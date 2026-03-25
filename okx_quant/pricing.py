@@ -27,6 +27,22 @@ def format_decimal(value: Decimal) -> str:
     return text or "0"
 
 
+def decimal_places_for_increment(increment: Decimal | None) -> int | None:
+    if increment is None or increment <= 0:
+        return None
+    normalized = increment.normalize()
+    return max(0, -normalized.as_tuple().exponent)
+
+
+def format_decimal_by_increment(value: Decimal, increment: Decimal | None) -> str:
+    places = decimal_places_for_increment(increment)
+    if places is None:
+        return format_decimal(value)
+    quant = Decimal("1").scaleb(-places)
+    rounded = value.quantize(quant, rounding=ROUND_HALF_UP)
+    return format(rounded, f".{places}f")
+
+
 def format_decimal_fixed(value: Decimal, places: int = 2) -> str:
     if places < 0:
         raise ValueError("places must be non-negative")

@@ -17,14 +17,18 @@ class EmaDynamicOrderStrategy:
                 entry_reference=None,
                 atr_value=None,
                 ema_value=None,
+                signal_candle_high=None,
+                signal_candle_low=None,
             )
 
         closes = [candle.close for candle in candles]
         ema_values = ema(closes, config.ema_period)
+        trend_ema_values = ema(closes, config.trend_ema_period)
         atr_values = atr(candles, config.atr_period)
 
         current_candle = candles[-1]
         current_ema = ema_values[-1]
+        trend_ema = trend_ema_values[-1]
         current_atr = atr_values[-1]
         if current_atr is None:
             return SignalDecision(
@@ -34,6 +38,8 @@ class EmaDynamicOrderStrategy:
                 entry_reference=None,
                 atr_value=None,
                 ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
             )
 
         if config.signal_mode == "long_only":
@@ -45,9 +51,39 @@ class EmaDynamicOrderStrategy:
                     entry_reference=None,
                     atr_value=current_atr,
                     ema_value=current_ema,
+                    signal_candle_high=current_candle.high,
+                    signal_candle_low=current_candle.low,
+                )
+            if current_ema <= trend_ema:
+                return SignalDecision(
+                    signal=None,
+                    reason=(
+                        f"EMA{config.ema_period} 当前仍在 EMA{config.trend_ema_period} 下方，"
+                        "趋势过滤不允许做多"
+                    ),
+                    candle_ts=current_candle.ts,
+                    entry_reference=None,
+                    atr_value=current_atr,
+                    ema_value=current_ema,
+                    signal_candle_high=current_candle.high,
+                    signal_candle_low=current_candle.low,
+                )
+            if current_candle.close <= trend_ema:
+                return SignalDecision(
+                    signal=None,
+                    reason=f"最近一根已收盘 K 线未站上 EMA{config.trend_ema_period}，趋势过滤不允许做多",
+                    candle_ts=current_candle.ts,
+                    entry_reference=None,
+                    atr_value=current_atr,
+                    ema_value=current_ema,
+                    signal_candle_high=current_candle.high,
+                    signal_candle_low=current_candle.low,
                 )
             signal = "long"
-            reason = "以上一根已收盘 EMA 作为做多回调挂单价格"
+            reason = (
+                f"以上一根已收盘 EMA 作为做多回调挂单价格，且 EMA{config.ema_period} 与收盘"
+                f"需位于 EMA{config.trend_ema_period} 上方"
+            )
         elif config.signal_mode == "short_only":
             if current_candle.close >= current_ema:
                 return SignalDecision(
@@ -57,9 +93,39 @@ class EmaDynamicOrderStrategy:
                     entry_reference=None,
                     atr_value=current_atr,
                     ema_value=current_ema,
+                    signal_candle_high=current_candle.high,
+                    signal_candle_low=current_candle.low,
+                )
+            if current_ema >= trend_ema:
+                return SignalDecision(
+                    signal=None,
+                    reason=(
+                        f"EMA{config.ema_period} 当前仍在 EMA{config.trend_ema_period} 上方，"
+                        "趋势过滤不允许做空"
+                    ),
+                    candle_ts=current_candle.ts,
+                    entry_reference=None,
+                    atr_value=current_atr,
+                    ema_value=current_ema,
+                    signal_candle_high=current_candle.high,
+                    signal_candle_low=current_candle.low,
+                )
+            if current_candle.close >= trend_ema:
+                return SignalDecision(
+                    signal=None,
+                    reason=f"最近一根已收盘 K 线未跌破 EMA{config.trend_ema_period}，趋势过滤不允许做空",
+                    candle_ts=current_candle.ts,
+                    entry_reference=None,
+                    atr_value=current_atr,
+                    ema_value=current_ema,
+                    signal_candle_high=current_candle.high,
+                    signal_candle_low=current_candle.low,
                 )
             signal = "short"
-            reason = "以上一根已收盘 EMA 作为做空反弹挂单价格"
+            reason = (
+                f"以上一根已收盘 EMA 作为做空反弹挂单价格，且 EMA{config.ema_period} 与收盘"
+                f"需位于 EMA{config.trend_ema_period} 下方"
+            )
         else:
             return SignalDecision(
                 signal=None,
@@ -68,6 +134,8 @@ class EmaDynamicOrderStrategy:
                 entry_reference=None,
                 atr_value=current_atr,
                 ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
             )
 
         return SignalDecision(
@@ -77,4 +145,6 @@ class EmaDynamicOrderStrategy:
             entry_reference=current_ema,
             atr_value=current_atr,
             ema_value=current_ema,
+            signal_candle_high=current_candle.high,
+            signal_candle_low=current_candle.low,
         )

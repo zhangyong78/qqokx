@@ -4,4 +4,14 @@ __pycache__/
 *.pyo
 *.pyd
 *.log
+.env
+.env.*
+*.pem
+*.key
+*.secret
+tests_artifacts/
 .okx_quant_credentials.json
+.okx_quant_settings.json
+.okx_quant_backtest_history.json
+.okx_quant_candle_cache/
+debug_*.txt

@@ -44,7 +44,8 @@ STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
             "一旦出现新信号，就按照当时的参考价格和 ATR 计算止盈止损，并立即市价下单。"
         ),
         parameter_hint=(
-            "同样支持风险金自动算仓位；如果后面你不想保留这个旧策略，也可以随时再移掉。"
+            "止损按信号 K 线极值加减 1ATR 计算：做多用信号K线最低价减 1ATR，"
+            "做空用信号K线最高价加 1ATR。数量同样支持风险金自动计算。"
         ),
         allowed_signal_labels=("双向", "只做多", "只做空"),
         default_signal_label="双向",
