@@ -15,3 +15,4 @@ tests_artifacts/
 .okx_quant_backtest_history.json
 .okx_quant_candle_cache/
 debug_*.txt
+reports/backtest_exports/batch_*.txt

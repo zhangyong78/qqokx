@@ -12,14 +12,19 @@ from okx_quant.backtest import (
     _load_backtest_candles,
     _backtest_trade_start_index,
     _format_backtest_timestamp,
+    _try_close_position,
     _try_close_position_same_candle_after_fill,
     build_atr_batch_configs,
     format_backtest_report,
     run_backtest,
     run_backtest_batch,
 )
+import okx_quant.backtest_export as backtest_export_module
 import okx_quant.backtest_ui as backtest_ui_module
+from okx_quant.backtest_export import export_batch_backtest_report, export_single_backtest_report
 from okx_quant.backtest_ui import (
+    DEFAULT_MAKER_FEE_PERCENT,
+    DEFAULT_TAKER_FEE_PERCENT,
     _backtest_candle_color,
     _backtest_bar_value_from_label,
     _BacktestSnapshotStore,
@@ -70,6 +75,10 @@ class DummyBacktestClient:
 
 
 class BacktestTest(TestCase):
+    def test_backtest_default_fee_percents(self) -> None:
+        self.assertEqual(DEFAULT_MAKER_FEE_PERCENT, "0.01")
+        self.assertEqual(DEFAULT_TAKER_FEE_PERCENT, "0.028")
+
     def _build_instrument(self) -> Instrument:
         return Instrument(
             inst_id="BTC-USDT-SWAP",
@@ -140,6 +149,54 @@ class BacktestTest(TestCase):
         self.assertIn("结束时间：", format_backtest_report(result))
         self.assertIn(f"预热K线：前 {BACKTEST_RESERVED_CANDLES} 根", format_backtest_report(result))
         self.assertEqual(client.history_limits, [len(candles)])
+
+    def test_cross_backtest_applies_taker_fees_on_entry_and_exit(self) -> None:
+        warmup_candles = [
+            Candle(index, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True)
+            for index in range(1, BACKTEST_RESERVED_CANDLES + 1)
+        ]
+        trade_candles = [
+            Candle(1, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(2, Decimal("100"), Decimal("101"), Decimal("98"), Decimal("99"), Decimal("1"), True),
+            Candle(3, Decimal("99"), Decimal("100"), Decimal("97"), Decimal("98"), Decimal("1"), True),
+            Candle(4, Decimal("98"), Decimal("99"), Decimal("95"), Decimal("96"), Decimal("1"), True),
+            Candle(5, Decimal("96"), Decimal("106"), Decimal("95"), Decimal("104"), Decimal("1"), True),
+            Candle(6, Decimal("104"), Decimal("133"), Decimal("100"), Decimal("130"), Decimal("1"), True),
+        ]
+        candles = warmup_candles + [
+            Candle(
+                BACKTEST_RESERVED_CANDLES + candle.ts,
+                candle.open,
+                candle.high,
+                candle.low,
+                candle.close,
+                candle.volume,
+                candle.confirmed,
+            )
+            for candle in trade_candles
+        ]
+        client = DummyBacktestClient(candles, self._build_instrument())
+        config = self._build_config()
+
+        no_fee_result = run_backtest(client, config, candle_limit=len(candles))
+        fee_result = run_backtest(
+            client,
+            config,
+            candle_limit=len(candles),
+            maker_fee_rate=Decimal("0"),
+            taker_fee_rate=Decimal("0.001"),
+        )
+
+        self.assertGreater(fee_result.report.total_fees, Decimal("0"))
+        self.assertEqual(fee_result.report.maker_fees, Decimal("0"))
+        self.assertEqual(fee_result.report.taker_fees, fee_result.report.total_fees)
+        self.assertLess(fee_result.report.total_pnl, no_fee_result.report.total_pnl)
+        self.assertTrue(all(trade.entry_fee_type == "taker" for trade in fee_result.trades))
+        self.assertTrue(all(trade.exit_fee_type == "taker" for trade in fee_result.trades))
+        self.assertEqual(
+            fee_result.report.total_fees,
+            sum((trade.total_fee for trade in fee_result.trades), Decimal("0")),
+        )
 
     def test_backtest_supports_more_than_300_candles(self) -> None:
         candles = [
@@ -393,6 +450,46 @@ class BacktestTest(TestCase):
 
         self.assertIsNone(trade)
 
+    def test_close_position_subtracts_maker_and_taker_fees_from_trade_pnl(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=10,
+            entry_ts=1710976500000,
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("95"),
+            take_profit=Decimal("110"),
+            size=Decimal("2"),
+            entry_fee_rate=Decimal("0.001"),
+            entry_fee_type="maker",
+        )
+        candle = Candle(
+            1710977400000,
+            Decimal("101"),
+            Decimal("111"),
+            Decimal("96"),
+            Decimal("109"),
+            Decimal("1"),
+            True,
+        )
+
+        trade = _try_close_position(
+            position,
+            candle,
+            11,
+            exit_fee_rate=Decimal("0.002"),
+            exit_fee_type="taker",
+        )
+
+        self.assertIsNotNone(trade)
+        assert trade is not None
+        self.assertEqual(trade.gross_pnl, Decimal("20"))
+        self.assertEqual(trade.entry_fee, Decimal("0.200"))
+        self.assertEqual(trade.exit_fee, Decimal("0.440"))
+        self.assertEqual(trade.total_fee, Decimal("0.640"))
+        self.assertEqual(trade.pnl, Decimal("19.360"))
+        self.assertEqual(trade.entry_fee_type, "maker")
+        self.assertEqual(trade.exit_fee_type, "taker")
+
     def test_backtest_candle_color_uses_green_for_up_and_red_for_down(self) -> None:
         self.assertEqual(_backtest_candle_color(Decimal("100"), Decimal("101")), "#1a7f37")
         self.assertEqual(_backtest_candle_color(Decimal("100"), Decimal("99")), "#d1242f")
@@ -533,6 +630,222 @@ class BacktestTest(TestCase):
         self.assertIn("回测K线数：800", detail)
         self.assertIn("方向只做空", detail)
 
+    def test_backtest_report_contains_fee_lines(self) -> None:
+        report = BacktestReport(
+            total_trades=1,
+            win_trades=1,
+            loss_trades=0,
+            breakeven_trades=0,
+            win_rate=Decimal("100"),
+            total_pnl=Decimal("9.36"),
+            average_pnl=Decimal("9.36"),
+            gross_profit=Decimal("9.36"),
+            gross_loss=Decimal("0"),
+            profit_factor=None,
+            average_win=Decimal("9.36"),
+            average_loss=Decimal("0"),
+            profit_loss_ratio=None,
+            average_r_multiple=Decimal("1.87"),
+            max_drawdown=Decimal("0"),
+            take_profit_hits=1,
+            stop_loss_hits=0,
+            maker_fees=Decimal("0.20"),
+            taker_fees=Decimal("0.44"),
+            total_fees=Decimal("0.64"),
+        )
+        result = BacktestResult(
+            candles=[
+                Candle(1710976500000, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+                Candle(1711062900000, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+            ],
+            trades=[],
+            report=report,
+            instrument=self._build_instrument(),
+            ema_period=21,
+            trend_ema_period=55,
+            strategy_id=STRATEGY_DYNAMIC_ID,
+            maker_fee_rate=Decimal("0.0002"),
+            taker_fee_rate=Decimal("0.0005"),
+        )
+
+        report_text = format_backtest_report(result)
+
+        self.assertIn("Maker手续费：0.0200%", report_text)
+        self.assertIn("Taker手续费：0.0500%", report_text)
+        self.assertIn("手续费合计：0.6400", report_text)
+
+    def test_export_single_backtest_report_writes_file(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            original_export_dir = backtest_export_module.backtest_report_export_dir_path
+            backtest_export_module.backtest_report_export_dir_path = lambda base_dir=None: Path(temp_dir)
+            try:
+                config = StrategyConfig(
+                    inst_id="BTC-USDT-SWAP",
+                    bar="1H",
+                    ema_period=21,
+                    trend_ema_period=55,
+                    atr_period=10,
+                    atr_stop_multiplier=Decimal("1.5"),
+                    atr_take_multiplier=Decimal("4.5"),
+                    order_size=Decimal("0"),
+                    trade_mode="cross",
+                    signal_mode="long_only",
+                    position_mode="net",
+                    environment="demo",
+                    tp_sl_trigger_type="mark",
+                    strategy_id=STRATEGY_DYNAMIC_ID,
+                    risk_amount=Decimal("100"),
+                )
+                result = BacktestResult(
+                    candles=[
+                        Candle(1710976500000, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+                        Candle(1711062900000, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+                    ],
+                    trades=[],
+                    report=BacktestReport(
+                        total_trades=1,
+                        win_trades=1,
+                        loss_trades=0,
+                        breakeven_trades=0,
+                        win_rate=Decimal("100"),
+                        total_pnl=Decimal("12.34"),
+                        average_pnl=Decimal("12.34"),
+                        gross_profit=Decimal("12.34"),
+                        gross_loss=Decimal("0"),
+                        profit_factor=None,
+                        average_win=Decimal("12.34"),
+                        average_loss=Decimal("0"),
+                        profit_loss_ratio=None,
+                        average_r_multiple=Decimal("1.2"),
+                        max_drawdown=Decimal("0"),
+                        take_profit_hits=1,
+                        stop_loss_hits=0,
+                        maker_fees=Decimal("0.2"),
+                        taker_fees=Decimal("0.5"),
+                        total_fees=Decimal("0.7"),
+                    ),
+                    instrument=self._build_instrument(),
+                    ema_period=21,
+                    trend_ema_period=55,
+                    strategy_id=STRATEGY_DYNAMIC_ID,
+                    data_source_note="cache hit 9988 | latest 12 | total 10000",
+                    maker_fee_rate=Decimal("0.0002"),
+                    taker_fee_rate=Decimal("0.0005"),
+                )
+
+                exported = export_single_backtest_report(
+                    result,
+                    config,
+                    10000,
+                    exported_at=datetime(2026, 3, 26, 20, 30, 0),
+                )
+
+                self.assertTrue(exported.exists())
+                self.assertIn("single_20260326_203000", exported.name)
+                content = exported.read_text(encoding="utf-8-sig")
+                self.assertIn("BTC-USDT-SWAP", content)
+                self.assertIn("EMA21", content)
+                self.assertIn("10000", content)
+                self.assertIn("0.0200%", content)
+            finally:
+                backtest_export_module.backtest_report_export_dir_path = original_export_dir
+
+    def test_export_batch_backtest_report_writes_matrix_summary(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            original_export_dir = backtest_export_module.backtest_report_export_dir_path
+            backtest_export_module.backtest_report_export_dir_path = lambda base_dir=None: Path(temp_dir)
+            try:
+                base_config = StrategyConfig(
+                    inst_id="ETH-USDT-SWAP",
+                    bar="4H",
+                    ema_period=21,
+                    trend_ema_period=55,
+                    atr_period=10,
+                    atr_stop_multiplier=Decimal("1"),
+                    atr_take_multiplier=Decimal("1"),
+                    order_size=Decimal("0"),
+                    trade_mode="cross",
+                    signal_mode="short_only",
+                    position_mode="net",
+                    environment="demo",
+                    tp_sl_trigger_type="mark",
+                    strategy_id=STRATEGY_DYNAMIC_ID,
+                    risk_amount=Decimal("100"),
+                )
+                results = []
+                for take_multiplier, total_pnl in (
+                    (Decimal("1"), Decimal("100")),
+                    (Decimal("2"), Decimal("200")),
+                    (Decimal("3"), Decimal("300")),
+                ):
+                    config = StrategyConfig(
+                        inst_id=base_config.inst_id,
+                        bar=base_config.bar,
+                        ema_period=base_config.ema_period,
+                        trend_ema_period=base_config.trend_ema_period,
+                        atr_period=base_config.atr_period,
+                        atr_stop_multiplier=Decimal("1"),
+                        atr_take_multiplier=take_multiplier,
+                        order_size=base_config.order_size,
+                        trade_mode=base_config.trade_mode,
+                        signal_mode=base_config.signal_mode,
+                        position_mode=base_config.position_mode,
+                        environment=base_config.environment,
+                        tp_sl_trigger_type=base_config.tp_sl_trigger_type,
+                        strategy_id=base_config.strategy_id,
+                        risk_amount=base_config.risk_amount,
+                    )
+                    result = BacktestResult(
+                        candles=[
+                            Candle(1710976500000, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+                            Candle(1711062900000, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+                        ],
+                        trades=[],
+                        report=BacktestReport(
+                            total_trades=10,
+                            win_trades=4,
+                            loss_trades=6,
+                            breakeven_trades=0,
+                            win_rate=Decimal("40"),
+                            total_pnl=total_pnl,
+                            average_pnl=Decimal("10"),
+                            gross_profit=Decimal("150"),
+                            gross_loss=Decimal("50"),
+                            profit_factor=Decimal("3"),
+                            average_win=Decimal("37.5"),
+                            average_loss=Decimal("8.3333"),
+                            profit_loss_ratio=Decimal("4.5"),
+                            average_r_multiple=Decimal("0.5"),
+                            max_drawdown=Decimal("20"),
+                            take_profit_hits=4,
+                            stop_loss_hits=6,
+                        ),
+                        instrument=self._build_instrument(),
+                        ema_period=21,
+                        trend_ema_period=55,
+                        strategy_id=STRATEGY_DYNAMIC_ID,
+                        maker_fee_rate=Decimal("0.0002"),
+                        taker_fee_rate=Decimal("0.0005"),
+                    )
+                    results.append((config, result))
+
+                exported = export_batch_backtest_report(
+                    results,
+                    10000,
+                    batch_label="B001",
+                    exported_at=datetime(2026, 3, 26, 21, 0, 0),
+                )
+
+                self.assertTrue(exported.exists())
+                self.assertIn("batch_20260326_210000", exported.name)
+                content = exported.read_text(encoding="utf-8-sig")
+                self.assertIn("ETH-USDT-SWAP", content)
+                self.assertIn("SL \\\\ TP", content)
+                self.assertIn("TP = SL x2", content)
+                self.assertIn("300.0000", content)
+            finally:
+                backtest_export_module.backtest_report_export_dir_path = original_export_dir
+
     def test_backtest_snapshot_store_persists_records_to_disk(self) -> None:
         with TemporaryDirectory() as temp_dir:
             history_path = Path(temp_dir) / ".okx_quant_backtest_history.json"
@@ -589,7 +902,7 @@ class BacktestTest(TestCase):
                     risk_amount=Decimal("100"),
                 )
 
-                store.add_snapshot(result, config, 500)
+                store.add_snapshot(result, config, 500, export_path="D:/qqokx/reports/backtest_exports/demo.txt")
                 reloaded_store = _BacktestSnapshotStore()
                 snapshots = reloaded_store.list_snapshots()
 

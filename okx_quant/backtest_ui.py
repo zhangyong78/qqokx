@@ -5,6 +5,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, Canvas, StringVar, Text, Toplevel, X, Y
 from tkinter import messagebox, ttk
 
@@ -18,6 +19,7 @@ from okx_quant.backtest import (
     run_backtest,
     run_backtest_batch,
 )
+from okx_quant.backtest_export import export_batch_backtest_report, export_single_backtest_report
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import backtest_history_file_path
@@ -64,6 +66,8 @@ BACKTEST_SYMBOL_OPTIONS = (
     "BNB-USDT-SWAP",
     "DOGE-USDT-SWAP",
 )
+DEFAULT_MAKER_FEE_PERCENT = "0.01"
+DEFAULT_TAKER_FEE_PERCENT = "0.028"
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,8 @@ class BacktestLaunchState:
     position_mode_label: str
     trigger_type_label: str
     environment_label: str
+    maker_fee_percent: str = DEFAULT_MAKER_FEE_PERCENT
+    taker_fee_percent: str = DEFAULT_TAKER_FEE_PERCENT
 
 
 @dataclass
@@ -117,6 +123,9 @@ class _BacktestSnapshot:
     start_ts: int | None = None
     end_ts: int | None = None
     result: BacktestResult | None = None
+    maker_fee_rate: Decimal = Decimal("0")
+    taker_fee_rate: Decimal = Decimal("0")
+    export_path: str | None = None
 
 
 class _BacktestSnapshotStore:
@@ -133,6 +142,8 @@ class _BacktestSnapshotStore:
         result: BacktestResult,
         config: StrategyConfig,
         candle_limit: int,
+        *,
+        export_path: str | None = None,
     ) -> _BacktestSnapshot:
         self._sequence += 1
         snapshot = _BacktestSnapshot(
@@ -146,6 +157,9 @@ class _BacktestSnapshotStore:
             report=result.report,
             report_text=format_backtest_report(result),
             result=None,
+            maker_fee_rate=result.maker_fee_rate,
+            taker_fee_rate=result.taker_fee_rate,
+            export_path=export_path,
         )
         self._snapshots[snapshot.snapshot_id] = snapshot
         self._order.append(snapshot.snapshot_id)
@@ -294,7 +308,11 @@ def _build_backtest_compare_row(snapshot: _BacktestSnapshot) -> tuple[str, ...]:
         STRATEGY_ID_TO_NAME.get(config.strategy_id, config.strategy_id),
         config.inst_id,
         _normalize_backtest_bar_label(config.bar),
-        _build_backtest_param_summary(config),
+        _build_backtest_param_summary(
+            config,
+            maker_fee_rate=snapshot.maker_fee_rate,
+            taker_fee_rate=snapshot.taker_fee_rate,
+        ),
         str(report.total_trades),
         f"{format_decimal_fixed(report.win_rate, 2)}%",
         format_decimal_fixed(report.total_pnl, 4),
@@ -302,12 +320,18 @@ def _build_backtest_compare_row(snapshot: _BacktestSnapshot) -> tuple[str, ...]:
     )
 
 
-def _build_backtest_param_summary(config: StrategyConfig) -> str:
+def _build_backtest_param_summary(
+    config: StrategyConfig,
+    *,
+    maker_fee_rate: Decimal = Decimal("0"),
+    taker_fee_rate: Decimal = Decimal("0"),
+) -> str:
     risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
     return (
         f"EMA{config.ema_period} / 趋势{config.trend_ema_period} / ATR{config.atr_period} / "
         f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
-        f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 风险{risk_text}"
+        f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 风险{risk_text} / "
+        f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)}"
     )
 
 
@@ -322,13 +346,19 @@ def _build_backtest_compare_detail(snapshot: _BacktestSnapshot) -> str:
         f"交易对：{config.inst_id}",
         f"K线周期：{_normalize_backtest_bar_label(config.bar)}",
         f"回测K线数：{snapshot.candle_limit}",
-        f"参数：{_build_backtest_param_summary(config)}",
+        f"参数：{_build_backtest_param_summary(config, maker_fee_rate=snapshot.maker_fee_rate, taker_fee_rate=snapshot.taker_fee_rate)}",
         f"\u5f00\u59cb\u65f6\u95f4\uff1a{start_text}",
         f"\u7ed3\u675f\u65f6\u95f4\uff1a{end_text}",
         "",
         snapshot.report_text,
     ]
+    if snapshot.export_path:
+        lines.insert(-2, f"\u62a5\u544a\u6587\u4ef6\uff1a{snapshot.export_path}")
     return "\n".join(lines)
+
+
+def _format_fee_rate_percent(rate: Decimal) -> str:
+    return f"{format_decimal_fixed(rate * Decimal('100'), 4)}%"
 
 
 def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
@@ -406,6 +436,9 @@ def _serialize_backtest_report(report: BacktestReport) -> dict[str, object]:
         "max_drawdown": str(report.max_drawdown),
         "take_profit_hits": report.take_profit_hits,
         "stop_loss_hits": report.stop_loss_hits,
+        "maker_fees": str(report.maker_fees),
+        "taker_fees": str(report.taker_fees),
+        "total_fees": str(report.total_fees),
     }
 
 
@@ -430,6 +463,9 @@ def _deserialize_backtest_report(payload: dict[str, object]) -> BacktestReport:
         max_drawdown=Decimal(str(payload.get("max_drawdown", "0"))),
         take_profit_hits=int(payload.get("take_profit_hits", 0)),
         stop_loss_hits=int(payload.get("stop_loss_hits", 0)),
+        maker_fees=Decimal(str(payload.get("maker_fees", "0"))),
+        taker_fees=Decimal(str(payload.get("taker_fees", "0"))),
+        total_fees=Decimal(str(payload.get("total_fees", "0"))),
     )
 
 
@@ -441,6 +477,9 @@ def _serialize_backtest_snapshot(snapshot: _BacktestSnapshot) -> dict[str, objec
         "candle_count": snapshot.candle_count,
         "start_ts": snapshot.start_ts,
         "end_ts": snapshot.end_ts,
+        "maker_fee_rate": str(snapshot.maker_fee_rate),
+        "taker_fee_rate": str(snapshot.taker_fee_rate),
+        "export_path": snapshot.export_path or "",
         "config": _serialize_strategy_config(snapshot.config),
         "report": _serialize_backtest_report(snapshot.report),
         "report_text": snapshot.report_text,
@@ -468,6 +507,9 @@ def _deserialize_backtest_snapshot(payload: object) -> _BacktestSnapshot | None:
             report=_deserialize_backtest_report(report_payload),
             report_text=str(payload.get("report_text", "")),
             result=None,
+            maker_fee_rate=Decimal(str(payload.get("maker_fee_rate", "0"))),
+            taker_fee_rate=Decimal(str(payload.get("taker_fee_rate", "0"))),
+            export_path=str(payload.get("export_path", "")).strip() or None,
         )
     except Exception:
         return None
@@ -609,6 +651,8 @@ class BacktestWindow:
         self.stop_atr = StringVar(value=initial_state.stop_atr)
         self.take_atr = StringVar(value=initial_state.take_atr)
         self.risk_amount = StringVar(value=initial_state.risk_amount)
+        self.maker_fee_percent = StringVar(value=initial_state.maker_fee_percent)
+        self.taker_fee_percent = StringVar(value=initial_state.taker_fee_percent)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
         self.position_mode_label = StringVar(value=initial_state.position_mode_label)
@@ -698,6 +742,12 @@ class BacktestWindow:
         row += 1
         ttk.Label(controls, text="风险金").grid(row=row, column=0, sticky="w", pady=(12, 0))
         ttk.Entry(controls, textvariable=self.risk_amount).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        ttk.Label(controls, text="Maker手续费(%)").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.maker_fee_percent).grid(
+            row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
+        )
+        ttk.Label(controls, text="Taker手续费(%)").grid(row=row, column=4, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.taker_fee_percent).grid(row=row, column=5, sticky="ew", pady=(12, 0))
 
         row += 1
         ttk.Label(controls, text="回测K线数").grid(row=row, column=0, sticky="w", pady=(12, 0))
@@ -951,7 +1001,7 @@ class BacktestWindow:
         if self._backtest_running:
             return
         try:
-            config, candle_limit = self._build_backtest_request()
+            config, candle_limit, maker_fee_rate, taker_fee_rate = self._build_backtest_request()
         except Exception as exc:
             messagebox.showerror("鍥炴祴鍙傛暟閿欒", str(exc), parent=self.window)
             return
@@ -961,7 +1011,7 @@ class BacktestWindow:
         batch_label = self._next_batch_label()
         threading.Thread(
             target=self._run_batch_backtest_worker,
-            args=(config, candle_limit, batch_label),
+            args=(config, candle_limit, batch_label, maker_fee_rate, taker_fee_rate),
             daemon=True,
         ).start()
 
@@ -969,7 +1019,7 @@ class BacktestWindow:
         if self._backtest_running:
             return
         try:
-            config, candle_limit = self._build_backtest_request()
+            config, candle_limit, maker_fee_rate, taker_fee_rate = self._build_backtest_request()
         except Exception as exc:
             messagebox.showerror("鍥炴祴鍙傛暟閿欒", str(exc), parent=self.window)
             return
@@ -978,12 +1028,17 @@ class BacktestWindow:
         self._set_backtest_running(True)
         threading.Thread(
             target=self._run_backtest_worker,
-            args=(config, candle_limit),
+            args=(config, candle_limit, maker_fee_rate, taker_fee_rate),
             daemon=True,
         ).start()
 
-    def _build_backtest_request(self) -> tuple[StrategyConfig, int]:
-        return self._build_config(), self._parse_positive_int(self.candle_limit.get(), "鍥炴祴K绾挎暟")
+    def _build_backtest_request(self) -> tuple[StrategyConfig, int, Decimal, Decimal]:
+        return (
+            self._build_config(),
+            self._parse_positive_int(self.candle_limit.get(), "鍥炴祴K绾挎暟"),
+            self._parse_fee_percent(self.maker_fee_percent.get(), "Maker手续费"),
+            self._parse_fee_percent(self.taker_fee_percent.get(), "Taker手续费"),
+        )
 
     def _prepare_backtest_output(self, summary_text: str) -> None:
         self.report_summary.set(summary_text)
@@ -1007,7 +1062,8 @@ class BacktestWindow:
             f"{STRATEGY_ID_TO_NAME.get(snapshot.config.strategy_id, snapshot.config.strategy_id)} | "
             f"{snapshot.config.inst_id} | "
             f"{_normalize_backtest_bar_label(snapshot.config.bar)} | "
-            f"{signal_label}"
+            f"{signal_label} | M费{_format_fee_rate_percent(snapshot.maker_fee_rate)} | "
+            f"T费{_format_fee_rate_percent(snapshot.taker_fee_rate)}"
         )
 
     def _set_backtest_running(self, running: bool) -> None:
@@ -1018,22 +1074,52 @@ class BacktestWindow:
         if getattr(self, "batch_backtest_button", None) is not None:
             self.batch_backtest_button.configure(state=state)
 
-    def _run_batch_backtest_worker(self, config: StrategyConfig, candle_limit: int, batch_label: str) -> None:
+    def _run_batch_backtest_worker(
+        self,
+        config: StrategyConfig,
+        candle_limit: int,
+        batch_label: str,
+        maker_fee_rate: Decimal,
+        taker_fee_rate: Decimal,
+    ) -> None:
         try:
-            results = run_backtest_batch(self.client, config, candle_limit=candle_limit)
+            results = run_backtest_batch(
+                self.client,
+                config,
+                candle_limit=candle_limit,
+                maker_fee_rate=maker_fee_rate,
+                taker_fee_rate=taker_fee_rate,
+            )
             self.window.after(0, lambda: self._apply_batch_backtest_results(results, candle_limit, batch_label))
         except Exception as exc:
             self.window.after(0, lambda: self._show_backtest_error(exc))
 
-    def _run_backtest_worker(self, config: StrategyConfig, candle_limit: int) -> None:
+    def _run_backtest_worker(
+        self,
+        config: StrategyConfig,
+        candle_limit: int,
+        maker_fee_rate: Decimal,
+        taker_fee_rate: Decimal,
+    ) -> None:
         try:
-            result = run_backtest(self.client, config, candle_limit=candle_limit)
+            result = run_backtest(
+                self.client,
+                config,
+                candle_limit=candle_limit,
+                maker_fee_rate=maker_fee_rate,
+                taker_fee_rate=taker_fee_rate,
+            )
             self.window.after(0, lambda: self._apply_backtest_result(result, config, candle_limit))
         except Exception as exc:
             self.window.after(0, lambda: self._show_backtest_error(exc))
 
     def _apply_backtest_result(self, result: BacktestResult, config: StrategyConfig, candle_limit: int) -> None:
-        snapshot = self._append_backtest_snapshot(result, config, candle_limit)
+        export_path = None
+        try:
+            export_path = str(export_single_backtest_report(result, config, candle_limit))
+        except Exception as exc:
+            messagebox.showwarning("回测报告导出失败", f"回测已完成，但报告导出失败：{exc}", parent=self.window)
+        snapshot = self._append_backtest_snapshot(result, config, candle_limit, export_path=export_path)
         self._load_snapshot(snapshot.snapshot_id)
         self._set_backtest_running(False)
 
@@ -1043,9 +1129,26 @@ class BacktestWindow:
         candle_limit: int,
         batch_label: str,
     ) -> None:
+        export_path = None
+        try:
+            export_path = str(
+                export_batch_backtest_report(
+                    results,
+                    candle_limit,
+                    batch_label=batch_label,
+                )
+            )
+        except Exception as exc:
+            messagebox.showwarning("批量回测报告导出失败", f"批量回测已完成，但报告导出失败：{exc}", parent=self.window)
         last_snapshot: _BacktestSnapshot | None = None
         for config, result in results:
-            last_snapshot = self._append_backtest_snapshot(result, config, candle_limit, batch_label=batch_label)
+            last_snapshot = self._append_backtest_snapshot(
+                result,
+                config,
+                candle_limit,
+                batch_label=batch_label,
+                export_path=export_path,
+            )
         if last_snapshot is not None:
             self._load_snapshot(last_snapshot.snapshot_id)
             self._show_batch_matrix(batch_label)
@@ -1096,6 +1199,7 @@ class BacktestWindow:
         candle_limit: int,
         *,
         batch_label: str | None = None,
+        export_path: str | None = None,
     ) -> _BacktestSnapshot:
         self._backtest_snapshot_sequence += 1
         snapshot = _BacktestSnapshot(
@@ -1109,6 +1213,9 @@ class BacktestWindow:
             report=result.report,
             report_text=format_backtest_report(result),
             result=result,
+            maker_fee_rate=result.maker_fee_rate,
+            taker_fee_rate=result.taker_fee_rate,
+            export_path=export_path,
         )
         self._backtest_snapshots[snapshot.snapshot_id] = snapshot
         self._backtest_snapshot_order.append(snapshot.snapshot_id)
@@ -1117,7 +1224,7 @@ class BacktestWindow:
             self._snapshot_batch_labels[snapshot.snapshot_id] = batch_label
         self.compare_tree.insert("", END, iid=snapshot.snapshot_id, values=_build_backtest_compare_row(snapshot))
         self._update_compare_summary()
-        get_backtest_snapshot_store().add_snapshot(result, config, candle_limit)
+        get_backtest_snapshot_store().add_snapshot(result, config, candle_limit, export_path=export_path)
         return snapshot
 
     def _update_compare_summary(self) -> None:
@@ -1171,7 +1278,11 @@ class BacktestWindow:
         signal_label = SIGNAL_VALUE_TO_LABEL.get(snapshots[0].config.signal_mode, snapshots[0].config.signal_mode)
         symbol_text = snapshots[0].config.inst_id
         bar_text = _normalize_backtest_bar_label(snapshots[0].config.bar)
-        param_text = _build_backtest_param_summary(snapshots[0].config)
+        param_text = _build_backtest_param_summary(
+            snapshots[0].config,
+            maker_fee_rate=snapshots[0].maker_fee_rate,
+            taker_fee_rate=snapshots[0].taker_fee_rate,
+        )
         start_text, end_text = _backtest_snapshot_range_text(snapshots[0])
         self.matrix_summary.set(
             f"ATR \u77e9\u9635\u6279\u6b21\uff1a{batch_label} \uff5c \u4ea4\u6613\u5bf9\uff1a{symbol_text} \uff5c \u5468\u671f\uff1a{bar_text} \uff5c "
@@ -1270,11 +1381,14 @@ class BacktestWindow:
             f"\u7f16\u53f7\uff1a{snapshot.snapshot_id} | \u65f6\u95f4\uff1a{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
             f"\u7b56\u7565\uff1a{STRATEGY_ID_TO_NAME.get(snapshot.config.strategy_id, snapshot.config.strategy_id)} | "
             f"\u4ea4\u6613\u5bf9\uff1a{snapshot.config.inst_id} | K\u7ebf\uff1a{_normalize_backtest_bar_label(snapshot.config.bar)} | "
+            f"M费\uff1a{_format_fee_rate_percent(snapshot.maker_fee_rate)} | T费\uff1a{_format_fee_rate_percent(snapshot.taker_fee_rate)} | "
             f"\u5f00\u59cb\uff1a{start_text} | \u7ed3\u675f\uff1a{end_text} | "
             f"\u4fe1\u53f7\u65b9\u5411\uff1a{signal_label} | \u4ea4\u6613\u6b21\u6570\uff1a{result.report.total_trades}"
         )
         if result.data_source_note:
             summary_text = f"{summary_text}\n{result.data_source_note}"
+        if snapshot.export_path:
+            summary_text = f"{summary_text}\n报告文件：{snapshot.export_path}"
         self.report_summary.set(summary_text)
         self.report_text.delete("1.0", END)
         self.report_text.insert("1.0", format_backtest_report(result))
@@ -1781,6 +1895,15 @@ class BacktestWindow:
         if value <= 0:
             raise ValueError(f"{field_name} 必须大于 0")
         return value
+
+    def _parse_fee_percent(self, raw: str, field_name: str) -> Decimal:
+        try:
+            value = Decimal(raw)
+        except InvalidOperation as exc:
+            raise ValueError(f"{field_name} 不是有效数字") from exc
+        if value < 0:
+            raise ValueError(f"{field_name} 不能小于 0")
+        return value / Decimal("100")
 
 
 def _normalize_chart_viewport(

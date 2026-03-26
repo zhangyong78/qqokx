@@ -2728,6 +2728,8 @@ class QuantApp:
                 position_mode_label=self.position_mode_label.get(),
                 trigger_type_label=self.trigger_type_label.get(),
                 environment_label=self.environment_label.get(),
+                maker_fee_percent="0.01",
+                taker_fee_percent="0.028",
             ),
         )
 

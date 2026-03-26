@@ -9,6 +9,7 @@ CREDENTIALS_FILE_NAME = ".okx_quant_credentials.json"
 SETTINGS_FILE_NAME = ".okx_quant_settings.json"
 BACKTEST_HISTORY_FILE_NAME = ".okx_quant_backtest_history.json"
 BACKTEST_CANDLE_CACHE_DIR_NAME = ".okx_quant_candle_cache"
+BACKTEST_REPORT_EXPORT_DIR_NAME = "backtest_exports"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 
 
@@ -34,6 +35,12 @@ def candle_cache_dir_path(base_dir: Path | None = None) -> Path:
     if base_dir is None:
         base_dir = Path(__file__).resolve().parent.parent
     return Path(base_dir) / BACKTEST_CANDLE_CACHE_DIR_NAME
+
+
+def backtest_report_export_dir_path(base_dir: Path | None = None) -> Path:
+    if base_dir is None:
+        base_dir = Path(__file__).resolve().parent.parent
+    return Path(base_dir) / "reports" / BACKTEST_REPORT_EXPORT_DIR_NAME
 
 
 def _empty_credentials_snapshot() -> dict[str, str]:

@@ -5,8 +5,8 @@ from datetime import datetime
 from decimal import Decimal
 
 from okx_quant.engine import build_order_plan
-from okx_quant.indicators import ema
-from okx_quant.models import Candle, Instrument, StrategyConfig
+from okx_quant.indicators import atr, ema
+from okx_quant.models import Candle, Instrument, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
@@ -40,10 +40,16 @@ class BacktestTrade:
     stop_loss: Decimal
     take_profit: Decimal
     size: Decimal
+    gross_pnl: Decimal
     pnl: Decimal
     risk_value: Decimal
     r_multiple: Decimal
     exit_reason: str
+    entry_fee: Decimal = Decimal("0")
+    exit_fee: Decimal = Decimal("0")
+    total_fee: Decimal = Decimal("0")
+    entry_fee_type: str = "none"
+    exit_fee_type: str = "none"
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,9 @@ class BacktestReport:
     max_drawdown: Decimal
     take_profit_hits: int
     stop_loss_hits: int
+    maker_fees: Decimal = Decimal("0")
+    taker_fees: Decimal = Decimal("0")
+    total_fees: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -79,6 +88,8 @@ class BacktestResult:
     trend_ema_period: int = 55
     strategy_id: str = STRATEGY_DYNAMIC_ID
     data_source_note: str = ""
+    maker_fee_rate: Decimal = Decimal("0")
+    taker_fee_rate: Decimal = Decimal("0")
 
 
 @dataclass
@@ -90,6 +101,8 @@ class _OpenPosition:
     stop_loss: Decimal
     take_profit: Decimal
     size: Decimal
+    entry_fee_rate: Decimal = Decimal("0")
+    entry_fee_type: str = "none"
 
 
 def run_backtest(
@@ -97,6 +110,8 @@ def run_backtest(
     config: StrategyConfig,
     *,
     candle_limit: int = 200,
+    maker_fee_rate: Decimal = Decimal("0"),
+    taker_fee_rate: Decimal = Decimal("0"),
 ) -> BacktestResult:
     if candle_limit <= 0:
         raise ValueError("回测 K 线数量必须大于 0")
@@ -110,6 +125,8 @@ def run_backtest(
         instrument,
         config,
         data_source_note=_build_backtest_data_source_note(client),
+        maker_fee_rate=maker_fee_rate,
+        taker_fee_rate=taker_fee_rate,
     )
 
 
@@ -139,6 +156,8 @@ def run_backtest_batch(
     candle_limit: int = 200,
     atr_multipliers: tuple[Decimal, ...] = ATR_BATCH_MULTIPLIERS,
     take_ratios: tuple[Decimal, ...] = ATR_BATCH_TAKE_RATIOS,
+    maker_fee_rate: Decimal = Decimal("0"),
+    taker_fee_rate: Decimal = Decimal("0"),
 ) -> list[tuple[StrategyConfig, BacktestResult]]:
     if candle_limit <= 0:
         raise ValueError("\u56de\u6d4b K \u7ebf\u6570\u91cf\u5fc5\u987b\u5927\u4e8e 0")
@@ -150,7 +169,19 @@ def run_backtest_batch(
     data_source_note = _build_backtest_data_source_note(client)
     results: list[tuple[StrategyConfig, BacktestResult]] = []
     for config in build_atr_batch_configs(base_config, atr_multipliers=atr_multipliers, take_ratios=take_ratios):
-        results.append((config, _run_backtest_with_loaded_data(candles, instrument, config, data_source_note=data_source_note)))
+        results.append(
+            (
+                config,
+                _run_backtest_with_loaded_data(
+                    candles,
+                    instrument,
+                    config,
+                    data_source_note=data_source_note,
+                    maker_fee_rate=maker_fee_rate,
+                    taker_fee_rate=taker_fee_rate,
+                ),
+            )
+        )
     return results
 
 
@@ -160,11 +191,24 @@ def _run_backtest_with_loaded_data(
     config: StrategyConfig,
     *,
     data_source_note: str = "",
+    maker_fee_rate: Decimal = Decimal("0"),
+    taker_fee_rate: Decimal = Decimal("0"),
 ) -> BacktestResult:
     if config.strategy_id == STRATEGY_DYNAMIC_ID:
-        trades = _run_dynamic_backtest(candles, instrument, config)
+        trades = _run_dynamic_backtest(
+            candles,
+            instrument,
+            config,
+            maker_fee_rate=maker_fee_rate,
+            taker_fee_rate=taker_fee_rate,
+        )
     elif config.strategy_id == STRATEGY_CROSS_ID:
-        trades = _run_cross_backtest(candles, instrument, config)
+        trades = _run_cross_backtest(
+            candles,
+            instrument,
+            config,
+            taker_fee_rate=taker_fee_rate,
+        )
     else:
         raise RuntimeError(f"暂不支持的回测策略：{config.strategy_id}")
     ema_values = ema([candle.close for candle in candles], config.ema_period) if candles else []
@@ -181,6 +225,8 @@ def _run_backtest_with_loaded_data(
         trend_ema_period=config.trend_ema_period,
         strategy_id=config.strategy_id,
         data_source_note=data_source_note,
+        maker_fee_rate=maker_fee_rate,
+        taker_fee_rate=taker_fee_rate,
     )
 
 
@@ -193,12 +239,17 @@ def format_backtest_report(result: BacktestResult) -> str:
         f"开始时间：{start_time}",
         f"结束时间：{end_time}",
         f"预热K线：前 {min(BACKTEST_RESERVED_CANDLES, len(result.candles))} 根仅用于指标预热与绘图，不参与回测",
+        f"Maker手续费：{_format_fee_rate_percent(result.maker_fee_rate)}",
+        f"Taker手续费：{_format_fee_rate_percent(result.taker_fee_rate)}",
         f"交易次数：{report.total_trades}",
         f"胜率：{format_decimal_fixed(report.win_rate, 2)}%",
         f"总盈亏：{format_decimal(report.total_pnl)}",
         f"平均每笔：{format_decimal_fixed(report.average_pnl, 4)}",
         f"平均R倍数：{format_decimal_fixed(report.average_r_multiple, 4)}",
         f"最大回撤：{format_decimal_fixed(report.max_drawdown, 4)}",
+        f"手续费合计：{format_decimal_fixed(report.total_fees, 4)}",
+        f"Maker手续费合计：{format_decimal_fixed(report.maker_fees, 4)}",
+        f"Taker手续费合计：{format_decimal_fixed(report.taker_fees, 4)}",
         f"止盈触发次数：{report.take_profit_hits}",
         f"止损触发次数：{report.stop_loss_hits}",
     ]
@@ -276,6 +327,8 @@ def _run_cross_backtest(
     candles: list[Candle],
     instrument: Instrument,
     config: StrategyConfig,
+    *,
+    taker_fee_rate: Decimal = Decimal("0"),
 ) -> list[BacktestTrade]:
     strategy = EmaAtrStrategy()
     minimum = max(config.ema_period + 2, config.atr_period + 2)
@@ -291,7 +344,13 @@ def _run_cross_backtest(
     for index in range(trade_start_index, len(candles)):
         candle = candles[index]
         if open_position is not None:
-            closed_trade = _try_close_position(open_position, candle, index)
+            closed_trade = _try_close_position(
+                open_position,
+                candle,
+                index,
+                exit_fee_rate=taker_fee_rate,
+                exit_fee_type="taker",
+            )
             if closed_trade is not None:
                 trades.append(closed_trade)
                 open_position = None
@@ -324,6 +383,8 @@ def _run_cross_backtest(
             stop_loss=plan.stop_loss,
             take_profit=plan.take_profit,
             size=plan.size,
+            entry_fee_rate=taker_fee_rate,
+            entry_fee_type="taker",
         )
 
     return trades
@@ -333,8 +394,10 @@ def _run_dynamic_backtest(
     candles: list[Candle],
     instrument: Instrument,
     config: StrategyConfig,
+    *,
+    maker_fee_rate: Decimal = Decimal("0"),
+    taker_fee_rate: Decimal = Decimal("0"),
 ) -> list[BacktestTrade]:
-    strategy = EmaDynamicOrderStrategy()
     minimum = max(config.ema_period, config.atr_period)
     if len(candles) < minimum + 1:
         raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum + 1} 根")
@@ -342,6 +405,10 @@ def _run_dynamic_backtest(
     if len(candles) <= trade_start_index:
         return []
 
+    closes = [candle.close for candle in candles]
+    ema_values = ema(closes, config.ema_period)
+    trend_ema_values = ema(closes, config.trend_ema_period)
+    atr_values = atr(candles, config.atr_period)
     trades: list[BacktestTrade] = []
     open_position: _OpenPosition | None = None
     active_plan = None
@@ -350,16 +417,34 @@ def _run_dynamic_backtest(
         candle = candles[index]
 
         if open_position is not None:
-            closed_trade = _try_close_position(open_position, candle, index)
+            closed_trade = _try_close_position(
+                open_position,
+                candle,
+                index,
+                exit_fee_rate=taker_fee_rate,
+                exit_fee_type="taker",
+            )
             if closed_trade is not None:
                 trades.append(closed_trade)
                 open_position = None
 
         if active_plan is not None and open_position is None:
-            filled_position = _try_fill_dynamic_order(active_plan, candle, index)
+            filled_position = _try_fill_dynamic_order(
+                active_plan,
+                candle,
+                index,
+                entry_fee_rate=maker_fee_rate,
+                entry_fee_type="maker",
+            )
             active_plan = None
             if filled_position is not None:
-                closed_trade = _try_close_position_same_candle_after_fill(filled_position, candle, index)
+                closed_trade = _try_close_position_same_candle_after_fill(
+                    filled_position,
+                    candle,
+                    index,
+                    exit_fee_rate=taker_fee_rate,
+                    exit_fee_type="taker",
+                )
                 if closed_trade is not None:
                     trades.append(closed_trade)
                 else:
@@ -368,7 +453,14 @@ def _run_dynamic_backtest(
         if open_position is not None or index >= len(candles) - 1:
             continue
 
-        decision = strategy.evaluate(candles[: index + 1], config)
+        decision = _evaluate_dynamic_signal_precomputed(
+            candles,
+            index,
+            ema_values,
+            trend_ema_values,
+            atr_values,
+            config,
+        )
         if decision.signal is None:
             continue
         if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
@@ -389,7 +481,140 @@ def _run_dynamic_backtest(
     return trades
 
 
-def _try_fill_dynamic_order(plan, candle: Candle, candle_index: int) -> _OpenPosition | None:
+def _evaluate_dynamic_signal_precomputed(
+    candles: list[Candle],
+    index: int,
+    ema_values: list[Decimal],
+    trend_ema_values: list[Decimal],
+    atr_values: list[Decimal | None],
+    config: StrategyConfig,
+) -> SignalDecision:
+    current_candle = candles[index]
+    current_ema = ema_values[index]
+    trend_ema = trend_ema_values[index]
+    current_atr = atr_values[index]
+    if current_atr is None:
+        return SignalDecision(
+            signal=None,
+            reason="atr_not_ready",
+            candle_ts=current_candle.ts,
+            entry_reference=None,
+            atr_value=None,
+            ema_value=current_ema,
+            signal_candle_high=current_candle.high,
+            signal_candle_low=current_candle.low,
+        )
+
+    if config.signal_mode == "long_only":
+        if current_candle.close <= current_ema:
+            return SignalDecision(
+                signal=None,
+                reason="close_below_entry_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
+        if current_ema <= trend_ema:
+            return SignalDecision(
+                signal=None,
+                reason="fast_ema_below_trend_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
+        if current_candle.close <= trend_ema:
+            return SignalDecision(
+                signal=None,
+                reason="close_below_trend_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
+        return SignalDecision(
+            signal="long",
+            reason="dynamic_long",
+            candle_ts=current_candle.ts,
+            entry_reference=current_ema,
+            atr_value=current_atr,
+            ema_value=current_ema,
+            signal_candle_high=current_candle.high,
+            signal_candle_low=current_candle.low,
+        )
+
+    if config.signal_mode == "short_only":
+        if current_candle.close >= current_ema:
+            return SignalDecision(
+                signal=None,
+                reason="close_above_entry_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
+        if current_ema >= trend_ema:
+            return SignalDecision(
+                signal=None,
+                reason="fast_ema_above_trend_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
+        if current_candle.close >= trend_ema:
+            return SignalDecision(
+                signal=None,
+                reason="close_above_trend_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
+        return SignalDecision(
+            signal="short",
+            reason="dynamic_short",
+            candle_ts=current_candle.ts,
+            entry_reference=current_ema,
+            atr_value=current_atr,
+            ema_value=current_ema,
+            signal_candle_high=current_candle.high,
+            signal_candle_low=current_candle.low,
+        )
+
+    return SignalDecision(
+        signal=None,
+        reason="unsupported_signal_mode",
+        candle_ts=current_candle.ts,
+        entry_reference=None,
+        atr_value=current_atr,
+        ema_value=current_ema,
+        signal_candle_high=current_candle.high,
+        signal_candle_low=current_candle.low,
+    )
+
+
+def _try_fill_dynamic_order(
+    plan,
+    candle: Candle,
+    candle_index: int,
+    *,
+    entry_fee_rate: Decimal = Decimal("0"),
+    entry_fee_type: str = "none",
+) -> _OpenPosition | None:
     filled = candle.low <= plan.entry_reference <= candle.high
     if not filled:
         return None
@@ -402,6 +627,8 @@ def _try_fill_dynamic_order(plan, candle: Candle, candle_index: int) -> _OpenPos
         stop_loss=plan.stop_loss,
         take_profit=plan.take_profit,
         size=plan.size,
+        entry_fee_rate=entry_fee_rate,
+        entry_fee_type=entry_fee_type,
     )
 
 
@@ -456,11 +683,17 @@ def _build_closed_trade(
     *,
     exit_price: Decimal,
     exit_reason: str,
+    exit_fee_rate: Decimal = Decimal("0"),
+    exit_fee_type: str = "none",
 ) -> BacktestTrade:
     if position.signal == "long":
-        pnl = (exit_price - position.entry_price) * position.size
+        gross_pnl = (exit_price - position.entry_price) * position.size
     else:
-        pnl = (position.entry_price - exit_price) * position.size
+        gross_pnl = (position.entry_price - exit_price) * position.size
+    entry_fee = abs(position.entry_price * position.size) * position.entry_fee_rate
+    exit_fee = abs(exit_price * position.size) * exit_fee_rate
+    total_fee = entry_fee + exit_fee
+    pnl = gross_pnl - total_fee
     risk_value = abs(position.entry_price - position.stop_loss) * position.size
     r_multiple = Decimal("0") if risk_value == 0 else pnl / risk_value
     return BacktestTrade(
@@ -474,10 +707,16 @@ def _build_closed_trade(
         stop_loss=position.stop_loss,
         take_profit=position.take_profit,
         size=position.size,
+        gross_pnl=gross_pnl,
         pnl=pnl,
         risk_value=risk_value,
         r_multiple=r_multiple,
         exit_reason=exit_reason,
+        entry_fee=entry_fee,
+        exit_fee=exit_fee,
+        total_fee=total_fee,
+        entry_fee_type=position.entry_fee_type,
+        exit_fee_type=exit_fee_type,
     )
 
 
@@ -485,6 +724,9 @@ def _try_close_position_same_candle_after_fill(
     position: _OpenPosition,
     candle: Candle,
     candle_index: int,
+    *,
+    exit_fee_rate: Decimal = Decimal("0"),
+    exit_fee_type: str = "none",
 ) -> BacktestTrade | None:
     path_points = _same_candle_path_points(candle)
     if path_points is None:
@@ -513,6 +755,8 @@ def _try_close_position_same_candle_after_fill(
                     candle_index,
                     exit_price=exit_price,
                     exit_reason=exit_reason,
+                    exit_fee_rate=exit_fee_rate,
+                    exit_fee_type=exit_fee_type,
                 )
             entry_reached = True
         else:
@@ -530,6 +774,8 @@ def _try_close_position_same_candle_after_fill(
                     candle_index,
                     exit_price=exit_price,
                     exit_reason=exit_reason,
+                    exit_fee_rate=exit_fee_rate,
+                    exit_fee_type=exit_fee_type,
                 )
         segment_start = segment_end
     return None
@@ -541,6 +787,8 @@ def _try_close_position(
     candle_index: int,
     *,
     allow_same_candle: bool = False,
+    exit_fee_rate: Decimal = Decimal("0"),
+    exit_fee_type: str = "none",
 ) -> BacktestTrade | None:
     if candle_index < position.entry_index:
         return None
@@ -575,6 +823,8 @@ def _try_close_position(
         candle_index,
         exit_price=exit_price,
         exit_reason=exit_reason,
+        exit_fee_rate=exit_fee_rate,
+        exit_fee_type=exit_fee_type,
     )
 
 
@@ -599,6 +849,9 @@ def _build_report(trades: list[BacktestTrade]) -> BacktestReport:
             max_drawdown=Decimal("0"),
             take_profit_hits=0,
             stop_loss_hits=0,
+            maker_fees=Decimal("0"),
+            taker_fees=Decimal("0"),
+            total_fees=Decimal("0"),
         )
 
     wins = [trade for trade in trades if trade.pnl > 0]
@@ -607,6 +860,18 @@ def _build_report(trades: list[BacktestTrade]) -> BacktestReport:
     gross_profit = sum((trade.pnl for trade in wins), Decimal("0"))
     gross_loss = abs(sum((trade.pnl for trade in losses), Decimal("0")))
     total_pnl = sum((trade.pnl for trade in trades), Decimal("0"))
+    maker_fees = Decimal("0")
+    taker_fees = Decimal("0")
+    for trade in trades:
+        if trade.entry_fee_type == "maker":
+            maker_fees += trade.entry_fee
+        elif trade.entry_fee_type == "taker":
+            taker_fees += trade.entry_fee
+        if trade.exit_fee_type == "maker":
+            maker_fees += trade.exit_fee
+        elif trade.exit_fee_type == "taker":
+            taker_fees += trade.exit_fee
+    total_fees = maker_fees + taker_fees
     average_pnl = total_pnl / Decimal(total_trades)
     average_win = gross_profit / Decimal(len(wins)) if wins else Decimal("0")
     average_loss = gross_loss / Decimal(len(losses)) if losses else Decimal("0")
@@ -643,8 +908,15 @@ def _build_report(trades: list[BacktestTrade]) -> BacktestReport:
         max_drawdown=max_drawdown,
         take_profit_hits=sum(1 for trade in trades if trade.exit_reason == "take_profit"),
         stop_loss_hits=sum(1 for trade in trades if trade.exit_reason == "stop_loss"),
+        maker_fees=maker_fees,
+        taker_fees=taker_fees,
+        total_fees=total_fees,
     )
 
 
 def _backtest_trade_start_index(minimum_candles: int) -> int:
     return max(max(minimum_candles - 1, 0), BACKTEST_RESERVED_CANDLES)
+
+
+def _format_fee_rate_percent(rate: Decimal) -> str:
+    return f"{format_decimal_fixed(rate * Decimal('100'), 4)}%"
