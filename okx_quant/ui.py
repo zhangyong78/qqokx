@@ -844,6 +844,8 @@ class QuantApp:
         position_detail_frame.columnconfigure(0, weight=1)
         position_detail_frame.rowconfigure(0, weight=1)
         position_pane.add(position_detail_frame, weight=2)
+        self._main_positions_pane = position_pane
+        self._main_position_detail_frame = position_detail_frame
 
         self._position_detail_panel = Text(
             position_detail_frame,
@@ -861,6 +863,7 @@ class QuantApp:
         position_detail_scroll.grid(row=0, column=1, sticky="ns")
         self._position_detail_panel.configure(yscrollcommand=position_detail_scroll.set)
         self._set_readonly_text(self._position_detail_panel, self.position_detail_text.get())
+        self.toggle_main_position_detail()
 
         log_frame = ttk.LabelFrame(self.root, text="运行日志", padding=12)
         log_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
