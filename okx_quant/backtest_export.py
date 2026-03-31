@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 from okx_quant.backtest import BacktestResult, format_backtest_report
@@ -245,12 +246,20 @@ def _build_matrix_lines(results: list[tuple[StrategyConfig, BacktestResult]]) ->
 
 
 def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
-    risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
+    if config.backtest_sizing_mode == "risk_percent":
+        sizing_text = f"风险百分比{format_decimal(config.backtest_risk_percent or Decimal('0'))}%"
+    elif config.backtest_sizing_mode == "fixed_size":
+        sizing_text = f"固定数量{format_decimal(config.order_size)}"
+    else:
+        sizing_text = f"固定风险金{format_decimal(config.risk_amount or Decimal('0'))}"
     return (
         f"EMA{config.ema_period} / 趋势EMA{config.trend_ema_period} / ATR{config.atr_period} / "
         f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
-        f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 风险金{risk_text} / "
-        f"M费{_format_percent(result.maker_fee_rate)} / T费{_format_percent(result.taker_fee_rate)}"
+        f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
+        f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
+        f"{'复利' if config.backtest_compounding else '不复利'} / "
+        f"M费{_format_percent(result.maker_fee_rate)} / T费{_format_percent(result.taker_fee_rate)} / "
+        f"滑点{_format_percent(config.backtest_slippage_rate)} / 资金费{_format_percent(config.backtest_funding_rate)}"
     )
 
 

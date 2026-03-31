@@ -2,8 +2,17 @@ from decimal import Decimal
 from unittest import TestCase
 
 from okx_quant.models import Credentials
-from okx_quant.okx_client import OkxFillHistoryItem, OkxPositionHistoryItem, OkxRestClient
+from okx_quant.okx_client import (
+    OkxAccountAssetItem,
+    OkxAccountConfig,
+    OkxAccountOverview,
+    OkxFillHistoryItem,
+    OkxPositionHistoryItem,
+    OkxRestClient,
+)
 from okx_quant.ui import (
+    _build_account_asset_detail_text,
+    _build_account_config_detail_text,
     _build_fill_history_detail_text,
     _build_position_history_detail_text,
     _build_position_history_usdt_price_map,
@@ -17,6 +26,90 @@ from okx_quant.ui import (
 
 
 class OkxHistoryParsingTest(TestCase):
+    def test_get_account_overview_parses_summary_and_details(self) -> None:
+        client = OkxRestClient()
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            self.assertEqual(path, "/api/v5/account/balance")
+            return {
+                "data": [
+                    {
+                        "totalEq": "12500.5",
+                        "adjEq": "12000.1",
+                        "availEq": "8600.2",
+                        "upl": "-120.3",
+                        "imr": "3400",
+                        "mmr": "2100",
+                        "ordFroz": "88.6",
+                        "notionalUsd": "52000",
+                        "details": [
+                            {
+                                "ccy": "USDT",
+                                "eq": "5000",
+                                "eqUsd": "5000",
+                                "cashBal": "5200",
+                                "availBal": "4800",
+                                "availEq": "4700",
+                                "upl": "-5",
+                                "frozenBal": "20",
+                                "liab": "0",
+                            },
+                            {
+                                "ccy": "BTC",
+                                "eq": "0.12",
+                                "eqUsd": "9600",
+                                "cashBal": "0.15",
+                                "availBal": "0.1",
+                                "availEq": "0.09",
+                                "upl": "0.002",
+                                "disEq": "0.11",
+                                "crossLiab": "0.01",
+                                "interest": "0.0001",
+                            },
+                        ],
+                    }
+                ]
+            }
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        overview = client.get_account_overview(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            environment="live",
+        )
+
+        self.assertEqual(overview.total_equity, Decimal("12500.5"))
+        self.assertEqual(overview.details[0].ccy, "BTC")
+        self.assertEqual(overview.details[0].equity_usd, Decimal("9600"))
+        self.assertEqual(overview.details[1].ccy, "USDT")
+
+    def test_get_account_config_parses_key_fields(self) -> None:
+        client = OkxRestClient()
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            self.assertEqual(path, "/api/v5/account/config")
+            return {
+                "data": [
+                    {
+                        "acctLv": "4",
+                        "posMode": "net",
+                        "autoLoan": "true",
+                        "greeksType": "PA",
+                        "level": "Lv1",
+                    }
+                ]
+            }
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        config = client.get_account_config(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            environment="live",
+        )
+
+        self.assertEqual(config.account_level, "4")
+        self.assertEqual(config.position_mode, "net")
+        self.assertTrue(config.auto_loan)
+        self.assertEqual(config.greeks_type, "PA")
+
     def test_get_fills_history_merges_and_sorts_items(self) -> None:
         client = OkxRestClient()
 
@@ -442,3 +535,50 @@ class OkxHistoryParsingTest(TestCase):
         self.assertIn("盈亏合计 USDT +12.30 / BTC +0.001", summary)
         self.assertIn("已实现合计 USDT +8.50 / BTC +0.0005", summary)
         self.assertIn("折合USDT合计 +40", summary)
+
+    def test_build_account_config_detail_text_contains_translated_labels(self) -> None:
+        text = _build_account_config_detail_text(
+            OkxAccountConfig(account_level="4", position_mode="net", auto_loan=True, greeks_type="PA", level="Lv1", raw={}),
+            OkxAccountOverview(
+                total_equity=Decimal("10000"),
+                adjusted_equity=Decimal("9800"),
+                isolated_equity=None,
+                available_equity=Decimal("7600"),
+                unrealized_pnl=Decimal("50"),
+                initial_margin=Decimal("2000"),
+                maintenance_margin=Decimal("900"),
+                order_frozen=Decimal("88"),
+                notional_usd=Decimal("42000"),
+                details=(),
+                raw={},
+            ),
+            profile_name="主账户",
+            environment="live",
+        )
+
+        self.assertIn("账户模式：组合保证金", text)
+        self.assertIn("持仓模式：净持仓 net", text)
+        self.assertIn("Greeks类型：PA", text)
+
+    def test_build_account_asset_detail_text_contains_asset_fields(self) -> None:
+        text = _build_account_asset_detail_text(
+            OkxAccountAssetItem(
+                ccy="BTC",
+                equity=Decimal("0.12"),
+                equity_usd=Decimal("9600"),
+                cash_balance=Decimal("0.15"),
+                available_balance=Decimal("0.1"),
+                available_equity=Decimal("0.09"),
+                frozen_balance=Decimal("0.01"),
+                unrealized_pnl=Decimal("0.002"),
+                discount_equity=Decimal("0.11"),
+                liability=Decimal("0.003"),
+                cross_liability=Decimal("0.001"),
+                interest=Decimal("0.0001"),
+                raw={},
+            )
+        )
+
+        self.assertIn("币种：BTC", text)
+        self.assertIn("折合USD：9600.00", text)
+        self.assertIn("全仓负债：0.001", text)

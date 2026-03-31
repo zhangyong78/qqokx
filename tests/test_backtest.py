@@ -9,6 +9,9 @@ from okx_quant.backtest import (
     ATR_BATCH_TAKE_RATIOS,
     BACKTEST_RESERVED_CANDLES,
     _OpenPosition,
+    _build_drawdown_curves,
+    _build_equity_curve,
+    _build_period_stats,
     _load_backtest_candles,
     _backtest_trade_start_index,
     _format_backtest_timestamp,
@@ -45,7 +48,7 @@ from okx_quant.backtest_ui import (
     _BacktestSnapshot,
 )
 from okx_quant.indicators import ema
-from okx_quant.backtest import BacktestReport, BacktestResult
+from okx_quant.backtest import BacktestReport, BacktestResult, BacktestTrade
 from okx_quant.models import Candle, Instrument, StrategyConfig
 from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID
 
@@ -143,6 +146,8 @@ class BacktestTest(TestCase):
         self.assertGreater(result.report.total_pnl, Decimal("0"))
         self.assertEqual(result.ema_values, ema([candle.close for candle in candles], config.ema_period))
         self.assertEqual(result.trend_ema_values, ema([candle.close for candle in candles], config.trend_ema_period))
+        self.assertEqual(len(result.equity_curve), len(candles))
+        self.assertEqual(result.equity_curve[-1], result.report.total_pnl)
         self.assertEqual(result.trend_ema_period, config.trend_ema_period)
         self.assertIn(str(result.report.total_trades), format_backtest_report(result))
         self.assertIn("开始时间：", format_backtest_report(result))
@@ -957,16 +962,135 @@ class BacktestTest(TestCase):
             ),
             ema_value=Decimal("104.5"),
             trend_ema_value=Decimal("101.25"),
+            equity_value=Decimal("88.4321"),
+            drawdown_pct_value=Decimal("12.34"),
             ema_period="21",
             trend_ema_period="55",
             tick_size=Decimal("0.0001"),
         )
-        self.assertEqual(len(lines), 4)
+        self.assertEqual(len(lines), 6)
         self.assertTrue(lines[0].startswith("时间: "))
         self.assertIn("开/高/低/收:", lines[1])
         self.assertIn("202", lines[0])
         self.assertIn("EMA(21): 104.5000", lines[2])
         self.assertIn("趋势EMA(55): 101.2500", lines[3])
+        self.assertIn("净值曲线: 88.43", lines[4])
+        self.assertIn("当前回撤: 12.34%", lines[5])
+
+    def test_build_equity_curve_accumulates_trade_pnl_by_exit_candle(self) -> None:
+        candles = [
+            Candle(index, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True)
+            for index in range(5)
+        ]
+        trades = [
+            BacktestTrade(
+                signal="long",
+                entry_index=0,
+                exit_index=1,
+                entry_ts=1,
+                exit_ts=2,
+                entry_price=Decimal("100"),
+                exit_price=Decimal("102"),
+                stop_loss=Decimal("95"),
+                take_profit=Decimal("110"),
+                size=Decimal("1"),
+                gross_pnl=Decimal("2"),
+                pnl=Decimal("1.5"),
+                risk_value=Decimal("5"),
+                r_multiple=Decimal("0.3"),
+                exit_reason="take_profit",
+            ),
+            BacktestTrade(
+                signal="short",
+                entry_index=2,
+                exit_index=3,
+                entry_ts=3,
+                exit_ts=4,
+                entry_price=Decimal("100"),
+                exit_price=Decimal("104"),
+                stop_loss=Decimal("105"),
+                take_profit=Decimal("95"),
+                size=Decimal("1"),
+                gross_pnl=Decimal("-4"),
+                pnl=Decimal("-4.5"),
+                risk_value=Decimal("5"),
+                r_multiple=Decimal("-0.9"),
+                exit_reason="stop_loss",
+            ),
+        ]
+
+        self.assertEqual(
+            _build_equity_curve(candles, trades),
+            [
+                Decimal("0"),
+                Decimal("1.5"),
+                Decimal("1.5"),
+                Decimal("-3.0"),
+                Decimal("-3.0"),
+            ],
+        )
+
+    def test_build_drawdown_curves_tracks_peak_to_trough(self) -> None:
+        drawdown_curve, drawdown_pct_curve = _build_drawdown_curves(
+            [
+                Decimal("10000"),
+                Decimal("10100"),
+                Decimal("9950"),
+                Decimal("10200"),
+                Decimal("10000"),
+            ]
+        )
+
+        self.assertEqual(drawdown_curve, [Decimal("0"), Decimal("0"), Decimal("150"), Decimal("0"), Decimal("200")])
+        self.assertEqual(drawdown_pct_curve[0], Decimal("0"))
+        self.assertEqual(drawdown_pct_curve[2].quantize(Decimal("0.01")), Decimal("1.49"))
+        self.assertEqual(drawdown_pct_curve[4].quantize(Decimal("0.01")), Decimal("1.96"))
+
+    def test_build_period_stats_groups_monthly_results(self) -> None:
+        trades = [
+            BacktestTrade(
+                signal="long",
+                entry_index=0,
+                exit_index=1,
+                entry_ts=1735660800000,
+                exit_ts=1735840800000,
+                entry_price=Decimal("100"),
+                exit_price=Decimal("102"),
+                stop_loss=Decimal("95"),
+                take_profit=Decimal("110"),
+                size=Decimal("1"),
+                gross_pnl=Decimal("2"),
+                pnl=Decimal("100"),
+                risk_value=Decimal("5"),
+                r_multiple=Decimal("1"),
+                exit_reason="take_profit",
+            ),
+            BacktestTrade(
+                signal="short",
+                entry_index=2,
+                exit_index=3,
+                entry_ts=1738368000000,
+                exit_ts=1738454400000,
+                entry_price=Decimal("100"),
+                exit_price=Decimal("101"),
+                stop_loss=Decimal("105"),
+                take_profit=Decimal("95"),
+                size=Decimal("1"),
+                gross_pnl=Decimal("-1"),
+                pnl=Decimal("-50"),
+                risk_value=Decimal("5"),
+                r_multiple=Decimal("-0.5"),
+                exit_reason="stop_loss",
+            ),
+        ]
+
+        monthly_stats = _build_period_stats(trades, initial_capital=Decimal("10000"), by="month")
+
+        self.assertEqual([item.period_label for item in monthly_stats], ["2025-01", "2025-02"])
+        self.assertEqual(monthly_stats[0].trades, 1)
+        self.assertEqual(monthly_stats[0].end_equity, Decimal("10100"))
+        self.assertEqual(monthly_stats[1].start_equity, Decimal("10100"))
+        self.assertEqual(monthly_stats[1].end_equity, Decimal("10050"))
 
     def test_format_price_by_tick_size_uses_tick_decimals(self) -> None:
         self.assertEqual(_decimal_places_for_tick_size(Decimal("0.1")), 1)

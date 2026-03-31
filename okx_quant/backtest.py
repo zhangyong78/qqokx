@@ -8,7 +8,7 @@ from okx_quant.engine import build_order_plan
 from okx_quant.indicators import atr, ema
 from okx_quant.models import Candle, Instrument, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxRestClient
-from okx_quant.pricing import format_decimal, format_decimal_fixed
+from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID
@@ -50,6 +50,8 @@ class BacktestTrade:
     total_fee: Decimal = Decimal("0")
     entry_fee_type: str = "none"
     exit_fee_type: str = "none"
+    slippage_cost: Decimal = Decimal("0")
+    funding_cost: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -69,11 +71,29 @@ class BacktestReport:
     profit_loss_ratio: Decimal | None
     average_r_multiple: Decimal
     max_drawdown: Decimal
-    take_profit_hits: int
-    stop_loss_hits: int
+    max_drawdown_pct: Decimal = Decimal("0")
+    take_profit_hits: int = 0
+    stop_loss_hits: int = 0
+    ending_equity: Decimal = Decimal("0")
+    total_return_pct: Decimal = Decimal("0")
     maker_fees: Decimal = Decimal("0")
     taker_fees: Decimal = Decimal("0")
     total_fees: Decimal = Decimal("0")
+    slippage_costs: Decimal = Decimal("0")
+    funding_costs: Decimal = Decimal("0")
+
+
+@dataclass(frozen=True)
+class BacktestPeriodStat:
+    period_label: str
+    trades: int
+    win_rate: Decimal
+    total_pnl: Decimal
+    return_pct: Decimal
+    start_equity: Decimal
+    end_equity: Decimal
+    max_drawdown: Decimal
+    max_drawdown_pct: Decimal
 
 
 @dataclass(frozen=True)
@@ -84,12 +104,23 @@ class BacktestResult:
     instrument: Instrument
     ema_values: list[Decimal] = field(default_factory=list)
     trend_ema_values: list[Decimal] = field(default_factory=list)
+    equity_curve: list[Decimal] = field(default_factory=list)
+    net_value_curve: list[Decimal] = field(default_factory=list)
+    drawdown_curve: list[Decimal] = field(default_factory=list)
+    drawdown_pct_curve: list[Decimal] = field(default_factory=list)
+    monthly_stats: list[BacktestPeriodStat] = field(default_factory=list)
+    yearly_stats: list[BacktestPeriodStat] = field(default_factory=list)
+    initial_capital: Decimal = Decimal("10000")
     ema_period: int = 21
     trend_ema_period: int = 55
     strategy_id: str = STRATEGY_DYNAMIC_ID
     data_source_note: str = ""
     maker_fee_rate: Decimal = Decimal("0")
     taker_fee_rate: Decimal = Decimal("0")
+    slippage_rate: Decimal = Decimal("0")
+    funding_rate: Decimal = Decimal("0")
+    sizing_mode: str = "fixed_risk"
+    compounding: bool = False
 
 
 @dataclass
@@ -98,11 +129,16 @@ class _OpenPosition:
     entry_index: int
     entry_ts: int
     entry_price: Decimal
-    stop_loss: Decimal
-    take_profit: Decimal
-    size: Decimal
+    entry_price_raw: Decimal = Decimal("0")
+    stop_loss: Decimal = Decimal("0")
+    take_profit: Decimal = Decimal("0")
+    size: Decimal = Decimal("0")
+    tick_size: Decimal = Decimal("0.1")
     entry_fee_rate: Decimal = Decimal("0")
     entry_fee_type: str = "none"
+    entry_slippage_cost: Decimal = Decimal("0")
+    slippage_rate: Decimal = Decimal("0")
+    funding_rate: Decimal = Decimal("0")
 
 
 def run_backtest(
@@ -213,20 +249,36 @@ def _run_backtest_with_loaded_data(
         raise RuntimeError(f"暂不支持的回测策略：{config.strategy_id}")
     ema_values = ema([candle.close for candle in candles], config.ema_period) if candles else []
     trend_ema_values = ema([candle.close for candle in candles], config.trend_ema_period) if candles else []
+    initial_capital = config.backtest_initial_capital
+    equity_curve = _build_equity_curve(candles, trades)
+    net_value_curve = [initial_capital + value for value in equity_curve]
+    drawdown_curve, drawdown_pct_curve = _build_drawdown_curves(net_value_curve)
+    report = _build_report(trades, initial_capital=initial_capital)
 
     return BacktestResult(
         candles=candles,
         trades=trades,
-        report=_build_report(trades),
+        report=report,
         instrument=instrument,
         ema_values=ema_values,
         trend_ema_values=trend_ema_values,
+        equity_curve=equity_curve,
+        net_value_curve=net_value_curve,
+        drawdown_curve=drawdown_curve,
+        drawdown_pct_curve=drawdown_pct_curve,
+        monthly_stats=_build_period_stats(trades, initial_capital=initial_capital, by="month"),
+        yearly_stats=_build_period_stats(trades, initial_capital=initial_capital, by="year"),
+        initial_capital=initial_capital,
         ema_period=config.ema_period,
         trend_ema_period=config.trend_ema_period,
         strategy_id=config.strategy_id,
         data_source_note=data_source_note,
         maker_fee_rate=maker_fee_rate,
         taker_fee_rate=taker_fee_rate,
+        slippage_rate=config.backtest_slippage_rate,
+        funding_rate=config.backtest_funding_rate,
+        sizing_mode=config.backtest_sizing_mode,
+        compounding=config.backtest_compounding,
     )
 
 
@@ -239,17 +291,27 @@ def format_backtest_report(result: BacktestResult) -> str:
         f"开始时间：{start_time}",
         f"结束时间：{end_time}",
         f"预热K线：前 {min(BACKTEST_RESERVED_CANDLES, len(result.candles))} 根仅用于指标预热与绘图，不参与回测",
+        f"初始资金：{format_decimal_fixed(result.initial_capital, 2)}",
+        f"结束权益：{format_decimal_fixed(report.ending_equity, 2)}",
+        f"总收益率：{format_decimal_fixed(report.total_return_pct, 2)}%",
+        f"仓位模式：{_format_backtest_sizing_mode(result.sizing_mode)}",
+        f"复利模式：{'开启' if result.compounding else '关闭'}",
         f"Maker手续费：{_format_fee_rate_percent(result.maker_fee_rate)}",
         f"Taker手续费：{_format_fee_rate_percent(result.taker_fee_rate)}",
+        f"滑点：{_format_fee_rate_percent(result.slippage_rate)}",
+        f"资金费率/8h：{_format_fee_rate_percent(result.funding_rate)}",
         f"交易次数：{report.total_trades}",
         f"胜率：{format_decimal_fixed(report.win_rate, 2)}%",
         f"总盈亏：{format_decimal(report.total_pnl)}",
         f"平均每笔：{format_decimal_fixed(report.average_pnl, 4)}",
         f"平均R倍数：{format_decimal_fixed(report.average_r_multiple, 4)}",
         f"最大回撤：{format_decimal_fixed(report.max_drawdown, 4)}",
+        f"最大回撤比例：{format_decimal_fixed(report.max_drawdown_pct, 2)}%",
         f"手续费合计：{format_decimal_fixed(report.total_fees, 4)}",
         f"Maker手续费合计：{format_decimal_fixed(report.maker_fees, 4)}",
         f"Taker手续费合计：{format_decimal_fixed(report.taker_fees, 4)}",
+        f"滑点成本合计：{format_decimal_fixed(report.slippage_costs, 4)}",
+        f"资金费合计：{format_decimal_fixed(report.funding_costs, 4)}",
         f"止盈触发次数：{report.take_profit_hits}",
         f"止损触发次数：{report.stop_loss_hits}",
     ]
@@ -364,10 +426,11 @@ def _run_cross_backtest(
         if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
             continue
 
+        resolved_config = _resolve_backtest_config(config, trades)
         plan = build_order_plan(
             instrument=instrument,
-            config=config,
-            order_size=config.order_size,
+            config=resolved_config,
+            order_size=resolved_config.order_size,
             signal=decision.signal,
             entry_reference=decision.entry_reference,
             atr_value=decision.atr_value,
@@ -375,16 +438,19 @@ def _run_cross_backtest(
             signal_candle_high=decision.signal_candle_high,
             signal_candle_low=decision.signal_candle_low,
         )
-        open_position = _OpenPosition(
+        open_position = _create_open_position(
+            instrument=instrument,
             signal=plan.signal,
             entry_index=index,
             entry_ts=plan.candle_ts,
-            entry_price=plan.entry_reference,
+            entry_price_raw=plan.entry_reference,
             stop_loss=plan.stop_loss,
             take_profit=plan.take_profit,
             size=plan.size,
             entry_fee_rate=taker_fee_rate,
             entry_fee_type="taker",
+            slippage_rate=config.backtest_slippage_rate,
+            funding_rate=config.backtest_funding_rate,
         )
 
     return trades
@@ -430,11 +496,14 @@ def _run_dynamic_backtest(
 
         if active_plan is not None and open_position is None:
             filled_position = _try_fill_dynamic_order(
+                instrument,
                 active_plan,
                 candle,
                 index,
                 entry_fee_rate=maker_fee_rate,
                 entry_fee_type="maker",
+                slippage_rate=config.backtest_slippage_rate,
+                funding_rate=config.backtest_funding_rate,
             )
             active_plan = None
             if filled_position is not None:
@@ -466,10 +535,11 @@ def _run_dynamic_backtest(
         if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
             continue
 
+        resolved_config = _resolve_backtest_config(config, trades)
         active_plan = build_order_plan(
             instrument=instrument,
-            config=config,
-            order_size=None,
+            config=resolved_config,
+            order_size=resolved_config.order_size,
             signal=decision.signal,
             entry_reference=decision.entry_reference,
             atr_value=decision.atr_value,
@@ -607,28 +677,121 @@ def _evaluate_dynamic_signal_precomputed(
     )
 
 
+def _realized_pnl(trades: list[BacktestTrade]) -> Decimal:
+    return sum((trade.pnl for trade in trades), Decimal("0"))
+
+
+def _base_equity_for_sizing(config: StrategyConfig, trades: list[BacktestTrade]) -> Decimal:
+    if config.backtest_compounding:
+        return config.backtest_initial_capital + _realized_pnl(trades)
+    return config.backtest_initial_capital
+
+
+def _resolve_backtest_config(config: StrategyConfig, trades: list[BacktestTrade]) -> StrategyConfig:
+    if config.backtest_sizing_mode == "fixed_size":
+        return replace(config, risk_amount=None)
+
+    if config.backtest_sizing_mode == "risk_percent":
+        if config.backtest_risk_percent is None or config.backtest_risk_percent <= 0:
+            raise RuntimeError("风险百分比模式下，风险百分比必须大于 0")
+        base_equity = _base_equity_for_sizing(config, trades)
+        if base_equity <= 0:
+            raise RuntimeError("当前权益小于等于 0，无法继续按风险百分比回测")
+        risk_amount = base_equity * config.backtest_risk_percent / Decimal("100")
+        return replace(config, risk_amount=risk_amount, order_size=Decimal("0"))
+
+    if config.risk_amount is None or config.risk_amount <= 0:
+        raise RuntimeError("固定风险模式下，风险金必须大于 0")
+    return replace(config, risk_amount=config.risk_amount, order_size=Decimal("0"))
+
+
+def _apply_slippage_price(
+    price: Decimal,
+    *,
+    signal: str,
+    tick_size: Decimal,
+    slippage_rate: Decimal,
+    is_entry: bool,
+) -> Decimal:
+    if slippage_rate <= 0:
+        return price
+    if signal == "long":
+        raw_price = price * (Decimal("1") + slippage_rate) if is_entry else price * (Decimal("1") - slippage_rate)
+        direction = "up" if is_entry else "down"
+    else:
+        raw_price = price * (Decimal("1") - slippage_rate) if is_entry else price * (Decimal("1") + slippage_rate)
+        direction = "down" if is_entry else "up"
+    return snap_to_increment(raw_price, tick_size, direction)
+
+
+def _create_open_position(
+    *,
+    instrument: Instrument,
+    signal: str,
+    entry_index: int,
+    entry_ts: int,
+    entry_price_raw: Decimal,
+    stop_loss: Decimal,
+    take_profit: Decimal,
+    size: Decimal,
+    entry_fee_rate: Decimal,
+    entry_fee_type: str,
+    slippage_rate: Decimal,
+    funding_rate: Decimal,
+) -> _OpenPosition:
+    entry_price = _apply_slippage_price(
+        entry_price_raw,
+        signal=signal,
+        tick_size=instrument.tick_size,
+        slippage_rate=slippage_rate,
+        is_entry=True,
+    )
+    return _OpenPosition(
+        signal=signal,
+        entry_index=entry_index,
+        entry_ts=entry_ts,
+        entry_price=entry_price,
+        entry_price_raw=entry_price_raw,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        size=size,
+        tick_size=instrument.tick_size,
+        entry_fee_rate=entry_fee_rate,
+        entry_fee_type=entry_fee_type,
+        entry_slippage_cost=abs(entry_price - entry_price_raw) * abs(size),
+        slippage_rate=slippage_rate,
+        funding_rate=funding_rate if instrument.inst_type == "SWAP" else Decimal("0"),
+    )
+
+
 def _try_fill_dynamic_order(
+    instrument: Instrument,
     plan,
     candle: Candle,
     candle_index: int,
     *,
     entry_fee_rate: Decimal = Decimal("0"),
     entry_fee_type: str = "none",
+    slippage_rate: Decimal = Decimal("0"),
+    funding_rate: Decimal = Decimal("0"),
 ) -> _OpenPosition | None:
     filled = candle.low <= plan.entry_reference <= candle.high
     if not filled:
         return None
 
-    return _OpenPosition(
+    return _create_open_position(
+        instrument=instrument,
         signal=plan.signal,
         entry_index=candle_index,
         entry_ts=candle.ts,
-        entry_price=plan.entry_reference,
+        entry_price_raw=plan.entry_reference,
         stop_loss=plan.stop_loss,
         take_profit=plan.take_profit,
         size=plan.size,
         entry_fee_rate=entry_fee_rate,
         entry_fee_type=entry_fee_type,
+        slippage_rate=slippage_rate,
+        funding_rate=funding_rate,
     )
 
 
@@ -681,6 +844,7 @@ def _build_closed_trade(
     candle: Candle,
     candle_index: int,
     *,
+    exit_price_raw: Decimal,
     exit_price: Decimal,
     exit_reason: str,
     exit_fee_rate: Decimal = Decimal("0"),
@@ -693,9 +857,12 @@ def _build_closed_trade(
     entry_fee = abs(position.entry_price * position.size) * position.entry_fee_rate
     exit_fee = abs(exit_price * position.size) * exit_fee_rate
     total_fee = entry_fee + exit_fee
-    pnl = gross_pnl - total_fee
+    funding_periods = Decimal(str(max(candle.ts - position.entry_ts, 0))) / Decimal("28800000")
+    funding_cost = abs(position.entry_price * position.size) * position.funding_rate * funding_periods
+    pnl = gross_pnl - total_fee - funding_cost
     risk_value = abs(position.entry_price - position.stop_loss) * position.size
     r_multiple = Decimal("0") if risk_value == 0 else pnl / risk_value
+    slippage_cost = position.entry_slippage_cost + (abs(exit_price - exit_price_raw) * abs(position.size))
     return BacktestTrade(
         signal=position.signal,
         entry_index=position.entry_index,
@@ -717,6 +884,8 @@ def _build_closed_trade(
         total_fee=total_fee,
         entry_fee_type=position.entry_fee_type,
         exit_fee_type=exit_fee_type,
+        slippage_cost=slippage_cost,
+        funding_cost=funding_cost,
     )
 
 
@@ -748,11 +917,19 @@ def _try_close_position_same_candle_after_fill(
                 take_profit=position.take_profit,
             )
             if touched_exit is not None:
-                exit_price, exit_reason = touched_exit
+                exit_price_raw, exit_reason = touched_exit
+                exit_price = _apply_slippage_price(
+                    exit_price_raw,
+                    signal=position.signal,
+                    tick_size=position.tick_size,
+                    slippage_rate=position.slippage_rate,
+                    is_entry=False,
+                )
                 return _build_closed_trade(
                     position,
                     candle,
                     candle_index,
+                    exit_price_raw=exit_price_raw,
                     exit_price=exit_price,
                     exit_reason=exit_reason,
                     exit_fee_rate=exit_fee_rate,
@@ -767,11 +944,19 @@ def _try_close_position_same_candle_after_fill(
                 take_profit=position.take_profit,
             )
             if touched_exit is not None:
-                exit_price, exit_reason = touched_exit
+                exit_price_raw, exit_reason = touched_exit
+                exit_price = _apply_slippage_price(
+                    exit_price_raw,
+                    signal=position.signal,
+                    tick_size=position.tick_size,
+                    slippage_rate=position.slippage_rate,
+                    is_entry=False,
+                )
                 return _build_closed_trade(
                     position,
                     candle,
                     candle_index,
+                    exit_price_raw=exit_price_raw,
                     exit_price=exit_price,
                     exit_reason=exit_reason,
                     exit_fee_rate=exit_fee_rate,
@@ -799,10 +984,10 @@ def _try_close_position(
         stop_hit = candle.low <= position.stop_loss
         take_hit = candle.high >= position.take_profit
         if stop_hit:
-            exit_price = position.stop_loss
+            exit_price_raw = position.stop_loss
             exit_reason = "stop_loss"
         elif take_hit:
-            exit_price = position.take_profit
+            exit_price_raw = position.take_profit
             exit_reason = "take_profit"
         else:
             return None
@@ -810,17 +995,25 @@ def _try_close_position(
         stop_hit = candle.high >= position.stop_loss
         take_hit = candle.low <= position.take_profit
         if stop_hit:
-            exit_price = position.stop_loss
+            exit_price_raw = position.stop_loss
             exit_reason = "stop_loss"
         elif take_hit:
-            exit_price = position.take_profit
+            exit_price_raw = position.take_profit
             exit_reason = "take_profit"
         else:
             return None
+    exit_price = _apply_slippage_price(
+        exit_price_raw,
+        signal=position.signal,
+        tick_size=position.tick_size,
+        slippage_rate=position.slippage_rate,
+        is_entry=False,
+    )
     return _build_closed_trade(
         position,
         candle,
         candle_index,
+        exit_price_raw=exit_price_raw,
         exit_price=exit_price,
         exit_reason=exit_reason,
         exit_fee_rate=exit_fee_rate,
@@ -828,7 +1021,99 @@ def _try_close_position(
     )
 
 
-def _build_report(trades: list[BacktestTrade]) -> BacktestReport:
+def _build_equity_curve(candles: list[Candle], trades: list[BacktestTrade]) -> list[Decimal]:
+    if not candles:
+        return []
+    changes = [Decimal("0") for _ in candles]
+    last_index = len(candles) - 1
+    for trade in trades:
+        exit_index = max(0, min(trade.exit_index, last_index))
+        changes[exit_index] += trade.pnl
+    equity_curve: list[Decimal] = []
+    running_total = Decimal("0")
+    for change in changes:
+        running_total += change
+        equity_curve.append(running_total)
+    return equity_curve
+
+
+def _build_drawdown_curves(net_value_curve: list[Decimal]) -> tuple[list[Decimal], list[Decimal]]:
+    drawdown_curve: list[Decimal] = []
+    drawdown_pct_curve: list[Decimal] = []
+    if not net_value_curve:
+        return drawdown_curve, drawdown_pct_curve
+    peak = net_value_curve[0]
+    for value in net_value_curve:
+        if value > peak:
+            peak = value
+        drawdown = peak - value
+        drawdown_curve.append(drawdown)
+        if peak > 0:
+            drawdown_pct_curve.append((drawdown / peak) * Decimal("100"))
+        else:
+            drawdown_pct_curve.append(Decimal("0"))
+    return drawdown_curve, drawdown_pct_curve
+
+
+def _build_period_stats(
+    trades: list[BacktestTrade],
+    *,
+    initial_capital: Decimal,
+    by: str,
+) -> list[BacktestPeriodStat]:
+    if by not in {"month", "year"}:
+        raise ValueError("Unsupported period grouping")
+    if not trades:
+        return []
+
+    sorted_trades = sorted(trades, key=lambda trade: trade.exit_ts)
+    groups: dict[str, list[BacktestTrade]] = {}
+    for trade in sorted_trades:
+        dt = datetime.fromtimestamp(trade.exit_ts / 1000 if trade.exit_ts >= 10**12 else trade.exit_ts)
+        key = dt.strftime("%Y-%m") if by == "month" else dt.strftime("%Y")
+        groups.setdefault(key, []).append(trade)
+
+    stats: list[BacktestPeriodStat] = []
+    realized_before_period = Decimal("0")
+    for period_label in sorted(groups):
+        period_trades = groups[period_label]
+        start_equity = initial_capital + realized_before_period
+        period_equity = start_equity
+        peak = start_equity
+        max_drawdown = Decimal("0")
+        wins = 0
+        total_pnl = Decimal("0")
+        for trade in period_trades:
+            total_pnl += trade.pnl
+            period_equity += trade.pnl
+            if trade.pnl > 0:
+                wins += 1
+            if period_equity > peak:
+                peak = period_equity
+            drawdown = peak - period_equity
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+        end_equity = start_equity + total_pnl
+        return_pct = Decimal("0") if start_equity <= 0 else (total_pnl / start_equity) * Decimal("100")
+        max_drawdown_pct = Decimal("0") if peak <= 0 else (max_drawdown / peak) * Decimal("100")
+        stats.append(
+            BacktestPeriodStat(
+                period_label=period_label,
+                trades=len(period_trades),
+                win_rate=(Decimal(wins) / Decimal(len(period_trades))) * Decimal("100"),
+                total_pnl=total_pnl,
+                return_pct=return_pct,
+                start_equity=start_equity,
+                end_equity=end_equity,
+                max_drawdown=max_drawdown,
+                max_drawdown_pct=max_drawdown_pct,
+            )
+        )
+        realized_before_period += total_pnl
+    return stats
+
+
+def _build_report(trades: list[BacktestTrade], *, initial_capital: Decimal) -> BacktestReport:
     total_trades = len(trades)
     if total_trades == 0:
         return BacktestReport(
@@ -847,11 +1132,16 @@ def _build_report(trades: list[BacktestTrade]) -> BacktestReport:
             profit_loss_ratio=None,
             average_r_multiple=Decimal("0"),
             max_drawdown=Decimal("0"),
+            max_drawdown_pct=Decimal("0"),
             take_profit_hits=0,
             stop_loss_hits=0,
+            ending_equity=initial_capital,
+            total_return_pct=Decimal("0"),
             maker_fees=Decimal("0"),
             taker_fees=Decimal("0"),
             total_fees=Decimal("0"),
+            slippage_costs=Decimal("0"),
+            funding_costs=Decimal("0"),
         )
 
     wins = [trade for trade in trades if trade.pnl > 0]
@@ -860,6 +1150,8 @@ def _build_report(trades: list[BacktestTrade]) -> BacktestReport:
     gross_profit = sum((trade.pnl for trade in wins), Decimal("0"))
     gross_loss = abs(sum((trade.pnl for trade in losses), Decimal("0")))
     total_pnl = sum((trade.pnl for trade in trades), Decimal("0"))
+    slippage_costs = sum((trade.slippage_cost for trade in trades), Decimal("0"))
+    funding_costs = sum((trade.funding_cost for trade in trades), Decimal("0"))
     maker_fees = Decimal("0")
     taker_fees = Decimal("0")
     for trade in trades:
@@ -879,8 +1171,8 @@ def _build_report(trades: list[BacktestTrade]) -> BacktestReport:
     profit_loss_ratio = None if average_loss == 0 else average_win / average_loss
     average_r_multiple = sum((trade.r_multiple for trade in trades), Decimal("0")) / Decimal(total_trades)
 
-    equity = Decimal("0")
-    peak = Decimal("0")
+    equity = initial_capital
+    peak = initial_capital
     max_drawdown = Decimal("0")
     for trade in trades:
         equity += trade.pnl
@@ -889,6 +1181,9 @@ def _build_report(trades: list[BacktestTrade]) -> BacktestReport:
         drawdown = peak - equity
         if drawdown > max_drawdown:
             max_drawdown = drawdown
+    max_drawdown_pct = Decimal("0") if peak <= 0 else (max_drawdown / peak) * Decimal("100")
+    ending_equity = initial_capital + total_pnl
+    total_return_pct = Decimal("0") if initial_capital <= 0 else (total_pnl / initial_capital) * Decimal("100")
 
     return BacktestReport(
         total_trades=total_trades,
@@ -906,11 +1201,16 @@ def _build_report(trades: list[BacktestTrade]) -> BacktestReport:
         profit_loss_ratio=profit_loss_ratio,
         average_r_multiple=average_r_multiple,
         max_drawdown=max_drawdown,
+        max_drawdown_pct=max_drawdown_pct,
         take_profit_hits=sum(1 for trade in trades if trade.exit_reason == "take_profit"),
         stop_loss_hits=sum(1 for trade in trades if trade.exit_reason == "stop_loss"),
+        ending_equity=ending_equity,
+        total_return_pct=total_return_pct,
         maker_fees=maker_fees,
         taker_fees=taker_fees,
         total_fees=total_fees,
+        slippage_costs=slippage_costs,
+        funding_costs=funding_costs,
     )
 
 
@@ -920,3 +1220,13 @@ def _backtest_trade_start_index(minimum_candles: int) -> int:
 
 def _format_fee_rate_percent(rate: Decimal) -> str:
     return f"{format_decimal_fixed(rate * Decimal('100'), 4)}%"
+
+
+def _format_backtest_sizing_mode(value: str) -> str:
+    if value == "fixed_risk":
+        return "固定风险金"
+    if value == "fixed_size":
+        return "固定数量"
+    if value == "risk_percent":
+        return "风险百分比"
+    return value

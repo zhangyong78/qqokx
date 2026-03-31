@@ -138,6 +138,48 @@ class OkxPositionHistoryItem:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class OkxAccountAssetItem:
+    ccy: str
+    equity: Decimal | None
+    equity_usd: Decimal | None
+    cash_balance: Decimal | None
+    available_balance: Decimal | None
+    available_equity: Decimal | None
+    frozen_balance: Decimal | None
+    unrealized_pnl: Decimal | None
+    discount_equity: Decimal | None
+    liability: Decimal | None
+    cross_liability: Decimal | None
+    interest: Decimal | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxAccountOverview:
+    total_equity: Decimal | None
+    adjusted_equity: Decimal | None
+    isolated_equity: Decimal | None
+    available_equity: Decimal | None
+    unrealized_pnl: Decimal | None
+    initial_margin: Decimal | None
+    maintenance_margin: Decimal | None
+    order_frozen: Decimal | None
+    notional_usd: Decimal | None
+    details: tuple[OkxAccountAssetItem, ...]
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxAccountConfig:
+    account_level: str | None
+    position_mode: str | None
+    auto_loan: bool | None
+    greeks_type: str | None
+    level: str | None
+    raw: dict[str, Any]
+
+
 class OkxRestClient:
     base_url = "https://www.okx.com"
 
@@ -420,6 +462,83 @@ class OkxRestClient:
         positions.sort(key=lambda item: (item.inst_type, item.inst_id, item.pos_side))
         return positions
 
+    def get_account_overview(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> OkxAccountOverview:
+        payload = self._request(
+            "GET",
+            "/api/v5/account/balance",
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        first = (payload.get("data") or [{}])[0]
+        details: list[OkxAccountAssetItem] = []
+        for item in first.get("details", []):
+            details.append(
+                OkxAccountAssetItem(
+                    ccy=item.get("ccy", ""),
+                    equity=_first_decimal(item.get("eq"), item.get("cashBal")),
+                    equity_usd=_to_decimal(item.get("eqUsd")),
+                    cash_balance=_to_decimal(item.get("cashBal")),
+                    available_balance=_to_decimal(item.get("availBal")),
+                    available_equity=_to_decimal(item.get("availEq")),
+                    frozen_balance=_first_decimal(item.get("frozenBal"), item.get("ordFrozen"), item.get("fixedBal")),
+                    unrealized_pnl=_to_decimal(item.get("upl")),
+                    discount_equity=_to_decimal(item.get("disEq")),
+                    liability=_first_decimal(item.get("liab"), item.get("uplLiab")),
+                    cross_liability=_to_decimal(item.get("crossLiab")),
+                    interest=_to_decimal(item.get("interest")),
+                    raw=item,
+                )
+            )
+        details.sort(key=lambda asset: (asset.equity_usd or Decimal("0"), asset.equity or Decimal("0")), reverse=True)
+        return OkxAccountOverview(
+            total_equity=_to_decimal(first.get("totalEq")),
+            adjusted_equity=_to_decimal(first.get("adjEq")),
+            isolated_equity=_to_decimal(first.get("isoEq")),
+            available_equity=_to_decimal(first.get("availEq")),
+            unrealized_pnl=_to_decimal(first.get("upl")),
+            initial_margin=_to_decimal(first.get("imr")),
+            maintenance_margin=_to_decimal(first.get("mmr")),
+            order_frozen=_first_decimal(first.get("ordFroz"), first.get("frozenBal")),
+            notional_usd=_to_decimal(first.get("notionalUsd")),
+            details=tuple(details),
+            raw=first,
+        )
+
+    def get_account_config(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> OkxAccountConfig:
+        payload = self._request(
+            "GET",
+            "/api/v5/account/config",
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        first = (payload.get("data") or [{}])[0]
+        auto_loan_raw = first.get("autoLoan")
+        auto_loan: bool | None
+        if auto_loan_raw in {None, ""}:
+            auto_loan = None
+        else:
+            auto_loan = str(auto_loan_raw).strip().lower() in {"true", "on", "1"}
+        return OkxAccountConfig(
+            account_level=first.get("acctLv"),
+            position_mode=first.get("posMode"),
+            auto_loan=auto_loan,
+            greeks_type=first.get("greeksType"),
+            level=first.get("level"),
+            raw=first,
+        )
+
     def get_fills_history(
         self,
         credentials: Credentials,
@@ -593,6 +712,7 @@ class OkxRestClient:
         ord_type: str,
         pos_side: str | None = None,
         price: Decimal | None = None,
+        cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
         order: dict[str, Any] = {
             "instId": inst_id,
@@ -605,6 +725,8 @@ class OkxRestClient:
             order["posSide"] = pos_side
         if price is not None:
             order["px"] = format_decimal(price)
+        if cl_ord_id:
+            order["clOrdId"] = cl_ord_id
 
         payload = self._request(
             "POST",
@@ -656,22 +778,31 @@ class OkxRestClient:
         config: StrategyConfig,
         *,
         inst_id: str,
-        ord_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
     ) -> OkxOrderStatus:
+        if not ord_id and not cl_ord_id:
+            raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个。")
+        params = {"instId": inst_id}
+        if ord_id:
+            params["ordId"] = ord_id
+        if cl_ord_id:
+            params["clOrdId"] = cl_ord_id
         payload = self._request(
             "GET",
             "/api/v5/trade/order",
-            params={"instId": inst_id, "ordId": ord_id},
+            params=params,
             auth=True,
             credentials=credentials,
             simulated=config.environment == "demo",
         )
         if not payload["data"]:
-            raise OkxApiError(f"OKX 未返回订单状态：{ord_id}")
+            order_key = ord_id or cl_ord_id or ""
+            raise OkxApiError(f"OKX 未返回订单状态：{order_key}")
 
         first = payload["data"][0]
         return OkxOrderStatus(
-            ord_id=first.get("ordId", ord_id),
+            ord_id=first.get("ordId", ord_id or ""),
             state=first.get("state", ""),
             side=first.get("side"),
             ord_type=first.get("ordType"),

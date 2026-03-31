@@ -17,6 +17,7 @@ from okx_quant.position_protection import (
     uses_underlying_price_trigger,
 )
 from okx_quant.pricing import format_decimal, format_decimal_fixed
+from okx_quant.window_layout import apply_adaptive_window_geometry
 
 
 BAR_OPTIONS = ["1m", "3m", "5m", "15m", "1H", "4H"]
@@ -44,8 +45,15 @@ class ProtectionReplayWindow:
         self.initial_state = initial_state or ProtectionReplayLaunchState()
         self.window = Toplevel(parent)
         self.window.title("期权持仓保护回放模拟")
-        self.window.geometry("1220x860")
-        self.window.minsize(1080, 760)
+        apply_adaptive_window_geometry(
+            self.window,
+            width_ratio=0.78,
+            height_ratio=0.8,
+            min_width=1080,
+            min_height=760,
+            max_width=1540,
+            max_height=1060,
+        )
 
         self.bar = StringVar(value=self.initial_state.bar)
         self.candle_limit = StringVar(value=self.initial_state.candle_limit)

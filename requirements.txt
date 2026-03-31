@@ -1,0 +1,4 @@
+# 当前项目运行时不依赖第三方 Python 包。
+# 需要 Python 3.11+。
+# 如果远程环境是 Linux 且需要运行桌面界面，请额外安装系统级 Tk：
+# Debian/Ubuntu: sudo apt-get install -y python3-tk

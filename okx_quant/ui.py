@@ -9,11 +9,18 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from tkinter import BooleanVar, END, Menu, StringVar, Text, Tk, Toplevel, simpledialog
 from tkinter import messagebox, ttk
 
+from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
 from okx_quant.backtest_ui import BacktestCompareOverviewWindow, BacktestLaunchState, BacktestWindow
+from okx_quant.deribit_client import DeribitRestClient
+from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
+from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.engine import StrategyEngine, fetch_hourly_ema_debug, format_hourly_debug
 from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.okx_client import (
+    OkxAccountAssetItem,
+    OkxAccountConfig,
+    OkxAccountOverview,
     OkxApiError,
     OkxFillHistoryItem,
     OkxPosition,
@@ -34,17 +41,20 @@ from okx_quant.persistence import (
 from okx_quant.position_protection import (
     OptionProtectionConfig,
     PositionProtectionManager,
+    build_close_order_price_from_mark,
     describe_protection_price_logic,
     derive_position_direction,
     infer_protection_profit_on_rise,
     infer_default_spot_inst_id,
     normalize_spot_inst_id,
+    validate_live_protection_order_price_guard,
 )
 from okx_quant.protection_replay_ui import ProtectionReplayLaunchState, ProtectionReplayWindow
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.signal_monitor import DEFAULT_MONITOR_SYMBOLS
 from okx_quant.signal_monitor_ui import SignalMonitorWindow
 from okx_quant.strategy_catalog import STRATEGY_DEFINITIONS, StrategyDefinition, get_strategy_definition
+from okx_quant.window_layout import apply_adaptive_window_geometry, apply_fill_window_geometry
 
 
 BAR_OPTIONS = ["1m", "3m", "5m", "15m", "1H", "4H"]
@@ -153,11 +163,18 @@ class StrategySession:
 class QuantApp:
     def __init__(self) -> None:
         self.root = Tk()
-        self.root.title("OKX 策略工作台")
-        self.root.geometry("1720x1060")
-        self.root.minsize(1480, 920)
+        self.root.title(build_app_title())
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        default_width = min(max(int(screen_width * 0.9), 1560), max(screen_width - 80, 1560))
+        default_height = min(max(int(screen_height * 0.88), 980), max(screen_height - 80, 980))
+        offset_x = max((screen_width - default_width) // 2, 20)
+        offset_y = max((screen_height - default_height) // 2 - 12, 20)
+        self.root.geometry(f"{default_width}x{default_height}+{offset_x}+{offset_y}")
+        self.root.minsize(1420, 900)
 
         self.client = OkxRestClient()
+        self.deribit_client = DeribitRestClient()
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.instruments: list[Instrument] = []
         self.sessions: dict[str, StrategySession] = {}
@@ -166,6 +183,8 @@ class QuantApp:
         self._backtest_window: BacktestWindow | None = None
         self._backtest_compare_window: BacktestCompareOverviewWindow | None = None
         self._signal_monitor_window: SignalMonitorWindow | None = None
+        self._deribit_volatility_monitor_window: DeribitVolatilityMonitorWindow | None = None
+        self._deribit_volatility_window: DeribitVolatilityWindow | None = None
         self._positions_zoom_window: Toplevel | None = None
         self._protection_window: Toplevel | None = None
         self._protection_replay_window: ProtectionReplayWindow | None = None
@@ -193,6 +212,13 @@ class QuantApp:
         self._positions_zoom_fills_detail: Text | None = None
         self._positions_zoom_position_history_tree: ttk.Treeview | None = None
         self._positions_zoom_position_history_detail: Text | None = None
+        self._account_info_window: Toplevel | None = None
+        self._account_info_tree: ttk.Treeview | None = None
+        self._account_info_detail_panel: Text | None = None
+        self._account_info_config_panel: Text | None = None
+        self._account_info_refreshing = False
+        self._latest_account_overview: OkxAccountOverview | None = None
+        self._latest_account_config: OkxAccountConfig | None = None
         self._positions_zoom_column_window: Toplevel | None = None
         self._positions_zoom_detail_frame: ttk.LabelFrame | None = None
         self._positions_zoom_fills_detail_frame: ttk.LabelFrame | None = None
@@ -206,6 +232,10 @@ class QuantApp:
         self._position_history_last_refresh_at: datetime | None = None
         self._positions_zoom_column_groups: dict[str, dict[str, object]] = {}
         self._positions_zoom_column_vars: dict[str, dict[str, BooleanVar]] = {}
+        self._main_positions_pane: ttk.Panedwindow | None = None
+        self._main_position_detail_frame: ttk.LabelFrame | None = None
+        self._main_position_detail_collapsed = False
+        self._main_position_detail_toggle_text = StringVar(value="灞曞紑鎸佷粨璇︽儏")
         self._positions_zoom_detail_collapsed = False
         self._positions_zoom_history_collapsed = False
         self._positions_zoom_fills_detail_collapsed = False
@@ -228,6 +258,8 @@ class QuantApp:
         self._positions_zoom_apply_expiry_prefix_button: ttk.Button | None = None
         self._positions_zoom_position_history_apply_contract_button: ttk.Button | None = None
         self._positions_zoom_position_history_apply_expiry_prefix_button: ttk.Button | None = None
+        self._main_body_pane: ttk.Panedwindow | None = None
+        self._sessions_pane: ttk.Panedwindow | None = None
         self._protection_sessions_tree: ttk.Treeview | None = None
         self._protection_detail_text: Text | None = None
         self._protection_form_title_text = StringVar(value="请选择一个期权持仓后，再设置保护。")
@@ -324,6 +356,17 @@ class QuantApp:
         self.position_margin_text = StringVar(value="-")
         self.position_delta_text = StringVar(value="-")
         self.position_detail_text = StringVar(value=self._default_position_detail_text())
+        self.account_info_summary_text = StringVar(value="尚未读取账户信息。")
+        self.account_total_equity_text = StringVar(value="-")
+        self.account_adjusted_equity_text = StringVar(value="-")
+        self.account_available_equity_text = StringVar(value="-")
+        self.account_upl_text = StringVar(value="-")
+        self.account_imr_text = StringVar(value="-")
+        self.account_mmr_text = StringVar(value="-")
+        self._main_position_detail_toggle_text.set("\u5c55\u5f00\u6301\u4ed3\u8be6\u60c5")
+        self._positions_zoom_detail_toggle_text.set("\u5c55\u5f00\u6301\u4ed3\u8be6\u60c5")
+        self._positions_zoom_fills_detail_toggle_text.set("\u5c55\u5f00\u6210\u4ea4\u8be6\u60c5")
+        self._positions_zoom_position_history_detail_toggle_text.set("\u5c55\u5f00\u4ed3\u4f4d\u8be6\u60c5")
 
         self._credential_watch_enabled = False
         self._credential_save_job: str | None = None
@@ -341,9 +384,11 @@ class QuantApp:
         self._load_saved_notification_settings()
         self._build_menu()
         self._build_layout()
+        self._apply_initial_detail_visibility()
         self._bind_auto_save()
         self._apply_selected_strategy_definition()
         self._update_settings_summary()
+        self.root.after_idle(self._apply_initial_pane_layout)
         self.root.after(250, self._drain_log_queue)
         self.root.after(500, self._refresh_status)
         self.root.after(1200, self._refresh_positions_periodic)
@@ -360,14 +405,21 @@ class QuantApp:
         tools_menu.add_command(label="打开回测窗口", command=self.open_backtest_window)
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
         tools_menu.add_command(label="打开信号监控", command=self.open_signal_monitor_window)
+        tools_menu.add_command(label="打开波动率监控", command=self.open_deribit_volatility_monitor_window)
+        tools_menu.add_command(label="打开Deribit波动率指数", command=self.open_deribit_volatility_window)
         tools_menu.add_command(label="刷新账户持仓", command=self.refresh_positions)
         menu_bar.add_cascade(label="工具", menu=tools_menu)
 
         system_menu = Menu(menu_bar, tearoff=False)
+        system_menu.add_command(label=f"版本信息 (v{APP_VERSION})", command=self.show_version_info)
+        system_menu.add_separator()
         system_menu.add_command(label="退出", command=self._on_close)
         menu_bar.add_cascade(label="系统", menu=system_menu)
 
         self.root.config(menu=menu_bar)
+
+    def show_version_info(self) -> None:
+        messagebox.showinfo("版本信息", build_version_info_text(), parent=self.root)
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -398,6 +450,7 @@ class QuantApp:
 
         body = ttk.Panedwindow(self.root, orient="horizontal")
         body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 10))
+        self._main_body_pane = body
 
         launcher_frame = ttk.Frame(body, padding=12)
         sessions_frame = ttk.Frame(body, padding=12)
@@ -407,9 +460,7 @@ class QuantApp:
         launcher_frame.columnconfigure(0, weight=1)
         launcher_frame.rowconfigure(1, weight=1)
         sessions_frame.columnconfigure(0, weight=1)
-        sessions_frame.rowconfigure(0, weight=2)
-        sessions_frame.rowconfigure(1, weight=2)
-        sessions_frame.rowconfigure(2, weight=7)
+        sessions_frame.rowconfigure(0, weight=1)
 
         start_frame = ttk.LabelFrame(launcher_frame, text="策略启动", padding=16)
         start_frame.grid(row=0, column=0, sticky="ew")
@@ -562,7 +613,17 @@ class QuantApp:
             justify="left",
         ).grid(row=5, column=0, sticky="w", pady=(6, 0))
 
-        running_frame = ttk.LabelFrame(sessions_frame, text="运行中策略", padding=12)
+        sessions_pane = ttk.Panedwindow(sessions_frame, orient="vertical")
+        sessions_pane.grid(row=0, column=0, sticky="nsew")
+        self._sessions_pane = sessions_pane
+
+        session_top_frame = ttk.Frame(sessions_pane)
+        session_top_frame.columnconfigure(0, weight=1)
+        session_top_frame.rowconfigure(0, weight=3)
+        session_top_frame.rowconfigure(1, weight=2)
+        sessions_pane.add(session_top_frame, weight=3)
+
+        running_frame = ttk.LabelFrame(session_top_frame, text="运行中策略", padding=12)
         running_frame.grid(row=0, column=0, sticky="nsew")
         running_frame.columnconfigure(0, weight=1)
         running_frame.rowconfigure(0, weight=1)
@@ -596,7 +657,7 @@ class QuantApp:
         control_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Button(control_row, text="停止选中策略", command=self.stop_selected_session).grid(row=0, column=0)
 
-        detail_frame = ttk.LabelFrame(sessions_frame, text="选中策略详情", padding=16)
+        detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)
         detail_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         detail_frame.columnconfigure(0, weight=1)
         detail_frame.rowconfigure(0, weight=1)
@@ -613,10 +674,10 @@ class QuantApp:
         self._selected_session_detail.configure(yscrollcommand=detail_scroll.set)
         self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
 
-        positions_frame = ttk.LabelFrame(sessions_frame, text="账户持仓（仿 OKX 客户端风格）", padding=12)
-        positions_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        positions_frame = ttk.LabelFrame(sessions_pane, text="账户持仓（仿 OKX 客户端风格）", padding=12)
         positions_frame.columnconfigure(0, weight=1)
         positions_frame.rowconfigure(3, weight=1)
+        sessions_pane.add(positions_frame, weight=6)
 
         header_row = ttk.Frame(positions_frame)
         header_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -640,17 +701,24 @@ class QuantApp:
             textvariable=self.position_auto_refresh_button_text,
             command=self.toggle_position_auto_refresh,
         ).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(action_row, text="持仓大窗", command=self.open_positions_zoom_window).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(action_row, text="账户信息", command=self.open_account_info_window).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(action_row, text="持仓大窗", command=self.open_positions_zoom_window).grid(row=0, column=5, padx=(0, 6))
         ttk.Button(action_row, text="设置期权保护", command=self.open_position_protection_window).grid(
-            row=0, column=5, padx=(0, 6)
-        )
-        ttk.Button(action_row, text="全部展开", command=self.expand_all_position_groups).grid(
             row=0, column=6, padx=(0, 6)
         )
-        ttk.Button(action_row, text="折叠分组", command=self.collapse_position_groups).grid(
+        ttk.Button(action_row, text="全部展开", command=self.expand_all_position_groups).grid(
             row=0, column=7, padx=(0, 6)
         )
-        ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=8)
+        ttk.Button(action_row, text="折叠分组", command=self.collapse_position_groups).grid(
+            row=0, column=8, padx=(0, 6)
+        )
+        ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=9)
+
+        ttk.Button(
+            action_row,
+            textvariable=self._main_position_detail_toggle_text,
+            command=self.toggle_main_position_detail,
+        ).grid(row=0, column=10)
 
         filter_row = ttk.Frame(positions_frame)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -805,6 +873,41 @@ class QuantApp:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=scrollbar.set)
 
+    def _apply_initial_pane_layout(self) -> None:
+        try:
+            if self._main_body_pane is not None and self._main_body_pane.winfo_exists():
+                total_width = self._main_body_pane.winfo_width()
+                if total_width > 1200:
+                    self._main_body_pane.sashpos(0, int(total_width * Decimal("0.39")))
+            if self._sessions_pane is not None and self._sessions_pane.winfo_exists():
+                total_height = self._sessions_pane.winfo_height()
+                if total_height > 600:
+                    self._sessions_pane.sashpos(0, int(total_height * Decimal("0.34")))
+        except Exception:
+            return
+
+    def _apply_initial_detail_visibility(self) -> None:
+        if not self._main_position_detail_collapsed:
+            self.root.after_idle(self.toggle_main_position_detail)
+
+    def toggle_main_position_detail(self) -> None:
+        if self._main_positions_pane is None or self._main_position_detail_frame is None:
+            return
+        try:
+            panes = tuple(str(pane) for pane in self._main_positions_pane.panes())
+            frame_id = str(self._main_position_detail_frame)
+            if self._main_position_detail_collapsed:
+                if frame_id not in panes:
+                    self._main_positions_pane.add(self._main_position_detail_frame, weight=2)
+                self._main_position_detail_toggle_text.set("\u6298\u53e0\u6301\u4ed3\u8be6\u60c5")
+            else:
+                if frame_id in panes:
+                    self._main_positions_pane.forget(self._main_position_detail_frame)
+                self._main_position_detail_toggle_text.set("\u5c55\u5f00\u6301\u4ed3\u8be6\u60c5")
+            self._main_position_detail_collapsed = not self._main_position_detail_collapsed
+        except Exception:
+            return
+
     def _default_selected_session_text(self) -> str:
         return (
             "启动后，这里会显示选中策略的完整详情。\n"
@@ -815,6 +918,12 @@ class QuantApp:
         return (
             "这里会显示选中持仓或风险分组的详细信息。\n"
             "你可以先刷新持仓，再用上面的类型筛选、搜索、展开/折叠，按 OKX 客户端那种方式查看账户结构。"
+        )
+
+    def _default_account_info_detail_text(self) -> str:
+        return (
+            "这里会显示账户概览、账户配置和选中资产详情。\n"
+            "点击“账户信息”后，程序会读取 OKX 账户余额与账户配置接口，方便你在持仓页里直接查看账户状态。"
         )
 
     def _set_readonly_text(self, widget: Text | None, content: str) -> None:
@@ -832,6 +941,272 @@ class QuantApp:
         ttk.Label(card, textvariable=value_var, font=("Microsoft YaHei UI", 11, "bold")).grid(
             row=0, column=0, sticky="w"
         )
+
+    def open_account_info_window(self) -> None:
+        if self._account_info_window is not None and self._account_info_window.winfo_exists():
+            self._account_info_window.focus_force()
+            self.refresh_account_info()
+            return
+
+        window = Toplevel(self.root)
+        window.title("账户信息")
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.78,
+            height_ratio=0.76,
+            min_width=1120,
+            min_height=760,
+            max_width=1600,
+            max_height=1080,
+        )
+        self._account_info_window = window
+        window.protocol("WM_DELETE_WINDOW", self._close_account_info_window)
+
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(3, weight=1)
+        container.rowconfigure(4, weight=1)
+
+        header = ttk.Frame(container)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, textvariable=self.account_info_summary_text, justify="left").grid(row=0, column=0, sticky="w")
+        action_row = ttk.Frame(header)
+        action_row.grid(row=0, column=1, sticky="e")
+        ttk.Button(action_row, text="刷新", command=self.refresh_account_info).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(action_row, text="关闭", command=self._close_account_info_window).grid(row=0, column=1)
+
+        overview_row = ttk.Frame(container)
+        overview_row.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        for column in range(6):
+            overview_row.columnconfigure(column, weight=1)
+        self._build_metric_card(overview_row, 0, "总权益", self.account_total_equity_text)
+        self._build_metric_card(overview_row, 1, "调整后权益", self.account_adjusted_equity_text)
+        self._build_metric_card(overview_row, 2, "可用权益", self.account_available_equity_text)
+        self._build_metric_card(overview_row, 3, "未实现盈亏", self.account_upl_text)
+        self._build_metric_card(overview_row, 4, "初始保证金(IMR)", self.account_imr_text)
+        self._build_metric_card(overview_row, 5, "维持保证金(MMR)", self.account_mmr_text)
+
+        config_frame = ttk.LabelFrame(container, text="账户配置", padding=10)
+        config_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
+        config_frame.columnconfigure(0, weight=1)
+        config_frame.rowconfigure(0, weight=1)
+        self._account_info_config_panel = Text(
+            config_frame,
+            height=5,
+            wrap="word",
+            font=("Microsoft YaHei UI", 10),
+            relief="flat",
+        )
+        self._account_info_config_panel.grid(row=0, column=0, sticky="nsew")
+        config_scroll = ttk.Scrollbar(config_frame, orient="vertical", command=self._account_info_config_panel.yview)
+        config_scroll.grid(row=0, column=1, sticky="ns")
+        self._account_info_config_panel.configure(yscrollcommand=config_scroll.set)
+        self._set_readonly_text(self._account_info_config_panel, self._default_account_info_detail_text())
+
+        asset_frame = ttk.LabelFrame(container, text="资产明细", padding=10)
+        asset_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
+        asset_frame.columnconfigure(0, weight=1)
+        asset_frame.rowconfigure(0, weight=1)
+
+        self._account_info_tree = ttk.Treeview(
+            asset_frame,
+            columns=("ccy", "eq", "eq_usd", "cash", "avail_bal", "avail_eq", "upl", "frozen", "liab"),
+            show="headings",
+            selectmode="browse",
+        )
+        tree = self._account_info_tree
+        tree.heading("ccy", text="币种")
+        tree.heading("eq", text="权益")
+        tree.heading("eq_usd", text="折合USD")
+        tree.heading("cash", text="现金余额")
+        tree.heading("avail_bal", text="可用余额")
+        tree.heading("avail_eq", text="可用权益")
+        tree.heading("upl", text="未实现盈亏")
+        tree.heading("frozen", text="冻结")
+        tree.heading("liab", text="负债")
+        tree.column("ccy", width=90, anchor="center")
+        tree.column("eq", width=110, anchor="e")
+        tree.column("eq_usd", width=110, anchor="e")
+        tree.column("cash", width=110, anchor="e")
+        tree.column("avail_bal", width=110, anchor="e")
+        tree.column("avail_eq", width=110, anchor="e")
+        tree.column("upl", width=110, anchor="e")
+        tree.column("frozen", width=100, anchor="e")
+        tree.column("liab", width=100, anchor="e")
+        tree.grid(row=0, column=0, sticky="nsew")
+        tree.bind("<<TreeviewSelect>>", self._refresh_account_info_detail)
+        tree.tag_configure("profit", foreground="#13803d")
+        tree.tag_configure("loss", foreground="#c23b3b")
+        asset_scroll_y = ttk.Scrollbar(asset_frame, orient="vertical", command=tree.yview)
+        asset_scroll_y.grid(row=0, column=1, sticky="ns")
+        asset_scroll_x = ttk.Scrollbar(asset_frame, orient="horizontal", command=tree.xview)
+        asset_scroll_x.grid(row=1, column=0, sticky="ew")
+        tree.configure(yscrollcommand=asset_scroll_y.set, xscrollcommand=asset_scroll_x.set)
+
+        detail_frame = ttk.LabelFrame(container, text="选中资产详情", padding=10)
+        detail_frame.grid(row=4, column=0, sticky="nsew")
+        detail_frame.columnconfigure(0, weight=1)
+        detail_frame.rowconfigure(0, weight=1)
+        self._account_info_detail_panel = Text(
+            detail_frame,
+            height=8,
+            wrap="word",
+            font=("Microsoft YaHei UI", 10),
+            relief="flat",
+        )
+        self._account_info_detail_panel.grid(row=0, column=0, sticky="nsew")
+        detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self._account_info_detail_panel.yview)
+        detail_scroll.grid(row=0, column=1, sticky="ns")
+        self._account_info_detail_panel.configure(yscrollcommand=detail_scroll.set)
+        self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
+
+        self._expand_to_screen(window, margin=30)
+        self.refresh_account_info()
+
+    def _close_account_info_window(self) -> None:
+        if self._account_info_window is not None and self._account_info_window.winfo_exists():
+            self._account_info_window.destroy()
+        self._account_info_window = None
+        self._account_info_tree = None
+        self._account_info_detail_panel = None
+        self._account_info_config_panel = None
+
+    def refresh_account_info(self) -> None:
+        if self._account_info_refreshing:
+            return
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            self.account_info_summary_text.set("未配置 API 凭证，无法读取账户信息。")
+            self._set_readonly_text(self._account_info_config_panel, "未配置 API 凭证，无法读取账户配置。")
+            self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
+            if self._account_info_tree is not None:
+                self._account_info_tree.delete(*self._account_info_tree.get_children())
+            return
+        self._account_info_refreshing = True
+        self.account_info_summary_text.set("正在刷新账户信息...")
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        threading.Thread(
+            target=self._refresh_account_info_worker,
+            args=(credentials, environment),
+            daemon=True,
+        ).start()
+
+    def _refresh_account_info_worker(self, credentials: Credentials, environment: str) -> None:
+        try:
+            overview = self.client.get_account_overview(credentials, environment=environment)
+            config = self.client.get_account_config(credentials, environment=environment)
+        except Exception as exc:
+            message = str(exc)
+            if "50101" in message and "current environment" in message:
+                alternate = "live" if environment == "demo" else "demo"
+                try:
+                    overview = self.client.get_account_overview(credentials, environment=alternate)
+                    config = self.client.get_account_config(credentials, environment=alternate)
+                except Exception:
+                    self.root.after(0, lambda: self._apply_account_info_error(message))
+                    return
+                summary = (
+                    f"当前 API Key 与 {alternate} 环境匹配，已自动按 "
+                    f"{'实盘' if alternate == 'live' else '模拟盘'} 读取账户信息。"
+                )
+                self.root.after(0, lambda: self._apply_account_info(overview, config, summary, alternate))
+                return
+            self.root.after(0, lambda: self._apply_account_info_error(message))
+            return
+        self.root.after(0, lambda: self._apply_account_info(overview, config, None, environment))
+
+    def _apply_account_info(
+        self,
+        overview: OkxAccountOverview,
+        config: OkxAccountConfig,
+        summary_note: str | None,
+        effective_environment: str,
+    ) -> None:
+        self._account_info_refreshing = False
+        self._latest_account_overview = overview
+        self._latest_account_config = config
+        environment_label = "实盘 live" if effective_environment == "live" else "模拟盘 demo"
+        summary_parts = []
+        if summary_note:
+            summary_parts.append(summary_note)
+        summary_parts.append(f"API配置：{self._current_credential_profile()}")
+        summary_parts.append(f"环境：{environment_label}")
+        summary_parts.append(f"账户模式：{_format_account_level(config.account_level)}")
+        summary_parts.append(f"持仓模式：{_format_account_position_mode(config.position_mode)}")
+        summary_parts.append(f"Greeks：{_format_greeks_type(config.greeks_type)}")
+        self.account_info_summary_text.set(" | ".join(summary_parts))
+        self.account_total_equity_text.set(_format_optional_usdt_precise(overview.total_equity, places=2, with_sign=False))
+        self.account_adjusted_equity_text.set(_format_optional_usdt_precise(overview.adjusted_equity, places=2, with_sign=False))
+        self.account_available_equity_text.set(_format_optional_usdt_precise(overview.available_equity, places=2, with_sign=False))
+        self.account_upl_text.set(_format_optional_usdt_precise(overview.unrealized_pnl, places=2))
+        self.account_imr_text.set(_format_optional_usdt_precise(overview.initial_margin, places=2, with_sign=False))
+        self.account_mmr_text.set(_format_optional_usdt_precise(overview.maintenance_margin, places=2, with_sign=False))
+        self._set_readonly_text(
+            self._account_info_config_panel,
+            _build_account_config_detail_text(
+                config,
+                overview,
+                profile_name=self._current_credential_profile(),
+                environment=effective_environment,
+            ),
+        )
+        if self._account_info_tree is not None:
+            selected_before = self._account_info_tree.selection()[0] if self._account_info_tree.selection() else None
+            self._account_info_tree.delete(*self._account_info_tree.get_children())
+            for index, asset in enumerate(overview.details):
+                tags: tuple[str, ...] = ()
+                if asset.unrealized_pnl is not None:
+                    tags = (_pnl_tag(asset.unrealized_pnl),)
+                self._account_info_tree.insert(
+                    "",
+                    END,
+                    iid=f"acct-{index}",
+                    values=(
+                        asset.ccy or "-",
+                        _format_optional_decimal(asset.equity),
+                        _format_optional_usdt_precise(asset.equity_usd, places=2, with_sign=False),
+                        _format_optional_decimal(asset.cash_balance),
+                        _format_optional_decimal(asset.available_balance),
+                        _format_optional_decimal(asset.available_equity),
+                        _format_optional_decimal(asset.unrealized_pnl, with_sign=True),
+                        _format_optional_decimal(asset.frozen_balance),
+                        _format_optional_decimal(asset.liability),
+                    ),
+                    tags=tags,
+                )
+            if selected_before and self._account_info_tree.exists(selected_before):
+                self._account_info_tree.selection_set(selected_before)
+            elif overview.details:
+                self._account_info_tree.selection_set("acct-0")
+            self._refresh_account_info_detail()
+
+    def _apply_account_info_error(self, message: str) -> None:
+        self._account_info_refreshing = False
+        self.account_info_summary_text.set(f"账户信息读取失败：{message}")
+        self._set_readonly_text(self._account_info_config_panel, f"账户配置读取失败：{message}")
+        self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
+
+    def _refresh_account_info_detail(self, *_: object) -> None:
+        tree = self._account_info_tree
+        overview = self._latest_account_overview
+        if tree is None or overview is None:
+            self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
+            return
+        selection = tree.selection()
+        if not selection:
+            self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
+            return
+        try:
+            index = int(selection[0].split("-", 1)[1])
+        except Exception:
+            self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
+            return
+        if index < 0 or index >= len(overview.details):
+            self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
+            return
+        self._set_readonly_text(self._account_info_detail_panel, _build_account_asset_detail_text(overview.details[index]))
 
     def _schedule_protection_window_refresh(self) -> None:
         try:
@@ -901,10 +1276,7 @@ class QuantApp:
 
     def _expand_to_screen(self, window: Toplevel, *, margin: int = 20) -> None:
         try:
-            window.update_idletasks()
-            screen_width = max(window.winfo_screenwidth() - margin, 1200)
-            screen_height = max(window.winfo_screenheight() - margin - 40, 800)
-            window.geometry(f"{screen_width}x{screen_height}+0+0")
+            apply_fill_window_geometry(window, min_width=1200, min_height=800, margin=margin)
         except Exception:
             return
 
@@ -926,7 +1298,15 @@ class QuantApp:
 
         window = Toplevel(self.root)
         window.title("账户持仓大窗")
-        window.geometry("1460x900")
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.84,
+            height_ratio=0.82,
+            min_width=1280,
+            min_height=860,
+            max_width=1800,
+            max_height=1120,
+        )
         self._positions_zoom_window = window
         window.protocol("WM_DELETE_WINDOW", self._close_positions_zoom_window)
 
@@ -945,19 +1325,20 @@ class QuantApp:
         zoom_actions.grid(row=0, column=1, sticky="e")
         ttk.Button(zoom_actions, text="刷新历史", command=self.refresh_position_histories).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(zoom_actions, text="刷新", command=self.refresh_positions).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(zoom_actions, text="账户信息", command=self.open_account_info_window).grid(row=0, column=2, padx=(0, 6))
         ttk.Button(zoom_actions, text="设置期权保护", command=self.open_position_protection_window).grid(
-            row=0, column=2, padx=(0, 6)
-        )
-        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=2)
-        ttk.Button(zoom_actions, text="列设置", command=self.open_positions_zoom_column_window).grid(
             row=0, column=3, padx=(0, 6)
+        )
+        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=4)
+        ttk.Button(zoom_actions, text="列设置", command=self.open_positions_zoom_column_window).grid(
+            row=0, column=5, padx=(0, 6)
         )
 
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_detail_toggle_text, command=self.toggle_positions_zoom_detail).grid(
-            row=0, column=4, padx=(0, 6)
+            row=0, column=6, padx=(0, 6)
         )
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_history_toggle_text, command=self.toggle_positions_zoom_history).grid(
-            row=0, column=5
+            row=0, column=7
         )
         for column_index, child in enumerate(zoom_actions.winfo_children()):
             child.grid_configure(column=column_index)
@@ -1072,6 +1453,12 @@ class QuantApp:
         position_history_tab.rowconfigure(3, weight=1)
         history_notebook.add(position_history_tab, text="历史仓位")
         self._build_positions_zoom_position_history_tab(position_history_tab)
+        if not self._positions_zoom_detail_collapsed:
+            self.toggle_positions_zoom_detail()
+        if not self._positions_zoom_fills_detail_collapsed:
+            self.toggle_positions_zoom_fills_detail()
+        if not self._positions_zoom_position_history_detail_collapsed:
+            self.toggle_positions_zoom_position_history_detail()
         self.refresh_position_histories()
         self._expand_to_screen(window)
         self._update_positions_zoom_search_shortcuts()
@@ -1318,6 +1705,9 @@ class QuantApp:
         self._positions_zoom_history_collapsed = False
         self._positions_zoom_fills_detail_collapsed = False
         self._positions_zoom_position_history_detail_collapsed = False
+        self._positions_zoom_detail_toggle_text.set("\u5c55\u5f00\u6301\u4ed3\u8be6\u60c5")
+        self._positions_zoom_fills_detail_toggle_text.set("\u5c55\u5f00\u6210\u4ea4\u8be6\u60c5")
+        self._positions_zoom_position_history_detail_toggle_text.set("\u5c55\u5f00\u4ed3\u4f4d\u8be6\u60c5")
         self._positions_zoom_detail_toggle_text.set("折叠持仓详情")
         self._positions_zoom_history_toggle_text.set("折叠历史区域")
         self._positions_zoom_fills_detail_toggle_text.set("折叠成交详情")
@@ -1353,8 +1743,15 @@ class QuantApp:
 
         window = Toplevel(self._positions_zoom_window)
         window.title("持仓大窗列设置")
-        window.geometry("540x520")
-        window.minsize(480, 420)
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.34,
+            height_ratio=0.48,
+            min_width=480,
+            min_height=420,
+            max_width=700,
+            max_height=760,
+        )
         window.transient(self._positions_zoom_window)
         self._positions_zoom_column_window = window
         window.protocol("WM_DELETE_WINDOW", self._close_positions_zoom_column_window)
@@ -1990,8 +2387,15 @@ class QuantApp:
 
         window = Toplevel(self.root)
         window.title("期权持仓保护")
-        window.geometry("1100x820")
-        window.minsize(980, 760)
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.76,
+            height_ratio=0.78,
+            min_width=980,
+            min_height=760,
+            max_width=1520,
+            max_height=1060,
+        )
         self._protection_window = window
         window.protocol("WM_DELETE_WINDOW", self._close_position_protection_window)
 
@@ -2389,7 +2793,7 @@ class QuantApp:
             notifier = self._build_optional_protection_notifier()
             self._protection_manager.set_notifier(notifier)
             protection = self._build_selected_position_protection(position)
-            _validate_protection_live_price_availability(self.client, protection)
+            _validate_protection_live_price_availability(self.client, protection, position)
             config = self._build_manual_protection_strategy_config(position, protection)
             session_id = self._protection_manager.start(credentials, config, protection)
             self._enqueue_log(f"[持仓保护 {session_id}] 已启动 {position.inst_id} 的期权保护任务。")
@@ -2557,8 +2961,15 @@ class QuantApp:
 
         window = Toplevel(self.root)
         window.title("API 与通知设置")
-        window.geometry("860x690")
-        window.minsize(760, 620)
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.58,
+            height_ratio=0.66,
+            min_width=760,
+            min_height=620,
+            max_width=1080,
+            max_height=900,
+        )
         window.transient(self.root)
         self._settings_window = window
         window.protocol("WM_DELETE_WINDOW", self._close_settings_window)
@@ -2730,6 +3141,12 @@ class QuantApp:
                 environment_label=self.environment_label.get(),
                 maker_fee_percent="0.01",
                 taker_fee_percent="0.028",
+                initial_capital="10000",
+                sizing_mode_label="固定风险金",
+                risk_percent="1",
+                compounding_enabled=False,
+                slippage_percent="0",
+                funding_rate_percent="0",
             ),
         )
 
@@ -2748,6 +3165,32 @@ class QuantApp:
             self.root,
             self.client,
             notifier_factory=self._build_signal_monitor_notifier,
+            logger=self._enqueue_log,
+        )
+
+    def open_deribit_volatility_monitor_window(self) -> None:
+        if (
+            self._deribit_volatility_monitor_window is not None
+            and self._deribit_volatility_monitor_window.window.winfo_exists()
+        ):
+            self._deribit_volatility_monitor_window.show()
+            return
+
+        self._deribit_volatility_monitor_window = DeribitVolatilityMonitorWindow(
+            self.root,
+            self.deribit_client,
+            notifier_factory=self._build_signal_monitor_notifier,
+            logger=self._enqueue_log,
+        )
+
+    def open_deribit_volatility_window(self) -> None:
+        if self._deribit_volatility_window is not None and self._deribit_volatility_window.window.winfo_exists():
+            self._deribit_volatility_window.show()
+            return
+
+        self._deribit_volatility_window = DeribitVolatilityWindow(
+            self.root,
+            self.deribit_client,
             logger=self._enqueue_log,
         )
 
@@ -3858,6 +4301,13 @@ class QuantApp:
             self._backtest_compare_window.window.destroy()
         if self._signal_monitor_window is not None and self._signal_monitor_window.window.winfo_exists():
             self._signal_monitor_window.destroy()
+        if (
+            self._deribit_volatility_monitor_window is not None
+            and self._deribit_volatility_monitor_window.window.winfo_exists()
+        ):
+            self._deribit_volatility_monitor_window.destroy()
+        if self._deribit_volatility_window is not None and self._deribit_volatility_window.window.winfo_exists():
+            self._deribit_volatility_window.window.destroy()
         if self._protection_replay_window is not None and self._protection_replay_window.window.winfo_exists():
             self._protection_replay_window.window.destroy()
         self._close_positions_zoom_window()
@@ -3929,6 +4379,39 @@ def _format_margin_mode(value: str | None) -> str:
         return "逐仓 isolated"
     if text == "cross":
         return "全仓 cross"
+    return text
+
+
+def _format_account_level(value: str | None) -> str:
+    mapping = {
+        "1": "简单交易",
+        "2": "单币种保证金",
+        "3": "跨币种保证金",
+        "4": "组合保证金",
+    }
+    text = (value or "").strip()
+    if not text:
+        return "-"
+    return mapping.get(text, text)
+
+
+def _format_account_position_mode(value: str | None) -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return "-"
+    if text == "net":
+        return "净持仓 net"
+    if text in {"long_short", "long/short"}:
+        return "双向持仓 long/short"
+    return text
+
+
+def _format_greeks_type(value: str | None) -> str:
+    text = (value or "").strip().upper()
+    if not text:
+        return "-"
+    if text in {"PA", "BS"}:
+        return text
     return text
 
 
@@ -4559,6 +5042,7 @@ def _validate_protection_price_relationship(
 def _validate_protection_live_price_availability(
     client: OkxRestClient,
     protection: OptionProtectionConfig,
+    position: OkxPosition,
 ) -> None:
     if protection.trigger_price_type == "mark":
         try:
@@ -4583,6 +5067,62 @@ def _validate_protection_live_price_availability(
             f"{protection.option_inst_id} 当前拿不到标记价格，不能用“标记价格加减滑点”报单。"
             "请把止盈/止损报单方式改成“设定价格”，或者等 OKX 返回 markPx 后再启动。"
         ) from exc
+
+    instrument = client.get_instrument(protection.option_inst_id)
+    close_side = "sell" if derive_position_direction(position) == "long" else "buy"
+    open_avg_price = position.avg_price
+
+    if protection.take_profit_trigger is not None:
+        if protection.take_profit_order_mode == "mark_with_slippage":
+            mark_price = client.get_trigger_price(protection.option_inst_id, "mark")
+            preview_price = build_close_order_price_from_mark(
+                mark_price=mark_price,
+                close_side=close_side,
+                tick_size=instrument.tick_size,
+                mode=protection.take_profit_order_mode,
+                fixed_price=protection.take_profit_order_price,
+                slippage=protection.take_profit_slippage,
+            )
+        else:
+            preview_price = protection.take_profit_order_price
+        if preview_price is not None:
+            try:
+                validate_live_protection_order_price_guard(
+                    client=client,
+                    option_inst_id=protection.option_inst_id,
+                    close_side=close_side,
+                    order_price=preview_price,
+                    tick_size=instrument.tick_size,
+                    open_avg_price=open_avg_price,
+                )
+            except RuntimeError as exc:
+                raise ValueError(str(exc)) from exc
+
+    if protection.stop_loss_trigger is not None:
+        if protection.stop_loss_order_mode == "mark_with_slippage":
+            mark_price = client.get_trigger_price(protection.option_inst_id, "mark")
+            preview_price = build_close_order_price_from_mark(
+                mark_price=mark_price,
+                close_side=close_side,
+                tick_size=instrument.tick_size,
+                mode=protection.stop_loss_order_mode,
+                fixed_price=protection.stop_loss_order_price,
+                slippage=protection.stop_loss_slippage,
+            )
+        else:
+            preview_price = protection.stop_loss_order_price
+        if preview_price is not None:
+            try:
+                validate_live_protection_order_price_guard(
+                    client=client,
+                    option_inst_id=protection.option_inst_id,
+                    close_side=close_side,
+                    order_price=preview_price,
+                    tick_size=instrument.tick_size,
+                    open_avg_price=open_avg_price,
+                )
+            except RuntimeError as exc:
+                raise ValueError(str(exc)) from exc
 
 
 def _resolve_protection_order_mode_value(mode_label: str) -> str:
@@ -4766,6 +5306,51 @@ def _format_position_history_pnl(
 
 def _format_fill_history_pnl(item: OkxFillHistoryItem) -> str:
     return _format_history_amount(item.pnl, _infer_fill_history_pnl_currency(item), with_sign=True)
+
+
+def _build_account_config_detail_text(
+    config: OkxAccountConfig,
+    overview: OkxAccountOverview,
+    *,
+    profile_name: str,
+    environment: str,
+) -> str:
+    environment_label = "实盘 live" if environment == "live" else "模拟盘 demo"
+    if config.auto_loan is True:
+        auto_loan_text = "开启"
+    elif config.auto_loan is False:
+        auto_loan_text = "关闭"
+    else:
+        auto_loan_text = "-"
+    return (
+        f"API配置：{profile_name}\n"
+        f"环境：{environment_label}\n"
+        f"账户模式：{_format_account_level(config.account_level)}\n"
+        f"持仓模式：{_format_account_position_mode(config.position_mode)}\n"
+        f"Greeks类型：{_format_greeks_type(config.greeks_type)}\n"
+        f"自动借币：{auto_loan_text}\n"
+        f"总权益：{_format_optional_usdt_precise(overview.total_equity, places=2, with_sign=False)}\n"
+        f"调整后权益：{_format_optional_usdt_precise(overview.adjusted_equity, places=2, with_sign=False)}\n"
+        f"总名义价值(USD)：{_format_optional_usdt_precise(overview.notional_usd, places=2, with_sign=False)}\n"
+        f"订单冻结：{_format_optional_usdt_precise(overview.order_frozen, places=2, with_sign=False)}"
+    )
+
+
+def _build_account_asset_detail_text(item: OkxAccountAssetItem) -> str:
+    return (
+        f"币种：{item.ccy or '-'}\n"
+        f"权益：{_format_optional_decimal(item.equity)}\n"
+        f"折合USD：{_format_optional_usdt_precise(item.equity_usd, places=2, with_sign=False)}\n"
+        f"现金余额：{_format_optional_decimal(item.cash_balance)}\n"
+        f"可用余额：{_format_optional_decimal(item.available_balance)}\n"
+        f"可用权益：{_format_optional_decimal(item.available_equity)}\n"
+        f"未实现盈亏：{_format_optional_decimal(item.unrealized_pnl, with_sign=True)}\n"
+        f"折后权益：{_format_optional_decimal(item.discount_equity)}\n"
+        f"冻结：{_format_optional_decimal(item.frozen_balance)}\n"
+        f"负债：{_format_optional_decimal(item.liability)}\n"
+        f"全仓负债：{_format_optional_decimal(item.cross_liability)}\n"
+        f"利息：{_format_optional_decimal(item.interest)}"
+    )
 
 
 def _build_fill_history_detail_text(item: OkxFillHistoryItem) -> str:

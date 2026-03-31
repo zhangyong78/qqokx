@@ -309,10 +309,6 @@ def main() -> None:
     concise_path = REPORTS_DIR / f"EMA动态委托_浓缩表_1小时4小时_{EXPORT_DATE.strftime('%Y%m%d')}.txt"
     concise_text = build_concise_table(all_entries)
     write_text(concise_path, concise_text)
-    write_text(
-        REPORTS_DIR / f"ema_dynamic_concise_1h_4h_{EXPORT_DATE.strftime('%Y%m%d')}.txt",
-        concise_text,
-    )
     print(f"concise -> {concise_path}")
 
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, Canvas, StringVar, Text, Toplevel, X, Y
+from tkinter import BOTH, END, LEFT, RIGHT, BooleanVar, Canvas, StringVar, Text, Toplevel, X, Y
 from tkinter import messagebox, ttk
 
 from okx_quant.backtest import (
@@ -25,6 +25,7 @@ from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import backtest_history_file_path
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import STRATEGY_DEFINITIONS, STRATEGY_DYNAMIC_ID, StrategyDefinition, get_strategy_definition
+from okx_quant.window_layout import apply_adaptive_window_geometry
 
 
 SIGNAL_LABEL_TO_VALUE = {
@@ -68,6 +69,12 @@ BACKTEST_SYMBOL_OPTIONS = (
 )
 DEFAULT_MAKER_FEE_PERCENT = "0.01"
 DEFAULT_TAKER_FEE_PERCENT = "0.028"
+BACKTEST_SIZING_OPTIONS = {
+    "固定风险金": "fixed_risk",
+    "固定数量": "fixed_size",
+    "风险百分比": "risk_percent",
+}
+BACKTEST_SIZING_VALUE_TO_LABEL = {value: label for label, value in BACKTEST_SIZING_OPTIONS.items()}
 
 
 @dataclass(frozen=True)
@@ -88,6 +95,12 @@ class BacktestLaunchState:
     environment_label: str
     maker_fee_percent: str = DEFAULT_MAKER_FEE_PERCENT
     taker_fee_percent: str = DEFAULT_TAKER_FEE_PERCENT
+    initial_capital: str = "10000"
+    sizing_mode_label: str = "固定风险金"
+    risk_percent: str = "1"
+    compounding_enabled: bool = False
+    slippage_percent: str = "0"
+    funding_rate_percent: str = "0"
 
 
 @dataclass
@@ -104,6 +117,11 @@ class _ChartRenderState:
     right: int
     top: int
     bottom: int
+    price_bottom: int
+    net_top: int
+    net_bottom: int
+    drawdown_top: int
+    drawdown_bottom: int
     width: int
     height: int
     start_index: int
@@ -327,11 +345,22 @@ def _build_backtest_param_summary(
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> str:
     risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
+    sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
+    if config.backtest_sizing_mode == "risk_percent":
+        sizing_text = f"{sizing_label}{format_decimal(config.backtest_risk_percent or Decimal('0'))}%"
+    elif config.backtest_sizing_mode == "fixed_size":
+        sizing_text = f"{sizing_label}{format_decimal(config.order_size)}"
+    else:
+        sizing_text = f"{sizing_label}{risk_text}"
     return (
         f"EMA{config.ema_period} / 趋势{config.trend_ema_period} / ATR{config.atr_period} / "
         f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
-        f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 风险{risk_text} / "
-        f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)}"
+        f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
+        f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
+        f"{'复利' if config.backtest_compounding else '不复利'} / "
+        f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
+        f"滑点{_format_fee_rate_percent(config.backtest_slippage_rate)} / "
+        f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
     )
 
 
@@ -384,6 +413,14 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "local_tp_sl_inst_id": config.local_tp_sl_inst_id,
         "entry_side_mode": config.entry_side_mode,
         "run_mode": config.run_mode,
+        "backtest_initial_capital": str(config.backtest_initial_capital),
+        "backtest_sizing_mode": config.backtest_sizing_mode,
+        "backtest_risk_percent": None
+        if config.backtest_risk_percent is None
+        else str(config.backtest_risk_percent),
+        "backtest_compounding": config.backtest_compounding,
+        "backtest_slippage_rate": str(config.backtest_slippage_rate),
+        "backtest_funding_rate": str(config.backtest_funding_rate),
     }
 
 
@@ -414,6 +451,14 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         else str(payload.get("local_tp_sl_inst_id")),
         entry_side_mode=str(payload.get("entry_side_mode", "follow_signal")),
         run_mode=str(payload.get("run_mode", "trade")),
+        backtest_initial_capital=Decimal(str(payload.get("backtest_initial_capital", "10000"))),
+        backtest_sizing_mode=str(payload.get("backtest_sizing_mode", "fixed_risk")),
+        backtest_risk_percent=None
+        if payload.get("backtest_risk_percent") in (None, "")
+        else Decimal(str(payload.get("backtest_risk_percent"))),
+        backtest_compounding=bool(payload.get("backtest_compounding", False)),
+        backtest_slippage_rate=Decimal(str(payload.get("backtest_slippage_rate", "0"))),
+        backtest_funding_rate=Decimal(str(payload.get("backtest_funding_rate", "0"))),
     )
 
 
@@ -434,11 +479,16 @@ def _serialize_backtest_report(report: BacktestReport) -> dict[str, object]:
         "profit_loss_ratio": None if report.profit_loss_ratio is None else str(report.profit_loss_ratio),
         "average_r_multiple": str(report.average_r_multiple),
         "max_drawdown": str(report.max_drawdown),
+        "max_drawdown_pct": str(report.max_drawdown_pct),
         "take_profit_hits": report.take_profit_hits,
         "stop_loss_hits": report.stop_loss_hits,
+        "ending_equity": str(report.ending_equity),
+        "total_return_pct": str(report.total_return_pct),
         "maker_fees": str(report.maker_fees),
         "taker_fees": str(report.taker_fees),
         "total_fees": str(report.total_fees),
+        "slippage_costs": str(report.slippage_costs),
+        "funding_costs": str(report.funding_costs),
     }
 
 
@@ -461,11 +511,16 @@ def _deserialize_backtest_report(payload: dict[str, object]) -> BacktestReport:
         else Decimal(str(payload.get("profit_loss_ratio"))),
         average_r_multiple=Decimal(str(payload.get("average_r_multiple", "0"))),
         max_drawdown=Decimal(str(payload.get("max_drawdown", "0"))),
+        max_drawdown_pct=Decimal(str(payload.get("max_drawdown_pct", "0"))),
         take_profit_hits=int(payload.get("take_profit_hits", 0)),
         stop_loss_hits=int(payload.get("stop_loss_hits", 0)),
+        ending_equity=Decimal(str(payload.get("ending_equity", "0"))),
+        total_return_pct=Decimal(str(payload.get("total_return_pct", "0"))),
         maker_fees=Decimal(str(payload.get("maker_fees", "0"))),
         taker_fees=Decimal(str(payload.get("taker_fees", "0"))),
         total_fees=Decimal(str(payload.get("total_fees", "0"))),
+        slippage_costs=Decimal(str(payload.get("slippage_costs", "0"))),
+        funding_costs=Decimal(str(payload.get("funding_costs", "0"))),
     )
 
 
@@ -519,8 +574,15 @@ class BacktestCompareOverviewWindow:
     def __init__(self, parent) -> None:
         self.window = Toplevel(parent)
         self.window.title("策略回测对比总览")
-        self.window.geometry("1460x860")
-        self.window.minsize(1180, 720)
+        apply_adaptive_window_geometry(
+            self.window,
+            width_ratio=0.82,
+            height_ratio=0.78,
+            min_width=1180,
+            min_height=720,
+            max_width=1640,
+            max_height=980,
+        )
         self.window.columnconfigure(0, weight=1)
         self.window.rowconfigure(1, weight=1)
         self.window.rowconfigure(2, weight=1)
@@ -637,8 +699,15 @@ class BacktestWindow:
         self.client = client
         self.window = Toplevel(parent)
         self.window.title("策略回测")
-        self.window.geometry("1320x860")
-        self.window.minsize(1100, 760)
+        apply_adaptive_window_geometry(
+            self.window,
+            width_ratio=0.8,
+            height_ratio=0.8,
+            min_width=1100,
+            min_height=760,
+            max_width=1580,
+            max_height=1080,
+        )
 
         self._strategy_name_to_id = {item.name: item.strategy_id for item in STRATEGY_DEFINITIONS}
 
@@ -653,6 +722,12 @@ class BacktestWindow:
         self.risk_amount = StringVar(value=initial_state.risk_amount)
         self.maker_fee_percent = StringVar(value=initial_state.maker_fee_percent)
         self.taker_fee_percent = StringVar(value=initial_state.taker_fee_percent)
+        self.initial_capital = StringVar(value=initial_state.initial_capital)
+        self.sizing_mode_label = StringVar(value=initial_state.sizing_mode_label)
+        self.risk_percent = StringVar(value=initial_state.risk_percent)
+        self.compounding_enabled = BooleanVar(value=initial_state.compounding_enabled)
+        self.slippage_percent = StringVar(value=initial_state.slippage_percent)
+        self.funding_rate_percent = StringVar(value=initial_state.funding_rate_percent)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
         self.position_mode_label = StringVar(value=initial_state.position_mode_label)
@@ -662,6 +737,10 @@ class BacktestWindow:
         self.report_summary = StringVar(value="点击“开始回测”后，会在这里显示报告摘要。")
         self.compare_summary = StringVar(value="暂无回测对比记录。")
         self.matrix_summary = StringVar(value="\u6682\u65e0 ATR \u6279\u91cf\u56de\u6d4b\u77e9\u9635\u3002")
+        self.heatmap_summary = StringVar(
+            value="\u53c2\u6570\u70ed\u529b\u56fe\u4f1a\u5728\u8fd9\u91cc\u663e\u793a\uff0c\u53ef\u5207\u6362\u6307\u6807\u5e76\u5355\u51fb\u5355\u5143\u683c\u8054\u52a8\u56de\u6d4b\u89c6\u56fe\u3002"
+        )
+        self.heatmap_metric = StringVar(value="总盈亏")
         self._latest_result: BacktestResult | None = None
         self._chart_zoom_window: Toplevel | None = None
         self._chart_zoom_canvas: Canvas | None = None
@@ -683,6 +762,7 @@ class BacktestWindow:
 
         self._build_layout()
         self._apply_selected_strategy_definition()
+        self._update_sizing_mode_widgets()
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
@@ -740,14 +820,43 @@ class BacktestWindow:
         self.signal_combo.grid(row=row, column=5, sticky="ew", pady=(12, 0))
 
         row += 1
-        ttk.Label(controls, text="风险金").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.risk_amount).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.size_or_risk_label = ttk.Label(controls, text="固定风险金/数量")
+        self.size_or_risk_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self.size_or_risk_entry = ttk.Entry(controls, textvariable=self.risk_amount)
+        self.size_or_risk_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
         ttk.Label(controls, text="Maker手续费(%)").grid(row=row, column=2, sticky="w", pady=(12, 0))
         ttk.Entry(controls, textvariable=self.maker_fee_percent).grid(
             row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
         )
         ttk.Label(controls, text="Taker手续费(%)").grid(row=row, column=4, sticky="w", pady=(12, 0))
         ttk.Entry(controls, textvariable=self.taker_fee_percent).grid(row=row, column=5, sticky="ew", pady=(12, 0))
+
+        row += 1
+        ttk.Label(controls, text="初始资金").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.initial_capital).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        ttk.Label(controls, text="仓位模式").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self.sizing_mode_combo = ttk.Combobox(
+            controls,
+            textvariable=self.sizing_mode_label,
+            values=list(BACKTEST_SIZING_OPTIONS.keys()),
+            state="readonly",
+        )
+        self.sizing_mode_combo.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.sizing_mode_combo.bind("<<ComboboxSelected>>", lambda *_: self._update_sizing_mode_widgets())
+        ttk.Label(controls, text="风险百分比(%)").grid(row=row, column=4, sticky="w", pady=(12, 0))
+        self.risk_percent_entry = ttk.Entry(controls, textvariable=self.risk_percent)
+        self.risk_percent_entry.grid(row=row, column=5, sticky="ew", pady=(12, 0))
+
+        row += 1
+        ttk.Label(controls, text="滑点(%)").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.slippage_percent).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        ttk.Label(controls, text="资金费率/8h(%)").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.funding_rate_percent).grid(
+            row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
+        )
+        ttk.Checkbutton(controls, text="启用复利", variable=self.compounding_enabled).grid(
+            row=row, column=4, columnspan=2, sticky="w", pady=(12, 0)
+        )
 
         row += 1
         ttk.Label(controls, text="回测K线数").grid(row=row, column=0, sticky="w", pady=(12, 0))
@@ -875,8 +984,100 @@ class BacktestWindow:
         self.matrix_grid_frame.grid(row=1, column=0, sticky="nsew")
         report_notebook.add(matrix_tab, text="\u77e9\u9635\u5bf9\u6bd4")
 
+        heatmap_tab = ttk.Frame(report_notebook, padding=8)
+        heatmap_tab.columnconfigure(0, weight=1)
+        heatmap_tab.rowconfigure(2, weight=1)
+        heatmap_toolbar = ttk.Frame(heatmap_tab)
+        heatmap_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        heatmap_toolbar.columnconfigure(2, weight=1)
+        ttk.Label(heatmap_toolbar, text="热力指标").grid(row=0, column=0, sticky="w")
+        heatmap_metric_combo = ttk.Combobox(
+            heatmap_toolbar,
+            textvariable=self.heatmap_metric,
+            values=("总盈亏", "盈亏回撤比", "胜率", "交易数"),
+            state="readonly",
+            width=16,
+        )
+        heatmap_metric_combo.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        heatmap_metric_combo.bind("<<ComboboxSelected>>", lambda *_: self._show_batch_heatmap(self._current_matrix_batch_label))
+        ttk.Label(
+            heatmap_toolbar,
+            text="单击单元格可切换到对应回测。",
+            foreground="#57606a",
+        ).grid(row=0, column=2, sticky="e", padx=(12, 0))
+        ttk.Label(
+            heatmap_tab,
+            textvariable=self.heatmap_summary,
+            justify="left",
+            wraplength=860,
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.heatmap_canvas = Canvas(heatmap_tab, background="#ffffff", highlightthickness=0)
+        self.heatmap_canvas.grid(row=2, column=0, sticky="nsew")
+        self.heatmap_canvas.bind("<Configure>", lambda *_: self._show_batch_heatmap(self._current_matrix_batch_label))
+        report_notebook.add(heatmap_tab, text="参数热力图")
+
+        stats_tab = ttk.Frame(report_notebook, padding=8)
+        stats_tab.columnconfigure(0, weight=1)
+        stats_tab.rowconfigure(0, weight=1)
+        stats_notebook = ttk.Notebook(stats_tab)
+        stats_notebook.grid(row=0, column=0, sticky="nsew")
+
+        monthly_tab = ttk.Frame(stats_notebook, padding=8)
+        monthly_tab.columnconfigure(0, weight=1)
+        monthly_tab.rowconfigure(0, weight=1)
+        self.monthly_stats_tree = ttk.Treeview(
+            monthly_tab,
+            columns=("period", "trades", "win_rate", "pnl", "return_pct", "drawdown", "drawdown_pct", "end_equity"),
+            show="headings",
+            selectmode="browse",
+        )
+        for column, label, width in (
+            ("period", "月份", 90),
+            ("trades", "交易数", 70),
+            ("win_rate", "胜率", 80),
+            ("pnl", "总盈亏", 100),
+            ("return_pct", "收益率", 90),
+            ("drawdown", "最大回撤", 100),
+            ("drawdown_pct", "回撤比例", 90),
+            ("end_equity", "期末权益", 110),
+        ):
+            self.monthly_stats_tree.heading(column, text=label)
+            self.monthly_stats_tree.column(column, width=width, anchor="e" if column != "period" else "center")
+        self.monthly_stats_tree.grid(row=0, column=0, sticky="nsew")
+        stats_notebook.add(monthly_tab, text="月度统计")
+
+        yearly_tab = ttk.Frame(stats_notebook, padding=8)
+        yearly_tab.columnconfigure(0, weight=1)
+        yearly_tab.rowconfigure(0, weight=1)
+        self.yearly_stats_tree = ttk.Treeview(
+            yearly_tab,
+            columns=("period", "trades", "win_rate", "pnl", "return_pct", "drawdown", "drawdown_pct", "end_equity"),
+            show="headings",
+            selectmode="browse",
+        )
+        for column, label, width in (
+            ("period", "年份", 90),
+            ("trades", "交易数", 70),
+            ("win_rate", "胜率", 80),
+            ("pnl", "总盈亏", 100),
+            ("return_pct", "收益率", 90),
+            ("drawdown", "最大回撤", 100),
+            ("drawdown_pct", "回撤比例", 90),
+            ("end_equity", "期末权益", 110),
+        ):
+            self.yearly_stats_tree.heading(column, text=label)
+            self.yearly_stats_tree.column(column, width=width, anchor="e" if column != "period" else "center")
+        self.yearly_stats_tree.grid(row=0, column=0, sticky="nsew")
+        stats_notebook.add(yearly_tab, text="年度统计")
+        report_notebook.add(stats_tab, text="周期统计")
+
+        trade_tree_frame = ttk.Frame(trades_frame)
+        trade_tree_frame.grid(row=0, column=0, sticky="nsew")
+        trade_tree_frame.columnconfigure(0, weight=1)
+        trade_tree_frame.rowconfigure(0, weight=1)
+
         self.trade_tree = ttk.Treeview(
-            trades_frame,
+            trade_tree_frame,
             columns=("signal", "entry_time", "entry", "exit_time", "exit", "reason", "pnl", "r"),
             show="headings",
             selectmode="browse",
@@ -898,8 +1099,11 @@ class BacktestWindow:
         self.trade_tree.column("pnl", width=110, anchor="e")
         self.trade_tree.column("r", width=90, anchor="e")
         self.trade_tree.grid(row=0, column=0, sticky="nsew")
+        trade_tree_scroll_y = ttk.Scrollbar(trade_tree_frame, orient="vertical", command=self.trade_tree.yview)
+        self.trade_tree.configure(yscrollcommand=trade_tree_scroll_y.set)
+        trade_tree_scroll_y.grid(row=0, column=1, sticky="ns")
 
-        self.chart_frame = ttk.LabelFrame(self.window, text="K线图与止盈止损触发位置 | 暂无选中回测", padding=12)
+        self.chart_frame = ttk.LabelFrame(self.window, text="K线图、资金曲线与止盈止损触发位置 | 暂无选中回测", padding=12)
         self.chart_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
         self.chart_frame.columnconfigure(0, weight=1)
         self.chart_frame.rowconfigure(1, weight=1)
@@ -909,7 +1113,7 @@ class BacktestWindow:
         chart_toolbar.columnconfigure(0, weight=1)
         ttk.Label(
             chart_toolbar,
-            text="支持滚轮缩放、按住左键拖动平移，可使用“图表大窗”或双击主图放大观察。",
+            text="支持滚轮缩放、按住左键拖动平移；上方显示K线与EMA，下方显示资金曲线，可使用“图表大窗”或双击主图放大观察。",
         ).grid(row=0, column=0, sticky="w")
         ttk.Button(chart_toolbar, text="重置视图", command=self.reset_main_chart_view).grid(row=0, column=1, sticky="e", padx=(0, 8))
         ttk.Button(chart_toolbar, text="图表大窗", command=self.open_chart_zoom_window).grid(row=0, column=2, sticky="e")
@@ -919,6 +1123,21 @@ class BacktestWindow:
         self.chart_canvas.bind("<Double-Button-1>", lambda *_: self.open_chart_zoom_window())
         self.chart_canvas.bind("<Configure>", self._schedule_chart_redraw)
         self._bind_chart_interactions(self.chart_canvas)
+
+    def _update_sizing_mode_widgets(self) -> None:
+        mode = BACKTEST_SIZING_OPTIONS.get(self.sizing_mode_label.get(), "fixed_risk")
+        if mode == "fixed_size":
+            self.size_or_risk_label.configure(text="固定数量")
+            self.size_or_risk_entry.configure(state="normal")
+            self.risk_percent_entry.configure(state="disabled")
+        elif mode == "risk_percent":
+            self.size_or_risk_label.configure(text="固定风险金/数量")
+            self.size_or_risk_entry.configure(state="disabled")
+            self.risk_percent_entry.configure(state="normal")
+        else:
+            self.size_or_risk_label.configure(text="固定风险金")
+            self.size_or_risk_entry.configure(state="normal")
+            self.risk_percent_entry.configure(state="disabled")
 
     def start_backtest(self) -> None:
         try:
@@ -990,11 +1209,13 @@ class BacktestWindow:
             self.compare_tree.see(snapshot.snapshot_id)
         self._update_compare_detail(snapshot)
         self._show_batch_matrix_for_snapshot(snapshot.snapshot_id)
+        self._populate_period_stats(self.monthly_stats_tree, result.monthly_stats)
+        self._populate_period_stats(self.yearly_stats_tree, result.yearly_stats)
         self._redraw_all_charts()
 
     def _show_backtest_error(self, exc: Exception) -> None:
         self.report_summary.set("回测失败")
-        self._set_chart_title("K线图与止盈止损触发位置 | 回测失败")
+        self._set_chart_title("K线图、资金曲线与止盈止损触发位置 | 回测失败")
         messagebox.showerror("回测失败", str(exc), parent=self.window)
 
     def start_backtest(self) -> None:
@@ -1046,7 +1267,7 @@ class BacktestWindow:
         self.trade_tree.delete(*self.trade_tree.get_children())
         self._reset_chart_views()
         self._clear_chart_canvas(self.chart_canvas)
-        self._set_chart_title("K线图与止盈止损触发位置 | 正在准备回测")
+        self._set_chart_title("K线图、资金曲线与止盈止损触发位置 | 正在准备回测")
         if self._chart_zoom_canvas is not None and self._chart_zoom_canvas.winfo_exists():
             self._clear_chart_canvas(self._chart_zoom_canvas)
 
@@ -1057,7 +1278,7 @@ class BacktestWindow:
     def _build_chart_title_for_snapshot(self, snapshot: _BacktestSnapshot) -> str:
         signal_label = SIGNAL_VALUE_TO_LABEL.get(snapshot.config.signal_mode, snapshot.config.signal_mode)
         return (
-            "K线图与止盈止损触发位置 | "
+            "K线图、资金曲线与止盈止损触发位置 | "
             f"{snapshot.snapshot_id} | "
             f"{STRATEGY_ID_TO_NAME.get(snapshot.config.strategy_id, snapshot.config.strategy_id)} | "
             f"{snapshot.config.inst_id} | "
@@ -1161,6 +1382,17 @@ class BacktestWindow:
 
     def _build_config(self) -> StrategyConfig:
         definition = self._selected_strategy_definition()
+        sizing_mode = BACKTEST_SIZING_OPTIONS[self.sizing_mode_label.get()]
+        size_or_risk = self._parse_positive_decimal(self.risk_amount.get(), "固定风险金/数量")
+        risk_percent = None
+        order_size = Decimal("0")
+        risk_amount = None
+        if sizing_mode == "fixed_size":
+            order_size = size_or_risk
+        elif sizing_mode == "risk_percent":
+            risk_percent = self._parse_positive_decimal(self.risk_percent.get(), "风险百分比")
+        else:
+            risk_amount = size_or_risk
         return StrategyConfig(
             inst_id=self.symbol.get().strip().upper(),
             bar=_backtest_bar_value_from_label(self.bar_label.get()),
@@ -1169,14 +1401,21 @@ class BacktestWindow:
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
             atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
-            order_size=Decimal("0"),
+            order_size=order_size,
             trade_mode=TRADE_MODE_OPTIONS[self.trade_mode_label.get()],
             signal_mode=SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()],
             position_mode=POSITION_MODE_OPTIONS[self.position_mode_label.get()],
             environment=ENV_OPTIONS[self.environment_label.get()],
             tp_sl_trigger_type=TRIGGER_TYPE_OPTIONS[self.trigger_type_label.get()],
             strategy_id=definition.strategy_id,
-            risk_amount=self._parse_positive_decimal(self.risk_amount.get(), "风险金"),
+            risk_amount=risk_amount,
+            backtest_initial_capital=self._parse_positive_decimal(self.initial_capital.get(), "初始资金"),
+            backtest_sizing_mode=sizing_mode,
+            backtest_risk_percent=risk_percent,
+            backtest_compounding=bool(self.compounding_enabled.get()),
+            backtest_slippage_rate=self._parse_nonnegative_decimal(self.slippage_percent.get(), "滑点") / Decimal("100"),
+            backtest_funding_rate=self._parse_nonnegative_decimal(self.funding_rate_percent.get(), "资金费率/8h")
+            / Decimal("100"),
         )
 
     def _selected_strategy_definition(self) -> StrategyDefinition:
@@ -1239,6 +1478,8 @@ class BacktestWindow:
         if snapshot is None:
             self.compare_detail_text.delete("1.0", END)
             self._show_batch_matrix(None)
+            self._populate_period_stats(self.monthly_stats_tree, [])
+            self._populate_period_stats(self.yearly_stats_tree, [])
             return
         if snapshot.snapshot_id != self._current_snapshot_id:
             self._load_snapshot(snapshot.snapshot_id)
@@ -1264,6 +1505,7 @@ class BacktestWindow:
         self._current_matrix_batch_label = batch_label
         for child in self.matrix_grid_frame.winfo_children():
             child.destroy()
+        self._show_batch_heatmap(batch_label)
 
         if not batch_label:
             self.matrix_summary.set("\u5f53\u524d\u6240\u9009\u56de\u6d4b\u4e0d\u5c5e\u4e8e ATR \u6279\u91cf\u77e9\u9635\u3002")
@@ -1338,6 +1580,102 @@ class BacktestWindow:
                     command=lambda sid=snapshot.snapshot_id: self._load_snapshot(sid),
                 ).grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
 
+    def _show_batch_heatmap(self, batch_label: str | None) -> None:
+        canvas = getattr(self, "heatmap_canvas", None)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 640)
+        height = max(canvas.winfo_height(), 340)
+        if not batch_label:
+            self.heatmap_summary.set("参数热力图会在这里显示，可切换指标并单击单元格联动回测视图。")
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="当前没有可显示的参数热力图。",
+                fill="#6e7781",
+                font=("Microsoft YaHei UI", 11),
+            )
+            return
+
+        snapshot_ids = self._batch_snapshot_groups.get(batch_label, [])
+        snapshots = [self._backtest_snapshots[snapshot_id] for snapshot_id in snapshot_ids if snapshot_id in self._backtest_snapshots]
+        if not snapshots:
+            self.heatmap_summary.set("当前批次暂无热力图数据。")
+            canvas.create_text(width / 2, height / 2, text="当前批次暂无热力图数据。", fill="#6e7781")
+            return
+
+        metric_label = self.heatmap_metric.get()
+        signal_label = SIGNAL_VALUE_TO_LABEL.get(snapshots[0].config.signal_mode, snapshots[0].config.signal_mode)
+        symbol_text = snapshots[0].config.inst_id
+        bar_text = _normalize_backtest_bar_label(snapshots[0].config.bar)
+        self.heatmap_summary.set(
+            f"批次：{batch_label} | 交易对：{symbol_text} | 周期：{bar_text} | 信号方向：{signal_label} | 指标：{metric_label}"
+        )
+        values = [_heatmap_metric_value(snapshot, metric_label) for snapshot in snapshots]
+        min_value = min(values) if values else Decimal("0")
+        max_value = max(values) if values else Decimal("0")
+        left = 92
+        top = 60
+        right = 24
+        bottom = 20
+        grid_width = width - left - right
+        grid_height = height - top - bottom
+        cell_width = grid_width / max(len(ATR_BATCH_TAKE_RATIOS), 1)
+        cell_height = grid_height / max(len(ATR_BATCH_MULTIPLIERS), 1)
+
+        snapshot_map = {
+            (snapshot.config.atr_stop_multiplier, snapshot.config.atr_take_multiplier): snapshot
+            for snapshot in snapshots
+        }
+        canvas.create_rectangle(left, top, left + grid_width, top + grid_height, outline="#d0d7de", width=1)
+        for column, take_ratio in enumerate(ATR_BATCH_TAKE_RATIOS):
+            x1 = left + (column * cell_width)
+            x2 = x1 + cell_width
+            canvas.create_text(
+                (x1 + x2) / 2,
+                top - 22,
+                text=f"TP = SL x{format_decimal(take_ratio)}",
+                fill="#57606a",
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
+        for row, stop_multiplier in enumerate(ATR_BATCH_MULTIPLIERS):
+            y1 = top + (row * cell_height)
+            y2 = y1 + cell_height
+            canvas.create_text(
+                left - 12,
+                (y1 + y2) / 2,
+                text=f"SL x{format_decimal(stop_multiplier)}",
+                anchor="e",
+                fill="#57606a",
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
+            for column, take_ratio in enumerate(ATR_BATCH_TAKE_RATIOS):
+                take_multiplier = stop_multiplier * take_ratio
+                snapshot = snapshot_map.get((stop_multiplier, take_multiplier))
+                x1 = left + (column * cell_width)
+                y1 = top + (row * cell_height)
+                x2 = x1 + cell_width
+                y2 = y1 + cell_height
+                fill = "#f3f4f6"
+                text = "--"
+                if snapshot is not None:
+                    value = _heatmap_metric_value(snapshot, metric_label)
+                    fill = _heatmap_fill_color(value, min_value, max_value)
+                    text = _heatmap_metric_text(snapshot, metric_label)
+                item_id = canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="#d0d7de")
+                text_id = canvas.create_text(
+                    (x1 + x2) / 2,
+                    (y1 + y2) / 2,
+                    text=text,
+                    width=cell_width - 14,
+                    fill="#24292f",
+                    font=("Microsoft YaHei UI", 11),
+                )
+                if snapshot is not None:
+                    canvas.tag_bind(item_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+                    canvas.tag_bind(text_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+
     def _selected_compare_snapshot(self) -> _BacktestSnapshot | None:
         selection = self.compare_tree.selection()
         if not selection:
@@ -1366,7 +1704,9 @@ class BacktestWindow:
         self.compare_detail_text.delete("1.0", END)
         self._update_compare_summary()
         self._show_batch_matrix(None)
-        self._set_chart_title("K线图与止盈止损触发位置 | 暂无选中回测")
+        self._populate_period_stats(self.monthly_stats_tree, [])
+        self._populate_period_stats(self.yearly_stats_tree, [])
+        self._set_chart_title("K线图、资金曲线与止盈止损触发位置 | 暂无选中回测")
 
     def _load_snapshot(self, snapshot_id: str) -> None:
         snapshot = self._backtest_snapshots[snapshot_id]
@@ -1553,6 +1893,25 @@ class BacktestWindow:
         if inner_width <= 0 or inner_height <= 0:
             return
 
+        panel_gap = 14
+        drawdown_panel_height = max(72, min(110, int(inner_height * 0.16)))
+        net_panel_height = max(84, min(150, int(inner_height * 0.22)))
+        reserved_height = net_panel_height + drawdown_panel_height + (panel_gap * 2)
+        if inner_height - reserved_height < 140:
+            drawdown_panel_height = max(64, min(90, int(inner_height * 0.14)))
+            net_panel_height = max(76, min(120, int(inner_height * 0.2)))
+            panel_gap = 10
+            reserved_height = net_panel_height + drawdown_panel_height + (panel_gap * 2)
+        price_panel_height = max(inner_height - reserved_height, 120)
+        price_bottom = top + price_panel_height
+        net_top = price_bottom + panel_gap
+        net_bottom = net_top + net_panel_height
+        drawdown_top = net_bottom + panel_gap
+        drawdown_bottom = height - bottom
+        if drawdown_bottom <= drawdown_top:
+            drawdown_top = net_bottom + 8
+            drawdown_bottom = height - bottom
+
         viewport = self._viewport_for_canvas(canvas)
         start_index, visible_count = _normalize_chart_viewport(
             viewport.start_index,
@@ -1567,6 +1926,11 @@ class BacktestWindow:
             right=right,
             top=top,
             bottom=bottom,
+            price_bottom=price_bottom,
+            net_top=net_top,
+            net_bottom=net_bottom,
+            drawdown_top=drawdown_top,
+            drawdown_bottom=drawdown_bottom,
             width=width,
             height=height,
             start_index=start_index,
@@ -1577,6 +1941,16 @@ class BacktestWindow:
         visible_candles = candles[start_index:end_index]
         visible_ema = result.ema_values[start_index:end_index]
         visible_trend_ema = result.trend_ema_values[start_index:end_index]
+        visible_net_value = (
+            result.net_value_curve[start_index:end_index]
+            if result.net_value_curve
+            else [Decimal("0") for _ in visible_candles]
+        )
+        visible_drawdown = (
+            [Decimal("0") - value for value in result.drawdown_pct_curve[start_index:end_index]]
+            if result.drawdown_pct_curve
+            else [Decimal("0") for _ in visible_candles]
+        )
 
         plotted_prices = [float(candle.high) for candle in visible_candles] + [float(candle.low) for candle in visible_candles]
         plotted_prices.extend(float(value) for value in visible_ema)
@@ -1600,15 +1974,41 @@ class BacktestWindow:
 
         def y_for(price: Decimal) -> float:
             ratio = (price_max - float(price)) / (price_max - price_min)
-            return top + (ratio * inner_height)
+            return top + (ratio * price_panel_height)
+
+        net_floor = min((float(value) for value in visible_net_value), default=0.0)
+        net_ceiling = max((float(value) for value in visible_net_value), default=0.0)
+        net_min = min(net_floor, 0.0)
+        net_max = max(net_ceiling, 0.0)
+        if net_max == net_min:
+            padding = max(abs(net_max) * 0.1, 1.0)
+            net_max += padding
+            net_min -= padding
+
+        def y_for_net_value(value: Decimal) -> float:
+            ratio = (net_max - float(value)) / (net_max - net_min)
+            return net_top + (ratio * max(net_bottom - net_top, 1))
+
+        drawdown_floor = min((float(value) for value in visible_drawdown), default=0.0)
+        drawdown_min = min(drawdown_floor, -0.01)
+        drawdown_max = 0.0
+        if drawdown_max == drawdown_min:
+            drawdown_min -= 1.0
+
+        def y_for_drawdown(value: Decimal) -> float:
+            ratio = (drawdown_max - float(value)) / (drawdown_max - drawdown_min)
+            return drawdown_top + (ratio * max(drawdown_bottom - drawdown_top, 1))
+
+        candle_step = inner_width / max(visible_count, 1)
 
         def x_for(global_index: int) -> float:
             return left + ((global_index - start_index) * candle_step) + (candle_step / 2)
 
-        candle_step = inner_width / max(visible_count, 1)
         body_width = max(2.0, candle_step * 0.6)
 
-        canvas.create_rectangle(left, top, width - right, height - bottom, outline="#d0d7de")
+        canvas.create_rectangle(left, top, width - right, price_bottom, outline="#d0d7de")
+        canvas.create_rectangle(left, net_top, width - right, net_bottom, outline="#d0d7de")
+        canvas.create_rectangle(left, drawdown_top, width - right, drawdown_bottom, outline="#d0d7de")
         canvas.create_text(
             left,
             top - 6,
@@ -1630,17 +2030,58 @@ class BacktestWindow:
                 font=("Microsoft YaHei UI", 9),
             )
 
+        net_axis_steps = 1 if fast_mode else 3
+        for net_value in _chart_price_axis_values(Decimal(str(net_min)), Decimal(str(net_max)), steps=net_axis_steps):
+            y = y_for_net_value(net_value)
+            canvas.create_line(left, y, width - right, y, fill="#eef2f7", dash=(2, 4))
+            canvas.create_text(
+                left - 8,
+                y,
+                text=format_decimal_fixed(net_value, 2),
+                anchor="e",
+                fill="#57606a",
+                font=("Microsoft YaHei UI", 9),
+            )
+
+        if net_min < 0 < net_max:
+            zero_y = y_for_net_value(Decimal("0"))
+            canvas.create_line(left, zero_y, width - right, zero_y, fill="#8c959f", dash=(4, 3))
+
+        for drawdown_value in _chart_price_axis_values(Decimal(str(drawdown_min)), Decimal("0"), steps=2 if fast_mode else 3):
+            y = y_for_drawdown(drawdown_value)
+            canvas.create_line(left, y, width - right, y, fill="#eef2f7", dash=(2, 4))
+            canvas.create_text(
+                left - 8,
+                y,
+                text=f"{format_decimal_fixed(abs(drawdown_value), 2)}%",
+                anchor="e",
+                fill="#57606a",
+                font=("Microsoft YaHei UI", 9),
+            )
+
         ema_points: list[float] = []
         if visible_ema:
             for index, ema_value in enumerate(visible_ema, start=start_index):
                 x = x_for(index)
                 ema_points.extend((x, y_for(ema_value)))
 
-        ema55_points: list[float] = []
+        trend_ema_points: list[float] = []
         if visible_trend_ema:
-            for index, ema55_value in enumerate(visible_trend_ema, start=start_index):
+            for index, trend_ema_value in enumerate(visible_trend_ema, start=start_index):
                 x = x_for(index)
-                ema55_points.extend((x, y_for(ema55_value)))
+                trend_ema_points.extend((x, y_for(trend_ema_value)))
+
+        net_value_points: list[float] = []
+        if visible_net_value:
+            for index, net_value in enumerate(visible_net_value, start=start_index):
+                x = x_for(index)
+                net_value_points.extend((x, y_for_net_value(net_value)))
+
+        drawdown_points: list[float] = []
+        if visible_drawdown:
+            for index, drawdown_value in enumerate(visible_drawdown, start=start_index):
+                x = x_for(index)
+                drawdown_points.extend((x, y_for_drawdown(drawdown_value)))
 
         for index, candle in enumerate(visible_candles, start=start_index):
             x = x_for(index)
@@ -1692,7 +2133,7 @@ class BacktestWindow:
         time_label_target = 4 if fast_mode else 6
         for time_index in _chart_time_label_indices(start_index, end_index, target_labels=time_label_target):
             x = x_for(time_index)
-            canvas.create_line(x, top, x, height - bottom, fill="#f3f4f6", dash=(2, 4))
+            canvas.create_line(x, top, x, drawdown_bottom, fill="#f3f4f6", dash=(2, 4))
             canvas.create_line(x, height - bottom, x, height - bottom + 5, fill="#8c959f")
             canvas.create_text(
                 x,
@@ -1713,8 +2154,8 @@ class BacktestWindow:
                 fill="#ff8c00",
                 font=("Microsoft YaHei UI", 10, "bold"),
             )
-        if len(ema55_points) >= 4:
-            canvas.create_line(*ema55_points, fill="#0a7f5a", width=2, smooth=not fast_mode)
+        if len(trend_ema_points) >= 4:
+            canvas.create_line(*trend_ema_points, fill="#0a7f5a", width=2, smooth=not fast_mode)
             canvas.create_text(
                 width - right,
                 top + 30,
@@ -1723,6 +2164,26 @@ class BacktestWindow:
                 fill="#0a7f5a",
                 font=("Microsoft YaHei UI", 10, "bold"),
             )
+        if len(net_value_points) >= 4:
+            canvas.create_line(*net_value_points, fill="#0969da", width=2, smooth=not fast_mode)
+        if len(drawdown_points) >= 4:
+            canvas.create_line(*drawdown_points, fill="#d1242f", width=2, smooth=not fast_mode)
+        canvas.create_text(
+            width - right,
+            net_top + 12,
+            text="净值曲线",
+            anchor="ne",
+            fill="#0969da",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        canvas.create_text(
+            width - right,
+            drawdown_top + 12,
+            text="回撤曲线(%)",
+            anchor="ne",
+            fill="#d1242f",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
         if not fast_mode:
             self._render_chart_hover(canvas)
 
@@ -1745,7 +2206,7 @@ class BacktestWindow:
             x,
             state.top,
             x,
-            state.height - state.bottom,
+            state.drawdown_bottom,
             fill="#8b949e",
             dash=(4, 4),
             tags=("chart-hover",),
@@ -1754,6 +2215,10 @@ class BacktestWindow:
             candle=candle,
             ema_value=ema_value,
             trend_ema_value=trend_ema_value,
+            equity_value=self._latest_result.net_value_curve[hover_index] if self._latest_result.net_value_curve else Decimal("0"),
+            drawdown_pct_value=self._latest_result.drawdown_pct_curve[hover_index]
+            if self._latest_result.drawdown_pct_curve
+            else Decimal("0"),
             ema_period=self.ema_period.get().strip(),
             trend_ema_period=str(self._latest_result.trend_ema_period),
             tick_size=self._latest_result.instrument.tick_size,
@@ -1787,10 +2252,29 @@ class BacktestWindow:
         canvas.create_text(
             width / 2,
             height / 2,
-            text="\u8fd0\u884c\u56de\u6d4b\u540e\uff0c\u8fd9\u91cc\u4f1a\u663e\u793a K \u7ebf\u3001EMA \u548c\u4ea4\u6613\u8def\u5f84\u3002",
+            text="\u8fd0\u884c\u56de\u6d4b\u540e\uff0c\u8fd9\u91cc\u4f1a\u663e\u793a K \u7ebf\u3001EMA\u3001\u51c0\u503c\u66f2\u7ebf\u3001\u56de\u64a4\u66f2\u7ebf\u548c\u4ea4\u6613\u8def\u5f84\u3002",
             fill="#6e7781",
             font=("Microsoft YaHei UI", 11),
         )
+
+    def _populate_period_stats(self, tree: ttk.Treeview, stats: list) -> None:
+        tree.delete(*tree.get_children())
+        for index, stat in enumerate(stats, start=1):
+            tree.insert(
+                "",
+                END,
+                iid=f"S{index:03d}",
+                values=(
+                    stat.period_label,
+                    stat.trades,
+                    f"{format_decimal_fixed(stat.win_rate, 2)}%",
+                    format_decimal_fixed(stat.total_pnl, 4),
+                    f"{format_decimal_fixed(stat.return_pct, 2)}%",
+                    format_decimal_fixed(stat.max_drawdown, 4),
+                    f"{format_decimal_fixed(stat.max_drawdown_pct, 2)}%",
+                    format_decimal_fixed(stat.end_equity, 2),
+                ),
+            )
 
     def _schedule_chart_redraw(self, *_: object, delay_ms: int = 16) -> None:
         if self._latest_result is None:
@@ -1835,8 +2319,15 @@ class BacktestWindow:
 
         zoom_window = Toplevel(self.window)
         zoom_window.title("\u56de\u6d4b\u56fe\u8868\u5927\u7a97")
-        zoom_window.geometry("1680x980")
-        zoom_window.minsize(1200, 720)
+        apply_adaptive_window_geometry(
+            zoom_window,
+            width_ratio=0.9,
+            height_ratio=0.88,
+            min_width=1200,
+            min_height=720,
+            max_width=1880,
+            max_height=1160,
+        )
         zoom_window.columnconfigure(0, weight=1)
         zoom_window.rowconfigure(1, weight=1)
         zoom_window.protocol("WM_DELETE_WINDOW", self._close_chart_zoom_window)
@@ -1850,7 +2341,7 @@ class BacktestWindow:
         toolbar.columnconfigure(0, weight=1)
         ttk.Label(
             toolbar,
-            text="放大图表：适合全面观察 K 线结构、EMA 轨迹和 TP/SL 触发位置，支持滚轮缩放和拖动平移。",
+            text="放大图表：适合全面观察 K 线结构、EMA 轨迹、资金曲线和 TP/SL 触发位置，支持滚轮缩放和拖动平移。",
         ).grid(row=0, column=0, sticky="w")
         ttk.Button(toolbar, text="重置视图", command=self.reset_zoom_chart_view).grid(row=0, column=1, sticky="e", padx=(0, 8))
         ttk.Button(toolbar, text="关闭", command=self._close_chart_zoom_window).grid(row=0, column=2, sticky="e")
@@ -1894,6 +2385,15 @@ class BacktestWindow:
             raise ValueError(f"{field_name} 不是有效数字") from exc
         if value <= 0:
             raise ValueError(f"{field_name} 必须大于 0")
+        return value
+
+    def _parse_nonnegative_decimal(self, raw: str, field_name: str) -> Decimal:
+        try:
+            value = Decimal(raw)
+        except InvalidOperation as exc:
+            raise ValueError(f"{field_name} 不是有效数字") from exc
+        if value < 0:
+            raise ValueError(f"{field_name} 不能小于 0")
         return value
 
     def _parse_fee_percent(self, raw: str, field_name: str) -> Decimal:
@@ -2052,6 +2552,8 @@ def _format_chart_hover_lines(
     candle,
     ema_value: Decimal,
     trend_ema_value: Decimal,
+    equity_value: Decimal,
+    drawdown_pct_value: Decimal,
     ema_period: str,
     trend_ema_period: str,
     tick_size: Decimal,
@@ -2065,6 +2567,8 @@ def _format_chart_hover_lines(
         ),
         f"EMA({ema_period}): {_format_price_by_tick_size(ema_value, tick_size)}",
         f"趋势EMA({trend_ema_period}): {_format_price_by_tick_size(trend_ema_value, tick_size)}",
+        f"净值曲线: {format_decimal_fixed(equity_value, 2)}",
+        f"当前回撤: {format_decimal_fixed(drawdown_pct_value, 2)}%",
     ]
 
 
@@ -2077,3 +2581,55 @@ def _decimal_places_for_tick_size(tick_size: Decimal) -> int:
     normalized = tick_size.normalize()
     exponent = normalized.as_tuple().exponent
     return max(-exponent, 0)
+
+
+def _heatmap_metric_value(snapshot: _BacktestSnapshot, metric_label: str) -> Decimal:
+    report = snapshot.report
+    if metric_label == "胜率":
+        return report.win_rate
+    if metric_label == "交易数":
+        return Decimal(report.total_trades)
+    if metric_label == "盈亏回撤比":
+        if report.max_drawdown <= 0:
+            return Decimal("0")
+        return report.total_pnl / report.max_drawdown
+    return report.total_pnl
+
+
+def _heatmap_metric_text(snapshot: _BacktestSnapshot, metric_label: str) -> str:
+    value = _heatmap_metric_value(snapshot, metric_label)
+    if metric_label == "胜率":
+        return f"{format_decimal_fixed(value, 2)}%"
+    if metric_label == "交易数":
+        return f"{snapshot.report.total_trades}笔"
+    if metric_label == "盈亏回撤比":
+        return format_decimal_fixed(value, 2)
+    return format_decimal_fixed(value, 4)
+
+
+def _heatmap_fill_color(value: Decimal, min_value: Decimal, max_value: Decimal) -> str:
+    if max_value == min_value:
+        return "#eef2f7"
+    if min_value < 0 < max_value:
+        span = max(abs(min_value), abs(max_value))
+        if span <= 0:
+            return "#eef2f7"
+        intensity = float(min(abs(value) / span, Decimal("1")))
+        if value > 0:
+            red = int(235 - (55 * intensity))
+            green = int(248 - (40 * intensity))
+            blue = int(235 - (145 * intensity))
+            return f"#{red:02x}{green:02x}{blue:02x}"
+        if value < 0:
+            red = int(248 - (12 * intensity))
+            green = int(236 - (120 * intensity))
+            blue = int(236 - (120 * intensity))
+            return f"#{red:02x}{green:02x}{blue:02x}"
+        return "#eef2f7"
+    ratio = float((value - min_value) / (max_value - min_value))
+    start = (238, 242, 247)
+    end = (18, 133, 63)
+    red = int(start[0] + ((end[0] - start[0]) * ratio))
+    green = int(start[1] + ((end[1] - start[1]) * ratio))
+    blue = int(start[2] + ((end[2] - start[2]) * ratio))
+    return f"#{red:02x}{green:02x}{blue:02x}"

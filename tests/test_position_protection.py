@@ -10,12 +10,16 @@ from okx_quant.position_protection import (
     PositionProtectionManager,
     ProtectionReplayPoint,
     build_close_order_price,
+    build_close_order_price_from_mark,
+    compute_option_intrinsic_price,
     describe_protection_price_logic,
     evaluate_protection_trigger,
     infer_protection_profit_on_rise,
     infer_default_spot_inst_id,
+    infer_option_strike,
     normalize_spot_inst_id,
     replay_option_protection,
+    validate_protection_order_price_guard,
     wait_order_fill,
 )
 from okx_quant.ui import (
@@ -98,6 +102,63 @@ class _StubPriceClient:
         return self._mark_price
 
 
+class _TickerQuote:
+    def __init__(
+        self,
+        *,
+        last: Decimal | None,
+        bid: Decimal | None,
+        ask: Decimal | None,
+        mark: Decimal | None = None,
+    ) -> None:
+        self.last = last
+        self.bid = bid
+        self.ask = ask
+        self.mark = mark
+
+
+class _PriceGuardClient:
+    def __init__(
+        self,
+        *,
+        spot_price: Decimal,
+        option_mark_price: Decimal,
+        option_bid: Decimal | None,
+        option_ask: Decimal | None,
+        option_last: Decimal | None,
+        tick_size: Decimal = Decimal("0.0001"),
+    ) -> None:
+        self._spot_price = spot_price
+        self._option_mark_price = option_mark_price
+        self._option_quote = _TickerQuote(last=option_last, bid=option_bid, ask=option_ask, mark=option_mark_price)
+        self._tick_size = tick_size
+
+    def get_trigger_price(self, inst_id: str, price_type: str) -> Decimal:
+        if price_type == "mark":
+            return self._option_mark_price
+        return self._spot_price
+
+    def get_ticker(self, inst_id: str) -> _TickerQuote:
+        assert inst_id
+        return self._option_quote
+
+    def get_instrument(self, inst_id: str) -> Instrument:
+        return Instrument(
+            inst_id=inst_id,
+            inst_type="OPTION",
+            tick_size=self._tick_size,
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            settle_ccy="BTC",
+            ct_val=Decimal("1"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+            uly="BTC-USD",
+            inst_family="BTC-USD",
+        )
+
+
 class _MissingMarkPriceClient:
     def get_trigger_price(self, inst_id: str, price_type: str) -> Decimal:
         raise OkxApiError(f"{inst_id} 缺少标记价格，无法触发")
@@ -119,6 +180,8 @@ class _SimulatedProtectionClient:
         initial_position: OkxPosition,
         trigger_prices: dict[tuple[str, str], list[Decimal]],
         order_results: list[dict[str, Decimal | str | None]],
+        submit_exceptions: list[Exception | None] | None = None,
+        ticker_quotes: dict[str, dict[str, Decimal | None]] | None = None,
         option_tick_size: Decimal = Decimal("0.0001"),
         option_lot_size: Decimal = Decimal("1"),
         option_min_size: Decimal = Decimal("1"),
@@ -128,6 +191,8 @@ class _SimulatedProtectionClient:
         self._directional_position = bool(initial_position.pos_side and initial_position.pos_side.lower() != "net")
         self._trigger_prices = {key: list(values) for key, values in trigger_prices.items()}
         self._order_results = list(order_results)
+        self._submit_exceptions = list(submit_exceptions or [])
+        self._ticker_quotes = dict(ticker_quotes or {})
         self._order_lookup: dict[str, dict[str, Decimal | str | None]] = {}
         self.price_requests: list[tuple[str, str]] = []
         self.orders: list[dict[str, Decimal | str | None]] = []
@@ -149,14 +214,36 @@ class _SimulatedProtectionClient:
     def get_trigger_price(self, inst_id: str, price_type: str) -> Decimal:
         self.price_requests.append((inst_id, price_type))
         key = (inst_id, price_type)
+        if key not in self._trigger_prices and price_type == "last":
+            default_spot = infer_default_spot_inst_id(self._position_template.inst_id)
+            if inst_id == default_spot:
+                strike = infer_option_strike(self._position_template.inst_id) or Decimal("1")
+                return strike
         prices = self._trigger_prices[key]
         if len(prices) > 1:
-            return prices.pop(0)
-        return prices[0]
+            current = prices.pop(0)
+        else:
+            current = prices[0]
+        if isinstance(current, Exception):
+            raise current
+        return current
 
     def get_instrument(self, inst_id: str) -> Instrument:
         assert inst_id == self._instrument.inst_id
         return self._instrument
+
+    def get_ticker(self, inst_id: str) -> _TickerQuote:
+        quote = self._ticker_quotes.get(inst_id)
+        if quote is not None:
+            return _TickerQuote(
+                last=quote.get("last"),
+                bid=quote.get("bid"),
+                ask=quote.get("ask"),
+                mark=quote.get("mark"),
+            )
+        mark_values = self._trigger_prices.get((inst_id, "mark"), [])
+        mark_value = next((value for value in mark_values if isinstance(value, Decimal)), None)
+        return _TickerQuote(last=mark_value, bid=mark_value, ask=mark_value, mark=mark_value)
 
     def place_simple_order(
         self,
@@ -169,6 +256,7 @@ class _SimulatedProtectionClient:
         ord_type: str,
         pos_side: str | None = None,
         price: Decimal | None = None,
+        cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
         assert credentials.api_key
         assert config.environment == "live"
@@ -181,11 +269,18 @@ class _SimulatedProtectionClient:
                 "ord_type": ord_type,
                 "pos_side": pos_side,
                 "price": price,
+                "cl_ord_id": cl_ord_id,
             }
         )
         order_result = self._order_results.pop(0)
-        self._order_lookup[ord_id] = dict(order_result, applied=False)
-        return OkxOrderResult(ord_id=ord_id, cl_ord_id=None, s_code="0", s_msg="", raw={})
+        lookup_entry = dict(order_result, applied=False, cl_ord_id=cl_ord_id)
+        self._order_lookup[ord_id] = lookup_entry
+        if cl_ord_id:
+            self._order_lookup[f"cl:{cl_ord_id}"] = lookup_entry
+        submit_exc = self._submit_exceptions.pop(0) if self._submit_exceptions else None
+        if submit_exc is not None:
+            raise submit_exc
+        return OkxOrderResult(ord_id=ord_id, cl_ord_id=cl_ord_id, s_code="0", s_msg="", raw={})
 
     def get_order(
         self,
@@ -193,16 +288,18 @@ class _SimulatedProtectionClient:
         config: StrategyConfig,
         *,
         inst_id: str,
-        ord_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
     ) -> OkxOrderStatus:
         assert credentials.secret_key
         assert config.trade_mode == "cross"
-        order_result = self._order_lookup[ord_id]
+        key = ord_id or f"cl:{cl_ord_id}"
+        order_result = self._order_lookup[key]
         if not order_result["applied"]:
             self._apply_fill(order_result.get("filled_size"))
             order_result["applied"] = True
         return OkxOrderStatus(
-            ord_id=ord_id,
+            ord_id=ord_id or "from-cl-ord-id",
             state=str(order_result["state"]),
             side=None,
             ord_type="ioc",
@@ -278,12 +375,13 @@ class _OrderStatusClient:
         config: StrategyConfig,
         *,
         inst_id: str,
-        ord_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
     ) -> OkxOrderStatus:
         assert credentials.api_key
         assert config.environment
         assert inst_id
-        assert ord_id
+        assert ord_id or cl_ord_id
         self.calls += 1
         if len(self._statuses) > 1:
             return self._statuses.pop(0)
@@ -386,6 +484,44 @@ class PositionProtectionTest(TestCase):
         self.assertIn("价格上涨偏向止盈", text)
         self.assertIn("价格下跌偏向止损", text)
 
+    def test_infer_option_strike_and_intrinsic_price(self) -> None:
+        self.assertEqual(infer_option_strike("BTC-USD-20260626-80000-P"), Decimal("80000"))
+        self.assertEqual(
+            compute_option_intrinsic_price(
+                option_inst_id="BTC-USD-20260626-80000-P",
+                spot_price=Decimal("75000"),
+            ),
+            Decimal("5000") / Decimal("75000"),
+        )
+
+    def test_validate_protection_order_price_guard_blocks_unreasonable_buy_price(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "价格保护已拦截"):
+            validate_protection_order_price_guard(
+                option_inst_id="BTC-USD-20260331-66500-P",
+                close_side="buy",
+                order_price=Decimal("0.5000"),
+                tick_size=Decimal("0.0001"),
+                open_avg_price=Decimal("0.0065"),
+                spot_price=Decimal("66500"),
+                option_bid=Decimal("0.0250"),
+                option_ask=Decimal("0.0300"),
+                option_last=Decimal("0.0280"),
+            )
+
+    def test_validate_protection_order_price_guard_blocks_unreasonable_sell_price(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "价格保护已拦截"):
+            validate_protection_order_price_guard(
+                option_inst_id="BTC-USD-20260626-60000-C",
+                close_side="sell",
+                order_price=Decimal("0.0001"),
+                tick_size=Decimal("0.0001"),
+                open_avg_price=Decimal("0.0500"),
+                spot_price=Decimal("75000"),
+                option_bid=Decimal("0.1800"),
+                option_ask=Decimal("0.1850"),
+                option_last=Decimal("0.1820"),
+            )
+
     def test_ui_validation_allows_short_put_spot_take_profit_above_stop_loss(self) -> None:
         _validate_protection_price_relationship(
             option_inst_id="BTC-USD-20260626-50000-P",
@@ -415,7 +551,11 @@ class PositionProtectionTest(TestCase):
             trigger_label="option mark",
         )
         with self.assertRaisesRegex(ValueError, "不能用“期权标记价格”触发"):
-            _validate_protection_live_price_availability(_MissingMarkPriceClient(), protection)
+            _validate_protection_live_price_availability(
+                _MissingMarkPriceClient(),
+                protection,
+                _make_option_position(inst_id=protection.option_inst_id, position="-2", pos_side="short"),
+            )
 
     def test_live_price_validation_blocks_missing_mark_slippage_order(self) -> None:
         protection = OptionProtectionConfig(
@@ -436,7 +576,43 @@ class PositionProtectionTest(TestCase):
             trigger_label="spot last",
         )
         with self.assertRaisesRegex(ValueError, "不能用“标记价格加减滑点”报单"):
-            _validate_protection_live_price_availability(_MissingMarkPriceClient(), protection)
+            _validate_protection_live_price_availability(
+                _MissingMarkPriceClient(),
+                protection,
+                _make_option_position(inst_id=protection.option_inst_id, position="-2", pos_side="short"),
+            )
+
+    def test_live_price_validation_blocks_unreasonable_mark_slippage_price(self) -> None:
+        protection = OptionProtectionConfig(
+            option_inst_id="BTC-USD-20260331-66500-P",
+            trigger_inst_id="BTC-USDT",
+            trigger_price_type="last",
+            direction="short",
+            pos_side="short",
+            take_profit_trigger=Decimal("70000"),
+            stop_loss_trigger=Decimal("66500"),
+            take_profit_order_mode="mark_with_slippage",
+            take_profit_order_price=None,
+            take_profit_slippage=Decimal("0"),
+            stop_loss_order_mode="mark_with_slippage",
+            stop_loss_order_price=None,
+            stop_loss_slippage=Decimal("0"),
+            poll_seconds=2,
+            trigger_label="BTC-USDT 最新价",
+        )
+        client = _PriceGuardClient(
+            spot_price=Decimal("66500"),
+            option_mark_price=Decimal("0.5000"),
+            option_bid=Decimal("0.0250"),
+            option_ask=Decimal("0.0300"),
+            option_last=Decimal("0.0280"),
+        )
+        with self.assertRaisesRegex(ValueError, "价格保护已拦截"):
+            _validate_protection_live_price_availability(
+                client,
+                protection,
+                _make_option_position(inst_id=protection.option_inst_id, position="-1", pos_side="short"),
+            )
 
     def test_replay_short_put_spot_take_profit_uses_rise_logic(self) -> None:
         result = replay_option_protection(
@@ -689,6 +865,8 @@ class PositionProtectionTest(TestCase):
         self.assertTrue(any("止盈" in subject for subject, _ in notifier.messages))
         self.assertTrue(any("持仓保护成交" in subject for subject, _ in notifier.messages))
         self.assertTrue(any("止盈触发" in line for line in logs))
+        self.assertTrue(any("bid/ask/last/mark=" in line for line in logs))
+        self.assertTrue(any("clOrdId=" in line for line in logs))
 
     def test_manager_stop_loss_closes_short_position_from_spot_trigger_in_multiple_orders(self) -> None:
         option_inst_id = "BTC-USD-20260327-70000-P"
@@ -795,6 +973,305 @@ class PositionProtectionTest(TestCase):
 
         self.assertFalse(worker.thread.is_alive())
         self.assertEqual(client.current_position, Decimal("2"))
+        self.assertEqual(client.orders, [])
+
+    def test_manager_retries_transient_polling_errors_until_protection_completes(self) -> None:
+        option_inst_id = "BTC-USD-20260327-70000-C"
+        client = _SimulatedProtectionClient(
+            initial_position=_make_option_position(inst_id=option_inst_id, position="2", pos_side="long"),
+            trigger_prices={
+                (option_inst_id, "mark"): [
+                    OkxApiError("网络错误：_ssl.c:1015: The handshake operation timed out"),
+                    Decimal("0.0155"),
+                ],
+            },
+            order_results=[
+                {
+                    "state": "filled",
+                    "filled_size": Decimal("2"),
+                    "avg_price": Decimal("0.0152"),
+                    "price": Decimal("0.0152"),
+                    "size": Decimal("2"),
+                }
+            ],
+        )
+        notifier = _NotifierStub()
+        manager = PositionProtectionManager(
+            client,
+            lambda message: None,
+            notifier=notifier,
+            transient_alert_interval_seconds=999,
+            transient_status_interval_seconds=0,
+        )
+
+        session_id = manager.start(
+            _make_credentials(),
+            _make_strategy_config(),
+            OptionProtectionConfig(
+                option_inst_id=option_inst_id,
+                trigger_inst_id=option_inst_id,
+                trigger_price_type="mark",
+                direction="long",
+                pos_side="long",
+                take_profit_trigger=Decimal("0.0150"),
+                stop_loss_trigger=Decimal("0.0130"),
+                take_profit_order_mode="fixed_price",
+                take_profit_order_price=Decimal("0.0152"),
+                take_profit_slippage=Decimal("0"),
+                stop_loss_order_mode="fixed_price",
+                stop_loss_order_price=Decimal("0.0132"),
+                stop_loss_slippage=Decimal("0"),
+                poll_seconds=0.01,
+                trigger_label=f"{option_inst_id} mark",
+            ),
+        )
+
+        worker = manager._workers[session_id]
+        assert worker.thread is not None
+        worker.thread.join(timeout=2)
+
+        self.assertFalse(worker.thread.is_alive())
+        self.assertEqual(worker.status, "已完成")
+        self.assertEqual(client.current_position, Decimal("0"))
+        retry_subjects = [subject for subject, _ in notifier.messages if "网络重试" in subject]
+        self.assertEqual(len(retry_subjects), 1)
+        self.assertTrue(any("持仓保护触发" in subject for subject, _ in notifier.messages))
+        self.assertTrue(any("持仓保护成交" in subject for subject, _ in notifier.messages))
+        self.assertFalse(any("持仓保护异常" in subject for subject, _ in notifier.messages))
+
+    def test_manager_retries_transient_close_errors_without_duplicate_trigger_notice(self) -> None:
+        option_inst_id = "BTC-USD-20260327-70000-P"
+        spot_inst_id = "BTC-USDT"
+        client = _SimulatedProtectionClient(
+            initial_position=_make_option_position(inst_id=option_inst_id, position="2", pos_side="short"),
+            trigger_prices={
+                (spot_inst_id, "last"): [Decimal("100001")],
+                (option_inst_id, "mark"): [
+                    OkxApiError("网络错误：_ssl.c:1015: The handshake operation timed out"),
+                    Decimal("0.0150"),
+                ],
+            },
+            order_results=[
+                {
+                    "state": "filled",
+                    "filled_size": Decimal("2"),
+                    "avg_price": Decimal("0.0153"),
+                    "price": Decimal("0.0153"),
+                    "size": Decimal("2"),
+                }
+            ],
+        )
+        notifier = _NotifierStub()
+        manager = PositionProtectionManager(
+            client,
+            lambda message: None,
+            notifier=notifier,
+            transient_alert_interval_seconds=999,
+            transient_status_interval_seconds=0,
+        )
+
+        session_id = manager.start(
+            _make_credentials(),
+            _make_strategy_config(),
+            OptionProtectionConfig(
+                option_inst_id=option_inst_id,
+                trigger_inst_id=spot_inst_id,
+                trigger_price_type="last",
+                direction="short",
+                pos_side="short",
+                take_profit_trigger=Decimal("98000"),
+                stop_loss_trigger=Decimal("100000"),
+                take_profit_order_mode="mark_with_slippage",
+                take_profit_order_price=None,
+                take_profit_slippage=Decimal("0.0002"),
+                stop_loss_order_mode="mark_with_slippage",
+                stop_loss_order_price=None,
+                stop_loss_slippage=Decimal("0.0003"),
+                poll_seconds=0.01,
+                trigger_label=f"{spot_inst_id} last",
+            ),
+        )
+
+        worker = manager._workers[session_id]
+        assert worker.thread is not None
+        worker.thread.join(timeout=2)
+
+        self.assertFalse(worker.thread.is_alive())
+        self.assertEqual(worker.status, "已完成")
+        self.assertEqual(client.current_position, Decimal("0"))
+        trigger_subjects = [subject for subject, _ in notifier.messages if "持仓保护触发" in subject]
+        retry_subjects = [subject for subject, _ in notifier.messages if "网络重试" in subject]
+        self.assertEqual(len(trigger_subjects), 1)
+        self.assertEqual(len(retry_subjects), 1)
+        self.assertTrue(any("持仓保护成交" in subject for subject, _ in notifier.messages))
+
+    def test_manager_does_not_duplicate_close_order_after_submit_timeout(self) -> None:
+        option_inst_id = "BTC-USD-20260327-70000-C"
+        client = _SimulatedProtectionClient(
+            initial_position=_make_option_position(inst_id=option_inst_id, position="2", pos_side="long"),
+            trigger_prices={
+                (option_inst_id, "mark"): [Decimal("0.0155")],
+            },
+            order_results=[
+                {
+                    "state": "filled",
+                    "filled_size": Decimal("2"),
+                    "avg_price": Decimal("0.0152"),
+                    "price": Decimal("0.0152"),
+                    "size": Decimal("2"),
+                }
+            ],
+            submit_exceptions=[OkxApiError("网络错误：下单返回超时")],
+        )
+        notifier = _NotifierStub()
+        manager = PositionProtectionManager(
+            client,
+            lambda message: None,
+            notifier=notifier,
+            transient_alert_interval_seconds=999,
+            transient_status_interval_seconds=0,
+        )
+
+        session_id = manager.start(
+            _make_credentials(),
+            _make_strategy_config(),
+            OptionProtectionConfig(
+                option_inst_id=option_inst_id,
+                trigger_inst_id=option_inst_id,
+                trigger_price_type="mark",
+                direction="long",
+                pos_side="long",
+                take_profit_trigger=Decimal("0.0150"),
+                stop_loss_trigger=Decimal("0.0130"),
+                take_profit_order_mode="fixed_price",
+                take_profit_order_price=Decimal("0.0152"),
+                take_profit_slippage=Decimal("0"),
+                stop_loss_order_mode="fixed_price",
+                stop_loss_order_price=Decimal("0.0132"),
+                stop_loss_slippage=Decimal("0"),
+                poll_seconds=0.01,
+                trigger_label=f"{option_inst_id} mark",
+            ),
+        )
+
+        worker = manager._workers[session_id]
+        assert worker.thread is not None
+        worker.thread.join(timeout=2)
+
+        self.assertFalse(worker.thread.is_alive())
+        self.assertEqual(worker.status, "已完成")
+        self.assertEqual(client.current_position, Decimal("0"))
+        self.assertEqual(len(client.orders), 1)
+        self.assertIsNotNone(client.orders[0]["cl_ord_id"])
+        self.assertTrue(any("网络重试" in subject for subject, _ in notifier.messages))
+        self.assertEqual(len([subject for subject, _ in notifier.messages if "持仓保护触发" in subject]), 1)
+
+    def test_manager_blocks_unreasonable_mark_price_before_placing_close_order(self) -> None:
+        option_inst_id = "BTC-USD-20260331-66500-P"
+        spot_inst_id = "BTC-USDT"
+        client = _SimulatedProtectionClient(
+            initial_position=_make_option_position(inst_id=option_inst_id, position="-1", pos_side="short"),
+            trigger_prices={
+                (spot_inst_id, "last"): [Decimal("66500"), Decimal("66500")],
+                (option_inst_id, "mark"): [Decimal("0.5000")],
+            },
+            ticker_quotes={
+                option_inst_id: {
+                    "last": Decimal("0.0280"),
+                    "bid": Decimal("0.0250"),
+                    "ask": Decimal("0.0300"),
+                    "mark": Decimal("0.5000"),
+                }
+            },
+            order_results=[],
+        )
+        notifier = _NotifierStub()
+        manager = PositionProtectionManager(client, lambda message: None, notifier=notifier)
+
+        session_id = manager.start(
+            _make_credentials(),
+            _make_strategy_config(),
+            OptionProtectionConfig(
+                option_inst_id=option_inst_id,
+                trigger_inst_id=spot_inst_id,
+                trigger_price_type="last",
+                direction="short",
+                pos_side="short",
+                take_profit_trigger=None,
+                stop_loss_trigger=Decimal("66500"),
+                take_profit_order_mode="mark_with_slippage",
+                take_profit_order_price=None,
+                take_profit_slippage=Decimal("0"),
+                stop_loss_order_mode="mark_with_slippage",
+                stop_loss_order_price=None,
+                stop_loss_slippage=Decimal("0"),
+                poll_seconds=0.01,
+                trigger_label=f"{spot_inst_id} last",
+            ),
+        )
+
+        worker = manager._workers[session_id]
+        assert worker.thread is not None
+        worker.thread.join(timeout=2)
+
+        self.assertFalse(worker.thread.is_alive())
+        self.assertEqual(worker.status, "异常")
+        self.assertEqual(client.orders, [])
+        self.assertTrue(any("价格拦截" in subject for subject, _ in notifier.messages))
+
+    def test_manager_throttles_transient_error_notifications_while_retrying(self) -> None:
+        option_inst_id = "BTC-USD-20260327-70000-C"
+        client = _SimulatedProtectionClient(
+            initial_position=_make_option_position(inst_id=option_inst_id, position="2", pos_side="long"),
+            trigger_prices={
+                (option_inst_id, "mark"): [OkxApiError("网络错误：_ssl.c:1015: The handshake operation timed out")],
+            },
+            order_results=[],
+        )
+        notifier = _NotifierStub()
+        manager = PositionProtectionManager(
+            client,
+            lambda message: None,
+            notifier=notifier,
+            transient_alert_interval_seconds=0.05,
+            transient_status_interval_seconds=0,
+        )
+
+        session_id = manager.start(
+            _make_credentials(),
+            _make_strategy_config(),
+            OptionProtectionConfig(
+                option_inst_id=option_inst_id,
+                trigger_inst_id=option_inst_id,
+                trigger_price_type="mark",
+                direction="long",
+                pos_side="long",
+                take_profit_trigger=Decimal("0.0200"),
+                stop_loss_trigger=Decimal("0.0100"),
+                take_profit_order_mode="fixed_price",
+                take_profit_order_price=Decimal("0.0195"),
+                take_profit_slippage=Decimal("0"),
+                stop_loss_order_mode="fixed_price",
+                stop_loss_order_price=Decimal("0.0095"),
+                stop_loss_slippage=Decimal("0"),
+                poll_seconds=0.01,
+                trigger_label=f"{option_inst_id} mark",
+            ),
+        )
+
+        sleep(0.03)
+        first_retry_count = len([subject for subject, _ in notifier.messages if "网络重试" in subject])
+        self.assertEqual(first_retry_count, 1)
+
+        sleep(0.08)
+        manager.stop(session_id)
+        worker = manager._workers[session_id]
+        assert worker.thread is not None
+        worker.thread.join(timeout=1)
+
+        retry_subjects = [subject for subject, _ in notifier.messages if "网络重试" in subject]
+        self.assertGreaterEqual(len(retry_subjects), 2)
+        self.assertEqual(worker.status, "已停止")
         self.assertEqual(client.orders, [])
 
     def test_manager_enters_error_state_when_close_order_cannot_fill(self) -> None:

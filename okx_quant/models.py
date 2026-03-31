@@ -14,6 +14,7 @@ InstrumentType = Literal["SWAP", "OPTION", "SPOT"]
 TpSlMode = Literal["exchange", "local_trade", "local_signal", "local_custom"]
 EntrySideMode = Literal["follow_signal", "fixed_buy", "fixed_sell"]
 RunMode = Literal["trade", "signal_only"]
+BacktestSizingMode = Literal["fixed_risk", "fixed_size", "risk_percent"]
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,12 @@ class StrategyConfig:
     local_tp_sl_inst_id: str | None = None
     entry_side_mode: EntrySideMode = "follow_signal"
     run_mode: RunMode = "trade"
+    backtest_initial_capital: Decimal = Decimal("10000")
+    backtest_sizing_mode: BacktestSizingMode = "fixed_risk"
+    backtest_risk_percent: Decimal | None = None
+    backtest_compounding: bool = False
+    backtest_slippage_rate: Decimal = Decimal("0")
+    backtest_funding_rate: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)

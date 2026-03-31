@@ -63,8 +63,12 @@ class SignalMonitorWindow:
 
         self.window = Toplevel(parent)
         self.window.title("信号监控")
-        self.window.geometry("1160x1040")
-        self.window.minsize(1000, 900)
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+        default_width = min(max(int(screen_width * 0.78), 1220), 1680)
+        default_height = min(max(int(screen_height * 0.84), 980), 1180)
+        self.window.geometry(f"{default_width}x{default_height}")
+        self.window.minsize(1120, 900)
         self.window.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.bar = StringVar(value=self._defaults.bar)
@@ -113,10 +117,7 @@ class SignalMonitorWindow:
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
-        self.window.rowconfigure(2, weight=0)
-        self.window.rowconfigure(3, weight=1)
-        self.window.rowconfigure(4, weight=1)
-        self.window.rowconfigure(5, weight=1)
+        self.window.rowconfigure(2, weight=1)
 
         header = ttk.Frame(self.window, padding=(16, 16, 16, 8))
         header.grid(row=0, column=0, sticky="ew")
@@ -205,10 +206,13 @@ class SignalMonitorWindow:
             justify="left",
         ).grid(row=6, column=0, sticky="w", pady=(12, 0))
 
-        task_frame = ttk.LabelFrame(self.window, text="监控任务", padding=12)
-        task_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        content_pane = ttk.Panedwindow(self.window, orient="vertical")
+        content_pane.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
+
+        task_frame = ttk.LabelFrame(content_pane, text="监控任务", padding=12)
         task_frame.columnconfigure(0, weight=1)
         task_frame.rowconfigure(1, weight=1)
+        content_pane.add(task_frame, weight=2)
 
         task_header = ttk.Frame(task_frame)
         task_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
@@ -243,10 +247,10 @@ class SignalMonitorWindow:
         task_scroll.grid(row=1, column=1, sticky="ns")
         self.tasks_tree.configure(yscrollcommand=task_scroll.set)
 
-        signal_list_frame = ttk.LabelFrame(self.window, text="最近触发信号", padding=12)
-        signal_list_frame.grid(row=3, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        signal_list_frame = ttk.LabelFrame(content_pane, text="最近触发信号", padding=12)
         signal_list_frame.columnconfigure(0, weight=1)
         signal_list_frame.rowconfigure(0, weight=1)
+        content_pane.add(signal_list_frame, weight=3)
 
         self.signal_tree = ttk.Treeview(
             signal_list_frame,
@@ -276,10 +280,10 @@ class SignalMonitorWindow:
         signal_scroll.grid(row=0, column=1, sticky="ns")
         self.signal_tree.configure(yscrollcommand=signal_scroll.set)
 
-        log_frame = ttk.LabelFrame(self.window, text="监控日志", padding=12)
-        log_frame.grid(row=4, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        log_frame = ttk.LabelFrame(content_pane, text="监控日志", padding=12)
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
+        content_pane.add(log_frame, weight=2)
 
         self.log_text = Text(log_frame, height=12, wrap="word", font=("Consolas", 10))
         self.log_text.grid(row=0, column=0, sticky="nsew")
@@ -287,10 +291,10 @@ class SignalMonitorWindow:
         log_scroll.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
-        diagnostic_frame = ttk.LabelFrame(self.window, text="实时诊断", padding=12)
-        diagnostic_frame.grid(row=5, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        diagnostic_frame = ttk.LabelFrame(content_pane, text="实时诊断", padding=12)
         diagnostic_frame.columnconfigure(0, weight=1)
         diagnostic_frame.rowconfigure(1, weight=1)
+        content_pane.add(diagnostic_frame, weight=3)
 
         ttk.Label(
             diagnostic_frame,
