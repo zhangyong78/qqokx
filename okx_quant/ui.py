@@ -53,7 +53,14 @@ from okx_quant.protection_replay_ui import ProtectionReplayLaunchState, Protecti
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.signal_monitor import DEFAULT_MONITOR_SYMBOLS
 from okx_quant.signal_monitor_ui import SignalMonitorWindow
-from okx_quant.strategy_catalog import STRATEGY_DEFINITIONS, StrategyDefinition, get_strategy_definition
+from okx_quant.smart_order import SmartOrderRuntimeConfig
+from okx_quant.smart_order_ui import SmartOrderWindow
+from okx_quant.strategy_catalog import (
+    STRATEGY_DEFINITIONS,
+    STRATEGY_EMA5_EMA8_ID,
+    StrategyDefinition,
+    get_strategy_definition,
+)
 from okx_quant.window_layout import apply_adaptive_window_geometry, apply_fill_window_geometry
 
 
@@ -183,6 +190,7 @@ class QuantApp:
         self._backtest_window: BacktestWindow | None = None
         self._backtest_compare_window: BacktestCompareOverviewWindow | None = None
         self._signal_monitor_window: SignalMonitorWindow | None = None
+        self._smart_order_window: SmartOrderWindow | None = None
         self._deribit_volatility_monitor_window: DeribitVolatilityMonitorWindow | None = None
         self._deribit_volatility_window: DeribitVolatilityWindow | None = None
         self._positions_zoom_window: Toplevel | None = None
@@ -373,6 +381,7 @@ class QuantApp:
         self._last_saved_credentials: tuple[str, str, str, str] | None = None
         self._auto_save_notice_shown = False
         self._credential_profiles: dict[str, dict[str, str]] = {}
+        self._header_credential_profile_combo: ttk.Combobox | None = None
         self._credential_profile_combo: ttk.Combobox | None = None
         self._loaded_credential_profile_name = DEFAULT_CREDENTIAL_PROFILE_NAME
 
@@ -402,6 +411,7 @@ class QuantApp:
         menu_bar.add_cascade(label="设置", menu=settings_menu)
 
         tools_menu = Menu(menu_bar, tearoff=False)
+        tools_menu.add_command(label="打开无限下单", command=self.open_smart_order_window)
         tools_menu.add_command(label="打开回测窗口", command=self.open_backtest_window)
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
         tools_menu.add_command(label="打开信号监控", command=self.open_signal_monitor_window)
@@ -441,12 +451,24 @@ class QuantApp:
             textvariable=self.status_text,
             font=("Microsoft YaHei UI", 11, "bold"),
         ).grid(row=0, column=1, sticky="e")
+        summary_row = ttk.Frame(header)
+        summary_row.grid(row=1, column=1, sticky="e", pady=(6, 0))
+        ttk.Label(summary_row, text="API").grid(row=0, column=0, sticky="e")
+        self._header_credential_profile_combo = ttk.Combobox(
+            summary_row,
+            textvariable=self.api_profile_name,
+            values=self._credential_profile_names(),
+            state="readonly",
+            width=10,
+        )
+        self._header_credential_profile_combo.grid(row=0, column=1, sticky="e", padx=(4, 8))
+        self._header_credential_profile_combo.bind("<<ComboboxSelected>>", self._on_api_profile_selected)
         ttk.Label(
-            header,
+            summary_row,
             textvariable=self.settings_summary_text,
             justify="right",
-            wraplength=620,
-        ).grid(row=1, column=1, sticky="e", pady=(6, 0))
+            wraplength=540,
+        ).grid(row=0, column=2, sticky="e")
 
         body = ttk.Panedwindow(self.root, orient="horizontal")
         body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 10))
@@ -619,9 +641,9 @@ class QuantApp:
 
         session_top_frame = ttk.Frame(sessions_pane)
         session_top_frame.columnconfigure(0, weight=1)
-        session_top_frame.rowconfigure(0, weight=3)
-        session_top_frame.rowconfigure(1, weight=2)
-        sessions_pane.add(session_top_frame, weight=3)
+        session_top_frame.rowconfigure(0, weight=4)
+        session_top_frame.rowconfigure(1, weight=1)
+        sessions_pane.add(session_top_frame, weight=2)
 
         running_frame = ttk.LabelFrame(session_top_frame, text="运行中策略", padding=12)
         running_frame.grid(row=0, column=0, sticky="nsew")
@@ -677,7 +699,7 @@ class QuantApp:
         positions_frame = ttk.LabelFrame(sessions_pane, text="账户持仓（仿 OKX 客户端风格）", padding=12)
         positions_frame.columnconfigure(0, weight=1)
         positions_frame.rowconfigure(3, weight=1)
-        sessions_pane.add(positions_frame, weight=6)
+        sessions_pane.add(positions_frame, weight=7)
 
         header_row = ttk.Frame(positions_frame)
         header_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -885,7 +907,7 @@ class QuantApp:
             if self._sessions_pane is not None and self._sessions_pane.winfo_exists():
                 total_height = self._sessions_pane.winfo_height()
                 if total_height > 600:
-                    self._sessions_pane.sashpos(0, int(total_height * Decimal("0.34")))
+                    self._sessions_pane.sashpos(0, int(total_height * Decimal("0.28")))
         except Exception:
             return
 
@@ -3153,6 +3175,17 @@ class QuantApp:
             ),
         )
 
+    def open_smart_order_window(self) -> None:
+        if self._smart_order_window is not None and self._smart_order_window.window.winfo_exists():
+            self._smart_order_window.show()
+            return
+        self._smart_order_window = SmartOrderWindow(
+            self.root,
+            self.client,
+            runtime_config_provider=self._build_smart_order_runtime_config_or_none,
+            logger=self._enqueue_log,
+        )
+
     def open_backtest_compare_window(self) -> None:
         if self._backtest_compare_window is not None and self._backtest_compare_window.window.winfo_exists():
             self._backtest_compare_window.show()
@@ -3240,6 +3273,9 @@ class QuantApp:
 
     def _sync_credential_profile_combo(self) -> None:
         values = self._credential_profile_names()
+        header_width = max(8, min(14, max((len(item) for item in values), default=8) + 1))
+        if self._header_credential_profile_combo is not None:
+            self._header_credential_profile_combo.configure(values=values, width=header_width)
         if self._credential_profile_combo is not None:
             self._credential_profile_combo.configure(values=values)
         current = self._current_credential_profile()
@@ -3958,6 +3994,13 @@ class QuantApp:
         self.signal_combo["values"] = definition.allowed_signal_labels
         if self.signal_mode_label.get() not in definition.allowed_signal_labels:
             self.signal_mode_label.set(definition.default_signal_label)
+        if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
+            self.bar.set("4H")
+            self.ema_period.set("5")
+            self.trend_ema_period.set("8")
+            self.risk_amount.set("100")
+            self.entry_side_mode_label.set("跟随信号")
+            self.tp_sl_mode_label.set("按信号标的的价格（本地）")
         self.strategy_summary_text.set(definition.summary)
         self.strategy_rule_text.set(definition.rule_description)
         self.strategy_hint_text.set(definition.parameter_hint)
@@ -4024,12 +4067,19 @@ class QuantApp:
             if not notification_config.notify_signals:
                 raise ValueError("只发信号邮件模式需要勾选“信号邮件”")
 
+        if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
+            trade_symbol = symbol
+            local_tp_sl_symbol = symbol
+            tp_sl_mode = "local_signal"
+            risk_amount = Decimal("100")
+            order_size = Decimal("0")
+
         credentials = Credentials(api_key=api_key, secret_key=secret_key, passphrase=passphrase)
         config = StrategyConfig(
             inst_id=symbol,
-            bar=self.bar.get(),
-            ema_period=self._parse_positive_int(self.ema_period.get(), "EMA 周期"),
-            trend_ema_period=self._parse_positive_int(self.trend_ema_period.get(), "趋势EMA周期"),
+            bar="4H" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self.bar.get(),
+            ema_period=5 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.ema_period.get(), "EMA 周期"),
+            trend_ema_period=8 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.trend_ema_period.get(), "趋势EMA周期"),
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
             atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
@@ -4045,7 +4095,7 @@ class QuantApp:
             trade_inst_id=trade_symbol,
             tp_sl_mode=tp_sl_mode,
             local_tp_sl_inst_id=local_tp_sl_symbol,
-            entry_side_mode=ENTRY_SIDE_MODE_OPTIONS[self.entry_side_mode_label.get()],
+            entry_side_mode="follow_signal" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else ENTRY_SIDE_MODE_OPTIONS[self.entry_side_mode_label.get()],
             run_mode=run_mode,
         )
         return credentials, config
@@ -4114,14 +4164,13 @@ class QuantApp:
         messagebox.showinfo("提示", "测试邮件已提交，请检查收件箱。", parent=self._settings_window or self.root)
 
     def _update_settings_summary(self) -> None:
-        api_status = "API 已配置" if all(
+        api_status = "已配置" if all(
             [self.api_key.get().strip(), self.secret_key.get().strip(), self.passphrase.get().strip()]
-        ) else "API 未配置"
+        ) else "未配置"
         mail_status = "邮件已启用" if self.notify_enabled.get() else "邮件未启用"
-        profile_name = self._current_credential_profile()
         self.settings_summary_text.set(
-            f"{api_status}({profile_name}) | {mail_status} | {self.environment_label.get()} | "
-            f"{self.trade_mode_label.get()} | {self.position_mode_label.get()}"
+            f"{api_status} | {mail_status} | {self.environment_label.get()} | {self.trade_mode_label.get()} | "
+            f"{self.position_mode_label.get()}"
         )
 
     def _make_session_logger(self, session_id: str, strategy_name: str, symbol: str):
@@ -4246,6 +4295,18 @@ class QuantApp:
             return None
         return Credentials(api_key=api_key, secret_key=secret_key, passphrase=passphrase)
 
+    def _build_smart_order_runtime_config_or_none(self) -> SmartOrderRuntimeConfig | None:
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            return None
+        return SmartOrderRuntimeConfig(
+            credentials=credentials,
+            environment=ENV_OPTIONS[self.environment_label.get()],
+            trade_mode=TRADE_MODE_OPTIONS[self.trade_mode_label.get()],
+            position_mode=POSITION_MODE_OPTIONS[self.position_mode_label.get()],
+            credential_profile_name=self._loaded_credential_profile_name,
+        )
+
     def _current_notification_state(self) -> tuple[object, ...]:
         return (
             self.environment_label.get(),
@@ -4304,6 +4365,8 @@ class QuantApp:
             self._backtest_compare_window.window.destroy()
         if self._signal_monitor_window is not None and self._signal_monitor_window.window.winfo_exists():
             self._signal_monitor_window.destroy()
+        if self._smart_order_window is not None and self._smart_order_window.window.winfo_exists():
+            self._smart_order_window.destroy()
         if (
             self._deribit_volatility_monitor_window is not None
             and self._deribit_volatility_monitor_window.window.winfo_exists()

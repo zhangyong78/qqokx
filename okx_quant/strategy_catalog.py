@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 STRATEGY_DYNAMIC_ID = "ema_dynamic_order"
 STRATEGY_CROSS_ID = "ema_cross_market"
+STRATEGY_EMA5_EMA8_ID = "ema5_ema8_cross_stop"
 
 
 @dataclass(frozen=True)
@@ -26,11 +27,11 @@ STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
         rule_description=(
             "启动后立即以上一根已收盘 K 线的 EMA 作为开仓价挂限价单；"
             "每一根新 K 线确认后，先撤掉旧挂单，再按最新的上一根 EMA 重新挂单。"
-            "做多时要求最近一根收盘仍在 EMA 上方，做空时要求最近一根收盘仍在 EMA 下方。"
+            "做多要求最近一根收盘仍在 EMA 上方，做空要求最近一根收盘仍在 EMA 下方。"
         ),
         parameter_hint=(
             "数量由风险金自动计算：开仓数量 = 风险金 / abs(开仓价格 - 止损价格)。"
-            "适用于上升趋势回调做多、下降趋势反弹做空。"
+            "适合上升趋势回调做多、下降趋势反弹做空。"
         ),
         allowed_signal_labels=("只做多", "只做空"),
         default_signal_label="只做多",
@@ -44,8 +45,24 @@ STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
             "一旦出现新信号，就按照当时的参考价格和 ATR 计算止盈止损，并立即市价下单。"
         ),
         parameter_hint=(
-            "止损按信号 K 线极值加减 1ATR 计算：做多用信号K线最低价减 1ATR，"
-            "做空用信号K线最高价加 1ATR。数量同样支持风险金自动计算。"
+            "止损按信号 K 线极值加减 1ATR 计算：做多用信号 K 线最低价减 1ATR，"
+            "做空用信号 K 线最高价加 1ATR。数量同样支持风险金自动计算。"
+        ),
+        allowed_signal_labels=("双向", "只做多", "只做空"),
+        default_signal_label="双向",
+    ),
+    StrategyDefinition(
+        strategy_id=STRATEGY_EMA5_EMA8_ID,
+        name="4H EMA5/EMA8 金叉死叉",
+        summary="固定用 4 小时 EMA5 与 EMA8 的金叉死叉做开单，止损线跟随 EMA8。",
+        rule_description=(
+            "只使用 4 小时已收盘 K 线。EMA5 上穿 EMA8 视为金叉做多，"
+            "EMA5 下穿 EMA8 视为死叉做空。开仓后不设固定止盈，"
+            "而是持续监控最新 4 小时 EMA8：做多跌破 EMA8 止损，做空站回 EMA8 上方止损。"
+        ),
+        parameter_hint=(
+            "固定使用 EMA5 / EMA8 与 4 小时周期。风险金默认 100，"
+            "仓位按‘风险金 / abs(开仓价 - EMA8止损线)’自动计算。"
         ),
         allowed_signal_labels=("双向", "只做多", "只做空"),
         default_signal_label="双向",

@@ -4,14 +4,15 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 
-from okx_quant.engine import build_order_plan
+from okx_quant.engine import build_order_plan, determine_order_size
 from okx_quant.indicators import atr, ema
 from okx_quant.models import Candle, Instrument, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
+from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
-from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID
+from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID, STRATEGY_EMA5_EMA8_ID
 
 
 MAX_BACKTEST_CANDLES = 10000
@@ -195,6 +196,8 @@ def run_backtest_batch(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> list[tuple[StrategyConfig, BacktestResult]]:
+    if base_config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+        raise RuntimeError("4H EMA5/EMA8 金叉死叉策略不参与 ATR 批量矩阵回测，请使用单组回测。")
     if candle_limit <= 0:
         raise ValueError("\u56de\u6d4b K \u7ebf\u6570\u91cf\u5fc5\u987b\u5927\u4e8e 0")
     if candle_limit > MAX_BACKTEST_CANDLES:
@@ -240,6 +243,13 @@ def _run_backtest_with_loaded_data(
         )
     elif config.strategy_id == STRATEGY_CROSS_ID:
         trades = _run_cross_backtest(
+            candles,
+            instrument,
+            config,
+            taker_fee_rate=taker_fee_rate,
+        )
+    elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+        trades = _run_ema5_ema8_backtest(
             candles,
             instrument,
             config,
@@ -321,6 +331,12 @@ def format_backtest_report(result: BacktestResult) -> str:
             f"EMA{result.ema_period} < EMA{result.trend_ema_period} 才做空"
         )
         lines.append("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓")
+    if result.strategy_id == STRATEGY_EMA5_EMA8_ID:
+        lines.append(
+            f"交易逻辑：固定 4H EMA{result.ema_period}/EMA{result.trend_ema_period} 金叉死叉开仓，"
+            f"收盘价跌破/站回 EMA{result.trend_ema_period} 时按动态止损离场。"
+        )
+        lines.append("本策略不设固定止盈，回测使用收盘确认与收盘价离场。")
     if report.profit_factor is None:
         lines.append("Profit Factor：无亏损交易")
     else:
@@ -383,6 +399,87 @@ def _build_backtest_data_source_note(client: OkxRestClient) -> str:
     if returned_count > 0:
         parts.append(f"\u672c\u6b21\u56de\u6d4b\u53d6\u6570 {returned_count} \u6839")
     return " | ".join(parts)
+
+
+def _run_ema5_ema8_backtest(
+    candles: list[Candle],
+    instrument: Instrument,
+    config: StrategyConfig,
+    *,
+    taker_fee_rate: Decimal = Decimal("0"),
+) -> list[BacktestTrade]:
+    strategy = EmaCrossEmaStopStrategy()
+    minimum = max(config.ema_period, config.trend_ema_period) + 1
+    if len(candles) < minimum:
+        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根")
+    trade_start_index = _backtest_trade_start_index(minimum)
+    if len(candles) <= trade_start_index:
+        return []
+
+    trades: list[BacktestTrade] = []
+    open_position: _OpenPosition | None = None
+
+    for index in range(trade_start_index, len(candles)):
+        candle = candles[index]
+
+        if open_position is not None:
+            _, stop_line = strategy.latest_stop_line(candles[: index + 1], config)
+            stop_hit = candle.close < stop_line if open_position.signal == "long" else candle.close > stop_line
+            if stop_hit:
+                exit_price_raw = candle.close
+                exit_price = _apply_slippage_price(
+                    exit_price_raw,
+                    signal=open_position.signal,
+                    tick_size=open_position.tick_size,
+                    slippage_rate=open_position.slippage_rate,
+                    is_entry=False,
+                )
+                trades.append(
+                    _build_closed_trade(
+                        open_position,
+                        candle,
+                        index,
+                        exit_price_raw=exit_price_raw,
+                        exit_price=exit_price,
+                        exit_reason="stop_loss",
+                        exit_fee_rate=taker_fee_rate,
+                        exit_fee_type="taker",
+                    )
+                )
+                open_position = None
+                continue
+
+        if open_position is not None:
+            continue
+
+        decision = strategy.evaluate(candles[: index + 1], config)
+        if decision.signal is None or decision.ema_value is None or decision.candle_ts is None:
+            continue
+
+        resolved_config = _resolve_backtest_config(config, trades)
+        size = determine_order_size(
+            instrument=instrument,
+            config=resolved_config,
+            entry_price=decision.entry_reference,
+            stop_loss=decision.ema_value,
+            risk_price_compatible=True,
+        )
+        open_position = _create_open_position(
+            instrument=instrument,
+            signal=decision.signal,
+            entry_index=index,
+            entry_ts=decision.candle_ts,
+            entry_price_raw=decision.entry_reference,
+            stop_loss=decision.ema_value,
+            take_profit=decision.entry_reference,
+            size=size,
+            entry_fee_rate=taker_fee_rate,
+            entry_fee_type="taker",
+            slippage_rate=config.backtest_slippage_rate,
+            funding_rate=config.backtest_funding_rate,
+        )
+
+    return trades
 
 
 def _run_cross_backtest(

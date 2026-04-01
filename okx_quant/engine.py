@@ -12,8 +12,9 @@ from okx_quant.notifications import EmailNotifier
 from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
+from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
-from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID
+from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID, STRATEGY_EMA5_EMA8_ID
 
 
 Logger = Callable[[str], None]
@@ -122,6 +123,8 @@ class StrategyEngine:
                     self._run_dynamic_signal_only(config, signal_instrument)
                 elif config.strategy_id == STRATEGY_CROSS_ID:
                     self._run_cross_signal_only(config, signal_instrument)
+                elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+                    self._run_ema5_ema8_signal_only(config, signal_instrument)
                 else:
                     raise RuntimeError(f"未知策略：{config.strategy_id}")
 
@@ -144,6 +147,8 @@ class StrategyEngine:
                     self._run_cross_exchange_strategy(credentials, config, signal_instrument)
                 else:
                     self._run_cross_local_strategy(credentials, config, signal_instrument, trade_instrument)
+            elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+                self._run_ema5_ema8_local_strategy(credentials, config, signal_instrument, trade_instrument)
             else:
                 raise RuntimeError(f"未知策略：{config.strategy_id}")
         except Exception as exc:
@@ -704,6 +709,189 @@ class StrategyEngine:
                 reason=reason,
             )
             self._stop_event.wait(config.poll_seconds)
+
+    def _run_ema5_ema8_signal_only(
+        self,
+        config: StrategyConfig,
+        instrument: Instrument,
+    ) -> None:
+        strategy = EmaCrossEmaStopStrategy()
+        lookback = recommended_indicator_lookback(config.ema_period, config.trend_ema_period)
+        last_candle_ts: int | None = None
+
+        self._logger(f"鍚姩淇″彿鐩戞帶 | 绛栫暐={self._strategy_name} | 鏍囩殑={instrument.inst_id} | K绾垮懆鏈?{config.bar}")
+        self._logger(
+            f"杩愯妯″紡锛氬彧鐩戞帶淇″彿锛屼笉涓嬪崟锛?EMA{config.ema_period}/EMA{config.trend_ema_period} "
+            "鍑虹幇閲戝弶姝诲弶鏃跺彂閫侀偖浠堕€氱煡銆?"
+        )
+
+        while not self._stop_event.is_set():
+            candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            minimum = max(config.ema_period, config.trend_ema_period) + 1
+            if len(confirmed) < minimum:
+                self._logger("宸叉敹鐩?K 绾挎暟閲忎笉瓒筹紝缁х画绛夊緟鏇村鏁版嵁...")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            newest_ts = confirmed[-1].ts
+            if newest_ts == last_candle_ts:
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            last_candle_ts = newest_ts
+
+            decision = strategy.evaluate(confirmed, config)
+            if decision.signal is None or decision.entry_reference is None or decision.ema_value is None:
+                self._logger(f"{_fmt_ts(newest_ts)} | 褰撳墠鏃?EMA5/EMA8 浜ゅ弶淇″彿 | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            reason = (
+                f"EMA{config.ema_period}/EMA{config.trend_ema_period} 浜ゅ弶淇″彿 | "
+                f"EMA{config.trend_ema_period}={format_decimal(decision.ema_value)}"
+            )
+            self._logger(
+                f"{_fmt_ts(decision.candle_ts or newest_ts)} | 淇″彿瑙﹀彂 | 鏂瑰悜={decision.signal.upper()} | "
+                f"鍏ュ満鍙傝€冧环={format_decimal(decision.entry_reference)} | {reason}"
+            )
+            self._notify_signal(
+                config,
+                signal=decision.signal,
+                trigger_symbol=instrument.inst_id,
+                entry_reference=decision.entry_reference,
+                reason=reason,
+            )
+            self._stop_event.wait(config.poll_seconds)
+
+    def _run_ema5_ema8_local_strategy(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        signal_instrument: Instrument,
+        trade_instrument: Instrument,
+    ) -> None:
+        if resolve_trade_inst_id(config) != config.inst_id:
+            raise RuntimeError("4H EMA5/EMA8 绛栫暐鐩墠鍙敮鎸佷俊鍙锋爣鐨勪笌涓嬪崟鏍囩殑鐩稿悓")
+
+        strategy = EmaCrossEmaStopStrategy()
+        lookback = recommended_indicator_lookback(config.ema_period, config.trend_ema_period)
+        last_candle_ts: int | None = None
+        active_position: FilledPosition | None = None
+        active_signal: Literal["long", "short"] | None = None
+
+        self._log_strategy_start(config, signal_instrument, trade_instrument)
+        self._logger(
+            f"杩愯妯″紡锛?4H EMA{config.ema_period}/EMA{config.trend_ema_period} 浜ゅ弶寮€浠?+ EMA{config.trend_ema_period} 鍔ㄦ€佹鎹? "
+            f"| 淇″彿鏍囩殑={signal_instrument.inst_id}"
+        )
+        self._logger(f"椋庨櫓閲?{format_decimal(config.risk_amount or Decimal('100'))} | 淇″彿鏂瑰悜={config.signal_mode}")
+
+        while not self._stop_event.is_set():
+            candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            minimum = max(config.ema_period, config.trend_ema_period) + 1
+            if len(confirmed) < minimum:
+                self._logger("宸叉敹鐩?K 绾挎暟閲忎笉瓒筹紝缁х画绛夊緟鏇村鏁版嵁...")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            newest_ts = confirmed[-1].ts
+            if newest_ts == last_candle_ts:
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            last_candle_ts = newest_ts
+
+            current_candle, current_stop_line = strategy.latest_stop_line(confirmed, config)
+
+            if active_position is not None and active_signal is not None:
+                stop_hit, stop_candle, stop_line = strategy.stop_triggered(confirmed, config, active_signal)
+                self._logger(
+                    f"{_fmt_ts(stop_candle.ts)} | 鎸佷粨鐩戞帶 | 鏂瑰悜={active_signal.upper()} | "
+                    f"褰撳墠鏀剁洏={format_decimal(stop_candle.close)} | EMA{config.trend_ema_period}={format_decimal(stop_line)}"
+                )
+                if stop_hit:
+                    self._logger(
+                        f"{_fmt_ts(stop_candle.ts)} | EMA{config.trend_ema_period} 鍔ㄦ€佹鎹熻Е鍙? | "
+                        f"褰撳墠鏀剁洏={format_decimal(stop_candle.close)} | 鍔ㄦ€佹鎹熺嚎={format_decimal(stop_line)}"
+                    )
+                    self._close_position(credentials, config, trade_instrument, active_position, "姝㈡崯")
+                    active_position = None
+                    active_signal = None
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            decision = strategy.evaluate(confirmed, config)
+            if decision.signal is None or decision.entry_reference is None or decision.ema_value is None:
+                self._logger(f"{_fmt_ts(newest_ts)} | 褰撳墠鏃?EMA5/EMA8 寮€浠撲俊鍙? | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            active_position = self._open_ema_stop_position(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                signal=decision.signal,
+                stop_loss=current_stop_line,
+                signal_candle_ts=decision.candle_ts or newest_ts,
+            )
+            active_signal = decision.signal
+            self._logger(
+                f"{_fmt_ts(decision.candle_ts or newest_ts)} | 鍔ㄦ€?EMA 姝㈡崯绛栫暐宸插紑浠? | "
+                f"鏂瑰悜={decision.signal.upper()} | EMA{config.trend_ema_period} 姝㈡崯绾?{format_decimal(current_stop_line)}"
+            )
+            self._stop_event.wait(config.poll_seconds)
+
+    def _open_ema_stop_position(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        signal: Literal["long", "short"],
+        stop_loss: Decimal,
+        signal_candle_ts: int,
+    ) -> FilledPosition:
+        trade_side: Literal["buy", "sell"] = "buy" if signal == "long" else "sell"
+        pos_side = resolve_open_pos_side(config, trade_side)
+        price_for_size = estimate_trade_entry_price(self._client, trade_instrument, trade_side)
+        stop_price = snap_to_increment(stop_loss, trade_instrument.tick_size, "nearest")
+        size = determine_order_size(
+            instrument=trade_instrument,
+            config=config,
+            entry_price=price_for_size,
+            stop_loss=stop_price,
+            risk_price_compatible=True,
+        )
+        self._logger(
+            f"{_fmt_ts(signal_candle_ts)} | 鍑嗗涓嬪崟 | 鏂瑰悜={signal.upper()} | "
+            f"棰勪及鍏ュ満浠?{format_decimal(price_for_size)} | EMA姝㈡崯绾?{format_decimal(stop_price)} | "
+            f"鏁伴噺={format_decimal(size)}"
+        )
+        result = self._place_entry_order(credentials, config, trade_instrument, trade_side, size, pos_side)
+        filled = self._wait_for_order_fill(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            side=trade_side,
+            pos_side=pos_side,
+            result=result,
+            estimated_entry=price_for_size,
+        )
+        self._logger(
+            f"EMA 浜ゅ弶涓嬪崟鎴愪氦 | ordId={filled.ord_id} | 鏍囩殑={trade_instrument.inst_id} | "
+            f"鏂瑰悜={trade_side.upper()} | 鎴愪氦鍧囦环={format_decimal(filled.entry_price)} | "
+            f"鎴愪氦鏁伴噺={format_decimal(filled.size)}"
+        )
+        self._notify_trade_fill(
+            config,
+            title="寮€浠撴垚浜?",
+            symbol=trade_instrument.inst_id,
+            side=trade_side,
+            size=filled.size,
+            price=filled.entry_price,
+            reason=f"EMA{config.ema_period}/EMA{config.trend_ema_period} 浜ゅ弶淇″彿鎴愪氦",
+        )
+        return filled
 
     def _open_local_position(
         self,

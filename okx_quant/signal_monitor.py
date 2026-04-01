@@ -312,6 +312,34 @@ def evaluate_monitor_signals(
     return list(evaluate_monitor_signal_report(candles, symbol, config, tick_size=tick_size).matched_events)
 
 
+def evaluate_monitor_signal_history(
+    candles: list[Candle],
+    symbol: str,
+    config: SignalMonitorConfig,
+    *,
+    tick_size: Decimal | None = None,
+    signal_type: SignalType | None = None,
+    direction: SignalDirection | None = None,
+) -> list[MonitorSignalEvent]:
+    matched_events: list[MonitorSignalEvent] = []
+    for index in range(len(candles)):
+        prefix_candles = candles[: index + 1]
+        for event in _detect_all_monitor_signals(
+            prefix_candles,
+            symbol,
+            config,
+            tick_size=tick_size,
+        ):
+            if not _is_signal_enabled(config, event.signal_type):
+                continue
+            if signal_type is not None and event.signal_type != signal_type:
+                continue
+            if direction is not None and event.direction != direction:
+                continue
+            matched_events.append(event)
+    return matched_events
+
+
 def _detect_all_monitor_signals(
     candles: list[Candle],
     symbol: str,

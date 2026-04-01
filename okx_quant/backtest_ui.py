@@ -24,7 +24,13 @@ from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import backtest_history_file_path
 from okx_quant.pricing import format_decimal, format_decimal_fixed
-from okx_quant.strategy_catalog import STRATEGY_DEFINITIONS, STRATEGY_DYNAMIC_ID, StrategyDefinition, get_strategy_definition
+from okx_quant.strategy_catalog import (
+    STRATEGY_DEFINITIONS,
+    STRATEGY_DYNAMIC_ID,
+    STRATEGY_EMA5_EMA8_ID,
+    StrategyDefinition,
+    get_strategy_definition,
+)
 from okx_quant.window_layout import apply_adaptive_window_geometry
 
 
@@ -344,6 +350,24 @@ def _build_backtest_param_summary(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> str:
+    if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+        sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
+        if config.backtest_sizing_mode == "risk_percent":
+            sizing_text = f"{sizing_label}{format_decimal(config.backtest_risk_percent or Decimal('0'))}%"
+        elif config.backtest_sizing_mode == "fixed_size":
+            sizing_text = f"{sizing_label}{format_decimal(config.order_size)}"
+        else:
+            sizing_text = f"{sizing_label}{format_decimal(config.risk_amount or Decimal('0'))}"
+        return (
+            f"4H固定 / EMA{config.ema_period} / 趋势EMA{config.trend_ema_period} / "
+            f"EMA{config.trend_ema_period}动态止损 / 方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / "
+            f"仓位{sizing_text} / 本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
+            f"{'复利' if config.backtest_compounding else '不复利'} / "
+            f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
+            f"滑点{_format_fee_rate_percent(config.backtest_slippage_rate)} / "
+            f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
+        )
+
     risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
     sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
     if config.backtest_sizing_mode == "risk_percent":
@@ -1221,6 +1245,9 @@ class BacktestWindow:
     def start_backtest(self) -> None:
         if self._backtest_running:
             return
+        if self._selected_strategy_definition().strategy_id == STRATEGY_EMA5_EMA8_ID:
+            self.start_single_backtest()
+            return
         try:
             config, candle_limit, maker_fee_rate, taker_fee_rate = self._build_backtest_request()
         except Exception as exc:
@@ -1393,11 +1420,14 @@ class BacktestWindow:
             risk_percent = self._parse_positive_decimal(self.risk_percent.get(), "风险百分比")
         else:
             risk_amount = size_or_risk
+        if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
+            risk_amount = Decimal("100")
+            order_size = Decimal("0")
         return StrategyConfig(
             inst_id=self.symbol.get().strip().upper(),
-            bar=_backtest_bar_value_from_label(self.bar_label.get()),
-            ema_period=self._parse_positive_int(self.ema_period.get(), "EMA 周期"),
-            trend_ema_period=self._parse_positive_int(self.trend_ema_period.get(), "趋势EMA周期"),
+            bar="4H" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else _backtest_bar_value_from_label(self.bar_label.get()),
+            ema_period=5 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.ema_period.get(), "EMA 周期"),
+            trend_ema_period=8 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.trend_ema_period.get(), "趋势EMA周期"),
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
             atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
@@ -1430,6 +1460,11 @@ class BacktestWindow:
         self.signal_combo["values"] = definition.allowed_signal_labels
         if self.signal_mode_label.get() not in definition.allowed_signal_labels:
             self.signal_mode_label.set(definition.default_signal_label)
+        if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
+            self.bar_label.set("4小时")
+            self.ema_period.set("5")
+            self.trend_ema_period.set("8")
+            self.risk_amount.set("100")
 
     def _append_backtest_snapshot(
         self,

@@ -13,10 +13,18 @@ from okx_quant.signal_monitor import (
     detect_ema55_breakout,
     detect_ema55_slope_turn,
     detect_ema_cross_signal,
+    evaluate_monitor_signal_history,
     evaluate_monitor_signal_report,
     evaluate_monitor_signals,
 )
-from okx_quant.signal_monitor_ui import SignalMonitorWindow, _format_monitor_diagnostic_round
+from okx_quant.signal_monitor_ui import (
+    SignalMonitorWindow,
+    _format_monitor_diagnostic_round,
+    _normalize_signal_chart_viewport,
+    _pan_signal_chart_viewport,
+    _signal_chart_hover_index_for_x,
+    _zoom_signal_chart_viewport,
+)
 
 
 class _FakeNotifier:
@@ -163,6 +171,29 @@ class SignalMonitorTest(TestCase):
 
         self.assertEqual([event.signal_type for event in report.matched_events], ["ema55_slope_turn"])
         self.assertEqual([event.signal_type for event in report.filtered_events], ["ema21_55_cross", "ema55_breakout"])
+
+    def test_signal_history_replays_all_matching_breakouts(self) -> None:
+        symbol = "BTC-USDT-SWAP"
+        closes = [Decimal("100")] * 60 + [Decimal("110"), Decimal("90"), Decimal("110"), Decimal("90"), Decimal("110")]
+        candles = _make_candles(closes)
+
+        events = evaluate_monitor_signal_history(
+            candles,
+            symbol,
+            SignalMonitorConfig(
+                symbols=(symbol,),
+                enable_ema21_55_cross=False,
+                enable_ema55_slope_turn=False,
+                enable_ema55_breakout=True,
+                enable_candle_pattern=False,
+            ),
+            signal_type="ema55_breakout",
+        )
+
+        self.assertEqual(
+            [(event.candle_ts, event.direction) for event in events],
+            [(61, "long"), (62, "short"), (63, "long"), (64, "short"), (65, "long")],
+        )
 
     def test_signal_monitor_email_sender_respects_signal_toggle(self) -> None:
         window = SignalMonitorWindow.__new__(SignalMonitorWindow)
@@ -318,3 +349,34 @@ class SignalMonitorTest(TestCase):
     def test_seconds_until_next_check_uses_bar_close_and_buffer(self) -> None:
         wait = _seconds_until_next_check("15m", 10, now_ts=1_710_000_001)
         self.assertEqual(wait, 909)
+
+    def test_signal_chart_viewport_clamps_bounds(self) -> None:
+        start_index, visible_count = _normalize_signal_chart_viewport(90, 40, 100, min_visible=24)
+        self.assertEqual((start_index, visible_count), (60, 40))
+
+    def test_signal_chart_viewport_zooms_in_around_anchor(self) -> None:
+        start_index, visible_count = _zoom_signal_chart_viewport(
+            start_index=0,
+            visible_count=100,
+            total_count=200,
+            anchor_ratio=0.5,
+            zoom_in=True,
+            min_visible=24,
+        )
+        self.assertEqual(visible_count, 80)
+        self.assertEqual(start_index, 10)
+
+    def test_signal_chart_viewport_pans_window(self) -> None:
+        start_index = _pan_signal_chart_viewport(20, 50, 200, 15, min_visible=24)
+        self.assertEqual(start_index, 35)
+
+    def test_signal_chart_hover_index_tracks_visible_candle(self) -> None:
+        index = _signal_chart_hover_index_for_x(
+            x=166,
+            left=55,
+            width=400,
+            start_index=10,
+            end_index=30,
+            candle_step=20,
+        )
+        self.assertEqual(index, 15)

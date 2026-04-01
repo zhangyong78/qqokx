@@ -77,6 +77,14 @@ class OkxTicker:
 
 
 @dataclass(frozen=True)
+class OkxOrderBook:
+    inst_id: str
+    bids: tuple[tuple[Decimal, Decimal], ...]
+    asks: tuple[tuple[Decimal, Decimal], ...]
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class OkxPosition:
     inst_id: str
     inst_type: str
@@ -374,6 +382,37 @@ class OkxRestClient:
             ask=_to_decimal(first.get("askPx")),
             mark=_to_decimal(first.get("markPx")),
             index=_to_decimal(first.get("idxPx")),
+            raw=first,
+        )
+
+    def get_order_book(self, inst_id: str, depth: int = 50) -> OkxOrderBook:
+        size = max(1, min(depth, 400))
+        payload = self._request("GET", "/api/v5/market/books", params={"instId": inst_id, "sz": str(size)})
+        if not payload["data"]:
+            raise OkxApiError(f"OKX 未返回盘口：{inst_id}")
+        first = payload["data"][0]
+        bids: list[tuple[Decimal, Decimal]] = []
+        asks: list[tuple[Decimal, Decimal]] = []
+        for row in first.get("bids", []):
+            if len(row) < 2:
+                continue
+            price = _to_decimal(row[0])
+            book_size = _to_decimal(row[1])
+            if price is None or book_size is None:
+                continue
+            bids.append((price, book_size))
+        for row in first.get("asks", []):
+            if len(row) < 2:
+                continue
+            price = _to_decimal(row[0])
+            book_size = _to_decimal(row[1])
+            if price is None or book_size is None:
+                continue
+            asks.append((price, book_size))
+        return OkxOrderBook(
+            inst_id=inst_id,
+            bids=tuple(bids),
+            asks=tuple(asks),
             raw=first,
         )
 

@@ -50,7 +50,7 @@ from okx_quant.backtest_ui import (
 from okx_quant.indicators import ema
 from okx_quant.backtest import BacktestReport, BacktestResult, BacktestTrade
 from okx_quant.models import Candle, Instrument, StrategyConfig
-from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID
+from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID, STRATEGY_EMA5_EMA8_ID
 
 
 class DummyBacktestClient:
@@ -107,6 +107,25 @@ class BacktestTest(TestCase):
             environment="demo",
             tp_sl_trigger_type="mark",
             strategy_id=STRATEGY_CROSS_ID,
+            risk_amount=Decimal("100"),
+        )
+
+    def _build_ema5_ema8_config(self, *, signal_mode: str = "both") -> StrategyConfig:
+        return StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="4H",
+            ema_period=2,
+            trend_ema_period=3,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("1"),
+            atr_take_multiplier=Decimal("1"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode=signal_mode,
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA5_EMA8_ID,
             risk_amount=Decimal("100"),
         )
 
@@ -313,6 +332,16 @@ class BacktestTest(TestCase):
         self.assertEqual(results[-1][0].atr_take_multiplier, Decimal("6"))
         self.assertTrue(all(len(result.candles) == 500 for _, result in results))
 
+    def test_ema5_ema8_strategy_rejects_atr_batch_backtest(self) -> None:
+        candles = [
+            Candle(index, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True)
+            for index in range(1, 701)
+        ]
+        client = DummyBacktestClient(candles, self._build_instrument())
+
+        with self.assertRaisesRegex(RuntimeError, "不参与 ATR 批量矩阵回测"):
+            run_backtest_batch(client, self._build_ema5_ema8_config(), candle_limit=500)
+
     def test_backtest_bar_label_mapping_accepts_raw_values_and_labels(self) -> None:
         self.assertEqual(_normalize_backtest_bar_label("5m"), "5分钟")
         self.assertEqual(_normalize_backtest_bar_label("15分钟"), "15分钟")
@@ -374,6 +403,43 @@ class BacktestTest(TestCase):
 
         self.assertIn("趋势过滤：EMA21 > EMA55 才做多，EMA21 < EMA55 才做空", report_text)
         self.assertIn("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓", report_text)
+
+    def test_ema5_ema8_backtest_uses_dynamic_ema_stop(self) -> None:
+        warmup_candles = [
+            Candle(index, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True)
+            for index in range(1, BACKTEST_RESERVED_CANDLES + 1)
+        ]
+        trade_closes = ["100", "100", "100", "103", "100", "97"]
+        trade_candles: list[Candle] = []
+        previous_close = Decimal(trade_closes[0])
+        for index, raw_close in enumerate(trade_closes, start=1):
+            close = Decimal(raw_close)
+            open_price = previous_close
+            high = max(open_price, close) + Decimal("1")
+            low = min(open_price, close) - Decimal("1")
+            trade_candles.append(
+                Candle(
+                    BACKTEST_RESERVED_CANDLES + index,
+                    open_price,
+                    high,
+                    low,
+                    close,
+                    Decimal("1"),
+                    True,
+                )
+            )
+            previous_close = close
+        candles = warmup_candles + trade_candles
+        client = DummyBacktestClient(candles, self._build_instrument())
+
+        result = run_backtest(client, self._build_ema5_ema8_config(), candle_limit=len(candles))
+
+        self.assertGreaterEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0].signal, "long")
+        self.assertEqual(result.trades[0].exit_reason, "stop_loss")
+        report_text = format_backtest_report(result)
+        self.assertIn("EMA2/EMA3", report_text)
+        self.assertIn("动态止损", report_text)
 
     def test_same_candle_short_fill_on_bullish_candle_does_not_take_profit_before_entry(self) -> None:
         position = _OpenPosition(

@@ -10,6 +10,7 @@ SETTINGS_FILE_NAME = ".okx_quant_settings.json"
 BACKTEST_HISTORY_FILE_NAME = ".okx_quant_backtest_history.json"
 BACKTEST_CANDLE_CACHE_DIR_NAME = ".okx_quant_candle_cache"
 BACKTEST_REPORT_EXPORT_DIR_NAME = "backtest_exports"
+SMART_ORDER_TASKS_FILE_NAME = ".okx_quant_smart_order_tasks.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 
 
@@ -41,6 +42,12 @@ def backtest_report_export_dir_path(base_dir: Path | None = None) -> Path:
     if base_dir is None:
         base_dir = Path(__file__).resolve().parent.parent
     return Path(base_dir) / "reports" / BACKTEST_REPORT_EXPORT_DIR_NAME
+
+
+def smart_order_tasks_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is None:
+        base_dir = Path(__file__).resolve().parent.parent
+    return Path(base_dir) / SMART_ORDER_TASKS_FILE_NAME
 
 
 def _empty_credentials_snapshot() -> dict[str, str]:
@@ -250,6 +257,62 @@ def save_notification_snapshot(
         "notify_trade_fills": notify_trade_fills,
         "notify_signals": notify_signals,
         "notify_errors": notify_errors,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
+def load_smart_order_tasks_snapshot(path: Path | None = None) -> dict[str, object]:
+    target = path or smart_order_tasks_file_path()
+    if not target.exists():
+        return {
+            "task_counter": 0,
+            "locked_inst_id": None,
+            "locked_instrument": None,
+            "position_limit_enabled": False,
+            "long_position_limit": None,
+            "short_position_limit": None,
+            "tasks": [],
+        }
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list):
+        tasks = []
+    return {
+        "task_counter": int(payload.get("task_counter", 0)),
+        "locked_inst_id": payload.get("locked_inst_id"),
+        "locked_instrument": payload.get("locked_instrument"),
+        "position_limit_enabled": bool(payload.get("position_limit_enabled", False)),
+        "long_position_limit": payload.get("long_position_limit"),
+        "short_position_limit": payload.get("short_position_limit"),
+        "tasks": tasks,
+    }
+
+
+def save_smart_order_tasks_snapshot(
+    *,
+    task_counter: int,
+    locked_inst_id: str | None,
+    locked_instrument: dict[str, object] | None,
+    position_limit_enabled: bool,
+    long_position_limit: str | None,
+    short_position_limit: str | None,
+    tasks: list[dict[str, object]],
+    path: Path | None = None,
+) -> Path:
+    target = path or smart_order_tasks_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "task_counter": int(task_counter),
+        "locked_inst_id": locked_inst_id,
+        "locked_instrument": locked_instrument,
+        "position_limit_enabled": bool(position_limit_enabled),
+        "long_position_limit": long_position_limit,
+        "short_position_limit": short_position_limit,
+        "tasks": tasks,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     temp_path = target.with_suffix(target.suffix + ".tmp")
