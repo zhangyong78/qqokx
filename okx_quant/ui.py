@@ -4614,6 +4614,7 @@ def _aggregate_position_metrics(
     pnl_currency: str | None = pnl_currencies[0] if len(pnl_currencies) == 1 else None
     return {
         "count": len(positions),
+        "size_display": _format_group_position_size(positions, position_instruments),
         "upl": _sum_decimal([item.unrealized_pnl for item in positions]),
         "upl_usdt": _sum_decimal([_position_unrealized_pnl_usdt(item, upl_usdt_prices) for item in positions]),
         "market_value_usdt": _sum_decimal(
@@ -4634,13 +4635,18 @@ def _aggregate_position_metrics(
 def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | None]) -> tuple[str, ...]:
     count = metrics["count"]
     pnl_places = _group_pnl_places(metrics.get("pnl_currency"))
+    size_display = metrics.get("size_display")
     return (
         group_type,
         "--",
         "--",
         "--",
         "--",
-        f"{count} 个持仓" if isinstance(count, int) else "--",
+        (
+            f"{count} 个持仓 | {size_display}"
+            if isinstance(count, int) and isinstance(size_display, str) and size_display
+            else (f"{count} 个持仓" if isinstance(count, int) else "--")
+        ),
         _format_optional_decimal_fixed(
             metrics["upl"] if isinstance(metrics["upl"], Decimal) else None,
             places=pnl_places,
@@ -4667,12 +4673,17 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
     )
 
 
-def _format_position_size(position: OkxPosition, position_instruments: dict[str, Instrument]) -> str:
+def _position_signed_display_amount(
+    position: OkxPosition,
+    position_instruments: dict[str, Instrument],
+) -> tuple[Decimal | None, str | None]:
     if position.position == 0:
-        return "-"
+        return None, None
+
     direction = _format_pos_side(position.pos_side, position.position)
     sign = Decimal("-1") if direction == "short" else Decimal("1")
     instrument = position_instruments.get(position.inst_id)
+
     if instrument is not None and instrument.ct_val is not None and instrument.ct_val > 0 and instrument.ct_val_ccy:
         multiplier = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
         quote_currency = instrument.ct_val_ccy.upper()
@@ -4681,10 +4692,48 @@ def _format_position_size(position: OkxPosition, position_instruments: dict[str,
             base_currency = _extract_asset_key(position.inst_id).upper()
             if reference_price is not None and reference_price > 0 and base_currency:
                 amount = (abs(position.position) * instrument.ct_val * multiplier / reference_price) * sign
-                return f"{format_decimal_fixed(amount, 4)} {base_currency} ({direction})"
+                return amount, base_currency
         amount = abs(position.position) * instrument.ct_val * multiplier * sign
-        return f"{format_decimal(amount)} {quote_currency} ({direction})"
-    return f"{format_decimal(abs(position.position) * sign)} ({direction})"
+        return amount, quote_currency
+
+    asset_currency = _extract_asset_key(position.inst_id).upper()
+    return abs(position.position) * sign, asset_currency if asset_currency else None
+
+
+def _format_group_position_size(
+    positions: list[OkxPosition],
+    position_instruments: dict[str, Instrument],
+) -> str:
+    totals: dict[str, Decimal] = {}
+    for position in positions:
+        amount, currency = _position_signed_display_amount(position, position_instruments)
+        if amount is None or not currency:
+            continue
+        totals[currency] = totals.get(currency, Decimal("0")) + amount
+
+    if not totals:
+        return ""
+
+    parts: list[str] = []
+    for currency in sorted(totals.keys()):
+        amount = totals[currency]
+        parts.append(f"{format_decimal(amount)} {currency}")
+    return " / ".join(parts)
+
+
+def _format_position_size(position: OkxPosition, position_instruments: dict[str, Instrument]) -> str:
+    if position.position == 0:
+        return "-"
+
+    direction = _format_pos_side(position.pos_side, position.position)
+    amount, currency = _position_signed_display_amount(position, position_instruments)
+    if amount is None:
+        return "-"
+    if currency and currency not in {"USD", "USDT", "USDC"} and position.inst_type in {"FUTURES", "SWAP"}:
+        return f"{format_decimal_fixed(amount, 4)} {currency} ({direction})"
+    if currency:
+        return f"{format_decimal(amount)} {currency} ({direction})"
+    return f"{format_decimal(amount)} ({direction})"
 
 
 def _position_delta_value(

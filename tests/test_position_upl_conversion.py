@@ -13,6 +13,7 @@ from okx_quant.ui import (
     _format_optional_integer,
     _format_optional_usdt_precise,
     _format_optional_usdt,
+    _format_group_position_size,
     _format_position_avg_price,
     _format_position_avg_price_usdt,
     _format_position_market_value,
@@ -491,6 +492,7 @@ class PositionUplConversionTest(TestCase):
             "组合",
             {
                 "count": 1,
+                "size_display": "250000 DOGE",
                 "upl": Decimal("-2733.7537"),
                 "upl_usdt": Decimal("-2734"),
                 "market_value_usdt": Decimal("360"),
@@ -505,10 +507,57 @@ class PositionUplConversionTest(TestCase):
                 "theta_usdt": Decimal("123.456"),
             },
         )
+        self.assertEqual(values[5], "1 个持仓 | 250000 DOGE")
         self.assertEqual(values[6], "-2733.75")
         self.assertEqual(values[8], "-31.36")
         self.assertEqual(values[14], "250000.00000")
         self.assertEqual(values[18], "+123.46")
+
+    def test_format_group_position_size_accumulates_coin_quantity(self) -> None:
+        positions = [
+            OkxPosition(
+                **{
+                    **_make_position(inst_id="BTC-USD-260626-50000-P", upl="0", margin_ccy="BTC").__dict__,
+                    "position": Decimal("-20"),
+                    "pos_side": "short",
+                }
+            ),
+            OkxPosition(
+                **{
+                    **_make_position(inst_id="BTC-USD-260626-60000-P", upl="0", margin_ccy="BTC").__dict__,
+                    "position": Decimal("-30"),
+                    "pos_side": "short",
+                }
+            ),
+        ]
+        instruments = {
+            "BTC-USD-260626-50000-P": Instrument(
+                inst_id="BTC-USD-260626-50000-P",
+                inst_type="OPTION",
+                tick_size=Decimal("0.0001"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+                ct_val=Decimal("0.01"),
+                ct_mult=Decimal("1"),
+                ct_val_ccy="BTC",
+                settle_ccy="BTC",
+            ),
+            "BTC-USD-260626-60000-P": Instrument(
+                inst_id="BTC-USD-260626-60000-P",
+                inst_type="OPTION",
+                tick_size=Decimal("0.0001"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+                ct_val=Decimal("0.01"),
+                ct_mult=Decimal("1"),
+                ct_val_ccy="BTC",
+                settle_ccy="BTC",
+            ),
+        }
+
+        self.assertEqual(_format_group_position_size(positions, instruments), "-0.5 BTC")
 
     def test_group_positions_for_tree_orders_buckets_by_nearest_date(self) -> None:
         positions = [
