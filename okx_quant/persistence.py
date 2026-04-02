@@ -11,6 +11,7 @@ BACKTEST_HISTORY_FILE_NAME = ".okx_quant_backtest_history.json"
 BACKTEST_CANDLE_CACHE_DIR_NAME = ".okx_quant_candle_cache"
 BACKTEST_REPORT_EXPORT_DIR_NAME = "backtest_exports"
 SMART_ORDER_TASKS_FILE_NAME = ".okx_quant_smart_order_tasks.json"
+SMART_ORDER_FAVORITES_FILE_NAME = ".okx_quant_smart_order_favorites.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 
 
@@ -48,6 +49,12 @@ def smart_order_tasks_file_path(base_dir: Path | None = None) -> Path:
     if base_dir is None:
         base_dir = Path(__file__).resolve().parent.parent
     return Path(base_dir) / SMART_ORDER_TASKS_FILE_NAME
+
+
+def smart_order_favorites_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is None:
+        base_dir = Path(__file__).resolve().parent.parent
+    return Path(base_dir) / SMART_ORDER_FAVORITES_FILE_NAME
 
 
 def _empty_credentials_snapshot() -> dict[str, str]:
@@ -313,6 +320,70 @@ def save_smart_order_tasks_snapshot(
         "long_position_limit": long_position_limit,
         "short_position_limit": short_position_limit,
         "tasks": tasks,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
+def _normalize_smart_order_favorite(item: object) -> dict[str, str] | None:
+    if not isinstance(item, dict):
+        return None
+    inst_id = str(item.get("inst_id", "")).strip().upper()
+    inst_type = str(item.get("inst_type", "")).strip().upper()
+    if not inst_id or not inst_type:
+        return None
+    return {
+        "inst_id": inst_id,
+        "inst_type": inst_type,
+    }
+
+
+def load_smart_order_favorites_snapshot(path: Path | None = None) -> dict[str, object]:
+    target = path or smart_order_favorites_file_path()
+    if not target.exists():
+        return {"favorites": []}
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    raw_items = payload.get("favorites")
+    if not isinstance(raw_items, list):
+        raw_items = []
+    favorites: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw_items:
+        normalized = _normalize_smart_order_favorite(item)
+        if normalized is None:
+            continue
+        key = (normalized["inst_type"], normalized["inst_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        favorites.append(normalized)
+    favorites.sort(key=lambda item: (item["inst_type"], item["inst_id"]))
+    return {"favorites": favorites}
+
+
+def save_smart_order_favorites_snapshot(
+    favorites: list[dict[str, str]],
+    path: Path | None = None,
+) -> Path:
+    target = path or smart_order_favorites_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    normalized_favorites: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in favorites:
+        normalized = _normalize_smart_order_favorite(item)
+        if normalized is None:
+            continue
+        key = (normalized["inst_type"], normalized["inst_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_favorites.append(normalized)
+    normalized_favorites.sort(key=lambda item: (item["inst_type"], item["inst_id"]))
+    payload = {
+        "favorites": normalized_favorites,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     temp_path = target.with_suffix(target.suffix + ".tmp")

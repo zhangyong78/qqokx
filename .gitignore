@@ -14,6 +14,7 @@ tests_artifacts/
 .okx_quant_settings.json
 .okx_quant_backtest_history.json
 .okx_quant_smart_order_tasks.json
+.okx_quant_smart_order_favorites.json
 .okx_quant_candle_cache/
 debug_*.txt
 dist/

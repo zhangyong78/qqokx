@@ -41,7 +41,7 @@ def build_package(version: str) -> tuple[Path, Path]:
     dist_root.mkdir(parents=True, exist_ok=True)
     stage_dir.mkdir(parents=True, exist_ok=True)
 
-    for file_name in ("main.py", "pyproject.toml", "requirements.txt", "README.md"):
+    for file_name in ("main.py", "pyproject.toml", "requirements.txt", "README.md", "软件开发指南.md"):
         shutil.copy2(project_root / file_name, stage_dir / file_name)
     shutil.copytree(
         project_root / "okx_quant",
@@ -108,6 +108,7 @@ def build_package(version: str) -> tuple[Path, Path]:
             "- Linux Tk install example: sudo apt-get install -y python3-tk\n\n"
             "2. Included\n"
             "- main.py\n"
+            "- 软件开发指南.md\n"
             "- okx_quant/\n"
             "- RUN.bat\n"
             "- RUN.ps1\n"

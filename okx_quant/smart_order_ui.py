@@ -6,6 +6,10 @@ from tkinter import messagebox, ttk
 from typing import Callable
 
 from okx_quant.models import Instrument
+from okx_quant.persistence import (
+    load_smart_order_favorites_snapshot,
+    save_smart_order_favorites_snapshot,
+)
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, snap_to_increment
 from okx_quant.smart_order import (
     CycleMode,
@@ -63,6 +67,9 @@ class SmartOrderWindow:
         self._last_task_signature: tuple[tuple[object, ...], ...] = ()
         self._last_ladder_signature: tuple[tuple[object, ...], ...] = ()
         self._last_instrument_status: str = ""
+        self._favorites = list(load_smart_order_favorites_snapshot().get("favorites", []))
+        self.favorite_selection = StringVar()
+        self._favorite_combo: ttk.Combobox | None = None
 
         self.window = Toplevel(parent)
         self.window.title("无限下单")
@@ -137,6 +144,7 @@ class SmartOrderWindow:
         self._bootstrap_locked_contract()
         self._refresh_quantity_labels()
         self._sync_position_limit_fields_from_manager()
+        self._refresh_favorite_options()
         self._schedule_refresh()
 
     def show(self) -> None:
@@ -157,6 +165,7 @@ class SmartOrderWindow:
         self._refresh_ladder_filter_options(instrument)
         self._refresh_quantity_labels()
         self._sync_position_limit_fields_from_manager()
+        self._refresh_favorite_options(preferred_inst_id=instrument.inst_id)
         try:
             self.manager.ensure_market_snapshot(instrument, force=True)
         except Exception:
@@ -222,6 +231,91 @@ class SmartOrderWindow:
         if self._instrument is None:
             self._refresh_quantity_labels()
             self._sync_position_limit_fields_from_manager()
+        self._refresh_favorite_options()
+
+    def _current_type_favorites(self) -> list[dict[str, str]]:
+        selected_type = INSTRUMENT_TYPE_OPTIONS.get(self.instrument_type_label.get(), "OPTION")
+        return [item for item in self._favorites if item.get("inst_type") == selected_type]
+
+    def _refresh_favorite_options(self, preferred_inst_id: str | None = None) -> None:
+        values = [item["inst_id"] for item in self._current_type_favorites()]
+        if self._favorite_combo is not None:
+            self._favorite_combo.configure(values=values)
+        if preferred_inst_id and preferred_inst_id in values:
+            self.favorite_selection.set(preferred_inst_id)
+        elif self.favorite_selection.get() not in values:
+            self.favorite_selection.set(values[0] if values else "")
+
+    def _save_favorites(self) -> None:
+        save_smart_order_favorites_snapshot(self._favorites)
+
+    def _favorite_entry_by_inst_id(self, inst_id: str) -> dict[str, str] | None:
+        normalized = inst_id.strip().upper()
+        for item in self._favorites:
+            if item.get("inst_id") == normalized:
+                return item
+        return None
+
+    def _on_favorite_selected(self, _event=None) -> None:
+        inst_id = self.favorite_selection.get().strip().upper()
+        if not inst_id:
+            return
+        entry = self._favorite_entry_by_inst_id(inst_id)
+        if entry is None:
+            return
+        self.instrument_type_label.set(self._instrument_type_label(entry["inst_type"]))
+        self.instrument_id.set(entry["inst_id"])
+        self._refresh_quantity_labels()
+        self._sync_position_limit_fields_from_manager()
+        self._refresh_favorite_options(preferred_inst_id=entry["inst_id"])
+
+    def add_favorite_instrument(self) -> None:
+        inst_id = self.instrument_id.get().strip().upper()
+        if not inst_id:
+            messagebox.showerror("收藏失败", "请先填写或加载一个合约。", parent=self.window)
+            return
+        expected_type = INSTRUMENT_TYPE_OPTIONS[self.instrument_type_label.get()]
+        try:
+            instrument = self.client.get_instrument(inst_id)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("收藏失败", str(exc), parent=self.window)
+            return
+        if instrument.inst_type != expected_type:
+            messagebox.showerror(
+                "收藏失败",
+                f"{instrument.inst_id} 实际是 {instrument.inst_type}，和当前类型不一致。",
+                parent=self.window,
+            )
+            return
+        entry = {"inst_id": instrument.inst_id, "inst_type": instrument.inst_type}
+        key = (entry["inst_type"], entry["inst_id"])
+        if any((item["inst_type"], item["inst_id"]) == key for item in self._favorites):
+            self._refresh_favorite_options(preferred_inst_id=entry["inst_id"])
+            messagebox.showinfo("提示", f"{instrument.inst_id} 已在自选合约里。", parent=self.window)
+            return
+        self._favorites.append(entry)
+        self._save_favorites()
+        self._refresh_favorite_options(preferred_inst_id=entry["inst_id"])
+        messagebox.showinfo("提示", f"已添加自选合约：{instrument.inst_id}", parent=self.window)
+
+    def remove_favorite_instrument(self) -> None:
+        inst_id = self.favorite_selection.get().strip().upper() or self.instrument_id.get().strip().upper()
+        if not inst_id:
+            messagebox.showerror("删除失败", "请先选择一个自选合约。", parent=self.window)
+            return
+        selected_type = INSTRUMENT_TYPE_OPTIONS.get(self.instrument_type_label.get(), "OPTION")
+        before = len(self._favorites)
+        self._favorites = [
+            item
+            for item in self._favorites
+            if not (item.get("inst_type") == selected_type and item.get("inst_id") == inst_id)
+        ]
+        if len(self._favorites) == before:
+            messagebox.showinfo("提示", "当前类型下没有这个自选合约。", parent=self.window)
+            return
+        self._save_favorites()
+        self._refresh_favorite_options()
+        messagebox.showinfo("提示", f"已删除自选合约：{inst_id}", parent=self.window)
 
     def _convert_input_size_to_order_size(self, raw_value: str, field_name: str, instrument: Instrument) -> Decimal:
         size = self._parse_positive_decimal(raw_value, field_name)
@@ -318,6 +412,7 @@ class SmartOrderWindow:
         instrument_frame.grid(row=0, column=0, sticky="ew")
         instrument_frame.columnconfigure(1, weight=1)
         instrument_frame.columnconfigure(3, weight=1)
+        instrument_frame.columnconfigure(6, weight=1)
 
         ttk.Label(instrument_frame, text="类型").grid(row=0, column=0, sticky="w")
         instrument_type_combo = ttk.Combobox(
@@ -331,6 +426,18 @@ class SmartOrderWindow:
         ttk.Label(instrument_frame, text="合约").grid(row=0, column=2, sticky="w")
         ttk.Entry(instrument_frame, textvariable=self.instrument_id).grid(row=0, column=3, sticky="ew", padx=(0, 12))
         ttk.Button(instrument_frame, text="加载合约", command=self.load_instrument).grid(row=0, column=4, sticky="e")
+        ttk.Button(instrument_frame, text="加入自选", command=self.add_favorite_instrument).grid(row=0, column=5, sticky="e", padx=(8, 8))
+        ttk.Label(instrument_frame, text="自选").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        favorite_combo = ttk.Combobox(
+            instrument_frame,
+            textvariable=self.favorite_selection,
+            state="readonly",
+        )
+        favorite_combo.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(10, 0), padx=(0, 12))
+        favorite_combo.bind("<<ComboboxSelected>>", self._on_favorite_selected)
+        self._favorite_combo = favorite_combo
+        ttk.Button(instrument_frame, text="带入自选", command=self._on_favorite_selected).grid(row=1, column=4, sticky="e", pady=(10, 0))
+        ttk.Button(instrument_frame, text="删除自选", command=self.remove_favorite_instrument).grid(row=1, column=5, sticky="e", padx=(8, 8), pady=(10, 0))
 
         notebook = ttk.Notebook(left)
         notebook.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
@@ -651,6 +758,7 @@ class SmartOrderWindow:
         self.instrument_id.set(instrument.inst_id)
         self._refresh_ladder_filter_options(instrument)
         self._refresh_quantity_labels()
+        self._refresh_favorite_options(preferred_inst_id=instrument.inst_id)
         self.manager.ensure_market_snapshot(instrument, force=True)
         self._last_ladder_signature = ()
         self._last_instrument_status = ""
