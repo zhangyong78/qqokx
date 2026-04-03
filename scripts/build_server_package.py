@@ -20,7 +20,12 @@ def write_text(path: Path, content: str, *, encoding: str = "utf-8-sig") -> None
 def package_ignore(_src: str, names: list[str]) -> set[str]:
     ignored: set[str] = set()
     for name in names:
-        if name == "__pycache__" or name.endswith(".pyc") or name.endswith(".pyo"):
+        if (
+            name == "__pycache__"
+            or name.endswith(".pyc")
+            or name.endswith(".pyo")
+            or ".bak_" in name
+        ):
             ignored.add(name)
     return ignored
 

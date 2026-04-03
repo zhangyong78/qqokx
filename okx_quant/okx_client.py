@@ -349,11 +349,44 @@ class OkxRestClient:
         return candles
 
     def get_mark_price_candles(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
-        payload = self._request(
-            "GET",
-            "/api/v5/market/mark-price-candles",
-            params={"instId": inst_id, "bar": bar, "limit": str(limit)},
+        requested_limit = max(1, limit)
+        collected = self._fetch_mark_price_candles_page(
+            inst_id,
+            bar,
+            limit=min(requested_limit, MAX_PUBLIC_CANDLE_LIMIT),
         )
+        after = str(collected[0].ts) if collected else None
+
+        while len(collected) < requested_limit and after is not None:
+            page_limit = min(requested_limit - len(collected), MAX_PUBLIC_CANDLE_LIMIT)
+            batch = self._fetch_mark_price_candles_page(inst_id, bar, limit=page_limit, after=after)
+            if not batch:
+                break
+            previous_oldest = collected[0].ts if collected else None
+            collected = merge_candles(collected, batch)
+            oldest_ts = collected[0].ts if collected else None
+            if oldest_ts is None or oldest_ts == previous_oldest:
+                break
+            after = str(oldest_ts)
+            if len(batch) < page_limit:
+                break
+        return collected[-requested_limit:]
+
+    def _fetch_mark_price_candles_page(
+        self,
+        inst_id: str,
+        bar: str,
+        *,
+        limit: int,
+        after: str | None = None,
+    ) -> list[Candle]:
+        params = {"instId": inst_id, "bar": bar, "limit": str(max(1, min(limit, MAX_PUBLIC_CANDLE_LIMIT)))}
+        if after is not None:
+            params["after"] = after
+        payload = self._request("GET", "/api/v5/market/mark-price-candles", params=params)
+        return self._parse_mark_price_candles_payload(payload)
+
+    def _parse_mark_price_candles_payload(self, payload: dict[str, Any]) -> list[Candle]:
         candles: list[Candle] = []
         for row in payload["data"]:
             candles.append(
@@ -369,6 +402,35 @@ class OkxRestClient:
             )
         candles.sort(key=lambda candle: candle.ts)
         return candles
+
+    def get_tickers(
+        self,
+        inst_type: str,
+        *,
+        uly: str | None = None,
+        inst_family: str | None = None,
+    ) -> list[OkxTicker]:
+        params = {"instType": inst_type.upper()}
+        if uly:
+            params["uly"] = uly
+        if inst_family:
+            params["instFamily"] = inst_family
+        payload = self._request("GET", "/api/v5/market/tickers", params=params)
+        items: list[OkxTicker] = []
+        for row in payload.get("data", []):
+            items.append(
+                OkxTicker(
+                    inst_id=row.get("instId", ""),
+                    last=_to_decimal(row.get("last")),
+                    bid=_to_decimal(row.get("bidPx")),
+                    ask=_to_decimal(row.get("askPx")),
+                    mark=_to_decimal(row.get("markPx")),
+                    index=_first_decimal(row.get("idxPx"), row.get("indexPx")),
+                    raw=row,
+                )
+            )
+        items.sort(key=lambda item: item.inst_id)
+        return items
 
     def get_ticker(self, inst_id: str) -> OkxTicker:
         payload = self._request("GET", "/api/v5/market/ticker", params={"instId": inst_id})

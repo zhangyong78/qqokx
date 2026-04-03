@@ -225,6 +225,69 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(items[0].close_size, Decimal("200"))
         self.assertEqual(items[1].mgn_mode, "isolated")
 
+    def test_get_tickers_parses_market_rows(self) -> None:
+        client = OkxRestClient()
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            self.assertEqual(path, "/api/v5/market/tickers")
+            self.assertEqual(params["instType"], "OPTION")
+            self.assertEqual(params["instFamily"], "BTC-USD")
+            return {
+                "data": [
+                    {
+                        "instId": "BTC-USD-260626-100000-C",
+                        "last": "0.012",
+                        "bidPx": "0.0115",
+                        "askPx": "0.0125",
+                        "markPx": "0.0121",
+                        "idxPx": "98500",
+                    }
+                ]
+            }
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        items = client.get_tickers("OPTION", inst_family="BTC-USD")
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].inst_id, "BTC-USD-260626-100000-C")
+        self.assertEqual(items[0].mark, Decimal("0.0121"))
+        self.assertEqual(items[0].index, Decimal("98500"))
+
+    def test_get_mark_price_candles_pages_when_limit_exceeds_public_cap(self) -> None:
+        client = OkxRestClient()
+        requests: list[dict[str, str]] = []
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            self.assertEqual(method, "GET")
+            self.assertEqual(path, "/api/v5/market/mark-price-candles")
+            requests.append(dict(params or {}))
+            after = (params or {}).get("after")
+            if after is None:
+                return {
+                    "data": [
+                        ["3000", "1.3", "1.4", "1.2", "1.35", "1"],
+                        ["2000", "1.2", "1.3", "1.1", "1.25", "1"],
+                        ["1000", "1.1", "1.2", "1.0", "1.15", "1"],
+                    ]
+                }
+            self.assertEqual(after, "1000")
+            return {
+                "data": [
+                    ["0", "1.0", "1.1", "0.9", "1.05", "1"],
+                    ["-1000", "0.9", "1.0", "0.8", "0.95", "1"],
+                ]
+            }
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        candles = client.get_mark_price_candles("BTC-USD-260626-100000-C", "1H", limit=5)
+
+        self.assertEqual(len(candles), 5)
+        self.assertEqual([item.ts for item in candles], [-1000, 0, 1000, 2000, 3000])
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0]["limit"], "5")
+        self.assertEqual(requests[1]["limit"], "2")
+        self.assertEqual(requests[1]["after"], "1000")
+
     def test_position_history_realized_pnl_usdt_converts_coin_margin(self) -> None:
         item = OkxPositionHistoryItem(
             update_time=1710000000200,

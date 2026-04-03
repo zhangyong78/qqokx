@@ -17,6 +17,7 @@ from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.engine import StrategyEngine, fetch_hourly_ema_debug, format_hourly_debug
 from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
+from okx_quant.option_strategy_ui import OptionStrategyCalculatorWindow
 from okx_quant.okx_client import (
     OkxAccountAssetItem,
     OkxAccountConfig,
@@ -193,6 +194,7 @@ class QuantApp:
         self._smart_order_window: SmartOrderWindow | None = None
         self._deribit_volatility_monitor_window: DeribitVolatilityMonitorWindow | None = None
         self._deribit_volatility_window: DeribitVolatilityWindow | None = None
+        self._option_strategy_window: OptionStrategyCalculatorWindow | None = None
         self._positions_zoom_window: Toplevel | None = None
         self._protection_window: Toplevel | None = None
         self._protection_replay_window: ProtectionReplayWindow | None = None
@@ -417,6 +419,7 @@ class QuantApp:
         tools_menu.add_command(label="打开信号监控", command=self.open_signal_monitor_window)
         tools_menu.add_command(label="打开波动率监控", command=self.open_deribit_volatility_monitor_window)
         tools_menu.add_command(label="打开Deribit波动率指数", command=self.open_deribit_volatility_window)
+        tools_menu.add_command(label="打开期权策略计算器", command=self.open_option_strategy_window)
         tools_menu.add_command(label="刷新账户持仓", command=self.refresh_positions)
         menu_bar.add_cascade(label="工具", menu=tools_menu)
 
@@ -3230,6 +3233,17 @@ class QuantApp:
             logger=self._enqueue_log,
         )
 
+    def open_option_strategy_window(self) -> None:
+        if self._option_strategy_window is not None and self._option_strategy_window.window.winfo_exists():
+            self._option_strategy_window.show()
+            return
+
+        self._option_strategy_window = OptionStrategyCalculatorWindow(
+            self.root,
+            self.client,
+            logger=self._enqueue_log,
+        )
+
     def _close_settings_window(self) -> None:
         self._save_credentials_now(silent=True)
         self._save_notification_settings_now(silent=True)
@@ -4374,6 +4388,8 @@ class QuantApp:
             self._deribit_volatility_monitor_window.destroy()
         if self._deribit_volatility_window is not None and self._deribit_volatility_window.window.winfo_exists():
             self._deribit_volatility_window.window.destroy()
+        if self._option_strategy_window is not None and self._option_strategy_window.window.winfo_exists():
+            self._option_strategy_window.window.destroy()
         if self._protection_replay_window is not None and self._protection_replay_window.window.winfo_exists():
             self._protection_replay_window.window.destroy()
         self._close_positions_zoom_window()

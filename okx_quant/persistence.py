@@ -12,6 +12,7 @@ BACKTEST_CANDLE_CACHE_DIR_NAME = ".okx_quant_candle_cache"
 BACKTEST_REPORT_EXPORT_DIR_NAME = "backtest_exports"
 SMART_ORDER_TASKS_FILE_NAME = ".okx_quant_smart_order_tasks.json"
 SMART_ORDER_FAVORITES_FILE_NAME = ".okx_quant_smart_order_favorites.json"
+OPTION_STRATEGIES_FILE_NAME = ".okx_quant_option_strategies.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 
 
@@ -55,6 +56,12 @@ def smart_order_favorites_file_path(base_dir: Path | None = None) -> Path:
     if base_dir is None:
         base_dir = Path(__file__).resolve().parent.parent
     return Path(base_dir) / SMART_ORDER_FAVORITES_FILE_NAME
+
+
+def option_strategies_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is None:
+        base_dir = Path(__file__).resolve().parent.parent
+    return Path(base_dir) / OPTION_STRATEGIES_FILE_NAME
 
 
 def _empty_credentials_snapshot() -> dict[str, str]:
@@ -384,6 +391,84 @@ def save_smart_order_favorites_snapshot(
     normalized_favorites.sort(key=lambda item: (item["inst_type"], item["inst_id"]))
     payload = {
         "favorites": normalized_favorites,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
+def _normalize_option_strategy_leg(item: object) -> dict[str, object] | None:
+    if not isinstance(item, dict):
+        return None
+    alias = str(item.get("alias", "")).strip()
+    inst_id = str(item.get("inst_id", "")).strip().upper()
+    side = str(item.get("side", "buy")).strip().lower()
+    quantity = str(item.get("quantity", "1")).strip()
+    premium = str(item.get("premium", "")).strip()
+    enabled = bool(item.get("enabled", True))
+    if not alias or not inst_id or side not in {"buy", "sell"}:
+        return None
+    return {
+        "alias": alias,
+        "inst_id": inst_id,
+        "side": side,
+        "quantity": quantity or "1",
+        "premium": premium,
+        "enabled": enabled,
+    }
+
+
+def _normalize_option_strategy_record(item: object) -> dict[str, object] | None:
+    if not isinstance(item, dict):
+        return None
+    name = str(item.get("name", "")).strip()
+    if not name:
+        return None
+    raw_legs = item.get("legs")
+    if not isinstance(raw_legs, list):
+        raw_legs = []
+    legs = [normalized for raw in raw_legs if (normalized := _normalize_option_strategy_leg(raw)) is not None]
+    return {
+        "name": name,
+        "option_family": str(item.get("option_family", "")).strip().upper(),
+        "expiry_code": str(item.get("expiry_code", "")).strip(),
+        "bar": str(item.get("bar", "15m")).strip() or "15m",
+        "candle_limit": str(item.get("candle_limit", "600")).strip() or "600",
+        "chart_display_ccy": str(item.get("chart_display_ccy", "USDT")).strip() or "USDT",
+        "formula": str(item.get("formula", "")).strip(),
+        "legs": legs,
+    }
+
+
+def load_option_strategies_snapshot(path: Path | None = None) -> dict[str, object]:
+    target = path or option_strategies_file_path()
+    if not target.exists():
+        return {"strategies": []}
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    raw_items = payload.get("strategies")
+    if not isinstance(raw_items, list):
+        raw_items = []
+    strategies = [
+        normalized for item in raw_items if (normalized := _normalize_option_strategy_record(item)) is not None
+    ]
+    strategies.sort(key=lambda item: str(item["name"]))
+    return {"strategies": strategies}
+
+
+def save_option_strategies_snapshot(
+    strategies: list[dict[str, object]],
+    path: Path | None = None,
+) -> Path:
+    target = path or option_strategies_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    normalized = [
+        item for strategy in strategies if (item := _normalize_option_strategy_record(strategy)) is not None
+    ]
+    normalized.sort(key=lambda item: str(item["name"]))
+    payload = {
+        "strategies": normalized,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     temp_path = target.with_suffix(target.suffix + ".tmp")

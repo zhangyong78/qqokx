@@ -6,8 +6,11 @@ from uuid import uuid4
 from okx_quant.persistence import (
     credentials_file_path,
     load_credentials_snapshot,
+    load_option_strategies_snapshot,
     load_smart_order_favorites_snapshot,
+    option_strategies_file_path,
     save_credentials_snapshot,
+    save_option_strategies_snapshot,
     save_smart_order_favorites_snapshot,
     smart_order_favorites_file_path,
 )
@@ -75,3 +78,48 @@ class PersistenceTest(TestCase):
             snapshot["favorites"],
             [{"inst_type": "OPTION", "inst_id": "BTC-USD-260410-66000-P"}],
         )
+
+    def test_save_and_load_option_strategy_snapshot(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        temp_path = option_strategies_file_path(temp_dir)
+        save_option_strategies_snapshot(
+            [
+                {
+                    "name": "Bull Call",
+                    "option_family": "BTC-USD",
+                    "expiry_code": "260626",
+                    "bar": "15m",
+                    "candle_limit": "600",
+                    "chart_display_ccy": "USDT",
+                    "formula": "L1 - L2",
+                    "legs": [
+                        {
+                            "alias": "L1",
+                            "inst_id": "BTC-USD-260626-100000-C",
+                            "side": "buy",
+                            "quantity": "1",
+                            "premium": "0.01",
+                            "enabled": True,
+                        },
+                        {
+                            "alias": "L2",
+                            "inst_id": "BTC-USD-260626-120000-C",
+                            "side": "sell",
+                            "quantity": "1",
+                            "premium": "0.003",
+                            "enabled": True,
+                        },
+                    ],
+                }
+            ],
+            temp_path,
+        )
+
+        snapshot = load_option_strategies_snapshot(temp_path)
+        self.assertEqual(len(snapshot["strategies"]), 1)
+        record = snapshot["strategies"][0]
+        self.assertEqual(record["name"], "Bull Call")
+        self.assertEqual(record["candle_limit"], "600")
+        self.assertEqual(record["chart_display_ccy"], "USDT")
+        self.assertEqual(record["formula"], "L1 - L2")
+        self.assertEqual(record["legs"][0]["inst_id"], "BTC-USD-260626-100000-C")
