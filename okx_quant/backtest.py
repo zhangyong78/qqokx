@@ -105,6 +105,7 @@ class BacktestResult:
     instrument: Instrument
     ema_values: list[Decimal] = field(default_factory=list)
     trend_ema_values: list[Decimal] = field(default_factory=list)
+    big_ema_values: list[Decimal] = field(default_factory=list)
     equity_curve: list[Decimal] = field(default_factory=list)
     net_value_curve: list[Decimal] = field(default_factory=list)
     drawdown_curve: list[Decimal] = field(default_factory=list)
@@ -114,6 +115,7 @@ class BacktestResult:
     initial_capital: Decimal = Decimal("10000")
     ema_period: int = 21
     trend_ema_period: int = 55
+    big_ema_period: int = 233
     strategy_id: str = STRATEGY_DYNAMIC_ID
     data_source_note: str = ""
     maker_fee_rate: Decimal = Decimal("0")
@@ -147,6 +149,8 @@ def run_backtest(
     config: StrategyConfig,
     *,
     candle_limit: int = 200,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> BacktestResult:
@@ -154,9 +158,20 @@ def run_backtest(
         raise ValueError("回测 K 线数量必须大于 0")
     if candle_limit > MAX_BACKTEST_CANDLES:
         raise ValueError(f"回测最多支持 {MAX_BACKTEST_CANDLES} 根 K 线")
+    if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        raise ValueError("开始时间不能晚于结束时间")
 
     instrument = client.get_instrument(config.inst_id)
-    candles = _load_backtest_candles(client, config.inst_id, config.bar, candle_limit)
+    preload_count = _required_backtest_preload_candles(config)
+    candles = _load_backtest_candles(
+        client,
+        config.inst_id,
+        config.bar,
+        candle_limit,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        preload_count=preload_count,
+    )
     return _run_backtest_with_loaded_data(
         candles,
         instrument,
@@ -191,6 +206,8 @@ def run_backtest_batch(
     base_config: StrategyConfig,
     *,
     candle_limit: int = 200,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
     atr_multipliers: tuple[Decimal, ...] = ATR_BATCH_MULTIPLIERS,
     take_ratios: tuple[Decimal, ...] = ATR_BATCH_TAKE_RATIOS,
     maker_fee_rate: Decimal = Decimal("0"),
@@ -202,9 +219,20 @@ def run_backtest_batch(
         raise ValueError("\u56de\u6d4b K \u7ebf\u6570\u91cf\u5fc5\u987b\u5927\u4e8e 0")
     if candle_limit > MAX_BACKTEST_CANDLES:
         raise ValueError(f"\u56de\u6d4b\u6700\u591a\u652f\u6301 {MAX_BACKTEST_CANDLES} \u6839 K \u7ebf")
+    if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        raise ValueError("开始时间不能晚于结束时间")
 
+    preload_count = _required_backtest_preload_candles(base_config)
     instrument = client.get_instrument(base_config.inst_id)
-    candles = _load_backtest_candles(client, base_config.inst_id, base_config.bar, candle_limit)
+    candles = _load_backtest_candles(
+        client,
+        base_config.inst_id,
+        base_config.bar,
+        candle_limit,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        preload_count=preload_count,
+    )
     data_source_note = _build_backtest_data_source_note(client)
     results: list[tuple[StrategyConfig, BacktestResult]] = []
     for config in build_atr_batch_configs(base_config, atr_multipliers=atr_multipliers, take_ratios=take_ratios):
@@ -259,6 +287,7 @@ def _run_backtest_with_loaded_data(
         raise RuntimeError(f"暂不支持的回测策略：{config.strategy_id}")
     ema_values = ema([candle.close for candle in candles], config.ema_period) if candles else []
     trend_ema_values = ema([candle.close for candle in candles], config.trend_ema_period) if candles else []
+    big_ema_values = ema([candle.close for candle in candles], config.big_ema_period) if candles else []
     initial_capital = config.backtest_initial_capital
     equity_curve = _build_equity_curve(candles, trades)
     net_value_curve = [initial_capital + value for value in equity_curve]
@@ -272,6 +301,7 @@ def _run_backtest_with_loaded_data(
         instrument=instrument,
         ema_values=ema_values,
         trend_ema_values=trend_ema_values,
+        big_ema_values=big_ema_values,
         equity_curve=equity_curve,
         net_value_curve=net_value_curve,
         drawdown_curve=drawdown_curve,
@@ -281,6 +311,7 @@ def _run_backtest_with_loaded_data(
         initial_capital=initial_capital,
         ema_period=config.ema_period,
         trend_ema_period=config.trend_ema_period,
+        big_ema_period=config.big_ema_period,
         strategy_id=config.strategy_id,
         data_source_note=data_source_note,
         maker_fee_rate=maker_fee_rate,
@@ -327,8 +358,8 @@ def format_backtest_report(result: BacktestResult) -> str:
     ]
     if result.strategy_id == STRATEGY_DYNAMIC_ID:
         lines.append(
-            f"趋势过滤：EMA{result.ema_period} > EMA{result.trend_ema_period} 才做多，"
-            f"EMA{result.ema_period} < EMA{result.trend_ema_period} 才做空"
+            f"趋势过滤：EMA{result.ema_period} > EMA{result.trend_ema_period} 且收盘价位于 EMA{result.big_ema_period} 上方才做多，"
+            f"EMA{result.ema_period} < EMA{result.trend_ema_period} 且收盘价位于 EMA{result.big_ema_period} 下方才做空"
         )
         lines.append("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓")
     if result.strategy_id == STRATEGY_EMA5_EMA8_ID:
@@ -372,20 +403,84 @@ def _load_backtest_candles(
     inst_id: str,
     bar: str,
     candle_limit: int,
+    *,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    preload_count: int = 0,
 ) -> list[Candle]:
+    range_fetcher = getattr(client, "get_candles_history_range", None)
     history_fetcher = getattr(client, "get_candles_history", None)
-    if callable(history_fetcher):
+    used_range_fetcher = (start_ts is not None or end_ts is not None) and callable(range_fetcher)
+    if used_range_fetcher:
+        raw_candles = range_fetcher(
+            inst_id,
+            bar,
+            start_ts=0 if start_ts is None else start_ts,
+            end_ts=9999999999999 if end_ts is None else end_ts,
+            limit=candle_limit,
+            preload_count=max(0, preload_count),
+        )
+    elif callable(history_fetcher):
         raw_candles = history_fetcher(inst_id, bar, limit=candle_limit)
     else:
         raw_candles = client.get_candles(inst_id, bar, limit=candle_limit)
     candles = [candle for candle in raw_candles if candle.confirmed]
-    return candles[-candle_limit:]
+    if not used_range_fetcher and start_ts is not None:
+        candles = [candle for candle in candles if candle.ts >= start_ts]
+    if not used_range_fetcher and end_ts is not None:
+        candles = [candle for candle in candles if candle.ts <= end_ts]
+    return candles if used_range_fetcher else candles[-candle_limit:]
+
+
+def _required_backtest_preload_candles(config: StrategyConfig) -> int:
+    if config.strategy_id == STRATEGY_CROSS_ID:
+        minimum = max(
+            config.ema_period + 2,
+            config.trend_ema_period + 2,
+            config.big_ema_period + 2,
+            config.atr_period + 2,
+        )
+    elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+        minimum = max(config.ema_period, config.trend_ema_period) + 1
+    else:
+        minimum = max(
+            config.ema_period,
+            config.trend_ema_period,
+            config.big_ema_period,
+            config.atr_period,
+        )
+    return _backtest_trade_start_index(minimum)
 
 
 def _build_backtest_data_source_note(client: OkxRestClient) -> str:
     stats = getattr(client, "last_candle_history_stats", None)
     if not isinstance(stats, dict):
         return ""
+    if stats.get("range_mode"):
+        returned_count = int(stats.get("returned_count", 0) or 0)
+        requested_count = int(stats.get("requested_count", 0) or 0)
+        selected_count = int(stats.get("selected_count", 0) or 0)
+        preload_count = int(stats.get("preload_count", 0) or 0)
+        start_ts = stats.get("start_ts")
+        end_ts = stats.get("end_ts")
+        range_text = ""
+        if start_ts and end_ts:
+            range_text = (
+                f"{datetime.fromtimestamp(int(start_ts) / 1000).strftime('%Y-%m-%d %H:%M')}"
+                f" ~ {datetime.fromtimestamp(int(end_ts) / 1000).strftime('%Y-%m-%d %H:%M')}"
+            )
+        parts = ["按时间段取数"]
+        if range_text:
+            parts.append(range_text)
+        if requested_count > 0:
+            parts.append(f"上限 {requested_count} 根")
+        if selected_count > 0:
+            parts.append(f"区间内返回 {selected_count} 根")
+        if preload_count > 0:
+            parts.append(f"前置补足 {preload_count} 根")
+        if returned_count > 0:
+            parts.append(f"实际载入 {returned_count} 根")
+        return " | ".join(parts)
     cache_hit_count = int(stats.get("cache_hit_count", 0) or 0)
     latest_fetch_count = int(stats.get("latest_fetch_count", 0) or 0)
     older_fetch_count = int(stats.get("older_fetch_count", 0) or 0)
@@ -490,7 +585,12 @@ def _run_cross_backtest(
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> list[BacktestTrade]:
     strategy = EmaAtrStrategy()
-    minimum = max(config.ema_period + 2, config.atr_period + 2)
+    minimum = max(
+        config.ema_period + 2,
+        config.trend_ema_period + 2,
+        config.big_ema_period + 2,
+        config.atr_period + 2,
+    )
     if len(candles) < minimum:
         raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根")
     trade_start_index = _backtest_trade_start_index(minimum)
@@ -561,7 +661,12 @@ def _run_dynamic_backtest(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> list[BacktestTrade]:
-    minimum = max(config.ema_period, config.atr_period)
+    minimum = max(
+        config.ema_period,
+        config.trend_ema_period,
+        config.big_ema_period,
+        config.atr_period,
+    )
     if len(candles) < minimum + 1:
         raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum + 1} 根")
     trade_start_index = _backtest_trade_start_index(minimum)
@@ -571,6 +676,7 @@ def _run_dynamic_backtest(
     closes = [candle.close for candle in candles]
     ema_values = ema(closes, config.ema_period)
     trend_ema_values = ema(closes, config.trend_ema_period)
+    big_ema_values = ema(closes, config.big_ema_period)
     atr_values = atr(candles, config.atr_period)
     trades: list[BacktestTrade] = []
     open_position: _OpenPosition | None = None
@@ -624,6 +730,7 @@ def _run_dynamic_backtest(
             index,
             ema_values,
             trend_ema_values,
+            big_ema_values,
             atr_values,
             config,
         )
@@ -653,12 +760,14 @@ def _evaluate_dynamic_signal_precomputed(
     index: int,
     ema_values: list[Decimal],
     trend_ema_values: list[Decimal],
+    big_ema_values: list[Decimal],
     atr_values: list[Decimal | None],
     config: StrategyConfig,
 ) -> SignalDecision:
     current_candle = candles[index]
     current_ema = ema_values[index]
     trend_ema = trend_ema_values[index]
+    big_ema = big_ema_values[index]
     current_atr = atr_values[index]
     if current_atr is None:
         return SignalDecision(
@@ -706,6 +815,17 @@ def _evaluate_dynamic_signal_precomputed(
                 signal_candle_high=current_candle.high,
                 signal_candle_low=current_candle.low,
             )
+        if current_candle.close <= big_ema:
+            return SignalDecision(
+                signal=None,
+                reason="close_below_big_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
         return SignalDecision(
             signal="long",
             reason="dynamic_long",
@@ -744,6 +864,17 @@ def _evaluate_dynamic_signal_precomputed(
             return SignalDecision(
                 signal=None,
                 reason="close_above_trend_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
+        if current_candle.close >= big_ema:
+            return SignalDecision(
+                signal=None,
+                reason="close_above_big_ema",
                 candle_ts=current_candle.ts,
                 entry_reference=None,
                 atr_value=current_atr,

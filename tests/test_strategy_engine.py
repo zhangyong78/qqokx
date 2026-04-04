@@ -32,6 +32,8 @@ class StrategyEngineTest(TestCase):
             inst_id="BTC-USDT-SWAP",
             bar="15m",
             ema_period=2,
+            trend_ema_period=2,
+            big_ema_period=3,
             atr_period=2,
             atr_stop_multiplier=Decimal("2"),
             atr_take_multiplier=Decimal("4"),
@@ -52,6 +54,8 @@ class StrategyEngineTest(TestCase):
             inst_id="BTC-USDT-SWAP",
             bar="15m",
             ema_period=2,
+            trend_ema_period=5,
+            big_ema_period=6,
             atr_period=2,
             atr_stop_multiplier=Decimal("2"),
             atr_take_multiplier=Decimal("4"),
@@ -66,7 +70,7 @@ class StrategyEngineTest(TestCase):
         decision = EmaAtrStrategy().evaluate(candles, config)
 
         self.assertIsNone(decision.signal)
-        self.assertIn("EMA55", decision.reason)
+        self.assertIn("EMA6", decision.reason)
 
     def test_order_plan_builds_tp_and_sl(self) -> None:
         instrument = Instrument(
@@ -81,6 +85,8 @@ class StrategyEngineTest(TestCase):
             inst_id="BTC-USDT-SWAP",
             bar="15m",
             ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
             atr_period=14,
             atr_stop_multiplier=Decimal("2"),
             atr_take_multiplier=Decimal("4"),
@@ -119,6 +125,8 @@ class StrategyEngineTest(TestCase):
             inst_id="BTC-USDT-SWAP",
             bar="15m",
             ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
             atr_period=14,
             atr_stop_multiplier=Decimal("2"),
             atr_take_multiplier=Decimal("4"),

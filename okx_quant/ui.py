@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import queue
 import re
@@ -6,6 +6,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import tkinter.font as tkfont
 from tkinter import BooleanVar, END, Menu, StringVar, Text, Tk, Toplevel, simpledialog
 from tkinter import messagebox, ttk
 
@@ -70,9 +71,11 @@ POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
     "positions": (
         "inst_type",
         "mark",
+        "mark_usdt",
         "avg",
         "avg_usdt",
         "pos",
+        "option_side",
         "upl",
         "upl_usdt",
         "realized",
@@ -308,6 +311,7 @@ class QuantApp:
         self.bar = StringVar(value="15m")
         self.ema_period = StringVar(value="21")
         self.trend_ema_period = StringVar(value="55")
+        self.big_ema_period = StringVar(value="233")
         self.atr_period = StringVar(value="10")
         self.stop_atr = StringVar(value="2")
         self.take_atr = StringVar(value="4")
@@ -365,6 +369,10 @@ class QuantApp:
         self.position_realized_text = StringVar(value="-")
         self.position_margin_text = StringVar(value="-")
         self.position_delta_text = StringVar(value="-")
+        self.position_short_call_text = StringVar(value="-")
+        self.position_short_put_text = StringVar(value="-")
+        self.position_long_call_text = StringVar(value="-")
+        self.position_long_put_text = StringVar(value="-")
         self.position_detail_text = StringVar(value=self._default_position_detail_text())
         self.account_info_summary_text = StringVar(value="尚未读取账户信息。")
         self.account_total_equity_text = StringVar(value="-")
@@ -532,19 +540,23 @@ class QuantApp:
         ttk.Entry(start_frame, textvariable=self.poll_seconds).grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
         row += 1
-        ttk.Label(start_frame, text="EMA 周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(start_frame, text="EMA小周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
         ttk.Entry(start_frame, textvariable=self.ema_period).grid(
             row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
         )
-        ttk.Label(start_frame, text="趋势EMA周期").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        ttk.Label(start_frame, text="EMA中周期").grid(row=row, column=2, sticky="w", pady=(12, 0))
         ttk.Entry(start_frame, textvariable=self.trend_ema_period).grid(
             row=row, column=3, sticky="ew", pady=(12, 0)
         )
 
         row += 1
-        ttk.Label(start_frame, text="ATR 周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(start_frame, textvariable=self.atr_period).grid(
+        ttk.Label(start_frame, text="EMA大周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(start_frame, textvariable=self.big_ema_period).grid(
             row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
+        )
+        ttk.Label(start_frame, text="ATR 周期").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        ttk.Entry(start_frame, textvariable=self.atr_period).grid(
+            row=row, column=3, sticky="ew", pady=(12, 0)
         )
 
         row += 1
@@ -769,13 +781,17 @@ class QuantApp:
 
         overview_row = ttk.Frame(positions_frame)
         overview_row.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        for column in range(5):
+        for column in range(9):
             overview_row.columnconfigure(column, weight=1)
         self._build_metric_card(overview_row, 0, "持仓笔数", self.position_total_text)
         self._build_metric_card(overview_row, 1, "浮动盈亏(USDT)", self.position_upl_text)
         self._build_metric_card(overview_row, 2, "已实现盈亏", self.position_realized_text)
         self._build_metric_card(overview_row, 3, "初始保证金(IMR)", self.position_margin_text)
         self._build_metric_card(overview_row, 4, "Delta 合计", self.position_delta_text)
+        self._build_metric_card(overview_row, 5, "买购数量", self.position_long_call_text)
+        self._build_metric_card(overview_row, 6, "卖购数量", self.position_short_call_text)
+        self._build_metric_card(overview_row, 7, "买沽数量", self.position_long_put_text)
+        self._build_metric_card(overview_row, 8, "卖沽数量", self.position_short_put_text)
 
         position_pane = ttk.Panedwindow(positions_frame, orient="vertical")
         position_pane.grid(row=3, column=0, sticky="nsew")
@@ -791,9 +807,11 @@ class QuantApp:
                 "inst_type",
                 "mgn_mode",
                 "mark",
+                "mark_usdt",
                 "avg",
                 "avg_usdt",
                 "pos",
+                "option_side",
                 "upl",
                 "upl_usdt",
                 "realized",
@@ -814,11 +832,13 @@ class QuantApp:
         self.position_tree.heading("#0", text="合约 / 分组")
         self.position_tree.heading("inst_type", text="类型")
         self.position_tree.heading("mgn_mode", text="保证金模式")
-        self.position_tree.heading("mark", text="标记价格")
-        self.position_tree.heading("avg", text="开仓均价")
-        self.position_tree.heading("avg_usdt", text="均价≈USDT")
+        self.position_tree.heading("mark", text="标记价")
+        self.position_tree.heading("mark_usdt", text="标记≈USDT")
+        self.position_tree.heading("avg", text="开仓价")
+        self.position_tree.heading("avg_usdt", text="开仓≈USDT")
         self.position_tree.heading("pos", text="持仓量")
-        self.position_tree.heading("upl", text="浮动盈亏")
+        self.position_tree.heading("option_side", text="买卖购沽")
+        self.position_tree.heading("upl", text="浮盈亏")
         self.position_tree.heading("upl_usdt", text="浮盈≈USDT")
         self.position_tree.heading("realized", text="已实现盈亏")
         self.position_tree.heading("market_value", text="市值")
@@ -835,11 +855,13 @@ class QuantApp:
         self.position_tree.column("inst_type", width=72, anchor="center")
         self.position_tree.column("mgn_mode", width=92, anchor="center")
         self.position_tree.column("mark", width=108, anchor="e")
-        self.position_tree.column("avg", width=90, anchor="e")
-        self.position_tree.column("avg_usdt", width=92, anchor="e")
+        self.position_tree.column("mark_usdt", width=54, anchor="e")
+        self.position_tree.column("avg", width=108, anchor="e")
+        self.position_tree.column("avg_usdt", width=54, anchor="e")
         self.position_tree.column("pos", width=110, anchor="e")
-        self.position_tree.column("upl", width=220, anchor="e")
-        self.position_tree.column("upl_usdt", width=92, anchor="e")
+        self.position_tree.column("option_side", width=110, anchor="center")
+        self.position_tree.column("upl", width=210, anchor="e")
+        self.position_tree.column("upl_usdt", width=105, anchor="e")
         self.position_tree.column("realized", width=118, anchor="e")
         self.position_tree.column("market_value", width=160, anchor="e")
         self.position_tree.column("liq", width=92, anchor="e")
@@ -849,8 +871,8 @@ class QuantApp:
         self.position_tree.column("delta", width=82, anchor="e")
         self.position_tree.column("gamma", width=82, anchor="e")
         self.position_tree.column("vega", width=82, anchor="e")
-        self.position_tree.column("theta", width=82, anchor="e")
-        self.position_tree.column("theta_usdt", width=88, anchor="e")
+        self.position_tree.column("theta", width=108, anchor="e")
+        self.position_tree.column("theta_usdt", width=54, anchor="e")
         self.position_tree.grid(row=0, column=0, sticky="nsew")
         self.position_tree.bind("<<TreeviewSelect>>", self._on_position_selected)
         self.position_tree.tag_configure("profit", foreground="#13803d")
@@ -1418,16 +1440,7 @@ class QuantApp:
         columns = tuple(self.position_tree["columns"])
         zoom_tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings", selectmode="browse")
         self._positions_zoom_tree = zoom_tree
-        for column_id in ("#0", *columns):
-            heading = self.position_tree.heading(column_id)
-            column = self.position_tree.column(column_id)
-            zoom_tree.heading(column_id, text=heading.get("text", ""))
-            zoom_tree.column(
-                column_id,
-                width=column.get("width"),
-                anchor=column.get("anchor"),
-                stretch=column.get("stretch"),
-            )
+        self._sync_positions_zoom_columns_from_main()
         zoom_tree.grid(row=0, column=0, sticky="nsew")
         zoom_tree.bind("<<TreeviewSelect>>", self._on_positions_zoom_selected)
         zoom_tree.tag_configure("profit", foreground="#13803d")
@@ -1951,6 +1964,7 @@ class QuantApp:
 
         self._positions_zoom_summary_text.set(self.positions_summary_text.get())
         zoom_tree = self._positions_zoom_tree
+        self._sync_positions_zoom_columns_from_main()
         zoom_tree.delete(*zoom_tree.get_children())
 
         def _copy_branch(source_parent: str, target_parent: str) -> None:
@@ -1979,6 +1993,34 @@ class QuantApp:
                 self._position_selection_syncing = False
         self._refresh_positions_zoom_detail()
         self._update_positions_zoom_search_shortcuts()
+
+    def _sync_positions_zoom_columns_from_main(self) -> None:
+        if self.position_tree is None or self._positions_zoom_tree is None:
+            return
+        zoom_tree = self._positions_zoom_tree
+        columns = tuple(self.position_tree["columns"])
+        approx_heading_columns = {"mark_usdt", "avg_usdt", "upl_usdt", "theta_usdt"}
+        heading_font_name = ttk.Style().lookup("Treeview.Heading", "font") or "TkDefaultFont"
+        try:
+            heading_font = tkfont.nametofont(heading_font_name)
+        except Exception:
+            heading_font = tkfont.nametofont("TkDefaultFont")
+        for column_id in ("#0", *columns):
+            heading = self.position_tree.heading(column_id)
+            column = self.position_tree.column(column_id)
+            width = column.get("width")
+            stretch = column.get("stretch")
+            if column_id in approx_heading_columns:
+                heading_text = str(heading.get("text", ""))
+                width = max(heading_font.measure(heading_text) + 20, 84)
+                stretch = False
+            zoom_tree.heading(column_id, text=heading.get("text", ""))
+            zoom_tree.column(
+                column_id,
+                width=width,
+                anchor=column.get("anchor"),
+                stretch=stretch,
+            )
 
     def _on_positions_zoom_selected(self, *_: object) -> None:
         if self._positions_zoom_tree is None or self._positions_view_rendering:
@@ -3158,6 +3200,7 @@ class QuantApp:
                 bar=self.bar.get(),
                 ema_period=self.ema_period.get(),
                 trend_ema_period=self.trend_ema_period.get(),
+                big_ema_period=self.big_ema_period.get(),
                 atr_period=self.atr_period.get(),
                 stop_atr=self.stop_atr.get(),
                 take_atr=self.take_atr.get(),
@@ -3175,6 +3218,7 @@ class QuantApp:
                 compounding_enabled=False,
                 slippage_percent="0",
                 funding_rate_percent="0",
+                candle_limit="10000",
             ),
         )
 
@@ -3648,8 +3692,8 @@ class QuantApp:
         if not symbol:
             messagebox.showerror("提示", "请先选择信号标的")
             return
-        ema_period = self._parse_positive_int(self.ema_period.get(), "EMA 周期")
-        self._enqueue_log(f"正在获取 {symbol} 的 1 小时调试值，EMA 周期={ema_period} ...")
+        ema_period = self._parse_positive_int(self.ema_period.get(), "EMA小周期")
+        self._enqueue_log(f"正在获取 {symbol} 的 1 小时调试值，EMA小周期={ema_period} ...")
         threading.Thread(
             target=self._debug_hourly_values_worker,
             args=(symbol, ema_period),
@@ -3846,9 +3890,11 @@ class QuantApp:
                 position.inst_type,
                 _format_margin_mode(position.mgn_mode),
                 _format_mark_price(position),
+                _format_position_mark_price_usdt(position, self._upl_usdt_prices),
                 _format_position_avg_price(position, self._position_instruments),
                 _format_position_avg_price_usdt(position, self._upl_usdt_prices),
                 _format_position_size(position, self._position_instruments),
+                _format_option_trade_side(position),
                 _format_position_unrealized_pnl(position),
                 _format_optional_usdt(_position_unrealized_pnl_usdt(position, self._upl_usdt_prices)),
                 _format_optional_decimal_fixed(position.realized_pnl, places=5, with_sign=True),
@@ -3915,7 +3961,7 @@ class QuantApp:
         self.position_realized_text.set(
             _format_optional_decimal_fixed(
                 metrics["realized"] if isinstance(metrics["realized"], Decimal) else None,
-                places=5,
+                places=_group_pnl_places(metrics.get("pnl_currency")),
                 with_sign=True,
             )
         )
@@ -3923,7 +3969,39 @@ class QuantApp:
             _format_optional_integer(metrics["imr"] if isinstance(metrics["imr"], Decimal) else None)
         )
         self.position_delta_text.set(
-            _format_optional_decimal(metrics["delta"] if isinstance(metrics["delta"], Decimal) else None)
+            _format_summary_delta(metrics["delta"] if isinstance(metrics["delta"], Decimal) else None)
+        )
+        self.position_short_call_text.set(
+            _format_filtered_option_position_size(
+                visible_positions,
+                self._position_instruments,
+                option_kind="C",
+                direction="short",
+            )
+        )
+        self.position_short_put_text.set(
+            _format_filtered_option_position_size(
+                visible_positions,
+                self._position_instruments,
+                option_kind="P",
+                direction="short",
+            )
+        )
+        self.position_long_call_text.set(
+            _format_filtered_option_position_size(
+                visible_positions,
+                self._position_instruments,
+                option_kind="C",
+                direction="long",
+            )
+        )
+        self.position_long_put_text.set(
+            _format_filtered_option_position_size(
+                visible_positions,
+                self._position_instruments,
+                option_kind="P",
+                direction="long",
+            )
         )
 
     def _selected_position_payload(self) -> dict[str, object] | None:
@@ -3989,6 +4067,10 @@ class QuantApp:
         self.position_realized_text.set("-")
         self.position_margin_text.set("-")
         self.position_delta_text.set("-")
+        self.position_short_call_text.set("-")
+        self.position_short_put_text.set("-")
+        self.position_long_call_text.set("-")
+        self.position_long_put_text.set("-")
         self.position_detail_text.set(self._default_position_detail_text())
         self._set_readonly_text(self._position_detail_panel, self.position_detail_text.get())
         self._sync_positions_zoom_window()
@@ -4012,6 +4094,7 @@ class QuantApp:
             self.bar.set("4H")
             self.ema_period.set("5")
             self.trend_ema_period.set("8")
+            self.big_ema_period.set("233")
             self.risk_amount.set("100")
             self.entry_side_mode_label.set("跟随信号")
             self.tp_sl_mode_label.set("按信号标的的价格（本地）")
@@ -4037,8 +4120,9 @@ class QuantApp:
             f"下单方向模式：{self.entry_side_mode_label.get()}\n"
             f"止盈止损模式：{self.tp_sl_mode_label.get()}\n"
             f"自定义触发标的：{self.local_tp_sl_symbol.get().strip().upper() or '-'}\n"
-            f"EMA 周期：{config.ema_period}\n"
-            f"趋势EMA周期：{config.trend_ema_period}\n"
+            f"EMA小周期：{config.ema_period}\n"
+            f"EMA中周期：{config.trend_ema_period}\n"
+            f"EMA大周期：{config.big_ema_period}\n"
             f"ATR 周期：{config.atr_period}\n"
             f"风险金：{risk_value}\n"
             f"固定数量：{fixed_size}\n\n"
@@ -4092,8 +4176,9 @@ class QuantApp:
         config = StrategyConfig(
             inst_id=symbol,
             bar="4H" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self.bar.get(),
-            ema_period=5 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.ema_period.get(), "EMA 周期"),
-            trend_ema_period=8 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.trend_ema_period.get(), "趋势EMA周期"),
+            ema_period=5 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.ema_period.get(), "EMA小周期"),
+            trend_ema_period=8 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期"),
+            big_ema_period=233 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.big_ema_period.get(), "EMA大周期"),
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
             atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
@@ -4247,8 +4332,9 @@ class QuantApp:
             f"下单标的：{session.config.trade_inst_id or session.config.inst_id}\n"
             f"方向：{session.direction_label}\n"
             f"K线周期：{session.config.bar}\n"
-            f"EMA 周期：{session.config.ema_period}\n"
-            f"趋势EMA周期：{session.config.trend_ema_period}\n"
+            f"EMA小周期：{session.config.ema_period}\n"
+            f"EMA中周期：{session.config.trend_ema_period}\n"
+            f"EMA大周期：{session.config.big_ema_period}\n"
             f"ATR 周期：{session.config.atr_period}\n"
             f"止损 ATR 倍数：{session.config.atr_stop_multiplier}\n"
             f"止盈 ATR 倍数：{session.config.atr_take_multiplier}\n"
@@ -4412,6 +4498,19 @@ def _format_optional_decimal_fixed(value: Decimal | None, *, places: int, with_s
     if with_sign and value > 0:
         return f"+{text}"
     return text
+
+
+def _format_summary_delta(value: Decimal | None) -> str:
+    if value is None:
+        return "-"
+    magnitude = abs(value)
+    if magnitude >= Decimal("1000"):
+        places = 2
+    elif magnitude >= Decimal("1"):
+        places = 4
+    else:
+        places = 5
+    return _format_optional_decimal_fixed(value, places=places)
 
 
 def _format_optional_integer(value: Decimal | None, *, with_sign: bool = False) -> str:
@@ -4631,6 +4730,7 @@ def _aggregate_position_metrics(
     return {
         "count": len(positions),
         "size_display": _format_group_position_size(positions, position_instruments),
+        "option_side_display": _format_group_option_trade_side(positions, position_instruments),
         "upl": _sum_decimal([item.unrealized_pnl for item in positions]),
         "upl_usdt": _sum_decimal([_position_unrealized_pnl_usdt(item, upl_usdt_prices) for item in positions]),
         "market_value_usdt": _sum_decimal(
@@ -4652,8 +4752,10 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
     count = metrics["count"]
     pnl_places = _group_pnl_places(metrics.get("pnl_currency"))
     size_display = metrics.get("size_display")
+    option_side_display = metrics.get("option_side_display")
     return (
         group_type,
+        "--",
         "--",
         "--",
         "--",
@@ -4663,6 +4765,7 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
             if isinstance(count, int) and isinstance(size_display, str) and size_display
             else (f"{count} 个持仓" if isinstance(count, int) else "--")
         ),
+        option_side_display if isinstance(option_side_display, str) and option_side_display else "--",
         _format_optional_decimal_fixed(
             metrics["upl"] if isinstance(metrics["upl"], Decimal) else None,
             places=pnl_places,
@@ -4733,7 +4836,88 @@ def _format_group_position_size(
     parts: list[str] = []
     for currency in sorted(totals.keys()):
         amount = totals[currency]
-        parts.append(f"{format_decimal(amount)} {currency}")
+        parts.append(f"{format_decimal_fixed(amount, 2)} {currency}")
+    return " / ".join(parts)
+
+
+def _extract_option_kind(inst_id: str) -> str | None:
+    parts = inst_id.split("-")
+    if not parts:
+        return None
+    suffix = parts[-1].strip().upper()
+    return suffix if suffix in {"C", "P"} else None
+
+
+def _format_option_trade_side(position: OkxPosition) -> str:
+    if position.inst_type != "OPTION":
+        return "-"
+    option_kind = _extract_option_kind(position.inst_id)
+    direction = _format_pos_side(position.pos_side, position.position)
+    if option_kind == "C":
+        if direction == "long":
+            return "买购"
+        if direction == "short":
+            return "卖购"
+    if option_kind == "P":
+        if direction == "long":
+            return "买沽"
+        if direction == "short":
+            return "卖沽"
+    return "-"
+
+
+def _format_group_option_trade_side(
+    positions: list[OkxPosition],
+    position_instruments: dict[str, Instrument],
+) -> str:
+    totals: dict[str, tuple[Decimal, str]] = {}
+    ordered_labels = ("买购", "卖购", "买沽", "卖沽")
+    for position in positions:
+        label = _format_option_trade_side(position)
+        if label == "-":
+            continue
+        amount, currency = _position_signed_display_amount(position, position_instruments)
+        if amount is None or not currency:
+            continue
+        existing_amount, _ = totals.get(label, (Decimal("0"), currency))
+        totals[label] = (existing_amount + abs(amount), currency)
+
+    parts: list[str] = []
+    for label in ordered_labels:
+        if label not in totals:
+            continue
+        amount, currency = totals[label]
+        parts.append(f"{label}{format_decimal_fixed(amount, 2)}{currency}")
+    return " / ".join(parts)
+
+
+def _format_filtered_option_position_size(
+    positions: list[OkxPosition],
+    position_instruments: dict[str, Instrument],
+    *,
+    option_kind: str,
+    direction: str,
+) -> str:
+    totals: dict[str, Decimal] = {}
+    for position in positions:
+        if position.inst_type != "OPTION":
+            continue
+        if _extract_option_kind(position.inst_id) != option_kind:
+            continue
+        current_direction = _format_pos_side(position.pos_side, position.position)
+        if current_direction != direction:
+            continue
+        amount, currency = _position_signed_display_amount(position, position_instruments)
+        if amount is None or not currency:
+            continue
+        totals[currency] = totals.get(currency, Decimal("0")) + abs(amount)
+
+    if not totals:
+        return "-"
+
+    parts: list[str] = []
+    for currency in sorted(totals.keys()):
+        parts.append(f"{format_decimal_fixed(totals[currency], 2)} {currency}")
     return " / ".join(parts)
 
 
@@ -4785,6 +4969,22 @@ def _position_theta_usdt(position: OkxPosition, upl_usdt_prices: dict[str, Decim
     if price is None:
         return None
     return position.theta * price
+
+
+def _position_mark_price_usdt(position: OkxPosition, upl_usdt_prices: dict[str, Decimal]) -> Decimal | None:
+    mark_price = position.mark_price or position.last_price
+    if mark_price is None:
+        return None
+    if position.inst_type == "OPTION":
+        currency = _infer_upl_currency(position)
+    else:
+        currency = (_extract_quote_key(position.inst_id) or "").upper()
+    if currency in {"USDT", "USD", "USDC"}:
+        return mark_price
+    price = upl_usdt_prices.get(currency)
+    if price is None:
+        return None
+    return mark_price * price
 
 
 def _format_mark_price(position: OkxPosition) -> str:
@@ -4856,6 +5056,10 @@ def _position_avg_price_usdt(position: OkxPosition, upl_usdt_prices: dict[str, D
 
 def _format_position_avg_price_usdt(position: OkxPosition, upl_usdt_prices: dict[str, Decimal]) -> str:
     return _format_optional_usdt(_position_avg_price_usdt(position, upl_usdt_prices), with_sign=False)
+
+
+def _format_position_mark_price_usdt(position: OkxPosition, upl_usdt_prices: dict[str, Decimal]) -> str:
+    return _format_optional_usdt(_position_mark_price_usdt(position, upl_usdt_prices), with_sign=False)
 
 
 def _infer_upl_currency(position: OkxPosition) -> str:
@@ -5083,12 +5287,13 @@ def _build_position_detail_text(
         f"可平数量：{_format_optional_decimal(position.avail_position)}\n"
         f"保证金模式：{position.mgn_mode or '-'}\n"
         f"杠杆：{_format_optional_decimal(position.leverage)}\n"
-        f"开仓均价 / 均价≈USDT：{_format_position_avg_price(position, position_instruments)} / "
+        f"开仓价 / 开仓≈USDT：{_format_position_avg_price(position, position_instruments)} / "
         f"{_format_position_avg_price_usdt(position, upl_usdt_prices)}\n"
-        f"标记价格：{_format_mark_price(position)}\n"
+        f"标记价 / 标记≈USDT：{_format_mark_price(position)} / "
+        f"{_format_position_mark_price_usdt(position, upl_usdt_prices)}\n"
         f"市值：{_format_position_market_value(position, position_instruments, upl_usdt_prices)}\n"
         f"最新价：{_format_optional_decimal(position.last_price)}\n"
-        f"浮动盈亏 / 浮盈≈USDT：{_format_position_unrealized_pnl(position)} / "
+        f"浮盈亏 / 浮盈≈USDT：{_format_position_unrealized_pnl(position)} / "
         f"{_format_optional_usdt(_position_unrealized_pnl_usdt(position, upl_usdt_prices))}\n"
         f"已实现盈亏：{_format_optional_decimal_fixed(position.realized_pnl, places=5, with_sign=True)}\n"
         f"强平价：{_format_optional_decimal(position.liquidation_price)}\n"

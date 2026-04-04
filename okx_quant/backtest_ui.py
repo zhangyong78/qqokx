@@ -90,6 +90,7 @@ class BacktestLaunchState:
     bar: str
     ema_period: str
     trend_ema_period: str
+    big_ema_period: str
     atr_period: str
     stop_atr: str
     take_atr: str
@@ -107,6 +108,9 @@ class BacktestLaunchState:
     compounding_enabled: bool = False
     slippage_percent: str = "0"
     funding_rate_percent: str = "0"
+    start_time_text: str = ""
+    end_time_text: str = ""
+    candle_limit: str = "10000"
 
 
 @dataclass
@@ -359,7 +363,7 @@ def _build_backtest_param_summary(
         else:
             sizing_text = f"{sizing_label}{format_decimal(config.risk_amount or Decimal('0'))}"
         return (
-            f"4H固定 / EMA{config.ema_period} / 趋势EMA{config.trend_ema_period} / "
+            f"4H固定 / EMA{config.ema_period}/{config.trend_ema_period}/{config.big_ema_period} / "
             f"EMA{config.trend_ema_period}动态止损 / 方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / "
             f"仓位{sizing_text} / 本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
             f"{'复利' if config.backtest_compounding else '不复利'} / "
@@ -377,7 +381,7 @@ def _build_backtest_param_summary(
     else:
         sizing_text = f"{sizing_label}{risk_text}"
     return (
-        f"EMA{config.ema_period} / 趋势{config.trend_ema_period} / ATR{config.atr_period} / "
+        f"EMA{config.ema_period}/{config.trend_ema_period}/{config.big_ema_period} / ATR{config.atr_period} / "
         f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
         f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
         f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
@@ -420,6 +424,7 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "bar": config.bar,
         "ema_period": config.ema_period,
         "trend_ema_period": config.trend_ema_period,
+        "big_ema_period": config.big_ema_period,
         "atr_period": config.atr_period,
         "atr_stop_multiplier": str(config.atr_stop_multiplier),
         "atr_take_multiplier": str(config.atr_take_multiplier),
@@ -454,6 +459,7 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         bar=str(payload.get("bar", "15m")),
         ema_period=int(payload.get("ema_period", 21)),
         trend_ema_period=int(payload.get("trend_ema_period", 55)),
+        big_ema_period=int(payload.get("big_ema_period", 233)),
         atr_period=int(payload.get("atr_period", 14)),
         atr_stop_multiplier=Decimal(str(payload.get("atr_stop_multiplier", "2"))),
         atr_take_multiplier=Decimal(str(payload.get("atr_take_multiplier", "4"))),
@@ -740,6 +746,7 @@ class BacktestWindow:
         self.bar_label = StringVar(value=_normalize_backtest_bar_label(initial_state.bar))
         self.ema_period = StringVar(value=initial_state.ema_period)
         self.trend_ema_period = StringVar(value=initial_state.trend_ema_period)
+        self.big_ema_period = StringVar(value=initial_state.big_ema_period)
         self.atr_period = StringVar(value=initial_state.atr_period)
         self.stop_atr = StringVar(value=initial_state.stop_atr)
         self.take_atr = StringVar(value=initial_state.take_atr)
@@ -752,12 +759,14 @@ class BacktestWindow:
         self.compounding_enabled = BooleanVar(value=initial_state.compounding_enabled)
         self.slippage_percent = StringVar(value=initial_state.slippage_percent)
         self.funding_rate_percent = StringVar(value=initial_state.funding_rate_percent)
+        self.start_time_text = StringVar(value=initial_state.start_time_text)
+        self.end_time_text = StringVar(value=initial_state.end_time_text)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
         self.position_mode_label = StringVar(value=initial_state.position_mode_label)
         self.trigger_type_label = StringVar(value=initial_state.trigger_type_label)
         self.environment_label = StringVar(value=initial_state.environment_label)
-        self.candle_limit = StringVar(value="200")
+        self.candle_limit = StringVar(value=initial_state.candle_limit)
         self.report_summary = StringVar(value="点击“开始回测”后，会在这里显示报告摘要。")
         self.compare_summary = StringVar(value="暂无回测对比记录。")
         self.matrix_summary = StringVar(value="\u6682\u65e0 ATR \u6279\u91cf\u56de\u6d4b\u77e9\u9635\u3002")
@@ -825,23 +834,33 @@ class BacktestWindow:
         ).grid(row=row, column=5, sticky="ew")
 
         row += 1
-        ttk.Label(controls, text="EMA 周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.ema_period).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        ttk.Label(controls, text="趋势EMA周期").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        ttk.Label(controls, text="EMA小周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.ema_period).grid(
+            row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0)
+        )
+        ttk.Label(controls, text="EMA中周期").grid(row=row, column=2, sticky="w", pady=(12, 0))
         ttk.Entry(controls, textvariable=self.trend_ema_period).grid(
             row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
         )
-        ttk.Label(controls, text="ATR 周期").grid(row=row, column=4, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.atr_period).grid(row=row, column=5, sticky="ew", pady=(12, 0))
+        ttk.Label(controls, text="EMA大周期").grid(row=row, column=4, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.big_ema_period).grid(row=row, column=5, sticky="ew", pady=(12, 0))
 
         row += 1
-        ttk.Label(controls, text="止损 ATR 倍数").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.stop_atr).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        ttk.Label(controls, text="止盈 ATR 倍数").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.take_atr).grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
-        ttk.Label(controls, text="信号方向").grid(row=row, column=4, sticky="w", pady=(12, 0))
+        ttk.Label(controls, text="ATR 周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.atr_period).grid(
+            row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0)
+        )
+        ttk.Label(controls, text="止损 ATR 倍数").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.stop_atr).grid(
+            row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
+        )
+        ttk.Label(controls, text="止盈 ATR 倍数").grid(row=row, column=4, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.take_atr).grid(row=row, column=5, sticky="ew", pady=(12, 0))
+
+        row += 1
+        ttk.Label(controls, text="信号方向").grid(row=row, column=0, sticky="w", pady=(12, 0))
         self.signal_combo = ttk.Combobox(controls, textvariable=self.signal_mode_label, state="readonly")
-        self.signal_combo.grid(row=row, column=5, sticky="ew", pady=(12, 0))
+        self.signal_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
 
         row += 1
         self.size_or_risk_label = ttk.Label(controls, text="固定风险金/数量")
@@ -883,11 +902,25 @@ class BacktestWindow:
         )
 
         row += 1
+        ttk.Label(controls, text="开始时间").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.start_time_text).grid(
+            row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0)
+        )
+        ttk.Label(controls, text="结束时间").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.end_time_text).grid(
+            row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
+        )
+        ttk.Label(
+            controls,
+            text="支持 YYYYMMDD 或 YYYYMMDD HH:MM",
+        ).grid(row=row, column=4, columnspan=2, sticky="w", pady=(12, 0))
+
+        row += 1
         ttk.Label(controls, text="回测K线数").grid(row=row, column=0, sticky="w", pady=(12, 0))
         ttk.Entry(controls, textvariable=self.candle_limit).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
         ttk.Label(
             controls,
-            text="当前最多支持最近 10000 根已收盘 K 线",
+            text="当前回测区间最多支持 10000 根已收盘 K 线",
         ).grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Button(controls, text="开始回测", command=self.start_backtest).grid(row=row, column=4, columnspan=2, sticky="e", pady=(12, 0))
 
@@ -907,7 +940,7 @@ class BacktestWindow:
         self.single_backtest_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
         ttk.Label(
             batch_note,
-            text="\u56de\u6d4b\u53d6\u6570\u73b0\u5df2\u652f\u6301 10000 \u6839 K \u7ebf\uff0c\u5e76\u4f1a\u81ea\u52a8\u4f18\u5148\u4f7f\u7528\u672c\u5730\u5386\u53f2\u7f13\u5b58\u3002",
+            text="回测取数已支持 10000 根区间 K 线，并会自动补足前置预热数据、优先使用本地历史缓存。",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.batch_backtest_button = None
 
@@ -1190,7 +1223,7 @@ class BacktestWindow:
             result = run_backtest(self.client, config, candle_limit=candle_limit)
             self.window.after(0, lambda: self._apply_backtest_result(result, config, candle_limit))
         except Exception as exc:
-            self.window.after(0, lambda: self._show_backtest_error(exc))
+            self.window.after(0, lambda error=exc: self._show_backtest_error(error))
 
     def _apply_backtest_result(self, result: BacktestResult, config: StrategyConfig, candle_limit: int) -> None:
         snapshot = self._append_backtest_snapshot(result, config, candle_limit)
@@ -1249,9 +1282,9 @@ class BacktestWindow:
             self.start_single_backtest()
             return
         try:
-            config, candle_limit, maker_fee_rate, taker_fee_rate = self._build_backtest_request()
+            config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts = self._build_backtest_request()
         except Exception as exc:
-            messagebox.showerror("鍥炴祴鍙傛暟閿欒", str(exc), parent=self.window)
+            messagebox.showerror("回测参数错误", str(exc), parent=self.window)
             return
 
         self._prepare_backtest_output("\u6b63\u5728\u6279\u91cf\u56de\u6d4b 9 \u7ec4 ATR \u53c2\u6570\uff0c\u8bf7\u7a0d\u5019...")
@@ -1259,7 +1292,7 @@ class BacktestWindow:
         batch_label = self._next_batch_label()
         threading.Thread(
             target=self._run_batch_backtest_worker,
-            args=(config, candle_limit, batch_label, maker_fee_rate, taker_fee_rate),
+            args=(config, candle_limit, batch_label, maker_fee_rate, taker_fee_rate, start_ts, end_ts),
             daemon=True,
         ).start()
 
@@ -1267,25 +1300,31 @@ class BacktestWindow:
         if self._backtest_running:
             return
         try:
-            config, candle_limit, maker_fee_rate, taker_fee_rate = self._build_backtest_request()
+            config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts = self._build_backtest_request()
         except Exception as exc:
-            messagebox.showerror("鍥炴祴鍙傛暟閿欒", str(exc), parent=self.window)
+            messagebox.showerror("回测参数错误", str(exc), parent=self.window)
             return
 
         self._prepare_backtest_output("\u6b63\u5728\u5355\u7ec4\u56de\u6d4b\uff0c\u8bf7\u7a0d\u5019...")
         self._set_backtest_running(True)
         threading.Thread(
             target=self._run_backtest_worker,
-            args=(config, candle_limit, maker_fee_rate, taker_fee_rate),
+            args=(config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts),
             daemon=True,
         ).start()
 
-    def _build_backtest_request(self) -> tuple[StrategyConfig, int, Decimal, Decimal]:
+    def _build_backtest_request(self) -> tuple[StrategyConfig, int, Decimal, Decimal, int | None, int | None]:
+        start_ts = self._parse_optional_datetime(self.start_time_text.get(), "开始时间", end_of_day=False)
+        end_ts = self._parse_optional_datetime(self.end_time_text.get(), "结束时间", end_of_day=True)
+        if start_ts is not None and end_ts is not None and start_ts > end_ts:
+            raise ValueError("开始时间不能晚于结束时间")
         return (
             self._build_config(),
-            self._parse_positive_int(self.candle_limit.get(), "鍥炴祴K绾挎暟"),
+            self._parse_positive_int(self.candle_limit.get(), "回测K线数"),
             self._parse_fee_percent(self.maker_fee_percent.get(), "Maker手续费"),
             self._parse_fee_percent(self.taker_fee_percent.get(), "Taker手续费"),
+            start_ts,
+            end_ts,
         )
 
     def _prepare_backtest_output(self, summary_text: str) -> None:
@@ -1329,18 +1368,22 @@ class BacktestWindow:
         batch_label: str,
         maker_fee_rate: Decimal,
         taker_fee_rate: Decimal,
+        start_ts: int | None,
+        end_ts: int | None,
     ) -> None:
         try:
             results = run_backtest_batch(
                 self.client,
                 config,
                 candle_limit=candle_limit,
+                start_ts=start_ts,
+                end_ts=end_ts,
                 maker_fee_rate=maker_fee_rate,
                 taker_fee_rate=taker_fee_rate,
             )
             self.window.after(0, lambda: self._apply_batch_backtest_results(results, candle_limit, batch_label))
         except Exception as exc:
-            self.window.after(0, lambda: self._show_backtest_error(exc))
+            self.window.after(0, lambda error=exc: self._show_backtest_error(error))
 
     def _run_backtest_worker(
         self,
@@ -1348,18 +1391,22 @@ class BacktestWindow:
         candle_limit: int,
         maker_fee_rate: Decimal,
         taker_fee_rate: Decimal,
+        start_ts: int | None,
+        end_ts: int | None,
     ) -> None:
         try:
             result = run_backtest(
                 self.client,
                 config,
                 candle_limit=candle_limit,
+                start_ts=start_ts,
+                end_ts=end_ts,
                 maker_fee_rate=maker_fee_rate,
                 taker_fee_rate=taker_fee_rate,
             )
             self.window.after(0, lambda: self._apply_backtest_result(result, config, candle_limit))
         except Exception as exc:
-            self.window.after(0, lambda: self._show_backtest_error(exc))
+            self.window.after(0, lambda error=exc: self._show_backtest_error(error))
 
     def _apply_backtest_result(self, result: BacktestResult, config: StrategyConfig, candle_limit: int) -> None:
         export_path = None
@@ -1403,9 +1450,9 @@ class BacktestWindow:
         self._set_backtest_running(False)
 
     def _show_backtest_error(self, exc: Exception) -> None:
-        self.report_summary.set("鍥炴祴澶辫触")
+        self.report_summary.set("回测失败")
         self._set_backtest_running(False)
-        messagebox.showerror("鍥炴祴澶辫触", str(exc), parent=self.window)
+        messagebox.showerror("回测失败", str(exc), parent=self.window)
 
     def _build_config(self) -> StrategyConfig:
         definition = self._selected_strategy_definition()
@@ -1426,8 +1473,9 @@ class BacktestWindow:
         return StrategyConfig(
             inst_id=self.symbol.get().strip().upper(),
             bar="4H" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else _backtest_bar_value_from_label(self.bar_label.get()),
-            ema_period=5 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.ema_period.get(), "EMA 周期"),
-            trend_ema_period=8 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.trend_ema_period.get(), "趋势EMA周期"),
+            ema_period=5 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.ema_period.get(), "EMA小周期"),
+            trend_ema_period=8 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期"),
+            big_ema_period=233 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.big_ema_period.get(), "EMA大周期"),
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
             atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
@@ -1464,6 +1512,7 @@ class BacktestWindow:
             self.bar_label.set("4小时")
             self.ema_period.set("5")
             self.trend_ema_period.set("8")
+            self.big_ema_period.set("233")
             self.risk_amount.set("100")
 
     def _append_backtest_snapshot(
@@ -1976,6 +2025,7 @@ class BacktestWindow:
         visible_candles = candles[start_index:end_index]
         visible_ema = result.ema_values[start_index:end_index]
         visible_trend_ema = result.trend_ema_values[start_index:end_index]
+        visible_big_ema = result.big_ema_values[start_index:end_index]
         visible_net_value = (
             result.net_value_curve[start_index:end_index]
             if result.net_value_curve
@@ -1990,6 +2040,7 @@ class BacktestWindow:
         plotted_prices = [float(candle.high) for candle in visible_candles] + [float(candle.low) for candle in visible_candles]
         plotted_prices.extend(float(value) for value in visible_ema)
         plotted_prices.extend(float(value) for value in visible_trend_ema)
+        plotted_prices.extend(float(value) for value in visible_big_ema)
         for trade in result.trades:
             if trade.exit_index < start_index or trade.entry_index >= end_index:
                 continue
@@ -2106,6 +2157,12 @@ class BacktestWindow:
                 x = x_for(index)
                 trend_ema_points.extend((x, y_for(trend_ema_value)))
 
+        big_ema_points: list[float] = []
+        if visible_big_ema:
+            for index, big_ema_value in enumerate(visible_big_ema, start=start_index):
+                x = x_for(index)
+                big_ema_points.extend((x, y_for(big_ema_value)))
+
         net_value_points: list[float] = []
         if visible_net_value:
             for index, net_value in enumerate(visible_net_value, start=start_index):
@@ -2184,7 +2241,7 @@ class BacktestWindow:
             canvas.create_text(
                 width - right,
                 top + 12,
-                text=f"EMA({self.ema_period.get().strip()})",
+                text=f"EMA({result.ema_period})",
                 anchor="ne",
                 fill="#ff8c00",
                 font=("Microsoft YaHei UI", 10, "bold"),
@@ -2197,6 +2254,16 @@ class BacktestWindow:
                 text=f"EMA({result.trend_ema_period})",
                 anchor="ne",
                 fill="#0a7f5a",
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
+        if len(big_ema_points) >= 4:
+            canvas.create_line(*big_ema_points, fill="#8b5cf6", width=2, smooth=not fast_mode)
+            canvas.create_text(
+                width - right,
+                top + 48,
+                text=f"EMA({result.big_ema_period})",
+                anchor="ne",
+                fill="#8b5cf6",
                 font=("Microsoft YaHei UI", 10, "bold"),
             )
         if len(net_value_points) >= 4:
@@ -2234,8 +2301,27 @@ class BacktestWindow:
             return
 
         candle = self._latest_result.candles[hover_index]
-        ema_value = self._latest_result.ema_values[hover_index]
-        trend_ema_value = self._latest_result.trend_ema_values[hover_index]
+        ema_value = (
+            self._latest_result.ema_values[hover_index]
+            if hover_index < len(self._latest_result.ema_values)
+            else Decimal("0")
+        )
+        trend_ema_value = (
+            self._latest_result.trend_ema_values[hover_index]
+            if hover_index < len(self._latest_result.trend_ema_values)
+            else Decimal("0")
+        )
+        big_ema_value = (
+            self._latest_result.big_ema_values[hover_index]
+            if hover_index < len(self._latest_result.big_ema_values)
+            else Decimal("0")
+        )
+        equity_value = self._latest_result.net_value_curve[hover_index] if self._latest_result.net_value_curve else Decimal("0")
+        drawdown_pct_value = (
+            Decimal("0") - self._latest_result.drawdown_pct_curve[hover_index]
+            if self._latest_result.drawdown_pct_curve
+            else Decimal("0")
+        )
         x = state.left + ((hover_index - state.start_index) * state.candle_step) + (state.candle_step / 2)
         canvas.create_line(
             x,
@@ -2250,12 +2336,12 @@ class BacktestWindow:
             candle=candle,
             ema_value=ema_value,
             trend_ema_value=trend_ema_value,
-            equity_value=self._latest_result.net_value_curve[hover_index] if self._latest_result.net_value_curve else Decimal("0"),
-            drawdown_pct_value=self._latest_result.drawdown_pct_curve[hover_index]
-            if self._latest_result.drawdown_pct_curve
-            else Decimal("0"),
-            ema_period=self.ema_period.get().strip(),
+            big_ema_value=big_ema_value,
+            equity_value=equity_value,
+            drawdown_pct_value=drawdown_pct_value,
+            ema_period=str(self._latest_result.ema_period),
             trend_ema_period=str(self._latest_result.trend_ema_period),
+            big_ema_period=str(self._latest_result.big_ema_period),
             tick_size=self._latest_result.instrument.tick_size,
         )
         text_item = canvas.create_text(
@@ -2440,6 +2526,28 @@ class BacktestWindow:
             raise ValueError(f"{field_name} 不能小于 0")
         return value / Decimal("100")
 
+    def _parse_optional_datetime(self, raw: str, field_name: str, *, end_of_day: bool) -> int | None:
+        text = raw.strip()
+        if not text:
+            return None
+        formats = (
+            ("%Y%m%d %H:%M:%S", False),
+            ("%Y%m%d %H:%M", False),
+            ("%Y%m%d", True),
+            ("%Y-%m-%d %H:%M:%S", False),
+            ("%Y-%m-%d %H:%M", False),
+            ("%Y-%m-%d", True),
+        )
+        for fmt, date_only in formats:
+            try:
+                parsed = datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+            if date_only:
+                parsed = parsed.replace(hour=23 if end_of_day else 0, minute=59 if end_of_day else 0, second=59 if end_of_day else 0)
+            return int(parsed.timestamp() * 1000)
+        raise ValueError(f"{field_name} 格式不正确，支持 YYYYMMDD 或 YYYYMMDD HH:MM")
+
 
 def _normalize_chart_viewport(
     start_index: int,
@@ -2587,10 +2695,12 @@ def _format_chart_hover_lines(
     candle,
     ema_value: Decimal,
     trend_ema_value: Decimal,
+    big_ema_value: Decimal,
     equity_value: Decimal,
     drawdown_pct_value: Decimal,
     ema_period: str,
     trend_ema_period: str,
+    big_ema_period: str,
     tick_size: Decimal,
 ) -> list[str]:
     return [
@@ -2601,7 +2711,8 @@ def _format_chart_hover_lines(
             f"{format_decimal(candle.low)} / {format_decimal(candle.close)}"
         ),
         f"EMA({ema_period}): {_format_price_by_tick_size(ema_value, tick_size)}",
-        f"趋势EMA({trend_ema_period}): {_format_price_by_tick_size(trend_ema_value, tick_size)}",
+        f"EMA({trend_ema_period}): {_format_price_by_tick_size(trend_ema_value, tick_size)}",
+        f"EMA({big_ema_period}): {_format_price_by_tick_size(big_ema_value, tick_size)}",
         f"净值曲线: {format_decimal_fixed(equity_value, 2)}",
         f"当前回撤: {format_decimal_fixed(drawdown_pct_value, 2)}%",
     ]

@@ -30,6 +30,8 @@ class DynamicStrategyTest(TestCase):
             inst_id="BTC-USDT-SWAP",
             bar="15m",
             ema_period=2,
+            trend_ema_period=3,
+            big_ema_period=4,
             atr_period=2,
             atr_stop_multiplier=Decimal("2"),
             atr_take_multiplier=Decimal("4"),
@@ -57,6 +59,8 @@ class DynamicStrategyTest(TestCase):
             inst_id="BTC-USDT-SWAP",
             bar="15m",
             ema_period=2,
+            trend_ema_period=3,
+            big_ema_period=4,
             atr_period=2,
             atr_stop_multiplier=Decimal("2"),
             atr_take_multiplier=Decimal("4"),
@@ -72,12 +76,14 @@ class DynamicStrategyTest(TestCase):
         self.assertIsNone(decision.signal)
         self.assertIsNone(decision.entry_reference)
 
-    def test_long_mode_is_blocked_when_price_is_below_ema55(self) -> None:
+    def test_long_mode_is_blocked_when_price_is_below_medium_trend_ema(self) -> None:
         candles = self._make_candles(["100"] * 60 + ["50", "80"])
         config = StrategyConfig(
             inst_id="BTC-USDT-SWAP",
             bar="15m",
             ema_period=2,
+            trend_ema_period=5,
+            big_ema_period=6,
             atr_period=2,
             atr_stop_multiplier=Decimal("2"),
             atr_take_multiplier=Decimal("4"),
@@ -93,7 +99,32 @@ class DynamicStrategyTest(TestCase):
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)
 
         self.assertIsNone(decision.signal)
-        self.assertIn("EMA55", decision.reason)
+        self.assertIn("EMA5", decision.reason)
+
+    def test_long_mode_is_blocked_when_price_is_below_big_trend_ema(self) -> None:
+        candles = self._make_candles(["100", "100", "100", "100", "100", "100", "60", "60", "65", "75"])
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=2,
+            trend_ema_period=3,
+            big_ema_period=6,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("100"),
+        )
+
+        decision = EmaDynamicOrderStrategy().evaluate(candles, config)
+
+        self.assertIsNone(decision.signal)
+        self.assertIn("EMA6", decision.reason)
 
     def test_long_mode_is_blocked_when_fast_ema_is_below_trend_ema(self) -> None:
         candles = self._make_candles(["100", "90", "80", "70", "60", "66"])
@@ -102,6 +133,7 @@ class DynamicStrategyTest(TestCase):
             bar="15m",
             ema_period=2,
             trend_ema_period=5,
+            big_ema_period=6,
             atr_period=2,
             atr_stop_multiplier=Decimal("2"),
             atr_take_multiplier=Decimal("4"),
@@ -127,6 +159,7 @@ class DynamicStrategyTest(TestCase):
             bar="15m",
             ema_period=2,
             trend_ema_period=5,
+            big_ema_period=6,
             atr_period=2,
             atr_stop_multiplier=Decimal("2"),
             atr_take_multiplier=Decimal("4"),
@@ -158,6 +191,8 @@ class DynamicStrategyTest(TestCase):
             inst_id="BTC-USDT-SWAP",
             bar="15m",
             ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
             atr_period=14,
             atr_stop_multiplier=Decimal("2"),
             atr_take_multiplier=Decimal("4"),

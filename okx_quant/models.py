@@ -66,6 +66,7 @@ class StrategyConfig:
     environment: EnvironmentMode
     tp_sl_trigger_type: TriggerPriceType
     trend_ema_period: int = 55
+    big_ema_period: int = 233
     strategy_id: str = "ema_dynamic_order"
     poll_seconds: float = 3.0
     risk_amount: Decimal | None = None

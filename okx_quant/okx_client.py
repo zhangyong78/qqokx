@@ -317,6 +317,72 @@ class OkxRestClient:
         }
         return returned
 
+    def get_candles_history_range(
+        self,
+        inst_id: str,
+        bar: str,
+        *,
+        start_ts: int,
+        end_ts: int,
+        limit: int = 200,
+        preload_count: int = 0,
+    ) -> list[Candle]:
+        if start_ts > end_ts:
+            raise ValueError("开始时间不能晚于结束时间")
+        requested_limit = max(1, limit)
+        preload_limit = max(0, preload_count)
+        selected_collected: list[Candle] = []
+        preload_collected: list[Candle] = []
+        after = str(end_ts + 1)
+
+        while after is not None:
+            enough_selected = len(selected_collected) >= requested_limit
+            enough_preload = len(preload_collected) >= preload_limit
+            if enough_selected and enough_preload:
+                break
+            page_limit = MAX_PUBLIC_CANDLE_LIMIT
+            batch = self._fetch_history_candles_page(inst_id, bar, limit=page_limit, after=after)
+            if not batch:
+                break
+            eligible_batch = [candle for candle in batch if candle.ts <= end_ts]
+            selected_batch = [candle for candle in eligible_batch if start_ts <= candle.ts <= end_ts]
+            preload_batch = [candle for candle in eligible_batch if candle.ts < start_ts]
+            selected_collected = merge_candles(selected_collected, selected_batch)
+            if preload_limit > 0:
+                preload_collected = merge_candles(preload_collected, preload_batch)
+                if len(preload_collected) > preload_limit:
+                    preload_collected = preload_collected[-preload_limit:]
+            oldest_ts = batch[0].ts if batch else None
+            if oldest_ts is None or oldest_ts <= start_ts:
+                if preload_limit == 0 or len(preload_collected) >= preload_limit:
+                    break
+            next_after = str(oldest_ts)
+            if next_after == after:
+                break
+            after = next_after
+            if len(batch) < page_limit:
+                break
+
+        selected_returned = selected_collected[-requested_limit:]
+        preload_returned = preload_collected[-preload_limit:] if preload_limit > 0 else []
+        returned = merge_candles(preload_returned, selected_returned)
+        save_candle_cache(
+            inst_id,
+            bar,
+            merge_candles(load_candle_cache(inst_id, bar), merge_candles(preload_collected, selected_collected)),
+            max_records=max(DEFAULT_CANDLE_CACHE_CAPACITY, requested_limit + preload_limit),
+        )
+        self.last_candle_history_stats = {
+            "range_mode": True,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "requested_count": requested_limit,
+            "selected_count": len(selected_returned),
+            "preload_count": len(preload_returned),
+            "returned_count": len(returned),
+        }
+        return returned
+
     def _fetch_history_candles_page(
         self,
         inst_id: str,

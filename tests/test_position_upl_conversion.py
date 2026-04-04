@@ -1,4 +1,4 @@
-from decimal import Decimal
+﻿from decimal import Decimal
 from unittest import TestCase
 
 from okx_quant.models import Credentials, Instrument
@@ -9,13 +9,16 @@ from okx_quant.ui import (
     _build_group_row_values,
     _format_margin_mode,
     _format_mark_price,
+    _format_option_trade_side,
     _format_optional_decimal_fixed,
     _format_optional_integer,
     _format_optional_usdt_precise,
     _format_optional_usdt,
+    _format_group_option_trade_side,
     _format_group_position_size,
     _format_position_avg_price,
     _format_position_avg_price_usdt,
+    _format_position_mark_price_usdt,
     _format_position_market_value,
     _format_position_size,
     _format_position_unrealized_pnl,
@@ -24,6 +27,7 @@ from okx_quant.ui import (
     _margin_mode_tag,
     _option_search_shortcuts,
     _position_theta_usdt,
+    _position_mark_price_usdt,
     _position_unrealized_pnl_usdt,
 )
 
@@ -147,6 +151,52 @@ class PositionUplConversionTest(TestCase):
         )
         self.assertEqual(_format_position_size(position, {instrument.inst_id: instrument}), "-")
 
+    def test_format_option_trade_side_maps_all_four_option_directions(self) -> None:
+        call_long = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
+        call_short = OkxPosition(**{**call_long.__dict__, "position": Decimal("1"), "pos_side": "short"})
+        put_long = OkxPosition(**{**call_long.__dict__, "inst_id": "BTC-USD-260626-50000-P"})
+        put_short = OkxPosition(**{**put_long.__dict__, "position": Decimal("1"), "pos_side": "short"})
+
+        self.assertEqual(_format_option_trade_side(call_long), "买购")
+        self.assertEqual(_format_option_trade_side(call_short), "卖购")
+        self.assertEqual(_format_option_trade_side(put_long), "买沽")
+        self.assertEqual(_format_option_trade_side(put_short), "卖沽")
+
+    def test_format_group_option_trade_side_summarizes_by_option_direction(self) -> None:
+        positions = [
+            OkxPosition(**{**_make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC").__dict__, "position": Decimal("20"), "pos_side": "long"}),
+            OkxPosition(**{**_make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC").__dict__, "position": Decimal("10"), "pos_side": "short"}),
+            OkxPosition(**{**_make_position(inst_id="BTC-USD-260626-50000-P", upl="0", margin_ccy="BTC").__dict__, "position": Decimal("30"), "pos_side": "short"}),
+        ]
+        instruments = {
+            "BTC-USD-260626-100000-C": Instrument(
+                inst_id="BTC-USD-260626-100000-C",
+                inst_type="OPTION",
+                tick_size=Decimal("0.0001"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+                ct_val=Decimal("1"),
+                ct_mult=Decimal("0.01"),
+                ct_val_ccy="BTC",
+            ),
+            "BTC-USD-260626-50000-P": Instrument(
+                inst_id="BTC-USD-260626-50000-P",
+                inst_type="OPTION",
+                tick_size=Decimal("0.0001"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+                ct_val=Decimal("1"),
+                ct_mult=Decimal("0.01"),
+                ct_val_ccy="BTC",
+            ),
+        }
+        self.assertEqual(
+            _format_group_option_trade_side(positions, instruments),
+            "买购0.20BTC / 卖购0.10BTC / 卖沽0.30BTC",
+        )
+
     def test_format_position_size_converts_usd_futures_to_base_coin(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626", upl="0", margin_ccy="BTC")
         position = OkxPosition(
@@ -221,6 +271,16 @@ class PositionUplConversionTest(TestCase):
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
         position = OkxPosition(**{**position.__dict__, "avg_price": Decimal("0.015")})
         self.assertEqual(_format_position_avg_price_usdt(position, {"BTC": Decimal("80000")}), "1200")
+
+    def test_position_mark_price_usdt_for_option(self) -> None:
+        position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
+        position = OkxPosition(**{**position.__dict__, "mark_price": Decimal("0.0524")})
+        self.assertEqual(_position_mark_price_usdt(position, {"BTC": Decimal("80000")}), Decimal("4192.0000"))
+
+    def test_format_position_mark_price_usdt_for_option(self) -> None:
+        position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
+        position = OkxPosition(**{**position.__dict__, "mark_price": Decimal("0.0524")})
+        self.assertEqual(_format_position_mark_price_usdt(position, {"BTC": Decimal("80000")}), "4192")
 
     def test_format_position_avg_price_uses_b_prefix_for_btc_option(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
@@ -465,7 +525,7 @@ class PositionUplConversionTest(TestCase):
 
     def test_group_row_values_use_five_decimals_for_coin_pnl(self) -> None:
         values = _build_group_row_values(
-            "组合",
+            "缁勫悎",
             {
                 "count": 3,
                 "upl": Decimal("-0.06947484"),
@@ -482,14 +542,14 @@ class PositionUplConversionTest(TestCase):
                 "theta_usdt": Decimal("-27.2"),
             },
         )
-        self.assertEqual(values[6], "-0.06947")
-        self.assertEqual(values[8], "+0.73992")
-        self.assertEqual(values[14], "1.23456")
-        self.assertEqual(values[18], "-27.20")
+        self.assertEqual(values[8], "-0.06947")
+        self.assertEqual(values[10], "+0.73992")
+        self.assertEqual(values[16], "1.23456")
+        self.assertEqual(values[20], "-27.20")
 
     def test_group_row_values_use_two_decimals_for_usdt_pnl(self) -> None:
         values = _build_group_row_values(
-            "组合",
+            "缁勫悎",
             {
                 "count": 1,
                 "size_display": "250000 DOGE",
@@ -507,11 +567,11 @@ class PositionUplConversionTest(TestCase):
                 "theta_usdt": Decimal("123.456"),
             },
         )
-        self.assertEqual(values[5], "1 个持仓 | 250000 DOGE")
-        self.assertEqual(values[6], "-2733.75")
-        self.assertEqual(values[8], "-31.36")
-        self.assertEqual(values[14], "250000.00000")
-        self.assertEqual(values[18], "+123.46")
+        self.assertEqual(values[6], "1 个持仓 | 250000 DOGE")
+        self.assertEqual(values[8], "-2733.75")
+        self.assertEqual(values[10], "-31.36")
+        self.assertEqual(values[16], "250000.00000")
+        self.assertEqual(values[20], "+123.46")
 
     def test_format_group_position_size_accumulates_coin_quantity(self) -> None:
         positions = [
@@ -557,7 +617,7 @@ class PositionUplConversionTest(TestCase):
             ),
         }
 
-        self.assertEqual(_format_group_position_size(positions, instruments), "-0.5 BTC")
+        self.assertEqual(_format_group_position_size(positions, instruments), "-0.50 BTC")
 
     def test_group_positions_for_tree_orders_buckets_by_nearest_date(self) -> None:
         positions = [
