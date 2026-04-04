@@ -3961,7 +3961,7 @@ class QuantApp:
         self.position_realized_text.set(
             _format_optional_decimal_fixed(
                 metrics["realized"] if isinstance(metrics["realized"], Decimal) else None,
-                places=_group_pnl_places(metrics.get("pnl_currency")),
+                places=2,
                 with_sign=True,
             )
         )
