@@ -21,7 +21,7 @@ from okx_quant.signal_monitor import (
     SignalMonitorConfig,
     evaluate_monitor_signal_history,
 )
-from okx_quant.window_layout import apply_adaptive_window_geometry
+from okx_quant.window_layout import apply_adaptive_window_geometry, apply_window_icon
 
 
 NotifierFactory = Callable[[], EmailNotifier | None]
@@ -126,6 +126,7 @@ class SignalMonitorWindow:
 
         self.window = Toplevel(parent)
         self.window.title("信号监控")
+        apply_window_icon(self.window)
         screen_width = self.window.winfo_screenwidth()
         screen_height = self.window.winfo_screenheight()
         default_width = min(max(int(screen_width * 0.78), 1220), 1680)
