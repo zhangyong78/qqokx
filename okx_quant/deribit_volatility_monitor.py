@@ -18,6 +18,8 @@ VolatilitySignalType = Literal[
     "bullish_reversal_after_drop",
     "squeeze_breakout_up",
     "squeeze_breakout_down",
+    "box_breakout_up",
+    "box_breakout_down",
     "ema34_turn_up",
     "ema34_turn_down",
 ]
@@ -30,6 +32,8 @@ VOL_SIGNAL_LABELS: dict[VolatilitySignalType, str] = {
     "bullish_reversal_after_drop": "连跌后大阳反转",
     "squeeze_breakout_up": "窄幅后大阳突破",
     "squeeze_breakout_down": "窄幅后大阴突破",
+    "box_breakout_up": "箱体向上突破",
+    "box_breakout_down": "箱体向下突破",
     "ema34_turn_up": "EMA34转强",
     "ema34_turn_down": "EMA34转弱",
 }
@@ -55,6 +59,8 @@ class VolatilityMonitorConfig:
     enable_bullish_reversal_after_drop: bool = True
     enable_squeeze_breakout_up: bool = True
     enable_squeeze_breakout_down: bool = True
+    enable_box_breakout_up: bool = True
+    enable_box_breakout_down: bool = True
     enable_ema34_turn_up: bool = True
     enable_ema34_turn_down: bool = True
     ema_period: int = 34
@@ -324,6 +330,8 @@ def _detect_all_volatility_signals(
         detect_bullish_reversal_after_drop,
         detect_squeeze_breakout_up,
         detect_squeeze_breakout_down,
+        detect_box_breakout_up,
+        detect_box_breakout_down,
         detect_ema34_turn_up,
         detect_ema34_turn_down,
     ):
@@ -339,6 +347,8 @@ def _is_signal_enabled(config: VolatilityMonitorConfig, signal_type: VolatilityS
         "bullish_reversal_after_drop": config.enable_bullish_reversal_after_drop,
         "squeeze_breakout_up": config.enable_squeeze_breakout_up,
         "squeeze_breakout_down": config.enable_squeeze_breakout_down,
+        "box_breakout_up": config.enable_box_breakout_up,
+        "box_breakout_down": config.enable_box_breakout_down,
         "ema34_turn_up": config.enable_ema34_turn_up,
         "ema34_turn_down": config.enable_ema34_turn_down,
     }[signal_type]
@@ -433,12 +443,15 @@ def detect_squeeze_breakout_up(
     last = candles[-1]
     if last.close <= last.open:
         return None
+    avg_body = _average_body(candles[-11:-1])
+    current_body = _body(last)
+    box_window_bars = max(config.squeeze_bars + 2, 10)
+    box_window = candles[-(box_window_bars + 1) : -1]
+    box_high = max(item.high for item in box_window)
     squeeze_range = _average_range(squeeze_window)
     context_range = _average_range(context)
     if context_range <= 0 or squeeze_range > context_range * config.squeeze_range_ratio:
         return None
-    avg_body = _average_body(candles[-11:-1])
-    current_body = _body(last)
     if avg_body <= 0 or current_body < avg_body * config.breakout_body_multiplier:
         return None
     if last.close <= max(item.high for item in squeeze_window):
@@ -471,12 +484,15 @@ def detect_squeeze_breakout_down(
     last = candles[-1]
     if last.close >= last.open:
         return None
+    avg_body = _average_body(candles[-11:-1])
+    current_body = _body(last)
+    box_window_bars = max(config.squeeze_bars + 2, 10)
+    box_window = candles[-(box_window_bars + 1) : -1]
+    box_low = min(item.low for item in box_window)
     squeeze_range = _average_range(squeeze_window)
     context_range = _average_range(context)
     if context_range <= 0 or squeeze_range > context_range * config.squeeze_range_ratio:
         return None
-    avg_body = _average_body(candles[-11:-1])
-    current_body = _body(last)
     if avg_body <= 0 or current_body < avg_body * config.breakout_body_multiplier:
         return None
     if last.close >= min(item.low for item in squeeze_window):
@@ -493,6 +509,58 @@ def detect_squeeze_breakout_down(
             f"前{squeeze_bars}根窄幅波动，平均波幅压缩至过去20根的{_fmt_pct(squeeze_range / context_range)} | "
             f"当前大阴实体={_fmt_value(current_body, places)}，收盘跌破区间低点"
         ),
+    )
+
+
+def detect_box_breakout_up(
+    currency: str,
+    candles: list[DeribitVolatilityCandle],
+    config: VolatilityMonitorConfig,
+) -> VolatilitySignalEvent | None:
+    if len(candles) < max(config.squeeze_bars + 25, 30):
+        return None
+    last = candles[-1]
+    avg_body = _average_body(candles[-11:-1])
+    current_body = _body(last)
+    box_window_bars = max(config.squeeze_bars + 2, 10)
+    box_window = candles[-(box_window_bars + 1) : -1]
+    box_high = max(item.high for item in box_window)
+    body_high = max(_body_high(item) for item in box_window)
+    return _detect_box_breakout_up(
+        currency,
+        candles,
+        last,
+        box_window_bars,
+        box_high,
+        body_high,
+        avg_body,
+        current_body,
+    )
+
+
+def detect_box_breakout_down(
+    currency: str,
+    candles: list[DeribitVolatilityCandle],
+    config: VolatilityMonitorConfig,
+) -> VolatilitySignalEvent | None:
+    if len(candles) < max(config.squeeze_bars + 25, 30):
+        return None
+    last = candles[-1]
+    avg_body = _average_body(candles[-11:-1])
+    current_body = _body(last)
+    box_window_bars = max(config.squeeze_bars + 2, 10)
+    box_window = candles[-(box_window_bars + 1) : -1]
+    box_low = min(item.low for item in box_window)
+    body_low = min(_body_low(item) for item in box_window)
+    return _detect_box_breakout_down(
+        currency,
+        candles,
+        last,
+        box_window_bars,
+        box_low,
+        body_low,
+        avg_body,
+        current_body,
     )
 
 
@@ -570,6 +638,14 @@ def _range(candle: DeribitVolatilityCandle) -> Decimal:
     return candle.high - candle.low
 
 
+def _body_high(candle: DeribitVolatilityCandle) -> Decimal:
+    return max(candle.open, candle.close)
+
+
+def _body_low(candle: DeribitVolatilityCandle) -> Decimal:
+    return min(candle.open, candle.close)
+
+
 def _average_body(candles: list[DeribitVolatilityCandle]) -> Decimal:
     if not candles:
         return Decimal("0")
@@ -580,6 +656,120 @@ def _average_range(candles: list[DeribitVolatilityCandle]) -> Decimal:
     if not candles:
         return Decimal("0")
     return sum((_range(item) for item in candles), Decimal("0")) / Decimal(len(candles))
+
+
+def _detect_box_breakout_up(
+    currency: str,
+    candles: list[DeribitVolatilityCandle],
+    last: DeribitVolatilityCandle,
+    box_window_bars: int,
+    box_high: Decimal,
+    body_high: Decimal,
+    avg_body: Decimal,
+    current_body: Decimal,
+) -> VolatilitySignalEvent | None:
+    close_near_high = Decimal("0") if _range(last) <= 0 else (last.close - last.low) / _range(last)
+    recent_range = _average_range(candles[-11:-1])
+    breakout_distance = last.close - box_high
+    breakout_ratio = Decimal("0") if box_high <= 0 else breakout_distance / box_high
+    body_breakout_distance = last.close - body_high
+    body_breakout_ratio = Decimal("0") if body_high <= 0 else body_breakout_distance / body_high
+    strong_body_breakout = (
+        avg_body > 0
+        and current_body >= avg_body * Decimal("0.95")
+        and last.high > box_high
+        and last.close > box_high
+        and close_near_high >= Decimal("0.50")
+    )
+    valid_close_breakout = (
+        last.high > box_high
+        and last.close > box_high
+        and close_near_high >= Decimal("0.35")
+        and (
+            breakout_ratio >= Decimal("0.0015")
+            or (recent_range > 0 and breakout_distance >= recent_range * Decimal("0.10"))
+        )
+    )
+    valid_body_box_breakout = (
+        last.close > body_high
+        and close_near_high >= Decimal("0.35")
+        and (
+            body_breakout_ratio >= Decimal("0.0012")
+            or (recent_range > 0 and body_breakout_distance >= recent_range * Decimal("0.08"))
+        )
+    )
+    if not (strong_body_breakout or valid_close_breakout or valid_body_box_breakout):
+        return None
+    places = _infer_decimal_places(candles)
+    return VolatilitySignalEvent(
+        currency=currency,
+        signal_type="box_breakout_up",
+        direction="up",
+        candle_ts=last.ts,
+        trigger_value=last.close,
+        decimal_places=places,
+        reason=(
+            f"前{box_window_bars}根箱体高点={_fmt_value(box_high, places)} | "
+            f"当前收盘={_fmt_value(last.close, places)}，收线有效站上箱体高点"
+        ),
+    )
+
+
+def _detect_box_breakout_down(
+    currency: str,
+    candles: list[DeribitVolatilityCandle],
+    last: DeribitVolatilityCandle,
+    box_window_bars: int,
+    box_low: Decimal,
+    body_low: Decimal,
+    avg_body: Decimal,
+    current_body: Decimal,
+) -> VolatilitySignalEvent | None:
+    close_near_low = Decimal("0") if _range(last) <= 0 else (last.high - last.close) / _range(last)
+    recent_range = _average_range(candles[-11:-1])
+    breakout_distance = box_low - last.close
+    breakout_ratio = Decimal("0") if box_low <= 0 else breakout_distance / box_low
+    body_breakout_distance = body_low - last.close
+    body_breakout_ratio = Decimal("0") if body_low <= 0 else body_breakout_distance / body_low
+    strong_body_breakout = (
+        avg_body > 0
+        and current_body >= avg_body * Decimal("0.95")
+        and last.low < box_low
+        and last.close < box_low
+        and close_near_low >= Decimal("0.50")
+    )
+    valid_close_breakout = (
+        last.low < box_low
+        and last.close < box_low
+        and close_near_low >= Decimal("0.35")
+        and (
+            breakout_ratio >= Decimal("0.0015")
+            or (recent_range > 0 and breakout_distance >= recent_range * Decimal("0.10"))
+        )
+    )
+    valid_body_box_breakout = (
+        last.close < body_low
+        and close_near_low >= Decimal("0.35")
+        and (
+            body_breakout_ratio >= Decimal("0.0012")
+            or (recent_range > 0 and body_breakout_distance >= recent_range * Decimal("0.08"))
+        )
+    )
+    if not (strong_body_breakout or valid_close_breakout or valid_body_box_breakout):
+        return None
+    places = _infer_decimal_places(candles)
+    return VolatilitySignalEvent(
+        currency=currency,
+        signal_type="box_breakout_down",
+        direction="down",
+        candle_ts=last.ts,
+        trigger_value=last.close,
+        decimal_places=places,
+        reason=(
+            f"前{box_window_bars}根箱体低点={_fmt_value(box_low, places)} | "
+            f"当前收盘={_fmt_value(last.close, places)}，收线有效跌破箱体低点"
+        ),
+    )
 
 
 def _pct_change(current: Decimal, baseline: Decimal) -> Decimal:

@@ -107,6 +107,8 @@ class DeribitVolatilityMonitorWindow:
         self.enable_bullish_reversal_after_drop = BooleanVar(value=True)
         self.enable_squeeze_breakout_up = BooleanVar(value=True)
         self.enable_squeeze_breakout_down = BooleanVar(value=True)
+        self.enable_box_breakout_up = BooleanVar(value=True)
+        self.enable_box_breakout_down = BooleanVar(value=True)
         self.enable_ema34_turn_up = BooleanVar(value=True)
         self.enable_ema34_turn_down = BooleanVar(value=True)
 
@@ -229,17 +231,27 @@ class DeribitVolatilityMonitorWindow:
         ).grid(row=3, column=0, sticky="w", pady=4)
         ttk.Checkbutton(
             signal_frame,
+            text="箱体向上突破",
+            variable=self.enable_box_breakout_up,
+        ).grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(
+            signal_frame,
+            text="箱体向下突破",
+            variable=self.enable_box_breakout_down,
+        ).grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(
+            signal_frame,
             text="EMA34转强",
             variable=self.enable_ema34_turn_up,
-        ).grid(row=4, column=0, sticky="w", pady=4)
+        ).grid(row=6, column=0, sticky="w", pady=4)
         ttk.Checkbutton(
             signal_frame,
             text="EMA34转弱",
             variable=self.enable_ema34_turn_down,
-        ).grid(row=5, column=0, sticky="w", pady=4)
+        ).grid(row=7, column=0, sticky="w", pady=4)
 
         button_row = ttk.Frame(signal_frame)
-        button_row.grid(row=6, column=0, sticky="w", pady=(14, 0))
+        button_row.grid(row=8, column=0, sticky="w", pady=(14, 0))
         ttk.Button(button_row, text="启动任务", command=self.start).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(button_row, text="停止选中任务", command=self.stop).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(button_row, text="停止全部任务", command=self.stop_all).grid(row=0, column=2)
@@ -252,7 +264,7 @@ class DeribitVolatilityMonitorWindow:
             ),
             wraplength=430,
             justify="left",
-        ).grid(row=7, column=0, sticky="w", pady=(12, 0))
+        ).grid(row=9, column=0, sticky="w", pady=(12, 0))
 
         task_frame = ttk.LabelFrame(self.window, text="监控任务", padding=12)
         task_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
@@ -456,6 +468,8 @@ class DeribitVolatilityMonitorWindow:
                 self.enable_bullish_reversal_after_drop.get(),
                 self.enable_squeeze_breakout_up.get(),
                 self.enable_squeeze_breakout_down.get(),
+                self.enable_box_breakout_up.get(),
+                self.enable_box_breakout_down.get(),
                 self.enable_ema34_turn_up.get(),
                 self.enable_ema34_turn_down.get(),
             )
@@ -470,6 +484,8 @@ class DeribitVolatilityMonitorWindow:
             enable_bullish_reversal_after_drop=self.enable_bullish_reversal_after_drop.get(),
             enable_squeeze_breakout_up=self.enable_squeeze_breakout_up.get(),
             enable_squeeze_breakout_down=self.enable_squeeze_breakout_down.get(),
+            enable_box_breakout_up=self.enable_box_breakout_up.get(),
+            enable_box_breakout_down=self.enable_box_breakout_down.get(),
             enable_ema34_turn_up=self.enable_ema34_turn_up.get(),
             enable_ema34_turn_down=self.enable_ema34_turn_down.get(),
             ema_period=self._parse_positive_int(self.ema_period.get(), "EMA周期"),

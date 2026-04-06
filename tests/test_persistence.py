@@ -91,6 +91,7 @@ class PersistenceTest(TestCase):
                     "bar": "15m",
                     "candle_limit": "600",
                     "chart_display_ccy": "USDT",
+                    "combo_chart_mode": "pnl",
                     "formula": "L1 - L2",
                     "legs": [
                         {
@@ -99,6 +100,10 @@ class PersistenceTest(TestCase):
                             "side": "buy",
                             "quantity": "1",
                             "premium": "0.01",
+                            "delta": "0.42",
+                            "gamma": "0.01",
+                            "theta": "-0.002",
+                            "vega": "0.12",
                             "enabled": True,
                         },
                         {
@@ -121,5 +126,8 @@ class PersistenceTest(TestCase):
         self.assertEqual(record["name"], "Bull Call")
         self.assertEqual(record["candle_limit"], "600")
         self.assertEqual(record["chart_display_ccy"], "USDT")
+        self.assertEqual(record["combo_chart_mode"], "pnl")
         self.assertEqual(record["formula"], "L1 - L2")
         self.assertEqual(record["legs"][0]["inst_id"], "BTC-USD-260626-100000-C")
+        self.assertEqual(record["legs"][0]["delta"], "0.42")
+        self.assertEqual(record["legs"][0]["theta"], "-0.002")

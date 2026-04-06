@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import math
 import hashlib
 import hmac
 import json
@@ -715,37 +716,153 @@ class OkxRestClient:
         limit: int = 100,
     ) -> list[OkxFillHistoryItem]:
         items: list[OkxFillHistoryItem] = []
-        per_type_limit = max(1, min(limit, 100))
-        for inst_type in inst_types:
-            payload = self._request(
+        normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
+        per_type_target = max(1, math.ceil(limit / max(len(normalized_types), 1)))
+        for inst_type in normalized_types:
+            collected_for_type = 0
+            after: str | None = None
+            while collected_for_type < per_type_target:
+                request_limit = min(100, max(1, per_type_target - collected_for_type))
+                params = {"instType": inst_type, "limit": str(request_limit)}
+                if after:
+                    params["after"] = after
+                payload = self._request(
+                    "GET",
+                    "/api/v5/trade/fills-history",
+                    params=params,
+                    auth=True,
+                    credentials=credentials,
+                    simulated=environment == "demo",
+                )
+                batch = payload.get("data", [])
+                if not batch:
+                    break
+                for item in batch:
+                    items.append(
+                        OkxFillHistoryItem(
+                            fill_time=_to_int(item.get("fillTime"), item.get("ts"), item.get("cTime")),
+                            inst_id=item.get("instId", ""),
+                            inst_type=item.get("instType", inst_type),
+                            side=item.get("side"),
+                            pos_side=item.get("posSide"),
+                            fill_price=_to_decimal(item.get("fillPx")),
+                            fill_size=_to_decimal(item.get("fillSz")),
+                            fill_fee=_to_decimal(item.get("fillFee")),
+                            fee_currency=item.get("fillFeeCcy") or item.get("feeCcy"),
+                            pnl=_to_decimal(item.get("fillPnl")),
+                            order_id=item.get("ordId"),
+                            trade_id=item.get("tradeId"),
+                            exec_type=item.get("execType"),
+                            raw=item,
+                        )
+                    )
+                collected_for_type += len(batch)
+                after = str(batch[-1].get("billId") or batch[-1].get("ts") or "")
+                if not after or len(batch) < request_limit:
+                    break
+        items = self._merge_exercise_and_delivery_history(
+            items,
+            credentials=credentials,
+            environment=environment,
+            limit=limit,
+        )
+        items.sort(key=lambda item: item.fill_time or 0, reverse=True)
+        return items[:limit]
+
+    def _merge_exercise_and_delivery_history(
+        self,
+        fills: list[OkxFillHistoryItem],
+        *,
+        credentials: Credentials,
+        environment: str,
+        limit: int,
+    ) -> list[OkxFillHistoryItem]:
+        existing_keys = {_fill_history_dedupe_key(item) for item in fills}
+        merged = list(fills)
+        for inst_type in ("OPTION", "FUTURES"):
+            bills = self._fetch_execution_bill_history(
+                credentials=credentials,
+                environment=environment,
+                inst_type=inst_type,
+                target_count=max(limit, 100),
+            )
+            for bill in bills:
+                synthetic = _build_fill_history_item_from_bill(bill)
+                if synthetic is None:
+                    continue
+                dedupe_key = _fill_history_dedupe_key(synthetic)
+                if dedupe_key in existing_keys:
+                    continue
+                existing_keys.add(dedupe_key)
+                merged.append(synthetic)
+                if len(merged) >= limit * 2:
+                    return merged
+        return merged
+
+    def _fetch_execution_bill_history(
+        self,
+        *,
+        credentials: Credentials,
+        environment: str,
+        inst_type: str,
+        target_count: int,
+    ) -> list[dict[str, Any]]:
+        collected: list[dict[str, Any]] = []
+        seen_bill_ids: set[str] = set()
+        archive_page_limit = 100
+        after: str | None = None
+
+        while len(collected) < target_count:
+            params = {"instType": inst_type, "limit": str(archive_page_limit)}
+            if after:
+                params["after"] = after
+            try:
+                batch = self._request(
+                    "GET",
+                    "/api/v5/account/bills-archive",
+                    params=params,
+                    auth=True,
+                    credentials=credentials,
+                    simulated=environment == "demo",
+                ).get("data", [])
+            except Exception:
+                batch = []
+            if not batch:
+                break
+            for bill in batch:
+                bill_id = str(bill.get("billId") or "")
+                if bill_id and bill_id in seen_bill_ids:
+                    continue
+                if bill_id:
+                    seen_bill_ids.add(bill_id)
+                collected.append(bill)
+            last_bill_id = str(batch[-1].get("billId") or "")
+            if not last_bill_id or len(batch) < archive_page_limit:
+                break
+            after = last_bill_id
+
+        try:
+            recent_bills = self._request(
                 "GET",
-                "/api/v5/trade/fills-history",
-                params={"instType": inst_type, "limit": str(per_type_limit)},
+                "/api/v5/account/bills",
+                params={"instType": inst_type, "limit": "100"},
                 auth=True,
                 credentials=credentials,
                 simulated=environment == "demo",
-            )
-            for item in payload.get("data", []):
-                items.append(
-                    OkxFillHistoryItem(
-                        fill_time=_to_int(item.get("fillTime"), item.get("ts"), item.get("cTime")),
-                        inst_id=item.get("instId", ""),
-                        inst_type=item.get("instType", inst_type),
-                        side=item.get("side"),
-                        pos_side=item.get("posSide"),
-                        fill_price=_to_decimal(item.get("fillPx")),
-                        fill_size=_to_decimal(item.get("fillSz")),
-                        fill_fee=_to_decimal(item.get("fillFee")),
-                        fee_currency=item.get("fillFeeCcy") or item.get("feeCcy"),
-                        pnl=_to_decimal(item.get("fillPnl")),
-                        order_id=item.get("ordId"),
-                        trade_id=item.get("tradeId"),
-                        exec_type=item.get("execType"),
-                        raw=item,
-                    )
-                )
-        items.sort(key=lambda item: item.fill_time or 0, reverse=True)
-        return items[:limit]
+            ).get("data", [])
+        except Exception:
+            recent_bills = []
+
+        for bill in recent_bills:
+            bill_id = str(bill.get("billId") or "")
+            if bill_id and bill_id in seen_bill_ids:
+                continue
+            if bill_id:
+                seen_bill_ids.add(bill_id)
+            collected.append(bill)
+
+        collected.sort(key=lambda item: _to_int(item.get("ts"), item.get("cTime"), item.get("uTime")) or 0, reverse=True)
+        return collected
 
     def get_positions_history(
         self,
@@ -1122,6 +1239,78 @@ def _to_int(*values: Any) -> int | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _fill_history_dedupe_key(item: OkxFillHistoryItem) -> tuple[Any, ...]:
+    return (
+        item.inst_id,
+        item.fill_time,
+        item.fill_price,
+        item.fill_size,
+        item.side,
+        item.exec_type,
+    )
+
+
+def _build_fill_history_item_from_bill(item: dict[str, Any]) -> OkxFillHistoryItem | None:
+    inst_id = str(item.get("instId") or "").strip()
+    inst_type = str(item.get("instType") or "").strip().upper()
+    if not inst_id or inst_type not in {"OPTION", "FUTURES"}:
+        return None
+    fill_time = _to_int(item.get("ts"), item.get("cTime"), item.get("uTime"))
+    fill_price = _first_decimal(item.get("px"), item.get("fillPx"), item.get("price"))
+    fill_size = _first_decimal(item.get("sz"), item.get("fillSz"), item.get("size"))
+    if fill_time is None or fill_price is None or fill_size is None:
+        return None
+    side = _normalize_bill_fill_side(item)
+    exec_type = _normalize_bill_exec_type(item)
+    if exec_type not in {"exercise", "delivery"}:
+        return None
+    return OkxFillHistoryItem(
+        fill_time=fill_time,
+        inst_id=inst_id,
+        inst_type=inst_type,
+        side=side,
+        pos_side=item.get("posSide"),
+        fill_price=fill_price,
+        fill_size=fill_size,
+        fill_fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+        fee_currency=item.get("feeCcy") or item.get("fillFeeCcy"),
+        pnl=_first_decimal(item.get("pnl"), item.get("fillPnl"), item.get("balChg"), item.get("posBalChg")),
+        order_id=item.get("ordId"),
+        trade_id=item.get("tradeId"),
+        exec_type="行权/交割",
+        raw=item,
+    )
+
+
+def _normalize_bill_fill_side(item: dict[str, Any]) -> str | None:
+    side = str(item.get("side") or "").strip().lower()
+    if side in {"buy", "sell"}:
+        return side
+    sub_type = str(item.get("subType") or "").strip().lower()
+    if "buy" in sub_type:
+        return "buy"
+    if "sell" in sub_type:
+        return "sell"
+    return "exercise"
+
+
+def _normalize_bill_exec_type(item: dict[str, Any]) -> str:
+    text = " ".join(
+        str(item.get(key) or "").strip().lower()
+        for key in ("subType", "type", "bizType", "eventType")
+    )
+    sub_type = str(item.get("subType") or "").strip()
+    if sub_type in {"170", "171"}:
+        return "exercise"
+    if sub_type in {"112", "113"}:
+        return "delivery"
+    if any(marker in text for marker in ("exercise", "行权")):
+        return "exercise"
+    if any(marker in text for marker in ("delivery", "交割", "expire", "expiration")):
+        return "delivery"
+    return ""
 
 
 def _okx_timestamp() -> str:

@@ -407,6 +407,10 @@ def _normalize_option_strategy_leg(item: object) -> dict[str, object] | None:
     side = str(item.get("side", "buy")).strip().lower()
     quantity = str(item.get("quantity", "1")).strip()
     premium = str(item.get("premium", "")).strip()
+    delta = str(item.get("delta", "")).strip()
+    gamma = str(item.get("gamma", "")).strip()
+    theta = str(item.get("theta", "")).strip()
+    vega = str(item.get("vega", "")).strip()
     enabled = bool(item.get("enabled", True))
     if not alias or not inst_id or side not in {"buy", "sell"}:
         return None
@@ -416,6 +420,10 @@ def _normalize_option_strategy_leg(item: object) -> dict[str, object] | None:
         "side": side,
         "quantity": quantity or "1",
         "premium": premium,
+        "delta": delta,
+        "gamma": gamma,
+        "theta": theta,
+        "vega": vega,
         "enabled": enabled,
     }
 
@@ -430,6 +438,7 @@ def _normalize_option_strategy_record(item: object) -> dict[str, object] | None:
     if not isinstance(raw_legs, list):
         raw_legs = []
     legs = [normalized for raw in raw_legs if (normalized := _normalize_option_strategy_leg(raw)) is not None]
+    combo_chart_mode = str(item.get("combo_chart_mode", "price")).strip().lower() or "price"
     return {
         "name": name,
         "option_family": str(item.get("option_family", "")).strip().upper(),
@@ -437,6 +446,7 @@ def _normalize_option_strategy_record(item: object) -> dict[str, object] | None:
         "bar": str(item.get("bar", "15m")).strip() or "15m",
         "candle_limit": str(item.get("candle_limit", "600")).strip() or "600",
         "chart_display_ccy": str(item.get("chart_display_ccy", "USDT")).strip() or "USDT",
+        "combo_chart_mode": "pnl" if combo_chart_mode == "pnl" else "price",
         "formula": str(item.get("formula", "")).strip(),
         "legs": legs,
     }

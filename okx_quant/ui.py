@@ -63,7 +63,11 @@ from okx_quant.strategy_catalog import (
     StrategyDefinition,
     get_strategy_definition,
 )
-from okx_quant.window_layout import apply_adaptive_window_geometry, apply_fill_window_geometry
+from okx_quant.window_layout import (
+    apply_adaptive_window_geometry,
+    apply_fill_window_geometry,
+    apply_window_icon,
+)
 
 
 BAR_OPTIONS = ["1m", "3m", "5m", "15m", "1H", "4H"]
@@ -137,6 +141,11 @@ HISTORY_MARGIN_MODE_FILTER_OPTIONS = {
     "全仓 cross": "cross",
     "逐仓 isolated": "isolated",
 }
+HISTORY_FILL_SIDE_FILTER_OPTIONS = {
+    "全部方向": "",
+    "买入 buy": "buy",
+    "卖出 sell": "sell",
+}
 POSITION_REFRESH_INTERVAL_OPTIONS = {
     "10秒": 10_000,
     "15秒": 15_000,
@@ -174,6 +183,7 @@ class StrategySession:
 class QuantApp:
     def __init__(self) -> None:
         self.root = Tk()
+        apply_window_icon(self.root)
         self.root.title(build_app_title())
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
@@ -258,17 +268,25 @@ class QuantApp:
         self._positions_zoom_fills_detail_toggle_text = StringVar(value="折叠成交详情")
         self._positions_zoom_position_history_detail_toggle_text = StringVar(value="折叠仓位详情")
         self._positions_zoom_fills_summary_text = StringVar(value="历史成交尚未读取。")
+        self._positions_zoom_fills_load_more_text = StringVar(value="增加100条")
         self._positions_zoom_position_history_summary_text = StringVar(value="历史仓位尚未读取。")
         self._positions_zoom_position_history_base_summary = "历史仓位尚未读取。"
+        self._fill_history_fetch_limit = 500
+        self._fill_history_load_more_clicks = 0
         self._positions_zoom_summary_text = StringVar(value="当前尚未获取持仓。")
         self._positions_zoom_option_search_hint_text = StringVar(
             value="\u9009\u4e2d\u671f\u6743\u540e\uff0c\u53ef\u4e00\u952e\u5e26\u5165\u5408\u7ea6\u6216\u5230\u671f\u524d\u7f00\u3002"
+        )
+        self._positions_zoom_fill_history_search_hint_text = StringVar(
+            value="\u9009\u4e2d\u5386\u53f2\u671f\u6743\u6210\u4ea4\u540e\uff0c\u53ef\u4e00\u952e\u5e26\u5165\u5408\u7ea6\u6216\u5230\u671f\u524d\u7f00\u3002"
         )
         self._positions_zoom_position_history_search_hint_text = StringVar(
             value="\u9009\u4e2d\u5386\u53f2\u671f\u6743\u540e\uff0c\u53ef\u4e00\u952e\u5e26\u5165\u5408\u7ea6\u6216\u5230\u671f\u524d\u7f00\u3002"
         )
         self._positions_zoom_apply_contract_button: ttk.Button | None = None
         self._positions_zoom_apply_expiry_prefix_button: ttk.Button | None = None
+        self._positions_zoom_fills_apply_contract_button: ttk.Button | None = None
+        self._positions_zoom_fills_apply_expiry_prefix_button: ttk.Button | None = None
         self._positions_zoom_position_history_apply_contract_button: ttk.Button | None = None
         self._positions_zoom_position_history_apply_expiry_prefix_button: ttk.Button | None = None
         self._main_body_pane: ttk.Panedwindow | None = None
@@ -339,6 +357,9 @@ class QuantApp:
         self.notify_errors = BooleanVar(value=True)
         self.position_type_filter = StringVar(value="全部类型")
         self.position_keyword = StringVar()
+        self.fill_history_type_filter = StringVar(value="全部类型")
+        self.fill_history_side_filter = StringVar(value="全部方向")
+        self.fill_history_keyword = StringVar()
         self.position_history_type_filter = StringVar(value="全部类型")
         self.position_history_margin_filter = StringVar(value="全部模式")
         self.position_history_keyword = StringVar()
@@ -837,7 +858,7 @@ class QuantApp:
         self.position_tree.heading("avg", text="开仓价")
         self.position_tree.heading("avg_usdt", text="开仓≈USDT")
         self.position_tree.heading("pos", text="持仓量")
-        self.position_tree.heading("option_side", text="买卖购沽")
+        self.position_tree.heading("option_side", text="买购:卖购 | 买沽:卖沽")
         self.position_tree.heading("upl", text="浮盈亏")
         self.position_tree.heading("upl_usdt", text="浮盈≈USDT")
         self.position_tree.heading("realized", text="已实现盈亏")
@@ -859,7 +880,7 @@ class QuantApp:
         self.position_tree.column("avg", width=108, anchor="e")
         self.position_tree.column("avg_usdt", width=54, anchor="e")
         self.position_tree.column("pos", width=110, anchor="e")
-        self.position_tree.column("option_side", width=110, anchor="center")
+        self.position_tree.column("option_side", width=170, anchor="center")
         self.position_tree.column("upl", width=210, anchor="e")
         self.position_tree.column("upl_usdt", width=105, anchor="e")
         self.position_tree.column("realized", width=118, anchor="e")
@@ -1373,22 +1394,23 @@ class QuantApp:
         ttk.Label(header, textvariable=self._positions_zoom_summary_text).grid(row=0, column=0, sticky="w")
         zoom_actions = ttk.Frame(header)
         zoom_actions.grid(row=0, column=1, sticky="e")
-        ttk.Button(zoom_actions, text="刷新历史", command=self.refresh_position_histories).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(zoom_actions, text="刷新", command=self.refresh_positions).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(zoom_actions, text="账户信息", command=self.open_account_info_window).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(zoom_actions, text="刷新历史", command=self.refresh_position_histories).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(zoom_actions, text="刷新历史成交", command=self.refresh_fill_history).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(zoom_actions, text="账户信息", command=self.open_account_info_window).grid(row=0, column=3, padx=(0, 6))
         ttk.Button(zoom_actions, text="设置期权保护", command=self.open_position_protection_window).grid(
-            row=0, column=3, padx=(0, 6)
+            row=0, column=4, padx=(0, 6)
         )
-        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=4)
+        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=5)
         ttk.Button(zoom_actions, text="列设置", command=self.open_positions_zoom_column_window).grid(
-            row=0, column=5, padx=(0, 6)
+            row=0, column=6, padx=(0, 6)
         )
 
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_detail_toggle_text, command=self.toggle_positions_zoom_detail).grid(
-            row=0, column=6, padx=(0, 6)
+            row=0, column=7, padx=(0, 6)
         )
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_history_toggle_text, command=self.toggle_positions_zoom_history).grid(
-            row=0, column=7
+            row=0, column=8
         )
         for column_index, child in enumerate(zoom_actions.winfo_children()):
             child.grid_configure(column=column_index)
@@ -1511,11 +1533,64 @@ class QuantApp:
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, textvariable=self._positions_zoom_fills_summary_text).grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            header,
+            textvariable=self._positions_zoom_fills_load_more_text,
+            command=self.expand_fill_history_limit,
+        ).grid(row=0, column=1, sticky="e", padx=(0, 6))
         ttk.Button(header, textvariable=self._positions_zoom_fills_detail_toggle_text, command=self.toggle_positions_zoom_fills_detail).grid(
-            row=0, column=1, sticky="e"
+            row=0, column=2, sticky="e"
         )
+        filter_row = ttk.Frame(parent)
+        filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        filter_row.columnconfigure(5, weight=1)
+        ttk.Label(filter_row, text="类型").grid(row=0, column=0, sticky="w")
+        type_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.fill_history_type_filter,
+            values=list(POSITION_TYPE_OPTIONS.keys()),
+            state="readonly",
+            width=16,
+        )
+        type_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        type_combo.bind("<<ComboboxSelected>>", self._on_fill_history_filter_changed)
+        ttk.Label(filter_row, text="方向").grid(row=0, column=2, sticky="w")
+        side_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.fill_history_side_filter,
+            values=list(HISTORY_FILL_SIDE_FILTER_OPTIONS.keys()),
+            state="readonly",
+            width=16,
+        )
+        side_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
+        side_combo.bind("<<ComboboxSelected>>", self._on_fill_history_filter_changed)
+        ttk.Label(filter_row, text="搜索").grid(row=0, column=4, sticky="w")
+        keyword_entry = ttk.Entry(filter_row, textvariable=self.fill_history_keyword)
+        keyword_entry.grid(row=0, column=5, sticky="ew", padx=(6, 12))
+        keyword_entry.bind("<KeyRelease>", self._on_fill_history_filter_changed)
+        self._positions_zoom_fills_apply_contract_button = ttk.Button(
+            filter_row,
+            text="\u5e26\u5165\u5408\u7ea6",
+            command=self.apply_selected_option_to_fill_history_search,
+        )
+        self._positions_zoom_fills_apply_contract_button.grid(row=0, column=6, padx=(0, 6))
+        self._positions_zoom_fills_apply_expiry_prefix_button = ttk.Button(
+            filter_row,
+            text="\u5e26\u5165\u5230\u671f\u524d\u7f00",
+            command=self.apply_selected_option_expiry_prefix_to_fill_history_search,
+        )
+        self._positions_zoom_fills_apply_expiry_prefix_button.grid(row=0, column=7, padx=(0, 6))
+        ttk.Button(filter_row, text="应用筛选", command=self._render_positions_zoom_fills_view).grid(
+            row=0, column=8, padx=(0, 6)
+        )
+        ttk.Button(filter_row, text="清空筛选", command=self.reset_fill_history_filters).grid(row=0, column=9)
+        ttk.Label(
+            filter_row,
+            textvariable=self._positions_zoom_fill_history_search_hint_text,
+            foreground="#6b7280",
+        ).grid(row=1, column=4, columnspan=6, sticky="w", pady=(6, 0))
         tree_frame = ttk.Frame(parent)
-        tree_frame.grid(row=1, column=0, sticky="nsew")
+        tree_frame.grid(row=2, column=0, sticky="nsew")
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
 
@@ -1560,7 +1635,7 @@ class QuantApp:
         self._register_positions_zoom_columns("fills", "历史成交", tree, columns)
 
         detail_frame = ttk.LabelFrame(parent, text="成交详情", padding=12)
-        detail_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        detail_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
         self._positions_zoom_fills_detail_frame = detail_frame
         detail_frame.columnconfigure(0, weight=1)
         detail_frame.rowconfigure(0, weight=1)
@@ -1740,6 +1815,8 @@ class QuantApp:
         self._positions_zoom_selected_item_id = None
         self._positions_zoom_apply_contract_button = None
         self._positions_zoom_apply_expiry_prefix_button = None
+        self._positions_zoom_fills_apply_contract_button = None
+        self._positions_zoom_fills_apply_expiry_prefix_button = None
         self._positions_zoom_position_history_apply_contract_button = None
         self._positions_zoom_position_history_apply_expiry_prefix_button = None
         self._positions_zoom_detail_collapsed = False
@@ -2096,6 +2173,33 @@ class QuantApp:
             f"已选历史期权：{contract} | 快捷筛选：合约={contract} | 到期前缀={expiry_prefix}"
         )
 
+    def _selected_fill_history_option_for_search(self) -> OkxFillHistoryItem | None:
+        if self._positions_zoom_fills_tree is None:
+            return None
+        selection = self._positions_zoom_fills_tree.selection()
+        if not selection:
+            return None
+        index = _history_tree_index(selection[0], "fill")
+        if index is None or index >= len(self._latest_fill_history):
+            return None
+        item = self._latest_fill_history[index]
+        if item.inst_type == "OPTION":
+            return item
+        return None
+
+    def _update_fill_history_search_shortcuts(self) -> None:
+        item = self._selected_fill_history_option_for_search()
+        contract, expiry_prefix = _option_search_shortcuts(item.inst_id if item else "")
+        enabled = bool(contract)
+        self._set_optional_button_enabled(self._positions_zoom_fills_apply_contract_button, enabled)
+        self._set_optional_button_enabled(self._positions_zoom_fills_apply_expiry_prefix_button, enabled)
+        if not enabled:
+            self._positions_zoom_fill_history_search_hint_text.set("选中历史期权成交后，可一键带入合约或到期前缀。")
+            return
+        self._positions_zoom_fill_history_search_hint_text.set(
+            f"已选历史期权成交：{contract} | 快捷筛选：合约={contract} | 到期前缀={expiry_prefix}"
+        )
+
     def apply_selected_option_to_position_search(self) -> None:
         position = self._selected_positions_zoom_option_for_search()
         contract, _ = _option_search_shortcuts(position.inst_id if position else "")
@@ -2131,6 +2235,24 @@ class QuantApp:
             return
         self.position_history_keyword.set(expiry_prefix)
         self._render_positions_zoom_position_history_view()
+
+    def apply_selected_option_to_fill_history_search(self) -> None:
+        item = self._selected_fill_history_option_for_search()
+        contract, _ = _option_search_shortcuts(item.inst_id if item else "")
+        if not contract:
+            messagebox.showinfo("快捷筛选", "请先在历史成交里选中一条期权合约。")
+            return
+        self.fill_history_keyword.set(contract)
+        self._render_positions_zoom_fills_view()
+
+    def apply_selected_option_expiry_prefix_to_fill_history_search(self) -> None:
+        item = self._selected_fill_history_option_for_search()
+        _, expiry_prefix = _option_search_shortcuts(item.inst_id if item else "")
+        if not expiry_prefix:
+            messagebox.showinfo("快捷筛选", "请先在历史成交里选中一条期权合约。")
+            return
+        self.fill_history_keyword.set(expiry_prefix)
+        self._render_positions_zoom_fills_view()
 
     def _refresh_positions_zoom_detail(self) -> None:
         if self._positions_zoom_detail is None:
@@ -2174,26 +2296,50 @@ class QuantApp:
             self._positions_zoom_position_history_summary_text.set(self._positions_zoom_position_history_base_summary)
             return
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
-        if not self._position_history_refreshing:
-            self._position_history_refreshing = True
-            self._positions_zoom_position_history_summary_text.set("正在刷新历史仓位...")
-            threading.Thread(
-                target=self._refresh_position_history_worker,
-                args=(credentials, environment),
-                daemon=True,
-            ).start()
-        if not self._fills_history_refreshing:
-            self._fills_history_refreshing = True
-            self._positions_zoom_fills_summary_text.set("正在刷新历史成交...")
-            threading.Thread(
-                target=self._refresh_fill_history_worker,
-                args=(credentials, environment),
-                daemon=True,
-            ).start()
+        self._start_position_history_refresh(credentials, environment)
+        self._start_fill_history_refresh(credentials, environment)
+
+    def refresh_fill_history(self) -> None:
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            self._positions_zoom_fills_summary_text.set("未配置 API 凭证，无法读取历史成交。")
+            return
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        self._start_fill_history_refresh(credentials, environment)
+
+    def expand_fill_history_limit(self) -> None:
+        self._fill_history_fetch_limit, self._fill_history_load_more_clicks, next_label = _advance_fill_history_limit(
+            self._fill_history_fetch_limit,
+            self._fill_history_load_more_clicks,
+        )
+        self._positions_zoom_fills_load_more_text.set(next_label)
+        self.refresh_fill_history()
+
+    def _start_fill_history_refresh(self, credentials: Credentials, environment: str) -> None:
+        if self._fills_history_refreshing:
+            return
+        self._fills_history_refreshing = True
+        self._positions_zoom_fills_summary_text.set("正在刷新历史成交...")
+        threading.Thread(
+            target=self._refresh_fill_history_worker,
+            args=(credentials, environment),
+            daemon=True,
+        ).start()
+
+    def _start_position_history_refresh(self, credentials: Credentials, environment: str) -> None:
+        if self._position_history_refreshing:
+            return
+        self._position_history_refreshing = True
+        self._positions_zoom_position_history_summary_text.set("正在刷新历史仓位...")
+        threading.Thread(
+            target=self._refresh_position_history_worker,
+            args=(credentials, environment),
+            daemon=True,
+        ).start()
 
     def _refresh_fill_history_worker(self, credentials: Credentials, environment: str) -> None:
         try:
-            fills = self.client.get_fills_history(credentials, environment=environment, limit=100)
+            fills = self.client.get_fills_history(credentials, environment=environment, limit=self._fill_history_fetch_limit)
             note = None
             effective_environment = environment
         except Exception as exc:
@@ -2201,7 +2347,7 @@ class QuantApp:
             if "50101" in message and "current environment" in message:
                 alternate = "live" if environment == "demo" else "demo"
                 try:
-                    fills = self.client.get_fills_history(credentials, environment=alternate, limit=100)
+                    fills = self.client.get_fills_history(credentials, environment=alternate, limit=self._fill_history_fetch_limit)
                     note = f"历史数据自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
                     effective_environment = alternate
                 except Exception:
@@ -2291,7 +2437,13 @@ class QuantApp:
         tree = self._positions_zoom_fills_tree
         selected_before = tree.selection()[0] if tree.selection() else None
         tree.delete(*tree.get_children())
-        for index, item in enumerate(self._latest_fill_history):
+        filtered_items = _filter_fill_history_items(
+            self._latest_fill_history,
+            inst_type=POSITION_TYPE_OPTIONS.get(self.fill_history_type_filter.get(), ""),
+            side=HISTORY_FILL_SIDE_FILTER_OPTIONS.get(self.fill_history_side_filter.get(), ""),
+            keyword=self.fill_history_keyword.get(),
+        )
+        for index, item in filtered_items:
             iid = f"fill-{index}"
             tree.insert(
                 "",
@@ -2302,14 +2454,26 @@ class QuantApp:
                     item.inst_type or "-",
                     item.inst_id or "-",
                     _format_history_side(item.side, item.pos_side),
-                    _format_optional_decimal(item.fill_price),
+                    _format_fill_history_price(item),
                     _format_optional_decimal(item.fill_size),
                     _format_optional_decimal(item.fill_fee),
                     _format_fill_history_pnl(item),
                     item.exec_type or "-",
-                ),
-                tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
-            )
+                  ),
+                  tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
+              )
+        if self._fills_history_last_refresh_at is not None:
+            timestamp = self._fills_history_last_refresh_at.strftime("%H:%M:%S")
+            summary = f"历史成交：{len(self._latest_fill_history)} 条 | 最近刷新：{timestamp}"
+        else:
+            summary = f"历史成交：{len(self._latest_fill_history)} 条"
+        if (
+            POSITION_TYPE_OPTIONS.get(self.fill_history_type_filter.get(), "")
+            or HISTORY_FILL_SIDE_FILTER_OPTIONS.get(self.fill_history_side_filter.get(), "")
+            or self.fill_history_keyword.get().strip()
+        ):
+            summary = f"{summary} | 当前显示：{len(filtered_items)}/{len(self._latest_fill_history)}"
+        self._positions_zoom_fills_summary_text.set(summary)
         if selected_before and tree.exists(selected_before):
             tree.selection_set(selected_before)
             tree.focus(selected_before)
@@ -2318,6 +2482,16 @@ class QuantApp:
             tree.selection_set(first)
             tree.focus(first)
         self._refresh_positions_zoom_fills_detail()
+        self._update_fill_history_search_shortcuts()
+
+    def _on_fill_history_filter_changed(self, *_: object) -> None:
+        self._render_positions_zoom_fills_view()
+
+    def reset_fill_history_filters(self) -> None:
+        self.fill_history_type_filter.set("全部类型")
+        self.fill_history_side_filter.set("全部方向")
+        self.fill_history_keyword.set("")
+        self._render_positions_zoom_fills_view()
 
     def _render_positions_zoom_position_history_view(self) -> None:
         if self._positions_zoom_position_history_tree is None:
@@ -2385,6 +2559,7 @@ class QuantApp:
 
     def _on_positions_zoom_fills_selected(self, *_: object) -> None:
         self._refresh_positions_zoom_fills_detail()
+        self._update_fill_history_search_shortcuts()
 
     def _on_position_history_filter_changed(self, *_: object) -> None:
         self._render_positions_zoom_position_history_view()
@@ -3285,6 +3460,7 @@ class QuantApp:
         self._option_strategy_window = OptionStrategyCalculatorWindow(
             self.root,
             self.client,
+            runtime_provider=self._build_option_strategy_runtime_or_none,
             logger=self._enqueue_log,
         )
 
@@ -3894,7 +4070,7 @@ class QuantApp:
                 _format_position_avg_price(position, self._position_instruments),
                 _format_position_avg_price_usdt(position, self._upl_usdt_prices),
                 _format_position_size(position, self._position_instruments),
-                _format_option_trade_side(position),
+                _format_option_trade_side_display(position),
                 _format_position_unrealized_pnl(position),
                 _format_optional_usdt(_position_unrealized_pnl_usdt(position, self._upl_usdt_prices)),
                 _format_optional_decimal_fixed(position.realized_pnl, places=5, with_sign=True),
@@ -4407,6 +4583,13 @@ class QuantApp:
             credential_profile_name=self._loaded_credential_profile_name,
         )
 
+    def _build_option_strategy_runtime_or_none(self) -> tuple[Credentials, str] | None:
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            return None
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        return credentials, environment
+
     def _current_notification_state(self) -> tuple[object, ...]:
         return (
             self.environment_label.get(),
@@ -4708,6 +4891,11 @@ def _option_search_shortcuts(inst_id: str) -> tuple[str, str]:
     return normalized, f"{parts[0]}-{parts[1]}-{parts[2]}-"
 
 
+def _advance_fill_history_limit(current_limit: int, load_more_clicks: int) -> tuple[int, int, str]:
+    increment = 100 if load_more_clicks == 0 else 200
+    return current_limit + increment, load_more_clicks + 1, "增加200条"
+
+
 def _aggregate_position_metrics(
     positions: list[OkxPosition],
     upl_usdt_prices: dict[str, Decimal],
@@ -4866,11 +5054,15 @@ def _format_option_trade_side(position: OkxPosition) -> str:
     return "-"
 
 
+def _format_option_trade_side_display(position: OkxPosition) -> str:
+    return _format_option_trade_side(position)
+
+
 def _format_group_option_trade_side(
     positions: list[OkxPosition],
     position_instruments: dict[str, Instrument],
 ) -> str:
-    totals: dict[str, tuple[Decimal, str]] = {}
+    totals: dict[str, Decimal] = {}
     ordered_labels = ("买购", "卖购", "买沽", "卖沽")
     for position in positions:
         label = _format_option_trade_side(position)
@@ -4879,16 +5071,18 @@ def _format_group_option_trade_side(
         amount, currency = _position_signed_display_amount(position, position_instruments)
         if amount is None or not currency:
             continue
-        existing_amount, _ = totals.get(label, (Decimal("0"), currency))
-        totals[label] = (existing_amount + abs(amount), currency)
+        totals[label] = totals.get(label, Decimal("0")) + abs(amount)
 
-    parts: list[str] = []
-    for label in ordered_labels:
+    def _slot_text(label: str) -> str:
         if label not in totals:
-            continue
-        amount, currency = totals[label]
-        parts.append(f"{label}{format_decimal_fixed(amount, 2)}{currency}")
-    return " / ".join(parts)
+            return "-"
+        amount = totals[label]
+        return format_decimal_fixed(amount, 2)
+
+    return (
+        f"{_slot_text('买购')} : {_slot_text('卖购')} | "
+        f"{_slot_text('买沽')} : {_slot_text('卖沽')}"
+    )
 
 
 def _format_filtered_option_position_size(
@@ -5529,6 +5723,42 @@ def _filter_position_history_items(
     return filtered
 
 
+def _filter_fill_history_items(
+    items: list[OkxFillHistoryItem],
+    *,
+    inst_type: str = "",
+    side: str = "",
+    keyword: str = "",
+) -> list[tuple[int, OkxFillHistoryItem]]:
+    normalized_inst_type = inst_type.strip().upper()
+    normalized_side = side.strip().lower()
+    normalized_keyword = keyword.strip().lower()
+    filtered: list[tuple[int, OkxFillHistoryItem]] = []
+
+    for index, item in enumerate(items):
+        if normalized_inst_type and (item.inst_type or "").upper() != normalized_inst_type:
+            continue
+        if normalized_side and (item.side or "").lower() != normalized_side:
+            continue
+        if normalized_keyword:
+            haystack = " ".join(
+                part
+                for part in (
+                    item.inst_id,
+                    item.inst_type,
+                    item.side,
+                    item.pos_side,
+                    item.exec_type,
+                    item.fee_currency,
+                )
+                if part
+            ).lower()
+            if normalized_keyword not in haystack:
+                continue
+        filtered.append((index, item))
+    return filtered
+
+
 def _format_position_history_currency_totals(totals: dict[str, Decimal]) -> str:
     if not totals:
         return "-"
@@ -5644,6 +5874,17 @@ def _format_fill_history_pnl(item: OkxFillHistoryItem) -> str:
     return _format_history_amount(item.pnl, _infer_fill_history_pnl_currency(item), with_sign=True)
 
 
+def _format_fill_history_price(item: OkxFillHistoryItem) -> str:
+    if item.exec_type == "行权/交割":
+        return _format_optional_decimal_fixed(item.fill_price, places=2)
+    if item.inst_type == "OPTION":
+        return _format_optional_decimal(item.fill_price)
+    quote_currency = _extract_quote_key(item.inst_id)
+    if quote_currency in {"USDT", "USD", "USDC"}:
+        return _format_optional_decimal_fixed(item.fill_price, places=2)
+    return _format_optional_decimal(item.fill_price)
+
+
 def _build_account_config_detail_text(
     config: OkxAccountConfig,
     overview: OkxAccountOverview,
@@ -5695,7 +5936,7 @@ def _build_fill_history_detail_text(item: OkxFillHistoryItem) -> str:
         f"合约：{item.inst_id or '-'}\n"
         f"类型：{item.inst_type or '-'}\n"
         f"方向：{_format_history_side(item.side, item.pos_side)}\n"
-        f"成交价：{_format_optional_decimal(item.fill_price)}\n"
+        f"成交价：{_format_fill_history_price(item)}\n"
         f"成交量：{_format_optional_decimal(item.fill_size)}\n"
         f"手续费：{_format_optional_decimal(item.fill_fee)} {item.fee_currency or ''}\n"
         f"已实现盈亏：{_format_fill_history_pnl(item)}\n"

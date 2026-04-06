@@ -16,6 +16,7 @@ from okx_quant.option_strategy import (
     convert_candles_by_reference,
     convert_payoff_snapshot_to_usdt,
     evaluate_linear_formula,
+    estimate_strategy_greeks,
     infer_implied_volatility_for_leg,
     infer_inverse_implied_volatility,
     inverse_black_scholes_price,
@@ -26,6 +27,7 @@ from okx_quant.option_strategy import (
     parse_option_contract,
     parse_option_expiry_datetime,
     resolve_strategy_leg,
+    shift_candles,
     simulated_option_value,
 )
 
@@ -228,6 +230,26 @@ class OptionStrategyTest(TestCase):
         self.assertEqual(converted[0].low, Decimal("392.000"))
         self.assertEqual(converted[0].close, Decimal("757.500"))
 
+    def test_shift_candles_offsets_each_ohlc_value(self) -> None:
+        candles = [
+            Candle(
+                ts=1,
+                open=Decimal("0.01"),
+                high=Decimal("0.015"),
+                low=Decimal("0.008"),
+                close=Decimal("0.012"),
+                volume=Decimal("0"),
+                confirmed=True,
+            )
+        ]
+
+        shifted = shift_candles(candles, offset=Decimal("-0.005"))
+
+        self.assertEqual(shifted[0].open, Decimal("0.005"))
+        self.assertEqual(shifted[0].high, Decimal("0.010"))
+        self.assertEqual(shifted[0].low, Decimal("0.003"))
+        self.assertEqual(shifted[0].close, Decimal("0.007"))
+
     def test_inverse_black_scholes_price_can_round_trip_implied_volatility(self) -> None:
         option_value = inverse_black_scholes_price(
             settlement_price=Decimal("100000"),
@@ -317,6 +339,37 @@ class OptionStrategyTest(TestCase):
         self.assertIsNotNone(implied)
         self.assertAlmostEqual(float(implied), float(target_volatility), places=4)
 
+    def test_infer_implied_volatility_for_leg_can_use_market_price_separate_from_entry_cost(self) -> None:
+        target_volatility = Decimal("0.55")
+        market_value = inverse_black_scholes_price(
+            settlement_price=Decimal("100000"),
+            strike=Decimal("100000"),
+            option_type="C",
+            contract_value=Decimal("0.1"),
+            time_to_expiry_years=option_time_to_expiry_years("260626", valuation_time=datetime(2026, 1, 1, 0, 0, 0)),
+            volatility=target_volatility,
+        )
+        leg = resolve_strategy_leg(
+            StrategyLegDefinition(
+                alias="L1",
+                inst_id="BTC-USD-260626-100000-C",
+                side="buy",
+                quantity=Decimal("1"),
+                premium=Decimal("0.01"),
+            ),
+            _make_instrument("BTC-USD-260626-100000-C"),
+        )
+
+        implied = infer_implied_volatility_for_leg(
+            leg,
+            settlement_price=Decimal("100000"),
+            valuation_time=datetime(2026, 1, 1, 0, 0, 0),
+            option_price=market_value / Decimal("0.1"),
+        )
+
+        self.assertIsNotNone(implied)
+        self.assertAlmostEqual(float(implied), float(target_volatility), places=4)
+
     def test_build_simulated_payoff_snapshot_reduces_to_expiry_value_when_time_is_over(self) -> None:
         leg = resolve_strategy_leg(
             StrategyLegDefinition(
@@ -339,3 +392,28 @@ class OptionStrategyTest(TestCase):
 
         target = next(point for point in snapshot.points if point.underlying_price == Decimal("100000"))
         self.assertEqual(target.pnl, Decimal("-0.005"))
+
+    def test_estimate_strategy_greeks_returns_expected_keys(self) -> None:
+        leg = resolve_strategy_leg(
+            StrategyLegDefinition(
+                alias="L1",
+                inst_id="BTC-USD-260626-100000-C",
+                side="buy",
+                quantity=Decimal("1"),
+                premium=Decimal("0.05"),
+            ),
+            _make_instrument("BTC-USD-260626-100000-C"),
+        )
+
+        greeks = estimate_strategy_greeks(
+            [leg],
+            implied_volatility_by_alias={"L1": Decimal("0.7")},
+            valuation_time=datetime(2026, 1, 1, 0, 0, 0),
+            settlement_price=Decimal("100000"),
+        )
+
+        self.assertIn("delta", greeks)
+        self.assertIn("gamma", greeks)
+        self.assertIn("theta", greeks)
+        self.assertIn("vega", greeks)
+        self.assertGreater(greeks["delta"], Decimal("0"))

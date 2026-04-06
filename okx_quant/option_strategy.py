@@ -64,6 +64,10 @@ class StrategyLegDefinition:
     side: LegSide
     quantity: Decimal
     premium: Decimal | None = None
+    delta: Decimal | None = None
+    gamma: Decimal | None = None
+    theta: Decimal | None = None
+    vega: Decimal | None = None
     enabled: bool = True
 
 
@@ -125,6 +129,21 @@ def convert_payoff_snapshot_to_usdt(
         price_upper=snapshot.price_upper,
         current_underlying_price=snapshot.current_underlying_price,
     )
+
+
+def shift_candles(candles: list[Candle], *, offset: Decimal) -> list[Candle]:
+    return [
+        Candle(
+            ts=item.ts,
+            open=item.open + offset,
+            high=item.high + offset,
+            low=item.low + offset,
+            close=item.close + offset,
+            volume=item.volume,
+            confirmed=item.confirmed,
+        )
+        for item in candles
+    ]
 
 
 def convert_candles_by_reference(candles: list[Candle], reference_candles: list[Candle]) -> list[Candle]:
@@ -495,8 +514,10 @@ def infer_implied_volatility_for_leg(
     *,
     settlement_price: Decimal,
     valuation_time: datetime,
+    option_price: Decimal | None = None,
 ) -> Decimal | None:
-    theoretical_price = leg.premium * leg.contract_value
+    reference_option_price = option_price if option_price is not None and option_price > 0 else leg.premium
+    theoretical_price = reference_option_price * leg.contract_value
     time_to_expiry = option_time_to_expiry_years(leg.expiry_code, valuation_time=valuation_time)
     if theoretical_price <= 0:
         return MIN_SIMULATION_VOLATILITY
@@ -510,6 +531,111 @@ def infer_implied_volatility_for_leg(
         contract_value=leg.contract_value,
         time_to_expiry_years=time_to_expiry,
     )
+
+
+def estimate_strategy_greeks(
+    legs: list[ResolvedStrategyLeg],
+    *,
+    implied_volatility_by_alias: dict[str, Decimal],
+    valuation_time: datetime,
+    settlement_price: Decimal,
+) -> dict[str, Decimal]:
+    totals = {
+        "delta": Decimal("0"),
+        "gamma": Decimal("0"),
+        "theta": Decimal("0"),
+        "vega": Decimal("0"),
+    }
+    active_legs = [item for item in legs if item.quantity > 0]
+    if settlement_price <= 0 or not active_legs:
+        return totals
+
+    for leg in active_legs:
+        greeks = estimate_leg_greeks(
+            leg,
+            settlement_price=settlement_price,
+            valuation_time=valuation_time,
+            base_implied_volatility=implied_volatility_by_alias.get(leg.alias),
+        )
+        direction = Decimal("1") if leg.side == "buy" else Decimal("-1")
+        for key, value in greeks.items():
+            totals[key] += direction * value * leg.quantity
+    return totals
+
+
+def estimate_leg_greeks(
+    leg: ResolvedStrategyLeg,
+    *,
+    settlement_price: Decimal,
+    valuation_time: datetime,
+    base_implied_volatility: Decimal | None,
+) -> dict[str, Decimal]:
+    if settlement_price <= 0:
+        return {
+            "delta": Decimal("0"),
+            "gamma": Decimal("0"),
+            "theta": Decimal("0"),
+            "vega": Decimal("0"),
+        }
+
+    base_value = simulated_option_value(
+        settlement_price=settlement_price,
+        leg=leg,
+        valuation_time=valuation_time,
+        base_implied_volatility=base_implied_volatility,
+    )
+    price_step = max(settlement_price * Decimal("0.005"), Decimal("1"))
+    max_down_step = max(settlement_price - Decimal("0.0001"), Decimal("0"))
+    price_step = min(price_step, max_down_step)
+    if price_step <= 0:
+        delta = Decimal("0")
+        gamma = Decimal("0")
+    else:
+        up_value = simulated_option_value(
+            settlement_price=settlement_price + price_step,
+            leg=leg,
+            valuation_time=valuation_time,
+            base_implied_volatility=base_implied_volatility,
+        )
+        down_value = simulated_option_value(
+            settlement_price=settlement_price - price_step,
+            leg=leg,
+            valuation_time=valuation_time,
+            base_implied_volatility=base_implied_volatility,
+        )
+        denominator = price_step * Decimal("2")
+        delta = (up_value - down_value) / denominator
+        gamma = (up_value - (Decimal("2") * base_value) + down_value) / (price_step * price_step)
+
+    vol_step = Decimal("0.01")
+    vega = (
+        simulated_option_value(
+            settlement_price=settlement_price,
+            leg=leg,
+            valuation_time=valuation_time,
+            base_implied_volatility=base_implied_volatility,
+            volatility_shift=vol_step,
+        )
+        - simulated_option_value(
+            settlement_price=settlement_price,
+            leg=leg,
+            valuation_time=valuation_time,
+            base_implied_volatility=base_implied_volatility,
+            volatility_shift=-vol_step,
+        )
+    ) / Decimal("2")
+    theta = simulated_option_value(
+        settlement_price=settlement_price,
+        leg=leg,
+        valuation_time=valuation_time + timedelta(days=1),
+        base_implied_volatility=base_implied_volatility,
+    ) - base_value
+    return {
+        "delta": delta,
+        "gamma": gamma,
+        "theta": theta,
+        "vega": vega,
+    }
 
 
 def option_time_to_expiry_years(expiry_code: str, *, valuation_time: datetime) -> Decimal:

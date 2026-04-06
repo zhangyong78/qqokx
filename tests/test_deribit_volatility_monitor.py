@@ -8,6 +8,8 @@ from okx_quant.deribit_volatility_monitor import (
     VolatilityMonitorRoundDiagnostic,
     VolatilityMonitorSymbolDiagnostic,
     detect_bearish_reversal_after_rally,
+    detect_box_breakout_down,
+    detect_box_breakout_up,
     detect_bullish_reversal_after_drop,
     detect_ema34_turn_down,
     detect_ema34_turn_up,
@@ -110,6 +112,168 @@ class DeribitVolatilityMonitorSignalsTest(TestCase):
         self.assertEqual(event.signal_type, "squeeze_breakout_down")
         self.assertEqual(event.direction, "down")
         self.assertEqual(event.trigger_value, Decimal("47"))
+
+    def test_detect_box_breakout_up(self) -> None:
+        config = VolatilityMonitorConfig(currencies=("BTC",), squeeze_bars=6)
+        candles: list[DeribitVolatilityCandle] = []
+        for index in range(20):
+            base = Decimal("50") + Decimal(index % 2)
+            candles.append(_candle(index, base, base + Decimal("2.6"), base - Decimal("2.4"), base + Decimal("0.5")))
+        for index in range(20, 30):
+            open_price = Decimal("52.0") + Decimal(index % 3) * Decimal("0.2")
+            candles.append(_candle(index, open_price, Decimal("54.2"), Decimal("51.2"), Decimal("52.8")))
+        candles.append(_candle(30, "53.0", "56.8", "52.8", "56.3"))
+
+        event = detect_box_breakout_up("BTC", candles, config)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.signal_type, "box_breakout_up")
+        self.assertEqual(event.direction, "up")
+        self.assertIn("箱体高点", event.reason)
+
+    def test_detect_box_breakout_down(self) -> None:
+        config = VolatilityMonitorConfig(currencies=("BTC",), squeeze_bars=6)
+        candles: list[DeribitVolatilityCandle] = []
+        for index in range(20):
+            base = Decimal("50") + Decimal(index % 2)
+            candles.append(_candle(index, base, base + Decimal("2.6"), base - Decimal("2.4"), base + Decimal("0.5")))
+        for index in range(20, 30):
+            open_price = Decimal("52.0") + Decimal(index % 3) * Decimal("0.2")
+            candles.append(_candle(index, open_price, Decimal("54.2"), Decimal("51.2"), Decimal("52.6")))
+        candles.append(_candle(30, "52.5", "52.7", "48.4", "48.9"))
+
+        event = detect_box_breakout_down("BTC", candles, config)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.signal_type, "box_breakout_down")
+        self.assertEqual(event.direction, "down")
+        self.assertIn("箱体低点", event.reason)
+
+    def test_detect_box_breakout_up_by_valid_close_breakout(self) -> None:
+        config = VolatilityMonitorConfig(currencies=("BTC",), squeeze_bars=6)
+        candles: list[DeribitVolatilityCandle] = []
+        for index in range(20):
+            base = Decimal("50.0") + Decimal(index % 2) * Decimal("0.4")
+            candles.append(_candle(index, base, base + Decimal("1.8"), base - Decimal("1.6"), base + Decimal("0.4")))
+        box_rows = [
+            ("52.0", "52.5", "51.7", "52.2"),
+            ("52.1", "52.4", "51.8", "52.0"),
+            ("52.0", "52.6", "51.9", "52.3"),
+            ("52.2", "52.5", "51.9", "52.1"),
+            ("52.1", "52.4", "51.8", "52.0"),
+            ("52.0", "52.5", "51.8", "52.2"),
+            ("52.1", "52.4", "51.9", "52.1"),
+            ("52.0", "52.5", "51.9", "52.2"),
+            ("52.2", "52.5", "51.8", "52.0"),
+            ("52.1", "52.4", "51.9", "52.1"),
+        ]
+        for offset, row in enumerate(box_rows, start=20):
+            candles.append(_candle(offset, *row))
+        candles.append(_candle(30, "52.35", "52.90", "52.10", "52.78"))
+
+        event = detect_box_breakout_up("BTC", candles, config)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.signal_type, "box_breakout_up")
+        self.assertEqual(event.direction, "up")
+        self.assertEqual(event.trigger_value, Decimal("52.78"))
+
+    def test_detect_box_breakout_up_by_body_box_breakout(self) -> None:
+        config = VolatilityMonitorConfig(currencies=("BTC",), squeeze_bars=6)
+        candles: list[DeribitVolatilityCandle] = []
+        for index in range(18):
+            base = Decimal("50.0") + Decimal(index % 2) * Decimal("0.3")
+            candles.append(_candle(index, base, base + Decimal("1.2"), base - Decimal("1.1"), base + Decimal("0.2")))
+        box_rows = [
+            ("52.00", "52.40", "51.80", "52.10"),
+            ("52.10", "52.50", "51.90", "52.00"),
+            ("52.00", "52.45", "51.85", "52.05"),
+            ("52.05", "52.50", "51.90", "52.10"),
+            ("52.10", "52.55", "51.95", "52.15"),
+            ("52.15", "53.80", "52.00", "52.20"),
+            ("52.10", "52.50", "51.95", "52.15"),
+            ("52.05", "52.45", "51.90", "52.10"),
+            ("52.00", "52.40", "51.85", "52.05"),
+            ("52.10", "52.55", "51.95", "52.20"),
+            ("52.15", "52.60", "51.95", "52.25"),
+            ("52.20", "52.65", "52.00", "52.30"),
+        ]
+        for offset, row in enumerate(box_rows, start=18):
+            candles.append(_candle(offset, *row))
+        candles.append(_candle(30, "52.28", "52.85", "52.12", "52.68"))
+
+        event = detect_box_breakout_up("BTC", candles, config)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.signal_type, "box_breakout_up")
+        self.assertEqual(event.direction, "up")
+        self.assertEqual(event.trigger_value, Decimal("52.68"))
+
+    def test_detect_box_breakout_down_by_valid_close_breakout(self) -> None:
+        config = VolatilityMonitorConfig(currencies=("BTC",), squeeze_bars=6)
+        candles: list[DeribitVolatilityCandle] = []
+        for index in range(20):
+            base = Decimal("50.0") + Decimal(index % 2) * Decimal("0.4")
+            candles.append(_candle(index, base, base + Decimal("1.8"), base - Decimal("1.6"), base + Decimal("0.4")))
+        box_rows = [
+            ("52.0", "52.5", "51.7", "52.2"),
+            ("52.1", "52.4", "51.8", "52.0"),
+            ("52.0", "52.6", "51.9", "52.3"),
+            ("52.2", "52.5", "51.9", "52.1"),
+            ("52.1", "52.4", "51.8", "52.0"),
+            ("52.0", "52.5", "51.8", "52.2"),
+            ("52.1", "52.4", "51.9", "52.1"),
+            ("52.0", "52.5", "51.9", "52.2"),
+            ("52.2", "52.5", "51.8", "52.0"),
+            ("52.1", "52.4", "51.9", "52.1"),
+        ]
+        for offset, row in enumerate(box_rows, start=20):
+            candles.append(_candle(offset, *row))
+        candles.append(_candle(30, "51.95", "52.10", "51.35", "51.44"))
+
+        event = detect_box_breakout_down("BTC", candles, config)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.signal_type, "box_breakout_down")
+        self.assertEqual(event.direction, "down")
+        self.assertEqual(event.trigger_value, Decimal("51.44"))
+
+    def test_detect_box_breakout_down_by_body_box_breakout(self) -> None:
+        config = VolatilityMonitorConfig(currencies=("BTC",), squeeze_bars=6)
+        candles: list[DeribitVolatilityCandle] = []
+        for index in range(18):
+            base = Decimal("50.0") + Decimal(index % 2) * Decimal("0.3")
+            candles.append(_candle(index, base, base + Decimal("1.2"), base - Decimal("1.1"), base + Decimal("0.2")))
+        box_rows = [
+            ("52.40", "52.65", "52.00", "52.30"),
+            ("52.35", "52.60", "52.05", "52.25"),
+            ("52.30", "52.55", "52.00", "52.20"),
+            ("52.25", "52.50", "51.95", "52.15"),
+            ("52.20", "52.45", "51.90", "52.10"),
+            ("52.15", "52.35", "50.70", "52.05"),
+            ("52.20", "52.40", "51.95", "52.10"),
+            ("52.25", "52.45", "52.00", "52.15"),
+            ("52.30", "52.50", "52.05", "52.20"),
+            ("52.35", "52.55", "52.10", "52.25"),
+            ("52.30", "52.50", "52.05", "52.20"),
+            ("52.25", "52.45", "52.00", "52.15"),
+        ]
+        for offset, row in enumerate(box_rows, start=18):
+            candles.append(_candle(offset, *row))
+        candles.append(_candle(30, "52.10", "52.18", "51.35", "51.52"))
+
+        event = detect_box_breakout_down("BTC", candles, config)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.signal_type, "box_breakout_down")
+        self.assertEqual(event.direction, "down")
+        self.assertEqual(event.trigger_value, Decimal("51.52"))
 
     def test_detect_ema34_turn_up(self) -> None:
         config = VolatilityMonitorConfig(currencies=("BTC",), ema_period=34)

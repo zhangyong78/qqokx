@@ -1,6 +1,22 @@
 from __future__ import annotations
 
+from pathlib import Path
 from tkinter import BaseWidget
+
+
+def _app_icon_path() -> Path:
+    return Path(__file__).resolve().parent / "assets" / "btc.ico"
+
+
+def apply_window_icon(window: BaseWidget) -> bool:
+    icon_path = _app_icon_path()
+    if not icon_path.exists():
+        return False
+    try:
+        window.iconbitmap(str(icon_path))
+        return True
+    except Exception:
+        return False
 
 
 def apply_adaptive_window_geometry(
@@ -16,6 +32,7 @@ def apply_adaptive_window_geometry(
     top_reserve: int = 56,
     center: bool = True,
 ) -> tuple[int, int]:
+    apply_window_icon(window)
     try:
         window.update_idletasks()
     except Exception:
@@ -55,6 +72,7 @@ def apply_fill_window_geometry(
     margin: int = 30,
     top_reserve: int = 56,
 ) -> tuple[int, int]:
+    apply_window_icon(window)
     try:
         window.update_idletasks()
     except Exception:

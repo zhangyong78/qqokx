@@ -11,9 +11,12 @@ from okx_quant.okx_client import (
     OkxRestClient,
 )
 from okx_quant.ui import (
+    _advance_fill_history_limit,
     _build_account_asset_detail_text,
     _build_account_config_detail_text,
     _build_fill_history_detail_text,
+    _filter_fill_history_items,
+    _format_fill_history_price,
     _build_position_history_detail_text,
     _build_position_history_usdt_price_map,
     _filter_position_history_items,
@@ -26,6 +29,17 @@ from okx_quant.ui import (
 
 
 class OkxHistoryParsingTest(TestCase):
+    def test_advance_fill_history_limit_uses_100_then_200(self) -> None:
+        limit, clicks, label = _advance_fill_history_limit(500, 0)
+        self.assertEqual(limit, 600)
+        self.assertEqual(clicks, 1)
+        self.assertEqual(label, "增加200条")
+
+        limit, clicks, label = _advance_fill_history_limit(limit, clicks)
+        self.assertEqual(limit, 800)
+        self.assertEqual(clicks, 2)
+        self.assertEqual(label, "增加200条")
+
     def test_get_account_overview_parses_summary_and_details(self) -> None:
         client = OkxRestClient()
 
@@ -114,8 +128,10 @@ class OkxHistoryParsingTest(TestCase):
         client = OkxRestClient()
 
         def _stub_request(method: str, path: str, params=None, **kwargs):
-            self.assertEqual(path, "/api/v5/trade/fills-history")
             inst_type = params["instType"]
+            self.assertIn(path, {"/api/v5/trade/fills-history", "/api/v5/account/bills"})
+            if path == "/api/v5/account/bills":
+                return {"data": []}
             if inst_type == "SWAP":
                 return {
                     "data": [
@@ -168,6 +184,109 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(items[0].inst_id, "BTC-USDT-SWAP")
         self.assertEqual(items[0].fill_price, Decimal("71210.5"))
         self.assertEqual(items[1].fee_currency, "BTC")
+
+    def test_get_fills_history_pages_and_merges_exercise_bills(self) -> None:
+        client = OkxRestClient()
+        seen_after: list[str | None] = []
+        option_first_page = [
+            {
+                "billId": str(1000 - index),
+                "instId": "BTC-USD-260626-90000-P",
+                "instType": "OPTION",
+                "side": "buy",
+                "posSide": "long",
+                "fillPx": "0.02",
+                "fillSz": "10",
+                "fillFee": "-0.0001",
+                "fillFeeCcy": "BTC",
+                "fillPnl": "0.0002",
+                "ordId": str(index),
+                "tradeId": str(index),
+                "execType": "T",
+                "fillTime": str(1710000000300 - index),
+            }
+            for index in range(100)
+        ]
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            self.assertIn(path, {"/api/v5/trade/fills-history", "/api/v5/account/bills"})
+            if path == "/api/v5/account/bills":
+                return {
+                    "data": [
+                        {
+                            "instId": "BTC-USD-260626-100000-C",
+                            "instType": "OPTION",
+                            "subType": "exercise",
+                            "px": "0.025",
+                            "sz": "5",
+                            "fee": "-0.0001",
+                            "feeCcy": "BTC",
+                            "pnl": "0.0004",
+                            "ts": "1710000000400",
+                        }
+                    ]
+                }
+            inst_type = params["instType"]
+            if inst_type == "OPTION":
+                after = params.get("after")
+                seen_after.append(after)
+                if after is None:
+                    return {"data": option_first_page}
+                return {"data": []}
+            return {"data": []}
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        items = client.get_fills_history(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            environment="live",
+            inst_types=("OPTION",),
+            limit=101,
+        )
+
+        self.assertEqual(seen_after, [None, "901"])
+        self.assertEqual(len(items), 101)
+        self.assertEqual(items[0].exec_type, "行权/交割")
+        self.assertEqual(items[0].fill_price, Decimal("0.025"))
+
+    def test_filter_fill_history_items_supports_type_side_and_keyword(self) -> None:
+        items = [
+            OkxFillHistoryItem(
+                fill_time=1710000000200,
+                inst_id="BTC-USDT-SWAP",
+                inst_type="SWAP",
+                side="buy",
+                pos_side="long",
+                fill_price=Decimal("71210.5"),
+                fill_size=Decimal("3"),
+                fill_fee=Decimal("-0.5"),
+                fee_currency="USDT",
+                pnl=Decimal("12.3"),
+                order_id="1",
+                trade_id="11",
+                exec_type="T",
+                raw={},
+            ),
+            OkxFillHistoryItem(
+                fill_time=1710000000100,
+                inst_id="BTC-USD-260626-100000-C",
+                inst_type="OPTION",
+                side="exercise",
+                pos_side=None,
+                fill_price=Decimal("0.015"),
+                fill_size=Decimal("20"),
+                fill_fee=Decimal("-0.0001"),
+                fee_currency="BTC",
+                pnl=Decimal("-0.0005"),
+                order_id=None,
+                trade_id=None,
+                exec_type="行权/交割",
+                raw={},
+            ),
+        ]
+
+        filtered = _filter_fill_history_items(items, inst_type="OPTION", side="", keyword="100000-C")
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0][1].exec_type, "行权/交割")
 
     def test_get_positions_history_merges_and_sorts_items(self) -> None:
         client = OkxRestClient()
@@ -419,6 +538,48 @@ class OkxHistoryParsingTest(TestCase):
             )
         )
         self.assertEqual(text, "+12.30")
+
+    def test_fill_history_price_formats_exercise_delivery_with_two_decimals(self) -> None:
+        text = _format_fill_history_price(
+            OkxFillHistoryItem(
+                fill_time=1710000000200,
+                inst_id="BTC-USD-260327-80000-P",
+                inst_type="OPTION",
+                side="exercise",
+                pos_side=None,
+                fill_price=Decimal("68068.3972692822113241"),
+                fill_size=Decimal("50"),
+                fill_fee=Decimal("-0.0001"),
+                fee_currency="BTC",
+                pnl=Decimal("-0.00426901"),
+                order_id=None,
+                trade_id=None,
+                exec_type="行权/交割",
+                raw={},
+            )
+        )
+        self.assertEqual(text, "68068.40")
+
+    def test_fill_history_price_keeps_option_trade_precision(self) -> None:
+        text = _format_fill_history_price(
+            OkxFillHistoryItem(
+                fill_time=1710000000200,
+                inst_id="BTC-USD-260529-80000-C",
+                inst_type="OPTION",
+                side="sell",
+                pos_side="short",
+                fill_price=Decimal("0.0185"),
+                fill_size=Decimal("20"),
+                fill_fee=Decimal("-0.0001"),
+                fee_currency="BTC",
+                pnl=Decimal("-0.0005"),
+                order_id="2",
+                trade_id="22",
+                exec_type="M",
+                raw={},
+            )
+        )
+        self.assertEqual(text, "0.0185")
 
     def test_position_history_detail_formats_option_values_with_capped_decimals(self) -> None:
         detail = _build_position_history_detail_text(

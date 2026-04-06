@@ -8,8 +8,8 @@ from tkinter import BOTH, END, Canvas, DoubleVar, StringVar, Toplevel, simpledia
 from tkinter import messagebox, ttk
 from typing import Callable
 
-from okx_quant.models import Candle, Instrument
-from okx_quant.okx_client import OkxRestClient, OkxTicker
+from okx_quant.models import Candle, Credentials, Instrument
+from okx_quant.okx_client import OkxPosition, OkxRestClient, OkxTicker
 from okx_quant.option_strategy import (
     OptionChainRow,
     OptionQuote,
@@ -25,6 +25,8 @@ from okx_quant.option_strategy import (
     convert_candles_by_reference,
     convert_payoff_snapshot_to_usdt,
     evaluate_linear_formula,
+    estimate_leg_greeks,
+    estimate_strategy_greeks,
     format_option_expiry_label,
     infer_implied_volatility_for_leg,
     option_contract_value,
@@ -32,6 +34,7 @@ from okx_quant.option_strategy import (
     parse_option_contract,
     parse_option_expiry_datetime,
     resolve_strategy_leg,
+    shift_candles,
 )
 from okx_quant.persistence import load_option_strategies_snapshot, save_option_strategies_snapshot
 from okx_quant.pricing import decimal_places_for_increment, format_decimal, format_decimal_by_increment, format_decimal_fixed
@@ -39,9 +42,11 @@ from okx_quant.window_layout import apply_adaptive_window_geometry
 
 
 Logger = Callable[[str], None]
+RuntimeProvider = Callable[[], tuple[Credentials, str] | None]
 BAR_OPTIONS = ["1m", "3m", "5m", "15m", "1H", "4H"]
 DEFAULT_OPTION_FAMILY_OPTIONS = ("BTC-USD", "ETH-USD")
 MAX_OPTION_COMBO_CANDLES = 1200
+ALL_LEG_GROUP_KEY = "all"
 
 
 @dataclass(frozen=True)
@@ -81,8 +86,16 @@ class ComboChartHoverState:
 
 
 class OptionStrategyCalculatorWindow:
-    def __init__(self, parent, client: OkxRestClient, *, logger: Logger | None = None) -> None:
+    def __init__(
+        self,
+        parent,
+        client: OkxRestClient,
+        *,
+        runtime_provider: RuntimeProvider | None = None,
+        logger: Logger | None = None,
+    ) -> None:
         self.client = client
+        self.runtime_provider = runtime_provider
         self.logger = logger
 
         self.window = Toplevel(parent)
@@ -103,10 +116,12 @@ class OptionStrategyCalculatorWindow:
         self.saved_strategy_name = StringVar()
         self.option_family = StringVar()
         self.expiry_code = StringVar()
+        self.leg_group_scope = StringVar(value="全部到期日")
         self.default_quantity = StringVar(value="1")
         self.bar = StringVar(value="15m")
         self.candle_limit = StringVar(value="600")
         self.chart_display_ccy = StringVar(value="USDT")
+        self.combo_chart_mode = StringVar(value="价格K线")
         self.payoff_time_progress = DoubleVar(value=100.0)
         self.payoff_vol_shift_percent = DoubleVar(value=0.0)
         self.payoff_sim_date_text = StringVar(value="估值日 -")
@@ -115,12 +130,17 @@ class OptionStrategyCalculatorWindow:
         self.chain_selection_text = StringVar(value="选择一个行权价后，可把认购 / 认沽直接加入策略腿。")
         self.strategy_summary_text = StringVar(value="暂无策略腿。")
         self.payoff_summary_text = StringVar(value="加入策略腿后，可生成到期盈亏图。")
-        self.combo_summary_text = StringVar(value="组合 K 线采用 OKX 期权标记价格。")
+        self.combo_summary_text = StringVar(value="组合 K 线支持价格 / 持仓盈亏两种模式。")
+        self.chain_toggle_text = StringVar(value="折叠期权链")
+        self.legs_toggle_text = StringVar(value="折叠策略腿")
 
+        self._upper_pane: ttk.Panedwindow | None = None
         self._family_combo: ttk.Combobox | None = None
         self._expiry_combo: ttk.Combobox | None = None
         self._saved_strategy_combo: ttk.Combobox | None = None
+        self._leg_group_combo: ttk.Combobox | None = None
         self._chain_frame: ttk.LabelFrame | None = None
+        self._strategy_frame: ttk.LabelFrame | None = None
         self._chain_tree: ttk.Treeview | None = None
         self._legs_tree: ttk.Treeview | None = None
         self._payoff_canvas: Canvas | None = None
@@ -141,6 +161,7 @@ class OptionStrategyCalculatorWindow:
         self._latest_payoff_snapshot: StrategyPayoffSnapshot | None = None
         self._latest_expiry_payoff_snapshot: StrategyPayoffSnapshot | None = None
         self._latest_combo_value: Decimal | None = None
+        self._latest_combo_entry_value: Decimal | None = None
         self._latest_chart_formula = ""
         self._latest_resolved_legs: list[ResolvedStrategyLeg] = []
         self._latest_implied_volatility_by_alias: dict[str, Decimal] = {}
@@ -148,10 +169,16 @@ class OptionStrategyCalculatorWindow:
         self._latest_payoff_expiry_at: datetime | None = None
         self._payoff_hover_state: PayoffChartHoverState | None = None
         self._combo_hover_state: ComboChartHoverState | None = None
+        self._chain_collapsed = False
+        self._legs_collapsed = False
         self._did_initial_chain_refresh = False
         self._chain_request_id = 0
         self._chart_request_id = 0
         self._alias_counter = 0
+        self._current_leg_group_key = ALL_LEG_GROUP_KEY
+        self._leg_group_labels: dict[str, str] = {}
+        self._leg_group_keys_by_label: dict[str, str] = {}
+        self._leg_group_formula_overrides: dict[str, str] = {}
 
         self._load_saved_strategies()
         self._build_layout()
@@ -213,7 +240,7 @@ class OptionStrategyCalculatorWindow:
         market_panel.columnconfigure(1, weight=1)
         market_panel.columnconfigure(3, weight=1)
         ttk.Label(market_panel, text="期权链", font=("Microsoft YaHei UI", 10, "bold")).grid(
-            row=0, column=0, columnspan=5, sticky="w", pady=(0, 8)
+            row=0, column=0, columnspan=6, sticky="w", pady=(0, 8)
         )
         ttk.Label(market_panel, text="期权系列").grid(row=1, column=0, sticky="w")
         family_combo = ttk.Combobox(market_panel, textvariable=self.option_family, width=18)
@@ -228,6 +255,9 @@ class OptionStrategyCalculatorWindow:
         ttk.Button(market_panel, text="刷新期权链", width=14, command=self.refresh_chain).grid(
             row=1, column=4, sticky="e"
         )
+        ttk.Button(market_panel, text="导入到期持仓", width=14, command=self.import_current_expiry_positions).grid(
+            row=1, column=5, sticky="e", padx=(8, 0)
+        )
         ttk.Label(market_panel, text="默认数量").grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(market_panel, textvariable=self.default_quantity, width=12).grid(
             row=2, column=1, sticky="w", padx=(8, 14), pady=(8, 0)
@@ -237,6 +267,9 @@ class OptionStrategyCalculatorWindow:
             text="先选系列，再刷新后获取该系列全部到期日。",
             justify="left",
         ).grid(row=2, column=2, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Button(market_panel, text="导入系列持仓", width=14, command=self.import_current_family_positions).grid(
+            row=2, column=5, sticky="e", padx=(8, 0), pady=(8, 0)
+        )
 
         formula_panel = ttk.Frame(controls)
         formula_panel.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
@@ -254,6 +287,12 @@ class OptionStrategyCalculatorWindow:
         ttk.Button(formula_actions, text="刷新图表", width=12, command=self.refresh_charts).grid(
             row=0, column=1, sticky="ew", padx=(6, 0)
         )
+        ttk.Button(formula_actions, textvariable=self.chain_toggle_text, width=12, command=self.toggle_chain_panel).grid(
+            row=0, column=2, sticky="ew", padx=(6, 0)
+        )
+        ttk.Button(formula_actions, textvariable=self.legs_toggle_text, width=12, command=self.toggle_legs_panel).grid(
+            row=0, column=3, sticky="ew", padx=(6, 0)
+        )
         ttk.Label(
             formula_panel,
             text="公式支持线性表达式，例如 L1 - 2*L2 + 0.5；K 线周期和数量在“组合K线”页签切换。",
@@ -264,8 +303,9 @@ class OptionStrategyCalculatorWindow:
         body = ttk.Panedwindow(self.window, orient="vertical")
         body.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
 
-        upper = ttk.Panedwindow(body, orient="horizontal")
+        upper = ttk.Panedwindow(body, orient="vertical")
         body.add(upper, weight=3)
+        self._upper_pane = upper
 
         chain_frame = ttk.LabelFrame(upper, text="期权链", padding=12)
         chain_frame.columnconfigure(0, weight=1)
@@ -273,7 +313,7 @@ class OptionStrategyCalculatorWindow:
         upper.add(chain_frame, weight=5)
         self._chain_frame = chain_frame
 
-        ttk.Label(chain_frame, textvariable=self.chain_selection_text, justify="left", wraplength=720).grid(
+        ttk.Label(chain_frame, textvariable=self.chain_selection_text, justify="left", wraplength=1320).grid(
             row=0, column=0, sticky="w", pady=(0, 8)
         )
         chain_tree = ttk.Treeview(
@@ -317,18 +357,48 @@ class OptionStrategyCalculatorWindow:
             row=0, column=3, sticky="ew"
         )
 
-        strategy_frame = ttk.Frame(upper, padding=0)
+        strategy_frame = ttk.LabelFrame(upper, text="策略腿", padding=12)
         strategy_frame.columnconfigure(0, weight=1)
-        strategy_frame.rowconfigure(1, weight=1)
+        strategy_frame.rowconfigure(2, weight=1)
         upper.add(strategy_frame, weight=4)
+        self._strategy_frame = strategy_frame
 
-        ttk.Label(strategy_frame, textvariable=self.strategy_summary_text, justify="left", wraplength=620).grid(
-            row=0, column=0, sticky="w", pady=(0, 8)
+        group_bar = ttk.Frame(strategy_frame)
+        group_bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        group_bar.columnconfigure(1, weight=1)
+        ttk.Label(group_bar, text="鎸佷粨鍒嗙粍").grid(row=0, column=0, sticky="w")
+        leg_group_combo = ttk.Combobox(group_bar, textvariable=self.leg_group_scope, state="readonly", width=28)
+        leg_group_combo.grid(row=0, column=1, sticky="w", padx=(8, 12))
+        leg_group_combo.bind("<<ComboboxSelected>>", self._on_leg_group_selected)
+        self._leg_group_combo = leg_group_combo
+        ttk.Label(group_bar, text="鍒囨崲鍒嗙粍鍚庯紝琛ㄦ牸鍜屽浘琛ㄤ細鎸夊綋鍓嶅埌鏈熸棩璁＄畻銆?").grid(
+            row=0, column=2, sticky="w"
+        )
+
+        ttk.Label(strategy_frame, textvariable=self.strategy_summary_text, justify="left", wraplength=1320).grid(
+            row=1, column=0, sticky="w", pady=(0, 8)
         )
 
         legs_tree = ttk.Treeview(
             strategy_frame,
-            columns=("alias", "inst_id", "type", "expiry", "strike", "side", "qty", "mark", "contract", "premium_total"),
+            columns=(
+                "alias",
+                "inst_id",
+                "type",
+                "expiry",
+                "strike",
+                "side",
+                "qty",
+                "entry",
+                "mark",
+                "entry_usdt",
+                "mark_usdt",
+                "delta",
+                "gamma",
+                "theta",
+                "vega",
+                "pnl",
+            ),
             show="headings",
             selectmode="browse",
         )
@@ -340,22 +410,28 @@ class OptionStrategyCalculatorWindow:
             ("strike", "行权价", 92, "e"),
             ("side", "买卖", 64, "center"),
             ("qty", "数量", 70, "e"),
-            ("mark", "标记价", 90, "e"),
-            ("contract", "每张面值", 90, "e"),
-            ("premium_total", "权利金合计", 110, "e"),
+            ("entry", "持仓价", 90, "e"),
+            ("mark", "现价", 90, "e"),
+            ("entry_usdt", "持仓≈USDT", 104, "e"),
+            ("mark_usdt", "现价≈USDT", 104, "e"),
+            ("delta", "Delta", 86, "e"),
+            ("gamma", "Gamma", 86, "e"),
+            ("theta", "Theta", 86, "e"),
+            ("vega", "Vega", 86, "e"),
+            ("pnl", "浮盈亏", 110, "e"),
         ):
             legs_tree.heading(column, text=label)
             legs_tree.column(column, width=width, anchor=anchor)
-        legs_tree.grid(row=1, column=0, sticky="nsew")
+        legs_tree.grid(row=2, column=0, sticky="nsew")
         legs_tree.bind("<Double-1>", self._on_legs_tree_double_click)
         legs_scroll = ttk.Scrollbar(strategy_frame, orient="vertical", command=legs_tree.yview)
-        legs_scroll.grid(row=1, column=1, sticky="ns")
+        legs_scroll.grid(row=2, column=1, sticky="ns")
         legs_tree.configure(yscrollcommand=legs_scroll.set)
         self._legs_tree = legs_tree
 
         legs_actions = ttk.Frame(strategy_frame)
-        legs_actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        for column in range(4):
+        legs_actions.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        for column in range(5):
             legs_actions.columnconfigure(column, weight=1)
         ttk.Button(legs_actions, text="删除选中腿", command=self.remove_selected_leg).grid(
             row=0, column=0, sticky="ew", padx=(0, 8)
@@ -363,10 +439,13 @@ class OptionStrategyCalculatorWindow:
         ttk.Button(legs_actions, text="修改数量", command=self.edit_selected_leg_quantity).grid(
             row=0, column=1, sticky="ew", padx=(0, 8)
         )
-        ttk.Button(legs_actions, text="清空策略腿", command=self.clear_legs).grid(
+        ttk.Button(legs_actions, text="修改持仓价", command=self.edit_selected_leg_entry_price).grid(
             row=0, column=2, sticky="ew", padx=(0, 8)
         )
-        ttk.Button(legs_actions, text="刷新腿报价", command=self.refresh_leg_quotes).grid(row=0, column=3, sticky="ew")
+        ttk.Button(legs_actions, text="清空策略腿", command=self.clear_legs).grid(
+            row=0, column=3, sticky="ew", padx=(0, 8)
+        )
+        ttk.Button(legs_actions, text="刷新现价", command=self.refresh_leg_quotes).grid(row=0, column=4, sticky="ew")
 
         charts = ttk.Notebook(body)
         body.add(charts, weight=3)
@@ -424,7 +503,7 @@ class OptionStrategyCalculatorWindow:
         combo_tab.rowconfigure(2, weight=1)
         combo_toolbar = ttk.Frame(combo_tab)
         combo_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        combo_toolbar.columnconfigure(7, weight=1)
+        combo_toolbar.columnconfigure(9, weight=1)
         ttk.Label(combo_toolbar, text="K线周期").grid(row=0, column=0, sticky="w")
         combo_bar_combo = ttk.Combobox(combo_toolbar, textvariable=self.bar, values=BAR_OPTIONS, state="readonly", width=10)
         combo_bar_combo.grid(row=0, column=1, sticky="w", padx=(6, 14))
@@ -433,7 +512,17 @@ class OptionStrategyCalculatorWindow:
         combo_limit_entry = ttk.Entry(combo_toolbar, textvariable=self.candle_limit, width=10)
         combo_limit_entry.grid(row=0, column=3, sticky="w", padx=(6, 14))
         combo_limit_entry.bind("<Return>", lambda _event: self.refresh_combo_chart())
-        ttk.Label(combo_toolbar, text="图表币种").grid(row=0, column=4, sticky="w")
+        ttk.Label(combo_toolbar, text="图表模式").grid(row=0, column=4, sticky="w")
+        combo_mode_combo = ttk.Combobox(
+            combo_toolbar,
+            textvariable=self.combo_chart_mode,
+            values=("价格K线", "持仓盈亏K线"),
+            state="readonly",
+            width=10,
+        )
+        combo_mode_combo.grid(row=0, column=5, sticky="w", padx=(6, 14))
+        combo_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_chart_display(combo_only=True))
+        ttk.Label(combo_toolbar, text="图表币种").grid(row=0, column=6, sticky="w")
         combo_ccy_combo = ttk.Combobox(
             combo_toolbar,
             textvariable=self.chart_display_ccy,
@@ -441,10 +530,10 @@ class OptionStrategyCalculatorWindow:
             state="readonly",
             width=10,
         )
-        combo_ccy_combo.grid(row=0, column=5, sticky="w", padx=(6, 14))
+        combo_ccy_combo.grid(row=0, column=7, sticky="w", padx=(6, 14))
         combo_ccy_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_chart_display(combo_only=True))
-        ttk.Label(combo_toolbar, text="只影响组合K线").grid(row=0, column=6, sticky="w")
-        ttk.Button(combo_toolbar, text="刷新组合K线", command=self.refresh_combo_chart).grid(row=0, column=8, sticky="e")
+        ttk.Label(combo_toolbar, text="只影响组合K线").grid(row=0, column=8, sticky="w")
+        ttk.Button(combo_toolbar, text="刷新组合K线", command=self.refresh_combo_chart).grid(row=0, column=10, sticky="e")
         ttk.Label(combo_tab, textvariable=self.combo_summary_text, justify="left", wraplength=1040).grid(
             row=1, column=0, sticky="w", pady=(0, 8)
         )
@@ -455,12 +544,13 @@ class OptionStrategyCalculatorWindow:
         charts.add(combo_tab, text="组合K线")
         self._combo_canvas = combo_canvas
         self._update_chain_context_ui()
+        self._refresh_leg_group_options()
         self._update_payoff_simulation_labels()
 
         if self._payoff_canvas is not None:
             self._clear_canvas(self._payoff_canvas, "加入策略腿后，可生成到期盈亏图。")
         if self._combo_canvas is not None:
-            self._clear_canvas(self._combo_canvas, "组合 K 线使用期权标记价格；先加入策略腿再生成。")
+            self._clear_canvas(self._combo_canvas, "组合 K 线支持价格 / 持仓盈亏两种模式；先加入策略腿再生成。")
 
     def _load_saved_strategies(self) -> None:
         try:
@@ -547,6 +637,101 @@ class OptionStrategyCalculatorWindow:
             self.expiry_code.set("")
         self._update_chain_context_ui()
 
+    def _grouped_legs_by_expiry(self) -> dict[str, list[tuple[int, StrategyLegDefinition]]]:
+        groups: dict[str, list[tuple[int, StrategyLegDefinition]]] = {}
+        for index, leg in enumerate(self._legs):
+            try:
+                expiry_key = parse_option_contract(leg.inst_id).expiry_code
+            except Exception:
+                expiry_key = "-"
+            groups.setdefault(expiry_key, []).append((index, leg))
+        return {key: groups[key] for key in sorted(groups)}
+
+    def _build_leg_group_label(self, group_key: str, leg_count: int) -> str:
+        if group_key == ALL_LEG_GROUP_KEY:
+            return f"鍏ㄩ儴鍒版湡鏃? | {leg_count} 鏉¤吙"
+        if len(group_key) == 6 and group_key.isdigit():
+            return f"{group_key} ({format_option_expiry_label(group_key)}) | {leg_count} 鏉¤吙"
+        return f"{group_key or '-'} | {leg_count} 鏉¤吙"
+
+    def _refresh_leg_group_options(self, *, preferred_key: str | None = None) -> None:
+        groups = self._grouped_legs_by_expiry()
+        labels = {
+            ALL_LEG_GROUP_KEY: self._build_leg_group_label(ALL_LEG_GROUP_KEY, len(self._legs)),
+        }
+        for group_key, items in groups.items():
+            labels[group_key] = self._build_leg_group_label(group_key, len(items))
+        self._leg_group_labels = labels
+        self._leg_group_keys_by_label = {label: key for key, label in labels.items()}
+
+        selected_key = preferred_key or self._current_leg_group_key
+        if selected_key != ALL_LEG_GROUP_KEY and selected_key not in groups:
+            selected_key = ALL_LEG_GROUP_KEY
+        self._current_leg_group_key = selected_key
+
+        values = [labels[ALL_LEG_GROUP_KEY], *[labels[key] for key in groups]]
+        if self._leg_group_combo is not None:
+            self._leg_group_combo.configure(values=values, state="readonly")
+        self.leg_group_scope.set(labels.get(selected_key, labels[ALL_LEG_GROUP_KEY]))
+
+    def _selected_leg_group_key(self) -> str:
+        return self._leg_group_keys_by_label.get(self.leg_group_scope.get().strip(), ALL_LEG_GROUP_KEY)
+
+    def _active_leg_group_key(self) -> str:
+        groups = self._grouped_legs_by_expiry()
+        if self._current_leg_group_key != ALL_LEG_GROUP_KEY and self._current_leg_group_key not in groups:
+            return ALL_LEG_GROUP_KEY
+        return self._current_leg_group_key
+
+    def _current_leg_group_label(self) -> str:
+        group_key = self._active_leg_group_key()
+        label = self._leg_group_labels.get(group_key)
+        if label:
+            return label
+        return self._build_leg_group_label(group_key, len(self._legs_for_group(group_key)))
+
+    def _leg_items_for_group(self, group_key: str | None = None) -> list[tuple[int, StrategyLegDefinition]]:
+        active_key = self._active_leg_group_key() if group_key is None else group_key
+        if active_key == ALL_LEG_GROUP_KEY:
+            return list(enumerate(self._legs))
+        return list(self._grouped_legs_by_expiry().get(active_key, ()))
+
+    def _legs_for_group(self, group_key: str | None = None) -> list[StrategyLegDefinition]:
+        return [leg for _, leg in self._leg_items_for_group(group_key)]
+
+    def _active_legs(self) -> list[StrategyLegDefinition]:
+        return self._legs_for_group(self._active_leg_group_key())
+
+    def _remember_group_formula(self, group_key: str | None = None) -> None:
+        active_key = self._active_leg_group_key() if group_key is None else group_key
+        formula = self.formula.get().strip()
+        if formula:
+            self._leg_group_formula_overrides[active_key] = formula
+        else:
+            self._leg_group_formula_overrides.pop(active_key, None)
+
+    def _apply_formula_for_group(self, group_key: str | None = None) -> None:
+        active_key = self._active_leg_group_key() if group_key is None else group_key
+        default_formula = build_default_formula(self._legs_for_group(active_key))
+        formula = self._leg_group_formula_overrides.get(active_key, default_formula)
+        self.formula.set(formula or default_formula)
+
+    def _on_leg_group_selected(self, _event=None) -> None:
+        next_group_key = self._selected_leg_group_key()
+        current_group_key = self._active_leg_group_key()
+        if next_group_key == current_group_key:
+            return
+        self._remember_group_formula(current_group_key)
+        self._current_leg_group_key = next_group_key
+        self._apply_formula_for_group(next_group_key)
+        self._render_legs()
+        self._refresh_strategy_summary()
+        if self._legs_for_group(next_group_key):
+            self.status_text.set(f"Switched leg group: {self._current_leg_group_label()}")
+            self.refresh_charts()
+            return
+        self.status_text.set("Current leg group has no strategy legs.")
+
     def refresh_chain(self) -> None:
         family = self.option_family.get().strip().upper()
         if not family:
@@ -594,7 +779,7 @@ class OptionStrategyCalculatorWindow:
                 ),
             )
         except Exception as exc:  # noqa: BLE001
-            self.window.after(0, lambda: self._show_chain_error(request_id, exc))
+            self.window.after(0, lambda error=exc: self._show_chain_error(request_id, error))
 
     def _apply_chain_snapshot(
         self,
@@ -638,6 +823,205 @@ class OptionStrategyCalculatorWindow:
             return
         self.status_text.set("期权链加载失败")
         messagebox.showerror("期权链加载失败", str(exc), parent=self.window)
+
+    def import_current_expiry_positions(self) -> None:
+        self._start_account_positions_import(scope="expiry")
+
+    def import_current_family_positions(self) -> None:
+        self._start_account_positions_import(scope="family")
+
+    def _start_account_positions_import(self, *, scope: str) -> None:
+        family = self.option_family.get().strip().upper()
+        expiry = self._selected_expiry_code()
+        if not family:
+            messagebox.showerror("导入持仓失败", "请先选择期权系列。", parent=self.window)
+            return
+        if scope == "expiry" and not expiry:
+            messagebox.showerror("导入持仓失败", "请先选择期权系列和到期日。", parent=self.window)
+            return
+        if self.runtime_provider is None:
+            messagebox.showerror("导入持仓失败", "当前窗口未接入账户环境，无法读取真实仓位。", parent=self.window)
+            return
+        runtime = self.runtime_provider()
+        if runtime is None:
+            messagebox.showerror("导入持仓失败", "当前未配置可用 API 凭证。", parent=self.window)
+            return
+        if self._legs:
+            confirmed = messagebox.askyesno(
+                "导入当前账户持仓",
+                "导入真实仓位会覆盖现有策略腿，是否继续？",
+                parent=self.window,
+            )
+            if not confirmed:
+                return
+        credentials, environment = runtime
+        scope_label = f"{family} {expiry}" if scope == "expiry" else family
+        self.status_text.set(f"正在导入 {scope_label} 的当前账户期权持仓...")
+        threading.Thread(
+            target=self._import_account_positions_worker,
+            args=(credentials, environment, family, expiry, scope),
+            daemon=True,
+        ).start()
+
+    def _import_account_positions_worker(
+        self,
+        credentials: Credentials,
+        environment: str,
+        family: str,
+        expiry: str,
+        scope: str,
+    ) -> None:
+        try:
+            positions, effective_environment = self._load_option_positions_for_runtime(credentials, environment)
+            self.window.after(
+                0,
+                lambda: self._apply_imported_positions(
+                    family=family,
+                    expiry=expiry,
+                    scope=scope,
+                    positions=positions,
+                    effective_environment=effective_environment,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.window.after(0, lambda error=exc: messagebox.showerror("导入持仓失败", str(error), parent=self.window))
+
+    def _load_option_positions_for_runtime(
+        self,
+        credentials: Credentials,
+        environment: str,
+    ) -> tuple[list[OkxPosition], str]:
+        try:
+            positions = self.client.get_positions(credentials, environment=environment, inst_type="OPTION")
+            return positions, environment
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            if "50101" in message and "current environment" in message:
+                alternate = "live" if environment == "demo" else "demo"
+                positions = self.client.get_positions(credentials, environment=alternate, inst_type="OPTION")
+                return positions, alternate
+            raise
+
+    def _apply_imported_positions(
+        self,
+        *,
+        family: str,
+        expiry: str,
+        scope: str,
+        positions: list[OkxPosition],
+        effective_environment: str,
+    ) -> None:
+        imported_legs: list[StrategyLegDefinition] = []
+        imported_inst_ids: list[str] = []
+        next_alias_index = 0
+        for position in positions:
+            if position.inst_type != "OPTION":
+                continue
+            try:
+                parsed = parse_option_contract(position.inst_id)
+            except Exception:
+                continue
+            if parsed.inst_family != family:
+                continue
+            if scope == "expiry" and parsed.expiry_code != expiry:
+                continue
+            quantity = abs(position.position)
+            if quantity <= 0:
+                continue
+            next_alias_index += 1
+            imported_legs.append(
+                StrategyLegDefinition(
+                    alias=f"L{next_alias_index}",
+                    inst_id=position.inst_id,
+                    side=_option_position_side(position),
+                    quantity=quantity,
+                    premium=position.avg_price or position.mark_price or position.last_price,
+                    delta=position.delta,
+                    gamma=position.gamma,
+                    theta=position.theta,
+                    vega=position.vega,
+                    enabled=True,
+                )
+            )
+            imported_inst_ids.append(position.inst_id)
+
+        if not imported_legs:
+            env_label = "实盘" if effective_environment == "live" else "模拟盘"
+            scope_label = f"{family} {expiry}" if scope == "expiry" else family
+            messagebox.showinfo(
+                "导入当前账户持仓",
+                f"当前 {env_label} 账户里没有 {scope_label} 的非零期权持仓。",
+                parent=self.window,
+            )
+            self.status_text.set(f"{scope_label} 当前没有可导入的账户持仓。")
+            return
+
+        self._legs = imported_legs
+        self._alias_counter = len(imported_legs)
+        self._leg_group_formula_overrides.clear()
+        self._reset_chart_state_for_import()
+        for inst_id in imported_inst_ids:
+            try:
+                self._instrument_map[inst_id] = self._instrument_map.get(inst_id) or self.client.get_instrument(inst_id)
+            except Exception:
+                continue
+        imported_groups = self._grouped_legs_by_expiry()
+        preferred_group_key = expiry if expiry and expiry in imported_groups else ALL_LEG_GROUP_KEY
+        self._refresh_leg_group_options(preferred_key=preferred_group_key)
+        self._apply_formula_for_group(preferred_group_key)
+        self._render_legs()
+        self._refresh_strategy_summary()
+        env_label = "实盘" if effective_environment == "live" else "模拟盘"
+        scope_label = f"{family} {expiry}" if scope == "expiry" else family
+        self.status_text.set(f"已导入 {len(imported_legs)} 条 {scope_label} {env_label} 持仓。")
+        self.refresh_charts()
+
+    def _reset_chart_state_for_import(self) -> None:
+        self._latest_payoff_snapshot = None
+        self._latest_expiry_payoff_snapshot = None
+        self._latest_combo_candles = []
+        self._latest_combo_value = None
+        self._latest_combo_entry_value = None
+        self._latest_chart_formula = ""
+        self._latest_resolved_legs = []
+        self._latest_implied_volatility_by_alias = {}
+        self._latest_payoff_loaded_at = None
+        self._latest_payoff_expiry_at = None
+        self._reset_payoff_simulation_controls()
+
+    def toggle_chain_panel(self) -> None:
+        pane = self._upper_pane
+        frame = self._chain_frame
+        if pane is None or frame is None:
+            return
+        if self._chain_collapsed:
+            current_panes = list(pane.panes())
+            frame_id = str(frame)
+            if frame_id not in current_panes:
+                if current_panes:
+                    pane.insert(0, frame, weight=5)
+                else:
+                    pane.add(frame, weight=5)
+            self._chain_collapsed = False
+            self.chain_toggle_text.set("折叠期权链")
+        else:
+            pane.forget(frame)
+            self._chain_collapsed = True
+            self.chain_toggle_text.set("展开期权链")
+
+    def toggle_legs_panel(self) -> None:
+        pane = self._upper_pane
+        frame = self._strategy_frame
+        if pane is None or frame is None:
+            return
+        if self._legs_collapsed:
+            pane.add(frame, weight=4)
+            self._legs_collapsed = False
+            self.legs_toggle_text.set("折叠策略腿")
+        else:
+            pane.forget(frame)
+            self._legs_collapsed = True
+            self.legs_toggle_text.set("展开策略腿")
 
     def _render_chain_rows(self) -> None:
         if self._chain_tree is None:
@@ -710,11 +1094,14 @@ class OptionStrategyCalculatorWindow:
             return
         row_id = self._legs_tree.identify_row(event.y)
         column_id = self._legs_tree.identify_column(event.x)
-        if not row_id or column_id != "#7":
+        if not row_id or column_id not in {"#7", "#8"}:
             return
         self._legs_tree.selection_set(row_id)
         self._legs_tree.focus(row_id)
-        self.edit_selected_leg_quantity()
+        if column_id == "#7":
+            self.edit_selected_leg_quantity()
+        else:
+            self.edit_selected_leg_entry_price()
 
     def add_selected_chain_leg(self, option_type: str, side: str) -> None:
         row = self._selected_chain_row()
@@ -730,6 +1117,8 @@ class OptionStrategyCalculatorWindow:
         except Exception as exc:
             messagebox.showerror("数量错误", str(exc), parent=self.window)
             return
+        current_group_key = self._active_leg_group_key()
+        previous_default_formula = build_default_formula(self._legs_for_group(current_group_key))
         self._alias_counter += 1
         alias = f"L{self._alias_counter}"
         leg = StrategyLegDefinition(
@@ -740,12 +1129,21 @@ class OptionStrategyCalculatorWindow:
             premium=quote.reference_price,
             enabled=True,
         )
+        leg_expiry_code = parse_option_contract(quote.instrument.inst_id).expiry_code
+        if current_group_key not in {ALL_LEG_GROUP_KEY, leg_expiry_code}:
+            self._remember_group_formula(current_group_key)
         self._legs.append(leg)
         self._instrument_map[quote.instrument.inst_id] = quote.instrument
         if quote.reference_price is not None:
             self._quotes_by_inst_id[quote.instrument.inst_id] = quote
-        if not self.formula.get().strip():
-            self.formula.set(build_default_formula(self._legs))
+        preferred_group_key = (
+            current_group_key if current_group_key in {ALL_LEG_GROUP_KEY, leg_expiry_code} else leg_expiry_code
+        )
+        self._refresh_leg_group_options(preferred_key=preferred_group_key)
+        if preferred_group_key != current_group_key:
+            self._apply_formula_for_group(preferred_group_key)
+        else:
+            self._sync_default_formula_if_applicable(previous_default_formula)
         self._render_legs()
         self._refresh_strategy_summary()
 
@@ -756,7 +1154,14 @@ class OptionStrategyCalculatorWindow:
             return
         if index < 0 or index >= len(self._legs):
             return
+        current_group_key = self._active_leg_group_key()
+        previous_default_formula = build_default_formula(self._legs_for_group(current_group_key))
         self._legs.pop(index)
+        self._refresh_leg_group_options(preferred_key=current_group_key)
+        if current_group_key == self._active_leg_group_key():
+            self._sync_default_formula_if_applicable(previous_default_formula)
+        else:
+            self._apply_formula_for_group(self._active_leg_group_key())
         self._render_legs()
         self._refresh_strategy_summary()
 
@@ -769,7 +1174,8 @@ class OptionStrategyCalculatorWindow:
             return
 
         leg = self._legs[index]
-        old_default_formula = build_default_formula(self._legs)
+        current_group_key = self._active_leg_group_key()
+        old_default_formula = build_default_formula(self._legs_for_group(current_group_key))
         response = simpledialog.askstring(
             "修改数量",
             f"请输入 {leg.alias} 的新数量：",
@@ -786,18 +1192,62 @@ class OptionStrategyCalculatorWindow:
 
         leg.quantity = quantity
         if self.formula.get().strip() == old_default_formula:
-            self.formula.set(build_default_formula(self._legs))
+            self.formula.set(build_default_formula(self._legs_for_group(current_group_key)))
+        self._remember_group_formula(current_group_key)
+        self._render_legs()
+        self._refresh_strategy_summary()
+        if self._latest_payoff_snapshot is not None or self._latest_combo_candles:
+            self.refresh_charts()
+
+    def edit_selected_leg_entry_price(self) -> None:
+        index = self._selected_leg_index()
+        if index is None:
+            messagebox.showinfo("修改持仓价", "请先选择一条策略腿。", parent=self.window)
+            return
+        if index < 0 or index >= len(self._legs):
+            return
+
+        leg = self._legs[index]
+        instrument = self._instrument_map.get(leg.inst_id)
+        initial_value = (
+            _format_price(leg.premium, instrument.tick_size if instrument is not None else None)
+            if leg.premium is not None
+            else ""
+        )
+        response = simpledialog.askstring(
+            "修改持仓价",
+            f"请输入 {leg.alias} 的持仓价：",
+            initialvalue=initial_value,
+            parent=self.window,
+        )
+        if response is None:
+            return
+        try:
+            premium = self._parse_positive_decimal(response, "持仓价")
+        except Exception as exc:
+            messagebox.showerror("修改持仓价失败", str(exc), parent=self.window)
+            return
+
+        leg.premium = premium
+        self._remember_group_formula()
         self._render_legs()
         self._refresh_strategy_summary()
         if self._latest_payoff_snapshot is not None or self._latest_combo_candles:
             self.refresh_charts()
 
     def clear_legs(self) -> None:
+        previous_default_formula = build_default_formula(self._active_legs())
         self._legs.clear()
+        self._leg_group_formula_overrides.clear()
+        self._current_leg_group_key = ALL_LEG_GROUP_KEY
+        current_formula = self.formula.get().strip()
+        if not current_formula or current_formula == previous_default_formula:
+            self.formula.set("")
         self._latest_payoff_snapshot = None
         self._latest_expiry_payoff_snapshot = None
         self._latest_combo_candles = []
         self._latest_combo_value = None
+        self._latest_combo_entry_value = None
         self._latest_spot_usdt_price = None
         self._latest_spot_usdt_candles = []
         self._latest_chart_formula = ""
@@ -806,25 +1256,67 @@ class OptionStrategyCalculatorWindow:
         self._latest_payoff_loaded_at = None
         self._latest_payoff_expiry_at = None
         self._reset_payoff_simulation_controls()
+        self._refresh_leg_group_options(preferred_key=ALL_LEG_GROUP_KEY)
         self._render_legs()
         self._refresh_strategy_summary()
         if self._payoff_canvas is not None:
             self._clear_canvas(self._payoff_canvas, "加入策略腿后，可生成到期盈亏图。")
         if self._combo_canvas is not None:
-            self._clear_canvas(self._combo_canvas, "组合 K 线使用期权标记价格；先加入策略腿再生成。")
+            self._clear_canvas(self._combo_canvas, "组合 K 线支持价格 / 持仓盈亏两种模式；先加入策略腿再生成。")
         self.payoff_summary_text.set("加入策略腿后，可生成到期盈亏图。")
-        self.combo_summary_text.set("组合 K 线采用 OKX 期权标记价格。")
+        self.combo_summary_text.set("组合 K 线支持价格 / 持仓盈亏两种模式。")
+
+    def _sync_default_formula_if_applicable(self, previous_default_formula: str) -> None:
+        current_formula = self.formula.get().strip()
+        if not current_formula or current_formula == previous_default_formula:
+            self.formula.set(build_default_formula(self._active_legs()))
+        self._remember_group_formula()
+
+    def _estimated_leg_greeks_by_alias(self) -> dict[str, dict[str, Decimal]]:
+        if (
+            not self._latest_resolved_legs
+            or not self._latest_implied_volatility_by_alias
+            or self._latest_payoff_loaded_at is None
+            or self._current_underlying_price is None
+        ):
+            return {}
+        estimated: dict[str, dict[str, Decimal]] = {}
+        for leg in self._latest_resolved_legs:
+            try:
+                estimated[leg.alias] = estimate_leg_greeks(
+                    leg,
+                    settlement_price=self._current_underlying_price,
+                    valuation_time=self._latest_payoff_loaded_at,
+                    base_implied_volatility=self._latest_implied_volatility_by_alias.get(leg.alias),
+                )
+            except Exception:
+                continue
+        return estimated
 
     def _render_legs(self) -> None:
         if self._legs_tree is None:
             return
         self._legs_tree.delete(*self._legs_tree.get_children())
-        for index, leg in enumerate(self._legs):
+        estimated_greeks_by_alias = self._estimated_leg_greeks_by_alias()
+        for index, leg in self._leg_items_for_group():
             instrument = self._instrument_map.get(leg.inst_id)
             parsed = parse_option_contract(leg.inst_id)
-            premium = leg.premium
+            entry_price = leg.premium
+            latest_quote = self._quotes_by_inst_id.get(leg.inst_id)
+            mark_price = latest_quote.reference_price if latest_quote is not None else None
+            current_underlying_price = self._current_underlying_price
+            entry_usdt = entry_price * current_underlying_price if entry_price is not None and current_underlying_price is not None else None
+            mark_usdt = mark_price * current_underlying_price if mark_price is not None and current_underlying_price is not None else None
             contract_value = option_contract_value(instrument) if instrument is not None else Decimal("1")
-            premium_total = premium * contract_value * leg.quantity if premium is not None else None
+            floating_pnl: Decimal | None = None
+            if entry_price is not None and mark_price is not None:
+                direction = Decimal("1") if leg.side == "buy" else Decimal("-1")
+                floating_pnl = direction * (mark_price - entry_price) * contract_value * leg.quantity
+            estimated_greeks = estimated_greeks_by_alias.get(leg.alias, {})
+            delta_value = leg.delta if leg.delta is not None else estimated_greeks.get("delta")
+            gamma_value = leg.gamma if leg.gamma is not None else estimated_greeks.get("gamma")
+            theta_value = leg.theta if leg.theta is not None else estimated_greeks.get("theta")
+            vega_value = leg.vega if leg.vega is not None else estimated_greeks.get("vega")
             self._legs_tree.insert(
                 "",
                 END,
@@ -837,21 +1329,28 @@ class OptionStrategyCalculatorWindow:
                     format_decimal(parsed.strike),
                     "买入" if leg.side == "buy" else "卖出",
                     format_decimal(leg.quantity),
-                    _format_price(premium, instrument.tick_size if instrument is not None else None),
-                    format_decimal(contract_value),
-                    format_decimal(premium_total) if premium_total is not None else "-",
+                    _format_price(entry_price, instrument.tick_size if instrument is not None else None),
+                    _format_price(mark_price, instrument.tick_size if instrument is not None else None),
+                    _format_compact_number(entry_usdt) if entry_usdt is not None else "-",
+                    _format_compact_number(mark_usdt) if mark_usdt is not None else "-",
+                    _format_compact_number(delta_value) if delta_value is not None else "-",
+                    _format_compact_number(gamma_value) if gamma_value is not None else "-",
+                    _format_compact_number(theta_value) if theta_value is not None else "-",
+                    _format_compact_number(vega_value) if vega_value is not None else "-",
+                    format_decimal(floating_pnl) if floating_pnl is not None else "-",
                 ),
             )
 
     def use_default_formula(self) -> None:
-        self.formula.set(build_default_formula(self._legs))
+        self.formula.set(build_default_formula(self._active_legs()))
+        self._remember_group_formula()
         self._refresh_strategy_summary()
 
     def refresh_leg_quotes(self) -> None:
         if not self._legs:
-            messagebox.showinfo("刷新腿报价", "当前没有策略腿。", parent=self.window)
+            messagebox.showinfo("刷新现价", "当前没有策略腿。", parent=self.window)
             return
-        self.status_text.set("正在刷新策略腿报价...")
+        self.status_text.set("正在刷新策略腿现价...")
         threading.Thread(target=self._refresh_leg_quotes_worker, daemon=True).start()
 
     def _refresh_leg_quotes_worker(self) -> None:
@@ -864,26 +1363,24 @@ class OptionStrategyCalculatorWindow:
                 refreshed.append((leg.inst_id, quote.reference_price, instrument, quote))
             self.window.after(0, lambda: self._apply_refreshed_leg_quotes(refreshed))
         except Exception as exc:  # noqa: BLE001
-            self.window.after(0, lambda: messagebox.showerror("刷新腿报价失败", str(exc), parent=self.window))
+            self.window.after(0, lambda error=exc: messagebox.showerror("刷新现价失败", str(error), parent=self.window))
 
     def _apply_refreshed_leg_quotes(
         self,
         refreshed: list[tuple[str, Decimal | None, Instrument, OptionQuote]],
     ) -> None:
-        for inst_id, premium, instrument, quote in refreshed:
+        for inst_id, _premium, instrument, quote in refreshed:
             self._instrument_map[inst_id] = instrument
             self._quotes_by_inst_id[inst_id] = quote
-            for leg in self._legs:
-                if leg.inst_id == inst_id:
-                    leg.premium = premium
             if self._current_underlying_price is None and quote.index_price is not None:
                 self._current_underlying_price = quote.index_price
         self._render_legs()
         self._refresh_strategy_summary()
-        self.status_text.set("策略腿报价已刷新。")
+        self.status_text.set("策略腿现价已刷新。")
 
     def refresh_charts(self) -> None:
-        if not self._legs:
+        active_legs = [StrategyLegDefinition(**leg.__dict__) for leg in self._active_legs() if leg.enabled]
+        if not active_legs:
             messagebox.showinfo("刷新图表", "请先至少加入一条策略腿。", parent=self.window)
             return
         try:
@@ -898,8 +1395,8 @@ class OptionStrategyCalculatorWindow:
                 parent=self.window,
             )
             return
-        aliases = {item.alias for item in self._legs if item.alias.strip()}
-        formula = self.formula.get().strip() or build_default_formula(self._legs)
+        aliases = {item.alias for item in active_legs if item.alias.strip()}
+        formula = self.formula.get().strip() or build_default_formula(active_legs)
         if not formula:
             messagebox.showerror("图表参数错误", "请先加入有效策略腿，再生成组合公式。", parent=self.window)
             return
@@ -909,17 +1406,19 @@ class OptionStrategyCalculatorWindow:
             messagebox.showerror("组合公式错误", str(exc), parent=self.window)
             return
 
+        self._remember_group_formula()
         self._chart_request_id += 1
         request_id = self._chart_request_id
         self.status_text.set("正在生成到期盈亏图和组合 K 线...")
         threading.Thread(
             target=self._load_chart_worker,
-            args=(request_id, candle_limit, formula),
+            args=(request_id, candle_limit, formula, active_legs),
             daemon=True,
         ).start()
 
     def refresh_combo_chart(self, *, silent: bool = False) -> None:
-        if not self._legs:
+        active_legs = [StrategyLegDefinition(**leg.__dict__) for leg in self._active_legs() if leg.enabled]
+        if not active_legs:
             if not silent:
                 messagebox.showinfo("刷新组合K线", "请先至少加入一条策略腿。", parent=self.window)
             return
@@ -937,8 +1436,8 @@ class OptionStrategyCalculatorWindow:
                     parent=self.window,
                 )
             return
-        aliases = {item.alias for item in self._legs if item.alias.strip()}
-        formula = self.formula.get().strip() or build_default_formula(self._legs)
+        aliases = {item.alias for item in active_legs if item.alias.strip()}
+        formula = self.formula.get().strip() or build_default_formula(active_legs)
         if not formula:
             if not silent:
                 messagebox.showerror("图表参数错误", "请先加入有效策略腿，再生成组合公式。", parent=self.window)
@@ -950,18 +1449,24 @@ class OptionStrategyCalculatorWindow:
                 messagebox.showerror("组合公式错误", str(exc), parent=self.window)
             return
 
+        self._remember_group_formula()
         self._chart_request_id += 1
         request_id = self._chart_request_id
         self.status_text.set("正在刷新组合 K 线...")
         threading.Thread(
             target=self._load_combo_chart_worker,
-            args=(request_id, candle_limit, formula),
+            args=(request_id, candle_limit, formula, active_legs),
             daemon=True,
         ).start()
 
-    def _load_chart_worker(self, request_id: int, candle_limit: int, formula: str) -> None:
+    def _load_chart_worker(
+        self,
+        request_id: int,
+        candle_limit: int,
+        formula: str,
+        active_legs: list[StrategyLegDefinition],
+    ) -> None:
         try:
-            active_legs = [StrategyLegDefinition(**leg.__dict__) for leg in self._legs if leg.enabled]
             if not active_legs:
                 raise ValueError("请先启用至少一条策略腿。")
 
@@ -982,7 +1487,6 @@ class OptionStrategyCalculatorWindow:
                 latest_quotes[leg.inst_id] = quote
                 if quote.reference_price is None:
                     raise ValueError(f"{leg.inst_id} 当前缺少标记价 / 最新价，无法计算。")
-                leg.premium = quote.reference_price
                 if current_underlying_price is None and quote.index_price is not None:
                     current_underlying_price = quote.index_price
                 resolved_legs.append(resolve_strategy_leg(leg, instrument))
@@ -1007,6 +1511,7 @@ class OptionStrategyCalculatorWindow:
                         leg,
                         settlement_price=current_underlying_price,
                         valuation_time=payoff_loaded_at,
+                        option_price=latest_quotes[leg.inst_id].reference_price,
                     )
                     if current_underlying_price is not None
                     else None
@@ -1021,12 +1526,17 @@ class OptionStrategyCalculatorWindow:
                 leg.alias: latest_quotes[leg.inst_id].reference_price or Decimal("0")
                 for leg in active_legs
             }
+            entry_values = {
+                leg.alias: (leg.premium if leg.premium is not None else Decimal("0"))
+                for leg in active_legs
+            }
             combo_candles = build_composite_candles(
                 formula,
                 candles_by_alias,
                 allowed_names=set(latest_values.keys()),
             )
             combo_last = evaluate_linear_formula(formula, latest_values, allowed_names=set(latest_values.keys()))
+            combo_entry_value = evaluate_linear_formula(formula, entry_values, allowed_names=set(entry_values.keys()))
             self.window.after(
                 0,
                 lambda: self._apply_chart_snapshot(
@@ -1035,6 +1545,7 @@ class OptionStrategyCalculatorWindow:
                     payoff_snapshot=payoff_snapshot,
                     latest_quotes=latest_quotes,
                     latest_combo_value=combo_last,
+                    latest_combo_entry_value=combo_entry_value,
                     spot_usdt_price=spot_usdt_price,
                     spot_usdt_candles=spot_usdt_candles,
                     formula=formula,
@@ -1045,11 +1556,16 @@ class OptionStrategyCalculatorWindow:
                 ),
             )
         except Exception as exc:  # noqa: BLE001
-            self.window.after(0, lambda: self._show_chart_error(request_id, exc))
+            self.window.after(0, lambda error=exc: self._show_chart_error(request_id, error))
 
-    def _load_combo_chart_worker(self, request_id: int, candle_limit: int, formula: str) -> None:
+    def _load_combo_chart_worker(
+        self,
+        request_id: int,
+        candle_limit: int,
+        formula: str,
+        active_legs: list[StrategyLegDefinition],
+    ) -> None:
         try:
-            active_legs = [StrategyLegDefinition(**leg.__dict__) for leg in self._legs if leg.enabled]
             if not active_legs:
                 raise ValueError("请先启用至少一条策略腿。")
 
@@ -1064,7 +1580,6 @@ class OptionStrategyCalculatorWindow:
                 latest_quotes[leg.inst_id] = quote
                 if quote.reference_price is None:
                     raise ValueError(f"{leg.inst_id} 当前缺少标记价 / 最新价，无法计算。")
-                leg.premium = quote.reference_price
                 if current_underlying_price is None and quote.index_price is not None:
                     current_underlying_price = quote.index_price
                 candles = self.client.get_mark_price_candles(leg.inst_id, self.bar.get().strip(), limit=candle_limit)
@@ -1080,6 +1595,13 @@ class OptionStrategyCalculatorWindow:
                 allowed_names=set(latest_values.keys()),
             )
             combo_last = evaluate_linear_formula(formula, latest_values, allowed_names=set(latest_values.keys()))
+            combo_entry_value: Decimal | None = None
+            if all(leg.premium is not None for leg in active_legs):
+                entry_values = {
+                    leg.alias: (leg.premium if leg.premium is not None else Decimal("0"))
+                    for leg in active_legs
+                }
+                combo_entry_value = evaluate_linear_formula(formula, entry_values, allowed_names=set(entry_values.keys()))
             spot_usdt_price, spot_usdt_candles = self._load_usdt_reference_context(
                 active_legs,
                 bar=self.bar.get().strip(),
@@ -1092,6 +1614,7 @@ class OptionStrategyCalculatorWindow:
                     combo_candles=combo_candles,
                     latest_quotes=latest_quotes,
                     latest_combo_value=combo_last,
+                    latest_combo_entry_value=combo_entry_value,
                     spot_usdt_price=spot_usdt_price,
                     spot_usdt_candles=spot_usdt_candles,
                     formula=formula,
@@ -1099,7 +1622,7 @@ class OptionStrategyCalculatorWindow:
                 ),
             )
         except Exception as exc:  # noqa: BLE001
-            self.window.after(0, lambda: self._show_chart_error(request_id, exc))
+            self.window.after(0, lambda error=exc: self._show_chart_error(request_id, error))
 
     def _apply_chart_snapshot(
         self,
@@ -1109,6 +1632,7 @@ class OptionStrategyCalculatorWindow:
         payoff_snapshot: StrategyPayoffSnapshot,
         latest_quotes: dict[str, OptionQuote],
         latest_combo_value: Decimal,
+        latest_combo_entry_value: Decimal,
         spot_usdt_price: Decimal | None,
         spot_usdt_candles: list[Candle],
         formula: str,
@@ -1123,6 +1647,7 @@ class OptionStrategyCalculatorWindow:
         self._latest_expiry_payoff_snapshot = payoff_snapshot
         self._latest_payoff_snapshot = payoff_snapshot
         self._latest_combo_value = latest_combo_value
+        self._latest_combo_entry_value = latest_combo_entry_value
         self._latest_spot_usdt_price = spot_usdt_price or current_underlying_price
         self._latest_spot_usdt_candles = list(spot_usdt_candles)
         self._latest_chart_formula = formula
@@ -1137,9 +1662,6 @@ class OptionStrategyCalculatorWindow:
         self._current_underlying_price = current_underlying_price
         for inst_id, quote in latest_quotes.items():
             self._quotes_by_inst_id[inst_id] = quote
-            for leg in self._legs:
-                if leg.inst_id == inst_id:
-                    leg.premium = quote.reference_price
         self._render_legs()
         self._refresh_strategy_summary()
         self._refresh_payoff_simulation()
@@ -1153,6 +1675,7 @@ class OptionStrategyCalculatorWindow:
         combo_candles: list[Candle],
         latest_quotes: dict[str, OptionQuote],
         latest_combo_value: Decimal,
+        latest_combo_entry_value: Decimal | None,
         spot_usdt_price: Decimal | None,
         spot_usdt_candles: list[Candle],
         formula: str,
@@ -1162,15 +1685,13 @@ class OptionStrategyCalculatorWindow:
             return
         self._latest_combo_candles = combo_candles
         self._latest_combo_value = latest_combo_value
+        self._latest_combo_entry_value = latest_combo_entry_value
         self._latest_spot_usdt_price = spot_usdt_price or current_underlying_price
         self._latest_spot_usdt_candles = list(spot_usdt_candles)
         self._latest_chart_formula = formula
         self._current_underlying_price = current_underlying_price
         for inst_id, quote in latest_quotes.items():
             self._quotes_by_inst_id[inst_id] = quote
-            for leg in self._legs:
-                if leg.inst_id == inst_id:
-                    leg.premium = quote.reference_price
         self._render_legs()
         self._refresh_strategy_summary()
         self._refresh_chart_display(combo_only=True)
@@ -1250,7 +1771,8 @@ class OptionStrategyCalculatorWindow:
         return "模拟盈亏"
 
     def _refresh_chart_display(self, *, combo_only: bool = False) -> None:
-        formula = self._latest_chart_formula or self.formula.get().strip() or build_default_formula(self._legs)
+        active_legs = self._active_legs()
+        formula = self._latest_chart_formula or self.formula.get().strip() or build_default_formula(active_legs)
 
         if not combo_only and self._latest_payoff_snapshot is not None:
             mode_label = self._payoff_chart_mode_label()
@@ -1279,6 +1801,7 @@ class OptionStrategyCalculatorWindow:
                 f"{underlying_text} | 单位 {payoff_ccy} | 估值日 {valuation_text} | 波动率平移 {_format_signed_percent(self._current_volatility_shift_decimal() * Decimal('100'))}\n"
                 f"净权利金 {_format_compact_number(payoff_snapshot.net_premium)} | 盈亏平衡点 {break_even_text}{compare_text}"
             )
+            self.payoff_summary_text.set(f"{self._current_leg_group_label()} | {self.payoff_summary_text.get()}")
             if self._payoff_canvas is not None:
                 self._draw_payoff_chart(
                     self._payoff_canvas,
@@ -1290,12 +1813,12 @@ class OptionStrategyCalculatorWindow:
                 )
 
         if self._latest_combo_candles:
-            combo_candles, combo_ccy, converted = self._combo_candles_for_display(self._latest_combo_candles)
+            combo_candles, combo_ccy, converted, mode_note = self._combo_candles_for_display(self._latest_combo_candles)
             latest_candle = combo_candles[-1] if combo_candles else None
             latest_value_text = (
                 _format_compact_number(latest_candle.close)
                 if latest_candle is not None
-                else _format_compact_number(self._latest_combo_value)
+                else _format_compact_number(self._latest_combo_value_for_display())
             )
             latest_candle_text = (
                 f"O {_format_compact_number(latest_candle.open)} / H {_format_compact_number(latest_candle.high)} / "
@@ -1303,38 +1826,71 @@ class OptionStrategyCalculatorWindow:
                 if latest_candle is not None
                 else "暂无组合 K 线"
             )
-            note = ""
+            note_parts: list[str] = []
             if self._display_in_usdt() and not converted:
-                note = f" | 缺少 {_native_display_currency(self._legs, self._instrument_map)}-USDT 历史，当前按结算币显示"
+                note_parts.append(f"缺少 {_native_display_currency(active_legs, self._instrument_map)}-USDT 历史，当前按结算币显示")
+            if mode_note:
+                note_parts.append(mode_note)
+            note = f" | {' | '.join(note_parts)}" if note_parts else ""
             self.combo_summary_text.set(
                 f"公式: {formula}\n"
-                f"周期 {self.bar.get().strip()} | 根数 {len(combo_candles)} | 单位 {combo_ccy} | 最新组合值 {latest_value_text} | {latest_candle_text}{note}"
+                f"模式 {self._combo_chart_mode_label()} | 周期 {self.bar.get().strip()} | 根数 {len(combo_candles)} | 单位 {combo_ccy} | 最新值 {latest_value_text} | {latest_candle_text}{note}"
             )
+            self.combo_summary_text.set(f"{self._current_leg_group_label()} | {self.combo_summary_text.get()}")
             if self._combo_canvas is not None:
-                self._draw_combo_chart(self._combo_canvas, combo_candles, combo_ccy)
+                self._draw_combo_chart(
+                    self._combo_canvas,
+                    combo_candles,
+                    combo_ccy,
+                    chart_title=self._combo_chart_title(),
+                )
 
     def _display_in_usdt(self) -> bool:
         return self.chart_display_ccy.get().strip().upper() == "USDT"
+
+    def _combo_chart_mode_key(self) -> str:
+        raw = self.combo_chart_mode.get().strip().lower()
+        return "pnl" if raw in {"pnl", "持仓盈亏k线"} else "price"
+
+    def _combo_chart_mode_label(self) -> str:
+        return "持仓盈亏K线" if self._combo_chart_mode_key() == "pnl" else "价格K线"
+
+    def _combo_chart_title(self) -> str:
+        return "持仓盈亏K线" if self._combo_chart_mode_key() == "pnl" else "标记价格组合K线"
+
+    def _latest_combo_value_for_display(self) -> Decimal | None:
+        if self._combo_chart_mode_key() == "pnl":
+            if self._latest_combo_value is None or self._latest_combo_entry_value is None:
+                return self._latest_combo_value
+            return self._latest_combo_value - self._latest_combo_entry_value
+        return self._latest_combo_value
 
     def _payoff_snapshot_for_display(
         self,
         snapshot: StrategyPayoffSnapshot,
     ) -> tuple[StrategyPayoffSnapshot, str]:
         if not self._display_in_usdt():
-            return snapshot, _native_display_currency(self._legs, self._instrument_map)
+            return snapshot, _native_display_currency(self._active_legs(), self._instrument_map)
         reference_price = self._latest_spot_usdt_price or snapshot.current_underlying_price
         return convert_payoff_snapshot_to_usdt(snapshot, reference_price=reference_price), "USDT"
 
-    def _combo_candles_for_display(self, candles: list[Candle]) -> tuple[list[Candle], str, bool]:
-        native_ccy = _native_display_currency(self._legs, self._instrument_map)
+    def _combo_candles_for_display(self, candles: list[Candle]) -> tuple[list[Candle], str, bool, str]:
+        native_ccy = _native_display_currency(self._active_legs(), self._instrument_map)
+        display_candles = candles
+        mode_note = ""
+        if self._combo_chart_mode_key() == "pnl":
+            if self._latest_combo_entry_value is None:
+                mode_note = "缺少持仓价基准，当前回退为价格K线"
+            else:
+                display_candles = shift_candles(candles, offset=-self._latest_combo_entry_value)
         if not self._display_in_usdt():
-            return candles, native_ccy, True
+            return display_candles, native_ccy, True, mode_note
         if not self._latest_spot_usdt_candles:
-            return candles, native_ccy, False
-        converted = convert_candles_by_reference(candles, self._latest_spot_usdt_candles)
+            return display_candles, native_ccy, False, mode_note
+        converted = convert_candles_by_reference(display_candles, self._latest_spot_usdt_candles)
         if not converted:
-            return candles, native_ccy, False
-        return converted, "USDT", True
+            return display_candles, native_ccy, False, mode_note
+        return converted, "USDT", True, mode_note
 
     def _load_usdt_reference_context(
         self,
@@ -1382,6 +1938,7 @@ class OptionStrategyCalculatorWindow:
             messagebox.showerror("保存策略失败", "当前没有可保存的策略腿。", parent=self.window)
             return
 
+        self._remember_group_formula()
         records = list(self._saved_strategies)
         existing_index = next((index for index, item in enumerate(records) if str(item.get("name", "")).strip() == name), None)
         if existing_index is not None:
@@ -1392,10 +1949,13 @@ class OptionStrategyCalculatorWindow:
         payload = {
             "name": name,
             "option_family": self.option_family.get().strip().upper(),
-            "expiry_code": self._selected_expiry_code(),
+            "expiry_code": (
+                self._active_leg_group_key() if self._active_leg_group_key() != ALL_LEG_GROUP_KEY else self._selected_expiry_code()
+            ),
             "bar": self.bar.get().strip(),
             "candle_limit": self.candle_limit.get().strip(),
             "chart_display_ccy": self.chart_display_ccy.get().strip(),
+            "combo_chart_mode": self._combo_chart_mode_key(),
             "formula": self.formula.get().strip(),
             "legs": [
                 {
@@ -1404,6 +1964,10 @@ class OptionStrategyCalculatorWindow:
                     "side": item.side,
                     "quantity": format_decimal(item.quantity),
                     "premium": format_decimal(item.premium) if item.premium is not None else "",
+                    "delta": format_decimal(item.delta) if item.delta is not None else "",
+                    "gamma": format_decimal(item.gamma) if item.gamma is not None else "",
+                    "theta": format_decimal(item.theta) if item.theta is not None else "",
+                    "vega": format_decimal(item.vega) if item.vega is not None else "",
                     "enabled": item.enabled,
                 }
                 for item in self._legs
@@ -1446,6 +2010,8 @@ class OptionStrategyCalculatorWindow:
         self.bar.set(str(record.get("bar", self.bar.get())).strip() or "15m")
         self.candle_limit.set(str(record.get("candle_limit", self.candle_limit.get())).strip() or "600")
         self.chart_display_ccy.set(str(record.get("chart_display_ccy", self.chart_display_ccy.get())).strip() or "USDT")
+        saved_combo_mode = str(record.get("combo_chart_mode", "price")).strip().lower() or "price"
+        self.combo_chart_mode.set("持仓盈亏K线" if saved_combo_mode == "pnl" else "价格K线")
         self.formula.set(str(record.get("formula", "")).strip())
 
         raw_legs = record.get("legs", [])
@@ -1463,6 +2029,10 @@ class OptionStrategyCalculatorWindow:
             quantity = self._parse_positive_decimal(str(raw.get("quantity", "1")), "策略腿数量")
             premium_text = str(raw.get("premium", "")).strip()
             premium = Decimal(premium_text) if premium_text else None
+            delta_text = str(raw.get("delta", "")).strip()
+            gamma_text = str(raw.get("gamma", "")).strip()
+            theta_text = str(raw.get("theta", "")).strip()
+            vega_text = str(raw.get("vega", "")).strip()
             if not alias or not inst_id or side not in {"buy", "sell"}:
                 continue
             restored.append(
@@ -1472,6 +2042,10 @@ class OptionStrategyCalculatorWindow:
                     side="buy" if side == "buy" else "sell",
                     quantity=quantity,
                     premium=premium,
+                    delta=Decimal(delta_text) if delta_text else None,
+                    gamma=Decimal(gamma_text) if gamma_text else None,
+                    theta=Decimal(theta_text) if theta_text else None,
+                    vega=Decimal(vega_text) if vega_text else None,
                     enabled=enabled,
                 )
             )
@@ -1482,6 +2056,7 @@ class OptionStrategyCalculatorWindow:
             raise ValueError("策略里没有可用的策略腿。")
         self._alias_counter = max(self._alias_counter, max_alias_index)
         self._legs = restored
+        self._leg_group_formula_overrides.clear()
         for leg in restored:
             if leg.inst_id in self._instrument_map:
                 continue
@@ -1490,6 +2065,12 @@ class OptionStrategyCalculatorWindow:
             except Exception:
                 pass
         self._sync_expiry_options(preferred=self.expiry_code.get().strip())
+        preferred_group_key = self._selected_expiry_code()
+        if preferred_group_key and preferred_group_key in self._grouped_legs_by_expiry():
+            self._refresh_leg_group_options(preferred_key=preferred_group_key)
+        else:
+            self._refresh_leg_group_options(preferred_key=ALL_LEG_GROUP_KEY)
+        self._remember_group_formula()
         self._render_legs()
         self._refresh_strategy_summary()
         if self.option_family.get().strip() and self._selected_expiry_code():
@@ -1575,28 +2156,57 @@ class OptionStrategyCalculatorWindow:
         if not self._legs:
             self.strategy_summary_text.set("暂无策略腿。")
             return
-        formula = self.formula.get().strip() or build_default_formula(self._legs)
-        aliases = {item.alias for item in self._legs if item.alias.strip()}
+        active_legs = self._active_legs()
+        if not active_legs:
+            self.strategy_summary_text.set(f"{self._current_leg_group_label()} | 鏆傛棤鍙敤绛栫暐鑵裤€?")
+            return
+        formula = self.formula.get().strip() or build_default_formula(active_legs)
+        aliases = {item.alias for item in active_legs if item.alias.strip()}
+        formula_note = ""
+        try:
+            parsed_formula = parse_linear_formula(formula, allowed_names=aliases)
+            missing_aliases = [
+                leg.alias for leg in active_legs if leg.enabled and leg.alias.strip() and leg.alias not in parsed_formula.coefficients
+            ]
+            if missing_aliases:
+                formula_note = f" | 未引用策略腿 {', '.join(missing_aliases)}"
+        except Exception:
+            formula_note = ""
         combo_value: str = "-"
+        combo_pnl_text: str = "-"
         try:
             latest_values = {
                 leg.alias: (self._quotes_by_inst_id.get(leg.inst_id).reference_price if self._quotes_by_inst_id.get(leg.inst_id) else leg.premium)
-                for leg in self._legs
+                for leg in active_legs
             }
             if all(value is not None for value in latest_values.values()):
-                combo_value = _format_compact_number(
-                    evaluate_linear_formula(
+                normalized_latest_values = {
+                    name: value for name, value in latest_values.items() if isinstance(value, Decimal)
+                }
+                combo_value_decimal = evaluate_linear_formula(
+                    formula,
+                    normalized_latest_values,
+                    allowed_names=aliases,
+                )
+                combo_value = _format_compact_number(combo_value_decimal)
+                entry_values = {
+                    leg.alias: leg.premium
+                    for leg in active_legs
+                }
+                if all(value is not None for value in entry_values.values()):
+                    combo_entry_value = evaluate_linear_formula(
                         formula,
-                        {name: value for name, value in latest_values.items() if isinstance(value, Decimal)},
+                        {name: value for name, value in entry_values.items() if isinstance(value, Decimal)},
                         allowed_names=aliases,
                     )
-                )
+                    combo_pnl_text = _format_compact_number(combo_value_decimal - combo_entry_value)
         except Exception:
             combo_value = "-"
+            combo_pnl_text = "-"
 
         net_premium: Decimal | None = Decimal("0")
         premium_ccy: str | None = None
-        for leg in self._legs:
+        for leg in active_legs:
             instrument = self._instrument_map.get(leg.inst_id)
             if instrument is None or leg.premium is None:
                 net_premium = None
@@ -1621,10 +2231,35 @@ class OptionStrategyCalculatorWindow:
             if self._current_underlying_price
             else ""
         )
+        greeks_text = "Δ - | Γ - | Θ(1d) - | Vega(1%) -"
+        if (
+            self._latest_resolved_legs
+            and self._latest_implied_volatility_by_alias
+            and self._latest_payoff_loaded_at is not None
+            and self._current_underlying_price is not None
+        ):
+            try:
+                strategy_greeks = estimate_strategy_greeks(
+                    self._latest_resolved_legs,
+                    implied_volatility_by_alias=self._latest_implied_volatility_by_alias,
+                    valuation_time=self._latest_payoff_loaded_at,
+                    settlement_price=self._current_underlying_price,
+                )
+                greeks_text = (
+                    f"Δ {_format_compact_number(strategy_greeks['delta'])} | "
+                    f"Γ {_format_compact_number(strategy_greeks['gamma'])} | "
+                    f"Θ(1d) {_format_compact_number(strategy_greeks['theta'])} | "
+                    f"Vega(1%) {_format_compact_number(strategy_greeks['vega'])}"
+                )
+            except Exception:
+                greeks_text = "Δ - | Γ - | Θ(1d) - | Vega(1%) -"
         self.strategy_summary_text.set(
-            f"策略腿 {len(self._legs)} 条 | 净权利金 {premium_text} | 当前组合值 {combo_value}{underlying_text}\n"
-            f"组合公式 {formula or '-'}"
+            f"策略腿 {len(active_legs)} / {len(self._legs)} 条 | 净权利金 {premium_text} | 当前组合值 {combo_value} | 当前浮盈 {combo_pnl_text}{underlying_text}\n"
+            f"组合公式 {formula or '-'}{formula_note}\n"
+            f"组合希腊 {greeks_text}"
         )
+
+        self.strategy_summary_text.set(f"{self._current_leg_group_label()} | {self.strategy_summary_text.get()}")
 
     def _draw_payoff_chart(
         self,
@@ -1807,7 +2442,7 @@ class OptionStrategyCalculatorWindow:
                 canvas.create_polygon(x1, zero_y, x1, y1, cross_x, zero_y, outline="", fill="#fecaca")
                 canvas.create_polygon(cross_x, zero_y, x2, y2, x2, zero_y, outline="", fill="#c6f6d5")
 
-    def _draw_combo_chart(self, canvas: Canvas, candles: list[Candle], value_ccy: str) -> None:
+    def _draw_combo_chart(self, canvas: Canvas, candles: list[Candle], value_ccy: str, *, chart_title: str) -> None:
         if not candles:
             self._clear_canvas(canvas, "没有可用的组合 K 线数据。")
             return
@@ -1900,7 +2535,7 @@ class OptionStrategyCalculatorWindow:
             width - right,
             top + 10,
             text=(
-                f"标记价格组合K线 ({value_ccy}) | 最新 O {_format_compact_number(latest.open)} "
+                f"{chart_title} ({value_ccy}) | 最新 O {_format_compact_number(latest.open)} "
                 f"H {_format_compact_number(latest.high)} L {_format_compact_number(latest.low)} C {_format_compact_number(latest.close)}"
             ),
             anchor="ne",
@@ -2127,6 +2762,15 @@ def _build_option_quote(instrument: Instrument, ticker: OkxTicker | None) -> Opt
         last_price=ticker.last if ticker is not None else None,
         index_price=ticker.index if ticker is not None else None,
     )
+
+
+def _option_position_side(position: OkxPosition) -> str:
+    pos_side = (position.pos_side or "").strip().lower()
+    if pos_side == "short":
+        return "sell"
+    if pos_side == "long":
+        return "buy"
+    return "sell" if position.position < 0 else "buy"
 
 
 def _spot_usdt_inst_id(inst_family: str | None) -> str | None:

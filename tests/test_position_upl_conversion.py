@@ -10,6 +10,7 @@ from okx_quant.ui import (
     _format_margin_mode,
     _format_mark_price,
     _format_option_trade_side,
+    _format_option_trade_side_display,
     _format_optional_decimal_fixed,
     _format_optional_integer,
     _format_optional_usdt_precise,
@@ -162,6 +163,17 @@ class PositionUplConversionTest(TestCase):
         self.assertEqual(_format_option_trade_side(put_long), "买沽")
         self.assertEqual(_format_option_trade_side(put_short), "卖沽")
 
+    def test_format_option_trade_side_display_uses_grouped_slots(self) -> None:
+        call_long = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
+        call_short = OkxPosition(**{**call_long.__dict__, "position": Decimal("1"), "pos_side": "short"})
+        put_long = OkxPosition(**{**call_long.__dict__, "inst_id": "BTC-USD-260626-50000-P"})
+        put_short = OkxPosition(**{**put_long.__dict__, "position": Decimal("1"), "pos_side": "short"})
+
+        self.assertEqual(_format_option_trade_side_display(call_long), "买购")
+        self.assertEqual(_format_option_trade_side_display(call_short), "卖购")
+        self.assertEqual(_format_option_trade_side_display(put_long), "买沽")
+        self.assertEqual(_format_option_trade_side_display(put_short), "卖沽")
+
     def test_format_group_option_trade_side_summarizes_by_option_direction(self) -> None:
         positions = [
             OkxPosition(**{**_make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC").__dict__, "position": Decimal("20"), "pos_side": "long"}),
@@ -194,7 +206,7 @@ class PositionUplConversionTest(TestCase):
         }
         self.assertEqual(
             _format_group_option_trade_side(positions, instruments),
-            "买购0.20BTC / 卖购0.10BTC / 卖沽0.30BTC",
+            "0.20 : 0.10 | - : 0.30",
         )
 
     def test_format_position_size_converts_usd_futures_to_base_coin(self) -> None:
