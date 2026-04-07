@@ -3,7 +3,6 @@ from decimal import Decimal
 from unittest import TestCase
 
 from okx_quant.models import Candle, Instrument
-from okx_quant.okx_client import OkxPosition
 from okx_quant.option_strategy import (
     OptionQuote,
     StrategyLegDefinition,
@@ -31,7 +30,6 @@ from okx_quant.option_strategy import (
     shift_candles,
     simulated_option_value,
 )
-from okx_quant.option_strategy_ui import _filter_option_positions, _position_side_and_quantity
 
 
 def _make_instrument(inst_id: str) -> Instrument:
@@ -50,146 +48,6 @@ def _make_instrument(inst_id: str) -> Instrument:
 
 
 class OptionStrategyTest(TestCase):
-    def test_filter_option_positions_supports_family_and_expiry(self) -> None:
-        positions = [
-            OkxPosition(
-                inst_id="BTC-USD-260410-68000-C",
-                inst_type="OPTION",
-                pos_side="net",
-                mgn_mode="cross",
-                position=Decimal("2"),
-                avail_position=None,
-                avg_price=Decimal("0.01"),
-                mark_price=None,
-                unrealized_pnl=None,
-                unrealized_pnl_ratio=None,
-                liquidation_price=None,
-                leverage=None,
-                margin_ccy=None,
-                last_price=None,
-                realized_pnl=None,
-                margin_ratio=None,
-                initial_margin=None,
-                maintenance_margin=None,
-                delta=None,
-                gamma=None,
-                vega=None,
-                theta=None,
-                raw={},
-            ),
-            OkxPosition(
-                inst_id="BTC-USD-260417-68000-P",
-                inst_type="OPTION",
-                pos_side="short",
-                mgn_mode="cross",
-                position=Decimal("-3"),
-                avail_position=None,
-                avg_price=Decimal("0.02"),
-                mark_price=None,
-                unrealized_pnl=None,
-                unrealized_pnl_ratio=None,
-                liquidation_price=None,
-                leverage=None,
-                margin_ccy=None,
-                last_price=None,
-                realized_pnl=None,
-                margin_ratio=None,
-                initial_margin=None,
-                maintenance_margin=None,
-                delta=None,
-                gamma=None,
-                vega=None,
-                theta=None,
-                raw={},
-            ),
-            OkxPosition(
-                inst_id="ETH-USD-260410-3000-C",
-                inst_type="OPTION",
-                pos_side="long",
-                mgn_mode="cross",
-                position=Decimal("1"),
-                avail_position=None,
-                avg_price=Decimal("0.03"),
-                mark_price=None,
-                unrealized_pnl=None,
-                unrealized_pnl_ratio=None,
-                liquidation_price=None,
-                leverage=None,
-                margin_ccy=None,
-                last_price=None,
-                realized_pnl=None,
-                margin_ratio=None,
-                initial_margin=None,
-                maintenance_margin=None,
-                delta=None,
-                gamma=None,
-                vega=None,
-                theta=None,
-                raw={},
-            ),
-        ]
-
-        family_rows = _filter_option_positions(positions, family="BTC-USD")
-        expiry_rows = _filter_option_positions(positions, family="BTC-USD", expiry_code="260410")
-
-        self.assertEqual([item.inst_id for item in family_rows], ["BTC-USD-260410-68000-C", "BTC-USD-260417-68000-P"])
-        self.assertEqual([item.inst_id for item in expiry_rows], ["BTC-USD-260410-68000-C"])
-
-    def test_position_side_and_quantity_prefers_pos_side(self) -> None:
-        short_position = OkxPosition(
-            inst_id="BTC-USD-260410-68000-P",
-            inst_type="OPTION",
-            pos_side="short",
-            mgn_mode="cross",
-            position=Decimal("5"),
-            avail_position=None,
-            avg_price=Decimal("0.02"),
-            mark_price=None,
-            unrealized_pnl=None,
-            unrealized_pnl_ratio=None,
-            liquidation_price=None,
-            leverage=None,
-            margin_ccy=None,
-            last_price=None,
-            realized_pnl=None,
-            margin_ratio=None,
-            initial_margin=None,
-            maintenance_margin=None,
-            delta=None,
-            gamma=None,
-            vega=None,
-            theta=None,
-            raw={},
-        )
-        net_short = OkxPosition(
-            inst_id="BTC-USD-260410-68000-C",
-            inst_type="OPTION",
-            pos_side="net",
-            mgn_mode="cross",
-            position=Decimal("-2"),
-            avail_position=None,
-            avg_price=Decimal("0.01"),
-            mark_price=None,
-            unrealized_pnl=None,
-            unrealized_pnl_ratio=None,
-            liquidation_price=None,
-            leverage=None,
-            margin_ccy=None,
-            last_price=None,
-            realized_pnl=None,
-            margin_ratio=None,
-            initial_margin=None,
-            maintenance_margin=None,
-            delta=None,
-            gamma=None,
-            vega=None,
-            theta=None,
-            raw={},
-        )
-
-        self.assertEqual(_position_side_and_quantity(short_position), ("sell", Decimal("5")))
-        self.assertEqual(_position_side_and_quantity(net_short), ("sell", Decimal("2")))
-
     def test_parse_option_contract_extracts_fields(self) -> None:
         parsed = parse_option_contract("BTC-USD-260626-90000-C")
         self.assertEqual(parsed.inst_family, "BTC-USD")

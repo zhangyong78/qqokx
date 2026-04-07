@@ -57,15 +57,6 @@ class _SignalChartRequest:
     session_id: str | None = None
 
 
-SIGNAL_DEFINITIONS: tuple[_SignalDefinition, ...] = (
-    _SignalDefinition("ema21_55_cross", "EMA21/55金叉死叉"),
-    _SignalDefinition("ema55_slope_turn", "EMA55斜率改变"),
-    _SignalDefinition("ema55_breakout", "EMA55突破"),
-    _SignalDefinition("candle_pattern", "K线形态信号"),
-)
-SIGNAL_TYPE_LABELS = {item.signal_type: item.label for item in SIGNAL_DEFINITIONS}
-
-
 @dataclass(frozen=True)
 class _SignalChartDataset:
     request: _SignalChartRequest
@@ -76,6 +67,18 @@ class _SignalChartDataset:
     primary_ema_values: tuple[Decimal, ...]
     secondary_ema_label: str | None
     secondary_ema_values: tuple[Decimal, ...]
+
+
+SIGNAL_DEFINITIONS: tuple[_SignalDefinition, ...] = (
+    _SignalDefinition("ema21_55_cross", "EMA21/55金叉死叉"),
+    _SignalDefinition("ema55_slope_turn", "EMA55斜率改变"),
+    _SignalDefinition("ema55_breakout", "EMA55突破"),
+    _SignalDefinition("candle_pattern", "K线形态信号"),
+)
+
+SIGNAL_TYPE_LABELS: dict[SignalType, str] = {
+    definition.signal_type: definition.label for definition in SIGNAL_DEFINITIONS
+}
 
 
 @dataclass
@@ -152,21 +155,16 @@ class SignalMonitorWindow:
         self._signal_chart_render_state: _SignalChartRenderState | None = None
         self._signal_chart_hover_index: int | None = None
         self._signal_chart_hover_y: float | None = None
-        self._content_pane: ttk.Panedwindow | None = None
-        self._signal_preview_symbol_box: ttk.Combobox | None = None
 
         self.window = Toplevel(parent)
         self.window.title("信号监控")
         apply_window_icon(self.window)
-        apply_adaptive_window_geometry(
-            self.window,
-            width_ratio=0.84,
-            height_ratio=0.88,
-            min_width=1260,
-            min_height=980,
-            max_width=1780,
-            max_height=1260,
-        )
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+        default_width = min(max(int(screen_width * 0.78), 1220), 1680)
+        default_height = min(max(int(screen_height * 0.84), 980), 1180)
+        self.window.geometry(f"{default_width}x{default_height}")
+        self.window.minsize(1120, 900)
         self.window.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.bar = StringVar(value=self._defaults.bar)
@@ -193,18 +191,18 @@ class SignalMonitorWindow:
             "ema55_breakout": self.enable_ema55_breakout,
             "candle_pattern": self.enable_candle_pattern,
         }
+        self._signal_preview_symbol_box: ttk.Combobox | None = None
         self.tasks_tree: ttk.Treeview | None = None
         self.signal_tree: ttk.Treeview | None = None
         self.log_text: Text | None = None
         self.diagnostic_text: Text | None = None
 
         self.custom_symbols.trace_add("write", lambda *_: self._sync_signal_preview_symbol())
-        for _, var in self._symbol_vars.values():
-            var.trace_add("write", lambda *_: self._sync_signal_preview_symbol())
+        for _, (_, variable) in self._symbol_vars.items():
+            variable.trace_add("write", lambda *_: self._sync_signal_preview_symbol())
 
         self._build_layout()
         self._sync_signal_preview_symbol()
-        self.window.after_idle(self._apply_initial_layout_preferences)
         self._schedule_refresh()
 
     def show(self) -> None:
@@ -289,26 +287,26 @@ class SignalMonitorWindow:
                 signal_frame,
                 text="查看K线",
                 command=lambda signal_type=definition.signal_type: self._open_signal_preview(signal_type),
-            ).grid(row=row_index, column=1, sticky="e", pady=2)
+            ).grid(row=row_index, column=1, sticky="e", pady=4, padx=(12, 0))
 
-        preview_box = ttk.LabelFrame(signal_frame, text="信号预览", padding=10)
+        preview_box = ttk.LabelFrame(signal_frame, text="预览设置", padding=10)
         preview_box.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         preview_box.columnconfigure(1, weight=1)
-        preview_box.columnconfigure(3, weight=1)
         ttk.Label(preview_box, text="预览币种").grid(row=0, column=0, sticky="w")
-        preview_symbol_box = ttk.Combobox(preview_box, textvariable=self.signal_preview_symbol)
-        preview_symbol_box.grid(row=0, column=1, sticky="ew", padx=(8, 12))
-        self._signal_preview_symbol_box = preview_symbol_box
-        ttk.Label(preview_box, text="K线数量").grid(row=0, column=2, sticky="w")
-        ttk.Entry(preview_box, textvariable=self.signal_chart_candle_limit, width=10).grid(
-            row=0, column=3, sticky="w", padx=(8, 0)
+        self._signal_preview_symbol_box = ttk.Combobox(
+            preview_box,
+            textvariable=self.signal_preview_symbol,
+            state="readonly",
         )
+        self._signal_preview_symbol_box.grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(preview_box, text="K线数量").grid(row=1, column=0, sticky="w")
+        ttk.Entry(preview_box, textvariable=self.signal_chart_candle_limit).grid(row=1, column=1, sticky="ew", pady=4)
         ttk.Label(
             preview_box,
-            text="点击上方按钮，可按当前参数直接预览该信号在历史K线中的触发位置。",
+            text="默认加载 1000 根，可自行调整后再点击对应信号的查看K线。",
             foreground="#57606a",
             justify="left",
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         pattern_box = ttk.LabelFrame(signal_frame, text="K线形态信号参数", padding=10)
         pattern_box.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(12, 0))
@@ -340,7 +338,6 @@ class SignalMonitorWindow:
 
         content_pane = ttk.Panedwindow(self.window, orient="vertical")
         content_pane.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
-        self._content_pane = content_pane
 
         task_frame = ttk.LabelFrame(content_pane, text="监控任务", padding=12)
         task_frame.columnconfigure(0, weight=1)
@@ -417,7 +414,7 @@ class SignalMonitorWindow:
         log_frame = ttk.LabelFrame(content_pane, text="监控日志", padding=12)
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        content_pane.add(log_frame, weight=3)
+        content_pane.add(log_frame, weight=2)
 
         self.log_text = Text(log_frame, height=12, wrap="word", font=("Consolas", 10))
         self.log_text.grid(row=0, column=0, sticky="nsew")
@@ -428,7 +425,7 @@ class SignalMonitorWindow:
         diagnostic_frame = ttk.LabelFrame(content_pane, text="实时诊断", padding=12)
         diagnostic_frame.columnconfigure(0, weight=1)
         diagnostic_frame.rowconfigure(1, weight=1)
-        content_pane.add(diagnostic_frame, weight=2)
+        content_pane.add(diagnostic_frame, weight=3)
 
         ttk.Label(
             diagnostic_frame,
@@ -442,29 +439,6 @@ class SignalMonitorWindow:
         diagnostic_scroll.grid(row=1, column=1, sticky="ns")
         self.diagnostic_text.configure(yscrollcommand=diagnostic_scroll.set)
 
-    def _apply_initial_layout_preferences(self) -> None:
-        self.window.update_idletasks()
-        if self._content_pane is None or len(self._content_pane.panes()) < 4:
-            return
-
-        window_height = max(self.window.winfo_height(), self.window.winfo_reqheight())
-        content_height = max(self._content_pane.winfo_height(), window_height - 300)
-        if window_height < 1020:
-            ratios = (0.14, 0.31, 0.24)
-        else:
-            ratios = (0.15, 0.33, 0.24)
-
-        positions = [
-            max(120, int(content_height * ratios[0])),
-            max(360, int(content_height * (ratios[0] + ratios[1]))),
-            max(560, int(content_height * (ratios[0] + ratios[1] + ratios[2]))),
-        ]
-        for index, position in enumerate(positions):
-            try:
-                self._content_pane.sashpos(index, position)
-            except Exception:
-                break
-
     def _collect_configured_symbols(self) -> list[str]:
         symbols = [inst_id for _, (inst_id, var) in self._symbol_vars.items() if var.get()]
         for item in self.custom_symbols.get().replace(";", ",").split(","):
@@ -475,43 +449,27 @@ class SignalMonitorWindow:
 
     def _sync_signal_preview_symbol(self) -> None:
         configured_symbols = self._collect_configured_symbols()
+        values = configured_symbols or [DEFAULT_MONITOR_SYMBOLS[0][1]]
+        current_value = self.signal_preview_symbol.get().strip().upper()
+        if current_value and current_value not in values:
+            values.append(current_value)
+        if not current_value:
+            current_value = values[0]
+        self.signal_preview_symbol.set(current_value)
         if self._signal_preview_symbol_box is not None:
-            self._signal_preview_symbol_box.configure(values=configured_symbols)
-
-        current = self.signal_preview_symbol.get().strip()
-        if current:
-            return
-        if configured_symbols:
-            self.signal_preview_symbol.set(configured_symbols[0])
-            return
-        self.signal_preview_symbol.set(DEFAULT_MONITOR_SYMBOLS[0][1])
+            self._signal_preview_symbol_box.configure(values=values)
 
     def _parse_signal_chart_candle_limit(self) -> int:
-        value = self._parse_positive_int(self.signal_chart_candle_limit.get(), "信号图K线数量")
+        value = self._parse_positive_int(self.signal_chart_candle_limit.get(), "K线数量")
         if value > MAX_SIGNAL_CHART_CANDLE_LIMIT:
-            raise ValueError(f"信号图K线数量最多支持 {MAX_SIGNAL_CHART_CANDLE_LIMIT} 根")
+            raise ValueError(f"K线数量不能超过 {MAX_SIGNAL_CHART_CANDLE_LIMIT}")
         return value
 
     def _build_signal_preview_request(self, signal_type: SignalType) -> _SignalChartRequest:
-        symbol = _normalize_symbol_input(self.signal_preview_symbol.get())
-        if not symbol:
-            raise ValueError("请先填写要预览的币种")
-        config = SignalMonitorConfig(
-            symbols=(symbol,),
-            bar=self.bar.get(),
-            poll_seconds=float(self._defaults.poll_seconds),
-            enable_ema21_55_cross=signal_type == "ema21_55_cross",
-            enable_ema55_slope_turn=signal_type == "ema55_slope_turn",
-            enable_ema55_breakout=signal_type == "ema55_breakout",
-            enable_candle_pattern=signal_type == "candle_pattern",
-            pattern_ema_period=self._parse_positive_int(self.pattern_ema_period.get(), "EMA周期"),
-            ema_near_tolerance=self._parse_positive_decimal(self.ema_near_tolerance.get(), "EMA附近容差"),
-            body_ratio_threshold=self._parse_ratio(self.body_ratio_threshold.get(), "大K线实体比例阈值"),
-            wick_ratio_threshold=self._parse_ratio(self.wick_ratio_threshold.get(), "影线比例阈值"),
-        )
+        config = self._build_config()
         return _SignalChartRequest(
             mode="preview",
-            symbol=symbol,
+            symbol=_normalize_symbol_input(self.signal_preview_symbol.get().strip().upper()),
             bar=config.bar,
             config=config,
             signal_type=signal_type,
@@ -699,12 +657,7 @@ class SignalMonitorWindow:
         payload = self._signal_row_payloads.get(selection[0])
         if payload is None:
             return
-        try:
-            request = self._build_signal_event_request(payload)
-        except Exception as exc:
-            messagebox.showerror("信号图加载失败", str(exc), parent=self.window)
-            return
-        self._open_signal_chart(request)
+        self._open_signal_chart(self._build_signal_event_request(payload))
 
     def _open_signal_chart(self, request: _SignalChartRequest) -> None:
         self._signal_chart_active_request = request
@@ -715,15 +668,9 @@ class SignalMonitorWindow:
             self._signal_chart_summary.set(
                 f"正在加载 {request.symbol} {request.bar} 的 {request.candle_limit} 根 K 线，并预览 {signal_label} 的历史触发位置..."
             )
-            self._signal_chart_hint.set(
-                "蓝色为做多信号，紫色为做空信号；支持滚轮缩放、左键拖动和平移，修改 K 线数量后可刷新当前图表。"
-            )
         else:
             self._signal_chart_summary.set(
                 f"正在加载 {request.symbol} {request.bar} 的 {request.candle_limit} 根 K 线，并回放 {signal_label} 历史信号..."
-            )
-            self._signal_chart_hint.set(
-                "橙色标记为当前信号，蓝色为做多历史信号，紫色为做空历史信号；支持滚轮缩放、左键拖动和平移、悬浮十字光标。"
             )
         if self._signal_chart_canvas is not None:
             self._clear_signal_chart_canvas(self._signal_chart_canvas, message="正在加载 K 线与历史信号...")
@@ -767,24 +714,26 @@ class SignalMonitorWindow:
             justify="left",
             wraplength=1180,
         ).grid(row=0, column=0, sticky="w")
-        control_box = ttk.Frame(header)
-        control_box.grid(row=0, column=1, sticky="e", padx=(12, 0))
-        ttk.Label(control_box, text="K线数").grid(row=0, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(control_box, textvariable=self.signal_chart_candle_limit, width=8).grid(row=0, column=1, sticky="e")
-        ttk.Button(control_box, text="刷新当前", command=self._refresh_active_signal_chart).grid(
-            row=0, column=2, sticky="e", padx=(8, 8)
+        chart_controls = ttk.Frame(header)
+        chart_controls.grid(row=0, column=1, sticky="e")
+        ttk.Label(chart_controls, text="K线数量").grid(row=0, column=0, sticky="e")
+        ttk.Entry(chart_controls, textvariable=self.signal_chart_candle_limit, width=8).grid(
+            row=0, column=1, sticky="e", padx=(6, 12)
         )
-        ttk.Button(control_box, text="重置视图", command=self._reset_signal_chart_view).grid(
+        ttk.Button(header, text="重置视图", command=self._reset_signal_chart_view).grid(
+            row=0, column=2, sticky="e", padx=(12, 8)
+        )
+        ttk.Button(header, text="刷新当前", command=self._refresh_active_signal_chart).grid(
             row=0, column=3, sticky="e", padx=(0, 8)
         )
-        ttk.Button(control_box, text="关闭", command=self._close_signal_chart_window).grid(row=0, column=4, sticky="e")
+        ttk.Button(header, text="关闭", command=self._close_signal_chart_window).grid(row=0, column=4, sticky="e")
         ttk.Label(
             header,
             textvariable=self._signal_chart_hint,
             justify="left",
             foreground="#57606a",
             wraplength=1180,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
         chart_canvas = Canvas(chart_window, background="#ffffff", highlightthickness=0)
         chart_canvas.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
@@ -799,27 +748,28 @@ class SignalMonitorWindow:
             self._clear_signal_chart_canvas(chart_canvas)
 
     def _refresh_active_signal_chart(self) -> None:
-        request = self._signal_chart_active_request
-        if request is None:
+        if self._signal_chart_active_request is None:
             return
         try:
-            if request.mode == "preview":
-                refreshed_request = self._build_signal_preview_request(request.signal_type)
+            if self._signal_chart_active_request.mode == "preview":
+                request = self._build_signal_preview_request(self._signal_chart_active_request.signal_type)
             else:
-                refreshed_request = _SignalChartRequest(
+                active_request = self._signal_chart_active_request
+                assert active_request.selected_event is not None
+                request = _SignalChartRequest(
                     mode="event",
-                    symbol=request.symbol,
-                    bar=request.bar,
-                    config=request.config,
-                    signal_type=request.signal_type,
+                    symbol=active_request.symbol,
+                    bar=active_request.bar,
+                    config=active_request.config,
+                    signal_type=active_request.signal_type,
                     candle_limit=self._parse_signal_chart_candle_limit(),
-                    selected_event=request.selected_event,
-                    session_id=request.session_id,
+                    selected_event=active_request.selected_event,
+                    session_id=active_request.session_id,
                 )
         except Exception as exc:
             messagebox.showerror("刷新失败", str(exc), parent=self._signal_chart_window or self.window)
             return
-        self._open_signal_chart(refreshed_request)
+        self._open_signal_chart(request)
 
     def _bind_signal_chart_interactions(self, canvas: Canvas) -> None:
         canvas.bind("<MouseWheel>", lambda event, target=canvas: self._on_signal_chart_mousewheel(target, event))
@@ -982,28 +932,29 @@ class SignalMonitorWindow:
         self._signal_chart_hover_index = None
         self._signal_chart_hover_y = None
         request = dataset.request
-        signal_label = SIGNAL_TYPE_LABELS.get(request.signal_type, request.signal_type)
+        selected_event = request.selected_event
         history_count = len(dataset.history_events)
-        if request.selected_event is not None:
-            selected_event = request.selected_event
+        signal_label = SIGNAL_TYPE_LABELS.get(request.signal_type, request.signal_type)
+        summary = (
+            f"币种: {request.symbol} | 周期: {request.bar} | 规则: {signal_label} | "
+            f"当前加载 K 线: {len(dataset.candles)} 根 | 历史同规则信号: {history_count} 个"
+        )
+        if selected_event is not None:
             selected_found = any(_monitor_events_match(item, selected_event) for item in dataset.history_events)
             summary = (
-                f"币种: {request.symbol} | 周期: {request.bar} | 规则: {signal_label} | "
-                f"当前信号时间: {datetime.fromtimestamp(selected_event.candle_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')} | "
-                f"当前加载 K 线: {len(dataset.candles)} 根 | 历史同规则信号: {history_count} 个"
+                f"{summary} | 当前信号时间: "
+                f"{datetime.fromtimestamp(selected_event.candle_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')}"
             )
             if not selected_found:
                 summary = f"{summary} | 当前信号不在已加载 K 线范围内"
-        else:
-            latest_event_time = (
-                datetime.fromtimestamp(dataset.history_events[-1].candle_ts / 1000).strftime("%Y-%m-%d %H:%M:%S")
-                if dataset.history_events
-                else "暂无"
-            )
+        elif dataset.history_events:
+            latest_event = dataset.history_events[-1]
             summary = (
-                f"币种: {request.symbol} | 周期: {request.bar} | 规则: {signal_label} | "
-                f"当前加载 K 线: {len(dataset.candles)} 根 | 触发次数: {history_count} 个 | 最近触发: {latest_event_time}"
+                f"{summary} | 最近触发: "
+                f"{datetime.fromtimestamp(latest_event.candle_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')}"
             )
+        else:
+            summary = f"{summary} | 当前范围内未触发该信号"
         self._signal_chart_summary.set(summary)
         self._redraw_signal_chart()
 
@@ -1170,7 +1121,8 @@ class SignalMonitorWindow:
             legend_lines.append(dataset.primary_ema_label)
         if dataset.secondary_ema_label:
             legend_lines.append(dataset.secondary_ema_label)
-        legend_lines.append("橙色=当前")
+        if selected_event is not None:
+            legend_lines.append("橙色=当前")
         legend_lines.append("蓝色=做多历史")
         legend_lines.append("紫色=做空历史")
         canvas.create_text(
@@ -1193,7 +1145,7 @@ class SignalMonitorWindow:
         canvas.create_text(
             width / 2,
             height / 2,
-            text=message or "选择最近触发信号，或点击右侧信号配置里的“查看K线”按钮进行预览。",
+            text=message or "选择最近触发信号，或点击右侧“查看K线”来预览当前信号配置。",
             fill="#6e7781",
             font=("Microsoft YaHei UI", 11),
         )
@@ -1904,5 +1856,5 @@ def _format_signal_group(events: tuple[MonitorSignalEvent, ...]) -> str:
     formatted = []
     for event in events:
         direction = "做多" if event.direction == "long" else "做空"
-        formatted.append(f"{event.signal_type}/{direction}")
+        formatted.append(f"{SIGNAL_TYPE_LABELS.get(event.signal_type, event.signal_type)}/{direction}")
     return "，".join(formatted)

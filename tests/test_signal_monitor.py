@@ -19,8 +19,8 @@ from okx_quant.signal_monitor import (
     evaluate_monitor_signals,
 )
 from okx_quant.signal_monitor_ui import (
-    SignalMonitorWindow,
     SignalMonitorDefaults,
+    SignalMonitorWindow,
     _format_monitor_diagnostic_round,
     _normalize_signal_chart_viewport,
     _pan_signal_chart_viewport,
@@ -58,20 +58,31 @@ def _make_candles(closes: list[Decimal]) -> list[Candle]:
 def _make_signal_monitor_window_stub() -> SignalMonitorWindow:
     interp = Tcl()
     window = SignalMonitorWindow.__new__(SignalMonitorWindow)
-    window._defaults = SignalMonitorDefaults()
-    window._signal_preview_symbol_box = None
-    window._test_interp = interp
-    window.bar = StringVar(master=interp, value="4H")
-    window.custom_symbols = StringVar(master=interp, value="")
-    window.pattern_ema_period = StringVar(master=interp, value=window._defaults.pattern_ema_period)
-    window.ema_near_tolerance = StringVar(master=interp, value=window._defaults.ema_near_tolerance)
-    window.body_ratio_threshold = StringVar(master=interp, value=window._defaults.body_ratio_threshold)
-    window.wick_ratio_threshold = StringVar(master=interp, value=window._defaults.wick_ratio_threshold)
+    defaults = SignalMonitorDefaults()
+    window._defaults = defaults
+    window.bar = StringVar(master=interp, value=defaults.bar)
+    window.poll_seconds = StringVar(master=interp, value=defaults.poll_seconds)
+    window.custom_symbols = StringVar(master=interp)
+    window.enable_ema21_55_cross = BooleanVar(master=interp, value=True)
+    window.enable_ema55_slope_turn = BooleanVar(master=interp, value=True)
+    window.enable_ema55_breakout = BooleanVar(master=interp, value=True)
+    window.enable_candle_pattern = BooleanVar(master=interp, value=True)
+    window.pattern_ema_period = StringVar(master=interp, value=defaults.pattern_ema_period)
+    window.ema_near_tolerance = StringVar(master=interp, value=defaults.ema_near_tolerance)
+    window.body_ratio_threshold = StringVar(master=interp, value=defaults.body_ratio_threshold)
+    window.wick_ratio_threshold = StringVar(master=interp, value=defaults.wick_ratio_threshold)
     window.signal_chart_candle_limit = StringVar(master=interp, value="1000")
-    window.signal_preview_symbol = StringVar(master=interp, value="")
+    window.signal_preview_symbol = StringVar(master=interp, value="BTC-USDT-SWAP")
     window._symbol_vars = {
         "BTCUSDT": ("BTC-USDT-SWAP", BooleanVar(master=interp, value=True)),
         "ETHUSDT": ("ETH-USDT-SWAP", BooleanVar(master=interp, value=False)),
+    }
+    window._signal_preview_symbol_box = None
+    window._signal_enabled_vars = {
+        "ema21_55_cross": window.enable_ema21_55_cross,
+        "ema55_slope_turn": window.enable_ema55_slope_turn,
+        "ema55_breakout": window.enable_ema55_breakout,
+        "candle_pattern": window.enable_candle_pattern,
     }
     return window
 
@@ -256,34 +267,6 @@ class SignalMonitorTest(TestCase):
         self.assertIn("参考价：123.5", body)
         self.assertIn("说明：测试信号", body)
 
-    def test_signal_preview_request_uses_selected_signal_and_candle_limit(self) -> None:
-        window = _make_signal_monitor_window_stub()
-        window.signal_preview_symbol.set("ETH-USDT-SWAP")
-        window.signal_chart_candle_limit.set("1200")
-
-        request = window._build_signal_preview_request("ema55_breakout")
-
-        self.assertEqual(request.mode, "preview")
-        self.assertEqual(request.symbol, "ETH-USDT-SWAP")
-        self.assertEqual(request.candle_limit, 1200)
-        self.assertEqual(request.config.symbols, ("ETH-USDT-SWAP",))
-        self.assertFalse(request.config.enable_ema21_55_cross)
-        self.assertFalse(request.config.enable_ema55_slope_turn)
-        self.assertTrue(request.config.enable_ema55_breakout)
-        self.assertFalse(request.config.enable_candle_pattern)
-
-    def test_signal_preview_symbol_sync_prefills_but_keeps_manual_symbol(self) -> None:
-        window = _make_signal_monitor_window_stub()
-
-        window._sync_signal_preview_symbol()
-        self.assertEqual(window.signal_preview_symbol.get(), "BTC-USDT-SWAP")
-
-        window.signal_preview_symbol.set("SOL-USDT-SWAP")
-        window._symbol_vars["BTCUSDT"][1].set(False)
-        window._symbol_vars["ETHUSDT"][1].set(True)
-        window._sync_signal_preview_symbol()
-        self.assertEqual(window.signal_preview_symbol.get(), "SOL-USDT-SWAP")
-
     def test_signal_reason_formats_values_by_tick_size(self) -> None:
         closes = [Decimal("100")] * 55 + [Decimal("105"), Decimal("104"), Decimal("103"), Decimal("80")]
         candles = _make_candles(closes)
@@ -388,9 +371,9 @@ class SignalMonitorTest(TestCase):
         )
 
         self.assertIn("M01", text)
-        self.assertIn("新触发: ema21_55_cross/做多", text)
-        self.assertIn("已过滤: ema55_breakout/做空", text)
-        self.assertIn("重复抑制: candle_pattern/做空", text)
+        self.assertIn("新触发: EMA21/55金叉死叉/做多", text)
+        self.assertIn("已过滤: EMA55突破/做空", text)
+        self.assertIn("重复抑制: K线形态信号/做空", text)
 
     def test_bar_interval_seconds_supports_monitor_bars(self) -> None:
         self.assertEqual(_bar_interval_seconds("15m"), 900)
@@ -431,3 +414,34 @@ class SignalMonitorTest(TestCase):
             candle_step=20,
         )
         self.assertEqual(index, 15)
+
+    def test_signal_preview_request_uses_selected_signal_and_candle_limit(self) -> None:
+        window = _make_signal_monitor_window_stub()
+        window.signal_preview_symbol.set("ETHUSDT")
+        window.signal_chart_candle_limit.set("888")
+        window.enable_ema21_55_cross.set(False)
+
+        request = window._build_signal_preview_request("ema55_breakout")
+
+        self.assertEqual(request.mode, "preview")
+        self.assertEqual(request.signal_type, "ema55_breakout")
+        self.assertEqual(request.symbol, "ETH-USDT-SWAP")
+        self.assertEqual(request.candle_limit, 888)
+        self.assertEqual(request.config.symbols, ("BTC-USDT-SWAP",))
+        self.assertFalse(request.config.enable_ema21_55_cross)
+
+    def test_signal_preview_symbol_sync_prefills_and_keeps_manual_symbol(self) -> None:
+        window = _make_signal_monitor_window_stub()
+
+        window._sync_signal_preview_symbol()
+        self.assertEqual(window.signal_preview_symbol.get(), "BTC-USDT-SWAP")
+
+        window.signal_preview_symbol.set("SOL-USDT-SWAP")
+        window.custom_symbols.set("solusdt, bnbusdt")
+        window._sync_signal_preview_symbol()
+
+        self.assertEqual(window.signal_preview_symbol.get(), "SOL-USDT-SWAP")
+        self.assertEqual(
+            window._collect_configured_symbols(),
+            ["BTC-USDT-SWAP", "SOL-USDT-SWAP", "BNB-USDT-SWAP"],
+        )

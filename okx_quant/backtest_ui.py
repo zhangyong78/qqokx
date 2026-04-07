@@ -792,17 +792,15 @@ class BacktestWindow:
         self._batch_snapshot_groups: dict[str, list[str]] = {}
         self._snapshot_batch_labels: dict[str, str] = {}
         self._current_matrix_batch_label: str | None = None
-        self._content_pane: ttk.Panedwindow | None = None
-        self._report_pane: ttk.Panedwindow | None = None
 
         self._build_layout()
         self._apply_selected_strategy_definition()
         self._update_sizing_mode_widgets()
-        self.window.after_idle(self._apply_initial_layout_preferences)
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
         self.window.rowconfigure(1, weight=1)
+        self.window.rowconfigure(2, weight=2)
 
         controls = ttk.LabelFrame(self.window, text="回测参数", padding=16)
         controls.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
@@ -946,18 +944,13 @@ class BacktestWindow:
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.batch_backtest_button = None
 
-        content_pane = ttk.Panedwindow(self.window, orient="vertical")
-        content_pane.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
-        self._content_pane = content_pane
-
-        report_frame = ttk.Panedwindow(content_pane, orient="horizontal")
-        self._report_pane = report_frame
+        report_frame = ttk.Panedwindow(self.window, orient="horizontal")
+        report_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
 
         summary_frame = ttk.LabelFrame(report_frame, text="回测报告", padding=12)
         trades_frame = ttk.LabelFrame(report_frame, text="交易明细", padding=12)
         report_frame.add(summary_frame, weight=1)
         report_frame.add(trades_frame, weight=1)
-        content_pane.add(report_frame, weight=2)
 
         summary_frame.columnconfigure(0, weight=1)
         summary_frame.rowconfigure(0, weight=1)
@@ -1167,10 +1160,10 @@ class BacktestWindow:
         self.trade_tree.configure(yscrollcommand=trade_tree_scroll_y.set)
         trade_tree_scroll_y.grid(row=0, column=1, sticky="ns")
 
-        self.chart_frame = ttk.LabelFrame(content_pane, text="K线图、资金曲线与止盈止损触发位置 | 暂无选中回测", padding=12)
+        self.chart_frame = ttk.LabelFrame(self.window, text="K线图、资金曲线与止盈止损触发位置 | 暂无选中回测", padding=12)
+        self.chart_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
         self.chart_frame.columnconfigure(0, weight=1)
         self.chart_frame.rowconfigure(1, weight=1)
-        content_pane.add(self.chart_frame, weight=3)
 
         chart_toolbar = ttk.Frame(self.chart_frame)
         chart_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -1187,29 +1180,6 @@ class BacktestWindow:
         self.chart_canvas.bind("<Double-Button-1>", lambda *_: self.open_chart_zoom_window())
         self.chart_canvas.bind("<Configure>", self._schedule_chart_redraw)
         self._bind_chart_interactions(self.chart_canvas)
-
-    def _apply_initial_layout_preferences(self) -> None:
-        self.window.update_idletasks()
-        window_height = max(self.window.winfo_height(), self.window.winfo_reqheight())
-        window_width = max(self.window.winfo_width(), self.window.winfo_reqwidth())
-
-        if self._content_pane is not None and len(self._content_pane.panes()) >= 2:
-            content_height = max(self._content_pane.winfo_height(), window_height - 260)
-            top_ratio = 0.34 if window_height < 920 else 0.38
-            report_height = max(240, min(int(content_height * top_ratio), content_height - 300))
-            try:
-                self._content_pane.sashpos(0, report_height)
-            except Exception:
-                pass
-
-        if self._report_pane is not None and len(self._report_pane.panes()) >= 2:
-            report_width = max(self._report_pane.winfo_width(), window_width - 80)
-            left_ratio = 0.42 if window_width < 1400 else 0.45
-            summary_width = max(420, min(int(report_width * left_ratio), report_width - 520))
-            try:
-                self._report_pane.sashpos(0, summary_width)
-            except Exception:
-                pass
 
     def _update_sizing_mode_widgets(self) -> None:
         mode = BACKTEST_SIZING_OPTIONS.get(self.sizing_mode_label.get(), "fixed_risk")
