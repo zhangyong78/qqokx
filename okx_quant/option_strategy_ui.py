@@ -216,6 +216,9 @@ class OptionStrategyCalculatorWindow:
         ttk.Button(strategy_actions, text="保存", width=10, command=self.save_current_strategy).grid(
             row=0, column=1, sticky="ew", padx=(6, 0)
         )
+        ttk.Button(strategy_actions, text="删除", width=10, command=self.delete_selected_strategy).grid(
+            row=0, column=2, sticky="ew", padx=(6, 0)
+        )
 
         market_panel = ttk.Frame(controls)
         market_panel.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
@@ -1624,6 +1627,33 @@ class OptionStrategyCalculatorWindow:
             messagebox.showerror("加载策略失败", str(exc), parent=self.window)
             return
         self.status_text.set(f"策略 {name} 已加载。")
+
+    def delete_selected_strategy(self) -> None:
+        name = self.saved_strategy_name.get().strip()
+        if not name:
+            messagebox.showinfo("删除策略", "请先从已保存策略里选择一个名称。", parent=self.window)
+            return
+        record = next((item for item in self._saved_strategies if str(item.get("name", "")).strip() == name), None)
+        if record is None:
+            messagebox.showerror("删除策略失败", "没有找到对应的策略记录。", parent=self.window)
+            return
+        confirmed = messagebox.askyesno("删除策略", f"确定删除策略 {name} 吗？", parent=self.window)
+        if not confirmed:
+            return
+
+        records = [item for item in self._saved_strategies if str(item.get("name", "")).strip() != name]
+        try:
+            save_option_strategies_snapshot(records)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("删除策略失败", str(exc), parent=self.window)
+            return
+
+        self._saved_strategies = records
+        if self.strategy_name.get().strip() == name:
+            self.strategy_name.set("")
+        self.saved_strategy_name.set("")
+        self._refresh_saved_strategy_options()
+        self.status_text.set(f"策略 {name} 已删除。")
 
     def _apply_saved_strategy(self, record: dict[str, object]) -> None:
         self.strategy_name.set(str(record.get("name", "")))
