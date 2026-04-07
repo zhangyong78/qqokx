@@ -1,4 +1,5 @@
 from decimal import Decimal
+from tkinter import BooleanVar, StringVar, Tcl
 from unittest import TestCase
 
 from okx_quant.models import Candle
@@ -19,6 +20,7 @@ from okx_quant.signal_monitor import (
 )
 from okx_quant.signal_monitor_ui import (
     SignalMonitorWindow,
+    SignalMonitorDefaults,
     _format_monitor_diagnostic_round,
     _normalize_signal_chart_viewport,
     _pan_signal_chart_viewport,
@@ -51,6 +53,27 @@ def _make_candles(closes: list[Decimal]) -> list[Candle]:
             )
         )
     return candles
+
+
+def _make_signal_monitor_window_stub() -> SignalMonitorWindow:
+    interp = Tcl()
+    window = SignalMonitorWindow.__new__(SignalMonitorWindow)
+    window._defaults = SignalMonitorDefaults()
+    window._signal_preview_symbol_box = None
+    window._test_interp = interp
+    window.bar = StringVar(master=interp, value="4H")
+    window.custom_symbols = StringVar(master=interp, value="")
+    window.pattern_ema_period = StringVar(master=interp, value=window._defaults.pattern_ema_period)
+    window.ema_near_tolerance = StringVar(master=interp, value=window._defaults.ema_near_tolerance)
+    window.body_ratio_threshold = StringVar(master=interp, value=window._defaults.body_ratio_threshold)
+    window.wick_ratio_threshold = StringVar(master=interp, value=window._defaults.wick_ratio_threshold)
+    window.signal_chart_candle_limit = StringVar(master=interp, value="1000")
+    window.signal_preview_symbol = StringVar(master=interp, value="")
+    window._symbol_vars = {
+        "BTCUSDT": ("BTC-USDT-SWAP", BooleanVar(master=interp, value=True)),
+        "ETHUSDT": ("ETH-USDT-SWAP", BooleanVar(master=interp, value=False)),
+    }
+    return window
 
 
 class SignalMonitorTest(TestCase):
@@ -232,6 +255,34 @@ class SignalMonitorTest(TestCase):
         self.assertIn("方向：long", body)
         self.assertIn("参考价：123.5", body)
         self.assertIn("说明：测试信号", body)
+
+    def test_signal_preview_request_uses_selected_signal_and_candle_limit(self) -> None:
+        window = _make_signal_monitor_window_stub()
+        window.signal_preview_symbol.set("ETH-USDT-SWAP")
+        window.signal_chart_candle_limit.set("1200")
+
+        request = window._build_signal_preview_request("ema55_breakout")
+
+        self.assertEqual(request.mode, "preview")
+        self.assertEqual(request.symbol, "ETH-USDT-SWAP")
+        self.assertEqual(request.candle_limit, 1200)
+        self.assertEqual(request.config.symbols, ("ETH-USDT-SWAP",))
+        self.assertFalse(request.config.enable_ema21_55_cross)
+        self.assertFalse(request.config.enable_ema55_slope_turn)
+        self.assertTrue(request.config.enable_ema55_breakout)
+        self.assertFalse(request.config.enable_candle_pattern)
+
+    def test_signal_preview_symbol_sync_prefills_but_keeps_manual_symbol(self) -> None:
+        window = _make_signal_monitor_window_stub()
+
+        window._sync_signal_preview_symbol()
+        self.assertEqual(window.signal_preview_symbol.get(), "BTC-USDT-SWAP")
+
+        window.signal_preview_symbol.set("SOL-USDT-SWAP")
+        window._symbol_vars["BTCUSDT"][1].set(False)
+        window._symbol_vars["ETHUSDT"][1].set(True)
+        window._sync_signal_preview_symbol()
+        self.assertEqual(window.signal_preview_symbol.get(), "SOL-USDT-SWAP")
 
     def test_signal_reason_formats_values_by_tick_size(self) -> None:
         closes = [Decimal("100")] * 55 + [Decimal("105"), Decimal("104"), Decimal("103"), Decimal("80")]

@@ -17,7 +17,8 @@ def load_app_version() -> str:
     if not pyproject.exists():
         return DEFAULT_APP_VERSION
     try:
-        payload = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        with pyproject.open("rb") as handle:
+            payload = tomllib.load(handle)
         project = payload.get("project", {})
         version = str(project.get("version", "")).strip()
         return version or DEFAULT_APP_VERSION

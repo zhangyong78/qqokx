@@ -1,4 +1,5 @@
 from decimal import Decimal
+from tkinter import BooleanVar, StringVar, Tcl
 from unittest import TestCase
 
 from okx_quant.deribit_client import DeribitVolatilityCandle
@@ -15,9 +16,11 @@ from okx_quant.deribit_volatility_monitor import (
     detect_ema34_turn_up,
     detect_squeeze_breakout_down,
     detect_squeeze_breakout_up,
+    evaluate_volatility_signal_history,
     evaluate_volatility_signal_report,
     format_volatility_diagnostic_round,
 )
+from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow, VolatilityMonitorDefaults
 
 
 def _candle(
@@ -34,6 +37,27 @@ def _candle(
         low=Decimal(str(low_price)),
         close=Decimal(str(close_price)),
     )
+
+
+def _make_volatility_monitor_window_stub() -> DeribitVolatilityMonitorWindow:
+    interp = Tcl()
+    window = DeribitVolatilityMonitorWindow.__new__(DeribitVolatilityMonitorWindow)
+    window._defaults = VolatilityMonitorDefaults()
+    window.resolution_label = StringVar(master=interp, value=window._defaults.resolution_label)
+    window.buffer_seconds = StringVar(master=interp, value=window._defaults.buffer_seconds)
+    window.ema_period = StringVar(master=interp, value=window._defaults.ema_period)
+    window.trend_streak_bars = StringVar(master=interp, value=window._defaults.trend_streak_bars)
+    window.squeeze_bars = StringVar(master=interp, value=window._defaults.squeeze_bars)
+    window.lookback_candles = StringVar(master=interp, value=window._defaults.lookback_candles)
+    window.cumulative_change_threshold = StringVar(master=interp, value=window._defaults.cumulative_change_threshold)
+    window.reversal_body_multiplier = StringVar(master=interp, value=window._defaults.reversal_body_multiplier)
+    window.breakout_body_multiplier = StringVar(master=interp, value=window._defaults.breakout_body_multiplier)
+    window.squeeze_range_ratio = StringVar(master=interp, value=window._defaults.squeeze_range_ratio)
+    window.signal_chart_candle_limit = StringVar(master=interp, value="1000")
+    window.signal_preview_currency = StringVar(master=interp, value="BTC")
+    window.enable_btc = BooleanVar(master=interp, value=True)
+    window.enable_eth = BooleanVar(master=interp, value=False)
+    return window
 
 
 class DeribitVolatilityMonitorSignalsTest(TestCase):
@@ -323,6 +347,30 @@ class DeribitVolatilityMonitorSignalsTest(TestCase):
         self.assertEqual(len(report.filtered_events), 1)
         self.assertEqual(report.filtered_events[0].signal_type, "bearish_reversal_after_rally")
 
+    def test_signal_history_replays_matching_bearish_reversal(self) -> None:
+        config = VolatilityMonitorConfig(currencies=("BTC",), trend_streak_bars=4)
+        candles = [
+            _candle(0, "90", "91", "89", "90"),
+            _candle(1, "91", "92", "90", "91"),
+            _candle(2, "100", "102", "99", "101"),
+            _candle(3, "103", "105", "102", "104"),
+            _candle(4, "106", "108", "105", "107"),
+            _candle(5, "109", "111", "108", "110"),
+            _candle(6, "113", "114", "103", "104"),
+        ]
+
+        events = evaluate_volatility_signal_history(
+            candles,
+            "BTC",
+            config,
+            signal_type="bearish_reversal_after_rally",
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].signal_type, "bearish_reversal_after_rally")
+        self.assertEqual(events[0].direction, "down")
+        self.assertEqual(events[0].candle_ts, candles[-1].ts)
+
     def test_format_diagnostic_round_shows_new_filtered_and_errors(self) -> None:
         config = VolatilityMonitorConfig(currencies=("BTC",))
         up_event = detect_ema34_turn_up(
@@ -361,3 +409,30 @@ class DeribitVolatilityMonitorSignalsTest(TestCase):
 
     def test_resolution_seconds_mapping_contains_hourly(self) -> None:
         self.assertEqual(DERIBIT_VOL_RESOLUTION_SECONDS["3600"], 3600)
+
+
+class DeribitVolatilityMonitorUiTest(TestCase):
+    def test_signal_preview_request_uses_selected_signal_and_candle_limit(self) -> None:
+        window = _make_volatility_monitor_window_stub()
+        window.signal_preview_currency.set("ETH")
+        window.signal_chart_candle_limit.set("1200")
+
+        request = window._build_signal_preview_request("ema34_turn_down")
+
+        self.assertEqual(request.mode, "preview")
+        self.assertEqual(request.currency, "ETH")
+        self.assertEqual(request.candle_limit, 1200)
+        self.assertEqual(request.config.currencies, ("ETH",))
+        self.assertFalse(request.config.enable_bearish_reversal_after_rally)
+        self.assertFalse(request.config.enable_bullish_reversal_after_drop)
+        self.assertFalse(request.config.enable_ema34_turn_up)
+        self.assertTrue(request.config.enable_ema34_turn_down)
+
+    def test_collect_configured_currencies_returns_checked_items(self) -> None:
+        window = _make_volatility_monitor_window_stub()
+
+        self.assertEqual(window._collect_configured_currencies(), ["BTC"])
+
+        window.enable_btc.set(False)
+        window.enable_eth.set(True)
+        self.assertEqual(window._collect_configured_currencies(), ["ETH"])

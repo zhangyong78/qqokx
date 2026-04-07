@@ -318,6 +318,28 @@ def evaluate_volatility_signal_report(
     )
 
 
+def evaluate_volatility_signal_history(
+    candles: list[DeribitVolatilityCandle],
+    currency: str,
+    config: VolatilityMonitorConfig,
+    *,
+    signal_type: VolatilitySignalType | None = None,
+    direction: VolatilityDirection | None = None,
+) -> list[VolatilitySignalEvent]:
+    matched_events: list[VolatilitySignalEvent] = []
+    for index in range(len(candles)):
+        prefix_candles = candles[: index + 1]
+        for event in _detect_all_volatility_signals(prefix_candles, currency, config):
+            if not _is_signal_enabled(config, event.signal_type):
+                continue
+            if signal_type is not None and event.signal_type != signal_type:
+                continue
+            if direction is not None and event.direction != direction:
+                continue
+            matched_events.append(event)
+    return matched_events
+
+
 def _detect_all_volatility_signals(
     candles: list[DeribitVolatilityCandle],
     currency: str,
