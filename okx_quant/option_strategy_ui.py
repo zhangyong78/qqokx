@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import math
-from tkinter import BOTH, END, Canvas, DoubleVar, StringVar, Toplevel, simpledialog
+from tkinter import BOTH, END, BooleanVar, Canvas, DoubleVar, StringVar, Toplevel, simpledialog
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
@@ -123,6 +123,7 @@ class OptionStrategyCalculatorWindow:
         self.bar = StringVar(value="15m")
         self.candle_limit = StringVar(value="2000")
         self.chart_display_ccy = StringVar(value="USDT")
+        self.combo_hide_wicks = BooleanVar(value=False)
         self.payoff_time_progress = DoubleVar(value=100.0)
         self.payoff_vol_shift_percent = DoubleVar(value=0.0)
         self.payoff_sim_date_text = StringVar(value="估值日 -")
@@ -472,7 +473,7 @@ class OptionStrategyCalculatorWindow:
         combo_tab.rowconfigure(2, weight=1)
         combo_toolbar = ttk.Frame(combo_tab)
         combo_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        combo_toolbar.columnconfigure(7, weight=1)
+        combo_toolbar.columnconfigure(8, weight=1)
         ttk.Label(combo_toolbar, text="K线周期").grid(row=0, column=0, sticky="w")
         combo_bar_combo = ttk.Combobox(combo_toolbar, textvariable=self.bar, values=BAR_OPTIONS, state="readonly", width=10)
         combo_bar_combo.grid(row=0, column=1, sticky="w", padx=(6, 14))
@@ -492,7 +493,13 @@ class OptionStrategyCalculatorWindow:
         combo_ccy_combo.grid(row=0, column=5, sticky="w", padx=(6, 14))
         combo_ccy_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_chart_display(combo_only=True))
         ttk.Label(combo_toolbar, text="只影响组合K线").grid(row=0, column=6, sticky="w")
-        ttk.Button(combo_toolbar, text="刷新组合K线", command=self.refresh_combo_chart).grid(row=0, column=8, sticky="e")
+        ttk.Checkbutton(
+            combo_toolbar,
+            text="消除影线",
+            variable=self.combo_hide_wicks,
+            command=lambda: self._refresh_chart_display(combo_only=True),
+        ).grid(row=0, column=7, sticky="w", padx=(10, 0))
+        ttk.Button(combo_toolbar, text="刷新组合K线", command=self.refresh_combo_chart).grid(row=0, column=9, sticky="e")
         ttk.Label(combo_tab, textvariable=self.combo_summary_text, justify="left", wraplength=1040).grid(
             row=1, column=0, sticky="w", pady=(0, 8)
         )
@@ -2471,6 +2478,20 @@ class OptionStrategyCalculatorWindow:
             self._clear_canvas(canvas, "没有可用的组合 K 线数据。")
             return
 
+        hide_wicks = bool(self.combo_hide_wicks.get())
+        display_candles = [
+            Candle(
+                ts=candle.ts,
+                open=candle.open,
+                high=max(candle.open, candle.close) if hide_wicks else candle.high,
+                low=min(candle.open, candle.close) if hide_wicks else candle.low,
+                close=candle.close,
+                volume=candle.volume,
+                confirmed=candle.confirmed,
+            )
+            for candle in candles
+        ]
+
         canvas.delete("all")
         width = max(canvas.winfo_width(), 960)
         height = max(canvas.winfo_height(), 420)
@@ -2483,8 +2504,8 @@ class OptionStrategyCalculatorWindow:
         if inner_width <= 0 or inner_height <= 0:
             return
 
-        price_max = max(item.high for item in candles)
-        price_min = min(item.low for item in candles)
+        price_max = max(item.high for item in display_candles)
+        price_min = min(item.low for item in display_candles)
         if price_max == price_min:
             price_max += Decimal("1")
             price_min -= Decimal("1")
@@ -2517,15 +2538,17 @@ class OptionStrategyCalculatorWindow:
         x_positions: list[float] = []
         close_y_positions: list[float] = []
         for index, candle in enumerate(candles):
+            display_candle = display_candles[index]
             x = x_for(index)
             open_y = y_for(candle.open)
             close_y = y_for(candle.close)
-            high_y = y_for(candle.high)
-            low_y = y_for(candle.low)
+            high_y = y_for(display_candle.high)
+            low_y = y_for(display_candle.low)
             x_positions.append(x)
             close_y_positions.append(close_y)
-            color = "#cf222e" if candle.close >= candle.open else "#1a7f37"
-            canvas.create_line(x, high_y, x, low_y, fill=color, width=1)
+            color = "#1a7f37" if candle.close >= candle.open else "#cf222e"
+            if not hide_wicks:
+                canvas.create_line(x, high_y, x, low_y, fill=color, width=1)
             body_top = min(open_y, close_y)
             body_bottom = max(open_y, close_y)
             if abs(body_bottom - body_top) < 1:
@@ -2646,7 +2669,7 @@ class OptionStrategyCalculatorWindow:
             low_y = y_for(candle.low)
             x_positions.append(x)
             close_y_positions.append(close_y)
-            color = "#cf222e" if candle.close >= candle.open else "#1a7f37"
+            color = "#1a7f37" if candle.close >= candle.open else "#cf222e"
             canvas.create_line(x, high_y, x, low_y, fill=color, width=1)
             body_top = min(open_y, close_y)
             body_bottom = max(open_y, close_y)
