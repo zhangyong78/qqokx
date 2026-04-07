@@ -124,7 +124,7 @@ class PersistenceTest(TestCase):
         self.assertEqual(len(snapshot["strategies"]), 1)
         record = snapshot["strategies"][0]
         self.assertEqual(record["name"], "Bull Call")
-        self.assertEqual(record["candle_limit"], "600")
+        self.assertEqual(record["candle_limit"], "2000")
         self.assertEqual(record["chart_display_ccy"], "USDT")
         self.assertEqual(record["combo_chart_mode"], "pnl")
         self.assertEqual(record["formula"], "L1 - L2")

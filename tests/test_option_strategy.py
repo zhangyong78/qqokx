@@ -3,6 +3,14 @@ from decimal import Decimal
 from unittest import TestCase
 
 from okx_quant.models import Candle, Instrument
+from okx_quant.option_strategy_ui import (
+    _align_overlay_candles,
+    _annualization_factor_for_bar,
+    _build_volatility_candles_from_reference,
+    _normalized_kline_view,
+    _pan_kline_view,
+    _zoom_kline_view,
+)
 from okx_quant.option_strategy import (
     OptionQuote,
     StrategyLegDefinition,
@@ -48,6 +56,66 @@ def _make_instrument(inst_id: str) -> Instrument:
 
 
 class OptionStrategyTest(TestCase):
+    def test_build_volatility_candles_from_reference_generates_kline_series(self) -> None:
+        candles: list[Candle] = []
+        base_price = Decimal("60000")
+        for index in range(25):
+            close = base_price + Decimal(index * 100)
+            candles.append(
+                Candle(
+                    ts=1_700_000_000_000 + (index * 3_600_000),
+                    open=close - Decimal("50"),
+                    high=close + Decimal("80"),
+                    low=close - Decimal("120"),
+                    close=close,
+                    volume=Decimal("0"),
+                    confirmed=True,
+                )
+            )
+
+        volatility_candles = _build_volatility_candles_from_reference(candles, bar="1H", lookback=20)
+
+        self.assertEqual(len(volatility_candles), 5)
+        self.assertTrue(all(item.close >= 0 for item in volatility_candles))
+        self.assertEqual(volatility_candles[-1].ts, candles[-1].ts)
+
+    def test_annualization_factor_for_4h_is_positive(self) -> None:
+        factor = _annualization_factor_for_bar("4H")
+        self.assertGreater(factor, 0.0)
+
+    def test_align_overlay_candles_uses_common_timestamps(self) -> None:
+        combo_candles = [
+            Candle(ts=1000, open=Decimal("1"), high=Decimal("2"), low=Decimal("0.5"), close=Decimal("1.5"), volume=Decimal("0"), confirmed=True),
+            Candle(ts=2000, open=Decimal("1.5"), high=Decimal("2.2"), low=Decimal("1.2"), close=Decimal("2.0"), volume=Decimal("0"), confirmed=True),
+            Candle(ts=3000, open=Decimal("2.0"), high=Decimal("2.4"), low=Decimal("1.8"), close=Decimal("2.1"), volume=Decimal("0"), confirmed=True),
+        ]
+        volatility_candles = [
+            Candle(ts=2000, open=Decimal("45"), high=Decimal("46"), low=Decimal("44"), close=Decimal("45.5"), volume=Decimal("0"), confirmed=True),
+            Candle(ts=3000, open=Decimal("45.5"), high=Decimal("47"), low=Decimal("45"), close=Decimal("46.2"), volume=Decimal("0"), confirmed=True),
+            Candle(ts=4000, open=Decimal("46.2"), high=Decimal("48"), low=Decimal("46"), close=Decimal("47.8"), volume=Decimal("0"), confirmed=True),
+        ]
+
+        aligned = _align_overlay_candles(combo_candles, volatility_candles)
+
+        self.assertEqual(len(aligned), 2)
+        self.assertEqual([item[0].ts for item in aligned], [2000, 3000])
+        self.assertEqual([item[1].ts for item in aligned], [2000, 3000])
+
+    def test_normalized_kline_view_returns_full_when_auto_full(self) -> None:
+        start, visible = _normalized_kline_view(200, 20, 50, auto_full=True)
+        self.assertEqual((start, visible), (0, 200))
+
+    def test_zoom_kline_view_keeps_focus_inside_bounds(self) -> None:
+        start, visible = _zoom_kline_view(2000, 0, 2000, focus_ratio=0.5, zoom_in=True)
+        self.assertLess(visible, 2000)
+        self.assertGreaterEqual(start, 0)
+        self.assertLessEqual(start + visible, 2000)
+
+    def test_pan_kline_view_clamps_to_available_range(self) -> None:
+        start, visible = _pan_kline_view(500, 100, 120, delta_items=600)
+        self.assertEqual(visible, 120)
+        self.assertEqual(start, 380)
+
     def test_parse_option_contract_extracts_fields(self) -> None:
         parsed = parse_option_contract("BTC-USD-260626-90000-C")
         self.assertEqual(parsed.inst_family, "BTC-USD")

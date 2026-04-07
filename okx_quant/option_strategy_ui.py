@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+import math
 from tkinter import BOTH, END, Canvas, DoubleVar, StringVar, Toplevel, simpledialog
 from tkinter import messagebox, ttk
 from typing import Any, Callable
@@ -41,7 +42,7 @@ from okx_quant.window_layout import apply_adaptive_window_geometry
 Logger = Callable[[str], None]
 BAR_OPTIONS = ["1m", "3m", "5m", "15m", "1H", "4H"]
 DEFAULT_OPTION_FAMILY_OPTIONS = ("BTC-USD", "ETH-USD")
-MAX_OPTION_COMBO_CANDLES = 1200
+MAX_OPTION_COMBO_CANDLES = 2000
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,13 @@ class ComboChartHoverState:
     value_ccy: str
 
 
+@dataclass
+class KlineChartViewState:
+    start_index: int = 0
+    visible_count: int | None = None
+    auto_full: bool = True
+
+
 class OptionStrategyCalculatorWindow:
     def __init__(
         self,
@@ -113,7 +121,7 @@ class OptionStrategyCalculatorWindow:
         self.expiry_code = StringVar()
         self.default_quantity = StringVar(value="1")
         self.bar = StringVar(value="15m")
-        self.candle_limit = StringVar(value="600")
+        self.candle_limit = StringVar(value="2000")
         self.chart_display_ccy = StringVar(value="USDT")
         self.payoff_time_progress = DoubleVar(value=100.0)
         self.payoff_vol_shift_percent = DoubleVar(value=0.0)
@@ -124,6 +132,8 @@ class OptionStrategyCalculatorWindow:
         self.strategy_summary_text = StringVar(value="暂无策略腿。")
         self.payoff_summary_text = StringVar(value="加入策略腿后，可生成到期盈亏图。")
         self.combo_summary_text = StringVar(value="组合 K 线采用 OKX 期权标记价格。")
+        self.volatility_summary_text = StringVar(value="波动率 K 线基于标的现货历史收盘收益率估算。")
+        self.overlay_summary_text = StringVar(value="叠加图使用左轴显示组合K线，右轴显示历史波动率K线。")
 
         self._family_combo: ttk.Combobox | None = None
         self._expiry_combo: ttk.Combobox | None = None
@@ -133,6 +143,13 @@ class OptionStrategyCalculatorWindow:
         self._legs_tree: ttk.Treeview | None = None
         self._payoff_canvas: Canvas | None = None
         self._combo_canvas: Canvas | None = None
+        self._big_chart_window: Toplevel | None = None
+        self._big_payoff_canvas: Canvas | None = None
+        self._big_combo_canvas: Canvas | None = None
+        self._big_volatility_canvas: Canvas | None = None
+        self._big_overlay_combo_canvas: Canvas | None = None
+        self._big_overlay_volatility_canvas: Canvas | None = None
+        self._big_chart_redraw_after_id: str | None = None
 
         self._all_option_instruments: list[Instrument] = []
         self._family_instruments_cache: dict[str, list[Instrument]] = {}
@@ -149,13 +166,18 @@ class OptionStrategyCalculatorWindow:
         self._latest_payoff_snapshot: StrategyPayoffSnapshot | None = None
         self._latest_expiry_payoff_snapshot: StrategyPayoffSnapshot | None = None
         self._latest_combo_value: Decimal | None = None
+        self._latest_combo_requested_limit: int | None = None
+        self._latest_combo_source_counts: dict[str, int] = {}
         self._latest_chart_formula = ""
         self._latest_resolved_legs: list[ResolvedStrategyLeg] = []
         self._latest_implied_volatility_by_alias: dict[str, Decimal] = {}
         self._latest_payoff_loaded_at: datetime | None = None
         self._latest_payoff_expiry_at: datetime | None = None
         self._payoff_hover_state: PayoffChartHoverState | None = None
+        self._big_payoff_hover_state: PayoffChartHoverState | None = None
         self._combo_hover_state: ComboChartHoverState | None = None
+        self._kline_view_states: dict[str, KlineChartViewState] = {}
+        self._kline_drag_states: dict[str, tuple[float, int, int]] = {}
         self._did_initial_chain_refresh = False
         self._chain_request_id = 0
         self._chart_request_id = 0
@@ -271,6 +293,9 @@ class OptionStrategyCalculatorWindow:
         )
         ttk.Button(formula_actions, text="刷新图表", width=12, command=self.refresh_charts).grid(
             row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+        ttk.Button(formula_actions, text="图表大窗", width=12, command=self.open_big_chart_window).grid(
+            row=0, column=2, sticky="ew", padx=(6, 0)
         )
         ttk.Label(
             formula_panel,
@@ -470,6 +495,8 @@ class OptionStrategyCalculatorWindow:
         combo_canvas.grid(row=2, column=0, sticky="nsew")
         combo_canvas.bind("<Motion>", self._on_combo_canvas_motion)
         combo_canvas.bind("<Leave>", lambda _event: self._clear_chart_hover(combo_canvas))
+        combo_canvas.bind("<Configure>", lambda _event: self._redraw_kline_chart("main_combo"))
+        self._bind_kline_chart_interactions(combo_canvas, "main_combo")
         charts.add(combo_tab, text="组合K线")
         self._combo_canvas = combo_canvas
         self._update_chain_context_ui()
@@ -1148,6 +1175,313 @@ class OptionStrategyCalculatorWindow:
             daemon=True,
         ).start()
 
+    def open_big_chart_window(self) -> None:
+        window = self._ensure_big_chart_window()
+        if not window.winfo_exists():
+            return
+        window.deiconify()
+        window.lift()
+        window.focus_force()
+        self._refresh_big_chart_window()
+
+    def _ensure_big_chart_window(self) -> Toplevel:
+        if self._big_chart_window is not None and self._big_chart_window.winfo_exists():
+            return self._big_chart_window
+
+        window = Toplevel(self.window)
+        window.title("期权策略图表大窗")
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.92,
+            height_ratio=0.9,
+            min_width=1320,
+            min_height=880,
+            max_width=1920,
+            max_height=1280,
+        )
+        window.protocol("WM_DELETE_WINDOW", window.withdraw)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        notebook = ttk.Notebook(window)
+        notebook.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+
+        payoff_tab = ttk.Frame(notebook, padding=12)
+        payoff_tab.columnconfigure(0, weight=1)
+        payoff_tab.rowconfigure(1, weight=1)
+        ttk.Label(payoff_tab, textvariable=self.payoff_summary_text, justify="left", wraplength=1260).grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
+        payoff_canvas = Canvas(payoff_tab, background="#ffffff", highlightthickness=0, cursor="crosshair")
+        payoff_canvas.grid(row=1, column=0, sticky="nsew")
+        payoff_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
+        payoff_canvas.bind("<Motion>", self._on_big_payoff_canvas_motion)
+        payoff_canvas.bind("<Leave>", lambda _event: self._clear_chart_hover(payoff_canvas))
+        notebook.add(payoff_tab, text="到期盈亏图")
+
+        combo_tab = ttk.Frame(notebook, padding=12)
+        combo_tab.columnconfigure(0, weight=1)
+        combo_tab.rowconfigure(1, weight=1)
+        ttk.Label(combo_tab, textvariable=self.combo_summary_text, justify="left", wraplength=1260).grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
+        combo_canvas = Canvas(combo_tab, background="#ffffff", highlightthickness=0)
+        combo_canvas.grid(row=1, column=0, sticky="nsew")
+        combo_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
+        self._bind_kline_chart_interactions(combo_canvas, "big_combo")
+        notebook.add(combo_tab, text="组合K线")
+
+        volatility_tab = ttk.Frame(notebook, padding=12)
+        volatility_tab.columnconfigure(0, weight=1)
+        volatility_tab.rowconfigure(1, weight=1)
+        ttk.Label(volatility_tab, textvariable=self.volatility_summary_text, justify="left", wraplength=1260).grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
+        volatility_canvas = Canvas(volatility_tab, background="#ffffff", highlightthickness=0)
+        volatility_canvas.grid(row=1, column=0, sticky="nsew")
+        volatility_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
+        self._bind_kline_chart_interactions(volatility_canvas, "big_volatility")
+        notebook.add(volatility_tab, text="波动率K线")
+
+        overlay_tab = ttk.Frame(notebook, padding=12)
+        overlay_tab.columnconfigure(0, weight=1)
+        overlay_tab.rowconfigure(1, weight=3)
+        overlay_tab.rowconfigure(2, weight=2)
+        ttk.Label(overlay_tab, textvariable=self.overlay_summary_text, justify="left", wraplength=1260).grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
+        overlay_combo_canvas = Canvas(overlay_tab, background="#ffffff", highlightthickness=0, cursor="crosshair")
+        overlay_combo_canvas.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        overlay_combo_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
+        self._bind_kline_chart_interactions(overlay_combo_canvas, "big_overlay")
+        overlay_volatility_canvas = Canvas(overlay_tab, background="#ffffff", highlightthickness=0, cursor="crosshair")
+        overlay_volatility_canvas.grid(row=2, column=0, sticky="nsew")
+        overlay_volatility_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
+        self._bind_kline_chart_interactions(overlay_volatility_canvas, "big_overlay")
+        notebook.add(overlay_tab, text="叠加对比")
+
+        self._big_chart_window = window
+        self._big_payoff_canvas = payoff_canvas
+        self._big_combo_canvas = combo_canvas
+        self._big_volatility_canvas = volatility_canvas
+        self._big_overlay_combo_canvas = overlay_combo_canvas
+        self._big_overlay_volatility_canvas = overlay_volatility_canvas
+        return window
+
+    def _bind_kline_chart_interactions(self, canvas: Canvas, key: str) -> None:
+        canvas.bind("<MouseWheel>", lambda event, chart_key=key: self._on_kline_chart_mousewheel(chart_key, event))
+        canvas.bind("<Button-4>", lambda event, chart_key=key: self._on_kline_chart_mousewheel(chart_key, event))
+        canvas.bind("<Button-5>", lambda event, chart_key=key: self._on_kline_chart_mousewheel(chart_key, event))
+        canvas.bind("<ButtonPress-1>", lambda event, chart_key=key: self._on_kline_chart_drag_start(chart_key, event), add="+")
+        canvas.bind("<B1-Motion>", lambda event, chart_key=key: self._on_kline_chart_drag_motion(chart_key, event), add="+")
+        canvas.bind("<ButtonRelease-1>", lambda _event, chart_key=key: self._on_kline_chart_drag_end(chart_key), add="+")
+
+    def _on_kline_chart_mousewheel(self, key: str, event) -> None:
+        items = self._kline_items_for_key(key)
+        if len(items) < 2:
+            return
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            num = getattr(event, "num", 0)
+            delta = 120 if num == 4 else -120 if num == 5 else 0
+        if delta == 0:
+            return
+        canvas = self._canvas_for_key(key)
+        width = max(canvas.winfo_width() if canvas is not None else 0, 1)
+        focus_ratio = min(1.0, max(0.0, float(getattr(event, "x", 0)) / width))
+        view_state = self._kline_view_states.setdefault(key, KlineChartViewState())
+        start, visible = _normalized_kline_view(len(items), view_state.start_index, view_state.visible_count, auto_full=view_state.auto_full)
+        new_start, new_visible = _zoom_kline_view(len(items), start, visible, focus_ratio=focus_ratio, zoom_in=delta > 0)
+        view_state.start_index = new_start
+        view_state.visible_count = new_visible
+        view_state.auto_full = new_visible >= len(items) and new_start == 0
+        self._redraw_kline_chart(key)
+
+    def _on_kline_chart_drag_start(self, key: str, event) -> None:
+        items = self._kline_items_for_key(key)
+        if len(items) < 2:
+            return
+        view_state = self._kline_view_states.setdefault(key, KlineChartViewState())
+        start, visible = _normalized_kline_view(len(items), view_state.start_index, view_state.visible_count, auto_full=view_state.auto_full)
+        self._kline_drag_states[key] = (float(getattr(event, "x", 0.0)), start, visible)
+
+    def _on_kline_chart_drag_motion(self, key: str, event) -> None:
+        drag_state = self._kline_drag_states.get(key)
+        if drag_state is None:
+            return
+        items = self._kline_items_for_key(key)
+        if len(items) < 2:
+            return
+        canvas = self._canvas_for_key(key)
+        width = max(canvas.winfo_width() if canvas is not None else 0, 1)
+        start_x, base_start, visible = drag_state
+        delta_items = int(round(-(float(getattr(event, "x", 0.0)) - start_x) * visible / width))
+        new_start, new_visible = _pan_kline_view(len(items), base_start, visible, delta_items=delta_items)
+        view_state = self._kline_view_states.setdefault(key, KlineChartViewState())
+        view_state.start_index = new_start
+        view_state.visible_count = new_visible
+        view_state.auto_full = new_visible >= len(items) and new_start == 0
+        self._redraw_kline_chart(key)
+
+    def _on_kline_chart_drag_end(self, key: str) -> None:
+        self._kline_drag_states.pop(key, None)
+
+    def _canvas_for_key(self, key: str) -> Canvas | None:
+        if key == "main_combo":
+            return self._combo_canvas
+        if key == "big_combo":
+            return self._big_combo_canvas
+        if key == "big_volatility":
+            return self._big_volatility_canvas
+        if key == "big_overlay":
+            return self._big_overlay_combo_canvas
+        return None
+
+    def _kline_items_for_key(self, key: str) -> list[Any]:
+        if key in {"main_combo", "big_combo"}:
+            combo_candles, _combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
+            return combo_candles
+        if key == "big_volatility":
+            return self._current_volatility_candles()
+        if key == "big_overlay":
+            combo_candles, _combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
+            return _align_overlay_candles(combo_candles, self._current_volatility_candles())
+        return []
+
+    def _apply_kline_view(self, key: str, items: list[Any]) -> list[Any]:
+        if not items:
+            return items
+        view_state = self._kline_view_states.setdefault(key, KlineChartViewState())
+        start, visible = _normalized_kline_view(len(items), view_state.start_index, view_state.visible_count, auto_full=view_state.auto_full)
+        view_state.start_index = start
+        view_state.visible_count = visible
+        view_state.auto_full = visible >= len(items) and start == 0
+        return items[start : start + visible]
+
+    def _current_volatility_candles(self) -> list[Candle]:
+        return _build_volatility_candles_from_reference(
+            self._latest_spot_usdt_candles,
+            bar=self.bar.get().strip(),
+        )
+
+    def _redraw_kline_chart(self, key: str) -> None:
+        if key == "main_combo":
+            if self._combo_canvas is None or not self._latest_combo_candles:
+                return
+            combo_candles, combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
+            visible = self._apply_kline_view(key, combo_candles)
+            self._draw_combo_chart(self._combo_canvas, visible, combo_ccy)
+            return
+        if key == "big_combo":
+            if self._big_combo_canvas is None or not self._latest_combo_candles:
+                return
+            combo_candles, combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
+            visible = self._apply_kline_view(key, combo_candles)
+            self._draw_combo_chart(self._big_combo_canvas, visible, combo_ccy, enable_hover=False)
+            return
+        if key == "big_volatility":
+            if self._big_volatility_canvas is None:
+                return
+            volatility_candles = self._current_volatility_candles()
+            if not volatility_candles:
+                self._clear_canvas(self._big_volatility_canvas, "暂无可用的波动率 K 线数据。")
+                return
+            visible = self._apply_kline_view(key, volatility_candles)
+            self._draw_volatility_chart(self._big_volatility_canvas, visible, enable_hover=False)
+            return
+        if key == "big_overlay":
+            if self._big_overlay_combo_canvas is None or self._big_overlay_volatility_canvas is None or not self._latest_combo_candles:
+                return
+            combo_candles, combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
+            aligned = _align_overlay_candles(combo_candles, self._current_volatility_candles())
+            if not aligned:
+                self._clear_canvas(self._big_overlay_combo_canvas, "暂无可用的叠加对比数据。")
+                self._clear_canvas(self._big_overlay_volatility_canvas, "暂无可用的叠加对比数据。")
+                return
+            visible = self._apply_kline_view(key, aligned)
+            visible_combo = [item[0] for item in visible]
+            visible_volatility = [item[1] for item in visible]
+            self._draw_combo_chart(self._big_overlay_combo_canvas, visible_combo, combo_ccy, enable_hover=False)
+            self._draw_volatility_chart(self._big_overlay_volatility_canvas, visible_volatility, enable_hover=False)
+
+    def _schedule_big_chart_redraw(self, _event=None) -> None:
+        window = self._big_chart_window
+        if window is None or not window.winfo_exists():
+            return
+        if self._big_chart_redraw_after_id is not None:
+            try:
+                window.after_cancel(self._big_chart_redraw_after_id)
+            except Exception:
+                pass
+        self._big_chart_redraw_after_id = window.after(90, self._refresh_big_chart_window)
+
+    def _refresh_big_chart_window(self) -> None:
+        window = self._big_chart_window
+        if window is None or not window.winfo_exists():
+            return
+        self._big_chart_redraw_after_id = None
+
+        if self._big_payoff_canvas is not None:
+            if self._latest_payoff_snapshot is not None:
+                mode_label = self._payoff_chart_mode_label()
+                payoff_snapshot, payoff_ccy = self._payoff_snapshot_for_display(self._latest_payoff_snapshot)
+                reference_snapshot: StrategyPayoffSnapshot | None = None
+                if (
+                    mode_label != "到期盈亏"
+                    and self._latest_expiry_payoff_snapshot is not None
+                    and self._latest_expiry_payoff_snapshot.points
+                ):
+                    reference_snapshot, _ = self._payoff_snapshot_for_display(self._latest_expiry_payoff_snapshot)
+                self._draw_payoff_chart(
+                    self._big_payoff_canvas,
+                    payoff_snapshot,
+                    payoff_ccy,
+                    mode_label,
+                    reference_snapshot=reference_snapshot,
+                    reference_label="到期盈亏",
+                    enable_hover=True,
+                    hover_target="big",
+                )
+            else:
+                self._clear_canvas(self._big_payoff_canvas, "加入策略腿后，可生成到期盈亏图。")
+
+        if self._big_combo_canvas is not None:
+            if self._latest_combo_candles:
+                combo_candles, combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
+                self._draw_combo_chart(self._big_combo_canvas, combo_candles, combo_ccy, enable_hover=False)
+            else:
+                self._clear_canvas(self._big_combo_canvas, "组合 K 线使用期权标记价格；先加入策略腿再生成。")
+
+        volatility_candles = self._current_volatility_candles()
+
+        if self._big_volatility_canvas is not None:
+            if volatility_candles:
+                self.volatility_summary_text.set(
+                    f"历史波动率 K 线 | 标的现货 {self.bar.get().strip()} | 根数 {len(volatility_candles)} | 周期与组合K线一致"
+                )
+                visible_volatility = self._apply_kline_view("big_volatility", volatility_candles)
+                self._draw_volatility_chart(self._big_volatility_canvas, visible_volatility, enable_hover=False)
+            else:
+                self.volatility_summary_text.set("历史波动率 K 线需要足够的标的现货历史；当前数据不足。")
+                self._clear_canvas(self._big_volatility_canvas, "暂无可用的波动率 K 线数据。")
+
+        if self._big_overlay_combo_canvas is not None and self._big_overlay_volatility_canvas is not None:
+            if self._latest_combo_candles and volatility_candles:
+                combo_candles, combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
+                aligned = _align_overlay_candles(combo_candles, volatility_candles)
+                self.overlay_summary_text.set(
+                    f"叠加对比 | 上图=组合K线({combo_ccy}) | 下图=历史波动率(%) | 共用时间轴 | 周期 {self.bar.get().strip()}"
+                )
+                visible_aligned = self._apply_kline_view("big_overlay", aligned)
+                visible_combo = [item[0] for item in visible_aligned]
+                visible_volatility = [item[1] for item in visible_aligned]
+                self._draw_combo_chart(self._big_overlay_combo_canvas, visible_combo, combo_ccy, enable_hover=False)
+                self._draw_volatility_chart(self._big_overlay_volatility_canvas, visible_volatility, enable_hover=False)
+            else:
+                self.overlay_summary_text.set("叠加对比需要同时具备组合K线与历史波动率K线数据。")
+                self._clear_canvas(self._big_overlay_combo_canvas, "暂无可用的叠加对比数据。")
+                self._clear_canvas(self._big_overlay_volatility_canvas, "暂无可用的叠加对比数据。")
+
     def _load_chart_worker(self, request_id: int, candle_limit: int, formula: str) -> None:
         try:
             active_legs = [StrategyLegDefinition(**leg.__dict__) for leg in self._legs if leg.enabled]
@@ -1221,6 +1555,8 @@ class OptionStrategyCalculatorWindow:
                 lambda: self._apply_chart_snapshot(
                     request_id=request_id,
                     combo_candles=combo_candles,
+                    requested_limit=candle_limit,
+                    source_counts={alias: len(items) for alias, items in candles_by_alias.items()},
                     payoff_snapshot=payoff_snapshot,
                     latest_quotes=latest_quotes,
                     latest_combo_value=combo_last,
@@ -1279,6 +1615,8 @@ class OptionStrategyCalculatorWindow:
                 lambda: self._apply_combo_chart_snapshot(
                     request_id=request_id,
                     combo_candles=combo_candles,
+                    requested_limit=candle_limit,
+                    source_counts={alias: len(items) for alias, items in candles_by_alias.items()},
                     latest_quotes=latest_quotes,
                     latest_combo_value=combo_last,
                     spot_usdt_price=spot_usdt_price,
@@ -1295,6 +1633,8 @@ class OptionStrategyCalculatorWindow:
         *,
         request_id: int,
         combo_candles: list[Candle],
+        requested_limit: int,
+        source_counts: dict[str, int],
         payoff_snapshot: StrategyPayoffSnapshot,
         latest_quotes: dict[str, OptionQuote],
         latest_combo_value: Decimal,
@@ -1309,6 +1649,8 @@ class OptionStrategyCalculatorWindow:
         if request_id != self._chart_request_id or not self.window.winfo_exists():
             return
         self._latest_combo_candles = combo_candles
+        self._latest_combo_requested_limit = requested_limit
+        self._latest_combo_source_counts = dict(source_counts)
         self._latest_expiry_payoff_snapshot = payoff_snapshot
         self._latest_payoff_snapshot = payoff_snapshot
         self._latest_combo_value = latest_combo_value
@@ -1340,6 +1682,8 @@ class OptionStrategyCalculatorWindow:
         *,
         request_id: int,
         combo_candles: list[Candle],
+        requested_limit: int,
+        source_counts: dict[str, int],
         latest_quotes: dict[str, OptionQuote],
         latest_combo_value: Decimal,
         spot_usdt_price: Decimal | None,
@@ -1350,6 +1694,8 @@ class OptionStrategyCalculatorWindow:
         if request_id != self._chart_request_id or not self.window.winfo_exists():
             return
         self._latest_combo_candles = combo_candles
+        self._latest_combo_requested_limit = requested_limit
+        self._latest_combo_source_counts = dict(source_counts)
         self._latest_combo_value = latest_combo_value
         self._latest_spot_usdt_price = spot_usdt_price or current_underlying_price
         self._latest_spot_usdt_candles = list(spot_usdt_candles)
@@ -1495,12 +1841,26 @@ class OptionStrategyCalculatorWindow:
             note = ""
             if self._display_in_usdt() and not converted:
                 note = f" | 缺少 {_native_display_currency(self._legs, self._instrument_map)}-USDT 历史，当前按结算币显示"
+            alignment_note = ""
+            if self._latest_combo_requested_limit is not None:
+                requested_text = f"请求 {self._latest_combo_requested_limit} 根"
+                actual_text = f"实际 {len(combo_candles)} 根"
+                if self._latest_combo_source_counts:
+                    counts_text = " / ".join(
+                        f"{alias}={count}" for alias, count in sorted(self._latest_combo_source_counts.items())
+                    )
+                    alignment_note = f" | 多腿共同时间对齐（{requested_text}，{actual_text}；各腿 {counts_text}）"
+                else:
+                    alignment_note = f" | {requested_text}，{actual_text}"
             self.combo_summary_text.set(
                 f"公式: {formula}\n"
-                f"周期 {self.bar.get().strip()} | 根数 {len(combo_candles)} | 单位 {combo_ccy} | 最新组合值 {latest_value_text} | {latest_candle_text}{note}"
+                f"周期 {self.bar.get().strip()} | 根数 {len(combo_candles)} | 单位 {combo_ccy} | 最新组合值 {latest_value_text} | {latest_candle_text}{note}{alignment_note}"
             )
             if self._combo_canvas is not None:
-                self._draw_combo_chart(self._combo_canvas, combo_candles, combo_ccy)
+                visible_combo_candles = self._apply_kline_view("main_combo", combo_candles)
+                self._draw_combo_chart(self._combo_canvas, visible_combo_candles, combo_ccy)
+        if self._big_chart_window is not None and self._big_chart_window.winfo_exists():
+            self._refresh_big_chart_window()
 
     def _display_in_usdt(self) -> bool:
         return self.chart_display_ccy.get().strip().upper() == "USDT"
@@ -1660,7 +2020,7 @@ class OptionStrategyCalculatorWindow:
         self.option_family.set(str(record.get("option_family", "")).strip().upper())
         self.expiry_code.set(str(record.get("expiry_code", "")).strip())
         self.bar.set(str(record.get("bar", self.bar.get())).strip() or "15m")
-        self.candle_limit.set(str(record.get("candle_limit", self.candle_limit.get())).strip() or "600")
+        self.candle_limit.set(str(record.get("candle_limit", self.candle_limit.get())).strip() or "2000")
         self.chart_display_ccy.set(str(record.get("chart_display_ccy", self.chart_display_ccy.get())).strip() or "USDT")
         self.formula.set(str(record.get("formula", "")).strip())
 
@@ -1851,6 +2211,8 @@ class OptionStrategyCalculatorWindow:
         *,
         reference_snapshot: StrategyPayoffSnapshot | None = None,
         reference_label: str = "到期盈亏",
+        enable_hover: bool = True,
+        hover_target: str = "main",
     ) -> None:
         points = list(snapshot.points)
         if not points:
@@ -1979,19 +2341,24 @@ class OptionStrategyCalculatorWindow:
             fill="#57606a",
             font=("Microsoft YaHei UI", 9, "bold"),
         )
-        self._payoff_hover_state = PayoffChartHoverState(
-            bounds=bounds,
-            primary_points=tuple(points),
-            reference_points=tuple(reference_points) if show_reference else tuple(),
-            x_positions=x_positions,
-            primary_y_positions=primary_y_positions,
-            reference_y_positions=reference_y_positions,
-            value_ccy=value_ccy,
-            primary_label=mode_label,
-            reference_label=reference_label if show_reference else "",
-            primary_color=primary_line_color,
-            reference_color=reference_line_color if show_reference else "",
-        )
+        if enable_hover:
+            hover_state = PayoffChartHoverState(
+                bounds=bounds,
+                primary_points=tuple(points),
+                reference_points=tuple(reference_points) if show_reference else tuple(),
+                x_positions=x_positions,
+                primary_y_positions=primary_y_positions,
+                reference_y_positions=reference_y_positions,
+                value_ccy=value_ccy,
+                primary_label=mode_label,
+                reference_label=reference_label if show_reference else "",
+                primary_color=primary_line_color,
+                reference_color=reference_line_color if show_reference else "",
+            )
+            if hover_target == "big":
+                self._big_payoff_hover_state = hover_state
+            else:
+                self._payoff_hover_state = hover_state
 
     def _draw_payoff_fill(
         self,
@@ -2023,7 +2390,7 @@ class OptionStrategyCalculatorWindow:
                 canvas.create_polygon(x1, zero_y, x1, y1, cross_x, zero_y, outline="", fill="#fecaca")
                 canvas.create_polygon(cross_x, zero_y, x2, y2, x2, zero_y, outline="", fill="#c6f6d5")
 
-    def _draw_combo_chart(self, canvas: Canvas, candles: list[Candle], value_ccy: str) -> None:
+    def _draw_combo_chart(self, canvas: Canvas, candles: list[Candle], value_ccy: str, *, enable_hover: bool = True) -> None:
         if not candles:
             self._clear_canvas(canvas, "没有可用的组合 K 线数据。")
             return
@@ -2123,18 +2490,276 @@ class OptionStrategyCalculatorWindow:
             fill="#57606a",
             font=("Microsoft YaHei UI", 9, "bold"),
         )
-        self._combo_hover_state = ComboChartHoverState(
-            bounds=bounds,
-            candles=tuple(candles),
-            x_positions=tuple(x_positions),
-            close_y_positions=tuple(close_y_positions),
-            candle_step=candle_step,
-            value_ccy=value_ccy,
+        if enable_hover:
+            self._combo_hover_state = ComboChartHoverState(
+                bounds=bounds,
+                candles=tuple(candles),
+                x_positions=tuple(x_positions),
+                close_y_positions=tuple(close_y_positions),
+                candle_step=candle_step,
+                value_ccy=value_ccy,
+            )
+
+    def _draw_volatility_chart(self, canvas: Canvas, candles: list[Candle], *, enable_hover: bool = False) -> None:
+        if not candles:
+            self._clear_canvas(canvas, "暂无可用的波动率 K 线数据。")
+            return
+
+        canvas.delete("all")
+        canvas.update_idletasks()
+        width = max(canvas.winfo_width(), 960)
+        height = max(canvas.winfo_height(), 420)
+        left = 62
+        right = 24
+        top = 22
+        bottom = 38
+        inner_width = width - left - right
+        inner_height = height - top - bottom
+        if inner_width <= 0 or inner_height <= 0:
+            return
+
+        value_max = max(item.high for item in candles)
+        value_min = min(item.low for item in candles)
+        if value_max == value_min:
+            value_max += Decimal("1")
+            value_min -= Decimal("1")
+
+        candle_step = inner_width / max(len(candles), 1)
+        body_width = max(2.0, min(10.0, candle_step * 0.62))
+
+        def x_for(index: int) -> float:
+            return left + (index * candle_step) + (candle_step / 2)
+
+        def y_for(value: Decimal) -> float:
+            ratio = (value_max - value) / max(value_max - value_min, Decimal("0.00000001"))
+            return top + float(ratio) * inner_height
+
+        canvas.create_rectangle(left, top, width - right, height - bottom, outline="#d0d7de")
+
+        for price_value in _axis_values(value_min, value_max, steps=4):
+            y = y_for(price_value)
+            canvas.create_line(left, y, width - right, y, fill="#eaeef2", dash=(2, 4))
+            canvas.create_text(
+                left - 8,
+                y,
+                text=f"{_format_axis_value(price_value)}%",
+                anchor="e",
+                fill="#57606a",
+                font=("Microsoft YaHei UI", 9),
+            )
+
+        x_positions: list[float] = []
+        close_y_positions: list[float] = []
+        for index, candle in enumerate(candles):
+            x = x_for(index)
+            open_y = y_for(candle.open)
+            close_y = y_for(candle.close)
+            high_y = y_for(candle.high)
+            low_y = y_for(candle.low)
+            x_positions.append(x)
+            close_y_positions.append(close_y)
+            color = "#cf222e" if candle.close >= candle.open else "#1a7f37"
+            canvas.create_line(x, high_y, x, low_y, fill=color, width=1)
+            body_top = min(open_y, close_y)
+            body_bottom = max(open_y, close_y)
+            if abs(body_bottom - body_top) < 1:
+                body_bottom = body_top + 1
+            canvas.create_rectangle(
+                x - (body_width / 2),
+                body_top,
+                x + (body_width / 2),
+                body_bottom,
+                outline=color,
+                fill=color,
+            )
+
+        for index in _index_markers(len(candles), target_count=6):
+            x = x_for(index)
+            canvas.create_line(x, top, x, height - bottom, fill="#f3f4f6", dash=(2, 4))
+            is_first = index == 0
+            is_last = index == len(candles) - 1
+            canvas.create_text(
+                x,
+                height - bottom + 8,
+                text=_format_chart_ts(candles[index].ts),
+                anchor="nw" if is_first else "ne" if is_last else "n",
+                fill="#57606a",
+                font=("Microsoft YaHei UI", 9),
+            )
+
+        latest = candles[-1]
+        canvas.create_text(
+            width - right,
+            top + 10,
+            text=(
+                f"历史波动率K线 (%) | 最新 O {_format_compact_number(latest.open)} "
+                f"H {_format_compact_number(latest.high)} L {_format_compact_number(latest.low)} C {_format_compact_number(latest.close)}"
+            ),
+            anchor="ne",
+            fill="#57606a",
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+
+    def _draw_overlay_chart(
+        self,
+        canvas: Canvas,
+        combo_candles: list[Candle],
+        combo_ccy: str,
+        volatility_candles: list[Candle],
+    ) -> None:
+        aligned = _align_overlay_candles(combo_candles, volatility_candles)
+        if len(aligned) < 2:
+            self._clear_canvas(canvas, "组合K线与波动率K线缺少重叠时间，无法叠加显示。")
+            return
+
+        canvas.delete("all")
+        canvas.update_idletasks()
+        width = max(canvas.winfo_width(), 960)
+        height = max(canvas.winfo_height(), 420)
+        left = 62
+        right = 68
+        top = 22
+        bottom = 38
+        inner_width = width - left - right
+        inner_height = height - top - bottom
+        if inner_width <= 0 or inner_height <= 0:
+            return
+
+        combo_only = [item[0] for item in aligned]
+        vol_only = [item[1] for item in aligned]
+        combo_max = max(item.high for item in combo_only)
+        combo_min = min(item.low for item in combo_only)
+        vol_max = max(item.high for item in vol_only)
+        vol_min = min(item.low for item in vol_only)
+        if combo_max == combo_min:
+            combo_max += Decimal("1")
+            combo_min -= Decimal("1")
+        if vol_max == vol_min:
+            vol_max += Decimal("1")
+            vol_min -= Decimal("1")
+
+        candle_step = inner_width / max(len(aligned), 1)
+        combo_body_width = max(3.0, min(11.0, candle_step * 0.46))
+        vol_body_width = max(2.0, min(7.0, candle_step * 0.24))
+        vol_offset = max(combo_body_width * 0.38, 2.5)
+
+        def x_for(index: int) -> float:
+            return left + (index * candle_step) + (candle_step / 2)
+
+        def y_combo(price: Decimal) -> float:
+            ratio = (combo_max - price) / max(combo_max - combo_min, Decimal("0.00000001"))
+            return top + float(ratio) * inner_height
+
+        def y_vol(value: Decimal) -> float:
+            ratio = (vol_max - value) / max(vol_max - vol_min, Decimal("0.00000001"))
+            return top + float(ratio) * inner_height
+
+        canvas.create_rectangle(left, top, width - right, height - bottom, outline="#d0d7de")
+
+        for index in range(5):
+            ratio = index / 4
+            y = top + (ratio * inner_height)
+            combo_value = combo_max - ((combo_max - combo_min) * Decimal(str(ratio)))
+            vol_value = vol_max - ((vol_max - vol_min) * Decimal(str(ratio)))
+            canvas.create_line(left, y, width - right, y, fill="#eaeef2", dash=(2, 4))
+            canvas.create_text(
+                left - 8,
+                y,
+                text=_format_axis_value(combo_value),
+                anchor="e",
+                fill="#2563eb",
+                font=("Microsoft YaHei UI", 9),
+            )
+            canvas.create_text(
+                width - right + 8,
+                y,
+                text=f"{_format_axis_value(vol_value)}%",
+                anchor="w",
+                fill="#ea580c",
+                font=("Microsoft YaHei UI", 9),
+            )
+
+        for index, (combo_candle, vol_candle) in enumerate(aligned):
+            x = x_for(index)
+
+            combo_open_y = y_combo(combo_candle.open)
+            combo_close_y = y_combo(combo_candle.close)
+            combo_high_y = y_combo(combo_candle.high)
+            combo_low_y = y_combo(combo_candle.low)
+            combo_color = "#2563eb" if combo_candle.close >= combo_candle.open else "#60a5fa"
+            canvas.create_line(x, combo_high_y, x, combo_low_y, fill=combo_color, width=1)
+            combo_top = min(combo_open_y, combo_close_y)
+            combo_bottom = max(combo_open_y, combo_close_y)
+            if abs(combo_bottom - combo_top) < 1:
+                combo_bottom = combo_top + 1
+            canvas.create_rectangle(
+                x - (combo_body_width / 2),
+                combo_top,
+                x + (combo_body_width / 2),
+                combo_bottom,
+                outline=combo_color,
+                fill=combo_color,
+            )
+
+            vol_x = x + vol_offset
+            vol_open_y = y_vol(vol_candle.open)
+            vol_close_y = y_vol(vol_candle.close)
+            vol_high_y = y_vol(vol_candle.high)
+            vol_low_y = y_vol(vol_candle.low)
+            vol_color = "#ea580c" if vol_candle.close >= vol_candle.open else "#fdba74"
+            canvas.create_line(vol_x, vol_high_y, vol_x, vol_low_y, fill=vol_color, width=1)
+            vol_top = min(vol_open_y, vol_close_y)
+            vol_bottom = max(vol_open_y, vol_close_y)
+            if abs(vol_bottom - vol_top) < 1:
+                vol_bottom = vol_top + 1
+            canvas.create_rectangle(
+                vol_x - (vol_body_width / 2),
+                vol_top,
+                vol_x + (vol_body_width / 2),
+                vol_bottom,
+                outline=vol_color,
+                fill=vol_color,
+            )
+
+        for index in _index_markers(len(aligned), target_count=6):
+            x = x_for(index)
+            canvas.create_line(x, top, x, height - bottom, fill="#f3f4f6", dash=(2, 4))
+            is_first = index == 0
+            is_last = index == len(aligned) - 1
+            canvas.create_text(
+                x,
+                height - bottom + 8,
+                text=_format_chart_ts(aligned[index][0].ts),
+                anchor="nw" if is_first else "ne" if is_last else "n",
+                fill="#57606a",
+                font=("Microsoft YaHei UI", 9),
+            )
+
+        latest_combo, latest_vol = aligned[-1]
+        canvas.create_text(
+            width - right,
+            top + 10,
+            text=(
+                f"叠加对比 | 左轴=组合K线({combo_ccy}) C {_format_compact_number(latest_combo.close)} "
+                f"| 右轴=历史波动率(%) C {_format_compact_number(latest_vol.close)}"
+            ),
+            anchor="ne",
+            fill="#57606a",
+            font=("Microsoft YaHei UI", 9, "bold"),
         )
 
     def _on_payoff_canvas_motion(self, event) -> None:
-        canvas = self._payoff_canvas
-        state = self._payoff_hover_state
+        self._handle_payoff_canvas_motion(self._payoff_canvas, self._payoff_hover_state, event)
+
+    def _on_big_payoff_canvas_motion(self, event) -> None:
+        self._handle_payoff_canvas_motion(self._big_payoff_canvas, self._big_payoff_hover_state, event)
+
+    def _handle_payoff_canvas_motion(
+        self,
+        canvas: Canvas | None,
+        state: PayoffChartHoverState | None,
+        event,
+    ) -> None:
         if canvas is None or state is None or not state.primary_points:
             return
         if not state.bounds.contains(float(event.x), float(event.y)):
@@ -2296,6 +2921,8 @@ class OptionStrategyCalculatorWindow:
         canvas.delete("all")
         if canvas is self._payoff_canvas:
             self._payoff_hover_state = None
+        elif canvas is self._big_payoff_canvas:
+            self._big_payoff_hover_state = None
         elif canvas is self._combo_canvas:
             self._combo_hover_state = None
         width = max(canvas.winfo_width(), 900)
@@ -2485,3 +3112,127 @@ def _nearest_candle_index(x: float, left: float, candle_step: float, length: int
 
 def _format_chart_ts(ts: int) -> str:
     return datetime.fromtimestamp(ts / 1000).strftime("%m-%d %H:%M")
+
+
+def _annualization_factor_for_bar(bar: str) -> float:
+    normalized = bar.strip()
+    periods_per_year = {
+        "1m": 365 * 24 * 60,
+        "3m": (365 * 24 * 60) / 3,
+        "5m": (365 * 24 * 60) / 5,
+        "15m": (365 * 24 * 60) / 15,
+        "1H": 365 * 24,
+        "4H": 365 * 6,
+    }.get(normalized)
+    if periods_per_year is None:
+        return 0.0
+    return math.sqrt(periods_per_year)
+
+
+def _build_volatility_candles_from_reference(
+    reference_candles: list[Candle],
+    *,
+    bar: str,
+    lookback: int = 20,
+) -> list[Candle]:
+    confirmed = [item for item in reference_candles if item.confirmed]
+    if len(confirmed) < lookback + 1:
+        return []
+
+    annualization = _annualization_factor_for_bar(bar)
+    if annualization <= 0:
+        return []
+
+    volatility_candles: list[Candle] = []
+    previous_close_vol: float | None = None
+    for index in range(lookback, len(confirmed)):
+        closes = [float(item.close) for item in confirmed[index - lookback : index + 1]]
+        if any(value <= 0 for value in closes):
+            continue
+        returns = [math.log(closes[offset] / closes[offset - 1]) for offset in range(1, len(closes))]
+        if not returns:
+            continue
+        mean_return = sum(returns) / len(returns)
+        variance = sum((value - mean_return) ** 2 for value in returns) / len(returns)
+        close_vol = math.sqrt(max(variance, 0.0)) * annualization * 100.0
+        open_vol = previous_close_vol if previous_close_vol is not None else close_vol
+        high_vol = max(open_vol, close_vol)
+        low_vol = min(open_vol, close_vol)
+        candle = confirmed[index]
+        volatility_candles.append(
+            Candle(
+                ts=candle.ts,
+                open=Decimal(str(open_vol)),
+                high=Decimal(str(high_vol)),
+                low=Decimal(str(low_vol)),
+                close=Decimal(str(close_vol)),
+                volume=Decimal("0"),
+                confirmed=candle.confirmed,
+            )
+        )
+        previous_close_vol = close_vol
+    return volatility_candles
+
+
+def _align_overlay_candles(
+    combo_candles: list[Candle],
+    volatility_candles: list[Candle],
+) -> list[tuple[Candle, Candle]]:
+    if not combo_candles or not volatility_candles:
+        return []
+    volatility_by_ts = {item.ts: item for item in volatility_candles}
+    aligned: list[tuple[Candle, Candle]] = []
+    for combo_candle in combo_candles:
+        volatility_candle = volatility_by_ts.get(combo_candle.ts)
+        if volatility_candle is not None:
+            aligned.append((combo_candle, volatility_candle))
+    return aligned
+
+
+def _normalized_kline_view(
+    length: int,
+    start_index: int,
+    visible_count: int | None,
+    *,
+    auto_full: bool,
+    min_visible: int = 30,
+) -> tuple[int, int]:
+    if length <= 0:
+        return 0, 0
+    if auto_full or visible_count is None or visible_count >= length:
+        return 0, length
+    effective_min = min(length, max(min_visible, 1))
+    visible = max(effective_min, min(length, visible_count))
+    start = max(0, min(start_index, max(length - visible, 0)))
+    return start, visible
+
+
+def _zoom_kline_view(
+    length: int,
+    start_index: int,
+    visible_count: int,
+    *,
+    focus_ratio: float,
+    zoom_in: bool,
+    min_visible: int = 30,
+) -> tuple[int, int]:
+    if length <= 0:
+        return 0, 0
+    focus_ratio = min(1.0, max(0.0, focus_ratio))
+    current_visible = max(1, min(length, visible_count))
+    effective_min = min(length, max(min_visible, 1))
+    next_visible = max(effective_min, int(round(current_visible * (0.8 if zoom_in else 1.25))))
+    next_visible = max(effective_min, min(length, next_visible))
+    focus_index = start_index + int(round((current_visible - 1) * focus_ratio))
+    next_start = focus_index - int(round((next_visible - 1) * focus_ratio))
+    next_start = max(0, min(next_start, max(length - next_visible, 0)))
+    return next_start, next_visible
+
+
+def _pan_kline_view(length: int, start_index: int, visible_count: int, *, delta_items: int) -> tuple[int, int]:
+    if length <= 0:
+        return 0, 0
+    visible = max(1, min(length, visible_count))
+    next_start = start_index + delta_items
+    next_start = max(0, min(next_start, max(length - visible, 0)))
+    return next_start, visible
