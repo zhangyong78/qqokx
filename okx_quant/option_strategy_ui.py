@@ -144,6 +144,7 @@ class OptionStrategyCalculatorWindow:
         self._payoff_canvas: Canvas | None = None
         self._combo_canvas: Canvas | None = None
         self._big_chart_window: Toplevel | None = None
+        self._big_chart_notebook: ttk.Notebook | None = None
         self._big_payoff_canvas: Canvas | None = None
         self._big_combo_canvas: Canvas | None = None
         self._big_volatility_canvas: Canvas | None = None
@@ -176,6 +177,10 @@ class OptionStrategyCalculatorWindow:
         self._payoff_hover_state: PayoffChartHoverState | None = None
         self._big_payoff_hover_state: PayoffChartHoverState | None = None
         self._combo_hover_state: ComboChartHoverState | None = None
+        self._big_combo_hover_state: ComboChartHoverState | None = None
+        self._big_volatility_hover_state: ComboChartHoverState | None = None
+        self._big_overlay_combo_hover_state: ComboChartHoverState | None = None
+        self._big_overlay_volatility_hover_state: ComboChartHoverState | None = None
         self._kline_view_states: dict[str, KlineChartViewState] = {}
         self._kline_drag_states: dict[str, tuple[float, int, int]] = {}
         self._did_initial_chain_refresh = False
@@ -1205,6 +1210,7 @@ class OptionStrategyCalculatorWindow:
 
         notebook = ttk.Notebook(window)
         notebook.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        notebook.bind("<<NotebookTabChanged>>", self._schedule_big_chart_redraw)
 
         payoff_tab = ttk.Frame(notebook, padding=12)
         payoff_tab.columnconfigure(0, weight=1)
@@ -1225,9 +1231,11 @@ class OptionStrategyCalculatorWindow:
         ttk.Label(combo_tab, textvariable=self.combo_summary_text, justify="left", wraplength=1260).grid(
             row=0, column=0, sticky="w", pady=(0, 8)
         )
-        combo_canvas = Canvas(combo_tab, background="#ffffff", highlightthickness=0)
+        combo_canvas = Canvas(combo_tab, background="#ffffff", highlightthickness=0, cursor="crosshair")
         combo_canvas.grid(row=1, column=0, sticky="nsew")
         combo_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
+        combo_canvas.bind("<Motion>", self._on_big_combo_canvas_motion)
+        combo_canvas.bind("<Leave>", lambda _event: self._clear_chart_hover(combo_canvas))
         self._bind_kline_chart_interactions(combo_canvas, "big_combo")
         notebook.add(combo_tab, text="组合K线")
 
@@ -1237,9 +1245,11 @@ class OptionStrategyCalculatorWindow:
         ttk.Label(volatility_tab, textvariable=self.volatility_summary_text, justify="left", wraplength=1260).grid(
             row=0, column=0, sticky="w", pady=(0, 8)
         )
-        volatility_canvas = Canvas(volatility_tab, background="#ffffff", highlightthickness=0)
+        volatility_canvas = Canvas(volatility_tab, background="#ffffff", highlightthickness=0, cursor="crosshair")
         volatility_canvas.grid(row=1, column=0, sticky="nsew")
         volatility_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
+        volatility_canvas.bind("<Motion>", self._on_big_volatility_canvas_motion)
+        volatility_canvas.bind("<Leave>", lambda _event: self._clear_chart_hover(volatility_canvas))
         self._bind_kline_chart_interactions(volatility_canvas, "big_volatility")
         notebook.add(volatility_tab, text="波动率K线")
 
@@ -1253,20 +1263,37 @@ class OptionStrategyCalculatorWindow:
         overlay_combo_canvas = Canvas(overlay_tab, background="#ffffff", highlightthickness=0, cursor="crosshair")
         overlay_combo_canvas.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         overlay_combo_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
+        overlay_combo_canvas.bind("<Motion>", self._on_big_overlay_combo_canvas_motion)
+        overlay_combo_canvas.bind("<Leave>", self._clear_overlay_chart_hover)
         self._bind_kline_chart_interactions(overlay_combo_canvas, "big_overlay")
         overlay_volatility_canvas = Canvas(overlay_tab, background="#ffffff", highlightthickness=0, cursor="crosshair")
         overlay_volatility_canvas.grid(row=2, column=0, sticky="nsew")
         overlay_volatility_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
+        overlay_volatility_canvas.bind("<Motion>", self._on_big_overlay_volatility_canvas_motion)
+        overlay_volatility_canvas.bind("<Leave>", self._clear_overlay_chart_hover)
         self._bind_kline_chart_interactions(overlay_volatility_canvas, "big_overlay")
         notebook.add(overlay_tab, text="叠加对比")
 
         self._big_chart_window = window
+        self._big_chart_notebook = notebook
         self._big_payoff_canvas = payoff_canvas
         self._big_combo_canvas = combo_canvas
         self._big_volatility_canvas = volatility_canvas
         self._big_overlay_combo_canvas = overlay_combo_canvas
         self._big_overlay_volatility_canvas = overlay_volatility_canvas
         return window
+
+    def _selected_big_chart_tab(self) -> str:
+        notebook = self._big_chart_notebook
+        if notebook is None or not notebook.winfo_exists():
+            return "到期盈亏图"
+        try:
+            selected = notebook.select()
+            if not selected:
+                return "到期盈亏图"
+            return str(notebook.tab(selected, "text") or "到期盈亏图")
+        except Exception:
+            return "到期盈亏图"
 
     def _bind_kline_chart_interactions(self, canvas: Canvas, key: str) -> None:
         canvas.bind("<MouseWheel>", lambda event, chart_key=key: self._on_kline_chart_mousewheel(chart_key, event))
@@ -1377,7 +1404,7 @@ class OptionStrategyCalculatorWindow:
                 return
             combo_candles, combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
             visible = self._apply_kline_view(key, combo_candles)
-            self._draw_combo_chart(self._big_combo_canvas, visible, combo_ccy, enable_hover=False)
+            self._draw_combo_chart(self._big_combo_canvas, visible, combo_ccy, enable_hover=True, hover_target="big_combo")
             return
         if key == "big_volatility":
             if self._big_volatility_canvas is None:
@@ -1387,7 +1414,7 @@ class OptionStrategyCalculatorWindow:
                 self._clear_canvas(self._big_volatility_canvas, "暂无可用的波动率 K 线数据。")
                 return
             visible = self._apply_kline_view(key, volatility_candles)
-            self._draw_volatility_chart(self._big_volatility_canvas, visible, enable_hover=False)
+            self._draw_volatility_chart(self._big_volatility_canvas, visible, enable_hover=True, hover_target="big_volatility")
             return
         if key == "big_overlay":
             if self._big_overlay_combo_canvas is None or self._big_overlay_volatility_canvas is None or not self._latest_combo_candles:
@@ -1401,8 +1428,19 @@ class OptionStrategyCalculatorWindow:
             visible = self._apply_kline_view(key, aligned)
             visible_combo = [item[0] for item in visible]
             visible_volatility = [item[1] for item in visible]
-            self._draw_combo_chart(self._big_overlay_combo_canvas, visible_combo, combo_ccy, enable_hover=False)
-            self._draw_volatility_chart(self._big_overlay_volatility_canvas, visible_volatility, enable_hover=False)
+            self._draw_combo_chart(
+                self._big_overlay_combo_canvas,
+                visible_combo,
+                combo_ccy,
+                enable_hover=True,
+                hover_target="big_overlay_combo",
+            )
+            self._draw_volatility_chart(
+                self._big_overlay_volatility_canvas,
+                visible_volatility,
+                enable_hover=True,
+                hover_target="big_overlay_volatility",
+            )
 
     def _schedule_big_chart_redraw(self, _event=None) -> None:
         window = self._big_chart_window
@@ -1420,8 +1458,9 @@ class OptionStrategyCalculatorWindow:
         if window is None or not window.winfo_exists():
             return
         self._big_chart_redraw_after_id = None
+        selected_tab = self._selected_big_chart_tab()
 
-        if self._big_payoff_canvas is not None:
+        if selected_tab == "到期盈亏图" and self._big_payoff_canvas is not None:
             if self._latest_payoff_snapshot is not None:
                 mode_label = self._payoff_chart_mode_label()
                 payoff_snapshot, payoff_ccy = self._payoff_snapshot_for_display(self._latest_payoff_snapshot)
@@ -1444,28 +1483,46 @@ class OptionStrategyCalculatorWindow:
                 )
             else:
                 self._clear_canvas(self._big_payoff_canvas, "加入策略腿后，可生成到期盈亏图。")
+            return
 
-        if self._big_combo_canvas is not None:
+        if selected_tab == "组合K线" and self._big_combo_canvas is not None:
             if self._latest_combo_candles:
                 combo_candles, combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
-                self._draw_combo_chart(self._big_combo_canvas, combo_candles, combo_ccy, enable_hover=False)
+                visible_combo_candles = self._apply_kline_view("big_combo", combo_candles)
+                self._draw_combo_chart(
+                    self._big_combo_canvas,
+                    visible_combo_candles,
+                    combo_ccy,
+                    enable_hover=True,
+                    hover_target="big_combo",
+                )
             else:
                 self._clear_canvas(self._big_combo_canvas, "组合 K 线使用期权标记价格；先加入策略腿再生成。")
+            return
 
         volatility_candles = self._current_volatility_candles()
-
-        if self._big_volatility_canvas is not None:
+        if selected_tab == "波动率K线" and self._big_volatility_canvas is not None:
             if volatility_candles:
                 self.volatility_summary_text.set(
                     f"历史波动率 K 线 | 标的现货 {self.bar.get().strip()} | 根数 {len(volatility_candles)} | 周期与组合K线一致"
                 )
                 visible_volatility = self._apply_kline_view("big_volatility", volatility_candles)
-                self._draw_volatility_chart(self._big_volatility_canvas, visible_volatility, enable_hover=False)
+                self._draw_volatility_chart(
+                    self._big_volatility_canvas,
+                    visible_volatility,
+                    enable_hover=True,
+                    hover_target="big_volatility",
+                )
             else:
                 self.volatility_summary_text.set("历史波动率 K 线需要足够的标的现货历史；当前数据不足。")
                 self._clear_canvas(self._big_volatility_canvas, "暂无可用的波动率 K 线数据。")
+            return
 
-        if self._big_overlay_combo_canvas is not None and self._big_overlay_volatility_canvas is not None:
+        if (
+            selected_tab == "叠加对比"
+            and self._big_overlay_combo_canvas is not None
+            and self._big_overlay_volatility_canvas is not None
+        ):
             if self._latest_combo_candles and volatility_candles:
                 combo_candles, combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
                 aligned = _align_overlay_candles(combo_candles, volatility_candles)
@@ -1475,8 +1532,19 @@ class OptionStrategyCalculatorWindow:
                 visible_aligned = self._apply_kline_view("big_overlay", aligned)
                 visible_combo = [item[0] for item in visible_aligned]
                 visible_volatility = [item[1] for item in visible_aligned]
-                self._draw_combo_chart(self._big_overlay_combo_canvas, visible_combo, combo_ccy, enable_hover=False)
-                self._draw_volatility_chart(self._big_overlay_volatility_canvas, visible_volatility, enable_hover=False)
+                self._draw_combo_chart(
+                    self._big_overlay_combo_canvas,
+                    visible_combo,
+                    combo_ccy,
+                    enable_hover=True,
+                    hover_target="big_overlay_combo",
+                )
+                self._draw_volatility_chart(
+                    self._big_overlay_volatility_canvas,
+                    visible_volatility,
+                    enable_hover=True,
+                    hover_target="big_overlay_volatility",
+                )
             else:
                 self.overlay_summary_text.set("叠加对比需要同时具备组合K线与历史波动率K线数据。")
                 self._clear_canvas(self._big_overlay_combo_canvas, "暂无可用的叠加对比数据。")
@@ -2390,13 +2458,20 @@ class OptionStrategyCalculatorWindow:
                 canvas.create_polygon(x1, zero_y, x1, y1, cross_x, zero_y, outline="", fill="#fecaca")
                 canvas.create_polygon(cross_x, zero_y, x2, y2, x2, zero_y, outline="", fill="#c6f6d5")
 
-    def _draw_combo_chart(self, canvas: Canvas, candles: list[Candle], value_ccy: str, *, enable_hover: bool = True) -> None:
+    def _draw_combo_chart(
+        self,
+        canvas: Canvas,
+        candles: list[Candle],
+        value_ccy: str,
+        *,
+        enable_hover: bool = True,
+        hover_target: str = "main_combo",
+    ) -> None:
         if not candles:
             self._clear_canvas(canvas, "没有可用的组合 K 线数据。")
             return
 
         canvas.delete("all")
-        canvas.update_idletasks()
         width = max(canvas.winfo_width(), 960)
         height = max(canvas.winfo_height(), 420)
         left = 62
@@ -2491,7 +2566,7 @@ class OptionStrategyCalculatorWindow:
             font=("Microsoft YaHei UI", 9, "bold"),
         )
         if enable_hover:
-            self._combo_hover_state = ComboChartHoverState(
+            hover_state = ComboChartHoverState(
                 bounds=bounds,
                 candles=tuple(candles),
                 x_positions=tuple(x_positions),
@@ -2499,14 +2574,26 @@ class OptionStrategyCalculatorWindow:
                 candle_step=candle_step,
                 value_ccy=value_ccy,
             )
+            if hover_target == "main_combo":
+                self._combo_hover_state = hover_state
+            elif hover_target == "big_combo":
+                self._big_combo_hover_state = hover_state
+            elif hover_target == "big_overlay_combo":
+                self._big_overlay_combo_hover_state = hover_state
 
-    def _draw_volatility_chart(self, canvas: Canvas, candles: list[Candle], *, enable_hover: bool = False) -> None:
+    def _draw_volatility_chart(
+        self,
+        canvas: Canvas,
+        candles: list[Candle],
+        *,
+        enable_hover: bool = False,
+        hover_target: str = "big_volatility",
+    ) -> None:
         if not candles:
             self._clear_canvas(canvas, "暂无可用的波动率 K 线数据。")
             return
 
         canvas.delete("all")
-        canvas.update_idletasks()
         width = max(canvas.winfo_width(), 960)
         height = max(canvas.winfo_height(), 420)
         left = 62
@@ -2534,6 +2621,7 @@ class OptionStrategyCalculatorWindow:
             ratio = (value_max - value) / max(value_max - value_min, Decimal("0.00000001"))
             return top + float(ratio) * inner_height
 
+        bounds = ChartBounds(left=float(left), top=float(top), right=float(width - right), bottom=float(height - bottom))
         canvas.create_rectangle(left, top, width - right, height - bottom, outline="#d0d7de")
 
         for price_value in _axis_values(value_min, value_max, steps=4):
@@ -2599,6 +2687,19 @@ class OptionStrategyCalculatorWindow:
             fill="#57606a",
             font=("Microsoft YaHei UI", 9, "bold"),
         )
+        if enable_hover:
+            hover_state = ComboChartHoverState(
+                bounds=bounds,
+                candles=tuple(candles),
+                x_positions=tuple(x_positions),
+                close_y_positions=tuple(close_y_positions),
+                candle_step=candle_step,
+                value_ccy="%",
+            )
+            if hover_target == "big_volatility":
+                self._big_volatility_hover_state = hover_state
+            elif hover_target == "big_overlay_volatility":
+                self._big_overlay_volatility_hover_state = hover_state
 
     def _draw_overlay_chart(
         self,
@@ -2613,7 +2714,6 @@ class OptionStrategyCalculatorWindow:
             return
 
         canvas.delete("all")
-        canvas.update_idletasks()
         width = max(canvas.winfo_width(), 960)
         height = max(canvas.winfo_height(), 420)
         left = 62
@@ -2789,14 +2889,61 @@ class OptionStrategyCalculatorWindow:
         )
 
     def _on_combo_canvas_motion(self, event) -> None:
-        canvas = self._combo_canvas
-        state = self._combo_hover_state
+        self._handle_kline_canvas_motion(self._combo_canvas, self._combo_hover_state, event)
+
+    def _on_big_combo_canvas_motion(self, event) -> None:
+        self._handle_kline_canvas_motion(self._big_combo_canvas, self._big_combo_hover_state, event)
+
+    def _on_big_volatility_canvas_motion(self, event) -> None:
+        self._handle_kline_canvas_motion(self._big_volatility_canvas, self._big_volatility_hover_state, event)
+
+    def _on_big_overlay_combo_canvas_motion(self, event) -> None:
+        self._handle_overlay_kline_motion(
+            self._big_overlay_combo_canvas,
+            self._big_overlay_combo_hover_state,
+            self._big_overlay_volatility_canvas,
+            self._big_overlay_volatility_hover_state,
+            event,
+        )
+
+    def _on_big_overlay_volatility_canvas_motion(self, event) -> None:
+        self._handle_overlay_kline_motion(
+            self._big_overlay_volatility_canvas,
+            self._big_overlay_volatility_hover_state,
+            self._big_overlay_combo_canvas,
+            self._big_overlay_combo_hover_state,
+            event,
+        )
+
+    def _handle_kline_canvas_motion(self, canvas: Canvas | None, state: ComboChartHoverState | None, event) -> None:
         if canvas is None or state is None or not state.candles:
             return
         if not state.bounds.contains(float(event.x), float(event.y)):
             self._clear_chart_hover(canvas)
             return
         index = _nearest_candle_index(float(event.x), state.bounds.left, state.candle_step, len(state.candles))
+        self._draw_kline_hover_for_index(canvas, state, index)
+
+    def _handle_overlay_kline_motion(
+        self,
+        canvas: Canvas | None,
+        state: ComboChartHoverState | None,
+        paired_canvas: Canvas | None,
+        paired_state: ComboChartHoverState | None,
+        event,
+    ) -> None:
+        if canvas is None or state is None or not state.candles:
+            return
+        if not state.bounds.contains(float(event.x), float(event.y)):
+            self._clear_overlay_chart_hover()
+            return
+        index = _nearest_candle_index(float(event.x), state.bounds.left, state.candle_step, len(state.candles))
+        self._draw_kline_hover_for_index(canvas, state, index)
+        if paired_canvas is not None and paired_state is not None and paired_state.candles:
+            paired_index = min(index, len(paired_state.candles) - 1)
+            self._draw_kline_hover_for_index(paired_canvas, paired_state, paired_index)
+
+    def _draw_kline_hover_for_index(self, canvas: Canvas, state: ComboChartHoverState, index: int) -> None:
         candle = state.candles[index]
         marker_color = "#cf222e" if candle.close >= candle.open else "#1a7f37"
         self._draw_chart_hover_overlay(
@@ -2815,6 +2962,12 @@ class OptionStrategyCalculatorWindow:
             marker_positions=((state.close_y_positions[index], marker_color),),
         )
 
+    def _clear_overlay_chart_hover(self, _event=None) -> None:
+        if self._big_overlay_combo_canvas is not None:
+            self._clear_chart_hover(self._big_overlay_combo_canvas)
+        if self._big_overlay_volatility_canvas is not None:
+            self._clear_chart_hover(self._big_overlay_volatility_canvas)
+
     def _draw_chart_hover_overlay(
         self,
         canvas: Canvas,
@@ -2832,6 +2985,16 @@ class OptionStrategyCalculatorWindow:
             bounds.top,
             x,
             bounds.bottom,
+            fill="#6e7781",
+            dash=(4, 4),
+            width=1,
+            tags="chart-hover",
+        )
+        canvas.create_line(
+            bounds.left,
+            y,
+            bounds.right,
+            y,
             fill="#6e7781",
             dash=(4, 4),
             width=1,
@@ -2925,6 +3088,14 @@ class OptionStrategyCalculatorWindow:
             self._big_payoff_hover_state = None
         elif canvas is self._combo_canvas:
             self._combo_hover_state = None
+        elif canvas is self._big_combo_canvas:
+            self._big_combo_hover_state = None
+        elif canvas is self._big_volatility_canvas:
+            self._big_volatility_hover_state = None
+        elif canvas is self._big_overlay_combo_canvas:
+            self._big_overlay_combo_hover_state = None
+        elif canvas is self._big_overlay_volatility_canvas:
+            self._big_overlay_volatility_hover_state = None
         width = max(canvas.winfo_width(), 900)
         height = max(canvas.winfo_height(), 360)
         canvas.create_rectangle(0, 0, width, height, outline="", fill="#ffffff")
