@@ -30,6 +30,64 @@ class ProtectionPriceGuardError(RuntimeError):
     """Raised when a computed protection order price looks unsafe."""
 
 
+class ProtectionCloseRetryError(RuntimeError):
+    """Raised when a close attempt should be retried instead of stopping the task."""
+
+
+_MOJIBAKE_REPLACEMENTS = {
+    "准备�?": "准备中",
+    "运行�?": "运行中",
+    "已完�?": "已完成",
+    "已停�?": "已停止",
+    "停止�?": "停止中",
+    "监控�?": "监控中",
+    "盘口=不可�?": "盘口=不可用",
+    "未返回订单状�?": "未返回订单状态",
+    "ֹӯ触发市场快照": "触发市场快照",
+    "ֹӯ平仓报单": "平仓报单",
+    "ֹӯ平仓成交": "平仓成交",
+    "ֹӯ": "止盈",
+    "损�": "损",
+}
+
+
+def _repair_mojibake_text(text: str) -> str:
+    if not text:
+        return text
+    suspicious_markers = (
+        "鍑",
+        "杩",
+        "宸",
+        "鍋",
+        "寮",
+        "鐩",
+        "鏈",
+        "缃",
+        "鎸",
+        "姝",
+        "鏂",
+        "褰",
+        "瑙",
+        "閹",
+        "瓒",
+        "鎻",
+        "浠",
+        "鍚",
+        "鐨",
+        "鍓",
+    )
+    if not any(marker in text for marker in suspicious_markers):
+        return text
+    repaired = text
+    try:
+        repaired = text.encode("gbk", errors="ignore").decode("utf-8", errors="ignore")
+    except Exception:
+        repaired = text
+    for bad, good in _MOJIBAKE_REPLACEMENTS.items():
+        repaired = repaired.replace(bad, good)
+    return repaired
+
+
 @dataclass(frozen=True)
 class OptionProtectionConfig:
     option_inst_id: str
@@ -1201,3 +1259,766 @@ def _fmt_optional(value: Decimal | None) -> str:
     if value is None:
         return "-"
     return format_decimal(value)
+
+
+def _pp_list_sessions(self: PositionProtectionManager) -> list[ProtectionSessionSnapshot]:
+    with self._lock:
+        workers = list(self._workers.values())
+    workers.sort(key=lambda item: item.started_at, reverse=True)
+    return [
+        ProtectionSessionSnapshot(
+            session_id=item.session_id,
+            option_inst_id=item.protection.option_inst_id,
+            trigger_label=item.protection.trigger_label or item.protection.trigger_inst_id,
+            direction=item.protection.direction,
+            take_profit_trigger=item.protection.take_profit_trigger,
+            stop_loss_trigger=item.protection.stop_loss_trigger,
+            status=_repair_mojibake_text(item.status),
+            started_at=item.started_at,
+            last_message=_repair_mojibake_text(item.last_message),
+        )
+        for item in workers
+    ]
+
+
+def _pp_start(
+    self: PositionProtectionManager,
+    credentials: Credentials,
+    config: StrategyConfig,
+    protection: OptionProtectionConfig,
+) -> str:
+    with self._lock:
+        for existing in self._workers.values():
+            existing_status = _repair_mojibake_text(existing.status)
+            if existing.protection.option_inst_id == protection.option_inst_id and existing_status in {
+                "准备中",
+                "运行中",
+                "平仓重试中",
+                "持续未成交待人工",
+            }:
+                raise RuntimeError(f"{protection.option_inst_id} 已经存在一个运行中的保护任务。")
+
+        self._counter += 1
+        session_id = f"P{self._counter:02d}"
+        worker = _ProtectionWorker(
+            session_id=session_id,
+            credentials=credentials,
+            config=config,
+            protection=protection,
+        )
+        worker.status = "准备中"
+        worker.thread = threading.Thread(
+            target=self._run_worker,
+            args=(worker,),
+            daemon=True,
+            name=f"qqokx-protection-{session_id}",
+        )
+        self._workers[session_id] = worker
+
+    self._set_status(worker, "准备中", "期权持仓保护任务已创建。")
+    assert worker.thread is not None
+    worker.thread.start()
+    return session_id
+
+
+def _pp_stop(self: PositionProtectionManager, session_id: str) -> None:
+    with self._lock:
+        worker = self._workers.get(session_id)
+    if worker is None:
+        raise RuntimeError("未找到对应的保护任务。")
+    worker.stop_event.set()
+    self._set_status(worker, "停止中", "已请求停止保护任务。")
+
+
+def _pp_stop_all(self: PositionProtectionManager) -> None:
+    with self._lock:
+        workers = list(self._workers.values())
+    for worker in workers:
+        worker.stop_event.set()
+        self._set_status(worker, "停止中", "主程序关闭，正在停止保护任务。")
+
+
+def _pp_handle_close_retry(
+    self: PositionProtectionManager,
+    worker: _ProtectionWorker,
+    reason: str,
+    exc: Exception,
+) -> None:
+    now = datetime.now()
+    worker.close_retry_count += 1
+    if worker.close_retry_count >= 3:
+        status = "持续未成交待人工"
+        message = (
+            f"{reason}平仓持续未成交，待人工关注（第{worker.close_retry_count}次） | "
+            f"{worker.protection.option_inst_id} | {exc}"
+        )
+    else:
+        status = "平仓重试中"
+        message = (
+            f"{reason}平仓未成交，正在重试（第{worker.close_retry_count}次） | "
+            f"{worker.protection.option_inst_id} | {exc}"
+        )
+    self._set_status(worker, status, message)
+    if (
+        worker.last_transient_notify_at is None
+        or (now - worker.last_transient_notify_at).total_seconds() >= self._transient_alert_interval_seconds
+    ):
+        self._notify(
+            subject=f"[QQOKX] 持仓保护平仓重试 | {worker.protection.option_inst_id}",
+            body="\n".join(
+                [
+                    f"任务：{worker.session_id}",
+                    f"期权合约：{worker.protection.option_inst_id}",
+                    f"当前阶段：{reason}已触发，仍在平仓重试",
+                    f"重试次数：{worker.close_retry_count}",
+                    f"最新原因：{exc}",
+                ]
+            ),
+        )
+        worker.last_transient_notify_at = now
+
+
+def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -> None:
+    protection = worker.protection
+    self._set_status(
+        worker,
+        "运行中",
+        (
+            f"开始监控 {protection.option_inst_id} | 触发源={protection.trigger_label or protection.trigger_inst_id} | "
+            f"止盈={_fmt_optional(protection.take_profit_trigger)} | 止损={_fmt_optional(protection.stop_loss_trigger)}"
+        ),
+    )
+    while not worker.stop_event.is_set():
+        try:
+            if worker.pending_close_reason is not None:
+                self._close_position(worker, worker.pending_close_reason)
+                self._reset_transient_state(worker)
+                worker.close_retry_count = 0
+                self._set_status(worker, "已完成", f"{worker.pending_close_reason}已完成平仓流程。")
+                return
+
+            current_price = self._client.get_trigger_price(
+                protection.trigger_inst_id,
+                protection.trigger_price_type,
+            )
+            worker.last_trigger_price = current_price
+            stop_hit, take_hit = evaluate_protection_trigger(
+                direction=protection.direction,
+                current_price=current_price,
+                stop_loss=protection.stop_loss_trigger,
+                take_profit=protection.take_profit_trigger,
+                option_inst_id=protection.option_inst_id,
+                uses_underlying_trigger=uses_underlying_price_trigger(protection),
+            )
+            self._reset_transient_state(worker)
+            self._set_status(
+                worker,
+                "运行中",
+                f"监控中 | 触发价={format_decimal(current_price)} | 触发源={protection.trigger_label or protection.trigger_inst_id}",
+            )
+            if stop_hit or take_hit:
+                reason = "止损" if stop_hit else "止盈"
+                worker.pending_close_reason = reason
+                worker.close_retry_count = 0
+                trigger_ticker = self._safe_get_ticker(protection.option_inst_id)
+                trigger_market_summary = self._format_ticker_snapshot(trigger_ticker)
+                self._logger(
+                    _repair_mojibake_text(
+                        f"[持仓保护 {worker.session_id}] {reason}触发市场快照 | {protection.option_inst_id} | {trigger_market_summary}"
+                    )
+                )
+                if not worker.trigger_notification_sent:
+                    self._logger(
+                        _repair_mojibake_text(
+                            f"[持仓保护 {worker.session_id}] {reason}触发 | {protection.option_inst_id} | "
+                            f"触发源={protection.trigger_label or protection.trigger_inst_id} | 当前价={format_decimal(current_price)}"
+                        )
+                    )
+                    self._notify(
+                        subject=f"[QQOKX] 持仓保护触发 | {reason} | {protection.option_inst_id}",
+                        body="\n".join(
+                            [
+                                f"任务：{worker.session_id}",
+                                f"期权合约：{protection.option_inst_id}",
+                                f"方向：{protection.direction}",
+                                f"触发源：{protection.trigger_label or protection.trigger_inst_id}",
+                                f"当前触发价：{format_decimal(current_price)}",
+                                f"止盈触发：{_fmt_optional(protection.take_profit_trigger)}",
+                                f"止损触发：{_fmt_optional(protection.stop_loss_trigger)}",
+                                f"触发原因：{reason}",
+                            ]
+                        ),
+                    )
+                    worker.trigger_notification_sent = True
+                self._set_status(worker, "运行中", f"{reason}已触发，正在尝试平仓 | 触发价={format_decimal(current_price)}")
+                continue
+            worker.stop_event.wait(protection.poll_seconds)
+        except ProtectionCloseRetryError as exc:
+            self._pp_handle_close_retry(worker, worker.pending_close_reason or "平仓", exc)
+            worker.stop_event.wait(max(protection.poll_seconds, 0.2))
+            continue
+        except ProtectionPriceGuardError as exc:
+            self._set_status(worker, "异常", f"价格保护拦截：{exc}")
+            self._notify(
+                subject=f"[QQOKX] 持仓保护价格拦截 | {protection.option_inst_id}",
+                body="\n".join(
+                    [
+                        f"任务：{worker.session_id}",
+                        f"期权合约：{protection.option_inst_id}",
+                        f"触发源：{protection.trigger_label or protection.trigger_inst_id}",
+                        f"当前阶段：{worker.pending_close_reason or '监控触发价'}",
+                        f"拦截原因：{exc}",
+                        "处理结果：本次自动报单已停止，请人工确认后处理。",
+                    ]
+                ),
+            )
+            return
+        except Exception as exc:
+            if self._is_transient_error(exc):
+                self._handle_transient_error(worker, exc)
+                worker.stop_event.wait(max(protection.poll_seconds, 0.05))
+                continue
+            self._set_status(worker, "异常", f"保护任务异常：{exc}")
+            self._notify(
+                subject=f"[QQOKX] 持仓保护异常 | {protection.option_inst_id}",
+                body="\n".join(
+                    [
+                        f"任务：{worker.session_id}",
+                        f"期权合约：{protection.option_inst_id}",
+                        f"触发源：{protection.trigger_label or protection.trigger_inst_id}",
+                        f"异常：{exc}",
+                    ]
+                ),
+            )
+            return
+
+    self._set_status(worker, "已停止", "保护任务已停止。")
+
+
+def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorker, reason: str) -> None:
+    trade_instrument = self._client.get_instrument(worker.protection.option_inst_id)
+    remaining_position = self._find_matching_position(worker)
+    if remaining_position is None:
+        opposite = self._find_any_position(worker)
+        if opposite is not None:
+            raise RuntimeError(
+                f"{worker.protection.option_inst_id} 检测到反向仓位 {format_decimal(opposite.position)}，已停止自动保护，请立即人工检查。"
+            )
+        self._clear_active_close_order(worker)
+        self._logger(f"[持仓保护 {worker.session_id}] {worker.protection.option_inst_id} 当前已经没有持仓。")
+        return
+
+    remaining = abs(remaining_position.position)
+    close_side = derive_close_side(worker.protection.direction)
+    pos_side = worker.protection.pos_side
+
+    for _ in range(3):
+        if remaining <= 0:
+            break
+
+        if worker.active_close_cl_ord_id is not None:
+            state = self._reconcile_active_close_order(
+                worker,
+                reason=reason,
+                close_side=close_side,
+                expected_remaining=remaining,
+            )
+            if state == "waiting":
+                raise ProtectionCloseRetryError("平仓订单状态确认中，稍后重试。")
+            latest = self._find_matching_position(worker)
+            if latest is None:
+                opposite = self._find_any_position(worker)
+                if opposite is not None:
+                    raise RuntimeError(
+                        f"{worker.protection.option_inst_id} 检测到反向仓位 {format_decimal(opposite.position)}，已停止自动保护，请立即人工检查。"
+                    )
+                remaining = Decimal("0")
+                break
+            remaining = abs(latest.position)
+            if state == "progressed":
+                continue
+            raise ProtectionCloseRetryError(f"{reason}平仓单未成交，准备重新挂单。")
+
+        size = snap_to_increment(remaining, trade_instrument.lot_size, "down")
+        if size < trade_instrument.min_size:
+            raise RuntimeError(
+                f"剩余仓位 {format_decimal(remaining)} 小于最小下单量 {format_decimal(trade_instrument.min_size)}"
+            )
+
+        cl_ord_id = worker.active_close_cl_ord_id or self._next_close_cl_ord_id(worker)
+        order_price = build_close_order_price(
+            client=self._client,
+            option_inst_id=worker.protection.option_inst_id,
+            close_side=close_side,
+            tick_size=trade_instrument.tick_size,
+            mode=worker.protection.stop_loss_order_mode if reason == "止损" else worker.protection.take_profit_order_mode,
+            fixed_price=worker.protection.stop_loss_order_price if reason == "止损" else worker.protection.take_profit_order_price,
+            slippage=worker.protection.stop_loss_slippage if reason == "止损" else worker.protection.take_profit_slippage,
+        )
+        spot_price, option_ticker = validate_live_protection_order_price_guard(
+            client=self._client,
+            option_inst_id=worker.protection.option_inst_id,
+            close_side=close_side,
+            order_price=order_price,
+            tick_size=trade_instrument.tick_size,
+            open_avg_price=remaining_position.avg_price,
+        )
+        self._logger(
+            _repair_mojibake_text(
+                f"[持仓保护 {worker.session_id}] {reason}平仓报单 | {worker.protection.option_inst_id} | "
+                f"方向={close_side.upper()} | 委托价={format_decimal(order_price)} | 委托量={format_decimal(size)} | "
+                f"clOrdId={cl_ord_id} | 触发价={_fmt_optional(worker.last_trigger_price)} | "
+                f"现货={format_decimal(spot_price)} | 开仓均价={_fmt_optional(remaining_position.avg_price)} | "
+                f"{self._format_ticker_snapshot(option_ticker)}"
+            )
+        )
+        worker.active_close_cl_ord_id = cl_ord_id
+        worker.active_close_submitted_at = datetime.now()
+        result = self._client.place_simple_order(
+            worker.credentials,
+            worker.config,
+            inst_id=worker.protection.option_inst_id,
+            side=close_side,
+            size=size,
+            ord_type="ioc",
+            pos_side=pos_side,
+            price=order_price,
+            cl_ord_id=cl_ord_id,
+        )
+        worker.active_close_ord_id = result.ord_id or None
+        worker.active_close_cl_ord_id = result.cl_ord_id or cl_ord_id
+        try:
+            filled_size, filled_price = wait_order_fill(
+                client=self._client,
+                credentials=worker.credentials,
+                config=worker.config,
+                inst_id=worker.protection.option_inst_id,
+                ord_id=result.ord_id,
+                estimated_price=order_price,
+                wait_seconds=max(worker.protection.poll_seconds / 2, 0.5),
+                stop_event=worker.stop_event,
+            )
+        except ProtectionCloseRetryError:
+            self._clear_active_close_order(worker)
+            raise
+
+        latest = self._find_matching_position(worker)
+        remaining = Decimal("0") if latest is None else abs(latest.position)
+        opposite = self._find_any_position(worker)
+        if latest is None and opposite is not None:
+            raise RuntimeError(
+                f"{worker.protection.option_inst_id} 检测到反向仓位 {format_decimal(opposite.position)}，已停止自动保护，请立即人工检查。"
+            )
+        self._record_close_fill(
+            worker,
+            reason=reason,
+            close_side=close_side,
+            filled_size=filled_size,
+            filled_price=filled_price,
+            remaining=remaining,
+            order_price=order_price,
+            ticker=option_ticker,
+        )
+        self._clear_active_close_order(worker)
+        latest = self._find_matching_position(worker)
+        if latest is None:
+            remaining = Decimal("0")
+            break
+        remaining = abs(latest.position)
+
+    if remaining > 0:
+        raise RuntimeError(f"{worker.protection.option_inst_id} 保护平仓后仍有剩余仓位 {format_decimal(remaining)}")
+
+
+def _pp_reconcile_active_close_order(
+    self: PositionProtectionManager,
+    worker: _ProtectionWorker,
+    *,
+    reason: str,
+    close_side: Literal["buy", "sell"],
+    expected_remaining: Decimal,
+) -> Literal["waiting", "progressed", "retry"]:
+    if worker.active_close_cl_ord_id is None:
+        return "retry"
+    try:
+        status = self._client.get_order(
+            worker.credentials,
+            worker.config,
+            inst_id=worker.protection.option_inst_id,
+            ord_id=worker.active_close_ord_id,
+            cl_ord_id=worker.active_close_cl_ord_id,
+        )
+    except OkxApiError as exc:
+        if not self._is_missing_order_error(exc):
+            raise
+        if worker.active_close_submitted_at is not None:
+            elapsed = (datetime.now() - worker.active_close_submitted_at).total_seconds()
+            if elapsed < max(worker.protection.poll_seconds * 2, 5.0):
+                return "waiting"
+        self._clear_active_close_order(worker)
+        return "retry"
+
+    state = (status.state or "").lower()
+    filled_size = status.filled_size or Decimal("0")
+    if filled_size > 0:
+        latest = self._find_matching_position(worker)
+        remaining = Decimal("0") if latest is None else abs(latest.position)
+        self._record_close_fill(
+            worker,
+            reason=reason,
+            close_side=close_side,
+            filled_size=filled_size,
+            filled_price=status.avg_price or status.price or Decimal("0"),
+            remaining=remaining,
+            order_price=status.price,
+            ticker=self._safe_get_ticker(worker.protection.option_inst_id),
+        )
+
+    if state in {"filled", "partially_filled"}:
+        self._clear_active_close_order(worker)
+        return "progressed"
+    if state in {"canceled", "mmp_canceled", "order_failed"}:
+        self._clear_active_close_order(worker)
+        return "progressed" if filled_size > 0 else "retry"
+    return "waiting"
+
+
+def _pp_record_close_fill(
+    self: PositionProtectionManager,
+    worker: _ProtectionWorker,
+    *,
+    reason: str,
+    close_side: Literal["buy", "sell"],
+    filled_size: Decimal,
+    filled_price: Decimal,
+    remaining: Decimal,
+    order_price: Decimal | None = None,
+    ticker: OkxTicker | None = None,
+) -> None:
+    self._logger(
+        _repair_mojibake_text(
+            f"[持仓保护 {worker.session_id}] {reason}平仓成交 | {worker.protection.option_inst_id} | "
+            f"方向={close_side.upper()} | 成交价={format_decimal(filled_price)} | 成交量={format_decimal(filled_size)} | "
+            f"剩余={format_decimal(max(remaining, Decimal('0')))}"
+        )
+    )
+    self._logger(
+        _repair_mojibake_text(
+            f"[持仓保护 {worker.session_id}] {reason}成交快照 | {worker.protection.option_inst_id} | "
+            f"委托价={_fmt_optional(order_price)} | {self._format_ticker_snapshot(ticker)}"
+        )
+    )
+    self._notify(
+        subject=f"[QQOKX] 持仓保护成交 | {reason} | {worker.protection.option_inst_id}",
+        body="\n".join(
+            [
+                f"任务：{worker.session_id}",
+                f"期权合约：{worker.protection.option_inst_id}",
+                f"触发原因：{reason}",
+                f"平仓方向：{close_side}",
+                f"成交数量：{format_decimal(filled_size)}",
+                f"成交价格：{format_decimal(filled_price)}",
+                f"剩余仓位：{format_decimal(max(remaining, Decimal('0')))}",
+            ]
+        ),
+    )
+
+
+def _pp_is_missing_order_error(self: PositionProtectionManager, exc: Exception) -> bool:
+    message = _repair_mojibake_text(str(exc)).lower()
+    return "未返回订单状态" in message or "order does not exist" in message
+
+
+def _pp_set_status(self: PositionProtectionManager, worker: _ProtectionWorker, status: str, message: str) -> None:
+    repaired_status = _repair_mojibake_text(status)
+    repaired_message = _repair_mojibake_text(message)
+    with self._lock:
+        worker.status = repaired_status
+        worker.last_message = repaired_message
+    self._logger(f"[持仓保护 {worker.session_id}] {repaired_message}")
+    self._emit_change()
+
+
+def _pp_is_transient_error(self: PositionProtectionManager, exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, OkxApiError) and exc.status is not None and exc.status >= 500:
+        return True
+    message = _repair_mojibake_text(str(exc)).lower()
+    transient_markers = (
+        "网络错误",
+        "timeout",
+        "timed out",
+        "handshake",
+        "ssl",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "temporarily unavailable",
+        "temporary failure",
+        "remote disconnected",
+        "read timed out",
+        "connect timeout",
+        "proxy error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "握手",
+        "超时",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
+def _pp_handle_transient_error(self: PositionProtectionManager, worker: _ProtectionWorker, exc: Exception) -> None:
+    now = datetime.now()
+    worker.transient_error_count += 1
+    worker.last_transient_error_at = now
+    message = (
+        f"网络异常，正在重试（第{worker.transient_error_count}次） | "
+        f"{worker.protection.option_inst_id} | {exc}"
+    )
+    if (
+        worker.last_transient_status_at is None
+        or (now - worker.last_transient_status_at).total_seconds() >= self._transient_status_interval_seconds
+    ):
+        self._set_status(worker, "运行中", message)
+        worker.last_transient_status_at = now
+
+    if (
+        worker.last_transient_notify_at is None
+        or (now - worker.last_transient_notify_at).total_seconds() >= self._transient_alert_interval_seconds
+    ):
+        self._notify(
+            subject=f"[QQOKX] 持仓保护网络重试 | {worker.protection.option_inst_id}",
+            body="\n".join(
+                [
+                    f"任务：{worker.session_id}",
+                    f"期权合约：{worker.protection.option_inst_id}",
+                    f"触发源：{worker.protection.trigger_label or worker.protection.trigger_inst_id}",
+                    "当前状态：网络异常，正在重试，任务不会自动停止",
+                    f"连续异常次数：{worker.transient_error_count}",
+                    f"最新异常：{exc}",
+                    (
+                        f"当前平仓阶段：{worker.pending_close_reason}"
+                        if worker.pending_close_reason is not None
+                        else "当前阶段：监控触发价"
+                    ),
+                ]
+            ),
+        )
+        worker.last_transient_notify_at = now
+
+
+def _pp_notify(self: PositionProtectionManager, *, subject: str, body: str) -> None:
+    if self._notifier is not None and self._notifier.enabled:
+        self._notifier.notify_async(_repair_mojibake_text(subject), _repair_mojibake_text(body))
+
+
+def _pp_format_ticker_snapshot(self: PositionProtectionManager, ticker: OkxTicker | None) -> str:
+    if ticker is None:
+        return "盘口=不可用"
+    return (
+        "盘口 "
+        f"bid/ask/last/mark={_fmt_optional(ticker.bid)}/{_fmt_optional(ticker.ask)}/"
+        f"{_fmt_optional(ticker.last)}/{_fmt_optional(ticker.mark)}"
+    )
+
+
+def validate_protection_order_price_guard(
+    *,
+    option_inst_id: str,
+    close_side: Literal["buy", "sell"],
+    order_price: Decimal,
+    tick_size: Decimal,
+    open_avg_price: Decimal | None,
+    spot_price: Decimal,
+    option_bid: Decimal | None,
+    option_ask: Decimal | None,
+    option_last: Decimal | None,
+) -> None:
+    if order_price <= 0:
+        raise ProtectionPriceGuardError(f"{option_inst_id} 的报单价格 {format_decimal(order_price)} 无效。")
+    if spot_price <= 0:
+        raise ProtectionPriceGuardError(f"{option_inst_id} 无法取得有效现货价格，不能完成价格保护校验。")
+
+    intrinsic_price = compute_option_intrinsic_price(option_inst_id=option_inst_id, spot_price=spot_price)
+    hard_cap = compute_option_hard_price_cap(option_inst_id=option_inst_id, spot_price=spot_price)
+    option_quotes = _positive_quote_candidates(option_bid, option_ask, option_last)
+    market_anchor = max(option_quotes) * PRICE_GUARD_MARKET_MULTIPLIER if option_quotes else Decimal("0")
+    avg_price = open_avg_price if open_avg_price is not None and open_avg_price > 0 else Decimal("0")
+
+    strike = infer_option_strike(option_inst_id)
+    if strike is None:
+        raise ProtectionPriceGuardError(f"{option_inst_id} 无法解析行权价，不能完成价格保护校验。")
+
+    moneyness_distance = abs(spot_price - strike) / spot_price
+    delta_one_anchor = intrinsic_price + moneyness_distance + (avg_price * PRICE_GUARD_OPEN_BUFFER_MULTIPLIER)
+    open_anchor = avg_price * PRICE_GUARD_OPEN_AVG_MULTIPLIER if avg_price > 0 else Decimal("0")
+
+    if close_side == "buy":
+        upper_candidates = [tick_size, delta_one_anchor, open_anchor, market_anchor]
+        upper_bound = max(upper_candidates)
+        if hard_cap is not None and hard_cap > 0:
+            upper_bound = min(upper_bound, hard_cap)
+        upper_bound = max(upper_bound, tick_size)
+        if order_price > upper_bound:
+            raise ProtectionPriceGuardError(
+                (
+                    f"{option_inst_id} 价格保护已拦截：买回报单价 {format_decimal(order_price)} 高于安全上限 "
+                    f"{format_decimal(upper_bound)} | 现货价 {format_decimal(spot_price)} | 行权价 {format_decimal(strike)} | "
+                    f"开仓均价 {_fmt_optional(open_avg_price)} | bid/ask/last={_fmt_optional(option_bid)}/"
+                    f"{_fmt_optional(option_ask)}/{_fmt_optional(option_last)}"
+                )
+            )
+        return
+
+    lower_candidates = [tick_size]
+    if intrinsic_price > 0:
+        lower_candidates.append(intrinsic_price * PRICE_GUARD_SELL_INTRINSIC_FLOOR_RATIO)
+    if option_bid is not None and option_bid > 0:
+        lower_candidates.append(option_bid * PRICE_GUARD_SELL_BID_FLOOR_RATIO)
+    lower_bound = max(lower_candidates)
+    if order_price < lower_bound:
+        raise ProtectionPriceGuardError(
+            (
+                f"{option_inst_id} 价格保护已拦截：卖出报单价 {format_decimal(order_price)} 低于安全下限 "
+                f"{format_decimal(lower_bound)} | 现货价 {format_decimal(spot_price)} | 行权价 {format_decimal(strike)} | "
+                f"开仓均价 {_fmt_optional(open_avg_price)} | bid/ask/last={_fmt_optional(option_bid)}/"
+                f"{_fmt_optional(option_ask)}/{_fmt_optional(option_last)}"
+            )
+        )
+
+
+def describe_protection_price_logic(
+    *,
+    option_inst_id: str,
+    direction: Literal["long", "short"],
+    trigger_inst_id: str,
+    trigger_price_type: TriggerPriceType,
+) -> str:
+    uses_underlying_trigger = not (
+        option_inst_id.strip().upper() == trigger_inst_id.strip().upper() and trigger_price_type == "mark"
+    )
+    option_style = infer_option_style(option_inst_id)
+    direction_label = "买入" if direction == "long" else "卖出"
+    style_label = "认购" if option_style == "call" else "认沽" if option_style == "put" else "期权"
+    trigger_label = "现货触发" if uses_underlying_trigger else "期权标记价格触发"
+    profit_on_rise = is_profit_when_trigger_price_rises(
+        option_inst_id=option_inst_id,
+        direction=direction,
+        uses_underlying_trigger=uses_underlying_trigger,
+    )
+    if profit_on_rise:
+        return (
+            f"{direction_label}{style_label} + {trigger_label}：价格上涨偏向止盈，价格下跌偏向止损，"
+            f"所以止盈触发价应大于止损触发价。"
+        )
+    return (
+        f"{direction_label}{style_label} + {trigger_label}：价格下跌偏向止盈，价格上涨偏向止损，"
+        f"所以止盈触发价应小于止损触发价。"
+    )
+
+
+def build_close_order_price_from_mark(
+    *,
+    mark_price: Decimal,
+    close_side: Literal["buy", "sell"],
+    tick_size: Decimal,
+    mode: ClosePriceMode,
+    fixed_price: Decimal | None,
+    slippage: Decimal,
+) -> Decimal:
+    if mode == "fixed_price":
+        if fixed_price is None or fixed_price <= 0:
+            raise RuntimeError("固定报单价格必须大于 0。")
+        return snap_to_increment(fixed_price, tick_size, "up" if close_side == "buy" else "down")
+
+    if close_side == "buy":
+        raw_price = mark_price + slippage
+        return snap_to_increment(raw_price, tick_size, "up")
+    raw_price = mark_price - slippage
+    if raw_price <= 0:
+        raw_price = tick_size
+    return snap_to_increment(raw_price, tick_size, "down")
+
+
+def validate_live_protection_order_price_guard(
+    *,
+    client: OkxRestClient,
+    option_inst_id: str,
+    close_side: Literal["buy", "sell"],
+    order_price: Decimal,
+    tick_size: Decimal,
+    open_avg_price: Decimal | None,
+    spot_price: Decimal | None = None,
+    ticker: OkxTicker | None = None,
+) -> tuple[Decimal, OkxTicker]:
+    spot_inst_id = infer_default_spot_inst_id(option_inst_id)
+    if not spot_inst_id:
+        raise ProtectionPriceGuardError(f"{option_inst_id} 无法推导现货标的，不能完成价格保护校验。")
+    resolved_spot_price = spot_price if spot_price is not None else client.get_trigger_price(spot_inst_id, "last")
+    resolved_ticker = ticker if ticker is not None else client.get_ticker(option_inst_id)
+    validate_protection_order_price_guard(
+        option_inst_id=option_inst_id,
+        close_side=close_side,
+        order_price=order_price,
+        tick_size=tick_size,
+        open_avg_price=open_avg_price,
+        spot_price=resolved_spot_price,
+        option_bid=resolved_ticker.bid,
+        option_ask=resolved_ticker.ask,
+        option_last=resolved_ticker.last,
+    )
+    return resolved_spot_price, resolved_ticker
+
+
+def wait_order_fill(
+    *,
+    client: OkxRestClient,
+    credentials: Credentials,
+    config: StrategyConfig,
+    inst_id: str,
+    ord_id: str | None,
+    estimated_price: Decimal,
+    wait_seconds: float,
+    stop_event: threading.Event,
+) -> tuple[Decimal, Decimal]:
+    if not ord_id:
+        raise RuntimeError("OKX 未返回 ordId，无法确认保护平仓结果。")
+
+    latest_state = ""
+    for _ in range(12):
+        status = client.get_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
+        latest_state = (status.state or "").lower()
+        filled_size = status.filled_size or Decimal("0")
+        resolved_price = status.avg_price or status.price or estimated_price
+        if latest_state == "filled":
+            return filled_size if filled_size > 0 else status.size or Decimal("0"), resolved_price
+        if latest_state == "partially_filled" and filled_size > 0:
+            return filled_size, resolved_price
+        if latest_state in {"canceled", "order_failed", "mmp_canceled"}:
+            if filled_size > 0:
+                return filled_size, resolved_price
+            raise ProtectionCloseRetryError(
+                f"保护平仓订单未成交，ordId={ord_id}，状态={latest_state or 'unknown'}"
+            )
+        stop_event.wait(wait_seconds)
+
+    raise ProtectionCloseRetryError(f"保护平仓订单未成交，ordId={ord_id}，状态={latest_state or 'unknown'}")
+
+
+PositionProtectionManager.list_sessions = _pp_list_sessions
+PositionProtectionManager.start = _pp_start
+PositionProtectionManager.stop = _pp_stop
+PositionProtectionManager.stop_all = _pp_stop_all
+PositionProtectionManager._run_worker = _pp_run_worker
+PositionProtectionManager._close_position = _pp_close_position
+PositionProtectionManager._reconcile_active_close_order = _pp_reconcile_active_close_order
+PositionProtectionManager._record_close_fill = _pp_record_close_fill
+PositionProtectionManager._is_missing_order_error = _pp_is_missing_order_error
+PositionProtectionManager._set_status = _pp_set_status
+PositionProtectionManager._is_transient_error = _pp_is_transient_error
+PositionProtectionManager._handle_transient_error = _pp_handle_transient_error
+PositionProtectionManager._notify = _pp_notify
+PositionProtectionManager._format_ticker_snapshot = _pp_format_ticker_snapshot
+PositionProtectionManager._pp_handle_close_retry = _pp_handle_close_retry

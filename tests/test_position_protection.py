@@ -1,4 +1,4 @@
-from decimal import Decimal
+﻿from decimal import Decimal
 from threading import Event
 from time import sleep
 from unittest import TestCase
@@ -161,7 +161,7 @@ class _PriceGuardClient:
 
 class _MissingMarkPriceClient:
     def get_trigger_price(self, inst_id: str, price_type: str) -> Decimal:
-        raise OkxApiError(f"{inst_id} 缺少标记价格，无法触发")
+        raise OkxApiError(f"{inst_id} 缺少标记价格，无法触发。")
 
 
 class _NotifierStub:
@@ -981,7 +981,7 @@ class PositionProtectionTest(TestCase):
             initial_position=_make_option_position(inst_id=option_inst_id, position="2", pos_side="long"),
             trigger_prices={
                 (option_inst_id, "mark"): [
-                    OkxApiError("网络错误：_ssl.c:1015: The handshake operation timed out"),
+            OkxApiError("网络错误：_ssl.c:1015: The handshake operation timed out"),
                     Decimal("0.0155"),
                 ],
             },
@@ -1047,7 +1047,7 @@ class PositionProtectionTest(TestCase):
             trigger_prices={
                 (spot_inst_id, "last"): [Decimal("100001")],
                 (option_inst_id, "mark"): [
-                    OkxApiError("网络错误：_ssl.c:1015: The handshake operation timed out"),
+            OkxApiError("网络错误：_ssl.c:1015: The handshake operation timed out"),
                     Decimal("0.0150"),
                 ],
             },
@@ -1316,15 +1316,19 @@ class PositionProtectionTest(TestCase):
             ),
         )
 
+        sleep(0.05)
         worker = manager._workers[session_id]
         assert worker.thread is not None
-        worker.thread.join(timeout=1)
 
-        self.assertFalse(worker.thread.is_alive())
-        self.assertEqual(len(client.orders), 1)
+        self.assertTrue(worker.thread.is_alive())
+        self.assertGreaterEqual(len(client.orders), 1)
         self.assertEqual(client.current_position, Decimal("2"))
-        self.assertTrue(any("异常" in subject for subject, _ in notifier.messages))
-        self.assertIn("异常", worker.status)
+        self.assertIn(worker.status, {"平仓重试中", "持续未成交待人工"})
+        self.assertFalse(any("持仓保护异常" in subject for subject, _ in notifier.messages))
+        self.assertTrue(any("平仓重试" in subject for subject, _ in notifier.messages))
+
+        manager.stop(session_id)
+        worker.thread.join(timeout=1)
 
     def test_manager_errors_when_remaining_position_is_below_min_size(self) -> None:
         option_inst_id = "BTC-USD-20260327-70000-C"
@@ -1471,3 +1475,5 @@ class PositionProtectionTest(TestCase):
         self.assertFalse(worker.thread.is_alive())
         self.assertEqual(manager.clear_finished(), 1)
         self.assertEqual(len(manager._workers), 0)
+
+
