@@ -2574,7 +2574,11 @@ class QuantApp:
             ),
         )
 
-    def _selected_option_position(self) -> OkxPosition | None:
+    def _selected_option_position(self, *, prefer_protection_form: bool = False) -> OkxPosition | None:
+        if prefer_protection_form and self._protection_form_position_key:
+            fallback = _find_position_by_key(self._latest_positions, self._protection_form_position_key)
+            if fallback is not None and fallback.inst_type == "OPTION":
+                return fallback
         payload = None
         if self._positions_zoom_window is not None and self._positions_zoom_window.winfo_exists():
             if self._positions_zoom_selected_item_id:
@@ -2593,7 +2597,7 @@ class QuantApp:
 
     def open_position_protection_window(self) -> None:
         if self._protection_window is not None and self._protection_window.winfo_exists():
-            self._populate_protection_form_from_selection(force=False)
+            self._populate_protection_form_from_selection(force=True)
             self._refresh_protection_window_view()
             self._protection_window.focus_force()
             return
@@ -2804,7 +2808,7 @@ class QuantApp:
         self._protection_form_position_key = None
 
     def _populate_protection_form_from_selection(self, *, force: bool = False) -> None:
-        position = self._selected_option_position()
+        position = self._selected_option_position(prefer_protection_form=not force)
         if position is None:
             if self._positions_view_rendering and self._protection_form_position_key:
                 return
@@ -2845,7 +2849,7 @@ class QuantApp:
         self._update_protection_logic_hint()
 
     def _update_protection_logic_hint(self) -> None:
-        position = self._selected_option_position()
+        position = self._selected_option_position(prefer_protection_form=True)
         if position is None:
             self._protection_logic_hint_text.set("请先选择一条期权持仓，系统会显示当前组合下的止盈止损方向。")
             return
@@ -2993,7 +2997,7 @@ class QuantApp:
         )
 
     def start_selected_position_protection(self) -> None:
-        position = self._selected_option_position()
+        position = self._selected_option_position(prefer_protection_form=True)
         if position is None:
             messagebox.showinfo("提示", "请先在账户持仓中选中一条期权仓位。", parent=self._protection_window or self.root)
             return
@@ -3025,7 +3029,7 @@ class QuantApp:
             messagebox.showerror("停止保护失败", str(exc), parent=self._protection_window or self.root)
 
     def open_position_protection_replay_window(self) -> None:
-        position = self._selected_option_position()
+        position = self._selected_option_position(prefer_protection_form=True)
         if position is None:
             messagebox.showinfo("提示", "请先在账户持仓中选中一条期权仓位。", parent=self._protection_window or self.root)
             return
