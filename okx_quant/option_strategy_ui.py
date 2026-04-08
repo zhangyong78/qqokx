@@ -25,6 +25,7 @@ from okx_quant.option_strategy import (
     build_simulated_payoff_snapshot,
     convert_candles_by_reference,
     convert_payoff_snapshot_to_usdt,
+    estimate_leg_greeks,
     evaluate_linear_formula,
     format_option_expiry_label,
     infer_implied_volatility_for_leg,
@@ -120,9 +121,9 @@ class OptionStrategyCalculatorWindow:
         self.option_family = StringVar()
         self.expiry_code = StringVar()
         self.default_quantity = StringVar(value="1")
-        self.bar = StringVar(value="15m")
-        self.candle_limit = StringVar(value="2000")
-        self.chart_display_ccy = StringVar(value="USDT")
+        self.bar = StringVar(value="1H")
+        self.candle_limit = StringVar(value="1000")
+        self.chart_display_ccy = StringVar(value="结算币")
         self.combo_hide_wicks = BooleanVar(value=False)
         self.payoff_time_progress = DoubleVar(value=100.0)
         self.payoff_vol_shift_percent = DoubleVar(value=0.0)
@@ -377,7 +378,23 @@ class OptionStrategyCalculatorWindow:
 
         legs_tree = ttk.Treeview(
             strategy_frame,
-            columns=("alias", "inst_id", "type", "expiry", "strike", "side", "qty", "mark", "contract", "premium_total"),
+            columns=(
+                "alias",
+                "inst_id",
+                "type",
+                "expiry",
+                "strike",
+                "side",
+                "qty",
+                "premium",
+                "mark",
+                "contract",
+                "premium_total",
+                "delta",
+                "gamma",
+                "theta",
+                "vega",
+            ),
             show="headings",
             selectmode="browse",
         )
@@ -389,9 +406,14 @@ class OptionStrategyCalculatorWindow:
             ("strike", "行权价", 92, "e"),
             ("side", "买卖", 64, "center"),
             ("qty", "数量", 70, "e"),
+            ("premium", "持仓价", 90, "e"),
             ("mark", "标记价", 90, "e"),
             ("contract", "每张面值", 90, "e"),
             ("premium_total", "权利金合计", 110, "e"),
+            ("delta", "Delta", 88, "e"),
+            ("gamma", "Gamma", 88, "e"),
+            ("theta", "Theta", 88, "e"),
+            ("vega", "Vega", 88, "e"),
         ):
             legs_tree.heading(column, text=label)
             legs_tree.column(column, width=width, anchor=anchor)
@@ -404,7 +426,7 @@ class OptionStrategyCalculatorWindow:
 
         legs_actions = ttk.Frame(strategy_frame)
         legs_actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        for column in range(4):
+        for column in range(5):
             legs_actions.columnconfigure(column, weight=1)
         ttk.Button(legs_actions, text="删除选中腿", command=self.remove_selected_leg).grid(
             row=0, column=0, sticky="ew", padx=(0, 8)
@@ -412,10 +434,13 @@ class OptionStrategyCalculatorWindow:
         ttk.Button(legs_actions, text="修改数量", command=self.edit_selected_leg_quantity).grid(
             row=0, column=1, sticky="ew", padx=(0, 8)
         )
-        ttk.Button(legs_actions, text="清空策略腿", command=self.clear_legs).grid(
+        ttk.Button(legs_actions, text="修改持仓价", command=self.edit_selected_leg_premium).grid(
             row=0, column=2, sticky="ew", padx=(0, 8)
         )
-        ttk.Button(legs_actions, text="刷新腿报价", command=self.refresh_leg_quotes).grid(row=0, column=3, sticky="ew")
+        ttk.Button(legs_actions, text="清空策略腿", command=self.clear_legs).grid(
+            row=0, column=3, sticky="ew", padx=(0, 8)
+        )
+        ttk.Button(legs_actions, text="刷新腿报价", command=self.refresh_leg_quotes).grid(row=0, column=4, sticky="ew")
 
         charts = ttk.Notebook(body)
         body.add(charts, weight=3)
@@ -854,6 +879,7 @@ class OptionStrategyCalculatorWindow:
         if should_reset_formula:
             self.formula.set(build_default_formula(self._legs))
 
+        self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
         scope_text = "当前到期日" if scope == "expiry" else "当前系列"
@@ -938,11 +964,14 @@ class OptionStrategyCalculatorWindow:
             return
         row_id = self._legs_tree.identify_row(event.y)
         column_id = self._legs_tree.identify_column(event.x)
-        if not row_id or column_id != "#7":
+        if not row_id:
             return
         self._legs_tree.selection_set(row_id)
         self._legs_tree.focus(row_id)
-        self.edit_selected_leg_quantity()
+        if column_id == "#7":
+            self.edit_selected_leg_quantity()
+        elif column_id == "#8":
+            self.edit_selected_leg_premium()
 
     def add_selected_chain_leg(self, option_type: str, side: str) -> None:
         row = self._selected_chain_row()
@@ -974,6 +1003,7 @@ class OptionStrategyCalculatorWindow:
             self._quotes_by_inst_id[quote.instrument.inst_id] = quote
         if not self.formula.get().strip():
             self.formula.set(build_default_formula(self._legs))
+        self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
 
@@ -1020,6 +1050,45 @@ class OptionStrategyCalculatorWindow:
         if self._latest_payoff_snapshot is not None or self._latest_combo_candles:
             self.refresh_charts()
 
+    def edit_selected_leg_premium(self) -> None:
+        index = self._selected_leg_index()
+        if index is None:
+            messagebox.showinfo("修改持仓价", "请先选择一条策略腿。", parent=self.window)
+            return
+        if index < 0 or index >= len(self._legs):
+            return
+
+        leg = self._legs[index]
+        instrument = self._instrument_map.get(leg.inst_id)
+        initial_value = format_decimal(leg.premium) if leg.premium is not None else ""
+        response = simpledialog.askstring(
+            "修改持仓价",
+            f"请输入 {leg.alias} 的持仓价：",
+            initialvalue=initial_value,
+            parent=self.window,
+        )
+        if response is None:
+            return
+        text = response.strip()
+        if not text:
+            leg.premium = None
+        else:
+            try:
+                premium = self._parse_positive_decimal(text, "持仓价")
+            except Exception as exc:
+                messagebox.showerror("修改持仓价失败", str(exc), parent=self.window)
+                return
+            tick_size = instrument.tick_size if instrument is not None else None
+            if tick_size is not None and premium <= 0:
+                messagebox.showerror("修改持仓价失败", "持仓价必须大于 0。", parent=self.window)
+                return
+            leg.premium = premium
+        self._render_legs()
+        self._refresh_strategy_summary()
+        if self._latest_payoff_snapshot is not None or self._latest_combo_candles:
+            self._refresh_payoff_simulation()
+            self._refresh_chart_display(combo_only=False)
+
     def clear_legs(self) -> None:
         self._legs.clear()
         self._latest_payoff_snapshot = None
@@ -1051,6 +1120,7 @@ class OptionStrategyCalculatorWindow:
             instrument = self._instrument_map.get(leg.inst_id)
             parsed = parse_option_contract(leg.inst_id)
             premium = leg.premium
+            mark_price = self._leg_mark_price(leg.inst_id)
             contract_value = option_contract_value(instrument) if instrument is not None else Decimal("1")
             premium_total = premium * contract_value * leg.quantity if premium is not None else None
             self._legs_tree.insert(
@@ -1066,10 +1136,62 @@ class OptionStrategyCalculatorWindow:
                     "买入" if leg.side == "buy" else "卖出",
                     format_decimal(leg.quantity),
                     _format_price(premium, instrument.tick_size if instrument is not None else None),
+                    _format_price(mark_price, instrument.tick_size if instrument is not None else None),
                     format_decimal(contract_value),
                     format_decimal(premium_total) if premium_total is not None else "-",
+                    _format_compact_number(leg.delta),
+                    _format_compact_number(leg.gamma),
+                    _format_compact_number(leg.theta),
+                    _format_compact_number(leg.vega),
                 ),
             )
+
+    def _leg_mark_price(self, inst_id: str) -> Decimal | None:
+        quote = self._quotes_by_inst_id.get(inst_id)
+        if quote is None:
+            return None
+        return quote.reference_price
+
+    def _refresh_leg_greeks(self) -> None:
+        valuation_time = datetime.now()
+        settlement_price = self._current_underlying_price
+        for leg in self._legs:
+            leg.delta = None
+            leg.gamma = None
+            leg.theta = None
+            leg.vega = None
+            instrument = self._instrument_map.get(leg.inst_id)
+            quote = self._quotes_by_inst_id.get(leg.inst_id)
+            if (
+                instrument is None
+                or quote is None
+                or quote.reference_price is None
+                or settlement_price is None
+                or settlement_price <= 0
+                or leg.premium is None
+            ):
+                continue
+            try:
+                resolved_leg = resolve_strategy_leg(leg, instrument)
+                implied_volatility = infer_implied_volatility_for_leg(
+                    resolved_leg,
+                    settlement_price=settlement_price,
+                    valuation_time=valuation_time,
+                    option_price=quote.reference_price,
+                )
+                greeks = estimate_leg_greeks(
+                    resolved_leg,
+                    settlement_price=settlement_price,
+                    valuation_time=valuation_time,
+                    base_implied_volatility=implied_volatility,
+                )
+                direction = Decimal("1") if leg.side == "buy" else Decimal("-1")
+                leg.delta = greeks["delta"] * direction * leg.quantity
+                leg.gamma = greeks["gamma"] * direction * leg.quantity
+                leg.theta = greeks["theta"] * direction * leg.quantity
+                leg.vega = greeks["vega"] * direction * leg.quantity
+            except Exception:
+                continue
 
     def use_default_formula(self) -> None:
         self.formula.set(build_default_formula(self._legs))
@@ -1084,26 +1206,23 @@ class OptionStrategyCalculatorWindow:
 
     def _refresh_leg_quotes_worker(self) -> None:
         try:
-            refreshed: list[tuple[str, Decimal | None, Instrument, OptionQuote]] = []
+            refreshed: list[tuple[str, Instrument, OptionQuote]] = []
             for leg in self._legs:
                 instrument = self._instrument_map.get(leg.inst_id) or self.client.get_instrument(leg.inst_id)
                 ticker = self.client.get_ticker(leg.inst_id)
                 quote = _build_option_quote(instrument, ticker)
-                refreshed.append((leg.inst_id, quote.reference_price, instrument, quote))
+                refreshed.append((leg.inst_id, instrument, quote))
             self.window.after(0, lambda: self._apply_refreshed_leg_quotes(refreshed))
         except Exception as exc:  # noqa: BLE001
             self.window.after(0, lambda: messagebox.showerror("刷新腿报价失败", str(exc), parent=self.window))
 
     def _apply_refreshed_leg_quotes(
         self,
-        refreshed: list[tuple[str, Decimal | None, Instrument, OptionQuote]],
+        refreshed: list[tuple[str, Instrument, OptionQuote]],
     ) -> None:
-        for inst_id, premium, instrument, quote in refreshed:
+        for inst_id, instrument, quote in refreshed:
             self._instrument_map[inst_id] = instrument
             self._quotes_by_inst_id[inst_id] = quote
-            for leg in self._legs:
-                if leg.inst_id == inst_id:
-                    leg.premium = premium
             if self._current_underlying_price is None and quote.index_price is not None:
                 self._current_underlying_price = quote.index_price
         self._render_legs()
@@ -1580,7 +1699,6 @@ class OptionStrategyCalculatorWindow:
                 latest_quotes[leg.inst_id] = quote
                 if quote.reference_price is None:
                     raise ValueError(f"{leg.inst_id} 当前缺少标记价 / 最新价，无法计算。")
-                leg.premium = quote.reference_price
                 if current_underlying_price is None and quote.index_price is not None:
                     current_underlying_price = quote.index_price
                 resolved_legs.append(resolve_strategy_leg(leg, instrument))
@@ -1664,7 +1782,6 @@ class OptionStrategyCalculatorWindow:
                 latest_quotes[leg.inst_id] = quote
                 if quote.reference_price is None:
                     raise ValueError(f"{leg.inst_id} 当前缺少标记价 / 最新价，无法计算。")
-                leg.premium = quote.reference_price
                 if current_underlying_price is None and quote.index_price is not None:
                     current_underlying_price = quote.index_price
                 candles = self.client.get_mark_price_candles(leg.inst_id, self.bar.get().strip(), limit=candle_limit)
@@ -1743,9 +1860,7 @@ class OptionStrategyCalculatorWindow:
         self._current_underlying_price = current_underlying_price
         for inst_id, quote in latest_quotes.items():
             self._quotes_by_inst_id[inst_id] = quote
-            for leg in self._legs:
-                if leg.inst_id == inst_id:
-                    leg.premium = quote.reference_price
+        self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
         self._refresh_payoff_simulation()
@@ -1778,9 +1893,7 @@ class OptionStrategyCalculatorWindow:
         self._current_underlying_price = current_underlying_price
         for inst_id, quote in latest_quotes.items():
             self._quotes_by_inst_id[inst_id] = quote
-            for leg in self._legs:
-                if leg.inst_id == inst_id:
-                    leg.premium = quote.reference_price
+        self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
         self._refresh_chart_display(combo_only=True)
@@ -2028,6 +2141,10 @@ class OptionStrategyCalculatorWindow:
                     "side": item.side,
                     "quantity": format_decimal(item.quantity),
                     "premium": format_decimal(item.premium) if item.premium is not None else "",
+                    "delta": format_decimal(item.delta) if item.delta is not None else "",
+                    "gamma": format_decimal(item.gamma) if item.gamma is not None else "",
+                    "theta": format_decimal(item.theta) if item.theta is not None else "",
+                    "vega": format_decimal(item.vega) if item.vega is not None else "",
                     "enabled": item.enabled,
                 }
                 for item in self._legs
@@ -2114,6 +2231,10 @@ class OptionStrategyCalculatorWindow:
             quantity = self._parse_positive_decimal(str(raw.get("quantity", "1")), "策略腿数量")
             premium_text = str(raw.get("premium", "")).strip()
             premium = Decimal(premium_text) if premium_text else None
+            delta_text = str(raw.get("delta", "")).strip()
+            gamma_text = str(raw.get("gamma", "")).strip()
+            theta_text = str(raw.get("theta", "")).strip()
+            vega_text = str(raw.get("vega", "")).strip()
             if not alias or not inst_id or side not in {"buy", "sell"}:
                 continue
             restored.append(
@@ -2123,6 +2244,10 @@ class OptionStrategyCalculatorWindow:
                     side="buy" if side == "buy" else "sell",
                     quantity=quantity,
                     premium=premium,
+                    delta=Decimal(delta_text) if delta_text else None,
+                    gamma=Decimal(gamma_text) if gamma_text else None,
+                    theta=Decimal(theta_text) if theta_text else None,
+                    vega=Decimal(vega_text) if vega_text else None,
                     enabled=enabled,
                 )
             )
@@ -2141,6 +2266,7 @@ class OptionStrategyCalculatorWindow:
             except Exception:
                 pass
         self._sync_expiry_options(preferred=self.expiry_code.get().strip())
+        self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
         if self.option_family.get().strip() and self._selected_expiry_code():

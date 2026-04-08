@@ -4,6 +4,7 @@ from unittest import TestCase
 
 from okx_quant.models import Candle, Instrument
 from okx_quant.option_strategy_ui import (
+    OptionStrategyCalculatorWindow,
     _align_overlay_candles,
     _annualization_factor_for_bar,
     _build_volatility_candles_from_reference,
@@ -56,6 +57,74 @@ def _make_instrument(inst_id: str) -> Instrument:
 
 
 class OptionStrategyTest(TestCase):
+    def test_refresh_leg_quotes_keeps_holding_price_and_updates_mark(self) -> None:
+        window = OptionStrategyCalculatorWindow.__new__(OptionStrategyCalculatorWindow)
+        leg = StrategyLegDefinition(
+            alias="L1",
+            inst_id="BTC-USD-260626-90000-C",
+            side="buy",
+            quantity=Decimal("2"),
+            premium=Decimal("0.0123"),
+        )
+        instrument = _make_instrument("BTC-USD-260626-90000-C")
+        quote = OptionQuote(
+            instrument=instrument,
+            mark_price=Decimal("0.0345"),
+            bid_price=Decimal("0.0340"),
+            ask_price=Decimal("0.0350"),
+            index_price=Decimal("65000"),
+        )
+
+        class _Status:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        window._instrument_map = {}
+        window._quotes_by_inst_id = {}
+        window._legs = [leg]
+        window._current_underlying_price = None
+        window._render_legs = lambda: None
+        window._refresh_strategy_summary = lambda: None
+        window.status_text = _Status()
+
+        window._apply_refreshed_leg_quotes([(leg.inst_id, instrument, quote)])
+
+        self.assertEqual(window._legs[0].premium, Decimal("0.0123"))
+        self.assertEqual(window._leg_mark_price(leg.inst_id), Decimal("0.0345"))
+        self.assertEqual(window._current_underlying_price, Decimal("65000"))
+        self.assertEqual(window.status_text.value, "策略腿报价已刷新。")
+
+    def test_refresh_leg_greeks_populates_values_when_quote_and_underlying_exist(self) -> None:
+        window = OptionStrategyCalculatorWindow.__new__(OptionStrategyCalculatorWindow)
+        leg = StrategyLegDefinition(
+            alias="L1",
+            inst_id="BTC-USD-260626-90000-C",
+            side="buy",
+            quantity=Decimal("2"),
+            premium=Decimal("0.0123"),
+        )
+        instrument = _make_instrument("BTC-USD-260626-90000-C")
+        quote = OptionQuote(
+            instrument=instrument,
+            mark_price=Decimal("0.0345"),
+            bid_price=Decimal("0.0340"),
+            ask_price=Decimal("0.0350"),
+        )
+        window._legs = [leg]
+        window._instrument_map = {leg.inst_id: instrument}
+        window._quotes_by_inst_id = {leg.inst_id: quote}
+        window._current_underlying_price = Decimal("65000")
+
+        window._refresh_leg_greeks()
+
+        self.assertIsNotNone(window._legs[0].delta)
+        self.assertIsNotNone(window._legs[0].gamma)
+        self.assertIsNotNone(window._legs[0].theta)
+        self.assertIsNotNone(window._legs[0].vega)
+
     def test_build_volatility_candles_from_reference_generates_kline_series(self) -> None:
         candles: list[Candle] = []
         base_price = Decimal("60000")

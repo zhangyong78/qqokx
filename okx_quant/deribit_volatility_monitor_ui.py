@@ -267,10 +267,7 @@ class DeribitVolatilityMonitorWindow:
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
-        self.window.rowconfigure(2, weight=0)
-        self.window.rowconfigure(3, weight=1)
-        self.window.rowconfigure(4, weight=1)
-        self.window.rowconfigure(5, weight=1)
+        self.window.rowconfigure(1, weight=1)
 
         header = ttk.Frame(self.window, padding=(16, 16, 16, 8))
         header.grid(row=0, column=0, sticky="ew")
@@ -280,8 +277,32 @@ class DeribitVolatilityMonitorWindow:
         )
         ttk.Label(header, textvariable=self.status_text).grid(row=0, column=1, sticky="e")
 
-        controls = ttk.Frame(self.window, padding=(16, 0, 16, 8))
-        controls.grid(row=1, column=0, sticky="nsew")
+        page_frame = ttk.Frame(self.window)
+        page_frame.grid(row=1, column=0, sticky="nsew")
+        page_frame.columnconfigure(0, weight=1)
+        page_frame.rowconfigure(0, weight=1)
+
+        page_canvas = Canvas(page_frame, highlightthickness=0, background=self.window.cget("background"))
+        page_canvas.grid(row=0, column=0, sticky="nsew")
+        page_scroll = ttk.Scrollbar(page_frame, orient="vertical", command=page_canvas.yview)
+        page_scroll.grid(row=0, column=1, sticky="ns")
+        page_canvas.configure(yscrollcommand=page_scroll.set)
+
+        page_body = ttk.Frame(page_canvas, padding=(16, 0, 16, 16))
+        page_body.columnconfigure(0, weight=1)
+        page_window = page_canvas.create_window((0, 0), window=page_body, anchor="nw")
+
+        def _sync_page_scrollregion(_event=None) -> None:
+            page_canvas.configure(scrollregion=page_canvas.bbox("all"))
+
+        def _sync_page_body_width(event) -> None:
+            page_canvas.itemconfigure(page_window, width=event.width)
+
+        page_body.bind("<Configure>", _sync_page_scrollregion)
+        page_canvas.bind("<Configure>", _sync_page_body_width)
+
+        controls = ttk.Frame(page_body, padding=(0, 0, 0, 8))
+        controls.grid(row=0, column=0, sticky="nsew")
         controls.columnconfigure(0, weight=1)
         controls.columnconfigure(1, weight=1)
 
@@ -388,8 +409,8 @@ class DeribitVolatilityMonitorWindow:
             justify="left",
         ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
-        task_frame = ttk.LabelFrame(self.window, text="监控任务", padding=12)
-        task_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        task_frame = ttk.LabelFrame(page_body, text="监控任务", padding=12)
+        task_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         task_frame.columnconfigure(0, weight=1)
         task_frame.rowconfigure(1, weight=1)
 
@@ -423,8 +444,8 @@ class DeribitVolatilityMonitorWindow:
         task_scroll.grid(row=1, column=1, sticky="ns")
         self.tasks_tree.configure(yscrollcommand=task_scroll.set)
 
-        signal_list_frame = ttk.LabelFrame(self.window, text="最近触发信号", padding=12)
-        signal_list_frame.grid(row=3, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        signal_list_frame = ttk.LabelFrame(page_body, text="最近触发信号", padding=12)
+        signal_list_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
         signal_list_frame.columnconfigure(0, weight=1)
         signal_list_frame.rowconfigure(0, weight=1)
 
@@ -452,8 +473,8 @@ class DeribitVolatilityMonitorWindow:
         signal_scroll.grid(row=0, column=1, sticky="ns")
         self.signal_tree.configure(yscrollcommand=signal_scroll.set)
 
-        log_frame = ttk.LabelFrame(self.window, text="监控日志", padding=12)
-        log_frame.grid(row=4, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        log_frame = ttk.LabelFrame(page_body, text="监控日志", padding=12)
+        log_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.log_text = Text(log_frame, height=10, wrap="word", font=("Consolas", 10))
@@ -462,8 +483,8 @@ class DeribitVolatilityMonitorWindow:
         log_scroll.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
-        diagnostic_frame = ttk.LabelFrame(self.window, text="实时诊断", padding=12)
-        diagnostic_frame.grid(row=5, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        diagnostic_frame = ttk.LabelFrame(page_body, text="实时诊断", padding=12)
+        diagnostic_frame.grid(row=4, column=0, sticky="nsew")
         diagnostic_frame.columnconfigure(0, weight=1)
         diagnostic_frame.rowconfigure(1, weight=1)
         ttk.Label(

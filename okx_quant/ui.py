@@ -257,8 +257,8 @@ class QuantApp:
         self._positions_zoom_column_vars: dict[str, dict[str, BooleanVar]] = {}
         self._main_positions_pane: ttk.Panedwindow | None = None
         self._main_position_detail_frame: ttk.LabelFrame | None = None
-        self._main_position_detail_collapsed = False
-        self._main_position_detail_toggle_text = StringVar(value="灞曞紑鎸佷粨璇︽儏")
+        self._main_position_detail_collapsed = True
+        self._main_position_detail_toggle_text = StringVar(value="展开持仓详情")
         self._positions_zoom_detail_collapsed = False
         self._positions_zoom_history_collapsed = False
         self._positions_zoom_fills_detail_collapsed = False
@@ -772,12 +772,6 @@ class QuantApp:
         )
         ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=9)
 
-        ttk.Button(
-            action_row,
-            textvariable=self._main_position_detail_toggle_text,
-            command=self.toggle_main_position_detail,
-        ).grid(row=0, column=10)
-
         filter_row = ttk.Frame(positions_frame)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         filter_row.columnconfigure(3, weight=1)
@@ -814,13 +808,10 @@ class QuantApp:
         self._build_metric_card(overview_row, 7, "买沽数量", self.position_long_put_text)
         self._build_metric_card(overview_row, 8, "卖沽数量", self.position_short_put_text)
 
-        position_pane = ttk.Panedwindow(positions_frame, orient="vertical")
-        position_pane.grid(row=3, column=0, sticky="nsew")
-
-        position_table = ttk.Frame(position_pane)
+        position_table = ttk.Frame(positions_frame)
+        position_table.grid(row=3, column=0, sticky="nsew")
         position_table.columnconfigure(0, weight=1)
         position_table.rowconfigure(0, weight=1)
-        position_pane.add(position_table, weight=4)
 
         self.position_tree = ttk.Treeview(
             position_table,
@@ -908,30 +899,8 @@ class QuantApp:
         position_scroll_x.grid(row=1, column=0, sticky="ew")
         self.position_tree.configure(yscrollcommand=position_scroll_y.set, xscrollcommand=position_scroll_x.set)
 
-        position_detail_frame = ttk.LabelFrame(position_pane, text="选中持仓详情", padding=12)
-        position_detail_frame.columnconfigure(0, weight=1)
-        position_detail_frame.rowconfigure(0, weight=1)
-        position_pane.add(position_detail_frame, weight=2)
-        self._main_positions_pane = position_pane
-        self._main_position_detail_frame = position_detail_frame
-
-        self._position_detail_panel = Text(
-            position_detail_frame,
-            height=8,
-            wrap="word",
-            font=("Microsoft YaHei UI", 10),
-            relief="flat",
-        )
-        self._position_detail_panel.grid(row=0, column=0, sticky="nsew")
-        position_detail_scroll = ttk.Scrollbar(
-            position_detail_frame,
-            orient="vertical",
-            command=self._position_detail_panel.yview,
-        )
-        position_detail_scroll.grid(row=0, column=1, sticky="ns")
-        self._position_detail_panel.configure(yscrollcommand=position_detail_scroll.set)
-        self._set_readonly_text(self._position_detail_panel, self.position_detail_text.get())
-        self.toggle_main_position_detail()
+        self._main_positions_pane = None
+        self._main_position_detail_frame = None
 
         log_frame = ttk.LabelFrame(self.root, text="运行日志", padding=12)
         log_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
@@ -953,13 +922,12 @@ class QuantApp:
             if self._sessions_pane is not None and self._sessions_pane.winfo_exists():
                 total_height = self._sessions_pane.winfo_height()
                 if total_height > 600:
-                    self._sessions_pane.sashpos(0, int(total_height * Decimal("0.28")))
+                    self._sessions_pane.sashpos(0, int(total_height * Decimal("0.15")))
         except Exception:
             return
 
     def _apply_initial_detail_visibility(self) -> None:
-        if not self._main_position_detail_collapsed:
-            self.root.after_idle(self.toggle_main_position_detail)
+        return
 
     def toggle_main_position_detail(self) -> None:
         if self._main_positions_pane is None or self._main_position_detail_frame is None:

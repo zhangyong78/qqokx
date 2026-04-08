@@ -124,10 +124,41 @@ class PersistenceTest(TestCase):
         self.assertEqual(len(snapshot["strategies"]), 1)
         record = snapshot["strategies"][0]
         self.assertEqual(record["name"], "Bull Call")
-        self.assertEqual(record["candle_limit"], "2000")
+        self.assertEqual(record["candle_limit"], "1000")
         self.assertEqual(record["chart_display_ccy"], "USDT")
         self.assertEqual(record["combo_chart_mode"], "pnl")
         self.assertEqual(record["formula"], "L1 - L2")
         self.assertEqual(record["legs"][0]["inst_id"], "BTC-USD-260626-100000-C")
         self.assertEqual(record["legs"][0]["delta"], "0.42")
         self.assertEqual(record["legs"][0]["theta"], "-0.002")
+
+    def test_load_option_strategy_snapshot_uses_new_defaults_when_fields_missing(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        temp_path = option_strategies_file_path(temp_dir)
+        save_option_strategies_snapshot(
+            [
+                {
+                    "name": "Defaulted",
+                    "option_family": "BTC-USD",
+                    "expiry_code": "260626",
+                    "formula": "L1",
+                    "legs": [
+                        {
+                            "alias": "L1",
+                            "inst_id": "BTC-USD-260626-100000-C",
+                            "side": "buy",
+                            "quantity": "1",
+                            "premium": "0.01",
+                            "enabled": True,
+                        }
+                    ],
+                }
+            ],
+            temp_path,
+        )
+
+        snapshot = load_option_strategies_snapshot(temp_path)
+        record = snapshot["strategies"][0]
+        self.assertEqual(record["bar"], "1H")
+        self.assertEqual(record["candle_limit"], "1000")
+        self.assertEqual(record["chart_display_ccy"], "结算币")

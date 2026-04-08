@@ -439,17 +439,17 @@ def _normalize_option_strategy_record(item: object) -> dict[str, object] | None:
         raw_legs = []
     legs = [normalized for raw in raw_legs if (normalized := _normalize_option_strategy_leg(raw)) is not None]
     combo_chart_mode = str(item.get("combo_chart_mode", "price")).strip().lower() or "price"
-    candle_limit = str(item.get("candle_limit", "2000")).strip() or "2000"
+    candle_limit = str(item.get("candle_limit", "1000")).strip() or "1000"
     # 历史版本默认是 600，这里视为旧默认值，自动迁移到 2000。
     if candle_limit == "600":
-        candle_limit = "2000"
+        candle_limit = "1000"
     return {
         "name": name,
         "option_family": str(item.get("option_family", "")).strip().upper(),
         "expiry_code": str(item.get("expiry_code", "")).strip(),
-        "bar": str(item.get("bar", "15m")).strip() or "15m",
+        "bar": str(item.get("bar", "1H")).strip() or "1H",
         "candle_limit": candle_limit,
-        "chart_display_ccy": str(item.get("chart_display_ccy", "USDT")).strip() or "USDT",
+        "chart_display_ccy": str(item.get("chart_display_ccy", "结算币")).strip() or "结算币",
         "combo_chart_mode": "pnl" if combo_chart_mode == "pnl" else "price",
         "formula": str(item.get("formula", "")).strip(),
         "legs": legs,

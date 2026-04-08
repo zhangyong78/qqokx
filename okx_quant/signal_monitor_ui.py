@@ -228,7 +228,7 @@ class SignalMonitorWindow:
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
-        self.window.rowconfigure(2, weight=1)
+        self.window.rowconfigure(1, weight=1)
 
         header = ttk.Frame(self.window, padding=(16, 16, 16, 8))
         header.grid(row=0, column=0, sticky="ew")
@@ -238,8 +238,32 @@ class SignalMonitorWindow:
         )
         ttk.Label(header, textvariable=self.status_text).grid(row=0, column=1, sticky="e")
 
-        controls = ttk.Frame(self.window, padding=(16, 0, 16, 8))
-        controls.grid(row=1, column=0, sticky="nsew")
+        page_frame = ttk.Frame(self.window)
+        page_frame.grid(row=1, column=0, sticky="nsew")
+        page_frame.columnconfigure(0, weight=1)
+        page_frame.rowconfigure(0, weight=1)
+
+        page_canvas = Canvas(page_frame, highlightthickness=0, background=self.window.cget("background"))
+        page_canvas.grid(row=0, column=0, sticky="nsew")
+        page_scroll = ttk.Scrollbar(page_frame, orient="vertical", command=page_canvas.yview)
+        page_scroll.grid(row=0, column=1, sticky="ns")
+        page_canvas.configure(yscrollcommand=page_scroll.set)
+
+        page_body = ttk.Frame(page_canvas, padding=(16, 0, 16, 16))
+        page_body.columnconfigure(0, weight=1)
+        page_window = page_canvas.create_window((0, 0), window=page_body, anchor="nw")
+
+        def _sync_page_scrollregion(_event=None) -> None:
+            page_canvas.configure(scrollregion=page_canvas.bbox("all"))
+
+        def _sync_page_body_width(event) -> None:
+            page_canvas.itemconfigure(page_window, width=event.width)
+
+        page_body.bind("<Configure>", _sync_page_scrollregion)
+        page_canvas.bind("<Configure>", _sync_page_body_width)
+
+        controls = ttk.Frame(page_body, padding=(0, 0, 0, 8))
+        controls.grid(row=0, column=0, sticky="nsew")
         controls.columnconfigure(0, weight=1)
         controls.columnconfigure(1, weight=1)
 
@@ -336,8 +360,8 @@ class SignalMonitorWindow:
             justify="left",
         ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
-        content_pane = ttk.Panedwindow(self.window, orient="vertical")
-        content_pane.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        content_pane = ttk.Panedwindow(page_body, orient="vertical", height=980)
+        content_pane.grid(row=1, column=0, sticky="ew")
 
         task_frame = ttk.LabelFrame(content_pane, text="监控任务", padding=12)
         task_frame.columnconfigure(0, weight=1)
