@@ -21,6 +21,8 @@ from okx_quant.ui import (
     _format_position_avg_price_usdt,
     _format_position_mark_price_usdt,
     _format_position_market_value,
+    _format_position_option_component_usdt,
+    _format_position_option_price_component,
     _format_position_size,
     _format_position_unrealized_pnl,
     _group_positions_for_tree,
@@ -28,7 +30,11 @@ from okx_quant.ui import (
     _margin_mode_tag,
     _option_search_shortcuts,
     _position_theta_usdt,
+    _position_option_intrinsic_value,
+    _position_option_intrinsic_value_usdt,
     _position_mark_price_usdt,
+    _position_option_time_value,
+    _position_option_time_value_usdt,
     _position_unrealized_pnl_usdt,
 )
 
@@ -294,6 +300,32 @@ class PositionUplConversionTest(TestCase):
         position = OkxPosition(**{**position.__dict__, "mark_price": Decimal("0.0524")})
         self.assertEqual(_format_position_mark_price_usdt(position, {"BTC": Decimal("80000")}), "4192")
 
+    def test_option_intrinsic_and_time_value_for_call(self) -> None:
+        position = _make_position(inst_id="BTC-USD-260626-65000-C", upl="0", margin_ccy="BTC")
+        position = OkxPosition(**{**position.__dict__, "mark_price": Decimal("0.2000")})
+        prices = {"BTC": Decimal("80000")}
+        self.assertEqual(_position_option_intrinsic_value(position, prices), Decimal("0.1875"))
+        self.assertEqual(_position_option_intrinsic_value_usdt(position, prices), Decimal("15000.0"))
+        self.assertEqual(_position_option_time_value(position, prices), Decimal("0.0125"))
+        self.assertEqual(_position_option_time_value_usdt(position, prices), Decimal("1000.0"))
+        self.assertEqual(
+            _format_position_option_price_component(position, prices, component="intrinsic_value"),
+            "B 0.1875",
+        )
+        self.assertEqual(
+            _format_position_option_component_usdt(position, prices, component="time_value"),
+            "1000.00",
+        )
+
+    def test_option_intrinsic_and_time_value_for_put(self) -> None:
+        position = _make_position(inst_id="BTC-USD-260626-85000-P", upl="0", margin_ccy="BTC")
+        position = OkxPosition(**{**position.__dict__, "mark_price": Decimal("0.0700")})
+        prices = {"BTC": Decimal("80000")}
+        self.assertEqual(_position_option_intrinsic_value(position, prices), Decimal("0.0625"))
+        self.assertEqual(_position_option_intrinsic_value_usdt(position, prices), Decimal("5000.0"))
+        self.assertEqual(_position_option_time_value(position, prices), Decimal("0.0075"))
+        self.assertEqual(_position_option_time_value_usdt(position, prices), Decimal("600.0"))
+
     def test_format_position_avg_price_uses_b_prefix_for_btc_option(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
         position = OkxPosition(**{**position.__dict__, "avg_price": Decimal("0.015")})
@@ -554,10 +586,10 @@ class PositionUplConversionTest(TestCase):
                 "theta_usdt": Decimal("-27.2"),
             },
         )
-        self.assertEqual(values[8], "-0.06947")
-        self.assertEqual(values[10], "+0.73992")
-        self.assertEqual(values[16], "1.23456")
-        self.assertEqual(values[20], "-27.20")
+        self.assertEqual(values[12], "-0.06947")
+        self.assertEqual(values[14], "+0.73992")
+        self.assertEqual(values[20], "1.23456")
+        self.assertEqual(values[24], "-27.20")
 
     def test_group_row_values_use_two_decimals_for_usdt_pnl(self) -> None:
         values = _build_group_row_values(
@@ -579,11 +611,11 @@ class PositionUplConversionTest(TestCase):
                 "theta_usdt": Decimal("123.456"),
             },
         )
-        self.assertEqual(values[6], "1 个持仓 | 250000 DOGE")
-        self.assertEqual(values[8], "-2733.75")
-        self.assertEqual(values[10], "-31.36")
-        self.assertEqual(values[16], "250000.00000")
-        self.assertEqual(values[20], "+123.46")
+        self.assertEqual(values[10], "1 个持仓 | 250000 DOGE")
+        self.assertEqual(values[12], "-2733.75")
+        self.assertEqual(values[14], "-31.36")
+        self.assertEqual(values[20], "250000.00000")
+        self.assertEqual(values[24], "+123.46")
 
     def test_format_group_position_size_accumulates_coin_quantity(self) -> None:
         positions = [

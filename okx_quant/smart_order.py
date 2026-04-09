@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Literal
 
+from okx_quant.log_utils import ensure_log_timestamp
 from okx_quant.models import Credentials, Instrument, PositionMode, StrategyConfig, TradeMode, TriggerPriceType
 from okx_quant.okx_client import OkxOrderBook, OkxOrderStatus, OkxRestClient, OkxTicker, infer_inst_type
 from okx_quant.persistence import load_smart_order_tasks_snapshot, save_smart_order_tasks_snapshot
@@ -1713,7 +1714,7 @@ class SmartOrderManager:
         return f"订单监控 | 状态={status.state} | 价格={_fmt_optional(status.price)} | 成交均价={_fmt_optional(status.avg_price)} | 已成交={_fmt_optional(status.filled_size)}"
 
     def _log(self, task: _SmartOrderTask, message: str) -> None:
-        line = f"[无限下单 {task.task_id}] {message}"
+        line = ensure_log_timestamp(f"[无限下单 {task.task_id}] {message}")
         with self._lock:
             self._logs.append(line)
         if self._logger is not None:

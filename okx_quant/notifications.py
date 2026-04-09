@@ -5,6 +5,7 @@ import threading
 from email.message import EmailMessage
 from typing import Callable
 
+from okx_quant.log_utils import ensure_log_timestamp
 from okx_quant.models import EmailNotificationConfig, StrategyConfig
 
 
@@ -154,4 +155,4 @@ class EmailNotifier:
 
     def _log(self, message: str) -> None:
         if self._logger is not None:
-            self._logger(message)
+            self._logger(ensure_log_timestamp(message))

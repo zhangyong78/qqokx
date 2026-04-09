@@ -16,6 +16,7 @@ from okx_quant.deribit_client import DeribitRestClient
 from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.engine import StrategyEngine, fetch_hourly_ema_debug, format_hourly_debug
+from okx_quant.log_utils import ensure_log_timestamp
 from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.option_strategy_ui import OptionStrategyCalculatorWindow
@@ -74,6 +75,10 @@ BAR_OPTIONS = ["1m", "3m", "5m", "15m", "1H", "4H"]
 POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
     "positions": (
         "inst_type",
+        "time_value",
+        "time_value_usdt",
+        "intrinsic_value",
+        "intrinsic_usdt",
         "mark",
         "mark_usdt",
         "avg",
@@ -818,6 +823,10 @@ class QuantApp:
             columns=(
                 "inst_type",
                 "mgn_mode",
+                "time_value",
+                "time_value_usdt",
+                "intrinsic_value",
+                "intrinsic_usdt",
                 "mark",
                 "mark_usdt",
                 "avg",
@@ -844,6 +853,10 @@ class QuantApp:
         self.position_tree.heading("#0", text="合约 / 分组")
         self.position_tree.heading("inst_type", text="类型")
         self.position_tree.heading("mgn_mode", text="保证金模式")
+        self.position_tree.heading("time_value", text="时间价值")
+        self.position_tree.heading("time_value_usdt", text="时间≈USDT")
+        self.position_tree.heading("intrinsic_value", text="内在价值")
+        self.position_tree.heading("intrinsic_usdt", text="内在≈USDT")
         self.position_tree.heading("mark", text="标记价")
         self.position_tree.heading("mark_usdt", text="标记≈USDT")
         self.position_tree.heading("avg", text="开仓价")
@@ -866,6 +879,10 @@ class QuantApp:
         self.position_tree.column("#0", width=240, anchor="w", stretch=True)
         self.position_tree.column("inst_type", width=72, anchor="center")
         self.position_tree.column("mgn_mode", width=92, anchor="center")
+        self.position_tree.column("time_value", width=88, anchor="e")
+        self.position_tree.column("time_value_usdt", width=44, anchor="e")
+        self.position_tree.column("intrinsic_value", width=88, anchor="e")
+        self.position_tree.column("intrinsic_usdt", width=44, anchor="e")
         self.position_tree.column("mark", width=108, anchor="e")
         self.position_tree.column("mark_usdt", width=54, anchor="e")
         self.position_tree.column("avg", width=108, anchor="e")
@@ -885,6 +902,31 @@ class QuantApp:
         self.position_tree.column("vega", width=82, anchor="e")
         self.position_tree.column("theta", width=108, anchor="e")
         self.position_tree.column("theta_usdt", width=54, anchor="e")
+        self.position_tree.configure(
+            displaycolumns=(
+                "inst_type",
+                "mgn_mode",
+                "mark",
+                "mark_usdt",
+                "avg",
+                "avg_usdt",
+                "pos",
+                "option_side",
+                "upl",
+                "upl_usdt",
+                "realized",
+                "market_value",
+                "liq",
+                "mgn_ratio",
+                "imr",
+                "mmr",
+                "delta",
+                "gamma",
+                "vega",
+                "theta",
+                "theta_usdt",
+            )
+        )
         self.position_tree.grid(row=0, column=0, sticky="nsew")
         self.position_tree.bind("<<TreeviewSelect>>", self._on_position_selected)
         self.position_tree.tag_configure("profit", foreground="#13803d")
@@ -2044,7 +2086,18 @@ class QuantApp:
             return
         zoom_tree = self._positions_zoom_tree
         columns = tuple(self.position_tree["columns"])
-        approx_heading_columns = {"mark_usdt", "avg_usdt", "upl_usdt", "theta_usdt"}
+        approx_heading_columns = {
+            "mark_usdt",
+            "avg_usdt",
+            "upl_usdt",
+            "theta_usdt",
+        }
+        compact_zoom_columns = {
+            "time_value": 88,
+            "time_value_usdt": 72,
+            "intrinsic_value": 88,
+            "intrinsic_usdt": 72,
+        }
         heading_font_name = ttk.Style().lookup("Treeview.Heading", "font") or "TkDefaultFont"
         try:
             heading_font = tkfont.nametofont(heading_font_name)
@@ -2055,7 +2108,10 @@ class QuantApp:
             column = self.position_tree.column(column_id)
             width = column.get("width")
             stretch = column.get("stretch")
-            if column_id in approx_heading_columns:
+            if column_id in compact_zoom_columns:
+                width = compact_zoom_columns[column_id]
+                stretch = False
+            elif column_id in approx_heading_columns:
                 heading_text = str(heading.get("text", ""))
                 width = max(heading_font.measure(heading_text) + 20, 84)
                 stretch = False
@@ -4037,6 +4093,10 @@ class QuantApp:
             values=(
                 position.inst_type,
                 _format_margin_mode(position.mgn_mode),
+                _format_position_option_price_component(position, self._upl_usdt_prices, component="time_value"),
+                _format_position_option_component_usdt(position, self._upl_usdt_prices, component="time_value"),
+                _format_position_option_price_component(position, self._upl_usdt_prices, component="intrinsic_value"),
+                _format_position_option_component_usdt(position, self._upl_usdt_prices, component="intrinsic_value"),
                 _format_mark_price(position),
                 _format_position_mark_price_usdt(position, self._upl_usdt_prices),
                 _format_position_avg_price(position, self._position_instruments),
@@ -4582,7 +4642,7 @@ class QuantApp:
         )
 
     def _enqueue_log(self, message: str) -> None:
-        self.log_queue.put(message)
+        self.log_queue.put(ensure_log_timestamp(message))
 
     def _drain_log_queue(self) -> None:
         while not self.log_queue.empty():
@@ -4920,6 +4980,10 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
         "--",
         "--",
         "--",
+        "--",
+        "--",
+        "--",
+        "--",
         (
             f"{count} 个持仓 | {size_display}"
             if isinstance(count, int) and isinstance(size_display, str) and size_display
@@ -5135,6 +5199,102 @@ def _position_theta_usdt(position: OkxPosition, upl_usdt_prices: dict[str, Decim
     if price is None:
         return None
     return position.theta * price
+
+
+def _position_option_intrinsic_value(position: OkxPosition, upl_usdt_prices: dict[str, Decimal]) -> Decimal | None:
+    if position.inst_type != "OPTION":
+        return None
+    asset_currency = _extract_asset_key(position.inst_id).upper()
+    underlying_price = upl_usdt_prices.get(asset_currency)
+    if underlying_price is None or underlying_price <= 0:
+        return None
+    strike, option_kind = _extract_option_sort_components(position.inst_id)
+    strike_price = Decimal(str(strike))
+    if option_kind == "C":
+        intrinsic_usdt = max(underlying_price - strike_price, Decimal("0"))
+    elif option_kind == "P":
+        intrinsic_usdt = max(strike_price - underlying_price, Decimal("0"))
+    else:
+        return None
+
+    payout_currency = _infer_upl_currency(position)
+    if payout_currency in {"USDT", "USD", "USDC"}:
+        return intrinsic_usdt
+    return intrinsic_usdt / underlying_price
+
+
+def _position_option_intrinsic_value_usdt(position: OkxPosition, upl_usdt_prices: dict[str, Decimal]) -> Decimal | None:
+    intrinsic_value = _position_option_intrinsic_value(position, upl_usdt_prices)
+    if intrinsic_value is None:
+        return None
+    payout_currency = _infer_upl_currency(position)
+    if payout_currency in {"USDT", "USD", "USDC"}:
+        return intrinsic_value
+    asset_currency = _extract_asset_key(position.inst_id).upper()
+    underlying_price = upl_usdt_prices.get(asset_currency)
+    if underlying_price is None:
+        return None
+    return intrinsic_value * underlying_price
+
+
+def _position_option_time_value(position: OkxPosition, upl_usdt_prices: dict[str, Decimal]) -> Decimal | None:
+    if position.inst_type != "OPTION":
+        return None
+    mark_price = position.mark_price or position.last_price
+    intrinsic_value = _position_option_intrinsic_value(position, upl_usdt_prices)
+    if mark_price is None or intrinsic_value is None:
+        return None
+    return mark_price - intrinsic_value
+
+
+def _position_option_time_value_usdt(position: OkxPosition, upl_usdt_prices: dict[str, Decimal]) -> Decimal | None:
+    time_value = _position_option_time_value(position, upl_usdt_prices)
+    if time_value is None:
+        return None
+    payout_currency = _infer_upl_currency(position)
+    if payout_currency in {"USDT", "USD", "USDC"}:
+        return time_value
+    asset_currency = _extract_asset_key(position.inst_id).upper()
+    underlying_price = upl_usdt_prices.get(asset_currency)
+    if underlying_price is None:
+        return None
+    return time_value * underlying_price
+
+
+def _format_option_price_component(value: Decimal | None, position: OkxPosition) -> str:
+    if value is None:
+        return "-"
+    prefix = _mark_price_prefix(position)
+    text = format_decimal_fixed(value, 4)
+    return f"{prefix} {text}" if prefix else text
+
+
+def _format_position_option_price_component(
+    position: OkxPosition,
+    upl_usdt_prices: dict[str, Decimal],
+    *,
+    component: str,
+) -> str:
+    if component == "time_value":
+        return _format_option_price_component(_position_option_time_value(position, upl_usdt_prices), position)
+    if component == "intrinsic_value":
+        return _format_option_price_component(_position_option_intrinsic_value(position, upl_usdt_prices), position)
+    return "-"
+
+
+def _format_position_option_component_usdt(
+    position: OkxPosition,
+    upl_usdt_prices: dict[str, Decimal],
+    *,
+    component: str,
+) -> str:
+    if component == "time_value":
+        value = _position_option_time_value_usdt(position, upl_usdt_prices)
+    elif component == "intrinsic_value":
+        value = _position_option_intrinsic_value_usdt(position, upl_usdt_prices)
+    else:
+        value = None
+    return _format_optional_usdt_precise(value, places=2, with_sign=False)
 
 
 def _position_mark_price_usdt(position: OkxPosition, upl_usdt_prices: dict[str, Decimal]) -> Decimal | None:
@@ -5457,6 +5617,12 @@ def _build_position_detail_text(
         f"{_format_position_avg_price_usdt(position, upl_usdt_prices)}\n"
         f"标记价 / 标记≈USDT：{_format_mark_price(position)} / "
         f"{_format_position_mark_price_usdt(position, upl_usdt_prices)}\n"
+        f"时间价值 / 时间≈USDT："
+        f"{_format_position_option_price_component(position, upl_usdt_prices, component='time_value')} / "
+        f"{_format_position_option_component_usdt(position, upl_usdt_prices, component='time_value')}\n"
+        f"内在价值 / 内在≈USDT："
+        f"{_format_position_option_price_component(position, upl_usdt_prices, component='intrinsic_value')} / "
+        f"{_format_position_option_component_usdt(position, upl_usdt_prices, component='intrinsic_value')}\n"
         f"市值：{_format_position_market_value(position, position_instruments, upl_usdt_prices)}\n"
         f"最新价：{_format_optional_decimal(position.last_price)}\n"
         f"浮盈亏 / 浮盈≈USDT：{_format_position_unrealized_pnl(position)} / "

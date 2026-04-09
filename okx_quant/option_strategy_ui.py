@@ -9,6 +9,7 @@ from tkinter import BOTH, END, BooleanVar, Canvas, DoubleVar, StringVar, Topleve
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
+from okx_quant.log_utils import ensure_log_timestamp
 from okx_quant.models import Candle, Instrument
 from okx_quant.okx_client import OkxPosition, OkxRestClient, OkxTicker
 from okx_quant.option_strategy import (
@@ -3278,7 +3279,7 @@ class OptionStrategyCalculatorWindow:
 
     def _log(self, message: str) -> None:
         if self.logger is not None:
-            self.logger(message)
+            self.logger(ensure_log_timestamp(message))
 
 
 def _build_option_quote(instrument: Instrument, ticker: OkxTicker | None) -> OptionQuote:
