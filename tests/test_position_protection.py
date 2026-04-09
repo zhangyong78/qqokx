@@ -3,6 +3,7 @@ from threading import Event
 from time import sleep
 from unittest import TestCase
 
+import okx_quant.position_protection as protection_module
 from okx_quant.models import Credentials, Instrument, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxPosition
 from okx_quant.position_protection import (
@@ -1329,6 +1330,47 @@ class PositionProtectionTest(TestCase):
 
         manager.stop(session_id)
         worker.thread.join(timeout=1)
+
+    def test_manager_deduplicates_close_retry_emails_for_same_status(self) -> None:
+        option_inst_id = "BTC-USD-20260327-70000-C"
+        client = _SimulatedProtectionClient(
+            initial_position=_make_option_position(inst_id=option_inst_id, position="2", pos_side="long"),
+            trigger_prices={(option_inst_id, "mark"): [Decimal("0.0155")]},
+            order_results=[],
+        )
+        notifier = _NotifierStub()
+        manager = PositionProtectionManager(client, lambda message: None, notifier=notifier)
+        worker = protection_module._ProtectionWorker(
+            session_id="P01",
+            credentials=_make_credentials(),
+            config=_make_strategy_config(),
+            protection=OptionProtectionConfig(
+                option_inst_id=option_inst_id,
+                trigger_inst_id=option_inst_id,
+                trigger_price_type="mark",
+                direction="long",
+                pos_side="long",
+                take_profit_trigger=Decimal("0.0150"),
+                stop_loss_trigger=None,
+                take_profit_order_mode="fixed_price",
+                take_profit_order_price=Decimal("0.0152"),
+                take_profit_slippage=Decimal("0"),
+                stop_loss_order_mode="fixed_price",
+                stop_loss_order_price=None,
+                stop_loss_slippage=Decimal("0"),
+                poll_seconds=0.01,
+                trigger_label=f"{option_inst_id} mark",
+            ),
+        )
+
+        manager._pp_handle_close_retry(worker, "止盈", RuntimeError("保护平仓订单未成交，状态=canceled"))
+        manager._pp_handle_close_retry(worker, "止盈", RuntimeError("保护平仓订单未成交，状态=canceled"))
+        manager._pp_handle_close_retry(worker, "止盈", RuntimeError("保护平仓订单未成交，状态=canceled"))
+        manager._pp_handle_close_retry(worker, "止盈", RuntimeError("保护平仓订单未成交，状态=canceled"))
+
+        retry_subjects = [subject for subject, _ in notifier.messages if "平仓重试" in subject]
+        self.assertEqual(len(retry_subjects), 2)
+        self.assertEqual(worker.status, "持续未成交待人工")
 
     def test_manager_errors_when_remaining_position_is_below_min_size(self) -> None:
         option_inst_id = "BTC-USD-20260327-70000-C"

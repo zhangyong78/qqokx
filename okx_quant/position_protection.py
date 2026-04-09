@@ -172,6 +172,8 @@ class _ProtectionWorker:
     last_transient_error_at: datetime | None = None
     last_transient_notify_at: datetime | None = None
     last_transient_status_at: datetime | None = None
+    close_retry_count: int = 0
+    last_close_retry_notify_key: str | None = None
     trigger_notification_sent: bool = False
     close_order_sequence: int = 0
     active_close_cl_ord_id: str | None = None
@@ -652,6 +654,7 @@ class PositionProtectionManager:
         worker.last_transient_error_at = None
         worker.last_transient_notify_at = None
         worker.last_transient_status_at = None
+        worker.last_close_retry_notify_key = None
 
     def _is_transient_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -1344,7 +1347,6 @@ def _pp_handle_close_retry(
     reason: str,
     exc: Exception,
 ) -> None:
-    now = datetime.now()
     worker.close_retry_count += 1
     if worker.close_retry_count >= 3:
         status = "持续未成交待人工"
@@ -1359,10 +1361,8 @@ def _pp_handle_close_retry(
             f"{worker.protection.option_inst_id} | {exc}"
         )
     self._set_status(worker, status, message)
-    if (
-        worker.last_transient_notify_at is None
-        or (now - worker.last_transient_notify_at).total_seconds() >= self._transient_alert_interval_seconds
-    ):
+    notify_key = f"{worker.protection.option_inst_id}|{reason}|{status}"
+    if worker.last_close_retry_notify_key != notify_key:
         self._notify(
             subject=f"[QQOKX] 持仓保护平仓重试 | {worker.protection.option_inst_id}",
             body="\n".join(
@@ -1375,7 +1375,7 @@ def _pp_handle_close_retry(
                 ]
             ),
         )
-        worker.last_transient_notify_at = now
+        worker.last_close_retry_notify_key = notify_key
 
 
 def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -> None:
@@ -1394,6 +1394,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
                 self._close_position(worker, worker.pending_close_reason)
                 self._reset_transient_state(worker)
                 worker.close_retry_count = 0
+                worker.last_close_retry_notify_key = None
                 self._set_status(worker, "已完成", f"{worker.pending_close_reason}已完成平仓流程。")
                 return
 
@@ -1420,6 +1421,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
                 reason = "止损" if stop_hit else "止盈"
                 worker.pending_close_reason = reason
                 worker.close_retry_count = 0
+                worker.last_close_retry_notify_key = None
                 trigger_ticker = self._safe_get_ticker(protection.option_inst_id)
                 trigger_market_summary = self._format_ticker_snapshot(trigger_ticker)
                 self._logger(
