@@ -16,7 +16,7 @@ from okx_quant.deribit_client import DeribitRestClient
 from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.engine import StrategyEngine, fetch_hourly_ema_debug, format_hourly_debug
-from okx_quant.log_utils import ensure_log_timestamp
+from okx_quant.log_utils import append_log_line
 from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.option_strategy_ui import OptionStrategyCalculatorWindow
@@ -4642,7 +4642,7 @@ class QuantApp:
         )
 
     def _enqueue_log(self, message: str) -> None:
-        self.log_queue.put(ensure_log_timestamp(message))
+        self.log_queue.put(append_log_line(message))
 
     def _drain_log_queue(self) -> None:
         while not self.log_queue.empty():

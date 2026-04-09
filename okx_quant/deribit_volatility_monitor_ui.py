@@ -27,6 +27,7 @@ from okx_quant.deribit_volatility_ui import (
     _zoom_chart_viewport,
 )
 from okx_quant.indicators import ema
+from okx_quant.log_utils import append_log_line, current_log_timestamp
 from okx_quant.notifications import EmailNotifier
 from okx_quant.pricing import format_decimal_fixed
 from okx_quant.window_layout import apply_adaptive_window_geometry
@@ -1354,11 +1355,14 @@ class DeribitVolatilityMonitorWindow:
     def _log(self, session_id: str, message: str) -> None:
         if self.log_text is None:
             return
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        timestamp = current_log_timestamp()
         line = f"[{timestamp}] [{session_id}] {message}\n"
         self.log_text.insert(END, line)
         self.log_text.see(END)
-        self._logger(f"[波动率监控 {session_id}] {message}")
+        if self._logger is not None:
+            self._logger(f"[波动率监控 {session_id}] {message}")
+            return
+        append_log_line(f"[波动率监控 {session_id}] {message}")
 
     def _parse_positive_int(self, raw: str, field_name: str) -> int:
         value = int(raw)

@@ -10,7 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Literal
 
-from okx_quant.log_utils import ensure_log_timestamp
+from okx_quant.log_utils import append_log_line, ensure_log_timestamp
 from okx_quant.models import Credentials, Instrument, PositionMode, StrategyConfig, TradeMode, TriggerPriceType
 from okx_quant.okx_client import OkxOrderBook, OkxOrderStatus, OkxRestClient, OkxTicker, infer_inst_type
 from okx_quant.persistence import load_smart_order_tasks_snapshot, save_smart_order_tasks_snapshot
@@ -1719,6 +1719,8 @@ class SmartOrderManager:
             self._logs.append(line)
         if self._logger is not None:
             self._logger(line)
+            return
+        append_log_line(line)
 
     def _is_transient_error(self, exc: Exception) -> bool:
         text = str(exc).lower()

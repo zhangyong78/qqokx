@@ -10,6 +10,7 @@ from tkinter import messagebox, ttk
 from typing import Callable, Literal
 
 from okx_quant.indicators import ema
+from okx_quant.log_utils import append_log_line, current_log_timestamp
 from okx_quant.models import Candle
 from okx_quant.notifications import EmailNotifier
 from okx_quant.pricing import format_decimal_by_increment, format_decimal_fixed
@@ -1503,11 +1504,14 @@ class SignalMonitorWindow:
     def _log(self, session_id: str, message: str) -> None:
         if self.log_text is None:
             return
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        timestamp = current_log_timestamp()
         line = f"[{timestamp}] [{session_id}] {message}\n"
         self.log_text.insert(END, line)
         self.log_text.see(END)
-        self._logger(f"[信号监控 {session_id}] {message}")
+        if self._logger is not None:
+            self._logger(f"[信号监控 {session_id}] {message}")
+            return
+        append_log_line(f"[信号监控 {session_id}] {message}")
 
     def _parse_positive_int(self, raw: str, field_name: str) -> int:
         value = int(raw)
