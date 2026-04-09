@@ -6,12 +6,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-_TIMESTAMP_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\](?:\s|$)")
+_TIMESTAMP_PREFIX_RE = re.compile(r"^\[(?:\d{4}-)?\d{2}-\d{2} \d{2}:\d{2}:\d{2}\](?:\s|$)")
 _LOG_FILE_LOCK = threading.Lock()
 
 
 def current_log_timestamp() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now().strftime("%m-%d %H:%M:%S")
 
 
 def ensure_log_timestamp(message: str, *, timestamp: str | None = None) -> str:
@@ -46,7 +46,7 @@ def append_log_line(
     target_time = now or datetime.now()
     line = ensure_log_timestamp(
         message,
-        timestamp=timestamp or target_time.strftime("%Y-%m-%d %H:%M:%S"),
+        timestamp=timestamp or target_time.strftime("%m-%d %H:%M:%S"),
     )
     if not line:
         return line

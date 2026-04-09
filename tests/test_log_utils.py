@@ -13,18 +13,27 @@ class LogUtilsTest(unittest.TestCase):
         self.assertEqual(
             ensure_log_timestamp(
                 "[邮件 信号监控] 邮件已发送 | [QQOKX] 信号监控",
-                timestamp="2026-04-09 10:35:12",
+                timestamp="04-09 10:35:12",
             ),
-            "[2026-04-09 10:35:12] [邮件 信号监控] 邮件已发送 | [QQOKX] 信号监控",
+            "[04-09 10:35:12] [邮件 信号监控] 邮件已发送 | [QQOKX] 信号监控",
         )
 
     def test_keeps_existing_datetime(self) -> None:
         self.assertEqual(
             ensure_log_timestamp(
                 "[2026-04-09 12:34:56] [持仓保护] 已触发",
-                timestamp="2026-04-09 09:08:07",
+                timestamp="04-09 09:08:07",
             ),
             "[2026-04-09 12:34:56] [持仓保护] 已触发",
+        )
+
+    def test_keeps_existing_short_datetime(self) -> None:
+        self.assertEqual(
+            ensure_log_timestamp(
+                "[04-09 12:34:56] [持仓保护] 已触发",
+                timestamp="04-09 09:08:07",
+            ),
+            "[04-09 12:34:56] [持仓保护] 已触发",
         )
 
     def test_trims_blank_message(self) -> None:
@@ -45,6 +54,7 @@ class LogUtilsTest(unittest.TestCase):
             )
             path = Path(temp_dir) / "logs" / "2026-04-09.log"
             self.assertTrue(path.exists())
+            self.assertTrue(line.startswith("[04-09 10:35:12] "))
             self.assertEqual(path.read_text(encoding="utf-8").splitlines(), [line])
 
     def test_append_log_line_preserves_existing_timestamp(self) -> None:

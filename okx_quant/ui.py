@@ -29,6 +29,7 @@ from okx_quant.okx_client import (
     OkxPosition,
     OkxPositionHistoryItem,
     OkxRestClient,
+    OkxTicker,
     infer_inst_type,
     infer_option_family,
 )
@@ -79,6 +80,10 @@ POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
         "time_value_usdt",
         "intrinsic_value",
         "intrinsic_usdt",
+        "bid_price",
+        "bid_usdt",
+        "ask_price",
+        "ask_usdt",
         "mark",
         "mark_usdt",
         "avg",
@@ -229,6 +234,7 @@ class QuantApp:
         self._upl_usdt_prices: dict[str, Decimal] = {}
         self._position_history_usdt_prices: dict[str, Decimal] = {}
         self._position_instruments: dict[str, Instrument] = {}
+        self._position_tickers: dict[str, OkxTicker] = {}
         self._position_row_payloads: dict[str, dict[str, object]] = {}
         self._positions_view_rendering = False
         self._selected_session_detail: Text | None = None
@@ -827,6 +833,10 @@ class QuantApp:
                 "time_value_usdt",
                 "intrinsic_value",
                 "intrinsic_usdt",
+                "bid_price",
+                "bid_usdt",
+                "ask_price",
+                "ask_usdt",
                 "mark",
                 "mark_usdt",
                 "avg",
@@ -857,6 +867,10 @@ class QuantApp:
         self.position_tree.heading("time_value_usdt", text="时间≈USDT")
         self.position_tree.heading("intrinsic_value", text="内在价值")
         self.position_tree.heading("intrinsic_usdt", text="内在≈USDT")
+        self.position_tree.heading("bid_price", text="买一价")
+        self.position_tree.heading("bid_usdt", text="买一≈USDT")
+        self.position_tree.heading("ask_price", text="卖一价")
+        self.position_tree.heading("ask_usdt", text="卖一≈USDT")
         self.position_tree.heading("mark", text="标记价")
         self.position_tree.heading("mark_usdt", text="标记≈USDT")
         self.position_tree.heading("avg", text="开仓价")
@@ -883,6 +897,10 @@ class QuantApp:
         self.position_tree.column("time_value_usdt", width=44, anchor="e")
         self.position_tree.column("intrinsic_value", width=88, anchor="e")
         self.position_tree.column("intrinsic_usdt", width=44, anchor="e")
+        self.position_tree.column("bid_price", width=78, anchor="e")
+        self.position_tree.column("bid_usdt", width=50, anchor="e")
+        self.position_tree.column("ask_price", width=78, anchor="e")
+        self.position_tree.column("ask_usdt", width=50, anchor="e")
         self.position_tree.column("mark", width=108, anchor="e")
         self.position_tree.column("mark_usdt", width=54, anchor="e")
         self.position_tree.column("avg", width=108, anchor="e")
@@ -2087,6 +2105,8 @@ class QuantApp:
         zoom_tree = self._positions_zoom_tree
         columns = tuple(self.position_tree["columns"])
         approx_heading_columns = {
+            "bid_usdt",
+            "ask_usdt",
             "mark_usdt",
             "avg_usdt",
             "upl_usdt",
@@ -2097,6 +2117,10 @@ class QuantApp:
             "time_value_usdt": 72,
             "intrinsic_value": 88,
             "intrinsic_usdt": 72,
+            "bid_price": 72,
+            "bid_usdt": 78,
+            "ask_price": 72,
+            "ask_usdt": 78,
         }
         heading_font_name = ttk.Style().lookup("Treeview.Heading", "font") or "TkDefaultFont"
         try:
@@ -3934,6 +3958,7 @@ class QuantApp:
             positions = self.client.get_positions(credentials, environment=environment)
             upl_usdt_prices = _build_upl_usdt_price_map(self.client, positions)
             position_instruments = _build_position_instrument_map(self.client, positions)
+            position_tickers = _build_position_ticker_map(self.client, positions)
         except Exception as exc:
             message = str(exc)
             if "50101" in message and "current environment" in message:
@@ -3942,6 +3967,7 @@ class QuantApp:
                     positions = self.client.get_positions(credentials, environment=alternate)
                     upl_usdt_prices = _build_upl_usdt_price_map(self.client, positions)
                     position_instruments = _build_position_instrument_map(self.client, positions)
+                    position_tickers = _build_position_ticker_map(self.client, positions)
                 except Exception:
                     self.root.after(0, lambda: self._apply_positions_error(message))
                     return
@@ -3957,6 +3983,7 @@ class QuantApp:
                         alternate,
                         upl_usdt_prices,
                         position_instruments,
+                        position_tickers,
                     ),
                 )
                 return
@@ -3970,6 +3997,7 @@ class QuantApp:
                 environment,
                 upl_usdt_prices,
                 position_instruments,
+                position_tickers,
             ),
         )
 
@@ -3980,6 +4008,7 @@ class QuantApp:
         effective_environment: str | None = None,
         upl_usdt_prices: dict[str, Decimal] | None = None,
         position_instruments: dict[str, Instrument] | None = None,
+        position_tickers: dict[str, OkxTicker] | None = None,
     ) -> None:
         self._positions_refreshing = False
         self._latest_positions = list(positions)
@@ -3988,6 +4017,7 @@ class QuantApp:
         self._positions_effective_environment = effective_environment
         self._upl_usdt_prices = dict(upl_usdt_prices or {})
         self._position_instruments = dict(position_instruments or {})
+        self._position_tickers = dict(position_tickers or {})
         self._render_positions_view()
 
     def _render_positions_view(self) -> None:
@@ -4097,6 +4127,30 @@ class QuantApp:
                 _format_position_option_component_usdt(position, self._upl_usdt_prices, component="time_value"),
                 _format_position_option_price_component(position, self._upl_usdt_prices, component="intrinsic_value"),
                 _format_position_option_component_usdt(position, self._upl_usdt_prices, component="intrinsic_value"),
+                _format_position_quote_price(
+                    position,
+                    self._position_instruments,
+                    self._position_tickers,
+                    side="bid",
+                ),
+                _format_position_quote_price_usdt(
+                    position,
+                    self._position_tickers,
+                    self._upl_usdt_prices,
+                    side="bid",
+                ),
+                _format_position_quote_price(
+                    position,
+                    self._position_instruments,
+                    self._position_tickers,
+                    side="ask",
+                ),
+                _format_position_quote_price_usdt(
+                    position,
+                    self._position_tickers,
+                    self._upl_usdt_prices,
+                    side="ask",
+                ),
                 _format_mark_price(position),
                 _format_position_mark_price_usdt(position, self._upl_usdt_prices),
                 _format_position_avg_price(position, self._position_instruments),
@@ -4267,6 +4321,7 @@ class QuantApp:
         self._positions_last_refresh_at = None
         self._positions_effective_environment = None
         self._upl_usdt_prices = {}
+        self._position_tickers = {}
         self.position_tree.delete(*self.position_tree.get_children())
         self._position_row_payloads.clear()
         self.positions_summary_text.set(f"持仓读取失败：{message}")
@@ -4984,6 +5039,10 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
         "--",
         "--",
         "--",
+        "--",
+        "--",
+        "--",
+        "--",
         (
             f"{count} 个持仓 | {size_display}"
             if isinstance(count, int) and isinstance(size_display, str) and size_display
@@ -5325,6 +5384,80 @@ def _format_mark_price(position: OkxPosition) -> str:
     return f"{prefix} {amount_text}" if prefix else amount_text
 
 
+def _format_position_quote_price(
+    position: OkxPosition,
+    position_instruments: dict[str, Instrument],
+    position_tickers: dict[str, OkxTicker],
+    *,
+    side: str,
+) -> str:
+    ticker = position_tickers.get(position.inst_id)
+    if ticker is None:
+        return "-"
+    if side == "bid":
+        quote_price = ticker.bid
+    elif side == "ask":
+        quote_price = ticker.ask
+    else:
+        quote_price = None
+    if quote_price is None:
+        return "-"
+    prefix = _mark_price_prefix(position)
+    instrument = position_instruments.get(position.inst_id)
+    places = _tick_size_places(instrument.tick_size) if instrument is not None else None
+    if position.inst_type == "OPTION":
+        if places is None:
+            places = 4
+        amount_text = format_decimal_fixed(quote_price, places)
+    elif position.inst_type not in {"FUTURES", "SWAP"}:
+        amount_text = _format_optional_decimal(quote_price)
+    elif places is None:
+        amount_text = _format_optional_decimal(quote_price)
+    else:
+        amount_text = format_decimal_fixed(quote_price, places)
+    return f"{prefix} {amount_text}" if prefix and amount_text != "-" else amount_text
+
+
+def _position_quote_price_usdt(
+    position: OkxPosition,
+    position_tickers: dict[str, OkxTicker],
+    upl_usdt_prices: dict[str, Decimal],
+    *,
+    side: str,
+) -> Decimal | None:
+    ticker = position_tickers.get(position.inst_id)
+    if ticker is None:
+        return None
+    if side == "bid":
+        quote_price = ticker.bid
+    elif side == "ask":
+        quote_price = ticker.ask
+    else:
+        quote_price = None
+    if quote_price is None:
+        return None
+    if position.inst_type == "OPTION":
+        currency = _infer_upl_currency(position)
+    else:
+        currency = (_extract_quote_key(position.inst_id) or "").upper()
+    if currency in {"USDT", "USD", "USDC"}:
+        return quote_price
+    price = upl_usdt_prices.get(currency)
+    if price is None:
+        return None
+    return quote_price * price
+
+
+def _format_position_quote_price_usdt(
+    position: OkxPosition,
+    position_tickers: dict[str, OkxTicker],
+    upl_usdt_prices: dict[str, Decimal],
+    *,
+    side: str,
+) -> str:
+    return _format_optional_usdt(_position_quote_price_usdt(position, position_tickers, upl_usdt_prices, side=side), with_sign=False)
+
+
 def _mark_price_prefix(position: OkxPosition) -> str:
     if position.inst_type == "OPTION":
         currency = _extract_asset_key(position.inst_id).upper()
@@ -5558,6 +5691,16 @@ def _build_position_instrument_map(client: OkxRestClient, positions: list[OkxPos
             if instrument.inst_id in futures_ids:
                 result[instrument.inst_id] = instrument
 
+    return result
+
+
+def _build_position_ticker_map(client: OkxRestClient, positions: list[OkxPosition]) -> dict[str, OkxTicker]:
+    result: dict[str, OkxTicker] = {}
+    for inst_id in sorted({position.inst_id for position in positions}):
+        try:
+            result[inst_id] = client.get_ticker(inst_id)
+        except Exception:
+            continue
     return result
 
 
