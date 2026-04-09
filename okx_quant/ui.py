@@ -3065,9 +3065,19 @@ class QuantApp:
                     f"任务：{session.session_id}",
                     f"期权合约：{session.option_inst_id}",
                     f"触发条件：{session.trigger_label}",
+                    f"触发标的：{session.trigger_inst_id}",
+                    f"触发价格类型：{_format_protection_trigger_price_type(session.trigger_price_type)}",
                     f"方向：{session.direction}",
+                    f"持仓方向：{session.pos_side or '-'}",
                     f"止盈触发：{_format_optional_decimal(session.take_profit_trigger)}",
+                    f"止盈报单方式：{_format_protection_order_mode_label(session.take_profit_order_mode)}",
+                    f"止盈报单价格：{_format_protection_order_price_detail(session.take_profit_order_mode, session.take_profit_order_price)}",
+                    f"止盈滑点：{_format_optional_decimal(session.take_profit_slippage)}",
                     f"止损触发：{_format_optional_decimal(session.stop_loss_trigger)}",
+                    f"止损报单方式：{_format_protection_order_mode_label(session.stop_loss_order_mode)}",
+                    f"止损报单价格：{_format_protection_order_price_detail(session.stop_loss_order_mode, session.stop_loss_order_price)}",
+                    f"止损滑点：{_format_optional_decimal(session.stop_loss_slippage)}",
+                    f"轮询秒数：{session.poll_seconds:g}",
                     f"状态：{session.status}",
                     f"启动时间：{session.started_at.strftime('%Y-%m-%d %H:%M:%S')}",
                     "",
@@ -5943,6 +5953,20 @@ def _resolve_protection_order_mode_value(mode_label: str) -> str:
     if "mark" in normalized or "滑点" in mode_label or "slippage" in normalized:
         return "mark_with_slippage"
     return "fixed_price"
+
+
+def _format_protection_order_mode_label(mode: str) -> str:
+    return "设定价格" if mode == "fixed_price" else "标记价格加减滑点"
+
+
+def _format_protection_order_price_detail(mode: str, price: Decimal | None) -> str:
+    if mode == "fixed_price":
+        return _format_optional_decimal(price)
+    return "自动按标记价与滑点计算"
+
+
+def _format_protection_trigger_price_type(trigger_price_type: str) -> str:
+    return "标记价" if trigger_price_type == "mark" else "最新价"
 
 
 def _format_okx_ms_timestamp(timestamp_ms: int | None) -> str:

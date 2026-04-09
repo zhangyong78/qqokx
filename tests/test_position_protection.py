@@ -1474,6 +1474,13 @@ class PositionProtectionTest(TestCase):
         sessions = manager.list_sessions()
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0].session_id, session_id)
+        self.assertEqual(sessions[0].trigger_inst_id, option_inst_id)
+        self.assertEqual(sessions[0].trigger_price_type, "mark")
+        self.assertEqual(sessions[0].take_profit_order_mode, "fixed_price")
+        self.assertEqual(sessions[0].take_profit_order_price, Decimal("0.0152"))
+        self.assertEqual(sessions[0].stop_loss_order_mode, "fixed_price")
+        self.assertIsNone(sessions[0].stop_loss_order_price)
+        self.assertEqual(sessions[0].poll_seconds, 0.01)
         self.assertEqual(len(manager._workers), 1)
 
     def test_clear_finished_removes_stopped_worker(self) -> None:

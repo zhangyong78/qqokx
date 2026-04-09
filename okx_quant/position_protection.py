@@ -111,10 +111,20 @@ class OptionProtectionConfig:
 class ProtectionSessionSnapshot:
     session_id: str
     option_inst_id: str
+    trigger_inst_id: str
     trigger_label: str
+    trigger_price_type: TriggerPriceType
     direction: str
+    pos_side: str | None
     take_profit_trigger: Decimal | None
+    take_profit_order_mode: ClosePriceMode
+    take_profit_order_price: Decimal | None
+    take_profit_slippage: Decimal
     stop_loss_trigger: Decimal | None
+    stop_loss_order_mode: ClosePriceMode
+    stop_loss_order_price: Decimal | None
+    stop_loss_slippage: Decimal
+    poll_seconds: float
     status: str
     started_at: datetime
     last_message: str
@@ -214,10 +224,20 @@ class PositionProtectionManager:
             ProtectionSessionSnapshot(
                 session_id=item.session_id,
                 option_inst_id=item.protection.option_inst_id,
+                trigger_inst_id=item.protection.trigger_inst_id,
                 trigger_label=item.protection.trigger_label or item.protection.trigger_inst_id,
+                trigger_price_type=item.protection.trigger_price_type,
                 direction=item.protection.direction,
+                pos_side=item.protection.pos_side,
                 take_profit_trigger=item.protection.take_profit_trigger,
+                take_profit_order_mode=item.protection.take_profit_order_mode,
+                take_profit_order_price=item.protection.take_profit_order_price,
+                take_profit_slippage=item.protection.take_profit_slippage,
                 stop_loss_trigger=item.protection.stop_loss_trigger,
+                stop_loss_order_mode=item.protection.stop_loss_order_mode,
+                stop_loss_order_price=item.protection.stop_loss_order_price,
+                stop_loss_slippage=item.protection.stop_loss_slippage,
+                poll_seconds=item.protection.poll_seconds,
                 status=item.status,
                 started_at=item.started_at,
                 last_message=item.last_message,
@@ -1272,10 +1292,20 @@ def _pp_list_sessions(self: PositionProtectionManager) -> list[ProtectionSession
         ProtectionSessionSnapshot(
             session_id=item.session_id,
             option_inst_id=item.protection.option_inst_id,
+            trigger_inst_id=item.protection.trigger_inst_id,
             trigger_label=item.protection.trigger_label or item.protection.trigger_inst_id,
+            trigger_price_type=item.protection.trigger_price_type,
             direction=item.protection.direction,
+            pos_side=item.protection.pos_side,
             take_profit_trigger=item.protection.take_profit_trigger,
+            take_profit_order_mode=item.protection.take_profit_order_mode,
+            take_profit_order_price=item.protection.take_profit_order_price,
+            take_profit_slippage=item.protection.take_profit_slippage,
             stop_loss_trigger=item.protection.stop_loss_trigger,
+            stop_loss_order_mode=item.protection.stop_loss_order_mode,
+            stop_loss_order_price=item.protection.stop_loss_order_price,
+            stop_loss_slippage=item.protection.stop_loss_slippage,
+            poll_seconds=item.protection.poll_seconds,
             status=_repair_mojibake_text(item.status),
             started_at=item.started_at,
             last_message=_repair_mojibake_text(item.last_message),
