@@ -175,6 +175,7 @@ PROTECTION_ORDER_MODE_OPTIONS = {
 @dataclass
 class StrategySession:
     session_id: str
+    api_name: str
     strategy_id: str
     strategy_name: str
     symbol: str
@@ -187,6 +188,8 @@ class StrategySession:
 
     @property
     def log_prefix(self) -> str:
+        if self.api_name:
+            return f"[{self.api_name}] [{self.session_id} {self.strategy_name} {self.symbol}]"
         return f"[{self.session_id} {self.strategy_name} {self.symbol}]"
 
 
@@ -699,16 +702,18 @@ class QuantApp:
 
         self.session_tree = ttk.Treeview(
             running_frame,
-            columns=("strategy", "symbol", "direction", "mode", "status", "started"),
+            columns=("api", "strategy", "symbol", "direction", "mode", "status", "started"),
             show="headings",
             selectmode="browse",
         )
+        self.session_tree.heading("api", text="API")
         self.session_tree.heading("strategy", text="策略")
         self.session_tree.heading("symbol", text="信号 -> 下单")
         self.session_tree.heading("direction", text="方向")
         self.session_tree.heading("mode", text="模式")
         self.session_tree.heading("status", text="状态")
         self.session_tree.heading("started", text="启动时间")
+        self.session_tree.column("api", width=96, anchor="center")
         self.session_tree.column("strategy", width=130, anchor="w")
         self.session_tree.column("symbol", width=180, anchor="w")
         self.session_tree.column("direction", width=90, anchor="center")
@@ -2830,15 +2835,17 @@ class QuantApp:
         )
         task_tree = ttk.Treeview(
             sessions_frame,
-            columns=("option", "trigger", "direction", "status", "started"),
+            columns=("api", "option", "trigger", "direction", "status", "started"),
             show="headings",
             selectmode="browse",
         )
+        task_tree.heading("api", text="API")
         task_tree.heading("option", text="期权合约")
         task_tree.heading("trigger", text="触发条件")
         task_tree.heading("direction", text="方向")
         task_tree.heading("status", text="状态")
         task_tree.heading("started", text="启动时间")
+        task_tree.column("api", width=96, anchor="center")
         task_tree.column("option", width=250, anchor="w")
         task_tree.column("trigger", width=180, anchor="w")
         task_tree.column("direction", width=80, anchor="center")
@@ -3024,6 +3031,7 @@ class QuantApp:
                     END,
                     iid=session.session_id,
                     values=(
+                        session.api_name or "-",
                         session.option_inst_id,
                         session.trigger_label,
                         session.direction,
@@ -3063,6 +3071,7 @@ class QuantApp:
             "\n".join(
                 [
                     f"任务：{session.session_id}",
+                    f"API配置：{session.api_name or '-'}",
                     f"期权合约：{session.option_inst_id}",
                     f"触发条件：{session.trigger_label}",
                     f"触发标的：{session.trigger_inst_id}",
@@ -3103,7 +3112,10 @@ class QuantApp:
             _validate_protection_live_price_availability(self.client, protection, position)
             config = self._build_manual_protection_strategy_config(position, protection)
             session_id = self._protection_manager.start(credentials, config, protection)
-            self._enqueue_log(f"[持仓保护 {session_id}] 已启动 {position.inst_id} 的期权保护任务。")
+            if credentials.profile_name:
+                self._enqueue_log(f"[持仓保护 {credentials.profile_name} {session_id}] 已启动 {position.inst_id} 的期权保护任务。")
+            else:
+                self._enqueue_log(f"[持仓保护 {session_id}] 已启动 {position.inst_id} 的期权保护任务。")
             self._refresh_protection_window_view()
         except Exception as exc:
             messagebox.showerror("启动保护失败", str(exc), parent=self._protection_window or self.root)
@@ -3882,14 +3894,16 @@ class QuantApp:
 
             session_id = self._next_session_id()
             session_symbol = f"{config.inst_id} -> {config.trade_inst_id or config.inst_id}"
+            api_name = credentials.profile_name or self._current_credential_profile()
             engine = StrategyEngine(
                 self.client,
-                self._make_session_logger(session_id, definition.name, session_symbol),
+                self._make_session_logger(session_id, definition.name, session_symbol, api_name),
                 notifier=notifier,
                 strategy_name=definition.name,
             )
             session = StrategySession(
                 session_id=session_id,
+                api_name=api_name,
                 strategy_id=definition.strategy_id,
                 strategy_name=definition.name,
                 symbol=session_symbol,
@@ -4545,8 +4559,8 @@ class QuantApp:
             f"{self.position_mode_label.get()}"
         )
 
-    def _make_session_logger(self, session_id: str, strategy_name: str, symbol: str):
-        prefix = f"[{session_id} {strategy_name} {symbol}]"
+    def _make_session_logger(self, session_id: str, strategy_name: str, symbol: str, api_name: str = ""):
+        prefix = f"[{api_name}] [{session_id} {strategy_name} {symbol}]" if api_name else f"[{session_id} {strategy_name} {symbol}]"
 
         def _logger(message: str) -> None:
             self._enqueue_log(f"{prefix} {message}")
@@ -4567,6 +4581,7 @@ class QuantApp:
 
     def _upsert_session_row(self, session: StrategySession) -> None:
         values = (
+            session.api_name or "-",
             session.strategy_name,
             session.symbol,
             session.direction_label,
@@ -4598,6 +4613,7 @@ class QuantApp:
         definition = get_strategy_definition(session.strategy_id)
         self.selected_session_text.set(
             f"会话：{session.session_id}\n"
+            f"API配置：{session.api_name or '-'}\n"
             f"状态：{session.status}\n"
             f"策略：{session.strategy_name}\n"
             f"运行模式：{session.run_mode_label}\n"
@@ -4666,7 +4682,12 @@ class QuantApp:
         passphrase = self.passphrase.get().strip()
         if not api_key or not secret_key or not passphrase:
             return None
-        return Credentials(api_key=api_key, secret_key=secret_key, passphrase=passphrase)
+        return Credentials(
+            api_key=api_key,
+            secret_key=secret_key,
+            passphrase=passphrase,
+            profile_name=self._current_credential_profile(),
+        )
 
     def _build_smart_order_runtime_config_or_none(self) -> SmartOrderRuntimeConfig | None:
         credentials = self._current_credentials_or_none()

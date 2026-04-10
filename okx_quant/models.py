@@ -49,6 +49,7 @@ class Credentials:
     api_key: str
     secret_key: str
     passphrase: str
+    profile_name: str = ""
 
 
 @dataclass(frozen=True)

@@ -171,6 +171,8 @@ class StrategyEngine:
         strategy = EmaDynamicOrderStrategy()
         lookback = recommended_indicator_lookback(
             config.ema_period,
+            config.trend_ema_period,
+            config.big_ema_period,
             config.atr_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
@@ -190,12 +192,22 @@ class StrategyEngine:
         )
         self._logger(f"指标回看数量：{lookback} 根 K 线")
 
-        self._log_hourly_debug(config.inst_id, config.ema_period)
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            trend_ema_period=config.trend_ema_period,
+            big_ema_period=config.big_ema_period,
+        )
 
         while not self._stop_event.is_set():
             candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period, config.atr_period)
+            minimum = max(
+                config.ema_period,
+                config.trend_ema_period,
+                config.big_ema_period,
+                config.atr_period,
+            )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -315,6 +327,8 @@ class StrategyEngine:
         strategy = EmaAtrStrategy()
         lookback = recommended_indicator_lookback(
             config.ema_period,
+            config.trend_ema_period,
+            config.big_ema_period,
             config.atr_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
@@ -328,12 +342,22 @@ class StrategyEngine:
         )
         self._logger(f"指标回看数量：{lookback} 根 K 线")
 
-        self._log_hourly_debug(config.inst_id, config.ema_period)
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            trend_ema_period=config.trend_ema_period,
+            big_ema_period=config.big_ema_period,
+        )
 
         while not self._stop_event.is_set():
             candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period + 2, config.atr_period + 2)
+            minimum = max(
+                config.ema_period + 2,
+                config.trend_ema_period + 2,
+                config.big_ema_period + 2,
+                config.atr_period + 2,
+            )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -411,6 +435,8 @@ class StrategyEngine:
         strategy = EmaAtrStrategy()
         lookback = recommended_indicator_lookback(
             config.ema_period,
+            config.trend_ema_period,
+            config.big_ema_period,
             config.atr_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
@@ -419,12 +445,22 @@ class StrategyEngine:
         self._log_strategy_start(config, signal_instrument, trade_instrument)
         self._log_local_mode_summary(config, signal_instrument, trade_instrument)
         self._logger("策略规则：最近一根已收盘 K 线上穿 EMA 做多，下穿 EMA 做空，信号出现后立即对下单标的开仓。")
-        self._log_hourly_debug(config.inst_id, config.ema_period)
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            trend_ema_period=config.trend_ema_period,
+            big_ema_period=config.big_ema_period,
+        )
 
         while not self._stop_event.is_set():
             candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period + 2, config.atr_period + 2)
+            minimum = max(
+                config.ema_period + 2,
+                config.trend_ema_period + 2,
+                config.big_ema_period + 2,
+                config.atr_period + 2,
+            )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -483,6 +519,8 @@ class StrategyEngine:
         strategy = EmaDynamicOrderStrategy()
         lookback = recommended_indicator_lookback(
             config.ema_period,
+            config.trend_ema_period,
+            config.big_ema_period,
             config.atr_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
@@ -495,12 +533,22 @@ class StrategyEngine:
             "策略规则：根据上一根已收盘 K 线 EMA 生成动态委托价，不再直接往 OKX 挂单，"
             "而是在本地轮询信号标的价格，触碰 EMA 后立即对下单标的开仓。"
         )
-        self._log_hourly_debug(config.inst_id, config.ema_period)
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            trend_ema_period=config.trend_ema_period,
+            big_ema_period=config.big_ema_period,
+        )
 
         while not self._stop_event.is_set():
             candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period, config.atr_period)
+            minimum = max(
+                config.ema_period,
+                config.trend_ema_period,
+                config.big_ema_period,
+                config.atr_period,
+            )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -579,6 +627,8 @@ class StrategyEngine:
         strategy = EmaDynamicOrderStrategy()
         lookback = recommended_indicator_lookback(
             config.ema_period,
+            config.trend_ema_period,
+            config.big_ema_period,
             config.atr_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
@@ -586,12 +636,22 @@ class StrategyEngine:
 
         self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
         self._logger("运行模式：只监控信号，不下单；每根新 K 线确认后，如生成新的 EMA 动态委托参考价，则发送邮件通知。")
-        self._log_hourly_debug(config.inst_id, config.ema_period)
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            trend_ema_period=config.trend_ema_period,
+            big_ema_period=config.big_ema_period,
+        )
 
         while not self._stop_event.is_set():
             candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period, config.atr_period)
+            minimum = max(
+                config.ema_period,
+                config.trend_ema_period,
+                config.big_ema_period,
+                config.atr_period,
+            )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -647,6 +707,8 @@ class StrategyEngine:
         strategy = EmaAtrStrategy()
         lookback = recommended_indicator_lookback(
             config.ema_period,
+            config.trend_ema_period,
+            config.big_ema_period,
             config.atr_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
@@ -654,12 +716,22 @@ class StrategyEngine:
 
         self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
         self._logger("运行模式：只监控信号，不下单；当 EMA 穿越信号出现时发送邮件通知。")
-        self._log_hourly_debug(config.inst_id, config.ema_period)
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            trend_ema_period=config.trend_ema_period,
+            big_ema_period=config.big_ema_period,
+        )
 
         while not self._stop_event.is_set():
             candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period + 2, config.atr_period + 2)
+            minimum = max(
+                config.ema_period + 2,
+                config.trend_ema_period + 2,
+                config.big_ema_period + 2,
+                config.atr_period + 2,
+            )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -1271,9 +1343,22 @@ class StrategyEngine:
             f"止盈止损触发价类型={config.tp_sl_trigger_type}"
         )
 
-    def _log_hourly_debug(self, inst_id: str, ema_period: int) -> None:
+    def _log_hourly_debug(
+        self,
+        inst_id: str,
+        ema_period: int,
+        *,
+        trend_ema_period: int = 0,
+        big_ema_period: int = 0,
+    ) -> None:
         try:
-            hourly_snapshot = fetch_hourly_ema_debug(self._client, inst_id, ema_period=ema_period)
+            hourly_snapshot = fetch_hourly_ema_debug(
+                self._client,
+                inst_id,
+                ema_period=ema_period,
+                trend_ema_period=trend_ema_period,
+                big_ema_period=big_ema_period,
+            )
             self._logger(format_hourly_debug(inst_id, hourly_snapshot))
         except Exception as exc:
             self._logger(f"1小时调试值获取失败：{exc}")
@@ -1531,11 +1616,18 @@ def fetch_hourly_ema_debug(
     inst_id: str,
     ema_period: int,
     atr_period: int = DEFAULT_DEBUG_ATR_PERIOD,
+    trend_ema_period: int = 0,
+    big_ema_period: int = 0,
 ) -> HourlyDebugSnapshot:
-    lookback = recommended_indicator_lookback(ema_period, atr_period)
+    lookback = recommended_indicator_lookback(
+        ema_period,
+        atr_period,
+        trend_ema_period,
+        big_ema_period,
+    )
     candles = client.get_candles(inst_id, "1H", limit=lookback)
     confirmed = [candle for candle in candles if candle.confirmed]
-    minimum = max(ema_period, atr_period)
+    minimum = max(ema_period, atr_period, trend_ema_period, big_ema_period)
     if len(confirmed) < minimum:
         raise RuntimeError(f"已收盘 1 小时 K 线不足，无法计算 EMA{ema_period} / ATR{atr_period}")
 

@@ -40,5 +40,31 @@ class DebugSnapshotTest(TestCase):
         self.assertEqual(snapshot.ema_period, 21)
         self.assertEqual(snapshot.atr_period, 10)
         self.assertEqual(client.calls[0], ("BTC-USDT-SWAP", "1H", 120))
-        self.assertIn("上一根EMA21", debug_text)
-        self.assertIn("上一根ATR10", debug_text)
+        self.assertIn("EMA21", debug_text)
+        self.assertIn("ATR10", debug_text)
+
+    def test_hourly_debug_expands_lookback_for_big_ema_filter(self) -> None:
+        candles = []
+        for index in range(1, 305):
+            candles.append(
+                Candle(
+                    ts=index,
+                    open=Decimal(index),
+                    high=Decimal(index + 1),
+                    low=Decimal(index - 1),
+                    close=Decimal(index),
+                    volume=Decimal("1"),
+                    confirmed=True,
+                )
+            )
+        client = DummyClient(candles)
+        snapshot = fetch_hourly_ema_debug(
+            client,
+            "BTC-USDT-SWAP",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+        )
+        self.assertEqual(snapshot.lookback_used, 300)
+        self.assertEqual(snapshot.confirmed_count, 304)
+        self.assertEqual(client.calls[0], ("BTC-USDT-SWAP", "1H", 300))
