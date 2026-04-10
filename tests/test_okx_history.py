@@ -1,7 +1,7 @@
 from decimal import Decimal
 from unittest import TestCase
 
-from okx_quant.models import Credentials
+from okx_quant.models import Credentials, Instrument
 from okx_quant.okx_client import (
     OkxAccountAssetItem,
     OkxAccountConfig,
@@ -15,8 +15,10 @@ from okx_quant.ui import (
     _build_account_asset_detail_text,
     _build_account_config_detail_text,
     _build_fill_history_detail_text,
+    _build_history_instrument_map,
     _filter_fill_history_items,
     _format_fill_history_price,
+    _format_fill_history_size,
     _build_position_history_detail_text,
     _build_position_history_usdt_price_map,
     _filter_position_history_items,
@@ -24,21 +26,108 @@ from okx_quant.ui import (
     _format_position_history_filter_stats,
     _format_position_history_pnl,
     _format_position_history_price,
+    _format_position_history_size,
     _position_history_realized_pnl_usdt,
 )
 
 
 class OkxHistoryParsingTest(TestCase):
+    @staticmethod
+    def _option_instruments() -> dict[str, Instrument]:
+        return {
+            "BTC-USD-260626-100000-C": Instrument(
+                inst_id="BTC-USD-260626-100000-C",
+                inst_type="OPTION",
+                tick_size=Decimal("0.0001"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+                settle_ccy="BTC",
+                ct_val=Decimal("1"),
+                ct_mult=Decimal("0.01"),
+                ct_val_ccy="BTC",
+                uly="BTC-USD",
+                inst_family="BTC-USD",
+            )
+        }
+
+    @staticmethod
+    def _futures_instruments() -> dict[str, Instrument]:
+        return {
+            "BTC-USD-260626": Instrument(
+                inst_id="BTC-USD-260626",
+                inst_type="FUTURES",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+                settle_ccy="BTC",
+                ct_val=Decimal("100"),
+                ct_mult=Decimal("1"),
+                ct_val_ccy="USD",
+                uly="BTC-USD",
+                inst_family="BTC-USD",
+            )
+        }
+
+    @staticmethod
+    def _usdt_futures_instruments() -> dict[str, Instrument]:
+        return {
+            "BTC-USDT-260626": Instrument(
+                inst_id="BTC-USDT-260626",
+                inst_type="FUTURES",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+                settle_ccy="USDT",
+                ct_val=Decimal("0.01"),
+                ct_mult=Decimal("1"),
+                ct_val_ccy="BTC",
+                uly="BTC-USDT",
+                inst_family="BTC-USDT",
+            )
+        }
+
+    def test_build_history_instrument_map_recognizes_delivery_futures_ids(self) -> None:
+        class _StubClient:
+            @staticmethod
+            def get_option_instruments(inst_family: str):
+                return []
+
+            @staticmethod
+            def get_instruments(inst_type: str):
+                self.assertEqual(inst_type, "FUTURES")
+                return list(self._futures_instruments().values()) + list(self._usdt_futures_instruments().values())
+
+            @staticmethod
+            def get_swap_instruments():
+                return []
+
+        instruments = _build_history_instrument_map(
+            _StubClient(),
+            ["BTC-USD-260626", "BTC-USDT-260626"],
+        )
+
+        self.assertIn("BTC-USD-260626", instruments)
+        self.assertIn("BTC-USDT-260626", instruments)
+
     def test_advance_fill_history_limit_uses_100_then_200(self) -> None:
-        limit, clicks, label = _advance_fill_history_limit(500, 0)
-        self.assertEqual(limit, 600)
+        limit, clicks, label = _advance_fill_history_limit(100, 0)
+        self.assertEqual(limit, 200)
         self.assertEqual(clicks, 1)
         self.assertEqual(label, "增加200条")
 
         limit, clicks, label = _advance_fill_history_limit(limit, clicks)
-        self.assertEqual(limit, 800)
+        self.assertEqual(limit, 400)
         self.assertEqual(clicks, 2)
         self.assertEqual(label, "增加200条")
+
+    def test_advance_fill_history_limit_matches_position_history_growth_rule(self) -> None:
+        limit, clicks, label = _advance_fill_history_limit(100, 0)
+        self.assertEqual((limit, clicks, label), (200, 1, "增加200条"))
+        limit, clicks, label = _advance_fill_history_limit(limit, clicks)
+        self.assertEqual((limit, clicks, label), (400, 2, "增加200条"))
 
     def test_get_account_overview_parses_summary_and_details(self) -> None:
         client = OkxRestClient()
@@ -514,9 +603,56 @@ class OkxHistoryParsingTest(TestCase):
                 trade_id="22",
                 exec_type="M",
                 raw={},
-            )
+            ),
+            self._option_instruments(),
         )
         self.assertIn("已实现盈亏：-0.0005", detail)
+
+        self.assertIn("成交量：0.2 BTC", detail)
+
+    def test_fill_history_detail_uses_family_fallback_for_expired_option_amount(self) -> None:
+        detail = _build_fill_history_detail_text(
+            OkxFillHistoryItem(
+                fill_time=1710000000200,
+                inst_id="BTC-USD-260410-65500-P",
+                inst_type="OPTION",
+                side="sell",
+                pos_side="short",
+                fill_price=Decimal("0.015"),
+                fill_size=Decimal("20"),
+                fill_fee=Decimal("-0.0001"),
+                fee_currency="BTC",
+                pnl=Decimal("-0.0005"),
+                order_id="2",
+                trade_id="22",
+                exec_type="M",
+                raw={},
+            ),
+            self._option_instruments(),
+        )
+        self.assertIn("成交量：0.2 BTC", detail)
+
+    def test_fill_history_size_keeps_asset_unit_when_instrument_metadata_missing(self) -> None:
+        text = _format_fill_history_size(
+            OkxFillHistoryItem(
+                fill_time=1710000000200,
+                inst_id="MON-USDT",
+                inst_type="SPOT",
+                side="sell",
+                pos_side=None,
+                fill_price=Decimal("0.02"),
+                fill_size=Decimal("14967.123456"),
+                fill_fee=Decimal("-0.1"),
+                fee_currency="MON",
+                pnl=Decimal("0"),
+                order_id="9",
+                trade_id="99",
+                exec_type="T",
+                raw={},
+            ),
+            {},
+        )
+        self.assertEqual(text, "14967.1235 MON")
 
     def test_fill_history_pnl_formats_usdt_with_two_decimals(self) -> None:
         text = _format_fill_history_pnl(
@@ -538,6 +674,94 @@ class OkxHistoryParsingTest(TestCase):
             )
         )
         self.assertEqual(text, "+12.30")
+
+    def test_fill_history_size_converts_coin_margined_futures_contracts_to_coin_amount(self) -> None:
+        detail = _build_fill_history_detail_text(
+            OkxFillHistoryItem(
+                fill_time=1710000000200,
+                inst_id="BTC-USD-260626",
+                inst_type="FUTURES",
+                side="buy",
+                pos_side="long",
+                fill_price=Decimal("20000"),
+                fill_size=Decimal("20"),
+                fill_fee=None,
+                fee_currency="BTC",
+                pnl=Decimal("0.01"),
+                order_id="3",
+                trade_id="33",
+                exec_type="M",
+                raw={},
+            ),
+            self._futures_instruments(),
+        )
+        self.assertIn("成交量：0.1 BTC", detail)
+
+    def test_fill_history_size_uses_family_fallback_for_usdt_futures(self) -> None:
+        text = _format_fill_history_size(
+            OkxFillHistoryItem(
+                fill_time=1710000000200,
+                inst_id="BTC-USDT-260920",
+                inst_type="FUTURES",
+                side="buy",
+                pos_side="long",
+                fill_price=Decimal("68804.9"),
+                fill_size=Decimal("10"),
+                fill_fee=Decimal("-0.1"),
+                fee_currency="USDT",
+                pnl=Decimal("0"),
+                order_id="4",
+                trade_id="44",
+                exec_type="T",
+                raw={},
+            ),
+            self._usdt_futures_instruments(),
+        )
+        self.assertEqual(text, "0.1 BTC")
+
+    def test_fill_history_size_uses_bill_face_value_for_coin_delivery_without_fillsz(self) -> None:
+        text = _format_fill_history_size(
+            OkxFillHistoryItem(
+                fill_time=1710000000200,
+                inst_id="BTC-USD-260626",
+                inst_type="FUTURES",
+                side="buy",
+                pos_side="long",
+                fill_price=Decimal("68820.40"),
+                fill_size=Decimal("30600"),
+                fill_fee=None,
+                fee_currency="BTC",
+                pnl=Decimal("0"),
+                order_id="5",
+                trade_id="55",
+                exec_type="琛屾潈/浜ゅ壊",
+                raw={"billId": "1", "subType": "112"},
+            ),
+            self._futures_instruments(),
+        )
+        self.assertEqual(text, "0.4446 BTC")
+
+    def test_fill_history_size_prefers_bill_fillsz_when_available(self) -> None:
+        text = _format_fill_history_size(
+            OkxFillHistoryItem(
+                fill_time=1710000000200,
+                inst_id="BTC-USD-260626",
+                inst_type="FUTURES",
+                side="buy",
+                pos_side="long",
+                fill_price=Decimal("68820.40"),
+                fill_size=Decimal("30600"),
+                fill_fee=None,
+                fee_currency="BTC",
+                pnl=Decimal("0"),
+                order_id="6",
+                trade_id="66",
+                exec_type="琛屾潈/浜ゅ壊",
+                raw={"billId": "2", "subType": "112", "fillSz": "20"},
+            ),
+            self._futures_instruments(),
+        )
+        self.assertEqual(text, "0.0291 BTC")
 
     def test_fill_history_price_formats_exercise_delivery_with_two_decimals(self) -> None:
         text = _format_fill_history_price(
@@ -599,11 +823,57 @@ class OkxHistoryParsingTest(TestCase):
                 raw={},
             ),
             {"BTC": Decimal("90000")},
+            self._option_instruments(),
         )
         self.assertIn("开仓均价：0.02", detail)
         self.assertIn("平仓均价：0.03", detail)
         self.assertIn("盈亏：0.001", detail)
         self.assertIn("已实现盈亏：+0.0005", detail)
+
+        self.assertIn("平仓数量：0.1 BTC", detail)
+
+    def test_position_history_detail_uses_family_fallback_for_expired_option_amount(self) -> None:
+        detail = _build_position_history_detail_text(
+            OkxPositionHistoryItem(
+                update_time=1710000000200,
+                inst_id="BTC-USD-260410-65500-P",
+                inst_type="OPTION",
+                mgn_mode="isolated",
+                pos_side="long",
+                direction=None,
+                open_avg_price=Decimal("0.02"),
+                close_avg_price=Decimal("0.03"),
+                close_size=Decimal("20"),
+                pnl=Decimal("0.001"),
+                realized_pnl=Decimal("0.0005"),
+                settle_pnl=Decimal("0"),
+                raw={},
+            ),
+            {"BTC": Decimal("90000")},
+            self._option_instruments(),
+        )
+        self.assertIn("平仓数量：0.2 BTC", detail)
+
+    def test_position_history_size_keeps_asset_unit_when_instrument_metadata_missing(self) -> None:
+        text = _format_position_history_size(
+            OkxPositionHistoryItem(
+                update_time=1710000000200,
+                inst_id="BTC-USD-260626",
+                inst_type="FUTURES",
+                mgn_mode="cross",
+                pos_side="short",
+                direction=None,
+                open_avg_price=Decimal("21000"),
+                close_avg_price=Decimal("25000"),
+                close_size=Decimal("10.123456"),
+                pnl=Decimal("0.01"),
+                realized_pnl=Decimal("0.008"),
+                settle_pnl=Decimal("0"),
+                raw={},
+            ),
+            {},
+        )
+        self.assertEqual(text, "10.1235 BTC")
 
     def test_position_history_formats_usdt_values_with_two_decimals(self) -> None:
         item = OkxPositionHistoryItem(
@@ -625,6 +895,70 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(_format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type), "70500.00")
         self.assertEqual(_format_position_history_pnl(item.pnl, item), "12.30")
         self.assertEqual(_format_position_history_pnl(item.realized_pnl, item, with_sign=True), "+8.50")
+
+    def test_position_history_size_converts_coin_margined_futures_contracts_to_coin_amount(self) -> None:
+        detail = _build_position_history_detail_text(
+            OkxPositionHistoryItem(
+                update_time=1710000000200,
+                inst_id="BTC-USD-260626",
+                inst_type="FUTURES",
+                mgn_mode="cross",
+                pos_side="short",
+                direction=None,
+                open_avg_price=Decimal("21000"),
+                close_avg_price=Decimal("25000"),
+                close_size=Decimal("25"),
+                pnl=Decimal("0.01"),
+                realized_pnl=Decimal("0.008"),
+                settle_pnl=Decimal("0"),
+                raw={},
+            ),
+            {"BTC": Decimal("90000")},
+            self._futures_instruments(),
+        )
+        self.assertIn("平仓数量：0.1 BTC", detail)
+
+    def test_position_history_size_uses_family_fallback_for_coin_margined_futures(self) -> None:
+        text = _format_position_history_size(
+            OkxPositionHistoryItem(
+                update_time=1710000000200,
+                inst_id="BTC-USD-260920",
+                inst_type="FUTURES",
+                mgn_mode="cross",
+                pos_side="short",
+                direction=None,
+                open_avg_price=Decimal("71000"),
+                close_avg_price=Decimal("68913.21"),
+                close_size=Decimal("1424"),
+                pnl=Decimal("0.08"),
+                realized_pnl=Decimal("0.97"),
+                settle_pnl=Decimal("0"),
+                raw={},
+            ),
+            self._futures_instruments(),
+        )
+        self.assertEqual(text, "2.0664 BTC")
+
+    def test_position_history_size_uses_family_fallback_for_usdt_futures(self) -> None:
+        text = _format_position_history_size(
+            OkxPositionHistoryItem(
+                update_time=1710000000200,
+                inst_id="BTC-USDT-260920",
+                inst_type="FUTURES",
+                mgn_mode="cross",
+                pos_side="short",
+                direction=None,
+                open_avg_price=Decimal("70000"),
+                close_avg_price=Decimal("68084.9"),
+                close_size=Decimal("75"),
+                pnl=Decimal("0.02"),
+                realized_pnl=Decimal("0.01"),
+                settle_pnl=Decimal("0"),
+                raw={},
+            ),
+            self._usdt_futures_instruments(),
+        )
+        self.assertEqual(text, "0.75 BTC")
 
     def test_filter_position_history_items_supports_type_margin_and_keyword(self) -> None:
         items = [
@@ -667,6 +1001,119 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual([index for index, _ in filtered_by_type], [1])
         self.assertEqual([index for index, _ in filtered_by_margin], [0])
         self.assertEqual([index for index, _ in filtered_by_keyword], [1])
+
+    def test_filter_fill_history_items_supports_asset_and_expiry_prefix(self) -> None:
+        items = [
+            OkxFillHistoryItem(
+                fill_time=1710000000200,
+                inst_id="BTC-USDT-SWAP",
+                inst_type="SWAP",
+                side="buy",
+                pos_side="long",
+                fill_price=Decimal("71210.5"),
+                fill_size=Decimal("3"),
+                fill_fee=Decimal("-0.5"),
+                fee_currency="USDT",
+                pnl=Decimal("12.3"),
+                order_id="1",
+                trade_id="11",
+                exec_type="T",
+                raw={},
+            ),
+            OkxFillHistoryItem(
+                fill_time=1710000000100,
+                inst_id="BTC-USD-260626-100000-C",
+                inst_type="OPTION",
+                side="exercise",
+                pos_side=None,
+                fill_price=Decimal("0.015"),
+                fill_size=Decimal("20"),
+                fill_fee=Decimal("-0.0001"),
+                fee_currency="BTC",
+                pnl=Decimal("-0.0005"),
+                order_id=None,
+                trade_id=None,
+                exec_type="琛屾潈/浜ゅ壊",
+                raw={},
+            ),
+            OkxFillHistoryItem(
+                fill_time=1710000000000,
+                inst_id="ETH-USD-260626",
+                inst_type="FUTURES",
+                side="sell",
+                pos_side="short",
+                fill_price=Decimal("2500"),
+                fill_size=Decimal("10"),
+                fill_fee=Decimal("-0.1"),
+                fee_currency="ETH",
+                pnl=Decimal("0.01"),
+                order_id="3",
+                trade_id="33",
+                exec_type="M",
+                raw={},
+            ),
+        ]
+
+        filtered_by_asset = _filter_fill_history_items(items, asset="BTC")
+        filtered_by_expiry = _filter_fill_history_items(items, expiry_prefix="260626")
+
+        self.assertEqual([index for index, _ in filtered_by_asset], [0, 1])
+        self.assertEqual([index for index, _ in filtered_by_expiry], [1, 2])
+
+    def test_filter_position_history_items_supports_asset_and_expiry_prefix(self) -> None:
+        items = [
+            OkxPositionHistoryItem(
+                update_time=1710000000300,
+                inst_id="BTC-USDT-SWAP",
+                inst_type="SWAP",
+                mgn_mode="cross",
+                pos_side="long",
+                direction=None,
+                open_avg_price=Decimal("70000"),
+                close_avg_price=Decimal("70500"),
+                close_size=Decimal("3"),
+                pnl=Decimal("12.3"),
+                realized_pnl=Decimal("8.5"),
+                settle_pnl=Decimal("0"),
+                raw={},
+            ),
+            OkxPositionHistoryItem(
+                update_time=1710000000200,
+                inst_id="BTC-USD-260626-100000-C",
+                inst_type="OPTION",
+                mgn_mode="isolated",
+                pos_side="short",
+                direction=None,
+                open_avg_price=Decimal("0.02"),
+                close_avg_price=Decimal("0.03"),
+                close_size=Decimal("10"),
+                pnl=Decimal("0.001"),
+                realized_pnl=Decimal("0.0005"),
+                settle_pnl=Decimal("0"),
+                raw={},
+            ),
+            OkxPositionHistoryItem(
+                update_time=1710000000100,
+                inst_id="ETH-USD-260626",
+                inst_type="FUTURES",
+                mgn_mode="cross",
+                pos_side="short",
+                direction=None,
+                open_avg_price=Decimal("2500"),
+                close_avg_price=Decimal("2450"),
+                close_size=Decimal("50"),
+                pnl=Decimal("0.02"),
+                realized_pnl=Decimal("0.01"),
+                settle_pnl=Decimal("0"),
+                raw={},
+            ),
+        ]
+
+        filtered_by_asset = _filter_position_history_items(items, asset="BTC")
+        filtered_by_expiry = _filter_position_history_items(items, expiry_prefix="260626")
+
+        self.assertEqual([index for index, _ in filtered_by_asset], [0, 1])
+        self.assertEqual([index for index, _ in filtered_by_expiry], [1, 2])
 
     def test_format_position_history_filter_stats_sums_option_totals(self) -> None:
         filtered_items = [

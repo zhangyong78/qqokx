@@ -19,7 +19,9 @@ from okx_quant.engine import StrategyEngine, fetch_hourly_ema_debug, format_hour
 from okx_quant.log_utils import append_log_line
 from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
-from okx_quant.option_strategy_ui import OptionStrategyCalculatorWindow
+from okx_quant.option_roll import is_short_option_position
+from okx_quant.option_roll_ui import OptionRollSuggestionWindow
+from okx_quant.option_strategy_ui import OptionStrategyCalculatorWindow, _build_option_quote
 from okx_quant.okx_client import (
     OkxAccountAssetItem,
     OkxAccountConfig,
@@ -221,6 +223,7 @@ class QuantApp:
         self._deribit_volatility_monitor_window: DeribitVolatilityMonitorWindow | None = None
         self._deribit_volatility_window: DeribitVolatilityWindow | None = None
         self._option_strategy_window: OptionStrategyCalculatorWindow | None = None
+        self._option_roll_window: OptionRollSuggestionWindow | None = None
         self._positions_zoom_window: Toplevel | None = None
         self._protection_window: Toplevel | None = None
         self._protection_replay_window: ProtectionReplayWindow | None = None
@@ -237,6 +240,8 @@ class QuantApp:
         self._upl_usdt_prices: dict[str, Decimal] = {}
         self._position_history_usdt_prices: dict[str, Decimal] = {}
         self._position_instruments: dict[str, Instrument] = {}
+        self._fill_history_instruments: dict[str, Instrument] = {}
+        self._position_history_instruments: dict[str, Instrument] = {}
         self._position_tickers: dict[str, OkxTicker] = {}
         self._position_row_payloads: dict[str, dict[str, object]] = {}
         self._positions_view_rendering = False
@@ -284,9 +289,12 @@ class QuantApp:
         self._positions_zoom_fills_summary_text = StringVar(value="历史成交尚未读取。")
         self._positions_zoom_fills_load_more_text = StringVar(value="增加100条")
         self._positions_zoom_position_history_summary_text = StringVar(value="历史仓位尚未读取。")
+        self._positions_zoom_position_history_load_more_text = StringVar(value="增加100条")
         self._positions_zoom_position_history_base_summary = "历史仓位尚未读取。"
-        self._fill_history_fetch_limit = 500
+        self._fill_history_fetch_limit = 100
         self._fill_history_load_more_clicks = 0
+        self._position_history_fetch_limit = 100
+        self._position_history_load_more_clicks = 0
         self._positions_zoom_summary_text = StringVar(value="当前尚未获取持仓。")
         self._positions_zoom_option_search_hint_text = StringVar(
             value="\u9009\u4e2d\u671f\u6743\u540e\uff0c\u53ef\u4e00\u952e\u5e26\u5165\u5408\u7ea6\u6216\u5230\u671f\u524d\u7f00\u3002"
@@ -373,9 +381,13 @@ class QuantApp:
         self.position_keyword = StringVar()
         self.fill_history_type_filter = StringVar(value="全部类型")
         self.fill_history_side_filter = StringVar(value="全部方向")
+        self.fill_history_asset_filter = StringVar()
+        self.fill_history_expiry_prefix_filter = StringVar()
         self.fill_history_keyword = StringVar()
         self.position_history_type_filter = StringVar(value="全部类型")
         self.position_history_margin_filter = StringVar(value="全部模式")
+        self.position_history_asset_filter = StringVar()
+        self.position_history_expiry_prefix_filter = StringVar()
         self.position_history_keyword = StringVar()
         self.position_refresh_interval_label = StringVar(value="15秒")
         self.position_auto_refresh_button_text = StringVar(value="暂停自动刷新")
@@ -780,13 +792,16 @@ class QuantApp:
         ttk.Button(action_row, text="设置期权保护", command=self.open_position_protection_window).grid(
             row=0, column=6, padx=(0, 6)
         )
-        ttk.Button(action_row, text="全部展开", command=self.expand_all_position_groups).grid(
+        ttk.Button(action_row, text="展期建议", command=self.open_option_roll_window).grid(
             row=0, column=7, padx=(0, 6)
         )
-        ttk.Button(action_row, text="折叠分组", command=self.collapse_position_groups).grid(
+        ttk.Button(action_row, text="全部展开", command=self.expand_all_position_groups).grid(
             row=0, column=8, padx=(0, 6)
         )
-        ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=9)
+        ttk.Button(action_row, text="折叠分组", command=self.collapse_position_groups).grid(
+            row=0, column=9, padx=(0, 6)
+        )
+        ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=10)
 
         filter_row = ttk.Frame(positions_frame)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -1434,16 +1449,19 @@ class QuantApp:
         ttk.Button(zoom_actions, text="设置期权保护", command=self.open_position_protection_window).grid(
             row=0, column=4, padx=(0, 6)
         )
-        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=5)
+        ttk.Button(zoom_actions, text="展期建议", command=self.open_option_roll_window).grid(
+            row=0, column=5, padx=(0, 6)
+        )
+        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=6)
         ttk.Button(zoom_actions, text="列设置", command=self.open_positions_zoom_column_window).grid(
-            row=0, column=6, padx=(0, 6)
+            row=0, column=7, padx=(0, 6)
         )
 
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_detail_toggle_text, command=self.toggle_positions_zoom_detail).grid(
-            row=0, column=7, padx=(0, 6)
+            row=0, column=8, padx=(0, 6)
         )
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_history_toggle_text, command=self.toggle_positions_zoom_history).grid(
-            row=0, column=8
+            row=0, column=9
         )
         for column_index, child in enumerate(zoom_actions.winfo_children()):
             child.grid_configure(column=column_index)
@@ -1576,7 +1594,7 @@ class QuantApp:
         )
         filter_row = ttk.Frame(parent)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        filter_row.columnconfigure(5, weight=1)
+        filter_row.columnconfigure(9, weight=1)
         ttk.Label(filter_row, text="类型").grid(row=0, column=0, sticky="w")
         type_combo = ttk.Combobox(
             filter_row,
@@ -1597,31 +1615,39 @@ class QuantApp:
         )
         side_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
         side_combo.bind("<<ComboboxSelected>>", self._on_fill_history_filter_changed)
-        ttk.Label(filter_row, text="搜索").grid(row=0, column=4, sticky="w")
+        ttk.Label(filter_row, text="标的").grid(row=0, column=4, sticky="w")
+        asset_entry = ttk.Entry(filter_row, textvariable=self.fill_history_asset_filter, width=10)
+        asset_entry.grid(row=0, column=5, sticky="w", padx=(6, 12))
+        asset_entry.bind("<KeyRelease>", self._on_fill_history_filter_changed)
+        ttk.Label(filter_row, text="到期前缀").grid(row=0, column=6, sticky="w")
+        expiry_entry = ttk.Entry(filter_row, textvariable=self.fill_history_expiry_prefix_filter, width=14)
+        expiry_entry.grid(row=0, column=7, sticky="w", padx=(6, 12))
+        expiry_entry.bind("<KeyRelease>", self._on_fill_history_filter_changed)
+        ttk.Label(filter_row, text="搜索").grid(row=0, column=8, sticky="w")
         keyword_entry = ttk.Entry(filter_row, textvariable=self.fill_history_keyword)
-        keyword_entry.grid(row=0, column=5, sticky="ew", padx=(6, 12))
+        keyword_entry.grid(row=0, column=9, sticky="ew", padx=(6, 12))
         keyword_entry.bind("<KeyRelease>", self._on_fill_history_filter_changed)
         self._positions_zoom_fills_apply_contract_button = ttk.Button(
             filter_row,
             text="\u5e26\u5165\u5408\u7ea6",
             command=self.apply_selected_option_to_fill_history_search,
         )
-        self._positions_zoom_fills_apply_contract_button.grid(row=0, column=6, padx=(0, 6))
+        self._positions_zoom_fills_apply_contract_button.grid(row=0, column=10, padx=(0, 6))
         self._positions_zoom_fills_apply_expiry_prefix_button = ttk.Button(
             filter_row,
             text="\u5e26\u5165\u5230\u671f\u524d\u7f00",
             command=self.apply_selected_option_expiry_prefix_to_fill_history_search,
         )
-        self._positions_zoom_fills_apply_expiry_prefix_button.grid(row=0, column=7, padx=(0, 6))
+        self._positions_zoom_fills_apply_expiry_prefix_button.grid(row=0, column=11, padx=(0, 6))
         ttk.Button(filter_row, text="应用筛选", command=self._render_positions_zoom_fills_view).grid(
-            row=0, column=8, padx=(0, 6)
+            row=0, column=12, padx=(0, 6)
         )
-        ttk.Button(filter_row, text="清空筛选", command=self.reset_fill_history_filters).grid(row=0, column=9)
+        ttk.Button(filter_row, text="清空筛选", command=self.reset_fill_history_filters).grid(row=0, column=13)
         ttk.Label(
             filter_row,
             textvariable=self._positions_zoom_fill_history_search_hint_text,
             foreground="#6b7280",
-        ).grid(row=1, column=4, columnspan=6, sticky="w", pady=(6, 0))
+        ).grid(row=1, column=8, columnspan=6, sticky="w", pady=(6, 0))
         tree_frame = ttk.Frame(parent)
         tree_frame.grid(row=2, column=0, sticky="nsew")
         tree_frame.columnconfigure(0, weight=1)
@@ -1686,12 +1712,17 @@ class QuantApp:
         ttk.Label(header, textvariable=self._positions_zoom_position_history_summary_text).grid(row=0, column=0, sticky="w")
         ttk.Button(
             header,
+            textvariable=self._positions_zoom_position_history_load_more_text,
+            command=self.expand_position_history_limit,
+        ).grid(row=0, column=1, sticky="e", padx=(0, 6))
+        ttk.Button(
+            header,
             textvariable=self._positions_zoom_position_history_detail_toggle_text,
             command=self.toggle_positions_zoom_position_history_detail,
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=2, sticky="e")
         filter_row = ttk.Frame(parent)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        filter_row.columnconfigure(5, weight=1)
+        filter_row.columnconfigure(9, weight=1)
         ttk.Label(filter_row, text="类型").grid(row=0, column=0, sticky="w")
         type_combo = ttk.Combobox(
             filter_row,
@@ -1712,31 +1743,39 @@ class QuantApp:
         )
         margin_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
         margin_combo.bind("<<ComboboxSelected>>", self._on_position_history_filter_changed)
-        ttk.Label(filter_row, text="搜索").grid(row=0, column=4, sticky="w")
+        ttk.Label(filter_row, text="标的").grid(row=0, column=4, sticky="w")
+        asset_entry = ttk.Entry(filter_row, textvariable=self.position_history_asset_filter, width=10)
+        asset_entry.grid(row=0, column=5, sticky="w", padx=(6, 12))
+        asset_entry.bind("<KeyRelease>", self._on_position_history_filter_changed)
+        ttk.Label(filter_row, text="到期前缀").grid(row=0, column=6, sticky="w")
+        expiry_entry = ttk.Entry(filter_row, textvariable=self.position_history_expiry_prefix_filter, width=14)
+        expiry_entry.grid(row=0, column=7, sticky="w", padx=(6, 12))
+        expiry_entry.bind("<KeyRelease>", self._on_position_history_filter_changed)
+        ttk.Label(filter_row, text="搜索").grid(row=0, column=8, sticky="w")
         keyword_entry = ttk.Entry(filter_row, textvariable=self.position_history_keyword)
-        keyword_entry.grid(row=0, column=5, sticky="ew", padx=(6, 12))
+        keyword_entry.grid(row=0, column=9, sticky="ew", padx=(6, 12))
         keyword_entry.bind("<KeyRelease>", self._on_position_history_filter_changed)
         self._positions_zoom_position_history_apply_contract_button = ttk.Button(
             filter_row,
             text="\u5e26\u5165\u5408\u7ea6",
             command=self.apply_selected_option_to_position_history_search,
         )
-        self._positions_zoom_position_history_apply_contract_button.grid(row=0, column=6, padx=(0, 6))
+        self._positions_zoom_position_history_apply_contract_button.grid(row=0, column=10, padx=(0, 6))
         self._positions_zoom_position_history_apply_expiry_prefix_button = ttk.Button(
             filter_row,
             text="\u5e26\u5165\u5230\u671f\u524d\u7f00",
             command=self.apply_selected_option_expiry_prefix_to_position_history_search,
         )
-        self._positions_zoom_position_history_apply_expiry_prefix_button.grid(row=0, column=7, padx=(0, 6))
+        self._positions_zoom_position_history_apply_expiry_prefix_button.grid(row=0, column=11, padx=(0, 6))
         ttk.Button(filter_row, text="应用筛选", command=self._render_positions_zoom_position_history_view).grid(
-            row=0, column=8, padx=(0, 6)
+            row=0, column=12, padx=(0, 6)
         )
-        ttk.Button(filter_row, text="清空筛选", command=self.reset_position_history_filters).grid(row=0, column=9)
+        ttk.Button(filter_row, text="清空筛选", command=self.reset_position_history_filters).grid(row=0, column=13)
         ttk.Label(
             filter_row,
             textvariable=self._positions_zoom_position_history_search_hint_text,
             foreground="#6b7280",
-        ).grid(row=1, column=4, columnspan=6, sticky="w", pady=(6, 0))
+        ).grid(row=1, column=8, columnspan=6, sticky="w", pady=(6, 0))
         tree_frame = ttk.Frame(parent)
         tree_frame.grid(row=2, column=0, sticky="nsew")
         tree_frame.columnconfigure(0, weight=1)
@@ -1863,6 +1902,12 @@ class QuantApp:
         self._positions_zoom_history_toggle_text.set("折叠历史区域")
         self._positions_zoom_fills_detail_toggle_text.set("折叠成交详情")
         self._positions_zoom_position_history_detail_toggle_text.set("折叠仓位详情")
+        self._positions_zoom_fills_load_more_text.set("增加100条")
+        self._positions_zoom_position_history_load_more_text.set("增加100条")
+        self._fill_history_fetch_limit = 100
+        self._fill_history_load_more_clicks = 0
+        self._position_history_fetch_limit = 100
+        self._position_history_load_more_clicks = 0
         self._positions_zoom_option_search_hint_text.set("选中期权后，可一键带入合约或到期前缀。")
         self._positions_zoom_position_history_search_hint_text.set("选中历史期权后，可一键带入合约或到期前缀。")
 
@@ -2286,7 +2331,7 @@ class QuantApp:
         if not expiry_prefix:
             messagebox.showinfo("快捷筛选", "请先在历史仓位里选中一条期权合约。")
             return
-        self.position_history_keyword.set(expiry_prefix)
+        self.position_history_expiry_prefix_filter.set(expiry_prefix.rstrip("-").split("-")[-1])
         self._render_positions_zoom_position_history_view()
 
     def apply_selected_option_to_fill_history_search(self) -> None:
@@ -2304,7 +2349,7 @@ class QuantApp:
         if not expiry_prefix:
             messagebox.showinfo("快捷筛选", "请先在历史成交里选中一条期权合约。")
             return
-        self.fill_history_keyword.set(expiry_prefix)
+        self.fill_history_expiry_prefix_filter.set(expiry_prefix.rstrip("-").split("-")[-1])
         self._render_positions_zoom_fills_view()
 
     def _refresh_positions_zoom_detail(self) -> None:
@@ -2368,6 +2413,19 @@ class QuantApp:
         self._positions_zoom_fills_load_more_text.set(next_label)
         self.refresh_fill_history()
 
+    def expand_position_history_limit(self) -> None:
+        self._position_history_fetch_limit, self._position_history_load_more_clicks, next_label = _advance_fill_history_limit(
+            self._position_history_fetch_limit,
+            self._position_history_load_more_clicks,
+        )
+        self._positions_zoom_position_history_load_more_text.set(next_label)
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            self._positions_zoom_position_history_summary_text.set("未配置 API 凭证，无法读取历史仓位。")
+            return
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        self._start_position_history_refresh(credentials, environment)
+
     def _start_fill_history_refresh(self, credentials: Credentials, environment: str) -> None:
         if self._fills_history_refreshing:
             return
@@ -2393,6 +2451,7 @@ class QuantApp:
     def _refresh_fill_history_worker(self, credentials: Credentials, environment: str) -> None:
         try:
             fills = self.client.get_fills_history(credentials, environment=environment, limit=self._fill_history_fetch_limit)
+            instruments = _build_history_instrument_map(self.client, [item.inst_id for item in fills])
             note = None
             effective_environment = environment
         except Exception as exc:
@@ -2401,6 +2460,7 @@ class QuantApp:
                 alternate = "live" if environment == "demo" else "demo"
                 try:
                     fills = self.client.get_fills_history(credentials, environment=alternate, limit=self._fill_history_fetch_limit)
+                    instruments = _build_history_instrument_map(self.client, [item.inst_id for item in fills])
                     note = f"历史数据自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
                     effective_environment = alternate
                 except Exception:
@@ -2409,12 +2469,13 @@ class QuantApp:
             else:
                 self.root.after(0, lambda: self._apply_fill_history_error(message))
                 return
-        self.root.after(0, lambda: self._apply_fill_history(fills, note, effective_environment))
+        self.root.after(0, lambda: self._apply_fill_history(fills, instruments, note, effective_environment))
 
     def _refresh_position_history_worker(self, credentials: Credentials, environment: str) -> None:
         try:
-            position_history = self.client.get_positions_history(credentials, environment=environment, limit=100)
+            position_history = self.client.get_positions_history(credentials, environment=environment, limit=self._position_history_fetch_limit)
             usdt_prices = _build_position_history_usdt_price_map(self.client, position_history)
+            instruments = _build_history_instrument_map(self.client, [item.inst_id for item in position_history])
             note = None
             effective_environment = environment
         except Exception as exc:
@@ -2422,8 +2483,9 @@ class QuantApp:
             if "50101" in message and "current environment" in message:
                 alternate = "live" if environment == "demo" else "demo"
                 try:
-                    position_history = self.client.get_positions_history(credentials, environment=alternate, limit=100)
+                    position_history = self.client.get_positions_history(credentials, environment=alternate, limit=self._position_history_fetch_limit)
                     usdt_prices = _build_position_history_usdt_price_map(self.client, position_history)
+                    instruments = _build_history_instrument_map(self.client, [item.inst_id for item in position_history])
                     note = f"历史数据自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
                     effective_environment = alternate
                 except Exception:
@@ -2432,16 +2494,21 @@ class QuantApp:
             else:
                 self.root.after(0, lambda: self._apply_position_history_error(message))
                 return
-        self.root.after(0, lambda: self._apply_position_history(position_history, usdt_prices, note, effective_environment))
+        self.root.after(
+            0,
+            lambda: self._apply_position_history(position_history, usdt_prices, instruments, note, effective_environment),
+        )
 
     def _apply_fill_history(
         self,
         fills: list[OkxFillHistoryItem],
+        instruments: dict[str, Instrument],
         note: str | None = None,
         effective_environment: str | None = None,
     ) -> None:
         self._fills_history_refreshing = False
         self._latest_fill_history = list(fills)
+        self._fill_history_instruments = dict(instruments)
         self._fills_history_last_refresh_at = datetime.now()
         self._positions_history_last_refresh_at = self._fills_history_last_refresh_at
         if effective_environment:
@@ -2457,12 +2524,14 @@ class QuantApp:
         self,
         position_history: list[OkxPositionHistoryItem],
         usdt_prices: dict[str, Decimal],
+        instruments: dict[str, Instrument],
         note: str | None = None,
         effective_environment: str | None = None,
     ) -> None:
         self._position_history_refreshing = False
         self._latest_position_history = list(position_history)
         self._position_history_usdt_prices = dict(usdt_prices)
+        self._position_history_instruments = dict(instruments)
         self._position_history_last_refresh_at = datetime.now()
         self._positions_history_last_refresh_at = self._position_history_last_refresh_at
         if effective_environment:
@@ -2494,6 +2563,8 @@ class QuantApp:
             self._latest_fill_history,
             inst_type=POSITION_TYPE_OPTIONS.get(self.fill_history_type_filter.get(), ""),
             side=HISTORY_FILL_SIDE_FILTER_OPTIONS.get(self.fill_history_side_filter.get(), ""),
+            asset=self.fill_history_asset_filter.get(),
+            expiry_prefix=self.fill_history_expiry_prefix_filter.get(),
             keyword=self.fill_history_keyword.get(),
         )
         for index, item in filtered_items:
@@ -2508,7 +2579,7 @@ class QuantApp:
                     item.inst_id or "-",
                     _format_history_side(item.side, item.pos_side),
                     _format_fill_history_price(item),
-                    _format_optional_decimal(item.fill_size),
+                    _format_fill_history_size(item, self._fill_history_instruments),
                     _format_optional_decimal(item.fill_fee),
                     _format_fill_history_pnl(item),
                     item.exec_type or "-",
@@ -2523,6 +2594,8 @@ class QuantApp:
         if (
             POSITION_TYPE_OPTIONS.get(self.fill_history_type_filter.get(), "")
             or HISTORY_FILL_SIDE_FILTER_OPTIONS.get(self.fill_history_side_filter.get(), "")
+            or self.fill_history_asset_filter.get().strip()
+            or self.fill_history_expiry_prefix_filter.get().strip()
             or self.fill_history_keyword.get().strip()
         ):
             summary = f"{summary} | 当前显示：{len(filtered_items)}/{len(self._latest_fill_history)}"
@@ -2543,6 +2616,8 @@ class QuantApp:
     def reset_fill_history_filters(self) -> None:
         self.fill_history_type_filter.set("全部类型")
         self.fill_history_side_filter.set("全部方向")
+        self.fill_history_asset_filter.set("")
+        self.fill_history_expiry_prefix_filter.set("")
         self.fill_history_keyword.set("")
         self._render_positions_zoom_fills_view()
 
@@ -2556,6 +2631,8 @@ class QuantApp:
             self._latest_position_history,
             inst_type=POSITION_TYPE_OPTIONS.get(self.position_history_type_filter.get(), ""),
             margin_mode=HISTORY_MARGIN_MODE_FILTER_OPTIONS.get(self.position_history_margin_filter.get(), ""),
+            asset=self.position_history_asset_filter.get(),
+            expiry_prefix=self.position_history_expiry_prefix_filter.get(),
             keyword=self.position_history_keyword.get(),
         )
         for index, item in filtered_items:
@@ -2572,7 +2649,7 @@ class QuantApp:
                     _format_history_side(None, item.pos_side or item.direction),
                     _format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type),
                     _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
-                    _format_optional_decimal(item.close_size),
+                    _format_position_history_size(item, self._position_history_instruments),
                     _format_position_history_pnl(item.pnl, item),
                     _format_position_history_pnl(item.realized_pnl, item, with_sign=True),
                     _format_optional_usdt(
@@ -2586,12 +2663,16 @@ class QuantApp:
         if (
             POSITION_TYPE_OPTIONS.get(self.position_history_type_filter.get(), "")
             or HISTORY_MARGIN_MODE_FILTER_OPTIONS.get(self.position_history_margin_filter.get(), "")
+            or self.position_history_asset_filter.get().strip()
+            or self.position_history_expiry_prefix_filter.get().strip()
             or self.position_history_keyword.get().strip()
         ):
             summary = f"{summary} | 当前显示：{len(filtered_items)}/{len(self._latest_position_history)}"
         if (
             POSITION_TYPE_OPTIONS.get(self.position_history_type_filter.get(), "")
             or HISTORY_MARGIN_MODE_FILTER_OPTIONS.get(self.position_history_margin_filter.get(), "")
+            or self.position_history_asset_filter.get().strip()
+            or self.position_history_expiry_prefix_filter.get().strip()
             or self.position_history_keyword.get().strip()
         ):
             summary = (
@@ -2620,6 +2701,8 @@ class QuantApp:
     def reset_position_history_filters(self) -> None:
         self.position_history_type_filter.set("全部类型")
         self.position_history_margin_filter.set("全部模式")
+        self.position_history_asset_filter.set("")
+        self.position_history_expiry_prefix_filter.set("")
         self.position_history_keyword.set("")
         self._render_positions_zoom_position_history_view()
 
@@ -2638,7 +2721,10 @@ class QuantApp:
         if index is None or index >= len(self._latest_fill_history):
             self._set_readonly_text(self._positions_zoom_fills_detail, "这里会显示选中历史成交单的详情。")
             return
-        self._set_readonly_text(self._positions_zoom_fills_detail, _build_fill_history_detail_text(self._latest_fill_history[index]))
+        self._set_readonly_text(
+            self._positions_zoom_fills_detail,
+            _build_fill_history_detail_text(self._latest_fill_history[index], self._fill_history_instruments),
+        )
 
     def _refresh_positions_zoom_position_history_detail(self) -> None:
         if self._positions_zoom_position_history_tree is None or self._positions_zoom_position_history_detail is None:
@@ -2656,6 +2742,7 @@ class QuantApp:
             _build_position_history_detail_text(
                 self._latest_position_history[index],
                 self._position_history_usdt_prices,
+                self._position_history_instruments,
             ),
         )
 
@@ -3535,6 +3622,69 @@ class QuantApp:
             self.root,
             self.client,
             runtime_provider=self._build_option_strategy_runtime_or_none,
+            logger=self._enqueue_log,
+        )
+
+    def open_option_roll_window(self) -> None:
+        position = self._selected_option_position()
+        if position is None:
+            messagebox.showinfo("提示", "请先在账户持仓中选中一条期权持仓。", parent=self.root)
+            return
+        if position.inst_type != "OPTION":
+            messagebox.showinfo("提示", "展期建议目前只支持期权持仓。", parent=self.root)
+            return
+        if not is_short_option_position(position):
+            messagebox.showinfo("提示", "展期建议第一版只支持期权卖出方持仓。", parent=self.root)
+            return
+
+        instrument = self._position_instruments.get(position.inst_id)
+        if instrument is None:
+            try:
+                instrument = self.client.get_instrument(position.inst_id)
+            except Exception as exc:
+                messagebox.showerror("打开失败", f"读取合约信息失败：{exc}", parent=self.root)
+                return
+
+        ticker = self._position_tickers.get(position.inst_id)
+        if ticker is None:
+            try:
+                ticker = self.client.get_ticker(position.inst_id)
+            except Exception as exc:
+                messagebox.showerror("打开失败", f"读取行情失败：{exc}", parent=self.root)
+                return
+
+        quote = _build_option_quote(instrument, ticker)
+        api_name = self._current_credential_profile()
+
+        def _send_to_option_strategy(payload):
+            if self._option_strategy_window is None or not self._option_strategy_window.window.winfo_exists():
+                self._option_strategy_window = OptionStrategyCalculatorWindow(
+                    self.root,
+                    self.client,
+                    runtime_provider=self._build_option_strategy_runtime_or_none,
+                    logger=self._enqueue_log,
+                )
+            self._option_strategy_window.load_roll_transfer_payload(payload)
+
+        if self._option_roll_window is not None and self._option_roll_window.window.winfo_exists():
+            self._option_roll_window.load_position(
+                position=position,
+                instrument=instrument,
+                quote=quote,
+                api_name=api_name,
+                auto_scan=True,
+            )
+            self._option_roll_window.show()
+            return
+
+        self._option_roll_window = OptionRollSuggestionWindow(
+            self.root,
+            self.client,
+            position=position,
+            instrument=instrument,
+            quote=quote,
+            api_name=api_name,
+            send_to_strategy_callback=_send_to_option_strategy,
             logger=self._enqueue_log,
         )
 
@@ -4777,6 +4927,8 @@ class QuantApp:
             self._deribit_volatility_window.window.destroy()
         if self._option_strategy_window is not None and self._option_strategy_window.window.winfo_exists():
             self._option_strategy_window.window.destroy()
+        if self._option_roll_window is not None and self._option_roll_window.window.winfo_exists():
+            self._option_roll_window.window.destroy()
         if self._protection_replay_window is not None and self._protection_replay_window.window.winfo_exists():
             self._protection_replay_window.window.destroy()
         self._close_positions_zoom_window()
@@ -4936,6 +5088,39 @@ def _extract_quote_key(inst_id: str) -> str | None:
     if len(parts) >= 2 and parts[1]:
         return parts[1].upper()
     return None
+
+
+def _extract_history_expiry_prefix(inst_id: str) -> str:
+    parts = inst_id.strip().upper().split("-")
+    if len(parts) >= 3 and re.fullmatch(r"\d{6,8}", parts[2] or ""):
+        return parts[2]
+    return ""
+
+
+def _extract_history_family(inst_id: str, inst_type: str) -> str | None:
+    normalized = inst_id.strip().upper()
+    if not normalized:
+        return None
+    if inst_type == "OPTION":
+        return infer_option_family(normalized)
+    parts = normalized.split("-")
+    if inst_type in {"FUTURES", "SWAP"} and len(parts) >= 2:
+        return f"{parts[0]}-{parts[1]}"
+    return None
+
+
+def _infer_history_inst_type(inst_id: str) -> str:
+    normalized = inst_id.strip().upper()
+    if not normalized:
+        return "SPOT"
+    if normalized.endswith("-SWAP"):
+        return "SWAP"
+    if infer_option_family(normalized):
+        return "OPTION"
+    parts = normalized.split("-")
+    if len(parts) == 3 and re.fullmatch(r"\d{6,8}", parts[2] or ""):
+        return "FUTURES"
+    return infer_inst_type(normalized)
 
 
 def _extract_bucket_key(position: OkxPosition) -> str:
@@ -6019,10 +6204,14 @@ def _filter_position_history_items(
     *,
     inst_type: str = "",
     margin_mode: str = "",
+    asset: str = "",
+    expiry_prefix: str = "",
     keyword: str = "",
 ) -> list[tuple[int, OkxPositionHistoryItem]]:
     normalized_inst_type = inst_type.strip().upper()
     normalized_margin_mode = margin_mode.strip().lower()
+    normalized_asset = asset.strip().upper()
+    normalized_expiry_prefix = expiry_prefix.strip().upper()
     normalized_keyword = keyword.strip().lower()
     filtered: list[tuple[int, OkxPositionHistoryItem]] = []
 
@@ -6030,6 +6219,10 @@ def _filter_position_history_items(
         if normalized_inst_type and (item.inst_type or "").upper() != normalized_inst_type:
             continue
         if normalized_margin_mode and (item.mgn_mode or "").lower() != normalized_margin_mode:
+            continue
+        if normalized_asset and _extract_asset_key(item.inst_id).upper() != normalized_asset:
+            continue
+        if normalized_expiry_prefix and not _extract_history_expiry_prefix(item.inst_id).startswith(normalized_expiry_prefix):
             continue
         if normalized_keyword:
             haystack = " ".join(
@@ -6054,10 +6247,14 @@ def _filter_fill_history_items(
     *,
     inst_type: str = "",
     side: str = "",
+    asset: str = "",
+    expiry_prefix: str = "",
     keyword: str = "",
 ) -> list[tuple[int, OkxFillHistoryItem]]:
     normalized_inst_type = inst_type.strip().upper()
     normalized_side = side.strip().lower()
+    normalized_asset = asset.strip().upper()
+    normalized_expiry_prefix = expiry_prefix.strip().upper()
     normalized_keyword = keyword.strip().lower()
     filtered: list[tuple[int, OkxFillHistoryItem]] = []
 
@@ -6065,6 +6262,10 @@ def _filter_fill_history_items(
         if normalized_inst_type and (item.inst_type or "").upper() != normalized_inst_type:
             continue
         if normalized_side and (item.side or "").lower() != normalized_side:
+            continue
+        if normalized_asset and _extract_asset_key(item.inst_id).upper() != normalized_asset:
+            continue
+        if normalized_expiry_prefix and not _extract_history_expiry_prefix(item.inst_id).startswith(normalized_expiry_prefix):
             continue
         if normalized_keyword:
             haystack = " ".join(
@@ -6149,6 +6350,181 @@ def _position_history_realized_pnl_usdt(
     if price is None:
         return None
     return item.realized_pnl * price
+
+
+def _build_history_instrument_map(
+    client: OkxRestClient,
+    inst_ids: list[str],
+) -> dict[str, Instrument]:
+    option_families = sorted(
+        {
+            family
+            for inst_id in inst_ids
+            if _infer_history_inst_type(inst_id) == "OPTION"
+            for family in [infer_option_family(inst_id)]
+            if family
+        }
+    )
+    instruments: dict[str, Instrument] = {}
+    for family in option_families:
+        try:
+            option_instruments = client.get_option_instruments(inst_family=family)
+        except Exception:
+            continue
+        for instrument in option_instruments:
+            instruments[instrument.inst_id] = instrument
+
+    futures_ids = {inst_id for inst_id in inst_ids if _infer_history_inst_type(inst_id) == "FUTURES"}
+    futures_families = {
+        family
+        for inst_id in futures_ids
+        for family in [_extract_history_family(inst_id, "FUTURES")]
+        if family
+    }
+    if futures_ids:
+        try:
+            for instrument in client.get_instruments("FUTURES"):
+                instrument_family = (
+                    instrument.inst_family.upper()
+                    if instrument.inst_family
+                    else _extract_history_family(instrument.inst_id, instrument.inst_type)
+                )
+                if instrument.inst_id in futures_ids or instrument_family in futures_families:
+                    instruments[instrument.inst_id] = instrument
+        except Exception:
+            pass
+
+    swap_ids = {inst_id for inst_id in inst_ids if _infer_history_inst_type(inst_id) == "SWAP"}
+    if swap_ids:
+        try:
+            for instrument in client.get_swap_instruments():
+                if instrument.inst_id in swap_ids:
+                    instruments[instrument.inst_id] = instrument
+        except Exception:
+            pass
+    return instruments
+
+
+def _resolve_history_instrument(
+    *,
+    inst_id: str,
+    inst_type: str,
+    instruments: dict[str, Instrument],
+) -> Instrument | None:
+    instrument = instruments.get(inst_id)
+    if instrument is not None:
+        return instrument
+
+    family = _extract_history_family(inst_id, inst_type)
+    if not family:
+        return None
+
+    for candidate in instruments.values():
+        candidate_family = (
+            candidate.inst_family.upper()
+            if candidate.inst_family
+            else _extract_history_family(candidate.inst_id, candidate.inst_type)
+        )
+        if candidate.inst_type != inst_type or candidate_family != family:
+            continue
+        if candidate.ct_val is not None and candidate.ct_val > 0 and candidate.ct_val_ccy:
+            return candidate
+    return None
+
+
+def _history_display_amount(
+    *,
+    inst_id: str,
+    inst_type: str,
+    size: Decimal | None,
+    reference_price: Decimal | None,
+    instruments: dict[str, Instrument],
+) -> tuple[Decimal | None, str | None]:
+    if size is None:
+        return None, None
+
+    instrument = _resolve_history_instrument(inst_id=inst_id, inst_type=inst_type, instruments=instruments)
+    if instrument is None or instrument.ct_val is None or instrument.ct_val <= 0 or not instrument.ct_val_ccy:
+        asset_currency = _extract_asset_key(inst_id).upper()
+        return size, asset_currency if asset_currency else None
+
+    multiplier = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
+    payout_currency = instrument.ct_val_ccy.upper()
+    if payout_currency in {"USD", "USDT", "USDC"} and inst_type in {"FUTURES", "SWAP"}:
+        base_currency = _extract_asset_key(inst_id).upper()
+        if reference_price is not None and reference_price > 0 and base_currency:
+            amount = abs(size) * instrument.ct_val * multiplier / reference_price
+            return amount, base_currency
+    amount = abs(size) * instrument.ct_val * multiplier
+    return amount, payout_currency
+
+
+def _format_history_size_amount(value: Decimal | None, currency: str | None) -> str:
+    if value is None:
+        return "-"
+    text = _format_optional_decimal_capped(value, places=4)
+    if currency:
+        return f"{text} {currency}"
+    return text
+
+
+def _format_fill_history_size(item: OkxFillHistoryItem, instruments: dict[str, Instrument]) -> str:
+    amount, currency = _history_fill_display_amount(item, instruments)
+    return _format_history_size_amount(amount, currency)
+
+
+def _history_fill_display_amount(
+    item: OkxFillHistoryItem,
+    instruments: dict[str, Instrument],
+) -> tuple[Decimal | None, str | None]:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    bill_id = str(raw.get("billId") or "").strip()
+    bill_sub_type = str(raw.get("subType") or "").strip()
+
+    if bill_id and item.inst_type == "FUTURES" and bill_sub_type in {"112", "113"}:
+        instrument = _resolve_history_instrument(inst_id=item.inst_id, inst_type=item.inst_type, instruments=instruments)
+        if instrument is not None and item.fill_price is not None and item.fill_price > 0:
+            raw_fill_sz = raw.get("fillSz")
+            if raw_fill_sz not in {None, ""}:
+                try:
+                    contract_size = Decimal(str(raw_fill_sz))
+                except (InvalidOperation, ValueError):
+                    contract_size = item.fill_size
+                else:
+                    amount, currency = _history_display_amount(
+                        inst_id=item.inst_id,
+                        inst_type=item.inst_type,
+                        size=contract_size,
+                        reference_price=item.fill_price,
+                        instruments=instruments,
+                    )
+                    if amount is not None:
+                        return amount, currency
+
+            payout_currency = (instrument.ct_val_ccy or "").upper()
+            base_currency = _extract_asset_key(item.inst_id).upper()
+            if payout_currency in {"USD", "USDT", "USDC"} and base_currency and item.fill_size is not None:
+                return abs(item.fill_size) / item.fill_price, base_currency
+
+    amount, currency = _history_display_amount(
+        inst_id=item.inst_id,
+        inst_type=item.inst_type,
+        size=item.fill_size,
+        reference_price=item.fill_price,
+        instruments=instruments,
+    )
+    return amount, currency
+
+
+def _format_position_history_size(item: OkxPositionHistoryItem, instruments: dict[str, Instrument]) -> str:
+    amount, currency = _history_display_amount(
+        inst_id=item.inst_id,
+        inst_type=item.inst_type,
+        size=item.close_size,
+        reference_price=item.close_avg_price,
+        instruments=instruments,
+    )
+    return _format_history_size_amount(amount, currency)
 
 
 def _infer_fill_history_pnl_currency(item: OkxFillHistoryItem) -> str:
@@ -6256,14 +6632,14 @@ def _build_account_asset_detail_text(item: OkxAccountAssetItem) -> str:
     )
 
 
-def _build_fill_history_detail_text(item: OkxFillHistoryItem) -> str:
+def _build_fill_history_detail_text(item: OkxFillHistoryItem, instruments: dict[str, Instrument]) -> str:
     return (
         f"时间：{_format_okx_ms_timestamp(item.fill_time)}\n"
         f"合约：{item.inst_id or '-'}\n"
         f"类型：{item.inst_type or '-'}\n"
         f"方向：{_format_history_side(item.side, item.pos_side)}\n"
         f"成交价：{_format_fill_history_price(item)}\n"
-        f"成交量：{_format_optional_decimal(item.fill_size)}\n"
+        f"成交量：{_format_fill_history_size(item, instruments)}\n"
         f"手续费：{_format_optional_decimal(item.fill_fee)} {item.fee_currency or ''}\n"
         f"已实现盈亏：{_format_fill_history_pnl(item)}\n"
         f"成交类型：{item.exec_type or '-'}\n"
@@ -6272,7 +6648,11 @@ def _build_fill_history_detail_text(item: OkxFillHistoryItem) -> str:
     )
 
 
-def _build_position_history_detail_text(item: OkxPositionHistoryItem, upl_usdt_prices: dict[str, Decimal]) -> str:
+def _build_position_history_detail_text(
+    item: OkxPositionHistoryItem,
+    upl_usdt_prices: dict[str, Decimal],
+    instruments: dict[str, Instrument],
+) -> str:
     return (
         f"更新时间：{_format_okx_ms_timestamp(item.update_time)}\n"
         f"合约：{item.inst_id or '-'}\n"
@@ -6281,7 +6661,7 @@ def _build_position_history_detail_text(item: OkxPositionHistoryItem, upl_usdt_p
         f"方向：{_format_history_side(None, item.pos_side or item.direction)}\n"
         f"开仓均价：{_format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type)}\n"
         f"平仓均价：{_format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type)}\n"
-        f"平仓数量：{_format_optional_decimal(item.close_size)}\n"
+        f"平仓数量：{_format_position_history_size(item, instruments)}\n"
         f"盈亏：{_format_position_history_pnl(item.pnl, item)}\n"
         f"已实现盈亏：{_format_position_history_pnl(item.realized_pnl, item, with_sign=True)}\n"
         f"结算盈亏：{_format_optional_decimal(item.settle_pnl)}"

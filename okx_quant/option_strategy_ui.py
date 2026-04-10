@@ -12,6 +12,7 @@ from typing import Any, Callable
 from okx_quant.log_utils import append_log_line, ensure_log_timestamp
 from okx_quant.models import Candle, Instrument
 from okx_quant.okx_client import OkxPosition, OkxRestClient, OkxTicker
+from okx_quant.option_roll import OptionRollTransferPayload
 from okx_quant.option_strategy import (
     OptionChainRow,
     OptionQuote,
@@ -2273,6 +2274,53 @@ class OptionStrategyCalculatorWindow:
         if self.option_family.get().strip() and self._selected_expiry_code():
             self.refresh_chain()
         self.refresh_charts()
+
+    def load_roll_transfer_payload(self, payload: OptionRollTransferPayload) -> None:
+        if self._legs:
+            replace = messagebox.askyesno(
+                "送入展期建议",
+                "当前策略计算器里已有策略腿，是否用展期建议替换当前内容？",
+                parent=self.window,
+            )
+            if not replace:
+                return
+        self.show()
+        self.strategy_name.set(payload.strategy_name)
+        self.option_family.set(payload.option_family)
+        self.expiry_code.set(payload.expiry_code)
+        self._legs = [
+            StrategyLegDefinition(
+                alias=leg.alias,
+                inst_id=leg.inst_id,
+                side=leg.side,
+                quantity=leg.quantity,
+                premium=leg.premium,
+                delta=leg.delta,
+                gamma=leg.gamma,
+                theta=leg.theta,
+                vega=leg.vega,
+                enabled=leg.enabled,
+            )
+            for leg in payload.legs
+        ]
+        for instrument in payload.instruments:
+            self._instrument_map[instrument.inst_id] = instrument
+        for quote in payload.quotes:
+            self._quotes_by_inst_id[quote.instrument.inst_id] = quote
+            if quote.index_price is not None and quote.index_price > 0:
+                self._current_underlying_price = quote.index_price
+        self._latest_payoff_snapshot = None
+        self._latest_expiry_payoff_snapshot = None
+        self._latest_combo_candles = []
+        self._latest_chart_formula = ""
+        self.formula.set(build_default_formula(self._legs))
+        self._sync_expiry_options(preferred=payload.expiry_code)
+        self._refresh_leg_greeks()
+        self._render_legs()
+        self._refresh_strategy_summary()
+        self.refresh_chain()
+        self.refresh_charts()
+        self.status_text.set(f"已载入展期建议：{payload.strategy_name}")
 
     def _selected_expiry_code(self) -> str:
         raw = self.expiry_code.get().strip()
