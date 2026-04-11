@@ -3610,6 +3610,7 @@ class QuantApp:
         self._deribit_volatility_window = DeribitVolatilityWindow(
             self.root,
             self.deribit_client,
+            market_client=self.client,
             logger=self._enqueue_log,
         )
 
