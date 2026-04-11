@@ -604,6 +604,11 @@ class DeribitVolatilityWindow:
         if price_max == price_min:
             price_max += 1.0
             price_min -= 1.0
+        else:
+            price_span = price_max - price_min
+            padding = max(price_span * 0.06, abs(price_max) * 0.002, 0.01)
+            price_max += padding
+            price_min -= padding
 
         def y_for(price: Decimal) -> float:
             ratio = (price_max - float(price)) / (price_max - price_min)
