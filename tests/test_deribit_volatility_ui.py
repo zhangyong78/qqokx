@@ -7,8 +7,14 @@ from okx_quant.deribit_volatility_ui import (
     _aggregate_price_candles_to_resolution,
     _aggregate_candles_to_resolution,
     _align_candles_by_timestamp,
+    _default_chart_viewport,
+    _hourly_history_limit,
+    _max_limit_for_resolution_value,
+    _merge_deribit_candles,
+    _merge_price_candles,
     _normalize_chart_viewport,
     _pan_chart_viewport,
+    _required_hourly_limit,
     _to_average_price_candles,
     _to_average_volatility_candles,
     _zoom_chart_viewport,
@@ -154,3 +160,53 @@ class DeribitVolatilityUiTest(TestCase):
         self.assertEqual(averaged[1].open, Decimal("101.88"))
         self.assertEqual(averaged[1].close, Decimal("107.25"))
         self.assertEqual(averaged[1].volume, Decimal("2"))
+
+    def test_required_hourly_limit_scales_with_resolution(self) -> None:
+        self.assertEqual(_required_hourly_limit("3600", 300), 348)
+        self.assertEqual(_required_hourly_limit("14400", 300), 1248)
+        self.assertEqual(_required_hourly_limit("1D", 300), 7248)
+
+    def test_hourly_history_limit_covers_requested_range(self) -> None:
+        self.assertEqual(_hourly_history_limit(0, 0), 1)
+        self.assertEqual(_hourly_history_limit(0, 3_600_000 * 24), 26)
+
+    def test_max_limit_for_resolution_value(self) -> None:
+        self.assertEqual(_max_limit_for_resolution_value("3600"), 30000)
+        self.assertEqual(_max_limit_for_resolution_value("14400"), 10000)
+        self.assertEqual(_max_limit_for_resolution_value("1D"), 10000)
+
+    def test_default_chart_viewport_targets_latest_requested_window(self) -> None:
+        self.assertEqual(_default_chart_viewport(1000, 300, min_visible=24), (700, 300))
+        self.assertEqual(_default_chart_viewport(10, 300, min_visible=24), (0, 10))
+
+    def test_merge_deribit_candles_replaces_same_timestamp(self) -> None:
+        existing = [
+            DeribitVolatilityCandle(ts=0, open=Decimal("10"), high=Decimal("12"), low=Decimal("9"), close=Decimal("11")),
+            DeribitVolatilityCandle(ts=1_000, open=Decimal("11"), high=Decimal("13"), low=Decimal("10"), close=Decimal("12")),
+        ]
+        incoming = [
+            DeribitVolatilityCandle(ts=1_000, open=Decimal("20"), high=Decimal("21"), low=Decimal("19"), close=Decimal("20")),
+            DeribitVolatilityCandle(ts=2_000, open=Decimal("30"), high=Decimal("31"), low=Decimal("29"), close=Decimal("30")),
+        ]
+
+        merged = _merge_deribit_candles(existing, incoming)
+
+        self.assertEqual([candle.ts for candle in merged], [0, 1_000, 2_000])
+        self.assertEqual(merged[1].open, Decimal("20"))
+        self.assertEqual(merged[2].close, Decimal("30"))
+
+    def test_merge_price_candles_replaces_same_timestamp(self) -> None:
+        existing = [
+            Candle(ts=0, open=Decimal("100"), high=Decimal("110"), low=Decimal("90"), close=Decimal("105"), volume=Decimal("1"), confirmed=True),
+            Candle(ts=1_000, open=Decimal("105"), high=Decimal("112"), low=Decimal("104"), close=Decimal("108"), volume=Decimal("2"), confirmed=True),
+        ]
+        incoming = [
+            Candle(ts=1_000, open=Decimal("200"), high=Decimal("210"), low=Decimal("190"), close=Decimal("205"), volume=Decimal("3"), confirmed=True),
+            Candle(ts=2_000, open=Decimal("300"), high=Decimal("310"), low=Decimal("290"), close=Decimal("305"), volume=Decimal("4"), confirmed=True),
+        ]
+
+        merged = _merge_price_candles(existing, incoming)
+
+        self.assertEqual([candle.ts for candle in merged], [0, 1_000, 2_000])
+        self.assertEqual(merged[1].open, Decimal("200"))
+        self.assertEqual(merged[2].close, Decimal("305"))

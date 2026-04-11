@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import csv
+import json
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from tkinter import BooleanVar, END, Canvas, StringVar, Toplevel
@@ -18,21 +19,19 @@ from okx_quant.window_layout import apply_adaptive_window_geometry
 
 DERIBIT_CURRENCY_OPTIONS = ("BTC", "ETH")
 DERIBIT_RESOLUTION_OPTIONS = {
-    "1分钟": "60",
     "1小时": "3600",
     "4小时": "14400",
     "1天": "1D",
 }
 DERIBIT_RESOLUTION_SECONDS = {
-    "60": 60,
     "3600": 3_600,
     "14400": 14_400,
     "1D": 86_400,
 }
+DERIBIT_BASE_HOURLY_RESOLUTION = "3600"
 DERIBIT_LOCAL_AGGREGATED_RESOLUTIONS = {"14400", "1D"}
 OKX_SPOT_SYMBOLS = {"BTC": "BTC-USDT", "ETH": "ETH-USDT"}
 OKX_BAR_BY_RESOLUTION = {
-    "60": "1m",
     "3600": "1H",
     "14400": "4H",
     "1D": "1D",
@@ -41,12 +40,20 @@ DAY_ALIGN_OPTIONS = {
     "北京时间凌晨12点": 0,
     "北京时间早上8点": 8,
 }
+AUTO_REFRESH_MS = 3_600_000
+DERIBIT_VOLATILITY_CACHE_FILE_NAME = ".okx_quant_deribit_volatility_cache.json"
+DERIBIT_FULL_HISTORY_START_TS = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+DERIBIT_HOURLY_REFRESH_OVERLAP = 240
+DERIBIT_DEFAULT_VISIBLE_CANDLE_COUNT = 300
+DERIBIT_VOLATILITY_UI_STATE_KEY = "_ui_state"
 
 
 @dataclass(frozen=True)
 class DeribitMarketSnapshot:
     currency: str
     resolution: str
+    day_align_label: str
+    requested_limit: int
     volatility_candles: list[DeribitVolatilityCandle]
     spot_inst_id: str
     spot_candles: list[Candle]
@@ -97,6 +104,7 @@ class DeribitVolatilityWindow:
         self.client = client
         self.market_client = market_client or OkxRestClient()
         self.logger = logger
+        saved_ui_state = self._load_saved_ui_state()
 
         self.window = Toplevel(master)
         self.window.title("Deribit 波动率指数")
@@ -112,10 +120,14 @@ class DeribitVolatilityWindow:
 
         self.currency = StringVar(value="BTC")
         self.resolution_label = StringVar(value="1小时")
-        self.day_align_label = StringVar(value="北京时间凌晨12点")
+        saved_day_align_label = str(saved_ui_state.get("day_align_label") or "北京时间凌晨12点")
+        self.day_align_label = StringVar(
+            value=saved_day_align_label if saved_day_align_label in DAY_ALIGN_OPTIONS else "北京时间凌晨12点"
+        )
         self.candle_limit = StringVar(value="300")
         self.average_kline = BooleanVar(value=False)
-        self.status_text = StringVar(value="选择参数后点击“获取历史K线”。")
+        self.show_detail = BooleanVar(value=False)
+        self.status_text = StringVar(value="打开页面后自动加载历史K线，并每小时同步一次。")
         self.summary_text = StringVar(value="暂无数据。")
         self.spot_chart_title_text = StringVar(value="同币种现货K线")
 
@@ -125,14 +137,23 @@ class DeribitVolatilityWindow:
         self._chart_render_token = 0
         self._volatility_hover_state: _KlineHoverState | None = None
         self._spot_hover_state: _KlineHoverState | None = None
+        self._body_pane: ttk.Panedwindow | None = None
+        self._detail_frame: ttk.LabelFrame | None = None
+        self._detail_frame_added = False
+        self._auto_refresh_job: str | None = None
+        self._request_token = 0
+        self._pending_refresh_after_load = False
 
         self._build_layout()
-        self.window.protocol("WM_DELETE_WINDOW", self.window.withdraw)
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.window.after(50, self._bootstrap_initial_load)
 
     def show(self) -> None:
         self.window.deiconify()
         self.window.lift()
         self.window.focus_force()
+        self._schedule_auto_refresh()
+        self._refresh_for_current_selection(use_cache=True, force_network=True)
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
@@ -144,12 +165,14 @@ class DeribitVolatilityWindow:
             controls.columnconfigure(column, weight=1)
 
         ttk.Label(controls, text="币种").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(controls, textvariable=self.currency, values=DERIBIT_CURRENCY_OPTIONS, state="readonly").grid(
+        currency_combo = ttk.Combobox(controls, textvariable=self.currency, values=DERIBIT_CURRENCY_OPTIONS, state="readonly")
+        currency_combo.grid(
             row=0,
             column=1,
             sticky="ew",
             padx=(0, 12),
         )
+        currency_combo.bind("<<ComboboxSelected>>", self._on_selection_changed, add="+")
         ttk.Label(controls, text="周期").grid(row=0, column=2, sticky="w")
         self.resolution_combo = ttk.Combobox(
             controls,
@@ -158,7 +181,7 @@ class DeribitVolatilityWindow:
             state="readonly",
         )
         self.resolution_combo.grid(row=0, column=3, sticky="ew", padx=(0, 12))
-        self.resolution_combo.bind("<<ComboboxSelected>>", self._on_resolution_changed, add="+")
+        self.resolution_combo.bind("<<ComboboxSelected>>", self._on_selection_changed, add="+")
         ttk.Label(controls, text="日线对齐").grid(row=0, column=4, sticky="w")
         self.day_align_combo = ttk.Combobox(
             controls,
@@ -167,8 +190,12 @@ class DeribitVolatilityWindow:
             state="readonly",
         )
         self.day_align_combo.grid(row=0, column=5, sticky="ew", padx=(0, 12))
+        self.day_align_combo.bind("<<ComboboxSelected>>", self._on_selection_changed, add="+")
         ttk.Label(controls, text="K线数量").grid(row=0, column=6, sticky="w")
-        ttk.Entry(controls, textvariable=self.candle_limit).grid(row=0, column=7, sticky="ew", padx=(0, 12))
+        candle_limit_entry = ttk.Entry(controls, textvariable=self.candle_limit)
+        candle_limit_entry.grid(row=0, column=7, sticky="ew", padx=(0, 12))
+        candle_limit_entry.bind("<Return>", self._on_limit_changed, add="+")
+        candle_limit_entry.bind("<FocusOut>", self._on_limit_changed, add="+")
         ttk.Checkbutton(
             controls,
             text="平均K线",
@@ -180,15 +207,22 @@ class DeribitVolatilityWindow:
         ttk.Label(controls, textvariable=self.status_text, wraplength=980, justify="left").grid(
             row=1,
             column=0,
-            columnspan=7,
+            columnspan=6,
             sticky="w",
             pady=(12, 0),
         )
-        ttk.Button(controls, text="获取历史K线", command=self.fetch_history).grid(row=1, column=7, sticky="e", pady=(12, 0))
+        ttk.Checkbutton(
+            controls,
+            text="显示历史明细",
+            variable=self.show_detail,
+            command=self._toggle_detail_visibility,
+        ).grid(row=1, column=6, sticky="w", pady=(12, 0))
+        ttk.Button(controls, text="立即刷新", command=self.fetch_history).grid(row=1, column=7, sticky="e", pady=(12, 0))
         ttk.Button(controls, text="导出CSV", command=self.export_csv).grid(row=1, column=8, sticky="e", pady=(12, 0))
 
         body = ttk.Panedwindow(self.window, orient="vertical")
         body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        self._body_pane = body
 
         charts_frame = ttk.LabelFrame(body, text="Deribit 波动率指数与同币种现货K线", padding=12)
         charts_frame.columnconfigure(0, weight=1)
@@ -233,7 +267,7 @@ class DeribitVolatilityWindow:
         self.detail_notebook.grid(row=0, column=0, sticky="nsew")
         self.volatility_tree = self._build_detail_tree(self.detail_notebook, tab_text="波动率明细")
         self.spot_tree = self._build_detail_tree(self.detail_notebook, tab_text="现货明细")
-        body.add(detail_frame, weight=1)
+        self._detail_frame = detail_frame
         self._on_resolution_changed()
 
     def _build_detail_tree(self, notebook: ttk.Notebook, *, tab_text: str) -> ttk.Treeview:
@@ -258,141 +292,160 @@ class DeribitVolatilityWindow:
         return tree
 
     def fetch_history(self) -> None:
-        if self._loading:
-            return
-        try:
-            limit = int(self.candle_limit.get().strip())
-        except ValueError:
-            messagebox.showerror("参数错误", "K线数量必须是整数。", parent=self.window)
-            return
-        if limit <= 0 or limit > 10000:
-            messagebox.showerror("参数错误", "K线数量必须在 1 到 10000 之间。", parent=self.window)
-            return
+        self._refresh_for_current_selection(use_cache=False, force_network=True)
 
+    def _bootstrap_initial_load(self) -> None:
+        self._on_resolution_changed()
+        self._refresh_for_current_selection(use_cache=True, force_network=True)
+        self._schedule_auto_refresh()
+
+    def _refresh_for_current_selection(self, *, use_cache: bool, force_network: bool) -> None:
+        limit = self._validated_limit()
+        if limit is None:
+            return
         currency = self.currency.get().strip().upper()
         resolution = DERIBIT_RESOLUTION_OPTIONS[self.resolution_label.get()]
-        now_ts = int(datetime.now().timestamp() * 1000)
-        span_seconds = DERIBIT_RESOLUTION_SECONDS[resolution] * max(limit + 8, 16)
-        start_ts = now_ts - (span_seconds * 1000)
+        day_align_label = self.day_align_label.get().strip()
+        cached: DeribitMarketSnapshot | None = None
+        if use_cache:
+            cached = self._load_cached_snapshot(currency, resolution, day_align_label, limit)
+            if cached is not None:
+                self._apply_snapshot(cached, request_token=None, from_cache=True)
+                if not force_network:
+                    return
+        if self._loading:
+            self._pending_refresh_after_load = True
+            return
 
         self._loading = True
+        self._pending_refresh_after_load = False
         self.status_text.set("正在获取 Deribit 波动率K线和同币种现货K线，请稍候...")
+        self._request_token += 1
+        request_token = self._request_token
         threading.Thread(
             target=self._fetch_worker,
-            args=(currency, resolution, start_ts, now_ts, limit),
+            args=(currency, resolution, day_align_label, limit, request_token),
             daemon=True,
         ).start()
 
     def _on_resolution_changed(self, _event=None) -> None:
         is_daily = DERIBIT_RESOLUTION_OPTIONS.get(self.resolution_label.get()) == "1D"
         self.day_align_combo.configure(state="readonly" if is_daily else "disabled")
+        if not is_daily:
+            self.day_align_label.set("北京时间凌晨12点")
 
-    def _fetch_worker(self, currency: str, resolution: str, start_ts: int, end_ts: int, limit: int) -> None:
-        try:
-            volatility_candles = self._fetch_volatility_candles(currency, resolution, start_ts, end_ts, limit)
-            spot_inst_id = OKX_SPOT_SYMBOLS[currency]
-            spot_candles = self._fetch_spot_candles(spot_inst_id, resolution, limit)
-            aligned_volatility, aligned_spot = _align_candles_by_timestamp(volatility_candles, spot_candles)
-            snapshot = DeribitMarketSnapshot(
-                currency=currency,
-                resolution=resolution,
-                volatility_candles=volatility_candles,
-                spot_inst_id=spot_inst_id,
-                spot_candles=spot_candles,
-                aligned_volatility_candles=aligned_volatility,
-                aligned_spot_candles=aligned_spot,
-                fetched_at=datetime.now(),
-            )
-            self.window.after(0, lambda data=snapshot: self._apply_snapshot(data))
-        except Exception as exc:
-            self.window.after(0, lambda error=exc: self._show_fetch_error(error))
+    def _on_selection_changed(self, _event=None) -> None:
+        self._save_ui_state()
+        self._on_resolution_changed()
+        self._refresh_for_current_selection(use_cache=True, force_network=False)
 
-    def _fetch_volatility_candles(
+    def _on_limit_changed(self, _event=None) -> None:
+        self._refresh_for_current_selection(use_cache=True, force_network=False)
+
+    def _fetch_worker(
         self,
         currency: str,
         resolution: str,
-        start_ts: int,
-        end_ts: int,
+        day_align_label: str,
         limit: int,
-    ) -> list[DeribitVolatilityCandle]:
-        if resolution in DERIBIT_LOCAL_AGGREGATED_RESOLUTIONS:
-            base_resolution = "3600"
-            multiplier = 4 if resolution == "14400" else 24
-            base_start_ts = max(0, start_ts - (DERIBIT_RESOLUTION_SECONDS[resolution] * 1000))
-            base_candles = self.client.get_volatility_index_candles(
-                currency,
-                base_resolution,
-                start_ts=base_start_ts,
-                end_ts=end_ts,
-                max_records=max(limit * multiplier + 48, 96),
+        request_token: int,
+    ) -> None:
+        try:
+            spot_inst_id = OKX_SPOT_SYMBOLS[currency]
+            cached_hourly = self._load_cached_hourly_series(currency)
+            now_ts = int(datetime.now().timestamp() * 1000)
+            cache_needs_full_backfill = (
+                cached_hourly is None
+                or not cached_hourly[1]
+                or not cached_hourly[2]
+                or cached_hourly[1][0].ts > DERIBIT_FULL_HISTORY_START_TS + 3_600_000
+                or cached_hourly[2][0].ts > DERIBIT_FULL_HISTORY_START_TS + 3_600_000
             )
-            if resolution == "1D":
-                four_hour_candles = _aggregate_candles_to_resolution(
-                    base_candles,
-                    14_400_000,
-                    anchor_offset_ms=self._daily_anchor_offset_ms(),
-                )
-                candles = _aggregate_candles_to_resolution(
-                    four_hour_candles,
-                    86_400_000,
-                    anchor_offset_ms=self._daily_anchor_offset_ms(),
-                )
+            if cache_needs_full_backfill:
+                fetch_start_ts = DERIBIT_FULL_HISTORY_START_TS
             else:
-                candles = _aggregate_candles_to_resolution(
-                    base_candles,
-                    14_400_000,
-                    anchor_offset_ms=0,
+                fetch_start_ts = max(
+                    DERIBIT_FULL_HISTORY_START_TS,
+                    now_ts - (max(DERIBIT_HOURLY_REFRESH_OVERLAP, 96) * DERIBIT_RESOLUTION_SECONDS[DERIBIT_BASE_HOURLY_RESOLUTION] * 1000),
                 )
-            candles = [candle for candle in candles if start_ts <= candle.ts <= end_ts]
-            return candles[-limit:] if limit > 0 else candles
-        return self.client.get_volatility_index_candles(
-            currency,
-            resolution,
-            start_ts=start_ts,
-            end_ts=end_ts,
-            max_records=limit,
-        )
+            fetched_volatility = self.client.get_volatility_index_candles(
+                currency,
+                DERIBIT_BASE_HOURLY_RESOLUTION,
+                start_ts=fetch_start_ts,
+                end_ts=now_ts,
+                max_records=None,
+            )
+            fetched_spot = self.market_client.get_candles_history_range(
+                spot_inst_id,
+                "1H",
+                start_ts=fetch_start_ts,
+                end_ts=now_ts,
+                limit=_hourly_history_limit(fetch_start_ts, now_ts),
+            )
+            fetched_spot = [candle for candle in fetched_spot if candle.confirmed]
 
-    def _fetch_spot_candles(self, inst_id: str, resolution: str, limit: int) -> list[Candle]:
-        okx_bar = OKX_BAR_BY_RESOLUTION[resolution]
-        if resolution in DERIBIT_LOCAL_AGGREGATED_RESOLUTIONS:
-            multiplier = 4 if resolution == "14400" else 24
-            base_candles = self.market_client.get_candles_history(inst_id, "1H", limit=max(limit * multiplier + 48, 96))
-            confirmed = [candle for candle in base_candles if candle.confirmed]
-            if resolution == "1D":
-                four_hour_candles = _aggregate_price_candles_to_resolution(
-                    confirmed,
-                    14_400_000,
-                    anchor_offset_ms=self._daily_anchor_offset_ms(),
-                )
-                candles = _aggregate_price_candles_to_resolution(
-                    four_hour_candles,
-                    86_400_000,
-                    anchor_offset_ms=self._daily_anchor_offset_ms(),
-                )
+            if cached_hourly is not None:
+                _, cached_volatility, cached_spot, _ = cached_hourly
+                volatility_hourly = _merge_deribit_candles(cached_volatility, fetched_volatility)
+                spot_hourly = _merge_price_candles(cached_spot, fetched_spot)
             else:
-                candles = _aggregate_price_candles_to_resolution(
-                    confirmed,
-                    14_400_000,
-                    anchor_offset_ms=0,
-                )
-        else:
-            candles = self.market_client.get_candles_history(inst_id, okx_bar, limit=limit)
-            candles = [candle for candle in candles if candle.confirmed]
-        return candles[-limit:]
+                volatility_hourly = list(fetched_volatility)
+                spot_hourly = list(fetched_spot)
+            fetched_at = datetime.now()
+            self._save_cached_hourly_series(
+                currency,
+                spot_inst_id=spot_inst_id,
+                volatility_candles=volatility_hourly,
+                spot_candles=spot_hourly,
+                fetched_at=fetched_at,
+            )
+            snapshot = self._build_snapshot_from_hourly(
+                currency=currency,
+                resolution=resolution,
+                day_align_label=day_align_label,
+                requested_limit=limit,
+                spot_inst_id=spot_inst_id,
+                volatility_hourly=volatility_hourly,
+                spot_hourly=spot_hourly,
+                fetched_at=fetched_at,
+            )
+            self.window.after(
+                0,
+                lambda data=snapshot, token=request_token: self._apply_snapshot(
+                    data,
+                    request_token=token,
+                    from_cache=False,
+                ),
+            )
+        except Exception as exc:
+            self.window.after(0, lambda error=exc, token=request_token: self._show_fetch_error(error, token))
 
-    def _apply_snapshot(self, snapshot: DeribitMarketSnapshot) -> None:
+    def _apply_snapshot(
+        self,
+        snapshot: DeribitMarketSnapshot,
+        *,
+        request_token: int | None,
+        from_cache: bool,
+    ) -> None:
+        if request_token is not None and request_token != self._request_token:
+            return
+        if not self._snapshot_matches_current_selection(snapshot):
+            return
         self._loading = False
         self._latest_snapshot = snapshot
-        self._chart_viewport = _ChartViewport()
+        self._set_default_chart_view(snapshot)
         self._clear_linked_hover()
-        _fill_deribit_tree(self.volatility_tree, snapshot.aligned_volatility_candles)
-        _fill_price_tree(self.spot_tree, snapshot.aligned_spot_candles)
+        if self.show_detail.get():
+            self._refresh_detail_trees(snapshot)
 
-        resolution_text = self.resolution_label.get()
+        resolution_text = _resolution_label_for_value(snapshot.resolution)
         local_note = self._local_note_for_resolution(snapshot.resolution)
         self.spot_chart_title_text.set(f"{snapshot.spot_inst_id} 现货K线 | {resolution_text}{local_note}")
-        self.status_text.set("Deribit 波动率K线与同币种现货K线获取完成，支持滚轮缩放、左键拖动、双击重置视图和联动十字光标。")
+        self.status_text.set(
+            "已从本地缓存恢复图表，并在后台继续同步最新数据。"
+            if from_cache
+            else "Deribit 波动率K线与同币种现货K线获取完成，支持滚轮缩放、左键拖动、双图联动十字光标。"
+        )
         if snapshot.aligned_volatility_candles and snapshot.aligned_spot_candles:
             self.summary_text.set(
                 f"{snapshot.currency} | 周期 {resolution_text}{local_note} | "
@@ -409,9 +462,13 @@ class DeribitVolatilityWindow:
                 f"[Deribit波动率指数] 已加载 {snapshot.currency} {resolution_text}{local_note} | "
                 f"波动率={len(snapshot.volatility_candles)} | 现货={len(snapshot.spot_candles)} | 共同={len(snapshot.aligned_volatility_candles)}"
             )
+        self._schedule_auto_refresh()
+        if self._pending_refresh_after_load:
+            self._pending_refresh_after_load = False
+            self.window.after(10, lambda: self._refresh_for_current_selection(use_cache=True, force_network=True))
 
-    def _daily_anchor_offset_ms(self) -> int:
-        anchor_hour = DAY_ALIGN_OPTIONS.get(self.day_align_label.get(), 0)
+    def _daily_anchor_offset_ms(self, day_align_label: str) -> int:
+        anchor_hour = DAY_ALIGN_OPTIONS.get(day_align_label, 0)
         utc_hour = (anchor_hour - 8) % 24
         return utc_hour * 3_600_000
 
@@ -422,10 +479,15 @@ class DeribitVolatilityWindow:
             return "（本地聚合）"
         return ""
 
-    def _show_fetch_error(self, exc: Exception) -> None:
+    def _show_fetch_error(self, exc: Exception, request_token: int) -> None:
+        if request_token != self._request_token:
+            return
         self._loading = False
         self.status_text.set("Deribit 波动率指数历史K线获取失败。")
         messagebox.showerror("获取失败", str(exc), parent=self.window)
+        if self._pending_refresh_after_load:
+            self._pending_refresh_after_load = False
+            self.window.after(10, lambda: self._refresh_for_current_selection(use_cache=True, force_network=True))
 
     def export_csv(self) -> None:
         if self._latest_snapshot is None or not self._latest_snapshot.aligned_volatility_candles:
@@ -452,11 +514,318 @@ class DeribitVolatilityWindow:
 
         messagebox.showinfo("导出成功", f"已导出到：\n{vol_path}\n{spot_path}", parent=self.window)
 
+    def _toggle_detail_visibility(self) -> None:
+        if self._body_pane is None or self._detail_frame is None:
+            return
+        if self.show_detail.get():
+            if not self._detail_frame_added:
+                self._body_pane.add(self._detail_frame, weight=1)
+                self._detail_frame_added = True
+                total_height = max(self._body_pane.winfo_height(), 640)
+                self.window.after(10, lambda: self._body_pane.sashpos(0, int(total_height * 0.72)))
+            if self._latest_snapshot is not None:
+                self._refresh_detail_trees(self._latest_snapshot)
+        elif self._detail_frame_added:
+            self._body_pane.forget(self._detail_frame)
+            self._detail_frame_added = False
+
+    def _refresh_detail_trees(self, snapshot: DeribitMarketSnapshot) -> None:
+        _fill_deribit_tree(self.volatility_tree, snapshot.aligned_volatility_candles)
+        _fill_price_tree(self.spot_tree, snapshot.aligned_spot_candles)
+
+    def _validated_limit(self) -> int | None:
+        try:
+            limit = int(self.candle_limit.get().strip())
+        except ValueError:
+            messagebox.showerror("参数错误", "K线数量必须是整数。", parent=self.window)
+            return None
+        resolution = DERIBIT_RESOLUTION_OPTIONS.get(self.resolution_label.get(), self.resolution_label.get())
+        max_limit = _max_limit_for_resolution_value(resolution)
+        if limit <= 0 or limit > max_limit:
+            messagebox.showerror("参数错误", f"K线数量必须在 1 到 {max_limit} 之间。", parent=self.window)
+            return None
+        return limit
+
+    def _on_close(self) -> None:
+        self._cancel_auto_refresh()
+        self.window.withdraw()
+
+    def _schedule_auto_refresh(self) -> None:
+        self._cancel_auto_refresh()
+        if not self.window.winfo_exists() or self.window.state() == "withdrawn":
+            return
+        self._auto_refresh_job = self.window.after(AUTO_REFRESH_MS, self._auto_refresh)
+
+    def _cancel_auto_refresh(self) -> None:
+        if self._auto_refresh_job is not None and self.window.winfo_exists():
+            self.window.after_cancel(self._auto_refresh_job)
+        self._auto_refresh_job = None
+
+    def _auto_refresh(self) -> None:
+        self._auto_refresh_job = None
+        if not self.window.winfo_exists() or self.window.state() == "withdrawn":
+            return
+        self._refresh_for_current_selection(use_cache=True, force_network=True)
+
+    def _cache_file_path(self) -> Path:
+        return Path(__file__).resolve().parent.parent / DERIBIT_VOLATILITY_CACHE_FILE_NAME
+
+    def _cache_key(self, currency: str, resolution: str, day_align_label: str) -> str:
+        return f"{currency}|{resolution}|{day_align_label if resolution == '1D' else ''}"
+
+    def _hourly_cache_key(self, currency: str) -> str:
+        return f"{currency}|hourly_base"
+
+    def _load_saved_ui_state(self) -> dict:
+        payload = self._load_cache_payload()
+        item = payload.get(DERIBIT_VOLATILITY_UI_STATE_KEY)
+        return item if isinstance(item, dict) else {}
+
+    def _save_ui_state(self) -> None:
+        cache_path = self._cache_file_path()
+        payload = self._load_cache_payload()
+        payload[DERIBIT_VOLATILITY_UI_STATE_KEY] = {
+            "day_align_label": self.day_align_label.get().strip(),
+        }
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _load_cache_payload(self) -> dict:
+        cache_path = self._cache_file_path()
+        if not cache_path.exists():
+            return {}
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    def _load_cached_snapshot(
+        self,
+        currency: str,
+        resolution: str,
+        day_align_label: str,
+        limit: int,
+    ) -> DeribitMarketSnapshot | None:
+        payload = self._load_cache_payload()
+        hourly_series = self._load_cached_hourly_series(currency, payload=payload)
+        if hourly_series is not None:
+            spot_inst_id, volatility_hourly, spot_hourly, fetched_at = hourly_series
+            return self._build_snapshot_from_hourly(
+                currency=currency,
+                resolution=resolution,
+                day_align_label=day_align_label,
+                requested_limit=limit,
+                spot_inst_id=spot_inst_id,
+                volatility_hourly=volatility_hourly,
+                spot_hourly=spot_hourly,
+                fetched_at=fetched_at,
+            )
+
+        item = payload.get(self._cache_key(currency, resolution, day_align_label))
+        if not isinstance(item, dict):
+            return None
+        try:
+            volatility_candles = [
+                DeribitVolatilityCandle(
+                    ts=int(candle["ts"]),
+                    open=Decimal(str(candle["open"])),
+                    high=Decimal(str(candle["high"])),
+                    low=Decimal(str(candle["low"])),
+                    close=Decimal(str(candle["close"])),
+                )
+                for candle in item.get("volatility_candles", [])
+            ][-limit:]
+            spot_candles = [
+                Candle(
+                    ts=int(candle["ts"]),
+                    open=Decimal(str(candle["open"])),
+                    high=Decimal(str(candle["high"])),
+                    low=Decimal(str(candle["low"])),
+                    close=Decimal(str(candle["close"])),
+                    volume=Decimal(str(candle.get("volume", "0"))),
+                    confirmed=bool(candle.get("confirmed", True)),
+                )
+                for candle in item.get("spot_candles", [])
+            ][-limit:]
+            if not volatility_candles or not spot_candles:
+                return None
+            aligned_volatility, aligned_spot = _align_candles_by_timestamp(volatility_candles, spot_candles)
+            return DeribitMarketSnapshot(
+                currency=currency,
+                resolution=resolution,
+                day_align_label=day_align_label,
+                requested_limit=limit,
+                volatility_candles=volatility_candles,
+                spot_inst_id=str(item.get("spot_inst_id", OKX_SPOT_SYMBOLS[currency])),
+                spot_candles=spot_candles,
+                aligned_volatility_candles=aligned_volatility,
+                aligned_spot_candles=aligned_spot,
+                fetched_at=datetime.fromisoformat(str(item["fetched_at"])),
+            )
+        except Exception:
+            return None
+
+    def _load_cached_hourly_series(
+        self,
+        currency: str,
+        *,
+        payload: dict | None = None,
+    ) -> tuple[str, list[DeribitVolatilityCandle], list[Candle], datetime] | None:
+        cache_payload = payload if payload is not None else self._load_cache_payload()
+        item = cache_payload.get(self._hourly_cache_key(currency))
+        if not isinstance(item, dict):
+            return None
+        try:
+            volatility_candles = [
+                DeribitVolatilityCandle(
+                    ts=int(candle["ts"]),
+                    open=Decimal(str(candle["open"])),
+                    high=Decimal(str(candle["high"])),
+                    low=Decimal(str(candle["low"])),
+                    close=Decimal(str(candle["close"])),
+                )
+                for candle in item.get("volatility_hourly", [])
+            ]
+            spot_candles = [
+                Candle(
+                    ts=int(candle["ts"]),
+                    open=Decimal(str(candle["open"])),
+                    high=Decimal(str(candle["high"])),
+                    low=Decimal(str(candle["low"])),
+                    close=Decimal(str(candle["close"])),
+                    volume=Decimal(str(candle.get("volume", "0"))),
+                    confirmed=bool(candle.get("confirmed", True)),
+                )
+                for candle in item.get("spot_hourly", [])
+            ]
+            if not volatility_candles or not spot_candles:
+                return None
+            return (
+                str(item.get("spot_inst_id", OKX_SPOT_SYMBOLS[currency])),
+                volatility_candles,
+                [candle for candle in spot_candles if candle.confirmed],
+                datetime.fromisoformat(str(item["fetched_at"])),
+            )
+        except Exception:
+            return None
+
+    def _save_cached_hourly_series(
+        self,
+        currency: str,
+        *,
+        spot_inst_id: str,
+        volatility_candles: list[DeribitVolatilityCandle],
+        spot_candles: list[Candle],
+        fetched_at: datetime,
+    ) -> None:
+        cache_path = self._cache_file_path()
+        payload = self._load_cache_payload()
+        payload[self._hourly_cache_key(currency)] = {
+            "spot_inst_id": spot_inst_id,
+            "fetched_at": fetched_at.isoformat(),
+            "volatility_hourly": [
+                {
+                    "ts": candle.ts,
+                    "open": str(candle.open),
+                    "high": str(candle.high),
+                    "low": str(candle.low),
+                    "close": str(candle.close),
+                }
+                for candle in volatility_candles
+            ],
+            "spot_hourly": [
+                {
+                    "ts": candle.ts,
+                    "open": str(candle.open),
+                    "high": str(candle.high),
+                    "low": str(candle.low),
+                    "close": str(candle.close),
+                    "volume": str(candle.volume),
+                    "confirmed": candle.confirmed,
+                }
+                for candle in spot_candles
+            ],
+        }
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+    def _build_snapshot_from_hourly(
+        self,
+        *,
+        currency: str,
+        resolution: str,
+        day_align_label: str,
+        requested_limit: int,
+        spot_inst_id: str,
+        volatility_hourly: list[DeribitVolatilityCandle],
+        spot_hourly: list[Candle],
+        fetched_at: datetime,
+    ) -> DeribitMarketSnapshot:
+        if resolution == DERIBIT_BASE_HOURLY_RESOLUTION:
+            volatility_candles = list(volatility_hourly)
+            spot_candles = list(candle for candle in spot_hourly if candle.confirmed)
+        elif resolution == "14400":
+            volatility_candles = _aggregate_candles_to_resolution(volatility_hourly, 14_400_000)
+            spot_candles = _aggregate_price_candles_to_resolution(
+                [candle for candle in spot_hourly if candle.confirmed],
+                14_400_000,
+            )
+        else:
+            anchor_offset_ms = self._daily_anchor_offset_ms(day_align_label)
+            volatility_4h = _aggregate_candles_to_resolution(volatility_hourly, 14_400_000)
+            spot_4h = _aggregate_price_candles_to_resolution(
+                [candle for candle in spot_hourly if candle.confirmed],
+                14_400_000,
+            )
+            volatility_candles = _aggregate_candles_to_resolution(
+                volatility_4h,
+                86_400_000,
+                anchor_offset_ms=anchor_offset_ms,
+            )
+            spot_candles = _aggregate_price_candles_to_resolution(
+                spot_4h,
+                86_400_000,
+                anchor_offset_ms=anchor_offset_ms,
+            )
+
+        aligned_volatility, aligned_spot = _align_candles_by_timestamp(volatility_candles, spot_candles)
+        return DeribitMarketSnapshot(
+            currency=currency,
+            resolution=resolution,
+            day_align_label=day_align_label,
+            requested_limit=requested_limit,
+            volatility_candles=volatility_candles,
+            spot_inst_id=spot_inst_id,
+            spot_candles=spot_candles,
+            aligned_volatility_candles=aligned_volatility,
+            aligned_spot_candles=aligned_spot,
+            fetched_at=fetched_at,
+        )
+
+    def _snapshot_matches_current_selection(self, snapshot: DeribitMarketSnapshot) -> bool:
+        limit = self._validated_limit()
+        if limit is None:
+            return False
+        current_resolution = DERIBIT_RESOLUTION_OPTIONS.get(self.resolution_label.get(), self.resolution_label.get())
+        return (
+            snapshot.currency == self.currency.get().strip().upper()
+            and snapshot.resolution == current_resolution
+            and snapshot.day_align_label == self.day_align_label.get().strip()
+            and snapshot.requested_limit == limit
+        )
+
     def reset_chart_view(self) -> None:
         if self._latest_snapshot is None:
             return
-        self._chart_viewport = _ChartViewport()
+        self._set_default_chart_view(self._latest_snapshot)
         self._draw_linked_charts(self._latest_snapshot)
+
+    def _set_default_chart_view(self, snapshot: DeribitMarketSnapshot) -> None:
+        start_index, visible_count = _default_chart_viewport(
+            len(snapshot.aligned_volatility_candles),
+            snapshot.requested_limit,
+            min_visible=24,
+        )
+        self._chart_viewport = _ChartViewport(start_index=start_index, visible_count=visible_count)
 
     def _on_chart_style_changed(self) -> None:
         if self._latest_snapshot is None:
@@ -707,9 +1076,9 @@ class DeribitVolatilityWindow:
             f"L {format_decimal_fixed(candle.low, state.places)}",
             f"C {format_decimal_fixed(candle.close, state.places)}{state.value_suffix}",
         )
-        line_height = 13
-        tooltip_width = max(92, max(len(line) for line in lines) * 5 + 12)
-        tooltip_height = 6 + (line_height * len(lines))
+        line_height = 16
+        tooltip_width = max(116, max(len(line) for line in lines) * 6 + 18)
+        tooltip_height = 10 + (line_height * len(lines))
         mid_x = (state.bounds.left + state.bounds.right) / 2
         if x <= mid_x:
             tooltip_left = state.bounds.right - tooltip_width - 10
@@ -721,18 +1090,18 @@ class DeribitVolatilityWindow:
             tooltip_top,
             tooltip_left + tooltip_width,
             tooltip_top + tooltip_height,
-            fill="#0b1220",
-            outline="#1f2937",
+            fill="#030712",
+            outline="#111827",
             tags="hover-overlay",
         )
         for line_index, line in enumerate(lines):
             canvas.create_text(
-                tooltip_left + 6,
-                tooltip_top + 4 + (line_index * line_height),
+                tooltip_left + 9,
+                tooltip_top + 7 + (line_index * line_height),
                 text=line,
                 anchor="nw",
                 fill="#f9fafb",
-                font=("Consolas", 7),
+                font=("Consolas", 9, "bold"),
                 tags="hover-overlay",
             )
 
@@ -842,6 +1211,38 @@ def _aggregate_price_candles_to_resolution(
     return aggregated
 
 
+def _required_hourly_limit(resolution: str, requested_limit: int) -> int:
+    multiplier = 1
+    if resolution == "14400":
+        multiplier = 4
+    elif resolution == "1D":
+        multiplier = 24
+    return max((requested_limit * multiplier) + 48, 120)
+
+
+def _hourly_history_limit(start_ts: int, end_ts: int) -> int:
+    if end_ts <= start_ts:
+        return 1
+    return max(1, int(((end_ts - start_ts) // 3_600_000) + 2))
+
+
+def _merge_deribit_candles(
+    existing: list[DeribitVolatilityCandle],
+    incoming: list[DeribitVolatilityCandle],
+) -> list[DeribitVolatilityCandle]:
+    merged: dict[int, DeribitVolatilityCandle] = {candle.ts: candle for candle in existing}
+    for candle in incoming:
+        merged[candle.ts] = candle
+    return [merged[ts] for ts in sorted(merged)]
+
+
+def _merge_price_candles(existing: list[Candle], incoming: list[Candle]) -> list[Candle]:
+    merged: dict[int, Candle] = {candle.ts: candle for candle in existing}
+    for candle in incoming:
+        merged[candle.ts] = candle
+    return [merged[ts] for ts in sorted(merged)]
+
+
 def _to_average_volatility_candles(candles: list[DeribitVolatilityCandle]) -> list[DeribitVolatilityCandle]:
     if not candles:
         return []
@@ -908,6 +1309,19 @@ def _resolution_file_label(label: str) -> str:
     return label.replace("小时", "h").replace("分钟", "m").replace("天", "d").replace("秒", "s")
 
 
+def _resolution_label_for_value(value: str) -> str:
+    for label, resolution in DERIBIT_RESOLUTION_OPTIONS.items():
+        if resolution == value:
+            return label
+    return value
+
+
+def _max_limit_for_resolution_value(value: str) -> int:
+    if value == "3600":
+        return 30000
+    return 10000
+
+
 def _format_ts(ts: int) -> str:
     return datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -954,8 +1368,16 @@ def _normalize_chart_viewport(
     if total_count <= 0:
         return 0, max(min_visible, 1)
     normalized_visible = visible_count if visible_count is not None else total_count
-    normalized_visible = max(min_visible, min(total_count, normalized_visible))
+    normalized_visible = min(total_count, max(min_visible, normalized_visible))
     normalized_start = max(0, min(start_index, total_count - normalized_visible))
+    return normalized_start, normalized_visible
+
+
+def _default_chart_viewport(total_count: int, requested_limit: int, *, min_visible: int) -> tuple[int, int]:
+    if total_count <= 0:
+        return 0, max(min_visible, 1)
+    normalized_visible = min(total_count, max(min_visible, requested_limit))
+    normalized_start = max(0, total_count - normalized_visible)
     return normalized_start, normalized_visible
 
 

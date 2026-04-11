@@ -538,7 +538,7 @@ class QuantApp:
         body.add(sessions_frame, weight=3)
 
         launcher_frame.columnconfigure(0, weight=1)
-        launcher_frame.rowconfigure(1, weight=1)
+        launcher_frame.rowconfigure(1, weight=0)
         sessions_frame.columnconfigure(0, weight=1)
         sessions_frame.rowconfigure(0, weight=1)
 
@@ -664,7 +664,7 @@ class QuantApp:
         ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(14, 0))
 
         strategy_info = ttk.LabelFrame(launcher_frame, text="策略说明", padding=16)
-        strategy_info.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        strategy_info.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         strategy_info.columnconfigure(0, weight=1)
 
         ttk.Label(strategy_info, text="策略简介", font=("Microsoft YaHei UI", 11, "bold")).grid(
