@@ -18,30 +18,28 @@ from okx_quant.window_layout import apply_adaptive_window_geometry
 
 DERIBIT_CURRENCY_OPTIONS = ("BTC", "ETH")
 DERIBIT_RESOLUTION_OPTIONS = {
-    "1秒": "1",
     "1分钟": "60",
     "1小时": "3600",
     "4小时": "14400",
-    "12小时": "43200",
     "1天": "1D",
 }
 DERIBIT_RESOLUTION_SECONDS = {
-    "1": 1,
     "60": 60,
     "3600": 3_600,
     "14400": 14_400,
-    "43200": 43_200,
     "1D": 86_400,
 }
-DERIBIT_LOCAL_AGGREGATED_RESOLUTIONS = {"14400"}
+DERIBIT_LOCAL_AGGREGATED_RESOLUTIONS = {"14400", "1D"}
 OKX_SPOT_SYMBOLS = {"BTC": "BTC-USDT", "ETH": "ETH-USDT"}
 OKX_BAR_BY_RESOLUTION = {
-    "1": "1s",
     "60": "1m",
     "3600": "1H",
     "14400": "4H",
-    "43200": "12H",
     "1D": "1D",
+}
+DAY_ALIGN_OPTIONS = {
+    "北京时间凌晨12点": 0,
+    "北京时间早上8点": 8,
 }
 
 
@@ -84,6 +82,7 @@ class _KlineHoverState:
     y_positions: tuple[float, ...]
     title: str
     value_suffix: str
+    places: int
 
 
 class DeribitVolatilityWindow:
@@ -113,6 +112,7 @@ class DeribitVolatilityWindow:
 
         self.currency = StringVar(value="BTC")
         self.resolution_label = StringVar(value="1小时")
+        self.day_align_label = StringVar(value="北京时间凌晨12点")
         self.candle_limit = StringVar(value="1000")
         self.average_kline = BooleanVar(value=False)
         self.status_text = StringVar(value="选择参数后点击“获取历史K线”。")
@@ -140,7 +140,7 @@ class DeribitVolatilityWindow:
 
         controls = ttk.LabelFrame(self.window, text="查询参数", padding=16)
         controls.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
-        for column in range(8):
+        for column in range(10):
             controls.columnconfigure(column, weight=1)
 
         ttk.Label(controls, text="币种").grid(row=0, column=0, sticky="w")
@@ -151,31 +151,41 @@ class DeribitVolatilityWindow:
             padx=(0, 12),
         )
         ttk.Label(controls, text="周期").grid(row=0, column=2, sticky="w")
-        ttk.Combobox(
+        self.resolution_combo = ttk.Combobox(
             controls,
             textvariable=self.resolution_label,
             values=list(DERIBIT_RESOLUTION_OPTIONS.keys()),
             state="readonly",
-        ).grid(row=0, column=3, sticky="ew", padx=(0, 12))
-        ttk.Label(controls, text="K线数量").grid(row=0, column=4, sticky="w")
-        ttk.Entry(controls, textvariable=self.candle_limit).grid(row=0, column=5, sticky="ew", padx=(0, 12))
+        )
+        self.resolution_combo.grid(row=0, column=3, sticky="ew", padx=(0, 12))
+        self.resolution_combo.bind("<<ComboboxSelected>>", self._on_resolution_changed, add="+")
+        ttk.Label(controls, text="日线对齐").grid(row=0, column=4, sticky="w")
+        self.day_align_combo = ttk.Combobox(
+            controls,
+            textvariable=self.day_align_label,
+            values=list(DAY_ALIGN_OPTIONS.keys()),
+            state="readonly",
+        )
+        self.day_align_combo.grid(row=0, column=5, sticky="ew", padx=(0, 12))
+        ttk.Label(controls, text="K线数量").grid(row=0, column=6, sticky="w")
+        ttk.Entry(controls, textvariable=self.candle_limit).grid(row=0, column=7, sticky="ew", padx=(0, 12))
         ttk.Checkbutton(
             controls,
             text="平均K线",
             variable=self.average_kline,
             command=self._on_chart_style_changed,
-        ).grid(row=0, column=6, sticky="w")
-        ttk.Button(controls, text="重置视图", command=self.reset_chart_view).grid(row=0, column=6, sticky="e")
+        ).grid(row=0, column=8, sticky="w")
+        ttk.Button(controls, text="重置视图", command=self.reset_chart_view).grid(row=0, column=8, sticky="e")
 
         ttk.Label(controls, textvariable=self.status_text, wraplength=980, justify="left").grid(
             row=1,
             column=0,
-            columnspan=5,
+            columnspan=7,
             sticky="w",
             pady=(12, 0),
         )
-        ttk.Button(controls, text="获取历史K线", command=self.fetch_history).grid(row=1, column=5, sticky="e", pady=(12, 0))
-        ttk.Button(controls, text="导出CSV", command=self.export_csv).grid(row=1, column=6, sticky="e", pady=(12, 0))
+        ttk.Button(controls, text="获取历史K线", command=self.fetch_history).grid(row=1, column=7, sticky="e", pady=(12, 0))
+        ttk.Button(controls, text="导出CSV", command=self.export_csv).grid(row=1, column=8, sticky="e", pady=(12, 0))
 
         body = ttk.Panedwindow(self.window, orient="vertical")
         body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
@@ -223,7 +233,8 @@ class DeribitVolatilityWindow:
         self.detail_notebook.grid(row=0, column=0, sticky="nsew")
         self.volatility_tree = self._build_detail_tree(self.detail_notebook, tab_text="波动率明细")
         self.spot_tree = self._build_detail_tree(self.detail_notebook, tab_text="现货明细")
-        body.add(detail_frame, weight=2)
+        body.add(detail_frame, weight=1)
+        self._on_resolution_changed()
 
     def _build_detail_tree(self, notebook: ttk.Notebook, *, tab_text: str) -> ttk.Treeview:
         frame = ttk.Frame(notebook)
@@ -272,6 +283,10 @@ class DeribitVolatilityWindow:
             daemon=True,
         ).start()
 
+    def _on_resolution_changed(self, _event=None) -> None:
+        is_daily = DERIBIT_RESOLUTION_OPTIONS.get(self.resolution_label.get()) == "1D"
+        self.day_align_combo.configure(state="readonly" if is_daily else "disabled")
+
     def _fetch_worker(self, currency: str, resolution: str, start_ts: int, end_ts: int, limit: int) -> None:
         try:
             volatility_candles = self._fetch_volatility_candles(currency, resolution, start_ts, end_ts, limit)
@@ -301,15 +316,33 @@ class DeribitVolatilityWindow:
         limit: int,
     ) -> list[DeribitVolatilityCandle]:
         if resolution in DERIBIT_LOCAL_AGGREGATED_RESOLUTIONS:
+            base_resolution = "3600"
+            multiplier = 4 if resolution == "14400" else 24
             base_start_ts = max(0, start_ts - (DERIBIT_RESOLUTION_SECONDS[resolution] * 1000))
             base_candles = self.client.get_volatility_index_candles(
                 currency,
-                "3600",
+                base_resolution,
                 start_ts=base_start_ts,
                 end_ts=end_ts,
-                max_records=max(limit * 4 + 16, 64),
+                max_records=max(limit * multiplier + 48, 96),
             )
-            candles = _aggregate_candles_to_resolution(base_candles, 14_400_000)
+            if resolution == "1D":
+                four_hour_candles = _aggregate_candles_to_resolution(
+                    base_candles,
+                    14_400_000,
+                    anchor_offset_ms=self._daily_anchor_offset_ms(),
+                )
+                candles = _aggregate_candles_to_resolution(
+                    four_hour_candles,
+                    86_400_000,
+                    anchor_offset_ms=self._daily_anchor_offset_ms(),
+                )
+            else:
+                candles = _aggregate_candles_to_resolution(
+                    base_candles,
+                    14_400_000,
+                    anchor_offset_ms=0,
+                )
             candles = [candle for candle in candles if start_ts <= candle.ts <= end_ts]
             return candles[-limit:] if limit > 0 else candles
         return self.client.get_volatility_index_candles(
@@ -323,9 +356,26 @@ class DeribitVolatilityWindow:
     def _fetch_spot_candles(self, inst_id: str, resolution: str, limit: int) -> list[Candle]:
         okx_bar = OKX_BAR_BY_RESOLUTION[resolution]
         if resolution in DERIBIT_LOCAL_AGGREGATED_RESOLUTIONS:
-            base_candles = self.market_client.get_candles_history(inst_id, "1H", limit=max(limit * 4 + 16, 64))
+            multiplier = 4 if resolution == "14400" else 24
+            base_candles = self.market_client.get_candles_history(inst_id, "1H", limit=max(limit * multiplier + 48, 96))
             confirmed = [candle for candle in base_candles if candle.confirmed]
-            candles = _aggregate_price_candles_to_resolution(confirmed, 14_400_000)
+            if resolution == "1D":
+                four_hour_candles = _aggregate_price_candles_to_resolution(
+                    confirmed,
+                    14_400_000,
+                    anchor_offset_ms=self._daily_anchor_offset_ms(),
+                )
+                candles = _aggregate_price_candles_to_resolution(
+                    four_hour_candles,
+                    86_400_000,
+                    anchor_offset_ms=self._daily_anchor_offset_ms(),
+                )
+            else:
+                candles = _aggregate_price_candles_to_resolution(
+                    confirmed,
+                    14_400_000,
+                    anchor_offset_ms=0,
+                )
         else:
             candles = self.market_client.get_candles_history(inst_id, okx_bar, limit=limit)
             candles = [candle for candle in candles if candle.confirmed]
@@ -340,7 +390,7 @@ class DeribitVolatilityWindow:
         _fill_price_tree(self.spot_tree, snapshot.aligned_spot_candles)
 
         resolution_text = self.resolution_label.get()
-        local_note = "（本地聚合）" if snapshot.resolution in DERIBIT_LOCAL_AGGREGATED_RESOLUTIONS else ""
+        local_note = self._local_note_for_resolution(snapshot.resolution)
         self.spot_chart_title_text.set(f"{snapshot.spot_inst_id} 现货K线 | {resolution_text}{local_note}")
         self.status_text.set("Deribit 波动率K线与同币种现货K线获取完成，支持滚轮缩放、左键拖动、双击重置视图和联动十字光标。")
         if snapshot.aligned_volatility_candles and snapshot.aligned_spot_candles:
@@ -359,6 +409,18 @@ class DeribitVolatilityWindow:
                 f"[Deribit波动率指数] 已加载 {snapshot.currency} {resolution_text}{local_note} | "
                 f"波动率={len(snapshot.volatility_candles)} | 现货={len(snapshot.spot_candles)} | 共同={len(snapshot.aligned_volatility_candles)}"
             )
+
+    def _daily_anchor_offset_ms(self) -> int:
+        anchor_hour = DAY_ALIGN_OPTIONS.get(self.day_align_label.get(), 0)
+        utc_hour = (anchor_hour - 8) % 24
+        return utc_hour * 3_600_000
+
+    def _local_note_for_resolution(self, resolution: str) -> str:
+        if resolution == "1D":
+            return f"（本地4小时对齐聚合，{self.day_align_label.get()}收线）"
+        if resolution in DERIBIT_LOCAL_AGGREGATED_RESOLUTIONS:
+            return "（本地聚合）"
+        return ""
 
     def _show_fetch_error(self, exc: Exception) -> None:
         self._loading = False
@@ -580,7 +642,7 @@ class DeribitVolatilityWindow:
                 x + (body_width / 2),
                 bottom_y,
                 outline=color,
-                fill="#ffffff" if up else color,
+                fill=color,
             )
 
         for index in _sample_time_indices(len(candles)):
@@ -589,21 +651,6 @@ class DeribitVolatilityWindow:
             canvas.create_line(x, top, x, height - bottom, fill="#eef2f7", dash=(2, 4))
             canvas.create_text(x, height - bottom + 16, text=label, anchor="n", fill="#57606a")
 
-        last_candle = candles[-1]
-        canvas.create_text(
-            width - 12,
-            top + 6,
-            text=(
-                f"{title} | 最新 O {format_decimal_fixed(last_candle.open, places)} "
-                f"H {format_decimal_fixed(last_candle.high, places)} "
-                f"L {format_decimal_fixed(last_candle.low, places)} "
-                f"C {format_decimal_fixed(last_candle.close, places)}{axis_suffix}"
-            ),
-            anchor="ne",
-            fill="#1f2937",
-            font=("Segoe UI", 9, "bold"),
-        )
-
         return _KlineHoverState(
             bounds=_ChartBounds(left=left, top=top, right=width - right, bottom=height - bottom),
             candles=tuple(candles),
@@ -611,6 +658,7 @@ class DeribitVolatilityWindow:
             y_positions=tuple(y_positions),
             title=title,
             value_suffix=axis_suffix,
+            places=places,
         )
 
     def _on_linked_chart_motion(self, source: str, event) -> None:
@@ -649,38 +697,37 @@ class DeribitVolatilityWindow:
 
         lines = (
             _format_short_ts(candle.ts),
-            f"O {candle.open}",
-            f"H {candle.high}",
-            f"L {candle.low}",
-            f"C {candle.close}{state.value_suffix}",
+            f"O {format_decimal_fixed(candle.open, state.places)}",
+            f"H {format_decimal_fixed(candle.high, state.places)}",
+            f"L {format_decimal_fixed(candle.low, state.places)}",
+            f"C {format_decimal_fixed(candle.close, state.places)}{state.value_suffix}",
         )
-        line_height = 14
-        tooltip_width = max(112, max(len(line) for line in lines) * 6 + 14)
-        tooltip_height = 8 + (line_height * len(lines))
-        tooltip_left = x + 10
-        tooltip_top = y - tooltip_height - 6
-        if tooltip_left + tooltip_width > state.bounds.right:
-            tooltip_left = x - tooltip_width - 10
-        if tooltip_top < state.bounds.top:
-            tooltip_top = y + 6
+        line_height = 13
+        tooltip_width = max(92, max(len(line) for line in lines) * 5 + 12)
+        tooltip_height = 6 + (line_height * len(lines))
+        mid_x = (state.bounds.left + state.bounds.right) / 2
+        if x <= mid_x:
+            tooltip_left = state.bounds.right - tooltip_width - 10
+        else:
+            tooltip_left = state.bounds.left + 10
+        tooltip_top = state.bounds.top + 10
         canvas.create_rectangle(
             tooltip_left,
             tooltip_top,
             tooltip_left + tooltip_width,
             tooltip_top + tooltip_height,
-            fill="#111827",
-            outline="#374151",
-            stipple="gray50",
+            fill="#0b1220",
+            outline="#1f2937",
             tags="hover-overlay",
         )
         for line_index, line in enumerate(lines):
             canvas.create_text(
-                tooltip_left + 7,
-                tooltip_top + 5 + (line_index * line_height),
+                tooltip_left + 6,
+                tooltip_top + 4 + (line_index * line_height),
                 text=line,
                 anchor="nw",
                 fill="#f9fafb",
-                font=("Consolas", 8),
+                font=("Consolas", 7),
                 tags="hover-overlay",
             )
 
@@ -734,12 +781,17 @@ def _align_candles_by_timestamp(
     return aligned_volatility, aligned_spot
 
 
-def _aggregate_candles_to_resolution(candles: list[DeribitVolatilityCandle], resolution_ms: int) -> list[DeribitVolatilityCandle]:
+def _aggregate_candles_to_resolution(
+    candles: list[DeribitVolatilityCandle],
+    resolution_ms: int,
+    *,
+    anchor_offset_ms: int = 0,
+) -> list[DeribitVolatilityCandle]:
     if not candles:
         return []
     buckets: dict[int, list[DeribitVolatilityCandle]] = {}
     for candle in candles:
-        bucket_ts = candle.ts - (candle.ts % resolution_ms)
+        bucket_ts = ((candle.ts - anchor_offset_ms) // resolution_ms) * resolution_ms + anchor_offset_ms
         buckets.setdefault(bucket_ts, []).append(candle)
     aggregated: list[DeribitVolatilityCandle] = []
     for bucket_ts in sorted(buckets):
@@ -756,12 +808,17 @@ def _aggregate_candles_to_resolution(candles: list[DeribitVolatilityCandle], res
     return aggregated
 
 
-def _aggregate_price_candles_to_resolution(candles: list[Candle], resolution_ms: int) -> list[Candle]:
+def _aggregate_price_candles_to_resolution(
+    candles: list[Candle],
+    resolution_ms: int,
+    *,
+    anchor_offset_ms: int = 0,
+) -> list[Candle]:
     if not candles:
         return []
     buckets: dict[int, list[Candle]] = {}
     for candle in candles:
-        bucket_ts = candle.ts - (candle.ts % resolution_ms)
+        bucket_ts = ((candle.ts - anchor_offset_ms) // resolution_ms) * resolution_ms + anchor_offset_ms
         buckets.setdefault(bucket_ts, []).append(candle)
     aggregated: list[Candle] = []
     for bucket_ts in sorted(buckets):
@@ -783,23 +840,25 @@ def _aggregate_price_candles_to_resolution(candles: list[Candle], resolution_ms:
 def _to_average_volatility_candles(candles: list[DeribitVolatilityCandle]) -> list[DeribitVolatilityCandle]:
     if not candles:
         return []
+    places = _decimal_places_generic(candles)
+    quantum = Decimal("1").scaleb(-places)
     averaged: list[DeribitVolatilityCandle] = []
     previous_open: Decimal | None = None
     previous_close: Decimal | None = None
     divisor = Decimal("4")
     two = Decimal("2")
     for candle in candles:
-        average_close = (candle.open + candle.high + candle.low + candle.close) / divisor
+        average_close = ((candle.open + candle.high + candle.low + candle.close) / divisor).quantize(quantum)
         if previous_open is None or previous_close is None:
-            average_open = (candle.open + candle.close) / two
+            average_open = ((candle.open + candle.close) / two).quantize(quantum)
         else:
-            average_open = (previous_open + previous_close) / two
+            average_open = ((previous_open + previous_close) / two).quantize(quantum)
         averaged.append(
             DeribitVolatilityCandle(
                 ts=candle.ts,
                 open=average_open,
-                high=max(candle.high, average_open, average_close),
-                low=min(candle.low, average_open, average_close),
+                high=max(candle.high, average_open, average_close).quantize(quantum),
+                low=min(candle.low, average_open, average_close).quantize(quantum),
                 close=average_close,
             )
         )
@@ -811,23 +870,25 @@ def _to_average_volatility_candles(candles: list[DeribitVolatilityCandle]) -> li
 def _to_average_price_candles(candles: list[Candle]) -> list[Candle]:
     if not candles:
         return []
+    places = _decimal_places_generic(candles)
+    quantum = Decimal("1").scaleb(-places)
     averaged: list[Candle] = []
     previous_open: Decimal | None = None
     previous_close: Decimal | None = None
     divisor = Decimal("4")
     two = Decimal("2")
     for candle in candles:
-        average_close = (candle.open + candle.high + candle.low + candle.close) / divisor
+        average_close = ((candle.open + candle.high + candle.low + candle.close) / divisor).quantize(quantum)
         if previous_open is None or previous_close is None:
-            average_open = (candle.open + candle.close) / two
+            average_open = ((candle.open + candle.close) / two).quantize(quantum)
         else:
-            average_open = (previous_open + previous_close) / two
+            average_open = ((previous_open + previous_close) / two).quantize(quantum)
         averaged.append(
             Candle(
                 ts=candle.ts,
                 open=average_open,
-                high=max(candle.high, average_open, average_close),
-                low=min(candle.low, average_open, average_close),
+                high=max(candle.high, average_open, average_close).quantize(quantum),
+                low=min(candle.low, average_open, average_close).quantize(quantum),
                 close=average_close,
                 volume=candle.volume,
                 confirmed=candle.confirmed,

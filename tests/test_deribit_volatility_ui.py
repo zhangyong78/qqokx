@@ -36,6 +36,23 @@ class DeribitVolatilityUiTest(TestCase):
         self.assertEqual(aggregated[1].ts, 14_400_000)
         self.assertEqual(aggregated[1].close, Decimal("15"))
 
+    def test_aggregate_candles_to_daily_with_anchor(self) -> None:
+        candles = [
+            DeribitVolatilityCandle(ts=57_600_000, open=Decimal("10"), high=Decimal("12"), low=Decimal("9"), close=Decimal("11")),
+            DeribitVolatilityCandle(ts=61_200_000, open=Decimal("11"), high=Decimal("13"), low=Decimal("10"), close=Decimal("12")),
+            DeribitVolatilityCandle(ts=144_000_000, open=Decimal("12"), high=Decimal("14"), low=Decimal("11"), close=Decimal("13")),
+        ]
+
+        aggregated = _aggregate_candles_to_resolution(candles, 86_400_000, anchor_offset_ms=57_600_000)
+
+        self.assertEqual(len(aggregated), 2)
+        self.assertEqual(aggregated[0].ts, 57_600_000)
+        self.assertEqual(aggregated[0].open, Decimal("10"))
+        self.assertEqual(aggregated[0].close, Decimal("12"))
+        self.assertEqual(aggregated[1].ts, 144_000_000)
+        self.assertEqual(aggregated[1].open, Decimal("12"))
+        self.assertEqual(aggregated[1].close, Decimal("13"))
+
     def test_normalize_chart_viewport_clamps_bounds(self) -> None:
         start_index, visible_count = _normalize_chart_viewport(90, 40, 100, min_visible=24)
         self.assertEqual((start_index, visible_count), (60, 40))
@@ -92,6 +109,23 @@ class DeribitVolatilityUiTest(TestCase):
         self.assertEqual(aggregated[0].volume, Decimal("10"))
         self.assertTrue(aggregated[0].confirmed)
 
+    def test_aggregate_price_candles_to_daily_with_anchor(self) -> None:
+        candles = [
+            Candle(ts=57_600_000, open=Decimal("100"), high=Decimal("110"), low=Decimal("90"), close=Decimal("105"), volume=Decimal("1"), confirmed=True),
+            Candle(ts=61_200_000, open=Decimal("105"), high=Decimal("112"), low=Decimal("104"), close=Decimal("108"), volume=Decimal("2"), confirmed=True),
+            Candle(ts=144_000_000, open=Decimal("108"), high=Decimal("115"), low=Decimal("107"), close=Decimal("111"), volume=Decimal("3"), confirmed=True),
+        ]
+
+        aggregated = _aggregate_price_candles_to_resolution(candles, 86_400_000, anchor_offset_ms=57_600_000)
+
+        self.assertEqual(len(aggregated), 2)
+        self.assertEqual(aggregated[0].ts, 57_600_000)
+        self.assertEqual(aggregated[0].open, Decimal("100"))
+        self.assertEqual(aggregated[0].close, Decimal("108"))
+        self.assertEqual(aggregated[0].volume, Decimal("3"))
+        self.assertEqual(aggregated[1].ts, 144_000_000)
+        self.assertEqual(aggregated[1].close, Decimal("111"))
+
     def test_average_volatility_candles(self) -> None:
         candles = [
             DeribitVolatilityCandle(ts=0, open=Decimal("10"), high=Decimal("12"), low=Decimal("9"), close=Decimal("11")),
@@ -117,6 +151,6 @@ class DeribitVolatilityUiTest(TestCase):
         self.assertEqual(len(averaged), 2)
         self.assertEqual(averaged[0].open, Decimal("102.5"))
         self.assertEqual(averaged[0].close, Decimal("101.25"))
-        self.assertEqual(averaged[1].open, Decimal("101.875"))
+        self.assertEqual(averaged[1].open, Decimal("101.88"))
         self.assertEqual(averaged[1].close, Decimal("107.25"))
         self.assertEqual(averaged[1].volume, Decimal("2"))
