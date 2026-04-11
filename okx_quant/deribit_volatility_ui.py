@@ -113,7 +113,7 @@ class DeribitVolatilityWindow:
         self.currency = StringVar(value="BTC")
         self.resolution_label = StringVar(value="1小时")
         self.day_align_label = StringVar(value="北京时间凌晨12点")
-        self.candle_limit = StringVar(value="1000")
+        self.candle_limit = StringVar(value="300")
         self.average_kline = BooleanVar(value=False)
         self.status_text = StringVar(value="选择参数后点击“获取历史K线”。")
         self.summary_text = StringVar(value="暂无数据。")
