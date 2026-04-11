@@ -472,6 +472,17 @@ class DeribitVolatilityWindow:
         utc_hour = (anchor_hour - 8) % 24
         return utc_hour * 3_600_000
 
+    def _format_fetch_error_message(self, exc: Exception) -> str:
+        raw = str(exc).strip() or exc.__class__.__name__
+        lowered = raw.lower()
+        if "handshake operation timed out" in lowered:
+            return "网络握手超时，请稍后重试。"
+        if "read operation timed out" in lowered or "read timed out" in lowered:
+            return "网络读取超时，请稍后重试。"
+        if "timed out" in lowered:
+            return "网络连接超时，请稍后重试。"
+        return raw
+
     def _local_note_for_resolution(self, resolution: str) -> str:
         if resolution == "1D":
             return f"（本地4小时对齐聚合，{self.day_align_label.get()}收线）"
@@ -483,6 +494,19 @@ class DeribitVolatilityWindow:
         if request_token != self._request_token:
             return
         self._loading = False
+        friendly_message = self._format_fetch_error_message(exc)
+        has_current_snapshot = self._latest_snapshot is not None and self._snapshot_matches_current_selection(self._latest_snapshot)
+        if has_current_snapshot:
+            self.status_text.set(f"最新网络刷新失败，继续显示当前缓存。{friendly_message}")
+        else:
+            self.status_text.set("Deribit 波动率指数历史K线获取失败。")
+            messagebox.showerror("获取失败", friendly_message, parent=self.window)
+        if self.logger is not None:
+            self.logger(f"[Deribit波动率指数] 获取失败 | {friendly_message}")
+        if self._pending_refresh_after_load:
+            self._pending_refresh_after_load = False
+            self.window.after(10, lambda: self._refresh_for_current_selection(use_cache=True, force_network=True))
+        return
         self.status_text.set("Deribit 波动率指数历史K线获取失败。")
         messagebox.showerror("获取失败", str(exc), parent=self.window)
         if self._pending_refresh_after_load:

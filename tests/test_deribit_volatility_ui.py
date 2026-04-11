@@ -8,6 +8,7 @@ from okx_quant.deribit_volatility_ui import (
     _aggregate_candles_to_resolution,
     _align_candles_by_timestamp,
     _default_chart_viewport,
+    DeribitVolatilityWindow,
     _hourly_history_limit,
     _max_limit_for_resolution_value,
     _merge_deribit_candles,
@@ -174,6 +175,13 @@ class DeribitVolatilityUiTest(TestCase):
         self.assertEqual(_max_limit_for_resolution_value("3600"), 30000)
         self.assertEqual(_max_limit_for_resolution_value("14400"), 10000)
         self.assertEqual(_max_limit_for_resolution_value("1D"), 10000)
+
+    def test_format_fetch_error_message_timeout(self) -> None:
+        window = object.__new__(DeribitVolatilityWindow)
+        self.assertEqual(
+            DeribitVolatilityWindow._format_fetch_error_message(window, TimeoutError("The read operation timed out")),
+            "网络读取超时，请稍后重试。",
+        )
 
     def test_default_chart_viewport_targets_latest_requested_window(self) -> None:
         self.assertEqual(_default_chart_viewport(1000, 300, min_visible=24), (700, 300))

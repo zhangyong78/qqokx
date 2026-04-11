@@ -174,6 +174,20 @@ PROTECTION_ORDER_MODE_OPTIONS = {
 }
 
 
+def _format_network_error_message(message: str) -> str:
+    raw = (message or "").strip()
+    if not raw:
+        return "网络请求失败，请稍后重试。"
+    lowered = raw.lower()
+    if "handshake operation timed out" in lowered:
+        return "网络握手超时，请稍后重试。"
+    if "read operation timed out" in lowered or "read timed out" in lowered:
+        return "网络读取超时，请稍后重试。"
+    if "timed out" in lowered:
+        return "网络连接超时，请稍后重试。"
+    return raw
+
+
 @dataclass
 class StrategySession:
     session_id: str
@@ -4490,7 +4504,15 @@ class QuantApp:
         self._refresh_protection_window_view()
 
     def _apply_positions_error(self, message: str) -> None:
+        friendly_message = _format_network_error_message(message)
+        has_previous_positions = bool(self._latest_positions) or bool(self._position_row_payloads)
         self._positions_refreshing = False
+        if has_previous_positions:
+            self.positions_summary_text.set(f"持仓刷新失败，继续显示上一份缓存：{friendly_message}")
+            self._sync_positions_zoom_window()
+            self._refresh_positions_zoom_detail()
+            self._enqueue_log(f"持仓刷新失败，继续显示上一份缓存：{friendly_message}")
+            return
         self._latest_positions = []
         self._positions_context_note = None
         self._positions_last_refresh_at = None
@@ -4499,7 +4521,7 @@ class QuantApp:
         self._position_tickers = {}
         self.position_tree.delete(*self.position_tree.get_children())
         self._position_row_payloads.clear()
-        self.positions_summary_text.set(f"持仓读取失败：{message}")
+        self.positions_summary_text.set(f"持仓读取失败：{friendly_message}")
         self.position_total_text.set("-")
         self.position_upl_text.set("-")
         self.position_realized_text.set("-")
@@ -4513,7 +4535,7 @@ class QuantApp:
         self._set_readonly_text(self._position_detail_panel, self.position_detail_text.get())
         self._sync_positions_zoom_window()
         self._refresh_positions_zoom_detail()
-        self._enqueue_log(f"持仓读取失败：{message}")
+        self._enqueue_log(f"持仓读取失败：{friendly_message}")
 
     def _refresh_positions_periodic(self) -> None:
         if self.position_auto_refresh_enabled:
