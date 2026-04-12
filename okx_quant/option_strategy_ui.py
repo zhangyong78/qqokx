@@ -1,14 +1,17 @@
 ﻿from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import math
+from pathlib import Path
 from tkinter import BOTH, END, BooleanVar, Canvas, DoubleVar, StringVar, Toplevel, simpledialog
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
+from okx_quant.deribit_client import DeribitVolatilityCandle
 from okx_quant.log_utils import append_log_line, ensure_log_timestamp
 from okx_quant.models import Candle, Instrument
 from okx_quant.okx_client import OkxPosition, OkxRestClient, OkxTicker
@@ -46,6 +49,15 @@ Logger = Callable[[str], None]
 BAR_OPTIONS = ["1m", "3m", "5m", "15m", "1H", "4H"]
 DEFAULT_OPTION_FAMILY_OPTIONS = ("BTC-USD", "ETH-USD")
 MAX_OPTION_COMBO_CANDLES = 2000
+DERIBIT_VOLATILITY_CACHE_FILE_NAME = ".okx_quant_deribit_volatility_cache.json"
+DERIBIT_OPTION_CHART_BAR_TO_RESOLUTION = {
+    "1m": "3600",
+    "3m": "3600",
+    "5m": "3600",
+    "15m": "3600",
+    "1H": "3600",
+    "4H": "14400",
+}
 
 
 @dataclass(frozen=True)
@@ -136,8 +148,8 @@ class OptionStrategyCalculatorWindow:
         self.strategy_summary_text = StringVar(value="暂无策略腿。")
         self.payoff_summary_text = StringVar(value="加入策略腿后，可生成到期盈亏图。")
         self.combo_summary_text = StringVar(value="组合 K 线采用 OKX 期权标记价格。")
-        self.volatility_summary_text = StringVar(value="波动率 K 线基于标的现货历史收盘收益率估算。")
-        self.overlay_summary_text = StringVar(value="叠加图使用左轴显示组合K线，右轴显示历史波动率K线。")
+        self.volatility_summary_text = StringVar(value="波动率 K 线使用 Deribit 波动率指数缓存。")
+        self.overlay_summary_text = StringVar(value="叠加图使用左轴显示组合K线，右轴显示 Deribit 波动率指数K线。")
 
         self._family_combo: ttk.Combobox | None = None
         self._expiry_combo: ttk.Combobox | None = None
@@ -167,6 +179,9 @@ class OptionStrategyCalculatorWindow:
         self._current_underlying_price: Decimal | None = None
         self._latest_spot_usdt_price: Decimal | None = None
         self._latest_spot_usdt_candles: list[Candle] = []
+        self._latest_deribit_volatility_candles: list[Candle] = []
+        self._latest_deribit_resolution_label = ""
+        self._latest_deribit_resolution_note = ""
         self._latest_combo_candles: list[Candle] = []
         self._latest_payoff_snapshot: StrategyPayoffSnapshot | None = None
         self._latest_expiry_payoff_snapshot: StrategyPayoffSnapshot | None = None
@@ -1513,11 +1528,40 @@ class OptionStrategyCalculatorWindow:
         view_state.auto_full = visible >= len(items) and start == 0
         return items[start : start + visible]
 
-    def _current_volatility_candles(self) -> list[Candle]:
-        return _build_volatility_candles_from_reference(
-            self._latest_spot_usdt_candles,
+    def _current_deribit_currency(self) -> str | None:
+        if self._latest_resolved_legs:
+            try:
+                return parse_option_contract(self._latest_resolved_legs[0].inst_id).inst_family.split("-")[0]
+            except Exception:
+                pass
+        if self._legs:
+            try:
+                return parse_option_contract(self._legs[0].inst_id).inst_family.split("-")[0]
+            except Exception:
+                pass
+        family_text = self.option_family.get().strip().upper()
+        if family_text:
+            return family_text.split("-")[0]
+        return None
+
+    def _refresh_deribit_volatility_series(self, requested_limit: int) -> None:
+        currency = self._current_deribit_currency()
+        if not currency:
+            self._latest_deribit_volatility_candles = []
+            self._latest_deribit_resolution_label = ""
+            self._latest_deribit_resolution_note = ""
+            return
+        candles, resolution_label, resolution_note = _load_deribit_option_chart_candles(
+            currency,
             bar=self.bar.get().strip(),
+            requested_limit=requested_limit,
         )
+        self._latest_deribit_volatility_candles = candles
+        self._latest_deribit_resolution_label = resolution_label
+        self._latest_deribit_resolution_note = resolution_note
+
+    def _current_volatility_candles(self) -> list[Candle]:
+        return list(self._latest_deribit_volatility_candles)
 
     def _redraw_kline_chart(self, key: str) -> None:
         if key == "main_combo":
@@ -1539,7 +1583,7 @@ class OptionStrategyCalculatorWindow:
                 return
             volatility_candles = self._current_volatility_candles()
             if not volatility_candles:
-                self._clear_canvas(self._big_volatility_canvas, "暂无可用的波动率 K 线数据。")
+                self._clear_canvas(self._big_volatility_canvas, "暂无可用的 Deribit 波动率指数 K 线数据。")
                 return
             visible = self._apply_kline_view(key, volatility_candles)
             self._draw_volatility_chart(self._big_volatility_canvas, visible, enable_hover=True, hover_target="big_volatility")
@@ -1631,8 +1675,9 @@ class OptionStrategyCalculatorWindow:
         volatility_candles = self._current_volatility_candles()
         if selected_tab == "波动率K线" and self._big_volatility_canvas is not None:
             if volatility_candles:
+                note_text = f" | {self._latest_deribit_resolution_note}" if self._latest_deribit_resolution_note else ""
                 self.volatility_summary_text.set(
-                    f"历史波动率 K 线 | 标的现货 {self.bar.get().strip()} | 根数 {len(volatility_candles)} | 周期与组合K线一致"
+                    f"Deribit 波动率指数 K 线 | 周期 {self._latest_deribit_resolution_label}{note_text} | 根数 {len(volatility_candles)}"
                 )
                 visible_volatility = self._apply_kline_view("big_volatility", volatility_candles)
                 self._draw_volatility_chart(
@@ -1642,8 +1687,8 @@ class OptionStrategyCalculatorWindow:
                     hover_target="big_volatility",
                 )
             else:
-                self.volatility_summary_text.set("历史波动率 K 线需要足够的标的现货历史；当前数据不足。")
-                self._clear_canvas(self._big_volatility_canvas, "暂无可用的波动率 K 线数据。")
+                self.volatility_summary_text.set("Deribit 波动率指数 K 线暂无可用缓存；请先打开 Deribit 波动率指数窗口刷新数据。")
+                self._clear_canvas(self._big_volatility_canvas, "暂无可用的 Deribit 波动率指数 K 线数据。")
             return
 
         if (
@@ -1654,8 +1699,9 @@ class OptionStrategyCalculatorWindow:
             if self._latest_combo_candles and volatility_candles:
                 combo_candles, combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
                 aligned = _align_overlay_candles(combo_candles, volatility_candles)
+                note_text = f" | {self._latest_deribit_resolution_note}" if self._latest_deribit_resolution_note else ""
                 self.overlay_summary_text.set(
-                    f"叠加对比 | 上图=组合K线({combo_ccy}) | 下图=历史波动率(%) | 共用时间轴 | 周期 {self.bar.get().strip()}"
+                    f"叠加对比 | 上图=组合K线({combo_ccy}) | 下图=Deribit波动率指数(%) | 共用时间轴 | 周期 {self._latest_deribit_resolution_label}{note_text}"
                 )
                 visible_aligned = self._apply_kline_view("big_overlay", aligned)
                 visible_combo = [item[0] for item in visible_aligned]
@@ -1674,7 +1720,7 @@ class OptionStrategyCalculatorWindow:
                     hover_target="big_overlay_volatility",
                 )
             else:
-                self.overlay_summary_text.set("叠加对比需要同时具备组合K线与历史波动率K线数据。")
+                self.overlay_summary_text.set("叠加对比需要同时具备组合K线与 Deribit 波动率指数数据。")
                 self._clear_canvas(self._big_overlay_combo_canvas, "暂无可用的叠加对比数据。")
                 self._clear_canvas(self._big_overlay_volatility_canvas, "暂无可用的叠加对比数据。")
 
@@ -1860,6 +1906,7 @@ class OptionStrategyCalculatorWindow:
             else None
         )
         self._current_underlying_price = current_underlying_price
+        self._refresh_deribit_volatility_series(requested_limit)
         for inst_id, quote in latest_quotes.items():
             self._quotes_by_inst_id[inst_id] = quote
         self._refresh_leg_greeks()
@@ -1893,6 +1940,7 @@ class OptionStrategyCalculatorWindow:
         self._latest_spot_usdt_candles = list(spot_usdt_candles)
         self._latest_chart_formula = formula
         self._current_underlying_price = current_underlying_price
+        self._refresh_deribit_volatility_series(requested_limit)
         for inst_id, quote in latest_quotes.items():
             self._quotes_by_inst_id[inst_id] = quote
         self._refresh_leg_greeks()
@@ -2788,7 +2836,7 @@ class OptionStrategyCalculatorWindow:
         hover_target: str = "big_volatility",
     ) -> None:
         if not candles:
-            self._clear_canvas(canvas, "暂无可用的波动率 K 线数据。")
+            self._clear_canvas(canvas, "暂无可用的 Deribit 波动率指数 K 线数据。")
             return
 
         canvas.delete("all")
@@ -2878,7 +2926,7 @@ class OptionStrategyCalculatorWindow:
             width - right,
             top + 10,
             text=(
-                f"历史波动率K线 (%) | 最新 O {_format_compact_number(latest.open)} "
+                f"Deribit波动率指数K线 (%) | 最新 O {_format_compact_number(latest.open)} "
                 f"H {_format_compact_number(latest.high)} L {_format_compact_number(latest.low)} C {_format_compact_number(latest.close)}"
             ),
             anchor="ne",
@@ -3039,7 +3087,7 @@ class OptionStrategyCalculatorWindow:
             top + 10,
             text=(
                 f"叠加对比 | 左轴=组合K线({combo_ccy}) C {_format_compact_number(latest_combo.close)} "
-                f"| 右轴=历史波动率(%) C {_format_compact_number(latest_vol.close)}"
+                f"| 右轴=Deribit波动率指数(%) C {_format_compact_number(latest_vol.close)}"
             ),
             anchor="ne",
             fill="#57606a",
@@ -3483,6 +3531,130 @@ def _nearest_candle_index(x: float, left: float, candle_step: float, length: int
 
 def _format_chart_ts(ts: int) -> str:
     return datetime.fromtimestamp(ts / 1000).strftime("%m-%d %H:%M")
+
+
+def _option_strategy_deribit_cache_file_path() -> Path:
+    return Path(__file__).resolve().parent.parent / DERIBIT_VOLATILITY_CACHE_FILE_NAME
+
+
+def _load_deribit_option_chart_cache_payload() -> dict:
+    cache_path = _option_strategy_deribit_cache_file_path()
+    if not cache_path.exists():
+        return {}
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_deribit_hourly_series_from_cache(currency: str) -> list[DeribitVolatilityCandle]:
+    payload = _load_deribit_option_chart_cache_payload()
+    item = payload.get(f"{currency.strip().upper()}|hourly_base")
+    if not isinstance(item, dict):
+        return []
+    candles: list[DeribitVolatilityCandle] = []
+    for raw in item.get("volatility_hourly", []):
+        if not isinstance(raw, dict):
+            continue
+        try:
+            candles.append(
+                DeribitVolatilityCandle(
+                    ts=int(raw["ts"]),
+                    open=Decimal(str(raw["open"])),
+                    high=Decimal(str(raw["high"])),
+                    low=Decimal(str(raw["low"])),
+                    close=Decimal(str(raw["close"])),
+                )
+            )
+        except Exception:
+            continue
+    candles.sort(key=lambda item: item.ts)
+    return candles
+
+
+def _aggregate_deribit_option_chart_candles(
+    candles: list[DeribitVolatilityCandle],
+    resolution_ms: int,
+) -> list[DeribitVolatilityCandle]:
+    if not candles:
+        return []
+    grouped: list[list[DeribitVolatilityCandle]] = []
+    current_bucket: int | None = None
+    current_group: list[DeribitVolatilityCandle] = []
+    for candle in candles:
+        bucket = candle.ts // resolution_ms
+        if current_bucket is None or bucket != current_bucket:
+            if current_group:
+                grouped.append(current_group)
+            current_bucket = bucket
+            current_group = [candle]
+        else:
+            current_group.append(candle)
+    if current_group:
+        grouped.append(current_group)
+
+    aggregated: list[DeribitVolatilityCandle] = []
+    for group in grouped:
+        aggregated.append(
+            DeribitVolatilityCandle(
+                ts=group[0].ts,
+                open=group[0].open,
+                high=max(item.high for item in group),
+                low=min(item.low for item in group),
+                close=group[-1].close,
+            )
+        )
+    return aggregated
+
+
+def _build_deribit_option_chart_candles(
+    hourly_candles: list[DeribitVolatilityCandle],
+    *,
+    bar: str,
+    requested_limit: int,
+) -> tuple[list[Candle], str, str]:
+    normalized_bar = bar.strip()
+    resolution = DERIBIT_OPTION_CHART_BAR_TO_RESOLUTION.get(normalized_bar, "3600")
+    resolution_label = "4小时" if resolution == "14400" else "1小时"
+    resolution_note = "" if normalized_bar in {"1H", "4H"} else "Deribit 最小周期为1小时，当前按1小时指数显示"
+    selected = list(hourly_candles)
+    if resolution == "14400":
+        selected = _aggregate_deribit_option_chart_candles(selected, 14_400_000)
+    if requested_limit > 0:
+        selected = selected[-requested_limit:]
+    chart_candles = [
+        Candle(
+            ts=item.ts,
+            open=item.open,
+            high=item.high,
+            low=item.low,
+            close=item.close,
+            volume=Decimal("0"),
+            confirmed=True,
+        )
+        for item in selected
+    ]
+    return chart_candles, resolution_label, resolution_note
+
+
+def _load_deribit_option_chart_candles(
+    currency: str,
+    *,
+    bar: str,
+    requested_limit: int,
+) -> tuple[list[Candle], str, str]:
+    hourly_candles = _load_deribit_hourly_series_from_cache(currency)
+    if not hourly_candles:
+        resolution = DERIBIT_OPTION_CHART_BAR_TO_RESOLUTION.get(bar.strip(), "3600")
+        resolution_label = "4小时" if resolution == "14400" else "1小时"
+        resolution_note = "" if bar.strip() in {"1H", "4H"} else "Deribit 最小周期为1小时，当前按1小时指数显示"
+        return [], resolution_label, resolution_note
+    return _build_deribit_option_chart_candles(
+        hourly_candles,
+        bar=bar,
+        requested_limit=requested_limit,
+    )
 
 
 def _annualization_factor_for_bar(bar: str) -> float:

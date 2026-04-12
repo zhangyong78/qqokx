@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import json
@@ -126,7 +126,6 @@ class DeribitVolatilityWindow:
         )
         self.candle_limit = StringVar(value="300")
         self.average_kline = BooleanVar(value=False)
-        self.show_detail = BooleanVar(value=False)
         self.status_text = StringVar(value="打开页面后自动加载历史K线，并每小时同步一次。")
         self.summary_text = StringVar(value="暂无数据。")
         self.spot_chart_title_text = StringVar(value="同币种现货K线")
@@ -137,9 +136,6 @@ class DeribitVolatilityWindow:
         self._chart_render_token = 0
         self._volatility_hover_state: _KlineHoverState | None = None
         self._spot_hover_state: _KlineHoverState | None = None
-        self._body_pane: ttk.Panedwindow | None = None
-        self._detail_frame: ttk.LabelFrame | None = None
-        self._detail_frame_added = False
         self._auto_refresh_job: str | None = None
         self._request_token = 0
         self._pending_refresh_after_load = False
@@ -211,20 +207,11 @@ class DeribitVolatilityWindow:
             sticky="w",
             pady=(12, 0),
         )
-        ttk.Checkbutton(
-            controls,
-            text="显示历史明细",
-            variable=self.show_detail,
-            command=self._toggle_detail_visibility,
-        ).grid(row=1, column=6, sticky="w", pady=(12, 0))
         ttk.Button(controls, text="立即刷新", command=self.fetch_history).grid(row=1, column=7, sticky="e", pady=(12, 0))
         ttk.Button(controls, text="导出CSV", command=self.export_csv).grid(row=1, column=8, sticky="e", pady=(12, 0))
 
-        body = ttk.Panedwindow(self.window, orient="vertical")
-        body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
-        self._body_pane = body
-
-        charts_frame = ttk.LabelFrame(body, text="Deribit 波动率指数与同币种现货K线", padding=12)
+        charts_frame = ttk.LabelFrame(self.window, text="Deribit 波动率指数与同币种现货K线", padding=12)
+        charts_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
         charts_frame.columnconfigure(0, weight=1)
         charts_frame.rowconfigure(1, weight=1)
         ttk.Label(charts_frame, textvariable=self.summary_text, justify="left").grid(row=0, column=0, sticky="w", pady=(0, 8))
@@ -258,38 +245,7 @@ class DeribitVolatilityWindow:
             canvas.bind("<Motion>", lambda event, source=name: self._on_linked_chart_motion(source, event), add="+")
             canvas.bind("<Leave>", lambda _event: self._clear_linked_hover(), add="+")
 
-        body.add(charts_frame, weight=4)
-
-        detail_frame = ttk.LabelFrame(body, text="历史K线明细", padding=12)
-        detail_frame.columnconfigure(0, weight=1)
-        detail_frame.rowconfigure(0, weight=1)
-        self.detail_notebook = ttk.Notebook(detail_frame)
-        self.detail_notebook.grid(row=0, column=0, sticky="nsew")
-        self.volatility_tree = self._build_detail_tree(self.detail_notebook, tab_text="波动率明细")
-        self.spot_tree = self._build_detail_tree(self.detail_notebook, tab_text="现货明细")
-        self._detail_frame = detail_frame
         self._on_resolution_changed()
-
-    def _build_detail_tree(self, notebook: ttk.Notebook, *, tab_text: str) -> ttk.Treeview:
-        frame = ttk.Frame(notebook)
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-        tree = ttk.Treeview(frame, columns=("time", "open", "high", "low", "close"), show="headings", selectmode="browse")
-        for column, label, width in (
-            ("time", "时间", 180),
-            ("open", "开", 110),
-            ("high", "高", 110),
-            ("low", "低", 110),
-            ("close", "收", 110),
-        ):
-            tree.heading(column, text=label)
-            tree.column(column, width=width, anchor="center" if column == "time" else "e")
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=scrollbar.set)
-        tree.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        notebook.add(frame, text=tab_text)
-        return tree
 
     def fetch_history(self) -> None:
         self._refresh_for_current_selection(use_cache=False, force_network=True)
@@ -435,8 +391,6 @@ class DeribitVolatilityWindow:
         self._latest_snapshot = snapshot
         self._set_default_chart_view(snapshot)
         self._clear_linked_hover()
-        if self.show_detail.get():
-            self._refresh_detail_trees(snapshot)
 
         resolution_text = _resolution_label_for_value(snapshot.resolution)
         local_note = self._local_note_for_resolution(snapshot.resolution)
@@ -537,25 +491,6 @@ class DeribitVolatilityWindow:
                 writer.writerow([candle.ts, _format_ts(candle.ts), str(candle.open), str(candle.high), str(candle.low), str(candle.close)])
 
         messagebox.showinfo("导出成功", f"已导出到：\n{vol_path}\n{spot_path}", parent=self.window)
-
-    def _toggle_detail_visibility(self) -> None:
-        if self._body_pane is None or self._detail_frame is None:
-            return
-        if self.show_detail.get():
-            if not self._detail_frame_added:
-                self._body_pane.add(self._detail_frame, weight=1)
-                self._detail_frame_added = True
-                total_height = max(self._body_pane.winfo_height(), 640)
-                self.window.after(10, lambda: self._body_pane.sashpos(0, int(total_height * 0.72)))
-            if self._latest_snapshot is not None:
-                self._refresh_detail_trees(self._latest_snapshot)
-        elif self._detail_frame_added:
-            self._body_pane.forget(self._detail_frame)
-            self._detail_frame_added = False
-
-    def _refresh_detail_trees(self, snapshot: DeribitMarketSnapshot) -> None:
-        _fill_deribit_tree(self.volatility_tree, snapshot.aligned_volatility_candles)
-        _fill_price_tree(self.spot_tree, snapshot.aligned_spot_candles)
 
     def _validated_limit(self) -> int | None:
         try:

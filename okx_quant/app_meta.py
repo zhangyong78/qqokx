@@ -3,9 +3,11 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+from okx_quant import __version__
+
 
 APP_NAME = "OKX 策略工作台"
-DEFAULT_APP_VERSION = "0.1.0"
+DEFAULT_APP_VERSION = __version__
 
 
 def project_root() -> Path:
@@ -36,5 +38,5 @@ def build_version_info_text() -> str:
     return (
         f"{APP_NAME}\n"
         f"版本：v{APP_VERSION}\n"
-        f"版本来源：pyproject.toml"
+        f"版本来源：pyproject.toml / 包内兜底版本"
     )

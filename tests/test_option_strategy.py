@@ -2,11 +2,14 @@ from datetime import datetime
 from decimal import Decimal
 from unittest import TestCase
 
+from okx_quant.deribit_client import DeribitVolatilityCandle
 from okx_quant.models import Candle, Instrument
 from okx_quant.option_strategy_ui import (
     OptionStrategyCalculatorWindow,
     _align_overlay_candles,
+    _aggregate_deribit_option_chart_candles,
     _annualization_factor_for_bar,
+    _build_deribit_option_chart_candles,
     _build_volatility_candles_from_reference,
     _normalized_kline_view,
     _pan_kline_view,
@@ -151,6 +154,75 @@ class OptionStrategyTest(TestCase):
     def test_annualization_factor_for_4h_is_positive(self) -> None:
         factor = _annualization_factor_for_bar("4H")
         self.assertGreater(factor, 0.0)
+
+    def test_build_deribit_option_chart_candles_uses_hourly_for_subhour_bars(self) -> None:
+        hourly = [
+            DeribitVolatilityCandle(
+                ts=1_700_000_000_000,
+                open=Decimal("40.0"),
+                high=Decimal("41.0"),
+                low=Decimal("39.0"),
+                close=Decimal("40.5"),
+            ),
+            DeribitVolatilityCandle(
+                ts=1_700_003_600_000,
+                open=Decimal("40.5"),
+                high=Decimal("42.0"),
+                low=Decimal("40.0"),
+                close=Decimal("41.2"),
+            ),
+        ]
+
+        candles, resolution_label, resolution_note = _build_deribit_option_chart_candles(
+            hourly,
+            bar="15m",
+            requested_limit=100,
+        )
+
+        self.assertEqual(len(candles), 2)
+        self.assertEqual(resolution_label, "1小时")
+        self.assertIn("最小周期为1小时", resolution_note)
+        self.assertEqual(candles[-1].close, Decimal("41.2"))
+
+    def test_aggregate_deribit_option_chart_candles_builds_4h_bar(self) -> None:
+        hourly = [
+            DeribitVolatilityCandle(
+                ts=0,
+                open=Decimal("40.0"),
+                high=Decimal("41.0"),
+                low=Decimal("39.0"),
+                close=Decimal("40.5"),
+            ),
+            DeribitVolatilityCandle(
+                ts=3_600_000,
+                open=Decimal("40.5"),
+                high=Decimal("42.0"),
+                low=Decimal("40.0"),
+                close=Decimal("41.2"),
+            ),
+            DeribitVolatilityCandle(
+                ts=7_200_000,
+                open=Decimal("41.2"),
+                high=Decimal("43.0"),
+                low=Decimal("41.0"),
+                close=Decimal("42.0"),
+            ),
+            DeribitVolatilityCandle(
+                ts=10_800_000,
+                open=Decimal("42.0"),
+                high=Decimal("44.0"),
+                low=Decimal("41.5"),
+                close=Decimal("43.1"),
+            ),
+        ]
+
+        aggregated = _aggregate_deribit_option_chart_candles(hourly, 14_400_000)
+
+        self.assertEqual(len(aggregated), 1)
+        self.assertEqual(aggregated[0].open, Decimal("40.0"))
+        self.assertEqual(aggregated[0].close, Decimal("43.1"))
+        self.assertEqual(aggregated[0].high, Decimal("44.0"))
+        self.assertEqual(aggregated[0].low, Decimal("39.0"))
 
     def test_align_overlay_candles_uses_common_timestamps(self) -> None:
         combo_candles = [
