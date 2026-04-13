@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -309,7 +309,7 @@ def _run_backtest_with_loaded_data(
             taker_fee_rate=taker_fee_rate,
         )
     else:
-        raise RuntimeError(f"暂不支持的回测策略：{config.strategy_id}")
+        raise RuntimeError(f"鏆備笉鏀寔鐨勫洖娴嬬瓥鐣ワ細{config.strategy_id}")
     ema_values = ema([candle.close for candle in candles], config.ema_period) if candles else []
     trend_ema_values = ema([candle.close for candle in candles], config.trend_ema_period) if candles else []
     atr_values = atr(candles, config.atr_period) if candles else []
@@ -424,7 +424,7 @@ def format_backtest_report(result: BacktestResult) -> str:
         lines.extend(
             [
                 "期末未平仓：",
-                f"方向：{'做多' if open_position.signal == 'buy' else '做空'}",
+                f"方向：{'做多' if open_position.signal in ('buy', 'long') else '做空'}",
                 f"开仓时间：{_format_backtest_timestamp(open_position.entry_ts)}",
                 f"当前时间：{_format_backtest_timestamp(open_position.current_ts)}",
                 f"开仓价格：{format_decimal_fixed(open_position.entry_price, 4)}",
@@ -556,7 +556,7 @@ def _run_ema5_ema8_backtest(
     strategy = EmaCrossEmaStopStrategy()
     minimum = max(config.ema_period, config.trend_ema_period) + 1
     if len(candles) < minimum:
-        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根")
+        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根。")
     trade_start_index = _backtest_trade_start_index(minimum)
     if len(candles) <= trade_start_index:
         return []
@@ -643,7 +643,7 @@ def _run_cross_backtest(
         config.atr_period + 2,
     )
     if len(candles) < minimum:
-        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根")
+        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根。")
     trade_start_index = _backtest_trade_start_index(minimum)
     if len(candles) <= trade_start_index:
         return []
@@ -719,7 +719,7 @@ def _run_dynamic_backtest(
         config.atr_period,
     )
     if len(candles) < minimum + 1:
-        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum + 1} 根")
+        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum + 1} 根。")
     trade_start_index = _backtest_trade_start_index(minimum)
     if len(candles) <= trade_start_index:
         return [], None
@@ -959,7 +959,7 @@ def _resolve_backtest_config(config: StrategyConfig, trades: list[BacktestTrade]
             raise RuntimeError("风险百分比模式下，风险百分比必须大于 0")
         base_equity = _base_equity_for_sizing(config, trades)
         if base_equity <= 0:
-            raise RuntimeError("当前权益小于等于 0，无法继续按风险百分比回测")
+            raise RuntimeError("当前权益小于等于 0，无法继续按风险百分比回测。")
         risk_amount = base_equity * config.backtest_risk_percent / Decimal("100")
         return replace(config, risk_amount=risk_amount, order_size=Decimal("0"))
 

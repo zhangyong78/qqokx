@@ -411,7 +411,6 @@ def _build_backtest_param_summary(
         f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
     )
 
-
 def _build_backtest_compare_detail(snapshot: _BacktestSnapshot) -> str:
     config = snapshot.config
     strategy_name = STRATEGY_ID_TO_NAME.get(config.strategy_id, config.strategy_id)
@@ -424,15 +423,14 @@ def _build_backtest_compare_detail(snapshot: _BacktestSnapshot) -> str:
         f"K线周期：{_normalize_backtest_bar_label(config.bar)}",
         f"回测K线数：{snapshot.candle_limit}",
         f"参数：{_build_backtest_param_summary(config, maker_fee_rate=snapshot.maker_fee_rate, taker_fee_rate=snapshot.taker_fee_rate)}",
-        f"\u5f00\u59cb\u65f6\u95f4\uff1a{start_text}",
-        f"\u7ed3\u675f\u65f6\u95f4\uff1a{end_text}",
+        f"开始时间：{start_text}",
+        f"结束时间：{end_text}",
         "",
         snapshot.report_text,
     ]
     if snapshot.export_path:
-        lines.insert(-2, f"\u62a5\u544a\u6587\u4ef6\uff1a{snapshot.export_path}")
+        lines.insert(-2, f"报告文件：{snapshot.export_path}")
     return "\n".join(lines)
-
 
 def _format_fee_rate_percent(rate: Decimal) -> str:
     return f"{format_decimal_fixed(rate * Decimal('100'), 4)}%"
@@ -1186,10 +1184,11 @@ class BacktestWindow:
 
         self.trade_tree = ttk.Treeview(
             trade_tree_frame,
-            columns=("signal", "entry_time", "entry", "stop", "atr", "size", "exit_time", "exit", "reason", "pnl", "r"),
+            columns=("seq", "signal", "entry_time", "entry", "stop", "atr", "size", "exit_time", "exit", "reason", "pnl", "r"),
             show="headings",
             selectmode="browse",
         )
+        self.trade_tree.heading("seq", text="序号")
         self.trade_tree.heading("signal", text="方向")
         self.trade_tree.heading("entry_time", text="进场时间")
         self.trade_tree.heading("entry", text="进场价格")
@@ -1201,6 +1200,7 @@ class BacktestWindow:
         self.trade_tree.heading("reason", text="原因")
         self.trade_tree.heading("pnl", text="盈亏")
         self.trade_tree.heading("r", text="R倍数")
+        self.trade_tree.column("seq", width=60, anchor="center")
         self.trade_tree.column("signal", width=70, anchor="center")
         self.trade_tree.column("entry_time", width=140, anchor="center")
         self.trade_tree.column("entry", width=110, anchor="e")
@@ -1261,7 +1261,12 @@ class BacktestWindow:
             messagebox.showerror("回测参数错误", str(exc), parent=self.window)
             return
 
-        self.report_summary.set("正在回测中，请稍候...")
+        self.report_summary.set(
+            f"编号：{snapshot.snapshot_id} | 时间：{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"策略：{STRATEGY_ID_TO_NAME.get(snapshot.config.strategy_id, snapshot.config.strategy_id)} | "
+            f"交易对：{snapshot.config.inst_id} | K线：{_normalize_backtest_bar_label(snapshot.config.bar)} | "
+            f"交易次数：{result.report.total_trades}"
+        )
         self.report_text.delete("1.0", END)
         self.trade_tree.delete(*self.trade_tree.get_children())
         self._reset_chart_views()
@@ -1304,17 +1309,25 @@ class BacktestWindow:
         self.report_text.insert("1.0", format_backtest_report(result))
         self.trade_tree.delete(*self.trade_tree.get_children())
         for index, trade in enumerate(result.trades, start=1):
+            exit_reason = {
+                "take_profit": "止盈",
+                "stop_loss": "止损",
+            }.get(trade.exit_reason, trade.exit_reason)
             self.trade_tree.insert(
                 "",
                 END,
                 iid=f"T{index:03d}",
                 values=(
+                    index,
                     "做多" if trade.signal == "long" else "做空",
                     _format_chart_timestamp(trade.entry_ts),
                     format_decimal_fixed(trade.entry_price, 4),
+                    format_decimal_fixed(trade.stop_loss, 4),
+                    format_decimal_fixed(trade.atr_value, 4),
+                    format_decimal_fixed(trade.size, 4),
                     _format_chart_timestamp(trade.exit_ts),
                     format_decimal_fixed(trade.exit_price, 4),
-                    "止盈" if trade.exit_reason == "take_profit" else "止损",
+                    exit_reason,
                     format_decimal_fixed(trade.pnl, 4),
                     format_decimal_fixed(trade.r_multiple, 4),
                 ),
@@ -1895,11 +1908,16 @@ class BacktestWindow:
         self.report_text.insert("1.0", format_backtest_report(result))
         self.trade_tree.delete(*self.trade_tree.get_children())
         for index, trade in enumerate(result.trades, start=1):
+            exit_reason = {
+                "take_profit": "\u6b62\u76c8",
+                "stop_loss": "\u6b62\u635f",
+            }.get(trade.exit_reason, trade.exit_reason)
             self.trade_tree.insert(
                 "",
                 END,
                 iid=f"T{index:03d}",
                 values=(
+                    index,
                     "\u505a\u591a" if trade.signal == "long" else "\u505a\u7a7a",
                     _format_chart_timestamp(trade.entry_ts),
                     format_decimal_fixed(trade.entry_price, 4),
@@ -1908,7 +1926,7 @@ class BacktestWindow:
                     format_decimal_fixed(trade.size, 4),
                     _format_chart_timestamp(trade.exit_ts),
                     format_decimal_fixed(trade.exit_price, 4),
-                    "\u6b62\u76c8" if trade.exit_reason == "take_profit" else "\u6b62\u635f",
+                    exit_reason,
                     format_decimal_fixed(trade.pnl, 4),
                     format_decimal_fixed(trade.r_multiple, 4),
                 ),

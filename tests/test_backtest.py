@@ -1,4 +1,4 @@
-from dataclasses import replace
+﻿from dataclasses import replace
 from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
@@ -307,7 +307,7 @@ class BacktestTest(TestCase):
             ),
             instrument=self._build_instrument(),
             open_position=BacktestOpenPosition(
-                signal="sell",
+                signal="long",
                 entry_index=0,
                 entry_ts=1730000000000,
                 current_ts=1730003600000,
@@ -328,6 +328,7 @@ class BacktestTest(TestCase):
         report_text = format_backtest_report(result)
 
         self.assertIn("期末未平仓：", report_text)
+        self.assertIn("做多", report_text)
         self.assertIn("开仓时间：", report_text)
         self.assertIn("当前时间：", report_text)
         self.assertIn("开仓数量：2.0000", report_text)
@@ -524,7 +525,7 @@ class BacktestTest(TestCase):
         self.assertEqual(_normalize_backtest_bar_label("5m"), "5分钟")
         self.assertEqual(_normalize_backtest_bar_label("15分钟"), "15分钟")
         self.assertEqual(_normalize_backtest_bar_label("1H"), "1小时")
-        self.assertEqual(_normalize_backtest_bar_label("4小时"), "4小时")
+        self.assertEqual(_normalize_backtest_bar_label("4H"), "4小时")
         self.assertEqual(_backtest_bar_value_from_label("1小时"), "1H")
 
     def test_backtest_bar_label_mapping_falls_back_to_15_minutes(self) -> None:
@@ -580,7 +581,7 @@ class BacktestTest(TestCase):
 
         report_text = format_backtest_report(result)
 
-        self.assertIn("趋势过滤：EMA21 > EMA55 且收盘价位于 EMA233 上方才做多，EMA21 < EMA55 且收盘价位于 EMA233 下方才做空", report_text)
+        self.assertIn("趋势过滤：EMA21 > EMA55 且收盘价位于 EMA55 上方才做多，EMA21 < EMA55 且收盘价位于 EMA55 下方才做空", report_text)
         self.assertIn("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓", report_text)
 
     def test_ema5_ema8_backtest_uses_dynamic_ema_stop(self) -> None:
@@ -787,7 +788,7 @@ class BacktestTest(TestCase):
             candle_limit=500,
             candle_count=500,
             report=report,
-            report_text="示例报告",
+            report_text="绀轰緥鎶ュ憡",
             start_ts=1711152000000,
             end_ts=1711238400000,
             result=BacktestResult(
@@ -1218,15 +1219,15 @@ class BacktestTest(TestCase):
             tick_size=Decimal("0.0001"),
         )
         self.assertEqual(len(lines), 8)
-        self.assertTrue(lines[0].startswith("时间: "))
-        self.assertIn("开/高/低/收:", lines[1])
+        self.assertTrue(lines[0].startswith("鏃堕棿: "))
+        self.assertIn("开/高/低/收", lines[1])
         self.assertIn("202", lines[0])
         self.assertIn("EMA(21): 104.5000", lines[2])
         self.assertIn("EMA(55): 101.2500", lines[3])
         self.assertIn("ATR(10): 1000.3600", lines[4])
         self.assertIn("EMA(233): 98.7500", lines[5])
         self.assertIn("净值曲线: 88.43", lines[5])
-        self.assertIn("当前回撤: 12.34%", lines[6])
+        self.assertIn("褰撳墠鍥炴挙: 12.34%", lines[6])
 
     def test_format_chart_hover_lines_contains_atr_and_emas(self) -> None:
         lines = _format_chart_hover_lines(
@@ -1482,3 +1483,4 @@ def _patched_run_backtest_selected_range_auto_prepends_warmup_candles(self: Back
 BacktestTest.test_run_backtest_selected_range_auto_prepends_warmup_candles = (
     _patched_run_backtest_selected_range_auto_prepends_warmup_candles
 )
+

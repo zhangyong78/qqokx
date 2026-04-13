@@ -138,6 +138,7 @@ class DeribitVolatilityWindow:
         self._auto_refresh_job: str | None = None
         self._request_token = 0
         self._pending_refresh_after_load = False
+        self._pending_force_network = False
 
         self._build_layout()
         self.window.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -270,11 +271,20 @@ class DeribitVolatilityWindow:
                     return
         if self._loading:
             self._pending_refresh_after_load = True
+            self._pending_force_network = self._pending_force_network or force_network
+            self.status_text.set("当前请求仍在处理中，已排队刷新最新选择，请稍候...")
+            if self.logger is not None:
+                self.logger("[Deribit波动率指数] 当前请求仍在处理中，已排队刷新最新选择。")
             return
 
         self._loading = True
         self._pending_refresh_after_load = False
-        self.status_text.set("正在获取 Deribit 波动率K线和同币种现货K线，请稍候...")
+        self._pending_force_network = False
+        self.status_text.set(
+            "首次获取 Deribit 波动率K线和同币种现货K线，正在补全本地缓存，请稍候..."
+            if cached is None
+            else "正在获取 Deribit 波动率K线和同币种现货K线，请稍候..."
+        )
         self._request_token += 1
         request_token = self._request_token
         threading.Thread(
@@ -292,7 +302,7 @@ class DeribitVolatilityWindow:
     def _on_selection_changed(self, _event=None) -> None:
         self._save_ui_state()
         self._on_resolution_changed()
-        self._refresh_for_current_selection(use_cache=True, force_network=False)
+        self._refresh_for_current_selection(use_cache=True, force_network=True)
 
     def _on_limit_changed(self, _event=None) -> None:
         self._refresh_for_current_selection(use_cache=True, force_network=False)
@@ -384,9 +394,45 @@ class DeribitVolatilityWindow:
     ) -> None:
         if request_token is not None and request_token != self._request_token:
             return
-        if not self._snapshot_matches_current_selection(snapshot):
+        selection_matches = self._snapshot_matches_current_selection(snapshot)
+        if not from_cache:
+            self._loading = False
+        if not selection_matches:
+            if self._pending_refresh_after_load:
+                force_network = self._pending_force_network
+                self._pending_refresh_after_load = False
+                self._pending_force_network = False
+                self.window.after(
+                    10,
+                    lambda force=force_network: self._refresh_for_current_selection(
+                        use_cache=True,
+                        force_network=force,
+                    ),
+                )
             return
-        self._loading = False
+        previous_snapshot = self._latest_snapshot
+        previous_last_ts = _snapshot_last_ts(previous_snapshot) if previous_snapshot is not None else None
+        previous_key = (
+            previous_snapshot.currency,
+            previous_snapshot.resolution,
+            previous_snapshot.day_align_label,
+            previous_snapshot.requested_limit,
+        ) if previous_snapshot is not None else None
+        current_key = (
+            snapshot.currency,
+            snapshot.resolution,
+            snapshot.day_align_label,
+            snapshot.requested_limit,
+        )
+        current_last_ts = _snapshot_last_ts(snapshot)
+        no_new_candle = (
+            not from_cache
+            and previous_key == current_key
+            and previous_last_ts == current_last_ts
+            and previous_snapshot is not None
+            and len(previous_snapshot.aligned_volatility_candles) == len(snapshot.aligned_volatility_candles)
+            and len(previous_snapshot.aligned_spot_candles) == len(snapshot.aligned_spot_candles)
+        )
         self._latest_snapshot = snapshot
         self._set_default_chart_view(snapshot)
         self._clear_linked_hover()
@@ -397,7 +443,11 @@ class DeribitVolatilityWindow:
         self.status_text.set(
             "已从本地缓存恢复图表，并在后台继续同步最新数据。"
             if from_cache
-            else "Deribit 波动率K线与同币种现货K线获取完成，支持滚轮缩放、左键拖动、双图联动十字光标。"
+            else (
+                "Deribit 波动率K线已刷新，当前暂无新增K线。"
+                if no_new_candle
+                else "Deribit 波动率K线与同币种现货K线获取完成，支持滚轮缩放、左键拖动、双图联动十字光标。"
+            )
         )
         if snapshot.aligned_volatility_candles and snapshot.aligned_spot_candles:
             self.summary_text.set(
@@ -419,8 +469,16 @@ class DeribitVolatilityWindow:
             )
         self._schedule_auto_refresh()
         if self._pending_refresh_after_load:
+            force_network = self._pending_force_network
             self._pending_refresh_after_load = False
-            self.window.after(10, lambda: self._refresh_for_current_selection(use_cache=True, force_network=True))
+            self._pending_force_network = False
+            self.window.after(
+                10,
+                lambda force=force_network: self._refresh_for_current_selection(
+                    use_cache=True,
+                    force_network=force,
+                ),
+            )
 
     def _daily_anchor_offset_ms(self, day_align_label: str) -> int:
         anchor_hour = DAY_ALIGN_OPTIONS.get(day_align_label, 0)
@@ -459,8 +517,16 @@ class DeribitVolatilityWindow:
         if self.logger is not None:
             self.logger(f"[Deribit波动率指数] 获取失败 | {friendly_message}")
         if self._pending_refresh_after_load:
+            force_network = self._pending_force_network
             self._pending_refresh_after_load = False
-            self.window.after(10, lambda: self._refresh_for_current_selection(use_cache=True, force_network=True))
+            self._pending_force_network = False
+            self.window.after(
+                10,
+                lambda force=force_network: self._refresh_for_current_selection(
+                    use_cache=True,
+                    force_network=force,
+                ),
+            )
         return
         self.status_text.set("Deribit 波动率指数历史K线获取失败。")
         messagebox.showerror("获取失败", str(exc), parent=self.window)
