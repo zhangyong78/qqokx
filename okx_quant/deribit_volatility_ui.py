@@ -4,7 +4,7 @@ import csv
 import json
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from tkinter import BooleanVar, END, Canvas, StringVar, Toplevel
@@ -1116,14 +1116,12 @@ def _snapshot_last_ts(snapshot: DeribitMarketSnapshot | None) -> int | None:
 
 
 def _next_refresh_delay_ms(snapshot: DeribitMarketSnapshot | None, resolution: str, *, now_ms: int | None = None) -> int:
-    current_ms = now_ms if now_ms is not None else int(datetime.now().timestamp() * 1000)
-    last_ts = _snapshot_last_ts(snapshot)
-    resolution_ms = DERIBIT_RESOLUTION_SECONDS.get(resolution, DERIBIT_RESOLUTION_SECONDS[DERIBIT_BASE_HOURLY_RESOLUTION]) * 1000
-    if last_ts is not None:
-        target_ms = last_ts + resolution_ms + 5_000
-        return max(1_000, target_ms - current_ms)
-    next_boundary_ms = ((current_ms // resolution_ms) + 1) * resolution_ms
-    return max(1_000, next_boundary_ms + 5_000 - current_ms)
+    del snapshot, resolution
+    current_dt = datetime.fromtimestamp((now_ms / 1000) if now_ms is not None else datetime.now().timestamp())
+    next_hour = current_dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    target_dt = next_hour + timedelta(seconds=5)
+    delay_ms = int((target_dt - current_dt).total_seconds() * 1000)
+    return max(1_000, delay_ms)
 
 
 def _align_candles_by_timestamp(

@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 from unittest import TestCase
 
@@ -235,18 +236,7 @@ class DeribitVolatilityUiTest(TestCase):
 
         self.assertEqual(_snapshot_last_ts(snapshot), 2_000)
 
-    def test_next_refresh_delay_follows_last_candle_boundary(self) -> None:
-        snapshot = type(
-            "Snapshot",
-            (),
-            {
-                "aligned_volatility_candles": [DeribitVolatilityCandle(ts=3_600_000, open=Decimal("1"), high=Decimal("1"), low=Decimal("1"), close=Decimal("1"))],
-                "volatility_candles": [],
-                "aligned_spot_candles": [],
-                "spot_candles": [],
-            },
-        )()
-
-        delay = _next_refresh_delay_ms(snapshot, "3600", now_ms=5_100_000)
-
-        self.assertEqual(delay, 2_105_000)
+    def test_next_refresh_delay_follows_local_top_of_hour(self) -> None:
+        base = datetime(2026, 4, 13, 16, 27, 6)
+        delay = _next_refresh_delay_ms(None, "3600", now_ms=int(base.timestamp() * 1000))
+        self.assertEqual(delay, 1_979_000)
