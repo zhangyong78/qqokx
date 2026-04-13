@@ -63,6 +63,7 @@ from okx_quant.smart_order import SmartOrderRuntimeConfig
 from okx_quant.smart_order_ui import SmartOrderWindow
 from okx_quant.strategy_catalog import (
     STRATEGY_DEFINITIONS,
+    STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA5_EMA8_ID,
     StrategyDefinition,
     get_strategy_definition,
@@ -474,6 +475,10 @@ class QuantApp:
         self.root.after(1200, self._refresh_positions_periodic)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    @staticmethod
+    def _strategy_uses_big_ema(strategy_id: str) -> bool:
+        return strategy_id == STRATEGY_EMA5_EMA8_ID
+
     def _build_menu(self) -> None:
         menu_bar = Menu(self.root)
 
@@ -611,10 +616,10 @@ class QuantApp:
         )
 
         row += 1
-        ttk.Label(start_frame, text="EMA大周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(start_frame, textvariable=self.big_ema_period).grid(
-            row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
-        )
+        self._big_ema_label = ttk.Label(start_frame, text="EMA大周期")
+        self._big_ema_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self._big_ema_entry = ttk.Entry(start_frame, textvariable=self.big_ema_period)
+        self._big_ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
         ttk.Label(start_frame, text="ATR 周期").grid(row=row, column=2, sticky="w", pady=(12, 0))
         ttk.Entry(start_frame, textvariable=self.atr_period).grid(
             row=row, column=3, sticky="ew", pady=(12, 0)
@@ -3560,8 +3565,8 @@ class QuantApp:
                 position_mode_label=self.position_mode_label.get(),
                 trigger_type_label=self.trigger_type_label.get(),
                 environment_label=self.environment_label.get(),
-                maker_fee_percent="0.01",
-                taker_fee_percent="0.028",
+                maker_fee_percent="0.015",
+                taker_fee_percent="0.036",
                 initial_capital="10000",
                 sizing_mode_label="固定风险金",
                 risk_percent="1",
@@ -4558,6 +4563,12 @@ class QuantApp:
             self.risk_amount.set("100")
             self.entry_side_mode_label.set("跟随信号")
             self.tp_sl_mode_label.set("按信号标的的价格（本地）")
+        if self._strategy_uses_big_ema(definition.strategy_id):
+            self._big_ema_label.grid()
+            self._big_ema_entry.grid()
+        else:
+            self._big_ema_label.grid_remove()
+            self._big_ema_entry.grid_remove()
         self.strategy_summary_text.set(definition.summary)
         self.strategy_rule_text.set(definition.rule_description)
         self.strategy_hint_text.set(definition.parameter_hint)
@@ -4570,25 +4581,33 @@ class QuantApp:
         trade_symbol = config.trade_inst_id or config.inst_id
         risk_value = self.risk_amount.get().strip() or "-"
         fixed_size = self.order_size.get().strip() or "-"
-        message = (
-            f"策略：{definition.name}\n"
-            f"运行模式：{self.run_mode_label.get()}\n"
-            f"信号标的：{config.inst_id}\n"
-            f"下单标的：{trade_symbol}\n"
-            f"K线周期：{config.bar}\n"
-            f"信号方向：{self.signal_mode_label.get()}\n"
-            f"下单方向模式：{self.entry_side_mode_label.get()}\n"
-            f"止盈止损模式：{self.tp_sl_mode_label.get()}\n"
-            f"自定义触发标的：{self.local_tp_sl_symbol.get().strip().upper() or '-'}\n"
-            f"EMA小周期：{config.ema_period}\n"
-            f"EMA中周期：{config.trend_ema_period}\n"
-            f"EMA大周期：{config.big_ema_period}\n"
-            f"ATR 周期：{config.atr_period}\n"
-            f"风险金：{risk_value}\n"
-            f"固定数量：{fixed_size}\n\n"
-            f"{definition.rule_description}\n\n"
-            "确认启动这个策略吗？"
+        lines = [
+            f"策略：{definition.name}",
+            f"运行模式：{self.run_mode_label.get()}",
+            f"信号标的：{config.inst_id}",
+            f"下单标的：{trade_symbol}",
+            f"K线周期：{config.bar}",
+            f"信号方向：{self.signal_mode_label.get()}",
+            f"下单方向模式：{self.entry_side_mode_label.get()}",
+            f"止盈止损模式：{self.tp_sl_mode_label.get()}",
+            f"自定义触发标的：{self.local_tp_sl_symbol.get().strip().upper() or '-'}",
+            f"EMA小周期：{config.ema_period}",
+            f"EMA中周期：{config.trend_ema_period}",
+        ]
+        if self._strategy_uses_big_ema(definition.strategy_id):
+            lines.append(f"EMA大周期：{config.big_ema_period}")
+        lines.extend(
+            [
+                f"ATR 周期：{config.atr_period}",
+                f"风险金：{risk_value}",
+                f"固定数量：{fixed_size}",
+                "",
+                definition.rule_description,
+                "",
+                "确认启动这个策略吗？",
+            ]
         )
+        message = "\n".join(lines)
         return messagebox.askokcancel(f"确认启动 {definition.name}", message)
 
     def _collect_inputs(self, definition: StrategyDefinition) -> tuple[Credentials, StrategyConfig]:
@@ -4784,33 +4803,42 @@ class QuantApp:
             return
 
         definition = get_strategy_definition(session.strategy_id)
-        self.selected_session_text.set(
-            f"会话：{session.session_id}\n"
-            f"API配置：{session.api_name or '-'}\n"
-            f"状态：{session.status}\n"
-            f"策略：{session.strategy_name}\n"
-            f"运行模式：{session.run_mode_label}\n"
-            f"信号标的：{session.config.inst_id}\n"
-            f"下单标的：{session.config.trade_inst_id or session.config.inst_id}\n"
-            f"方向：{session.direction_label}\n"
-            f"K线周期：{session.config.bar}\n"
-            f"EMA小周期：{session.config.ema_period}\n"
-            f"EMA中周期：{session.config.trend_ema_period}\n"
-            f"EMA大周期：{session.config.big_ema_period}\n"
-            f"ATR 周期：{session.config.atr_period}\n"
-            f"止损 ATR 倍数：{session.config.atr_stop_multiplier}\n"
-            f"止盈 ATR 倍数：{session.config.atr_take_multiplier}\n"
-            f"风险金：{session.config.risk_amount}\n"
-            f"固定数量：{session.config.order_size}\n"
-            f"下单方向模式：{session.config.entry_side_mode}\n"
-            f"止盈止损模式：{session.config.tp_sl_mode}\n"
-            f"自定义触发标的：{session.config.local_tp_sl_inst_id or '-'}\n"
-            f"轮询秒数：{session.config.poll_seconds}\n"
-            f"启动时间：{session.started_at.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"策略简介：{definition.summary}\n\n"
-            f"规则说明：{definition.rule_description}\n\n"
-            f"参数提示：{definition.parameter_hint}"
+        lines = [
+            f"会话：{session.session_id}",
+            f"API配置：{session.api_name or '-'}",
+            f"状态：{session.status}",
+            f"策略：{session.strategy_name}",
+            f"运行模式：{session.run_mode_label}",
+            f"信号标的：{session.config.inst_id}",
+            f"下单标的：{session.config.trade_inst_id or session.config.inst_id}",
+            f"方向：{session.direction_label}",
+            f"K线周期：{session.config.bar}",
+            f"EMA小周期：{session.config.ema_period}",
+            f"EMA中周期：{session.config.trend_ema_period}",
+        ]
+        if self._strategy_uses_big_ema(session.strategy_id):
+            lines.append(f"EMA大周期：{session.config.big_ema_period}")
+        lines.extend(
+            [
+                f"ATR 周期：{session.config.atr_period}",
+                f"止损 ATR 倍数：{session.config.atr_stop_multiplier}",
+                f"止盈 ATR 倍数：{session.config.atr_take_multiplier}",
+                f"风险金：{session.config.risk_amount}",
+                f"固定数量：{session.config.order_size}",
+                f"下单方向模式：{session.config.entry_side_mode}",
+                f"止盈止损模式：{session.config.tp_sl_mode}",
+                f"自定义触发标的：{session.config.local_tp_sl_inst_id or '-'}",
+                f"轮询秒数：{session.config.poll_seconds}",
+                f"启动时间：{session.started_at.strftime('%Y-%m-%d %H:%M:%S')}",
+                "",
+                f"策略简介：{definition.summary}",
+                "",
+                f"规则说明：{definition.rule_description}",
+                "",
+                f"参数提示：{definition.parameter_hint}",
+            ]
         )
+        self.selected_session_text.set("\n".join(lines))
         self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
 
     def _parse_positive_int(self, raw: str, field_name: str) -> int:

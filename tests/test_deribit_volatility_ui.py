@@ -13,6 +13,8 @@ from okx_quant.deribit_volatility_ui import (
     _max_limit_for_resolution_value,
     _merge_deribit_candles,
     _merge_price_candles,
+    _next_refresh_delay_ms,
+    _snapshot_last_ts,
     _normalize_chart_viewport,
     _pan_chart_viewport,
     _required_hourly_limit,
@@ -218,3 +220,33 @@ class DeribitVolatilityUiTest(TestCase):
         self.assertEqual([candle.ts for candle in merged], [0, 1_000, 2_000])
         self.assertEqual(merged[1].open, Decimal("200"))
         self.assertEqual(merged[2].close, Decimal("305"))
+
+    def test_snapshot_last_ts_prefers_aligned_volatility(self) -> None:
+        snapshot = type(
+            "Snapshot",
+            (),
+            {
+                "aligned_volatility_candles": [DeribitVolatilityCandle(ts=2_000, open=Decimal("1"), high=Decimal("1"), low=Decimal("1"), close=Decimal("1"))],
+                "volatility_candles": [DeribitVolatilityCandle(ts=1_000, open=Decimal("1"), high=Decimal("1"), low=Decimal("1"), close=Decimal("1"))],
+                "aligned_spot_candles": [],
+                "spot_candles": [],
+            },
+        )()
+
+        self.assertEqual(_snapshot_last_ts(snapshot), 2_000)
+
+    def test_next_refresh_delay_follows_last_candle_boundary(self) -> None:
+        snapshot = type(
+            "Snapshot",
+            (),
+            {
+                "aligned_volatility_candles": [DeribitVolatilityCandle(ts=3_600_000, open=Decimal("1"), high=Decimal("1"), low=Decimal("1"), close=Decimal("1"))],
+                "volatility_candles": [],
+                "aligned_spot_candles": [],
+                "spot_candles": [],
+            },
+        )()
+
+        delay = _next_refresh_delay_ms(snapshot, "3600", now_ms=5_100_000)
+
+        self.assertEqual(delay, 2_105_000)

@@ -172,7 +172,6 @@ class StrategyEngine:
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
-            config.big_ema_period,
             config.atr_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
@@ -196,7 +195,6 @@ class StrategyEngine:
             config.inst_id,
             config.ema_period,
             trend_ema_period=config.trend_ema_period,
-            big_ema_period=config.big_ema_period,
         )
 
         while not self._stop_event.is_set():
@@ -205,7 +203,6 @@ class StrategyEngine:
             minimum = max(
                 config.ema_period,
                 config.trend_ema_period,
-                config.big_ema_period,
                 config.atr_period,
             )
             if len(confirmed) < minimum:
@@ -520,7 +517,6 @@ class StrategyEngine:
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
-            config.big_ema_period,
             config.atr_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
@@ -537,7 +533,6 @@ class StrategyEngine:
             config.inst_id,
             config.ema_period,
             trend_ema_period=config.trend_ema_period,
-            big_ema_period=config.big_ema_period,
         )
 
         while not self._stop_event.is_set():
@@ -546,7 +541,6 @@ class StrategyEngine:
             minimum = max(
                 config.ema_period,
                 config.trend_ema_period,
-                config.big_ema_period,
                 config.atr_period,
             )
             if len(confirmed) < minimum:
@@ -628,7 +622,6 @@ class StrategyEngine:
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
-            config.big_ema_period,
             config.atr_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
@@ -640,7 +633,6 @@ class StrategyEngine:
             config.inst_id,
             config.ema_period,
             trend_ema_period=config.trend_ema_period,
-            big_ema_period=config.big_ema_period,
         )
 
         while not self._stop_event.is_set():
@@ -649,7 +641,6 @@ class StrategyEngine:
             minimum = max(
                 config.ema_period,
                 config.trend_ema_period,
-                config.big_ema_period,
                 config.atr_period,
             )
             if len(confirmed) < minimum:

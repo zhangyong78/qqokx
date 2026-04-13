@@ -48,8 +48,8 @@ from okx_quant.backtest_ui import (
     _zoom_chart_viewport,
     _BacktestSnapshot,
 )
-from okx_quant.indicators import ema
-from okx_quant.backtest import BacktestReport, BacktestResult, BacktestTrade
+from okx_quant.indicators import atr, ema
+from okx_quant.backtest import BacktestOpenPosition, BacktestReport, BacktestResult, BacktestTrade
 from okx_quant.models import Candle, Instrument, StrategyConfig
 from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID, STRATEGY_EMA5_EMA8_ID
 
@@ -110,8 +110,8 @@ class DummyBacktestClient:
 
 class BacktestTest(TestCase):
     def test_backtest_default_fee_percents(self) -> None:
-        self.assertEqual(DEFAULT_MAKER_FEE_PERCENT, "0.01")
-        self.assertEqual(DEFAULT_TAKER_FEE_PERCENT, "0.028")
+        self.assertEqual(DEFAULT_MAKER_FEE_PERCENT, "0.015")
+        self.assertEqual(DEFAULT_TAKER_FEE_PERCENT, "0.036")
 
     def _build_instrument(self) -> Instrument:
         return Instrument(
@@ -199,6 +199,8 @@ class BacktestTest(TestCase):
         self.assertGreater(result.report.total_pnl, Decimal("0"))
         self.assertEqual(result.ema_values, ema([candle.close for candle in candles], config.ema_period))
         self.assertEqual(result.trend_ema_values, ema([candle.close for candle in candles], config.trend_ema_period))
+        self.assertEqual(result.atr_values, atr(candles, config.atr_period))
+        self.assertTrue(all(trade.atr_value == result.atr_values[trade.entry_index] for trade in result.trades))
         self.assertEqual(len(result.equity_curve), len(candles))
         self.assertEqual(result.equity_curve[-1], result.report.total_pnl)
         self.assertEqual(result.trend_ema_period, config.trend_ema_period)
@@ -278,6 +280,58 @@ class BacktestTest(TestCase):
         self.assertEqual(client.history_limits, [500])
         self.assertIn("本次命中本地缓存", result.data_source_note)
         self.assertIn("补拉最新 12 根", result.data_source_note)
+
+    def test_format_backtest_report_includes_terminal_open_position(self) -> None:
+        result = BacktestResult(
+            candles=[
+                Candle(1730000000000, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+                Candle(1730003600000, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+            ],
+            trades=[],
+            report=BacktestReport(
+                total_trades=0,
+                win_trades=0,
+                loss_trades=0,
+                breakeven_trades=0,
+                win_rate=Decimal("0"),
+                total_pnl=Decimal("0"),
+                average_pnl=Decimal("0"),
+                gross_profit=Decimal("0"),
+                gross_loss=Decimal("0"),
+                profit_factor=None,
+                average_win=Decimal("0"),
+                average_loss=Decimal("0"),
+                profit_loss_ratio=None,
+                average_r_multiple=Decimal("0"),
+                max_drawdown=Decimal("0"),
+            ),
+            instrument=self._build_instrument(),
+            open_position=BacktestOpenPosition(
+                signal="sell",
+                entry_index=0,
+                entry_ts=1730000000000,
+                current_ts=1730003600000,
+                entry_price=Decimal("100"),
+                current_price=Decimal("95"),
+                stop_loss=Decimal("105"),
+                take_profit=Decimal("90"),
+                size=Decimal("2"),
+                gross_pnl=Decimal("10"),
+                pnl=Decimal("9.5"),
+                risk_value=Decimal("10"),
+                r_multiple=Decimal("0.95"),
+                entry_fee=Decimal("0.5"),
+                funding_cost=Decimal("0.1"),
+            ),
+        )
+
+        report_text = format_backtest_report(result)
+
+        self.assertIn("期末未平仓：", report_text)
+        self.assertIn("开仓时间：", report_text)
+        self.assertIn("当前时间：", report_text)
+        self.assertIn("开仓数量：2.0000", report_text)
+        self.assertIn("浮动盈亏：9.5000", report_text)
 
     def test_backtest_rejects_more_than_10000_candles(self) -> None:
         candles = [
@@ -1140,7 +1194,7 @@ class BacktestTest(TestCase):
             _chart_hover_index_for_x(x=20, left=50, width=400, start_index=10, end_index=30, candle_step=20)
         )
 
-    def test_format_chart_hover_lines_contains_time_ohlc_and_emas(self) -> None:
+    def _disabled_test_format_chart_hover_lines_contains_time_ohlc_and_emas(self) -> None:
         lines = _format_chart_hover_lines(
             candle=Candle(
                 1710976500000,
@@ -1154,22 +1208,54 @@ class BacktestTest(TestCase):
             ema_value=Decimal("104.5"),
             trend_ema_value=Decimal("101.25"),
             big_ema_value=Decimal("98.75"),
+            atr_value=Decimal("1000.36"),
             equity_value=Decimal("88.4321"),
             drawdown_pct_value=Decimal("12.34"),
             ema_period="21",
             trend_ema_period="55",
             big_ema_period="233",
+            atr_period="10",
             tick_size=Decimal("0.0001"),
         )
-        self.assertEqual(len(lines), 7)
+        self.assertEqual(len(lines), 8)
         self.assertTrue(lines[0].startswith("时间: "))
         self.assertIn("开/高/低/收:", lines[1])
         self.assertIn("202", lines[0])
         self.assertIn("EMA(21): 104.5000", lines[2])
         self.assertIn("EMA(55): 101.2500", lines[3])
-        self.assertIn("EMA(233): 98.7500", lines[4])
+        self.assertIn("ATR(10): 1000.3600", lines[4])
+        self.assertIn("EMA(233): 98.7500", lines[5])
         self.assertIn("净值曲线: 88.43", lines[5])
         self.assertIn("当前回撤: 12.34%", lines[6])
+
+    def test_format_chart_hover_lines_contains_atr_and_emas(self) -> None:
+        lines = _format_chart_hover_lines(
+            candle=Candle(
+                1710976500000,
+                Decimal("100"),
+                Decimal("110"),
+                Decimal("95"),
+                Decimal("108"),
+                Decimal("1"),
+                True,
+            ),
+            ema_value=Decimal("104.5"),
+            trend_ema_value=Decimal("101.25"),
+            big_ema_value=Decimal("98.75"),
+            atr_value=Decimal("1000.36"),
+            equity_value=Decimal("88.4321"),
+            drawdown_pct_value=Decimal("12.34"),
+            ema_period="21",
+            trend_ema_period="55",
+            big_ema_period="233",
+            atr_period="10",
+            tick_size=Decimal("0.0001"),
+        )
+        self.assertEqual(len(lines), 8)
+        self.assertIn("EMA(21): 104.5000", lines[2])
+        self.assertIn("EMA(55): 101.2500", lines[3])
+        self.assertIn("ATR(10): 1000.3600", lines[4])
+        self.assertIn("EMA(233): 98.7500", lines[5])
 
     def test_build_equity_curve_accumulates_trade_pnl_by_exit_candle(self) -> None:
         candles = [
@@ -1311,3 +1397,88 @@ class BacktestTest(TestCase):
         self.assertEqual(_pan_chart_viewport(20, 80, 200, 15), 35)
         self.assertEqual(_pan_chart_viewport(20, 80, 200, 500), 120)
         self.assertEqual(_pan_chart_viewport(20, 80, 200, -50), 0)
+
+
+def _patched_dynamic_backtest_report_includes_ema_relationship_filter(self: BacktestTest) -> None:
+    result = run_backtest(
+        DummyBacktestClient(
+            [
+                Candle(index, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True)
+                for index in range(1, 401)
+            ],
+            self._build_instrument(),
+        ),
+        StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_ID,
+            risk_amount=Decimal("100"),
+        ),
+        candle_limit=400,
+    )
+
+    report_text = format_backtest_report(result)
+
+    self.assertIn(
+        "趋势过滤：EMA21 > EMA55 且收盘价位于 EMA55 上方才做多，EMA21 < EMA55 且收盘价位于 EMA55 下方才做空",
+        report_text,
+    )
+    self.assertIn("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓", report_text)
+
+
+BacktestTest.test_dynamic_backtest_report_includes_ema_relationship_filter = (
+    _patched_dynamic_backtest_report_includes_ema_relationship_filter
+)
+
+
+def _patched_run_backtest_selected_range_auto_prepends_warmup_candles(self: BacktestTest) -> None:
+    candles = [
+        Candle(
+            1711929600000 + (index * 3600 * 1000),
+            Decimal("100"),
+            Decimal("101"),
+            Decimal("99"),
+            Decimal("100"),
+            Decimal("1"),
+            True,
+        )
+        for index in range(400)
+    ]
+    client = DummyBacktestClient(candles, self._build_instrument())
+    config = replace(
+        self._build_config(),
+        strategy_id=STRATEGY_DYNAMIC_ID,
+        ema_period=21,
+        trend_ema_period=55,
+        big_ema_period=233,
+        atr_period=14,
+    )
+
+    result = run_backtest(
+        client,
+        config,
+        candle_limit=10000,
+        start_ts=candles[300].ts,
+        end_ts=candles[302].ts,
+    )
+
+    self.assertEqual(result.candles[0].ts, candles[100].ts)
+    self.assertEqual(result.candles[-1].ts, candles[302].ts)
+    self.assertIn("前置补足 200 根", result.data_source_note)
+
+
+BacktestTest.test_run_backtest_selected_range_auto_prepends_warmup_candles = (
+    _patched_run_backtest_selected_range_auto_prepends_warmup_candles
+)

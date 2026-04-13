@@ -73,8 +73,8 @@ BACKTEST_SYMBOL_OPTIONS = (
     "BNB-USDT-SWAP",
     "DOGE-USDT-SWAP",
 )
-DEFAULT_MAKER_FEE_PERCENT = "0.01"
-DEFAULT_TAKER_FEE_PERCENT = "0.028"
+DEFAULT_MAKER_FEE_PERCENT = "0.015"
+DEFAULT_TAKER_FEE_PERCENT = "0.036"
 BACKTEST_SIZING_OPTIONS = {
     "固定风险金": "fixed_risk",
     "固定数量": "fixed_size",
@@ -354,6 +354,26 @@ def _build_backtest_param_summary(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> str:
+    if config.strategy_id == STRATEGY_DYNAMIC_ID:
+        risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
+        sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
+        if config.backtest_sizing_mode == "risk_percent":
+            sizing_text = f"{sizing_label}{format_decimal(config.backtest_risk_percent or Decimal('0'))}%"
+        elif config.backtest_sizing_mode == "fixed_size":
+            sizing_text = f"{sizing_label}{format_decimal(config.order_size)}"
+        else:
+            sizing_text = f"{sizing_label}{risk_text}"
+        return (
+            f"EMA{config.ema_period}/{config.trend_ema_period} / ATR{config.atr_period} / "
+            f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
+            f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
+            f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
+            f"{'复利' if config.backtest_compounding else '不复利'} / "
+            f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
+            f"滑点{_format_fee_rate_percent(config.backtest_slippage_rate)} / "
+            f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
+        )
+
     if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
         if config.backtest_sizing_mode == "risk_percent":
@@ -631,6 +651,10 @@ class BacktestCompareOverviewWindow:
         self.window.focus_force()
         self._refresh()
 
+    @staticmethod
+    def _strategy_uses_big_ema(strategy_id: str) -> bool:
+        return strategy_id == STRATEGY_EMA5_EMA8_ID
+
     def _build_layout(self) -> None:
         header = ttk.LabelFrame(self.window, text="回测总览", padding=12)
         header.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
@@ -729,6 +753,8 @@ class BacktestWindow:
         self.client = client
         self.window = Toplevel(parent)
         self.window.title("策略回测")
+        self._closed = False
+        self.window.protocol("WM_DELETE_WINDOW", self._close)
         apply_adaptive_window_geometry(
             self.window,
             width_ratio=0.8,
@@ -797,6 +823,30 @@ class BacktestWindow:
         self._apply_selected_strategy_definition()
         self._update_sizing_mode_widgets()
 
+    @staticmethod
+    def _widget_exists(widget: object) -> bool:
+        try:
+            return widget is not None and bool(widget.winfo_exists())
+        except Exception:
+            return False
+
+    def _ui_alive(self) -> bool:
+        return (not self._closed) and self._widget_exists(self.window)
+
+    def _close(self) -> None:
+        self._closed = True
+        if self._widget_exists(getattr(self, "_chart_zoom_window", None)):
+            try:
+                self._chart_zoom_window.destroy()
+            except Exception:
+                pass
+        if self._widget_exists(self.window):
+            self.window.destroy()
+
+    @staticmethod
+    def _strategy_uses_big_ema(strategy_id: str) -> bool:
+        return strategy_id == STRATEGY_EMA5_EMA8_ID
+
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
         self.window.rowconfigure(1, weight=1)
@@ -804,6 +854,7 @@ class BacktestWindow:
 
         controls = ttk.LabelFrame(self.window, text="回测参数", padding=16)
         controls.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        self._controls_frame = controls
         for column in range(6):
             controls.columnconfigure(column, weight=1)
 
@@ -1135,13 +1186,16 @@ class BacktestWindow:
 
         self.trade_tree = ttk.Treeview(
             trade_tree_frame,
-            columns=("signal", "entry_time", "entry", "exit_time", "exit", "reason", "pnl", "r"),
+            columns=("signal", "entry_time", "entry", "stop", "atr", "size", "exit_time", "exit", "reason", "pnl", "r"),
             show="headings",
             selectmode="browse",
         )
         self.trade_tree.heading("signal", text="方向")
         self.trade_tree.heading("entry_time", text="进场时间")
         self.trade_tree.heading("entry", text="进场价格")
+        self.trade_tree.heading("stop", text="止损值")
+        self.trade_tree.heading("atr", text="ATR值")
+        self.trade_tree.heading("size", text="开仓数量")
         self.trade_tree.heading("exit_time", text="出场时间")
         self.trade_tree.heading("exit", text="出场价格")
         self.trade_tree.heading("reason", text="原因")
@@ -1150,6 +1204,9 @@ class BacktestWindow:
         self.trade_tree.column("signal", width=70, anchor="center")
         self.trade_tree.column("entry_time", width=140, anchor="center")
         self.trade_tree.column("entry", width=110, anchor="e")
+        self.trade_tree.column("stop", width=110, anchor="e")
+        self.trade_tree.column("atr", width=100, anchor="e")
+        self.trade_tree.column("size", width=100, anchor="e")
         self.trade_tree.column("exit_time", width=140, anchor="center")
         self.trade_tree.column("exit", width=110, anchor="e")
         self.trade_tree.column("reason", width=90, anchor="center")
@@ -1230,6 +1287,8 @@ class BacktestWindow:
         self._load_snapshot(snapshot.snapshot_id)
 
     def _load_snapshot(self, snapshot_id: str) -> None:
+        if not self._ui_alive():
+            return
         snapshot = self._backtest_snapshots[snapshot_id]
         result = snapshot.result
         self._current_snapshot_id = snapshot_id
@@ -1356,9 +1415,9 @@ class BacktestWindow:
     def _set_backtest_running(self, running: bool) -> None:
         self._backtest_running = running
         state = "disabled" if running else "normal"
-        if getattr(self, "single_backtest_button", None) is not None:
+        if self._widget_exists(getattr(self, "single_backtest_button", None)):
             self.single_backtest_button.configure(state=state)
-        if getattr(self, "batch_backtest_button", None) is not None:
+        if self._widget_exists(getattr(self, "batch_backtest_button", None)):
             self.batch_backtest_button.configure(state=state)
 
     def _run_batch_backtest_worker(
@@ -1381,9 +1440,11 @@ class BacktestWindow:
                 maker_fee_rate=maker_fee_rate,
                 taker_fee_rate=taker_fee_rate,
             )
-            self.window.after(0, lambda: self._apply_batch_backtest_results(results, candle_limit, batch_label))
+            if self._ui_alive():
+                self.window.after(0, lambda: self._apply_batch_backtest_results(results, candle_limit, batch_label))
         except Exception as exc:
-            self.window.after(0, lambda error=exc: self._show_backtest_error(error))
+            if self._ui_alive():
+                self.window.after(0, lambda error=exc: self._show_backtest_error(error))
 
     def _run_backtest_worker(
         self,
@@ -1404,11 +1465,15 @@ class BacktestWindow:
                 maker_fee_rate=maker_fee_rate,
                 taker_fee_rate=taker_fee_rate,
             )
-            self.window.after(0, lambda: self._apply_backtest_result(result, config, candle_limit))
+            if self._ui_alive():
+                self.window.after(0, lambda: self._apply_backtest_result(result, config, candle_limit))
         except Exception as exc:
-            self.window.after(0, lambda error=exc: self._show_backtest_error(error))
+            if self._ui_alive():
+                self.window.after(0, lambda error=exc: self._show_backtest_error(error))
 
     def _apply_backtest_result(self, result: BacktestResult, config: StrategyConfig, candle_limit: int) -> None:
+        if not self._ui_alive():
+            return
         export_path = None
         try:
             export_path = str(export_single_backtest_report(result, config, candle_limit))
@@ -1424,6 +1489,8 @@ class BacktestWindow:
         candle_limit: int,
         batch_label: str,
     ) -> None:
+        if not self._ui_alive():
+            return
         export_path = None
         try:
             export_path = str(
@@ -1450,6 +1517,8 @@ class BacktestWindow:
         self._set_backtest_running(False)
 
     def _show_backtest_error(self, exc: Exception) -> None:
+        if not self._ui_alive():
+            return
         self.report_summary.set("回测失败")
         self._set_backtest_running(False)
         messagebox.showerror("回测失败", str(exc), parent=self.window)
@@ -1514,6 +1583,13 @@ class BacktestWindow:
             self.trend_ema_period.set("8")
             self.big_ema_period.set("233")
             self.risk_amount.set("100")
+        if hasattr(self, "_controls_frame"):
+            big_ema_widgets = self._controls_frame.grid_slaves(row=1, column=4) + self._controls_frame.grid_slaves(row=1, column=5)
+            for widget in big_ema_widgets:
+                if self._strategy_uses_big_ema(definition.strategy_id):
+                    widget.grid()
+                else:
+                    widget.grid_remove()
 
     def _append_backtest_snapshot(
         self,
@@ -1545,8 +1621,9 @@ class BacktestWindow:
         if batch_label:
             self._batch_snapshot_groups.setdefault(batch_label, []).append(snapshot.snapshot_id)
             self._snapshot_batch_labels[snapshot.snapshot_id] = batch_label
-        self.compare_tree.insert("", END, iid=snapshot.snapshot_id, values=_build_backtest_compare_row(snapshot))
-        self._update_compare_summary()
+        if self._ui_alive() and self._widget_exists(getattr(self, "compare_tree", None)):
+            self.compare_tree.insert("", END, iid=snapshot.snapshot_id, values=_build_backtest_compare_row(snapshot))
+            self._update_compare_summary()
         get_backtest_snapshot_store().add_snapshot(result, config, candle_limit, export_path=export_path)
         return snapshot
 
@@ -1826,6 +1903,9 @@ class BacktestWindow:
                     "\u505a\u591a" if trade.signal == "long" else "\u505a\u7a7a",
                     _format_chart_timestamp(trade.entry_ts),
                     format_decimal_fixed(trade.entry_price, 4),
+                    format_decimal_fixed(trade.stop_loss, 4),
+                    format_decimal_fixed(trade.atr_value, 4),
+                    format_decimal_fixed(trade.size, 4),
                     _format_chart_timestamp(trade.exit_ts),
                     format_decimal_fixed(trade.exit_price, 4),
                     "\u6b62\u76c8" if trade.exit_reason == "take_profit" else "\u6b62\u635f",
@@ -2025,7 +2105,11 @@ class BacktestWindow:
         visible_candles = candles[start_index:end_index]
         visible_ema = result.ema_values[start_index:end_index]
         visible_trend_ema = result.trend_ema_values[start_index:end_index]
-        visible_big_ema = result.big_ema_values[start_index:end_index]
+        visible_big_ema = (
+            result.big_ema_values[start_index:end_index]
+            if self._strategy_uses_big_ema(result.strategy_id)
+            else []
+        )
         visible_net_value = (
             result.net_value_curve[start_index:end_index]
             if result.net_value_curve
@@ -2311,11 +2395,17 @@ class BacktestWindow:
             if hover_index < len(self._latest_result.trend_ema_values)
             else Decimal("0")
         )
-        big_ema_value = (
-            self._latest_result.big_ema_values[hover_index]
-            if hover_index < len(self._latest_result.big_ema_values)
-            else Decimal("0")
+        atr_value = (
+            self._latest_result.atr_values[hover_index]
+            if hover_index < len(self._latest_result.atr_values)
+            else None
         )
+        if self._strategy_uses_big_ema(self._latest_result.strategy_id) and hover_index < len(self._latest_result.big_ema_values):
+            big_ema_value: Decimal | None = self._latest_result.big_ema_values[hover_index]
+            big_ema_period: str | None = str(self._latest_result.big_ema_period)
+        else:
+            big_ema_value = None
+            big_ema_period = None
         equity_value = self._latest_result.net_value_curve[hover_index] if self._latest_result.net_value_curve else Decimal("0")
         drawdown_pct_value = (
             Decimal("0") - self._latest_result.drawdown_pct_curve[hover_index]
@@ -2337,11 +2427,13 @@ class BacktestWindow:
             ema_value=ema_value,
             trend_ema_value=trend_ema_value,
             big_ema_value=big_ema_value,
+            atr_value=atr_value,
             equity_value=equity_value,
             drawdown_pct_value=drawdown_pct_value,
             ema_period=str(self._latest_result.ema_period),
             trend_ema_period=str(self._latest_result.trend_ema_period),
-            big_ema_period=str(self._latest_result.big_ema_period),
+            big_ema_period=big_ema_period,
+            atr_period=str(self._latest_result.atr_period),
             tick_size=self._latest_result.instrument.tick_size,
         )
         text_item = canvas.create_text(
@@ -2716,6 +2808,44 @@ def _format_chart_hover_lines(
         f"净值曲线: {format_decimal_fixed(equity_value, 2)}",
         f"当前回撤: {format_decimal_fixed(drawdown_pct_value, 2)}%",
     ]
+
+
+def _format_chart_hover_lines(
+    *,
+    candle,
+    ema_value: Decimal,
+    trend_ema_value: Decimal,
+    big_ema_value: Decimal | None,
+    atr_value: Decimal | None,
+    equity_value: Decimal,
+    drawdown_pct_value: Decimal,
+    ema_period: str,
+    trend_ema_period: str,
+    big_ema_period: str | None,
+    atr_period: str,
+    tick_size: Decimal,
+) -> list[str]:
+    lines = [
+        f"时间: {_format_chart_timestamp(candle.ts)}",
+        (
+            "开/高/低/收: "
+            f"{format_decimal(candle.open)} / {format_decimal(candle.high)} / "
+            f"{format_decimal(candle.low)} / {format_decimal(candle.close)}"
+        ),
+        f"EMA({ema_period}): {_format_price_by_tick_size(ema_value, tick_size)}",
+        f"EMA({trend_ema_period}): {_format_price_by_tick_size(trend_ema_value, tick_size)}",
+    ]
+    if atr_value is not None:
+        lines.append(f"ATR({atr_period}): {_format_price_by_tick_size(atr_value, tick_size)}")
+    if big_ema_value is not None and big_ema_period:
+        lines.append(f"EMA({big_ema_period}): {_format_price_by_tick_size(big_ema_value, tick_size)}")
+    lines.extend(
+        [
+            f"净值曲线: {format_decimal_fixed(equity_value, 2)}",
+            f"当前回撤: {format_decimal_fixed(drawdown_pct_value, 2)}%",
+        ]
+    )
+    return lines
 
 
 def _format_price_by_tick_size(value: Decimal, tick_size: Decimal) -> str:

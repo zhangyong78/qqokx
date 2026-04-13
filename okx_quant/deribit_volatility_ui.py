@@ -40,7 +40,6 @@ DAY_ALIGN_OPTIONS = {
     "北京时间凌晨12点": 0,
     "北京时间早上8点": 8,
 }
-AUTO_REFRESH_MS = 3_600_000
 DERIBIT_VOLATILITY_CACHE_FILE_NAME = ".okx_quant_deribit_volatility_cache.json"
 DERIBIT_FULL_HISTORY_START_TS = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
 DERIBIT_HOURLY_REFRESH_OVERLAP = 240
@@ -412,9 +411,11 @@ class DeribitVolatilityWindow:
             self.summary_text.set("当前区间缺少可联动的共同K线数据。")
         self._draw_linked_charts(snapshot)
         if self.logger is not None:
+            last_candle_ts = _snapshot_last_ts(snapshot)
             self.logger(
                 f"[Deribit波动率指数] 已加载 {snapshot.currency} {resolution_text}{local_note} | "
                 f"波动率={len(snapshot.volatility_candles)} | 现货={len(snapshot.spot_candles)} | 共同={len(snapshot.aligned_volatility_candles)}"
+                f" | 最后一根K线={_format_ts(last_candle_ts) if last_candle_ts is not None else '-'}"
             )
         self._schedule_auto_refresh()
         if self._pending_refresh_after_load:
@@ -513,7 +514,9 @@ class DeribitVolatilityWindow:
         self._cancel_auto_refresh()
         if not self.window.winfo_exists() or self.window.state() == "withdrawn":
             return
-        self._auto_refresh_job = self.window.after(AUTO_REFRESH_MS, self._auto_refresh)
+        resolution = DERIBIT_RESOLUTION_OPTIONS.get(self.resolution_label.get(), DERIBIT_BASE_HOURLY_RESOLUTION)
+        delay_ms = _next_refresh_delay_ms(self._latest_snapshot, resolution)
+        self._auto_refresh_job = self.window.after(delay_ms, self._auto_refresh)
 
     def _cancel_auto_refresh(self) -> None:
         if self._auto_refresh_job is not None and self.window.winfo_exists():
@@ -1096,6 +1099,31 @@ def _fill_price_tree(tree: ttk.Treeview, candles: list[Candle]) -> None:
                 format_decimal_fixed(candle.close, places),
             ),
         )
+
+
+def _snapshot_last_ts(snapshot: DeribitMarketSnapshot | None) -> int | None:
+    if snapshot is None:
+        return None
+    if snapshot.aligned_volatility_candles:
+        return snapshot.aligned_volatility_candles[-1].ts
+    if snapshot.volatility_candles:
+        return snapshot.volatility_candles[-1].ts
+    if snapshot.aligned_spot_candles:
+        return snapshot.aligned_spot_candles[-1].ts
+    if snapshot.spot_candles:
+        return snapshot.spot_candles[-1].ts
+    return None
+
+
+def _next_refresh_delay_ms(snapshot: DeribitMarketSnapshot | None, resolution: str, *, now_ms: int | None = None) -> int:
+    current_ms = now_ms if now_ms is not None else int(datetime.now().timestamp() * 1000)
+    last_ts = _snapshot_last_ts(snapshot)
+    resolution_ms = DERIBIT_RESOLUTION_SECONDS.get(resolution, DERIBIT_RESOLUTION_SECONDS[DERIBIT_BASE_HOURLY_RESOLUTION]) * 1000
+    if last_ts is not None:
+        target_ms = last_ts + resolution_ms + 5_000
+        return max(1_000, target_ms - current_ms)
+    next_boundary_ms = ((current_ms // resolution_ms) + 1) * resolution_ms
+    return max(1_000, next_boundary_ms + 5_000 - current_ms)
 
 
 def _align_candles_by_timestamp(
