@@ -10,6 +10,7 @@ from okx_quant.deribit_volatility_ui import (
     _align_candles_by_timestamp,
     _default_chart_viewport,
     DeribitVolatilityWindow,
+    _hourly_fetch_start_ts,
     _hourly_history_limit,
     _max_limit_for_resolution_value,
     _merge_deribit_candles,
@@ -173,6 +174,21 @@ class DeribitVolatilityUiTest(TestCase):
     def test_hourly_history_limit_covers_requested_range(self) -> None:
         self.assertEqual(_hourly_history_limit(0, 0), 1)
         self.assertEqual(_hourly_history_limit(0, 3_600_000 * 24), 26)
+
+    def test_hourly_fetch_start_uses_full_history_without_cache(self) -> None:
+        self.assertEqual(_hourly_fetch_start_ts([], []), 1609459200000)
+
+    def test_hourly_fetch_start_uses_incremental_tail_with_cache(self) -> None:
+        volatility = [
+            DeribitVolatilityCandle(ts=0, open=Decimal("10"), high=Decimal("12"), low=Decimal("9"), close=Decimal("11")),
+            DeribitVolatilityCandle(ts=3_600_000 * 100, open=Decimal("11"), high=Decimal("13"), low=Decimal("10"), close=Decimal("12")),
+        ]
+        spot = [
+            Candle(ts=0, open=Decimal("100"), high=Decimal("110"), low=Decimal("90"), close=Decimal("105"), volume=Decimal("1"), confirmed=True),
+            Candle(ts=3_600_000 * 101, open=Decimal("105"), high=Decimal("112"), low=Decimal("104"), close=Decimal("108"), volume=Decimal("2"), confirmed=True),
+        ]
+
+        self.assertEqual(_hourly_fetch_start_ts(volatility, spot), max(1609459200000, (3_600_000 * 100) - (240 * 3_600_000)))
 
     def test_max_limit_for_resolution_value(self) -> None:
         self.assertEqual(_max_limit_for_resolution_value("3600"), 30000)

@@ -47,6 +47,17 @@ DERIBIT_DEFAULT_VISIBLE_CANDLE_COUNT = 300
 DERIBIT_VOLATILITY_UI_STATE_KEY = "_ui_state"
 
 
+def _hourly_fetch_start_ts(
+    cached_volatility: list[DeribitVolatilityCandle],
+    cached_spot: list[Candle],
+) -> int:
+    if not cached_volatility or not cached_spot:
+        return DERIBIT_FULL_HISTORY_START_TS
+    overlap_ms = DERIBIT_HOURLY_REFRESH_OVERLAP * DERIBIT_RESOLUTION_SECONDS[DERIBIT_BASE_HOURLY_RESOLUTION] * 1000
+    latest_cached_ts = min(cached_volatility[-1].ts, cached_spot[-1].ts)
+    return max(DERIBIT_FULL_HISTORY_START_TS, latest_cached_ts - overlap_ms)
+
+
 @dataclass(frozen=True)
 class DeribitMarketSnapshot:
     currency: str
@@ -248,14 +259,20 @@ class DeribitVolatilityWindow:
         self._on_resolution_changed()
 
     def fetch_history(self) -> None:
-        self._refresh_for_current_selection(use_cache=False, force_network=True)
+        self._refresh_for_current_selection(use_cache=True, force_network=True, supersede_if_loading=True)
 
     def _bootstrap_initial_load(self) -> None:
         self._on_resolution_changed()
-        self._refresh_for_current_selection(use_cache=True, force_network=True)
+        self._refresh_for_current_selection(use_cache=True, force_network=True, supersede_if_loading=False)
         self._schedule_auto_refresh()
 
-    def _refresh_for_current_selection(self, *, use_cache: bool, force_network: bool) -> None:
+    def _refresh_for_current_selection(
+        self,
+        *,
+        use_cache: bool,
+        force_network: bool,
+        supersede_if_loading: bool = False,
+    ) -> None:
         limit = self._validated_limit()
         if limit is None:
             return
@@ -270,9 +287,27 @@ class DeribitVolatilityWindow:
                 if not force_network:
                     return
         if self._loading:
+            if supersede_if_loading:
+                self._request_token += 1
+                request_token = self._request_token
+                self._pending_refresh_after_load = False
+                self._pending_force_network = False
+                self.status_text.set("已显示本地缓存，正在获取最新数据，请稍候...")
+                if self.logger is not None:
+                    self.logger("[Deribit波动率指数] 用户切换了选择，立即刷新当前选择并忽略旧请求结果。")
+                threading.Thread(
+                    target=self._fetch_worker,
+                    args=(currency, resolution, day_align_label, limit, request_token),
+                    daemon=True,
+                ).start()
+                return
             self._pending_refresh_after_load = True
             self._pending_force_network = self._pending_force_network or force_network
-            self.status_text.set("当前请求仍在处理中，已排队刷新最新选择，请稍候...")
+            self.status_text.set(
+                "已显示本地缓存，当前请求结束后会自动刷新最新选择，请稍候..."
+                if cached is not None
+                else "当前请求仍在处理中，已排队刷新最新选择，请稍候..."
+            )
             if self.logger is not None:
                 self.logger("[Deribit波动率指数] 当前请求仍在处理中，已排队刷新最新选择。")
             return
@@ -302,10 +337,10 @@ class DeribitVolatilityWindow:
     def _on_selection_changed(self, _event=None) -> None:
         self._save_ui_state()
         self._on_resolution_changed()
-        self._refresh_for_current_selection(use_cache=True, force_network=True)
+        self._refresh_for_current_selection(use_cache=True, force_network=True, supersede_if_loading=True)
 
     def _on_limit_changed(self, _event=None) -> None:
-        self._refresh_for_current_selection(use_cache=True, force_network=False)
+        self._refresh_for_current_selection(use_cache=True, force_network=False, supersede_if_loading=True)
 
     def _fetch_worker(
         self,
@@ -319,19 +354,13 @@ class DeribitVolatilityWindow:
             spot_inst_id = OKX_SPOT_SYMBOLS[currency]
             cached_hourly = self._load_cached_hourly_series(currency)
             now_ts = int(datetime.now().timestamp() * 1000)
-            cache_needs_full_backfill = (
-                cached_hourly is None
-                or not cached_hourly[1]
-                or not cached_hourly[2]
-                or cached_hourly[1][0].ts > DERIBIT_FULL_HISTORY_START_TS + 3_600_000
-                or cached_hourly[2][0].ts > DERIBIT_FULL_HISTORY_START_TS + 3_600_000
-            )
-            if cache_needs_full_backfill:
+            if cached_hourly is None:
                 fetch_start_ts = DERIBIT_FULL_HISTORY_START_TS
             else:
-                fetch_start_ts = max(
-                    DERIBIT_FULL_HISTORY_START_TS,
-                    now_ts - (max(DERIBIT_HOURLY_REFRESH_OVERLAP, 96) * DERIBIT_RESOLUTION_SECONDS[DERIBIT_BASE_HOURLY_RESOLUTION] * 1000),
+                _, cached_volatility, cached_spot, _ = cached_hourly
+                fetch_start_ts = _hourly_fetch_start_ts(
+                    cached_volatility=cached_volatility,
+                    cached_spot=cached_spot,
                 )
             fetched_volatility = self.client.get_volatility_index_candles(
                 currency,
@@ -407,6 +436,7 @@ class DeribitVolatilityWindow:
                     lambda force=force_network: self._refresh_for_current_selection(
                         use_cache=True,
                         force_network=force,
+                        supersede_if_loading=False,
                     ),
                 )
             return
@@ -477,6 +507,7 @@ class DeribitVolatilityWindow:
                 lambda force=force_network: self._refresh_for_current_selection(
                     use_cache=True,
                     force_network=force,
+                    supersede_if_loading=False,
                 ),
             )
 
@@ -525,6 +556,7 @@ class DeribitVolatilityWindow:
                 lambda force=force_network: self._refresh_for_current_selection(
                     use_cache=True,
                     force_network=force,
+                    supersede_if_loading=False,
                 ),
             )
         return
@@ -532,7 +564,14 @@ class DeribitVolatilityWindow:
         messagebox.showerror("获取失败", str(exc), parent=self.window)
         if self._pending_refresh_after_load:
             self._pending_refresh_after_load = False
-            self.window.after(10, lambda: self._refresh_for_current_selection(use_cache=True, force_network=True))
+            self.window.after(
+                10,
+                lambda: self._refresh_for_current_selection(
+                    use_cache=True,
+                    force_network=True,
+                    supersede_if_loading=False,
+                ),
+            )
 
     def export_csv(self) -> None:
         if self._latest_snapshot is None or not self._latest_snapshot.aligned_volatility_candles:
@@ -593,7 +632,7 @@ class DeribitVolatilityWindow:
         self._auto_refresh_job = None
         if not self.window.winfo_exists() or self.window.state() == "withdrawn":
             return
-        self._refresh_for_current_selection(use_cache=True, force_network=True)
+        self._refresh_for_current_selection(use_cache=True, force_network=True, supersede_if_loading=False)
 
     def _cache_file_path(self) -> Path:
         return Path(__file__).resolve().parent.parent / DERIBIT_VOLATILITY_CACHE_FILE_NAME
