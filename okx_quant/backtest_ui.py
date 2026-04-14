@@ -1301,7 +1301,7 @@ class BacktestWindow:
 
         self.trade_tree = ttk.Treeview(
             trade_tree_frame,
-            columns=("seq", "signal", "entry_time", "entry", "stop", "atr", "size", "exit_time", "exit", "reason", "pnl", "r"),
+            columns=("seq", "signal", "entry_time", "entry", "stop", "atr", "size", "exit_time", "exit", "fee", "reason", "pnl", "r"),
             show="headings",
             selectmode="browse",
         )
@@ -1314,6 +1314,7 @@ class BacktestWindow:
         self.trade_tree.heading("size", text="开仓数量")
         self.trade_tree.heading("exit_time", text="出场时间")
         self.trade_tree.heading("exit", text="出场价格")
+        self.trade_tree.heading("fee", text="手续费")
         self.trade_tree.heading("reason", text="原因")
         self.trade_tree.heading("pnl", text="盈亏")
         self.trade_tree.heading("r", text="R倍数")
@@ -1326,6 +1327,7 @@ class BacktestWindow:
         self.trade_tree.column("size", width=100, anchor="e")
         self.trade_tree.column("exit_time", width=140, anchor="center")
         self.trade_tree.column("exit", width=110, anchor="e")
+        self.trade_tree.column("fee", width=100, anchor="e")
         self.trade_tree.column("reason", width=90, anchor="center")
         self.trade_tree.column("pnl", width=110, anchor="e")
         self.trade_tree.column("r", width=90, anchor="e")
@@ -2439,6 +2441,7 @@ class BacktestWindow:
                     format_decimal_fixed(trade.size, 4),
                     _format_chart_timestamp(trade.exit_ts),
                     format_decimal_fixed(trade.exit_price, 4),
+                    format_decimal_fixed(trade.total_fee, 4),
                     exit_reason,
                     format_decimal_fixed(trade.pnl, 4),
                     format_decimal_fixed(trade.r_multiple, 4),

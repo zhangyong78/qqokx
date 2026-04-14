@@ -4,9 +4,9 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 
-from okx_quant.engine import build_order_plan, determine_order_size
+from okx_quant.engine import build_protection_plan, determine_order_size
 from okx_quant.indicators import atr, ema
-from okx_quant.models import Candle, Instrument, SignalDecision, StrategyConfig
+from okx_quant.models import Candle, Instrument, OrderPlan, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
@@ -298,6 +298,106 @@ def build_parameter_batch_configs(
     return configs
 
 
+def _backtest_min_order_size(instrument: Instrument) -> Decimal:
+    minimum = snap_to_increment(instrument.min_size, instrument.lot_size, "up")
+    if minimum < instrument.min_size:
+        return instrument.min_size
+    return minimum
+
+
+def _determine_backtest_order_size(
+    *,
+    instrument: Instrument,
+    config: StrategyConfig,
+    entry_price: Decimal,
+    stop_loss: Decimal,
+    risk_price_compatible: bool,
+) -> Decimal:
+    if config.risk_amount is not None and config.risk_amount > 0 and risk_price_compatible:
+        risk_per_unit = abs(entry_price - stop_loss)
+        if risk_per_unit <= 0:
+            raise RuntimeError("开仓价与止损价过于接近，无法根据风险金计算数量")
+        size_raw = config.risk_amount / risk_per_unit
+        size = snap_to_increment(size_raw, instrument.lot_size, "down")
+        if size < instrument.min_size:
+            return _backtest_min_order_size(instrument)
+        return size
+
+    return determine_order_size(
+        instrument=instrument,
+        config=config,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        risk_price_compatible=risk_price_compatible,
+    )
+
+
+def _build_backtest_order_plan(
+    *,
+    instrument: Instrument,
+    config: StrategyConfig,
+    order_size: Decimal | None,
+    signal: str,
+    entry_reference: Decimal,
+    atr_value: Decimal,
+    candle_ts: int,
+    signal_candle_high: Decimal | None = None,
+    signal_candle_low: Decimal | None = None,
+) -> OrderPlan:
+    protection = build_protection_plan(
+        instrument=instrument,
+        config=config,
+        direction=signal,
+        entry_reference=entry_reference,
+        atr_value=atr_value,
+        candle_ts=candle_ts,
+        trigger_inst_id=instrument.inst_id,
+        use_signal_extrema=config.strategy_id == STRATEGY_CROSS_ID,
+        signal_candle_high=signal_candle_high,
+        signal_candle_low=signal_candle_low,
+    )
+
+    side = "buy" if signal == "long" else "sell"
+    pos_side = None
+    if config.position_mode == "long_short":
+        pos_side = "long" if side == "buy" else "short"
+
+    if config.risk_amount is not None and config.risk_amount > 0:
+        size = _determine_backtest_order_size(
+            instrument=instrument,
+            config=config,
+            entry_price=protection.entry_reference,
+            stop_loss=protection.stop_loss,
+            risk_price_compatible=True,
+        )
+    else:
+        if order_size is None:
+            raise RuntimeError("缂哄皯涓嬪崟鏁伴噺锛屼笖鏈缃闄╅噾")
+        manual_config = replace(config, order_size=order_size, risk_amount=None)
+        size = _determine_backtest_order_size(
+            instrument=instrument,
+            config=manual_config,
+            entry_price=protection.entry_reference,
+            stop_loss=protection.stop_loss,
+            risk_price_compatible=False,
+        )
+
+    return OrderPlan(
+        inst_id=instrument.inst_id,
+        side=side,
+        pos_side=pos_side,
+        size=size,
+        take_profit=protection.take_profit,
+        stop_loss=protection.stop_loss,
+        entry_reference=protection.entry_reference,
+        atr_value=protection.atr_value,
+        signal=signal,
+        candle_ts=candle_ts,
+        tp_sl_inst_id=instrument.inst_id,
+        tp_sl_mode="exchange",
+    )
+
+
 def run_backtest_batch(
     client: OkxRestClient,
     base_config: StrategyConfig,
@@ -439,6 +539,13 @@ def format_backtest_report(result: BacktestResult) -> str:
     report = result.report
     start_time = _format_backtest_timestamp(result.candles[0].ts) if result.candles else "-"
     end_time = _format_backtest_timestamp(result.candles[-1].ts) if result.candles else "-"
+    pnl_before_fees = report.total_pnl + report.total_fees
+    average_fee = report.total_fees / Decimal(report.total_trades) if report.total_trades > 0 else Decimal("0")
+    fee_to_prefee_pct = None if pnl_before_fees == 0 else (report.total_fees / abs(pnl_before_fees)) * Decimal("100")
+    fee_to_net_pct = None if report.total_pnl == 0 else (report.total_fees / abs(report.total_pnl)) * Decimal("100")
+    fee_to_capital_pct = (
+        Decimal("0") if result.initial_capital <= 0 else (report.total_fees / result.initial_capital) * Decimal("100")
+    )
     lines = [
         f"回测K线数：{len(result.candles)}",
         f"开始时间：{start_time}",
@@ -463,6 +570,19 @@ def format_backtest_report(result: BacktestResult) -> str:
         f"手续费合计：{format_decimal_fixed(report.total_fees, 4)}",
         f"Maker手续费合计：{format_decimal_fixed(report.maker_fees, 4)}",
         f"Taker手续费合计：{format_decimal_fixed(report.taker_fees, 4)}",
+        f"手续费前盈亏：{format_decimal_fixed(pnl_before_fees, 4)}",
+        f"平均单笔手续费：{format_decimal_fixed(average_fee, 4)}",
+        (
+            f"手续费占手续费前盈亏：{format_decimal_fixed(fee_to_prefee_pct, 2)}%"
+            if fee_to_prefee_pct is not None
+            else "手续费占手续费前盈亏：无"
+        ),
+        (
+            f"手续费占净盈亏绝对值：{format_decimal_fixed(fee_to_net_pct, 2)}%"
+            if fee_to_net_pct is not None
+            else "手续费占净盈亏绝对值：无"
+        ),
+        f"手续费占初始资金：{format_decimal_fixed(fee_to_capital_pct, 2)}%",
         f"滑点成本合计：{format_decimal_fixed(report.slippage_costs, 4)}",
         f"资金费合计：{format_decimal_fixed(report.funding_costs, 4)}",
         f"止盈触发次数：{report.take_profit_hits}",
@@ -692,7 +812,7 @@ def _run_ema5_ema8_backtest(
             continue
 
         resolved_config = _resolve_backtest_config(config, trades)
-        size = determine_order_size(
+        size = _determine_backtest_order_size(
             instrument=instrument,
             config=resolved_config,
             entry_price=decision.entry_reference,
@@ -765,7 +885,7 @@ def _run_cross_backtest(
             continue
 
         resolved_config = _resolve_backtest_config(config, trades)
-        plan = build_order_plan(
+        plan = _build_backtest_order_plan(
             instrument=instrument,
             config=resolved_config,
             order_size=resolved_config.order_size,
@@ -901,7 +1021,7 @@ def _run_dynamic_backtest(
             continue
 
         resolved_config = _resolve_backtest_config(config, trades)
-        active_plan = build_order_plan(
+        active_plan = _build_backtest_order_plan(
             instrument=instrument,
             config=resolved_config,
             order_size=resolved_config.order_size,

@@ -14,6 +14,7 @@ from okx_quant.backtest import (
     _build_drawdown_curves,
     _build_equity_curve,
     _build_period_stats,
+    _determine_backtest_order_size,
     _load_backtest_candles,
     _backtest_trade_start_index,
     _format_backtest_timestamp,
@@ -114,6 +115,44 @@ class BacktestTest(TestCase):
     def test_backtest_default_fee_percents(self) -> None:
         self.assertEqual(DEFAULT_MAKER_FEE_PERCENT, "0.015")
         self.assertEqual(DEFAULT_TAKER_FEE_PERCENT, "0.036")
+
+    def test_backtest_risk_size_below_min_order_size_is_clamped_to_min_size(self) -> None:
+        instrument = Instrument(
+            inst_id="BNB-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+        config = StrategyConfig(
+            inst_id="BNB-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_ID,
+            risk_amount=Decimal("100"),
+        )
+
+        size = _determine_backtest_order_size(
+            instrument=instrument,
+            config=config,
+            entry_price=Decimal("600"),
+            stop_loss=Decimal("900"),
+            risk_price_compatible=True,
+        )
+
+        self.assertEqual(size, Decimal("1"))
 
     def _build_instrument(self) -> Instrument:
         return Instrument(
@@ -1075,6 +1114,10 @@ class BacktestTest(TestCase):
         self.assertIn("Maker手续费：0.0200%", report_text)
         self.assertIn("Taker手续费：0.0500%", report_text)
         self.assertIn("手续费合计：0.6400", report_text)
+        self.assertIn("手续费前盈亏：10.0000", report_text)
+        self.assertIn("平均单笔手续费：0.6400", report_text)
+        self.assertIn("手续费占手续费前盈亏：6.40%", report_text)
+        self.assertIn("手续费占净盈亏绝对值：6.84%", report_text)
 
     def test_export_single_backtest_report_writes_file(self) -> None:
         with TemporaryDirectory() as temp_dir:
