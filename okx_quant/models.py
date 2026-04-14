@@ -15,6 +15,7 @@ TpSlMode = Literal["exchange", "local_trade", "local_signal", "local_custom"]
 EntrySideMode = Literal["follow_signal", "fixed_buy", "fixed_sell"]
 RunMode = Literal["trade", "signal_only"]
 BacktestSizingMode = Literal["fixed_risk", "fixed_size", "risk_percent"]
+TakeProfitMode = Literal["fixed", "dynamic"]
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,8 @@ class StrategyConfig:
     backtest_compounding: bool = False
     backtest_slippage_rate: Decimal = Decimal("0")
     backtest_funding_rate: Decimal = Decimal("0")
+    take_profit_mode: TakeProfitMode = "fixed"
+    max_entries_per_trend: int = 0
 
 
 @dataclass(frozen=True)

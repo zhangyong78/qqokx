@@ -64,9 +64,13 @@ from okx_quant.smart_order_ui import SmartOrderWindow
 from okx_quant.strategy_catalog import (
     STRATEGY_DEFINITIONS,
     STRATEGY_DYNAMIC_ID,
+    STRATEGY_DYNAMIC_LONG_ID,
+    STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
     StrategyDefinition,
     get_strategy_definition,
+    is_dynamic_strategy_id,
+    resolve_dynamic_signal_mode,
 )
 from okx_quant.window_layout import (
     apply_adaptive_window_geometry,
@@ -137,6 +141,10 @@ ENTRY_SIDE_MODE_OPTIONS = {
     "跟随信号": "follow_signal",
     "固定买入": "fixed_buy",
     "固定卖出": "fixed_sell",
+}
+TAKE_PROFIT_MODE_OPTIONS = {
+    "固定止盈": "fixed",
+    "动态止盈": "dynamic",
 }
 RUN_MODE_OPTIONS = {
     "交易并下单": "trade",
@@ -374,6 +382,8 @@ class QuantApp:
         self.order_size = StringVar(value="1")
         self.poll_seconds = StringVar(value="10")
         self.signal_mode_label = StringVar(value=STRATEGY_DEFINITIONS[0].default_signal_label)
+        self.take_profit_mode_label = StringVar(value="固定止盈")
+        self.max_entries_per_trend = StringVar(value="0")
         self.run_mode_label = StringVar(value="交易并下单")
         self.trade_mode_label = StringVar(value="全仓 cross")
         self.position_mode_label = StringVar(value="净持仓 net")
@@ -593,6 +603,21 @@ class QuantApp:
         ttk.Label(start_frame, text="信号方向").grid(row=row, column=2, sticky="w", pady=(12, 0))
         self.signal_combo = ttk.Combobox(start_frame, textvariable=self.signal_mode_label, state="readonly")
         self.signal_combo.grid(row=row, column=3, sticky="ew", pady=(12, 0))
+
+        row += 1
+        self._take_profit_mode_label = ttk.Label(start_frame, text="止盈方式")
+        self._take_profit_mode_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self._take_profit_mode_combo = ttk.Combobox(
+            start_frame,
+            textvariable=self.take_profit_mode_label,
+            values=list(TAKE_PROFIT_MODE_OPTIONS.keys()),
+            state="readonly",
+        )
+        self._take_profit_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
+        self._max_entries_per_trend_label = ttk.Label(start_frame, text="每波最多开仓次数")
+        self._max_entries_per_trend_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self._max_entries_per_trend_entry = ttk.Entry(start_frame, textvariable=self.max_entries_per_trend)
+        self._max_entries_per_trend_entry.grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
         row += 1
         ttk.Label(start_frame, text="运行模式").grid(row=row, column=0, sticky="w", pady=(12, 0))
@@ -3560,6 +3585,8 @@ class QuantApp:
                 stop_atr=self.stop_atr.get(),
                 take_atr=self.take_atr.get(),
                 risk_amount=self.risk_amount.get(),
+                take_profit_mode_label=self.take_profit_mode_label.get(),
+                max_entries_per_trend=self.max_entries_per_trend.get(),
                 signal_mode_label=self.signal_mode_label.get(),
                 trade_mode_label=self.trade_mode_label.get(),
                 position_mode_label=self.position_mode_label.get(),
@@ -4555,12 +4582,24 @@ class QuantApp:
         self.signal_combo["values"] = definition.allowed_signal_labels
         if self.signal_mode_label.get() not in definition.allowed_signal_labels:
             self.signal_mode_label.set(definition.default_signal_label)
+        if is_dynamic_strategy_id(definition.strategy_id):
+            self._take_profit_mode_label.grid()
+            self._take_profit_mode_combo.grid()
+            self._max_entries_per_trend_label.grid()
+            self._max_entries_per_trend_entry.grid()
+        else:
+            self._take_profit_mode_label.grid_remove()
+            self._take_profit_mode_combo.grid_remove()
+            self._max_entries_per_trend_label.grid_remove()
+            self._max_entries_per_trend_entry.grid_remove()
         if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
             self.bar.set("4H")
             self.ema_period.set("5")
             self.trend_ema_period.set("8")
             self.big_ema_period.set("233")
             self.risk_amount.set("100")
+            self.take_profit_mode_label.set("固定止盈")
+            self.max_entries_per_trend.set("0")
             self.entry_side_mode_label.set("跟随信号")
             self.tp_sl_mode_label.set("按信号标的的价格（本地）")
         if self._strategy_uses_big_ema(definition.strategy_id):
@@ -4594,6 +4633,13 @@ class QuantApp:
             f"EMA小周期：{config.ema_period}",
             f"EMA中周期：{config.trend_ema_period}",
         ]
+        if is_dynamic_strategy_id(definition.strategy_id):
+            lines.extend(
+                [
+                    f"止盈方式：{self.take_profit_mode_label.get()}",
+                    f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}",
+                ]
+            )
         if self._strategy_uses_big_ema(definition.strategy_id):
             lines.append(f"EMA大周期：{config.big_ema_period}")
         lines.extend(
@@ -4619,8 +4665,13 @@ class QuantApp:
         local_tp_sl_symbol = _normalize_symbol_input(self.local_tp_sl_symbol.get()) or None
         tp_sl_mode = TP_SL_MODE_OPTIONS[self.tp_sl_mode_label.get()]
         run_mode = RUN_MODE_OPTIONS[self.run_mode_label.get()]
+        effective_signal_mode = resolve_dynamic_signal_mode(
+            definition.strategy_id,
+            SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()],
+        )
         risk_amount = self._parse_optional_positive_decimal(self.risk_amount.get(), "风险金")
         order_size = self._parse_optional_positive_decimal(self.order_size.get(), "固定数量") or Decimal("0")
+        max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
 
         if not api_key or not secret_key or not passphrase:
             raise ValueError("请先在 菜单 > 设置 > API 与通知设置 中填写 API 凭证")
@@ -4632,6 +4683,8 @@ class QuantApp:
                     raise ValueError("OKX 托管止盈止损只支持信号标的和下单标的相同")
                 if infer_inst_type(trade_symbol) != "SWAP":
                     raise ValueError("OKX 托管止盈止损当前只支持永续合约")
+                if is_dynamic_strategy_id(definition.strategy_id) and TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()] == "dynamic":
+                    raise ValueError("EMA 动态委托的动态止盈需要本地托管止盈止损，请不要选择 OKX 托管。")
             if tp_sl_mode == "local_custom" and not local_tp_sl_symbol:
                 raise ValueError("已选择自定义本地止盈止损，请填写触发标的")
             if risk_amount is None and order_size <= 0:
@@ -4663,7 +4716,7 @@ class QuantApp:
             atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
             order_size=order_size,
             trade_mode=TRADE_MODE_OPTIONS[self.trade_mode_label.get()],
-            signal_mode=SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()],
+            signal_mode=effective_signal_mode,
             position_mode=POSITION_MODE_OPTIONS[self.position_mode_label.get()],
             environment=ENV_OPTIONS[self.environment_label.get()],
             tp_sl_trigger_type=TRIGGER_TYPE_OPTIONS[self.trigger_type_label.get()],
@@ -4675,6 +4728,8 @@ class QuantApp:
             local_tp_sl_inst_id=local_tp_sl_symbol,
             entry_side_mode="follow_signal" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else ENTRY_SIDE_MODE_OPTIONS[self.entry_side_mode_label.get()],
             run_mode=run_mode,
+            take_profit_mode=TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()],
+            max_entries_per_trend=max_entries_per_trend,
         )
         return credentials, config
 
@@ -4848,6 +4903,15 @@ class QuantApp:
             raise ValueError(f"{field_name} 不是有效整数") from exc
         if value <= 0:
             raise ValueError(f"{field_name} 必须大于 0")
+        return value
+
+    def _parse_nonnegative_int(self, raw: str, field_name: str) -> int:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 不是有效整数") from exc
+        if value < 0:
+            raise ValueError(f"{field_name} 不能小于 0")
         return value
 
     def _parse_positive_decimal(self, raw: str, field_name: str) -> Decimal:

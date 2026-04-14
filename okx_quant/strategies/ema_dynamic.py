@@ -2,17 +2,14 @@ from __future__ import annotations
 
 from okx_quant.indicators import atr, ema
 from okx_quant.models import Candle, SignalDecision, StrategyConfig
+from okx_quant.strategy_catalog import resolve_dynamic_signal_mode
 
 
 class EmaDynamicOrderStrategy:
     name = "ema_dynamic"
 
     def evaluate(self, candles: list[Candle], config: StrategyConfig) -> SignalDecision:
-        minimum = max(
-            config.ema_period,
-            config.trend_ema_period,
-            config.atr_period,
-        )
+        minimum = max(config.ema_period, config.trend_ema_period, config.atr_period)
         if len(candles) < minimum:
             return SignalDecision(
                 signal=None,
@@ -46,13 +43,15 @@ class EmaDynamicOrderStrategy:
                 signal_candle_low=current_candle.low,
             )
 
-        if config.signal_mode == "long_only":
+        effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
+
+        if effective_signal_mode == "long_only":
             if current_ema <= trend_ema:
                 return SignalDecision(
                     signal=None,
                     reason=(
-                        f"EMA{config.ema_period} 当前仍在 EMA{config.trend_ema_period} 下方，"
-                        "中周期趋势过滤不允许做多。"
+                        f"EMA{config.ema_period} 仍在 EMA{config.trend_ema_period} 下方，"
+                        "当前不是有效多头趋势。"
                     ),
                     candle_ts=current_candle.ts,
                     entry_reference=None,
@@ -65,8 +64,8 @@ class EmaDynamicOrderStrategy:
                 return SignalDecision(
                     signal=None,
                     reason=(
-                        f"最近一根已收盘 K 线未站上 EMA{config.trend_ema_period}，"
-                        "中周期趋势过滤不允许做多。"
+                        f"收盘价仍在 EMA{config.trend_ema_period} 下方，"
+                        "当前不是有效多头趋势。"
                     ),
                     candle_ts=current_candle.ts,
                     entry_reference=None,
@@ -77,17 +76,15 @@ class EmaDynamicOrderStrategy:
                 )
             signal = "long"
             reason = (
-                f"以上一根已收盘 EMA{config.ema_period} 作为做多回调挂单价，"
-                f"且 EMA{config.ema_period} > EMA{config.trend_ema_period}，"
-                f"收盘价位于 EMA{config.trend_ema_period} 上方。"
+                f"多头趋势成立，以 EMA{config.ema_period} 作为下一根回调委托价。"
             )
-        elif config.signal_mode == "short_only":
+        elif effective_signal_mode == "short_only":
             if current_ema >= trend_ema:
                 return SignalDecision(
                     signal=None,
                     reason=(
-                        f"EMA{config.ema_period} 当前仍在 EMA{config.trend_ema_period} 上方，"
-                        "中周期趋势过滤不允许做空。"
+                        f"EMA{config.ema_period} 仍在 EMA{config.trend_ema_period} 上方，"
+                        "当前不是有效空头趋势。"
                     ),
                     candle_ts=current_candle.ts,
                     entry_reference=None,
@@ -100,8 +97,8 @@ class EmaDynamicOrderStrategy:
                 return SignalDecision(
                     signal=None,
                     reason=(
-                        f"最近一根已收盘 K 线未跌破 EMA{config.trend_ema_period}，"
-                        "中周期趋势过滤不允许做空。"
+                        f"收盘价仍在 EMA{config.trend_ema_period} 上方，"
+                        "当前不是有效空头趋势。"
                     ),
                     candle_ts=current_candle.ts,
                     entry_reference=None,
@@ -112,14 +109,12 @@ class EmaDynamicOrderStrategy:
                 )
             signal = "short"
             reason = (
-                f"以上一根已收盘 EMA{config.ema_period} 作为做空反弹挂单价，"
-                f"且 EMA{config.ema_period} < EMA{config.trend_ema_period}，"
-                f"收盘价位于 EMA{config.trend_ema_period} 下方。"
+                f"空头趋势成立，以 EMA{config.ema_period} 作为下一根反弹委托价。"
             )
         else:
             return SignalDecision(
                 signal=None,
-                reason="EMA 动态委托策略只支持只做多或只做空。",
+                reason="EMA 动态委托只支持单向运行，请选择只做多或只做空。",
                 candle_ts=current_candle.ts,
                 entry_reference=None,
                 atr_value=current_atr,

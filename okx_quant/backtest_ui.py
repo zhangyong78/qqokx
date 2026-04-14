@@ -25,11 +25,14 @@ from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import backtest_history_file_path
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import (
+    ALL_STRATEGY_DEFINITIONS,
     STRATEGY_DEFINITIONS,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA5_EMA8_ID,
     StrategyDefinition,
     get_strategy_definition,
+    is_dynamic_strategy_id,
+    resolve_dynamic_signal_mode,
 )
 from okx_quant.window_layout import apply_adaptive_window_geometry
 
@@ -64,7 +67,7 @@ BACKTEST_BAR_LABEL_TO_VALUE = {
 }
 BACKTEST_BAR_VALUE_TO_LABEL = {value: label for label, value in BACKTEST_BAR_LABEL_TO_VALUE.items()}
 DEFAULT_BACKTEST_BAR_LABEL = "15分钟"
-STRATEGY_ID_TO_NAME = {item.strategy_id: item.name for item in STRATEGY_DEFINITIONS}
+STRATEGY_ID_TO_NAME = {item.strategy_id: item.name for item in ALL_STRATEGY_DEFINITIONS}
 SIGNAL_VALUE_TO_LABEL = {value: label for label, value in SIGNAL_LABEL_TO_VALUE.items()}
 BACKTEST_SYMBOL_OPTIONS = (
     "BTC-USDT-SWAP",
@@ -81,6 +84,10 @@ BACKTEST_SIZING_OPTIONS = {
     "风险百分比": "risk_percent",
 }
 BACKTEST_SIZING_VALUE_TO_LABEL = {value: label for label, value in BACKTEST_SIZING_OPTIONS.items()}
+TAKE_PROFIT_MODE_OPTIONS = {
+    "固定止盈": "fixed",
+    "动态止盈": "dynamic",
+}
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,8 @@ class BacktestLaunchState:
     stop_atr: str
     take_atr: str
     risk_amount: str
+    take_profit_mode_label: str
+    max_entries_per_trend: str
     signal_mode_label: str
     trade_mode_label: str
     position_mode_label: str
@@ -354,7 +363,7 @@ def _build_backtest_param_summary(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> str:
-    if config.strategy_id == STRATEGY_DYNAMIC_ID:
+    if is_dynamic_strategy_id(config.strategy_id):
         risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
         sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
         if config.backtest_sizing_mode == "risk_percent":
@@ -363,9 +372,12 @@ def _build_backtest_param_summary(
             sizing_text = f"{sizing_label}{format_decimal(config.order_size)}"
         else:
             sizing_text = f"{sizing_label}{risk_text}"
+        take_profit_label = "动态止盈" if config.take_profit_mode == "dynamic" else "固定止盈"
+        max_entries_text = "不限" if config.max_entries_per_trend <= 0 else f"每波前{config.max_entries_per_trend}次"
         return (
             f"EMA{config.ema_period}/{config.trend_ema_period} / ATR{config.atr_period} / "
             f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
+            f"{take_profit_label} / {max_entries_text} / "
             f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
             f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
             f"{'复利' if config.backtest_compounding else '不复利'} / "
@@ -460,6 +472,8 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "local_tp_sl_inst_id": config.local_tp_sl_inst_id,
         "entry_side_mode": config.entry_side_mode,
         "run_mode": config.run_mode,
+        "take_profit_mode": config.take_profit_mode,
+        "max_entries_per_trend": config.max_entries_per_trend,
         "backtest_initial_capital": str(config.backtest_initial_capital),
         "backtest_sizing_mode": config.backtest_sizing_mode,
         "backtest_risk_percent": None
@@ -499,6 +513,8 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         else str(payload.get("local_tp_sl_inst_id")),
         entry_side_mode=str(payload.get("entry_side_mode", "follow_signal")),
         run_mode=str(payload.get("run_mode", "trade")),
+        take_profit_mode=str(payload.get("take_profit_mode", "fixed")),
+        max_entries_per_trend=int(payload.get("max_entries_per_trend", 0)),
         backtest_initial_capital=Decimal(str(payload.get("backtest_initial_capital", "10000"))),
         backtest_sizing_mode=str(payload.get("backtest_sizing_mode", "fixed_risk")),
         backtest_risk_percent=None
@@ -785,6 +801,8 @@ class BacktestWindow:
         self.funding_rate_percent = StringVar(value=initial_state.funding_rate_percent)
         self.start_time_text = StringVar(value=initial_state.start_time_text)
         self.end_time_text = StringVar(value=initial_state.end_time_text)
+        self.take_profit_mode_label = StringVar(value=initial_state.take_profit_mode_label)
+        self.max_entries_per_trend = StringVar(value=initial_state.max_entries_per_trend)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
         self.position_mode_label = StringVar(value=initial_state.position_mode_label)
@@ -910,6 +928,21 @@ class BacktestWindow:
         ttk.Label(controls, text="信号方向").grid(row=row, column=0, sticky="w", pady=(12, 0))
         self.signal_combo = ttk.Combobox(controls, textvariable=self.signal_mode_label, state="readonly")
         self.signal_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+
+        row += 1
+        self.take_profit_mode_caption = ttk.Label(controls, text="止盈方式")
+        self.take_profit_mode_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self.take_profit_mode_combo = ttk.Combobox(
+            controls,
+            textvariable=self.take_profit_mode_label,
+            values=list(TAKE_PROFIT_MODE_OPTIONS.keys()),
+            state="readonly",
+        )
+        self.take_profit_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.max_entries_caption = ttk.Label(controls, text="每波最多开仓次数")
+        self.max_entries_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self.max_entries_entry = ttk.Entry(controls, textvariable=self.max_entries_per_trend)
+        self.max_entries_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
 
         row += 1
         self.size_or_risk_label = ttk.Label(controls, text="固定风险金/数量")
@@ -1538,6 +1571,7 @@ class BacktestWindow:
 
     def _build_config(self) -> StrategyConfig:
         definition = self._selected_strategy_definition()
+        dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
         sizing_mode = BACKTEST_SIZING_OPTIONS[self.sizing_mode_label.get()]
         size_or_risk = self._parse_positive_decimal(self.risk_amount.get(), "固定风险金/数量")
         risk_percent = None
@@ -1552,23 +1586,39 @@ class BacktestWindow:
         if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
             risk_amount = Decimal("100")
             order_size = Decimal("0")
+        signal_mode = SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()]
+        if dynamic_strategy:
+            signal_mode = resolve_dynamic_signal_mode(definition.strategy_id, signal_mode)
+        take_profit_mode = "fixed"
+        max_entries_per_trend = 0
+        if dynamic_strategy:
+            take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
+            max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
         return StrategyConfig(
             inst_id=self.symbol.get().strip().upper(),
             bar="4H" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else _backtest_bar_value_from_label(self.bar_label.get()),
             ema_period=5 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.ema_period.get(), "EMA小周期"),
             trend_ema_period=8 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期"),
-            big_ema_period=233 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.big_ema_period.get(), "EMA大周期"),
+            big_ema_period=233
+            if definition.strategy_id == STRATEGY_EMA5_EMA8_ID
+            else (
+                self._parse_positive_int(self.big_ema_period.get(), "EMA大周期")
+                if self._strategy_uses_big_ema(definition.strategy_id)
+                else 0
+            ),
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
             atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
             order_size=order_size,
             trade_mode=TRADE_MODE_OPTIONS[self.trade_mode_label.get()],
-            signal_mode=SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()],
+            signal_mode=signal_mode,
             position_mode=POSITION_MODE_OPTIONS[self.position_mode_label.get()],
             environment=ENV_OPTIONS[self.environment_label.get()],
             tp_sl_trigger_type=TRIGGER_TYPE_OPTIONS[self.trigger_type_label.get()],
             strategy_id=definition.strategy_id,
             risk_amount=risk_amount,
+            take_profit_mode=take_profit_mode,
+            max_entries_per_trend=max_entries_per_trend,
             backtest_initial_capital=self._parse_positive_decimal(self.initial_capital.get(), "初始资金"),
             backtest_sizing_mode=sizing_mode,
             backtest_risk_percent=risk_percent,
@@ -1587,6 +1637,7 @@ class BacktestWindow:
 
     def _apply_selected_strategy_definition(self) -> None:
         definition = self._selected_strategy_definition()
+        dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
         self.signal_combo["values"] = definition.allowed_signal_labels
         if self.signal_mode_label.get() not in definition.allowed_signal_labels:
             self.signal_mode_label.set(definition.default_signal_label)
@@ -1600,6 +1651,17 @@ class BacktestWindow:
             big_ema_widgets = self._controls_frame.grid_slaves(row=1, column=4) + self._controls_frame.grid_slaves(row=1, column=5)
             for widget in big_ema_widgets:
                 if self._strategy_uses_big_ema(definition.strategy_id):
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            dynamic_widgets = (
+                self.take_profit_mode_caption,
+                self.take_profit_mode_combo,
+                self.max_entries_caption,
+                self.max_entries_entry,
+            )
+            for widget in dynamic_widgets:
+                if dynamic_strategy:
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -2607,6 +2669,15 @@ class BacktestWindow:
         value = int(raw)
         if value <= 0:
             raise ValueError(f"{field_name} 必须大于 0")
+        return value
+
+    def _parse_nonnegative_int(self, raw: str, field_name: str) -> int:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 不是有效整数") from exc
+        if value < 0:
+            raise ValueError(f"{field_name} 不能小于 0")
         return value
 
     def _parse_positive_decimal(self, raw: str, field_name: str) -> Decimal:

@@ -315,6 +315,8 @@ class BacktestTest(TestCase):
                 current_price=Decimal("95"),
                 stop_loss=Decimal("105"),
                 take_profit=Decimal("90"),
+                initial_stop_loss=Decimal("105"),
+                initial_take_profit=Decimal("90"),
                 size=Decimal("2"),
                 gross_pnl=Decimal("10"),
                 pnl=Decimal("9.5"),
@@ -581,7 +583,8 @@ class BacktestTest(TestCase):
 
         report_text = format_backtest_report(result)
 
-        self.assertIn("趋势过滤：EMA21 > EMA55 且收盘价位于 EMA55 上方才做多，EMA21 < EMA55 且收盘价位于 EMA55 下方才做空", report_text)
+        self.assertIn("趋势过滤：EMA21 与 EMA55 组成趋势过滤", report_text)
+        self.assertIn("止盈模式：固定止盈或永久阶梯动态止盈", report_text)
         self.assertIn("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓", report_text)
 
     def test_ema5_ema8_backtest_uses_dynamic_ema_stop(self) -> None:
@@ -807,7 +810,7 @@ class BacktestTest(TestCase):
         self.assertEqual(row[0], "R001")
         self.assertEqual(row[2], "2024-03-23 08:00")
         self.assertEqual(row[3], "2024-03-24 08:00")
-        self.assertEqual(row[4], "EMA 动态委托")
+        self.assertIn("EMA 动态委托", row[4])
         self.assertEqual(row[5], "BTC-USDT-SWAP")
         self.assertEqual(row[6], "15分钟")
         self.assertIn("EMA21", row[7])
@@ -1432,10 +1435,8 @@ def _patched_dynamic_backtest_report_includes_ema_relationship_filter(self: Back
 
     report_text = format_backtest_report(result)
 
-    self.assertIn(
-        "趋势过滤：EMA21 > EMA55 且收盘价位于 EMA55 上方才做多，EMA21 < EMA55 且收盘价位于 EMA55 下方才做空",
-        report_text,
-    )
+    self.assertIn("趋势过滤：EMA21 与 EMA55 组成趋势过滤", report_text)
+    self.assertIn("止盈模式：固定止盈或永久阶梯动态止盈", report_text)
     self.assertIn("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓", report_text)
 
 

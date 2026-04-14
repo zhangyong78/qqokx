@@ -12,7 +12,15 @@ from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_incr
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
-from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID, STRATEGY_EMA5_EMA8_ID
+from okx_quant.strategy_catalog import (
+    STRATEGY_CROSS_ID,
+    STRATEGY_DYNAMIC_ID,
+    STRATEGY_DYNAMIC_LONG_ID,
+    STRATEGY_DYNAMIC_SHORT_ID,
+    STRATEGY_EMA5_EMA8_ID,
+    is_dynamic_strategy_id,
+    resolve_dynamic_signal_mode,
+)
 
 
 MAX_BACKTEST_CANDLES = 10000
@@ -47,6 +55,7 @@ class BacktestTrade:
     r_multiple: Decimal
     exit_reason: str
     atr_value: Decimal = Decimal("0")
+    entry_sequence: int = 0
     entry_fee: Decimal = Decimal("0")
     exit_fee: Decimal = Decimal("0")
     total_fee: Decimal = Decimal("0")
@@ -140,6 +149,8 @@ class BacktestOpenPosition:
     current_price: Decimal
     stop_loss: Decimal
     take_profit: Decimal
+    initial_stop_loss: Decimal
+    initial_take_profit: Decimal
     size: Decimal
     gross_pnl: Decimal
     pnl: Decimal
@@ -158,9 +169,15 @@ class _OpenPosition:
     entry_price_raw: Decimal = Decimal("0")
     stop_loss: Decimal = Decimal("0")
     take_profit: Decimal = Decimal("0")
+    initial_stop_loss: Decimal = Decimal("0")
+    initial_take_profit: Decimal = Decimal("0")
     atr_value: Decimal = Decimal("0")
     size: Decimal = Decimal("0")
+    risk_per_unit: Decimal = Decimal("0")
     tick_size: Decimal = Decimal("0.1")
+    entry_sequence: int = 0
+    dynamic_take_profit_enabled: bool = False
+    next_dynamic_trigger_r: int = 2
     entry_fee_rate: Decimal = Decimal("0")
     entry_fee_type: str = "none"
     entry_slippage_cost: Decimal = Decimal("0")
@@ -286,7 +303,7 @@ def _run_backtest_with_loaded_data(
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> BacktestResult:
     terminal_open_position: BacktestOpenPosition | None = None
-    if config.strategy_id == STRATEGY_DYNAMIC_ID:
+    if is_dynamic_strategy_id(config.strategy_id):
         trades, terminal_open_position = _run_dynamic_backtest(
             candles,
             instrument,
@@ -313,7 +330,7 @@ def _run_backtest_with_loaded_data(
     ema_values = ema([candle.close for candle in candles], config.ema_period) if candles else []
     trend_ema_values = ema([candle.close for candle in candles], config.trend_ema_period) if candles else []
     atr_values = atr(candles, config.atr_period) if candles else []
-    if config.strategy_id == STRATEGY_DYNAMIC_ID:
+    if is_dynamic_strategy_id(config.strategy_id):
         big_ema_values: list[Decimal] = []
     else:
         big_ema_values = ema([candle.close for candle in candles], config.big_ema_period) if candles else []
@@ -388,11 +405,13 @@ def format_backtest_report(result: BacktestResult) -> str:
         f"止盈触发次数：{report.take_profit_hits}",
         f"止损触发次数：{report.stop_loss_hits}",
     ]
-    if result.strategy_id == STRATEGY_DYNAMIC_ID:
+    if is_dynamic_strategy_id(result.strategy_id):
+        direction_text = "做多" if result.strategy_id == STRATEGY_DYNAMIC_LONG_ID else "做空" if result.strategy_id == STRATEGY_DYNAMIC_SHORT_ID else "按方向参数"
         lines.append(
-            f"趋势过滤：EMA{result.ema_period} > EMA{result.trend_ema_period} 且收盘价位于 EMA{result.trend_ema_period} 上方才做多，"
-            f"EMA{result.ema_period} < EMA{result.trend_ema_period} 且收盘价位于 EMA{result.trend_ema_period} 下方才做空"
+            f"趋势过滤：EMA{result.ema_period} 与 EMA{result.trend_ema_period} 组成趋势过滤，当前策略方向={direction_text}"
         )
+        lines.append("委托规则：每根新 K 线按最新 EMA 重新撤旧挂新，未成交委托不跨 K 线保留")
+        lines.append("止盈模式：固定止盈或永久阶梯动态止盈，具体以当次参数为准")
         lines.append("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓")
     if result.strategy_id == STRATEGY_EMA5_EMA8_ID:
         lines.append(
@@ -429,8 +448,10 @@ def format_backtest_report(result: BacktestResult) -> str:
                 f"当前时间：{_format_backtest_timestamp(open_position.current_ts)}",
                 f"开仓价格：{format_decimal_fixed(open_position.entry_price, 4)}",
                 f"当前价格：{format_decimal_fixed(open_position.current_price, 4)}",
-                f"止损值：{format_decimal_fixed(open_position.stop_loss, 4)}",
-                f"止盈值：{format_decimal_fixed(open_position.take_profit, 4)}",
+                f"初始止损：{format_decimal_fixed(open_position.initial_stop_loss, 4)}",
+                f"当前止损：{format_decimal_fixed(open_position.stop_loss, 4)}",
+                f"初始止盈：{format_decimal_fixed(open_position.initial_take_profit, 4)}",
+                f"当前止盈：{format_decimal_fixed(open_position.take_profit, 4)}",
                 f"开仓数量：{format_decimal_fixed(open_position.size, 4)}",
                 f"浮动盈亏：{format_decimal_fixed(open_position.pnl, 4)}",
                 f"R倍数：{format_decimal_fixed(open_position.r_multiple, 4)}",
@@ -712,7 +733,7 @@ def _run_dynamic_backtest(
     *,
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
-) -> list[BacktestTrade]:
+) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
     minimum = max(
         config.ema_period,
         config.trend_ema_period,
@@ -731,6 +752,10 @@ def _run_dynamic_backtest(
     trades: list[BacktestTrade] = []
     open_position: _OpenPosition | None = None
     active_plan = None
+    current_wave_signal: str | None = None
+    entries_in_current_wave = 0
+    entry_sequence = 0
+    dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
 
     for index in range(trade_start_index, len(candles)):
         candle = candles[index]
@@ -757,9 +782,13 @@ def _run_dynamic_backtest(
                 entry_fee_type="maker",
                 slippage_rate=config.backtest_slippage_rate,
                 funding_rate=config.backtest_funding_rate,
+                entry_sequence=entry_sequence + 1,
+                dynamic_take_profit_enabled=dynamic_take_profit_enabled,
             )
             active_plan = None
             if filled_position is not None:
+                entry_sequence += 1
+                entries_in_current_wave += 1
                 closed_trade = _try_close_position_same_candle_after_fill(
                     filled_position,
                     candle,
@@ -784,8 +813,16 @@ def _run_dynamic_backtest(
             config,
         )
         if decision.signal is None:
+            current_wave_signal = None
+            entries_in_current_wave = 0
             continue
         if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
+            continue
+
+        if current_wave_signal != decision.signal:
+            current_wave_signal = decision.signal
+            entries_in_current_wave = 0
+        if config.max_entries_per_trend > 0 and entries_in_current_wave >= config.max_entries_per_trend:
             continue
 
         resolved_config = _resolve_backtest_config(config, trades)
@@ -824,6 +861,8 @@ def _run_dynamic_backtest(
             current_price=current_price,
             stop_loss=open_position.stop_loss,
             take_profit=open_position.take_profit,
+            initial_stop_loss=open_position.initial_stop_loss,
+            initial_take_profit=open_position.initial_take_profit,
             size=open_position.size,
             gross_pnl=gross_pnl,
             pnl=pnl,
@@ -860,7 +899,9 @@ def _evaluate_dynamic_signal_precomputed(
             signal_candle_low=current_candle.low,
         )
 
-    if config.signal_mode == "long_only":
+    effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
+
+    if effective_signal_mode == "long_only":
         if current_ema <= trend_ema:
             return SignalDecision(
                 signal=None,
@@ -894,7 +935,7 @@ def _evaluate_dynamic_signal_precomputed(
             signal_candle_low=current_candle.low,
         )
 
-    if config.signal_mode == "short_only":
+    if effective_signal_mode == "short_only":
         if current_ema >= trend_ema:
             return SignalDecision(
                 signal=None,
@@ -1002,6 +1043,10 @@ def _create_open_position(
     entry_fee_type: str,
     slippage_rate: Decimal,
     funding_rate: Decimal,
+    entry_sequence: int = 0,
+    dynamic_take_profit_enabled: bool = False,
+    next_dynamic_trigger_r: int = 2,
+    current_take_profit: Decimal | None = None,
 ) -> _OpenPosition:
     entry_price = _apply_slippage_price(
         entry_price_raw,
@@ -1010,6 +1055,17 @@ def _create_open_position(
         slippage_rate=slippage_rate,
         is_entry=True,
     )
+    risk_per_unit = abs(entry_price - stop_loss)
+    if current_take_profit is None:
+        if dynamic_take_profit_enabled:
+            if signal == "long":
+                display_take_profit = entry_price + (risk_per_unit * Decimal(str(next_dynamic_trigger_r)))
+            else:
+                display_take_profit = entry_price - (risk_per_unit * Decimal(str(next_dynamic_trigger_r)))
+        else:
+            display_take_profit = take_profit
+    else:
+        display_take_profit = current_take_profit
     return _OpenPosition(
         signal=signal,
         entry_index=entry_index,
@@ -1017,10 +1073,16 @@ def _create_open_position(
         entry_price=entry_price,
         entry_price_raw=entry_price_raw,
         stop_loss=stop_loss,
-        take_profit=take_profit,
+        take_profit=display_take_profit,
+        initial_stop_loss=stop_loss,
+        initial_take_profit=take_profit,
         atr_value=atr_value,
         size=size,
+        risk_per_unit=risk_per_unit,
         tick_size=instrument.tick_size,
+        entry_sequence=entry_sequence,
+        dynamic_take_profit_enabled=dynamic_take_profit_enabled,
+        next_dynamic_trigger_r=next_dynamic_trigger_r,
         entry_fee_rate=entry_fee_rate,
         entry_fee_type=entry_fee_type,
         entry_slippage_cost=abs(entry_price - entry_price_raw) * abs(size),
@@ -1039,6 +1101,8 @@ def _try_fill_dynamic_order(
     entry_fee_type: str = "none",
     slippage_rate: Decimal = Decimal("0"),
     funding_rate: Decimal = Decimal("0"),
+    entry_sequence: int = 0,
+    dynamic_take_profit_enabled: bool = False,
 ) -> _OpenPosition | None:
     filled = candle.low <= plan.entry_reference <= candle.high
     if not filled:
@@ -1058,6 +1122,8 @@ def _try_fill_dynamic_order(
         entry_fee_type=entry_fee_type,
         slippage_rate=slippage_rate,
         funding_rate=funding_rate,
+        entry_sequence=entry_sequence,
+        dynamic_take_profit_enabled=dynamic_take_profit_enabled,
     )
 
 
@@ -1105,6 +1171,73 @@ def _same_candle_path_points(candle: Candle) -> tuple[Decimal, ...] | None:
     return None
 
 
+def _candle_path_points(candle: Candle) -> tuple[Decimal, ...]:
+    if candle.close >= candle.open:
+        return candle.open, candle.low, candle.high, candle.close
+    return candle.open, candle.high, candle.low, candle.close
+
+
+def _dynamic_trigger_price(position: _OpenPosition, trigger_r: int) -> Decimal:
+    offset = position.risk_per_unit * Decimal(str(trigger_r))
+    if position.signal == "long":
+        return position.entry_price + offset
+    return position.entry_price - offset
+
+
+def _dynamic_stop_price(position: _OpenPosition, trigger_r: int, exit_fee_rate: Decimal) -> Decimal:
+    if trigger_r <= 2:
+        fee_offset = abs(position.entry_price) * (position.entry_fee_rate + exit_fee_rate)
+        if position.signal == "long":
+            return position.entry_price + fee_offset
+        return position.entry_price - fee_offset
+    locked_offset = position.risk_per_unit * Decimal(str(trigger_r - 1))
+    if position.signal == "long":
+        return position.entry_price + locked_offset
+    return position.entry_price - locked_offset
+
+
+def _advance_dynamic_stop(position: _OpenPosition, favorable_price: Decimal, exit_fee_rate: Decimal) -> None:
+    while position.next_dynamic_trigger_r >= 2:
+        trigger_price = _dynamic_trigger_price(position, position.next_dynamic_trigger_r)
+        if position.signal == "long":
+            if favorable_price < trigger_price:
+                break
+            candidate_stop = _dynamic_stop_price(position, position.next_dynamic_trigger_r, exit_fee_rate)
+            if candidate_stop > position.stop_loss:
+                position.stop_loss = candidate_stop
+            position.next_dynamic_trigger_r += 1
+        else:
+            if favorable_price > trigger_price:
+                break
+            candidate_stop = _dynamic_stop_price(position, position.next_dynamic_trigger_r, exit_fee_rate)
+            if candidate_stop < position.stop_loss:
+                position.stop_loss = candidate_stop
+            position.next_dynamic_trigger_r += 1
+    position.take_profit = _dynamic_trigger_price(position, position.next_dynamic_trigger_r)
+
+
+def _process_dynamic_position_segment(
+    position: _OpenPosition,
+    start: Decimal,
+    end: Decimal,
+    *,
+    exit_fee_rate: Decimal,
+) -> tuple[Decimal, str] | None:
+    if position.signal == "long":
+        if end < start:
+            if _segment_contains_price(start, end, position.stop_loss):
+                return position.stop_loss, "stop_loss"
+            return None
+        _advance_dynamic_stop(position, end, exit_fee_rate)
+        return None
+    if end > start:
+        if _segment_contains_price(start, end, position.stop_loss):
+            return position.stop_loss, "stop_loss"
+        return None
+    _advance_dynamic_stop(position, end, exit_fee_rate)
+    return None
+
+
 def _build_closed_trade(
     position: _OpenPosition,
     candle: Candle,
@@ -1126,7 +1259,7 @@ def _build_closed_trade(
     funding_periods = Decimal(str(max(candle.ts - position.entry_ts, 0))) / Decimal("28800000")
     funding_cost = abs(position.entry_price * position.size) * position.funding_rate * funding_periods
     pnl = gross_pnl - total_fee - funding_cost
-    risk_value = abs(position.entry_price - position.stop_loss) * position.size
+    risk_value = abs(position.entry_price - position.initial_stop_loss) * position.size
     r_multiple = Decimal("0") if risk_value == 0 else pnl / risk_value
     slippage_cost = position.entry_slippage_cost + (abs(exit_price - exit_price_raw) * abs(position.size))
     return BacktestTrade(
@@ -1137,15 +1270,16 @@ def _build_closed_trade(
         exit_ts=candle.ts,
         entry_price=position.entry_price,
         exit_price=exit_price,
-        stop_loss=position.stop_loss,
-        take_profit=position.take_profit,
+        stop_loss=position.initial_stop_loss,
+        take_profit=position.initial_take_profit,
         size=position.size,
         gross_pnl=gross_pnl,
         pnl=pnl,
-        risk_value=risk_value,
+        risk_value=abs(position.entry_price - position.initial_stop_loss) * position.size,
         r_multiple=r_multiple,
         exit_reason=exit_reason,
         atr_value=position.atr_value,
+        entry_sequence=position.entry_sequence,
         entry_fee=entry_fee,
         exit_fee=exit_fee,
         total_fee=total_fee,
@@ -1177,12 +1311,20 @@ def _try_close_position_same_candle_after_fill(
             if not _segment_contains_price(segment_start, segment_end, entry_price):
                 segment_start = segment_end
                 continue
-            touched_exit = _first_touched_exit_on_segment(
-                entry_price,
-                segment_end,
-                stop_loss=position.stop_loss,
-                take_profit=position.take_profit,
-            )
+            if position.dynamic_take_profit_enabled:
+                touched_exit = _process_dynamic_position_segment(
+                    position,
+                    entry_price,
+                    segment_end,
+                    exit_fee_rate=exit_fee_rate,
+                )
+            else:
+                touched_exit = _first_touched_exit_on_segment(
+                    entry_price,
+                    segment_end,
+                    stop_loss=position.stop_loss,
+                    take_profit=position.take_profit,
+                )
             if touched_exit is not None:
                 exit_price_raw, exit_reason = touched_exit
                 exit_price = _apply_slippage_price(
@@ -1204,12 +1346,20 @@ def _try_close_position_same_candle_after_fill(
                 )
             entry_reached = True
         else:
-            touched_exit = _first_touched_exit_on_segment(
-                segment_start,
-                segment_end,
-                stop_loss=position.stop_loss,
-                take_profit=position.take_profit,
-            )
+            if position.dynamic_take_profit_enabled:
+                touched_exit = _process_dynamic_position_segment(
+                    position,
+                    segment_start,
+                    segment_end,
+                    exit_fee_rate=exit_fee_rate,
+                )
+            else:
+                touched_exit = _first_touched_exit_on_segment(
+                    segment_start,
+                    segment_end,
+                    stop_loss=position.stop_loss,
+                    take_profit=position.take_profit,
+                )
             if touched_exit is not None:
                 exit_price_raw, exit_reason = touched_exit
                 exit_price = _apply_slippage_price(
@@ -1245,6 +1395,38 @@ def _try_close_position(
     if candle_index < position.entry_index:
         return None
     if not allow_same_candle and candle_index == position.entry_index:
+        return None
+
+    if position.dynamic_take_profit_enabled:
+        path_points = _candle_path_points(candle)
+        segment_start = path_points[0]
+        for segment_end in path_points[1:]:
+            touched_exit = _process_dynamic_position_segment(
+                position,
+                segment_start,
+                segment_end,
+                exit_fee_rate=exit_fee_rate,
+            )
+            if touched_exit is not None:
+                exit_price_raw, exit_reason = touched_exit
+                exit_price = _apply_slippage_price(
+                    exit_price_raw,
+                    signal=position.signal,
+                    tick_size=position.tick_size,
+                    slippage_rate=position.slippage_rate,
+                    is_entry=False,
+                )
+                return _build_closed_trade(
+                    position,
+                    candle,
+                    candle_index,
+                    exit_price_raw=exit_price_raw,
+                    exit_price=exit_price,
+                    exit_reason=exit_reason,
+                    exit_fee_rate=exit_fee_rate,
+                    exit_fee_type=exit_fee_type,
+                )
+            segment_start = segment_end
         return None
 
     if position.signal == "long":

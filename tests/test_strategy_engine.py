@@ -1,10 +1,15 @@
 from decimal import Decimal
 from unittest import TestCase
 
-from okx_quant.engine import build_order_plan
+from okx_quant.engine import _advance_dynamic_stop_live, build_order_plan, can_use_exchange_managed_orders
 from okx_quant.models import Candle, Instrument, StrategyConfig
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
-from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID
+from okx_quant.strategy_catalog import (
+    STRATEGY_CROSS_ID,
+    STRATEGY_DYNAMIC_ID,
+    STRATEGY_DYNAMIC_LONG_ID,
+    STRATEGY_DYNAMIC_SHORT_ID,
+)
 
 
 class StrategyEngineTest(TestCase):
@@ -111,6 +116,96 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(plan.pos_side, "long")
         self.assertEqual(plan.stop_loss, Decimal("2480"))
         self.assertEqual(plan.take_profit, Decimal("2540"))
+
+    def test_dynamic_long_strategy_cannot_use_okx托管止盈止损(self) -> None:
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="4H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+        )
+
+        self.assertFalse(can_use_exchange_managed_orders(config, instrument, instrument))
+
+    def test_dynamic_short_strategy_cannot_use_okx托管止盈止损(self) -> None:
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="4H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_SHORT_ID,
+        )
+
+        self.assertFalse(can_use_exchange_managed_orders(config, instrument, instrument))
+
+    def test_dynamic_live_stop_moves_to_break_even_plus_fees_at_2r(self) -> None:
+        stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
+            direction="long",
+            current_price=Decimal("120"),
+            entry_price=Decimal("100"),
+            risk_per_unit=Decimal("10"),
+            current_stop_loss=Decimal("90"),
+            next_trigger_r=2,
+            tick_size=Decimal("0.1"),
+        )
+
+        self.assertTrue(moved)
+        self.assertEqual(stop_loss, Decimal("100.1"))
+        self.assertEqual(next_take_profit, Decimal("130"))
+        self.assertEqual(next_trigger_r, 3)
+
+    def test_dynamic_live_stop_locks_2r_at_3r(self) -> None:
+        stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
+            direction="long",
+            current_price=Decimal("130"),
+            entry_price=Decimal("100"),
+            risk_per_unit=Decimal("10"),
+            current_stop_loss=Decimal("100.1"),
+            next_trigger_r=3,
+            tick_size=Decimal("0.1"),
+        )
+
+        self.assertTrue(moved)
+        self.assertEqual(stop_loss, Decimal("120"))
+        self.assertEqual(next_take_profit, Decimal("140"))
+        self.assertEqual(next_trigger_r, 4)
 
     def test_cross_strategy_stop_loss_uses_signal_candle_low_minus_one_atr(self) -> None:
         instrument = Instrument(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Callable, Literal
@@ -14,12 +14,22 @@ from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_incr
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
-from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_ID, STRATEGY_EMA5_EMA8_ID
+from okx_quant.strategy_catalog import (
+    STRATEGY_CROSS_ID,
+    STRATEGY_DYNAMIC_ID,
+    STRATEGY_DYNAMIC_LONG_ID,
+    STRATEGY_DYNAMIC_SHORT_ID,
+    STRATEGY_EMA5_EMA8_ID,
+    is_dynamic_strategy_id,
+    resolve_dynamic_signal_mode,
+)
 
 
 Logger = Callable[[str], None]
 OKX_SINGLE_REQUEST_MAX_CANDLES = 300
 DEFAULT_DEBUG_ATR_PERIOD = 10
+LIVE_DYNAMIC_MAKER_FEE_RATE = Decimal("0.00015")
+LIVE_DYNAMIC_TAKER_FEE_RATE = Decimal("0.00036")
 
 
 @dataclass(frozen=True)
@@ -119,8 +129,8 @@ class StrategyEngine:
                 raise RuntimeError(f"{signal_instrument.inst_id} 当前不可交易，状态：{signal_instrument.state}")
 
             if config.run_mode == "signal_only":
-                if config.strategy_id == STRATEGY_DYNAMIC_ID:
-                    self._run_dynamic_signal_only(config, signal_instrument)
+                if is_dynamic_strategy_id(config.strategy_id):
+                    self._run_dynamic_signal_only_v2(config, signal_instrument)
                 elif config.strategy_id == STRATEGY_CROSS_ID:
                     self._run_cross_signal_only(config, signal_instrument)
                 elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
@@ -137,11 +147,8 @@ class StrategyEngine:
             if trade_instrument.inst_type == "SPOT":
                 raise RuntimeError("当前版本只支持永续或期权下单，现货暂时仅支持作为触发价格来源")
 
-            if config.strategy_id == STRATEGY_DYNAMIC_ID:
-                if can_use_exchange_managed_orders(config, signal_instrument, trade_instrument):
-                    self._run_dynamic_exchange_strategy(credentials, config, signal_instrument)
-                else:
-                    self._run_dynamic_local_strategy(credentials, config, signal_instrument, trade_instrument)
+            if is_dynamic_strategy_id(config.strategy_id):
+                self._run_dynamic_local_strategy_v2(credentials, config, signal_instrument, trade_instrument)
             elif config.strategy_id == STRATEGY_CROSS_ID:
                 if can_use_exchange_managed_orders(config, signal_instrument, trade_instrument):
                     self._run_cross_exchange_strategy(credentials, config, signal_instrument)
@@ -690,6 +697,236 @@ class StrategyEngine:
             )
             self._stop_event.wait(config.poll_seconds)
 
+    def _run_dynamic_local_strategy_v2(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        signal_instrument: Instrument,
+        trade_instrument: Instrument,
+    ) -> None:
+        effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
+        if effective_signal_mode == "both":
+            raise RuntimeError("EMA 动态委托不支持双向，请选择只做多或只做空。")
+
+        strategy = EmaDynamicOrderStrategy()
+        lookback = recommended_indicator_lookback(
+            config.ema_period,
+            config.trend_ema_period,
+            config.atr_period,
+            DEFAULT_DEBUG_ATR_PERIOD,
+        )
+        last_candle_ts: int | None = None
+        active_trigger: LocalSignalTrigger | None = None
+        current_wave_signal: Literal["long", "short"] | None = None
+        entries_in_current_wave = 0
+
+        self._log_strategy_start(config, signal_instrument, trade_instrument)
+        self._log_local_mode_summary(config, signal_instrument, trade_instrument)
+        self._logger(
+            "策略规则：每根新 K 线确认后，上一根动态委托自动失效，再按最新 EMA 小周期重新挂下一根委托。"
+        )
+        self._logger(
+            f"方向={_format_signal_mode(effective_signal_mode)} | 止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'} | "
+            f"每波最多开仓次数={config.max_entries_per_trend or 0}"
+        )
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            trend_ema_period=config.trend_ema_period,
+        )
+
+        while not self._stop_event.is_set():
+            candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period)
+            if len(confirmed) < minimum:
+                self._logger("已收盘 K 线数量不足，继续等待更多数据...")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            newest_ts = confirmed[-1].ts
+            if newest_ts != last_candle_ts or active_trigger is None:
+                decision = strategy.evaluate(confirmed, replace(config, signal_mode=effective_signal_mode))
+                last_candle_ts = newest_ts
+                if decision.signal is None:
+                    active_trigger = None
+                    current_wave_signal = None
+                    entries_in_current_wave = 0
+                    self._logger(f"{_fmt_ts(newest_ts)} | 当前无法生成动态开仓价 | {decision.reason}")
+                    self._stop_event.wait(config.poll_seconds)
+                    continue
+                if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
+                    raise RuntimeError("策略返回的数据不完整，无法生成本地触发条件。")
+
+                if current_wave_signal != decision.signal:
+                    current_wave_signal = decision.signal
+                    entries_in_current_wave = 0
+
+                if config.max_entries_per_trend > 0 and entries_in_current_wave >= config.max_entries_per_trend:
+                    active_trigger = None
+                    self._logger(
+                        f"{_fmt_ts(decision.candle_ts)} | 本波趋势开仓次数已达上限 | 方向={decision.signal.upper()} | "
+                        f"上限={config.max_entries_per_trend}"
+                    )
+                    self._stop_event.wait(config.poll_seconds)
+                    continue
+
+                active_trigger = LocalSignalTrigger(
+                    signal=decision.signal,
+                    entry_reference=decision.entry_reference,
+                    atr_value=decision.atr_value,
+                    candle_ts=decision.candle_ts,
+                    signal_candle_high=decision.signal_candle_high,
+                    signal_candle_low=decision.signal_candle_low,
+                )
+                self._logger(
+                    f"{_fmt_ts(decision.candle_ts)} | 动态等待中 | 信号方向={decision.signal.upper()} | "
+                    f"第{entries_in_current_wave + 1}次委托 | 触发价={format_decimal(decision.entry_reference)} | "
+                    f"下单标的={trade_instrument.inst_id}"
+                )
+
+            if active_trigger is None:
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            current_signal_price = self._client.get_trigger_price(config.inst_id, "last")
+            if not local_entry_trigger_hit(active_trigger.signal, current_signal_price, active_trigger.entry_reference):
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            self._logger(
+                f"{_fmt_ts(active_trigger.candle_ts)} | 信号标的已触发动态开仓条件 | 当前价={format_decimal(current_signal_price)} | "
+                f"目标价={format_decimal(active_trigger.entry_reference)}"
+            )
+            position = self._open_local_position(
+                credentials,
+                config,
+                signal_instrument=signal_instrument,
+                trade_instrument=trade_instrument,
+                signal=active_trigger.signal,
+                signal_entry_reference=active_trigger.entry_reference,
+                signal_atr_value=active_trigger.atr_value,
+                signal_candle_ts=active_trigger.candle_ts,
+                signal_candle_high=active_trigger.signal_candle_high,
+                signal_candle_low=active_trigger.signal_candle_low,
+            )
+            protection = self._build_local_protection_plan(
+                config,
+                signal_instrument=signal_instrument,
+                trade_instrument=trade_instrument,
+                signal=active_trigger.signal,
+                trade_side=position.side,
+                estimated_trade_entry=position.entry_price,
+                signal_entry_reference=active_trigger.entry_reference,
+                signal_atr_value=active_trigger.atr_value,
+                signal_candle_ts=active_trigger.candle_ts,
+                signal_candle_high=active_trigger.signal_candle_high,
+                signal_candle_low=active_trigger.signal_candle_low,
+            )
+            entries_in_current_wave += 1
+            active_trigger = None
+            self._monitor_local_exit_v2(credentials, config, trade_instrument, position, protection)
+
+    def _run_dynamic_signal_only_v2(
+        self,
+        config: StrategyConfig,
+        instrument: Instrument,
+    ) -> None:
+        effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
+        if effective_signal_mode == "both":
+            raise RuntimeError("EMA 动态委托不支持双向，请选择只做多或只做空。")
+
+        strategy = EmaDynamicOrderStrategy()
+        lookback = recommended_indicator_lookback(
+            config.ema_period,
+            config.trend_ema_period,
+            config.atr_period,
+            DEFAULT_DEBUG_ATR_PERIOD,
+        )
+        last_candle_ts: int | None = None
+        current_wave_signal: Literal["long", "short"] | None = None
+        entries_in_current_wave = 0
+
+        self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
+        self._logger(
+            f"运行模式：只监控信号，不下单 | 方向={_format_signal_mode(effective_signal_mode)} | "
+            f"止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'} | "
+            f"每波最多开仓次数={config.max_entries_per_trend or 0}"
+        )
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            trend_ema_period=config.trend_ema_period,
+        )
+
+        while not self._stop_event.is_set():
+            candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period)
+            if len(confirmed) < minimum:
+                self._logger("已收盘 K 线数量不足，继续等待更多数据...")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            newest_ts = confirmed[-1].ts
+            if newest_ts == last_candle_ts:
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            last_candle_ts = newest_ts
+
+            decision = strategy.evaluate(confirmed, replace(config, signal_mode=effective_signal_mode))
+            if decision.signal is None:
+                current_wave_signal = None
+                entries_in_current_wave = 0
+                self._logger(f"{_fmt_ts(newest_ts)} | 当前无动态委托信号 | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
+                raise RuntimeError("策略返回的数据不完整，无法生成信号提醒。")
+
+            if current_wave_signal != decision.signal:
+                current_wave_signal = decision.signal
+                entries_in_current_wave = 0
+
+            if config.max_entries_per_trend > 0 and entries_in_current_wave >= config.max_entries_per_trend:
+                self._logger(
+                    f"{_fmt_ts(decision.candle_ts)} | 本波趋势信号次数已达上限 | 方向={decision.signal.upper()} | "
+                    f"上限={config.max_entries_per_trend}"
+                )
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            protection = build_protection_plan(
+                instrument=instrument,
+                config=config,
+                direction=decision.signal,
+                entry_reference=decision.entry_reference,
+                atr_value=decision.atr_value,
+                candle_ts=decision.candle_ts,
+                trigger_inst_id=instrument.inst_id,
+            )
+            if config.take_profit_mode == "dynamic":
+                reason = f"EMA 动态委托参考价已更新 | 止损={format_decimal(protection.stop_loss)} | 止盈方式=动态止盈"
+            else:
+                reason = (
+                    f"EMA 动态委托参考价已更新 | 止损={format_decimal(protection.stop_loss)} | "
+                    f"止盈={format_decimal(protection.take_profit)}"
+                )
+            self._logger(
+                f"{_fmt_ts(decision.candle_ts)} | 信号触发 | 方向={decision.signal.upper()} | "
+                f"第{entries_in_current_wave + 1}次信号 | 参考价={format_decimal(decision.entry_reference)} | {reason}"
+            )
+            self._notify_signal(
+                config,
+                signal=decision.signal,
+                trigger_symbol=instrument.inst_id,
+                entry_reference=decision.entry_reference,
+                reason=reason,
+            )
+            entries_in_current_wave += 1
+            self._stop_event.wait(config.poll_seconds)
+
     def _run_cross_signal_only(
         self,
         config: StrategyConfig,
@@ -1058,7 +1295,7 @@ class StrategyEngine:
                 signal_candle_low=signal_candle_low,
             )
 
-        if mode == "local_trade":
+        if mode in {"exchange", "local_trade"}:
             snapshot = fetch_atr_snapshot(self._client, trade_instrument.inst_id, config.bar, config.atr_period)
             trade_direction: Literal["long", "short"] = "long" if trade_side == "buy" else "short"
             return build_protection_plan(
@@ -1097,6 +1334,11 @@ class StrategyEngine:
         position: FilledPosition,
         protection: ProtectionPlan,
     ) -> None:
+        dynamic_take_profit_enabled = is_dynamic_strategy_id(config.strategy_id) and config.take_profit_mode == "dynamic"
+        current_stop_loss = protection.stop_loss
+        current_take_profit = protection.take_profit
+        next_trigger_r = 2
+        risk_per_unit = abs(position.entry_price - protection.stop_loss)
         self._logger(
             f"开始本地止盈止损监控 | 触发标的={protection.trigger_inst_id} | "
             f"触发价格类型={protection.trigger_price_type} | 止损={format_decimal(protection.stop_loss)} | "
@@ -1104,12 +1346,33 @@ class StrategyEngine:
         )
         while not self._stop_event.is_set():
             current_price = self._client.get_trigger_price(protection.trigger_inst_id, protection.trigger_price_type)
-            stop_hit, take_hit = evaluate_local_exit(
-                direction=protection.direction,
-                current_price=current_price,
-                stop_loss=protection.stop_loss,
-                take_profit=protection.take_profit,
-            )
+            if dynamic_take_profit_enabled:
+                updated_stop_loss, updated_take_profit, updated_trigger_r, moved = _advance_dynamic_stop_live(
+                    direction=protection.direction,
+                    current_price=current_price,
+                    entry_price=position.entry_price,
+                    risk_per_unit=risk_per_unit,
+                    current_stop_loss=current_stop_loss,
+                    next_trigger_r=next_trigger_r,
+                    tick_size=trade_instrument.tick_size,
+                )
+                if moved:
+                    current_stop_loss = updated_stop_loss
+                    current_take_profit = updated_take_profit
+                    next_trigger_r = updated_trigger_r
+                    self._logger(
+                        f"鍔ㄦ€佹鐩堝凡鏇存柊 | 瑙﹀彂浠?{format_decimal(current_price)} | "
+                        f"鏂版鎹?{format_decimal(current_stop_loss)} | 涓嬩竴闃舵={next_trigger_r}R"
+                    )
+                stop_hit = current_price <= current_stop_loss if protection.direction == "long" else current_price >= current_stop_loss
+                take_hit = False
+            else:
+                stop_hit, take_hit = evaluate_local_exit(
+                    direction=protection.direction,
+                    current_price=current_price,
+                    stop_loss=current_stop_loss,
+                    take_profit=current_take_profit,
+                )
             if stop_hit or take_hit:
                 reason = "止损" if stop_hit else "止盈"
                 self._logger(
@@ -1180,6 +1443,16 @@ class StrategyEngine:
             raise RuntimeError(f"本地{reason}平仓后仍有剩余仓位 {format_decimal(remaining)}，请手动检查")
 
         self._logger("本次本地止盈止损流程已结束。")
+
+    def _monitor_local_exit_v2(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        protection: ProtectionPlan,
+    ) -> None:
+        self._monitor_local_exit(credentials, config, trade_instrument, position, protection)
 
     def _place_entry_order(
         self,
@@ -1413,6 +1686,8 @@ def can_use_exchange_managed_orders(
     signal_instrument: Instrument,
     trade_instrument: Instrument,
 ) -> bool:
+    if is_dynamic_strategy_id(config.strategy_id):
+        return False
     return (
         config.tp_sl_mode == "exchange"
         and signal_instrument.inst_id == trade_instrument.inst_id
@@ -1468,6 +1743,89 @@ def evaluate_local_exit(
     if direction == "long":
         return current_price <= stop_loss, current_price >= take_profit
     return current_price >= stop_loss, current_price <= take_profit
+
+
+def _dynamic_round_trip_fee_offset_live(entry_price: Decimal) -> Decimal:
+    return abs(entry_price) * (LIVE_DYNAMIC_MAKER_FEE_RATE + LIVE_DYNAMIC_TAKER_FEE_RATE)
+
+
+def _dynamic_trigger_price_live(
+    *,
+    direction: Literal["long", "short"],
+    entry_price: Decimal,
+    risk_per_unit: Decimal,
+    trigger_r: int,
+    tick_size: Decimal,
+) -> Decimal:
+    distance = risk_per_unit * Decimal(trigger_r)
+    raw = entry_price + distance if direction == "long" else entry_price - distance
+    rounding = "up" if direction == "long" else "down"
+    return snap_to_increment(raw, tick_size, rounding)
+
+
+def _dynamic_stop_price_live(
+    *,
+    direction: Literal["long", "short"],
+    entry_price: Decimal,
+    risk_per_unit: Decimal,
+    trigger_r: int,
+    tick_size: Decimal,
+) -> Decimal:
+    if trigger_r <= 2:
+        raw = (
+            entry_price + _dynamic_round_trip_fee_offset_live(entry_price)
+            if direction == "long"
+            else entry_price - _dynamic_round_trip_fee_offset_live(entry_price)
+        )
+    else:
+        lock_multiple = Decimal(trigger_r - 1)
+        raw = (
+            entry_price + (risk_per_unit * lock_multiple)
+            if direction == "long"
+            else entry_price - (risk_per_unit * lock_multiple)
+        )
+    rounding = "up" if direction == "long" else "down"
+    return snap_to_increment(raw, tick_size, rounding)
+
+
+def _advance_dynamic_stop_live(
+    *,
+    direction: Literal["long", "short"],
+    current_price: Decimal,
+    entry_price: Decimal,
+    risk_per_unit: Decimal,
+    current_stop_loss: Decimal,
+    next_trigger_r: int,
+    tick_size: Decimal,
+) -> tuple[Decimal, Decimal, int, bool]:
+    if risk_per_unit <= 0:
+        return current_stop_loss, entry_price, next_trigger_r, False
+
+    moved = False
+    updated_stop = current_stop_loss
+    trigger_r = next_trigger_r
+    while True:
+        trigger_price = _dynamic_trigger_price_live(
+            direction=direction,
+            entry_price=entry_price,
+            risk_per_unit=risk_per_unit,
+            trigger_r=trigger_r,
+            tick_size=tick_size,
+        )
+        reached = current_price >= trigger_price if direction == "long" else current_price <= trigger_price
+        if not reached:
+            return updated_stop, trigger_price, trigger_r, moved
+
+        candidate = _dynamic_stop_price_live(
+            direction=direction,
+            entry_price=entry_price,
+            risk_per_unit=risk_per_unit,
+            trigger_r=trigger_r,
+            tick_size=tick_size,
+        )
+        updated_stop = max(updated_stop, candidate) if direction == "long" else min(updated_stop, candidate)
+        trigger_r += 1
+        moved = True
 
 
 def determine_order_size(
@@ -1694,27 +2052,7 @@ def build_order_plan(
     else:
         if order_size is None:
             raise RuntimeError("缺少下单数量，且未设置风险金")
-        manual_config = StrategyConfig(
-            inst_id=config.inst_id,
-            bar=config.bar,
-            ema_period=config.ema_period,
-            atr_period=config.atr_period,
-            atr_stop_multiplier=config.atr_stop_multiplier,
-            atr_take_multiplier=config.atr_take_multiplier,
-            order_size=order_size,
-            trade_mode=config.trade_mode,
-            signal_mode=config.signal_mode,
-            position_mode=config.position_mode,
-            environment=config.environment,
-            tp_sl_trigger_type=config.tp_sl_trigger_type,
-            strategy_id=config.strategy_id,
-            poll_seconds=config.poll_seconds,
-            risk_amount=None,
-            trade_inst_id=config.trade_inst_id,
-            tp_sl_mode=config.tp_sl_mode,
-            local_tp_sl_inst_id=config.local_tp_sl_inst_id,
-            entry_side_mode=config.entry_side_mode,
-        )
+        manual_config = replace(config, order_size=order_size, risk_amount=None)
         size = determine_order_size(
             instrument=instrument,
             config=manual_config,

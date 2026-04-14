@@ -120,7 +120,7 @@ class DynamicStrategyTest(TestCase):
 
         self.assertEqual(decision.signal, "long")
         self.assertIn("EMA2", decision.reason)
-        self.assertIn("EMA3", decision.reason)
+        self.assertIn("多头趋势成立", decision.reason)
 
     def test_long_mode_is_blocked_when_fast_ema_is_below_trend_ema(self) -> None:
         candles = self._make_candles(["100", "90", "80", "70", "60", "66"])
