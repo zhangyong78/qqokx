@@ -375,6 +375,7 @@ class QuantApp:
         self.ema_period = StringVar(value="21")
         self.trend_ema_period = StringVar(value="55")
         self.big_ema_period = StringVar(value="233")
+        self.entry_reference_ema_period = StringVar(value="0")
         self.atr_period = StringVar(value="10")
         self.stop_atr = StringVar(value="2")
         self.take_atr = StringVar(value="4")
@@ -645,6 +646,10 @@ class QuantApp:
         self._big_ema_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
         self._big_ema_entry = ttk.Entry(start_frame, textvariable=self.big_ema_period)
         self._big_ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
+        self._entry_reference_ema_label = ttk.Label(start_frame, text="挂单参考EMA")
+        self._entry_reference_ema_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self._entry_reference_ema_entry = ttk.Entry(start_frame, textvariable=self.entry_reference_ema_period)
+        self._entry_reference_ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
         ttk.Label(start_frame, text="ATR 周期").grid(row=row, column=2, sticky="w", pady=(12, 0))
         ttk.Entry(start_frame, textvariable=self.atr_period).grid(
             row=row, column=3, sticky="ew", pady=(12, 0)
@@ -3581,6 +3586,7 @@ class QuantApp:
                 ema_period=self.ema_period.get(),
                 trend_ema_period=self.trend_ema_period.get(),
                 big_ema_period=self.big_ema_period.get(),
+                entry_reference_ema_period=self.entry_reference_ema_period.get(),
                 atr_period=self.atr_period.get(),
                 stop_atr=self.stop_atr.get(),
                 take_atr=self.take_atr.get(),
@@ -4142,16 +4148,36 @@ class QuantApp:
             messagebox.showerror("提示", "请先选择信号标的")
             return
         ema_period = self._parse_positive_int(self.ema_period.get(), "EMA小周期")
-        self._enqueue_log(f"正在获取 {symbol} 的 1 小时调试值，EMA小周期={ema_period} ...")
+        trend_ema_period = self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期")
+        entry_reference_ema_period = 0
+        if is_dynamic_strategy_id(self._selected_strategy_definition().strategy_id):
+            entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
+        if entry_reference_ema_period <= 0:
+            entry_reference_ema_period = ema_period
+        self._enqueue_log(
+            f"正在获取 {symbol} 的 1 小时调试值，EMA小周期={ema_period}，趋势EMA={trend_ema_period}，挂单参考EMA={entry_reference_ema_period} ..."
+        )
         threading.Thread(
             target=self._debug_hourly_values_worker,
-            args=(symbol, ema_period),
+            args=(symbol, ema_period, trend_ema_period, entry_reference_ema_period),
             daemon=True,
         ).start()
 
-    def _debug_hourly_values_worker(self, symbol: str, ema_period: int) -> None:
+    def _debug_hourly_values_worker(
+        self,
+        symbol: str,
+        ema_period: int,
+        trend_ema_period: int,
+        entry_reference_ema_period: int,
+    ) -> None:
         try:
-            snapshot = fetch_hourly_ema_debug(self.client, symbol, ema_period=ema_period)
+            snapshot = fetch_hourly_ema_debug(
+                self.client,
+                symbol,
+                ema_period=ema_period,
+                trend_ema_period=trend_ema_period,
+                entry_reference_ema_period=entry_reference_ema_period,
+            )
             self._enqueue_log(format_hourly_debug(symbol, snapshot))
         except Exception as exc:
             self._enqueue_log(f"获取 1 小时调试值失败：{exc}")
@@ -4587,16 +4613,21 @@ class QuantApp:
             self._take_profit_mode_combo.grid()
             self._max_entries_per_trend_label.grid()
             self._max_entries_per_trend_entry.grid()
+            self._entry_reference_ema_label.grid()
+            self._entry_reference_ema_entry.grid()
         else:
             self._take_profit_mode_label.grid_remove()
             self._take_profit_mode_combo.grid_remove()
             self._max_entries_per_trend_label.grid_remove()
             self._max_entries_per_trend_entry.grid_remove()
+            self._entry_reference_ema_label.grid_remove()
+            self._entry_reference_ema_entry.grid_remove()
         if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
             self.bar.set("4H")
             self.ema_period.set("5")
             self.trend_ema_period.set("8")
             self.big_ema_period.set("233")
+            self.entry_reference_ema_period.set("0")
             self.risk_amount.set("100")
             self.take_profit_mode_label.set("固定止盈")
             self.max_entries_per_trend.set("0")
@@ -4608,6 +4639,8 @@ class QuantApp:
         else:
             self._big_ema_label.grid_remove()
             self._big_ema_entry.grid_remove()
+        if is_dynamic_strategy_id(definition.strategy_id) and not self.entry_reference_ema_period.get().strip():
+            self.entry_reference_ema_period.set("0")
         self.strategy_summary_text.set(definition.summary)
         self.strategy_rule_text.set(definition.rule_description)
         self.strategy_hint_text.set(definition.parameter_hint)
@@ -4636,6 +4669,7 @@ class QuantApp:
         if is_dynamic_strategy_id(definition.strategy_id):
             lines.extend(
                 [
+                    f"挂单参考EMA：{config.entry_reference_ema_label()}",
                     f"止盈方式：{self.take_profit_mode_label.get()}",
                     f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}",
                 ]
@@ -4672,6 +4706,9 @@ class QuantApp:
         risk_amount = self._parse_optional_positive_decimal(self.risk_amount.get(), "风险金")
         order_size = self._parse_optional_positive_decimal(self.order_size.get(), "固定数量") or Decimal("0")
         max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
+        entry_reference_ema_period = 0
+        if is_dynamic_strategy_id(definition.strategy_id):
+            entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
 
         if not api_key or not secret_key or not passphrase:
             raise ValueError("请先在 菜单 > 设置 > API 与通知设置 中填写 API 凭证")
@@ -4711,6 +4748,7 @@ class QuantApp:
             ema_period=5 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.ema_period.get(), "EMA小周期"),
             trend_ema_period=8 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期"),
             big_ema_period=233 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.big_ema_period.get(), "EMA大周期"),
+            entry_reference_ema_period=entry_reference_ema_period,
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
             atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
@@ -4871,6 +4909,8 @@ class QuantApp:
             f"EMA小周期：{session.config.ema_period}",
             f"EMA中周期：{session.config.trend_ema_period}",
         ]
+        if is_dynamic_strategy_id(session.strategy_id):
+            lines.append(f"挂单参考EMA：{session.config.entry_reference_ema_label()}")
         if self._strategy_uses_big_ema(session.strategy_id):
             lines.append(f"EMA大周期：{session.config.big_ema_period}")
         lines.extend(

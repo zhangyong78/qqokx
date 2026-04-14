@@ -521,7 +521,7 @@ class BacktestTest(TestCase):
         self.assertEqual(configs[-1].atr_stop_multiplier, ATR_BATCH_MULTIPLIERS[-1])
         self.assertEqual(configs[-1].atr_take_multiplier, ATR_BATCH_MULTIPLIERS[-1] * ATR_BATCH_TAKE_RATIOS[-1])
 
-    def test_build_parameter_batch_configs_for_dynamic_take_profit_returns_four_entry_variants(self) -> None:
+    def test_build_parameter_batch_configs_for_dynamic_take_profit_returns_twelve_stop_and_entry_variants(self) -> None:
         base_config = StrategyConfig(
             inst_id="BTC-USDT-SWAP",
             bar="15m",
@@ -544,10 +544,14 @@ class BacktestTest(TestCase):
 
         configs = build_parameter_batch_configs(base_config)
 
-        self.assertEqual(len(configs), 4)
-        self.assertEqual([config.max_entries_per_trend for config in configs], list(BATCH_MAX_ENTRIES_OPTIONS))
-        self.assertTrue(all(config.atr_stop_multiplier == Decimal("2") for config in configs))
+        self.assertEqual(len(configs), 12)
+        self.assertEqual({config.max_entries_per_trend for config in configs}, set(BATCH_MAX_ENTRIES_OPTIONS))
+        self.assertEqual({config.atr_stop_multiplier for config in configs}, set(ATR_BATCH_MULTIPLIERS))
         self.assertTrue(all(config.atr_take_multiplier == Decimal("4") for config in configs))
+        self.assertEqual(configs[0].atr_stop_multiplier, ATR_BATCH_MULTIPLIERS[0])
+        self.assertEqual(configs[0].max_entries_per_trend, 0)
+        self.assertEqual(configs[-1].atr_stop_multiplier, ATR_BATCH_MULTIPLIERS[-1])
+        self.assertEqual(configs[-1].max_entries_per_trend, 3)
 
     def test_run_backtest_batch_returns_nine_results_and_reuses_history_fetch(self) -> None:
         candles = [
@@ -615,7 +619,7 @@ class BacktestTest(TestCase):
         self.assertEqual(client.history_limits, [500])
         self.assertEqual({cfg.max_entries_per_trend for cfg, _ in results}, set(BATCH_MAX_ENTRIES_OPTIONS))
 
-    def test_run_backtest_batch_for_dynamic_take_profit_returns_four_results(self) -> None:
+    def test_run_backtest_batch_for_dynamic_take_profit_returns_twelve_results(self) -> None:
         candles = [
             Candle(
                 index,
@@ -651,9 +655,10 @@ class BacktestTest(TestCase):
 
         results = run_backtest_batch(client, config, candle_limit=500)
 
-        self.assertEqual(len(results), 4)
+        self.assertEqual(len(results), 12)
         self.assertEqual(client.history_limits, [500])
-        self.assertEqual([cfg.max_entries_per_trend for cfg, _ in results], list(BATCH_MAX_ENTRIES_OPTIONS))
+        self.assertEqual({cfg.max_entries_per_trend for cfg, _ in results}, set(BATCH_MAX_ENTRIES_OPTIONS))
+        self.assertEqual({cfg.atr_stop_multiplier for cfg, _ in results}, set(ATR_BATCH_MULTIPLIERS))
 
     def test_ema5_ema8_strategy_rejects_atr_batch_backtest(self) -> None:
         candles = [
@@ -726,6 +731,7 @@ class BacktestTest(TestCase):
         report_text = format_backtest_report(result)
 
         self.assertIn("趋势过滤：EMA21 与 EMA55 组成趋势过滤", report_text)
+        self.assertIn("挂单参考EMA：EMA21", report_text)
         self.assertIn("止盈模式：固定止盈或永久阶梯动态止盈", report_text)
         self.assertIn("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓", report_text)
 
@@ -1578,6 +1584,7 @@ def _patched_dynamic_backtest_report_includes_ema_relationship_filter(self: Back
     report_text = format_backtest_report(result)
 
     self.assertIn("趋势过滤：EMA21 与 EMA55 组成趋势过滤", report_text)
+    self.assertIn("挂单参考EMA：EMA21", report_text)
     self.assertIn("止盈方式：", report_text)
     self.assertIn("每波最多开仓次数：", report_text)
     self.assertIn("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓", report_text)

@@ -99,6 +99,7 @@ class BacktestLaunchState:
     ema_period: str
     trend_ema_period: str
     big_ema_period: str
+    entry_reference_ema_period: str
     atr_period: str
     stop_atr: str
     take_atr: str
@@ -377,6 +378,7 @@ def _build_backtest_param_summary(
         max_entries_text = "不限" if config.max_entries_per_trend <= 0 else f"每波前{config.max_entries_per_trend}次"
         return (
             f"EMA{config.ema_period}/{config.trend_ema_period} / ATR{config.atr_period} / "
+            f"挂单EMA{config.resolved_entry_reference_ema_period()} / "
             f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
             f"{take_profit_label} / {max_entries_text} / "
             f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
@@ -481,7 +483,7 @@ def _batch_entry_levels(snapshots: list[_BacktestSnapshot]) -> list[int]:
 def _snapshot_sort_key(snapshot: _BacktestSnapshot, batch_mode: str) -> tuple[object, ...]:
     config = snapshot.config
     if batch_mode == "dynamic_entries":
-        return (config.max_entries_per_trend,)
+        return (config.atr_stop_multiplier, config.max_entries_per_trend)
     if batch_mode == "fixed_entries":
         return (
             config.max_entries_per_trend,
@@ -498,6 +500,7 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "ema_period": config.ema_period,
         "trend_ema_period": config.trend_ema_period,
         "big_ema_period": config.big_ema_period,
+        "entry_reference_ema_period": config.entry_reference_ema_period,
         "atr_period": config.atr_period,
         "atr_stop_multiplier": str(config.atr_stop_multiplier),
         "atr_take_multiplier": str(config.atr_take_multiplier),
@@ -535,6 +538,7 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         ema_period=int(payload.get("ema_period", 21)),
         trend_ema_period=int(payload.get("trend_ema_period", 55)),
         big_ema_period=int(payload.get("big_ema_period", 233)),
+        entry_reference_ema_period=int(payload.get("entry_reference_ema_period", 0)),
         atr_period=int(payload.get("atr_period", 14)),
         atr_stop_multiplier=Decimal(str(payload.get("atr_stop_multiplier", "2"))),
         atr_take_multiplier=Decimal(str(payload.get("atr_take_multiplier", "4"))),
@@ -830,6 +834,7 @@ class BacktestWindow:
         self.ema_period = StringVar(value=initial_state.ema_period)
         self.trend_ema_period = StringVar(value=initial_state.trend_ema_period)
         self.big_ema_period = StringVar(value=initial_state.big_ema_period)
+        self.entry_reference_ema_period = StringVar(value=initial_state.entry_reference_ema_period)
         self.atr_period = StringVar(value=initial_state.atr_period)
         self.stop_atr = StringVar(value=initial_state.stop_atr)
         self.take_atr = StringVar(value=initial_state.take_atr)
@@ -973,6 +978,10 @@ class BacktestWindow:
         ttk.Label(controls, text="信号方向").grid(row=row, column=0, sticky="w", pady=(12, 0))
         self.signal_combo = ttk.Combobox(controls, textvariable=self.signal_mode_label, state="readonly")
         self.signal_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.entry_reference_ema_caption = ttk.Label(controls, text="挂单参考EMA")
+        self.entry_reference_ema_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self.entry_reference_ema_entry = ttk.Entry(controls, textvariable=self.entry_reference_ema_period)
+        self.entry_reference_ema_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
 
         row += 1
         self.take_profit_mode_caption = ttk.Label(controls, text="止盈方式")
@@ -1174,7 +1183,7 @@ class BacktestWindow:
         self.matrix_layer_combo.bind("<<ComboboxSelected>>", lambda *_: self._refresh_current_batch_views())
         ttk.Label(
             matrix_toolbar,
-            text="固定止盈按开仓次数分层查看，动态止盈自动切到 4 组次数对比。",
+            text="固定止盈按开仓次数分层查看，动态止盈自动切到 SL x 开仓次数矩阵。",
             foreground="#57606a",
         ).grid(row=0, column=4, sticky="e", padx=(12, 0))
         ttk.Label(
@@ -1666,9 +1675,11 @@ class BacktestWindow:
             signal_mode = resolve_dynamic_signal_mode(definition.strategy_id, signal_mode)
         take_profit_mode = "fixed"
         max_entries_per_trend = 0
+        entry_reference_ema_period = 0
         if dynamic_strategy:
             take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
             max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
+            entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
         return StrategyConfig(
             inst_id=self.symbol.get().strip().upper(),
             bar="4H" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else _backtest_bar_value_from_label(self.bar_label.get()),
@@ -1681,6 +1692,7 @@ class BacktestWindow:
                 if self._strategy_uses_big_ema(definition.strategy_id)
                 else 0
             ),
+            entry_reference_ema_period=entry_reference_ema_period,
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
             atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
@@ -1721,11 +1733,21 @@ class BacktestWindow:
             self.ema_period.set("5")
             self.trend_ema_period.set("8")
             self.big_ema_period.set("233")
+            self.entry_reference_ema_period.set("0")
             self.risk_amount.set("100")
         if hasattr(self, "_controls_frame"):
             big_ema_widgets = self._controls_frame.grid_slaves(row=1, column=4) + self._controls_frame.grid_slaves(row=1, column=5)
             for widget in big_ema_widgets:
                 if self._strategy_uses_big_ema(definition.strategy_id):
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            entry_reference_widgets = (
+                self.entry_reference_ema_caption,
+                self.entry_reference_ema_entry,
+            )
+            for widget in entry_reference_widgets:
+                if dynamic_strategy:
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -1740,6 +1762,8 @@ class BacktestWindow:
                     widget.grid()
                 else:
                     widget.grid_remove()
+        if dynamic_strategy and not self.entry_reference_ema_period.get().strip():
+            self.entry_reference_ema_period.set("0")
 
     def _append_backtest_snapshot(
         self,
@@ -2028,7 +2052,7 @@ class BacktestWindow:
 
         if not batch_label:
             self._update_batch_layer_controls("none", [])
-            self.matrix_summary.set("当前所选回测不属于批量参数对比。")
+            self.matrix_summary.set("????????????????")
             self._show_batch_heatmap_v2(batch_label)
             return
 
@@ -2036,7 +2060,7 @@ class BacktestWindow:
         snapshots = [self._backtest_snapshots[snapshot_id] for snapshot_id in snapshot_ids if snapshot_id in self._backtest_snapshots]
         if not snapshots:
             self._update_batch_layer_controls("none", [])
-            self.matrix_summary.set("当前批量回测暂无可用矩阵数据。")
+            self.matrix_summary.set("当前所选回测不属于批量参数对比。")
             self._show_batch_heatmap_v2(batch_label)
             return
 
@@ -2059,16 +2083,12 @@ class BacktestWindow:
             self.matrix_summary.set(
                 f"动态止盈批次：{batch_label} ｜ 交易对：{symbol_text} ｜ 周期：{bar_text} ｜ 参数摘要：{param_text} ｜ "
                 f"信号方向：{signal_label} ｜ 开始时间：{start_text} ｜ 结束时间：{end_text} ｜ 共 {len(ordered_snapshots)} 组结果，"
-                "当前按每波最多开仓次数 0/1/2/3 做横向对比。单元格显示“总盈亏 | 胜率 | 交易数”，点击可加载对应回测。"
+                "行为止损倍数 SL x1/1.5/2，列为每波最多开仓次数 0/1/2/3。单元格显示“总盈亏 | 胜率 | 交易数”，点击可加载对应回测。"
             )
             self.matrix_grid_frame.columnconfigure(0, weight=0)
-            ttk.Label(self.matrix_grid_frame, text="每波最多开仓次数", anchor="center").grid(
+            ttk.Label(self.matrix_grid_frame, text="SL \\\\ 开仓次数", anchor="center").grid(
                 row=0, column=0, sticky="nsew", padx=4, pady=4
             )
-            ttk.Label(self.matrix_grid_frame, text="结果", anchor="center").grid(
-                row=1, column=0, sticky="nsew", padx=4, pady=4
-            )
-            snapshot_map = {snapshot.config.max_entries_per_trend: snapshot for snapshot in ordered_snapshots}
             for column, entry_limit in enumerate(levels, start=1):
                 self.matrix_grid_frame.columnconfigure(column, weight=1)
                 ttk.Label(
@@ -2076,27 +2096,38 @@ class BacktestWindow:
                     text=_batch_entries_label(entry_limit),
                     anchor="center",
                 ).grid(row=0, column=column, sticky="nsew", padx=4, pady=4)
-                snapshot = snapshot_map.get(entry_limit)
-                if snapshot is None:
-                    ttk.Label(
-                        self.matrix_grid_frame,
-                        text="--",
-                        anchor="center",
-                        relief="groove",
-                        padding=8,
-                    ).grid(row=1, column=column, sticky="nsew", padx=4, pady=4)
-                    continue
-                cell_text = (
-                    f"{format_decimal_fixed(snapshot.report.total_pnl, 4)} | "
-                    f"{format_decimal_fixed(snapshot.report.win_rate, 2)}% | "
-                    f"{snapshot.report.total_trades}笔"
-                )
-                ttk.Button(
+            snapshot_map = {
+                (snapshot.config.atr_stop_multiplier, snapshot.config.max_entries_per_trend): snapshot
+                for snapshot in ordered_snapshots
+            }
+            for row, stop_multiplier in enumerate(ATR_BATCH_MULTIPLIERS, start=1):
+                ttk.Label(
                     self.matrix_grid_frame,
-                    text=cell_text,
-                    command=lambda sid=snapshot.snapshot_id: self._load_snapshot(sid),
-                ).grid(row=1, column=column, sticky="nsew", padx=(4, 4), pady=4)
-            self.matrix_grid_frame.rowconfigure(1, weight=1)
+                    text=f"SL x{format_decimal(stop_multiplier)}",
+                    anchor="center",
+                ).grid(row=row, column=0, sticky="nsew", padx=4, pady=4)
+                self.matrix_grid_frame.rowconfigure(row, weight=1)
+                for column, entry_limit in enumerate(levels, start=1):
+                    snapshot = snapshot_map.get((stop_multiplier, entry_limit))
+                    if snapshot is None:
+                        ttk.Label(
+                            self.matrix_grid_frame,
+                            text="--",
+                            anchor="center",
+                            relief="groove",
+                            padding=8,
+                        ).grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
+                        continue
+                    cell_text = (
+                        f"{format_decimal_fixed(snapshot.report.total_pnl, 4)} | "
+                        f"{format_decimal_fixed(snapshot.report.win_rate, 2)}% | "
+                        f"{snapshot.report.total_trades}笔"
+                    )
+                    ttk.Button(
+                        self.matrix_grid_frame,
+                        text=cell_text,
+                        command=lambda sid=snapshot.snapshot_id: self._load_snapshot(sid),
+                    ).grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
         else:
             selected_limit = _batch_entries_value_from_label(self.batch_entries_layer_label.get())
             filtered = (
@@ -2201,7 +2232,7 @@ class BacktestWindow:
             render_snapshots = ordered_snapshots
             self.heatmap_summary.set(
                 f"批次：{batch_label} | 交易对：{symbol_text} | 周期：{bar_text} | 信号方向：{signal_label} | "
-                f"指标：{metric_label} | 当前为动态止盈模式，横向比较每波最多开仓次数 0/1/2/3。"
+                f"指标：{metric_label} | 当前为动态止盈模式，按止损倍数 x 开仓次数显示 3 x 4 对比。"
             )
         elif batch_mode == "fixed_entries":
             selected_limit = _batch_entries_value_from_label(self.batch_entries_layer_label.get())
@@ -2219,7 +2250,7 @@ class BacktestWindow:
         values = [_heatmap_metric_value(snapshot, metric_label) for snapshot in render_snapshots]
         min_value = min(values) if values else Decimal("0")
         max_value = max(values) if values else Decimal("0")
-        left = 72 if batch_mode == "dynamic_entries" else 92
+        left = 92
         top = 60
         right = 24
         bottom = 20
@@ -2229,15 +2260,11 @@ class BacktestWindow:
 
         if batch_mode == "dynamic_entries":
             cell_width = grid_width / max(len(levels), 1)
-            snapshot_map = {snapshot.config.max_entries_per_trend: snapshot for snapshot in render_snapshots}
-            canvas.create_text(
-                left - 10,
-                top + (grid_height / 2),
-                text="结果",
-                anchor="e",
-                fill="#57606a",
-                font=("Microsoft YaHei UI", 10, "bold"),
-            )
+            cell_height = grid_height / max(len(ATR_BATCH_MULTIPLIERS), 1)
+            snapshot_map = {
+                (snapshot.config.atr_stop_multiplier, snapshot.config.max_entries_per_trend): snapshot
+                for snapshot in render_snapshots
+            }
             for column, entry_limit in enumerate(levels):
                 x1 = left + (column * cell_width)
                 x2 = x1 + cell_width
@@ -2248,25 +2275,39 @@ class BacktestWindow:
                     fill="#57606a",
                     font=("Microsoft YaHei UI", 10, "bold"),
                 )
-                snapshot = snapshot_map.get(entry_limit)
-                fill = "#f3f4f6"
-                text = "--"
-                if snapshot is not None:
-                    value = _heatmap_metric_value(snapshot, metric_label)
-                    fill = _heatmap_fill_color(value, min_value, max_value)
-                    text = _heatmap_metric_text(snapshot, metric_label)
-                item_id = canvas.create_rectangle(x1, top, x2, top + grid_height, fill=fill, outline="#d0d7de")
-                text_id = canvas.create_text(
-                    (x1 + x2) / 2,
-                    top + (grid_height / 2),
-                    text=text,
-                    width=cell_width - 14,
-                    fill="#24292f",
-                    font=("Microsoft YaHei UI", 11),
+            for row, stop_multiplier in enumerate(ATR_BATCH_MULTIPLIERS):
+                y1 = top + (row * cell_height)
+                y2 = y1 + cell_height
+                canvas.create_text(
+                    left - 12,
+                    (y1 + y2) / 2,
+                    text=f"SL x{format_decimal(stop_multiplier)}",
+                    anchor="e",
+                    fill="#57606a",
+                    font=("Microsoft YaHei UI", 10, "bold"),
                 )
-                if snapshot is not None:
-                    canvas.tag_bind(item_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
-                    canvas.tag_bind(text_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+                for column, entry_limit in enumerate(levels):
+                    x1 = left + (column * cell_width)
+                    x2 = x1 + cell_width
+                    snapshot = snapshot_map.get((stop_multiplier, entry_limit))
+                    fill = "#f3f4f6"
+                    text = "--"
+                    if snapshot is not None:
+                        value = _heatmap_metric_value(snapshot, metric_label)
+                        fill = _heatmap_fill_color(value, min_value, max_value)
+                        text = _heatmap_metric_text(snapshot, metric_label)
+                    item_id = canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="#d0d7de")
+                    text_id = canvas.create_text(
+                        (x1 + x2) / 2,
+                        (y1 + y2) / 2,
+                        text=text,
+                        width=cell_width - 14,
+                        fill="#24292f",
+                        font=("Microsoft YaHei UI", 11),
+                    )
+                    if snapshot is not None:
+                        canvas.tag_bind(item_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+                        canvas.tag_bind(text_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
             return
 
         cell_width = grid_width / max(len(ATR_BATCH_TAKE_RATIOS), 1)

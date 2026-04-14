@@ -48,6 +48,35 @@ class DynamicStrategyTest(TestCase):
         self.assertEqual(decision.entry_reference, decision.ema_value)
         self.assertIsNotNone(decision.atr_value)
 
+    def test_long_mode_can_use_independent_entry_reference_ema(self) -> None:
+        candles = self._make_candles(["100", "101", "103", "106", "110", "109", "112"])
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=2,
+            trend_ema_period=3,
+            big_ema_period=4,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("100"),
+            entry_reference_ema_period=5,
+        )
+
+        decision = EmaDynamicOrderStrategy().evaluate(candles, config)
+
+        self.assertEqual(decision.signal, "long")
+        self.assertIsNotNone(decision.entry_reference)
+        self.assertIsNotNone(decision.ema_value)
+        self.assertNotEqual(decision.entry_reference, decision.ema_value)
+        self.assertIn("EMA5", decision.reason)
+
     def test_long_mode_keeps_pullback_order_when_close_dips_below_fast_ema(self) -> None:
         candles = self._make_candles(["100", "100", "100", "112", "107"])
         config = StrategyConfig(

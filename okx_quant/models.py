@@ -85,6 +85,18 @@ class StrategyConfig:
     backtest_funding_rate: Decimal = Decimal("0")
     take_profit_mode: TakeProfitMode = "fixed"
     max_entries_per_trend: int = 0
+    entry_reference_ema_period: int = 0
+
+    def resolved_entry_reference_ema_period(self) -> int:
+        if self.entry_reference_ema_period > 0:
+            return self.entry_reference_ema_period
+        return self.ema_period
+
+    def entry_reference_ema_label(self) -> str:
+        resolved_period = self.resolved_entry_reference_ema_period()
+        if self.entry_reference_ema_period > 0:
+            return f"EMA{resolved_period}"
+        return f"跟随EMA小周期(EMA{resolved_period})"
 
 
 @dataclass(frozen=True)

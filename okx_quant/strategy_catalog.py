@@ -24,14 +24,14 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     StrategyDefinition(
         strategy_id=STRATEGY_DYNAMIC_LONG_ID,
         name="EMA 动态委托-多头",
-        summary="只做多头。趋势成立后，每根新 K 线都会按最新 EMA 小周期重算回调委托价。",
+        summary="只做多头。趋势成立后，每根新 K 线都会按挂单参考 EMA 重算回调委托价。",
         rule_description=(
             "做多条件：EMA 小周期高于 EMA 中周期，且收盘价位于 EMA 中周期上方。"
-            " 每根新 K 线确认后，上一个委托自动失效，再按最新已收盘 K 线的 EMA 小周期重挂下一根回调委托。"
+            " 每根新 K 线确认后，上一个委托自动失效，再按最新已收盘 K 线的挂单参考 EMA 重挂下一根回调委托。"
             " 支持每波趋势最多开仓次数限制，并可在固定止盈和动态止盈之间切换。"
         ),
         parameter_hint=(
-            "EMA 小周期决定回调委托价格，EMA 中周期决定趋势过滤。"
+            "EMA 小周期决定信号强弱，EMA 中周期决定趋势过滤，挂单参考 EMA 决定回调委托价格；填 0 表示跟随 EMA 小周期。"
             " 每波趋势最多开仓次数填 0 表示不限。"
             " 动态止盈达到 2R 后先移动到保本加双向手续费，之后按 nR 锁定 (n-1)R。"
         ),
@@ -41,14 +41,14 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     StrategyDefinition(
         strategy_id=STRATEGY_DYNAMIC_SHORT_ID,
         name="EMA 动态委托-空头",
-        summary="只做空头。趋势成立后，每根新 K 线都会按最新 EMA 小周期重算反弹委托价。",
+        summary="只做空头。趋势成立后，每根新 K 线都会按挂单参考 EMA 重算反弹委托价。",
         rule_description=(
             "做空条件：EMA 小周期低于 EMA 中周期，且收盘价位于 EMA 中周期下方。"
-            " 每根新 K 线确认后，上一个委托自动失效，再按最新已收盘 K 线的 EMA 小周期重挂下一根反弹委托。"
+            " 每根新 K 线确认后，上一个委托自动失效，再按最新已收盘 K 线的挂单参考 EMA 重挂下一根反弹委托。"
             " 支持每波趋势最多开仓次数限制，并可在固定止盈和动态止盈之间切换。"
         ),
         parameter_hint=(
-            "EMA 小周期决定反弹委托价格，EMA 中周期决定趋势过滤。"
+            "EMA 小周期决定信号强弱，EMA 中周期决定趋势过滤，挂单参考 EMA 决定反弹委托价格；填 0 表示跟随 EMA 小周期。"
             " 每波趋势最多开仓次数填 0 表示不限。"
             " 动态止盈达到 2R 后先移动到保本加双向手续费，之后按 nR 锁定 (n-1)R。"
         ),

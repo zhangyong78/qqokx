@@ -127,6 +127,7 @@ class BacktestResult:
     initial_capital: Decimal = Decimal("10000")
     ema_period: int = 21
     trend_ema_period: int = 55
+    entry_reference_ema_period: int = 21
     big_ema_period: int = 233
     atr_period: int = 10
     strategy_id: str = STRATEGY_DYNAMIC_ID
@@ -248,9 +249,20 @@ def build_atr_batch_configs(
 def build_dynamic_entry_batch_configs(
     base_config: StrategyConfig,
     *,
+    atr_multipliers: tuple[Decimal, ...] = ATR_BATCH_MULTIPLIERS,
     max_entries_options: tuple[int, ...] = BATCH_MAX_ENTRIES_OPTIONS,
 ) -> list[StrategyConfig]:
-    return [replace(base_config, max_entries_per_trend=value) for value in max_entries_options]
+    configs: list[StrategyConfig] = []
+    for stop_multiplier in atr_multipliers:
+        for max_entries in max_entries_options:
+            configs.append(
+                replace(
+                    base_config,
+                    atr_stop_multiplier=stop_multiplier,
+                    max_entries_per_trend=max_entries,
+                )
+            )
+    return configs
 
 
 def build_parameter_batch_configs(
@@ -269,6 +281,7 @@ def build_parameter_batch_configs(
     if base_config.take_profit_mode == "dynamic":
         return build_dynamic_entry_batch_configs(
             base_config,
+            atr_multipliers=atr_multipliers,
             max_entries_options=max_entries_options,
         )
 
@@ -405,6 +418,7 @@ def _run_backtest_with_loaded_data(
         initial_capital=initial_capital,
         ema_period=config.ema_period,
         trend_ema_period=config.trend_ema_period,
+        entry_reference_ema_period=config.resolved_entry_reference_ema_period(),
         big_ema_period=config.big_ema_period,
         atr_period=config.atr_period,
         strategy_id=config.strategy_id,
@@ -459,7 +473,10 @@ def format_backtest_report(result: BacktestResult) -> str:
         lines.append(
             f"趋势过滤：EMA{result.ema_period} 与 EMA{result.trend_ema_period} 组成趋势过滤，当前策略方向={direction_text}"
         )
-        lines.append("委托规则：每根新 K 线按最新 EMA 重新撤旧挂新，未成交委托不跨 K 线保留")
+        lines.append(f"挂单参考EMA：EMA{result.entry_reference_ema_period}")
+        lines.append(
+            f"委托规则：每根新 K 线按最新 EMA{result.entry_reference_ema_period} 重新撤旧挂新，未成交委托不跨 K 线保留"
+        )
         lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
         lines.append(f"每波最多开仓次数：{result.max_entries_per_trend if result.max_entries_per_trend > 0 else '不限'}")
         lines.append("止盈说明：动态止盈为永久阶梯规则；固定止盈为 ATR 倍数止盈。")
@@ -570,6 +587,7 @@ def _required_backtest_preload_candles(config: StrategyConfig) -> int:
             config.ema_period,
             config.trend_ema_period,
             config.atr_period,
+            config.resolved_entry_reference_ema_period(),
         )
     return _backtest_trade_start_index(minimum)
 
@@ -785,10 +803,12 @@ def _run_dynamic_backtest(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
+    entry_reference_ema_period = config.resolved_entry_reference_ema_period()
     minimum = max(
         config.ema_period,
         config.trend_ema_period,
         config.atr_period,
+        entry_reference_ema_period,
     )
     if len(candles) < minimum + 1:
         raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum + 1} 根。")
@@ -798,6 +818,9 @@ def _run_dynamic_backtest(
 
     closes = [candle.close for candle in candles]
     ema_values = ema(closes, config.ema_period)
+    entry_reference_ema_values = (
+        ema_values if entry_reference_ema_period == config.ema_period else ema(closes, entry_reference_ema_period)
+    )
     trend_ema_values = ema(closes, config.trend_ema_period)
     atr_values = atr(candles, config.atr_period)
     trades: list[BacktestTrade] = []
@@ -859,6 +882,7 @@ def _run_dynamic_backtest(
             candles,
             index,
             ema_values,
+            entry_reference_ema_values,
             trend_ema_values,
             atr_values,
             config,
@@ -930,12 +954,14 @@ def _evaluate_dynamic_signal_precomputed(
     candles: list[Candle],
     index: int,
     ema_values: list[Decimal],
+    entry_reference_ema_values: list[Decimal],
     trend_ema_values: list[Decimal],
     atr_values: list[Decimal | None],
     config: StrategyConfig,
 ) -> SignalDecision:
     current_candle = candles[index]
     current_ema = ema_values[index]
+    current_entry_reference = entry_reference_ema_values[index]
     trend_ema = trend_ema_values[index]
     current_atr = atr_values[index]
     if current_atr is None:
@@ -979,7 +1005,7 @@ def _evaluate_dynamic_signal_precomputed(
             signal="long",
             reason="dynamic_long",
             candle_ts=current_candle.ts,
-            entry_reference=current_ema,
+            entry_reference=current_entry_reference,
             atr_value=current_atr,
             ema_value=current_ema,
             signal_candle_high=current_candle.high,
@@ -1013,7 +1039,7 @@ def _evaluate_dynamic_signal_precomputed(
             signal="short",
             reason="dynamic_short",
             candle_ts=current_candle.ts,
-            entry_reference=current_ema,
+            entry_reference=current_entry_reference,
             atr_value=current_atr,
             ema_value=current_ema,
             signal_candle_high=current_candle.high,

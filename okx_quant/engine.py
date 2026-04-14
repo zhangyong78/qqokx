@@ -176,10 +176,12 @@ class StrategyEngine:
             raise RuntimeError("风险金必须大于 0")
 
         strategy = EmaDynamicOrderStrategy()
+        entry_reference_ema_period = config.resolved_entry_reference_ema_period()
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
             config.atr_period,
+            entry_reference_ema_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = None
@@ -188,8 +190,8 @@ class StrategyEngine:
         self._log_strategy_start(config, instrument, instrument)
         self._logger("运行模式：同标的永续下单，止盈止损交给 OKX 托管")
         self._logger(
-            "策略规则：以上一根已收盘 K 线的 EMA 作为开仓价直接挂限价单。"
-            "每根新 K 线确认后，撤掉旧单，再按最新上一根 EMA 重新挂单。"
+            f"策略规则：以上一根已收盘 K 线的 {_dynamic_entry_reference_ema_text(config)} 作为开仓价直接挂限价单。"
+            f"每根新 K 线确认后，撤掉旧单，再按最新上一根 {_dynamic_entry_reference_ema_text(config)} 重新挂单。"
         )
         self._logger(
             f"方向={_format_signal_mode(config.signal_mode)} | 风险金={format_decimal(config.risk_amount)} | "
@@ -202,6 +204,7 @@ class StrategyEngine:
             config.inst_id,
             config.ema_period,
             trend_ema_period=config.trend_ema_period,
+            entry_reference_ema_period=entry_reference_ema_period,
         )
 
         while not self._stop_event.is_set():
@@ -211,6 +214,7 @@ class StrategyEngine:
                 config.ema_period,
                 config.trend_ema_period,
                 config.atr_period,
+                entry_reference_ema_period,
             )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
@@ -521,10 +525,12 @@ class StrategyEngine:
             raise RuntimeError("EMA 动态委托策略不支持双向，请选择只做多或只做空")
 
         strategy = EmaDynamicOrderStrategy()
+        entry_reference_ema_period = config.resolved_entry_reference_ema_period()
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
             config.atr_period,
+            entry_reference_ema_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = None
@@ -533,13 +539,14 @@ class StrategyEngine:
         self._log_strategy_start(config, signal_instrument, trade_instrument)
         self._log_local_mode_summary(config, signal_instrument, trade_instrument)
         self._logger(
-            "策略规则：根据上一根已收盘 K 线 EMA 生成动态委托价，不再直接往 OKX 挂单，"
-            "而是在本地轮询信号标的价格，触碰 EMA 后立即对下单标的开仓。"
+            f"策略规则：根据上一根已收盘 K 线的 {_dynamic_entry_reference_ema_text(config)} 生成动态委托价，不再直接往 OKX 挂单，"
+            f"而是在本地轮询信号标的价格，触碰 {_dynamic_entry_reference_ema_text(config)} 后立即对下单标的开仓。"
         )
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
             trend_ema_period=config.trend_ema_period,
+            entry_reference_ema_period=entry_reference_ema_period,
         )
 
         while not self._stop_event.is_set():
@@ -549,6 +556,7 @@ class StrategyEngine:
                 config.ema_period,
                 config.trend_ema_period,
                 config.atr_period,
+                entry_reference_ema_period,
             )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
@@ -626,20 +634,25 @@ class StrategyEngine:
             raise RuntimeError("EMA 动态委托策略不支持双向，请选择只做多或只做空")
 
         strategy = EmaDynamicOrderStrategy()
+        entry_reference_ema_period = config.resolved_entry_reference_ema_period()
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
             config.atr_period,
+            entry_reference_ema_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = None
 
         self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
-        self._logger("运行模式：只监控信号，不下单；每根新 K 线确认后，如生成新的 EMA 动态委托参考价，则发送邮件通知。")
+        self._logger(
+            f"运行模式：只监控信号，不下单；每根新 K 线确认后，如生成新的 {_dynamic_entry_reference_ema_text(config)} 动态委托参考价，则发送邮件通知。"
+        )
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
             trend_ema_period=config.trend_ema_period,
+            entry_reference_ema_period=entry_reference_ema_period,
         )
 
         while not self._stop_event.is_set():
@@ -649,6 +662,7 @@ class StrategyEngine:
                 config.ema_period,
                 config.trend_ema_period,
                 config.atr_period,
+                entry_reference_ema_period,
             )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
@@ -709,36 +723,40 @@ class StrategyEngine:
             raise RuntimeError("EMA 动态委托不支持双向，请选择只做多或只做空。")
 
         strategy = EmaDynamicOrderStrategy()
+        entry_reference_ema_period = config.resolved_entry_reference_ema_period()
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
             config.atr_period,
+            entry_reference_ema_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = None
         active_trigger: LocalSignalTrigger | None = None
         current_wave_signal: Literal["long", "short"] | None = None
         entries_in_current_wave = 0
+        current_wave_index = 0
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
         self._log_local_mode_summary(config, signal_instrument, trade_instrument)
         self._logger(
-            "策略规则：每根新 K 线确认后，上一根动态委托自动失效，再按最新 EMA 小周期重新挂下一根委托。"
+            f"策略规则：每根新 K 线确认后，上一根动态委托自动失效，再按最新 {_dynamic_entry_reference_ema_text(config)} 重新挂下一根委托。"
         )
         self._logger(
             f"方向={_format_signal_mode(effective_signal_mode)} | 止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'} | "
-            f"每波最多开仓次数={config.max_entries_per_trend or 0}"
+            f"每波最多开仓次数={config.max_entries_per_trend or 0} | 挂单参考={_dynamic_entry_reference_ema_text(config)}"
         )
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
             trend_ema_period=config.trend_ema_period,
+            entry_reference_ema_period=entry_reference_ema_period,
         )
 
         while not self._stop_event.is_set():
             candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period)
+            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period, entry_reference_ema_period)
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -761,11 +779,15 @@ class StrategyEngine:
                 if current_wave_signal != decision.signal:
                     current_wave_signal = decision.signal
                     entries_in_current_wave = 0
+                    current_wave_index += 1
+                    self._logger(
+                        f"{_fmt_ts(decision.candle_ts)} | 第{current_wave_index}波趋势开始 | 方向={decision.signal.upper()}"
+                    )
 
                 if config.max_entries_per_trend > 0 and entries_in_current_wave >= config.max_entries_per_trend:
                     active_trigger = None
                     self._logger(
-                        f"{_fmt_ts(decision.candle_ts)} | 本波趋势开仓次数已达上限 | 方向={decision.signal.upper()} | "
+                        f"{_fmt_ts(decision.candle_ts)} | 第{current_wave_index}波趋势开仓次数已达上限 | 方向={decision.signal.upper()} | "
                         f"上限={config.max_entries_per_trend}"
                     )
                     self._stop_event.wait(config.poll_seconds)
@@ -781,7 +803,7 @@ class StrategyEngine:
                 )
                 self._logger(
                     f"{_fmt_ts(decision.candle_ts)} | 动态等待中 | 信号方向={decision.signal.upper()} | "
-                    f"第{entries_in_current_wave + 1}次委托 | 触发价={format_decimal(decision.entry_reference)} | "
+                    f"第{current_wave_index}波 | 本波第{entries_in_current_wave + 1}次委托 | 触发价={format_decimal(decision.entry_reference)} | "
                     f"下单标的={trade_instrument.inst_id}"
                 )
 
@@ -837,32 +859,36 @@ class StrategyEngine:
             raise RuntimeError("EMA 动态委托不支持双向，请选择只做多或只做空。")
 
         strategy = EmaDynamicOrderStrategy()
+        entry_reference_ema_period = config.resolved_entry_reference_ema_period()
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
             config.atr_period,
+            entry_reference_ema_period,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = None
         current_wave_signal: Literal["long", "short"] | None = None
         entries_in_current_wave = 0
+        current_wave_index = 0
 
         self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
         self._logger(
             f"运行模式：只监控信号，不下单 | 方向={_format_signal_mode(effective_signal_mode)} | "
             f"止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'} | "
-            f"每波最多开仓次数={config.max_entries_per_trend or 0}"
+            f"每波最多开仓次数={config.max_entries_per_trend or 0} | 挂单参考={_dynamic_entry_reference_ema_text(config)}"
         )
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
             trend_ema_period=config.trend_ema_period,
+            entry_reference_ema_period=entry_reference_ema_period,
         )
 
         while not self._stop_event.is_set():
             candles = self._client.get_candles(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period)
+            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period, entry_reference_ema_period)
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -888,10 +914,14 @@ class StrategyEngine:
             if current_wave_signal != decision.signal:
                 current_wave_signal = decision.signal
                 entries_in_current_wave = 0
+                current_wave_index += 1
+                self._logger(
+                    f"{_fmt_ts(decision.candle_ts)} | 第{current_wave_index}波趋势开始 | 方向={decision.signal.upper()}"
+                )
 
             if config.max_entries_per_trend > 0 and entries_in_current_wave >= config.max_entries_per_trend:
                 self._logger(
-                    f"{_fmt_ts(decision.candle_ts)} | 本波趋势信号次数已达上限 | 方向={decision.signal.upper()} | "
+                    f"{_fmt_ts(decision.candle_ts)} | 第{current_wave_index}波趋势信号次数已达上限 | 方向={decision.signal.upper()} | "
                     f"上限={config.max_entries_per_trend}"
                 )
                 self._stop_event.wait(config.poll_seconds)
@@ -915,7 +945,8 @@ class StrategyEngine:
                 )
             self._logger(
                 f"{_fmt_ts(decision.candle_ts)} | 信号触发 | 方向={decision.signal.upper()} | "
-                f"第{entries_in_current_wave + 1}次信号 | 参考价={format_decimal(decision.entry_reference)} | {reason}"
+                f"第{current_wave_index}波 | 本波第{entries_in_current_wave + 1}次信号 | "
+                f"参考价={format_decimal(decision.entry_reference)} | {reason}"
             )
             self._notify_signal(
                 config,
@@ -1586,10 +1617,16 @@ class StrategyEngine:
         signal_instrument: Instrument,
         trade_instrument: Instrument,
     ) -> None:
-        self._logger(
+        message = (
             f"启动策略 | 信号标的={signal_instrument.inst_id} | 下单标的={trade_instrument.inst_id} | "
             f"K线周期={config.bar} | EMA={config.ema_period} | ATR={config.atr_period}"
         )
+        if is_dynamic_strategy_id(config.strategy_id):
+            message = (
+                f"{message} | 趋势EMA={config.trend_ema_period} | "
+                f"挂单参考EMA={config.resolved_entry_reference_ema_period()}"
+            )
+        self._logger(message)
 
     def _log_local_mode_summary(
         self,
@@ -1614,6 +1651,7 @@ class StrategyEngine:
         *,
         trend_ema_period: int = 0,
         big_ema_period: int = 0,
+        entry_reference_ema_period: int = 0,
     ) -> None:
         try:
             hourly_snapshot = fetch_hourly_ema_debug(
@@ -1622,6 +1660,7 @@ class StrategyEngine:
                 ema_period=ema_period,
                 trend_ema_period=trend_ema_period,
                 big_ema_period=big_ema_period,
+                entry_reference_ema_period=entry_reference_ema_period,
             )
             self._logger(format_hourly_debug(inst_id, hourly_snapshot))
         except Exception as exc:
@@ -1960,6 +1999,10 @@ def recommended_indicator_lookback(*periods: int) -> int:
     return min(requested, OKX_SINGLE_REQUEST_MAX_CANDLES)
 
 
+def _dynamic_entry_reference_ema_text(config: StrategyConfig) -> str:
+    return f"EMA{config.resolved_entry_reference_ema_period()}"
+
+
 def fetch_hourly_ema_debug(
     client: OkxRestClient,
     inst_id: str,
@@ -1967,16 +2010,18 @@ def fetch_hourly_ema_debug(
     atr_period: int = DEFAULT_DEBUG_ATR_PERIOD,
     trend_ema_period: int = 0,
     big_ema_period: int = 0,
+    entry_reference_ema_period: int = 0,
 ) -> HourlyDebugSnapshot:
     lookback = recommended_indicator_lookback(
         ema_period,
         atr_period,
         trend_ema_period,
         big_ema_period,
+        entry_reference_ema_period,
     )
     candles = client.get_candles(inst_id, "1H", limit=lookback)
     confirmed = [candle for candle in candles if candle.confirmed]
-    minimum = max(ema_period, atr_period, trend_ema_period, big_ema_period)
+    minimum = max(ema_period, atr_period, trend_ema_period, big_ema_period, entry_reference_ema_period)
     if len(confirmed) < minimum:
         raise RuntimeError(f"已收盘 1 小时 K 线不足，无法计算 EMA{ema_period} / ATR{atr_period}")
 

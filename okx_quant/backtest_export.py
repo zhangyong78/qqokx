@@ -171,7 +171,10 @@ def _build_batch_backtest_report_text(
     )
     for index, (config, result) in enumerate(sorted_results, start=1):
         if batch_mode == "dynamic_entries":
-            title = f"[{index}] 每波最多开仓次数：{_format_max_entries_label(config.max_entries_per_trend)}"
+            title = (
+                f"[{index}] 动态止盈 | SL x{format_decimal(config.atr_stop_multiplier)} | "
+                f"每波最多开仓次数：{_format_max_entries_label(config.max_entries_per_trend)}"
+            )
         elif batch_mode == "fixed_entries":
             title = (
                 f"[{index}] 每波最多开仓次数：{_format_max_entries_label(config.max_entries_per_trend)} | "
@@ -230,7 +233,7 @@ def _resolve_batch_mode(config: StrategyConfig) -> str:
 
 def _batch_result_sort_key(config: StrategyConfig, batch_mode: str) -> tuple[object, ...]:
     if batch_mode == "dynamic_entries":
-        return (config.max_entries_per_trend,)
+        return (config.atr_stop_multiplier, config.max_entries_per_trend)
     if batch_mode == "fixed_entries":
         return (
             config.max_entries_per_trend,
@@ -251,16 +254,17 @@ def _build_batch_scope_line(
     maker_fee = _format_percent(results[0][1].maker_fee_rate)
     taker_fee = _format_percent(results[0][1].taker_fee_rate)
     if batch_mode == "dynamic_entries":
-        base_config = results[0][0]
         return (
             "参数范围：动态止盈；"
+            f"挂单参考EMA = EMA{results[0][0].resolved_entry_reference_ema_period()}；"
+            "SL = 1/1.5/2 ATR；"
             "每波最多开仓次数 = 0/1/2/3；"
-            f"当前止损 = SL x{format_decimal(base_config.atr_stop_multiplier)}；"
             f"手续费 M/T = {maker_fee} / {taker_fee}"
         )
     if batch_mode == "fixed_entries":
         return (
-            "参数范围：每波最多开仓次数 = 0/1/2/3；"
+            f"参数范围：挂单参考EMA = EMA{results[0][0].resolved_entry_reference_ema_period()}；"
+            "每波最多开仓次数 = 0/1/2/3；"
             "SL = 1/1.5/2 ATR；"
             "TP = SL x1/x2/x3；"
             f"手续费 M/T = {maker_fee} / {taker_fee}"
@@ -270,16 +274,20 @@ def _build_batch_scope_line(
 
 def _build_batch_matrix_lines(results: list[tuple[StrategyConfig, BacktestResult]], batch_mode: str) -> str:
     if batch_mode == "dynamic_entries":
-        header = ["每波最多开仓次数", "不限(0)", "1次", "2次", "3次"]
-        cells = ["总盈亏 | 胜率 | 交易数"]
-        result_map = {config.max_entries_per_trend: result for config, result in results}
-        for entry_limit in (0, 1, 2, 3):
-            matched = result_map.get(entry_limit)
-            if matched is None:
-                cells.append("-")
-                continue
-            cells.append(_build_matrix_cell_text(matched))
-        return "\n".join([" | ".join(header), " | ".join(cells)])
+        header = ["SL \\\\ 每波最多开仓次数", "不限(0)", "1次", "2次", "3次"]
+        rows = [" | ".join(header)]
+        result_map = {
+            (config.atr_stop_multiplier, config.max_entries_per_trend): result
+            for config, result in results
+        }
+        stop_values = sorted({config.atr_stop_multiplier for config, _ in results})
+        for stop_value in stop_values:
+            cells = [f"SL x{format_decimal(stop_value)}"]
+            for entry_limit in (0, 1, 2, 3):
+                matched = result_map.get((stop_value, entry_limit))
+                cells.append("-" if matched is None else _build_matrix_cell_text(matched))
+            rows.append(" | ".join(cells))
+        return "\n".join(rows)
 
     if batch_mode == "fixed_entries":
         groups: dict[int, list[tuple[StrategyConfig, BacktestResult]]] = {}
@@ -337,6 +345,7 @@ def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
     parts = [
         f"EMA{config.ema_period}",
         f"趋势EMA{config.trend_ema_period}",
+        f"挂单EMA{config.resolved_entry_reference_ema_period()}",
         f"ATR{config.atr_period}",
         f"SL x{format_decimal(config.atr_stop_multiplier)}",
         f"TP x{format_decimal(config.atr_take_multiplier)}",
