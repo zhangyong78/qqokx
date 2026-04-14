@@ -35,6 +35,7 @@ ATR_BATCH_TAKE_RATIOS: tuple[Decimal, ...] = (
     Decimal("2"),
     Decimal("3"),
 )
+BATCH_MAX_ENTRIES_OPTIONS: tuple[int, ...] = (0, 1, 2, 3)
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,8 @@ class BacktestResult:
     taker_fee_rate: Decimal = Decimal("0")
     slippage_rate: Decimal = Decimal("0")
     funding_rate: Decimal = Decimal("0")
+    take_profit_mode: str = "fixed"
+    max_entries_per_trend: int = 0
     sizing_mode: str = "fixed_risk"
     compounding: bool = False
     open_position: "BacktestOpenPosition | None" = None
@@ -242,6 +245,46 @@ def build_atr_batch_configs(
     return configs
 
 
+def build_dynamic_entry_batch_configs(
+    base_config: StrategyConfig,
+    *,
+    max_entries_options: tuple[int, ...] = BATCH_MAX_ENTRIES_OPTIONS,
+) -> list[StrategyConfig]:
+    return [replace(base_config, max_entries_per_trend=value) for value in max_entries_options]
+
+
+def build_parameter_batch_configs(
+    base_config: StrategyConfig,
+    *,
+    atr_multipliers: tuple[Decimal, ...] = ATR_BATCH_MULTIPLIERS,
+    take_ratios: tuple[Decimal, ...] = ATR_BATCH_TAKE_RATIOS,
+    max_entries_options: tuple[int, ...] = BATCH_MAX_ENTRIES_OPTIONS,
+) -> list[StrategyConfig]:
+    if not is_dynamic_strategy_id(base_config.strategy_id):
+        return build_atr_batch_configs(
+            base_config,
+            atr_multipliers=atr_multipliers,
+            take_ratios=take_ratios,
+        )
+    if base_config.take_profit_mode == "dynamic":
+        return build_dynamic_entry_batch_configs(
+            base_config,
+            max_entries_options=max_entries_options,
+        )
+
+    configs: list[StrategyConfig] = []
+    for max_entries in max_entries_options:
+        layer_config = replace(base_config, max_entries_per_trend=max_entries)
+        configs.extend(
+            build_atr_batch_configs(
+                layer_config,
+                atr_multipliers=atr_multipliers,
+                take_ratios=take_ratios,
+            )
+        )
+    return configs
+
+
 def run_backtest_batch(
     client: OkxRestClient,
     base_config: StrategyConfig,
@@ -276,7 +319,11 @@ def run_backtest_batch(
     )
     data_source_note = _build_backtest_data_source_note(client)
     results: list[tuple[StrategyConfig, BacktestResult]] = []
-    for config in build_atr_batch_configs(base_config, atr_multipliers=atr_multipliers, take_ratios=take_ratios):
+    for config in build_parameter_batch_configs(
+        base_config,
+        atr_multipliers=atr_multipliers,
+        take_ratios=take_ratios,
+    ):
         results.append(
             (
                 config,
@@ -366,6 +413,8 @@ def _run_backtest_with_loaded_data(
         taker_fee_rate=taker_fee_rate,
         slippage_rate=config.backtest_slippage_rate,
         funding_rate=config.backtest_funding_rate,
+        take_profit_mode=str(config.take_profit_mode),
+        max_entries_per_trend=int(config.max_entries_per_trend),
         sizing_mode=config.backtest_sizing_mode,
         compounding=config.backtest_compounding,
         open_position=terminal_open_position,
@@ -411,7 +460,9 @@ def format_backtest_report(result: BacktestResult) -> str:
             f"趋势过滤：EMA{result.ema_period} 与 EMA{result.trend_ema_period} 组成趋势过滤，当前策略方向={direction_text}"
         )
         lines.append("委托规则：每根新 K 线按最新 EMA 重新撤旧挂新，未成交委托不跨 K 线保留")
-        lines.append("止盈模式：固定止盈或永久阶梯动态止盈，具体以当次参数为准")
+        lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
+        lines.append(f"每波最多开仓次数：{result.max_entries_per_trend if result.max_entries_per_trend > 0 else '不限'}")
+        lines.append("止盈说明：动态止盈为永久阶梯规则；固定止盈为 ATR 倍数止盈。")
         lines.append("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓")
     if result.strategy_id == STRATEGY_EMA5_EMA8_ID:
         lines.append(

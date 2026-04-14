@@ -12,6 +12,7 @@ from tkinter import messagebox, ttk
 from okx_quant.backtest import (
     ATR_BATCH_MULTIPLIERS,
     ATR_BATCH_TAKE_RATIOS,
+    BATCH_MAX_ENTRIES_OPTIONS,
     BacktestReport,
     BacktestResult,
     BacktestTrade,
@@ -448,6 +449,48 @@ def _format_fee_rate_percent(rate: Decimal) -> str:
     return f"{format_decimal_fixed(rate * Decimal('100'), 4)}%"
 
 
+def _batch_entries_label(value: int) -> str:
+    return "不限(0)" if value <= 0 else f"{value}次"
+
+
+def _batch_entries_value_from_label(label: str) -> int:
+    if label.startswith("不限"):
+        return 0
+    digits = "".join(ch for ch in label if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def _batch_mode_for_snapshots(snapshots: list[_BacktestSnapshot]) -> str:
+    if not snapshots:
+        return "none"
+    config = snapshots[0].config
+    if is_dynamic_strategy_id(config.strategy_id):
+        if config.take_profit_mode == "dynamic":
+            return "dynamic_entries"
+        return "fixed_entries"
+    return "atr_matrix"
+
+
+def _batch_entry_levels(snapshots: list[_BacktestSnapshot]) -> list[int]:
+    levels = sorted({snapshot.config.max_entries_per_trend for snapshot in snapshots})
+    if levels:
+        return levels
+    return list(BATCH_MAX_ENTRIES_OPTIONS)
+
+
+def _snapshot_sort_key(snapshot: _BacktestSnapshot, batch_mode: str) -> tuple[object, ...]:
+    config = snapshot.config
+    if batch_mode == "dynamic_entries":
+        return (config.max_entries_per_trend,)
+    if batch_mode == "fixed_entries":
+        return (
+            config.max_entries_per_trend,
+            config.atr_stop_multiplier,
+            config.atr_take_multiplier,
+        )
+    return (config.atr_stop_multiplier, config.atr_take_multiplier)
+
+
 def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
     return {
         "inst_id": config.inst_id,
@@ -816,6 +859,7 @@ class BacktestWindow:
             value="\u53c2\u6570\u70ed\u529b\u56fe\u4f1a\u5728\u8fd9\u91cc\u663e\u793a\uff0c\u53ef\u5207\u6362\u6307\u6807\u5e76\u5355\u51fb\u5355\u5143\u683c\u8054\u52a8\u56de\u6d4b\u89c6\u56fe\u3002"
         )
         self.heatmap_metric = StringVar(value="总盈亏")
+        self.batch_entries_layer_label = StringVar(value=_batch_entries_label(BATCH_MAX_ENTRIES_OPTIONS[0]))
         self._latest_result: BacktestResult | None = None
         self._chart_zoom_window: Toplevel | None = None
         self._chart_zoom_canvas: Canvas | None = None
@@ -836,6 +880,7 @@ class BacktestWindow:
         self._current_matrix_batch_label: str | None = None
 
         self._build_layout()
+        self._update_batch_layer_controls("none", [])
         self._apply_selected_strategy_definition()
         self._update_sizing_mode_widgets()
 
@@ -1112,15 +1157,34 @@ class BacktestWindow:
 
         matrix_tab = ttk.Frame(report_notebook, padding=8)
         matrix_tab.columnconfigure(0, weight=1)
-        matrix_tab.rowconfigure(1, weight=1)
+        matrix_tab.rowconfigure(2, weight=1)
+        matrix_toolbar = ttk.Frame(matrix_tab)
+        matrix_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        matrix_toolbar.columnconfigure(4, weight=1)
+        self.matrix_layer_caption = ttk.Label(matrix_toolbar, text="开仓次数层")
+        self.matrix_layer_caption.grid(row=0, column=0, sticky="w")
+        self.matrix_layer_combo = ttk.Combobox(
+            matrix_toolbar,
+            textvariable=self.batch_entries_layer_label,
+            values=[_batch_entries_label(value) for value in BATCH_MAX_ENTRIES_OPTIONS],
+            state="readonly",
+            width=12,
+        )
+        self.matrix_layer_combo.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.matrix_layer_combo.bind("<<ComboboxSelected>>", lambda *_: self._refresh_current_batch_views())
+        ttk.Label(
+            matrix_toolbar,
+            text="固定止盈按开仓次数分层查看，动态止盈自动切到 4 组次数对比。",
+            foreground="#57606a",
+        ).grid(row=0, column=4, sticky="e", padx=(12, 0))
         ttk.Label(
             matrix_tab,
             textvariable=self.matrix_summary,
             wraplength=480,
             justify="left",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        ).grid(row=1, column=0, sticky="w", pady=(0, 10))
         self.matrix_grid_frame = ttk.Frame(matrix_tab)
-        self.matrix_grid_frame.grid(row=1, column=0, sticky="nsew")
+        self.matrix_grid_frame.grid(row=2, column=0, sticky="nsew")
         report_notebook.add(matrix_tab, text="\u77e9\u9635\u5bf9\u6bd4")
 
         heatmap_tab = ttk.Frame(report_notebook, padding=8)
@@ -1128,7 +1192,7 @@ class BacktestWindow:
         heatmap_tab.rowconfigure(2, weight=1)
         heatmap_toolbar = ttk.Frame(heatmap_tab)
         heatmap_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        heatmap_toolbar.columnconfigure(2, weight=1)
+        heatmap_toolbar.columnconfigure(4, weight=1)
         ttk.Label(heatmap_toolbar, text="热力指标").grid(row=0, column=0, sticky="w")
         heatmap_metric_combo = ttk.Combobox(
             heatmap_toolbar,
@@ -1139,11 +1203,22 @@ class BacktestWindow:
         )
         heatmap_metric_combo.grid(row=0, column=1, sticky="w", padx=(8, 0))
         heatmap_metric_combo.bind("<<ComboboxSelected>>", lambda *_: self._show_batch_heatmap(self._current_matrix_batch_label))
+        self.heatmap_layer_caption = ttk.Label(heatmap_toolbar, text="开仓次数层")
+        self.heatmap_layer_caption.grid(row=0, column=2, sticky="w", padx=(16, 0))
+        self.heatmap_layer_combo = ttk.Combobox(
+            heatmap_toolbar,
+            textvariable=self.batch_entries_layer_label,
+            values=[_batch_entries_label(value) for value in BATCH_MAX_ENTRIES_OPTIONS],
+            state="readonly",
+            width=12,
+        )
+        self.heatmap_layer_combo.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        self.heatmap_layer_combo.bind("<<ComboboxSelected>>", lambda *_: self._refresh_current_batch_views())
         ttk.Label(
             heatmap_toolbar,
             text="单击单元格可切换到对应回测。",
             foreground="#57606a",
-        ).grid(row=0, column=2, sticky="e", padx=(12, 0))
+        ).grid(row=0, column=4, sticky="e", padx=(12, 0))
         ttk.Label(
             heatmap_tab,
             textvariable=self.heatmap_summary,
@@ -1735,9 +1810,13 @@ class BacktestWindow:
         if snapshot_id is None:
             self._show_batch_matrix(None)
             return
+        snapshot = self._backtest_snapshots.get(snapshot_id)
+        if snapshot is not None and is_dynamic_strategy_id(snapshot.config.strategy_id) and snapshot.config.take_profit_mode != "dynamic":
+            self.batch_entries_layer_label.set(_batch_entries_label(snapshot.config.max_entries_per_trend))
         self._show_batch_matrix(self._snapshot_batch_labels.get(snapshot_id))
 
     def _show_batch_matrix(self, batch_label: str | None) -> None:
+        return self._show_batch_matrix_v2(batch_label)
         self._current_matrix_batch_label = batch_label
         for child in self.matrix_grid_frame.winfo_children():
             child.destroy()
@@ -1817,6 +1896,7 @@ class BacktestWindow:
                 ).grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
 
     def _show_batch_heatmap(self, batch_label: str | None) -> None:
+        return self._show_batch_heatmap_v2(batch_label)
         canvas = getattr(self, "heatmap_canvas", None)
         if canvas is None:
             return
@@ -1865,6 +1945,336 @@ class BacktestWindow:
             for snapshot in snapshots
         }
         canvas.create_rectangle(left, top, left + grid_width, top + grid_height, outline="#d0d7de", width=1)
+        for column, take_ratio in enumerate(ATR_BATCH_TAKE_RATIOS):
+            x1 = left + (column * cell_width)
+            x2 = x1 + cell_width
+            canvas.create_text(
+                (x1 + x2) / 2,
+                top - 22,
+                text=f"TP = SL x{format_decimal(take_ratio)}",
+                fill="#57606a",
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
+        for row, stop_multiplier in enumerate(ATR_BATCH_MULTIPLIERS):
+            y1 = top + (row * cell_height)
+            y2 = y1 + cell_height
+            canvas.create_text(
+                left - 12,
+                (y1 + y2) / 2,
+                text=f"SL x{format_decimal(stop_multiplier)}",
+                anchor="e",
+                fill="#57606a",
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
+            for column, take_ratio in enumerate(ATR_BATCH_TAKE_RATIOS):
+                take_multiplier = stop_multiplier * take_ratio
+                snapshot = snapshot_map.get((stop_multiplier, take_multiplier))
+                x1 = left + (column * cell_width)
+                y1 = top + (row * cell_height)
+                x2 = x1 + cell_width
+                y2 = y1 + cell_height
+                fill = "#f3f4f6"
+                text = "--"
+                if snapshot is not None:
+                    value = _heatmap_metric_value(snapshot, metric_label)
+                    fill = _heatmap_fill_color(value, min_value, max_value)
+                    text = _heatmap_metric_text(snapshot, metric_label)
+                item_id = canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="#d0d7de")
+                text_id = canvas.create_text(
+                    (x1 + x2) / 2,
+                    (y1 + y2) / 2,
+                    text=text,
+                    width=cell_width - 14,
+                    fill="#24292f",
+                    font=("Microsoft YaHei UI", 11),
+                )
+                if snapshot is not None:
+                    canvas.tag_bind(item_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+                    canvas.tag_bind(text_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+
+    def _refresh_current_batch_views(self) -> None:
+        self._show_batch_matrix(self._current_matrix_batch_label)
+
+    def _update_batch_layer_controls(self, batch_mode: str, levels: list[int]) -> None:
+        labels = [_batch_entries_label(value) for value in levels]
+        for combo in (getattr(self, "matrix_layer_combo", None), getattr(self, "heatmap_layer_combo", None)):
+            if self._widget_exists(combo):
+                combo.configure(values=labels)
+
+        widgets = (
+            getattr(self, "matrix_layer_caption", None),
+            getattr(self, "matrix_layer_combo", None),
+            getattr(self, "heatmap_layer_caption", None),
+            getattr(self, "heatmap_layer_combo", None),
+        )
+        if batch_mode == "fixed_entries":
+            if labels and self.batch_entries_layer_label.get() not in labels:
+                self.batch_entries_layer_label.set(labels[0])
+            for widget in widgets:
+                if self._widget_exists(widget):
+                    widget.grid()
+            return
+
+        if labels and self.batch_entries_layer_label.get() not in labels:
+            self.batch_entries_layer_label.set(labels[0])
+        for widget in widgets:
+            if self._widget_exists(widget):
+                widget.grid_remove()
+
+    def _show_batch_matrix_v2(self, batch_label: str | None) -> None:
+        self._current_matrix_batch_label = batch_label
+        for child in self.matrix_grid_frame.winfo_children():
+            child.destroy()
+
+        if not batch_label:
+            self._update_batch_layer_controls("none", [])
+            self.matrix_summary.set("当前所选回测不属于批量参数对比。")
+            self._show_batch_heatmap_v2(batch_label)
+            return
+
+        snapshot_ids = self._batch_snapshot_groups.get(batch_label, [])
+        snapshots = [self._backtest_snapshots[snapshot_id] for snapshot_id in snapshot_ids if snapshot_id in self._backtest_snapshots]
+        if not snapshots:
+            self._update_batch_layer_controls("none", [])
+            self.matrix_summary.set("当前批量回测暂无可用矩阵数据。")
+            self._show_batch_heatmap_v2(batch_label)
+            return
+
+        batch_mode = _batch_mode_for_snapshots(snapshots)
+        ordered_snapshots = sorted(snapshots, key=lambda item: _snapshot_sort_key(item, batch_mode))
+        levels = _batch_entry_levels(ordered_snapshots)
+        self._update_batch_layer_controls(batch_mode, levels)
+
+        signal_label = SIGNAL_VALUE_TO_LABEL.get(ordered_snapshots[0].config.signal_mode, ordered_snapshots[0].config.signal_mode)
+        symbol_text = ordered_snapshots[0].config.inst_id
+        bar_text = _normalize_backtest_bar_label(ordered_snapshots[0].config.bar)
+        param_text = _build_backtest_param_summary(
+            ordered_snapshots[0].config,
+            maker_fee_rate=ordered_snapshots[0].maker_fee_rate,
+            taker_fee_rate=ordered_snapshots[0].taker_fee_rate,
+        )
+        start_text, end_text = _backtest_snapshot_range_text(ordered_snapshots[0])
+
+        if batch_mode == "dynamic_entries":
+            self.matrix_summary.set(
+                f"动态止盈批次：{batch_label} ｜ 交易对：{symbol_text} ｜ 周期：{bar_text} ｜ 参数摘要：{param_text} ｜ "
+                f"信号方向：{signal_label} ｜ 开始时间：{start_text} ｜ 结束时间：{end_text} ｜ 共 {len(ordered_snapshots)} 组结果，"
+                "当前按每波最多开仓次数 0/1/2/3 做横向对比。单元格显示“总盈亏 | 胜率 | 交易数”，点击可加载对应回测。"
+            )
+            self.matrix_grid_frame.columnconfigure(0, weight=0)
+            ttk.Label(self.matrix_grid_frame, text="每波最多开仓次数", anchor="center").grid(
+                row=0, column=0, sticky="nsew", padx=4, pady=4
+            )
+            ttk.Label(self.matrix_grid_frame, text="结果", anchor="center").grid(
+                row=1, column=0, sticky="nsew", padx=4, pady=4
+            )
+            snapshot_map = {snapshot.config.max_entries_per_trend: snapshot for snapshot in ordered_snapshots}
+            for column, entry_limit in enumerate(levels, start=1):
+                self.matrix_grid_frame.columnconfigure(column, weight=1)
+                ttk.Label(
+                    self.matrix_grid_frame,
+                    text=_batch_entries_label(entry_limit),
+                    anchor="center",
+                ).grid(row=0, column=column, sticky="nsew", padx=4, pady=4)
+                snapshot = snapshot_map.get(entry_limit)
+                if snapshot is None:
+                    ttk.Label(
+                        self.matrix_grid_frame,
+                        text="--",
+                        anchor="center",
+                        relief="groove",
+                        padding=8,
+                    ).grid(row=1, column=column, sticky="nsew", padx=4, pady=4)
+                    continue
+                cell_text = (
+                    f"{format_decimal_fixed(snapshot.report.total_pnl, 4)} | "
+                    f"{format_decimal_fixed(snapshot.report.win_rate, 2)}% | "
+                    f"{snapshot.report.total_trades}笔"
+                )
+                ttk.Button(
+                    self.matrix_grid_frame,
+                    text=cell_text,
+                    command=lambda sid=snapshot.snapshot_id: self._load_snapshot(sid),
+                ).grid(row=1, column=column, sticky="nsew", padx=(4, 4), pady=4)
+            self.matrix_grid_frame.rowconfigure(1, weight=1)
+        else:
+            selected_limit = _batch_entries_value_from_label(self.batch_entries_layer_label.get())
+            filtered = (
+                [snapshot for snapshot in ordered_snapshots if snapshot.config.max_entries_per_trend == selected_limit]
+                if batch_mode == "fixed_entries"
+                else ordered_snapshots
+            )
+            if batch_mode == "fixed_entries":
+                self.matrix_summary.set(
+                    f"ATR 矩阵批次：{batch_label} ｜ 交易对：{symbol_text} ｜ 周期：{bar_text} ｜ 参数摘要：{param_text} ｜ "
+                    f"信号方向：{signal_label} ｜ 开始时间：{start_text} ｜ 结束时间：{end_text} ｜ 共 {len(ordered_snapshots)} 组结果，"
+                    f"当前展示“每波最多开仓次数 = {_batch_entries_label(selected_limit)}”这一层的 3x3 SL/TP 矩阵。"
+                )
+            else:
+                self.matrix_summary.set(
+                    f"ATR 矩阵批次：{batch_label} ｜ 交易对：{symbol_text} ｜ 周期：{bar_text} ｜ 参数摘要：{param_text} ｜ "
+                    f"信号方向：{signal_label} ｜ 开始时间：{start_text} ｜ 结束时间：{end_text} ｜ 共 {len(ordered_snapshots)} 组结果，"
+                    "行为 SL x1/1.5/2，列为 TP = SL x1/2/3。单元格显示“总盈亏 | 胜率 | 交易数”，点击可加载对应回测。"
+                )
+
+            ttk.Label(self.matrix_grid_frame, text="SL \\\\ TP", anchor="center").grid(
+                row=0, column=0, sticky="nsew", padx=4, pady=4
+            )
+            for column, take_ratio in enumerate(ATR_BATCH_TAKE_RATIOS, start=1):
+                ttk.Label(
+                    self.matrix_grid_frame,
+                    text=f"TP = SL x{format_decimal(take_ratio)}",
+                    anchor="center",
+                ).grid(row=0, column=column, sticky="nsew", padx=4, pady=4)
+                self.matrix_grid_frame.columnconfigure(column, weight=1)
+            self.matrix_grid_frame.columnconfigure(0, weight=0)
+
+            snapshot_map = {
+                (snapshot.config.atr_stop_multiplier, snapshot.config.atr_take_multiplier): snapshot
+                for snapshot in filtered
+            }
+            for row, stop_multiplier in enumerate(ATR_BATCH_MULTIPLIERS, start=1):
+                ttk.Label(
+                    self.matrix_grid_frame,
+                    text=f"SL x{format_decimal(stop_multiplier)}",
+                    anchor="center",
+                ).grid(row=row, column=0, sticky="nsew", padx=4, pady=4)
+                self.matrix_grid_frame.rowconfigure(row, weight=1)
+                for column, take_ratio in enumerate(ATR_BATCH_TAKE_RATIOS, start=1):
+                    take_multiplier = stop_multiplier * take_ratio
+                    snapshot = snapshot_map.get((stop_multiplier, take_multiplier))
+                    if snapshot is None:
+                        ttk.Label(
+                            self.matrix_grid_frame,
+                            text="--",
+                            anchor="center",
+                            relief="groove",
+                            padding=8,
+                        ).grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
+                        continue
+                    cell_text = (
+                        f"{format_decimal_fixed(snapshot.report.total_pnl, 4)} | "
+                        f"{format_decimal_fixed(snapshot.report.win_rate, 2)}% | "
+                        f"{snapshot.report.total_trades}笔"
+                    )
+                    ttk.Button(
+                        self.matrix_grid_frame,
+                        text=cell_text,
+                        command=lambda sid=snapshot.snapshot_id: self._load_snapshot(sid),
+                    ).grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
+
+        self._show_batch_heatmap_v2(batch_label)
+
+    def _show_batch_heatmap_v2(self, batch_label: str | None) -> None:
+        canvas = getattr(self, "heatmap_canvas", None)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 640)
+        height = max(canvas.winfo_height(), 340)
+        if not batch_label:
+            self.heatmap_summary.set("参数热力图会在这里显示，可切换指标并单击单元格联动回测视图。")
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="当前没有可显示的参数热力图。",
+                fill="#6e7781",
+                font=("Microsoft YaHei UI", 11),
+            )
+            return
+
+        snapshot_ids = self._batch_snapshot_groups.get(batch_label, [])
+        snapshots = [self._backtest_snapshots[snapshot_id] for snapshot_id in snapshot_ids if snapshot_id in self._backtest_snapshots]
+        if not snapshots:
+            self.heatmap_summary.set("当前批次暂无热力图数据。")
+            canvas.create_text(width / 2, height / 2, text="当前批次暂无热力图数据。", fill="#6e7781")
+            return
+
+        batch_mode = _batch_mode_for_snapshots(snapshots)
+        ordered_snapshots = sorted(snapshots, key=lambda item: _snapshot_sort_key(item, batch_mode))
+        levels = _batch_entry_levels(ordered_snapshots)
+        metric_label = self.heatmap_metric.get()
+        signal_label = SIGNAL_VALUE_TO_LABEL.get(ordered_snapshots[0].config.signal_mode, ordered_snapshots[0].config.signal_mode)
+        symbol_text = ordered_snapshots[0].config.inst_id
+        bar_text = _normalize_backtest_bar_label(ordered_snapshots[0].config.bar)
+        if batch_mode == "dynamic_entries":
+            render_snapshots = ordered_snapshots
+            self.heatmap_summary.set(
+                f"批次：{batch_label} | 交易对：{symbol_text} | 周期：{bar_text} | 信号方向：{signal_label} | "
+                f"指标：{metric_label} | 当前为动态止盈模式，横向比较每波最多开仓次数 0/1/2/3。"
+            )
+        elif batch_mode == "fixed_entries":
+            selected_limit = _batch_entries_value_from_label(self.batch_entries_layer_label.get())
+            render_snapshots = [snapshot for snapshot in ordered_snapshots if snapshot.config.max_entries_per_trend == selected_limit]
+            self.heatmap_summary.set(
+                f"批次：{batch_label} | 交易对：{symbol_text} | 周期：{bar_text} | 信号方向：{signal_label} | "
+                f"指标：{metric_label} | 当前热力图层：每波最多开仓次数 = {_batch_entries_label(selected_limit)}。"
+            )
+        else:
+            render_snapshots = ordered_snapshots
+            self.heatmap_summary.set(
+                f"批次：{batch_label} | 交易对：{symbol_text} | 周期：{bar_text} | 信号方向：{signal_label} | 指标：{metric_label}"
+            )
+
+        values = [_heatmap_metric_value(snapshot, metric_label) for snapshot in render_snapshots]
+        min_value = min(values) if values else Decimal("0")
+        max_value = max(values) if values else Decimal("0")
+        left = 72 if batch_mode == "dynamic_entries" else 92
+        top = 60
+        right = 24
+        bottom = 20
+        grid_width = width - left - right
+        grid_height = height - top - bottom
+        canvas.create_rectangle(left, top, left + grid_width, top + grid_height, outline="#d0d7de", width=1)
+
+        if batch_mode == "dynamic_entries":
+            cell_width = grid_width / max(len(levels), 1)
+            snapshot_map = {snapshot.config.max_entries_per_trend: snapshot for snapshot in render_snapshots}
+            canvas.create_text(
+                left - 10,
+                top + (grid_height / 2),
+                text="结果",
+                anchor="e",
+                fill="#57606a",
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
+            for column, entry_limit in enumerate(levels):
+                x1 = left + (column * cell_width)
+                x2 = x1 + cell_width
+                canvas.create_text(
+                    (x1 + x2) / 2,
+                    top - 22,
+                    text=_batch_entries_label(entry_limit),
+                    fill="#57606a",
+                    font=("Microsoft YaHei UI", 10, "bold"),
+                )
+                snapshot = snapshot_map.get(entry_limit)
+                fill = "#f3f4f6"
+                text = "--"
+                if snapshot is not None:
+                    value = _heatmap_metric_value(snapshot, metric_label)
+                    fill = _heatmap_fill_color(value, min_value, max_value)
+                    text = _heatmap_metric_text(snapshot, metric_label)
+                item_id = canvas.create_rectangle(x1, top, x2, top + grid_height, fill=fill, outline="#d0d7de")
+                text_id = canvas.create_text(
+                    (x1 + x2) / 2,
+                    top + (grid_height / 2),
+                    text=text,
+                    width=cell_width - 14,
+                    fill="#24292f",
+                    font=("Microsoft YaHei UI", 11),
+                )
+                if snapshot is not None:
+                    canvas.tag_bind(item_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+                    canvas.tag_bind(text_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+            return
+
+        cell_width = grid_width / max(len(ATR_BATCH_TAKE_RATIOS), 1)
+        cell_height = grid_height / max(len(ATR_BATCH_MULTIPLIERS), 1)
+        snapshot_map = {
+            (snapshot.config.atr_stop_multiplier, snapshot.config.atr_take_multiplier): snapshot
+            for snapshot in render_snapshots
+        }
         for column, take_ratio in enumerate(ATR_BATCH_TAKE_RATIOS):
             x1 = left + (column * cell_width)
             x2 = x1 + cell_width
