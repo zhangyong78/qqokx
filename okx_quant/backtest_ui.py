@@ -868,6 +868,9 @@ class BacktestWindow:
         self._latest_result: BacktestResult | None = None
         self._chart_zoom_window: Toplevel | None = None
         self._chart_zoom_canvas: Canvas | None = None
+        self._chart_zoom_intro_label: ttk.Label | None = None
+        self._chart_zoom_context_label: ttk.Label | None = None
+        self._chart_zoom_metrics_label: ttk.Label | None = None
         self._chart_redraw_job: str | None = None
         self._chart_canvas_redraw_jobs: dict[int, str] = {}
         self._main_chart_view = _ChartViewport()
@@ -1522,11 +1525,13 @@ class BacktestWindow:
         self.report_summary.set(summary_text)
         self.report_text.delete("1.0", END)
         self.trade_tree.delete(*self.trade_tree.get_children())
+        self._current_snapshot_id = None
         self._reset_chart_views()
         self._clear_chart_canvas(self.chart_canvas)
         self._set_chart_title("K线图、资金曲线与止盈止损触发位置 | 正在准备回测")
         if self._chart_zoom_canvas is not None and self._chart_zoom_canvas.winfo_exists():
             self._clear_chart_canvas(self._chart_zoom_canvas)
+        self._refresh_zoom_chart_header()
 
     def _set_chart_title(self, text: str) -> None:
         if getattr(self, "chart_frame", None) is not None:
@@ -1651,8 +1656,11 @@ class BacktestWindow:
     def _show_backtest_error(self, exc: Exception) -> None:
         if not self._ui_alive():
             return
+        self._current_snapshot_id = None
+        self._latest_result = None
         self.report_summary.set("回测失败")
         self._set_backtest_running(False)
+        self._refresh_zoom_chart_header()
         messagebox.showerror("回测失败", str(exc), parent=self.window)
 
     def _build_config(self) -> StrategyConfig:
@@ -2054,7 +2062,118 @@ class BacktestWindow:
 
         if not batch_label:
             self._update_batch_layer_controls("none", [])
-            self.matrix_summary.set("????????????????")
+            current_snapshot = self._backtest_snapshots.get(self._current_snapshot_id) if self._current_snapshot_id else None
+            if current_snapshot is None:
+                self.matrix_summary.set("当前没有可展示的参数矩阵。执行单组或批量回测后，这里会显示参数对比摘要。")
+                self._show_batch_heatmap_v2(batch_label)
+                return
+
+            signal_label = SIGNAL_VALUE_TO_LABEL.get(
+                current_snapshot.config.signal_mode,
+                current_snapshot.config.signal_mode,
+            )
+            symbol_text = current_snapshot.config.inst_id
+            bar_text = _normalize_backtest_bar_label(current_snapshot.config.bar)
+            strategy_name = STRATEGY_ID_TO_NAME.get(current_snapshot.config.strategy_id, current_snapshot.config.strategy_id)
+            entry_reference_ema = current_snapshot.config.resolved_entry_reference_ema_period()
+            take_profit_label = (
+                "动态止盈"
+                if current_snapshot.config.take_profit_mode == "dynamic"
+                else f"固定止盈 TP x{format_decimal(current_snapshot.config.atr_take_multiplier)}"
+            )
+            max_entries_label = (
+                "不限(0)"
+                if current_snapshot.config.max_entries_per_trend <= 0
+                else str(current_snapshot.config.max_entries_per_trend)
+            )
+            param_text = _build_backtest_param_summary(
+                current_snapshot.config,
+                maker_fee_rate=current_snapshot.maker_fee_rate,
+                taker_fee_rate=current_snapshot.taker_fee_rate,
+            )
+            start_text, end_text = _backtest_snapshot_range_text(current_snapshot)
+            self.matrix_summary.set(
+                f"当前参数单组回测：交易对：{symbol_text} ｜ 周期：{bar_text} ｜ 参数摘要：{param_text} ｜ "
+                f"信号方向：{signal_label} ｜ 开始时间：{start_text} ｜ 结束时间：{end_text}。"
+                "当前只保留 1 组结果，因此这里展示单组摘要卡；批量回测时会自动生成参数矩阵。"
+            )
+            self.matrix_grid_frame.columnconfigure(0, weight=1)
+            self.matrix_grid_frame.columnconfigure(1, weight=1)
+            self.matrix_grid_frame.rowconfigure(1, weight=1)
+            ttk.Label(self.matrix_grid_frame, text="当前参数", anchor="center").grid(
+                row=0, column=0, sticky="nsew", padx=4, pady=4
+            )
+            ttk.Label(self.matrix_grid_frame, text="当前回测结果", anchor="center").grid(
+                row=0, column=1, sticky="nsew", padx=4, pady=4
+            )
+            param_frame = ttk.Frame(self.matrix_grid_frame, padding=12, relief="groove")
+            param_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+            param_frame.columnconfigure(0, weight=1)
+            param_frame.columnconfigure(1, weight=1)
+            param_frame.columnconfigure(2, weight=1)
+            ttk.Label(
+                param_frame,
+                text=f"策略：{strategy_name} ｜ 方向：{signal_label}",
+                anchor="center",
+                justify="center",
+            ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+            ttk.Label(
+                param_frame,
+                text=f"挂单EMA\nEMA{entry_reference_ema}",
+                anchor="center",
+                justify="center",
+                relief="ridge",
+                padding=(8, 8),
+            ).grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+            ttk.Label(
+                param_frame,
+                text=f"止盈模式\n{take_profit_label}",
+                anchor="center",
+                justify="center",
+                relief="ridge",
+                padding=(8, 8),
+            ).grid(row=1, column=1, sticky="nsew", padx=4)
+            ttk.Label(
+                param_frame,
+                text=f"每波开仓\n{max_entries_label}",
+                anchor="center",
+                justify="center",
+                relief="ridge",
+                padding=(8, 8),
+            ).grid(row=1, column=2, sticky="nsew", padx=(4, 0))
+            ttk.Label(
+                param_frame,
+                text=f"时间范围：{start_text} ~ {end_text}\n{param_text}",
+                anchor="w",
+                justify="left",
+                wraplength=360,
+            ).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+
+            result_frame = ttk.Frame(self.matrix_grid_frame, padding=12, relief="groove")
+            result_frame.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
+            result_frame.columnconfigure(0, weight=1)
+            ttk.Label(
+                result_frame,
+                text=f"编号：{current_snapshot.snapshot_id}",
+                anchor="center",
+                justify="center",
+            ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+            ttk.Label(
+                result_frame,
+                text=(
+                    f"总盈亏\n{format_decimal_fixed(current_snapshot.report.total_pnl, 4)}\n\n"
+                    f"胜率\n{format_decimal_fixed(current_snapshot.report.win_rate, 2)}%\n\n"
+                    f"交易数\n{current_snapshot.report.total_trades}笔\n\n"
+                    f"最大回撤\n{format_decimal_fixed(current_snapshot.report.max_drawdown, 4)}"
+                ),
+                anchor="center",
+                justify="center",
+            ).grid(row=1, column=0, sticky="nsew")
+            ttk.Button(
+                result_frame,
+                text="重新加载当前回测",
+                command=lambda sid=current_snapshot.snapshot_id: self._load_snapshot(sid),
+            ).grid(row=2, column=0, sticky="ew", pady=(10, 0))
             self._show_batch_heatmap_v2(batch_label)
             return
 
@@ -2206,11 +2325,26 @@ class BacktestWindow:
         width = max(canvas.winfo_width(), 640)
         height = max(canvas.winfo_height(), 340)
         if not batch_label:
-            self.heatmap_summary.set("参数热力图会在这里显示，可切换指标并单击单元格联动回测视图。")
+            current_snapshot = self._backtest_snapshots.get(self._current_snapshot_id) if self._current_snapshot_id else None
+            if current_snapshot is None:
+                self.heatmap_summary.set("参数热力图会在这里显示，可切换指标并单击单元格联动回测视图。")
+                canvas.create_text(
+                    width / 2,
+                    height / 2,
+                    text="当前没有可显示的参数热力图。",
+                    fill="#6e7781",
+                    font=("Microsoft YaHei UI", 11),
+                )
+                return
+
+            self.heatmap_summary.set(
+                f"当前参数单组回测：{current_snapshot.config.inst_id} | {_normalize_backtest_bar_label(current_snapshot.config.bar)} | "
+                "热力图仅在批量参数对比时生成。"
+            )
             canvas.create_text(
                 width / 2,
                 height / 2,
-                text="当前没有可显示的参数热力图。",
+                text="当前为单组回测，暂无参数热力图。\n如需热力图，请执行批量参数回测。",
                 fill="#6e7781",
                 font=("Microsoft YaHei UI", 11),
             )
@@ -2389,6 +2523,7 @@ class BacktestWindow:
         self._snapshot_batch_labels.clear()
         self._current_matrix_batch_label = None
         self._current_snapshot_id = None
+        self._latest_result = None
         self.compare_tree.delete(*self.compare_tree.get_children())
         self.compare_detail_text.delete("1.0", END)
         self._update_compare_summary()
@@ -2396,6 +2531,10 @@ class BacktestWindow:
         self._populate_period_stats(self.monthly_stats_tree, [])
         self._populate_period_stats(self.yearly_stats_tree, [])
         self._set_chart_title("K线图、资金曲线与止盈止损触发位置 | 暂无选中回测")
+        self._clear_chart_canvas(self.chart_canvas)
+        if self._chart_zoom_canvas is not None and self._chart_zoom_canvas.winfo_exists():
+            self._clear_chart_canvas(self._chart_zoom_canvas)
+        self._refresh_zoom_chart_header()
 
     def _load_snapshot(self, snapshot_id: str) -> None:
         snapshot = self._backtest_snapshots[snapshot_id]
@@ -2404,6 +2543,7 @@ class BacktestWindow:
         self._latest_result = result
         self._reset_chart_views()
         self._set_chart_title(self._build_chart_title_for_snapshot(snapshot))
+        self._refresh_zoom_chart_header()
         signal_label = SIGNAL_VALUE_TO_LABEL.get(snapshot.config.signal_mode, snapshot.config.signal_mode)
         start_text, end_text = _backtest_snapshot_range_text(snapshot)
         summary_text = (
@@ -3056,11 +3196,55 @@ class BacktestWindow:
         if self._chart_zoom_canvas is not None and self._chart_zoom_canvas.winfo_exists():
             self._draw_chart(self._latest_result, self._chart_zoom_canvas)
 
+    def _build_zoom_chart_header_lines(self, snapshot: _BacktestSnapshot | None) -> tuple[str, str]:
+        if snapshot is None or snapshot.result is None:
+            return (
+                "暂无选中回测",
+                "运行或切换回测后，这里会显示策略、方向、挂单 EMA、止损、止盈方式、每波开仓次数和关键绩效。",
+            )
+
+        config = snapshot.config
+        result = snapshot.result
+        report = result.report
+        strategy_name = STRATEGY_ID_TO_NAME.get(config.strategy_id, config.strategy_id)
+        signal_label = SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)
+        entry_reference_ema = config.resolved_entry_reference_ema_period()
+        take_profit_label = "动态止盈" if config.take_profit_mode == "dynamic" else f"固定止盈(TP x{format_decimal(config.atr_take_multiplier)})"
+        max_entries_label = "不限(0)" if config.max_entries_per_trend <= 0 else str(config.max_entries_per_trend)
+        context_line = (
+            f"编号：{snapshot.snapshot_id} | 策略：{strategy_name} | 交易对：{config.inst_id} | "
+            f"K线：{_normalize_backtest_bar_label(config.bar)} | 方向：{signal_label}"
+        )
+        metrics_line = (
+            f"挂单EMA：EMA{entry_reference_ema} | 指标：EMA{result.ema_period} / 趋势EMA{result.trend_ema_period} / ATR{result.atr_period} | "
+            f"止损：{format_decimal(config.atr_stop_multiplier)} ATR | 止盈：{take_profit_label} | "
+            f"每波开仓：{max_entries_label} | 交易数：{report.total_trades} | "
+            f"胜率：{format_decimal_fixed(report.win_rate, 2)}% | 总盈亏：{format_decimal_fixed(report.total_pnl, 4)} | "
+            f"最大回撤：{format_decimal_fixed(report.max_drawdown, 4)}"
+        )
+        return context_line, metrics_line
+
+    def _refresh_zoom_chart_header(self) -> None:
+        snapshot = self._backtest_snapshots.get(self._current_snapshot_id) if self._current_snapshot_id else None
+        context_line, metrics_line = self._build_zoom_chart_header_lines(snapshot)
+        if self._chart_zoom_context_label is not None and self._widget_exists(self._chart_zoom_context_label):
+            self._chart_zoom_context_label.configure(text=context_line)
+        if self._chart_zoom_metrics_label is not None and self._widget_exists(self._chart_zoom_metrics_label):
+            self._chart_zoom_metrics_label.configure(text=metrics_line)
+        if self._chart_zoom_window is not None and self._chart_zoom_window.winfo_exists():
+            if snapshot is None:
+                self._chart_zoom_window.title("回测图表大窗")
+            else:
+                self._chart_zoom_window.title(
+                    f"回测图表大窗 | {snapshot.snapshot_id} | {snapshot.config.inst_id} | {_normalize_backtest_bar_label(snapshot.config.bar)}"
+                )
+
     def open_chart_zoom_window(self) -> None:
         if self._chart_zoom_window is not None and self._chart_zoom_window.winfo_exists():
             self._chart_zoom_window.deiconify()
             self._chart_zoom_window.lift()
             self._chart_zoom_window.focus_force()
+            self._refresh_zoom_chart_header()
             self._redraw_all_charts()
             return
 
@@ -3086,12 +3270,18 @@ class BacktestWindow:
         toolbar = ttk.Frame(zoom_window, padding=(12, 12, 12, 0))
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(0, weight=1)
-        ttk.Label(
+        self._chart_zoom_intro_label = ttk.Label(
             toolbar,
             text="放大图表：适合全面观察 K 线结构、EMA 轨迹、资金曲线和 TP/SL 触发位置，支持滚轮缩放和拖动平移。",
-        ).grid(row=0, column=0, sticky="w")
+            justify="left",
+        )
+        self._chart_zoom_intro_label.grid(row=0, column=0, sticky="w")
         ttk.Button(toolbar, text="重置视图", command=self.reset_zoom_chart_view).grid(row=0, column=1, sticky="e", padx=(0, 8))
         ttk.Button(toolbar, text="关闭", command=self._close_chart_zoom_window).grid(row=0, column=2, sticky="e")
+        self._chart_zoom_context_label = ttk.Label(toolbar, justify="left")
+        self._chart_zoom_context_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self._chart_zoom_metrics_label = ttk.Label(toolbar, justify="left")
+        self._chart_zoom_metrics_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         zoom_canvas = Canvas(zoom_window, background="#ffffff", highlightthickness=0)
         zoom_canvas.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
@@ -3100,6 +3290,7 @@ class BacktestWindow:
 
         self._chart_zoom_window = zoom_window
         self._chart_zoom_canvas = zoom_canvas
+        self._refresh_zoom_chart_header()
         if self._latest_result is not None:
             self._redraw_all_charts()
         else:
@@ -3111,6 +3302,9 @@ class BacktestWindow:
             self._chart_zoom_window.destroy()
         self._chart_zoom_window = None
         self._chart_zoom_canvas = None
+        self._chart_zoom_intro_label = None
+        self._chart_zoom_context_label = None
+        self._chart_zoom_metrics_label = None
         self._zoom_chart_view = _ChartViewport()
         if zoom_canvas is not None:
             self._chart_render_states.pop(id(zoom_canvas), None)
