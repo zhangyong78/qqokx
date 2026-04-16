@@ -86,6 +86,7 @@ class StrategyConfig:
     take_profit_mode: TakeProfitMode = "fixed"
     max_entries_per_trend: int = 0
     entry_reference_ema_period: int = 0
+    dynamic_two_r_break_even: bool = False
 
     def resolved_entry_reference_ema_period(self) -> int:
         if self.entry_reference_ema_period > 0:
@@ -97,6 +98,10 @@ class StrategyConfig:
         if self.entry_reference_ema_period > 0:
             return f"EMA{resolved_period}"
         return f"跟随EMA小周期(EMA{resolved_period})"
+
+    def dynamic_two_r_break_even_label(self) -> str:
+        return "\u5f00\u542f" if self.dynamic_two_r_break_even else "\u5173\u95ed"
+
 
 
 @dataclass(frozen=True)

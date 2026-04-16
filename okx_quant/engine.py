@@ -742,10 +742,15 @@ class StrategyEngine:
         self._logger(
             f"策略规则：每根新 K 线确认后，上一根动态委托自动失效，再按最新 {_dynamic_entry_reference_ema_text(config)} 重新挂下一根委托。"
         )
-        self._logger(
-            f"方向={_format_signal_mode(effective_signal_mode)} | 止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'} | "
-            f"每波最多开仓次数={config.max_entries_per_trend or 0} | 挂单参考={_dynamic_entry_reference_ema_text(config)}"
-        )
+        mode_parts = [
+            f"方向={_format_signal_mode(effective_signal_mode)}",
+            f"止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}",
+            f"每波最多开仓次数={config.max_entries_per_trend or 0}",
+            f"挂单参考={_dynamic_entry_reference_ema_text(config)}",
+        ]
+        if config.take_profit_mode == "dynamic":
+            mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
+        self._logger(" | ".join(mode_parts))
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
@@ -873,11 +878,16 @@ class StrategyEngine:
         current_wave_index = 0
 
         self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
-        self._logger(
-            f"运行模式：只监控信号，不下单 | 方向={_format_signal_mode(effective_signal_mode)} | "
-            f"止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'} | "
-            f"每波最多开仓次数={config.max_entries_per_trend or 0} | 挂单参考={_dynamic_entry_reference_ema_text(config)}"
-        )
+        mode_parts = [
+            "运行模式：只监控信号，不下单",
+            f"方向={_format_signal_mode(effective_signal_mode)}",
+            f"止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}",
+            f"每波最多开仓次数={config.max_entries_per_trend or 0}",
+            f"挂单参考={_dynamic_entry_reference_ema_text(config)}",
+        ]
+        if config.take_profit_mode == "dynamic":
+            mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
+        self._logger(" | ".join(mode_parts))
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
@@ -1370,11 +1380,15 @@ class StrategyEngine:
         current_take_profit = protection.take_profit
         next_trigger_r = 2
         risk_per_unit = abs(position.entry_price - protection.stop_loss)
-        self._logger(
-            f"开始本地止盈止损监控 | 触发标的={protection.trigger_inst_id} | "
-            f"触发价格类型={protection.trigger_price_type} | 止损={format_decimal(protection.stop_loss)} | "
-            f"止盈={format_decimal(protection.take_profit)}"
-        )
+        monitor_parts = [
+            f"开始本地止盈止损监控 | 触发标的={protection.trigger_inst_id}",
+            f"触发价格类型={protection.trigger_price_type}",
+            f"止损={format_decimal(protection.stop_loss)}",
+            f"止盈={format_decimal(protection.take_profit)}",
+        ]
+        if dynamic_take_profit_enabled:
+            monitor_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
+        self._logger(" | ".join(monitor_parts))
         while not self._stop_event.is_set():
             current_price = self._client.get_trigger_price(protection.trigger_inst_id, protection.trigger_price_type)
             if dynamic_take_profit_enabled:
@@ -1386,6 +1400,7 @@ class StrategyEngine:
                     current_stop_loss=current_stop_loss,
                     next_trigger_r=next_trigger_r,
                     tick_size=trade_instrument.tick_size,
+                    two_r_break_even=config.dynamic_two_r_break_even,
                 )
                 if moved:
                     current_stop_loss = updated_stop_loss
@@ -1784,8 +1799,13 @@ def evaluate_local_exit(
     return current_price >= stop_loss, current_price <= take_profit
 
 
-def _dynamic_round_trip_fee_offset_live(entry_price: Decimal) -> Decimal:
-    return abs(entry_price) * (LIVE_DYNAMIC_MAKER_FEE_RATE + LIVE_DYNAMIC_TAKER_FEE_RATE)
+def _dynamic_two_taker_fee_offset_live(
+    entry_price: Decimal,
+    taker_fee_rate: Decimal = LIVE_DYNAMIC_TAKER_FEE_RATE,
+) -> Decimal:
+    if taker_fee_rate <= 0:
+        return Decimal("0")
+    return abs(entry_price) * taker_fee_rate * Decimal("2")
 
 
 def _dynamic_trigger_price_live(
@@ -1795,8 +1815,9 @@ def _dynamic_trigger_price_live(
     risk_per_unit: Decimal,
     trigger_r: int,
     tick_size: Decimal,
+    taker_fee_rate: Decimal = LIVE_DYNAMIC_TAKER_FEE_RATE,
 ) -> Decimal:
-    distance = risk_per_unit * Decimal(trigger_r)
+    distance = (risk_per_unit * Decimal(trigger_r)) + _dynamic_two_taker_fee_offset_live(entry_price, taker_fee_rate)
     raw = entry_price + distance if direction == "long" else entry_price - distance
     rounding = "up" if direction == "long" else "down"
     return snap_to_increment(raw, tick_size, rounding)
@@ -1809,20 +1830,18 @@ def _dynamic_stop_price_live(
     risk_per_unit: Decimal,
     trigger_r: int,
     tick_size: Decimal,
+    two_r_break_even: bool = False,
+    taker_fee_rate: Decimal = LIVE_DYNAMIC_TAKER_FEE_RATE,
 ) -> Decimal:
-    if trigger_r <= 2:
-        raw = (
-            entry_price + _dynamic_round_trip_fee_offset_live(entry_price)
-            if direction == "long"
-            else entry_price - _dynamic_round_trip_fee_offset_live(entry_price)
-        )
-    else:
-        lock_multiple = Decimal(trigger_r - 1)
-        raw = (
-            entry_price + (risk_per_unit * lock_multiple)
-            if direction == "long"
-            else entry_price - (risk_per_unit * lock_multiple)
-        )
+    lock_multiple = Decimal(max(trigger_r - 1, 0))
+    if two_r_break_even and trigger_r == 2:
+        lock_multiple = Decimal("0")
+    fee_offset = _dynamic_two_taker_fee_offset_live(entry_price, taker_fee_rate)
+    raw = (
+        entry_price + (risk_per_unit * lock_multiple) + fee_offset
+        if direction == "long"
+        else entry_price - (risk_per_unit * lock_multiple) - fee_offset
+    )
     rounding = "up" if direction == "long" else "down"
     return snap_to_increment(raw, tick_size, rounding)
 
@@ -1836,9 +1855,19 @@ def _advance_dynamic_stop_live(
     current_stop_loss: Decimal,
     next_trigger_r: int,
     tick_size: Decimal,
+    two_r_break_even: bool = False,
+    taker_fee_rate: Decimal = LIVE_DYNAMIC_TAKER_FEE_RATE,
 ) -> tuple[Decimal, Decimal, int, bool]:
     if risk_per_unit <= 0:
-        return current_stop_loss, entry_price, next_trigger_r, False
+        next_take_profit = _dynamic_trigger_price_live(
+            direction=direction,
+            entry_price=entry_price,
+            risk_per_unit=Decimal("0"),
+            trigger_r=next_trigger_r,
+            tick_size=tick_size,
+            taker_fee_rate=taker_fee_rate,
+        )
+        return current_stop_loss, next_take_profit, next_trigger_r, False
 
     moved = False
     updated_stop = current_stop_loss
@@ -1850,6 +1879,7 @@ def _advance_dynamic_stop_live(
             risk_per_unit=risk_per_unit,
             trigger_r=trigger_r,
             tick_size=tick_size,
+            taker_fee_rate=taker_fee_rate,
         )
         reached = current_price >= trigger_price if direction == "long" else current_price <= trigger_price
         if not reached:
@@ -1861,6 +1891,8 @@ def _advance_dynamic_stop_live(
             risk_per_unit=risk_per_unit,
             trigger_r=trigger_r,
             tick_size=tick_size,
+            two_r_break_even=two_r_break_even,
+            taker_fee_rate=taker_fee_rate,
         )
         updated_stop = max(updated_stop, candidate) if direction == "long" else min(updated_stop, candidate)
         trigger_r += 1

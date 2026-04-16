@@ -137,6 +137,7 @@ class BacktestResult:
     slippage_rate: Decimal = Decimal("0")
     funding_rate: Decimal = Decimal("0")
     take_profit_mode: str = "fixed"
+    dynamic_two_r_break_even: bool = False
     max_entries_per_trend: int = 0
     sizing_mode: str = "fixed_risk"
     compounding: bool = False
@@ -182,6 +183,8 @@ class _OpenPosition:
     entry_sequence: int = 0
     dynamic_take_profit_enabled: bool = False
     next_dynamic_trigger_r: int = 2
+    dynamic_exit_fee_rate: Decimal = Decimal("0")
+    dynamic_two_r_break_even: bool = False
     entry_fee_rate: Decimal = Decimal("0")
     entry_fee_type: str = "none"
     entry_slippage_cost: Decimal = Decimal("0")
@@ -528,6 +531,7 @@ def _run_backtest_with_loaded_data(
         slippage_rate=config.backtest_slippage_rate,
         funding_rate=config.backtest_funding_rate,
         take_profit_mode=str(config.take_profit_mode),
+        dynamic_two_r_break_even=bool(config.dynamic_two_r_break_even),
         max_entries_per_trend=int(config.max_entries_per_trend),
         sizing_mode=config.backtest_sizing_mode,
         compounding=config.backtest_compounding,
@@ -599,7 +603,20 @@ def format_backtest_report(result: BacktestResult) -> str:
         )
         lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
         lines.append(f"每波最多开仓次数：{result.max_entries_per_trend if result.max_entries_per_trend > 0 else '不限'}")
-        lines.append("止盈说明：动态止盈为永久阶梯规则；固定止盈为 ATR 倍数止盈。")
+        if result.take_profit_mode == "dynamic":
+            lines.append(
+                f"2R保本开关：{'开启' if result.dynamic_two_r_break_even else '关闭'}"
+            )
+            if result.dynamic_two_r_break_even:
+                lines.append(
+                    "止盈说明：动态止盈按 2 倍 Taker 手续费留出缓冲，2R 先上移到开仓价+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
+                )
+            else:
+                lines.append(
+                    "止盈说明：动态止盈按 2 倍 Taker 手续费留出缓冲，2R 直接上移到 1R+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
+                )
+        else:
+            lines.append("止盈说明：固定止盈为 ATR 倍数止盈。")
         lines.append("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓")
     if result.strategy_id == STRATEGY_EMA5_EMA8_ID:
         lines.append(
@@ -978,6 +995,8 @@ def _run_dynamic_backtest(
                 funding_rate=config.backtest_funding_rate,
                 entry_sequence=entry_sequence + 1,
                 dynamic_take_profit_enabled=dynamic_take_profit_enabled,
+                dynamic_exit_fee_rate=taker_fee_rate,
+                dynamic_two_r_break_even=config.dynamic_two_r_break_even,
             )
             active_plan = None
             if filled_position is not None:
@@ -1242,6 +1261,8 @@ def _create_open_position(
     funding_rate: Decimal,
     entry_sequence: int = 0,
     dynamic_take_profit_enabled: bool = False,
+    dynamic_exit_fee_rate: Decimal = Decimal("0"),
+    dynamic_two_r_break_even: bool = False,
     next_dynamic_trigger_r: int = 2,
     current_take_profit: Decimal | None = None,
 ) -> _OpenPosition:
@@ -1253,17 +1274,8 @@ def _create_open_position(
         is_entry=True,
     )
     risk_per_unit = abs(entry_price - stop_loss)
-    if current_take_profit is None:
-        if dynamic_take_profit_enabled:
-            if signal == "long":
-                display_take_profit = entry_price + (risk_per_unit * Decimal(str(next_dynamic_trigger_r)))
-            else:
-                display_take_profit = entry_price - (risk_per_unit * Decimal(str(next_dynamic_trigger_r)))
-        else:
-            display_take_profit = take_profit
-    else:
-        display_take_profit = current_take_profit
-    return _OpenPosition(
+    display_take_profit = take_profit if current_take_profit is None else current_take_profit
+    open_position = _OpenPosition(
         signal=signal,
         entry_index=entry_index,
         entry_ts=entry_ts,
@@ -1280,12 +1292,17 @@ def _create_open_position(
         entry_sequence=entry_sequence,
         dynamic_take_profit_enabled=dynamic_take_profit_enabled,
         next_dynamic_trigger_r=next_dynamic_trigger_r,
+        dynamic_exit_fee_rate=dynamic_exit_fee_rate,
+        dynamic_two_r_break_even=dynamic_two_r_break_even,
         entry_fee_rate=entry_fee_rate,
         entry_fee_type=entry_fee_type,
         entry_slippage_cost=abs(entry_price - entry_price_raw) * abs(size),
         slippage_rate=slippage_rate,
         funding_rate=funding_rate if instrument.inst_type == "SWAP" else Decimal("0"),
     )
+    if current_take_profit is None and dynamic_take_profit_enabled:
+        open_position.take_profit = _dynamic_trigger_price(open_position, next_dynamic_trigger_r)
+    return open_position
 
 
 def _try_fill_dynamic_order(
@@ -1300,6 +1317,8 @@ def _try_fill_dynamic_order(
     funding_rate: Decimal = Decimal("0"),
     entry_sequence: int = 0,
     dynamic_take_profit_enabled: bool = False,
+    dynamic_exit_fee_rate: Decimal = Decimal("0"),
+    dynamic_two_r_break_even: bool = False,
 ) -> _OpenPosition | None:
     filled = candle.low <= plan.entry_reference <= candle.high
     if not filled:
@@ -1321,6 +1340,8 @@ def _try_fill_dynamic_order(
         funding_rate=funding_rate,
         entry_sequence=entry_sequence,
         dynamic_take_profit_enabled=dynamic_take_profit_enabled,
+        dynamic_exit_fee_rate=dynamic_exit_fee_rate,
+        dynamic_two_r_break_even=dynamic_two_r_break_even,
     )
 
 
@@ -1374,39 +1395,49 @@ def _candle_path_points(candle: Candle) -> tuple[Decimal, ...]:
     return candle.open, candle.high, candle.low, candle.close
 
 
+def _dynamic_fee_offset(entry_price: Decimal, exit_fee_rate: Decimal) -> Decimal:
+    if exit_fee_rate <= 0:
+        return Decimal("0")
+    return abs(entry_price) * exit_fee_rate * Decimal("2")
+
+
 def _dynamic_trigger_price(position: _OpenPosition, trigger_r: int) -> Decimal:
-    offset = position.risk_per_unit * Decimal(str(trigger_r))
-    if position.signal == "long":
-        return position.entry_price + offset
-    return position.entry_price - offset
+    fee_offset = _dynamic_fee_offset(position.entry_price, position.dynamic_exit_fee_rate)
+    offset = (position.risk_per_unit * Decimal(str(trigger_r))) + fee_offset
+    raw = position.entry_price + offset if position.signal == "long" else position.entry_price - offset
+    rounding = "up" if position.signal == "long" else "down"
+    return snap_to_increment(raw, position.tick_size, rounding)
 
 
-def _dynamic_stop_price(position: _OpenPosition, trigger_r: int, exit_fee_rate: Decimal) -> Decimal:
-    if trigger_r <= 2:
-        fee_offset = abs(position.entry_price) * (position.entry_fee_rate + exit_fee_rate)
-        if position.signal == "long":
-            return position.entry_price + fee_offset
-        return position.entry_price - fee_offset
-    locked_offset = position.risk_per_unit * Decimal(str(trigger_r - 1))
-    if position.signal == "long":
-        return position.entry_price + locked_offset
-    return position.entry_price - locked_offset
+def _dynamic_stop_price(position: _OpenPosition, trigger_r: int) -> Decimal:
+    lock_multiple = max(trigger_r - 1, 0)
+    if position.dynamic_two_r_break_even and trigger_r == 2:
+        lock_multiple = 0
+    locked_offset = position.risk_per_unit * Decimal(str(lock_multiple))
+    fee_offset = _dynamic_fee_offset(position.entry_price, position.dynamic_exit_fee_rate)
+    raw = (
+        position.entry_price + locked_offset + fee_offset
+        if position.signal == "long"
+        else position.entry_price - locked_offset - fee_offset
+    )
+    rounding = "up" if position.signal == "long" else "down"
+    return snap_to_increment(raw, position.tick_size, rounding)
 
 
-def _advance_dynamic_stop(position: _OpenPosition, favorable_price: Decimal, exit_fee_rate: Decimal) -> None:
+def _advance_dynamic_stop(position: _OpenPosition, favorable_price: Decimal) -> None:
     while position.next_dynamic_trigger_r >= 2:
         trigger_price = _dynamic_trigger_price(position, position.next_dynamic_trigger_r)
         if position.signal == "long":
             if favorable_price < trigger_price:
                 break
-            candidate_stop = _dynamic_stop_price(position, position.next_dynamic_trigger_r, exit_fee_rate)
+            candidate_stop = _dynamic_stop_price(position, position.next_dynamic_trigger_r)
             if candidate_stop > position.stop_loss:
                 position.stop_loss = candidate_stop
             position.next_dynamic_trigger_r += 1
         else:
             if favorable_price > trigger_price:
                 break
-            candidate_stop = _dynamic_stop_price(position, position.next_dynamic_trigger_r, exit_fee_rate)
+            candidate_stop = _dynamic_stop_price(position, position.next_dynamic_trigger_r)
             if candidate_stop < position.stop_loss:
                 position.stop_loss = candidate_stop
             position.next_dynamic_trigger_r += 1
@@ -1417,21 +1448,19 @@ def _process_dynamic_position_segment(
     position: _OpenPosition,
     start: Decimal,
     end: Decimal,
-    *,
-    exit_fee_rate: Decimal,
 ) -> tuple[Decimal, str] | None:
     if position.signal == "long":
         if end < start:
             if _segment_contains_price(start, end, position.stop_loss):
                 return position.stop_loss, "stop_loss"
             return None
-        _advance_dynamic_stop(position, end, exit_fee_rate)
+        _advance_dynamic_stop(position, end)
         return None
     if end > start:
         if _segment_contains_price(start, end, position.stop_loss):
             return position.stop_loss, "stop_loss"
         return None
-    _advance_dynamic_stop(position, end, exit_fee_rate)
+    _advance_dynamic_stop(position, end)
     return None
 
 
@@ -1513,7 +1542,6 @@ def _try_close_position_same_candle_after_fill(
                     position,
                     entry_price,
                     segment_end,
-                    exit_fee_rate=exit_fee_rate,
                 )
             else:
                 touched_exit = _first_touched_exit_on_segment(
@@ -1548,7 +1576,6 @@ def _try_close_position_same_candle_after_fill(
                     position,
                     segment_start,
                     segment_end,
-                    exit_fee_rate=exit_fee_rate,
                 )
             else:
                 touched_exit = _first_touched_exit_on_segment(
@@ -1602,7 +1629,6 @@ def _try_close_position(
                 position,
                 segment_start,
                 segment_end,
-                exit_fee_rate=exit_fee_rate,
             )
             if touched_exit is not None:
                 exit_price_raw, exit_reason = touched_exit

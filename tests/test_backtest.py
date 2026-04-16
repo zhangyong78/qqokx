@@ -15,6 +15,7 @@ from okx_quant.backtest import (
     _build_equity_curve,
     _build_period_stats,
     _determine_backtest_order_size,
+    _dynamic_stop_price,
     _load_backtest_candles,
     _backtest_trade_start_index,
     _format_backtest_timestamp,
@@ -115,6 +116,48 @@ class BacktestTest(TestCase):
     def test_backtest_default_fee_percents(self) -> None:
         self.assertEqual(DEFAULT_MAKER_FEE_PERCENT, "0.015")
         self.assertEqual(DEFAULT_TAKER_FEE_PERCENT, "0.036")
+
+    def test_dynamic_backtest_stop_locks_1r_at_2r(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("120"),
+            initial_stop_loss=Decimal("90"),
+            initial_take_profit=Decimal("120"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+        )
+
+        stop_price = _dynamic_stop_price(position, 2)
+
+        self.assertEqual(stop_price, Decimal("110"))
+
+    def test_dynamic_backtest_stop_can_move_to_break_even_plus_two_taker_fees_at_2r(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("120"),
+            initial_stop_loss=Decimal("90"),
+            initial_take_profit=Decimal("120"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            dynamic_exit_fee_rate=Decimal("0.00036"),
+            dynamic_two_r_break_even=True,
+        )
+
+        stop_price = _dynamic_stop_price(position, 2)
+
+        self.assertEqual(stop_price, Decimal("100.1"))
 
     def test_backtest_risk_size_below_min_order_size_is_clamped_to_min_size(self) -> None:
         instrument = Instrument(
@@ -771,7 +814,8 @@ class BacktestTest(TestCase):
 
         self.assertIn("趋势过滤：EMA21 与 EMA55 组成趋势过滤", report_text)
         self.assertIn("挂单参考EMA：EMA21", report_text)
-        self.assertIn("止盈模式：固定止盈或永久阶梯动态止盈", report_text)
+        self.assertIn("止盈方式：固定止盈", report_text)
+        self.assertIn("止盈说明：固定止盈为 ATR 倍数止盈。", report_text)
         self.assertIn("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓", report_text)
 
     def test_ema5_ema8_backtest_uses_dynamic_ema_stop(self) -> None:

@@ -385,6 +385,7 @@ class QuantApp:
         self.signal_mode_label = StringVar(value=STRATEGY_DEFINITIONS[0].default_signal_label)
         self.take_profit_mode_label = StringVar(value="固定止盈")
         self.max_entries_per_trend = StringVar(value="0")
+        self.dynamic_two_r_break_even = BooleanVar(value=False)
         self.run_mode_label = StringVar(value="交易并下单")
         self.trade_mode_label = StringVar(value="全仓 cross")
         self.position_mode_label = StringVar(value="净持仓 net")
@@ -615,10 +616,19 @@ class QuantApp:
             state="readonly",
         )
         self._take_profit_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
+        self._take_profit_mode_combo.bind("<<ComboboxSelected>>", lambda *_: self._sync_dynamic_take_profit_controls())
         self._max_entries_per_trend_label = ttk.Label(start_frame, text="每波最多开仓次数")
         self._max_entries_per_trend_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
         self._max_entries_per_trend_entry = ttk.Entry(start_frame, textvariable=self.max_entries_per_trend)
         self._max_entries_per_trend_entry.grid(row=row, column=3, sticky="ew", pady=(12, 0))
+
+        row += 1
+        self._dynamic_two_r_break_even_check = ttk.Checkbutton(
+            start_frame,
+            text="启用2R保本（2R时移动到开仓价+2倍Taker手续费）",
+            variable=self.dynamic_two_r_break_even,
+        )
+        self._dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=(12, 0))
 
         row += 1
         ttk.Label(start_frame, text="运行模式").grid(row=row, column=0, sticky="w", pady=(12, 0))
@@ -3593,6 +3603,7 @@ class QuantApp:
                 risk_amount=self.risk_amount.get(),
                 take_profit_mode_label=self.take_profit_mode_label.get(),
                 max_entries_per_trend=self.max_entries_per_trend.get(),
+                dynamic_two_r_break_even=self.dynamic_two_r_break_even.get(),
                 signal_mode_label=self.signal_mode_label.get(),
                 trade_mode_label=self.trade_mode_label.get(),
                 position_mode_label=self.position_mode_label.get(),
@@ -4613,6 +4624,7 @@ class QuantApp:
             self._take_profit_mode_combo.grid()
             self._max_entries_per_trend_label.grid()
             self._max_entries_per_trend_entry.grid()
+            self._dynamic_two_r_break_even_check.grid()
             self._entry_reference_ema_label.grid()
             self._entry_reference_ema_entry.grid()
         else:
@@ -4620,6 +4632,7 @@ class QuantApp:
             self._take_profit_mode_combo.grid_remove()
             self._max_entries_per_trend_label.grid_remove()
             self._max_entries_per_trend_entry.grid_remove()
+            self._dynamic_two_r_break_even_check.grid_remove()
             self._entry_reference_ema_label.grid_remove()
             self._entry_reference_ema_entry.grid_remove()
         if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
@@ -4641,9 +4654,20 @@ class QuantApp:
             self._big_ema_entry.grid_remove()
         if is_dynamic_strategy_id(definition.strategy_id) and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("0")
+        self._sync_dynamic_take_profit_controls()
         self.strategy_summary_text.set(definition.summary)
         self.strategy_rule_text.set(definition.rule_description)
         self.strategy_hint_text.set(definition.parameter_hint)
+
+    def _sync_dynamic_take_profit_controls(self) -> None:
+        if not hasattr(self, "_dynamic_two_r_break_even_check"):
+            return
+        definition = self._selected_strategy_definition()
+        dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
+        dynamic_take_profit = (
+            dynamic_strategy and TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "fixed") == "dynamic"
+        )
+        self._dynamic_two_r_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
 
     def _selected_strategy_definition(self) -> StrategyDefinition:
         strategy_id = self._strategy_name_to_id[self.strategy_name.get()]
@@ -4674,6 +4698,8 @@ class QuantApp:
                     f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}",
                 ]
             )
+            if config.take_profit_mode == "dynamic":
+                lines.append(f"2R保本开关：{config.dynamic_two_r_break_even_label()}")
         if self._strategy_uses_big_ema(definition.strategy_id):
             lines.append(f"EMA大周期：{config.big_ema_period}")
         lines.extend(
@@ -4768,6 +4794,9 @@ class QuantApp:
             run_mode=run_mode,
             take_profit_mode=TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()],
             max_entries_per_trend=max_entries_per_trend,
+            dynamic_two_r_break_even=self.dynamic_two_r_break_even.get()
+            if is_dynamic_strategy_id(definition.strategy_id)
+            else False,
         )
         return credentials, config
 
@@ -4911,6 +4940,8 @@ class QuantApp:
         ]
         if is_dynamic_strategy_id(session.strategy_id):
             lines.append(f"挂单参考EMA：{session.config.entry_reference_ema_label()}")
+            if session.config.take_profit_mode == "dynamic":
+                lines.append(f"2R保本开关：{session.config.dynamic_two_r_break_even_label()}")
         if self._strategy_uses_big_ema(session.strategy_id):
             lines.append(f"EMA大周期：{session.config.big_ema_period}")
         lines.extend(

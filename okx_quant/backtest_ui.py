@@ -106,6 +106,7 @@ class BacktestLaunchState:
     risk_amount: str
     take_profit_mode_label: str
     max_entries_per_trend: str
+    dynamic_two_r_break_even: bool
     signal_mode_label: str
     trade_mode_label: str
     position_mode_label: str
@@ -376,11 +377,16 @@ def _build_backtest_param_summary(
             sizing_text = f"{sizing_label}{risk_text}"
         take_profit_label = "动态止盈" if config.take_profit_mode == "dynamic" else "固定止盈"
         max_entries_text = "不限" if config.max_entries_per_trend <= 0 else f"每波前{config.max_entries_per_trend}次"
+        extra_parts = [take_profit_label]
+        if config.take_profit_mode == "dynamic":
+            extra_parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
+        extra_parts.append(max_entries_text)
+        extra_text = " / ".join(extra_parts)
         return (
             f"EMA{config.ema_period}/{config.trend_ema_period} / ATR{config.atr_period} / "
             f"挂单EMA{config.resolved_entry_reference_ema_period()} / "
             f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
-            f"{take_profit_label} / {max_entries_text} / "
+            f"{extra_text} / "
             f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
             f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
             f"{'复利' if config.backtest_compounding else '不复利'} / "
@@ -520,6 +526,7 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "run_mode": config.run_mode,
         "take_profit_mode": config.take_profit_mode,
         "max_entries_per_trend": config.max_entries_per_trend,
+        "dynamic_two_r_break_even": config.dynamic_two_r_break_even,
         "backtest_initial_capital": str(config.backtest_initial_capital),
         "backtest_sizing_mode": config.backtest_sizing_mode,
         "backtest_risk_percent": None
@@ -562,6 +569,7 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         run_mode=str(payload.get("run_mode", "trade")),
         take_profit_mode=str(payload.get("take_profit_mode", "fixed")),
         max_entries_per_trend=int(payload.get("max_entries_per_trend", 0)),
+        dynamic_two_r_break_even=bool(payload.get("dynamic_two_r_break_even", False)),
         backtest_initial_capital=Decimal(str(payload.get("backtest_initial_capital", "10000"))),
         backtest_sizing_mode=str(payload.get("backtest_sizing_mode", "fixed_risk")),
         backtest_risk_percent=None
@@ -851,6 +859,7 @@ class BacktestWindow:
         self.end_time_text = StringVar(value=initial_state.end_time_text)
         self.take_profit_mode_label = StringVar(value=initial_state.take_profit_mode_label)
         self.max_entries_per_trend = StringVar(value=initial_state.max_entries_per_trend)
+        self.dynamic_two_r_break_even = BooleanVar(value=initial_state.dynamic_two_r_break_even)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
         self.position_mode_label = StringVar(value=initial_state.position_mode_label)
@@ -996,10 +1005,19 @@ class BacktestWindow:
             state="readonly",
         )
         self.take_profit_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.take_profit_mode_combo.bind("<<ComboboxSelected>>", lambda *_: self._sync_dynamic_take_profit_controls())
         self.max_entries_caption = ttk.Label(controls, text="每波最多开仓次数")
         self.max_entries_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
         self.max_entries_entry = ttk.Entry(controls, textvariable=self.max_entries_per_trend)
         self.max_entries_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+
+        row += 1
+        self.dynamic_two_r_break_even_check = ttk.Checkbutton(
+            controls,
+            text="启用2R保本（2R时移动到开仓价+2倍Taker手续费）",
+            variable=self.dynamic_two_r_break_even,
+        )
+        self.dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=(12, 0))
 
         row += 1
         self.size_or_risk_label = ttk.Label(controls, text="固定风险金/数量")
@@ -1686,10 +1704,12 @@ class BacktestWindow:
         take_profit_mode = "fixed"
         max_entries_per_trend = 0
         entry_reference_ema_period = 0
+        dynamic_two_r_break_even = False
         if dynamic_strategy:
             take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
             max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
             entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
+            dynamic_two_r_break_even = bool(self.dynamic_two_r_break_even.get())
         return StrategyConfig(
             inst_id=self.symbol.get().strip().upper(),
             bar="4H" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else _backtest_bar_value_from_label(self.bar_label.get()),
@@ -1716,6 +1736,7 @@ class BacktestWindow:
             risk_amount=risk_amount,
             take_profit_mode=take_profit_mode,
             max_entries_per_trend=max_entries_per_trend,
+            dynamic_two_r_break_even=dynamic_two_r_break_even,
             backtest_initial_capital=self._parse_positive_decimal(self.initial_capital.get(), "初始资金"),
             backtest_sizing_mode=sizing_mode,
             backtest_risk_percent=risk_percent,
@@ -1766,6 +1787,7 @@ class BacktestWindow:
                 self.take_profit_mode_combo,
                 self.max_entries_caption,
                 self.max_entries_entry,
+                self.dynamic_two_r_break_even_check,
             )
             for widget in dynamic_widgets:
                 if dynamic_strategy:
@@ -1774,6 +1796,17 @@ class BacktestWindow:
                     widget.grid_remove()
         if dynamic_strategy and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("0")
+        self._sync_dynamic_take_profit_controls()
+
+    def _sync_dynamic_take_profit_controls(self) -> None:
+        if not hasattr(self, "dynamic_two_r_break_even_check"):
+            return
+        definition = self._selected_strategy_definition()
+        dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
+        dynamic_take_profit = (
+            dynamic_strategy and TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "fixed") == "dynamic"
+        )
+        self.dynamic_two_r_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
 
     def _append_backtest_snapshot(
         self,
@@ -3215,13 +3248,24 @@ class BacktestWindow:
             f"编号：{snapshot.snapshot_id} | 策略：{strategy_name} | 交易对：{config.inst_id} | "
             f"K线：{_normalize_backtest_bar_label(config.bar)} | 方向：{signal_label}"
         )
-        metrics_line = (
-            f"挂单EMA：EMA{entry_reference_ema} | 指标：EMA{result.ema_period} / 趋势EMA{result.trend_ema_period} / ATR{result.atr_period} | "
-            f"止损：{format_decimal(config.atr_stop_multiplier)} ATR | 止盈：{take_profit_label} | "
-            f"每波开仓：{max_entries_label} | 交易数：{report.total_trades} | "
-            f"胜率：{format_decimal_fixed(report.win_rate, 2)}% | 总盈亏：{format_decimal_fixed(report.total_pnl, 4)} | "
-            f"最大回撤：{format_decimal_fixed(report.max_drawdown, 4)}"
+        metrics_parts = [
+            f"挂单EMA：EMA{entry_reference_ema}",
+            f"指标：EMA{result.ema_period} / 趋势EMA{result.trend_ema_period} / ATR{result.atr_period}",
+            f"止损：{format_decimal(config.atr_stop_multiplier)} ATR",
+            f"止盈：{take_profit_label}",
+        ]
+        if config.take_profit_mode == "dynamic":
+            metrics_parts.append(f"2R保本：{config.dynamic_two_r_break_even_label()}")
+        metrics_parts.extend(
+            [
+                f"每波开仓：{max_entries_label}",
+                f"交易数：{report.total_trades}",
+                f"胜率：{format_decimal_fixed(report.win_rate, 2)}%",
+                f"总盈亏：{format_decimal_fixed(report.total_pnl, 4)}",
+                f"最大回撤：{format_decimal_fixed(report.max_drawdown, 4)}",
+            ]
         )
+        metrics_line = " | ".join(metrics_parts)
         return context_line, metrics_line
 
     def _refresh_zoom_chart_header(self) -> None:

@@ -175,10 +175,10 @@ class StrategyEngineTest(TestCase):
 
         self.assertFalse(can_use_exchange_managed_orders(config, instrument, instrument))
 
-    def test_dynamic_live_stop_moves_to_break_even_plus_fees_at_2r(self) -> None:
+    def test_dynamic_live_stop_locks_1r_at_2r(self) -> None:
         stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
             direction="long",
-            current_price=Decimal("120"),
+            current_price=Decimal("120.1"),
             entry_price=Decimal("100"),
             risk_per_unit=Decimal("10"),
             current_stop_loss=Decimal("90"),
@@ -187,25 +187,59 @@ class StrategyEngineTest(TestCase):
         )
 
         self.assertTrue(moved)
-        self.assertEqual(stop_loss, Decimal("100.1"))
-        self.assertEqual(next_take_profit, Decimal("130"))
+        self.assertEqual(stop_loss, Decimal("110.1"))
+        self.assertEqual(next_take_profit, Decimal("130.1"))
         self.assertEqual(next_trigger_r, 3)
 
     def test_dynamic_live_stop_locks_2r_at_3r(self) -> None:
         stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
             direction="long",
-            current_price=Decimal("130"),
+            current_price=Decimal("130.1"),
             entry_price=Decimal("100"),
             risk_per_unit=Decimal("10"),
-            current_stop_loss=Decimal("100.1"),
+            current_stop_loss=Decimal("110.1"),
             next_trigger_r=3,
             tick_size=Decimal("0.1"),
         )
 
         self.assertTrue(moved)
-        self.assertEqual(stop_loss, Decimal("120"))
-        self.assertEqual(next_take_profit, Decimal("140"))
+        self.assertEqual(stop_loss, Decimal("120.1"))
+        self.assertEqual(next_take_profit, Decimal("140.1"))
         self.assertEqual(next_trigger_r, 4)
+
+    def test_dynamic_live_stop_can_move_to_break_even_plus_two_taker_fees_at_2r(self) -> None:
+        stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
+            direction="long",
+            current_price=Decimal("120.1"),
+            entry_price=Decimal("100"),
+            risk_per_unit=Decimal("10"),
+            current_stop_loss=Decimal("90"),
+            next_trigger_r=2,
+            tick_size=Decimal("0.1"),
+            two_r_break_even=True,
+        )
+
+        self.assertTrue(moved)
+        self.assertEqual(stop_loss, Decimal("100.1"))
+        self.assertEqual(next_take_profit, Decimal("130.1"))
+        self.assertEqual(next_trigger_r, 3)
+
+    def test_dynamic_live_break_even_mode_is_mirrored_for_short(self) -> None:
+        stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
+            direction="short",
+            current_price=Decimal("79.9"),
+            entry_price=Decimal("100"),
+            risk_per_unit=Decimal("10"),
+            current_stop_loss=Decimal("110"),
+            next_trigger_r=2,
+            tick_size=Decimal("0.1"),
+            two_r_break_even=True,
+        )
+
+        self.assertTrue(moved)
+        self.assertEqual(stop_loss, Decimal("99.9"))
+        self.assertEqual(next_take_profit, Decimal("69.9"))
+        self.assertEqual(next_trigger_r, 3)
 
     def test_cross_strategy_stop_loss_uses_signal_candle_low_minus_one_atr(self) -> None:
         instrument = Instrument(
