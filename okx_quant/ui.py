@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import json
 import queue
 import re
 import threading
@@ -7,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import tkinter.font as tkfont
-from tkinter import BooleanVar, END, Menu, StringVar, Text, Tk, Toplevel, simpledialog
+from tkinter import BooleanVar, END, Menu, StringVar, Text, TclError, Tk, Toplevel, simpledialog
 from tkinter import messagebox, ttk
 
 from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
@@ -28,10 +29,12 @@ from okx_quant.okx_client import (
     OkxAccountOverview,
     OkxApiError,
     OkxFillHistoryItem,
+    OkxOrderResult,
     OkxPosition,
     OkxPositionHistoryItem,
     OkxRestClient,
     OkxTicker,
+    OkxTradeOrderItem,
     infer_inst_type,
     infer_option_family,
 )
@@ -108,6 +111,60 @@ POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
         "theta",
         "theta_usdt",
     ),
+    "pending_orders": (
+        "time",
+        "source",
+        "inst_type",
+        "inst_id",
+        "state",
+        "side",
+        "ord_type",
+        "price",
+        "size",
+        "filled",
+        "tp_sl",
+        "order_id",
+        "cl_ord_id",
+    ),
+    "order_history": (
+        "time",
+        "source",
+        "inst_type",
+        "inst_id",
+        "state",
+        "side",
+        "ord_type",
+        "price",
+        "size",
+        "filled",
+        "tp_sl",
+        "order_id",
+        "cl_ord_id",
+    ),
+    "fills": (
+        "time",
+        "inst_type",
+        "inst_id",
+        "side",
+        "price",
+        "size",
+        "fee",
+        "pnl",
+        "exec_type",
+    ),
+    "position_history": (
+        "time",
+        "inst_type",
+        "inst_id",
+        "mgn_mode",
+        "side",
+        "open_avg",
+        "close_avg",
+        "close_size",
+        "pnl",
+        "realized",
+        "realized_usdt",
+    ),
 }
 SIGNAL_LABEL_TO_VALUE = {
     "双向": "both",
@@ -167,6 +224,23 @@ HISTORY_FILL_SIDE_FILTER_OPTIONS = {
     "买入 buy": "buy",
     "卖出 sell": "sell",
 }
+ORDER_SOURCE_FILTER_OPTIONS = {
+    "全部来源": "",
+    "普通委托": "normal",
+    "算法委托": "algo",
+}
+ORDER_STATE_FILTER_OPTIONS = {
+    "全部状态": "",
+    "生效 live": "live",
+    "部分成交 partially_filled": "partially_filled",
+    "已成交 filled": "filled",
+    "已撤销 canceled": "canceled",
+    "算法生效 effective": "effective",
+    "失败 order_failed": "order_failed",
+}
+ENGINE_CL_ORD_ID_PATTERN = re.compile(r"^[a-z0-9]{4,8}(ent|exi)[0-9]{15}$")
+PROTECTION_CL_ORD_ID_PATTERN = re.compile(r"^ppp\d{2,}\d{4}$")
+SMART_ORDER_CL_ORD_ID_PATTERN = re.compile(r"^so[a-z0-9]{4}\d{6}$")
 POSITION_REFRESH_INTERVAL_OPTIONS = {
     "10秒": 10_000,
     "15秒": 15_000,
@@ -254,6 +328,8 @@ class QuantApp:
         self._positions_history_refreshing = False
         self._default_symbol_values = [label for label, _ in DEFAULT_MONITOR_SYMBOLS]
         self._latest_positions: list[OkxPosition] = []
+        self._latest_pending_orders: list[OkxTradeOrderItem] = []
+        self._latest_order_history: list[OkxTradeOrderItem] = []
         self._latest_fill_history: list[OkxFillHistoryItem] = []
         self._latest_position_history: list[OkxPositionHistoryItem] = []
         self._positions_context_note: str | None = None
@@ -273,6 +349,10 @@ class QuantApp:
         self._positions_zoom_tree: ttk.Treeview | None = None
         self._positions_zoom_detail: Text | None = None
         self._positions_zoom_notebook: ttk.Notebook | None = None
+        self._positions_zoom_pending_orders_tree: ttk.Treeview | None = None
+        self._positions_zoom_pending_orders_detail: Text | None = None
+        self._positions_zoom_order_history_tree: ttk.Treeview | None = None
+        self._positions_zoom_order_history_detail: Text | None = None
         self._positions_zoom_fills_tree: ttk.Treeview | None = None
         self._positions_zoom_fills_detail: Text | None = None
         self._positions_zoom_position_history_tree: ttk.Treeview | None = None
@@ -286,6 +366,8 @@ class QuantApp:
         self._latest_account_config: OkxAccountConfig | None = None
         self._positions_zoom_column_window: Toplevel | None = None
         self._positions_zoom_detail_frame: ttk.LabelFrame | None = None
+        self._positions_zoom_pending_orders_detail_frame: ttk.LabelFrame | None = None
+        self._positions_zoom_order_history_detail_frame: ttk.LabelFrame | None = None
         self._positions_zoom_fills_detail_frame: ttk.LabelFrame | None = None
         self._positions_zoom_position_history_detail_frame: ttk.LabelFrame | None = None
         self._position_selection_syncing = False
@@ -293,6 +375,11 @@ class QuantApp:
         self._positions_zoom_selected_item_id: str | None = None
         self._fills_history_refreshing = False
         self._position_history_refreshing = False
+        self._pending_orders_refreshing = False
+        self._pending_order_canceling = False
+        self._order_history_refreshing = False
+        self._pending_orders_last_refresh_at: datetime | None = None
+        self._order_history_last_refresh_at: datetime | None = None
         self._fills_history_last_refresh_at: datetime | None = None
         self._position_history_last_refresh_at: datetime | None = None
         self._positions_zoom_column_groups: dict[str, dict[str, object]] = {}
@@ -303,12 +390,20 @@ class QuantApp:
         self._main_position_detail_toggle_text = StringVar(value="展开持仓详情")
         self._positions_zoom_detail_collapsed = False
         self._positions_zoom_history_collapsed = False
+        self._positions_zoom_pending_orders_detail_collapsed = False
+        self._positions_zoom_order_history_detail_collapsed = False
         self._positions_zoom_fills_detail_collapsed = False
         self._positions_zoom_position_history_detail_collapsed = False
         self._positions_zoom_detail_toggle_text = StringVar(value="折叠持仓详情")
         self._positions_zoom_history_toggle_text = StringVar(value="折叠历史区域")
+        self._positions_zoom_pending_orders_detail_toggle_text = StringVar(value="折叠委托详情")
+        self._positions_zoom_order_history_detail_toggle_text = StringVar(value="折叠委托详情")
         self._positions_zoom_fills_detail_toggle_text = StringVar(value="折叠成交详情")
         self._positions_zoom_position_history_detail_toggle_text = StringVar(value="折叠仓位详情")
+        self._positions_zoom_pending_orders_summary_text = StringVar(value="当前委托尚未读取。")
+        self._positions_zoom_order_history_summary_text = StringVar(value="历史委托尚未读取。")
+        self._positions_zoom_pending_orders_base_summary = "当前委托尚未读取。"
+        self._positions_zoom_order_history_base_summary = "历史委托尚未读取。"
         self._positions_zoom_fills_summary_text = StringVar(value="历史成交尚未读取。")
         self._positions_zoom_fills_load_more_text = StringVar(value="增加100条")
         self._positions_zoom_position_history_summary_text = StringVar(value="历史仓位尚未读取。")
@@ -407,6 +502,18 @@ class QuantApp:
         self.notify_errors = BooleanVar(value=True)
         self.position_type_filter = StringVar(value="全部类型")
         self.position_keyword = StringVar()
+        self.pending_order_type_filter = StringVar(value="全部类型")
+        self.pending_order_source_filter = StringVar(value="全部来源")
+        self.pending_order_state_filter = StringVar(value="全部状态")
+        self.pending_order_asset_filter = StringVar()
+        self.pending_order_expiry_prefix_filter = StringVar()
+        self.pending_order_keyword = StringVar()
+        self.order_history_type_filter = StringVar(value="全部类型")
+        self.order_history_source_filter = StringVar(value="全部来源")
+        self.order_history_state_filter = StringVar(value="全部状态")
+        self.order_history_asset_filter = StringVar()
+        self.order_history_expiry_prefix_filter = StringVar()
+        self.order_history_keyword = StringVar()
         self.fill_history_type_filter = StringVar(value="全部类型")
         self.fill_history_side_filter = StringVar(value="全部方向")
         self.fill_history_asset_filter = StringVar()
@@ -1121,12 +1228,15 @@ class QuantApp:
         )
 
     def _set_readonly_text(self, widget: Text | None, content: str) -> None:
-        if widget is None:
+        if widget is None or not _widget_exists(widget):
             return
-        widget.configure(state="normal")
-        widget.delete("1.0", END)
-        widget.insert("1.0", content)
-        widget.configure(state="disabled")
+        try:
+            widget.configure(state="normal")
+            widget.delete("1.0", END)
+            widget.insert("1.0", content)
+            widget.configure(state="disabled")
+        except TclError:
+            return
 
     def _build_metric_card(self, parent: ttk.Frame, column: int, title: str, value_var: StringVar) -> None:
         card = ttk.LabelFrame(parent, text=title, padding=(10, 8))
@@ -1487,6 +1597,7 @@ class QuantApp:
         if self._positions_zoom_window is not None and self._positions_zoom_window.winfo_exists():
             self._positions_zoom_window.focus_force()
             self._schedule_positions_zoom_sync()
+            self.refresh_order_views()
             self.refresh_position_histories()
             return
 
@@ -1629,6 +1740,20 @@ class QuantApp:
         history_notebook.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
         self._positions_zoom_notebook = history_notebook
 
+        pending_orders_tab = ttk.Frame(history_notebook, padding=10)
+        pending_orders_tab.columnconfigure(0, weight=1)
+        pending_orders_tab.rowconfigure(2, weight=1)
+        pending_orders_tab.rowconfigure(3, weight=1)
+        history_notebook.add(pending_orders_tab, text="当前委托")
+        self._build_positions_zoom_pending_orders_tab(pending_orders_tab)
+
+        order_history_tab = ttk.Frame(history_notebook, padding=10)
+        order_history_tab.columnconfigure(0, weight=1)
+        order_history_tab.rowconfigure(2, weight=1)
+        order_history_tab.rowconfigure(3, weight=1)
+        history_notebook.add(order_history_tab, text="历史委托")
+        self._build_positions_zoom_order_history_tab(order_history_tab)
+
         fills_tab = ttk.Frame(history_notebook, padding=10)
         fills_tab.columnconfigure(0, weight=1)
         fills_tab.rowconfigure(1, weight=1)
@@ -1644,15 +1769,278 @@ class QuantApp:
         self._build_positions_zoom_position_history_tab(position_history_tab)
         if not self._positions_zoom_detail_collapsed:
             self.toggle_positions_zoom_detail()
+        if not self._positions_zoom_pending_orders_detail_collapsed:
+            self.toggle_positions_zoom_pending_orders_detail()
+        if not self._positions_zoom_order_history_detail_collapsed:
+            self.toggle_positions_zoom_order_history_detail()
         if not self._positions_zoom_fills_detail_collapsed:
             self.toggle_positions_zoom_fills_detail()
         if not self._positions_zoom_position_history_detail_collapsed:
             self.toggle_positions_zoom_position_history_detail()
+        self.refresh_order_views()
         self.refresh_position_histories()
         self._expand_to_screen(window)
         self._update_positions_zoom_search_shortcuts()
         self._update_position_history_search_shortcuts()
         self._schedule_positions_zoom_sync(30)
+
+    def _build_positions_zoom_pending_orders_tab(self, parent: ttk.Frame) -> None:
+        header = ttk.Frame(parent)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, textvariable=self._positions_zoom_pending_orders_summary_text).grid(row=0, column=0, sticky="w")
+        ttk.Button(header, text="刷新", command=self.refresh_pending_orders).grid(row=0, column=1, sticky="e", padx=(0, 6))
+        ttk.Button(header, text="撤单选中", command=self.cancel_selected_pending_order).grid(
+            row=0, column=2, sticky="e", padx=(0, 6)
+        )
+        ttk.Button(header, text="批量撤当前筛选", command=self.cancel_filtered_pending_orders).grid(
+            row=0, column=3, sticky="e", padx=(0, 6)
+        )
+        ttk.Button(
+            header,
+            textvariable=self._positions_zoom_pending_orders_detail_toggle_text,
+            command=self.toggle_positions_zoom_pending_orders_detail,
+        ).grid(row=0, column=4, sticky="e")
+
+        filter_row = ttk.Frame(parent)
+        filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        filter_row.columnconfigure(11, weight=1)
+        ttk.Label(filter_row, text="类型").grid(row=0, column=0, sticky="w")
+        type_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.pending_order_type_filter,
+            values=list(POSITION_TYPE_OPTIONS.keys()),
+            state="readonly",
+            width=16,
+        )
+        type_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        type_combo.bind("<<ComboboxSelected>>", self._on_pending_order_filter_changed)
+        ttk.Label(filter_row, text="来源").grid(row=0, column=2, sticky="w")
+        source_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.pending_order_source_filter,
+            values=list(ORDER_SOURCE_FILTER_OPTIONS.keys()),
+            state="readonly",
+            width=16,
+        )
+        source_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
+        source_combo.bind("<<ComboboxSelected>>", self._on_pending_order_filter_changed)
+        ttk.Label(filter_row, text="状态").grid(row=0, column=4, sticky="w")
+        state_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.pending_order_state_filter,
+            values=list(ORDER_STATE_FILTER_OPTIONS.keys()),
+            state="readonly",
+            width=20,
+        )
+        state_combo.grid(row=0, column=5, sticky="w", padx=(6, 12))
+        state_combo.bind("<<ComboboxSelected>>", self._on_pending_order_filter_changed)
+        ttk.Label(filter_row, text="标的").grid(row=0, column=6, sticky="w")
+        asset_entry = ttk.Entry(filter_row, textvariable=self.pending_order_asset_filter, width=10)
+        asset_entry.grid(row=0, column=7, sticky="w", padx=(6, 12))
+        asset_entry.bind("<KeyRelease>", self._on_pending_order_filter_changed)
+        ttk.Label(filter_row, text="到期前缀").grid(row=0, column=8, sticky="w")
+        expiry_entry = ttk.Entry(filter_row, textvariable=self.pending_order_expiry_prefix_filter, width=14)
+        expiry_entry.grid(row=0, column=9, sticky="w", padx=(6, 12))
+        expiry_entry.bind("<KeyRelease>", self._on_pending_order_filter_changed)
+        ttk.Label(filter_row, text="搜索").grid(row=0, column=10, sticky="w")
+        keyword_entry = ttk.Entry(filter_row, textvariable=self.pending_order_keyword)
+        keyword_entry.grid(row=0, column=11, sticky="ew", padx=(6, 12))
+        keyword_entry.bind("<KeyRelease>", self._on_pending_order_filter_changed)
+        ttk.Button(filter_row, text="应用筛选", command=self._render_pending_orders_view).grid(row=0, column=12, padx=(0, 6))
+        ttk.Button(filter_row, text="清空筛选", command=self.reset_pending_order_filters).grid(row=0, column=13)
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.grid(row=2, column=0, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+        columns = ("time", "source", "inst_type", "inst_id", "state", "side", "ord_type", "price", "size", "filled", "tp_sl", "order_id", "cl_ord_id")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
+        self._positions_zoom_pending_orders_tree = tree
+        headings = {
+            "time": "时间",
+            "source": "来源",
+            "inst_type": "类型",
+            "inst_id": "合约",
+            "state": "状态",
+            "side": "方向",
+            "ord_type": "委托类型",
+            "price": "委托价",
+            "size": "委托量",
+            "filled": "已成交",
+            "tp_sl": "TP/SL",
+            "order_id": "订单ID",
+            "cl_ord_id": "clOrdId",
+        }
+        for column_id, width in (
+            ("time", 150),
+            ("source", 82),
+            ("inst_type", 72),
+            ("inst_id", 240),
+            ("state", 120),
+            ("side", 96),
+            ("ord_type", 110),
+            ("price", 100),
+            ("size", 100),
+            ("filled", 100),
+            ("tp_sl", 180),
+            ("order_id", 120),
+            ("cl_ord_id", 150),
+        ):
+            tree.heading(column_id, text=headings[column_id])
+            tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "filled"} else "center")
+        tree.column("inst_id", anchor="w")
+        tree.column("tp_sl", anchor="w")
+        tree.column("cl_ord_id", anchor="w")
+        tree.grid(row=0, column=0, sticky="nsew")
+        tree.bind("<<TreeviewSelect>>", self._on_pending_orders_selected)
+        tree.tag_configure("profit", foreground="#13803d")
+        tree.tag_configure("loss", foreground="#c23b3b")
+        scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        scroll_x.grid(row=1, column=0, sticky="ew")
+        tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        self._register_positions_zoom_columns("pending_orders", "当前委托", tree, columns)
+
+        detail_frame = ttk.LabelFrame(parent, text="委托详情", padding=12)
+        detail_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        self._positions_zoom_pending_orders_detail_frame = detail_frame
+        detail_frame.columnconfigure(0, weight=1)
+        detail_frame.rowconfigure(0, weight=1)
+        self._positions_zoom_pending_orders_detail = Text(detail_frame, height=8, wrap="word", font=("Microsoft YaHei UI", 10), relief="flat")
+        self._positions_zoom_pending_orders_detail.grid(row=0, column=0, sticky="nsew")
+        detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self._positions_zoom_pending_orders_detail.yview)
+        detail_scroll.grid(row=0, column=1, sticky="ns")
+        self._positions_zoom_pending_orders_detail.configure(yscrollcommand=detail_scroll.set)
+        self._set_readonly_text(self._positions_zoom_pending_orders_detail, "这里会显示选中当前委托的详情。")
+
+    def _build_positions_zoom_order_history_tab(self, parent: ttk.Frame) -> None:
+        header = ttk.Frame(parent)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, textvariable=self._positions_zoom_order_history_summary_text).grid(row=0, column=0, sticky="w")
+        ttk.Button(header, text="刷新", command=self.refresh_order_history).grid(row=0, column=1, sticky="e", padx=(0, 6))
+        ttk.Button(
+            header,
+            textvariable=self._positions_zoom_order_history_detail_toggle_text,
+            command=self.toggle_positions_zoom_order_history_detail,
+        ).grid(row=0, column=2, sticky="e")
+
+        filter_row = ttk.Frame(parent)
+        filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        filter_row.columnconfigure(11, weight=1)
+        ttk.Label(filter_row, text="类型").grid(row=0, column=0, sticky="w")
+        type_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.order_history_type_filter,
+            values=list(POSITION_TYPE_OPTIONS.keys()),
+            state="readonly",
+            width=16,
+        )
+        type_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        type_combo.bind("<<ComboboxSelected>>", self._on_order_history_filter_changed)
+        ttk.Label(filter_row, text="来源").grid(row=0, column=2, sticky="w")
+        source_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.order_history_source_filter,
+            values=list(ORDER_SOURCE_FILTER_OPTIONS.keys()),
+            state="readonly",
+            width=16,
+        )
+        source_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
+        source_combo.bind("<<ComboboxSelected>>", self._on_order_history_filter_changed)
+        ttk.Label(filter_row, text="状态").grid(row=0, column=4, sticky="w")
+        state_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.order_history_state_filter,
+            values=list(ORDER_STATE_FILTER_OPTIONS.keys()),
+            state="readonly",
+            width=20,
+        )
+        state_combo.grid(row=0, column=5, sticky="w", padx=(6, 12))
+        state_combo.bind("<<ComboboxSelected>>", self._on_order_history_filter_changed)
+        ttk.Label(filter_row, text="标的").grid(row=0, column=6, sticky="w")
+        asset_entry = ttk.Entry(filter_row, textvariable=self.order_history_asset_filter, width=10)
+        asset_entry.grid(row=0, column=7, sticky="w", padx=(6, 12))
+        asset_entry.bind("<KeyRelease>", self._on_order_history_filter_changed)
+        ttk.Label(filter_row, text="到期前缀").grid(row=0, column=8, sticky="w")
+        expiry_entry = ttk.Entry(filter_row, textvariable=self.order_history_expiry_prefix_filter, width=14)
+        expiry_entry.grid(row=0, column=9, sticky="w", padx=(6, 12))
+        expiry_entry.bind("<KeyRelease>", self._on_order_history_filter_changed)
+        ttk.Label(filter_row, text="搜索").grid(row=0, column=10, sticky="w")
+        keyword_entry = ttk.Entry(filter_row, textvariable=self.order_history_keyword)
+        keyword_entry.grid(row=0, column=11, sticky="ew", padx=(6, 12))
+        keyword_entry.bind("<KeyRelease>", self._on_order_history_filter_changed)
+        ttk.Button(filter_row, text="应用筛选", command=self._render_order_history_view).grid(row=0, column=12, padx=(0, 6))
+        ttk.Button(filter_row, text="清空筛选", command=self.reset_order_history_filters).grid(row=0, column=13)
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.grid(row=2, column=0, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+        columns = ("time", "source", "inst_type", "inst_id", "state", "side", "ord_type", "price", "size", "filled", "tp_sl", "order_id", "cl_ord_id")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
+        self._positions_zoom_order_history_tree = tree
+        headings = {
+            "time": "时间",
+            "source": "来源",
+            "inst_type": "类型",
+            "inst_id": "合约",
+            "state": "状态",
+            "side": "方向",
+            "ord_type": "委托类型",
+            "price": "委托价",
+            "size": "委托量",
+            "filled": "已成交",
+            "tp_sl": "TP/SL",
+            "order_id": "订单ID",
+            "cl_ord_id": "clOrdId",
+        }
+        for column_id, width in (
+            ("time", 150),
+            ("source", 82),
+            ("inst_type", 72),
+            ("inst_id", 240),
+            ("state", 120),
+            ("side", 96),
+            ("ord_type", 110),
+            ("price", 100),
+            ("size", 100),
+            ("filled", 100),
+            ("tp_sl", 180),
+            ("order_id", 120),
+            ("cl_ord_id", 150),
+        ):
+            tree.heading(column_id, text=headings[column_id])
+            tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "filled"} else "center")
+        tree.column("inst_id", anchor="w")
+        tree.column("tp_sl", anchor="w")
+        tree.column("cl_ord_id", anchor="w")
+        tree.grid(row=0, column=0, sticky="nsew")
+        tree.bind("<<TreeviewSelect>>", self._on_order_history_selected)
+        tree.tag_configure("profit", foreground="#13803d")
+        tree.tag_configure("loss", foreground="#c23b3b")
+        scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        scroll_x.grid(row=1, column=0, sticky="ew")
+        tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        self._register_positions_zoom_columns("order_history", "历史委托", tree, columns)
+
+        detail_frame = ttk.LabelFrame(parent, text="委托详情", padding=12)
+        detail_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        self._positions_zoom_order_history_detail_frame = detail_frame
+        detail_frame.columnconfigure(0, weight=1)
+        detail_frame.rowconfigure(0, weight=1)
+        self._positions_zoom_order_history_detail = Text(detail_frame, height=8, wrap="word", font=("Microsoft YaHei UI", 10), relief="flat")
+        self._positions_zoom_order_history_detail.grid(row=0, column=0, sticky="nsew")
+        detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self._positions_zoom_order_history_detail.yview)
+        detail_scroll.grid(row=0, column=1, sticky="ns")
+        self._positions_zoom_order_history_detail.configure(yscrollcommand=detail_scroll.set)
+        self._set_readonly_text(self._positions_zoom_order_history_detail, "这里会显示选中历史委托的详情。")
 
     def _build_positions_zoom_fills_tab(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent)
@@ -1949,6 +2337,10 @@ class QuantApp:
         self._positions_zoom_tree = None
         self._positions_zoom_detail = None
         self._positions_zoom_notebook = None
+        self._positions_zoom_pending_orders_tree = None
+        self._positions_zoom_pending_orders_detail = None
+        self._positions_zoom_order_history_tree = None
+        self._positions_zoom_order_history_detail = None
         self._positions_zoom_fills_tree = None
         self._positions_zoom_fills_detail = None
         self._positions_zoom_position_history_tree = None
@@ -1957,6 +2349,8 @@ class QuantApp:
         self._positions_zoom_column_vars = {}
         self._position_history_usdt_prices = {}
         self._positions_zoom_detail_frame = None
+        self._positions_zoom_pending_orders_detail_frame = None
+        self._positions_zoom_order_history_detail_frame = None
         self._positions_zoom_fills_detail_frame = None
         self._positions_zoom_position_history_detail_frame = None
         self._positions_zoom_selected_item_id = None
@@ -1966,15 +2360,22 @@ class QuantApp:
         self._positions_zoom_fills_apply_expiry_prefix_button = None
         self._positions_zoom_position_history_apply_contract_button = None
         self._positions_zoom_position_history_apply_expiry_prefix_button = None
+        self._pending_order_canceling = False
         self._positions_zoom_detail_collapsed = False
         self._positions_zoom_history_collapsed = False
+        self._positions_zoom_pending_orders_detail_collapsed = False
+        self._positions_zoom_order_history_detail_collapsed = False
         self._positions_zoom_fills_detail_collapsed = False
         self._positions_zoom_position_history_detail_collapsed = False
         self._positions_zoom_detail_toggle_text.set("\u5c55\u5f00\u6301\u4ed3\u8be6\u60c5")
+        self._positions_zoom_pending_orders_detail_toggle_text.set("\u5c55\u5f00\u59d4\u6258\u8be6\u60c5")
+        self._positions_zoom_order_history_detail_toggle_text.set("\u5c55\u5f00\u59d4\u6258\u8be6\u60c5")
         self._positions_zoom_fills_detail_toggle_text.set("\u5c55\u5f00\u6210\u4ea4\u8be6\u60c5")
         self._positions_zoom_position_history_detail_toggle_text.set("\u5c55\u5f00\u4ed3\u4f4d\u8be6\u60c5")
         self._positions_zoom_detail_toggle_text.set("折叠持仓详情")
         self._positions_zoom_history_toggle_text.set("折叠历史区域")
+        self._positions_zoom_pending_orders_detail_toggle_text.set("折叠委托详情")
+        self._positions_zoom_order_history_detail_toggle_text.set("折叠委托详情")
         self._positions_zoom_fills_detail_toggle_text.set("折叠成交详情")
         self._positions_zoom_position_history_detail_toggle_text.set("折叠仓位详情")
         self._positions_zoom_fills_load_more_text.set("增加100条")
@@ -2041,7 +2442,7 @@ class QuantApp:
         notebook.grid(row=1, column=0, sticky="nsew")
 
         self._positions_zoom_column_vars = {}
-        group_order = ("positions", "fills", "position_history")
+        group_order = ("positions", "pending_orders", "order_history", "fills", "position_history")
         for group_key in group_order:
             group = self._positions_zoom_column_groups.get(group_key)
             if not group:
@@ -2160,6 +2561,28 @@ class QuantApp:
             self._positions_zoom_notebook.grid_remove()
             self._positions_zoom_history_toggle_text.set("展开历史区域")
         self._positions_zoom_history_collapsed = not self._positions_zoom_history_collapsed
+
+    def toggle_positions_zoom_pending_orders_detail(self) -> None:
+        if self._positions_zoom_pending_orders_detail_frame is None:
+            return
+        if self._positions_zoom_pending_orders_detail_collapsed:
+            self._positions_zoom_pending_orders_detail_frame.grid()
+            self._positions_zoom_pending_orders_detail_toggle_text.set("折叠委托详情")
+        else:
+            self._positions_zoom_pending_orders_detail_frame.grid_remove()
+            self._positions_zoom_pending_orders_detail_toggle_text.set("展开委托详情")
+        self._positions_zoom_pending_orders_detail_collapsed = not self._positions_zoom_pending_orders_detail_collapsed
+
+    def toggle_positions_zoom_order_history_detail(self) -> None:
+        if self._positions_zoom_order_history_detail_frame is None:
+            return
+        if self._positions_zoom_order_history_detail_collapsed:
+            self._positions_zoom_order_history_detail_frame.grid()
+            self._positions_zoom_order_history_detail_toggle_text.set("折叠委托详情")
+        else:
+            self._positions_zoom_order_history_detail_frame.grid_remove()
+            self._positions_zoom_order_history_detail_toggle_text.set("展开委托详情")
+        self._positions_zoom_order_history_detail_collapsed = not self._positions_zoom_order_history_detail_collapsed
 
     def toggle_positions_zoom_fills_detail(self) -> None:
         if self._positions_zoom_fills_detail_frame is None:
@@ -2460,6 +2883,737 @@ class QuantApp:
             )
             return
         self._set_readonly_text(self._positions_zoom_detail, self.position_detail_text.get())
+
+    def refresh_order_views(self) -> None:
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            self._positions_zoom_pending_orders_base_summary = "未配置 API 凭证，无法读取当前委托。"
+            self._positions_zoom_pending_orders_summary_text.set(self._positions_zoom_pending_orders_base_summary)
+            self._positions_zoom_order_history_base_summary = "未配置 API 凭证，无法读取历史委托。"
+            self._positions_zoom_order_history_summary_text.set(self._positions_zoom_order_history_base_summary)
+            self._latest_pending_orders = []
+            self._latest_order_history = []
+            self._render_pending_orders_view()
+            self._render_order_history_view()
+            return
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        self._start_pending_orders_refresh(credentials, environment)
+        self._start_order_history_refresh(credentials, environment)
+
+    def refresh_pending_orders(self) -> None:
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            self._positions_zoom_pending_orders_base_summary = "未配置 API 凭证，无法读取当前委托。"
+            self._positions_zoom_pending_orders_summary_text.set(self._positions_zoom_pending_orders_base_summary)
+            self._latest_pending_orders = []
+            self._render_pending_orders_view()
+            return
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        self._start_pending_orders_refresh(credentials, environment)
+
+    def refresh_order_history(self) -> None:
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            self._positions_zoom_order_history_base_summary = "未配置 API 凭证，无法读取历史委托。"
+            self._positions_zoom_order_history_summary_text.set(self._positions_zoom_order_history_base_summary)
+            self._latest_order_history = []
+            self._render_order_history_view()
+            return
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        self._start_order_history_refresh(credentials, environment)
+
+    def cancel_selected_pending_order(self) -> None:
+        parent = self._positions_zoom_window if _widget_exists(self._positions_zoom_window) else self.root
+        if self._pending_order_canceling:
+            messagebox.showinfo("撤单中", "当前已有一笔撤单请求在处理中，请稍等。", parent=parent)
+            return
+        item = self._selected_pending_order_item()
+        if item is None:
+            messagebox.showinfo("撤单", "请先在当前委托里选中一条要撤销的委托。", parent=parent)
+            return
+        owner_label = _trade_order_program_owner_label(item)
+        if owner_label is None:
+            messagebox.showinfo(
+                "撤单限制",
+                "当前只允许撤销本程序发出的委托。\n这条委托没有识别到本程序 clOrdId 规则，已拦截。",
+                parent=parent,
+            )
+            return
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            messagebox.showinfo("撤单", "当前未配置 API 凭证，无法发起撤单。", parent=parent)
+            return
+        cancel_id = _trade_order_cancel_reference(item)
+        if not cancel_id:
+            messagebox.showinfo("撤单", "这条委托缺少可用订单 ID，暂时无法撤单。", parent=parent)
+            return
+        confirm_message = (
+            f"确认撤销这条{item.source_label or '委托'}吗？\n\n"
+            f"程序来源：{owner_label}\n"
+            f"合约：{item.inst_id or '-'}\n"
+            f"方向：{_format_history_side(item.side, item.pos_side)}\n"
+            f"状态：{_format_trade_order_state(item.state)}\n"
+            f"标识：{cancel_id}"
+        )
+        if not messagebox.askyesno("撤单确认", confirm_message, parent=parent):
+            return
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        self._pending_order_canceling = True
+        self._positions_zoom_pending_orders_summary_text.set(
+            f"正在撤单：{item.source_label or '委托'} | {item.inst_id or '-'} | {cancel_id}"
+        )
+        threading.Thread(
+            target=self._cancel_selected_pending_order_worker,
+            args=(credentials, environment, item, owner_label),
+            daemon=True,
+        ).start()
+
+    def cancel_filtered_pending_orders(self) -> None:
+        parent = self._positions_zoom_window if _widget_exists(self._positions_zoom_window) else self.root
+        if self._pending_order_canceling:
+            messagebox.showinfo("撤单中", "当前已有撤单请求在处理中，请稍等。", parent=parent)
+            return
+        filtered_items = [item for _, item in self._filtered_pending_order_items()]
+        if not filtered_items:
+            messagebox.showinfo("批量撤单", "当前筛选结果为空，没有可撤的委托。", parent=parent)
+            return
+        cancelable_items = [
+            item for item in filtered_items if _trade_order_program_owner_label(item) is not None and _trade_order_cancel_reference(item)
+        ]
+        skipped_manual = sum(1 for item in filtered_items if _trade_order_program_owner_label(item) is None)
+        skipped_missing_id = sum(
+            1 for item in filtered_items if _trade_order_program_owner_label(item) is not None and not _trade_order_cancel_reference(item)
+        )
+        if not cancelable_items:
+            messagebox.showinfo(
+                "批量撤单",
+                "当前筛选结果里没有可识别为本程序发出的可撤委托。\n不会撤销手工单或来源不明的委托。",
+                parent=parent,
+            )
+            return
+        filter_warning = ""
+        if not _trade_order_filter_enabled(
+            POSITION_TYPE_OPTIONS.get(self.pending_order_type_filter.get(), ""),
+            ORDER_SOURCE_FILTER_OPTIONS.get(self.pending_order_source_filter.get(), ""),
+            ORDER_STATE_FILTER_OPTIONS.get(self.pending_order_state_filter.get(), ""),
+            self.pending_order_asset_filter.get(),
+            self.pending_order_expiry_prefix_filter.get(),
+            self.pending_order_keyword.get(),
+        ):
+            filter_warning = "当前未启用任何筛选，本次会按当前页全部可识别程序单执行。\n\n"
+        confirm_message = (
+            f"{filter_warning}"
+            f"确认批量撤销当前筛选结果中的程序委托吗？\n\n"
+            f"筛选结果总数：{len(filtered_items)}\n"
+            f"将尝试撤销：{len(cancelable_items)}\n"
+            f"跳过非程序单：{skipped_manual}\n"
+            f"跳过缺少ID：{skipped_missing_id}"
+        )
+        if not messagebox.askyesno("批量撤单确认", confirm_message, parent=parent):
+            return
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            messagebox.showinfo("批量撤单", "当前未配置 API 凭证，无法发起批量撤单。", parent=parent)
+            return
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        self._pending_order_canceling = True
+        self._positions_zoom_pending_orders_summary_text.set(
+            f"正在批量撤单：准备处理 {len(cancelable_items)} / {len(filtered_items)} 条"
+        )
+        threading.Thread(
+            target=self._cancel_filtered_pending_orders_worker,
+            args=(credentials, environment, cancelable_items, skipped_manual, skipped_missing_id),
+            daemon=True,
+        ).start()
+
+    def _cancel_selected_pending_order_worker(
+        self,
+        credentials: Credentials,
+        environment: str,
+        item: OkxTradeOrderItem,
+        owner_label: str,
+    ) -> None:
+        try:
+            result = self._cancel_pending_order_request(credentials, environment=environment, item=item)
+            note = None
+            effective_environment = environment
+        except Exception as exc:
+            message = str(exc)
+            if "50101" in message and "current environment" in message:
+                alternate = "live" if environment == "demo" else "demo"
+                try:
+                    result = self._cancel_pending_order_request(credentials, environment=alternate, item=item)
+                    note = f"撤单自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境执行。"
+                    effective_environment = alternate
+                except Exception:
+                    self.root.after(0, lambda: self._apply_pending_order_cancel_error(item, message, owner_label, environment))
+                    return
+            else:
+                self.root.after(0, lambda: self._apply_pending_order_cancel_error(item, message, owner_label, environment))
+                return
+        self.root.after(
+            0,
+            lambda: self._apply_pending_order_cancel_result(item, result, owner_label, note, effective_environment),
+        )
+
+    def _cancel_filtered_pending_orders_worker(
+        self,
+        credentials: Credentials,
+        environment: str,
+        items: list[OkxTradeOrderItem],
+        skipped_manual: int,
+        skipped_missing_id: int,
+    ) -> None:
+        success_items: list[tuple[OkxTradeOrderItem, OkxOrderResult, str]] = []
+        failed_items: list[tuple[OkxTradeOrderItem, str, str]] = []
+        active_environment = environment
+        note: str | None = None
+        switched = False
+        for item in items:
+            owner_label = _trade_order_program_owner_label(item) or "本程序委托"
+            try:
+                result = self._cancel_pending_order_request(credentials, environment=active_environment, item=item)
+            except Exception as exc:
+                message = str(exc)
+                if not switched and "50101" in message and "current environment" in message:
+                    alternate = "live" if active_environment == "demo" else "demo"
+                    try:
+                        result = self._cancel_pending_order_request(credentials, environment=alternate, item=item)
+                        active_environment = alternate
+                        note = f"批量撤单自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境执行。"
+                        switched = True
+                    except Exception as retry_exc:
+                        failed_items.append((item, owner_label, str(retry_exc)))
+                        continue
+                else:
+                    failed_items.append((item, owner_label, message))
+                    continue
+            success_items.append((item, result, owner_label))
+        self.root.after(
+            0,
+            lambda: self._apply_bulk_pending_order_cancel_result(
+                success_items,
+                failed_items,
+                skipped_manual,
+                skipped_missing_id,
+                note,
+                active_environment,
+            ),
+        )
+
+    def _cancel_pending_order_request(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        item: OkxTradeOrderItem,
+    ) -> OkxOrderResult:
+        if item.source_kind == "algo":
+            return self.client.cancel_algo_order(
+                credentials,
+                environment=environment,
+                inst_id=item.inst_id,
+                algo_id=item.algo_id or None,
+                algo_cl_ord_id=item.algo_client_order_id or item.client_order_id or None,
+            )
+        return self.client.cancel_order_by_id(
+            credentials,
+            environment=environment,
+            inst_id=item.inst_id,
+            ord_id=item.order_id or None,
+            cl_ord_id=item.client_order_id or None,
+        )
+
+    def _apply_pending_order_cancel_result(
+        self,
+        item: OkxTradeOrderItem,
+        result: OkxOrderResult,
+        owner_label: str,
+        note: str | None = None,
+        effective_environment: str | None = None,
+    ) -> None:
+        self._pending_order_canceling = False
+        if effective_environment:
+            self._positions_effective_environment = effective_environment
+        cancel_id = _trade_order_cancel_reference(item) or result.ord_id or result.cl_ord_id or "-"
+        summary = f"撤单请求已提交：{item.inst_id or '-'} | {cancel_id}"
+        if note:
+            summary = f"{summary} | {note}"
+        self._positions_zoom_pending_orders_base_summary = summary
+        self._positions_zoom_pending_orders_summary_text.set(summary)
+        self._enqueue_log(
+            "实盘撤单"
+            f" | 模式=单笔"
+            f" | 环境={effective_environment or '-'}"
+            f" | 程序来源={owner_label}"
+            f" | 来源={item.source_label or '-'}"
+            f" | 合约={item.inst_id or '-'}"
+            f" | 标识={cancel_id}"
+            f" | 结果=已提交"
+            f" | sCode={result.s_code}"
+            f" | sMsg={result.s_msg or 'accepted'}"
+        )
+        parent = self._positions_zoom_window if _widget_exists(self._positions_zoom_window) else self.root
+        messagebox.showinfo(
+            "撤单结果",
+            (
+                "撤单请求已提交。\n\n"
+                f"程序来源：{owner_label}\n"
+                f"来源：{item.source_label or '-'}\n"
+                f"合约：{item.inst_id or '-'}\n"
+                f"标识：{cancel_id}\n"
+                f"返回：sCode={result.s_code} | sMsg={result.s_msg or 'accepted'}"
+            ),
+            parent=parent,
+        )
+        self.refresh_pending_orders()
+        self.refresh_order_history()
+
+    def _apply_pending_order_cancel_error(
+        self,
+        item: OkxTradeOrderItem,
+        message: str,
+        owner_label: str,
+        environment: str,
+    ) -> None:
+        self._pending_order_canceling = False
+        friendly_message = _format_network_error_message(message)
+        self._positions_zoom_pending_orders_base_summary = f"撤单失败：{friendly_message}"
+        self._positions_zoom_pending_orders_summary_text.set(self._positions_zoom_pending_orders_base_summary)
+        self._enqueue_log(
+            "实盘撤单"
+            f" | 模式=单笔"
+            f" | 环境={environment}"
+            f" | 程序来源={owner_label}"
+            f" | 来源={item.source_label or '-'}"
+            f" | 合约={item.inst_id or '-'}"
+            f" | 标识={_trade_order_cancel_reference(item) or '-'}"
+            f" | 结果=失败"
+            f" | 原因={friendly_message}"
+        )
+        parent = self._positions_zoom_window if _widget_exists(self._positions_zoom_window) else self.root
+        messagebox.showerror(
+            "撤单失败",
+            (
+                f"{item.source_label or '委托'} 撤单失败。\n\n"
+                f"程序来源：{owner_label}\n"
+                f"合约：{item.inst_id or '-'}\n"
+                f"原因：{friendly_message}"
+            ),
+            parent=parent,
+        )
+
+    def _apply_bulk_pending_order_cancel_result(
+        self,
+        success_items: list[tuple[OkxTradeOrderItem, OkxOrderResult, str]],
+        failed_items: list[tuple[OkxTradeOrderItem, str, str]],
+        skipped_manual: int,
+        skipped_missing_id: int,
+        note: str | None = None,
+        effective_environment: str | None = None,
+    ) -> None:
+        self._pending_order_canceling = False
+        if effective_environment:
+            self._positions_effective_environment = effective_environment
+        success_count = len(success_items)
+        failed_count = len(failed_items)
+        summary = (
+            f"批量撤单完成：提交 {success_count} 条"
+            f" | 失败 {failed_count} 条"
+            f" | 跳过非程序单 {skipped_manual} 条"
+            f" | 跳过缺少ID {skipped_missing_id} 条"
+        )
+        if note:
+            summary = f"{summary} | {note}"
+        self._positions_zoom_pending_orders_base_summary = summary
+        self._positions_zoom_pending_orders_summary_text.set(summary)
+        self._enqueue_log(
+            "实盘撤单"
+            f" | 模式=批量"
+            f" | 环境={effective_environment or '-'}"
+            f" | 提交={success_count}"
+            f" | 失败={failed_count}"
+            f" | 跳过非程序单={skipped_manual}"
+            f" | 跳过缺少ID={skipped_missing_id}"
+            f"{' | 备注=' + note if note else ''}"
+        )
+        for item, result, owner_label in success_items:
+            self._enqueue_log(
+                "实盘撤单明细"
+                f" | 结果=已提交"
+                f" | 程序来源={owner_label}"
+                f" | 来源={item.source_label or '-'}"
+                f" | 合约={item.inst_id or '-'}"
+                f" | 标识={_trade_order_cancel_reference(item) or result.ord_id or result.cl_ord_id or '-'}"
+                f" | sCode={result.s_code}"
+                f" | sMsg={result.s_msg or 'accepted'}"
+            )
+        for item, owner_label, message in failed_items:
+            self._enqueue_log(
+                "实盘撤单明细"
+                f" | 结果=失败"
+                f" | 程序来源={owner_label}"
+                f" | 来源={item.source_label or '-'}"
+                f" | 合约={item.inst_id or '-'}"
+                f" | 标识={_trade_order_cancel_reference(item) or '-'}"
+                f" | 原因={_format_network_error_message(message)}"
+            )
+        parent = self._positions_zoom_window if _widget_exists(self._positions_zoom_window) else self.root
+        messagebox.showinfo(
+            "批量撤单结果",
+            (
+                f"{summary}\n\n"
+                f"已提交：{success_count}\n"
+                f"失败：{failed_count}\n"
+                f"跳过非程序单：{skipped_manual}\n"
+                f"跳过缺少ID：{skipped_missing_id}"
+            ),
+            parent=parent,
+        )
+        self.refresh_pending_orders()
+        self.refresh_order_history()
+
+    def _start_pending_orders_refresh(self, credentials: Credentials, environment: str) -> None:
+        if self._pending_orders_refreshing:
+            return
+        self._pending_orders_refreshing = True
+        self._positions_zoom_pending_orders_summary_text.set("正在刷新当前委托...")
+        threading.Thread(
+            target=self._refresh_pending_orders_worker,
+            args=(credentials, environment),
+            daemon=True,
+        ).start()
+
+    def _start_order_history_refresh(self, credentials: Credentials, environment: str) -> None:
+        if self._order_history_refreshing:
+            return
+        self._order_history_refreshing = True
+        self._positions_zoom_order_history_summary_text.set("正在刷新历史委托...")
+        threading.Thread(
+            target=self._refresh_order_history_worker,
+            args=(credentials, environment),
+            daemon=True,
+        ).start()
+
+    def _refresh_pending_orders_worker(self, credentials: Credentials, environment: str) -> None:
+        try:
+            items = self.client.get_pending_orders(credentials, environment=environment, limit=200)
+            note = None
+            effective_environment = environment
+        except Exception as exc:
+            message = str(exc)
+            if "50101" in message and "current environment" in message:
+                alternate = "live" if environment == "demo" else "demo"
+                try:
+                    items = self.client.get_pending_orders(credentials, environment=alternate, limit=200)
+                    note = f"委托数据自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
+                    effective_environment = alternate
+                except Exception:
+                    self.root.after(0, lambda: self._apply_pending_orders_error(message))
+                    return
+            else:
+                self.root.after(0, lambda: self._apply_pending_orders_error(message))
+                return
+        self.root.after(0, lambda: self._apply_pending_orders(items, note, effective_environment))
+
+    def _refresh_order_history_worker(self, credentials: Credentials, environment: str) -> None:
+        try:
+            items = self.client.get_order_history(credentials, environment=environment, limit=200)
+            note = None
+            effective_environment = environment
+        except Exception as exc:
+            message = str(exc)
+            if "50101" in message and "current environment" in message:
+                alternate = "live" if environment == "demo" else "demo"
+                try:
+                    items = self.client.get_order_history(credentials, environment=alternate, limit=200)
+                    note = f"委托数据自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
+                    effective_environment = alternate
+                except Exception:
+                    self.root.after(0, lambda: self._apply_order_history_error(message))
+                    return
+            else:
+                self.root.after(0, lambda: self._apply_order_history_error(message))
+                return
+        self.root.after(0, lambda: self._apply_order_history(items, note, effective_environment))
+
+    def _apply_pending_orders(
+        self,
+        items: list[OkxTradeOrderItem],
+        note: str | None = None,
+        effective_environment: str | None = None,
+    ) -> None:
+        self._pending_orders_refreshing = False
+        self._latest_pending_orders = list(items)
+        self._pending_orders_last_refresh_at = datetime.now()
+        if effective_environment:
+            self._positions_effective_environment = effective_environment
+        timestamp = self._pending_orders_last_refresh_at.strftime("%H:%M:%S")
+        summary = f"当前委托：{len(items)} 条 | 最近刷新：{timestamp}"
+        if note:
+            summary = f"{summary} | {note}"
+        self._positions_zoom_pending_orders_base_summary = summary
+        self._positions_zoom_pending_orders_summary_text.set(summary)
+        self._render_pending_orders_view()
+
+    def _apply_order_history(
+        self,
+        items: list[OkxTradeOrderItem],
+        note: str | None = None,
+        effective_environment: str | None = None,
+    ) -> None:
+        self._order_history_refreshing = False
+        self._latest_order_history = list(items)
+        self._order_history_last_refresh_at = datetime.now()
+        if effective_environment:
+            self._positions_effective_environment = effective_environment
+        timestamp = self._order_history_last_refresh_at.strftime("%H:%M:%S")
+        summary = f"历史委托：{len(items)} 条 | 最近刷新：{timestamp}"
+        if note:
+            summary = f"{summary} | {note}"
+        self._positions_zoom_order_history_base_summary = summary
+        self._positions_zoom_order_history_summary_text.set(summary)
+        self._render_order_history_view()
+
+    def _apply_pending_orders_error(self, message: str) -> None:
+        self._pending_orders_refreshing = False
+        self._positions_zoom_pending_orders_base_summary = f"当前委托读取失败：{message}"
+        self._positions_zoom_pending_orders_summary_text.set(self._positions_zoom_pending_orders_base_summary)
+
+    def _apply_order_history_error(self, message: str) -> None:
+        self._order_history_refreshing = False
+        self._positions_zoom_order_history_base_summary = f"历史委托读取失败：{message}"
+        self._positions_zoom_order_history_summary_text.set(self._positions_zoom_order_history_base_summary)
+
+    def _on_pending_order_filter_changed(self, *_: object) -> None:
+        self._render_pending_orders_view()
+
+    def reset_pending_order_filters(self) -> None:
+        self.pending_order_type_filter.set("全部类型")
+        self.pending_order_source_filter.set("全部来源")
+        self.pending_order_state_filter.set("全部状态")
+        self.pending_order_asset_filter.set("")
+        self.pending_order_expiry_prefix_filter.set("")
+        self.pending_order_keyword.set("")
+        self._render_pending_orders_view()
+
+    def _on_order_history_filter_changed(self, *_: object) -> None:
+        self._render_order_history_view()
+
+    def reset_order_history_filters(self) -> None:
+        self.order_history_type_filter.set("全部类型")
+        self.order_history_source_filter.set("全部来源")
+        self.order_history_state_filter.set("全部状态")
+        self.order_history_asset_filter.set("")
+        self.order_history_expiry_prefix_filter.set("")
+        self.order_history_keyword.set("")
+        self._render_order_history_view()
+
+    def _render_pending_orders_view(self) -> None:
+        tree = self._positions_zoom_pending_orders_tree
+        if tree is None or not _widget_exists(tree):
+            if tree is not None and not _widget_exists(tree):
+                self._positions_zoom_pending_orders_tree = None
+            return
+        try:
+            selection = tree.selection()
+            selected_before = selection[0] if selection else None
+            tree.delete(*tree.get_children())
+            filtered_items = self._filtered_pending_order_items()
+            for index, item in filtered_items:
+                iid = f"po-{index}"
+                tree.insert(
+                    "",
+                    END,
+                    iid=iid,
+                    values=(
+                        _format_trade_order_timestamp(item),
+                        item.source_label,
+                        item.inst_type or "-",
+                        item.inst_id or "-",
+                        _format_trade_order_state(item.state),
+                        _format_history_side(item.side, item.pos_side),
+                        item.ord_type or "-",
+                        _format_trade_order_price(item.price, item.inst_id, item.inst_type),
+                        _format_trade_order_size(item.size),
+                        _format_trade_order_size(item.filled_size),
+                        _format_trade_order_tp_sl(item),
+                        item.order_id or item.algo_id or "-",
+                        item.client_order_id or item.algo_client_order_id or "-",
+                    ),
+                    tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
+                )
+            summary = self._positions_zoom_pending_orders_base_summary
+            cancelable_count = sum(
+                1 for _, item in filtered_items if _trade_order_program_owner_label(item) is not None and _trade_order_cancel_reference(item)
+            )
+            if _trade_order_filter_enabled(
+                POSITION_TYPE_OPTIONS.get(self.pending_order_type_filter.get(), ""),
+                ORDER_SOURCE_FILTER_OPTIONS.get(self.pending_order_source_filter.get(), ""),
+                ORDER_STATE_FILTER_OPTIONS.get(self.pending_order_state_filter.get(), ""),
+                self.pending_order_asset_filter.get(),
+                self.pending_order_expiry_prefix_filter.get(),
+                self.pending_order_keyword.get(),
+            ):
+                summary = f"{summary} | 当前显示：{len(filtered_items)}/{len(self._latest_pending_orders)}"
+            if filtered_items:
+                summary = f"{summary} | 可撤程序单：{cancelable_count}/{len(filtered_items)}"
+            self._positions_zoom_pending_orders_summary_text.set(summary)
+            if selected_before and tree.exists(selected_before):
+                tree.selection_set(selected_before)
+                tree.focus(selected_before)
+            elif tree.get_children():
+                first = tree.get_children()[0]
+                tree.selection_set(first)
+                tree.focus(first)
+        except TclError:
+            self._positions_zoom_pending_orders_tree = None
+            return
+        self._refresh_pending_orders_detail()
+
+    def _render_order_history_view(self) -> None:
+        tree = self._positions_zoom_order_history_tree
+        if tree is None or not _widget_exists(tree):
+            if tree is not None and not _widget_exists(tree):
+                self._positions_zoom_order_history_tree = None
+            return
+        try:
+            selection = tree.selection()
+            selected_before = selection[0] if selection else None
+            tree.delete(*tree.get_children())
+            filtered_items = _filter_trade_order_items(
+                self._latest_order_history,
+                inst_type=POSITION_TYPE_OPTIONS.get(self.order_history_type_filter.get(), ""),
+                source=ORDER_SOURCE_FILTER_OPTIONS.get(self.order_history_source_filter.get(), ""),
+                state=ORDER_STATE_FILTER_OPTIONS.get(self.order_history_state_filter.get(), ""),
+                asset=self.order_history_asset_filter.get(),
+                expiry_prefix=self.order_history_expiry_prefix_filter.get(),
+                keyword=self.order_history_keyword.get(),
+            )
+            for index, item in filtered_items:
+                iid = f"oh-{index}"
+                tree.insert(
+                    "",
+                    END,
+                    iid=iid,
+                    values=(
+                        _format_trade_order_timestamp(item),
+                        item.source_label,
+                        item.inst_type or "-",
+                        item.inst_id or "-",
+                        _format_trade_order_state(item.state),
+                        _format_history_side(item.side, item.pos_side),
+                        item.ord_type or "-",
+                        _format_trade_order_price(item.price, item.inst_id, item.inst_type),
+                        _format_trade_order_size(item.size),
+                        _format_trade_order_size(item.filled_size),
+                        _format_trade_order_tp_sl(item),
+                        item.order_id or item.algo_id or "-",
+                        item.client_order_id or item.algo_client_order_id or "-",
+                    ),
+                    tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
+                )
+            summary = self._positions_zoom_order_history_base_summary
+            if _trade_order_filter_enabled(
+                POSITION_TYPE_OPTIONS.get(self.order_history_type_filter.get(), ""),
+                ORDER_SOURCE_FILTER_OPTIONS.get(self.order_history_source_filter.get(), ""),
+                ORDER_STATE_FILTER_OPTIONS.get(self.order_history_state_filter.get(), ""),
+                self.order_history_asset_filter.get(),
+                self.order_history_expiry_prefix_filter.get(),
+                self.order_history_keyword.get(),
+            ):
+                summary = f"{summary} | 当前显示：{len(filtered_items)}/{len(self._latest_order_history)}"
+            self._positions_zoom_order_history_summary_text.set(summary)
+            if selected_before and tree.exists(selected_before):
+                tree.selection_set(selected_before)
+                tree.focus(selected_before)
+            elif tree.get_children():
+                first = tree.get_children()[0]
+                tree.selection_set(first)
+                tree.focus(first)
+        except TclError:
+            self._positions_zoom_order_history_tree = None
+            return
+        self._refresh_order_history_detail()
+
+    def _on_pending_orders_selected(self, *_: object) -> None:
+        self._refresh_pending_orders_detail()
+
+    def _on_order_history_selected(self, *_: object) -> None:
+        self._refresh_order_history_detail()
+
+    def _refresh_pending_orders_detail(self) -> None:
+        if (
+            self._positions_zoom_pending_orders_tree is None
+            or self._positions_zoom_pending_orders_detail is None
+            or not _widget_exists(self._positions_zoom_pending_orders_tree)
+            or not _widget_exists(self._positions_zoom_pending_orders_detail)
+        ):
+            return
+        try:
+            selection = self._positions_zoom_pending_orders_tree.selection()
+        except TclError:
+            self._positions_zoom_pending_orders_tree = None
+            self._positions_zoom_pending_orders_detail = None
+            return
+        if not selection:
+            self._set_readonly_text(self._positions_zoom_pending_orders_detail, "这里会显示选中当前委托的详情。")
+            return
+        index = _history_tree_index(selection[0], "po")
+        if index is None or index >= len(self._latest_pending_orders):
+            self._set_readonly_text(self._positions_zoom_pending_orders_detail, "这里会显示选中当前委托的详情。")
+            return
+        self._set_readonly_text(self._positions_zoom_pending_orders_detail, _build_trade_order_detail_text(self._latest_pending_orders[index]))
+
+    def _refresh_order_history_detail(self) -> None:
+        if (
+            self._positions_zoom_order_history_tree is None
+            or self._positions_zoom_order_history_detail is None
+            or not _widget_exists(self._positions_zoom_order_history_tree)
+            or not _widget_exists(self._positions_zoom_order_history_detail)
+        ):
+            return
+        try:
+            selection = self._positions_zoom_order_history_tree.selection()
+        except TclError:
+            self._positions_zoom_order_history_tree = None
+            self._positions_zoom_order_history_detail = None
+            return
+        if not selection:
+            self._set_readonly_text(self._positions_zoom_order_history_detail, "这里会显示选中历史委托的详情。")
+            return
+        index = _history_tree_index(selection[0], "oh")
+        if index is None or index >= len(self._latest_order_history):
+            self._set_readonly_text(self._positions_zoom_order_history_detail, "这里会显示选中历史委托的详情。")
+            return
+        self._set_readonly_text(self._positions_zoom_order_history_detail, _build_trade_order_detail_text(self._latest_order_history[index]))
+
+    def _selected_pending_order_item(self) -> OkxTradeOrderItem | None:
+        tree = self._positions_zoom_pending_orders_tree
+        if tree is None or not _widget_exists(tree):
+            return None
+        try:
+            selection = tree.selection()
+        except TclError:
+            self._positions_zoom_pending_orders_tree = None
+            return None
+        if not selection:
+            return None
+        index = _history_tree_index(selection[0], "po")
+        if index is None or index >= len(self._latest_pending_orders):
+            return None
+        return self._latest_pending_orders[index]
+
+    def _filtered_pending_order_items(self) -> list[tuple[int, OkxTradeOrderItem]]:
+        return _filter_trade_order_items(
+            self._latest_pending_orders,
+            inst_type=POSITION_TYPE_OPTIONS.get(self.pending_order_type_filter.get(), ""),
+            source=ORDER_SOURCE_FILTER_OPTIONS.get(self.pending_order_source_filter.get(), ""),
+            state=ORDER_STATE_FILTER_OPTIONS.get(self.pending_order_state_filter.get(), ""),
+            asset=self.pending_order_asset_filter.get(),
+            expiry_prefix=self.pending_order_expiry_prefix_filter.get(),
+            keyword=self.pending_order_keyword.get(),
+        )
 
     def refresh_position_histories(self) -> None:
         credentials = self._current_credentials_or_none()
@@ -3632,7 +4786,8 @@ class QuantApp:
                 sizing_mode_label="固定风险金",
                 risk_percent="1",
                 compounding_enabled=False,
-                slippage_percent="0",
+                entry_slippage_percent="0",
+                exit_slippage_percent="0",
                 funding_rate_percent="0",
                 candle_limit="10000",
             ),
@@ -4131,6 +5286,7 @@ class QuantApp:
                 self._make_session_logger(session_id, definition.name, session_symbol, api_name),
                 notifier=notifier,
                 strategy_name=definition.name,
+                session_id=session_id,
             )
             session = StrategySession(
                 session_id=session_id,
@@ -6499,6 +7655,253 @@ def _filter_fill_history_items(
     return filtered
 
 
+def _filter_trade_order_items(
+    items: list[OkxTradeOrderItem],
+    *,
+    inst_type: str = "",
+    source: str = "",
+    state: str = "",
+    asset: str = "",
+    expiry_prefix: str = "",
+    keyword: str = "",
+) -> list[tuple[int, OkxTradeOrderItem]]:
+    normalized_inst_type = inst_type.strip().upper()
+    normalized_source = source.strip().lower()
+    normalized_state = state.strip().lower()
+    normalized_asset = asset.strip().upper()
+    normalized_expiry_prefix = expiry_prefix.strip().upper()
+    normalized_keyword = keyword.strip().lower()
+    filtered: list[tuple[int, OkxTradeOrderItem]] = []
+
+    for index, item in enumerate(items):
+        if normalized_inst_type and (item.inst_type or "").upper() != normalized_inst_type:
+            continue
+        if normalized_source and (item.source_kind or "").lower() != normalized_source:
+            continue
+        if normalized_state and (item.state or "").lower() != normalized_state:
+            continue
+        if normalized_asset and _extract_asset_key(item.inst_id).upper() != normalized_asset:
+            continue
+        if normalized_expiry_prefix and not _extract_history_expiry_prefix(item.inst_id).startswith(normalized_expiry_prefix):
+            continue
+        if normalized_keyword:
+            haystack = " ".join(
+                part
+                for part in (
+                    item.source_label,
+                    item.source_kind,
+                    item.inst_id,
+                    item.inst_type,
+                    item.state,
+                    item.side,
+                    item.pos_side,
+                    item.td_mode,
+                    item.ord_type,
+                    item.order_id,
+                    item.algo_id,
+                    item.client_order_id,
+                    item.algo_client_order_id,
+                )
+                if part
+            ).lower()
+            if normalized_keyword not in haystack:
+                continue
+        filtered.append((index, item))
+    return filtered
+
+
+def _trade_order_filter_enabled(
+    inst_type: str,
+    source: str,
+    state: str,
+    asset: str,
+    expiry_prefix: str,
+    keyword: str,
+) -> bool:
+    return any(
+        str(value or "").strip()
+        for value in (inst_type, source, state, asset, expiry_prefix, keyword)
+    )
+
+
+def _format_trade_order_timestamp(item: OkxTradeOrderItem) -> str:
+    return _format_okx_ms_timestamp(item.update_time or item.created_time)
+
+
+def _format_trade_order_state(state: str | None) -> str:
+    normalized = (state or "").strip().lower()
+    if not normalized:
+        return "-"
+    mapping = {
+        "live": "生效中 live",
+        "partially_filled": "部分成交 partially_filled",
+        "filled": "已成交 filled",
+        "canceled": "已撤销 canceled",
+        "mmp_canceled": "风控撤销 mmp_canceled",
+        "effective": "算法生效 effective",
+        "triggered": "已触发 triggered",
+        "pause": "暂停 pause",
+        "order_failed": "失败 order_failed",
+        "partially_failed": "部分失败 partially_failed",
+    }
+    return mapping.get(normalized, normalized)
+
+
+def _format_trade_order_trigger_price_type(trigger_price_type: str | None) -> str:
+    normalized = (trigger_price_type or "").strip().lower()
+    if not normalized:
+        return "-"
+    mapping = {
+        "mark": "标记价 mark",
+        "last": "最新价 last",
+        "index": "指数价 index",
+    }
+    return mapping.get(normalized, normalized)
+
+
+def _format_trade_order_price(value: Decimal | None, inst_id: str, inst_type: str) -> str:
+    if value is None:
+        return "-"
+    if value == Decimal("-1"):
+        return "市价"
+    normalized_inst_type = (inst_type or "").upper()
+    if normalized_inst_type == "OPTION":
+        return _format_optional_decimal(value)
+    quote_currency = _extract_quote_key(inst_id)
+    if quote_currency in {"USDT", "USD", "USDC"}:
+        return _format_optional_decimal_fixed(value, places=2)
+    return _format_optional_decimal(value)
+
+
+def _format_trade_order_size(value: Decimal | None) -> str:
+    return _format_optional_decimal(value)
+
+
+def _format_trade_order_tp_sl(item: OkxTradeOrderItem) -> str:
+    def _build_tp_sl_segment(label: str, trigger_price: Decimal | None, order_price: Decimal | None) -> str | None:
+        if trigger_price is None:
+            return None
+        trigger_text = _format_trade_order_price(trigger_price, item.inst_id, item.inst_type)
+        if order_price is None or order_price == trigger_price:
+            return f"{label} {trigger_text}"
+        order_text = _format_trade_order_price(order_price, item.inst_id, item.inst_type)
+        return f"{label} {trigger_text}=>{order_text}"
+
+    parts = [
+        segment
+        for segment in (
+            _build_tp_sl_segment("TP", item.take_profit_trigger_price, item.take_profit_order_price),
+            _build_tp_sl_segment("SL", item.stop_loss_trigger_price, item.stop_loss_order_price),
+        )
+        if segment
+    ]
+    if parts:
+        return " / ".join(parts)
+    if item.trigger_price is not None:
+        trigger_text = _format_trade_order_price(item.trigger_price, item.inst_id, item.inst_type)
+        if item.order_price is None or item.order_price == item.trigger_price:
+            return f"触发 {trigger_text}"
+        order_text = _format_trade_order_price(item.order_price, item.inst_id, item.inst_type)
+        return f"触发 {trigger_text}=>{order_text}"
+    return "-"
+
+
+def _trade_order_cancel_reference(item: OkxTradeOrderItem) -> str:
+    if item.source_kind == "algo":
+        return item.algo_id or item.algo_client_order_id or item.client_order_id or ""
+    return item.order_id or item.client_order_id or ""
+
+
+def _trade_order_program_owner_label(item: OkxTradeOrderItem) -> str | None:
+    candidates = [
+        (item.client_order_id or "").strip().lower(),
+        (item.algo_client_order_id or "").strip().lower(),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if PROTECTION_CL_ORD_ID_PATTERN.fullmatch(candidate):
+            return "风控保护"
+        if SMART_ORDER_CL_ORD_ID_PATTERN.fullmatch(candidate):
+            return "智能下单"
+        if ENGINE_CL_ORD_ID_PATTERN.fullmatch(candidate):
+            return "策略引擎"
+    return None
+
+
+def _build_trade_order_detail_text(item: OkxTradeOrderItem) -> str:
+    def _format_flag(value: bool | None) -> str:
+        if value is True:
+            return "是"
+        if value is False:
+            return "否"
+        return "-"
+
+    def _format_amount(value: Decimal | None, currency: str | None, *, with_sign: bool = False) -> str:
+        amount_text = _format_optional_decimal(value, with_sign=with_sign)
+        normalized_currency = (currency or "").strip().upper()
+        if normalized_currency and amount_text != "-":
+            return f"{amount_text} {normalized_currency}"
+        return amount_text
+
+    owner_label = _trade_order_program_owner_label(item)
+    lines = [
+        f"来源：{item.source_label or '-'}",
+        f"程序来源：{owner_label or '非本程序委托'}",
+        f"创建时间：{_format_okx_ms_timestamp(item.created_time)}",
+        f"更新时间：{_format_okx_ms_timestamp(item.update_time)}",
+        f"合约：{item.inst_id or '-'}",
+        f"类型：{item.inst_type or '-'}",
+        f"状态：{_format_trade_order_state(item.state)}",
+        f"方向：{_format_history_side(item.side, item.pos_side)}",
+        f"保证金模式：{_format_margin_mode(item.td_mode)}",
+        f"委托类型：{item.ord_type or '-'}",
+        f"委托价：{_format_trade_order_price(item.price, item.inst_id, item.inst_type)}",
+        f"委托量：{_format_trade_order_size(item.size)}",
+        f"已成交：{_format_trade_order_size(item.filled_size)}",
+        f"成交均价：{_format_trade_order_price(item.avg_price, item.inst_id, item.inst_type)}",
+        f"reduceOnly：{_format_flag(item.reduce_only)}",
+        f"TP/SL：{_format_trade_order_tp_sl(item)}",
+        f"订单ID：{item.order_id or '-'}",
+        f"算法ID：{item.algo_id or '-'}",
+        f"clOrdId：{item.client_order_id or '-'}",
+        f"algoClOrdId：{item.algo_client_order_id or '-'}",
+    ]
+
+    if item.trigger_price is not None:
+        lines.append(f"触发价：{_format_trade_order_price(item.trigger_price, item.inst_id, item.inst_type)}")
+        lines.append(f"触发价类型：{_format_trade_order_trigger_price_type(item.trigger_price_type)}")
+    if item.order_price is not None and item.order_price != item.price:
+        lines.append(f"算法委托价：{_format_trade_order_price(item.order_price, item.inst_id, item.inst_type)}")
+    if item.actual_price is not None and item.actual_price != item.avg_price:
+        lines.append(f"实际价格：{_format_trade_order_price(item.actual_price, item.inst_id, item.inst_type)}")
+    if item.actual_size is not None and item.actual_size != item.filled_size:
+        lines.append(f"实际数量：{_format_trade_order_size(item.actual_size)}")
+    if item.actual_side and item.actual_side != item.side:
+        lines.append(f"实际方向：{item.actual_side}")
+    if item.take_profit_trigger_price is not None:
+        tp_line = f"止盈触发价：{_format_trade_order_price(item.take_profit_trigger_price, item.inst_id, item.inst_type)}"
+        if item.take_profit_trigger_price_type:
+            tp_line = f"{tp_line}（{_format_trade_order_trigger_price_type(item.take_profit_trigger_price_type)}）"
+        lines.append(tp_line)
+    if item.take_profit_order_price is not None:
+        lines.append(f"止盈委托价：{_format_trade_order_price(item.take_profit_order_price, item.inst_id, item.inst_type)}")
+    if item.stop_loss_trigger_price is not None:
+        sl_line = f"止损触发价：{_format_trade_order_price(item.stop_loss_trigger_price, item.inst_id, item.inst_type)}"
+        if item.stop_loss_trigger_price_type:
+            sl_line = f"{sl_line}（{_format_trade_order_trigger_price_type(item.stop_loss_trigger_price_type)}）"
+        lines.append(sl_line)
+    if item.stop_loss_order_price is not None:
+        lines.append(f"止损委托价：{_format_trade_order_price(item.stop_loss_order_price, item.inst_id, item.inst_type)}")
+    if item.pnl is not None:
+        lines.append(f"盈亏：{_format_optional_decimal(item.pnl, with_sign=True)}")
+    if item.fee is not None or item.fee_currency:
+        lines.append(f"手续费：{_format_amount(item.fee, item.fee_currency, with_sign=True)}")
+
+    raw_text = json.dumps(item.raw, ensure_ascii=False, indent=2, sort_keys=True)
+    return "\n".join(lines) + f"\n\n原始响应：\n{raw_text}"
+
+
 def _format_position_history_currency_totals(totals: dict[str, Decimal]) -> str:
     if not totals:
         return "-"
@@ -6888,6 +8291,18 @@ def _tree_display_columns(tree: ttk.Treeview, columns: tuple[str, ...]) -> tuple
     if isinstance(display_columns, str):
         return tuple(part for part in display_columns.split() if part)
     return tuple(display_columns)
+
+
+def _widget_exists(widget: object) -> bool:
+    if widget is None:
+        return False
+    winfo_exists = getattr(widget, "winfo_exists", None)
+    if not callable(winfo_exists):
+        return False
+    try:
+        return bool(winfo_exists())
+    except TclError:
+        return False
 
 
 def _tree_safe_token(value: str) -> str:

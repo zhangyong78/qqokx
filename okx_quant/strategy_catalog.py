@@ -7,6 +7,8 @@ STRATEGY_DYNAMIC_LONG_ID = "ema_dynamic_order_long"
 STRATEGY_DYNAMIC_SHORT_ID = "ema_dynamic_order_short"
 STRATEGY_CROSS_ID = "ema_cross_market"
 STRATEGY_EMA5_EMA8_ID = "ema5_ema8_cross_stop"
+STRATEGY_SLOT_LONG_ID = "ema_slot_handoff_long"
+STRATEGY_SLOT_SHORT_ID = "ema_slot_handoff_short"
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,38 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
         allowed_signal_labels=("只做多", "只做空"),
     ),
     StrategyDefinition(
+        strategy_id=STRATEGY_SLOT_LONG_ID,
+        name="EMA 槽位接管做多",
+        summary="5m 趋势突破做多，盈利自动止盈或盈利失效退出，亏损单移交人工池继续占用槽位。",
+        rule_description=(
+            "做多条件：收盘价上穿 EMA 小周期，且收盘价位于 EMA 中周期上方。"
+            " 开仓后按 ATR 计算理论止损和止盈，但自动系统只执行止盈；"
+            " 若收盘重新跌回 EMA 小周期下方，则盈利单自动平仓，亏损单转入人工池。"
+        ),
+        parameter_hint=(
+            "固定数量代表单个槽位大小；“每波最多开仓次数”在本策略中表示最大槽位数。"
+            " 人工池仓位继续占用槽位，只有手动处理或回测结束才会释放。"
+        ),
+        default_signal_label="只做多",
+        allowed_signal_labels=("只做多",),
+    ),
+    StrategyDefinition(
+        strategy_id=STRATEGY_SLOT_SHORT_ID,
+        name="EMA 槽位接管做空",
+        summary="5m 趋势跌破做空，盈利自动止盈或盈利失效退出，亏损单移交人工池继续占用槽位。",
+        rule_description=(
+            "做空条件：收盘价下穿 EMA 小周期，且收盘价位于 EMA 中周期下方。"
+            " 开仓后按 ATR 计算理论止损和止盈，但自动系统只执行止盈；"
+            " 若收盘重新站回 EMA 小周期上方，则盈利单自动平仓，亏损单转入人工池。"
+        ),
+        parameter_hint=(
+            "固定数量代表单个槽位大小；“每波最多开仓次数”在本策略中表示最大槽位数。"
+            " 人工池仓位继续占用槽位，只有手动处理或回测结束才会释放。"
+        ),
+        default_signal_label="只做空",
+        allowed_signal_labels=("只做空",),
+    ),
+    StrategyDefinition(
         strategy_id=STRATEGY_DYNAMIC_ID,
         name="EMA 动态委托（兼容旧版）",
         summary="仅用于兼容旧配置和旧回测记录。新任务建议改用多头版或空头版。",
@@ -91,11 +125,20 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     ),
 )
 
+BACKTEST_ONLY_STRATEGY_IDS = {
+    STRATEGY_SLOT_LONG_ID,
+    STRATEGY_SLOT_SHORT_ID,
+}
+
 VISIBLE_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = tuple(
     item for item in ALL_STRATEGY_DEFINITIONS if item.strategy_id != STRATEGY_DYNAMIC_ID
 )
 
-STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = VISIBLE_STRATEGY_DEFINITIONS
+BACKTEST_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = VISIBLE_STRATEGY_DEFINITIONS
+
+STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = tuple(
+    item for item in VISIBLE_STRATEGY_DEFINITIONS if item.strategy_id not in BACKTEST_ONLY_STRATEGY_IDS
+)
 
 
 def get_strategy_definition(strategy_id: str) -> StrategyDefinition:
@@ -110,6 +153,13 @@ def is_dynamic_strategy_id(strategy_id: str) -> bool:
         STRATEGY_DYNAMIC_ID,
         STRATEGY_DYNAMIC_LONG_ID,
         STRATEGY_DYNAMIC_SHORT_ID,
+    }
+
+
+def is_slot_handoff_strategy_id(strategy_id: str) -> bool:
+    return strategy_id in {
+        STRATEGY_SLOT_LONG_ID,
+        STRATEGY_SLOT_SHORT_ID,
     }
 
 

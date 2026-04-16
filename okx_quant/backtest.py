@@ -6,12 +6,14 @@ from decimal import Decimal
 
 from okx_quant.engine import build_protection_plan, determine_order_size
 from okx_quant.indicators import atr, ema
+from okx_quant.backtest_strategy_pool import build_slot_handoff_strategy_pool_configs
 from okx_quant.models import Candle, Instrument, OrderPlan, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
+from okx_quant.strategies.ema_slot_handoff import EmaSlotHandoffStrategy
 from okx_quant.strategy_catalog import (
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
@@ -19,6 +21,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
     is_dynamic_strategy_id,
+    is_slot_handoff_strategy_id,
     resolve_dynamic_signal_mode,
 )
 
@@ -36,6 +39,7 @@ ATR_BATCH_TAKE_RATIOS: tuple[Decimal, ...] = (
     Decimal("3"),
 )
 BATCH_MAX_ENTRIES_OPTIONS: tuple[int, ...] = (0, 1, 2, 3)
+MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT = Decimal("0.50")
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,12 @@ class BacktestReport:
     total_fees: Decimal = Decimal("0")
     slippage_costs: Decimal = Decimal("0")
     funding_costs: Decimal = Decimal("0")
+    manual_handoffs: int = 0
+    manual_open_positions: int = 0
+    manual_open_size: Decimal = Decimal("0")
+    manual_open_pnl: Decimal = Decimal("0")
+    max_manual_positions: int = 0
+    max_total_occupied_slots: int = 0
 
 
 @dataclass(frozen=True)
@@ -134,6 +144,8 @@ class BacktestResult:
     data_source_note: str = ""
     maker_fee_rate: Decimal = Decimal("0")
     taker_fee_rate: Decimal = Decimal("0")
+    entry_slippage_rate: Decimal = Decimal("0")
+    exit_slippage_rate: Decimal = Decimal("0")
     slippage_rate: Decimal = Decimal("0")
     funding_rate: Decimal = Decimal("0")
     take_profit_mode: str = "fixed"
@@ -142,7 +154,11 @@ class BacktestResult:
     max_entries_per_trend: int = 1
     sizing_mode: str = "fixed_risk"
     compounding: bool = False
+    backtest_profile_id: str = ""
+    backtest_profile_name: str = ""
+    backtest_profile_summary: str = ""
     open_position: "BacktestOpenPosition | None" = None
+    manual_positions: list["BacktestManualPosition"] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -162,6 +178,32 @@ class BacktestOpenPosition:
     pnl: Decimal
     risk_value: Decimal
     r_multiple: Decimal
+    entry_fee: Decimal = Decimal("0")
+    funding_cost: Decimal = Decimal("0")
+
+
+@dataclass(frozen=True)
+class BacktestManualPosition:
+    signal: str
+    entry_index: int
+    handoff_index: int
+    entry_ts: int
+    handoff_ts: int
+    current_ts: int
+    entry_price: Decimal
+    handoff_price: Decimal
+    current_price: Decimal
+    stop_loss: Decimal
+    take_profit: Decimal
+    size: Decimal
+    gross_pnl: Decimal
+    pnl: Decimal
+    risk_value: Decimal
+    r_multiple: Decimal
+    break_even_price: Decimal
+    handoff_reason: str
+    atr_value: Decimal = Decimal("0")
+    entry_sequence: int = 0
     entry_fee: Decimal = Decimal("0")
     funding_cost: Decimal = Decimal("0")
 
@@ -188,10 +230,22 @@ class _OpenPosition:
     dynamic_two_r_break_even: bool = False
     dynamic_fee_offset_enabled: bool = True
     entry_fee_rate: Decimal = Decimal("0")
+    estimated_exit_fee_rate: Decimal = Decimal("0")
     entry_fee_type: str = "none"
     entry_slippage_cost: Decimal = Decimal("0")
+    entry_slippage_rate: Decimal = Decimal("0")
+    exit_slippage_rate: Decimal = Decimal("0")
     slippage_rate: Decimal = Decimal("0")
     funding_rate: Decimal = Decimal("0")
+
+
+@dataclass
+class _ManualPosition:
+    position: _OpenPosition
+    handoff_index: int
+    handoff_ts: int
+    handoff_price_raw: Decimal
+    handoff_reason: str
 
 
 def run_backtest(
@@ -277,6 +331,8 @@ def build_parameter_batch_configs(
     take_ratios: tuple[Decimal, ...] = ATR_BATCH_TAKE_RATIOS,
     max_entries_options: tuple[int, ...] = BATCH_MAX_ENTRIES_OPTIONS,
 ) -> list[StrategyConfig]:
+    if is_slot_handoff_strategy_id(base_config.strategy_id):
+        return build_slot_handoff_strategy_pool_configs(base_config)
     if not is_dynamic_strategy_id(base_config.strategy_id):
         return build_atr_batch_configs(
             base_config,
@@ -424,12 +480,21 @@ def run_backtest_batch(
     if start_ts is not None and end_ts is not None and start_ts > end_ts:
         raise ValueError("开始时间不能晚于结束时间")
 
-    preload_count = _required_backtest_preload_candles(base_config)
-    instrument = client.get_instrument(base_config.inst_id)
+    batch_configs = build_parameter_batch_configs(
+        base_config,
+        atr_multipliers=atr_multipliers,
+        take_ratios=take_ratios,
+    )
+    if not batch_configs:
+        return []
+
+    preload_count = max(_required_backtest_preload_candles(config) for config in batch_configs)
+    sample_config = batch_configs[0]
+    instrument = client.get_instrument(sample_config.inst_id)
     candles = _load_backtest_candles(
         client,
-        base_config.inst_id,
-        base_config.bar,
+        sample_config.inst_id,
+        sample_config.bar,
         candle_limit,
         start_ts=start_ts,
         end_ts=end_ts,
@@ -437,11 +502,7 @@ def run_backtest_batch(
     )
     data_source_note = _build_backtest_data_source_note(client)
     results: list[tuple[StrategyConfig, BacktestResult]] = []
-    for config in build_parameter_batch_configs(
-        base_config,
-        atr_multipliers=atr_multipliers,
-        take_ratios=take_ratios,
-    ):
+    for config in batch_configs:
         results.append(
             (
                 config,
@@ -468,6 +529,10 @@ def _run_backtest_with_loaded_data(
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> BacktestResult:
     terminal_open_position: BacktestOpenPosition | None = None
+    manual_positions: list[BacktestManualPosition] = []
+    manual_handoffs = 0
+    max_manual_positions = 0
+    max_total_occupied_slots = 0
     if is_dynamic_strategy_id(config.strategy_id):
         trades, terminal_open_position = _run_dynamic_backtest(
             candles,
@@ -490,12 +555,25 @@ def _run_backtest_with_loaded_data(
             config,
             taker_fee_rate=taker_fee_rate,
         )
+    elif is_slot_handoff_strategy_id(config.strategy_id):
+        (
+            trades,
+            manual_positions,
+            manual_handoffs,
+            max_manual_positions,
+            max_total_occupied_slots,
+        ) = _run_slot_handoff_backtest(
+            candles,
+            instrument,
+            config,
+            taker_fee_rate=taker_fee_rate,
+        )
     else:
         raise RuntimeError(f"鏆備笉鏀寔鐨勫洖娴嬬瓥鐣ワ細{config.strategy_id}")
     ema_values = ema([candle.close for candle in candles], config.ema_period) if candles else []
     trend_ema_values = ema([candle.close for candle in candles], config.trend_ema_period) if candles else []
     atr_values = atr(candles, config.atr_period) if candles else []
-    if is_dynamic_strategy_id(config.strategy_id):
+    if is_dynamic_strategy_id(config.strategy_id) or is_slot_handoff_strategy_id(config.strategy_id):
         big_ema_values: list[Decimal] = []
     else:
         big_ema_values = ema([candle.close for candle in candles], config.big_ema_period) if candles else []
@@ -503,7 +581,14 @@ def _run_backtest_with_loaded_data(
     equity_curve = _build_equity_curve(candles, trades)
     net_value_curve = [initial_capital + value for value in equity_curve]
     drawdown_curve, drawdown_pct_curve = _build_drawdown_curves(net_value_curve)
-    report = _build_report(trades, initial_capital=initial_capital)
+    report = _build_report(
+        trades,
+        initial_capital=initial_capital,
+        manual_handoffs=manual_handoffs,
+        manual_positions=manual_positions,
+        max_manual_positions=max_manual_positions,
+        max_total_occupied_slots=max_total_occupied_slots,
+    )
 
     return BacktestResult(
         candles=candles,
@@ -530,7 +615,9 @@ def _run_backtest_with_loaded_data(
         data_source_note=data_source_note,
         maker_fee_rate=maker_fee_rate,
         taker_fee_rate=taker_fee_rate,
-        slippage_rate=config.backtest_slippage_rate,
+        entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
+        exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
+        slippage_rate=config.resolved_backtest_exit_slippage_rate(),
         funding_rate=config.backtest_funding_rate,
         take_profit_mode=str(config.take_profit_mode),
         dynamic_two_r_break_even=bool(config.dynamic_two_r_break_even),
@@ -538,8 +625,89 @@ def _run_backtest_with_loaded_data(
         max_entries_per_trend=int(config.max_entries_per_trend),
         sizing_mode=config.backtest_sizing_mode,
         compounding=config.backtest_compounding,
+        backtest_profile_id=config.backtest_profile_id,
+        backtest_profile_name=config.backtest_profile_name,
+        backtest_profile_summary=config.backtest_profile_summary,
         open_position=terminal_open_position,
+        manual_positions=manual_positions,
     )
+
+
+def _manual_position_break_even_gap_pct(manual_position: BacktestManualPosition) -> Decimal:
+    gap_value = abs(manual_position.current_price - manual_position.break_even_price)
+    base_price = abs(manual_position.break_even_price)
+    if base_price <= 0:
+        base_price = abs(manual_position.entry_price)
+    if base_price <= 0:
+        return Decimal("0")
+    return (gap_value / base_price) * Decimal("100")
+
+
+def _manual_direction_pressure_text(manual_positions: list[BacktestManualPosition]) -> str:
+    parts: list[str] = []
+    for signal, label in (("long", "做多"), ("short", "做空")):
+        positions = [item for item in manual_positions if item.signal == signal]
+        if not positions:
+            continue
+        total_size = sum((item.size for item in positions), Decimal("0"))
+        total_pnl = sum((item.pnl for item in positions), Decimal("0"))
+        nearest_gap = min((_manual_position_break_even_gap_pct(item) for item in positions), default=Decimal("0"))
+        parts.append(
+            f"{label} {len(positions)} 笔 / {format_decimal_fixed(total_size, 4)} / "
+            f"浮盈亏 {format_decimal_fixed(total_pnl, 4)} / 最近保本 {format_decimal_fixed(nearest_gap, 2)}%"
+        )
+    return " | ".join(parts) if parts else "当前无待人工处理仓位。"
+
+
+def _manual_pool_pressure_lines(result: BacktestResult) -> list[str]:
+    report = result.report
+    slot_limit = result.max_entries_per_trend
+    slot_pressure_pct = (
+        Decimal("0")
+        if slot_limit <= 0
+        else (Decimal(report.max_total_occupied_slots) / Decimal(slot_limit)) * Decimal("100")
+    )
+    slot_pressure_text = (
+        f"{report.max_total_occupied_slots}/{slot_limit}"
+        if slot_limit > 0
+        else str(report.max_total_occupied_slots)
+    )
+    lines = [
+        (
+            f"人工接管压力：峰值占槽 {slot_pressure_text} ({format_decimal_fixed(slot_pressure_pct, 2)}%) | "
+            f"峰值人工池 {report.max_manual_positions} | 累计移交 {report.manual_handoffs}"
+        )
+    ]
+    if not result.manual_positions:
+        lines.append("人工池方向拆分：当前无待人工处理仓位。")
+        return lines
+
+    near_count = sum(
+        1
+        for position in result.manual_positions
+        if _manual_position_break_even_gap_pct(position) <= MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT
+    )
+    win_count = sum(1 for position in result.manual_positions if position.pnl > 0)
+    loss_count = sum(1 for position in result.manual_positions if position.pnl < 0)
+    entry_fees = sum((position.entry_fee for position in result.manual_positions), Decimal("0"))
+    funding_costs = sum((position.funding_cost for position in result.manual_positions), Decimal("0"))
+    risk_total = sum((position.risk_value for position in result.manual_positions), Decimal("0"))
+    nearest_gap = min((_manual_position_break_even_gap_pct(position) for position in result.manual_positions), default=Decimal("0"))
+
+    lines.extend(
+        [
+            f"人工池方向拆分：{_manual_direction_pressure_text(result.manual_positions)}",
+            (
+                f"人工池状态：盈利 {win_count} | 亏损 {loss_count} | "
+                f"接近保本 {near_count} | 最接近保本 {format_decimal_fixed(nearest_gap, 2)}%"
+            ),
+            (
+                f"人工池成本：开仓手续费 {format_decimal_fixed(entry_fees, 4)} | "
+                f"资金费 {format_decimal_fixed(funding_costs, 4)} | 风险值合计 {format_decimal_fixed(risk_total, 4)}"
+            ),
+        ]
+    )
+    return lines
 
 
 def format_backtest_report(result: BacktestResult) -> str:
@@ -565,7 +733,8 @@ def format_backtest_report(result: BacktestResult) -> str:
         f"复利模式：{'开启' if result.compounding else '关闭'}",
         f"Maker手续费：{_format_fee_rate_percent(result.maker_fee_rate)}",
         f"Taker手续费：{_format_fee_rate_percent(result.taker_fee_rate)}",
-        f"滑点：{_format_fee_rate_percent(result.slippage_rate)}",
+        f"开仓滑点：{_format_fee_rate_percent(result.entry_slippage_rate)}",
+        f"平仓滑点：{_format_fee_rate_percent(result.exit_slippage_rate)}",
         f"资金费率/8h：{_format_fee_rate_percent(result.funding_rate)}",
         f"交易次数：{report.total_trades}",
         f"胜率：{format_decimal_fixed(report.win_rate, 2)}%",
@@ -635,6 +804,25 @@ def format_backtest_report(result: BacktestResult) -> str:
             f"收盘价跌破/站回 EMA{result.trend_ema_period} 时按动态止损离场。"
         )
         lines.append("本策略不设固定止盈，回测使用收盘确认与收盘价离场。")
+    if is_slot_handoff_strategy_id(result.strategy_id):
+        direction_text = "做多" if "long" in result.strategy_id else "做空"
+        if result.backtest_profile_name:
+            lines.append(f"策略池候选：{result.backtest_profile_name}")
+        if result.backtest_profile_summary:
+            lines.append(f"候选说明：{result.backtest_profile_summary}")
+        lines.append(
+            f"槽位策略：{direction_text}方向仅在 EMA{result.ema_period} 突破并通过 EMA{result.trend_ema_period} 过滤时开仓。"
+        )
+        lines.append(
+            f"槽位上限：{result.max_entries_per_trend} | 自动规则：止盈触发自动平仓，信号失效但净盈利大于 0 时平仓，否则转人工池。"
+        )
+        lines.append(f"人工移交次数：{report.manual_handoffs}")
+        lines.append(f"期末人工池笔数：{report.manual_open_positions}")
+        lines.append(f"期末人工池数量：{format_decimal_fixed(report.manual_open_size, 4)}")
+        lines.append(f"期末人工池浮盈亏：{format_decimal_fixed(report.manual_open_pnl, 4)}")
+        lines.append(f"最大人工池占用：{report.max_manual_positions}")
+        lines.append(f"最大总占用槽位：{report.max_total_occupied_slots}")
+        lines.extend(_manual_pool_pressure_lines(result))
     if report.profit_factor is None:
         lines.append("Profit Factor：无亏损交易")
     else:
@@ -675,6 +863,22 @@ def format_backtest_report(result: BacktestResult) -> str:
                 f"资金费：{format_decimal_fixed(open_position.funding_cost, 4)}",
             ]
         )
+    if result.manual_positions:
+        lines.append("期末人工池：")
+        for index, manual_position in enumerate(result.manual_positions, start=1):
+            direction_text = "做多" if manual_position.signal == "long" else "做空"
+            lines.append(
+                f"[{index}] {direction_text} | 开仓={_format_backtest_timestamp(manual_position.entry_ts)} "
+                f"| 移交={_format_backtest_timestamp(manual_position.handoff_ts)} | 数量={format_decimal_fixed(manual_position.size, 4)}"
+            )
+            lines.append(
+                f"    开仓价={format_decimal_fixed(manual_position.entry_price, 4)} | 当前价={format_decimal_fixed(manual_position.current_price, 4)} "
+                f"| 保本价={format_decimal_fixed(manual_position.break_even_price, 4)}"
+            )
+            lines.append(
+                f"    浮盈亏={format_decimal_fixed(manual_position.pnl, 4)} | 手续费={format_decimal_fixed(manual_position.entry_fee, 4)} "
+                f"| 资金费={format_decimal_fixed(manual_position.funding_cost, 4)} | 原因={manual_position.handoff_reason}"
+            )
     return "\n".join(lines)
 
 
@@ -727,6 +931,12 @@ def _required_backtest_preload_candles(config: StrategyConfig) -> int:
             config.trend_ema_period + 2,
             config.big_ema_period + 2,
             config.atr_period + 2,
+        )
+    elif is_slot_handoff_strategy_id(config.strategy_id):
+        minimum = max(
+            config.ema_period + 2,
+            config.trend_ema_period + 1,
+            config.atr_period + 1,
         )
     elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         minimum = max(config.ema_period, config.trend_ema_period) + 1
@@ -814,7 +1024,7 @@ def _run_ema5_ema8_backtest(
                     exit_price_raw,
                     signal=open_position.signal,
                     tick_size=open_position.tick_size,
-                    slippage_rate=open_position.slippage_rate,
+                    slippage_rate=open_position.exit_slippage_rate,
                     is_entry=False,
                 )
                 trades.append(
@@ -858,8 +1068,10 @@ def _run_ema5_ema8_backtest(
             atr_value=decision.atr_value,
             size=size,
             entry_fee_rate=taker_fee_rate,
+            exit_fee_rate=taker_fee_rate,
             entry_fee_type="taker",
-            slippage_rate=config.backtest_slippage_rate,
+            entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
+            exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
             funding_rate=config.backtest_funding_rate,
         )
 
@@ -935,8 +1147,10 @@ def _run_cross_backtest(
             atr_value=plan.atr_value,
             size=plan.size,
             entry_fee_rate=taker_fee_rate,
+            exit_fee_rate=taker_fee_rate,
             entry_fee_type="taker",
-            slippage_rate=config.backtest_slippage_rate,
+            entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
+            exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
             funding_rate=config.backtest_funding_rate,
         )
 
@@ -1002,7 +1216,8 @@ def _run_dynamic_backtest(
                 index,
                 entry_fee_rate=maker_fee_rate,
                 entry_fee_type="maker",
-                slippage_rate=config.backtest_slippage_rate,
+                entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
+                exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
                 funding_rate=config.backtest_funding_rate,
                 entry_sequence=entry_sequence + 1,
                 dynamic_take_profit_enabled=dynamic_take_profit_enabled,
@@ -1076,7 +1291,7 @@ def _run_dynamic_backtest(
         funding_periods = Decimal(str(max(last_candle.ts - open_position.entry_ts, 0))) / Decimal("28800000")
         funding_cost = abs(open_position.entry_price * open_position.size) * open_position.funding_rate * funding_periods
         pnl = gross_pnl - entry_fee - funding_cost
-        risk_value = abs(open_position.entry_price - open_position.stop_loss) * open_position.size
+        risk_value = abs(_position_strategy_entry_price(open_position) - open_position.stop_loss) * open_position.size
         r_multiple = Decimal("0") if risk_value == 0 else pnl / risk_value
         terminal_open_position = BacktestOpenPosition(
             signal=open_position.signal,
@@ -1099,6 +1314,131 @@ def _run_dynamic_backtest(
         )
 
     return trades, terminal_open_position
+
+
+def _run_slot_handoff_backtest(
+    candles: list[Candle],
+    instrument: Instrument,
+    config: StrategyConfig,
+    *,
+    taker_fee_rate: Decimal = Decimal("0"),
+) -> tuple[list[BacktestTrade], list[BacktestManualPosition], int, int, int]:
+    if config.backtest_sizing_mode != "fixed_size":
+        raise RuntimeError("槽位接管策略当前只支持固定数量回测。")
+    if config.order_size <= 0:
+        raise RuntimeError("槽位接管策略的固定数量必须大于 0。")
+    if config.max_entries_per_trend <= 0:
+        raise RuntimeError("槽位接管策略的最大槽位数必须大于 0。")
+
+    strategy = EmaSlotHandoffStrategy()
+    minimum = max(
+        config.ema_period + 2,
+        config.trend_ema_period + 1,
+        config.atr_period + 1,
+    )
+    if len(candles) < minimum:
+        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根。")
+
+    trade_start_index = _backtest_trade_start_index(minimum)
+    if len(candles) <= trade_start_index:
+        return [], [], 0, 0, 0
+
+    trades: list[BacktestTrade] = []
+    active_positions: list[_OpenPosition] = []
+    manual_pool: list[_ManualPosition] = []
+    manual_handoffs = 0
+    max_manual_positions = 0
+    max_total_occupied_slots = 0
+
+    for index in range(trade_start_index, len(candles)):
+        candle = candles[index]
+        surviving_positions: list[_OpenPosition] = []
+
+        for position in active_positions:
+            take_profit_trade = _try_close_take_profit_only(
+                position,
+                candle,
+                index,
+                exit_fee_rate=taker_fee_rate,
+                exit_fee_type="taker",
+            )
+            if take_profit_trade is not None:
+                trades.append(take_profit_trade)
+                continue
+
+            invalidated, _, invalidation_reason = strategy.signal_invalidated(candles[: index + 1], config, position.signal)
+            if not invalidated:
+                surviving_positions.append(position)
+                continue
+
+            closed_trade, manual_position = _try_close_slot_position_on_signal(
+                position,
+                candle,
+                index,
+                invalidation_reason=invalidation_reason,
+                exit_fee_rate=taker_fee_rate,
+                exit_fee_type="taker",
+            )
+            if closed_trade is not None:
+                trades.append(closed_trade)
+            elif manual_position is not None:
+                manual_pool.append(manual_position)
+                manual_handoffs += 1
+
+        active_positions = surviving_positions
+        max_manual_positions = max(max_manual_positions, len(manual_pool))
+        max_total_occupied_slots = max(max_total_occupied_slots, len(active_positions) + len(manual_pool))
+
+        if index >= len(candles) - 1:
+            continue
+        if len(active_positions) + len(manual_pool) >= config.max_entries_per_trend:
+            continue
+
+        decision = strategy.evaluate(candles[: index + 1], config)
+        if decision.signal is None:
+            continue
+        if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
+            continue
+
+        resolved_config = _resolve_backtest_config(config, trades)
+        plan = _build_backtest_order_plan(
+            instrument=instrument,
+            config=resolved_config,
+            order_size=resolved_config.order_size,
+            signal=decision.signal,
+            entry_reference=decision.entry_reference,
+            atr_value=decision.atr_value,
+            candle_ts=decision.candle_ts,
+            signal_candle_high=decision.signal_candle_high,
+            signal_candle_low=decision.signal_candle_low,
+        )
+        active_positions.append(
+            _create_open_position(
+                instrument=instrument,
+                signal=plan.signal,
+                entry_index=index,
+                entry_ts=plan.candle_ts,
+                entry_price_raw=plan.entry_reference,
+                stop_loss=plan.stop_loss,
+                take_profit=plan.take_profit,
+                atr_value=plan.atr_value,
+                size=plan.size,
+                entry_fee_rate=taker_fee_rate,
+                exit_fee_rate=taker_fee_rate,
+                entry_fee_type="taker",
+                entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
+                exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
+                funding_rate=config.backtest_funding_rate,
+            )
+        )
+        max_total_occupied_slots = max(max_total_occupied_slots, len(active_positions) + len(manual_pool))
+
+    last_candle = candles[-1]
+    manual_positions = [
+        _build_manual_backtest_position(item, last_candle)
+        for item in manual_pool
+    ]
+    return trades, manual_positions, manual_handoffs, max_manual_positions, max_total_occupied_slots
 
 
 def _evaluate_dynamic_signal_precomputed(
@@ -1268,8 +1608,10 @@ def _create_open_position(
     atr_value: Decimal,
     size: Decimal,
     entry_fee_rate: Decimal,
+    exit_fee_rate: Decimal,
     entry_fee_type: str,
-    slippage_rate: Decimal,
+    entry_slippage_rate: Decimal,
+    exit_slippage_rate: Decimal,
     funding_rate: Decimal,
     entry_sequence: int = 0,
     dynamic_take_profit_enabled: bool = False,
@@ -1278,15 +1620,21 @@ def _create_open_position(
     dynamic_fee_offset_enabled: bool = True,
     next_dynamic_trigger_r: int = 2,
     current_take_profit: Decimal | None = None,
+    apply_entry_slippage: bool = True,
 ) -> _OpenPosition:
-    entry_price = _apply_slippage_price(
-        entry_price_raw,
-        signal=signal,
-        tick_size=instrument.tick_size,
-        slippage_rate=slippage_rate,
-        is_entry=True,
+    strategy_entry_price = entry_price_raw
+    entry_price = (
+        _apply_slippage_price(
+            entry_price_raw,
+            signal=signal,
+            tick_size=instrument.tick_size,
+            slippage_rate=entry_slippage_rate,
+            is_entry=True,
+        )
+        if apply_entry_slippage
+        else strategy_entry_price
     )
-    risk_per_unit = abs(entry_price - stop_loss)
+    risk_per_unit = abs(strategy_entry_price - stop_loss)
     display_take_profit = take_profit if current_take_profit is None else current_take_profit
     open_position = _OpenPosition(
         signal=signal,
@@ -1309,14 +1657,159 @@ def _create_open_position(
         dynamic_two_r_break_even=dynamic_two_r_break_even,
         dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
         entry_fee_rate=entry_fee_rate,
+        estimated_exit_fee_rate=exit_fee_rate,
         entry_fee_type=entry_fee_type,
-        entry_slippage_cost=abs(entry_price - entry_price_raw) * abs(size),
-        slippage_rate=slippage_rate,
+        entry_slippage_cost=abs(entry_price - strategy_entry_price) * abs(size),
+        entry_slippage_rate=entry_slippage_rate,
+        exit_slippage_rate=exit_slippage_rate,
+        slippage_rate=exit_slippage_rate,
         funding_rate=funding_rate if instrument.inst_type == "SWAP" else Decimal("0"),
     )
     if current_take_profit is None and dynamic_take_profit_enabled:
         open_position.take_profit = _dynamic_trigger_price(open_position, next_dynamic_trigger_r)
     return open_position
+
+
+def _try_close_take_profit_only(
+    position: _OpenPosition,
+    candle: Candle,
+    candle_index: int,
+    *,
+    exit_fee_rate: Decimal = Decimal("0"),
+    exit_fee_type: str = "none",
+) -> BacktestTrade | None:
+    take_profit_hit = candle.high >= position.take_profit if position.signal == "long" else candle.low <= position.take_profit
+    if not take_profit_hit:
+        return None
+    exit_price_raw = position.take_profit
+    exit_price = _apply_slippage_price(
+        exit_price_raw,
+        signal=position.signal,
+        tick_size=position.tick_size,
+        slippage_rate=position.exit_slippage_rate,
+        is_entry=False,
+    )
+    return _build_closed_trade(
+        position,
+        candle,
+        candle_index,
+        exit_price_raw=exit_price_raw,
+        exit_price=exit_price,
+        exit_reason="take_profit",
+        exit_fee_rate=exit_fee_rate,
+        exit_fee_type=exit_fee_type,
+    )
+
+
+def _try_close_slot_position_on_signal(
+    position: _OpenPosition,
+    candle: Candle,
+    candle_index: int,
+    *,
+    invalidation_reason: str,
+    exit_fee_rate: Decimal = Decimal("0"),
+    exit_fee_type: str = "none",
+) -> tuple[BacktestTrade | None, _ManualPosition | None]:
+    exit_price_raw = candle.close
+    exit_price = _apply_slippage_price(
+        exit_price_raw,
+        signal=position.signal,
+        tick_size=position.tick_size,
+        slippage_rate=position.exit_slippage_rate,
+        is_entry=False,
+    )
+    candidate_trade = _build_closed_trade(
+        position,
+        candle,
+        candle_index,
+        exit_price_raw=exit_price_raw,
+        exit_price=exit_price,
+        exit_reason="signal_profit_exit",
+        exit_fee_rate=exit_fee_rate,
+        exit_fee_type=exit_fee_type,
+    )
+    if candidate_trade.pnl > 0:
+        return candidate_trade, None
+    return None, _ManualPosition(
+        position=position,
+        handoff_index=candle_index,
+        handoff_ts=candle.ts,
+        handoff_price_raw=exit_price_raw,
+        handoff_reason=invalidation_reason,
+    )
+
+
+def _build_manual_backtest_position(position: _ManualPosition, current_candle: Candle) -> BacktestManualPosition:
+    open_position = position.position
+    current_price = current_candle.close
+    if open_position.signal == "long":
+        gross_pnl = (current_price - open_position.entry_price) * open_position.size
+    else:
+        gross_pnl = (open_position.entry_price - current_price) * open_position.size
+    entry_fee = abs(open_position.entry_price * open_position.size) * open_position.entry_fee_rate
+    funding_periods = Decimal(str(max(current_candle.ts - open_position.entry_ts, 0))) / Decimal("28800000")
+    funding_cost = abs(open_position.entry_price * open_position.size) * open_position.funding_rate * funding_periods
+    pnl = gross_pnl - entry_fee - funding_cost
+    risk_value = abs(_position_strategy_entry_price(open_position) - open_position.initial_stop_loss) * open_position.size
+    r_multiple = Decimal("0") if risk_value == 0 else pnl / risk_value
+    break_even_price = _estimate_manual_break_even_price(
+        open_position,
+        entry_fee=entry_fee,
+        funding_cost=funding_cost,
+    )
+    return BacktestManualPosition(
+        signal=open_position.signal,
+        entry_index=open_position.entry_index,
+        handoff_index=position.handoff_index,
+        entry_ts=open_position.entry_ts,
+        handoff_ts=position.handoff_ts,
+        current_ts=current_candle.ts,
+        entry_price=open_position.entry_price,
+        handoff_price=position.handoff_price_raw,
+        current_price=current_price,
+        stop_loss=open_position.initial_stop_loss,
+        take_profit=open_position.initial_take_profit,
+        size=open_position.size,
+        gross_pnl=gross_pnl,
+        pnl=pnl,
+        risk_value=risk_value,
+        r_multiple=r_multiple,
+        break_even_price=break_even_price,
+        handoff_reason=position.handoff_reason,
+        atr_value=open_position.atr_value,
+        entry_sequence=open_position.entry_sequence,
+        entry_fee=entry_fee,
+        funding_cost=funding_cost,
+    )
+
+
+def _estimate_manual_break_even_price(
+    position: _OpenPosition,
+    *,
+    entry_fee: Decimal,
+    funding_cost: Decimal,
+) -> Decimal:
+    size = abs(position.size)
+    if size <= 0:
+        return position.entry_price
+    carrying_cost_per_unit = (entry_fee + funding_cost) / size
+    exit_fee_rate = position.estimated_exit_fee_rate
+    slippage_rate = position.exit_slippage_rate
+
+    if position.signal == "long":
+        multiplier = (Decimal("1") - slippage_rate) * (Decimal("1") - exit_fee_rate)
+        if multiplier <= 0:
+            return position.entry_price
+        raw_price = (position.entry_price + carrying_cost_per_unit) / multiplier
+        return snap_to_increment(raw_price, position.tick_size, "up")
+
+    multiplier = (Decimal("1") + slippage_rate) * (Decimal("1") + exit_fee_rate)
+    if multiplier <= 0:
+        return position.entry_price
+    raw_price = (position.entry_price - carrying_cost_per_unit) / multiplier
+    if raw_price <= 0:
+        return position.tick_size
+    return snap_to_increment(raw_price, position.tick_size, "down")
 
 
 def _try_fill_dynamic_order(
@@ -1327,7 +1820,8 @@ def _try_fill_dynamic_order(
     *,
     entry_fee_rate: Decimal = Decimal("0"),
     entry_fee_type: str = "none",
-    slippage_rate: Decimal = Decimal("0"),
+    entry_slippage_rate: Decimal = Decimal("0"),
+    exit_slippage_rate: Decimal = Decimal("0"),
     funding_rate: Decimal = Decimal("0"),
     entry_sequence: int = 0,
     dynamic_take_profit_enabled: bool = False,
@@ -1350,14 +1844,17 @@ def _try_fill_dynamic_order(
         atr_value=plan.atr_value,
         size=plan.size,
         entry_fee_rate=entry_fee_rate,
+        exit_fee_rate=dynamic_exit_fee_rate,
         entry_fee_type=entry_fee_type,
-        slippage_rate=slippage_rate,
+        entry_slippage_rate=entry_slippage_rate,
+        exit_slippage_rate=exit_slippage_rate,
         funding_rate=funding_rate,
         entry_sequence=entry_sequence,
         dynamic_take_profit_enabled=dynamic_take_profit_enabled,
         dynamic_exit_fee_rate=dynamic_exit_fee_rate,
         dynamic_two_r_break_even=dynamic_two_r_break_even,
         dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+        apply_entry_slippage=False,
     )
 
 
@@ -1417,32 +1914,38 @@ def _dynamic_fee_offset(entry_price: Decimal, exit_fee_rate: Decimal, *, enabled
     return abs(entry_price) * exit_fee_rate * Decimal("2")
 
 
+def _position_strategy_entry_price(position: _OpenPosition) -> Decimal:
+    return position.entry_price_raw if position.entry_price_raw > 0 else position.entry_price
+
+
 def _dynamic_trigger_price(position: _OpenPosition, trigger_r: int) -> Decimal:
+    entry_price = _position_strategy_entry_price(position)
     fee_offset = _dynamic_fee_offset(
-        position.entry_price,
+        entry_price,
         position.dynamic_exit_fee_rate,
         enabled=position.dynamic_fee_offset_enabled,
     )
     offset = (position.risk_per_unit * Decimal(str(trigger_r))) + fee_offset
-    raw = position.entry_price + offset if position.signal == "long" else position.entry_price - offset
+    raw = entry_price + offset if position.signal == "long" else entry_price - offset
     rounding = "up" if position.signal == "long" else "down"
     return snap_to_increment(raw, position.tick_size, rounding)
 
 
 def _dynamic_stop_price(position: _OpenPosition, trigger_r: int) -> Decimal:
+    entry_price = _position_strategy_entry_price(position)
     lock_multiple = max(trigger_r - 1, 0)
     if position.dynamic_two_r_break_even and trigger_r == 2:
         lock_multiple = 0
     locked_offset = position.risk_per_unit * Decimal(str(lock_multiple))
     fee_offset = _dynamic_fee_offset(
-        position.entry_price,
+        entry_price,
         position.dynamic_exit_fee_rate,
         enabled=position.dynamic_fee_offset_enabled,
     )
     raw = (
-        position.entry_price + locked_offset + fee_offset
+        entry_price + locked_offset + fee_offset
         if position.signal == "long"
-        else position.entry_price - locked_offset - fee_offset
+        else entry_price - locked_offset - fee_offset
     )
     rounding = "up" if position.signal == "long" else "down"
     return snap_to_increment(raw, position.tick_size, rounding)
@@ -1509,7 +2012,8 @@ def _build_closed_trade(
     funding_periods = Decimal(str(max(candle.ts - position.entry_ts, 0))) / Decimal("28800000")
     funding_cost = abs(position.entry_price * position.size) * position.funding_rate * funding_periods
     pnl = gross_pnl - total_fee - funding_cost
-    risk_value = abs(position.entry_price - position.initial_stop_loss) * position.size
+    strategy_entry_price = _position_strategy_entry_price(position)
+    risk_value = abs(strategy_entry_price - position.initial_stop_loss) * position.size
     r_multiple = Decimal("0") if risk_value == 0 else pnl / risk_value
     slippage_cost = position.entry_slippage_cost + (abs(exit_price - exit_price_raw) * abs(position.size))
     return BacktestTrade(
@@ -1525,7 +2029,7 @@ def _build_closed_trade(
         size=position.size,
         gross_pnl=gross_pnl,
         pnl=pnl,
-        risk_value=abs(position.entry_price - position.initial_stop_loss) * position.size,
+        risk_value=risk_value,
         r_multiple=r_multiple,
         exit_reason=exit_reason,
         atr_value=position.atr_value,
@@ -1552,7 +2056,7 @@ def _try_close_position_same_candle_after_fill(
     if path_points is None:
         return None
 
-    entry_price = position.entry_price
+    entry_price = _position_strategy_entry_price(position)
     entry_reached = False
     segment_start = path_points[0]
 
@@ -1580,7 +2084,7 @@ def _try_close_position_same_candle_after_fill(
                     exit_price_raw,
                     signal=position.signal,
                     tick_size=position.tick_size,
-                    slippage_rate=position.slippage_rate,
+                    slippage_rate=position.exit_slippage_rate,
                     is_entry=False,
                 )
                 return _build_closed_trade(
@@ -1614,7 +2118,7 @@ def _try_close_position_same_candle_after_fill(
                     exit_price_raw,
                     signal=position.signal,
                     tick_size=position.tick_size,
-                    slippage_rate=position.slippage_rate,
+                    slippage_rate=position.exit_slippage_rate,
                     is_entry=False,
                 )
                 return _build_closed_trade(
@@ -1660,7 +2164,7 @@ def _try_close_position(
                     exit_price_raw,
                     signal=position.signal,
                     tick_size=position.tick_size,
-                    slippage_rate=position.slippage_rate,
+                    slippage_rate=position.exit_slippage_rate,
                     is_entry=False,
                 )
                 return _build_closed_trade(
@@ -1702,7 +2206,7 @@ def _try_close_position(
         exit_price_raw,
         signal=position.signal,
         tick_size=position.tick_size,
-        slippage_rate=position.slippage_rate,
+        slippage_rate=position.exit_slippage_rate,
         is_entry=False,
     )
     return _build_closed_trade(
@@ -1809,7 +2313,18 @@ def _build_period_stats(
     return stats
 
 
-def _build_report(trades: list[BacktestTrade], *, initial_capital: Decimal) -> BacktestReport:
+def _build_report(
+    trades: list[BacktestTrade],
+    *,
+    initial_capital: Decimal,
+    manual_handoffs: int = 0,
+    manual_positions: list[BacktestManualPosition] | None = None,
+    max_manual_positions: int = 0,
+    max_total_occupied_slots: int = 0,
+) -> BacktestReport:
+    manual_positions = manual_positions or []
+    manual_open_size = sum((position.size for position in manual_positions), Decimal("0"))
+    manual_open_pnl = sum((position.pnl for position in manual_positions), Decimal("0"))
     total_trades = len(trades)
     if total_trades == 0:
         return BacktestReport(
@@ -1838,6 +2353,12 @@ def _build_report(trades: list[BacktestTrade], *, initial_capital: Decimal) -> B
             total_fees=Decimal("0"),
             slippage_costs=Decimal("0"),
             funding_costs=Decimal("0"),
+            manual_handoffs=manual_handoffs,
+            manual_open_positions=len(manual_positions),
+            manual_open_size=manual_open_size,
+            manual_open_pnl=manual_open_pnl,
+            max_manual_positions=max_manual_positions,
+            max_total_occupied_slots=max_total_occupied_slots,
         )
 
     wins = [trade for trade in trades if trade.pnl > 0]
@@ -1907,6 +2428,12 @@ def _build_report(trades: list[BacktestTrade], *, initial_capital: Decimal) -> B
         total_fees=total_fees,
         slippage_costs=slippage_costs,
         funding_costs=funding_costs,
+        manual_handoffs=manual_handoffs,
+        manual_open_positions=len(manual_positions),
+        manual_open_size=manual_open_size,
+        manual_open_pnl=manual_open_pnl,
+        max_manual_positions=max_manual_positions,
+        max_total_occupied_slots=max_total_occupied_slots,
     )
 
 

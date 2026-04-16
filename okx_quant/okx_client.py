@@ -148,6 +148,46 @@ class OkxPositionHistoryItem:
 
 
 @dataclass(frozen=True)
+class OkxTradeOrderItem:
+    source_kind: str
+    source_label: str
+    created_time: int | None
+    update_time: int | None
+    inst_id: str
+    inst_type: str
+    side: str | None
+    pos_side: str | None
+    td_mode: str | None
+    ord_type: str | None
+    state: str | None
+    price: Decimal | None
+    size: Decimal | None
+    filled_size: Decimal | None
+    avg_price: Decimal | None
+    order_id: str | None
+    algo_id: str | None
+    client_order_id: str | None
+    algo_client_order_id: str | None
+    pnl: Decimal | None
+    fee: Decimal | None
+    fee_currency: str | None
+    reduce_only: bool | None
+    trigger_price: Decimal | None
+    trigger_price_type: str | None
+    order_price: Decimal | None
+    actual_price: Decimal | None
+    actual_size: Decimal | None
+    actual_side: str | None
+    take_profit_trigger_price: Decimal | None
+    take_profit_order_price: Decimal | None
+    take_profit_trigger_price_type: str | None
+    stop_loss_trigger_price: Decimal | None
+    stop_loss_order_price: Decimal | None
+    stop_loss_trigger_price_type: str | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class OkxAccountAssetItem:
     ccy: str
     equity: Decimal | None
@@ -904,11 +944,230 @@ class OkxRestClient:
         items.sort(key=lambda item: item.update_time or 0, reverse=True)
         return items[:limit]
 
+    def get_pending_orders(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION", "SPOT"),
+        limit: int = 100,
+    ) -> list[OkxTradeOrderItem]:
+        items: list[OkxTradeOrderItem] = []
+        normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
+        per_type_target = max(1, math.ceil(limit / max(len(normalized_types), 1)))
+        request_limit = min(100, max(1, per_type_target))
+        for inst_type in normalized_types:
+            payload = self._request(
+                "GET",
+                "/api/v5/trade/orders-pending",
+                params={"instType": inst_type, "limit": str(request_limit)},
+                auth=True,
+                credentials=credentials,
+                simulated=environment == "demo",
+            )
+            for item in payload.get("data", []):
+                items.append(self._parse_trade_order_item(item, default_inst_type=inst_type, source_kind="normal"))
+        items.extend(
+            self._fetch_algo_orders(
+                credentials=credentials,
+                environment=environment,
+                limit=limit,
+                history=False,
+            )
+        )
+        items.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
+        return items[:limit]
+
+    def get_order_history(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION", "SPOT"),
+        limit: int = 100,
+    ) -> list[OkxTradeOrderItem]:
+        items: list[OkxTradeOrderItem] = []
+        normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
+        per_type_target = max(1, math.ceil(limit / max(len(normalized_types), 1)))
+        request_limit = min(100, max(1, per_type_target))
+        for inst_type in normalized_types:
+            payload = self._request(
+                "GET",
+                "/api/v5/trade/orders-history",
+                params={"instType": inst_type, "limit": str(request_limit)},
+                auth=True,
+                credentials=credentials,
+                simulated=environment == "demo",
+            )
+            for item in payload.get("data", []):
+                items.append(self._parse_trade_order_item(item, default_inst_type=inst_type, source_kind="normal"))
+        items.extend(
+            self._fetch_algo_orders(
+                credentials=credentials,
+                environment=environment,
+                limit=limit,
+                history=True,
+            )
+        )
+        items.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
+        return items[:limit]
+
+    def _fetch_algo_orders(
+        self,
+        *,
+        credentials: Credentials,
+        environment: str,
+        limit: int,
+        history: bool,
+    ) -> list[OkxTradeOrderItem]:
+        endpoint = "/api/v5/trade/orders-algo-history" if history else "/api/v5/trade/orders-algo-pending"
+        ord_types = ("conditional", "oco", "trigger", "move_order_stop")
+        states = ("effective", "canceled", "order_failed") if history else ("",)
+        request_limit = min(100, max(20, limit))
+        items: list[OkxTradeOrderItem] = []
+        seen_keys: set[tuple[str, str, str, int]] = set()
+        for ord_type in ord_types:
+            for state in states:
+                params = {"ordType": ord_type, "limit": str(request_limit)}
+                if state:
+                    params["state"] = state
+                try:
+                    payload = self._request(
+                        "GET",
+                        endpoint,
+                        params=params,
+                        auth=True,
+                        credentials=credentials,
+                        simulated=environment == "demo",
+                    )
+                except Exception:
+                    continue
+                for item in payload.get("data", []):
+                    parsed = self._parse_trade_order_item(item, default_inst_type="", source_kind="algo")
+                    key = (
+                        parsed.algo_id or "",
+                        parsed.order_id or "",
+                        parsed.algo_client_order_id or parsed.client_order_id or "",
+                        parsed.created_time or 0,
+                    )
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    items.append(parsed)
+        return items
+
+    def _parse_trade_order_item(
+        self,
+        item: dict[str, Any],
+        *,
+        default_inst_type: str,
+        source_kind: str,
+    ) -> OkxTradeOrderItem:
+        if source_kind == "algo":
+            return self._parse_algo_order_item(item, default_inst_type=default_inst_type)
+        return self._parse_normal_order_item(item, default_inst_type=default_inst_type)
+
+    def _parse_normal_order_item(
+        self,
+        item: dict[str, Any],
+        *,
+        default_inst_type: str,
+    ) -> OkxTradeOrderItem:
+        inst_id = str(item.get("instId") or "").strip().upper()
+        tp_sl = _extract_tp_sl_fields(item)
+        return OkxTradeOrderItem(
+            source_kind="normal",
+            source_label="普通委托",
+            created_time=_to_int(item.get("cTime"), item.get("ts")),
+            update_time=_to_int(item.get("uTime"), item.get("fillTime"), item.get("ts")),
+            inst_id=inst_id,
+            inst_type=str(item.get("instType") or default_inst_type or infer_inst_type(inst_id)).upper(),
+            side=item.get("side"),
+            pos_side=item.get("posSide"),
+            td_mode=item.get("tdMode"),
+            ord_type=item.get("ordType"),
+            state=item.get("state"),
+            price=_to_decimal(item.get("px")),
+            size=_first_decimal(item.get("sz"), item.get("qty")),
+            filled_size=_first_decimal(item.get("accFillSz"), item.get("fillSz")),
+            avg_price=_first_decimal(item.get("avgPx"), item.get("fillPx")),
+            order_id=item.get("ordId"),
+            algo_id=item.get("algoId"),
+            client_order_id=item.get("clOrdId"),
+            algo_client_order_id=item.get("algoClOrdId"),
+            pnl=_to_decimal(item.get("pnl")),
+            fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+            fee_currency=item.get("feeCcy") or item.get("fillFeeCcy"),
+            reduce_only=_to_bool(item.get("reduceOnly")),
+            trigger_price=None,
+            trigger_price_type=None,
+            order_price=_to_decimal(item.get("px")),
+            actual_price=_first_decimal(item.get("avgPx"), item.get("fillPx")),
+            actual_size=_first_decimal(item.get("accFillSz"), item.get("fillSz")),
+            actual_side=item.get("side"),
+            take_profit_trigger_price=tp_sl["take_profit_trigger_price"],
+            take_profit_order_price=tp_sl["take_profit_order_price"],
+            take_profit_trigger_price_type=tp_sl["take_profit_trigger_price_type"],
+            stop_loss_trigger_price=tp_sl["stop_loss_trigger_price"],
+            stop_loss_order_price=tp_sl["stop_loss_order_price"],
+            stop_loss_trigger_price_type=tp_sl["stop_loss_trigger_price_type"],
+            raw=item,
+        )
+
+    def _parse_algo_order_item(
+        self,
+        item: dict[str, Any],
+        *,
+        default_inst_type: str,
+    ) -> OkxTradeOrderItem:
+        inst_id = str(item.get("instId") or "").strip().upper()
+        tp_sl = _extract_tp_sl_fields(item)
+        return OkxTradeOrderItem(
+            source_kind="algo",
+            source_label="算法委托",
+            created_time=_to_int(item.get("cTime"), item.get("ts")),
+            update_time=_to_int(item.get("uTime"), item.get("triggerTime"), item.get("actualTime"), item.get("ts")),
+            inst_id=inst_id,
+            inst_type=str(item.get("instType") or default_inst_type or infer_inst_type(inst_id)).upper(),
+            side=item.get("side"),
+            pos_side=item.get("posSide"),
+            td_mode=item.get("tdMode"),
+            ord_type=item.get("ordType"),
+            state=item.get("state"),
+            price=_first_decimal(item.get("px"), item.get("actualPx")),
+            size=_first_decimal(item.get("sz"), item.get("closeFraction")),
+            filled_size=_first_decimal(item.get("actualSz"), item.get("accFillSz")),
+            avg_price=_first_decimal(item.get("actualPx"), item.get("avgPx")),
+            order_id=item.get("ordId") or item.get("actualOrdId"),
+            algo_id=item.get("algoId"),
+            client_order_id=item.get("clOrdId") or item.get("attachAlgoClOrdId"),
+            algo_client_order_id=item.get("algoClOrdId"),
+            pnl=_to_decimal(item.get("pnl")),
+            fee=_first_decimal(item.get("fee"), item.get("actualFee")),
+            fee_currency=item.get("feeCcy") or item.get("feeCurrency"),
+            reduce_only=_to_bool(item.get("reduceOnly")),
+            trigger_price=_first_decimal(item.get("triggerPx"), item.get("activePx")),
+            trigger_price_type=item.get("triggerPxType"),
+            order_price=_first_decimal(item.get("orderPx"), item.get("px")),
+            actual_price=_first_decimal(item.get("actualPx"), item.get("avgPx")),
+            actual_size=_first_decimal(item.get("actualSz"), item.get("accFillSz")),
+            actual_side=item.get("actualSide"),
+            take_profit_trigger_price=tp_sl["take_profit_trigger_price"],
+            take_profit_order_price=tp_sl["take_profit_order_price"],
+            take_profit_trigger_price_type=tp_sl["take_profit_trigger_price_type"],
+            stop_loss_trigger_price=tp_sl["stop_loss_trigger_price"],
+            stop_loss_order_price=tp_sl["stop_loss_order_price"],
+            stop_loss_trigger_price_type=tp_sl["stop_loss_trigger_price_type"],
+            raw=item,
+        )
+
     def place_market_order(
         self,
         credentials: Credentials,
         config: StrategyConfig,
         plan: OrderPlan,
+        *,
+        cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
@@ -933,6 +1192,8 @@ class OkxRestClient:
         }
         if plan.pos_side:
             order["posSide"] = plan.pos_side
+        if cl_ord_id:
+            order["clOrdId"] = cl_ord_id
 
         payload = self._request(
             "POST",
@@ -942,13 +1203,19 @@ class OkxRestClient:
             credentials=credentials,
             simulated=config.environment == "demo",
         )
-        return self._parse_order_result(payload, empty_message="OKX 返回了空的市价下单结果")
+        return self._parse_order_result(
+            payload,
+            empty_message="OKX 返回了空的市价下单结果",
+            fallback_cl_ord_id=cl_ord_id,
+        )
 
     def place_limit_order(
         self,
         credentials: Credentials,
         config: StrategyConfig,
         plan: OrderPlan,
+        *,
+        cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
@@ -974,6 +1241,8 @@ class OkxRestClient:
         }
         if plan.pos_side:
             order["posSide"] = plan.pos_side
+        if cl_ord_id:
+            order["clOrdId"] = cl_ord_id
 
         payload = self._request(
             "POST",
@@ -983,7 +1252,11 @@ class OkxRestClient:
             credentials=credentials,
             simulated=config.environment == "demo",
         )
-        return self._parse_order_result(payload, empty_message="OKX 返回了空的限价下单结果")
+        return self._parse_order_result(
+            payload,
+            empty_message="OKX 返回了空的限价下单结果",
+            fallback_cl_ord_id=cl_ord_id,
+        )
 
     def place_simple_order(
         self,
@@ -1020,7 +1293,11 @@ class OkxRestClient:
             credentials=credentials,
             simulated=config.environment == "demo",
         )
-        return self._parse_order_result(payload, empty_message="OKX 返回了空的下单结果")
+        return self._parse_order_result(
+            payload,
+            empty_message="OKX 返回了空的下单结果",
+            fallback_cl_ord_id=cl_ord_id,
+        )
 
     def place_aggressive_limit_order(
         self,
@@ -1031,6 +1308,7 @@ class OkxRestClient:
         side: str,
         size: Decimal,
         pos_side: str | None = None,
+        cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
         ticker = self.get_ticker(instrument.inst_id)
         base_price = _pick_aggressive_price(ticker, side)
@@ -1054,6 +1332,7 @@ class OkxRestClient:
             ord_type="ioc",
             pos_side=pos_side,
             price=order_price,
+            cl_ord_id=cl_ord_id,
         )
 
     def get_order(
@@ -1103,19 +1382,84 @@ class OkxRestClient:
         config: StrategyConfig,
         *,
         inst_id: str,
-        ord_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
+        return self.cancel_order_by_id(
+            credentials,
+            environment=config.environment,
+            inst_id=inst_id,
+            ord_id=ord_id,
+            cl_ord_id=cl_ord_id,
+        )
+
+    def cancel_order_by_id(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+    ) -> OkxOrderResult:
+        if not ord_id and not cl_ord_id:
+            raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个。")
+        body = {"instId": inst_id}
+        if ord_id:
+            body["ordId"] = ord_id
+        if cl_ord_id:
+            body["clOrdId"] = cl_ord_id
         payload = self._request(
             "POST",
             "/api/v5/trade/cancel-order",
-            body={"instId": inst_id, "ordId": ord_id},
+            body=body,
             auth=True,
             credentials=credentials,
-            simulated=config.environment == "demo",
+            simulated=environment == "demo",
         )
-        return self._parse_order_result(payload, empty_message="OKX 返回了空的撤单结果")
+        return self._parse_order_result(
+            payload,
+            empty_message="OKX 返回了空的撤单结果",
+            fallback_cl_ord_id=cl_ord_id,
+        )
 
-    def _parse_order_result(self, payload: dict[str, Any], *, empty_message: str) -> OkxOrderResult:
+    def cancel_algo_order(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        algo_id: str | None = None,
+        algo_cl_ord_id: str | None = None,
+    ) -> OkxOrderResult:
+        if not algo_id and not algo_cl_ord_id:
+            raise ValueError("algo_id 和 algo_cl_ord_id 至少需要提供一个。")
+        body_item = {"instId": inst_id}
+        if algo_id:
+            body_item["algoId"] = algo_id
+        if algo_cl_ord_id:
+            body_item["algoClOrdId"] = algo_cl_ord_id
+        payload = self._request(
+            "POST",
+            "/api/v5/trade/cancel-algos",
+            body=[body_item],
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        return self._parse_algo_order_result(
+            payload,
+            empty_message="OKX 返回了空的算法撤单结果",
+            fallback_algo_cl_ord_id=algo_cl_ord_id,
+        )
+
+    def _parse_order_result(
+        self,
+        payload: dict[str, Any],
+        *,
+        empty_message: str,
+        fallback_cl_ord_id: str | None = None,
+    ) -> OkxOrderResult:
         if not payload["data"]:
             raise OkxApiError(empty_message)
 
@@ -1125,7 +1469,29 @@ class OkxRestClient:
 
         return OkxOrderResult(
             ord_id=first.get("ordId", ""),
-            cl_ord_id=first.get("clOrdId"),
+            cl_ord_id=first.get("clOrdId") or fallback_cl_ord_id,
+            s_code=first.get("sCode", "0"),
+            s_msg=first.get("sMsg", ""),
+            raw=payload,
+        )
+
+    def _parse_algo_order_result(
+        self,
+        payload: dict[str, Any],
+        *,
+        empty_message: str,
+        fallback_algo_cl_ord_id: str | None = None,
+    ) -> OkxOrderResult:
+        if not payload["data"]:
+            raise OkxApiError(empty_message)
+
+        first = payload["data"][0]
+        if first.get("sCode") not in {None, "", "0"}:
+            raise OkxApiError(first.get("sMsg", "OKX 算法委托撤单请求被拒绝"), code=first.get("sCode"))
+
+        return OkxOrderResult(
+            ord_id=first.get("algoId", ""),
+            cl_ord_id=first.get("algoClOrdId") or first.get("clOrdId") or fallback_algo_cl_ord_id,
             s_code=first.get("sCode", "0"),
             s_msg=first.get("sMsg", ""),
             raw=payload,
@@ -1239,6 +1605,33 @@ def _to_int(*values: Any) -> int | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _to_bool(value: Any) -> bool | None:
+    if value in {None, ""}:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "y"}:
+        return True
+    if normalized in {"false", "0", "no", "n"}:
+        return False
+    return None
+
+
+def _extract_tp_sl_fields(item: dict[str, Any]) -> dict[str, Decimal | str | None]:
+    attach_algo_orders = item.get("attachAlgoOrds")
+    if isinstance(attach_algo_orders, list) and attach_algo_orders:
+        source = attach_algo_orders[0] if isinstance(attach_algo_orders[0], dict) else item
+    else:
+        source = item
+    return {
+        "take_profit_trigger_price": _first_decimal(source.get("tpTriggerPx"), source.get("takeProfitTriggerPrice")),
+        "take_profit_order_price": _first_decimal(source.get("tpOrdPx"), source.get("takeProfitOrdPx")),
+        "take_profit_trigger_price_type": source.get("tpTriggerPxType") or source.get("takeProfitTriggerPxType"),
+        "stop_loss_trigger_price": _first_decimal(source.get("slTriggerPx"), source.get("stopLossTriggerPrice")),
+        "stop_loss_order_price": _first_decimal(source.get("slOrdPx"), source.get("stopLossOrdPx")),
+        "stop_loss_trigger_price_type": source.get("slTriggerPxType") or source.get("stopLossTriggerPxType"),
+    }
 
 
 def _fill_history_dedupe_key(item: OkxFillHistoryItem) -> tuple[Any, ...]:

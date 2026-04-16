@@ -56,6 +56,7 @@ class AtrSnapshot:
 @dataclass(frozen=True)
 class ManagedEntryOrder:
     ord_id: str
+    cl_ord_id: str | None
     candle_ts: int
     entry_reference: Decimal
     size: Decimal
@@ -66,6 +67,7 @@ class ManagedEntryOrder:
 @dataclass(frozen=True)
 class FilledPosition:
     ord_id: str
+    cl_ord_id: str | None
     inst_id: str
     side: Literal["buy", "sell"]
     close_side: Literal["buy", "sell"]
@@ -92,14 +94,17 @@ class StrategyEngine:
         *,
         notifier: EmailNotifier | None = None,
         strategy_name: str = "Strategy",
+        session_id: str = "",
     ) -> None:
         self._client = client
         self._logger = logger
         self._notifier = notifier
         self._strategy_name = strategy_name
+        self._session_id = session_id
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        self._order_ref_counter = 0
 
     @property
     def is_running(self) -> bool:
@@ -308,11 +313,13 @@ class StrategyEngine:
                 f"开仓价={format_decimal(plan.entry_reference)} | 数量={format_decimal(plan.size)} | "
                 f"止损={format_decimal(plan.stop_loss)} | 止盈={format_decimal(plan.take_profit)}"
             )
-            result = self._client.place_limit_order(credentials, config, plan)
+            cl_ord_id = self._next_client_order_id(role="entry")
+            result = self._client.place_limit_order(credentials, config, plan, cl_ord_id=cl_ord_id)
             if not result.ord_id:
                 raise RuntimeError("OKX 未返回挂单 ordId，无法继续监控该委托")
             active_order = ManagedEntryOrder(
                 ord_id=result.ord_id,
+                cl_ord_id=result.cl_ord_id or cl_ord_id,
                 candle_ts=plan.candle_ts,
                 entry_reference=plan.entry_reference,
                 size=plan.size,
@@ -324,6 +331,7 @@ class StrategyEngine:
                 f"{_fmt_ts(plan.candle_ts)} | 挂单已提交到 OKX | ordId={result.ord_id or '-'} | "
                 f"sCode={result.s_code} | sMsg={result.s_msg or 'accepted'}"
             )
+            self._logger(f"{_fmt_ts(plan.candle_ts)} | 委托追踪 | clOrdId={active_order.cl_ord_id or '-'}")
             self._stop_event.wait(config.poll_seconds)
 
     def _run_cross_exchange_strategy(
@@ -402,11 +410,13 @@ class StrategyEngine:
                 f"参考入场价={format_decimal(plan.entry_reference)} | 数量={format_decimal(plan.size)} | "
                 f"止损={format_decimal(plan.stop_loss)} | 止盈={format_decimal(plan.take_profit)}"
             )
-            result = self._client.place_market_order(credentials, config, plan)
+            cl_ord_id = self._next_client_order_id(role="entry")
+            result = self._client.place_market_order(credentials, config, plan, cl_ord_id=cl_ord_id)
             self._logger(
                 f"订单已提交到 OKX | ordId={result.ord_id or '-'} | "
                 f"sCode={result.s_code} | sMsg={result.s_msg or 'accepted'}"
             )
+            self._logger(f"{_fmt_ts(plan.candle_ts)} | 委托追踪 | clOrdId={result.cl_ord_id or cl_ord_id or '-'}")
             filled = self._wait_for_order_fill(
                 credentials,
                 config,
@@ -1234,6 +1244,7 @@ class StrategyEngine:
             price=filled.entry_price,
             reason=f"EMA{config.ema_period}/EMA{config.trend_ema_period} 浜ゅ弶淇″彿鎴愪氦",
         )
+        self._logger(f"委托追踪 | clOrdId={filled.cl_ord_id or '-'} | ordId={filled.ord_id}")
         return filled
 
     def _open_local_position(
@@ -1304,6 +1315,7 @@ class StrategyEngine:
             price=filled.entry_price,
             reason="本地下单成交",
         )
+        self._logger(f"委托追踪 | clOrdId={filled.cl_ord_id or '-'} | ordId={filled.ord_id}")
         return filled
 
     def _build_local_protection_plan(
@@ -1512,7 +1524,10 @@ class StrategyEngine:
         side: Literal["buy", "sell"],
         size: Decimal,
         pos_side: Literal["long", "short"] | None,
+        *,
+        cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
+        resolved_cl_ord_id = cl_ord_id or self._next_client_order_id(role="entry")
         if trade_instrument.inst_type == "OPTION":
             return self._client.place_aggressive_limit_order(
                 credentials,
@@ -1521,6 +1536,7 @@ class StrategyEngine:
                 side=side,
                 size=size,
                 pos_side=pos_side,
+                cl_ord_id=resolved_cl_ord_id,
             )
         return self._client.place_simple_order(
             credentials,
@@ -1530,6 +1546,7 @@ class StrategyEngine:
             size=size,
             ord_type="market",
             pos_side=pos_side,
+            cl_ord_id=resolved_cl_ord_id,
         )
 
     def _place_exit_order(
@@ -1542,7 +1559,15 @@ class StrategyEngine:
         size: Decimal,
         pos_side: Literal["long", "short"] | None,
     ) -> OkxOrderResult:
-        return self._place_entry_order(credentials, config, trade_instrument, side, size, pos_side)
+        return self._place_entry_order(
+            credentials,
+            config,
+            trade_instrument,
+            side,
+            size,
+            pos_side,
+            cl_ord_id=self._next_client_order_id(role="exit"),
+        )
 
     def _wait_for_order_fill(
         self,
@@ -1571,6 +1596,7 @@ class StrategyEngine:
             if latest_state == "filled":
                 return FilledPosition(
                     ord_id=result.ord_id,
+                    cl_ord_id=result.cl_ord_id,
                     inst_id=trade_instrument.inst_id,
                     side=side,
                     close_side="sell" if side == "buy" else "buy",
@@ -1581,6 +1607,7 @@ class StrategyEngine:
             if latest_state == "partially_filled" and filled_size > 0:
                 return FilledPosition(
                     ord_id=result.ord_id,
+                    cl_ord_id=result.cl_ord_id,
                     inst_id=trade_instrument.inst_id,
                     side=side,
                     close_side="sell" if side == "buy" else "buy",
@@ -1593,6 +1620,15 @@ class StrategyEngine:
             self._stop_event.wait(max(config.poll_seconds / 2, 0.5))
 
         raise RuntimeError(f"订单未成交，ordId={result.ord_id}，状态={latest_state or 'unknown'}")
+
+    def _next_client_order_id(self, *, role: str) -> str:
+        self._order_ref_counter += 1
+        session_token = "".join(ch for ch in self._session_id.lower() if ch.isalnum())[:4] or "sess"
+        strategy_token = "".join(ch for ch in self._strategy_name.lower() if ch.isalnum())[:4] or "stg"
+        role_token = "".join(ch for ch in role.lower() if ch.isalnum())[:3] or "ord"
+        timestamp = datetime.utcnow().strftime("%m%d%H%M%S%f")[:-3]
+        suffix = f"{self._order_ref_counter % 100:02d}"
+        return f"{session_token}{strategy_token}{role_token}{timestamp}{suffix}"[:32]
 
     def _cancel_active_order(
         self,

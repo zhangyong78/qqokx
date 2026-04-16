@@ -81,6 +81,8 @@ class StrategyConfig:
     backtest_sizing_mode: BacktestSizingMode = "fixed_risk"
     backtest_risk_percent: Decimal | None = None
     backtest_compounding: bool = False
+    backtest_entry_slippage_rate: Decimal = Decimal("0")
+    backtest_exit_slippage_rate: Decimal = Decimal("0")
     backtest_slippage_rate: Decimal = Decimal("0")
     backtest_funding_rate: Decimal = Decimal("0")
     take_profit_mode: TakeProfitMode = "dynamic"
@@ -88,11 +90,24 @@ class StrategyConfig:
     entry_reference_ema_period: int = 55
     dynamic_two_r_break_even: bool = True
     dynamic_fee_offset_enabled: bool = True
+    backtest_profile_id: str = ""
+    backtest_profile_name: str = ""
+    backtest_profile_summary: str = ""
 
     def resolved_entry_reference_ema_period(self) -> int:
         if self.entry_reference_ema_period > 0:
             return self.entry_reference_ema_period
         return self.ema_period
+
+    def resolved_backtest_entry_slippage_rate(self) -> Decimal:
+        if self.backtest_entry_slippage_rate > 0 or self.backtest_exit_slippage_rate > 0:
+            return self.backtest_entry_slippage_rate
+        return self.backtest_slippage_rate
+
+    def resolved_backtest_exit_slippage_rate(self) -> Decimal:
+        if self.backtest_entry_slippage_rate > 0 or self.backtest_exit_slippage_rate > 0:
+            return self.backtest_exit_slippage_rate
+        return self.backtest_slippage_rate
 
     def entry_reference_ema_label(self) -> str:
         resolved_period = self.resolved_entry_reference_ema_period()

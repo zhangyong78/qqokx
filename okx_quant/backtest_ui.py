@@ -13,26 +13,31 @@ from okx_quant.backtest import (
     ATR_BATCH_MULTIPLIERS,
     ATR_BATCH_TAKE_RATIOS,
     BATCH_MAX_ENTRIES_OPTIONS,
+    BacktestManualPosition,
     BacktestReport,
     BacktestResult,
     BacktestTrade,
+    build_parameter_batch_configs,
     format_backtest_report,
     run_backtest,
     run_backtest_batch,
 )
+from okx_quant.backtest_audit import describe_backtest_export_artifacts
 from okx_quant.backtest_export import export_batch_backtest_report, export_single_backtest_report
+from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_pool_profile_name
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import backtest_history_file_path
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import (
     ALL_STRATEGY_DEFINITIONS,
-    STRATEGY_DEFINITIONS,
+    BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA5_EMA8_ID,
     StrategyDefinition,
     get_strategy_definition,
     is_dynamic_strategy_id,
+    is_slot_handoff_strategy_id,
     resolve_dynamic_signal_mode,
 )
 from okx_quant.window_layout import apply_adaptive_window_geometry
@@ -89,6 +94,22 @@ TAKE_PROFIT_MODE_OPTIONS = {
     "固定止盈": "fixed",
     "动态止盈": "dynamic",
 }
+MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT = Decimal("0.50")
+MANUAL_FILTER_OPTIONS = {
+    "全部": "all",
+    "仅接近保本": "near_break_even",
+    "仅亏损仓": "loss_only",
+    "仅做多": "long_only",
+    "仅做空": "short_only",
+}
+MANUAL_SORT_OPTIONS = {
+    "方向+距保本": "direction_gap",
+    "距保本最近": "break_even_gap",
+    "入池最久": "oldest_handoff",
+    "浮亏最大": "largest_loss",
+    "风险值最大": "largest_risk",
+}
+MANUAL_DEFAULT_SORT_LABEL = "方向+距保本"
 
 
 @dataclass(frozen=True)
@@ -119,7 +140,8 @@ class BacktestLaunchState:
     sizing_mode_label: str = "固定风险金"
     risk_percent: str = "1"
     compounding_enabled: bool = False
-    slippage_percent: str = "0"
+    entry_slippage_percent: str = "0"
+    exit_slippage_percent: str = "0"
     funding_rate_percent: str = "0"
     start_time_text: str = ""
     end_time_text: str = ""
@@ -303,6 +325,13 @@ def _build_backtest_symbol_options(current_symbol: str) -> tuple[str, ...]:
     return BACKTEST_SYMBOL_OPTIONS
 
 
+def _strategy_display_name(config: StrategyConfig) -> str:
+    base_name = STRATEGY_ID_TO_NAME.get(config.strategy_id, config.strategy_id)
+    if config.backtest_profile_name:
+        return f"{base_name} / {config.backtest_profile_name}"
+    return base_name
+
+
 def _extract_report_line_value(report_text: str, *prefixes: str) -> str | None:
     for raw_line in report_text.splitlines():
         line = raw_line.strip()
@@ -346,7 +375,7 @@ def _build_backtest_compare_row(snapshot: _BacktestSnapshot) -> tuple[str, ...]:
         snapshot.created_at.strftime("%m-%d %H:%M:%S"),
         start_text,
         end_text,
-        STRATEGY_ID_TO_NAME.get(config.strategy_id, config.strategy_id),
+        _strategy_display_name(config),
         config.inst_id,
         _normalize_backtest_bar_label(config.bar),
         _build_backtest_param_summary(
@@ -393,7 +422,21 @@ def _build_backtest_param_summary(
             f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
             f"{'复利' if config.backtest_compounding else '不复利'} / "
             f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
-            f"滑点{_format_fee_rate_percent(config.backtest_slippage_rate)} / "
+            f"{_format_backtest_slippage_summary(config)} / "
+            f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
+        )
+
+    if is_slot_handoff_strategy_id(config.strategy_id):
+        profile_prefix = f"候选{config.backtest_profile_name} / " if config.backtest_profile_name else ""
+        return (
+            f"{profile_prefix}EMA{config.ema_period}/{config.trend_ema_period} / ATR{config.atr_period} / "
+            f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
+            f"最大槽位{config.max_entries_per_trend} / 单槽位{format_decimal(config.order_size)} / "
+            f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / "
+            f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
+            f"{'复利' if config.backtest_compounding else '不复利'} / "
+            f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
+            f"{_format_backtest_slippage_summary(config)} / "
             f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
         )
 
@@ -411,7 +454,7 @@ def _build_backtest_param_summary(
             f"仓位{sizing_text} / 本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
             f"{'复利' if config.backtest_compounding else '不复利'} / "
             f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
-            f"滑点{_format_fee_rate_percent(config.backtest_slippage_rate)} / "
+            f"{_format_backtest_slippage_summary(config)} / "
             f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
         )
 
@@ -430,13 +473,22 @@ def _build_backtest_param_summary(
         f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
         f"{'复利' if config.backtest_compounding else '不复利'} / "
         f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
-        f"滑点{_format_fee_rate_percent(config.backtest_slippage_rate)} / "
+        f"{_format_backtest_slippage_summary(config)} / "
         f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
     )
 
+def _backtest_export_detail_lines(export_path: str | None) -> list[str]:
+    if not export_path:
+        return []
+    try:
+        return describe_backtest_export_artifacts(export_path)
+    except Exception:
+        return [f"报告文件：{export_path}"]
+
+
 def _build_backtest_compare_detail(snapshot: _BacktestSnapshot) -> str:
     config = snapshot.config
-    strategy_name = STRATEGY_ID_TO_NAME.get(config.strategy_id, config.strategy_id)
+    strategy_name = _strategy_display_name(config)
     start_text, end_text = _backtest_snapshot_range_text(snapshot)
     lines = [
         f"编号：{snapshot.snapshot_id}",
@@ -448,15 +500,281 @@ def _build_backtest_compare_detail(snapshot: _BacktestSnapshot) -> str:
         f"参数：{_build_backtest_param_summary(config, maker_fee_rate=snapshot.maker_fee_rate, taker_fee_rate=snapshot.taker_fee_rate)}",
         f"开始时间：{start_text}",
         f"结束时间：{end_text}",
+    ]
+    lines.extend(_backtest_export_detail_lines(snapshot.export_path))
+    lines.extend([
         "",
         snapshot.report_text,
-    ]
-    if snapshot.export_path:
-        lines.insert(-2, f"报告文件：{snapshot.export_path}")
+    ])
     return "\n".join(lines)
+
+
+def _format_trade_exit_reason(exit_reason: str) -> str:
+    return {
+        "take_profit": "止盈",
+        "stop_loss": "止损",
+        "signal_profit_exit": "信号失效盈利平仓",
+    }.get(exit_reason, exit_reason)
+
+
+def _manual_position_break_even_gap_pct(manual_position: BacktestManualPosition) -> Decimal:
+    gap_value = abs(manual_position.current_price - manual_position.break_even_price)
+    base_price = abs(manual_position.break_even_price)
+    if base_price <= 0:
+        base_price = abs(manual_position.entry_price)
+    if base_price <= 0:
+        return Decimal("0")
+    return (gap_value / base_price) * Decimal("100")
+
+
+def _format_manual_gap_pct(gap_pct: Decimal) -> str:
+    return f"{format_decimal_fixed(gap_pct, 2)}%"
+
+
+def _manual_direction_order(signal: str) -> int:
+    return 0 if signal == "long" else 1
+
+
+def _manual_sort_description(sort_value: str) -> str:
+    if sort_value == "break_even_gap":
+        return "全池按距保本从近到远排序"
+    if sort_value == "oldest_handoff":
+        return "全池按入池时间从久到新排序"
+    if sort_value == "largest_loss":
+        return "全池按浮亏从大到小排序"
+    if sort_value == "largest_risk":
+        return "全池按风险值从大到小排序"
+    return "同方向内按距保本从近到远排序"
+
+
+def _sorted_manual_positions(
+    manual_positions: list[BacktestManualPosition],
+    sort_value: str = "direction_gap",
+) -> list[BacktestManualPosition]:
+    if sort_value == "break_even_gap":
+        return sorted(
+            manual_positions,
+            key=lambda item: (
+                _manual_position_break_even_gap_pct(item),
+                _manual_direction_order(item.signal),
+                item.handoff_ts,
+                item.entry_ts,
+            ),
+        )
+    if sort_value == "oldest_handoff":
+        return sorted(
+            manual_positions,
+            key=lambda item: (
+                item.handoff_ts,
+                item.entry_ts,
+                _manual_direction_order(item.signal),
+                _manual_position_break_even_gap_pct(item),
+            ),
+        )
+    if sort_value == "largest_loss":
+        return sorted(
+            manual_positions,
+            key=lambda item: (
+                item.pnl,
+                _manual_position_break_even_gap_pct(item),
+                -item.risk_value,
+                item.handoff_ts,
+                item.entry_ts,
+            ),
+        )
+    if sort_value == "largest_risk":
+        return sorted(
+            manual_positions,
+            key=lambda item: (
+                -item.risk_value,
+                item.pnl,
+                _manual_position_break_even_gap_pct(item),
+                item.handoff_ts,
+                item.entry_ts,
+            ),
+        )
+    return sorted(
+        manual_positions,
+        key=lambda item: (
+            _manual_direction_order(item.signal),
+            _manual_position_break_even_gap_pct(item),
+            item.handoff_ts,
+            item.entry_ts,
+        ),
+    )
+
+
+def _manual_direction_breakdown_text(manual_positions: list[BacktestManualPosition]) -> str:
+    direction_parts: list[str] = []
+    for signal, label in (("long", "做多"), ("short", "做空")):
+        positions = [item for item in manual_positions if item.signal == signal]
+        if not positions:
+            continue
+        total_size = sum((item.size for item in positions), Decimal("0"))
+        total_pnl = sum((item.pnl for item in positions), Decimal("0"))
+        nearest_gap = min((_manual_position_break_even_gap_pct(item) for item in positions), default=Decimal("0"))
+        direction_parts.append(
+            f"{label} {len(positions)} 笔 / {format_decimal_fixed(total_size, 4)} / "
+            f"浮盈亏 {format_decimal_fixed(total_pnl, 4)} / 最近保本 {format_decimal_fixed(nearest_gap, 2)}%"
+        )
+    return " | ".join(direction_parts) if direction_parts else "当前无待人工处理仓位。"
+
+
+def _manual_row_tag(manual_position: BacktestManualPosition) -> str:
+    near_break_even = _manual_position_break_even_gap_pct(manual_position) <= MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT
+    if manual_position.pnl > 0:
+        return "manual_profit_near" if near_break_even else "manual_profit"
+    if manual_position.pnl < 0:
+        return "manual_loss_near" if near_break_even else "manual_loss"
+    return "manual_flat_near" if near_break_even else "manual_flat"
+
+
+def _manual_position_matches_filter(manual_position: BacktestManualPosition, filter_value: str) -> bool:
+    if filter_value == "near_break_even":
+        return _manual_position_break_even_gap_pct(manual_position) <= MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT
+    if filter_value == "loss_only":
+        return manual_position.pnl < 0
+    if filter_value == "long_only":
+        return manual_position.signal == "long"
+    if filter_value == "short_only":
+        return manual_position.signal == "short"
+    return True
+
+
+def _filter_manual_positions(
+    manual_positions: list[BacktestManualPosition],
+    filter_value: str,
+) -> list[BacktestManualPosition]:
+    return [item for item in manual_positions if _manual_position_matches_filter(item, filter_value)]
+
+
+def _manual_signed_gap_value(manual_position: BacktestManualPosition) -> Decimal:
+    if manual_position.signal == "long":
+        return manual_position.current_price - manual_position.break_even_price
+    return manual_position.break_even_price - manual_position.current_price
+
+
+def _format_signed_price_gap(value: Decimal) -> str:
+    if value > 0:
+        return f"+{format_decimal_fixed(value, 4)}"
+    return format_decimal_fixed(value, 4)
+
+
+def _format_manual_age(manual_position: BacktestManualPosition) -> str:
+    raw_delta = max(manual_position.current_ts - manual_position.handoff_ts, 0)
+    if manual_position.current_ts >= 10**12 or manual_position.handoff_ts >= 10**12:
+        total_minutes = raw_delta // 60000
+    else:
+        total_minutes = raw_delta // 60
+    days, remaining_minutes = divmod(int(total_minutes), 1440)
+    hours, minutes = divmod(remaining_minutes, 60)
+    if days > 0:
+        return f"{days}d{hours:02d}h"
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m"
+
+
+def _manual_focus_window(
+    manual_position: BacktestManualPosition,
+    total_count: int,
+    *,
+    min_visible: int = 40,
+    leading_padding: int = 12,
+    trailing_padding: int = 18,
+) -> tuple[int, int, int]:
+    if total_count <= 0:
+        return 0, 0, 0
+    anchor_index = max(0, min(manual_position.handoff_index, total_count - 1))
+    left_index = max(min(manual_position.entry_index, manual_position.handoff_index) - leading_padding, 0)
+    right_index = min(max(manual_position.entry_index, manual_position.handoff_index) + trailing_padding, total_count - 1)
+    visible_count = max(min_visible, right_index - left_index + 1)
+    visible_count = min(visible_count, total_count)
+    target_start = max(left_index, anchor_index - (visible_count // 2))
+    start_index, visible_count = _normalize_chart_viewport(target_start, visible_count, total_count, min_visible=min_visible)
+    return start_index, visible_count, anchor_index
+
+
+def _build_manual_pool_summary(
+    result: BacktestResult,
+    config: StrategyConfig,
+    *,
+    visible_positions: list[BacktestManualPosition] | None = None,
+    filter_label: str | None = None,
+    sort_label: str | None = None,
+) -> str:
+    if not is_slot_handoff_strategy_id(config.strategy_id):
+        return "当前策略未启用人工接管池。"
+
+    report = result.report
+    current_ts = result.manual_positions[0].current_ts if result.manual_positions else (result.candles[-1].ts if result.candles else None)
+    current_time_text = _format_chart_timestamp(current_ts) if current_ts is not None else "-"
+    slot_limit_text = (
+        f"{report.max_total_occupied_slots}/{config.max_entries_per_trend}"
+        if config.max_entries_per_trend > 0
+        else str(report.max_total_occupied_slots)
+    )
+    total_entry_fee = sum((item.entry_fee for item in result.manual_positions), Decimal("0"))
+    total_funding = sum((item.funding_cost for item in result.manual_positions), Decimal("0"))
+    base_text = (
+        f"当前时间：{current_time_text} | 人工池：{report.manual_open_positions} 笔 / "
+        f"{format_decimal_fixed(report.manual_open_size, 4)} | 浮盈亏：{format_decimal_fixed(report.manual_open_pnl, 4)} | "
+        f"累计移交：{report.manual_handoffs} | 峰值人工池：{report.max_manual_positions} | "
+        f"峰值占槽：{slot_limit_text} | 开仓手续费：{format_decimal_fixed(total_entry_fee, 4)} | "
+        f"资金费：{format_decimal_fixed(total_funding, 4)}"
+    )
+    resolved_sort_label = sort_label if sort_label in MANUAL_SORT_OPTIONS else MANUAL_DEFAULT_SORT_LABEL
+    sort_value = MANUAL_SORT_OPTIONS.get(resolved_sort_label, "direction_gap")
+    base_text = f"{base_text} | 当前排序：{resolved_sort_label}"
+    display_positions = result.manual_positions if visible_positions is None else visible_positions
+    if filter_label and filter_label in MANUAL_FILTER_OPTIONS and filter_label != "全部":
+        base_text = f"{base_text} | 当前筛选：{filter_label} ({len(display_positions)}/{len(result.manual_positions)})"
+    if not result.manual_positions:
+        return f"{base_text}\n当前无待人工处理仓位。"
+    if not display_positions:
+        return f"{base_text}\n当前筛选下暂无仓位。"
+
+    sorted_positions = _sorted_manual_positions(display_positions, sort_value)
+    nearest_position = min(display_positions, key=_manual_position_break_even_gap_pct)
+    nearest_gap_text = _format_manual_gap_pct(_manual_position_break_even_gap_pct(nearest_position))
+    return (
+        f"{base_text}\n"
+        f"方向分组：{_manual_direction_breakdown_text(sorted_positions)} | "
+        f"最接近保本：{nearest_gap_text} | "
+        f"{_manual_sort_description(sort_value)}，黄色底表示距保本 ≤ {_format_manual_gap_pct(MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT)}"
+    )
+
+
+def _build_manual_position_row(index: int, manual_position: BacktestManualPosition) -> tuple[str, ...]:
+    return (
+        str(index),
+        "做多" if manual_position.signal == "long" else "做空",
+        _format_chart_timestamp(manual_position.entry_ts),
+        _format_chart_timestamp(manual_position.handoff_ts),
+        _format_manual_age(manual_position),
+        format_decimal_fixed(manual_position.entry_price, 4),
+        format_decimal_fixed(manual_position.handoff_price, 4),
+        format_decimal_fixed(manual_position.current_price, 4),
+        format_decimal_fixed(manual_position.break_even_price, 4),
+        _format_signed_price_gap(_manual_signed_gap_value(manual_position)),
+        _format_manual_gap_pct(_manual_position_break_even_gap_pct(manual_position)),
+        format_decimal_fixed(manual_position.size, 4),
+        format_decimal_fixed(manual_position.pnl, 4),
+        format_decimal_fixed(manual_position.entry_fee, 4),
+        format_decimal_fixed(manual_position.funding_cost, 4),
+        manual_position.handoff_reason,
+    )
+
 
 def _format_fee_rate_percent(rate: Decimal) -> str:
     return f"{format_decimal_fixed(rate * Decimal('100'), 4)}%"
+
+
+def _format_backtest_slippage_summary(config: StrategyConfig) -> str:
+    return (
+        f"开滑{_format_fee_rate_percent(config.resolved_backtest_entry_slippage_rate())} / "
+        f"平滑{_format_fee_rate_percent(config.resolved_backtest_exit_slippage_rate())}"
+    )
 
 
 def _batch_entries_label(value: int) -> str:
@@ -474,6 +792,8 @@ def _batch_mode_for_snapshots(snapshots: list[_BacktestSnapshot]) -> str:
     if not snapshots:
         return "none"
     config = snapshots[0].config
+    if is_strategy_pool_config(config):
+        return "strategy_pool"
     if is_dynamic_strategy_id(config.strategy_id):
         if config.take_profit_mode == "dynamic":
             return "dynamic_entries"
@@ -490,6 +810,15 @@ def _batch_entry_levels(snapshots: list[_BacktestSnapshot]) -> list[int]:
 
 def _snapshot_sort_key(snapshot: _BacktestSnapshot, batch_mode: str) -> tuple[object, ...]:
     config = snapshot.config
+    if batch_mode == "strategy_pool":
+        return (
+            config.backtest_profile_id or config.backtest_profile_name,
+            config.ema_period,
+            config.trend_ema_period,
+            config.atr_period,
+            config.atr_stop_multiplier,
+            config.atr_take_multiplier,
+        )
     if batch_mode == "dynamic_entries":
         return (config.atr_stop_multiplier, config.max_entries_per_trend)
     if batch_mode == "fixed_entries":
@@ -530,18 +859,34 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "max_entries_per_trend": config.max_entries_per_trend,
         "dynamic_two_r_break_even": config.dynamic_two_r_break_even,
         "dynamic_fee_offset_enabled": config.dynamic_fee_offset_enabled,
+        "backtest_profile_id": config.backtest_profile_id,
+        "backtest_profile_name": config.backtest_profile_name,
+        "backtest_profile_summary": config.backtest_profile_summary,
         "backtest_initial_capital": str(config.backtest_initial_capital),
         "backtest_sizing_mode": config.backtest_sizing_mode,
         "backtest_risk_percent": None
         if config.backtest_risk_percent is None
         else str(config.backtest_risk_percent),
         "backtest_compounding": config.backtest_compounding,
+        "backtest_entry_slippage_rate": str(config.resolved_backtest_entry_slippage_rate()),
+        "backtest_exit_slippage_rate": str(config.resolved_backtest_exit_slippage_rate()),
         "backtest_slippage_rate": str(config.backtest_slippage_rate),
         "backtest_funding_rate": str(config.backtest_funding_rate),
     }
 
 
 def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
+    legacy_slippage_rate = Decimal(str(payload.get("backtest_slippage_rate", "0")))
+    entry_slippage_rate = (
+        legacy_slippage_rate
+        if payload.get("backtest_entry_slippage_rate") in (None, "")
+        else Decimal(str(payload.get("backtest_entry_slippage_rate")))
+    )
+    exit_slippage_rate = (
+        legacy_slippage_rate
+        if payload.get("backtest_exit_slippage_rate") in (None, "")
+        else Decimal(str(payload.get("backtest_exit_slippage_rate")))
+    )
     return StrategyConfig(
         inst_id=str(payload.get("inst_id", "")),
         bar=str(payload.get("bar", "15m")),
@@ -574,13 +919,18 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         max_entries_per_trend=int(payload.get("max_entries_per_trend", 1)),
         dynamic_two_r_break_even=bool(payload.get("dynamic_two_r_break_even", True)),
         dynamic_fee_offset_enabled=bool(payload.get("dynamic_fee_offset_enabled", True)),
+        backtest_profile_id=str(payload.get("backtest_profile_id", "")),
+        backtest_profile_name=str(payload.get("backtest_profile_name", "")),
+        backtest_profile_summary=str(payload.get("backtest_profile_summary", "")),
         backtest_initial_capital=Decimal(str(payload.get("backtest_initial_capital", "10000"))),
         backtest_sizing_mode=str(payload.get("backtest_sizing_mode", "fixed_risk")),
         backtest_risk_percent=None
         if payload.get("backtest_risk_percent") in (None, "")
         else Decimal(str(payload.get("backtest_risk_percent"))),
         backtest_compounding=bool(payload.get("backtest_compounding", False)),
-        backtest_slippage_rate=Decimal(str(payload.get("backtest_slippage_rate", "0"))),
+        backtest_entry_slippage_rate=entry_slippage_rate,
+        backtest_exit_slippage_rate=exit_slippage_rate,
+        backtest_slippage_rate=legacy_slippage_rate,
         backtest_funding_rate=Decimal(str(payload.get("backtest_funding_rate", "0"))),
     )
 
@@ -612,6 +962,12 @@ def _serialize_backtest_report(report: BacktestReport) -> dict[str, object]:
         "total_fees": str(report.total_fees),
         "slippage_costs": str(report.slippage_costs),
         "funding_costs": str(report.funding_costs),
+        "manual_handoffs": report.manual_handoffs,
+        "manual_open_positions": report.manual_open_positions,
+        "manual_open_size": str(report.manual_open_size),
+        "manual_open_pnl": str(report.manual_open_pnl),
+        "max_manual_positions": report.max_manual_positions,
+        "max_total_occupied_slots": report.max_total_occupied_slots,
     }
 
 
@@ -644,6 +1000,12 @@ def _deserialize_backtest_report(payload: dict[str, object]) -> BacktestReport:
         total_fees=Decimal(str(payload.get("total_fees", "0"))),
         slippage_costs=Decimal(str(payload.get("slippage_costs", "0"))),
         funding_costs=Decimal(str(payload.get("funding_costs", "0"))),
+        manual_handoffs=int(payload.get("manual_handoffs", 0)),
+        manual_open_positions=int(payload.get("manual_open_positions", 0)),
+        manual_open_size=Decimal(str(payload.get("manual_open_size", "0"))),
+        manual_open_pnl=Decimal(str(payload.get("manual_open_pnl", "0"))),
+        max_manual_positions=int(payload.get("max_manual_positions", 0)),
+        max_total_occupied_slots=int(payload.get("max_total_occupied_slots", 0)),
     )
 
 
@@ -838,7 +1200,7 @@ class BacktestWindow:
             max_height=1080,
         )
 
-        self._strategy_name_to_id = {item.name: item.strategy_id for item in STRATEGY_DEFINITIONS}
+        self._strategy_name_to_id = {item.name: item.strategy_id for item in BACKTEST_STRATEGY_DEFINITIONS}
 
         self.strategy_name = StringVar(value=initial_state.strategy_name)
         self.symbol = StringVar(value=initial_state.symbol)
@@ -857,7 +1219,8 @@ class BacktestWindow:
         self.sizing_mode_label = StringVar(value=initial_state.sizing_mode_label)
         self.risk_percent = StringVar(value=initial_state.risk_percent)
         self.compounding_enabled = BooleanVar(value=initial_state.compounding_enabled)
-        self.slippage_percent = StringVar(value=initial_state.slippage_percent)
+        self.entry_slippage_percent = StringVar(value=initial_state.entry_slippage_percent)
+        self.exit_slippage_percent = StringVar(value=initial_state.exit_slippage_percent)
         self.funding_rate_percent = StringVar(value=initial_state.funding_rate_percent)
         self.start_time_text = StringVar(value=initial_state.start_time_text)
         self.end_time_text = StringVar(value=initial_state.end_time_text)
@@ -872,6 +1235,9 @@ class BacktestWindow:
         self.environment_label = StringVar(value=initial_state.environment_label)
         self.candle_limit = StringVar(value=initial_state.candle_limit)
         self.report_summary = StringVar(value="点击“开始回测”后，会在这里显示报告摘要。")
+        self.manual_summary = StringVar(value="当前策略未启用人工接管池。")
+        self.manual_filter_label = StringVar(value="全部")
+        self.manual_sort_label = StringVar(value=MANUAL_DEFAULT_SORT_LABEL)
         self.compare_summary = StringVar(value="暂无回测对比记录。")
         self.matrix_summary = StringVar(value="\u6682\u65e0 ATR \u6279\u91cf\u56de\u6d4b\u77e9\u9635\u3002")
         self.heatmap_summary = StringVar(
@@ -894,6 +1260,7 @@ class BacktestWindow:
         self._backtest_snapshots: dict[str, _BacktestSnapshot] = {}
         self._backtest_snapshot_order: list[str] = []
         self._backtest_snapshot_sequence = 0
+        self._manual_tree_position_map: dict[str, BacktestManualPosition] = {}
         self._current_snapshot_id: str | None = None
         self._backtest_running = False
         self._batch_sequence = 0
@@ -946,7 +1313,7 @@ class BacktestWindow:
         strategy_combo = ttk.Combobox(
             controls,
             textvariable=self.strategy_name,
-            values=[item.name for item in STRATEGY_DEFINITIONS],
+            values=[item.name for item in BACKTEST_STRATEGY_DEFINITIONS],
             state="readonly",
         )
         strategy_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12))
@@ -1068,14 +1435,20 @@ class BacktestWindow:
         self.risk_percent_entry.grid(row=row, column=5, sticky="ew", pady=(12, 0))
 
         row += 1
-        ttk.Label(controls, text="滑点(%)").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.slippage_percent).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        ttk.Label(controls, text="资金费率/8h(%)").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.funding_rate_percent).grid(
+        ttk.Label(controls, text="开仓滑点(%)").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.entry_slippage_percent).grid(
+            row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0)
+        )
+        ttk.Label(controls, text="平仓滑点(%)").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.exit_slippage_percent).grid(
             row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
         )
+        ttk.Label(controls, text="资金费率/8h(%)").grid(row=row, column=4, sticky="w", pady=(12, 0))
+        ttk.Entry(controls, textvariable=self.funding_rate_percent).grid(row=row, column=5, sticky="ew", pady=(12, 0))
+
+        row += 1
         ttk.Checkbutton(controls, text="启用复利", variable=self.compounding_enabled).grid(
-            row=row, column=4, columnspan=2, sticky="w", pady=(12, 0)
+            row=row, column=0, columnspan=2, sticky="w", pady=(12, 0)
         )
 
         row += 1
@@ -1335,7 +1708,17 @@ class BacktestWindow:
         stats_notebook.add(yearly_tab, text="年度统计")
         report_notebook.add(stats_tab, text="周期统计")
 
-        trade_tree_frame = ttk.Frame(trades_frame)
+        trades_notebook = ttk.Notebook(trades_frame)
+        trades_notebook.grid(row=0, column=0, sticky="nsew")
+
+        trade_tab = ttk.Frame(trades_notebook, padding=8)
+        trade_tab.columnconfigure(0, weight=1)
+        trade_tab.rowconfigure(0, weight=1)
+        manual_tab = ttk.Frame(trades_notebook, padding=8)
+        manual_tab.columnconfigure(0, weight=1)
+        manual_tab.rowconfigure(2, weight=1)
+
+        trade_tree_frame = ttk.Frame(trade_tab)
         trade_tree_frame.grid(row=0, column=0, sticky="nsew")
         trade_tree_frame.columnconfigure(0, weight=1)
         trade_tree_frame.rowconfigure(0, weight=1)
@@ -1374,8 +1757,129 @@ class BacktestWindow:
         self.trade_tree.column("r", width=90, anchor="e")
         self.trade_tree.grid(row=0, column=0, sticky="nsew")
         trade_tree_scroll_y = ttk.Scrollbar(trade_tree_frame, orient="vertical", command=self.trade_tree.yview)
-        self.trade_tree.configure(yscrollcommand=trade_tree_scroll_y.set)
+        trade_tree_scroll_x = ttk.Scrollbar(trade_tree_frame, orient="horizontal", command=self.trade_tree.xview)
+        self.trade_tree.configure(
+            yscrollcommand=trade_tree_scroll_y.set,
+            xscrollcommand=trade_tree_scroll_x.set,
+        )
         trade_tree_scroll_y.grid(row=0, column=1, sticky="ns")
+        trade_tree_scroll_x.grid(row=1, column=0, sticky="ew")
+
+        ttk.Label(manual_tab, textvariable=self.manual_summary, wraplength=520, justify="left").grid(
+            row=0, column=0, sticky="w", pady=(0, 10)
+        )
+
+        manual_toolbar = ttk.Frame(manual_tab)
+        manual_toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        manual_toolbar.columnconfigure(5, weight=1)
+        ttk.Label(manual_toolbar, text="筛选").grid(row=0, column=0, sticky="w")
+        manual_filter_combo = ttk.Combobox(
+            manual_toolbar,
+            textvariable=self.manual_filter_label,
+            values=list(MANUAL_FILTER_OPTIONS.keys()),
+            state="readonly",
+            width=12,
+        )
+        manual_filter_combo.grid(row=0, column=1, sticky="w", padx=(8, 12))
+        manual_filter_combo.bind("<<ComboboxSelected>>", lambda *_: self.refresh_manual_tree_view())
+        ttk.Label(manual_toolbar, text="排序").grid(row=0, column=2, sticky="w")
+        manual_sort_combo = ttk.Combobox(
+            manual_toolbar,
+            textvariable=self.manual_sort_label,
+            values=list(MANUAL_SORT_OPTIONS.keys()),
+            state="readonly",
+            width=14,
+        )
+        manual_sort_combo.grid(row=0, column=3, sticky="w", padx=(8, 12))
+        manual_sort_combo.bind("<<ComboboxSelected>>", lambda *_: self.refresh_manual_tree_view())
+        ttk.Button(manual_toolbar, text="定位选中", command=self.focus_selected_manual_position_on_chart).grid(
+            row=0, column=4, sticky="w"
+        )
+        ttk.Label(
+            manual_toolbar,
+            text="双击仓位可直接跳到图表对应开仓/移交区间。",
+            justify="left",
+        ).grid(row=0, column=5, sticky="w", padx=(12, 0))
+
+        manual_tree_frame = ttk.Frame(manual_tab)
+        manual_tree_frame.grid(row=2, column=0, sticky="nsew")
+        manual_tree_frame.columnconfigure(0, weight=1)
+        manual_tree_frame.rowconfigure(0, weight=1)
+
+        self.manual_tree = ttk.Treeview(
+            manual_tree_frame,
+            columns=(
+                "seq",
+                "signal",
+                "entry_time",
+                "handoff_time",
+                "age",
+                "entry",
+                "handoff",
+                "current",
+                "break_even",
+                "gap_value",
+                "gap_pct",
+                "size",
+                "pnl",
+                "entry_fee",
+                "funding",
+                "reason",
+            ),
+            show="headings",
+            selectmode="browse",
+        )
+        self.manual_tree.heading("seq", text="序号")
+        self.manual_tree.heading("signal", text="方向")
+        self.manual_tree.heading("entry_time", text="开仓时间")
+        self.manual_tree.heading("handoff_time", text="移交时间")
+        self.manual_tree.heading("age", text="入池时长")
+        self.manual_tree.heading("entry", text="开仓价")
+        self.manual_tree.heading("handoff", text="移交价")
+        self.manual_tree.heading("current", text="当前价")
+        self.manual_tree.heading("break_even", text="保本价")
+        self.manual_tree.heading("gap_value", text="距保本价差")
+        self.manual_tree.heading("gap_pct", text="距保本")
+        self.manual_tree.heading("size", text="数量")
+        self.manual_tree.heading("pnl", text="浮盈亏")
+        self.manual_tree.heading("entry_fee", text="开仓手续费")
+        self.manual_tree.heading("funding", text="资金费")
+        self.manual_tree.heading("reason", text="移交原因")
+        self.manual_tree.column("seq", width=60, anchor="center")
+        self.manual_tree.column("signal", width=70, anchor="center")
+        self.manual_tree.column("entry_time", width=140, anchor="center")
+        self.manual_tree.column("handoff_time", width=140, anchor="center")
+        self.manual_tree.column("age", width=90, anchor="center")
+        self.manual_tree.column("entry", width=100, anchor="e")
+        self.manual_tree.column("handoff", width=100, anchor="e")
+        self.manual_tree.column("current", width=100, anchor="e")
+        self.manual_tree.column("break_even", width=100, anchor="e")
+        self.manual_tree.column("gap_value", width=100, anchor="e")
+        self.manual_tree.column("gap_pct", width=90, anchor="e")
+        self.manual_tree.column("size", width=90, anchor="e")
+        self.manual_tree.column("pnl", width=110, anchor="e")
+        self.manual_tree.column("entry_fee", width=110, anchor="e")
+        self.manual_tree.column("funding", width=110, anchor="e")
+        self.manual_tree.column("reason", width=220, anchor="w")
+        self.manual_tree.tag_configure("manual_profit", foreground="#1a7f37")
+        self.manual_tree.tag_configure("manual_profit_near", foreground="#1a7f37", background="#fff3bf")
+        self.manual_tree.tag_configure("manual_loss", foreground="#d1242f")
+        self.manual_tree.tag_configure("manual_loss_near", foreground="#d1242f", background="#fff3bf")
+        self.manual_tree.tag_configure("manual_flat", foreground="#9a6700")
+        self.manual_tree.tag_configure("manual_flat_near", foreground="#9a6700", background="#fff3bf")
+        self.manual_tree.grid(row=0, column=0, sticky="nsew")
+        self.manual_tree.bind("<Double-Button-1>", lambda *_: self.focus_selected_manual_position_on_chart())
+        manual_tree_scroll_y = ttk.Scrollbar(manual_tree_frame, orient="vertical", command=self.manual_tree.yview)
+        manual_tree_scroll_x = ttk.Scrollbar(manual_tree_frame, orient="horizontal", command=self.manual_tree.xview)
+        self.manual_tree.configure(
+            yscrollcommand=manual_tree_scroll_y.set,
+            xscrollcommand=manual_tree_scroll_x.set,
+        )
+        manual_tree_scroll_y.grid(row=0, column=1, sticky="ns")
+        manual_tree_scroll_x.grid(row=1, column=0, sticky="ew")
+
+        trades_notebook.add(trade_tab, text="已平仓")
+        trades_notebook.add(manual_tab, text="人工池")
 
         self.chart_frame = ttk.LabelFrame(self.window, text="K线图、资金曲线与止盈止损触发位置 | 暂无选中回测", padding=12)
         self.chart_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
@@ -1399,6 +1903,15 @@ class BacktestWindow:
         self._bind_chart_interactions(self.chart_canvas)
 
     def _update_sizing_mode_widgets(self) -> None:
+        definition = self._selected_strategy_definition()
+        if is_slot_handoff_strategy_id(definition.strategy_id):
+            self.sizing_mode_label.set("固定数量")
+            self.size_or_risk_label.configure(text="单槽位数量")
+            self.size_or_risk_entry.configure(state="normal")
+            self.risk_percent_entry.configure(state="disabled")
+            self.sizing_mode_combo.configure(state="disabled")
+            return
+        self.sizing_mode_combo.configure(state="readonly")
         mode = BACKTEST_SIZING_OPTIONS.get(self.sizing_mode_label.get(), "fixed_risk")
         if mode == "fixed_size":
             self.size_or_risk_label.configure(text="固定数量")
@@ -1515,11 +2028,16 @@ class BacktestWindow:
             return
         try:
             config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts = self._build_backtest_request()
+            batch_count = len(build_parameter_batch_configs(config))
         except Exception as exc:
             messagebox.showerror("回测参数错误", str(exc), parent=self.window)
             return
 
-        self._prepare_backtest_output("\u6b63\u5728\u6279\u91cf\u56de\u6d4b 9 \u7ec4 ATR \u53c2\u6570\uff0c\u8bf7\u7a0d\u5019...")
+        if is_slot_handoff_strategy_id(config.strategy_id):
+            summary_text = f"正在批量深测 {batch_count} 组 5m 槽位接管候选策略，请稍候..."
+        else:
+            summary_text = f"正在批量回测 {batch_count} 组参数组合，请稍候..."
+        self._prepare_backtest_output(summary_text)
         self._set_backtest_running(True)
         batch_label = self._next_batch_label()
         threading.Thread(
@@ -1562,7 +2080,13 @@ class BacktestWindow:
     def _prepare_backtest_output(self, summary_text: str) -> None:
         self.report_summary.set(summary_text)
         self.report_text.delete("1.0", END)
-        self.trade_tree.delete(*self.trade_tree.get_children())
+        self._clear_detail_tables(
+            manual_summary_text=(
+                "等待回测结果后，这里会显示人工接管仓位。"
+                if is_slot_handoff_strategy_id(self._selected_strategy_definition().strategy_id)
+                else "当前策略未启用人工接管池。"
+            )
+        )
         self._current_snapshot_id = None
         self._reset_chart_views()
         self._clear_chart_canvas(self.chart_canvas)
@@ -1580,12 +2104,123 @@ class BacktestWindow:
         return (
             "K线图、资金曲线与止盈止损触发位置 | "
             f"{snapshot.snapshot_id} | "
-            f"{STRATEGY_ID_TO_NAME.get(snapshot.config.strategy_id, snapshot.config.strategy_id)} | "
+            f"{_strategy_display_name(snapshot.config)} | "
             f"{snapshot.config.inst_id} | "
             f"{_normalize_backtest_bar_label(snapshot.config.bar)} | "
             f"{signal_label} | M费{_format_fee_rate_percent(snapshot.maker_fee_rate)} | "
             f"T费{_format_fee_rate_percent(snapshot.taker_fee_rate)}"
         )
+
+    def _manual_filter_value(self) -> str:
+        return MANUAL_FILTER_OPTIONS.get(self.manual_filter_label.get(), "all")
+
+    def _manual_sort_value(self) -> str:
+        return MANUAL_SORT_OPTIONS.get(self.manual_sort_label.get(), "direction_gap")
+
+    def _selected_manual_position(self) -> BacktestManualPosition | None:
+        selection = self.manual_tree.selection()
+        if not selection:
+            return None
+        return self._manual_tree_position_map.get(selection[0])
+
+    def _focus_chart_on_manual_position(self, manual_position: BacktestManualPosition) -> None:
+        if self._latest_result is None or not self._latest_result.candles:
+            return
+        start_index, visible_count, hover_index = _manual_focus_window(
+            manual_position,
+            len(self._latest_result.candles),
+        )
+        for viewport in (self._main_chart_view, self._zoom_chart_view):
+            viewport.start_index = start_index
+            viewport.visible_count = visible_count
+        if self._widget_exists(getattr(self, "chart_canvas", None)):
+            self._chart_hover_indices[id(self.chart_canvas)] = hover_index
+        if self._chart_zoom_canvas is not None and self._widget_exists(self._chart_zoom_canvas):
+            self._chart_hover_indices[id(self._chart_zoom_canvas)] = hover_index
+        self._redraw_all_charts()
+
+    def focus_selected_manual_position_on_chart(self) -> None:
+        manual_position = self._selected_manual_position()
+        if manual_position is None:
+            messagebox.showinfo("人工池", "请先在人工池里选中一条仓位。", parent=self.window)
+            return
+        self._focus_chart_on_manual_position(manual_position)
+
+    def refresh_manual_tree_view(self) -> None:
+        if self._current_snapshot_id is None:
+            if self._latest_result is None:
+                return
+            self.manual_summary.set("当前没有人工接管仓位。")
+            return
+        snapshot = self._backtest_snapshots.get(self._current_snapshot_id)
+        if snapshot is None or snapshot.result is None:
+            return
+        self._populate_manual_tree(snapshot.result, snapshot.config)
+
+    def _clear_detail_tables(self, *, manual_summary_text: str | None = None) -> None:
+        self.trade_tree.delete(*self.trade_tree.get_children())
+        self.manual_tree.delete(*self.manual_tree.get_children())
+        self._manual_tree_position_map.clear()
+        self.manual_summary.set(manual_summary_text or "当前没有人工接管仓位。")
+
+    def _populate_trade_tree(self, trades: list[BacktestTrade]) -> None:
+        self.trade_tree.delete(*self.trade_tree.get_children())
+        for index, trade in enumerate(trades, start=1):
+            self.trade_tree.insert(
+                "",
+                END,
+                iid=f"T{index:03d}",
+                values=(
+                    index,
+                    "做多" if trade.signal == "long" else "做空",
+                    _format_chart_timestamp(trade.entry_ts),
+                    format_decimal_fixed(trade.entry_price, 4),
+                    format_decimal_fixed(trade.stop_loss, 4),
+                    format_decimal_fixed(trade.atr_value, 4),
+                    format_decimal_fixed(trade.size, 4),
+                    _format_chart_timestamp(trade.exit_ts),
+                    format_decimal_fixed(trade.exit_price, 4),
+                    format_decimal_fixed(trade.total_fee, 4),
+                    _format_trade_exit_reason(trade.exit_reason),
+                    format_decimal_fixed(trade.pnl, 4),
+                    format_decimal_fixed(trade.r_multiple, 4),
+                ),
+            )
+
+    def _populate_manual_tree(self, result: BacktestResult, config: StrategyConfig) -> None:
+        previous_selected = self._selected_manual_position()
+        filter_label = self.manual_filter_label.get()
+        sort_label = self.manual_sort_label.get()
+        filtered_positions = _filter_manual_positions(result.manual_positions, self._manual_filter_value())
+        sorted_positions = _sorted_manual_positions(filtered_positions, self._manual_sort_value())
+        self.manual_tree.delete(*self.manual_tree.get_children())
+        self._manual_tree_position_map.clear()
+        self.manual_summary.set(
+            _build_manual_pool_summary(
+                result,
+                config,
+                visible_positions=filtered_positions,
+                filter_label=filter_label,
+                sort_label=sort_label,
+            )
+        )
+        target_iid = None
+        for index, manual_position in enumerate(sorted_positions, start=1):
+            iid = f"M{index:03d}"
+            self.manual_tree.insert(
+                "",
+                END,
+                iid=iid,
+                values=_build_manual_position_row(index, manual_position),
+                tags=(_manual_row_tag(manual_position),),
+            )
+            self._manual_tree_position_map[iid] = manual_position
+            if previous_selected == manual_position:
+                target_iid = iid
+        if target_iid is not None:
+            self.manual_tree.selection_set(target_iid)
+            self.manual_tree.focus(target_iid)
+            self.manual_tree.see(target_iid)
 
     def _set_backtest_running(self, running: bool) -> None:
         self._backtest_running = running
@@ -1697,6 +2332,7 @@ class BacktestWindow:
         self._current_snapshot_id = None
         self._latest_result = None
         self.report_summary.set("回测失败")
+        self._clear_detail_tables()
         self._set_backtest_running(False)
         self._refresh_zoom_chart_header()
         messagebox.showerror("回测失败", str(exc), parent=self.window)
@@ -1704,7 +2340,10 @@ class BacktestWindow:
     def _build_config(self) -> StrategyConfig:
         definition = self._selected_strategy_definition()
         dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
+        slot_strategy = is_slot_handoff_strategy_id(definition.strategy_id)
         sizing_mode = BACKTEST_SIZING_OPTIONS[self.sizing_mode_label.get()]
+        if slot_strategy and sizing_mode != "fixed_size":
+            raise ValueError("槽位接管策略当前只支持固定数量。")
         size_or_risk = self._parse_positive_decimal(self.risk_amount.get(), "固定风险金/数量")
         risk_percent = None
         order_size = Decimal("0")
@@ -1732,6 +2371,10 @@ class BacktestWindow:
             entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
             dynamic_two_r_break_even = bool(self.dynamic_two_r_break_even.get())
             dynamic_fee_offset_enabled = bool(self.dynamic_fee_offset_enabled.get())
+        if slot_strategy:
+            max_entries_per_trend = self._parse_positive_int(self.max_entries_per_trend.get(), "最大槽位数")
+        entry_slippage_rate = self._parse_nonnegative_decimal(self.entry_slippage_percent.get(), "开仓滑点") / Decimal("100")
+        exit_slippage_rate = self._parse_nonnegative_decimal(self.exit_slippage_percent.get(), "平仓滑点") / Decimal("100")
         return StrategyConfig(
             inst_id=self.symbol.get().strip().upper(),
             bar="4H" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else _backtest_bar_value_from_label(self.bar_label.get()),
@@ -1764,7 +2407,9 @@ class BacktestWindow:
             backtest_sizing_mode=sizing_mode,
             backtest_risk_percent=risk_percent,
             backtest_compounding=bool(self.compounding_enabled.get()),
-            backtest_slippage_rate=self._parse_nonnegative_decimal(self.slippage_percent.get(), "滑点") / Decimal("100"),
+            backtest_entry_slippage_rate=entry_slippage_rate,
+            backtest_exit_slippage_rate=exit_slippage_rate,
+            backtest_slippage_rate=exit_slippage_rate,
             backtest_funding_rate=self._parse_nonnegative_decimal(self.funding_rate_percent.get(), "资金费率/8h")
             / Decimal("100"),
         )
@@ -1779,6 +2424,7 @@ class BacktestWindow:
     def _apply_selected_strategy_definition(self) -> None:
         definition = self._selected_strategy_definition()
         dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
+        slot_strategy = is_slot_handoff_strategy_id(definition.strategy_id)
         self.signal_combo["values"] = definition.allowed_signal_labels
         if self.signal_mode_label.get() not in definition.allowed_signal_labels:
             self.signal_mode_label.set(definition.default_signal_label)
@@ -1819,9 +2465,30 @@ class BacktestWindow:
                     widget.grid()
                 else:
                     widget.grid_remove()
+            if slot_strategy:
+                self.max_entries_caption.configure(text="最大槽位数")
+                self.max_entries_caption.grid()
+                self.max_entries_entry.grid()
+            elif not dynamic_strategy:
+                self.max_entries_caption.configure(text="每波最多开仓次数")
         if dynamic_strategy and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
+        if slot_strategy:
+            self.take_profit_mode_label.set("固定止盈")
+            if not self.max_entries_per_trend.get().strip() or self.max_entries_per_trend.get().strip() == "0":
+                self.max_entries_per_trend.set("10")
+            if BACKTEST_SIZING_OPTIONS.get(self.sizing_mode_label.get()) != "fixed_size":
+                self.sizing_mode_label.set("固定数量")
+            if not self.risk_amount.get().strip():
+                self.risk_amount.set("1")
         self._sync_dynamic_take_profit_controls()
+        self._update_sizing_mode_widgets()
+        if self._latest_result is None:
+            self.manual_summary.set(
+                "等待回测结果后，这里会显示人工接管仓位。"
+                if slot_strategy
+                else "当前策略未启用人工接管池。"
+            )
 
     def _sync_dynamic_take_profit_controls(self) -> None:
         if not hasattr(self, "dynamic_two_r_break_even_check"):
@@ -2114,6 +2781,59 @@ class BacktestWindow:
             if self._widget_exists(widget):
                 widget.grid_remove()
 
+    def _render_strategy_pool_matrix(self, snapshots: list[_BacktestSnapshot]) -> None:
+        columns = min(3, max(len(snapshots), 1))
+        for column in range(columns):
+            self.matrix_grid_frame.columnconfigure(column, weight=1)
+        rows = max((len(snapshots) + columns - 1) // columns, 1)
+        for row in range(rows):
+            self.matrix_grid_frame.rowconfigure(row, weight=1)
+
+        for index, snapshot in enumerate(snapshots):
+            row = index // columns
+            column = index % columns
+            frame = ttk.Frame(self.matrix_grid_frame, padding=12, relief="groove")
+            frame.grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
+            frame.columnconfigure(0, weight=1)
+            profile_name = strategy_pool_profile_name(snapshot.config)
+            metrics_text = (
+                f"总盈亏：{format_decimal_fixed(snapshot.report.total_pnl, 4)}\n"
+                f"胜率：{format_decimal_fixed(snapshot.report.win_rate, 2)}%\n"
+                f"交易数：{snapshot.report.total_trades}笔\n"
+                f"移交：{snapshot.report.manual_handoffs} / 期末人工池：{snapshot.report.manual_open_positions}\n"
+                f"峰值占槽：{snapshot.report.max_total_occupied_slots}"
+            )
+            ttk.Label(
+                frame,
+                text=profile_name,
+                anchor="center",
+                justify="center",
+            ).grid(row=0, column=0, sticky="ew")
+            ttk.Label(
+                frame,
+                text=(
+                    f"{snapshot.config.backtest_profile_summary}\n"
+                    f"EMA{snapshot.config.ema_period}/{snapshot.config.trend_ema_period} | "
+                    f"ATR{snapshot.config.atr_period} | "
+                    f"SL x{format_decimal(snapshot.config.atr_stop_multiplier)} | "
+                    f"TP x{format_decimal(snapshot.config.atr_take_multiplier)}"
+                ),
+                anchor="w",
+                justify="left",
+                wraplength=300,
+            ).grid(row=1, column=0, sticky="ew", pady=(8, 8))
+            ttk.Label(
+                frame,
+                text=metrics_text,
+                anchor="w",
+                justify="left",
+            ).grid(row=2, column=0, sticky="ew")
+            ttk.Button(
+                frame,
+                text="加载该候选",
+                command=lambda sid=snapshot.snapshot_id: self._load_snapshot(sid),
+            ).grid(row=3, column=0, sticky="ew", pady=(10, 0))
+
     def _show_batch_matrix_v2(self, batch_label: str | None) -> None:
         self._current_matrix_batch_label = batch_label
         for child in self.matrix_grid_frame.winfo_children():
@@ -2133,7 +2853,7 @@ class BacktestWindow:
             )
             symbol_text = current_snapshot.config.inst_id
             bar_text = _normalize_backtest_bar_label(current_snapshot.config.bar)
-            strategy_name = STRATEGY_ID_TO_NAME.get(current_snapshot.config.strategy_id, current_snapshot.config.strategy_id)
+            strategy_name = _strategy_display_name(current_snapshot.config)
             entry_reference_ema = current_snapshot.config.resolved_entry_reference_ema_period()
             take_profit_label = (
                 "动态止盈"
@@ -2258,6 +2978,16 @@ class BacktestWindow:
             taker_fee_rate=ordered_snapshots[0].taker_fee_rate,
         )
         start_text, end_text = _backtest_snapshot_range_text(ordered_snapshots[0])
+
+        if batch_mode == "strategy_pool":
+            self.matrix_summary.set(
+                f"5m 策略池批次：{batch_label} ｜ 交易对：{symbol_text} ｜ 周期：{bar_text} ｜ "
+                f"方向：{signal_label} ｜ 开始时间：{start_text} ｜ 结束时间：{end_text} ｜ "
+                f"共 {len(ordered_snapshots)} 组候选，批量深测固定使用 5m 候选参数，仅保留你的方向、槽位和费用设定。"
+            )
+            self._render_strategy_pool_matrix(ordered_snapshots)
+            self._show_batch_heatmap_v2(batch_label)
+            return
 
         if batch_mode == "dynamic_entries":
             self.matrix_summary.set(
@@ -2423,7 +3153,13 @@ class BacktestWindow:
         signal_label = SIGNAL_VALUE_TO_LABEL.get(ordered_snapshots[0].config.signal_mode, ordered_snapshots[0].config.signal_mode)
         symbol_text = ordered_snapshots[0].config.inst_id
         bar_text = _normalize_backtest_bar_label(ordered_snapshots[0].config.bar)
-        if batch_mode == "dynamic_entries":
+        if batch_mode == "strategy_pool":
+            render_snapshots = ordered_snapshots
+            self.heatmap_summary.set(
+                f"批次：{batch_label} | 交易对：{symbol_text} | 周期：{bar_text} | 方向：{signal_label} | "
+                f"指标：{metric_label} | 当前为 5m 槽位接管候选策略池。"
+            )
+        elif batch_mode == "dynamic_entries":
             render_snapshots = ordered_snapshots
             self.heatmap_summary.set(
                 f"批次：{batch_label} | 交易对：{symbol_text} | 周期：{bar_text} | 信号方向：{signal_label} | "
@@ -2452,6 +3188,33 @@ class BacktestWindow:
         grid_width = width - left - right
         grid_height = height - top - bottom
         canvas.create_rectangle(left, top, left + grid_width, top + grid_height, outline="#d0d7de", width=1)
+
+        if batch_mode == "strategy_pool":
+            columns = min(3, max(len(render_snapshots), 1))
+            rows = max((len(render_snapshots) + columns - 1) // columns, 1)
+            cell_width = grid_width / max(columns, 1)
+            cell_height = grid_height / max(rows, 1)
+            for index, snapshot in enumerate(render_snapshots):
+                row = index // columns
+                column = index % columns
+                x1 = left + (column * cell_width)
+                y1 = top + (row * cell_height)
+                x2 = x1 + cell_width
+                y2 = y1 + cell_height
+                value = _heatmap_metric_value(snapshot, metric_label)
+                fill = _heatmap_fill_color(value, min_value, max_value)
+                item_id = canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="#d0d7de")
+                text_id = canvas.create_text(
+                    (x1 + x2) / 2,
+                    (y1 + y2) / 2,
+                    text=f"{strategy_pool_profile_name(snapshot.config)}\n{_heatmap_metric_text(snapshot, metric_label)}",
+                    width=cell_width - 18,
+                    fill="#24292f",
+                    font=("Microsoft YaHei UI", 11),
+                )
+                canvas.tag_bind(item_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+                canvas.tag_bind(text_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+            return
 
         if batch_mode == "dynamic_entries":
             cell_width = grid_width / max(len(levels), 1)
@@ -2587,6 +3350,9 @@ class BacktestWindow:
         self.compare_detail_text.delete("1.0", END)
         self._update_compare_summary()
         self._show_batch_matrix(None)
+        self.report_summary.set("暂无选中回测。")
+        self.report_text.delete("1.0", END)
+        self._clear_detail_tables()
         self._populate_period_stats(self.monthly_stats_tree, [])
         self._populate_period_stats(self.yearly_stats_tree, [])
         self._set_chart_title("K线图、资金曲线与止盈止损触发位置 | 暂无选中回测")
@@ -2607,7 +3373,7 @@ class BacktestWindow:
         start_text, end_text = _backtest_snapshot_range_text(snapshot)
         summary_text = (
             f"\u7f16\u53f7\uff1a{snapshot.snapshot_id} | \u65f6\u95f4\uff1a{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
-            f"\u7b56\u7565\uff1a{STRATEGY_ID_TO_NAME.get(snapshot.config.strategy_id, snapshot.config.strategy_id)} | "
+            f"\u7b56\u7565\uff1a{_strategy_display_name(snapshot.config)} | "
             f"\u4ea4\u6613\u5bf9\uff1a{snapshot.config.inst_id} | K\u7ebf\uff1a{_normalize_backtest_bar_label(snapshot.config.bar)} | "
             f"M费\uff1a{_format_fee_rate_percent(snapshot.maker_fee_rate)} | T费\uff1a{_format_fee_rate_percent(snapshot.taker_fee_rate)} | "
             f"\u5f00\u59cb\uff1a{start_text} | \u7ed3\u675f\uff1a{end_text} | "
@@ -2615,43 +3381,22 @@ class BacktestWindow:
         )
         if result.data_source_note:
             summary_text = f"{summary_text}\n{result.data_source_note}"
-        if snapshot.export_path:
-            summary_text = f"{summary_text}\n报告文件：{snapshot.export_path}"
+        export_lines = _backtest_export_detail_lines(snapshot.export_path)
+        if export_lines:
+            summary_text = f"{summary_text}\n" + "\n".join(export_lines)
         self.report_summary.set(summary_text)
         self.report_text.delete("1.0", END)
         self.report_text.insert("1.0", format_backtest_report(result))
-        self.trade_tree.delete(*self.trade_tree.get_children())
-        for index, trade in enumerate(result.trades, start=1):
-            exit_reason = {
-                "take_profit": "\u6b62\u76c8",
-                "stop_loss": "\u6b62\u635f",
-            }.get(trade.exit_reason, trade.exit_reason)
-            self.trade_tree.insert(
-                "",
-                END,
-                iid=f"T{index:03d}",
-                values=(
-                    index,
-                    "\u505a\u591a" if trade.signal == "long" else "\u505a\u7a7a",
-                    _format_chart_timestamp(trade.entry_ts),
-                    format_decimal_fixed(trade.entry_price, 4),
-                    format_decimal_fixed(trade.stop_loss, 4),
-                    format_decimal_fixed(trade.atr_value, 4),
-                    format_decimal_fixed(trade.size, 4),
-                    _format_chart_timestamp(trade.exit_ts),
-                    format_decimal_fixed(trade.exit_price, 4),
-                    format_decimal_fixed(trade.total_fee, 4),
-                    exit_reason,
-                    format_decimal_fixed(trade.pnl, 4),
-                    format_decimal_fixed(trade.r_multiple, 4),
-                ),
-            )
+        self._populate_trade_tree(result.trades)
+        self._populate_manual_tree(result, snapshot.config)
         if self.compare_tree.exists(snapshot.snapshot_id):
             self.compare_tree.selection_set(snapshot.snapshot_id)
             self.compare_tree.focus(snapshot.snapshot_id)
             self.compare_tree.see(snapshot.snapshot_id)
         self._update_compare_detail(snapshot)
         self._show_batch_matrix_for_snapshot(snapshot.snapshot_id)
+        self._populate_period_stats(self.monthly_stats_tree, result.monthly_stats)
+        self._populate_period_stats(self.yearly_stats_tree, result.yearly_stats)
         self._redraw_all_charts()
 
     def _bind_chart_interactions(self, canvas: Canvas) -> None:
@@ -2869,6 +3614,17 @@ class BacktestWindow:
                     float(trade.take_profit),
                 ]
             )
+        for manual_position in result.manual_positions:
+            if manual_position.handoff_index < start_index or manual_position.entry_index >= end_index:
+                continue
+            plotted_prices.extend(
+                [
+                    float(manual_position.entry_price),
+                    float(manual_position.handoff_price),
+                    float(manual_position.current_price),
+                    float(manual_position.break_even_price),
+                ]
+            )
         price_max = max(plotted_prices)
         price_min = min(plotted_prices)
         if price_max == price_min:
@@ -3037,6 +3793,80 @@ class BacktestWindow:
                     text="TP" if trade.exit_reason == "take_profit" else "SL",
                     anchor="w",
                     fill=exit_color,
+                )
+
+        selected_manual_position = self._selected_manual_position()
+        for manual_position in result.manual_positions:
+            if manual_position.handoff_index < start_index or manual_position.entry_index >= end_index:
+                continue
+            entry_visible = start_index <= manual_position.entry_index < end_index
+            handoff_visible = start_index <= manual_position.handoff_index < end_index
+            if not entry_visible and not handoff_visible:
+                continue
+            manual_color = "#9a6700" if manual_position.signal == "long" else "#bc4c00"
+            highlight_width = 3 if manual_position == selected_manual_position else 2
+            if entry_visible:
+                entry_x = x_for(manual_position.entry_index)
+                entry_y = y_for(manual_position.entry_price)
+                canvas.create_polygon(
+                    entry_x,
+                    entry_y - 7,
+                    entry_x - 6,
+                    entry_y + 5,
+                    entry_x + 6,
+                    entry_y + 5,
+                    fill=manual_color,
+                    outline="",
+                )
+            else:
+                entry_x = None
+                entry_y = None
+            if handoff_visible:
+                handoff_x = x_for(manual_position.handoff_index)
+                handoff_y = y_for(manual_position.handoff_price)
+                canvas.create_polygon(
+                    handoff_x,
+                    handoff_y - 6,
+                    handoff_x - 6,
+                    handoff_y,
+                    handoff_x,
+                    handoff_y + 6,
+                    handoff_x + 6,
+                    handoff_y,
+                    fill="#f59e0b",
+                    outline="",
+                )
+                break_even_y = y_for(manual_position.break_even_price)
+                canvas.create_line(
+                    max(left, handoff_x - 28),
+                    break_even_y,
+                    min(width - right, handoff_x + 28),
+                    break_even_y,
+                    fill="#f59e0b",
+                    dash=(3, 2),
+                    width=1,
+                )
+                if not fast_mode:
+                    canvas.create_text(
+                        handoff_x + 8,
+                        handoff_y - 8,
+                        text="转人工",
+                        anchor="sw",
+                        fill="#9a6700",
+                        font=("Microsoft YaHei UI", 9, "bold"),
+                    )
+            else:
+                handoff_x = None
+                handoff_y = None
+            if entry_visible and handoff_visible and entry_x is not None and entry_y is not None and handoff_x is not None and handoff_y is not None:
+                canvas.create_line(
+                    entry_x,
+                    entry_y,
+                    handoff_x,
+                    handoff_y,
+                    fill=manual_color,
+                    width=highlight_width,
+                    dash=(4, 3),
                 )
 
         time_label_target = 4 if fast_mode else 6
@@ -3265,7 +4095,7 @@ class BacktestWindow:
         config = snapshot.config
         result = snapshot.result
         report = result.report
-        strategy_name = STRATEGY_ID_TO_NAME.get(config.strategy_id, config.strategy_id)
+        strategy_name = _strategy_display_name(config)
         signal_label = SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)
         entry_reference_ema = config.resolved_entry_reference_ema_period()
         take_profit_label = "动态止盈" if config.take_profit_mode == "dynamic" else f"固定止盈(TP x{format_decimal(config.atr_take_multiplier)})"
