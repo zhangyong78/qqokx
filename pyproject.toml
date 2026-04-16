@@ -1,6 +1,6 @@
 ﻿[project]
 name = "okx-quant-mvp"
-version = "0.3.93"
+version = "0.3.94"
 description = "Desktop MVP for OKX EMA signal trading with ATR-based TP/SL"
 requires-python = ">=3.11"
 

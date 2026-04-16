@@ -241,6 +241,24 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(next_take_profit, Decimal("69.9"))
         self.assertEqual(next_trigger_r, 3)
 
+    def test_dynamic_live_break_even_can_disable_fee_offset(self) -> None:
+        stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
+            direction="long",
+            current_price=Decimal("120"),
+            entry_price=Decimal("100"),
+            risk_per_unit=Decimal("10"),
+            current_stop_loss=Decimal("90"),
+            next_trigger_r=2,
+            tick_size=Decimal("0.1"),
+            two_r_break_even=True,
+            dynamic_fee_offset_enabled=False,
+        )
+
+        self.assertTrue(moved)
+        self.assertEqual(stop_loss, Decimal("100"))
+        self.assertEqual(next_take_profit, Decimal("130"))
+        self.assertEqual(next_trigger_r, 3)
+
     def test_cross_strategy_stop_loss_uses_signal_candle_low_minus_one_atr(self) -> None:
         instrument = Instrument(
             inst_id="BTC-USDT-SWAP",

@@ -138,7 +138,8 @@ class BacktestResult:
     funding_rate: Decimal = Decimal("0")
     take_profit_mode: str = "fixed"
     dynamic_two_r_break_even: bool = False
-    max_entries_per_trend: int = 0
+    dynamic_fee_offset_enabled: bool = True
+    max_entries_per_trend: int = 1
     sizing_mode: str = "fixed_risk"
     compounding: bool = False
     open_position: "BacktestOpenPosition | None" = None
@@ -185,6 +186,7 @@ class _OpenPosition:
     next_dynamic_trigger_r: int = 2
     dynamic_exit_fee_rate: Decimal = Decimal("0")
     dynamic_two_r_break_even: bool = False
+    dynamic_fee_offset_enabled: bool = True
     entry_fee_rate: Decimal = Decimal("0")
     entry_fee_type: str = "none"
     entry_slippage_cost: Decimal = Decimal("0")
@@ -532,6 +534,7 @@ def _run_backtest_with_loaded_data(
         funding_rate=config.backtest_funding_rate,
         take_profit_mode=str(config.take_profit_mode),
         dynamic_two_r_break_even=bool(config.dynamic_two_r_break_even),
+        dynamic_fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
         max_entries_per_trend=int(config.max_entries_per_trend),
         sizing_mode=config.backtest_sizing_mode,
         compounding=config.backtest_compounding,
@@ -607,14 +610,22 @@ def format_backtest_report(result: BacktestResult) -> str:
             lines.append(
                 f"2R保本开关：{'开启' if result.dynamic_two_r_break_even else '关闭'}"
             )
+            lines.append(
+                f"手续费偏移开关：{'开启' if result.dynamic_fee_offset_enabled else '关闭'}"
+            )
             if result.dynamic_two_r_break_even:
-                lines.append(
-                    "止盈说明：动态止盈按 2 倍 Taker 手续费留出缓冲，2R 先上移到开仓价+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
+                description = (
+                    "止盈说明：动态止盈在 2R 时先上移到开仓价+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
+                    if result.dynamic_fee_offset_enabled
+                    else "止盈说明：动态止盈在 2R 时先上移到开仓价，3R 起按 n-1R 递推；固定止盈为 ATR 倍数止盈。"
                 )
             else:
-                lines.append(
-                    "止盈说明：动态止盈按 2 倍 Taker 手续费留出缓冲，2R 直接上移到 1R+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
+                description = (
+                    "止盈说明：动态止盈在 2R 时上移到 1R+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
+                    if result.dynamic_fee_offset_enabled
+                    else "止盈说明：动态止盈在 2R 时上移到 1R，3R 起按 n-1R 递推；固定止盈为 ATR 倍数止盈。"
                 )
+            lines.append(description)
         else:
             lines.append("止盈说明：固定止盈为 ATR 倍数止盈。")
         lines.append("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓")
@@ -997,6 +1008,7 @@ def _run_dynamic_backtest(
                 dynamic_take_profit_enabled=dynamic_take_profit_enabled,
                 dynamic_exit_fee_rate=taker_fee_rate,
                 dynamic_two_r_break_even=config.dynamic_two_r_break_even,
+                dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
             )
             active_plan = None
             if filled_position is not None:
@@ -1263,6 +1275,7 @@ def _create_open_position(
     dynamic_take_profit_enabled: bool = False,
     dynamic_exit_fee_rate: Decimal = Decimal("0"),
     dynamic_two_r_break_even: bool = False,
+    dynamic_fee_offset_enabled: bool = True,
     next_dynamic_trigger_r: int = 2,
     current_take_profit: Decimal | None = None,
 ) -> _OpenPosition:
@@ -1294,6 +1307,7 @@ def _create_open_position(
         next_dynamic_trigger_r=next_dynamic_trigger_r,
         dynamic_exit_fee_rate=dynamic_exit_fee_rate,
         dynamic_two_r_break_even=dynamic_two_r_break_even,
+        dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
         entry_fee_rate=entry_fee_rate,
         entry_fee_type=entry_fee_type,
         entry_slippage_cost=abs(entry_price - entry_price_raw) * abs(size),
@@ -1319,6 +1333,7 @@ def _try_fill_dynamic_order(
     dynamic_take_profit_enabled: bool = False,
     dynamic_exit_fee_rate: Decimal = Decimal("0"),
     dynamic_two_r_break_even: bool = False,
+    dynamic_fee_offset_enabled: bool = True,
 ) -> _OpenPosition | None:
     filled = candle.low <= plan.entry_reference <= candle.high
     if not filled:
@@ -1342,6 +1357,7 @@ def _try_fill_dynamic_order(
         dynamic_take_profit_enabled=dynamic_take_profit_enabled,
         dynamic_exit_fee_rate=dynamic_exit_fee_rate,
         dynamic_two_r_break_even=dynamic_two_r_break_even,
+        dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
     )
 
 
@@ -1395,14 +1411,18 @@ def _candle_path_points(candle: Candle) -> tuple[Decimal, ...]:
     return candle.open, candle.high, candle.low, candle.close
 
 
-def _dynamic_fee_offset(entry_price: Decimal, exit_fee_rate: Decimal) -> Decimal:
-    if exit_fee_rate <= 0:
+def _dynamic_fee_offset(entry_price: Decimal, exit_fee_rate: Decimal, *, enabled: bool = True) -> Decimal:
+    if not enabled or exit_fee_rate <= 0:
         return Decimal("0")
     return abs(entry_price) * exit_fee_rate * Decimal("2")
 
 
 def _dynamic_trigger_price(position: _OpenPosition, trigger_r: int) -> Decimal:
-    fee_offset = _dynamic_fee_offset(position.entry_price, position.dynamic_exit_fee_rate)
+    fee_offset = _dynamic_fee_offset(
+        position.entry_price,
+        position.dynamic_exit_fee_rate,
+        enabled=position.dynamic_fee_offset_enabled,
+    )
     offset = (position.risk_per_unit * Decimal(str(trigger_r))) + fee_offset
     raw = position.entry_price + offset if position.signal == "long" else position.entry_price - offset
     rounding = "up" if position.signal == "long" else "down"
@@ -1414,7 +1434,11 @@ def _dynamic_stop_price(position: _OpenPosition, trigger_r: int) -> Decimal:
     if position.dynamic_two_r_break_even and trigger_r == 2:
         lock_multiple = 0
     locked_offset = position.risk_per_unit * Decimal(str(lock_multiple))
-    fee_offset = _dynamic_fee_offset(position.entry_price, position.dynamic_exit_fee_rate)
+    fee_offset = _dynamic_fee_offset(
+        position.entry_price,
+        position.dynamic_exit_fee_rate,
+        enabled=position.dynamic_fee_offset_enabled,
+    )
     raw = (
         position.entry_price + locked_offset + fee_offset
         if position.signal == "long"

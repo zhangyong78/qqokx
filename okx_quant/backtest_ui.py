@@ -107,6 +107,7 @@ class BacktestLaunchState:
     take_profit_mode_label: str
     max_entries_per_trend: str
     dynamic_two_r_break_even: bool
+    dynamic_fee_offset_enabled: bool
     signal_mode_label: str
     trade_mode_label: str
     position_mode_label: str
@@ -380,6 +381,7 @@ def _build_backtest_param_summary(
         extra_parts = [take_profit_label]
         if config.take_profit_mode == "dynamic":
             extra_parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
+            extra_parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
         extra_parts.append(max_entries_text)
         extra_text = " / ".join(extra_parts)
         return (
@@ -527,6 +529,7 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "take_profit_mode": config.take_profit_mode,
         "max_entries_per_trend": config.max_entries_per_trend,
         "dynamic_two_r_break_even": config.dynamic_two_r_break_even,
+        "dynamic_fee_offset_enabled": config.dynamic_fee_offset_enabled,
         "backtest_initial_capital": str(config.backtest_initial_capital),
         "backtest_sizing_mode": config.backtest_sizing_mode,
         "backtest_risk_percent": None
@@ -545,9 +548,9 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         ema_period=int(payload.get("ema_period", 21)),
         trend_ema_period=int(payload.get("trend_ema_period", 55)),
         big_ema_period=int(payload.get("big_ema_period", 233)),
-        entry_reference_ema_period=int(payload.get("entry_reference_ema_period", 0)),
+        entry_reference_ema_period=int(payload.get("entry_reference_ema_period", 55)),
         atr_period=int(payload.get("atr_period", 14)),
-        atr_stop_multiplier=Decimal(str(payload.get("atr_stop_multiplier", "2"))),
+        atr_stop_multiplier=Decimal(str(payload.get("atr_stop_multiplier", "1.5"))),
         atr_take_multiplier=Decimal(str(payload.get("atr_take_multiplier", "4"))),
         order_size=Decimal(str(payload.get("order_size", "0"))),
         trade_mode=str(payload.get("trade_mode", "cross")),
@@ -567,9 +570,10 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         else str(payload.get("local_tp_sl_inst_id")),
         entry_side_mode=str(payload.get("entry_side_mode", "follow_signal")),
         run_mode=str(payload.get("run_mode", "trade")),
-        take_profit_mode=str(payload.get("take_profit_mode", "fixed")),
-        max_entries_per_trend=int(payload.get("max_entries_per_trend", 0)),
-        dynamic_two_r_break_even=bool(payload.get("dynamic_two_r_break_even", False)),
+        take_profit_mode=str(payload.get("take_profit_mode", "dynamic")),
+        max_entries_per_trend=int(payload.get("max_entries_per_trend", 1)),
+        dynamic_two_r_break_even=bool(payload.get("dynamic_two_r_break_even", True)),
+        dynamic_fee_offset_enabled=bool(payload.get("dynamic_fee_offset_enabled", True)),
         backtest_initial_capital=Decimal(str(payload.get("backtest_initial_capital", "10000"))),
         backtest_sizing_mode=str(payload.get("backtest_sizing_mode", "fixed_risk")),
         backtest_risk_percent=None
@@ -860,6 +864,7 @@ class BacktestWindow:
         self.take_profit_mode_label = StringVar(value=initial_state.take_profit_mode_label)
         self.max_entries_per_trend = StringVar(value=initial_state.max_entries_per_trend)
         self.dynamic_two_r_break_even = BooleanVar(value=initial_state.dynamic_two_r_break_even)
+        self.dynamic_fee_offset_enabled = BooleanVar(value=initial_state.dynamic_fee_offset_enabled)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
         self.position_mode_label = StringVar(value=initial_state.position_mode_label)
@@ -1014,10 +1019,25 @@ class BacktestWindow:
         row += 1
         self.dynamic_two_r_break_even_check = ttk.Checkbutton(
             controls,
-            text="启用2R保本（2R时移动到开仓价+2倍Taker手续费）",
+            text="启用2R保本（2R时先移到保本位）",
             variable=self.dynamic_two_r_break_even,
         )
         self.dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=(12, 0))
+
+        row += 1
+        self.dynamic_fee_offset_check = ttk.Checkbutton(
+            controls,
+            text="启用手续费偏移（按2倍Taker手续费留缓冲）",
+            variable=self.dynamic_fee_offset_enabled,
+        )
+        self.dynamic_fee_offset_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        row += 1
+        self.dynamic_fee_offset_hint_label = ttk.Label(
+            controls,
+            text="提示：保本位是否叠加手续费偏移，由下方开关决定；大部分组合开启更优，默认建议开启。",
+        )
+        self.dynamic_fee_offset_hint_label.grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         row += 1
         self.size_or_risk_label = ttk.Label(controls, text="固定风险金/数量")
@@ -1705,11 +1725,13 @@ class BacktestWindow:
         max_entries_per_trend = 0
         entry_reference_ema_period = 0
         dynamic_two_r_break_even = False
+        dynamic_fee_offset_enabled = False
         if dynamic_strategy:
             take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
             max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
             entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
             dynamic_two_r_break_even = bool(self.dynamic_two_r_break_even.get())
+            dynamic_fee_offset_enabled = bool(self.dynamic_fee_offset_enabled.get())
         return StrategyConfig(
             inst_id=self.symbol.get().strip().upper(),
             bar="4H" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else _backtest_bar_value_from_label(self.bar_label.get()),
@@ -1737,6 +1759,7 @@ class BacktestWindow:
             take_profit_mode=take_profit_mode,
             max_entries_per_trend=max_entries_per_trend,
             dynamic_two_r_break_even=dynamic_two_r_break_even,
+            dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
             backtest_initial_capital=self._parse_positive_decimal(self.initial_capital.get(), "初始资金"),
             backtest_sizing_mode=sizing_mode,
             backtest_risk_percent=risk_percent,
@@ -1788,6 +1811,8 @@ class BacktestWindow:
                 self.max_entries_caption,
                 self.max_entries_entry,
                 self.dynamic_two_r_break_even_check,
+                self.dynamic_fee_offset_check,
+                self.dynamic_fee_offset_hint_label,
             )
             for widget in dynamic_widgets:
                 if dynamic_strategy:
@@ -1795,7 +1820,7 @@ class BacktestWindow:
                 else:
                     widget.grid_remove()
         if dynamic_strategy and not self.entry_reference_ema_period.get().strip():
-            self.entry_reference_ema_period.set("0")
+            self.entry_reference_ema_period.set("55")
         self._sync_dynamic_take_profit_controls()
 
     def _sync_dynamic_take_profit_controls(self) -> None:
@@ -1807,6 +1832,7 @@ class BacktestWindow:
             dynamic_strategy and TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "fixed") == "dynamic"
         )
         self.dynamic_two_r_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
+        self.dynamic_fee_offset_check.configure(state="normal" if dynamic_take_profit else "disabled")
 
     def _append_backtest_snapshot(
         self,
@@ -3256,6 +3282,7 @@ class BacktestWindow:
         ]
         if config.take_profit_mode == "dynamic":
             metrics_parts.append(f"2R保本：{config.dynamic_two_r_break_even_label()}")
+            metrics_parts.append(f"手续费偏移：{config.dynamic_fee_offset_enabled_label()}")
         metrics_parts.extend(
             [
                 f"每波开仓：{max_entries_label}",

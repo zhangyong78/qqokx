@@ -260,6 +260,7 @@ def _build_batch_scope_line(
             "SL = 1/1.5/2 ATR；"
             "每波最多开仓次数 = 0/1/2/3；"
             f"2R保本 = {results[0][0].dynamic_two_r_break_even_label()}；"
+            f"手续费偏移 = {results[0][0].dynamic_fee_offset_enabled_label()}；"
             f"手续费 M/T = {maker_fee} / {taker_fee}"
         )
     if batch_mode == "fixed_entries":
@@ -355,6 +356,7 @@ def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
         parts.append(f"止盈方式{'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}")
         if config.take_profit_mode == "dynamic":
             parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
+            parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
         parts.append(f"每波最多开仓次数{_format_max_entries_label(config.max_entries_per_trend)}")
     parts.extend(
         [

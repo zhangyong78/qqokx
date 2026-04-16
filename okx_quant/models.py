@@ -83,10 +83,11 @@ class StrategyConfig:
     backtest_compounding: bool = False
     backtest_slippage_rate: Decimal = Decimal("0")
     backtest_funding_rate: Decimal = Decimal("0")
-    take_profit_mode: TakeProfitMode = "fixed"
-    max_entries_per_trend: int = 0
-    entry_reference_ema_period: int = 0
-    dynamic_two_r_break_even: bool = False
+    take_profit_mode: TakeProfitMode = "dynamic"
+    max_entries_per_trend: int = 1
+    entry_reference_ema_period: int = 55
+    dynamic_two_r_break_even: bool = True
+    dynamic_fee_offset_enabled: bool = True
 
     def resolved_entry_reference_ema_period(self) -> int:
         if self.entry_reference_ema_period > 0:
@@ -101,6 +102,9 @@ class StrategyConfig:
 
     def dynamic_two_r_break_even_label(self) -> str:
         return "\u5f00\u542f" if self.dynamic_two_r_break_even else "\u5173\u95ed"
+
+    def dynamic_fee_offset_enabled_label(self) -> str:
+        return "\u5f00\u542f" if self.dynamic_fee_offset_enabled else "\u5173\u95ed"
 
 
 

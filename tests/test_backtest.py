@@ -159,6 +159,29 @@ class BacktestTest(TestCase):
 
         self.assertEqual(stop_price, Decimal("100.1"))
 
+    def test_dynamic_backtest_stop_can_disable_fee_offset_and_move_to_plain_break_even_at_2r(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("120"),
+            initial_stop_loss=Decimal("90"),
+            initial_take_profit=Decimal("120"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            dynamic_exit_fee_rate=Decimal("0.00036"),
+            dynamic_two_r_break_even=True,
+            dynamic_fee_offset_enabled=False,
+        )
+
+        stop_price = _dynamic_stop_price(position, 2)
+
+        self.assertEqual(stop_price, Decimal("100"))
+
     def test_backtest_risk_size_below_min_order_size_is_clamped_to_min_size(self) -> None:
         instrument = Instrument(
             inst_id="BNB-USDT-SWAP",
@@ -1260,6 +1283,7 @@ class BacktestTest(TestCase):
                     tp_sl_trigger_type="mark",
                     strategy_id=STRATEGY_DYNAMIC_ID,
                     risk_amount=Decimal("100"),
+                    take_profit_mode="fixed",
                 )
                 results = []
                 for take_multiplier, total_pnl in (
@@ -1283,6 +1307,7 @@ class BacktestTest(TestCase):
                         tp_sl_trigger_type=base_config.tp_sl_trigger_type,
                         strategy_id=base_config.strategy_id,
                         risk_amount=base_config.risk_amount,
+                        take_profit_mode="fixed",
                     )
                     result = BacktestResult(
                         candles=[
@@ -1315,6 +1340,7 @@ class BacktestTest(TestCase):
                         strategy_id=STRATEGY_DYNAMIC_ID,
                         maker_fee_rate=Decimal("0.0002"),
                         taker_fee_rate=Decimal("0.0005"),
+                        take_profit_mode="fixed",
                     )
                     results.append((config, result))
 
@@ -1664,6 +1690,7 @@ def _patched_dynamic_backtest_report_includes_ema_relationship_filter(self: Back
             tp_sl_trigger_type="mark",
             strategy_id=STRATEGY_DYNAMIC_ID,
             risk_amount=Decimal("100"),
+            entry_reference_ema_period=21,
         ),
         candle_limit=400,
     )
