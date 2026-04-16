@@ -117,7 +117,7 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(plan.stop_loss, Decimal("2480"))
         self.assertEqual(plan.take_profit, Decimal("2540"))
 
-    def test_dynamic_long_strategy_cannot_use_okx托管止盈止损(self) -> None:
+    def test_dynamic_long_strategy_can_use_okx托管止盈止损(self) -> None:
         instrument = Instrument(
             inst_id="BTC-USDT-SWAP",
             inst_type="SWAP",
@@ -144,9 +144,9 @@ class StrategyEngineTest(TestCase):
             strategy_id=STRATEGY_DYNAMIC_LONG_ID,
         )
 
-        self.assertFalse(can_use_exchange_managed_orders(config, instrument, instrument))
+        self.assertTrue(can_use_exchange_managed_orders(config, instrument, instrument))
 
-    def test_dynamic_short_strategy_cannot_use_okx托管止盈止损(self) -> None:
+    def test_dynamic_short_strategy_can_use_okx托管止盈止损(self) -> None:
         instrument = Instrument(
             inst_id="BTC-USDT-SWAP",
             inst_type="SWAP",
@@ -173,7 +173,7 @@ class StrategyEngineTest(TestCase):
             strategy_id=STRATEGY_DYNAMIC_SHORT_ID,
         )
 
-        self.assertFalse(can_use_exchange_managed_orders(config, instrument, instrument))
+        self.assertTrue(can_use_exchange_managed_orders(config, instrument, instrument))
 
     def test_dynamic_live_stop_locks_1r_at_2r(self) -> None:
         stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(

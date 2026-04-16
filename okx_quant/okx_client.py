@@ -1168,6 +1168,8 @@ class OkxRestClient:
         plan: OrderPlan,
         *,
         cl_ord_id: str | None = None,
+        include_take_profit: bool = True,
+        stop_loss_algo_cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
@@ -1180,14 +1182,12 @@ class OkxRestClient:
             "ordType": "market",
             "sz": format_decimal(plan.size),
             "attachAlgoOrds": [
-                {
-                    "tpTriggerPx": format_decimal(plan.take_profit),
-                    "tpOrdPx": "-1",
-                    "tpTriggerPxType": config.tp_sl_trigger_type,
-                    "slTriggerPx": format_decimal(plan.stop_loss),
-                    "slOrdPx": "-1",
-                    "slTriggerPxType": config.tp_sl_trigger_type,
-                }
+                _build_attached_algo_order(
+                    config=config,
+                    plan=plan,
+                    include_take_profit=include_take_profit,
+                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                )
             ],
         }
         if plan.pos_side:
@@ -1216,6 +1216,8 @@ class OkxRestClient:
         plan: OrderPlan,
         *,
         cl_ord_id: str | None = None,
+        include_take_profit: bool = True,
+        stop_loss_algo_cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
@@ -1229,14 +1231,12 @@ class OkxRestClient:
             "px": format_decimal(plan.entry_reference),
             "sz": format_decimal(plan.size),
             "attachAlgoOrds": [
-                {
-                    "tpTriggerPx": format_decimal(plan.take_profit),
-                    "tpOrdPx": "-1",
-                    "tpTriggerPxType": config.tp_sl_trigger_type,
-                    "slTriggerPx": format_decimal(plan.stop_loss),
-                    "slOrdPx": "-1",
-                    "slTriggerPxType": config.tp_sl_trigger_type,
-                }
+                _build_attached_algo_order(
+                    config=config,
+                    plan=plan,
+                    include_take_profit=include_take_profit,
+                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                )
             ],
         }
         if plan.pos_side:
@@ -1453,6 +1453,51 @@ class OkxRestClient:
             fallback_algo_cl_ord_id=algo_cl_ord_id,
         )
 
+    def amend_algo_order(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        algo_id: str | None = None,
+        algo_cl_ord_id: str | None = None,
+        req_id: str | None = None,
+        new_stop_loss_trigger_price: Decimal | None = None,
+        new_stop_loss_trigger_price_type: str | None = None,
+    ) -> OkxOrderResult:
+        if not algo_id and not algo_cl_ord_id:
+            raise ValueError("algo_id or algo_cl_ord_id is required")
+        if new_stop_loss_trigger_price is None:
+            raise ValueError("new_stop_loss_trigger_price is required")
+
+        body_item: dict[str, Any] = {
+            "instId": inst_id,
+            "newSlTriggerPx": format_decimal(new_stop_loss_trigger_price),
+            "newSlOrdPx": "-1",
+        }
+        if algo_id:
+            body_item["algoId"] = algo_id
+        if algo_cl_ord_id:
+            body_item["algoClOrdId"] = algo_cl_ord_id
+        if req_id:
+            body_item["reqId"] = req_id
+        if new_stop_loss_trigger_price_type:
+            body_item["newSlTriggerPxType"] = new_stop_loss_trigger_price_type
+
+        payload = self._request(
+            "POST",
+            "/api/v5/trade/amend-algos",
+            body=[body_item],
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        return self._parse_algo_order_result(
+            payload,
+            empty_message="OKX did not return an amend-algo result",
+            fallback_algo_cl_ord_id=algo_cl_ord_id,
+        )
+
     def _parse_order_result(
         self,
         payload: dict[str, Any],
@@ -1616,6 +1661,31 @@ def _to_bool(value: Any) -> bool | None:
     if normalized in {"false", "0", "no", "n"}:
         return False
     return None
+
+
+def _build_attached_algo_order(
+    *,
+    config: StrategyConfig,
+    plan: OrderPlan,
+    include_take_profit: bool = True,
+    stop_loss_algo_cl_ord_id: str | None = None,
+) -> dict[str, str]:
+    order = {
+        "slTriggerPx": format_decimal(plan.stop_loss),
+        "slOrdPx": "-1",
+        "slTriggerPxType": config.tp_sl_trigger_type,
+    }
+    if include_take_profit:
+        order.update(
+            {
+                "tpTriggerPx": format_decimal(plan.take_profit),
+                "tpOrdPx": "-1",
+                "tpTriggerPxType": config.tp_sl_trigger_type,
+            }
+        )
+    if stop_loss_algo_cl_ord_id:
+        order["attachAlgoClOrdId"] = stop_loss_algo_cl_ord_id
+    return order
 
 
 def _extract_tp_sl_fields(item: dict[str, Any]) -> dict[str, Decimal | str | None]:

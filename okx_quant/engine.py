@@ -9,7 +9,7 @@ from typing import Callable, Literal
 from okx_quant.indicators import atr, ema
 from okx_quant.models import Credentials, Instrument, OrderPlan, ProtectionPlan, StrategyConfig
 from okx_quant.notifications import EmailNotifier
-from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxRestClient
+from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxPosition, OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
@@ -59,6 +59,8 @@ class ManagedEntryOrder:
     cl_ord_id: str | None
     candle_ts: int
     entry_reference: Decimal
+    stop_loss: Decimal
+    stop_loss_algo_cl_ord_id: str | None
     size: Decimal
     side: Literal["buy", "sell"]
     signal: Literal["long", "short"]
@@ -153,7 +155,10 @@ class StrategyEngine:
                 raise RuntimeError("当前版本只支持永续或期权下单，现货暂时仅支持作为触发价格来源")
 
             if is_dynamic_strategy_id(config.strategy_id):
-                self._run_dynamic_local_strategy_v2(credentials, config, signal_instrument, trade_instrument)
+                if can_use_exchange_managed_orders(config, signal_instrument, trade_instrument):
+                    self._run_dynamic_exchange_strategy(credentials, config, trade_instrument)
+                else:
+                    self._run_dynamic_local_strategy_v2(credentials, config, signal_instrument, trade_instrument)
             elif config.strategy_id == STRATEGY_CROSS_ID:
                 if can_use_exchange_managed_orders(config, signal_instrument, trade_instrument):
                     self._run_cross_exchange_strategy(credentials, config, signal_instrument)
@@ -191,6 +196,7 @@ class StrategyEngine:
         )
         last_candle_ts: int | None = None
         active_order: ManagedEntryOrder | None = None
+        dynamic_stop_only = config.take_profit_mode == "dynamic"
 
         self._log_strategy_start(config, instrument, instrument)
         self._logger("运行模式：同标的永续下单，止盈止损交给 OKX 托管")
@@ -203,6 +209,11 @@ class StrategyEngine:
             f"止损ATR倍数={format_decimal(config.atr_stop_multiplier)} | "
             f"止盈ATR倍数={format_decimal(config.atr_take_multiplier)}"
         )
+        if dynamic_stop_only:
+            self._logger(
+                f"动态止盈已启用 | 2R保本={config.dynamic_two_r_break_even_label()} | "
+                f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | 初始仅在 OKX 挂止损"
+            )
         self._logger(f"指标回看数量：{lookback} 根 K 线")
 
         self._log_hourly_debug(
@@ -243,6 +254,11 @@ class StrategyEngine:
                         f"{_fmt_ts(newest_ts)} | 挂单已成交 | ordId={status.ord_id} | "
                         f"开仓价={format_decimal(filled_price)} | 数量={format_decimal(filled_size)}"
                     )
+                    fill_reason = (
+                        "EMA 动态委托已成交，初始止损已交给 OKX 托管，后续将动态上移"
+                        if dynamic_stop_only
+                        else "EMA 动态委托已成交，止盈止损已交给 OKX 托管"
+                    )
                     self._notify_trade_fill(
                         config,
                         title="开仓委托成交",
@@ -250,9 +266,33 @@ class StrategyEngine:
                         side=active_order.side,
                         size=filled_size,
                         price=filled_price,
-                        reason="EMA 动态委托已成交，止盈止损已交给 OKX 托管",
+                        reason=fill_reason,
                     )
-                    self._logger("止盈止损已附加到 OKX 主单，本次策略结束。")
+                    if dynamic_stop_only:
+                        position = FilledPosition(
+                            ord_id=status.ord_id,
+                            cl_ord_id=active_order.cl_ord_id,
+                            inst_id=instrument.inst_id,
+                            side=active_order.side,
+                            close_side="sell" if active_order.side == "buy" else "buy",
+                            pos_side=resolve_open_pos_side(config, active_order.side),
+                            size=filled_size,
+                            entry_price=filled_price,
+                        )
+                        self._logger(
+                            f"初始 OKX 止损已提交 | algoClOrdId={active_order.stop_loss_algo_cl_ord_id or '-'} | "
+                            f"止损={format_decimal(active_order.stop_loss)} | 启动动态上移监控"
+                        )
+                        self._monitor_exchange_dynamic_stop(
+                            credentials,
+                            config,
+                            trade_instrument=instrument,
+                            position=position,
+                            initial_stop_loss=active_order.stop_loss,
+                            stop_loss_algo_cl_ord_id=active_order.stop_loss_algo_cl_ord_id,
+                        )
+                    else:
+                        self._logger("止盈止损已附加到 OKX 主单，本次策略结束。")
                     return
                 if state == "partially_filled":
                     filled_price = status.avg_price or status.price or active_order.entry_reference
@@ -311,10 +351,19 @@ class StrategyEngine:
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 准备挂单 | 方向={plan.signal.upper()} | "
                 f"开仓价={format_decimal(plan.entry_reference)} | 数量={format_decimal(plan.size)} | "
-                f"止损={format_decimal(plan.stop_loss)} | 止盈={format_decimal(plan.take_profit)}"
+                f"止损={format_decimal(plan.stop_loss)} | "
+                f"{'动态止盈=初始不挂止盈' if dynamic_stop_only else f'止盈={format_decimal(plan.take_profit)}'}"
             )
             cl_ord_id = self._next_client_order_id(role="entry")
-            result = self._client.place_limit_order(credentials, config, plan, cl_ord_id=cl_ord_id)
+            stop_loss_algo_cl_ord_id = self._next_client_order_id(role="slg") if dynamic_stop_only else None
+            result = self._client.place_limit_order(
+                credentials,
+                config,
+                plan,
+                cl_ord_id=cl_ord_id,
+                include_take_profit=not dynamic_stop_only,
+                stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+            )
             if not result.ord_id:
                 raise RuntimeError("OKX 未返回挂单 ordId，无法继续监控该委托")
             active_order = ManagedEntryOrder(
@@ -322,6 +371,8 @@ class StrategyEngine:
                 cl_ord_id=result.cl_ord_id or cl_ord_id,
                 candle_ts=plan.candle_ts,
                 entry_reference=plan.entry_reference,
+                stop_loss=plan.stop_loss,
+                stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
                 size=plan.size,
                 side=plan.side,
                 signal=plan.signal,
@@ -1516,6 +1567,113 @@ class StrategyEngine:
     ) -> None:
         self._monitor_local_exit(credentials, config, trade_instrument, position, protection)
 
+    def _monitor_exchange_dynamic_stop(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        initial_stop_loss: Decimal,
+        stop_loss_algo_cl_ord_id: str | None,
+    ) -> None:
+        if not stop_loss_algo_cl_ord_id:
+            raise RuntimeError("动态止盈模式缺少 OKX 止损委托标识，无法继续动态上移。")
+
+        current_stop_loss = initial_stop_loss
+        next_trigger_r = 2
+        risk_per_unit = abs(position.entry_price - initial_stop_loss)
+        self._logger(
+            " | ".join(
+                [
+                    f"开始监控 OKX 动态止损 | 标的={trade_instrument.inst_id}",
+                    f"触发价格类型={config.tp_sl_trigger_type}",
+                    f"初始止损={format_decimal(initial_stop_loss)}",
+                    f"2R保本={config.dynamic_two_r_break_even_label()}",
+                    f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
+                ]
+            )
+        )
+
+        while not self._stop_event.is_set():
+            live_position = self._find_managed_position(credentials, config, trade_instrument, position)
+            if live_position is None:
+                self._logger("未检测到策略持仓，OKX 动态止损监控结束。")
+                return
+
+            current_price = self._client.get_trigger_price(trade_instrument.inst_id, config.tp_sl_trigger_type)
+            updated_stop_loss, _, updated_trigger_r, moved = _advance_dynamic_stop_live(
+                direction="long" if position.side == "buy" else "short",
+                current_price=current_price,
+                entry_price=position.entry_price,
+                risk_per_unit=risk_per_unit,
+                current_stop_loss=current_stop_loss,
+                next_trigger_r=next_trigger_r,
+                tick_size=trade_instrument.tick_size,
+                two_r_break_even=config.dynamic_two_r_break_even,
+                dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+            )
+            should_amend = moved and (
+                updated_stop_loss > current_stop_loss if position.side == "buy" else updated_stop_loss < current_stop_loss
+            )
+            if should_amend:
+                try:
+                    self._client.amend_algo_order(
+                        credentials,
+                        environment=config.environment,
+                        inst_id=trade_instrument.inst_id,
+                        algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                        req_id=self._next_client_order_id(role="amd"),
+                        new_stop_loss_trigger_price=updated_stop_loss,
+                        new_stop_loss_trigger_price_type=config.tp_sl_trigger_type,
+                    )
+                except OkxApiError as exc:
+                    live_position = self._find_managed_position(credentials, config, trade_instrument, position)
+                    if live_position is None:
+                        self._logger("检测到持仓已关闭，停止 OKX 动态止损监控。")
+                        return
+                    raise RuntimeError(f"OKX 动态上移止损失败：{exc}") from exc
+
+                current_stop_loss = updated_stop_loss
+                next_trigger_r = updated_trigger_r
+                self._logger(
+                    f"OKX 动态止损已上移 | 当前价={format_decimal(current_price)} | "
+                    f"新止损={format_decimal(current_stop_loss)} | 下一阶段={next_trigger_r}R | "
+                    f"algoClOrdId={stop_loss_algo_cl_ord_id}"
+                )
+
+            self._stop_event.wait(config.poll_seconds)
+
+        self._logger("策略已停止，保留当前 OKX 动态止损。")
+
+    def _find_managed_position(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+    ) -> OkxPosition | None:
+        positions = self._client.get_positions(
+            credentials,
+            environment=config.environment,
+            inst_type=trade_instrument.inst_type,
+        )
+        for item in positions:
+            if item.inst_id != trade_instrument.inst_id:
+                continue
+            item_pos_side = (item.pos_side or "").strip().lower()
+            expected_pos_side = (position.pos_side or "").strip().lower()
+            if expected_pos_side:
+                if item_pos_side != expected_pos_side:
+                    continue
+            elif config.position_mode == "net":
+                if position.side == "buy" and item.position < 0:
+                    continue
+                if position.side == "sell" and item.position > 0:
+                    continue
+            return item
+        return None
+
     def _place_entry_order(
         self,
         credentials: Credentials,
@@ -1780,8 +1938,6 @@ def can_use_exchange_managed_orders(
     signal_instrument: Instrument,
     trade_instrument: Instrument,
 ) -> bool:
-    if is_dynamic_strategy_id(config.strategy_id):
-        return False
     return (
         config.tp_sl_mode == "exchange"
         and signal_instrument.inst_id == trade_instrument.inst_id

@@ -190,10 +190,16 @@ TRIGGER_TYPE_OPTIONS = {
 }
 TP_SL_MODE_OPTIONS = {
     "OKX 托管（仅同标的永续）": "exchange",
+    "按交易标的价格（本地）": "local_trade",
     "按下单标的价格（本地）": "local_trade",
     "按信号标的价格（本地）": "local_signal",
     "按自定义标的价格（本地）": "local_custom",
 }
+LAUNCHER_TP_SL_MODE_LABELS = (
+    "OKX 托管（仅同标的永续）",
+    "按交易标的价格（本地）",
+    "按自定义标的价格（本地）",
+)
 ENTRY_SIDE_MODE_OPTIONS = {
     "跟随信号": "follow_signal",
     "固定买入": "fixed_buy",
@@ -326,7 +332,13 @@ class QuantApp:
         self._protection_replay_window: ProtectionReplayWindow | None = None
         self._positions_refreshing = False
         self._positions_history_refreshing = False
-        self._default_symbol_values = [label for label, _ in DEFAULT_MONITOR_SYMBOLS]
+        self._default_symbol_values = list(dict.fromkeys(inst_id for _, inst_id in DEFAULT_MONITOR_SYMBOLS))
+        self._custom_trigger_symbol_values = ["", *self._default_symbol_values]
+        self._default_launch_symbol = (
+            "ETH-USDT-SWAP"
+            if "ETH-USDT-SWAP" in self._default_symbol_values
+            else (self._default_symbol_values[0] if self._default_symbol_values else "")
+        )
         self._latest_positions: list[OkxPosition] = []
         self._latest_pending_orders: list[OkxTradeOrderItem] = []
         self._latest_order_history: list[OkxTradeOrderItem] = []
@@ -463,8 +475,8 @@ class QuantApp:
         self.api_profile_name = StringVar(value=DEFAULT_CREDENTIAL_PROFILE_NAME)
         self.environment_label = StringVar(value="模拟盘 demo")
 
-        self.symbol = StringVar(value=self._default_symbol_values[0])
-        self.trade_symbol = StringVar(value="")
+        self.symbol = StringVar(value=self._default_launch_symbol)
+        self.trade_symbol = StringVar(value=self._default_launch_symbol)
         self.local_tp_sl_symbol = StringVar(value="")
         self.bar = StringVar(value="15m")
         self.ema_period = StringVar(value="21")
@@ -472,9 +484,9 @@ class QuantApp:
         self.big_ema_period = StringVar(value="233")
         self.entry_reference_ema_period = StringVar(value="55")
         self.atr_period = StringVar(value="10")
-        self.stop_atr = StringVar(value="1.5")
+        self.stop_atr = StringVar(value="2")
         self.take_atr = StringVar(value="4")
-        self.risk_amount = StringVar(value="100")
+        self.risk_amount = StringVar(value="10")
         self.order_size = StringVar(value="1")
         self.poll_seconds = StringVar(value="10")
         self.signal_mode_label = StringVar(value=STRATEGY_DEFINITIONS[0].default_signal_label)
@@ -488,6 +500,7 @@ class QuantApp:
         self.trigger_type_label = StringVar(value="标记价格 mark")
         self.tp_sl_mode_label = StringVar(value="OKX 托管（仅同标的永续）")
         self.entry_side_mode_label = StringVar(value="跟随信号")
+        self.symbol.trace_add("write", self._sync_trade_symbol_to_symbol)
 
         self.notify_enabled = BooleanVar(value=False)
         self.smtp_host = StringVar()
@@ -696,12 +709,12 @@ class QuantApp:
         )
         self.strategy_combo.grid(row=row, column=1, sticky="ew", padx=(0, 16))
         self.strategy_combo.bind("<<ComboboxSelected>>", self._on_strategy_selected)
-        ttk.Label(start_frame, text="信号标的").grid(row=row, column=2, sticky="w")
+        ttk.Label(start_frame, text="交易标的").grid(row=row, column=2, sticky="w")
         self.symbol_combo = ttk.Combobox(
             start_frame,
             textvariable=self.symbol,
             values=self._default_symbol_values,
-            state="normal",
+            state="readonly",
         )
         self.symbol_combo.grid(row=row, column=3, sticky="ew")
 
@@ -805,29 +818,31 @@ class QuantApp:
         ttk.Entry(start_frame, textvariable=self.order_size).grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
         row += 1
-        ttk.Label(start_frame, text="下单标的").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Combobox(start_frame, textvariable=self.trade_symbol, values=self._default_symbol_values, state="normal").grid(
-            row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
-        )
-        ttk.Label(start_frame, text="下单方向模式").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        ttk.Label(start_frame, text="下单方向模式").grid(row=row, column=0, sticky="w", pady=(12, 0))
         ttk.Combobox(
             start_frame,
             textvariable=self.entry_side_mode_label,
             values=list(ENTRY_SIDE_MODE_OPTIONS.keys()),
             state="readonly",
-        ).grid(row=row, column=3, sticky="ew", pady=(12, 0))
-
-        row += 1
-        ttk.Label(start_frame, text="止盈止损模式").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ).grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
+        ttk.Label(start_frame, text="止盈止损模式").grid(row=row, column=2, sticky="w", pady=(12, 0))
         ttk.Combobox(
             start_frame,
             textvariable=self.tp_sl_mode_label,
-            values=list(TP_SL_MODE_OPTIONS.keys()),
+            values=LAUNCHER_TP_SL_MODE_LABELS,
             state="readonly",
-        ).grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
-        ttk.Label(start_frame, text="自定义触发标的").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(start_frame, textvariable=self.local_tp_sl_symbol).grid(
-            row=row, column=3, sticky="ew", pady=(12, 0)
+        ).grid(row=row, column=3, sticky="ew", pady=(12, 0))
+
+        row += 1
+        ttk.Label(start_frame, text="自定义触发标的").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self.local_tp_sl_symbol_combo = ttk.Combobox(
+            start_frame,
+            textvariable=self.local_tp_sl_symbol,
+            values=self._custom_trigger_symbol_values,
+            state="readonly",
+        )
+        self.local_tp_sl_symbol_combo.grid(
+            row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
         )
 
         row += 1
@@ -902,7 +917,7 @@ class QuantApp:
         )
         self.session_tree.heading("api", text="API")
         self.session_tree.heading("strategy", text="策略")
-        self.session_tree.heading("symbol", text="信号 -> 下单")
+        self.session_tree.heading("symbol", text="标的")
         self.session_tree.heading("direction", text="方向")
         self.session_tree.heading("mode", text="模式")
         self.session_tree.heading("status", text="状态")
@@ -5262,10 +5277,32 @@ class QuantApp:
     def _apply_symbols(self, instruments: list[Instrument], symbols: list[str]) -> None:
         self.instruments = instruments
         merged = list(dict.fromkeys(self._default_symbol_values + symbols))
+        custom_trigger_values = ["", *merged]
+        preferred_symbol = self._default_launch_symbol if self._default_launch_symbol in merged else (merged[0] if merged else "")
         self.symbol_combo["values"] = merged
-        if self.symbol.get() not in symbols and symbols:
-            self.symbol.set(merged[0])
+        self.local_tp_sl_symbol_combo["values"] = custom_trigger_values
+        if self.symbol.get() not in merged and merged:
+            self.symbol.set(preferred_symbol)
+        elif merged and self.trade_symbol.get() not in merged:
+            self.trade_symbol.set(preferred_symbol)
+        if self.local_tp_sl_symbol.get() not in custom_trigger_values:
+            self.local_tp_sl_symbol.set("")
         self._enqueue_log(f"已加载 {len(symbols)} 个可交易永续合约。")
+
+    def _sync_trade_symbol_to_symbol(self, *_: str) -> None:
+        symbol = self.symbol.get().strip().upper()
+        if self.trade_symbol.get() != symbol:
+            self.trade_symbol.set(symbol)
+
+    @staticmethod
+    def _format_strategy_symbol_display(signal_symbol: str, trade_symbol: str | None) -> str:
+        normalized_signal = signal_symbol.strip().upper()
+        normalized_trade = (trade_symbol or normalized_signal).strip().upper()
+        if not normalized_signal:
+            return normalized_trade
+        if normalized_trade == normalized_signal:
+            return normalized_signal
+        return f"{normalized_signal} -> {normalized_trade}"
 
     def start(self) -> None:
         try:
@@ -5279,7 +5316,7 @@ class QuantApp:
             self._save_notification_settings_now(silent=True)
 
             session_id = self._next_session_id()
-            session_symbol = f"{config.inst_id} -> {config.trade_inst_id or config.inst_id}"
+            session_symbol = self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
             api_name = credentials.profile_name or self._current_credential_profile()
             engine = StrategyEngine(
                 self.client,
@@ -5329,7 +5366,7 @@ class QuantApp:
     def debug_hourly_values(self) -> None:
         symbol = _normalize_symbol_input(self.symbol.get())
         if not symbol:
-            messagebox.showerror("提示", "请先选择信号标的")
+            messagebox.showerror("提示", "请先选择交易标的")
             return
         ema_period = self._parse_positive_int(self.ema_period.get(), "EMA小周期")
         trend_ema_period = self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期")
@@ -5818,11 +5855,11 @@ class QuantApp:
             self.trend_ema_period.set("8")
             self.big_ema_period.set("233")
             self.entry_reference_ema_period.set("0")
-            self.risk_amount.set("100")
+            self.risk_amount.set("10")
             self.take_profit_mode_label.set("固定止盈")
             self.max_entries_per_trend.set("0")
             self.entry_side_mode_label.set("跟随信号")
-            self.tp_sl_mode_label.set("按信号标的的价格（本地）")
+            self.tp_sl_mode_label.set("按交易标的价格（本地）")
         if self._strategy_uses_big_ema(definition.strategy_id):
             self._big_ema_label.grid()
             self._big_ema_entry.grid()
@@ -5852,14 +5889,13 @@ class QuantApp:
         return get_strategy_definition(strategy_id)
 
     def _confirm_start(self, definition: StrategyDefinition, config: StrategyConfig) -> bool:
-        trade_symbol = config.trade_inst_id or config.inst_id
+        strategy_symbol = self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
         risk_value = self.risk_amount.get().strip() or "-"
         fixed_size = self.order_size.get().strip() or "-"
         lines = [
             f"策略：{definition.name}",
             f"运行模式：{self.run_mode_label.get()}",
-            f"信号标的：{config.inst_id}",
-            f"下单标的：{trade_symbol}",
+            f"交易标的：{strategy_symbol}",
             f"K线周期：{config.bar}",
             f"信号方向：{self.signal_mode_label.get()}",
             f"下单方向模式：{self.entry_side_mode_label.get()}",
@@ -5900,7 +5936,7 @@ class QuantApp:
         secret_key = self.secret_key.get().strip()
         passphrase = self.passphrase.get().strip()
         symbol = _normalize_symbol_input(self.symbol.get())
-        trade_symbol = _normalize_symbol_input(self.trade_symbol.get()) or symbol
+        trade_symbol = symbol
         local_tp_sl_symbol = _normalize_symbol_input(self.local_tp_sl_symbol.get()) or None
         tp_sl_mode = TP_SL_MODE_OPTIONS[self.tp_sl_mode_label.get()]
         run_mode = RUN_MODE_OPTIONS[self.run_mode_label.get()]
@@ -5918,15 +5954,13 @@ class QuantApp:
         if not api_key or not secret_key or not passphrase:
             raise ValueError("请先在 菜单 > 设置 > API 与通知设置 中填写 API 凭证")
         if not symbol:
-            raise ValueError("请选择信号标的")
+            raise ValueError("请选择交易标的")
         if run_mode == "trade":
             if tp_sl_mode == "exchange":
                 if trade_symbol != symbol:
-                    raise ValueError("OKX 托管止盈止损只支持信号标的和下单标的相同")
+                    raise ValueError("OKX 托管止盈止损只支持同一交易标的")
                 if infer_inst_type(trade_symbol) != "SWAP":
                     raise ValueError("OKX 托管止盈止损当前只支持永续合约")
-                if is_dynamic_strategy_id(definition.strategy_id) and TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()] == "dynamic":
-                    raise ValueError("EMA 动态委托的动态止盈需要本地托管止盈止损，请不要选择 OKX 托管。")
             if tp_sl_mode == "local_custom" and not local_tp_sl_symbol:
                 raise ValueError("已选择自定义本地止盈止损，请填写触发标的")
             if risk_amount is None and order_size <= 0:
@@ -5942,8 +5976,8 @@ class QuantApp:
         if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
             trade_symbol = symbol
             local_tp_sl_symbol = symbol
-            tp_sl_mode = "local_signal"
-            risk_amount = Decimal("100")
+            tp_sl_mode = "local_trade"
+            risk_amount = Decimal("10")
             order_size = Decimal("0")
 
         credentials = Credentials(api_key=api_key, secret_key=secret_key, passphrase=passphrase)
@@ -6113,8 +6147,7 @@ class QuantApp:
             f"状态：{session.status}",
             f"策略：{session.strategy_name}",
             f"运行模式：{session.run_mode_label}",
-            f"信号标的：{session.config.inst_id}",
-            f"下单标的：{session.config.trade_inst_id or session.config.inst_id}",
+            f"交易标的：{self._format_strategy_symbol_display(session.config.inst_id, session.config.trade_inst_id)}",
             f"方向：{session.direction_label}",
             f"K线周期：{session.config.bar}",
             f"EMA小周期：{session.config.ema_period}",
