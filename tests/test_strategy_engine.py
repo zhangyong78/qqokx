@@ -1,8 +1,16 @@
 from decimal import Decimal
 from unittest import TestCase
 
-from okx_quant.engine import _advance_dynamic_stop_live, build_order_plan, can_use_exchange_managed_orders
+from okx_quant.engine import (
+    ManagedEntryOrder,
+    StrategyEngine,
+    _advance_dynamic_stop_live,
+    _is_exchange_dynamic_stop_candidate_valid,
+    build_order_plan,
+    can_use_exchange_managed_orders,
+)
 from okx_quant.models import Candle, Instrument, StrategyConfig
+from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxTradeOrderItem
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategy_catalog import (
     STRATEGY_CROSS_ID,
@@ -175,6 +183,44 @@ class StrategyEngineTest(TestCase):
 
         self.assertTrue(can_use_exchange_managed_orders(config, instrument, instrument))
 
+
+    def test_dynamic_strategy_cannot_use_okx_when_symbols_differ(self) -> None:
+        signal_instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+        trade_instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="4H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+        )
+
+        self.assertFalse(can_use_exchange_managed_orders(config, signal_instrument, trade_instrument))
+
     def test_dynamic_live_stop_locks_1r_at_2r(self) -> None:
         stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
             direction="long",
@@ -224,6 +270,616 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(next_take_profit, Decimal("130.1"))
         self.assertEqual(next_trigger_r, 3)
 
+    def test_engine_client_order_id_uses_ascii_only_tokens(self) -> None:
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            lambda *_: None,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01-测试",
+        )
+
+        client_order_id = engine._next_client_order_id(role="entry")
+
+        self.assertTrue(client_order_id.isascii())
+        self.assertRegex(client_order_id, r"^[a-z0-9]+$")
+        self.assertLessEqual(len(client_order_id), 32)
+
+    def test_okx_read_retry_recovers_from_transient_error(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+
+        attempts = {"count": 0}
+
+        def _flaky_read() -> str:
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise OkxApiError("SSL handshake timed out")
+            return "ok"
+
+        result = engine._call_okx_read_with_retry("读取订单状态", _flaky_read)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(waits, [1.0, 2.0])
+        self.assertTrue(any("准备重试" in message for message in messages))
+
+    def test_okx_read_retry_does_not_retry_non_transient_error(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+
+        with self.assertRaises(OkxApiError):
+            engine._call_okx_read_with_retry(
+                "读取订单状态",
+                lambda: (_ for _ in ()).throw(OkxApiError("参数错误", code="51000")),
+            )
+
+        self.assertEqual(waits, [])
+        self.assertTrue(any("OKX 读取失败" in message for message in messages))
+
+    def test_log_hourly_debug_retries_transient_okx_errors(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+        candles = self._make_candles([str(100 + index) for index in range(80)])
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        class _StubClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get_candles(self, inst_id: str, bar: str, *, limit: int):  # noqa: ANN001
+                self.calls += 1
+                if self.calls < 3:
+                    raise OkxApiError("SSL handshake timed out")
+                return candles[-limit:]
+
+        client = _StubClient()
+        engine = StrategyEngine(
+            client,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+
+        engine._log_hourly_debug(
+            "ETH-USDT-SWAP",
+            21,
+            trend_ema_period=55,
+            entry_reference_ema_period=55,
+        )
+
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(waits, [1.0, 2.0])
+        self.assertTrue(any("OKX 读取异常，准备重试" in message for message in messages))
+        self.assertTrue(any("1小时调试 | ETH-USDT-SWAP" in message for message in messages))
+        self.assertFalse(any("1小时调试值获取失败" in message for message in messages))
+
+    def test_place_entry_order_recovers_when_write_response_is_lost(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        class _StubClient:
+            def __init__(self) -> None:
+                self.place_calls = 0
+                self.cl_ord_ids: list[str | None] = []
+
+            def place_simple_order(self, credentials, config, *, inst_id: str, side: str, size: Decimal, ord_type: str, pos_side=None, price=None, cl_ord_id=None):  # noqa: ANN001,E501
+                self.place_calls += 1
+                self.cl_ord_ids.append(cl_ord_id)
+                raise OkxApiError("SSL handshake timed out")
+
+            def get_order(self, credentials, config, *, inst_id: str, ord_id=None, cl_ord_id=None):  # noqa: ANN001
+                return OkxOrderStatus(
+                    ord_id="ord-recovered-1",
+                    state="live",
+                    side="buy",
+                    ord_type="market",
+                    price=Decimal("2300"),
+                    avg_price=None,
+                    size=Decimal("0.01"),
+                    filled_size=Decimal("0"),
+                    raw={"clOrdId": cl_ord_id},
+                )
+
+        client = _StubClient()
+        engine = StrategyEngine(
+            client,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=3,
+            trend_ema_period=5,
+            big_ema_period=233,
+            atr_period=3,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        result = engine._place_entry_order(
+            None,  # type: ignore[arg-type]
+            config,
+            instrument,
+            "buy",
+            Decimal("0.01"),
+            "long",
+        )
+
+        self.assertEqual(result.ord_id, "ord-recovered-1")
+        self.assertEqual(result.cl_ord_id, client.cl_ord_ids[0])
+        self.assertEqual(client.place_calls, 1)
+        self.assertEqual(waits, [])
+        self.assertTrue(any("回查确认委托已落地" in message for message in messages))
+
+    def test_place_entry_order_retries_with_same_client_order_id_after_reconcile_miss(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        class _StubClient:
+            def __init__(self) -> None:
+                self.place_calls = 0
+                self.cl_ord_ids: list[str | None] = []
+
+            def place_simple_order(self, credentials, config, *, inst_id: str, side: str, size: Decimal, ord_type: str, pos_side=None, price=None, cl_ord_id=None):  # noqa: ANN001,E501
+                self.place_calls += 1
+                self.cl_ord_ids.append(cl_ord_id)
+                if self.place_calls == 1:
+                    raise OkxApiError("SSL handshake timed out")
+                return OkxOrderResult(
+                    ord_id="ord-retry-1",
+                    cl_ord_id=cl_ord_id,
+                    s_code="0",
+                    s_msg="accepted",
+                    raw={},
+                )
+
+            def get_order(self, credentials, config, *, inst_id: str, ord_id=None, cl_ord_id=None):  # noqa: ANN001
+                raise OkxApiError(f"OKX 未返回订单状态：{cl_ord_id}")
+
+        client = _StubClient()
+        engine = StrategyEngine(
+            client,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=3,
+            trend_ema_period=5,
+            big_ema_period=233,
+            atr_period=3,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        result = engine._place_entry_order(
+            None,  # type: ignore[arg-type]
+            config,
+            instrument,
+            "buy",
+            Decimal("0.01"),
+            "long",
+        )
+
+        self.assertEqual(result.ord_id, "ord-retry-1")
+        self.assertEqual(client.place_calls, 2)
+        self.assertEqual(client.cl_ord_ids[0], client.cl_ord_ids[1])
+        self.assertEqual(waits, [1.0, 2.0])
+        self.assertTrue(any("准备使用同一 clOrdId 补发一次" in message for message in messages))
+
+    def test_cancel_active_order_recovers_when_cancel_response_is_lost(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        class _StubClient:
+            @staticmethod
+            def cancel_order(credentials, config, *, inst_id: str, ord_id=None, cl_ord_id=None):  # noqa: ANN001
+                raise OkxApiError("SSL handshake timed out")
+
+            @staticmethod
+            def get_order(credentials, config, *, inst_id: str, ord_id=None, cl_ord_id=None):  # noqa: ANN001
+                return OkxOrderStatus(
+                    ord_id=ord_id or "ord-cancel-1",
+                    state="canceled",
+                    side="buy",
+                    ord_type="limit",
+                    price=Decimal("2300"),
+                    avg_price=None,
+                    size=Decimal("0.01"),
+                    filled_size=Decimal("0"),
+                    raw={},
+                )
+
+        engine = StrategyEngine(
+            _StubClient(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=3,
+            trend_ema_period=5,
+            big_ema_period=233,
+            atr_period=3,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+        )
+        active_order = ManagedEntryOrder(
+            ord_id="ord-cancel-1",
+            cl_ord_id="cl-cancel-1",
+            candle_ts=1,
+            entry_reference=Decimal("2300"),
+            stop_loss=Decimal("2200"),
+            stop_loss_algo_cl_ord_id=None,
+            size=Decimal("0.01"),
+            side="buy",
+            signal="long",
+        )
+
+        engine._cancel_active_order(
+            None,  # type: ignore[arg-type]
+            config,
+            active_order,
+            1,
+        )
+
+        self.assertEqual(waits, [])
+        self.assertTrue(any("已确认撤单" in message for message in messages))
+
+    def test_amend_algo_order_recovers_when_pending_stop_is_already_updated(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+        target_stop = Decimal("2200")
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        class _StubClient:
+            @staticmethod
+            def amend_algo_order(*args, **kwargs):  # noqa: ANN002,ANN003
+                raise OkxApiError("SSL handshake timed out")
+
+            @staticmethod
+            def get_pending_orders(credentials, *, environment: str, inst_types: tuple[str, ...], limit: int):  # noqa: ANN001
+                return [
+                    OkxTradeOrderItem(
+                        source_kind="algo",
+                        source_label="算法委托",
+                        created_time=1,
+                        update_time=2,
+                        inst_id="ETH-USDT-SWAP",
+                        inst_type="SWAP",
+                        side="sell",
+                        pos_side="long",
+                        td_mode="cross",
+                        ord_type="conditional",
+                        state="live",
+                        price=None,
+                        size=None,
+                        filled_size=None,
+                        avg_price=None,
+                        order_id=None,
+                        algo_id="algo-1",
+                        client_order_id=None,
+                        algo_client_order_id="algo-cl-1",
+                        pnl=None,
+                        fee=None,
+                        fee_currency=None,
+                        reduce_only=None,
+                        trigger_price=None,
+                        trigger_price_type=None,
+                        order_price=None,
+                        actual_price=None,
+                        actual_size=None,
+                        actual_side=None,
+                        take_profit_trigger_price=None,
+                        take_profit_order_price=None,
+                        take_profit_trigger_price_type=None,
+                        stop_loss_trigger_price=target_stop,
+                        stop_loss_order_price=Decimal("-1"),
+                        stop_loss_trigger_price_type="last",
+                        raw={},
+                    )
+                ]
+
+        engine = StrategyEngine(
+            _StubClient(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=3,
+            trend_ema_period=5,
+            big_ema_period=233,
+            atr_period=3,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        engine._amend_algo_order_with_recovery(
+            None,  # type: ignore[arg-type]
+            config,
+            trade_instrument=instrument,
+            algo_id="algo-1",
+            algo_cl_ord_id="algo-cl-1",
+            req_id="req-1",
+            new_stop_loss_trigger_price=target_stop,
+            new_stop_loss_trigger_price_type="last",
+        )
+
+        self.assertEqual(waits, [])
+        self.assertTrue(any("回查显示已生效" in message for message in messages))
+
+    def test_find_pending_algo_order_by_client_id_matches_target_algo(self) -> None:
+        target_order = OkxTradeOrderItem(
+            source_kind="algo",
+            source_label="算法委托",
+            created_time=1,
+            update_time=2,
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            side="sell",
+            pos_side="long",
+            td_mode="cross",
+            ord_type="conditional",
+            state="live",
+            price=None,
+            size=None,
+            filled_size=None,
+            avg_price=None,
+            order_id=None,
+            algo_id="algo-1",
+            client_order_id=None,
+            algo_client_order_id="algo-cl-1",
+            pnl=None,
+            fee=None,
+            fee_currency=None,
+            reduce_only=None,
+            trigger_price=None,
+            trigger_price_type=None,
+            order_price=None,
+            actual_price=None,
+            actual_size=None,
+            actual_side=None,
+            take_profit_trigger_price=None,
+            take_profit_order_price=None,
+            take_profit_trigger_price_type=None,
+            stop_loss_trigger_price=Decimal("2200"),
+            stop_loss_order_price=Decimal("-1"),
+            stop_loss_trigger_price_type="last",
+            raw={},
+        )
+
+        class _StubClient:
+            @staticmethod
+            def get_pending_orders(*args, **kwargs):
+                return [
+                    OkxTradeOrderItem(
+                        source_kind="normal",
+                        source_label="普通委托",
+                        created_time=1,
+                        update_time=1,
+                        inst_id="ETH-USDT-SWAP",
+                        inst_type="SWAP",
+                        side="buy",
+                        pos_side="long",
+                        td_mode="cross",
+                        ord_type="limit",
+                        state="live",
+                        price=Decimal("2300"),
+                        size=Decimal("0.02"),
+                        filled_size=Decimal("0"),
+                        avg_price=None,
+                        order_id="ord-1",
+                        algo_id=None,
+                        client_order_id="cl-1",
+                        algo_client_order_id=None,
+                        pnl=None,
+                        fee=None,
+                        fee_currency=None,
+                        reduce_only=None,
+                        trigger_price=None,
+                        trigger_price_type=None,
+                        order_price=None,
+                        actual_price=None,
+                        actual_size=None,
+                        actual_side=None,
+                        take_profit_trigger_price=None,
+                        take_profit_order_price=None,
+                        take_profit_trigger_price_type=None,
+                        stop_loss_trigger_price=None,
+                        stop_loss_order_price=None,
+                        stop_loss_trigger_price_type=None,
+                        raw={},
+                    ),
+                    target_order,
+                ]
+
+        engine = StrategyEngine(
+            _StubClient(),  # type: ignore[arg-type]
+            lambda *_: None,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=3,
+            trend_ema_period=5,
+            big_ema_period=233,
+            atr_period=3,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.02"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        matched = engine._find_pending_algo_order_by_client_id(
+            None,  # type: ignore[arg-type]
+            config,
+            trade_instrument=instrument,
+            algo_cl_ord_id="algo-cl-1",
+        )
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched.algo_id, "algo-1")
+
     def test_dynamic_live_break_even_mode_is_mirrored_for_short(self) -> None:
         stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
             direction="short",
@@ -258,6 +914,52 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(stop_loss, Decimal("100"))
         self.assertEqual(next_take_profit, Decimal("130"))
         self.assertEqual(next_trigger_r, 3)
+
+    def test_exchange_dynamic_stop_candidate_for_long_requires_price_above_stop(self) -> None:
+        self.assertTrue(
+            _is_exchange_dynamic_stop_candidate_valid(
+                direction="long",
+                current_price=Decimal("100.1"),
+                candidate_stop_loss=Decimal("100"),
+            )
+        )
+        self.assertFalse(
+            _is_exchange_dynamic_stop_candidate_valid(
+                direction="long",
+                current_price=Decimal("100"),
+                candidate_stop_loss=Decimal("100"),
+            )
+        )
+        self.assertFalse(
+            _is_exchange_dynamic_stop_candidate_valid(
+                direction="long",
+                current_price=Decimal("99.9"),
+                candidate_stop_loss=Decimal("100"),
+            )
+        )
+
+    def test_exchange_dynamic_stop_candidate_for_short_requires_price_below_stop(self) -> None:
+        self.assertTrue(
+            _is_exchange_dynamic_stop_candidate_valid(
+                direction="short",
+                current_price=Decimal("99.9"),
+                candidate_stop_loss=Decimal("100"),
+            )
+        )
+        self.assertFalse(
+            _is_exchange_dynamic_stop_candidate_valid(
+                direction="short",
+                current_price=Decimal("100"),
+                candidate_stop_loss=Decimal("100"),
+            )
+        )
+        self.assertFalse(
+            _is_exchange_dynamic_stop_candidate_valid(
+                direction="short",
+                current_price=Decimal("100.1"),
+                candidate_stop_loss=Decimal("100"),
+            )
+        )
 
     def test_cross_strategy_stop_loss_uses_signal_candle_low_minus_one_atr(self) -> None:
         instrument = Instrument(

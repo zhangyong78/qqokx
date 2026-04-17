@@ -1487,7 +1487,7 @@ class OkxRestClient:
         payload = self._request(
             "POST",
             "/api/v5/trade/amend-algos",
-            body=[body_item],
+            body=body_item,
             auth=True,
             credentials=credentials,
             simulated=environment == "demo",
@@ -1595,7 +1595,8 @@ class OkxRestClient:
             raise OkxApiError(f"网络错误：{exc.reason}") from exc
 
         if payload.get("code") not in {None, "0"}:
-            raise OkxApiError(payload.get("msg", "OKX API 错误"), code=payload.get("code"))
+            message = str(payload.get("msg") or "").strip() or f"OKX API 错误 code={payload.get('code')}"
+            raise OkxApiError(message, code=payload.get("code"))
         return payload
 
 

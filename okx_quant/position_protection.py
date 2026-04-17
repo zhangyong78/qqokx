@@ -8,7 +8,7 @@ from typing import Callable, Literal
 
 from okx_quant.models import Credentials, StrategyConfig
 from okx_quant.notifications import EmailNotifier
-from okx_quant.okx_client import OkxApiError, OkxPosition, OkxRestClient, OkxTicker
+from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxPosition, OkxRestClient, OkxTicker
 from okx_quant.pricing import format_decimal, snap_to_increment
 
 
@@ -24,6 +24,9 @@ PRICE_GUARD_OPEN_BUFFER_MULTIPLIER = Decimal("3")
 PRICE_GUARD_MARKET_MULTIPLIER = Decimal("2")
 PRICE_GUARD_SELL_INTRINSIC_FLOOR_RATIO = Decimal("0.8")
 PRICE_GUARD_SELL_BID_FLOOR_RATIO = Decimal("0.5")
+WRITE_RECONCILE_ATTEMPTS = 3
+WRITE_RECONCILE_BASE_DELAY_SECONDS = 1.0
+WRITE_RECONCILE_MAX_DELAY_SECONDS = 3.0
 
 
 class ProtectionPriceGuardError(RuntimeError):
@@ -1635,15 +1638,13 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
         )
         worker.active_close_cl_ord_id = cl_ord_id
         worker.active_close_submitted_at = datetime.now()
-        result = self._client.place_simple_order(
-            worker.credentials,
-            worker.config,
-            inst_id=worker.protection.option_inst_id,
-            side=close_side,
+        result = self._submit_close_order_with_recovery(
+            worker,
+            reason=reason,
+            close_side=close_side,
             size=size,
-            ord_type="ioc",
             pos_side=pos_side,
-            price=order_price,
+            order_price=order_price,
             cl_ord_id=cl_ord_id,
         )
         worker.active_close_ord_id = result.ord_id or None
@@ -2068,6 +2069,201 @@ def wait_order_fill(
     raise ProtectionCloseRetryError(f"保护平仓订单未成交，ordId={ord_id}，状态={latest_state or 'unknown'}")
 
 
+def _pp_wait_for_write_reconcile(worker: _ProtectionWorker, attempt: int) -> None:
+    delay_seconds = min(
+        WRITE_RECONCILE_BASE_DELAY_SECONDS * attempt,
+        WRITE_RECONCILE_MAX_DELAY_SECONDS,
+    )
+    worker.stop_event.wait(delay_seconds)
+
+
+def _pp_try_get_order_status_for_write_recovery(
+    self: PositionProtectionManager,
+    worker: _ProtectionWorker,
+    *,
+    label: str,
+    ord_id: str | None = None,
+    cl_ord_id: str | None = None,
+) -> OkxOrderStatus | None:
+    order_key = ord_id or cl_ord_id or "-"
+    last_exc: OkxApiError | None = None
+    for attempt in range(1, WRITE_RECONCILE_ATTEMPTS + 1):
+        try:
+            return self._client.get_order(
+                worker.credentials,
+                worker.config,
+                inst_id=worker.protection.option_inst_id,
+                ord_id=ord_id,
+                cl_ord_id=cl_ord_id,
+            )
+        except OkxApiError as exc:
+            if self._is_missing_order_error(exc):
+                return None
+            last_exc = exc
+            detail = _repair_mojibake_text(str(exc).strip() or f"code={getattr(exc, 'code', None) or '-'}")
+            if self._is_transient_error(exc) and attempt < WRITE_RECONCILE_ATTEMPTS and not worker.stop_event.is_set():
+                self._logger(
+                    _repair_mojibake_text(
+                        " | ".join(
+                            [
+                                f"{_protection_worker_prefix_clean(worker)} 写入回查读取异常，稍后重试",
+                                f"操作={label}",
+                                f"订单={order_key}",
+                                f"第{attempt}/{WRITE_RECONCILE_ATTEMPTS}次",
+                                detail,
+                            ]
+                        )
+                    )
+                )
+                _pp_wait_for_write_reconcile(worker, attempt)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    return None
+
+
+def _pp_recover_submitted_close_order(
+    self: PositionProtectionManager,
+    worker: _ProtectionWorker,
+    *,
+    cl_ord_id: str,
+    label: str,
+) -> OkxOrderResult | None:
+    for attempt in range(1, WRITE_RECONCILE_ATTEMPTS + 1):
+        status = _pp_try_get_order_status_for_write_recovery(
+            self,
+            worker,
+            label=label,
+            cl_ord_id=cl_ord_id,
+        )
+        if status is not None and status.ord_id:
+            return OkxOrderResult(
+                ord_id=status.ord_id,
+                cl_ord_id=cl_ord_id,
+                s_code="0",
+                s_msg="recovered via order lookup",
+                raw={"recovered": True, "state": status.state, "order": status.raw},
+            )
+        if attempt < WRITE_RECONCILE_ATTEMPTS and not worker.stop_event.is_set():
+            self._logger(
+                _repair_mojibake_text(
+                    " | ".join(
+                        [
+                            f"{_protection_worker_prefix_clean(worker)} 平仓报单回查暂未命中",
+                            f"操作={label}",
+                            f"clOrdId={cl_ord_id}",
+                            f"第{attempt}/{WRITE_RECONCILE_ATTEMPTS}次",
+                        ]
+                    )
+                )
+            )
+            _pp_wait_for_write_reconcile(worker, attempt)
+    return None
+
+
+def _pp_submit_close_order_with_recovery(
+    self: PositionProtectionManager,
+    worker: _ProtectionWorker,
+    *,
+    reason: str,
+    close_side: Literal["buy", "sell"],
+    size: Decimal,
+    pos_side: Literal["long", "short"] | None,
+    order_price: Decimal,
+    cl_ord_id: str,
+) -> OkxOrderResult:
+    def _submit() -> OkxOrderResult:
+        return self._client.place_simple_order(
+            worker.credentials,
+            worker.config,
+            inst_id=worker.protection.option_inst_id,
+            side=close_side,
+            size=size,
+            ord_type="ioc",
+            pos_side=pos_side,
+            price=order_price,
+            cl_ord_id=cl_ord_id,
+        )
+
+    try:
+        return _submit()
+    except OkxApiError as exc:
+        if not self._is_transient_error(exc):
+            raise
+        detail = _repair_mojibake_text(str(exc).strip() or f"code={getattr(exc, 'code', None) or '-'}")
+        self._logger(
+            _repair_mojibake_text(
+                " | ".join(
+                    [
+                        f"{_protection_worker_prefix_clean(worker)} {reason}平仓报单响应异常，开始回查订单状态",
+                        f"clOrdId={cl_ord_id}",
+                        detail,
+                    ]
+                )
+            )
+        )
+        recovered = _pp_recover_submitted_close_order(
+            self,
+            worker,
+            cl_ord_id=cl_ord_id,
+            label=f"{reason}平仓报单回查",
+        )
+        if recovered is not None:
+            self._logger(
+                _repair_mojibake_text(
+                    " | ".join(
+                        [
+                            f"{_protection_worker_prefix_clean(worker)} {reason}平仓报单响应丢失，但回查确认已落地",
+                            f"ordId={recovered.ord_id or '-'}",
+                            f"clOrdId={cl_ord_id}",
+                        ]
+                    )
+                )
+            )
+            return recovered
+        if worker.stop_event.is_set():
+            raise ProtectionCloseRetryError(
+                f"{reason}平仓报单中断，且回查未确认订单状态，clOrdId={cl_ord_id}"
+            ) from exc
+        self._logger(
+            _repair_mojibake_text(
+                " | ".join(
+                    [
+                        f"{_protection_worker_prefix_clean(worker)} {reason}平仓报单回查未确认，准备使用同一 clOrdId 补发一次",
+                        f"clOrdId={cl_ord_id}",
+                    ]
+                )
+            )
+        )
+        try:
+            return _submit()
+        except OkxApiError as retry_exc:
+            recovered = _pp_recover_submitted_close_order(
+                self,
+                worker,
+                cl_ord_id=cl_ord_id,
+                label=f"{reason}平仓报单回查",
+            )
+            if recovered is not None:
+                self._logger(
+                    _repair_mojibake_text(
+                        " | ".join(
+                            [
+                                f"{_protection_worker_prefix_clean(worker)} {reason}平仓补发响应异常，但回查确认已落地",
+                                f"ordId={recovered.ord_id or '-'}",
+                                f"clOrdId={cl_ord_id}",
+                            ]
+                        )
+                    )
+                )
+                return recovered
+            detail = _repair_mojibake_text(str(retry_exc).strip() or f"code={getattr(retry_exc, 'code', None) or '-'}")
+            raise ProtectionCloseRetryError(
+                f"{reason}平仓报单失败且回查未确认订单状态，clOrdId={cl_ord_id} | {detail}"
+            ) from retry_exc
+
+
 def _pp_format_ticker_snapshot(self: PositionProtectionManager, ticker: OkxTicker | None) -> str:
     if ticker is None:
         return "盘口不可用"
@@ -2468,6 +2664,7 @@ PositionProtectionManager.stop = _pp_stop
 PositionProtectionManager.stop_all = _pp_stop_all
 PositionProtectionManager._run_worker = _pp_run_worker
 PositionProtectionManager._close_position = _pp_close_position
+PositionProtectionManager._submit_close_order_with_recovery = _pp_submit_close_order_with_recovery
 PositionProtectionManager._reconcile_active_close_order = _pp_reconcile_active_close_order
 PositionProtectionManager._record_close_fill = _pp_record_close_fill
 PositionProtectionManager._is_missing_order_error = _pp_is_missing_order_error

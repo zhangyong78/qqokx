@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.3.96`
+当前版本：`v0.3.97`
 
 这是一个面向 OKX 的桌面交易工作台，围绕“监控、交易、保护、回测、分析”构建。当前项目已经包含：
 
@@ -559,7 +559,19 @@ ATR 批量矩阵规则：
 - `.okx_quant_candle_cache/`
 
 ## 11. 更新日志
-当前版本：v0.3.96
+当前版本：v0.3.97
+
+### v0.3.97
+
+- 实盘策略的 OKX 读取链路已统一接入受控重试：标的信息、K 线、订单状态、挂单列表、持仓列表、触发价、ATR 快照与成交价估算遇到 `timeout / handshake / connection reset / 429 / 5xx` 等瞬时异常时会自动重试，并明确区分业务错误与网络抖动
+- 策略引擎、智能下单与持仓保护已补齐写入恢复链路：下单、撤单与 OKX 算法止损改单在响应丢失时会先按 `clOrdId / algoClOrdId` 回查落地状态，必要时使用同一 `clOrdId` 补发一次，避免瞬时网络抖动把任务直接打断
+- 实盘下单标识继续收紧为 ASCII 安全格式，并补强 `动态止盈 + OKX 托管` 的联动校验与候选止损判定，降低中文策略名拒单和交易所算法单尚未就绪时的竞态风险
+- `账户信息` 窗口现已补齐 `当前委托` / `历史委托` 标签页和 `刷新全部` 入口，不必再切换到持仓大窗才能查看或刷新账户委托
+- 委托表格、筛选、详情与撤单逻辑已抽成复用组件，`账户信息` 与 `持仓大窗` 共用同一套数据源和渲染链路，多窗口并行打开时也不会继续引用已关闭窗口的失效控件
+- 智能下单进一步补齐 `long_short` 仓位模式下的 `posSide` 处理，网格单、条件单、止盈止损平仓和激进成交路径都能按多空方向带出正确仓位侧
+- 新增“现货增强三十六计”回测实验室底座：支持子策略注册、信号聚合、门控规则、额度引擎、运行时热切换、样例策略包与审计导出，便于持续迭代现货增强策略
+- 新增持仓证据与总仓管理导出：可输出 `position_ledger.csv`、`position_ledger_summary.csv`、`manual_review_manifest.csv`、`evidence_index.csv`、证据 K 线小图、`position_management.html`、`total_position_management.html` 与 `total_position_summary.csv`，并支持多种总仓合并口径与价格域隔离
+- 已补充并通过本轮核心回归：`python -m unittest tests.test_strategy_engine tests.test_smart_order tests.test_okx_client_orders tests.test_enhanced_strategy_foundation tests.test_enhanced_strategy_lab`
 
 ### v0.3.96
 

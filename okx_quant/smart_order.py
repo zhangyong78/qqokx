@@ -12,7 +12,7 @@ from typing import Callable, Literal
 
 from okx_quant.log_utils import append_log_line, ensure_log_timestamp
 from okx_quant.models import Credentials, Instrument, PositionMode, StrategyConfig, TradeMode, TriggerPriceType
-from okx_quant.okx_client import OkxOrderBook, OkxOrderStatus, OkxRestClient, OkxTicker, infer_inst_type
+from okx_quant.okx_client import OkxApiError, OkxOrderBook, OkxOrderResult, OkxOrderStatus, OkxRestClient, OkxTicker, infer_inst_type
 from okx_quant.persistence import load_smart_order_tasks_snapshot, save_smart_order_tasks_snapshot
 from okx_quant.position_protection import evaluate_protection_trigger, validate_live_protection_order_price_guard
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, snap_to_increment
@@ -29,6 +29,9 @@ GRID_TICKER_REFRESH_SECONDS = 3.0
 WORKER_POLL_SECONDS = 1.2
 MAX_LOG_LINES = 400
 POSITION_USAGE_REFRESH_SECONDS = 3.0
+WRITE_RECONCILE_ATTEMPTS = 3
+WRITE_RECONCILE_BASE_DELAY_SECONDS = 1.0
+WRITE_RECONCILE_MAX_DELAY_SECONDS = 3.0
 
 STATUS_READY = "\u51c6\u5907\u4e2d"
 STATUS_WAIT_TRIGGER = "\u7b49\u5f85\u89e6\u53d1"
@@ -760,6 +763,26 @@ class SmartOrderManager:
         reduction = min(size, actual_long)
         return Decimal("0"), size - reduction
 
+    def _resolve_order_pos_side(
+        self,
+        task: _SmartOrderTask,
+        *,
+        side: Literal["buy", "sell"],
+        pos_side: Literal["long", "short"] | None,
+    ) -> Literal["long", "short"] | None:
+        if pos_side is not None:
+            return pos_side
+        if task.instrument.inst_type == "SPOT" or task.runtime.position_mode != "long_short":
+            return None
+        if task.task_type == "grid":
+            return "long" if task.initial_side == "buy" else "short"
+        opening_side = self._task_opening_side(task)
+        if opening_side == "buy":
+            return "long"
+        if opening_side == "sell":
+            return "short"
+        return None
+
     def _task_opening_side(self, task: _SmartOrderTask) -> Literal["buy", "sell"] | None:
         if task.task_type == "tp_sl":
             return None
@@ -951,10 +974,10 @@ class SmartOrderManager:
         if task.status not in {STATUS_RECOVERABLE, STATUS_STOPPED, STATUS_ERROR, STATUS_COMPLETED}:
             raise RuntimeError("当前任务仍在运行或等待中，无需重新启动。")
 
+        task.runtime = runtime
         self.set_contract(task.instrument)
         self._cleanup_recovery_order(task, runtime)
 
-        task.runtime = runtime
         task.stop_requested = False
         task.transient_error_count = 0
         task.last_message = "任务已重新启动。"
@@ -1005,25 +1028,351 @@ class SmartOrderManager:
         if self._worker.is_alive():
             self._worker.join(timeout=2.0)
 
+    def _wait_for_write_reconcile(self, attempt: int) -> None:
+        delay_seconds = min(
+            WRITE_RECONCILE_BASE_DELAY_SECONDS * attempt,
+            WRITE_RECONCILE_MAX_DELAY_SECONDS,
+        )
+        self._stop_event.wait(delay_seconds)
+
+    def _is_order_not_found_error(self, exc: OkxApiError) -> bool:
+        detail = str(exc).strip()
+        if not detail:
+            return False
+        normalized = detail.lower()
+        return (
+            "未返回订单状态" in detail
+            or "订单不存在" in detail
+            or "order does not exist" in normalized
+            or "order not exist" in normalized
+        )
+
+    def _try_get_order_status_for_write_recovery(
+        self,
+        task: _SmartOrderTask,
+        *,
+        label: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+    ) -> OkxOrderStatus | None:
+        order_key = ord_id or cl_ord_id or "-"
+        config = self._build_config(task.inst_id, task.runtime)
+        last_exc: OkxApiError | None = None
+        for attempt in range(1, WRITE_RECONCILE_ATTEMPTS + 1):
+            try:
+                return self._client.get_order(
+                    task.runtime.credentials,
+                    config,
+                    inst_id=task.inst_id,
+                    ord_id=ord_id,
+                    cl_ord_id=cl_ord_id,
+                )
+            except OkxApiError as exc:
+                if self._is_order_not_found_error(exc):
+                    return None
+                last_exc = exc
+                detail = str(exc).strip() or f"code={exc.code or '-'}"
+                if self._is_transient_error(exc) and attempt < WRITE_RECONCILE_ATTEMPTS and not self._stop_event.is_set():
+                    self._log(
+                        task,
+                        " | ".join(
+                            [
+                                "写入回查读取异常，稍后重试",
+                                f"操作={label}",
+                                f"订单={order_key}",
+                                f"第{attempt}/{WRITE_RECONCILE_ATTEMPTS}次",
+                                detail,
+                            ]
+                        ),
+                    )
+                    self._wait_for_write_reconcile(attempt)
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        return None
+
+    def _recover_submitted_order_result(
+        self,
+        task: _SmartOrderTask,
+        *,
+        cl_ord_id: str,
+        label: str,
+    ) -> OkxOrderResult | None:
+        for attempt in range(1, WRITE_RECONCILE_ATTEMPTS + 1):
+            status = self._try_get_order_status_for_write_recovery(
+                task,
+                label=label,
+                cl_ord_id=cl_ord_id,
+            )
+            if status is not None and status.ord_id:
+                return OkxOrderResult(
+                    ord_id=status.ord_id,
+                    cl_ord_id=cl_ord_id,
+                    s_code="0",
+                    s_msg="recovered via order lookup",
+                    raw={
+                        "recovered": True,
+                        "state": status.state,
+                        "order": status.raw,
+                    },
+                )
+            if attempt < WRITE_RECONCILE_ATTEMPTS and not self._stop_event.is_set():
+                self._log(
+                    task,
+                    " | ".join(
+                        [
+                            "写入异常后回查暂未命中",
+                            f"操作={label}",
+                            f"clOrdId={cl_ord_id}",
+                            f"第{attempt}/{WRITE_RECONCILE_ATTEMPTS}次",
+                        ]
+                    ),
+                )
+                self._wait_for_write_reconcile(attempt)
+        return None
+
+    def _submit_order_with_recovery(
+        self,
+        task: _SmartOrderTask,
+        *,
+        label: str,
+        cl_ord_id: str,
+        submit_fn: Callable[[], OkxOrderResult],
+    ) -> OkxOrderResult:
+        try:
+            return submit_fn()
+        except OkxApiError as exc:
+            if not self._is_transient_error(exc):
+                raise
+            detail = str(exc).strip() or f"code={exc.code or '-'}"
+            self._log(
+                task,
+                " | ".join(
+                    [
+                        "下单请求响应异常，开始回查订单状态",
+                        f"操作={label}",
+                        f"标的={task.inst_id}",
+                        f"clOrdId={cl_ord_id}",
+                        detail,
+                    ]
+                ),
+            )
+            recovered = self._recover_submitted_order_result(
+                task,
+                cl_ord_id=cl_ord_id,
+                label=label,
+            )
+            if recovered is not None:
+                self._log(
+                    task,
+                    " | ".join(
+                        [
+                            "下单响应丢失，但回查确认委托已落地",
+                            f"操作={label}",
+                            f"标的={task.inst_id}",
+                            f"ordId={recovered.ord_id or '-'}",
+                            f"clOrdId={cl_ord_id}",
+                        ]
+                    ),
+                )
+                return recovered
+
+            if self._stop_event.is_set():
+                raise RuntimeError(f"{label}中断，且回查未确认订单状态 | clOrdId={cl_ord_id}") from exc
+
+            self._log(
+                task,
+                " | ".join(
+                    [
+                        "下单回查未确认，准备使用同一 clOrdId 补发一次",
+                        f"操作={label}",
+                        f"标的={task.inst_id}",
+                        f"clOrdId={cl_ord_id}",
+                    ]
+                ),
+            )
+            try:
+                return submit_fn()
+            except OkxApiError as retry_exc:
+                recovered = self._recover_submitted_order_result(
+                    task,
+                    cl_ord_id=cl_ord_id,
+                    label=label,
+                )
+                if recovered is not None:
+                    self._log(
+                        task,
+                        " | ".join(
+                            [
+                                "下单补发响应异常，但回查确认委托已落地",
+                                f"操作={label}",
+                                f"标的={task.inst_id}",
+                                f"ordId={recovered.ord_id or '-'}",
+                                f"clOrdId={cl_ord_id}",
+                            ]
+                        ),
+                    )
+                    return recovered
+                detail = str(retry_exc).strip() or f"code={retry_exc.code or '-'}"
+                raise RuntimeError(f"{label}失败且回查未确认订单状态 | clOrdId={cl_ord_id} | {detail}") from retry_exc
+
+    def _cancel_order_with_recovery(
+        self,
+        task: _SmartOrderTask,
+        *,
+        label: str,
+        ord_id: str,
+    ) -> OkxOrderStatus | None:
+        config = self._build_config(task.inst_id, task.runtime)
+
+        def _submit_cancel() -> OkxOrderResult:
+            return self._client.cancel_order(
+                task.runtime.credentials,
+                config,
+                inst_id=task.inst_id,
+                ord_id=ord_id,
+            )
+
+        try:
+            _submit_cancel()
+            return None
+        except OkxApiError as exc:
+            if self._is_order_not_found_error(exc):
+                return None
+            if not self._is_transient_error(exc):
+                raise
+            detail = str(exc).strip() or f"code={exc.code or '-'}"
+            self._log(
+                task,
+                " | ".join(
+                    [
+                        "撤单请求响应异常，开始回查订单状态",
+                        f"操作={label}",
+                        f"ordId={ord_id}",
+                        detail,
+                    ]
+                ),
+            )
+            latest_status = self._try_get_order_status_for_write_recovery(
+                task,
+                label=f"{label}回查",
+                ord_id=ord_id,
+            )
+            latest_state = (latest_status.state or "").lower() if latest_status is not None else ""
+            if latest_state == "canceled":
+                self._log(
+                    task,
+                    " | ".join(
+                        [
+                            "撤单响应丢失，但回查确认已撤单",
+                            f"操作={label}",
+                            f"ordId={ord_id}",
+                        ]
+                    ),
+                )
+                return latest_status
+            if latest_state == "filled":
+                return latest_status
+
+            if self._stop_event.is_set():
+                raise RuntimeError(f"{label}中断，且回查未确认订单状态 | ordId={ord_id}") from exc
+
+            self._log(
+                task,
+                " | ".join(
+                    [
+                        "撤单回查未确认完成，准备补发一次撤单",
+                        f"操作={label}",
+                        f"ordId={ord_id}",
+                    ]
+                ),
+            )
+            try:
+                _submit_cancel()
+            except OkxApiError as retry_exc:
+                if self._is_order_not_found_error(retry_exc):
+                    return None
+                latest_status = self._try_get_order_status_for_write_recovery(
+                    task,
+                    label=f"{label}回查",
+                    ord_id=ord_id,
+                )
+                if latest_status is None:
+                    detail = str(retry_exc).strip() or f"code={retry_exc.code or '-'}"
+                    raise RuntimeError(f"{label}失败且回查未确认订单状态 | ordId={ord_id} | {detail}") from retry_exc
+                latest_state = (latest_status.state or "").lower()
+                if latest_state == "canceled":
+                    self._log(
+                        task,
+                        " | ".join(
+                            [
+                                "撤单补发响应异常，但回查确认已撤单",
+                                f"操作={label}",
+                                f"ordId={ord_id}",
+                            ]
+                        ),
+                    )
+                    return latest_status
+                if latest_state == "filled":
+                    return latest_status
+                detail = str(retry_exc).strip() or f"code={retry_exc.code or '-'}"
+                raise RuntimeError(
+                    f"{label}失败且回查显示订单仍为{latest_status.state or 'unknown'} | ordId={ord_id} | {detail}"
+                ) from retry_exc
+
+            latest_status = self._try_get_order_status_for_write_recovery(
+                task,
+                label=f"{label}回查",
+                ord_id=ord_id,
+            )
+            if latest_status is None:
+                return None
+            latest_state = (latest_status.state or "").lower()
+            if latest_state == "canceled":
+                self._log(
+                    task,
+                    " | ".join(
+                        [
+                            "撤单补发后已确认撤单",
+                            f"操作={label}",
+                            f"ordId={ord_id}",
+                        ]
+                    ),
+                )
+                return latest_status
+            if latest_state == "filled":
+                return latest_status
+            raise RuntimeError(f"{label}补发后回查显示订单仍为{latest_status.state or 'unknown'} | ordId={ord_id}")
+
     def _cleanup_recovery_order(self, task: _SmartOrderTask, runtime: SmartOrderRuntimeConfig) -> None:
         if not task.active_order_id and not task.active_order_cl_ord_id:
             return
-        status = self._client.get_order(
-            runtime.credentials,
-            self._build_config(task.inst_id, runtime),
-            inst_id=task.inst_id,
+        status = self._try_get_order_status_for_write_recovery(
+            task,
+            label="恢复前清理旧委托",
             ord_id=task.active_order_id,
             cl_ord_id=task.active_order_cl_ord_id,
         )
+        if status is None:
+            task.active_order_id = None
+            task.active_order_cl_ord_id = None
+            task.waiting_for_fill = False
+            return
         if status.state == "filled":
             raise RuntimeError("旧委托已成交，请先检查仓位和委托后再人工处理。")
-        if status.state in {"live", "partially_filled"} and task.active_order_id:
-            self._client.cancel_order(
-                runtime.credentials,
-                self._build_config(task.inst_id, runtime),
-                inst_id=task.inst_id,
-                ord_id=task.active_order_id,
+        if status.state in {"live", "partially_filled"}:
+            ord_id = status.ord_id or task.active_order_id
+            if not ord_id:
+                raise RuntimeError("恢复前清理旧委托时，无法确认 ordId。")
+            latest_status = self._cancel_order_with_recovery(
+                task,
+                label="恢复前清理旧委托",
+                ord_id=ord_id,
             )
+            latest_state = (latest_status.state or "").lower() if latest_status is not None else ""
+            if latest_state == "filled":
+                raise RuntimeError("旧委托在恢复前已成交，请先检查仓位和委托后再人工处理。")
         task.active_order_id = None
         task.active_order_cl_ord_id = None
         task.waiting_for_fill = False
@@ -1275,24 +1624,27 @@ class SmartOrderManager:
                 self._freeze_task_for_position_limit(task, str(exc))
 
     def _cancel_opening_order_for_position_limit(self, task: _SmartOrderTask, reason: str) -> None:
-        status = self._client.get_order(
-            task.runtime.credentials,
-            self._build_config(task.inst_id, task.runtime),
-            inst_id=task.inst_id,
+        status = self._try_get_order_status_for_write_recovery(
+            task,
+            label="仓位限制撤单前回查",
             ord_id=task.active_order_id,
             cl_ord_id=task.active_order_cl_ord_id,
         )
+        if status is None:
+            raise RuntimeError("仓位限制触发，但无法确认活动开仓单状态。")
         ord_id = status.ord_id or task.active_order_id
         if not ord_id:
             raise RuntimeError("仓位限制触发，但无法确认活动开仓单编号。")
-        self._client.cancel_order(
-            task.runtime.credentials,
-            self._build_config(task.inst_id, task.runtime),
-            inst_id=task.inst_id,
+        latest_status = self._cancel_order_with_recovery(
+            task,
+            label="仓位限制撤销开仓单",
             ord_id=ord_id,
         )
-        order_size = status.size or task.active_order_size or task.size
-        filled_size = status.filled_size or Decimal("0")
+        resolved_status = latest_status or status
+        if (resolved_status.state or "").lower() == "filled":
+            raise RuntimeError("仓位限制触发，但活动开仓单已成交，请检查实际仓位。")
+        order_size = resolved_status.size or status.size or task.active_order_size or task.size
+        filled_size = resolved_status.filled_size or status.filled_size or Decimal("0")
         remaining_size = order_size - filled_size
         task.active_order_size = remaining_size if remaining_size > 0 else Decimal("0")
         task.active_order_id = None
@@ -1536,17 +1888,23 @@ class SmartOrderManager:
                 size=size,
                 ignore_task_id=task.task_id,
             )
+        resolved_pos_side = self._resolve_order_pos_side(task, side=side, pos_side=pos_side)
         cl_ord_id = f"so{task.task_id.lower()}{int(time.time() * 1000) % 1000000:06d}"
-        result = self._client.place_simple_order(
-            task.runtime.credentials,
-            self._build_config(task.inst_id, task.runtime),
-            inst_id=task.inst_id,
-            side=side,
-            size=size,
-            ord_type="limit",
-            pos_side=pos_side,
-            price=price,
+        result = self._submit_order_with_recovery(
+            task,
+            label=message_prefix,
             cl_ord_id=cl_ord_id,
+            submit_fn=lambda: self._client.place_simple_order(
+                task.runtime.credentials,
+                self._build_config(task.inst_id, task.runtime),
+                inst_id=task.inst_id,
+                side=side,
+                size=size,
+                ord_type="limit",
+                pos_side=resolved_pos_side,
+                price=price,
+                cl_ord_id=cl_ord_id,
+            ),
         )
         task.active_order_id = result.ord_id
         task.active_order_cl_ord_id = result.cl_ord_id or cl_ord_id
@@ -1577,16 +1935,24 @@ class SmartOrderManager:
                 size=size,
                 ignore_task_id=task.task_id,
             )
-        result = self._client.place_aggressive_limit_order(
-            task.runtime.credentials,
-            self._build_config(task.inst_id, task.runtime),
-            task.instrument,
-            side=side,
-            size=size,
-            pos_side=pos_side,
+        resolved_pos_side = self._resolve_order_pos_side(task, side=side, pos_side=pos_side)
+        cl_ord_id = f"so{task.task_id.lower()}{int(time.time() * 1000) % 1000000:06d}"
+        result = self._submit_order_with_recovery(
+            task,
+            label=message_prefix,
+            cl_ord_id=cl_ord_id,
+            submit_fn=lambda: self._client.place_aggressive_limit_order(
+                task.runtime.credentials,
+                self._build_config(task.inst_id, task.runtime),
+                task.instrument,
+                side=side,
+                size=size,
+                pos_side=resolved_pos_side,
+                cl_ord_id=cl_ord_id,
+            ),
         )
         task.active_order_id = result.ord_id
-        task.active_order_cl_ord_id = result.cl_ord_id
+        task.active_order_cl_ord_id = result.cl_ord_id or cl_ord_id
         task.active_order_size = size
         task.active_order_side = side
         task.waiting_for_fill = True
@@ -1599,22 +1965,29 @@ class SmartOrderManager:
         if task.active_order_id or task.active_order_cl_ord_id:
             try:
                 ord_id = task.active_order_id
+                state = ""
                 if not ord_id and task.active_order_cl_ord_id:
-                    status = self._client.get_order(
-                        task.runtime.credentials,
-                        self._build_config(task.inst_id, task.runtime),
-                        inst_id=task.inst_id,
+                    status = self._try_get_order_status_for_write_recovery(
+                        task,
+                        label="停止任务前查询委托",
                         cl_ord_id=task.active_order_cl_ord_id,
                     )
-                    ord_id = status.ord_id
-                if not ord_id:
+                    if status is not None:
+                        ord_id = status.ord_id
+                        state = (status.state or "").lower()
+                if state == "filled":
+                    raise RuntimeError("任务停止前活动委托已成交，请先检查仓位。")
+                if ord_id and state != "canceled":
+                    latest_status = self._cancel_order_with_recovery(
+                        task,
+                        label="停止任务撤单",
+                        ord_id=ord_id,
+                    )
+                    latest_state = (latest_status.state or "").lower() if latest_status is not None else ""
+                    if latest_state == "filled":
+                        raise RuntimeError("任务停止前活动委托已成交，请先检查仓位。")
+                elif state not in {"", "canceled"}:
                     raise RuntimeError("无法确认旧委托编号，不能安全撤单。")
-                self._client.cancel_order(
-                    task.runtime.credentials,
-                    self._build_config(task.inst_id, task.runtime),
-                    inst_id=task.inst_id,
-                    ord_id=ord_id,
-                )
             except Exception as exc:  # noqa: BLE001
                 if self._is_transient_error(exc):
                     task.last_message = f"撤单重试中：{exc}"
@@ -1723,10 +2096,24 @@ class SmartOrderManager:
         append_log_line(line)
 
     def _is_transient_error(self, exc: Exception) -> bool:
+        if isinstance(exc, TimeoutError):
+            return True
+        if isinstance(exc, OkxApiError) and exc.status is not None and exc.status >= 500:
+            return True
         text = str(exc).lower()
         return any(
             token in text
             for token in (
+                "network error",
+                "temporary failure",
+                "proxy error",
+                "remote disconnected",
+                "bad gateway",
+                "service unavailable",
+                "gateway timeout",
+                "网络错误",
+                "握手",
+                "超时",
                 "timed out",
                 "handshake",
                 "ssl",

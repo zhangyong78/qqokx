@@ -373,6 +373,10 @@ class QuantApp:
         self._account_info_tree: ttk.Treeview | None = None
         self._account_info_detail_panel: Text | None = None
         self._account_info_config_panel: Text | None = None
+        self._account_info_pending_orders_tree: ttk.Treeview | None = None
+        self._account_info_pending_orders_detail: Text | None = None
+        self._account_info_order_history_tree: ttk.Treeview | None = None
+        self._account_info_order_history_detail: Text | None = None
         self._account_info_refreshing = False
         self._latest_account_overview: OkxAccountOverview | None = None
         self._latest_account_config: OkxAccountConfig | None = None
@@ -1239,7 +1243,7 @@ class QuantApp:
     def _default_account_info_detail_text(self) -> str:
         return (
             "这里会显示账户概览、账户配置和选中资产详情。\n"
-            "点击“账户信息”后，程序会读取 OKX 账户余额与账户配置接口，方便你在持仓页里直接查看账户状态。"
+            "点击“账户信息”后，程序会读取 OKX 账户余额与账户配置接口；下方标签页也可以继续查看当前委托和历史委托。"
         )
 
     def _set_readonly_text(self, widget: Text | None, content: str) -> None:
@@ -1261,10 +1265,72 @@ class QuantApp:
             row=0, column=0, sticky="w"
         )
 
+    def _create_trade_order_tree(
+        self,
+        parent: ttk.Frame,
+        *,
+        on_select,
+        column_group_key: str | None = None,
+        title: str | None = None,
+    ) -> ttk.Treeview:
+        columns = ("time", "source", "inst_type", "inst_id", "state", "side", "ord_type", "price", "size", "filled", "tp_sl", "order_id", "cl_ord_id")
+        tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse")
+        headings = {
+            "time": "时间",
+            "source": "来源",
+            "inst_type": "类型",
+            "inst_id": "合约",
+            "state": "状态",
+            "side": "方向",
+            "ord_type": "委托类型",
+            "price": "委托价",
+            "size": "委托量",
+            "filled": "已成交",
+            "tp_sl": "TP/SL",
+            "order_id": "订单ID",
+            "cl_ord_id": "clOrdId",
+        }
+        for column_id, width in (
+            ("time", 150),
+            ("source", 82),
+            ("inst_type", 72),
+            ("inst_id", 240),
+            ("state", 120),
+            ("side", 96),
+            ("ord_type", 110),
+            ("price", 100),
+            ("size", 100),
+            ("filled", 100),
+            ("tp_sl", 180),
+            ("order_id", 120),
+            ("cl_ord_id", 150),
+        ):
+            tree.heading(column_id, text=headings[column_id])
+            tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "filled"} else "center")
+        tree.column("inst_id", anchor="w")
+        tree.column("tp_sl", anchor="w")
+        tree.column("cl_ord_id", anchor="w")
+        tree.grid(row=0, column=0, sticky="nsew")
+        tree.bind("<<TreeviewSelect>>", on_select)
+        tree.tag_configure("profit", foreground="#13803d")
+        tree.tag_configure("loss", foreground="#c23b3b")
+        scroll_y = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        scroll_x = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
+        scroll_x.grid(row=1, column=0, sticky="ew")
+        tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        if column_group_key and title:
+            self._register_positions_zoom_columns(column_group_key, title, tree, columns)
+        return tree
+
+    def refresh_account_dashboard(self) -> None:
+        self.refresh_account_info()
+        self.refresh_order_views()
+
     def open_account_info_window(self) -> None:
         if self._account_info_window is not None and self._account_info_window.winfo_exists():
             self._account_info_window.focus_force()
-            self.refresh_account_info()
+            self.refresh_account_dashboard()
             return
 
         window = Toplevel(self.root)
@@ -1285,7 +1351,6 @@ class QuantApp:
         container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
         container.rowconfigure(3, weight=1)
-        container.rowconfigure(4, weight=1)
 
         header = ttk.Frame(container)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -1293,7 +1358,7 @@ class QuantApp:
         ttk.Label(header, textvariable=self.account_info_summary_text, justify="left").grid(row=0, column=0, sticky="w")
         action_row = ttk.Frame(header)
         action_row.grid(row=0, column=1, sticky="e")
-        ttk.Button(action_row, text="刷新", command=self.refresh_account_info).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(action_row, text="刷新全部", command=self.refresh_account_dashboard).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(action_row, text="关闭", command=self._close_account_info_window).grid(row=0, column=1)
 
         overview_row = ttk.Frame(container)
@@ -1324,8 +1389,17 @@ class QuantApp:
         self._account_info_config_panel.configure(yscrollcommand=config_scroll.set)
         self._set_readonly_text(self._account_info_config_panel, self._default_account_info_detail_text())
 
-        asset_frame = ttk.LabelFrame(container, text="资产明细", padding=10)
-        asset_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
+        notebook = ttk.Notebook(container)
+        notebook.grid(row=3, column=0, sticky="nsew")
+
+        asset_tab = ttk.Frame(notebook, padding=10)
+        asset_tab.columnconfigure(0, weight=1)
+        asset_tab.rowconfigure(0, weight=1)
+        asset_tab.rowconfigure(1, weight=1)
+        notebook.add(asset_tab, text="资产明细")
+
+        asset_frame = ttk.LabelFrame(asset_tab, text="资产明细", padding=10)
+        asset_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
         asset_frame.columnconfigure(0, weight=1)
         asset_frame.rowconfigure(0, weight=1)
 
@@ -1364,8 +1438,8 @@ class QuantApp:
         asset_scroll_x.grid(row=1, column=0, sticky="ew")
         tree.configure(yscrollcommand=asset_scroll_y.set, xscrollcommand=asset_scroll_x.set)
 
-        detail_frame = ttk.LabelFrame(container, text="选中资产详情", padding=10)
-        detail_frame.grid(row=4, column=0, sticky="nsew")
+        detail_frame = ttk.LabelFrame(asset_tab, text="选中资产详情", padding=10)
+        detail_frame.grid(row=1, column=0, sticky="nsew")
         detail_frame.columnconfigure(0, weight=1)
         detail_frame.rowconfigure(0, weight=1)
         self._account_info_detail_panel = Text(
@@ -1381,8 +1455,22 @@ class QuantApp:
         self._account_info_detail_panel.configure(yscrollcommand=detail_scroll.set)
         self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
 
+        pending_orders_tab = ttk.Frame(notebook, padding=10)
+        pending_orders_tab.columnconfigure(0, weight=1)
+        pending_orders_tab.rowconfigure(2, weight=1)
+        pending_orders_tab.rowconfigure(3, weight=1)
+        notebook.add(pending_orders_tab, text="当前委托")
+        self._build_account_info_pending_orders_tab(pending_orders_tab)
+
+        order_history_tab = ttk.Frame(notebook, padding=10)
+        order_history_tab.columnconfigure(0, weight=1)
+        order_history_tab.rowconfigure(2, weight=1)
+        order_history_tab.rowconfigure(3, weight=1)
+        notebook.add(order_history_tab, text="历史委托")
+        self._build_account_info_order_history_tab(order_history_tab)
+
         self._expand_to_screen(window, margin=30)
-        self.refresh_account_info()
+        self.refresh_account_dashboard()
 
     def _close_account_info_window(self) -> None:
         if self._account_info_window is not None and self._account_info_window.winfo_exists():
@@ -1391,6 +1479,10 @@ class QuantApp:
         self._account_info_tree = None
         self._account_info_detail_panel = None
         self._account_info_config_panel = None
+        self._account_info_pending_orders_tree = None
+        self._account_info_pending_orders_detail = None
+        self._account_info_order_history_tree = None
+        self._account_info_order_history_detail = None
 
     def refresh_account_info(self) -> None:
         if self._account_info_refreshing:
@@ -1526,6 +1618,178 @@ class QuantApp:
             self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
             return
         self._set_readonly_text(self._account_info_detail_panel, _build_account_asset_detail_text(overview.details[index]))
+
+    def _build_account_info_pending_orders_tab(self, parent: ttk.Frame) -> None:
+        header = ttk.Frame(parent)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, textvariable=self._positions_zoom_pending_orders_summary_text).grid(row=0, column=0, sticky="w")
+        ttk.Button(header, text="刷新", command=self.refresh_pending_orders).grid(row=0, column=1, sticky="e", padx=(0, 6))
+        ttk.Button(
+            header,
+            text="撤单选中",
+            command=lambda: self.cancel_selected_pending_order("account_info"),
+        ).grid(row=0, column=2, sticky="e", padx=(0, 6))
+        ttk.Button(
+            header,
+            text="批量撤当前筛选",
+            command=lambda: self.cancel_filtered_pending_orders("account_info"),
+        ).grid(row=0, column=3, sticky="e")
+
+        filter_row = ttk.Frame(parent)
+        filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        filter_row.columnconfigure(11, weight=1)
+        ttk.Label(filter_row, text="类型").grid(row=0, column=0, sticky="w")
+        type_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.pending_order_type_filter,
+            values=list(POSITION_TYPE_OPTIONS.keys()),
+            state="readonly",
+            width=16,
+        )
+        type_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        type_combo.bind("<<ComboboxSelected>>", self._on_pending_order_filter_changed)
+        ttk.Label(filter_row, text="来源").grid(row=0, column=2, sticky="w")
+        source_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.pending_order_source_filter,
+            values=list(ORDER_SOURCE_FILTER_OPTIONS.keys()),
+            state="readonly",
+            width=16,
+        )
+        source_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
+        source_combo.bind("<<ComboboxSelected>>", self._on_pending_order_filter_changed)
+        ttk.Label(filter_row, text="状态").grid(row=0, column=4, sticky="w")
+        state_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.pending_order_state_filter,
+            values=list(ORDER_STATE_FILTER_OPTIONS.keys()),
+            state="readonly",
+            width=20,
+        )
+        state_combo.grid(row=0, column=5, sticky="w", padx=(6, 12))
+        state_combo.bind("<<ComboboxSelected>>", self._on_pending_order_filter_changed)
+        ttk.Label(filter_row, text="标的").grid(row=0, column=6, sticky="w")
+        asset_entry = ttk.Entry(filter_row, textvariable=self.pending_order_asset_filter, width=10)
+        asset_entry.grid(row=0, column=7, sticky="w", padx=(6, 12))
+        asset_entry.bind("<KeyRelease>", self._on_pending_order_filter_changed)
+        ttk.Label(filter_row, text="到期前缀").grid(row=0, column=8, sticky="w")
+        expiry_entry = ttk.Entry(filter_row, textvariable=self.pending_order_expiry_prefix_filter, width=14)
+        expiry_entry.grid(row=0, column=9, sticky="w", padx=(6, 12))
+        expiry_entry.bind("<KeyRelease>", self._on_pending_order_filter_changed)
+        ttk.Label(filter_row, text="搜索").grid(row=0, column=10, sticky="w")
+        keyword_entry = ttk.Entry(filter_row, textvariable=self.pending_order_keyword)
+        keyword_entry.grid(row=0, column=11, sticky="ew", padx=(6, 12))
+        keyword_entry.bind("<KeyRelease>", self._on_pending_order_filter_changed)
+        ttk.Button(filter_row, text="应用筛选", command=self._render_pending_orders_view).grid(row=0, column=12, padx=(0, 6))
+        ttk.Button(filter_row, text="清空筛选", command=self.reset_pending_order_filters).grid(row=0, column=13)
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.grid(row=2, column=0, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self._account_info_pending_orders_tree = self._create_trade_order_tree(
+            tree_frame,
+            on_select=self._on_pending_orders_selected,
+        )
+
+        detail_frame = ttk.LabelFrame(parent, text="委托详情", padding=12)
+        detail_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        detail_frame.columnconfigure(0, weight=1)
+        detail_frame.rowconfigure(0, weight=1)
+        self._account_info_pending_orders_detail = Text(
+            detail_frame,
+            height=8,
+            wrap="word",
+            font=("Microsoft YaHei UI", 10),
+            relief="flat",
+        )
+        self._account_info_pending_orders_detail.grid(row=0, column=0, sticky="nsew")
+        detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self._account_info_pending_orders_detail.yview)
+        detail_scroll.grid(row=0, column=1, sticky="ns")
+        self._account_info_pending_orders_detail.configure(yscrollcommand=detail_scroll.set)
+        self._set_readonly_text(self._account_info_pending_orders_detail, "这里会显示选中当前委托的详情。")
+
+    def _build_account_info_order_history_tab(self, parent: ttk.Frame) -> None:
+        header = ttk.Frame(parent)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, textvariable=self._positions_zoom_order_history_summary_text).grid(row=0, column=0, sticky="w")
+        ttk.Button(header, text="刷新", command=self.refresh_order_history).grid(row=0, column=1, sticky="e")
+
+        filter_row = ttk.Frame(parent)
+        filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        filter_row.columnconfigure(11, weight=1)
+        ttk.Label(filter_row, text="类型").grid(row=0, column=0, sticky="w")
+        type_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.order_history_type_filter,
+            values=list(POSITION_TYPE_OPTIONS.keys()),
+            state="readonly",
+            width=16,
+        )
+        type_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        type_combo.bind("<<ComboboxSelected>>", self._on_order_history_filter_changed)
+        ttk.Label(filter_row, text="来源").grid(row=0, column=2, sticky="w")
+        source_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.order_history_source_filter,
+            values=list(ORDER_SOURCE_FILTER_OPTIONS.keys()),
+            state="readonly",
+            width=16,
+        )
+        source_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
+        source_combo.bind("<<ComboboxSelected>>", self._on_order_history_filter_changed)
+        ttk.Label(filter_row, text="状态").grid(row=0, column=4, sticky="w")
+        state_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.order_history_state_filter,
+            values=list(ORDER_STATE_FILTER_OPTIONS.keys()),
+            state="readonly",
+            width=20,
+        )
+        state_combo.grid(row=0, column=5, sticky="w", padx=(6, 12))
+        state_combo.bind("<<ComboboxSelected>>", self._on_order_history_filter_changed)
+        ttk.Label(filter_row, text="标的").grid(row=0, column=6, sticky="w")
+        asset_entry = ttk.Entry(filter_row, textvariable=self.order_history_asset_filter, width=10)
+        asset_entry.grid(row=0, column=7, sticky="w", padx=(6, 12))
+        asset_entry.bind("<KeyRelease>", self._on_order_history_filter_changed)
+        ttk.Label(filter_row, text="到期前缀").grid(row=0, column=8, sticky="w")
+        expiry_entry = ttk.Entry(filter_row, textvariable=self.order_history_expiry_prefix_filter, width=14)
+        expiry_entry.grid(row=0, column=9, sticky="w", padx=(6, 12))
+        expiry_entry.bind("<KeyRelease>", self._on_order_history_filter_changed)
+        ttk.Label(filter_row, text="搜索").grid(row=0, column=10, sticky="w")
+        keyword_entry = ttk.Entry(filter_row, textvariable=self.order_history_keyword)
+        keyword_entry.grid(row=0, column=11, sticky="ew", padx=(6, 12))
+        keyword_entry.bind("<KeyRelease>", self._on_order_history_filter_changed)
+        ttk.Button(filter_row, text="应用筛选", command=self._render_order_history_view).grid(row=0, column=12, padx=(0, 6))
+        ttk.Button(filter_row, text="清空筛选", command=self.reset_order_history_filters).grid(row=0, column=13)
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.grid(row=2, column=0, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self._account_info_order_history_tree = self._create_trade_order_tree(
+            tree_frame,
+            on_select=self._on_order_history_selected,
+        )
+
+        detail_frame = ttk.LabelFrame(parent, text="委托详情", padding=12)
+        detail_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        detail_frame.columnconfigure(0, weight=1)
+        detail_frame.rowconfigure(0, weight=1)
+        self._account_info_order_history_detail = Text(
+            detail_frame,
+            height=8,
+            wrap="word",
+            font=("Microsoft YaHei UI", 10),
+            relief="flat",
+        )
+        self._account_info_order_history_detail.grid(row=0, column=0, sticky="nsew")
+        detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self._account_info_order_history_detail.yview)
+        detail_scroll.grid(row=0, column=1, sticky="ns")
+        self._account_info_order_history_detail.configure(yscrollcommand=detail_scroll.set)
+        self._set_readonly_text(self._account_info_order_history_detail, "这里会显示选中历史委托的详情。")
 
     def _schedule_protection_window_refresh(self) -> None:
         try:
@@ -1805,10 +2069,10 @@ class QuantApp:
         header.columnconfigure(0, weight=1)
         ttk.Label(header, textvariable=self._positions_zoom_pending_orders_summary_text).grid(row=0, column=0, sticky="w")
         ttk.Button(header, text="刷新", command=self.refresh_pending_orders).grid(row=0, column=1, sticky="e", padx=(0, 6))
-        ttk.Button(header, text="撤单选中", command=self.cancel_selected_pending_order).grid(
+        ttk.Button(header, text="撤单选中", command=lambda: self.cancel_selected_pending_order("positions_zoom")).grid(
             row=0, column=2, sticky="e", padx=(0, 6)
         )
-        ttk.Button(header, text="批量撤当前筛选", command=self.cancel_filtered_pending_orders).grid(
+        ttk.Button(header, text="批量撤当前筛选", command=lambda: self.cancel_filtered_pending_orders("positions_zoom")).grid(
             row=0, column=3, sticky="e", padx=(0, 6)
         )
         ttk.Button(
@@ -2937,12 +3201,34 @@ class QuantApp:
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
         self._start_order_history_refresh(credentials, environment)
 
-    def cancel_selected_pending_order(self) -> None:
-        parent = self._positions_zoom_window if _widget_exists(self._positions_zoom_window) else self.root
+    def _pending_order_tree_for_view(self, view_name: str | None = None) -> ttk.Treeview | None:
+        if view_name == "account_info":
+            return self._account_info_pending_orders_tree
+        if view_name == "positions_zoom":
+            return self._positions_zoom_pending_orders_tree
+        if self._positions_zoom_pending_orders_tree is not None and _widget_exists(self._positions_zoom_pending_orders_tree):
+            return self._positions_zoom_pending_orders_tree
+        if self._account_info_pending_orders_tree is not None and _widget_exists(self._account_info_pending_orders_tree):
+            return self._account_info_pending_orders_tree
+        return None
+
+    def _pending_order_parent_for_view(self, view_name: str | None = None):
+        if view_name == "account_info" and _widget_exists(self._account_info_window):
+            return self._account_info_window
+        if view_name == "positions_zoom" and _widget_exists(self._positions_zoom_window):
+            return self._positions_zoom_window
+        if _widget_exists(self._positions_zoom_window):
+            return self._positions_zoom_window
+        if _widget_exists(self._account_info_window):
+            return self._account_info_window
+        return self.root
+
+    def cancel_selected_pending_order(self, view_name: str | None = None) -> None:
+        parent = self._pending_order_parent_for_view(view_name)
         if self._pending_order_canceling:
             messagebox.showinfo("撤单中", "当前已有一笔撤单请求在处理中，请稍等。", parent=parent)
             return
-        item = self._selected_pending_order_item()
+        item = self._selected_pending_order_item(view_name)
         if item is None:
             messagebox.showinfo("撤单", "请先在当前委托里选中一条要撤销的委托。", parent=parent)
             return
@@ -2979,12 +3265,12 @@ class QuantApp:
         )
         threading.Thread(
             target=self._cancel_selected_pending_order_worker,
-            args=(credentials, environment, item, owner_label),
+            args=(credentials, environment, item, owner_label, view_name),
             daemon=True,
         ).start()
 
-    def cancel_filtered_pending_orders(self) -> None:
-        parent = self._positions_zoom_window if _widget_exists(self._positions_zoom_window) else self.root
+    def cancel_filtered_pending_orders(self, view_name: str | None = None) -> None:
+        parent = self._pending_order_parent_for_view(view_name)
         if self._pending_order_canceling:
             messagebox.showinfo("撤单中", "当前已有撤单请求在处理中，请稍等。", parent=parent)
             return
@@ -3037,7 +3323,7 @@ class QuantApp:
         )
         threading.Thread(
             target=self._cancel_filtered_pending_orders_worker,
-            args=(credentials, environment, cancelable_items, skipped_manual, skipped_missing_id),
+            args=(credentials, environment, cancelable_items, skipped_manual, skipped_missing_id, view_name),
             daemon=True,
         ).start()
 
@@ -3047,6 +3333,7 @@ class QuantApp:
         environment: str,
         item: OkxTradeOrderItem,
         owner_label: str,
+        view_name: str | None,
     ) -> None:
         try:
             result = self._cancel_pending_order_request(credentials, environment=environment, item=item)
@@ -3061,14 +3348,20 @@ class QuantApp:
                     note = f"撤单自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境执行。"
                     effective_environment = alternate
                 except Exception:
-                    self.root.after(0, lambda: self._apply_pending_order_cancel_error(item, message, owner_label, environment))
+                    self.root.after(
+                        0,
+                        lambda: self._apply_pending_order_cancel_error(item, message, owner_label, environment, view_name),
+                    )
                     return
             else:
-                self.root.after(0, lambda: self._apply_pending_order_cancel_error(item, message, owner_label, environment))
+                self.root.after(
+                    0,
+                    lambda: self._apply_pending_order_cancel_error(item, message, owner_label, environment, view_name),
+                )
                 return
         self.root.after(
             0,
-            lambda: self._apply_pending_order_cancel_result(item, result, owner_label, note, effective_environment),
+            lambda: self._apply_pending_order_cancel_result(item, result, owner_label, note, effective_environment, view_name),
         )
 
     def _cancel_filtered_pending_orders_worker(
@@ -3078,6 +3371,7 @@ class QuantApp:
         items: list[OkxTradeOrderItem],
         skipped_manual: int,
         skipped_missing_id: int,
+        view_name: str | None,
     ) -> None:
         success_items: list[tuple[OkxTradeOrderItem, OkxOrderResult, str]] = []
         failed_items: list[tuple[OkxTradeOrderItem, str, str]] = []
@@ -3113,6 +3407,7 @@ class QuantApp:
                 skipped_missing_id,
                 note,
                 active_environment,
+                view_name,
             ),
         )
 
@@ -3146,6 +3441,7 @@ class QuantApp:
         owner_label: str,
         note: str | None = None,
         effective_environment: str | None = None,
+        view_name: str | None = None,
     ) -> None:
         self._pending_order_canceling = False
         if effective_environment:
@@ -3168,7 +3464,7 @@ class QuantApp:
             f" | sCode={result.s_code}"
             f" | sMsg={result.s_msg or 'accepted'}"
         )
-        parent = self._positions_zoom_window if _widget_exists(self._positions_zoom_window) else self.root
+        parent = self._pending_order_parent_for_view(view_name)
         messagebox.showinfo(
             "撤单结果",
             (
@@ -3190,6 +3486,7 @@ class QuantApp:
         message: str,
         owner_label: str,
         environment: str,
+        view_name: str | None = None,
     ) -> None:
         self._pending_order_canceling = False
         friendly_message = _format_network_error_message(message)
@@ -3206,7 +3503,7 @@ class QuantApp:
             f" | 结果=失败"
             f" | 原因={friendly_message}"
         )
-        parent = self._positions_zoom_window if _widget_exists(self._positions_zoom_window) else self.root
+        parent = self._pending_order_parent_for_view(view_name)
         messagebox.showerror(
             "撤单失败",
             (
@@ -3226,6 +3523,7 @@ class QuantApp:
         skipped_missing_id: int,
         note: str | None = None,
         effective_environment: str | None = None,
+        view_name: str | None = None,
     ) -> None:
         self._pending_order_canceling = False
         if effective_environment:
@@ -3273,7 +3571,7 @@ class QuantApp:
                 f" | 标识={_trade_order_cancel_reference(item) or '-'}"
                 f" | 原因={_format_network_error_message(message)}"
             )
-        parent = self._positions_zoom_window if _widget_exists(self._positions_zoom_window) else self.root
+        parent = self._pending_order_parent_for_view(view_name)
         messagebox.showinfo(
             "批量撤单结果",
             (
@@ -3424,131 +3722,148 @@ class QuantApp:
         self.order_history_keyword.set("")
         self._render_order_history_view()
 
-    def _render_pending_orders_view(self) -> None:
-        tree = self._positions_zoom_pending_orders_tree
-        if tree is None or not _widget_exists(tree):
+    def _trade_order_views(self, *pairs: tuple[str, str]) -> list[tuple[str, str, ttk.Treeview, Text | None]]:
+        views: list[tuple[str, str, ttk.Treeview, Text | None]] = []
+        for tree_attr, detail_attr in pairs:
+            tree = getattr(self, tree_attr)
+            detail = getattr(self, detail_attr)
             if tree is not None and not _widget_exists(tree):
-                self._positions_zoom_pending_orders_tree = None
-            return
-        try:
-            selection = tree.selection()
-            selected_before = selection[0] if selection else None
-            tree.delete(*tree.get_children())
-            filtered_items = self._filtered_pending_order_items()
-            for index, item in filtered_items:
-                iid = f"po-{index}"
-                tree.insert(
-                    "",
-                    END,
-                    iid=iid,
-                    values=(
-                        _format_trade_order_timestamp(item),
-                        item.source_label,
-                        item.inst_type or "-",
-                        item.inst_id or "-",
-                        _format_trade_order_state(item.state),
-                        _format_history_side(item.side, item.pos_side),
-                        item.ord_type or "-",
-                        _format_trade_order_price(item.price, item.inst_id, item.inst_type),
-                        _format_trade_order_size(item.size),
-                        _format_trade_order_size(item.filled_size),
-                        _format_trade_order_tp_sl(item),
-                        item.order_id or item.algo_id or "-",
-                        item.client_order_id or item.algo_client_order_id or "-",
-                    ),
-                    tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
-                )
-            summary = self._positions_zoom_pending_orders_base_summary
-            cancelable_count = sum(
-                1 for _, item in filtered_items if _trade_order_program_owner_label(item) is not None and _trade_order_cancel_reference(item)
-            )
-            if _trade_order_filter_enabled(
-                POSITION_TYPE_OPTIONS.get(self.pending_order_type_filter.get(), ""),
-                ORDER_SOURCE_FILTER_OPTIONS.get(self.pending_order_source_filter.get(), ""),
-                ORDER_STATE_FILTER_OPTIONS.get(self.pending_order_state_filter.get(), ""),
-                self.pending_order_asset_filter.get(),
-                self.pending_order_expiry_prefix_filter.get(),
-                self.pending_order_keyword.get(),
-            ):
-                summary = f"{summary} | 当前显示：{len(filtered_items)}/{len(self._latest_pending_orders)}"
-            if filtered_items:
-                summary = f"{summary} | 可撤程序单：{cancelable_count}/{len(filtered_items)}"
-            self._positions_zoom_pending_orders_summary_text.set(summary)
-            if selected_before and tree.exists(selected_before):
-                tree.selection_set(selected_before)
-                tree.focus(selected_before)
-            elif tree.get_children():
-                first = tree.get_children()[0]
-                tree.selection_set(first)
-                tree.focus(first)
-        except TclError:
-            self._positions_zoom_pending_orders_tree = None
-            return
+                setattr(self, tree_attr, None)
+                tree = None
+            if detail is not None and not _widget_exists(detail):
+                setattr(self, detail_attr, None)
+                detail = None
+            if tree is not None:
+                views.append((tree_attr, detail_attr, tree, detail))
+        return views
+
+    def _pending_order_views(self) -> list[tuple[str, str, ttk.Treeview, Text | None]]:
+        return self._trade_order_views(
+            ("_positions_zoom_pending_orders_tree", "_positions_zoom_pending_orders_detail"),
+            ("_account_info_pending_orders_tree", "_account_info_pending_orders_detail"),
+        )
+
+    def _order_history_views(self) -> list[tuple[str, str, ttk.Treeview, Text | None]]:
+        return self._trade_order_views(
+            ("_positions_zoom_order_history_tree", "_positions_zoom_order_history_detail"),
+            ("_account_info_order_history_tree", "_account_info_order_history_detail"),
+        )
+
+    def _render_pending_orders_view(self) -> None:
+        filtered_items = self._filtered_pending_order_items()
+        summary = self._positions_zoom_pending_orders_base_summary
+        cancelable_count = sum(
+            1 for _, item in filtered_items if _trade_order_program_owner_label(item) is not None and _trade_order_cancel_reference(item)
+        )
+        if _trade_order_filter_enabled(
+            POSITION_TYPE_OPTIONS.get(self.pending_order_type_filter.get(), ""),
+            ORDER_SOURCE_FILTER_OPTIONS.get(self.pending_order_source_filter.get(), ""),
+            ORDER_STATE_FILTER_OPTIONS.get(self.pending_order_state_filter.get(), ""),
+            self.pending_order_asset_filter.get(),
+            self.pending_order_expiry_prefix_filter.get(),
+            self.pending_order_keyword.get(),
+        ):
+            summary = f"{summary} | 当前显示：{len(filtered_items)}/{len(self._latest_pending_orders)}"
+        if filtered_items:
+            summary = f"{summary} | 可撤程序单：{cancelable_count}/{len(filtered_items)}"
+        self._positions_zoom_pending_orders_summary_text.set(summary)
+        for tree_attr, _, tree, _ in self._pending_order_views():
+            try:
+                selection = tree.selection()
+                selected_before = selection[0] if selection else None
+                tree.delete(*tree.get_children())
+                for index, item in filtered_items:
+                    iid = f"po-{index}"
+                    tree.insert(
+                        "",
+                        END,
+                        iid=iid,
+                        values=(
+                            _format_trade_order_timestamp(item),
+                            item.source_label,
+                            item.inst_type or "-",
+                            item.inst_id or "-",
+                            _format_trade_order_state(item.state),
+                            _format_history_side(item.side, item.pos_side),
+                            item.ord_type or "-",
+                            _format_trade_order_price(item.price, item.inst_id, item.inst_type),
+                            _format_trade_order_size(item.size),
+                            _format_trade_order_size(item.filled_size),
+                            _format_trade_order_tp_sl(item),
+                            item.order_id or item.algo_id or "-",
+                            item.client_order_id or item.algo_client_order_id or "-",
+                        ),
+                        tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
+                    )
+                if selected_before and tree.exists(selected_before):
+                    tree.selection_set(selected_before)
+                    tree.focus(selected_before)
+                elif tree.get_children():
+                    first = tree.get_children()[0]
+                    tree.selection_set(first)
+                    tree.focus(first)
+            except TclError:
+                setattr(self, tree_attr, None)
         self._refresh_pending_orders_detail()
 
     def _render_order_history_view(self) -> None:
-        tree = self._positions_zoom_order_history_tree
-        if tree is None or not _widget_exists(tree):
-            if tree is not None and not _widget_exists(tree):
-                self._positions_zoom_order_history_tree = None
-            return
-        try:
-            selection = tree.selection()
-            selected_before = selection[0] if selection else None
-            tree.delete(*tree.get_children())
-            filtered_items = _filter_trade_order_items(
-                self._latest_order_history,
-                inst_type=POSITION_TYPE_OPTIONS.get(self.order_history_type_filter.get(), ""),
-                source=ORDER_SOURCE_FILTER_OPTIONS.get(self.order_history_source_filter.get(), ""),
-                state=ORDER_STATE_FILTER_OPTIONS.get(self.order_history_state_filter.get(), ""),
-                asset=self.order_history_asset_filter.get(),
-                expiry_prefix=self.order_history_expiry_prefix_filter.get(),
-                keyword=self.order_history_keyword.get(),
-            )
-            for index, item in filtered_items:
-                iid = f"oh-{index}"
-                tree.insert(
-                    "",
-                    END,
-                    iid=iid,
-                    values=(
-                        _format_trade_order_timestamp(item),
-                        item.source_label,
-                        item.inst_type or "-",
-                        item.inst_id or "-",
-                        _format_trade_order_state(item.state),
-                        _format_history_side(item.side, item.pos_side),
-                        item.ord_type or "-",
-                        _format_trade_order_price(item.price, item.inst_id, item.inst_type),
-                        _format_trade_order_size(item.size),
-                        _format_trade_order_size(item.filled_size),
-                        _format_trade_order_tp_sl(item),
-                        item.order_id or item.algo_id or "-",
-                        item.client_order_id or item.algo_client_order_id or "-",
-                    ),
-                    tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
-                )
-            summary = self._positions_zoom_order_history_base_summary
-            if _trade_order_filter_enabled(
-                POSITION_TYPE_OPTIONS.get(self.order_history_type_filter.get(), ""),
-                ORDER_SOURCE_FILTER_OPTIONS.get(self.order_history_source_filter.get(), ""),
-                ORDER_STATE_FILTER_OPTIONS.get(self.order_history_state_filter.get(), ""),
-                self.order_history_asset_filter.get(),
-                self.order_history_expiry_prefix_filter.get(),
-                self.order_history_keyword.get(),
-            ):
-                summary = f"{summary} | 当前显示：{len(filtered_items)}/{len(self._latest_order_history)}"
-            self._positions_zoom_order_history_summary_text.set(summary)
-            if selected_before and tree.exists(selected_before):
-                tree.selection_set(selected_before)
-                tree.focus(selected_before)
-            elif tree.get_children():
-                first = tree.get_children()[0]
-                tree.selection_set(first)
-                tree.focus(first)
-        except TclError:
-            self._positions_zoom_order_history_tree = None
-            return
+        filtered_items = _filter_trade_order_items(
+            self._latest_order_history,
+            inst_type=POSITION_TYPE_OPTIONS.get(self.order_history_type_filter.get(), ""),
+            source=ORDER_SOURCE_FILTER_OPTIONS.get(self.order_history_source_filter.get(), ""),
+            state=ORDER_STATE_FILTER_OPTIONS.get(self.order_history_state_filter.get(), ""),
+            asset=self.order_history_asset_filter.get(),
+            expiry_prefix=self.order_history_expiry_prefix_filter.get(),
+            keyword=self.order_history_keyword.get(),
+        )
+        summary = self._positions_zoom_order_history_base_summary
+        if _trade_order_filter_enabled(
+            POSITION_TYPE_OPTIONS.get(self.order_history_type_filter.get(), ""),
+            ORDER_SOURCE_FILTER_OPTIONS.get(self.order_history_source_filter.get(), ""),
+            ORDER_STATE_FILTER_OPTIONS.get(self.order_history_state_filter.get(), ""),
+            self.order_history_asset_filter.get(),
+            self.order_history_expiry_prefix_filter.get(),
+            self.order_history_keyword.get(),
+        ):
+            summary = f"{summary} | 当前显示：{len(filtered_items)}/{len(self._latest_order_history)}"
+        self._positions_zoom_order_history_summary_text.set(summary)
+        for tree_attr, _, tree, _ in self._order_history_views():
+            try:
+                selection = tree.selection()
+                selected_before = selection[0] if selection else None
+                tree.delete(*tree.get_children())
+                for index, item in filtered_items:
+                    iid = f"oh-{index}"
+                    tree.insert(
+                        "",
+                        END,
+                        iid=iid,
+                        values=(
+                            _format_trade_order_timestamp(item),
+                            item.source_label,
+                            item.inst_type or "-",
+                            item.inst_id or "-",
+                            _format_trade_order_state(item.state),
+                            _format_history_side(item.side, item.pos_side),
+                            item.ord_type or "-",
+                            _format_trade_order_price(item.price, item.inst_id, item.inst_type),
+                            _format_trade_order_size(item.size),
+                            _format_trade_order_size(item.filled_size),
+                            _format_trade_order_tp_sl(item),
+                            item.order_id or item.algo_id or "-",
+                            item.client_order_id or item.algo_client_order_id or "-",
+                        ),
+                        tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
+                    )
+                if selected_before and tree.exists(selected_before):
+                    tree.selection_set(selected_before)
+                    tree.focus(selected_before)
+                elif tree.get_children():
+                    first = tree.get_children()[0]
+                    tree.selection_set(first)
+                    tree.focus(first)
+            except TclError:
+                setattr(self, tree_attr, None)
         self._refresh_order_history_detail()
 
     def _on_pending_orders_selected(self, *_: object) -> None:
@@ -3558,66 +3873,63 @@ class QuantApp:
         self._refresh_order_history_detail()
 
     def _refresh_pending_orders_detail(self) -> None:
-        if (
-            self._positions_zoom_pending_orders_tree is None
-            or self._positions_zoom_pending_orders_detail is None
-            or not _widget_exists(self._positions_zoom_pending_orders_tree)
-            or not _widget_exists(self._positions_zoom_pending_orders_detail)
-        ):
-            return
-        try:
-            selection = self._positions_zoom_pending_orders_tree.selection()
-        except TclError:
-            self._positions_zoom_pending_orders_tree = None
-            self._positions_zoom_pending_orders_detail = None
-            return
-        if not selection:
-            self._set_readonly_text(self._positions_zoom_pending_orders_detail, "这里会显示选中当前委托的详情。")
-            return
-        index = _history_tree_index(selection[0], "po")
-        if index is None or index >= len(self._latest_pending_orders):
-            self._set_readonly_text(self._positions_zoom_pending_orders_detail, "这里会显示选中当前委托的详情。")
-            return
-        self._set_readonly_text(self._positions_zoom_pending_orders_detail, _build_trade_order_detail_text(self._latest_pending_orders[index]))
+        for tree_attr, detail_attr, tree, detail in self._pending_order_views():
+            if detail is None:
+                continue
+            try:
+                selection = tree.selection()
+            except TclError:
+                setattr(self, tree_attr, None)
+                setattr(self, detail_attr, None)
+                continue
+            if not selection:
+                self._set_readonly_text(detail, "这里会显示选中当前委托的详情。")
+                continue
+            index = _history_tree_index(selection[0], "po")
+            if index is None or index >= len(self._latest_pending_orders):
+                self._set_readonly_text(detail, "这里会显示选中当前委托的详情。")
+                continue
+            self._set_readonly_text(detail, _build_trade_order_detail_text(self._latest_pending_orders[index]))
 
     def _refresh_order_history_detail(self) -> None:
-        if (
-            self._positions_zoom_order_history_tree is None
-            or self._positions_zoom_order_history_detail is None
-            or not _widget_exists(self._positions_zoom_order_history_tree)
-            or not _widget_exists(self._positions_zoom_order_history_detail)
-        ):
-            return
-        try:
-            selection = self._positions_zoom_order_history_tree.selection()
-        except TclError:
-            self._positions_zoom_order_history_tree = None
-            self._positions_zoom_order_history_detail = None
-            return
-        if not selection:
-            self._set_readonly_text(self._positions_zoom_order_history_detail, "这里会显示选中历史委托的详情。")
-            return
-        index = _history_tree_index(selection[0], "oh")
-        if index is None or index >= len(self._latest_order_history):
-            self._set_readonly_text(self._positions_zoom_order_history_detail, "这里会显示选中历史委托的详情。")
-            return
-        self._set_readonly_text(self._positions_zoom_order_history_detail, _build_trade_order_detail_text(self._latest_order_history[index]))
+        for tree_attr, detail_attr, tree, detail in self._order_history_views():
+            if detail is None:
+                continue
+            try:
+                selection = tree.selection()
+            except TclError:
+                setattr(self, tree_attr, None)
+                setattr(self, detail_attr, None)
+                continue
+            if not selection:
+                self._set_readonly_text(detail, "这里会显示选中历史委托的详情。")
+                continue
+            index = _history_tree_index(selection[0], "oh")
+            if index is None or index >= len(self._latest_order_history):
+                self._set_readonly_text(detail, "这里会显示选中历史委托的详情。")
+                continue
+            self._set_readonly_text(detail, _build_trade_order_detail_text(self._latest_order_history[index]))
 
-    def _selected_pending_order_item(self) -> OkxTradeOrderItem | None:
-        tree = self._positions_zoom_pending_orders_tree
-        if tree is None or not _widget_exists(tree):
-            return None
-        try:
-            selection = tree.selection()
-        except TclError:
-            self._positions_zoom_pending_orders_tree = None
-            return None
-        if not selection:
-            return None
-        index = _history_tree_index(selection[0], "po")
-        if index is None or index >= len(self._latest_pending_orders):
-            return None
-        return self._latest_pending_orders[index]
+    def _selected_pending_order_item(self, view_name: str | None = None) -> OkxTradeOrderItem | None:
+        candidate_trees: list[ttk.Treeview] = []
+        tree = self._pending_order_tree_for_view(view_name)
+        if tree is not None and _widget_exists(tree):
+            candidate_trees.append(tree)
+        for fallback_tree in (self._positions_zoom_pending_orders_tree, self._account_info_pending_orders_tree):
+            if fallback_tree is not None and fallback_tree not in candidate_trees and _widget_exists(fallback_tree):
+                candidate_trees.append(fallback_tree)
+        for active_tree in candidate_trees:
+            try:
+                selection = active_tree.selection()
+            except TclError:
+                continue
+            if not selection:
+                continue
+            index = _history_tree_index(selection[0], "po")
+            if index is None or index >= len(self._latest_pending_orders):
+                continue
+            return self._latest_pending_orders[index]
+        return None
 
     def _filtered_pending_order_items(self) -> list[tuple[int, OkxTradeOrderItem]]:
         return _filter_trade_order_items(

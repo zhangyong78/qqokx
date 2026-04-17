@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from okx_quant.models import Credentials, Instrument
 from okx_quant.okx_client import (
     OkxAccountOverview,
+    OkxApiError,
     OkxOrderBook,
     OkxOrderResult,
     OkxOrderStatus,
@@ -33,8 +34,13 @@ class _FakeClient:
         self.ticker_calls = 0
         self.order_book_calls = 0
         self.placed_orders: list[dict[str, object]] = []
+        self.aggressive_orders: list[dict[str, object]] = []
         self.canceled_orders: list[str] = []
         self.positions: list[OkxPosition] = []
+        self.submit_exceptions: list[Exception | None] = []
+        self.cancel_exceptions: list[Exception | None] = []
+        self.order_results: list[dict[str, object]] = []
+        self.order_lookup: dict[str, dict[str, object]] = {}
         self.account_overview = OkxAccountOverview(
             total_equity=None,
             adjusted_equity=None,
@@ -72,15 +78,46 @@ class _FakeClient:
 
     def place_simple_order(self, credentials, config, **kwargs) -> OkxOrderResult:  # noqa: ANN001
         self.placed_orders.append(kwargs)
+        ord_id = f"ord{len(self.placed_orders):03d}"
+        cl_ord_id = kwargs.get("cl_ord_id")
+        order_result = self.order_results.pop(0) if self.order_results else {}
+        status_payload = {
+            "ord_id": ord_id,
+            "state": order_result.get("state", "live"),
+            "price": order_result.get("price", kwargs.get("price")),
+            "avg_price": order_result.get("avg_price"),
+            "size": order_result.get("size", kwargs.get("size")),
+            "filled_size": order_result.get("filled_size", Decimal("0")),
+        }
+        self.order_lookup[ord_id] = status_payload
+        if cl_ord_id:
+            self.order_lookup[f"cl:{cl_ord_id}"] = status_payload
+        submit_exc = self.submit_exceptions.pop(0) if self.submit_exceptions else None
+        if submit_exc is not None:
+            raise submit_exc
         return OkxOrderResult(
-            ord_id=f"ord{len(self.placed_orders):03d}",
-            cl_ord_id=kwargs.get("cl_ord_id"),
+            ord_id=ord_id,
+            cl_ord_id=cl_ord_id,
             s_code="0",
             s_msg="",
             raw={},
         )
 
     def get_order(self, credentials, config, *, inst_id: str, ord_id: str | None = None, cl_ord_id: str | None = None) -> OkxOrderStatus:  # noqa: ANN001
+        key = ord_id or (f"cl:{cl_ord_id}" if cl_ord_id else None)
+        if key and key in self.order_lookup:
+            payload = self.order_lookup[key]
+            return OkxOrderStatus(
+                ord_id=str(payload.get("ord_id") or ord_id or "ord001"),
+                state=str(payload.get("state") or "live"),
+                side="buy",
+                ord_type="limit",
+                price=payload.get("price"),  # type: ignore[arg-type]
+                avg_price=payload.get("avg_price"),  # type: ignore[arg-type]
+                size=payload.get("size"),  # type: ignore[arg-type]
+                filled_size=payload.get("filled_size"),  # type: ignore[arg-type]
+                raw={},
+            )
         return OkxOrderStatus(
             ord_id=ord_id or "ord001",
             state="canceled",
@@ -95,7 +132,27 @@ class _FakeClient:
 
     def cancel_order(self, credentials, config, *, inst_id: str, ord_id: str) -> OkxOrderResult:  # noqa: ANN001
         self.canceled_orders.append(ord_id)
+        payload = self.order_lookup.get(ord_id)
+        if payload is not None:
+            payload["state"] = "canceled"
+        cancel_exc = self.cancel_exceptions.pop(0) if self.cancel_exceptions else None
+        if cancel_exc is not None:
+            raise cancel_exc
         return OkxOrderResult(ord_id=ord_id, cl_ord_id=None, s_code="0", s_msg="", raw={})
+
+    def place_aggressive_limit_order(self, credentials, config, instrument, **kwargs) -> OkxOrderResult:  # noqa: ANN001
+        self.aggressive_orders.append({"instrument": instrument.inst_id, **kwargs})
+        return self.place_simple_order(
+            credentials,
+            config,
+            inst_id=instrument.inst_id,
+            side=kwargs["side"],
+            size=kwargs["size"],
+            ord_type="ioc",
+            pos_side=kwargs.get("pos_side"),
+            price=Decimal("0.0101"),
+            cl_ord_id=kwargs.get("cl_ord_id"),
+        )
 
     def get_positions(self, credentials, *, environment: str, inst_type: str | None = None):  # noqa: ANN001
         if inst_type is None:
@@ -107,6 +164,37 @@ class _FakeClient:
 
     def get_trigger_price(self, inst_id: str, price_type: str):  # noqa: ANN001
         return Decimal("0.010")
+
+
+def _make_runtime(*, position_mode: str = "net") -> SmartOrderRuntimeConfig:
+    return SmartOrderRuntimeConfig(
+        credentials=Credentials(api_key="a", secret_key="b", passphrase="c"),
+        environment="demo",
+        trade_mode="cross",
+        position_mode=position_mode,  # type: ignore[arg-type]
+    )
+
+
+def _make_option_instrument(inst_id: str = "BTC-USD-TEST") -> Instrument:
+    return Instrument(
+        inst_id=inst_id,
+        inst_type="OPTION",
+        tick_size=Decimal("0.0001"),
+        lot_size=Decimal("1"),
+        min_size=Decimal("1"),
+        state="live",
+    )
+
+
+def _make_swap_instrument(inst_id: str = "ETH-USDT-SWAP") -> Instrument:
+    return Instrument(
+        inst_id=inst_id,
+        inst_type="SWAP",
+        tick_size=Decimal("0.01"),
+        lot_size=Decimal("0.01"),
+        min_size=Decimal("0.01"),
+        state="live",
+    )
 
 
 class SmartOrderLogicTests(unittest.TestCase):
@@ -662,6 +750,178 @@ class SmartOrderLogicTests(unittest.TestCase):
                 self.assertEqual(Decimal("2"), short_limit)
             finally:
                 restored.destroy()
+
+    def test_submit_limit_order_recovers_when_response_is_lost(self) -> None:
+        client = _FakeClient()
+        client.submit_exceptions = [OkxApiError("SSL handshake timed out")]
+        with TemporaryDirectory() as temp_dir:
+            manager = SmartOrderManager(client, storage_path=Path(temp_dir) / ".okx_quant_smart_order_tasks.json")
+            try:
+                instrument = _make_option_instrument()
+                runtime = _make_runtime()
+                task = _SmartOrderTask(
+                    task_id="G900",
+                    task_type="grid",
+                    inst_id=instrument.inst_id,
+                    instrument=instrument,
+                    runtime=runtime,
+                    side="buy",
+                    size=Decimal("1"),
+                    initial_side="buy",
+                    long_step=Decimal("0.001"),
+                    short_step=Decimal("0.001"),
+                )
+                manager._submit_limit_order(
+                    task,
+                    side="buy",
+                    price=Decimal("0.0100"),
+                    size=Decimal("1"),
+                    message_prefix="测试限价委托",
+                )
+                self.assertEqual(1, len(client.placed_orders))
+                self.assertEqual("ord001", task.active_order_id)
+                self.assertEqual(STATUS_WAIT_FILL, task.status)
+                self.assertTrue(task.waiting_for_fill)
+                self.assertIsNotNone(task.active_order_cl_ord_id)
+            finally:
+                manager.destroy()
+
+    def test_handle_stop_recovers_when_cancel_response_is_lost(self) -> None:
+        client = _FakeClient()
+        with TemporaryDirectory() as temp_dir:
+            manager = SmartOrderManager(client, storage_path=Path(temp_dir) / ".okx_quant_smart_order_tasks.json")
+            try:
+                instrument = _make_option_instrument()
+                runtime = _make_runtime()
+                task = _SmartOrderTask(
+                    task_id="G901",
+                    task_type="grid",
+                    inst_id=instrument.inst_id,
+                    instrument=instrument,
+                    runtime=runtime,
+                    side="buy",
+                    size=Decimal("1"),
+                    initial_side="buy",
+                    long_step=Decimal("0.001"),
+                    short_step=Decimal("0.001"),
+                )
+                manager._submit_limit_order(
+                    task,
+                    side="buy",
+                    price=Decimal("0.0100"),
+                    size=Decimal("1"),
+                    message_prefix="测试停止撤单",
+                )
+                client.cancel_exceptions = [OkxApiError("read timed out")]
+                task.stop_requested = True
+
+                manager._handle_stop(task)
+
+                self.assertEqual(STATUS_STOPPED, task.status)
+                self.assertFalse(task.waiting_for_fill)
+                self.assertIsNone(task.active_order_id)
+                self.assertIsNone(task.active_order_cl_ord_id)
+                self.assertIn("ord001", client.canceled_orders)
+            finally:
+                manager.destroy()
+
+    def test_submit_aggressive_order_recovers_when_response_is_lost(self) -> None:
+        client = _FakeClient()
+        client.submit_exceptions = [OkxApiError("connection reset by peer")]
+        with TemporaryDirectory() as temp_dir:
+            manager = SmartOrderManager(client, storage_path=Path(temp_dir) / ".okx_quant_smart_order_tasks.json")
+            try:
+                instrument = _make_option_instrument()
+                runtime = _make_runtime()
+                task = _SmartOrderTask(
+                    task_id="T902",
+                    task_type="tp_sl",
+                    inst_id=instrument.inst_id,
+                    instrument=instrument,
+                    runtime=runtime,
+                    side="sell",
+                    size=Decimal("1"),
+                    protection_position_side="long",
+                )
+                manager._submit_aggressive_order(
+                    task,
+                    side="sell",
+                    size=Decimal("1"),
+                    message_prefix="测试止盈止损平仓",
+                )
+                self.assertEqual(1, len(client.aggressive_orders))
+                self.assertEqual("ord001", task.active_order_id)
+                self.assertEqual(STATUS_WAIT_FILL, task.status)
+                self.assertTrue(task.waiting_for_fill)
+                self.assertIsNotNone(task.active_order_cl_ord_id)
+            finally:
+                manager.destroy()
+
+    def test_grid_long_short_uses_long_pos_side_for_open_and_reverse_orders(self) -> None:
+        client = _FakeClient()
+        with TemporaryDirectory() as temp_dir:
+            manager = SmartOrderManager(client, storage_path=Path(temp_dir) / ".okx_quant_smart_order_tasks.json")
+            try:
+                instrument = _make_swap_instrument()
+                runtime = _make_runtime(position_mode="long_short")
+                task_id = manager.start_grid_task(
+                    instrument=instrument,
+                    runtime=runtime,
+                    side="buy",
+                    entry_price=Decimal("2300"),
+                    size=Decimal("0.01"),
+                    long_step=Decimal("10"),
+                    short_step=Decimal("10"),
+                    cycle_mode="counted",
+                    cycle_limit=2,
+                )
+                task = manager._tasks[task_id]
+                self.assertEqual("buy", client.placed_orders[0]["side"])
+                self.assertEqual("long", client.placed_orders[0]["pos_side"])
+
+                manager._handle_order_filled(
+                    task,
+                    OkxOrderStatus(
+                        ord_id=task.active_order_id or "ord001",
+                        state="filled",
+                        side="buy",
+                        ord_type="limit",
+                        price=Decimal("2300"),
+                        avg_price=Decimal("2300"),
+                        size=Decimal("0.01"),
+                        filled_size=Decimal("0.01"),
+                        raw={},
+                    ),
+                )
+
+                self.assertEqual(2, len(client.placed_orders))
+                self.assertEqual("sell", client.placed_orders[1]["side"])
+                self.assertEqual("long", client.placed_orders[1]["pos_side"])
+            finally:
+                manager.destroy()
+
+    def test_grid_long_short_sell_side_uses_short_pos_side(self) -> None:
+        client = _FakeClient()
+        with TemporaryDirectory() as temp_dir:
+            manager = SmartOrderManager(client, storage_path=Path(temp_dir) / ".okx_quant_smart_order_tasks.json")
+            try:
+                instrument = _make_swap_instrument()
+                runtime = _make_runtime(position_mode="long_short")
+                manager.start_grid_task(
+                    instrument=instrument,
+                    runtime=runtime,
+                    side="sell",
+                    entry_price=Decimal("2300"),
+                    size=Decimal("0.01"),
+                    long_step=Decimal("10"),
+                    short_step=Decimal("10"),
+                    cycle_mode="counted",
+                    cycle_limit=1,
+                )
+                self.assertEqual("sell", client.placed_orders[0]["side"])
+                self.assertEqual("short", client.placed_orders[0]["pos_side"])
+            finally:
+                manager.destroy()
 
 if __name__ == "__main__":
     unittest.main()
