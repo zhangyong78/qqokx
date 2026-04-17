@@ -10,6 +10,7 @@ SETTINGS_FILE_NAME = ".okx_quant_settings.json"
 BACKTEST_HISTORY_FILE_NAME = ".okx_quant_backtest_history.json"
 BACKTEST_CANDLE_CACHE_DIR_NAME = ".okx_quant_candle_cache"
 BACKTEST_REPORT_EXPORT_DIR_NAME = "backtest_exports"
+STRATEGY_HISTORY_FILE_NAME = ".okx_quant_strategy_history.json"
 SMART_ORDER_TASKS_FILE_NAME = ".okx_quant_smart_order_tasks.json"
 SMART_ORDER_FAVORITES_FILE_NAME = ".okx_quant_smart_order_favorites.json"
 OPTION_STRATEGIES_FILE_NAME = ".okx_quant_option_strategies.json"
@@ -44,6 +45,12 @@ def backtest_report_export_dir_path(base_dir: Path | None = None) -> Path:
     if base_dir is None:
         base_dir = Path(__file__).resolve().parent.parent
     return Path(base_dir) / "reports" / BACKTEST_REPORT_EXPORT_DIR_NAME
+
+
+def strategy_history_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is None:
+        base_dir = Path(__file__).resolve().parent.parent
+    return Path(base_dir) / STRATEGY_HISTORY_FILE_NAME
 
 
 def smart_order_tasks_file_path(base_dir: Path | None = None) -> Path:
@@ -391,6 +398,72 @@ def save_smart_order_favorites_snapshot(
     normalized_favorites.sort(key=lambda item: (item["inst_type"], item["inst_id"]))
     payload = {
         "favorites": normalized_favorites,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
+def _normalize_strategy_history_record(item: object) -> dict[str, object] | None:
+    if not isinstance(item, dict):
+        return None
+    record_id = str(item.get("record_id", "")).strip()
+    strategy_name = str(item.get("strategy_name", "")).strip()
+    started_at = str(item.get("started_at", "")).strip()
+    if not record_id or not strategy_name or not started_at:
+        return None
+    raw_config_snapshot = item.get("config_snapshot")
+    config_snapshot = raw_config_snapshot if isinstance(raw_config_snapshot, dict) else {}
+    stopped_at = str(item.get("stopped_at", "")).strip()
+    updated_at = str(item.get("updated_at", "")).strip()
+    return {
+        "record_id": record_id,
+        "session_id": str(item.get("session_id", "")).strip(),
+        "api_name": str(item.get("api_name", "")).strip(),
+        "strategy_id": str(item.get("strategy_id", "")).strip(),
+        "strategy_name": strategy_name,
+        "symbol": str(item.get("symbol", "")).strip(),
+        "direction_label": str(item.get("direction_label", "")).strip(),
+        "run_mode_label": str(item.get("run_mode_label", "")).strip(),
+        "status": str(item.get("status", "已停止")).strip() or "已停止",
+        "started_at": started_at,
+        "stopped_at": stopped_at or None,
+        "ended_reason": str(item.get("ended_reason", "")).strip(),
+        "log_file_path": str(item.get("log_file_path", "")).strip(),
+        "updated_at": updated_at or None,
+        "config_snapshot": config_snapshot,
+    }
+
+
+def load_strategy_history_snapshot(path: Path | None = None) -> dict[str, object]:
+    target = path or strategy_history_file_path()
+    if not target.exists():
+        return {"records": []}
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    raw_records = payload.get("records")
+    if not isinstance(raw_records, list):
+        raw_records = []
+    records = [
+        normalized for item in raw_records if (normalized := _normalize_strategy_history_record(item)) is not None
+    ]
+    records.sort(key=lambda item: (str(item["started_at"]), str(item["record_id"])), reverse=True)
+    return {"records": records}
+
+
+def save_strategy_history_snapshot(
+    records: list[dict[str, object]],
+    path: Path | None = None,
+) -> Path:
+    target = path or strategy_history_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    normalized_records = [
+        item for record in records if (item := _normalize_strategy_history_record(record)) is not None
+    ]
+    normalized_records.sort(key=lambda item: (str(item["started_at"]), str(item["record_id"])), reverse=True)
+    payload = {
+        "records": normalized_records,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     temp_path = target.with_suffix(target.suffix + ".tmp")

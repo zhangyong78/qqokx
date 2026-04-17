@@ -1,12 +1,14 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 import queue
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
 import tkinter.font as tkfont
 from tkinter import BooleanVar, END, Menu, StringVar, Text, TclError, Tk, Toplevel, simpledialog
 from tkinter import messagebox, ttk
@@ -17,7 +19,7 @@ from okx_quant.deribit_client import DeribitRestClient
 from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.engine import StrategyEngine, fetch_hourly_ema_debug, format_hourly_debug
-from okx_quant.log_utils import append_log_line
+from okx_quant.log_utils import append_log_line, append_preformatted_log_line, strategy_session_log_file_path
 from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.option_roll import is_short_option_position
@@ -43,9 +45,12 @@ from okx_quant.persistence import (
     DEFAULT_CREDENTIAL_PROFILE_NAME,
     load_credentials_profiles_snapshot,
     load_notification_snapshot,
+    load_strategy_history_snapshot,
     save_credentials_profiles_snapshot,
     save_notification_snapshot,
+    save_strategy_history_snapshot,
     settings_file_path,
+    strategy_history_file_path,
 )
 from okx_quant.position_protection import (
     OptionProtectionConfig,
@@ -290,12 +295,76 @@ class StrategySession:
     config: StrategyConfig
     started_at: datetime
     status: str = "运行中"
+    history_record_id: str | None = None
+    stopped_at: datetime | None = None
+    ended_reason: str = ""
+    log_file_path: Path | None = None
 
     @property
     def log_prefix(self) -> str:
         if self.api_name:
             return f"[{self.api_name}] [{self.session_id} {self.strategy_name} {self.symbol}]"
         return f"[{self.session_id} {self.strategy_name} {self.symbol}]"
+
+
+@dataclass
+class StrategyHistoryRecord:
+    record_id: str
+    session_id: str
+    api_name: str
+    strategy_id: str
+    strategy_name: str
+    symbol: str
+    direction_label: str
+    run_mode_label: str
+    status: str
+    started_at: datetime
+    stopped_at: datetime | None = None
+    ended_reason: str = ""
+    log_file_path: str = ""
+    updated_at: datetime | None = None
+    config_snapshot: dict[str, object] = field(default_factory=dict)
+
+
+def _serialize_strategy_config_snapshot(config: StrategyConfig) -> dict[str, object]:
+    snapshot: dict[str, object] = {}
+    for item in dataclass_fields(StrategyConfig):
+        value = getattr(config, item.name)
+        if isinstance(value, Decimal):
+            snapshot[item.name] = format(value, "f")
+        else:
+            snapshot[item.name] = value
+    return snapshot
+
+
+def _parse_datetime_snapshot(value: object) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _format_history_datetime(value: datetime | None) -> str:
+    if value is None:
+        return "-"
+    try:
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "-"
+
+
+def _coerce_log_file_path(value: object) -> Path | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser()
+    except Exception:
+        return None
 
 
 class QuantApp:
@@ -317,6 +386,9 @@ class QuantApp:
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.instruments: list[Instrument] = []
         self.sessions: dict[str, StrategySession] = {}
+        self._strategy_history_records: list[StrategyHistoryRecord] = []
+        self._strategy_history_by_id: dict[str, StrategyHistoryRecord] = {}
+        self._strategy_log_write_failures: set[str] = set()
         self._session_counter = 0
         self._settings_window: Toplevel | None = None
         self._backtest_window: BacktestWindow | None = None
@@ -328,6 +400,7 @@ class QuantApp:
         self._option_strategy_window: OptionStrategyCalculatorWindow | None = None
         self._option_roll_window: OptionRollSuggestionWindow | None = None
         self._positions_zoom_window: Toplevel | None = None
+        self._strategy_history_window: Toplevel | None = None
         self._protection_window: Toplevel | None = None
         self._protection_replay_window: ProtectionReplayWindow | None = None
         self._positions_refreshing = False
@@ -562,6 +635,7 @@ class QuantApp:
         self.strategy_rule_text = StringVar()
         self.strategy_hint_text = StringVar()
         self.selected_session_text = StringVar(value=self._default_selected_session_text())
+        self.strategy_history_text = StringVar(value=self._default_strategy_history_text())
         self.positions_summary_text = StringVar(value="当前尚未获取持仓。")
         self.position_total_text = StringVar(value="-")
         self.position_upl_text = StringVar(value="-")
@@ -593,6 +667,9 @@ class QuantApp:
         self._header_credential_profile_combo: ttk.Combobox | None = None
         self._credential_profile_combo: ttk.Combobox | None = None
         self._loaded_credential_profile_name = DEFAULT_CREDENTIAL_PROFILE_NAME
+        self._strategy_history_tree: ttk.Treeview | None = None
+        self._strategy_history_detail: Text | None = None
+        self._strategy_history_selected_record_id: str | None = None
 
         self._settings_watch_enabled = False
         self._settings_save_job: str | None = None
@@ -600,6 +677,7 @@ class QuantApp:
 
         self._load_saved_credentials()
         self._load_saved_notification_settings()
+        self._load_strategy_history()
         self._build_menu()
         self._build_layout()
         self._apply_initial_detail_visibility()
@@ -628,6 +706,7 @@ class QuantApp:
         tools_menu.add_command(label="打开回测窗口", command=self.open_backtest_window)
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
         tools_menu.add_command(label="打开信号监控", command=self.open_signal_monitor_window)
+        tools_menu.add_command(label="打开策略历史", command=self.open_strategy_history_window)
         tools_menu.add_command(label="打开波动率监控", command=self.open_deribit_volatility_monitor_window)
         tools_menu.add_command(label="打开Deribit波动率指数", command=self.open_deribit_volatility_window)
         tools_menu.add_command(label="打开期权策略计算器", command=self.open_option_strategy_window)
@@ -943,6 +1022,12 @@ class QuantApp:
         control_row = ttk.Frame(running_frame)
         control_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Button(control_row, text="停止选中策略", command=self.stop_selected_session).grid(row=0, column=0)
+        ttk.Button(control_row, text="清空已停止", command=self.clear_stopped_sessions).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="历史策略", command=self.open_strategy_history_window).grid(
+            row=0, column=2, padx=(8, 0)
+        )
 
         detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)
         detail_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
@@ -1232,6 +1317,12 @@ class QuantApp:
         return (
             "启动后，这里会显示选中策略的完整详情。\n"
             "左侧选择策略并点击“启动”后，右侧列表会出现会话；选中某个会话，就能在这里查看规则、参数和运行状态。"
+        )
+
+    def _default_strategy_history_text(self) -> str:
+        return (
+            "这里会显示历史策略记录。\n"
+            "每次启动、停止、异常结束，都会同步写入本地策略历史文件，方便后续溯源。"
         )
 
     def _default_position_detail_text(self) -> str:
@@ -5630,9 +5721,23 @@ class QuantApp:
             session_id = self._next_session_id()
             session_symbol = self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
             api_name = credentials.profile_name or self._current_credential_profile()
+            session_started_at = datetime.now()
+            session_log_path = strategy_session_log_file_path(
+                started_at=session_started_at,
+                session_id=session_id,
+                strategy_name=definition.name,
+                symbol=session_symbol,
+                api_name=api_name,
+            ).resolve()
             engine = StrategyEngine(
                 self.client,
-                self._make_session_logger(session_id, definition.name, session_symbol, api_name),
+                self._make_session_logger(
+                    session_id,
+                    definition.name,
+                    session_symbol,
+                    api_name,
+                    session_log_path,
+                ),
                 notifier=notifier,
                 strategy_name=definition.name,
                 session_id=session_id,
@@ -5647,16 +5752,24 @@ class QuantApp:
                 run_mode_label=self.run_mode_label.get(),
                 engine=engine,
                 config=config,
-                started_at=datetime.now(),
+                started_at=session_started_at,
+                log_file_path=session_log_path,
             )
 
             self.sessions[session_id] = session
             self._upsert_session_row(session)
-            engine.start(credentials, config)
+            try:
+                engine.start(credentials, config)
+            except Exception:
+                self.sessions.pop(session_id, None)
+                if self.session_tree.exists(session_id):
+                    self.session_tree.delete(session_id)
+                raise
+            self._record_strategy_session_started(session)
             self.session_tree.selection_set(session_id)
             self.session_tree.focus(session_id)
             self._refresh_selected_session_details()
-            self._enqueue_log(f"{session.log_prefix} 已提交启动请求。")
+            self._log_session_message(session, "已提交启动请求。")
         except Exception as exc:
             messagebox.showerror("启动失败", str(exc))
 
@@ -5670,10 +5783,68 @@ class QuantApp:
             return
 
         session.status = "停止中"
+        session.ended_reason = "用户手动停止"
         session.engine.stop()
         self._upsert_session_row(session)
         self._refresh_selected_session_details()
-        self._enqueue_log(f"{session.log_prefix} 已请求停止。")
+        self._sync_strategy_history_from_session(session)
+        self._log_session_message(session, "已请求停止。")
+
+    @staticmethod
+    def _session_can_be_cleared(session: StrategySession) -> bool:
+        return session.status == "已停止" and not session.engine.is_running
+
+    @staticmethod
+    def _next_session_selection_after_clear(
+        selected_before: str | None,
+        remaining_session_ids: tuple[str, ...] | list[str],
+    ) -> str | None:
+        if selected_before and selected_before in remaining_session_ids:
+            return selected_before
+        return remaining_session_ids[0] if remaining_session_ids else None
+
+    @staticmethod
+    def _next_history_selection_after_mutation(
+        selected_before: str | None,
+        remaining_record_ids: tuple[str, ...] | list[str],
+    ) -> str | None:
+        if selected_before and selected_before in remaining_record_ids:
+            return selected_before
+        return remaining_record_ids[0] if remaining_record_ids else None
+
+    def clear_stopped_sessions(self) -> None:
+        stopped_ids = [
+            session_id
+            for session_id, session in self.sessions.items()
+            if self._session_can_be_cleared(session)
+        ]
+        if not stopped_ids:
+            messagebox.showinfo("提示", "当前没有可清空的已停止策略。")
+            return
+
+        confirmed = messagebox.askyesno(
+            "确认清空",
+            f"确认从运行中策略列表清空 {len(stopped_ids)} 条已停止会话吗？\n\n历史策略记录和独立日志会保留。",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+
+        tree = self.session_tree
+        selected_before = tree.selection()[0] if tree.selection() else None
+        for session_id in stopped_ids:
+            self.sessions.pop(session_id, None)
+            if tree.exists(session_id):
+                tree.delete(session_id)
+
+        remaining = tuple(tree.get_children())
+        next_selection = self._next_session_selection_after_clear(selected_before, remaining)
+        if next_selection is not None:
+            tree.selection_set(next_selection)
+            tree.focus(next_selection)
+            tree.see(next_selection)
+        self._refresh_selected_session_details()
+        self._enqueue_log(f"已从运行中策略列表清空 {len(stopped_ids)} 条已停止会话；历史策略记录保留。")
 
     def debug_hourly_values(self) -> None:
         symbol = _normalize_symbol_input(self.symbol.get())
@@ -6401,11 +6572,48 @@ class QuantApp:
             f"{self.position_mode_label.get()}"
         )
 
-    def _make_session_logger(self, session_id: str, strategy_name: str, symbol: str, api_name: str = ""):
+    def _append_logged_message(
+        self,
+        message: str,
+        *,
+        extra_log_path: Path | None = None,
+        extra_log_owner: str = "",
+    ) -> None:
+        line = append_log_line(message)
+        if extra_log_path is not None:
+            try:
+                append_preformatted_log_line(line, path=extra_log_path)
+            except Exception as exc:
+                failure_key = str(extra_log_path)
+                if failure_key not in self._strategy_log_write_failures:
+                    self._strategy_log_write_failures.add(failure_key)
+                    owner_prefix = f"{extra_log_owner} " if extra_log_owner else ""
+                    self._enqueue_log(f"{owner_prefix}独立日志写入失败：{exc}")
+        self.log_queue.put(line)
+
+    def _log_session_message(self, session: StrategySession, message: str) -> None:
+        self._append_logged_message(
+            f"{session.log_prefix} {message}",
+            extra_log_path=session.log_file_path,
+            extra_log_owner=session.log_prefix,
+        )
+
+    def _make_session_logger(
+        self,
+        session_id: str,
+        strategy_name: str,
+        symbol: str,
+        api_name: str = "",
+        log_file_path: Path | None = None,
+    ):
         prefix = f"[{api_name}] [{session_id} {strategy_name} {symbol}]" if api_name else f"[{session_id} {strategy_name} {symbol}]"
 
         def _logger(message: str) -> None:
-            self._enqueue_log(f"{prefix} {message}")
+            self._append_logged_message(
+                f"{prefix} {message}",
+                extra_log_path=log_file_path,
+                extra_log_owner=prefix,
+            )
 
         return _logger
 
@@ -6452,48 +6660,664 @@ class QuantApp:
             self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
             return
 
-        definition = get_strategy_definition(session.strategy_id)
-        lines = [
-            f"会话：{session.session_id}",
-            f"API配置：{session.api_name or '-'}",
-            f"状态：{session.status}",
-            f"策略：{session.strategy_name}",
-            f"运行模式：{session.run_mode_label}",
-            f"交易标的：{self._format_strategy_symbol_display(session.config.inst_id, session.config.trade_inst_id)}",
-            f"方向：{session.direction_label}",
-            f"K线周期：{session.config.bar}",
-            f"EMA小周期：{session.config.ema_period}",
-            f"EMA中周期：{session.config.trend_ema_period}",
-        ]
-        if is_dynamic_strategy_id(session.strategy_id):
-            lines.append(f"挂单参考EMA：{session.config.entry_reference_ema_label()}")
-            if session.config.take_profit_mode == "dynamic":
-                lines.append(f"2R保本开关：{session.config.dynamic_two_r_break_even_label()}")
-                lines.append(f"手续费偏移开关：{session.config.dynamic_fee_offset_enabled_label()}")
-        if self._strategy_uses_big_ema(session.strategy_id):
-            lines.append(f"EMA大周期：{session.config.big_ema_period}")
+        self.selected_session_text.set(
+            self._build_strategy_detail_text(
+                session_id=session.session_id,
+                api_name=session.api_name,
+                status=session.status,
+                strategy_id=session.strategy_id,
+                strategy_name=session.strategy_name,
+                symbol=session.symbol,
+                direction_label=session.direction_label,
+                run_mode_label=session.run_mode_label,
+                started_at=session.started_at,
+                stopped_at=session.stopped_at,
+                ended_reason=session.ended_reason,
+                config_snapshot=_serialize_strategy_config_snapshot(session.config),
+                log_file_path=session.log_file_path,
+            )
+        )
+        self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
+
+    @staticmethod
+    def _snapshot_optional_text(snapshot: dict[str, object], key: str) -> str | None:
+        value = snapshot.get(key)
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @staticmethod
+    def _snapshot_text(snapshot: dict[str, object], key: str, default: str = "-") -> str:
+        value = QuantApp._snapshot_optional_text(snapshot, key)
+        return value if value is not None else default
+
+    @staticmethod
+    def _snapshot_int(snapshot: dict[str, object], key: str, default: int = 0) -> int:
+        value = snapshot.get(key, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _bool_label(value: object) -> str:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return "开启" if normalized in {"1", "true", "yes", "on", "开启"} else "关闭"
+        return "开启" if bool(value) else "关闭"
+
+    def _build_strategy_detail_text(
+        self,
+        *,
+        session_id: str,
+        api_name: str,
+        status: str,
+        strategy_id: str,
+        strategy_name: str,
+        symbol: str,
+        direction_label: str,
+        run_mode_label: str,
+        started_at: datetime,
+        stopped_at: datetime | None,
+        ended_reason: str,
+        config_snapshot: dict[str, object],
+        log_file_path: str | Path | None = None,
+        record_id: str | None = None,
+        updated_at: datetime | None = None,
+    ) -> str:
+        try:
+            definition = get_strategy_definition(strategy_id)
+            summary = definition.summary
+            rule_description = definition.rule_description
+            parameter_hint = definition.parameter_hint
+        except KeyError:
+            summary = "历史记录中的策略定义已不存在，保留原始参数供溯源。"
+            rule_description = "-"
+            parameter_hint = "-"
+        snapshot = dict(config_snapshot or {})
+        signal_inst_id = self._snapshot_optional_text(snapshot, "inst_id") or ""
+        trade_inst_id = self._snapshot_optional_text(snapshot, "trade_inst_id")
+        display_symbol = symbol or self._format_strategy_symbol_display(signal_inst_id, trade_inst_id)
+        ema_period = self._snapshot_int(snapshot, "ema_period")
+        trend_ema_period = self._snapshot_int(snapshot, "trend_ema_period")
+        entry_reference_ema_period = self._snapshot_int(snapshot, "entry_reference_ema_period")
+        lines = []
+        if record_id:
+            lines.append(f"记录ID：{record_id}")
         lines.extend(
             [
-                f"ATR 周期：{session.config.atr_period}",
-                f"止损 ATR 倍数：{session.config.atr_stop_multiplier}",
-                f"止盈 ATR 倍数：{session.config.atr_take_multiplier}",
-                f"风险金：{session.config.risk_amount}",
-                f"固定数量：{session.config.order_size}",
-                f"下单方向模式：{session.config.entry_side_mode}",
-                f"止盈止损模式：{session.config.tp_sl_mode}",
-                f"自定义触发标的：{session.config.local_tp_sl_inst_id or '-'}",
-                f"轮询秒数：{session.config.poll_seconds}",
-                f"启动时间：{session.started_at.strftime('%Y-%m-%d %H:%M:%S')}",
-                "",
-                f"策略简介：{definition.summary}",
-                "",
-                f"规则说明：{definition.rule_description}",
-                "",
-                f"参数提示：{definition.parameter_hint}",
+                f"会话：{session_id or '-'}",
+                f"API配置：{api_name or '-'}",
+                f"状态：{status or '-'}",
+                f"独立日志：{_coerce_log_file_path(log_file_path) or '-'}",
             ]
         )
-        self.selected_session_text.set("\n".join(lines))
-        self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
+        if ended_reason:
+            lines.append(f"结束原因：{ended_reason}")
+        lines.extend(
+            [
+                f"策略：{strategy_name}",
+                f"运行模式：{run_mode_label or '-'}",
+                f"交易标的：{display_symbol or '-'}",
+                f"方向：{direction_label or '-'}",
+                f"K线周期：{self._snapshot_text(snapshot, 'bar')}",
+                f"EMA小周期：{ema_period or '-'}",
+                f"EMA中周期：{trend_ema_period or '-'}",
+            ]
+        )
+        if is_dynamic_strategy_id(strategy_id):
+            if entry_reference_ema_period > 0:
+                entry_reference_label = f"EMA{entry_reference_ema_period}"
+            else:
+                entry_reference_label = f"跟随EMA小周期(EMA{ema_period or '-'})"
+            lines.append(f"挂单参考EMA：{entry_reference_label}")
+            if self._snapshot_text(snapshot, "take_profit_mode", "dynamic") == "dynamic":
+                lines.append(f"2R保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}")
+                lines.append(f"手续费偏移开关：{self._bool_label(snapshot.get('dynamic_fee_offset_enabled', True))}")
+        if self._strategy_uses_big_ema(strategy_id):
+            lines.append(f"EMA大周期：{self._snapshot_int(snapshot, 'big_ema_period') or '-'}")
+        lines.extend(
+            [
+                f"ATR 周期：{self._snapshot_text(snapshot, 'atr_period')}",
+                f"止损 ATR 倍数：{self._snapshot_text(snapshot, 'atr_stop_multiplier')}",
+                f"止盈 ATR 倍数：{self._snapshot_text(snapshot, 'atr_take_multiplier')}",
+                f"风险金：{self._snapshot_text(snapshot, 'risk_amount')}",
+                f"固定数量：{self._snapshot_text(snapshot, 'order_size')}",
+                f"下单方向模式：{self._snapshot_text(snapshot, 'entry_side_mode')}",
+                f"止盈止损模式：{self._snapshot_text(snapshot, 'tp_sl_mode')}",
+                f"自定义触发标的：{self._snapshot_text(snapshot, 'local_tp_sl_inst_id')}",
+                f"轮询秒数：{self._snapshot_text(snapshot, 'poll_seconds')}",
+                f"启动时间：{_format_history_datetime(started_at)}",
+            ]
+        )
+        if stopped_at is not None:
+            lines.append(f"停止时间：{_format_history_datetime(stopped_at)}")
+        if updated_at is not None:
+            lines.append(f"最近更新：{_format_history_datetime(updated_at)}")
+        lines.extend(
+            [
+                "",
+                f"策略简介：{summary}",
+                "",
+                f"规则说明：{rule_description}",
+                "",
+                f"参数提示：{parameter_hint}",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _history_record_from_payload(self, payload: dict[str, object]) -> StrategyHistoryRecord | None:
+        started_at = _parse_datetime_snapshot(payload.get("started_at"))
+        if started_at is None:
+            return None
+        config_snapshot = payload.get("config_snapshot")
+        return StrategyHistoryRecord(
+            record_id=str(payload.get("record_id", "")).strip(),
+            session_id=str(payload.get("session_id", "")).strip(),
+            api_name=str(payload.get("api_name", "")).strip(),
+            strategy_id=str(payload.get("strategy_id", "")).strip(),
+            strategy_name=str(payload.get("strategy_name", "")).strip(),
+            symbol=str(payload.get("symbol", "")).strip(),
+            direction_label=str(payload.get("direction_label", "")).strip(),
+            run_mode_label=str(payload.get("run_mode_label", "")).strip(),
+            status=str(payload.get("status", "")).strip() or "已停止",
+            started_at=started_at,
+            stopped_at=_parse_datetime_snapshot(payload.get("stopped_at")),
+            ended_reason=str(payload.get("ended_reason", "")).strip(),
+            log_file_path=str(payload.get("log_file_path", "")).strip(),
+            updated_at=_parse_datetime_snapshot(payload.get("updated_at")),
+            config_snapshot=dict(config_snapshot) if isinstance(config_snapshot, dict) else {},
+        )
+
+    @staticmethod
+    def _history_record_payload(record: StrategyHistoryRecord) -> dict[str, object]:
+        return {
+            "record_id": record.record_id,
+            "session_id": record.session_id,
+            "api_name": record.api_name,
+            "strategy_id": record.strategy_id,
+            "strategy_name": record.strategy_name,
+            "symbol": record.symbol,
+            "direction_label": record.direction_label,
+            "run_mode_label": record.run_mode_label,
+            "status": record.status,
+            "started_at": record.started_at.isoformat(timespec="seconds"),
+            "stopped_at": record.stopped_at.isoformat(timespec="seconds") if record.stopped_at is not None else None,
+            "ended_reason": record.ended_reason,
+            "log_file_path": record.log_file_path,
+            "updated_at": record.updated_at.isoformat(timespec="seconds") if record.updated_at is not None else None,
+            "config_snapshot": dict(record.config_snapshot),
+        }
+
+    def _sort_strategy_history_records(self) -> None:
+        self._strategy_history_records.sort(
+            key=lambda item: (item.started_at.isoformat(timespec="seconds"), item.record_id),
+            reverse=True,
+        )
+
+    def _save_strategy_history_records(self) -> None:
+        self._sort_strategy_history_records()
+        try:
+            save_strategy_history_snapshot(
+                [self._history_record_payload(record) for record in self._strategy_history_records]
+            )
+        except Exception as exc:
+            self._enqueue_log(f"保存策略历史失败：{exc}")
+
+    def _load_strategy_history(self) -> None:
+        try:
+            snapshot = load_strategy_history_snapshot()
+        except Exception as exc:
+            self._enqueue_log(f"读取策略历史失败：{exc}")
+            return
+        records: list[StrategyHistoryRecord] = []
+        raw_records = snapshot.get("records", [])
+        if isinstance(raw_records, list):
+            for item in raw_records:
+                if not isinstance(item, dict):
+                    continue
+                record = self._history_record_from_payload(item)
+                if record is not None:
+                    records.append(record)
+        self._strategy_history_records = records
+        self._strategy_history_by_id = {record.record_id: record for record in records}
+        recovered_count = self._mark_unfinished_strategy_history_records()
+        if recovered_count:
+            self._enqueue_log(f"检测到 {recovered_count} 条未正常结束的历史策略，已自动标记为异常结束。")
+
+    def _mark_unfinished_strategy_history_records(self) -> int:
+        recovered_at = datetime.now()
+        recovered_count = 0
+        for record in self._strategy_history_records:
+            if record.status not in {"运行中", "停止中"}:
+                continue
+            record.status = "异常结束"
+            if record.stopped_at is None:
+                record.stopped_at = recovered_at
+            if not record.ended_reason:
+                record.ended_reason = "应用异常退出"
+            record.updated_at = recovered_at
+            recovered_count += 1
+        if recovered_count:
+            self._save_strategy_history_records()
+        return recovered_count
+
+    def _next_strategy_history_record_id(self, session: StrategySession) -> str:
+        base = f"{session.started_at.strftime('%Y%m%d%H%M%S%f')}-{session.session_id}"
+        record_id = base
+        suffix = 2
+        while record_id in self._strategy_history_by_id:
+            record_id = f"{base}-{suffix}"
+            suffix += 1
+        return record_id
+
+    def _build_strategy_history_record(self, session: StrategySession) -> StrategyHistoryRecord:
+        record_id = session.history_record_id or self._next_strategy_history_record_id(session)
+        return StrategyHistoryRecord(
+            record_id=record_id,
+            session_id=session.session_id,
+            api_name=session.api_name,
+            strategy_id=session.strategy_id,
+            strategy_name=session.strategy_name,
+            symbol=session.symbol,
+            direction_label=session.direction_label,
+            run_mode_label=session.run_mode_label,
+            status=session.status,
+            started_at=session.started_at,
+            stopped_at=session.stopped_at,
+            ended_reason=session.ended_reason,
+            log_file_path=str(session.log_file_path) if session.log_file_path is not None else "",
+            updated_at=datetime.now(),
+            config_snapshot=_serialize_strategy_config_snapshot(session.config),
+        )
+
+    def _upsert_strategy_history_record(self, record: StrategyHistoryRecord) -> None:
+        existing = self._strategy_history_by_id.get(record.record_id)
+        self._strategy_history_by_id[record.record_id] = record
+        if existing is None:
+            self._strategy_history_records.append(record)
+        else:
+            for index, item in enumerate(self._strategy_history_records):
+                if item.record_id == record.record_id:
+                    self._strategy_history_records[index] = record
+                    break
+        self._save_strategy_history_records()
+        self._render_strategy_history_view()
+
+    def _record_strategy_session_started(self, session: StrategySession) -> None:
+        record = self._build_strategy_history_record(session)
+        session.history_record_id = record.record_id
+        self._upsert_strategy_history_record(record)
+
+    def _sync_strategy_history_from_session(self, session: StrategySession) -> None:
+        if not session.history_record_id:
+            return
+        record = self._strategy_history_by_id.get(session.history_record_id)
+        if record is None:
+            self._record_strategy_session_started(session)
+            return
+        desired_snapshot = _serialize_strategy_config_snapshot(session.config)
+        changed = False
+        for attr, desired in (
+            ("session_id", session.session_id),
+            ("api_name", session.api_name),
+            ("strategy_id", session.strategy_id),
+            ("strategy_name", session.strategy_name),
+            ("symbol", session.symbol),
+            ("direction_label", session.direction_label),
+            ("run_mode_label", session.run_mode_label),
+            ("status", session.status),
+            ("started_at", session.started_at),
+            ("stopped_at", session.stopped_at),
+            ("ended_reason", session.ended_reason),
+            ("log_file_path", str(session.log_file_path) if session.log_file_path is not None else ""),
+        ):
+            if getattr(record, attr) != desired:
+                setattr(record, attr, desired)
+                changed = True
+        if record.config_snapshot != desired_snapshot:
+            record.config_snapshot = desired_snapshot
+            changed = True
+        if not changed:
+            return
+        record.updated_at = datetime.now()
+        self._upsert_strategy_history_record(record)
+
+    def open_strategy_history_window(self) -> None:
+        if self._strategy_history_window is not None and _widget_exists(self._strategy_history_window):
+            self._strategy_history_window.focus_force()
+            self._render_strategy_history_view()
+            return
+
+        window = Toplevel(self.root)
+        apply_window_icon(window)
+        window.title("历史策略")
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.76,
+            height_ratio=0.72,
+            min_width=1080,
+            min_height=640,
+            max_width=1680,
+            max_height=1080,
+        )
+        self._strategy_history_window = window
+        window.protocol("WM_DELETE_WINDOW", self._close_strategy_history_window)
+
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(1, weight=1)
+        container.rowconfigure(2, weight=1)
+
+        header = ttk.Frame(container)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(
+            header,
+            text=f"历史策略会永久保存到：{strategy_history_file_path()}",
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        action_row = ttk.Frame(header)
+        action_row.grid(row=0, column=1, sticky="e")
+        ttk.Button(action_row, text="删除选中", command=self.delete_selected_strategy_history_record).grid(
+            row=0, column=0, padx=(0, 6)
+        )
+        ttk.Button(action_row, text="清空历史", command=self.clear_strategy_history_records).grid(
+            row=0, column=1, padx=(0, 6)
+        )
+        ttk.Button(action_row, text="打开日志", command=self.open_selected_strategy_history_log).grid(
+            row=0, column=2, padx=(0, 6)
+        )
+        ttk.Button(action_row, text="复制日志路径", command=self.copy_selected_strategy_history_log_path).grid(
+            row=0, column=3, padx=(0, 6)
+        )
+        ttk.Button(action_row, text="刷新", command=self._render_strategy_history_view).grid(
+            row=0, column=4, padx=(0, 6)
+        )
+        ttk.Button(action_row, text="关闭", command=self._close_strategy_history_window).grid(row=0, column=5)
+
+        list_frame = ttk.LabelFrame(container, text="历史策略列表", padding=12)
+        list_frame.grid(row=1, column=0, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        self._strategy_history_tree = ttk.Treeview(
+            list_frame,
+            columns=("api", "strategy", "symbol", "direction", "mode", "status", "started", "stopped"),
+            show="headings",
+            selectmode="browse",
+        )
+        tree = self._strategy_history_tree
+        tree.heading("api", text="API")
+        tree.heading("strategy", text="策略")
+        tree.heading("symbol", text="标的")
+        tree.heading("direction", text="方向")
+        tree.heading("mode", text="模式")
+        tree.heading("status", text="状态")
+        tree.heading("started", text="启动时间")
+        tree.heading("stopped", text="停止时间")
+        tree.column("api", width=96, anchor="center")
+        tree.column("strategy", width=150, anchor="w")
+        tree.column("symbol", width=190, anchor="w")
+        tree.column("direction", width=90, anchor="center")
+        tree.column("mode", width=110, anchor="center")
+        tree.column("status", width=96, anchor="center")
+        tree.column("started", width=160, anchor="center")
+        tree.column("stopped", width=160, anchor="center")
+        tree.grid(row=0, column=0, sticky="nsew")
+        tree.bind("<<TreeviewSelect>>", self._on_strategy_history_selected)
+        history_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+        history_scroll.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=history_scroll.set)
+
+        detail_frame = ttk.LabelFrame(container, text="选中历史记录详情", padding=12)
+        detail_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        detail_frame.columnconfigure(0, weight=1)
+        detail_frame.rowconfigure(0, weight=1)
+
+        self._strategy_history_detail = Text(
+            detail_frame,
+            height=12,
+            wrap="word",
+            font=("Microsoft YaHei UI", 10),
+            relief="flat",
+        )
+        self._strategy_history_detail.grid(row=0, column=0, sticky="nsew")
+        detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self._strategy_history_detail.yview)
+        detail_scroll.grid(row=0, column=1, sticky="ns")
+        self._strategy_history_detail.configure(yscrollcommand=detail_scroll.set)
+        self._set_readonly_text(self._strategy_history_detail, self.strategy_history_text.get())
+        self._render_strategy_history_view()
+
+    def _close_strategy_history_window(self) -> None:
+        if self._strategy_history_window is not None and _widget_exists(self._strategy_history_window):
+            self._strategy_history_window.destroy()
+        self._strategy_history_window = None
+        self._strategy_history_tree = None
+        self._strategy_history_detail = None
+        self._strategy_history_selected_record_id = None
+
+    def _selected_strategy_history_record(self) -> StrategyHistoryRecord | None:
+        tree = self._strategy_history_tree
+        if tree is None or not _widget_exists(tree):
+            if self._strategy_history_selected_record_id is None:
+                return None
+            return self._strategy_history_by_id.get(self._strategy_history_selected_record_id)
+        try:
+            selection = tree.selection()
+        except TclError:
+            selection = ()
+        if selection:
+            self._strategy_history_selected_record_id = selection[0]
+        if self._strategy_history_selected_record_id is None:
+            return None
+        return self._strategy_history_by_id.get(self._strategy_history_selected_record_id)
+
+    def _session_by_history_record_id(self, record_id: str) -> StrategySession | None:
+        for session in self.sessions.values():
+            if session.history_record_id == record_id:
+                return session
+        return None
+
+    @staticmethod
+    def _session_blocks_history_deletion(session: StrategySession) -> bool:
+        return session.engine.is_running or session.status in {"运行中", "停止中"}
+
+    def _remove_strategy_history_records(self, record_ids: list[str], *, selected_before: str | None = None) -> tuple[int, int]:
+        removed_count = 0
+        blocked_count = 0
+        blocked_ids: set[str] = set()
+        for record_id in record_ids:
+            record = self._strategy_history_by_id.get(record_id)
+            if record is None:
+                continue
+            session = self._session_by_history_record_id(record_id)
+            if session is not None and self._session_blocks_history_deletion(session):
+                blocked_count += 1
+                blocked_ids.add(record_id)
+                continue
+            if session is not None:
+                session.history_record_id = None
+            self._strategy_history_by_id.pop(record_id, None)
+            removed_count += 1
+        if removed_count:
+            self._strategy_history_records = [
+                record for record in self._strategy_history_records if record.record_id not in set(record_ids) - blocked_ids
+            ]
+            self._save_strategy_history_records()
+        self._render_strategy_history_view(selected_before=selected_before)
+        return removed_count, blocked_count
+
+    def delete_selected_strategy_history_record(self) -> None:
+        parent = self._strategy_history_window if _widget_exists(self._strategy_history_window) else self.root
+        record = self._selected_strategy_history_record()
+        if record is None:
+            messagebox.showinfo("提示", "请先在历史策略列表中选中一条记录。", parent=parent)
+            return
+        session = self._session_by_history_record_id(record.record_id)
+        if session is not None and self._session_blocks_history_deletion(session):
+            messagebox.showinfo(
+                "提示",
+                "这条历史记录对应的策略仍在运行或停止中，暂时不能删除。\n请先在运行中策略列表处理完成后再删。",
+                parent=parent,
+            )
+            return
+        confirmed = messagebox.askyesno(
+            "确认删除",
+            "确认删除当前选中的历史策略记录吗？\n\n只删除历史记录，不删除独立日志文件。",
+            parent=parent,
+        )
+        if not confirmed:
+            return
+        removed_count, _ = self._remove_strategy_history_records([record.record_id], selected_before=record.record_id)
+        if removed_count:
+            self._enqueue_log(f"[历史策略 {record.record_id}] 已删除选中历史记录；独立日志文件保留。")
+
+    def clear_strategy_history_records(self) -> None:
+        parent = self._strategy_history_window if _widget_exists(self._strategy_history_window) else self.root
+        if not self._strategy_history_records:
+            messagebox.showinfo("提示", "当前没有可清空的历史策略记录。", parent=parent)
+            return
+        deletable_count = 0
+        for record in self._strategy_history_records:
+            session = self._session_by_history_record_id(record.record_id)
+            if session is None or not self._session_blocks_history_deletion(session):
+                deletable_count += 1
+        if deletable_count <= 0:
+            messagebox.showinfo(
+                "提示",
+                "当前历史列表里的记录都仍被运行中的策略占用，暂时不能清空。",
+                parent=parent,
+            )
+            return
+        confirmed = messagebox.askyesno(
+            "确认清空",
+            f"确认清空 {deletable_count} 条历史策略记录吗？\n\n运行中的策略记录会保留，独立日志文件不会删除。",
+            parent=parent,
+        )
+        if not confirmed:
+            return
+        selected_before = self._strategy_history_selected_record_id
+        record_ids = [record.record_id for record in self._strategy_history_records]
+        removed_count, blocked_count = self._remove_strategy_history_records(record_ids, selected_before=selected_before)
+        if removed_count:
+            message = f"已清空 {removed_count} 条历史策略记录；独立日志文件保留。"
+            if blocked_count:
+                message += f" 另有 {blocked_count} 条运行中的记录已保留。"
+            self._enqueue_log(message)
+
+    def _selected_strategy_history_log_path(self) -> Path | None:
+        record = self._selected_strategy_history_record()
+        if record is None:
+            return None
+        return _coerce_log_file_path(record.log_file_path)
+
+    def copy_selected_strategy_history_log_path(self) -> None:
+        parent = self._strategy_history_window if _widget_exists(self._strategy_history_window) else self.root
+        record = self._selected_strategy_history_record()
+        if record is None:
+            messagebox.showinfo("提示", "请先在历史策略列表中选中一条记录。", parent=parent)
+            return
+        log_path = self._selected_strategy_history_log_path()
+        if log_path is None:
+            messagebox.showinfo("提示", "这条历史策略还没有记录独立日志路径。", parent=parent)
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(str(log_path))
+        self._enqueue_log(f"[历史策略 {record.record_id}] 已复制独立日志路径：{log_path}")
+
+    def open_selected_strategy_history_log(self) -> None:
+        parent = self._strategy_history_window if _widget_exists(self._strategy_history_window) else self.root
+        record = self._selected_strategy_history_record()
+        if record is None:
+            messagebox.showinfo("提示", "请先在历史策略列表中选中一条记录。", parent=parent)
+            return
+        log_path = self._selected_strategy_history_log_path()
+        if log_path is None:
+            messagebox.showinfo("提示", "这条历史策略还没有记录独立日志路径。", parent=parent)
+            return
+        if not log_path.exists():
+            messagebox.showerror("打开失败", f"日志文件不存在：\n{log_path}", parent=parent)
+            return
+        startfile = getattr(os, "startfile", None)
+        if not callable(startfile):
+            messagebox.showerror("打开失败", "当前系统不支持直接打开日志文件。", parent=parent)
+            return
+        startfile(str(log_path))
+        self._enqueue_log(f"[历史策略 {record.record_id}] 已打开独立日志：{log_path}")
+
+    def _on_strategy_history_selected(self, *_: object) -> None:
+        record = self._selected_strategy_history_record()
+        self._strategy_history_selected_record_id = record.record_id if record is not None else None
+        self._refresh_selected_strategy_history_details()
+
+    def _refresh_selected_strategy_history_details(self) -> None:
+        record = self._selected_strategy_history_record()
+        if record is None:
+            self.strategy_history_text.set(self._default_strategy_history_text())
+            self._set_readonly_text(self._strategy_history_detail, self.strategy_history_text.get())
+            return
+        self.strategy_history_text.set(
+            self._build_strategy_detail_text(
+                record_id=record.record_id,
+                session_id=record.session_id,
+                api_name=record.api_name,
+                status=record.status,
+                strategy_id=record.strategy_id,
+                strategy_name=record.strategy_name,
+                symbol=record.symbol,
+                direction_label=record.direction_label,
+                run_mode_label=record.run_mode_label,
+                started_at=record.started_at,
+                stopped_at=record.stopped_at,
+                ended_reason=record.ended_reason,
+                updated_at=record.updated_at,
+                config_snapshot=record.config_snapshot,
+                log_file_path=record.log_file_path,
+            )
+        )
+        self._set_readonly_text(self._strategy_history_detail, self.strategy_history_text.get())
+
+    def _render_strategy_history_view(self, *, selected_before: str | None = None) -> None:
+        tree = self._strategy_history_tree
+        if tree is None or not _widget_exists(tree):
+            return
+        if selected_before is None:
+            try:
+                current_selection = tree.selection()
+                selected_before = current_selection[0] if current_selection else self._strategy_history_selected_record_id
+            except TclError:
+                selected_before = self._strategy_history_selected_record_id
+        for item_id in tree.get_children():
+            tree.delete(item_id)
+        for record in self._strategy_history_records:
+            tree.insert(
+                "",
+                END,
+                iid=record.record_id,
+                values=(
+                    record.api_name or "-",
+                    record.strategy_name,
+                    record.symbol,
+                    record.direction_label,
+                    record.run_mode_label,
+                    record.status,
+                    _format_history_datetime(record.started_at),
+                    _format_history_datetime(record.stopped_at),
+                ),
+            )
+        remaining_ids = tuple(record.record_id for record in self._strategy_history_records)
+        target = self._next_history_selection_after_mutation(selected_before, remaining_ids)
+        if target is not None and tree.exists(target):
+            tree.selection_set(target)
+            tree.focus(target)
+            tree.see(target)
+            self._strategy_history_selected_record_id = target
+        else:
+            self._strategy_history_selected_record_id = None
+        self._refresh_selected_strategy_history_details()
 
     def _parse_positive_int(self, raw: str, field_name: str) -> int:
         try:
@@ -6607,10 +7431,17 @@ class QuantApp:
             if session.engine.is_running:
                 if session.status != "停止中":
                     session.status = "运行中"
+                    if session.ended_reason == "应用关闭":
+                        session.ended_reason = ""
                 running_count += 1
             elif session.status in {"运行中", "停止中"}:
                 session.status = "已停止"
+                if session.stopped_at is None:
+                    session.stopped_at = datetime.now()
+                if not session.ended_reason:
+                    session.ended_reason = "策略线程结束"
             self._upsert_session_row(session)
+            self._sync_strategy_history_from_session(session)
 
         self.status_text.set(f"运行中策略：{running_count}")
         self._update_settings_summary()
@@ -6620,9 +7451,18 @@ class QuantApp:
     def _on_close(self) -> None:
         self._save_credentials_now(silent=True)
         self._save_notification_settings_now(silent=True)
+        closed_at = datetime.now()
         for session in self.sessions.values():
+            if session.status in {"运行中", "停止中"} or session.engine.is_running:
+                session.status = "已停止"
+                if session.stopped_at is None:
+                    session.stopped_at = closed_at
+                if not session.ended_reason:
+                    session.ended_reason = "应用关闭"
+                self._sync_strategy_history_from_session(session)
             session.engine.stop()
         self._protection_manager.stop_all()
+        self._close_strategy_history_window()
         self._close_settings_window()
         if self._backtest_window is not None and self._backtest_window.window.winfo_exists():
             self._backtest_window.window.destroy()

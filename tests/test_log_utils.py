@@ -5,7 +5,13 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from okx_quant.log_utils import append_log_line, daily_log_file_path, ensure_log_timestamp
+from okx_quant.log_utils import (
+    append_log_line,
+    append_preformatted_log_line,
+    daily_log_file_path,
+    ensure_log_timestamp,
+    strategy_session_log_file_path,
+)
 
 
 class LogUtilsTest(unittest.TestCase):
@@ -67,6 +73,36 @@ class LogUtilsTest(unittest.TestCase):
             self.assertEqual(line, "[2026-04-09 12:34:56] [持仓保护] 已触发")
             path = Path(temp_dir) / "logs" / "2026-04-09.log"
             self.assertEqual(path.read_text(encoding="utf-8").strip(), line)
+
+    def test_strategy_session_log_file_path_uses_dedicated_strategy_folder(self) -> None:
+        target = strategy_session_log_file_path(
+            started_at=datetime(2026, 4, 17, 17, 9, 51, 123456),
+            session_id="S02",
+            strategy_name="EMA 动态委托-空头",
+            symbol="ETH-USDT-SWAP",
+            api_name="QQzhangyong",
+            base_dir="D:/qqokx",
+        )
+        self.assertEqual(
+            target,
+            Path(
+                "D:/qqokx/logs/strategy_sessions/2026-04-17/"
+                "20260417_170951_123456__QQzhangyong__S02__EMA__ETH-USDT-SWAP.log"
+            ),
+        )
+
+    def test_append_preformatted_log_line_writes_given_line_without_reformatting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "logs" / "strategy_sessions" / "2026-04-17" / "session.log"
+            line = append_preformatted_log_line(
+                "[04-17 17:09:51] [QQzhangyong] [S02 EMA 动态委托-空头 ETH-USDT-SWAP] 已请求停止。",
+                path=path,
+            )
+            self.assertTrue(path.exists())
+            self.assertEqual(
+                path.read_text(encoding="utf-8").splitlines(),
+                [line],
+            )
 
 
 if __name__ == "__main__":

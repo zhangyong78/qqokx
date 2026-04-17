@@ -8,11 +8,14 @@ from okx_quant.persistence import (
     load_credentials_snapshot,
     load_option_strategies_snapshot,
     load_smart_order_favorites_snapshot,
+    load_strategy_history_snapshot,
     option_strategies_file_path,
     save_credentials_snapshot,
     save_option_strategies_snapshot,
     save_smart_order_favorites_snapshot,
+    save_strategy_history_snapshot,
     smart_order_favorites_file_path,
+    strategy_history_file_path,
 )
 
 
@@ -162,3 +165,100 @@ class PersistenceTest(TestCase):
         self.assertEqual(record["bar"], "1H")
         self.assertEqual(record["candle_limit"], "1000")
         self.assertEqual(record["chart_display_ccy"], "结算币")
+
+    def test_load_strategy_history_snapshot_returns_empty_when_missing(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        temp_path = strategy_history_file_path(temp_dir)
+
+        snapshot = load_strategy_history_snapshot(temp_path)
+
+        self.assertEqual(snapshot, {"records": []})
+
+    def test_save_and_load_strategy_history_snapshot(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        temp_path = strategy_history_file_path(temp_dir)
+        save_strategy_history_snapshot(
+            [
+                {
+                    "record_id": "20260417170951000000-S02",
+                    "session_id": "S02",
+                    "api_name": "QQzhangyong",
+                    "strategy_id": "ema_dynamic_order_short",
+                    "strategy_name": "EMA 动态委托-空头",
+                    "symbol": "ETH-USDT-SWAP",
+                    "direction_label": "只做空",
+                    "run_mode_label": "交易并下单",
+                    "status": "已停止",
+                    "started_at": "2026-04-17T17:09:51",
+                    "stopped_at": "2026-04-17T17:19:51",
+                    "ended_reason": "用户手动停止",
+                    "log_file_path": r"D:\qqokx\logs\strategy_sessions\2026-04-17\20260417_170951_123456__QQzhangyong__S02__EMA.log",
+                    "updated_at": "2026-04-17T17:19:51",
+                    "config_snapshot": {
+                        "inst_id": "ETH-USDT-SWAP",
+                        "trade_inst_id": "ETH-USDT-SWAP",
+                        "risk_amount": "10",
+                        "atr_stop_multiplier": "2",
+                        "take_profit_mode": "dynamic",
+                    },
+                },
+                {
+                    "record_id": "20260417165044000000-S01",
+                    "session_id": "S01",
+                    "api_name": "QQzhangyong",
+                    "strategy_id": "ema_dynamic_order_long",
+                    "strategy_name": "EMA 动态委托-多头",
+                    "symbol": "ETH-USDT-SWAP",
+                    "direction_label": "只做多",
+                    "run_mode_label": "交易并下单",
+                    "status": "运行中",
+                    "started_at": "2026-04-17T16:50:44",
+                    "config_snapshot": {
+                        "inst_id": "ETH-USDT-SWAP",
+                        "trade_inst_id": "ETH-USDT-SWAP",
+                        "risk_amount": "10",
+                    },
+                },
+            ],
+            temp_path,
+        )
+
+        snapshot = load_strategy_history_snapshot(temp_path)
+
+        self.assertEqual(len(snapshot["records"]), 2)
+        self.assertEqual(snapshot["records"][0]["record_id"], "20260417170951000000-S02")
+        self.assertEqual(snapshot["records"][0]["ended_reason"], "用户手动停止")
+        self.assertTrue(str(snapshot["records"][0]["log_file_path"]).endswith("__S02__EMA.log"))
+        self.assertEqual(snapshot["records"][1]["record_id"], "20260417165044000000-S01")
+        self.assertEqual(snapshot["records"][1]["status"], "运行中")
+
+    def test_load_strategy_history_snapshot_skips_invalid_records_and_defaults_optional_fields(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        temp_path = strategy_history_file_path(temp_dir)
+        temp_path.write_text(
+            """
+{
+  "records": [
+    {
+      "record_id": "valid-1",
+      "strategy_name": "EMA 动态委托-多头",
+      "started_at": "2026-04-17T16:50:44",
+      "config_snapshot": "bad"
+    },
+    {
+      "record_id": "",
+      "strategy_name": "bad",
+      "started_at": "2026-04-17T16:50:44"
+    }
+  ]
+}
+            """.strip(),
+            encoding="utf-8",
+        )
+
+        snapshot = load_strategy_history_snapshot(temp_path)
+
+        self.assertEqual(len(snapshot["records"]), 1)
+        self.assertEqual(snapshot["records"][0]["record_id"], "valid-1")
+        self.assertEqual(snapshot["records"][0]["status"], "已停止")
+        self.assertEqual(snapshot["records"][0]["config_snapshot"], {})
