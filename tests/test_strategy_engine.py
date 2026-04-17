@@ -1,15 +1,17 @@
 from decimal import Decimal
 from unittest import TestCase
+from unittest.mock import patch
 
 from okx_quant.engine import (
     ManagedEntryOrder,
     StrategyEngine,
     _advance_dynamic_stop_live,
+    _idle_signal_wait_seconds,
     _is_exchange_dynamic_stop_candidate_valid,
     build_order_plan,
     can_use_exchange_managed_orders,
 )
-from okx_quant.models import Candle, Instrument, StrategyConfig
+from okx_quant.models import Candle, Instrument, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxTradeOrderItem
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategy_catalog import (
@@ -283,6 +285,182 @@ class StrategyEngineTest(TestCase):
         self.assertTrue(client_order_id.isascii())
         self.assertRegex(client_order_id, r"^[a-z0-9]+$")
         self.assertLessEqual(len(client_order_id), 32)
+
+    def test_idle_signal_wait_seconds_caps_hourly_polling_to_one_minute(self) -> None:
+        self.assertEqual(_idle_signal_wait_seconds("1H", 10, now_ts=1000.0), 60.0)
+
+    def test_idle_signal_wait_seconds_keeps_upcoming_close_window(self) -> None:
+        self.assertEqual(_idle_signal_wait_seconds("1H", 10, now_ts=3590.0), 20.0)
+
+    def test_dynamic_exchange_strategy_logs_no_signal_only_once_per_candle(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+        evaluate_calls = 0
+        candles = self._make_candles([str(2000 + index) for index in range(80)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+                self._wait_calls = 0
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, timeout: float) -> bool:
+                waits.append(timeout)
+                self._wait_calls += 1
+                if self._wait_calls >= 2:
+                    self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            risk_amount=Decimal("10"),
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        def _fake_evaluate(_strategy, _candles, _config):  # noqa: ANN001
+            nonlocal evaluate_calls
+            evaluate_calls += 1
+            return SignalDecision(
+                signal=None,
+                reason="EMA21 仍在 EMA55 下方，当前不是有效多头趋势。",
+                candle_ts=_candles[-1].ts,
+                entry_reference=None,
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2000"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=1000.0), patch(
+            "okx_quant.engine.EmaDynamicOrderStrategy.evaluate",
+            new=_fake_evaluate,
+        ):
+            engine._run_dynamic_exchange_strategy(None, config, instrument)  # type: ignore[arg-type]
+
+        self.assertEqual(evaluate_calls, 1)
+        self.assertEqual(sum("当前无法生成挂单" in message for message in messages), 1)
+        self.assertEqual(waits, [60.0, 60.0])
+
+    def test_dynamic_local_strategy_v2_logs_no_signal_only_once_per_candle(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+        evaluate_calls = 0
+        candles = self._make_candles([str(2000 + index) for index in range(80)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+                self._wait_calls = 0
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, timeout: float) -> bool:
+                waits.append(timeout)
+                self._wait_calls += 1
+                if self._wait_calls >= 2:
+                    self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_local_mode_summary = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            max_entries_per_trend=1,
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        def _fake_evaluate(_strategy, _candles, _config):  # noqa: ANN001
+            nonlocal evaluate_calls
+            evaluate_calls += 1
+            return SignalDecision(
+                signal=None,
+                reason="EMA21 仍在 EMA55 下方，当前不是有效多头趋势。",
+                candle_ts=_candles[-1].ts,
+                entry_reference=None,
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2000"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=1000.0), patch(
+            "okx_quant.engine.EmaDynamicOrderStrategy.evaluate",
+            new=_fake_evaluate,
+        ):
+            engine._run_dynamic_local_strategy_v2(
+                None,  # type: ignore[arg-type]
+                config,
+                instrument,
+                instrument,
+            )
+
+        self.assertEqual(evaluate_calls, 1)
+        self.assertEqual(sum("当前无法生成动态开仓价" in message for message in messages), 1)
+        self.assertEqual(waits, [60.0, 60.0])
 
     def test_okx_read_retry_recovers_from_transient_error(self) -> None:
         messages: list[str] = []

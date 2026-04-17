@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
@@ -36,6 +37,7 @@ OKX_READ_RETRY_MAX_DELAY_SECONDS = 5.0
 OKX_WRITE_RECONCILE_ATTEMPTS = 3
 OKX_WRITE_RECONCILE_BASE_DELAY_SECONDS = 1.0
 OKX_WRITE_RECONCILE_MAX_DELAY_SECONDS = 3.0
+IDLE_SIGNAL_MAX_WAIT_SECONDS = 60.0
 
 T = TypeVar("T")
 
@@ -204,6 +206,7 @@ class StrategyEngine:
         )
         last_candle_ts: int | None = None
         active_order: ManagedEntryOrder | None = None
+        idle_signal_candle_ts: int | None = None
         dynamic_stop_only = config.take_profit_mode == "dynamic"
 
         self._log_strategy_start(config, instrument, instrument)
@@ -324,11 +327,16 @@ class StrategyEngine:
                         f"{_fmt_ts(newest_ts)} | 检测到挂单状态已变更为 {status.state}，准备重新同步挂单。"
                     )
                     active_order = None
+                    idle_signal_candle_ts = None
 
             candle_changed = newest_ts != last_candle_ts
             if active_order is not None and candle_changed:
                 self._cancel_active_order(credentials, config, active_order, newest_ts)
                 active_order = None
+
+            if active_order is None and idle_signal_candle_ts == newest_ts:
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
 
             should_place_order = candle_changed or active_order is None
             if not should_place_order:
@@ -337,9 +345,10 @@ class StrategyEngine:
 
             decision = strategy.evaluate(confirmed, config)
             if decision.signal is None:
+                idle_signal_candle_ts = newest_ts
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无法生成挂单 | {decision.reason}")
                 last_candle_ts = newest_ts
-                self._stop_event.wait(config.poll_seconds)
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                 continue
 
             if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
@@ -392,6 +401,7 @@ class StrategyEngine:
                 side=plan.side,
                 signal=plan.signal,
             )
+            idle_signal_candle_ts = None
             last_candle_ts = newest_ts
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 挂单已提交到 OKX | ordId={result.ord_id or '-'} | "
@@ -623,6 +633,7 @@ class StrategyEngine:
         )
         last_candle_ts: int | None = None
         active_trigger: LocalSignalTrigger | None = None
+        idle_signal_candle_ts: int | None = None
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
         self._log_local_mode_summary(config, signal_instrument, trade_instrument)
@@ -652,13 +663,17 @@ class StrategyEngine:
                 continue
 
             newest_ts = confirmed[-1].ts
+            if active_trigger is None and idle_signal_candle_ts == newest_ts:
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
             if newest_ts != last_candle_ts or active_trigger is None:
                 decision = strategy.evaluate(confirmed, config)
                 last_candle_ts = newest_ts
                 if decision.signal is None:
                     active_trigger = None
+                    idle_signal_candle_ts = newest_ts
                     self._logger(f"{_fmt_ts(newest_ts)} | 当前无法生成动态开仓价 | {decision.reason}")
-                    self._stop_event.wait(config.poll_seconds)
+                    self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                     continue
                 if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
                     raise RuntimeError("策略返回的数据不完整，无法生成本地触发条件")
@@ -670,6 +685,7 @@ class StrategyEngine:
                     signal_candle_high=decision.signal_candle_high,
                     signal_candle_low=decision.signal_candle_low,
                 )
+                idle_signal_candle_ts = None
                 self._logger(
                     f"{_fmt_ts(decision.candle_ts)} | 动态等待中 | 信号方向={decision.signal.upper()} | "
                     f"信号标的触发价={format_decimal(decision.entry_reference)} | "
@@ -821,6 +837,7 @@ class StrategyEngine:
         )
         last_candle_ts: int | None = None
         active_trigger: LocalSignalTrigger | None = None
+        idle_signal_candle_ts: int | None = None
         current_wave_signal: Literal["long", "short"] | None = None
         entries_in_current_wave = 0
         current_wave_index = 0
@@ -857,6 +874,9 @@ class StrategyEngine:
                 continue
 
             newest_ts = confirmed[-1].ts
+            if active_trigger is None and idle_signal_candle_ts == newest_ts:
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
             if newest_ts != last_candle_ts or active_trigger is None:
                 decision = strategy.evaluate(confirmed, replace(config, signal_mode=effective_signal_mode))
                 last_candle_ts = newest_ts
@@ -864,8 +884,9 @@ class StrategyEngine:
                     active_trigger = None
                     current_wave_signal = None
                     entries_in_current_wave = 0
+                    idle_signal_candle_ts = newest_ts
                     self._logger(f"{_fmt_ts(newest_ts)} | 当前无法生成动态开仓价 | {decision.reason}")
-                    self._stop_event.wait(config.poll_seconds)
+                    self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                     continue
                 if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
                     raise RuntimeError("策略返回的数据不完整，无法生成本地触发条件。")
@@ -880,11 +901,12 @@ class StrategyEngine:
 
                 if config.max_entries_per_trend > 0 and entries_in_current_wave >= config.max_entries_per_trend:
                     active_trigger = None
+                    idle_signal_candle_ts = newest_ts
                     self._logger(
                         f"{_fmt_ts(decision.candle_ts)} | 第{current_wave_index}波趋势开仓次数已达上限 | 方向={decision.signal.upper()} | "
                         f"上限={config.max_entries_per_trend}"
                     )
-                    self._stop_event.wait(config.poll_seconds)
+                    self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                     continue
 
                 active_trigger = LocalSignalTrigger(
@@ -895,6 +917,7 @@ class StrategyEngine:
                     signal_candle_high=decision.signal_candle_high,
                     signal_candle_low=decision.signal_candle_low,
                 )
+                idle_signal_candle_ts = None
                 self._logger(
                     f"{_fmt_ts(decision.candle_ts)} | 动态等待中 | 信号方向={decision.signal.upper()} | "
                     f"第{current_wave_index}波 | 本波第{entries_in_current_wave + 1}次委托 | 触发价={format_decimal(decision.entry_reference)} | "
@@ -3081,6 +3104,46 @@ def _format_signal_mode(signal_mode: str) -> str:
     if signal_mode == "both":
         return "双向"
     return signal_mode
+
+
+def _bar_interval_seconds(bar: str) -> int:
+    normalized = bar.strip()
+    if len(normalized) < 2:
+        raise ValueError(f"不支持的K线周期：{bar}")
+    unit = normalized[-1].lower()
+    value = int(normalized[:-1])
+    if value <= 0:
+        raise ValueError(f"不支持的K线周期：{bar}")
+    if unit == "m":
+        return value * 60
+    if unit == "h":
+        return value * 60 * 60
+    if unit == "d":
+        return value * 60 * 60 * 24
+    raise ValueError(f"不支持的K线周期：{bar}")
+
+
+def _seconds_until_next_bar_close(bar: str, buffer_seconds: float, *, now_ts: float | None = None) -> float:
+    current_ts = time.time() if now_ts is None else now_ts
+    interval_seconds = _bar_interval_seconds(bar)
+    next_close_ts = ((int(current_ts) // interval_seconds) + 1) * interval_seconds
+    wait_seconds = (next_close_ts + float(buffer_seconds)) - current_ts
+    return max(wait_seconds, 1.0)
+
+
+def _idle_signal_wait_seconds(
+    bar: str,
+    poll_seconds: float,
+    *,
+    max_wait_seconds: float = IDLE_SIGNAL_MAX_WAIT_SECONDS,
+    now_ts: float | None = None,
+) -> float:
+    base_wait_seconds = max(float(poll_seconds), 1.0)
+    try:
+        next_check_seconds = _seconds_until_next_bar_close(bar, base_wait_seconds, now_ts=now_ts)
+    except ValueError:
+        return base_wait_seconds
+    return max(base_wait_seconds, min(float(max_wait_seconds), next_check_seconds))
 
 
 def _fmt_ts(timestamp_ms: int) -> str:
