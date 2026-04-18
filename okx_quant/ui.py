@@ -10,7 +10,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import tkinter.font as tkfont
-from tkinter import BooleanVar, END, Menu, StringVar, Text, TclError, Tk, Toplevel, simpledialog
+from tkinter import BooleanVar, END, Label, Menu, StringVar, Text, TclError, Tk, Toplevel, simpledialog
 from tkinter import messagebox, ttk
 
 from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
@@ -265,6 +265,13 @@ POSITION_REFRESH_INTERVAL_OPTIONS = {
     "30秒": 30_000,
     "60秒": 60_000,
 }
+REFRESH_STALE_FAILURE_THRESHOLD = 3
+REFRESH_BADGE_PALETTES = {
+    "idle": {"bg": "#f3f4f6", "fg": "#4b5563"},
+    "normal": {"bg": "#e8f7ee", "fg": "#137333"},
+    "warning": {"bg": "#fff4e5", "fg": "#9a6700"},
+    "stale": {"bg": "#fde8e8", "fg": "#b42318"},
+}
 PROTECTION_TRIGGER_SOURCE_OPTIONS = {
     "期权标记价格": "option_mark",
     "现货最新价": "spot_last",
@@ -279,6 +286,9 @@ def _format_network_error_message(message: str) -> str:
     raw = (message or "").strip()
     if not raw:
         return "网络请求失败，请稍后重试。"
+    html_summary = _summarize_http_error_message(raw)
+    if html_summary:
+        return html_summary
     lowered = raw.lower()
     if "handshake operation timed out" in lowered:
         return "网络握手超时，请稍后重试。"
@@ -286,7 +296,169 @@ def _format_network_error_message(message: str) -> str:
         return "网络读取超时，请稍后重试。"
     if "timed out" in lowered:
         return "网络连接超时，请稍后重试。"
-    return raw
+    collapsed = _collapse_error_message(raw)
+    if len(collapsed) > 220:
+        return f"{collapsed[:217]}..."
+    return collapsed
+
+
+@dataclass
+class RefreshHealthState:
+    label: str
+    last_success_at: datetime | None = None
+    consecutive_failures: int = 0
+    stale_since: datetime | None = None
+    last_error_summary: str | None = None
+
+
+def _collapse_error_message(message: str) -> str:
+    return re.sub(r"\s+", " ", (message or "")).strip()
+
+
+def _extract_http_status_code(message: str) -> str | None:
+    raw = message or ""
+    patterns = (
+        r"\bHTTP\s*(\d{3})\b",
+        r"\berror code\s*(\d{3})\b",
+        r"\b(\d{3})\s*:\s*Bad gateway\b",
+        r"\b(\d{3})\s*:\s*Service unavailable\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _extract_cloudflare_ray_id(message: str) -> str | None:
+    match = re.search(
+        r"Cloudflare Ray ID:\s*(?:<strong[^>]*>)?([A-Za-z0-9]+)",
+        message or "",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        return match.group(1)
+    return None
+
+
+def _summarize_http_error_message(message: str) -> str | None:
+    raw = (message or "").strip()
+    lowered = raw.lower()
+    if "<html" not in lowered and "<!doctype html" not in lowered:
+        return None
+    status_code = _extract_http_status_code(raw)
+    parts: list[str] = []
+    if status_code:
+        parts.append(f"HTTP {status_code}")
+    if "cloudflare" in lowered and ("bad gateway" in lowered or ("host" in lowered and "error" in lowered)):
+        parts.append("OKX源站异常")
+    elif status_code and status_code.startswith("5"):
+        parts.append("交易所服务暂时不可用")
+    elif "cloudflare" in lowered:
+        parts.append("Cloudflare 错误页")
+    else:
+        parts.append("交易所返回HTML错误页")
+    ray_id = _extract_cloudflare_ray_id(raw)
+    if ray_id:
+        parts.append(f"RayID={ray_id}")
+    return " | ".join(parts)
+
+
+def _mark_refresh_health_success(state: RefreshHealthState, *, at: datetime | None = None) -> None:
+    state.last_success_at = at or datetime.now()
+    state.consecutive_failures = 0
+    state.stale_since = None
+    state.last_error_summary = None
+
+
+def _reset_refresh_health(state: RefreshHealthState) -> None:
+    state.last_success_at = None
+    state.consecutive_failures = 0
+    state.stale_since = None
+    state.last_error_summary = None
+
+
+def _mark_refresh_health_failure(
+    state: RefreshHealthState,
+    summary: str,
+    *,
+    at: datetime | None = None,
+    stale_after_failures: int = REFRESH_STALE_FAILURE_THRESHOLD,
+) -> None:
+    failure_at = at or datetime.now()
+    state.consecutive_failures += 1
+    state.last_error_summary = summary
+    if (
+        state.last_success_at is not None
+        and state.consecutive_failures >= stale_after_failures
+        and state.stale_since is None
+    ):
+        state.stale_since = failure_at
+
+
+def _format_elapsed_compact(total_seconds: int) -> str:
+    seconds = max(int(total_seconds), 0)
+    if seconds < 60:
+        return f"{seconds}秒"
+    if seconds < 3600:
+        minutes, remain = divmod(seconds, 60)
+        return f"{minutes}分{remain}秒" if remain else f"{minutes}分"
+    hours, remain = divmod(seconds, 3600)
+    minutes = remain // 60
+    return f"{hours}小时{minutes}分" if minutes else f"{hours}小时"
+
+
+def _format_refresh_health_suffix(state: RefreshHealthState, *, now: datetime | None = None) -> str:
+    if state.consecutive_failures <= 0:
+        return ""
+    current_at = now or datetime.now()
+    parts = [f"连续失败：{state.consecutive_failures}次"]
+    if state.last_success_at is not None:
+        parts.append(f"上次成功：{state.last_success_at.strftime('%H:%M:%S')}")
+        if state.stale_since is not None:
+            age_seconds = int((current_at - state.last_success_at).total_seconds())
+            parts.append(f"缓存年龄≈{_format_elapsed_compact(age_seconds)}")
+            parts.append("数据可能已过期")
+    return " | " + " | ".join(parts)
+
+
+def _refresh_health_is_stale(state: RefreshHealthState) -> bool:
+    return state.stale_since is not None
+
+
+def _refresh_indicator_level(state: RefreshHealthState) -> str:
+    if _refresh_health_is_stale(state):
+        return "stale"
+    if state.consecutive_failures > 0:
+        return "warning"
+    if state.last_success_at is None:
+        return "idle"
+    return "normal"
+
+
+def _refresh_indicator_badge_text(state: RefreshHealthState) -> str:
+    level = _refresh_indicator_level(state)
+    if level == "stale":
+        return f"过期 x{state.consecutive_failures}"
+    if level == "warning":
+        return f"告警 x{state.consecutive_failures}"
+    if level == "normal":
+        return "正常"
+    return "未读"
+
+
+def _describe_refresh_health(state: RefreshHealthState, *, now: datetime | None = None) -> str:
+    current_at = now or datetime.now()
+    lines = [f"连续失败：{state.consecutive_failures}次"]
+    if state.last_success_at is not None:
+        lines.append(f"上次成功：{state.last_success_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        age_seconds = int((current_at - state.last_success_at).total_seconds())
+        lines.append(f"缓存年龄：{_format_elapsed_compact(age_seconds)}")
+    if state.last_error_summary:
+        lines.append(f"最近原因：{state.last_error_summary}")
+    if state.stale_since is not None:
+        lines.append("当前数据可能已过期。")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -428,6 +600,10 @@ class QuantApp:
         self._positions_last_refresh_at: datetime | None = None
         self._positions_history_last_refresh_at: datetime | None = None
         self._positions_effective_environment: str | None = None
+        self._positions_refresh_health = RefreshHealthState("持仓")
+        self._pending_orders_refresh_health = RefreshHealthState("当前委托")
+        self._order_history_refresh_health = RefreshHealthState("历史委托")
+        self._account_info_refresh_health = RefreshHealthState("账户信息")
         self._upl_usdt_prices: dict[str, Decimal] = {}
         self._position_history_usdt_prices: dict[str, Decimal] = {}
         self._position_instruments: dict[str, Instrument] = {}
@@ -469,6 +645,10 @@ class QuantApp:
         self._position_selection_syncing = False
         self._positions_zoom_sync_job: str | None = None
         self._positions_zoom_selected_item_id: str | None = None
+        self._positions_refresh_badges: list[Label] = []
+        self._account_info_refresh_badges: list[Label] = []
+        self._pending_orders_refresh_badges: list[Label] = []
+        self._order_history_refresh_badges: list[Label] = []
         self._fills_history_refreshing = False
         self._position_history_refreshing = False
         self._pending_orders_refreshing = False
@@ -644,6 +824,7 @@ class QuantApp:
         self.selected_session_text = StringVar(value=self._default_selected_session_text())
         self.strategy_history_text = StringVar(value=self._default_strategy_history_text())
         self.positions_summary_text = StringVar(value="当前尚未获取持仓。")
+        self._positions_refresh_badge_text = StringVar(value="未读")
         self.position_total_text = StringVar(value="-")
         self.position_upl_text = StringVar(value="-")
         self.position_realized_text = StringVar(value="-")
@@ -655,6 +836,9 @@ class QuantApp:
         self.position_long_put_text = StringVar(value="-")
         self.position_detail_text = StringVar(value=self._default_position_detail_text())
         self.account_info_summary_text = StringVar(value="尚未读取账户信息。")
+        self._account_info_refresh_badge_text = StringVar(value="未读")
+        self._pending_orders_refresh_badge_text = StringVar(value="未读")
+        self._order_history_refresh_badge_text = StringVar(value="未读")
         self.account_total_equity_text = StringVar(value="-")
         self.account_adjusted_equity_text = StringVar(value="-")
         self.account_available_equity_text = StringVar(value="-")
@@ -687,6 +871,7 @@ class QuantApp:
         self._load_strategy_history()
         self._build_menu()
         self._build_layout()
+        self._refresh_all_refresh_badges()
         self._apply_initial_detail_visibility()
         self._bind_auto_save()
         self._apply_selected_strategy_definition()
@@ -1060,10 +1245,16 @@ class QuantApp:
 
         header_row = ttk.Frame(positions_frame)
         header_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        header_row.columnconfigure(0, weight=1)
-        ttk.Label(header_row, textvariable=self.positions_summary_text).grid(row=0, column=0, sticky="w")
+        header_row.columnconfigure(1, weight=1)
+        positions_badge = self._create_refresh_badge(
+            header_row,
+            self._positions_refresh_badge_text,
+            self._positions_refresh_badges,
+        )
+        positions_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(header_row, textvariable=self.positions_summary_text).grid(row=0, column=1, sticky="w")
         action_row = ttk.Frame(header_row)
-        action_row.grid(row=0, column=1, sticky="e")
+        action_row.grid(row=0, column=2, sticky="e")
         ttk.Button(action_row, text="刷新", command=self.refresh_positions).grid(row=0, column=0, padx=(0, 6))
         ttk.Label(action_row, text="自动刷新").grid(row=0, column=1, padx=(0, 6))
         position_refresh_interval_combo = ttk.Combobox(
@@ -1452,10 +1643,16 @@ class QuantApp:
 
         header = ttk.Frame(container)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        header.columnconfigure(0, weight=1)
-        ttk.Label(header, textvariable=self.account_info_summary_text, justify="left").grid(row=0, column=0, sticky="w")
+        header.columnconfigure(1, weight=1)
+        account_badge = self._create_refresh_badge(
+            header,
+            self._account_info_refresh_badge_text,
+            self._account_info_refresh_badges,
+        )
+        account_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(header, textvariable=self.account_info_summary_text, justify="left").grid(row=0, column=1, sticky="w")
         action_row = ttk.Frame(header)
-        action_row.grid(row=0, column=1, sticky="e")
+        action_row.grid(row=0, column=2, sticky="e")
         ttk.Button(action_row, text="刷新全部", command=self.refresh_account_dashboard).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(action_row, text="关闭", command=self._close_account_info_window).grid(row=0, column=1)
 
@@ -1568,6 +1765,7 @@ class QuantApp:
         self._build_account_info_order_history_tab(order_history_tab)
 
         self._expand_to_screen(window, margin=30)
+        self._refresh_all_refresh_badges()
         self.refresh_account_dashboard()
 
     def _close_account_info_window(self) -> None:
@@ -1587,11 +1785,13 @@ class QuantApp:
             return
         credentials = self._current_credentials_or_none()
         if credentials is None:
+            _reset_refresh_health(self._account_info_refresh_health)
             self.account_info_summary_text.set("未配置 API 凭证，无法读取账户信息。")
             self._set_readonly_text(self._account_info_config_panel, "未配置 API 凭证，无法读取账户配置。")
             self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
             if self._account_info_tree is not None:
                 self._account_info_tree.delete(*self._account_info_tree.get_children())
+            self._refresh_all_refresh_badges()
             return
         self._account_info_refreshing = True
         self.account_info_summary_text.set("正在刷新账户信息...")
@@ -1636,6 +1836,8 @@ class QuantApp:
         self._account_info_refreshing = False
         self._latest_account_overview = overview
         self._latest_account_config = config
+        _mark_refresh_health_success(self._account_info_refresh_health)
+        self._refresh_all_refresh_badges()
         environment_label = "实盘 live" if effective_environment == "live" else "模拟盘 demo"
         summary_parts = []
         if summary_note:
@@ -1693,9 +1895,21 @@ class QuantApp:
 
     def _apply_account_info_error(self, message: str) -> None:
         self._account_info_refreshing = False
-        self.account_info_summary_text.set(f"账户信息读取失败：{message}")
-        self._set_readonly_text(self._account_info_config_panel, f"账户配置读取失败：{message}")
+        friendly_message = _format_network_error_message(message)
+        _mark_refresh_health_failure(self._account_info_refresh_health, friendly_message)
+        self._refresh_all_refresh_badges()
+        suffix = _format_refresh_health_suffix(self._account_info_refresh_health)
+        has_previous_data = self._latest_account_overview is not None or self._latest_account_config is not None
+        if has_previous_data:
+            summary = f"账户信息刷新失败，继续显示上一份缓存：{friendly_message}{suffix}"
+            self.account_info_summary_text.set(summary)
+            self._enqueue_log(summary)
+            return
+        summary = f"账户信息读取失败：{friendly_message}{suffix}"
+        self.account_info_summary_text.set(summary)
+        self._set_readonly_text(self._account_info_config_panel, f"账户配置读取失败：{friendly_message}")
         self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
+        self._enqueue_log(summary)
 
     def _refresh_account_info_detail(self, *_: object) -> None:
         tree = self._account_info_tree
@@ -1720,19 +1934,25 @@ class QuantApp:
     def _build_account_info_pending_orders_tab(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        header.columnconfigure(0, weight=1)
-        ttk.Label(header, textvariable=self._positions_zoom_pending_orders_summary_text).grid(row=0, column=0, sticky="w")
-        ttk.Button(header, text="刷新", command=self.refresh_pending_orders).grid(row=0, column=1, sticky="e", padx=(0, 6))
+        header.columnconfigure(1, weight=1)
+        pending_badge = self._create_refresh_badge(
+            header,
+            self._pending_orders_refresh_badge_text,
+            self._pending_orders_refresh_badges,
+        )
+        pending_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(header, textvariable=self._positions_zoom_pending_orders_summary_text).grid(row=0, column=1, sticky="w")
+        ttk.Button(header, text="刷新", command=self.refresh_pending_orders).grid(row=0, column=2, sticky="e", padx=(0, 6))
         ttk.Button(
             header,
             text="撤单选中",
             command=lambda: self.cancel_selected_pending_order("account_info"),
-        ).grid(row=0, column=2, sticky="e", padx=(0, 6))
+        ).grid(row=0, column=3, sticky="e", padx=(0, 6))
         ttk.Button(
             header,
             text="批量撤当前筛选",
             command=lambda: self.cancel_filtered_pending_orders("account_info"),
-        ).grid(row=0, column=3, sticky="e")
+        ).grid(row=0, column=4, sticky="e")
 
         filter_row = ttk.Frame(parent)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -1811,9 +2031,15 @@ class QuantApp:
     def _build_account_info_order_history_tab(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        header.columnconfigure(0, weight=1)
-        ttk.Label(header, textvariable=self._positions_zoom_order_history_summary_text).grid(row=0, column=0, sticky="w")
-        ttk.Button(header, text="刷新", command=self.refresh_order_history).grid(row=0, column=1, sticky="e")
+        header.columnconfigure(1, weight=1)
+        order_history_badge = self._create_refresh_badge(
+            header,
+            self._order_history_refresh_badge_text,
+            self._order_history_refresh_badges,
+        )
+        order_history_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(header, textvariable=self._positions_zoom_order_history_summary_text).grid(row=0, column=1, sticky="w")
+        ttk.Button(header, text="刷新", command=self.refresh_order_history).grid(row=0, column=2, sticky="e")
 
         filter_row = ttk.Frame(parent)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -2001,10 +2227,16 @@ class QuantApp:
 
         header = ttk.Frame(container)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        header.columnconfigure(0, weight=1)
-        ttk.Label(header, textvariable=self._positions_zoom_summary_text).grid(row=0, column=0, sticky="w")
+        header.columnconfigure(1, weight=1)
+        zoom_positions_badge = self._create_refresh_badge(
+            header,
+            self._positions_refresh_badge_text,
+            self._positions_refresh_badges,
+        )
+        zoom_positions_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(header, textvariable=self._positions_zoom_summary_text).grid(row=0, column=1, sticky="w")
         zoom_actions = ttk.Frame(header)
-        zoom_actions.grid(row=0, column=1, sticky="e")
+        zoom_actions.grid(row=0, column=2, sticky="e")
         ttk.Button(zoom_actions, text="刷新", command=self.refresh_positions).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(zoom_actions, text="刷新历史", command=self.refresh_position_histories).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(zoom_actions, text="刷新历史成交", command=self.refresh_fill_history).grid(row=0, column=2, padx=(0, 6))
@@ -2157,6 +2389,7 @@ class QuantApp:
         self.refresh_order_views()
         self.refresh_position_histories()
         self._expand_to_screen(window)
+        self._refresh_all_refresh_badges()
         self._update_positions_zoom_search_shortcuts()
         self._update_position_history_search_shortcuts()
         self._schedule_positions_zoom_sync(30)
@@ -2164,20 +2397,26 @@ class QuantApp:
     def _build_positions_zoom_pending_orders_tab(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        header.columnconfigure(0, weight=1)
-        ttk.Label(header, textvariable=self._positions_zoom_pending_orders_summary_text).grid(row=0, column=0, sticky="w")
-        ttk.Button(header, text="刷新", command=self.refresh_pending_orders).grid(row=0, column=1, sticky="e", padx=(0, 6))
+        header.columnconfigure(1, weight=1)
+        pending_badge = self._create_refresh_badge(
+            header,
+            self._pending_orders_refresh_badge_text,
+            self._pending_orders_refresh_badges,
+        )
+        pending_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(header, textvariable=self._positions_zoom_pending_orders_summary_text).grid(row=0, column=1, sticky="w")
+        ttk.Button(header, text="刷新", command=self.refresh_pending_orders).grid(row=0, column=2, sticky="e", padx=(0, 6))
         ttk.Button(header, text="撤单选中", command=lambda: self.cancel_selected_pending_order("positions_zoom")).grid(
-            row=0, column=2, sticky="e", padx=(0, 6)
+            row=0, column=3, sticky="e", padx=(0, 6)
         )
         ttk.Button(header, text="批量撤当前筛选", command=lambda: self.cancel_filtered_pending_orders("positions_zoom")).grid(
-            row=0, column=3, sticky="e", padx=(0, 6)
+            row=0, column=4, sticky="e", padx=(0, 6)
         )
         ttk.Button(
             header,
             textvariable=self._positions_zoom_pending_orders_detail_toggle_text,
             command=self.toggle_positions_zoom_pending_orders_detail,
-        ).grid(row=0, column=4, sticky="e")
+        ).grid(row=0, column=5, sticky="e")
 
         filter_row = ttk.Frame(parent)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -2296,14 +2535,20 @@ class QuantApp:
     def _build_positions_zoom_order_history_tab(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        header.columnconfigure(0, weight=1)
-        ttk.Label(header, textvariable=self._positions_zoom_order_history_summary_text).grid(row=0, column=0, sticky="w")
-        ttk.Button(header, text="刷新", command=self.refresh_order_history).grid(row=0, column=1, sticky="e", padx=(0, 6))
+        header.columnconfigure(1, weight=1)
+        order_history_badge = self._create_refresh_badge(
+            header,
+            self._order_history_refresh_badge_text,
+            self._order_history_refresh_badges,
+        )
+        order_history_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(header, textvariable=self._positions_zoom_order_history_summary_text).grid(row=0, column=1, sticky="w")
+        ttk.Button(header, text="刷新", command=self.refresh_order_history).grid(row=0, column=2, sticky="e", padx=(0, 6))
         ttk.Button(
             header,
             textvariable=self._positions_zoom_order_history_detail_toggle_text,
             command=self.toggle_positions_zoom_order_history_detail,
-        ).grid(row=0, column=2, sticky="e")
+        ).grid(row=0, column=3, sticky="e")
 
         filter_row = ttk.Frame(parent)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -3264,6 +3509,8 @@ class QuantApp:
     def refresh_order_views(self) -> None:
         credentials = self._current_credentials_or_none()
         if credentials is None:
+            _reset_refresh_health(self._pending_orders_refresh_health)
+            _reset_refresh_health(self._order_history_refresh_health)
             self._positions_zoom_pending_orders_base_summary = "未配置 API 凭证，无法读取当前委托。"
             self._positions_zoom_pending_orders_summary_text.set(self._positions_zoom_pending_orders_base_summary)
             self._positions_zoom_order_history_base_summary = "未配置 API 凭证，无法读取历史委托。"
@@ -3272,6 +3519,7 @@ class QuantApp:
             self._latest_order_history = []
             self._render_pending_orders_view()
             self._render_order_history_view()
+            self._refresh_all_refresh_badges()
             return
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
         self._start_pending_orders_refresh(credentials, environment)
@@ -3280,10 +3528,12 @@ class QuantApp:
     def refresh_pending_orders(self) -> None:
         credentials = self._current_credentials_or_none()
         if credentials is None:
+            _reset_refresh_health(self._pending_orders_refresh_health)
             self._positions_zoom_pending_orders_base_summary = "未配置 API 凭证，无法读取当前委托。"
             self._positions_zoom_pending_orders_summary_text.set(self._positions_zoom_pending_orders_base_summary)
             self._latest_pending_orders = []
             self._render_pending_orders_view()
+            self._refresh_all_refresh_badges()
             return
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
         self._start_pending_orders_refresh(credentials, environment)
@@ -3291,10 +3541,12 @@ class QuantApp:
     def refresh_order_history(self) -> None:
         credentials = self._current_credentials_or_none()
         if credentials is None:
+            _reset_refresh_health(self._order_history_refresh_health)
             self._positions_zoom_order_history_base_summary = "未配置 API 凭证，无法读取历史委托。"
             self._positions_zoom_order_history_summary_text.set(self._positions_zoom_order_history_base_summary)
             self._latest_order_history = []
             self._render_order_history_view()
+            self._refresh_all_refresh_badges()
             return
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
         self._start_order_history_refresh(credentials, environment)
@@ -3321,6 +3573,89 @@ class QuantApp:
             return self._account_info_window
         return self.root
 
+    def _create_refresh_badge(self, parent, textvariable: StringVar, store: list[Label]) -> Label:
+        badge = Label(
+            parent,
+            textvariable=textvariable,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            padx=8,
+            pady=2,
+            bd=0,
+            relief="flat",
+        )
+        store.append(badge)
+        return badge
+
+    def _apply_refresh_badge_state(
+        self,
+        store: list[Label],
+        textvariable: StringVar,
+        state: RefreshHealthState,
+    ) -> None:
+        textvariable.set(_refresh_indicator_badge_text(state))
+        palette = REFRESH_BADGE_PALETTES[_refresh_indicator_level(state)]
+        alive: list[Label] = []
+        for badge in store:
+            if not _widget_exists(badge):
+                continue
+            badge.configure(
+                bg=palette["bg"],
+                fg=palette["fg"],
+                activebackground=palette["bg"],
+                activeforeground=palette["fg"],
+            )
+            alive.append(badge)
+        store[:] = alive
+
+    def _refresh_all_refresh_badges(self) -> None:
+        self._apply_refresh_badge_state(
+            self._positions_refresh_badges,
+            self._positions_refresh_badge_text,
+            self._positions_refresh_health,
+        )
+        self._apply_refresh_badge_state(
+            self._account_info_refresh_badges,
+            self._account_info_refresh_badge_text,
+            self._account_info_refresh_health,
+        )
+        self._apply_refresh_badge_state(
+            self._pending_orders_refresh_badges,
+            self._pending_orders_refresh_badge_text,
+            self._pending_orders_refresh_health,
+        )
+        self._apply_refresh_badge_state(
+            self._order_history_refresh_badges,
+            self._order_history_refresh_badge_text,
+            self._order_history_refresh_health,
+        )
+
+    def _guard_live_action_against_stale_cache(
+        self,
+        state: RefreshHealthState,
+        *,
+        action_label: str,
+        data_label: str,
+        parent,
+        refresh_callback=None,
+    ) -> bool:
+        if not _refresh_health_is_stale(state):
+            return True
+        if callable(refresh_callback):
+            try:
+                refresh_callback()
+            except Exception:
+                pass
+        messagebox.showwarning(
+            "数据可能已过期",
+            (
+                f"当前{data_label}已经连续刷新失败，为避免基于旧缓存执行{action_label}，本次操作已拦截。\n\n"
+                f"{_describe_refresh_health(state)}\n\n"
+                "系统已尝试重新发起刷新，请等待下一次刷新成功后再重试。"
+            ),
+            parent=parent,
+        )
+        return False
+
     def cancel_selected_pending_order(self, view_name: str | None = None) -> None:
         parent = self._pending_order_parent_for_view(view_name)
         if self._pending_order_canceling:
@@ -3341,6 +3676,14 @@ class QuantApp:
         credentials = self._current_credentials_or_none()
         if credentials is None:
             messagebox.showinfo("撤单", "当前未配置 API 凭证，无法发起撤单。", parent=parent)
+            return
+        if not self._guard_live_action_against_stale_cache(
+            self._pending_orders_refresh_health,
+            action_label="撤单",
+            data_label="当前委托",
+            parent=parent,
+            refresh_callback=self.refresh_pending_orders,
+        ):
             return
         cancel_id = _trade_order_cancel_reference(item)
         if not cancel_id:
@@ -3413,6 +3756,14 @@ class QuantApp:
         credentials = self._current_credentials_or_none()
         if credentials is None:
             messagebox.showinfo("批量撤单", "当前未配置 API 凭证，无法发起批量撤单。", parent=parent)
+            return
+        if not self._guard_live_action_against_stale_cache(
+            self._pending_orders_refresh_health,
+            action_label="批量撤单",
+            data_label="当前委托",
+            parent=parent,
+            refresh_callback=self.refresh_pending_orders,
+        ):
             return
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
         self._pending_order_canceling = True
@@ -3757,6 +4108,8 @@ class QuantApp:
         self._pending_orders_refreshing = False
         self._latest_pending_orders = list(items)
         self._pending_orders_last_refresh_at = datetime.now()
+        _mark_refresh_health_success(self._pending_orders_refresh_health, at=self._pending_orders_last_refresh_at)
+        self._refresh_all_refresh_badges()
         if effective_environment:
             self._positions_effective_environment = effective_environment
         timestamp = self._pending_orders_last_refresh_at.strftime("%H:%M:%S")
@@ -3776,6 +4129,8 @@ class QuantApp:
         self._order_history_refreshing = False
         self._latest_order_history = list(items)
         self._order_history_last_refresh_at = datetime.now()
+        _mark_refresh_health_success(self._order_history_refresh_health, at=self._order_history_last_refresh_at)
+        self._refresh_all_refresh_badges()
         if effective_environment:
             self._positions_effective_environment = effective_environment
         timestamp = self._order_history_last_refresh_at.strftime("%H:%M:%S")
@@ -3788,13 +4143,33 @@ class QuantApp:
 
     def _apply_pending_orders_error(self, message: str) -> None:
         self._pending_orders_refreshing = False
-        self._positions_zoom_pending_orders_base_summary = f"当前委托读取失败：{message}"
+        friendly_message = _format_network_error_message(message)
+        _mark_refresh_health_failure(self._pending_orders_refresh_health, friendly_message)
+        self._refresh_all_refresh_badges()
+        suffix = _format_refresh_health_suffix(self._pending_orders_refresh_health)
+        has_previous_items = bool(self._latest_pending_orders) or self._pending_orders_last_refresh_at is not None
+        if has_previous_items:
+            summary = f"当前委托刷新失败，继续显示上一份缓存：{friendly_message}{suffix}"
+        else:
+            summary = f"当前委托读取失败：{friendly_message}{suffix}"
+        self._positions_zoom_pending_orders_base_summary = summary
         self._positions_zoom_pending_orders_summary_text.set(self._positions_zoom_pending_orders_base_summary)
+        self._enqueue_log(summary)
 
     def _apply_order_history_error(self, message: str) -> None:
         self._order_history_refreshing = False
-        self._positions_zoom_order_history_base_summary = f"历史委托读取失败：{message}"
+        friendly_message = _format_network_error_message(message)
+        _mark_refresh_health_failure(self._order_history_refresh_health, friendly_message)
+        self._refresh_all_refresh_badges()
+        suffix = _format_refresh_health_suffix(self._order_history_refresh_health)
+        has_previous_items = bool(self._latest_order_history) or self._order_history_last_refresh_at is not None
+        if has_previous_items:
+            summary = f"历史委托刷新失败，继续显示上一份缓存：{friendly_message}{suffix}"
+        else:
+            summary = f"历史委托读取失败：{friendly_message}{suffix}"
+        self._positions_zoom_order_history_base_summary = summary
         self._positions_zoom_order_history_summary_text.set(self._positions_zoom_order_history_base_summary)
+        self._enqueue_log(summary)
 
     def _on_pending_order_filter_changed(self, *_: object) -> None:
         self._render_pending_orders_view()
@@ -4844,6 +5219,14 @@ class QuantApp:
         credentials = self._current_credentials_or_none()
         if credentials is None:
             messagebox.showerror("启动失败", "请先在设置里配置 API 凭证。", parent=self._protection_window or self.root)
+            return
+        if not self._guard_live_action_against_stale_cache(
+            self._positions_refresh_health,
+            action_label="启动持仓保护",
+            data_label="持仓",
+            parent=self._protection_window or self.root,
+            refresh_callback=self.refresh_positions,
+        ):
             return
 
         try:
@@ -5915,6 +6298,8 @@ class QuantApp:
         credentials = self._current_credentials_or_none()
         if credentials is None:
             self._apply_positions([], "未配置 API 凭证，无法读取持仓。")
+            _reset_refresh_health(self._positions_refresh_health)
+            self._refresh_all_refresh_badges()
             return
 
         self._positions_refreshing = True
@@ -5988,6 +6373,8 @@ class QuantApp:
         self._positions_context_note = summary
         self._positions_last_refresh_at = datetime.now()
         self._positions_effective_environment = effective_environment
+        _mark_refresh_health_success(self._positions_refresh_health, at=self._positions_last_refresh_at)
+        self._refresh_all_refresh_badges()
         self._upl_usdt_prices = dict(upl_usdt_prices or {})
         self._position_instruments = dict(position_instruments or {})
         self._position_tickers = dict(position_tickers or {})
@@ -6289,23 +6676,31 @@ class QuantApp:
 
     def _apply_positions_error(self, message: str) -> None:
         friendly_message = _format_network_error_message(message)
-        has_previous_positions = bool(self._latest_positions) or bool(self._position_row_payloads)
+        _mark_refresh_health_failure(self._positions_refresh_health, friendly_message)
+        self._refresh_all_refresh_badges()
+        suffix = _format_refresh_health_suffix(self._positions_refresh_health)
+        has_previous_positions = (
+            bool(self._latest_positions)
+            or bool(self._position_row_payloads)
+            or self._positions_last_refresh_at is not None
+        )
         self._positions_refreshing = False
         if has_previous_positions:
-            self.positions_summary_text.set(f"持仓刷新失败，继续显示上一份缓存：{friendly_message}")
+            summary = f"持仓刷新失败，继续显示上一份缓存：{friendly_message}{suffix}"
+            self.positions_summary_text.set(summary)
             self._sync_positions_zoom_window()
             self._refresh_positions_zoom_detail()
-            self._enqueue_log(f"持仓刷新失败，继续显示上一份缓存：{friendly_message}")
+            self._enqueue_log(summary)
             return
         self._latest_positions = []
         self._positions_context_note = None
         self._positions_last_refresh_at = None
         self._positions_effective_environment = None
         self._upl_usdt_prices = {}
+        self._position_instruments = {}
         self._position_tickers = {}
         self.position_tree.delete(*self.position_tree.get_children())
         self._position_row_payloads.clear()
-        self.positions_summary_text.set(f"持仓读取失败：{friendly_message}")
         self.position_total_text.set("-")
         self.position_upl_text.set("-")
         self.position_realized_text.set("-")
@@ -6319,7 +6714,9 @@ class QuantApp:
         self._set_readonly_text(self._position_detail_panel, self.position_detail_text.get())
         self._sync_positions_zoom_window()
         self._refresh_positions_zoom_detail()
-        self._enqueue_log(f"持仓读取失败：{friendly_message}")
+        summary = f"持仓读取失败：{friendly_message}{suffix}"
+        self.positions_summary_text.set(summary)
+        self._enqueue_log(summary)
 
     def _refresh_positions_periodic(self) -> None:
         if self.position_auto_refresh_enabled:
