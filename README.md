@@ -1,6 +1,6 @@
-﻿# OKX 策略工作台
+# OKX 策略工作台
 
-当前版本：`v0.3.99`
+当前版本：`v0.3.100`
 
 这是一个面向 OKX 的桌面交易工作台，围绕“监控、交易、保护、回测、分析”构建。当前项目已经包含：
 
@@ -21,6 +21,7 @@
 - `EMA 动态委托-空头`
 - `EMA 穿越市价`
 - `4H EMA5 / EMA8 金叉死叉`
+- `现货增强三十六计`
 
 主界面能力包括：
 
@@ -559,7 +560,16 @@ ATR 批量矩阵规则：
 - `.okx_quant_candle_cache/`
 
 ## 11. 更新日志
-当前版本：v0.3.99
+当前版本：v0.3.100
+
+### v0.3.100
+
+- 已将 `现货增强三十六计` 作为 live-only 策略接入主界面启动链路，并将回测窗口候选策略与实盘候选策略分离；选中该策略时打开回测会自动回退到可回测策略，避免配置错位
+- 已新增 `okx_quant/enhanced_live_engine.py`，支持现货信号标的与永续交易标的自动换算、信号源 K 线加载、人工池优先减仓与会话产物落盘，为主界面直接启动“现货增强三十六计”提供执行引擎
+- 已在 `okx_quant/ui.py` 与 `okx_quant/strategy_catalog.py` 补齐“现货增强三十六计”参数校验与默认值：`固定数量` 作为单槽数量，`每波最多开仓次数` 作为每个方向最大槽位数，并收口为“交易并下单”模式
+- 已为 `持仓保护` 监控心跳增加节流：连续“监控中”状态默认每 `30s` 才写一次日志，但状态消息仍实时刷新；若刚经历网络异常等非监控状态，恢复监控后会立即补打一条心跳，减少刷屏同时保留状态切换可见性
+- 已修复回测标准 `R` 倍数口径：未平仓展示、人工池持仓和已平仓交易统一按开仓价到初始止损的原始风险计算，不再因为止损上移而放大 `R` 值
+- 已补充并通过本轮验证：`python -m unittest tests.test_backtest tests.test_enhanced_live_engine tests.test_position_protection`（106 项测试通过）与 `python -m py_compile okx_quant\\backtest.py okx_quant\\strategy_catalog.py okx_quant\\ui.py okx_quant\\enhanced_live_engine.py okx_quant\\position_protection.py tests\\test_backtest.py tests\\test_enhanced_live_engine.py tests\\test_position_protection.py`
 
 ### v0.3.99
 

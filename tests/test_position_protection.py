@@ -1,4 +1,5 @@
 ﻿from decimal import Decimal
+from datetime import timedelta
 from threading import Event
 from time import sleep
 from unittest import TestCase
@@ -868,6 +869,88 @@ class PositionProtectionTest(TestCase):
         self.assertTrue(any("止盈触发" in line for line in logs))
         self.assertTrue(any("bid/ask/last/mark=" in line for line in logs))
         self.assertTrue(any("clOrdId=" in line for line in logs))
+
+    def test_monitoring_status_heartbeats_are_throttled(self) -> None:
+        logs: list[str] = []
+        manager = PositionProtectionManager(
+            _StubPriceClient(Decimal("0.0150")),
+            logs.append,
+            notifier=None,
+            monitor_heartbeat_interval_seconds=30,
+        )
+        protection = OptionProtectionConfig(
+            option_inst_id="BTC-USD-20260327-70000-C",
+            trigger_inst_id="BTC-USD-20260327-70000-C",
+            trigger_price_type="mark",
+            direction="long",
+            pos_side="long",
+            take_profit_trigger=Decimal("0.0200"),
+            stop_loss_trigger=Decimal("0.0100"),
+            take_profit_order_mode="fixed_price",
+            take_profit_order_price=Decimal("0.0195"),
+            take_profit_slippage=Decimal("0"),
+            stop_loss_order_mode="fixed_price",
+            stop_loss_order_price=Decimal("0.0095"),
+            stop_loss_slippage=Decimal("0"),
+            poll_seconds=0.01,
+            trigger_label="BTC-USD-20260327-70000-C mark",
+        )
+        worker = protection_module._ProtectionWorker(
+            session_id="P01",
+            credentials=_make_credentials(),
+            config=_make_strategy_config(),
+            protection=protection,
+        )
+
+        manager._set_monitoring_status(worker, Decimal("0.0150"))
+        manager._set_monitoring_status(worker, Decimal("0.0151"))
+
+        self.assertEqual(len([line for line in logs if "监控中 | 触发价=" in line]), 1)
+        self.assertIn("0.0151", worker.last_message)
+
+        assert worker.last_monitor_heartbeat_at is not None
+        worker.last_monitor_heartbeat_at = worker.last_monitor_heartbeat_at - timedelta(seconds=31)
+        manager._set_monitoring_status(worker, Decimal("0.0152"))
+
+        self.assertEqual(len([line for line in logs if "监控中 | 触发价=" in line]), 2)
+
+    def test_monitoring_status_logs_immediately_after_non_monitoring_status(self) -> None:
+        logs: list[str] = []
+        manager = PositionProtectionManager(
+            _StubPriceClient(Decimal("0.0150")),
+            logs.append,
+            notifier=None,
+            monitor_heartbeat_interval_seconds=30,
+        )
+        protection = OptionProtectionConfig(
+            option_inst_id="BTC-USD-20260327-70000-C",
+            trigger_inst_id="BTC-USD-20260327-70000-C",
+            trigger_price_type="mark",
+            direction="long",
+            pos_side="long",
+            take_profit_trigger=Decimal("0.0200"),
+            stop_loss_trigger=Decimal("0.0100"),
+            take_profit_order_mode="fixed_price",
+            take_profit_order_price=Decimal("0.0195"),
+            take_profit_slippage=Decimal("0"),
+            stop_loss_order_mode="fixed_price",
+            stop_loss_order_price=Decimal("0.0095"),
+            stop_loss_slippage=Decimal("0"),
+            poll_seconds=0.01,
+            trigger_label="BTC-USD-20260327-70000-C mark",
+        )
+        worker = protection_module._ProtectionWorker(
+            session_id="P02",
+            credentials=_make_credentials(),
+            config=_make_strategy_config(),
+            protection=protection,
+        )
+
+        manager._set_monitoring_status(worker, Decimal("0.0150"))
+        manager._set_status(worker, "运行中", "网络异常，正在重试")
+        manager._set_monitoring_status(worker, Decimal("0.0151"))
+
+        self.assertEqual(len([line for line in logs if "监控中 | 触发价=" in line]), 2)
 
     def test_manager_stop_loss_closes_short_position_from_spot_trigger_in_multiple_orders(self) -> None:
         option_inst_id = "BTC-USD-20260327-70000-P"

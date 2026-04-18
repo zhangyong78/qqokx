@@ -20,6 +20,7 @@ from okx_quant.backtest import (
     _dynamic_stop_price,
     _dynamic_trigger_price,
     _load_backtest_candles,
+    _position_initial_risk_value,
     _backtest_trade_start_index,
     _format_backtest_timestamp,
     _try_close_position,
@@ -296,6 +297,32 @@ class BacktestTest(TestCase):
         self.assertEqual(position.entry_price, Decimal("99"))
         self.assertEqual(position.risk_per_unit, Decimal("10"))
         self.assertEqual(_dynamic_trigger_price(position, 2), Decimal("80"))
+
+    def test_position_initial_risk_value_ignores_moved_stop_loss(self) -> None:
+        position = _create_open_position(
+            instrument=self._build_instrument(),
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("140"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            entry_fee_rate=Decimal("0"),
+            exit_fee_rate=Decimal("0"),
+            entry_fee_type="maker",
+            entry_slippage_rate=Decimal("0"),
+            exit_slippage_rate=Decimal("0"),
+            funding_rate=Decimal("0"),
+            dynamic_take_profit_enabled=True,
+        )
+
+        self.assertIsNotNone(position)
+        assert position is not None
+        position.stop_loss = Decimal("101.5")
+
+        self.assertEqual(_position_initial_risk_value(position), Decimal("10"))
 
     def test_backtest_risk_size_below_min_order_size_is_clamped_to_min_size(self) -> None:
         instrument = Instrument(

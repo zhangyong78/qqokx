@@ -27,6 +27,7 @@ PRICE_GUARD_SELL_BID_FLOOR_RATIO = Decimal("0.5")
 WRITE_RECONCILE_ATTEMPTS = 3
 WRITE_RECONCILE_BASE_DELAY_SECONDS = 1.0
 WRITE_RECONCILE_MAX_DELAY_SECONDS = 3.0
+MONITOR_HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
 class ProtectionPriceGuardError(RuntimeError):
@@ -218,6 +219,7 @@ class _ProtectionWorker:
     active_close_ord_id: str | None = None
     active_close_submitted_at: datetime | None = None
     last_trigger_price: Decimal | None = None
+    last_monitor_heartbeat_at: datetime | None = None
 
 
 class PositionProtectionManager:
@@ -230,6 +232,7 @@ class PositionProtectionManager:
         on_change: ChangeCallback | None = None,
         transient_alert_interval_seconds: float = 180.0,
         transient_status_interval_seconds: float = 15.0,
+        monitor_heartbeat_interval_seconds: float = MONITOR_HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self._client = client
         self._logger = logger
@@ -240,6 +243,7 @@ class PositionProtectionManager:
         self._workers: dict[str, _ProtectionWorker] = {}
         self._transient_alert_interval_seconds = max(transient_alert_interval_seconds, 0.0)
         self._transient_status_interval_seconds = max(transient_status_interval_seconds, 0.0)
+        self._monitor_heartbeat_interval_seconds = max(monitor_heartbeat_interval_seconds, 0.0)
 
     def set_notifier(self, notifier: EmailNotifier | None) -> None:
         self._notifier = notifier
@@ -357,11 +361,7 @@ class PositionProtectionManager:
                     uses_underlying_trigger=uses_underlying_price_trigger(protection),
                 )
                 self._reset_transient_state(worker)
-                self._set_status(
-                    worker,
-                    "运行中",
-                    f"监控中 | 触发价={format_decimal(current_price)} | 触发源={protection.trigger_label or protection.trigger_inst_id}",
-                )
+                self._set_monitoring_status(worker, current_price)
                 if stop_hit or take_hit:
                     reason = "止损" if stop_hit else "止盈"
                     worker.pending_close_reason = reason
@@ -1474,11 +1474,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
                 uses_underlying_trigger=uses_underlying_price_trigger(protection),
             )
             self._reset_transient_state(worker)
-            self._set_status(
-                worker,
-                "运行中",
-                f"监控中 | 触发价={format_decimal(current_price)} | 触发源={protection.trigger_label or protection.trigger_inst_id}",
-            )
+            self._set_monitoring_status(worker, current_price)
             if stop_hit or take_hit:
                 reason = "止损" if stop_hit else "止盈"
                 worker.pending_close_reason = reason
@@ -2346,11 +2342,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
                 uses_underlying_trigger=uses_underlying_price_trigger(protection),
             )
             self._reset_transient_state(worker)
-            self._set_status(
-                worker,
-                "运行中",
-                f"监控中 | 触发价={format_decimal(current_price)} | 触发源={protection.trigger_label or protection.trigger_inst_id}",
-            )
+            self._set_monitoring_status(worker, current_price)
             if stop_hit or take_hit:
                 reason = "止损" if stop_hit else "止盈"
                 worker.pending_close_reason = reason
@@ -2602,14 +2594,43 @@ def _pp_record_close_fill(
     )
 
 
-def _pp_set_status(self: PositionProtectionManager, worker: _ProtectionWorker, status: str, message: str) -> None:
+def _pp_set_status(
+    self: PositionProtectionManager,
+    worker: _ProtectionWorker,
+    status: str,
+    message: str,
+    *,
+    emit_log: bool = True,
+) -> None:
     repaired_status = _repair_mojibake_text(status)
     repaired_message = _repair_mojibake_text(message)
     with self._lock:
         worker.status = repaired_status
         worker.last_message = repaired_message
-    self._logger(f"{_protection_worker_prefix_clean(worker)} {repaired_message}")
+    if emit_log:
+        self._logger(f"{_protection_worker_prefix_clean(worker)} {repaired_message}")
     self._emit_change()
+
+
+def _pp_set_monitoring_status(
+    self: PositionProtectionManager,
+    worker: _ProtectionWorker,
+    current_price: Decimal,
+) -> None:
+    message = (
+        f"监控中 | 触发价={format_decimal(current_price)} | "
+        f"触发源={worker.protection.trigger_label or worker.protection.trigger_inst_id}"
+    )
+    now = datetime.now()
+    previous_message = worker.last_message or ""
+    emit_log = (
+        worker.last_monitor_heartbeat_at is None
+        or not previous_message.startswith("监控中 |")
+        or (now - worker.last_monitor_heartbeat_at).total_seconds() >= self._monitor_heartbeat_interval_seconds
+    )
+    self._set_status(worker, "运行中", message, emit_log=emit_log)
+    if emit_log:
+        worker.last_monitor_heartbeat_at = now
 
 
 def _pp_handle_transient_error(self: PositionProtectionManager, worker: _ProtectionWorker, exc: Exception) -> None:
@@ -2669,6 +2690,7 @@ PositionProtectionManager._reconcile_active_close_order = _pp_reconcile_active_c
 PositionProtectionManager._record_close_fill = _pp_record_close_fill
 PositionProtectionManager._is_missing_order_error = _pp_is_missing_order_error
 PositionProtectionManager._set_status = _pp_set_status
+PositionProtectionManager._set_monitoring_status = _pp_set_monitoring_status
 PositionProtectionManager._is_transient_error = _pp_is_transient_error
 PositionProtectionManager._handle_transient_error = _pp_handle_transient_error
 PositionProtectionManager._notify = _pp_notify

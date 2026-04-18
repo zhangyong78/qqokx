@@ -9,6 +9,7 @@ STRATEGY_CROSS_ID = "ema_cross_market"
 STRATEGY_EMA5_EMA8_ID = "ema5_ema8_cross_stop"
 STRATEGY_SLOT_LONG_ID = "ema_slot_handoff_long"
 STRATEGY_SLOT_SHORT_ID = "ema_slot_handoff_short"
+STRATEGY_SPOT_ENHANCEMENT_36_ID = "spot_enhancement_36"
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,24 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     ),
 )
 
+LIVE_ONLY_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
+    StrategyDefinition(
+        strategy_id=STRATEGY_SPOT_ENHANCEMENT_36_ID,
+        name="现货增强三十六计",
+        summary="现货信号驱动的永续短线增强策略。做对自动止盈，做错转人工池继续占用额度，支持在主界面直接启动模拟盘/实盘。",
+        rule_description=(
+            "先用现货 K 线子策略找入场点，再按固定单槽数量去做永续对冲/增强。"
+            " 每次开仓只占用一个槽位；盈利单自动止盈；触发人工线或超时亏损单进入人工池，不自动止损。"
+        ),
+        parameter_hint=(
+            "固定数量 = 单个槽位大小；每波最多开仓次数 = 每个方向的最大槽位数。"
+            " 当前第一版优先支持 5m 现货信号驱动永续执行，子策略启停与参数沿用增强策略运行时配置文件。"
+        ),
+        default_signal_label="双向",
+        allowed_signal_labels=("双向", "只做多", "只做空"),
+    ),
+)
+
 BACKTEST_ONLY_STRATEGY_IDS = {
     STRATEGY_SLOT_LONG_ID,
     STRATEGY_SLOT_SHORT_ID,
@@ -137,12 +156,13 @@ VISIBLE_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = tuple(
 BACKTEST_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = VISIBLE_STRATEGY_DEFINITIONS
 
 STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = tuple(
-    item for item in VISIBLE_STRATEGY_DEFINITIONS if item.strategy_id not in BACKTEST_ONLY_STRATEGY_IDS
+    list(item for item in VISIBLE_STRATEGY_DEFINITIONS if item.strategy_id not in BACKTEST_ONLY_STRATEGY_IDS)
+    + list(LIVE_ONLY_STRATEGY_DEFINITIONS)
 )
 
 
 def get_strategy_definition(strategy_id: str) -> StrategyDefinition:
-    for item in ALL_STRATEGY_DEFINITIONS:
+    for item in (*ALL_STRATEGY_DEFINITIONS, *LIVE_ONLY_STRATEGY_DEFINITIONS):
         if item.strategy_id == strategy_id:
             return item
     raise KeyError(f"未知策略：{strategy_id}")

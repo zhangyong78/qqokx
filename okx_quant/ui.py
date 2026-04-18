@@ -19,6 +19,12 @@ from okx_quant.deribit_client import DeribitRestClient
 from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.engine import StrategyEngine, fetch_hourly_ema_debug, format_hourly_debug
+from okx_quant.enhanced_live_engine import (
+    EnhancedStrategyEngine,
+    derive_spot_signal_inst_id,
+    derive_swap_trade_inst_id,
+    is_spot_enhancement_strategy_id,
+)
 from okx_quant.log_utils import append_log_line, append_preformatted_log_line, strategy_session_log_file_path
 from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
@@ -70,6 +76,7 @@ from okx_quant.signal_monitor_ui import SignalMonitorWindow
 from okx_quant.smart_order import SmartOrderRuntimeConfig
 from okx_quant.smart_order_ui import SmartOrderWindow
 from okx_quant.strategy_catalog import (
+    BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_DEFINITIONS,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
@@ -5174,11 +5181,16 @@ class QuantApp:
             self._backtest_window.window.focus_force()
             return
 
+        backtest_strategy_name = self.strategy_name.get()
+        backtest_strategy_names = {item.name for item in BACKTEST_STRATEGY_DEFINITIONS}
+        if backtest_strategy_name not in backtest_strategy_names:
+            backtest_strategy_name = BACKTEST_STRATEGY_DEFINITIONS[0].name
+
         self._backtest_window = BacktestWindow(
             self.root,
             self.client,
             BacktestLaunchState(
-                strategy_name=self.strategy_name.get(),
+                strategy_name=backtest_strategy_name,
                 symbol=_normalize_symbol_input(self.symbol.get()),
                 bar=self.bar.get(),
                 ema_period=self.ema_period.get(),
@@ -5729,19 +5741,29 @@ class QuantApp:
                 symbol=session_symbol,
                 api_name=api_name,
             ).resolve()
-            engine = StrategyEngine(
-                self.client,
-                self._make_session_logger(
-                    session_id,
-                    definition.name,
-                    session_symbol,
-                    api_name,
-                    session_log_path,
-                ),
-                notifier=notifier,
-                strategy_name=definition.name,
-                session_id=session_id,
+            session_logger = self._make_session_logger(
+                session_id,
+                definition.name,
+                session_symbol,
+                api_name,
+                session_log_path,
             )
+            if is_spot_enhancement_strategy_id(definition.strategy_id):
+                engine = EnhancedStrategyEngine(
+                    self.client,
+                    session_logger,
+                    notifier=notifier,
+                    strategy_name=definition.name,
+                    session_id=session_id,
+                )
+            else:
+                engine = StrategyEngine(
+                    self.client,
+                    session_logger,
+                    notifier=notifier,
+                    strategy_name=definition.name,
+                    session_id=session_id,
+                )
             session = StrategySession(
                 session_id=session_id,
                 api_name=api_name,
@@ -6332,6 +6354,9 @@ class QuantApp:
             self._dynamic_fee_offset_hint_label.grid_remove()
             self._entry_reference_ema_label.grid_remove()
             self._entry_reference_ema_entry.grid_remove()
+            if is_spot_enhancement_strategy_id(definition.strategy_id):
+                self._max_entries_per_trend_label.grid()
+                self._max_entries_per_trend_entry.grid()
         if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
             self.bar.set("4H")
             self.ema_period.set("5")
@@ -6343,6 +6368,20 @@ class QuantApp:
             self.max_entries_per_trend.set("0")
             self.entry_side_mode_label.set("跟随信号")
             self.tp_sl_mode_label.set("按交易标的价格（本地）")
+        elif is_spot_enhancement_strategy_id(definition.strategy_id):
+            self.bar.set("5m")
+            self.ema_period.set("21")
+            self.trend_ema_period.set("55")
+            self.big_ema_period.set("233")
+            self.entry_reference_ema_period.set("0")
+            self.risk_amount.set("")
+            if not self.order_size.get().strip():
+                self.order_size.set("1")
+            if not self.max_entries_per_trend.get().strip() or self.max_entries_per_trend.get().strip() == "0":
+                self.max_entries_per_trend.set("10")
+            self.entry_side_mode_label.set("跟随信号")
+            self.tp_sl_mode_label.set("按交易标的价格（本地）")
+            self.run_mode_label.set("交易并下单")
         if self._strategy_uses_big_ema(definition.strategy_id):
             self._big_ema_label.grid()
             self._big_ema_entry.grid()
@@ -6373,6 +6412,25 @@ class QuantApp:
 
     def _confirm_start(self, definition: StrategyDefinition, config: StrategyConfig) -> bool:
         strategy_symbol = self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
+        if is_spot_enhancement_strategy_id(definition.strategy_id):
+            message = "\n".join(
+                [
+                    f"策略：{definition.name}",
+                    f"运行模式：{self.run_mode_label.get()}",
+                    f"信号标的：{config.inst_id}",
+                    f"交易标的：{config.trade_inst_id or config.inst_id}",
+                    f"K线周期：{config.bar}",
+                    f"方向：{self.signal_mode_label.get()}",
+                    f"单槽数量：{format_decimal(config.order_size)}",
+                    f"每方向最大槽位：{config.max_entries_per_trend}",
+                    f"环境：{self.environment_label.get()}",
+                    "",
+                    definition.rule_description,
+                    "",
+                    "确认启动这个策略吗？",
+                ]
+            )
+            return messagebox.askokcancel(f"确认启动 {definition.name}", message)
         risk_value = self.risk_amount.get().strip() or "-"
         fixed_size = self.order_size.get().strip() or "-"
         lines = [
@@ -6438,6 +6496,42 @@ class QuantApp:
             raise ValueError("请先在 菜单 > 设置 > API 与通知设置 中填写 API 凭证")
         if not symbol:
             raise ValueError("请选择交易标的")
+        if is_spot_enhancement_strategy_id(definition.strategy_id):
+            if run_mode != "trade":
+                raise ValueError("现货增强三十六计当前只支持“交易并下单”模式")
+            if order_size <= 0:
+                raise ValueError("现货增强三十六计必须填写固定数量，它会作为单个槽位大小")
+            if max_entries_per_trend <= 0:
+                raise ValueError("现货增强三十六计要求“每波最多开仓次数”大于 0，它会作为每个方向的最大槽位数")
+            trade_symbol = derive_swap_trade_inst_id(symbol)
+            signal_symbol = derive_spot_signal_inst_id(symbol)
+            credentials = Credentials(api_key=api_key, secret_key=secret_key, passphrase=passphrase)
+            return credentials, StrategyConfig(
+                inst_id=signal_symbol,
+                bar=self.bar.get() or "5m",
+                ema_period=21,
+                atr_period=14,
+                atr_stop_multiplier=Decimal("1"),
+                atr_take_multiplier=Decimal("2"),
+                order_size=order_size,
+                trade_mode=TRADE_MODE_OPTIONS[self.trade_mode_label.get()],
+                signal_mode=SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()],
+                position_mode=POSITION_MODE_OPTIONS[self.position_mode_label.get()],
+                environment=ENV_OPTIONS[self.environment_label.get()],
+                tp_sl_trigger_type=TRIGGER_TYPE_OPTIONS[self.trigger_type_label.get()],
+                trend_ema_period=55,
+                big_ema_period=233,
+                strategy_id=definition.strategy_id,
+                poll_seconds=float(self._parse_positive_decimal(self.poll_seconds.get(), "轮询秒数")),
+                risk_amount=None,
+                trade_inst_id=trade_symbol,
+                tp_sl_mode="local_trade",
+                local_tp_sl_inst_id=signal_symbol,
+                entry_side_mode="follow_signal",
+                run_mode="trade",
+                take_profit_mode="fixed",
+                max_entries_per_trend=max_entries_per_trend,
+            )
         if run_mode == "trade":
             if tp_sl_mode == "exchange":
                 if trade_symbol != symbol:

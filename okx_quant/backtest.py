@@ -1291,7 +1291,7 @@ def _run_dynamic_backtest(
         funding_periods = Decimal(str(max(last_candle.ts - open_position.entry_ts, 0))) / Decimal("28800000")
         funding_cost = abs(open_position.entry_price * open_position.size) * open_position.funding_rate * funding_periods
         pnl = gross_pnl - entry_fee - funding_cost
-        risk_value = abs(_position_strategy_entry_price(open_position) - open_position.stop_loss) * open_position.size
+        risk_value = _position_initial_risk_value(open_position)
         r_multiple = Decimal("0") if risk_value == 0 else pnl / risk_value
         terminal_open_position = BacktestOpenPosition(
             signal=open_position.signal,
@@ -1750,7 +1750,7 @@ def _build_manual_backtest_position(position: _ManualPosition, current_candle: C
     funding_periods = Decimal(str(max(current_candle.ts - open_position.entry_ts, 0))) / Decimal("28800000")
     funding_cost = abs(open_position.entry_price * open_position.size) * open_position.funding_rate * funding_periods
     pnl = gross_pnl - entry_fee - funding_cost
-    risk_value = abs(_position_strategy_entry_price(open_position) - open_position.initial_stop_loss) * open_position.size
+    risk_value = _position_initial_risk_value(open_position)
     r_multiple = Decimal("0") if risk_value == 0 else pnl / risk_value
     break_even_price = _estimate_manual_break_even_price(
         open_position,
@@ -1918,6 +1918,11 @@ def _position_strategy_entry_price(position: _OpenPosition) -> Decimal:
     return position.entry_price_raw if position.entry_price_raw > 0 else position.entry_price
 
 
+def _position_initial_risk_value(position: _OpenPosition) -> Decimal:
+    strategy_entry_price = _position_strategy_entry_price(position)
+    return abs(strategy_entry_price - position.initial_stop_loss) * position.size
+
+
 def _dynamic_trigger_price(position: _OpenPosition, trigger_r: int) -> Decimal:
     entry_price = _position_strategy_entry_price(position)
     fee_offset = _dynamic_fee_offset(
@@ -2012,8 +2017,7 @@ def _build_closed_trade(
     funding_periods = Decimal(str(max(candle.ts - position.entry_ts, 0))) / Decimal("28800000")
     funding_cost = abs(position.entry_price * position.size) * position.funding_rate * funding_periods
     pnl = gross_pnl - total_fee - funding_cost
-    strategy_entry_price = _position_strategy_entry_price(position)
-    risk_value = abs(strategy_entry_price - position.initial_stop_loss) * position.size
+    risk_value = _position_initial_risk_value(position)
     r_multiple = Decimal("0") if risk_value == 0 else pnl / risk_value
     slippage_cost = position.entry_slippage_cost + (abs(exit_price - exit_price_raw) * abs(position.size))
     return BacktestTrade(
