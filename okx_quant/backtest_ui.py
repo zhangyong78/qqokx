@@ -129,6 +129,8 @@ class BacktestLaunchState:
     max_entries_per_trend: str
     dynamic_two_r_break_even: bool
     dynamic_fee_offset_enabled: bool
+    time_stop_break_even_enabled: bool
+    time_stop_break_even_bars: str
     signal_mode_label: str
     trade_mode_label: str
     position_mode_label: str
@@ -411,6 +413,9 @@ def _build_backtest_param_summary(
         if config.take_profit_mode == "dynamic":
             extra_parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
             extra_parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
+            extra_parts.append(
+                f"时间保本{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
+            )
         extra_parts.append(max_entries_text)
         extra_text = " / ".join(extra_parts)
         return (
@@ -859,6 +864,8 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "max_entries_per_trend": config.max_entries_per_trend,
         "dynamic_two_r_break_even": config.dynamic_two_r_break_even,
         "dynamic_fee_offset_enabled": config.dynamic_fee_offset_enabled,
+        "time_stop_break_even_enabled": config.time_stop_break_even_enabled,
+        "time_stop_break_even_bars": config.resolved_time_stop_break_even_bars(),
         "backtest_profile_id": config.backtest_profile_id,
         "backtest_profile_name": config.backtest_profile_name,
         "backtest_profile_summary": config.backtest_profile_summary,
@@ -919,6 +926,8 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         max_entries_per_trend=int(payload.get("max_entries_per_trend", 1)),
         dynamic_two_r_break_even=bool(payload.get("dynamic_two_r_break_even", True)),
         dynamic_fee_offset_enabled=bool(payload.get("dynamic_fee_offset_enabled", True)),
+        time_stop_break_even_enabled=bool(payload.get("time_stop_break_even_enabled", True)),
+        time_stop_break_even_bars=int(payload.get("time_stop_break_even_bars", 10)),
         backtest_profile_id=str(payload.get("backtest_profile_id", "")),
         backtest_profile_name=str(payload.get("backtest_profile_name", "")),
         backtest_profile_summary=str(payload.get("backtest_profile_summary", "")),
@@ -1228,6 +1237,8 @@ class BacktestWindow:
         self.max_entries_per_trend = StringVar(value=initial_state.max_entries_per_trend)
         self.dynamic_two_r_break_even = BooleanVar(value=initial_state.dynamic_two_r_break_even)
         self.dynamic_fee_offset_enabled = BooleanVar(value=initial_state.dynamic_fee_offset_enabled)
+        self.time_stop_break_even_enabled = BooleanVar(value=initial_state.time_stop_break_even_enabled)
+        self.time_stop_break_even_bars = StringVar(value=initial_state.time_stop_break_even_bars)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
         self.position_mode_label = StringVar(value=initial_state.position_mode_label)
@@ -1405,6 +1416,19 @@ class BacktestWindow:
             text="提示：保本位是否叠加手续费偏移，由下方开关决定；大部分组合开启更优，默认建议开启。",
         )
         self.dynamic_fee_offset_hint_label.grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
+
+        row += 1
+        self.time_stop_break_even_check = ttk.Checkbutton(
+            controls,
+            text="启用时间保本（持仓满指定K线且已达到净保本时，上移到保本位）",
+            variable=self.time_stop_break_even_enabled,
+            command=self._sync_dynamic_take_profit_controls,
+        )
+        self.time_stop_break_even_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.time_stop_break_even_bars_label = ttk.Label(controls, text="时间保本K线数")
+        self.time_stop_break_even_bars_label.grid(row=row, column=2, sticky="e", pady=(8, 0))
+        self.time_stop_break_even_bars_entry = ttk.Entry(controls, textvariable=self.time_stop_break_even_bars)
+        self.time_stop_break_even_bars_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
 
         row += 1
         self.size_or_risk_label = ttk.Label(controls, text="固定风险金/数量")
@@ -2365,12 +2389,20 @@ class BacktestWindow:
         entry_reference_ema_period = 0
         dynamic_two_r_break_even = False
         dynamic_fee_offset_enabled = False
+        time_stop_break_even_enabled = False
+        time_stop_break_even_bars = 0
         if dynamic_strategy:
             take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
             max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
             entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
             dynamic_two_r_break_even = bool(self.dynamic_two_r_break_even.get())
             dynamic_fee_offset_enabled = bool(self.dynamic_fee_offset_enabled.get())
+            time_stop_break_even_enabled = bool(self.time_stop_break_even_enabled.get())
+            time_stop_break_even_bars = (
+                self._parse_positive_int(self.time_stop_break_even_bars.get(), "时间保本K线数")
+                if time_stop_break_even_enabled
+                else 0
+            )
         if slot_strategy:
             max_entries_per_trend = self._parse_positive_int(self.max_entries_per_trend.get(), "最大槽位数")
         entry_slippage_rate = self._parse_nonnegative_decimal(self.entry_slippage_percent.get(), "开仓滑点") / Decimal("100")
@@ -2403,6 +2435,8 @@ class BacktestWindow:
             max_entries_per_trend=max_entries_per_trend,
             dynamic_two_r_break_even=dynamic_two_r_break_even,
             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+            time_stop_break_even_enabled=time_stop_break_even_enabled,
+            time_stop_break_even_bars=time_stop_break_even_bars,
             backtest_initial_capital=self._parse_positive_decimal(self.initial_capital.get(), "初始资金"),
             backtest_sizing_mode=sizing_mode,
             backtest_risk_percent=risk_percent,
@@ -2459,6 +2493,9 @@ class BacktestWindow:
                 self.dynamic_two_r_break_even_check,
                 self.dynamic_fee_offset_check,
                 self.dynamic_fee_offset_hint_label,
+                self.time_stop_break_even_check,
+                self.time_stop_break_even_bars_label,
+                self.time_stop_break_even_bars_entry,
             )
             for widget in dynamic_widgets:
                 if dynamic_strategy:
@@ -2500,6 +2537,11 @@ class BacktestWindow:
         )
         self.dynamic_two_r_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self.dynamic_fee_offset_check.configure(state="normal" if dynamic_take_profit else "disabled")
+        self.time_stop_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
+        self.time_stop_break_even_bars_label.configure(state="normal" if dynamic_take_profit else "disabled")
+        self.time_stop_break_even_bars_entry.configure(
+            state="normal" if dynamic_take_profit and self.time_stop_break_even_enabled.get() else "disabled"
+        )
 
     def _append_backtest_snapshot(
         self,
@@ -4113,6 +4155,9 @@ class BacktestWindow:
         if config.take_profit_mode == "dynamic":
             metrics_parts.append(f"2R保本：{config.dynamic_two_r_break_even_label()}")
             metrics_parts.append(f"手续费偏移：{config.dynamic_fee_offset_enabled_label()}")
+            metrics_parts.append(
+                f"时间保本：{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
+            )
         metrics_parts.extend(
             [
                 f"每波开仓：{max_entries_label}",

@@ -1093,6 +1093,82 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(next_take_profit, Decimal("130"))
         self.assertEqual(next_trigger_r, 3)
 
+    def test_dynamic_live_time_stop_break_even_moves_long_stop_after_threshold(self) -> None:
+        stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
+            direction="long",
+            current_price=Decimal("100.2"),
+            entry_price=Decimal("100"),
+            risk_per_unit=Decimal("10"),
+            current_stop_loss=Decimal("90"),
+            next_trigger_r=2,
+            tick_size=Decimal("0.1"),
+            holding_bars=10,
+            time_stop_break_even_enabled=True,
+            time_stop_break_even_bars=10,
+        )
+
+        self.assertTrue(moved)
+        self.assertEqual(stop_loss, Decimal("100.1"))
+        self.assertEqual(next_take_profit, Decimal("120.1"))
+        self.assertEqual(next_trigger_r, 2)
+
+    def test_dynamic_live_time_stop_break_even_moves_short_stop_after_threshold(self) -> None:
+        stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
+            direction="short",
+            current_price=Decimal("99.8"),
+            entry_price=Decimal("100"),
+            risk_per_unit=Decimal("10"),
+            current_stop_loss=Decimal("110"),
+            next_trigger_r=2,
+            tick_size=Decimal("0.1"),
+            holding_bars=10,
+            time_stop_break_even_enabled=True,
+            time_stop_break_even_bars=10,
+        )
+
+        self.assertTrue(moved)
+        self.assertEqual(stop_loss, Decimal("99.9"))
+        self.assertEqual(next_take_profit, Decimal("79.9"))
+        self.assertEqual(next_trigger_r, 2)
+
+    def test_dynamic_live_time_stop_break_even_waits_for_bar_threshold(self) -> None:
+        stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
+            direction="long",
+            current_price=Decimal("100.2"),
+            entry_price=Decimal("100"),
+            risk_per_unit=Decimal("10"),
+            current_stop_loss=Decimal("90"),
+            next_trigger_r=2,
+            tick_size=Decimal("0.1"),
+            holding_bars=9,
+            time_stop_break_even_enabled=True,
+            time_stop_break_even_bars=10,
+        )
+
+        self.assertFalse(moved)
+        self.assertEqual(stop_loss, Decimal("90"))
+        self.assertEqual(next_take_profit, Decimal("120.1"))
+        self.assertEqual(next_trigger_r, 2)
+
+    def test_dynamic_live_time_stop_break_even_never_retrogrades_existing_stop(self) -> None:
+        stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
+            direction="long",
+            current_price=Decimal("100.2"),
+            entry_price=Decimal("100"),
+            risk_per_unit=Decimal("10"),
+            current_stop_loss=Decimal("105"),
+            next_trigger_r=2,
+            tick_size=Decimal("0.1"),
+            holding_bars=10,
+            time_stop_break_even_enabled=True,
+            time_stop_break_even_bars=10,
+        )
+
+        self.assertFalse(moved)
+        self.assertEqual(stop_loss, Decimal("105"))
+        self.assertEqual(next_take_profit, Decimal("120.1"))
+        self.assertEqual(next_trigger_r, 2)
+
     def test_exchange_dynamic_stop_candidate_for_long_requires_price_above_stop(self) -> None:
         self.assertTrue(
             _is_exchange_dynamic_stop_candidate_valid(

@@ -86,6 +86,7 @@ class FilledPosition:
     pos_side: Literal["long", "short"] | None
     size: Decimal
     entry_price: Decimal
+    entry_ts: int
 
 
 @dataclass(frozen=True)
@@ -223,7 +224,9 @@ class StrategyEngine:
         if dynamic_stop_only:
             self._logger(
                 f"动态止盈已启用 | 2R保本={config.dynamic_two_r_break_even_label()} | "
-                f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | 初始仅在 OKX 挂止损"
+                f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | "
+                f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根 | "
+                "初始仅在 OKX 挂止损"
             )
         self._logger(f"指标回看数量：{lookback} 根 K 线")
 
@@ -289,6 +292,7 @@ class StrategyEngine:
                             pos_side=resolve_open_pos_side(config, active_order.side),
                             size=filled_size,
                             entry_price=filled_price,
+                            entry_ts=int(time.time() * 1000),
                         )
                         self._logger(
                             f"初始 OKX 止损已提交 | algoClOrdId={active_order.stop_loss_algo_cl_ord_id or '-'} | "
@@ -856,6 +860,9 @@ class StrategyEngine:
         if config.take_profit_mode == "dynamic":
             mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
             mode_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
+            mode_parts.append(
+                f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
+            )
         self._logger(" | ".join(mode_parts))
         self._log_hourly_debug(
             config.inst_id,
@@ -1000,6 +1007,9 @@ class StrategyEngine:
         if config.take_profit_mode == "dynamic":
             mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
             mode_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
+            mode_parts.append(
+                f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
+            )
         self._logger(" | ".join(mode_parts))
         self._log_hourly_debug(
             config.inst_id,
@@ -1504,6 +1514,9 @@ class StrategyEngine:
         if dynamic_take_profit_enabled:
             monitor_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
             monitor_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
+            monitor_parts.append(
+                f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
+            )
         self._logger(" | ".join(monitor_parts))
         while not self._stop_event.is_set():
             current_price = self._get_trigger_price_with_retry(
@@ -1511,6 +1524,7 @@ class StrategyEngine:
                 protection.trigger_price_type,
             )
             if dynamic_take_profit_enabled:
+                holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
                 updated_stop_loss, updated_take_profit, updated_trigger_r, moved = _advance_dynamic_stop_live(
                     direction=protection.direction,
                     current_price=current_price,
@@ -1521,14 +1535,18 @@ class StrategyEngine:
                     tick_size=trade_instrument.tick_size,
                     two_r_break_even=config.dynamic_two_r_break_even,
                     dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                    holding_bars=holding_bars,
+                    time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+                    time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
                 )
                 if moved:
                     current_stop_loss = updated_stop_loss
                     current_take_profit = updated_take_profit
                     next_trigger_r = updated_trigger_r
                     self._logger(
-                        f"鍔ㄦ€佹鐩堝凡鏇存柊 | 瑙﹀彂浠?{format_decimal(current_price)} | "
-                        f"鏂版鎹?{format_decimal(current_stop_loss)} | 涓嬩竴闃舵={next_trigger_r}R"
+                        f"动态止盈上移 | 当前价={format_decimal(current_price)} | "
+                        f"新止损={format_decimal(current_stop_loss)} | 下一阶段={next_trigger_r}R | "
+                        f"holding_bars={holding_bars}"
                     )
                 stop_hit = current_price <= current_stop_loss if protection.direction == "long" else current_price >= current_stop_loss
                 take_hit = False
@@ -1544,7 +1562,7 @@ class StrategyEngine:
                 self._logger(
                     f"本地{reason}触发 | 触发标的={protection.trigger_inst_id} | "
                     f"当前价={format_decimal(current_price)} | "
-                    f"止损={format_decimal(protection.stop_loss)} | 止盈={format_decimal(protection.take_profit)}"
+                    f"止损={format_decimal(current_stop_loss)} | 止盈={format_decimal(current_take_profit)}"
                 )
                 self._close_position(credentials, config, trade_instrument, position, reason)
                 return
@@ -1645,6 +1663,7 @@ class StrategyEngine:
                     f"初始止损={format_decimal(initial_stop_loss)}",
                     f"2R保本={config.dynamic_two_r_break_even_label()}",
                     f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
+                    f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根",
                 ]
             )
         )
@@ -1657,6 +1676,7 @@ class StrategyEngine:
 
             direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
             current_price = self._get_trigger_price_with_retry(trade_instrument.inst_id, config.tp_sl_trigger_type)
+            holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
             updated_stop_loss, next_trigger_price, updated_trigger_r, moved = _advance_dynamic_stop_live(
                 direction=direction,
                 current_price=current_price,
@@ -1667,6 +1687,9 @@ class StrategyEngine:
                 tick_size=trade_instrument.tick_size,
                 two_r_break_even=config.dynamic_two_r_break_even,
                 dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                holding_bars=holding_bars,
+                time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+                time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
             )
             should_amend = moved and (
                 updated_stop_loss > current_stop_loss if position.side == "buy" else updated_stop_loss < current_stop_loss
@@ -1773,7 +1796,7 @@ class StrategyEngine:
                 self._logger(
                     f"OKX 动态止损已上移 | 当前价={format_decimal(fresh_price)} | "
                     f"新止损={format_decimal(current_stop_loss)} | 下一阶段={next_trigger_r}R | "
-                    f"algoClOrdId={stop_loss_algo_cl_ord_id}"
+                    f"algoClOrdId={stop_loss_algo_cl_ord_id} | holding_bars={holding_bars}"
                 )
 
             self._stop_event.wait(config.poll_seconds)
@@ -2383,6 +2406,7 @@ class StrategyEngine:
                     pos_side=pos_side,
                     size=filled_size if filled_size > 0 else status.size or Decimal("0"),
                     entry_price=status.avg_price or status.price or estimated_entry,
+                    entry_ts=int(time.time() * 1000),
                 )
             if latest_state == "partially_filled" and filled_size > 0:
                 return FilledPosition(
@@ -2394,6 +2418,7 @@ class StrategyEngine:
                     pos_side=pos_side,
                     size=filled_size,
                     entry_price=status.avg_price or status.price or estimated_entry,
+                    entry_ts=int(time.time() * 1000),
                 )
             if latest_state in {"canceled", "order_failed"}:
                 break
@@ -2684,6 +2709,41 @@ def _dynamic_two_taker_fee_offset_live(
     return abs(entry_price) * taker_fee_rate * Decimal("2")
 
 
+def _bar_to_milliseconds_live(bar: str) -> int:
+    normalized = str(bar or "").strip().lower()
+    if normalized.endswith("m") and normalized[:-1].isdigit():
+        return int(normalized[:-1]) * 60 * 1000
+    if normalized.endswith("h") and normalized[:-1].isdigit():
+        return int(normalized[:-1]) * 60 * 60 * 1000
+    if normalized.endswith("d") and normalized[:-1].isdigit():
+        return int(normalized[:-1]) * 24 * 60 * 60 * 1000
+    raise ValueError(f"不支持的 K 线周期：{bar}")
+
+
+def _holding_bars_live(entry_ts: int, reference_ts: int, bar: str) -> int:
+    if reference_ts <= entry_ts:
+        return 0
+    return int((reference_ts - entry_ts) // _bar_to_milliseconds_live(bar))
+
+
+def _time_stop_break_even_price_live(
+    *,
+    direction: Literal["long", "short"],
+    entry_price: Decimal,
+    tick_size: Decimal,
+    taker_fee_rate: Decimal = LIVE_DYNAMIC_TAKER_FEE_RATE,
+    dynamic_fee_offset_enabled: bool = True,
+) -> Decimal:
+    fee_offset = _dynamic_two_taker_fee_offset_live(
+        entry_price,
+        taker_fee_rate,
+        enabled=dynamic_fee_offset_enabled,
+    )
+    raw = entry_price + fee_offset if direction == "long" else entry_price - fee_offset
+    rounding = "up" if direction == "long" else "down"
+    return snap_to_increment(raw, tick_size, rounding)
+
+
 def _dynamic_trigger_price_live(
     *,
     direction: Literal["long", "short"],
@@ -2744,6 +2804,9 @@ def _advance_dynamic_stop_live(
     two_r_break_even: bool = False,
     taker_fee_rate: Decimal = LIVE_DYNAMIC_TAKER_FEE_RATE,
     dynamic_fee_offset_enabled: bool = True,
+    holding_bars: int = 0,
+    time_stop_break_even_enabled: bool = False,
+    time_stop_break_even_bars: int = 0,
 ) -> tuple[Decimal, Decimal, int, bool]:
     if risk_per_unit <= 0:
         next_take_profit = _dynamic_trigger_price_live(
@@ -2755,11 +2818,43 @@ def _advance_dynamic_stop_live(
             taker_fee_rate=taker_fee_rate,
             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
         )
-        return current_stop_loss, next_take_profit, next_trigger_r, False
+        updated_stop = current_stop_loss
+        moved = False
+        if time_stop_break_even_enabled and time_stop_break_even_bars > 0 and holding_bars >= time_stop_break_even_bars:
+            candidate = _time_stop_break_even_price_live(
+                direction=direction,
+                entry_price=entry_price,
+                tick_size=tick_size,
+                taker_fee_rate=taker_fee_rate,
+                dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+            )
+            if direction == "long":
+                if current_price >= candidate and candidate > updated_stop:
+                    updated_stop = candidate
+                    moved = True
+            elif current_price <= candidate and candidate < updated_stop:
+                updated_stop = candidate
+                moved = True
+        return updated_stop, next_take_profit, next_trigger_r, moved
 
     moved = False
     updated_stop = current_stop_loss
     trigger_r = next_trigger_r
+    if time_stop_break_even_enabled and time_stop_break_even_bars > 0 and holding_bars >= time_stop_break_even_bars:
+        candidate = _time_stop_break_even_price_live(
+            direction=direction,
+            entry_price=entry_price,
+            tick_size=tick_size,
+            taker_fee_rate=taker_fee_rate,
+            dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+        )
+        if direction == "long":
+            if current_price >= candidate and candidate > updated_stop:
+                updated_stop = candidate
+                moved = True
+        elif current_price <= candidate and candidate < updated_stop:
+            updated_stop = candidate
+            moved = True
     while True:
         trigger_price = _dynamic_trigger_price_live(
             direction=direction,

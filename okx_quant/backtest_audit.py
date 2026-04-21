@@ -713,6 +713,8 @@ def _strategy_config_snapshot(config: StrategyConfig) -> dict[str, object]:
     if is_dynamic_strategy_id(config.strategy_id):
         payload["dynamic_two_r_break_even"] = config.dynamic_two_r_break_even
         payload["dynamic_fee_offset_enabled"] = config.dynamic_fee_offset_enabled
+        payload["time_stop_break_even_enabled"] = config.time_stop_break_even_enabled
+        payload["time_stop_break_even_bars"] = config.resolved_time_stop_break_even_bars()
     return payload
 
 

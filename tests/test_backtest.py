@@ -17,6 +17,7 @@ from okx_quant.backtest import (
     _build_equity_curve,
     _build_period_stats,
     _determine_backtest_order_size,
+    _advance_dynamic_stop,
     _dynamic_stop_price,
     _dynamic_trigger_price,
     _load_backtest_candles,
@@ -203,6 +204,106 @@ class BacktestTest(TestCase):
 
         self.assertEqual(stop_price, Decimal("100"))
 
+    def test_dynamic_backtest_time_stop_break_even_moves_long_stop_after_threshold(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price=Decimal("100"),
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("120"),
+            initial_stop_loss=Decimal("90"),
+            initial_take_profit=Decimal("120"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            dynamic_exit_fee_rate=Decimal("0.00036"),
+            dynamic_take_profit_enabled=True,
+            time_stop_break_even_enabled=True,
+            time_stop_break_even_bars=10,
+        )
+
+        _advance_dynamic_stop(position, Decimal("100.2"), holding_bars=10)
+
+        self.assertEqual(position.stop_loss, Decimal("100.1"))
+
+    def test_dynamic_backtest_time_stop_break_even_moves_short_stop_after_threshold(self) -> None:
+        position = _OpenPosition(
+            signal="short",
+            entry_index=0,
+            entry_ts=0,
+            entry_price=Decimal("100"),
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("110"),
+            take_profit=Decimal("80"),
+            initial_stop_loss=Decimal("110"),
+            initial_take_profit=Decimal("80"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            dynamic_exit_fee_rate=Decimal("0.00036"),
+            dynamic_take_profit_enabled=True,
+            time_stop_break_even_enabled=True,
+            time_stop_break_even_bars=10,
+        )
+
+        _advance_dynamic_stop(position, Decimal("99.8"), holding_bars=10)
+
+        self.assertEqual(position.stop_loss, Decimal("99.9"))
+
+    def test_dynamic_backtest_time_stop_break_even_waits_for_bar_threshold(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price=Decimal("100"),
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("120"),
+            initial_stop_loss=Decimal("90"),
+            initial_take_profit=Decimal("120"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            dynamic_exit_fee_rate=Decimal("0.00036"),
+            dynamic_take_profit_enabled=True,
+            time_stop_break_even_enabled=True,
+            time_stop_break_even_bars=10,
+        )
+
+        _advance_dynamic_stop(position, Decimal("100.2"), holding_bars=9)
+
+        self.assertEqual(position.stop_loss, Decimal("90"))
+
+    def test_dynamic_backtest_time_stop_break_even_never_retrogrades_existing_stop(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price=Decimal("100"),
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("105"),
+            take_profit=Decimal("120"),
+            initial_stop_loss=Decimal("90"),
+            initial_take_profit=Decimal("120"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            dynamic_exit_fee_rate=Decimal("0.00036"),
+            dynamic_take_profit_enabled=True,
+            time_stop_break_even_enabled=True,
+            time_stop_break_even_bars=10,
+        )
+
+        _advance_dynamic_stop(position, Decimal("100.2"), holding_bars=10)
+
+        self.assertEqual(position.stop_loss, Decimal("105"))
+
     def test_dynamic_limit_fill_does_not_apply_entry_slippage(self) -> None:
         plan = OrderPlan(
             inst_id="BTC-USDT-SWAP",
@@ -247,6 +348,104 @@ class BacktestTest(TestCase):
         self.assertEqual(position.entry_slippage_cost, Decimal("0"))
         self.assertEqual(position.risk_per_unit, Decimal("10"))
         self.assertEqual(_dynamic_trigger_price(position, 2), Decimal("120.1"))
+
+    def test_dynamic_limit_fill_at_open_uses_open_price_and_taker_fee_for_long(self) -> None:
+        plan = OrderPlan(
+            inst_id="BTC-USDT-SWAP",
+            side="buy",
+            pos_side=None,
+            size=Decimal("1"),
+            take_profit=Decimal("140"),
+            stop_loss=Decimal("90"),
+            entry_reference=Decimal("100"),
+            atr_value=Decimal("10"),
+            signal="long",
+            candle_ts=1,
+        )
+        candle = Candle(
+            1,
+            Decimal("95"),
+            Decimal("99"),
+            Decimal("94"),
+            Decimal("96"),
+            Decimal("1"),
+            True,
+        )
+
+        position = _try_fill_dynamic_order(
+            self._build_instrument(),
+            plan,
+            candle,
+            0,
+            entry_fee_rate=Decimal("0.00015"),
+            entry_fee_type="maker",
+            entry_slippage_rate=Decimal("0.01"),
+            exit_slippage_rate=Decimal("0.02"),
+            dynamic_take_profit_enabled=True,
+            dynamic_exit_fee_rate=Decimal("0.00036"),
+            dynamic_two_r_break_even=True,
+            immediate_entry_fee_rate=Decimal("0.00036"),
+            immediate_entry_fee_type="taker",
+        )
+
+        self.assertIsNotNone(position)
+        assert position is not None
+        self.assertEqual(position.entry_price, Decimal("95"))
+        self.assertEqual(position.entry_price_raw, Decimal("100"))
+        self.assertEqual(position.entry_path_price, Decimal("95"))
+        self.assertEqual(position.entry_fee_rate, Decimal("0.00036"))
+        self.assertEqual(position.entry_fee_type, "taker")
+        self.assertEqual(position.entry_slippage_cost, Decimal("0"))
+        self.assertEqual(_dynamic_trigger_price(position, 2), Decimal("120.1"))
+
+    def test_dynamic_limit_fill_at_open_uses_open_price_and_taker_fee_for_short(self) -> None:
+        plan = OrderPlan(
+            inst_id="BTC-USDT-SWAP",
+            side="sell",
+            pos_side=None,
+            size=Decimal("1"),
+            take_profit=Decimal("60"),
+            stop_loss=Decimal("110"),
+            entry_reference=Decimal("100"),
+            atr_value=Decimal("10"),
+            signal="short",
+            candle_ts=1,
+        )
+        candle = Candle(
+            1,
+            Decimal("105"),
+            Decimal("106"),
+            Decimal("101"),
+            Decimal("104"),
+            Decimal("1"),
+            True,
+        )
+
+        position = _try_fill_dynamic_order(
+            self._build_instrument(),
+            plan,
+            candle,
+            0,
+            entry_fee_rate=Decimal("0.00015"),
+            entry_fee_type="maker",
+            entry_slippage_rate=Decimal("0.01"),
+            exit_slippage_rate=Decimal("0.02"),
+            dynamic_take_profit_enabled=True,
+            dynamic_exit_fee_rate=Decimal("0.00036"),
+            dynamic_two_r_break_even=True,
+            immediate_entry_fee_rate=Decimal("0.00036"),
+            immediate_entry_fee_type="taker",
+        )
+
+        self.assertIsNotNone(position)
+        assert position is not None
+        self.assertEqual(position.entry_price, Decimal("105"))
+        self.assertEqual(position.entry_price_raw, Decimal("100"))
+        self.assertEqual(position.entry_path_price, Decimal("105"))
+        self.assertEqual(position.entry_fee_rate, Decimal("0.00036"))
+        self.assertEqual(position.entry_fee_type, "taker")
+        self.assertEqual(position.entry_slippage_cost, Decimal("0"))
+        self.assertEqual(_dynamic_trigger_price(position, 2), Decimal("79.9"))
 
     def test_dynamic_trigger_uses_strategy_entry_price_for_long_when_fill_price_slips(self) -> None:
         position = _create_open_position(
@@ -372,6 +571,42 @@ class BacktestTest(TestCase):
             state="live",
         )
 
+    def _build_custom_instrument(
+        self,
+        *,
+        inst_id: str,
+        tick_size: str,
+        lot_size: str,
+        min_size: str,
+    ) -> Instrument:
+        return Instrument(
+            inst_id=inst_id,
+            inst_type="SWAP",
+            tick_size=Decimal(tick_size),
+            lot_size=Decimal(lot_size),
+            min_size=Decimal(min_size),
+            state="live",
+        )
+
+    def _load_cached_candles(self, cache_name: str, *, end_ts: int | None = None) -> list[Candle]:
+        cache_path = Path(__file__).resolve().parents[1] / ".okx_quant_candle_cache" / cache_name
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        candles: list[Candle] = []
+        for item in payload["candles"]:
+            candle = Candle(
+                int(item["ts"]),
+                Decimal(item["open"]),
+                Decimal(item["high"]),
+                Decimal(item["low"]),
+                Decimal(item["close"]),
+                Decimal(item["volume"]),
+                bool(item.get("confirmed", True)),
+            )
+            candles.append(candle)
+            if end_ts is not None and candle.ts >= end_ts:
+                break
+        return candles
+
     def _build_config(self, *, ema_period: int = 2, atr_period: int = 2) -> StrategyConfig:
         return StrategyConfig(
             inst_id="BTC-USDT-SWAP",
@@ -411,6 +646,95 @@ class BacktestTest(TestCase):
             strategy_id=STRATEGY_EMA5_EMA8_ID,
             risk_amount=Decimal("100"),
         )
+
+    def test_dynamic_backtest_short_gap_fill_regression_uses_next_candle_open_for_sol_4h(self) -> None:
+        target_entry_ts = 1645747200000  # 2022-02-25 08:00:00
+        candles = self._load_cached_candles("SOL-USDT-SWAP__4H.json", end_ts=1645819200000)
+        instrument = self._build_custom_instrument(
+            inst_id="SOL-USDT-SWAP",
+            tick_size="0.01",
+            lot_size="0.01",
+            min_size="0.01",
+        )
+        client = DummyBacktestClient(candles, instrument)
+        config = StrategyConfig(
+            inst_id="SOL-USDT-SWAP",
+            bar="4H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=0,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("1"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_ID,
+            risk_amount=Decimal("10"),
+            take_profit_mode="dynamic",
+            max_entries_per_trend=1,
+            entry_reference_ema_period=21,
+            dynamic_two_r_break_even=True,
+            dynamic_fee_offset_enabled=True,
+        )
+
+        result = run_backtest(client, config, candle_limit=len(candles))
+        trade = next((item for item in result.trades if item.entry_ts == target_entry_ts), None)
+
+        self.assertIsNotNone(trade)
+        assert trade is not None
+        self.assertEqual(trade.signal, "short")
+        self.assertEqual(trade.entry_price, Decimal("89.33"))
+        self.assertEqual(trade.entry_fee_type, "taker")
+
+    def test_dynamic_backtest_long_gap_fill_regression_uses_next_candle_open_for_btc_4h(self) -> None:
+        target_entry_ts = 1634990400000  # 2021-10-23 20:00:00
+        candles = self._load_cached_candles("BTC-USDT-SWAP__4H.json", end_ts=1636560000000)
+        instrument = self._build_custom_instrument(
+            inst_id="BTC-USDT-SWAP",
+            tick_size="0.1",
+            lot_size="0.001",
+            min_size="0.001",
+        )
+        client = DummyBacktestClient(candles, instrument)
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="4H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=0,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("1.5"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_ID,
+            risk_amount=Decimal("10"),
+            take_profit_mode="dynamic",
+            max_entries_per_trend=1,
+            entry_reference_ema_period=21,
+            dynamic_two_r_break_even=True,
+            dynamic_fee_offset_enabled=True,
+        )
+
+        result = run_backtest(client, config, candle_limit=len(candles))
+        trade = next((item for item in result.trades if item.entry_ts == target_entry_ts), None)
+
+        self.assertIsNotNone(
+            trade,
+            msg=f"entries={[item.entry_ts for item in result.trades[:5]]}",
+        )
+        assert trade is not None
+        self.assertEqual(trade.signal, "long")
+        self.assertEqual(trade.entry_price, Decimal("61566.6"))
+        self.assertEqual(trade.entry_fee_type, "taker")
 
     def test_cross_backtest_generates_trade_and_report(self) -> None:
         warmup_candles = [
@@ -1167,6 +1491,38 @@ class BacktestTest(TestCase):
         trade = _try_close_position_same_candle_after_fill(position, candle, 10)
 
         self.assertIsNone(trade)
+
+    def test_same_candle_immediate_open_fill_uses_execution_path_price(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=10,
+            entry_ts=1710976500000,
+            entry_price=Decimal("95"),
+            entry_price_raw=Decimal("100"),
+            entry_path_price=Decimal("95"),
+            stop_loss=Decimal("94"),
+            take_profit=Decimal("110"),
+            initial_stop_loss=Decimal("94"),
+            initial_take_profit=Decimal("110"),
+            size=Decimal("1"),
+            tick_size=Decimal("0.1"),
+        )
+        candle = Candle(
+            1710977400000,
+            Decimal("95"),
+            Decimal("99"),
+            Decimal("94"),
+            Decimal("98"),
+            Decimal("1"),
+            True,
+        )
+
+        trade = _try_close_position_same_candle_after_fill(position, candle, 10)
+
+        self.assertIsNotNone(trade)
+        assert trade is not None
+        self.assertEqual(trade.exit_reason, "stop_loss")
+        self.assertEqual(trade.exit_price, Decimal("94"))
 
     def test_close_position_subtracts_maker_and_taker_fees_from_trade_pnl(self) -> None:
         position = _OpenPosition(

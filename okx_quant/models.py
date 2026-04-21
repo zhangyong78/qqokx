@@ -90,6 +90,8 @@ class StrategyConfig:
     entry_reference_ema_period: int = 55
     dynamic_two_r_break_even: bool = True
     dynamic_fee_offset_enabled: bool = True
+    time_stop_break_even_enabled: bool = True
+    time_stop_break_even_bars: int = 10
     backtest_profile_id: str = ""
     backtest_profile_name: str = ""
     backtest_profile_summary: str = ""
@@ -120,6 +122,12 @@ class StrategyConfig:
 
     def dynamic_fee_offset_enabled_label(self) -> str:
         return "\u5f00\u542f" if self.dynamic_fee_offset_enabled else "\u5173\u95ed"
+
+    def resolved_time_stop_break_even_bars(self) -> int:
+        return max(int(self.time_stop_break_even_bars), 0)
+
+    def time_stop_break_even_enabled_label(self) -> str:
+        return "\u5f00\u542f" if self.time_stop_break_even_enabled else "\u5173\u95ed"
 
 
 

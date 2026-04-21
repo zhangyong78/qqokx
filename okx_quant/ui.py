@@ -478,12 +478,37 @@ class StrategySession:
     stopped_at: datetime | None = None
     ended_reason: str = ""
     log_file_path: Path | None = None
+    stop_cleanup_in_progress: bool = False
 
     @property
     def log_prefix(self) -> str:
         if self.api_name:
             return f"[{self.api_name}] [{self.session_id} {self.strategy_name} {self.symbol}]"
         return f"[{self.session_id} {self.strategy_name} {self.symbol}]"
+
+
+@dataclass
+class StrategyStopCleanupSnapshot:
+    effective_environment: str
+    pending_orders: list[OkxTradeOrderItem]
+    order_history: list[OkxTradeOrderItem]
+    positions: list[OkxPosition]
+    environment_note: str | None = None
+
+
+@dataclass
+class StrategyStopCleanupResult:
+    session_id: str
+    effective_environment: str
+    environment_note: str | None = None
+    cancel_requested_summaries: tuple[str, ...] = ()
+    cancel_failed_summaries: tuple[str, ...] = ()
+    remaining_pending_summaries: tuple[str, ...] = ()
+    protective_pending_summaries: tuple[str, ...] = ()
+    filled_order_summaries: tuple[str, ...] = ()
+    open_position_summaries: tuple[str, ...] = ()
+    needs_manual_review: bool = False
+    final_reason: str = "用户手动停止"
 
 
 @dataclass
@@ -758,6 +783,8 @@ class QuantApp:
         self.max_entries_per_trend = StringVar(value="1")
         self.dynamic_two_r_break_even = BooleanVar(value=True)
         self.dynamic_fee_offset_enabled = BooleanVar(value=True)
+        self.time_stop_break_even_enabled = BooleanVar(value=True)
+        self.time_stop_break_even_bars = StringVar(value="10")
         self.run_mode_label = StringVar(value="交易并下单")
         self.trade_mode_label = StringVar(value="全仓 cross")
         self.position_mode_label = StringVar(value="净持仓 net")
@@ -765,6 +792,7 @@ class QuantApp:
         self.tp_sl_mode_label = StringVar(value="OKX 托管（仅同标的永续）")
         self.entry_side_mode_label = StringVar(value="跟随信号")
         self.symbol.trace_add("write", self._sync_trade_symbol_to_symbol)
+        self.time_stop_break_even_enabled.trace_add("write", lambda *_: self._sync_dynamic_take_profit_controls())
 
         self.notify_enabled = BooleanVar(value=False)
         self.smtp_host = StringVar()
@@ -1040,6 +1068,18 @@ class QuantApp:
             text="提示：保本位是否叠加手续费偏移，由下方开关决定；大部分组合开启更优，默认建议开启。",
         )
         self._dynamic_fee_offset_hint_label.grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
+
+        row += 1
+        self._time_stop_break_even_check = ttk.Checkbutton(
+            start_frame,
+            text="启用时间保本（持仓满指定K线且已达到净保本时，上移到保本位）",
+            variable=self.time_stop_break_even_enabled,
+        )
+        self._time_stop_break_even_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self._time_stop_break_even_bars_label = ttk.Label(start_frame, text="时间保本K线数")
+        self._time_stop_break_even_bars_label.grid(row=row, column=2, sticky="e", pady=(8, 0))
+        self._time_stop_break_even_bars_entry = ttk.Entry(start_frame, textvariable=self.time_stop_break_even_bars)
+        self._time_stop_break_even_bars_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row += 1
         ttk.Label(start_frame, text="运行模式").grid(row=row, column=0, sticky="w", pady=(12, 0))
@@ -5588,6 +5628,8 @@ class QuantApp:
                 max_entries_per_trend=self.max_entries_per_trend.get(),
                 dynamic_two_r_break_even=self.dynamic_two_r_break_even.get(),
                 dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get(),
+                time_stop_break_even_enabled=self.time_stop_break_even_enabled.get(),
+                time_stop_break_even_bars=self.time_stop_break_even_bars.get(),
                 signal_mode_label=self.signal_mode_label.get(),
                 trade_mode_label=self.trade_mode_label.get(),
                 position_mode_label=self.position_mode_label.get(),
@@ -6183,17 +6225,301 @@ class QuantApp:
         if session is None:
             messagebox.showinfo("提示", "请先在右侧选择一个策略会话。")
             return
+        if session.stop_cleanup_in_progress:
+            messagebox.showinfo("提示", "这个策略正在执行停止清理，请稍等。")
+            return
         if not session.engine.is_running:
             messagebox.showinfo("提示", "这个策略已经停止了。")
             return
 
+        credentials = self._credentials_for_profile_or_none(session.api_name)
         session.status = "停止中"
+        session.stop_cleanup_in_progress = True
         session.ended_reason = "用户手动停止"
         session.engine.stop()
         self._upsert_session_row(session)
         self._refresh_selected_session_details()
         self._sync_strategy_history_from_session(session)
-        self._log_session_message(session, "已请求停止。")
+        self._log_session_message(session, "已请求停止，正在检查本策略委托与持仓。")
+        if credentials is None:
+            session.stop_cleanup_in_progress = False
+            session.status = "已停止"
+            session.stopped_at = datetime.now()
+            session.ended_reason = "用户手动停止（未找到对应API凭证，未执行撤单检查）"
+            self._upsert_session_row(session)
+            self._refresh_selected_session_details()
+            self._sync_strategy_history_from_session(session)
+            self._log_session_message(session, "停止清理失败：未找到该会话对应的 API 凭证，请人工检查委托与仓位。")
+            messagebox.showwarning(
+                "停止提醒",
+                "策略线程已收到停止请求，但当前找不到该会话对应的 API 凭证。\n\n请人工检查：\n- 当前委托是否还有残留\n- 是否已经成交并留下仓位",
+            )
+            return
+        threading.Thread(
+            target=self._stop_session_cleanup_worker,
+            args=(session.session_id, credentials),
+            daemon=True,
+        ).start()
+
+    def _credentials_for_profile_or_none(self, profile_name: str) -> Credentials | None:
+        target = profile_name.strip() or self._current_credential_profile()
+        current_profile = self._current_credential_profile()
+        if target == current_profile:
+            current_credentials = self._current_credentials_or_none()
+            if current_credentials is not None:
+                return Credentials(
+                    api_key=current_credentials.api_key,
+                    secret_key=current_credentials.secret_key,
+                    passphrase=current_credentials.passphrase,
+                    profile_name=target,
+                )
+        snapshot = self._credential_profiles.get(target)
+        if not snapshot:
+            return None
+        api_key = str(snapshot.get("api_key", "")).strip()
+        secret_key = str(snapshot.get("secret_key", "")).strip()
+        passphrase = str(snapshot.get("passphrase", "")).strip()
+        if not api_key or not secret_key or not passphrase:
+            return None
+        return Credentials(
+            api_key=api_key,
+            secret_key=secret_key,
+            passphrase=passphrase,
+            profile_name=target,
+        )
+
+    def _load_strategy_stop_cleanup_snapshot(
+        self,
+        session: StrategySession,
+        credentials: Credentials,
+        environment: str,
+    ) -> StrategyStopCleanupSnapshot:
+        pending_orders = self.client.get_pending_orders(credentials, environment=environment, limit=200)
+        order_history = self.client.get_order_history(credentials, environment=environment, limit=200)
+        positions = self.client.get_positions(credentials, environment=environment)
+        return StrategyStopCleanupSnapshot(
+            effective_environment=environment,
+            pending_orders=pending_orders,
+            order_history=order_history,
+            positions=positions,
+        )
+
+    def _load_strategy_stop_cleanup_snapshot_with_fallback(
+        self,
+        session: StrategySession,
+        credentials: Credentials,
+    ) -> StrategyStopCleanupSnapshot:
+        environment = session.config.environment
+        try:
+            return self._load_strategy_stop_cleanup_snapshot(session, credentials, environment)
+        except Exception as exc:
+            message = str(exc)
+            if "50101" not in message or "current environment" not in message:
+                raise
+            alternate = "live" if environment == "demo" else "demo"
+            snapshot = self._load_strategy_stop_cleanup_snapshot(session, credentials, alternate)
+            snapshot.environment_note = f"停止检查自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境执行。"
+            return snapshot
+
+    def _perform_stop_session_cleanup(
+        self,
+        session: StrategySession,
+        credentials: Credentials,
+    ) -> StrategyStopCleanupResult:
+        initial_snapshot = self._load_strategy_stop_cleanup_snapshot_with_fallback(session, credentials)
+        effective_environment = initial_snapshot.effective_environment
+        initial_pending = [item for item in initial_snapshot.pending_orders if _trade_order_belongs_to_session(item, session)]
+        cancelable_pending = [
+            item for item in initial_pending if _trade_order_session_role(item, session) in {"ent", "exi"}
+        ]
+
+        cancel_requested_summaries: list[str] = []
+        cancel_failed_summaries: list[str] = []
+        for item in cancelable_pending:
+            try:
+                result = self._cancel_pending_order_request(credentials, environment=effective_environment, item=item)
+                cancel_requested_summaries.append(
+                    f"{_trade_order_cancel_summary(item)} | sCode={result.s_code} | sMsg={result.s_msg or 'accepted'}"
+                )
+            except Exception as exc:
+                cancel_failed_summaries.append(
+                    f"{_trade_order_cancel_summary(item)} | 原因={_format_network_error_message(str(exc))}"
+                )
+
+        final_snapshot = initial_snapshot
+        wait_rounds = 3 if cancelable_pending else 1
+        for attempt in range(wait_rounds):
+            if attempt > 0:
+                threading.Event().wait(0.6)
+            final_snapshot = self._load_strategy_stop_cleanup_snapshot(session, credentials, effective_environment)
+            remaining_cancelable = [
+                item
+                for item in final_snapshot.pending_orders
+                if _trade_order_session_role(item, session) in {"ent", "exi"}
+            ]
+            if not remaining_cancelable:
+                break
+
+        for _ in range(20):
+            if not session.engine.is_running:
+                break
+            threading.Event().wait(0.25)
+
+        remaining_cancelable = [
+            item
+            for item in final_snapshot.pending_orders
+            if _trade_order_session_role(item, session) in {"ent", "exi"}
+        ]
+        protective_pending = [
+            item
+            for item in final_snapshot.pending_orders
+            if _trade_order_session_role(item, session) == "slg"
+        ]
+        session_history = [item for item in final_snapshot.order_history if _trade_order_belongs_to_session(item, session)]
+        filled_orders = [
+            item
+            for item in session_history
+            if (item.filled_size or Decimal("0")) > 0 or (item.state or "").strip().lower() in {"filled", "partially_filled"}
+        ]
+        trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or "").strip().upper()
+        open_positions = [
+            position
+            for position in final_snapshot.positions
+            if position.inst_id.strip().upper() == trade_inst_id and position.position != 0
+        ]
+
+        needs_manual_review = bool(cancel_failed_summaries or remaining_cancelable)
+        if open_positions and (filled_orders or protective_pending):
+            needs_manual_review = True
+        if protective_pending and not open_positions:
+            needs_manual_review = True
+
+        final_reason_parts: list[str] = []
+        if cancel_failed_summaries or remaining_cancelable:
+            final_reason_parts.append("撤单未完全确认，需人工检查")
+        if open_positions and filled_orders:
+            final_reason_parts.append("检测到已成交仓位，需人工判断")
+        elif protective_pending:
+            final_reason_parts.append("检测到保护委托，需人工确认")
+        final_reason = "用户手动停止"
+        if final_reason_parts:
+            final_reason = f"用户手动停止（{'；'.join(final_reason_parts)}）"
+
+        return StrategyStopCleanupResult(
+            session_id=session.session_id,
+            effective_environment=effective_environment,
+            environment_note=initial_snapshot.environment_note,
+            cancel_requested_summaries=tuple(cancel_requested_summaries),
+            cancel_failed_summaries=tuple(cancel_failed_summaries),
+            remaining_pending_summaries=tuple(_trade_order_cancel_summary(item) for item in remaining_cancelable),
+            protective_pending_summaries=tuple(_trade_order_cancel_summary(item) for item in protective_pending),
+            filled_order_summaries=tuple(_trade_order_fill_summary(item) for item in filled_orders),
+            open_position_summaries=tuple(_position_manual_review_summary(item) for item in open_positions),
+            needs_manual_review=needs_manual_review,
+            final_reason=final_reason,
+        )
+
+    def _stop_session_cleanup_worker(self, session_id: str, credentials: Credentials) -> None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return
+        try:
+            result = self._perform_stop_session_cleanup(session, credentials)
+        except Exception as exc:
+            self.root.after(0, lambda: self._apply_stop_session_cleanup_error(session_id, str(exc)))
+            return
+        self.root.after(0, lambda: self._apply_stop_session_cleanup_result(result))
+
+    def _apply_stop_session_cleanup_result(self, result: StrategyStopCleanupResult) -> None:
+        session = self.sessions.get(result.session_id)
+        if session is None:
+            return
+        session.stop_cleanup_in_progress = False
+        session.status = "已停止"
+        if session.stopped_at is None:
+            session.stopped_at = datetime.now()
+        session.ended_reason = result.final_reason
+        self._upsert_session_row(session)
+        self._refresh_selected_session_details()
+        self._sync_strategy_history_from_session(session)
+
+        if result.environment_note:
+            self._log_session_message(session, result.environment_note)
+        if result.cancel_requested_summaries:
+            self._log_session_message(session, f"停止清理：已提交撤单 {len(result.cancel_requested_summaries)} 条。")
+            for summary in result.cancel_requested_summaries:
+                self._log_session_message(session, f"停止清理 | 已提交撤单 | {summary}")
+        else:
+            self._log_session_message(session, "停止清理：未发现需要自动撤销的程序挂单。")
+        for summary in result.cancel_failed_summaries:
+            self._log_session_message(session, f"停止清理 | 撤单失败 | {summary}")
+        for summary in result.remaining_pending_summaries:
+            self._log_session_message(session, f"停止清理 | 残留未撤委托 | {summary}")
+        for summary in result.filled_order_summaries:
+            self._log_session_message(session, f"停止清理 | 检测到已成交委托 | {summary}")
+        for summary in result.open_position_summaries:
+            self._log_session_message(session, f"停止清理 | 检测到仍有仓位 | {summary}")
+        for summary in result.protective_pending_summaries:
+            self._log_session_message(session, f"停止清理 | 检测到保护委托 | {summary}")
+        self._log_session_message(session, f"停止流程结束 | 结论={result.final_reason}")
+
+        if session.api_name.strip() == self._current_credential_profile():
+            self.refresh_positions()
+            self.refresh_order_views()
+
+        if result.needs_manual_review:
+            details: list[str] = ["策略已停止，但检测到需要人工接管的情况。"]
+            if result.cancel_failed_summaries or result.remaining_pending_summaries:
+                details.append("")
+                details.append("委托检查：")
+                details.append(
+                    f"- 撤单失败 {len(result.cancel_failed_summaries)} 条，残留未确认撤销 {len(result.remaining_pending_summaries)} 条"
+                )
+            if result.filled_order_summaries and result.open_position_summaries:
+                details.append("")
+                details.append("已成交且仍有仓位：")
+                for summary in result.open_position_summaries[:3]:
+                    details.append(f"- {summary}")
+            if result.protective_pending_summaries:
+                details.append("")
+                details.append("保护委托仍在交易所：")
+                for summary in result.protective_pending_summaries[:3]:
+                    details.append(f"- {summary}")
+            details.append("")
+            details.append("请人工检查“当前委托 / 账户持仓 / OKX 托管止损”，再决定是否保留、撤单或平仓。")
+            messagebox.showwarning("停止提醒", "\n".join(details))
+            return
+
+        messagebox.showinfo(
+            "停止结果",
+            (
+                "策略已停止。\n\n"
+                f"自动撤单：{len(result.cancel_requested_summaries)} 条\n"
+                "未发现残留仓位或需人工接管的问题。"
+            ),
+        )
+
+    def _apply_stop_session_cleanup_error(self, session_id: str, message: str) -> None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return
+        session.stop_cleanup_in_progress = False
+        session.status = "已停止"
+        if session.stopped_at is None:
+            session.stopped_at = datetime.now()
+        friendly_message = _format_network_error_message(message)
+        session.ended_reason = "用户手动停止（停止清理失败，需人工检查）"
+        self._upsert_session_row(session)
+        self._refresh_selected_session_details()
+        self._sync_strategy_history_from_session(session)
+        self._log_session_message(session, f"停止清理失败：{friendly_message}")
+        self._log_session_message(session, "请人工检查当前委托、历史委托与账户持仓。")
+        messagebox.showwarning(
+            "停止提醒",
+            "策略线程已收到停止请求，但停止清理阶段失败。\n\n"
+            f"原因：{friendly_message}\n\n"
+            "请人工检查：\n- 当前委托是否仍有残留\n- 是否已经成交并留下仓位\n- OKX 托管止损是否仍在",
+        )
 
     @staticmethod
     def _session_can_be_cleared(session: StrategySession) -> bool:
@@ -6739,6 +7065,9 @@ class QuantApp:
             self._dynamic_two_r_break_even_check.grid()
             self._dynamic_fee_offset_check.grid()
             self._dynamic_fee_offset_hint_label.grid()
+            self._time_stop_break_even_check.grid()
+            self._time_stop_break_even_bars_label.grid()
+            self._time_stop_break_even_bars_entry.grid()
             self._entry_reference_ema_label.grid()
             self._entry_reference_ema_entry.grid()
         else:
@@ -6749,6 +7078,9 @@ class QuantApp:
             self._dynamic_two_r_break_even_check.grid_remove()
             self._dynamic_fee_offset_check.grid_remove()
             self._dynamic_fee_offset_hint_label.grid_remove()
+            self._time_stop_break_even_check.grid_remove()
+            self._time_stop_break_even_bars_label.grid_remove()
+            self._time_stop_break_even_bars_entry.grid_remove()
             self._entry_reference_ema_label.grid_remove()
             self._entry_reference_ema_entry.grid_remove()
             if is_spot_enhancement_strategy_id(definition.strategy_id):
@@ -6802,6 +7134,11 @@ class QuantApp:
         )
         self._dynamic_two_r_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self._dynamic_fee_offset_check.configure(state="normal" if dynamic_take_profit else "disabled")
+        self._time_stop_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
+        self._time_stop_break_even_bars_label.configure(state="normal" if dynamic_take_profit else "disabled")
+        self._time_stop_break_even_bars_entry.configure(
+            state="normal" if dynamic_take_profit and self.time_stop_break_even_enabled.get() else "disabled"
+        )
 
     def _selected_strategy_definition(self) -> StrategyDefinition:
         strategy_id = self._strategy_name_to_id[self.strategy_name.get()]
@@ -6853,6 +7190,9 @@ class QuantApp:
             if config.take_profit_mode == "dynamic":
                 lines.append(f"2R保本开关：{config.dynamic_two_r_break_even_label()}")
                 lines.append(f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}")
+                lines.append(
+                    f"时间保本：{config.time_stop_break_even_enabled_label()} / {config.resolved_time_stop_break_even_bars()}根"
+                )
         if self._strategy_uses_big_ema(definition.strategy_id):
             lines.append(f"EMA大周期：{config.big_ema_period}")
         lines.extend(
@@ -6987,6 +7327,14 @@ class QuantApp:
             dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get()
             if is_dynamic_strategy_id(definition.strategy_id)
             else False,
+            time_stop_break_even_enabled=self.time_stop_break_even_enabled.get()
+            if is_dynamic_strategy_id(definition.strategy_id)
+            else False,
+            time_stop_break_even_bars=(
+                self._parse_positive_int(self.time_stop_break_even_bars.get(), "时间保本K线数")
+                if is_dynamic_strategy_id(definition.strategy_id) and self.time_stop_break_even_enabled.get()
+                else 0
+            ),
         )
         return credentials, config
 
@@ -7266,6 +7614,11 @@ class QuantApp:
             if self._snapshot_text(snapshot, "take_profit_mode", "dynamic") == "dynamic":
                 lines.append(f"2R保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}")
                 lines.append(f"手续费偏移开关：{self._bool_label(snapshot.get('dynamic_fee_offset_enabled', True))}")
+                lines.append(
+                    "时间保本："
+                    f"{self._bool_label(snapshot.get('time_stop_break_even_enabled', True))} / "
+                    f"{self._snapshot_text(snapshot, 'time_stop_break_even_bars', '10')}根"
+                )
         if self._strategy_uses_big_ema(strategy_id):
             lines.append(f"EMA大周期：{self._snapshot_int(snapshot, 'big_ema_period') or '-'}")
         lines.extend(
@@ -7925,6 +8278,8 @@ class QuantApp:
                     if session.ended_reason == "应用关闭":
                         session.ended_reason = ""
                 running_count += 1
+            elif session.stop_cleanup_in_progress:
+                session.status = "停止中"
             elif session.status in {"运行中", "停止中"}:
                 session.status = "已停止"
                 if session.stopped_at is None:
@@ -9503,6 +9858,60 @@ def _trade_order_program_owner_label(item: OkxTradeOrderItem) -> str | None:
         if ENGINE_CL_ORD_ID_PATTERN.fullmatch(candidate):
             return "策略引擎"
     return None
+
+
+def _session_order_prefixes(session: StrategySession) -> tuple[str, ...]:
+    session_token = "".join(ch for ch in session.session_id.lower() if ch.isascii() and ch.isalnum())[:4] or "sess"
+    if is_spot_enhancement_strategy_id(session.strategy_id):
+        return (f"{session_token}spot",)
+    strategy_token = "".join(ch for ch in session.strategy_name.lower() if ch.isascii() and ch.isalnum())[:4] or "stg"
+    return (f"{session_token}{strategy_token}",)
+
+
+def _trade_order_session_role(item: OkxTradeOrderItem, session: StrategySession) -> str | None:
+    prefixes = _session_order_prefixes(session)
+    candidates = [
+        (item.client_order_id or "").strip().lower(),
+        (item.algo_client_order_id or "").strip().lower(),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        for prefix in prefixes:
+            if not candidate.startswith(prefix):
+                continue
+            role = candidate[len(prefix): len(prefix) + 3]
+            if role in {"ent", "exi", "slg"}:
+                return role
+    return None
+
+
+def _trade_order_belongs_to_session(item: OkxTradeOrderItem, session: StrategySession) -> bool:
+    return _trade_order_session_role(item, session) is not None
+
+
+def _trade_order_cancel_summary(item: OkxTradeOrderItem) -> str:
+    cancel_id = _trade_order_cancel_reference(item) or "-"
+    return (
+        f"{item.source_label or '委托'} | 合约={item.inst_id or '-'} | "
+        f"方向={_format_history_side(item.side, item.pos_side)} | 标识={cancel_id}"
+    )
+
+
+def _trade_order_fill_summary(item: OkxTradeOrderItem) -> str:
+    return (
+        f"{item.source_label or '委托'} | 合约={item.inst_id or '-'} | "
+        f"状态={_format_trade_order_state(item.state)} | "
+        f"方向={_format_history_side(item.side, item.pos_side)} | "
+        f"成交量={_format_trade_order_size(item.filled_size)} | "
+        f"均价={_format_trade_order_price(item.avg_price or item.price, item.inst_id, item.inst_type)}"
+    )
+
+
+def _position_manual_review_summary(position: OkxPosition) -> str:
+    side = position.pos_side or "net"
+    avg_price = _format_optional_decimal(position.avg_price)
+    return f"{position.inst_id} [{side}] | 持仓量={format_decimal(position.position)} | 开仓均价={avg_price}"
 
 
 def _build_trade_order_detail_text(item: OkxTradeOrderItem) -> str:
