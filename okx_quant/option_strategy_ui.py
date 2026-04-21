@@ -40,7 +40,11 @@ from okx_quant.option_strategy import (
     parse_option_expiry_datetime,
     resolve_strategy_leg,
 )
-from okx_quant.persistence import load_option_strategies_snapshot, save_option_strategies_snapshot
+from okx_quant.persistence import (
+    deribit_volatility_cache_file_path,
+    load_option_strategies_snapshot,
+    save_option_strategies_snapshot,
+)
 from okx_quant.pricing import decimal_places_for_increment, format_decimal, format_decimal_by_increment, format_decimal_fixed
 from okx_quant.window_layout import apply_adaptive_window_geometry
 
@@ -49,7 +53,6 @@ Logger = Callable[[str], None]
 BAR_OPTIONS = ["1m", "3m", "5m", "15m", "1H", "4H"]
 DEFAULT_OPTION_FAMILY_OPTIONS = ("BTC-USD", "ETH-USD")
 MAX_OPTION_COMBO_CANDLES = 2000
-DERIBIT_VOLATILITY_CACHE_FILE_NAME = ".okx_quant_deribit_volatility_cache.json"
 DERIBIT_OPTION_CHART_BAR_TO_RESOLUTION = {
     "1m": "3600",
     "3m": "3600",
@@ -3534,7 +3537,7 @@ def _format_chart_ts(ts: int) -> str:
 
 
 def _option_strategy_deribit_cache_file_path() -> Path:
-    return Path(__file__).resolve().parent.parent / DERIBIT_VOLATILITY_CACHE_FILE_NAME
+    return deribit_volatility_cache_file_path()
 
 
 def _load_deribit_option_chart_cache_payload() -> dict:

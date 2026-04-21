@@ -5,7 +5,7 @@ import os
 import queue
 import re
 import threading
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import MISSING, dataclass, field, fields as dataclass_fields
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -21,6 +21,7 @@ from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.engine import StrategyEngine, fetch_hourly_ema_debug, format_hourly_debug
 from okx_quant.enhanced_live_engine import (
     EnhancedStrategyEngine,
+    build_live_report_artifact_paths,
     derive_spot_signal_inst_id,
     derive_swap_trade_inst_id,
     is_spot_enhancement_strategy_id,
@@ -49,9 +50,11 @@ from okx_quant.okx_client import (
 from okx_quant.persistence import (
     credentials_file_path,
     DEFAULT_CREDENTIAL_PROFILE_NAME,
+    load_recoverable_strategy_sessions_snapshot,
     load_credentials_profiles_snapshot,
     load_notification_snapshot,
     load_strategy_history_snapshot,
+    save_recoverable_strategy_sessions_snapshot,
     save_credentials_profiles_snapshot,
     save_notification_snapshot,
     save_strategy_history_snapshot,
@@ -483,7 +486,7 @@ class StrategySession:
     symbol: str
     direction_label: str
     run_mode_label: str
-    engine: StrategyEngine
+    engine: StrategyEngine | EnhancedStrategyEngine
     config: StrategyConfig
     started_at: datetime
     status: str = "运行中"
@@ -494,6 +497,8 @@ class StrategySession:
     stop_cleanup_in_progress: bool = False
     runtime_status: str = "启动中"
     last_message: str = ""
+    recovery_root_dir: Path | None = None
+    recovery_supported: bool = False
 
     @property
     def log_prefix(self) -> str:
@@ -551,6 +556,23 @@ class StrategyHistoryRecord:
     config_snapshot: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass
+class RecoverableStrategySessionRecord:
+    session_id: str
+    api_name: str
+    strategy_id: str
+    strategy_name: str
+    symbol: str
+    direction_label: str
+    run_mode_label: str
+    started_at: datetime
+    history_record_id: str = ""
+    log_file_path: Path | None = None
+    recovery_root_dir: Path | None = None
+    config_snapshot: dict[str, object] = field(default_factory=dict)
+    updated_at: datetime | None = None
+
+
 def _serialize_strategy_config_snapshot(config: StrategyConfig) -> dict[str, object]:
     snapshot: dict[str, object] = {}
     for item in dataclass_fields(StrategyConfig):
@@ -560,6 +582,210 @@ def _serialize_strategy_config_snapshot(config: StrategyConfig) -> dict[str, obj
         else:
             snapshot[item.name] = value
     return snapshot
+
+
+def _strategy_config_default(field_name: str) -> object:
+    for item in dataclass_fields(StrategyConfig):
+        if item.name != field_name:
+            continue
+        if item.default is not MISSING:
+            return item.default
+        if item.default_factory is not MISSING:
+            return item.default_factory()
+        break
+    raise KeyError(field_name)
+
+
+def _coerce_snapshot_decimal(value: object, default: Decimal) -> Decimal:
+    raw = str(value or "").strip()
+    if not raw:
+        return default
+    try:
+        return Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return default
+
+
+def _coerce_snapshot_optional_decimal(value: object) -> Decimal | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _coerce_snapshot_int(value: object, default: int, *, minimum: int | None = None) -> int:
+    try:
+        parsed = int(float(str(value)))
+    except (TypeError, ValueError):
+        parsed = default
+    if minimum is not None:
+        parsed = max(parsed, minimum)
+    return parsed
+
+
+def _coerce_snapshot_float(value: object, default: float, *, minimum: float | None = None) -> float:
+    try:
+        parsed = float(str(value))
+    except (TypeError, ValueError):
+        parsed = default
+    if minimum is not None:
+        parsed = max(parsed, minimum)
+    return parsed
+
+
+def _coerce_snapshot_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    raw = str(value).strip().lower()
+    if raw in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if raw in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
+def _coerce_snapshot_text(value: object, default: str = "") -> str:
+    raw = str(value or "").strip()
+    return raw or default
+
+
+def _coerce_snapshot_optional_text(value: object) -> str | None:
+    raw = str(value or "").strip()
+    return raw or None
+
+
+def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | None:
+    if not isinstance(payload, dict):
+        return None
+    inst_id = _coerce_snapshot_text(payload.get("inst_id"))
+    bar = _coerce_snapshot_text(payload.get("bar"))
+    if not inst_id or not bar:
+        return None
+    return StrategyConfig(
+        inst_id=inst_id,
+        bar=bar,
+        ema_period=_coerce_snapshot_int(payload.get("ema_period"), 21, minimum=1),
+        atr_period=_coerce_snapshot_int(payload.get("atr_period"), 10, minimum=1),
+        atr_stop_multiplier=_coerce_snapshot_decimal(payload.get("atr_stop_multiplier"), Decimal("2")),
+        atr_take_multiplier=_coerce_snapshot_decimal(payload.get("atr_take_multiplier"), Decimal("4")),
+        order_size=_coerce_snapshot_decimal(payload.get("order_size"), Decimal("1")),
+        trade_mode=_coerce_snapshot_text(payload.get("trade_mode"), "cross"),
+        signal_mode=_coerce_snapshot_text(payload.get("signal_mode"), "both"),
+        position_mode=_coerce_snapshot_text(payload.get("position_mode"), "net"),
+        environment=_coerce_snapshot_text(payload.get("environment"), "demo"),
+        tp_sl_trigger_type=_coerce_snapshot_text(payload.get("tp_sl_trigger_type"), "mark"),
+        trend_ema_period=_coerce_snapshot_int(
+            payload.get("trend_ema_period"),
+            int(_strategy_config_default("trend_ema_period")),
+            minimum=1,
+        ),
+        big_ema_period=_coerce_snapshot_int(
+            payload.get("big_ema_period"),
+            int(_strategy_config_default("big_ema_period")),
+            minimum=1,
+        ),
+        strategy_id=_coerce_snapshot_text(
+            payload.get("strategy_id"),
+            str(_strategy_config_default("strategy_id")),
+        ),
+        poll_seconds=_coerce_snapshot_float(
+            payload.get("poll_seconds"),
+            float(_strategy_config_default("poll_seconds")),
+            minimum=0.2,
+        ),
+        risk_amount=_coerce_snapshot_optional_decimal(payload.get("risk_amount")),
+        trade_inst_id=_coerce_snapshot_optional_text(payload.get("trade_inst_id")),
+        tp_sl_mode=_coerce_snapshot_text(
+            payload.get("tp_sl_mode"),
+            str(_strategy_config_default("tp_sl_mode")),
+        ),
+        local_tp_sl_inst_id=_coerce_snapshot_optional_text(payload.get("local_tp_sl_inst_id")),
+        entry_side_mode=_coerce_snapshot_text(
+            payload.get("entry_side_mode"),
+            str(_strategy_config_default("entry_side_mode")),
+        ),
+        run_mode=_coerce_snapshot_text(
+            payload.get("run_mode"),
+            str(_strategy_config_default("run_mode")),
+        ),
+        backtest_initial_capital=_coerce_snapshot_decimal(
+            payload.get("backtest_initial_capital"),
+            Decimal(str(_strategy_config_default("backtest_initial_capital"))),
+        ),
+        backtest_sizing_mode=_coerce_snapshot_text(
+            payload.get("backtest_sizing_mode"),
+            str(_strategy_config_default("backtest_sizing_mode")),
+        ),
+        backtest_risk_percent=_coerce_snapshot_optional_decimal(payload.get("backtest_risk_percent")),
+        backtest_compounding=_coerce_snapshot_bool(
+            payload.get("backtest_compounding"),
+            bool(_strategy_config_default("backtest_compounding")),
+        ),
+        backtest_entry_slippage_rate=_coerce_snapshot_decimal(
+            payload.get("backtest_entry_slippage_rate"),
+            Decimal(str(_strategy_config_default("backtest_entry_slippage_rate"))),
+        ),
+        backtest_exit_slippage_rate=_coerce_snapshot_decimal(
+            payload.get("backtest_exit_slippage_rate"),
+            Decimal(str(_strategy_config_default("backtest_exit_slippage_rate"))),
+        ),
+        backtest_slippage_rate=_coerce_snapshot_decimal(
+            payload.get("backtest_slippage_rate"),
+            Decimal(str(_strategy_config_default("backtest_slippage_rate"))),
+        ),
+        backtest_funding_rate=_coerce_snapshot_decimal(
+            payload.get("backtest_funding_rate"),
+            Decimal(str(_strategy_config_default("backtest_funding_rate"))),
+        ),
+        take_profit_mode=_coerce_snapshot_text(
+            payload.get("take_profit_mode"),
+            str(_strategy_config_default("take_profit_mode")),
+        ),
+        max_entries_per_trend=_coerce_snapshot_int(
+            payload.get("max_entries_per_trend"),
+            int(_strategy_config_default("max_entries_per_trend")),
+            minimum=1,
+        ),
+        entry_reference_ema_period=_coerce_snapshot_int(
+            payload.get("entry_reference_ema_period"),
+            int(_strategy_config_default("entry_reference_ema_period")),
+            minimum=1,
+        ),
+        dynamic_two_r_break_even=_coerce_snapshot_bool(
+            payload.get("dynamic_two_r_break_even"),
+            bool(_strategy_config_default("dynamic_two_r_break_even")),
+        ),
+        dynamic_fee_offset_enabled=_coerce_snapshot_bool(
+            payload.get("dynamic_fee_offset_enabled"),
+            bool(_strategy_config_default("dynamic_fee_offset_enabled")),
+        ),
+        time_stop_break_even_enabled=_coerce_snapshot_bool(
+            payload.get("time_stop_break_even_enabled"),
+            bool(_strategy_config_default("time_stop_break_even_enabled")),
+        ),
+        time_stop_break_even_bars=_coerce_snapshot_int(
+            payload.get("time_stop_break_even_bars"),
+            int(_strategy_config_default("time_stop_break_even_bars")),
+            minimum=0,
+        ),
+        backtest_profile_id=_coerce_snapshot_text(
+            payload.get("backtest_profile_id"),
+            str(_strategy_config_default("backtest_profile_id")),
+        ),
+        backtest_profile_name=_coerce_snapshot_text(
+            payload.get("backtest_profile_name"),
+            str(_strategy_config_default("backtest_profile_name")),
+        ),
+        backtest_profile_summary=_coerce_snapshot_text(
+            payload.get("backtest_profile_summary"),
+            str(_strategy_config_default("backtest_profile_summary")),
+        ),
+    )
 
 
 def _parse_datetime_snapshot(value: object) -> datetime | None:
@@ -651,6 +877,7 @@ class QuantApp:
         self.sessions: dict[str, StrategySession] = {}
         self._strategy_history_records: list[StrategyHistoryRecord] = []
         self._strategy_history_by_id: dict[str, StrategyHistoryRecord] = {}
+        self._recoverable_strategy_sessions: dict[str, RecoverableStrategySessionRecord] = {}
         self._strategy_log_write_failures: set[str] = set()
         self._session_counter = 0
         self._settings_window: Toplevel | None = None
@@ -956,9 +1183,11 @@ class QuantApp:
 
         self._load_saved_credentials()
         self._load_saved_notification_settings()
+        self._load_recoverable_strategy_sessions_registry()
         self._load_strategy_history()
         self._build_menu()
         self._build_layout()
+        self._hydrate_recoverable_strategy_sessions()
         self._refresh_all_refresh_badges()
         self._apply_initial_detail_visibility()
         self._bind_auto_save()
@@ -967,6 +1196,7 @@ class QuantApp:
         self.root.after_idle(self._apply_initial_pane_layout)
         self.root.after(250, self._drain_log_queue)
         self.root.after(500, self._refresh_status)
+        self.root.after(900, self._attempt_auto_restore_recoverable_sessions)
         self.root.after(1200, self._refresh_positions_periodic)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1314,11 +1544,16 @@ class QuantApp:
         control_row = ttk.Frame(running_frame)
         control_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Button(control_row, text="停止选中策略", command=self.stop_selected_session).grid(row=0, column=0)
+        ttk.Button(control_row, text="恢复选中策略", command=self.recover_selected_session).grid(
+            row=0,
+            column=1,
+            padx=(8, 0),
+        )
         ttk.Button(control_row, text="清空已停止", command=self.clear_stopped_sessions).grid(
-            row=0, column=1, padx=(8, 0)
+            row=0, column=2, padx=(8, 0)
         )
         ttk.Button(control_row, text="历史策略", command=self.open_strategy_history_window).grid(
-            row=0, column=2, padx=(8, 0)
+            row=0, column=3, padx=(8, 0)
         )
 
         detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)
@@ -6282,29 +6517,23 @@ class QuantApp:
                 symbol=session_symbol,
                 api_name=api_name,
             ).resolve()
-            session_logger = self._make_session_logger(
-                session_id,
-                definition.name,
-                session_symbol,
-                api_name,
-                session_log_path,
+            recovery_root_dir: Path | None = None
+            recovery_supported = is_spot_enhancement_strategy_id(definition.strategy_id)
+            if recovery_supported:
+                recovery_root_dir = build_live_report_artifact_paths(
+                    started_at=session_started_at,
+                    session_id=session_id,
+                    trade_inst_id=derive_swap_trade_inst_id(config.trade_inst_id or config.inst_id),
+                ).root_dir
+            engine = self._create_session_engine(
+                strategy_id=definition.strategy_id,
+                strategy_name=definition.name,
+                session_id=session_id,
+                symbol=session_symbol,
+                api_name=api_name,
+                log_file_path=session_log_path,
+                notifier=notifier,
             )
-            if is_spot_enhancement_strategy_id(definition.strategy_id):
-                engine = EnhancedStrategyEngine(
-                    self.client,
-                    session_logger,
-                    notifier=notifier,
-                    strategy_name=definition.name,
-                    session_id=session_id,
-                )
-            else:
-                engine = StrategyEngine(
-                    self.client,
-                    session_logger,
-                    notifier=notifier,
-                    strategy_name=definition.name,
-                    session_id=session_id,
-                )
             session = StrategySession(
                 session_id=session_id,
                 api_name=api_name,
@@ -6317,18 +6546,29 @@ class QuantApp:
                 config=config,
                 started_at=session_started_at,
                 log_file_path=session_log_path,
+                recovery_root_dir=recovery_root_dir,
+                recovery_supported=recovery_supported,
             )
 
             self.sessions[session_id] = session
             self._upsert_session_row(session)
             try:
-                engine.start(credentials, config)
+                if recovery_supported and isinstance(engine, EnhancedStrategyEngine):
+                    engine.start_with_context(
+                        credentials,
+                        config,
+                        started_at=session_started_at,
+                        recovery_root_dir=recovery_root_dir,
+                    )
+                else:
+                    engine.start(credentials, config)
             except Exception:
                 self.sessions.pop(session_id, None)
                 if self.session_tree.exists(session_id):
                     self.session_tree.delete(session_id)
                 raise
             self._record_strategy_session_started(session)
+            self._upsert_recoverable_strategy_session(session)
             self.session_tree.selection_set(session_id)
             self.session_tree.focus(session_id)
             self._refresh_selected_session_details()
@@ -6362,6 +6602,7 @@ class QuantApp:
             session.status = "已停止"
             session.stopped_at = datetime.now()
             session.ended_reason = "用户手动停止（未找到对应API凭证，未执行撤单检查）"
+            self._remove_recoverable_strategy_session(session.session_id)
             self._upsert_session_row(session)
             self._refresh_selected_session_details()
             self._sync_strategy_history_from_session(session)
@@ -6555,6 +6796,7 @@ class QuantApp:
         if session.stopped_at is None:
             session.stopped_at = datetime.now()
         session.ended_reason = result.final_reason
+        self._remove_recoverable_strategy_session(session.session_id)
         self._upsert_session_row(session)
         self._refresh_selected_session_details()
         self._sync_strategy_history_from_session(session)
@@ -6625,6 +6867,7 @@ class QuantApp:
             session.stopped_at = datetime.now()
         friendly_message = _format_network_error_message(message)
         session.ended_reason = "用户手动停止（停止清理失败，需人工检查）"
+        self._remove_recoverable_strategy_session(session.session_id)
         self._upsert_session_row(session)
         self._refresh_selected_session_details()
         self._sync_strategy_history_from_session(session)
@@ -7582,9 +7825,46 @@ class QuantApp:
 
         return _logger
 
+    def _create_session_engine(
+        self,
+        *,
+        strategy_id: str,
+        strategy_name: str,
+        session_id: str,
+        symbol: str,
+        api_name: str,
+        log_file_path: Path | None,
+        notifier: EmailNotifier | None,
+    ) -> StrategyEngine | EnhancedStrategyEngine:
+        session_logger = self._make_session_logger(
+            session_id,
+            strategy_name,
+            symbol,
+            api_name,
+            log_file_path,
+        )
+        if is_spot_enhancement_strategy_id(strategy_id):
+            return EnhancedStrategyEngine(
+                self.client,
+                session_logger,
+                notifier=notifier,
+                strategy_name=strategy_name,
+                session_id=session_id,
+            )
+        return StrategyEngine(
+            self.client,
+            session_logger,
+            notifier=notifier,
+            strategy_name=strategy_name,
+            session_id=session_id,
+        )
+
     def _next_session_id(self) -> str:
-        self._session_counter += 1
-        return f"S{self._session_counter:02d}"
+        while True:
+            self._session_counter += 1
+            session_id = f"S{self._session_counter:02d}"
+            if session_id not in self.sessions:
+                return session_id
 
     def _record_session_runtime_message(self, session_id: str, message: str) -> None:
         session = self.sessions.get(session_id)
@@ -7789,6 +8069,251 @@ class QuantApp:
         )
         return "\n".join(lines)
 
+    def _recoverable_strategy_record_from_payload(
+        self,
+        payload: dict[str, object],
+    ) -> RecoverableStrategySessionRecord | None:
+        started_at = _parse_datetime_snapshot(payload.get("started_at"))
+        if started_at is None:
+            return None
+        recovery_root_dir = _coerce_log_file_path(payload.get("recovery_root_dir"))
+        if recovery_root_dir is None:
+            return None
+        config_snapshot = payload.get("config_snapshot")
+        return RecoverableStrategySessionRecord(
+            session_id=str(payload.get("session_id", "")).strip(),
+            api_name=str(payload.get("api_name", "")).strip(),
+            strategy_id=str(payload.get("strategy_id", "")).strip(),
+            strategy_name=str(payload.get("strategy_name", "")).strip(),
+            symbol=str(payload.get("symbol", "")).strip(),
+            direction_label=str(payload.get("direction_label", "")).strip(),
+            run_mode_label=str(payload.get("run_mode_label", "")).strip(),
+            started_at=started_at,
+            history_record_id=str(payload.get("history_record_id", "")).strip(),
+            log_file_path=_coerce_log_file_path(payload.get("log_file_path")),
+            recovery_root_dir=recovery_root_dir,
+            config_snapshot=dict(config_snapshot) if isinstance(config_snapshot, dict) else {},
+            updated_at=_parse_datetime_snapshot(payload.get("updated_at")),
+        )
+
+    @staticmethod
+    def _recoverable_strategy_record_payload(record: RecoverableStrategySessionRecord) -> dict[str, object]:
+        return {
+            "session_id": record.session_id,
+            "api_name": record.api_name,
+            "strategy_id": record.strategy_id,
+            "strategy_name": record.strategy_name,
+            "symbol": record.symbol,
+            "direction_label": record.direction_label,
+            "run_mode_label": record.run_mode_label,
+            "started_at": record.started_at.isoformat(timespec="seconds"),
+            "history_record_id": record.history_record_id,
+            "log_file_path": str(record.log_file_path) if record.log_file_path is not None else "",
+            "recovery_root_dir": str(record.recovery_root_dir) if record.recovery_root_dir is not None else "",
+            "config_snapshot": dict(record.config_snapshot),
+            "updated_at": record.updated_at.isoformat(timespec="seconds") if record.updated_at is not None else None,
+        }
+
+    def _load_recoverable_strategy_sessions_registry(self) -> None:
+        try:
+            snapshot = load_recoverable_strategy_sessions_snapshot()
+        except Exception as exc:
+            self._enqueue_log(f"读取可恢复策略会话失败：{exc}")
+            return
+        records: dict[str, RecoverableStrategySessionRecord] = {}
+        raw_sessions = snapshot.get("sessions", [])
+        if isinstance(raw_sessions, list):
+            for item in raw_sessions:
+                if not isinstance(item, dict):
+                    continue
+                record = self._recoverable_strategy_record_from_payload(item)
+                if record is None or not record.session_id:
+                    continue
+                records[record.session_id] = record
+        self._recoverable_strategy_sessions = records
+
+    def _save_recoverable_strategy_sessions_registry(self) -> None:
+        records = sorted(
+            self._recoverable_strategy_sessions.values(),
+            key=lambda item: (item.started_at.isoformat(timespec="seconds"), item.session_id),
+            reverse=True,
+        )
+        try:
+            save_recoverable_strategy_sessions_snapshot(
+                [self._recoverable_strategy_record_payload(item) for item in records]
+            )
+        except Exception as exc:
+            self._enqueue_log(f"保存可恢复策略会话失败：{exc}")
+
+    def _build_recoverable_strategy_session_record(
+        self,
+        session: StrategySession,
+    ) -> RecoverableStrategySessionRecord | None:
+        if not session.recovery_supported or session.recovery_root_dir is None:
+            return None
+        return RecoverableStrategySessionRecord(
+            session_id=session.session_id,
+            api_name=session.api_name,
+            strategy_id=session.strategy_id,
+            strategy_name=session.strategy_name,
+            symbol=session.symbol,
+            direction_label=session.direction_label,
+            run_mode_label=session.run_mode_label,
+            started_at=session.started_at,
+            history_record_id=session.history_record_id or "",
+            log_file_path=session.log_file_path,
+            recovery_root_dir=session.recovery_root_dir,
+            config_snapshot=_serialize_strategy_config_snapshot(session.config),
+            updated_at=datetime.now(),
+        )
+
+    def _upsert_recoverable_strategy_session(self, session: StrategySession) -> None:
+        record = self._build_recoverable_strategy_session_record(session)
+        if record is None:
+            return
+        self._recoverable_strategy_sessions[record.session_id] = record
+        self._save_recoverable_strategy_sessions_registry()
+
+    def _remove_recoverable_strategy_session(self, session_id: str) -> None:
+        if self._recoverable_strategy_sessions.pop(session_id, None) is None:
+            return
+        self._save_recoverable_strategy_sessions_registry()
+
+    def _hydrate_recoverable_strategy_sessions(self) -> None:
+        restored_count = 0
+        records = sorted(
+            self._recoverable_strategy_sessions.values(),
+            key=lambda item: (item.started_at.isoformat(timespec="seconds"), item.session_id),
+        )
+        for record in records:
+            if not is_spot_enhancement_strategy_id(record.strategy_id):
+                continue
+            if record.session_id in self.sessions:
+                continue
+            config = _deserialize_strategy_config_snapshot(record.config_snapshot)
+            if config is None:
+                self._enqueue_log(f"[{record.session_id}] 可恢复会话缺少有效配置快照，已跳过。")
+                continue
+            engine = self._create_session_engine(
+                strategy_id=record.strategy_id,
+                strategy_name=record.strategy_name,
+                session_id=record.session_id,
+                symbol=record.symbol,
+                api_name=record.api_name,
+                log_file_path=record.log_file_path,
+                notifier=None,
+            )
+            history_record = (
+                self._strategy_history_by_id.get(record.history_record_id)
+                if record.history_record_id
+                else None
+            )
+            if history_record is not None and history_record.status != "待恢复":
+                self._remove_recoverable_strategy_session(record.session_id)
+                continue
+            session = StrategySession(
+                session_id=record.session_id,
+                api_name=record.api_name,
+                strategy_id=record.strategy_id,
+                strategy_name=record.strategy_name,
+                symbol=record.symbol,
+                direction_label=record.direction_label,
+                run_mode_label=record.run_mode_label,
+                engine=engine,
+                config=config,
+                started_at=record.started_at,
+                status="待恢复",
+                history_record_id=record.history_record_id or None,
+                stopped_at=history_record.stopped_at if history_record is not None else record.updated_at,
+                ended_reason="应用关闭后待恢复接管",
+                log_file_path=record.log_file_path,
+                runtime_status="待恢复",
+                recovery_root_dir=record.recovery_root_dir,
+                recovery_supported=True,
+            )
+            self.sessions[session.session_id] = session
+            self._upsert_session_row(session)
+            restored_count += 1
+        if restored_count:
+            self._enqueue_log(f"已加载 {restored_count} 条待恢复策略会话。")
+
+    def _attempt_auto_restore_recoverable_sessions(self) -> None:
+        pending_ids = [
+            session.session_id
+            for session in self.sessions.values()
+            if session.recovery_supported and session.status == "待恢复"
+        ]
+        for session_id in pending_ids:
+            self._recover_session(session_id, auto=True)
+
+    def recover_selected_session(self) -> None:
+        session = self._selected_session()
+        if session is None:
+            messagebox.showinfo("提示", "请先在右侧选择一个待恢复策略。")
+            return
+        if not session.recovery_supported:
+            messagebox.showinfo("提示", "当前选中策略不支持恢复接管。")
+            return
+        if session.status not in {"待恢复", "恢复中"}:
+            messagebox.showinfo("提示", "当前选中策略不是待恢复状态。")
+            return
+        self._recover_session(session.session_id, auto=False)
+
+    def _recover_session(self, session_id: str, *, auto: bool) -> bool:
+        session = self.sessions.get(session_id)
+        if session is None or not session.recovery_supported:
+            return False
+        if session.engine.is_running:
+            return True
+        credentials = self._credentials_for_profile_or_none(session.api_name)
+        if credentials is None:
+            if auto:
+                self._enqueue_log(f"[{session.session_id}] 未找到恢复所需的 API 凭证，保持待恢复。")
+            if not auto:
+                messagebox.showwarning(
+                    "恢复失败",
+                    "未找到该会话对应的 API 凭证，请先确认本地凭证配置，再重试恢复。",
+                )
+            return False
+        if not isinstance(session.engine, EnhancedStrategyEngine):
+            if not auto:
+                messagebox.showwarning("恢复失败", "当前会话没有可用的增强策略恢复引擎。")
+            return False
+        if session.recovery_root_dir is None:
+            if auto:
+                self._enqueue_log(f"[{session.session_id}] 缺少恢复目录，无法自动接管。")
+            if not auto:
+                messagebox.showwarning("恢复失败", "当前会话缺少恢复目录，无法接管。")
+            return False
+        session.status = "恢复中"
+        session.runtime_status = "恢复中"
+        session.ended_reason = "恢复中"
+        self._upsert_session_row(session)
+        self._refresh_selected_session_details()
+        self._sync_strategy_history_from_session(session)
+        try:
+            session.engine.start_with_context(
+                credentials,
+                session.config,
+                started_at=session.started_at,
+                recovery_root_dir=session.recovery_root_dir,
+            )
+        except Exception as exc:
+            session.status = "待恢复"
+            session.runtime_status = "待恢复"
+            session.ended_reason = "恢复启动失败"
+            self._upsert_session_row(session)
+            self._refresh_selected_session_details()
+            self._sync_strategy_history_from_session(session)
+            if auto:
+                self._enqueue_log(f"[{session.session_id}] 自动恢复启动失败：{exc}")
+            if not auto:
+                messagebox.showerror("恢复失败", str(exc))
+            return False
+        self._upsert_recoverable_strategy_session(session)
+        self._log_session_message(session, f"已提交恢复请求，恢复目录：{session.recovery_root_dir}")
+        return True
+
     def _history_record_from_payload(self, payload: dict[str, object]) -> StrategyHistoryRecord | None:
         started_at = _parse_datetime_snapshot(payload.get("started_at"))
         if started_at is None:
@@ -7864,26 +8389,35 @@ class QuantApp:
                     records.append(record)
         self._strategy_history_records = records
         self._strategy_history_by_id = {record.record_id: record for record in records}
-        recovered_count = self._mark_unfinished_strategy_history_records()
-        if recovered_count:
-            self._enqueue_log(f"检测到 {recovered_count} 条未正常结束的历史策略，已自动标记为异常结束。")
+        recoverable_count, abnormal_count = self._mark_unfinished_strategy_history_records()
+        if recoverable_count:
+            self._enqueue_log(f"检测到 {recoverable_count} 条可恢复历史策略，已标记为待恢复。")
+        if abnormal_count:
+            self._enqueue_log(f"检测到 {abnormal_count} 条未正常结束的历史策略，已自动标记为异常结束。")
 
-    def _mark_unfinished_strategy_history_records(self) -> int:
+    def _mark_unfinished_strategy_history_records(self) -> tuple[int, int]:
         recovered_at = datetime.now()
-        recovered_count = 0
+        recoverable_count = 0
+        abnormal_count = 0
         for record in self._strategy_history_records:
             if record.status not in {"运行中", "停止中"}:
                 continue
-            record.status = "异常结束"
+            if record.session_id in self._recoverable_strategy_sessions:
+                record.status = "待恢复"
+                if not record.ended_reason:
+                    record.ended_reason = "应用关闭后待恢复接管"
+                recoverable_count += 1
+            else:
+                record.status = "异常结束"
+                if not record.ended_reason:
+                    record.ended_reason = "应用异常退出"
+                abnormal_count += 1
             if record.stopped_at is None:
                 record.stopped_at = recovered_at
-            if not record.ended_reason:
-                record.ended_reason = "应用异常退出"
             record.updated_at = recovered_at
-            recovered_count += 1
-        if recovered_count:
+        if recoverable_count or abnormal_count:
             self._save_strategy_history_records()
-        return recovered_count
+        return recoverable_count, abnormal_count
 
     def _next_strategy_history_record_id(self, session: StrategySession) -> str:
         base = f"{session.started_at.strftime('%Y%m%d%H%M%S%f')}-{session.session_id}"
@@ -8105,7 +8639,7 @@ class QuantApp:
 
     @staticmethod
     def _session_blocks_history_deletion(session: StrategySession) -> bool:
-        return session.engine.is_running or session.status in {"运行中", "停止中"}
+        return session.engine.is_running or session.status in {"运行中", "停止中", "待恢复", "恢复中"}
 
     def _remove_strategy_history_records(self, record_ids: list[str], *, selected_before: str | None = None) -> tuple[int, int]:
         removed_count = 0
@@ -8413,17 +8947,27 @@ class QuantApp:
             if session.engine.is_running:
                 if session.status != "停止中":
                     session.status = "运行中"
-                    if session.ended_reason == "应用关闭":
+                    if session.runtime_status in {"待恢复", "恢复中"} and not session.last_message:
+                        session.runtime_status = "运行中"
+                    if session.ended_reason in {"应用关闭", "应用关闭后待恢复接管", "恢复中", "恢复启动失败"}:
                         session.ended_reason = ""
                 running_count += 1
             elif session.stop_cleanup_in_progress:
                 session.status = "停止中"
+            elif session.status == "恢复中":
+                session.status = "待恢复"
+                session.runtime_status = "待恢复"
+                if session.stopped_at is None:
+                    session.stopped_at = datetime.now()
+                if not session.ended_reason or session.ended_reason == "恢复中":
+                    session.ended_reason = "恢复启动失败"
             elif session.status in {"运行中", "停止中"}:
                 session.status = "已停止"
                 if session.stopped_at is None:
                     session.stopped_at = datetime.now()
                 if not session.ended_reason:
                     session.ended_reason = "策略线程结束"
+                self._remove_recoverable_strategy_session(session.session_id)
             self._upsert_session_row(session)
             self._sync_strategy_history_from_session(session)
 
@@ -8438,13 +8982,24 @@ class QuantApp:
         closed_at = datetime.now()
         for session in self.sessions.values():
             if session.status in {"运行中", "停止中"} or session.engine.is_running:
-                session.status = "已停止"
+                if session.recovery_supported:
+                    session.status = "待恢复"
+                    session.runtime_status = "待恢复"
+                    session.ended_reason = "应用关闭后待恢复接管"
+                    session.stopped_at = closed_at
+                    self._upsert_recoverable_strategy_session(session)
+                else:
+                    session.status = "已停止"
+                    if not session.ended_reason:
+                        session.ended_reason = "应用关闭"
+                    self._remove_recoverable_strategy_session(session.session_id)
+                    if session.stopped_at is None:
+                        session.stopped_at = closed_at
                 if session.stopped_at is None:
                     session.stopped_at = closed_at
-                if not session.ended_reason:
-                    session.ended_reason = "应用关闭"
                 self._sync_strategy_history_from_session(session)
             session.engine.stop()
+            session.engine.wait_stopped(timeout=1.5)
         self._protection_manager.stop_all()
         self._close_strategy_history_window()
         self._close_settings_window()

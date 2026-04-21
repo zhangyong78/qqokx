@@ -4,72 +4,100 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from okx_quant.app_paths import cache_dir_path, config_dir_path, reports_dir_path, state_dir_path
 
-CREDENTIALS_FILE_NAME = ".okx_quant_credentials.json"
-SETTINGS_FILE_NAME = ".okx_quant_settings.json"
-BACKTEST_HISTORY_FILE_NAME = ".okx_quant_backtest_history.json"
-BACKTEST_CANDLE_CACHE_DIR_NAME = ".okx_quant_candle_cache"
+
+CREDENTIALS_FILE_NAME = "credentials.json"
+SETTINGS_FILE_NAME = "settings.json"
+ENHANCED_STRATEGY_RUNTIME_FILE_NAME = "enhanced_strategy_runtime.json"
+BACKTEST_HISTORY_FILE_NAME = "backtest_history.json"
+BACKTEST_CANDLE_CACHE_DIR_NAME = "candle_cache"
 BACKTEST_REPORT_EXPORT_DIR_NAME = "backtest_exports"
-STRATEGY_HISTORY_FILE_NAME = ".okx_quant_strategy_history.json"
-SMART_ORDER_TASKS_FILE_NAME = ".okx_quant_smart_order_tasks.json"
-SMART_ORDER_FAVORITES_FILE_NAME = ".okx_quant_smart_order_favorites.json"
-OPTION_STRATEGIES_FILE_NAME = ".okx_quant_option_strategies.json"
+ANALYSIS_REPORT_DIR_NAME = "analysis"
+DERIBIT_REPORT_EXPORT_DIR_NAME = "deribit"
+LIVE_STRATEGY_SESSIONS_DIR_NAME = "live_strategy_sessions"
+DERIBIT_VOLATILITY_CACHE_FILE_NAME = "deribit_volatility_cache.json"
+STRATEGY_HISTORY_FILE_NAME = "strategy_history.json"
+RECOVERABLE_STRATEGY_SESSIONS_FILE_NAME = "recoverable_strategy_sessions.json"
+SMART_ORDER_TASKS_FILE_NAME = "smart_order_tasks.json"
+SMART_ORDER_FAVORITES_FILE_NAME = "smart_order_favorites.json"
+OPTION_STRATEGIES_FILE_NAME = "option_strategies.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 PROFILE_ENVIRONMENTS = {"demo", "live"}
 
 
 def credentials_file_path(base_dir: Path | None = None) -> Path:
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parent.parent
-    return Path(base_dir) / CREDENTIALS_FILE_NAME
+    return Path(base_dir) / CREDENTIALS_FILE_NAME if base_dir is not None else config_dir_path() / CREDENTIALS_FILE_NAME
 
 
 def settings_file_path(base_dir: Path | None = None) -> Path:
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parent.parent
-    return Path(base_dir) / SETTINGS_FILE_NAME
+    return Path(base_dir) / SETTINGS_FILE_NAME if base_dir is not None else config_dir_path() / SETTINGS_FILE_NAME
+
+
+def enhanced_strategy_runtime_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / ENHANCED_STRATEGY_RUNTIME_FILE_NAME
+    return config_dir_path() / ENHANCED_STRATEGY_RUNTIME_FILE_NAME
 
 
 def backtest_history_file_path(base_dir: Path | None = None) -> Path:
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parent.parent
-    return Path(base_dir) / BACKTEST_HISTORY_FILE_NAME
+    return Path(base_dir) / BACKTEST_HISTORY_FILE_NAME if base_dir is not None else state_dir_path() / BACKTEST_HISTORY_FILE_NAME
 
 
 def candle_cache_dir_path(base_dir: Path | None = None) -> Path:
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parent.parent
-    return Path(base_dir) / BACKTEST_CANDLE_CACHE_DIR_NAME
+    return Path(base_dir) / BACKTEST_CANDLE_CACHE_DIR_NAME if base_dir is not None else cache_dir_path() / BACKTEST_CANDLE_CACHE_DIR_NAME
 
 
 def backtest_report_export_dir_path(base_dir: Path | None = None) -> Path:
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parent.parent
-    return Path(base_dir) / "reports" / BACKTEST_REPORT_EXPORT_DIR_NAME
+    if base_dir is not None:
+        return Path(base_dir) / "reports" / BACKTEST_REPORT_EXPORT_DIR_NAME
+    return reports_dir_path() / BACKTEST_REPORT_EXPORT_DIR_NAME
+
+
+def analysis_report_dir_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / "reports" / ANALYSIS_REPORT_DIR_NAME
+    return reports_dir_path() / ANALYSIS_REPORT_DIR_NAME
+
+
+def deribit_report_export_dir_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / "reports" / DERIBIT_REPORT_EXPORT_DIR_NAME
+    return reports_dir_path() / DERIBIT_REPORT_EXPORT_DIR_NAME
+
+
+def live_strategy_sessions_dir_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / "reports" / LIVE_STRATEGY_SESSIONS_DIR_NAME
+    return reports_dir_path() / LIVE_STRATEGY_SESSIONS_DIR_NAME
+
+
+def deribit_volatility_cache_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / DERIBIT_VOLATILITY_CACHE_FILE_NAME
+    return cache_dir_path() / DERIBIT_VOLATILITY_CACHE_FILE_NAME
 
 
 def strategy_history_file_path(base_dir: Path | None = None) -> Path:
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parent.parent
-    return Path(base_dir) / STRATEGY_HISTORY_FILE_NAME
+    return Path(base_dir) / STRATEGY_HISTORY_FILE_NAME if base_dir is not None else state_dir_path() / STRATEGY_HISTORY_FILE_NAME
+
+
+def recoverable_strategy_sessions_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / RECOVERABLE_STRATEGY_SESSIONS_FILE_NAME
+    return state_dir_path() / RECOVERABLE_STRATEGY_SESSIONS_FILE_NAME
 
 
 def smart_order_tasks_file_path(base_dir: Path | None = None) -> Path:
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parent.parent
-    return Path(base_dir) / SMART_ORDER_TASKS_FILE_NAME
+    return Path(base_dir) / SMART_ORDER_TASKS_FILE_NAME if base_dir is not None else state_dir_path() / SMART_ORDER_TASKS_FILE_NAME
 
 
 def smart_order_favorites_file_path(base_dir: Path | None = None) -> Path:
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parent.parent
-    return Path(base_dir) / SMART_ORDER_FAVORITES_FILE_NAME
+    return Path(base_dir) / SMART_ORDER_FAVORITES_FILE_NAME if base_dir is not None else state_dir_path() / SMART_ORDER_FAVORITES_FILE_NAME
 
 
 def option_strategies_file_path(base_dir: Path | None = None) -> Path:
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parent.parent
-    return Path(base_dir) / OPTION_STRATEGIES_FILE_NAME
+    return Path(base_dir) / OPTION_STRATEGIES_FILE_NAME if base_dir is not None else state_dir_path() / OPTION_STRATEGIES_FILE_NAME
 
 
 def _empty_credentials_snapshot() -> dict[str, str]:
@@ -481,6 +509,75 @@ def save_strategy_history_snapshot(
     normalized_records.sort(key=lambda item: (str(item["started_at"]), str(item["record_id"])), reverse=True)
     payload = {
         "records": normalized_records,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
+def _normalize_recoverable_strategy_session_record(item: object) -> dict[str, object] | None:
+    if not isinstance(item, dict):
+        return None
+    session_id = str(item.get("session_id", "")).strip()
+    strategy_id = str(item.get("strategy_id", "")).strip()
+    strategy_name = str(item.get("strategy_name", "")).strip()
+    started_at = str(item.get("started_at", "")).strip()
+    recovery_root_dir = str(item.get("recovery_root_dir", "")).strip()
+    raw_config_snapshot = item.get("config_snapshot")
+    config_snapshot = raw_config_snapshot if isinstance(raw_config_snapshot, dict) else {}
+    if not session_id or not strategy_id or not strategy_name or not started_at or not recovery_root_dir:
+        return None
+    updated_at = str(item.get("updated_at", "")).strip()
+    return {
+        "session_id": session_id,
+        "api_name": str(item.get("api_name", "")).strip(),
+        "strategy_id": strategy_id,
+        "strategy_name": strategy_name,
+        "symbol": str(item.get("symbol", "")).strip(),
+        "direction_label": str(item.get("direction_label", "")).strip(),
+        "run_mode_label": str(item.get("run_mode_label", "")).strip(),
+        "started_at": started_at,
+        "history_record_id": str(item.get("history_record_id", "")).strip(),
+        "log_file_path": str(item.get("log_file_path", "")).strip(),
+        "recovery_root_dir": recovery_root_dir,
+        "config_snapshot": config_snapshot,
+        "updated_at": updated_at or None,
+    }
+
+
+def load_recoverable_strategy_sessions_snapshot(path: Path | None = None) -> dict[str, object]:
+    target = path or recoverable_strategy_sessions_file_path()
+    if not target.exists():
+        return {"sessions": []}
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    raw_sessions = payload.get("sessions")
+    if not isinstance(raw_sessions, list):
+        raw_sessions = []
+    sessions = [
+        normalized
+        for item in raw_sessions
+        if (normalized := _normalize_recoverable_strategy_session_record(item)) is not None
+    ]
+    sessions.sort(key=lambda item: (str(item["started_at"]), str(item["session_id"])), reverse=True)
+    return {"sessions": sessions}
+
+
+def save_recoverable_strategy_sessions_snapshot(
+    sessions: list[dict[str, object]],
+    path: Path | None = None,
+) -> Path:
+    target = path or recoverable_strategy_sessions_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    normalized_sessions = [
+        item
+        for session in sessions
+        if (item := _normalize_recoverable_strategy_session_record(session)) is not None
+    ]
+    normalized_sessions.sort(key=lambda item: (str(item["started_at"]), str(item["session_id"])), reverse=True)
+    payload = {
+        "sessions": normalized_sessions,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     temp_path = target.with_suffix(target.suffix + ".tmp")

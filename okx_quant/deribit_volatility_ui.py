@@ -13,6 +13,7 @@ from tkinter import messagebox, ttk
 from okx_quant.deribit_client import DeribitRestClient, DeribitVolatilityCandle
 from okx_quant.models import Candle
 from okx_quant.okx_client import OkxRestClient
+from okx_quant.persistence import deribit_report_export_dir_path, deribit_volatility_cache_file_path
 from okx_quant.pricing import format_decimal_fixed
 from okx_quant.window_layout import apply_adaptive_window_geometry
 
@@ -40,7 +41,6 @@ DAY_ALIGN_OPTIONS = {
     "北京时间凌晨12点": 0,
     "北京时间早上8点": 8,
 }
-DERIBIT_VOLATILITY_CACHE_FILE_NAME = ".okx_quant_deribit_volatility_cache.json"
 DERIBIT_FULL_HISTORY_START_TS = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
 DERIBIT_HOURLY_REFRESH_OVERLAP = 240
 DERIBIT_DEFAULT_VISIBLE_CANDLE_COUNT = 300
@@ -577,7 +577,7 @@ class DeribitVolatilityWindow:
         if self._latest_snapshot is None or not self._latest_snapshot.aligned_volatility_candles:
             messagebox.showinfo("没有数据", "请先获取历史K线。", parent=self.window)
             return
-        export_dir = Path("D:/qqokx/reports/deribit")
+        export_dir = deribit_report_export_dir_path()
         export_dir.mkdir(parents=True, exist_ok=True)
         resolution_text = _resolution_file_label(self.resolution_label.get())
         base_name = f"{self._latest_snapshot.currency}_{resolution_text}_{self._latest_snapshot.fetched_at.strftime('%Y%m%d_%H%M%S')}"
@@ -635,7 +635,7 @@ class DeribitVolatilityWindow:
         self._refresh_for_current_selection(use_cache=True, force_network=True, supersede_if_loading=False)
 
     def _cache_file_path(self) -> Path:
-        return Path(__file__).resolve().parent.parent / DERIBIT_VOLATILITY_CACHE_FILE_NAME
+        return deribit_volatility_cache_file_path()
 
     def _cache_key(self, currency: str, resolution: str, day_align_label: str) -> str:
         return f"{currency}|{resolution}|{day_align_label if resolution == '1D' else ''}"

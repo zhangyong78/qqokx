@@ -149,6 +149,14 @@ class StrategyEngine:
     def stop(self) -> None:
         self._stop_event.set()
 
+    def wait_stopped(self, timeout: float | None = None) -> bool:
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
+
     def _run(self, credentials: Credentials, config: StrategyConfig) -> None:
         try:
             signal_instrument = self._get_instrument_with_retry(config.inst_id)

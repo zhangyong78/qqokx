@@ -5,6 +5,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from okx_quant.app_paths import logs_dir_path as _logs_dir_path
+
 
 _TIMESTAMP_PREFIX_RE = re.compile(r"^\[(?:\d{4}-)?\d{2}-\d{2} \d{2}:\d{2}:\d{2}\](?:\s|$)")
 _LOG_FILE_LOCK = threading.Lock()
@@ -27,8 +29,9 @@ def ensure_log_timestamp(message: str, *, timestamp: str | None = None) -> str:
 
 
 def logs_dir(*, base_dir: str | Path | None = None) -> Path:
-    root = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parents[1]
-    return root / "logs"
+    if base_dir is not None:
+        return Path(base_dir) / "logs"
+    return _logs_dir_path()
 
 
 def strategy_session_logs_dir(*, base_dir: str | Path | None = None) -> Path:

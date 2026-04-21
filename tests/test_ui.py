@@ -503,6 +503,7 @@ class StrategyStopCleanupTest(TestCase):
         log_messages: list[str] = []
         app = SimpleNamespace(
             sessions={session.session_id: session},
+            _remove_recoverable_strategy_session=MagicMock(),
             _upsert_session_row=MagicMock(),
             _refresh_selected_session_details=MagicMock(),
             _sync_strategy_history_from_session=MagicMock(),
@@ -542,6 +543,7 @@ class StrategyStopCleanupTest(TestCase):
         log_messages: list[str] = []
         app = SimpleNamespace(
             sessions={session.session_id: session},
+            _remove_recoverable_strategy_session=MagicMock(),
             _upsert_session_row=MagicMock(),
             _refresh_selected_session_details=MagicMock(),
             _sync_strategy_history_from_session=MagicMock(),

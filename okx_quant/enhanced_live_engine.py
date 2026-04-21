@@ -26,14 +26,13 @@ from okx_quant.enhanced_signal_engine import bar_to_minutes
 from okx_quant.models import Candle, Credentials, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.okx_client import OkxFillHistoryItem, OkxPosition, OkxRestClient, infer_inst_type
+from okx_quant.persistence import enhanced_strategy_runtime_file_path, live_strategy_sessions_dir_path
 from okx_quant.pricing import format_decimal, snap_to_increment
 from okx_quant.strategy_catalog import STRATEGY_SPOT_ENHANCEMENT_36_ID
 
 
 Logger = Callable[[str], None]
 ZERO = Decimal("0")
-RUNTIME_CONFIG_PATH = Path(__file__).resolve().parents[1] / ".okx_quant_enhanced_strategy_runtime.json"
-LIVE_REPORT_ROOT = Path(__file__).resolve().parents[1] / "reports" / "live_strategy_sessions"
 DEFAULT_SIGNAL_LOOKBACK = 256
 DEFAULT_STATE_FLUSH_SECONDS = 12.0
 DEFAULT_FILL_HISTORY_LIMIT = 200
@@ -201,14 +200,20 @@ def _safe_token(value: str) -> str:
     return cleaned.strip("._-") or "session"
 
 
-def _build_artifact_paths(
+def build_live_report_artifact_paths(
     *,
     started_at: datetime,
     session_id: str,
     trade_inst_id: str,
+    root_dir: Path | None = None,
 ) -> ArtifactPaths:
-    token = started_at.strftime("%Y%m%d_%H%M%S")
-    root_dir = LIVE_REPORT_ROOT / started_at.strftime("%Y-%m-%d") / f"{token}__{_safe_token(session_id)}__{_safe_token(trade_inst_id)}"
+    if root_dir is None:
+        token = started_at.strftime("%Y%m%d_%H%M%S")
+        root_dir = live_strategy_sessions_dir_path() / started_at.strftime("%Y-%m-%d") / (
+            f"{token}__{_safe_token(session_id)}__{_safe_token(trade_inst_id)}"
+        )
+    else:
+        root_dir = Path(root_dir)
     return ArtifactPaths(
         root_dir=root_dir,
         state_json=root_dir / "state.json",
@@ -389,6 +394,33 @@ def _serialize_value(value: object) -> object:
     return value
 
 
+def _deserialize_decimal(value: object, default: Decimal = ZERO) -> Decimal:
+    if value in {None, ""}:
+        return default
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return default
+
+
+def _deserialize_optional_decimal(value: object) -> Decimal | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _deserialize_optional_int(value: object) -> int | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -435,13 +467,23 @@ class EnhancedStrategyEngine:
             return self._thread is not None and self._thread.is_alive()
 
     def start(self, credentials: Credentials, config: StrategyConfig) -> None:
+        self.start_with_context(credentials, config)
+
+    def start_with_context(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        started_at: datetime | None = None,
+        recovery_root_dir: Path | None = None,
+    ) -> None:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("策略已经在运行中")
             self._stop_event.clear()
             self._thread = threading.Thread(
                 target=self._run,
-                args=(credentials, config),
+                args=(credentials, config, started_at, recovery_root_dir),
                 daemon=True,
                 name=f"okx-{config.strategy_id}-enhanced",
             )
@@ -450,10 +492,29 @@ class EnhancedStrategyEngine:
     def stop(self) -> None:
         self._stop_event.set()
 
-    def _run(self, credentials: Credentials, config: StrategyConfig) -> None:
+    def wait_stopped(self, timeout: float | None = None) -> bool:
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
+
+    def _run(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        started_at: datetime | None = None,
+        recovery_root_dir: Path | None = None,
+    ) -> None:
         state: _EngineState | None = None
         try:
-            state = self._bootstrap_state(credentials, config)
+            state = self._bootstrap_state(
+                credentials,
+                config,
+                started_at=started_at,
+                recovery_root_dir=recovery_root_dir,
+            )
             self._logger(
                 "现货增强三十六计已启动 | "
                 f"信号={state.signal_inst_id} | 交易={state.trade_inst_id} | "
@@ -477,7 +538,14 @@ class EnhancedStrategyEngine:
                 self._write_state_snapshot(state, force=True)
             self._stop_event.set()
 
-    def _bootstrap_state(self, credentials: Credentials, config: StrategyConfig) -> _EngineState:
+    def _bootstrap_state(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        started_at: datetime | None = None,
+        recovery_root_dir: Path | None = None,
+    ) -> _EngineState:
         if config.run_mode != "trade":
             raise RuntimeError("现货增强三十六计当前只支持自动交易模式")
         trade_inst_id = derive_swap_trade_inst_id(config.trade_inst_id or config.inst_id)
@@ -504,7 +572,8 @@ class EnhancedStrategyEngine:
             spot_inst_id=signal_inst_id,
             signal_bar=config.bar,
         )
-        store = load_runtime_store(RUNTIME_CONFIG_PATH)
+        runtime_config_path = enhanced_strategy_runtime_file_path()
+        store = load_runtime_store(runtime_config_path)
         payload = get_strategy_runtime_payload(store, PARENT_STRATEGY_ID)
         if payload is not None:
             apply_strategy_runtime_payload(
@@ -516,11 +585,12 @@ class EnhancedStrategyEngine:
         if not enabled_signals:
             raise RuntimeError("当前没有启用的子策略可执行")
 
-        started_at = datetime.now()
-        artifacts = _build_artifact_paths(
+        started_at = started_at or datetime.now()
+        artifacts = build_live_report_artifact_paths(
             started_at=started_at,
             session_id=self._session_id or "session",
             trade_inst_id=trade_inst_id,
+            root_dir=recovery_root_dir,
         )
         total_qty = slot_size * Decimal(str(config.max_entries_per_trend))
         long_total = total_qty if config.signal_mode in {"both", "long_only"} else ZERO
@@ -537,27 +607,30 @@ class EnhancedStrategyEngine:
             short_quota=DirectionQuota(total=short_total),
             enabled_signal_ids=tuple(item.signal_id for item in enabled_signals),
         )
-        _write_json(
-            artifacts.manifest_json,
-            {
-                "schema_version": 1,
-                "created_at": _iso_now(),
-                "strategy_id": config.strategy_id,
-                "strategy_name": self._strategy_name,
-                "session_id": self._session_id,
-                "signal_inst_id": signal_inst_id,
-                "trade_inst_id": trade_inst_id,
-                "environment": config.environment,
-                "signal_mode": config.signal_mode,
-                "slot_size": format(slot_size, "f"),
-                "max_slots_per_direction": config.max_entries_per_trend,
-                "runtime_config_path": str(RUNTIME_CONFIG_PATH),
-            },
-        )
-        state.seen_fill_keys = {
-            _fill_key(item)
-            for item in self._safe_get_fills_history(credentials, config)
-        }
+        if recovery_root_dir is not None:
+            self._restore_state_snapshot(state)
+        else:
+            _write_json(
+                artifacts.manifest_json,
+                {
+                    "schema_version": 1,
+                    "created_at": _iso_now(),
+                    "strategy_id": config.strategy_id,
+                    "strategy_name": self._strategy_name,
+                    "session_id": self._session_id,
+                    "signal_inst_id": signal_inst_id,
+                    "trade_inst_id": trade_inst_id,
+                    "environment": config.environment,
+                    "signal_mode": config.signal_mode,
+                    "slot_size": format(slot_size, "f"),
+                    "max_slots_per_direction": config.max_entries_per_trend,
+                    "runtime_config_path": str(runtime_config_path),
+                },
+            )
+            state.seen_fill_keys = {
+                _fill_key(item)
+                for item in self._safe_get_fills_history(credentials, config)
+            }
         self._bootstrap_existing_positions(credentials, config, state)
         return state
 
@@ -567,6 +640,10 @@ class EnhancedStrategyEngine:
         config: StrategyConfig,
         state: _EngineState,
     ) -> None:
+        tracked_by_direction = {
+            "long": sum((item.quantity for item in state.active_positions.values() if item.direction == "long"), ZERO),
+            "short": sum((item.quantity for item in state.active_positions.values() if item.direction == "short"), ZERO),
+        }
         positions = self._client.get_positions(credentials, environment=config.environment, inst_type="SWAP")
         for raw in positions:
             if raw.inst_id != state.trade_inst_id:
@@ -578,11 +655,18 @@ class EnhancedStrategyEngine:
                 continue
             if config.signal_mode == "short_only" and direction != "short":
                 continue
-            _direction_quota(state, direction).used += raw.position
+            actual_quantity = abs(raw.position)
+            if actual_quantity <= 0:
+                continue
+            tracked_quantity = tracked_by_direction[direction]
+            surplus_quantity = actual_quantity - tracked_quantity
+            if surplus_quantity <= ZERO:
+                continue
+            _direction_quota(state, direction).used += surplus_quantity
             tracked = LiveEnhancedPosition(
                 position_id=f"baseline-{direction}-{len(state.active_positions) + 1:02d}",
                 signal_id=f"baseline_{direction}",
-                signal_name="启动前已有仓位",
+                signal_name="恢复基线仓" if tracked_quantity > 0 else "启动前已有仓位",
                 playbook_id=f"baseline_{direction}",
                 playbook_name="人工接管基线仓",
                 playbook_action="SWAP_LONG" if direction == "long" else "SWAP_SHORT",
@@ -590,7 +674,7 @@ class EnhancedStrategyEngine:
                 source_inst_id=state.trade_inst_id,
                 source_bar=config.bar,
                 trade_inst_id=state.trade_inst_id,
-                quantity=raw.position,
+                quantity=surplus_quantity,
                 signal_price=raw.avg_price or raw.mark_price or ZERO,
                 entry_price=raw.avg_price or raw.mark_price or ZERO,
                 entry_ts=_ts_from_position(raw),
@@ -599,15 +683,16 @@ class EnhancedStrategyEngine:
                 max_hold_bars=0,
                 fee_rate=ZERO,
                 slippage_rate=ZERO,
-                trigger_reason="启动前已有仓位，自动纳入人工池",
+                trigger_reason="恢复时发现账户存在未追踪仓位，自动纳入人工池" if tracked_quantity > 0 else "启动前已有仓位，自动纳入人工池",
                 pos_side=direction if config.position_mode == "long_short" else None,
                 last_reference_price=raw.last_price or raw.mark_price or raw.avg_price,
                 last_reference_ts=_ts_from_position(raw),
                 status="manual_managed",
                 handoff_ts=_ts_from_position(raw),
-                handoff_reason="启动前已有仓位",
+                handoff_reason="恢复时发现未追踪仓位" if tracked_quantity > 0 else "启动前已有仓位",
             )
             state.active_positions[tracked.position_id] = tracked
+            tracked_by_direction[direction] += surplus_quantity
             self._append_event(
                 state,
                 {
@@ -619,6 +704,140 @@ class EnhancedStrategyEngine:
                     "ts": _iso_now(),
                 },
             )
+
+    def _restore_state_snapshot(self, state: _EngineState) -> None:
+        if not state.artifacts.manifest_json.exists():
+            raise RuntimeError(f"恢复失败：缺少会话清单 {state.artifacts.manifest_json}")
+        if not state.artifacts.state_json.exists():
+            raise RuntimeError(f"恢复失败：缺少状态快照 {state.artifacts.state_json}")
+
+        manifest_payload = json.loads(state.artifacts.manifest_json.read_text(encoding="utf-8"))
+        state_payload = json.loads(state.artifacts.state_json.read_text(encoding="utf-8"))
+        manifest_trade_inst_id = str(manifest_payload.get("trade_inst_id", "")).strip().upper()
+        if manifest_trade_inst_id and manifest_trade_inst_id != state.trade_inst_id:
+            raise RuntimeError(
+                f"恢复失败：快照交易标的 {manifest_trade_inst_id} 与当前配置 {state.trade_inst_id} 不一致"
+            )
+
+        restored_positions: dict[str, LiveEnhancedPosition] = {}
+        raw_positions = state_payload.get("active_positions", [])
+        if isinstance(raw_positions, list):
+            for raw_item in raw_positions:
+                position = self._deserialize_position_snapshot(raw_item)
+                if position is None:
+                    continue
+                restored_positions[position.position_id] = position
+        state.active_positions = restored_positions
+
+        quota_payload = state_payload.get("quota")
+        tracked_long = sum((item.quantity for item in restored_positions.values() if item.direction == "long"), ZERO)
+        tracked_short = sum((item.quantity for item in restored_positions.values() if item.direction == "short"), ZERO)
+        if isinstance(quota_payload, dict):
+            state.long_quota.total = _deserialize_decimal(quota_payload.get("long_total"), state.long_quota.total)
+            state.short_quota.total = _deserialize_decimal(quota_payload.get("short_total"), state.short_quota.total)
+            state.long_quota.used = max(_deserialize_decimal(quota_payload.get("long_used"), tracked_long), tracked_long)
+            state.short_quota.used = max(_deserialize_decimal(quota_payload.get("short_used"), tracked_short), tracked_short)
+        else:
+            state.long_quota.used = tracked_long
+            state.short_quota.used = tracked_short
+
+        counts_payload = state_payload.get("counts")
+        if isinstance(counts_payload, dict):
+            state.closed_position_count = max(int(counts_payload.get("closed_positions", 0)), 0)
+            state.event_count = max(int(counts_payload.get("events", 0)), 0)
+
+        raw_events = state_payload.get("recent_events", [])
+        if isinstance(raw_events, list):
+            state.recent_events = [item for item in raw_events if isinstance(item, dict)]
+        state.event_count = max(state.event_count, len(state.recent_events))
+        state.processed_signal_keys = {
+            str(item).strip()
+            for item in state_payload.get("processed_signal_keys", [])
+            if str(item).strip()
+        }
+        state.seen_fill_keys = {
+            str(item).strip()
+            for item in state_payload.get("seen_fill_keys", [])
+            if str(item).strip()
+        }
+        state.engine_order_ids = {
+            str(item).strip()
+            for item in state_payload.get("engine_order_ids", [])
+            if str(item).strip()
+        }
+        state.engine_client_order_ids = {
+            str(item).strip()
+            for item in state_payload.get("engine_client_order_ids", [])
+            if str(item).strip()
+        }
+        restored_manual = sum(1 for item in restored_positions.values() if item.status == "manual_managed")
+        restored_auto = len(restored_positions) - restored_manual
+        self._logger(
+            "已加载恢复快照 | "
+            f"目录={state.artifacts.root_dir} | 自动仓位={restored_auto} | 人工池={restored_manual}"
+        )
+
+    @staticmethod
+    def _deserialize_position_snapshot(payload: object) -> LiveEnhancedPosition | None:
+        if not isinstance(payload, dict):
+            return None
+        position_id = str(payload.get("position_id", "")).strip()
+        direction = str(payload.get("direction", "")).strip().lower()
+        trade_inst_id = str(payload.get("trade_inst_id", "")).strip().upper()
+        source_inst_id = str(payload.get("source_inst_id", trade_inst_id)).strip().upper()
+        source_bar = str(payload.get("source_bar", "")).strip() or "5m"
+        if not position_id or direction not in {"long", "short"} or not trade_inst_id:
+            return None
+        pos_side_raw = str(payload.get("pos_side", "")).strip().lower()
+        pos_side: Literal["long", "short"] | None = pos_side_raw if pos_side_raw in {"long", "short"} else None
+        status_raw = str(payload.get("status", "")).strip().lower()
+        manual_pool = str(payload.get("manual_pool", "")).strip().lower()
+        status: Literal["opened_auto", "manual_managed"]
+        status = "manual_managed" if status_raw == "manual_managed" or manual_pool == "manual" else "opened_auto"
+        try:
+            entry_ts = int(payload.get("entry_ts", _now_ms()))
+        except Exception:
+            entry_ts = _now_ms()
+        max_hold_bars = 0
+        try:
+            max_hold_bars = max(int(payload.get("max_hold_bars", 0)), 0)
+        except Exception:
+            max_hold_bars = 0
+        return LiveEnhancedPosition(
+            position_id=position_id,
+            signal_id=str(payload.get("signal_id", "")).strip(),
+            signal_name=str(payload.get("signal_name", "")).strip(),
+            playbook_id=str(payload.get("playbook_id", "")).strip(),
+            playbook_name=str(payload.get("playbook_name", "")).strip(),
+            playbook_action=str(
+                payload.get("playbook_action", "SWAP_LONG" if direction == "long" else "SWAP_SHORT")
+            ).strip(),
+            direction=direction,
+            source_inst_id=source_inst_id,
+            source_bar=source_bar,
+            trade_inst_id=trade_inst_id,
+            quantity=_deserialize_decimal(payload.get("quantity")),
+            signal_price=_deserialize_decimal(payload.get("signal_price")),
+            entry_price=_deserialize_decimal(payload.get("entry_price")),
+            entry_ts=entry_ts,
+            stop_loss_price=_deserialize_optional_decimal(payload.get("stop_loss_price")),
+            take_profit_price=_deserialize_optional_decimal(payload.get("take_profit_price")),
+            max_hold_bars=max_hold_bars,
+            fee_rate=_deserialize_decimal(payload.get("fee_rate")),
+            slippage_rate=_deserialize_decimal(payload.get("slippage_rate")),
+            trigger_reason=str(payload.get("trigger_reason", "")).strip(),
+            pos_side=pos_side,
+            entry_order_id=str(payload.get("entry_order_id", "")).strip() or None,
+            entry_client_order_id=str(payload.get("entry_client_order_id", "")).strip() or None,
+            last_reference_price=_deserialize_optional_decimal(
+                payload.get("last_reference_price", payload.get("current_price"))
+            ),
+            last_reference_ts=_deserialize_optional_int(payload.get("last_reference_ts")),
+            last_evaluated_candle_ts=_deserialize_optional_int(payload.get("last_evaluated_candle_ts")),
+            status=status,
+            handoff_ts=_deserialize_optional_int(payload.get("handoff_ts")),
+            handoff_reason=str(payload.get("handoff_reason", "")).strip(),
+        )
 
     def _run_cycle(self, credentials: Credentials, config: StrategyConfig, state: _EngineState) -> None:
         fills = self._safe_get_fills_history(credentials, config)
@@ -1094,6 +1313,10 @@ class EnhancedStrategyEngine:
                 },
                 "active_positions": [_serialize_value(item) for item in all_rows],
                 "recent_events": [_serialize_value(item) for item in state.recent_events[-200:]],
+                "processed_signal_keys": sorted(state.processed_signal_keys),
+                "seen_fill_keys": sorted(state.seen_fill_keys),
+                "engine_order_ids": sorted(state.engine_order_ids),
+                "engine_client_order_ids": sorted(state.engine_client_order_ids),
             },
         )
         _write_csv(state.artifacts.active_csv, [_stringify_row(item) for item in all_rows])
@@ -1198,7 +1421,9 @@ class EnhancedStrategyEngine:
             "signal_name": position.signal_name,
             "playbook_id": position.playbook_id,
             "playbook_name": position.playbook_name,
+            "playbook_action": position.playbook_action,
             "direction": position.direction,
+            "status": position.status,
             "manual_pool": position.manual_pool,
             "quantity": position.quantity,
             "entry_price": position.entry_price,
@@ -1210,6 +1435,15 @@ class EnhancedStrategyEngine:
             "estimated_pnl": estimated_pnl,
             "entry_ts": position.entry_ts,
             "entry_time": datetime.fromtimestamp(position.entry_ts / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "max_hold_bars": position.max_hold_bars,
+            "fee_rate": position.fee_rate,
+            "slippage_rate": position.slippage_rate,
+            "pos_side": position.pos_side,
+            "entry_order_id": position.entry_order_id,
+            "entry_client_order_id": position.entry_client_order_id,
+            "last_reference_price": position.last_reference_price,
+            "last_reference_ts": position.last_reference_ts,
+            "last_evaluated_candle_ts": position.last_evaluated_candle_ts,
             "handoff_ts": position.handoff_ts,
             "handoff_reason": position.handoff_reason,
             "trigger_reason": position.trigger_reason,
