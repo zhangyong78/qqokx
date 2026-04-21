@@ -3,6 +3,8 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from okx_quant.engine import (
+    OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES,
+    FilledPosition,
     ManagedEntryOrder,
     StrategyEngine,
     _advance_dynamic_stop_live,
@@ -499,6 +501,43 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(waits, [1.0, 2.0])
         self.assertTrue(any("准备重试" in message for message in messages))
 
+    def test_okx_read_retry_recovers_from_raw_timeout_error(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 鍔ㄦ€佸鎵?澶氬ご",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+
+        attempts = {"count": 0}
+
+        def _flaky_read() -> str:
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise TimeoutError("The read operation timed out")
+            return "ok"
+
+        result = engine._call_okx_read_with_retry("璇诲彇瑙﹀彂浠锋牸", _flaky_read)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(waits, [1.0, 2.0])
+        self.assertGreaterEqual(len(messages), 2)
+
     def test_okx_read_retry_does_not_retry_non_transient_error(self) -> None:
         messages: list[str] = []
         waits: list[float] = []
@@ -576,6 +615,165 @@ class StrategyEngineTest(TestCase):
         self.assertTrue(any("OKX 读取异常，准备重试" in message for message in messages))
         self.assertTrue(any("1小时调试 | ETH-USDT-SWAP" in message for message in messages))
         self.assertFalse(any("1小时调试值获取失败" in message for message in messages))
+
+    def test_exchange_dynamic_stop_monitor_keeps_running_after_transient_read_failures(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+        )
+        position = FilledPosition(
+            ord_id="ord-1",
+            cl_ord_id="cl-1",
+            inst_id="BTC-USDT-SWAP",
+            side="buy",
+            close_side="sell",
+            pos_side="long",
+            size=Decimal("0.01"),
+            entry_price=Decimal("75000"),
+            entry_ts=0,
+        )
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 鍔ㄦ€佸鎵?澶氬ご",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+
+        attempts = {"count": 0}
+
+        def _find_position(*_args, **_kwargs):  # noqa: ANN001
+            attempts["count"] += 1
+            if attempts["count"] <= 2:
+                raise OkxApiError("The read operation timed out")
+            return None
+
+        engine._find_managed_position = _find_position  # type: ignore[method-assign]
+
+        engine._monitor_exchange_dynamic_stop(
+            None,  # type: ignore[arg-type]
+            config,
+            trade_instrument=instrument,
+            position=position,
+            initial_stop_loss=Decimal("73000"),
+            stop_loss_algo_cl_ord_id="algo-1",
+        )
+
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(waits, [max(config.poll_seconds, 1.0), max(config.poll_seconds, 1.0)])
+        self.assertTrue(any("The read operation timed out" in message and "/6" in message for message in messages))
+        self.assertFalse(any("绛栫暐鍋滄" in message for message in messages))
+
+    def test_exchange_dynamic_stop_monitor_stops_after_consecutive_read_failures(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+        )
+        position = FilledPosition(
+            ord_id="ord-1",
+            cl_ord_id="cl-1",
+            inst_id="BTC-USDT-SWAP",
+            side="buy",
+            close_side="sell",
+            pos_side="long",
+            size=Decimal("0.01"),
+            entry_price=Decimal("75000"),
+            entry_ts=0,
+        )
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 鍔ㄦ€佸鎵?澶氬ご",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._find_managed_position = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OkxApiError("The read operation timed out"))
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            engine._monitor_exchange_dynamic_stop(
+                None,  # type: ignore[arg-type]
+                config,
+                trade_instrument=instrument,
+                position=position,
+                initial_stop_loss=Decimal("73000"),
+                stop_loss_algo_cl_ord_id="algo-1",
+            )
+
+        self.assertIn("The read operation timed out", str(ctx.exception))
+        self.assertIn(str(OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES), str(ctx.exception))
+        self.assertEqual(len(waits), OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES - 1)
+        self.assertEqual(
+            sum("The read operation timed out" in message and "/6" in message for message in messages),
+            OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES - 1,
+        )
 
     def test_place_entry_order_recovers_when_write_response_is_lost(self) -> None:
         messages: list[str] = []

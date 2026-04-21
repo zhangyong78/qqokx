@@ -13,6 +13,7 @@ from okx_quant.ui import (
     StrategyStopCleanupResult,
     _coerce_log_file_path,
     _format_network_error_message,
+    _infer_session_runtime_status,
     _mark_refresh_health_failure,
     _mark_refresh_health_success,
     _refresh_indicator_badge_text,
@@ -107,6 +108,18 @@ HTTP 502: <!DOCTYPE html>
         _mark_refresh_health_failure(state, "HTTP 502", at=datetime(2026, 4, 18, 12, 0, 20))
         _mark_refresh_health_failure(state, "HTTP 502", at=datetime(2026, 4, 18, 12, 0, 30))
         self.assertEqual(_refresh_indicator_badge_text(state), "\u8fc7\u671f x3")
+
+    def test_infer_session_runtime_status_maps_entry_and_position_phases(self) -> None:
+        self.assertEqual(_infer_session_runtime_status("准备挂单 | 方向=LONG"), "开仓监控中")
+        self.assertEqual(_infer_session_runtime_status("挂单已提交到 OKX | ordId=1"), "开仓监控中")
+        self.assertEqual(_infer_session_runtime_status("开始监控 OKX 动态止损 | 标的=BTC-USDT-SWAP"), "持仓监控中")
+        self.assertEqual(_infer_session_runtime_status("当前无法生成挂单 | 趋势未确认"), "等待信号")
+
+    def test_infer_session_runtime_status_preserves_existing_phase_during_okx_retry(self) -> None:
+        self.assertEqual(
+            _infer_session_runtime_status("OKX 读取异常，准备重试 | 操作=读取持仓 SWAP", "持仓监控中"),
+            "持仓监控中",
+        )
 
     def test_trade_order_session_role_matches_regular_strategy_order_prefix(self) -> None:
         session = SimpleNamespace(
@@ -210,6 +223,134 @@ HTTP 502: <!DOCTYPE html>
 class _FastEvent:
     def wait(self, timeout: float | None = None) -> bool:
         return False
+
+
+class _Var:
+    def __init__(self, value: str = "") -> None:
+        self._value = value
+
+    def get(self) -> str:
+        return self._value
+
+    def set(self, value: str) -> None:
+        self._value = value
+
+
+class _AfterRoot:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, object]] = []
+        self.canceled: list[object] = []
+
+    def after(self, delay: int, callback: object) -> str:
+        self.calls.append((delay, callback))
+        return f"job-{len(self.calls)}"
+
+    def after_cancel(self, job: object) -> None:
+        self.canceled.append(job)
+
+
+class CredentialProfileEnvironmentTest(TestCase):
+    def test_apply_credentials_profile_restores_environment_and_clears_effective_cache(self) -> None:
+        app = SimpleNamespace(
+            _credential_profiles={
+                "moni": {
+                    "api_key": "demo-key",
+                    "secret_key": "demo-secret",
+                    "passphrase": "demo-pass",
+                    "environment": "demo",
+                }
+            },
+            _loaded_credential_profile_name="real",
+            api_profile_name=_Var("real"),
+            api_key=_Var(),
+            secret_key=_Var(),
+            passphrase=_Var(),
+            environment_label=_Var("\u5b9e\u76d8 live"),
+            _default_environment_label="\u5b9e\u76d8 live",
+            _positions_effective_environment="live",
+            _sync_credential_profile_combo=MagicMock(),
+            _update_settings_summary=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+
+        def _set_credentials_fields(snapshot: dict[str, str]) -> None:
+            app.api_key.set(snapshot["api_key"])
+            app.secret_key.set(snapshot["secret_key"])
+            app.passphrase.set(snapshot["passphrase"])
+
+        app._set_credentials_fields = _set_credentials_fields
+        app._normalized_environment_label = lambda label, fallback=None: QuantApp._normalized_environment_label(
+            app, label, fallback=fallback
+        )
+        app._environment_label_for_profile = lambda profile_name: QuantApp._environment_label_for_profile(app, profile_name)
+        app._apply_profile_environment = lambda profile_name: QuantApp._apply_profile_environment(app, profile_name)
+
+        QuantApp._apply_credentials_profile(app, "moni", log_change=True)
+
+        self.assertEqual(app.api_profile_name.get(), "moni")
+        self.assertEqual(app.environment_label.get(), "\u6a21\u62df\u76d8 demo")
+        self.assertIsNone(app._positions_effective_environment)
+        self.assertEqual(
+            app._last_saved_credentials,
+            ("moni", "demo-key", "demo-secret", "demo-pass", "demo"),
+        )
+        app._enqueue_log.assert_called_once_with("\u5df2\u5207\u6362 API \u914d\u7f6e\uff1amoni")
+
+    def test_save_credentials_now_persists_environment_with_profile(self) -> None:
+        app = SimpleNamespace(
+            _credential_save_job=None,
+            _current_credentials_state=lambda: ("real", "live-key", "live-secret", "live-pass", "live"),
+            _last_saved_credentials=None,
+            _credential_profiles={},
+            _auto_save_notice_shown=False,
+            _sync_credential_profile_combo=MagicMock(),
+            _update_settings_summary=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+
+        with patch("okx_quant.ui.save_credentials_profiles_snapshot") as save_snapshot:
+            QuantApp._save_credentials_now(app, silent=True)
+
+        self.assertEqual(
+            app._credential_profiles["real"],
+            {
+                "api_key": "live-key",
+                "secret_key": "live-secret",
+                "passphrase": "live-pass",
+                "environment": "live",
+            },
+        )
+        save_snapshot.assert_called_once()
+
+    def test_on_environment_label_changed_schedules_profile_and_settings_save(self) -> None:
+        root = _AfterRoot()
+        save_credentials = MagicMock()
+        save_settings = MagicMock()
+        app = SimpleNamespace(
+            environment_label=_Var("\u5b9e\u76d8 live"),
+            _default_environment_label="\u6a21\u62df\u76d8 demo",
+            _positions_effective_environment="demo",
+            _update_settings_summary=MagicMock(),
+            _credential_watch_enabled=True,
+            _settings_watch_enabled=True,
+            _credential_save_job="cred-old",
+            _settings_save_job="settings-old",
+            root=root,
+            _save_credentials_now=save_credentials,
+            _save_notification_settings_now=save_settings,
+        )
+        app._normalized_environment_label = lambda label, fallback=None: QuantApp._normalized_environment_label(
+            app, label, fallback=fallback
+        )
+
+        QuantApp._on_environment_label_changed(app)
+
+        self.assertEqual(app._default_environment_label, "\u5b9e\u76d8 live")
+        self.assertIsNone(app._positions_effective_environment)
+        self.assertEqual(root.canceled, ["cred-old", "settings-old"])
+        self.assertEqual(root.calls, [(600, save_credentials), (600, save_settings)])
+        self.assertEqual(app._credential_save_job, "job-1")
+        self.assertEqual(app._settings_save_job, "job-2")
 
 
 class StrategyStopCleanupTest(TestCase):

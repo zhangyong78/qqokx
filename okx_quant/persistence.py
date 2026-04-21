@@ -15,6 +15,7 @@ SMART_ORDER_TASKS_FILE_NAME = ".okx_quant_smart_order_tasks.json"
 SMART_ORDER_FAVORITES_FILE_NAME = ".okx_quant_smart_order_favorites.json"
 OPTION_STRATEGIES_FILE_NAME = ".okx_quant_option_strategies.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
+PROFILE_ENVIRONMENTS = {"demo", "live"}
 
 
 def credentials_file_path(base_dir: Path | None = None) -> Path:
@@ -76,7 +77,22 @@ def _empty_credentials_snapshot() -> dict[str, str]:
         "api_key": "",
         "secret_key": "",
         "passphrase": "",
+        "environment": "",
     }
+
+
+def _normalize_credentials_environment(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    environment = str(payload.get("environment", "")).strip().lower()
+    if environment in PROFILE_ENVIRONMENTS:
+        return environment
+    environment_label = str(payload.get("environment_label", "")).strip().lower()
+    if environment_label.endswith("live"):
+        return "live"
+    if environment_label.endswith("demo"):
+        return "demo"
+    return ""
 
 
 def _normalize_credentials_profile(payload: object) -> dict[str, str]:
@@ -86,6 +102,7 @@ def _normalize_credentials_profile(payload: object) -> dict[str, str]:
         "api_key": str(payload.get("api_key", "")),
         "secret_key": str(payload.get("secret_key", "")),
         "passphrase": str(payload.get("passphrase", "")),
+        "environment": _normalize_credentials_environment(payload),
     }
 
 

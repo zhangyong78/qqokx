@@ -195,6 +195,19 @@ ENV_OPTIONS = {
     "模拟盘 demo": "demo",
     "实盘 live": "live",
 }
+
+
+def _blank_credential_profile_snapshot(*, environment: str = "") -> dict[str, str]:
+    snapshot = {
+        "api_key": "",
+        "secret_key": "",
+        "passphrase": "",
+    }
+    if environment in {"demo", "live"}:
+        snapshot["environment"] = environment
+    return snapshot
+
+
 TRIGGER_TYPE_OPTIONS = {
     "标记价格 mark": "mark",
     "最新成交价 last": "last",
@@ -479,12 +492,20 @@ class StrategySession:
     ended_reason: str = ""
     log_file_path: Path | None = None
     stop_cleanup_in_progress: bool = False
+    runtime_status: str = "启动中"
+    last_message: str = ""
 
     @property
     def log_prefix(self) -> str:
         if self.api_name:
             return f"[{self.api_name}] [{self.session_id} {self.strategy_name} {self.symbol}]"
         return f"[{self.session_id} {self.strategy_name} {self.symbol}]"
+
+    @property
+    def display_status(self) -> str:
+        if self.status == "运行中" and self.runtime_status:
+            return self.runtime_status
+        return self.status
 
 
 @dataclass
@@ -569,6 +590,44 @@ def _coerce_log_file_path(value: object) -> Path | None:
         return Path(raw).expanduser()
     except Exception:
         return None
+
+
+def _infer_session_runtime_status(message: str, current_status: str = "") -> str | None:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    if "OKX 读取异常，准备重试" in text or "OKX 读取失败" in text:
+        return current_status or "网络重试中"
+    if "开始监控 OKX 动态止损" in text or "开始本地止盈止损监控" in text:
+        return "持仓监控中"
+    if (
+        "挂单已成交" in text
+        or "初始 OKX 止损已提交" in text
+        or "动态止盈上移" in text
+        or "OKX 动态止损已上移" in text
+        or "OKX 动态止损候选价已过期" in text
+        or "OKX 动态止损委托暂未出现在挂单列表" in text
+        or "OKX 动态止损上移失败，稍后重试" in text
+    ):
+        return "持仓监控中"
+    if (
+        "准备挂单" in text
+        or "挂单已提交到 OKX" in text
+        or "委托追踪" in text
+        or "检测到挂单状态已变更" in text
+        or "挂单部分成交" in text
+    ):
+        return "开仓监控中"
+    if "已提交启动请求" in text:
+        return "启动中"
+    if (
+        "当前无法生成挂单" in text
+        or "当前无法生成动态开仓价" in text
+        or "当前无法生成本地开仓价" in text
+        or "已收盘K线数量不足" in text
+    ):
+        return "等待信号"
+    return current_status or None
 
 
 class QuantApp:
@@ -783,7 +842,7 @@ class QuantApp:
         self.max_entries_per_trend = StringVar(value="1")
         self.dynamic_two_r_break_even = BooleanVar(value=True)
         self.dynamic_fee_offset_enabled = BooleanVar(value=True)
-        self.time_stop_break_even_enabled = BooleanVar(value=True)
+        self.time_stop_break_even_enabled = BooleanVar(value=False)
         self.time_stop_break_even_bars = StringVar(value="10")
         self.run_mode_label = StringVar(value="交易并下单")
         self.trade_mode_label = StringVar(value="全仓 cross")
@@ -880,12 +939,13 @@ class QuantApp:
 
         self._credential_watch_enabled = False
         self._credential_save_job: str | None = None
-        self._last_saved_credentials: tuple[str, str, str, str] | None = None
+        self._last_saved_credentials: tuple[str, str, str, str, str] | None = None
         self._auto_save_notice_shown = False
         self._credential_profiles: dict[str, dict[str, str]] = {}
         self._header_credential_profile_combo: ttk.Combobox | None = None
         self._credential_profile_combo: ttk.Combobox | None = None
         self._loaded_credential_profile_name = DEFAULT_CREDENTIAL_PROFILE_NAME
+        self._default_environment_label = self.environment_label.get()
         self._strategy_history_tree: ttk.Treeview | None = None
         self._strategy_history_detail: Text | None = None
         self._strategy_history_selected_record_id: str | None = None
@@ -1242,7 +1302,7 @@ class QuantApp:
         self.session_tree.column("symbol", width=180, anchor="w")
         self.session_tree.column("direction", width=90, anchor="center")
         self.session_tree.column("mode", width=110, anchor="center")
-        self.session_tree.column("status", width=80, anchor="center")
+        self.session_tree.column("status", width=120, anchor="center")
         self.session_tree.column("started", width=120, anchor="center")
         self.session_tree.grid(row=0, column=0, sticky="nsew")
         self.session_tree.bind("<<TreeviewSelect>>", self._on_session_selected)
@@ -5804,12 +5864,41 @@ class QuantApp:
             return profile_name
         return self._current_credential_profile()
 
-    def _current_credentials_state(self) -> tuple[str, str, str, str]:
+    def _normalized_environment_label(self, label: str | None, *, fallback: str | None = None) -> str:
+        candidate = (label or "").strip()
+        if candidate in ENV_OPTIONS:
+            return candidate
+        fallback_candidate = (fallback or "").strip()
+        if fallback_candidate in ENV_OPTIONS:
+            return fallback_candidate
+        default_candidate = getattr(self, "_default_environment_label", "").strip()
+        if default_candidate in ENV_OPTIONS:
+            return default_candidate
+        return next(iter(ENV_OPTIONS))
+
+    def _environment_value_from_label(self, label: str | None) -> str:
+        return ENV_OPTIONS[self._normalized_environment_label(label)]
+
+    def _environment_label_for_profile(self, profile_name: str) -> str:
+        snapshot = self._credential_profiles.get(profile_name, {})
+        environment = str(snapshot.get("environment", "")).strip().lower()
+        if environment == "live":
+            return "实盘 live"
+        if environment == "demo":
+            return "模拟盘 demo"
+        return self._normalized_environment_label(None)
+
+    def _apply_profile_environment(self, profile_name: str) -> None:
+        self._positions_effective_environment = None
+        self.environment_label.set(self._environment_label_for_profile(profile_name))
+
+    def _current_credentials_state(self) -> tuple[str, str, str, str, str]:
         return (
             self._editing_credential_profile(),
             self.api_key.get().strip(),
             self.secret_key.get().strip(),
             self.passphrase.get().strip(),
+            self._environment_value_from_label(self.environment_label.get()),
         )
 
     def _set_credentials_fields(self, snapshot: dict[str, str]) -> None:
@@ -5835,7 +5924,10 @@ class QuantApp:
 
     def _apply_credentials_profile(self, profile_name: str, *, log_change: bool = False) -> None:
         target = profile_name.strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
-        snapshot = self._credential_profiles.get(target, {"api_key": "", "secret_key": "", "passphrase": ""})
+        snapshot = self._credential_profiles.get(target, _blank_credential_profile_snapshot())
+        stored_environment = str(snapshot.get("environment", "")).strip().lower()
+        if stored_environment not in {"demo", "live"}:
+            stored_environment = ""
         self._loaded_credential_profile_name = target
         self.api_profile_name.set(target)
         self._set_credentials_fields(snapshot)
@@ -5844,7 +5936,9 @@ class QuantApp:
             snapshot["api_key"],
             snapshot["secret_key"],
             snapshot["passphrase"],
+            stored_environment,
         )
+        self._apply_profile_environment(target)
         self._sync_credential_profile_combo()
         self._update_settings_summary()
         if log_change:
@@ -5861,7 +5955,7 @@ class QuantApp:
         self._credential_profiles = profiles if isinstance(profiles, dict) else {}
         self._sync_credential_profile_combo()
         self._apply_credentials_profile(str(snapshot.get("selected_profile", DEFAULT_CREDENTIAL_PROFILE_NAME)))
-        if any(self._current_credentials_state()[1:]):
+        if any(self._current_credentials_state()[1:4]):
             self._enqueue_log(f"已自动读取本地凭证文件：{credentials_file_path().name}")
 
     def _load_saved_notification_settings(self) -> None:
@@ -5871,7 +5965,6 @@ class QuantApp:
             self._enqueue_log(f"读取通知设置失败：{exc}")
             return
 
-        self.environment_label.set(str(snapshot["environment_label"]))
         self.trade_mode_label.set(str(snapshot["trade_mode_label"]))
         self.position_mode_label.set(str(snapshot["position_mode_label"]))
         self.trigger_type_label.set(str(snapshot["trigger_type_label"]))
@@ -5886,13 +5979,16 @@ class QuantApp:
         self.notify_trade_fills.set(bool(snapshot["notify_trade_fills"]))
         self.notify_signals.set(bool(snapshot["notify_signals"]))
         self.notify_errors.set(bool(snapshot["notify_errors"]))
+        self._default_environment_label = self._normalized_environment_label(str(snapshot["environment_label"]))
+        self.environment_label.set(self._default_environment_label)
+        self._apply_profile_environment(self._current_credential_profile())
         self._last_saved_notification_state = self._current_notification_state()
 
     def _bind_auto_save(self) -> None:
         self.api_key.trace_add("write", self._on_credentials_changed)
         self.secret_key.trace_add("write", self._on_credentials_changed)
         self.passphrase.trace_add("write", self._on_credentials_changed)
-        self.environment_label.trace_add("write", self._on_settings_changed)
+        self.environment_label.trace_add("write", self._on_environment_label_changed)
         self.trade_mode_label.trace_add("write", self._on_settings_changed)
         self.position_mode_label.trace_add("write", self._on_settings_changed)
         self.trigger_type_label.trace_add("write", self._on_settings_changed)
@@ -5932,6 +6028,19 @@ class QuantApp:
     def _on_settings_changed(self, *_: str) -> None:
         self._update_settings_summary()
 
+    def _on_environment_label_changed(self, *_: str) -> None:
+        self._default_environment_label = self._normalized_environment_label(self.environment_label.get())
+        self._positions_effective_environment = None
+        self._update_settings_summary()
+        if self._credential_watch_enabled:
+            if self._credential_save_job is not None:
+                self.root.after_cancel(self._credential_save_job)
+            self._credential_save_job = self.root.after(600, self._save_credentials_now)
+        if self._settings_watch_enabled:
+            if self._settings_save_job is not None:
+                self.root.after_cancel(self._settings_save_job)
+            self._settings_save_job = self.root.after(600, self._save_notification_settings_now)
+
     def _save_credentials_now(self, silent: bool = False) -> None:
         if self._credential_save_job is not None:
             try:
@@ -5945,11 +6054,12 @@ class QuantApp:
             return
 
         try:
-            profile_name, api_key, secret_key, passphrase = current
+            profile_name, api_key, secret_key, passphrase, environment = current
             self._credential_profiles[profile_name] = {
                 "api_key": api_key,
                 "secret_key": secret_key,
                 "passphrase": passphrase,
+                "environment": environment,
             }
             save_credentials_profiles_snapshot(
                 selected_profile=profile_name,
@@ -5961,7 +6071,7 @@ class QuantApp:
             return
 
         self._last_saved_credentials = current
-        if not silent and any(current[1:]) and not self._auto_save_notice_shown:
+        if not silent and any(current[1:4]) and not self._auto_save_notice_shown:
             self._enqueue_log(f"已自动保存 API 凭证到：{credentials_file_path().name}")
             self._auto_save_notice_shown = True
         self._sync_credential_profile_combo()
@@ -5984,7 +6094,9 @@ class QuantApp:
             return
         self._save_credentials_now(silent=True)
         if selected not in self._credential_profiles:
-            self._credential_profiles[selected] = {"api_key": "", "secret_key": "", "passphrase": ""}
+            self._credential_profiles[selected] = _blank_credential_profile_snapshot(
+                environment=self._environment_value_from_label(self.environment_label.get())
+            )
             save_credentials_profiles_snapshot(
                 selected_profile=selected,
                 profiles=self._credential_profiles,
@@ -5994,7 +6106,9 @@ class QuantApp:
     def _create_api_profile(self) -> None:
         self._save_credentials_now(silent=True)
         profile_name = self._next_api_profile_name()
-        self._credential_profiles[profile_name] = {"api_key": "", "secret_key": "", "passphrase": ""}
+        self._credential_profiles[profile_name] = _blank_credential_profile_snapshot(
+            environment=self._environment_value_from_label(self.environment_label.get())
+        )
         save_credentials_profiles_snapshot(
             selected_profile=profile_name,
             profiles=self._credential_profiles,
@@ -6029,7 +6143,7 @@ class QuantApp:
 
         self._save_credentials_now(silent=True)
         profiles = dict(self._credential_profiles)
-        profile_payload = profiles.pop(current_name, {"api_key": "", "secret_key": "", "passphrase": ""})
+        profile_payload = profiles.pop(current_name, _blank_credential_profile_snapshot())
         profiles[target_name] = profile_payload
         self._credential_profiles = profiles
         save_credentials_profiles_snapshot(
@@ -6052,7 +6166,9 @@ class QuantApp:
         profiles.pop(profile_name, None)
         if not profiles:
             next_profile = DEFAULT_CREDENTIAL_PROFILE_NAME
-            profiles[next_profile] = {"api_key": "", "secret_key": "", "passphrase": ""}
+            profiles[next_profile] = _blank_credential_profile_snapshot(
+                environment=self._environment_value_from_label(self.environment_label.get())
+            )
         else:
             next_profile = sorted(profiles.keys())[0]
 
@@ -7431,6 +7547,7 @@ class QuantApp:
         self.log_queue.put(line)
 
     def _log_session_message(self, session: StrategySession, message: str) -> None:
+        self._record_session_runtime_message(session.session_id, message)
         self._append_logged_message(
             f"{session.log_prefix} {message}",
             extra_log_path=session.log_file_path,
@@ -7448,6 +7565,7 @@ class QuantApp:
         prefix = f"[{api_name}] [{session_id} {strategy_name} {symbol}]" if api_name else f"[{session_id} {strategy_name} {symbol}]"
 
         def _logger(message: str) -> None:
+            self._record_session_runtime_message(session_id, message)
             self._append_logged_message(
                 f"{prefix} {message}",
                 extra_log_path=log_file_path,
@@ -7468,6 +7586,18 @@ class QuantApp:
         self._session_counter += 1
         return f"S{self._session_counter:02d}"
 
+    def _record_session_runtime_message(self, session_id: str, message: str) -> None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return
+        text = str(message or "").strip()
+        if not text:
+            return
+        session.last_message = text
+        inferred = _infer_session_runtime_status(text, session.runtime_status)
+        if inferred:
+            session.runtime_status = inferred
+
     def _upsert_session_row(self, session: StrategySession) -> None:
         values = (
             session.api_name or "-",
@@ -7475,7 +7605,7 @@ class QuantApp:
             session.symbol,
             session.direction_label,
             session.run_mode_label,
-            session.status,
+            session.display_status,
             session.started_at.strftime("%H:%M:%S"),
         )
         if self.session_tree.exists(session.session_id):
@@ -7504,6 +7634,7 @@ class QuantApp:
                 session_id=session.session_id,
                 api_name=session.api_name,
                 status=session.status,
+                runtime_status=session.runtime_status,
                 strategy_id=session.strategy_id,
                 strategy_name=session.strategy_name,
                 symbol=session.symbol,
@@ -7514,6 +7645,7 @@ class QuantApp:
                 ended_reason=session.ended_reason,
                 config_snapshot=_serialize_strategy_config_snapshot(session.config),
                 log_file_path=session.log_file_path,
+                last_message=session.last_message,
             )
         )
         self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
@@ -7564,6 +7696,8 @@ class QuantApp:
         log_file_path: str | Path | None = None,
         record_id: str | None = None,
         updated_at: datetime | None = None,
+        runtime_status: str | None = None,
+        last_message: str = "",
     ) -> str:
         try:
             definition = get_strategy_definition(strategy_id)
@@ -7592,6 +7726,10 @@ class QuantApp:
                 f"独立日志：{_coerce_log_file_path(log_file_path) or '-'}",
             ]
         )
+        if runtime_status and status == "运行中":
+            lines.append(f"最近运行状态：{runtime_status}")
+        if last_message:
+            lines.append(f"最近日志：{last_message}")
         if ended_reason:
             lines.append(f"结束原因：{ended_reason}")
         lines.extend(
@@ -7616,7 +7754,7 @@ class QuantApp:
                 lines.append(f"手续费偏移开关：{self._bool_label(snapshot.get('dynamic_fee_offset_enabled', True))}")
                 lines.append(
                     "时间保本："
-                    f"{self._bool_label(snapshot.get('time_stop_break_even_enabled', True))} / "
+                    f"{self._bool_label(snapshot.get('time_stop_break_even_enabled', False))} / "
                     f"{self._snapshot_text(snapshot, 'time_stop_break_even_bars', '10')}根"
                 )
         if self._strategy_uses_big_ema(strategy_id):

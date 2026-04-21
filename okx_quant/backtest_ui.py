@@ -926,7 +926,7 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         max_entries_per_trend=int(payload.get("max_entries_per_trend", 1)),
         dynamic_two_r_break_even=bool(payload.get("dynamic_two_r_break_even", True)),
         dynamic_fee_offset_enabled=bool(payload.get("dynamic_fee_offset_enabled", True)),
-        time_stop_break_even_enabled=bool(payload.get("time_stop_break_even_enabled", True)),
+        time_stop_break_even_enabled=bool(payload.get("time_stop_break_even_enabled", False)),
         time_stop_break_even_bars=int(payload.get("time_stop_break_even_bars", 10)),
         backtest_profile_id=str(payload.get("backtest_profile_id", "")),
         backtest_profile_name=str(payload.get("backtest_profile_name", "")),
@@ -1202,11 +1202,11 @@ class BacktestWindow:
         apply_adaptive_window_geometry(
             self.window,
             width_ratio=0.8,
-            height_ratio=0.8,
+            height_ratio=0.88,
             min_width=1100,
-            min_height=760,
+            min_height=840,
             max_width=1580,
-            max_height=1080,
+            max_height=1220,
         )
 
         self._strategy_name_to_id = {item.name: item.strategy_id for item in BACKTEST_STRATEGY_DEFINITIONS}
@@ -1311,7 +1311,7 @@ class BacktestWindow:
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
         self.window.rowconfigure(1, weight=1)
-        self.window.rowconfigure(2, weight=2)
+        self.window.rowconfigure(2, weight=3)
 
         controls = ttk.LabelFrame(self.window, text="回测参数", padding=16)
         controls.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))

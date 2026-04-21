@@ -34,6 +34,7 @@ LIVE_DYNAMIC_TAKER_FEE_RATE = Decimal("0.00036")
 OKX_READ_RETRY_ATTEMPTS = 4
 OKX_READ_RETRY_BASE_DELAY_SECONDS = 1.0
 OKX_READ_RETRY_MAX_DELAY_SECONDS = 5.0
+OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES = 6
 OKX_WRITE_RECONCILE_ATTEMPTS = 3
 OKX_WRITE_RECONCILE_BASE_DELAY_SECONDS = 1.0
 OKX_WRITE_RECONCILE_MAX_DELAY_SECONDS = 3.0
@@ -97,6 +98,14 @@ class LocalSignalTrigger:
     candle_ts: int
     signal_candle_high: Decimal | None
     signal_candle_low: Decimal | None
+
+
+@dataclass(frozen=True)
+class DynamicStopMonitorStepResult:
+    keep_monitoring: bool
+    current_stop_loss: Decimal
+    next_trigger_r: int
+    amend_failures: int
 
 
 class StrategyEngine:
@@ -1654,6 +1663,7 @@ class StrategyEngine:
         current_stop_loss = initial_stop_loss
         next_trigger_r = 2
         amend_failures = 0
+        consecutive_read_failures = 0
         risk_per_unit = abs(position.entry_price - initial_stop_loss)
         self._logger(
             " | ".join(
@@ -1669,6 +1679,51 @@ class StrategyEngine:
         )
 
         while not self._stop_event.is_set():
+            try:
+                should_continue = self._monitor_exchange_dynamic_stop_once(
+                    credentials,
+                    config,
+                    trade_instrument=trade_instrument,
+                    position=position,
+                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                    current_stop_loss=current_stop_loss,
+                    next_trigger_r=next_trigger_r,
+                    risk_per_unit=risk_per_unit,
+                    amend_failures=amend_failures,
+                )
+            except Exception as exc:
+                if self._stop_event.is_set():
+                    break
+                retryable_exc = _coerce_okx_read_exception(exc)
+                if retryable_exc is None or not _is_transient_okx_error(retryable_exc):
+                    raise
+                consecutive_read_failures += 1
+                detail = str(retryable_exc).strip() or f"code={retryable_exc.code or '-'}"
+                if consecutive_read_failures < OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES:
+                    self._logger(
+                        " | ".join(
+                            [
+                                "OKX 动态止损监控读取异常，保留当前止损并继续重试",
+                                f"连续失败={consecutive_read_failures}/{OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES}",
+                                detail,
+                            ]
+                        )
+                    )
+                    self._stop_event.wait(max(config.poll_seconds, 1.0))
+                    continue
+                raise RuntimeError(
+                    f"OKX 动态止损监控连续读取失败 {consecutive_read_failures} 次：{detail} | 已保留当前 OKX 止损，请人工检查"
+                ) from exc
+            else:
+                consecutive_read_failures = 0
+                current_stop_loss = should_continue.current_stop_loss
+                next_trigger_r = should_continue.next_trigger_r
+                amend_failures = should_continue.amend_failures
+                if not should_continue.keep_monitoring:
+                    return
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
             live_position = self._find_managed_position(credentials, config, trade_instrument, position)
             if live_position is None:
                 self._logger("未检测到策略持仓，OKX 动态止损监控结束。")
@@ -1803,6 +1858,191 @@ class StrategyEngine:
 
         self._logger("策略已停止，保留当前 OKX 动态止损。")
 
+    def _monitor_exchange_dynamic_stop_once(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        stop_loss_algo_cl_ord_id: str,
+        current_stop_loss: Decimal,
+        next_trigger_r: int,
+        risk_per_unit: Decimal,
+        amend_failures: int,
+    ) -> DynamicStopMonitorStepResult:
+        live_position = self._find_managed_position(credentials, config, trade_instrument, position)
+        if live_position is None:
+            self._logger("未检测到策略持仓，OKX 动态止损监控结束。")
+            return DynamicStopMonitorStepResult(
+                keep_monitoring=False,
+                current_stop_loss=current_stop_loss,
+                next_trigger_r=next_trigger_r,
+                amend_failures=amend_failures,
+            )
+
+        direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
+        current_price = self._get_trigger_price_with_retry(trade_instrument.inst_id, config.tp_sl_trigger_type)
+        holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
+        updated_stop_loss, next_trigger_price, updated_trigger_r, moved = _advance_dynamic_stop_live(
+            direction=direction,
+            current_price=current_price,
+            entry_price=position.entry_price,
+            risk_per_unit=risk_per_unit,
+            current_stop_loss=current_stop_loss,
+            next_trigger_r=next_trigger_r,
+            tick_size=trade_instrument.tick_size,
+            two_r_break_even=config.dynamic_two_r_break_even,
+            dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+            holding_bars=holding_bars,
+            time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+            time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+        )
+        should_amend = moved and (
+            updated_stop_loss > current_stop_loss if position.side == "buy" else updated_stop_loss < current_stop_loss
+        )
+        if not should_amend:
+            return DynamicStopMonitorStepResult(
+                keep_monitoring=True,
+                current_stop_loss=current_stop_loss,
+                next_trigger_r=next_trigger_r,
+                amend_failures=0,
+            )
+
+        fresh_price = self._get_trigger_price_with_retry(trade_instrument.inst_id, config.tp_sl_trigger_type)
+        if not _is_exchange_dynamic_stop_candidate_valid(
+            direction=direction,
+            current_price=fresh_price,
+            candidate_stop_loss=updated_stop_loss,
+        ):
+            self._logger(
+                " | ".join(
+                    [
+                        "OKX 动态止损候选价已过期，跳过本次上移",
+                        f"当前价={format_decimal(fresh_price)}",
+                        f"当前止损={format_decimal(current_stop_loss)}",
+                        f"候选止损={format_decimal(updated_stop_loss)}",
+                        f"下一触发价={format_decimal(next_trigger_price)}",
+                        f"algoClOrdId={stop_loss_algo_cl_ord_id}",
+                    ]
+                )
+            )
+            self._stop_event.wait(max(config.poll_seconds / 2, 0.5))
+            return DynamicStopMonitorStepResult(
+                keep_monitoring=True,
+                current_stop_loss=current_stop_loss,
+                next_trigger_r=next_trigger_r,
+                amend_failures=amend_failures,
+            )
+
+        algo_order = self._find_pending_algo_order_by_client_id(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+        )
+        if algo_order is None:
+            self._logger(
+                " | ".join(
+                    [
+                        "OKX 动态止损委托暂未出现在挂单列表，稍后重试",
+                        f"候选止损={format_decimal(updated_stop_loss)}",
+                        f"algoClOrdId={stop_loss_algo_cl_ord_id}",
+                    ]
+                )
+            )
+            self._stop_event.wait(max(config.poll_seconds / 2, 0.5))
+            return DynamicStopMonitorStepResult(
+                keep_monitoring=True,
+                current_stop_loss=current_stop_loss,
+                next_trigger_r=next_trigger_r,
+                amend_failures=amend_failures,
+            )
+
+        try:
+            self._amend_algo_order_with_recovery(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                algo_id=algo_order.algo_id,
+                algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                req_id=self._next_client_order_id(role="amd"),
+                new_stop_loss_trigger_price=updated_stop_loss,
+                new_stop_loss_trigger_price_type=config.tp_sl_trigger_type,
+            )
+        except OkxApiError as exc:
+            live_position = self._find_managed_position(credentials, config, trade_instrument, position)
+            if live_position is None:
+                self._logger("检测到持仓已关闭，停止 OKX 动态止损监控。")
+                return DynamicStopMonitorStepResult(
+                    keep_monitoring=False,
+                    current_stop_loss=current_stop_loss,
+                    next_trigger_r=next_trigger_r,
+                    amend_failures=amend_failures,
+                )
+            latest_price = self._get_trigger_price_with_retry(
+                trade_instrument.inst_id,
+                config.tp_sl_trigger_type,
+            )
+            detail = str(exc).strip() or f"code={exc.code or '-'}"
+            if not _is_exchange_dynamic_stop_candidate_valid(
+                direction=direction,
+                current_price=latest_price,
+                candidate_stop_loss=updated_stop_loss,
+            ):
+                self._logger(
+                    " | ".join(
+                        [
+                            "OKX 动态止损上移遇到快速回抽，本次改价已放弃",
+                            f"当前价={format_decimal(latest_price)}",
+                            f"候选止损={format_decimal(updated_stop_loss)}",
+                            f"algoClOrdId={stop_loss_algo_cl_ord_id}",
+                            detail,
+                        ]
+                    )
+                )
+                self._stop_event.wait(max(config.poll_seconds / 2, 0.5))
+                return DynamicStopMonitorStepResult(
+                    keep_monitoring=True,
+                    current_stop_loss=current_stop_loss,
+                    next_trigger_r=next_trigger_r,
+                    amend_failures=amend_failures,
+                )
+
+            next_amend_failures = amend_failures + 1
+            if next_amend_failures < 4:
+                self._logger(
+                    " | ".join(
+                        [
+                            "OKX 动态止损上移失败，稍后重试",
+                            f"当前价={format_decimal(latest_price)}",
+                            f"候选止损={format_decimal(updated_stop_loss)}",
+                            f"algoClOrdId={stop_loss_algo_cl_ord_id}",
+                            detail,
+                        ]
+                    )
+                )
+                self._stop_event.wait(max(config.poll_seconds / 2, 0.5))
+                return DynamicStopMonitorStepResult(
+                    keep_monitoring=True,
+                    current_stop_loss=current_stop_loss,
+                    next_trigger_r=next_trigger_r,
+                    amend_failures=next_amend_failures,
+                )
+            raise RuntimeError(f"OKX 动态止损上移失败：{detail}") from exc
+
+        self._logger(
+            f"OKX 动态止损已上移 | 当前价={format_decimal(fresh_price)} | "
+            f"新止损={format_decimal(updated_stop_loss)} | 下一阶段={updated_trigger_r}R | "
+            f"algoClOrdId={stop_loss_algo_cl_ord_id} | holding_bars={holding_bars}"
+        )
+        return DynamicStopMonitorStepResult(
+            keep_monitoring=True,
+            current_stop_loss=updated_stop_loss,
+            next_trigger_r=updated_trigger_r,
+            amend_failures=0,
+        )
+
     def _find_pending_algo_order_by_client_id(
         self,
         credentials: Credentials,
@@ -1860,12 +2100,53 @@ class StrategyEngine:
         for attempt in range(1, OKX_READ_RETRY_ATTEMPTS + 1):
             try:
                 return fn()
-            except OkxApiError as exc:
-                last_exc = exc
-                detail = str(exc).strip() or f"code={exc.code or '-'}"
-                if not _is_transient_okx_error(exc) or attempt >= OKX_READ_RETRY_ATTEMPTS or self._stop_event.is_set():
+            except Exception as exc:
+                okx_exc = _coerce_okx_read_exception(exc)
+                if okx_exc is None:
+                    raise
+                last_exc = okx_exc
+                detail = str(okx_exc).strip() or f"code={okx_exc.code or '-'}"
+                if (
+                    not _is_transient_okx_error(okx_exc)
+                    or attempt >= OKX_READ_RETRY_ATTEMPTS
+                    or self._stop_event.is_set()
+                ):
                     self._logger(f"OKX 读取失败 | 操作={label} | {detail}")
                     raise
+                self._logger(
+                    " | ".join(
+                        [
+                            "OKX 读取异常，准备重试",
+                            f"操作={label}",
+                            f"第{attempt}/{OKX_READ_RETRY_ATTEMPTS}次",
+                            detail,
+                        ]
+                    )
+                )
+                delay_seconds = min(OKX_READ_RETRY_BASE_DELAY_SECONDS * attempt, OKX_READ_RETRY_MAX_DELAY_SECONDS)
+                self._stop_event.wait(delay_seconds)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"OKX 读取失败：{label}")
+
+    def _call_okx_read_with_retry(self, label: str, fn: Callable[[], T]) -> T:
+        last_exc: OkxApiError | None = None
+        for attempt in range(1, OKX_READ_RETRY_ATTEMPTS + 1):
+            try:
+                return fn()
+            except Exception as exc:
+                okx_exc = _coerce_okx_read_exception(exc)
+                if okx_exc is None:
+                    raise
+                last_exc = okx_exc
+                detail = str(okx_exc).strip() or f"code={okx_exc.code or '-'}"
+                if (
+                    not _is_transient_okx_error(okx_exc)
+                    or attempt >= OKX_READ_RETRY_ATTEMPTS
+                    or self._stop_event.is_set()
+                ):
+                    self._logger(f"OKX 读取失败 | 操作={label} | {detail}")
+                    raise okx_exc
                 self._logger(
                     " | ".join(
                         [
@@ -2893,6 +3174,27 @@ def _is_exchange_dynamic_stop_candidate_valid(
     if direction == "long":
         return current_price > candidate_stop_loss
     return current_price < candidate_stop_loss
+
+
+def _coerce_okx_read_exception(exc: Exception) -> OkxApiError | None:
+    if isinstance(exc, OkxApiError):
+        return exc
+    detail = str(exc).strip()
+    lowered = detail.lower()
+    if isinstance(exc, OSError) and any(
+        marker in lowered
+        for marker in (
+            "timeout",
+            "timed out",
+            "handshake",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "eof occurred",
+        )
+    ):
+        return OkxApiError(f"网络错误：{detail or exc.__class__.__name__}")
+    return None
 
 
 def _is_transient_okx_error(exc: OkxApiError) -> bool:

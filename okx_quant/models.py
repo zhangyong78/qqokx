@@ -90,7 +90,7 @@ class StrategyConfig:
     entry_reference_ema_period: int = 55
     dynamic_two_r_break_even: bool = True
     dynamic_fee_offset_enabled: bool = True
-    time_stop_break_even_enabled: bool = True
+    time_stop_break_even_enabled: bool = False
     time_stop_break_even_bars: int = 10
     backtest_profile_id: str = ""
     backtest_profile_name: str = ""

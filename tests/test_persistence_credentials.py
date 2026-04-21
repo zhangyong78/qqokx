@@ -35,6 +35,7 @@ class CredentialProfilesPersistenceTest(TestCase):
                     "api_key": "legacy-key",
                     "secret_key": "legacy-secret",
                     "passphrase": "legacy-pass",
+                    "environment": "",
                 },
             )
 
@@ -76,15 +77,17 @@ class CredentialProfilesPersistenceTest(TestCase):
     def test_save_and_load_custom_profile_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".okx_quant_credentials.json"
+            main_profile = "\u4e3b\u8d26\u6237"
+            option_profile = "\u671f\u6743\u8d26\u6237"
             save_credentials_profiles_snapshot(
-                selected_profile="期权账户",
+                selected_profile=option_profile,
                 profiles={
-                    "主账户": {
+                    main_profile: {
                         "api_key": "main-key",
                         "secret_key": "main-secret",
                         "passphrase": "main-pass",
                     },
-                    "期权账户": {
+                    option_profile: {
                         "api_key": "option-key",
                         "secret_key": "option-secret",
                         "passphrase": "option-pass",
@@ -95,6 +98,51 @@ class CredentialProfilesPersistenceTest(TestCase):
 
             snapshot = load_credentials_profiles_snapshot(path)
 
-            self.assertEqual(snapshot["selected_profile"], "期权账户")
-            self.assertEqual(snapshot["profiles"]["主账户"]["api_key"], "main-key")
-            self.assertEqual(snapshot["profiles"]["期权账户"]["api_key"], "option-key")
+            self.assertEqual(snapshot["selected_profile"], option_profile)
+            self.assertEqual(snapshot["profiles"][main_profile]["api_key"], "main-key")
+            self.assertEqual(snapshot["profiles"][option_profile]["api_key"], "option-key")
+
+    def test_load_profile_environment_from_saved_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".okx_quant_credentials.json"
+            save_credentials_profiles_snapshot(
+                selected_profile="live",
+                profiles={
+                    "live": {
+                        "api_key": "live-key",
+                        "secret_key": "live-secret",
+                        "passphrase": "live-pass",
+                        "environment": "live",
+                    }
+                },
+                path=path,
+            )
+
+            snapshot = load_credentials_snapshot(path, profile_name="live")
+
+            self.assertEqual(snapshot["environment"], "live")
+
+    def test_load_profile_environment_from_environment_label_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".okx_quant_credentials.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "selected_profile": "demo",
+                        "profiles": {
+                            "demo": {
+                                "api_key": "demo-key",
+                                "secret_key": "demo-secret",
+                                "passphrase": "demo-pass",
+                                "environment_label": "\u6a21\u62df\u76d8 demo",
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            snapshot = load_credentials_snapshot(path, profile_name="demo")
+
+            self.assertEqual(snapshot["environment"], "demo")

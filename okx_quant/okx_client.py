@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import math
@@ -542,7 +542,7 @@ class OkxRestClient:
     def get_ticker(self, inst_id: str) -> OkxTicker:
         payload = self._request("GET", "/api/v5/market/ticker", params={"instId": inst_id})
         if not payload["data"]:
-            raise OkxApiError(f"OKX 未返回行情：{inst_id}")
+            raise OkxApiError(f"OKX 鏈繑鍥炶鎯咃細{inst_id}")
         first = payload["data"][0]
         return OkxTicker(
             inst_id=inst_id,
@@ -558,7 +558,7 @@ class OkxRestClient:
         size = max(1, min(depth, 400))
         payload = self._request("GET", "/api/v5/market/books", params={"instId": inst_id, "sz": str(size)})
         if not payload["data"]:
-            raise OkxApiError(f"OKX 未返回盘口：{inst_id}")
+            raise OkxApiError(f"OKX 鏈繑鍥炵洏鍙ｏ細{inst_id}")
         first = payload["data"][0]
         bids: list[tuple[Decimal, Decimal]] = []
         asks: list[tuple[Decimal, Decimal]] = []
@@ -1124,7 +1124,7 @@ class OkxRestClient:
         tp_sl = _extract_tp_sl_fields(item)
         return OkxTradeOrderItem(
             source_kind="algo",
-            source_label="算法委托",
+            source_label="绠楁硶濮旀墭",
             created_time=_to_int(item.get("cTime"), item.get("ts")),
             update_time=_to_int(item.get("uTime"), item.get("triggerTime"), item.get("actualTime"), item.get("ts")),
             inst_id=inst_id,
@@ -1173,7 +1173,7 @@ class OkxRestClient:
     ) -> OkxOrderResult:
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
-            raise OkxApiError("OKX 期权不支持这里的市价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
+            raise OkxApiError("OKX 鏈熸潈涓嶆敮鎸佽繖閲岀殑甯備环闄勫甫姝㈢泩姝㈡崯涓嬪崟锛岃鏀硅蛋鏈湴涓嬪崟/鏈湴姝㈢泩姝㈡崯娴佺▼")
 
         order: dict[str, Any] = {
             "instId": plan.inst_id,
@@ -1221,7 +1221,7 @@ class OkxRestClient:
     ) -> OkxOrderResult:
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
-            raise OkxApiError("OKX 期权不支持这里的限价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
+            raise OkxApiError("OKX 鏈熸潈涓嶆敮鎸佽繖閲岀殑闄愪环闄勫甫姝㈢泩姝㈡崯涓嬪崟锛岃鏀硅蛋鏈湴涓嬪崟/鏈湴姝㈢泩姝㈡崯娴佺▼")
 
         order: dict[str, Any] = {
             "instId": plan.inst_id,
@@ -1313,7 +1313,7 @@ class OkxRestClient:
         ticker = self.get_ticker(instrument.inst_id)
         base_price = _pick_aggressive_price(ticker, side)
         if base_price is None or base_price <= 0:
-            raise OkxApiError(f"{instrument.inst_id} 缺少可用买一卖一/最新价，无法下单")
+            raise OkxApiError(f"{instrument.inst_id} 缺少可用买一卖一或最新价，无法下单")
 
         if side == "buy":
             order_price = snap_to_increment(base_price + (instrument.tick_size * 2), instrument.tick_size, "up")
@@ -1345,7 +1345,7 @@ class OkxRestClient:
         cl_ord_id: str | None = None,
     ) -> OkxOrderStatus:
         if not ord_id and not cl_ord_id:
-            raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个。")
+            raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个")
         params = {"instId": inst_id}
         if ord_id:
             params["ordId"] = ord_id
@@ -1361,7 +1361,7 @@ class OkxRestClient:
         )
         if not payload["data"]:
             order_key = ord_id or cl_ord_id or ""
-            raise OkxApiError(f"OKX 未返回订单状态：{order_key}")
+            raise OkxApiError(f"OKX 鏈繑鍥炶鍗曠姸鎬侊細{order_key}")
 
         first = payload["data"][0]
         return OkxOrderStatus(
@@ -1403,7 +1403,7 @@ class OkxRestClient:
         cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
         if not ord_id and not cl_ord_id:
-            raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个。")
+            raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个")
         body = {"instId": inst_id}
         if ord_id:
             body["ordId"] = ord_id
@@ -1433,7 +1433,7 @@ class OkxRestClient:
         algo_cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
         if not algo_id and not algo_cl_ord_id:
-            raise ValueError("algo_id 和 algo_cl_ord_id 至少需要提供一个。")
+            raise ValueError("algo_id 和 algo_cl_ord_id 至少需要提供一个")
         body_item = {"instId": inst_id}
         if algo_id:
             body_item["algoId"] = algo_id
@@ -1566,7 +1566,7 @@ class OkxRestClient:
         headers = dict(DEFAULT_HEADERS)
         if auth:
             if credentials is None:
-                raise ValueError("鉴权请求缺少 API 凭证")
+                raise ValueError("閴存潈璇锋眰缂哄皯 API 鍑瘉")
             timestamp = _okx_timestamp()
             signature = _sign_request(timestamp, method, path, body_text, credentials.secret_key)
             headers.update(
@@ -1594,8 +1594,26 @@ class OkxRestClient:
         except error.URLError as exc:
             raise OkxApiError(f"网络错误：{exc.reason}") from exc
 
+        except OSError as exc:
+            detail = str(exc).strip()
+            lowered = detail.lower()
+            if any(
+                marker in lowered
+                for marker in (
+                    "timeout",
+                    "timed out",
+                    "handshake",
+                    "connection reset",
+                    "connection aborted",
+                    "connection refused",
+                    "eof occurred",
+                )
+            ):
+                raise OkxApiError(f"网络错误：{detail or exc.__class__.__name__}") from exc
+            raise
+
         if payload.get("code") not in {None, "0"}:
-            message = str(payload.get("msg") or "").strip() or f"OKX API 错误 code={payload.get('code')}"
+            message = str(payload.get("msg") or "").strip() or f"OKX API 閿欒 code={payload.get('code')}"
             raise OkxApiError(message, code=payload.get("code"))
         return payload
 
@@ -1743,7 +1761,7 @@ def _build_fill_history_item_from_bill(item: dict[str, Any]) -> OkxFillHistoryIt
         pnl=_first_decimal(item.get("pnl"), item.get("fillPnl"), item.get("balChg"), item.get("posBalChg")),
         order_id=item.get("ordId"),
         trade_id=item.get("tradeId"),
-        exec_type="行权/交割",
+        exec_type="琛屾潈/浜ゅ壊",
         raw=item,
     )
 
@@ -1770,9 +1788,9 @@ def _normalize_bill_exec_type(item: dict[str, Any]) -> str:
         return "exercise"
     if sub_type in {"112", "113"}:
         return "delivery"
-    if any(marker in text for marker in ("exercise", "行权")):
+    if any(marker in text for marker in ("exercise", "琛屾潈")):
         return "exercise"
-    if any(marker in text for marker in ("delivery", "交割", "expire", "expiration")):
+    if any(marker in text for marker in ("delivery", "浜ゅ壊", "expire", "expiration")):
         return "delivery"
     return ""
 
