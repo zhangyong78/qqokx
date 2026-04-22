@@ -1355,7 +1355,7 @@ class QuantApp:
         self._startup_chase_window_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
         self._startup_chase_window_hint_label = ttk.Label(
             start_frame,
-            text="0=启动默认不追老信号，仅在窗口内允许接管启动前刚确认的波段。",
+            text="0=不追单；300=只追启动前5分钟内刚确认的信号。",
         )
         self._startup_chase_window_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
 
