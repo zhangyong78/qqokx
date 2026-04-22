@@ -7,6 +7,34 @@ from okx_quant.okx_client import OkxApiError, OkxRestClient
 
 
 class OkxClientOrderRequestTest(TestCase):
+    def test_get_order_book_empty_payload_uses_readable_error_message(self) -> None:
+        client = OkxRestClient()
+        client._request = lambda *args, **kwargs: {"data": []}  # type: ignore[method-assign]
+
+        with self.assertRaises(OkxApiError) as context:
+            client.get_order_book("BTC-USDT-SWAP")
+
+        self.assertEqual(str(context.exception), "OKX 未返回盘口：BTC-USDT-SWAP")
+
+    def test_parse_algo_order_item_uses_readable_source_label(self) -> None:
+        client = OkxRestClient()
+
+        parsed = client._parse_algo_order_item(
+            {
+                "instId": "BTC-USDT-SWAP",
+                "instType": "SWAP",
+                "side": "buy",
+                "posSide": "long",
+                "ordType": "conditional",
+                "state": "live",
+                "algoId": "123",
+            },
+            default_inst_type="SWAP",
+        )
+
+        self.assertEqual(parsed.source_kind, "algo")
+        self.assertEqual(parsed.source_label, "算法委托")
+
     def test_amend_algo_order_posts_single_object_payload(self) -> None:
         client = OkxRestClient()
         captured: dict[str, object] = {}

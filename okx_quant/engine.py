@@ -1200,10 +1200,10 @@ class StrategyEngine:
         lookback = recommended_indicator_lookback(config.ema_period, config.trend_ema_period)
         last_candle_ts: int | None = None
 
-        self._logger(f"鍚姩淇″彿鐩戞帶 | 绛栫暐={self._strategy_name} | 鏍囩殑={instrument.inst_id} | K绾垮懆鏈?{config.bar}")
+        self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
         self._logger(
-            f"杩愯妯″紡锛氬彧鐩戞帶淇″彿锛屼笉涓嬪崟锛?EMA{config.ema_period}/EMA{config.trend_ema_period} "
-            "鍑虹幇閲戝弶姝诲弶鏃跺彂閫侀偖浠堕€氱煡銆?"
+            f"运行模式：只监控信号，不下单，EMA{config.ema_period}/EMA{config.trend_ema_period} "
+            "出现金叉死叉时发送邮件通知。"
         )
 
         while not self._stop_event.is_set():
@@ -1211,7 +1211,7 @@ class StrategyEngine:
             confirmed = [candle for candle in candles if candle.confirmed]
             minimum = max(config.ema_period, config.trend_ema_period) + 1
             if len(confirmed) < minimum:
-                self._logger("宸叉敹鐩?K 绾挎暟閲忎笉瓒筹紝缁х画绛夊緟鏇村鏁版嵁...")
+                self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
@@ -1223,17 +1223,17 @@ class StrategyEngine:
 
             decision = strategy.evaluate(confirmed, config)
             if decision.signal is None or decision.entry_reference is None or decision.ema_value is None:
-                self._logger(f"{_fmt_ts(newest_ts)} | 褰撳墠鏃?EMA5/EMA8 浜ゅ弶淇″彿 | {decision.reason}")
+                self._logger(f"{_fmt_ts(newest_ts)} | 当前无 EMA5/EMA8 交叉信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
             reason = (
-                f"EMA{config.ema_period}/EMA{config.trend_ema_period} 浜ゅ弶淇″彿 | "
+                f"EMA{config.ema_period}/EMA{config.trend_ema_period} 交叉信号 | "
                 f"EMA{config.trend_ema_period}={format_decimal(decision.ema_value)}"
             )
             self._logger(
-                f"{_fmt_ts(decision.candle_ts or newest_ts)} | 淇″彿瑙﹀彂 | 鏂瑰悜={decision.signal.upper()} | "
-                f"鍏ュ満鍙傝€冧环={format_decimal(decision.entry_reference)} | {reason}"
+                f"{_fmt_ts(decision.candle_ts or newest_ts)} | 信号触发 | 方向={decision.signal.upper()} | "
+                f"参考价={format_decimal(decision.entry_reference)} | {reason}"
             )
             self._notify_signal(
                 config,
@@ -1252,7 +1252,7 @@ class StrategyEngine:
         trade_instrument: Instrument,
     ) -> None:
         if resolve_trade_inst_id(config) != config.inst_id:
-            raise RuntimeError("4H EMA5/EMA8 绛栫暐鐩墠鍙敮鎸佷俊鍙锋爣鐨勪笌涓嬪崟鏍囩殑鐩稿悓")
+            raise RuntimeError("4H EMA5/EMA8 策略目前只支持信号标的与下单标的相同")
 
         strategy = EmaCrossEmaStopStrategy()
         lookback = recommended_indicator_lookback(config.ema_period, config.trend_ema_period)
@@ -1262,17 +1262,17 @@ class StrategyEngine:
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
         self._logger(
-            f"杩愯妯″紡锛?4H EMA{config.ema_period}/EMA{config.trend_ema_period} 浜ゅ弶寮€浠?+ EMA{config.trend_ema_period} 鍔ㄦ€佹鎹? "
-            f"| 淇″彿鏍囩殑={signal_instrument.inst_id}"
+            f"运行模式：4H EMA{config.ema_period}/EMA{config.trend_ema_period} 交叉开仓 + EMA{config.trend_ema_period} 动态止损 "
+            f"| 信号标的={signal_instrument.inst_id}"
         )
-        self._logger(f"椋庨櫓閲?{format_decimal(config.risk_amount or Decimal('100'))} | 淇″彿鏂瑰悜={config.signal_mode}")
+        self._logger(f"风险金={format_decimal(config.risk_amount or Decimal('100'))} | 信号方向={config.signal_mode}")
 
         while not self._stop_event.is_set():
             candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
             minimum = max(config.ema_period, config.trend_ema_period) + 1
             if len(confirmed) < minimum:
-                self._logger("宸叉敹鐩?K 绾挎暟閲忎笉瓒筹紝缁х画绛夊緟鏇村鏁版嵁...")
+                self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
@@ -1287,15 +1287,15 @@ class StrategyEngine:
             if active_position is not None and active_signal is not None:
                 stop_hit, stop_candle, stop_line = strategy.stop_triggered(confirmed, config, active_signal)
                 self._logger(
-                    f"{_fmt_ts(stop_candle.ts)} | 鎸佷粨鐩戞帶 | 鏂瑰悜={active_signal.upper()} | "
-                    f"褰撳墠鏀剁洏={format_decimal(stop_candle.close)} | EMA{config.trend_ema_period}={format_decimal(stop_line)}"
+                    f"{_fmt_ts(stop_candle.ts)} | 持仓监控 | 方向={active_signal.upper()} | "
+                    f"当前收盘价={format_decimal(stop_candle.close)} | EMA{config.trend_ema_period}={format_decimal(stop_line)}"
                 )
                 if stop_hit:
                     self._logger(
-                        f"{_fmt_ts(stop_candle.ts)} | EMA{config.trend_ema_period} 鍔ㄦ€佹鎹熻Е鍙? | "
-                        f"褰撳墠鏀剁洏={format_decimal(stop_candle.close)} | 鍔ㄦ€佹鎹熺嚎={format_decimal(stop_line)}"
+                        f"{_fmt_ts(stop_candle.ts)} | EMA{config.trend_ema_period} 动态止损触发 | "
+                        f"当前收盘价={format_decimal(stop_candle.close)} | 动态止损线={format_decimal(stop_line)}"
                     )
-                    self._close_position(credentials, config, trade_instrument, active_position, "姝㈡崯")
+                    self._close_position(credentials, config, trade_instrument, active_position, "止损")
                     active_position = None
                     active_signal = None
                 self._stop_event.wait(config.poll_seconds)
@@ -1303,7 +1303,7 @@ class StrategyEngine:
 
             decision = strategy.evaluate(confirmed, config)
             if decision.signal is None or decision.entry_reference is None or decision.ema_value is None:
-                self._logger(f"{_fmt_ts(newest_ts)} | 褰撳墠鏃?EMA5/EMA8 寮€浠撲俊鍙? | {decision.reason}")
+                self._logger(f"{_fmt_ts(newest_ts)} | 当前无 EMA5/EMA8 开仓信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
@@ -1317,8 +1317,8 @@ class StrategyEngine:
             )
             active_signal = decision.signal
             self._logger(
-                f"{_fmt_ts(decision.candle_ts or newest_ts)} | 鍔ㄦ€?EMA 姝㈡崯绛栫暐宸插紑浠? | "
-                f"鏂瑰悜={decision.signal.upper()} | EMA{config.trend_ema_period} 姝㈡崯绾?{format_decimal(current_stop_line)}"
+                f"{_fmt_ts(decision.candle_ts or newest_ts)} | 动态 EMA 止损策略已开仓 | "
+                f"方向={decision.signal.upper()} | EMA{config.trend_ema_period} 止损线={format_decimal(current_stop_line)}"
             )
             self._stop_event.wait(config.poll_seconds)
 
@@ -1344,9 +1344,9 @@ class StrategyEngine:
             risk_price_compatible=True,
         )
         self._logger(
-            f"{_fmt_ts(signal_candle_ts)} | 鍑嗗涓嬪崟 | 鏂瑰悜={signal.upper()} | "
-            f"棰勪及鍏ュ満浠?{format_decimal(price_for_size)} | EMA姝㈡崯绾?{format_decimal(stop_price)} | "
-            f"鏁伴噺={format_decimal(size)}"
+            f"{_fmt_ts(signal_candle_ts)} | 准备下单 | 方向={signal.upper()} | "
+            f"预估入场价={format_decimal(price_for_size)} | EMA止损线={format_decimal(stop_price)} | "
+            f"下单数量={format_decimal(size)}"
         )
         result = self._place_entry_order(credentials, config, trade_instrument, trade_side, size, pos_side)
         filled = self._wait_for_order_fill(
@@ -1359,18 +1359,18 @@ class StrategyEngine:
             estimated_entry=price_for_size,
         )
         self._logger(
-            f"EMA 浜ゅ弶涓嬪崟鎴愪氦 | ordId={filled.ord_id} | 鏍囩殑={trade_instrument.inst_id} | "
-            f"鏂瑰悜={trade_side.upper()} | 鎴愪氦鍧囦环={format_decimal(filled.entry_price)} | "
-            f"鎴愪氦鏁伴噺={format_decimal(filled.size)}"
+            f"EMA 交叉开仓已成交 | ordId={filled.ord_id} | 标的={trade_instrument.inst_id} | "
+            f"方向={trade_side.upper()} | 成交均价={format_decimal(filled.entry_price)} | "
+            f"成交数量={format_decimal(filled.size)}"
         )
         self._notify_trade_fill(
             config,
-            title="寮€浠撴垚浜?",
+            title="开仓成交",
             symbol=trade_instrument.inst_id,
             side=trade_side,
             size=filled.size,
             price=filled.entry_price,
-            reason=f"EMA{config.ema_period}/EMA{config.trend_ema_period} 浜ゅ弶淇″彿鎴愪氦",
+            reason=f"EMA{config.ema_period}/EMA{config.trend_ema_period} 交叉信号成交",
         )
         self._logger(f"委托追踪 | clOrdId={filled.cl_ord_id or '-'} | ordId={filled.ord_id}")
         return filled

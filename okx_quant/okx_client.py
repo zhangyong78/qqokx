@@ -558,7 +558,7 @@ class OkxRestClient:
         size = max(1, min(depth, 400))
         payload = self._request("GET", "/api/v5/market/books", params={"instId": inst_id, "sz": str(size)})
         if not payload["data"]:
-            raise OkxApiError(f"OKX 鏈繑鍥炵洏鍙ｏ細{inst_id}")
+            raise OkxApiError(f"OKX 未返回盘口：{inst_id}")
         first = payload["data"][0]
         bids: list[tuple[Decimal, Decimal]] = []
         asks: list[tuple[Decimal, Decimal]] = []
@@ -1124,7 +1124,7 @@ class OkxRestClient:
         tp_sl = _extract_tp_sl_fields(item)
         return OkxTradeOrderItem(
             source_kind="algo",
-            source_label="绠楁硶濮旀墭",
+            source_label="算法委托",
             created_time=_to_int(item.get("cTime"), item.get("ts")),
             update_time=_to_int(item.get("uTime"), item.get("triggerTime"), item.get("actualTime"), item.get("ts")),
             inst_id=inst_id,
@@ -1173,7 +1173,7 @@ class OkxRestClient:
     ) -> OkxOrderResult:
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
-            raise OkxApiError("OKX 鏈熸潈涓嶆敮鎸佽繖閲岀殑甯備环闄勫甫姝㈢泩姝㈡崯涓嬪崟锛岃鏀硅蛋鏈湴涓嬪崟/鏈湴姝㈢泩姝㈡崯娴佺▼")
+            raise OkxApiError("OKX 期权不支持这里的市价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
 
         order: dict[str, Any] = {
             "instId": plan.inst_id,
@@ -1221,7 +1221,7 @@ class OkxRestClient:
     ) -> OkxOrderResult:
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
-            raise OkxApiError("OKX 鏈熸潈涓嶆敮鎸佽繖閲岀殑闄愪环闄勫甫姝㈢泩姝㈡崯涓嬪崟锛岃鏀硅蛋鏈湴涓嬪崟/鏈湴姝㈢泩姝㈡崯娴佺▼")
+            raise OkxApiError("OKX 期权不支持这里的限价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
 
         order: dict[str, Any] = {
             "instId": plan.inst_id,
@@ -1613,7 +1613,7 @@ class OkxRestClient:
             raise
 
         if payload.get("code") not in {None, "0"}:
-            message = str(payload.get("msg") or "").strip() or f"OKX API 閿欒 code={payload.get('code')}"
+            message = str(payload.get("msg") or "").strip() or f"OKX API 错误 code={payload.get('code')}"
             raise OkxApiError(message, code=payload.get("code"))
         return payload
 

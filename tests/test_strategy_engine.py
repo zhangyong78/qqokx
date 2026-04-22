@@ -518,7 +518,7 @@ class StrategyEngineTest(TestCase):
         engine = StrategyEngine(
             None,  # type: ignore[arg-type]
             messages.append,
-            strategy_name="EMA 鍔ㄦ€佸鎵?澶氬ご",
+            strategy_name="EMA 动态委托-多头",
             session_id="S01",
         )
         engine._stop_event = _StopStub()  # type: ignore[assignment]
@@ -531,7 +531,7 @@ class StrategyEngineTest(TestCase):
                 raise TimeoutError("The read operation timed out")
             return "ok"
 
-        result = engine._call_okx_read_with_retry("璇诲彇瑙﹀彂浠锋牸", _flaky_read)
+        result = engine._call_okx_read_with_retry("读取触发价格", _flaky_read)
 
         self.assertEqual(result, "ok")
         self.assertEqual(attempts["count"], 3)
@@ -668,7 +668,7 @@ class StrategyEngineTest(TestCase):
         engine = StrategyEngine(
             None,  # type: ignore[arg-type]
             messages.append,
-            strategy_name="EMA 鍔ㄦ€佸鎵?澶氬ご",
+            strategy_name="EMA 动态委托-多头",
             session_id="S01",
         )
         engine._stop_event = _StopStub()  # type: ignore[assignment]
@@ -695,7 +695,7 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(attempts["count"], 3)
         self.assertEqual(waits, [max(config.poll_seconds, 1.0), max(config.poll_seconds, 1.0)])
         self.assertTrue(any("The read operation timed out" in message and "/6" in message for message in messages))
-        self.assertFalse(any("绛栫暐鍋滄" in message for message in messages))
+        self.assertFalse(any("策略停止" in message for message in messages))
 
     def test_exchange_dynamic_stop_monitor_stops_after_consecutive_read_failures(self) -> None:
         messages: list[str] = []
@@ -749,7 +749,7 @@ class StrategyEngineTest(TestCase):
         engine = StrategyEngine(
             None,  # type: ignore[arg-type]
             messages.append,
-            strategy_name="EMA 鍔ㄦ€佸鎵?澶氬ご",
+            strategy_name="EMA 动态委托-多头",
             session_id="S01",
         )
         engine._stop_event = _StopStub()  # type: ignore[assignment]

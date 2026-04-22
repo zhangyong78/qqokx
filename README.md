@@ -1,6 +1,6 @@
 # OKX 策略工作台
 
-当前版本：`v0.3.104`
+当前版本：`v0.3.105`
 
 这是一个面向 OKX 的桌面交易工作台，围绕“监控、交易、保护、回测、分析”构建。当前项目已经包含：
 
@@ -560,7 +560,14 @@ ATR 批量矩阵规则：
 - `.okx_quant_candle_cache/`
 
 ## 11. 更新日志
-当前版本：v0.3.104
+当前版本：v0.3.105
+
+### v0.3.105
+
+- 已清理 `EMA5/EMA8` 实盘策略相关乱码文案：包括信号监控、运行模式、无信号提示、动态止损触发、准备下单、开仓成交、委托追踪等日志与提示，统一恢复为正常中文。
+- 已清理 `OKX` 客户端中的用户可见乱码文案：包括 `算法委托`、`OKX 未返回盘口`、期权不支持“市价/限价附带止盈止损下单”的报错，以及 `OKX API 错误 code=...` 的兜底提示。
+- 已同步更新相关测试样例与断言，并补充 `get_order_book` 空返回报错文案、算法委托来源文案的覆盖。
+- 已完成本轮验证：`python -m py_compile okx_quant\engine.py okx_quant\okx_client.py tests\test_strategy_engine.py tests\test_okx_client_orders.py`、`python -m unittest tests.test_strategy_engine tests.test_okx_client_orders`（`39` 项测试通过）。
 
 ### v0.3.104
 
