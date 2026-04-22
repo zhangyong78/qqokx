@@ -764,6 +764,11 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             payload.get("dynamic_fee_offset_enabled"),
             bool(_strategy_config_default("dynamic_fee_offset_enabled")),
         ),
+        startup_chase_window_seconds=_coerce_snapshot_int(
+            payload.get("startup_chase_window_seconds"),
+            int(_strategy_config_default("startup_chase_window_seconds")),
+            minimum=0,
+        ),
         time_stop_break_even_enabled=_coerce_snapshot_bool(
             payload.get("time_stop_break_even_enabled"),
             bool(_strategy_config_default("time_stop_break_even_enabled")),
@@ -842,6 +847,7 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
         or "委托追踪" in text
         or "检测到挂单状态已变更" in text
         or "挂单部分成交" in text
+        or "启动追单窗口内接管当前波段" in text
     ):
         return "开仓监控中"
     if "已提交启动请求" in text:
@@ -851,6 +857,11 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
         or "当前无法生成动态开仓价" in text
         or "当前无法生成本地开仓价" in text
         or "已收盘K线数量不足" in text
+        or "启动默认不追老信号" in text
+        or "启动追单窗口已过期，当前不追单" in text
+        or "开仓次数已达上限" in text
+        or "信号次数已达上限" in text
+        or "本轮持仓已结束，继续监控下一次信号" in text
     ):
         return "等待信号"
     return current_status or None
@@ -1067,6 +1078,7 @@ class QuantApp:
         self.signal_mode_label = StringVar(value=STRATEGY_DEFINITIONS[0].default_signal_label)
         self.take_profit_mode_label = StringVar(value="动态止盈")
         self.max_entries_per_trend = StringVar(value="1")
+        self.startup_chase_window_seconds = StringVar(value="0")
         self.dynamic_two_r_break_even = BooleanVar(value=True)
         self.dynamic_fee_offset_enabled = BooleanVar(value=True)
         self.time_stop_break_even_enabled = BooleanVar(value=False)
@@ -1335,6 +1347,17 @@ class QuantApp:
         self._max_entries_per_trend_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
         self._max_entries_per_trend_entry = ttk.Entry(start_frame, textvariable=self.max_entries_per_trend)
         self._max_entries_per_trend_entry.grid(row=row, column=3, sticky="ew", pady=(12, 0))
+
+        row += 1
+        self._startup_chase_window_label = ttk.Label(start_frame, text="启动追单窗口(秒)")
+        self._startup_chase_window_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self._startup_chase_window_entry = ttk.Entry(start_frame, textvariable=self.startup_chase_window_seconds)
+        self._startup_chase_window_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
+        self._startup_chase_window_hint_label = ttk.Label(
+            start_frame,
+            text="0=启动默认不追老信号，仅在窗口内允许接管启动前刚确认的波段。",
+        )
+        self._startup_chase_window_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
 
         row += 1
         self._dynamic_two_r_break_even_check = ttk.Checkbutton(
@@ -7421,6 +7444,9 @@ class QuantApp:
             self._take_profit_mode_combo.grid()
             self._max_entries_per_trend_label.grid()
             self._max_entries_per_trend_entry.grid()
+            self._startup_chase_window_label.grid()
+            self._startup_chase_window_entry.grid()
+            self._startup_chase_window_hint_label.grid()
             self._dynamic_two_r_break_even_check.grid()
             self._dynamic_fee_offset_check.grid()
             self._dynamic_fee_offset_hint_label.grid()
@@ -7434,6 +7460,9 @@ class QuantApp:
             self._take_profit_mode_combo.grid_remove()
             self._max_entries_per_trend_label.grid_remove()
             self._max_entries_per_trend_entry.grid_remove()
+            self._startup_chase_window_label.grid_remove()
+            self._startup_chase_window_entry.grid_remove()
+            self._startup_chase_window_hint_label.grid_remove()
             self._dynamic_two_r_break_even_check.grid_remove()
             self._dynamic_fee_offset_check.grid_remove()
             self._dynamic_fee_offset_hint_label.grid_remove()
@@ -7478,6 +7507,8 @@ class QuantApp:
             self._big_ema_entry.grid_remove()
         if is_dynamic_strategy_id(definition.strategy_id) and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
+        if is_dynamic_strategy_id(definition.strategy_id) and not self.startup_chase_window_seconds.get().strip():
+            self.startup_chase_window_seconds.set("0")
         self._sync_dynamic_take_profit_controls()
         self.strategy_summary_text.set(definition.summary)
         self.strategy_rule_text.set(definition.rule_description)
@@ -7544,6 +7575,7 @@ class QuantApp:
                     f"挂单参考EMA：{config.entry_reference_ema_label()}",
                     f"止盈方式：{self.take_profit_mode_label.get()}",
                     f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}",
+                    f"启动追单窗口：{config.startup_chase_window_label()}",
                 ]
             )
             if config.take_profit_mode == "dynamic":
@@ -7584,9 +7616,14 @@ class QuantApp:
         risk_amount = self._parse_optional_positive_decimal(self.risk_amount.get(), "风险金")
         order_size = self._parse_optional_positive_decimal(self.order_size.get(), "固定数量") or Decimal("0")
         max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
+        startup_chase_window_seconds = 0
         entry_reference_ema_period = 0
         if is_dynamic_strategy_id(definition.strategy_id):
             entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
+            startup_chase_window_seconds = self._parse_nonnegative_int(
+                self.startup_chase_window_seconds.get(),
+                "启动追单窗口(秒)",
+            )
 
         if not api_key or not secret_key or not passphrase:
             raise ValueError("请先在 菜单 > 设置 > API 与通知设置 中填写 API 凭证")
@@ -7627,6 +7664,7 @@ class QuantApp:
                 run_mode="trade",
                 take_profit_mode="fixed",
                 max_entries_per_trend=max_entries_per_trend,
+                startup_chase_window_seconds=0,
             )
         if run_mode == "trade":
             if tp_sl_mode == "exchange":
@@ -7680,6 +7718,7 @@ class QuantApp:
             run_mode=run_mode,
             take_profit_mode=TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()],
             max_entries_per_trend=max_entries_per_trend,
+            startup_chase_window_seconds=startup_chase_window_seconds if is_dynamic_strategy_id(definition.strategy_id) else 0,
             dynamic_two_r_break_even=self.dynamic_two_r_break_even.get()
             if is_dynamic_strategy_id(definition.strategy_id)
             else False,
@@ -8029,6 +8068,11 @@ class QuantApp:
             else:
                 entry_reference_label = f"跟随EMA小周期(EMA{ema_period or '-'})"
             lines.append(f"挂单参考EMA：{entry_reference_label}")
+            startup_window_seconds = self._snapshot_int(snapshot, "startup_chase_window_seconds") or 0
+            lines.append(
+                "启动追单窗口："
+                + ("关闭（启动不追老信号）" if startup_window_seconds <= 0 else f"{startup_window_seconds}秒")
+            )
             if self._snapshot_text(snapshot, "take_profit_mode", "dynamic") == "dynamic":
                 lines.append(f"2R保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}")
                 lines.append(f"手续费偏移开关：{self._bool_label(snapshot.get('dynamic_fee_offset_enabled', True))}")

@@ -108,6 +108,13 @@ class DynamicStopMonitorStepResult:
     amend_failures: int
 
 
+@dataclass
+class StartupSignalGateState:
+    started_at_ms: int
+    chase_window_seconds: int
+    blocked_signal: Literal["long", "short"] | None = None
+
+
 class StrategyEngine:
     def __init__(
         self,
@@ -226,6 +233,13 @@ class StrategyEngine:
         active_order: ManagedEntryOrder | None = None
         idle_signal_candle_ts: int | None = None
         dynamic_stop_only = config.take_profit_mode == "dynamic"
+        current_wave_signal: Literal["long", "short"] | None = None
+        entries_in_current_wave = 0
+        current_wave_index = 0
+        startup_gate = StartupSignalGateState(
+            started_at_ms=int(time.time() * 1000),
+            chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+        )
 
         self._log_strategy_start(config, instrument, instrument)
         self._logger("运行模式：同标的永续下单，止盈止损交给 OKX 托管")
@@ -233,11 +247,15 @@ class StrategyEngine:
             f"策略规则：以上一根已收盘 K 线的 {_dynamic_entry_reference_ema_text(config)} 作为开仓价直接挂限价单。"
             f"每根新 K 线确认后，撤掉旧单，再按最新上一根 {_dynamic_entry_reference_ema_text(config)} 重新挂单。"
         )
-        self._logger(
-            f"方向={_format_signal_mode(config.signal_mode)} | 风险金={format_decimal(config.risk_amount)} | "
-            f"止损ATR倍数={format_decimal(config.atr_stop_multiplier)} | "
-            f"止盈ATR倍数={format_decimal(config.atr_take_multiplier)}"
-        )
+        mode_parts = [
+            f"方向={_format_signal_mode(config.signal_mode)}",
+            f"风险金={format_decimal(config.risk_amount)}",
+            f"止损ATR倍数={format_decimal(config.atr_stop_multiplier)}",
+            f"止盈ATR倍数={format_decimal(config.atr_take_multiplier)}",
+            f"每波最多开仓次数={config.max_entries_per_trend or 0}",
+            f"启动追单窗口={config.startup_chase_window_label()}",
+        ]
+        self._logger(" | ".join(mode_parts))
         if dynamic_stop_only:
             self._logger(
                 f"动态止盈已启用 | 2R保本={config.dynamic_two_r_break_even_label()} | "
@@ -281,6 +299,7 @@ class StrategyEngine:
                 if state == "filled":
                     filled_price = status.avg_price or status.price or active_order.entry_reference
                     filled_size = status.filled_size or active_order.size
+                    entries_in_current_wave += 1
                     self._logger(
                         f"{_fmt_ts(newest_ts)} | 挂单已成交 | ordId={status.ord_id} | "
                         f"开仓价={format_decimal(filled_price)} | 数量={format_decimal(filled_size)}"
@@ -299,18 +318,18 @@ class StrategyEngine:
                         price=filled_price,
                         reason=fill_reason,
                     )
+                    position = FilledPosition(
+                        ord_id=status.ord_id,
+                        cl_ord_id=active_order.cl_ord_id,
+                        inst_id=instrument.inst_id,
+                        side=active_order.side,
+                        close_side="sell" if active_order.side == "buy" else "buy",
+                        pos_side=resolve_open_pos_side(config, active_order.side),
+                        size=filled_size,
+                        entry_price=filled_price,
+                        entry_ts=int(time.time() * 1000),
+                    )
                     if dynamic_stop_only:
-                        position = FilledPosition(
-                            ord_id=status.ord_id,
-                            cl_ord_id=active_order.cl_ord_id,
-                            inst_id=instrument.inst_id,
-                            side=active_order.side,
-                            close_side="sell" if active_order.side == "buy" else "buy",
-                            pos_side=resolve_open_pos_side(config, active_order.side),
-                            size=filled_size,
-                            entry_price=filled_price,
-                            entry_ts=int(time.time() * 1000),
-                        )
                         self._logger(
                             f"初始 OKX 止损已提交 | algoClOrdId={active_order.stop_loss_algo_cl_ord_id or '-'} | "
                             f"止损={format_decimal(active_order.stop_loss)} | 启动动态上移监控"
@@ -324,8 +343,19 @@ class StrategyEngine:
                             stop_loss_algo_cl_ord_id=active_order.stop_loss_algo_cl_ord_id,
                         )
                     else:
-                        self._logger("止盈止损已附加到 OKX 主单，本次策略结束。")
-                    return
+                        self._logger("止盈止损已附加到 OKX 主单，开始监控持仓是否结束。")
+                        self._monitor_exchange_managed_position_until_closed(
+                            credentials,
+                            config,
+                            trade_instrument=instrument,
+                            position=position,
+                        )
+                    active_order = None
+                    idle_signal_candle_ts = None
+                    if self._stop_event.is_set():
+                        return
+                    self._logger("本轮持仓已结束，继续监控下一次信号。")
+                    continue
                 if state == "partially_filled":
                     filled_price = status.avg_price or status.price or active_order.entry_reference
                     filled_size = status.filled_size or active_order.size
@@ -365,15 +395,48 @@ class StrategyEngine:
                 continue
 
             decision = strategy.evaluate(confirmed, config)
+            last_candle_ts = newest_ts
             if decision.signal is None:
+                current_wave_signal = None
+                entries_in_current_wave = 0
+                _reset_startup_signal_gate(startup_gate)
                 idle_signal_candle_ts = newest_ts
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无法生成挂单 | {decision.reason}")
-                last_candle_ts = newest_ts
                 self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                 continue
 
             if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
                 raise RuntimeError("策略返回的数据不完整，无法生成挂单计划")
+
+            should_skip_startup_signal, startup_gate_message = _should_skip_startup_signal(
+                startup_gate,
+                signal=decision.signal,
+                candle_ts=decision.candle_ts,
+                bar=config.bar,
+            )
+            if startup_gate_message:
+                self._logger(startup_gate_message)
+            if should_skip_startup_signal:
+                idle_signal_candle_ts = newest_ts
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
+
+            if current_wave_signal != decision.signal:
+                current_wave_signal = decision.signal
+                entries_in_current_wave = 0
+                current_wave_index += 1
+                self._logger(
+                    f"{_fmt_ts(decision.candle_ts)} | 第{current_wave_index}波趋势开始 | 方向={decision.signal.upper()}"
+                )
+
+            if config.max_entries_per_trend > 0 and entries_in_current_wave >= config.max_entries_per_trend:
+                idle_signal_candle_ts = newest_ts
+                self._logger(
+                    f"{_fmt_ts(decision.candle_ts)} | 第{current_wave_index}波趋势开仓次数已达上限 | "
+                    f"方向={decision.signal.upper()} | 上限={config.max_entries_per_trend}"
+                )
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
 
             plan = build_order_plan(
                 instrument=instrument,
@@ -388,6 +451,7 @@ class StrategyEngine:
             )
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 准备挂单 | 方向={plan.signal.upper()} | "
+                f"第{current_wave_index}波 | 本波第{entries_in_current_wave + 1}次委托 | "
                 f"开仓价={format_decimal(plan.entry_reference)} | 数量={format_decimal(plan.size)} | "
                 f"止损={format_decimal(plan.stop_loss)} | "
                 f"{'动态止盈=初始不挂止盈' if dynamic_stop_only else f'止盈={format_decimal(plan.take_profit)}'}"
@@ -423,7 +487,6 @@ class StrategyEngine:
                 signal=plan.signal,
             )
             idle_signal_candle_ts = None
-            last_candle_ts = newest_ts
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 挂单已提交到 OKX | ordId={result.ord_id or '-'} | "
                 f"sCode={result.s_code} | sMsg={result.s_msg or 'accepted'}"
@@ -862,6 +925,10 @@ class StrategyEngine:
         current_wave_signal: Literal["long", "short"] | None = None
         entries_in_current_wave = 0
         current_wave_index = 0
+        startup_gate = StartupSignalGateState(
+            started_at_ms=int(time.time() * 1000),
+            chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+        )
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
         self._log_local_mode_summary(config, signal_instrument, trade_instrument)
@@ -873,6 +940,7 @@ class StrategyEngine:
             f"止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}",
             f"每波最多开仓次数={config.max_entries_per_trend or 0}",
             f"挂单参考={_dynamic_entry_reference_ema_text(config)}",
+            f"启动追单窗口={config.startup_chase_window_label()}",
         ]
         if config.take_profit_mode == "dynamic":
             mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
@@ -908,12 +976,27 @@ class StrategyEngine:
                     active_trigger = None
                     current_wave_signal = None
                     entries_in_current_wave = 0
+                    _reset_startup_signal_gate(startup_gate)
                     idle_signal_candle_ts = newest_ts
                     self._logger(f"{_fmt_ts(newest_ts)} | 当前无法生成动态开仓价 | {decision.reason}")
                     self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                     continue
                 if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
                     raise RuntimeError("策略返回的数据不完整，无法生成本地触发条件。")
+
+                should_skip_startup_signal, startup_gate_message = _should_skip_startup_signal(
+                    startup_gate,
+                    signal=decision.signal,
+                    candle_ts=decision.candle_ts,
+                    bar=config.bar,
+                )
+                if startup_gate_message:
+                    self._logger(startup_gate_message)
+                if should_skip_startup_signal:
+                    active_trigger = None
+                    idle_signal_candle_ts = newest_ts
+                    self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                    continue
 
                 if current_wave_signal != decision.signal:
                     current_wave_signal = decision.signal
@@ -989,6 +1072,8 @@ class StrategyEngine:
             entries_in_current_wave += 1
             active_trigger = None
             self._monitor_local_exit_v2(credentials, config, trade_instrument, position, protection)
+            if not self._stop_event.is_set():
+                self._logger("本轮持仓已结束，继续监控下一次信号。")
 
     def _run_dynamic_signal_only_v2(
         self,
@@ -1012,6 +1097,10 @@ class StrategyEngine:
         current_wave_signal: Literal["long", "short"] | None = None
         entries_in_current_wave = 0
         current_wave_index = 0
+        startup_gate = StartupSignalGateState(
+            started_at_ms=int(time.time() * 1000),
+            chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+        )
 
         self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
         mode_parts = [
@@ -1020,6 +1109,7 @@ class StrategyEngine:
             f"止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}",
             f"每波最多开仓次数={config.max_entries_per_trend or 0}",
             f"挂单参考={_dynamic_entry_reference_ema_text(config)}",
+            f"启动追单窗口={config.startup_chase_window_label()}",
         ]
         if config.take_profit_mode == "dynamic":
             mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
@@ -1054,12 +1144,25 @@ class StrategyEngine:
             if decision.signal is None:
                 current_wave_signal = None
                 entries_in_current_wave = 0
+                _reset_startup_signal_gate(startup_gate)
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无动态委托信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
             if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
                 raise RuntimeError("策略返回的数据不完整，无法生成信号提醒。")
+
+            should_skip_startup_signal, startup_gate_message = _should_skip_startup_signal(
+                startup_gate,
+                signal=decision.signal,
+                candle_ts=decision.candle_ts,
+                bar=config.bar,
+            )
+            if startup_gate_message:
+                self._logger(startup_gate_message)
+            if should_skip_startup_signal:
+                self._stop_event.wait(config.poll_seconds)
+                continue
 
             if current_wave_signal != decision.signal:
                 current_wave_signal = decision.signal
@@ -2051,6 +2154,52 @@ class StrategyEngine:
             amend_failures=0,
         )
 
+    def _monitor_exchange_managed_position_until_closed(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+    ) -> None:
+        consecutive_read_failures = 0
+        saw_live_position = False
+        while not self._stop_event.is_set():
+            try:
+                live_position = self._find_managed_position(credentials, config, trade_instrument, position)
+            except OkxApiError as exc:
+                consecutive_read_failures += 1
+                detail = str(exc).strip() or f"code={exc.code or '-'}"
+                if consecutive_read_failures < OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES:
+                    self._logger(
+                        " | ".join(
+                            [
+                                "OKX 托管持仓读取异常，保留当前 OKX 止盈止损，稍后重试",
+                                f"第{consecutive_read_failures}/{OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES}次",
+                                detail,
+                            ]
+                        )
+                    )
+                    self._stop_event.wait(max(config.poll_seconds, 1.0))
+                    continue
+                raise RuntimeError(
+                    "OKX 托管持仓连续读取失败 "
+                    f"{OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES} 次：{detail} | 已保留当前 OKX 止盈止损，请人工检查"
+                ) from exc
+
+            consecutive_read_failures = 0
+            if live_position is None:
+                if saw_live_position:
+                    self._logger("检测到 OKX 托管持仓已结束。")
+                else:
+                    self._logger("未再检测到策略持仓，视为本轮 OKX 托管持仓已结束。")
+                return
+
+            saw_live_position = True
+            self._stop_event.wait(config.poll_seconds)
+
+        self._logger("策略已停止，保留当前 OKX 托管止盈止损。")
+
     def _find_pending_algo_order_by_client_id(
         self,
         credentials: Credentials,
@@ -3009,6 +3158,10 @@ def _bar_to_milliseconds_live(bar: str) -> int:
     raise ValueError(f"不支持的 K 线周期：{bar}")
 
 
+def _signal_confirmation_ts_ms(candle_ts: int, bar: str) -> int:
+    return candle_ts + _bar_to_milliseconds_live(bar)
+
+
 def _holding_bars_live(entry_ts: int, reference_ts: int, bar: str) -> int:
     if reference_ts <= entry_ts:
         return 0
@@ -3182,6 +3335,50 @@ def _is_exchange_dynamic_stop_candidate_valid(
     if direction == "long":
         return current_price > candidate_stop_loss
     return current_price < candidate_stop_loss
+
+
+def _reset_startup_signal_gate(gate_state: StartupSignalGateState) -> None:
+    gate_state.blocked_signal = None
+
+
+def _should_skip_startup_signal(
+    gate_state: StartupSignalGateState,
+    *,
+    signal: Literal["long", "short"],
+    candle_ts: int,
+    bar: str,
+) -> tuple[bool, str | None]:
+    if gate_state.blocked_signal is not None and gate_state.blocked_signal != signal:
+        gate_state.blocked_signal = None
+
+    if gate_state.blocked_signal == signal:
+        return True, None
+
+    confirmation_ts = _signal_confirmation_ts_ms(candle_ts, bar)
+    if confirmation_ts > gate_state.started_at_ms:
+        return False, None
+
+    signal_age_seconds = max((gate_state.started_at_ms - confirmation_ts) // 1000, 0)
+    window_seconds = max(int(gate_state.chase_window_seconds), 0)
+    if window_seconds > 0 and signal_age_seconds <= window_seconds:
+        return (
+            False,
+            f"{_fmt_ts(candle_ts)} | 启动追单窗口内接管当前波段 | 方向={signal.upper()} | "
+            f"信号年龄={signal_age_seconds}秒 | 窗口={window_seconds}秒",
+        )
+
+    gate_state.blocked_signal = signal
+    if window_seconds > 0:
+        return (
+            True,
+            f"{_fmt_ts(candle_ts)} | 启动追单窗口已过期，当前不追单 | 方向={signal.upper()} | "
+            f"信号年龄={signal_age_seconds}秒 | 窗口={window_seconds}秒 | 等待当前波失效后再接管",
+        )
+    return (
+        True,
+        f"{_fmt_ts(candle_ts)} | 启动默认不追老信号 | 方向={signal.upper()} | 当前波已在启动前确认 | "
+        "等待当前波失效后再接管",
+    )
 
 
 def _coerce_okx_read_exception(exc: Exception) -> OkxApiError | None:

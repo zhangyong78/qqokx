@@ -121,6 +121,11 @@ HTTP 502: <!DOCTYPE html>
             "持仓监控中",
         )
 
+    def test_infer_session_runtime_status_maps_startup_gate_and_round_completion_to_waiting(self) -> None:
+        self.assertEqual(_infer_session_runtime_status("启动默认不追老信号 | 方向=LONG"), "等待信号")
+        self.assertEqual(_infer_session_runtime_status("启动追单窗口已过期，当前不追单 | 方向=LONG"), "等待信号")
+        self.assertEqual(_infer_session_runtime_status("本轮持仓已结束，继续监控下一次信号。"), "等待信号")
+
     def test_trade_order_session_role_matches_regular_strategy_order_prefix(self) -> None:
         session = SimpleNamespace(
             session_id="S01",

@@ -90,6 +90,7 @@ class StrategyConfig:
     entry_reference_ema_period: int = 55
     dynamic_two_r_break_even: bool = True
     dynamic_fee_offset_enabled: bool = True
+    startup_chase_window_seconds: int = 0
     time_stop_break_even_enabled: bool = False
     time_stop_break_even_bars: int = 10
     backtest_profile_id: str = ""
@@ -122,6 +123,15 @@ class StrategyConfig:
 
     def dynamic_fee_offset_enabled_label(self) -> str:
         return "\u5f00\u542f" if self.dynamic_fee_offset_enabled else "\u5173\u95ed"
+
+    def resolved_startup_chase_window_seconds(self) -> int:
+        return max(int(self.startup_chase_window_seconds), 0)
+
+    def startup_chase_window_label(self) -> str:
+        seconds = self.resolved_startup_chase_window_seconds()
+        if seconds <= 0:
+            return "\u5173\u95ed\uff08\u542f\u52a8\u4e0d\u8ffd\u8001\u4fe1\u53f7\uff09"
+        return f"{seconds}\u79d2"
 
     def resolved_time_stop_break_even_bars(self) -> int:
         return max(int(self.time_stop_break_even_bars), 0)
