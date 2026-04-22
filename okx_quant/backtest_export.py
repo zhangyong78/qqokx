@@ -42,6 +42,10 @@ FEE_TYPE_TO_LABEL = {
 }
 
 
+def _format_candle_limit_text(candle_limit: int) -> str:
+    return "全量" if candle_limit <= 0 else str(candle_limit)
+
+
 def export_single_backtest_report(
     result: BacktestResult,
     config: StrategyConfig,
@@ -178,7 +182,7 @@ def _build_single_backtest_report_text(
         f"交易对：{config.inst_id}",
         f"周期：{BAR_VALUE_TO_LABEL.get(config.bar, config.bar)}",
         f"信号方向：{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)}",
-        f"回测K线数：{candle_limit}",
+        f"回测K线数：{_format_candle_limit_text(candle_limit)}",
         f"开始时间：{_format_result_start(result)}",
         f"结束时间：{_format_result_end(result)}",
         f"参数摘要：{_build_param_summary(config, result)}",
@@ -231,7 +235,7 @@ def _build_batch_backtest_report_text(
         f"交易对：{first_config.inst_id}",
         f"周期：{BAR_VALUE_TO_LABEL.get(first_config.bar, first_config.bar)}",
         f"信号方向：{SIGNAL_VALUE_TO_LABEL.get(first_config.signal_mode, first_config.signal_mode)}",
-        f"回测K线数：{candle_limit}",
+        f"回测K线数：{_format_candle_limit_text(candle_limit)}",
         f"开始时间：{_format_timestamp(min(starts)) if starts else '-'}",
         f"结束时间：{_format_timestamp(max(ends)) if ends else '-'}",
         _build_batch_scope_line(sorted_results, batch_mode),

@@ -294,7 +294,8 @@ class OkxRestClient:
         return self._parse_candles_payload(payload)
 
     def get_candles_history(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
-        requested_limit = max(1, limit)
+        fetch_full_history = limit <= 0
+        requested_limit = 0 if fetch_full_history else max(1, limit)
         cached = load_candle_cache(inst_id, bar)
         cached_ts = {candle.ts for candle in cached}
         latest_added_ts: set[int] = set()
@@ -304,18 +305,21 @@ class OkxRestClient:
             latest_batch = self._fetch_history_candles_page(
                 inst_id,
                 bar,
-                limit=min(requested_limit, MAX_PUBLIC_CANDLE_LIMIT),
+                limit=MAX_PUBLIC_CANDLE_LIMIT if fetch_full_history else min(requested_limit, MAX_PUBLIC_CANDLE_LIMIT),
             )
         except Exception:
-            returned = cached[-requested_limit:]
+            returned = list(cached) if fetch_full_history else cached[-requested_limit:]
             self.last_candle_history_stats = {
-                "cache_hit_count": min(len(returned), requested_limit),
+                "cache_hit_count": len(returned) if fetch_full_history else min(len(returned), requested_limit),
                 "latest_fetch_count": 0,
                 "older_fetch_count": 0,
                 "requested_count": requested_limit,
                 "returned_count": len(returned),
+                "full_history": fetch_full_history,
             }
-            if len(cached) >= requested_limit:
+            if fetch_full_history and cached:
+                return returned
+            if not fetch_full_history and len(cached) >= requested_limit:
                 return returned
             raise
 
@@ -325,8 +329,10 @@ class OkxRestClient:
         collected = merge_candles(cached, latest_batch)
         after = str(collected[0].ts) if collected else None
 
-        while len(collected) < requested_limit and after is not None:
-            page_limit = min(requested_limit - len(collected), MAX_PUBLIC_CANDLE_LIMIT)
+        while after is not None:
+            if not fetch_full_history and len(collected) >= requested_limit:
+                break
+            page_limit = MAX_PUBLIC_CANDLE_LIMIT if fetch_full_history else min(requested_limit - len(collected), MAX_PUBLIC_CANDLE_LIMIT)
             batch = self._fetch_history_candles_page(inst_id, bar, limit=page_limit, after=after)
             if not batch:
                 break
@@ -345,9 +351,9 @@ class OkxRestClient:
             inst_id,
             bar,
             collected,
-            max_records=max(DEFAULT_CANDLE_CACHE_CAPACITY, requested_limit),
+            max_records=max(DEFAULT_CANDLE_CACHE_CAPACITY, requested_limit, len(collected)),
         )
-        returned = collected[-requested_limit:]
+        returned = list(collected) if fetch_full_history else collected[-requested_limit:]
         returned_ts = {candle.ts for candle in returned}
         self.last_candle_history_stats = {
             "cache_hit_count": len(returned_ts & cached_ts),
@@ -355,6 +361,7 @@ class OkxRestClient:
             "older_fetch_count": len(returned_ts & older_added_ts),
             "requested_count": requested_limit,
             "returned_count": len(returned),
+            "full_history": fetch_full_history,
         }
         return returned
 
@@ -370,14 +377,15 @@ class OkxRestClient:
     ) -> list[Candle]:
         if start_ts > end_ts:
             raise ValueError("开始时间不能晚于结束时间")
-        requested_limit = max(1, limit)
+        fetch_full_history = limit <= 0
+        requested_limit = 0 if fetch_full_history else max(1, limit)
         preload_limit = max(0, preload_count)
         selected_collected: list[Candle] = []
         preload_collected: list[Candle] = []
         after = str(end_ts + 1)
 
         while after is not None:
-            enough_selected = len(selected_collected) >= requested_limit
+            enough_selected = (not fetch_full_history) and len(selected_collected) >= requested_limit
             enough_preload = len(preload_collected) >= preload_limit
             if enough_selected and enough_preload:
                 break
@@ -404,14 +412,18 @@ class OkxRestClient:
             if len(batch) < page_limit:
                 break
 
-        selected_returned = selected_collected[-requested_limit:]
+        selected_returned = list(selected_collected) if fetch_full_history else selected_collected[-requested_limit:]
         preload_returned = preload_collected[-preload_limit:] if preload_limit > 0 else []
         returned = merge_candles(preload_returned, selected_returned)
         save_candle_cache(
             inst_id,
             bar,
             merge_candles(load_candle_cache(inst_id, bar), merge_candles(preload_collected, selected_collected)),
-            max_records=max(DEFAULT_CANDLE_CACHE_CAPACITY, requested_limit + preload_limit),
+            max_records=max(
+                DEFAULT_CANDLE_CACHE_CAPACITY,
+                requested_limit + preload_limit,
+                len(preload_collected) + len(selected_collected),
+            ),
         )
         self.last_candle_history_stats = {
             "range_mode": True,
@@ -421,6 +433,7 @@ class OkxRestClient:
             "selected_count": len(selected_returned),
             "preload_count": len(preload_returned),
             "returned_count": len(returned),
+            "full_history": fetch_full_history,
         }
         return returned
 

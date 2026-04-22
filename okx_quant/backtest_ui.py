@@ -17,6 +17,7 @@ from okx_quant.backtest import (
     BacktestReport,
     BacktestResult,
     BacktestTrade,
+    MAX_BACKTEST_CANDLES,
     build_parameter_batch_configs,
     format_backtest_report,
     run_backtest,
@@ -82,6 +83,7 @@ BACKTEST_SYMBOL_OPTIONS = (
     "BNB-USDT-SWAP",
     "DOGE-USDT-SWAP",
 )
+BACKTEST_HISTORY_SYNC_BARS = ("5m", "15m", "1H", "4H")
 DEFAULT_MAKER_FEE_PERCENT = "0.015"
 DEFAULT_TAKER_FEE_PERCENT = "0.036"
 BACKTEST_SIZING_OPTIONS = {
@@ -320,6 +322,10 @@ def _backtest_bar_value_from_label(label: str) -> str:
     return BACKTEST_BAR_LABEL_TO_VALUE[_normalize_backtest_bar_label(label)]
 
 
+def _format_backtest_candle_limit(candle_limit: int) -> str:
+    return "全量" if candle_limit <= 0 else str(candle_limit)
+
+
 def _build_backtest_symbol_options(current_symbol: str) -> tuple[str, ...]:
     normalized = current_symbol.strip().upper()
     if normalized and normalized not in BACKTEST_SYMBOL_OPTIONS:
@@ -501,7 +507,7 @@ def _build_backtest_compare_detail(snapshot: _BacktestSnapshot) -> str:
         f"策略：{strategy_name}",
         f"交易对：{config.inst_id}",
         f"K线周期：{_normalize_backtest_bar_label(config.bar)}",
-        f"回测K线数：{snapshot.candle_limit}",
+        f"回测K线数：{_format_backtest_candle_limit(snapshot.candle_limit)}",
         f"参数：{_build_backtest_param_summary(config, maker_fee_rate=snapshot.maker_fee_rate, taker_fee_rate=snapshot.taker_fee_rate)}",
         f"开始时间：{start_text}",
         f"结束时间：{end_text}",
@@ -1245,6 +1251,9 @@ class BacktestWindow:
         self.trigger_type_label = StringVar(value=initial_state.trigger_type_label)
         self.environment_label = StringVar(value=initial_state.environment_label)
         self.candle_limit = StringVar(value=initial_state.candle_limit)
+        self.history_sync_status = StringVar(
+            value="填 0 = 全量；填 10000 = 最新往前 10000 根。可先点“同步历史数据”下载 5 个币种的 5m / 15m / 1H / 4H 全量缓存。"
+        )
         self.report_summary = StringVar(value="点击“开始回测”后，会在这里显示报告摘要。")
         self.manual_summary = StringVar(value="当前策略未启用人工接管池。")
         self.manual_filter_label = StringVar(value="全部")
@@ -1274,6 +1283,7 @@ class BacktestWindow:
         self._manual_tree_position_map: dict[str, BacktestManualPosition] = {}
         self._current_snapshot_id: str | None = None
         self._backtest_running = False
+        self._history_sync_running = False
         self._batch_sequence = 0
         self._batch_snapshot_groups: dict[str, list[str]] = {}
         self._snapshot_batch_labels: dict[str, str] = {}
@@ -1494,9 +1504,12 @@ class BacktestWindow:
         ttk.Entry(controls, textvariable=self.candle_limit).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
         ttk.Label(
             controls,
-            text="当前回测区间最多支持 10000 根已收盘 K 线",
+            text="填 0 = 全量；填 10000 = 最新往前 10000 根；正数上限 10000。",
         ).grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Button(controls, text="开始回测", command=self.start_backtest).grid(row=row, column=4, columnspan=2, sticky="e", pady=(12, 0))
+        self.sync_history_button = ttk.Button(controls, text="同步历史数据", command=self.sync_history_data)
+        self.sync_history_button.grid(row=row, column=4, sticky="e", pady=(12, 0), padx=(0, 8))
+        self.batch_backtest_button = ttk.Button(controls, text="开始回测", command=self.start_backtest)
+        self.batch_backtest_button.grid(row=row, column=5, sticky="e", pady=(12, 0))
 
         row += 1
         batch_note = ttk.Frame(controls)
@@ -1514,9 +1527,8 @@ class BacktestWindow:
         self.single_backtest_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
         ttk.Label(
             batch_note,
-            text="回测取数已支持 10000 根区间 K 线，并会自动补足前置预热数据、优先使用本地历史缓存。",
+            textvariable=self.history_sync_status,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.batch_backtest_button = None
 
         report_frame = ttk.Panedwindow(self.window, orient="horizontal")
         report_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
@@ -2045,7 +2057,7 @@ class BacktestWindow:
         messagebox.showerror("回测失败", str(exc), parent=self.window)
 
     def start_backtest(self) -> None:
-        if self._backtest_running:
+        if self._backtest_running or self._history_sync_running:
             return
         if self._selected_strategy_definition().strategy_id == STRATEGY_EMA5_EMA8_ID:
             self.start_single_backtest()
@@ -2071,7 +2083,7 @@ class BacktestWindow:
         ).start()
 
     def start_single_backtest(self) -> None:
-        if self._backtest_running:
+        if self._backtest_running or self._history_sync_running:
             return
         try:
             config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts = self._build_backtest_request()
@@ -2094,7 +2106,7 @@ class BacktestWindow:
             raise ValueError("开始时间不能晚于结束时间")
         return (
             self._build_config(),
-            self._parse_positive_int(self.candle_limit.get(), "回测K线数"),
+            self._parse_backtest_candle_limit(self.candle_limit.get()),
             self._parse_fee_percent(self.maker_fee_percent.get(), "Maker手续费"),
             self._parse_fee_percent(self.taker_fee_percent.get(), "Taker手续费"),
             start_ts,
@@ -2248,11 +2260,89 @@ class BacktestWindow:
 
     def _set_backtest_running(self, running: bool) -> None:
         self._backtest_running = running
-        state = "disabled" if running else "normal"
+        self._refresh_action_button_states()
+
+    def _set_history_sync_running(self, running: bool) -> None:
+        self._history_sync_running = running
+        self._refresh_action_button_states()
+
+    def _refresh_action_button_states(self) -> None:
+        state = "disabled" if (self._backtest_running or self._history_sync_running) else "normal"
         if self._widget_exists(getattr(self, "single_backtest_button", None)):
             self.single_backtest_button.configure(state=state)
         if self._widget_exists(getattr(self, "batch_backtest_button", None)):
             self.batch_backtest_button.configure(state=state)
+        if self._widget_exists(getattr(self, "sync_history_button", None)):
+            self.sync_history_button.configure(state=state)
+
+    def sync_history_data(self) -> None:
+        if self._backtest_running or self._history_sync_running:
+            return
+        tasks = [(symbol, bar) for symbol in BACKTEST_SYMBOL_OPTIONS for bar in BACKTEST_HISTORY_SYNC_BARS]
+        self.history_sync_status.set(
+            f"正在同步历史数据（0/{len(tasks)}）：5 个币种 x 4 个周期，全量缓存下载中，请稍候..."
+        )
+        self._set_history_sync_running(True)
+        threading.Thread(
+            target=self._run_history_sync_worker,
+            args=(tasks,),
+            daemon=True,
+        ).start()
+
+    def _run_history_sync_worker(self, tasks: list[tuple[str, str]]) -> None:
+        results: list[tuple[str, str, int, str | None]] = []
+        try:
+            total = len(tasks)
+            for index, (symbol, bar) in enumerate(tasks, start=1):
+                if self._ui_alive():
+                    progress_text = (
+                        f"正在同步历史数据（{index}/{total}）："
+                        f"{symbol} | {_normalize_backtest_bar_label(bar)} | 全量历史"
+                    )
+                    self.window.after(0, lambda text=progress_text: self.history_sync_status.set(text))
+                try:
+                    candles = self.client.get_candles_history(symbol, bar, limit=0)
+                    results.append((symbol, bar, len(candles), None))
+                except Exception as exc:
+                    results.append((symbol, bar, 0, str(exc)))
+            if self._ui_alive():
+                self.window.after(0, lambda: self._apply_history_sync_results(results))
+        except Exception as exc:
+            if self._ui_alive():
+                self.window.after(0, lambda error=exc: self._show_history_sync_error(error))
+
+    def _apply_history_sync_results(self, results: list[tuple[str, str, int, str | None]]) -> None:
+        if not self._ui_alive():
+            return
+        self._set_history_sync_running(False)
+        success = [(symbol, bar, count) for symbol, bar, count, error in results if not error]
+        failed = [(symbol, bar, error or "未知错误") for symbol, bar, _, error in results if error]
+        total_candles = sum(count for _, _, count in success)
+        if failed:
+            self.history_sync_status.set(f"历史数据同步完成：成功 {len(success)} 组，失败 {len(failed)} 组。")
+        else:
+            self.history_sync_status.set(
+                f"历史数据同步完成：{len(success)} 组全量缓存已更新，累计缓存 {total_candles} 根。"
+            )
+        lines = [f"本次同步共 {len(results)} 组：成功 {len(success)} 组，失败 {len(failed)} 组。"]
+        if success:
+            lines.append("")
+            lines.append("已同步：")
+            lines.extend(
+                f"{symbol} | {_normalize_backtest_bar_label(bar)} | {count} 根"
+                for symbol, bar, count in success
+            )
+        if failed:
+            lines.append("")
+            lines.append("失败：")
+            lines.extend(
+                f"{symbol} | {_normalize_backtest_bar_label(bar)} | {error}"
+                for symbol, bar, error in failed
+            )
+        if failed:
+            messagebox.showwarning("同步历史数据部分失败", "\n".join(lines), parent=self.window)
+            return
+        messagebox.showinfo("同步历史数据完成", "\n".join(lines), parent=self.window)
 
     def _run_batch_backtest_worker(
         self,
@@ -2360,6 +2450,13 @@ class BacktestWindow:
         self._set_backtest_running(False)
         self._refresh_zoom_chart_header()
         messagebox.showerror("回测失败", str(exc), parent=self.window)
+
+    def _show_history_sync_error(self, exc: Exception) -> None:
+        if not self._ui_alive():
+            return
+        self._set_history_sync_running(False)
+        self.history_sync_status.set(f"历史数据同步失败：{exc}")
+        messagebox.showerror("同步历史数据失败", str(exc), parent=self.window)
 
     def _build_config(self) -> StrategyConfig:
         definition = self._selected_strategy_definition()
@@ -4272,6 +4369,12 @@ class BacktestWindow:
             raise ValueError(f"{field_name} 不是有效整数") from exc
         if value < 0:
             raise ValueError(f"{field_name} 不能小于 0")
+        return value
+
+    def _parse_backtest_candle_limit(self, raw: str) -> int:
+        value = self._parse_nonnegative_int(raw, "回测K线数")
+        if value > MAX_BACKTEST_CANDLES:
+            raise ValueError(f"回测K线数最多支持 {MAX_BACKTEST_CANDLES}")
         return value
 
     def _parse_positive_decimal(self, raw: str, field_name: str) -> Decimal:

@@ -263,8 +263,8 @@ def run_backtest(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> BacktestResult:
-    if candle_limit <= 0:
-        raise ValueError("回测 K 线数量必须大于 0")
+    if candle_limit < 0:
+        raise ValueError("回测 K 线数量不能小于 0")
     if candle_limit > MAX_BACKTEST_CANDLES:
         raise ValueError(f"回测最多支持 {MAX_BACKTEST_CANDLES} 根 K 线")
     if start_ts is not None and end_ts is not None and start_ts > end_ts:
@@ -478,8 +478,8 @@ def run_backtest_batch(
 ) -> list[tuple[StrategyConfig, BacktestResult]]:
     if base_config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         raise RuntimeError("4H EMA5/EMA8 金叉死叉策略不参与 ATR 批量矩阵回测，请使用单组回测。")
-    if candle_limit <= 0:
-        raise ValueError("\u56de\u6d4b K \u7ebf\u6570\u91cf\u5fc5\u987b\u5927\u4e8e 0")
+    if candle_limit < 0:
+        raise ValueError("\u56de\u6d4b K \u7ebf\u6570\u91cf\u4e0d\u80fd\u5c0f\u4e8e 0")
     if candle_limit > MAX_BACKTEST_CANDLES:
         raise ValueError(f"\u56de\u6d4b\u6700\u591a\u652f\u6301 {MAX_BACKTEST_CANDLES} \u6839 K \u7ebf")
     if start_ts is not None and end_ts is not None and start_ts > end_ts:
@@ -972,6 +972,7 @@ def _build_backtest_data_source_note(client: OkxRestClient) -> str:
     stats = getattr(client, "last_candle_history_stats", None)
     if not isinstance(stats, dict):
         return ""
+    full_history = bool(stats.get("full_history"))
     if stats.get("range_mode"):
         returned_count = int(stats.get("returned_count", 0) or 0)
         requested_count = int(stats.get("requested_count", 0) or 0)
@@ -988,7 +989,9 @@ def _build_backtest_data_source_note(client: OkxRestClient) -> str:
         parts = ["按时间段取数"]
         if range_text:
             parts.append(range_text)
-        if requested_count > 0:
+        if full_history:
+            parts.append("区间全量")
+        elif requested_count > 0:
             parts.append(f"上限 {requested_count} 根")
         if selected_count > 0:
             parts.append(f"区间内返回 {selected_count} 根")
@@ -1005,6 +1008,8 @@ def _build_backtest_data_source_note(client: OkxRestClient) -> str:
         f"\u672c\u6b21\u547d\u4e2d\u672c\u5730\u7f13\u5b58 {cache_hit_count} \u6839",
         f"\u8865\u62c9\u6700\u65b0 {latest_fetch_count} \u6839",
     ]
+    if full_history:
+        parts.insert(0, "全量历史")
     if older_fetch_count > 0:
         parts.append(f"\u8865\u62c9\u66f4\u65e9 {older_fetch_count} \u6839")
     if returned_count > 0:

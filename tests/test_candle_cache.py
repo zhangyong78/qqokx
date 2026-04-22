@@ -92,3 +92,39 @@ class CandleCacheTest(TestCase):
         self.assertEqual(client.last_candle_history_stats["cache_hit_count"], 800)
         self.assertEqual(client.last_candle_history_stats["latest_fetch_count"], 0)
         self.assertEqual(client.last_candle_history_stats["older_fetch_count"], 0)
+
+    def test_history_fetch_zero_limit_downloads_full_history(self) -> None:
+        pages = {
+            "__LATEST__": [_build_okx_row(index, str(100 + index)) for index in range(701, 1001)],
+            "701": [_build_okx_row(index, str(100 + index)) for index in range(401, 701)],
+            "401": [_build_okx_row(index, str(100 + index)) for index in range(101, 401)],
+            "101": [_build_okx_row(index, str(100 + index)) for index in range(1, 101)],
+        }
+        saved_snapshots: list[tuple[list[Candle], int | None]] = []
+        client = DummyHistoryClient(pages)
+
+        original_load = okx_client_module.load_candle_cache
+        original_save = okx_client_module.save_candle_cache
+        okx_client_module.load_candle_cache = lambda inst_id, bar: []
+        okx_client_module.save_candle_cache = (
+            lambda inst_id, bar, candles, max_records=None: saved_snapshots.append((list(candles), max_records))
+        )
+        try:
+            candles = client.get_candles_history("BTC-USDT-SWAP", "15m", limit=0)
+        finally:
+            okx_client_module.load_candle_cache = original_load
+            okx_client_module.save_candle_cache = original_save
+
+        self.assertEqual(len(client.calls), 4)
+        self.assertEqual([call.get("after") for call in client.calls], [None, "701", "401", "101"])
+        self.assertEqual(len(candles), 1000)
+        self.assertEqual(candles[0].ts, 1)
+        self.assertEqual(candles[-1].ts, 1000)
+        self.assertTrue(saved_snapshots)
+        self.assertEqual(len(saved_snapshots[-1][0]), 1000)
+        self.assertEqual(saved_snapshots[-1][1], 12000)
+        self.assertTrue(client.last_candle_history_stats["full_history"])
+        self.assertEqual(client.last_candle_history_stats["requested_count"], 0)
+        self.assertEqual(client.last_candle_history_stats["returned_count"], 1000)
+        self.assertEqual(client.last_candle_history_stats["latest_fetch_count"], 300)
+        self.assertEqual(client.last_candle_history_stats["older_fetch_count"], 700)

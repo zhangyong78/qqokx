@@ -1,6 +1,6 @@
 # OKX 策略工作台
 
-当前版本：`v0.4.01`
+当前版本：`v0.4.02`
 
 这是一个面向 OKX 的桌面交易工作台，围绕“监控、交易、保护、回测、分析”构建。当前项目已经包含：
 
@@ -560,7 +560,14 @@ ATR 批量矩阵规则：
 - `.okx_quant_candle_cache/`
 
 ## 11. 更新日志
-当前版本：v0.4.01
+当前版本：v0.4.02
+
+### v0.4.02
+
+- 已为回测界面新增“同步历史数据”按钮：可一键批量下载 `BTC / ETH / SOL / BNB / DOGE` 在 `5m / 15m / 1H / 4H` 四个周期的全量历史缓存，并实时显示同步进度与结果摘要。
+- 已把回测 `K` 线数 `0` 正式定义为“全量历史”：回测、区间回测、报告导出、对比详情与数据来源说明都会按全量口径展示，不再把 `0` 视为非法值。
+- 已补强 `OKX` 历史 K 线拉取与缓存：`get_candles_history` / `get_candles_history_range` 现在支持 `limit=0` 全量取数，并把完整结果写回本地缓存，同时区分“全量历史 / 区间全量”的来源提示。
+- 已补充并通过本轮验证：`python -m py_compile okx_quant\backtest_ui.py okx_quant\backtest.py okx_quant\okx_client.py okx_quant\backtest_export.py tests\test_backtest.py tests\test_candle_cache.py`、`python -m unittest tests.test_backtest tests.test_candle_cache`（`85` 项测试通过）。
 
 ### v0.4.01
 

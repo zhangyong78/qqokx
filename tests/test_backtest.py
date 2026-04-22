@@ -94,14 +94,18 @@ class DummyBacktestClient:
 
     def get_candles_history(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
         self.history_limits.append(limit)
+        fetch_full_history = limit <= 0
+        requested_count = 0 if fetch_full_history else limit
+        returned = list(self._candles) if fetch_full_history else self._candles[-limit:]
         self.last_candle_history_stats = {
-            "cache_hit_count": max(limit - 12, 0),
-            "latest_fetch_count": 12,
+            "cache_hit_count": len(returned) if fetch_full_history else max(limit - 12, 0),
+            "latest_fetch_count": 0 if fetch_full_history else 12,
             "older_fetch_count": 0,
-            "requested_count": limit,
-            "returned_count": min(limit, len(self._candles)),
+            "requested_count": requested_count,
+            "returned_count": len(returned),
+            "full_history": fetch_full_history,
         }
-        return self._candles[-limit:]
+        return returned
 
     def get_candles_history_range(
         self,
@@ -115,7 +119,9 @@ class DummyBacktestClient:
     ) -> list[Candle]:
         self.history_limits.append(limit)
         filtered = [candle for candle in self._candles if start_ts <= candle.ts <= end_ts]
-        selected_returned = filtered[-limit:]
+        fetch_full_history = limit <= 0
+        requested_count = 0 if fetch_full_history else limit
+        selected_returned = list(filtered) if fetch_full_history else filtered[-limit:]
         preload = (
             [candle for candle in self._candles if candle.ts < start_ts][-preload_count:]
             if preload_count > 0
@@ -126,10 +132,11 @@ class DummyBacktestClient:
             "range_mode": True,
             "start_ts": start_ts,
             "end_ts": end_ts,
-            "requested_count": limit,
+            "requested_count": requested_count,
             "selected_count": len(selected_returned),
             "preload_count": len(preload),
             "returned_count": len(returned),
+            "full_history": fetch_full_history,
         }
         return returned
 
@@ -928,6 +935,28 @@ class BacktestTest(TestCase):
         with self.assertRaises(ValueError):
             run_backtest(client, config, candle_limit=10001)
 
+    def test_run_backtest_accepts_zero_candle_limit_for_full_history(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("100"),
+                Decimal("101"),
+                Decimal("99"),
+                Decimal("100"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(1, 701)
+        ]
+        client = DummyBacktestClient(candles, self._build_instrument())
+        config = self._build_config(ema_period=21, atr_period=14)
+
+        result = run_backtest(client, config, candle_limit=0)
+
+        self.assertEqual(len(result.candles), len(candles))
+        self.assertEqual(client.history_limits, [0])
+        self.assertIn("全量历史", result.data_source_note)
+
     def test_load_backtest_candles_supports_10000_candles(self) -> None:
         candles = [
             Candle(
@@ -946,6 +975,26 @@ class BacktestTest(TestCase):
 
         self.assertEqual(len(result), 10000)
         self.assertEqual(client.history_limits, [10000])
+
+    def test_load_backtest_candles_zero_limit_returns_full_history(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("100"),
+                Decimal("101"),
+                Decimal("99"),
+                Decimal("100"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(1, 321)
+        ]
+        client = DummyBacktestClient(candles, self._build_instrument())
+
+        result = _load_backtest_candles(client, "BTC-USDT-SWAP", "15m", 0)
+
+        self.assertEqual(len(result), len(candles))
+        self.assertEqual(client.history_limits, [0])
 
     def test_load_backtest_candles_filters_selected_time_range(self) -> None:
         candles = [
@@ -1704,6 +1753,67 @@ class BacktestTest(TestCase):
         self.assertIn("回测K线数：800", detail)
         self.assertIn("方向只做空", detail)
 
+    def test_build_backtest_compare_detail_formats_zero_candle_limit_as_full_history(self) -> None:
+        report = BacktestReport(
+            total_trades=0,
+            win_trades=0,
+            loss_trades=0,
+            breakeven_trades=0,
+            win_rate=Decimal("0"),
+            total_pnl=Decimal("0"),
+            average_pnl=Decimal("0"),
+            gross_profit=Decimal("0"),
+            gross_loss=Decimal("0"),
+            profit_factor=None,
+            average_win=Decimal("0"),
+            average_loss=Decimal("0"),
+            profit_loss_ratio=None,
+            average_r_multiple=Decimal("0"),
+            max_drawdown=Decimal("0"),
+            take_profit_hits=0,
+            stop_loss_hits=0,
+        )
+        snapshot = _BacktestSnapshot(
+            snapshot_id="R011",
+            created_at=datetime(2026, 3, 23, 8, 30, 0),
+            config=StrategyConfig(
+                inst_id="BTC-USDT-SWAP",
+                bar="15m",
+                ema_period=21,
+                trend_ema_period=55,
+                atr_period=14,
+                atr_stop_multiplier=Decimal("1"),
+                atr_take_multiplier=Decimal("2"),
+                order_size=Decimal("0"),
+                trade_mode="cross",
+                signal_mode="long_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+                strategy_id=STRATEGY_CROSS_ID,
+                risk_amount=Decimal("100"),
+            ),
+            candle_limit=0,
+            candle_count=1200,
+            report=report,
+            report_text="示例详情",
+            start_ts=1711065600000,
+            end_ts=1711152000000,
+            result=BacktestResult(
+                candles=[],
+                trades=[],
+                report=report,
+                instrument=self._build_instrument(),
+                ema_period=21,
+                trend_ema_period=55,
+                strategy_id=STRATEGY_CROSS_ID,
+            ),
+        )
+
+        detail = _build_backtest_compare_detail(snapshot)
+
+        self.assertIn("回测K线数：全量", detail)
+
     def test_build_backtest_compare_detail_includes_audit_file_paths(self) -> None:
         report = BacktestReport(
             total_trades=0,
@@ -1968,6 +2078,69 @@ class BacktestTest(TestCase):
                 manifest_payload = json.loads(artifact_paths["manifest"].read_text(encoding="utf-8"))
                 self.assertEqual(manifest_payload["export_scope"], "single")
                 self.assertTrue(manifest_payload["files"]["report"]["exists"])
+            finally:
+                backtest_export_module.backtest_report_export_dir_path = original_export_dir
+
+    def test_export_single_backtest_report_formats_zero_candle_limit_as_full_history(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            original_export_dir = backtest_export_module.backtest_report_export_dir_path
+            backtest_export_module.backtest_report_export_dir_path = lambda base_dir=None: Path(temp_dir)
+            try:
+                config = StrategyConfig(
+                    inst_id="BTC-USDT-SWAP",
+                    bar="1H",
+                    ema_period=21,
+                    trend_ema_period=55,
+                    atr_period=10,
+                    atr_stop_multiplier=Decimal("1.5"),
+                    atr_take_multiplier=Decimal("4.5"),
+                    order_size=Decimal("0"),
+                    trade_mode="cross",
+                    signal_mode="long_only",
+                    position_mode="net",
+                    environment="demo",
+                    tp_sl_trigger_type="mark",
+                    strategy_id=STRATEGY_DYNAMIC_ID,
+                    risk_amount=Decimal("100"),
+                )
+                result = BacktestResult(
+                    candles=[
+                        Candle(1710976500000, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+                        Candle(1711062900000, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+                    ],
+                    trades=[],
+                    report=BacktestReport(
+                        total_trades=0,
+                        win_trades=0,
+                        loss_trades=0,
+                        breakeven_trades=0,
+                        win_rate=Decimal("0"),
+                        total_pnl=Decimal("0"),
+                        average_pnl=Decimal("0"),
+                        gross_profit=Decimal("0"),
+                        gross_loss=Decimal("0"),
+                        profit_factor=None,
+                        average_win=Decimal("0"),
+                        average_loss=Decimal("0"),
+                        profit_loss_ratio=None,
+                        average_r_multiple=Decimal("0"),
+                        max_drawdown=Decimal("0"),
+                    ),
+                    instrument=self._build_instrument(),
+                    ema_period=21,
+                    trend_ema_period=55,
+                    strategy_id=STRATEGY_DYNAMIC_ID,
+                )
+
+                exported = export_single_backtest_report(
+                    result,
+                    config,
+                    0,
+                    exported_at=datetime(2026, 3, 26, 20, 45, 0),
+                )
+
+                content = exported.read_text(encoding="utf-8-sig")
+                self.assertIn("回测K线数：全量", content)
             finally:
                 backtest_export_module.backtest_report_export_dir_path = original_export_dir
 
