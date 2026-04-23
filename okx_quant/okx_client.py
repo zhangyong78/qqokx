@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 from urllib import error, parse, request
 
 from okx_quant.candle_cache import (
@@ -35,6 +35,7 @@ DEFAULT_HEADERS = {
 
 OPTION_ID_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+-\d{6}-[0-9]+-[CP]$")
 MAX_PUBLIC_CANDLE_LIMIT = 300
+FULL_HISTORY_CHECKPOINT_PAGE_INTERVAL = 25
 
 
 class OkxApiError(RuntimeError):
@@ -188,6 +189,31 @@ class OkxTradeOrderItem:
 
 
 @dataclass(frozen=True)
+class OkxAccountBillItem:
+    bill_id: str
+    bill_time: int | None
+    inst_id: str
+    inst_type: str
+    bill_type: str | None
+    bill_sub_type: str | None
+    business_type: str | None
+    event_type: str | None
+    side: str | None
+    pos_side: str | None
+    size: Decimal | None
+    price: Decimal | None
+    amount: Decimal | None
+    fee: Decimal | None
+    pnl: Decimal | None
+    balance_change: Decimal | None
+    currency: str | None
+    order_id: str | None
+    trade_id: str | None
+    client_order_id: str | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class OkxAccountAssetItem:
     ccy: str
     equity: Decimal | None
@@ -293,7 +319,14 @@ class OkxRestClient:
         )
         return self._parse_candles_payload(payload)
 
-    def get_candles_history(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
+    def get_candles_history(
+        self,
+        inst_id: str,
+        bar: str,
+        limit: int = 200,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[Candle]:
         fetch_full_history = limit <= 0
         requested_limit = 0 if fetch_full_history else max(1, limit)
         cached = load_candle_cache(inst_id, bar)
@@ -328,6 +361,19 @@ class OkxRestClient:
 
         collected = merge_candles(cached, latest_batch)
         after = str(collected[0].ts) if collected else None
+        page_count = 1 if latest_batch else 0
+        if fetch_full_history and collected:
+            self._emit_candle_history_progress(
+                progress_callback,
+                inst_id=inst_id,
+                bar=bar,
+                page_count=page_count,
+                cached_count=len(cached),
+                total_count=len(collected),
+                oldest_ts=collected[0].ts,
+                newest_ts=collected[-1].ts,
+            )
+            self._save_full_history_checkpoint(inst_id, bar, collected)
 
         while after is not None:
             if not fetch_full_history and len(collected) >= requested_limit:
@@ -340,6 +386,20 @@ class OkxRestClient:
             previous_oldest = collected[0].ts if collected else None
             collected = merge_candles(collected, batch)
             older_added_ts.update({candle.ts for candle in batch} - previous_ts)
+            page_count += 1
+            if fetch_full_history and collected:
+                self._emit_candle_history_progress(
+                    progress_callback,
+                    inst_id=inst_id,
+                    bar=bar,
+                    page_count=page_count,
+                    cached_count=len(cached),
+                    total_count=len(collected),
+                    oldest_ts=collected[0].ts,
+                    newest_ts=collected[-1].ts,
+                )
+                if page_count % FULL_HISTORY_CHECKPOINT_PAGE_INTERVAL == 0:
+                    self._save_full_history_checkpoint(inst_id, bar, collected)
             oldest_ts = collected[0].ts if collected else None
             if oldest_ts is None or oldest_ts == previous_oldest:
                 break
@@ -364,6 +424,44 @@ class OkxRestClient:
             "full_history": fetch_full_history,
         }
         return returned
+
+    @staticmethod
+    def _emit_candle_history_progress(
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+        *,
+        inst_id: str,
+        bar: str,
+        page_count: int,
+        cached_count: int,
+        total_count: int,
+        oldest_ts: int | None,
+        newest_ts: int | None,
+    ) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(
+                {
+                    "inst_id": inst_id,
+                    "bar": bar,
+                    "page_count": page_count,
+                    "cached_count": cached_count,
+                    "total_count": total_count,
+                    "oldest_ts": oldest_ts,
+                    "newest_ts": newest_ts,
+                }
+            )
+        except Exception:
+            return
+
+    @staticmethod
+    def _save_full_history_checkpoint(inst_id: str, bar: str, candles: list[Candle]) -> None:
+        save_candle_cache(
+            inst_id,
+            bar,
+            candles,
+            max_records=max(DEFAULT_CANDLE_CACHE_CAPACITY, len(candles)),
+        )
 
     def get_candles_history_range(
         self,
@@ -852,7 +950,7 @@ class OkxRestClient:
                     return merged
         return merged
 
-    def _fetch_execution_bill_history(
+    def _fetch_account_bill_history(
         self,
         *,
         credentials: Credentials,
@@ -916,6 +1014,52 @@ class OkxRestClient:
 
         collected.sort(key=lambda item: _to_int(item.get("ts"), item.get("cTime"), item.get("uTime")) or 0, reverse=True)
         return collected
+
+    def _fetch_execution_bill_history(
+        self,
+        *,
+        credentials: Credentials,
+        environment: str,
+        inst_type: str,
+        target_count: int,
+    ) -> list[dict[str, Any]]:
+        return self._fetch_account_bill_history(
+            credentials=credentials,
+            environment=environment,
+            inst_type=inst_type,
+            target_count=target_count,
+        )
+
+    def get_account_bills_history(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION", "SPOT"),
+        limit: int = 200,
+    ) -> list[OkxAccountBillItem]:
+        items: list[OkxAccountBillItem] = []
+        normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
+        per_type_target = max(1, math.ceil(limit / max(len(normalized_types), 1)))
+        seen_bill_ids: set[str] = set()
+        for inst_type in normalized_types:
+            bills = self._fetch_account_bill_history(
+                credentials=credentials,
+                environment=environment,
+                inst_type=inst_type,
+                target_count=max(per_type_target, 100),
+            )
+            for item in bills:
+                parsed = _build_account_bill_item(item, default_inst_type=inst_type)
+                if parsed is None:
+                    continue
+                if parsed.bill_id and parsed.bill_id in seen_bill_ids:
+                    continue
+                if parsed.bill_id:
+                    seen_bill_ids.add(parsed.bill_id)
+                items.append(parsed)
+        items.sort(key=lambda item: item.bill_time or 0, reverse=True)
+        return items[:limit]
 
     def get_positions_history(
         self,
@@ -1775,6 +1919,38 @@ def _build_fill_history_item_from_bill(item: dict[str, Any]) -> OkxFillHistoryIt
         order_id=item.get("ordId"),
         trade_id=item.get("tradeId"),
         exec_type="琛屾潈/浜ゅ壊",
+        raw=item,
+    )
+
+
+def _build_account_bill_item(item: dict[str, Any], *, default_inst_type: str) -> OkxAccountBillItem | None:
+    bill_id = str(item.get("billId") or "").strip()
+    bill_time = _to_int(item.get("ts"), item.get("cTime"), item.get("uTime"), item.get("fillTime"))
+    inst_id = str(item.get("instId") or "").strip().upper()
+    inst_type = str(item.get("instType") or default_inst_type or infer_inst_type(inst_id)).strip().upper()
+    if not bill_id or bill_time is None:
+        return None
+    return OkxAccountBillItem(
+        bill_id=bill_id,
+        bill_time=bill_time,
+        inst_id=inst_id,
+        inst_type=inst_type,
+        bill_type=str(item.get("type") or "").strip() or None,
+        bill_sub_type=str(item.get("subType") or "").strip() or None,
+        business_type=str(item.get("bizType") or "").strip() or None,
+        event_type=str(item.get("eventType") or "").strip() or None,
+        side=str(item.get("side") or "").strip().lower() or None,
+        pos_side=str(item.get("posSide") or "").strip().lower() or None,
+        size=_first_decimal(item.get("sz"), item.get("fillSz"), item.get("size")),
+        price=_first_decimal(item.get("px"), item.get("fillPx"), item.get("price")),
+        amount=_first_decimal(item.get("pnl"), item.get("balChg"), item.get("posBalChg"), item.get("amount")),
+        fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+        pnl=_first_decimal(item.get("pnl"), item.get("fillPnl")),
+        balance_change=_first_decimal(item.get("balChg"), item.get("posBalChg")),
+        currency=str(item.get("ccy") or item.get("feeCcy") or item.get("fillFeeCcy") or "").strip() or None,
+        order_id=str(item.get("ordId") or "").strip() or None,
+        trade_id=str(item.get("tradeId") or "").strip() or None,
+        client_order_id=str(item.get("clOrdId") or item.get("algoClOrdId") or "").strip() or None,
         raw=item,
     )
 

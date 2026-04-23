@@ -2301,7 +2301,32 @@ class BacktestWindow:
                     )
                     self.window.after(0, lambda text=progress_text: self.history_sync_status.set(text))
                 try:
-                    candles = self.client.get_candles_history(symbol, bar, limit=0)
+                    progress_state = {"last_page": 0}
+
+                    def on_progress(payload: dict[str, object]) -> None:
+                        if not self._ui_alive():
+                            return
+                        page_count = int(payload.get("page_count", 0) or 0)
+                        if page_count > 1 and page_count % 5 != 0:
+                            return
+                        if page_count <= progress_state["last_page"]:
+                            return
+                        progress_state["last_page"] = page_count
+                        total_count = int(payload.get("total_count", 0) or 0)
+                        oldest_ts = payload.get("oldest_ts")
+                        range_text = (
+                            _format_chart_timestamp(int(oldest_ts))
+                            if isinstance(oldest_ts, int)
+                            else "-"
+                        )
+                        progress_text = (
+                            f"正在同步历史数据（{index}/{total}）：{symbol} | "
+                            f"{_normalize_backtest_bar_label(bar)} | 第 {page_count} 页 | "
+                            f"已累计 {total_count} 根 | 最早到 {range_text}"
+                        )
+                        self.window.after(0, lambda text=progress_text: self.history_sync_status.set(text))
+
+                    candles = self.client.get_candles_history(symbol, bar, limit=0, progress_callback=on_progress)
                     results.append((symbol, bar, len(candles), None))
                 except Exception as exc:
                     results.append((symbol, bar, 0, str(exc)))

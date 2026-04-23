@@ -9,6 +9,7 @@ from okx_quant.enhanced_models import QuotaSnapshot
 from okx_quant.enhanced_registry import EnhancedStrategyRegistry
 from okx_quant.enhanced_seed_strategies import register_seed_strategy_package
 from okx_quant.models import Candle
+from okx_quant.persistence import analysis_report_dir_path
 
 
 def build_demo_candles(closes: list[str]) -> list[Candle]:
@@ -50,7 +51,7 @@ def main() -> None:
         },
     )
 
-    target_dir = Path("reports") / "analysis"
+    target_dir = analysis_report_dir_path()
     target_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     target = target_dir / f"enhanced_seed_lab_smoke_report_{timestamp}.md"

@@ -128,3 +128,43 @@ class CandleCacheTest(TestCase):
         self.assertEqual(client.last_candle_history_stats["returned_count"], 1000)
         self.assertEqual(client.last_candle_history_stats["latest_fetch_count"], 300)
         self.assertEqual(client.last_candle_history_stats["older_fetch_count"], 700)
+
+    def test_history_fetch_zero_limit_reports_progress_and_saves_checkpoints(self) -> None:
+        pages = {
+            "__LATEST__": [_build_okx_row(index, str(100 + index)) for index in range(701, 1001)],
+            "701": [_build_okx_row(index, str(100 + index)) for index in range(401, 701)],
+            "401": [_build_okx_row(index, str(100 + index)) for index in range(101, 401)],
+            "101": [_build_okx_row(index, str(100 + index)) for index in range(1, 101)],
+        }
+        saved_snapshots: list[tuple[list[Candle], int | None]] = []
+        progress_records: list[dict[str, object]] = []
+        client = DummyHistoryClient(pages)
+
+        original_load = okx_client_module.load_candle_cache
+        original_save = okx_client_module.save_candle_cache
+        original_interval = okx_client_module.FULL_HISTORY_CHECKPOINT_PAGE_INTERVAL
+        okx_client_module.load_candle_cache = lambda inst_id, bar: []
+        okx_client_module.save_candle_cache = (
+            lambda inst_id, bar, candles, max_records=None: saved_snapshots.append((list(candles), max_records))
+        )
+        okx_client_module.FULL_HISTORY_CHECKPOINT_PAGE_INTERVAL = 2
+        try:
+            candles = client.get_candles_history(
+                "ETH-USDT-SWAP",
+                "5m",
+                limit=0,
+                progress_callback=lambda payload: progress_records.append(dict(payload)),
+            )
+        finally:
+            okx_client_module.load_candle_cache = original_load
+            okx_client_module.save_candle_cache = original_save
+            okx_client_module.FULL_HISTORY_CHECKPOINT_PAGE_INTERVAL = original_interval
+
+        self.assertEqual(len(candles), 1000)
+        self.assertEqual([record["page_count"] for record in progress_records], [1, 2, 3, 4])
+        self.assertEqual(progress_records[-1]["total_count"], 1000)
+        self.assertEqual(progress_records[-1]["oldest_ts"], 1)
+        self.assertEqual(progress_records[-1]["newest_ts"], 1000)
+        self.assertGreaterEqual(len(saved_snapshots), 3)
+        self.assertEqual(saved_snapshots[0][1], 12000)
+        self.assertEqual(saved_snapshots[-1][1], 12000)

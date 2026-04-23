@@ -1,6 +1,6 @@
 # OKX 策略工作台
 
-当前版本：`v0.4.02`
+当前版本：`v0.4.04`
 
 这是一个面向 OKX 的桌面交易工作台，围绕“监控、交易、保护、回测、分析”构建。当前项目已经包含：
 
@@ -560,7 +560,15 @@ ATR 批量矩阵规则：
 - `.okx_quant_candle_cache/`
 
 ## 11. 更新日志
-当前版本：v0.4.02
+当前版本：v0.4.04
+
+### v0.4.04
+
+- 已为实盘策略会话新增交易账本与结束归因链路：每轮交易会落入 `qqokx_data/state/strategy_trade_ledger.json`，并结合历史委托、历史成交、仓位历史与账户账单补齐手续费、资金费、毛盈亏、净盈亏和结束原因。
+- 已为“运行中策略 / 历史策略”补齐资金视角展示：列表新增 `净盈亏`，运行中策略进一步新增 `实时浮盈亏`，并在主界面上方增加“多策略合计”摘要，方便直接查看多策略整体盈亏。
+- 已补强回测历史同步体验：全量历史下载时会显示页级进度、累计根数与最早时间，同时按页数分段写回缓存 checkpoint，避免长时间同步过程完全黑盒。
+- 已将剩余正式回测/分析脚本统一切到共享数据目录路径入口，避免脚本继续写回旧 `reports/...` 或旧 `.okx_quant_*` 路径。
+- 已完成本轮验证：`python -m py_compile okx_quant\backtest_ui.py okx_quant\okx_client.py okx_quant\persistence.py okx_quant\ui.py scripts\generate_dynamic_fee_offset_report.py scripts\generate_dynamic_two_r_break_even_report.py scripts\generate_ema_dynamic_reports.py scripts\generate_enhanced_seed_lab_realdata_report.py scripts\generate_enhanced_seed_lab_smoke_report.py scripts\generate_slot_handoff_strategy_pool_report.py tests\test_candle_cache.py tests\test_okx_client_orders.py tests\test_persistence.py tests\test_ui.py`、`python -m unittest tests.test_candle_cache tests.test_okx_client_orders tests.test_persistence tests.test_ui`（`56` 项测试通过）。
 
 ### v0.4.02
 

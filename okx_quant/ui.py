@@ -6,7 +6,7 @@ import queue
 import re
 import threading
 from dataclasses import MISSING, dataclass, field, fields as dataclass_fields
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import tkinter.font as tkfont
@@ -33,6 +33,7 @@ from okx_quant.option_roll import is_short_option_position
 from okx_quant.option_roll_ui import OptionRollSuggestionWindow
 from okx_quant.option_strategy_ui import OptionStrategyCalculatorWindow, _build_option_quote
 from okx_quant.okx_client import (
+    OkxAccountBillItem,
     OkxAccountAssetItem,
     OkxAccountConfig,
     OkxAccountOverview,
@@ -54,12 +55,15 @@ from okx_quant.persistence import (
     load_credentials_profiles_snapshot,
     load_notification_snapshot,
     load_strategy_history_snapshot,
+    load_strategy_trade_ledger_snapshot,
     save_recoverable_strategy_sessions_snapshot,
     save_credentials_profiles_snapshot,
     save_notification_snapshot,
     save_strategy_history_snapshot,
     settings_file_path,
     strategy_history_file_path,
+    strategy_trade_ledger_file_path,
+    save_strategy_trade_ledger_snapshot,
 )
 from okx_quant.position_protection import (
     OptionProtectionConfig,
@@ -275,6 +279,9 @@ ORDER_STATE_FILTER_OPTIONS = {
 ENGINE_CL_ORD_ID_PATTERN = re.compile(r"^[a-z0-9]{4,8}(ent|exi)[0-9]{15}$")
 PROTECTION_CL_ORD_ID_PATTERN = re.compile(r"^ppp\d{2,}\d{4}$")
 SMART_ORDER_CL_ORD_ID_PATTERN = re.compile(r"^so[a-z0-9]{4}\d{6}$")
+SESSION_BAR_TIME_PATTERN = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \|")
+FUNDING_FEE_BILL_SUBTYPES = {"173", "174"}
+FUNDING_FEE_BILL_MARKERS = ("funding", "资金费")
 POSITION_REFRESH_INTERVAL_OPTIONS = {
     "10秒": 10_000,
     "15秒": 15_000,
@@ -478,6 +485,85 @@ def _describe_refresh_health(state: RefreshHealthState, *, now: datetime | None 
 
 
 @dataclass
+class ProfilePositionSnapshot:
+    api_name: str
+    effective_environment: str | None
+    positions: list[OkxPosition]
+    upl_usdt_prices: dict[str, Decimal]
+    refreshed_at: datetime
+
+
+@dataclass
+class StrategyTradeRuntimeState:
+    round_id: str
+    signal_bar_at: datetime | None = None
+    opened_logged_at: datetime | None = None
+    entry_order_id: str = ""
+    entry_client_order_id: str = ""
+    entry_price: Decimal | None = None
+    size: Decimal | None = None
+    protective_algo_id: str = ""
+    protective_algo_cl_ord_id: str = ""
+    current_stop_price: Decimal | None = None
+    reconciliation_started: bool = False
+
+
+@dataclass
+class StrategyTradeLedgerRecord:
+    record_id: str
+    history_record_id: str
+    session_id: str
+    api_name: str
+    strategy_id: str
+    strategy_name: str
+    symbol: str
+    direction_label: str
+    run_mode_label: str
+    environment: str
+    closed_at: datetime
+    signal_bar_at: datetime | None = None
+    opened_at: datetime | None = None
+    entry_order_id: str = ""
+    entry_client_order_id: str = ""
+    exit_order_id: str = ""
+    protective_algo_id: str = ""
+    protective_algo_cl_ord_id: str = ""
+    entry_price: Decimal | None = None
+    exit_price: Decimal | None = None
+    size: Decimal | None = None
+    entry_fee: Decimal | None = None
+    exit_fee: Decimal | None = None
+    funding_fee: Decimal | None = None
+    gross_pnl: Decimal | None = None
+    net_pnl: Decimal | None = None
+    close_reason: str = ""
+    reason_confidence: str = "low"
+    summary_note: str = ""
+    updated_at: datetime | None = None
+
+
+@dataclass
+class StrategyTradeReconciliationSnapshot:
+    effective_environment: str
+    order_history: list[OkxTradeOrderItem]
+    fills: list[OkxFillHistoryItem]
+    position_history: list[OkxPositionHistoryItem]
+    account_bills: list[OkxAccountBillItem]
+    environment_note: str | None = None
+
+
+@dataclass
+class StrategyTradeReconciliationResult:
+    session_id: str
+    round_id: str
+    ledger_record: StrategyTradeLedgerRecord | None = None
+    environment_note: str | None = None
+    attribution_summary: str = ""
+    cumulative_summary: str = ""
+    error_message: str = ""
+
+
+@dataclass
 class StrategySession:
     session_id: str
     api_name: str
@@ -499,6 +585,14 @@ class StrategySession:
     last_message: str = ""
     recovery_root_dir: Path | None = None
     recovery_supported: bool = False
+    active_trade: StrategyTradeRuntimeState | None = None
+    trade_count: int = 0
+    win_count: int = 0
+    gross_pnl_total: Decimal = Decimal("0")
+    fee_total: Decimal = Decimal("0")
+    funding_total: Decimal = Decimal("0")
+    net_pnl_total: Decimal = Decimal("0")
+    last_close_reason: str = ""
 
     @property
     def log_prefix(self) -> str:
@@ -554,6 +648,13 @@ class StrategyHistoryRecord:
     log_file_path: str = ""
     updated_at: datetime | None = None
     config_snapshot: dict[str, object] = field(default_factory=dict)
+    trade_count: int = 0
+    win_count: int = 0
+    gross_pnl_total: Decimal = Decimal("0")
+    fee_total: Decimal = Decimal("0")
+    funding_total: Decimal = Decimal("0")
+    net_pnl_total: Decimal = Decimal("0")
+    last_close_reason: str = ""
 
 
 @dataclass
@@ -804,6 +905,16 @@ def _parse_datetime_snapshot(value: object) -> datetime | None:
         return None
 
 
+def _parse_decimal_snapshot(value: object, *, default: Decimal | None = Decimal("0")) -> Decimal | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return default
+    try:
+        return Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return default
+
+
 def _format_history_datetime(value: datetime | None) -> str:
     if value is None:
         return "-"
@@ -867,6 +978,90 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
     return current_status or None
 
 
+def _extract_session_bar_time(message: str) -> datetime | None:
+    match = SESSION_BAR_TIME_PATTERN.match(str(message or "").strip())
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _extract_log_field(message: str, field_name: str) -> str | None:
+    text = str(message or "")
+    marker = f"{field_name}="
+    start = text.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = text.find("|", start)
+    if end < 0:
+        end = len(text)
+    value = text[start:end].strip()
+    return value or None
+
+
+def _extract_log_field_decimal(message: str, field_name: str) -> Decimal | None:
+    raw = _extract_log_field(message, field_name)
+    if raw is None:
+        return None
+    try:
+        return Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _trade_order_event_time(item: OkxTradeOrderItem) -> int:
+    return item.update_time or item.created_time or 0
+
+
+def _weighted_average_fill_price(fills: list[OkxFillHistoryItem]) -> Decimal | None:
+    weighted_total = Decimal("0")
+    size_total = Decimal("0")
+    for item in fills:
+        if item.fill_price is None or item.fill_size is None:
+            continue
+        weighted_total += item.fill_price * item.fill_size
+        size_total += item.fill_size
+    if size_total <= 0:
+        return None
+    return weighted_total / size_total
+
+
+def _sum_fill_size(fills: list[OkxFillHistoryItem]) -> Decimal | None:
+    total = Decimal("0")
+    seen = False
+    for item in fills:
+        if item.fill_size is None:
+            continue
+        total += item.fill_size
+        seen = True
+    return total if seen else None
+
+
+def _sum_fill_fee(fills: list[OkxFillHistoryItem]) -> Decimal | None:
+    total = Decimal("0")
+    seen = False
+    for item in fills:
+        if item.fill_fee is None:
+            continue
+        total += item.fill_fee
+        seen = True
+    return total if seen else None
+
+
+def _sum_fill_pnl(fills: list[OkxFillHistoryItem]) -> Decimal | None:
+    total = Decimal("0")
+    seen = False
+    for item in fills:
+        if item.pnl is None:
+            continue
+        total += item.pnl
+        seen = True
+    return total if seen else None
+
+
 class QuantApp:
     def __init__(self) -> None:
         self.root = Tk()
@@ -888,6 +1083,8 @@ class QuantApp:
         self.sessions: dict[str, StrategySession] = {}
         self._strategy_history_records: list[StrategyHistoryRecord] = []
         self._strategy_history_by_id: dict[str, StrategyHistoryRecord] = {}
+        self._strategy_trade_ledger_records: list[StrategyTradeLedgerRecord] = []
+        self._strategy_trade_ledger_by_id: dict[str, StrategyTradeLedgerRecord] = {}
         self._recoverable_strategy_sessions: dict[str, RecoverableStrategySessionRecord] = {}
         self._strategy_log_write_failures: set[str] = set()
         self._session_counter = 0
@@ -1143,6 +1340,7 @@ class QuantApp:
         self.protection_poll_seconds = StringVar(value="2")
 
         self.status_text = StringVar(value="运行中策略：0")
+        self.session_summary_text = StringVar(value="多策略合计：当前没有运行中的策略。")
         self.settings_summary_text = StringVar()
         self.strategy_summary_text = StringVar()
         self.strategy_rule_text = StringVar()
@@ -1188,6 +1386,8 @@ class QuantApp:
         self._strategy_history_tree: ttk.Treeview | None = None
         self._strategy_history_detail: Text | None = None
         self._strategy_history_selected_record_id: str | None = None
+        self._positions_snapshot_by_profile: dict[str, ProfilePositionSnapshot] = {}
+        self._session_live_pnl_cache: dict[str, tuple[Decimal | None, datetime | None]] = {}
 
         self._settings_watch_enabled = False
         self._settings_save_job: str | None = None
@@ -1197,6 +1397,7 @@ class QuantApp:
         self._load_saved_notification_settings()
         self._load_recoverable_strategy_sessions_registry()
         self._load_strategy_history()
+        self._load_strategy_trade_ledger()
         self._build_menu()
         self._build_layout()
         self._hydrate_recoverable_strategy_sessions()
@@ -1535,11 +1736,20 @@ class QuantApp:
         running_frame = ttk.LabelFrame(session_top_frame, text="运行中策略", padding=12)
         running_frame.grid(row=0, column=0, sticky="nsew")
         running_frame.columnconfigure(0, weight=1)
-        running_frame.rowconfigure(0, weight=1)
+        running_frame.rowconfigure(1, weight=1)
+
+        running_header = ttk.Frame(running_frame)
+        running_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        running_header.columnconfigure(0, weight=1)
+        ttk.Label(running_header, textvariable=self.session_summary_text, justify="left").grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
 
         self.session_tree = ttk.Treeview(
             running_frame,
-            columns=("api", "strategy", "symbol", "direction", "mode", "status", "started"),
+            columns=("api", "strategy", "symbol", "direction", "mode", "live_pnl", "pnl", "status", "started"),
             show="headings",
             selectmode="browse",
         )
@@ -1548,6 +1758,8 @@ class QuantApp:
         self.session_tree.heading("symbol", text="标的")
         self.session_tree.heading("direction", text="方向")
         self.session_tree.heading("mode", text="模式")
+        self.session_tree.heading("live_pnl", text="实时浮盈亏")
+        self.session_tree.heading("pnl", text="净盈亏")
         self.session_tree.heading("status", text="状态")
         self.session_tree.heading("started", text="启动时间")
         self.session_tree.column("api", width=96, anchor="center")
@@ -1555,17 +1767,19 @@ class QuantApp:
         self.session_tree.column("symbol", width=180, anchor="w")
         self.session_tree.column("direction", width=90, anchor="center")
         self.session_tree.column("mode", width=110, anchor="center")
+        self.session_tree.column("live_pnl", width=120, anchor="e")
+        self.session_tree.column("pnl", width=110, anchor="e")
         self.session_tree.column("status", width=120, anchor="center")
         self.session_tree.column("started", width=120, anchor="center")
-        self.session_tree.grid(row=0, column=0, sticky="nsew")
+        self.session_tree.grid(row=1, column=0, sticky="nsew")
         self.session_tree.bind("<<TreeviewSelect>>", self._on_session_selected)
 
         tree_scroll = ttk.Scrollbar(running_frame, orient="vertical", command=self.session_tree.yview)
-        tree_scroll.grid(row=0, column=1, sticky="ns")
+        tree_scroll.grid(row=1, column=1, sticky="ns")
         self.session_tree.configure(yscrollcommand=tree_scroll.set)
 
         control_row = ttk.Frame(running_frame)
-        control_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        control_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Button(control_row, text="停止选中策略", command=self.stop_selected_session).grid(row=0, column=0)
         ttk.Button(control_row, text="恢复选中策略", command=self.recover_selected_session).grid(
             row=0,
@@ -7013,13 +7227,14 @@ class QuantApp:
         self._positions_refreshing = True
         self.positions_summary_text.set("正在刷新账户持仓...")
         environment = ENV_OPTIONS[self.environment_label.get()]
+        profile_name = credentials.profile_name or self._current_credential_profile()
         threading.Thread(
             target=self._refresh_positions_worker,
-            args=(credentials, environment),
+            args=(credentials, environment, profile_name),
             daemon=True,
         ).start()
 
-    def _refresh_positions_worker(self, credentials: Credentials, environment: str) -> None:
+    def _refresh_positions_worker(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         try:
             positions = self.client.get_positions(credentials, environment=environment)
             upl_usdt_prices = _build_upl_usdt_price_map(self.client, positions)
@@ -7044,12 +7259,13 @@ class QuantApp:
                 self.root.after(
                     0,
                     lambda: self._apply_positions(
-                        positions,
-                        summary,
-                        alternate,
-                        upl_usdt_prices,
-                        position_instruments,
-                        position_tickers,
+                        positions=positions,
+                        summary=summary,
+                        effective_environment=alternate,
+                        credential_profile_name=profile_name,
+                        upl_usdt_prices=upl_usdt_prices,
+                        position_instruments=position_instruments,
+                        position_tickers=position_tickers,
                     ),
                 )
                 return
@@ -7058,12 +7274,13 @@ class QuantApp:
         self.root.after(
             0,
             lambda: self._apply_positions(
-                positions,
-                None,
-                environment,
-                upl_usdt_prices,
-                position_instruments,
-                position_tickers,
+                positions=positions,
+                summary=None,
+                effective_environment=environment,
+                credential_profile_name=profile_name,
+                upl_usdt_prices=upl_usdt_prices,
+                position_instruments=position_instruments,
+                position_tickers=position_tickers,
             ),
         )
 
@@ -7072,6 +7289,7 @@ class QuantApp:
         positions: list[OkxPosition],
         summary: str | None = None,
         effective_environment: str | None = None,
+        credential_profile_name: str | None = None,
         upl_usdt_prices: dict[str, Decimal] | None = None,
         position_instruments: dict[str, Instrument] | None = None,
         position_tickers: dict[str, OkxTicker] | None = None,
@@ -7086,7 +7304,157 @@ class QuantApp:
         self._upl_usdt_prices = dict(upl_usdt_prices or {})
         self._position_instruments = dict(position_instruments or {})
         self._position_tickers = dict(position_tickers or {})
+        profile_name = (credential_profile_name or self._current_credential_profile()).strip()
+        if profile_name:
+            self._positions_snapshot_by_profile[profile_name] = ProfilePositionSnapshot(
+                api_name=profile_name,
+                effective_environment=effective_environment,
+                positions=list(positions),
+                upl_usdt_prices=dict(upl_usdt_prices or {}),
+                refreshed_at=self._positions_last_refresh_at,
+            )
         self._render_positions_view()
+        self._refresh_session_live_pnl_cache()
+        for session in self.sessions.values():
+            self._upsert_session_row(session)
+        self._refresh_running_session_summary()
+        self._refresh_selected_session_details()
+
+    @staticmethod
+    def _session_counts_toward_running_summary(session: StrategySession) -> bool:
+        return bool(
+            session.engine.is_running
+            or session.stop_cleanup_in_progress
+            or session.status in {"运行中", "停止中", "待恢复", "恢复中"}
+        )
+
+    def _positions_snapshot_for_session(self, session: StrategySession) -> ProfilePositionSnapshot | None:
+        profile_name = (session.api_name or "").strip()
+        if not profile_name:
+            return None
+        snapshot = self._positions_snapshot_by_profile.get(profile_name)
+        if snapshot is None:
+            return None
+        expected_environment = str(getattr(session.config, "environment", "") or "").strip().lower()
+        effective_environment = str(snapshot.effective_environment or "").strip().lower()
+        if expected_environment and effective_environment and expected_environment != effective_environment:
+            return None
+        return snapshot
+
+    def _refresh_session_live_pnl_cache(self) -> None:
+        cache: dict[str, tuple[Decimal | None, datetime | None]] = {
+            session.session_id: (None, None) for session in self.sessions.values()
+        }
+        sessions_by_snapshot_key: dict[tuple[str, str], tuple[ProfilePositionSnapshot, list[StrategySession]]] = {}
+        for session in self.sessions.values():
+            if session.active_trade is None:
+                continue
+            snapshot = self._positions_snapshot_for_session(session)
+            if snapshot is None:
+                continue
+            snapshot_key = (
+                snapshot.api_name,
+                str(snapshot.effective_environment or "").strip().lower(),
+            )
+            bucket = sessions_by_snapshot_key.get(snapshot_key)
+            if bucket is None:
+                sessions_by_snapshot_key[snapshot_key] = (snapshot, [session])
+            else:
+                bucket[1].append(session)
+
+        for snapshot, sessions in sessions_by_snapshot_key.values():
+            for position in snapshot.positions:
+                candidate_sessions = [
+                    session
+                    for session in sessions
+                    if _position_matches_session_live_pnl(
+                        position,
+                        trade_inst_id=_session_trade_inst_id(session),
+                        expected_sides=_session_expected_position_sides(session),
+                    )
+                ]
+                if not candidate_sessions:
+                    continue
+                pnl_value = _position_unrealized_pnl_usdt(position, snapshot.upl_usdt_prices)
+                if pnl_value is None and _infer_upl_currency(position) in {"USDT", "USD", "USDC"}:
+                    pnl_value = position.unrealized_pnl
+                if pnl_value is None:
+                    for session in candidate_sessions:
+                        cache[session.session_id] = (cache[session.session_id][0], snapshot.refreshed_at)
+                    continue
+
+                allocations: dict[str, Decimal] = {}
+                weighted_sizes: list[Decimal] = []
+                for session in candidate_sessions:
+                    trade_size = session.active_trade.size if session.active_trade is not None else None
+                    if trade_size is None or trade_size <= 0:
+                        weighted_sizes = []
+                        break
+                    weighted_sizes.append(trade_size)
+
+                if len(candidate_sessions) == 1:
+                    allocations[candidate_sessions[0].session_id] = pnl_value
+                elif weighted_sizes:
+                    total_size = sum(weighted_sizes, Decimal("0"))
+                    if total_size > 0:
+                        for session, trade_size in zip(candidate_sessions, weighted_sizes):
+                            allocations[session.session_id] = pnl_value * trade_size / total_size
+                if not allocations:
+                    shared_value = pnl_value / Decimal(len(candidate_sessions))
+                    for session in candidate_sessions:
+                        allocations[session.session_id] = shared_value
+
+                for session in candidate_sessions:
+                    previous_value, _ = cache[session.session_id]
+                    allocated = allocations.get(session.session_id)
+                    if allocated is None:
+                        cache[session.session_id] = (previous_value, snapshot.refreshed_at)
+                        continue
+                    cache[session.session_id] = (
+                        (previous_value or Decimal("0")) + allocated,
+                        snapshot.refreshed_at,
+                    )
+
+        self._session_live_pnl_cache = cache
+
+    def _session_live_pnl_snapshot(self, session: StrategySession) -> tuple[Decimal | None, datetime | None]:
+        return self._session_live_pnl_cache.get(session.session_id, (None, None))
+
+    def _refresh_running_session_summary(self) -> None:
+        self._refresh_session_live_pnl_cache()
+        active_sessions = [
+            session for session in self.sessions.values() if self._session_counts_toward_running_summary(session)
+        ]
+        if not active_sessions:
+            self.session_summary_text.set("多策略合计：当前没有运行中的策略。")
+            return
+
+        net_total = Decimal("0")
+        live_total = Decimal("0")
+        live_covered = 0
+        latest_refresh_at: datetime | None = None
+        for session in active_sessions:
+            net_total += session.net_pnl_total or Decimal("0")
+            live_pnl, refreshed_at = self._session_live_pnl_snapshot(session)
+            if refreshed_at is not None and (latest_refresh_at is None or refreshed_at > latest_refresh_at):
+                latest_refresh_at = refreshed_at
+            if live_pnl is None:
+                continue
+            live_total += live_pnl
+            live_covered += 1
+
+        parts = [
+            f"多策略合计：{len(active_sessions)} 个策略",
+            f"实时浮盈亏={_format_optional_usdt_precise(live_total, places=2) if live_covered else '-'}",
+            f"净盈亏={_format_optional_usdt_precise(net_total, places=2)}",
+        ]
+        if live_covered < len(active_sessions):
+            parts.append(f"浮盈覆盖 {live_covered}/{len(active_sessions)}")
+        if latest_refresh_at is not None:
+            parts.append(f"参考持仓 {latest_refresh_at.strftime('%H:%M:%S')}")
+        else:
+            parts.append("实时浮盈待持仓刷新")
+        self.session_summary_text.set(" | ".join(parts))
 
     def _render_positions_view(self) -> None:
         selected_before = self.position_tree.selection()[0] if self.position_tree.selection() else None
@@ -7916,14 +8284,497 @@ class QuantApp:
         inferred = _infer_session_runtime_status(text, session.runtime_status)
         if inferred:
             session.runtime_status = inferred
+        self._track_session_trade_runtime(session, text)
+
+    def _ensure_session_trade_runtime(
+        self,
+        session: StrategySession,
+        *,
+        observed_at: datetime,
+        signal_bar_at: datetime | None = None,
+    ) -> StrategyTradeRuntimeState:
+        current = session.active_trade
+        if current is None or current.reconciliation_started:
+            current = StrategyTradeRuntimeState(
+                round_id=f"{session.session_id}-{observed_at.strftime('%Y%m%d%H%M%S%f')}",
+                signal_bar_at=signal_bar_at,
+            )
+            session.active_trade = current
+        elif signal_bar_at is not None and current.signal_bar_at is None:
+            current.signal_bar_at = signal_bar_at
+        return current
+
+    def _track_session_trade_runtime(self, session: StrategySession, message: str) -> None:
+        observed_at = datetime.now()
+        signal_bar_at = _extract_session_bar_time(message)
+        if "挂单已提交到 OKX" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            entry_order_id = _extract_log_field(message, "ordId")
+            if entry_order_id:
+                trade.entry_order_id = entry_order_id
+            return
+        if "委托追踪" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            client_order_id = _extract_log_field(message, "clOrdId")
+            if client_order_id:
+                trade.entry_client_order_id = client_order_id
+            return
+        if "挂单已成交" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            trade.opened_logged_at = observed_at
+            entry_order_id = _extract_log_field(message, "ordId")
+            if entry_order_id:
+                trade.entry_order_id = entry_order_id
+            entry_price = _extract_log_field_decimal(message, "开仓价")
+            if entry_price is not None:
+                trade.entry_price = entry_price
+            size = _extract_log_field_decimal(message, "数量")
+            if size is not None:
+                trade.size = size
+            return
+        if "初始 OKX 止损已提交" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            algo_cl_ord_id = _extract_log_field(message, "algoClOrdId")
+            if algo_cl_ord_id:
+                trade.protective_algo_cl_ord_id = algo_cl_ord_id
+            stop_price = _extract_log_field_decimal(message, "止损")
+            if stop_price is not None:
+                trade.current_stop_price = stop_price
+            return
+        if "OKX 动态止损已上移" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            new_stop = _extract_log_field_decimal(message, "新止损") or _extract_log_field_decimal(message, "止损")
+            if new_stop is not None:
+                trade.current_stop_price = new_stop
+            return
+        if "本轮持仓已结束，继续监控下一次信号" in message:
+            trade = session.active_trade
+            if trade is None or trade.reconciliation_started:
+                return
+            trade.reconciliation_started = True
+            self._start_session_trade_reconciliation(session, trade)
+
+    def _start_session_trade_reconciliation(
+        self,
+        session: StrategySession,
+        trade: StrategyTradeRuntimeState,
+    ) -> None:
+        credentials = self._credentials_for_profile_or_none(session.api_name)
+        if credentials is None:
+            self._log_session_message(
+                session,
+                "检测到仓位已关闭，但未找到该会话对应的 API 凭证，无法自动归因与结算。",
+            )
+            if session.active_trade is not None and session.active_trade.round_id == trade.round_id:
+                session.active_trade = None
+            return
+        self._log_session_message(
+            session,
+            f"检测到仓位已关闭，开始归因 | 最近保护单={trade.protective_algo_cl_ord_id or '-'}",
+        )
+        trade_snapshot = StrategyTradeRuntimeState(
+            round_id=trade.round_id,
+            signal_bar_at=trade.signal_bar_at,
+            opened_logged_at=trade.opened_logged_at,
+            entry_order_id=trade.entry_order_id,
+            entry_client_order_id=trade.entry_client_order_id,
+            entry_price=trade.entry_price,
+            size=trade.size,
+            protective_algo_id=trade.protective_algo_id,
+            protective_algo_cl_ord_id=trade.protective_algo_cl_ord_id,
+            current_stop_price=trade.current_stop_price,
+            reconciliation_started=True,
+        )
+        threading.Thread(
+            target=self._reconcile_session_trade_worker,
+            args=(session.session_id, trade_snapshot, credentials),
+            daemon=True,
+        ).start()
+
+    def _load_strategy_trade_reconciliation_snapshot(
+        self,
+        session: StrategySession,
+        credentials: Credentials,
+        environment: str,
+    ) -> StrategyTradeReconciliationSnapshot:
+        trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or session.symbol).strip().upper()
+        inst_type = infer_inst_type(trade_inst_id) if trade_inst_id else "SWAP"
+        inst_types = (inst_type,)
+        return StrategyTradeReconciliationSnapshot(
+            effective_environment=environment,
+            order_history=self.client.get_order_history(credentials, environment=environment, inst_types=inst_types, limit=400),
+            fills=self.client.get_fills_history(credentials, environment=environment, inst_types=inst_types, limit=400),
+            position_history=self.client.get_positions_history(
+                credentials,
+                environment=environment,
+                inst_types=inst_types if inst_type != "SPOT" else ("SPOT",),
+                limit=200,
+            ),
+            account_bills=self.client.get_account_bills_history(
+                credentials,
+                environment=environment,
+                inst_types=inst_types,
+                limit=300,
+            ),
+        )
+
+    def _load_strategy_trade_reconciliation_snapshot_with_fallback(
+        self,
+        session: StrategySession,
+        credentials: Credentials,
+    ) -> StrategyTradeReconciliationSnapshot:
+        environment = session.config.environment
+        try:
+            return self._load_strategy_trade_reconciliation_snapshot(session, credentials, environment)
+        except Exception as exc:
+            message = str(exc)
+            if "50101" not in message or "current environment" not in message:
+                raise
+            alternate = "live" if environment == "demo" else "demo"
+            snapshot = self._load_strategy_trade_reconciliation_snapshot(session, credentials, alternate)
+            snapshot.environment_note = f"本轮归因自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
+            return snapshot
+
+    @staticmethod
+    def _is_funding_fee_bill(item: OkxAccountBillItem) -> bool:
+        if (item.bill_sub_type or "").strip() in FUNDING_FEE_BILL_SUBTYPES:
+            return True
+        text = " ".join(
+            value.strip().lower()
+            for value in (item.bill_type or "", item.bill_sub_type or "", item.business_type or "", item.event_type or "")
+            if value
+        )
+        return any(marker in text for marker in FUNDING_FEE_BILL_MARKERS)
+
+    def _build_strategy_trade_reconciliation_result(
+        self,
+        session: StrategySession,
+        trade: StrategyTradeRuntimeState,
+        snapshot: StrategyTradeReconciliationSnapshot,
+    ) -> StrategyTradeReconciliationResult:
+        trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or session.symbol).strip().upper()
+        open_anchor = trade.opened_logged_at or datetime.now()
+        open_ms = int((open_anchor - timedelta(minutes=2)).timestamp() * 1000)
+
+        session_orders = [
+            item
+            for item in snapshot.order_history
+            if _trade_order_belongs_to_session(item, session)
+            and (not trade_inst_id or item.inst_id.strip().upper() == trade_inst_id)
+        ]
+        recent_orders = [item for item in session_orders if _trade_order_event_time(item) >= open_ms]
+        if not recent_orders:
+            recent_orders = session_orders
+
+        entry_order = next(
+            (
+                item
+                for item in recent_orders
+                if trade.entry_order_id and (item.order_id or "").strip() == trade.entry_order_id
+            ),
+            None,
+        )
+        if entry_order is None:
+            entry_order = next(
+                (
+                    item
+                    for item in recent_orders
+                    if trade.entry_client_order_id and (item.client_order_id or "").strip() == trade.entry_client_order_id
+                ),
+                None,
+            )
+        if entry_order is None:
+            entry_candidates = [item for item in recent_orders if _trade_order_session_role(item, session) == "ent"]
+            entry_candidates.sort(key=_trade_order_event_time)
+            entry_order = next(
+                (
+                    item
+                    for item in entry_candidates
+                    if (item.filled_size or Decimal("0")) > 0 or (item.state or "").strip().lower() == "filled"
+                ),
+                entry_candidates[0] if entry_candidates else None,
+            )
+
+        protective_orders = [item for item in recent_orders if _trade_order_session_role(item, session) == "slg"]
+        protective_orders.sort(
+            key=lambda item: (
+                0
+                if trade.protective_algo_cl_ord_id
+                and (item.algo_client_order_id or "").strip() == trade.protective_algo_cl_ord_id
+                else 1,
+                -_trade_order_event_time(item),
+            )
+        )
+        protective_order = protective_orders[0] if protective_orders else None
+
+        exit_orders = [item for item in recent_orders if _trade_order_session_role(item, session) == "exi"]
+        exit_orders.sort(key=_trade_order_event_time, reverse=True)
+        filled_exit_order = next(
+            (
+                item
+                for item in exit_orders
+                if (item.filled_size or Decimal("0")) > 0
+                or (item.actual_size or Decimal("0")) > 0
+                or (item.state or "").strip().lower() == "filled"
+            ),
+            None,
+        )
+
+        relevant_fills = [
+            item
+            for item in snapshot.fills
+            if (not trade_inst_id or item.inst_id.strip().upper() == trade_inst_id)
+            and (item.fill_time or 0) >= open_ms
+        ]
+        entry_order_ids = {
+            value
+            for value in (
+                trade.entry_order_id,
+                entry_order.order_id if entry_order is not None else "",
+            )
+            if value
+        }
+        close_order_ids = {
+            value
+            for value in (
+                filled_exit_order.order_id if filled_exit_order is not None else "",
+                protective_order.order_id if protective_order is not None else "",
+            )
+            if value
+        }
+        entry_fills = [item for item in relevant_fills if (item.order_id or "") in entry_order_ids]
+        close_fills = [item for item in relevant_fills if (item.order_id or "") in close_order_ids]
+
+        relevant_position_history = [
+            item
+            for item in snapshot.position_history
+            if (not trade_inst_id or item.inst_id.strip().upper() == trade_inst_id)
+            and (item.update_time or 0) >= open_ms
+        ]
+        relevant_position_history.sort(key=lambda item: item.update_time or 0, reverse=True)
+        matched_position_history = relevant_position_history[0] if relevant_position_history else None
+
+        close_reason = "持仓已关闭（原因待确认）"
+        reason_confidence = "low"
+        close_order = filled_exit_order
+        protective_executed = False
+        if protective_order is not None:
+            protective_executed = (
+                (protective_order.actual_size or Decimal("0")) > 0
+                or (protective_order.filled_size or Decimal("0")) > 0
+                or protective_order.actual_price is not None
+                or (
+                    protective_order.order_id is not None
+                    and any((item.order_id or "") == protective_order.order_id for item in close_fills)
+                )
+            )
+        if protective_executed:
+            close_reason = "OKX止损触发"
+            reason_confidence = "high"
+            close_order = protective_order
+        elif filled_exit_order is not None:
+            close_reason = "策略主动平仓"
+            reason_confidence = "high"
+        elif close_fills:
+            close_reason = "外部成交平仓"
+            reason_confidence = "medium"
+        elif matched_position_history is not None:
+            close_reason = "持仓已关闭（原因待确认）"
+            reason_confidence = "medium"
+
+        entry_price = (
+            _weighted_average_fill_price(entry_fills)
+            or trade.entry_price
+            or (entry_order.avg_price if entry_order is not None else None)
+            or (entry_order.actual_price if entry_order is not None else None)
+            or (entry_order.price if entry_order is not None else None)
+        )
+        size = (
+            _sum_fill_size(entry_fills)
+            or trade.size
+            or (entry_order.filled_size if entry_order is not None else None)
+            or (entry_order.actual_size if entry_order is not None else None)
+            or (entry_order.size if entry_order is not None else None)
+        )
+        exit_price = (
+            _weighted_average_fill_price(close_fills)
+            or (close_order.actual_price if close_order is not None else None)
+            or (close_order.avg_price if close_order is not None else None)
+            or (close_order.price if close_order is not None else None)
+            or (matched_position_history.close_avg_price if matched_position_history is not None else None)
+            or trade.current_stop_price
+        )
+        entry_fee = _sum_fill_fee(entry_fills)
+        if entry_fee is None and entry_order is not None:
+            entry_fee = entry_order.fee
+        exit_fee = _sum_fill_fee(close_fills)
+        if exit_fee is None and close_order is not None:
+            exit_fee = close_order.fee
+        gross_pnl = _sum_fill_pnl(close_fills)
+        if gross_pnl is None and close_order is not None:
+            gross_pnl = close_order.pnl
+        if gross_pnl is None and matched_position_history is not None:
+            gross_pnl = matched_position_history.pnl
+
+        close_time_ms = max(
+            [item.fill_time or 0 for item in close_fills]
+            + [
+                _trade_order_event_time(close_order) if close_order is not None else 0,
+                matched_position_history.update_time if matched_position_history is not None else 0,
+            ]
+        )
+        if close_time_ms > 0:
+            closed_at = datetime.fromtimestamp(close_time_ms / 1000)
+        else:
+            closed_at = datetime.now()
+
+        funding_fee = None
+        if snapshot.account_bills:
+            funding_total = Decimal("0")
+            funding_seen = False
+            close_window_ms = int((closed_at + timedelta(minutes=2)).timestamp() * 1000)
+            for bill in snapshot.account_bills:
+                if trade_inst_id and bill.inst_id.strip().upper() != trade_inst_id:
+                    continue
+                if (bill.bill_time or 0) < open_ms or (bill.bill_time or 0) > close_window_ms:
+                    continue
+                if not self._is_funding_fee_bill(bill):
+                    continue
+                amount = bill.amount
+                if amount is None:
+                    amount = bill.pnl if bill.pnl is not None else bill.balance_change
+                if amount is None:
+                    continue
+                funding_total += amount
+                funding_seen = True
+            if funding_seen:
+                funding_fee = funding_total
+
+        net_pnl = None
+        if gross_pnl is not None:
+            net_pnl = gross_pnl + (entry_fee or Decimal("0")) + (exit_fee or Decimal("0")) + (funding_fee or Decimal("0"))
+        elif matched_position_history is not None and matched_position_history.realized_pnl is not None:
+            net_pnl = matched_position_history.realized_pnl
+
+        ledger_record = StrategyTradeLedgerRecord(
+            record_id=self._next_strategy_trade_ledger_record_id(session, closed_at),
+            history_record_id=session.history_record_id or "",
+            session_id=session.session_id,
+            api_name=session.api_name,
+            strategy_id=session.strategy_id,
+            strategy_name=session.strategy_name,
+            symbol=trade_inst_id or session.symbol,
+            direction_label=session.direction_label,
+            run_mode_label=session.run_mode_label,
+            environment=snapshot.effective_environment,
+            signal_bar_at=trade.signal_bar_at,
+            opened_at=trade.opened_logged_at,
+            closed_at=closed_at,
+            entry_order_id=trade.entry_order_id or (entry_order.order_id if entry_order is not None else ""),
+            entry_client_order_id=trade.entry_client_order_id,
+            exit_order_id=close_order.order_id if close_order is not None and close_order.order_id is not None else "",
+            protective_algo_id=protective_order.algo_id if protective_order is not None and protective_order.algo_id is not None else "",
+            protective_algo_cl_ord_id=trade.protective_algo_cl_ord_id or (
+                protective_order.algo_client_order_id if protective_order is not None else ""
+            ),
+            entry_price=entry_price,
+            exit_price=exit_price,
+            size=size,
+            entry_fee=entry_fee,
+            exit_fee=exit_fee,
+            funding_fee=funding_fee,
+            gross_pnl=gross_pnl,
+            net_pnl=net_pnl,
+            close_reason=close_reason,
+            reason_confidence=reason_confidence,
+            summary_note=snapshot.environment_note or "",
+            updated_at=datetime.now(),
+        )
+
+        projected_trade_count = session.trade_count + 1
+        projected_win_count = session.win_count + (1 if (net_pnl or Decimal("0")) > 0 else 0)
+        projected_net_pnl = session.net_pnl_total + (net_pnl or Decimal("0"))
+        win_rate_text = (
+            _format_ratio(Decimal(projected_win_count) / Decimal(projected_trade_count), places=2)
+            if projected_trade_count
+            else "-"
+        )
+        attribution_summary = (
+            f"本轮结束 | 原因={close_reason} | 开仓均价={_format_optional_decimal(entry_price)} | "
+            f"平仓均价={_format_optional_decimal(exit_price)} | 数量={_format_optional_decimal(size)} | "
+            f"开仓手续费={_format_optional_usdt_precise(entry_fee, places=2)} | "
+            f"平仓手续费={_format_optional_usdt_precise(exit_fee, places=2)} | "
+            f"资金费={_format_optional_usdt_precise(funding_fee, places=2)} | "
+            f"毛盈亏={_format_optional_usdt_precise(gross_pnl, places=2)} | "
+            f"净盈亏={_format_optional_usdt_precise(net_pnl, places=2)}"
+        )
+        cumulative_summary = (
+            f"会话累计 | 交易次数={projected_trade_count} | 胜率={win_rate_text} | "
+            f"累计净盈亏={_format_optional_usdt_precise(projected_net_pnl, places=2)}"
+        )
+        return StrategyTradeReconciliationResult(
+            session_id=session.session_id,
+            round_id=trade.round_id,
+            ledger_record=ledger_record,
+            environment_note=snapshot.environment_note,
+            attribution_summary=attribution_summary,
+            cumulative_summary=cumulative_summary,
+        )
+
+    def _reconcile_session_trade_worker(
+        self,
+        session_id: str,
+        trade: StrategyTradeRuntimeState,
+        credentials: Credentials,
+    ) -> None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return
+        try:
+            snapshot = self._load_strategy_trade_reconciliation_snapshot_with_fallback(session, credentials)
+            result = self._build_strategy_trade_reconciliation_result(session, trade, snapshot)
+        except Exception as exc:
+            result = StrategyTradeReconciliationResult(
+                session_id=session_id,
+                round_id=trade.round_id,
+                error_message=_format_network_error_message(str(exc)),
+            )
+        self.root.after(0, lambda: self._apply_strategy_trade_reconciliation_result(result))
+
+    def _apply_strategy_trade_reconciliation_result(self, result: StrategyTradeReconciliationResult) -> None:
+        session = self.sessions.get(result.session_id)
+        if session is None:
+            return
+        if session.active_trade is not None and session.active_trade.round_id == result.round_id:
+            session.active_trade = None
+        if result.environment_note:
+            self._log_session_message(session, result.environment_note)
+        if result.error_message:
+            self._log_session_message(session, f"本轮结束归因失败：{result.error_message}")
+            return
+        if result.ledger_record is None:
+            return
+        self._upsert_strategy_trade_ledger_record(result.ledger_record)
+        self._refresh_session_financials_from_trade_ledger(session)
+        session.last_close_reason = result.ledger_record.close_reason
+        self._refresh_running_session_summary()
+        self._log_session_message(session, result.attribution_summary)
+        self._log_session_message(session, result.cumulative_summary)
 
     def _upsert_session_row(self, session: StrategySession) -> None:
+        live_pnl, _ = self._session_live_pnl_snapshot(session)
         values = (
             session.api_name or "-",
             session.strategy_name,
             session.symbol,
             session.direction_label,
             session.run_mode_label,
+            _format_optional_usdt_precise(live_pnl, places=2),
+            _format_optional_usdt_precise(session.net_pnl_total, places=2),
             session.display_status,
             session.started_at.strftime("%H:%M:%S"),
         )
@@ -7948,6 +8799,7 @@ class QuantApp:
             self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
             return
 
+        live_pnl, live_pnl_refreshed_at = self._session_live_pnl_snapshot(session)
         self.selected_session_text.set(
             self._build_strategy_detail_text(
                 session_id=session.session_id,
@@ -7965,6 +8817,15 @@ class QuantApp:
                 config_snapshot=_serialize_strategy_config_snapshot(session.config),
                 log_file_path=session.log_file_path,
                 last_message=session.last_message,
+                trade_count=session.trade_count,
+                win_count=session.win_count,
+                gross_pnl_total=session.gross_pnl_total,
+                fee_total=session.fee_total,
+                funding_total=session.funding_total,
+                net_pnl_total=session.net_pnl_total,
+                last_close_reason=session.last_close_reason,
+                live_pnl=live_pnl,
+                live_pnl_refreshed_at=live_pnl_refreshed_at,
             )
         )
         self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
@@ -8017,6 +8878,15 @@ class QuantApp:
         updated_at: datetime | None = None,
         runtime_status: str | None = None,
         last_message: str = "",
+        trade_count: int = 0,
+        win_count: int = 0,
+        gross_pnl_total: Decimal = Decimal("0"),
+        fee_total: Decimal = Decimal("0"),
+        funding_total: Decimal = Decimal("0"),
+        net_pnl_total: Decimal = Decimal("0"),
+        last_close_reason: str = "",
+        live_pnl: Decimal | None = None,
+        live_pnl_refreshed_at: datetime | None = None,
     ) -> str:
         try:
             definition = get_strategy_definition(strategy_id)
@@ -8051,6 +8921,27 @@ class QuantApp:
             lines.append(f"最近日志：{last_message}")
         if ended_reason:
             lines.append(f"结束原因：{ended_reason}")
+        lines.extend(
+            [
+                f"交易次数：{trade_count}",
+                f"胜率：{_format_ratio(Decimal(win_count) / Decimal(trade_count), places=2) if trade_count else '-'}",
+            ]
+        )
+        if record_id is None:
+            live_pnl_text = _format_optional_usdt_precise(live_pnl, places=2)
+            if live_pnl_refreshed_at is not None:
+                live_pnl_text += f"（参考持仓 {live_pnl_refreshed_at.strftime('%H:%M:%S')}）"
+            lines.append(f"实时浮盈亏：{live_pnl_text}")
+        lines.extend(
+            [
+                f"毛盈亏：{_format_optional_usdt_precise(gross_pnl_total, places=2)}",
+                f"手续费：{_format_optional_usdt_precise(fee_total, places=2)}",
+                f"资金费：{_format_optional_usdt_precise(funding_total, places=2)}",
+                f"净盈亏：{_format_optional_usdt_precise(net_pnl_total, places=2)}",
+            ]
+        )
+        if last_close_reason:
+            lines.append(f"最近结论：{last_close_reason}")
         lines.extend(
             [
                 f"策略：{strategy_name}",
@@ -8379,6 +9270,13 @@ class QuantApp:
             log_file_path=str(payload.get("log_file_path", "")).strip(),
             updated_at=_parse_datetime_snapshot(payload.get("updated_at")),
             config_snapshot=dict(config_snapshot) if isinstance(config_snapshot, dict) else {},
+            trade_count=max(0, int(payload.get("trade_count", 0) or 0)),
+            win_count=max(0, int(payload.get("win_count", 0) or 0)),
+            gross_pnl_total=_parse_decimal_snapshot(payload.get("gross_pnl_total")),
+            fee_total=_parse_decimal_snapshot(payload.get("fee_total")),
+            funding_total=_parse_decimal_snapshot(payload.get("funding_total")),
+            net_pnl_total=_parse_decimal_snapshot(payload.get("net_pnl_total")),
+            last_close_reason=str(payload.get("last_close_reason", "")).strip(),
         )
 
     @staticmethod
@@ -8399,6 +9297,13 @@ class QuantApp:
             "log_file_path": record.log_file_path,
             "updated_at": record.updated_at.isoformat(timespec="seconds") if record.updated_at is not None else None,
             "config_snapshot": dict(record.config_snapshot),
+            "trade_count": record.trade_count,
+            "win_count": record.win_count,
+            "gross_pnl_total": format(record.gross_pnl_total, "f"),
+            "fee_total": format(record.fee_total, "f"),
+            "funding_total": format(record.funding_total, "f"),
+            "net_pnl_total": format(record.net_pnl_total, "f"),
+            "last_close_reason": record.last_close_reason,
         }
 
     def _sort_strategy_history_records(self) -> None:
@@ -8415,6 +9320,194 @@ class QuantApp:
             )
         except Exception as exc:
             self._enqueue_log(f"保存策略历史失败：{exc}")
+
+    def _trade_ledger_record_from_payload(self, payload: dict[str, object]) -> StrategyTradeLedgerRecord | None:
+        closed_at = _parse_datetime_snapshot(payload.get("closed_at"))
+        if closed_at is None:
+            return None
+        return StrategyTradeLedgerRecord(
+            record_id=str(payload.get("record_id", "")).strip(),
+            history_record_id=str(payload.get("history_record_id", "")).strip(),
+            session_id=str(payload.get("session_id", "")).strip(),
+            api_name=str(payload.get("api_name", "")).strip(),
+            strategy_id=str(payload.get("strategy_id", "")).strip(),
+            strategy_name=str(payload.get("strategy_name", "")).strip(),
+            symbol=str(payload.get("symbol", "")).strip(),
+            direction_label=str(payload.get("direction_label", "")).strip(),
+            run_mode_label=str(payload.get("run_mode_label", "")).strip(),
+            environment=str(payload.get("environment", "")).strip(),
+            signal_bar_at=_parse_datetime_snapshot(payload.get("signal_bar_at")),
+            opened_at=_parse_datetime_snapshot(payload.get("opened_at")),
+            closed_at=closed_at,
+            entry_order_id=str(payload.get("entry_order_id", "")).strip(),
+            entry_client_order_id=str(payload.get("entry_client_order_id", "")).strip(),
+            exit_order_id=str(payload.get("exit_order_id", "")).strip(),
+            protective_algo_id=str(payload.get("protective_algo_id", "")).strip(),
+            protective_algo_cl_ord_id=str(payload.get("protective_algo_cl_ord_id", "")).strip(),
+            entry_price=_parse_decimal_snapshot(payload.get("entry_price"), default=None) if payload.get("entry_price") else None,
+            exit_price=_parse_decimal_snapshot(payload.get("exit_price"), default=None) if payload.get("exit_price") else None,
+            size=_parse_decimal_snapshot(payload.get("size"), default=None) if payload.get("size") else None,
+            entry_fee=_parse_decimal_snapshot(payload.get("entry_fee"), default=None) if payload.get("entry_fee") else None,
+            exit_fee=_parse_decimal_snapshot(payload.get("exit_fee"), default=None) if payload.get("exit_fee") else None,
+            funding_fee=_parse_decimal_snapshot(payload.get("funding_fee"), default=None) if payload.get("funding_fee") else None,
+            gross_pnl=_parse_decimal_snapshot(payload.get("gross_pnl"), default=None) if payload.get("gross_pnl") else None,
+            net_pnl=_parse_decimal_snapshot(payload.get("net_pnl"), default=None) if payload.get("net_pnl") else None,
+            close_reason=str(payload.get("close_reason", "")).strip(),
+            reason_confidence=str(payload.get("reason_confidence", "")).strip() or "low",
+            summary_note=str(payload.get("summary_note", "")).strip(),
+            updated_at=_parse_datetime_snapshot(payload.get("updated_at")),
+        )
+
+    @staticmethod
+    def _trade_ledger_payload(record: StrategyTradeLedgerRecord) -> dict[str, object]:
+        return {
+            "record_id": record.record_id,
+            "history_record_id": record.history_record_id,
+            "session_id": record.session_id,
+            "api_name": record.api_name,
+            "strategy_id": record.strategy_id,
+            "strategy_name": record.strategy_name,
+            "symbol": record.symbol,
+            "direction_label": record.direction_label,
+            "run_mode_label": record.run_mode_label,
+            "environment": record.environment,
+            "signal_bar_at": record.signal_bar_at.isoformat(timespec="seconds") if record.signal_bar_at is not None else None,
+            "opened_at": record.opened_at.isoformat(timespec="seconds") if record.opened_at is not None else None,
+            "closed_at": record.closed_at.isoformat(timespec="seconds"),
+            "entry_order_id": record.entry_order_id,
+            "entry_client_order_id": record.entry_client_order_id,
+            "exit_order_id": record.exit_order_id,
+            "protective_algo_id": record.protective_algo_id,
+            "protective_algo_cl_ord_id": record.protective_algo_cl_ord_id,
+            "entry_price": format(record.entry_price, "f") if record.entry_price is not None else None,
+            "exit_price": format(record.exit_price, "f") if record.exit_price is not None else None,
+            "size": format(record.size, "f") if record.size is not None else None,
+            "entry_fee": format(record.entry_fee, "f") if record.entry_fee is not None else None,
+            "exit_fee": format(record.exit_fee, "f") if record.exit_fee is not None else None,
+            "funding_fee": format(record.funding_fee, "f") if record.funding_fee is not None else None,
+            "gross_pnl": format(record.gross_pnl, "f") if record.gross_pnl is not None else None,
+            "net_pnl": format(record.net_pnl, "f") if record.net_pnl is not None else None,
+            "close_reason": record.close_reason,
+            "reason_confidence": record.reason_confidence,
+            "summary_note": record.summary_note,
+            "updated_at": record.updated_at.isoformat(timespec="seconds") if record.updated_at is not None else None,
+        }
+
+    def _sort_strategy_trade_ledger_records(self) -> None:
+        self._strategy_trade_ledger_records.sort(
+            key=lambda item: (item.closed_at.isoformat(timespec="seconds"), item.record_id),
+            reverse=True,
+        )
+
+    def _save_strategy_trade_ledger_records(self) -> None:
+        self._sort_strategy_trade_ledger_records()
+        try:
+            save_strategy_trade_ledger_snapshot(
+                [self._trade_ledger_payload(record) for record in self._strategy_trade_ledger_records]
+            )
+        except Exception as exc:
+            self._enqueue_log(f"保存策略交易账本失败：{exc}")
+
+    def _load_strategy_trade_ledger(self) -> None:
+        try:
+            snapshot = load_strategy_trade_ledger_snapshot()
+        except Exception as exc:
+            self._enqueue_log(f"读取策略交易账本失败：{exc}")
+            return
+        records: list[StrategyTradeLedgerRecord] = []
+        raw_records = snapshot.get("records", [])
+        if isinstance(raw_records, list):
+            for item in raw_records:
+                if not isinstance(item, dict):
+                    continue
+                record = self._trade_ledger_record_from_payload(item)
+                if record is not None:
+                    records.append(record)
+        self._strategy_trade_ledger_records = records
+        self._strategy_trade_ledger_by_id = {record.record_id: record for record in records}
+        self._rebuild_history_financials_from_trade_ledger()
+
+    def _next_strategy_trade_ledger_record_id(self, session: StrategySession, closed_at: datetime) -> str:
+        base = f"{closed_at.strftime('%Y%m%d%H%M%S%f')}-{session.session_id}"
+        record_id = base
+        suffix = 2
+        while record_id in self._strategy_trade_ledger_by_id:
+            record_id = f"{base}-{suffix}"
+            suffix += 1
+        return record_id
+
+    def _upsert_strategy_trade_ledger_record(self, record: StrategyTradeLedgerRecord) -> None:
+        existing = self._strategy_trade_ledger_by_id.get(record.record_id)
+        self._strategy_trade_ledger_by_id[record.record_id] = record
+        if existing is None:
+            self._strategy_trade_ledger_records.append(record)
+        else:
+            for index, item in enumerate(self._strategy_trade_ledger_records):
+                if item.record_id == record.record_id:
+                    self._strategy_trade_ledger_records[index] = record
+                    break
+        self._save_strategy_trade_ledger_records()
+
+    def _apply_financial_totals(self, target: StrategySession | StrategyHistoryRecord, records: list[StrategyTradeLedgerRecord]) -> None:
+        target.trade_count = len(records)
+        target.win_count = sum(1 for item in records if (item.net_pnl or Decimal("0")) > 0)
+        target.gross_pnl_total = sum(((item.gross_pnl or Decimal("0")) for item in records), Decimal("0"))
+        target.fee_total = sum(
+            (((item.entry_fee or Decimal("0")) + (item.exit_fee or Decimal("0"))) for item in records),
+            Decimal("0"),
+        )
+        target.funding_total = sum(((item.funding_fee or Decimal("0")) for item in records), Decimal("0"))
+        target.net_pnl_total = sum(((item.net_pnl or Decimal("0")) for item in records), Decimal("0"))
+        target.last_close_reason = records[0].close_reason if records else ""
+
+    def _rebuild_history_financials_from_trade_ledger(self) -> None:
+        grouped: dict[str, list[StrategyTradeLedgerRecord]] = {}
+        for record in self._strategy_trade_ledger_records:
+            key = record.history_record_id.strip()
+            if not key:
+                continue
+            grouped.setdefault(key, []).append(record)
+        changed = False
+        for record in self._strategy_history_records:
+            matched = grouped.get(record.record_id, [])
+            previous = (
+                record.trade_count,
+                record.win_count,
+                record.gross_pnl_total,
+                record.fee_total,
+                record.funding_total,
+                record.net_pnl_total,
+                record.last_close_reason,
+            )
+            self._apply_financial_totals(record, matched)
+            current = (
+                record.trade_count,
+                record.win_count,
+                record.gross_pnl_total,
+                record.fee_total,
+                record.funding_total,
+                record.net_pnl_total,
+                record.last_close_reason,
+            )
+            if current != previous:
+                record.updated_at = datetime.now()
+                changed = True
+        if changed:
+            self._save_strategy_history_records()
+
+    def _refresh_session_financials_from_trade_ledger(self, session: StrategySession) -> None:
+        if session.history_record_id:
+            matched = [
+                record
+                for record in self._strategy_trade_ledger_records
+                if record.history_record_id == session.history_record_id
+            ]
+        else:
+            matched = [record for record in self._strategy_trade_ledger_records if record.session_id == session.session_id]
+        self._apply_financial_totals(session, matched)
+        self._upsert_session_row(session)
+        self._refresh_selected_session_details()
+        self._sync_strategy_history_from_session(session)
 
     def _load_strategy_history(self) -> None:
         try:
@@ -8490,6 +9583,13 @@ class QuantApp:
             log_file_path=str(session.log_file_path) if session.log_file_path is not None else "",
             updated_at=datetime.now(),
             config_snapshot=_serialize_strategy_config_snapshot(session.config),
+            trade_count=session.trade_count,
+            win_count=session.win_count,
+            gross_pnl_total=session.gross_pnl_total,
+            fee_total=session.fee_total,
+            funding_total=session.funding_total,
+            net_pnl_total=session.net_pnl_total,
+            last_close_reason=session.last_close_reason,
         )
 
     def _upsert_strategy_history_record(self, record: StrategyHistoryRecord) -> None:
@@ -8532,6 +9632,13 @@ class QuantApp:
             ("stopped_at", session.stopped_at),
             ("ended_reason", session.ended_reason),
             ("log_file_path", str(session.log_file_path) if session.log_file_path is not None else ""),
+            ("trade_count", session.trade_count),
+            ("win_count", session.win_count),
+            ("gross_pnl_total", session.gross_pnl_total),
+            ("fee_total", session.fee_total),
+            ("funding_total", session.funding_total),
+            ("net_pnl_total", session.net_pnl_total),
+            ("last_close_reason", session.last_close_reason),
         ):
             if getattr(record, attr) != desired:
                 setattr(record, attr, desired)
@@ -8605,7 +9712,7 @@ class QuantApp:
 
         self._strategy_history_tree = ttk.Treeview(
             list_frame,
-            columns=("api", "strategy", "symbol", "direction", "mode", "status", "started", "stopped"),
+            columns=("api", "strategy", "symbol", "direction", "mode", "pnl", "status", "started", "stopped"),
             show="headings",
             selectmode="browse",
         )
@@ -8615,6 +9722,7 @@ class QuantApp:
         tree.heading("symbol", text="标的")
         tree.heading("direction", text="方向")
         tree.heading("mode", text="模式")
+        tree.heading("pnl", text="净盈亏")
         tree.heading("status", text="状态")
         tree.heading("started", text="启动时间")
         tree.heading("stopped", text="停止时间")
@@ -8623,6 +9731,7 @@ class QuantApp:
         tree.column("symbol", width=190, anchor="w")
         tree.column("direction", width=90, anchor="center")
         tree.column("mode", width=110, anchor="center")
+        tree.column("pnl", width=110, anchor="e")
         tree.column("status", width=96, anchor="center")
         tree.column("started", width=160, anchor="center")
         tree.column("stopped", width=160, anchor="center")
@@ -8689,6 +9798,7 @@ class QuantApp:
         removed_count = 0
         blocked_count = 0
         blocked_ids: set[str] = set()
+        removed_ids: set[str] = set()
         for record_id in record_ids:
             record = self._strategy_history_by_id.get(record_id)
             if record is None:
@@ -8702,10 +9812,21 @@ class QuantApp:
                 session.history_record_id = None
             self._strategy_history_by_id.pop(record_id, None)
             removed_count += 1
+            removed_ids.add(record_id)
         if removed_count:
             self._strategy_history_records = [
                 record for record in self._strategy_history_records if record.record_id not in set(record_ids) - blocked_ids
             ]
+            if removed_ids:
+                self._strategy_trade_ledger_records = [
+                    record
+                    for record in self._strategy_trade_ledger_records
+                    if record.history_record_id not in removed_ids
+                ]
+                self._strategy_trade_ledger_by_id = {
+                    record.record_id: record for record in self._strategy_trade_ledger_records
+                }
+                self._save_strategy_trade_ledger_records()
             self._save_strategy_history_records()
         self._render_strategy_history_view(selected_before=selected_before)
         return removed_count, blocked_count
@@ -8836,6 +9957,13 @@ class QuantApp:
                 updated_at=record.updated_at,
                 config_snapshot=record.config_snapshot,
                 log_file_path=record.log_file_path,
+                trade_count=record.trade_count,
+                win_count=record.win_count,
+                gross_pnl_total=record.gross_pnl_total,
+                fee_total=record.fee_total,
+                funding_total=record.funding_total,
+                net_pnl_total=record.net_pnl_total,
+                last_close_reason=record.last_close_reason,
             )
         )
         self._set_readonly_text(self._strategy_history_detail, self.strategy_history_text.get())
@@ -8863,6 +9991,7 @@ class QuantApp:
                     record.symbol,
                     record.direction_label,
                     record.run_mode_label,
+                    _format_optional_usdt_precise(record.net_pnl_total, places=2),
                     record.status,
                     _format_history_datetime(record.started_at),
                     _format_history_datetime(record.stopped_at),
@@ -8987,6 +10116,7 @@ class QuantApp:
 
     def _refresh_status(self) -> None:
         running_count = 0
+        self._refresh_session_live_pnl_cache()
         for session in self.sessions.values():
             if session.engine.is_running:
                 if session.status != "停止中":
@@ -9016,6 +10146,7 @@ class QuantApp:
             self._sync_strategy_history_from_session(session)
 
         self.status_text.set(f"运行中策略：{running_count}")
+        self._refresh_running_session_summary()
         self._update_settings_summary()
         self._refresh_selected_session_details()
         self.root.after(500, self._refresh_status)
@@ -9118,18 +10249,27 @@ def _format_optional_approx_usdt(value: Decimal | None) -> str:
     return f"≈{_format_optional_usdt(value, with_sign=False)} USDT"
 
 
-def _format_optional_usdt(value: Decimal | None, *, with_sign: bool = True) -> str:
+def _format_optional_usdt(value: Decimal | int | float | None, *, with_sign: bool = True) -> str:
     if value is None:
         return "-"
+    if not isinstance(value, Decimal):
+        value = Decimal(str(value))
     text = format_decimal_fixed(value, 0)
     if with_sign and value > 0:
         return f"+{text}"
     return text
 
 
-def _format_optional_usdt_precise(value: Decimal | None, *, places: int = 2, with_sign: bool = True) -> str:
+def _format_optional_usdt_precise(
+    value: Decimal | int | float | None,
+    *,
+    places: int = 2,
+    with_sign: bool = True,
+) -> str:
     if value is None:
         return "-"
+    if not isinstance(value, Decimal):
+        value = Decimal(str(value))
     text = format_decimal_fixed(value, places)
     if with_sign and value > 0:
         return f"+{text}"
@@ -9981,6 +11121,33 @@ def _position_unrealized_pnl_usdt(position: OkxPosition, upl_usdt_prices: dict[s
     if price is None:
         return None
     return position.unrealized_pnl * price
+
+
+def _session_trade_inst_id(session: StrategySession) -> str:
+    config = getattr(session, "config", None)
+    trade_inst_id = getattr(config, "trade_inst_id", None) or getattr(config, "inst_id", None) or getattr(session, "symbol", "")
+    return str(trade_inst_id or "").strip().upper()
+
+
+def _session_expected_position_sides(session: StrategySession) -> tuple[str, ...]:
+    signal_mode = str(getattr(getattr(session, "config", None), "signal_mode", "") or "").strip().lower()
+    if signal_mode == "long_only":
+        return ("long",)
+    if signal_mode == "short_only":
+        return ("short",)
+    return ("long", "short")
+
+
+def _position_matches_session_live_pnl(
+    position: OkxPosition,
+    *,
+    trade_inst_id: str,
+    expected_sides: tuple[str, ...],
+) -> bool:
+    if position.inst_id.strip().upper() != trade_inst_id:
+        return False
+    derived_side = _format_pos_side(position.pos_side, position.position).strip().lower()
+    return derived_side in expected_sides
 
 
 def _build_upl_usdt_price_map(client: OkxRestClient, positions: list[OkxPosition]) -> dict[str, Decimal]:

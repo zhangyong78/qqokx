@@ -42,10 +42,11 @@ from okx_quant.enhanced_runtime_config import (
 )
 from okx_quant.enhanced_seed_strategies import register_seed_strategy_package
 from okx_quant.okx_client import OkxRestClient
+from okx_quant.persistence import analysis_report_dir_path, enhanced_strategy_runtime_file_path
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-DEFAULT_RUNTIME_CONFIG_FILE = ".okx_quant_enhanced_strategy_runtime.json"
+DEFAULT_RUNTIME_CONFIG_FILE = str(enhanced_strategy_runtime_file_path())
 
 
 def parse_args() -> argparse.Namespace:
@@ -1072,7 +1073,7 @@ def main() -> None:
         playbook_actions=playbook_actions,
         latest_reference_candles=latest_reference_candles,
     )
-    target_dir = Path("reports") / "analysis"
+    target_dir = analysis_report_dir_path()
     target_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     stem = f"enhanced_seed_lab_realdata_{args.inst_id.replace('-', '_')}_{args.base_bar}_{timestamp}"

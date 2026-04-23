@@ -18,9 +18,10 @@ import okx_quant.backtest as backtest_module
 from okx_quant.backtest import _build_backtest_data_source_note, _load_backtest_candles, _run_backtest_with_loaded_data
 from okx_quant.models import Instrument, StrategyConfig
 from okx_quant.okx_client import OkxRestClient
+from okx_quant.persistence import analysis_report_dir_path
 from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_LONG_ID, STRATEGY_DYNAMIC_SHORT_ID
 
-REPORTS_DIR = ROOT / "reports" / "analysis"
+REPORTS_DIR = analysis_report_dir_path()
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 SYMBOLS = (

@@ -9,13 +9,16 @@ from okx_quant.persistence import (
     load_option_strategies_snapshot,
     load_smart_order_favorites_snapshot,
     load_strategy_history_snapshot,
+    load_strategy_trade_ledger_snapshot,
     option_strategies_file_path,
     save_credentials_snapshot,
     save_option_strategies_snapshot,
     save_smart_order_favorites_snapshot,
     save_strategy_history_snapshot,
+    save_strategy_trade_ledger_snapshot,
     smart_order_favorites_file_path,
     strategy_history_file_path,
+    strategy_trade_ledger_file_path,
 )
 
 
@@ -262,3 +265,52 @@ class PersistenceTest(TestCase):
         self.assertEqual(snapshot["records"][0]["record_id"], "valid-1")
         self.assertEqual(snapshot["records"][0]["status"], "已停止")
         self.assertEqual(snapshot["records"][0]["config_snapshot"], {})
+
+    def test_save_and_load_strategy_trade_ledger_snapshot(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        temp_path = strategy_trade_ledger_file_path(temp_dir)
+        save_strategy_trade_ledger_snapshot(
+            [
+                {
+                    "record_id": "20260423170920000000-S01",
+                    "history_record_id": "20260423081513000000-S01",
+                    "session_id": "S01",
+                    "api_name": "QQzhangyong",
+                    "strategy_id": "ema_dynamic_order_long",
+                    "strategy_name": "EMA 动态委托-多头",
+                    "symbol": "ETH-USDT-SWAP",
+                    "direction_label": "只做多",
+                    "run_mode_label": "交易并下单",
+                    "environment": "demo",
+                    "signal_bar_at": "2026-04-23T08:00:00",
+                    "opened_at": "2026-04-23T08:15:13",
+                    "closed_at": "2026-04-23T17:09:20",
+                    "entry_order_id": "1001",
+                    "entry_client_order_id": "s01emaent042300000897343",
+                    "exit_order_id": "2001",
+                    "protective_algo_id": "3001",
+                    "protective_algo_cl_ord_id": "s01emaslg042300000897344",
+                    "entry_price": "2358.42",
+                    "exit_price": "2320.66",
+                    "size": "0.1",
+                    "entry_fee": "-0.04",
+                    "exit_fee": "-0.04",
+                    "funding_fee": "-0.01",
+                    "gross_pnl": "-3.78",
+                    "net_pnl": "-3.87",
+                    "close_reason": "OKX止损触发",
+                    "reason_confidence": "high",
+                    "summary_note": "demo snapshot",
+                    "updated_at": "2026-04-23T17:09:21",
+                }
+            ],
+            temp_path,
+        )
+
+        snapshot = load_strategy_trade_ledger_snapshot(temp_path)
+
+        self.assertEqual(len(snapshot["records"]), 1)
+        record = snapshot["records"][0]
+        self.assertEqual(record["record_id"], "20260423170920000000-S01")
+        self.assertEqual(record["close_reason"], "OKX止损触发")
+        self.assertEqual(record["net_pnl"], "-3.87")

@@ -16,10 +16,11 @@ if str(ROOT) not in sys.path:
 from okx_quant.backtest import BacktestManualPosition, BacktestResult, run_backtest_batch
 from okx_quant.models import Instrument, StrategyConfig
 from okx_quant.okx_client import OkxRestClient
+from okx_quant.persistence import analysis_report_dir_path
 from okx_quant.pricing import snap_to_increment
 from okx_quant.strategy_catalog import STRATEGY_SLOT_LONG_ID, STRATEGY_SLOT_SHORT_ID
 
-REPORTS_DIR = ROOT / "reports" / "analysis"
+REPORTS_DIR = analysis_report_dir_path()
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 SYMBOLS = (

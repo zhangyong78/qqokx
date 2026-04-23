@@ -216,3 +216,34 @@ class OkxClientOrderRequestTest(TestCase):
 
         self.assertEqual(context.exception.code, "51000")
         self.assertEqual(str(context.exception), "OKX API 错误 code=51000")
+
+    def test_get_account_bills_history_parses_funding_fee_bill(self) -> None:
+        client = OkxRestClient()
+        client._fetch_account_bill_history = lambda **kwargs: [  # type: ignore[method-assign]
+            {
+                "billId": "9001",
+                "ts": "1713863360000",
+                "instId": "ETH-USDT-SWAP",
+                "instType": "SWAP",
+                "type": "8",
+                "subType": "173",
+                "pnl": "-0.01",
+                "balChg": "-0.01",
+                "ccy": "USDT",
+                "ordId": "2001",
+                "tradeId": "3001",
+            }
+        ]
+
+        items = client.get_account_bills_history(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            environment="demo",
+            inst_types=("SWAP",),
+            limit=20,
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].bill_id, "9001")
+        self.assertEqual(items[0].bill_sub_type, "173")
+        self.assertEqual(items[0].amount, Decimal("-0.01"))
+        self.assertEqual(items[0].currency, "USDT")

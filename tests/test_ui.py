@@ -8,9 +8,12 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from okx_quant.ui import (
+    ProfilePositionSnapshot,
     QuantApp,
     RefreshHealthState,
     StrategyStopCleanupResult,
+    StrategyTradeReconciliationSnapshot,
+    StrategyTradeRuntimeState,
     _coerce_log_file_path,
     _format_network_error_message,
     _infer_session_runtime_status,
@@ -225,6 +228,220 @@ HTTP 502: <!DOCTYPE html>
         self.assertIsNone(QuantApp._next_history_selection_after_mutation("R02", ()))
 
 
+class StrategyTradeTrackingTest(TestCase):
+    def _make_session(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            session_id="S01",
+            history_record_id="H01",
+            api_name="moni",
+            strategy_id="ema_dynamic_order_long",
+            strategy_name="EMA 动态委托-多头",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            config=SimpleNamespace(
+                trade_inst_id="ETH-USDT-SWAP",
+                inst_id="ETH-USDT-SWAP",
+                environment="demo",
+            ),
+            active_trade=None,
+            trade_count=0,
+            win_count=0,
+            gross_pnl_total=Decimal("0"),
+            fee_total=Decimal("0"),
+            funding_total=Decimal("0"),
+            net_pnl_total=Decimal("0"),
+            last_close_reason="",
+        )
+
+    def _make_app_for_tracking(self) -> SimpleNamespace:
+        app = SimpleNamespace()
+        app._ensure_session_trade_runtime = lambda session, observed_at, signal_bar_at=None: QuantApp._ensure_session_trade_runtime(
+            app,
+            session,
+            observed_at=observed_at,
+            signal_bar_at=signal_bar_at,
+        )
+        app._start_session_trade_reconciliation = MagicMock()
+        return app
+
+    def test_track_session_trade_runtime_captures_entry_stop_and_close_trigger(self) -> None:
+        session = self._make_session()
+        app = self._make_app_for_tracking()
+
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "2026-04-23 08:00:00 | 挂单已提交到 OKX | ordId=1001 | sCode=0 | sMsg=下单成功",
+        )
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "2026-04-23 08:00:00 | 委托追踪 | clOrdId=s01emaent042300000897343",
+        )
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "2026-04-23 08:00:00 | 挂单已成交 | ordId=1001 | 开仓价=2358.42 | 数量=0.1",
+        )
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "初始 OKX 止损已提交 | algoClOrdId=s01emaslg042300000897344 | 止损=2320.66 | 启动动态上移监控",
+        )
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "本轮持仓已结束，继续监控下一次信号。",
+        )
+
+        self.assertIsNotNone(session.active_trade)
+        self.assertEqual(session.active_trade.entry_order_id, "1001")
+        self.assertEqual(session.active_trade.entry_client_order_id, "s01emaent042300000897343")
+        self.assertEqual(session.active_trade.entry_price, Decimal("2358.42"))
+        self.assertEqual(session.active_trade.size, Decimal("0.1"))
+        self.assertEqual(session.active_trade.protective_algo_cl_ord_id, "s01emaslg042300000897344")
+        self.assertEqual(session.active_trade.current_stop_price, Decimal("2320.66"))
+        app._start_session_trade_reconciliation.assert_called_once()
+
+    def test_build_strategy_trade_reconciliation_result_attributes_stop_loss_and_net_pnl(self) -> None:
+        session = self._make_session()
+        trade = StrategyTradeRuntimeState(
+            round_id="round-1",
+            signal_bar_at=datetime(2026, 4, 23, 8, 0, 0),
+            opened_logged_at=datetime(2026, 4, 23, 8, 15, 13),
+            entry_order_id="1001",
+            entry_client_order_id="s01emaent042300000897343",
+            entry_price=Decimal("2358.42"),
+            size=Decimal("0.1"),
+            protective_algo_cl_ord_id="s01emaslg042300000897344",
+            current_stop_price=Decimal("2320.66"),
+            reconciliation_started=True,
+        )
+        prefix = _session_order_prefixes(session)[0]
+        open_ms = int(datetime(2026, 4, 23, 8, 15, 13).timestamp() * 1000)
+        close_ms = int(datetime(2026, 4, 23, 17, 9, 20).timestamp() * 1000)
+        snapshot = StrategyTradeReconciliationSnapshot(
+            effective_environment="demo",
+            order_history=[
+                SimpleNamespace(
+                    client_order_id=f"{prefix}ent042300000897343",
+                    algo_client_order_id="",
+                    order_id="1001",
+                    algo_id="",
+                    inst_id="ETH-USDT-SWAP",
+                    side="buy",
+                    pos_side="long",
+                    filled_size=Decimal("0.1"),
+                    actual_size=Decimal("0.1"),
+                    avg_price=Decimal("2358.42"),
+                    actual_price=Decimal("2358.42"),
+                    price=Decimal("2358.42"),
+                    fee=Decimal("-0.04"),
+                    pnl=None,
+                    state="filled",
+                    update_time=open_ms,
+                    created_time=open_ms,
+                ),
+                SimpleNamespace(
+                    client_order_id="",
+                    algo_client_order_id=f"{prefix}slg042300000897344",
+                    order_id="2001",
+                    algo_id="3001",
+                    inst_id="ETH-USDT-SWAP",
+                    side="sell",
+                    pos_side="long",
+                    filled_size=Decimal("0.1"),
+                    actual_size=Decimal("0.1"),
+                    avg_price=Decimal("2320.66"),
+                    actual_price=Decimal("2320.66"),
+                    price=Decimal("2320.66"),
+                    fee=Decimal("-0.04"),
+                    pnl=Decimal("-3.78"),
+                    state="filled",
+                    update_time=close_ms,
+                    created_time=close_ms,
+                ),
+            ],
+            fills=[
+                SimpleNamespace(
+                    inst_id="ETH-USDT-SWAP",
+                    order_id="1001",
+                    fill_time=open_ms,
+                    fill_price=Decimal("2358.42"),
+                    fill_size=Decimal("0.1"),
+                    fill_fee=Decimal("-0.04"),
+                    pnl=None,
+                ),
+                SimpleNamespace(
+                    inst_id="ETH-USDT-SWAP",
+                    order_id="2001",
+                    fill_time=close_ms,
+                    fill_price=Decimal("2320.66"),
+                    fill_size=Decimal("0.1"),
+                    fill_fee=Decimal("-0.04"),
+                    pnl=Decimal("-3.78"),
+                ),
+            ],
+            position_history=[
+                SimpleNamespace(
+                    inst_id="ETH-USDT-SWAP",
+                    update_time=close_ms,
+                    close_avg_price=Decimal("2320.66"),
+                    pnl=Decimal("-3.78"),
+                    realized_pnl=Decimal("-3.87"),
+                )
+            ],
+            account_bills=[
+                SimpleNamespace(
+                    inst_id="ETH-USDT-SWAP",
+                    bill_time=close_ms,
+                    bill_sub_type="173",
+                    bill_type="8",
+                    business_type="",
+                    event_type="",
+                    amount=Decimal("-0.01"),
+                    pnl=Decimal("-0.01"),
+                    balance_change=Decimal("-0.01"),
+                )
+            ],
+        )
+        app = SimpleNamespace(
+            _next_strategy_trade_ledger_record_id=lambda session_, closed_at: "T01",
+            _is_funding_fee_bill=QuantApp._is_funding_fee_bill,
+        )
+
+        result = QuantApp._build_strategy_trade_reconciliation_result(app, session, trade, snapshot)
+
+        self.assertEqual(result.ledger_record.record_id, "T01")
+        self.assertEqual(result.ledger_record.close_reason, "OKX止损触发")
+        self.assertEqual(result.ledger_record.gross_pnl, Decimal("-3.78"))
+        self.assertEqual(result.ledger_record.net_pnl, Decimal("-3.87"))
+        self.assertIn("原因=OKX止损触发", result.attribution_summary)
+        self.assertIn("累计净盈亏=-3.87", result.cumulative_summary)
+
+    def test_apply_financial_totals_keeps_decimal_zero_when_trade_ledger_is_empty(self) -> None:
+        target = SimpleNamespace(
+            trade_count=99,
+            win_count=88,
+            gross_pnl_total=Decimal("1"),
+            fee_total=Decimal("1"),
+            funding_total=Decimal("1"),
+            net_pnl_total=Decimal("1"),
+            last_close_reason="old",
+        )
+
+        QuantApp._apply_financial_totals(SimpleNamespace(), target, [])
+
+        self.assertEqual(target.trade_count, 0)
+        self.assertEqual(target.win_count, 0)
+        self.assertEqual(target.gross_pnl_total, Decimal("0"))
+        self.assertEqual(target.fee_total, Decimal("0"))
+        self.assertEqual(target.funding_total, Decimal("0"))
+        self.assertEqual(target.net_pnl_total, Decimal("0"))
+        self.assertEqual(target.last_close_reason, "")
+
+
 class _FastEvent:
     def wait(self, timeout: float | None = None) -> bool:
         return False
@@ -239,6 +456,86 @@ class _Var:
 
     def set(self, value: str) -> None:
         self._value = value
+
+
+class SessionLivePnlSummaryTest(TestCase):
+    def test_refresh_session_live_pnl_cache_allocates_same_position_by_trade_size(self) -> None:
+        refreshed_at = datetime(2026, 4, 23, 19, 5, 0)
+        snapshot = ProfilePositionSnapshot(
+            api_name="moni",
+            effective_environment="demo",
+            positions=[
+                SimpleNamespace(
+                    inst_id="ETH-USDT-SWAP",
+                    pos_side="long",
+                    position=Decimal("3"),
+                    unrealized_pnl=Decimal("30"),
+                    margin_ccy="USDT",
+                )
+            ],
+            upl_usdt_prices={"USDT": Decimal("1")},
+            refreshed_at=refreshed_at,
+        )
+        session_one = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            config=SimpleNamespace(trade_inst_id="ETH-USDT-SWAP", inst_id="ETH-USDT-SWAP", environment="demo", signal_mode="long_only"),
+            active_trade=SimpleNamespace(size=Decimal("1")),
+        )
+        session_two = SimpleNamespace(
+            session_id="S02",
+            api_name="moni",
+            config=SimpleNamespace(trade_inst_id="ETH-USDT-SWAP", inst_id="ETH-USDT-SWAP", environment="demo", signal_mode="long_only"),
+            active_trade=SimpleNamespace(size=Decimal("2")),
+        )
+        app = SimpleNamespace(
+            sessions={"S01": session_one, "S02": session_two},
+            _positions_snapshot_by_profile={"moni": snapshot},
+            _session_live_pnl_cache={},
+        )
+        app._positions_snapshot_for_session = lambda session: QuantApp._positions_snapshot_for_session(app, session)
+
+        QuantApp._refresh_session_live_pnl_cache(app)
+
+        self.assertEqual(app._session_live_pnl_cache["S01"], (Decimal("10"), refreshed_at))
+        self.assertEqual(app._session_live_pnl_cache["S02"], (Decimal("20"), refreshed_at))
+
+    def test_refresh_running_session_summary_includes_live_and_net_totals(self) -> None:
+        refreshed_at = datetime(2026, 4, 23, 19, 6, 0)
+        active_session = SimpleNamespace(
+            session_id="S01",
+            engine=SimpleNamespace(is_running=True),
+            stop_cleanup_in_progress=False,
+            status="运行中",
+            net_pnl_total=Decimal("5.5"),
+        )
+        waiting_session = SimpleNamespace(
+            session_id="S02",
+            engine=SimpleNamespace(is_running=True),
+            stop_cleanup_in_progress=False,
+            status="运行中",
+            net_pnl_total=Decimal("-1.25"),
+        )
+        app = SimpleNamespace(
+            sessions={"S01": active_session, "S02": waiting_session},
+            _session_live_pnl_cache={
+                "S01": (Decimal("3.25"), refreshed_at),
+                "S02": (None, None),
+            },
+            session_summary_text=_Var(),
+            _refresh_session_live_pnl_cache=lambda: None,
+            _session_live_pnl_snapshot=lambda session: app._session_live_pnl_cache.get(session.session_id, (None, None)),
+            _session_counts_toward_running_summary=lambda session: QuantApp._session_counts_toward_running_summary(session),
+        )
+
+        QuantApp._refresh_running_session_summary(app)
+
+        text = app.session_summary_text.get()
+        self.assertIn("多策略合计：2 个策略", text)
+        self.assertIn("实时浮盈亏=+3.25", text)
+        self.assertIn("净盈亏=+4.25", text)
+        self.assertIn("浮盈覆盖 1/2", text)
+        self.assertIn("参考持仓 19:06:00", text)
 
 
 class _AfterRoot:

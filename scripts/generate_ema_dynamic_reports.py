@@ -12,13 +12,14 @@ from okx_quant.backtest import (
 )
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import OkxRestClient
+from okx_quant.persistence import backtest_report_export_dir_path, reports_dir_path
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_ID
 
 
 ROOT = Path(__file__).resolve().parent.parent
-REPORTS_DIR = ROOT / "reports"
-DETAIL_DIR = REPORTS_DIR / "backtest_exports"
+REPORTS_DIR = reports_dir_path()
+DETAIL_DIR = backtest_report_export_dir_path()
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 DETAIL_DIR.mkdir(parents=True, exist_ok=True)
 

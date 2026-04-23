@@ -18,6 +18,7 @@ DERIBIT_REPORT_EXPORT_DIR_NAME = "deribit"
 LIVE_STRATEGY_SESSIONS_DIR_NAME = "live_strategy_sessions"
 DERIBIT_VOLATILITY_CACHE_FILE_NAME = "deribit_volatility_cache.json"
 STRATEGY_HISTORY_FILE_NAME = "strategy_history.json"
+STRATEGY_TRADE_LEDGER_FILE_NAME = "strategy_trade_ledger.json"
 RECOVERABLE_STRATEGY_SESSIONS_FILE_NAME = "recoverable_strategy_sessions.json"
 SMART_ORDER_TASKS_FILE_NAME = "smart_order_tasks.json"
 SMART_ORDER_FAVORITES_FILE_NAME = "smart_order_favorites.json"
@@ -80,6 +81,12 @@ def deribit_volatility_cache_file_path(base_dir: Path | None = None) -> Path:
 
 def strategy_history_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / STRATEGY_HISTORY_FILE_NAME if base_dir is not None else state_dir_path() / STRATEGY_HISTORY_FILE_NAME
+
+
+def strategy_trade_ledger_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / STRATEGY_TRADE_LEDGER_FILE_NAME
+    return state_dir_path() / STRATEGY_TRADE_LEDGER_FILE_NAME
 
 
 def recoverable_strategy_sessions_file_path(base_dir: Path | None = None) -> Path:
@@ -463,6 +470,14 @@ def _normalize_strategy_history_record(item: object) -> dict[str, object] | None
     config_snapshot = raw_config_snapshot if isinstance(raw_config_snapshot, dict) else {}
     stopped_at = str(item.get("stopped_at", "")).strip()
     updated_at = str(item.get("updated_at", "")).strip()
+    try:
+        trade_count = max(0, int(item.get("trade_count", 0) or 0))
+    except (TypeError, ValueError):
+        trade_count = 0
+    try:
+        win_count = max(0, int(item.get("win_count", 0) or 0))
+    except (TypeError, ValueError):
+        win_count = 0
     return {
         "record_id": record_id,
         "session_id": str(item.get("session_id", "")).strip(),
@@ -479,6 +494,13 @@ def _normalize_strategy_history_record(item: object) -> dict[str, object] | None
         "log_file_path": str(item.get("log_file_path", "")).strip(),
         "updated_at": updated_at or None,
         "config_snapshot": config_snapshot,
+        "trade_count": trade_count,
+        "win_count": win_count,
+        "gross_pnl_total": str(item.get("gross_pnl_total", "")).strip() or "0",
+        "fee_total": str(item.get("fee_total", "")).strip() or "0",
+        "funding_total": str(item.get("funding_total", "")).strip() or "0",
+        "net_pnl_total": str(item.get("net_pnl_total", "")).strip() or "0",
+        "last_close_reason": str(item.get("last_close_reason", "")).strip(),
     }
 
 
@@ -507,6 +529,86 @@ def save_strategy_history_snapshot(
         item for record in records if (item := _normalize_strategy_history_record(record)) is not None
     ]
     normalized_records.sort(key=lambda item: (str(item["started_at"]), str(item["record_id"])), reverse=True)
+    payload = {
+        "records": normalized_records,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
+def _normalize_strategy_trade_ledger_record(item: object) -> dict[str, object] | None:
+    if not isinstance(item, dict):
+        return None
+    record_id = str(item.get("record_id", "")).strip()
+    session_id = str(item.get("session_id", "")).strip()
+    strategy_name = str(item.get("strategy_name", "")).strip()
+    closed_at = str(item.get("closed_at", "")).strip()
+    if not record_id or not session_id or not strategy_name or not closed_at:
+        return None
+    return {
+        "record_id": record_id,
+        "history_record_id": str(item.get("history_record_id", "")).strip(),
+        "session_id": session_id,
+        "api_name": str(item.get("api_name", "")).strip(),
+        "strategy_id": str(item.get("strategy_id", "")).strip(),
+        "strategy_name": strategy_name,
+        "symbol": str(item.get("symbol", "")).strip(),
+        "direction_label": str(item.get("direction_label", "")).strip(),
+        "run_mode_label": str(item.get("run_mode_label", "")).strip(),
+        "environment": str(item.get("environment", "")).strip(),
+        "signal_bar_at": str(item.get("signal_bar_at", "")).strip() or None,
+        "opened_at": str(item.get("opened_at", "")).strip() or None,
+        "closed_at": closed_at,
+        "entry_order_id": str(item.get("entry_order_id", "")).strip(),
+        "entry_client_order_id": str(item.get("entry_client_order_id", "")).strip(),
+        "exit_order_id": str(item.get("exit_order_id", "")).strip(),
+        "protective_algo_id": str(item.get("protective_algo_id", "")).strip(),
+        "protective_algo_cl_ord_id": str(item.get("protective_algo_cl_ord_id", "")).strip(),
+        "entry_price": str(item.get("entry_price", "")).strip() or None,
+        "exit_price": str(item.get("exit_price", "")).strip() or None,
+        "size": str(item.get("size", "")).strip() or None,
+        "entry_fee": str(item.get("entry_fee", "")).strip() or None,
+        "exit_fee": str(item.get("exit_fee", "")).strip() or None,
+        "funding_fee": str(item.get("funding_fee", "")).strip() or None,
+        "gross_pnl": str(item.get("gross_pnl", "")).strip() or None,
+        "net_pnl": str(item.get("net_pnl", "")).strip() or None,
+        "close_reason": str(item.get("close_reason", "")).strip(),
+        "reason_confidence": str(item.get("reason_confidence", "")).strip() or "low",
+        "summary_note": str(item.get("summary_note", "")).strip(),
+        "updated_at": str(item.get("updated_at", "")).strip() or None,
+    }
+
+
+def load_strategy_trade_ledger_snapshot(path: Path | None = None) -> dict[str, object]:
+    target = path or strategy_trade_ledger_file_path()
+    if not target.exists():
+        return {"records": []}
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    raw_records = payload.get("records")
+    if not isinstance(raw_records, list):
+        raw_records = []
+    records = [
+        normalized
+        for item in raw_records
+        if (normalized := _normalize_strategy_trade_ledger_record(item)) is not None
+    ]
+    records.sort(key=lambda item: (str(item["closed_at"]), str(item["record_id"])), reverse=True)
+    return {"records": records}
+
+
+def save_strategy_trade_ledger_snapshot(
+    records: list[dict[str, object]],
+    path: Path | None = None,
+) -> Path:
+    target = path or strategy_trade_ledger_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    normalized_records = [
+        item for record in records if (item := _normalize_strategy_trade_ledger_record(record)) is not None
+    ]
+    normalized_records.sort(key=lambda item: (str(item["closed_at"]), str(item["record_id"])), reverse=True)
     payload = {
         "records": normalized_records,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
