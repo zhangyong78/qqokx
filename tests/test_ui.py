@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
+from okx_quant.models import StrategyConfig
+from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_SHORT_ID
 from okx_quant.ui import (
     ProfilePositionSnapshot,
     QuantApp,
@@ -14,6 +16,7 @@ from okx_quant.ui import (
     StrategyStopCleanupResult,
     StrategyTradeReconciliationSnapshot,
     StrategyTradeRuntimeState,
+    _build_strategy_template_payload,
     _coerce_log_file_path,
     _format_network_error_message,
     _infer_session_runtime_status,
@@ -21,7 +24,9 @@ from okx_quant.ui import (
     _mark_refresh_health_success,
     _refresh_indicator_badge_text,
     _refresh_health_is_stale,
+    _resolve_import_api_profile,
     _session_order_prefixes,
+    _strategy_template_record_from_payload,
     _trade_order_belongs_to_session,
     _trade_order_session_role,
 )
@@ -232,6 +237,351 @@ HTTP 502: <!DOCTYPE html>
 
     def test_next_history_selection_after_mutation_returns_none_when_empty(self) -> None:
         self.assertIsNone(QuantApp._next_history_selection_after_mutation("R02", ()))
+
+
+class StrategyTemplateImportExportTest(TestCase):
+    def test_strategy_template_payload_round_trip_preserves_config(self) -> None:
+        config = StrategyConfig(
+            inst_id="SOL-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("58.82"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            trend_ema_period=55,
+            big_ema_period=233,
+            strategy_id=STRATEGY_DYNAMIC_SHORT_ID,
+            poll_seconds=10.0,
+            risk_amount=Decimal("10"),
+            trade_inst_id="SOL-USDT-SWAP",
+            tp_sl_mode="exchange",
+            local_tp_sl_inst_id=None,
+            entry_side_mode="follow_signal",
+            run_mode="trade",
+            take_profit_mode="dynamic",
+            max_entries_per_trend=1,
+            entry_reference_ema_period=55,
+            dynamic_two_r_break_even=True,
+            dynamic_fee_offset_enabled=True,
+            startup_chase_window_seconds=300,
+            time_stop_break_even_enabled=False,
+            time_stop_break_even_bars=0,
+        )
+        session = SimpleNamespace(
+            api_name="moni",
+            strategy_id=STRATEGY_DYNAMIC_SHORT_ID,
+            strategy_name="EMA 动态委托-空头",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+            symbol="SOL-USDT-SWAP",
+            config=config,
+        )
+
+        payload = _build_strategy_template_payload(session)
+        record = _strategy_template_record_from_payload(payload)
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertFalse(payload["includes_credentials"])
+        self.assertEqual(record.api_name, "moni")
+        self.assertEqual(record.strategy_id, STRATEGY_DYNAMIC_SHORT_ID)
+        self.assertEqual(record.strategy_name, "EMA 动态委托-空头")
+        self.assertEqual(record.direction_label, "只做空")
+        self.assertEqual(record.symbol, "SOL-USDT-SWAP")
+        self.assertEqual(record.config.startup_chase_window_seconds, 300)
+        self.assertEqual(record.config.trade_inst_id, "SOL-USDT-SWAP")
+        self.assertEqual(record.config.take_profit_mode, "dynamic")
+
+    def test_resolve_import_api_profile_prefers_matching_profile(self) -> None:
+        self.assertEqual(
+            _resolve_import_api_profile("moni", "local", {"local", "moni"}),
+            ("moni", "已自动切换到导出文件里的 API：moni"),
+        )
+
+    def test_apply_strategy_template_record_keeps_current_api_when_source_profile_missing(self) -> None:
+        payload = {
+            "strategy_id": STRATEGY_DYNAMIC_SHORT_ID,
+            "strategy_name": "EMA 动态委托-空头",
+            "api_name": "remote",
+            "direction_label": "只做空",
+            "run_mode_label": "交易并下单",
+            "symbol": "SOL-USDT-SWAP",
+            "config_snapshot": {
+                "inst_id": "SOL-USDT-SWAP",
+                "bar": "1H",
+                "ema_period": 21,
+                "atr_period": 10,
+                "atr_stop_multiplier": "2",
+                "atr_take_multiplier": "4",
+                "order_size": "58.82",
+                "trade_mode": "cross",
+                "signal_mode": "short_only",
+                "position_mode": "net",
+                "environment": "demo",
+                "tp_sl_trigger_type": "mark",
+                "trend_ema_period": 55,
+                "big_ema_period": 233,
+                "strategy_id": STRATEGY_DYNAMIC_SHORT_ID,
+                "poll_seconds": 10,
+                "risk_amount": "10",
+                "trade_inst_id": "SOL-USDT-SWAP",
+                "tp_sl_mode": "exchange",
+                "entry_side_mode": "follow_signal",
+                "run_mode": "trade",
+                "take_profit_mode": "dynamic",
+                "max_entries_per_trend": 1,
+                "entry_reference_ema_period": 55,
+                "dynamic_two_r_break_even": True,
+                "dynamic_fee_offset_enabled": True,
+                "startup_chase_window_seconds": 0,
+                "time_stop_break_even_enabled": False,
+                "time_stop_break_even_bars": 0,
+            },
+        }
+        record = _strategy_template_record_from_payload(payload)
+        assert record is not None
+        app = SimpleNamespace(
+            _strategy_name_to_id={"EMA 动态委托-空头": STRATEGY_DYNAMIC_SHORT_ID},
+            _credential_profiles={"local": {"api_key": "k", "secret_key": "s", "passphrase": "p", "environment": "demo"}},
+            _current_credential_profile=lambda: "local",
+            _apply_credentials_profile=MagicMock(),
+            _on_strategy_selected=MagicMock(),
+            _sync_dynamic_take_profit_controls=MagicMock(),
+            _ensure_importable_strategy_symbols=MagicMock(),
+            strategy_name=_Var(),
+            symbol=_Var(),
+            trade_symbol=_Var(),
+            local_tp_sl_symbol=_Var(),
+            bar=_Var(),
+            ema_period=_Var(),
+            trend_ema_period=_Var(),
+            big_ema_period=_Var(),
+            entry_reference_ema_period=_Var(),
+            atr_period=_Var(),
+            stop_atr=_Var(),
+            take_atr=_Var(),
+            risk_amount=_Var(),
+            order_size=_Var(),
+            poll_seconds=_Var(),
+            signal_mode_label=_Var(),
+            take_profit_mode_label=_Var(),
+            max_entries_per_trend=_Var(),
+            startup_chase_window_seconds=_Var(),
+            dynamic_two_r_break_even=_Var(False),
+            dynamic_fee_offset_enabled=_Var(False),
+            time_stop_break_even_enabled=_Var(False),
+            time_stop_break_even_bars=_Var(),
+            run_mode_label=_Var(),
+            trade_mode_label=_Var(),
+            position_mode_label=_Var(),
+            trigger_type_label=_Var(),
+            tp_sl_mode_label=_Var(),
+            entry_side_mode_label=_Var(),
+            environment_label=_Var("实盘 live"),
+        )
+        app._resolve_strategy_template_definition = lambda item: QuantApp._resolve_strategy_template_definition(app, item)
+
+        definition, resolved_api_name, api_note = QuantApp._apply_strategy_template_record(app, record)
+
+        self.assertEqual(definition.name, "EMA 动态委托-空头")
+        self.assertEqual(resolved_api_name, "local")
+        self.assertIn("保留当前 API：local", api_note)
+        self.assertEqual(app.strategy_name.get(), "EMA 动态委托-空头")
+        self.assertEqual(app.symbol.get(), "SOL-USDT-SWAP")
+        self.assertEqual(app.risk_amount.get(), "10")
+        self.assertEqual(app.tp_sl_mode_label.get(), "OKX 托管（仅同标的永续）")
+        self.assertEqual(app.environment_label.get(), "模拟盘 demo")
+        app._apply_credentials_profile.assert_not_called()
+        app._ensure_importable_strategy_symbols.assert_called_once_with("SOL-USDT-SWAP", "")
+
+
+class StrategyDuplicateLaunchGuardTest(TestCase):
+    @staticmethod
+    def _make_config(*, risk_amount: str = "10") -> StrategyConfig:
+        return StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            trend_ema_period=55,
+            big_ema_period=233,
+            strategy_id="ema_dynamic_order_long",
+            poll_seconds=10.0,
+            risk_amount=Decimal(risk_amount),
+            trade_inst_id="ETH-USDT-SWAP",
+            tp_sl_mode="exchange",
+            local_tp_sl_inst_id=None,
+            entry_side_mode="follow_signal",
+            run_mode="trade",
+            take_profit_mode="dynamic",
+            max_entries_per_trend=1,
+            entry_reference_ema_period=55,
+            dynamic_two_r_break_even=True,
+            dynamic_fee_offset_enabled=True,
+            startup_chase_window_seconds=0,
+            time_stop_break_even_enabled=False,
+            time_stop_break_even_bars=0,
+        )
+
+    def test_find_duplicate_strategy_session_blocks_same_api_same_config(self) -> None:
+        config = self._make_config()
+        active_session = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            config=config,
+            status="运行中",
+            engine=SimpleNamespace(is_running=True),
+        )
+        app = SimpleNamespace(sessions={"S01": active_session})
+        app._session_blocks_duplicate_launch = lambda session: QuantApp._session_blocks_duplicate_launch(session)
+
+        duplicate = QuantApp._find_duplicate_strategy_session(app, api_name="moni", config=config)
+
+        self.assertIs(duplicate, active_session)
+
+    def test_find_duplicate_strategy_session_ignores_stopped_and_other_api(self) -> None:
+        config = self._make_config()
+        stopped_session = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            config=config,
+            status="已停止",
+            engine=SimpleNamespace(is_running=False),
+        )
+        other_api_session = SimpleNamespace(
+            session_id="S02",
+            api_name="other",
+            config=config,
+            status="运行中",
+            engine=SimpleNamespace(is_running=True),
+        )
+        app = SimpleNamespace(sessions={"S01": stopped_session, "S02": other_api_session})
+        app._session_blocks_duplicate_launch = lambda session: QuantApp._session_blocks_duplicate_launch(session)
+
+        duplicate = QuantApp._find_duplicate_strategy_session(app, api_name="moni", config=config)
+
+        self.assertIsNone(duplicate)
+
+    def test_find_duplicate_strategy_session_blocks_recoverable_session(self) -> None:
+        config = self._make_config()
+        recoverable_session = SimpleNamespace(
+            session_id="S03",
+            api_name="moni",
+            config=config,
+            status="待恢复",
+            engine=SimpleNamespace(is_running=False),
+        )
+        app = SimpleNamespace(sessions={"S03": recoverable_session})
+        app._session_blocks_duplicate_launch = lambda session: QuantApp._session_blocks_duplicate_launch(session)
+
+        duplicate = QuantApp._find_duplicate_strategy_session(app, api_name="moni", config=config)
+
+        self.assertIs(duplicate, recoverable_session)
+
+    def test_upsert_session_row_marks_duplicate_conflict_tag(self) -> None:
+        config = self._make_config()
+        session = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            strategy_name="EMA 动态委托-多头",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            net_pnl_total=Decimal("0"),
+            display_status="等待信号",
+            started_at=datetime(2026, 4, 23, 22, 6, 41),
+            status="运行中",
+            engine=SimpleNamespace(is_running=True),
+            config=config,
+        )
+        peer = SimpleNamespace(
+            session_id="S02",
+            api_name="moni",
+            status="运行中",
+            engine=SimpleNamespace(is_running=True),
+            config=config,
+        )
+        app = SimpleNamespace(
+            session_tree=_SessionTreeStub(),
+            _session_live_pnl_snapshot=lambda _session: (None, None),
+            sessions={"S01": session, "S02": peer},
+        )
+
+        QuantApp._upsert_session_row(app, session)
+
+        self.assertEqual(app.session_tree.rows["S01"]["tags"], ("duplicate_conflict",))
+
+    def test_finish_strategy_template_import_warns_and_skips_start_when_duplicate_exists(self) -> None:
+        duplicate_session = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            display_status="等待信号",
+            started_at=datetime(2026, 4, 23, 22, 4, 18),
+            symbol="ETH-USDT-SWAP",
+        )
+        app = SimpleNamespace(
+            _enqueue_log=MagicMock(),
+            _find_duplicate_strategy_session=lambda *, api_name, config: duplicate_session,
+            _focus_session_row=MagicMock(),
+            _format_duplicate_launch_block_message=lambda session, imported: QuantApp._format_duplicate_launch_block_message(
+                session, imported=imported
+            ),
+            start=MagicMock(),
+        )
+
+        with patch("okx_quant.ui.messagebox.showwarning") as showwarning, patch(
+            "okx_quant.ui.messagebox.askyesno"
+        ) as askyesno:
+            QuantApp._finish_strategy_template_import(
+                app,
+                source=r"D:\qqokx\templates\eth.json",
+                record=SimpleNamespace(config=self._make_config()),
+                definition=SimpleNamespace(name="EMA 动态委托-多头"),
+                applied_api="moni",
+                api_note="继续使用当前 API：moni",
+            )
+
+        showwarning.assert_called_once()
+        self.assertIn("请先修改标的或切换 API 后再启动", showwarning.call_args.args[1])
+        askyesno.assert_not_called()
+        app.start.assert_not_called()
+        app._focus_session_row.assert_called_once_with("S01")
+
+    def test_finish_strategy_template_import_prompts_copy_guidance_before_start(self) -> None:
+        app = SimpleNamespace(
+            _enqueue_log=MagicMock(),
+            _find_duplicate_strategy_session=lambda *, api_name, config: None,
+            symbol=_Var("SOL-USDT-SWAP"),
+            start=MagicMock(),
+        )
+
+        with patch("okx_quant.ui.messagebox.askyesno", return_value=False) as askyesno:
+            QuantApp._finish_strategy_template_import(
+                app,
+                source=r"D:\qqokx\templates\sol.json",
+                record=SimpleNamespace(config=self._make_config()),
+                definition=SimpleNamespace(name="EMA 动态委托-多头"),
+                applied_api="moni",
+                api_note="已自动切换到导出文件里的 API：moni",
+            )
+
+        askyesno.assert_called_once()
+        self.assertIn("如需复制参数开新策略，请先改标的或切换 API，再启动。", askyesno.call_args.args[1])
+        app.start.assert_not_called()
 
 
 class StrategyTradeTrackingTest(TestCase):
@@ -464,6 +814,20 @@ class _Var:
         self._value = value
 
 
+class _SessionTreeStub:
+    def __init__(self) -> None:
+        self.rows: dict[str, dict[str, object]] = {}
+
+    def exists(self, iid: str) -> bool:
+        return iid in self.rows
+
+    def item(self, iid: str, **kwargs: object) -> None:
+        self.rows.setdefault(iid, {}).update(kwargs)
+
+    def insert(self, _parent: str, _index: object, *, iid: str, values: tuple[object, ...], tags: tuple[str, ...] = ()) -> None:
+        self.rows[iid] = {"values": values, "tags": tags}
+
+
 class SessionLivePnlSummaryTest(TestCase):
     def test_refresh_session_live_pnl_cache_allocates_same_position_by_trade_size(self) -> None:
         refreshed_at = datetime(2026, 4, 23, 19, 5, 0)
@@ -558,6 +922,18 @@ class _AfterRoot:
 
 
 class CredentialProfileEnvironmentTest(TestCase):
+    def test_startup_credential_profile_name_prefers_moni_and_otherwise_falls_back(self) -> None:
+        app = SimpleNamespace(_credential_profiles={"real": {}, "moni": {}})
+        app._credential_profile_names = lambda: QuantApp._credential_profile_names(app)
+
+        self.assertEqual(QuantApp._startup_credential_profile_name(app, "real"), "moni")
+
+        fallback_app = SimpleNamespace(_credential_profiles={"real": {}, "trade": {}})
+        fallback_app._credential_profile_names = lambda: QuantApp._credential_profile_names(fallback_app)
+
+        self.assertEqual(QuantApp._startup_credential_profile_name(fallback_app, "real"), "real")
+        self.assertEqual(QuantApp._startup_credential_profile_name(fallback_app, "missing"), "real")
+
     def test_apply_credentials_profile_restores_environment_and_clears_effective_cache(self) -> None:
         app = SimpleNamespace(
             _credential_profiles={

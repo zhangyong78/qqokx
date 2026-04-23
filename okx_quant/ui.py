@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import tkinter.font as tkfont
-from tkinter import BooleanVar, END, Label, Menu, StringVar, Text, TclError, Tk, Toplevel, simpledialog
+from tkinter import BooleanVar, END, Label, Menu, StringVar, Text, TclError, Tk, Toplevel, filedialog, simpledialog
 from tkinter import messagebox, ttk
 
 from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
@@ -102,6 +102,8 @@ from okx_quant.window_layout import (
 
 
 BAR_OPTIONS = ["1m", "3m", "5m", "15m", "1H", "4H"]
+PREFERRED_STARTUP_CREDENTIAL_PROFILE_NAME = "moni"
+STRATEGY_TEMPLATE_SCHEMA_VERSION = 1
 POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
     "positions": (
         "inst_type",
@@ -676,6 +678,18 @@ class RecoverableStrategySessionRecord:
     updated_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class StrategyTemplateRecord:
+    strategy_id: str
+    strategy_name: str
+    api_name: str
+    direction_label: str
+    run_mode_label: str
+    symbol: str
+    config: StrategyConfig
+    exported_at: datetime | None = None
+
+
 def _serialize_strategy_config_snapshot(config: StrategyConfig) -> dict[str, object]:
     snapshot: dict[str, object] = {}
     for item in dataclass_fields(StrategyConfig):
@@ -760,6 +774,14 @@ def _coerce_snapshot_text(value: object, default: str = "") -> str:
 def _coerce_snapshot_optional_text(value: object) -> str | None:
     raw = str(value or "").strip()
     return raw or None
+
+
+def _reverse_lookup_label(mapping: dict[str, str], value: str, default: str) -> str:
+    normalized = str(value or "").strip()
+    for label, candidate in mapping.items():
+        if candidate == normalized:
+            return label
+    return default
 
 
 def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | None:
@@ -894,6 +916,115 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             str(_strategy_config_default("backtest_profile_summary")),
         ),
     )
+
+
+def _strategy_template_direction_label(strategy_id: str, config: StrategyConfig, fallback: str = "") -> str:
+    effective_signal_mode = resolve_dynamic_signal_mode(strategy_id, config.signal_mode)
+    default_label = fallback or _reverse_lookup_label(SIGNAL_LABEL_TO_VALUE, effective_signal_mode, "双向")
+    label = _reverse_lookup_label(SIGNAL_LABEL_TO_VALUE, effective_signal_mode, default_label)
+    try:
+        definition = get_strategy_definition(strategy_id)
+    except KeyError:
+        return label
+    if label in definition.allowed_signal_labels:
+        return label
+    return definition.default_signal_label
+
+
+def _launcher_symbol_from_strategy_config(strategy_id: str, config: StrategyConfig) -> str:
+    if is_spot_enhancement_strategy_id(strategy_id):
+        return derive_swap_trade_inst_id(config.trade_inst_id or config.inst_id)
+    return (config.trade_inst_id or config.inst_id or "").strip().upper()
+
+
+def _launcher_tp_sl_mode_label(tp_sl_mode: str) -> str:
+    if tp_sl_mode == "exchange":
+        return "OKX 托管（仅同标的永续）"
+    if tp_sl_mode == "local_custom":
+        return "按自定义标的价格（本地）"
+    return "按交易标的价格（本地）"
+
+
+def _format_entry_decimal(value: Decimal | None) -> str:
+    if value is None:
+        return ""
+    return format(value, "f")
+
+
+def _format_entry_float(value: float) -> str:
+    text = format(float(value), "g")
+    return text if text != "-0" else "0"
+
+
+def _build_strategy_template_payload(session: StrategySession) -> dict[str, object]:
+    return {
+        "schema_version": STRATEGY_TEMPLATE_SCHEMA_VERSION,
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "app_version": APP_VERSION,
+        "api_name": session.api_name,
+        "strategy_id": session.strategy_id,
+        "strategy_name": session.strategy_name,
+        "direction_label": session.direction_label,
+        "run_mode_label": session.run_mode_label,
+        "symbol": session.symbol,
+        "includes_credentials": False,
+        "config_snapshot": _serialize_strategy_config_snapshot(session.config),
+    }
+
+
+def _strategy_template_record_from_payload(payload: object) -> StrategyTemplateRecord | None:
+    if not isinstance(payload, dict):
+        return None
+    raw_snapshot = payload.get("config_snapshot")
+    config = _deserialize_strategy_config_snapshot(raw_snapshot)
+    if config is None:
+        return None
+    strategy_id = str(payload.get("strategy_id") or config.strategy_id).strip()
+    if not strategy_id:
+        return None
+    strategy_name = str(payload.get("strategy_name") or "").strip()
+    api_name = str(payload.get("api_name") or "").strip()
+    direction_label = str(payload.get("direction_label") or "").strip()
+    run_mode_label = str(payload.get("run_mode_label") or "").strip()
+    symbol = str(payload.get("symbol") or "").strip()
+    exported_at = _parse_datetime_snapshot(payload.get("exported_at"))
+    try:
+        definition = get_strategy_definition(strategy_id)
+    except KeyError:
+        definition = None
+    if not strategy_name and definition is not None:
+        strategy_name = definition.name
+    if not run_mode_label:
+        run_mode_label = _reverse_lookup_label(RUN_MODE_OPTIONS, config.run_mode, "交易并下单")
+    direction_label = _strategy_template_direction_label(
+        strategy_id,
+        config,
+        fallback=direction_label or (definition.default_signal_label if definition is not None else ""),
+    )
+    if not symbol:
+        symbol = _launcher_symbol_from_strategy_config(strategy_id, config)
+    return StrategyTemplateRecord(
+        strategy_id=strategy_id,
+        strategy_name=strategy_name,
+        api_name=api_name,
+        direction_label=direction_label,
+        run_mode_label=run_mode_label,
+        symbol=symbol,
+        config=config,
+        exported_at=exported_at,
+    )
+
+
+def _resolve_import_api_profile(source_api_name: str, current_api_name: str, available_profiles: set[str]) -> tuple[str, str]:
+    imported = source_api_name.strip()
+    current = current_api_name.strip()
+    if imported and imported in available_profiles:
+        return imported, f"已自动切换到导出文件里的 API：{imported}"
+    if imported and imported != current:
+        return current, f"导出文件里的 API：{imported} 在本机不存在，保留当前 API：{current}"
+    if current:
+        return current, f"继续使用当前 API：{current}"
+    return "", "当前未选择 API，请先确认本机 API 配置。"
 
 
 def _parse_datetime_snapshot(value: object) -> datetime | None:
@@ -1432,6 +1563,8 @@ class QuantApp:
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
         tools_menu.add_command(label="打开信号监控", command=self.open_signal_monitor_window)
         tools_menu.add_command(label="打开策略历史", command=self.open_strategy_history_window)
+        tools_menu.add_command(label="导出选中策略参数", command=self.export_selected_session_template)
+        tools_menu.add_command(label="导入策略参数并启动", command=self.import_strategy_template)
         tools_menu.add_command(label="打开波动率监控", command=self.open_deribit_volatility_monitor_window)
         tools_menu.add_command(label="打开Deribit波动率指数", command=self.open_deribit_volatility_window)
         tools_menu.add_command(label="打开期权策略计算器", command=self.open_option_strategy_window)
@@ -1775,6 +1908,7 @@ class QuantApp:
         self.session_tree.column("started", width=120, anchor="center")
         self.session_tree.grid(row=1, column=0, sticky="nsew")
         self.session_tree.bind("<<TreeviewSelect>>", self._on_session_selected)
+        self.session_tree.tag_configure("duplicate_conflict", background="#fff4e5", foreground="#a85a00")
 
         tree_scroll = ttk.Scrollbar(running_frame, orient="vertical", command=self.session_tree.yview)
         tree_scroll.grid(row=1, column=1, sticky="ns")
@@ -1793,6 +1927,12 @@ class QuantApp:
         )
         ttk.Button(control_row, text="历史策略", command=self.open_strategy_history_window).grid(
             row=0, column=3, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="导出选中参数", command=self.export_selected_session_template).grid(
+            row=0, column=4, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="导入策略参数", command=self.import_strategy_template).grid(
+            row=0, column=5, padx=(8, 0)
         )
 
         detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)
@@ -6326,6 +6466,15 @@ class QuantApp:
             return [DEFAULT_CREDENTIAL_PROFILE_NAME]
         return sorted(self._credential_profiles.keys())
 
+    def _startup_credential_profile_name(self, selected_profile: str) -> str:
+        preferred = PREFERRED_STARTUP_CREDENTIAL_PROFILE_NAME.strip()
+        if preferred and preferred in self._credential_profiles:
+            return preferred
+        target = selected_profile.strip()
+        if target in self._credential_profiles:
+            return target
+        return self._credential_profile_names()[0]
+
     def _current_credential_profile(self) -> str:
         profile_name = self.api_profile_name.get().strip()
         if profile_name:
@@ -6428,7 +6577,10 @@ class QuantApp:
         profiles = snapshot.get("profiles", {})
         self._credential_profiles = profiles if isinstance(profiles, dict) else {}
         self._sync_credential_profile_combo()
-        self._apply_credentials_profile(str(snapshot.get("selected_profile", DEFAULT_CREDENTIAL_PROFILE_NAME)))
+        startup_profile = self._startup_credential_profile_name(
+            str(snapshot.get("selected_profile", DEFAULT_CREDENTIAL_PROFILE_NAME))
+        )
+        self._apply_credentials_profile(startup_profile)
         if any(self._current_credentials_state()[1:4]):
             self._enqueue_log(f"已自动读取本地凭证文件：{credentials_file_path().name}")
 
@@ -6734,6 +6886,237 @@ class QuantApp:
             return normalized_signal
         return f"{normalized_signal} -> {normalized_trade}"
 
+    @staticmethod
+    def _default_strategy_template_filename(record: StrategyTemplateRecord) -> str:
+        raw = f"{record.strategy_name or record.strategy_id}_{record.symbol or 'strategy'}"
+        sanitized = re.sub(r'[\\/:*?"<>|]+', "_", raw).strip(" ._")
+        return f"{sanitized or 'strategy_template'}.json"
+
+    def _resolve_strategy_template_definition(self, record: StrategyTemplateRecord) -> StrategyDefinition:
+        try:
+            return get_strategy_definition(record.strategy_id)
+        except KeyError:
+            if record.strategy_name and record.strategy_name in self._strategy_name_to_id:
+                return get_strategy_definition(self._strategy_name_to_id[record.strategy_name])
+        raise ValueError(f"当前版本不认识这个策略：{record.strategy_id}")
+
+    def _ensure_importable_strategy_symbols(self, symbol: str, local_tp_sl_symbol: str | None = None) -> None:
+        normalized_symbol = _normalize_symbol_input(symbol)
+        if normalized_symbol and normalized_symbol not in self._default_symbol_values:
+            self._default_symbol_values.append(normalized_symbol)
+        merged = list(dict.fromkeys(self._default_symbol_values))
+        custom_values = ["", *merged]
+        normalized_local = _normalize_symbol_input(local_tp_sl_symbol or "")
+        if normalized_local and normalized_local not in custom_values:
+            custom_values.append(normalized_local)
+        self._default_symbol_values = merged
+        self._custom_trigger_symbol_values = custom_values
+        if hasattr(self, "symbol_combo") and self.symbol_combo is not None:
+            self.symbol_combo["values"] = merged
+        if hasattr(self, "local_tp_sl_symbol_combo") and self.local_tp_sl_symbol_combo is not None:
+            self.local_tp_sl_symbol_combo["values"] = custom_values
+
+    def _apply_strategy_template_record(self, record: StrategyTemplateRecord) -> tuple[StrategyDefinition, str, str]:
+        definition = self._resolve_strategy_template_definition(record)
+        resolved_api_name, api_note = _resolve_import_api_profile(
+            record.api_name,
+            self._current_credential_profile(),
+            set(self._credential_profiles.keys()),
+        )
+        if (
+            resolved_api_name
+            and resolved_api_name in self._credential_profiles
+            and resolved_api_name != self._current_credential_profile()
+        ):
+            self._apply_credentials_profile(resolved_api_name, log_change=False)
+
+        self.strategy_name.set(definition.name)
+        self._on_strategy_selected()
+
+        launch_symbol = _launcher_symbol_from_strategy_config(definition.strategy_id, record.config)
+        custom_symbol = (record.config.local_tp_sl_inst_id or "").strip().upper()
+        self._ensure_importable_strategy_symbols(launch_symbol, custom_symbol)
+
+        self.symbol.set(launch_symbol)
+        self.trade_symbol.set(launch_symbol)
+        self.local_tp_sl_symbol.set(custom_symbol)
+        self.bar.set(record.config.bar)
+        self.ema_period.set(str(record.config.ema_period))
+        self.trend_ema_period.set(str(record.config.trend_ema_period))
+        self.big_ema_period.set(str(record.config.big_ema_period))
+        self.entry_reference_ema_period.set(str(record.config.entry_reference_ema_period))
+        self.atr_period.set(str(record.config.atr_period))
+        self.stop_atr.set(_format_entry_decimal(record.config.atr_stop_multiplier))
+        self.take_atr.set(_format_entry_decimal(record.config.atr_take_multiplier))
+        self.risk_amount.set(_format_entry_decimal(record.config.risk_amount))
+        self.order_size.set(_format_entry_decimal(record.config.order_size))
+        self.poll_seconds.set(_format_entry_float(record.config.poll_seconds))
+        self.signal_mode_label.set(
+            _strategy_template_direction_label(
+                definition.strategy_id,
+                record.config,
+                fallback=record.direction_label or definition.default_signal_label,
+            )
+        )
+        self.take_profit_mode_label.set(
+            _reverse_lookup_label(TAKE_PROFIT_MODE_OPTIONS, record.config.take_profit_mode, "动态止盈")
+        )
+        self.max_entries_per_trend.set(str(record.config.max_entries_per_trend))
+        self.startup_chase_window_seconds.set(str(record.config.startup_chase_window_seconds))
+        self.dynamic_two_r_break_even.set(record.config.dynamic_two_r_break_even)
+        self.dynamic_fee_offset_enabled.set(record.config.dynamic_fee_offset_enabled)
+        self.time_stop_break_even_enabled.set(record.config.time_stop_break_even_enabled)
+        self.time_stop_break_even_bars.set(str(record.config.time_stop_break_even_bars))
+        self.run_mode_label.set(_reverse_lookup_label(RUN_MODE_OPTIONS, record.config.run_mode, record.run_mode_label))
+        self.trade_mode_label.set(_reverse_lookup_label(TRADE_MODE_OPTIONS, record.config.trade_mode, "全仓 cross"))
+        self.position_mode_label.set(
+            _reverse_lookup_label(POSITION_MODE_OPTIONS, record.config.position_mode, "净持仓 net")
+        )
+        self.trigger_type_label.set(
+            _reverse_lookup_label(TRIGGER_TYPE_OPTIONS, record.config.tp_sl_trigger_type, "标记价格 mark")
+        )
+        self.tp_sl_mode_label.set(_launcher_tp_sl_mode_label(record.config.tp_sl_mode))
+        self.entry_side_mode_label.set(
+            _reverse_lookup_label(ENTRY_SIDE_MODE_OPTIONS, record.config.entry_side_mode, "跟随信号")
+        )
+        self.environment_label.set(_reverse_lookup_label(ENV_OPTIONS, record.config.environment, "模拟盘 demo"))
+        self._sync_dynamic_take_profit_controls()
+        return definition, resolved_api_name, api_note
+
+    def export_selected_session_template(self) -> None:
+        session = self._selected_session()
+        if session is None:
+            messagebox.showinfo("提示", "请先在运行中策略列表中选中一条策略。")
+            return
+        record = _strategy_template_record_from_payload(_build_strategy_template_payload(session))
+        if record is None:
+            messagebox.showerror("导出失败", "当前选中策略缺少可导出的有效配置。")
+            return
+        target = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="导出策略参数",
+            defaultextension=".json",
+            filetypes=(("JSON 文件", "*.json"), ("所有文件", "*.*")),
+            initialfile=self._default_strategy_template_filename(record),
+        )
+        if not target:
+            return
+        payload = _build_strategy_template_payload(session)
+        try:
+            Path(target).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            messagebox.showerror("导出失败", f"写入策略参数文件失败：{exc}")
+            return
+        self._enqueue_log(f"[{session.session_id}] 已导出策略参数：{target}")
+        messagebox.showinfo(
+            "导出完成",
+            "已导出策略参数文件。\n\n文件不包含 API 密钥，可在其他机器导入后复用当前参数。",
+        )
+
+    def import_strategy_template(self) -> None:
+        source = filedialog.askopenfilename(
+            parent=self.root,
+            title="导入策略参数",
+            filetypes=(("JSON 文件", "*.json"), ("所有文件", "*.*")),
+        )
+        if not source:
+            return
+        try:
+            payload = json.loads(Path(source).read_text(encoding="utf-8"))
+            record = _strategy_template_record_from_payload(payload)
+            if record is None:
+                raise ValueError("文件缺少有效的策略配置快照。")
+            definition, resolved_api_name, api_note = self._apply_strategy_template_record(record)
+        except Exception as exc:
+            messagebox.showerror("导入失败", str(exc))
+            return
+
+        applied_api = resolved_api_name or self._current_credential_profile()
+        self._finish_strategy_template_import(
+            source=source,
+            record=record,
+            definition=definition,
+            applied_api=applied_api,
+            api_note=api_note,
+        )
+
+    @staticmethod
+    def _session_blocks_duplicate_launch(session: StrategySession) -> bool:
+        return session.engine.is_running or session.status in {"运行中", "停止中", "待恢复", "恢复中"}
+
+    @staticmethod
+    def _format_duplicate_launch_block_message(session: StrategySession, *, imported: bool) -> str:
+        headline = "已导入参数，但检测到重复策略：" if imported else "检测到重复策略启动："
+        guidance = (
+            "当前参数已经回填到启动区。\n如需复制参数开新策略，请先修改标的或切换 API 后再启动。"
+            if imported
+            else "当前已经存在同 API、同参数、同标的的策略会话。\n请先停止、恢复或清理原会话；如需复制参数开新策略，请先修改标的或切换 API 后再启动。"
+        )
+        return (
+            f"{headline}\n\n"
+            f"API：{session.api_name or '-'}\n"
+            f"会话：{session.session_id}\n"
+            f"状态：{session.display_status}\n"
+            f"启动时间：{session.started_at.strftime('%H:%M:%S')}\n"
+            f"标的：{session.symbol or '-'}\n\n"
+            f"{guidance}"
+        )
+
+    def _find_duplicate_strategy_session(self, *, api_name: str, config: StrategyConfig) -> StrategySession | None:
+        target_api_name = api_name.strip()
+        for session in self.sessions.values():
+            if session.api_name.strip() != target_api_name:
+                continue
+            if session.config != config:
+                continue
+            if not self._session_blocks_duplicate_launch(session):
+                continue
+            return session
+        return None
+
+    def _focus_session_row(self, session_id: str) -> None:
+        if not self.session_tree.exists(session_id):
+            return
+        self.session_tree.selection_set(session_id)
+        self.session_tree.focus(session_id)
+        self._refresh_selected_session_details()
+
+    def _finish_strategy_template_import(
+        self,
+        *,
+        source: str,
+        record: StrategyTemplateRecord,
+        definition: StrategyDefinition,
+        applied_api: str,
+        api_note: str,
+    ) -> None:
+        self._enqueue_log(
+            f"已导入策略参数：{source} | 策略={definition.name} | API={applied_api or '-'} | {api_note}"
+        )
+        duplicate_session = self._find_duplicate_strategy_session(api_name=applied_api, config=record.config) if applied_api else None
+        if duplicate_session is not None:
+            self._focus_session_row(duplicate_session.session_id)
+            messagebox.showwarning(
+                "导入完成",
+                self._format_duplicate_launch_block_message(duplicate_session, imported=True),
+            )
+            return
+
+        summary = "\n".join(
+            [
+                f"已导入：{definition.name}",
+                f"交易标的：{self.symbol.get()}",
+                f"API：{applied_api or '-'}",
+                api_note,
+                "导入文件不包含 API 密钥，只会复用本机当前或同名 API 配置。",
+                "如需复制参数开新策略，请先改标的或切换 API，再启动。",
+                "",
+                "是否现在就按这套参数启动？",
+            ]
+        )
+        if messagebox.askyesno("导入完成", summary):
+            self.start()
+
     def start(self) -> None:
         try:
             definition = self._selected_strategy_definition()
@@ -6745,9 +7128,14 @@ class QuantApp:
             self._save_credentials_now(silent=True)
             self._save_notification_settings_now(silent=True)
 
+            api_name = credentials.profile_name or self._current_credential_profile()
+            duplicate_session = self._find_duplicate_strategy_session(api_name=api_name, config=config)
+            if duplicate_session is not None:
+                self._focus_session_row(duplicate_session.session_id)
+                raise ValueError(self._format_duplicate_launch_block_message(duplicate_session, imported=False))
+
             session_id = self._next_session_id()
             session_symbol = self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
-            api_name = credentials.profile_name or self._current_credential_profile()
             session_started_at = datetime.now()
             session_log_path = strategy_session_log_file_path(
                 started_at=session_started_at,
@@ -7422,6 +7810,44 @@ class QuantApp:
     def _session_live_pnl_snapshot(self, session: StrategySession) -> tuple[Decimal | None, datetime | None]:
         return self._session_live_pnl_cache.get(session.session_id, (None, None))
 
+    def _active_duplicate_strategy_groups(self) -> dict[tuple[str, StrategyConfig], list[StrategySession]]:
+        groups: dict[tuple[str, StrategyConfig], list[StrategySession]] = {}
+        sessions = getattr(self, "sessions", {})
+        items = sessions.values() if isinstance(sessions, dict) else ()
+        for session in items:
+            api_name = str(getattr(session, "api_name", "") or "").strip()
+            config = getattr(session, "config", None)
+            if not api_name or not isinstance(config, StrategyConfig):
+                continue
+            if not QuantApp._session_blocks_duplicate_launch(session):
+                continue
+            key = (api_name, config)
+            groups.setdefault(key, []).append(session)
+        return {key: items for key, items in groups.items() if len(items) > 1}
+
+    def _duplicate_launch_conflicts_for(self, session: StrategySession) -> list[StrategySession]:
+        key = (session.api_name.strip(), session.config)
+        groups = QuantApp._active_duplicate_strategy_groups(self)
+        items = groups.get(key, [])
+        return [item for item in items if item.session_id != session.session_id]
+
+    def _session_has_duplicate_launch_conflict(self, session: StrategySession) -> bool:
+        return bool(QuantApp._duplicate_launch_conflicts_for(self, session))
+
+    @staticmethod
+    def _build_duplicate_launch_conflict_warning(
+        session: StrategySession,
+        conflicts: list[StrategySession],
+    ) -> str:
+        if not conflicts:
+            return ""
+        ordered = sorted(conflicts, key=lambda item: (item.started_at, item.session_id))
+        session_refs = ", ".join(item.session_id for item in ordered)
+        return (
+            f"重复风险：与 {session_refs} 参数完全相同（同 API）。"
+            " 如需复制参数开新策略，请先修改标的或切换 API 后再启动。"
+        )
+
     def _refresh_running_session_summary(self) -> None:
         self._refresh_session_live_pnl_cache()
         active_sessions = [
@@ -7450,6 +7876,10 @@ class QuantApp:
             f"实时浮盈亏={_format_optional_usdt_precise(live_total, places=2) if live_covered else '-'}",
             f"净盈亏={_format_optional_usdt_precise(net_total, places=2)}",
         ]
+        duplicate_groups = QuantApp._active_duplicate_strategy_groups(self)
+        if duplicate_groups:
+            duplicate_sessions = sum(len(items) for items in duplicate_groups.values())
+            parts.append(f"重复风险 {len(duplicate_groups)}组/{duplicate_sessions}条")
         if live_covered < len(active_sessions):
             parts.append(f"浮盈覆盖 {live_covered}/{len(active_sessions)}")
         if latest_refresh_at is not None:
@@ -8769,6 +9199,7 @@ class QuantApp:
 
     def _upsert_session_row(self, session: StrategySession) -> None:
         live_pnl, _ = self._session_live_pnl_snapshot(session)
+        tags = ("duplicate_conflict",) if QuantApp._session_has_duplicate_launch_conflict(self, session) else ()
         values = (
             session.api_name or "-",
             session.strategy_name,
@@ -8781,9 +9212,9 @@ class QuantApp:
             session.started_at.strftime("%H:%M:%S"),
         )
         if self.session_tree.exists(session.session_id):
-            self.session_tree.item(session.session_id, values=values)
+            self.session_tree.item(session.session_id, values=values, tags=tags)
         else:
-            self.session_tree.insert("", END, iid=session.session_id, values=values)
+            self.session_tree.insert("", END, iid=session.session_id, values=values, tags=tags)
 
     def _selected_session(self) -> StrategySession | None:
         selected = self.session_tree.selection()
@@ -8802,6 +9233,10 @@ class QuantApp:
             return
 
         live_pnl, live_pnl_refreshed_at = self._session_live_pnl_snapshot(session)
+        duplicate_warning = QuantApp._build_duplicate_launch_conflict_warning(
+            session,
+            QuantApp._duplicate_launch_conflicts_for(self, session),
+        )
         self.selected_session_text.set(
             self._build_strategy_detail_text(
                 session_id=session.session_id,
@@ -8828,6 +9263,7 @@ class QuantApp:
                 last_close_reason=session.last_close_reason,
                 live_pnl=live_pnl,
                 live_pnl_refreshed_at=live_pnl_refreshed_at,
+                duplicate_warning=duplicate_warning,
             )
         )
         self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
@@ -8889,6 +9325,7 @@ class QuantApp:
         last_close_reason: str = "",
         live_pnl: Decimal | None = None,
         live_pnl_refreshed_at: datetime | None = None,
+        duplicate_warning: str = "",
     ) -> str:
         try:
             definition = get_strategy_definition(strategy_id)
@@ -8919,6 +9356,8 @@ class QuantApp:
         )
         if runtime_status and status == "运行中":
             lines.append(f"最近运行状态：{runtime_status}")
+        if duplicate_warning:
+            lines.append(duplicate_warning)
         if last_message:
             lines.append(f"最近日志：{last_message}")
         if ended_reason:

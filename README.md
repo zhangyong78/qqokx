@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.4.05`
+当前版本：`v0.4.06`
 
 这是一个面向 OKX 的桌面交易工作台，围绕“监控、交易、保护、回测、分析”构建。当前项目已经包含：
 
@@ -560,7 +560,15 @@ ATR 批量矩阵规则：
 - `.okx_quant_candle_cache/`
 
 ## 11. 更新日志
-当前版本：v0.4.05
+当前版本：v0.4.06
+
+### v0.4.06
+
+- Added strategy template export/import in `D:\qqokx\okx_quant\ui.py`: the running strategies panel now includes `Export Selected Params` and `Import Strategy Params`, and the Tools menu also exposes export/import entry points.
+- Added a reusable strategy template payload flow via `StrategyTemplateRecord`, `_build_strategy_template_payload(...)`, and `_strategy_template_record_from_payload(...)`, so a running strategy's `config_snapshot` can be exported and later imported on another machine or under another API profile.
+- Import now handles API differences safely: template files do not include API keys; when the same API profile exists locally it is selected automatically, otherwise the current API stays selected and the prompt explains the fallback. On app startup, if local profile `moni` exists, it is selected as the default API.
+- Validation: `python -m py_compile okx_quant\ui.py tests\test_ui.py`, `python -m unittest tests.test_ui` (`43` tests passed).
+
 
 ### v0.4.05
 
