@@ -317,6 +317,8 @@ def _format_network_error_message(message: str) -> str:
         return "网络握手超时，请稍后重试。"
     if "read operation timed out" in lowered or "read timed out" in lowered:
         return "网络读取超时，请稍后重试。"
+    if "remote end closed connection without response" in lowered or "remotedisconnected" in lowered:
+        return "交易所提前断开连接，请稍后重试。"
     if "timed out" in lowered:
         return "网络连接超时，请稍后重试。"
     collapsed = _collapse_error_message(raw)

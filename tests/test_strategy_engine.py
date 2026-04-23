@@ -1,3 +1,4 @@
+import http.client
 from decimal import Decimal
 from unittest import TestCase
 from unittest.mock import patch
@@ -674,6 +675,43 @@ class StrategyEngineTest(TestCase):
             attempts["count"] += 1
             if attempts["count"] < 3:
                 raise TimeoutError("The read operation timed out")
+            return "ok"
+
+        result = engine._call_okx_read_with_retry("读取触发价格", _flaky_read)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(waits, [1.0, 2.0])
+        self.assertGreaterEqual(len(messages), 2)
+
+    def test_okx_read_retry_recovers_from_remote_end_closed_connection(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+
+        attempts = {"count": 0}
+
+        def _flaky_read() -> str:
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise http.client.RemoteDisconnected("Remote end closed connection without response")
             return "ok"
 
         result = engine._call_okx_read_with_retry("读取触发价格", _flaky_read)

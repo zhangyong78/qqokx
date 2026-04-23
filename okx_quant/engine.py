@@ -130,6 +130,7 @@ class StrategyEngine:
         self._notifier = notifier
         self._strategy_name = strategy_name
         self._session_id = session_id
+        self._api_name = ""
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -145,6 +146,7 @@ class StrategyEngine:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("策略已经在运行中")
             self._stop_event.clear()
+            self._api_name = credentials.profile_name.strip()
             self._thread = threading.Thread(
                 target=self._run,
                 args=(credentials, config),
@@ -3062,6 +3064,7 @@ class StrategyEngine:
             size=format_decimal(size),
             price=format_decimal(price),
             reason=reason,
+            api_name=self._api_name,
         )
 
     def _notify_error(self, config: StrategyConfig | None, message: str) -> None:
@@ -3071,6 +3074,7 @@ class StrategyEngine:
             strategy_name=self._strategy_name,
             config=config,
             message=message,
+            api_name=self._api_name if config is not None and config.run_mode != "signal_only" else "",
         )
 
 
@@ -3386,17 +3390,21 @@ def _coerce_okx_read_exception(exc: Exception) -> OkxApiError | None:
         return exc
     detail = str(exc).strip()
     lowered = detail.lower()
-    if isinstance(exc, OSError) and any(
-        marker in lowered
-        for marker in (
-            "timeout",
-            "timed out",
-            "handshake",
-            "connection reset",
-            "connection aborted",
-            "connection refused",
-            "eof occurred",
-        )
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "handshake",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "eof occurred",
+        "remote end closed connection without response",
+        "remotedisconnected",
+    )
+    if any(marker in lowered for marker in transient_markers) and (
+        isinstance(exc, OSError)
+        or "remote end closed connection without response" in lowered
+        or "remotedisconnected" in lowered
     ):
         return OkxApiError(f"网络错误：{detail or exc.__class__.__name__}")
     return None
@@ -3416,9 +3424,10 @@ def _is_transient_okx_error(exc: OkxApiError) -> bool:
         "connection refused",
         "handshake",
         "eof occurred",
+        "remote end closed connection without response",
+        "remotedisconnected",
     )
     return any(marker in detail for marker in transient_markers)
-
 
 def _is_okx_order_not_found_error(exc: OkxApiError) -> bool:
     detail = str(exc).strip()

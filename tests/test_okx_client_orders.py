@@ -1,3 +1,4 @@
+import http.client
 from decimal import Decimal
 from unittest import TestCase
 from unittest.mock import patch
@@ -216,6 +217,21 @@ class OkxClientOrderRequestTest(TestCase):
 
         self.assertEqual(context.exception.code, "51000")
         self.assertEqual(str(context.exception), "OKX API 错误 code=51000")
+
+    def test_request_wraps_remote_disconnected_as_okx_api_error(self) -> None:
+        client = OkxRestClient()
+
+        with patch(
+            "okx_quant.okx_client.request.urlopen",
+            side_effect=http.client.RemoteDisconnected("Remote end closed connection without response"),
+        ):
+            with self.assertRaises(OkxApiError) as context:
+                client._request("GET", "/api/v5/public/instruments")
+
+        self.assertEqual(
+            str(context.exception),
+            "\u7f51\u7edc\u9519\u8bef\uff1aRemote end closed connection without response",
+        )
 
     def test_get_account_bills_history_parses_funding_fee_bill(self) -> None:
         client = OkxRestClient()

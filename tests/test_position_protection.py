@@ -391,6 +391,20 @@ class _OrderStatusClient:
 
 
 class PositionProtectionTest(TestCase):
+    def test_manager_treats_remote_end_closed_as_transient_error(self) -> None:
+        manager = PositionProtectionManager(
+            _SimulatedProtectionClient(
+                initial_position=_make_option_position(),
+                trigger_prices={("BTC-USD-20260327-70000-C", "mark"): [Decimal("0.015")]},
+                order_results=[],
+            ),
+            lambda _message: None,
+        )
+
+        self.assertTrue(
+            manager._is_transient_error(RuntimeError("Remote end closed connection without response"))
+        )
+
     def test_infer_and_normalize_spot_symbol(self) -> None:
         self.assertEqual(infer_default_spot_inst_id("BTC-USD-20260327-70000-C"), "BTC-USDT")
         self.assertEqual(normalize_spot_inst_id("ethusdt"), "ETH-USDT")

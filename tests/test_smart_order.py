@@ -198,6 +198,13 @@ def _make_swap_instrument(inst_id: str = "ETH-USDT-SWAP") -> Instrument:
 
 
 class SmartOrderLogicTests(unittest.TestCase):
+    def test_manager_treats_remote_end_closed_as_transient_error(self) -> None:
+        manager = SmartOrderManager(_FakeClient())
+
+        self.assertTrue(
+            manager._is_transient_error(RuntimeError("Remote end closed connection without response"))
+        )
+
     def test_buy_fill_uses_long_step_for_next_sell(self) -> None:
         next_side, next_price = compute_next_grid_order_price(
             filled_side="buy",

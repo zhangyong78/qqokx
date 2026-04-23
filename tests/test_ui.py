@@ -40,6 +40,12 @@ class UiHelpersTest(TestCase):
             "\u7f51\u7edc\u63e1\u624b\u8d85\u65f6\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002",
         )
 
+    def test_format_network_error_message_remote_end_closed(self) -> None:
+        self.assertEqual(
+            _format_network_error_message("Remote end closed connection without response"),
+            "\u4ea4\u6613\u6240\u63d0\u524d\u65ad\u5f00\u8fde\u63a5\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002",
+        )
+
     def test_format_network_error_message_summarizes_cloudflare_html_502(self) -> None:
         message = """
 HTTP 502: <!DOCTYPE html>

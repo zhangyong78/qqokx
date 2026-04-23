@@ -456,6 +456,7 @@ class EnhancedStrategyEngine:
         self._notifier = notifier
         self._strategy_name = strategy_name or PARENT_STRATEGY_NAME
         self._session_id = session_id
+        self._api_name = ""
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -481,6 +482,7 @@ class EnhancedStrategyEngine:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("策略已经在运行中")
             self._stop_event.clear()
+            self._api_name = credentials.profile_name.strip()
             self._thread = threading.Thread(
                 target=self._run,
                 args=(credentials, config, started_at, recovery_root_dir),
@@ -1090,6 +1092,7 @@ class EnhancedStrategyEngine:
                 size=format_decimal(fill_qty),
                 price=format_decimal(fill_price),
                 reason=reason,
+                api_name=self._api_name,
             )
 
     def _close_position(
@@ -1488,6 +1491,7 @@ class EnhancedStrategyEngine:
                     strategy_name=self._strategy_name,
                     config=config,
                     message=message,
+                    api_name=self._api_name,
                 )
             except Exception:
                 pass

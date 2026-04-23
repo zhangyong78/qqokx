@@ -1,9 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import base64
 import math
 import hashlib
 import hmac
+import http.client
 import json
 import re
 from dataclasses import dataclass
@@ -1750,6 +1751,9 @@ class OkxRestClient:
             raise OkxApiError(f"HTTP {exc.code}: {body_text}", status=exc.code) from exc
         except error.URLError as exc:
             raise OkxApiError(f"网络错误：{exc.reason}") from exc
+        except http.client.RemoteDisconnected as exc:
+            detail = str(exc).strip() or "Remote end closed connection without response"
+            raise OkxApiError(f"网络错误：{detail}") from exc
 
         except OSError as exc:
             detail = str(exc).strip()
@@ -1764,6 +1768,8 @@ class OkxRestClient:
                     "connection aborted",
                     "connection refused",
                     "eof occurred",
+                    "remote end closed connection without response",
+                    "remotedisconnected",
                 )
             ):
                 raise OkxApiError(f"网络错误：{detail or exc.__class__.__name__}") from exc

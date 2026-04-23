@@ -25,6 +25,24 @@ class EmailNotifier:
     def signal_notifications_enabled(self) -> bool:
         return self.enabled and self._config.notify_signals
 
+    @staticmethod
+    def _clean_api_name(api_name: str | None) -> str:
+        return (api_name or "").strip()
+
+    def _subject_with_api(self, subject: str, api_name: str | None) -> str:
+        resolved_api_name = self._clean_api_name(api_name)
+        if not resolved_api_name:
+            return subject
+        return f"{subject} | API={resolved_api_name}"
+
+    def _lines_with_api(self, lines: list[str], api_name: str | None) -> list[str]:
+        resolved_api_name = self._clean_api_name(api_name)
+        if not resolved_api_name:
+            return lines
+        if not lines:
+            return [f"API配置：{resolved_api_name}"]
+        return [lines[0], f"API配置：{resolved_api_name}", *lines[1:]]
+
     def send_signal(
         self,
         *,
@@ -64,22 +82,26 @@ class EmailNotifier:
         size: str,
         price: str,
         reason: str,
+        api_name: str = "",
     ) -> None:
         if not self._config.notify_trade_fills:
             return
-        subject = f"[QQOKX] 成交通知 | {title} | {symbol}"
+        subject = self._subject_with_api(f"[QQOKX] 成交通知 | {title} | {symbol}", api_name)
         body = "\n".join(
-            [
-                f"策略：{strategy_name}",
-                f"运行模式：{config.run_mode}",
-                f"信号标的：{config.inst_id}",
-                f"下单标的：{config.trade_inst_id or config.inst_id}",
-                f"成交标的：{symbol}",
-                f"方向：{side}",
-                f"数量：{size}",
-                f"价格：{price}",
-                f"说明：{reason}",
-            ]
+            self._lines_with_api(
+                [
+                    f"策略：{strategy_name}",
+                    f"运行模式：{config.run_mode}",
+                    f"信号标的：{config.inst_id}",
+                    f"下单标的：{config.trade_inst_id or config.inst_id}",
+                    f"成交标的：{symbol}",
+                    f"方向：{side}",
+                    f"数量：{size}",
+                    f"价格：{price}",
+                    f"说明：{reason}",
+                ],
+                api_name,
+            )
         )
         self.notify_async(subject, body)
 
@@ -89,10 +111,11 @@ class EmailNotifier:
         strategy_name: str,
         config: StrategyConfig | None,
         message: str,
+        api_name: str = "",
     ) -> None:
         if not self._config.notify_errors:
             return
-        subject = f"[QQOKX] 异常提醒 | {strategy_name}"
+        subject = self._subject_with_api(f"[QQOKX] 异常提醒 | {strategy_name}", api_name)
         lines = [f"策略：{strategy_name}", f"异常：{message}"]
         if config is not None:
             lines.extend(
@@ -103,7 +126,7 @@ class EmailNotifier:
                     f"K线周期：{config.bar}",
                 ]
             )
-        self.notify_async(subject, "\n".join(lines))
+        self.notify_async(subject, "\n".join(self._lines_with_api(lines, api_name)))
 
     def notify_async(self, subject: str, body: str) -> None:
         if not self.enabled:

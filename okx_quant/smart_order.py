@@ -2108,6 +2108,8 @@ class SmartOrderManager:
                 "temporary failure",
                 "proxy error",
                 "remote disconnected",
+                "remote end closed connection without response",
+                "remotedisconnected",
                 "bad gateway",
                 "service unavailable",
                 "gateway timeout",
