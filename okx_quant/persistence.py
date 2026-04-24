@@ -24,6 +24,7 @@ SMART_ORDER_FAVORITES_FILE_NAME = "smart_order_favorites.json"
 OPTION_STRATEGIES_FILE_NAME = "option_strategies.json"
 SIGNAL_OBSERVER_TEMPLATES_FILE_NAME = "signal_observer_templates.json"
 TRADER_DESK_FILE_NAME = "trader_desk.json"
+POSITION_NOTES_FILE_NAME = "position_notes.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 PROFILE_ENVIRONMENTS = {"demo", "live"}
 
@@ -107,6 +108,10 @@ def signal_observer_templates_file_path(base_dir: Path | None = None) -> Path:
 
 def trader_desk_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / TRADER_DESK_FILE_NAME if base_dir is not None else state_dir_path() / TRADER_DESK_FILE_NAME
+
+
+def position_notes_file_path(base_dir: Path | None = None) -> Path:
+    return Path(base_dir) / POSITION_NOTES_FILE_NAME if base_dir is not None else state_dir_path() / POSITION_NOTES_FILE_NAME
 
 
 def _empty_credentials_snapshot() -> dict[str, str]:
@@ -682,6 +687,147 @@ def save_recoverable_strategy_sessions_snapshot(
     normalized_sessions.sort(key=lambda item: (str(item["started_at"]), str(item["session_id"])), reverse=True)
     payload = {
         "sessions": normalized_sessions,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
+def _normalize_position_note_text(value: object) -> str:
+    if value is None:
+        return ""
+    lines = str(value).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(line.rstrip() for line in lines)
+
+
+def _normalize_position_note_environment(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in PROFILE_ENVIRONMENTS else ""
+
+
+def _normalize_position_note_int(value: object, *, minimum: int | None = None) -> int | None:
+    if value in {None, ""}:
+        return None
+    try:
+        normalized = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if minimum is not None and normalized < minimum:
+        return minimum
+    return normalized
+
+
+def _normalize_position_current_note_record(item: object) -> dict[str, object] | None:
+    if not isinstance(item, dict):
+        return None
+    record_key = str(item.get("record_key", "")).strip()
+    note = _normalize_position_note_text(item.get("note", ""))
+    if not record_key or not note:
+        return None
+    raw_linked_history_keys = item.get("linked_history_keys")
+    linked_history_keys = (
+        [str(value).strip() for value in raw_linked_history_keys if str(value).strip()]
+        if isinstance(raw_linked_history_keys, list)
+        else []
+    )
+    return {
+        "record_key": record_key,
+        "profile_name": str(item.get("profile_name", "")).strip(),
+        "environment": _normalize_position_note_environment(item.get("environment")),
+        "inst_id": str(item.get("inst_id", "")).strip().upper(),
+        "pos_side": str(item.get("pos_side", "")).strip().lower(),
+        "mgn_mode": str(item.get("mgn_mode", "")).strip().lower(),
+        "note": note,
+        "activated_at_ms": _normalize_position_note_int(item.get("activated_at_ms"), minimum=0),
+        "updated_at_ms": _normalize_position_note_int(item.get("updated_at_ms"), minimum=0),
+        "missing_success_count": _normalize_position_note_int(item.get("missing_success_count"), minimum=0) or 0,
+        "missing_started_at_ms": _normalize_position_note_int(item.get("missing_started_at_ms"), minimum=0),
+        "linked_history_keys": linked_history_keys,
+    }
+
+
+def _normalize_position_history_note_record(item: object) -> dict[str, object] | None:
+    if not isinstance(item, dict):
+        return None
+    record_key = str(item.get("record_key", "")).strip()
+    note = _normalize_position_note_text(item.get("note", ""))
+    if not record_key or not note:
+        return None
+    return {
+        "record_key": record_key,
+        "profile_name": str(item.get("profile_name", "")).strip(),
+        "environment": _normalize_position_note_environment(item.get("environment")),
+        "inst_id": str(item.get("inst_id", "")).strip().upper(),
+        "update_time": _normalize_position_note_int(item.get("update_time"), minimum=0),
+        "mgn_mode": str(item.get("mgn_mode", "")).strip().lower(),
+        "pos_side": str(item.get("pos_side", "")).strip().lower(),
+        "direction": str(item.get("direction", "")).strip().lower(),
+        "close_size": str(item.get("close_size", "")).strip(),
+        "close_avg_price": str(item.get("close_avg_price", "")).strip(),
+        "note": note,
+        "source_current_key": str(item.get("source_current_key", "")).strip(),
+        "updated_at_ms": _normalize_position_note_int(item.get("updated_at_ms"), minimum=0),
+    }
+
+
+def load_position_notes_snapshot(path: Path | None = None) -> dict[str, object]:
+    target = path or position_notes_file_path()
+    if not target.exists():
+        return {"current_notes": [], "history_notes": []}
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    raw_current_notes = payload.get("current_notes")
+    raw_history_notes = payload.get("history_notes")
+    if not isinstance(raw_current_notes, list):
+        raw_current_notes = []
+    if not isinstance(raw_history_notes, list):
+        raw_history_notes = []
+    current_notes = [
+        normalized
+        for item in raw_current_notes
+        if (normalized := _normalize_position_current_note_record(item)) is not None
+    ]
+    history_notes = [
+        normalized
+        for item in raw_history_notes
+        if (normalized := _normalize_position_history_note_record(item)) is not None
+    ]
+    current_notes.sort(key=lambda item: str(item["record_key"]))
+    history_notes.sort(key=lambda item: (int(item.get("update_time") or 0), str(item["record_key"])), reverse=True)
+    return {
+        "current_notes": current_notes,
+        "history_notes": history_notes,
+    }
+
+
+def save_position_notes_snapshot(
+    *,
+    current_notes: list[dict[str, object]],
+    history_notes: list[dict[str, object]],
+    path: Path | None = None,
+) -> Path:
+    target = path or position_notes_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    normalized_current_notes = [
+        item
+        for record in current_notes
+        if (item := _normalize_position_current_note_record(record)) is not None
+    ]
+    normalized_history_notes = [
+        item
+        for record in history_notes
+        if (item := _normalize_position_history_note_record(record)) is not None
+    ]
+    normalized_current_notes.sort(key=lambda item: str(item["record_key"]))
+    normalized_history_notes.sort(key=lambda item: (int(item.get("update_time") or 0), str(item["record_key"])), reverse=True)
+    payload = {
+        "current_notes": normalized_current_notes,
+        "history_notes": normalized_history_notes,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     temp_path = target.with_suffix(target.suffix + ".tmp")

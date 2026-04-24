@@ -18,12 +18,25 @@ from okx_quant.ui import (
     StrategyStopCleanupResult,
     StrategyTradeReconciliationSnapshot,
     StrategyTradeRuntimeState,
+    _build_current_position_note_record,
+    _build_group_row_values,
+    _build_history_position_note_record,
     _build_strategy_template_payload,
     _coerce_log_file_path,
+    _filter_position_history_items,
+    _filter_positions,
     _format_network_error_message,
+    _format_position_note_summary,
     _infer_session_runtime_status,
+    _inherit_position_history_notes,
     _mark_refresh_health_failure,
     _mark_refresh_health_success,
+    _position_history_note_key,
+    _position_note_current_key,
+    _position_realized_pnl_usdt,
+    _position_tree_row_id,
+    _prune_closed_current_position_notes,
+    _reconcile_current_position_note_records,
     _refresh_indicator_badge_text,
     _refresh_health_is_stale,
     _resolve_import_api_profile,
@@ -774,6 +787,64 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(events[0][1], "warning")
         self.assertIn("检测到失效 watcher", events[0][2])
 
+    def test_apply_trader_desk_reconciliation_persists_zero_net_pnl_when_missing(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload={"strategy_id": "ema_dynamic_long"},
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+            pause_on_stop_loss=True,
+        )
+        run = TraderRunState(trader_id="T001", status="running", armed_session_id="S01")
+        slot = TraderSlotRecord(
+            slot_id="slot-1",
+            trader_id="T001",
+            session_id="S01",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="ETH-USDT-SWAP",
+            status="open",
+            quota_occupied=True,
+            opened_at=datetime(2026, 4, 24, 15, 0, 0),
+            entry_price=Decimal("2312.59"),
+            size=Decimal("0.1"),
+        )
+        events: list[tuple[str, str, str]] = []
+        app = SimpleNamespace(
+            _trader_desk_slot_for_session=lambda session_id: slot,
+            _trader_desk_draft_by_id=lambda trader_id: draft,
+            _trader_desk_run_by_id=lambda trader_id, create=False: run,
+            _trader_desk_add_event=lambda trader_id, message, level="info": events.append((trader_id, level, message)),
+            _save_trader_desk_snapshot=MagicMock(),
+            _ensure_trader_watcher=MagicMock(),
+        )
+        session = SimpleNamespace(
+            session_id="S01",
+            trader_id="T001",
+            trader_slot_id="slot-1",
+            ended_reason="OKX止损触发",
+            history_record_id="H01",
+        )
+        ledger_record = SimpleNamespace(
+            close_reason="OKX止损触发",
+            net_pnl=None,
+            opened_at=datetime(2026, 4, 24, 15, 0, 0),
+            closed_at=datetime(2026, 4, 24, 15, 6, 0),
+            entry_price=Decimal("2312.59"),
+            exit_price=Decimal("2311.10"),
+            size=Decimal("0.1"),
+            history_record_id="H01",
+        )
+
+        QuantApp._apply_trader_desk_reconciliation(app, session, ledger_record)
+
+        self.assertEqual(slot.status, "closed_loss")
+        self.assertEqual(slot.net_pnl, Decimal("0"))
+        self.assertEqual(run.status, "paused_loss")
+        self.assertIn("净盈亏=0.00", events[0][2])
+        app._ensure_trader_watcher.assert_not_called()
+
     def test_delete_trader_desk_draft_cleans_stale_watchers_before_delete(self) -> None:
         draft = TraderDraftRecord(
             trader_id="T001",
@@ -985,8 +1056,17 @@ class _SessionTreeStub:
     def item(self, iid: str, **kwargs: object) -> None:
         self.rows.setdefault(iid, {}).update(kwargs)
 
-    def insert(self, _parent: str, _index: object, *, iid: str, values: tuple[object, ...], tags: tuple[str, ...] = ()) -> None:
-        self.rows[iid] = {"values": values, "tags": tags}
+    def insert(
+        self,
+        _parent: str,
+        _index: object,
+        *,
+        iid: str,
+        values: tuple[object, ...],
+        tags: tuple[str, ...] = (),
+        text: str = "",
+    ) -> None:
+        self.rows[iid] = {"values": values, "tags": tags, "text": text}
 
     def delete(self, iid: str) -> None:
         self.rows.pop(iid, None)
@@ -1005,11 +1085,361 @@ class _SessionTreeStub:
     def selection_set(self, iid: str) -> None:
         self._selection = [iid]
 
-    def focus(self, iid: str) -> None:
+    def focus(self, iid: str | None = None):
+        if iid is None:
+            return self.focused or ""
         self.focused = iid
 
     def see(self, iid: str) -> None:
         self.seen = iid
+
+
+class PositionRealizedUsdtColumnTest(TestCase):
+    def test_position_realized_pnl_usdt_converts_native_currency(self) -> None:
+        position = SimpleNamespace(realized_pnl=Decimal("0.001"), margin_ccy="BTC", inst_id="BTC-USDT", inst_type="SPOT")
+
+        self.assertEqual(_position_realized_pnl_usdt(position, {"BTC": Decimal("100000")}), Decimal("100"))
+
+    def test_build_group_row_values_includes_realized_usdt_slot(self) -> None:
+        values = _build_group_row_values(
+            "组合",
+            {
+                "count": 2,
+                "size_display": "1.5 BTC",
+                "option_side_display": "--",
+                "upl": Decimal("0.012"),
+                "upl_usdt": Decimal("1200"),
+                "realized": Decimal("0.001"),
+                "realized_usdt": Decimal("100"),
+                "market_value_usdt": Decimal("50000"),
+                "pnl_currency": "BTC",
+                "imr": None,
+                "mmr": None,
+                "delta": None,
+                "gamma": None,
+                "vega": None,
+                "theta": None,
+                "theta_usdt": None,
+            },
+        )
+
+        self.assertEqual(values[18], "+0.00100")
+        self.assertEqual(values[19], "+100")
+
+    def test_insert_position_row_includes_realized_usdt_value(self) -> None:
+        app = SimpleNamespace(
+            position_tree=_SessionTreeStub(),
+            _upl_usdt_prices={"BTC": Decimal("100000")},
+            _position_instruments={},
+            _position_tickers={},
+            _position_row_payloads={},
+            _current_position_note_summary=lambda _position: "减仓观察",
+        )
+        position = SimpleNamespace(
+            inst_id="BTC-USDT",
+            inst_type="SPOT",
+            pos_side="net",
+            position=Decimal("0.5"),
+            avail_position=Decimal("0.5"),
+            mgn_mode="cross",
+            leverage=None,
+            avg_price=Decimal("100000"),
+            mark_price=Decimal("101000"),
+            last_price=Decimal("101000"),
+            unrealized_pnl=Decimal("0.01"),
+            unrealized_pnl_ratio=None,
+            realized_pnl=Decimal("0.001"),
+            liquidation_price=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            margin_ccy="BTC",
+        )
+
+        QuantApp._insert_position_row(app, "", position, "P01")
+
+        self.assertEqual(app.position_tree.rows["P01"]["values"][18], "+0.00100")
+        self.assertEqual(app.position_tree.rows["P01"]["values"][19], "+100")
+        self.assertEqual(app.position_tree.rows["P01"]["values"][-1], "减仓观察")
+
+
+class PositionNotesLifecycleTest(TestCase):
+    def _make_position(self, *, inst_id: str = "BTC-USD-260501-77000-C", pos_side: str = "short", mgn_mode: str = "cross"):
+        return SimpleNamespace(inst_id=inst_id, inst_type="OPTION", pos_side=pos_side, mgn_mode=mgn_mode)
+
+    def _make_position_history(
+        self,
+        *,
+        inst_id: str = "BTC-USD-260501-77000-C",
+        update_time: int = 2_000,
+        pos_side: str = "short",
+        direction: str = "short",
+        mgn_mode: str = "cross",
+        close_size: Decimal = Decimal("0.2"),
+        close_avg_price: Decimal = Decimal("0.03"),
+    ):
+        return SimpleNamespace(
+            inst_id=inst_id,
+            inst_type="OPTION",
+            update_time=update_time,
+            pos_side=pos_side,
+            direction=direction,
+            mgn_mode=mgn_mode,
+            close_size=close_size,
+            close_avg_price=close_avg_price,
+        )
+
+    def test_reconcile_current_position_note_records_marks_missing_after_successful_refresh(self) -> None:
+        position = self._make_position()
+        current_key = _position_note_current_key("moni", "demo", position)
+        current_notes = {
+            current_key: _build_current_position_note_record(
+                profile_name="moni",
+                environment="demo",
+                position=position,
+                note="观察仓位",
+                now_ms=1_000,
+            )
+        }
+
+        changed = _reconcile_current_position_note_records(
+            current_notes,
+            profile_name="moni",
+            environment="demo",
+            positions=[],
+            now_ms=3_000,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(current_notes[current_key]["missing_success_count"], 1)
+        self.assertEqual(current_notes[current_key]["missing_started_at_ms"], 3_000)
+
+    def test_inherit_position_history_notes_copies_current_note_for_partial_close(self) -> None:
+        position = self._make_position()
+        current_key = _position_note_current_key("moni", "demo", position)
+        current_notes = {
+            current_key: _build_current_position_note_record(
+                profile_name="moni",
+                environment="demo",
+                position=position,
+                note="周五前减 gamma",
+                now_ms=1_000,
+            )
+        }
+        history_item = self._make_position_history(update_time=2_000)
+        history_notes: dict[str, dict[str, object]] = {}
+
+        changed = _inherit_position_history_notes(
+            current_notes,
+            history_notes,
+            profile_name="moni",
+            environment="demo",
+            position_history=[history_item],
+            now_ms=2_500,
+        )
+
+        history_key = _position_history_note_key("moni", "demo", history_item)
+        self.assertTrue(changed)
+        self.assertEqual(history_notes[history_key]["note"], "周五前减 gamma")
+        self.assertEqual(current_notes[current_key]["linked_history_keys"], [history_key])
+
+    def test_prune_closed_current_position_notes_waits_for_history_after_missing(self) -> None:
+        position = self._make_position()
+        current_key = _position_note_current_key("moni", "demo", position)
+        current_notes = {
+            current_key: _build_current_position_note_record(
+                profile_name="moni",
+                environment="demo",
+                position=position,
+                note="平仓后复盘",
+                now_ms=1_000,
+            )
+        }
+        current_notes[current_key]["missing_success_count"] = 2
+        current_notes[current_key]["missing_started_at_ms"] = 4_000
+        history_item = self._make_position_history(update_time=3_500)
+        history_key = _position_history_note_key("moni", "demo", history_item)
+        history_notes = {
+            history_key: _build_history_position_note_record(
+                profile_name="moni",
+                environment="demo",
+                item=history_item,
+                note="旧快照",
+                now_ms=3_500,
+                source_current_key=current_key,
+            )
+        }
+        current_notes[current_key]["linked_history_keys"] = [history_key]
+
+        changed = _prune_closed_current_position_notes(
+            current_notes,
+            history_notes,
+            profile_name="moni",
+            environment="demo",
+        )
+        self.assertFalse(changed)
+        self.assertIn(current_key, current_notes)
+
+        history_notes[history_key]["update_time"] = 4_500
+        changed = _prune_closed_current_position_notes(
+            current_notes,
+            history_notes,
+            profile_name="moni",
+            environment="demo",
+        )
+
+        self.assertTrue(changed)
+        self.assertNotIn(current_key, current_notes)
+
+    def test_filter_positions_matches_note_keyword(self) -> None:
+        position = self._make_position(inst_id="BTC-USD-260501-77000-C", pos_side="short", mgn_mode="cross")
+        filtered = _filter_positions(
+            [position],
+            inst_type="",
+            keyword="gamma",
+            note_texts={_position_tree_row_id(position): "观察 gamma"},
+        )
+        self.assertEqual(len(filtered), 1)
+
+    def test_filter_position_history_items_matches_note_keyword(self) -> None:
+        history_item = self._make_position_history()
+
+        filtered = _filter_position_history_items(
+            [history_item],
+            keyword="复盘",
+            note_texts_by_index={0: "晚点复盘这一腿"},
+        )
+
+        self.assertEqual(len(filtered), 1)
+
+    def test_format_position_note_summary_truncates_multi_line_notes(self) -> None:
+        summary = _format_position_note_summary("第一行\n第二行 gamma 观察", limit=10)
+
+        self.assertTrue(summary.endswith("…"))
+
+
+class PositionZoomSelectionSyncTest(TestCase):
+    def test_on_position_selected_ignores_programmatic_main_sync(self) -> None:
+        tree = _SessionTreeStub()
+        tree.selection_set("P01")
+        app = SimpleNamespace(
+            position_tree=tree,
+            _position_selection_syncing=False,
+            _positions_view_rendering=False,
+            _position_selection_suppressed_item_id="P01",
+            _refresh_position_detail_panel=MagicMock(),
+        )
+
+        QuantApp._on_position_selected(app)
+
+        self.assertIsNone(app._position_selection_suppressed_item_id)
+        app._refresh_position_detail_panel.assert_not_called()
+
+    def test_on_positions_zoom_selected_ignores_reentrant_sync(self) -> None:
+        tree = _SessionTreeStub()
+        tree.selection_set("P01")
+        app = SimpleNamespace(
+            _positions_zoom_tree=tree,
+            _positions_view_rendering=False,
+            _position_selection_syncing=True,
+            _positions_zoom_selection_suppressed_item_id=None,
+            _positions_zoom_selected_item_id=None,
+            _refresh_positions_zoom_detail=MagicMock(),
+            _update_positions_zoom_search_shortcuts=MagicMock(),
+            position_tree=_SessionTreeStub(),
+        )
+
+        QuantApp._on_positions_zoom_selected(app)
+
+        self.assertIsNone(app._positions_zoom_selected_item_id)
+        app._refresh_positions_zoom_detail.assert_not_called()
+        app._update_positions_zoom_search_shortcuts.assert_not_called()
+
+    def test_on_positions_zoom_selected_ignores_programmatic_zoom_sync(self) -> None:
+        zoom_tree = _SessionTreeStub()
+        zoom_tree.selection_set("P01")
+        app = SimpleNamespace(
+            _positions_zoom_tree=zoom_tree,
+            _positions_view_rendering=False,
+            _position_selection_syncing=False,
+            _positions_zoom_selection_suppressed_item_id="P01",
+            _positions_zoom_selected_item_id=None,
+            _refresh_positions_zoom_detail=MagicMock(),
+            _update_positions_zoom_search_shortcuts=MagicMock(),
+            position_tree=_SessionTreeStub(),
+        )
+
+        QuantApp._on_positions_zoom_selected(app)
+
+        self.assertEqual(app._positions_zoom_selected_item_id, "P01")
+        self.assertIsNone(app._positions_zoom_selection_suppressed_item_id)
+        app._refresh_positions_zoom_detail.assert_not_called()
+        app._update_positions_zoom_search_shortcuts.assert_not_called()
+
+    def test_on_positions_zoom_selected_syncs_main_selection_and_refreshes_detail(self) -> None:
+        zoom_tree = _SessionTreeStub()
+        zoom_tree.rows["P01"] = {"values": (), "tags": (), "text": ""}
+        zoom_tree.selection_set("P01")
+        main_tree = _SessionTreeStub()
+        main_tree.rows["P01"] = {"values": (), "tags": (), "text": ""}
+        app = SimpleNamespace(
+            _positions_zoom_tree=zoom_tree,
+            _positions_view_rendering=False,
+            _position_selection_syncing=False,
+            _positions_zoom_selection_suppressed_item_id=None,
+            _positions_zoom_selected_item_id=None,
+            _refresh_positions_zoom_detail=MagicMock(),
+            _refresh_position_detail_panel=MagicMock(),
+            _update_positions_zoom_search_shortcuts=MagicMock(),
+            position_tree=main_tree,
+        )
+        app._sync_position_tree_selection = lambda item_id: QuantApp._sync_position_tree_selection(app, item_id)
+
+        QuantApp._on_positions_zoom_selected(app)
+
+        self.assertEqual(app._positions_zoom_selected_item_id, "P01")
+        self.assertEqual(main_tree.selection(), ("P01",))
+        self.assertEqual(app._position_selection_suppressed_item_id, "P01")
+        app._refresh_position_detail_panel.assert_called_once()
+        app._update_positions_zoom_search_shortcuts.assert_called_once()
+
+    def test_refresh_position_detail_panel_skips_zoom_reselect_when_already_selected(self) -> None:
+        zoom_tree = _SessionTreeStub()
+        zoom_tree.rows["P01"] = {"values": (), "tags": (), "text": ""}
+        zoom_tree.selection_set("P01")
+        main_tree = _SessionTreeStub()
+        main_tree.selection_set("P01")
+        position = SimpleNamespace(inst_id="BTC-USD-260501-77000-C", inst_type="OPTION")
+        app = SimpleNamespace(
+            position_tree=main_tree,
+            _positions_zoom_tree=zoom_tree,
+            _position_selection_syncing=False,
+            _positions_view_rendering=False,
+            _positions_zoom_selection_suppressed_item_id=None,
+            _upl_usdt_prices={},
+            _position_instruments={},
+            position_detail_text=_Var(""),
+            _position_detail_panel=SimpleNamespace(),
+            _position_row_payloads={"P01": {"kind": "position", "item": position, "label": "", "metrics": None}},
+            _selected_position_payload=lambda: {"kind": "position", "item": position, "label": "", "metrics": None},
+            _current_position_note_text=lambda _position: "",
+            _set_readonly_text=MagicMock(),
+            _refresh_positions_zoom_detail=MagicMock(),
+            _refresh_protection_window_view=MagicMock(),
+        )
+        app._sync_positions_zoom_selection = lambda item_id: QuantApp._sync_positions_zoom_selection(app, item_id)
+
+        with patch("okx_quant.ui._build_position_detail_text", return_value="detail"):
+            QuantApp._refresh_position_detail_panel(app)
+
+        self.assertEqual(zoom_tree.selection(), ("P01",))
+        app._refresh_positions_zoom_detail.assert_called_once()
+        app._refresh_protection_window_view.assert_called_once()
+        app._set_readonly_text.assert_called_once()
 
 
 class SessionLivePnlSummaryTest(TestCase):

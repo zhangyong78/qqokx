@@ -15,6 +15,7 @@ from okx_quant.ui import (
     _build_account_asset_detail_text,
     _build_account_config_detail_text,
     _build_fill_history_detail_text,
+    _format_fill_history_exec_type,
     _build_history_instrument_map,
     _filter_fill_history_items,
     _format_fill_history_price,
@@ -334,7 +335,7 @@ class OkxHistoryParsingTest(TestCase):
 
         self.assertEqual(seen_after, [None, "901"])
         self.assertEqual(len(items), 101)
-        self.assertEqual(items[0].exec_type, "行权/交割")
+        self.assertEqual(items[0].exec_type, "exercise")
         self.assertEqual(items[0].fill_price, Decimal("0.025"))
 
     def test_filter_fill_history_items_supports_type_side_and_keyword(self) -> None:
@@ -368,14 +369,14 @@ class OkxHistoryParsingTest(TestCase):
                 pnl=Decimal("-0.0005"),
                 order_id=None,
                 trade_id=None,
-                exec_type="行权/交割",
+                exec_type="exercise",
                 raw={},
             ),
         ]
 
         filtered = _filter_fill_history_items(items, inst_type="OPTION", side="", keyword="100000-C")
         self.assertEqual(len(filtered), 1)
-        self.assertEqual(filtered[0][1].exec_type, "行权/交割")
+        self.assertEqual(filtered[0][1].exec_type, "exercise")
 
     def test_get_positions_history_merges_and_sorts_items(self) -> None:
         client = OkxRestClient()
@@ -632,6 +633,29 @@ class OkxHistoryParsingTest(TestCase):
         )
         self.assertIn("成交量：0.2 BTC", detail)
 
+    def test_fill_history_detail_formats_exercise_exec_type_without_mojibake(self) -> None:
+        detail = _build_fill_history_detail_text(
+            OkxFillHistoryItem(
+                fill_time=1710000000200,
+                inst_id="BTC-USD-260410-70000-C",
+                inst_type="OPTION",
+                side="exercise",
+                pos_side=None,
+                fill_price=Decimal("75006.3117082961641391"),
+                fill_size=Decimal("40"),
+                fill_fee=Decimal("-0.00008"),
+                fee_currency="BTC",
+                pnl=Decimal("-0.0109652"),
+                order_id=None,
+                trade_id=None,
+                exec_type="exercise",
+                raw={},
+            ),
+            self._option_instruments(),
+        )
+        self.assertIn("成交价：75006.31", detail)
+        self.assertIn("成交类型：行权", detail)
+
     def test_fill_history_size_keeps_asset_unit_when_instrument_metadata_missing(self) -> None:
         text = _format_fill_history_size(
             OkxFillHistoryItem(
@@ -783,6 +807,12 @@ class OkxHistoryParsingTest(TestCase):
             )
         )
         self.assertEqual(text, "68068.40")
+
+    def test_fill_history_exec_type_formats_clean_labels_for_internal_and_legacy_values(self) -> None:
+        self.assertEqual(_format_fill_history_exec_type("exercise"), "行权")
+        self.assertEqual(_format_fill_history_exec_type("delivery"), "交割")
+        self.assertEqual(_format_fill_history_exec_type("琛屾潈/浜ゅ壊"), "行权/交割")
+        self.assertEqual(_format_fill_history_exec_type("T"), "T")
 
     def test_fill_history_price_keeps_option_trade_precision(self) -> None:
         text = _format_fill_history_price(

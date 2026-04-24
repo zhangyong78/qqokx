@@ -1924,7 +1924,7 @@ def _build_fill_history_item_from_bill(item: dict[str, Any]) -> OkxFillHistoryIt
         pnl=_first_decimal(item.get("pnl"), item.get("fillPnl"), item.get("balChg"), item.get("posBalChg")),
         order_id=item.get("ordId"),
         trade_id=item.get("tradeId"),
-        exec_type="琛屾潈/浜ゅ壊",
+        exec_type=exec_type,
         raw=item,
     )
 

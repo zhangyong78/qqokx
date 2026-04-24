@@ -119,6 +119,25 @@ class TraderDeskModelTest(TestCase):
         self.assertEqual(trader_realized_net_pnl(slots, "T001"), Decimal("-12.5"))
         self.assertEqual(trader_realized_close_counts(slots, "T001"), (1, 0, 1))
 
+    def test_realized_summary_counts_closed_loss_without_net_pnl_as_zero(self) -> None:
+        slots = [
+            TraderSlotRecord(
+                slot_id="slot-1",
+                trader_id="T001",
+                session_id="S001",
+                api_name="api1",
+                strategy_name="demo",
+                symbol="BTC-USDT-SWAP",
+                status="closed_loss",
+                quota_occupied=False,
+                closed_at=datetime(2026, 4, 24, 8, 10, 0),
+                net_pnl=None,
+            )
+        ]
+
+        self.assertEqual(trader_realized_net_pnl(slots, "T001"), Decimal("0"))
+        self.assertEqual(trader_realized_close_counts(slots, "T001"), (1, 0, 1))
+
     def test_snapshot_loader_supports_legacy_list_payload(self) -> None:
         with TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "trader_desk.json"

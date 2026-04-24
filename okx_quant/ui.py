@@ -47,11 +47,13 @@ from okx_quant.persistence import (
     load_recoverable_strategy_sessions_snapshot,
     load_credentials_profiles_snapshot,
     load_notification_snapshot,
+    load_position_notes_snapshot,
     load_strategy_history_snapshot,
     load_strategy_trade_ledger_snapshot,
     save_recoverable_strategy_sessions_snapshot,
     save_credentials_profiles_snapshot,
     save_notification_snapshot,
+    save_position_notes_snapshot,
     save_strategy_history_snapshot,
     settings_file_path,
     strategy_history_file_path,
@@ -137,8 +139,10 @@ POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
         "upl",
         "upl_usdt",
         "realized",
+        "realized_usdt",
         "market_value",
         "mgn_ratio",
+        "note",
         "delta",
         "gamma",
         "vega",
@@ -198,6 +202,7 @@ POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
         "pnl",
         "realized",
         "realized_usdt",
+        "note",
     ),
 }
 SIGNAL_LABEL_TO_VALUE = {
@@ -704,6 +709,32 @@ class StrategyTemplateRecord:
     symbol: str
     config: StrategyConfig
     exported_at: datetime | None = None
+
+
+class PositionNoteEditorDialog(simpledialog.Dialog):
+    def __init__(self, parent: Tk | Toplevel, *, title: str, prompt: str, initial_value: str = "") -> None:
+        self._prompt = prompt
+        self._initial_value = initial_value
+        self._note_text_widget: Text | None = None
+        self.result_text: str | None = None
+        super().__init__(parent, title)
+
+    def body(self, master: ttk.Frame) -> Text:
+        master.columnconfigure(0, weight=1)
+        master.rowconfigure(1, weight=1)
+        ttk.Label(master, text=self._prompt, justify="left", wraplength=520).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        note_text = Text(master, width=68, height=8, wrap="word", font=("Microsoft YaHei UI", 10))
+        note_text.grid(row=1, column=0, sticky="nsew")
+        note_text.insert("1.0", self._initial_value)
+        note_text.focus_set()
+        self._note_text_widget = note_text
+        return note_text
+
+    def apply(self) -> None:
+        if self._note_text_widget is None:
+            self.result_text = ""
+            return
+        self.result_text = _normalize_position_note_text(self._note_text_widget.get("1.0", END))
 
 
 def _serialize_strategy_config_snapshot(config: StrategyConfig) -> dict[str, object]:
@@ -1285,10 +1316,15 @@ class QuantApp:
         self._latest_order_history: list[OkxTradeOrderItem] = []
         self._latest_fill_history: list[OkxFillHistoryItem] = []
         self._latest_position_history: list[OkxPositionHistoryItem] = []
+        self._position_current_notes: dict[str, dict[str, object]] = {}
+        self._position_history_notes: dict[str, dict[str, object]] = {}
         self._positions_context_note: str | None = None
+        self._positions_context_profile_name: str | None = None
         self._positions_last_refresh_at: datetime | None = None
         self._positions_history_last_refresh_at: datetime | None = None
         self._positions_effective_environment: str | None = None
+        self._position_history_profile_name: str | None = None
+        self._position_history_effective_environment: str | None = None
         self._positions_refresh_health = RefreshHealthState("持仓")
         self._pending_orders_refresh_health = RefreshHealthState("当前委托")
         self._order_history_refresh_health = RefreshHealthState("历史委托")
@@ -1332,6 +1368,8 @@ class QuantApp:
         self._positions_zoom_fills_detail_frame: ttk.LabelFrame | None = None
         self._positions_zoom_position_history_detail_frame: ttk.LabelFrame | None = None
         self._position_selection_syncing = False
+        self._position_selection_suppressed_item_id: str | None = None
+        self._positions_zoom_selection_suppressed_item_id: str | None = None
         self._positions_zoom_sync_job: str | None = None
         self._positions_zoom_selected_item_id: str | None = None
         self._positions_refresh_badges: list[Label] = []
@@ -1566,6 +1604,7 @@ class QuantApp:
 
         self._load_saved_credentials()
         self._load_saved_notification_settings()
+        self._load_position_notes()
         self._load_recoverable_strategy_sessions_registry()
         self._load_strategy_history()
         self._load_strategy_trade_ledger()
@@ -2065,7 +2104,9 @@ class QuantApp:
         ttk.Button(action_row, text="折叠分组", command=self.collapse_position_groups).grid(
             row=0, column=9, padx=(0, 6)
         )
-        ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=10)
+        ttk.Button(action_row, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=10, padx=(0, 6))
+        ttk.Button(action_row, text="清空备注", command=self.clear_selected_position_note).grid(row=0, column=11, padx=(0, 6))
+        ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=12)
 
         filter_row = ttk.Frame(positions_frame)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -2130,6 +2171,7 @@ class QuantApp:
                 "upl",
                 "upl_usdt",
                 "realized",
+                "realized_usdt",
                 "market_value",
                 "liq",
                 "mgn_ratio",
@@ -2140,6 +2182,7 @@ class QuantApp:
                 "vega",
                 "theta",
                 "theta_usdt",
+                "note",
             ),
             show="tree headings",
             selectmode="browse",
@@ -2164,6 +2207,7 @@ class QuantApp:
         self.position_tree.heading("upl", text="浮盈亏")
         self.position_tree.heading("upl_usdt", text="浮盈≈USDT")
         self.position_tree.heading("realized", text="已实现盈亏")
+        self.position_tree.heading("realized_usdt", text="已实现≈USDT")
         self.position_tree.heading("market_value", text="市值")
         self.position_tree.heading("liq", text="强平价")
         self.position_tree.heading("mgn_ratio", text="保证金率")
@@ -2174,6 +2218,7 @@ class QuantApp:
         self.position_tree.heading("vega", text="Vega(PA)")
         self.position_tree.heading("theta", text="Theta(PA)")
         self.position_tree.heading("theta_usdt", text="Theta≈USDT")
+        self.position_tree.heading("note", text="备注")
         self.position_tree.column("#0", width=240, anchor="w", stretch=True)
         self.position_tree.column("inst_type", width=72, anchor="center")
         self.position_tree.column("mgn_mode", width=92, anchor="center")
@@ -2194,6 +2239,7 @@ class QuantApp:
         self.position_tree.column("upl", width=210, anchor="e")
         self.position_tree.column("upl_usdt", width=105, anchor="e")
         self.position_tree.column("realized", width=118, anchor="e")
+        self.position_tree.column("realized_usdt", width=105, anchor="e")
         self.position_tree.column("market_value", width=160, anchor="e")
         self.position_tree.column("liq", width=92, anchor="e")
         self.position_tree.column("mgn_ratio", width=88, anchor="e")
@@ -2204,6 +2250,7 @@ class QuantApp:
         self.position_tree.column("vega", width=82, anchor="e")
         self.position_tree.column("theta", width=108, anchor="e")
         self.position_tree.column("theta_usdt", width=54, anchor="e")
+        self.position_tree.column("note", width=180, anchor="w")
         self.position_tree.configure(
             displaycolumns=(
                 "inst_type",
@@ -2227,6 +2274,7 @@ class QuantApp:
                 "vega",
                 "theta",
                 "theta_usdt",
+                "note",
             )
         )
         self.position_tree.grid(row=0, column=0, sticky="nsew")
@@ -2918,6 +2966,7 @@ class QuantApp:
                 self._latest_positions,
                 inst_type=POSITION_TYPE_OPTIONS[self.position_type_filter.get()],
                 keyword=self.position_keyword.get(),
+                note_texts=self._current_position_note_text_map(),
             ))
 
     def _on_position_refresh_interval_changed(self, *_: object) -> None:
@@ -2925,6 +2974,7 @@ class QuantApp:
             self._latest_positions,
             inst_type=POSITION_TYPE_OPTIONS[self.position_type_filter.get()],
             keyword=self.position_keyword.get(),
+            note_texts=self._current_position_note_text_map(),
         )
         self._update_position_summary(visible_positions)
         self._enqueue_log(f"账户持仓自动刷新间隔已切换为：{self.position_refresh_interval_label.get()}")
@@ -2960,6 +3010,232 @@ class QuantApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(position.inst_id)
         self._enqueue_log(f"已复制合约代码：{position.inst_id}")
+
+    def _current_position_note_context(self) -> tuple[str, str]:
+        profile_name = (self._positions_context_profile_name or self._current_credential_profile()).strip()
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        return profile_name, environment
+
+    def _position_history_note_context(self) -> tuple[str, str]:
+        profile_name = (self._position_history_profile_name or self._current_credential_profile()).strip()
+        environment = self._position_history_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        return profile_name, environment
+
+    def _current_position_note_text(self, position: OkxPosition) -> str:
+        profile_name, environment = self._current_position_note_context()
+        record = self._position_current_notes.get(_position_note_current_key(profile_name, environment, position))
+        return _normalize_position_note_text(record.get("note", "")) if isinstance(record, dict) else ""
+
+    def _current_position_note_summary(self, position: OkxPosition) -> str:
+        return _format_position_note_summary(self._current_position_note_text(position))
+
+    def _position_history_note_text(self, item: OkxPositionHistoryItem) -> str:
+        profile_name, environment = self._position_history_note_context()
+        record = self._position_history_notes.get(_position_history_note_key(profile_name, environment, item))
+        return _normalize_position_note_text(record.get("note", "")) if isinstance(record, dict) else ""
+
+    def _position_history_note_summary(self, item: OkxPositionHistoryItem) -> str:
+        return _format_position_note_summary(self._position_history_note_text(item))
+
+    def _current_position_note_text_map(self) -> dict[str, str]:
+        return {
+            _position_tree_row_id(position): self._current_position_note_text(position)
+            for position in self._latest_positions
+        }
+
+    def _position_history_note_text_map_by_index(self) -> dict[int, str]:
+        return {
+            index: self._position_history_note_text(item)
+            for index, item in enumerate(self._latest_position_history)
+        }
+
+    def _selected_position_history_item(self) -> OkxPositionHistoryItem | None:
+        if self._positions_zoom_position_history_tree is None:
+            return None
+        selection = self._positions_zoom_position_history_tree.selection()
+        if not selection:
+            return None
+        index = _history_tree_index(selection[0], "ph")
+        if index is None or index >= len(self._latest_position_history):
+            return None
+        return self._latest_position_history[index]
+
+    def _sync_position_note_state_for_positions(
+        self,
+        *,
+        profile_name: str,
+        environment: str,
+        positions: list[OkxPosition],
+    ) -> None:
+        now_ms = _now_epoch_ms()
+        changed = _reconcile_current_position_note_records(
+            self._position_current_notes,
+            profile_name=profile_name,
+            environment=environment,
+            positions=positions,
+            now_ms=now_ms,
+        )
+        if (
+            self._position_history_profile_name == profile_name
+            and self._position_history_effective_environment == environment
+            and self._latest_position_history
+        ):
+            changed = _inherit_position_history_notes(
+                self._position_current_notes,
+                self._position_history_notes,
+                profile_name=profile_name,
+                environment=environment,
+                position_history=self._latest_position_history,
+                now_ms=now_ms,
+            ) or changed
+            changed = _prune_closed_current_position_notes(
+                self._position_current_notes,
+                self._position_history_notes,
+                profile_name=profile_name,
+                environment=environment,
+            ) or changed
+        if changed:
+            self._save_position_notes()
+
+    def _sync_position_note_state_for_history(
+        self,
+        *,
+        profile_name: str,
+        environment: str,
+        position_history: list[OkxPositionHistoryItem],
+    ) -> None:
+        now_ms = _now_epoch_ms()
+        changed = _inherit_position_history_notes(
+            self._position_current_notes,
+            self._position_history_notes,
+            profile_name=profile_name,
+            environment=environment,
+            position_history=position_history,
+            now_ms=now_ms,
+        )
+        changed = _prune_closed_current_position_notes(
+            self._position_current_notes,
+            self._position_history_notes,
+            profile_name=profile_name,
+            environment=environment,
+        ) or changed
+        if changed:
+            self._save_position_notes()
+
+    def edit_selected_position_note(self) -> None:
+        payload = self._selected_position_payload()
+        if payload is None or payload.get("kind") != "position":
+            messagebox.showinfo("备注", "请先在当前持仓里选中一条具体持仓。", parent=self._positions_zoom_window or self.root)
+            return
+        position = payload.get("item")
+        if not isinstance(position, OkxPosition):
+            return
+        dialog = PositionNoteEditorDialog(
+            self._positions_zoom_window or self.root,
+            title="编辑持仓备注",
+            prompt=f"为 {position.inst_id} 填写备注。留空后保存会清空当前持仓备注。",
+            initial_value=self._current_position_note_text(position),
+        )
+        if dialog.result_text is None:
+            return
+        profile_name, environment = self._current_position_note_context()
+        record_key = _position_note_current_key(profile_name, environment, position)
+        if dialog.result_text:
+            previous = self._position_current_notes.get(record_key)
+            record = _build_current_position_note_record(
+                profile_name=profile_name,
+                environment=environment,
+                position=position,
+                note=dialog.result_text,
+                now_ms=_now_epoch_ms(),
+                previous=previous,
+            )
+            if record is not None:
+                self._position_current_notes[record_key] = record
+                self._save_position_notes()
+                self._render_positions_view()
+                self._enqueue_log(f"已更新持仓备注：{position.inst_id}")
+            return
+        if record_key in self._position_current_notes:
+            del self._position_current_notes[record_key]
+            self._save_position_notes()
+            self._render_positions_view()
+            self._enqueue_log(f"已清空持仓备注：{position.inst_id}")
+
+    def clear_selected_position_note(self) -> None:
+        payload = self._selected_position_payload()
+        if payload is None or payload.get("kind") != "position":
+            messagebox.showinfo("备注", "请先在当前持仓里选中一条具体持仓。", parent=self._positions_zoom_window or self.root)
+            return
+        position = payload.get("item")
+        if not isinstance(position, OkxPosition):
+            return
+        profile_name, environment = self._current_position_note_context()
+        record_key = _position_note_current_key(profile_name, environment, position)
+        if record_key not in self._position_current_notes:
+            messagebox.showinfo("备注", "当前持仓还没有备注。", parent=self._positions_zoom_window or self.root)
+            return
+        del self._position_current_notes[record_key]
+        self._save_position_notes()
+        self._render_positions_view()
+        self._enqueue_log(f"已清空持仓备注：{position.inst_id}")
+
+    def edit_selected_position_history_note(self) -> None:
+        item = self._selected_position_history_item()
+        if item is None:
+            messagebox.showinfo("备注", "请先在历史仓位里选中一条记录。", parent=self._positions_zoom_window or self.root)
+            return
+        dialog = PositionNoteEditorDialog(
+            self._positions_zoom_window or self.root,
+            title="编辑历史仓位备注",
+            prompt=f"为 {item.inst_id} 的这条历史仓位填写备注。留空后保存会清空历史仓位备注。",
+            initial_value=self._position_history_note_text(item),
+        )
+        if dialog.result_text is None:
+            return
+        profile_name, environment = self._position_history_note_context()
+        record_key = _position_history_note_key(profile_name, environment, item)
+        if dialog.result_text:
+            previous = self._position_history_notes.get(record_key)
+            record = _build_history_position_note_record(
+                profile_name=profile_name,
+                environment=environment,
+                item=item,
+                note=dialog.result_text,
+                now_ms=_now_epoch_ms(),
+                source_current_key=(
+                    str(previous.get("source_current_key", ""))
+                    if isinstance(previous, dict)
+                    else ""
+                ),
+                previous=previous,
+            )
+            if record is not None:
+                self._position_history_notes[record_key] = record
+                self._save_position_notes()
+                self._render_positions_zoom_position_history_view()
+                self._enqueue_log(f"已更新历史仓位备注：{item.inst_id}")
+            return
+        if record_key in self._position_history_notes:
+            del self._position_history_notes[record_key]
+            self._save_position_notes()
+            self._render_positions_zoom_position_history_view()
+            self._enqueue_log(f"已清空历史仓位备注：{item.inst_id}")
+
+    def clear_selected_position_history_note(self) -> None:
+        item = self._selected_position_history_item()
+        if item is None:
+            messagebox.showinfo("备注", "请先在历史仓位里选中一条记录。", parent=self._positions_zoom_window or self.root)
+            return
+        profile_name, environment = self._position_history_note_context()
+        record_key = _position_history_note_key(profile_name, environment, item)
+        if record_key not in self._position_history_notes:
+            messagebox.showinfo("备注", "当前历史仓位还没有备注。", parent=self._positions_zoom_window or self.root)
+            return
+        del self._position_history_notes[record_key]
+        self._save_position_notes()
+        self._render_positions_zoom_position_history_view()
+        self._enqueue_log(f"已清空历史仓位备注：{item.inst_id}")
 
     def _expand_to_screen(self, window: Toplevel, *, margin: int = 20) -> None:
         try:
@@ -3021,22 +3297,24 @@ class QuantApp:
         ttk.Button(zoom_actions, text="刷新历史", command=self.refresh_position_histories).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(zoom_actions, text="刷新历史成交", command=self.refresh_fill_history).grid(row=0, column=2, padx=(0, 6))
         ttk.Button(zoom_actions, text="账户信息", command=self.open_account_info_window).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(zoom_actions, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(zoom_actions, text="清空备注", command=self.clear_selected_position_note).grid(row=0, column=5, padx=(0, 6))
         ttk.Button(zoom_actions, text="设置期权保护", command=self.open_position_protection_window).grid(
-            row=0, column=4, padx=(0, 6)
+            row=0, column=6, padx=(0, 6)
         )
         ttk.Button(zoom_actions, text="展期建议", command=self.open_option_roll_window).grid(
-            row=0, column=5, padx=(0, 6)
-        )
-        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=6)
-        ttk.Button(zoom_actions, text="列设置", command=self.open_positions_zoom_column_window).grid(
             row=0, column=7, padx=(0, 6)
+        )
+        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=8)
+        ttk.Button(zoom_actions, text="列设置", command=self.open_positions_zoom_column_window).grid(
+            row=0, column=9, padx=(0, 6)
         )
 
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_detail_toggle_text, command=self.toggle_positions_zoom_detail).grid(
-            row=0, column=8, padx=(0, 6)
+            row=0, column=10, padx=(0, 6)
         )
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_history_toggle_text, command=self.toggle_positions_zoom_history).grid(
-            row=0, column=9
+            row=0, column=11
         )
         for column_index, child in enumerate(zoom_actions.winfo_children()):
             child.grid_configure(column=column_index)
@@ -3542,7 +3820,7 @@ class QuantApp:
             ("size", 100),
             ("fee", 100),
             ("pnl", 110),
-            ("exec_type", 96),
+            ("exec_type", 108),
         ):
             tree.heading(column_id, text=headings[column_id])
             tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "fee", "pnl"} else "center")
@@ -3580,11 +3858,17 @@ class QuantApp:
             textvariable=self._positions_zoom_position_history_load_more_text,
             command=self.expand_position_history_limit,
         ).grid(row=0, column=1, sticky="e", padx=(0, 6))
+        ttk.Button(header, text="编辑备注", command=self.edit_selected_position_history_note).grid(
+            row=0, column=2, sticky="e", padx=(0, 6)
+        )
+        ttk.Button(header, text="清空备注", command=self.clear_selected_position_history_note).grid(
+            row=0, column=3, sticky="e", padx=(0, 6)
+        )
         ttk.Button(
             header,
             textvariable=self._positions_zoom_position_history_detail_toggle_text,
             command=self.toggle_positions_zoom_position_history_detail,
-        ).grid(row=0, column=2, sticky="e")
+        ).grid(row=0, column=4, sticky="e")
         filter_row = ttk.Frame(parent)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         filter_row.columnconfigure(9, weight=1)
@@ -3658,6 +3942,7 @@ class QuantApp:
             "pnl",
             "realized",
             "realized_usdt",
+            "note",
         )
         tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
         self._positions_zoom_position_history_tree = tree
@@ -3672,6 +3957,7 @@ class QuantApp:
             "close_size": "平仓数量",
             "pnl": "盈亏",
             "realized": "已实现盈亏",
+            "note": "备注",
         }
         headings["realized_usdt"] = "折合USDT"
         for column_id, width in (
@@ -3686,6 +3972,7 @@ class QuantApp:
             ("pnl", 100),
             ("realized", 110),
             ("realized_usdt", 110),
+            ("note", 220),
         ):
             tree.heading(column_id, text=headings[column_id])
             tree.column(
@@ -3694,6 +3981,7 @@ class QuantApp:
                 anchor="e" if column_id in {"open_avg", "close_avg", "close_size", "pnl", "realized", "realized_usdt"} else "center",
             )
         tree.column("inst_id", anchor="w")
+        tree.column("note", anchor="w")
         tree.grid(row=0, column=0, sticky="nsew")
         tree.bind("<<TreeviewSelect>>", self._on_positions_zoom_position_history_selected)
         tree.tag_configure("profit", foreground="#13803d")
@@ -3739,6 +4027,7 @@ class QuantApp:
         self._positions_zoom_tree = None
         self._positions_zoom_detail = None
         self._positions_zoom_notebook = None
+        self._positions_zoom_selection_suppressed_item_id = None
         self._positions_zoom_pending_orders_tree = None
         self._positions_zoom_pending_orders_detail = None
         self._positions_zoom_order_history_tree = None
@@ -4039,15 +4328,91 @@ class QuantApp:
         _copy_branch("", "")
         selected = self.position_tree.selection()
         if selected and zoom_tree.exists(selected[0]):
-            self._position_selection_syncing = True
+            if zoom_tree.selection() != (selected[0],):
+                self._positions_zoom_selection_suppressed_item_id = selected[0]
+                self._position_selection_syncing = True
+                try:
+                    zoom_tree.selection_set(selected[0])
+                finally:
+                    self._position_selection_syncing = False
             try:
-                zoom_tree.selection_set(selected[0])
-                zoom_tree.focus(selected[0])
-                self._positions_zoom_selected_item_id = selected[0]
-            finally:
-                self._position_selection_syncing = False
+                zoom_tree.see(selected[0])
+            except Exception:
+                pass
+            self._positions_zoom_selected_item_id = selected[0]
+        else:
+            self._positions_zoom_selected_item_id = None
         self._refresh_positions_zoom_detail()
         self._update_positions_zoom_search_shortcuts()
+
+    def _sync_position_tree_selection(self, item_id: str) -> None:
+        if self.position_tree is None or not self.position_tree.exists(item_id):
+            return
+        if self.position_tree.selection() == (item_id,):
+            return
+        self._position_selection_suppressed_item_id = item_id
+        self._position_selection_syncing = True
+        try:
+            self.position_tree.selection_set(item_id)
+        finally:
+            self._position_selection_syncing = False
+        try:
+            self.position_tree.see(item_id)
+        except Exception:
+            pass
+
+    def _sync_positions_zoom_selection(self, item_id: str) -> None:
+        if self._positions_zoom_tree is None or not self._positions_zoom_tree.exists(item_id):
+            return
+        if self._positions_zoom_tree.selection() == (item_id,):
+            return
+        self._positions_zoom_selection_suppressed_item_id = item_id
+        self._position_selection_syncing = True
+        try:
+            self._positions_zoom_tree.selection_set(item_id)
+        finally:
+            self._position_selection_syncing = False
+        try:
+            self._positions_zoom_tree.see(item_id)
+        except Exception:
+            pass
+
+    def _on_positions_zoom_selected(self, *_: object) -> None:
+        if self._positions_zoom_tree is None or self._positions_view_rendering or self._position_selection_syncing:
+            return
+        selection = self._positions_zoom_tree.selection()
+        if not selection:
+            self._positions_zoom_selection_suppressed_item_id = None
+            self._positions_zoom_selected_item_id = None
+            self._refresh_positions_zoom_detail()
+            self._update_positions_zoom_search_shortcuts()
+            return
+        selected_item_id = selection[0]
+        if self._positions_zoom_selection_suppressed_item_id == selected_item_id:
+            self._positions_zoom_selection_suppressed_item_id = None
+            self._positions_zoom_selected_item_id = selected_item_id
+            return
+        self._positions_zoom_selection_suppressed_item_id = None
+        self._positions_zoom_selected_item_id = selected_item_id
+        if self.position_tree is not None and self.position_tree.exists(selected_item_id):
+            self._sync_position_tree_selection(selected_item_id)
+            self._refresh_position_detail_panel()
+        else:
+            self._refresh_positions_zoom_detail()
+        self._update_positions_zoom_search_shortcuts()
+
+    def _selected_positions_zoom_option_for_search(self) -> OkxPosition | None:
+        payload = None
+        if self._positions_zoom_selected_item_id:
+            payload = self._position_row_payloads.get(self._positions_zoom_selected_item_id)
+        if payload is None:
+            payload = self._selected_position_payload()
+        if payload is None or payload.get("kind") != "position":
+            return None
+        position = payload.get("item")
+        if isinstance(position, OkxPosition) and position.inst_type == "OPTION":
+            return position
+        return None
 
     def _sync_positions_zoom_columns_from_main(self) -> None:
         if self.position_tree is None or self._positions_zoom_tree is None:
@@ -4060,6 +4425,7 @@ class QuantApp:
             "mark_usdt",
             "avg_usdt",
             "upl_usdt",
+            "realized_usdt",
             "theta_usdt",
         }
         compact_zoom_columns = {
@@ -4096,32 +4462,6 @@ class QuantApp:
                 anchor=column.get("anchor"),
                 stretch=stretch,
             )
-
-    def _on_positions_zoom_selected(self, *_: object) -> None:
-        if self._positions_zoom_tree is None or self._positions_view_rendering:
-            return
-        selection = self._positions_zoom_tree.selection()
-        if not selection:
-            self._positions_zoom_selected_item_id = None
-            self._refresh_positions_zoom_detail()
-            self._update_positions_zoom_search_shortcuts()
-            return
-        self._positions_zoom_selected_item_id = selection[0]
-        self._refresh_positions_zoom_detail()
-        self._update_positions_zoom_search_shortcuts()
-
-    def _selected_positions_zoom_option_for_search(self) -> OkxPosition | None:
-        payload = None
-        if self._positions_zoom_selected_item_id:
-            payload = self._position_row_payloads.get(self._positions_zoom_selected_item_id)
-        if payload is None:
-            payload = self._selected_position_payload()
-        if payload is None or payload.get("kind") != "position":
-            return None
-        position = payload.get("item")
-        if isinstance(position, OkxPosition) and position.inst_type == "OPTION":
-            return position
-        return None
 
     def _selected_position_history_option_for_search(self) -> OkxPositionHistoryItem | None:
         if self._positions_zoom_position_history_tree is None:
@@ -4266,7 +4606,12 @@ class QuantApp:
             if isinstance(position, OkxPosition):
                 self._set_readonly_text(
                     self._positions_zoom_detail,
-                    _build_position_detail_text(position, self._upl_usdt_prices, self._position_instruments),
+                    _build_position_detail_text(
+                        position,
+                        self._upl_usdt_prices,
+                        self._position_instruments,
+                        note=self._current_position_note_text(position),
+                    ),
                 )
                 return
         label = payload["label"]
@@ -5203,7 +5548,8 @@ class QuantApp:
             self._positions_zoom_position_history_summary_text.set(self._positions_zoom_position_history_base_summary)
             return
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
-        self._start_position_history_refresh(credentials, environment)
+        profile_name = credentials.profile_name or self._current_credential_profile()
+        self._start_position_history_refresh(credentials, environment, profile_name)
         self._start_fill_history_refresh(credentials, environment)
 
     def refresh_fill_history(self) -> None:
@@ -5233,7 +5579,8 @@ class QuantApp:
             self._positions_zoom_position_history_summary_text.set("未配置 API 凭证，无法读取历史仓位。")
             return
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
-        self._start_position_history_refresh(credentials, environment)
+        profile_name = credentials.profile_name or self._current_credential_profile()
+        self._start_position_history_refresh(credentials, environment, profile_name)
 
     def _start_fill_history_refresh(self, credentials: Credentials, environment: str) -> None:
         if self._fills_history_refreshing:
@@ -5246,14 +5593,14 @@ class QuantApp:
             daemon=True,
         ).start()
 
-    def _start_position_history_refresh(self, credentials: Credentials, environment: str) -> None:
+    def _start_position_history_refresh(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         if self._position_history_refreshing:
             return
         self._position_history_refreshing = True
         self._positions_zoom_position_history_summary_text.set("正在刷新历史仓位...")
         threading.Thread(
             target=self._refresh_position_history_worker,
-            args=(credentials, environment),
+            args=(credentials, environment, profile_name),
             daemon=True,
         ).start()
 
@@ -5280,7 +5627,7 @@ class QuantApp:
                 return
         self.root.after(0, lambda: self._apply_fill_history(fills, instruments, note, effective_environment))
 
-    def _refresh_position_history_worker(self, credentials: Credentials, environment: str) -> None:
+    def _refresh_position_history_worker(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         try:
             position_history = self.client.get_positions_history(credentials, environment=environment, limit=self._position_history_fetch_limit)
             usdt_prices = _build_position_history_usdt_price_map(self.client, position_history)
@@ -5305,7 +5652,14 @@ class QuantApp:
                 return
         self.root.after(
             0,
-            lambda: self._apply_position_history(position_history, usdt_prices, instruments, note, effective_environment),
+            lambda: self._apply_position_history(
+                position_history,
+                usdt_prices,
+                instruments,
+                note,
+                effective_environment,
+                profile_name,
+            ),
         )
 
     def _apply_fill_history(
@@ -5336,6 +5690,7 @@ class QuantApp:
         instruments: dict[str, Instrument],
         note: str | None = None,
         effective_environment: str | None = None,
+        credential_profile_name: str | None = None,
     ) -> None:
         self._position_history_refreshing = False
         self._latest_position_history = list(position_history)
@@ -5343,6 +5698,8 @@ class QuantApp:
         self._position_history_instruments = dict(instruments)
         self._position_history_last_refresh_at = datetime.now()
         self._positions_history_last_refresh_at = self._position_history_last_refresh_at
+        self._position_history_profile_name = (credential_profile_name or self._current_credential_profile()).strip()
+        self._position_history_effective_environment = effective_environment
         if effective_environment:
             self._positions_effective_environment = effective_environment
         timestamp = self._position_history_last_refresh_at.strftime("%H:%M:%S")
@@ -5351,6 +5708,12 @@ class QuantApp:
             history_summary = f"{history_summary} | {note}"
         self._positions_zoom_position_history_base_summary = history_summary
         self._positions_zoom_position_history_summary_text.set(history_summary)
+        if self._position_history_profile_name and self._position_history_effective_environment:
+            self._sync_position_note_state_for_history(
+                profile_name=self._position_history_profile_name,
+                environment=self._position_history_effective_environment,
+                position_history=position_history,
+            )
         self._render_positions_zoom_position_history_view()
 
     def _apply_fill_history_error(self, message: str) -> None:
@@ -5391,7 +5754,7 @@ class QuantApp:
                     _format_fill_history_size(item, self._fill_history_instruments),
                     _format_optional_decimal(item.fill_fee),
                     _format_fill_history_pnl(item),
-                    item.exec_type or "-",
+                    _format_fill_history_exec_type(item.exec_type),
                   ),
                   tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
               )
@@ -5443,6 +5806,7 @@ class QuantApp:
             asset=self.position_history_asset_filter.get(),
             expiry_prefix=self.position_history_expiry_prefix_filter.get(),
             keyword=self.position_history_keyword.get(),
+            note_texts_by_index=self._position_history_note_text_map_by_index(),
         )
         for index, item in filtered_items:
             iid = f"ph-{index}"
@@ -5465,6 +5829,7 @@ class QuantApp:
                         _position_history_realized_pnl_usdt(item, self._position_history_usdt_prices),
                         with_sign=True,
                     ),
+                    self._position_history_note_summary(item),
                 ),
                 tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
             )
@@ -5552,6 +5917,7 @@ class QuantApp:
                 self._latest_position_history[index],
                 self._position_history_usdt_prices,
                 self._position_history_instruments,
+                note=self._position_history_note_text(self._latest_position_history[index]),
             ),
         )
 
@@ -6708,6 +7074,36 @@ class QuantApp:
         self.environment_label.set(self._default_environment_label)
         self._apply_profile_environment(self._current_credential_profile())
         self._last_saved_notification_state = self._current_notification_state()
+
+    def _load_position_notes(self) -> None:
+        try:
+            snapshot = load_position_notes_snapshot()
+        except Exception as exc:
+            self._enqueue_log(f"读取持仓备注失败：{exc}")
+            return
+        raw_current_notes = snapshot.get("current_notes", [])
+        raw_history_notes = snapshot.get("history_notes", [])
+        if isinstance(raw_current_notes, list):
+            self._position_current_notes = {
+                str(item["record_key"]): dict(item)
+                for item in raw_current_notes
+                if isinstance(item, dict) and str(item.get("record_key", "")).strip()
+            }
+        if isinstance(raw_history_notes, list):
+            self._position_history_notes = {
+                str(item["record_key"]): dict(item)
+                for item in raw_history_notes
+                if isinstance(item, dict) and str(item.get("record_key", "")).strip()
+            }
+
+    def _save_position_notes(self) -> None:
+        try:
+            save_position_notes_snapshot(
+                current_notes=list(self._position_current_notes.values()),
+                history_notes=list(self._position_history_notes.values()),
+            )
+        except Exception as exc:
+            self._enqueue_log(f"保存持仓备注失败：{exc}")
 
     def _bind_auto_save(self) -> None:
         self.api_key.trace_add("write", self._on_credentials_changed)
@@ -8496,12 +8892,13 @@ class QuantApp:
         self._positions_context_note = summary
         self._positions_last_refresh_at = datetime.now()
         self._positions_effective_environment = effective_environment
+        self._positions_context_profile_name = (credential_profile_name or self._current_credential_profile()).strip()
         _mark_refresh_health_success(self._positions_refresh_health, at=self._positions_last_refresh_at)
         self._refresh_all_refresh_badges()
         self._upl_usdt_prices = dict(upl_usdt_prices or {})
         self._position_instruments = dict(position_instruments or {})
         self._position_tickers = dict(position_tickers or {})
-        profile_name = (credential_profile_name or self._current_credential_profile()).strip()
+        profile_name = self._positions_context_profile_name
         if profile_name:
             self._positions_snapshot_by_profile[profile_name] = ProfilePositionSnapshot(
                 api_name=profile_name,
@@ -8509,6 +8906,12 @@ class QuantApp:
                 positions=list(positions),
                 upl_usdt_prices=dict(upl_usdt_prices or {}),
                 refreshed_at=self._positions_last_refresh_at,
+            )
+        if profile_name and effective_environment:
+            self._sync_position_note_state_for_positions(
+                profile_name=profile_name,
+                environment=effective_environment,
+                positions=positions,
             )
         self._render_positions_view()
         self._refresh_session_live_pnl_cache()
@@ -8765,6 +9168,7 @@ class QuantApp:
                 self._latest_positions,
                 inst_type=POSITION_TYPE_OPTIONS[self.position_type_filter.get()],
                 keyword=self.position_keyword.get(),
+                note_texts=self._current_position_note_text_map(),
             )
             groups = _group_positions_for_tree(visible_positions)
             for asset_label, buckets in groups.items():
@@ -8888,6 +9292,7 @@ class QuantApp:
                 _format_position_unrealized_pnl(position),
                 _format_optional_usdt(_position_unrealized_pnl_usdt(position, self._upl_usdt_prices)),
                 _format_optional_decimal_fixed(position.realized_pnl, places=5, with_sign=True),
+                _format_optional_usdt(_position_realized_pnl_usdt(position, self._upl_usdt_prices)),
                 _format_position_market_value(position, self._position_instruments, self._upl_usdt_prices),
                 _format_optional_decimal(position.liquidation_price),
                 _format_ratio(position.margin_ratio, places=2),
@@ -8898,6 +9303,7 @@ class QuantApp:
                 _format_optional_decimal_fixed(position.vega, places=5),
                 _format_optional_decimal_fixed(position.theta, places=5),
                 _format_optional_usdt_precise(_position_theta_usdt(position, self._upl_usdt_prices), places=2),
+                self._current_position_note_summary(position),
             ),
             tags=tuple(tags),
         )
@@ -9003,6 +9409,11 @@ class QuantApp:
     def _on_position_selected(self, *_: object) -> None:
         if self._position_selection_syncing or self._positions_view_rendering:
             return
+        selection = self.position_tree.selection()
+        if selection and self._position_selection_suppressed_item_id == selection[0]:
+            self._position_selection_suppressed_item_id = None
+            return
+        self._position_selection_suppressed_item_id = None
         self._refresh_position_detail_panel()
 
     def _refresh_position_detail_panel(self) -> None:
@@ -9013,7 +9424,12 @@ class QuantApp:
             position = payload["item"]
             if isinstance(position, OkxPosition):
                 self.position_detail_text.set(
-                    _build_position_detail_text(position, self._upl_usdt_prices, self._position_instruments)
+                    _build_position_detail_text(
+                        position,
+                        self._upl_usdt_prices,
+                        self._position_instruments,
+                        note=self._current_position_note_text(position),
+                    )
                 )
         else:
             label = payload["label"]
@@ -9033,12 +9449,7 @@ class QuantApp:
         if self._positions_zoom_tree is not None:
             selection = self.position_tree.selection()
             if selection and self._positions_zoom_tree.exists(selection[0]):
-                self._position_selection_syncing = True
-                try:
-                    self._positions_zoom_tree.selection_set(selection[0])
-                    self._positions_zoom_tree.focus(selection[0])
-                finally:
-                    self._position_selection_syncing = False
+                self._sync_positions_zoom_selection(selection[0])
         self._refresh_positions_zoom_detail()
         self._refresh_protection_window_view()
 
@@ -9062,6 +9473,7 @@ class QuantApp:
             return
         self._latest_positions = []
         self._positions_context_note = None
+        self._positions_context_profile_name = None
         self._positions_last_refresh_at = None
         self._positions_effective_environment = None
         self._upl_usdt_prices = {}
@@ -10042,7 +10454,7 @@ class QuantApp:
         slot.entry_price = slot.entry_price if slot.entry_price is not None else ledger_record.entry_price
         slot.exit_price = ledger_record.exit_price
         slot.size = slot.size if slot.size is not None else ledger_record.size
-        slot.net_pnl = ledger_record.net_pnl
+        slot.net_pnl = net_pnl
         slot.close_reason = close_reason
         slot.history_record_id = ledger_record.history_record_id or session.history_record_id or ""
         run.armed_session_id = ""
@@ -10053,7 +10465,7 @@ class QuantApp:
             run.paused_reason = close_reason or "亏损后暂停"
             self._trader_desk_add_event(
                 trader_id,
-                f"亏损单已记录并暂停 | 会话={session.session_id} | 净盈亏={_format_optional_usdt_precise(ledger_record.net_pnl, places=2)} | 原因={close_reason or '-'}",
+                f"亏损单已记录并暂停 | 会话={session.session_id} | 净盈亏={_format_optional_usdt_precise(net_pnl, places=2)} | 原因={close_reason or '-'}",
                 level="warning",
             )
             self._save_trader_desk_snapshot()
@@ -10061,7 +10473,7 @@ class QuantApp:
         if slot.status == "closed_profit":
             self._trader_desk_add_event(
                 trader_id,
-                f"盈利单已释放额度 | 会话={session.session_id} | 净盈亏={_format_optional_usdt_precise(ledger_record.net_pnl, places=2)}",
+                f"盈利单已释放额度 | 会话={session.session_id} | 净盈亏={_format_optional_usdt_precise(net_pnl, places=2)}",
             )
             if not draft.auto_restart_on_profit:
                 run.status = "idle"
@@ -11759,6 +12171,7 @@ def _aggregate_position_metrics(
             [_position_market_value_usdt(item, position_instruments, upl_usdt_prices) for item in positions]
         ),
         "realized": _sum_decimal([item.realized_pnl for item in positions]),
+        "realized_usdt": _sum_decimal([_position_realized_pnl_usdt(item, upl_usdt_prices) for item in positions]),
         "pnl_currency": pnl_currency,
         "imr": _sum_decimal([item.initial_margin for item in positions]),
         "mmr": _sum_decimal([item.maintenance_margin for item in positions]),
@@ -11807,6 +12220,7 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
             places=pnl_places,
             with_sign=True,
         ),
+        _format_optional_usdt(metrics["realized_usdt"] if isinstance(metrics["realized_usdt"], Decimal) else None),
         _format_optional_approx_usdt(
             metrics["market_value_usdt"] if isinstance(metrics["market_value_usdt"], Decimal) else None
         ),
@@ -11818,7 +12232,11 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
         _format_optional_decimal_fixed(metrics["gamma"] if isinstance(metrics["gamma"], Decimal) else None, places=5),
         _format_optional_decimal_fixed(metrics["vega"] if isinstance(metrics["vega"], Decimal) else None, places=5),
         _format_optional_decimal_fixed(metrics["theta"] if isinstance(metrics["theta"], Decimal) else None, places=5),
-        _format_optional_usdt_precise(metrics["theta_usdt"] if isinstance(metrics["theta_usdt"], Decimal) else None, places=2),
+        _format_optional_usdt_precise(
+            metrics["theta_usdt"] if isinstance(metrics["theta_usdt"], Decimal) else None,
+            places=2,
+        ),
+        "--",
     )
 
 
@@ -12377,6 +12795,16 @@ def _position_unrealized_pnl_usdt(position: OkxPosition, upl_usdt_prices: dict[s
     return position.unrealized_pnl * price
 
 
+def _position_realized_pnl_usdt(position: OkxPosition, upl_usdt_prices: dict[str, Decimal]) -> Decimal | None:
+    if position.realized_pnl is None:
+        return None
+    currency = _infer_upl_currency(position)
+    price = upl_usdt_prices.get(currency)
+    if price is None:
+        return None
+    return position.realized_pnl * price
+
+
 def _session_trade_inst_id(session: StrategySession) -> str:
     config = getattr(session, "config", None)
     trade_inst_id = getattr(config, "trade_inst_id", None) or getattr(config, "inst_id", None) or getattr(session, "symbol", "")
@@ -12478,11 +12906,349 @@ def _build_position_ticker_map(client: OkxRestClient, positions: list[OkxPositio
     return result
 
 
+def _now_epoch_ms() -> int:
+    return int(datetime.now().timestamp() * 1000)
+
+
+def _normalize_position_note_text(value: object) -> str:
+    if value is None:
+        return ""
+    lines = str(value).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(line.rstrip() for line in lines)
+
+
+def _format_position_note_summary(note: str, *, limit: int = 24) -> str:
+    normalized_note = _normalize_position_note_text(note)
+    if not normalized_note:
+        return "-"
+    single_line = " | ".join(part.strip() for part in normalized_note.splitlines() if part.strip())
+    if len(single_line) <= limit:
+        return single_line
+    return f"{single_line[: max(limit - 1, 1)].rstrip()}…"
+
+
+def _format_position_note_detail(note: str) -> str:
+    normalized_note = _normalize_position_note_text(note)
+    if not normalized_note:
+        return ""
+    lines = normalized_note.splitlines()
+    if len(lines) == 1:
+        return f"备注：{lines[0]}\n"
+    formatted_lines = [f"备注：{lines[0]}"]
+    formatted_lines.extend(f"      {line}" for line in lines[1:])
+    return "\n".join(formatted_lines) + "\n"
+
+
+def _normalize_position_note_side(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"buy", "long"}:
+        return "long"
+    if normalized in {"sell", "short"}:
+        return "short"
+    if not normalized or normalized == "net":
+        return "net"
+    return normalized
+
+
+def _normalize_position_note_margin_mode(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized or "unknown"
+
+
+def _position_note_current_record_key(
+    profile_name: str,
+    environment: str,
+    inst_id: str,
+    pos_side: str | None,
+    mgn_mode: str | None,
+) -> str:
+    return "|".join(
+        (
+            profile_name.strip(),
+            environment.strip().lower(),
+            inst_id.strip().upper(),
+            _normalize_position_note_side(pos_side),
+            _normalize_position_note_margin_mode(mgn_mode),
+        )
+    )
+
+
+def _position_note_current_key(profile_name: str, environment: str, position: OkxPosition) -> str:
+    return _position_note_current_record_key(
+        profile_name,
+        environment,
+        position.inst_id,
+        position.pos_side,
+        position.mgn_mode,
+    )
+
+
+def _position_history_note_key(profile_name: str, environment: str, item: OkxPositionHistoryItem) -> str:
+    side = _normalize_position_note_side(item.pos_side or item.direction)
+    return "|".join(
+        (
+            profile_name.strip(),
+            environment.strip().lower(),
+            str(item.update_time or 0),
+            item.inst_id.strip().upper(),
+            _normalize_position_note_margin_mode(item.mgn_mode),
+            side,
+            str(item.close_size) if item.close_size is not None else "",
+            str(item.close_avg_price) if item.close_avg_price is not None else "",
+        )
+    )
+
+
+def _build_current_position_note_record(
+    *,
+    profile_name: str,
+    environment: str,
+    position: OkxPosition,
+    note: str,
+    now_ms: int,
+    previous: dict[str, object] | None = None,
+) -> dict[str, object] | None:
+    normalized_note = _normalize_position_note_text(note)
+    if not normalized_note:
+        return None
+    linked_history_keys = previous.get("linked_history_keys", []) if isinstance(previous, dict) else []
+    linked_history_values = (
+        [str(value).strip() for value in linked_history_keys if str(value).strip()]
+        if isinstance(linked_history_keys, list)
+        else []
+    )
+    return {
+        "record_key": _position_note_current_key(profile_name, environment, position),
+        "profile_name": profile_name.strip(),
+        "environment": environment.strip().lower(),
+        "inst_id": position.inst_id.strip().upper(),
+        "pos_side": _normalize_position_note_side(position.pos_side),
+        "mgn_mode": _normalize_position_note_margin_mode(position.mgn_mode),
+        "note": normalized_note,
+        "activated_at_ms": now_ms,
+        "updated_at_ms": now_ms,
+        "missing_success_count": 0,
+        "missing_started_at_ms": None,
+        "linked_history_keys": linked_history_values,
+    }
+
+
+def _build_history_position_note_record(
+    *,
+    profile_name: str,
+    environment: str,
+    item: OkxPositionHistoryItem,
+    note: str,
+    now_ms: int,
+    source_current_key: str = "",
+    previous: dict[str, object] | None = None,
+) -> dict[str, object] | None:
+    normalized_note = _normalize_position_note_text(note)
+    if not normalized_note:
+        return None
+    record = {
+        "record_key": _position_history_note_key(profile_name, environment, item),
+        "profile_name": profile_name.strip(),
+        "environment": environment.strip().lower(),
+        "inst_id": item.inst_id.strip().upper(),
+        "update_time": item.update_time,
+        "mgn_mode": _normalize_position_note_margin_mode(item.mgn_mode),
+        "pos_side": _normalize_position_note_side(item.pos_side),
+        "direction": _normalize_position_note_side(item.direction),
+        "close_size": str(item.close_size) if item.close_size is not None else "",
+        "close_avg_price": str(item.close_avg_price) if item.close_avg_price is not None else "",
+        "note": normalized_note,
+        "source_current_key": source_current_key.strip(),
+        "updated_at_ms": now_ms,
+    }
+    if isinstance(previous, dict):
+        previous_source = str(previous.get("source_current_key", "")).strip()
+        if previous_source and not record["source_current_key"]:
+            record["source_current_key"] = previous_source
+    return record
+
+
+def _history_note_record_time_ms(record: dict[str, object]) -> int | None:
+    update_time = record.get("update_time")
+    if isinstance(update_time, int):
+        return update_time
+    if isinstance(update_time, str) and update_time.strip().isdigit():
+        return int(update_time.strip())
+    updated_at_ms = record.get("updated_at_ms")
+    if isinstance(updated_at_ms, int):
+        return updated_at_ms
+    if isinstance(updated_at_ms, str) and updated_at_ms.strip().isdigit():
+        return int(updated_at_ms.strip())
+    return None
+
+
+def _find_current_position_note_for_history_item(
+    current_notes: dict[str, dict[str, object]],
+    *,
+    profile_name: str,
+    environment: str,
+    item: OkxPositionHistoryItem,
+) -> dict[str, object] | None:
+    exact_key = _position_note_current_record_key(
+        profile_name,
+        environment,
+        item.inst_id,
+        item.pos_side or item.direction,
+        item.mgn_mode,
+    )
+    candidate = current_notes.get(exact_key)
+    if candidate is not None:
+        activated_at_ms = candidate.get("activated_at_ms")
+        if not isinstance(activated_at_ms, int) or item.update_time is None or item.update_time >= activated_at_ms:
+            return candidate
+    if item.mgn_mode:
+        return None
+    matching_candidates = [
+        record
+        for record in current_notes.values()
+        if str(record.get("profile_name", "")).strip() == profile_name.strip()
+        and str(record.get("environment", "")).strip().lower() == environment.strip().lower()
+        and str(record.get("inst_id", "")).strip().upper() == item.inst_id.strip().upper()
+        and _normalize_position_note_side(str(record.get("pos_side", "")))
+        == _normalize_position_note_side(item.pos_side or item.direction)
+    ]
+    if len(matching_candidates) != 1:
+        return None
+    candidate = matching_candidates[0]
+    activated_at_ms = candidate.get("activated_at_ms")
+    if not isinstance(activated_at_ms, int) or item.update_time is None or item.update_time >= activated_at_ms:
+        return candidate
+    return None
+
+
+def _reconcile_current_position_note_records(
+    current_notes: dict[str, dict[str, object]],
+    *,
+    profile_name: str,
+    environment: str,
+    positions: list[OkxPosition],
+    now_ms: int,
+) -> bool:
+    visible_keys = {
+        _position_note_current_key(profile_name, environment, position)
+        for position in positions
+    }
+    changed = False
+    for record in current_notes.values():
+        if str(record.get("profile_name", "")).strip() != profile_name.strip():
+            continue
+        if str(record.get("environment", "")).strip().lower() != environment.strip().lower():
+            continue
+        record_key = str(record.get("record_key", "")).strip()
+        if not record_key:
+            continue
+        if record_key in visible_keys:
+            if int(record.get("missing_success_count", 0) or 0) != 0 or record.get("missing_started_at_ms") is not None:
+                record["missing_success_count"] = 0
+                record["missing_started_at_ms"] = None
+                record["updated_at_ms"] = now_ms
+                changed = True
+            continue
+        previous_count = int(record.get("missing_success_count", 0) or 0)
+        record["missing_success_count"] = previous_count + 1
+        if previous_count == 0 or record.get("missing_started_at_ms") is None:
+            record["missing_started_at_ms"] = now_ms
+        record["updated_at_ms"] = now_ms
+        changed = True
+    return changed
+
+
+def _inherit_position_history_notes(
+    current_notes: dict[str, dict[str, object]],
+    history_notes: dict[str, dict[str, object]],
+    *,
+    profile_name: str,
+    environment: str,
+    position_history: list[OkxPositionHistoryItem],
+    now_ms: int,
+) -> bool:
+    changed = False
+    for item in position_history:
+        history_key = _position_history_note_key(profile_name, environment, item)
+        if history_key in history_notes:
+            continue
+        current_record = _find_current_position_note_for_history_item(
+            current_notes,
+            profile_name=profile_name,
+            environment=environment,
+            item=item,
+        )
+        if current_record is None:
+            continue
+        history_record = _build_history_position_note_record(
+            profile_name=profile_name,
+            environment=environment,
+            item=item,
+            note=str(current_record.get("note", "")),
+            now_ms=now_ms,
+            source_current_key=str(current_record.get("record_key", "")),
+        )
+        if history_record is None:
+            continue
+        history_notes[history_key] = history_record
+        linked_history_keys = current_record.get("linked_history_keys", [])
+        if not isinstance(linked_history_keys, list):
+            linked_history_keys = []
+        if history_key not in linked_history_keys:
+            linked_history_keys.append(history_key)
+            current_record["linked_history_keys"] = linked_history_keys
+        current_record["updated_at_ms"] = now_ms
+        changed = True
+    return changed
+
+
+def _prune_closed_current_position_notes(
+    current_notes: dict[str, dict[str, object]],
+    history_notes: dict[str, dict[str, object]],
+    *,
+    profile_name: str,
+    environment: str,
+) -> bool:
+    changed = False
+    for record_key, record in list(current_notes.items()):
+        if str(record.get("profile_name", "")).strip() != profile_name.strip():
+            continue
+        if str(record.get("environment", "")).strip().lower() != environment.strip().lower():
+            continue
+        if int(record.get("missing_success_count", 0) or 0) < 2:
+            continue
+        missing_started_at_ms = record.get("missing_started_at_ms")
+        if not isinstance(missing_started_at_ms, int):
+            continue
+        linked_history_keys = record.get("linked_history_keys", [])
+        if not isinstance(linked_history_keys, list):
+            continue
+        has_history_after_missing = False
+        for history_key in linked_history_keys:
+            history_record = history_notes.get(str(history_key))
+            if history_record is None:
+                continue
+            history_time_ms = _history_note_record_time_ms(history_record)
+            if history_time_ms is not None and history_time_ms >= missing_started_at_ms:
+                has_history_after_missing = True
+                break
+        if not has_history_after_missing:
+            continue
+        del current_notes[record_key]
+        changed = True
+    return changed
+
+
 def _filter_positions(
     positions: list[OkxPosition],
     *,
     inst_type: str,
     keyword: str,
+    note_texts: dict[str, str] | None = None,
 ) -> list[OkxPosition]:
     normalized_keyword = keyword.strip().lower()
     results: list[OkxPosition] = []
@@ -12498,6 +13264,7 @@ def _filter_positions(
                     position.pos_side,
                     position.mgn_mode,
                     _extract_asset_key(position.inst_id),
+                    note_texts.get(_position_tree_row_id(position), "") if note_texts else "",
                 )
                 if part
             )
@@ -12520,13 +13287,16 @@ def _build_position_detail_text(
     position: OkxPosition,
     upl_usdt_prices: dict[str, Decimal],
     position_instruments: dict[str, Instrument],
+    note: str = "",
 ) -> str:
     delta_value = _position_delta_value(position, position_instruments)
+    note_line = _format_position_note_detail(note)
     return (
         f"合约：{position.inst_id}\n"
         f"类型：{position.inst_type}\n"
         f"方向：{_format_pos_side(position.pos_side, position.position)}\n"
         f"持仓量：{_format_position_size(position, position_instruments)}\n"
+        f"{note_line}"
         f"可平数量：{_format_optional_decimal(position.avail_position)}\n"
         f"保证金模式：{position.mgn_mode or '-'}\n"
         f"杠杆：{_format_optional_decimal(position.leverage)}\n"
@@ -12544,7 +13314,9 @@ def _build_position_detail_text(
         f"最新价：{_format_optional_decimal(position.last_price)}\n"
         f"浮盈亏 / 浮盈≈USDT：{_format_position_unrealized_pnl(position)} / "
         f"{_format_optional_usdt(_position_unrealized_pnl_usdt(position, upl_usdt_prices))}\n"
-        f"已实现盈亏：{_format_optional_decimal_fixed(position.realized_pnl, places=5, with_sign=True)}\n"
+        f"已实现盈亏 / 已实现≈USDT："
+        f"{_format_optional_decimal_fixed(position.realized_pnl, places=5, with_sign=True)} / "
+        f"{_format_optional_usdt(_position_realized_pnl_usdt(position, upl_usdt_prices))}\n"
         f"强平价：{_format_optional_decimal(position.liquidation_price)}\n"
         f"保证金币种：{position.margin_ccy or '-'}\n"
         f"保证金率：{_format_ratio(position.margin_ratio, places=2)}\n"
@@ -12574,6 +13346,7 @@ def _build_group_detail_text(
         f"折合USDT：{_format_optional_usdt(metrics['upl_usdt'] if isinstance(metrics['upl_usdt'], Decimal) else None)}",
         f"市值：{_format_optional_approx_usdt(metrics['market_value_usdt'] if isinstance(metrics['market_value_usdt'], Decimal) else None)}",
         f"已实现盈亏：{_format_optional_decimal_fixed(metrics['realized'] if isinstance(metrics['realized'], Decimal) else None, places=pnl_places, with_sign=True)}",
+        f"已实现≈USDT：{_format_optional_usdt(metrics['realized_usdt'] if isinstance(metrics['realized_usdt'], Decimal) else None)}",
         f"初始保证金(IMR)：{_format_optional_integer(metrics['imr'] if isinstance(metrics['imr'], Decimal) else None)}",
         f"维持保证金：{_format_optional_integer(metrics['mmr'] if isinstance(metrics['mmr'], Decimal) else None)}",
         f"Greeks 汇总(PA)：Δ {_format_optional_decimal(metrics['delta'] if isinstance(metrics['delta'], Decimal) else None)}"
@@ -12765,6 +13538,7 @@ def _filter_position_history_items(
     asset: str = "",
     expiry_prefix: str = "",
     keyword: str = "",
+    note_texts_by_index: dict[int, str] | None = None,
 ) -> list[tuple[int, OkxPositionHistoryItem]]:
     normalized_inst_type = inst_type.strip().upper()
     normalized_margin_mode = margin_mode.strip().lower()
@@ -12791,6 +13565,7 @@ def _filter_position_history_items(
                     item.mgn_mode,
                     item.pos_side,
                     item.direction,
+                    note_texts_by_index.get(index, "") if note_texts_by_index else "",
                 )
                 if part
             ).lower()
@@ -13433,8 +14208,41 @@ def _format_fill_history_pnl(item: OkxFillHistoryItem) -> str:
     return _format_history_amount(item.pnl, _infer_fill_history_pnl_currency(item), with_sign=True)
 
 
+def _normalize_fill_history_exec_type(value: object) -> str:
+    text = str(value or "").strip()
+    lowered = text.lower()
+    if lowered in {"t", "m", "exercise", "delivery"}:
+        return lowered
+    if any(marker in text for marker in ("行权", "琛屾潈")) and any(
+        marker in text for marker in ("交割", "浜ゅ壊")
+    ):
+        return "exercise_delivery"
+    if "exercise" in lowered or any(marker in text for marker in ("行权", "琛屾潈")):
+        return "exercise"
+    if any(marker in lowered for marker in ("delivery", "expire", "expiration")) or any(
+        marker in text for marker in ("交割", "浜ゅ壊")
+    ):
+        return "delivery"
+    return text
+
+
+def _format_fill_history_exec_type(value: object) -> str:
+    normalized = _normalize_fill_history_exec_type(value)
+    if normalized == "t":
+        return "T"
+    if normalized == "m":
+        return "M"
+    if normalized == "exercise":
+        return "行权"
+    if normalized == "delivery":
+        return "交割"
+    if normalized == "exercise_delivery":
+        return "行权/交割"
+    return str(value or "").strip() or "-"
+
+
 def _format_fill_history_price(item: OkxFillHistoryItem) -> str:
-    if item.exec_type == "行权/交割":
+    if _normalize_fill_history_exec_type(item.exec_type) in {"exercise", "delivery", "exercise_delivery"}:
         return _format_optional_decimal_fixed(item.fill_price, places=2)
     if item.inst_type == "OPTION":
         return _format_optional_decimal(item.fill_price)
@@ -13499,7 +14307,7 @@ def _build_fill_history_detail_text(item: OkxFillHistoryItem, instruments: dict[
         f"成交量：{_format_fill_history_size(item, instruments)}\n"
         f"手续费：{_format_optional_decimal(item.fill_fee)} {item.fee_currency or ''}\n"
         f"已实现盈亏：{_format_fill_history_pnl(item)}\n"
-        f"成交类型：{item.exec_type or '-'}\n"
+        f"成交类型：{_format_fill_history_exec_type(item.exec_type)}\n"
         f"订单ID：{item.order_id or '-'}\n"
         f"成交ID：{item.trade_id or '-'}"
     )
@@ -13509,11 +14317,14 @@ def _build_position_history_detail_text(
     item: OkxPositionHistoryItem,
     upl_usdt_prices: dict[str, Decimal],
     instruments: dict[str, Instrument],
+    note: str = "",
 ) -> str:
+    note_line = _format_position_note_detail(note)
     return (
         f"更新时间：{_format_okx_ms_timestamp(item.update_time)}\n"
         f"合约：{item.inst_id or '-'}\n"
         f"类型：{item.inst_type or '-'}\n"
+        f"{note_line}"
         f"保证金模式：{_format_margin_mode(item.mgn_mode or '')}\n"
         f"方向：{_format_history_side(None, item.pos_side or item.direction)}\n"
         f"开仓均价：{_format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type)}\n"

@@ -245,6 +245,16 @@ def trader_open_slots(slots: list[TraderSlotRecord], trader_id: str) -> list[Tra
     ]
 
 
+def _trader_slot_counts_as_realized_close(slot: TraderSlotRecord) -> bool:
+    return slot.closed_at is not None and slot.status in {"closed_profit", "closed_loss", "closed_manual"}
+
+
+def _trader_slot_effective_net_pnl(slot: TraderSlotRecord) -> Decimal | None:
+    if not _trader_slot_counts_as_realized_close(slot):
+        return None
+    return slot.net_pnl if slot.net_pnl is not None else Decimal("0")
+
+
 def trader_used_quota_steps(slots: list[TraderSlotRecord], trader_id: str) -> int:
     return sum(1 for item in trader_slots_for(slots, trader_id) if item.quota_occupied)
 
@@ -268,18 +278,18 @@ def trader_open_position_summary(slots: list[TraderSlotRecord], trader_id: str) 
 def trader_realized_net_pnl(slots: list[TraderSlotRecord], trader_id: str) -> Decimal:
     return sum(
         (
-            (item.net_pnl or Decimal("0"))
+            (_trader_slot_effective_net_pnl(item) or Decimal("0"))
             for item in trader_slots_for(slots, trader_id)
-            if item.closed_at is not None and item.net_pnl is not None
+            if _trader_slot_counts_as_realized_close(item)
         ),
         Decimal("0"),
     )
 
 
 def trader_realized_close_counts(slots: list[TraderSlotRecord], trader_id: str) -> tuple[int, int, int]:
-    closed = [item for item in trader_slots_for(slots, trader_id) if item.closed_at is not None and item.net_pnl is not None]
-    wins = sum(1 for item in closed if (item.net_pnl or Decimal("0")) > 0)
-    losses = sum(1 for item in closed if (item.net_pnl or Decimal("0")) <= 0)
+    closed = [item for item in trader_slots_for(slots, trader_id) if _trader_slot_counts_as_realized_close(item)]
+    wins = sum(1 for item in closed if (_trader_slot_effective_net_pnl(item) or Decimal("0")) > 0)
+    losses = sum(1 for item in closed if (_trader_slot_effective_net_pnl(item) or Decimal("0")) <= 0)
     return len(closed), wins, losses
 
 
