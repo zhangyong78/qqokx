@@ -260,6 +260,7 @@ RUN_MODE_OPTIONS = {
     "交易并下单": "trade",
     "只发信号邮件": "signal_only",
 }
+RUNNING_SESSION_FILTER_OPTIONS = ("全部", "普通量化", "交易员策略", "信号观察台")
 POSITION_TYPE_OPTIONS = {
     "全部类型": "",
     "永续 SWAP": "SWAP",
@@ -1469,6 +1470,7 @@ class QuantApp:
         self.notify_trade_fills = BooleanVar(value=True)
         self.notify_signals = BooleanVar(value=True)
         self.notify_errors = BooleanVar(value=True)
+        self.running_session_filter = StringVar(value="全部")
         self.position_type_filter = StringVar(value="全部类型")
         self.position_keyword = StringVar()
         self.pending_order_type_filter = StringVar(value="全部类型")
@@ -1916,31 +1918,57 @@ class QuantApp:
             column=0,
             sticky="w",
         )
+        ttk.Label(running_header, text="筛选").grid(row=0, column=1, sticky="e", padx=(12, 6))
+        running_session_filter_combo = ttk.Combobox(
+            running_header,
+            textvariable=self.running_session_filter,
+            values=RUNNING_SESSION_FILTER_OPTIONS,
+            state="readonly",
+            width=14,
+        )
+        running_session_filter_combo.grid(row=0, column=2, sticky="e")
+        running_session_filter_combo.bind("<<ComboboxSelected>>", self._on_running_session_filter_changed)
 
         self.session_tree = ttk.Treeview(
             running_frame,
-            columns=("api", "strategy", "symbol", "direction", "mode", "live_pnl", "pnl", "status", "started"),
+            columns=(
+                "api",
+                "source_type",
+                "strategy",
+                "symbol",
+                "bar",
+                "direction",
+                "mode",
+                "live_pnl",
+                "pnl",
+                "status",
+                "started",
+            ),
             show="headings",
             selectmode="browse",
         )
         self.session_tree.heading("api", text="API")
+        self.session_tree.heading("source_type", text="来源类型")
         self.session_tree.heading("strategy", text="策略")
         self.session_tree.heading("symbol", text="标的")
+        self.session_tree.heading("bar", text="周期")
         self.session_tree.heading("direction", text="方向")
         self.session_tree.heading("mode", text="模式")
         self.session_tree.heading("live_pnl", text="实时浮盈亏")
         self.session_tree.heading("pnl", text="净盈亏")
         self.session_tree.heading("status", text="状态")
         self.session_tree.heading("started", text="启动时间")
-        self.session_tree.column("api", width=96, anchor="center")
-        self.session_tree.column("strategy", width=130, anchor="w")
-        self.session_tree.column("symbol", width=180, anchor="w")
-        self.session_tree.column("direction", width=90, anchor="center")
-        self.session_tree.column("mode", width=110, anchor="center")
-        self.session_tree.column("live_pnl", width=120, anchor="e")
+        self.session_tree.column("api", width=88, anchor="center")
+        self.session_tree.column("source_type", width=108, anchor="center")
+        self.session_tree.column("strategy", width=128, anchor="w")
+        self.session_tree.column("symbol", width=168, anchor="w")
+        self.session_tree.column("bar", width=76, anchor="center")
+        self.session_tree.column("direction", width=82, anchor="center")
+        self.session_tree.column("mode", width=104, anchor="center")
+        self.session_tree.column("live_pnl", width=118, anchor="e")
         self.session_tree.column("pnl", width=110, anchor="e")
         self.session_tree.column("status", width=120, anchor="center")
-        self.session_tree.column("started", width=120, anchor="center")
+        self.session_tree.column("started", width=110, anchor="center")
         self.session_tree.grid(row=1, column=0, sticky="nsew")
         self.session_tree.bind("<<TreeviewSelect>>", self._on_session_selected)
         self.session_tree.tag_configure("duplicate_conflict", background="#fff4e5", foreground="#a85a00")
@@ -6415,6 +6443,7 @@ class QuantApp:
             trader_resumer=self.resume_trader_draft,
             trader_flattener=self.flatten_trader_draft,
             symbol_provider=self._trader_desk_symbol_choices,
+            runtime_snapshot_provider=self._trader_runtime_snapshot_for_ui,
         )
 
     def open_deribit_volatility_monitor_window(self) -> None:
@@ -7284,6 +7313,51 @@ class QuantApp:
             events=list(self._trader_desk_events),
         )
 
+    @staticmethod
+    def _session_runtime_snapshot_for_ui(session: StrategySession) -> dict[str, object]:
+        return {
+            "session_id": session.session_id,
+            "runtime_status": session.display_status or session.status,
+            "last_message": session.last_message,
+            "started_at": session.started_at,
+            "ended_reason": session.ended_reason,
+            "is_running": bool(session.engine.is_running or session.stop_cleanup_in_progress),
+            "log_file_path": str(session.log_file_path) if session.log_file_path is not None else "",
+        }
+
+    def _trader_runtime_snapshot_for_ui(self, trader_id: str) -> dict[str, object] | None:
+        normalized = trader_id.strip()
+        if not normalized:
+            return None
+        run = self._trader_desk_run_by_id(normalized)
+        preferred_session_id = run.armed_session_id if run is not None else ""
+        sessions = [session for session in self.sessions.values() if session.trader_id == normalized]
+        if preferred_session_id:
+            for session in sessions:
+                if session.session_id == preferred_session_id:
+                    return self._session_runtime_snapshot_for_ui(session)
+        if sessions:
+            sessions.sort(
+                key=lambda item: (
+                    1 if (item.engine.is_running or item.stop_cleanup_in_progress) else 0,
+                    item.started_at,
+                    item.session_id,
+                ),
+                reverse=True,
+            )
+            return self._session_runtime_snapshot_for_ui(sessions[0])
+        if preferred_session_id:
+            return {
+                "session_id": preferred_session_id,
+                "runtime_status": "未找到活动会话",
+                "last_message": "",
+                "started_at": None,
+                "ended_reason": "当前交易员记录里保留了 watcher 会话号，但主界面里已经找不到这条会话。",
+                "is_running": False,
+                "log_file_path": "",
+            }
+        return None
+
     def _trader_desk_draft_by_id(self, trader_id: str) -> TraderDraftRecord | None:
         normalized = trader_id.strip()
         if not normalized:
@@ -7397,6 +7471,7 @@ class QuantApp:
         draft = self._trader_desk_draft_by_id(trader_id)
         if draft is None:
             raise ValueError("未找到对应的交易员草稿。")
+        self._cleanup_stale_trader_watchers(trader_id)
         active_sessions = [
             session
             for session in self.sessions.values()
@@ -7549,7 +7624,11 @@ class QuantApp:
         draft.updated_at = now
         self._trader_desk_add_event(
             trader_id,
-            f"已启动 watcher | 会话={session_id} | 剩余额度格={trader_remaining_quota_steps(draft, self._trader_desk_slots)}",
+            "已启动 watcher"
+            f" | 会话={session_id}"
+            f" | 周期={config.bar}"
+            f" | 固定数量={format_decimal(draft.unit_quota)}"
+            f" | 剩余额度格={trader_remaining_quota_steps(draft, self._trader_desk_slots)}",
         )
         self._save_trader_desk_snapshot()
         return True
@@ -7561,6 +7640,7 @@ class QuantApp:
             return
         if run.status not in {"running", "quota_exhausted"}:
             return
+        self._cleanup_stale_trader_watchers(trader_id)
         if trader_has_watching_slot(self._trader_desk_slots, trader_id):
             return
         remaining = trader_remaining_quota_steps(draft, self._trader_desk_slots)
@@ -7577,6 +7657,33 @@ class QuantApp:
             run.paused_reason = ""
             run.updated_at = datetime.now()
         self._trader_desk_start_slot(trader_id)
+
+    def _cleanup_stale_trader_watchers(self, trader_id: str) -> None:
+        run = self._trader_desk_run_by_id(trader_id, create=True)
+        if run is None:
+            return
+        changed = False
+        now = datetime.now()
+        for slot in self._trader_desk_slots_for_statuses(trader_id, {"watching"}):
+            session = self.sessions.get(slot.session_id)
+            if session is not None and (session.engine.is_running or session.stop_cleanup_in_progress or session.status in {"运行中", "停止中", "恢复中"}):
+                continue
+            slot.status = "stopped"
+            slot.closed_at = slot.closed_at or now
+            slot.released_at = slot.released_at or now
+            slot.close_reason = slot.close_reason or "watcher 会话不存在或已停止"
+            if run.armed_session_id == slot.session_id:
+                run.armed_session_id = ""
+                run.last_event_at = now
+                run.updated_at = now
+            self._trader_desk_add_event(
+                trader_id,
+                f"检测到失效 watcher，已清理 | 会话={slot.session_id} | 原因={slot.close_reason}",
+                level="warning",
+            )
+            changed = True
+        if changed:
+            self._save_trader_desk_snapshot()
 
     def start_trader_draft(self, trader_id: str) -> None:
         draft = self._trader_desk_draft_by_id(trader_id)
@@ -8501,6 +8608,33 @@ class QuantApp:
         return bool(QuantApp._duplicate_launch_conflicts_for(self, session))
 
     @staticmethod
+    def _session_category_label(session: StrategySession) -> str:
+        trader_id = str(getattr(session, "trader_id", "") or "").strip()
+        if trader_id:
+            return "交易员策略"
+        config = getattr(session, "config", None)
+        run_mode = str(getattr(config, "run_mode", "") or "").strip().lower()
+        if run_mode == "signal_only":
+            return "信号观察台"
+        return "普通量化"
+
+    def _current_running_session_filter_label(self) -> str:
+        selected_filter: object = getattr(self, "running_session_filter", "全部")
+        if hasattr(selected_filter, "get"):
+            label = str(selected_filter.get() or "").strip()
+        else:
+            label = str(selected_filter or "").strip()
+        if label in RUNNING_SESSION_FILTER_OPTIONS:
+            return label
+        return "全部"
+
+    def _session_matches_running_filter(self, session: StrategySession) -> bool:
+        selected_filter = QuantApp._current_running_session_filter_label(self)
+        if selected_filter == "全部":
+            return True
+        return QuantApp._session_category_label(session) == selected_filter
+
+    @staticmethod
     def _build_duplicate_launch_conflict_warning(
         session: StrategySession,
         conflicts: list[StrategySession],
@@ -8548,11 +8682,37 @@ class QuantApp:
             parts.append(f"重复风险 {len(duplicate_groups)}组/{duplicate_sessions}条")
         if live_covered < len(active_sessions):
             parts.append(f"浮盈覆盖 {live_covered}/{len(active_sessions)}")
+        selected_filter = QuantApp._current_running_session_filter_label(self)
+        if selected_filter != "全部":
+            visible_count = sum(1 for session in active_sessions if QuantApp._session_matches_running_filter(self, session))
+            parts.append(f"当前筛选 {selected_filter} {visible_count}条")
         if latest_refresh_at is not None:
             parts.append(f"参考持仓 {latest_refresh_at.strftime('%H:%M:%S')}")
         else:
             parts.append("实时浮盈待持仓刷新")
         self.session_summary_text.set(" | ".join(parts))
+
+    def _refresh_running_session_tree(self) -> None:
+        tree = self.session_tree
+        selected_before = tree.selection()[0] if tree.selection() else None
+        for session in self.sessions.values():
+            self._upsert_session_row(session)
+
+        remaining = tuple(tree.get_children())
+        next_selection = None
+        if selected_before and tree.exists(selected_before):
+            next_selection = selected_before
+        elif remaining:
+            next_selection = remaining[0]
+        if next_selection is not None:
+            tree.selection_set(next_selection)
+            tree.focus(next_selection)
+            tree.see(next_selection)
+
+    def _on_running_session_filter_changed(self, *_: object) -> None:
+        self._refresh_running_session_summary()
+        self._refresh_running_session_tree()
+        self._refresh_selected_session_details()
 
     def _render_positions_view(self) -> None:
         selected_before = self.position_tree.selection()[0] if self.position_tree.selection() else None
@@ -9887,12 +10047,20 @@ class QuantApp:
         self._ensure_trader_watcher(trader_id)
 
     def _upsert_session_row(self, session: StrategySession) -> None:
+        if not QuantApp._session_matches_running_filter(self, session):
+            if self.session_tree.exists(session.session_id):
+                self.session_tree.delete(session.session_id)
+            return
         live_pnl, _ = self._session_live_pnl_snapshot(session)
+        source_type = QuantApp._session_category_label(session)
+        bar_label = str(getattr(getattr(session, "config", None), "bar", "") or "").strip() or "-"
         tags = ("duplicate_conflict",) if QuantApp._session_has_duplicate_launch_conflict(self, session) else ()
         values = (
             session.api_name or "-",
+            source_type,
             session.strategy_name,
             session.symbol,
+            bar_label,
             session.direction_label,
             session.run_mode_label,
             _format_optional_usdt_precise(live_pnl, places=2),

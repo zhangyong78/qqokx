@@ -9,7 +9,7 @@ from tkinter import messagebox, ttk
 from typing import Callable
 
 from okx_quant.pricing import format_decimal, format_decimal_fixed
-from okx_quant.strategy_catalog import supports_trader_desk
+from okx_quant.strategy_catalog import get_strategy_definition, is_dynamic_strategy_id, supports_trader_desk
 from okx_quant.trader_desk import (
     TRADER_DRAFT_STATUS_VALUES,
     TRADER_GATE_CONDITION_VALUES,
@@ -36,6 +36,7 @@ DraftSaver = Callable[[TraderDraftRecord], None]
 DraftDeleter = Callable[[str], None]
 TraderAction = Callable[[str], None]
 SymbolProvider = Callable[[], list[str]]
+RuntimeSnapshotProvider = Callable[[str], dict[str, object] | None]
 
 
 PRICE_TYPE_VALUES: tuple[str, ...] = ("mark", "last", "index")
@@ -47,6 +48,14 @@ GATE_CONDITION_LABELS: dict[str, str] = {
 }
 GATE_CONDITION_LABEL_TO_VALUE: dict[str, str] = {
     label: value for value, label in GATE_CONDITION_LABELS.items()
+}
+DRAFT_STATUS_LABELS: dict[str, str] = {
+    "draft": "草稿中",
+    "ready": "可启动",
+    "paused": "已暂停",
+}
+DRAFT_STATUS_LABEL_TO_VALUE: dict[str, str] = {
+    label: value for value, label in DRAFT_STATUS_LABELS.items()
 }
 
 
@@ -152,6 +161,12 @@ def _payload_signal_symbol(payload: dict[str, object]) -> str:
     return local_symbol or signal_symbol
 
 
+def _payload_bar(payload: dict[str, object]) -> str:
+    config = _payload_config_snapshot(payload)
+    bar = str(config.get("bar") or "").strip()
+    return bar or "-"
+
+
 def _format_optional_decimal(value: Decimal | None) -> str:
     if value is None:
         return "-"
@@ -183,6 +198,160 @@ def _gate_condition_value(value: str) -> str:
     return "always"
 
 
+def _draft_status_label(value: str) -> str:
+    normalized = str(value or "").strip()
+    if normalized in DRAFT_STATUS_LABELS:
+        return DRAFT_STATUS_LABELS[normalized]
+    if normalized in DRAFT_STATUS_LABEL_TO_VALUE:
+        return normalized
+    return DRAFT_STATUS_LABELS["draft"]
+
+
+def _draft_status_value(value: str) -> str:
+    normalized = str(value or "").strip()
+    if normalized in DRAFT_STATUS_LABEL_TO_VALUE:
+        return DRAFT_STATUS_LABEL_TO_VALUE[normalized]
+    if normalized in DRAFT_STATUS_LABELS:
+        return normalized
+    return "draft"
+
+
+def _snapshot_text(snapshot: dict[str, object], key: str, default: str = "-") -> str:
+    value = str(snapshot.get(key) or "").strip()
+    if value:
+        return value
+    return default
+
+
+def _bool_label(value: object) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return "开启" if normalized in {"1", "true", "yes", "on", "开启"} else "关闭"
+    return "开启" if bool(value) else "关闭"
+
+
+def _entry_reference_ema_label(snapshot: dict[str, object]) -> str:
+    raw_period = str(snapshot.get("entry_reference_ema_period") or "").strip()
+    if raw_period.isdigit() and int(raw_period) > 0:
+        return f"EMA{int(raw_period)}"
+    ema_period = _snapshot_text(snapshot, "ema_period")
+    return f"跟随EMA小周期(EMA{ema_period})"
+
+
+def _startup_chase_window_label(snapshot: dict[str, object]) -> str:
+    raw_value = str(snapshot.get("startup_chase_window_seconds") or "").strip()
+    if raw_value.isdigit() and int(raw_value) > 0:
+        return f"{int(raw_value)}秒"
+    return "关闭（启动不追老信号）"
+
+
+def _gate_summary_text(draft: TraderDraftRecord) -> str:
+    gate = draft.gate
+    if not gate.enabled:
+        return "关闭"
+    parts = [
+        _gate_condition_label(gate.condition),
+        f"标的={gate.trigger_inst_id or '-'}",
+        f"价格类型={gate.trigger_price_type or 'mark'}",
+    ]
+    if gate.lower_price is not None:
+        parts.append(f"下限={_normalize_decimal_text(gate.lower_price)}")
+    if gate.upper_price is not None:
+        parts.append(f"上限={_normalize_decimal_text(gate.upper_price)}")
+    return " | ".join(parts)
+
+
+def _build_trader_strategy_lines(
+    draft: TraderDraftRecord,
+    *,
+    runtime_snapshot: dict[str, object] | None = None,
+) -> list[str]:
+    payload = draft.template_payload
+    snapshot = _payload_config_snapshot(payload)
+    strategy_id = str(payload.get("strategy_id") or snapshot.get("strategy_id") or "").strip()
+    direction_label = str(payload.get("direction_label") or "-").strip() or "-"
+    run_mode_label = str(payload.get("run_mode_label") or "-").strip() or "-"
+    bar = _payload_bar(payload)
+    try:
+        definition = get_strategy_definition(strategy_id)
+    except KeyError:
+        definition = None
+
+    lines = [
+        f"策略说明：{definition.summary if definition is not None else '-'}",
+        f"开单逻辑：{definition.rule_description if definition is not None else '-'}",
+        f"参数提示：{definition.parameter_hint if definition is not None else '-'}",
+        f"K线周期：{bar}",
+        f"方向：{direction_label} | 运行模式：{run_mode_label}",
+        (
+            f"检查时机：每根 {bar} 已收盘K线确认后检查一次。"
+            if bar != "-"
+            else "检查时机：按策略轮询节奏持续检查。"
+        ),
+        f"交易员固定数量：{_normalize_decimal_text(draft.unit_quota)}",
+    ]
+
+    template_risk = str(snapshot.get("risk_amount") or "").strip()
+    if template_risk:
+        lines.append(f"模板风险金：{template_risk}（交易员模式不使用）")
+
+    lines.append(
+        "EMA参数："
+        f"小={_snapshot_text(snapshot, 'ema_period')} | "
+        f"趋势={_snapshot_text(snapshot, 'trend_ema_period')} | "
+        f"大={_snapshot_text(snapshot, 'big_ema_period')}"
+    )
+    lines.append(
+        "ATR参数："
+        f"周期={_snapshot_text(snapshot, 'atr_period')} | "
+        f"止损={_snapshot_text(snapshot, 'atr_stop_multiplier')} | "
+        f"止盈={_snapshot_text(snapshot, 'atr_take_multiplier')}"
+    )
+    if is_dynamic_strategy_id(strategy_id):
+        lines.append(f"挂单参考EMA：{_entry_reference_ema_label(snapshot)}")
+        take_profit_mode = "动态" if _snapshot_text(snapshot, "take_profit_mode", "dynamic") == "dynamic" else "固定"
+        lines.append(
+            f"止盈模式：{take_profit_mode} | "
+            f"2R保本={_bool_label(snapshot.get('dynamic_two_r_break_even', True))} | "
+            f"手续费偏移={_bool_label(snapshot.get('dynamic_fee_offset_enabled', True))}"
+        )
+        lines.append(
+            "时间保本："
+            f"{_bool_label(snapshot.get('time_stop_break_even_enabled', False))} / "
+            f"{_snapshot_text(snapshot, 'time_stop_break_even_bars', '0')}根"
+        )
+        lines.append(f"启动追单窗口：{_startup_chase_window_label(snapshot)}")
+    lines.append(
+        f"止盈止损模式：{_snapshot_text(snapshot, 'tp_sl_mode')} | "
+        f"轮询秒数：{_snapshot_text(snapshot, 'poll_seconds')}"
+    )
+    lines.append(f"价格开关：{_gate_summary_text(draft)}")
+
+    if runtime_snapshot:
+        session_id = str(runtime_snapshot.get("session_id") or "-").strip() or "-"
+        runtime_status = str(runtime_snapshot.get("runtime_status") or "-").strip() or "-"
+        thread_status = "运行中" if bool(runtime_snapshot.get("is_running")) else "已停止"
+        lines.append("")
+        lines.append("当前 watcher：")
+        lines.append(f"会话：{session_id} | 状态：{runtime_status} | 线程：{thread_status}")
+        started_at = runtime_snapshot.get("started_at")
+        if isinstance(started_at, datetime):
+            lines.append(f"会话启动：{started_at:%Y-%m-%d %H:%M:%S}")
+        last_message = str(runtime_snapshot.get("last_message") or "").strip()
+        ended_reason = str(runtime_snapshot.get("ended_reason") or "").strip()
+        if last_message:
+            lines.append(f"最近日志：{last_message}")
+        elif ended_reason:
+            lines.append(f"结束原因：{ended_reason}")
+        else:
+            lines.append("最近日志：-")
+    else:
+        lines.append("")
+        lines.append("当前 watcher：暂无活动会话")
+
+    return lines
+
+
 class TraderDeskWindow:
     def __init__(
         self,
@@ -201,6 +370,7 @@ class TraderDeskWindow:
         trader_resumer: TraderAction,
         trader_flattener: TraderAction,
         symbol_provider: SymbolProvider,
+        runtime_snapshot_provider: RuntimeSnapshotProvider,
     ) -> None:
         self._logger = logger
         self._current_template_factory = current_template_factory
@@ -215,19 +385,21 @@ class TraderDeskWindow:
         self._trader_resumer = trader_resumer
         self._trader_flattener = trader_flattener
         self._symbol_provider = symbol_provider
+        self._runtime_snapshot_provider = runtime_snapshot_provider
         self._refresh_job: str | None = None
         self._trader_counter = 0
         self._snapshot = TraderDeskSnapshot()
         self._form_dirty = False
         self._suspend_form_tracking = False
         self._loaded_trader_id = ""
+        self._pending_delete_trader_id = ""
 
         self._status_text = StringVar(value="草稿 0 条 | 运行中 0 条")
         self._summary_text = StringVar(value="交易员策略会固定数量下单，并按额度格持续补 watcher。")
         self.total_quota_var = StringVar(value="1")
         self.unit_quota_var = StringVar(value="0.1")
         self.quota_steps_var = StringVar(value="10")
-        self.status_var = StringVar(value="draft")
+        self.status_var = StringVar(value=_draft_status_label("draft"))
         self.notes_var = StringVar(value="")
         self.auto_restart_on_profit_var = BooleanVar(value=True)
         self.pause_on_stop_loss_var = BooleanVar(value=True)
@@ -342,17 +514,17 @@ class TraderDeskWindow:
 
         toolbar = ttk.Frame(left)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        ttk.Button(toolbar, text="加入当前参数", command=self.add_current_template).grid(row=0, column=0)
-        ttk.Button(toolbar, text="保存当前草稿", command=self.save_selected_draft).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(toolbar, text="招募交易员", command=self.add_current_template).grid(row=0, column=0)
+        ttk.Button(toolbar, text="保存交易规则", command=self.save_selected_draft).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(toolbar, text="启动", command=self.start_selected_trader).grid(row=0, column=2, padx=(8, 0))
         ttk.Button(toolbar, text="暂停", command=self.pause_selected_trader).grid(row=0, column=3, padx=(8, 0))
         ttk.Button(toolbar, text="恢复", command=self.resume_selected_trader).grid(row=0, column=4, padx=(8, 0))
         ttk.Button(toolbar, text="手动平仓", command=self.flatten_selected_trader).grid(row=0, column=5, padx=(8, 0))
-        ttk.Button(toolbar, text="删除草稿", command=self.delete_selected_draft).grid(row=0, column=6, padx=(8, 0))
+        ttk.Button(toolbar, text="辞退交易员", command=self.delete_selected_draft).grid(row=0, column=6, padx=(8, 0))
 
         self.tree = ttk.Treeview(
             left,
-            columns=("trader", "strategy", "symbol", "api", "run", "quota", "avg", "pnl", "updated"),
+            columns=("trader", "strategy", "bar", "symbol", "api", "run", "quota", "avg", "pnl", "updated"),
             show="headings",
             selectmode="browse",
             height=22,
@@ -362,7 +534,8 @@ class TraderDeskWindow:
         for column, text, width, anchor in (
             ("trader", "交易员", 80, "center"),
             ("strategy", "策略", 170, "w"),
-            ("symbol", "交易/触发", 180, "w"),
+            ("bar", "周期", 70, "center"),
+            ("symbol", "交易/触发", 170, "w"),
             ("api", "API", 80, "center"),
             ("run", "运行状态", 110, "center"),
             ("quota", "额度格", 110, "center"),
@@ -387,11 +560,11 @@ class TraderDeskWindow:
         ttk.Entry(right_top, textvariable=self.unit_quota_var).grid(row=1, column=1, sticky="ew", pady=(8, 0))
         ttk.Label(right_top, text="额度次数").grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(right_top, textvariable=self.quota_steps_var).grid(row=2, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(right_top, text="草稿状态").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(right_top, text="规则状态").grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Combobox(
             right_top,
             textvariable=self.status_var,
-            values=TRADER_DRAFT_STATUS_VALUES,
+            values=tuple(_draft_status_label(value) for value in TRADER_DRAFT_STATUS_VALUES),
             state="readonly",
         ).grid(row=3, column=1, sticky="ew", pady=(8, 0))
         ttk.Checkbutton(right_top, text="盈利后自动补位", variable=self.auto_restart_on_profit_var).grid(
@@ -460,8 +633,11 @@ class TraderDeskWindow:
         right_bottom.rowconfigure(4, weight=1)
 
         ttk.Label(right_bottom, textvariable=self._summary_text, justify="left").grid(row=0, column=0, sticky="w")
-        self.detail_text = Text(right_bottom, height=6, wrap="word", font=("Consolas", 10), relief="flat")
+        self.detail_text = Text(right_bottom, height=8, wrap="word", font=("Consolas", 10), relief="flat")
         self.detail_text.grid(row=1, column=0, sticky="ew", pady=(8, 10))
+        detail_scroll = ttk.Scrollbar(right_bottom, orient="vertical", command=self.detail_text.yview)
+        detail_scroll.grid(row=1, column=1, sticky="ns", pady=(8, 10))
+        self.detail_text.configure(yscrollcommand=detail_scroll.set)
 
         self.slot_tree = ttk.Treeview(
             right_bottom,
@@ -537,6 +713,13 @@ class TraderDeskWindow:
     def _append_log(self, message: str) -> None:
         self._logger(f"[交易员管理台] {message}")
 
+    def _clear_pending_delete(self, trader_id: str, *, reason: str = "") -> None:
+        if self._pending_delete_trader_id != trader_id:
+            return
+        self._pending_delete_trader_id = ""
+        if reason:
+            self._append_log(f"[{trader_id}] 已取消自动删除：{reason}")
+
     def add_current_template(self) -> None:
         try:
             template = self._current_template_factory()
@@ -571,7 +754,7 @@ class TraderDeskWindow:
         except Exception as exc:
             messagebox.showerror("加入失败", str(exc), parent=self.window)
             return
-        self._append_log(f"[{draft.trader_id}] 已加入当前参数。")
+        self._append_log(f"[{draft.trader_id}] 已招募交易员。")
         self._refresh_views(select_id=draft.trader_id)
 
     def clone_selected_to_target(self) -> None:
@@ -632,13 +815,39 @@ class TraderDeskWindow:
     def delete_selected_draft(self) -> None:
         draft = self._selected_draft()
         if draft is None:
-            messagebox.showinfo("提示", "请先选中要删除的草稿。", parent=self.window)
+            messagebox.showinfo("提示", "请先选中要辞退的交易员。", parent=self.window)
+            return
+        slots = trader_slots_for(self._snapshot.slots, draft.trader_id)
+        open_slots = [slot for slot in slots if slot.status == "open"]
+        watching_slots = [slot for slot in slots if slot.status == "watching"]
+        run_status = self._selected_run_status(draft.trader_id)
+        if open_slots:
+            messagebox.showerror("辞退失败", "该交易员仍有持仓中的额度格，请先手动平仓。", parent=self.window)
             return
         try:
             self._draft_deleter(draft.trader_id)
         except Exception as exc:
-            messagebox.showerror("删除失败", str(exc), parent=self.window)
+            message = str(exc)
+            if (
+                "仍有关联会话在运行" in message or "仍有活动中的额度格" in message
+            ) and (watching_slots or run_status in {"running", "quota_exhausted", "paused_manual", "stopped"}):
+                try:
+                    self._trader_pauser(draft.trader_id)
+                except Exception as pause_exc:
+                    messagebox.showerror("辞退失败", f"{message}\n\n同时自动停止 watcher 失败：{pause_exc}", parent=self.window)
+                    return
+                self._pending_delete_trader_id = draft.trader_id
+                self._append_log(f"[{draft.trader_id}] 已请求停止 watcher，清理完成后将自动辞退交易员。")
+                self._refresh_views(select_id=draft.trader_id)
+                messagebox.showinfo(
+                    "辞退处理中",
+                    "已先停止该交易员的 watcher。\n\n等待委托/槽位清理完成后，会自动辞退这名交易员。",
+                    parent=self.window,
+                )
+                return
+            messagebox.showerror("辞退失败", str(exc), parent=self.window)
             return
+        self._clear_pending_delete(draft.trader_id)
         self._refresh_views()
 
     def save_selected_draft(self) -> None:
@@ -651,7 +860,7 @@ class TraderDeskWindow:
                 total_quota=self.total_quota_var.get(),
                 unit_quota=self.unit_quota_var.get(),
                 quota_steps=self.quota_steps_var.get(),
-                status=self.status_var.get(),
+                status=_draft_status_value(self.status_var.get()),
                 gate_enabled=bool(self.gate_enabled_var.get()),
                 gate_condition=_gate_condition_value(self.gate_condition_var.get()),
                 gate_trigger_inst_id=self.gate_trigger_inst_id_var.get(),
@@ -679,7 +888,8 @@ class TraderDeskWindow:
         except Exception as exc:
             messagebox.showerror("保存失败", str(exc), parent=self.window)
             return
-        self._append_log(f"[{updated.trader_id}] 已保存。")
+        self._clear_pending_delete(updated.trader_id, reason="你又手动保存了这条草稿")
+        self._append_log(f"[{updated.trader_id}] 已保存交易规则。")
         self._refresh_views(select_id=updated.trader_id)
 
     def start_selected_trader(self) -> None:
@@ -704,6 +914,8 @@ class TraderDeskWindow:
         except Exception as exc:
             messagebox.showerror(f"{title}失败", str(exc), parent=self.window)
             return
+        if title in {"启动", "暂停", "恢复", "平仓"}:
+            self._clear_pending_delete(draft.trader_id, reason=f"你手动执行了{title}")
         self._append_log(f"[{draft.trader_id}] {success_text}。")
         self._refresh_views(select_id=draft.trader_id)
 
@@ -733,7 +945,7 @@ class TraderDeskWindow:
                 self.total_quota_var.set("1")
                 self.unit_quota_var.set("0.1")
                 self.quota_steps_var.set("10")
-                self.status_var.set("draft")
+                self.status_var.set(_draft_status_label("draft"))
                 self.notes_var.set("")
                 self.auto_restart_on_profit_var.set(True)
                 self.pause_on_stop_loss_var.set(True)
@@ -750,7 +962,7 @@ class TraderDeskWindow:
                 self.total_quota_var.set(_normalize_decimal_text(draft.total_quota))
                 self.unit_quota_var.set(_normalize_decimal_text(draft.unit_quota))
                 self.quota_steps_var.set(str(draft.quota_steps))
-                self.status_var.set(draft.status)
+                self.status_var.set(_draft_status_label(draft.status))
                 self.notes_var.set(draft.notes)
                 self.auto_restart_on_profit_var.set(draft.auto_restart_on_profit)
                 self.pause_on_stop_loss_var.set(draft.pause_on_stop_loss)
@@ -797,6 +1009,7 @@ class TraderDeskWindow:
                 values=(
                     draft.trader_id,
                     _strategy_label_from_payload(draft.template_payload),
+                    _payload_bar(draft.template_payload),
                     str(draft.template_payload.get("symbol") or "-"),
                     str(draft.template_payload.get("api_name") or "-"),
                     run_status,
@@ -875,9 +1088,21 @@ class TraderDeskWindow:
         remaining = trader_remaining_quota_steps(draft, self._snapshot.slots)
         realized_pnl = trader_realized_net_pnl(self._snapshot.slots, trader_id)
         loss_slots = [slot for slot in slots if slot.status == "closed_loss"][:8]
+        runtime_snapshot = self._runtime_snapshot_provider(trader_id)
+        runtime_status = ""
+        runtime_session_id = ""
+        if runtime_snapshot is not None:
+            runtime_status = str(runtime_snapshot.get("runtime_status") or "").strip()
+            runtime_session_id = str(runtime_snapshot.get("session_id") or "").strip()
         self._summary_text.set(
             f"运行状态：{run_status}"
             + (f" | 原因：{run_reason}" if run_reason else "")
+            + f" | 周期：{_payload_bar(draft.template_payload)}"
+            + (
+                f" | watcher：{runtime_session_id or '-'} {runtime_status}"
+                if runtime_session_id or runtime_status
+                else ""
+            )
             + f" | 额度：已用 {used}/{draft.quota_steps}，剩余 {remaining}"
         )
         lines = [
@@ -889,8 +1114,21 @@ class TraderDeskWindow:
             f"当前持仓：{open_count} 单 | 均价={_format_optional_decimal(average_entry)} | 总数量={_format_optional_decimal(total_size)}",
             f"累计结果：平仓 {close_count} 单 | 盈利 {win_count} | 亏损 {loss_count} | 净盈亏={_format_optional_pnl(realized_pnl)}",
             "",
-            "最近亏损单：",
         ]
+        if any(slot.status == "watching" for slot in slots) and open_count == 0:
+            lines.append("当前阶段：观察中，尚未开仓；只有满足策略条件后才会真正挂单。")
+            lines.append("")
+        lines.extend(
+            [
+                *_build_trader_strategy_lines(draft, runtime_snapshot=runtime_snapshot),
+                "",
+            ]
+        )
+        lines.extend(
+            [
+            "最近亏损单：",
+            ]
+        )
         if not loss_slots:
             lines.append("- 暂无")
         else:
@@ -920,6 +1158,11 @@ class TraderDeskWindow:
             form_dirty=self._form_dirty,
         )
         self._load_snapshot()
+        if self._pending_delete_trader_id:
+            pending_before = self._pending_delete_trader_id
+            self._try_complete_pending_delete()
+            if self._pending_delete_trader_id != pending_before:
+                self._load_snapshot()
         running_count = self._refresh_trader_tree(select_id=select_id)
         self._status_text.set(f"草稿 {len(self._snapshot.drafts)} 条 | 运行中 {running_count} 条")
         if reload_form:
@@ -927,6 +1170,22 @@ class TraderDeskWindow:
         self._refresh_slot_tree()
         self._refresh_event_text()
         self._refresh_detail_text()
+
+    def _try_complete_pending_delete(self) -> None:
+        trader_id = self._pending_delete_trader_id.strip()
+        if not trader_id:
+            return
+        try:
+            self._draft_deleter(trader_id)
+        except Exception as exc:
+            message = str(exc)
+            if "仍有关联会话在运行" in message or "仍有活动中的额度格" in message:
+                return
+            self._append_log(f"[{trader_id}] 自动辞退失败：{exc}")
+            self._pending_delete_trader_id = ""
+            return
+        self._append_log(f"[{trader_id}] 已自动辞退交易员。")
+        self._pending_delete_trader_id = ""
 
     def _schedule_refresh(self) -> None:
         if not self.window.winfo_exists():

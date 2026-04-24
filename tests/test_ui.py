@@ -525,6 +525,8 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         QuantApp._upsert_session_row(app, session)
 
         self.assertEqual(app.session_tree.rows["S01"]["tags"], ("duplicate_conflict",))
+        self.assertEqual(app.session_tree.rows["S01"]["values"][1], "普通量化")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][4], "1H")
 
     def test_finish_strategy_template_import_warns_and_skips_start_when_duplicate_exists(self) -> None:
         duplicate_session = SimpleNamespace(
@@ -712,6 +714,76 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(events[0][1], "error")
         self.assertIn("watcher 异常结束", events[0][2])
 
+    def test_cleanup_stale_trader_watchers_marks_missing_session_as_stopped(self) -> None:
+        run = TraderRunState(trader_id="T001", status="running", armed_session_id="S01")
+        slot = TraderSlotRecord(
+            slot_id="slot-1",
+            trader_id="T001",
+            session_id="S01",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="BTC-USDT-SWAP",
+            status="watching",
+        )
+        events: list[tuple[str, str, str]] = []
+        app = SimpleNamespace(
+            sessions={},
+            _trader_desk_run_by_id=lambda trader_id, create=False: run,
+            _trader_desk_slots_for_statuses=lambda trader_id, statuses: [slot] if "watching" in statuses else [],
+            _trader_desk_add_event=lambda trader_id, message, level="info": events.append((trader_id, level, message)),
+            _save_trader_desk_snapshot=MagicMock(),
+        )
+
+        QuantApp._cleanup_stale_trader_watchers(app, "T001")
+
+        self.assertEqual(slot.status, "stopped")
+        self.assertEqual(slot.close_reason, "watcher 会话不存在或已停止")
+        self.assertEqual(run.armed_session_id, "")
+        app._save_trader_desk_snapshot.assert_called_once()
+        self.assertEqual(events[0][0], "T001")
+        self.assertEqual(events[0][1], "warning")
+        self.assertIn("检测到失效 watcher", events[0][2])
+
+    def test_delete_trader_desk_draft_cleans_stale_watchers_before_delete(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload={"strategy_id": "ema_dynamic_long"},
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+        )
+        slot = TraderSlotRecord(
+            slot_id="slot-1",
+            trader_id="T001",
+            session_id="S01",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="BTC-USDT-SWAP",
+            status="watching",
+        )
+
+        def _cleanup(_trader_id: str) -> None:
+            slot.status = "stopped"
+
+        app = SimpleNamespace(
+            _trader_desk_draft_by_id=lambda trader_id: draft,
+            _cleanup_stale_trader_watchers=MagicMock(side_effect=_cleanup),
+            sessions={},
+            _trader_desk_slots_for_statuses=lambda trader_id, statuses: [slot] if slot.status in statuses else [],
+            _trader_desk_drafts=[draft],
+            _trader_desk_runs=[],
+            _trader_desk_slots=[slot],
+            _trader_desk_events=[],
+            _save_trader_desk_snapshot=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+
+        QuantApp._delete_trader_desk_draft(app, "T001")
+
+        app._cleanup_stale_trader_watchers.assert_called_once_with("T001")
+        self.assertEqual(app._trader_desk_drafts, [])
+        app._save_trader_desk_snapshot.assert_called_once()
+
     def test_build_strategy_trade_reconciliation_result_attributes_stop_loss_and_net_pnl(self) -> None:
         session = self._make_session()
         trade = StrategyTradeRuntimeState(
@@ -869,6 +941,9 @@ class _Var:
 class _SessionTreeStub:
     def __init__(self) -> None:
         self.rows: dict[str, dict[str, object]] = {}
+        self._selection: list[str] = []
+        self.focused: str | None = None
+        self.seen: str | None = None
 
     def exists(self, iid: str) -> bool:
         return iid in self.rows
@@ -878,6 +953,29 @@ class _SessionTreeStub:
 
     def insert(self, _parent: str, _index: object, *, iid: str, values: tuple[object, ...], tags: tuple[str, ...] = ()) -> None:
         self.rows[iid] = {"values": values, "tags": tags}
+
+    def delete(self, iid: str) -> None:
+        self.rows.pop(iid, None)
+        self._selection = [item for item in self._selection if item != iid]
+        if self.focused == iid:
+            self.focused = None
+        if self.seen == iid:
+            self.seen = None
+
+    def get_children(self) -> tuple[str, ...]:
+        return tuple(self.rows.keys())
+
+    def selection(self) -> tuple[str, ...]:
+        return tuple(self._selection)
+
+    def selection_set(self, iid: str) -> None:
+        self._selection = [iid]
+
+    def focus(self, iid: str) -> None:
+        self.focused = iid
+
+    def see(self, iid: str) -> None:
+        self.seen = iid
 
 
 class SessionLivePnlSummaryTest(TestCase):
@@ -958,6 +1056,79 @@ class SessionLivePnlSummaryTest(TestCase):
         self.assertIn("净盈亏=+4.25", text)
         self.assertIn("浮盈覆盖 1/2", text)
         self.assertIn("参考持仓 19:06:00", text)
+ 
+    def test_refresh_running_session_summary_appends_visible_count_when_filtered(self) -> None:
+        trader_session = SimpleNamespace(
+            session_id="S01",
+            engine=SimpleNamespace(is_running=True),
+            stop_cleanup_in_progress=False,
+            status="运行中",
+            net_pnl_total=Decimal("2"),
+            trader_id="TR001",
+            config=SimpleNamespace(run_mode="trade"),
+        )
+        signal_session = SimpleNamespace(
+            session_id="S02",
+            engine=SimpleNamespace(is_running=True),
+            stop_cleanup_in_progress=False,
+            status="运行中",
+            net_pnl_total=Decimal("0"),
+            trader_id="",
+            config=SimpleNamespace(run_mode="signal_only"),
+        )
+        app = SimpleNamespace(
+            sessions={"S01": trader_session, "S02": signal_session},
+            _session_live_pnl_cache={"S01": (None, None), "S02": (None, None)},
+            session_summary_text=_Var(),
+            running_session_filter=_Var("交易员策略"),
+            _refresh_session_live_pnl_cache=lambda: None,
+            _session_live_pnl_snapshot=lambda session: app._session_live_pnl_cache.get(session.session_id, (None, None)),
+            _session_counts_toward_running_summary=lambda session: QuantApp._session_counts_toward_running_summary(session),
+        )
+
+        QuantApp._refresh_running_session_summary(app)
+
+        self.assertIn("当前筛选 交易员策略 1条", app.session_summary_text.get())
+
+
+class RunningSessionFilterTest(TestCase):
+    def test_session_category_label_distinguishes_regular_trader_and_signal_watch(self) -> None:
+        regular_session = SimpleNamespace(trader_id="", config=SimpleNamespace(run_mode="trade"))
+        trader_session = SimpleNamespace(trader_id="TR001", config=SimpleNamespace(run_mode="trade"))
+        signal_session = SimpleNamespace(trader_id="", config=SimpleNamespace(run_mode="signal_only"))
+
+        self.assertEqual(QuantApp._session_category_label(regular_session), "普通量化")
+        self.assertEqual(QuantApp._session_category_label(trader_session), "交易员策略")
+        self.assertEqual(QuantApp._session_category_label(signal_session), "信号观察台")
+
+    def test_upsert_session_row_hides_row_when_session_does_not_match_filter(self) -> None:
+        session = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            strategy_name="EMA 动态委托做多",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            net_pnl_total=Decimal("0"),
+            display_status="等待信号",
+            started_at=datetime(2026, 4, 24, 11, 45, 26),
+            status="运行中",
+            engine=SimpleNamespace(is_running=True),
+            config=SimpleNamespace(run_mode="trade"),
+            trader_id="",
+        )
+        tree = _SessionTreeStub()
+        tree.insert("", "end", iid="S01", values=("old",), tags=())
+        app = SimpleNamespace(
+            session_tree=tree,
+            running_session_filter=_Var("交易员策略"),
+            _session_live_pnl_snapshot=lambda _session: (None, None),
+            sessions={"S01": session},
+        )
+
+        QuantApp._upsert_session_row(app, session)
+
+        self.assertFalse(app.session_tree.exists("S01"))
 
 
 class _AfterRoot:

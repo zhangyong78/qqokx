@@ -219,8 +219,10 @@ class StrategyEngine:
     ) -> None:
         if config.signal_mode == "both":
             raise RuntimeError("EMA 动态委托策略不支持双向，请选择只做多或只做空")
-        if config.risk_amount is None or config.risk_amount <= 0:
-            raise RuntimeError("风险金必须大于 0")
+        has_risk_amount = config.risk_amount is not None and config.risk_amount > 0
+        has_fixed_size = config.order_size > 0
+        if not has_risk_amount and not has_fixed_size:
+            raise RuntimeError("风险金必须大于 0，或固定数量必须大于 0")
 
         strategy = EmaDynamicOrderStrategy()
         entry_reference_ema_period = config.resolved_entry_reference_ema_period()
@@ -251,7 +253,11 @@ class StrategyEngine:
         )
         mode_parts = [
             f"方向={_format_signal_mode(config.signal_mode)}",
-            f"风险金={format_decimal(config.risk_amount)}",
+            (
+                f"风险金={format_decimal(config.risk_amount)}"
+                if has_risk_amount
+                else f"固定数量={format_decimal(config.order_size)}"
+            ),
             f"止损ATR倍数={format_decimal(config.atr_stop_multiplier)}",
             f"止盈ATR倍数={format_decimal(config.atr_take_multiplier)}",
             f"每波最多开仓次数={config.max_entries_per_trend or 0}",
@@ -270,6 +276,7 @@ class StrategyEngine:
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
+            current_bar=config.bar,
             trend_ema_period=config.trend_ema_period,
             entry_reference_ema_period=entry_reference_ema_period,
         )
@@ -443,7 +450,7 @@ class StrategyEngine:
             plan = build_order_plan(
                 instrument=instrument,
                 config=config,
-                order_size=None,
+                order_size=config.order_size if config.order_size > 0 else None,
                 signal=decision.signal,
                 entry_reference=decision.entry_reference,
                 atr_value=decision.atr_value,
@@ -523,6 +530,7 @@ class StrategyEngine:
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
+            current_bar=config.bar,
             trend_ema_period=config.trend_ema_period,
             big_ema_period=config.big_ema_period,
         )
@@ -640,6 +648,7 @@ class StrategyEngine:
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
+            current_bar=config.bar,
             trend_ema_period=config.trend_ema_period,
             big_ema_period=config.big_ema_period,
         )
@@ -730,6 +739,7 @@ class StrategyEngine:
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
+            current_bar=config.bar,
             trend_ema_period=config.trend_ema_period,
             entry_reference_ema_period=entry_reference_ema_period,
         )
@@ -841,6 +851,7 @@ class StrategyEngine:
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
+            current_bar=config.bar,
             trend_ema_period=config.trend_ema_period,
             entry_reference_ema_period=entry_reference_ema_period,
         )
@@ -954,6 +965,7 @@ class StrategyEngine:
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
+            current_bar=config.bar,
             trend_ema_period=config.trend_ema_period,
             entry_reference_ema_period=entry_reference_ema_period,
         )
@@ -1123,6 +1135,7 @@ class StrategyEngine:
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
+            current_bar=config.bar,
             trend_ema_period=config.trend_ema_period,
             entry_reference_ema_period=entry_reference_ema_period,
         )
@@ -1233,6 +1246,7 @@ class StrategyEngine:
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
+            current_bar=config.bar,
             trend_ema_period=config.trend_ema_period,
             big_ema_period=config.big_ema_period,
         )
@@ -3006,10 +3020,14 @@ class StrategyEngine:
         inst_id: str,
         ema_period: int,
         *,
+        current_bar: str = "",
         trend_ema_period: int = 0,
         big_ema_period: int = 0,
         entry_reference_ema_period: int = 0,
     ) -> None:
+        normalized_bar = str(current_bar or "").strip()
+        if normalized_bar and normalized_bar.upper() != "1H":
+            return
         try:
             hourly_snapshot = self._fetch_hourly_debug_snapshot_with_retry(
                 inst_id,
@@ -3018,9 +3036,12 @@ class StrategyEngine:
                 big_ema_period=big_ema_period,
                 entry_reference_ema_period=entry_reference_ema_period,
             )
-            self._logger(format_hourly_debug(inst_id, hourly_snapshot))
+            self._logger(format_hourly_debug(inst_id, hourly_snapshot, trading_bar=current_bar))
         except Exception as exc:
-            self._logger(f"1小时调试值获取失败：{exc}")
+            if normalized_bar and normalized_bar.upper() != "1H":
+                self._logger(f"1H参考调试值获取失败（当前交易周期={normalized_bar}）：{exc}")
+            else:
+                self._logger(f"1H调试值获取失败：{exc}")
 
     def _notify_signal(
         self,
@@ -3621,9 +3642,19 @@ def fetch_hourly_ema_debug(
     )
 
 
-def format_hourly_debug(inst_id: str, snapshot: HourlyDebugSnapshot) -> str:
+def format_hourly_debug(
+    inst_id: str,
+    snapshot: HourlyDebugSnapshot,
+    *,
+    trading_bar: str = "",
+) -> str:
+    normalized_bar = str(trading_bar or "").strip()
+    if normalized_bar and normalized_bar.upper() != "1H":
+        prefix = f"1H参考调试（当前交易周期={normalized_bar}）"
+    else:
+        prefix = "1H调试"
     return (
-        f"1小时调试 | {inst_id} | K线时间={_fmt_ts(snapshot.candle_ts)} | "
+        f"{prefix} | {inst_id} | K线时间={_fmt_ts(snapshot.candle_ts)} | "
         f"上一根收盘价={format_decimal_fixed(snapshot.candle_close, 2)} | "
         f"上一根EMA{snapshot.ema_period}={format_decimal_fixed(snapshot.ema_value, 2)} | "
         f"上一根ATR{snapshot.atr_period}={format_decimal_fixed(snapshot.atr_value, 2)} | "

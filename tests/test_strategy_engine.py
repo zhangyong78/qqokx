@@ -522,6 +522,111 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(sum("当前无法生成挂单" in message for message in messages), 1)
         self.assertEqual(waits, [60.0, 60.0])
 
+    def test_dynamic_exchange_strategy_accepts_fixed_size_without_risk_amount(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+        submit_calls = {"count": 0}
+        candles = self._make_candles([str(2000 + index) for index in range(80)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+                self._wait_calls = 0
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, timeout: float) -> bool:
+                waits.append(timeout)
+                self._wait_calls += 1
+                if self._wait_calls >= 2:
+                    self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._monitor_exchange_managed_position_until_closed = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+        def _fake_submit(*_args, **_kwargs) -> OkxOrderResult:  # noqa: ANN001
+            submit_calls["count"] += 1
+            return OkxOrderResult(
+                ord_id="ord-live-fixed-1",
+                cl_ord_id="cl-live-fixed-1",
+                s_code="0",
+                s_msg="accepted",
+                raw={},
+            )
+
+        engine._submit_order_with_recovery = _fake_submit  # type: ignore[assignment]
+        engine._get_order_with_retry = lambda *args, **kwargs: OkxOrderStatus(  # type: ignore[assignment]
+            ord_id="ord-live-fixed-1",
+            state="filled",
+            side="buy",
+            ord_type="limit",
+            price=Decimal("2300"),
+            avg_price=Decimal("2299"),
+            size=Decimal("0.01"),
+            filled_size=Decimal("0.01"),
+            raw={},
+        )
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            risk_amount=None,
+            max_entries_per_trend=1,
+            take_profit_mode="fixed",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        def _fake_evaluate(_strategy, _candles, _config):  # noqa: ANN001
+            return SignalDecision(
+                signal="long",
+                reason="趋势成立",
+                candle_ts=_candles[-1].ts,
+                entry_reference=Decimal("2300"),
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2310"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=0.0), patch(
+            "okx_quant.engine.EmaDynamicOrderStrategy.evaluate",
+            new=_fake_evaluate,
+        ):
+            engine._run_dynamic_exchange_strategy(None, config, instrument)  # type: ignore[arg-type]
+
+        self.assertEqual(submit_calls["count"], 1)
+        self.assertTrue(any("固定数量=0.01" in message for message in messages))
+
     def test_dynamic_local_strategy_v2_logs_no_signal_only_once_per_candle(self) -> None:
         messages: list[str] = []
         waits: list[float] = []
@@ -789,6 +894,7 @@ class StrategyEngineTest(TestCase):
         engine._log_hourly_debug(
             "ETH-USDT-SWAP",
             21,
+            current_bar="1H",
             trend_ema_period=55,
             entry_reference_ema_period=55,
         )
@@ -796,8 +902,38 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(client.calls, 3)
         self.assertEqual(waits, [1.0, 2.0])
         self.assertTrue(any("OKX 读取异常，准备重试" in message for message in messages))
-        self.assertTrue(any("1小时调试 | ETH-USDT-SWAP" in message for message in messages))
-        self.assertFalse(any("1小时调试值获取失败" in message for message in messages))
+        self.assertTrue(any("1H调试 | ETH-USDT-SWAP" in message for message in messages))
+        self.assertFalse(any("1H调试值获取失败" in message for message in messages))
+
+    def test_log_hourly_debug_skips_reference_logs_for_non_1h_bar(self) -> None:
+        messages: list[str] = []
+
+        class _StubClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get_candles(self, inst_id: str, bar: str, *, limit: int):  # noqa: ANN001
+                self.calls += 1
+                raise AssertionError("non-1H bar should not fetch hourly debug candles")
+
+        client = _StubClient()
+        engine = StrategyEngine(
+            client,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托多头",
+            session_id="S01",
+        )
+
+        engine._log_hourly_debug(
+            "ETH-USDT-SWAP",
+            21,
+            current_bar="1m",
+            trend_ema_period=55,
+            entry_reference_ema_period=55,
+        )
+
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(messages, [])
 
     def test_exchange_dynamic_stop_monitor_keeps_running_after_transient_read_failures(self) -> None:
         messages: list[str] = []

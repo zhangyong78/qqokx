@@ -43,6 +43,27 @@ class DebugSnapshotTest(TestCase):
         self.assertIn("EMA21", debug_text)
         self.assertIn("ATR10", debug_text)
 
+    def test_hourly_debug_can_mark_reference_trading_bar(self) -> None:
+        candles = []
+        for index in range(1, 130):
+            candles.append(
+                Candle(
+                    ts=index,
+                    open=Decimal(index),
+                    high=Decimal(index + 1),
+                    low=Decimal(index - 1),
+                    close=Decimal(index),
+                    volume=Decimal("1"),
+                    confirmed=True,
+                )
+            )
+        client = DummyClient(candles)
+        snapshot = fetch_hourly_ema_debug(client, "BTC-USDT-SWAP", ema_period=21)
+
+        debug_text = format_hourly_debug("BTC-USDT-SWAP", snapshot, trading_bar="1m")
+
+        self.assertIn("1H参考调试（当前交易周期=1m）", debug_text)
+
     def test_hourly_debug_expands_lookback_for_big_ema_filter(self) -> None:
         candles = []
         for index in range(1, 305):

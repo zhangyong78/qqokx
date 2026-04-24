@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+from datetime import datetime
+from decimal import Decimal
+from types import SimpleNamespace
 from unittest import TestCase
+from unittest.mock import MagicMock, patch
 
 from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_ID, STRATEGY_DYNAMIC_LONG_ID
+from okx_quant.trader_desk import TraderDeskSnapshot, TraderDraftRecord, TraderSlotRecord
 from okx_quant.trader_desk_ui import (
+    TraderDeskWindow,
+    _build_trader_strategy_lines,
+    _draft_status_label,
+    _draft_status_value,
     _draft_template_identity,
     _gate_condition_label,
     _gate_condition_value,
     _normalize_draft_form_values,
+    _payload_bar,
     _should_reload_draft_form,
     _validate_trader_desk_payload,
 )
@@ -29,8 +39,18 @@ class TraderDeskHelpersTest(TestCase):
                 "strategy_id": strategy_id,
                 "inst_id": symbol,
                 "trade_inst_id": symbol,
+                "bar": "15m",
+                "ema_period": 21,
+                "trend_ema_period": 55,
+                "big_ema_period": 233,
+                "atr_period": 10,
+                "atr_stop_multiplier": "2",
+                "atr_take_multiplier": "4",
+                "risk_amount": "10",
+                "poll_seconds": 10,
                 "run_mode": "trade",
                 "signal_mode": "long_only",
+                "take_profit_mode": "dynamic",
             },
         }
 
@@ -76,6 +96,15 @@ class TraderDeskHelpersTest(TestCase):
         self.assertEqual(label, "区间内 [下限, 上限]")
         self.assertEqual(_gate_condition_value(label), "between")
 
+    def test_draft_status_label_round_trip_uses_chinese_labels(self) -> None:
+        label = _draft_status_label("ready")
+
+        self.assertEqual(label, "可启动")
+        self.assertEqual(_draft_status_value(label), "ready")
+
+    def test_payload_bar_reads_snapshot_bar(self) -> None:
+        self.assertEqual(_payload_bar(self._payload()), "15m")
+
     def test_should_reload_draft_form_skips_same_selection_while_dirty(self) -> None:
         should_reload = _should_reload_draft_form(
             explicit_select_id=None,
@@ -95,3 +124,69 @@ class TraderDeskHelpersTest(TestCase):
         )
 
         self.assertTrue(should_reload)
+
+    def test_build_trader_strategy_lines_include_bar_and_runtime(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload=self._payload(),
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+        )
+
+        lines = _build_trader_strategy_lines(
+            draft,
+            runtime_snapshot={
+                "session_id": "S04",
+                "runtime_status": "等待信号",
+                "last_message": "当前无法生成挂单 | EMA21 仍在 EMA55 下方",
+                "started_at": datetime(2026, 4, 24, 11, 0, 53),
+                "is_running": True,
+            },
+        )
+        text = "\n".join(lines)
+
+        self.assertIn("K线周期：15m", text)
+        self.assertIn("交易员固定数量：0.1", text)
+        self.assertIn("当前 watcher：", text)
+        self.assertIn("会话：S04 | 状态：等待信号 | 线程：运行中", text)
+
+    def test_delete_selected_draft_auto_pauses_watching_trader_and_marks_pending_delete(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload=self._payload(),
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+        )
+        watching_slot = TraderSlotRecord(
+            slot_id="slot-1",
+            trader_id="T001",
+            session_id="S01",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="BTC-USDT-SWAP",
+            status="watching",
+        )
+        window = SimpleNamespace(
+            window=object(),
+            _snapshot=TraderDeskSnapshot(drafts=[draft], slots=[watching_slot]),
+            _pending_delete_trader_id="",
+            _selected_draft=lambda: draft,
+            _selected_run_status=lambda trader_id: "running",
+            _draft_deleter=MagicMock(side_effect=ValueError("该交易员仍有活动中的额度格，请先暂停或平仓。")),
+            _trader_pauser=MagicMock(),
+            _append_log=MagicMock(),
+            _refresh_views=MagicMock(),
+        )
+
+        with patch("okx_quant.trader_desk_ui.messagebox.showinfo") as showinfo, patch(
+            "okx_quant.trader_desk_ui.messagebox.showerror"
+        ) as showerror:
+            TraderDeskWindow.delete_selected_draft(window)
+
+        window._trader_pauser.assert_called_once_with("T001")
+        self.assertEqual(window._pending_delete_trader_id, "T001")
+        window._refresh_views.assert_called_once_with(select_id="T001")
+        showinfo.assert_called_once()
+        showerror.assert_not_called()
