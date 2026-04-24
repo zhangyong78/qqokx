@@ -47,6 +47,7 @@ from okx_quant.backtest_ui import (
     _build_backtest_compare_detail,
     _build_backtest_compare_row,
     _filter_manual_positions,
+    _has_extension_stats,
     _build_manual_pool_summary,
     _build_manual_position_row,
     _format_manual_gap_pct,
@@ -76,7 +77,6 @@ from okx_quant.strategy_catalog import (
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA5_EMA8_ID,
-    STRATEGY_SLOT_LONG_ID,
 )
 
 
@@ -597,6 +597,8 @@ class BacktestTest(TestCase):
 
     def _load_cached_candles(self, cache_name: str, *, end_ts: int | None = None) -> list[Candle]:
         cache_path = Path(__file__).resolve().parents[1] / ".okx_quant_candle_cache" / cache_name
+        if not cache_path.exists():
+            self.skipTest(f"missing candle cache: {cache_path.name}")
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
         candles: list[Candle] = []
         for item in payload["candles"]:
@@ -1173,39 +1175,6 @@ class BacktestTest(TestCase):
         self.assertEqual(configs[-1].atr_stop_multiplier, ATR_BATCH_MULTIPLIERS[-1])
         self.assertEqual(configs[-1].max_entries_per_trend, 3)
 
-    def test_build_parameter_batch_configs_for_slot_handoff_returns_strategy_pool_candidates(self) -> None:
-        base_config = StrategyConfig(
-            inst_id="BTC-USDT-SWAP",
-            bar="15m",
-            ema_period=21,
-            trend_ema_period=55,
-            big_ema_period=0,
-            atr_period=14,
-            atr_stop_multiplier=Decimal("1"),
-            atr_take_multiplier=Decimal("2"),
-            order_size=Decimal("0.5"),
-            trade_mode="cross",
-            signal_mode="long_only",
-            position_mode="net",
-            environment="demo",
-            tp_sl_trigger_type="mark",
-            strategy_id=STRATEGY_SLOT_LONG_ID,
-            risk_amount=None,
-            max_entries_per_trend=10,
-            backtest_sizing_mode="fixed_size",
-        )
-
-        configs = build_parameter_batch_configs(base_config)
-
-        self.assertEqual(len(configs), 6)
-        self.assertTrue(all(config.strategy_id == STRATEGY_SLOT_LONG_ID for config in configs))
-        self.assertTrue(all(config.bar == "5m" for config in configs))
-        self.assertTrue(all(config.max_entries_per_trend == 10 for config in configs))
-        self.assertTrue(all(config.order_size == Decimal("0.5") for config in configs))
-        self.assertEqual(configs[0].backtest_profile_id, "01_fast_breakout")
-        self.assertEqual(configs[-1].backtest_profile_id, "06_deep_trend")
-        self.assertTrue(all(config.backtest_profile_name for config in configs))
-
     def test_run_backtest_batch_returns_nine_results_and_reuses_history_fetch(self) -> None:
         candles = [
             Candle(
@@ -1313,40 +1282,7 @@ class BacktestTest(TestCase):
         self.assertEqual({cfg.max_entries_per_trend for cfg, _ in results}, set(BATCH_MAX_ENTRIES_OPTIONS))
         self.assertEqual({cfg.atr_stop_multiplier for cfg, _ in results}, set(ATR_BATCH_MULTIPLIERS))
 
-    def test_run_backtest_batch_for_slot_handoff_returns_strategy_pool_results(self) -> None:
-        candles = [
-            Candle(index, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True)
-            for index in range(1, 901)
-        ]
-        client = DummyBacktestClient(candles, self._build_instrument())
-        config = StrategyConfig(
-            inst_id="BTC-USDT-SWAP",
-            bar="15m",
-            ema_period=21,
-            trend_ema_period=55,
-            big_ema_period=0,
-            atr_period=14,
-            atr_stop_multiplier=Decimal("1"),
-            atr_take_multiplier=Decimal("2"),
-            order_size=Decimal("1"),
-            trade_mode="cross",
-            signal_mode="long_only",
-            position_mode="net",
-            environment="demo",
-            tp_sl_trigger_type="mark",
-            strategy_id=STRATEGY_SLOT_LONG_ID,
-            risk_amount=None,
-            max_entries_per_trend=8,
-            backtest_sizing_mode="fixed_size",
-        )
-
-        results = run_backtest_batch(client, config, candle_limit=500)
-
-        self.assertEqual(len(results), 6)
-        self.assertEqual(client.history_limits, [500])
-        self.assertTrue(all(cfg.bar == "5m" for cfg, _ in results))
-        self.assertTrue(all(cfg.max_entries_per_trend == 8 for cfg, _ in results))
-        self.assertTrue(all(result.backtest_profile_name for _, result in results))
+        self.assertTrue(all(not result.backtest_profile_name for _, result in results))
 
     def test_ema5_ema8_strategy_rejects_atr_batch_backtest(self) -> None:
         candles = [
@@ -1746,7 +1682,7 @@ class BacktestTest(TestCase):
         detail = _build_backtest_compare_detail(snapshot)
 
         self.assertIn("编号：R009", detail)
-        self.assertIn("策略：EMA 穿越市价", detail)
+        self.assertIn("策略：EMA 穿越策略", detail)
         self.assertIn("K线周期：1小时", detail)
         self.assertIn("开始时间：2024-03-22 08:00", detail)
         self.assertIn("结束时间：2024-03-23 08:00", detail)
@@ -1905,7 +1841,7 @@ class BacktestTest(TestCase):
                 position_mode="net",
                 environment="demo",
                 tp_sl_trigger_type="mark",
-                strategy_id=STRATEGY_SLOT_LONG_ID,
+                strategy_id=STRATEGY_DYNAMIC_ID,
                 risk_amount=None,
                 max_entries_per_trend=10,
                 backtest_sizing_mode="fixed_size",
@@ -2303,7 +2239,7 @@ class BacktestTest(TestCase):
                         position_mode="net",
                         environment="demo",
                         tp_sl_trigger_type="mark",
-                        strategy_id=STRATEGY_SLOT_LONG_ID,
+                        strategy_id=STRATEGY_DYNAMIC_ID,
                         risk_amount=None,
                         max_entries_per_trend=10,
                         backtest_sizing_mode="fixed_size",
@@ -2341,7 +2277,7 @@ class BacktestTest(TestCase):
                             max_total_occupied_slots=4,
                         ),
                         instrument=self._build_instrument(),
-                        strategy_id=STRATEGY_SLOT_LONG_ID,
+                        strategy_id=STRATEGY_DYNAMIC_ID,
                         max_entries_per_trend=10,
                         backtest_profile_id=profile_id,
                         backtest_profile_name=profile_name,
@@ -2357,7 +2293,7 @@ class BacktestTest(TestCase):
                 )
 
                 content = exported.read_text(encoding="utf-8-sig")
-                self.assertIn("候选策略 | 参数 | 总盈亏 | 胜率 | 交易数 | 期末人工池 | 峰值占槽", content)
+                self.assertIn("候选策略 | 参数 | 总盈亏 | 胜率 | 交易数 | PF | 平均R", content)
                 self.assertIn("快突破 9/21", content)
                 self.assertIn("均衡 21/55", content)
                 manifest_payload = json.loads(batch_backtest_artifact_paths(exported)["manifest"].read_text(encoding="utf-8"))
@@ -2445,6 +2381,88 @@ class BacktestTest(TestCase):
             finally:
                 backtest_ui_module.backtest_history_file_path = original_path_factory
 
+    def test_has_extension_stats_returns_false_for_plain_results(self) -> None:
+        result = BacktestResult(
+            candles=[],
+            trades=[],
+            report=BacktestReport(
+                total_trades=1,
+                win_trades=1,
+                loss_trades=0,
+                breakeven_trades=0,
+                win_rate=Decimal("100"),
+                total_pnl=Decimal("1"),
+                average_pnl=Decimal("1"),
+                gross_profit=Decimal("1"),
+                gross_loss=Decimal("0"),
+                profit_factor=None,
+                average_win=Decimal("1"),
+                average_loss=Decimal("0"),
+                profit_loss_ratio=None,
+                average_r_multiple=Decimal("1"),
+                max_drawdown=Decimal("0"),
+            ),
+            instrument=self._build_instrument(),
+            strategy_id=STRATEGY_DYNAMIC_ID,
+        )
+
+        self.assertFalse(_has_extension_stats(result))
+        self.assertFalse(_has_extension_stats(None))
+
+    def test_has_extension_stats_returns_true_when_manual_positions_exist(self) -> None:
+        manual_position = BacktestManualPosition(
+            signal="long",
+            entry_index=1,
+            handoff_index=2,
+            entry_ts=1710976500000,
+            handoff_ts=1710976800000,
+            current_ts=1710977100000,
+            entry_price=Decimal("100"),
+            handoff_price=Decimal("99"),
+            current_price=Decimal("98"),
+            stop_loss=Decimal("95"),
+            take_profit=Decimal("110"),
+            size=Decimal("0.5"),
+            gross_pnl=Decimal("-1"),
+            pnl=Decimal("-1.1"),
+            risk_value=Decimal("2"),
+            r_multiple=Decimal("-0.55"),
+            break_even_price=Decimal("100.2"),
+            handoff_reason="demo",
+        )
+        result = BacktestResult(
+            candles=[],
+            trades=[],
+            report=BacktestReport(
+                total_trades=0,
+                win_trades=0,
+                loss_trades=0,
+                breakeven_trades=0,
+                win_rate=Decimal("0"),
+                total_pnl=Decimal("0"),
+                average_pnl=Decimal("0"),
+                gross_profit=Decimal("0"),
+                gross_loss=Decimal("0"),
+                profit_factor=None,
+                average_win=Decimal("0"),
+                average_loss=Decimal("0"),
+                profit_loss_ratio=None,
+                average_r_multiple=Decimal("0"),
+                max_drawdown=Decimal("0"),
+                manual_handoffs=1,
+                manual_open_positions=1,
+                manual_open_size=Decimal("0.5"),
+                manual_open_pnl=Decimal("-1.1"),
+                max_manual_positions=1,
+                max_total_occupied_slots=1,
+            ),
+            instrument=self._build_instrument(),
+            strategy_id=STRATEGY_DYNAMIC_ID,
+            manual_positions=[manual_position],
+        )
+
+        self.assertTrue(_has_extension_stats(result))
+
     def test_build_manual_pool_summary_and_row_for_slot_strategy(self) -> None:
         manual_position = BacktestManualPosition(
             signal="long",
@@ -2499,7 +2517,7 @@ class BacktestTest(TestCase):
                 max_total_occupied_slots=4,
             ),
             instrument=self._build_instrument(),
-            strategy_id=STRATEGY_SLOT_LONG_ID,
+            strategy_id=STRATEGY_DYNAMIC_ID,
             max_entries_per_trend=10,
             manual_positions=[manual_position],
         )
@@ -2517,7 +2535,7 @@ class BacktestTest(TestCase):
             position_mode="net",
             environment="demo",
             tp_sl_trigger_type="mark",
-            strategy_id=STRATEGY_SLOT_LONG_ID,
+            strategy_id=STRATEGY_DYNAMIC_ID,
             risk_amount=None,
             max_entries_per_trend=10,
             backtest_sizing_mode="fixed_size",
@@ -2537,8 +2555,8 @@ class BacktestTest(TestCase):
             sort_label="浮亏最大",
         )
 
-        self.assertIn("人工池：1 笔 / 0.5000", summary_text)
-        self.assertIn("累计移交：3", summary_text)
+        self.assertIn("托管仓位：1 笔 / 0.5000", summary_text)
+        self.assertIn("累计转托管：3", summary_text)
         self.assertIn("峰值占槽：4/10", summary_text)
         self.assertIn("开仓手续费：0.1000", summary_text)
         self.assertIn("资金费：0.2000", summary_text)
@@ -2560,75 +2578,6 @@ class BacktestTest(TestCase):
         self.assertEqual(row[13], "0.1000")
         self.assertEqual(row[14], "0.2000")
         self.assertEqual(row[15], "close fell back below EMA21")
-
-    def test_slot_handoff_report_includes_profile_and_pressure_summary(self) -> None:
-        manual_position = BacktestManualPosition(
-            signal="long",
-            entry_index=3,
-            handoff_index=5,
-            entry_ts=1710976500000,
-            handoff_ts=1710977400000,
-            current_ts=1710978300000,
-            entry_price=Decimal("100"),
-            handoff_price=Decimal("98"),
-            current_price=Decimal("96"),
-            stop_loss=Decimal("95"),
-            take_profit=Decimal("110"),
-            size=Decimal("0.5"),
-            gross_pnl=Decimal("-2"),
-            pnl=Decimal("-2.3"),
-            risk_value=Decimal("2.5"),
-            r_multiple=Decimal("-0.92"),
-            break_even_price=Decimal("100.8"),
-            handoff_reason="close fell back below EMA21",
-            atr_value=Decimal("5"),
-            entry_fee=Decimal("0.1"),
-            funding_cost=Decimal("0.2"),
-        )
-        result = BacktestResult(
-            candles=[
-                Candle(1710976500000, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
-                Candle(1710978300000, Decimal("99"), Decimal("100"), Decimal("95"), Decimal("96"), Decimal("1"), True),
-            ],
-            trades=[],
-            report=BacktestReport(
-                total_trades=0,
-                win_trades=0,
-                loss_trades=0,
-                breakeven_trades=0,
-                win_rate=Decimal("0"),
-                total_pnl=Decimal("0"),
-                average_pnl=Decimal("0"),
-                gross_profit=Decimal("0"),
-                gross_loss=Decimal("0"),
-                profit_factor=None,
-                average_win=Decimal("0"),
-                average_loss=Decimal("0"),
-                profit_loss_ratio=None,
-                average_r_multiple=Decimal("0"),
-                max_drawdown=Decimal("0"),
-                manual_handoffs=3,
-                manual_open_positions=1,
-                manual_open_size=Decimal("0.5"),
-                manual_open_pnl=Decimal("-2.3"),
-                max_manual_positions=2,
-                max_total_occupied_slots=4,
-            ),
-            instrument=self._build_instrument(),
-            strategy_id=STRATEGY_SLOT_LONG_ID,
-            max_entries_per_trend=10,
-            backtest_profile_name="均衡 21/55",
-            backtest_profile_summary="过滤更稳，适合主升主跌段，是默认基准候选。",
-            manual_positions=[manual_position],
-        )
-
-        report_text = format_backtest_report(result)
-
-        self.assertIn("策略池候选：均衡 21/55", report_text)
-        self.assertIn("候选说明：过滤更稳，适合主升主跌段，是默认基准候选。", report_text)
-        self.assertIn("人工接管压力：峰值占槽 4/10 (40.00%)", report_text)
-        self.assertIn("人工池方向拆分：做多 1 笔 / 0.5000 / 浮盈亏 -2.3000 / 最近保本 4.76%", report_text)
-        self.assertIn("人工池成本：开仓手续费 0.1000 | 资金费 0.2000 | 风险值合计 2.5000", report_text)
 
     def test_manual_helpers_sort_gap_and_tag_rows(self) -> None:
         long_far = BacktestManualPosition(
@@ -3095,97 +3044,4 @@ def _slot_test_candles(sequence: list[tuple[str, str, str, str]], *, start_ts: i
     return candles
 
 
-def _patched_slot_handoff_backtest_reopens_after_take_profit(self: BacktestTest) -> None:
-    candles = _slot_test_candles(
-        [
-            ("100", "105", "99", "104"),
-            ("104", "113", "103", "110"),
-            ("110", "111", "98", "100"),
-            ("100", "106", "99", "105"),
-            ("105", "126", "104", "123"),
-        ]
-    )
-    client = DummyBacktestClient(candles, self._build_instrument())
-    config = StrategyConfig(
-        inst_id="BTC-USDT-SWAP",
-        bar="5m",
-        ema_period=2,
-        trend_ema_period=3,
-        big_ema_period=0,
-        atr_period=2,
-        atr_stop_multiplier=Decimal("1"),
-        atr_take_multiplier=Decimal("2"),
-        order_size=Decimal("1"),
-        trade_mode="cross",
-        signal_mode="long_only",
-        position_mode="net",
-        environment="demo",
-        tp_sl_trigger_type="mark",
-        strategy_id=STRATEGY_SLOT_LONG_ID,
-        risk_amount=None,
-        max_entries_per_trend=1,
-        backtest_sizing_mode="fixed_size",
-    )
-
-    result = run_backtest(client, config, candle_limit=len(candles))
-
-    self.assertEqual(result.report.total_trades, 2)
-    self.assertEqual(result.report.manual_handoffs, 0)
-    self.assertEqual(result.report.manual_open_positions, 0)
-    self.assertEqual(result.report.max_total_occupied_slots, 1)
-
-
-BacktestTest.test_slot_handoff_backtest_reopens_after_take_profit = (
-    _patched_slot_handoff_backtest_reopens_after_take_profit
-)
-
-
-def _patched_slot_handoff_backtest_stops_when_manual_pool_is_full(self: BacktestTest) -> None:
-    candles = _slot_test_candles(
-        [
-            ("100", "105", "99", "104"),
-            ("104", "105", "98", "100"),
-            ("100", "101", "98", "99"),
-            ("99", "107", "98", "105"),
-            ("105", "108", "104", "107"),
-        ]
-    )
-    client = DummyBacktestClient(candles, self._build_instrument())
-    config = StrategyConfig(
-        inst_id="BTC-USDT-SWAP",
-        bar="5m",
-        ema_period=2,
-        trend_ema_period=3,
-        big_ema_period=0,
-        atr_period=2,
-        atr_stop_multiplier=Decimal("1"),
-        atr_take_multiplier=Decimal("2"),
-        order_size=Decimal("1"),
-        trade_mode="cross",
-        signal_mode="long_only",
-        position_mode="net",
-        environment="demo",
-        tp_sl_trigger_type="mark",
-        strategy_id=STRATEGY_SLOT_LONG_ID,
-        risk_amount=None,
-        max_entries_per_trend=1,
-        backtest_sizing_mode="fixed_size",
-    )
-
-    result = run_backtest(client, config, candle_limit=len(candles))
-    report_text = format_backtest_report(result)
-
-    self.assertEqual(result.report.total_trades, 0)
-    self.assertEqual(result.report.manual_handoffs, 1)
-    self.assertEqual(result.report.manual_open_positions, 1)
-    self.assertEqual(len(result.manual_positions), 1)
-    self.assertEqual(result.report.max_manual_positions, 1)
-    self.assertEqual(result.report.max_total_occupied_slots, 1)
-    self.assertIn("期末人工池：", report_text)
-    self.assertIn("保本价=", report_text)
-
-
-BacktestTest.test_slot_handoff_backtest_stops_when_manual_pool_is_full = (
-    _patched_slot_handoff_backtest_stops_when_manual_pool_is_full
-)
 

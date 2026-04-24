@@ -16,7 +16,7 @@ from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_p
 from okx_quant.models import StrategyConfig
 from okx_quant.persistence import backtest_report_export_dir_path
 from okx_quant.pricing import format_decimal, format_decimal_fixed
-from okx_quant.strategy_catalog import BACKTEST_STRATEGY_DEFINITIONS, is_dynamic_strategy_id, is_slot_handoff_strategy_id
+from okx_quant.strategy_catalog import BACKTEST_STRATEGY_DEFINITIONS, is_dynamic_strategy_id
 
 
 STRATEGY_ID_TO_NAME = {item.strategy_id: item.name for item in BACKTEST_STRATEGY_DEFINITIONS}
@@ -396,7 +396,7 @@ def _build_batch_scope_line(
     if batch_mode == "strategy_pool":
         first_config = results[0][0]
         return (
-            "参数范围：5m 槽位接管候选策略池；"
+            "参数范围：5m 候选策略池；"
             f"候选数 = {len(results)}；"
             f"最大槽位 = {first_config.max_entries_per_trend}；"
             f"单槽位数量 = {format_decimal(first_config.order_size)}；"
@@ -425,7 +425,7 @@ def _build_batch_scope_line(
 
 def _build_batch_matrix_lines(results: list[tuple[StrategyConfig, BacktestResult]], batch_mode: str) -> str:
     if batch_mode == "strategy_pool":
-        lines = ["候选策略 | 参数 | 总盈亏 | 胜率 | 交易数 | 期末人工池 | 峰值占槽"]
+        lines = ["候选策略 | 参数 | 总盈亏 | 胜率 | 交易数 | PF | 平均R"]
         for config, result in results:
             lines.append(
                 " | ".join(
@@ -440,8 +440,8 @@ def _build_batch_matrix_lines(results: list[tuple[StrategyConfig, BacktestResult
                         format_decimal_fixed(result.report.total_pnl, 4),
                         f"{format_decimal_fixed(result.report.win_rate, 2)}%",
                         f"{result.report.total_trades}笔",
-                        f"{result.report.manual_open_positions}笔",
-                        str(result.report.max_total_occupied_slots),
+                        format_decimal_fixed(result.report.profit_factor or Decimal("0"), 2),
+                        format_decimal_fixed(result.report.average_r_multiple, 2),
                     ]
                 )
             )
@@ -532,9 +532,6 @@ def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
             parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
             parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
         parts.append(f"每波最多开仓次数{_format_max_entries_label(config.max_entries_per_trend)}")
-    elif is_slot_handoff_strategy_id(config.strategy_id):
-        parts.append(f"最大槽位{config.max_entries_per_trend}")
-        parts.append(f"单槽位{format_decimal(config.order_size)}")
     parts.extend(
         [
             f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)}",

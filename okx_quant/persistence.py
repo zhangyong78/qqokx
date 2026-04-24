@@ -9,7 +9,6 @@ from okx_quant.app_paths import cache_dir_path, config_dir_path, reports_dir_pat
 
 CREDENTIALS_FILE_NAME = "credentials.json"
 SETTINGS_FILE_NAME = "settings.json"
-ENHANCED_STRATEGY_RUNTIME_FILE_NAME = "enhanced_strategy_runtime.json"
 BACKTEST_HISTORY_FILE_NAME = "backtest_history.json"
 BACKTEST_CANDLE_CACHE_DIR_NAME = "candle_cache"
 BACKTEST_REPORT_EXPORT_DIR_NAME = "backtest_exports"
@@ -23,6 +22,8 @@ RECOVERABLE_STRATEGY_SESSIONS_FILE_NAME = "recoverable_strategy_sessions.json"
 SMART_ORDER_TASKS_FILE_NAME = "smart_order_tasks.json"
 SMART_ORDER_FAVORITES_FILE_NAME = "smart_order_favorites.json"
 OPTION_STRATEGIES_FILE_NAME = "option_strategies.json"
+SIGNAL_OBSERVER_TEMPLATES_FILE_NAME = "signal_observer_templates.json"
+TRADER_DESK_FILE_NAME = "trader_desk.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 PROFILE_ENVIRONMENTS = {"demo", "live"}
 
@@ -33,13 +34,6 @@ def credentials_file_path(base_dir: Path | None = None) -> Path:
 
 def settings_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / SETTINGS_FILE_NAME if base_dir is not None else config_dir_path() / SETTINGS_FILE_NAME
-
-
-def enhanced_strategy_runtime_file_path(base_dir: Path | None = None) -> Path:
-    if base_dir is not None:
-        return Path(base_dir) / ENHANCED_STRATEGY_RUNTIME_FILE_NAME
-    return config_dir_path() / ENHANCED_STRATEGY_RUNTIME_FILE_NAME
-
 
 def backtest_history_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / BACKTEST_HISTORY_FILE_NAME if base_dir is not None else state_dir_path() / BACKTEST_HISTORY_FILE_NAME
@@ -105,6 +99,14 @@ def smart_order_favorites_file_path(base_dir: Path | None = None) -> Path:
 
 def option_strategies_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / OPTION_STRATEGIES_FILE_NAME if base_dir is not None else state_dir_path() / OPTION_STRATEGIES_FILE_NAME
+
+
+def signal_observer_templates_file_path(base_dir: Path | None = None) -> Path:
+    return Path(base_dir) / SIGNAL_OBSERVER_TEMPLATES_FILE_NAME if base_dir is not None else state_dir_path() / SIGNAL_OBSERVER_TEMPLATES_FILE_NAME
+
+
+def trader_desk_file_path(base_dir: Path | None = None) -> Path:
+    return Path(base_dir) / TRADER_DESK_FILE_NAME if base_dir is not None else state_dir_path() / TRADER_DESK_FILE_NAME
 
 
 def _empty_credentials_snapshot() -> dict[str, str]:

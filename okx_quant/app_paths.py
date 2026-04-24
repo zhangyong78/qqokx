@@ -138,10 +138,6 @@ def _legacy_data_mappings(source_root: Path, target_root: Path) -> tuple[tuple[P
     return (
         (source_root / ".okx_quant_credentials.json", _config_dir_for(target_root) / "credentials.json"),
         (source_root / ".okx_quant_settings.json", _config_dir_for(target_root) / "settings.json"),
-        (
-            source_root / ".okx_quant_enhanced_strategy_runtime.json",
-            _config_dir_for(target_root) / "enhanced_strategy_runtime.json",
-        ),
         (source_root / ".okx_quant_backtest_history.json", _state_dir_for(target_root) / "backtest_history.json"),
         (source_root / ".okx_quant_strategy_history.json", _state_dir_for(target_root) / "strategy_history.json"),
         (source_root / ".okx_quant_smart_order_tasks.json", _state_dir_for(target_root) / "smart_order_tasks.json"),

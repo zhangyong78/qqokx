@@ -6,14 +6,12 @@ from decimal import Decimal
 
 from okx_quant.engine import build_protection_plan, determine_order_size
 from okx_quant.indicators import atr, ema
-from okx_quant.backtest_strategy_pool import build_slot_handoff_strategy_pool_configs
 from okx_quant.models import Candle, Instrument, OrderPlan, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
-from okx_quant.strategies.ema_slot_handoff import EmaSlotHandoffStrategy
 from okx_quant.strategy_catalog import (
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
@@ -21,7 +19,6 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
     is_dynamic_strategy_id,
-    is_slot_handoff_strategy_id,
     resolve_dynamic_signal_mode,
 )
 
@@ -336,8 +333,6 @@ def build_parameter_batch_configs(
     take_ratios: tuple[Decimal, ...] = ATR_BATCH_TAKE_RATIOS,
     max_entries_options: tuple[int, ...] = BATCH_MAX_ENTRIES_OPTIONS,
 ) -> list[StrategyConfig]:
-    if is_slot_handoff_strategy_id(base_config.strategy_id):
-        return build_slot_handoff_strategy_pool_configs(base_config)
     if not is_dynamic_strategy_id(base_config.strategy_id):
         return build_atr_batch_configs(
             base_config,
@@ -560,25 +555,12 @@ def _run_backtest_with_loaded_data(
             config,
             taker_fee_rate=taker_fee_rate,
         )
-    elif is_slot_handoff_strategy_id(config.strategy_id):
-        (
-            trades,
-            manual_positions,
-            manual_handoffs,
-            max_manual_positions,
-            max_total_occupied_slots,
-        ) = _run_slot_handoff_backtest(
-            candles,
-            instrument,
-            config,
-            taker_fee_rate=taker_fee_rate,
-        )
     else:
         raise RuntimeError(f"鏆備笉鏀寔鐨勫洖娴嬬瓥鐣ワ細{config.strategy_id}")
     ema_values = ema([candle.close for candle in candles], config.ema_period) if candles else []
     trend_ema_values = ema([candle.close for candle in candles], config.trend_ema_period) if candles else []
     atr_values = atr(candles, config.atr_period) if candles else []
-    if is_dynamic_strategy_id(config.strategy_id) or is_slot_handoff_strategy_id(config.strategy_id):
+    if is_dynamic_strategy_id(config.strategy_id):
         big_ema_values: list[Decimal] = []
     else:
         big_ema_values = ema([candle.close for candle in candles], config.big_ema_period) if candles else []
@@ -682,11 +664,11 @@ def _manual_pool_pressure_lines(result: BacktestResult) -> list[str]:
     lines = [
         (
             f"人工接管压力：峰值占槽 {slot_pressure_text} ({format_decimal_fixed(slot_pressure_pct, 2)}%) | "
-            f"峰值人工池 {report.max_manual_positions} | 累计移交 {report.manual_handoffs}"
+            f"峰值托管仓位 {report.max_manual_positions} | 累计转托管 {report.manual_handoffs}"
         )
     ]
     if not result.manual_positions:
-        lines.append("人工池方向拆分：当前无待人工处理仓位。")
+        lines.append("托管仓位方向拆分：当前无待人工处理仓位。")
         return lines
 
     near_count = sum(
@@ -703,13 +685,13 @@ def _manual_pool_pressure_lines(result: BacktestResult) -> list[str]:
 
     lines.extend(
         [
-            f"人工池方向拆分：{_manual_direction_pressure_text(result.manual_positions)}",
+            f"托管仓位方向拆分：{_manual_direction_pressure_text(result.manual_positions)}",
             (
-                f"人工池状态：盈利 {win_count} | 亏损 {loss_count} | "
+                f"托管仓位状态：盈利 {win_count} | 亏损 {loss_count} | "
                 f"接近保本 {near_count} | 最接近保本 {format_decimal_fixed(nearest_gap, 2)}%"
             ),
             (
-                f"人工池成本：开仓手续费 {format_decimal_fixed(entry_fees, 4)} | "
+                f"托管仓位成本：开仓手续费 {format_decimal_fixed(entry_fees, 4)} | "
                 f"资金费 {format_decimal_fixed(funding_costs, 4)} | 风险值合计 {format_decimal_fixed(risk_total, 4)}"
             ),
         ]
@@ -822,25 +804,6 @@ def format_backtest_report(result: BacktestResult) -> str:
             f"收盘价跌破/站回 EMA{result.trend_ema_period} 时按动态止损离场。"
         )
         lines.append("本策略不设固定止盈，回测使用收盘确认与收盘价离场。")
-    if is_slot_handoff_strategy_id(result.strategy_id):
-        direction_text = "做多" if "long" in result.strategy_id else "做空"
-        if result.backtest_profile_name:
-            lines.append(f"策略池候选：{result.backtest_profile_name}")
-        if result.backtest_profile_summary:
-            lines.append(f"候选说明：{result.backtest_profile_summary}")
-        lines.append(
-            f"槽位策略：{direction_text}方向仅在 EMA{result.ema_period} 突破并通过 EMA{result.trend_ema_period} 过滤时开仓。"
-        )
-        lines.append(
-            f"槽位上限：{result.max_entries_per_trend} | 自动规则：止盈触发自动平仓，信号失效但净盈利大于 0 时平仓，否则转人工池。"
-        )
-        lines.append(f"人工移交次数：{report.manual_handoffs}")
-        lines.append(f"期末人工池笔数：{report.manual_open_positions}")
-        lines.append(f"期末人工池数量：{format_decimal_fixed(report.manual_open_size, 4)}")
-        lines.append(f"期末人工池浮盈亏：{format_decimal_fixed(report.manual_open_pnl, 4)}")
-        lines.append(f"最大人工池占用：{report.max_manual_positions}")
-        lines.append(f"最大总占用槽位：{report.max_total_occupied_slots}")
-        lines.extend(_manual_pool_pressure_lines(result))
     if report.profit_factor is None:
         lines.append("Profit Factor：无亏损交易")
     else:
@@ -882,7 +845,7 @@ def format_backtest_report(result: BacktestResult) -> str:
             ]
         )
     if result.manual_positions:
-        lines.append("期末人工池：")
+        lines.append("期末托管仓位：")
         for index, manual_position in enumerate(result.manual_positions, start=1):
             direction_text = "做多" if manual_position.signal == "long" else "做空"
             lines.append(
@@ -949,12 +912,6 @@ def _required_backtest_preload_candles(config: StrategyConfig) -> int:
             config.trend_ema_period + 2,
             config.big_ema_period + 2,
             config.atr_period + 2,
-        )
-    elif is_slot_handoff_strategy_id(config.strategy_id):
-        minimum = max(
-            config.ema_period + 2,
-            config.trend_ema_period + 1,
-            config.atr_period + 1,
         )
     elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         minimum = max(config.ema_period, config.trend_ema_period) + 1
@@ -1341,131 +1298,6 @@ def _run_dynamic_backtest(
         )
 
     return trades, terminal_open_position
-
-
-def _run_slot_handoff_backtest(
-    candles: list[Candle],
-    instrument: Instrument,
-    config: StrategyConfig,
-    *,
-    taker_fee_rate: Decimal = Decimal("0"),
-) -> tuple[list[BacktestTrade], list[BacktestManualPosition], int, int, int]:
-    if config.backtest_sizing_mode != "fixed_size":
-        raise RuntimeError("槽位接管策略当前只支持固定数量回测。")
-    if config.order_size <= 0:
-        raise RuntimeError("槽位接管策略的固定数量必须大于 0。")
-    if config.max_entries_per_trend <= 0:
-        raise RuntimeError("槽位接管策略的最大槽位数必须大于 0。")
-
-    strategy = EmaSlotHandoffStrategy()
-    minimum = max(
-        config.ema_period + 2,
-        config.trend_ema_period + 1,
-        config.atr_period + 1,
-    )
-    if len(candles) < minimum:
-        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根。")
-
-    trade_start_index = _backtest_trade_start_index(minimum)
-    if len(candles) <= trade_start_index:
-        return [], [], 0, 0, 0
-
-    trades: list[BacktestTrade] = []
-    active_positions: list[_OpenPosition] = []
-    manual_pool: list[_ManualPosition] = []
-    manual_handoffs = 0
-    max_manual_positions = 0
-    max_total_occupied_slots = 0
-
-    for index in range(trade_start_index, len(candles)):
-        candle = candles[index]
-        surviving_positions: list[_OpenPosition] = []
-
-        for position in active_positions:
-            take_profit_trade = _try_close_take_profit_only(
-                position,
-                candle,
-                index,
-                exit_fee_rate=taker_fee_rate,
-                exit_fee_type="taker",
-            )
-            if take_profit_trade is not None:
-                trades.append(take_profit_trade)
-                continue
-
-            invalidated, _, invalidation_reason = strategy.signal_invalidated(candles[: index + 1], config, position.signal)
-            if not invalidated:
-                surviving_positions.append(position)
-                continue
-
-            closed_trade, manual_position = _try_close_slot_position_on_signal(
-                position,
-                candle,
-                index,
-                invalidation_reason=invalidation_reason,
-                exit_fee_rate=taker_fee_rate,
-                exit_fee_type="taker",
-            )
-            if closed_trade is not None:
-                trades.append(closed_trade)
-            elif manual_position is not None:
-                manual_pool.append(manual_position)
-                manual_handoffs += 1
-
-        active_positions = surviving_positions
-        max_manual_positions = max(max_manual_positions, len(manual_pool))
-        max_total_occupied_slots = max(max_total_occupied_slots, len(active_positions) + len(manual_pool))
-
-        if index >= len(candles) - 1:
-            continue
-        if len(active_positions) + len(manual_pool) >= config.max_entries_per_trend:
-            continue
-
-        decision = strategy.evaluate(candles[: index + 1], config)
-        if decision.signal is None:
-            continue
-        if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
-            continue
-
-        resolved_config = _resolve_backtest_config(config, trades)
-        plan = _build_backtest_order_plan(
-            instrument=instrument,
-            config=resolved_config,
-            order_size=resolved_config.order_size,
-            signal=decision.signal,
-            entry_reference=decision.entry_reference,
-            atr_value=decision.atr_value,
-            candle_ts=decision.candle_ts,
-            signal_candle_high=decision.signal_candle_high,
-            signal_candle_low=decision.signal_candle_low,
-        )
-        active_positions.append(
-            _create_open_position(
-                instrument=instrument,
-                signal=plan.signal,
-                entry_index=index,
-                entry_ts=plan.candle_ts,
-                entry_price_raw=plan.entry_reference,
-                stop_loss=plan.stop_loss,
-                take_profit=plan.take_profit,
-                atr_value=plan.atr_value,
-                size=plan.size,
-                entry_fee_rate=taker_fee_rate,
-                exit_fee_rate=taker_fee_rate,
-                entry_fee_type="taker",
-                entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
-                exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
-                funding_rate=config.backtest_funding_rate,
-            )
-        )
-        max_total_occupied_slots = max(max_total_occupied_slots, len(active_positions) + len(manual_pool))
-
-    last_candle = candles[-1]
-    manual_positions = [
-        _build_manual_backtest_position(item, last_candle)
-        for item in manual_pool
-    ]
-    return trades, manual_positions, manual_handoffs, max_manual_positions, max_total_occupied_slots
 
 
 def _evaluate_dynamic_signal_precomputed(

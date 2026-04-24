@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from okx_quant.models import StrategyConfig
 from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_SHORT_ID
+from okx_quant.trader_desk import TraderDraftRecord, TraderRunState, TraderSlotRecord
 from okx_quant.ui import (
     ProfilePositionSnapshot,
     QuantApp,
@@ -144,7 +145,7 @@ HTTP 502: <!DOCTYPE html>
         session = SimpleNamespace(
             session_id="S01",
             strategy_id="ema_dynamic_order",
-            strategy_name="EMA 动态委托-多头",
+            strategy_name="EMA 动态委托做多",
         )
         prefix = _session_order_prefixes(session)[0]
         order = SimpleNamespace(
@@ -159,7 +160,7 @@ HTTP 502: <!DOCTYPE html>
         session = SimpleNamespace(
             session_id="S01",
             strategy_id="ema_dynamic_order",
-            strategy_name="EMA 动态委托-多头",
+            strategy_name="EMA 动态委托做多",
         )
         prefix = _session_order_prefixes(session)[0]
         order = SimpleNamespace(
@@ -174,12 +175,12 @@ HTTP 502: <!DOCTYPE html>
         session = SimpleNamespace(
             session_id="S01",
             strategy_id="ema_dynamic_order",
-            strategy_name="EMA 动态委托-多头",
+            strategy_name="EMA 动态委托做多",
         )
         other_session = SimpleNamespace(
             session_id="S02",
             strategy_id="ema_dynamic_order",
-            strategy_name="EMA 动态委托-多头",
+            strategy_name="EMA 动态委托做多",
         )
         other_prefix = _session_order_prefixes(other_session)[0]
         order = SimpleNamespace(
@@ -276,7 +277,7 @@ class StrategyTemplateImportExportTest(TestCase):
         session = SimpleNamespace(
             api_name="moni",
             strategy_id=STRATEGY_DYNAMIC_SHORT_ID,
-            strategy_name="EMA 动态委托-空头",
+            strategy_name="EMA 动态委托做空",
             direction_label="只做空",
             run_mode_label="交易并下单",
             symbol="SOL-USDT-SWAP",
@@ -291,7 +292,7 @@ class StrategyTemplateImportExportTest(TestCase):
         self.assertFalse(payload["includes_credentials"])
         self.assertEqual(record.api_name, "moni")
         self.assertEqual(record.strategy_id, STRATEGY_DYNAMIC_SHORT_ID)
-        self.assertEqual(record.strategy_name, "EMA 动态委托-空头")
+        self.assertEqual(record.strategy_name, "EMA 动态委托做空")
         self.assertEqual(record.direction_label, "只做空")
         self.assertEqual(record.symbol, "SOL-USDT-SWAP")
         self.assertEqual(record.config.startup_chase_window_seconds, 300)
@@ -307,7 +308,7 @@ class StrategyTemplateImportExportTest(TestCase):
     def test_apply_strategy_template_record_keeps_current_api_when_source_profile_missing(self) -> None:
         payload = {
             "strategy_id": STRATEGY_DYNAMIC_SHORT_ID,
-            "strategy_name": "EMA 动态委托-空头",
+            "strategy_name": "EMA 动态委托做空",
             "api_name": "remote",
             "direction_label": "只做空",
             "run_mode_label": "交易并下单",
@@ -347,7 +348,7 @@ class StrategyTemplateImportExportTest(TestCase):
         record = _strategy_template_record_from_payload(payload)
         assert record is not None
         app = SimpleNamespace(
-            _strategy_name_to_id={"EMA 动态委托-空头": STRATEGY_DYNAMIC_SHORT_ID},
+            _strategy_name_to_id={"EMA 动态委托做空": STRATEGY_DYNAMIC_SHORT_ID},
             _credential_profiles={"local": {"api_key": "k", "secret_key": "s", "passphrase": "p", "environment": "demo"}},
             _current_credential_profile=lambda: "local",
             _apply_credentials_profile=MagicMock(),
@@ -389,10 +390,10 @@ class StrategyTemplateImportExportTest(TestCase):
 
         definition, resolved_api_name, api_note = QuantApp._apply_strategy_template_record(app, record)
 
-        self.assertEqual(definition.name, "EMA 动态委托-空头")
+        self.assertEqual(definition.name, "EMA 动态委托做空")
         self.assertEqual(resolved_api_name, "local")
         self.assertIn("保留当前 API：local", api_note)
-        self.assertEqual(app.strategy_name.get(), "EMA 动态委托-空头")
+        self.assertEqual(app.strategy_name.get(), "EMA 动态委托做空")
         self.assertEqual(app.symbol.get(), "SOL-USDT-SWAP")
         self.assertEqual(app.risk_amount.get(), "10")
         self.assertEqual(app.tp_sl_mode_label.get(), "OKX 托管（仅同标的永续）")
@@ -476,7 +477,7 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
 
         self.assertIsNone(duplicate)
 
-    def test_find_duplicate_strategy_session_blocks_recoverable_session(self) -> None:
+    def test_find_duplicate_strategy_session_ignores_recoverable_session(self) -> None:
         config = self._make_config()
         recoverable_session = SimpleNamespace(
             session_id="S03",
@@ -490,14 +491,14 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
 
         duplicate = QuantApp._find_duplicate_strategy_session(app, api_name="moni", config=config)
 
-        self.assertIs(duplicate, recoverable_session)
+        self.assertIsNone(duplicate)
 
     def test_upsert_session_row_marks_duplicate_conflict_tag(self) -> None:
         config = self._make_config()
         session = SimpleNamespace(
             session_id="S01",
             api_name="moni",
-            strategy_name="EMA 动态委托-多头",
+            strategy_name="EMA 动态委托做多",
             symbol="ETH-USDT-SWAP",
             direction_label="只做多",
             run_mode_label="交易并下单",
@@ -550,7 +551,7 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
                 app,
                 source=r"D:\qqokx\templates\eth.json",
                 record=SimpleNamespace(config=self._make_config()),
-                definition=SimpleNamespace(name="EMA 动态委托-多头"),
+                definition=SimpleNamespace(name="EMA 动态委托做多"),
                 applied_api="moni",
                 api_note="继续使用当前 API：moni",
             )
@@ -574,7 +575,7 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
                 app,
                 source=r"D:\qqokx\templates\sol.json",
                 record=SimpleNamespace(config=self._make_config()),
-                definition=SimpleNamespace(name="EMA 动态委托-多头"),
+                definition=SimpleNamespace(name="EMA 动态委托做多"),
                 applied_api="moni",
                 api_note="已自动切换到导出文件里的 API：moni",
             )
@@ -591,7 +592,7 @@ class StrategyTradeTrackingTest(TestCase):
             history_record_id="H01",
             api_name="moni",
             strategy_id="ema_dynamic_order_long",
-            strategy_name="EMA 动态委托-多头",
+            strategy_name="EMA 动态委托做多",
             symbol="ETH-USDT-SWAP",
             direction_label="只做多",
             run_mode_label="交易并下单",
@@ -659,6 +660,57 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(session.active_trade.protective_algo_cl_ord_id, "s01emaslg042300000897344")
         self.assertEqual(session.active_trade.current_stop_price, Decimal("2320.66"))
         app._start_session_trade_reconciliation.assert_called_once()
+
+    def test_handle_stopped_watcher_pauses_trader_on_unexpected_stop(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload={"strategy_id": "ema_dynamic_long"},
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+        )
+        run = TraderRunState(trader_id="T001", status="running")
+        slot = TraderSlotRecord(
+            slot_id="slot-1",
+            trader_id="T001",
+            session_id="S01",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="BTC-USDT-SWAP",
+            status="watching",
+        )
+        events: list[tuple[str, str, str]] = []
+        app = SimpleNamespace(
+            _trader_desk_slot_for_session=lambda session_id: slot,
+            _trader_desk_run_by_id=lambda trader_id, create=False: run,
+            _trader_desk_draft_by_id=lambda trader_id: draft,
+            _session_stop_reason_text=lambda session: QuantApp._session_stop_reason_text(session),
+            _expected_trader_stop_reason=lambda reason: QuantApp._expected_trader_stop_reason(reason),
+            _trader_desk_add_event=lambda trader_id, message, level="info": events.append((trader_id, level, message)),
+            _save_trader_desk_snapshot=MagicMock(),
+            _ensure_trader_watcher=MagicMock(),
+        )
+        session = SimpleNamespace(
+            session_id="S01",
+            trader_id="T001",
+            trader_slot_id="slot-1",
+            stopped_at=datetime(2026, 4, 24, 10, 34, 21),
+            ended_reason="",
+            last_message="策略停止，原因：测试异常",
+            history_record_id="H01",
+        )
+
+        QuantApp._trader_desk_handle_stopped_session(app, session)
+
+        self.assertEqual(slot.status, "stopped")
+        self.assertEqual(slot.close_reason, "测试异常")
+        self.assertEqual(run.status, "stopped")
+        self.assertEqual(run.paused_reason, "测试异常")
+        self.assertEqual(draft.status, "paused")
+        app._ensure_trader_watcher.assert_not_called()
+        self.assertEqual(events[0][0], "T001")
+        self.assertEqual(events[0][1], "error")
+        self.assertIn("watcher 异常结束", events[0][2])
 
     def test_build_strategy_trade_reconciliation_result_attributes_stop_loss_and_net_pnl(self) -> None:
         session = self._make_session()

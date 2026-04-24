@@ -5,7 +5,7 @@ import os
 import queue
 import re
 import threading
-from dataclasses import MISSING, dataclass, field, fields as dataclass_fields
+from dataclasses import MISSING, dataclass, field, fields as dataclass_fields, replace
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -19,13 +19,6 @@ from okx_quant.deribit_client import DeribitRestClient
 from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.engine import StrategyEngine, fetch_hourly_ema_debug, format_hourly_debug
-from okx_quant.enhanced_live_engine import (
-    EnhancedStrategyEngine,
-    build_live_report_artifact_paths,
-    derive_spot_signal_inst_id,
-    derive_swap_trade_inst_id,
-    is_spot_enhancement_strategy_id,
-)
 from okx_quant.log_utils import append_log_line, append_preformatted_log_line, strategy_session_log_file_path
 from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
@@ -78,8 +71,26 @@ from okx_quant.position_protection import (
 )
 from okx_quant.protection_replay_ui import ProtectionReplayLaunchState, ProtectionReplayWindow
 from okx_quant.pricing import format_decimal, format_decimal_fixed
-from okx_quant.signal_monitor import DEFAULT_MONITOR_SYMBOLS
 from okx_quant.signal_monitor_ui import SignalMonitorWindow
+from okx_quant.trader_desk import (
+    TraderDeskSnapshot,
+    TraderDraftRecord,
+    TraderEventRecord,
+    TraderRunState,
+    TraderSlotRecord,
+    load_trader_desk_snapshot,
+    normalize_trader_draft_inputs,
+    save_trader_desk_snapshot,
+    trader_gate_allows_price,
+    trader_has_watching_slot,
+    trader_open_position_summary,
+    trader_realized_close_counts,
+    trader_realized_net_pnl,
+    trader_remaining_quota_steps,
+    trader_slots_for,
+    trader_used_quota_steps,
+)
+from okx_quant.trader_desk_ui import TraderDeskWindow
 from okx_quant.smart_order import SmartOrderRuntimeConfig
 from okx_quant.smart_order_ui import SmartOrderWindow
 from okx_quant.strategy_catalog import (
@@ -93,6 +104,7 @@ from okx_quant.strategy_catalog import (
     get_strategy_definition,
     is_dynamic_strategy_id,
     resolve_dynamic_signal_mode,
+    supports_signal_only,
 )
 from okx_quant.window_layout import (
     apply_adaptive_window_geometry,
@@ -102,6 +114,7 @@ from okx_quant.window_layout import (
 
 
 BAR_OPTIONS = ["1m", "3m", "5m", "15m", "1H", "4H"]
+DEFAULT_LAUNCH_SYMBOLS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "BNB-USDT-SWAP", "DOGE-USDT-SWAP")
 PREFERRED_STARTUP_CREDENTIAL_PROFILE_NAME = "moni"
 STRATEGY_TEMPLATE_SCHEMA_VERSION = 1
 POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
@@ -576,7 +589,7 @@ class StrategySession:
     symbol: str
     direction_label: str
     run_mode_label: str
-    engine: StrategyEngine | EnhancedStrategyEngine
+    engine: StrategyEngine
     config: StrategyConfig
     started_at: datetime
     status: str = "运行中"
@@ -597,6 +610,8 @@ class StrategySession:
     funding_total: Decimal = Decimal("0")
     net_pnl_total: Decimal = Decimal("0")
     last_close_reason: str = ""
+    trader_id: str = ""
+    trader_slot_id: str = ""
 
     @property
     def log_prefix(self) -> str:
@@ -932,8 +947,7 @@ def _strategy_template_direction_label(strategy_id: str, config: StrategyConfig,
 
 
 def _launcher_symbol_from_strategy_config(strategy_id: str, config: StrategyConfig) -> str:
-    if is_spot_enhancement_strategy_id(strategy_id):
-        return derive_swap_trade_inst_id(config.trade_inst_id or config.inst_id)
+    del strategy_id
     return (config.trade_inst_id or config.inst_id or "").strip().upper()
 
 
@@ -969,6 +983,22 @@ def _build_strategy_template_payload(session: StrategySession) -> dict[str, obje
         "symbol": session.symbol,
         "includes_credentials": False,
         "config_snapshot": _serialize_strategy_config_snapshot(session.config),
+    }
+
+
+def _build_strategy_template_payload_from_record(record: StrategyTemplateRecord) -> dict[str, object]:
+    return {
+        "schema_version": STRATEGY_TEMPLATE_SCHEMA_VERSION,
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "app_version": APP_VERSION,
+        "api_name": record.api_name,
+        "strategy_id": record.strategy_id,
+        "strategy_name": record.strategy_name,
+        "direction_label": record.direction_label,
+        "run_mode_label": record.run_mode_label,
+        "symbol": record.symbol,
+        "includes_credentials": False,
+        "config_snapshot": _serialize_strategy_config_snapshot(record.config),
     }
 
 
@@ -1219,12 +1249,18 @@ class QuantApp:
         self._strategy_trade_ledger_records: list[StrategyTradeLedgerRecord] = []
         self._strategy_trade_ledger_by_id: dict[str, StrategyTradeLedgerRecord] = {}
         self._recoverable_strategy_sessions: dict[str, RecoverableStrategySessionRecord] = {}
+        self._trader_desk_drafts: list[TraderDraftRecord] = []
+        self._trader_desk_runs: list[TraderRunState] = []
+        self._trader_desk_slots: list[TraderSlotRecord] = []
+        self._trader_desk_events: list[TraderEventRecord] = []
+        self._trader_gate_price_cache: dict[str, tuple[datetime, OkxTicker]] = {}
         self._strategy_log_write_failures: set[str] = set()
         self._session_counter = 0
         self._settings_window: Toplevel | None = None
         self._backtest_window: BacktestWindow | None = None
         self._backtest_compare_window: BacktestCompareOverviewWindow | None = None
         self._signal_monitor_window: SignalMonitorWindow | None = None
+        self._trader_desk_window: TraderDeskWindow | None = None
         self._smart_order_window: SmartOrderWindow | None = None
         self._deribit_volatility_monitor_window: DeribitVolatilityMonitorWindow | None = None
         self._deribit_volatility_window: DeribitVolatilityWindow | None = None
@@ -1236,7 +1272,7 @@ class QuantApp:
         self._protection_replay_window: ProtectionReplayWindow | None = None
         self._positions_refreshing = False
         self._positions_history_refreshing = False
-        self._default_symbol_values = list(dict.fromkeys(inst_id for _, inst_id in DEFAULT_MONITOR_SYMBOLS))
+        self._default_symbol_values = list(DEFAULT_LAUNCH_SYMBOLS)
         self._custom_trigger_symbol_values = ["", *self._default_symbol_values]
         self._default_launch_symbol = (
             "ETH-USDT-SWAP"
@@ -1531,6 +1567,7 @@ class QuantApp:
         self._load_recoverable_strategy_sessions_registry()
         self._load_strategy_history()
         self._load_strategy_trade_ledger()
+        self._load_trader_desk_snapshot()
         self._build_menu()
         self._build_layout()
         self._hydrate_recoverable_strategy_sessions()
@@ -1561,10 +1598,8 @@ class QuantApp:
         tools_menu.add_command(label="打开无限下单", command=self.open_smart_order_window)
         tools_menu.add_command(label="打开回测窗口", command=self.open_backtest_window)
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
-        tools_menu.add_command(label="打开信号监控", command=self.open_signal_monitor_window)
-        tools_menu.add_command(label="打开策略历史", command=self.open_strategy_history_window)
-        tools_menu.add_command(label="导出选中策略参数", command=self.export_selected_session_template)
-        tools_menu.add_command(label="导入策略参数并启动", command=self.import_strategy_template)
+        tools_menu.add_command(label="打开信号观察台", command=self.open_signal_monitor_window)
+        tools_menu.add_command(label="打开交易员管理台", command=self.open_trader_desk_window)
         tools_menu.add_command(label="打开波动率监控", command=self.open_deribit_volatility_monitor_window)
         tools_menu.add_command(label="打开Deribit波动率指数", command=self.open_deribit_volatility_window)
         tools_menu.add_command(label="打开期权策略计算器", command=self.open_option_strategy_window)
@@ -1917,7 +1952,7 @@ class QuantApp:
         control_row = ttk.Frame(running_frame)
         control_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Button(control_row, text="停止选中策略", command=self.stop_selected_session).grid(row=0, column=0)
-        ttk.Button(control_row, text="恢复选中策略", command=self.recover_selected_session).grid(
+        ttk.Button(control_row, text="交易员管理台", command=self.open_trader_desk_window).grid(
             row=0,
             column=1,
             padx=(8, 0),
@@ -6346,9 +6381,40 @@ class QuantApp:
 
         self._signal_monitor_window = SignalMonitorWindow(
             self.root,
-            self.client,
-            notifier_factory=self._build_signal_monitor_notifier,
             logger=self._enqueue_log,
+            current_template_factory=lambda: self._template_record_from_launcher(force_run_mode="signal_only"),
+            template_serializer=_build_strategy_template_payload_from_record,
+            template_deserializer=_strategy_template_record_from_payload,
+            template_symbol_cloner=self._clone_template_record_for_symbol,
+            template_launcher=lambda record, source_label: self._launch_strategy_template_record(
+                record,
+                source_label=f"信号观察台[{source_label}]",
+                ask_confirm=False,
+            ),
+            session_provider=self._signal_observer_session_rows,
+            session_stopper=self._stop_sessions_by_id,
+        )
+
+    def open_trader_desk_window(self) -> None:
+        if self._trader_desk_window is not None and self._trader_desk_window.window.winfo_exists():
+            self._trader_desk_window.show()
+            return
+
+        self._trader_desk_window = TraderDeskWindow(
+            self.root,
+            logger=self._enqueue_log,
+            current_template_factory=self._template_record_from_launcher,
+            template_serializer=_build_strategy_template_payload_from_record,
+            template_deserializer=_strategy_template_record_from_payload,
+            template_target_cloner=self._clone_template_record_for_targets,
+            snapshot_provider=self._trader_desk_snapshot_for_ui,
+            draft_saver=self._save_trader_desk_draft,
+            draft_deleter=self._delete_trader_desk_draft,
+            trader_starter=self.start_trader_draft,
+            trader_pauser=self.pause_trader_draft,
+            trader_resumer=self.resume_trader_draft,
+            trader_flattener=self.flatten_trader_draft,
+            symbol_provider=self._trader_desk_symbol_choices,
         )
 
     def open_deribit_volatility_monitor_window(self) -> None:
@@ -7042,7 +7108,7 @@ class QuantApp:
 
     @staticmethod
     def _session_blocks_duplicate_launch(session: StrategySession) -> bool:
-        return session.engine.is_running or session.status in {"运行中", "停止中", "待恢复", "恢复中"}
+        return session.engine.is_running or session.status in {"运行中", "停止中"}
 
     @staticmethod
     def _format_duplicate_launch_block_message(session: StrategySession, *, imported: bool) -> str:
@@ -7117,6 +7183,643 @@ class QuantApp:
         if messagebox.askyesno("导入完成", summary):
             self.start()
 
+    def _template_record_from_launcher(self, *, force_run_mode: str | None = None) -> StrategyTemplateRecord:
+        definition = self._selected_strategy_definition()
+        original_run_mode_label = self.run_mode_label.get()
+        if force_run_mode is not None:
+            self.run_mode_label.set(_reverse_lookup_label(RUN_MODE_OPTIONS, force_run_mode, original_run_mode_label))
+        try:
+            _, config = self._collect_inputs(definition)
+        finally:
+            if force_run_mode is not None:
+                self.run_mode_label.set(original_run_mode_label)
+        if force_run_mode == "signal_only" and not supports_signal_only(definition.strategy_id):
+            raise ValueError(f"{definition.name} 当前不支持只发信号邮件模式。")
+        return StrategyTemplateRecord(
+            strategy_id=definition.strategy_id,
+            strategy_name=definition.name,
+            api_name=self._current_credential_profile(),
+            direction_label=_strategy_template_direction_label(
+                definition.strategy_id,
+                config,
+                fallback=self.signal_mode_label.get() or definition.default_signal_label,
+            ),
+            run_mode_label=_reverse_lookup_label(RUN_MODE_OPTIONS, config.run_mode, self.run_mode_label.get()),
+            symbol=_launcher_symbol_from_strategy_config(definition.strategy_id, config),
+            config=config,
+        )
+
+    def _clone_template_record_for_symbol(self, record: StrategyTemplateRecord, symbol: str) -> StrategyTemplateRecord:
+        normalized_symbol = _normalize_symbol_input(symbol)
+        if not normalized_symbol:
+            raise ValueError("复制草稿时缺少有效标的。")
+        cloned_config = replace(
+            record.config,
+            inst_id=normalized_symbol,
+            trade_inst_id=normalized_symbol if record.config.trade_inst_id is not None else None,
+            local_tp_sl_inst_id=None,
+        )
+        return StrategyTemplateRecord(
+            strategy_id=record.strategy_id,
+            strategy_name=record.strategy_name,
+            api_name=record.api_name,
+            direction_label=record.direction_label,
+            run_mode_label=record.run_mode_label,
+            symbol=normalized_symbol,
+            config=cloned_config,
+            exported_at=record.exported_at,
+        )
+
+    def _clone_template_record_for_targets(
+        self,
+        record: StrategyTemplateRecord,
+        trade_symbol: str,
+        trigger_symbol: str = "",
+    ) -> StrategyTemplateRecord:
+        normalized_trade = _normalize_symbol_input(trade_symbol)
+        if not normalized_trade:
+            raise ValueError("复制草稿时缺少有效的交易标的。")
+        normalized_trigger = _normalize_symbol_input(trigger_symbol) or normalized_trade
+        trigger_matches_trade = normalized_trigger == normalized_trade
+        cloned_config = replace(
+            record.config,
+            inst_id=normalized_trigger,
+            trade_inst_id=normalized_trade if (not trigger_matches_trade or record.config.trade_inst_id is not None) else None,
+            local_tp_sl_inst_id=None if trigger_matches_trade else normalized_trigger,
+            tp_sl_mode="exchange" if trigger_matches_trade else "local_custom",
+        )
+        return StrategyTemplateRecord(
+            strategy_id=record.strategy_id,
+            strategy_name=record.strategy_name,
+            api_name=record.api_name,
+            direction_label=record.direction_label,
+            run_mode_label=record.run_mode_label,
+            symbol=self._format_strategy_symbol_display(normalized_trigger, normalized_trade),
+            config=cloned_config,
+            exported_at=record.exported_at,
+        )
+
+    def _load_trader_desk_snapshot(self) -> None:
+        try:
+            snapshot = load_trader_desk_snapshot()
+        except Exception as exc:
+            self._enqueue_log(f"读取交易员管理台数据失败：{exc}")
+            return
+        self._trader_desk_drafts = list(snapshot.drafts)
+        self._trader_desk_runs = list(snapshot.runs)
+        self._trader_desk_slots = list(snapshot.slots)
+        self._trader_desk_events = list(snapshot.events)
+
+    def _save_trader_desk_snapshot(self) -> None:
+        try:
+            save_trader_desk_snapshot(self._trader_desk_snapshot_for_ui())
+        except Exception as exc:
+            self._enqueue_log(f"保存交易员管理台数据失败：{exc}")
+
+    def _trader_desk_snapshot_for_ui(self) -> TraderDeskSnapshot:
+        return TraderDeskSnapshot(
+            drafts=list(self._trader_desk_drafts),
+            runs=list(self._trader_desk_runs),
+            slots=list(self._trader_desk_slots),
+            events=list(self._trader_desk_events),
+        )
+
+    def _trader_desk_draft_by_id(self, trader_id: str) -> TraderDraftRecord | None:
+        normalized = trader_id.strip()
+        if not normalized:
+            return None
+        for draft in self._trader_desk_drafts:
+            if draft.trader_id == normalized:
+                return draft
+        return None
+
+    def _trader_desk_run_by_id(self, trader_id: str, *, create: bool = False) -> TraderRunState | None:
+        normalized = trader_id.strip()
+        if not normalized:
+            return None
+        for run in self._trader_desk_runs:
+            if run.trader_id == normalized:
+                return run
+        if not create:
+            return None
+        run = TraderRunState(trader_id=normalized, updated_at=datetime.now())
+        self._trader_desk_runs.append(run)
+        return run
+
+    def _trader_desk_slot_for_session(self, session_id: str) -> TraderSlotRecord | None:
+        normalized = session_id.strip()
+        if not normalized:
+            return None
+        for slot in self._trader_desk_slots:
+            if slot.session_id == normalized:
+                return slot
+        return None
+
+    def _trader_desk_slots_for_statuses(self, trader_id: str, statuses: set[str]) -> list[TraderSlotRecord]:
+        return [slot for slot in trader_slots_for(self._trader_desk_slots, trader_id) if slot.status in statuses]
+
+    def _trader_desk_next_slot_id(self, trader_id: str) -> str:
+        base = f"{trader_id}-{datetime.now():%Y%m%d%H%M%S%f}"
+        slot_id = base
+        suffix = 2
+        known_ids = {slot.slot_id for slot in self._trader_desk_slots}
+        while slot_id in known_ids:
+            slot_id = f"{base}-{suffix}"
+            suffix += 1
+        return slot_id
+
+    def _trader_desk_next_event_id(self, trader_id: str) -> str:
+        base = f"{trader_id}-{datetime.now():%Y%m%d%H%M%S%f}"
+        event_id = base
+        suffix = 2
+        known_ids = {event.event_id for event in self._trader_desk_events}
+        while event_id in known_ids:
+            event_id = f"{base}-{suffix}"
+            suffix += 1
+        return event_id
+
+    def _trader_desk_add_event(self, trader_id: str, message: str, *, level: str = "info") -> None:
+        text = str(message or "").strip()
+        normalized = trader_id.strip()
+        if not normalized or not text:
+            return
+        self._trader_desk_events.append(
+            TraderEventRecord(
+                event_id=self._trader_desk_next_event_id(normalized),
+                trader_id=normalized,
+                created_at=datetime.now(),
+                level=level,
+                message=text,
+            )
+        )
+        self._trader_desk_events.sort(key=lambda item: (item.created_at, item.event_id), reverse=True)
+        self._trader_desk_events = self._trader_desk_events[:400]
+        self._enqueue_log(f"[交易员管理台] [{normalized}] {text}")
+
+    @staticmethod
+    def _expected_trader_stop_reason(reason: str) -> bool:
+        normalized = str(reason or "").strip()
+        if not normalized:
+            return False
+        markers = (
+            "人工暂停",
+            "手动平仓",
+            "用户手动停止",
+            "信号观察台手动停止",
+            "应用关闭",
+            "待恢复",
+            "恢复启动失败",
+            "停止清理失败",
+        )
+        return any(marker in normalized for marker in markers)
+
+    @staticmethod
+    def _session_stop_reason_text(session: StrategySession) -> str:
+        ended_reason = str(getattr(session, "ended_reason", "") or "").strip()
+        if ended_reason:
+            return ended_reason
+        last_message = str(getattr(session, "last_message", "") or "").strip()
+        if last_message.startswith("策略停止，原因："):
+            detail = last_message.partition("：")[2].strip()
+            return detail or last_message
+        return "策略线程结束"
+
+    def _save_trader_desk_draft(self, draft: TraderDraftRecord) -> None:
+        for index, current in enumerate(self._trader_desk_drafts):
+            if current.trader_id == draft.trader_id:
+                self._trader_desk_drafts[index] = draft
+                break
+        else:
+            self._trader_desk_drafts.append(draft)
+        self._save_trader_desk_snapshot()
+
+    def _delete_trader_desk_draft(self, trader_id: str) -> None:
+        draft = self._trader_desk_draft_by_id(trader_id)
+        if draft is None:
+            raise ValueError("未找到对应的交易员草稿。")
+        active_sessions = [
+            session
+            for session in self.sessions.values()
+            if session.trader_id == trader_id and (session.engine.is_running or session.stop_cleanup_in_progress)
+        ]
+        if active_sessions:
+            raise ValueError("该交易员仍有关联会话在运行，请先暂停或平仓。")
+        active_slots = self._trader_desk_slots_for_statuses(trader_id, {"watching", "open"})
+        if active_slots:
+            raise ValueError("该交易员仍有活动中的额度格，请先暂停或平仓。")
+        self._trader_desk_drafts = [item for item in self._trader_desk_drafts if item.trader_id != trader_id]
+        self._trader_desk_runs = [item for item in self._trader_desk_runs if item.trader_id != trader_id]
+        self._trader_desk_slots = [item for item in self._trader_desk_slots if item.trader_id != trader_id]
+        self._trader_desk_events = [item for item in self._trader_desk_events if item.trader_id != trader_id]
+        self._save_trader_desk_snapshot()
+        self._enqueue_log(f"[交易员管理台] [{trader_id}] 已删除。")
+
+    def _trader_desk_symbol_choices(self) -> list[str]:
+        return list(dict.fromkeys(self._custom_trigger_symbol_values + self._default_symbol_values))
+
+    def _trader_desk_market_price(self, inst_id: str, price_type: str) -> Decimal | None:
+        normalized_inst_id = inst_id.strip().upper()
+        if not normalized_inst_id:
+            return None
+        cached = self._trader_gate_price_cache.get(normalized_inst_id)
+        now = datetime.now()
+        ticker: OkxTicker
+        if cached is not None and (now - cached[0]).total_seconds() < 3:
+            ticker = cached[1]
+        else:
+            ticker = self.client.get_ticker(normalized_inst_id)
+            self._trader_gate_price_cache[normalized_inst_id] = (now, ticker)
+        normalized_type = str(price_type or "mark").strip().lower()
+        candidate = (
+            ticker.last
+            if normalized_type == "last"
+            else ticker.index
+            if normalized_type == "index"
+            else ticker.mark
+        )
+        return candidate or ticker.last or ticker.mark or ticker.index
+
+    def _trader_desk_gate_passes(self, draft: TraderDraftRecord) -> bool:
+        if not draft.gate.enabled:
+            return True
+        current_price = self._trader_desk_market_price(draft.gate.trigger_inst_id, draft.gate.trigger_price_type)
+        if current_price is None:
+            return False
+        return trader_gate_allows_price(draft.gate, current_price)
+
+    def _trader_desk_start_slot(self, trader_id: str) -> bool:
+        draft = self._trader_desk_draft_by_id(trader_id)
+        run = self._trader_desk_run_by_id(trader_id, create=True)
+        if draft is None or run is None:
+            raise ValueError("未找到对应的交易员草稿。")
+        if run.status not in {"running", "quota_exhausted"}:
+            return False
+        if trader_has_watching_slot(self._trader_desk_slots, trader_id):
+            return False
+        remaining = trader_remaining_quota_steps(draft, self._trader_desk_slots)
+        if remaining <= 0:
+            if run.status != "quota_exhausted":
+                run.status = "quota_exhausted"
+                run.paused_reason = "额度已满，等待释放。"
+                run.updated_at = datetime.now()
+                self._trader_desk_add_event(trader_id, "额度已满，暂停补位等待释放。", level="warning")
+                self._save_trader_desk_snapshot()
+            return False
+        if not self._trader_desk_gate_passes(draft):
+            if run.paused_reason != "价格开关未满足。":
+                run.paused_reason = "价格开关未满足。"
+                run.updated_at = datetime.now()
+                self._save_trader_desk_snapshot()
+            return False
+
+        record = _strategy_template_record_from_payload(draft.template_payload)
+        if record is None:
+            run.status = "stopped"
+            run.paused_reason = "草稿缺少有效模板。"
+            run.updated_at = datetime.now()
+            self._trader_desk_add_event(trader_id, "启动 watcher 失败：草稿缺少有效模板。", level="error")
+            self._save_trader_desk_snapshot()
+            return False
+        definition = self._resolve_strategy_template_definition(record)
+        resolved_api_name, _ = _resolve_import_api_profile(
+            record.api_name,
+            self._current_credential_profile(),
+            set(self._credential_profiles.keys()),
+        )
+        target_api_name = resolved_api_name or self._current_credential_profile()
+        credentials = self._credentials_for_profile_or_none(target_api_name)
+        if credentials is None:
+            run.status = "stopped"
+            run.paused_reason = f"未找到 API：{target_api_name}"
+            run.updated_at = datetime.now()
+            self._trader_desk_add_event(trader_id, f"启动 watcher 失败：未找到 API {target_api_name}。", level="error")
+            self._save_trader_desk_snapshot()
+            return False
+
+        slot_id = self._trader_desk_next_slot_id(trader_id)
+        config = replace(record.config, run_mode="trade", risk_amount=None, order_size=draft.unit_quota)
+        notifier = self._build_notifier(config)
+        try:
+            session_id = self._start_strategy_session(
+                definition=definition,
+                credentials=credentials,
+                config=config,
+                notifier=notifier,
+                api_name=target_api_name,
+                direction_label=_strategy_template_direction_label(
+                    definition.strategy_id,
+                    config,
+                    fallback=record.direction_label or definition.default_signal_label,
+                ),
+                run_mode_label=_reverse_lookup_label(RUN_MODE_OPTIONS, config.run_mode, record.run_mode_label),
+                source_label=f"交易员 {trader_id}",
+                select_session=False,
+                allow_duplicate_launch=True,
+                trader_id=trader_id,
+                trader_slot_id=slot_id,
+            )
+        except Exception as exc:
+            run.status = "stopped"
+            run.paused_reason = str(exc)
+            run.updated_at = datetime.now()
+            self._trader_desk_add_event(trader_id, f"启动 watcher 失败：{exc}", level="error")
+            self._save_trader_desk_snapshot()
+            return False
+
+        now = datetime.now()
+        self._trader_desk_slots.append(
+            TraderSlotRecord(
+                slot_id=slot_id,
+                trader_id=trader_id,
+                session_id=session_id,
+                api_name=target_api_name,
+                strategy_name=definition.name,
+                symbol=self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id),
+                status="watching",
+                quota_occupied=False,
+                created_at=now,
+            )
+        )
+        run.status = "running"
+        run.paused_reason = ""
+        run.armed_session_id = session_id
+        run.last_started_at = now
+        run.last_event_at = now
+        run.updated_at = now
+        draft.updated_at = now
+        self._trader_desk_add_event(
+            trader_id,
+            f"已启动 watcher | 会话={session_id} | 剩余额度格={trader_remaining_quota_steps(draft, self._trader_desk_slots)}",
+        )
+        self._save_trader_desk_snapshot()
+        return True
+
+    def _ensure_trader_watcher(self, trader_id: str) -> None:
+        draft = self._trader_desk_draft_by_id(trader_id)
+        run = self._trader_desk_run_by_id(trader_id)
+        if draft is None or run is None:
+            return
+        if run.status not in {"running", "quota_exhausted"}:
+            return
+        if trader_has_watching_slot(self._trader_desk_slots, trader_id):
+            return
+        remaining = trader_remaining_quota_steps(draft, self._trader_desk_slots)
+        if remaining <= 0:
+            if run.status != "quota_exhausted":
+                run.status = "quota_exhausted"
+                run.paused_reason = "额度已满，等待释放。"
+                run.updated_at = datetime.now()
+                self._trader_desk_add_event(trader_id, "额度已满，暂停补位等待释放。", level="warning")
+                self._save_trader_desk_snapshot()
+            return
+        if run.status == "quota_exhausted":
+            run.status = "running"
+            run.paused_reason = ""
+            run.updated_at = datetime.now()
+        self._trader_desk_start_slot(trader_id)
+
+    def start_trader_draft(self, trader_id: str) -> None:
+        draft = self._trader_desk_draft_by_id(trader_id)
+        run = self._trader_desk_run_by_id(trader_id, create=True)
+        if draft is None or run is None:
+            raise ValueError("未找到对应的交易员草稿。")
+        now = datetime.now()
+        draft.status = "ready"
+        draft.updated_at = now
+        run.status = "running"
+        run.paused_reason = ""
+        run.updated_at = now
+        run.last_started_at = now
+        self._trader_desk_add_event(trader_id, "已启动交易员。")
+        self._save_trader_desk_snapshot()
+        self._ensure_trader_watcher(trader_id)
+
+    def pause_trader_draft(self, trader_id: str) -> None:
+        draft = self._trader_desk_draft_by_id(trader_id)
+        run = self._trader_desk_run_by_id(trader_id, create=True)
+        if draft is None or run is None:
+            raise ValueError("未找到对应的交易员草稿。")
+        now = datetime.now()
+        draft.status = "paused"
+        draft.updated_at = now
+        run.status = "paused_manual"
+        run.paused_reason = "人工暂停。"
+        run.updated_at = now
+        session_ids = [slot.session_id for slot in self._trader_desk_slots_for_statuses(trader_id, {"watching"})]
+        for session_id in session_ids:
+            self._request_stop_strategy_session(
+                session_id,
+                ended_reason="交易员人工暂停",
+                source_label=f"交易员 {trader_id} 人工暂停",
+                show_dialog=False,
+            )
+        self._trader_desk_add_event(trader_id, f"已人工暂停交易员，停止 watcher {len(session_ids)} 个。", level="warning")
+        self._save_trader_desk_snapshot()
+
+    def resume_trader_draft(self, trader_id: str) -> None:
+        draft = self._trader_desk_draft_by_id(trader_id)
+        run = self._trader_desk_run_by_id(trader_id, create=True)
+        if draft is None or run is None:
+            raise ValueError("未找到对应的交易员草稿。")
+        now = datetime.now()
+        draft.status = "ready"
+        draft.updated_at = now
+        run.status = "running"
+        run.paused_reason = ""
+        run.updated_at = now
+        self._trader_desk_add_event(trader_id, "已恢复交易员。")
+        self._save_trader_desk_snapshot()
+        self._ensure_trader_watcher(trader_id)
+
+    def flatten_trader_draft(self, trader_id: str) -> None:
+        draft = self._trader_desk_draft_by_id(trader_id)
+        run = self._trader_desk_run_by_id(trader_id, create=True)
+        if draft is None or run is None:
+            raise ValueError("未找到对应的交易员草稿。")
+        now = datetime.now()
+        draft.status = "paused"
+        draft.updated_at = now
+        run.status = "paused_manual"
+        run.paused_reason = "人工平仓。"
+        run.updated_at = now
+        session_ids = [
+            slot.session_id
+            for slot in self._trader_desk_slots_for_statuses(trader_id, {"watching", "open"})
+        ]
+        for session_id in session_ids:
+            self._request_stop_strategy_session(
+                session_id,
+                ended_reason="交易员手动平仓",
+                source_label=f"交易员 {trader_id} 手动平仓",
+                show_dialog=False,
+            )
+        self._trader_desk_add_event(trader_id, f"已请求手动平仓/停止 {len(session_ids)} 个额度格。", level="warning")
+        self._save_trader_desk_snapshot()
+
+    def _signal_observer_session_rows(self) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        ordered = sorted(self.sessions.values(), key=lambda item: (item.started_at, item.session_id), reverse=True)
+        for session in ordered:
+            if session.config.run_mode != "signal_only":
+                continue
+            rows.append(
+                {
+                    "session_id": session.session_id,
+                    "api_name": session.api_name or "-",
+                    "strategy_name": session.strategy_name,
+                    "symbol": session.symbol,
+                    "status": session.display_status,
+                    "last_message": session.last_message or "-",
+                }
+            )
+        return rows
+
+    def _stop_sessions_by_id(self, session_ids: list[str]) -> None:
+        for session_id in session_ids:
+            session = self.sessions.get(session_id)
+            if session is None:
+                continue
+            if session.config.run_mode != "signal_only":
+                self._enqueue_log(f"[{session.session_id}] 仅支持由信号观察台停止 signal_only 会话。")
+                continue
+            if session.stop_cleanup_in_progress:
+                continue
+            if not session.engine.is_running:
+                continue
+            session.stop_cleanup_in_progress = True
+            session.status = "停止中"
+            session.runtime_status = "停止中"
+            session.ended_reason = "信号观察台手动停止"
+            session.engine.stop()
+            session.engine.wait_stopped(timeout=1.5)
+            session.stop_cleanup_in_progress = False
+            session.status = "已停止"
+            session.runtime_status = "已停止"
+            session.stopped_at = datetime.now()
+            self._upsert_session_row(session)
+            self._refresh_selected_session_details()
+            self._sync_strategy_history_from_session(session)
+            self._log_session_message(session, "信号观察台已停止该会话。")
+
+    def _launch_strategy_template_record(
+        self,
+        record: StrategyTemplateRecord,
+        *,
+        source_label: str,
+        ask_confirm: bool,
+    ) -> str:
+        definition = self._resolve_strategy_template_definition(record)
+        resolved_api_name, _ = _resolve_import_api_profile(
+            record.api_name,
+            self._current_credential_profile(),
+            set(self._credential_profiles.keys()),
+        )
+        target_api_name = resolved_api_name or self._current_credential_profile()
+        credentials = self._credentials_for_profile_or_none(target_api_name)
+        if credentials is None:
+            raise ValueError(f"未找到 API 配置：{target_api_name}")
+        config = record.config
+        if config.run_mode == "signal_only" and not supports_signal_only(definition.strategy_id):
+            raise ValueError(f"{definition.name} 当前不支持只发信号邮件模式。")
+        if ask_confirm and not self._confirm_start(definition, config):
+            raise ValueError("已取消启动。")
+        notifier = self._build_notifier(config)
+        self._save_credentials_now(silent=True)
+        self._save_notification_settings_now(silent=True)
+        return self._start_strategy_session(
+            definition=definition,
+            credentials=credentials,
+            config=config,
+            notifier=notifier,
+            api_name=target_api_name,
+            direction_label=_strategy_template_direction_label(
+                definition.strategy_id,
+                config,
+                fallback=record.direction_label or definition.default_signal_label,
+            ),
+            run_mode_label=_reverse_lookup_label(RUN_MODE_OPTIONS, config.run_mode, record.run_mode_label),
+            source_label=source_label,
+            select_session=ask_confirm,
+        )
+
+    def _start_strategy_session(
+        self,
+        *,
+        definition: StrategyDefinition,
+        credentials: Credentials,
+        config: StrategyConfig,
+        notifier: EmailNotifier | None,
+        api_name: str,
+        direction_label: str,
+        run_mode_label: str,
+        source_label: str = "",
+        select_session: bool = True,
+        allow_duplicate_launch: bool = False,
+        trader_id: str = "",
+        trader_slot_id: str = "",
+    ) -> str:
+        if not allow_duplicate_launch:
+            duplicate_session = self._find_duplicate_strategy_session(api_name=api_name, config=config)
+            if duplicate_session is not None:
+                if select_session:
+                    self._focus_session_row(duplicate_session.session_id)
+                raise ValueError(self._format_duplicate_launch_block_message(duplicate_session, imported=False))
+
+        session_id = self._next_session_id()
+        session_symbol = self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
+        session_started_at = datetime.now()
+        session_log_path = strategy_session_log_file_path(
+            started_at=session_started_at,
+            session_id=session_id,
+            strategy_name=definition.name,
+            symbol=session_symbol,
+            api_name=api_name,
+        ).resolve()
+        engine = self._create_session_engine(
+            strategy_id=definition.strategy_id,
+            strategy_name=definition.name,
+            session_id=session_id,
+            symbol=session_symbol,
+            api_name=api_name,
+            log_file_path=session_log_path,
+            notifier=notifier,
+        )
+        session = StrategySession(
+            session_id=session_id,
+            api_name=api_name,
+            strategy_id=definition.strategy_id,
+            strategy_name=definition.name,
+            symbol=session_symbol,
+            direction_label=direction_label,
+            run_mode_label=run_mode_label,
+            engine=engine,
+            config=config,
+            started_at=session_started_at,
+            log_file_path=session_log_path,
+            trader_id=trader_id.strip(),
+            trader_slot_id=trader_slot_id.strip(),
+        )
+
+        self.sessions[session_id] = session
+        self._upsert_session_row(session)
+        try:
+            engine.start(credentials, config)
+        except Exception:
+            self.sessions.pop(session_id, None)
+            if self.session_tree.exists(session_id):
+                self.session_tree.delete(session_id)
+            raise
+        self._record_strategy_session_started(session)
+        if select_session:
+            self.session_tree.selection_set(session_id)
+            self.session_tree.focus(session_id)
+        self._refresh_selected_session_details()
+        if source_label:
+            self._log_session_message(session, f"{source_label} 已提交启动请求。")
+        else:
+            self._log_session_message(session, "已提交启动请求。")
+        return session_id
+
     def start(self) -> None:
         try:
             definition = self._selected_strategy_definition()
@@ -7127,79 +7830,17 @@ class QuantApp:
 
             self._save_credentials_now(silent=True)
             self._save_notification_settings_now(silent=True)
-
             api_name = credentials.profile_name or self._current_credential_profile()
-            duplicate_session = self._find_duplicate_strategy_session(api_name=api_name, config=config)
-            if duplicate_session is not None:
-                self._focus_session_row(duplicate_session.session_id)
-                raise ValueError(self._format_duplicate_launch_block_message(duplicate_session, imported=False))
-
-            session_id = self._next_session_id()
-            session_symbol = self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
-            session_started_at = datetime.now()
-            session_log_path = strategy_session_log_file_path(
-                started_at=session_started_at,
-                session_id=session_id,
-                strategy_name=definition.name,
-                symbol=session_symbol,
-                api_name=api_name,
-            ).resolve()
-            recovery_root_dir: Path | None = None
-            recovery_supported = is_spot_enhancement_strategy_id(definition.strategy_id)
-            if recovery_supported:
-                recovery_root_dir = build_live_report_artifact_paths(
-                    started_at=session_started_at,
-                    session_id=session_id,
-                    trade_inst_id=derive_swap_trade_inst_id(config.trade_inst_id or config.inst_id),
-                ).root_dir
-            engine = self._create_session_engine(
-                strategy_id=definition.strategy_id,
-                strategy_name=definition.name,
-                session_id=session_id,
-                symbol=session_symbol,
-                api_name=api_name,
-                log_file_path=session_log_path,
+            self._start_strategy_session(
+                definition=definition,
+                credentials=credentials,
+                config=config,
                 notifier=notifier,
-            )
-            session = StrategySession(
-                session_id=session_id,
                 api_name=api_name,
-                strategy_id=definition.strategy_id,
-                strategy_name=definition.name,
-                symbol=session_symbol,
                 direction_label=self.signal_mode_label.get(),
                 run_mode_label=self.run_mode_label.get(),
-                engine=engine,
-                config=config,
-                started_at=session_started_at,
-                log_file_path=session_log_path,
-                recovery_root_dir=recovery_root_dir,
-                recovery_supported=recovery_supported,
+                select_session=True,
             )
-
-            self.sessions[session_id] = session
-            self._upsert_session_row(session)
-            try:
-                if recovery_supported and isinstance(engine, EnhancedStrategyEngine):
-                    engine.start_with_context(
-                        credentials,
-                        config,
-                        started_at=session_started_at,
-                        recovery_root_dir=recovery_root_dir,
-                    )
-                else:
-                    engine.start(credentials, config)
-            except Exception:
-                self.sessions.pop(session_id, None)
-                if self.session_tree.exists(session_id):
-                    self.session_tree.delete(session_id)
-                raise
-            self._record_strategy_session_started(session)
-            self._upsert_recoverable_strategy_session(session)
-            self.session_tree.selection_set(session_id)
-            self.session_tree.focus(session_id)
-            self._refresh_selected_session_details()
-            self._log_session_message(session, "已提交启动请求。")
         except Exception as exc:
             messagebox.showerror("启动失败", str(exc))
 
@@ -7208,42 +7849,67 @@ class QuantApp:
         if session is None:
             messagebox.showinfo("提示", "请先在右侧选择一个策略会话。")
             return
+        self._request_stop_strategy_session(
+            session.session_id,
+            ended_reason="用户手动停止",
+            source_label="用户手动停止",
+            show_dialog=True,
+        )
+
+    def _request_stop_strategy_session(
+        self,
+        session_id: str,
+        *,
+        ended_reason: str,
+        source_label: str,
+        show_dialog: bool,
+    ) -> bool:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return False
         if session.stop_cleanup_in_progress:
-            messagebox.showinfo("提示", "这个策略正在执行停止清理，请稍等。")
-            return
+            if show_dialog:
+                messagebox.showinfo("提示", "这个策略正在执行停止清理，请稍等。")
+            return False
         if not session.engine.is_running:
-            messagebox.showinfo("提示", "这个策略已经停止了。")
-            return
+            if show_dialog:
+                messagebox.showinfo("提示", "这个策略已经停止了。")
+            return False
+        if session.config.run_mode == "signal_only":
+            self._stop_sessions_by_id([session.session_id])
+            return True
 
         credentials = self._credentials_for_profile_or_none(session.api_name)
         session.status = "停止中"
         session.stop_cleanup_in_progress = True
-        session.ended_reason = "用户手动停止"
+        session.ended_reason = ended_reason
         session.engine.stop()
         self._upsert_session_row(session)
         self._refresh_selected_session_details()
         self._sync_strategy_history_from_session(session)
-        self._log_session_message(session, "已请求停止，正在检查本策略委托与持仓。")
+        self._log_session_message(session, f"{source_label}，正在检查本策略委托与持仓。")
         if credentials is None:
             session.stop_cleanup_in_progress = False
             session.status = "已停止"
             session.stopped_at = datetime.now()
-            session.ended_reason = "用户手动停止（未找到对应API凭证，未执行撤单检查）"
+            session.ended_reason = f"{ended_reason}（未找到对应API凭证，未执行撤单检查）"
             self._remove_recoverable_strategy_session(session.session_id)
             self._upsert_session_row(session)
             self._refresh_selected_session_details()
             self._sync_strategy_history_from_session(session)
             self._log_session_message(session, "停止清理失败：未找到该会话对应的 API 凭证，请人工检查委托与仓位。")
-            messagebox.showwarning(
-                "停止提醒",
-                "策略线程已收到停止请求，但当前找不到该会话对应的 API 凭证。\n\n请人工检查：\n- 当前委托是否还有残留\n- 是否已经成交并留下仓位",
-            )
-            return
+            if show_dialog:
+                messagebox.showwarning(
+                    "停止提醒",
+                    "策略线程已收到停止请求，但当前找不到该会话对应的 API 凭证。\n\n请人工检查：\n- 当前委托是否还有残留\n- 是否已经成交并留下仓位",
+                )
+            return False
         threading.Thread(
             target=self._stop_session_cleanup_worker,
             args=(session.session_id, credentials),
             daemon=True,
         ).start()
+        return True
 
     def _credentials_for_profile_or_none(self, profile_name: str) -> Credentials | None:
         target = profile_name.strip() or self._current_credential_profile()
@@ -8271,9 +8937,6 @@ class QuantApp:
             self._time_stop_break_even_bars_entry.grid_remove()
             self._entry_reference_ema_label.grid_remove()
             self._entry_reference_ema_entry.grid_remove()
-            if is_spot_enhancement_strategy_id(definition.strategy_id):
-                self._max_entries_per_trend_label.grid()
-                self._max_entries_per_trend_entry.grid()
         if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
             self.bar.set("4H")
             self.ema_period.set("5")
@@ -8285,20 +8948,6 @@ class QuantApp:
             self.max_entries_per_trend.set("0")
             self.entry_side_mode_label.set("跟随信号")
             self.tp_sl_mode_label.set("按交易标的价格（本地）")
-        elif is_spot_enhancement_strategy_id(definition.strategy_id):
-            self.bar.set("5m")
-            self.ema_period.set("21")
-            self.trend_ema_period.set("55")
-            self.big_ema_period.set("233")
-            self.entry_reference_ema_period.set("0")
-            self.risk_amount.set("")
-            if not self.order_size.get().strip():
-                self.order_size.set("1")
-            if not self.max_entries_per_trend.get().strip() or self.max_entries_per_trend.get().strip() == "0":
-                self.max_entries_per_trend.set("10")
-            self.entry_side_mode_label.set("跟随信号")
-            self.tp_sl_mode_label.set("按交易标的价格（本地）")
-            self.run_mode_label.set("交易并下单")
         if self._strategy_uses_big_ema(definition.strategy_id):
             self._big_ema_label.grid()
             self._big_ema_entry.grid()
@@ -8336,25 +8985,6 @@ class QuantApp:
 
     def _confirm_start(self, definition: StrategyDefinition, config: StrategyConfig) -> bool:
         strategy_symbol = self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
-        if is_spot_enhancement_strategy_id(definition.strategy_id):
-            message = "\n".join(
-                [
-                    f"策略：{definition.name}",
-                    f"运行模式：{self.run_mode_label.get()}",
-                    f"信号标的：{config.inst_id}",
-                    f"交易标的：{config.trade_inst_id or config.inst_id}",
-                    f"K线周期：{config.bar}",
-                    f"方向：{self.signal_mode_label.get()}",
-                    f"单槽数量：{format_decimal(config.order_size)}",
-                    f"每方向最大槽位：{config.max_entries_per_trend}",
-                    f"环境：{self.environment_label.get()}",
-                    "",
-                    definition.rule_description,
-                    "",
-                    "确认启动这个策略吗？",
-                ]
-            )
-            return messagebox.askokcancel(f"确认启动 {definition.name}", message)
         risk_value = self.risk_amount.get().strip() or "-"
         fixed_size = self.order_size.get().strip() or "-"
         lines = [
@@ -8429,43 +9059,6 @@ class QuantApp:
             raise ValueError("请先在 菜单 > 设置 > API 与通知设置 中填写 API 凭证")
         if not symbol:
             raise ValueError("请选择交易标的")
-        if is_spot_enhancement_strategy_id(definition.strategy_id):
-            if run_mode != "trade":
-                raise ValueError("现货增强三十六计当前只支持“交易并下单”模式")
-            if order_size <= 0:
-                raise ValueError("现货增强三十六计必须填写固定数量，它会作为单个槽位大小")
-            if max_entries_per_trend <= 0:
-                raise ValueError("现货增强三十六计要求“每波最多开仓次数”大于 0，它会作为每个方向的最大槽位数")
-            trade_symbol = derive_swap_trade_inst_id(symbol)
-            signal_symbol = derive_spot_signal_inst_id(symbol)
-            credentials = Credentials(api_key=api_key, secret_key=secret_key, passphrase=passphrase)
-            return credentials, StrategyConfig(
-                inst_id=signal_symbol,
-                bar=self.bar.get() or "5m",
-                ema_period=21,
-                atr_period=14,
-                atr_stop_multiplier=Decimal("1"),
-                atr_take_multiplier=Decimal("2"),
-                order_size=order_size,
-                trade_mode=TRADE_MODE_OPTIONS[self.trade_mode_label.get()],
-                signal_mode=SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()],
-                position_mode=POSITION_MODE_OPTIONS[self.position_mode_label.get()],
-                environment=ENV_OPTIONS[self.environment_label.get()],
-                tp_sl_trigger_type=TRIGGER_TYPE_OPTIONS[self.trigger_type_label.get()],
-                trend_ema_period=55,
-                big_ema_period=233,
-                strategy_id=definition.strategy_id,
-                poll_seconds=float(self._parse_positive_decimal(self.poll_seconds.get(), "轮询秒数")),
-                risk_amount=None,
-                trade_inst_id=trade_symbol,
-                tp_sl_mode="local_trade",
-                local_tp_sl_inst_id=signal_symbol,
-                entry_side_mode="follow_signal",
-                run_mode="trade",
-                take_profit_mode="fixed",
-                max_entries_per_trend=max_entries_per_trend,
-                startup_chase_window_seconds=0,
-            )
         if run_mode == "trade":
             if tp_sl_mode == "exchange":
                 if trade_symbol != symbol:
@@ -8674,7 +9267,7 @@ class QuantApp:
         api_name: str,
         log_file_path: Path | None,
         notifier: EmailNotifier | None,
-    ) -> StrategyEngine | EnhancedStrategyEngine:
+    ) -> StrategyEngine:
         session_logger = self._make_session_logger(
             session_id,
             strategy_name,
@@ -8682,14 +9275,6 @@ class QuantApp:
             api_name,
             log_file_path,
         )
-        if is_spot_enhancement_strategy_id(strategy_id):
-            return EnhancedStrategyEngine(
-                self.client,
-                session_logger,
-                notifier=notifier,
-                strategy_name=strategy_name,
-                session_id=session_id,
-            )
         return StrategyEngine(
             self.client,
             session_logger,
@@ -8763,6 +9348,7 @@ class QuantApp:
             size = _extract_log_field_decimal(message, "数量")
             if size is not None:
                 trade.size = size
+            QuantApp._trader_desk_sync_open_trade_state(self, session)
             return
         if "初始 OKX 止损已提交" in message:
             trade = session.active_trade
@@ -8789,6 +9375,41 @@ class QuantApp:
                 return
             trade.reconciliation_started = True
             self._start_session_trade_reconciliation(session, trade)
+
+    def _trader_desk_sync_open_trade_state(self, session: StrategySession) -> None:
+        trader_id = getattr(session, "trader_id", "").strip()
+        trader_slot_id = getattr(session, "trader_slot_id", "").strip()
+        if not trader_id or not trader_slot_id:
+            return
+        slot = self._trader_desk_slot_for_session(session.session_id)
+        trade = session.active_trade
+        if slot is None or trade is None or trade.opened_logged_at is None:
+            return
+        changed = False
+        if slot.status == "watching":
+            slot.status = "open"
+            slot.quota_occupied = True
+            slot.opened_at = trade.opened_logged_at or datetime.now()
+            changed = True
+        if slot.entry_price is None and trade.entry_price is not None:
+            slot.entry_price = trade.entry_price
+            changed = True
+        if slot.size is None and trade.size is not None:
+            slot.size = trade.size
+            changed = True
+        if not changed:
+            return
+        run = self._trader_desk_run_by_id(trader_id, create=True)
+        if run is not None and run.armed_session_id == session.session_id:
+            run.armed_session_id = ""
+            run.last_event_at = datetime.now()
+            run.updated_at = datetime.now()
+        self._trader_desk_add_event(
+            trader_id,
+            f"额度格已开仓 | 会话={session.session_id} | 开仓价={_format_optional_decimal(slot.entry_price)} | 数量={_format_optional_decimal(slot.size)}",
+        )
+        self._save_trader_desk_snapshot()
+        self._ensure_trader_watcher(trader_id)
 
     def _start_session_trade_reconciliation(
         self,
@@ -9196,6 +9817,74 @@ class QuantApp:
         self._refresh_running_session_summary()
         self._log_session_message(session, result.attribution_summary)
         self._log_session_message(session, result.cumulative_summary)
+        self._apply_trader_desk_reconciliation(session, result.ledger_record)
+
+    def _apply_trader_desk_reconciliation(
+        self,
+        session: StrategySession,
+        ledger_record: StrategyTradeLedgerRecord,
+    ) -> None:
+        trader_id = getattr(session, "trader_id", "").strip()
+        trader_slot_id = getattr(session, "trader_slot_id", "").strip()
+        if not trader_id or not trader_slot_id:
+            return
+        slot = self._trader_desk_slot_for_session(session.session_id)
+        draft = self._trader_desk_draft_by_id(trader_id)
+        run = self._trader_desk_run_by_id(trader_id, create=True)
+        if slot is None or draft is None or run is None:
+            return
+        now = datetime.now()
+        close_reason = ledger_record.close_reason or session.ended_reason or ""
+        net_pnl = ledger_record.net_pnl or Decimal("0")
+        is_profit = net_pnl > 0
+        if "手动" in close_reason:
+            slot.status = "closed_manual"
+        else:
+            slot.status = "closed_profit" if is_profit else "closed_loss"
+        slot.quota_occupied = False
+        slot.opened_at = slot.opened_at or ledger_record.opened_at
+        slot.closed_at = ledger_record.closed_at
+        slot.released_at = ledger_record.closed_at
+        slot.entry_price = slot.entry_price if slot.entry_price is not None else ledger_record.entry_price
+        slot.exit_price = ledger_record.exit_price
+        slot.size = slot.size if slot.size is not None else ledger_record.size
+        slot.net_pnl = ledger_record.net_pnl
+        slot.close_reason = close_reason
+        slot.history_record_id = ledger_record.history_record_id or session.history_record_id or ""
+        run.armed_session_id = ""
+        run.last_event_at = now
+        run.updated_at = now
+        if slot.status == "closed_loss" and draft.pause_on_stop_loss:
+            run.status = "paused_loss"
+            run.paused_reason = close_reason or "亏损后暂停"
+            self._trader_desk_add_event(
+                trader_id,
+                f"亏损单已记录并暂停 | 会话={session.session_id} | 净盈亏={_format_optional_usdt_precise(ledger_record.net_pnl, places=2)} | 原因={close_reason or '-'}",
+                level="warning",
+            )
+            self._save_trader_desk_snapshot()
+            return
+        if slot.status == "closed_profit":
+            self._trader_desk_add_event(
+                trader_id,
+                f"盈利单已释放额度 | 会话={session.session_id} | 净盈亏={_format_optional_usdt_precise(ledger_record.net_pnl, places=2)}",
+            )
+            if not draft.auto_restart_on_profit:
+                run.status = "idle"
+                run.paused_reason = "盈利后等待人工继续。"
+                self._save_trader_desk_snapshot()
+                return
+        else:
+            self._trader_desk_add_event(
+                trader_id,
+                f"额度格已结束 | 会话={session.session_id} | 状态={slot.status} | 原因={close_reason or '-'}",
+                level="warning" if slot.status == "closed_loss" else "info",
+            )
+        if run.status not in {"paused_manual", "paused_loss", "stopped"}:
+            run.status = "running"
+            run.paused_reason = ""
+        self._save_trader_desk_snapshot()
+        self._ensure_trader_watcher(trader_id)
 
     def _upsert_session_row(self, session: StrategySession) -> None:
         live_pnl, _ = self._session_live_pnl_snapshot(session)
@@ -9491,204 +10180,36 @@ class QuantApp:
         }
 
     def _load_recoverable_strategy_sessions_registry(self) -> None:
-        try:
-            snapshot = load_recoverable_strategy_sessions_snapshot()
-        except Exception as exc:
-            self._enqueue_log(f"读取可恢复策略会话失败：{exc}")
-            return
-        records: dict[str, RecoverableStrategySessionRecord] = {}
-        raw_sessions = snapshot.get("sessions", [])
-        if isinstance(raw_sessions, list):
-            for item in raw_sessions:
-                if not isinstance(item, dict):
-                    continue
-                record = self._recoverable_strategy_record_from_payload(item)
-                if record is None or not record.session_id:
-                    continue
-                records[record.session_id] = record
-        self._recoverable_strategy_sessions = records
+        self._recoverable_strategy_sessions = {}
 
     def _save_recoverable_strategy_sessions_registry(self) -> None:
-        records = sorted(
-            self._recoverable_strategy_sessions.values(),
-            key=lambda item: (item.started_at.isoformat(timespec="seconds"), item.session_id),
-            reverse=True,
-        )
-        try:
-            save_recoverable_strategy_sessions_snapshot(
-                [self._recoverable_strategy_record_payload(item) for item in records]
-            )
-        except Exception as exc:
-            self._enqueue_log(f"保存可恢复策略会话失败：{exc}")
+        return
 
     def _build_recoverable_strategy_session_record(
         self,
         session: StrategySession,
     ) -> RecoverableStrategySessionRecord | None:
-        if not session.recovery_supported or session.recovery_root_dir is None:
-            return None
-        return RecoverableStrategySessionRecord(
-            session_id=session.session_id,
-            api_name=session.api_name,
-            strategy_id=session.strategy_id,
-            strategy_name=session.strategy_name,
-            symbol=session.symbol,
-            direction_label=session.direction_label,
-            run_mode_label=session.run_mode_label,
-            started_at=session.started_at,
-            history_record_id=session.history_record_id or "",
-            log_file_path=session.log_file_path,
-            recovery_root_dir=session.recovery_root_dir,
-            config_snapshot=_serialize_strategy_config_snapshot(session.config),
-            updated_at=datetime.now(),
-        )
+        return None
 
     def _upsert_recoverable_strategy_session(self, session: StrategySession) -> None:
-        record = self._build_recoverable_strategy_session_record(session)
-        if record is None:
-            return
-        self._recoverable_strategy_sessions[record.session_id] = record
-        self._save_recoverable_strategy_sessions_registry()
+        return
 
     def _remove_recoverable_strategy_session(self, session_id: str) -> None:
-        if self._recoverable_strategy_sessions.pop(session_id, None) is None:
-            return
-        self._save_recoverable_strategy_sessions_registry()
+        self._recoverable_strategy_sessions.pop(session_id, None)
 
     def _hydrate_recoverable_strategy_sessions(self) -> None:
-        restored_count = 0
-        records = sorted(
-            self._recoverable_strategy_sessions.values(),
-            key=lambda item: (item.started_at.isoformat(timespec="seconds"), item.session_id),
-        )
-        for record in records:
-            if not is_spot_enhancement_strategy_id(record.strategy_id):
-                continue
-            if record.session_id in self.sessions:
-                continue
-            config = _deserialize_strategy_config_snapshot(record.config_snapshot)
-            if config is None:
-                self._enqueue_log(f"[{record.session_id}] 可恢复会话缺少有效配置快照，已跳过。")
-                continue
-            engine = self._create_session_engine(
-                strategy_id=record.strategy_id,
-                strategy_name=record.strategy_name,
-                session_id=record.session_id,
-                symbol=record.symbol,
-                api_name=record.api_name,
-                log_file_path=record.log_file_path,
-                notifier=None,
-            )
-            history_record = (
-                self._strategy_history_by_id.get(record.history_record_id)
-                if record.history_record_id
-                else None
-            )
-            if history_record is not None and history_record.status != "待恢复":
-                self._remove_recoverable_strategy_session(record.session_id)
-                continue
-            session = StrategySession(
-                session_id=record.session_id,
-                api_name=record.api_name,
-                strategy_id=record.strategy_id,
-                strategy_name=record.strategy_name,
-                symbol=record.symbol,
-                direction_label=record.direction_label,
-                run_mode_label=record.run_mode_label,
-                engine=engine,
-                config=config,
-                started_at=record.started_at,
-                status="待恢复",
-                history_record_id=record.history_record_id or None,
-                stopped_at=history_record.stopped_at if history_record is not None else record.updated_at,
-                ended_reason="应用关闭后待恢复接管",
-                log_file_path=record.log_file_path,
-                runtime_status="待恢复",
-                recovery_root_dir=record.recovery_root_dir,
-                recovery_supported=True,
-            )
-            self.sessions[session.session_id] = session
-            self._upsert_session_row(session)
-            restored_count += 1
-        if restored_count:
-            self._enqueue_log(f"已加载 {restored_count} 条待恢复策略会话。")
+        return
 
     def _attempt_auto_restore_recoverable_sessions(self) -> None:
-        pending_ids = [
-            session.session_id
-            for session in self.sessions.values()
-            if session.recovery_supported and session.status == "待恢复"
-        ]
-        for session_id in pending_ids:
-            self._recover_session(session_id, auto=True)
+        return
 
     def recover_selected_session(self) -> None:
-        session = self._selected_session()
-        if session is None:
-            messagebox.showinfo("提示", "请先在右侧选择一个待恢复策略。")
-            return
-        if not session.recovery_supported:
-            messagebox.showinfo("提示", "当前选中策略不支持恢复接管。")
-            return
-        if session.status not in {"待恢复", "恢复中"}:
-            messagebox.showinfo("提示", "当前选中策略不是待恢复状态。")
-            return
-        self._recover_session(session.session_id, auto=False)
+        messagebox.showinfo("提示", "旧版恢复接管逻辑已下线。请使用信号观察台或交易员管理台的新流程。")
 
     def _recover_session(self, session_id: str, *, auto: bool) -> bool:
-        session = self.sessions.get(session_id)
-        if session is None or not session.recovery_supported:
-            return False
-        if session.engine.is_running:
-            return True
-        credentials = self._credentials_for_profile_or_none(session.api_name)
-        if credentials is None:
-            if auto:
-                self._enqueue_log(f"[{session.session_id}] 未找到恢复所需的 API 凭证，保持待恢复。")
-            if not auto:
-                messagebox.showwarning(
-                    "恢复失败",
-                    "未找到该会话对应的 API 凭证，请先确认本地凭证配置，再重试恢复。",
-                )
-            return False
-        if not isinstance(session.engine, EnhancedStrategyEngine):
-            if not auto:
-                messagebox.showwarning("恢复失败", "当前会话没有可用的增强策略恢复引擎。")
-            return False
-        if session.recovery_root_dir is None:
-            if auto:
-                self._enqueue_log(f"[{session.session_id}] 缺少恢复目录，无法自动接管。")
-            if not auto:
-                messagebox.showwarning("恢复失败", "当前会话缺少恢复目录，无法接管。")
-            return False
-        session.status = "恢复中"
-        session.runtime_status = "恢复中"
-        session.ended_reason = "恢复中"
-        self._upsert_session_row(session)
-        self._refresh_selected_session_details()
-        self._sync_strategy_history_from_session(session)
-        try:
-            session.engine.start_with_context(
-                credentials,
-                session.config,
-                started_at=session.started_at,
-                recovery_root_dir=session.recovery_root_dir,
-            )
-        except Exception as exc:
-            session.status = "待恢复"
-            session.runtime_status = "待恢复"
-            session.ended_reason = "恢复启动失败"
-            self._upsert_session_row(session)
-            self._refresh_selected_session_details()
-            self._sync_strategy_history_from_session(session)
-            if auto:
-                self._enqueue_log(f"[{session.session_id}] 自动恢复启动失败：{exc}")
-            if not auto:
-                messagebox.showerror("恢复失败", str(exc))
-            return False
-        self._upsert_recoverable_strategy_session(session)
-        self._log_session_message(session, f"已提交恢复请求，恢复目录：{session.recovery_root_dir}")
-        return True
+        if not auto:
+            self._enqueue_log(f"[{session_id}] 旧版恢复接管逻辑已下线。")
+        return False
 
     def _history_record_from_payload(self, payload: dict[str, object]) -> StrategyHistoryRecord | None:
         started_at = _parse_datetime_snapshot(payload.get("started_at"))
@@ -10555,6 +11076,89 @@ class QuantApp:
             self.log_text.see(END)
         self.root.after(250, self._drain_log_queue)
 
+    def _trader_desk_handle_stopped_session(self, session: StrategySession) -> None:
+        trader_id = getattr(session, "trader_id", "").strip()
+        trader_slot_id = getattr(session, "trader_slot_id", "").strip()
+        if not trader_id or not trader_slot_id:
+            return
+        slot = self._trader_desk_slot_for_session(session.session_id)
+        run = self._trader_desk_run_by_id(trader_id, create=True)
+        draft = self._trader_desk_draft_by_id(trader_id)
+        if slot is None or run is None:
+            return
+        if slot.status in {"closed_profit", "closed_loss", "closed_manual", "stopped", "failed"}:
+            return
+        stopped_at = session.stopped_at or datetime.now()
+        stop_reason = self._session_stop_reason_text(session)
+        expected_stop = self._expected_trader_stop_reason(stop_reason)
+        if slot.status == "watching":
+            slot.status = "stopped"
+            slot.closed_at = stopped_at
+            slot.released_at = stopped_at
+            slot.close_reason = stop_reason
+            run.armed_session_id = ""
+            run.last_event_at = datetime.now()
+            run.updated_at = datetime.now()
+            if not expected_stop and run.status not in {"paused_manual", "paused_loss", "stopped"}:
+                run.status = "stopped"
+                run.paused_reason = stop_reason
+                if draft is not None:
+                    draft.status = "paused"
+                    draft.updated_at = datetime.now()
+                self._trader_desk_add_event(
+                    trader_id,
+                    f"watcher 异常结束，已暂停交易员 | 会话={session.session_id} | 原因={stop_reason}",
+                    level="error",
+                )
+                self._save_trader_desk_snapshot()
+                return
+            self._trader_desk_add_event(
+                trader_id,
+                f"watcher 已停止 | 会话={session.session_id} | 原因={slot.close_reason}",
+                level="warning" if run.status.startswith("paused") else "info",
+            )
+            self._save_trader_desk_snapshot()
+            return
+        run.armed_session_id = ""
+        run.last_event_at = datetime.now()
+        run.updated_at = datetime.now()
+        if not expected_stop and run.status not in {"paused_manual", "paused_loss", "stopped"}:
+            slot.status = "failed"
+            slot.closed_at = stopped_at
+            slot.close_reason = stop_reason
+            slot.history_record_id = session.history_record_id or slot.history_record_id
+            run.status = "stopped"
+            run.paused_reason = f"活动额度格异常结束：{stop_reason}"
+            if draft is not None:
+                draft.status = "paused"
+                draft.updated_at = datetime.now()
+            self._trader_desk_add_event(
+                trader_id,
+                f"活动额度格异常结束，已暂停交易员 | 会话={session.session_id} | 原因={stop_reason} | 请人工核对持仓/委托",
+                level="error",
+            )
+            self._save_trader_desk_snapshot()
+            return
+        slot.status = "closed_manual"
+        slot.closed_at = stopped_at
+        slot.released_at = stopped_at
+        slot.quota_occupied = False
+        slot.close_reason = stop_reason
+        slot.history_record_id = session.history_record_id or slot.history_record_id
+        self._trader_desk_add_event(
+            trader_id,
+            f"活动额度格已停止 | 会话={session.session_id} | 原因={slot.close_reason}",
+            level="warning",
+        )
+        self._save_trader_desk_snapshot()
+        self._ensure_trader_watcher(trader_id)
+
+    def _refresh_trader_desk_runtime(self) -> None:
+        for run in list(self._trader_desk_runs):
+            if run.status not in {"running", "quota_exhausted"}:
+                continue
+            self._ensure_trader_watcher(run.trader_id)
+
     def _refresh_status(self) -> None:
         running_count = 0
         self._refresh_session_live_pnl_cache()
@@ -10580,13 +11184,14 @@ class QuantApp:
                 session.status = "已停止"
                 if session.stopped_at is None:
                     session.stopped_at = datetime.now()
-                if not session.ended_reason:
-                    session.ended_reason = "策略线程结束"
+                session.ended_reason = self._session_stop_reason_text(session)
                 self._remove_recoverable_strategy_session(session.session_id)
+                self._trader_desk_handle_stopped_session(session)
             self._upsert_session_row(session)
             self._sync_strategy_history_from_session(session)
 
         self.status_text.set(f"运行中策略：{running_count}")
+        self._refresh_trader_desk_runtime()
         self._refresh_running_session_summary()
         self._update_settings_summary()
         self._refresh_selected_session_details()
@@ -10625,6 +11230,8 @@ class QuantApp:
             self._backtest_compare_window.window.destroy()
         if self._signal_monitor_window is not None and self._signal_monitor_window.window.winfo_exists():
             self._signal_monitor_window.destroy()
+        if self._trader_desk_window is not None and self._trader_desk_window.window.winfo_exists():
+            self._trader_desk_window.destroy()
         if self._smart_order_window is not None and self._smart_order_window.window.winfo_exists():
             self._smart_order_window.destroy()
         if (
@@ -12207,8 +12814,6 @@ def _trade_order_program_owner_label(item: OkxTradeOrderItem) -> str | None:
 
 def _session_order_prefixes(session: StrategySession) -> tuple[str, ...]:
     session_token = "".join(ch for ch in session.session_id.lower() if ch.isascii() and ch.isalnum())[:4] or "sess"
-    if is_spot_enhancement_strategy_id(session.strategy_id):
-        return (f"{session_token}spot",)
     strategy_token = "".join(ch for ch in session.strategy_name.lower() if ch.isascii() and ch.isalnum())[:4] or "stg"
     return (f"{session_token}{strategy_token}",)
 

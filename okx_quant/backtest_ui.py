@@ -38,7 +38,6 @@ from okx_quant.strategy_catalog import (
     StrategyDefinition,
     get_strategy_definition,
     is_dynamic_strategy_id,
-    is_slot_handoff_strategy_id,
     resolve_dynamic_signal_mode,
 )
 from okx_quant.window_layout import apply_adaptive_window_geometry
@@ -437,20 +436,6 @@ def _build_backtest_param_summary(
             f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
         )
 
-    if is_slot_handoff_strategy_id(config.strategy_id):
-        profile_prefix = f"候选{config.backtest_profile_name} / " if config.backtest_profile_name else ""
-        return (
-            f"{profile_prefix}EMA{config.ema_period}/{config.trend_ema_period} / ATR{config.atr_period} / "
-            f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
-            f"最大槽位{config.max_entries_per_trend} / 单槽位{format_decimal(config.order_size)} / "
-            f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / "
-            f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
-            f"{'复利' if config.backtest_compounding else '不复利'} / "
-            f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
-            f"{_format_backtest_slippage_summary(config)} / "
-            f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
-        )
-
     if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
         if config.backtest_sizing_mode == "risk_percent":
@@ -706,6 +691,21 @@ def _manual_focus_window(
     return start_index, visible_count, anchor_index
 
 
+def _has_extension_stats(result: BacktestResult | None) -> bool:
+    if result is None:
+        return False
+    report = result.report
+    return bool(
+        result.manual_positions
+        or report.manual_handoffs
+        or report.manual_open_positions
+        or report.manual_open_size != 0
+        or report.manual_open_pnl != 0
+        or report.max_manual_positions
+        or report.max_total_occupied_slots
+    )
+
+
 def _build_manual_pool_summary(
     result: BacktestResult,
     config: StrategyConfig,
@@ -714,8 +714,8 @@ def _build_manual_pool_summary(
     filter_label: str | None = None,
     sort_label: str | None = None,
 ) -> str:
-    if not is_slot_handoff_strategy_id(config.strategy_id):
-        return "当前策略未启用人工接管池。"
+    if not result.manual_positions:
+        return "当前策略没有额外托管仓位统计。"
 
     report = result.report
     current_ts = result.manual_positions[0].current_ts if result.manual_positions else (result.candles[-1].ts if result.candles else None)
@@ -728,9 +728,9 @@ def _build_manual_pool_summary(
     total_entry_fee = sum((item.entry_fee for item in result.manual_positions), Decimal("0"))
     total_funding = sum((item.funding_cost for item in result.manual_positions), Decimal("0"))
     base_text = (
-        f"当前时间：{current_time_text} | 人工池：{report.manual_open_positions} 笔 / "
+        f"当前时间：{current_time_text} | 托管仓位：{report.manual_open_positions} 笔 / "
         f"{format_decimal_fixed(report.manual_open_size, 4)} | 浮盈亏：{format_decimal_fixed(report.manual_open_pnl, 4)} | "
-        f"累计移交：{report.manual_handoffs} | 峰值人工池：{report.max_manual_positions} | "
+        f"累计转托管：{report.manual_handoffs} | 峰值托管仓位：{report.max_manual_positions} | "
         f"峰值占槽：{slot_limit_text} | 开仓手续费：{format_decimal_fixed(total_entry_fee, 4)} | "
         f"资金费：{format_decimal_fixed(total_funding, 4)}"
     )
@@ -1255,7 +1255,7 @@ class BacktestWindow:
             value="填 0 = 全量；填 10000 = 最新往前 10000 根。可先点“同步历史数据”下载 5 个币种的 5m / 15m / 1H / 4H 全量缓存。"
         )
         self.report_summary = StringVar(value="点击“开始回测”后，会在这里显示报告摘要。")
-        self.manual_summary = StringVar(value="当前策略未启用人工接管池。")
+        self.manual_summary = StringVar(value="当前策略没有额外扩展统计。")
         self.manual_filter_label = StringVar(value="全部")
         self.manual_sort_label = StringVar(value=MANUAL_DEFAULT_SORT_LABEL)
         self.compare_summary = StringVar(value="暂无回测对比记录。")
@@ -1281,6 +1281,9 @@ class BacktestWindow:
         self._backtest_snapshot_order: list[str] = []
         self._backtest_snapshot_sequence = 0
         self._manual_tree_position_map: dict[str, BacktestManualPosition] = {}
+        self._trades_notebook: ttk.Notebook | None = None
+        self._trade_tab: ttk.Frame | None = None
+        self._extension_stats_tab: ttk.Frame | None = None
         self._current_snapshot_id: str | None = None
         self._backtest_running = False
         self._history_sync_running = False
@@ -1746,13 +1749,16 @@ class BacktestWindow:
 
         trades_notebook = ttk.Notebook(trades_frame)
         trades_notebook.grid(row=0, column=0, sticky="nsew")
+        self._trades_notebook = trades_notebook
 
         trade_tab = ttk.Frame(trades_notebook, padding=8)
         trade_tab.columnconfigure(0, weight=1)
         trade_tab.rowconfigure(0, weight=1)
+        self._trade_tab = trade_tab
         manual_tab = ttk.Frame(trades_notebook, padding=8)
         manual_tab.columnconfigure(0, weight=1)
         manual_tab.rowconfigure(2, weight=1)
+        self._extension_stats_tab = manual_tab
 
         trade_tree_frame = ttk.Frame(trade_tab)
         trade_tree_frame.grid(row=0, column=0, sticky="nsew")
@@ -1915,7 +1921,6 @@ class BacktestWindow:
         manual_tree_scroll_x.grid(row=1, column=0, sticky="ew")
 
         trades_notebook.add(trade_tab, text="已平仓")
-        trades_notebook.add(manual_tab, text="人工池")
 
         self.chart_frame = ttk.LabelFrame(self.window, text="K线图、资金曲线与止盈止损触发位置 | 暂无选中回测", padding=12)
         self.chart_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
@@ -1940,13 +1945,6 @@ class BacktestWindow:
 
     def _update_sizing_mode_widgets(self) -> None:
         definition = self._selected_strategy_definition()
-        if is_slot_handoff_strategy_id(definition.strategy_id):
-            self.sizing_mode_label.set("固定数量")
-            self.size_or_risk_label.configure(text="单槽位数量")
-            self.size_or_risk_entry.configure(state="normal")
-            self.risk_percent_entry.configure(state="disabled")
-            self.sizing_mode_combo.configure(state="disabled")
-            return
         self.sizing_mode_combo.configure(state="readonly")
         mode = BACKTEST_SIZING_OPTIONS.get(self.sizing_mode_label.get(), "fixed_risk")
         if mode == "fixed_size":
@@ -2069,10 +2067,7 @@ class BacktestWindow:
             messagebox.showerror("回测参数错误", str(exc), parent=self.window)
             return
 
-        if is_slot_handoff_strategy_id(config.strategy_id):
-            summary_text = f"正在批量深测 {batch_count} 组 5m 槽位接管候选策略，请稍候..."
-        else:
-            summary_text = f"正在批量回测 {batch_count} 组参数组合，请稍候..."
+        summary_text = f"正在批量回测 {batch_count} 组参数组合，请稍候..."
         self._prepare_backtest_output(summary_text)
         self._set_backtest_running(True)
         batch_label = self._next_batch_label()
@@ -2117,11 +2112,7 @@ class BacktestWindow:
         self.report_summary.set(summary_text)
         self.report_text.delete("1.0", END)
         self._clear_detail_tables(
-            manual_summary_text=(
-                "等待回测结果后，这里会显示人工接管仓位。"
-                if is_slot_handoff_strategy_id(self._selected_strategy_definition().strategy_id)
-                else "当前策略未启用人工接管池。"
-            )
+            manual_summary_text="当前策略没有额外扩展统计。"
         )
         self._current_snapshot_id = None
         self._reset_chart_views()
@@ -2178,15 +2169,33 @@ class BacktestWindow:
     def focus_selected_manual_position_on_chart(self) -> None:
         manual_position = self._selected_manual_position()
         if manual_position is None:
-            messagebox.showinfo("人工池", "请先在人工池里选中一条仓位。", parent=self.window)
+            messagebox.showinfo("扩展统计", "请先在扩展统计里选中一条记录。", parent=self.window)
             return
         self._focus_chart_on_manual_position(manual_position)
+
+    def _sync_extension_stats_tab(self, result: BacktestResult | None) -> None:
+        notebook = self._trades_notebook
+        trade_tab = self._trade_tab
+        extension_tab = self._extension_stats_tab
+        if notebook is None or trade_tab is None or extension_tab is None:
+            return
+        should_show = _has_extension_stats(result)
+        extension_tab_id = str(extension_tab)
+        visible_tab_ids = notebook.tabs()
+        is_visible = extension_tab_id in visible_tab_ids
+        if should_show and not is_visible:
+            notebook.add(extension_tab, text="扩展统计")
+            return
+        if not should_show and is_visible:
+            if notebook.select() == extension_tab_id:
+                notebook.select(trade_tab)
+            notebook.forget(extension_tab)
 
     def refresh_manual_tree_view(self) -> None:
         if self._current_snapshot_id is None:
             if self._latest_result is None:
                 return
-            self.manual_summary.set("当前没有人工接管仓位。")
+            self.manual_summary.set("当前策略没有额外扩展统计。")
             return
         snapshot = self._backtest_snapshots.get(self._current_snapshot_id)
         if snapshot is None or snapshot.result is None:
@@ -2197,7 +2206,8 @@ class BacktestWindow:
         self.trade_tree.delete(*self.trade_tree.get_children())
         self.manual_tree.delete(*self.manual_tree.get_children())
         self._manual_tree_position_map.clear()
-        self.manual_summary.set(manual_summary_text or "当前没有人工接管仓位。")
+        self.manual_summary.set(manual_summary_text or "当前策略没有额外扩展统计。")
+        self._sync_extension_stats_tab(None)
 
     def _populate_trade_tree(self, trades: list[BacktestTrade]) -> None:
         self.trade_tree.delete(*self.trade_tree.get_children())
@@ -2486,10 +2496,7 @@ class BacktestWindow:
     def _build_config(self) -> StrategyConfig:
         definition = self._selected_strategy_definition()
         dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
-        slot_strategy = is_slot_handoff_strategy_id(definition.strategy_id)
         sizing_mode = BACKTEST_SIZING_OPTIONS[self.sizing_mode_label.get()]
-        if slot_strategy and sizing_mode != "fixed_size":
-            raise ValueError("槽位接管策略当前只支持固定数量。")
         size_or_risk = self._parse_positive_decimal(self.risk_amount.get(), "固定风险金/数量")
         risk_percent = None
         order_size = Decimal("0")
@@ -2525,8 +2532,6 @@ class BacktestWindow:
                 if time_stop_break_even_enabled
                 else 0
             )
-        if slot_strategy:
-            max_entries_per_trend = self._parse_positive_int(self.max_entries_per_trend.get(), "最大槽位数")
         entry_slippage_rate = self._parse_nonnegative_decimal(self.entry_slippage_percent.get(), "开仓滑点") / Decimal("100")
         exit_slippage_rate = self._parse_nonnegative_decimal(self.exit_slippage_percent.get(), "平仓滑点") / Decimal("100")
         return StrategyConfig(
@@ -2580,7 +2585,6 @@ class BacktestWindow:
     def _apply_selected_strategy_definition(self) -> None:
         definition = self._selected_strategy_definition()
         dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
-        slot_strategy = is_slot_handoff_strategy_id(definition.strategy_id)
         self.signal_combo["values"] = definition.allowed_signal_labels
         if self.signal_mode_label.get() not in definition.allowed_signal_labels:
             self.signal_mode_label.set(definition.default_signal_label)
@@ -2624,30 +2628,14 @@ class BacktestWindow:
                     widget.grid()
                 else:
                     widget.grid_remove()
-            if slot_strategy:
-                self.max_entries_caption.configure(text="最大槽位数")
-                self.max_entries_caption.grid()
-                self.max_entries_entry.grid()
-            elif not dynamic_strategy:
+            if not dynamic_strategy:
                 self.max_entries_caption.configure(text="每波最多开仓次数")
         if dynamic_strategy and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
-        if slot_strategy:
-            self.take_profit_mode_label.set("固定止盈")
-            if not self.max_entries_per_trend.get().strip() or self.max_entries_per_trend.get().strip() == "0":
-                self.max_entries_per_trend.set("10")
-            if BACKTEST_SIZING_OPTIONS.get(self.sizing_mode_label.get()) != "fixed_size":
-                self.sizing_mode_label.set("固定数量")
-            if not self.risk_amount.get().strip():
-                self.risk_amount.set("1")
         self._sync_dynamic_take_profit_controls()
         self._update_sizing_mode_widgets()
         if self._latest_result is None:
-            self.manual_summary.set(
-                "等待回测结果后，这里会显示人工接管仓位。"
-                if slot_strategy
-                else "当前策略未启用人工接管池。"
-            )
+            self.manual_summary.set("当前策略没有额外扩展统计。")
 
     def _sync_dynamic_take_profit_controls(self) -> None:
         if not hasattr(self, "dynamic_two_r_break_even_check"):
@@ -2964,8 +2952,8 @@ class BacktestWindow:
                 f"总盈亏：{format_decimal_fixed(snapshot.report.total_pnl, 4)}\n"
                 f"胜率：{format_decimal_fixed(snapshot.report.win_rate, 2)}%\n"
                 f"交易数：{snapshot.report.total_trades}笔\n"
-                f"移交：{snapshot.report.manual_handoffs} / 期末人工池：{snapshot.report.manual_open_positions}\n"
-                f"峰值占槽：{snapshot.report.max_total_occupied_slots}"
+                f"PF：{format_decimal_fixed(snapshot.report.profit_factor or Decimal('0'), 2)}\n"
+                f"平均R：{format_decimal_fixed(snapshot.report.average_r_multiple, 2)}"
             )
             ttk.Label(
                 frame,
@@ -3321,7 +3309,7 @@ class BacktestWindow:
             render_snapshots = ordered_snapshots
             self.heatmap_summary.set(
                 f"批次：{batch_label} | 交易对：{symbol_text} | 周期：{bar_text} | 方向：{signal_label} | "
-                f"指标：{metric_label} | 当前为 5m 槽位接管候选策略池。"
+                f"指标：{metric_label} | 当前为 5m 候选策略池。"
             )
         elif batch_mode == "dynamic_entries":
             render_snapshots = ordered_snapshots
@@ -3530,6 +3518,7 @@ class BacktestWindow:
         result = snapshot.result
         self._current_snapshot_id = snapshot_id
         self._latest_result = result
+        self._sync_extension_stats_tab(result)
         self._reset_chart_views()
         self._set_chart_title(self._build_chart_title_for_snapshot(snapshot))
         self._refresh_zoom_chart_header()

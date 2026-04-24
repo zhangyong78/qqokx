@@ -2,7 +2,6 @@ from decimal import Decimal
 from unittest import TestCase
 from unittest.mock import MagicMock
 
-from okx_quant.enhanced_live_engine import EnhancedStrategyEngine
 from okx_quant.engine import StrategyEngine
 from okx_quant.models import EmailNotificationConfig, StrategyConfig
 from okx_quant.notifications import EmailNotifier
@@ -127,14 +126,3 @@ class StrategyEngineNotificationTest(TestCase):
         engine._notify_error(_make_strategy_config(run_mode="signal_only"), "读取失败")
 
         self.assertEqual(notifier.send_error.call_args.kwargs["api_name"], "")
-
-
-class EnhancedStrategyEngineNotificationTest(TestCase):
-    def test_trade_error_notification_passes_api_name_to_notifier(self) -> None:
-        notifier = MagicMock()
-        engine = EnhancedStrategyEngine(MagicMock(), lambda message: None, notifier=notifier)
-        engine._api_name = "spot-real"
-
-        engine._log_error(_make_strategy_config(), "现货增强异常")
-
-        self.assertEqual(notifier.send_error.call_args.kwargs["api_name"], "spot-real")
