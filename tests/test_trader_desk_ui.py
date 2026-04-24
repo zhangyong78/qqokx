@@ -14,11 +14,14 @@ from okx_quant.trader_desk_ui import (
     _draft_status_label,
     _draft_status_value,
     _draft_template_identity,
+    _gate_effective_price_inputs,
+    _gate_field_ui_state,
     _gate_condition_label,
     _gate_condition_value,
     _normalize_draft_form_values,
     _payload_bar,
     _should_reload_draft_form,
+    _trader_current_session_label,
     _validate_trader_desk_payload,
 )
 
@@ -96,6 +99,19 @@ class TraderDeskHelpersTest(TestCase):
         self.assertEqual(label, "区间内 [下限, 上限]")
         self.assertEqual(_gate_condition_value(label), "between")
 
+    def test_gate_field_ui_state_for_above_only_enables_lower_input(self) -> None:
+        lower_label, lower_state, upper_label, upper_state = _gate_field_ui_state("高于 >=")
+
+        self.assertEqual(lower_label, "触发价 >=")
+        self.assertEqual(lower_state, "normal")
+        self.assertEqual(upper_label, "上限（不填）")
+        self.assertEqual(upper_state, "disabled")
+
+    def test_gate_effective_price_inputs_drop_irrelevant_bounds(self) -> None:
+        self.assertEqual(_gate_effective_price_inputs("above", "95000", "99999"), ("95000", ""))
+        self.assertEqual(_gate_effective_price_inputs("below", "90000", "88000"), ("", "88000"))
+        self.assertEqual(_gate_effective_price_inputs("always", "1", "2"), ("", ""))
+
     def test_draft_status_label_round_trip_uses_chinese_labels(self) -> None:
         label = _draft_status_label("ready")
 
@@ -150,6 +166,34 @@ class TraderDeskHelpersTest(TestCase):
         self.assertIn("交易员固定数量：0.1", text)
         self.assertIn("当前 watcher：", text)
         self.assertIn("会话：S04 | 状态：等待信号 | 线程：运行中", text)
+
+    def test_trader_current_session_label_prefers_armed_session_and_shows_extra_count(self) -> None:
+        snapshot = TraderDeskSnapshot(
+            slots=[
+                TraderSlotRecord(
+                    slot_id="slot-1",
+                    trader_id="T001",
+                    session_id="S01",
+                    api_name="moni",
+                    strategy_name="EMA",
+                    symbol="BTC-USDT-SWAP",
+                    status="open",
+                ),
+                TraderSlotRecord(
+                    slot_id="slot-2",
+                    trader_id="T001",
+                    session_id="S02",
+                    api_name="moni",
+                    strategy_name="EMA",
+                    symbol="BTC-USDT-SWAP",
+                    status="watching",
+                ),
+            ],
+            runs=[SimpleNamespace(trader_id="T001", armed_session_id="S03")],
+        )
+
+        self.assertEqual(_trader_current_session_label(snapshot, "T001"), "S03 +2")
+        self.assertEqual(_trader_current_session_label(snapshot, "T999"), "-")
 
     def test_delete_selected_draft_auto_pauses_watching_trader_and_marks_pending_delete(self) -> None:
         draft = TraderDraftRecord(

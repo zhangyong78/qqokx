@@ -14,6 +14,7 @@ from okx_quant.ui import (
     ProfilePositionSnapshot,
     QuantApp,
     RefreshHealthState,
+    StrategyHistoryRecord,
     StrategyStopCleanupResult,
     StrategyTradeReconciliationSnapshot,
     StrategyTradeRuntimeState,
@@ -525,8 +526,37 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         QuantApp._upsert_session_row(app, session)
 
         self.assertEqual(app.session_tree.rows["S01"]["tags"], ("duplicate_conflict",))
-        self.assertEqual(app.session_tree.rows["S01"]["values"][1], "普通量化")
-        self.assertEqual(app.session_tree.rows["S01"]["values"][4], "1H")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][0], "S01")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][2], "普通量化")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][5], "1H")
+
+    def test_render_strategy_history_view_includes_session_column(self) -> None:
+        record = StrategyHistoryRecord(
+            record_id="R01",
+            session_id="S01",
+            api_name="moni",
+            strategy_id="ema_dynamic_short",
+            strategy_name="EMA 动态委托做空",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+            status="已停止",
+            started_at=datetime(2026, 4, 24, 13, 20, 0),
+            stopped_at=datetime(2026, 4, 24, 13, 25, 0),
+        )
+        tree = _SessionTreeStub()
+        app = SimpleNamespace(
+            _strategy_history_tree=tree,
+            _strategy_history_records=[record],
+            _strategy_history_selected_record_id=None,
+            _next_history_selection_after_mutation=lambda _selected_before, _remaining_ids: None,
+            _refresh_selected_strategy_history_details=lambda: None,
+        )
+
+        QuantApp._render_strategy_history_view(app)
+
+        self.assertEqual(tree.rows["R01"]["values"][0], "S01")
+        self.assertEqual(tree.rows["R01"]["values"][2], "EMA 动态委托做空")
 
     def test_finish_strategy_template_import_warns_and_skips_start_when_duplicate_exists(self) -> None:
         duplicate_session = SimpleNamespace(
@@ -944,6 +974,10 @@ class _SessionTreeStub:
         self._selection: list[str] = []
         self.focused: str | None = None
         self.seen: str | None = None
+
+    @staticmethod
+    def winfo_exists() -> bool:
+        return True
 
     def exists(self, iid: str) -> bool:
         return iid in self.rows

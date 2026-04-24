@@ -20,6 +20,7 @@ TemplateCloner = Callable[[object, str], object]
 TemplateLauncher = Callable[[object, str], str]
 SessionProvider = Callable[[], list[dict[str, str]]]
 SessionStopper = Callable[[list[str]], None]
+SessionDeleter = Callable[[list[str]], tuple[int, list[str]]]
 
 DEFAULT_SIGNAL_OBSERVER_SYMBOLS: tuple[str, ...] = (
     "BTC-USDT-SWAP",
@@ -61,6 +62,7 @@ class SignalMonitorWindow:
         template_launcher: TemplateLauncher,
         session_provider: SessionProvider,
         session_stopper: SessionStopper,
+        session_deleter: SessionDeleter,
     ) -> None:
         self._logger = logger
         self._current_template_factory = current_template_factory
@@ -70,6 +72,7 @@ class SignalMonitorWindow:
         self._template_launcher = template_launcher
         self._session_provider = session_provider
         self._session_stopper = session_stopper
+        self._session_deleter = session_deleter
         self._drafts: list[_ObserverDraft] = []
         self._draft_counter = 0
         self._refresh_job: str | None = None
@@ -79,7 +82,7 @@ class SignalMonitorWindow:
             for symbol in DEFAULT_SIGNAL_OBSERVER_SYMBOLS
         }
         self._custom_symbols = StringVar(value="")
-        self._status_text = StringVar(value="草稿 0 条 | 运行中 0 条")
+        self._status_text = StringVar(value="信号 0 条 | 运行中 0 条")
 
         self.window = Toplevel(parent)
         self.window.title("信号观察台")
@@ -141,7 +144,7 @@ class SignalMonitorWindow:
         ttk.Label(header, textvariable=self._status_text).grid(row=0, column=1, sticky="e")
         ttk.Label(
             header,
-            text="统一管理 signal_only 策略草稿，支持多币种批量启动，只观察不下单。",
+            text="统一管理 signal_only 信号，支持多币种批量启动，只观察不下单。",
             foreground="#556070",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
@@ -152,7 +155,7 @@ class SignalMonitorWindow:
         body.rowconfigure(0, weight=1)
         body.rowconfigure(1, weight=1)
 
-        left = ttk.LabelFrame(body, text="观察草稿", padding=12)
+        left = ttk.LabelFrame(body, text="观察信号", padding=12)
         left.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 12))
         left.columnconfigure(0, weight=1)
         left.rowconfigure(2, weight=1)
@@ -161,9 +164,9 @@ class SignalMonitorWindow:
         toolbar.grid(row=0, column=0, sticky="ew")
         ttk.Button(toolbar, text="加入当前参数", command=self.add_current_template).grid(row=0, column=0)
         ttk.Button(toolbar, text="复制到勾选币种", command=self.clone_selected_to_symbols).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(toolbar, text="启动选中草稿", command=self.start_selected_drafts).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(toolbar, text="启动全部草稿", command=self.start_all_drafts).grid(row=0, column=3, padx=(8, 0))
-        ttk.Button(toolbar, text="删除选中草稿", command=self.delete_selected_drafts).grid(row=0, column=4, padx=(8, 0))
+        ttk.Button(toolbar, text="启动选中信号", command=self.start_selected_drafts).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(toolbar, text="启动全部信号", command=self.start_all_drafts).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(toolbar, text="删除选中信号", command=self.delete_selected_drafts).grid(row=0, column=4, padx=(8, 0))
 
         symbol_frame = ttk.LabelFrame(left, text="默认批量币种", padding=10)
         symbol_frame.grid(row=1, column=0, sticky="ew", pady=(10, 10))
@@ -188,7 +191,7 @@ class SignalMonitorWindow:
         )
         self.draft_tree.grid(row=2, column=0, sticky="nsew")
         for column, text, width, anchor in (
-            ("draft", "草稿", 90, "center"),
+            ("draft", "信号", 90, "center"),
             ("strategy", "策略", 180, "w"),
             ("symbol", "标的", 160, "w"),
             ("api", "API", 90, "center"),
@@ -209,6 +212,7 @@ class SignalMonitorWindow:
         run_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ttk.Button(run_toolbar, text="刷新", command=self._refresh_views).grid(row=0, column=0)
         ttk.Button(run_toolbar, text="停止选中会话", command=self.stop_selected_sessions).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(run_toolbar, text="删除选中会话", command=self.delete_selected_sessions).grid(row=0, column=2, padx=(8, 0))
         self.session_tree = ttk.Treeview(
             upper_right,
             columns=("session", "strategy", "symbol", "api", "status", "last"),
@@ -239,9 +243,9 @@ class SignalMonitorWindow:
             justify="left",
             text="\n".join(
                 [
-                    "1. 先在主界面把参数调好，再点“加入当前参数”保存成观察草稿。",
+                    "1. 先在主界面把参数调好，再点“加入当前参数”保存成观察信号。",
                     "2. 这里启动的都是 signal_only，会沿用策略本体逻辑，不再维护独立信号算法。",
-                    "3. 可以把同一草稿复制到多个币种，适合一键启动邮件提醒。",
+                    "3. 可以把同一信号复制到多个币种，适合一键启动邮件提醒。",
                     "4. 真正的额度托管与审批，会放到独立的交易员管理台。",
                 ]
             ),
@@ -266,7 +270,7 @@ class SignalMonitorWindow:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
-            self._append_log(f"读取草稿失败：{exc}")
+            self._append_log(f"读取信号失败：{exc}")
             return
         if not isinstance(payload, list):
             return
@@ -345,12 +349,12 @@ class SignalMonitorWindow:
         self._drafts.append(draft)
         self._save_drafts()
         self._refresh_views()
-        self._append_log(f"[{draft.draft_id}] 已加入当前 signal_only 草稿。")
+        self._append_log(f"[{draft.draft_id}] 已加入当前 signal_only 信号。")
 
     def clone_selected_to_symbols(self) -> None:
         drafts = self._selected_drafts()
         if not drafts:
-            messagebox.showinfo("提示", "请先选中一条草稿。", parent=self.window)
+            messagebox.showinfo("提示", "请先选中一条信号。", parent=self.window)
             return
         symbols = self._selected_symbols()
         if not symbols:
@@ -374,32 +378,32 @@ class SignalMonitorWindow:
                 )
                 created += 1
         if created <= 0:
-            messagebox.showwarning("提示", "没有生成新的草稿。", parent=self.window)
+            messagebox.showwarning("提示", "没有生成新的信号。", parent=self.window)
             return
         self._save_drafts()
         self._refresh_views()
-        self._append_log(f"已复制 {created} 条草稿到批量币种。")
+        self._append_log(f"已复制 {created} 条信号到批量币种。")
 
     def delete_selected_drafts(self) -> None:
         selected_ids = set(self._selected_draft_ids())
         if not selected_ids:
-            messagebox.showinfo("提示", "请先选中要删除的草稿。", parent=self.window)
+            messagebox.showinfo("提示", "请先选中要删除的信号。", parent=self.window)
             return
         self._drafts = [item for item in self._drafts if item.draft_id not in selected_ids]
         self._save_drafts()
         self._refresh_views()
-        self._append_log(f"已删除 {len(selected_ids)} 条观察草稿。")
+        self._append_log(f"已删除 {len(selected_ids)} 条观察信号。")
 
     def _start_drafts(self, drafts: list[_ObserverDraft], source_label: str) -> None:
         if not drafts:
-            messagebox.showinfo("提示", "没有可启动的草稿。", parent=self.window)
+            messagebox.showinfo("提示", "没有可启动的信号。", parent=self.window)
             return
         started = 0
         failures: list[str] = []
         for draft in drafts:
             template = self._template_deserializer(draft.template_payload)
             if template is None:
-                failures.append(f"{draft.draft_id}: 草稿已损坏")
+                failures.append(f"{draft.draft_id}: 信号已损坏")
                 continue
             try:
                 session_id = self._template_launcher(template, source_label)
@@ -412,7 +416,7 @@ class SignalMonitorWindow:
         if failures:
             messagebox.showwarning("部分启动失败", "\n".join(failures[:12]), parent=self.window)
         if started:
-            self._append_log(f"本次共启动 {started} 条草稿。")
+            self._append_log(f"本次共启动 {started} 条信号。")
 
     def start_selected_drafts(self) -> None:
         self._start_drafts(self._selected_drafts(), "selected")
@@ -431,6 +435,39 @@ class SignalMonitorWindow:
             messagebox.showerror("停止失败", str(exc), parent=self.window)
             return
         self._append_log(f"已请求停止 {len(session_ids)} 个 signal_only 会话。")
+        self._refresh_views()
+
+    def delete_selected_sessions(self) -> None:
+        session_ids = self._selected_session_ids()
+        if not session_ids:
+            messagebox.showinfo("提示", "请先选中要删除的会话。", parent=self.window)
+            return
+        confirmed = messagebox.askyesno(
+            "确认删除",
+            (
+                f"确认从监控列表删除 {len(session_ids)} 个选中会话吗？\n\n"
+                "只会删除已停止的 signal_only 会话记录；"
+                "运行中或停止中的会话会保留。"
+            ),
+            parent=self.window,
+        )
+        if not confirmed:
+            return
+        try:
+            deleted_count, blocked_ids = self._session_deleter(session_ids)
+        except Exception as exc:
+            messagebox.showerror("删除失败", str(exc), parent=self.window)
+            return
+        if deleted_count > 0:
+            self._append_log(f"已删除 {deleted_count} 个 signal_only 会话记录。")
+        if blocked_ids:
+            messagebox.showinfo(
+                "部分未删除",
+                f"{len(blocked_ids)} 个会话当前还不能删除，请先停止并等待状态变为“已停止”。",
+                parent=self.window,
+            )
+        elif deleted_count <= 0:
+            messagebox.showinfo("提示", "选中的会话已经不在监控列表中。", parent=self.window)
         self._refresh_views()
 
     def _refresh_draft_tree(self) -> None:
@@ -490,7 +527,7 @@ class SignalMonitorWindow:
     def _refresh_views(self) -> None:
         self._refresh_draft_tree()
         session_count = self._refresh_session_tree()
-        self._status_text.set(f"草稿 {len(self._drafts)} 条 | 运行中 {session_count} 条")
+        self._status_text.set(f"信号 {len(self._drafts)} 条 | 运行中 {session_count} 条")
 
     def _append_log(self, message: str) -> None:
         timestamped = f"[信号观察台] {message}"

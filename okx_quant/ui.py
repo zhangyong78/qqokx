@@ -1932,6 +1932,7 @@ class QuantApp:
         self.session_tree = ttk.Treeview(
             running_frame,
             columns=(
+                "session",
                 "api",
                 "source_type",
                 "strategy",
@@ -1947,6 +1948,7 @@ class QuantApp:
             show="headings",
             selectmode="browse",
         )
+        self.session_tree.heading("session", text="会话")
         self.session_tree.heading("api", text="API")
         self.session_tree.heading("source_type", text="来源类型")
         self.session_tree.heading("strategy", text="策略")
@@ -1958,17 +1960,18 @@ class QuantApp:
         self.session_tree.heading("pnl", text="净盈亏")
         self.session_tree.heading("status", text="状态")
         self.session_tree.heading("started", text="启动时间")
-        self.session_tree.column("api", width=88, anchor="center")
-        self.session_tree.column("source_type", width=108, anchor="center")
-        self.session_tree.column("strategy", width=128, anchor="w")
-        self.session_tree.column("symbol", width=168, anchor="w")
-        self.session_tree.column("bar", width=76, anchor="center")
+        self.session_tree.column("session", width=72, anchor="center")
+        self.session_tree.column("api", width=80, anchor="center")
+        self.session_tree.column("source_type", width=98, anchor="center")
+        self.session_tree.column("strategy", width=120, anchor="w")
+        self.session_tree.column("symbol", width=156, anchor="w")
+        self.session_tree.column("bar", width=68, anchor="center")
         self.session_tree.column("direction", width=82, anchor="center")
-        self.session_tree.column("mode", width=104, anchor="center")
-        self.session_tree.column("live_pnl", width=118, anchor="e")
-        self.session_tree.column("pnl", width=110, anchor="e")
-        self.session_tree.column("status", width=120, anchor="center")
-        self.session_tree.column("started", width=110, anchor="center")
+        self.session_tree.column("mode", width=96, anchor="center")
+        self.session_tree.column("live_pnl", width=112, anchor="e")
+        self.session_tree.column("pnl", width=104, anchor="e")
+        self.session_tree.column("status", width=108, anchor="center")
+        self.session_tree.column("started", width=96, anchor="center")
         self.session_tree.grid(row=1, column=0, sticky="nsew")
         self.session_tree.bind("<<TreeviewSelect>>", self._on_session_selected)
         self.session_tree.tag_configure("duplicate_conflict", background="#fff4e5", foreground="#a85a00")
@@ -6421,6 +6424,7 @@ class QuantApp:
             ),
             session_provider=self._signal_observer_session_rows,
             session_stopper=self._stop_sessions_by_id,
+            session_deleter=self._delete_signal_observer_sessions_by_id,
         )
 
     def open_trader_desk_window(self) -> None:
@@ -7807,6 +7811,36 @@ class QuantApp:
             self._refresh_selected_session_details()
             self._sync_strategy_history_from_session(session)
             self._log_session_message(session, "信号观察台已停止该会话。")
+
+    def _delete_signal_observer_sessions_by_id(self, session_ids: list[str]) -> tuple[int, list[str]]:
+        tree = getattr(self, "session_tree", None)
+        tree_exists = tree is not None and tree.winfo_exists()
+        selected_before = tree.selection()[0] if tree_exists and tree.selection() else None
+        deleted_ids: list[str] = []
+        blocked_ids: list[str] = []
+        for session_id in session_ids:
+            session = self.sessions.get(session_id)
+            if session is None:
+                continue
+            if session.config.run_mode != "signal_only" or not QuantApp._session_can_be_cleared(session):
+                blocked_ids.append(session_id)
+                continue
+            self.sessions.pop(session_id, None)
+            self._remove_recoverable_strategy_session(session_id)
+            if tree_exists and tree.exists(session_id):
+                tree.delete(session_id)
+            deleted_ids.append(session_id)
+        if deleted_ids:
+            if tree_exists:
+                remaining = tuple(tree.get_children())
+                next_selection = QuantApp._next_session_selection_after_clear(selected_before, remaining)
+                if next_selection is not None:
+                    tree.selection_set(next_selection)
+                    tree.focus(next_selection)
+                    tree.see(next_selection)
+            self._refresh_selected_session_details()
+            self._refresh_running_session_summary()
+        return len(deleted_ids), blocked_ids
 
     def _launch_strategy_template_record(
         self,
@@ -10056,6 +10090,7 @@ class QuantApp:
         bar_label = str(getattr(getattr(session, "config", None), "bar", "") or "").strip() or "-"
         tags = ("duplicate_conflict",) if QuantApp._session_has_duplicate_launch_conflict(self, session) else ()
         values = (
+            session.session_id,
             session.api_name or "-",
             source_type,
             session.strategy_name,
@@ -10842,11 +10877,12 @@ class QuantApp:
 
         self._strategy_history_tree = ttk.Treeview(
             list_frame,
-            columns=("api", "strategy", "symbol", "direction", "mode", "pnl", "status", "started", "stopped"),
+            columns=("session", "api", "strategy", "symbol", "direction", "mode", "pnl", "status", "started", "stopped"),
             show="headings",
             selectmode="browse",
         )
         tree = self._strategy_history_tree
+        tree.heading("session", text="会话")
         tree.heading("api", text="API")
         tree.heading("strategy", text="策略")
         tree.heading("symbol", text="标的")
@@ -10856,15 +10892,16 @@ class QuantApp:
         tree.heading("status", text="状态")
         tree.heading("started", text="启动时间")
         tree.heading("stopped", text="停止时间")
-        tree.column("api", width=96, anchor="center")
-        tree.column("strategy", width=150, anchor="w")
-        tree.column("symbol", width=190, anchor="w")
-        tree.column("direction", width=90, anchor="center")
-        tree.column("mode", width=110, anchor="center")
+        tree.column("session", width=76, anchor="center")
+        tree.column("api", width=88, anchor="center")
+        tree.column("strategy", width=138, anchor="w")
+        tree.column("symbol", width=178, anchor="w")
+        tree.column("direction", width=82, anchor="center")
+        tree.column("mode", width=102, anchor="center")
         tree.column("pnl", width=110, anchor="e")
-        tree.column("status", width=96, anchor="center")
-        tree.column("started", width=160, anchor="center")
-        tree.column("stopped", width=160, anchor="center")
+        tree.column("status", width=92, anchor="center")
+        tree.column("started", width=150, anchor="center")
+        tree.column("stopped", width=150, anchor="center")
         tree.grid(row=0, column=0, sticky="nsew")
         tree.bind("<<TreeviewSelect>>", self._on_strategy_history_selected)
         history_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
@@ -11116,6 +11153,7 @@ class QuantApp:
                 END,
                 iid=record.record_id,
                 values=(
+                    record.session_id or "-",
                     record.api_name or "-",
                     record.strategy_name,
                     record.symbol,

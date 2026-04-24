@@ -180,6 +180,50 @@ def _format_optional_pnl(value: Decimal | None) -> str:
     return format_decimal_fixed(decimal_value, 2)
 
 
+def _gate_field_ui_state(condition: str) -> tuple[str, str, str, str]:
+    normalized = _gate_condition_value(condition)
+    if normalized == "above":
+        return ("触发价 >=", "normal", "上限（不填）", "disabled")
+    if normalized == "below":
+        return ("下限（不填）", "disabled", "触发价 <=", "normal")
+    if normalized == "between":
+        return ("区间下限 >=", "normal", "区间上限 <=", "normal")
+    return ("下限（无需填写）", "disabled", "上限（无需填写）", "disabled")
+
+
+def _gate_effective_price_inputs(condition: str, lower_price: str, upper_price: str) -> tuple[str, str]:
+    normalized = _gate_condition_value(condition)
+    if normalized == "above":
+        return (lower_price, "")
+    if normalized == "below":
+        return ("", upper_price)
+    if normalized == "between":
+        return (lower_price, upper_price)
+    return ("", "")
+
+
+def _trader_current_session_label(snapshot: TraderDeskSnapshot, trader_id: str) -> str:
+    run = next((item for item in snapshot.runs if item.trader_id == trader_id), None)
+    active_session_ids: list[str] = []
+    if run is not None and run.armed_session_id:
+        active_session_ids.append(run.armed_session_id)
+    for slot in sorted(
+        trader_slots_for(snapshot.slots, trader_id),
+        key=lambda item: (item.created_at, item.slot_id),
+        reverse=True,
+    ):
+        if slot.status not in {"watching", "open"}:
+            continue
+        session_id = str(slot.session_id or "").strip()
+        if session_id and session_id not in active_session_ids:
+            active_session_ids.append(session_id)
+    if not active_session_ids:
+        return "-"
+    if len(active_session_ids) == 1:
+        return active_session_ids[0]
+    return f"{active_session_ids[0]} +{len(active_session_ids) - 1}"
+
+
 def _gate_condition_label(value: str) -> str:
     normalized = str(value or "").strip()
     if normalized in GATE_CONDITION_LABELS:
@@ -409,6 +453,8 @@ class TraderDeskWindow:
         self.gate_price_type_var = StringVar(value="mark")
         self.gate_lower_price_var = StringVar(value="")
         self.gate_upper_price_var = StringVar(value="")
+        self._gate_lower_label_text = StringVar(value="下限（无需填写）")
+        self._gate_upper_label_text = StringVar(value="上限（无需填写）")
         self.copy_trade_symbol_var = StringVar(value="")
         self.copy_trigger_symbol_var = StringVar(value="")
 
@@ -431,11 +477,14 @@ class TraderDeskWindow:
         self.event_text: Text | None = None
         self.detail_text: Text | None = None
         self._gate_trigger_combo: ttk.Combobox | None = None
+        self._gate_lower_entry: ttk.Entry | None = None
+        self._gate_upper_entry: ttk.Entry | None = None
         self._copy_trade_combo: ttk.Combobox | None = None
         self._copy_trigger_combo: ttk.Combobox | None = None
 
         self._bind_form_dirty_tracking()
         self._build_layout()
+        self._refresh_gate_input_widgets()
         self._refresh_views()
         self._schedule_refresh()
 
@@ -479,11 +528,24 @@ class TraderDeskWindow:
             self.copy_trigger_symbol_var,
         ):
             variable.trace_add("write", self._mark_form_dirty)
+        self.gate_condition_var.trace_add("write", self._on_gate_condition_changed)
 
     def _mark_form_dirty(self, *_: object) -> None:
         if self._suspend_form_tracking:
             return
         self._form_dirty = True
+
+    def _on_gate_condition_changed(self, *_: object) -> None:
+        self._refresh_gate_input_widgets()
+
+    def _refresh_gate_input_widgets(self) -> None:
+        lower_label, lower_state, upper_label, upper_state = _gate_field_ui_state(self.gate_condition_var.get())
+        self._gate_lower_label_text.set(lower_label)
+        self._gate_upper_label_text.set(upper_label)
+        if self._gate_lower_entry is not None:
+            self._gate_lower_entry.configure(state=lower_state)
+        if self._gate_upper_entry is not None:
+            self._gate_upper_entry.configure(state=upper_state)
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
@@ -524,7 +586,7 @@ class TraderDeskWindow:
 
         self.tree = ttk.Treeview(
             left,
-            columns=("trader", "strategy", "bar", "symbol", "api", "run", "quota", "avg", "pnl", "updated"),
+            columns=("trader", "session", "strategy", "bar", "symbol", "api", "run", "quota", "avg", "pnl", "updated"),
             show="headings",
             selectmode="browse",
             height=22,
@@ -533,15 +595,16 @@ class TraderDeskWindow:
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         for column, text, width, anchor in (
             ("trader", "交易员", 80, "center"),
-            ("strategy", "策略", 170, "w"),
-            ("bar", "周期", 70, "center"),
-            ("symbol", "交易/触发", 170, "w"),
+            ("session", "当前会话", 92, "center"),
+            ("strategy", "策略", 150, "w"),
+            ("bar", "周期", 64, "center"),
+            ("symbol", "交易/触发", 156, "w"),
             ("api", "API", 80, "center"),
             ("run", "运行状态", 110, "center"),
-            ("quota", "额度格", 110, "center"),
+            ("quota", "额度格", 104, "center"),
             ("avg", "当前均价", 110, "center"),
             ("pnl", "累计净盈亏", 110, "e"),
-            ("updated", "更新时间", 150, "center"),
+            ("updated", "更新时间", 138, "center"),
         ):
             self.tree.heading(column, text=text)
             self.tree.column(column, width=width, anchor=anchor)
@@ -605,10 +668,12 @@ class TraderDeskWindow:
             values=PRICE_TYPE_VALUES,
             state="readonly",
         ).grid(row=2, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(gate_frame, text="下限").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(gate_frame, textvariable=self.gate_lower_price_var).grid(row=3, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(gate_frame, text="上限").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(gate_frame, textvariable=self.gate_upper_price_var).grid(row=4, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(gate_frame, textvariable=self._gate_lower_label_text).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self._gate_lower_entry = ttk.Entry(gate_frame, textvariable=self.gate_lower_price_var)
+        self._gate_lower_entry.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(gate_frame, textvariable=self._gate_upper_label_text).grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self._gate_upper_entry = ttk.Entry(gate_frame, textvariable=self.gate_upper_price_var)
+        self._gate_upper_entry.grid(row=4, column=1, sticky="ew", pady=(8, 0))
 
         copy_frame = ttk.LabelFrame(right_top, text="复制到目标标的", padding=10)
         copy_frame.grid(row=8, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
@@ -855,6 +920,12 @@ class TraderDeskWindow:
         if draft is None:
             messagebox.showinfo("提示", "请先选中一条交易员草稿。", parent=self.window)
             return
+        gate_condition = _gate_condition_value(self.gate_condition_var.get())
+        gate_lower_price, gate_upper_price = _gate_effective_price_inputs(
+            gate_condition,
+            self.gate_lower_price_var.get(),
+            self.gate_upper_price_var.get(),
+        )
         try:
             normalized = normalize_trader_draft_inputs(
                 total_quota=self.total_quota_var.get(),
@@ -862,11 +933,11 @@ class TraderDeskWindow:
                 quota_steps=self.quota_steps_var.get(),
                 status=_draft_status_value(self.status_var.get()),
                 gate_enabled=bool(self.gate_enabled_var.get()),
-                gate_condition=_gate_condition_value(self.gate_condition_var.get()),
+                gate_condition=gate_condition,
                 gate_trigger_inst_id=self.gate_trigger_inst_id_var.get(),
                 gate_trigger_price_type=self.gate_price_type_var.get(),
-                gate_lower_price=self.gate_lower_price_var.get(),
-                gate_upper_price=self.gate_upper_price_var.get(),
+                gate_lower_price=gate_lower_price,
+                gate_upper_price=gate_upper_price,
             )
         except ValueError as exc:
             messagebox.showerror("保存失败", str(exc), parent=self.window)
@@ -979,6 +1050,7 @@ class TraderDeskWindow:
             self._suspend_form_tracking = False
         self._form_dirty = False
         self._set_combo_values(symbol_choices)
+        self._refresh_gate_input_widgets()
 
     def _set_combo_values(self, symbol_choices: list[str]) -> None:
         values = list(dict.fromkeys(["", *symbol_choices]))
@@ -1008,6 +1080,7 @@ class TraderDeskWindow:
                 iid=draft.trader_id,
                 values=(
                     draft.trader_id,
+                    _trader_current_session_label(self._snapshot, draft.trader_id),
                     _strategy_label_from_payload(draft.template_payload),
                     _payload_bar(draft.template_payload),
                     str(draft.template_payload.get("symbol") or "-"),
