@@ -12,13 +12,20 @@ from okx_quant.okx_client import Instrument, OkxOrderResult, OkxPosition
 from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_SHORT_ID
 from okx_quant.trader_desk import TraderDraftRecord, TraderRunState, TraderSlotRecord
 from okx_quant.ui import (
+    NormalStrategyBookFilters,
+    NormalStrategyBookSummary,
     ProfilePositionSnapshot,
     QuantApp,
     RefreshHealthState,
     StrategyHistoryRecord,
+    StrategyTradeLedgerRecord,
     StrategyStopCleanupResult,
     StrategyTradeReconciliationSnapshot,
     StrategyTradeRuntimeState,
+    _build_normal_strategy_book_filter_options,
+    _build_normal_strategy_book_group_rows,
+    _build_normal_strategy_book_ledger_rows,
+    _build_normal_strategy_book_summary,
     _build_current_position_note_record,
     _build_group_row_values,
     _build_history_position_note_record,
@@ -93,6 +100,324 @@ HTTP 502: <!DOCTYPE html>
             _coerce_log_file_path(r"D:\qqokx\logs\strategy_sessions\2026-04-17\session.log"),
             Path(r"D:\qqokx\logs\strategy_sessions\2026-04-17\session.log"),
         )
+
+    def test_build_normal_strategy_book_summary_filters_out_trader_history(self) -> None:
+        history_records = [
+            StrategyHistoryRecord(
+                record_id="R-ordinary",
+                session_id="S01",
+                api_name="moni",
+                strategy_id="ema_dynamic_long",
+                strategy_name="EMA 动态委托做多",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                status="已停止",
+                started_at=datetime(2026, 4, 26, 8, 0, 0),
+                config_snapshot={"run_mode": "trade", "bar": "1m"},
+            ),
+            StrategyHistoryRecord(
+                record_id="R-trader",
+                session_id="S02",
+                api_name="moni",
+                strategy_id="ema_dynamic_short",
+                strategy_name="EMA 动态委托做空",
+                symbol="SOL-USDT-SWAP",
+                direction_label="只做空",
+                run_mode_label="交易并下单",
+                status="已停止",
+                started_at=datetime(2026, 4, 26, 8, 5, 0),
+                config_snapshot={"run_mode": "trade", "bar": "1m", "trader_virtual_stop_loss": True},
+            ),
+        ]
+        ledger_records = [
+            StrategyTradeLedgerRecord(
+                record_id="L-ordinary",
+                history_record_id="R-ordinary",
+                session_id="S01",
+                api_name="moni",
+                strategy_id="ema_dynamic_long",
+                strategy_name="EMA 动态委托做多",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                environment="demo",
+                closed_at=datetime(2026, 4, 26, 9, 0, 0),
+                net_pnl=Decimal("1.25"),
+                gross_pnl=Decimal("1.50"),
+                entry_fee=Decimal("0.10"),
+                exit_fee=Decimal("0.10"),
+            ),
+            StrategyTradeLedgerRecord(
+                record_id="L-trader",
+                history_record_id="R-trader",
+                session_id="S02",
+                api_name="moni",
+                strategy_id="ema_dynamic_short",
+                strategy_name="EMA 动态委托做空",
+                symbol="SOL-USDT-SWAP",
+                direction_label="只做空",
+                run_mode_label="交易并下单",
+                environment="demo",
+                closed_at=datetime(2026, 4, 26, 9, 5, 0),
+                net_pnl=Decimal("-0.50"),
+            ),
+        ]
+
+        summary = _build_normal_strategy_book_summary(ledger_records, history_records)
+
+        self.assertIsInstance(summary, NormalStrategyBookSummary)
+        self.assertEqual(summary.strategy_count, 1)
+        self.assertEqual(summary.history_count, 1)
+        self.assertEqual(summary.trade_count, 1)
+        self.assertEqual(summary.win_count, 1)
+        self.assertEqual(summary.loss_count, 0)
+        self.assertEqual(summary.net_pnl_total, Decimal("1.25"))
+
+    def test_build_normal_strategy_book_group_rows_aggregates_by_api_symbol_bar_and_direction(self) -> None:
+        history_records = [
+            StrategyHistoryRecord(
+                record_id="R01",
+                session_id="S01",
+                api_name="apiA",
+                strategy_id="ema_dynamic_long",
+                strategy_name="EMA 动态委托做多",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                status="已停止",
+                started_at=datetime(2026, 4, 26, 8, 0, 0),
+                config_snapshot={"run_mode": "trade", "bar": "15m"},
+            )
+        ]
+        ledger_records = [
+            StrategyTradeLedgerRecord(
+                record_id="L01",
+                history_record_id="R01",
+                session_id="S01",
+                api_name="apiA",
+                strategy_id="ema_dynamic_long",
+                strategy_name="EMA 动态委托做多",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                environment="demo",
+                closed_at=datetime(2026, 4, 26, 9, 0, 0),
+                net_pnl=Decimal("1.00"),
+                gross_pnl=Decimal("1.20"),
+                entry_fee=Decimal("0.10"),
+                exit_fee=Decimal("0.10"),
+            ),
+            StrategyTradeLedgerRecord(
+                record_id="L02",
+                history_record_id="R01",
+                session_id="S01",
+                api_name="apiA",
+                strategy_id="ema_dynamic_long",
+                strategy_name="EMA 动态委托做多",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                environment="demo",
+                closed_at=datetime(2026, 4, 26, 10, 0, 0),
+                net_pnl=Decimal("-0.40"),
+                gross_pnl=Decimal("-0.20"),
+                entry_fee=Decimal("0.10"),
+                exit_fee=Decimal("0.10"),
+            ),
+        ]
+
+        rows = _build_normal_strategy_book_group_rows(ledger_records, history_records)
+
+        self.assertEqual(len(rows), 1)
+        row_id, values = rows[0]
+        self.assertEqual(row_id, "apiA||-||EMA 动态委托做多||ETH-USDT-SWAP||15m||只做多")
+        self.assertEqual(values[0], "apiA")
+        self.assertEqual(values[1], "-")
+        self.assertEqual(values[4], "15m")
+        self.assertEqual(values[7], 2)
+        self.assertEqual(values[8], 1)
+        self.assertEqual(values[9], 1)
+        self.assertEqual(values[10], "50%")
+        self.assertEqual(values[14], "+0.60")
+
+    def test_build_normal_strategy_book_ledger_rows_keep_close_order(self) -> None:
+        history_records = [
+            StrategyHistoryRecord(
+                record_id="R01",
+                session_id="S01",
+                api_name="apiA",
+                strategy_id="ema_dynamic_short",
+                strategy_name="EMA 动态委托做空",
+                symbol="BTC-USDT-SWAP",
+                direction_label="只做空",
+                run_mode_label="交易并下单",
+                status="已停止",
+                started_at=datetime(2026, 4, 26, 7, 0, 0),
+                config_snapshot={"run_mode": "trade", "bar": "4H"},
+            )
+        ]
+        ledger_records = [
+            StrategyTradeLedgerRecord(
+                record_id="L01",
+                history_record_id="R01",
+                session_id="S01",
+                api_name="apiA",
+                strategy_id="ema_dynamic_short",
+                strategy_name="EMA 动态委托做空",
+                symbol="BTC-USDT-SWAP",
+                direction_label="只做空",
+                run_mode_label="交易并下单",
+                environment="demo",
+                opened_at=datetime(2026, 4, 26, 7, 30, 0),
+                closed_at=datetime(2026, 4, 26, 8, 30, 0),
+                entry_price=Decimal("90000"),
+                exit_price=Decimal("88000"),
+                size=Decimal("0.01"),
+                gross_pnl=Decimal("20"),
+                entry_fee=Decimal("1"),
+                exit_fee=Decimal("1"),
+                funding_fee=Decimal("0.50"),
+                net_pnl=Decimal("18.50"),
+                close_reason="ATR 止盈",
+            )
+        ]
+
+        rows = _build_normal_strategy_book_ledger_rows(ledger_records, history_records)
+
+        self.assertEqual(len(rows), 1)
+        row_id, values = rows[0]
+        self.assertEqual(row_id, "L01")
+        self.assertEqual(values[2], "-")
+        self.assertEqual(values[3], "EMA 动态委托做空")
+        self.assertEqual(values[5], "4H")
+        self.assertEqual(values[6], "只做空")
+        self.assertEqual(values[13], "+20.00")
+        self.assertEqual(values[14], "+2.00")
+        self.assertEqual(values[15], "+0.50")
+        self.assertEqual(values[16], "+18.50")
+
+    def test_build_normal_strategy_book_filter_options_include_trader_and_status(self) -> None:
+        history_records = [
+            StrategyHistoryRecord(
+                record_id="R01",
+                session_id="S01",
+                api_name="apiA",
+                strategy_id="ema_dynamic_long",
+                strategy_name="EMA Long",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                status="已停止",
+                started_at=datetime(2026, 4, 26, 8, 0, 0),
+                config_snapshot={"run_mode": "trade", "bar": "15m", "trader_id": "T008"},
+            )
+        ]
+        ledger_records = [
+            StrategyTradeLedgerRecord(
+                record_id="L01",
+                history_record_id="R01",
+                session_id="S01",
+                api_name="apiA",
+                strategy_id="ema_dynamic_long",
+                strategy_name="EMA Long",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                environment="demo",
+                closed_at=datetime(2026, 4, 26, 9, 0, 0),
+                net_pnl=Decimal("1.00"),
+            )
+        ]
+
+        options = _build_normal_strategy_book_filter_options(ledger_records, history_records)
+
+        self.assertIn("全部交易员", options["trader_label"])
+        self.assertIn("T008", options["trader_label"])
+        self.assertIn("全部状态", options["status"])
+        self.assertIn("已停止", options["status"])
+
+    def test_build_normal_strategy_book_rows_respect_filters(self) -> None:
+        history_records = [
+            StrategyHistoryRecord(
+                record_id="R01",
+                session_id="S01",
+                api_name="apiA",
+                strategy_id="ema_dynamic_long",
+                strategy_name="EMA Long",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                status="已停止",
+                started_at=datetime(2026, 4, 26, 8, 0, 0),
+                config_snapshot={"run_mode": "trade", "bar": "15m", "trader_id": "T001"},
+            ),
+            StrategyHistoryRecord(
+                record_id="R02",
+                session_id="S02",
+                api_name="apiB",
+                strategy_id="ema_dynamic_short",
+                strategy_name="EMA Short",
+                symbol="BTC-USDT-SWAP",
+                direction_label="只做空",
+                run_mode_label="交易并下单",
+                status="运行中",
+                started_at=datetime(2026, 4, 26, 8, 10, 0),
+                config_snapshot={"run_mode": "trade", "bar": "1H"},
+            ),
+        ]
+        ledger_records = [
+            StrategyTradeLedgerRecord(
+                record_id="L01",
+                history_record_id="R01",
+                session_id="S01",
+                api_name="apiA",
+                strategy_id="ema_dynamic_long",
+                strategy_name="EMA Long",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                environment="demo",
+                closed_at=datetime(2026, 4, 26, 9, 0, 0),
+                net_pnl=Decimal("1.00"),
+            ),
+            StrategyTradeLedgerRecord(
+                record_id="L02",
+                history_record_id="R02",
+                session_id="S02",
+                api_name="apiB",
+                strategy_id="ema_dynamic_short",
+                strategy_name="EMA Short",
+                symbol="BTC-USDT-SWAP",
+                direction_label="只做空",
+                run_mode_label="交易并下单",
+                environment="demo",
+                closed_at=datetime(2026, 4, 26, 9, 5, 0),
+                net_pnl=Decimal("-0.50"),
+            ),
+        ]
+        filters = NormalStrategyBookFilters(
+            api_name="apiA",
+            trader_label="T001",
+            strategy_name="EMA Long",
+            symbol="ETH-USDT-SWAP",
+            bar="15m",
+            direction_label="只做多",
+            status="已停止",
+        )
+
+        summary = _build_normal_strategy_book_summary(ledger_records, history_records, filters=filters)
+        group_rows = _build_normal_strategy_book_group_rows(ledger_records, history_records, filters=filters)
+        ledger_rows = _build_normal_strategy_book_ledger_rows(ledger_records, history_records, filters=filters)
+
+        self.assertEqual(summary.trade_count, 1)
+        self.assertEqual(summary.net_pnl_total, Decimal("1.00"))
+        self.assertEqual(len(group_rows), 1)
+        self.assertEqual(group_rows[0][1][0], "apiA")
+        self.assertEqual(group_rows[0][1][1], "T001")
+        self.assertEqual(len(ledger_rows), 1)
+        self.assertEqual(ledger_rows[0][1][1], "apiA")
+        self.assertEqual(ledger_rows[0][1][2], "T001")
 
     def test_refresh_health_marks_stale_after_three_failures_with_cached_success(self) -> None:
         state = RefreshHealthState("\u6301\u4ed3", last_success_at=datetime(2026, 4, 18, 12, 0, 0))

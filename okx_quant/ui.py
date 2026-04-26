@@ -266,6 +266,13 @@ RUN_MODE_OPTIONS = {
     "只发信号邮件": "signal_only",
 }
 RUNNING_SESSION_FILTER_OPTIONS = ("全部", "普通量化", "交易员策略", "信号观察台")
+STRATEGY_BOOK_FILTER_ALL_API = "全部API"
+STRATEGY_BOOK_FILTER_ALL_TRADER = "全部交易员"
+STRATEGY_BOOK_FILTER_ALL_STRATEGY = "全部策略"
+STRATEGY_BOOK_FILTER_ALL_SYMBOL = "全部标的"
+STRATEGY_BOOK_FILTER_ALL_BAR = "全部周期"
+STRATEGY_BOOK_FILTER_ALL_DIRECTION = "全部方向"
+STRATEGY_BOOK_FILTER_ALL_STATUS = "全部状态"
 POSITION_TYPE_OPTIONS = {
     "全部类型": "",
     "永续 SWAP": "SWAP",
@@ -680,6 +687,31 @@ class StrategyHistoryRecord:
     funding_total: Decimal = Decimal("0")
     net_pnl_total: Decimal = Decimal("0")
     last_close_reason: str = ""
+
+
+@dataclass
+class NormalStrategyBookSummary:
+    strategy_count: int = 0
+    history_count: int = 0
+    trade_count: int = 0
+    win_count: int = 0
+    loss_count: int = 0
+    api_count: int = 0
+    gross_pnl_total: Decimal = field(default_factory=lambda: Decimal("0"))
+    fee_total: Decimal = field(default_factory=lambda: Decimal("0"))
+    funding_total: Decimal = field(default_factory=lambda: Decimal("0"))
+    net_pnl_total: Decimal = field(default_factory=lambda: Decimal("0"))
+
+
+@dataclass(frozen=True)
+class NormalStrategyBookFilters:
+    api_name: str = ""
+    trader_label: str = ""
+    strategy_name: str = ""
+    symbol: str = ""
+    bar: str = ""
+    direction_label: str = ""
+    status: str = ""
 
 
 @dataclass
@@ -1133,6 +1165,308 @@ def _coerce_log_file_path(value: object) -> Path | None:
         return None
 
 
+def _history_record_source_type(record: StrategyHistoryRecord) -> str:
+    snapshot = dict(record.config_snapshot or {})
+    if bool(snapshot.get("trader_virtual_stop_loss")):
+        return "交易员策略"
+    run_mode = str(snapshot.get("run_mode") or "").strip().lower()
+    if run_mode == "signal_only":
+        return "信号观察台"
+    return "普通量化"
+
+
+def _history_record_bar_label(record: StrategyHistoryRecord | None) -> str:
+    if record is None:
+        return "-"
+    snapshot = dict(record.config_snapshot or {})
+    return str(snapshot.get("bar") or "").strip() or "-"
+
+
+def _history_record_trader_label(record: StrategyHistoryRecord | None) -> str:
+    if record is None:
+        return "-"
+    snapshot = dict(record.config_snapshot or {})
+    trader_id = str(snapshot.get("trader_id") or "").strip()
+    return trader_id or "-"
+
+
+def _history_record_status_label(record: StrategyHistoryRecord | None) -> str:
+    if record is None:
+        return "-"
+    return str(record.status or "").strip() or "-"
+
+
+def _strategy_book_filter_normalized(value: str, all_label: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized or normalized == all_label:
+        return ""
+    return normalized
+
+
+def _strategy_book_filter_match(actual: str, expected: str) -> bool:
+    return not expected or actual == expected
+
+
+def _normal_strategy_history_records(records: list[StrategyHistoryRecord]) -> list[StrategyHistoryRecord]:
+    ordered = [record for record in records if _history_record_source_type(record) == "普通量化"]
+    ordered.sort(key=lambda item: (item.started_at, item.record_id), reverse=True)
+    return ordered
+
+
+def _normal_strategy_history_record_matches(
+    record: StrategyHistoryRecord,
+    filters: NormalStrategyBookFilters,
+) -> bool:
+    return (
+        _strategy_book_filter_match(record.api_name or "-", filters.api_name)
+        and _strategy_book_filter_match(_history_record_trader_label(record), filters.trader_label)
+        and _strategy_book_filter_match(record.strategy_name or "-", filters.strategy_name)
+        and _strategy_book_filter_match(record.symbol or "-", filters.symbol)
+        and _strategy_book_filter_match(_history_record_bar_label(record), filters.bar)
+        and _strategy_book_filter_match(record.direction_label or "-", filters.direction_label)
+        and _strategy_book_filter_match(_history_record_status_label(record), filters.status)
+    )
+
+
+def _normal_strategy_trade_ledger_records(
+    ledger_records: list[StrategyTradeLedgerRecord],
+    history_records: list[StrategyHistoryRecord],
+    *,
+    filters: NormalStrategyBookFilters | None = None,
+) -> list[StrategyTradeLedgerRecord]:
+    active_filters = filters or NormalStrategyBookFilters()
+    history_by_id = {record.record_id: record for record in history_records}
+    ordered: list[StrategyTradeLedgerRecord] = []
+    for record in ledger_records:
+        history_record = history_by_id.get(record.history_record_id)
+        if history_record is not None:
+            if _history_record_source_type(history_record) != "普通量化":
+                continue
+            if not _normal_strategy_history_record_matches(history_record, active_filters):
+                continue
+        elif "信号" in str(record.run_mode_label or ""):
+            continue
+        else:
+            if not (
+                _strategy_book_filter_match(record.api_name or "-", active_filters.api_name)
+                and _strategy_book_filter_match("-", active_filters.trader_label)
+                and _strategy_book_filter_match(record.strategy_name or "-", active_filters.strategy_name)
+                and _strategy_book_filter_match(record.symbol or "-", active_filters.symbol)
+                and _strategy_book_filter_match("-", active_filters.bar)
+                and _strategy_book_filter_match(record.direction_label or "-", active_filters.direction_label)
+                and _strategy_book_filter_match("-", active_filters.status)
+            ):
+                continue
+        ordered.append(record)
+    ordered.sort(key=lambda item: (item.closed_at, item.record_id), reverse=True)
+    return ordered
+
+
+def _build_normal_strategy_book_filter_options(
+    ledger_records: list[StrategyTradeLedgerRecord],
+    history_records: list[StrategyHistoryRecord],
+) -> dict[str, tuple[str, ...]]:
+    normal_history = _normal_strategy_history_records(history_records)
+    normal_ledgers = _normal_strategy_trade_ledger_records(ledger_records, history_records)
+    history_by_id = {record.record_id: record for record in normal_history}
+
+    def _sorted_with_all(all_label: str, values: set[str]) -> tuple[str, ...]:
+        cleaned = sorted(value for value in values if str(value or "").strip())
+        return (all_label, *cleaned)
+
+    api_names = {record.api_name or "-" for record in normal_ledgers}
+    trader_labels = {_history_record_trader_label(history_by_id.get(record.history_record_id)) for record in normal_ledgers}
+    strategy_names = {record.strategy_name or "-" for record in normal_ledgers}
+    symbols = {record.symbol or "-" for record in normal_ledgers}
+    bars = {_history_record_bar_label(history_by_id.get(record.history_record_id)) for record in normal_ledgers}
+    directions = {record.direction_label or "-" for record in normal_ledgers}
+    statuses = {_history_record_status_label(history_by_id.get(record.history_record_id)) for record in normal_ledgers}
+
+    return {
+        "api_name": _sorted_with_all(STRATEGY_BOOK_FILTER_ALL_API, api_names),
+        "trader_label": _sorted_with_all(STRATEGY_BOOK_FILTER_ALL_TRADER, trader_labels),
+        "strategy_name": _sorted_with_all(STRATEGY_BOOK_FILTER_ALL_STRATEGY, strategy_names),
+        "symbol": _sorted_with_all(STRATEGY_BOOK_FILTER_ALL_SYMBOL, symbols),
+        "bar": _sorted_with_all(STRATEGY_BOOK_FILTER_ALL_BAR, bars),
+        "direction_label": _sorted_with_all(STRATEGY_BOOK_FILTER_ALL_DIRECTION, directions),
+        "status": _sorted_with_all(STRATEGY_BOOK_FILTER_ALL_STATUS, statuses),
+    }
+
+
+def _build_normal_strategy_book_summary(
+    ledger_records: list[StrategyTradeLedgerRecord],
+    history_records: list[StrategyHistoryRecord],
+    *,
+    filters: NormalStrategyBookFilters | None = None,
+) -> NormalStrategyBookSummary:
+    active_filters = filters or NormalStrategyBookFilters()
+    normal_history = [
+        record for record in _normal_strategy_history_records(history_records)
+        if _normal_strategy_history_record_matches(record, active_filters)
+    ]
+    normal_ledgers = _normal_strategy_trade_ledger_records(ledger_records, history_records, filters=active_filters)
+    history_by_id = {record.record_id: record for record in normal_history}
+    strategy_keys: set[tuple[str, str, str, str, str, str]] = set()
+    api_names: set[str] = set()
+    for record in normal_ledgers:
+        history_record = history_by_id.get(record.history_record_id)
+        strategy_keys.add(
+            (
+                record.api_name or "-",
+                _history_record_trader_label(history_record),
+                record.strategy_name or "-",
+                record.symbol or "-",
+                _history_record_bar_label(history_record),
+                record.direction_label or "-",
+            )
+        )
+        if record.api_name:
+            api_names.add(record.api_name)
+    return NormalStrategyBookSummary(
+        strategy_count=len(strategy_keys),
+        history_count=len(normal_history),
+        trade_count=len(normal_ledgers),
+        win_count=sum(1 for record in normal_ledgers if (record.net_pnl or Decimal("0")) > 0),
+        loss_count=sum(1 for record in normal_ledgers if (record.net_pnl or Decimal("0")) <= 0),
+        api_count=len(api_names),
+        gross_pnl_total=sum(((record.gross_pnl or Decimal("0")) for record in normal_ledgers), Decimal("0")),
+        fee_total=sum(
+            (((record.entry_fee or Decimal("0")) + (record.exit_fee or Decimal("0"))) for record in normal_ledgers),
+            Decimal("0"),
+        ),
+        funding_total=sum(((record.funding_fee or Decimal("0")) for record in normal_ledgers), Decimal("0")),
+        net_pnl_total=sum(((record.net_pnl or Decimal("0")) for record in normal_ledgers), Decimal("0")),
+    )
+
+
+def _normal_strategy_book_summary_text(summary: NormalStrategyBookSummary) -> str:
+    return (
+        f"普通量化策略 {summary.strategy_count} 组"
+        f" | 历史会话 {summary.history_count} 条"
+        f" | 平仓 {summary.trade_count} 单"
+        f" | 盈利 {summary.win_count}"
+        f" | 亏损 {summary.loss_count}"
+        f" | API {summary.api_count} 个"
+        f" | 毛盈亏 {_format_optional_usdt_precise(summary.gross_pnl_total, places=2)}"
+        f" | 手续费 {_format_optional_usdt_precise(summary.fee_total, places=2)}"
+        f" | 资金费 {_format_optional_usdt_precise(summary.funding_total, places=2)}"
+        f" | 总净盈亏 {_format_optional_usdt_precise(summary.net_pnl_total, places=2)}"
+    )
+
+
+def _build_normal_strategy_book_group_rows(
+    ledger_records: list[StrategyTradeLedgerRecord],
+    history_records: list[StrategyHistoryRecord],
+    *,
+    filters: NormalStrategyBookFilters | None = None,
+) -> list[tuple[str, tuple[object, ...]]]:
+    normal_ledgers = _normal_strategy_trade_ledger_records(ledger_records, history_records, filters=filters)
+    history_by_id = {record.record_id: record for record in history_records}
+    grouped: dict[tuple[str, str, str, str, str, str], list[StrategyTradeLedgerRecord]] = {}
+    for record in normal_ledgers:
+        history_record = history_by_id.get(record.history_record_id)
+        key = (
+            record.api_name or "-",
+            _history_record_trader_label(history_record),
+            record.strategy_name or "-",
+            record.symbol or "-",
+            _history_record_bar_label(history_record),
+            record.direction_label or "-",
+        )
+        grouped.setdefault(key, []).append(record)
+
+    rows: list[tuple[str, tuple[object, ...]]] = []
+    ordered_items = sorted(
+        grouped.items(),
+        key=lambda item: max(row.closed_at for row in item[1]),
+        reverse=True,
+    )
+    for key, records in ordered_items:
+        api_name, trader_label, strategy_name, symbol, bar, direction_label = key
+        trade_count = len(records)
+        win_count = sum(1 for record in records if (record.net_pnl or Decimal("0")) > 0)
+        loss_count = trade_count - win_count
+        gross_total = sum(((record.gross_pnl or Decimal("0")) for record in records), Decimal("0"))
+        fee_total = sum(
+            (((record.entry_fee or Decimal("0")) + (record.exit_fee or Decimal("0"))) for record in records),
+            Decimal("0"),
+        )
+        funding_total = sum(((record.funding_fee or Decimal("0")) for record in records), Decimal("0"))
+        net_total = sum(((record.net_pnl or Decimal("0")) for record in records), Decimal("0"))
+        win_rate = _format_ratio(Decimal(win_count) / Decimal(trade_count), places=0) if trade_count > 0 else "-"
+        latest_history_record = max(
+            (history_by_id.get(record.history_record_id) for record in records),
+            key=lambda item: item.updated_at or item.stopped_at or item.started_at if item is not None else datetime.min,
+            default=None,
+        )
+        row_id = "||".join(key)
+        rows.append(
+            (
+                row_id,
+                (
+                    api_name,
+                    trader_label,
+                    strategy_name,
+                    symbol,
+                    bar,
+                    direction_label,
+                    _history_record_status_label(latest_history_record),
+                    trade_count,
+                    win_count,
+                    loss_count,
+                    win_rate,
+                    _format_optional_usdt_precise(gross_total, places=2),
+                    _format_optional_usdt_precise(fee_total, places=2),
+                    _format_optional_usdt_precise(funding_total, places=2),
+                    _format_optional_usdt_precise(net_total, places=2),
+                    _format_history_datetime(max(record.closed_at for record in records)),
+                ),
+            )
+        )
+    return rows
+
+
+def _build_normal_strategy_book_ledger_rows(
+    ledger_records: list[StrategyTradeLedgerRecord],
+    history_records: list[StrategyHistoryRecord],
+    *,
+    filters: NormalStrategyBookFilters | None = None,
+) -> list[tuple[str, tuple[object, ...]]]:
+    history_by_id = {record.record_id: record for record in history_records}
+    rows: list[tuple[str, tuple[object, ...]]] = []
+    for record in _normal_strategy_trade_ledger_records(ledger_records, history_records, filters=filters):
+        history_record = history_by_id.get(record.history_record_id)
+        rows.append(
+            (
+                record.record_id,
+                (
+                    _format_history_datetime(record.closed_at),
+                    record.api_name or "-",
+                    _history_record_trader_label(history_record),
+                    record.strategy_name or "-",
+                    record.symbol or "-",
+                    _history_record_bar_label(history_record),
+                    record.direction_label or "-",
+                    _history_record_status_label(history_record),
+                    record.session_id or "-",
+                    _format_history_datetime(record.opened_at),
+                    _format_optional_decimal(record.entry_price),
+                    _format_optional_decimal(record.exit_price),
+                    _format_optional_decimal(record.size),
+                    _format_optional_usdt_precise(record.gross_pnl or Decimal("0"), places=2),
+                    _format_optional_usdt_precise(
+                        (record.entry_fee or Decimal("0")) + (record.exit_fee or Decimal("0")),
+                        places=2,
+                    ),
+                    _format_optional_usdt_precise(record.funding_fee or Decimal("0"), places=2),
+                    _format_optional_usdt_precise(record.net_pnl or Decimal("0"), places=2),
+                    record.close_reason or "-",
+                ),
+            )
+        )
+    return rows
+
+
 def _infer_session_runtime_status(message: str, current_status: str = "") -> str | None:
     text = str(message or "").strip()
     if not text:
@@ -1569,6 +1903,14 @@ class QuantApp:
         self.selected_session_text = StringVar(value=self._default_selected_session_text())
         self._selected_session_detail_session_id: str | None = None
         self.strategy_history_text = StringVar(value=self._default_strategy_history_text())
+        self.strategy_book_summary_text = StringVar(value="普通量化策略总账本尚未打开。")
+        self.strategy_book_api_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_API)
+        self.strategy_book_trader_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_TRADER)
+        self.strategy_book_strategy_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_STRATEGY)
+        self.strategy_book_symbol_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_SYMBOL)
+        self.strategy_book_bar_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_BAR)
+        self.strategy_book_direction_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_DIRECTION)
+        self.strategy_book_status_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_STATUS)
         self.positions_summary_text = StringVar(value="当前尚未获取持仓。")
         self._positions_refresh_badge_text = StringVar(value="未读")
         self.position_total_text = StringVar(value="-")
@@ -1608,6 +1950,16 @@ class QuantApp:
         self._strategy_history_tree: ttk.Treeview | None = None
         self._strategy_history_detail: Text | None = None
         self._strategy_history_selected_record_id: str | None = None
+        self._strategy_book_window: Toplevel | None = None
+        self._strategy_book_group_tree: ttk.Treeview | None = None
+        self._strategy_book_ledger_tree: ttk.Treeview | None = None
+        self._strategy_book_api_combo: ttk.Combobox | None = None
+        self._strategy_book_trader_combo: ttk.Combobox | None = None
+        self._strategy_book_strategy_combo: ttk.Combobox | None = None
+        self._strategy_book_symbol_combo: ttk.Combobox | None = None
+        self._strategy_book_bar_combo: ttk.Combobox | None = None
+        self._strategy_book_direction_combo: ttk.Combobox | None = None
+        self._strategy_book_status_combo: ttk.Combobox | None = None
         self._positions_snapshot_by_profile: dict[str, ProfilePositionSnapshot] = {}
         self._session_live_pnl_cache: dict[str, tuple[Decimal | None, datetime | None]] = {}
 
@@ -2049,11 +2401,14 @@ class QuantApp:
         ttk.Button(control_row, text="历史策略", command=self.open_strategy_history_window).grid(
             row=0, column=3, padx=(8, 0)
         )
-        ttk.Button(control_row, text="导出选中参数", command=self.export_selected_session_template).grid(
+        ttk.Button(control_row, text="策略总账本", command=self.open_strategy_book_window).grid(
             row=0, column=4, padx=(8, 0)
         )
-        ttk.Button(control_row, text="导入策略参数", command=self.import_strategy_template).grid(
+        ttk.Button(control_row, text="导出选中参数", command=self.export_selected_session_template).grid(
             row=0, column=5, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="导入策略参数", command=self.import_strategy_template).grid(
+            row=0, column=6, padx=(8, 0)
         )
 
         detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)
@@ -11675,6 +12030,469 @@ class QuantApp:
                 return session
         return None
 
+    def open_strategy_book_window(self) -> None:
+        if self._strategy_book_window is not None and _widget_exists(self._strategy_book_window):
+            self._strategy_book_window.focus_force()
+            self._refresh_strategy_book_window()
+            return
+
+        window = Toplevel(self.root)
+        apply_window_icon(window)
+        window.title("普通量化策略总账本")
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.82,
+            height_ratio=0.76,
+            min_width=1240,
+            min_height=720,
+            max_width=1780,
+            max_height=1160,
+        )
+        self._strategy_book_window = window
+        window.protocol("WM_DELETE_WINDOW", self._close_strategy_book_window)
+
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(2, weight=1)
+        container.rowconfigure(3, weight=2)
+
+        header = ttk.Frame(container)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(
+            header,
+            text=f"普通量化总账本来源：{strategy_trade_ledger_file_path()}",
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, textvariable=self.strategy_book_summary_text, justify="left").grid(
+            row=1,
+            column=0,
+            sticky="w",
+            pady=(6, 0),
+        )
+        action_row = ttk.Frame(header)
+        action_row.grid(row=0, column=1, rowspan=2, sticky="e")
+        ttk.Button(action_row, text="刷新", command=self._refresh_strategy_book_window).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(action_row, text="关闭", command=self._close_strategy_book_window).grid(row=0, column=1)
+
+        filter_frame = ttk.LabelFrame(container, text="筛选条件", padding=12)
+        filter_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        for column in range(7):
+            filter_frame.columnconfigure(column, weight=1 if column in {1, 3, 5} else 0)
+
+        ttk.Label(filter_frame, text="API").grid(row=0, column=0, sticky="w")
+        self._strategy_book_api_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_book_api_filter,
+            state="readonly",
+            width=14,
+        )
+        self._strategy_book_api_combo.grid(row=0, column=1, sticky="ew", padx=(6, 12))
+
+        ttk.Label(filter_frame, text="交易员").grid(row=0, column=2, sticky="w")
+        self._strategy_book_trader_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_book_trader_filter,
+            state="readonly",
+            width=14,
+        )
+        self._strategy_book_trader_combo.grid(row=0, column=3, sticky="ew", padx=(6, 12))
+
+        ttk.Label(filter_frame, text="策略").grid(row=0, column=4, sticky="w")
+        self._strategy_book_strategy_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_book_strategy_filter,
+            state="readonly",
+            width=20,
+        )
+        self._strategy_book_strategy_combo.grid(row=0, column=5, sticky="ew", padx=(6, 12))
+
+        ttk.Label(filter_frame, text="标的").grid(row=0, column=6, sticky="w")
+        self._strategy_book_symbol_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_book_symbol_filter,
+            state="readonly",
+            width=18,
+        )
+        self._strategy_book_symbol_combo.grid(row=0, column=7, sticky="ew", padx=(6, 0))
+
+        filter_frame.columnconfigure(7, weight=1)
+        ttk.Label(filter_frame, text="周期").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self._strategy_book_bar_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_book_bar_filter,
+            state="readonly",
+            width=14,
+        )
+        self._strategy_book_bar_combo.grid(row=1, column=1, sticky="ew", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(filter_frame, text="方向").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        self._strategy_book_direction_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_book_direction_filter,
+            state="readonly",
+            width=14,
+        )
+        self._strategy_book_direction_combo.grid(row=1, column=3, sticky="ew", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(filter_frame, text="状态").grid(row=1, column=4, sticky="w", pady=(8, 0))
+        self._strategy_book_status_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_book_status_filter,
+            state="readonly",
+            width=20,
+        )
+        self._strategy_book_status_combo.grid(row=1, column=5, sticky="ew", padx=(6, 12), pady=(8, 0))
+
+        ttk.Button(filter_frame, text="重置筛选", command=self._reset_strategy_book_filters).grid(
+            row=1,
+            column=7,
+            sticky="e",
+            pady=(8, 0),
+        )
+
+        for combo in (
+            self._strategy_book_api_combo,
+            self._strategy_book_trader_combo,
+            self._strategy_book_strategy_combo,
+            self._strategy_book_symbol_combo,
+            self._strategy_book_bar_combo,
+            self._strategy_book_direction_combo,
+            self._strategy_book_status_combo,
+        ):
+            combo.bind("<<ComboboxSelected>>", self._on_strategy_book_filter_changed)
+
+        summary_frame = ttk.LabelFrame(container, text="策略汇总", padding=12)
+        summary_frame.grid(row=2, column=0, sticky="nsew")
+        summary_frame.columnconfigure(0, weight=1)
+        summary_frame.rowconfigure(0, weight=1)
+        self._strategy_book_group_tree = ttk.Treeview(
+            summary_frame,
+            columns=(
+                "api",
+                "trader",
+                "strategy",
+                "symbol",
+                "bar",
+                "direction",
+                "status",
+                "trades",
+                "wins",
+                "losses",
+                "rate",
+                "gross",
+                "fee",
+                "funding",
+                "net",
+                "closed",
+            ),
+            show="headings",
+            selectmode="browse",
+        )
+        group_tree = self._strategy_book_group_tree
+        group_tree.heading("api", text="API")
+        group_tree.heading("trader", text="交易员")
+        group_tree.heading("strategy", text="策略")
+        group_tree.heading("symbol", text="标的")
+        group_tree.heading("bar", text="周期")
+        group_tree.heading("direction", text="方向")
+        group_tree.heading("status", text="状态")
+        group_tree.heading("trades", text="平仓单")
+        group_tree.heading("wins", text="盈利")
+        group_tree.heading("losses", text="亏损")
+        group_tree.heading("rate", text="胜率")
+        group_tree.heading("gross", text="毛盈亏")
+        group_tree.heading("fee", text="手续费")
+        group_tree.heading("funding", text="资金费")
+        group_tree.heading("net", text="净盈亏")
+        group_tree.heading("closed", text="最近平仓")
+        group_tree.column("api", width=84, anchor="center")
+        group_tree.column("trader", width=92, anchor="center")
+        group_tree.column("strategy", width=150, anchor="w")
+        group_tree.column("symbol", width=170, anchor="w")
+        group_tree.column("bar", width=68, anchor="center")
+        group_tree.column("direction", width=82, anchor="center")
+        group_tree.column("status", width=92, anchor="center")
+        group_tree.column("trades", width=72, anchor="center")
+        group_tree.column("wins", width=66, anchor="center")
+        group_tree.column("losses", width=66, anchor="center")
+        group_tree.column("rate", width=72, anchor="center")
+        group_tree.column("gross", width=98, anchor="e")
+        group_tree.column("fee", width=98, anchor="e")
+        group_tree.column("funding", width=98, anchor="e")
+        group_tree.column("net", width=98, anchor="e")
+        group_tree.column("closed", width=150, anchor="center")
+        group_tree.grid(row=0, column=0, sticky="nsew")
+        group_scroll = ttk.Scrollbar(summary_frame, orient="vertical", command=group_tree.yview)
+        group_scroll.grid(row=0, column=1, sticky="ns")
+        group_tree.configure(yscrollcommand=group_scroll.set)
+
+        ledger_frame = ttk.LabelFrame(container, text="账本流水", padding=12)
+        ledger_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        ledger_frame.columnconfigure(0, weight=1)
+        ledger_frame.rowconfigure(0, weight=1)
+        self._strategy_book_ledger_tree = ttk.Treeview(
+            ledger_frame,
+            columns=(
+                "closed",
+                "api",
+                "trader",
+                "strategy",
+                "symbol",
+                "bar",
+                "direction",
+                "status",
+                "session",
+                "opened",
+                "entry",
+                "exit",
+                "size",
+                "gross",
+                "fee",
+                "funding",
+                "net",
+                "reason",
+            ),
+            show="headings",
+            selectmode="browse",
+        )
+        ledger_tree = self._strategy_book_ledger_tree
+        ledger_tree.heading("closed", text="平仓时间")
+        ledger_tree.heading("api", text="API")
+        ledger_tree.heading("trader", text="交易员")
+        ledger_tree.heading("strategy", text="策略")
+        ledger_tree.heading("symbol", text="标的")
+        ledger_tree.heading("bar", text="周期")
+        ledger_tree.heading("direction", text="方向")
+        ledger_tree.heading("status", text="状态")
+        ledger_tree.heading("session", text="会话")
+        ledger_tree.heading("opened", text="开仓时间")
+        ledger_tree.heading("entry", text="开仓价")
+        ledger_tree.heading("exit", text="平仓价")
+        ledger_tree.heading("size", text="数量")
+        ledger_tree.heading("gross", text="毛盈亏")
+        ledger_tree.heading("fee", text="手续费")
+        ledger_tree.heading("funding", text="资金费")
+        ledger_tree.heading("net", text="净盈亏")
+        ledger_tree.heading("reason", text="原因")
+        ledger_tree.column("closed", width=150, anchor="center")
+        ledger_tree.column("api", width=84, anchor="center")
+        ledger_tree.column("trader", width=92, anchor="center")
+        ledger_tree.column("strategy", width=150, anchor="w")
+        ledger_tree.column("symbol", width=170, anchor="w")
+        ledger_tree.column("bar", width=68, anchor="center")
+        ledger_tree.column("direction", width=82, anchor="center")
+        ledger_tree.column("status", width=92, anchor="center")
+        ledger_tree.column("session", width=72, anchor="center")
+        ledger_tree.column("opened", width=150, anchor="center")
+        ledger_tree.column("entry", width=90, anchor="e")
+        ledger_tree.column("exit", width=90, anchor="e")
+        ledger_tree.column("size", width=82, anchor="e")
+        ledger_tree.column("gross", width=98, anchor="e")
+        ledger_tree.column("fee", width=98, anchor="e")
+        ledger_tree.column("funding", width=98, anchor="e")
+        ledger_tree.column("net", width=98, anchor="e")
+        ledger_tree.column("reason", width=220, anchor="w")
+        ledger_tree.grid(row=0, column=0, sticky="nsew")
+        ledger_tree.bind("<<TreeviewSelect>>", self._on_strategy_book_ledger_selected)
+        ledger_v_scroll = ttk.Scrollbar(ledger_frame, orient="vertical", command=ledger_tree.yview)
+        ledger_v_scroll.grid(row=0, column=1, sticky="ns")
+        ledger_x_scroll = ttk.Scrollbar(ledger_frame, orient="horizontal", command=ledger_tree.xview)
+        ledger_x_scroll.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ledger_tree.configure(yscrollcommand=ledger_v_scroll.set, xscrollcommand=ledger_x_scroll.set)
+
+        self._refresh_strategy_book_window()
+
+    def _close_strategy_book_window(self) -> None:
+        if self._strategy_book_window is not None and _widget_exists(self._strategy_book_window):
+            self._strategy_book_window.destroy()
+        self._strategy_book_window = None
+        self._strategy_book_group_tree = None
+        self._strategy_book_ledger_tree = None
+        self._strategy_book_api_combo = None
+        self._strategy_book_trader_combo = None
+        self._strategy_book_strategy_combo = None
+        self._strategy_book_symbol_combo = None
+        self._strategy_book_bar_combo = None
+        self._strategy_book_direction_combo = None
+        self._strategy_book_status_combo = None
+
+    def _current_strategy_book_filters(self) -> NormalStrategyBookFilters:
+        return NormalStrategyBookFilters(
+            api_name=_strategy_book_filter_normalized(
+                self.strategy_book_api_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_API,
+            ),
+            trader_label=_strategy_book_filter_normalized(
+                self.strategy_book_trader_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_TRADER,
+            ),
+            strategy_name=_strategy_book_filter_normalized(
+                self.strategy_book_strategy_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_STRATEGY,
+            ),
+            symbol=_strategy_book_filter_normalized(
+                self.strategy_book_symbol_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_SYMBOL,
+            ),
+            bar=_strategy_book_filter_normalized(
+                self.strategy_book_bar_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_BAR,
+            ),
+            direction_label=_strategy_book_filter_normalized(
+                self.strategy_book_direction_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_DIRECTION,
+            ),
+            status=_strategy_book_filter_normalized(
+                self.strategy_book_status_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_STATUS,
+            ),
+        )
+
+    def _reset_strategy_book_filters(self) -> None:
+        self.strategy_book_api_filter.set(STRATEGY_BOOK_FILTER_ALL_API)
+        self.strategy_book_trader_filter.set(STRATEGY_BOOK_FILTER_ALL_TRADER)
+        self.strategy_book_strategy_filter.set(STRATEGY_BOOK_FILTER_ALL_STRATEGY)
+        self.strategy_book_symbol_filter.set(STRATEGY_BOOK_FILTER_ALL_SYMBOL)
+        self.strategy_book_bar_filter.set(STRATEGY_BOOK_FILTER_ALL_BAR)
+        self.strategy_book_direction_filter.set(STRATEGY_BOOK_FILTER_ALL_DIRECTION)
+        self.strategy_book_status_filter.set(STRATEGY_BOOK_FILTER_ALL_STATUS)
+        self._refresh_strategy_book_window()
+
+    def _on_strategy_book_filter_changed(self, *_: object) -> None:
+        self._refresh_strategy_book_window()
+
+    def _refresh_strategy_book_filter_controls(self) -> None:
+        options = _build_normal_strategy_book_filter_options(
+            self._strategy_trade_ledger_records,
+            self._strategy_history_records,
+        )
+        control_specs = (
+            (
+                self._strategy_book_api_combo,
+                self.strategy_book_api_filter,
+                options["api_name"],
+                STRATEGY_BOOK_FILTER_ALL_API,
+            ),
+            (
+                self._strategy_book_trader_combo,
+                self.strategy_book_trader_filter,
+                options["trader_label"],
+                STRATEGY_BOOK_FILTER_ALL_TRADER,
+            ),
+            (
+                self._strategy_book_strategy_combo,
+                self.strategy_book_strategy_filter,
+                options["strategy_name"],
+                STRATEGY_BOOK_FILTER_ALL_STRATEGY,
+            ),
+            (
+                self._strategy_book_symbol_combo,
+                self.strategy_book_symbol_filter,
+                options["symbol"],
+                STRATEGY_BOOK_FILTER_ALL_SYMBOL,
+            ),
+            (
+                self._strategy_book_bar_combo,
+                self.strategy_book_bar_filter,
+                options["bar"],
+                STRATEGY_BOOK_FILTER_ALL_BAR,
+            ),
+            (
+                self._strategy_book_direction_combo,
+                self.strategy_book_direction_filter,
+                options["direction_label"],
+                STRATEGY_BOOK_FILTER_ALL_DIRECTION,
+            ),
+            (
+                self._strategy_book_status_combo,
+                self.strategy_book_status_filter,
+                options["status"],
+                STRATEGY_BOOK_FILTER_ALL_STATUS,
+            ),
+        )
+        for combo, variable, values, default_value in control_specs:
+            if combo is None or not _widget_exists(combo):
+                continue
+            combo.configure(values=values)
+            current_value = variable.get()
+            variable.set(current_value if current_value in values else default_value)
+
+    def _refresh_strategy_book_window(self) -> None:
+        if self._strategy_book_window is None or not _widget_exists(self._strategy_book_window):
+            return
+        self._refresh_strategy_book_filter_controls()
+        filters = self._current_strategy_book_filters()
+        summary = _build_normal_strategy_book_summary(
+            self._strategy_trade_ledger_records,
+            self._strategy_history_records,
+            filters=filters,
+        )
+        self.strategy_book_summary_text.set(_normal_strategy_book_summary_text(summary))
+        self._refresh_strategy_book_group_tree(filters=filters)
+        self._refresh_strategy_book_ledger_tree(filters=filters)
+
+    def _refresh_strategy_book_group_tree(self, *, filters: NormalStrategyBookFilters | None = None) -> None:
+        tree = self._strategy_book_group_tree
+        if tree is None or not _widget_exists(tree):
+            return
+        try:
+            selected = tree.selection()
+        except TclError:
+            selected = ()
+        selected_id = selected[0] if selected else None
+        for item_id in tree.get_children():
+            tree.delete(item_id)
+        for row_id, values in _build_normal_strategy_book_group_rows(
+            self._strategy_trade_ledger_records,
+            self._strategy_history_records,
+            filters=filters,
+        ):
+            tree.insert("", END, iid=row_id, values=values)
+        if selected_id is not None and tree.exists(selected_id):
+            tree.selection_set(selected_id)
+            tree.focus(selected_id)
+            tree.see(selected_id)
+
+    def _refresh_strategy_book_ledger_tree(self, *, filters: NormalStrategyBookFilters | None = None) -> None:
+        tree = self._strategy_book_ledger_tree
+        if tree is None or not _widget_exists(tree):
+            return
+        try:
+            selected = tree.selection()
+        except TclError:
+            selected = ()
+        selected_id = selected[0] if selected else None
+        for item_id in tree.get_children():
+            tree.delete(item_id)
+        for row_id, values in _build_normal_strategy_book_ledger_rows(
+            self._strategy_trade_ledger_records,
+            self._strategy_history_records,
+            filters=filters,
+        ):
+            session_id = str(values[8] or "").strip()
+            tree.insert("", END, iid=row_id, values=values, tags=(session_id,))
+        if selected_id is not None and tree.exists(selected_id):
+            tree.selection_set(selected_id)
+            tree.focus(selected_id)
+            tree.see(selected_id)
+
+    def _on_strategy_book_ledger_selected(self, *_: object) -> None:
+        tree = self._strategy_book_ledger_tree
+        if tree is None or not _widget_exists(tree):
+            return
+        try:
+            selection = tree.selection()
+        except TclError:
+            selection = ()
+        if not selection:
+            return
+        tags = tree.item(selection[0], "tags")
+        session_id = tags[0] if tags else ""
+        if session_id:
+            self._focus_session_row(session_id)
+
     @staticmethod
     def _session_blocks_history_deletion(session: StrategySession) -> bool:
         return session.engine.is_running or session.status in {"运行中", "停止中", "待恢复", "恢复中"}
@@ -12119,6 +12937,7 @@ class QuantApp:
         self._refresh_running_session_summary()
         self._update_settings_summary()
         self._refresh_selected_session_details()
+        self._refresh_strategy_book_window()
         self.root.after(500, self._refresh_status)
 
     def _on_close(self) -> None:
@@ -12147,6 +12966,7 @@ class QuantApp:
             session.engine.wait_stopped(timeout=1.5)
         self._protection_manager.stop_all()
         self._close_strategy_history_window()
+        self._close_strategy_book_window()
         self._close_settings_window()
         if self._backtest_window is not None and self._backtest_window.window.winfo_exists():
             self._backtest_window.window.destroy()
