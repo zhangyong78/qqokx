@@ -142,6 +142,44 @@ HTTP 502: <!DOCTYPE html>
             "当前模式：若风险金留空，将按固定数量下单。",
         )
 
+    def test_find_instrument_for_fixed_order_size_hint_uses_local_cache(self) -> None:
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        app = SimpleNamespace(
+            _fixed_order_size_hint_instrument_cache={"ETH-USDT-SWAP": instrument},
+            instruments=[],
+            _position_instruments={},
+            _ensure_fixed_order_size_hint_instrument_async=MagicMock(),
+        )
+
+        found = QuantApp._find_instrument_for_fixed_order_size_hint(app, "ETH-USDT-SWAP")
+
+        self.assertIs(found, instrument)
+        app._ensure_fixed_order_size_hint_instrument_async.assert_not_called()
+
+    def test_find_instrument_for_fixed_order_size_hint_defers_missing_fetch_async(self) -> None:
+        app = SimpleNamespace(
+            _fixed_order_size_hint_instrument_cache={},
+            instruments=[],
+            _position_instruments={},
+            _ensure_fixed_order_size_hint_instrument_async=MagicMock(),
+        )
+
+        found = QuantApp._find_instrument_for_fixed_order_size_hint(
+            app,
+            "ETH-USDT-SWAP",
+            fetch_if_missing=True,
+        )
+
+        self.assertIsNone(found)
+        app._ensure_fixed_order_size_hint_instrument_async.assert_called_once_with("ETH-USDT-SWAP")
+
     def test_build_normal_strategy_book_summary_filters_out_trader_history(self) -> None:
         history_records = [
             StrategyHistoryRecord(

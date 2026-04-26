@@ -1647,6 +1647,8 @@ class QuantApp:
         self.deribit_client = DeribitRestClient()
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.instruments: list[Instrument] = []
+        self._fixed_order_size_hint_instrument_cache: dict[str, Instrument] = {}
+        self._fixed_order_size_hint_fetching_inst_ids: set[str] = set()
         self.sessions: dict[str, StrategySession] = {}
         self._strategy_history_records: list[StrategyHistoryRecord] = []
         self._strategy_history_by_id: dict[str, StrategyHistoryRecord] = {}
@@ -1871,7 +1873,7 @@ class QuantApp:
         self.entry_side_mode_label = StringVar(value="跟随信号")
         self.entry_side_mode_hint_text = StringVar(value="")
         self.symbol.trace_add("write", self._sync_trade_symbol_to_symbol)
-        self.trade_symbol.trace_add("write", self._update_fixed_order_size_hint)
+        self.trade_symbol.trace_add("write", self._on_fixed_order_size_symbol_changed)
         self.risk_amount.trace_add("write", self._update_fixed_order_size_hint)
         self.order_size.trace_add("write", self._update_fixed_order_size_hint)
         self.time_stop_break_even_enabled.trace_add("write", lambda *_: self._sync_dynamic_take_profit_controls())
@@ -7789,6 +7791,9 @@ class QuantApp:
 
     def _apply_symbols(self, instruments: list[Instrument], symbols: list[str]) -> None:
         self.instruments = instruments
+        self._fixed_order_size_hint_instrument_cache.update(
+            {item.inst_id.strip().upper(): item for item in instruments if item.inst_id.strip()}
+        )
         merged = list(dict.fromkeys(self._default_symbol_values + symbols))
         custom_trigger_values = ["", *merged]
         preferred_symbol = self._default_launch_symbol if self._default_launch_symbol in merged else (merged[0] if merged else "")
@@ -7808,27 +7813,80 @@ class QuantApp:
         if self.trade_symbol.get() != symbol:
             self.trade_symbol.set(symbol)
 
-    def _update_fixed_order_size_hint(self, *_: str) -> None:
+    def _on_fixed_order_size_symbol_changed(self, *_: str) -> None:
+        self._update_fixed_order_size_hint(fetch_instrument_if_missing=True)
+
+    def _update_fixed_order_size_hint(self, *_: str, fetch_instrument_if_missing: bool = False) -> None:
         symbol = _normalize_symbol_input(self.trade_symbol.get()) or _normalize_symbol_input(self.symbol.get())
-        instrument = self._find_instrument_for_fixed_order_size_hint(symbol)
+        instrument = self._find_instrument_for_fixed_order_size_hint(
+            symbol,
+            fetch_if_missing=fetch_instrument_if_missing,
+        )
         base_hint = _build_fixed_order_size_hint_text(symbol, instrument)
         mode_hint = _build_order_size_mode_hint_text(self.risk_amount.get(), self.order_size.get())
         self.fixed_order_size_hint_text.set(f"{base_hint} {mode_hint}".strip())
 
-    def _find_instrument_for_fixed_order_size_hint(self, inst_id: str) -> Instrument | None:
+    def _find_instrument_for_fixed_order_size_hint(
+        self,
+        inst_id: str,
+        *,
+        fetch_if_missing: bool = False,
+    ) -> Instrument | None:
         normalized = _normalize_symbol_input(inst_id)
         if not normalized:
             return None
+        instrument = self._fixed_order_size_hint_instrument_cache.get(normalized)
+        if instrument is not None:
+            return instrument
         for instrument in self.instruments:
             if instrument.inst_id.strip().upper() == normalized:
+                self._fixed_order_size_hint_instrument_cache[normalized] = instrument
                 return instrument
         instrument = self._position_instruments.get(normalized)
         if instrument is not None:
+            self._fixed_order_size_hint_instrument_cache[normalized] = instrument
             return instrument
+        if fetch_if_missing:
+            self._ensure_fixed_order_size_hint_instrument_async(normalized)
+        return None
+
+    def _ensure_fixed_order_size_hint_instrument_async(self, inst_id: str) -> None:
+        normalized = _normalize_symbol_input(inst_id)
+        if not normalized:
+            return
+        if normalized in self._fixed_order_size_hint_instrument_cache:
+            return
+        if normalized in self._fixed_order_size_hint_fetching_inst_ids:
+            return
+        self._fixed_order_size_hint_fetching_inst_ids.add(normalized)
+        threading.Thread(
+            target=self._fetch_fixed_order_size_hint_instrument_worker,
+            args=(normalized,),
+            daemon=True,
+        ).start()
+
+    def _fetch_fixed_order_size_hint_instrument_worker(self, inst_id: str) -> None:
+        instrument: Instrument | None
         try:
-            return self.client.get_instrument(normalized)
+            instrument = self.client.get_instrument(inst_id)
         except Exception:
-            return None
+            instrument = None
+        try:
+            self.root.after(0, lambda: self._apply_fixed_order_size_hint_instrument(inst_id, instrument))
+        except Exception:
+            pass
+
+    def _apply_fixed_order_size_hint_instrument(self, inst_id: str, instrument: Instrument | None) -> None:
+        normalized = _normalize_symbol_input(inst_id)
+        if normalized:
+            self._fixed_order_size_hint_fetching_inst_ids.discard(normalized)
+            if instrument is not None:
+                self._fixed_order_size_hint_instrument_cache[normalized] = instrument
+                if all(item.inst_id.strip().upper() != normalized for item in self.instruments):
+                    self.instruments.append(instrument)
+        current_symbol = _normalize_symbol_input(self.trade_symbol.get()) or _normalize_symbol_input(self.symbol.get())
+        if normalized and current_symbol == normalized:
+            self._update_fixed_order_size_hint()
 
     @staticmethod
     def _format_strategy_symbol_display(signal_symbol: str, trade_symbol: str | None) -> str:
@@ -10711,7 +10769,7 @@ class QuantApp:
         self.strategy_summary_text.set(definition.summary)
         self.strategy_rule_text.set(definition.rule_description)
         self.strategy_hint_text.set(definition.parameter_hint)
-        self._update_fixed_order_size_hint()
+        self._on_fixed_order_size_symbol_changed()
 
     def _sync_dynamic_take_profit_controls(self) -> None:
         if not hasattr(self, "_dynamic_two_r_break_even_check"):
