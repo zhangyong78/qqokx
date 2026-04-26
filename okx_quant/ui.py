@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import tkinter.font as tkfont
-from tkinter import BooleanVar, END, Label, Menu, StringVar, Text, TclError, Tk, Toplevel, filedialog, simpledialog
+from tkinter import BooleanVar, Canvas, END, Label, Menu, StringVar, Text, TclError, Tk, Toplevel, filedialog, simpledialog
 from tkinter import messagebox, ttk
 
 from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
@@ -95,6 +95,13 @@ from okx_quant.trader_desk import (
 from okx_quant.trader_desk_ui import TraderDeskWindow
 from okx_quant.smart_order import SmartOrderRuntimeConfig
 from okx_quant.smart_order_ui import SmartOrderWindow
+from okx_quant.strategy_live_chart import (
+    DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT,
+    DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS,
+    StrategyLiveChartSnapshot,
+    build_strategy_live_chart_snapshot,
+    render_strategy_live_chart,
+)
 from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_DEFINITIONS,
@@ -637,6 +644,19 @@ class StrategySession:
         if self.status == "运行中" and self.runtime_status:
             return self.runtime_status
         return self.status
+
+
+@dataclass
+class StrategyLiveChartWindowState:
+    session_id: str
+    window: Toplevel
+    canvas: Canvas
+    headline_text: StringVar
+    status_text: StringVar
+    footer_text: StringVar
+    refresh_job: str | None = None
+    refresh_inflight: bool = False
+    last_snapshot: StrategyLiveChartSnapshot | None = None
 
 
 @dataclass
@@ -1951,6 +1971,7 @@ class QuantApp:
         self._strategy_history_detail: Text | None = None
         self._strategy_history_selected_record_id: str | None = None
         self._strategy_book_window: Toplevel | None = None
+        self._strategy_live_chart_windows: dict[str, StrategyLiveChartWindowState] = {}
         self._strategy_book_group_tree: ttk.Treeview | None = None
         self._strategy_book_ledger_tree: ttk.Treeview | None = None
         self._strategy_book_api_combo: ttk.Combobox | None = None
@@ -2389,26 +2410,34 @@ class QuantApp:
 
         control_row = ttk.Frame(running_frame)
         control_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Button(control_row, text="停止选中策略", command=self.stop_selected_session).grid(row=0, column=0)
-        ttk.Button(control_row, text="交易员管理台", command=self.open_trader_desk_window).grid(
+        ttk.Button(control_row, text="\u505c\u6b62\u9009\u4e2d\u7b56\u7565", command=self.stop_selected_session).grid(row=0, column=0)
+        ttk.Button(control_row, text="\u5b9e\u65f6K\u7ebf\u56fe", command=self.open_selected_strategy_live_chart).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="\u4fe1\u53f7\u89c2\u5bdf\u53f0", command=self.open_signal_monitor_window).grid(
             row=0,
-            column=1,
+            column=2,
             padx=(8, 0),
         )
-        ttk.Button(control_row, text="清空已停止", command=self.clear_stopped_sessions).grid(
-            row=0, column=2, padx=(8, 0)
+        ttk.Button(control_row, text="\u4ea4\u6613\u5458\u7ba1\u7406\u53f0", command=self.open_trader_desk_window).grid(
+            row=0,
+            column=3,
+            padx=(8, 0),
         )
-        ttk.Button(control_row, text="历史策略", command=self.open_strategy_history_window).grid(
-            row=0, column=3, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="策略总账本", command=self.open_strategy_book_window).grid(
+        ttk.Button(control_row, text="\u6e05\u7a7a\u5df2\u505c\u6b62", command=self.clear_stopped_sessions).grid(
             row=0, column=4, padx=(8, 0)
         )
-        ttk.Button(control_row, text="导出选中参数", command=self.export_selected_session_template).grid(
+        ttk.Button(control_row, text="\u5386\u53f2\u7b56\u7565", command=self.open_strategy_history_window).grid(
             row=0, column=5, padx=(8, 0)
         )
-        ttk.Button(control_row, text="导入策略参数", command=self.import_strategy_template).grid(
+        ttk.Button(control_row, text="\u7b56\u7565\u603b\u8d26\u672c", command=self.open_strategy_book_window).grid(
             row=0, column=6, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="\u5bfc\u51fa\u9009\u4e2d\u53c2\u6570", command=self.export_selected_session_template).grid(
+            row=0, column=7, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="\u5bfc\u5165\u7b56\u7565\u53c2\u6570", command=self.import_strategy_template).grid(
+            row=0, column=8, padx=(8, 0)
         )
 
         detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)
@@ -7951,6 +7980,441 @@ class QuantApp:
         self.session_tree.focus(session_id)
         self._refresh_selected_session_details()
 
+    def open_selected_strategy_live_chart(self) -> None:
+        session = self._selected_session()
+        if session is None:
+            messagebox.showinfo("\u63d0\u793a", "\u8bf7\u5148\u5728\u8fd0\u884c\u4e2d\u7b56\u7565\u5217\u8868\u4e2d\u9009\u4e2d\u4e00\u6761\u7b56\u7565\u3002")
+            return
+        self.open_strategy_live_chart_window(session.session_id)
+
+    def open_strategy_live_chart_window(self, session_id: str) -> None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            messagebox.showwarning("\u63d0\u793a", "\u5f53\u524d\u4f1a\u8bdd\u5df2\u4e0d\u5b58\u5728\uff0c\u8bf7\u91cd\u65b0\u9009\u62e9\u3002")
+            return
+        existing = self._strategy_live_chart_windows.get(session_id)
+        if existing is not None and _widget_exists(existing.window):
+            existing.window.focus_force()
+            self._request_strategy_live_chart_refresh(session_id, immediate=True)
+            return
+
+        window = Toplevel(self.root)
+        apply_window_icon(window)
+        window.title(self._strategy_live_chart_window_title(session))
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.76,
+            height_ratio=0.7,
+            min_width=1080,
+            min_height=700,
+            max_width=1760,
+            max_height=1180,
+        )
+        window.transient(self.root)
+
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(1, weight=1)
+
+        headline_text = StringVar(value=self._strategy_live_chart_headline(session))
+        status_text = StringVar(value="\u6b63\u5728\u51c6\u5907\u5b9e\u65f6K\u7ebf\u56fe...")
+        footer_text = StringVar(
+            value=(
+                f"\u53ea\u8bfb\u76d1\u63a7\u7a97\uff1a\u9ed8\u8ba4\u6bcf {DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS // 1000} \u79d2\u5237\u65b0\u4e00\u6b21\uff0c"
+                "\u7a97\u53e3\u5173\u95ed\u540e\u81ea\u52a8\u505c\u6b62\u3002"
+            )
+        )
+
+        header = ttk.Frame(container)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(
+            header,
+            textvariable=headline_text,
+            font=("Microsoft YaHei UI", 11, "bold"),
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            textvariable=status_text,
+            justify="left",
+            wraplength=980,
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        chart_frame = ttk.Frame(container)
+        chart_frame.grid(row=1, column=0, sticky="nsew")
+        chart_frame.columnconfigure(0, weight=1)
+        chart_frame.rowconfigure(0, weight=1)
+        canvas = Canvas(chart_frame, background="#ffffff", highlightthickness=0, width=1120, height=620)
+        canvas.grid(row=0, column=0, sticky="nsew")
+
+        footer = ttk.Frame(container)
+        footer.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(footer, textvariable=footer_text, justify="left", wraplength=980).grid(row=0, column=0, sticky="w")
+        action_row = ttk.Frame(footer)
+        action_row.grid(row=0, column=1, sticky="e")
+        ttk.Button(
+            action_row,
+            text="\u7acb\u5373\u5237\u65b0",
+            command=lambda target_session_id=session_id: self._request_strategy_live_chart_refresh(
+                target_session_id, immediate=True
+            ),
+        ).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(
+            action_row,
+            text="\u5173\u95ed",
+            command=lambda target_session_id=session_id: self._close_strategy_live_chart_window(target_session_id),
+        ).grid(row=0, column=1)
+
+        state = StrategyLiveChartWindowState(
+            session_id=session_id,
+            window=window,
+            canvas=canvas,
+            headline_text=headline_text,
+            status_text=status_text,
+            footer_text=footer_text,
+        )
+        self._strategy_live_chart_windows[session_id] = state
+        window.protocol("WM_DELETE_WINDOW", lambda target_session_id=session_id: self._close_strategy_live_chart_window(target_session_id))
+        canvas.bind("<Configure>", lambda *_args, target_session_id=session_id: self._render_strategy_live_chart_window(target_session_id))
+        self._render_strategy_live_chart_window(session_id)
+        self._request_strategy_live_chart_refresh(session_id, immediate=True)
+
+    def _strategy_live_chart_window_title(self, session: StrategySession) -> str:
+        trade_inst_id = _session_trade_inst_id(session) or session.symbol
+        return f"\u5b9e\u65f6K\u7ebf\u56fe - {session.session_id} {trade_inst_id}"
+
+    def _strategy_live_chart_headline(self, session: StrategySession) -> str:
+        trade_inst_id = _session_trade_inst_id(session) or session.symbol
+        return (
+            f"{session.session_id} | {session.strategy_name} | {trade_inst_id} | "
+            f"\u5468\u671f {session.config.bar} | API {session.api_name} | \u6a21\u5f0f {session.run_mode_label}"
+        )
+
+    def _close_strategy_live_chart_window(self, session_id: str) -> None:
+        state = self._strategy_live_chart_windows.pop(session_id, None)
+        if state is None:
+            return
+        if state.refresh_job is not None:
+            try:
+                self.root.after_cancel(state.refresh_job)
+            except TclError:
+                pass
+            state.refresh_job = None
+        if _widget_exists(state.window):
+            state.window.destroy()
+
+    def _close_all_strategy_live_chart_windows(self) -> None:
+        for session_id in tuple(self._strategy_live_chart_windows):
+            self._close_strategy_live_chart_window(session_id)
+
+    def _request_strategy_live_chart_refresh(self, session_id: str, *, immediate: bool = False) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None or not _widget_exists(state.window):
+            return
+        if state.refresh_job is not None:
+            try:
+                self.root.after_cancel(state.refresh_job)
+            except TclError:
+                pass
+            state.refresh_job = None
+        delay = 0 if immediate else DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS
+        state.refresh_job = self.root.after(delay, lambda target_session_id=session_id: self._run_strategy_live_chart_refresh(target_session_id))
+
+    def _run_strategy_live_chart_refresh(self, session_id: str) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None or not _widget_exists(state.window):
+            return
+        state.refresh_job = None
+        if state.refresh_inflight:
+            self._request_strategy_live_chart_refresh(session_id, immediate=False)
+            return
+        session = self.sessions.get(session_id)
+        if session is not None:
+            state.headline_text.set(self._strategy_live_chart_headline(session))
+            state.status_text.set(f"\u72b6\u6001 {session.display_status} | \u6b63\u5728\u5237\u65b0\u5b9e\u65f6K\u7ebf\u56fe...")
+        state.refresh_inflight = True
+        threading.Thread(target=self._refresh_strategy_live_chart_worker, args=(session_id,), daemon=True).start()
+
+    def _refresh_strategy_live_chart_worker(self, session_id: str) -> None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            self.root.after(0, lambda target_session_id=session_id: self._apply_strategy_live_chart_missing_session(target_session_id))
+            return
+
+        trade_inst_id = _session_trade_inst_id(session) or session.symbol.strip().upper()
+        if not trade_inst_id:
+            self.root.after(
+                0,
+                lambda target_session_id=session_id: self._apply_strategy_live_chart_error(
+                    target_session_id, "\u7f3a\u5c11\u53ef\u67e5\u8be2\u7684\u4ea4\u6613\u6807\u7684\u3002"
+                ),
+            )
+            return
+
+        try:
+            candles = self.client.get_candles(
+                trade_inst_id,
+                session.config.bar,
+                limit=DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT,
+            )
+        except Exception as exc:
+            self.root.after(
+                0,
+                lambda target_session_id=session_id, message=str(exc): self._apply_strategy_live_chart_error(
+                    target_session_id, message
+                ),
+            )
+            return
+
+        pending_entry_prices = self._strategy_live_chart_pending_entry_prices(session)
+        position_avg_price, position_refreshed_at = self._strategy_live_chart_position_avg_price(session)
+        live_pnl, live_pnl_refreshed_at = self._session_live_pnl_snapshot(session)
+        stop_price = self._strategy_live_chart_stop_price(session)
+        entry_price = session.active_trade.entry_price if session.active_trade is not None else None
+        chart_refreshed_at = datetime.now()
+        snapshot = build_strategy_live_chart_snapshot(
+            session_id=session.session_id,
+            candles=candles,
+            ema_period=session.config.ema_period,
+            trend_ema_period=session.config.trend_ema_period,
+            reference_ema_period=session.config.resolved_entry_reference_ema_period(),
+            pending_entry_prices=pending_entry_prices,
+            entry_price=entry_price,
+            position_avg_price=position_avg_price,
+            stop_price=stop_price,
+            latest_price=candles[-1].close if candles else None,
+            note=self._strategy_live_chart_canvas_note(
+                pending_entry_count=len(pending_entry_prices),
+                position_refreshed_at=position_refreshed_at,
+                live_pnl_refreshed_at=live_pnl_refreshed_at,
+                stop_price=stop_price,
+            ),
+        )
+        status_text = self._strategy_live_chart_status_text(
+            session,
+            live_pnl=live_pnl,
+            pending_entry_count=len(pending_entry_prices),
+            has_position=position_avg_price is not None or entry_price is not None,
+            stop_price=stop_price,
+        )
+        footer_text = self._strategy_live_chart_footer_text(
+            session=session,
+            trade_inst_id=trade_inst_id,
+            chart_refreshed_at=chart_refreshed_at,
+            position_refreshed_at=position_refreshed_at,
+            live_pnl_refreshed_at=live_pnl_refreshed_at,
+            candle_count=len(candles),
+            latest_candle_confirmed=bool(candles[-1].confirmed) if candles else True,
+        )
+        self.root.after(
+            0,
+            lambda target_session_id=session_id, chart_snapshot=snapshot, status_line=status_text, footer_line=footer_text: self._apply_strategy_live_chart_snapshot(
+                target_session_id,
+                chart_snapshot,
+                status_line,
+                footer_line,
+            ),
+        )
+
+    def _apply_strategy_live_chart_snapshot(
+        self,
+        session_id: str,
+        snapshot: StrategyLiveChartSnapshot,
+        status_text: str,
+        footer_text: str,
+    ) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None or not _widget_exists(state.window):
+            return
+        session = self.sessions.get(session_id)
+        state.refresh_inflight = False
+        state.last_snapshot = snapshot
+        if session is not None:
+            state.window.title(self._strategy_live_chart_window_title(session))
+            state.headline_text.set(self._strategy_live_chart_headline(session))
+        state.status_text.set(status_text)
+        state.footer_text.set(footer_text)
+        self._render_strategy_live_chart_window(session_id)
+        if session is not None:
+            self._request_strategy_live_chart_refresh(session_id, immediate=False)
+
+    def _apply_strategy_live_chart_missing_session(self, session_id: str) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None or not _widget_exists(state.window):
+            return
+        state.refresh_inflight = False
+        state.status_text.set("\u4f1a\u8bdd\u5df2\u4ece\u8fd0\u884c\u5217\u8868\u79fb\u9664\uff0c\u56fe\u7a97\u505c\u6b62\u81ea\u52a8\u5237\u65b0\u3002")
+        state.footer_text.set("\u5982\u5df2\u6e05\u7a7a\u505c\u6b62\u7b56\u7565\uff0c\u53ef\u76f4\u63a5\u5173\u95ed\u8fd9\u4e2a\u56fe\u7a97\u3002")
+
+    def _apply_strategy_live_chart_error(self, session_id: str, message: str) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None or not _widget_exists(state.window):
+            return
+        state.refresh_inflight = False
+        friendly_message = _format_network_error_message(message)
+        if state.last_snapshot is None:
+            state.last_snapshot = StrategyLiveChartSnapshot(
+                session_id=session_id,
+                candles=(),
+                note=friendly_message,
+            )
+            self._render_strategy_live_chart_window(session_id)
+            state.status_text.set(f"\u5b9e\u65f6K\u7ebf\u56fe\u8bfb\u53d6\u5931\u8d25\uff1a{friendly_message}")
+        else:
+            state.status_text.set(f"\u5b9e\u65f6K\u7ebf\u56fe\u5237\u65b0\u5931\u8d25\uff0c\u7ee7\u7eed\u663e\u793a\u4e0a\u4e00\u5f20\u56fe\uff1a{friendly_message}")
+        state.footer_text.set(
+            f"\u5c06\u4e8e {DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS // 1000} \u79d2\u540e\u81ea\u52a8\u91cd\u8bd5\u3002"
+        )
+        self._request_strategy_live_chart_refresh(session_id, immediate=False)
+
+    def _render_strategy_live_chart_window(self, session_id: str) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None or not _widget_exists(state.canvas):
+            return
+        snapshot = state.last_snapshot
+        if snapshot is None:
+            snapshot = StrategyLiveChartSnapshot(
+                session_id=session_id,
+                candles=(),
+                note="\u6b63\u5728\u52a0\u8f7dK\u7ebf\u6570\u636e...",
+            )
+        render_strategy_live_chart(state.canvas, snapshot)
+
+    def _strategy_live_chart_pending_entry_prices(self, session: StrategySession) -> tuple[Decimal, ...]:
+        prices: list[Decimal] = []
+        seen: set[Decimal] = set()
+        for item in self._latest_pending_orders:
+            if _trade_order_session_role(item, session) != "ent":
+                continue
+            for candidate in (item.price, item.order_price, item.trigger_price):
+                if candidate is None or candidate in seen:
+                    continue
+                seen.add(candidate)
+                prices.append(candidate)
+                break
+        return tuple(prices)
+
+    def _strategy_live_chart_stop_price(self, session: StrategySession) -> Decimal | None:
+        active_trade = session.active_trade
+        if active_trade is not None and active_trade.current_stop_price is not None:
+            return active_trade.current_stop_price
+        for item in self._latest_pending_orders:
+            if _trade_order_session_role(item, session) != "slg":
+                continue
+            for candidate in (
+                item.stop_loss_trigger_price,
+                item.trigger_price,
+                item.stop_loss_order_price,
+                item.order_price,
+            ):
+                if candidate is not None:
+                    return candidate
+        return None
+
+    def _strategy_live_chart_position_avg_price(self, session: StrategySession) -> tuple[Decimal | None, datetime | None]:
+        snapshot = self._positions_snapshot_for_session(session)
+        if snapshot is None:
+            return None, None
+        positions = [
+            position
+            for position in snapshot.positions
+            if (
+                position.position != 0
+                and position.avg_price is not None
+                and _position_matches_session_live_pnl(
+                    position,
+                    trade_inst_id=_session_trade_inst_id(session),
+                    expected_sides=_session_expected_position_sides(session),
+                )
+            )
+        ]
+        if not positions:
+            return None, snapshot.refreshed_at
+        if len(positions) == 1:
+            return positions[0].avg_price, snapshot.refreshed_at
+        total_size = sum((abs(position.position) for position in positions), Decimal("0"))
+        if total_size <= 0:
+            return positions[0].avg_price, snapshot.refreshed_at
+        weighted_value = sum((abs(position.position) * (position.avg_price or Decimal("0")) for position in positions), Decimal("0"))
+        return weighted_value / total_size, snapshot.refreshed_at
+
+    @staticmethod
+    def _strategy_live_chart_canvas_note(
+        *,
+        pending_entry_count: int,
+        position_refreshed_at: datetime | None,
+        live_pnl_refreshed_at: datetime | None,
+        stop_price: Decimal | None,
+    ) -> str:
+        parts: list[str] = []
+        if pending_entry_count > 0:
+            parts.append(f"\u6302\u5355 {pending_entry_count} \u6761")
+        if stop_price is not None:
+            parts.append("\u6b62\u635f\u5df2\u540c\u6b65")
+        if position_refreshed_at is not None:
+            parts.append(f"\u6301\u4ed3\u7f13\u5b58 {position_refreshed_at.strftime('%H:%M:%S')}")
+        if live_pnl_refreshed_at is not None and live_pnl_refreshed_at != position_refreshed_at:
+            parts.append(f"\u6d6e\u76c8\u7f13\u5b58 {live_pnl_refreshed_at.strftime('%H:%M:%S')}")
+        return " | ".join(parts)
+
+    def _strategy_live_chart_status_text(
+        self,
+        session: StrategySession,
+        *,
+        live_pnl: Decimal | None,
+        pending_entry_count: int,
+        has_position: bool,
+        stop_price: Decimal | None,
+    ) -> str:
+        parts = [
+            f"\u72b6\u6001 {session.display_status}",
+            f"\u5b9e\u65f6\u6d6e\u76c8\u4e8f {_format_optional_usdt_precise(live_pnl, places=2)} USDT",
+            f"\u51c0\u76c8\u4e8f {_format_optional_usdt_precise(session.net_pnl_total, places=2)} USDT",
+        ]
+        if has_position:
+            parts.append("\u5f53\u524d\u6709\u6301\u4ed3")
+        elif pending_entry_count > 0:
+            parts.append(f"\u5f53\u524d\u6709\u6302\u5355 x{pending_entry_count}")
+        else:
+            parts.append("\u5f53\u524d\u65e0\u6301\u4ed3/\u6302\u5355")
+        if stop_price is not None:
+            parts.append(f"\u6b62\u635f {format_decimal(stop_price)}")
+        last_message = (session.last_message or "").strip()
+        if last_message:
+            if len(last_message) > 72:
+                last_message = f"{last_message[:72]}..."
+            parts.append(f"\u6700\u8fd1\u6d88\u606f {last_message}")
+        return " | ".join(parts)
+
+    @staticmethod
+    def _strategy_live_chart_footer_text(
+        *,
+        session: StrategySession,
+        trade_inst_id: str,
+        chart_refreshed_at: datetime,
+        position_refreshed_at: datetime | None,
+        live_pnl_refreshed_at: datetime | None,
+        candle_count: int,
+        latest_candle_confirmed: bool,
+    ) -> str:
+        candle_state = "\u5df2\u6536\u76d8" if latest_candle_confirmed else "\u672a\u6536\u76d8"
+        parts = [
+            f"\u5408\u7ea6 {trade_inst_id}",
+            f"\u5468\u671f {session.config.bar}",
+            f"\u6700\u8fd1\u5237\u65b0 {chart_refreshed_at.strftime('%H:%M:%S')}",
+            f"K\u7ebf {candle_count} \u6839",
+            f"\u5f53\u524dK\u7ebf {candle_state}",
+            f"\u81ea\u52a8\u5237\u65b0 {DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS // 1000} \u79d2",
+        ]
+        if position_refreshed_at is not None:
+            parts.append(f"\u6301\u4ed3\u7f13\u5b58 {position_refreshed_at.strftime('%H:%M:%S')}")
+        if live_pnl_refreshed_at is not None and live_pnl_refreshed_at != position_refreshed_at:
+            parts.append(f"\u6d6e\u76c8\u7f13\u5b58 {live_pnl_refreshed_at.strftime('%H:%M:%S')}")
+        return " | ".join(parts)
+
     def _finish_strategy_template_import(
         self,
         *,
@@ -12967,6 +13431,7 @@ class QuantApp:
         self._protection_manager.stop_all()
         self._close_strategy_history_window()
         self._close_strategy_book_window()
+        self._close_all_strategy_live_chart_windows()
         self._close_settings_window()
         if self._backtest_window is not None and self._backtest_window.window.winfo_exists():
             self._backtest_window.window.destroy()

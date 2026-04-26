@@ -561,6 +561,82 @@ HTTP 502: <!DOCTYPE html>
         self.assertIsNone(_trade_order_session_role(order, session))
         self.assertFalse(_trade_order_belongs_to_session(order, session))
 
+    def test_strategy_live_chart_pending_entry_prices_deduplicate_same_price_orders(self) -> None:
+        app = QuantApp.__new__(QuantApp)
+        session = SimpleNamespace(
+            session_id="S01",
+            strategy_id="ema_dynamic_order",
+            strategy_name="EMA dynamic",
+        )
+        prefix = _session_order_prefixes(session)[0]
+        app._latest_pending_orders = [
+            SimpleNamespace(
+                price=Decimal("101.2"),
+                order_price=None,
+                trigger_price=None,
+                client_order_id=f"{prefix}ent001",
+                algo_client_order_id="",
+            ),
+            SimpleNamespace(
+                price=Decimal("101.2"),
+                order_price=None,
+                trigger_price=None,
+                client_order_id=f"{prefix}ent002",
+                algo_client_order_id="",
+            ),
+            SimpleNamespace(
+                price=None,
+                order_price=Decimal("102.5"),
+                trigger_price=None,
+                client_order_id=f"{prefix}ent003",
+                algo_client_order_id="",
+            ),
+        ]
+
+        self.assertEqual(
+            QuantApp._strategy_live_chart_pending_entry_prices(app, session),
+            (Decimal("101.2"), Decimal("102.5")),
+        )
+
+    def test_strategy_live_chart_position_avg_price_weights_matching_positions(self) -> None:
+        app = QuantApp.__new__(QuantApp)
+        refreshed_at = datetime(2026, 4, 26, 12, 0, 0)
+        app._positions_snapshot_by_profile = {
+            "moni": ProfilePositionSnapshot(
+                api_name="moni",
+                effective_environment="demo",
+                positions=[
+                    SimpleNamespace(inst_id="ETH-USDT-SWAP", pos_side="long", position=Decimal("1"), avg_price=Decimal("100")),
+                    SimpleNamespace(inst_id="ETH-USDT-SWAP", pos_side="long", position=Decimal("2"), avg_price=Decimal("130")),
+                ],
+                upl_usdt_prices={},
+                refreshed_at=refreshed_at,
+            )
+        }
+        session = SimpleNamespace(
+            api_name="moni",
+            symbol="ETH-USDT-SWAP",
+            config=StrategyConfig(
+                inst_id="ETH-USDT-SWAP",
+                bar="1H",
+                ema_period=21,
+                atr_period=10,
+                atr_stop_multiplier=Decimal("2"),
+                atr_take_multiplier=Decimal("4"),
+                order_size=Decimal("1"),
+                trade_mode="cross",
+                signal_mode="long_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+            ),
+        )
+
+        avg_price, snapshot_at = QuantApp._strategy_live_chart_position_avg_price(app, session)
+
+        self.assertEqual(avg_price, Decimal("120"))
+        self.assertEqual(snapshot_at, refreshed_at)
+
     def test_session_can_be_cleared_only_when_stopped_and_not_running(self) -> None:
         stopped = SimpleNamespace(status="\u5df2\u505c\u6b62", engine=SimpleNamespace(is_running=False))
         stopping = SimpleNamespace(status="\u505c\u6b62\u4e2d", engine=SimpleNamespace(is_running=False))
