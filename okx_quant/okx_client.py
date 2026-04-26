@@ -1328,6 +1328,7 @@ class OkxRestClient:
         cl_ord_id: str | None = None,
         include_take_profit: bool = True,
         stop_loss_algo_cl_ord_id: str | None = None,
+        include_attached_protection: bool = True,
     ) -> OkxOrderResult:
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
@@ -1339,15 +1340,16 @@ class OkxRestClient:
             "side": plan.side,
             "ordType": "market",
             "sz": format_decimal(plan.size),
-            "attachAlgoOrds": [
+        }
+        if include_attached_protection:
+            order["attachAlgoOrds"] = [
                 _build_attached_algo_order(
                     config=config,
                     plan=plan,
                     include_take_profit=include_take_profit,
                     stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
                 )
-            ],
-        }
+            ]
         if plan.pos_side:
             order["posSide"] = plan.pos_side
         if cl_ord_id:
@@ -1376,6 +1378,7 @@ class OkxRestClient:
         cl_ord_id: str | None = None,
         include_take_profit: bool = True,
         stop_loss_algo_cl_ord_id: str | None = None,
+        include_attached_protection: bool = True,
     ) -> OkxOrderResult:
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
@@ -1388,15 +1391,16 @@ class OkxRestClient:
             "ordType": "limit",
             "px": format_decimal(plan.entry_reference),
             "sz": format_decimal(plan.size),
-            "attachAlgoOrds": [
+        }
+        if include_attached_protection:
+            order["attachAlgoOrds"] = [
                 _build_attached_algo_order(
                     config=config,
                     plan=plan,
                     include_take_profit=include_take_profit,
                     stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
                 )
-            ],
-        }
+            ]
         if plan.pos_side:
             order["posSide"] = plan.pos_side
         if cl_ord_id:

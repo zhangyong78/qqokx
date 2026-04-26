@@ -191,6 +191,104 @@ class OkxClientOrderRequestTest(TestCase):
             },
         )
 
+    def test_place_limit_order_can_skip_attached_protection(self) -> None:
+        client = OkxRestClient()
+        captured: dict[str, object] = {}
+
+        def _stub_request(method: str, path: str, params=None, body=None, **kwargs):
+            if path == "/api/v5/public/instruments":
+                return {
+                    "data": [
+                        {
+                            "instId": "BTC-USD-SWAP",
+                            "instType": "SWAP",
+                            "tickSz": "0.1",
+                            "lotSz": "0.1",
+                            "minSz": "0.1",
+                            "state": "live",
+                            "settleCcy": "BTC",
+                            "ctVal": "100",
+                            "ctMult": "1",
+                            "ctValCcy": "USD",
+                            "uly": "BTC-USD",
+                            "instFamily": "BTC-USD",
+                        }
+                    ]
+                }
+            captured["method"] = method
+            captured["path"] = path
+            captured["body"] = body
+            return {
+                "data": [
+                    {
+                        "ordId": "789",
+                        "clOrdId": "entry-2",
+                        "sCode": "0",
+                        "sMsg": "",
+                    }
+                ]
+            }
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        config = StrategyConfig(
+            inst_id="BTC-USD-SWAP",
+            trade_inst_id="BTC-USD-SWAP",
+            local_tp_sl_inst_id="BTC-USD-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            tp_sl_mode="exchange",
+            take_profit_mode="dynamic",
+            risk_amount=Decimal("10"),
+        )
+        plan = OrderPlan(
+            inst_id="BTC-USD-SWAP",
+            side="buy",
+            pos_side="long",
+            size=Decimal("0.1"),
+            take_profit=Decimal("82000"),
+            stop_loss=Decimal("71000"),
+            entry_reference=Decimal("75000"),
+            atr_value=Decimal("1000"),
+            signal="long",
+            candle_ts=1710000000000,
+            tp_sl_inst_id="BTC-USD-SWAP",
+            tp_sl_mode="exchange",
+        )
+
+        result = client.place_limit_order(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            config,
+            plan,
+            cl_ord_id="entry-2",
+            include_attached_protection=False,
+        )
+
+        self.assertEqual(result.ord_id, "789")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["path"], "/api/v5/trade/order")
+        self.assertEqual(
+            captured["body"],
+            {
+                "instId": "BTC-USD-SWAP",
+                "tdMode": "cross",
+                "side": "buy",
+                "ordType": "limit",
+                "px": "75000",
+                "sz": "0.1",
+                "posSide": "long",
+                "clOrdId": "entry-2",
+            },
+        )
+
     def test_request_uses_code_when_okx_error_message_is_empty(self) -> None:
         client = OkxRestClient()
 

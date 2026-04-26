@@ -20,6 +20,9 @@ from okx_quant.trader_desk_ui import (
     _gate_condition_value,
     _normalize_draft_form_values,
     _payload_bar,
+    _replace_text_preserving_scroll,
+    _run_status_label,
+    _slot_status_label,
     _should_reload_draft_form,
     _trader_current_session_label,
     _validate_trader_desk_payload,
@@ -117,6 +120,31 @@ class TraderDeskHelpersTest(TestCase):
 
         self.assertEqual(label, "可启动")
         self.assertEqual(_draft_status_value(label), "ready")
+
+    def test_run_status_label_uses_chinese_text(self) -> None:
+        self.assertEqual(_run_status_label("paused_loss"), "亏损暂停")
+        self.assertEqual(_run_status_label("quota_exhausted"), "额度耗尽")
+
+    def test_slot_status_label_uses_chinese_text(self) -> None:
+        self.assertEqual(_slot_status_label("watching"), "观察中")
+        self.assertEqual(_slot_status_label("open"), "持仓中")
+        self.assertEqual(_slot_status_label("closed_loss"), "亏损平仓")
+        self.assertEqual(_slot_status_label("closed_profit"), "盈利平仓")
+        self.assertEqual(_slot_status_label("closed_manual"), "人工结束")
+        self.assertEqual(_slot_status_label("stopped"), "已停止")
+        self.assertEqual(_slot_status_label("failed"), "异常结束")
+        self.assertEqual(
+            _slot_status_label("closed_loss", close_reason="策略主动平仓", net_pnl=Decimal("-0.01")),
+            "止盈净亏",
+        )
+        self.assertEqual(
+            _slot_status_label("closed_profit", close_reason="策略主动平仓", net_pnl=Decimal("0.02")),
+            "止盈净盈",
+        )
+        self.assertEqual(
+            _slot_status_label("closed_loss", close_reason="OKX止损触发", net_pnl=Decimal("-0.08")),
+            "止损平仓",
+        )
 
     def test_payload_bar_reads_snapshot_bar(self) -> None:
         self.assertEqual(_payload_bar(self._payload()), "15m")
@@ -234,3 +262,252 @@ class TraderDeskHelpersTest(TestCase):
         window._refresh_views.assert_called_once_with(select_id="T001")
         showinfo.assert_called_once()
         showerror.assert_not_called()
+
+    def test_force_cleanup_selected_trader_confirms_then_runs_force_cleaner(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload=self._payload(),
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+        )
+        open_slot = TraderSlotRecord(
+            slot_id="slot-1",
+            trader_id="T001",
+            session_id="S01",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="BTC-USDT-SWAP",
+            status="open",
+            quota_occupied=True,
+        )
+        window = SimpleNamespace(
+            window=object(),
+            _snapshot=TraderDeskSnapshot(drafts=[draft], slots=[open_slot]),
+            _selected_draft=lambda: draft,
+            _trader_force_cleaner=MagicMock(),
+            _clear_pending_delete=MagicMock(),
+            _append_log=MagicMock(),
+            _refresh_views=MagicMock(),
+        )
+
+        with patch("okx_quant.trader_desk_ui.messagebox.askyesno", return_value=True) as askyesno, patch(
+            "okx_quant.trader_desk_ui.messagebox.showerror"
+        ) as showerror:
+            TraderDeskWindow.force_cleanup_selected_trader(window)
+
+        askyesno.assert_called_once()
+        window._trader_force_cleaner.assert_called_once_with("T001")
+        window._clear_pending_delete.assert_called_once()
+        window._refresh_views.assert_called_once_with(select_id="T001")
+        showerror.assert_not_called()
+
+    def test_delete_selected_draft_auto_force_cleans_when_only_hidden_residual_state_blocks_delete(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T004",
+            template_payload=self._payload(),
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+        )
+        delete_calls = {"count": 0}
+
+        def _delete(_trader_id: str) -> None:
+            delete_calls["count"] += 1
+            if delete_calls["count"] == 1:
+                raise ValueError("该交易员仍有关联会话在运行，请先暂停或平仓。")
+
+        window = SimpleNamespace(
+            window=object(),
+            _snapshot=TraderDeskSnapshot(drafts=[draft], slots=[]),
+            _pending_delete_trader_id="",
+            _selected_draft=lambda: draft,
+            _selected_run_status=lambda trader_id: "paused_manual",
+            _draft_deleter=MagicMock(side_effect=_delete),
+            _trader_force_cleaner=MagicMock(),
+            _trader_pauser=MagicMock(),
+            _clear_pending_delete=MagicMock(),
+            _append_log=MagicMock(),
+            _refresh_views=MagicMock(),
+        )
+
+        with patch("okx_quant.trader_desk_ui.messagebox.showinfo") as showinfo, patch(
+            "okx_quant.trader_desk_ui.messagebox.showerror"
+        ) as showerror:
+            TraderDeskWindow.delete_selected_draft(window)
+
+        self.assertEqual(delete_calls["count"], 2)
+        window._trader_force_cleaner.assert_called_once_with("T004")
+        window._trader_pauser.assert_not_called()
+        window._clear_pending_delete.assert_called_once_with("T004")
+        window._refresh_views.assert_called_once_with()
+        showinfo.assert_called_once()
+        showerror.assert_not_called()
+
+    def test_refresh_slot_tree_includes_exit_price_column_value(self) -> None:
+        class _FakeTree:
+            def __init__(self) -> None:
+                self.rows: dict[str, tuple[object, ...]] = {}
+
+            def get_children(self):
+                return list(self.rows.keys())
+
+            def delete(self, item_id: str) -> None:
+                self.rows.pop(item_id, None)
+
+            def insert(self, parent: str, index: object, iid: str, values: tuple[object, ...]) -> None:
+                self.rows[iid] = values
+
+        closed_slot = TraderSlotRecord(
+            slot_id="slot-1",
+            trader_id="T001",
+            session_id="S11",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="BTC-USDT-SWAP",
+            status="closed_profit",
+            opened_at=datetime(2026, 4, 25, 3, 1, 13),
+            closed_at=datetime(2026, 4, 25, 6, 46, 28),
+            entry_price=Decimal("77734.1"),
+            exit_price=Decimal("78034.1"),
+            size=Decimal("0.1"),
+            net_pnl=Decimal("0.30"),
+            close_reason="策略主动平仓",
+        )
+        window = SimpleNamespace(
+            slot_tree=_FakeTree(),
+            _selected_trader_id=lambda: "T001",
+            _snapshot=TraderDeskSnapshot(slots=[closed_slot]),
+        )
+
+        TraderDeskWindow._refresh_slot_tree(window)
+
+        values = window.slot_tree.rows["slot-1"]
+        self.assertEqual(values[1], "止盈净盈")
+        self.assertEqual(values[7], "78034.1")
+        self.assertEqual(values[8], "0.30")
+
+    def test_replace_text_preserving_scroll_restores_yview(self) -> None:
+        class _FakeText:
+            def __init__(self, y_position: float = 0.0) -> None:
+                self.content = ""
+                self.y_position = y_position
+
+            def yview(self) -> tuple[float, float]:
+                return (self.y_position, min(self.y_position + 0.2, 1.0))
+
+            def yview_moveto(self, fraction: float) -> None:
+                self.y_position = fraction
+
+            def delete(self, _start: str, _end: str) -> None:
+                self.content = ""
+                self.y_position = 0.0
+
+            def insert(self, _index: str, text: str) -> None:
+                self.content = text
+                self.y_position = 0.0
+
+        widget = _FakeText(y_position=0.62)
+
+        _replace_text_preserving_scroll(widget, "第一行\n第二行")
+
+        self.assertEqual(widget.content, "第一行\n第二行")
+        self.assertEqual(widget.y_position, 0.62)
+
+    def test_refresh_event_text_preserves_scroll_position(self) -> None:
+        class _FakeText:
+            def __init__(self, y_position: float = 0.0) -> None:
+                self.content = ""
+                self.y_position = y_position
+
+            def yview(self) -> tuple[float, float]:
+                return (self.y_position, min(self.y_position + 0.2, 1.0))
+
+            def yview_moveto(self, fraction: float) -> None:
+                self.y_position = fraction
+
+            def delete(self, _start: str, _end: str) -> None:
+                self.content = ""
+                self.y_position = 0.0
+
+            def insert(self, _index: str, text: str) -> None:
+                self.content = text
+                self.y_position = 0.0
+
+        event_text = _FakeText(y_position=0.55)
+        window = SimpleNamespace(
+            event_text=event_text,
+            _selected_trader_id=lambda: "T001",
+            _snapshot=TraderDeskSnapshot(
+                events=[
+                    SimpleNamespace(
+                        trader_id="T001",
+                        created_at=datetime(2026, 4, 26, 7, 46, 0),
+                        level="info",
+                        message="当前无法生成挂单",
+                    )
+                ]
+            ),
+        )
+
+        TraderDeskWindow._refresh_event_text(window)
+
+        self.assertEqual(event_text.y_position, 0.55)
+        self.assertIn("当前无法生成挂单", event_text.content)
+
+    def test_refresh_detail_text_preserves_scroll_position(self) -> None:
+        class _FakeText:
+            def __init__(self, y_position: float = 0.0) -> None:
+                self.content = ""
+                self.y_position = y_position
+
+            def yview(self) -> tuple[float, float]:
+                return (self.y_position, min(self.y_position + 0.2, 1.0))
+
+            def yview_moveto(self, fraction: float) -> None:
+                self.y_position = fraction
+
+            def delete(self, _start: str, _end: str) -> None:
+                self.content = ""
+                self.y_position = 0.0
+
+            def insert(self, _index: str, text: str) -> None:
+                self.content = text
+                self.y_position = 0.0
+
+        class _FakeStringVar:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload=self._payload(),
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+        )
+        detail_text = _FakeText(y_position=0.48)
+        summary_text = _FakeStringVar()
+        window = SimpleNamespace(
+            detail_text=detail_text,
+            _summary_text=summary_text,
+            _selected_draft=lambda: draft,
+            _selected_run_status=lambda trader_id: "running",
+            _selected_run_reason=lambda trader_id: "",
+            _runtime_snapshot_provider=lambda trader_id: {
+                "session_id": "S33",
+                "runtime_status": "等待信号",
+            },
+            _refresh_slot_tree=MagicMock(),
+            _snapshot=TraderDeskSnapshot(drafts=[draft], slots=[]),
+        )
+
+        TraderDeskWindow._refresh_detail_text(window)
+
+        self.assertEqual(detail_text.y_position, 0.48)
+        self.assertIn("交易员：T001", detail_text.content)
+        self.assertIn("当前 watcher：", detail_text.content)
+        self.assertIn("等待信号", detail_text.content)

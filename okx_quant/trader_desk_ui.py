@@ -57,6 +57,23 @@ DRAFT_STATUS_LABELS: dict[str, str] = {
 DRAFT_STATUS_LABEL_TO_VALUE: dict[str, str] = {
     label: value for value, label in DRAFT_STATUS_LABELS.items()
 }
+RUN_STATUS_LABELS: dict[str, str] = {
+    "idle": "未启动",
+    "running": "运行中",
+    "paused_manual": "人工暂停",
+    "paused_loss": "亏损暂停",
+    "quota_exhausted": "额度耗尽",
+    "stopped": "已停止",
+}
+SLOT_STATUS_LABELS: dict[str, str] = {
+    "watching": "观察中",
+    "open": "持仓中",
+    "closed_profit": "盈利平仓",
+    "closed_loss": "亏损平仓",
+    "closed_manual": "人工结束",
+    "stopped": "已停止",
+    "failed": "异常结束",
+}
 
 
 def _should_reload_draft_form(
@@ -180,6 +197,21 @@ def _format_optional_pnl(value: Decimal | None) -> str:
     return format_decimal_fixed(decimal_value, 2)
 
 
+def _replace_text_preserving_scroll(widget: Text, content: str) -> None:
+    try:
+        yview = widget.yview()
+    except Exception:
+        yview = None
+    widget.delete("1.0", END)
+    if content:
+        widget.insert("1.0", content)
+    if yview:
+        try:
+            widget.yview_moveto(yview[0])
+        except Exception:
+            pass
+
+
 def _gate_field_ui_state(condition: str) -> tuple[str, str, str, str]:
     normalized = _gate_condition_value(condition)
     if normalized == "above":
@@ -258,6 +290,30 @@ def _draft_status_value(value: str) -> str:
     if normalized in DRAFT_STATUS_LABELS:
         return normalized
     return "draft"
+
+
+def _run_status_label(value: str) -> str:
+    normalized = str(value or "").strip()
+    return RUN_STATUS_LABELS.get(normalized, normalized or "未启动")
+
+
+def _slot_status_label(
+    value: str,
+    *,
+    close_reason: str = "",
+    net_pnl: Decimal | None = None,
+) -> str:
+    normalized = str(value or "").strip()
+    reason = str(close_reason or "").strip()
+    if normalized == "closed_profit" and "策略主动平仓" in reason:
+        return "止盈净盈"
+    if normalized == "closed_loss" and "策略主动平仓" in reason:
+        return "止盈净亏"
+    if normalized == "closed_loss" and "止损" in reason:
+        return "止损平仓"
+    if normalized == "closed_profit" and net_pnl is not None and net_pnl <= 0:
+        return "平仓后净亏"
+    return SLOT_STATUS_LABELS.get(normalized, normalized or "-")
 
 
 def _snapshot_text(snapshot: dict[str, object], key: str, default: str = "-") -> str:
@@ -369,6 +425,7 @@ def _build_trader_strategy_lines(
         f"止盈止损模式：{_snapshot_text(snapshot, 'tp_sl_mode')} | "
         f"轮询秒数：{_snapshot_text(snapshot, 'poll_seconds')}"
     )
+    lines.append("交易员退出：虚拟止损只记触发不平仓；只有止盈或人工平仓才会释放额度。")
     lines.append(f"价格开关：{_gate_summary_text(draft)}")
 
     if runtime_snapshot:
@@ -413,6 +470,7 @@ class TraderDeskWindow:
         trader_pauser: TraderAction,
         trader_resumer: TraderAction,
         trader_flattener: TraderAction,
+        trader_force_cleaner: TraderAction,
         symbol_provider: SymbolProvider,
         runtime_snapshot_provider: RuntimeSnapshotProvider,
     ) -> None:
@@ -428,6 +486,7 @@ class TraderDeskWindow:
         self._trader_pauser = trader_pauser
         self._trader_resumer = trader_resumer
         self._trader_flattener = trader_flattener
+        self._trader_force_cleaner = trader_force_cleaner
         self._symbol_provider = symbol_provider
         self._runtime_snapshot_provider = runtime_snapshot_provider
         self._refresh_job: str | None = None
@@ -439,7 +498,7 @@ class TraderDeskWindow:
         self._pending_delete_trader_id = ""
 
         self._status_text = StringVar(value="草稿 0 条 | 运行中 0 条")
-        self._summary_text = StringVar(value="交易员策略会固定数量下单，并按额度格持续补 watcher。")
+        self._summary_text = StringVar(value="交易员策略会固定数量下单，虚拟止损只记触发不直接平仓，并按额度格持续补 watcher。")
         self.total_quota_var = StringVar(value="1")
         self.unit_quota_var = StringVar(value="0.1")
         self.quota_steps_var = StringVar(value="10")
@@ -582,7 +641,8 @@ class TraderDeskWindow:
         ttk.Button(toolbar, text="暂停", command=self.pause_selected_trader).grid(row=0, column=3, padx=(8, 0))
         ttk.Button(toolbar, text="恢复", command=self.resume_selected_trader).grid(row=0, column=4, padx=(8, 0))
         ttk.Button(toolbar, text="手动平仓", command=self.flatten_selected_trader).grid(row=0, column=5, padx=(8, 0))
-        ttk.Button(toolbar, text="辞退交易员", command=self.delete_selected_draft).grid(row=0, column=6, padx=(8, 0))
+        ttk.Button(toolbar, text="强制清格", command=self.force_cleanup_selected_trader).grid(row=0, column=6, padx=(8, 0))
+        ttk.Button(toolbar, text="辞退交易员", command=self.delete_selected_draft).grid(row=0, column=7, padx=(8, 0))
 
         self.tree = ttk.Treeview(
             left,
@@ -637,7 +697,7 @@ class TraderDeskWindow:
             sticky="w",
             pady=(10, 0),
         )
-        ttk.Checkbutton(right_top, text="止损后暂停补位", variable=self.pause_on_stop_loss_var).grid(
+        ttk.Checkbutton(right_top, text="单次止损后立即暂停补位", variable=self.pause_on_stop_loss_var).grid(
             row=5,
             column=0,
             columnspan=2,
@@ -706,7 +766,7 @@ class TraderDeskWindow:
 
         self.slot_tree = ttk.Treeview(
             right_bottom,
-            columns=("slot", "status", "session", "opened", "entry", "size", "closed", "pnl", "reason"),
+            columns=("slot", "status", "session", "opened", "entry", "size", "closed", "exit", "pnl", "reason"),
             show="headings",
             selectmode="browse",
             height=8,
@@ -720,6 +780,7 @@ class TraderDeskWindow:
             ("entry", "开仓价", 90, "center"),
             ("size", "数量", 90, "center"),
             ("closed", "结束时间", 120, "center"),
+            ("exit", "平仓价", 90, "center"),
             ("pnl", "净盈亏", 90, "e"),
             ("reason", "原因", 180, "w"),
         ):
@@ -895,6 +956,24 @@ class TraderDeskWindow:
             message = str(exc)
             if (
                 "仍有关联会话在运行" in message or "仍有活动中的额度格" in message
+            ) and not open_slots and not watching_slots:
+                try:
+                    self._trader_force_cleaner(draft.trader_id)
+                    self._draft_deleter(draft.trader_id)
+                except Exception as force_exc:
+                    message = str(force_exc)
+                else:
+                    self._clear_pending_delete(draft.trader_id)
+                    self._append_log(f"[{draft.trader_id}] 已自动强制清格并完成辞退。")
+                    self._refresh_views()
+                    messagebox.showinfo(
+                        "辞退完成",
+                        "检测到这名交易员只剩本地残留状态，系统已先强制清格并完成辞退。",
+                        parent=self.window,
+                    )
+                    return
+            if (
+                "仍有关联会话在运行" in message or "仍有活动中的额度格" in message
             ) and (watching_slots or run_status in {"running", "quota_exhausted", "paused_manual", "stopped"}):
                 try:
                     self._trader_pauser(draft.trader_id)
@@ -974,6 +1053,42 @@ class TraderDeskWindow:
 
     def flatten_selected_trader(self) -> None:
         self._run_action(self._trader_flattener, "平仓", "已请求手动平仓")
+
+    def force_cleanup_selected_trader(self) -> None:
+        draft = self._selected_draft()
+        if draft is None:
+            messagebox.showinfo("提示", "请先选中一条交易员草稿。", parent=self.window)
+            return
+        slots = trader_slots_for(self._snapshot.slots, draft.trader_id)
+        force_targets = [slot for slot in slots if slot.status in {"watching", "open", "stopped", "failed"}]
+        if not force_targets:
+            messagebox.showinfo("提示", "当前没有需要强制清理的额度格。", parent=self.window)
+            return
+        open_count = sum(1 for slot in force_targets if slot.status == "open")
+        watching_count = sum(1 for slot in force_targets if slot.status == "watching")
+        if open_count:
+            message = (
+                f"这会强制清理本地 {len(force_targets)} 个额度格"
+                f"（其中持仓中 {open_count} 个、watcher {watching_count} 个）。\n\n"
+                "注意：这不会替你在交易所平仓，只会释放交易员管理台里的本地占用状态。\n"
+                "请只在你已经确认真实仓位/委托都处理完毕时使用。\n\n是否继续？"
+            )
+        else:
+            message = (
+                f"这会强制清理本地 {len(force_targets)} 个残留额度格"
+                f"（watcher {watching_count} 个）。\n\n"
+                "该操作会释放本地额度占用，并尝试停止关联会话。\n\n是否继续？"
+            )
+        if not messagebox.askyesno("强制清格确认", message, parent=self.window):
+            return
+        try:
+            self._trader_force_cleaner(draft.trader_id)
+        except Exception as exc:
+            messagebox.showerror("强制清格失败", str(exc), parent=self.window)
+            return
+        self._clear_pending_delete(draft.trader_id, reason="你手动执行了强制清格")
+        self._append_log(f"[{draft.trader_id}] 已强制清理本地额度格。")
+        self._refresh_views(select_id=draft.trader_id)
 
     def _run_action(self, action: TraderAction, title: str, success_text: str) -> None:
         draft = self._selected_draft()
@@ -1085,7 +1200,7 @@ class TraderDeskWindow:
                     _payload_bar(draft.template_payload),
                     str(draft.template_payload.get("symbol") or "-"),
                     str(draft.template_payload.get("api_name") or "-"),
-                    run_status,
+                    _run_status_label(run_status),
                     f"{used}/{draft.quota_steps} | {_normalize_decimal_text(used_quota)}/{_normalize_decimal_text(draft.total_quota)}",
                     f"{open_count} 单 / {_format_optional_decimal(average_entry)}",
                     _format_optional_pnl(realized_pnl),
@@ -1118,12 +1233,13 @@ class TraderDeskWindow:
                 iid=slot.slot_id,
                 values=(
                     slot.slot_id,
-                    slot.status,
+                    _slot_status_label(slot.status, close_reason=slot.close_reason, net_pnl=slot.net_pnl),
                     slot.session_id,
                     slot.opened_at.strftime("%m-%d %H:%M:%S") if slot.opened_at else "-",
                     _format_optional_decimal(slot.entry_price),
                     _format_optional_decimal(slot.size),
                     slot.closed_at.strftime("%m-%d %H:%M:%S") if slot.closed_at else "-",
+                    _format_optional_decimal(slot.exit_price),
                     _format_optional_pnl(slot.net_pnl),
                     slot.close_reason or "-",
                 ),
@@ -1132,24 +1248,24 @@ class TraderDeskWindow:
     def _refresh_event_text(self) -> None:
         if self.event_text is None:
             return
-        self.event_text.delete("1.0", END)
         trader_id = self._selected_trader_id()
         if not trader_id:
+            _replace_text_preserving_scroll(self.event_text, "")
             return
         events = [event for event in self._snapshot.events if event.trader_id == trader_id][:80]
-        for event in events:
-            self.event_text.insert(
-                END,
-                f"{event.created_at:%Y-%m-%d %H:%M:%S} [{event.level}] {event.message}\n",
-            )
+        content = "".join(
+            f"{event.created_at:%Y-%m-%d %H:%M:%S} [{event.level}] {event.message}\n"
+            for event in events
+        )
+        _replace_text_preserving_scroll(self.event_text, content)
 
     def _refresh_detail_text(self) -> None:
         if self.detail_text is None:
             return
-        self.detail_text.delete("1.0", END)
         draft = self._selected_draft()
         if draft is None:
-            self._summary_text.set("交易员策略会固定数量下单，并按额度格持续补 watcher。")
+            self._summary_text.set("交易员策略会固定数量下单，虚拟止损只记触发不直接平仓，并按额度格持续补 watcher。")
+            _replace_text_preserving_scroll(self.detail_text, "")
             return
         trader_id = draft.trader_id
         run_status = self._selected_run_status(trader_id)
@@ -1168,7 +1284,7 @@ class TraderDeskWindow:
             runtime_status = str(runtime_snapshot.get("runtime_status") or "").strip()
             runtime_session_id = str(runtime_snapshot.get("session_id") or "").strip()
         self._summary_text.set(
-            f"运行状态：{run_status}"
+            f"运行状态：{_run_status_label(run_status)}"
             + (f" | 原因：{run_reason}" if run_reason else "")
             + f" | 周期：{_payload_bar(draft.template_payload)}"
             + (
@@ -1220,7 +1336,7 @@ class TraderDeskWindow:
                         ]
                     )
                 )
-        self.detail_text.insert(END, "\n".join(lines))
+        _replace_text_preserving_scroll(self.detail_text, "\n".join(lines))
 
     def _refresh_views(self, *, select_id: str | None = None) -> None:
         selected_id = select_id or self._selected_trader_id()

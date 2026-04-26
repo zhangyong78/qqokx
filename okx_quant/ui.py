@@ -950,6 +950,10 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             int(_strategy_config_default("time_stop_break_even_bars")),
             minimum=0,
         ),
+        trader_virtual_stop_loss=_coerce_snapshot_bool(
+            payload.get("trader_virtual_stop_loss"),
+            bool(_strategy_config_default("trader_virtual_stop_loss")),
+        ),
         backtest_profile_id=_coerce_snapshot_text(
             payload.get("backtest_profile_id"),
             str(_strategy_config_default("backtest_profile_id")),
@@ -1135,7 +1139,11 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
         return None
     if "OKX 读取异常，准备重试" in text or "OKX 读取失败" in text:
         return current_status or "网络重试中"
-    if "开始监控 OKX 动态止损" in text or "开始本地止盈止损监控" in text:
+    if (
+        "开始监控 OKX 动态止损" in text
+        or "开始本地止盈止损监控" in text
+        or "交易员虚拟止损监控启动" in text
+    ):
         return "持仓监控中"
     if (
         "挂单已成交" in text
@@ -1145,6 +1153,10 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
         or "OKX 动态止损候选价已过期" in text
         or "OKX 动态止损委托暂未出现在挂单列表" in text
         or "OKX 动态止损上移失败，稍后重试" in text
+        or "交易员动态止盈保护价已上移" in text
+        or "交易员虚拟止损已触发（不平仓）" in text
+        or "交易员固定止盈已触发" in text
+        or "交易员动态止盈保护价触发" in text
     ):
         return "持仓监控中"
     if (
@@ -1555,6 +1567,7 @@ class QuantApp:
         self.strategy_rule_text = StringVar()
         self.strategy_hint_text = StringVar()
         self.selected_session_text = StringVar(value=self._default_selected_session_text())
+        self._selected_session_detail_session_id: str | None = None
         self.strategy_history_text = StringVar(value=self._default_strategy_history_text())
         self.positions_summary_text = StringVar(value="当前尚未获取持仓。")
         self._positions_refresh_badge_text = StringVar(value="未读")
@@ -1972,6 +1985,7 @@ class QuantApp:
             running_frame,
             columns=(
                 "session",
+                "trader",
                 "api",
                 "source_type",
                 "strategy",
@@ -1988,6 +2002,7 @@ class QuantApp:
             selectmode="browse",
         )
         self.session_tree.heading("session", text="会话")
+        self.session_tree.heading("trader", text="交易员")
         self.session_tree.heading("api", text="API")
         self.session_tree.heading("source_type", text="来源类型")
         self.session_tree.heading("strategy", text="策略")
@@ -1999,7 +2014,8 @@ class QuantApp:
         self.session_tree.heading("pnl", text="净盈亏")
         self.session_tree.heading("status", text="状态")
         self.session_tree.heading("started", text="启动时间")
-        self.session_tree.column("session", width=72, anchor="center")
+        self.session_tree.column("session", width=56, anchor="center")
+        self.session_tree.column("trader", width=72, anchor="center")
         self.session_tree.column("api", width=80, anchor="center")
         self.session_tree.column("source_type", width=98, anchor="center")
         self.session_tree.column("strategy", width=120, anchor="w")
@@ -2363,13 +2379,16 @@ class QuantApp:
             "点击“账户信息”后，程序会读取 OKX 账户余额与账户配置接口；下方标签页也可以继续查看当前委托和历史委托。"
         )
 
-    def _set_readonly_text(self, widget: Text | None, content: str) -> None:
+    def _set_readonly_text(self, widget: Text | None, content: str, *, preserve_scroll: bool = False) -> None:
         if widget is None or not _widget_exists(widget):
             return
         try:
+            yview = widget.yview() if preserve_scroll else None
             widget.configure(state="normal")
             widget.delete("1.0", END)
             widget.insert("1.0", content)
+            if yview:
+                widget.yview_moveto(yview[0])
             widget.configure(state="disabled")
         except TclError:
             return
@@ -6812,6 +6831,7 @@ class QuantApp:
             trader_pauser=self.pause_trader_draft,
             trader_resumer=self.resume_trader_draft,
             trader_flattener=self.flatten_trader_draft,
+            trader_force_cleaner=self.force_clear_trader_draft,
             symbol_provider=self._trader_desk_symbol_choices,
             runtime_snapshot_provider=self._trader_runtime_snapshot_for_ui,
         )
@@ -7972,7 +7992,13 @@ class QuantApp:
             return False
 
         slot_id = self._trader_desk_next_slot_id(trader_id)
-        config = replace(record.config, run_mode="trade", risk_amount=None, order_size=draft.unit_quota)
+        config = replace(
+            record.config,
+            run_mode="trade",
+            risk_amount=None,
+            order_size=draft.unit_quota,
+            trader_virtual_stop_loss=True,
+        )
         notifier = self._build_notifier(config)
         try:
             session_id = self._start_strategy_session(
@@ -8163,6 +8189,55 @@ class QuantApp:
         self._trader_desk_add_event(trader_id, f"已请求手动平仓/停止 {len(session_ids)} 个额度格。", level="warning")
         self._save_trader_desk_snapshot()
 
+    def force_clear_trader_draft(self, trader_id: str) -> None:
+        draft = self._trader_desk_draft_by_id(trader_id)
+        run = self._trader_desk_run_by_id(trader_id, create=True)
+        if draft is None or run is None:
+            raise ValueError("未找到对应的交易员草稿。")
+        now = datetime.now()
+        draft.status = "paused"
+        draft.updated_at = now
+        run.status = "paused_manual"
+        run.paused_reason = "人工强制清格。"
+        run.armed_session_id = ""
+        run.last_event_at = now
+        run.updated_at = now
+
+        stop_requested = 0
+        for session in [item for item in self.sessions.values() if item.trader_id == trader_id]:
+            if session.stop_cleanup_in_progress or not session.engine.is_running:
+                continue
+            if self._request_stop_strategy_session(
+                session.session_id,
+                ended_reason="交易员强制清格",
+                source_label=f"交易员 {trader_id} 强制清格",
+                show_dialog=False,
+            ):
+                stop_requested += 1
+
+        cleared_slots = 0
+        for slot in trader_slots_for(self._trader_desk_slots, trader_id):
+            if slot.status in {"closed_profit", "closed_loss", "closed_manual"}:
+                continue
+            previous_status = slot.status
+            slot.status = "stopped"
+            slot.quota_occupied = False
+            slot.closed_at = slot.closed_at or now
+            slot.released_at = slot.released_at or now
+            if previous_status == "open":
+                slot.close_reason = "人工强制清格（未同步平仓结果）"
+            else:
+                slot.close_reason = slot.close_reason or "人工强制清格"
+            cleared_slots += 1
+
+        self._trader_desk_add_event(
+            trader_id,
+            f"已强制清理 {cleared_slots} 个额度格 | 已请求停止 {stop_requested} 个关联会话 | "
+            "本地额度占用已释放，请人工确认交易所真实仓位/委托。",
+            level="warning",
+        )
+        self._save_trader_desk_snapshot()
+
     def _signal_observer_session_rows(self) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
         ordered = sorted(self.sessions.values(), key=lambda item: (item.started_at, item.session_id), reverse=True)
@@ -8320,6 +8395,9 @@ class QuantApp:
             api_name=api_name,
             log_file_path=session_log_path,
             notifier=notifier,
+            direction_label=direction_label,
+            run_mode_label=run_mode_label,
+            trader_id=trader_id.strip(),
         )
         session = StrategySession(
             session_id=session_id,
@@ -9054,6 +9132,15 @@ class QuantApp:
         if run_mode == "signal_only":
             return "信号观察台"
         return "普通量化"
+
+    def _session_trader_label(self, session: StrategySession) -> str:
+        trader_id = str(getattr(session, "trader_id", "") or "").strip()
+        if not trader_id:
+            return "-"
+        draft = self._trader_desk_draft_by_id(trader_id)
+        if draft is None:
+            return trader_id
+        return str(getattr(draft, "trader_id", "") or "").strip() or trader_id
 
     def _current_running_session_filter_label(self) -> str:
         selected_filter: object = getattr(self, "running_session_filter", "全部")
@@ -9873,6 +9960,9 @@ class QuantApp:
         api_name: str,
         log_file_path: Path | None,
         notifier: EmailNotifier | None,
+        direction_label: str,
+        run_mode_label: str,
+        trader_id: str = "",
     ) -> StrategyEngine:
         session_logger = self._make_session_logger(
             session_id,
@@ -9887,6 +9977,9 @@ class QuantApp:
             notifier=notifier,
             strategy_name=strategy_name,
             session_id=session_id,
+            direction_label=direction_label,
+            run_mode_label=run_mode_label,
+            trader_id=trader_id,
         )
 
     def _next_session_id(self) -> str:
@@ -9955,6 +10048,30 @@ class QuantApp:
             if size is not None:
                 trade.size = size
             QuantApp._trader_desk_sync_open_trade_state(self, session)
+            return
+        if "交易员虚拟止损监控启动" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            stop_price = _extract_log_field_decimal(message, "策略止损")
+            if stop_price is not None:
+                trade.current_stop_price = stop_price
+            return
+        if "交易员动态止盈保护价已上移" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            new_stop = _extract_log_field_decimal(message, "新保护价") or _extract_log_field_decimal(message, "保护价")
+            if new_stop is not None:
+                trade.current_stop_price = new_stop
+            return
+        if "交易员虚拟止损已触发（不平仓）" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            stop_price = _extract_log_field_decimal(message, "策略止损")
+            if stop_price is not None:
+                trade.current_stop_price = stop_price
             return
         if "初始 OKX 止损已提交" in message:
             trade = session.active_trade
@@ -10499,10 +10616,12 @@ class QuantApp:
             return
         live_pnl, _ = self._session_live_pnl_snapshot(session)
         source_type = QuantApp._session_category_label(session)
+        trader_label = QuantApp._session_trader_label(self, session)
         bar_label = str(getattr(getattr(session, "config", None), "bar", "") or "").strip() or "-"
         tags = ("duplicate_conflict",) if QuantApp._session_has_duplicate_launch_conflict(self, session) else ()
         values = (
             session.session_id,
+            trader_label,
             session.api_name or "-",
             source_type,
             session.strategy_name,
@@ -10534,8 +10653,10 @@ class QuantApp:
         if session is None:
             self.selected_session_text.set(self._default_selected_session_text())
             self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
+            self._selected_session_detail_session_id = None
             return
 
+        preserve_scroll = session.session_id == self._selected_session_detail_session_id
         live_pnl, live_pnl_refreshed_at = self._session_live_pnl_snapshot(session)
         duplicate_warning = QuantApp._build_duplicate_launch_conflict_warning(
             session,
@@ -10570,7 +10691,12 @@ class QuantApp:
                 duplicate_warning=duplicate_warning,
             )
         )
-        self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
+        self._set_readonly_text(
+            self._selected_session_detail,
+            self.selected_session_text.get(),
+            preserve_scroll=preserve_scroll,
+        )
+        self._selected_session_detail_session_id = session.session_id
 
     @staticmethod
     def _snapshot_optional_text(snapshot: dict[str, object], key: str) -> str | None:

@@ -10,7 +10,15 @@ from typing import Callable, Literal, TypeVar
 from okx_quant.indicators import atr, ema
 from okx_quant.models import Credentials, Instrument, OrderPlan, ProtectionPlan, StrategyConfig
 from okx_quant.notifications import EmailNotifier
-from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxPosition, OkxRestClient, OkxTradeOrderItem
+from okx_quant.okx_client import (
+    OkxApiError,
+    OkxOrderResult,
+    OkxOrderStatus,
+    OkxPosition,
+    OkxRestClient,
+    OkxTradeOrderItem,
+    infer_inst_type,
+)
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
@@ -71,6 +79,7 @@ class ManagedEntryOrder:
     candle_ts: int
     entry_reference: Decimal
     stop_loss: Decimal
+    take_profit: Decimal
     stop_loss_algo_cl_ord_id: str | None
     size: Decimal
     side: Literal["buy", "sell"]
@@ -88,6 +97,12 @@ class FilledPosition:
     size: Decimal
     entry_price: Decimal
     entry_ts: int
+
+
+@dataclass(frozen=True)
+class CancelActiveOrderResult:
+    action: Literal["canceled", "pending", "filled", "partially_filled"]
+    status: OkxOrderStatus | None = None
 
 
 @dataclass(frozen=True)
@@ -124,12 +139,18 @@ class StrategyEngine:
         notifier: EmailNotifier | None = None,
         strategy_name: str = "Strategy",
         session_id: str = "",
+        direction_label: str = "",
+        run_mode_label: str = "",
+        trader_id: str = "",
     ) -> None:
         self._client = client
         self._logger = logger
         self._notifier = notifier
         self._strategy_name = strategy_name
         self._session_id = session_id
+        self._direction_label = direction_label.strip()
+        self._run_mode_label = run_mode_label.strip()
+        self._trader_id = trader_id.strip()
         self._api_name = ""
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -237,6 +258,7 @@ class StrategyEngine:
         active_order: ManagedEntryOrder | None = None
         idle_signal_candle_ts: int | None = None
         dynamic_stop_only = config.take_profit_mode == "dynamic"
+        trader_virtual_stop_loss_enabled = config.trader_virtual_stop_loss
         current_wave_signal: Literal["long", "short"] | None = None
         entries_in_current_wave = 0
         current_wave_index = 0
@@ -246,7 +268,11 @@ class StrategyEngine:
         )
 
         self._log_strategy_start(config, instrument, instrument)
-        self._logger("运行模式：同标的永续下单，止盈止损交给 OKX 托管")
+        if trader_virtual_stop_loss_enabled:
+            self._logger("交易员模式：止损价只做触发参考，不向 OKX 挂真实止损；只有止盈或人工平仓才释放额度。")
+            self._logger("运行模式：同标的永续下单，交易员虚拟止损只记触发，不向 OKX 挂真实止损。")
+        else:
+            self._logger("运行模式：同标的永续下单，止盈止损交给 OKX 托管")
         self._logger(
             f"策略规则：以上一根已收盘 K 线的 {_dynamic_entry_reference_ema_text(config)} 作为开仓价直接挂限价单。"
             f"每根新 K 线确认后，撤掉旧单，再按最新上一根 {_dynamic_entry_reference_ema_text(config)} 重新挂单。"
@@ -264,7 +290,14 @@ class StrategyEngine:
             f"启动追单窗口={config.startup_chase_window_label()}",
         ]
         self._logger(" | ".join(mode_parts))
-        if dynamic_stop_only:
+        if dynamic_stop_only and trader_virtual_stop_loss_enabled:
+            self._logger(
+                f"动态止盈已启用 | 2R保本={config.dynamic_two_r_break_even_label()} | "
+                f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | "
+                f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根 | "
+                "交易员模式：止损价只做触发参考，不会直接平仓。"
+            )
+        elif dynamic_stop_only:
             self._logger(
                 f"动态止盈已启用 | 2R保本={config.dynamic_two_r_break_even_label()} | "
                 f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | "
@@ -307,58 +340,16 @@ class StrategyEngine:
                 state = status.state.lower()
                 if state == "filled":
                     filled_price = status.avg_price or status.price or active_order.entry_reference
-                    filled_size = status.filled_size or active_order.size
                     entries_in_current_wave += 1
-                    self._logger(
-                        f"{_fmt_ts(newest_ts)} | 挂单已成交 | ordId={status.ord_id} | "
-                        f"开仓价={format_decimal(filled_price)} | 数量={format_decimal(filled_size)}"
-                    )
-                    fill_reason = (
-                        "EMA 动态委托已成交，初始止损已交给 OKX 托管，后续将动态上移"
-                        if dynamic_stop_only
-                        else "EMA 动态委托已成交，止盈止损已交给 OKX 托管"
-                    )
-                    self._notify_trade_fill(
+                    self._manage_filled_dynamic_entry(
+                        credentials,
                         config,
-                        title="开仓委托成交",
-                        symbol=config.inst_id,
-                        side=active_order.side,
-                        size=filled_size,
-                        price=filled_price,
-                        reason=fill_reason,
+                        trade_instrument=instrument,
+                        active_order=active_order,
+                        status=status,
+                        newest_ts=newest_ts,
+                        dynamic_stop_only=dynamic_stop_only,
                     )
-                    position = FilledPosition(
-                        ord_id=status.ord_id,
-                        cl_ord_id=active_order.cl_ord_id,
-                        inst_id=instrument.inst_id,
-                        side=active_order.side,
-                        close_side="sell" if active_order.side == "buy" else "buy",
-                        pos_side=resolve_open_pos_side(config, active_order.side),
-                        size=filled_size,
-                        entry_price=filled_price,
-                        entry_ts=int(time.time() * 1000),
-                    )
-                    if dynamic_stop_only:
-                        self._logger(
-                            f"初始 OKX 止损已提交 | algoClOrdId={active_order.stop_loss_algo_cl_ord_id or '-'} | "
-                            f"止损={format_decimal(active_order.stop_loss)} | 启动动态上移监控"
-                        )
-                        self._monitor_exchange_dynamic_stop(
-                            credentials,
-                            config,
-                            trade_instrument=instrument,
-                            position=position,
-                            initial_stop_loss=active_order.stop_loss,
-                            stop_loss_algo_cl_ord_id=active_order.stop_loss_algo_cl_ord_id,
-                        )
-                    else:
-                        self._logger("止盈止损已附加到 OKX 主单，开始监控持仓是否结束。")
-                        self._monitor_exchange_managed_position_until_closed(
-                            credentials,
-                            config,
-                            trade_instrument=instrument,
-                            position=position,
-                        )
                     active_order = None
                     idle_signal_candle_ts = None
                     if self._stop_event.is_set():
@@ -391,7 +382,39 @@ class StrategyEngine:
 
             candle_changed = newest_ts != last_candle_ts
             if active_order is not None and candle_changed:
-                self._cancel_active_order(credentials, config, active_order, newest_ts)
+                cancel_result = self._cancel_active_order(credentials, config, active_order, newest_ts)
+                if cancel_result.action == "pending":
+                    self._stop_event.wait(config.poll_seconds)
+                    continue
+                if cancel_result.action == "filled":
+                    status = cancel_result.status
+                    if status is None:
+                        raise RuntimeError(f"旧挂单成交回查缺少订单状态，ordId={active_order.ord_id}")
+                    entries_in_current_wave += 1
+                    self._logger(
+                        f"{_fmt_ts(newest_ts)} | 旧挂单在撤单前已成交，转入持仓监控 | ordId={status.ord_id or active_order.ord_id}"
+                    )
+                    self._manage_filled_dynamic_entry(
+                        credentials,
+                        config,
+                        trade_instrument=instrument,
+                        active_order=active_order,
+                        status=status,
+                        newest_ts=newest_ts,
+                        dynamic_stop_only=dynamic_stop_only,
+                    )
+                    active_order = None
+                    idle_signal_candle_ts = None
+                    if self._stop_event.is_set():
+                        return
+                    self._logger("本轮持仓已结束，继续监控下一次信号。")
+                    continue
+                if cancel_result.action == "partially_filled":
+                    status = cancel_result.status
+                    if status is None:
+                        raise RuntimeError(f"旧挂单部分成交回查缺少订单状态，ordId={active_order.ord_id}")
+                    self._log_partial_dynamic_fill_and_stop(active_order, status, newest_ts, config)
+                    return
                 active_order = None
 
             if active_order is None and idle_signal_candle_ts == newest_ts:
@@ -466,7 +489,11 @@ class StrategyEngine:
                 f"{'动态止盈=初始不挂止盈' if dynamic_stop_only else f'止盈={format_decimal(plan.take_profit)}'}"
             )
             cl_ord_id = self._next_client_order_id(role="entry")
-            stop_loss_algo_cl_ord_id = self._next_client_order_id(role="slg") if dynamic_stop_only else None
+            stop_loss_algo_cl_ord_id = (
+                self._next_client_order_id(role="slg")
+                if dynamic_stop_only and not trader_virtual_stop_loss_enabled
+                else None
+            )
             result = self._submit_order_with_recovery(
                 credentials,
                 config,
@@ -480,6 +507,7 @@ class StrategyEngine:
                     cl_ord_id=cl_ord_id,
                     include_take_profit=not dynamic_stop_only,
                     stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                    include_attached_protection=not trader_virtual_stop_loss_enabled,
                 ),
             )
             if not result.ord_id:
@@ -490,6 +518,7 @@ class StrategyEngine:
                 candle_ts=plan.candle_ts,
                 entry_reference=plan.entry_reference,
                 stop_loss=plan.stop_loss,
+                take_profit=plan.take_profit,
                 stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
                 size=plan.size,
                 side=plan.side,
@@ -1757,6 +1786,11 @@ class StrategyEngine:
                 size=filled.size,
                 price=filled.entry_price,
                 reason=f"本地{reason}触发后平仓成交",
+                trade_pnl=StrategyEngine._trade_fill_pnl_text_for_close(
+                    position,
+                    fill_size=filled.size,
+                    fill_price=filled.entry_price,
+                ),
             )
 
         if remaining > 0:
@@ -2238,6 +2272,34 @@ class StrategyEngine:
             if (item.algo_client_order_id or "").strip() != algo_cl_ord_id:
                 continue
             return item
+        return None
+
+    def _find_pending_entry_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        ord_id: str | None,
+        cl_ord_id: str | None,
+    ) -> OkxTradeOrderItem | None:
+        pending_orders = self._get_pending_orders_with_retry(
+            credentials,
+            config,
+            inst_types=(infer_inst_type(inst_id),),
+            limit=100,
+        )
+        normalized_ord_id = (ord_id or "").strip()
+        normalized_cl_ord_id = (cl_ord_id or "").strip()
+        for item in pending_orders:
+            if item.source_kind != "normal":
+                continue
+            if item.inst_id != inst_id:
+                continue
+            if normalized_ord_id and (item.order_id or "").strip() == normalized_ord_id:
+                return item
+            if normalized_cl_ord_id and (item.client_order_id or "").strip() == normalized_cl_ord_id:
+                return item
         return None
 
     def _find_managed_position(
@@ -2895,7 +2957,7 @@ class StrategyEngine:
         config: StrategyConfig,
         active_order: ManagedEntryOrder,
         newest_ts: int,
-    ) -> None:
+    ) -> CancelActiveOrderResult:
         try:
             result = self._client.cancel_order(
                 credentials,
@@ -2906,81 +2968,366 @@ class StrategyEngine:
             self._logger(
                 f"{_fmt_ts(newest_ts)} | 新 K 线已确认，撤掉旧挂单 | ordId={result.ord_id or active_order.ord_id}"
             )
+            return CancelActiveOrderResult("canceled")
         except OkxApiError as exc:
             detail = str(exc).strip() or f"code={exc.code or '-'}"
             latest_status: OkxOrderStatus | None = None
-            if _is_transient_okx_error(exc):
+            recover_message = "OKX 撤单请求响应异常，开始回查订单状态" if _is_transient_okx_error(exc) else "OKX 撤单失败，开始回查订单状态"
+            self._logger(
+                " | ".join(
+                    [
+                        recover_message,
+                        f"ordId={active_order.ord_id}",
+                        detail,
+                    ]
+                )
+            )
+            latest_status = self._try_get_order_status_for_write_recovery(
+                credentials,
+                config,
+                inst_id=config.inst_id,
+                label="撤单回查",
+                ord_id=active_order.ord_id,
+            )
+            if latest_status is not None and latest_status.state.lower() == "canceled":
+                self._logger(f"{_fmt_ts(newest_ts)} | 旧挂单已确认撤单，继续按最新 EMA 重挂。")
+                return CancelActiveOrderResult("canceled", latest_status)
+            if latest_status is not None and latest_status.state.lower() == "filled":
+                return CancelActiveOrderResult("filled", latest_status)
+            if latest_status is not None and latest_status.state.lower() == "partially_filled":
+                return CancelActiveOrderResult("partially_filled", latest_status)
+
+            if not self._stop_event.is_set() and (
+                latest_status is None or latest_status.state.lower() == "live"
+            ):
                 self._logger(
                     " | ".join(
                         [
-                            "OKX 撤单请求响应异常，开始回查订单状态",
+                            "OKX 撤单回查未确认完成，准备补发一次撤单",
                             f"ordId={active_order.ord_id}",
+                        ]
+                    )
+                )
+                try:
+                    result = self._client.cancel_order(
+                        credentials,
+                        config,
+                        inst_id=config.inst_id,
+                        ord_id=active_order.ord_id,
+                    )
+                    self._logger(
+                        f"{_fmt_ts(newest_ts)} | 新 K 线已确认，撤掉旧挂单 | ordId={result.ord_id or active_order.ord_id}"
+                    )
+                    return CancelActiveOrderResult("canceled")
+                except OkxApiError as retry_exc:
+                    detail = str(retry_exc).strip() or f"code={retry_exc.code or '-'}"
+                    latest_status = self._try_get_order_status_for_write_recovery(
+                        credentials,
+                        config,
+                        inst_id=config.inst_id,
+                        label="撤单回查",
+                        ord_id=active_order.ord_id,
+                    )
+                    if latest_status is not None and latest_status.state.lower() == "canceled":
+                        self._logger(f"{_fmt_ts(newest_ts)} | 旧挂单已确认撤单，继续按最新 EMA 重挂。")
+                        return CancelActiveOrderResult("canceled", latest_status)
+                    if latest_status is not None and latest_status.state.lower() == "filled":
+                        return CancelActiveOrderResult("filled", latest_status)
+                    if latest_status is not None and latest_status.state.lower() == "partially_filled":
+                        return CancelActiveOrderResult("partially_filled", latest_status)
+
+            if latest_status is not None:
+                state = latest_status.state.lower()
+                if state == "live":
+                    self._logger(
+                        " | ".join(
+                            [
+                                "撤单暂未完成，保留旧挂单继续回查",
+                                f"ordId={active_order.ord_id}",
+                                f"状态={latest_status.state}",
+                                detail,
+                            ]
+                        )
+                    )
+                    return CancelActiveOrderResult("pending", latest_status)
+                self._logger(
+                    f"{_fmt_ts(newest_ts)} | 旧挂单状态已变更为 {latest_status.state}，继续按最新 EMA 重挂。"
+                )
+                return CancelActiveOrderResult("canceled", latest_status)
+
+            try:
+                pending_order = self._find_pending_entry_order(
+                    credentials,
+                    config,
+                    inst_id=config.inst_id,
+                    ord_id=active_order.ord_id,
+                    cl_ord_id=active_order.cl_ord_id,
+                )
+            except Exception as pending_exc:
+                pending_detail = str(pending_exc).strip() or pending_exc.__class__.__name__
+                self._logger(
+                    " | ".join(
+                        [
+                            "撤单结果暂未确认，挂单列表回查失败，保留旧挂单继续回查",
+                            f"ordId={active_order.ord_id}",
+                            pending_detail,
+                        ]
+                    )
+                )
+                return CancelActiveOrderResult("pending")
+
+            if pending_order is not None:
+                pending_state = (pending_order.state or "live").strip() or "live"
+                self._logger(
+                    " | ".join(
+                        [
+                            "撤单结果暂未确认，旧挂单仍在待成交列表，保留继续回查",
+                            f"ordId={active_order.ord_id}",
+                            f"状态={pending_state}",
                             detail,
                         ]
                     )
                 )
-                latest_status = self._try_get_order_status_for_write_recovery(
-                    credentials,
-                    config,
-                    inst_id=config.inst_id,
-                    label="撤单回查",
-                    ord_id=active_order.ord_id,
+                return CancelActiveOrderResult("pending")
+
+            self._logger(
+                " | ".join(
+                    [
+                        "撤单结果暂未确认，挂单列表已找不到旧单，先等待下一轮状态同步",
+                        f"ordId={active_order.ord_id}",
+                        detail,
+                    ]
                 )
-                if latest_status is None or latest_status.state.lower() == "live":
-                    self._logger(
-                        " | ".join(
-                            [
-                                "OKX 撤单回查未确认完成，准备补发一次撤单",
-                                f"ordId={active_order.ord_id}",
-                            ]
-                        )
-                    )
-                    try:
-                        result = self._client.cancel_order(
-                            credentials,
-                            config,
-                            inst_id=config.inst_id,
-                            ord_id=active_order.ord_id,
-                        )
-                        self._logger(
-                            f"{_fmt_ts(newest_ts)} | 新 K 线已确认，撤掉旧挂单 | ordId={result.ord_id or active_order.ord_id}"
-                        )
-                        return
-                    except OkxApiError as retry_exc:
-                        latest_status = self._try_get_order_status_for_write_recovery(
-                            credentials,
-                            config,
-                            inst_id=config.inst_id,
-                            label="撤单回查",
-                            ord_id=active_order.ord_id,
-                        )
-                        if latest_status is None:
-                            retry_detail = str(retry_exc).strip() or f"code={retry_exc.code or '-'}"
-                            raise RuntimeError(
-                                f"撤单失败且回查未确认订单状态，ordId={active_order.ord_id} | {retry_detail}"
-                            ) from retry_exc
-                        if latest_status.state.lower() == "canceled":
-                            self._logger(f"{_fmt_ts(newest_ts)} | 旧挂单已确认撤单，继续按最新 EMA 重挂。")
-                            return
-                        detail = str(retry_exc).strip() or f"code={retry_exc.code or '-'}"
-            if latest_status is None:
-                latest_status = self._get_order_with_retry(
-                    credentials,
-                    config,
-                    inst_id=config.inst_id,
-                    ord_id=active_order.ord_id,
-                )
-            state = latest_status.state.lower()
-            if state == "filled":
-                raise RuntimeError(f"旧挂单在撤单前已成交，ordId={active_order.ord_id}") from exc
-            if state == "partially_filled":
-                raise RuntimeError(
-                    f"旧挂单在撤单前已部分成交，ordId={active_order.ord_id}，请手动检查剩余委托"
-                ) from exc
-            if state == "canceled":
-                self._logger(f"{_fmt_ts(newest_ts)} | 旧挂单已确认撤单，继续按最新 EMA 重挂。")
+            )
+            return CancelActiveOrderResult("pending")
+
+    def _manage_filled_dynamic_entry(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        active_order: ManagedEntryOrder,
+        status: OkxOrderStatus,
+        newest_ts: int,
+        dynamic_stop_only: bool,
+    ) -> None:
+        filled_price = status.avg_price or status.price or active_order.entry_reference
+        filled_size = status.filled_size or status.size or active_order.size
+        ord_id = status.ord_id or active_order.ord_id
+        if config.trader_virtual_stop_loss:
+            self._logger(
+                f"{_fmt_ts(newest_ts)} | 挂单已成交 | ordId={ord_id} | "
+                f"开仓价={format_decimal(filled_price)} | 数量={format_decimal(filled_size)}"
+            )
+            self._notify_trade_fill(
+                config,
+                title="开仓委托成交",
+                symbol=config.inst_id,
+                side=active_order.side,
+                size=filled_size,
+                price=filled_price,
+                reason="交易员模式已开仓：止损价仅作触发参考，不向 OKX 挂真实止损。",
+            )
+            position = FilledPosition(
+                ord_id=ord_id,
+                cl_ord_id=active_order.cl_ord_id,
+                inst_id=trade_instrument.inst_id,
+                side=active_order.side,
+                close_side="sell" if active_order.side == "buy" else "buy",
+                pos_side=resolve_open_pos_side(config, active_order.side),
+                size=filled_size,
+                entry_price=filled_price,
+                entry_ts=int(time.time() * 1000),
+            )
+            self._monitor_trader_virtual_position(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                position=position,
+                initial_stop_loss=active_order.stop_loss,
+                take_profit=active_order.take_profit,
+                dynamic_take_profit_enabled=dynamic_stop_only,
+            )
+            return
+        self._logger(
+            f"{_fmt_ts(newest_ts)} | 挂单已成交 | ordId={ord_id} | "
+            f"开仓价={format_decimal(filled_price)} | 数量={format_decimal(filled_size)}"
+        )
+        fill_reason = (
+            "EMA 动态委托已成交，初始止损已交给 OKX 托管，后续将动态上移"
+            if dynamic_stop_only
+            else "EMA 动态委托已成交，止盈止损已交给 OKX 托管"
+        )
+        self._notify_trade_fill(
+            config,
+            title="开仓委托成交",
+            symbol=config.inst_id,
+            side=active_order.side,
+            size=filled_size,
+            price=filled_price,
+            reason=fill_reason,
+        )
+        position = FilledPosition(
+            ord_id=ord_id,
+            cl_ord_id=active_order.cl_ord_id,
+            inst_id=trade_instrument.inst_id,
+            side=active_order.side,
+            close_side="sell" if active_order.side == "buy" else "buy",
+            pos_side=resolve_open_pos_side(config, active_order.side),
+            size=filled_size,
+            entry_price=filled_price,
+            entry_ts=int(time.time() * 1000),
+        )
+        if dynamic_stop_only:
+            self._logger(
+                f"初始 OKX 止损已提交 | algoClOrdId={active_order.stop_loss_algo_cl_ord_id or '-'} | "
+                f"止损={format_decimal(active_order.stop_loss)} | 启动动态上移监控"
+            )
+            self._monitor_exchange_dynamic_stop(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                position=position,
+                initial_stop_loss=active_order.stop_loss,
+                stop_loss_algo_cl_ord_id=active_order.stop_loss_algo_cl_ord_id,
+            )
+        else:
+            self._logger("止盈止损已附加到 OKX 主单，开始监控持仓是否结束。")
+            self._monitor_exchange_managed_position_until_closed(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                position=position,
+            )
+
+    def _monitor_trader_virtual_position(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        initial_stop_loss: Decimal,
+        take_profit: Decimal,
+        dynamic_take_profit_enabled: bool,
+    ) -> None:
+        direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
+        current_stop_loss = initial_stop_loss
+        current_take_profit = take_profit
+        next_trigger_r = 2
+        risk_per_unit = abs(position.entry_price - initial_stop_loss)
+        virtual_loss_logged = False
+        monitor_parts = [
+            f"交易员虚拟止损监控启动 | 标的={trade_instrument.inst_id}",
+            f"触发价格类型={config.tp_sl_trigger_type}",
+            f"策略止损={format_decimal(initial_stop_loss)}",
+        ]
+        if dynamic_take_profit_enabled:
+            monitor_parts.extend(
+                [
+                    "止盈方式=动态",
+                    f"2R保本={config.dynamic_two_r_break_even_label()}",
+                    f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
+                    f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根",
+                ]
+            )
+        else:
+            monitor_parts.append(f"固定止盈={format_decimal(take_profit)}")
+        self._logger(" | ".join(monitor_parts))
+
+        while not self._stop_event.is_set():
+            live_position = self._find_managed_position(credentials, config, trade_instrument, position)
+            if live_position is None:
+                self._logger("未检测到策略持仓，交易员虚拟止损监控结束。")
                 return
-            raise RuntimeError(f"撤单失败：{detail}") from exc
+
+            current_price = self._get_trigger_price_with_retry(trade_instrument.inst_id, config.tp_sl_trigger_type)
+            if dynamic_take_profit_enabled:
+                holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
+                updated_stop_loss, next_trigger_price, updated_trigger_r, moved = _advance_dynamic_stop_live(
+                    direction=direction,
+                    current_price=current_price,
+                    entry_price=position.entry_price,
+                    risk_per_unit=risk_per_unit,
+                    current_stop_loss=current_stop_loss,
+                    next_trigger_r=next_trigger_r,
+                    tick_size=trade_instrument.tick_size,
+                    two_r_break_even=config.dynamic_two_r_break_even,
+                    dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                    holding_bars=holding_bars,
+                    time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+                    time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+                )
+                if moved:
+                    current_stop_loss = updated_stop_loss
+                    current_take_profit = next_trigger_price
+                    next_trigger_r = updated_trigger_r
+                    self._logger(
+                        f"交易员动态止盈保护价已上移 | 当前价={format_decimal(current_price)} | "
+                        f"新保护价={format_decimal(current_stop_loss)} | 下一阶段={next_trigger_r}R | "
+                        f"holding_bars={holding_bars}"
+                    )
+            else:
+                _, take_hit = evaluate_local_exit(
+                    direction=direction,
+                    current_price=current_price,
+                    stop_loss=current_stop_loss,
+                    take_profit=current_take_profit,
+                )
+                if take_hit:
+                    self._logger(
+                        f"交易员固定止盈已触发 | 当前价={format_decimal(current_price)} | "
+                        f"止盈={format_decimal(current_take_profit)} | 开始平仓释放额度"
+                    )
+                    self._close_position(credentials, config, trade_instrument, position, "止盈")
+                    return
+
+            stop_hit = current_price <= current_stop_loss if direction == "long" else current_price >= current_stop_loss
+            if stop_hit:
+                if _is_profit_protecting_stop(
+                    direction=direction,
+                    entry_price=position.entry_price,
+                    stop_loss=current_stop_loss,
+                ):
+                    self._logger(
+                        f"交易员动态止盈保护价触发 | 当前价={format_decimal(current_price)} | "
+                        f"保护价={format_decimal(current_stop_loss)} | 开始平仓释放额度"
+                    )
+                    self._close_position(credentials, config, trade_instrument, position, "动态止盈")
+                    return
+                if not virtual_loss_logged:
+                    self._logger(
+                        f"交易员虚拟止损已触发（不平仓） | 当前价={format_decimal(current_price)} | "
+                        f"策略止损={format_decimal(current_stop_loss)} | 保留仓位等待后续止盈/人工处理"
+                    )
+                    virtual_loss_logged = True
+
+            self._stop_event.wait(config.poll_seconds)
+
+    def _log_partial_dynamic_fill_and_stop(
+        self,
+        active_order: ManagedEntryOrder,
+        status: OkxOrderStatus,
+        newest_ts: int,
+        config: StrategyConfig,
+    ) -> None:
+        filled_price = status.avg_price or status.price or active_order.entry_reference
+        filled_size = status.filled_size or status.size or active_order.size
+        ord_id = status.ord_id or active_order.ord_id
+        self._logger(
+            f"{_fmt_ts(newest_ts)} | 挂单部分成交 | ordId={ord_id} | "
+            "为避免重复撤单重挂，策略已停止，请手动检查剩余委托。"
+        )
+        self._notify_trade_fill(
+            config,
+            title="开仓委托部分成交",
+            symbol=config.inst_id,
+            side=active_order.side,
+            size=filled_size,
+            price=filled_price,
+            reason="EMA 动态委托出现部分成交，策略停止等待人工处理",
+        )
 
     def _log_strategy_start(
         self,
@@ -3061,6 +3408,11 @@ class StrategyEngine:
             trigger_symbol=trigger_symbol,
             entry_reference=format_decimal(entry_reference),
             reason=reason,
+            api_name=self._api_name,
+            session_id=self._session_id,
+            trader_id=self._trader_id,
+            direction_label=self._direction_label,
+            run_mode_label=self._run_mode_label,
         )
 
     def _notify_trade_fill(
@@ -3073,6 +3425,7 @@ class StrategyEngine:
         size: Decimal,
         price: Decimal,
         reason: str,
+        trade_pnl: str = "",
     ) -> None:
         if self._notifier is None:
             return
@@ -3085,8 +3438,24 @@ class StrategyEngine:
             size=format_decimal(size),
             price=format_decimal(price),
             reason=reason,
+            trade_pnl=trade_pnl,
             api_name=self._api_name,
+            session_id=self._session_id,
+            trader_id=self._trader_id,
+            direction_label=self._direction_label,
+            run_mode_label=self._run_mode_label,
         )
+
+    @staticmethod
+    def _trade_fill_pnl_text_for_close(position: FilledPosition, *, fill_size: Decimal, fill_price: Decimal) -> str:
+        matched_size = min(abs(fill_size), abs(position.size))
+        if matched_size <= 0:
+            return ""
+        if position.side == "buy":
+            pnl = (fill_price - position.entry_price) * matched_size
+        else:
+            pnl = (position.entry_price - fill_price) * matched_size
+        return format_decimal(pnl)
 
     def _notify_error(self, config: StrategyConfig | None, message: str) -> None:
         if self._notifier is None:
@@ -3096,6 +3465,10 @@ class StrategyEngine:
             config=config,
             message=message,
             api_name=self._api_name if config is not None and config.run_mode != "signal_only" else "",
+            session_id=self._session_id,
+            trader_id=self._trader_id,
+            direction_label=self._direction_label,
+            run_mode_label=self._run_mode_label,
         )
 
 
@@ -3360,6 +3733,17 @@ def _is_exchange_dynamic_stop_candidate_valid(
     if direction == "long":
         return current_price > candidate_stop_loss
     return current_price < candidate_stop_loss
+
+
+def _is_profit_protecting_stop(
+    *,
+    direction: Literal["long", "short"],
+    entry_price: Decimal,
+    stop_loss: Decimal,
+) -> bool:
+    if direction == "long":
+        return stop_loss >= entry_price
+    return stop_loss <= entry_price
 
 
 def _reset_startup_signal_gate(gate_state: StartupSignalGateState) -> None:
