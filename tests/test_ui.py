@@ -8,6 +8,7 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from okx_quant.models import StrategyConfig
+from okx_quant.okx_client import Instrument, OkxOrderResult, OkxPosition
 from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_SHORT_ID
 from okx_quant.trader_desk import TraderDraftRecord, TraderRunState, TraderSlotRecord
 from okx_quant.ui import (
@@ -1005,6 +1006,177 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(events[0][1], "warning")
         self.assertIn("已强制清理 2 个额度格", events[0][2])
         app._save_trader_desk_snapshot.assert_called_once()
+        app._save_trader_desk_snapshot.assert_called_once()
+
+    def test_flatten_trader_draft_submits_market_close_orders_and_marks_slots_closed_manual(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload={
+                "api_name": "moni",
+                "symbol": "ETH-USDT-SWAP",
+                "config_snapshot": {
+                    "inst_id": "ETH-USDT-SWAP",
+                    "trade_inst_id": "ETH-USDT-SWAP",
+                    "bar": "1m",
+                    "ema_period": 21,
+                    "atr_period": 10,
+                    "atr_stop_multiplier": "1",
+                    "atr_take_multiplier": "4",
+                    "order_size": "0.1",
+                    "trade_mode": "cross",
+                    "signal_mode": "short_only",
+                    "position_mode": "net",
+                    "environment": "demo",
+                    "tp_sl_trigger_type": "last",
+                },
+            },
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+            status="ready",
+        )
+        run = TraderRunState(trader_id="T001", status="running", armed_session_id="S30")
+        watching_slot = TraderSlotRecord(
+            slot_id="slot-watch",
+            trader_id="T001",
+            session_id="S33",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="ETH-USDT-SWAP",
+            status="watching",
+        )
+        open_slot_one = TraderSlotRecord(
+            slot_id="slot-open-1",
+            trader_id="T001",
+            session_id="S21",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="ETH-USDT-SWAP",
+            status="open",
+            quota_occupied=True,
+            size=Decimal("0.1"),
+            entry_price=Decimal("2300"),
+        )
+        open_slot_two = TraderSlotRecord(
+            slot_id="slot-open-2",
+            trader_id="T001",
+            session_id="S22",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="ETH-USDT-SWAP",
+            status="open",
+            quota_occupied=True,
+            size=Decimal("0.1"),
+            entry_price=Decimal("2301"),
+        )
+        slots = [watching_slot, open_slot_one, open_slot_two]
+        stop_requests: list[str] = []
+        events: list[tuple[str, str, str]] = []
+
+        class _StubClient:
+            def __init__(self) -> None:
+                self.orders: list[dict[str, object]] = []
+
+            @staticmethod
+            def get_instrument(inst_id: str) -> Instrument:
+                return Instrument(
+                    inst_id=inst_id,
+                    inst_type="SWAP",
+                    tick_size=Decimal("0.01"),
+                    lot_size=Decimal("0.1"),
+                    min_size=Decimal("0.1"),
+                    state="live",
+                )
+
+            @staticmethod
+            def get_positions(credentials, *, environment: str):  # noqa: ANN001
+                return [
+                    OkxPosition(
+                        inst_id="ETH-USDT-SWAP",
+                        inst_type="SWAP",
+                        pos_side="net",
+                        mgn_mode="cross",
+                        position=Decimal("-0.2"),
+                        avail_position=Decimal("-0.2"),
+                        avg_price=Decimal("2300"),
+                        mark_price=None,
+                        unrealized_pnl=None,
+                        unrealized_pnl_ratio=None,
+                        liquidation_price=None,
+                        leverage=None,
+                        margin_ccy="USDT",
+                        last_price=None,
+                        realized_pnl=None,
+                        margin_ratio=None,
+                        initial_margin=None,
+                        maintenance_margin=None,
+                        delta=None,
+                        gamma=None,
+                        vega=None,
+                        theta=None,
+                        raw={},
+                    )
+                ]
+
+            def place_simple_order(self, credentials, config, *, inst_id: str, side: str, size: Decimal, ord_type: str, pos_side=None, price=None, cl_ord_id=None):  # noqa: ANN001,E501
+                self.orders.append(
+                    {
+                        "inst_id": inst_id,
+                        "side": side,
+                        "size": size,
+                        "ord_type": ord_type,
+                        "pos_side": pos_side,
+                        "cl_ord_id": cl_ord_id,
+                    }
+                )
+                return OkxOrderResult(
+                    ord_id=f"ord-{len(self.orders)}",
+                    cl_ord_id=str(cl_ord_id or ""),
+                    s_code="0",
+                    s_msg="accepted",
+                    raw={},
+                )
+
+            @staticmethod
+            def get_order(credentials, config, *, inst_id: str, ord_id=None, cl_ord_id=None):  # noqa: ANN001
+                return SimpleNamespace(avg_price=Decimal("2299.5"), price=Decimal("2299.5"))
+
+        client = _StubClient()
+        app = SimpleNamespace(
+            client=client,
+            _trader_desk_draft_by_id=lambda trader_id: draft if trader_id == "T001" else None,
+            _trader_desk_run_by_id=lambda trader_id, create=False: run if trader_id == "T001" else None,
+            _trader_desk_slots_for_statuses=lambda trader_id, statuses: [slot for slot in slots if slot.status in statuses],
+            _request_stop_strategy_session=lambda session_id, **kwargs: stop_requests.append(session_id) or True,
+            _trader_desk_add_event=lambda trader_id, message, level="info": events.append((trader_id, level, message)),
+            _save_trader_desk_snapshot=MagicMock(),
+            _credentials_for_profile_or_none=lambda profile_name: SimpleNamespace(profile_name=profile_name),
+            _submit_trader_manual_flatten_orders=lambda draft_record, open_slot_records, now: QuantApp._submit_trader_manual_flatten_orders(app, draft_record, open_slot_records, now),
+            _lookup_trader_manual_flatten_exit_price=lambda credentials, config, inst_id, result: QuantApp._lookup_trader_manual_flatten_exit_price(app, credentials, config, inst_id=inst_id, result=result),
+            _build_trader_manual_flatten_cl_ord_id=QuantApp._build_trader_manual_flatten_cl_ord_id,
+            _trader_manual_flatten_open_side=QuantApp._trader_manual_flatten_open_side,
+            _trader_position_closeable_size=QuantApp._trader_position_closeable_size,
+            _trader_slot_flatten_size=QuantApp._trader_slot_flatten_size,
+        )
+
+        QuantApp.flatten_trader_draft(app, "T001")
+
+        self.assertEqual(draft.status, "paused")
+        self.assertEqual(run.status, "paused_manual")
+        self.assertEqual(run.armed_session_id, "")
+        self.assertEqual(stop_requests, ["S21", "S22", "S33"])
+        self.assertEqual(watching_slot.status, "stopped")
+        self.assertEqual(open_slot_one.status, "closed_manual")
+        self.assertEqual(open_slot_two.status, "closed_manual")
+        self.assertFalse(open_slot_one.quota_occupied)
+        self.assertFalse(open_slot_two.quota_occupied)
+        self.assertEqual(open_slot_one.close_reason, "人工手动平仓")
+        self.assertEqual(open_slot_two.close_reason, "人工手动平仓")
+        self.assertEqual(open_slot_one.exit_price, Decimal("2299.5"))
+        self.assertEqual(len(client.orders), 2)
+        self.assertEqual(client.orders[0]["side"], "buy")
+        self.assertEqual(client.orders[1]["side"], "buy")
+        self.assertTrue(any("手动平仓结果" in event[2] for event in events))
         app._save_trader_desk_snapshot.assert_called_once()
 
     def test_build_strategy_trade_reconciliation_result_attributes_stop_loss_and_net_pnl(self) -> None:

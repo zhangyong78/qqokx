@@ -72,7 +72,7 @@ from okx_quant.position_protection import (
     validate_live_protection_order_price_guard,
 )
 from okx_quant.protection_replay_ui import ProtectionReplayLaunchState, ProtectionReplayWindow
-from okx_quant.pricing import format_decimal, format_decimal_fixed
+from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.signal_monitor_ui import SignalMonitorWindow
 from okx_quant.trader_desk import (
     TraderDeskSnapshot,
@@ -8036,6 +8036,8 @@ class QuantApp:
                 api_name=target_api_name,
                 strategy_name=definition.name,
                 symbol=self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id),
+                bar=str(config.bar or "").strip(),
+                direction_label=record.direction_label or definition.default_signal_label,
                 status="watching",
                 quota_occupied=False,
                 created_at=now,
@@ -8174,11 +8176,10 @@ class QuantApp:
         draft.updated_at = now
         run.status = "paused_manual"
         run.paused_reason = "人工平仓。"
+        run.armed_session_id = ""
         run.updated_at = now
-        session_ids = [
-            slot.session_id
-            for slot in self._trader_desk_slots_for_statuses(trader_id, {"watching", "open"})
-        ]
+        active_slots = self._trader_desk_slots_for_statuses(trader_id, {"watching", "open"})
+        session_ids = sorted({slot.session_id for slot in active_slots if slot.session_id})
         for session_id in session_ids:
             self._request_stop_strategy_session(
                 session_id,
@@ -8186,8 +8187,187 @@ class QuantApp:
                 source_label=f"交易员 {trader_id} 手动平仓",
                 show_dialog=False,
             )
+        watching_slots = [slot for slot in active_slots if slot.status == "watching"]
+        for slot in watching_slots:
+            slot.status = "stopped"
+            slot.quota_occupied = False
+            slot.closed_at = slot.closed_at or now
+            slot.released_at = slot.released_at or now
+            slot.close_reason = slot.close_reason or "人工平仓停止 watcher"
+        open_slots = [slot for slot in active_slots if slot.status == "open"]
+        submitted_count, stale_count, failed_count = self._submit_trader_manual_flatten_orders(
+            draft,
+            open_slots,
+            now,
+        )
+        if submitted_count or stale_count or failed_count:
+            self._trader_desk_add_event(
+                trader_id,
+                "手动平仓结果 | "
+                f"已提交平仓单 {submitted_count} 个 | "
+                f"已清理无真实持仓槽位 {stale_count} 个 | "
+                f"提交失败 {failed_count} 个",
+                level="warning",
+            )
         self._trader_desk_add_event(trader_id, f"已请求手动平仓/停止 {len(session_ids)} 个额度格。", level="warning")
         self._save_trader_desk_snapshot()
+
+    @staticmethod
+    def _trader_manual_flatten_open_side(
+        config: StrategyConfig,
+    ) -> tuple[str, str, str | None]:
+        long_pos_side = "long" if config.position_mode == "long_short" else None
+        short_pos_side = "short" if config.position_mode == "long_short" else None
+        signal_mode = str(config.signal_mode or "").strip().lower()
+        if signal_mode == "long_only":
+            return ("sell", "long", long_pos_side)
+        if signal_mode == "short_only":
+            return ("buy", "short", short_pos_side)
+        raise ValueError("交易员手动平仓仅支持只做多或只做空策略。")
+
+    @staticmethod
+    def _trader_position_closeable_size(position: OkxPosition) -> Decimal:
+        base = position.avail_position
+        if base is None or base == 0:
+            base = position.position
+        return abs(base)
+
+    @staticmethod
+    def _trader_slot_flatten_size(slot: TraderSlotRecord, draft: TraderDraftRecord) -> Decimal:
+        if slot.size is not None and slot.size > 0:
+            return slot.size
+        return draft.unit_quota
+
+    @staticmethod
+    def _build_trader_manual_flatten_cl_ord_id(slot: TraderSlotRecord) -> str:
+        session_token = "".join(ch for ch in slot.session_id.lower() if ch.isascii() and ch.isalnum())[:4] or "sess"
+        strategy_token = "".join(ch for ch in slot.strategy_name.lower() if ch.isascii() and ch.isalnum())[:4] or "trdr"
+        suffix = datetime.now().strftime("%m%d%H%M%S%f")[-15:]
+        return f"{session_token}{strategy_token}exi{suffix}"[:32]
+
+    def _lookup_trader_manual_flatten_exit_price(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        result: OkxOrderResult,
+    ) -> Decimal | None:
+        order_id = (result.ord_id or "").strip()
+        client_order_id = (result.cl_ord_id or "").strip()
+        if not order_id and not client_order_id:
+            return None
+        for _ in range(3):
+            try:
+                status = self.client.get_order(
+                    credentials,
+                    config,
+                    inst_id=inst_id,
+                    ord_id=order_id or None,
+                    cl_ord_id=client_order_id or None,
+                )
+            except Exception:
+                threading.Event().wait(0.2)
+                continue
+            return status.avg_price or status.price
+        return None
+
+    def _submit_trader_manual_flatten_orders(
+        self,
+        draft: TraderDraftRecord,
+        open_slots: list[TraderSlotRecord],
+        now: datetime,
+    ) -> tuple[int, int, int]:
+        if not open_slots:
+            return (0, 0, 0)
+        config = _deserialize_strategy_config_snapshot(draft.template_payload.get("config_snapshot"))
+        if config is None:
+            raise ValueError("交易员草稿缺少可用的策略配置快照，无法执行手动平仓。")
+        credentials = self._credentials_for_profile_or_none(str(draft.template_payload.get("api_name") or ""))
+        if credentials is None:
+            raise ValueError("当前找不到该交易员对应的 API 凭证，无法执行手动平仓。")
+        trade_inst_id = (
+            config.trade_inst_id
+            or config.inst_id
+            or str(draft.template_payload.get("symbol") or "")
+        ).strip().upper()
+        if not trade_inst_id:
+            raise ValueError("交易员草稿缺少交易标的，无法执行手动平仓。")
+        close_side, expected_position_side, pos_side = self._trader_manual_flatten_open_side(config)
+        instrument = self.client.get_instrument(trade_inst_id)
+        positions = self.client.get_positions(credentials, environment=config.environment)
+        remaining_live_size = sum(
+            self._trader_position_closeable_size(position)
+            for position in positions
+            if position.inst_id.strip().upper() == trade_inst_id
+            and _format_pos_side(position.pos_side, position.position).strip().lower() == expected_position_side
+            and ((position.mgn_mode or "").strip().lower() or config.trade_mode) == config.trade_mode
+        )
+
+        submitted_count = 0
+        stale_count = 0
+        failed_count = 0
+        for slot in sorted(open_slots, key=lambda item: (item.created_at, item.slot_id)):
+            requested_size = self._trader_slot_flatten_size(slot, draft)
+            if remaining_live_size <= 0:
+                slot.status = "stopped"
+                slot.quota_occupied = False
+                slot.closed_at = slot.closed_at or now
+                slot.released_at = slot.released_at or now
+                slot.close_reason = "人工平仓时未检测到交易所持仓"
+                stale_count += 1
+                continue
+
+            close_size = snap_to_increment(min(requested_size, remaining_live_size), instrument.lot_size, "down")
+            if close_size < instrument.min_size:
+                slot.status = "stopped"
+                slot.quota_occupied = False
+                slot.closed_at = slot.closed_at or now
+                slot.released_at = slot.released_at or now
+                slot.close_reason = "人工平仓时剩余交易所持仓不足最小下单量"
+                stale_count += 1
+                continue
+
+            try:
+                result = self.client.place_simple_order(
+                    credentials,
+                    config,
+                    inst_id=trade_inst_id,
+                    side=close_side,
+                    size=close_size,
+                    ord_type="market",
+                    pos_side=pos_side,
+                    cl_ord_id=self._build_trader_manual_flatten_cl_ord_id(slot),
+                )
+            except Exception as exc:
+                failed_count += 1
+                slot.note = _format_network_error_message(str(exc))
+                self._trader_desk_add_event(
+                    draft.trader_id,
+                    f"手动平仓提交失败 | 会话={slot.session_id} | 合约={trade_inst_id} | 原因={slot.note}",
+                    level="warning",
+                )
+                continue
+
+            slot.status = "closed_manual"
+            slot.quota_occupied = False
+            slot.closed_at = slot.closed_at or now
+            slot.released_at = slot.released_at or now
+            slot.close_reason = "人工手动平仓"
+            slot.exit_price = self._lookup_trader_manual_flatten_exit_price(
+                credentials,
+                config,
+                inst_id=trade_inst_id,
+                result=result,
+            )
+            slot.note = (
+                f"人工平仓单已提交 | ordId={(result.ord_id or '-').strip() or '-'} | "
+                f"clOrdId={(result.cl_ord_id or '-').strip() or '-'}"
+            )
+            remaining_live_size = max(remaining_live_size - close_size, Decimal("0"))
+            submitted_count += 1
+
+        return (submitted_count, stale_count, failed_count)
 
     def force_clear_trader_draft(self, trader_id: str) -> None:
         draft = self._trader_desk_draft_by_id(trader_id)

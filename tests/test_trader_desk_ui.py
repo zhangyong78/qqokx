@@ -10,6 +10,8 @@ from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_ID, STRATEGY_DYNAMIC_LON
 from okx_quant.trader_desk import TraderDeskSnapshot, TraderDraftRecord, TraderSlotRecord
 from okx_quant.trader_desk_ui import (
     TraderDeskWindow,
+    _build_trader_book_ledger_rows,
+    _build_trader_book_summary_rows,
     _build_trader_strategy_lines,
     _draft_status_label,
     _draft_status_value,
@@ -24,6 +26,7 @@ from okx_quant.trader_desk_ui import (
     _run_status_label,
     _slot_status_label,
     _should_reload_draft_form,
+    _trader_book_summary_text,
     _trader_current_session_label,
     _validate_trader_desk_payload,
 )
@@ -222,6 +225,123 @@ class TraderDeskHelpersTest(TestCase):
 
         self.assertEqual(_trader_current_session_label(snapshot, "T001"), "S03 +2")
         self.assertEqual(_trader_current_session_label(snapshot, "T999"), "-")
+
+    def test_trader_book_summary_text_formats_global_totals(self) -> None:
+        from okx_quant.trader_desk import TraderBookSummary
+
+        text = _trader_book_summary_text(
+            TraderBookSummary(
+                trader_count=3,
+                profitable_trader_count=1,
+                losing_trader_count=1,
+                flat_trader_count=1,
+                realized_count=5,
+                win_count=3,
+                loss_count=1,
+                manual_count=1,
+                net_pnl=Decimal("1.23"),
+            )
+        )
+
+        self.assertIn("交易员 3 名", text)
+        self.assertIn("已平仓 5 单", text)
+        self.assertIn("盈利交易员 1", text)
+        self.assertIn("总净盈亏 1.23", text)
+
+    def test_build_trader_book_summary_rows_include_direction_and_rate(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload=self._payload(symbol="ETH-USDT-SWAP"),
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+        )
+        snapshot = TraderDeskSnapshot(
+            drafts=[draft],
+            slots=[
+                TraderSlotRecord(
+                    slot_id="slot-profit",
+                    trader_id="T001",
+                    session_id="S01",
+                    api_name="moni",
+                    strategy_name="EMA",
+                    symbol="ETH-USDT-SWAP",
+                    bar="1m",
+                    direction_label="只做多",
+                    status="closed_profit",
+                    closed_at=datetime(2026, 4, 26, 8, 0, 0),
+                    net_pnl=Decimal("0.25"),
+                ),
+                TraderSlotRecord(
+                    slot_id="slot-loss",
+                    trader_id="T001",
+                    session_id="S02",
+                    api_name="moni",
+                    strategy_name="EMA",
+                    symbol="ETH-USDT-SWAP",
+                    bar="1m",
+                    direction_label="只做多",
+                    status="closed_loss",
+                    closed_at=datetime(2026, 4, 26, 8, 5, 0),
+                    net_pnl=Decimal("-0.10"),
+                ),
+            ],
+        )
+
+        rows = _build_trader_book_summary_rows(snapshot)
+
+        self.assertEqual(len(rows), 1)
+        _, values = rows[0]
+        self.assertEqual(values[0], "T001")
+        self.assertEqual(values[3], "只做多")
+        self.assertEqual(values[5], 2)
+        self.assertEqual(values[9], "50%")
+        self.assertEqual(values[10], "0.15")
+
+    def test_build_trader_book_ledger_rows_include_slot_metadata(self) -> None:
+        snapshot = TraderDeskSnapshot(
+            drafts=[
+                TraderDraftRecord(
+                    trader_id="T006",
+                    template_payload=self._payload(symbol="ETH-USDT-SWAP"),
+                    total_quota=Decimal("1"),
+                    unit_quota=Decimal("0.1"),
+                    quota_steps=10,
+                )
+            ],
+            slots=[
+                TraderSlotRecord(
+                    slot_id="T006-slot-1",
+                    trader_id="T006",
+                    session_id="S25",
+                    api_name="moni",
+                    strategy_name="EMA",
+                    symbol="ETH-USDT-SWAP",
+                    bar="1m",
+                    direction_label="只做多",
+                    status="closed_loss",
+                    opened_at=datetime(2026, 4, 26, 3, 10, 34),
+                    closed_at=datetime(2026, 4, 26, 3, 29, 23),
+                    entry_price=Decimal("2310.59"),
+                    exit_price=Decimal("2308.49"),
+                    size=Decimal("0.1"),
+                    net_pnl=Decimal("-0.01"),
+                    close_reason="策略主动平仓",
+                )
+            ],
+        )
+
+        rows = _build_trader_book_ledger_rows(snapshot)
+
+        self.assertEqual(len(rows), 1)
+        row_id, trader_id, values = rows[0]
+        self.assertEqual(row_id, "T006-slot-1")
+        self.assertEqual(trader_id, "T006")
+        self.assertEqual(values[1], "T006")
+        self.assertEqual(values[4], "只做多")
+        self.assertEqual(values[5], "T006-slot-1")
+        self.assertEqual(values[8], "止盈净亏")
+        self.assertEqual(values[13], "-0.01")
 
     def test_delete_selected_draft_auto_pauses_watching_trader_and_marks_pending_delete(self) -> None:
         draft = TraderDraftRecord(

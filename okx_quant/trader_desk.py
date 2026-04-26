@@ -75,6 +75,8 @@ class TraderSlotRecord:
     api_name: str
     strategy_name: str
     symbol: str
+    bar: str = ""
+    direction_label: str = ""
     status: str = "watching"
     quota_occupied: bool = False
     created_at: datetime = field(default_factory=datetime.now)
@@ -105,6 +107,19 @@ class TraderDeskSnapshot:
     runs: list[TraderRunState] = field(default_factory=list)
     slots: list[TraderSlotRecord] = field(default_factory=list)
     events: list[TraderEventRecord] = field(default_factory=list)
+
+
+@dataclass
+class TraderBookSummary:
+    trader_count: int = 0
+    profitable_trader_count: int = 0
+    losing_trader_count: int = 0
+    flat_trader_count: int = 0
+    realized_count: int = 0
+    win_count: int = 0
+    loss_count: int = 0
+    manual_count: int = 0
+    net_pnl: Decimal = field(default_factory=lambda: Decimal("0"))
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -288,9 +303,85 @@ def trader_realized_net_pnl(slots: list[TraderSlotRecord], trader_id: str) -> De
 
 def trader_realized_close_counts(slots: list[TraderSlotRecord], trader_id: str) -> tuple[int, int, int]:
     closed = [item for item in trader_slots_for(slots, trader_id) if _trader_slot_counts_as_realized_close(item)]
-    wins = sum(1 for item in closed if (_trader_slot_effective_net_pnl(item) or Decimal("0")) > 0)
-    losses = sum(1 for item in closed if (_trader_slot_effective_net_pnl(item) or Decimal("0")) <= 0)
+    wins = 0
+    losses = 0
+    for item in closed:
+        if item.status == "closed_manual" and item.net_pnl is None:
+            continue
+        if (_trader_slot_effective_net_pnl(item) or Decimal("0")) > 0:
+            wins += 1
+        else:
+            losses += 1
     return len(closed), wins, losses
+
+
+def trader_realized_slots(slots: list[TraderSlotRecord], trader_id: str | None = None) -> list[TraderSlotRecord]:
+    normalized_trader_id = str(trader_id or "").strip()
+    realized = [
+        item
+        for item in slots
+        if _trader_slot_counts_as_realized_close(item)
+        and (not normalized_trader_id or item.trader_id == normalized_trader_id)
+    ]
+    realized.sort(
+        key=lambda item: (
+            item.closed_at or item.released_at or item.opened_at or item.created_at,
+            item.slot_id,
+        ),
+        reverse=True,
+    )
+    return realized
+
+
+def trader_book_summary(
+    drafts: list[TraderDraftRecord],
+    slots: list[TraderSlotRecord],
+) -> TraderBookSummary:
+    trader_ids = {draft.trader_id for draft in drafts}
+    realized = trader_realized_slots(slots)
+    trader_ids.update(slot.trader_id for slot in realized)
+    profitable_trader_count = 0
+    losing_trader_count = 0
+    flat_trader_count = 0
+    for trader_id in trader_ids:
+        net_pnl = trader_realized_net_pnl(slots, trader_id)
+        if net_pnl > 0:
+            profitable_trader_count += 1
+        elif net_pnl < 0:
+            losing_trader_count += 1
+        else:
+            flat_trader_count += 1
+
+    win_count = 0
+    loss_count = 0
+    manual_count = 0
+    for slot in realized:
+        if slot.status == "closed_manual":
+            manual_count += 1
+            if slot.net_pnl is None:
+                continue
+        effective_pnl = _trader_slot_effective_net_pnl(slot)
+        if effective_pnl is None:
+            continue
+        if effective_pnl > 0:
+            win_count += 1
+        else:
+            loss_count += 1
+
+    return TraderBookSummary(
+        trader_count=len(trader_ids),
+        profitable_trader_count=profitable_trader_count,
+        losing_trader_count=losing_trader_count,
+        flat_trader_count=flat_trader_count,
+        realized_count=len(realized),
+        win_count=win_count,
+        loss_count=loss_count,
+        manual_count=manual_count,
+        net_pnl=sum(
+            ((_trader_slot_effective_net_pnl(item) or Decimal("0")) for item in realized),
+            Decimal("0"),
+        ),
+    )
 
 
 def trader_has_watching_slot(slots: list[TraderSlotRecord], trader_id: str) -> bool:
@@ -484,6 +575,8 @@ def _slot_from_payload(payload: object) -> TraderSlotRecord | None:
         api_name=str(payload.get("api_name") or "").strip(),
         strategy_name=str(payload.get("strategy_name") or "").strip(),
         symbol=str(payload.get("symbol") or "").strip(),
+        bar=str(payload.get("bar") or "").strip(),
+        direction_label=str(payload.get("direction_label") or "").strip(),
         status=status,
         quota_occupied=bool(payload.get("quota_occupied", False)),
         created_at=_parse_time(payload.get("created_at")) or datetime.now(),
@@ -508,6 +601,8 @@ def _slot_to_payload(slot: TraderSlotRecord) -> dict[str, object]:
         "api_name": slot.api_name,
         "strategy_name": slot.strategy_name,
         "symbol": slot.symbol,
+        "bar": slot.bar,
+        "direction_label": slot.direction_label,
         "status": slot.status,
         "quota_occupied": slot.quota_occupied,
         "created_at": slot.created_at.isoformat(timespec="seconds"),

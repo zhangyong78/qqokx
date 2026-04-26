@@ -13,12 +13,16 @@ from okx_quant.strategy_catalog import get_strategy_definition, is_dynamic_strat
 from okx_quant.trader_desk import (
     TRADER_DRAFT_STATUS_VALUES,
     TRADER_GATE_CONDITION_VALUES,
+    TraderBookSummary,
     TraderDeskSnapshot,
     TraderDraftRecord,
+    TraderSlotRecord,
     normalize_trader_draft_inputs,
+    trader_book_summary,
     trader_open_position_summary,
     trader_realized_close_counts,
     trader_realized_net_pnl,
+    trader_realized_slots,
     trader_remaining_quota_steps,
     trader_slots_for,
     trader_used_quota_steps,
@@ -184,6 +188,19 @@ def _payload_bar(payload: dict[str, object]) -> str:
     return bar or "-"
 
 
+def _payload_direction(payload: dict[str, object]) -> str:
+    direction_label = str(payload.get("direction_label") or "").strip()
+    if direction_label:
+        return direction_label
+    config = _payload_config_snapshot(payload)
+    signal_mode = str(config.get("signal_mode") or "").strip().lower()
+    if signal_mode == "long_only":
+        return "只做多"
+    if signal_mode == "short_only":
+        return "只做空"
+    return "-"
+
+
 def _format_optional_decimal(value: Decimal | None) -> str:
     if value is None:
         return "-"
@@ -210,6 +227,117 @@ def _replace_text_preserving_scroll(widget: Text, content: str) -> None:
             widget.yview_moveto(yview[0])
         except Exception:
             pass
+
+
+def _format_win_rate(win_count: int, decisive_count: int) -> str:
+    if decisive_count <= 0:
+        return "-"
+    return f"{(win_count / decisive_count):.0%}"
+
+
+def _closed_slot_display_time(slot: TraderSlotRecord) -> datetime:
+    return slot.closed_at or slot.released_at or slot.opened_at or slot.created_at
+
+
+def _trader_book_summary_text(summary: TraderBookSummary) -> str:
+    return (
+        f"交易员 {summary.trader_count} 名"
+        f" | 已平仓 {summary.realized_count} 单"
+        f" | 盈利 {summary.win_count}"
+        f" | 亏损 {summary.loss_count}"
+        f" | 人工结束 {summary.manual_count}"
+        f" | 盈利交易员 {summary.profitable_trader_count}"
+        f" | 亏损交易员 {summary.losing_trader_count}"
+        f" | 总净盈亏 {_format_optional_pnl(summary.net_pnl)}"
+    )
+
+
+def _build_trader_book_summary_rows(snapshot: TraderDeskSnapshot) -> list[tuple[str, tuple[object, ...]]]:
+    draft_by_id = {draft.trader_id: draft for draft in snapshot.drafts}
+    ordered_trader_ids = [draft.trader_id for draft in snapshot.drafts]
+    for slot in trader_realized_slots(snapshot.slots):
+        if slot.trader_id not in draft_by_id and slot.trader_id not in ordered_trader_ids:
+            ordered_trader_ids.append(slot.trader_id)
+
+    rows: list[tuple[str, tuple[object, ...]]] = []
+    for trader_id in ordered_trader_ids:
+        draft = draft_by_id.get(trader_id)
+        realized_slots = trader_realized_slots(snapshot.slots, trader_id)
+        close_count, win_count, loss_count = trader_realized_close_counts(snapshot.slots, trader_id)
+        manual_count = sum(1 for slot in realized_slots if slot.status == "closed_manual")
+        net_pnl = trader_realized_net_pnl(snapshot.slots, trader_id)
+        fallback_slot = realized_slots[0] if realized_slots else None
+        strategy_name = (
+            _strategy_label_from_payload(draft.template_payload)
+            if draft is not None
+            else fallback_slot.strategy_name if fallback_slot is not None else "-"
+        )
+        bar = (
+            _payload_bar(draft.template_payload)
+            if draft is not None
+            else str(getattr(fallback_slot, "bar", "") or "").strip() or "-"
+        )
+        direction = (
+            _payload_direction(draft.template_payload)
+            if draft is not None
+            else str(getattr(fallback_slot, "direction_label", "") or "").strip() or "-"
+        )
+        symbol = (
+            _payload_trade_symbol(draft.template_payload)
+            if draft is not None
+            else str(getattr(fallback_slot, "symbol", "") or "").strip() or "-"
+        )
+        rows.append(
+            (
+                trader_id,
+                (
+                    trader_id,
+                    strategy_name,
+                    bar,
+                    direction,
+                    symbol,
+                    close_count,
+                    win_count,
+                    loss_count,
+                    manual_count,
+                    _format_win_rate(win_count, win_count + loss_count),
+                    _format_optional_pnl(net_pnl),
+                ),
+            )
+        )
+    return rows
+
+
+def _build_trader_book_ledger_rows(snapshot: TraderDeskSnapshot) -> list[tuple[str, str, tuple[object, ...]]]:
+    draft_by_id = {draft.trader_id: draft for draft in snapshot.drafts}
+    rows: list[tuple[str, str, tuple[object, ...]]] = []
+    for slot in trader_realized_slots(snapshot.slots):
+        draft = draft_by_id.get(slot.trader_id)
+        payload = draft.template_payload if draft is not None else {}
+        rows.append(
+            (
+                slot.slot_id,
+                slot.trader_id,
+                (
+                    _closed_slot_display_time(slot).strftime("%m-%d %H:%M:%S"),
+                    slot.trader_id,
+                    _strategy_label_from_payload(payload) if payload else (slot.strategy_name or "-"),
+                    str(slot.bar or (_payload_bar(payload) if payload else "-")).strip() or "-",
+                    str(slot.direction_label or (_payload_direction(payload) if payload else "-")).strip() or "-",
+                    slot.slot_id,
+                    slot.session_id or "-",
+                    slot.symbol or (_payload_trade_symbol(payload) if payload else "-"),
+                    _slot_status_label(slot.status, close_reason=slot.close_reason, net_pnl=slot.net_pnl),
+                    slot.opened_at.strftime("%m-%d %H:%M:%S") if slot.opened_at else "-",
+                    _format_optional_decimal(slot.entry_price),
+                    _format_optional_decimal(slot.exit_price),
+                    _format_optional_decimal(slot.size),
+                    _format_optional_pnl(slot.net_pnl),
+                    slot.close_reason or "-",
+                ),
+            )
+        )
+    return rows
 
 
 def _gate_field_ui_state(condition: str) -> tuple[str, str, str, str]:
@@ -496,6 +624,8 @@ class TraderDeskWindow:
         self._suspend_form_tracking = False
         self._loaded_trader_id = ""
         self._pending_delete_trader_id = ""
+        self._book_window: Toplevel | None = None
+        self._book_summary_text: StringVar | None = None
 
         self._status_text = StringVar(value="草稿 0 条 | 运行中 0 条")
         self._summary_text = StringVar(value="交易员策略会固定数量下单，虚拟止损只记触发不直接平仓，并按额度格持续补 watcher。")
@@ -535,6 +665,8 @@ class TraderDeskWindow:
         self.slot_tree: ttk.Treeview | None = None
         self.event_text: Text | None = None
         self.detail_text: Text | None = None
+        self._book_trader_tree: ttk.Treeview | None = None
+        self._book_ledger_tree: ttk.Treeview | None = None
         self._gate_trigger_combo: ttk.Combobox | None = None
         self._gate_lower_entry: ttk.Entry | None = None
         self._gate_upper_entry: ttk.Entry | None = None
@@ -562,11 +694,178 @@ class TraderDeskWindow:
             except Exception:
                 pass
             self._refresh_job = None
+        if self._book_window is not None and self._book_window.winfo_exists():
+            self._book_window.destroy()
         if self.window.winfo_exists():
             self.window.destroy()
 
     def _on_close(self) -> None:
+        if self._book_window is not None and self._book_window.winfo_exists():
+            self._book_window.withdraw()
         self.window.withdraw()
+
+    def open_book_window(self) -> None:
+        if self._book_window is not None and self._book_window.winfo_exists():
+            self._book_window.deiconify()
+            self._book_window.lift()
+            self._book_window.focus_force()
+            self._refresh_book_window()
+            return
+
+        self._book_window = Toplevel(self.window)
+        self._book_window.title("交易员账本")
+        apply_window_icon(self._book_window)
+        apply_adaptive_window_geometry(
+            self._book_window,
+            width_ratio=0.82,
+            height_ratio=0.82,
+            min_width=1480,
+            min_height=860,
+            max_width=1920,
+            max_height=1260,
+        )
+        self._book_window.protocol("WM_DELETE_WINDOW", self._on_close_book_window)
+        self._book_window.columnconfigure(0, weight=1)
+        self._book_window.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(self._book_window, padding=(16, 14, 16, 8))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="交易员账本", font=("Microsoft YaHei UI", 16, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text="这里按平仓流水汇总所有交易员的盈亏账目，便于对账、复盘和横向比较。",
+            foreground="#556070",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self._book_summary_text = StringVar(value="")
+        ttk.Label(header, textvariable=self._book_summary_text, justify="left").grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+        body = ttk.Frame(self._book_window, padding=(16, 0, 16, 16))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        body.rowconfigure(1, weight=3)
+
+        trader_frame = ttk.LabelFrame(body, text="交易员汇总", padding=12)
+        trader_frame.grid(row=0, column=0, sticky="nsew")
+        trader_frame.columnconfigure(0, weight=1)
+        trader_frame.rowconfigure(0, weight=1)
+        self._book_trader_tree = ttk.Treeview(
+            trader_frame,
+            columns=("trader", "strategy", "bar", "direction", "symbol", "closed", "wins", "losses", "manual", "rate", "pnl"),
+            show="headings",
+            selectmode="browse",
+            height=8,
+        )
+        self._book_trader_tree.grid(row=0, column=0, sticky="nsew")
+        self._book_trader_tree.bind("<<TreeviewSelect>>", self._on_book_trader_select)
+        for column, text, width, anchor in (
+            ("trader", "交易员", 90, "center"),
+            ("strategy", "策略", 160, "w"),
+            ("bar", "周期", 70, "center"),
+            ("direction", "方向", 90, "center"),
+            ("symbol", "标的", 160, "w"),
+            ("closed", "平仓单", 72, "center"),
+            ("wins", "盈利", 66, "center"),
+            ("losses", "亏损", 66, "center"),
+            ("manual", "人工", 66, "center"),
+            ("rate", "胜率", 76, "center"),
+            ("pnl", "净盈亏", 96, "e"),
+        ):
+            self._book_trader_tree.heading(column, text=text)
+            self._book_trader_tree.column(column, width=width, anchor=anchor)
+        trader_v_scroll = ttk.Scrollbar(trader_frame, orient="vertical", command=self._book_trader_tree.yview)
+        trader_v_scroll.grid(row=0, column=1, sticky="ns")
+        trader_x_scroll = ttk.Scrollbar(trader_frame, orient="horizontal", command=self._book_trader_tree.xview)
+        trader_x_scroll.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._book_trader_tree.configure(yscrollcommand=trader_v_scroll.set, xscrollcommand=trader_x_scroll.set)
+
+        ledger_frame = ttk.LabelFrame(body, text="总账流水", padding=12)
+        ledger_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        ledger_frame.columnconfigure(0, weight=1)
+        ledger_frame.rowconfigure(0, weight=1)
+        self._book_ledger_tree = ttk.Treeview(
+            ledger_frame,
+            columns=(
+                "closed",
+                "trader",
+                "strategy",
+                "bar",
+                "direction",
+                "slot",
+                "session",
+                "symbol",
+                "status",
+                "opened",
+                "entry",
+                "exit",
+                "size",
+                "pnl",
+                "reason",
+            ),
+            show="headings",
+            selectmode="browse",
+            height=16,
+        )
+        self._book_ledger_tree.grid(row=0, column=0, sticky="nsew")
+        self._book_ledger_tree.bind("<<TreeviewSelect>>", self._on_book_ledger_select)
+        for column, text, width, anchor in (
+            ("closed", "平仓时间", 120, "center"),
+            ("trader", "交易员", 90, "center"),
+            ("strategy", "策略", 150, "w"),
+            ("bar", "周期", 70, "center"),
+            ("direction", "方向", 90, "center"),
+            ("slot", "额度格", 150, "w"),
+            ("session", "会话", 76, "center"),
+            ("symbol", "标的", 170, "w"),
+            ("status", "结果", 90, "center"),
+            ("opened", "开仓时间", 120, "center"),
+            ("entry", "开仓价", 90, "center"),
+            ("exit", "平仓价", 90, "center"),
+            ("size", "数量", 80, "center"),
+            ("pnl", "净盈亏", 90, "e"),
+            ("reason", "原因", 220, "w"),
+        ):
+            self._book_ledger_tree.heading(column, text=text)
+            self._book_ledger_tree.column(column, width=width, anchor=anchor)
+        ledger_v_scroll = ttk.Scrollbar(ledger_frame, orient="vertical", command=self._book_ledger_tree.yview)
+        ledger_v_scroll.grid(row=0, column=1, sticky="ns")
+        ledger_x_scroll = ttk.Scrollbar(ledger_frame, orient="horizontal", command=self._book_ledger_tree.xview)
+        ledger_x_scroll.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._book_ledger_tree.configure(yscrollcommand=ledger_v_scroll.set, xscrollcommand=ledger_x_scroll.set)
+
+        self._refresh_book_window()
+
+    def _on_close_book_window(self) -> None:
+        if self._book_window is not None and self._book_window.winfo_exists():
+            self._book_window.withdraw()
+
+    def _focus_trader_row(self, trader_id: str) -> None:
+        normalized = str(trader_id or "").strip()
+        if not normalized or self.tree is None or not self.tree.exists(normalized):
+            return
+        self.tree.selection_set(normalized)
+        self.tree.focus(normalized)
+        self.tree.see(normalized)
+        self._on_select()
+
+    def _on_book_trader_select(self, *_: object) -> None:
+        if self._book_trader_tree is None:
+            return
+        selection = self._book_trader_tree.selection()
+        if selection:
+            self._focus_trader_row(str(selection[0]))
+
+    def _on_book_ledger_select(self, *_: object) -> None:
+        if self._book_ledger_tree is None:
+            return
+        selection = self._book_ledger_tree.selection()
+        if not selection:
+            return
+        tags = self._book_ledger_tree.item(selection[0], "tags")
+        trader_id = str(tags[0]) if tags else ""
+        if trader_id:
+            self._focus_trader_row(trader_id)
 
     def _bind_form_dirty_tracking(self) -> None:
         for variable in (
@@ -643,6 +942,7 @@ class TraderDeskWindow:
         ttk.Button(toolbar, text="手动平仓", command=self.flatten_selected_trader).grid(row=0, column=5, padx=(8, 0))
         ttk.Button(toolbar, text="强制清格", command=self.force_cleanup_selected_trader).grid(row=0, column=6, padx=(8, 0))
         ttk.Button(toolbar, text="辞退交易员", command=self.delete_selected_draft).grid(row=0, column=7, padx=(8, 0))
+        ttk.Button(toolbar, text="交易员账本", command=self.open_book_window).grid(row=0, column=8, padx=(8, 0))
 
         self.tree = ttk.Treeview(
             left,
@@ -1338,6 +1638,43 @@ class TraderDeskWindow:
                 )
         _replace_text_preserving_scroll(self.detail_text, "\n".join(lines))
 
+    def _refresh_book_window(self) -> None:
+        if self._book_window is None or not self._book_window.winfo_exists():
+            return
+        if self._book_summary_text is not None:
+            summary = trader_book_summary(self._snapshot.drafts, self._snapshot.slots)
+            self._book_summary_text.set(_trader_book_summary_text(summary))
+        self._refresh_book_trader_tree()
+        self._refresh_book_ledger_tree()
+
+    def _refresh_book_trader_tree(self) -> None:
+        if self._book_trader_tree is None:
+            return
+        selected = self._book_trader_tree.selection()
+        selected_id = str(selected[0]) if selected else (self._selected_trader_id() or "")
+        for item_id in self._book_trader_tree.get_children():
+            self._book_trader_tree.delete(item_id)
+        for trader_id, values in _build_trader_book_summary_rows(self._snapshot):
+            self._book_trader_tree.insert("", END, iid=trader_id, values=values)
+        if selected_id and self._book_trader_tree.exists(selected_id):
+            self._book_trader_tree.selection_set(selected_id)
+            self._book_trader_tree.focus(selected_id)
+            self._book_trader_tree.see(selected_id)
+
+    def _refresh_book_ledger_tree(self) -> None:
+        if self._book_ledger_tree is None:
+            return
+        selected = self._book_ledger_tree.selection()
+        selected_id = str(selected[0]) if selected else ""
+        for item_id in self._book_ledger_tree.get_children():
+            self._book_ledger_tree.delete(item_id)
+        for row_id, trader_id, values in _build_trader_book_ledger_rows(self._snapshot):
+            self._book_ledger_tree.insert("", END, iid=row_id, values=values, tags=(trader_id,))
+        if selected_id and self._book_ledger_tree.exists(selected_id):
+            self._book_ledger_tree.selection_set(selected_id)
+            self._book_ledger_tree.focus(selected_id)
+            self._book_ledger_tree.see(selected_id)
+
     def _refresh_views(self, *, select_id: str | None = None) -> None:
         selected_id = select_id or self._selected_trader_id()
         reload_form = _should_reload_draft_form(
@@ -1359,6 +1696,7 @@ class TraderDeskWindow:
         self._refresh_slot_tree()
         self._refresh_event_text()
         self._refresh_detail_text()
+        self._refresh_book_window()
 
     def _try_complete_pending_delete(self) -> None:
         trader_id = self._pending_delete_trader_id.strip()

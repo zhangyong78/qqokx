@@ -9,16 +9,19 @@ from unittest import TestCase
 
 from okx_quant.trader_desk import (
     TraderDeskSnapshot,
+    TraderBookSummary,
     TraderDraftRecord,
     TraderPriceGate,
     TraderSlotRecord,
     load_trader_desk_snapshot,
     normalize_trader_draft_inputs,
     save_trader_desk_snapshot,
+    trader_book_summary,
     trader_gate_allows_price,
     trader_open_position_summary,
     trader_realized_close_counts,
     trader_realized_net_pnl,
+    trader_realized_slots,
     trader_remaining_quota_steps,
     trader_used_quota_steps,
 )
@@ -138,6 +141,25 @@ class TraderDeskModelTest(TestCase):
         self.assertEqual(trader_realized_net_pnl(slots, "T001"), Decimal("0"))
         self.assertEqual(trader_realized_close_counts(slots, "T001"), (1, 0, 1))
 
+    def test_realized_summary_does_not_count_closed_manual_without_net_pnl_as_loss(self) -> None:
+        slots = [
+            TraderSlotRecord(
+                slot_id="slot-1",
+                trader_id="T001",
+                session_id="S001",
+                api_name="api1",
+                strategy_name="demo",
+                symbol="BTC-USDT-SWAP",
+                status="closed_manual",
+                quota_occupied=False,
+                closed_at=datetime(2026, 4, 24, 8, 10, 0),
+                net_pnl=None,
+            )
+        ]
+
+        self.assertEqual(trader_realized_net_pnl(slots, "T001"), Decimal("0"))
+        self.assertEqual(trader_realized_close_counts(slots, "T001"), (1, 0, 0))
+
     def test_snapshot_loader_supports_legacy_list_payload(self) -> None:
         with TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "trader_desk.json"
@@ -166,6 +188,109 @@ class TraderDeskModelTest(TestCase):
 
     def test_realized_net_pnl_returns_decimal_zero_when_empty(self) -> None:
         self.assertEqual(trader_realized_net_pnl([], "T001"), Decimal("0"))
+
+    def test_realized_slots_sort_descending_by_close_time(self) -> None:
+        slots = [
+            TraderSlotRecord(
+                slot_id="slot-early",
+                trader_id="T001",
+                session_id="S001",
+                api_name="api1",
+                strategy_name="demo",
+                symbol="BTC-USDT-SWAP",
+                status="closed_profit",
+                closed_at=datetime(2026, 4, 24, 8, 10, 0),
+                net_pnl=Decimal("1"),
+            ),
+            TraderSlotRecord(
+                slot_id="slot-late",
+                trader_id="T002",
+                session_id="S002",
+                api_name="api1",
+                strategy_name="demo",
+                symbol="ETH-USDT-SWAP",
+                status="closed_loss",
+                closed_at=datetime(2026, 4, 24, 8, 20, 0),
+                net_pnl=Decimal("-1"),
+            ),
+        ]
+
+        realized = trader_realized_slots(slots)
+
+        self.assertEqual([slot.slot_id for slot in realized], ["slot-late", "slot-early"])
+
+    def test_trader_book_summary_aggregates_all_trader_ledgers(self) -> None:
+        drafts = [
+            TraderDraftRecord(
+                trader_id="T001",
+                template_payload={"strategy_id": "ema_dynamic_long"},
+                total_quota=Decimal("1"),
+                unit_quota=Decimal("0.1"),
+                quota_steps=10,
+            ),
+            TraderDraftRecord(
+                trader_id="T002",
+                template_payload={"strategy_id": "ema_dynamic_short"},
+                total_quota=Decimal("1"),
+                unit_quota=Decimal("0.1"),
+                quota_steps=10,
+            ),
+            TraderDraftRecord(
+                trader_id="T003",
+                template_payload={"strategy_id": "ema_dynamic_long"},
+                total_quota=Decimal("1"),
+                unit_quota=Decimal("0.1"),
+                quota_steps=10,
+            ),
+        ]
+        slots = [
+            TraderSlotRecord(
+                slot_id="slot-profit",
+                trader_id="T001",
+                session_id="S001",
+                api_name="api1",
+                strategy_name="EMA",
+                symbol="BTC-USDT-SWAP",
+                status="closed_profit",
+                closed_at=datetime(2026, 4, 24, 8, 10, 0),
+                net_pnl=Decimal("0.50"),
+            ),
+            TraderSlotRecord(
+                slot_id="slot-loss",
+                trader_id="T002",
+                session_id="S002",
+                api_name="api1",
+                strategy_name="EMA",
+                symbol="ETH-USDT-SWAP",
+                status="closed_loss",
+                closed_at=datetime(2026, 4, 24, 8, 20, 0),
+                net_pnl=Decimal("-0.20"),
+            ),
+            TraderSlotRecord(
+                slot_id="slot-manual",
+                trader_id="T002",
+                session_id="S003",
+                api_name="api1",
+                strategy_name="EMA",
+                symbol="ETH-USDT-SWAP",
+                status="closed_manual",
+                closed_at=datetime(2026, 4, 24, 8, 25, 0),
+                net_pnl=None,
+            ),
+        ]
+
+        summary = trader_book_summary(drafts, slots)
+
+        self.assertIsInstance(summary, TraderBookSummary)
+        self.assertEqual(summary.trader_count, 3)
+        self.assertEqual(summary.profitable_trader_count, 1)
+        self.assertEqual(summary.losing_trader_count, 1)
+        self.assertEqual(summary.flat_trader_count, 1)
+        self.assertEqual(summary.realized_count, 3)
+        self.assertEqual(summary.win_count, 1)
+        self.assertEqual(summary.loss_count, 1)
+        self.assertEqual(summary.manual_count, 1)
+        self.assertEqual(summary.net_pnl, Decimal("0.30"))
 
     def test_snapshot_round_trip_persists_slots_and_events(self) -> None:
         with TemporaryDirectory() as temp_dir:
