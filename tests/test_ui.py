@@ -29,7 +29,9 @@ from okx_quant.ui import (
     _build_current_position_note_record,
     _build_group_row_values,
     _build_history_position_note_record,
+    _build_order_size_mode_hint_text,
     _build_strategy_template_payload,
+    _build_fixed_order_size_hint_text,
     _coerce_log_file_path,
     _filter_position_history_items,
     _filter_positions,
@@ -99,6 +101,45 @@ HTTP 502: <!DOCTYPE html>
         self.assertEqual(
             _coerce_log_file_path(r"D:\qqokx\logs\strategy_sessions\2026-04-17\session.log"),
             Path(r"D:\qqokx\logs\strategy_sessions\2026-04-17\session.log"),
+        )
+
+    def test_build_fixed_order_size_hint_text_for_swap_includes_contract_examples(self) -> None:
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+            ct_val=Decimal("0.1"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="ETH",
+        )
+
+        hint = _build_fixed_order_size_hint_text("ETH-USDT-SWAP", instrument)
+
+        self.assertIn("不是USDT", hint)
+        self.assertIn("风险金", hint)
+        self.assertIn("1=0.1 ETH", hint)
+        self.assertIn("10=1 ETH", hint)
+        self.assertIn("最小步长=0.01", hint)
+
+    def test_build_fixed_order_size_hint_text_without_instrument_falls_back_to_symbol_only(self) -> None:
+        hint = _build_fixed_order_size_hint_text("SOL-USDT-SWAP", None)
+
+        self.assertIn("SOL-USDT-SWAP", hint)
+        self.assertIn("不是USDT", hint)
+
+    def test_build_order_size_mode_hint_text_prefers_risk_amount_when_present(self) -> None:
+        self.assertEqual(
+            _build_order_size_mode_hint_text("10", "1"),
+            "当前模式：风险金优先，固定数量仅作备用。",
+        )
+
+    def test_build_order_size_mode_hint_text_switches_to_fixed_quantity_when_risk_blank(self) -> None:
+        self.assertEqual(
+            _build_order_size_mode_hint_text("", "1"),
+            "当前模式：若风险金留空，将按固定数量下单。",
         )
 
     def test_build_normal_strategy_book_summary_filters_out_trader_history(self) -> None:

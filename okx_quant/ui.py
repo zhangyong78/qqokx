@@ -18,7 +18,13 @@ from okx_quant.backtest_ui import BacktestCompareOverviewWindow, BacktestLaunchS
 from okx_quant.deribit_client import DeribitRestClient
 from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
-from okx_quant.engine import StrategyEngine, fetch_hourly_ema_debug, format_hourly_debug
+from okx_quant.engine import (
+    StrategyEngine,
+    fetch_hourly_ema_debug,
+    fixed_entry_side_mode_support_reason,
+    format_hourly_debug,
+    supports_fixed_entry_side_mode,
+)
 from okx_quant.log_utils import append_log_line, append_preformatted_log_line, strategy_session_log_file_path
 from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
@@ -1845,6 +1851,9 @@ class QuantApp:
         self.take_atr = StringVar(value="4")
         self.risk_amount = StringVar(value="10")
         self.order_size = StringVar(value="1")
+        self.fixed_order_size_hint_text = StringVar(
+            value="固定数量=OKX下单数量(sz)，不是USDT；若填写风险金，则优先按风险金计算。"
+        )
         self.poll_seconds = StringVar(value="10")
         self.signal_mode_label = StringVar(value=STRATEGY_DEFINITIONS[0].default_signal_label)
         self.take_profit_mode_label = StringVar(value="动态止盈")
@@ -1860,8 +1869,14 @@ class QuantApp:
         self.trigger_type_label = StringVar(value="标记价格 mark")
         self.tp_sl_mode_label = StringVar(value="OKX 托管（仅同标的永续）")
         self.entry_side_mode_label = StringVar(value="跟随信号")
+        self.entry_side_mode_hint_text = StringVar(value="")
         self.symbol.trace_add("write", self._sync_trade_symbol_to_symbol)
+        self.trade_symbol.trace_add("write", self._update_fixed_order_size_hint)
+        self.risk_amount.trace_add("write", self._update_fixed_order_size_hint)
+        self.order_size.trace_add("write", self._update_fixed_order_size_hint)
         self.time_stop_break_even_enabled.trace_add("write", lambda *_: self._sync_dynamic_take_profit_controls())
+        self.run_mode_label.trace_add("write", lambda *_: self._sync_entry_side_mode_controls())
+        self.tp_sl_mode_label.trace_add("write", lambda *_: self._sync_entry_side_mode_controls())
 
         self.notify_enabled = BooleanVar(value=False)
         self.smtp_host = StringVar()
@@ -2244,13 +2259,22 @@ class QuantApp:
         ttk.Entry(start_frame, textvariable=self.order_size).grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
         row += 1
+        ttk.Label(
+            start_frame,
+            textvariable=self.fixed_order_size_hint_text,
+            justify="left",
+            wraplength=760,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        row += 1
         ttk.Label(start_frame, text="下单方向模式").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Combobox(
+        self._entry_side_mode_combo = ttk.Combobox(
             start_frame,
             textvariable=self.entry_side_mode_label,
             values=list(ENTRY_SIDE_MODE_OPTIONS.keys()),
             state="readonly",
-        ).grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
+        )
+        self._entry_side_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
         ttk.Label(start_frame, text="止盈止损模式").grid(row=row, column=2, sticky="w", pady=(12, 0))
         ttk.Combobox(
             start_frame,
@@ -2258,6 +2282,14 @@ class QuantApp:
             values=LAUNCHER_TP_SL_MODE_LABELS,
             state="readonly",
         ).grid(row=row, column=3, sticky="ew", pady=(12, 0))
+
+        row += 1
+        ttk.Label(
+            start_frame,
+            textvariable=self.entry_side_mode_hint_text,
+            justify="left",
+            wraplength=760,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         row += 1
         ttk.Label(start_frame, text="自定义触发标的").grid(row=row, column=0, sticky="w", pady=(12, 0))
@@ -7769,11 +7801,34 @@ class QuantApp:
         if self.local_tp_sl_symbol.get() not in custom_trigger_values:
             self.local_tp_sl_symbol.set("")
         self._enqueue_log(f"已加载 {len(symbols)} 个可交易永续合约。")
+        self._update_fixed_order_size_hint()
 
     def _sync_trade_symbol_to_symbol(self, *_: str) -> None:
         symbol = self.symbol.get().strip().upper()
         if self.trade_symbol.get() != symbol:
             self.trade_symbol.set(symbol)
+
+    def _update_fixed_order_size_hint(self, *_: str) -> None:
+        symbol = _normalize_symbol_input(self.trade_symbol.get()) or _normalize_symbol_input(self.symbol.get())
+        instrument = self._find_instrument_for_fixed_order_size_hint(symbol)
+        base_hint = _build_fixed_order_size_hint_text(symbol, instrument)
+        mode_hint = _build_order_size_mode_hint_text(self.risk_amount.get(), self.order_size.get())
+        self.fixed_order_size_hint_text.set(f"{base_hint} {mode_hint}".strip())
+
+    def _find_instrument_for_fixed_order_size_hint(self, inst_id: str) -> Instrument | None:
+        normalized = _normalize_symbol_input(inst_id)
+        if not normalized:
+            return None
+        for instrument in self.instruments:
+            if instrument.inst_id.strip().upper() == normalized:
+                return instrument
+        instrument = self._position_instruments.get(normalized)
+        if instrument is not None:
+            return instrument
+        try:
+            return self.client.get_instrument(normalized)
+        except Exception:
+            return None
 
     @staticmethod
     def _format_strategy_symbol_display(signal_symbol: str, trade_symbol: str | None) -> str:
@@ -7880,6 +7935,7 @@ class QuantApp:
         )
         self.environment_label.set(_reverse_lookup_label(ENV_OPTIONS, record.config.environment, "模拟盘 demo"))
         self._sync_dynamic_take_profit_controls()
+        QuantApp._sync_entry_side_mode_controls(self)
         return definition, resolved_api_name, api_note
 
     def export_selected_session_template(self) -> None:
@@ -10651,9 +10707,11 @@ class QuantApp:
         if is_dynamic_strategy_id(definition.strategy_id) and not self.startup_chase_window_seconds.get().strip():
             self.startup_chase_window_seconds.set("0")
         self._sync_dynamic_take_profit_controls()
+        QuantApp._sync_entry_side_mode_controls(self)
         self.strategy_summary_text.set(definition.summary)
         self.strategy_rule_text.set(definition.rule_description)
         self.strategy_hint_text.set(definition.parameter_hint)
+        self._update_fixed_order_size_hint()
 
     def _sync_dynamic_take_profit_controls(self) -> None:
         if not hasattr(self, "_dynamic_two_r_break_even_check"):
@@ -10669,6 +10727,25 @@ class QuantApp:
         self._time_stop_break_even_bars_label.configure(state="normal" if dynamic_take_profit else "disabled")
         self._time_stop_break_even_bars_entry.configure(
             state="normal" if dynamic_take_profit and self.time_stop_break_even_enabled.get() else "disabled"
+        )
+
+    def _sync_entry_side_mode_controls(self) -> None:
+        if not hasattr(self, "_entry_side_mode_combo"):
+            return
+        definition = self._selected_strategy_definition()
+        run_mode = RUN_MODE_OPTIONS.get(self.run_mode_label.get(), "trade")
+        tp_sl_mode = TP_SL_MODE_OPTIONS.get(self.tp_sl_mode_label.get(), "exchange")
+        if supports_fixed_entry_side_mode(definition.strategy_id, run_mode, tp_sl_mode):
+            self._entry_side_mode_combo.configure(values=list(ENTRY_SIDE_MODE_OPTIONS.keys()), state="readonly")
+            self.entry_side_mode_hint_text.set("当前模式支持跟随信号、固定买入、固定卖出。")
+            if self.entry_side_mode_label.get() not in ENTRY_SIDE_MODE_OPTIONS:
+                self.entry_side_mode_label.set("跟随信号")
+            return
+        self._entry_side_mode_combo.configure(values=("跟随信号",), state="disabled")
+        if self.entry_side_mode_label.get() != "跟随信号":
+            self.entry_side_mode_label.set("跟随信号")
+        self.entry_side_mode_hint_text.set(
+            fixed_entry_side_mode_support_reason(definition.strategy_id, run_mode, tp_sl_mode) or "当前模式仅支持跟随信号。"
         )
 
     def _selected_strategy_definition(self) -> StrategyDefinition:
@@ -10731,6 +10808,9 @@ class QuantApp:
         local_tp_sl_symbol = _normalize_symbol_input(self.local_tp_sl_symbol.get()) or None
         tp_sl_mode = TP_SL_MODE_OPTIONS[self.tp_sl_mode_label.get()]
         run_mode = RUN_MODE_OPTIONS[self.run_mode_label.get()]
+        entry_side_mode = ENTRY_SIDE_MODE_OPTIONS[self.entry_side_mode_label.get()]
+        if not supports_fixed_entry_side_mode(definition.strategy_id, run_mode, tp_sl_mode):
+            entry_side_mode = "follow_signal"
         effective_signal_mode = resolve_dynamic_signal_mode(
             definition.strategy_id,
             SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()],
@@ -10799,7 +10879,7 @@ class QuantApp:
             trade_inst_id=trade_symbol,
             tp_sl_mode=tp_sl_mode,
             local_tp_sl_inst_id=local_tp_sl_symbol,
-            entry_side_mode="follow_signal" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else ENTRY_SIDE_MODE_OPTIONS[self.entry_side_mode_label.get()],
+            entry_side_mode=entry_side_mode,
             run_mode=run_mode,
             take_profit_mode=TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()],
             max_entries_per_trend=max_entries_per_trend,
@@ -13531,6 +13611,52 @@ def _format_optional_usdt_precise(
     if with_sign and value > 0:
         return f"+{text}"
     return text
+
+
+def _build_fixed_order_size_hint_text(inst_id: str, instrument: Instrument | None) -> str:
+    prefix = "固定数量=OKX下单数量(sz)，不是USDT；若填写风险金，则优先按风险金计算。"
+    normalized_inst_id = inst_id.strip().upper()
+    if not normalized_inst_id:
+        return prefix
+    if instrument is None:
+        return f"{prefix} 当前标的：{normalized_inst_id}。"
+    if instrument.inst_type == "SPOT":
+        return f"{prefix} 当前 {normalized_inst_id} 按币数量填写；最小步长={format_decimal(instrument.lot_size)}。"
+
+    contract_value = (instrument.ct_val or Decimal("0")) * (instrument.ct_mult or Decimal("1"))
+    contract_ccy = (instrument.ct_val_ccy or "").strip().upper()
+    if not contract_ccy and "-" in normalized_inst_id:
+        contract_ccy = normalized_inst_id.split("-", 1)[0]
+    if contract_value > 0 and contract_ccy:
+        step_value = contract_value * instrument.lot_size
+        return (
+            f"{prefix} 当前 {normalized_inst_id}：1={format_decimal(contract_value)} {contract_ccy}，"
+            f"10={format_decimal(contract_value * Decimal('10'))} {contract_ccy}，"
+            f"最小步长={format_decimal(instrument.lot_size)}（约{format_decimal(step_value)} {contract_ccy}）。"
+        )
+    return f"{prefix} 当前 {normalized_inst_id}：最小步长={format_decimal(instrument.lot_size)}。"
+
+
+def _build_order_size_mode_hint_text(risk_amount_raw: str, order_size_raw: str) -> str:
+    def _parse_positive(raw: str) -> Decimal | None:
+        cleaned = raw.strip()
+        if not cleaned:
+            return None
+        try:
+            value = Decimal(cleaned)
+        except InvalidOperation:
+            return None
+        if value <= 0:
+            return None
+        return value
+
+    risk_amount = _parse_positive(risk_amount_raw)
+    order_size = _parse_positive(order_size_raw)
+    if risk_amount is not None:
+        return "当前模式：风险金优先，固定数量仅作备用。"
+    if order_size is not None:
+        return "当前模式：若风险金留空，将按固定数量下单。"
+    return "当前模式：请填写风险金或固定数量其一。"
 
 
 def _format_ratio(value: Decimal | None, *, places: int = 2) -> str:

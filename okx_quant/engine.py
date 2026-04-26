@@ -212,6 +212,7 @@ class StrategyEngine:
             if trade_instrument.inst_type == "SPOT":
                 raise RuntimeError("当前版本只支持永续或期权下单，现货暂时仅支持作为触发价格来源")
 
+            validate_entry_side_mode_support(config)
             if is_dynamic_strategy_id(config.strategy_id):
                 if can_use_exchange_managed_orders(config, signal_instrument, trade_instrument):
                     self._run_dynamic_exchange_strategy(credentials, config, trade_instrument)
@@ -3482,6 +3483,42 @@ def can_use_exchange_managed_orders(
         and signal_instrument.inst_id == trade_instrument.inst_id
         and trade_instrument.inst_type == "SWAP"
     )
+
+
+def supports_fixed_entry_side_mode(strategy_id: str, run_mode: str, tp_sl_mode: str) -> bool:
+    normalized_run_mode = str(run_mode or "").strip().lower()
+    normalized_tp_sl_mode = str(tp_sl_mode or "").strip().lower()
+    return (
+        normalized_run_mode == "trade"
+        and strategy_id != STRATEGY_EMA5_EMA8_ID
+        and normalized_tp_sl_mode == "local_trade"
+    )
+
+
+def fixed_entry_side_mode_support_reason(strategy_id: str, run_mode: str, tp_sl_mode: str) -> str | None:
+    if supports_fixed_entry_side_mode(strategy_id, run_mode, tp_sl_mode):
+        return None
+    normalized_run_mode = str(run_mode or "").strip().lower()
+    normalized_tp_sl_mode = str(tp_sl_mode or "").strip().lower()
+    if normalized_run_mode != "trade":
+        return "只发信号邮件模式不下单，下单方向模式已固定为跟随信号。"
+    if strategy_id == STRATEGY_EMA5_EMA8_ID:
+        return "EMA5/EMA8 策略当前只支持跟随信号。"
+    if normalized_tp_sl_mode == "exchange":
+        return "OKX 托管模式当前只支持跟随信号；如需固定买入/固定卖出，请切到按交易标的价格（本地）。"
+    if normalized_tp_sl_mode == "local_signal":
+        return "按信号标的价格（本地）当前只支持跟随信号；如需固定买入/固定卖出，请切到按交易标的价格（本地）。"
+    if normalized_tp_sl_mode == "local_custom":
+        return "按自定义标的价格（本地）当前只支持跟随信号；如需固定买入/固定卖出，请切到按交易标的价格（本地）。"
+    return "当前模式仅支持跟随信号。"
+
+
+def validate_entry_side_mode_support(config: StrategyConfig) -> None:
+    if config.entry_side_mode == "follow_signal":
+        return
+    reason = fixed_entry_side_mode_support_reason(config.strategy_id, config.run_mode, config.tp_sl_mode)
+    if reason:
+        raise RuntimeError(reason)
 
 
 def resolve_trade_inst_id(config: StrategyConfig) -> str:

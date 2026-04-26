@@ -15,6 +15,9 @@ from okx_quant.engine import (
     _should_skip_startup_signal,
     build_order_plan,
     can_use_exchange_managed_orders,
+    fixed_entry_side_mode_support_reason,
+    supports_fixed_entry_side_mode,
+    validate_entry_side_mode_support,
 )
 from okx_quant.models import Candle, Instrument, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxTradeOrderItem
@@ -24,6 +27,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
+    STRATEGY_EMA5_EMA8_ID,
 )
 
 
@@ -227,6 +231,66 @@ class StrategyEngineTest(TestCase):
         )
 
         self.assertFalse(can_use_exchange_managed_orders(config, signal_instrument, trade_instrument))
+
+    def test_fixed_entry_side_mode_only_supported_in_local_trade_mode(self) -> None:
+        self.assertTrue(supports_fixed_entry_side_mode(STRATEGY_DYNAMIC_ID, "trade", "local_trade"))
+        self.assertFalse(supports_fixed_entry_side_mode(STRATEGY_DYNAMIC_ID, "trade", "exchange"))
+        self.assertFalse(supports_fixed_entry_side_mode(STRATEGY_DYNAMIC_ID, "signal_only", "local_trade"))
+        self.assertFalse(supports_fixed_entry_side_mode(STRATEGY_EMA5_EMA8_ID, "trade", "local_trade"))
+
+    def test_fixed_entry_side_mode_support_reason_describes_okx_managed_lock(self) -> None:
+        reason = fixed_entry_side_mode_support_reason(STRATEGY_DYNAMIC_ID, "trade", "exchange")
+        self.assertIsNotNone(reason)
+        self.assertIn("OKX 托管模式当前只支持跟随信号", str(reason))
+
+    def test_validate_entry_side_mode_support_rejects_fixed_sell_in_okx_managed_mode(self) -> None:
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_ID,
+            tp_sl_mode="exchange",
+            entry_side_mode="fixed_sell",
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            validate_entry_side_mode_support(config)
+
+        self.assertIn("只支持跟随信号", str(ctx.exception))
+
+    def test_validate_entry_side_mode_support_allows_fixed_sell_in_local_trade_mode(self) -> None:
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_ID,
+            tp_sl_mode="local_trade",
+            entry_side_mode="fixed_sell",
+        )
+
+        validate_entry_side_mode_support(config)
 
     def test_dynamic_live_stop_locks_1r_at_2r(self) -> None:
         stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(
