@@ -34,6 +34,7 @@ from okx_quant.window_layout import apply_adaptive_window_geometry
 
 
 NotifierFactory = Callable[[], EmailNotifier | None]
+ApiNameProvider = Callable[[], str]
 Logger = Callable[[str], None]
 
 DEFAULT_VOL_SIGNAL_CHART_CANDLE_LIMIT = 1000
@@ -162,10 +163,12 @@ class DeribitVolatilityMonitorWindow:
         parent,
         client: DeribitRestClient,
         notifier_factory: NotifierFactory,
+        api_name_provider: ApiNameProvider,
         logger: Logger,
     ) -> None:
         self.client = client
         self._notifier_factory = notifier_factory
+        self._api_name_provider = api_name_provider
         self._logger = logger
         self._defaults = VolatilityMonitorDefaults()
         self._tasks: dict[str, _VolatilityMonitorTask] = {}
@@ -544,7 +547,7 @@ class DeribitVolatilityMonitorWindow:
             return
         self._open_signal_chart(request)
 
-    def start(self) -> None:
+    def start(self, *, api_name: str | None = None) -> None:
         try:
             config = self._build_config()
             notifier = self._notifier_factory()
@@ -572,7 +575,7 @@ class DeribitVolatilityMonitorWindow:
             diagnostic_callback=lambda diagnostic, sid=session_id: self._queue_ui(
                 lambda: self._append_diagnostic(sid, diagnostic)
             ),
-            email_sender=self._build_email_sender(notifier, session_id),
+            email_sender=self._build_email_sender(notifier, session_id, api_name or self._api_name_provider()),
             monitor_name=f"波动率任务 {session_id}",
         )
         task = _VolatilityMonitorTask(
@@ -622,6 +625,7 @@ class DeribitVolatilityMonitorWindow:
         self,
         notifier: EmailNotifier | None,
         session_id: str,
+        api_name: str = '',
     ) -> Callable[[VolatilitySignalEvent, str], None] | None:
         if notifier is None or not notifier.signal_notifications_enabled:
             return None

@@ -97,6 +97,7 @@ class FilledPosition:
     size: Decimal
     entry_price: Decimal
     entry_ts: int
+    price_delta_multiplier: Decimal = Decimal("1")
 
 
 @dataclass(frozen=True)
@@ -3465,7 +3466,7 @@ class StrategyEngine:
             strategy_name=self._strategy_name,
             config=config,
             message=message,
-            api_name=self._api_name if config is not None and config.run_mode != "signal_only" else "",
+            api_name=self._api_name,
             session_id=self._session_id,
             trader_id=self._trader_id,
             direction_label=self._direction_label,

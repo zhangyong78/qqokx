@@ -1961,6 +1961,9 @@ class QuantApp:
 
         self.status_text = StringVar(value="运行中策略：0")
         self.session_summary_text = StringVar(value="多策略合计：当前没有运行中的策略。")
+        self.session_quick_actions_text = StringVar(
+            value="快捷操作：会话=双击日志 | 交易员=双击打开管理台 | 邮件=双击切换 | 标的=双击K线"
+        )
         self.global_email_toggle_text = StringVar(value="发邮件：开")
         self.settings_summary_text = StringVar()
         self.strategy_summary_text = StringVar()
@@ -2027,6 +2030,15 @@ class QuantApp:
         self._strategy_book_bar_combo: ttk.Combobox | None = None
         self._strategy_book_direction_combo: ttk.Combobox | None = None
         self._strategy_book_status_combo: ttk.Combobox | None = None
+        self._session_tree_hover_tip_window: Toplevel | None = None
+        self._session_tree_hover_tip_label: ttk.Label | None = None
+        self._session_tree_hover_tip_column = ""
+        self._history_tree_hover_tip_window: Toplevel | None = None
+        self._history_tree_hover_tip_label: ttk.Label | None = None
+        self._history_tree_hover_tip_column = ""
+        self._strategy_book_tree_hover_tip_window: Toplevel | None = None
+        self._strategy_book_tree_hover_tip_label: ttk.Label | None = None
+        self._strategy_book_tree_hover_tip_column = ""
         self._positions_snapshot_by_profile: dict[str, ProfilePositionSnapshot] = {}
         self._session_live_pnl_cache: dict[str, tuple[Decimal | None, datetime | None]] = {}
 
@@ -2546,6 +2558,12 @@ class QuantApp:
             column=0,
             sticky="w",
         )
+        ttk.Label(
+            running_header,
+            textvariable=self.session_quick_actions_text,
+            justify="left",
+            foreground="#556070",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Label(running_header, text="筛选").grid(row=0, column=1, sticky="e", padx=(12, 6))
         running_session_filter_combo = ttk.Combobox(
             running_header,
@@ -2578,13 +2596,13 @@ class QuantApp:
             show="headings",
             selectmode="browse",
         )
-        self.session_tree.heading("session", text="会话")
-        self.session_tree.heading("trader", text="交易员")
+        self.session_tree.heading("session", text="会话(双击日志)")
+        self.session_tree.heading("trader", text="交易员(双击打开)")
         self.session_tree.heading("email", text="邮件(双击切换)")
         self.session_tree.heading("api", text="API")
         self.session_tree.heading("source_type", text="来源类型")
         self.session_tree.heading("strategy", text="策略")
-        self.session_tree.heading("symbol", text="标的")
+        self.session_tree.heading("symbol", text="标的(双击K线)")
         self.session_tree.heading("bar", text="周期")
         self.session_tree.heading("direction", text="方向")
         self.session_tree.heading("mode", text="模式")
@@ -2609,6 +2627,8 @@ class QuantApp:
         self.session_tree.grid(row=1, column=0, sticky="nsew")
         self.session_tree.bind("<<TreeviewSelect>>", self._on_session_selected)
         self.session_tree.bind("<Double-1>", self._on_session_tree_double_click)
+        self.session_tree.bind("<Motion>", self._on_session_tree_hover)
+        self.session_tree.bind("<Leave>", self._on_session_tree_hover_leave)
         self.session_tree.tag_configure("duplicate_conflict", background="#fff4e5", foreground="#a85a00")
 
         tree_scroll = ttk.Scrollbar(running_frame, orient="vertical", command=self.session_tree.yview)
@@ -7410,6 +7430,8 @@ class QuantApp:
             session_provider=self._signal_observer_session_rows,
             session_stopper=self._stop_sessions_by_id,
             session_deleter=self._delete_signal_observer_sessions_by_id,
+            session_log_opener=self.open_strategy_session_log,
+            session_chart_opener=self.open_strategy_live_chart_window,
         )
 
     def open_trader_desk_window(self) -> None:
@@ -7436,6 +7458,21 @@ class QuantApp:
             runtime_snapshot_provider=self._trader_runtime_snapshot_for_ui,
         )
 
+    def open_trader_desk_window_for_trader(self, trader_id: str) -> None:
+        normalized = str(trader_id or "").strip()
+        if not normalized:
+            self.open_trader_desk_window()
+            return
+        self.open_trader_desk_window()
+        window = self._trader_desk_window
+        if window is None:
+            return
+        try:
+            window._refresh_views(select_id=normalized)
+            window._focus_trader_row(normalized)
+        except Exception:
+            pass
+
     def open_deribit_volatility_monitor_window(self) -> None:
         if (
             self._deribit_volatility_monitor_window is not None
@@ -7448,6 +7485,7 @@ class QuantApp:
             self.root,
             self.deribit_client,
             notifier_factory=self._build_signal_monitor_notifier,
+            api_name_provider=self._current_credential_profile,
             logger=self._enqueue_log,
         )
 
@@ -8320,6 +8358,25 @@ class QuantApp:
             messagebox.showinfo("\u63d0\u793a", "\u8bf7\u5148\u5728\u8fd0\u884c\u4e2d\u7b56\u7565\u5217\u8868\u4e2d\u9009\u4e2d\u4e00\u6761\u7b56\u7565\u3002")
             return
         self.open_strategy_live_chart_window(session.session_id)
+
+    def open_strategy_session_log(self, session_id: str) -> None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            messagebox.showwarning("\u63d0\u793a", "\u5f53\u524d\u4f1a\u8bdd\u5df2\u4e0d\u5b58\u5728\uff0c\u8bf7\u91cd\u65b0\u9009\u62e9\u3002", parent=self.root)
+            return
+        log_path = _coerce_log_file_path(session.log_file_path)
+        if log_path is None:
+            messagebox.showinfo("\u63d0\u793a", f"\u4f1a\u8bdd {session.session_id} \u8fd8\u6ca1\u6709\u72ec\u7acb\u65e5\u5fd7\u8def\u5f84\u3002", parent=self.root)
+            return
+        if not log_path.exists():
+            messagebox.showerror("\u6253\u5f00\u5931\u8d25", f"\u65e5\u5fd7\u6587\u4ef6\u4e0d\u5b58\u5728\uff1a\\n{log_path}", parent=self.root)
+            return
+        startfile = getattr(os, "startfile", None)
+        if not callable(startfile):
+            messagebox.showerror("\u6253\u5f00\u5931\u8d25", "\u5f53\u524d\u7cfb\u7edf\u4e0d\u652f\u6301\u76f4\u63a5\u6253\u5f00\u65e5\u5fd7\u6587\u4ef6\u3002", parent=self.root)
+            return
+        startfile(str(log_path))
+        self._enqueue_log(f"[\u4f1a\u8bdd {session.session_id}] \u5df2\u6253\u5f00\u72ec\u7acb\u65e5\u5fd7\uff1a{log_path}")
 
     def open_strategy_live_chart_window(self, session_id: str) -> None:
         session = self.sessions.get(session_id)
@@ -11393,7 +11450,32 @@ class QuantApp:
                 f"发送时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             ]
         )
-        notifier.notify_async(subject, body)
+        notifier.send_signal(
+            strategy_name="????",
+            config=StrategyConfig(
+                inst_id=self.symbol.get().strip().upper() or "-",
+                bar=self.bar.get().strip() or "-",
+                ema_period=0,
+                atr_period=0,
+                atr_stop_multiplier=Decimal("0"),
+                atr_take_multiplier=Decimal("0"),
+                order_size=Decimal("0"),
+                trade_mode=RUN_MODE_OPTIONS[self.run_mode_label.get()],
+                signal_mode=SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()],
+                position_mode=POSITION_MODE_OPTIONS[self.position_mode_label.get()],
+                environment=ENV_OPTIONS[self.environment_label.get()],
+                tp_sl_trigger_type=TP_SL_TRIGGER_TYPE_OPTIONS[self.trigger_type_label.get()],
+            ),
+            signal="long",
+            trigger_symbol=self.symbol.get().strip().upper() or "-",
+            entry_reference="-",
+            reason="????",
+            api_name=self._current_credential_profile(),
+            session_id="TEST",
+            trader_id="",
+            direction_label=self.direction_label.get() if hasattr(self, "direction_label") else "",
+            run_mode_label=self.run_mode_label.get(),
+        )
         self._enqueue_log("已提交测试邮件发送请求。")
         messagebox.showinfo("提示", "测试邮件已提交，请检查收件箱。", parent=self._settings_window or self.root)
 
@@ -12162,6 +12244,69 @@ class QuantApp:
     def _on_session_selected(self, *_: object) -> None:
         self._refresh_selected_session_details()
 
+    @staticmethod
+    def _session_tree_double_click_hint(column_id: str) -> str:
+        return {
+            "#1": "双击打开这条会话的独立日志",
+            "#2": "双击打开并定位对应交易员",
+            "#3": "双击切换当前会话发邮件开关",
+            "#7": "双击打开这条策略的实时K线图",
+        }.get(str(column_id or "").strip(), "")
+
+    def _show_session_tree_hover_tip(self, text: str, *, x_root: int, y_root: int) -> None:
+        if not text:
+            self._hide_session_tree_hover_tip()
+            return
+        if self._session_tree_hover_tip_window is None or not self._session_tree_hover_tip_window.winfo_exists():
+            window = Toplevel(self.root)
+            window.withdraw()
+            window.overrideredirect(True)
+            window.attributes("-topmost", True)
+            label = ttk.Label(window, text=text, padding=(8, 4), relief="solid", borderwidth=1)
+            label.pack()
+            self._session_tree_hover_tip_window = window
+            self._session_tree_hover_tip_label = label
+        else:
+            window = self._session_tree_hover_tip_window
+            label = self._session_tree_hover_tip_label
+            if label is not None:
+                label.configure(text=text)
+        if window is None:
+            return
+        window.geometry(f"+{x_root + 12}+{y_root + 16}")
+        window.deiconify()
+
+    def _hide_session_tree_hover_tip(self) -> None:
+        window = self._session_tree_hover_tip_window
+        if window is not None and window.winfo_exists():
+            window.withdraw()
+        self._session_tree_hover_tip_column = ""
+
+    def _on_session_tree_hover(self, event: object) -> None:
+        tree = self.session_tree
+        try:
+            x = int(getattr(event, "x", 0) or 0)
+            y = int(getattr(event, "y", 0) or 0)
+            x_root = int(getattr(event, "x_root", 0) or 0)
+            y_root = int(getattr(event, "y_root", 0) or 0)
+            region = str(tree.identify_region(x, y))
+            column_id = str(tree.identify_column(x))
+        except Exception:
+            self._hide_session_tree_hover_tip()
+            return
+        if region != "heading":
+            self._hide_session_tree_hover_tip()
+            return
+        tip_text = QuantApp._session_tree_double_click_hint(column_id)
+        if not tip_text:
+            self._hide_session_tree_hover_tip()
+            return
+        self._session_tree_hover_tip_column = column_id
+        self._show_session_tree_hover_tip(tip_text, x_root=x_root, y_root=y_root)
+
+    def _on_session_tree_hover_leave(self, *_: object) -> None:
+        self._hide_session_tree_hover_tip()
+
     def _on_session_tree_double_click(self, event: object) -> str | None:
         tree = self.session_tree
         try:
@@ -12169,13 +12314,27 @@ class QuantApp:
             row_id = str(tree.identify_row(getattr(event, "y", 0) or 0)).strip()
         except Exception:
             return None
-        if column_id != "#3" or not row_id:
+        if not row_id:
             return None
         session = self.sessions.get(row_id)
         if session is None:
             return None
-        self._set_selected_session_email_notifications(not bool(getattr(session, "email_notifications_enabled", True)))
-        return "break"
+        if column_id == "#1":
+            self.open_strategy_session_log(session.session_id)
+            return "break"
+        if column_id == "#2":
+            trader_id = str(getattr(session, "trader_id", "") or "").strip()
+            if trader_id:
+                self.open_trader_desk_window_for_trader(trader_id)
+                return "break"
+            return None
+        if column_id == "#3":
+            self._set_selected_session_email_notifications(not bool(getattr(session, "email_notifications_enabled", True)))
+            return "break"
+        if column_id == "#7":
+            self.open_strategy_live_chart_window(session.session_id)
+            return "break"
+        return None
 
     def _refresh_selected_session_details(self) -> None:
         session = self._selected_session()
@@ -12955,10 +13114,10 @@ class QuantApp:
             selectmode="browse",
         )
         tree = self._strategy_history_tree
-        tree.heading("session", text="会话")
+        tree.heading("session", text="会话(双击日志)")
         tree.heading("api", text="API")
         tree.heading("strategy", text="策略")
-        tree.heading("symbol", text="标的")
+        tree.heading("symbol", text="标的(双击K线)")
         tree.heading("direction", text="方向")
         tree.heading("mode", text="模式")
         tree.heading("pnl", text="净盈亏")
@@ -12977,6 +13136,9 @@ class QuantApp:
         tree.column("stopped", width=150, anchor="center")
         tree.grid(row=0, column=0, sticky="nsew")
         tree.bind("<<TreeviewSelect>>", self._on_strategy_history_selected)
+        tree.bind("<Double-1>", self._on_strategy_history_tree_double_click)
+        tree.bind("<Motion>", self._on_strategy_history_tree_hover)
+        tree.bind("<Leave>", self._on_strategy_history_tree_hover_leave)
         history_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
         history_scroll.grid(row=0, column=1, sticky="ns")
         tree.configure(yscrollcommand=history_scroll.set)
@@ -13192,9 +13354,9 @@ class QuantApp:
         )
         group_tree = self._strategy_book_group_tree
         group_tree.heading("api", text="API")
-        group_tree.heading("trader", text="交易员")
+        group_tree.heading("trader", text="交易员(双击打开)")
         group_tree.heading("strategy", text="策略")
-        group_tree.heading("symbol", text="标的")
+        group_tree.heading("symbol", text="标的(双击K线)")
         group_tree.heading("bar", text="周期")
         group_tree.heading("direction", text="方向")
         group_tree.heading("status", text="状态")
@@ -13224,6 +13386,9 @@ class QuantApp:
         group_tree.column("net", width=98, anchor="e")
         group_tree.column("closed", width=150, anchor="center")
         group_tree.grid(row=0, column=0, sticky="nsew")
+        group_tree.bind("<Double-1>", self._on_strategy_book_group_tree_double_click)
+        group_tree.bind("<Motion>", self._on_strategy_book_tree_hover)
+        group_tree.bind("<Leave>", self._on_strategy_book_tree_hover_leave)
         group_scroll = ttk.Scrollbar(summary_frame, orient="vertical", command=group_tree.yview)
         group_scroll.grid(row=0, column=1, sticky="ns")
         group_tree.configure(yscrollcommand=group_scroll.set)
@@ -13260,13 +13425,13 @@ class QuantApp:
         ledger_tree = self._strategy_book_ledger_tree
         ledger_tree.heading("closed", text="平仓时间")
         ledger_tree.heading("api", text="API")
-        ledger_tree.heading("trader", text="交易员")
+        ledger_tree.heading("trader", text="交易员(双击打开)")
         ledger_tree.heading("strategy", text="策略")
-        ledger_tree.heading("symbol", text="标的")
+        ledger_tree.heading("symbol", text="标的(双击K线)")
         ledger_tree.heading("bar", text="周期")
         ledger_tree.heading("direction", text="方向")
         ledger_tree.heading("status", text="状态")
-        ledger_tree.heading("session", text="会话")
+        ledger_tree.heading("session", text="会话(双击日志)")
         ledger_tree.heading("opened", text="开仓时间")
         ledger_tree.heading("entry", text="开仓价")
         ledger_tree.heading("exit", text="平仓价")
@@ -13296,6 +13461,9 @@ class QuantApp:
         ledger_tree.column("reason", width=220, anchor="w")
         ledger_tree.grid(row=0, column=0, sticky="nsew")
         ledger_tree.bind("<<TreeviewSelect>>", self._on_strategy_book_ledger_selected)
+        ledger_tree.bind("<Double-1>", self._on_strategy_book_ledger_tree_double_click)
+        ledger_tree.bind("<Motion>", self._on_strategy_book_tree_hover)
+        ledger_tree.bind("<Leave>", self._on_strategy_book_tree_hover_leave)
         ledger_v_scroll = ttk.Scrollbar(ledger_frame, orient="vertical", command=ledger_tree.yview)
         ledger_v_scroll.grid(row=0, column=1, sticky="ns")
         ledger_x_scroll = ttk.Scrollbar(ledger_frame, orient="horizontal", command=ledger_tree.xview)
@@ -13494,6 +13662,131 @@ class QuantApp:
             self._focus_session_row(session_id)
 
     @staticmethod
+    def _strategy_book_tree_double_click_hint(column_id: str) -> str:
+        return {
+            "#2": "双击打开并定位对应交易员",
+            "#4": "双击打开对应会话的实时K线图（若仍存在）",
+            "#9": "双击打开对应会话的独立日志（若仍存在）",
+        }.get(str(column_id or "").strip(), "")
+
+    def _show_strategy_book_tree_hover_tip(self, text: str, *, x_root: int, y_root: int) -> None:
+        if not text:
+            self._hide_strategy_book_tree_hover_tip()
+            return
+        if self._strategy_book_tree_hover_tip_window is None or not self._strategy_book_tree_hover_tip_window.winfo_exists():
+            window = Toplevel(self.root)
+            window.withdraw()
+            window.overrideredirect(True)
+            window.attributes("-topmost", True)
+            label = ttk.Label(window, text=text, padding=(8, 4), relief="solid", borderwidth=1)
+            label.pack()
+            self._strategy_book_tree_hover_tip_window = window
+            self._strategy_book_tree_hover_tip_label = label
+        else:
+            window = self._strategy_book_tree_hover_tip_window
+            label = self._strategy_book_tree_hover_tip_label
+            if label is not None:
+                label.configure(text=text)
+        if window is None:
+            return
+        window.geometry(f"+{x_root + 12}+{y_root + 16}")
+        window.deiconify()
+
+    def _hide_strategy_book_tree_hover_tip(self) -> None:
+        window = self._strategy_book_tree_hover_tip_window
+        if window is not None and window.winfo_exists():
+            window.withdraw()
+        self._strategy_book_tree_hover_tip_column = ""
+
+    def _on_strategy_book_tree_hover(self, event: object) -> None:
+        tree = getattr(event, "widget", None)
+        if tree is None:
+            self._hide_strategy_book_tree_hover_tip()
+            return
+        try:
+            x = int(getattr(event, "x", 0) or 0)
+            y = int(getattr(event, "y", 0) or 0)
+            x_root = int(getattr(event, "x_root", 0) or 0)
+            y_root = int(getattr(event, "y_root", 0) or 0)
+            region = str(tree.identify_region(x, y))
+            column_id = str(tree.identify_column(x))
+        except Exception:
+            self._hide_strategy_book_tree_hover_tip()
+            return
+        if region != "heading":
+            self._hide_strategy_book_tree_hover_tip()
+            return
+        tip_text = QuantApp._strategy_book_tree_double_click_hint(column_id)
+        if not tip_text:
+            self._hide_strategy_book_tree_hover_tip()
+            return
+        self._strategy_book_tree_hover_tip_column = column_id
+        self._show_strategy_book_tree_hover_tip(tip_text, x_root=x_root, y_root=y_root)
+
+    def _on_strategy_book_tree_hover_leave(self, *_: object) -> None:
+        self._hide_strategy_book_tree_hover_tip()
+
+    def _on_strategy_book_group_tree_double_click(self, event: object) -> str | None:
+        tree = self._strategy_book_group_tree
+        if tree is None or not _widget_exists(tree):
+            return None
+        try:
+            column_id = str(tree.identify_column(getattr(event, "x", 0) or 0))
+            row_id = str(tree.identify_row(getattr(event, "y", 0) or 0)).strip()
+        except Exception:
+            return None
+        if not row_id:
+            return None
+        values = tree.item(row_id, "values")
+        if column_id == "#2":
+            trader_id = str(values[1] if len(values) > 1 else "").strip()
+            if trader_id and trader_id != "-":
+                self.open_trader_desk_window_for_trader(trader_id)
+                return "break"
+        if column_id == "#4":
+            strategy_name = str(values[2] if len(values) > 2 else "").strip()
+            symbol = str(values[3] if len(values) > 3 else "").strip()
+            bar = str(values[4] if len(values) > 4 else "").strip()
+            direction = str(values[5] if len(values) > 5 else "").strip()
+            for session in self.sessions.values():
+                if (
+                    (session.strategy_name or "").strip() == strategy_name
+                    and (session.symbol or "").strip() == symbol
+                    and str(getattr(getattr(session, "config", None), "bar", "") or "").strip() == bar
+                    and (session.direction_label or "").strip() == direction
+                ):
+                    self.open_strategy_live_chart_window(session.session_id)
+                    return "break"
+        return None
+
+    def _on_strategy_book_ledger_tree_double_click(self, event: object) -> str | None:
+        tree = self._strategy_book_ledger_tree
+        if tree is None or not _widget_exists(tree):
+            return None
+        try:
+            column_id = str(tree.identify_column(getattr(event, "x", 0) or 0))
+            row_id = str(tree.identify_row(getattr(event, "y", 0) or 0)).strip()
+        except Exception:
+            return None
+        if not row_id:
+            return None
+        values = tree.item(row_id, "values")
+        tags = tree.item(row_id, "tags")
+        session_id = str(tags[0] if tags else "").strip()
+        if column_id == "#3":
+            trader_id = str(values[2] if len(values) > 2 else "").strip()
+            if trader_id and trader_id != "-":
+                self.open_trader_desk_window_for_trader(trader_id)
+                return "break"
+        if column_id == "#5" and session_id:
+            self.open_strategy_live_chart_window(session_id)
+            return "break"
+        if column_id == "#9" and session_id:
+            self.open_strategy_session_log(session_id)
+            return "break"
+        return None
+
+    @staticmethod
     def _session_blocks_history_deletion(session: StrategySession) -> bool:
         return session.engine.is_running or session.status in {"运行中", "停止中", "待恢复", "恢复中"}
 
@@ -13636,6 +13929,100 @@ class QuantApp:
         record = self._selected_strategy_history_record()
         self._strategy_history_selected_record_id = record.record_id if record is not None else None
         self._refresh_selected_strategy_history_details()
+
+    @staticmethod
+    def _strategy_history_tree_double_click_hint(column_id: str) -> str:
+        return {
+            "#1": "双击打开这条历史策略的独立日志",
+            "#4": "双击打开对应会话的实时K线图（若仍存在）",
+        }.get(str(column_id or "").strip(), "")
+
+    def _show_strategy_history_tree_hover_tip(self, text: str, *, x_root: int, y_root: int) -> None:
+        if not text:
+            self._hide_strategy_history_tree_hover_tip()
+            return
+        if self._history_tree_hover_tip_window is None or not self._history_tree_hover_tip_window.winfo_exists():
+            window = Toplevel(self.root)
+            window.withdraw()
+            window.overrideredirect(True)
+            window.attributes("-topmost", True)
+            label = ttk.Label(window, text=text, padding=(8, 4), relief="solid", borderwidth=1)
+            label.pack()
+            self._history_tree_hover_tip_window = window
+            self._history_tree_hover_tip_label = label
+        else:
+            window = self._history_tree_hover_tip_window
+            label = self._history_tree_hover_tip_label
+            if label is not None:
+                label.configure(text=text)
+        if window is None:
+            return
+        window.geometry(f"+{x_root + 12}+{y_root + 16}")
+        window.deiconify()
+
+    def _hide_strategy_history_tree_hover_tip(self) -> None:
+        window = self._history_tree_hover_tip_window
+        if window is not None and window.winfo_exists():
+            window.withdraw()
+        self._history_tree_hover_tip_column = ""
+
+    def _on_strategy_history_tree_hover(self, event: object) -> None:
+        tree = self._strategy_history_tree
+        if tree is None or not _widget_exists(tree):
+            self._hide_strategy_history_tree_hover_tip()
+            return
+        try:
+            x = int(getattr(event, "x", 0) or 0)
+            y = int(getattr(event, "y", 0) or 0)
+            x_root = int(getattr(event, "x_root", 0) or 0)
+            y_root = int(getattr(event, "y_root", 0) or 0)
+            region = str(tree.identify_region(x, y))
+            column_id = str(tree.identify_column(x))
+        except Exception:
+            self._hide_strategy_history_tree_hover_tip()
+            return
+        if region != "heading":
+            self._hide_strategy_history_tree_hover_tip()
+            return
+        tip_text = QuantApp._strategy_history_tree_double_click_hint(column_id)
+        if not tip_text:
+            self._hide_strategy_history_tree_hover_tip()
+            return
+        self._history_tree_hover_tip_column = column_id
+        self._show_strategy_history_tree_hover_tip(tip_text, x_root=x_root, y_root=y_root)
+
+    def _on_strategy_history_tree_hover_leave(self, *_: object) -> None:
+        self._hide_strategy_history_tree_hover_tip()
+
+    def _on_strategy_history_tree_double_click(self, event: object) -> str | None:
+        tree = self._strategy_history_tree
+        if tree is None or not _widget_exists(tree):
+            return None
+        try:
+            column_id = str(tree.identify_column(getattr(event, "x", 0) or 0))
+            row_id = str(tree.identify_row(getattr(event, "y", 0) or 0)).strip()
+        except Exception:
+            return None
+        if not row_id:
+            return None
+        record = self._strategy_history_by_id.get(row_id)
+        if record is None:
+            return None
+        self._strategy_history_selected_record_id = record.record_id
+        try:
+            tree.selection_set(record.record_id)
+        except Exception:
+            pass
+        if column_id == "#1":
+            self.open_selected_strategy_history_log()
+            return "break"
+        if column_id == "#4":
+            session = self._session_by_history_record_id(record.record_id)
+            if session is None:
+                return None
+            self.open_strategy_live_chart_window(session.session_id)
+            return "break"
+        return None
 
     def _refresh_selected_strategy_history_details(self) -> None:
         record = self._selected_strategy_history_record()

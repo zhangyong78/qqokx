@@ -1,4 +1,4 @@
-from decimal import Decimal
+﻿from decimal import Decimal
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock
@@ -283,7 +283,7 @@ class StrategyEngineNotificationTest(TestCase):
             "50",
         )
 
-    def test_signal_only_error_notification_omits_api_name(self) -> None:
+    def test_signal_only_error_notification_keeps_api_name(self) -> None:
         notifier = MagicMock()
         engine = StrategyEngine(
             MagicMock(),
@@ -298,5 +298,5 @@ class StrategyEngineNotificationTest(TestCase):
 
         engine._notify_error(_make_strategy_config(run_mode="signal_only"), "读取失败")
 
-        self.assertEqual(notifier.send_error.call_args.kwargs["api_name"], "")
+        self.assertEqual(notifier.send_error.call_args.kwargs["api_name"], "real-1")
         self.assertEqual(notifier.send_error.call_args.kwargs["session_id"], "S11")
