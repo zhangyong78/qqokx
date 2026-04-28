@@ -70,12 +70,12 @@ RUN_STATUS_LABELS: dict[str, str] = {
     "stopped": "已停止",
 }
 SLOT_STATUS_LABELS: dict[str, str] = {
-    "watching": "观察中",
+    "watching": "等待开仓",
     "open": "持仓中",
     "closed_profit": "盈利平仓",
     "closed_loss": "亏损平仓",
     "closed_manual": "人工结束",
-    "stopped": "已停止",
+    "stopped": "观察结束（未开仓）",
     "failed": "异常结束",
 }
 
@@ -205,6 +205,16 @@ def _format_optional_decimal(value: Decimal | None) -> str:
     if value is None:
         return "-"
     return format_decimal(value)
+
+
+def _format_optional_compact_price(value: Decimal | None, *, places: int = 4) -> str:
+    if value is None:
+        return "-"
+    decimal_value = value if isinstance(value, Decimal) else Decimal(str(value))
+    text = format_decimal_fixed(decimal_value, places)
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def _format_optional_pnl(value: Decimal | None) -> str:
@@ -1074,7 +1084,7 @@ class TraderDeskWindow:
         self.slot_tree.grid(row=2, column=0, sticky="nsew")
         for column, text, width, anchor in (
             ("slot", "额度格", 90, "center"),
-            ("status", "状态", 90, "center"),
+            ("status", "状态", 140, "center"),
             ("session", "会话", 80, "center"),
             ("opened", "开仓时间", 120, "center"),
             ("entry", "开仓价", 90, "center"),
@@ -1502,7 +1512,7 @@ class TraderDeskWindow:
                     str(draft.template_payload.get("api_name") or "-"),
                     _run_status_label(run_status),
                     f"{used}/{draft.quota_steps} | {_normalize_decimal_text(used_quota)}/{_normalize_decimal_text(draft.total_quota)}",
-                    f"{open_count} 单 / {_format_optional_decimal(average_entry)}",
+                    f"{open_count} 单 / {_format_optional_compact_price(average_entry)}",
                     _format_optional_pnl(realized_pnl),
                     draft.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
                 ),
@@ -1600,12 +1610,12 @@ class TraderDeskWindow:
             f"交易标的：{_payload_trade_symbol(draft.template_payload) or '-'}",
             f"触发标的：{_payload_signal_symbol(draft.template_payload) or '-'}",
             f"固定数量：{_normalize_decimal_text(draft.unit_quota)}",
-            f"当前持仓：{open_count} 单 | 均价={_format_optional_decimal(average_entry)} | 总数量={_format_optional_decimal(total_size)}",
+            f"当前持仓：{open_count} 单 | 均价={_format_optional_compact_price(average_entry)} | 总数量={_format_optional_decimal(total_size)}",
             f"累计结果：平仓 {close_count} 单 | 盈利 {win_count} | 亏损 {loss_count} | 净盈亏={_format_optional_pnl(realized_pnl)}",
             "",
         ]
         if any(slot.status == "watching" for slot in slots) and open_count == 0:
-            lines.append("当前阶段：观察中，尚未开仓；只有满足策略条件后才会真正挂单。")
+            lines.append("当前阶段：等待开仓，尚未开仓；只有满足策略条件后才会真正挂单。")
             lines.append("")
         lines.extend(
             [

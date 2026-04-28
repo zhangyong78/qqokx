@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import Instrument, OkxOrderResult, OkxPosition
-from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_SHORT_ID
+from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_LONG_ID, STRATEGY_DYNAMIC_SHORT_ID, STRATEGY_EMA5_EMA8_ID
 from okx_quant.trader_desk import TraderDraftRecord, TraderRunState, TraderSlotRecord
 from okx_quant.ui import (
     NormalStrategyBookFilters,
@@ -29,7 +29,11 @@ from okx_quant.ui import (
     _build_current_position_note_record,
     _build_group_row_values,
     _build_history_position_note_record,
+    _build_launch_parameter_hint_text,
     _build_order_size_mode_hint_text,
+    _build_dynamic_protection_hint_text,
+    _build_strategy_start_confirmation_message,
+    _build_trend_parameter_hint_text,
     _build_strategy_template_payload,
     _build_fixed_order_size_hint_text,
     _coerce_log_file_path,
@@ -179,6 +183,117 @@ HTTP 502: <!DOCTYPE html>
 
         self.assertIsNone(found)
         app._ensure_fixed_order_size_hint_instrument_async.assert_called_once_with("ETH-USDT-SWAP")
+
+    def test_build_strategy_start_confirmation_message_includes_parameter_explanations(self) -> None:
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="4H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            risk_amount=Decimal("20"),
+            tp_sl_mode="exchange",
+            entry_side_mode="follow_signal",
+            run_mode="trade",
+            take_profit_mode="dynamic",
+            max_entries_per_trend=1,
+            entry_reference_ema_period=21,
+            dynamic_two_r_break_even=True,
+            dynamic_fee_offset_enabled=True,
+            startup_chase_window_seconds=0,
+            time_stop_break_even_enabled=False,
+            time_stop_break_even_bars=0,
+        )
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+        )
+
+        message = _build_strategy_start_confirmation_message(
+            strategy_name="EMA 动态委托做多",
+            rule_description="当快线高于慢线时，等待回踩后挂单。",
+            strategy_symbol="BTC-USDT-SWAP",
+            config=config,
+            run_mode_label="交易并下单",
+            environment_label="模拟盘 demo",
+            trade_mode_label="全仓 cross",
+            position_mode_label="净持仓 net",
+            signal_mode_label="只做多",
+            entry_side_mode_label="跟随信号",
+            tp_sl_mode_label="OKX 托管（仅同标的永续）",
+            trigger_type_label="标记价格 mark",
+            take_profit_mode_label="动态止盈",
+            risk_value="20",
+            fixed_size="1",
+            custom_trigger_symbol="",
+            instrument=instrument,
+        )
+
+        self.assertIn("基础信息：", message)
+        self.assertIn("信号方向：只做多（只接收多头信号）", message)
+        self.assertIn("下单方向模式：跟随信号（多头买入，空头卖出）", message)
+        self.assertIn("止损 ATR 倍数：2（止损距离 = 2 × ATR）", message)
+        self.assertIn("止盈 ATR 倍数：4（当前为动态止盈，初始不直接挂止盈）", message)
+        self.assertIn("风险金：20（按止损距离反推仓位）", message)
+        self.assertIn("固定数量：1（OKX 下单数量 sz；当前已填写风险金，仅作备用；BTC-USDT-SWAP 下 1=0.01 BTC）", message)
+        self.assertIn("启动追单窗口：关闭（启动不追老信号，只等新波）", message)
+
+    def test_build_launch_parameter_hint_text_for_dynamic_take_profit(self) -> None:
+        hint = _build_launch_parameter_hint_text(
+            stop_atr_raw="2",
+            take_atr_raw="4",
+            take_profit_mode_label="动态止盈",
+            max_entries_raw="1",
+            startup_chase_window_raw="0",
+        )
+
+        self.assertIn("止损ATR倍数：2=止损距离是 2×ATR。", hint)
+        self.assertIn("动态止盈下不用于初始挂止盈", hint)
+        self.assertIn("每波最多开仓次数：1=同一波最多开 1 次。", hint)
+        self.assertIn("启动追单窗口：0=启动不追老信号", hint)
+
+    def test_build_trend_parameter_hint_text_for_dynamic_strategy(self) -> None:
+        hint = _build_trend_parameter_hint_text(
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            ema_period_raw="21",
+            trend_ema_period_raw="55",
+            big_ema_period_raw="233",
+            entry_reference_ema_period_raw="0",
+        )
+
+        self.assertIn("EMA小周期：21=快线", hint)
+        self.assertIn("EMA中周期：55=趋势过滤线", hint)
+        self.assertIn("挂单参考EMA：0=跟随EMA小周期，当前按 EMA21 作为挂单价格锚点。", hint)
+
+    def test_build_dynamic_protection_hint_text_for_enabled_dynamic_mode(self) -> None:
+        hint = _build_dynamic_protection_hint_text(
+            take_profit_mode_label="动态止盈",
+            dynamic_two_r_break_even_enabled=True,
+            dynamic_fee_offset_enabled=True,
+            time_stop_break_even_enabled=False,
+            time_stop_break_even_bars_raw="10",
+        )
+
+        self.assertIn("2R保本：开启", hint)
+        self.assertIn("手续费偏移：开启", hint)
+        self.assertIn("时间保本：关闭（当前设定 10 根", hint)
 
     def test_build_normal_strategy_book_summary_filters_out_trader_history(self) -> None:
         history_records = [
@@ -1036,6 +1151,7 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
             status="运行中",
             engine=SimpleNamespace(is_running=True),
             config=config,
+            email_notifications_enabled=True,
         )
         peer = SimpleNamespace(
             session_id="S02",
@@ -1048,6 +1164,7 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
             session_tree=_SessionTreeStub(),
             _session_live_pnl_snapshot=lambda _session: (None, None),
             sessions={"S01": session, "S02": peer},
+            notify_enabled=_Var(True),
         )
         app._trader_desk_draft_by_id = lambda _trader_id: None
 
@@ -1056,8 +1173,9 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         self.assertEqual(app.session_tree.rows["S01"]["tags"], ("duplicate_conflict",))
         self.assertEqual(app.session_tree.rows["S01"]["values"][0], "S01")
         self.assertEqual(app.session_tree.rows["S01"]["values"][1], "-")
-        self.assertEqual(app.session_tree.rows["S01"]["values"][3], "普通量化")
-        self.assertEqual(app.session_tree.rows["S01"]["values"][6], "1H")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][2], "开")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][4], "普通量化")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][7], "1H")
     def test_session_trader_label_prefers_trader_id_and_falls_back_to_dash(self) -> None:
         trader_session = SimpleNamespace(trader_id="T001")
         plain_session = SimpleNamespace(trader_id="")
@@ -1067,6 +1185,82 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
 
         self.assertEqual(QuantApp._session_trader_label(app, trader_session), "T001")
         self.assertEqual(QuantApp._session_trader_label(app, plain_session), "-")
+
+    def test_session_email_status_label_reflects_global_and_session_switches(self) -> None:
+        session = SimpleNamespace(email_notifications_enabled=True)
+        app = SimpleNamespace(notify_enabled=_Var(True))
+
+        self.assertEqual(QuantApp._session_email_status_label(app, session), "开")
+
+        session.email_notifications_enabled = False
+        self.assertEqual(QuantApp._session_email_status_label(app, session), "关")
+
+        app.notify_enabled.set(False)
+        self.assertEqual(QuantApp._session_email_status_label(app, session), "总关")
+
+    def test_toggle_global_email_notifications_updates_runtime_state(self) -> None:
+        logs: list[str] = []
+        app = SimpleNamespace(
+            notify_enabled=_Var(True),
+            global_email_toggle_text=_Var("发邮件：开"),
+            _refresh_global_email_toggle_text=lambda: QuantApp._refresh_global_email_toggle_text(app),
+            _refresh_running_session_tree=MagicMock(),
+            _refresh_selected_session_details=MagicMock(),
+            _save_notification_settings_now=MagicMock(),
+            _enqueue_log=logs.append,
+        )
+
+        QuantApp.toggle_global_email_notifications(app)
+
+        self.assertFalse(app.notify_enabled.get())
+        self.assertEqual(app.global_email_toggle_text.get(), "发邮件：关")
+        app._refresh_running_session_tree.assert_called_once()
+        app._refresh_selected_session_details.assert_called_once()
+        app._save_notification_settings_now.assert_called_once_with(silent=True)
+        self.assertEqual(logs[-1], "已关闭全局发邮件。")
+
+    def test_set_selected_session_email_notifications_updates_row_and_detail(self) -> None:
+        session = SimpleNamespace(session_id="S01", email_notifications_enabled=True)
+        logs: list[str] = []
+        app = SimpleNamespace(
+            root=object(),
+            _selected_session=lambda: session,
+            _upsert_session_row=MagicMock(),
+            _refresh_selected_session_details=MagicMock(),
+            _enqueue_log=logs.append,
+        )
+
+        QuantApp._set_selected_session_email_notifications(app, False)
+
+        self.assertFalse(session.email_notifications_enabled)
+        app._upsert_session_row.assert_called_once_with(session)
+        app._refresh_selected_session_details.assert_called_once()
+        self.assertEqual(logs[-1], "已关闭会话 S01 发邮件。")
+
+    def test_session_tree_double_click_toggles_email_only_on_email_column(self) -> None:
+        session = SimpleNamespace(session_id="S01", email_notifications_enabled=True)
+        tree = _SessionTreeStub()
+        tree.rows["S01"] = {"values": (), "tags": (), "text": ""}
+        app = SimpleNamespace(
+            session_tree=tree,
+            sessions={"S01": session},
+        )
+        toggles: list[bool] = []
+        app._set_selected_session_email_notifications = lambda enabled: toggles.append(enabled)
+
+        tree.identify_column = lambda _x: "#3"
+        tree.identify_row = lambda _y: "S01"
+        result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=24, y=12))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(toggles, [False])
+
+        toggles.clear()
+        tree.identify_column = lambda _x: "#2"
+        result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=12, y=12))
+
+        self.assertIsNone(result)
+        self.assertEqual(toggles, [])
 
 
     def test_render_strategy_history_view_includes_session_column(self) -> None:
@@ -1252,7 +1446,7 @@ class StrategyTradeTrackingTest(TestCase):
         )
         events: list[tuple[str, str, str]] = []
         app = SimpleNamespace(
-            _trader_desk_slot_for_session=lambda session_id: slot,
+            _trader_desk_slot_for_session=lambda session_id, trader_slot_id="": slot,
             _trader_desk_run_by_id=lambda trader_id, create=False: run,
             _trader_desk_draft_by_id=lambda trader_id: draft,
             _session_stop_reason_text=lambda session: QuantApp._session_stop_reason_text(session),
@@ -1338,7 +1532,7 @@ class StrategyTradeTrackingTest(TestCase):
         )
         events: list[tuple[str, str, str]] = []
         app = SimpleNamespace(
-            _trader_desk_slot_for_session=lambda session_id: slot,
+            _trader_desk_slot_for_session=lambda session_id, trader_slot_id="": slot,
             _trader_desk_draft_by_id=lambda trader_id: draft,
             _trader_desk_run_by_id=lambda trader_id, create=False: run,
             _trader_desk_add_event=lambda trader_id, message, level="info": events.append((trader_id, level, message)),
@@ -1370,6 +1564,166 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(run.status, "paused_loss")
         self.assertIn("净盈亏=0.00", events[0][2])
         app._ensure_trader_watcher.assert_not_called()
+
+    def test_trader_desk_slot_for_session_prefers_trader_slot_id_over_reused_session_id(self) -> None:
+        old_slot = TraderSlotRecord(
+            slot_id="slot-old",
+            trader_id="T001",
+            session_id="S02",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="ETH-USDT-SWAP",
+            status="open",
+            created_at=datetime(2026, 4, 26, 12, 7, 21),
+        )
+        new_slot = TraderSlotRecord(
+            slot_id="slot-new",
+            trader_id="T001",
+            session_id="S02",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="ETH-USDT-SWAP",
+            status="watching",
+            created_at=datetime(2026, 4, 27, 8, 5, 56),
+        )
+        app = SimpleNamespace(_trader_desk_slots=[old_slot, new_slot])
+
+        matched = QuantApp._trader_desk_slot_for_session(app, "S02", "slot-old")
+
+        self.assertIs(matched, old_slot)
+
+    def test_apply_trader_desk_reconciliation_overwrites_slot_open_fields_from_ledger(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload={"strategy_id": "ema_dynamic_short"},
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+            pause_on_stop_loss=False,
+        )
+        run = TraderRunState(trader_id="T001", status="running", armed_session_id="S02")
+        slot = TraderSlotRecord(
+            slot_id="slot-new",
+            trader_id="T001",
+            session_id="S02",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="ETH-USDT-SWAP",
+            status="open",
+            quota_occupied=True,
+            opened_at=datetime(2026, 4, 26, 12, 15, 28),
+            entry_price=Decimal("2310.67"),
+            size=Decimal("0.1"),
+        )
+        events: list[tuple[str, str, str]] = []
+        app = SimpleNamespace(
+            _trader_desk_slot_for_session=lambda session_id, trader_slot_id="": slot,
+            _trader_desk_draft_by_id=lambda trader_id: draft,
+            _trader_desk_run_by_id=lambda trader_id, create=False: run,
+            _trader_desk_add_event=lambda trader_id, message, level="info": events.append((trader_id, level, message)),
+            _save_trader_desk_snapshot=MagicMock(),
+            _ensure_trader_watcher=MagicMock(),
+        )
+        session = SimpleNamespace(
+            session_id="S02",
+            trader_id="T001",
+            trader_slot_id="slot-new",
+            ended_reason="策略主动平仓",
+            history_record_id="H02",
+        )
+        ledger_record = SimpleNamespace(
+            close_reason="策略主动平仓",
+            net_pnl=Decimal("-0.27"),
+            opened_at=datetime(2026, 4, 27, 8, 37, 57),
+            closed_at=datetime(2026, 4, 27, 13, 16, 52),
+            entry_price=Decimal("2364.81"),
+            exit_price=Decimal("2356.62"),
+            size=Decimal("0.1"),
+            history_record_id="H02",
+        )
+
+        QuantApp._apply_trader_desk_reconciliation(app, session, ledger_record)
+
+        self.assertEqual(slot.opened_at, datetime(2026, 4, 27, 8, 37, 57))
+        self.assertEqual(slot.entry_price, Decimal("2364.81"))
+        self.assertEqual(slot.exit_price, Decimal("2356.62"))
+
+    def test_repair_trader_desk_slots_from_trade_ledger_rewrites_closed_slot_fields(self) -> None:
+        slot = TraderSlotRecord(
+            slot_id="slot-1",
+            trader_id="T002",
+            session_id="S02",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="ETH-USDT-SWAP",
+            status="closed_loss",
+            opened_at=datetime(2026, 4, 26, 12, 15, 28),
+            closed_at=datetime(2026, 4, 27, 13, 16, 52),
+            entry_price=Decimal("2310.67"),
+            exit_price=Decimal("2356.62"),
+            size=Decimal("0.1"),
+            net_pnl=Decimal("-0.27"),
+            close_reason="策略主动平仓",
+            history_record_id="H02",
+        )
+        ledger_record = StrategyTradeLedgerRecord(
+            record_id="L01",
+            history_record_id="H02",
+            session_id="S02",
+            api_name="moni",
+            strategy_id="ema_dynamic_order_short",
+            strategy_name="EMA 动态委托做空",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+            environment="demo",
+            opened_at=datetime(2026, 4, 27, 8, 37, 57),
+            closed_at=datetime(2026, 4, 27, 13, 16, 52),
+            entry_price=Decimal("2364.81"),
+            exit_price=Decimal("2356.62"),
+            size=Decimal("0.1"),
+            net_pnl=Decimal("-0.270206047"),
+            close_reason="策略主动平仓",
+        )
+        app = SimpleNamespace(
+            _strategy_trade_ledger_records=[ledger_record],
+            _trader_desk_slots=[slot],
+            _save_trader_desk_snapshot=MagicMock(),
+        )
+
+        QuantApp._repair_trader_desk_slots_from_trade_ledger(app)
+
+        self.assertEqual(slot.opened_at, datetime(2026, 4, 27, 8, 37, 57))
+        self.assertEqual(slot.entry_price, Decimal("2364.81"))
+        self.assertEqual(slot.net_pnl, Decimal("-0.270206047"))
+        app._save_trader_desk_snapshot.assert_called_once()
+
+    def test_update_session_counter_from_session_id_uses_max_seen_value(self) -> None:
+        app = SimpleNamespace(_session_counter=2)
+
+        QuantApp._update_session_counter_from_session_id(app, "S15")
+        QuantApp._update_session_counter_from_session_id(app, "S03")
+        QuantApp._update_session_counter_from_session_id(app, "bad-id")
+
+        self.assertEqual(app._session_counter, 15)
+
+    def test_trader_desk_start_slot_skips_when_armed_session_already_exists(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload={"strategy_id": "ema_dynamic_short"},
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+        )
+        run = TraderRunState(trader_id="T001", status="running", armed_session_id="__starting__")
+        app = SimpleNamespace(
+            _trader_desk_draft_by_id=lambda trader_id: draft,
+            _trader_desk_run_by_id=lambda trader_id, create=False: run,
+        )
+
+        started = QuantApp._trader_desk_start_slot(app, "T001")
+
+        self.assertFalse(started)
 
     def test_delete_trader_desk_draft_cleans_stale_watchers_before_delete(self) -> None:
         draft = TraderDraftRecord(
@@ -1813,6 +2167,15 @@ class _Var:
         self._value = value
 
 
+class _LabelStub:
+    def __init__(self, text: str = "") -> None:
+        self.text = text
+
+    def configure(self, **kwargs: object) -> None:
+        if "text" in kwargs:
+            self.text = str(kwargs["text"])
+
+
 class _SessionTreeStub:
     def __init__(self) -> None:
         self.rows: dict[str, dict[str, object]] = {}
@@ -1826,6 +2189,14 @@ class _SessionTreeStub:
 
     def exists(self, iid: str) -> bool:
         return iid in self.rows
+
+    @staticmethod
+    def identify_column(_x: int) -> str:
+        return "#1"
+
+    @staticmethod
+    def identify_row(_y: int) -> str:
+        return ""
 
     def item(self, iid: str, **kwargs: object) -> None:
         self.rows.setdefault(iid, {}).update(kwargs)
@@ -2287,6 +2658,7 @@ class SelectedSessionDetailRefreshTest(TestCase):
             _session_live_pnl_snapshot=lambda _session: (None, None),
             _build_strategy_detail_text=MagicMock(return_value="detail"),
             _set_readonly_text=MagicMock(),
+            notify_enabled=_Var(True),
         )
 
         with patch("okx_quant.ui._serialize_strategy_config_snapshot", return_value={}), patch.object(
@@ -2340,6 +2712,7 @@ class SelectedSessionDetailRefreshTest(TestCase):
             _session_live_pnl_snapshot=lambda _session: (None, None),
             _build_strategy_detail_text=MagicMock(return_value="detail"),
             _set_readonly_text=MagicMock(),
+            notify_enabled=_Var(True),
         )
 
         with patch("okx_quant.ui._serialize_strategy_config_snapshot", return_value={}), patch.object(
@@ -2860,3 +3233,137 @@ class StrategyStopCleanupTest(TestCase):
         self.assertTrue(any("\u5df2\u63d0\u4ea4\u64a4\u5355 1 \u6761" in message for message in log_messages))
         showwarning.assert_not_called()
         showinfo.assert_called_once()
+
+    def test_apply_stop_session_cleanup_result_suppresses_dialog_when_requested(self) -> None:
+        session = self._make_session()
+        session.stop_result_show_dialog = False
+        app = SimpleNamespace(
+            sessions={session.session_id: session},
+            _remove_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _refresh_selected_session_details=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _log_session_message=MagicMock(),
+            _current_credential_profile=lambda: "moni",
+            refresh_positions=MagicMock(),
+            refresh_order_views=MagicMock(),
+        )
+        result = StrategyStopCleanupResult(
+            session_id=session.session_id,
+            effective_environment="demo",
+            cancel_requested_summaries=("entry cancel accepted",),
+            needs_manual_review=False,
+            final_reason="\u7528\u6237\u624b\u52a8\u505c\u6b62",
+        )
+
+        with patch("okx_quant.ui.messagebox.showwarning") as showwarning, patch(
+            "okx_quant.ui.messagebox.showinfo"
+        ) as showinfo:
+            QuantApp._apply_stop_session_cleanup_result(app, result)
+
+        showwarning.assert_not_called()
+        showinfo.assert_not_called()
+        self.assertTrue(session.stop_result_show_dialog)
+
+    def test_apply_stop_session_cleanup_error_suppresses_dialog_when_requested(self) -> None:
+        session = self._make_session()
+        session.stop_result_show_dialog = False
+        app = SimpleNamespace(
+            sessions={session.session_id: session},
+            _remove_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _refresh_selected_session_details=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _log_session_message=MagicMock(),
+        )
+
+        with patch("okx_quant.ui.messagebox.showwarning") as showwarning:
+            QuantApp._apply_stop_session_cleanup_error(app, session.session_id, "HTTP 500")
+
+        showwarning.assert_not_called()
+        self.assertTrue(session.stop_result_show_dialog)
+
+
+class StrategyParameterDraftRestoreTest(TestCase):
+    def _make_parameter_stub(self) -> SimpleNamespace:
+        app = SimpleNamespace(
+            _strategy_parameter_drafts={"launcher": {}},
+            _strategy_parameter_scope="launcher",
+            bar=_Var(""),
+            signal_mode_label=_Var(""),
+            ema_period=_Var(""),
+            trend_ema_period=_Var(""),
+            big_ema_period=_Var(""),
+            atr_period=_Var(""),
+            stop_atr=_Var(""),
+            take_atr=_Var(""),
+            entry_reference_ema_period=_Var(""),
+            take_profit_mode_label=_Var(""),
+            max_entries_per_trend=_Var(""),
+            dynamic_two_r_break_even=_Var(False),
+            dynamic_fee_offset_enabled=_Var(False),
+            time_stop_break_even_enabled=_Var(False),
+            time_stop_break_even_bars=_Var(""),
+            startup_chase_window_seconds=_Var(""),
+        )
+        app._strategy_parameter_scope_drafts = lambda: QuantApp._strategy_parameter_scope_drafts(app)
+        app._strategy_parameter_bindings = lambda: QuantApp._strategy_parameter_bindings(app)
+        return app
+
+    def test_restore_strategy_parameter_draft_applies_fixed_ema5_8_values(self) -> None:
+        app = self._make_parameter_stub()
+
+        QuantApp._restore_strategy_parameter_draft(app, STRATEGY_EMA5_EMA8_ID)
+
+        self.assertEqual(app.bar.get(), "4H")
+        self.assertEqual(app.ema_period.get(), 5)
+        self.assertEqual(app.trend_ema_period.get(), 8)
+        self.assertEqual(app.big_ema_period.get(), 233)
+
+    def test_restore_strategy_parameter_draft_prefers_saved_cross_values(self) -> None:
+        app = self._make_parameter_stub()
+        app._strategy_parameter_drafts["launcher"][STRATEGY_CROSS_ID] = {
+            "bar": "1H",
+            "ema_period": "34",
+            "trend_ema_period": "89",
+            "big_ema_period": "233",
+            "atr_period": "14",
+        }
+
+        QuantApp._restore_strategy_parameter_draft(app, STRATEGY_CROSS_ID)
+
+        self.assertEqual(app.bar.get(), "1H")
+        self.assertEqual(app.ema_period.get(), "34")
+        self.assertEqual(app.trend_ema_period.get(), "89")
+        self.assertEqual(app.atr_period.get(), "14")
+
+
+class StrategyParameterFixedLabelTest(TestCase):
+    def _make_label_stub(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            _bar_label=_LabelStub("K线周期"),
+            _signal_label=_LabelStub("信号方向"),
+            _ema_label=_LabelStub("EMA小周期"),
+            _trend_ema_label=_LabelStub("EMA中周期"),
+            _big_ema_label=_LabelStub("EMA大周期"),
+        )
+
+    def test_apply_strategy_parameter_fixed_labels_marks_ema5_8_fixed_fields(self) -> None:
+        app = self._make_label_stub()
+
+        QuantApp._apply_strategy_parameter_fixed_labels(app, STRATEGY_EMA5_EMA8_ID)
+
+        self.assertEqual(app._bar_label.text, "K线周期（本策略固定）")
+        self.assertEqual(app._ema_label.text, "EMA小周期（本策略固定）")
+        self.assertEqual(app._trend_ema_label.text, "EMA中周期（本策略固定）")
+        self.assertEqual(app._big_ema_label.text, "EMA大周期（本策略固定）")
+        self.assertEqual(app._signal_label.text, "信号方向")
+
+    def test_apply_strategy_parameter_fixed_labels_marks_dynamic_direction_only(self) -> None:
+        app = self._make_label_stub()
+
+        QuantApp._apply_strategy_parameter_fixed_labels(app, STRATEGY_DYNAMIC_LONG_ID)
+
+        self.assertEqual(app._signal_label.text, "信号方向（本策略固定）")
+        self.assertEqual(app._bar_label.text, "K线周期")
+        self.assertEqual(app._ema_label.text, "EMA小周期")

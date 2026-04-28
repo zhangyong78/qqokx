@@ -7,6 +7,7 @@ from okx_quant.persistence import (
     credentials_file_path,
     load_credentials_snapshot,
     load_option_strategies_snapshot,
+    load_strategy_parameter_drafts,
     load_smart_order_favorites_snapshot,
     load_strategy_history_snapshot,
     load_strategy_trade_ledger_snapshot,
@@ -14,9 +15,11 @@ from okx_quant.persistence import (
     save_credentials_snapshot,
     save_option_strategies_snapshot,
     save_smart_order_favorites_snapshot,
+    save_strategy_parameter_drafts,
     save_strategy_history_snapshot,
     save_strategy_trade_ledger_snapshot,
     smart_order_favorites_file_path,
+    strategy_parameter_drafts_file_path,
     strategy_history_file_path,
     strategy_trade_ledger_file_path,
 )
@@ -84,6 +87,35 @@ class PersistenceTest(TestCase):
             snapshot["favorites"],
             [{"inst_type": "OPTION", "inst_id": "BTC-USD-260410-66000-P"}],
         )
+
+    def test_save_and_load_strategy_parameter_drafts(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        temp_path = strategy_parameter_drafts_file_path(temp_dir)
+        save_strategy_parameter_drafts(
+            {
+                "launcher": {
+                    "ema_cross_market": {
+                        "bar": "1H",
+                        "ema_period": "21",
+                        "trend_ema_period": "55",
+                    }
+                },
+                "backtest": {
+                    "ema_dynamic_order_short": {
+                        "bar": "4小时",
+                        "entry_reference_ema_period": "21",
+                    }
+                },
+            },
+            temp_path,
+        )
+
+        snapshot = load_strategy_parameter_drafts(temp_path)
+
+        self.assertEqual(snapshot["launcher"]["ema_cross_market"]["bar"], "1H")
+        self.assertEqual(snapshot["launcher"]["ema_cross_market"]["ema_period"], "21")
+        self.assertEqual(snapshot["backtest"]["ema_dynamic_order_short"]["entry_reference_ema_period"], "21")
+        self.assertEqual(snapshot["observer"], {})
 
     def test_save_and_load_option_strategy_snapshot(self) -> None:
         temp_dir = self._workspace_temp_dir()

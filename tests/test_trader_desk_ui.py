@@ -21,6 +21,7 @@ from okx_quant.trader_desk_ui import (
     _gate_condition_label,
     _gate_condition_value,
     _normalize_draft_form_values,
+    _format_optional_compact_price,
     _payload_bar,
     _replace_text_preserving_scroll,
     _run_status_label,
@@ -129,12 +130,12 @@ class TraderDeskHelpersTest(TestCase):
         self.assertEqual(_run_status_label("quota_exhausted"), "额度耗尽")
 
     def test_slot_status_label_uses_chinese_text(self) -> None:
-        self.assertEqual(_slot_status_label("watching"), "观察中")
+        self.assertEqual(_slot_status_label("watching"), "等待开仓")
         self.assertEqual(_slot_status_label("open"), "持仓中")
         self.assertEqual(_slot_status_label("closed_loss"), "亏损平仓")
         self.assertEqual(_slot_status_label("closed_profit"), "盈利平仓")
         self.assertEqual(_slot_status_label("closed_manual"), "人工结束")
-        self.assertEqual(_slot_status_label("stopped"), "已停止")
+        self.assertEqual(_slot_status_label("stopped"), "观察结束（未开仓）")
         self.assertEqual(_slot_status_label("failed"), "异常结束")
         self.assertEqual(
             _slot_status_label("closed_loss", close_reason="策略主动平仓", net_pnl=Decimal("-0.01")),
@@ -151,6 +152,10 @@ class TraderDeskHelpersTest(TestCase):
 
     def test_payload_bar_reads_snapshot_bar(self) -> None:
         self.assertEqual(_payload_bar(self._payload()), "15m")
+
+    def test_format_optional_compact_price_limits_repeating_decimals(self) -> None:
+        self.assertEqual(_format_optional_compact_price(Decimal("2289.3833333333333333")), "2289.3833")
+        self.assertEqual(_format_optional_compact_price(Decimal("85.8300")), "85.83")
 
     def test_should_reload_draft_form_skips_same_selection_while_dirty(self) -> None:
         should_reload = _should_reload_draft_form(

@@ -1,0 +1,38 @@
+from unittest import TestCase
+
+from okx_quant.strategy_catalog import (
+    STRATEGY_CROSS_ID,
+    STRATEGY_DYNAMIC_LONG_ID,
+    STRATEGY_DYNAMIC_SHORT_ID,
+    STRATEGY_EMA5_EMA8_ID,
+)
+from okx_quant.strategy_parameters import (
+    iter_strategy_parameter_keys,
+    strategy_fixed_value,
+    strategy_is_parameter_editable,
+    strategy_uses_parameter,
+)
+
+
+class StrategyParametersTest(TestCase):
+    def test_cross_strategy_uses_big_ema(self) -> None:
+        self.assertTrue(strategy_uses_parameter(STRATEGY_CROSS_ID, "big_ema_period"))
+
+    def test_dynamic_short_strategy_uses_entry_reference_parameter(self) -> None:
+        self.assertTrue(strategy_uses_parameter(STRATEGY_DYNAMIC_SHORT_ID, "entry_reference_ema_period"))
+
+    def test_dynamic_long_strategy_fixed_signal_mode_is_long_only(self) -> None:
+        self.assertEqual(strategy_fixed_value(STRATEGY_DYNAMIC_LONG_ID, "signal_mode"), "long_only")
+        self.assertFalse(strategy_is_parameter_editable(STRATEGY_DYNAMIC_LONG_ID, "signal_mode", "launcher"))
+
+    def test_ema5_ema8_strategy_has_fixed_bar_and_ema_periods(self) -> None:
+        self.assertEqual(strategy_fixed_value(STRATEGY_EMA5_EMA8_ID, "bar"), "4H")
+        self.assertEqual(strategy_fixed_value(STRATEGY_EMA5_EMA8_ID, "ema_period"), 5)
+        self.assertEqual(strategy_fixed_value(STRATEGY_EMA5_EMA8_ID, "trend_ema_period"), 8)
+        self.assertEqual(strategy_fixed_value(STRATEGY_EMA5_EMA8_ID, "big_ema_period"), 233)
+        self.assertFalse(strategy_is_parameter_editable(STRATEGY_EMA5_EMA8_ID, "bar", "backtest"))
+        self.assertFalse(strategy_is_parameter_editable(STRATEGY_EMA5_EMA8_ID, "ema_period", "launcher"))
+
+    def test_strategy_parameter_keys_stay_strategy_specific(self) -> None:
+        self.assertNotIn("entry_reference_ema_period", iter_strategy_parameter_keys(STRATEGY_CROSS_ID))
+        self.assertIn("entry_reference_ema_period", iter_strategy_parameter_keys(STRATEGY_DYNAMIC_LONG_ID))

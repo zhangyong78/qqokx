@@ -54,12 +54,14 @@ from okx_quant.persistence import (
     load_credentials_profiles_snapshot,
     load_notification_snapshot,
     load_position_notes_snapshot,
+    load_strategy_parameter_drafts,
     load_strategy_history_snapshot,
     load_strategy_trade_ledger_snapshot,
     save_recoverable_strategy_sessions_snapshot,
     save_credentials_profiles_snapshot,
     save_notification_snapshot,
     save_position_notes_snapshot,
+    save_strategy_parameter_drafts,
     save_strategy_history_snapshot,
     settings_file_path,
     strategy_history_file_path,
@@ -111,6 +113,7 @@ from okx_quant.strategy_live_chart import (
 from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_DEFINITIONS,
+    STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
@@ -120,6 +123,13 @@ from okx_quant.strategy_catalog import (
     is_dynamic_strategy_id,
     resolve_dynamic_signal_mode,
     supports_signal_only,
+)
+from okx_quant.strategy_parameters import (
+    iter_strategy_parameter_keys,
+    strategy_fixed_value,
+    strategy_is_parameter_editable,
+    strategy_parameter_default_value,
+    strategy_uses_parameter,
 )
 from okx_quant.window_layout import (
     apply_adaptive_window_geometry,
@@ -638,6 +648,7 @@ class StrategySession:
     last_close_reason: str = ""
     trader_id: str = ""
     trader_slot_id: str = ""
+    email_notifications_enabled: bool = True
 
     @property
     def log_prefix(self) -> str:
@@ -1856,6 +1867,9 @@ class QuantApp:
         self.fixed_order_size_hint_text = StringVar(
             value="固定数量=OKX下单数量(sz)，不是USDT；若填写风险金，则优先按风险金计算。"
         )
+        self.launch_parameter_hint_text = StringVar(value="")
+        self.trend_parameter_hint_text = StringVar(value="")
+        self.dynamic_protection_hint_text = StringVar(value="")
         self.poll_seconds = StringVar(value="10")
         self.signal_mode_label = StringVar(value=STRATEGY_DEFINITIONS[0].default_signal_label)
         self.take_profit_mode_label = StringVar(value="动态止盈")
@@ -1876,6 +1890,20 @@ class QuantApp:
         self.trade_symbol.trace_add("write", self._on_fixed_order_size_symbol_changed)
         self.risk_amount.trace_add("write", self._update_fixed_order_size_hint)
         self.order_size.trace_add("write", self._update_fixed_order_size_hint)
+        self.stop_atr.trace_add("write", self._update_launch_parameter_hint)
+        self.take_atr.trace_add("write", self._update_launch_parameter_hint)
+        self.take_profit_mode_label.trace_add("write", self._update_launch_parameter_hint)
+        self.take_profit_mode_label.trace_add("write", self._update_dynamic_protection_hint)
+        self.max_entries_per_trend.trace_add("write", self._update_launch_parameter_hint)
+        self.startup_chase_window_seconds.trace_add("write", self._update_launch_parameter_hint)
+        self.ema_period.trace_add("write", self._update_trend_parameter_hint)
+        self.trend_ema_period.trace_add("write", self._update_trend_parameter_hint)
+        self.big_ema_period.trace_add("write", self._update_trend_parameter_hint)
+        self.entry_reference_ema_period.trace_add("write", self._update_trend_parameter_hint)
+        self.dynamic_two_r_break_even.trace_add("write", self._update_dynamic_protection_hint)
+        self.dynamic_fee_offset_enabled.trace_add("write", self._update_dynamic_protection_hint)
+        self.time_stop_break_even_enabled.trace_add("write", self._update_dynamic_protection_hint)
+        self.time_stop_break_even_bars.trace_add("write", self._update_dynamic_protection_hint)
         self.time_stop_break_even_enabled.trace_add("write", lambda *_: self._sync_dynamic_take_profit_controls())
         self.run_mode_label.trace_add("write", lambda *_: self._sync_entry_side_mode_controls())
         self.tp_sl_mode_label.trace_add("write", lambda *_: self._sync_entry_side_mode_controls())
@@ -1933,6 +1961,7 @@ class QuantApp:
 
         self.status_text = StringVar(value="运行中策略：0")
         self.session_summary_text = StringVar(value="多策略合计：当前没有运行中的策略。")
+        self.global_email_toggle_text = StringVar(value="发邮件：开")
         self.settings_summary_text = StringVar()
         self.strategy_summary_text = StringVar()
         self.strategy_rule_text = StringVar()
@@ -2011,6 +2040,9 @@ class QuantApp:
         self._load_recoverable_strategy_sessions_registry()
         self._load_strategy_history()
         self._load_strategy_trade_ledger()
+        self._strategy_parameter_drafts = load_strategy_parameter_drafts()
+        self._strategy_parameter_scope = "launcher"
+        self._last_strategy_parameter_strategy_id: str | None = None
         self._load_trader_desk_snapshot()
         self._build_menu()
         self._build_layout()
@@ -2029,7 +2061,117 @@ class QuantApp:
 
     @staticmethod
     def _strategy_uses_big_ema(strategy_id: str) -> bool:
-        return strategy_id == STRATEGY_EMA5_EMA8_ID
+        return strategy_uses_parameter(strategy_id, "big_ema_period")
+
+    @staticmethod
+    def _set_field_state(widget: object, *, editable: bool) -> None:
+        if isinstance(widget, ttk.Combobox):
+            widget.configure(state="readonly" if editable else "disabled")
+            return
+        try:
+            widget.configure(state="normal" if editable else "readonly")
+        except Exception:
+            try:
+                widget.configure(state="normal" if editable else "disabled")
+            except Exception:
+                pass
+
+    def _strategy_parameter_scope_drafts(self) -> dict[str, object]:
+        drafts = self._strategy_parameter_drafts.get(self._strategy_parameter_scope)
+        if not isinstance(drafts, dict):
+            drafts = {}
+            self._strategy_parameter_drafts[self._strategy_parameter_scope] = drafts
+        return drafts
+
+    def _strategy_parameter_bindings(self) -> dict[str, object]:
+        return {
+            "bar": self.bar,
+            "signal_mode": self.signal_mode_label,
+            "ema_period": self.ema_period,
+            "trend_ema_period": self.trend_ema_period,
+            "big_ema_period": self.big_ema_period,
+            "atr_period": self.atr_period,
+            "atr_stop_multiplier": self.stop_atr,
+            "atr_take_multiplier": self.take_atr,
+            "entry_reference_ema_period": self.entry_reference_ema_period,
+            "take_profit_mode": self.take_profit_mode_label,
+            "max_entries_per_trend": self.max_entries_per_trend,
+            "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
+            "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
+            "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
+            "time_stop_break_even_bars": self.time_stop_break_even_bars,
+            "startup_chase_window_seconds": self.startup_chase_window_seconds,
+        }
+
+    def _capture_strategy_parameter_draft(self, strategy_id: str) -> dict[str, object]:
+        values: dict[str, object] = {}
+        bindings = self._strategy_parameter_bindings()
+        for key in iter_strategy_parameter_keys(strategy_id):
+            variable = bindings.get(key)
+            if variable is None:
+                continue
+            values[key] = variable.get()
+        return values
+
+    def _save_strategy_parameter_draft(self, strategy_id: str | None = None) -> None:
+        target_strategy_id = strategy_id or self._last_strategy_parameter_strategy_id
+        if not target_strategy_id:
+            return
+        scope_drafts = self._strategy_parameter_scope_drafts()
+        scope_drafts[target_strategy_id] = self._capture_strategy_parameter_draft(target_strategy_id)
+        save_strategy_parameter_drafts(self._strategy_parameter_drafts)
+
+    def _restore_strategy_parameter_draft(self, strategy_id: str) -> None:
+        bindings = self._strategy_parameter_bindings()
+        draft_payload = self._strategy_parameter_scope_drafts().get(strategy_id)
+        draft = draft_payload if isinstance(draft_payload, dict) else {}
+        definition = get_strategy_definition(strategy_id)
+        for key in iter_strategy_parameter_keys(strategy_id):
+            variable = bindings.get(key)
+            if variable is None:
+                continue
+            if key in draft:
+                variable.set(draft[key])
+                continue
+            default_value = strategy_parameter_default_value(key)
+            if default_value is None:
+                continue
+            if key == "signal_mode":
+                variable.set(_reverse_lookup_label(SIGNAL_LABEL_TO_VALUE, str(default_value), definition.default_signal_label))
+            elif key == "take_profit_mode":
+                variable.set(_reverse_lookup_label(TAKE_PROFIT_MODE_OPTIONS, str(default_value), self.take_profit_mode_label.get()))
+            else:
+                variable.set(default_value)
+        for key in iter_strategy_parameter_keys(strategy_id):
+            fixed_value = strategy_fixed_value(strategy_id, key)
+            if fixed_value is None:
+                continue
+            variable = bindings.get(key)
+            if variable is None:
+                continue
+            if key == "signal_mode":
+                variable.set(_reverse_lookup_label(SIGNAL_LABEL_TO_VALUE, str(fixed_value), definition.default_signal_label))
+            else:
+                variable.set(fixed_value)
+
+    def _resolve_strategy_parameter_value(self, strategy_id: str, key: str, current_value: object) -> object:
+        fixed_value = strategy_fixed_value(strategy_id, key)
+        if fixed_value is not None:
+            return fixed_value
+        return current_value
+
+    def _apply_strategy_parameter_fixed_labels(self, strategy_id: str) -> None:
+        fixed_suffix = "（本策略固定）"
+        label_map = {
+            "bar": (self._bar_label, "K线周期"),
+            "signal_mode": (self._signal_label, "信号方向"),
+            "ema_period": (self._ema_label, "EMA小周期"),
+            "trend_ema_period": (self._trend_ema_label, "EMA中周期"),
+            "big_ema_period": (self._big_ema_label, "EMA大周期"),
+        }
+        for key, (widget, base_text) in label_map.items():
+            text = f"{base_text}{fixed_suffix}" if strategy_fixed_value(strategy_id, key) is not None else base_text
+            widget.configure(text=text)
 
     def _build_menu(self) -> None:
         menu_bar = Menu(self.root)
@@ -2139,11 +2281,12 @@ class QuantApp:
         self.symbol_combo.grid(row=row, column=3, sticky="ew")
 
         row += 1
-        ttk.Label(start_frame, text="K线周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Combobox(start_frame, textvariable=self.bar, values=BAR_OPTIONS, state="readonly").grid(
-            row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
-        )
-        ttk.Label(start_frame, text="信号方向").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self._bar_label = ttk.Label(start_frame, text="K线周期")
+        self._bar_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self._bar_combo = ttk.Combobox(start_frame, textvariable=self.bar, values=BAR_OPTIONS, state="readonly")
+        self._bar_combo.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
+        self._signal_label = ttk.Label(start_frame, text="信号方向")
+        self._signal_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
         self.signal_combo = ttk.Combobox(start_frame, textvariable=self.signal_mode_label, state="readonly")
         self.signal_combo.grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
@@ -2210,6 +2353,14 @@ class QuantApp:
         self._time_stop_break_even_bars_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row += 1
+        ttk.Label(
+            start_frame,
+            textvariable=self.dynamic_protection_hint_text,
+            justify="left",
+            wraplength=760,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        row += 1
         ttk.Label(start_frame, text="运行模式").grid(row=row, column=0, sticky="w", pady=(12, 0))
         ttk.Combobox(
             start_frame,
@@ -2221,14 +2372,14 @@ class QuantApp:
         ttk.Entry(start_frame, textvariable=self.poll_seconds).grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
         row += 1
-        ttk.Label(start_frame, text="EMA小周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(start_frame, textvariable=self.ema_period).grid(
-            row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
-        )
-        ttk.Label(start_frame, text="EMA中周期").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(start_frame, textvariable=self.trend_ema_period).grid(
-            row=row, column=3, sticky="ew", pady=(12, 0)
-        )
+        self._ema_label = ttk.Label(start_frame, text="EMA小周期")
+        self._ema_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self._ema_entry = ttk.Entry(start_frame, textvariable=self.ema_period)
+        self._ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
+        self._trend_ema_label = ttk.Label(start_frame, text="EMA中周期")
+        self._trend_ema_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self._trend_ema_entry = ttk.Entry(start_frame, textvariable=self.trend_ema_period)
+        self._trend_ema_entry.grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
         row += 1
         self._big_ema_label = ttk.Label(start_frame, text="EMA大周期")
@@ -2239,18 +2390,36 @@ class QuantApp:
         self._entry_reference_ema_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
         self._entry_reference_ema_entry = ttk.Entry(start_frame, textvariable=self.entry_reference_ema_period)
         self._entry_reference_ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
-        ttk.Label(start_frame, text="ATR 周期").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(start_frame, textvariable=self.atr_period).grid(
-            row=row, column=3, sticky="ew", pady=(12, 0)
-        )
+        self._atr_label = ttk.Label(start_frame, text="ATR 周期")
+        self._atr_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self._atr_entry = ttk.Entry(start_frame, textvariable=self.atr_period)
+        self._atr_entry.grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
         row += 1
-        ttk.Label(start_frame, text="止损 ATR 倍数").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(start_frame, textvariable=self.stop_atr).grid(
-            row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
-        )
-        ttk.Label(start_frame, text="止盈 ATR 倍数").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(start_frame, textvariable=self.take_atr).grid(row=row, column=3, sticky="ew", pady=(12, 0))
+        ttk.Label(
+            start_frame,
+            textvariable=self.trend_parameter_hint_text,
+            justify="left",
+            wraplength=760,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        row += 1
+        self._stop_atr_label = ttk.Label(start_frame, text="止损 ATR 倍数")
+        self._stop_atr_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self._stop_atr_entry = ttk.Entry(start_frame, textvariable=self.stop_atr)
+        self._stop_atr_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
+        self._take_atr_label = ttk.Label(start_frame, text="止盈 ATR 倍数")
+        self._take_atr_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self._take_atr_entry = ttk.Entry(start_frame, textvariable=self.take_atr)
+        self._take_atr_entry.grid(row=row, column=3, sticky="ew", pady=(12, 0))
+
+        row += 1
+        ttk.Label(
+            start_frame,
+            textvariable=self.launch_parameter_hint_text,
+            justify="left",
+            wraplength=760,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         row += 1
         ttk.Label(start_frame, text="风险金").grid(row=row, column=0, sticky="w", pady=(12, 0))
@@ -2393,6 +2562,7 @@ class QuantApp:
             columns=(
                 "session",
                 "trader",
+                "email",
                 "api",
                 "source_type",
                 "strategy",
@@ -2410,6 +2580,7 @@ class QuantApp:
         )
         self.session_tree.heading("session", text="会话")
         self.session_tree.heading("trader", text="交易员")
+        self.session_tree.heading("email", text="邮件(双击切换)")
         self.session_tree.heading("api", text="API")
         self.session_tree.heading("source_type", text="来源类型")
         self.session_tree.heading("strategy", text="策略")
@@ -2423,6 +2594,7 @@ class QuantApp:
         self.session_tree.heading("started", text="启动时间")
         self.session_tree.column("session", width=56, anchor="center")
         self.session_tree.column("trader", width=72, anchor="center")
+        self.session_tree.column("email", width=56, anchor="center")
         self.session_tree.column("api", width=80, anchor="center")
         self.session_tree.column("source_type", width=98, anchor="center")
         self.session_tree.column("strategy", width=120, anchor="w")
@@ -2436,6 +2608,7 @@ class QuantApp:
         self.session_tree.column("started", width=96, anchor="center")
         self.session_tree.grid(row=1, column=0, sticky="nsew")
         self.session_tree.bind("<<TreeviewSelect>>", self._on_session_selected)
+        self.session_tree.bind("<Double-1>", self._on_session_tree_double_click)
         self.session_tree.tag_configure("duplicate_conflict", background="#fff4e5", foreground="#a85a00")
 
         tree_scroll = ttk.Scrollbar(running_frame, orient="vertical", command=self.session_tree.yview)
@@ -2445,33 +2618,42 @@ class QuantApp:
         control_row = ttk.Frame(running_frame)
         control_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Button(control_row, text="\u505c\u6b62\u9009\u4e2d\u7b56\u7565", command=self.stop_selected_session).grid(row=0, column=0)
-        ttk.Button(control_row, text="\u5b9e\u65f6K\u7ebf\u56fe", command=self.open_selected_strategy_live_chart).grid(
+        ttk.Button(control_row, textvariable=self.global_email_toggle_text, command=self.toggle_global_email_notifications).grid(
             row=0, column=1, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u4fe1\u53f7\u89c2\u5bdf\u53f0", command=self.open_signal_monitor_window).grid(
+        ttk.Button(control_row, text="\u5f00\u542f\u90ae\u4ef6", command=self.enable_selected_session_email_notifications).grid(
             row=0,
             column=2,
             padx=(8, 0),
         )
-        ttk.Button(control_row, text="\u4ea4\u6613\u5458\u7ba1\u7406\u53f0", command=self.open_trader_desk_window).grid(
+        ttk.Button(control_row, text="\u5173\u95ed\u90ae\u4ef6", command=self.disable_selected_session_email_notifications).grid(
             row=0,
             column=3,
             padx=(8, 0),
         )
-        ttk.Button(control_row, text="\u6e05\u7a7a\u5df2\u505c\u6b62", command=self.clear_stopped_sessions).grid(
+        ttk.Button(control_row, text="\u5b9e\u65f6K\u7ebf\u56fe", command=self.open_selected_strategy_live_chart).grid(
             row=0, column=4, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u5386\u53f2\u7b56\u7565", command=self.open_strategy_history_window).grid(
+        ttk.Button(control_row, text="\u4fe1\u53f7\u89c2\u5bdf\u53f0", command=self.open_signal_monitor_window).grid(
             row=0, column=5, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u7b56\u7565\u603b\u8d26\u672c", command=self.open_strategy_book_window).grid(
+        ttk.Button(control_row, text="\u4ea4\u6613\u5458\u7ba1\u7406\u53f0", command=self.open_trader_desk_window).grid(
             row=0, column=6, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u5bfc\u51fa\u9009\u4e2d\u53c2\u6570", command=self.export_selected_session_template).grid(
+        ttk.Button(control_row, text="\u6e05\u7a7a\u5df2\u505c\u6b62", command=self.clear_stopped_sessions).grid(
             row=0, column=7, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u5bfc\u5165\u7b56\u7565\u53c2\u6570", command=self.import_strategy_template).grid(
+        ttk.Button(control_row, text="\u5386\u53f2\u7b56\u7565", command=self.open_strategy_history_window).grid(
             row=0, column=8, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="\u7b56\u7565\u603b\u8d26\u672c", command=self.open_strategy_book_window).grid(
+            row=0, column=9, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="\u5bfc\u51fa\u9009\u4e2d\u53c2\u6570", command=self.export_selected_session_template).grid(
+            row=0, column=10, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="\u5bfc\u5165\u7b56\u7565\u53c2\u6570", command=self.import_strategy_template).grid(
+            row=0, column=11, padx=(8, 0)
         )
 
         detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)
@@ -7508,6 +7690,7 @@ class QuantApp:
         self.notify_trade_fills.set(bool(snapshot["notify_trade_fills"]))
         self.notify_signals.set(bool(snapshot["notify_signals"]))
         self.notify_errors.set(bool(snapshot["notify_errors"]))
+        self._refresh_global_email_toggle_text()
         self._default_environment_label = self._normalized_environment_label(str(snapshot["environment_label"]))
         self.environment_label.set(self._default_environment_label)
         self._apply_profile_environment(self._current_credential_profile())
@@ -7579,6 +7762,9 @@ class QuantApp:
     def _on_notification_settings_changed(self, *_: str) -> None:
         if not self._settings_watch_enabled:
             return
+        self._refresh_global_email_toggle_text()
+        self._refresh_running_session_tree()
+        self._refresh_selected_session_details()
         self._on_settings_changed()
         if self._settings_save_job is not None:
             self.root.after_cancel(self._settings_save_job)
@@ -7815,6 +8001,40 @@ class QuantApp:
 
     def _on_fixed_order_size_symbol_changed(self, *_: str) -> None:
         self._update_fixed_order_size_hint(fetch_instrument_if_missing=True)
+
+    def _update_launch_parameter_hint(self, *_: str) -> None:
+        self.launch_parameter_hint_text.set(
+            _build_launch_parameter_hint_text(
+                stop_atr_raw=self.stop_atr.get(),
+                take_atr_raw=self.take_atr.get(),
+                take_profit_mode_label=self.take_profit_mode_label.get(),
+                max_entries_raw=self.max_entries_per_trend.get(),
+                startup_chase_window_raw=self.startup_chase_window_seconds.get(),
+            )
+        )
+
+    def _update_trend_parameter_hint(self, *_: str) -> None:
+        definition = self._selected_strategy_definition()
+        self.trend_parameter_hint_text.set(
+            _build_trend_parameter_hint_text(
+                strategy_id=definition.strategy_id,
+                ema_period_raw=self.ema_period.get(),
+                trend_ema_period_raw=self.trend_ema_period.get(),
+                big_ema_period_raw=self.big_ema_period.get(),
+                entry_reference_ema_period_raw=self.entry_reference_ema_period.get(),
+            )
+        )
+
+    def _update_dynamic_protection_hint(self, *_: str) -> None:
+        self.dynamic_protection_hint_text.set(
+            _build_dynamic_protection_hint_text(
+                take_profit_mode_label=self.take_profit_mode_label.get(),
+                dynamic_two_r_break_even_enabled=self.dynamic_two_r_break_even.get(),
+                dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get(),
+                time_stop_break_even_enabled=self.time_stop_break_even_enabled.get(),
+                time_stop_break_even_bars_raw=self.time_stop_break_even_bars.get(),
+            )
+        )
 
     def _update_fixed_order_size_hint(self, *_: str, fetch_instrument_if_missing: bool = False) -> None:
         symbol = _normalize_symbol_input(self.trade_symbol.get()) or _normalize_symbol_input(self.symbol.get())
@@ -8651,6 +8871,9 @@ class QuantApp:
         self._trader_desk_runs = list(snapshot.runs)
         self._trader_desk_slots = list(snapshot.slots)
         self._trader_desk_events = list(snapshot.events)
+        for slot in self._trader_desk_slots:
+            self._update_session_counter_from_session_id(slot.session_id)
+        self._repair_trader_desk_slots_from_trade_ledger()
 
     def _save_trader_desk_snapshot(self) -> None:
         try:
@@ -8665,6 +8888,39 @@ class QuantApp:
             slots=list(self._trader_desk_slots),
             events=list(self._trader_desk_events),
         )
+
+    def _repair_trader_desk_slots_from_trade_ledger(self) -> None:
+        ledger_by_history_id = {
+            record.history_record_id: record
+            for record in self._strategy_trade_ledger_records
+            if record.history_record_id
+        }
+        changed = False
+        for slot in self._trader_desk_slots:
+            if slot.status not in {"closed_profit", "closed_loss", "closed_manual"}:
+                continue
+            history_record_id = str(slot.history_record_id or "").strip()
+            if not history_record_id:
+                continue
+            ledger_record = ledger_by_history_id.get(history_record_id)
+            if ledger_record is None:
+                continue
+            updated_fields = {
+                "opened_at": ledger_record.opened_at,
+                "closed_at": ledger_record.closed_at,
+                "released_at": ledger_record.closed_at,
+                "entry_price": ledger_record.entry_price,
+                "exit_price": ledger_record.exit_price,
+                "size": ledger_record.size,
+                "net_pnl": ledger_record.net_pnl or Decimal("0"),
+                "close_reason": ledger_record.close_reason or slot.close_reason,
+            }
+            for field_name, field_value in updated_fields.items():
+                if getattr(slot, field_name) != field_value:
+                    setattr(slot, field_name, field_value)
+                    changed = True
+        if changed:
+            self._save_trader_desk_snapshot()
 
     @staticmethod
     def _session_runtime_snapshot_for_ui(session: StrategySession) -> dict[str, object]:
@@ -8733,14 +8989,31 @@ class QuantApp:
         self._trader_desk_runs.append(run)
         return run
 
-    def _trader_desk_slot_for_session(self, session_id: str) -> TraderSlotRecord | None:
+    def _trader_desk_slot_for_session(
+        self,
+        session_id: str,
+        trader_slot_id: str = "",
+    ) -> TraderSlotRecord | None:
+        normalized_slot_id = trader_slot_id.strip()
+        if normalized_slot_id:
+            for slot in self._trader_desk_slots:
+                if slot.slot_id == normalized_slot_id:
+                    return slot
         normalized = session_id.strip()
         if not normalized:
             return None
-        for slot in self._trader_desk_slots:
-            if slot.session_id == normalized:
-                return slot
-        return None
+        active_statuses = {"watching", "open"}
+        active_matches = [
+            slot
+            for slot in self._trader_desk_slots
+            if slot.session_id == normalized and slot.status in active_statuses
+        ]
+        if active_matches:
+            return max(active_matches, key=lambda item: (item.created_at, item.slot_id))
+        all_matches = [slot for slot in self._trader_desk_slots if slot.session_id == normalized]
+        if not all_matches:
+            return None
+        return max(all_matches, key=lambda item: (item.created_at, item.slot_id))
 
     def _trader_desk_slots_for_statuses(self, trader_id: str, statuses: set[str]) -> list[TraderSlotRecord]:
         return [slot for slot in trader_slots_for(self._trader_desk_slots, trader_id) if slot.status in statuses]
@@ -8764,6 +9037,13 @@ class QuantApp:
             event_id = f"{base}-{suffix}"
             suffix += 1
         return event_id
+
+    def _update_session_counter_from_session_id(self, session_id: str) -> None:
+        normalized = str(session_id or "").strip().upper()
+        match = re.fullmatch(r"S(\d+)", normalized)
+        if match is None:
+            return
+        self._session_counter = max(self._session_counter, int(match.group(1)))
 
     def _trader_desk_add_event(self, trader_id: str, message: str, *, level: str = "info") -> None:
         text = str(message or "").strip()
@@ -8882,6 +9162,8 @@ class QuantApp:
             raise ValueError("未找到对应的交易员草稿。")
         if run.status not in {"running", "quota_exhausted"}:
             return False
+        if run.armed_session_id:
+            return False
         if trader_has_watching_slot(self._trader_desk_slots, trader_id):
             return False
         remaining = trader_remaining_quota_steps(draft, self._trader_desk_slots)
@@ -8933,6 +9215,7 @@ class QuantApp:
             trader_virtual_stop_loss=True,
         )
         notifier = self._build_notifier(config)
+        run.armed_session_id = "__starting__"
         try:
             session_id = self._start_strategy_session(
                 definition=definition,
@@ -8953,6 +9236,7 @@ class QuantApp:
                 trader_slot_id=slot_id,
             )
         except Exception as exc:
+            run.armed_session_id = ""
             run.status = "stopped"
             run.paused_reason = str(exc)
             run.updated_at = datetime.now()
@@ -9500,6 +9784,7 @@ class QuantApp:
             symbol=session_symbol,
             api_name=api_name,
         ).resolve()
+        session_notifier = self._build_session_notifier(config, session_id) if notifier is not None else None
         engine = self._create_session_engine(
             strategy_id=definition.strategy_id,
             strategy_name=definition.name,
@@ -9507,7 +9792,7 @@ class QuantApp:
             symbol=session_symbol,
             api_name=api_name,
             log_file_path=session_log_path,
-            notifier=notifier,
+            notifier=session_notifier,
             direction_label=direction_label,
             run_mode_label=run_mode_label,
             trader_id=trader_id.strip(),
@@ -9610,6 +9895,7 @@ class QuantApp:
         credentials = self._credentials_for_profile_or_none(session.api_name)
         session.status = "停止中"
         session.stop_cleanup_in_progress = True
+        session.stop_result_show_dialog = show_dialog
         session.ended_reason = ended_reason
         session.engine.stop()
         self._upsert_session_row(session)
@@ -9812,6 +10098,8 @@ class QuantApp:
         session = self.sessions.get(result.session_id)
         if session is None:
             return
+        show_dialog = bool(getattr(session, "stop_result_show_dialog", True))
+        session.stop_result_show_dialog = True
         session.stop_cleanup_in_progress = False
         session.status = "已停止"
         if session.stopped_at is None:
@@ -9866,22 +10154,26 @@ class QuantApp:
                     details.append(f"- {summary}")
             details.append("")
             details.append("请人工检查“当前委托 / 账户持仓 / OKX 托管止损”，再决定是否保留、撤单或平仓。")
-            messagebox.showwarning("停止提醒", "\n".join(details))
+            if show_dialog:
+                messagebox.showwarning("停止提醒", "\n".join(details))
             return
 
-        messagebox.showinfo(
-            "停止结果",
-            (
-                "策略已停止。\n\n"
-                f"自动撤单：{len(result.cancel_requested_summaries)} 条\n"
-                "未发现残留仓位或需人工接管的问题。"
-            ),
-        )
+        if show_dialog:
+            messagebox.showinfo(
+                "停止结果",
+                (
+                    "策略已停止。\n\n"
+                    f"自动撤单：{len(result.cancel_requested_summaries)} 条\n"
+                    "未发现残留仓位或需人工接管的问题。"
+                ),
+            )
 
     def _apply_stop_session_cleanup_error(self, session_id: str, message: str) -> None:
         session = self.sessions.get(session_id)
         if session is None:
             return
+        show_dialog = bool(getattr(session, "stop_result_show_dialog", True))
+        session.stop_result_show_dialog = True
         session.stop_cleanup_in_progress = False
         session.status = "已停止"
         if session.stopped_at is None:
@@ -9894,12 +10186,13 @@ class QuantApp:
         self._sync_strategy_history_from_session(session)
         self._log_session_message(session, f"停止清理失败：{friendly_message}")
         self._log_session_message(session, "请人工检查当前委托、历史委托与账户持仓。")
-        messagebox.showwarning(
-            "停止提醒",
-            "策略线程已收到停止请求，但停止清理阶段失败。\n\n"
-            f"原因：{friendly_message}\n\n"
-            "请人工检查：\n- 当前委托是否仍有残留\n- 是否已经成交并留下仓位\n- OKX 托管止损是否仍在",
-        )
+        if show_dialog:
+            messagebox.showwarning(
+                "停止提醒",
+                "策略线程已收到停止请求，但停止清理阶段失败。\n\n"
+                f"原因：{friendly_message}\n\n"
+                "请人工检查：\n- 当前委托是否仍有残留\n- 是否已经成交并留下仓位\n- OKX 托管止损是否仍在",
+            )
 
     @staticmethod
     def _session_can_be_cleared(session: StrategySession) -> bool:
@@ -10708,10 +11001,26 @@ class QuantApp:
 
     def _apply_selected_strategy_definition(self) -> None:
         definition = self._selected_strategy_definition()
+        strategy_id = definition.strategy_id
+        previous_strategy_id = self._last_strategy_parameter_strategy_id
+        if previous_strategy_id and previous_strategy_id != strategy_id:
+            self._save_strategy_parameter_draft(previous_strategy_id)
+        self._restore_strategy_parameter_draft(strategy_id)
+        dynamic_strategy = is_dynamic_strategy_id(strategy_id)
         self.signal_combo["values"] = definition.allowed_signal_labels
-        if self.signal_mode_label.get() not in definition.allowed_signal_labels:
+        fixed_signal_mode = strategy_fixed_value(strategy_id, "signal_mode")
+        if fixed_signal_mode is not None:
+            self.signal_mode_label.set(_reverse_lookup_label(SIGNAL_LABEL_TO_VALUE, str(fixed_signal_mode), definition.default_signal_label))
+        elif self.signal_mode_label.get() not in definition.allowed_signal_labels:
             self.signal_mode_label.set(definition.default_signal_label)
-        if is_dynamic_strategy_id(definition.strategy_id):
+        if strategy_id == STRATEGY_EMA5_EMA8_ID:
+            self.entry_reference_ema_period.set("0")
+            self.risk_amount.set("10")
+            self.take_profit_mode_label.set("固定止盈")
+            self.max_entries_per_trend.set("0")
+            self.entry_side_mode_label.set("跟随信号")
+            self.tp_sl_mode_label.set("按交易标的价格（本地）")
+        if dynamic_strategy:
             self._take_profit_mode_label.grid()
             self._take_profit_mode_combo.grid()
             self._max_entries_per_trend_label.grid()
@@ -10725,8 +11034,6 @@ class QuantApp:
             self._time_stop_break_even_check.grid()
             self._time_stop_break_even_bars_label.grid()
             self._time_stop_break_even_bars_entry.grid()
-            self._entry_reference_ema_label.grid()
-            self._entry_reference_ema_entry.grid()
         else:
             self._take_profit_mode_label.grid_remove()
             self._take_profit_mode_combo.grid_remove()
@@ -10741,34 +11048,37 @@ class QuantApp:
             self._time_stop_break_even_check.grid_remove()
             self._time_stop_break_even_bars_label.grid_remove()
             self._time_stop_break_even_bars_entry.grid_remove()
+        if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
+            self._entry_reference_ema_label.grid()
+            self._entry_reference_ema_entry.grid()
+        else:
             self._entry_reference_ema_label.grid_remove()
             self._entry_reference_ema_entry.grid_remove()
-        if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
-            self.bar.set("4H")
-            self.ema_period.set("5")
-            self.trend_ema_period.set("8")
-            self.big_ema_period.set("233")
-            self.entry_reference_ema_period.set("0")
-            self.risk_amount.set("10")
-            self.take_profit_mode_label.set("固定止盈")
-            self.max_entries_per_trend.set("0")
-            self.entry_side_mode_label.set("跟随信号")
-            self.tp_sl_mode_label.set("按交易标的价格（本地）")
-        if self._strategy_uses_big_ema(definition.strategy_id):
+        if self._strategy_uses_big_ema(strategy_id):
             self._big_ema_label.grid()
             self._big_ema_entry.grid()
         else:
             self._big_ema_label.grid_remove()
             self._big_ema_entry.grid_remove()
-        if is_dynamic_strategy_id(definition.strategy_id) and not self.entry_reference_ema_period.get().strip():
+        self._set_field_state(self._bar_combo, editable=strategy_is_parameter_editable(strategy_id, "bar", "launcher"))
+        self._set_field_state(self._ema_entry, editable=strategy_is_parameter_editable(strategy_id, "ema_period", "launcher"))
+        self._set_field_state(self._trend_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "trend_ema_period", "launcher"))
+        self._set_field_state(self._big_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "big_ema_period", "launcher"))
+        self._set_field_state(self.signal_combo, editable=strategy_is_parameter_editable(strategy_id, "signal_mode", "launcher"))
+        self._apply_strategy_parameter_fixed_labels(strategy_id)
+        if dynamic_strategy and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
-        if is_dynamic_strategy_id(definition.strategy_id) and not self.startup_chase_window_seconds.get().strip():
+        if dynamic_strategy and not self.startup_chase_window_seconds.get().strip():
             self.startup_chase_window_seconds.set("0")
+        self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
         QuantApp._sync_entry_side_mode_controls(self)
         self.strategy_summary_text.set(definition.summary)
         self.strategy_rule_text.set(definition.rule_description)
         self.strategy_hint_text.set(definition.parameter_hint)
+        self._update_trend_parameter_hint()
+        self._update_launch_parameter_hint()
+        self._update_dynamic_protection_hint()
         self._on_fixed_order_size_symbol_changed()
 
     def _sync_dynamic_take_profit_controls(self) -> None:
@@ -10814,47 +11124,28 @@ class QuantApp:
         strategy_symbol = self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
         risk_value = self.risk_amount.get().strip() or "-"
         fixed_size = self.order_size.get().strip() or "-"
-        lines = [
-            f"策略：{definition.name}",
-            f"运行模式：{self.run_mode_label.get()}",
-            f"交易标的：{strategy_symbol}",
-            f"K线周期：{config.bar}",
-            f"信号方向：{self.signal_mode_label.get()}",
-            f"下单方向模式：{self.entry_side_mode_label.get()}",
-            f"止盈止损模式：{self.tp_sl_mode_label.get()}",
-            f"自定义触发标的：{self.local_tp_sl_symbol.get().strip().upper() or '-'}",
-            f"EMA小周期：{config.ema_period}",
-            f"EMA中周期：{config.trend_ema_period}",
-        ]
-        if is_dynamic_strategy_id(definition.strategy_id):
-            lines.extend(
-                [
-                    f"挂单参考EMA：{config.entry_reference_ema_label()}",
-                    f"止盈方式：{self.take_profit_mode_label.get()}",
-                    f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}",
-                    f"启动追单窗口：{config.startup_chase_window_label()}",
-                ]
-            )
-            if config.take_profit_mode == "dynamic":
-                lines.append(f"2R保本开关：{config.dynamic_two_r_break_even_label()}")
-                lines.append(f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}")
-                lines.append(
-                    f"时间保本：{config.time_stop_break_even_enabled_label()} / {config.resolved_time_stop_break_even_bars()}根"
-                )
-        if self._strategy_uses_big_ema(definition.strategy_id):
-            lines.append(f"EMA大周期：{config.big_ema_period}")
-        lines.extend(
-            [
-                f"ATR 周期：{config.atr_period}",
-                f"风险金：{risk_value}",
-                f"固定数量：{fixed_size}",
-                "",
-                definition.rule_description,
-                "",
-                "确认启动这个策略吗？",
-            ]
+        instrument = self._find_instrument_for_fixed_order_size_hint(
+            _normalize_symbol_input(config.trade_inst_id or config.inst_id),
         )
-        message = "\n".join(lines)
+        message = _build_strategy_start_confirmation_message(
+            strategy_name=definition.name,
+            rule_description=definition.rule_description,
+            strategy_symbol=strategy_symbol,
+            config=config,
+            run_mode_label=self.run_mode_label.get(),
+            environment_label=self.environment_label.get(),
+            trade_mode_label=self.trade_mode_label.get(),
+            position_mode_label=self.position_mode_label.get(),
+            signal_mode_label=self.signal_mode_label.get(),
+            entry_side_mode_label=self.entry_side_mode_label.get(),
+            tp_sl_mode_label=self.tp_sl_mode_label.get(),
+            trigger_type_label=self.trigger_type_label.get(),
+            take_profit_mode_label=self.take_profit_mode_label.get(),
+            risk_value=risk_value,
+            fixed_size=fixed_size,
+            custom_trigger_symbol=self.local_tp_sl_symbol.get().strip().upper(),
+            instrument=instrument,
+        )
         return messagebox.askokcancel(f"确认启动 {definition.name}", message)
 
     def _collect_inputs(self, definition: StrategyDefinition) -> tuple[Credentials, StrategyConfig]:
@@ -10869,16 +11160,20 @@ class QuantApp:
         entry_side_mode = ENTRY_SIDE_MODE_OPTIONS[self.entry_side_mode_label.get()]
         if not supports_fixed_entry_side_mode(definition.strategy_id, run_mode, tp_sl_mode):
             entry_side_mode = "follow_signal"
+        strategy_id = definition.strategy_id
         effective_signal_mode = resolve_dynamic_signal_mode(
-            definition.strategy_id,
+            strategy_id,
             SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()],
         )
+        fixed_signal_mode = strategy_fixed_value(strategy_id, "signal_mode")
+        if fixed_signal_mode is not None:
+            effective_signal_mode = str(fixed_signal_mode)
         risk_amount = self._parse_optional_positive_decimal(self.risk_amount.get(), "风险金")
         order_size = self._parse_optional_positive_decimal(self.order_size.get(), "固定数量") or Decimal("0")
         max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
         startup_chase_window_seconds = 0
         entry_reference_ema_period = 0
-        if is_dynamic_strategy_id(definition.strategy_id):
+        if is_dynamic_strategy_id(strategy_id):
             entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
             startup_chase_window_seconds = self._parse_nonnegative_int(
                 self.startup_chase_window_seconds.get(),
@@ -10907,7 +11202,7 @@ class QuantApp:
             if not notification_config.notify_signals:
                 raise ValueError("只发信号邮件模式需要勾选“信号邮件”")
 
-        if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
+        if strategy_id == STRATEGY_EMA5_EMA8_ID:
             trade_symbol = symbol
             local_tp_sl_symbol = symbol
             tp_sl_mode = "local_trade"
@@ -10917,10 +11212,28 @@ class QuantApp:
         credentials = Credentials(api_key=api_key, secret_key=secret_key, passphrase=passphrase)
         config = StrategyConfig(
             inst_id=symbol,
-            bar="4H" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self.bar.get(),
-            ema_period=5 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.ema_period.get(), "EMA小周期"),
-            trend_ema_period=8 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期"),
-            big_ema_period=233 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.big_ema_period.get(), "EMA大周期"),
+            bar=str(self._resolve_strategy_parameter_value(strategy_id, "bar", self.bar.get())),
+            ema_period=int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "ema_period",
+                    self._parse_positive_int(self.ema_period.get(), "EMA小周期"),
+                )
+            ),
+            trend_ema_period=int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "trend_ema_period",
+                    self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期"),
+                )
+            ),
+            big_ema_period=int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "big_ema_period",
+                    self._parse_positive_int(self.big_ema_period.get(), "EMA大周期"),
+                )
+            ),
             entry_reference_ema_period=entry_reference_ema_period,
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
@@ -10931,7 +11244,7 @@ class QuantApp:
             position_mode=POSITION_MODE_OPTIONS[self.position_mode_label.get()],
             environment=ENV_OPTIONS[self.environment_label.get()],
             tp_sl_trigger_type=TRIGGER_TYPE_OPTIONS[self.trigger_type_label.get()],
-            strategy_id=definition.strategy_id,
+            strategy_id=strategy_id,
             poll_seconds=float(self._parse_positive_decimal(self.poll_seconds.get(), "轮询秒数")),
             risk_amount=risk_amount,
             trade_inst_id=trade_symbol,
@@ -10941,23 +11254,85 @@ class QuantApp:
             run_mode=run_mode,
             take_profit_mode=TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()],
             max_entries_per_trend=max_entries_per_trend,
-            startup_chase_window_seconds=startup_chase_window_seconds if is_dynamic_strategy_id(definition.strategy_id) else 0,
+            startup_chase_window_seconds=startup_chase_window_seconds if is_dynamic_strategy_id(strategy_id) else 0,
             dynamic_two_r_break_even=self.dynamic_two_r_break_even.get()
-            if is_dynamic_strategy_id(definition.strategy_id)
+            if is_dynamic_strategy_id(strategy_id)
             else False,
             dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get()
-            if is_dynamic_strategy_id(definition.strategy_id)
+            if is_dynamic_strategy_id(strategy_id)
             else False,
             time_stop_break_even_enabled=self.time_stop_break_even_enabled.get()
-            if is_dynamic_strategy_id(definition.strategy_id)
+            if is_dynamic_strategy_id(strategy_id)
             else False,
             time_stop_break_even_bars=(
                 self._parse_positive_int(self.time_stop_break_even_bars.get(), "时间保本K线数")
-                if is_dynamic_strategy_id(definition.strategy_id) and self.time_stop_break_even_enabled.get()
+                if is_dynamic_strategy_id(strategy_id) and self.time_stop_break_even_enabled.get()
                 else 0
             ),
         )
         return credentials, config
+
+    def _refresh_global_email_toggle_text(self) -> None:
+        self.global_email_toggle_text.set("发邮件：开" if self.notify_enabled.get() else "发邮件：关")
+
+    def _session_email_runtime_enabled(self, session_id: str, kind: str) -> bool:
+        if not self.notify_enabled.get():
+            return False
+        if kind == "signal" and not self.notify_signals.get():
+            return False
+        if kind == "trade_fill" and not self.notify_trade_fills.get():
+            return False
+        if kind == "error" and not self.notify_errors.get():
+            return False
+        session = self.sessions.get(session_id)
+        if session is None:
+            return False
+        return bool(getattr(session, "email_notifications_enabled", True))
+
+    def _session_email_status_label(self, session: StrategySession) -> str:
+        if not self.notify_enabled.get():
+            return "总关"
+        return "开" if bool(getattr(session, "email_notifications_enabled", True)) else "关"
+
+    def toggle_global_email_notifications(self) -> None:
+        enabled = not self.notify_enabled.get()
+        self.notify_enabled.set(enabled)
+        self._refresh_global_email_toggle_text()
+        self._refresh_running_session_tree()
+        self._refresh_selected_session_details()
+        self._save_notification_settings_now(silent=True)
+        self._enqueue_log(f"已{'开启' if enabled else '关闭'}全局发邮件。")
+
+    def _set_selected_session_email_notifications(self, enabled: bool) -> None:
+        session = self._selected_session()
+        if session is None:
+            messagebox.showinfo("提示", "请先选择一个运行中策略。", parent=self.root)
+            return
+        current = bool(getattr(session, "email_notifications_enabled", True))
+        if current == enabled:
+            status_text = "开启" if enabled else "关闭"
+            self._enqueue_log(f"会话 {session.session_id} 发邮件已是{status_text}状态。")
+            return
+        session.email_notifications_enabled = enabled
+        self._upsert_session_row(session)
+        self._refresh_selected_session_details()
+        self._enqueue_log(f"已{'开启' if enabled else '关闭'}会话 {session.session_id} 发邮件。")
+
+    def enable_selected_session_email_notifications(self) -> None:
+        self._set_selected_session_email_notifications(True)
+
+    def disable_selected_session_email_notifications(self) -> None:
+        self._set_selected_session_email_notifications(False)
+
+    def _build_session_notifier(self, config: StrategyConfig, session_id: str) -> EmailNotifier | None:
+        notification_config = self._collect_notification_config(validate_if_enabled=True)
+        if not notification_config.enabled:
+            return None
+        return EmailNotifier(
+            notification_config,
+            logger=self._make_system_logger(f"邮件 {config.strategy_id}"),
+            delivery_policy=lambda kind, sid=session_id: self._session_email_runtime_enabled(sid, kind),
+        )
 
     def _collect_notification_config(self, *, validate_if_enabled: bool) -> EmailNotificationConfig:
         smtp_port = self._parse_optional_port(self.smtp_port.get())
@@ -11241,7 +11616,7 @@ class QuantApp:
         trader_slot_id = getattr(session, "trader_slot_id", "").strip()
         if not trader_id or not trader_slot_id:
             return
-        slot = self._trader_desk_slot_for_session(session.session_id)
+        slot = self._trader_desk_slot_for_session(session.session_id, trader_slot_id)
         trade = session.active_trade
         if slot is None or trade is None or trade.opened_logged_at is None:
             return
@@ -11688,7 +12063,7 @@ class QuantApp:
         trader_slot_id = getattr(session, "trader_slot_id", "").strip()
         if not trader_id or not trader_slot_id:
             return
-        slot = self._trader_desk_slot_for_session(session.session_id)
+        slot = self._trader_desk_slot_for_session(session.session_id, trader_slot_id)
         draft = self._trader_desk_draft_by_id(trader_id)
         run = self._trader_desk_run_by_id(trader_id, create=True)
         if slot is None or draft is None or run is None:
@@ -11702,12 +12077,12 @@ class QuantApp:
         else:
             slot.status = "closed_profit" if is_profit else "closed_loss"
         slot.quota_occupied = False
-        slot.opened_at = slot.opened_at or ledger_record.opened_at
+        slot.opened_at = ledger_record.opened_at or slot.opened_at
         slot.closed_at = ledger_record.closed_at
         slot.released_at = ledger_record.closed_at
-        slot.entry_price = slot.entry_price if slot.entry_price is not None else ledger_record.entry_price
+        slot.entry_price = ledger_record.entry_price if ledger_record.entry_price is not None else slot.entry_price
         slot.exit_price = ledger_record.exit_price
-        slot.size = slot.size if slot.size is not None else ledger_record.size
+        slot.size = ledger_record.size if ledger_record.size is not None else slot.size
         slot.net_pnl = net_pnl
         slot.close_reason = close_reason
         slot.history_record_id = ledger_record.history_record_id or session.history_record_id or ""
@@ -11754,11 +12129,13 @@ class QuantApp:
         live_pnl, _ = self._session_live_pnl_snapshot(session)
         source_type = QuantApp._session_category_label(session)
         trader_label = QuantApp._session_trader_label(self, session)
+        email_label = QuantApp._session_email_status_label(self, session)
         bar_label = str(getattr(getattr(session, "config", None), "bar", "") or "").strip() or "-"
         tags = ("duplicate_conflict",) if QuantApp._session_has_duplicate_launch_conflict(self, session) else ()
         values = (
             session.session_id,
             trader_label,
+            email_label,
             session.api_name or "-",
             source_type,
             session.strategy_name,
@@ -11784,6 +12161,21 @@ class QuantApp:
 
     def _on_session_selected(self, *_: object) -> None:
         self._refresh_selected_session_details()
+
+    def _on_session_tree_double_click(self, event: object) -> str | None:
+        tree = self.session_tree
+        try:
+            column_id = str(tree.identify_column(getattr(event, "x", 0) or 0))
+            row_id = str(tree.identify_row(getattr(event, "y", 0) or 0)).strip()
+        except Exception:
+            return None
+        if column_id != "#3" or not row_id:
+            return None
+        session = self.sessions.get(row_id)
+        if session is None:
+            return None
+        self._set_selected_session_email_notifications(not bool(getattr(session, "email_notifications_enabled", True)))
+        return "break"
 
     def _refresh_selected_session_details(self) -> None:
         session = self._selected_session()
@@ -11826,6 +12218,8 @@ class QuantApp:
                 live_pnl=live_pnl,
                 live_pnl_refreshed_at=live_pnl_refreshed_at,
                 duplicate_warning=duplicate_warning,
+                email_status_label=QuantApp._session_email_status_label(self, session),
+                global_email_enabled=self.notify_enabled.get(),
             )
         )
         self._set_readonly_text(
@@ -11893,6 +12287,8 @@ class QuantApp:
         live_pnl: Decimal | None = None,
         live_pnl_refreshed_at: datetime | None = None,
         duplicate_warning: str = "",
+        email_status_label: str = "-",
+        global_email_enabled: bool = False,
     ) -> str:
         try:
             definition = get_strategy_definition(strategy_id)
@@ -12366,6 +12762,8 @@ class QuantApp:
                     records.append(record)
         self._strategy_history_records = records
         self._strategy_history_by_id = {record.record_id: record for record in records}
+        for record in records:
+            self._update_session_counter_from_session_id(record.session_id)
         recoverable_count, abnormal_count = self._mark_unfinished_strategy_history_records()
         if recoverable_count:
             self._enqueue_log(f"检测到 {recoverable_count} 条可恢复历史策略，已标记为待恢复。")
@@ -13425,7 +13823,7 @@ class QuantApp:
         trader_slot_id = getattr(session, "trader_slot_id", "").strip()
         if not trader_id or not trader_slot_id:
             return
-        slot = self._trader_desk_slot_for_session(session.session_id)
+        slot = self._trader_desk_slot_for_session(session.session_id, trader_slot_id)
         run = self._trader_desk_run_by_id(trader_id, create=True)
         draft = self._trader_desk_draft_by_id(trader_id)
         if slot is None or run is None:
@@ -13499,6 +13897,7 @@ class QuantApp:
 
     def _refresh_trader_desk_runtime(self) -> None:
         for run in list(self._trader_desk_runs):
+            self._cleanup_stale_trader_watchers(run.trader_id)
             if run.status not in {"running", "quota_exhausted"}:
                 continue
             self._ensure_trader_watcher(run.trader_id)
@@ -13543,6 +13942,14 @@ class QuantApp:
         self.root.after(500, self._refresh_status)
 
     def _on_close(self) -> None:
+        confirmed = messagebox.askyesno(
+            "确认关闭",
+            "是否要关闭主界面？",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        self._save_strategy_parameter_draft()
         self._save_credentials_now(silent=True)
         self._save_notification_settings_now(silent=True)
         closed_at = datetime.now()
@@ -13715,6 +14122,272 @@ def _build_order_size_mode_hint_text(risk_amount_raw: str, order_size_raw: str) 
     if order_size is not None:
         return "当前模式：若风险金留空，将按固定数量下单。"
     return "当前模式：请填写风险金或固定数量其一。"
+
+
+def _build_launch_parameter_hint_text(
+    *,
+    stop_atr_raw: str,
+    take_atr_raw: str,
+    take_profit_mode_label: str,
+    max_entries_raw: str,
+    startup_chase_window_raw: str,
+) -> str:
+    stop_atr = stop_atr_raw.strip() or "?"
+    take_atr = take_atr_raw.strip() or "?"
+    max_entries = max_entries_raw.strip() or "?"
+    startup_chase_window = startup_chase_window_raw.strip() or "0"
+    parts = [
+        f"止损ATR倍数：{stop_atr}=止损距离是 {stop_atr}×ATR。",
+    ]
+    if take_profit_mode_label == "动态止盈":
+        parts.append(
+            f"止盈ATR倍数：{take_atr} 在动态止盈下不用于初始挂止盈，系统会先挂止损，后续靠上移止损锁盈。"
+        )
+    else:
+        parts.append(f"止盈ATR倍数：{take_atr}=止盈距离是 {take_atr}×ATR。")
+    if max_entries == "0":
+        parts.append("每波最多开仓次数：0=不限，同一波行情可重复开仓。")
+    else:
+        parts.append(f"每波最多开仓次数：{max_entries}=同一波最多开 {max_entries} 次。")
+    if startup_chase_window in {"", "0"}:
+        parts.append("启动追单窗口：0=启动不追老信号，只等启动后的新波。")
+    else:
+        parts.append(f"启动追单窗口：{startup_chase_window}秒=只接管启动前窗口内刚确认的波。")
+    return "参数速记： " + " ".join(parts)
+
+
+def _build_trend_parameter_hint_text(
+    *,
+    strategy_id: str,
+    ema_period_raw: str,
+    trend_ema_period_raw: str,
+    big_ema_period_raw: str,
+    entry_reference_ema_period_raw: str,
+) -> str:
+    ema_period = ema_period_raw.strip() or "?"
+    trend_ema_period = trend_ema_period_raw.strip() or "?"
+    big_ema_period = big_ema_period_raw.strip() or "?"
+    entry_reference_ema_period = entry_reference_ema_period_raw.strip() or "0"
+    parts = [
+        f"EMA小周期：{ema_period}=快线，负责捕捉最近节奏。",
+        f"EMA中周期：{trend_ema_period}=趋势过滤线，用来判断当前方向是否还有效。",
+    ]
+    if strategy_id == STRATEGY_CROSS_ID:
+        parts.append(f"EMA大周期：{big_ema_period}=大趋势过滤线，避免逆大方向开仓。")
+    elif strategy_id == STRATEGY_EMA5_EMA8_ID:
+        parts.append(f"EMA大周期：{big_ema_period}=4H 大趋势过滤线。")
+    if is_dynamic_strategy_id(strategy_id):
+        if entry_reference_ema_period in {"", "0"}:
+            parts.append(f"挂单参考EMA：0=跟随EMA小周期，当前按 EMA{ema_period} 作为挂单价格锚点。")
+        else:
+            parts.append(f"挂单参考EMA：{entry_reference_ema_period}=挂单价格锚点，价格会围绕 EMA{entry_reference_ema_period} 重挂。")
+    return "趋势参数： " + " ".join(parts)
+
+
+def _build_dynamic_protection_hint_text(
+    *,
+    take_profit_mode_label: str,
+    dynamic_two_r_break_even_enabled: bool,
+    dynamic_fee_offset_enabled: bool,
+    time_stop_break_even_enabled: bool,
+    time_stop_break_even_bars_raw: str,
+) -> str:
+    if take_profit_mode_label != "动态止盈":
+        return "动态保护：当前为固定止盈，2R保本 / 手续费偏移 / 时间保本都不生效。"
+    time_stop_bars = time_stop_break_even_bars_raw.strip() or "0"
+    parts = [
+        (
+            "2R保本：开启，浮盈达到 2R 后先把止损抬到保本位。"
+            if dynamic_two_r_break_even_enabled
+            else "2R保本：关闭，浮盈达到 2R 也不会自动抬到保本位。"
+        ),
+        (
+            "手续费偏移：开启，保本位会额外预留双边手续费缓冲。"
+            if dynamic_fee_offset_enabled
+            else "手续费偏移：关闭，保本位不额外预留手续费缓冲。"
+        ),
+        (
+            f"时间保本：开启，持仓满 {time_stop_bars} 根K线且达到净保本后，再把止损抬到保本位。"
+            if time_stop_break_even_enabled
+            else f"时间保本：关闭（当前设定 {time_stop_bars} 根，仅保存参数，不会启用）。"
+        ),
+    ]
+    return "动态保护： " + " ".join(parts)
+
+
+def _build_strategy_start_confirmation_message(
+    *,
+    strategy_name: str,
+    rule_description: str,
+    strategy_symbol: str,
+    config: StrategyConfig,
+    run_mode_label: str,
+    environment_label: str,
+    trade_mode_label: str,
+    position_mode_label: str,
+    signal_mode_label: str,
+    entry_side_mode_label: str,
+    tp_sl_mode_label: str,
+    trigger_type_label: str,
+    take_profit_mode_label: str,
+    risk_value: str,
+    fixed_size: str,
+    custom_trigger_symbol: str,
+    instrument: Instrument | None = None,
+) -> str:
+    def _signal_mode_text(label: str) -> str:
+        description = {
+            "双向": "多空信号都接收",
+            "只做多": "只接收多头信号",
+            "只做空": "只接收空头信号",
+        }.get(label, "")
+        return f"{label}（{description}）" if description else label
+
+    def _entry_side_mode_text(label: str) -> str:
+        description = {
+            "跟随信号": "多头买入，空头卖出",
+            "固定买入": "忽略信号方向，统一按买入开仓",
+            "固定卖出": "忽略信号方向，统一按卖出开仓",
+        }.get(label, "")
+        return f"{label}（{description}）" if description else label
+
+    def _tp_sl_mode_text() -> str:
+        if config.tp_sl_mode == "exchange":
+            if is_dynamic_strategy_id(config.strategy_id) and config.take_profit_mode == "dynamic":
+                return f"{tp_sl_mode_label}（开仓后由 OKX 托管初始止损，后续本地动态上移保护价）"
+            return f"{tp_sl_mode_label}（开仓后由 OKX 托管止损/止盈）"
+        if config.tp_sl_mode == "local_trade":
+            return f"{tp_sl_mode_label}（本地监控下单标的价格，触发后再执行平仓）"
+        if config.tp_sl_mode == "local_signal":
+            return f"{tp_sl_mode_label}（本地监控信号标的价格，触发后再执行平仓）"
+        if config.tp_sl_mode == "local_custom":
+            return f"{tp_sl_mode_label}（本地监控自定义标的价格，触发后再执行平仓）"
+        return tp_sl_mode_label
+
+    def _trigger_type_text(label: str) -> str:
+        description = {
+            "标记价格 mark": "止损/止盈按标记价触发",
+            "最新成交价 last": "止损/止盈按最新成交价触发",
+            "指数价格 index": "止损/止盈按指数价格触发",
+        }.get(label, "")
+        return f"{label}（{description}）" if description else label
+
+    def _startup_chase_text() -> str:
+        seconds = config.resolved_startup_chase_window_seconds()
+        if seconds <= 0:
+            return "关闭（启动不追老信号，只等新波）"
+        return f"{seconds}秒（只接管启动前窗口内刚确认的波）"
+
+    def _risk_amount_text() -> str:
+        if config.run_mode == "signal_only":
+            return "-（当前仅发信号，不下单）"
+        if config.risk_amount is not None and config.risk_amount > 0:
+            return f"{risk_value}（按止损距离反推仓位）"
+        return "-（当前不按风险金反推仓位）"
+
+    def _fixed_size_example_text() -> str:
+        if instrument is None:
+            return ""
+        if instrument.inst_type == "SPOT":
+            return f"；{strategy_symbol} 按币数量填写"
+        contract_value = (instrument.ct_val or Decimal("0")) * (instrument.ct_mult or Decimal("1"))
+        contract_ccy = (instrument.ct_val_ccy or "").strip().upper()
+        if not contract_ccy:
+            inst_text = (instrument.inst_id or strategy_symbol).strip().upper()
+            if "-" in inst_text:
+                contract_ccy = inst_text.split("-", 1)[0]
+        if contract_value > 0 and contract_ccy:
+            return f"；{strategy_symbol} 下 1={format_decimal(contract_value)} {contract_ccy}"
+        return ""
+
+    def _fixed_size_text() -> str:
+        if config.run_mode == "signal_only":
+            return "-（当前仅发信号，不下单）"
+        if config.risk_amount is not None and config.risk_amount > 0:
+            if fixed_size and fixed_size != "-":
+                return f"{fixed_size}（OKX 下单数量 sz；当前已填写风险金，仅作备用{_fixed_size_example_text()}）"
+            return "-（当前按风险金反推仓位）"
+        if fixed_size and fixed_size != "-":
+            return f"{fixed_size}（OKX 下单数量 sz；当前按固定数量下单{_fixed_size_example_text()}）"
+        return "-"
+
+    def _custom_trigger_text() -> str:
+        if config.tp_sl_mode != "local_custom":
+            return "-（当前模式未使用）"
+        return f"{custom_trigger_symbol or '-'}（本地止盈止损按这个标的触发）"
+
+    stop_atr_text = format_decimal(config.atr_stop_multiplier)
+    take_atr_text = format_decimal(config.atr_take_multiplier)
+    take_profit_mode_text = (
+        f"{take_profit_mode_label}（初始不挂止盈，后续通过上移止损锁盈）"
+        if config.take_profit_mode == "dynamic"
+        else f"{take_profit_mode_label}（止盈距离 = {take_atr_text} × ATR）"
+    )
+    take_profit_atr_text = (
+        f"{take_atr_text}（当前为动态止盈，初始不直接挂止盈）"
+        if config.take_profit_mode == "dynamic"
+        else f"{take_atr_text}（止盈距离 = {take_atr_text} × ATR）"
+    )
+
+    lines = [
+        f"策略：{strategy_name}",
+        "",
+        "基础信息：",
+        f"运行模式：{run_mode_label}",
+        f"交易环境：{environment_label}",
+        f"交易模式：{trade_mode_label}",
+        f"持仓模式：{position_mode_label}",
+        f"交易标的：{strategy_symbol}",
+        f"K线周期：{config.bar}",
+        "",
+        "执行口径：",
+        f"信号方向：{_signal_mode_text(signal_mode_label)}",
+        f"下单方向模式：{_entry_side_mode_text(entry_side_mode_label)}",
+        f"止盈止损模式：{_tp_sl_mode_text()}",
+        f"触发价格类型：{_trigger_type_text(trigger_type_label)}",
+        f"自定义触发标的：{_custom_trigger_text()}",
+        "",
+        "参数说明：",
+        f"EMA小周期：{config.ema_period}（快线）",
+        f"EMA中周期：{config.trend_ema_period}（趋势过滤线）",
+    ]
+    if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+        lines.append(f"EMA大周期：{config.big_ema_period}（大趋势过滤线）")
+    if is_dynamic_strategy_id(config.strategy_id):
+        lines.extend(
+            [
+                f"挂单参考EMA：{config.entry_reference_ema_label()}（挂单价格锚点）",
+                f"止盈方式：{take_profit_mode_text}",
+                f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}（同一波最多允许开仓的次数）",
+                f"启动追单窗口：{_startup_chase_text()}",
+            ]
+        )
+        if config.take_profit_mode == "dynamic":
+            lines.extend(
+                [
+                    f"2R保本开关：{config.dynamic_two_r_break_even_label()}（浮盈达到 2R 后止损抬到保本）",
+                    f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}（保本位预留双边手续费）",
+                    (
+                        f"时间保本：{config.time_stop_break_even_enabled_label()} / "
+                        f"{config.resolved_time_stop_break_even_bars()}根（持仓满指定K线且达到净保本时再抬止损）"
+                    ),
+                ]
+            )
+    lines.extend(
+        [
+            f"ATR周期：{config.atr_period}（波动计算周期）",
+            f"止损 ATR 倍数：{stop_atr_text}（止损距离 = {stop_atr_text} × ATR）",
+            f"止盈 ATR 倍数：{take_profit_atr_text}",
+            f"风险金：{_risk_amount_text()}",
+            f"固定数量：{_fixed_size_text()}",
+            "",
+            "策略规则：",
+            rule_description,
+            "",
+            "确认启动这个策略吗？",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _format_ratio(value: Decimal | None, *, places: int = 2) -> str:

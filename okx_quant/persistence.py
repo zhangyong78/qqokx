@@ -23,8 +23,11 @@ SMART_ORDER_TASKS_FILE_NAME = "smart_order_tasks.json"
 SMART_ORDER_FAVORITES_FILE_NAME = "smart_order_favorites.json"
 OPTION_STRATEGIES_FILE_NAME = "option_strategies.json"
 SIGNAL_OBSERVER_TEMPLATES_FILE_NAME = "signal_observer_templates.json"
+SIGNAL_OBSERVER_PRESETS_FILE_NAME = "signal_observer_presets.json"
 TRADER_DESK_FILE_NAME = "trader_desk.json"
 POSITION_NOTES_FILE_NAME = "position_notes.json"
+STRATEGY_PARAMETER_GLOBAL_DEFAULTS_FILE_NAME = "strategy_parameter_global_defaults.json"
+STRATEGY_PARAMETER_DRAFTS_FILE_NAME = "strategy_parameter_drafts.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 PROFILE_ENVIRONMENTS = {"demo", "live"}
 
@@ -106,12 +109,104 @@ def signal_observer_templates_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / SIGNAL_OBSERVER_TEMPLATES_FILE_NAME if base_dir is not None else state_dir_path() / SIGNAL_OBSERVER_TEMPLATES_FILE_NAME
 
 
+def signal_observer_presets_file_path(base_dir: Path | None = None) -> Path:
+    return Path(base_dir) / SIGNAL_OBSERVER_PRESETS_FILE_NAME if base_dir is not None else state_dir_path() / SIGNAL_OBSERVER_PRESETS_FILE_NAME
+
+
 def trader_desk_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / TRADER_DESK_FILE_NAME if base_dir is not None else state_dir_path() / TRADER_DESK_FILE_NAME
 
 
 def position_notes_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / POSITION_NOTES_FILE_NAME if base_dir is not None else state_dir_path() / POSITION_NOTES_FILE_NAME
+
+
+def strategy_parameter_global_defaults_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / STRATEGY_PARAMETER_GLOBAL_DEFAULTS_FILE_NAME
+    return state_dir_path() / STRATEGY_PARAMETER_GLOBAL_DEFAULTS_FILE_NAME
+
+
+def strategy_parameter_drafts_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / STRATEGY_PARAMETER_DRAFTS_FILE_NAME
+    return state_dir_path() / STRATEGY_PARAMETER_DRAFTS_FILE_NAME
+
+
+def _normalize_strategy_parameter_record(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): value for key, value in payload.items() if str(key).strip()}
+
+
+def load_strategy_parameter_global_defaults(path: Path | None = None) -> dict[str, object]:
+    target = path or strategy_parameter_global_defaults_file_path()
+    if not target.exists():
+        return {"values": {}}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"values": {}}
+    values = payload.get("values") if isinstance(payload, dict) else {}
+    return {"values": _normalize_strategy_parameter_record(values)}
+
+
+def save_strategy_parameter_global_defaults(values: dict[str, object], path: Path | None = None) -> Path:
+    target = path or strategy_parameter_global_defaults_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "values": _normalize_strategy_parameter_record(values),
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
+def load_strategy_parameter_drafts(path: Path | None = None) -> dict[str, object]:
+    target = path or strategy_parameter_drafts_file_path()
+    if not target.exists():
+        return {"launcher": {}, "backtest": {}, "observer": {}}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"launcher": {}, "backtest": {}, "observer": {}}
+    if not isinstance(payload, dict):
+        return {"launcher": {}, "backtest": {}, "observer": {}}
+    normalized: dict[str, object] = {}
+    for scope in ("launcher", "backtest", "observer"):
+        scope_payload = payload.get(scope)
+        if not isinstance(scope_payload, dict):
+            normalized[scope] = {}
+            continue
+        normalized[scope] = {
+            str(strategy_id): _normalize_strategy_parameter_record(values)
+            for strategy_id, values in scope_payload.items()
+            if str(strategy_id).strip()
+        }
+    return normalized
+
+
+def save_strategy_parameter_drafts(snapshot: dict[str, object], path: Path | None = None) -> Path:
+    target = path or strategy_parameter_drafts_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {}
+    for scope in ("launcher", "backtest", "observer"):
+        scope_payload = snapshot.get(scope, {}) if isinstance(snapshot, dict) else {}
+        if not isinstance(scope_payload, dict):
+            payload[scope] = {}
+            continue
+        payload[scope] = {
+            str(strategy_id): _normalize_strategy_parameter_record(values)
+            for strategy_id, values in scope_payload.items()
+            if str(strategy_id).strip()
+        }
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
 
 
 def _empty_credentials_snapshot() -> dict[str, str]:

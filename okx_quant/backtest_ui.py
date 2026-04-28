@@ -28,7 +28,7 @@ from okx_quant.backtest_export import export_batch_backtest_report, export_singl
 from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_pool_profile_name
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import OkxRestClient
-from okx_quant.persistence import backtest_history_file_path
+from okx_quant.persistence import backtest_history_file_path, load_strategy_parameter_drafts, save_strategy_parameter_drafts
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import (
     ALL_STRATEGY_DEFINITIONS,
@@ -39,6 +39,13 @@ from okx_quant.strategy_catalog import (
     get_strategy_definition,
     is_dynamic_strategy_id,
     resolve_dynamic_signal_mode,
+)
+from okx_quant.strategy_parameters import (
+    iter_strategy_parameter_keys,
+    strategy_fixed_value,
+    strategy_is_parameter_editable,
+    strategy_parameter_default_value,
+    strategy_uses_parameter,
 )
 from okx_quant.window_layout import apply_adaptive_window_geometry
 
@@ -96,6 +103,7 @@ TAKE_PROFIT_MODE_OPTIONS = {
     "动态止盈": "dynamic",
 }
 MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT = Decimal("0.50")
+TAKE_PROFIT_MODE_VALUE_TO_LABEL = {value: label for label, value in TAKE_PROFIT_MODE_OPTIONS.items()}
 MANUAL_FILTER_OPTIONS = {
     "全部": "all",
     "仅接近保本": "near_break_even",
@@ -1103,7 +1111,7 @@ class BacktestCompareOverviewWindow:
 
     @staticmethod
     def _strategy_uses_big_ema(strategy_id: str) -> bool:
-        return strategy_id == STRATEGY_EMA5_EMA8_ID
+        return strategy_uses_parameter(strategy_id, "big_ema_period")
 
     def _build_layout(self) -> None:
         header = ttk.LabelFrame(self.window, text="回测总览", padding=12)
@@ -1251,6 +1259,9 @@ class BacktestWindow:
         self.trigger_type_label = StringVar(value=initial_state.trigger_type_label)
         self.environment_label = StringVar(value=initial_state.environment_label)
         self.candle_limit = StringVar(value=initial_state.candle_limit)
+        self._strategy_parameter_drafts = load_strategy_parameter_drafts()
+        self._strategy_parameter_scope = "backtest"
+        self._last_strategy_parameter_strategy_id: str | None = None
         self.history_sync_status = StringVar(
             value="填 0 = 全量；填 10000 = 最新往前 10000 根。可先点“同步历史数据”下载 5 个币种的 5m / 15m / 1H / 4H 全量缓存。"
         )
@@ -1308,6 +1319,7 @@ class BacktestWindow:
         return (not self._closed) and self._widget_exists(self.window)
 
     def _close(self) -> None:
+        self._save_strategy_parameter_draft()
         self._closed = True
         if self._widget_exists(getattr(self, "_chart_zoom_window", None)):
             try:
@@ -1319,7 +1331,120 @@ class BacktestWindow:
 
     @staticmethod
     def _strategy_uses_big_ema(strategy_id: str) -> bool:
-        return strategy_id == STRATEGY_EMA5_EMA8_ID
+        return strategy_uses_parameter(strategy_id, "big_ema_period")
+
+    @staticmethod
+    def _set_field_state(widget: object, *, editable: bool) -> None:
+        state = "normal" if editable else "readonly"
+        if isinstance(widget, ttk.Combobox):
+            widget.configure(state="readonly" if editable else "disabled")
+            return
+        try:
+            widget.configure(state=state)
+        except Exception:
+            try:
+                widget.configure(state="normal" if editable else "disabled")
+            except Exception:
+                pass
+
+    def _strategy_parameter_scope_drafts(self) -> dict[str, object]:
+        drafts = self._strategy_parameter_drafts.get(self._strategy_parameter_scope)
+        if not isinstance(drafts, dict):
+            drafts = {}
+            self._strategy_parameter_drafts[self._strategy_parameter_scope] = drafts
+        return drafts
+
+    def _strategy_parameter_bindings(self) -> dict[str, object]:
+        return {
+            "bar": self.bar_label,
+            "signal_mode": self.signal_mode_label,
+            "ema_period": self.ema_period,
+            "trend_ema_period": self.trend_ema_period,
+            "big_ema_period": self.big_ema_period,
+            "atr_period": self.atr_period,
+            "atr_stop_multiplier": self.stop_atr,
+            "atr_take_multiplier": self.take_atr,
+            "entry_reference_ema_period": self.entry_reference_ema_period,
+            "take_profit_mode": self.take_profit_mode_label,
+            "max_entries_per_trend": self.max_entries_per_trend,
+            "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
+            "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
+            "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
+            "time_stop_break_even_bars": self.time_stop_break_even_bars,
+        }
+
+    def _capture_strategy_parameter_draft(self, strategy_id: str) -> dict[str, object]:
+        values: dict[str, object] = {}
+        bindings = self._strategy_parameter_bindings()
+        for key in iter_strategy_parameter_keys(strategy_id):
+            variable = bindings.get(key)
+            if variable is None:
+                continue
+            values[key] = variable.get()
+        return values
+
+    def _save_strategy_parameter_draft(self, strategy_id: str | None = None) -> None:
+        target_strategy_id = strategy_id or self._last_strategy_parameter_strategy_id
+        if not target_strategy_id:
+            return
+        scope_drafts = self._strategy_parameter_scope_drafts()
+        scope_drafts[target_strategy_id] = self._capture_strategy_parameter_draft(target_strategy_id)
+        save_strategy_parameter_drafts(self._strategy_parameter_drafts)
+
+    def _restore_strategy_parameter_draft(self, strategy_id: str) -> None:
+        bindings = self._strategy_parameter_bindings()
+        draft_payload = self._strategy_parameter_scope_drafts().get(strategy_id)
+        draft = draft_payload if isinstance(draft_payload, dict) else {}
+        definition = get_strategy_definition(strategy_id)
+        for key in iter_strategy_parameter_keys(strategy_id):
+            variable = bindings.get(key)
+            if variable is None:
+                continue
+            if key in draft:
+                variable.set(draft[key])
+                continue
+            default_value = strategy_parameter_default_value(key)
+            if default_value is None:
+                continue
+            if key == "bar":
+                variable.set(_normalize_backtest_bar_label(str(default_value)))
+            elif key == "signal_mode":
+                variable.set(SIGNAL_VALUE_TO_LABEL.get(str(default_value), definition.default_signal_label))
+            elif key == "take_profit_mode":
+                variable.set(TAKE_PROFIT_MODE_VALUE_TO_LABEL.get(str(default_value), self.take_profit_mode_label.get()))
+            else:
+                variable.set(default_value)
+        for key in iter_strategy_parameter_keys(strategy_id):
+            fixed_value = strategy_fixed_value(strategy_id, key)
+            if fixed_value is None:
+                continue
+            variable = bindings.get(key)
+            if variable is not None:
+                if key == "bar":
+                    variable.set(_normalize_backtest_bar_label(str(fixed_value)))
+                elif key == "signal_mode":
+                    variable.set(SIGNAL_VALUE_TO_LABEL.get(str(fixed_value), definition.default_signal_label))
+                else:
+                    variable.set(fixed_value)
+
+    def _resolve_strategy_parameter_value(self, strategy_id: str, key: str, current_value: object) -> object:
+        fixed_value = strategy_fixed_value(strategy_id, key)
+        if fixed_value is not None:
+            return fixed_value
+        return current_value
+
+    def _apply_strategy_parameter_fixed_labels(self, strategy_id: str) -> None:
+        fixed_suffix = "（本策略固定）"
+        label_map = {
+            "bar": (self.bar_caption, "K线周期"),
+            "signal_mode": (self.signal_caption, "信号方向"),
+            "ema_period": (self.ema_period_caption, "EMA小周期"),
+            "trend_ema_period": (self.trend_ema_period_caption, "EMA中周期"),
+            "big_ema_period": (self.big_ema_caption, "EMA大周期"),
+        }
+        for key, (widget, base_text) in label_map.items():
+            text = f"{base_text}{fixed_suffix}" if strategy_fixed_value(strategy_id, key) is not None else base_text
+            widget.configure(text=text)
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
@@ -1350,40 +1475,45 @@ class BacktestWindow:
             state="readonly",
         )
         self.symbol_combo.grid(row=row, column=3, sticky="ew", padx=(0, 12))
-        ttk.Label(controls, text="K线周期").grid(row=row, column=4, sticky="w")
-        ttk.Combobox(
+        self.bar_caption = ttk.Label(controls, text="K线周期")
+        self.bar_caption.grid(row=row, column=4, sticky="w")
+        self.bar_combo = ttk.Combobox(
             controls,
             textvariable=self.bar_label,
             values=list(BACKTEST_BAR_LABEL_TO_VALUE.keys()),
             state="readonly",
-        ).grid(row=row, column=5, sticky="ew")
+        )
+        self.bar_combo.grid(row=row, column=5, sticky="ew")
+        self.ema_period_caption = ttk.Label(controls, text="EMA小周期")
+        self.ema_period_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self.ema_period_entry = ttk.Entry(controls, textvariable=self.ema_period)
+        self.ema_period_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.trend_ema_period_caption = ttk.Label(controls, text="EMA中周期")
+        self.trend_ema_period_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self.trend_ema_period_entry = ttk.Entry(controls, textvariable=self.trend_ema_period)
+        self.trend_ema_period_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.big_ema_caption = ttk.Label(controls, text="EMA大周期")
+        self.big_ema_caption.grid(row=row, column=4, sticky="w", pady=(12, 0))
+        self.big_ema_entry = ttk.Entry(controls, textvariable=self.big_ema_period)
+        self.big_ema_entry.grid(row=row, column=5, sticky="ew", pady=(12, 0))
 
         row += 1
-        ttk.Label(controls, text="EMA小周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.ema_period).grid(
-            row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0)
-        )
-        ttk.Label(controls, text="EMA中周期").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.trend_ema_period).grid(
-            row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
-        )
-        ttk.Label(controls, text="EMA大周期").grid(row=row, column=4, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.big_ema_period).grid(row=row, column=5, sticky="ew", pady=(12, 0))
+        self.atr_period_caption = ttk.Label(controls, text="ATR 周期")
+        self.atr_period_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self.atr_period_entry = ttk.Entry(controls, textvariable=self.atr_period)
+        self.atr_period_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.stop_atr_caption = ttk.Label(controls, text="止损 ATR 倍数")
+        self.stop_atr_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self.stop_atr_entry = ttk.Entry(controls, textvariable=self.stop_atr)
+        self.stop_atr_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.take_atr_caption = ttk.Label(controls, text="止盈 ATR 倍数")
+        self.take_atr_caption.grid(row=row, column=4, sticky="w", pady=(12, 0))
+        self.take_atr_entry = ttk.Entry(controls, textvariable=self.take_atr)
+        self.take_atr_entry.grid(row=row, column=5, sticky="ew", pady=(12, 0))
 
         row += 1
-        ttk.Label(controls, text="ATR 周期").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.atr_period).grid(
-            row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0)
-        )
-        ttk.Label(controls, text="止损 ATR 倍数").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.stop_atr).grid(
-            row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
-        )
-        ttk.Label(controls, text="止盈 ATR 倍数").grid(row=row, column=4, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.take_atr).grid(row=row, column=5, sticky="ew", pady=(12, 0))
-
-        row += 1
-        ttk.Label(controls, text="信号方向").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self.signal_caption = ttk.Label(controls, text="信号方向")
+        self.signal_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
         self.signal_combo = ttk.Combobox(controls, textvariable=self.signal_mode_label, state="readonly")
         self.signal_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
         self.entry_reference_ema_caption = ttk.Label(controls, text="挂单参考EMA")
@@ -2496,6 +2626,7 @@ class BacktestWindow:
     def _build_config(self) -> StrategyConfig:
         definition = self._selected_strategy_definition()
         dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
+        strategy_id = definition.strategy_id
         sizing_mode = BACKTEST_SIZING_OPTIONS[self.sizing_mode_label.get()]
         size_or_risk = self._parse_positive_decimal(self.risk_amount.get(), "固定风险金/数量")
         risk_percent = None
@@ -2536,14 +2667,30 @@ class BacktestWindow:
         exit_slippage_rate = self._parse_nonnegative_decimal(self.exit_slippage_percent.get(), "平仓滑点") / Decimal("100")
         return StrategyConfig(
             inst_id=self.symbol.get().strip().upper(),
-            bar="4H" if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else _backtest_bar_value_from_label(self.bar_label.get()),
-            ema_period=5 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.ema_period.get(), "EMA小周期"),
-            trend_ema_period=8 if definition.strategy_id == STRATEGY_EMA5_EMA8_ID else self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期"),
-            big_ema_period=233
-            if definition.strategy_id == STRATEGY_EMA5_EMA8_ID
-            else (
-                self._parse_positive_int(self.big_ema_period.get(), "EMA大周期")
-                if self._strategy_uses_big_ema(definition.strategy_id)
+            bar=str(self._resolve_strategy_parameter_value(strategy_id, "bar", _backtest_bar_value_from_label(self.bar_label.get()))),
+            ema_period=int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "ema_period",
+                    self._parse_positive_int(self.ema_period.get(), "EMA小周期"),
+                )
+            ),
+            trend_ema_period=int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "trend_ema_period",
+                    self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期"),
+                )
+            ),
+            big_ema_period=(
+                int(
+                    self._resolve_strategy_parameter_value(
+                        strategy_id,
+                        "big_ema_period",
+                        self._parse_positive_int(self.big_ema_period.get(), "EMA大周期"),
+                    )
+                )
+                if self._strategy_uses_big_ema(strategy_id)
                 else 0
             ),
             entry_reference_ema_period=entry_reference_ema_period,
@@ -2584,21 +2731,25 @@ class BacktestWindow:
 
     def _apply_selected_strategy_definition(self) -> None:
         definition = self._selected_strategy_definition()
-        dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
+        strategy_id = definition.strategy_id
+        previous_strategy_id = self._last_strategy_parameter_strategy_id
+        if previous_strategy_id and previous_strategy_id != strategy_id:
+            self._save_strategy_parameter_draft(previous_strategy_id)
+        self._restore_strategy_parameter_draft(strategy_id)
+        dynamic_strategy = is_dynamic_strategy_id(strategy_id)
         self.signal_combo["values"] = definition.allowed_signal_labels
-        if self.signal_mode_label.get() not in definition.allowed_signal_labels:
+        fixed_signal_mode = strategy_fixed_value(strategy_id, "signal_mode")
+        if fixed_signal_mode is not None:
+            self.signal_mode_label.set(SIGNAL_VALUE_TO_LABEL.get(str(fixed_signal_mode), definition.default_signal_label))
+        elif self.signal_mode_label.get() not in definition.allowed_signal_labels:
             self.signal_mode_label.set(definition.default_signal_label)
-        if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
-            self.bar_label.set("4小时")
-            self.ema_period.set("5")
-            self.trend_ema_period.set("8")
-            self.big_ema_period.set("233")
+        if strategy_id == STRATEGY_EMA5_EMA8_ID:
             self.entry_reference_ema_period.set("0")
             self.risk_amount.set("100")
         if hasattr(self, "_controls_frame"):
-            big_ema_widgets = self._controls_frame.grid_slaves(row=1, column=4) + self._controls_frame.grid_slaves(row=1, column=5)
+            big_ema_widgets = (self.big_ema_caption, self.big_ema_entry)
             for widget in big_ema_widgets:
-                if self._strategy_uses_big_ema(definition.strategy_id):
+                if self._strategy_uses_big_ema(strategy_id):
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -2607,7 +2758,7 @@ class BacktestWindow:
                 self.entry_reference_ema_entry,
             )
             for widget in entry_reference_widgets:
-                if dynamic_strategy:
+                if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -2630,10 +2781,19 @@ class BacktestWindow:
                     widget.grid_remove()
             if not dynamic_strategy:
                 self.max_entries_caption.configure(text="每波最多开仓次数")
+            self._set_field_state(self.bar_combo, editable=strategy_is_parameter_editable(strategy_id, "bar", "backtest"))
+            self._set_field_state(self.ema_period_entry, editable=strategy_is_parameter_editable(strategy_id, "ema_period", "backtest"))
+            self._set_field_state(self.trend_ema_period_entry, editable=strategy_is_parameter_editable(strategy_id, "trend_ema_period", "backtest"))
+            self._set_field_state(self.big_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "big_ema_period", "backtest"))
+            self._set_field_state(self.signal_combo, editable=strategy_is_parameter_editable(strategy_id, "signal_mode", "backtest"))
+            self._apply_strategy_parameter_fixed_labels(strategy_id)
         if dynamic_strategy and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
+        self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
         self._update_sizing_mode_widgets()
+        if self._latest_result is None:
+            self.manual_summary.set("当前策略没有额外扩展统计。")
         if self._latest_result is None:
             self.manual_summary.set("当前策略没有额外扩展统计。")
 

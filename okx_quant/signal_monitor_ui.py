@@ -8,7 +8,14 @@ from tkinter import BooleanVar, END, StringVar, Text, Toplevel
 from tkinter import messagebox, ttk
 from typing import Callable
 
-from okx_quant.persistence import signal_observer_templates_file_path
+from okx_quant.persistence import signal_observer_presets_file_path, signal_observer_templates_file_path
+from okx_quant.strategy_catalog import get_strategy_definition
+from okx_quant.strategy_parameters import (
+    iter_strategy_parameter_keys,
+    strategy_fixed_value,
+    strategy_is_parameter_editable,
+    strategy_parameter_default_value,
+)
 from okx_quant.window_layout import apply_adaptive_window_geometry, apply_window_icon
 
 
@@ -29,11 +36,72 @@ DEFAULT_SIGNAL_OBSERVER_SYMBOLS: tuple[str, ...] = (
     "BNB-USDT-SWAP",
     "DOGE-USDT-SWAP",
 )
+_SIGNAL_MODE_VALUE_TO_LABEL = {
+    "both": "双向",
+    "long_only": "只做多",
+    "short_only": "只做空",
+}
+_SIGNAL_MODE_LABEL_TO_VALUE = {label: value for value, label in _SIGNAL_MODE_VALUE_TO_LABEL.items()}
+_TAKE_PROFIT_MODE_VALUE_TO_LABEL = {
+    "fixed": "固定止盈",
+    "dynamic": "动态止盈",
+}
+_TAKE_PROFIT_MODE_LABEL_TO_VALUE = {label: value for value, label in _TAKE_PROFIT_MODE_VALUE_TO_LABEL.items()}
+_OBSERVER_PARAMETER_LABELS = {
+    "bar": "观察周期",
+    "signal_mode": "开仓方向",
+    "ema_period": "快EMA周期",
+    "trend_ema_period": "中EMA周期",
+    "big_ema_period": "大EMA周期",
+    "atr_period": "ATR周期",
+    "atr_stop_multiplier": "止损 ATR 倍数",
+    "atr_take_multiplier": "止盈 ATR 倍数",
+    "entry_reference_ema_period": "进场参考EMA",
+    "take_profit_mode": "出场方式",
+    "max_entries_per_trend": "单波最多开仓次数",
+    "dynamic_two_r_break_even": "2R后保本",
+    "dynamic_fee_offset_enabled": "保本加手续费缓冲",
+    "time_stop_break_even_enabled": "超时启用保本",
+    "time_stop_break_even_bars": "超时K线根数",
+    "startup_chase_window_seconds": "启动追单窗口(秒)",
+}
+_OBSERVER_PARAMETER_ORDER: tuple[str, ...] = tuple(_OBSERVER_PARAMETER_LABELS.keys())
+_OBSERVER_PARAMETER_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("基础设定", ("bar", "signal_mode", "startup_chase_window_seconds")),
+    ("趋势过滤", ("ema_period", "trend_ema_period", "big_ema_period", "atr_period")),
+    (
+        "进场与保护",
+        (
+            "entry_reference_ema_period",
+            "max_entries_per_trend",
+            "atr_stop_multiplier",
+            "atr_take_multiplier",
+            "take_profit_mode",
+            "dynamic_two_r_break_even",
+            "dynamic_fee_offset_enabled",
+            "time_stop_break_even_enabled",
+            "time_stop_break_even_bars",
+        ),
+    ),
+)
+_OBSERVER_PARAMETER_GROUP_BY_KEY = {
+    key: group_name
+    for group_name, keys in _OBSERVER_PARAMETER_GROUPS
+    for key in keys
+}
 
 
 @dataclass
 class _ObserverDraft:
     draft_id: str
+    template_payload: dict[str, object]
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
+class _ObserverPreset:
+    preset_name: str
     template_payload: dict[str, object]
     created_at: datetime
     updated_at: datetime
@@ -47,6 +115,41 @@ def _parse_time(value: object) -> datetime | None:
         return datetime.fromisoformat(text)
     except ValueError:
         return None
+
+
+def _normalize_template_payload(payload: dict[str, object]) -> dict[str, object]:
+    normalized = dict(payload)
+    config_snapshot = normalized.get("config_snapshot")
+    if not isinstance(config_snapshot, dict):
+        return normalized
+    strategy_id = str(normalized.get("strategy_id") or config_snapshot.get("strategy_id") or "").strip()
+    if not strategy_id:
+        return normalized
+    normalized_snapshot = dict(config_snapshot)
+    for key in iter_strategy_parameter_keys(strategy_id):
+        fixed_value = strategy_fixed_value(strategy_id, key)
+        if fixed_value is not None:
+            normalized_snapshot[key] = fixed_value
+    normalized["config_snapshot"] = normalized_snapshot
+    normalized["strategy_id"] = strategy_id
+    if not str(normalized.get("strategy_name") or "").strip():
+        try:
+            normalized["strategy_name"] = get_strategy_definition(strategy_id).name
+        except KeyError:
+            pass
+    fixed_signal_mode = strategy_fixed_value(strategy_id, "signal_mode")
+    if fixed_signal_mode is not None:
+        normalized["direction_label"] = _SIGNAL_MODE_VALUE_TO_LABEL.get(str(fixed_signal_mode), str(fixed_signal_mode))
+    if not str(normalized.get("run_mode_label") or "").strip():
+        normalized["run_mode_label"] = "只发邮件"
+    return normalized
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "on"}
 
 
 class SignalMonitorWindow:
@@ -74,6 +177,7 @@ class SignalMonitorWindow:
         self._session_stopper = session_stopper
         self._session_deleter = session_deleter
         self._drafts: list[_ObserverDraft] = []
+        self._presets: list[_ObserverPreset] = []
         self._draft_counter = 0
         self._refresh_job: str | None = None
 
@@ -83,6 +187,24 @@ class SignalMonitorWindow:
         }
         self._custom_symbols = StringVar(value="")
         self._status_text = StringVar(value="信号 0 条 | 运行中 0 条")
+        self._editor_status_text = StringVar(value="请选择左侧一条观察模板，右侧可微调周期、趋势和保护参数。")
+        self._editor_strategy_text = StringVar(value="-")
+        self._editor_api_text = StringVar(value="-")
+        self._editor_symbol = StringVar(value="")
+        self._editor_run_mode_text = StringVar(value="只发邮件")
+        self._preset_name = StringVar(value="")
+        self._preset_choice = StringVar(value="")
+        self._editor_parameter_vars: dict[str, StringVar | BooleanVar] = {}
+        for key in _OBSERVER_PARAMETER_ORDER:
+            default_value = strategy_parameter_default_value(key)
+            if isinstance(default_value, bool):
+                self._editor_parameter_vars[key] = BooleanVar(value=default_value)
+            else:
+                self._editor_parameter_vars[key] = StringVar(value="" if default_value is None else str(default_value))
+        self._editor_parameter_labels: dict[str, ttk.Label] = {}
+        self._editor_parameter_inputs: dict[str, object] = {}
+        self._editor_group_frames: dict[str, ttk.Frame] = {}
+        self._editor_group_placeholders: dict[str, ttk.Label] = {}
 
         self.window = Toplevel(parent)
         self.window.title("信号观察台")
@@ -101,11 +223,22 @@ class SignalMonitorWindow:
         self.draft_tree: ttk.Treeview | None = None
         self.session_tree: ttk.Treeview | None = None
         self.log_text: Text | None = None
+        self._editor_save_button: ttk.Button | None = None
+        self._preset_combo: ttk.Combobox | None = None
 
-        self._build_layout()
-        self._load_drafts()
-        self._refresh_views()
-        self._schedule_refresh()
+        try:
+            self._build_layout()
+            self._load_drafts()
+            self._load_presets()
+            self._refresh_views()
+            self._schedule_refresh()
+        except Exception:
+            try:
+                if self.window.winfo_exists():
+                    self.window.destroy()
+            except Exception:
+                pass
+            raise
 
     def show(self) -> None:
         if not self.window.winfo_exists():
@@ -203,6 +336,7 @@ class SignalMonitorWindow:
         draft_scroll = ttk.Scrollbar(left, orient="vertical", command=self.draft_tree.yview)
         draft_scroll.grid(row=2, column=1, sticky="ns")
         self.draft_tree.configure(yscrollcommand=draft_scroll.set)
+        self.draft_tree.bind("<<TreeviewSelect>>", lambda *_: self._refresh_editor_from_selection())
 
         upper_right = ttk.LabelFrame(body, text="运行中的 signal_only 会话", padding=12)
         upper_right.grid(row=0, column=1, sticky="nsew")
@@ -235,21 +369,110 @@ class SignalMonitorWindow:
         session_scroll.grid(row=1, column=1, sticky="ns")
         self.session_tree.configure(yscrollcommand=session_scroll.set)
 
-        lower_right = ttk.LabelFrame(body, text="使用说明", padding=12)
+        lower_right = ttk.LabelFrame(body, text="模板详情", padding=12)
         lower_right.grid(row=1, column=1, sticky="nsew", pady=(12, 0))
-        lower_right.columnconfigure(0, weight=1)
+        lower_right.columnconfigure(1, weight=1)
+        lower_right.rowconfigure(6, weight=1)
+        ttk.Label(lower_right, textvariable=self._editor_status_text, foreground="#556070", wraplength=420).grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, 8),
+        )
+        ttk.Label(lower_right, text="观察策略").grid(row=1, column=0, sticky="w")
+        ttk.Label(lower_right, textvariable=self._editor_strategy_text).grid(row=1, column=1, sticky="w")
+        ttk.Label(lower_right, text="API").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(lower_right, textvariable=self._editor_api_text).grid(row=2, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(lower_right, text="观察标的").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self._editor_symbol_entry = ttk.Entry(lower_right, textvariable=self._editor_symbol)
+        self._editor_symbol_entry.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(lower_right, text="运行模式").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(lower_right, textvariable=self._editor_run_mode_text).grid(row=4, column=1, sticky="w", pady=(8, 0))
+
+        preset_frame = ttk.LabelFrame(lower_right, text="观察预设", padding=10)
+        preset_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        preset_frame.columnconfigure(1, weight=1)
+        ttk.Label(preset_frame, text="预设名称").grid(row=0, column=0, sticky="w")
+        ttk.Entry(preset_frame, textvariable=self._preset_name).grid(row=0, column=1, sticky="ew")
+        ttk.Button(preset_frame, text="保存为预设", command=self.save_current_as_preset).grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(preset_frame, text="已存预设").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self._preset_combo = ttk.Combobox(preset_frame, textvariable=self._preset_choice, state="readonly")
+        self._preset_combo.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+        self._preset_combo.bind("<<ComboboxSelected>>", lambda *_: self._on_preset_selected())
+        ttk.Button(preset_frame, text="套用到当前模板", command=self.apply_selected_preset).grid(
+            row=1,
+            column=2,
+            padx=(8, 0),
+            pady=(8, 0),
+        )
+        ttk.Button(preset_frame, text="从预设新建", command=self.create_draft_from_preset).grid(
+            row=2,
+            column=2,
+            padx=(8, 0),
+            pady=(8, 0),
+            sticky="e",
+        )
+
+        notebook = ttk.Notebook(lower_right)
+        notebook.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
+        for group_name, keys in _OBSERVER_PARAMETER_GROUPS:
+            group_frame = ttk.Frame(notebook, padding=(8, 8, 8, 8))
+            group_frame.columnconfigure(1, weight=1)
+            notebook.add(group_frame, text=group_name)
+            placeholder = ttk.Label(
+                group_frame,
+                text="当前策略在这个分组没有需要调整的观察参数。",
+                foreground="#556070",
+                wraplength=360,
+                justify="left",
+            )
+            placeholder.grid(row=0, column=0, columnspan=2, sticky="w")
+            self._editor_group_frames[group_name] = group_frame
+            self._editor_group_placeholders[group_name] = placeholder
+            for offset, key in enumerate(keys, start=1):
+                label = ttk.Label(group_frame, text=_OBSERVER_PARAMETER_LABELS[key])
+                label.grid(row=offset, column=0, sticky="w", pady=(8, 0))
+                variable = self._editor_parameter_vars[key]
+                if isinstance(variable, BooleanVar):
+                    widget = ttk.Checkbutton(group_frame, variable=variable, onvalue=True, offvalue=False)
+                elif key == "signal_mode":
+                    widget = ttk.Combobox(
+                        group_frame,
+                        textvariable=variable,
+                        values=list(_SIGNAL_MODE_LABEL_TO_VALUE.keys()),
+                        state="readonly",
+                    )
+                elif key == "take_profit_mode":
+                    widget = ttk.Combobox(
+                        group_frame,
+                        textvariable=variable,
+                        values=list(_TAKE_PROFIT_MODE_LABEL_TO_VALUE.keys()),
+                        state="readonly",
+                    )
+                elif key == "bar":
+                    widget = ttk.Combobox(
+                        group_frame,
+                        textvariable=variable,
+                        values=["1m", "3m", "5m", "15m", "1H", "4H"],
+                        state="readonly",
+                    )
+                else:
+                    widget = ttk.Entry(group_frame, textvariable=variable)
+                widget.grid(row=offset, column=1, sticky="ew", pady=(8, 0))
+                self._editor_parameter_labels[key] = label
+                self._editor_parameter_inputs[key] = widget
+
+        action_row = 7
+        self._editor_save_button = ttk.Button(lower_right, text="保存当前模板", command=self.save_selected_draft)
+        self._editor_save_button.grid(row=action_row, column=0, sticky="w", pady=(12, 0))
         ttk.Label(
             lower_right,
             justify="left",
-            text="\n".join(
-                [
-                    "1. 先在主界面把参数调好，再点“加入当前参数”保存成观察信号。",
-                    "2. 这里启动的都是 signal_only，会沿用策略本体逻辑，不再维护独立信号算法。",
-                    "3. 可以把同一信号复制到多个币种，适合一键启动邮件提醒。",
-                    "4. 真正的额度托管与审批，会放到独立的交易员管理台。",
-                ]
-            ),
-        ).grid(row=0, column=0, sticky="w")
+            foreground="#556070",
+            wraplength=420,
+            text="这里只维护 signal_only 观察参数，不改下单数量、不改额度配置；真正的额度托管与审批，会放到独立的交易员管理台。",
+        ).grid(row=action_row, column=1, sticky="w", pady=(12, 0))
 
         log_frame = ttk.LabelFrame(self.window, text="操作日志", padding=12)
         log_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
@@ -281,6 +504,7 @@ class SignalMonitorWindow:
             template_payload = item.get("template_payload")
             if not draft_id or not isinstance(template_payload, dict):
                 continue
+            template_payload = _normalize_template_payload(template_payload)
             created_at = _parse_time(item.get("created_at")) or datetime.now()
             updated_at = _parse_time(item.get("updated_at")) or created_at
             self._drafts.append(
@@ -309,6 +533,71 @@ class SignalMonitorWindow:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _preset_store_path(self) -> Path:
+        return signal_observer_presets_file_path()
+
+    def _load_presets(self) -> None:
+        path = self._preset_store_path()
+        self._presets = []
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self._append_log(f"读取观察预设失败：{exc}")
+            return
+        if not isinstance(payload, list):
+            return
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            preset_name = str(item.get("preset_name") or "").strip()
+            template_payload = item.get("template_payload")
+            if not preset_name or not isinstance(template_payload, dict):
+                continue
+            template_payload = _normalize_template_payload(template_payload)
+            created_at = _parse_time(item.get("created_at")) or datetime.now()
+            updated_at = _parse_time(item.get("updated_at")) or created_at
+            self._presets.append(
+                _ObserverPreset(
+                    preset_name=preset_name,
+                    template_payload=template_payload,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            )
+
+    def _save_presets(self) -> None:
+        payload = [
+            {
+                "preset_name": item.preset_name,
+                "template_payload": item.template_payload,
+                "created_at": item.created_at.isoformat(timespec="seconds"),
+                "updated_at": item.updated_at.isoformat(timespec="seconds"),
+            }
+            for item in self._presets
+        ]
+        path = self._preset_store_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _find_preset(self, preset_name: str) -> _ObserverPreset | None:
+        target = preset_name.strip()
+        for preset in self._presets:
+            if preset.preset_name == target:
+                return preset
+        return None
+
+    def _refresh_preset_choices(self) -> None:
+        if self._preset_combo is None:
+            return
+        choices = [item.preset_name for item in sorted(self._presets, key=lambda item: item.updated_at, reverse=True)]
+        self._preset_combo.configure(values=choices)
+        current = self._preset_choice.get().strip()
+        if current and current in choices:
+            return
+        self._preset_choice.set(choices[0] if choices else "")
+
     def _next_draft_id(self) -> str:
         self._draft_counter += 1
         return f"D{self._draft_counter:03d}"
@@ -332,10 +621,322 @@ class SignalMonitorWindow:
             return []
         return [str(item) for item in self.session_tree.selection()]
 
+    def _selected_single_draft(self) -> _ObserverDraft | None:
+        selected = self._selected_drafts()
+        if len(selected) != 1:
+            return None
+        return selected[0]
+
+    def _selected_preset(self) -> _ObserverPreset | None:
+        return self._find_preset(self._preset_choice.get())
+
+    def _suggest_preset_name(self, draft: _ObserverDraft) -> str:
+        payload = draft.template_payload
+        strategy_name = str(payload.get("strategy_name") or payload.get("strategy_id") or "观察模板").strip()
+        config_snapshot = payload.get("config_snapshot")
+        bar = ""
+        if isinstance(config_snapshot, dict):
+            bar = str(config_snapshot.get("bar") or "").strip()
+        direction = str(payload.get("direction_label") or "").strip()
+        parts = [strategy_name]
+        if bar:
+            parts.append(bar)
+        if direction:
+            parts.append(direction)
+        return " | ".join(parts)
+
+    def _on_preset_selected(self) -> None:
+        preset = self._selected_preset()
+        if preset is None:
+            return
+        self._preset_name.set(preset.preset_name)
+
+    def _set_editor_widget_state(self, widget: object, *, editable: bool) -> None:
+        if not editable:
+            try:
+                widget.configure(state="disabled")
+            except Exception:
+                pass
+            return
+        widget_class = ""
+        try:
+            widget_class = str(widget.winfo_class())
+        except Exception:
+            pass
+        preferred_states = ("readonly", "normal") if "Combobox" in widget_class else ("normal", "readonly")
+        for state in preferred_states:
+            try:
+                widget.configure(state=state)
+            except Exception:
+                continue
+            return
+
+    def _clear_editor(self, status: str) -> None:
+        self._editor_status_text.set(status)
+        self._editor_strategy_text.set("-")
+        self._editor_api_text.set("-")
+        self._editor_symbol.set("")
+        self._editor_run_mode_text.set("只发邮件")
+        for placeholder in self._editor_group_placeholders.values():
+            placeholder.configure(text="请选择左侧一条观察模板，右侧可微调周期、趋势和保护参数。")
+            placeholder.grid()
+        for key, variable in self._editor_parameter_vars.items():
+            default_value = strategy_parameter_default_value(key)
+            if isinstance(variable, BooleanVar):
+                variable.set(_coerce_bool(default_value))
+            else:
+                variable.set("" if default_value is None else str(default_value))
+            label = self._editor_parameter_labels.get(key)
+            if label is not None:
+                label.configure(text=_OBSERVER_PARAMETER_LABELS[key])
+            widget = self._editor_parameter_inputs.get(key)
+            if label is not None:
+                label.grid_remove()
+            if widget is not None:
+                widget.grid_remove()
+        self._set_editor_widget_state(self._editor_symbol_entry, editable=False)
+        if self._editor_save_button is not None:
+            self._set_editor_widget_state(self._editor_save_button, editable=False)
+
+    def _apply_editor_payload(self, draft: _ObserverDraft) -> None:
+        payload = draft.template_payload
+        strategy_id = str(payload.get("strategy_id") or "").strip()
+        config_snapshot = payload.get("config_snapshot")
+        if not strategy_id or not isinstance(config_snapshot, dict):
+            self._clear_editor("当前模板缺少策略参数，建议删除后重新加入。")
+            return
+        missing_keys = [
+            key
+            for key in _OBSERVER_PARAMETER_ORDER
+            if key not in self._editor_parameter_labels or key not in self._editor_parameter_inputs
+        ]
+        if missing_keys:
+            self._clear_editor("观察台参数面板尚未准备完成，请重新打开观察台。")
+            return
+        definition = get_strategy_definition(strategy_id)
+        self._editor_status_text.set(f"正在编辑 {draft.draft_id}，保存后只影响这条观察模板。")
+        self._editor_strategy_text.set(str(payload.get("strategy_name") or definition.name))
+        self._editor_api_text.set(str(payload.get("api_name") or "-"))
+        self._editor_symbol.set(str(payload.get("symbol") or config_snapshot.get("inst_id") or ""))
+        self._editor_run_mode_text.set(str(payload.get("run_mode_label") or "只发邮件"))
+        if not str(self._preset_name.get() or "").strip():
+            self._preset_name.set(self._suggest_preset_name(draft))
+        self._set_editor_widget_state(self._editor_symbol_entry, editable=True)
+        if self._editor_save_button is not None:
+            self._set_editor_widget_state(self._editor_save_button, editable=True)
+        visible_keys = set(iter_strategy_parameter_keys(strategy_id))
+        group_visible_counts = {group_name: 0 for group_name, _ in _OBSERVER_PARAMETER_GROUPS}
+        for key in _OBSERVER_PARAMETER_ORDER:
+            label = self._editor_parameter_labels[key]
+            widget = self._editor_parameter_inputs[key]
+            if key not in visible_keys:
+                label.grid_remove()
+                widget.grid_remove()
+                continue
+            group_name = _OBSERVER_PARAMETER_GROUP_BY_KEY.get(key, "")
+            if group_name:
+                group_visible_counts[group_name] = group_visible_counts.get(group_name, 0) + 1
+            label_text = _OBSERVER_PARAMETER_LABELS[key]
+            fixed_value = strategy_fixed_value(strategy_id, key)
+            if fixed_value is not None:
+                label_text = f"{label_text}（本策略固定）"
+            label.configure(text=label_text)
+            label.grid()
+            widget.grid()
+            raw_value = config_snapshot.get(key, strategy_parameter_default_value(key))
+            variable = self._editor_parameter_vars[key]
+            if key == "signal_mode":
+                variable.set(_SIGNAL_MODE_VALUE_TO_LABEL.get(str(raw_value), definition.default_signal_label))
+            elif key == "take_profit_mode":
+                variable.set(_TAKE_PROFIT_MODE_VALUE_TO_LABEL.get(str(raw_value), "动态止盈"))
+            elif isinstance(variable, BooleanVar):
+                variable.set(_coerce_bool(raw_value))
+            else:
+                variable.set("" if raw_value is None else str(raw_value))
+            self._set_editor_widget_state(widget, editable=strategy_is_parameter_editable(strategy_id, key, "observer"))
+        for group_name, placeholder in self._editor_group_placeholders.items():
+            if group_visible_counts.get(group_name, 0) > 0:
+                placeholder.grid_remove()
+            else:
+                placeholder.configure(text="当前策略在这个分组没有需要调整的观察参数。")
+                placeholder.grid()
+
+    def _refresh_editor_from_selection(self) -> None:
+        draft = self._selected_single_draft()
+        if draft is None:
+            if self._selected_draft_ids():
+                self._clear_editor("多选时仅支持批量启动；如需编辑，请只选中一条观察模板。")
+            else:
+                self._clear_editor("请选择左侧一条信号，右侧可微调观察参数。")
+            return
+        self._apply_editor_payload(draft)
+
+    def save_selected_draft(self) -> None:
+        draft = self._selected_single_draft()
+        if draft is None:
+            messagebox.showinfo("提示", "请先只选中一条观察模板。", parent=self.window)
+            return
+        payload = dict(draft.template_payload)
+        config_snapshot = payload.get("config_snapshot")
+        strategy_id = str(payload.get("strategy_id") or "").strip()
+        if not strategy_id or not isinstance(config_snapshot, dict):
+            messagebox.showerror("保存失败", "当前模板缺少有效的策略参数。", parent=self.window)
+            return
+        updated_snapshot = dict(config_snapshot)
+        symbol = str(self._editor_symbol.get() or "").strip().upper()
+        if not symbol:
+            messagebox.showinfo("提示", "请先填写有效标的。", parent=self.window)
+            return
+        old_symbol = str(payload.get("symbol") or updated_snapshot.get("inst_id") or "").strip().upper()
+        updated_snapshot["inst_id"] = symbol
+        if updated_snapshot.get("trade_inst_id") not in (None, ""):
+            updated_snapshot["trade_inst_id"] = symbol
+        if updated_snapshot.get("local_tp_sl_inst_id") not in (None, "") and updated_snapshot.get("local_tp_sl_inst_id") == old_symbol:
+            updated_snapshot["local_tp_sl_inst_id"] = symbol
+        direction_label = str(payload.get("direction_label") or "").strip()
+        definition = get_strategy_definition(strategy_id)
+        for key in iter_strategy_parameter_keys(strategy_id):
+            fixed_value = strategy_fixed_value(strategy_id, key)
+            if fixed_value is not None:
+                updated_snapshot[key] = fixed_value
+                if key == "signal_mode":
+                    direction_label = _SIGNAL_MODE_VALUE_TO_LABEL.get(str(fixed_value), definition.default_signal_label)
+                continue
+            variable = self._editor_parameter_vars.get(key)
+            if variable is None:
+                continue
+            if key == "signal_mode":
+                raw_value = _SIGNAL_MODE_LABEL_TO_VALUE.get(str(variable.get()).strip(), updated_snapshot.get(key, "both"))
+                direction_label = _SIGNAL_MODE_VALUE_TO_LABEL.get(str(raw_value), definition.default_signal_label)
+            elif key == "take_profit_mode":
+                raw_value = _TAKE_PROFIT_MODE_LABEL_TO_VALUE.get(
+                    str(variable.get()).strip(),
+                    updated_snapshot.get(key, "dynamic"),
+                )
+            elif isinstance(variable, BooleanVar):
+                raw_value = bool(variable.get())
+            else:
+                raw_value = str(variable.get()).strip()
+            updated_snapshot[key] = raw_value
+        payload["symbol"] = symbol
+        payload["direction_label"] = direction_label or definition.default_signal_label
+        payload["run_mode_label"] = "只发邮件"
+        payload["config_snapshot"] = updated_snapshot
+        draft.template_payload = _normalize_template_payload(payload)
+        draft.updated_at = datetime.now()
+        self._save_drafts()
+        self._refresh_views()
+        if self.draft_tree is not None and self.draft_tree.exists(draft.draft_id):
+            self.draft_tree.selection_set(draft.draft_id)
+        self._refresh_editor_from_selection()
+        self._append_log(f"[{draft.draft_id}] 已更新观察模板参数。")
+
+    def save_current_as_preset(self) -> None:
+        draft = self._selected_single_draft()
+        if draft is None:
+            messagebox.showinfo("提示", "请先只选中一条观察模板，再保存为预设。", parent=self.window)
+            return
+        preset_name = str(self._preset_name.get() or "").strip()
+        if not preset_name:
+            preset_name = self._suggest_preset_name(draft)
+            self._preset_name.set(preset_name)
+        existing = self._find_preset(preset_name)
+        if existing is not None:
+            confirmed = messagebox.askyesno(
+                "覆盖预设",
+                f"预设“{preset_name}”已经存在，是否用当前观察模板覆盖它？",
+                parent=self.window,
+            )
+            if not confirmed:
+                return
+            existing.template_payload = _normalize_template_payload(dict(draft.template_payload))
+            existing.updated_at = datetime.now()
+            if existing.created_at is None:
+                existing.created_at = existing.updated_at
+        else:
+            now = datetime.now()
+            self._presets.append(
+                _ObserverPreset(
+                    preset_name=preset_name,
+                    template_payload=_normalize_template_payload(dict(draft.template_payload)),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        self._save_presets()
+        self._refresh_preset_choices()
+        self._preset_choice.set(preset_name)
+        self._append_log(f"[预设] 已保存观察预设：{preset_name}")
+
+    def apply_selected_preset(self) -> None:
+        draft = self._selected_single_draft()
+        if draft is None:
+            messagebox.showinfo("提示", "请先只选中一条观察模板，再套用预设。", parent=self.window)
+            return
+        preset = self._selected_preset()
+        if preset is None:
+            messagebox.showinfo("提示", "请先选择一个观察预设。", parent=self.window)
+            return
+        preset_strategy_id = str(preset.template_payload.get("strategy_id") or "").strip()
+        draft_strategy_id = str(draft.template_payload.get("strategy_id") or "").strip()
+        if preset_strategy_id != draft_strategy_id:
+            messagebox.showinfo(
+                "提示",
+                "当前版本为了避免参数错位，只支持把同策略预设套用到当前观察模板。",
+                parent=self.window,
+            )
+            return
+        payload = dict(draft.template_payload)
+        config_snapshot = payload.get("config_snapshot")
+        preset_snapshot = preset.template_payload.get("config_snapshot")
+        if not isinstance(config_snapshot, dict) or not isinstance(preset_snapshot, dict):
+            messagebox.showerror("套用失败", "预设或模板缺少有效参数。", parent=self.window)
+            return
+        current_symbol = str(payload.get("symbol") or config_snapshot.get("inst_id") or "").strip().upper()
+        updated_snapshot = dict(preset_snapshot)
+        if current_symbol:
+            updated_snapshot["inst_id"] = current_symbol
+            if updated_snapshot.get("trade_inst_id") not in (None, ""):
+                updated_snapshot["trade_inst_id"] = current_symbol
+            if updated_snapshot.get("local_tp_sl_inst_id") not in (None, ""):
+                updated_snapshot["local_tp_sl_inst_id"] = current_symbol
+            payload["symbol"] = current_symbol
+        payload["direction_label"] = str(preset.template_payload.get("direction_label") or payload.get("direction_label") or "")
+        payload["run_mode_label"] = "只发邮件"
+        payload["config_snapshot"] = updated_snapshot
+        draft.template_payload = _normalize_template_payload(payload)
+        draft.updated_at = datetime.now()
+        self._save_drafts()
+        self._refresh_views()
+        if self.draft_tree is not None and self.draft_tree.exists(draft.draft_id):
+            self.draft_tree.selection_set(draft.draft_id)
+        self._refresh_editor_from_selection()
+        self._append_log(f"[{draft.draft_id}] 已套用观察预设：{preset.preset_name}")
+
+    def create_draft_from_preset(self) -> None:
+        preset = self._selected_preset()
+        if preset is None:
+            messagebox.showinfo("提示", "请先选择一个观察预设。", parent=self.window)
+            return
+        now = datetime.now()
+        draft = _ObserverDraft(
+            draft_id=self._next_draft_id(),
+            template_payload=_normalize_template_payload(dict(preset.template_payload)),
+            created_at=now,
+            updated_at=now,
+        )
+        self._drafts.append(draft)
+        self._save_drafts()
+        self._refresh_views()
+        if self.draft_tree is not None and self.draft_tree.exists(draft.draft_id):
+            self.draft_tree.selection_set(draft.draft_id)
+        self._refresh_editor_from_selection()
+        self._append_log(f"[{draft.draft_id}] 已从预设新建：{preset.preset_name}")
+
     def add_current_template(self) -> None:
         try:
             template = self._current_template_factory()
-            payload = self._template_serializer(template)
+            payload = _normalize_template_payload(self._template_serializer(template))
         except Exception as exc:
             messagebox.showerror("加入失败", str(exc), parent=self.window)
             return
@@ -349,6 +950,9 @@ class SignalMonitorWindow:
         self._drafts.append(draft)
         self._save_drafts()
         self._refresh_views()
+        if self.draft_tree is not None and self.draft_tree.exists(draft.draft_id):
+            self.draft_tree.selection_set(draft.draft_id)
+        self._refresh_editor_from_selection()
         self._append_log(f"[{draft.draft_id}] 已加入当前 signal_only 信号。")
 
     def clone_selected_to_symbols(self) -> None:
@@ -368,10 +972,11 @@ class SignalMonitorWindow:
                 continue
             for symbol in symbols:
                 cloned = self._template_symbol_cloner(template, symbol)
+                payload = _normalize_template_payload(self._template_serializer(cloned))
                 self._drafts.append(
                     _ObserverDraft(
                         draft_id=self._next_draft_id(),
-                        template_payload=self._template_serializer(cloned),
+                        template_payload=payload,
                         created_at=now,
                         updated_at=now,
                     )
@@ -382,6 +987,7 @@ class SignalMonitorWindow:
             return
         self._save_drafts()
         self._refresh_views()
+        self._refresh_editor_from_selection()
         self._append_log(f"已复制 {created} 条信号到批量币种。")
 
     def delete_selected_drafts(self) -> None:
@@ -392,6 +998,7 @@ class SignalMonitorWindow:
         self._drafts = [item for item in self._drafts if item.draft_id not in selected_ids]
         self._save_drafts()
         self._refresh_views()
+        self._refresh_editor_from_selection()
         self._append_log(f"已删除 {len(selected_ids)} 条观察信号。")
 
     def _start_drafts(self, drafts: list[_ObserverDraft], source_label: str) -> None:
@@ -527,7 +1134,9 @@ class SignalMonitorWindow:
     def _refresh_views(self) -> None:
         self._refresh_draft_tree()
         session_count = self._refresh_session_tree()
+        self._refresh_preset_choices()
         self._status_text.set(f"信号 {len(self._drafts)} 条 | 运行中 {session_count} 条")
+        self._refresh_editor_from_selection()
 
     def _append_log(self, message: str) -> None:
         timestamped = f"[信号观察台] {message}"

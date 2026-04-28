@@ -3,19 +3,26 @@ from __future__ import annotations
 import smtplib
 import threading
 from email.message import EmailMessage
-from typing import Callable
+from typing import Callable, Literal
 
 from okx_quant.log_utils import append_log_line, ensure_log_timestamp
 from okx_quant.models import EmailNotificationConfig, StrategyConfig
 
 
 Logger = Callable[[str], None]
+DeliveryPolicy = Callable[[Literal["signal", "trade_fill", "error"]], bool]
 
 
 class EmailNotifier:
-    def __init__(self, config: EmailNotificationConfig, logger: Logger | None = None) -> None:
+    def __init__(
+        self,
+        config: EmailNotificationConfig,
+        logger: Logger | None = None,
+        delivery_policy: DeliveryPolicy | None = None,
+    ) -> None:
         self._config = config
         self._logger = logger
+        self._delivery_policy = delivery_policy
 
     @property
     def enabled(self) -> bool:
@@ -23,7 +30,24 @@ class EmailNotifier:
 
     @property
     def signal_notifications_enabled(self) -> bool:
-        return self.enabled and self._config.notify_signals
+        return self.enabled and self._kind_enabled("signal")
+
+    def _delivery_allowed(self, kind: Literal["signal", "trade_fill", "error"]) -> bool:
+        if self._delivery_policy is None:
+            return True
+        try:
+            return bool(self._delivery_policy(kind))
+        except Exception:
+            return False
+
+    def _kind_enabled(self, kind: Literal["signal", "trade_fill", "error"]) -> bool:
+        if not self._delivery_allowed(kind):
+            return False
+        if kind == "signal":
+            return self._config.notify_signals
+        if kind == "trade_fill":
+            return self._config.notify_trade_fills
+        return self._config.notify_errors
 
     @staticmethod
     def _clean_api_name(api_name: str | None) -> str:
@@ -158,7 +182,7 @@ class EmailNotifier:
         direction_label: str = "",
         run_mode_label: str = "",
     ) -> None:
-        if not self._config.notify_signals:
+        if not self._kind_enabled("signal"):
             return
         subject = self._subject_with_context(
             f"[QQOKX] 信号提醒 | {strategy_name} | {trigger_symbol} | {self._signal_label(signal)}",
@@ -203,7 +227,7 @@ class EmailNotifier:
         direction_label: str = "",
         run_mode_label: str = "",
     ) -> None:
-        if not self._config.notify_trade_fills:
+        if not self._kind_enabled("trade_fill"):
             return
         subject = self._subject_with_context(
             f"[QQOKX] 成交通知 | {title} | {symbol}",
@@ -244,7 +268,7 @@ class EmailNotifier:
         direction_label: str = "",
         run_mode_label: str = "",
     ) -> None:
-        if not self._config.notify_errors:
+        if not self._kind_enabled("error"):
             return
         subject = self._subject_with_context(
             f"[QQOKX] 异常提醒 | {strategy_name}",
