@@ -90,6 +90,10 @@ class TraderSlotRecord:
     close_reason: str = ""
     history_record_id: str = ""
     note: str = ""
+    pending_manual_exit_mode: str = ""
+    pending_manual_exit_inst_id: str = ""
+    pending_manual_exit_order_id: str = ""
+    pending_manual_exit_cl_ord_id: str = ""
 
 
 @dataclass
@@ -590,6 +594,10 @@ def _slot_from_payload(payload: object) -> TraderSlotRecord | None:
         close_reason=str(payload.get("close_reason") or "").strip(),
         history_record_id=str(payload.get("history_record_id") or "").strip(),
         note=str(payload.get("note") or "").strip(),
+        pending_manual_exit_mode=str(payload.get("pending_manual_exit_mode") or "").strip(),
+        pending_manual_exit_inst_id=str(payload.get("pending_manual_exit_inst_id") or "").strip().upper(),
+        pending_manual_exit_order_id=str(payload.get("pending_manual_exit_order_id") or "").strip(),
+        pending_manual_exit_cl_ord_id=str(payload.get("pending_manual_exit_cl_ord_id") or "").strip(),
     )
 
 
@@ -616,6 +624,10 @@ def _slot_to_payload(slot: TraderSlotRecord) -> dict[str, object]:
         "close_reason": slot.close_reason,
         "history_record_id": slot.history_record_id,
         "note": slot.note,
+        "pending_manual_exit_mode": slot.pending_manual_exit_mode,
+        "pending_manual_exit_inst_id": slot.pending_manual_exit_inst_id,
+        "pending_manual_exit_order_id": slot.pending_manual_exit_order_id,
+        "pending_manual_exit_cl_ord_id": slot.pending_manual_exit_cl_ord_id,
     }
 
 

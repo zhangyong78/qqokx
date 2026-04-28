@@ -39,6 +39,7 @@ SnapshotProvider = Callable[[], TraderDeskSnapshot]
 DraftSaver = Callable[[TraderDraftRecord], None]
 DraftDeleter = Callable[[str], None]
 TraderAction = Callable[[str], None]
+TraderFlattenAction = Callable[[str, str], None]
 SymbolProvider = Callable[[], list[str]]
 RuntimeSnapshotProvider = Callable[[str], dict[str, object] | None]
 
@@ -77,6 +78,11 @@ SLOT_STATUS_LABELS: dict[str, str] = {
     "closed_manual": "人工结束",
     "stopped": "观察结束（未开仓）",
     "failed": "异常结束",
+}
+
+MANUAL_FLATTEN_MODE_LABELS: dict[str, str] = {
+    "market": "市价平仓",
+    "best_quote": "挂买一/卖一平仓",
 }
 
 
@@ -607,7 +613,7 @@ class TraderDeskWindow:
         trader_starter: TraderAction,
         trader_pauser: TraderAction,
         trader_resumer: TraderAction,
-        trader_flattener: TraderAction,
+        trader_flattener: TraderFlattenAction,
         trader_force_cleaner: TraderAction,
         symbol_provider: SymbolProvider,
         runtime_snapshot_provider: RuntimeSnapshotProvider,
@@ -1363,6 +1369,30 @@ class TraderDeskWindow:
 
     def flatten_selected_trader(self) -> None:
         self._run_action(self._trader_flattener, "平仓", "已请求手动平仓")
+
+    def flatten_selected_trader(self) -> None:
+        draft = self._selected_draft()
+        if draft is None:
+            messagebox.showinfo("提示", "请先选中一条交易员草稿。", parent=self.window)
+            return
+        choice = messagebox.askyesnocancel(
+            "手动平仓方式",
+            "请选择这次手动平仓的报单方式。\n\n"
+            "是：市价平仓\n"
+            "否：挂买一/卖一平仓\n"
+            "取消：不执行\n\n"
+            "说明：挂买一/卖一是限价挂单，可能不会立刻成交；未成交前额度不会释放。",
+            parent=self.window,
+        )
+        if choice is None:
+            return
+        flatten_mode = "market" if choice else "best_quote"
+        mode_label = MANUAL_FLATTEN_MODE_LABELS.get(flatten_mode, flatten_mode)
+        self._run_action(
+            lambda trader_id: self._trader_flattener(trader_id, flatten_mode),
+            "平仓",
+            f"已请求手动平仓（{mode_label}）",
+        )
 
     def force_cleanup_selected_trader(self) -> None:
         draft = self._selected_draft()

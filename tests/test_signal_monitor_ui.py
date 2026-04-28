@@ -24,8 +24,26 @@ class _SessionTreeStub:
     def exists(self, iid: str) -> bool:
         return iid in self.rows
 
+    @staticmethod
+    def identify_column(_x: int) -> str:
+        return "#1"
+
+    @staticmethod
+    def identify_row(_y: int) -> str:
+        return ""
+
+    @staticmethod
+    def identify_region(_x: int, _y: int) -> str:
+        return "heading"
+
     def insert(self, _parent: str, _index: object, *, iid: str, values: tuple[object, ...]) -> None:
         self.rows[iid] = {"values": values}
+
+    def item(self, iid: str, option: str | None = None):
+        row = self.rows[iid]
+        if option is None:
+            return row
+        return row.get(option)
 
     def delete(self, iid: str) -> None:
         self.rows.pop(iid, None)
@@ -63,6 +81,32 @@ class _Var:
 
 
 class SignalObserverTemplateNormalizationTest(TestCase):
+    def test_session_tree_double_click_hint_maps_supported_columns(self) -> None:
+        self.assertEqual(SignalMonitorWindow._session_tree_double_click_hint("#1"), "双击打开这条会话的独立日志")
+        self.assertEqual(SignalMonitorWindow._session_tree_double_click_hint("#3"), "双击打开这条会话的实时K线图")
+        self.assertEqual(SignalMonitorWindow._session_tree_double_click_hint("#2"), "")
+
+    def test_session_tree_double_click_opens_log_and_live_chart(self) -> None:
+        tree = _SessionTreeStub()
+        tree.rows["S01"] = {"values": ("S01", "EMA", "BTC-USDT-SWAP", "moni", "运行中", "-")}
+        window = object.__new__(SignalMonitorWindow)
+        window.session_tree = tree
+        opened_logs: list[str] = []
+        opened_charts: list[str] = []
+        window._session_log_opener = opened_logs.append
+        window._session_chart_opener = opened_charts.append
+
+        tree.identify_row = lambda _y: "S01"
+        tree.identify_column = lambda _x: "#1"
+        result = SignalMonitorWindow._on_session_tree_double_click(window, SimpleNamespace(x=8, y=12))
+        self.assertEqual(result, "break")
+        self.assertEqual(opened_logs, ["S01"])
+
+        tree.identify_column = lambda _x: "#3"
+        result = SignalMonitorWindow._on_session_tree_double_click(window, SimpleNamespace(x=24, y=12))
+        self.assertEqual(result, "break")
+        self.assertEqual(opened_charts, ["S01"])
+
     def test_normalize_template_payload_applies_fixed_dynamic_signal_mode(self) -> None:
         payload = {
             "strategy_id": STRATEGY_DYNAMIC_LONG_ID,

@@ -40,11 +40,22 @@ class StrategyLiveChartMarker:
 
 
 @dataclass(frozen=True)
+class StrategyLiveChartTimeMarker:
+    key: str
+    label: str
+    at: datetime
+    color: str
+    dash: tuple[int, ...] = ()
+    width: int = 1
+
+
+@dataclass(frozen=True)
 class StrategyLiveChartSnapshot:
     session_id: str
     candles: tuple[Candle, ...]
     series: tuple[StrategyLiveChartOverlaySeries, ...] = ()
     markers: tuple[StrategyLiveChartMarker, ...] = ()
+    time_markers: tuple[StrategyLiveChartTimeMarker, ...] = ()
     latest_price: Decimal | None = None
     latest_candle_time: datetime | None = None
     latest_candle_confirmed: bool = True
@@ -76,6 +87,8 @@ def build_strategy_live_chart_snapshot(
     reference_ema_period: int | None = None,
     pending_entry_prices: tuple[Decimal, ...] = (),
     entry_price: Decimal | None = None,
+    entry_time: datetime | None = None,
+    time_markers: tuple[StrategyLiveChartTimeMarker, ...] = (),
     position_avg_price: Decimal | None = None,
     stop_price: Decimal | None = None,
     latest_price: Decimal | None = None,
@@ -163,6 +176,20 @@ def build_strategy_live_chart_snapshot(
         color="#bf8700",
         dash=(2, 2),
     )
+    resolved_time_markers: list[StrategyLiveChartTimeMarker] = list(time_markers)
+    if entry_time is not None:
+        existing_entry = any(marker.key == "entry_time" for marker in resolved_time_markers)
+        if not existing_entry:
+            resolved_time_markers.append(
+                StrategyLiveChartTimeMarker(
+                    key="entry_time",
+                    label=f"开仓 {entry_time.strftime('%m-%d %H:%M')}",
+                    at=entry_time,
+                    color="#6f42c1",
+                    dash=(4, 3),
+                    width=2,
+                )
+            )
 
     latest_candle_time = None
     latest_candle_confirmed = True
@@ -177,6 +204,7 @@ def build_strategy_live_chart_snapshot(
         candles=candle_items,
         series=tuple(series),
         markers=tuple(markers),
+        time_markers=tuple(resolved_time_markers),
         latest_price=latest_price,
         latest_candle_time=latest_candle_time,
         latest_candle_confirmed=latest_candle_confirmed,
@@ -259,6 +287,31 @@ def render_strategy_live_chart(canvas: Canvas, snapshot: StrategyLiveChartSnapsh
             text=_format_chart_timestamp(snapshot.candles[index].ts),
             fill=_MUTED_TEXT_COLOR,
             anchor="n",
+            font=("Microsoft YaHei UI", 9),
+        )
+
+    for time_marker in snapshot.time_markers:
+        x = _time_marker_x(time_marker.at, snapshot, bounds, candle_step)
+        line_kwargs = {
+            "fill": time_marker.color,
+            "width": time_marker.width,
+        }
+        if time_marker.dash:
+            line_kwargs["dash"] = time_marker.dash
+        canvas.create_line(x, bounds.top, x, bounds.bottom, **line_kwargs)
+        label_text = time_marker.label
+        text_width = max(len(label_text) * 7 + 14, 88)
+        x1 = min(max(bounds.left, x - text_width / 2), max(bounds.left, bounds.right - text_width))
+        x2 = x1 + text_width
+        y1 = max(6, bounds.top - 28)
+        y2 = y1 + 18
+        canvas.create_rectangle(x1, y1, x2, y2, outline=time_marker.color, fill=_PRICE_LABEL_BG)
+        canvas.create_text(
+            x1 + 6,
+            y1 + 9,
+            text=label_text,
+            fill=time_marker.color,
+            anchor="w",
             font=("Microsoft YaHei UI", 9),
         )
 
@@ -406,6 +459,22 @@ def _price_to_y(price: Decimal, lower: Decimal, upper: Decimal, bounds: _ChartBo
     ratio = float((upper - price) / (upper - lower))
     ratio = min(max(ratio, 0.0), 1.0)
     return bounds.top + bounds.height * ratio
+
+
+def _time_marker_x(
+    at: datetime,
+    snapshot: StrategyLiveChartSnapshot,
+    bounds: _ChartBounds,
+    candle_step: float,
+) -> float:
+    if not snapshot.candles:
+        return bounds.left
+    target_ms = at.timestamp() * 1000
+    closest_index = min(
+        range(len(snapshot.candles)),
+        key=lambda index: abs(snapshot.candles[index].ts - target_ms),
+    )
+    return bounds.left + (closest_index + 0.5) * candle_step
 
 
 def _format_chart_timestamp(ts: int) -> str:

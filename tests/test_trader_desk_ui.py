@@ -388,6 +388,36 @@ class TraderDeskHelpersTest(TestCase):
         showinfo.assert_called_once()
         showerror.assert_not_called()
 
+    def test_flatten_selected_trader_asks_for_mode_and_dispatches_best_quote(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload=self._payload(),
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+        )
+        captured: dict[str, object] = {}
+        flattener = MagicMock()
+        window = SimpleNamespace(
+            window=object(),
+            _selected_draft=lambda: draft,
+            _trader_flattener=flattener,
+            _run_action=lambda action, title, success_message: captured.update(
+                action=action,
+                title=title,
+                success_message=success_message,
+            ),
+        )
+
+        with patch("okx_quant.trader_desk_ui.messagebox.askyesnocancel", return_value=False) as chooser:
+            TraderDeskWindow.flatten_selected_trader(window)
+
+        chooser.assert_called_once()
+        self.assertEqual(captured["title"], "平仓")
+        self.assertIn("挂买一/卖一平仓", str(captured["success_message"]))
+        captured["action"]("T001")
+        flattener.assert_called_once_with("T001", "best_quote")
+
     def test_force_cleanup_selected_trader_confirms_then_runs_force_cleaner(self) -> None:
         draft = TraderDraftRecord(
             trader_id="T001",

@@ -284,7 +284,7 @@ class StrategyEngine:
             (
                 f"风险金={format_decimal(config.risk_amount)}"
                 if has_risk_amount
-                else f"固定数量={format_decimal(config.order_size)}"
+                else f"固定数量={_format_size_with_contract_equivalent(instrument, config.order_size)}"
             ),
             f"止损ATR倍数={format_decimal(config.atr_stop_multiplier)}",
             f"止盈ATR倍数={format_decimal(config.atr_take_multiplier)}",
@@ -486,7 +486,7 @@ class StrategyEngine:
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 准备挂单 | 方向={plan.signal.upper()} | "
                 f"第{current_wave_index}波 | 本波第{entries_in_current_wave + 1}次委托 | "
-                f"开仓价={format_decimal(plan.entry_reference)} | 数量={format_decimal(plan.size)} | "
+                f"开仓价={format_decimal(plan.entry_reference)} | 数量={_format_size_with_contract_equivalent(instrument, plan.size)} | "
                 f"止损={format_decimal(plan.stop_loss)} | "
                 f"{'动态止盈=初始不挂止盈' if dynamic_stop_only else f'止盈={format_decimal(plan.take_profit)}'}"
             )
@@ -608,7 +608,7 @@ class StrategyEngine:
             )
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 准备市价单 | 方向={plan.signal.upper()} | "
-                f"参考入场价={format_decimal(plan.entry_reference)} | 数量={format_decimal(plan.size)} | "
+                f"参考入场价={format_decimal(plan.entry_reference)} | 数量={_format_size_with_contract_equivalent(instrument, plan.size)} | "
                 f"止损={format_decimal(plan.stop_loss)} | 止盈={format_decimal(plan.take_profit)}"
             )
             cl_ord_id = self._next_client_order_id(role="entry")
@@ -642,7 +642,7 @@ class StrategyEngine:
             self._logger(
                 f"市价单成交 | ordId={filled.ord_id} | 标的={instrument.inst_id} | "
                 f"方向={filled.side.upper()} | 成交均价={format_decimal(filled.entry_price)} | "
-                f"成交数量={format_decimal(filled.size)}"
+                f"成交数量={_format_size_with_contract_equivalent(instrument, filled.size)}"
             )
             self._notify_trade_fill(
                 config,
@@ -1496,7 +1496,7 @@ class StrategyEngine:
         self._logger(
             f"{_fmt_ts(signal_candle_ts)} | 准备下单 | 方向={signal.upper()} | "
             f"预估入场价={format_decimal(price_for_size)} | EMA止损线={format_decimal(stop_price)} | "
-            f"下单数量={format_decimal(size)}"
+            f"下单数量={_format_size_with_contract_equivalent(trade_instrument, size)}"
         )
         result = self._place_entry_order(credentials, config, trade_instrument, trade_side, size, pos_side)
         filled = self._wait_for_order_fill(
@@ -1511,7 +1511,7 @@ class StrategyEngine:
         self._logger(
             f"EMA 交叉开仓已成交 | ordId={filled.ord_id} | 标的={trade_instrument.inst_id} | "
             f"方向={trade_side.upper()} | 成交均价={format_decimal(filled.entry_price)} | "
-            f"成交数量={format_decimal(filled.size)}"
+            f"成交数量={_format_size_with_contract_equivalent(trade_instrument, filled.size)}"
         )
         self._notify_trade_fill(
             config,
@@ -1566,7 +1566,7 @@ class StrategyEngine:
         self._logger(
             f"{_fmt_ts(signal_candle_ts or int(datetime.now().timestamp() * 1000))} | 准备本地下单 | "
             f"信号方向={signal.upper()} | 实际下单方向={trade_side.upper()} | 下单标的={trade_instrument.inst_id} | "
-            f"预估入场价={format_decimal(price_for_size)} | 数量={format_decimal(size)}"
+            f"预估入场价={format_decimal(price_for_size)} | 数量={_format_size_with_contract_equivalent(trade_instrument, size)}"
         )
 
         result = self._place_entry_order(credentials, config, trade_instrument, trade_side, size, pos_side)
@@ -1582,7 +1582,7 @@ class StrategyEngine:
         self._logger(
             f"本地下单成交 | ordId={filled.ord_id} | 标的={trade_instrument.inst_id} | "
             f"方向={trade_side.upper()} | 成交均价={format_decimal(filled.entry_price)} | "
-            f"成交数量={format_decimal(filled.size)}"
+            f"成交数量={_format_size_with_contract_equivalent(trade_instrument, filled.size)}"
         )
         self._notify_trade_fill(
             config,
@@ -1778,7 +1778,7 @@ class StrategyEngine:
             self._logger(
                 f"本地{reason}平仓已成交 | ordId={filled.ord_id} | 标的={trade_instrument.inst_id} | "
                 f"方向={position.close_side.upper()} | 成交均价={format_decimal(filled.entry_price)} | "
-                f"成交数量={format_decimal(filled.size)} | 剩余={format_decimal(max(remaining, Decimal('0')))}"
+                f"成交数量={_format_size_with_contract_equivalent(trade_instrument, filled.size)} | 剩余={_format_size_with_contract_equivalent(trade_instrument, max(remaining, Decimal('0')))}"
             )
             self._notify_trade_fill(
                 config,
@@ -2905,6 +2905,7 @@ class StrategyEngine:
             raise RuntimeError("OKX 未返回 ordId，无法确认订单成交情况")
 
         latest_state = ""
+        price_delta_multiplier = _instrument_price_delta_multiplier(trade_instrument)
         for _ in range(12):
             status = self._get_order_with_retry(
                 credentials,
@@ -2925,6 +2926,7 @@ class StrategyEngine:
                     size=filled_size if filled_size > 0 else status.size or Decimal("0"),
                     entry_price=status.avg_price or status.price or estimated_entry,
                     entry_ts=int(time.time() * 1000),
+                    price_delta_multiplier=price_delta_multiplier,
                 )
             if latest_state == "partially_filled" and filled_size > 0:
                 return FilledPosition(
@@ -2937,6 +2939,7 @@ class StrategyEngine:
                     size=filled_size,
                     entry_price=status.avg_price or status.price or estimated_entry,
                     entry_ts=int(time.time() * 1000),
+                    price_delta_multiplier=price_delta_multiplier,
                 )
             if latest_state in {"canceled", "order_failed"}:
                 break
@@ -3117,10 +3120,11 @@ class StrategyEngine:
         filled_price = status.avg_price or status.price or active_order.entry_reference
         filled_size = status.filled_size or status.size or active_order.size
         ord_id = status.ord_id or active_order.ord_id
+        price_delta_multiplier = _instrument_price_delta_multiplier(trade_instrument)
         if config.trader_virtual_stop_loss:
             self._logger(
                 f"{_fmt_ts(newest_ts)} | 挂单已成交 | ordId={ord_id} | "
-                f"开仓价={format_decimal(filled_price)} | 数量={format_decimal(filled_size)}"
+                f"开仓价={format_decimal(filled_price)} | 数量={_format_size_with_contract_equivalent(trade_instrument, filled_size)}"
             )
             self._notify_trade_fill(
                 config,
@@ -3141,6 +3145,7 @@ class StrategyEngine:
                 size=filled_size,
                 entry_price=filled_price,
                 entry_ts=int(time.time() * 1000),
+                price_delta_multiplier=price_delta_multiplier,
             )
             self._monitor_trader_virtual_position(
                 credentials,
@@ -3154,7 +3159,7 @@ class StrategyEngine:
             return
         self._logger(
             f"{_fmt_ts(newest_ts)} | 挂单已成交 | ordId={ord_id} | "
-            f"开仓价={format_decimal(filled_price)} | 数量={format_decimal(filled_size)}"
+            f"开仓价={format_decimal(filled_price)} | 数量={_format_size_with_contract_equivalent(trade_instrument, filled_size)}"
         )
         fill_reason = (
             "EMA 动态委托已成交，初始止损已交给 OKX 托管，后续将动态上移"
@@ -3180,6 +3185,7 @@ class StrategyEngine:
             size=filled_size,
             entry_price=filled_price,
             entry_ts=int(time.time() * 1000),
+            price_delta_multiplier=price_delta_multiplier,
         )
         if dynamic_stop_only:
             self._logger(
@@ -3453,10 +3459,13 @@ class StrategyEngine:
         matched_size = min(abs(fill_size), abs(position.size))
         if matched_size <= 0:
             return ""
+        price_delta_multiplier = (
+            position.price_delta_multiplier if position.price_delta_multiplier > 0 else Decimal("1")
+        )
         if position.side == "buy":
-            pnl = (fill_price - position.entry_price) * matched_size
+            pnl = (fill_price - position.entry_price) * matched_size * price_delta_multiplier
         else:
-            pnl = (position.entry_price - fill_price) * matched_size
+            pnl = (position.entry_price - fill_price) * matched_size * price_delta_multiplier
         return format_decimal(pnl)
 
     def _notify_error(self, config: StrategyConfig | None, message: str) -> None:
@@ -3885,6 +3894,42 @@ def _is_okx_order_not_found_error(exc: OkxApiError) -> bool:
     )
 
 
+def _instrument_price_delta_multiplier(instrument: Instrument) -> Decimal:
+    if instrument.inst_type not in {"SWAP", "FUTURES"}:
+        return Decimal("1")
+    settle_ccy = (instrument.settle_ccy or "").strip().upper()
+    if settle_ccy not in {"USDT", "USDC"}:
+        return Decimal("1")
+    ct_val = instrument.ct_val if instrument.ct_val is not None and instrument.ct_val > 0 else None
+    if ct_val is None:
+        return Decimal("1")
+    ct_mult = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
+    multiplier = ct_val * ct_mult
+    return multiplier if multiplier > 0 else Decimal("1")
+
+
+def _instrument_contract_base_currency(instrument: Instrument) -> str | None:
+    candidate = (instrument.ct_val_ccy or "").strip().upper()
+    if candidate:
+        return candidate
+    normalized_inst_id = instrument.inst_id.strip().upper()
+    if "-" in normalized_inst_id:
+        return normalized_inst_id.split("-", 1)[0]
+    return None
+
+
+def _format_size_with_contract_equivalent(instrument: Instrument, size: Decimal) -> str:
+    contract_multiplier = _instrument_price_delta_multiplier(instrument)
+    contract_ccy = _instrument_contract_base_currency(instrument)
+    if instrument.inst_type in {"SWAP", "FUTURES", "OPTION"} and contract_multiplier > 0 and contract_ccy:
+        amount = abs(size) * contract_multiplier
+        amount_text = format_decimal(amount)
+        if size < 0:
+            amount_text = f"-{amount_text}"
+        return f"{format_decimal(size)}\u5f20\uff08\u6298\u5408{amount_text} {contract_ccy}\uff09"
+    return format_decimal(size)
+
+
 def determine_order_size(
     *,
     instrument: Instrument,
@@ -3894,7 +3939,7 @@ def determine_order_size(
     risk_price_compatible: bool,
 ) -> Decimal:
     if config.risk_amount is not None and config.risk_amount > 0 and risk_price_compatible:
-        risk_per_unit = abs(entry_price - stop_loss)
+        risk_per_unit = abs(entry_price - stop_loss) * _instrument_price_delta_multiplier(instrument)
         if risk_per_unit <= 0:
             raise RuntimeError("开仓价与止损价过于接近，无法根据风险金计算数量")
         size_raw = config.risk_amount / risk_per_unit

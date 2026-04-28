@@ -107,6 +107,7 @@ from okx_quant.strategy_live_chart import (
     DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT,
     DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS,
     StrategyLiveChartSnapshot,
+    StrategyLiveChartTimeMarker,
     build_strategy_live_chart_snapshot,
     render_strategy_live_chart,
 )
@@ -2728,21 +2729,22 @@ class QuantApp:
         ).grid(row=0, column=3, padx=(0, 6))
         ttk.Button(action_row, text="账户信息", command=self.open_account_info_window).grid(row=0, column=4, padx=(0, 6))
         ttk.Button(action_row, text="持仓大窗", command=self.open_positions_zoom_window).grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(action_row, text="平仓选中", command=self.flatten_selected_position).grid(row=0, column=6, padx=(0, 6))
         ttk.Button(action_row, text="设置期权保护", command=self.open_position_protection_window).grid(
-            row=0, column=6, padx=(0, 6)
-        )
-        ttk.Button(action_row, text="展期建议", command=self.open_option_roll_window).grid(
             row=0, column=7, padx=(0, 6)
         )
-        ttk.Button(action_row, text="全部展开", command=self.expand_all_position_groups).grid(
+        ttk.Button(action_row, text="展期建议", command=self.open_option_roll_window).grid(
             row=0, column=8, padx=(0, 6)
         )
-        ttk.Button(action_row, text="折叠分组", command=self.collapse_position_groups).grid(
+        ttk.Button(action_row, text="全部展开", command=self.expand_all_position_groups).grid(
             row=0, column=9, padx=(0, 6)
         )
-        ttk.Button(action_row, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=10, padx=(0, 6))
-        ttk.Button(action_row, text="清空备注", command=self.clear_selected_position_note).grid(row=0, column=11, padx=(0, 6))
-        ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=12)
+        ttk.Button(action_row, text="折叠分组", command=self.collapse_position_groups).grid(
+            row=0, column=10, padx=(0, 6)
+        )
+        ttk.Button(action_row, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=11, padx=(0, 6))
+        ttk.Button(action_row, text="清空备注", command=self.clear_selected_position_note).grid(row=0, column=12, padx=(0, 6))
+        ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=13)
 
         filter_row = ttk.Frame(positions_frame)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -3936,24 +3938,25 @@ class QuantApp:
         ttk.Button(zoom_actions, text="刷新历史", command=self.refresh_position_histories).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(zoom_actions, text="刷新历史成交", command=self.refresh_fill_history).grid(row=0, column=2, padx=(0, 6))
         ttk.Button(zoom_actions, text="账户信息", command=self.open_account_info_window).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(zoom_actions, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=4, padx=(0, 6))
-        ttk.Button(zoom_actions, text="清空备注", command=self.clear_selected_position_note).grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(zoom_actions, text="平仓选中", command=self.flatten_selected_position).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(zoom_actions, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(zoom_actions, text="清空备注", command=self.clear_selected_position_note).grid(row=0, column=6, padx=(0, 6))
         ttk.Button(zoom_actions, text="设置期权保护", command=self.open_position_protection_window).grid(
-            row=0, column=6, padx=(0, 6)
-        )
-        ttk.Button(zoom_actions, text="展期建议", command=self.open_option_roll_window).grid(
             row=0, column=7, padx=(0, 6)
         )
-        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=8)
+        ttk.Button(zoom_actions, text="展期建议", command=self.open_option_roll_window).grid(
+            row=0, column=8, padx=(0, 6)
+        )
+        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=9)
         ttk.Button(zoom_actions, text="列设置", command=self.open_positions_zoom_column_window).grid(
-            row=0, column=9, padx=(0, 6)
+            row=0, column=10, padx=(0, 6)
         )
 
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_detail_toggle_text, command=self.toggle_positions_zoom_detail).grid(
-            row=0, column=10, padx=(0, 6)
+            row=0, column=11, padx=(0, 6)
         )
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_history_toggle_text, command=self.toggle_positions_zoom_history).grid(
-            row=0, column=11
+            row=0, column=12
         )
         for column_index, child in enumerate(zoom_actions.winfo_children()):
             child.grid_configure(column=column_index)
@@ -7452,7 +7455,10 @@ class QuantApp:
             trader_starter=self.start_trader_draft,
             trader_pauser=self.pause_trader_draft,
             trader_resumer=self.resume_trader_draft,
-            trader_flattener=self.flatten_trader_draft,
+            trader_flattener=lambda trader_id, flatten_mode="market": self.flatten_trader_draft(
+                trader_id,
+                flatten_mode=flatten_mode,
+            ),
             trader_force_cleaner=self.force_clear_trader_draft,
             symbol_provider=self._trader_desk_symbol_choices,
             runtime_snapshot_provider=self._trader_runtime_snapshot_for_ui,
@@ -8481,8 +8487,157 @@ class QuantApp:
         trade_inst_id = _session_trade_inst_id(session) or session.symbol
         return (
             f"{session.session_id} | {session.strategy_name} | {trade_inst_id} | "
-            f"\u5468\u671f {session.config.bar} | API {session.api_name} | \u6a21\u5f0f {session.run_mode_label}"
+            f"?? {session.config.bar} | API {session.api_name} | ?? {session.run_mode_label}"
         )
+
+    def _latest_strategy_trade_ledger_record(self, session: StrategySession) -> StrategyTradeLedgerRecord | None:
+        matched: list[StrategyTradeLedgerRecord] = []
+        if session.history_record_id:
+            matched = [
+                item
+                for item in self._strategy_trade_ledger_records
+                if item.history_record_id == session.history_record_id
+            ]
+        if not matched:
+            matched = [item for item in self._strategy_trade_ledger_records if item.session_id == session.session_id]
+        if not matched:
+            return None
+        return max(matched, key=lambda item: (item.closed_at, item.record_id))
+
+    def _strategy_live_chart_event_time_markers(
+        self,
+        session: StrategySession,
+        trade_inst_id: str,
+    ) -> tuple[StrategyLiveChartTimeMarker, ...]:
+        markers: list[StrategyLiveChartTimeMarker] = []
+        trade = session.active_trade
+        latest_ledger = self._latest_strategy_trade_ledger_record(session)
+        if latest_ledger is not None and latest_ledger.opened_at and latest_ledger.closed_at:
+            if latest_ledger.closed_at >= latest_ledger.opened_at:
+                markers.append(
+                    StrategyLiveChartTimeMarker(
+                        key=f"close:{latest_ledger.record_id}",
+                        label=f"?? {latest_ledger.closed_at.strftime('%m-%d %H:%M')}",
+                        at=latest_ledger.closed_at,
+                        color="#cf222e",
+                        dash=(6, 3),
+                        width=2,
+                    )
+                )
+
+        credentials = self._credentials_for_profile_or_none(session.api_name)
+        if credentials is None:
+            return tuple(markers)
+
+        open_anchor = None
+        if trade is not None and trade.opened_logged_at is not None:
+            open_anchor = trade.opened_logged_at
+        elif latest_ledger is not None and latest_ledger.opened_at is not None:
+            open_anchor = latest_ledger.opened_at
+        if open_anchor is None:
+            return tuple(markers)
+
+        inst_type = infer_inst_type(trade_inst_id)
+        inst_types = (inst_type,) if inst_type else ("SWAP", "FUTURES", "OPTION", "SPOT")
+        try:
+            fills = self.client.get_fills_history(
+                credentials,
+                environment=session.config.environment,
+                inst_types=inst_types,
+                limit=120,
+            )
+        except Exception:
+            return tuple(markers)
+
+        lower_ms = int((open_anchor - timedelta(minutes=2)).timestamp() * 1000)
+        relevant_fills = [
+            item
+            for item in fills
+            if item.fill_time is not None
+            and item.fill_time >= lower_ms
+            and item.inst_id.strip().upper() == trade_inst_id.strip().upper()
+        ]
+        if not relevant_fills:
+            return tuple(markers)
+        relevant_fills.sort(key=lambda item: (item.fill_time or 0, item.trade_id or "", item.order_id or ""))
+
+        entry_order_ids = {
+            value.strip()
+            for value in (
+                trade.entry_order_id if trade is not None else "",
+                latest_ledger.entry_order_id if latest_ledger is not None else "",
+            )
+            if str(value).strip()
+        }
+        close_order_ids = {
+            value.strip()
+            for value in (latest_ledger.exit_order_id if latest_ledger is not None else "",)
+            if str(value).strip()
+        }
+
+        open_side = ""
+        for fill in relevant_fills:
+            order_id = str(fill.order_id or "").strip()
+            if order_id and order_id in entry_order_ids and fill.side:
+                open_side = str(fill.side).strip().lower()
+                break
+        if not open_side:
+            open_side = str(relevant_fills[0].side or "").strip().lower()
+
+        seen_events: set[str] = set()
+        same_side_seen = 0
+        close_marker_exists = any(marker.key.startswith("close:") for marker in markers)
+        for fill in relevant_fills:
+            fill_time = fill.fill_time
+            side = str(fill.side or "").strip().lower()
+            if fill_time is None or not side:
+                continue
+            order_id = str(fill.order_id or "").strip()
+            dedupe_key = order_id or f"{fill_time}:{side}"
+            if dedupe_key in seen_events:
+                continue
+            seen_events.add(dedupe_key)
+            event_at = datetime.fromtimestamp(fill_time / 1000)
+            if side == open_side:
+                if same_side_seen == 0:
+                    same_side_seen += 1
+                    continue
+                same_side_seen += 1
+                markers.append(
+                    StrategyLiveChartTimeMarker(
+                        key=f"add:{dedupe_key}",
+                        label=f"?? {event_at.strftime('%m-%d %H:%M')}",
+                        at=event_at,
+                        color="#1d4ed8",
+                        dash=(2, 2),
+                    )
+                )
+                continue
+            if order_id and order_id in close_order_ids:
+                if close_marker_exists:
+                    continue
+                markers.append(
+                    StrategyLiveChartTimeMarker(
+                        key=f"close-order:{dedupe_key}",
+                        label=f"?? {event_at.strftime('%m-%d %H:%M')}",
+                        at=event_at,
+                        color="#cf222e",
+                        dash=(6, 3),
+                        width=2,
+                    )
+                )
+                close_marker_exists = True
+                continue
+            markers.append(
+                StrategyLiveChartTimeMarker(
+                    key=f"reduce:{dedupe_key}",
+                    label=f"?? {event_at.strftime('%m-%d %H:%M')}",
+                    at=event_at,
+                    color="#d97706",
+                    dash=(3, 3),
+                )
+            )
+        return tuple(markers)
 
     def _close_strategy_live_chart_window(self, session_id: str) -> None:
         state = self._strategy_live_chart_windows.pop(session_id, None)
@@ -8565,6 +8720,8 @@ class QuantApp:
         live_pnl, live_pnl_refreshed_at = self._session_live_pnl_snapshot(session)
         stop_price = self._strategy_live_chart_stop_price(session)
         entry_price = session.active_trade.entry_price if session.active_trade is not None else None
+        entry_time = session.active_trade.opened_logged_at if session.active_trade is not None else None
+        time_markers = self._strategy_live_chart_event_time_markers(session, trade_inst_id)
         chart_refreshed_at = datetime.now()
         snapshot = build_strategy_live_chart_snapshot(
             session_id=session.session_id,
@@ -8574,6 +8731,8 @@ class QuantApp:
             reference_ema_period=session.config.resolved_entry_reference_ema_period(),
             pending_entry_prices=pending_entry_prices,
             entry_price=entry_price,
+            entry_time=entry_time,
+            time_markers=time_markers,
             position_avg_price=position_avg_price,
             stop_price=stop_price,
             latest_price=candles[-1].close if candles else None,
@@ -9440,11 +9599,12 @@ class QuantApp:
         self._save_trader_desk_snapshot()
         self._ensure_trader_watcher(trader_id)
 
-    def flatten_trader_draft(self, trader_id: str) -> None:
+    def flatten_trader_draft(self, trader_id: str, flatten_mode: str = "market") -> None:
         draft = self._trader_desk_draft_by_id(trader_id)
         run = self._trader_desk_run_by_id(trader_id, create=True)
         if draft is None or run is None:
             raise ValueError("未找到对应的交易员草稿。")
+        normalized_flatten_mode = self._normalize_trader_manual_flatten_mode(flatten_mode)
         now = datetime.now()
         draft.status = "paused"
         draft.updated_at = now
@@ -9473,17 +9633,23 @@ class QuantApp:
             draft,
             open_slots,
             now,
+            flatten_mode=normalized_flatten_mode,
         )
         if submitted_count or stale_count or failed_count:
             self._trader_desk_add_event(
                 trader_id,
                 "手动平仓结果 | "
+                f"方式={self._trader_manual_flatten_mode_label(normalized_flatten_mode)} | "
                 f"已提交平仓单 {submitted_count} 个 | "
                 f"已清理无真实持仓槽位 {stale_count} 个 | "
                 f"提交失败 {failed_count} 个",
                 level="warning",
             )
-        self._trader_desk_add_event(trader_id, f"已请求手动平仓/停止 {len(session_ids)} 个额度格。", level="warning")
+        self._trader_desk_add_event(
+            trader_id,
+            f"已请求手动平仓/停止 {len(session_ids)} 个额度格 | 方式={self._trader_manual_flatten_mode_label(normalized_flatten_mode)}。",
+            level="warning",
+        )
         self._save_trader_desk_snapshot()
 
     @staticmethod
@@ -9519,14 +9685,27 @@ class QuantApp:
         suffix = datetime.now().strftime("%m%d%H%M%S%f")[-15:]
         return f"{session_token}{strategy_token}exi{suffix}"[:32]
 
-    def _lookup_trader_manual_flatten_exit_price(
+    @staticmethod
+    def _normalize_trader_manual_flatten_mode(flatten_mode: str) -> str:
+        normalized = str(flatten_mode or "").strip().lower()
+        if normalized == "best_quote":
+            return "best_quote"
+        return "market"
+
+    @staticmethod
+    def _trader_manual_flatten_mode_label(flatten_mode: str) -> str:
+        if QuantApp._normalize_trader_manual_flatten_mode(flatten_mode) == "best_quote":
+            return "挂买一/卖一平仓"
+        return "市价平仓"
+
+    def _lookup_trader_manual_flatten_order_status(
         self,
         credentials: Credentials,
         config: StrategyConfig,
         *,
         inst_id: str,
         result: OkxOrderResult,
-    ) -> Decimal | None:
+    ):
         order_id = (result.ord_id or "").strip()
         client_order_id = (result.cl_ord_id or "").strip()
         if not order_id and not client_order_id:
@@ -9543,15 +9722,85 @@ class QuantApp:
             except Exception:
                 threading.Event().wait(0.2)
                 continue
-            return status.avg_price or status.price
+            return status
         return None
+
+    def _lookup_trader_manual_flatten_exit_price(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        result: OkxOrderResult,
+    ) -> Decimal | None:
+        status = self._lookup_trader_manual_flatten_order_status(
+            credentials,
+            config,
+            inst_id=inst_id,
+            result=result,
+        )
+        if status is None:
+            return None
+        return status.avg_price or status.price
+
+    def _resolve_trader_best_quote_flatten_price(
+        self,
+        instrument: Instrument,
+        *,
+        side: str,
+    ) -> Decimal:
+        order_book = None
+        try:
+            order_book = self.client.get_order_book(instrument.inst_id, depth=5)
+        except Exception:
+            order_book = None
+        ticker = self.client.get_ticker(instrument.inst_id)
+        if side == "buy":
+            raw_price = order_book.bids[0][0] if order_book is not None and order_book.bids else ticker.bid
+            if raw_price is None or raw_price <= 0:
+                raise ValueError(f"{instrument.inst_id} 当前缺少买一价，无法按买一挂平空单。")
+            return snap_to_increment(raw_price, instrument.tick_size, "down")
+        raw_price = order_book.asks[0][0] if order_book is not None and order_book.asks else ticker.ask
+        if raw_price is None or raw_price <= 0:
+            raise ValueError(f"{instrument.inst_id} 当前缺少卖一价，无法按卖一挂平多单。")
+        return snap_to_increment(raw_price, instrument.tick_size, "up")
+
+    @staticmethod
+    def _clear_trader_manual_flatten_pending(slot: TraderSlotRecord) -> None:
+        slot.pending_manual_exit_mode = ""
+        slot.pending_manual_exit_inst_id = ""
+        slot.pending_manual_exit_order_id = ""
+        slot.pending_manual_exit_cl_ord_id = ""
+
+    def _mark_trader_slot_manual_flatten_closed(
+        self,
+        slot: TraderSlotRecord,
+        *,
+        now: datetime,
+        exit_price: Decimal | None,
+        flatten_mode: str,
+    ) -> None:
+        normalized_flatten_mode = self._normalize_trader_manual_flatten_mode(flatten_mode)
+        slot.status = "closed_manual"
+        slot.quota_occupied = False
+        slot.closed_at = slot.closed_at or now
+        slot.released_at = slot.released_at or now
+        if normalized_flatten_mode == "best_quote":
+            slot.close_reason = "人工最优价挂单平仓已成交"
+        else:
+            slot.close_reason = "人工手动平仓"
+        slot.exit_price = exit_price
+        self._clear_trader_manual_flatten_pending(slot)
 
     def _submit_trader_manual_flatten_orders(
         self,
         draft: TraderDraftRecord,
         open_slots: list[TraderSlotRecord],
         now: datetime,
+        *,
+        flatten_mode: str = "market",
     ) -> tuple[int, int, int]:
+        normalized_flatten_mode = self._normalize_trader_manual_flatten_mode(flatten_mode)
         if not open_slots:
             return (0, 0, 0)
         config = _deserialize_strategy_config_snapshot(draft.template_payload.get("config_snapshot"))
@@ -9582,6 +9831,13 @@ class QuantApp:
         stale_count = 0
         failed_count = 0
         for slot in sorted(open_slots, key=lambda item: (item.created_at, item.slot_id)):
+            if slot.pending_manual_exit_order_id or slot.pending_manual_exit_cl_ord_id:
+                self._trader_desk_add_event(
+                    draft.trader_id,
+                    f"跳过重复手动平仓提交 | 会话={slot.session_id} | 方式={self._trader_manual_flatten_mode_label(slot.pending_manual_exit_mode)} | 已有待成交平仓单",
+                    level="warning",
+                )
+                continue
             requested_size = self._trader_slot_flatten_size(slot, draft)
             if remaining_live_size <= 0:
                 slot.status = "stopped"
@@ -9589,6 +9845,7 @@ class QuantApp:
                 slot.closed_at = slot.closed_at or now
                 slot.released_at = slot.released_at or now
                 slot.close_reason = "人工平仓时未检测到交易所持仓"
+                self._clear_trader_manual_flatten_pending(slot)
                 stale_count += 1
                 continue
 
@@ -9599,46 +9856,86 @@ class QuantApp:
                 slot.closed_at = slot.closed_at or now
                 slot.released_at = slot.released_at or now
                 slot.close_reason = "人工平仓时剩余交易所持仓不足最小下单量"
+                self._clear_trader_manual_flatten_pending(slot)
                 stale_count += 1
                 continue
 
             try:
-                result = self.client.place_simple_order(
-                    credentials,
-                    config,
-                    inst_id=trade_inst_id,
-                    side=close_side,
-                    size=close_size,
-                    ord_type="market",
-                    pos_side=pos_side,
-                    cl_ord_id=self._build_trader_manual_flatten_cl_ord_id(slot),
-                )
+                if normalized_flatten_mode == "best_quote":
+                    best_quote_price = self._resolve_trader_best_quote_flatten_price(instrument, side=close_side)
+                    result = self.client.place_simple_order(
+                        credentials,
+                        config,
+                        inst_id=trade_inst_id,
+                        side=close_side,
+                        size=close_size,
+                        ord_type="limit",
+                        pos_side=pos_side,
+                        price=best_quote_price,
+                        cl_ord_id=self._build_trader_manual_flatten_cl_ord_id(slot),
+                    )
+                else:
+                    best_quote_price = None
+                    result = self.client.place_simple_order(
+                        credentials,
+                        config,
+                        inst_id=trade_inst_id,
+                        side=close_side,
+                        size=close_size,
+                        ord_type="market",
+                        pos_side=pos_side,
+                        cl_ord_id=self._build_trader_manual_flatten_cl_ord_id(slot),
+                    )
             except Exception as exc:
                 failed_count += 1
                 slot.note = _format_network_error_message(str(exc))
                 self._trader_desk_add_event(
                     draft.trader_id,
-                    f"手动平仓提交失败 | 会话={slot.session_id} | 合约={trade_inst_id} | 原因={slot.note}",
+                    f"手动平仓提交失败 | 会话={slot.session_id} | 合约={trade_inst_id} | 方式={self._trader_manual_flatten_mode_label(normalized_flatten_mode)} | 原因={slot.note}",
                     level="warning",
                 )
                 continue
 
-            slot.status = "closed_manual"
-            slot.quota_occupied = False
-            slot.closed_at = slot.closed_at or now
-            slot.released_at = slot.released_at or now
-            slot.close_reason = "人工手动平仓"
-            slot.exit_price = self._lookup_trader_manual_flatten_exit_price(
+            order_status = self._lookup_trader_manual_flatten_order_status(
                 credentials,
                 config,
                 inst_id=trade_inst_id,
                 result=result,
             )
-            slot.note = (
-                f"人工平仓单已提交 | ordId={(result.ord_id or '-').strip() or '-'} | "
-                f"clOrdId={(result.cl_ord_id or '-').strip() or '-'}"
-            )
-            remaining_live_size = max(remaining_live_size - close_size, Decimal("0"))
+            latest_exit_price = None if order_status is None else (order_status.avg_price or order_status.price)
+            latest_state = "" if order_status is None else str(order_status.state or "").strip().lower()
+
+            slot.pending_manual_exit_mode = normalized_flatten_mode
+            slot.pending_manual_exit_inst_id = trade_inst_id
+            slot.pending_manual_exit_order_id = (result.ord_id or "").strip()
+            slot.pending_manual_exit_cl_ord_id = (result.cl_ord_id or "").strip()
+
+            if latest_state == "filled":
+                self._mark_trader_slot_manual_flatten_closed(
+                    slot,
+                    now=now,
+                    exit_price=latest_exit_price,
+                    flatten_mode=normalized_flatten_mode,
+                )
+                slot.note = (
+                    f"人工平仓已成交 | 方式={self._trader_manual_flatten_mode_label(normalized_flatten_mode)} | "
+                    f"ordId={(result.ord_id or '-').strip() or '-'}"
+                )
+                remaining_live_size = max(remaining_live_size - close_size, Decimal("0"))
+            else:
+                slot.note = (
+                    f"人工平仓单已提交 | 方式={self._trader_manual_flatten_mode_label(normalized_flatten_mode)} | "
+                    f"ordId={(result.ord_id or '-').strip() or '-'} | "
+                    f"clOrdId={(result.cl_ord_id or '-').strip() or '-'}"
+                )
+                if normalized_flatten_mode == "best_quote" and best_quote_price is not None:
+                    slot.note = f"{slot.note} | 挂单价={format_decimal(best_quote_price)}"
+                slot.close_reason = f"人工{self._trader_manual_flatten_mode_label(normalized_flatten_mode)}待成交"
+                self._trader_desk_add_event(
+                    draft.trader_id,
+                    f"人工平仓单已提交待成交 | 会话={slot.session_id} | 合约={trade_inst_id} | 方式={self._trader_manual_flatten_mode_label(normalized_flatten_mode)} | 状态={latest_state or 'unknown'}",
+                    level="warning",
+                )
             submitted_count += 1
 
         return (submitted_count, stale_count, failed_count)
@@ -10955,6 +11252,149 @@ class QuantApp:
         if not selection:
             return None
         return self._position_row_payloads.get(selection[0])
+
+    def _selected_position_item(self) -> OkxPosition | None:
+        payload = self._selected_position_payload()
+        if payload is None or payload.get("kind") != "position":
+            return None
+        position = payload.get("item")
+        return position if isinstance(position, OkxPosition) else None
+
+    def _position_action_parent(self):
+        return self._positions_zoom_window or self.root
+
+    @staticmethod
+    def _normalize_position_manual_flatten_mode(flatten_mode: str) -> str:
+        normalized = str(flatten_mode or "").strip().lower()
+        if normalized == "best_quote":
+            return "best_quote"
+        return "market"
+
+    @staticmethod
+    def _position_manual_flatten_mode_label(flatten_mode: str) -> str:
+        if QuantApp._normalize_position_manual_flatten_mode(flatten_mode) == "best_quote":
+            return "挂买一/卖一平仓"
+        return "市价平仓"
+
+    def _build_selected_position_manual_flatten_config(self, position: OkxPosition) -> StrategyConfig:
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        normalized_mgn_mode = (position.mgn_mode or "").strip().lower()
+        trade_mode = normalized_mgn_mode if normalized_mgn_mode in {"cross", "isolated", "cash"} else TRADE_MODE_OPTIONS[self.trade_mode_label.get()]
+        position_mode = "long_short" if position.pos_side and position.pos_side.lower() != "net" else "net"
+        direction = derive_position_direction(position)
+        return StrategyConfig(
+            inst_id=position.inst_id,
+            bar="1m",
+            ema_period=1,
+            atr_period=1,
+            atr_stop_multiplier=Decimal("1"),
+            atr_take_multiplier=Decimal("1"),
+            order_size=abs(position.position),
+            trade_mode=trade_mode,
+            signal_mode="long_only" if direction == "long" else "short_only",
+            position_mode=position_mode,
+            environment=environment,
+            tp_sl_trigger_type="last",
+            strategy_id="manual_position_flatten",
+            poll_seconds=10.0,
+            risk_amount=None,
+            trade_inst_id=position.inst_id,
+            tp_sl_mode="local_trade",
+            local_tp_sl_inst_id=position.inst_id,
+            entry_side_mode="follow_signal",
+            run_mode="trade",
+        )
+
+    def _selected_position_close_size(self, position: OkxPosition) -> Decimal:
+        base = position.avail_position
+        if base is None or base == 0:
+            base = position.position
+        return abs(base)
+
+    def _submit_selected_position_manual_flatten(self, position: OkxPosition, flatten_mode: str) -> tuple[OkxOrderResult, Decimal | None, str]:
+        profile_name = (self._positions_context_profile_name or self._current_credential_profile()).strip()
+        credentials = self._credentials_for_profile_or_none(profile_name)
+        if credentials is None:
+            raise ValueError("当前持仓所属 API 未配置有效凭证，无法执行选中持仓平仓。")
+        normalized_flatten_mode = self._normalize_position_manual_flatten_mode(flatten_mode)
+        config = self._build_selected_position_manual_flatten_config(position)
+        instrument = self.client.get_instrument(position.inst_id)
+        closeable_size = snap_to_increment(
+            self._selected_position_close_size(position),
+            instrument.lot_size,
+            "down",
+        )
+        if closeable_size < instrument.min_size:
+            raise ValueError("当前选中持仓的可平数量不足最小下单量，无法直接平仓。")
+        direction = derive_position_direction(position)
+        close_side = "sell" if direction == "long" else "buy"
+        pos_side = None
+        if config.position_mode == "long_short":
+            normalized_pos_side = (position.pos_side or "").strip().lower()
+            pos_side = normalized_pos_side if normalized_pos_side in {"long", "short"} else direction
+        if normalized_flatten_mode == "best_quote":
+            price = self._resolve_trader_best_quote_flatten_price(instrument, side=close_side)
+            result = self.client.place_simple_order(
+                credentials,
+                config,
+                inst_id=position.inst_id,
+                side=close_side,
+                size=closeable_size,
+                ord_type="limit",
+                pos_side=pos_side,
+                price=price,
+            )
+            return result, price, normalized_flatten_mode
+        result = self.client.place_simple_order(
+            credentials,
+            config,
+            inst_id=position.inst_id,
+            side=close_side,
+            size=closeable_size,
+            ord_type="market",
+            pos_side=pos_side,
+        )
+        return result, None, normalized_flatten_mode
+
+    def flatten_selected_position(self) -> None:
+        position = self._selected_position_item()
+        parent = self._position_action_parent()
+        if position is None:
+            messagebox.showinfo("平仓", "请先在当前持仓里选中一条具体持仓。", parent=parent)
+            return
+        choice = messagebox.askyesnocancel(
+            "选中持仓平仓方式",
+            "请选择这次对选中持仓的平仓方式。\n\n"
+            "是：市价平仓\n"
+            "否：挂买一/卖一平仓\n"
+            "取消：不执行\n\n"
+            "说明：平空会按买一挂单，平多会按卖一挂单；未成交前持仓不会消失。",
+            parent=parent,
+        )
+        if choice is None:
+            return
+        flatten_mode = "market" if choice else "best_quote"
+        mode_label = self._position_manual_flatten_mode_label(flatten_mode)
+        try:
+            result, price, normalized_flatten_mode = self._submit_selected_position_manual_flatten(position, flatten_mode)
+        except Exception as exc:
+            messagebox.showerror("平仓失败", str(exc), parent=parent)
+            return
+        order_id = (result.ord_id or "-").strip() or "-"
+        client_order_id = (result.cl_ord_id or "-").strip() or "-"
+        message = (
+            f"已提交选中持仓平仓。\n\n"
+            f"合约：{position.inst_id}\n"
+            f"方式：{mode_label}\n"
+            f"订单ID：{order_id}\n"
+            f"客户端单号：{client_order_id}"
+        )
+        if normalized_flatten_mode == "best_quote" and price is not None:
+            message = f"{message}\n挂单价：{format_decimal(price)}"
+        messagebox.showinfo("平仓已提交", message, parent=parent)
+        self._enqueue_log(f"已提交选中持仓平仓 | {position.inst_id} | 方式={mode_label} | ordId={order_id}")
+        self.refresh_positions()
+        self.refresh_order_views()
 
     def _on_position_selected(self, *_: object) -> None:
         if self._position_selection_syncing or self._positions_view_rendering:
@@ -14268,6 +14708,18 @@ class QuantApp:
             )
             self._save_trader_desk_snapshot()
             return
+        if slot.pending_manual_exit_order_id or slot.pending_manual_exit_cl_ord_id:
+            slot.close_reason = stop_reason or slot.close_reason or "人工平仓后停止策略线程"
+            slot.note = (
+                f"策略线程已停止，等待{self._trader_manual_flatten_mode_label(slot.pending_manual_exit_mode)}成交回查"
+            )
+            self._trader_desk_add_event(
+                trader_id,
+                f"活动额度格策略已停止，等待人工平仓单成交 | 会话={session.session_id} | 方式={self._trader_manual_flatten_mode_label(slot.pending_manual_exit_mode)}",
+                level="warning",
+            )
+            self._save_trader_desk_snapshot()
+            return
         slot.status = "closed_manual"
         slot.closed_at = stopped_at
         slot.released_at = stopped_at
@@ -14282,8 +14734,86 @@ class QuantApp:
         self._save_trader_desk_snapshot()
         self._ensure_trader_watcher(trader_id)
 
+    def _refresh_trader_pending_manual_flatten_orders(self, trader_id: str) -> None:
+        pending_slots = [
+            slot
+            for slot in trader_slots_for(self._trader_desk_slots, trader_id)
+            if slot.status == "open" and (slot.pending_manual_exit_order_id or slot.pending_manual_exit_cl_ord_id)
+        ]
+        if not pending_slots:
+            return
+        draft = self._trader_desk_draft_by_id(trader_id)
+        if draft is None:
+            return
+        config = _deserialize_strategy_config_snapshot(draft.template_payload.get("config_snapshot"))
+        if config is None:
+            return
+        credentials = self._credentials_for_profile_or_none(str(draft.template_payload.get("api_name") or ""))
+        if credentials is None:
+            return
+        changed = False
+        now = datetime.now()
+        for slot in sorted(pending_slots, key=lambda item: (item.created_at, item.slot_id)):
+            inst_id = (
+                str(slot.pending_manual_exit_inst_id or "").strip().upper()
+                or (config.trade_inst_id or config.inst_id or str(draft.template_payload.get("symbol") or "")).strip().upper()
+            )
+            if not inst_id:
+                continue
+            try:
+                status = self.client.get_order(
+                    credentials,
+                    config,
+                    inst_id=inst_id,
+                    ord_id=(slot.pending_manual_exit_order_id or "").strip() or None,
+                    cl_ord_id=(slot.pending_manual_exit_cl_ord_id or "").strip() or None,
+                )
+            except Exception:
+                continue
+            latest_state = str(status.state or "").strip().lower()
+            if latest_state == "filled":
+                self._mark_trader_slot_manual_flatten_closed(
+                    slot,
+                    now=now,
+                    exit_price=status.avg_price or status.price,
+                    flatten_mode=slot.pending_manual_exit_mode,
+                )
+                slot.note = (
+                    f"人工平仓已成交 | 方式={self._trader_manual_flatten_mode_label(slot.pending_manual_exit_mode)} | "
+                    f"ordId={(status.ord_id or '-').strip() or '-'}"
+                )
+                self._trader_desk_add_event(
+                    trader_id,
+                    f"人工平仓单已成交 | 会话={slot.session_id} | 方式={self._trader_manual_flatten_mode_label(slot.pending_manual_exit_mode)} | 平仓价={_format_optional_decimal(slot.exit_price)}",
+                )
+                changed = True
+                continue
+            if latest_state in {"canceled", "mmp_canceled", "order_failed", "partially_failed"}:
+                slot.note = (
+                    f"人工平仓挂单未成交 | 方式={self._trader_manual_flatten_mode_label(slot.pending_manual_exit_mode)} | "
+                    f"状态={latest_state or '-'} | ordId={(status.ord_id or '-').strip() or '-'}"
+                )
+                slot.close_reason = f"人工{self._trader_manual_flatten_mode_label(slot.pending_manual_exit_mode)}未成交"
+                self._clear_trader_manual_flatten_pending(slot)
+                self._trader_desk_add_event(
+                    trader_id,
+                    f"人工平仓挂单未成交 | 会话={slot.session_id} | 方式={self._trader_manual_flatten_mode_label(slot.pending_manual_exit_mode)} | 状态={latest_state or '-'}",
+                    level="warning",
+                )
+                changed = True
+                continue
+            if latest_state == "partially_filled":
+                slot.note = (
+                    f"人工平仓挂单部分成交 | 方式={self._trader_manual_flatten_mode_label(slot.pending_manual_exit_mode)} | "
+                    f"已成交={_format_optional_decimal(status.filled_size)} / {_format_optional_decimal(status.size)}"
+                )
+                changed = True
+        if changed:
+            self._save_trader_desk_snapshot()
+
     def _refresh_trader_desk_runtime(self) -> None:
         for run in list(self._trader_desk_runs):
+            self._refresh_trader_pending_manual_flatten_orders(run.trader_id)
             self._cleanup_stale_trader_watchers(run.trader_id)
             if run.status not in {"running", "quota_exhausted"}:
                 continue

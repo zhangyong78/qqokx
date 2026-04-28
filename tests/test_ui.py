@@ -8,7 +8,7 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from okx_quant.models import StrategyConfig
-from okx_quant.okx_client import Instrument, OkxOrderResult, OkxPosition
+from okx_quant.okx_client import Instrument, OkxOrderResult, OkxOrderStatus, OkxPosition
 from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_LONG_ID, STRATEGY_DYNAMIC_SHORT_ID, STRATEGY_EMA5_EMA8_ID
 from okx_quant.trader_desk import TraderDraftRecord, TraderRunState, TraderSlotRecord
 from okx_quant.ui import (
@@ -831,6 +831,71 @@ HTTP 502: <!DOCTYPE html>
         self.assertEqual(avg_price, Decimal("120"))
         self.assertEqual(snapshot_at, refreshed_at)
 
+    def test_strategy_live_chart_event_time_markers_include_close_add_and_reduce(self) -> None:
+        app = QuantApp.__new__(QuantApp)
+        app._strategy_trade_ledger_records = [
+            StrategyTradeLedgerRecord(
+                record_id="L01",
+                history_record_id="H01",
+                session_id="S01",
+                api_name="moni",
+                strategy_id="ema_dynamic_order",
+                strategy_name="EMA dynamic",
+                symbol="SOL-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                environment="demo",
+                closed_at=datetime(2026, 4, 28, 10, 15),
+                opened_at=datetime(2026, 4, 28, 9, 0),
+                entry_order_id="ent001",
+                exit_order_id="exi003",
+            )
+        ]
+        app._credentials_for_profile_or_none = lambda profile_name: SimpleNamespace(profile_name=profile_name)
+        app.client = SimpleNamespace(
+            get_fills_history=lambda credentials, **kwargs: [
+                SimpleNamespace(
+                    fill_time=int(datetime(2026, 4, 28, 9, 0).timestamp() * 1000),
+                    inst_id="SOL-USDT-SWAP",
+                    side="buy",
+                    order_id="ent001",
+                    trade_id="t1",
+                ),
+                SimpleNamespace(
+                    fill_time=int(datetime(2026, 4, 28, 9, 30).timestamp() * 1000),
+                    inst_id="SOL-USDT-SWAP",
+                    side="buy",
+                    order_id="ent002",
+                    trade_id="t2",
+                ),
+                SimpleNamespace(
+                    fill_time=int(datetime(2026, 4, 28, 9, 45).timestamp() * 1000),
+                    inst_id="SOL-USDT-SWAP",
+                    side="sell",
+                    order_id="red001",
+                    trade_id="t3",
+                ),
+                SimpleNamespace(
+                    fill_time=int(datetime(2026, 4, 28, 10, 15).timestamp() * 1000),
+                    inst_id="SOL-USDT-SWAP",
+                    side="sell",
+                    order_id="exi003",
+                    trade_id="t4",
+                ),
+            ]
+        )
+        session = SimpleNamespace(
+            session_id="S01",
+            history_record_id="H01",
+            api_name="moni",
+            active_trade=SimpleNamespace(opened_logged_at=datetime(2026, 4, 28, 9, 0), entry_order_id="ent001"),
+            config=SimpleNamespace(environment="demo"),
+        )
+
+        markers = QuantApp._strategy_live_chart_event_time_markers(app, session, "SOL-USDT-SWAP")
+
+        self.assertEqual([marker.key for marker in markers], ["close:L01", "add:ent002", "reduce:red001"])
+
     def test_session_can_be_cleared_only_when_stopped_and_not_running(self) -> None:
         stopped = SimpleNamespace(status="\u5df2\u505c\u6b62", engine=SimpleNamespace(is_running=False))
         stopping = SimpleNamespace(status="\u505c\u6b62\u4e2d", engine=SimpleNamespace(is_running=False))
@@ -1262,6 +1327,88 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         self.assertIsNone(result)
         self.assertEqual(toggles, [])
 
+    def test_session_tree_double_click_opens_live_chart_on_symbol_column(self) -> None:
+        session = SimpleNamespace(session_id="S01", email_notifications_enabled=True)
+        tree = _SessionTreeStub()
+        tree.rows["S01"] = {"values": (), "tags": (), "text": ""}
+        opened: list[str] = []
+        app = SimpleNamespace(
+            session_tree=tree,
+            sessions={"S01": session},
+            open_strategy_live_chart_window=lambda session_id: opened.append(session_id),
+        )
+
+        tree.identify_column = lambda _x: "#7"
+        tree.identify_row = lambda _y: "S01"
+        result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=48, y=12))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(opened, ["S01"])
+
+    def test_session_tree_double_click_opens_session_log_on_session_column(self) -> None:
+        session = SimpleNamespace(session_id="S01", email_notifications_enabled=True, trader_id="")
+        tree = _SessionTreeStub()
+        tree.rows["S01"] = {"values": (), "tags": (), "text": ""}
+        opened: list[str] = []
+        app = SimpleNamespace(
+            session_tree=tree,
+            sessions={"S01": session},
+            open_strategy_session_log=lambda session_id: opened.append(session_id),
+        )
+
+        tree.identify_column = lambda _x: "#1"
+        tree.identify_row = lambda _y: "S01"
+        result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=8, y=12))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(opened, ["S01"])
+
+    def test_session_tree_double_click_opens_trader_desk_on_trader_column(self) -> None:
+        session = SimpleNamespace(session_id="S01", email_notifications_enabled=True, trader_id="T001")
+        tree = _SessionTreeStub()
+        tree.rows["S01"] = {"values": (), "tags": (), "text": ""}
+        opened: list[bool] = []
+        app = SimpleNamespace(
+            session_tree=tree,
+            sessions={"S01": session},
+            open_trader_desk_window_for_trader=lambda trader_id: opened.append(trader_id == "T001"),
+        )
+
+        tree.identify_column = lambda _x: "#2"
+        tree.identify_row = lambda _y: "S01"
+        result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=16, y=12))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(opened, [True])
+
+    def test_open_trader_desk_window_for_trader_focuses_target_row(self) -> None:
+        window = SimpleNamespace(
+            _refresh_views=MagicMock(),
+            _focus_trader_row=MagicMock(),
+        )
+        app = SimpleNamespace(
+            _trader_desk_window=window,
+            open_trader_desk_window=MagicMock(),
+        )
+
+        QuantApp.open_trader_desk_window_for_trader(app, "T001")
+
+        app.open_trader_desk_window.assert_called_once_with()
+        window._refresh_views.assert_called_once_with(select_id="T001")
+        window._focus_trader_row.assert_called_once_with("T001")
+
+    def test_session_tree_double_click_hint_maps_supported_columns(self) -> None:
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#1"), "双击打开这条会话的独立日志")
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#2"), "双击打开并定位对应交易员")
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#3"), "双击切换当前会话发邮件开关")
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#7"), "双击打开这条策略的实时K线图")
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#4"), "")
+
+    def test_strategy_history_tree_double_click_hint_maps_supported_columns(self) -> None:
+        self.assertEqual(QuantApp._strategy_history_tree_double_click_hint("#1"), "双击打开这条历史策略的独立日志")
+        self.assertEqual(QuantApp._strategy_history_tree_double_click_hint("#4"), "双击打开对应会话的实时K线图（若仍存在）")
+        self.assertEqual(QuantApp._strategy_history_tree_double_click_hint("#2"), "")
+
 
     def test_render_strategy_history_view_includes_session_column(self) -> None:
         record = StrategyHistoryRecord(
@@ -1290,6 +1437,130 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
 
         self.assertEqual(tree.rows["R01"]["values"][0], "S01")
         self.assertEqual(tree.rows["R01"]["values"][2], "EMA 动态委托做空")
+
+    def test_strategy_history_tree_double_click_opens_log_on_session_column(self) -> None:
+        record = SimpleNamespace(record_id="R01")
+        tree = _SessionTreeStub()
+        tree.rows["R01"] = {"values": (), "tags": (), "text": ""}
+        opened: list[bool] = []
+        app = SimpleNamespace(
+            _strategy_history_tree=tree,
+            _strategy_history_by_id={"R01": record},
+            _strategy_history_selected_record_id=None,
+            open_selected_strategy_history_log=lambda: opened.append(True),
+        )
+
+        tree.identify_column = lambda _x: "#1"
+        tree.identify_row = lambda _y: "R01"
+        result = QuantApp._on_strategy_history_tree_double_click(app, SimpleNamespace(x=8, y=12))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(opened, [True])
+        self.assertEqual(app._strategy_history_selected_record_id, "R01")
+
+    def test_strategy_history_tree_double_click_opens_live_chart_on_symbol_column_when_session_exists(self) -> None:
+        record = SimpleNamespace(record_id="R01")
+        session = SimpleNamespace(session_id="S01")
+        tree = _SessionTreeStub()
+        tree.rows["R01"] = {"values": (), "tags": (), "text": ""}
+        opened: list[str] = []
+        app = SimpleNamespace(
+            _strategy_history_tree=tree,
+            _strategy_history_by_id={"R01": record},
+            _strategy_history_selected_record_id=None,
+            _session_by_history_record_id=lambda record_id: session if record_id == "R01" else None,
+            open_strategy_live_chart_window=lambda session_id: opened.append(session_id),
+        )
+
+        tree.identify_column = lambda _x: "#4"
+        tree.identify_row = lambda _y: "R01"
+        result = QuantApp._on_strategy_history_tree_double_click(app, SimpleNamespace(x=24, y=12))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(opened, ["S01"])
+
+    def test_strategy_book_tree_double_click_hint_maps_supported_columns(self) -> None:
+        self.assertEqual(QuantApp._strategy_book_tree_double_click_hint("#2"), "双击打开并定位对应交易员")
+        self.assertEqual(QuantApp._strategy_book_tree_double_click_hint("#4"), "双击打开对应会话的实时K线图（若仍存在）")
+        self.assertEqual(QuantApp._strategy_book_tree_double_click_hint("#9"), "双击打开对应会话的独立日志（若仍存在）")
+        self.assertEqual(QuantApp._strategy_book_tree_double_click_hint("#3"), "")
+
+    def test_strategy_book_group_tree_double_click_opens_trader_and_symbol_actions(self) -> None:
+        tree = _SessionTreeStub()
+        tree.rows["G01"] = {
+            "values": ("apiA", "T001", "EMA Long", "ETH-USDT-SWAP", "15m", "只做多"),
+            "tags": (),
+            "text": "",
+        }
+        opened_trader: list[str] = []
+        opened_chart: list[str] = []
+        session = SimpleNamespace(
+            session_id="S01",
+            strategy_name="EMA Long",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            config=SimpleNamespace(bar="15m"),
+        )
+        app = SimpleNamespace(
+            _strategy_book_group_tree=tree,
+            sessions={"S01": session},
+            open_trader_desk_window_for_trader=lambda trader_id: opened_trader.append(trader_id),
+            open_strategy_live_chart_window=lambda session_id: opened_chart.append(session_id),
+        )
+
+        tree.identify_row = lambda _y: "G01"
+        tree.identify_column = lambda _x: "#2"
+        result = QuantApp._on_strategy_book_group_tree_double_click(app, SimpleNamespace(x=10, y=10))
+        self.assertEqual(result, "break")
+        self.assertEqual(opened_trader, ["T001"])
+
+        tree.identify_column = lambda _x: "#4"
+        result = QuantApp._on_strategy_book_group_tree_double_click(app, SimpleNamespace(x=30, y=10))
+        self.assertEqual(result, "break")
+        self.assertEqual(opened_chart, ["S01"])
+
+    def test_strategy_book_ledger_tree_double_click_opens_trader_chart_and_log(self) -> None:
+        tree = _SessionTreeStub()
+        tree.rows["L01"] = {
+            "values": (
+                "04-28 09:00:00",
+                "apiA",
+                "T001",
+                "EMA Long",
+                "ETH-USDT-SWAP",
+                "15m",
+                "只做多",
+                "已停止",
+                "S01",
+            ),
+            "tags": ("S01",),
+            "text": "",
+        }
+        opened_trader: list[str] = []
+        opened_chart: list[str] = []
+        opened_log: list[str] = []
+        app = SimpleNamespace(
+            _strategy_book_ledger_tree=tree,
+            open_trader_desk_window_for_trader=lambda trader_id: opened_trader.append(trader_id),
+            open_strategy_live_chart_window=lambda session_id: opened_chart.append(session_id),
+            open_strategy_session_log=lambda session_id: opened_log.append(session_id),
+        )
+
+        tree.identify_row = lambda _y: "L01"
+        tree.identify_column = lambda _x: "#3"
+        result = QuantApp._on_strategy_book_ledger_tree_double_click(app, SimpleNamespace(x=10, y=10))
+        self.assertEqual(result, "break")
+        self.assertEqual(opened_trader, ["T001"])
+
+        tree.identify_column = lambda _x: "#5"
+        result = QuantApp._on_strategy_book_ledger_tree_double_click(app, SimpleNamespace(x=20, y=10))
+        self.assertEqual(result, "break")
+        self.assertEqual(opened_chart, ["S01"])
+
+        tree.identify_column = lambda _x: "#9"
+        result = QuantApp._on_strategy_book_ledger_tree_double_click(app, SimpleNamespace(x=40, y=10))
+        self.assertEqual(result, "break")
+        self.assertEqual(opened_log, ["S01"])
 
     def test_finish_strategy_template_import_warns_and_skips_start_when_duplicate_exists(self) -> None:
         duplicate_session = SimpleNamespace(
@@ -1973,7 +2244,17 @@ class StrategyTradeTrackingTest(TestCase):
 
             @staticmethod
             def get_order(credentials, config, *, inst_id: str, ord_id=None, cl_ord_id=None):  # noqa: ANN001
-                return SimpleNamespace(avg_price=Decimal("2299.5"), price=Decimal("2299.5"))
+                return OkxOrderStatus(
+                    ord_id=str(ord_id or "ord-1"),
+                    state="filled",
+                    side="buy",
+                    ord_type="market",
+                    price=Decimal("2299.5"),
+                    avg_price=Decimal("2299.5"),
+                    size=Decimal("0.1"),
+                    filled_size=Decimal("0.1"),
+                    raw={},
+                )
 
         client = _StubClient()
         app = SimpleNamespace(
@@ -1985,12 +2266,39 @@ class StrategyTradeTrackingTest(TestCase):
             _trader_desk_add_event=lambda trader_id, message, level="info": events.append((trader_id, level, message)),
             _save_trader_desk_snapshot=MagicMock(),
             _credentials_for_profile_or_none=lambda profile_name: SimpleNamespace(profile_name=profile_name),
-            _submit_trader_manual_flatten_orders=lambda draft_record, open_slot_records, now: QuantApp._submit_trader_manual_flatten_orders(app, draft_record, open_slot_records, now),
-            _lookup_trader_manual_flatten_exit_price=lambda credentials, config, inst_id, result: QuantApp._lookup_trader_manual_flatten_exit_price(app, credentials, config, inst_id=inst_id, result=result),
+            _submit_trader_manual_flatten_orders=lambda draft_record, open_slot_records, now, flatten_mode="market": QuantApp._submit_trader_manual_flatten_orders(
+                app,
+                draft_record,
+                open_slot_records,
+                now,
+                flatten_mode=flatten_mode,
+            ),
+            _lookup_trader_manual_flatten_order_status=lambda credentials, config, inst_id, result: QuantApp._lookup_trader_manual_flatten_order_status(
+                app,
+                credentials,
+                config,
+                inst_id=inst_id,
+                result=result,
+            ),
             _build_trader_manual_flatten_cl_ord_id=QuantApp._build_trader_manual_flatten_cl_ord_id,
             _trader_manual_flatten_open_side=QuantApp._trader_manual_flatten_open_side,
             _trader_position_closeable_size=QuantApp._trader_position_closeable_size,
             _trader_slot_flatten_size=QuantApp._trader_slot_flatten_size,
+            _normalize_trader_manual_flatten_mode=QuantApp._normalize_trader_manual_flatten_mode,
+            _trader_manual_flatten_mode_label=QuantApp._trader_manual_flatten_mode_label,
+            _resolve_trader_best_quote_flatten_price=lambda instrument, side: QuantApp._resolve_trader_best_quote_flatten_price(
+                app,
+                instrument,
+                side=side,
+            ),
+            _clear_trader_manual_flatten_pending=QuantApp._clear_trader_manual_flatten_pending,
+            _mark_trader_slot_manual_flatten_closed=lambda slot, now, exit_price, flatten_mode: QuantApp._mark_trader_slot_manual_flatten_closed(
+                app,
+                slot,
+                now=now,
+                exit_price=exit_price,
+                flatten_mode=flatten_mode,
+            ),
         )
 
         QuantApp.flatten_trader_draft(app, "T001")
@@ -2012,6 +2320,448 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(client.orders[1]["side"], "buy")
         self.assertTrue(any("手动平仓结果" in event[2] for event in events))
         app._save_trader_desk_snapshot.assert_called_once()
+
+    def test_submit_trader_manual_flatten_orders_best_quote_keeps_slot_open_until_filled(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload={
+                "api_name": "moni",
+                "symbol": "ETH-USDT-SWAP",
+                "config_snapshot": {
+                    "inst_id": "ETH-USDT-SWAP",
+                    "trade_inst_id": "ETH-USDT-SWAP",
+                    "bar": "1m",
+                    "ema_period": 21,
+                    "atr_period": 10,
+                    "atr_stop_multiplier": "1",
+                    "atr_take_multiplier": "4",
+                    "order_size": "0.1",
+                    "trade_mode": "cross",
+                    "signal_mode": "short_only",
+                    "position_mode": "net",
+                    "environment": "demo",
+                    "tp_sl_trigger_type": "last",
+                },
+            },
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+            status="ready",
+        )
+        slot = TraderSlotRecord(
+            slot_id="slot-open-1",
+            trader_id="T001",
+            session_id="S21",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="ETH-USDT-SWAP",
+            status="open",
+            quota_occupied=True,
+            size=Decimal("0.1"),
+            entry_price=Decimal("2300"),
+        )
+        events: list[tuple[str, str, str]] = []
+
+        class _StubClient:
+            def __init__(self) -> None:
+                self.orders: list[dict[str, object]] = []
+
+            @staticmethod
+            def get_instrument(inst_id: str) -> Instrument:
+                return Instrument(
+                    inst_id=inst_id,
+                    inst_type="SWAP",
+                    tick_size=Decimal("0.01"),
+                    lot_size=Decimal("0.1"),
+                    min_size=Decimal("0.1"),
+                    state="live",
+                )
+
+            @staticmethod
+            def get_positions(credentials, *, environment: str):  # noqa: ANN001
+                return [
+                    OkxPosition(
+                        inst_id="ETH-USDT-SWAP",
+                        inst_type="SWAP",
+                        pos_side="net",
+                        mgn_mode="cross",
+                        position=Decimal("-0.1"),
+                        avail_position=Decimal("-0.1"),
+                        avg_price=Decimal("2300"),
+                        mark_price=None,
+                        unrealized_pnl=None,
+                        unrealized_pnl_ratio=None,
+                        liquidation_price=None,
+                        leverage=None,
+                        margin_ccy="USDT",
+                        last_price=None,
+                        realized_pnl=None,
+                        margin_ratio=None,
+                        initial_margin=None,
+                        maintenance_margin=None,
+                        delta=None,
+                        gamma=None,
+                        vega=None,
+                        theta=None,
+                        raw={},
+                    )
+                ]
+
+            @staticmethod
+            def get_order_book(inst_id: str, depth: int = 5):  # noqa: ANN001
+                return SimpleNamespace(
+                    inst_id=inst_id,
+                    bids=((Decimal("2299.10"), Decimal("5")),),
+                    asks=((Decimal("2299.20"), Decimal("5")),),
+                    raw={},
+                )
+
+            @staticmethod
+            def get_ticker(inst_id: str):  # noqa: ANN001
+                return SimpleNamespace(inst_id=inst_id, bid=Decimal("2299.10"), ask=Decimal("2299.20"))
+
+            def place_simple_order(self, credentials, config, *, inst_id: str, side: str, size: Decimal, ord_type: str, pos_side=None, price=None, cl_ord_id=None):  # noqa: ANN001,E501
+                self.orders.append(
+                    {
+                        "inst_id": inst_id,
+                        "side": side,
+                        "size": size,
+                        "ord_type": ord_type,
+                        "price": price,
+                        "pos_side": pos_side,
+                        "cl_ord_id": cl_ord_id,
+                    }
+                )
+                return OkxOrderResult(
+                    ord_id="ord-1",
+                    cl_ord_id=str(cl_ord_id or ""),
+                    s_code="0",
+                    s_msg="accepted",
+                    raw={},
+                )
+
+            @staticmethod
+            def get_order(credentials, config, *, inst_id: str, ord_id=None, cl_ord_id=None):  # noqa: ANN001
+                return OkxOrderStatus(
+                    ord_id=str(ord_id or "ord-1"),
+                    state="live",
+                    side="buy",
+                    ord_type="limit",
+                    price=Decimal("2299.10"),
+                    avg_price=None,
+                    size=Decimal("0.1"),
+                    filled_size=Decimal("0"),
+                    raw={},
+                )
+
+        client = _StubClient()
+        app = SimpleNamespace(
+            client=client,
+            _credentials_for_profile_or_none=lambda profile_name: SimpleNamespace(profile_name=profile_name),
+            _trader_desk_add_event=lambda trader_id, message, level="info": events.append((trader_id, level, message)),
+            _trader_manual_flatten_open_side=QuantApp._trader_manual_flatten_open_side,
+            _trader_position_closeable_size=QuantApp._trader_position_closeable_size,
+            _trader_slot_flatten_size=QuantApp._trader_slot_flatten_size,
+            _build_trader_manual_flatten_cl_ord_id=QuantApp._build_trader_manual_flatten_cl_ord_id,
+            _lookup_trader_manual_flatten_order_status=lambda credentials, config, inst_id, result: QuantApp._lookup_trader_manual_flatten_order_status(
+                app,
+                credentials,
+                config,
+                inst_id=inst_id,
+                result=result,
+            ),
+            _normalize_trader_manual_flatten_mode=QuantApp._normalize_trader_manual_flatten_mode,
+            _trader_manual_flatten_mode_label=QuantApp._trader_manual_flatten_mode_label,
+            _resolve_trader_best_quote_flatten_price=lambda instrument, side: QuantApp._resolve_trader_best_quote_flatten_price(
+                app,
+                instrument,
+                side=side,
+            ),
+            _clear_trader_manual_flatten_pending=QuantApp._clear_trader_manual_flatten_pending,
+            _mark_trader_slot_manual_flatten_closed=lambda opened_slot, now, exit_price, flatten_mode: QuantApp._mark_trader_slot_manual_flatten_closed(
+                app,
+                opened_slot,
+                now=now,
+                exit_price=exit_price,
+                flatten_mode=flatten_mode,
+            ),
+        )
+
+        submitted_count, stale_count, failed_count = QuantApp._submit_trader_manual_flatten_orders(
+            app,
+            draft,
+            [slot],
+            datetime(2026, 4, 28, 11, 0, 0),
+            flatten_mode="best_quote",
+        )
+
+        self.assertEqual((submitted_count, stale_count, failed_count), (1, 0, 0))
+        self.assertEqual(slot.status, "open")
+        self.assertTrue(slot.quota_occupied)
+        self.assertEqual(slot.pending_manual_exit_mode, "best_quote")
+        self.assertEqual(slot.pending_manual_exit_inst_id, "ETH-USDT-SWAP")
+        self.assertEqual(slot.pending_manual_exit_order_id, "ord-1")
+        self.assertEqual(client.orders[0]["ord_type"], "limit")
+        self.assertEqual(client.orders[0]["price"], Decimal("2299.10"))
+        self.assertIn("挂单价=2299.1", slot.note)
+        self.assertTrue(any("待成交" in event[2] for event in events))
+
+    def test_refresh_trader_pending_manual_flatten_orders_marks_filled_slot_closed_manual(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T001",
+            template_payload={
+                "api_name": "moni",
+                "symbol": "ETH-USDT-SWAP",
+                "config_snapshot": {
+                    "inst_id": "ETH-USDT-SWAP",
+                    "trade_inst_id": "ETH-USDT-SWAP",
+                    "bar": "1m",
+                    "ema_period": 21,
+                    "atr_period": 10,
+                    "atr_stop_multiplier": "1",
+                    "atr_take_multiplier": "4",
+                    "order_size": "0.1",
+                    "trade_mode": "cross",
+                    "signal_mode": "short_only",
+                    "position_mode": "net",
+                    "environment": "demo",
+                    "tp_sl_trigger_type": "last",
+                },
+            },
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+            status="paused",
+        )
+        slot = TraderSlotRecord(
+            slot_id="slot-open-1",
+            trader_id="T001",
+            session_id="S21",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="ETH-USDT-SWAP",
+            status="open",
+            quota_occupied=True,
+            size=Decimal("0.1"),
+            entry_price=Decimal("2300"),
+            pending_manual_exit_mode="best_quote",
+            pending_manual_exit_inst_id="ETH-USDT-SWAP",
+            pending_manual_exit_order_id="ord-1",
+            pending_manual_exit_cl_ord_id="cl-1",
+        )
+        events: list[tuple[str, str, str]] = []
+
+        app = SimpleNamespace(
+            _trader_desk_slots=[slot],
+            client=SimpleNamespace(
+                get_order=lambda credentials, config, *, inst_id, ord_id=None, cl_ord_id=None: OkxOrderStatus(
+                    ord_id=str(ord_id or "ord-1"),
+                    state="filled",
+                    side="buy",
+                    ord_type="limit",
+                    price=Decimal("2299.10"),
+                    avg_price=Decimal("2299.08"),
+                    size=Decimal("0.1"),
+                    filled_size=Decimal("0.1"),
+                    raw={},
+                )
+            ),
+            _trader_desk_draft_by_id=lambda trader_id: draft if trader_id == "T001" else None,
+            _credentials_for_profile_or_none=lambda profile_name: SimpleNamespace(profile_name=profile_name),
+            _trader_desk_add_event=lambda trader_id, message, level="info": events.append((trader_id, level, message)),
+            _save_trader_desk_snapshot=MagicMock(),
+            _mark_trader_slot_manual_flatten_closed=lambda opened_slot, now, exit_price, flatten_mode: QuantApp._mark_trader_slot_manual_flatten_closed(
+                app,
+                opened_slot,
+                now=now,
+                exit_price=exit_price,
+                flatten_mode=flatten_mode,
+            ),
+            _normalize_trader_manual_flatten_mode=QuantApp._normalize_trader_manual_flatten_mode,
+            _trader_manual_flatten_mode_label=QuantApp._trader_manual_flatten_mode_label,
+            _clear_trader_manual_flatten_pending=QuantApp._clear_trader_manual_flatten_pending,
+        )
+
+        QuantApp._refresh_trader_pending_manual_flatten_orders(app, "T001")
+
+        self.assertEqual(slot.status, "closed_manual")
+        self.assertFalse(slot.quota_occupied)
+        self.assertEqual(slot.exit_price, Decimal("2299.08"))
+        self.assertEqual(slot.pending_manual_exit_order_id, "")
+        self.assertTrue(any("人工平仓单已成交" in event[2] for event in events))
+        app._save_trader_desk_snapshot.assert_called_once()
+
+    def test_submit_selected_position_manual_flatten_best_quote_uses_ask1_for_long_position(self) -> None:
+        position = OkxPosition(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="net",
+            mgn_mode="cross",
+            position=Decimal("0.3"),
+            avail_position=Decimal("0.2"),
+            avg_price=Decimal("2300"),
+            mark_price=None,
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy="USDT",
+            last_price=None,
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+
+        class _StubClient:
+            def __init__(self) -> None:
+                self.orders: list[dict[str, object]] = []
+
+            @staticmethod
+            def get_instrument(inst_id: str) -> Instrument:
+                return Instrument(
+                    inst_id=inst_id,
+                    inst_type="SWAP",
+                    tick_size=Decimal("0.01"),
+                    lot_size=Decimal("0.1"),
+                    min_size=Decimal("0.1"),
+                    state="live",
+                )
+
+            @staticmethod
+            def get_order_book(inst_id: str, depth: int = 5):  # noqa: ANN001
+                return SimpleNamespace(
+                    inst_id=inst_id,
+                    bids=((Decimal("2299.10"), Decimal("5")),),
+                    asks=((Decimal("2299.20"), Decimal("5")),),
+                    raw={},
+                )
+
+            @staticmethod
+            def get_ticker(inst_id: str):  # noqa: ANN001
+                return SimpleNamespace(inst_id=inst_id, bid=Decimal("2299.10"), ask=Decimal("2299.20"))
+
+            def place_simple_order(self, credentials, config, *, inst_id: str, side: str, size: Decimal, ord_type: str, pos_side=None, price=None, cl_ord_id=None):  # noqa: ANN001,E501
+                self.orders.append(
+                    {
+                        "inst_id": inst_id,
+                        "side": side,
+                        "size": size,
+                        "ord_type": ord_type,
+                        "pos_side": pos_side,
+                        "price": price,
+                        "cl_ord_id": cl_ord_id,
+                    }
+                )
+                return OkxOrderResult(
+                    ord_id="ord-position-1",
+                    cl_ord_id=str(cl_ord_id or ""),
+                    s_code="0",
+                    s_msg="accepted",
+                    raw={},
+                )
+
+        client = _StubClient()
+        app = SimpleNamespace(
+            client=client,
+            _positions_context_profile_name="apiA",
+            _positions_effective_environment="demo",
+            environment_label=_Var("模拟盘"),
+            trade_mode_label=_Var("全仓"),
+            _credentials_for_profile_or_none=lambda profile_name: SimpleNamespace(profile_name=profile_name),
+            _normalize_position_manual_flatten_mode=QuantApp._normalize_position_manual_flatten_mode,
+            _build_selected_position_manual_flatten_config=lambda selected: QuantApp._build_selected_position_manual_flatten_config(
+                app,
+                selected,
+            ),
+            _selected_position_close_size=lambda selected: QuantApp._selected_position_close_size(app, selected),
+            _resolve_trader_best_quote_flatten_price=lambda instrument, side: QuantApp._resolve_trader_best_quote_flatten_price(
+                app,
+                instrument,
+                side=side,
+            ),
+        )
+
+        result, price, normalized_mode = QuantApp._submit_selected_position_manual_flatten(
+            app,
+            position,
+            "best_quote",
+        )
+
+        self.assertEqual(result.ord_id, "ord-position-1")
+        self.assertEqual(price, Decimal("2299.20"))
+        self.assertEqual(normalized_mode, "best_quote")
+        self.assertEqual(client.orders[0]["side"], "sell")
+        self.assertEqual(client.orders[0]["ord_type"], "limit")
+        self.assertEqual(client.orders[0]["price"], Decimal("2299.20"))
+        self.assertEqual(client.orders[0]["size"], Decimal("0.2"))
+
+    def test_flatten_selected_position_best_quote_submits_and_refreshes(self) -> None:
+        position = OkxPosition(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="net",
+            mgn_mode="cross",
+            position=Decimal("-0.1"),
+            avail_position=Decimal("-0.1"),
+            avg_price=Decimal("2300"),
+            mark_price=None,
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy="USDT",
+            last_price=None,
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+        app = SimpleNamespace(
+            _selected_position_item=lambda: position,
+            _position_action_parent=lambda: "parent-window",
+            _position_manual_flatten_mode_label=QuantApp._position_manual_flatten_mode_label,
+            _submit_selected_position_manual_flatten=lambda selected, flatten_mode: (
+                OkxOrderResult(
+                    ord_id="ord-position-2",
+                    cl_ord_id="cl-position-2",
+                    s_code="0",
+                    s_msg="accepted",
+                    raw={},
+                ),
+                Decimal("2299.10"),
+                "best_quote",
+            ),
+            _enqueue_log=MagicMock(),
+            refresh_positions=MagicMock(),
+            refresh_order_views=MagicMock(),
+        )
+
+        with patch("okx_quant.ui.messagebox.askyesnocancel", return_value=False) as askyesnocancel, patch(
+            "okx_quant.ui.messagebox.showinfo"
+        ) as showinfo:
+            QuantApp.flatten_selected_position(app)
+
+        askyesnocancel.assert_called_once()
+        showinfo.assert_called_once()
+        show_args, show_kwargs = showinfo.call_args
+        self.assertEqual(show_args[0], "平仓已提交")
+        self.assertIn("方式：挂买一/卖一平仓", show_args[1])
+        self.assertIn("挂单价：2299.1", show_args[1])
+        self.assertEqual(show_kwargs["parent"], "parent-window")
+        app._enqueue_log.assert_called_once()
+        app.refresh_positions.assert_called_once()
+        app.refresh_order_views.assert_called_once()
 
     def test_build_strategy_trade_reconciliation_result_attributes_stop_loss_and_net_pnl(self) -> None:
         session = self._make_session()
@@ -2198,8 +2948,14 @@ class _SessionTreeStub:
     def identify_row(_y: int) -> str:
         return ""
 
-    def item(self, iid: str, **kwargs: object) -> None:
-        self.rows.setdefault(iid, {}).update(kwargs)
+    def item(self, iid: str, option: str | None = None, **kwargs: object):
+        row = self.rows.setdefault(iid, {})
+        if kwargs:
+            row.update(kwargs)
+            return None
+        if option is None:
+            return row
+        return row.get(option)
 
     def insert(
         self,

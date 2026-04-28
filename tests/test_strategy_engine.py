@@ -10,11 +10,13 @@ from okx_quant.engine import (
     StartupSignalGateState,
     StrategyEngine,
     _advance_dynamic_stop_live,
+    _format_size_with_contract_equivalent,
     _idle_signal_wait_seconds,
     _is_exchange_dynamic_stop_candidate_valid,
     _should_skip_startup_signal,
     build_order_plan,
     can_use_exchange_managed_orders,
+    determine_order_size,
     fixed_entry_side_mode_support_reason,
     supports_fixed_entry_side_mode,
     validate_entry_side_mode_support,
@@ -43,6 +45,124 @@ class StrategyEngineTest(TestCase):
             candles.append(Candle(index, open_price, high, low, close, Decimal("1"), True))
             previous_close = close
         return candles
+
+    def test_determine_order_size_uses_contract_value_for_linear_swap_risk_amount(self) -> None:
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+            settle_ccy="USDT",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="4H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("20"),
+        )
+
+        size = determine_order_size(
+            instrument=instrument,
+            config=config,
+            entry_price=Decimal("77628.1"),
+            stop_loss=Decimal("76401.8"),
+            risk_price_compatible=True,
+        )
+
+        self.assertEqual(size, Decimal("1.63"))
+
+    def test_determine_order_size_without_contract_value_keeps_spot_style_risk_math(self) -> None:
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("20"),
+        )
+
+        size = determine_order_size(
+            instrument=instrument,
+            config=config,
+            entry_price=Decimal("2400"),
+            stop_loss=Decimal("2398"),
+            risk_price_compatible=True,
+        )
+
+        self.assertEqual(size, Decimal("10"))
+
+    def test_format_size_with_contract_equivalent_for_linear_swap(self) -> None:
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+            settle_ccy="USDT",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+        )
+
+        text = _format_size_with_contract_equivalent(instrument, Decimal("1.63"))
+
+        self.assertEqual(text, "1.63\u5f20\uff08\u6298\u54080.0163 BTC\uff09")
+
+    def test_trade_fill_pnl_text_for_close_uses_contract_value_multiplier(self) -> None:
+        position = FilledPosition(
+            ord_id="ord-1",
+            cl_ord_id="cl-1",
+            inst_id="BTC-USDT-SWAP",
+            side="buy",
+            close_side="sell",
+            pos_side="long",
+            size=Decimal("1.63"),
+            entry_price=Decimal("77330.4"),
+            entry_ts=0,
+            price_delta_multiplier=Decimal("0.01"),
+        )
+
+        trade_pnl = StrategyEngine._trade_fill_pnl_text_for_close(
+            position,
+            fill_size=Decimal("1.63"),
+            fill_price=Decimal("76390"),
+        )
+
+        self.assertEqual(trade_pnl, "-15.32852")
 
     def test_long_signal_is_detected(self) -> None:
         candles = [

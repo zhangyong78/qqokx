@@ -28,6 +28,8 @@ TemplateLauncher = Callable[[object, str], str]
 SessionProvider = Callable[[], list[dict[str, str]]]
 SessionStopper = Callable[[list[str]], None]
 SessionDeleter = Callable[[list[str]], tuple[int, list[str]]]
+SessionLogOpener = Callable[[str], None]
+SessionChartOpener = Callable[[str], None]
 
 DEFAULT_SIGNAL_OBSERVER_SYMBOLS: tuple[str, ...] = (
     "BTC-USDT-SWAP",
@@ -166,6 +168,8 @@ class SignalMonitorWindow:
         session_provider: SessionProvider,
         session_stopper: SessionStopper,
         session_deleter: SessionDeleter,
+        session_log_opener: SessionLogOpener,
+        session_chart_opener: SessionChartOpener,
     ) -> None:
         self._logger = logger
         self._current_template_factory = current_template_factory
@@ -176,6 +180,8 @@ class SignalMonitorWindow:
         self._session_provider = session_provider
         self._session_stopper = session_stopper
         self._session_deleter = session_deleter
+        self._session_log_opener = session_log_opener
+        self._session_chart_opener = session_chart_opener
         self._drafts: list[_ObserverDraft] = []
         self._presets: list[_ObserverPreset] = []
         self._draft_counter = 0
@@ -225,6 +231,8 @@ class SignalMonitorWindow:
         self.log_text: Text | None = None
         self._editor_save_button: ttk.Button | None = None
         self._preset_combo: ttk.Combobox | None = None
+        self._session_tree_hover_tip_window: Toplevel | None = None
+        self._session_tree_hover_tip_label: ttk.Label | None = None
 
         try:
             self._build_layout()
@@ -356,9 +364,9 @@ class SignalMonitorWindow:
         )
         self.session_tree.grid(row=1, column=0, sticky="nsew")
         for column, text, width, anchor in (
-            ("session", "会话", 80, "center"),
+            ("session", "会话(双击日志)", 80, "center"),
             ("strategy", "策略", 150, "w"),
-            ("symbol", "标的", 150, "w"),
+            ("symbol", "标的(双击K线)", 150, "w"),
             ("api", "API", 90, "center"),
             ("status", "状态", 100, "center"),
             ("last", "最近消息", 280, "w"),
@@ -368,6 +376,9 @@ class SignalMonitorWindow:
         session_scroll = ttk.Scrollbar(upper_right, orient="vertical", command=self.session_tree.yview)
         session_scroll.grid(row=1, column=1, sticky="ns")
         self.session_tree.configure(yscrollcommand=session_scroll.set)
+        self.session_tree.bind("<Double-1>", self._on_session_tree_double_click)
+        self.session_tree.bind("<Motion>", self._on_session_tree_hover)
+        self.session_tree.bind("<Leave>", self._on_session_tree_hover_leave)
 
         lower_right = ttk.LabelFrame(body, text="模板详情", padding=12)
         lower_right.grid(row=1, column=1, sticky="nsew", pady=(12, 0))
@@ -620,6 +631,85 @@ class SignalMonitorWindow:
         if self.session_tree is None:
             return []
         return [str(item) for item in self.session_tree.selection()]
+
+    @staticmethod
+    def _session_tree_double_click_hint(column_id: str) -> str:
+        return {
+            "#1": "双击打开这条会话的独立日志",
+            "#3": "双击打开这条会话的实时K线图",
+        }.get(str(column_id or "").strip(), "")
+
+    def _show_session_tree_hover_tip(self, text: str, *, x_root: int, y_root: int) -> None:
+        if not text:
+            self._hide_session_tree_hover_tip()
+            return
+        if self._session_tree_hover_tip_window is None or not self._session_tree_hover_tip_window.winfo_exists():
+            window = Toplevel(self.window)
+            window.withdraw()
+            window.overrideredirect(True)
+            window.attributes("-topmost", True)
+            label = ttk.Label(window, text=text, padding=(8, 4), relief="solid", borderwidth=1)
+            label.pack()
+            self._session_tree_hover_tip_window = window
+            self._session_tree_hover_tip_label = label
+        else:
+            window = self._session_tree_hover_tip_window
+            label = self._session_tree_hover_tip_label
+            if label is not None:
+                label.configure(text=text)
+        if window is None:
+            return
+        window.geometry(f"+{x_root + 12}+{y_root + 16}")
+        window.deiconify()
+
+    def _hide_session_tree_hover_tip(self) -> None:
+        window = self._session_tree_hover_tip_window
+        if window is not None and window.winfo_exists():
+            window.withdraw()
+
+    def _on_session_tree_hover(self, event: object) -> None:
+        if self.session_tree is None:
+            self._hide_session_tree_hover_tip()
+            return
+        try:
+            x = int(getattr(event, "x", 0) or 0)
+            y = int(getattr(event, "y", 0) or 0)
+            x_root = int(getattr(event, "x_root", 0) or 0)
+            y_root = int(getattr(event, "y_root", 0) or 0)
+            region = str(self.session_tree.identify_region(x, y))
+            column_id = str(self.session_tree.identify_column(x))
+        except Exception:
+            self._hide_session_tree_hover_tip()
+            return
+        if region != "heading":
+            self._hide_session_tree_hover_tip()
+            return
+        tip_text = SignalMonitorWindow._session_tree_double_click_hint(column_id)
+        if not tip_text:
+            self._hide_session_tree_hover_tip()
+            return
+        self._show_session_tree_hover_tip(tip_text, x_root=x_root, y_root=y_root)
+
+    def _on_session_tree_hover_leave(self, *_: object) -> None:
+        self._hide_session_tree_hover_tip()
+
+    def _on_session_tree_double_click(self, event: object) -> str | None:
+        if self.session_tree is None:
+            return None
+        try:
+            column_id = str(self.session_tree.identify_column(getattr(event, "x", 0) or 0))
+            row_id = str(self.session_tree.identify_row(getattr(event, "y", 0) or 0)).strip()
+        except Exception:
+            return None
+        if not row_id:
+            return None
+        if column_id == "#1":
+            self._session_log_opener(row_id)
+            return "break"
+        if column_id == "#3":
+            self._session_chart_opener(row_id)
+            return "break"
+        return None
 
     def _selected_single_draft(self) -> _ObserverDraft | None:
         selected = self._selected_drafts()
