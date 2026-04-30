@@ -42,6 +42,8 @@ TraderAction = Callable[[str], None]
 TraderFlattenAction = Callable[[str, str], None]
 SymbolProvider = Callable[[], list[str]]
 RuntimeSnapshotProvider = Callable[[str], dict[str, object] | None]
+SessionLogOpener = Callable[[str], None]
+SessionChartOpener = Callable[[str], None]
 
 
 PRICE_TYPE_VALUES: tuple[str, ...] = ("mark", "last", "index")
@@ -400,6 +402,31 @@ def _trader_current_session_label(snapshot: TraderDeskSnapshot, trader_id: str) 
     return f"{active_session_ids[0]} +{len(active_session_ids) - 1}"
 
 
+def _trader_primary_session_id(snapshot: TraderDeskSnapshot, trader_id: str) -> str:
+    run = next((item for item in snapshot.runs if item.trader_id == trader_id), None)
+    if run is not None and run.armed_session_id:
+        return str(run.armed_session_id).strip()
+    for slot in sorted(
+        trader_slots_for(snapshot.slots, trader_id),
+        key=lambda item: (item.created_at, item.slot_id),
+        reverse=True,
+    ):
+        if slot.status not in {"watching", "open"}:
+            continue
+        session_id = str(slot.session_id or "").strip()
+        if session_id:
+            return session_id
+    return ""
+
+
+def _symbol_asset_text(payload: dict[str, object]) -> str:
+    symbol = _payload_trade_symbol(payload)
+    if not symbol:
+        return "-"
+    parts = symbol.split("-")
+    return parts[0] if parts else symbol
+
+
 def _gate_condition_label(value: str) -> str:
     normalized = str(value or "").strip()
     if normalized in GATE_CONDITION_LABELS:
@@ -617,6 +644,8 @@ class TraderDeskWindow:
         trader_force_cleaner: TraderAction,
         symbol_provider: SymbolProvider,
         runtime_snapshot_provider: RuntimeSnapshotProvider,
+        session_log_opener: SessionLogOpener,
+        session_chart_opener: SessionChartOpener,
     ) -> None:
         self._logger = logger
         self._current_template_factory = current_template_factory
@@ -633,6 +662,8 @@ class TraderDeskWindow:
         self._trader_force_cleaner = trader_force_cleaner
         self._symbol_provider = symbol_provider
         self._runtime_snapshot_provider = runtime_snapshot_provider
+        self._session_log_opener = session_log_opener
+        self._session_chart_opener = session_chart_opener
         self._refresh_job: str | None = None
         self._trader_counter = 0
         self._snapshot = TraderDeskSnapshot()
@@ -962,19 +993,21 @@ class TraderDeskWindow:
 
         self.tree = ttk.Treeview(
             left,
-            columns=("trader", "session", "strategy", "bar", "symbol", "api", "run", "quota", "avg", "pnl", "updated"),
+            columns=("trader", "session", "strategy", "bar", "symbol", "asset", "api", "run", "quota", "avg", "pnl", "updated"),
             show="headings",
             selectmode="browse",
             height=22,
         )
         self.tree.grid(row=1, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
         for column, text, width, anchor in (
             ("trader", "交易员", 80, "center"),
-            ("session", "当前会话", 92, "center"),
+            ("session", "当前会话(双击日志)", 120, "center"),
             ("strategy", "策略", 150, "w"),
             ("bar", "周期", 64, "center"),
             ("symbol", "交易/触发", 156, "w"),
+            ("asset", "币种(双击K线)", 108, "center"),
             ("api", "API", 80, "center"),
             ("run", "运行状态", 110, "center"),
             ("quota", "额度格", 104, "center"),
@@ -1082,16 +1115,18 @@ class TraderDeskWindow:
 
         self.slot_tree = ttk.Treeview(
             right_bottom,
-            columns=("slot", "status", "session", "opened", "entry", "size", "closed", "exit", "pnl", "reason"),
+            columns=("slot", "status", "session", "asset", "opened", "entry", "size", "closed", "exit", "pnl", "reason"),
             show="headings",
             selectmode="browse",
             height=8,
         )
         self.slot_tree.grid(row=2, column=0, sticky="nsew")
+        self.slot_tree.bind("<Double-1>", self._on_slot_tree_double_click)
         for column, text, width, anchor in (
             ("slot", "额度格", 90, "center"),
             ("status", "状态", 140, "center"),
-            ("session", "会话", 80, "center"),
+            ("session", "会话(双击日志)", 116, "center"),
+            ("asset", "币种(双击K线)", 116, "center"),
             ("opened", "开仓时间", 120, "center"),
             ("entry", "开仓价", 90, "center"),
             ("size", "数量", 90, "center"),
@@ -1458,6 +1493,37 @@ class TraderDeskWindow:
         self._refresh_event_text()
         self._refresh_detail_text()
 
+    def _on_tree_double_click(self, event) -> None:
+        if self.tree is None:
+            return
+        row_id = self.tree.identify_row(event.y)
+        if not row_id:
+            return
+        column_token = self.tree.identify_column(event.x)
+        if not column_token.startswith("#"):
+            return
+        try:
+            column_index = int(column_token[1:]) - 1
+        except ValueError:
+            return
+        columns = tuple(str(item) for item in self.tree["columns"])
+        if column_index < 0 or column_index >= len(columns):
+            return
+        column_name = columns[column_index]
+        session_id = _trader_primary_session_id(self._snapshot, row_id)
+        if column_name == "session":
+            if not session_id:
+                messagebox.showinfo("提示", "当前没有活动会话，无法打开日志。", parent=self.window)
+                return
+            self._session_log_opener(session_id)
+            return
+        if column_name == "asset":
+            if not session_id:
+                messagebox.showinfo("提示", "当前没有活动会话，无法打开实时K线图。", parent=self.window)
+                return
+            self._session_chart_opener(session_id)
+            return
+
     def _load_selected_draft_into_form(self) -> None:
         draft = self._selected_draft()
         symbol_choices = self._symbol_provider()
@@ -1539,6 +1605,7 @@ class TraderDeskWindow:
                     _strategy_label_from_payload(draft.template_payload),
                     _payload_bar(draft.template_payload),
                     str(draft.template_payload.get("symbol") or "-"),
+                    _symbol_asset_text(draft.template_payload),
                     str(draft.template_payload.get("api_name") or "-"),
                     _run_status_label(run_status),
                     f"{used}/{draft.quota_steps} | {_normalize_decimal_text(used_quota)}/{_normalize_decimal_text(draft.total_quota)}",
@@ -1575,6 +1642,7 @@ class TraderDeskWindow:
                     slot.slot_id,
                     _slot_status_label(slot.status, close_reason=slot.close_reason, net_pnl=slot.net_pnl),
                     slot.session_id,
+                    _symbol_asset_text({"symbol": slot.symbol}),
                     slot.opened_at.strftime("%m-%d %H:%M:%S") if slot.opened_at else "-",
                     _format_optional_decimal(slot.entry_price),
                     _format_optional_decimal(slot.size),
@@ -1584,6 +1652,40 @@ class TraderDeskWindow:
                     slot.close_reason or "-",
                 ),
             )
+
+    def _on_slot_tree_double_click(self, event) -> None:
+        if self.slot_tree is None:
+            return
+        row_id = self.slot_tree.identify_row(event.y)
+        if not row_id:
+            return
+        column_token = self.slot_tree.identify_column(event.x)
+        if not column_token.startswith("#"):
+            return
+        try:
+            column_index = int(column_token[1:]) - 1
+        except ValueError:
+            return
+        columns = tuple(str(item) for item in self.slot_tree["columns"])
+        if column_index < 0 or column_index >= len(columns):
+            return
+        column_name = columns[column_index]
+        slot = next((item for item in self._snapshot.slots if item.slot_id == row_id), None)
+        if slot is None:
+            return
+        session_id = str(slot.session_id or "").strip()
+        if column_name == "session":
+            if not session_id:
+                messagebox.showinfo("提示", "当前槽位没有关联会话，无法打开日志。", parent=self.window)
+                return
+            self._session_log_opener(session_id)
+            return
+        if column_name == "asset":
+            if not session_id:
+                messagebox.showinfo("提示", "当前槽位没有关联会话，无法打开实时K线图。", parent=self.window)
+                return
+            self._session_chart_opener(session_id)
+            return
 
     def _refresh_event_text(self) -> None:
         if self.event_text is None:

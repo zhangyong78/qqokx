@@ -2023,6 +2023,133 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(waits, [1.0, 2.0])
         self.assertTrue(any("准备使用同一 clOrdId 补发一次" in message for message in messages))
 
+    def test_place_entry_order_non_transient_rejection_shows_clear_reason(self) -> None:
+        messages: list[str] = []
+
+        class _StubClient:
+            @staticmethod
+            def place_simple_order(  # noqa: ANN001
+                credentials,
+                config,
+                *,
+                inst_id: str,
+                side: str,
+                size: Decimal,
+                ord_type: str,
+                pos_side=None,
+                price=None,
+                cl_ord_id=None,
+            ):
+                raise OkxApiError("操作全部失败")
+
+        engine = StrategyEngine(
+            _StubClient(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=3,
+            trend_ema_period=5,
+            big_ema_period=233,
+            atr_period=3,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            engine._place_entry_order(
+                None,  # type: ignore[arg-type]
+                config,
+                instrument,
+                "buy",
+                Decimal("0.01"),
+                "long",
+                cl_ord_id="cl-test-0001",
+            )
+
+        detail = str(ctx.exception)
+        self.assertIn("被交易所拒绝", detail)
+        self.assertIn("clOrdId=cl-test-0001", detail)
+        self.assertIn("常见原因", detail)
+
+    def test_place_entry_order_non_transient_rejection_includes_okx_code(self) -> None:
+        class _StubClient:
+            @staticmethod
+            def place_simple_order(  # noqa: ANN001
+                credentials,
+                config,
+                *,
+                inst_id: str,
+                side: str,
+                size: Decimal,
+                ord_type: str,
+                pos_side=None,
+                price=None,
+                cl_ord_id=None,
+            ):
+                raise OkxApiError("操作全部失败", code="51008")
+
+        engine = StrategyEngine(
+            _StubClient(),  # type: ignore[arg-type]
+            lambda message: None,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=3,
+            trend_ema_period=5,
+            big_ema_period=233,
+            atr_period=3,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            engine._place_entry_order(
+                None,  # type: ignore[arg-type]
+                config,
+                instrument,
+                "buy",
+                Decimal("0.01"),
+                "long",
+                cl_ord_id="cl-test-51008",
+            )
+
+        self.assertIn("code=51008", str(ctx.exception))
+
     def test_cancel_active_order_recovers_when_cancel_response_is_lost(self) -> None:
         messages: list[str] = []
         waits: list[float] = []

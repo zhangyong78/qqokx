@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import smtplib
 import threading
+from decimal import Decimal, InvalidOperation
 from email.message import EmailMessage
 from typing import Callable, Literal
 
@@ -159,6 +160,19 @@ class EmailNotifier:
             "sell": "卖出",
         }.get(normalized, side)
 
+    @staticmethod
+    def _format_signal_entry_reference(entry_reference: str, trigger_symbol: str) -> str:
+        raw = str(entry_reference or "").strip()
+        if not raw:
+            return "-"
+        try:
+            value = Decimal(raw)
+        except (InvalidOperation, ValueError):
+            return raw
+        if "e" in raw.lower():
+            return format(value, "f")
+        return raw
+
     def _lines_with_api(self, lines: list[str], api_name: str | None) -> list[str]:
         resolved_api_name = self._clean_api_name(api_name)
         if not resolved_api_name:
@@ -203,7 +217,7 @@ class EmailNotifier:
                 ),
                 f"当前信号：{self._signal_label(signal)}",
                 f"触发标的：{trigger_symbol}",
-                f"参考价：{entry_reference}",
+                f"参考价：{self._format_signal_entry_reference(entry_reference, trigger_symbol)}",
                 f"原因：{reason}",
             ]
         )

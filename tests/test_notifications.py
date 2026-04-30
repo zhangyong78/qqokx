@@ -98,6 +98,26 @@ class EmailNotifierTest(TestCase):
         self.assertIn("触发标的：BTC-USDT-SWAP", body)
         self.assertIn("参考价：95000", body)
 
+    def test_send_signal_keeps_tick_sized_entry_reference_text(self) -> None:
+        notifier = self._make_notifier()
+
+        notifier.send_signal(
+            strategy_name="EMA 动态委托",
+            config=_make_strategy_config(),
+            signal="short",
+            trigger_symbol="SOL-USDT-SWAP",
+            entry_reference="84.5766",
+            reason="趋势确认",
+            api_name="moni",
+            session_id="S02",
+            trader_id="T009",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+        )
+
+        _, body = notifier.notify_async.call_args.args
+        self.assertIn("参考价：84.5766", body)
+
     def test_send_error_includes_api_name_in_subject_and_body(self) -> None:
         notifier = self._make_notifier()
 
@@ -241,6 +261,27 @@ class StrategyEngineNotificationTest(TestCase):
         self.assertEqual(notifier.send_signal.call_args.kwargs["trader_id"], "T003")
         self.assertEqual(notifier.send_signal.call_args.kwargs["direction_label"], "只做多")
         self.assertEqual(notifier.send_signal.call_args.kwargs["run_mode_label"], "交易并下单")
+
+    def test_signal_notification_formats_entry_reference_by_tick_size(self) -> None:
+        notifier = MagicMock()
+        engine = StrategyEngine(
+            MagicMock(),
+            lambda message: None,
+            notifier=notifier,
+            strategy_name="EMA 动态委托",
+            session_id="S09",
+        )
+
+        engine._notify_signal(
+            _make_strategy_config(),
+            signal="long",
+            trigger_symbol="ETH-USDT-SWAP",
+            entry_reference=Decimal("2500.127"),
+            tick_size=Decimal("0.1"),
+            reason="突破确认",
+        )
+
+        self.assertEqual(notifier.send_signal.call_args.kwargs["entry_reference"], "2500.1")
 
     def test_trade_error_notification_passes_api_name_to_notifier(self) -> None:
         notifier = MagicMock()

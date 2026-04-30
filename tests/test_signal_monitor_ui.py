@@ -81,6 +81,30 @@ class _Var:
 
 
 class SignalObserverTemplateNormalizationTest(TestCase):
+    def test_refresh_draft_tree_includes_bar_column(self) -> None:
+        draft = _ObserverDraft(
+            draft_id="D001",
+            template_payload={
+                "strategy_id": STRATEGY_CROSS_ID,
+                "strategy_name": "EMA 动态断层修复",
+                "symbol": "BTC-USDT-SWAP",
+                "api_name": "moni",
+                "run_mode_label": "只发邮件",
+                "config_snapshot": {"bar": "3m"},
+            },
+            created_at=datetime.now(),
+            updated_at=datetime(2026, 4, 30, 15, 20, 0),
+        )
+        tree = _SessionTreeStub()
+        window = object.__new__(SignalMonitorWindow)
+        window.draft_tree = tree
+        window._drafts = [draft]
+
+        SignalMonitorWindow._refresh_draft_tree(window)
+
+        row = tree.item("D001", "values")
+        self.assertEqual(row[3], "3m")
+
     def test_session_tree_double_click_hint_maps_supported_columns(self) -> None:
         self.assertEqual(SignalMonitorWindow._session_tree_double_click_hint("#1"), "双击打开这条会话的独立日志")
         self.assertEqual(SignalMonitorWindow._session_tree_double_click_hint("#3"), "双击打开这条会话的实时K线图")

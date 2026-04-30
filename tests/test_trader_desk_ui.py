@@ -29,6 +29,8 @@ from okx_quant.trader_desk_ui import (
     _should_reload_draft_form,
     _trader_book_summary_text,
     _trader_current_session_label,
+    _trader_primary_session_id,
+    _symbol_asset_text,
     _validate_trader_desk_payload,
 )
 
@@ -230,6 +232,27 @@ class TraderDeskHelpersTest(TestCase):
 
         self.assertEqual(_trader_current_session_label(snapshot, "T001"), "S03 +2")
         self.assertEqual(_trader_current_session_label(snapshot, "T999"), "-")
+
+    def test_trader_primary_session_id_prefers_armed_session(self) -> None:
+        snapshot = TraderDeskSnapshot(
+            slots=[
+                TraderSlotRecord(
+                    slot_id="slot-1",
+                    trader_id="T001",
+                    session_id="S01",
+                    api_name="moni",
+                    strategy_name="EMA",
+                    symbol="BTC-USDT-SWAP",
+                    status="open",
+                ),
+            ],
+            runs=[SimpleNamespace(trader_id="T001", armed_session_id="S03")],
+        )
+        self.assertEqual(_trader_primary_session_id(snapshot, "T001"), "S03")
+        self.assertEqual(_trader_primary_session_id(snapshot, "T999"), "")
+
+    def test_symbol_asset_text_extracts_base_currency(self) -> None:
+        self.assertEqual(_symbol_asset_text(self._payload(symbol="ETH-USDT-SWAP")), "ETH")
 
     def test_trader_book_summary_text_formats_global_totals(self) -> None:
         from okx_quant.trader_desk import TraderBookSummary
@@ -539,8 +562,8 @@ class TraderDeskHelpersTest(TestCase):
 
         values = window.slot_tree.rows["slot-1"]
         self.assertEqual(values[1], "止盈净盈")
-        self.assertEqual(values[7], "78034.1")
-        self.assertEqual(values[8], "0.30")
+        self.assertEqual(values[8], "78034.1")
+        self.assertEqual(values[9], "0.30")
 
     def test_replace_text_preserving_scroll_restores_yview(self) -> None:
         class _FakeText:

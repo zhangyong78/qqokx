@@ -5,7 +5,7 @@ import os
 import queue
 import re
 import threading
-from dataclasses import MISSING, dataclass, field, fields as dataclass_fields, replace
+from dataclasses import MISSING, asdict, dataclass, field, fields as dataclass_fields, replace
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -53,6 +53,7 @@ from okx_quant.okx_client import (
 from okx_quant.persistence import (
     credentials_file_path,
     DEFAULT_CREDENTIAL_PROFILE_NAME,
+    load_history_cache_records,
     load_recoverable_strategy_sessions_snapshot,
     load_credentials_profiles_snapshot,
     load_notification_snapshot,
@@ -63,6 +64,7 @@ from okx_quant.persistence import (
     save_recoverable_strategy_sessions_snapshot,
     save_credentials_profiles_snapshot,
     save_notification_snapshot,
+    save_history_cache_records,
     save_position_notes_snapshot,
     save_strategy_parameter_drafts,
     save_strategy_history_snapshot,
@@ -1647,6 +1649,148 @@ def _sum_fill_pnl(fills: list[OkxFillHistoryItem]) -> Decimal | None:
     return total if seen else None
 
 
+def _history_cache_key(record: dict[str, object], fields: tuple[str, ...]) -> str:
+    return "|".join(str(record.get(name, "") or "") for name in fields)
+
+
+def _merge_history_cache_records(
+    local_records: list[dict[str, object]],
+    remote_records: list[dict[str, object]],
+    dedup_fields: tuple[str, ...],
+) -> list[dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    for record in local_records:
+        key = _history_cache_key(record, dedup_fields)
+        if key:
+            merged[key] = record
+    for record in remote_records:
+        key = _history_cache_key(record, dedup_fields)
+        if key:
+            merged[key] = record
+    return list(merged.values())
+
+
+def _serialize_history_item(item: object) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in asdict(item).items():
+        if isinstance(value, Decimal):
+            payload[key] = str(value)
+            continue
+        payload[key] = value
+    return payload
+
+
+def _parse_decimal_or_none(value: object) -> Decimal | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _parse_int_or_none(value: object) -> int | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _order_item_from_cache(record: dict[str, object]) -> OkxTradeOrderItem | None:
+    inst_id = str(record.get("inst_id", "")).strip()
+    if not inst_id:
+        return None
+    created_time = _parse_int_or_none(record.get("created_time"))
+    update_time = _parse_int_or_none(record.get("update_time"))
+    if created_time is None and update_time is None:
+        return None
+    return OkxTradeOrderItem(
+        source_kind=str(record.get("source_kind", "")),
+        source_label=str(record.get("source_label", "")),
+        created_time=created_time,
+        update_time=update_time,
+        inst_id=inst_id,
+        inst_type=str(record.get("inst_type", "")),
+        side=str(record.get("side", "")) or None,
+        pos_side=str(record.get("pos_side", "")) or None,
+        td_mode=str(record.get("td_mode", "")) or None,
+        ord_type=str(record.get("ord_type", "")) or None,
+        state=str(record.get("state", "")) or None,
+        price=_parse_decimal_or_none(record.get("price")),
+        size=_parse_decimal_or_none(record.get("size")),
+        filled_size=_parse_decimal_or_none(record.get("filled_size")),
+        avg_price=_parse_decimal_or_none(record.get("avg_price")),
+        order_id=str(record.get("order_id", "")) or None,
+        algo_id=str(record.get("algo_id", "")) or None,
+        client_order_id=str(record.get("client_order_id", "")) or None,
+        algo_client_order_id=str(record.get("algo_client_order_id", "")) or None,
+        pnl=_parse_decimal_or_none(record.get("pnl")),
+        fee=_parse_decimal_or_none(record.get("fee")),
+        fee_currency=str(record.get("fee_currency", "")) or None,
+        reduce_only=bool(record.get("reduce_only")) if record.get("reduce_only") is not None else None,
+        trigger_price=_parse_decimal_or_none(record.get("trigger_price")),
+        trigger_price_type=str(record.get("trigger_price_type", "")) or None,
+        order_price=_parse_decimal_or_none(record.get("order_price")),
+        actual_price=_parse_decimal_or_none(record.get("actual_price")),
+        actual_size=_parse_decimal_or_none(record.get("actual_size")),
+        actual_side=str(record.get("actual_side", "")) or None,
+        take_profit_trigger_price=_parse_decimal_or_none(record.get("take_profit_trigger_price")),
+        take_profit_order_price=_parse_decimal_or_none(record.get("take_profit_order_price")),
+        take_profit_trigger_price_type=str(record.get("take_profit_trigger_price_type", "")) or None,
+        stop_loss_trigger_price=_parse_decimal_or_none(record.get("stop_loss_trigger_price")),
+        stop_loss_order_price=_parse_decimal_or_none(record.get("stop_loss_order_price")),
+        stop_loss_trigger_price_type=str(record.get("stop_loss_trigger_price_type", "")) or None,
+        raw=record.get("raw") if isinstance(record.get("raw"), dict) else {},
+    )
+
+
+def _fill_item_from_cache(record: dict[str, object]) -> OkxFillHistoryItem | None:
+    inst_id = str(record.get("inst_id", "")).strip()
+    fill_time = _parse_int_or_none(record.get("fill_time"))
+    if not inst_id or fill_time is None:
+        return None
+    return OkxFillHistoryItem(
+        fill_time=fill_time,
+        inst_id=inst_id,
+        inst_type=str(record.get("inst_type", "")),
+        side=str(record.get("side", "")) or None,
+        pos_side=str(record.get("pos_side", "")) or None,
+        fill_price=_parse_decimal_or_none(record.get("fill_price")),
+        fill_size=_parse_decimal_or_none(record.get("fill_size")),
+        fill_fee=_parse_decimal_or_none(record.get("fill_fee")),
+        fee_currency=str(record.get("fee_currency", "")) or None,
+        pnl=_parse_decimal_or_none(record.get("pnl")),
+        order_id=str(record.get("order_id", "")) or None,
+        trade_id=str(record.get("trade_id", "")) or None,
+        exec_type=str(record.get("exec_type", "")) or None,
+        raw=record.get("raw") if isinstance(record.get("raw"), dict) else {},
+    )
+
+
+def _position_history_item_from_cache(record: dict[str, object]) -> OkxPositionHistoryItem | None:
+    inst_id = str(record.get("inst_id", "")).strip()
+    update_time = _parse_int_or_none(record.get("update_time"))
+    if not inst_id or update_time is None:
+        return None
+    return OkxPositionHistoryItem(
+        update_time=update_time,
+        inst_id=inst_id,
+        inst_type=str(record.get("inst_type", "")),
+        mgn_mode=str(record.get("mgn_mode", "")) or None,
+        pos_side=str(record.get("pos_side", "")) or None,
+        direction=str(record.get("direction", "")) or None,
+        open_avg_price=_parse_decimal_or_none(record.get("open_avg_price")),
+        close_avg_price=_parse_decimal_or_none(record.get("close_avg_price")),
+        close_size=_parse_decimal_or_none(record.get("close_size")),
+        pnl=_parse_decimal_or_none(record.get("pnl")),
+        realized_pnl=_parse_decimal_or_none(record.get("realized_pnl")),
+        settle_pnl=_parse_decimal_or_none(record.get("settle_pnl")),
+        raw=record.get("raw") if isinstance(record.get("raw"), dict) else {},
+    )
+
+
 class QuantApp:
     def __init__(self) -> None:
         self.root = Tk()
@@ -1728,6 +1872,8 @@ class QuantApp:
         self._upl_usdt_prices: dict[str, Decimal] = {}
         self._position_history_usdt_prices: dict[str, Decimal] = {}
         self._position_instruments: dict[str, Instrument] = {}
+        self._pending_order_instruments: dict[str, Instrument] = {}
+        self._order_history_instruments: dict[str, Instrument] = {}
         self._fill_history_instruments: dict[str, Instrument] = {}
         self._position_history_instruments: dict[str, Instrument] = {}
         self._position_tickers: dict[str, OkxTicker] = {}
@@ -3545,7 +3691,7 @@ class QuantApp:
         )
         order_history_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(header, textvariable=self._positions_zoom_order_history_summary_text).grid(row=0, column=1, sticky="w")
-        ttk.Button(header, text="刷新", command=self.refresh_order_history).grid(row=0, column=2, sticky="e")
+        ttk.Button(header, text="同步", command=self.refresh_order_history).grid(row=0, column=2, sticky="e")
 
         filter_row = ttk.Frame(parent)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -3934,8 +4080,7 @@ class QuantApp:
         if self._positions_zoom_window is not None and self._positions_zoom_window.winfo_exists():
             self._positions_zoom_window.focus_force()
             self._schedule_positions_zoom_sync()
-            self.refresh_order_views()
-            self.refresh_position_histories()
+            self.sync_positions_zoom_data()
             return
 
         window = Toplevel(self.root)
@@ -3972,28 +4117,26 @@ class QuantApp:
         zoom_actions = ttk.Frame(header)
         zoom_actions.grid(row=0, column=2, sticky="e")
         ttk.Button(zoom_actions, text="刷新", command=self.refresh_positions).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(zoom_actions, text="刷新历史", command=self.refresh_position_histories).grid(row=0, column=1, padx=(0, 6))
-        ttk.Button(zoom_actions, text="刷新历史成交", command=self.refresh_fill_history).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(zoom_actions, text="账户信息", command=self.open_account_info_window).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(zoom_actions, text="平仓选中", command=self.flatten_selected_position).grid(row=0, column=4, padx=(0, 6))
-        ttk.Button(zoom_actions, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=5, padx=(0, 6))
-        ttk.Button(zoom_actions, text="清空备注", command=self.clear_selected_position_note).grid(row=0, column=6, padx=(0, 6))
+        ttk.Button(zoom_actions, text="账户信息", command=self.open_account_info_window).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(zoom_actions, text="平仓选中", command=self.flatten_selected_position).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(zoom_actions, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(zoom_actions, text="清空备注", command=self.clear_selected_position_note).grid(row=0, column=4, padx=(0, 6))
         ttk.Button(zoom_actions, text="设置期权保护", command=self.open_position_protection_window).grid(
-            row=0, column=7, padx=(0, 6)
+            row=0, column=5, padx=(0, 6)
         )
         ttk.Button(zoom_actions, text="展期建议", command=self.open_option_roll_window).grid(
-            row=0, column=8, padx=(0, 6)
+            row=0, column=6, padx=(0, 6)
         )
-        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=9)
+        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=7)
         ttk.Button(zoom_actions, text="列设置", command=self.open_positions_zoom_column_window).grid(
-            row=0, column=10, padx=(0, 6)
+            row=0, column=8, padx=(0, 6)
         )
 
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_detail_toggle_text, command=self.toggle_positions_zoom_detail).grid(
-            row=0, column=11, padx=(0, 6)
+            row=0, column=9, padx=(0, 6)
         )
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_history_toggle_text, command=self.toggle_positions_zoom_history).grid(
-            row=0, column=12
+            row=0, column=10
         )
         for column_index, child in enumerate(zoom_actions.winfo_children()):
             child.grid_configure(column=column_index)
@@ -4113,6 +4256,12 @@ class QuantApp:
         position_history_tab.rowconfigure(3, weight=1)
         history_notebook.add(position_history_tab, text="历史仓位")
         self._build_positions_zoom_position_history_tab(position_history_tab)
+        history_actions = ttk.Frame(container)
+        history_actions.grid(row=5, column=0, sticky="e", pady=(8, 0))
+        ttk.Button(history_actions, text="同步历史委托", command=self.refresh_order_history).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(history_actions, text="同步历史成交", command=self.refresh_fill_history).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(history_actions, text="同步历史仓位", command=self.refresh_position_histories).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(history_actions, text="同步全部历史", command=self.sync_all_histories).grid(row=0, column=3)
         if not self._positions_zoom_detail_collapsed:
             self.toggle_positions_zoom_detail()
         if not self._positions_zoom_pending_orders_detail_collapsed:
@@ -4123,8 +4272,7 @@ class QuantApp:
             self.toggle_positions_zoom_fills_detail()
         if not self._positions_zoom_position_history_detail_collapsed:
             self.toggle_positions_zoom_position_history_detail()
-        self.refresh_order_views()
-        self.refresh_position_histories()
+        self.sync_positions_zoom_data()
         self._expand_to_screen(window)
         self._refresh_all_refresh_badges()
         self._update_positions_zoom_search_shortcuts()
@@ -4280,7 +4428,7 @@ class QuantApp:
         )
         order_history_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(header, textvariable=self._positions_zoom_order_history_summary_text).grid(row=0, column=1, sticky="w")
-        ttk.Button(header, text="刷新", command=self.refresh_order_history).grid(row=0, column=2, sticky="e", padx=(0, 6))
+        ttk.Button(header, text="同步", command=self.refresh_order_history).grid(row=0, column=2, sticky="e", padx=(0, 6))
         ttk.Button(
             header,
             textvariable=self._positions_zoom_order_history_detail_toggle_text,
@@ -5327,7 +5475,8 @@ class QuantApp:
             return
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
         self._start_pending_orders_refresh(credentials, environment)
-        self._start_order_history_refresh(credentials, environment)
+        profile_name = credentials.profile_name or self._current_credential_profile()
+        self._start_order_history_refresh(credentials, environment, profile_name)
 
     def refresh_pending_orders(self) -> None:
         credentials = self._current_credentials_or_none()
@@ -5353,7 +5502,32 @@ class QuantApp:
             self._refresh_all_refresh_badges()
             return
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
-        self._start_order_history_refresh(credentials, environment)
+        profile_name = credentials.profile_name or self._current_credential_profile()
+        self._start_order_history_refresh(credentials, environment, profile_name)
+
+    def _active_history_scope(self) -> tuple[str, str]:
+        credentials = self._current_credentials_or_none()
+        profile_name = credentials.profile_name if credentials and credentials.profile_name else self._current_credential_profile()
+        environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        return profile_name or DEFAULT_CREDENTIAL_PROFILE_NAME, environment
+
+    def _load_local_history_cache(self) -> None:
+        profile_name, environment = self._active_history_scope()
+        order_records = load_history_cache_records("orders", profile_name, environment)
+        fill_records = load_history_cache_records("fills", profile_name, environment)
+        position_records = load_history_cache_records("positions", profile_name, environment)
+        self._latest_order_history = [item for record in order_records if (item := _order_item_from_cache(record)) is not None]
+        self._latest_fill_history = [item for record in fill_records if (item := _fill_item_from_cache(record)) is not None]
+        self._latest_position_history = [
+            item for record in position_records if (item := _position_history_item_from_cache(record)) is not None
+        ]
+        self._positions_zoom_order_history_base_summary = f"历史委托：{len(self._latest_order_history)} 条 | 本地缓存"
+        self._positions_zoom_fills_summary_text.set(f"历史成交：{len(self._latest_fill_history)} 条 | 本地缓存")
+        self._positions_zoom_position_history_base_summary = f"历史仓位：{len(self._latest_position_history)} 条 | 本地缓存"
+        self._positions_zoom_position_history_summary_text.set(self._positions_zoom_position_history_base_summary)
+        self._render_order_history_view()
+        self._render_positions_zoom_fills_view()
+        self._render_positions_zoom_position_history_view()
 
     def _pending_order_tree_for_view(self, view_name: str | None = None) -> ttk.Treeview | None:
         if view_name == "account_info":
@@ -5850,20 +6024,21 @@ class QuantApp:
             daemon=True,
         ).start()
 
-    def _start_order_history_refresh(self, credentials: Credentials, environment: str) -> None:
+    def _start_order_history_refresh(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         if self._order_history_refreshing:
             return
         self._order_history_refreshing = True
-        self._positions_zoom_order_history_summary_text.set("正在刷新历史委托...")
+        self._positions_zoom_order_history_summary_text.set("正在同步历史委托...")
         threading.Thread(
             target=self._refresh_order_history_worker,
-            args=(credentials, environment),
+            args=(credentials, environment, profile_name),
             daemon=True,
         ).start()
 
     def _refresh_pending_orders_worker(self, credentials: Credentials, environment: str) -> None:
         try:
             items = self.client.get_pending_orders(credentials, environment=environment, limit=200)
+            instruments = _build_history_instrument_map(self.client, [item.inst_id for item in items])
             note = None
             effective_environment = environment
         except Exception as exc:
@@ -5872,6 +6047,7 @@ class QuantApp:
                 alternate = "live" if environment == "demo" else "demo"
                 try:
                     items = self.client.get_pending_orders(credentials, environment=alternate, limit=200)
+                    instruments = _build_history_instrument_map(self.client, [item.inst_id for item in items])
                     note = f"委托数据自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
                     effective_environment = alternate
                 except Exception:
@@ -5880,11 +6056,12 @@ class QuantApp:
             else:
                 self.root.after(0, lambda: self._apply_pending_orders_error(message))
                 return
-        self.root.after(0, lambda: self._apply_pending_orders(items, note, effective_environment))
+        self.root.after(0, lambda: self._apply_pending_orders(items, instruments, note, effective_environment))
 
-    def _refresh_order_history_worker(self, credentials: Credentials, environment: str) -> None:
+    def _refresh_order_history_worker(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         try:
             items = self.client.get_order_history(credentials, environment=environment, limit=200)
+            instruments = _build_history_instrument_map(self.client, [item.inst_id for item in items])
             note = None
             effective_environment = environment
         except Exception as exc:
@@ -5893,6 +6070,7 @@ class QuantApp:
                 alternate = "live" if environment == "demo" else "demo"
                 try:
                     items = self.client.get_order_history(credentials, environment=alternate, limit=200)
+                    instruments = _build_history_instrument_map(self.client, [item.inst_id for item in items])
                     note = f"委托数据自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
                     effective_environment = alternate
                 except Exception:
@@ -5901,16 +6079,18 @@ class QuantApp:
             else:
                 self.root.after(0, lambda: self._apply_order_history_error(message))
                 return
-        self.root.after(0, lambda: self._apply_order_history(items, note, effective_environment))
+        self.root.after(0, lambda: self._apply_order_history(items, instruments, note, effective_environment, profile_name))
 
     def _apply_pending_orders(
         self,
         items: list[OkxTradeOrderItem],
+        instruments: dict[str, Instrument],
         note: str | None = None,
         effective_environment: str | None = None,
     ) -> None:
         self._pending_orders_refreshing = False
         self._latest_pending_orders = list(items)
+        self._pending_order_instruments = dict(instruments)
         self._pending_orders_last_refresh_at = datetime.now()
         _mark_refresh_health_success(self._pending_orders_refresh_health, at=self._pending_orders_last_refresh_at)
         self._refresh_all_refresh_badges()
@@ -5927,18 +6107,30 @@ class QuantApp:
     def _apply_order_history(
         self,
         items: list[OkxTradeOrderItem],
+        instruments: dict[str, Instrument],
         note: str | None = None,
         effective_environment: str | None = None,
+        profile_name: str | None = None,
     ) -> None:
         self._order_history_refreshing = False
-        self._latest_order_history = list(items)
+        active_profile = (profile_name or self._current_credential_profile()).strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
+        active_environment = effective_environment or self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        local_records = load_history_cache_records("orders", active_profile, active_environment)
+        merged_records = _merge_history_cache_records(
+            local_records=local_records,
+            remote_records=[_serialize_history_item(item) for item in items],
+            dedup_fields=("source_kind", "order_id", "algo_id", "client_order_id", "algo_client_order_id", "inst_id", "created_time"),
+        )
+        save_history_cache_records("orders", active_profile, active_environment, merged_records)
+        self._latest_order_history = [item for record in merged_records if (item := _order_item_from_cache(record)) is not None]
+        self._order_history_instruments = dict(instruments)
         self._order_history_last_refresh_at = datetime.now()
         _mark_refresh_health_success(self._order_history_refresh_health, at=self._order_history_last_refresh_at)
         self._refresh_all_refresh_badges()
         if effective_environment:
             self._positions_effective_environment = effective_environment
         timestamp = self._order_history_last_refresh_at.strftime("%H:%M:%S")
-        summary = f"历史委托：{len(items)} 条 | 最近刷新：{timestamp}"
+        summary = f"历史委托：{len(self._latest_order_history)} 条 | 最近同步：{timestamp}"
         if note:
             summary = f"{summary} | {note}"
         self._positions_zoom_order_history_base_summary = summary
@@ -6064,8 +6256,8 @@ class QuantApp:
                             _format_history_side(item.side, item.pos_side),
                             item.ord_type or "-",
                             _format_trade_order_price(item.price, item.inst_id, item.inst_type),
-                            _format_trade_order_size(item.size),
-                            _format_trade_order_size(item.filled_size),
+                            _format_trade_order_coin_size(item, self._pending_order_instruments),
+                            _format_trade_order_coin_filled_size(item, self._pending_order_instruments),
                             _format_trade_order_tp_sl(item),
                             item.order_id or item.algo_id or "-",
                             item.client_order_id or item.algo_client_order_id or "-",
@@ -6124,8 +6316,8 @@ class QuantApp:
                             _format_history_side(item.side, item.pos_side),
                             item.ord_type or "-",
                             _format_trade_order_price(item.price, item.inst_id, item.inst_type),
-                            _format_trade_order_size(item.size),
-                            _format_trade_order_size(item.filled_size),
+                            _format_trade_order_coin_size(item, self._order_history_instruments),
+                            _format_trade_order_coin_filled_size(item, self._order_history_instruments),
                             _format_trade_order_tp_sl(item),
                             item.order_id or item.algo_id or "-",
                             item.client_order_id or item.algo_client_order_id or "-",
@@ -6229,7 +6421,16 @@ class QuantApp:
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
         profile_name = credentials.profile_name or self._current_credential_profile()
         self._start_position_history_refresh(credentials, environment, profile_name)
-        self._start_fill_history_refresh(credentials, environment)
+        self._start_fill_history_refresh(credentials, environment, profile_name)
+
+    def sync_all_histories(self) -> None:
+        self.refresh_order_history()
+        self.refresh_position_histories()
+
+    def sync_positions_zoom_data(self) -> None:
+        self.refresh_pending_orders()
+        self.refresh_order_history()
+        self.refresh_position_histories()
 
     def refresh_fill_history(self) -> None:
         credentials = self._current_credentials_or_none()
@@ -6237,7 +6438,8 @@ class QuantApp:
             self._positions_zoom_fills_summary_text.set("未配置 API 凭证，无法读取历史成交。")
             return
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
-        self._start_fill_history_refresh(credentials, environment)
+        profile_name = credentials.profile_name or self._current_credential_profile()
+        self._start_fill_history_refresh(credentials, environment, profile_name)
 
     def expand_fill_history_limit(self) -> None:
         self._fill_history_fetch_limit, self._fill_history_load_more_clicks, next_label = _advance_fill_history_limit(
@@ -6261,14 +6463,14 @@ class QuantApp:
         profile_name = credentials.profile_name or self._current_credential_profile()
         self._start_position_history_refresh(credentials, environment, profile_name)
 
-    def _start_fill_history_refresh(self, credentials: Credentials, environment: str) -> None:
+    def _start_fill_history_refresh(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         if self._fills_history_refreshing:
             return
         self._fills_history_refreshing = True
-        self._positions_zoom_fills_summary_text.set("正在刷新历史成交...")
+        self._positions_zoom_fills_summary_text.set("正在同步历史成交...")
         threading.Thread(
             target=self._refresh_fill_history_worker,
-            args=(credentials, environment),
+            args=(credentials, environment, profile_name),
             daemon=True,
         ).start()
 
@@ -6276,14 +6478,14 @@ class QuantApp:
         if self._position_history_refreshing:
             return
         self._position_history_refreshing = True
-        self._positions_zoom_position_history_summary_text.set("正在刷新历史仓位...")
+        self._positions_zoom_position_history_summary_text.set("正在同步历史仓位...")
         threading.Thread(
             target=self._refresh_position_history_worker,
             args=(credentials, environment, profile_name),
             daemon=True,
         ).start()
 
-    def _refresh_fill_history_worker(self, credentials: Credentials, environment: str) -> None:
+    def _refresh_fill_history_worker(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         try:
             fills = self.client.get_fills_history(credentials, environment=environment, limit=self._fill_history_fetch_limit)
             instruments = _build_history_instrument_map(self.client, [item.inst_id for item in fills])
@@ -6304,7 +6506,7 @@ class QuantApp:
             else:
                 self.root.after(0, lambda: self._apply_fill_history_error(message))
                 return
-        self.root.after(0, lambda: self._apply_fill_history(fills, instruments, note, effective_environment))
+        self.root.after(0, lambda: self._apply_fill_history(fills, instruments, note, effective_environment, profile_name))
 
     def _refresh_position_history_worker(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         try:
@@ -6347,16 +6549,26 @@ class QuantApp:
         instruments: dict[str, Instrument],
         note: str | None = None,
         effective_environment: str | None = None,
+        profile_name: str | None = None,
     ) -> None:
         self._fills_history_refreshing = False
-        self._latest_fill_history = list(fills)
+        active_profile = (profile_name or self._current_credential_profile()).strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
+        active_environment = effective_environment or self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        local_records = load_history_cache_records("fills", active_profile, active_environment)
+        merged_records = _merge_history_cache_records(
+            local_records=local_records,
+            remote_records=[_serialize_history_item(item) for item in fills],
+            dedup_fields=("trade_id", "order_id", "inst_id", "fill_time", "side", "fill_size", "fill_price"),
+        )
+        save_history_cache_records("fills", active_profile, active_environment, merged_records)
+        self._latest_fill_history = [item for record in merged_records if (item := _fill_item_from_cache(record)) is not None]
         self._fill_history_instruments = dict(instruments)
         self._fills_history_last_refresh_at = datetime.now()
         self._positions_history_last_refresh_at = self._fills_history_last_refresh_at
         if effective_environment:
             self._positions_effective_environment = effective_environment
         timestamp = self._fills_history_last_refresh_at.strftime("%H:%M:%S")
-        fill_summary = f"历史成交：{len(fills)} 条 | 最近刷新：{timestamp}"
+        fill_summary = f"历史成交：{len(self._latest_fill_history)} 条 | 最近同步：{timestamp}"
         if note:
             fill_summary = f"{fill_summary} | {note}"
         self._positions_zoom_fills_summary_text.set(fill_summary)
@@ -6372,7 +6584,6 @@ class QuantApp:
         credential_profile_name: str | None = None,
     ) -> None:
         self._position_history_refreshing = False
-        self._latest_position_history = list(position_history)
         self._position_history_usdt_prices = dict(usdt_prices)
         self._position_history_instruments = dict(instruments)
         self._position_history_last_refresh_at = datetime.now()
@@ -6382,7 +6593,19 @@ class QuantApp:
         if effective_environment:
             self._positions_effective_environment = effective_environment
         timestamp = self._position_history_last_refresh_at.strftime("%H:%M:%S")
-        history_summary = f"历史仓位：{len(position_history)} 条 | 最近刷新：{timestamp}"
+        active_profile = (credential_profile_name or self._current_credential_profile()).strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
+        active_environment = effective_environment or self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        local_records = load_history_cache_records("positions", active_profile, active_environment)
+        merged_records = _merge_history_cache_records(
+            local_records=local_records,
+            remote_records=[_serialize_history_item(item) for item in position_history],
+            dedup_fields=("update_time", "inst_id", "pos_side", "direction", "close_size", "close_avg_price"),
+        )
+        save_history_cache_records("positions", active_profile, active_environment, merged_records)
+        self._latest_position_history = [
+            item for record in merged_records if (item := _position_history_item_from_cache(record)) is not None
+        ]
+        history_summary = f"历史仓位：{len(self._latest_position_history)} 条 | 最近同步：{timestamp}"
         if note:
             history_summary = f"{history_summary} | {note}"
         self._positions_zoom_position_history_base_summary = history_summary
@@ -7513,6 +7736,8 @@ class QuantApp:
             trader_force_cleaner=self.force_clear_trader_draft,
             symbol_provider=self._trader_desk_symbol_choices,
             runtime_snapshot_provider=self._trader_runtime_snapshot_for_ui,
+            session_log_opener=self.open_strategy_session_log,
+            session_chart_opener=self.open_strategy_live_chart_window,
         )
 
     def open_trader_desk_window_for_trader(self, trader_id: str) -> None:
@@ -12218,7 +12443,7 @@ class QuantApp:
                 signal_mode=SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()],
                 position_mode=POSITION_MODE_OPTIONS[self.position_mode_label.get()],
                 environment=ENV_OPTIONS[self.environment_label.get()],
-                tp_sl_trigger_type=TP_SL_TRIGGER_TYPE_OPTIONS[self.trigger_type_label.get()],
+                tp_sl_trigger_type=TRIGGER_TYPE_OPTIONS[self.trigger_type_label.get()],
             ),
             signal="long",
             trigger_symbol=self.symbol.get().strip().upper() or "-",
@@ -17579,6 +17804,28 @@ def _format_trade_order_size(value: Decimal | None) -> str:
     return _format_optional_decimal(value)
 
 
+def _format_trade_order_coin_size(item: OkxTradeOrderItem, instruments: dict[str, Instrument]) -> str:
+    amount, currency = _history_display_amount(
+        inst_id=item.inst_id,
+        inst_type=item.inst_type,
+        size=item.size,
+        reference_price=item.price if item.price and item.price > 0 else item.avg_price,
+        instruments=instruments,
+    )
+    return _format_history_size_amount(amount, currency)
+
+
+def _format_trade_order_coin_filled_size(item: OkxTradeOrderItem, instruments: dict[str, Instrument]) -> str:
+    amount, currency = _history_display_amount(
+        inst_id=item.inst_id,
+        inst_type=item.inst_type,
+        size=item.filled_size,
+        reference_price=item.avg_price or item.price,
+        instruments=instruments,
+    )
+    return _format_history_size_amount(amount, currency)
+
+
 def _format_trade_order_tp_sl(item: OkxTradeOrderItem) -> str:
     def _build_tp_sl_segment(label: str, trigger_price: Decimal | None, order_price: Decimal | None) -> str | None:
         if trigger_price is None:
@@ -17915,6 +18162,9 @@ def _history_display_amount(
 
     instrument = _resolve_history_instrument(inst_id=inst_id, inst_type=inst_type, instruments=instruments)
     if instrument is None or instrument.ct_val is None or instrument.ct_val <= 0 or not instrument.ct_val_ccy:
+        normalized_type = (inst_type or "").upper()
+        if normalized_type in {"SWAP", "FUTURES", "OPTION"}:
+            return abs(size), "张"
         asset_currency = _extract_asset_key(inst_id).upper()
         return size, asset_currency if asset_currency else None
 

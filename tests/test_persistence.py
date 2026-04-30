@@ -5,6 +5,9 @@ from uuid import uuid4
 
 from okx_quant.persistence import (
     credentials_file_path,
+    history_cache_dir_path,
+    history_cache_file_path,
+    load_history_cache_records,
     load_credentials_snapshot,
     load_option_strategies_snapshot,
     load_strategy_parameter_drafts,
@@ -13,6 +16,7 @@ from okx_quant.persistence import (
     load_strategy_trade_ledger_snapshot,
     option_strategies_file_path,
     save_credentials_snapshot,
+    save_history_cache_records,
     save_option_strategies_snapshot,
     save_smart_order_favorites_snapshot,
     save_strategy_parameter_drafts,
@@ -346,3 +350,23 @@ class PersistenceTest(TestCase):
         self.assertEqual(record["record_id"], "20260423170920000000-S01")
         self.assertEqual(record["close_reason"], "OKX止损触发")
         self.assertEqual(record["net_pnl"], "-3.87")
+
+    def test_history_cache_path_isolated_by_profile_and_environment(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        cache_dir = history_cache_dir_path("api2", "live", base_dir=temp_dir)
+        cache_file = history_cache_file_path("fills", "api2", "live", base_dir=temp_dir)
+        self.assertTrue(str(cache_dir).endswith(str(Path("history") / "api2" / "live")))
+        self.assertTrue(str(cache_file).endswith(str(Path("history") / "api2" / "live" / "fills_history.json")))
+
+    def test_save_and_load_history_cache_records(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        save_history_cache_records(
+            "orders",
+            "api3",
+            "demo",
+            [{"order_id": "1001", "inst_id": "BTC-USDT-SWAP"}],
+            base_dir=temp_dir,
+        )
+        records = load_history_cache_records("orders", "api3", "demo", base_dir=temp_dir)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["order_id"], "1001")

@@ -28,6 +28,10 @@ TRADER_DESK_FILE_NAME = "trader_desk.json"
 POSITION_NOTES_FILE_NAME = "position_notes.json"
 STRATEGY_PARAMETER_GLOBAL_DEFAULTS_FILE_NAME = "strategy_parameter_global_defaults.json"
 STRATEGY_PARAMETER_DRAFTS_FILE_NAME = "strategy_parameter_drafts.json"
+HISTORY_CACHE_DIR_NAME = "history"
+HISTORY_ORDER_FILE_NAME = "order_history.json"
+HISTORY_FILLS_FILE_NAME = "fills_history.json"
+HISTORY_POSITIONS_FILE_NAME = "position_history.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 PROFILE_ENVIRONMENTS = {"demo", "live"}
 
@@ -131,6 +135,85 @@ def strategy_parameter_drafts_file_path(base_dir: Path | None = None) -> Path:
     if base_dir is not None:
         return Path(base_dir) / STRATEGY_PARAMETER_DRAFTS_FILE_NAME
     return state_dir_path() / STRATEGY_PARAMETER_DRAFTS_FILE_NAME
+
+
+def _normalize_history_profile_name(profile_name: object) -> str:
+    normalized = str(profile_name or "").strip()
+    return normalized or DEFAULT_CREDENTIAL_PROFILE_NAME
+
+
+def _normalize_history_environment(environment: object) -> str:
+    normalized = str(environment or "").strip().lower()
+    return normalized if normalized in PROFILE_ENVIRONMENTS else "demo"
+
+
+def history_cache_dir_path(
+    profile_name: str,
+    environment: str,
+    *,
+    base_dir: Path | None = None,
+) -> Path:
+    root = Path(base_dir) if base_dir is not None else state_dir_path()
+    return root / HISTORY_CACHE_DIR_NAME / _normalize_history_profile_name(profile_name) / _normalize_history_environment(environment)
+
+
+def history_cache_file_path(
+    history_kind: str,
+    profile_name: str,
+    environment: str,
+    *,
+    base_dir: Path | None = None,
+) -> Path:
+    file_name_by_kind = {
+        "orders": HISTORY_ORDER_FILE_NAME,
+        "fills": HISTORY_FILLS_FILE_NAME,
+        "positions": HISTORY_POSITIONS_FILE_NAME,
+    }
+    file_name = file_name_by_kind.get(str(history_kind).strip().lower())
+    if not file_name:
+        raise ValueError(f"Unsupported history cache kind: {history_kind}")
+    return history_cache_dir_path(profile_name, environment, base_dir=base_dir) / file_name
+
+
+def load_history_cache_records(
+    history_kind: str,
+    profile_name: str,
+    environment: str,
+    *,
+    base_dir: Path | None = None,
+) -> list[dict[str, object]]:
+    target = history_cache_file_path(history_kind, profile_name, environment, base_dir=base_dir)
+    if not target.exists():
+        return []
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        return []
+    return [item for item in records if isinstance(item, dict)]
+
+
+def save_history_cache_records(
+    history_kind: str,
+    profile_name: str,
+    environment: str,
+    records: list[dict[str, object]],
+    *,
+    base_dir: Path | None = None,
+) -> Path:
+    target = history_cache_file_path(history_kind, profile_name, environment, base_dir=base_dir)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    normalized_records = [item for item in records if isinstance(item, dict)]
+    payload = {
+        "records": normalized_records,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
 
 
 def _normalize_strategy_parameter_record(payload: object) -> dict[str, object]:

@@ -1,4 +1,4 @@
-﻿[project]
+[project]
 name = "okx-quant-mvp"
 version = "0.5.05"
 description = "Desktop MVP for OKX EMA signal trading with ATR-based TP/SL"

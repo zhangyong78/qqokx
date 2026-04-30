@@ -325,7 +325,7 @@ class SignalMonitorWindow:
 
         self.draft_tree = ttk.Treeview(
             left,
-            columns=("draft", "strategy", "symbol", "api", "mode", "updated"),
+            columns=("draft", "strategy", "symbol", "bar", "api", "mode", "updated"),
             show="headings",
             selectmode="extended",
             height=18,
@@ -335,6 +335,7 @@ class SignalMonitorWindow:
             ("draft", "信号", 90, "center"),
             ("strategy", "策略", 180, "w"),
             ("symbol", "标的", 160, "w"),
+            ("bar", "周期", 70, "center"),
             ("api", "API", 90, "center"),
             ("mode", "模式", 90, "center"),
             ("updated", "更新时间", 150, "center"),
@@ -1175,6 +1176,10 @@ class SignalMonitorWindow:
             self.draft_tree.delete(item_id)
         for draft in self._drafts:
             payload = draft.template_payload
+            config_snapshot = payload.get("config_snapshot")
+            bar = "-"
+            if isinstance(config_snapshot, dict):
+                bar = str(config_snapshot.get("bar") or "-")
             self.draft_tree.insert(
                 "",
                 END,
@@ -1183,6 +1188,7 @@ class SignalMonitorWindow:
                     draft.draft_id,
                     str(payload.get("strategy_name") or payload.get("strategy_id") or "-"),
                     str(payload.get("symbol") or "-"),
+                    bar,
                     str(payload.get("api_name") or "-"),
                     str(payload.get("run_mode_label") or "只发邮件"),
                     draft.updated_at.strftime("%Y-%m-%d %H:%M:%S"),

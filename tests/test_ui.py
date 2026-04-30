@@ -46,6 +46,10 @@ from okx_quant.ui import (
     _inherit_position_history_notes,
     _mark_refresh_health_failure,
     _mark_refresh_health_success,
+    _merge_history_cache_records,
+    _order_item_from_cache,
+    _position_history_item_from_cache,
+    _format_trade_order_coin_size,
     _position_history_note_key,
     _position_note_current_key,
     _position_realized_pnl_usdt,
@@ -63,6 +67,64 @@ from okx_quant.ui import (
 
 
 class UiHelpersTest(TestCase):
+    def test_order_item_from_cache_returns_none_for_invalid_record(self) -> None:
+        self.assertIsNone(_order_item_from_cache({"inst_id": "", "created_time": None, "update_time": None}))
+
+    def test_position_history_item_from_cache_returns_none_for_invalid_record(self) -> None:
+        self.assertIsNone(_position_history_item_from_cache({"inst_id": "BTC-USDT-SWAP", "update_time": ""}))
+
+    def test_format_trade_order_coin_size_uses_coin_amount(self) -> None:
+        order = SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            size=Decimal("10"),
+            price=Decimal("100000"),
+            avg_price=None,
+        )
+        instruments = {
+            "BTC-USDT-SWAP": Instrument(
+                inst_id="BTC-USDT-SWAP",
+                inst_type="SWAP",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("0.01"),
+                min_size=Decimal("0.01"),
+                state="live",
+                ct_val=Decimal("0.01"),
+                ct_mult=Decimal("1"),
+                ct_val_ccy="BTC",
+            )
+        }
+
+        text = _format_trade_order_coin_size(order, instruments)  # type: ignore[arg-type]
+        self.assertIn("0.1 BTC", text)
+
+    def test_format_trade_order_coin_size_without_instrument_falls_back_to_contracts(self) -> None:
+        order = SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            size=Decimal("20"),
+            price=Decimal("100000"),
+            avg_price=None,
+        )
+        text = _format_trade_order_coin_size(order, {})  # type: ignore[arg-type]
+        self.assertIn("20 张", text)
+
+    def test_merge_history_cache_records_prefers_remote_duplicates(self) -> None:
+        local_records = [
+            {"order_id": "1001", "inst_id": "BTC-USDT-SWAP", "state": "live"},
+            {"order_id": "1002", "inst_id": "BTC-USDT-SWAP", "state": "filled"},
+        ]
+        remote_records = [
+            {"order_id": "1001", "inst_id": "BTC-USDT-SWAP", "state": "canceled"},
+            {"order_id": "1003", "inst_id": "ETH-USDT-SWAP", "state": "live"},
+        ]
+        merged = _merge_history_cache_records(local_records, remote_records, ("order_id", "inst_id"))
+        merged_by_key = {(item["order_id"], item["inst_id"]): item for item in merged}
+        self.assertEqual(len(merged), 3)
+        self.assertEqual(merged_by_key[("1001", "BTC-USDT-SWAP")]["state"], "canceled")
+        self.assertEqual(merged_by_key[("1002", "BTC-USDT-SWAP")]["state"], "filled")
+        self.assertEqual(merged_by_key[("1003", "ETH-USDT-SWAP")]["state"], "live")
+
     def test_format_network_error_message_read_timeout(self) -> None:
         self.assertEqual(
             _format_network_error_message("The read operation timed out"),

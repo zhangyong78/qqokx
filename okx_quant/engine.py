@@ -378,6 +378,7 @@ class StrategyEngine:
                         symbol=config.inst_id,
                         side=active_order.side,
                         size=filled_size,
+                        size_text=_format_notify_size_with_unit(instrument, filled_size),
                         price=filled_price,
                         reason="EMA 动态委托出现部分成交，策略停止等待人工处理",
                     )
@@ -668,6 +669,7 @@ class StrategyEngine:
                 symbol=instrument.inst_id,
                 side=filled.side,
                 size=filled.size,
+                size_text=_format_notify_size_with_unit(instrument, filled.size),
                 price=filled.entry_price,
                 reason="EMA 穿越市价信号成交，止盈止损已交给 OKX 托管",
             )
@@ -969,6 +971,7 @@ class StrategyEngine:
                 signal=decision.signal,
                 trigger_symbol=instrument.inst_id,
                 entry_reference=decision.entry_reference,
+                tick_size=instrument.tick_size,
                 reason=reason,
             )
             self._stop_event.wait(config.poll_seconds)
@@ -1289,6 +1292,7 @@ class StrategyEngine:
                 signal=decision.signal,
                 trigger_symbol=instrument.inst_id,
                 entry_reference=decision.entry_reference,
+                tick_size=instrument.tick_size,
                 reason=reason,
             )
             entries_in_current_wave += 1
@@ -1374,6 +1378,7 @@ class StrategyEngine:
                 signal=decision.signal,
                 trigger_symbol=instrument.inst_id,
                 entry_reference=decision.entry_reference,
+                tick_size=instrument.tick_size,
                 reason=reason,
             )
             self._stop_event.wait(config.poll_seconds)
@@ -1427,6 +1432,7 @@ class StrategyEngine:
                 signal=decision.signal,
                 trigger_symbol=instrument.inst_id,
                 entry_reference=decision.entry_reference,
+                tick_size=instrument.tick_size,
                 reason=reason,
             )
             self._stop_event.wait(config.poll_seconds)
@@ -1561,6 +1567,7 @@ class StrategyEngine:
             symbol=trade_instrument.inst_id,
             side=trade_side,
             size=filled.size,
+            size_text=_format_notify_size_with_unit(trade_instrument, filled.size),
             price=filled.entry_price,
             reason=f"EMA{config.ema_period}/EMA{config.trend_ema_period} 交叉信号成交",
         )
@@ -1632,6 +1639,7 @@ class StrategyEngine:
             symbol=trade_instrument.inst_id,
             side=trade_side,
             size=filled.size,
+            size_text=_format_notify_size_with_unit(trade_instrument, filled.size),
             price=filled.entry_price,
             reason="本地下单成交",
         )
@@ -1828,6 +1836,7 @@ class StrategyEngine:
                 symbol=trade_instrument.inst_id,
                 side=position.close_side,
                 size=filled.size,
+                size_text=_format_notify_size_with_unit(trade_instrument, filled.size),
                 price=filled.entry_price,
                 reason=f"本地{reason}触发后平仓成交",
                 trade_pnl=StrategyEngine._trade_fill_pnl_text_for_close(
@@ -2651,6 +2660,30 @@ class StrategyEngine:
                 self._wait_for_write_reconcile(attempt)
         return None
 
+    @staticmethod
+    def _build_okx_write_failure_message(
+        *,
+        label: str,
+        inst_id: str,
+        cl_ord_id: str,
+        detail: str,
+        code: str | None = None,
+    ) -> str:
+        normalized_detail = str(detail or "").strip() or "-"
+        normalized_code = str(code or "").strip()
+        code_text = f" | code={normalized_code}" if normalized_code else ""
+        if "操作全部失败" in normalized_detail:
+            return (
+                f"OKX {label}被交易所拒绝 | 标的={inst_id} | clOrdId={cl_ord_id} | "
+                f"原始返回={normalized_detail}{code_text} | 常见原因："
+                "1) clOrdId 含非法字符；2) 保证金/可用余额不足；"
+                "3) 下单参数不合法（数量、价格精度、持仓模式）"
+            )
+        return (
+            f"OKX {label}失败 | 标的={inst_id} | clOrdId={cl_ord_id} | "
+            f"原始返回={normalized_detail}{code_text}"
+        )
+
     def _submit_order_with_recovery(
         self,
         credentials: Credentials,
@@ -2665,7 +2698,16 @@ class StrategyEngine:
             return submit_fn()
         except OkxApiError as exc:
             if not _is_transient_okx_error(exc):
-                raise
+                detail = str(exc).strip() or f"code={exc.code or '-'}"
+                raise RuntimeError(
+                    self._build_okx_write_failure_message(
+                        label=label,
+                        inst_id=inst_id,
+                        cl_ord_id=cl_ord_id,
+                        detail=detail,
+                        code=exc.code,
+                    )
+                ) from exc
             detail = str(exc).strip() or f"code={exc.code or '-'}"
             self._logger(
                 " | ".join(
@@ -2739,7 +2781,13 @@ class StrategyEngine:
                     return recovered
                 detail = str(retry_exc).strip() or f"code={retry_exc.code or '-'}"
                 raise RuntimeError(
-                    f"OKX {label}失败且回查未确认订单状态 | clOrdId={cl_ord_id} | {detail}"
+                    self._build_okx_write_failure_message(
+                        label=f"{label}失败且回查未确认订单状态",
+                        inst_id=inst_id,
+                        cl_ord_id=cl_ord_id,
+                        detail=detail,
+                        code=retry_exc.code,
+                    )
                 ) from retry_exc
 
     def _does_pending_algo_stop_loss_match(
@@ -3174,6 +3222,7 @@ class StrategyEngine:
                 symbol=config.inst_id,
                 side=active_order.side,
                 size=filled_size,
+                size_text=_format_notify_size_with_unit(trade_instrument, filled_size),
                 price=filled_price,
                 reason="交易员模式已开仓：止损价仅作触发参考，不向 OKX 挂真实止损。",
             )
@@ -3214,6 +3263,7 @@ class StrategyEngine:
             symbol=config.inst_id,
             side=active_order.side,
             size=filled_size,
+            size_text=_format_notify_size_with_unit(trade_instrument, filled_size),
             price=filled_price,
             reason=fill_reason,
         )
@@ -3375,6 +3425,7 @@ class StrategyEngine:
             symbol=config.inst_id,
             side=active_order.side,
             size=filled_size,
+            size_text=_format_notify_size_with_unit(trade_instrument, filled_size),
             price=filled_price,
             reason="EMA 动态委托出现部分成交，策略停止等待人工处理",
         )
@@ -3447,16 +3498,18 @@ class StrategyEngine:
         signal: Literal["long", "short"],
         trigger_symbol: str,
         entry_reference: Decimal,
+        tick_size: Decimal | None = None,
         reason: str,
     ) -> None:
         if self._notifier is None:
             return
+        entry_reference_text = _format_notify_price_by_tick_size(entry_reference, tick_size)
         self._notifier.send_signal(
             strategy_name=self._strategy_name,
             config=config,
             signal=signal,
             trigger_symbol=trigger_symbol,
-            entry_reference=format_decimal(entry_reference),
+            entry_reference=entry_reference_text,
             reason=reason,
             api_name=self._api_name,
             session_id=self._session_id,
@@ -3473,6 +3526,7 @@ class StrategyEngine:
         symbol: str,
         side: str,
         size: Decimal,
+        size_text: str = "",
         price: Decimal,
         reason: str,
         trade_pnl: str = "",
@@ -3485,7 +3539,7 @@ class StrategyEngine:
             title=title,
             symbol=symbol,
             side=side,
-            size=format_decimal(size),
+            size=size_text or format_decimal(size),
             price=format_decimal(price),
             reason=reason,
             trade_pnl=trade_pnl,
@@ -3972,6 +4026,18 @@ def _format_size_with_contract_equivalent(instrument: Instrument, size: Decimal)
     return format_decimal(size)
 
 
+def _format_notify_size_with_unit(instrument: Instrument, size: Decimal) -> str:
+    contract_multiplier = _instrument_price_delta_multiplier(instrument)
+    contract_ccy = _instrument_contract_base_currency(instrument)
+    if instrument.inst_type in {"SWAP", "FUTURES", "OPTION"} and contract_multiplier > 0 and contract_ccy:
+        amount = abs(size) * contract_multiplier
+        amount_text = format_decimal(amount)
+        if size < 0:
+            amount_text = f"-{amount_text}"
+        return f"{amount_text} {contract_ccy}"
+    return format_decimal(size)
+
+
 def _minimum_order_size_message(
     instrument: Instrument,
     *,
@@ -4137,6 +4203,19 @@ def recommended_indicator_lookback(*periods: int) -> int:
 
 def _dynamic_entry_reference_ema_text(config: StrategyConfig) -> str:
     return f"EMA{config.resolved_entry_reference_ema_period()}"
+
+
+def _decimal_places_for_tick_size(tick_size: Decimal) -> int:
+    normalized = tick_size.normalize()
+    exponent = normalized.as_tuple().exponent
+    return max(-exponent, 0)
+
+
+def _format_notify_price_by_tick_size(entry_reference: Decimal, tick_size: Decimal | None) -> str:
+    if tick_size is None or tick_size <= 0:
+        return format_decimal(entry_reference)
+    snapped = snap_to_increment(entry_reference, tick_size, "nearest")
+    return format_decimal_fixed(snapped, _decimal_places_for_tick_size(tick_size))
 
 
 def fetch_hourly_ema_debug(
