@@ -15,14 +15,17 @@ from tkinter import messagebox, ttk
 
 from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
 from okx_quant.backtest_ui import BacktestCompareOverviewWindow, BacktestLaunchState, BacktestWindow
+from okx_quant.btc_market_analysis_ui import BtcMarketAnalysisWindow
 from okx_quant.deribit_client import DeribitRestClient
 from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.engine import (
     StrategyEngine,
+    build_protection_plan,
     fetch_hourly_ema_debug,
     fixed_entry_side_mode_support_reason,
     format_hourly_debug,
+    recommended_indicator_lookback,
     supports_fixed_entry_side_mode,
 )
 from okx_quant.log_utils import append_log_line, append_preformatted_log_line, strategy_session_log_file_path
@@ -111,6 +114,9 @@ from okx_quant.strategy_live_chart import (
     build_strategy_live_chart_snapshot,
     render_strategy_live_chart,
 )
+from okx_quant.strategies.ema_atr import EmaAtrStrategy
+from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
+from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_DEFINITIONS,
@@ -1661,6 +1667,9 @@ class QuantApp:
         self.instruments: list[Instrument] = []
         self._fixed_order_size_hint_instrument_cache: dict[str, Instrument] = {}
         self._fixed_order_size_hint_fetching_inst_ids: set[str] = set()
+        self._minimum_order_risk_hint_after_id: str | None = None
+        self._minimum_order_risk_hint_request_serial = 0
+        self._minimum_order_risk_hint_active_request_serial = 0
         self.sessions: dict[str, StrategySession] = {}
         self._strategy_history_records: list[StrategyHistoryRecord] = []
         self._strategy_history_by_id: dict[str, StrategyHistoryRecord] = {}
@@ -1677,6 +1686,7 @@ class QuantApp:
         self._settings_window: Toplevel | None = None
         self._backtest_window: BacktestWindow | None = None
         self._backtest_compare_window: BacktestCompareOverviewWindow | None = None
+        self._btc_market_analysis_window: BtcMarketAnalysisWindow | None = None
         self._signal_monitor_window: SignalMonitorWindow | None = None
         self._trader_desk_window: TraderDeskWindow | None = None
         self._smart_order_window: SmartOrderWindow | None = None
@@ -1868,6 +1878,7 @@ class QuantApp:
         self.fixed_order_size_hint_text = StringVar(
             value="固定数量=OKX下单数量(sz)，不是USDT；若填写风险金，则优先按风险金计算。"
         )
+        self.minimum_order_risk_hint_text = StringVar(value="下单门槛：请先选择下单标的。")
         self.launch_parameter_hint_text = StringVar(value="")
         self.trend_parameter_hint_text = StringVar(value="")
         self.dynamic_protection_hint_text = StringVar(value="")
@@ -1889,7 +1900,19 @@ class QuantApp:
         self.entry_side_mode_hint_text = StringVar(value="")
         self.symbol.trace_add("write", self._sync_trade_symbol_to_symbol)
         self.trade_symbol.trace_add("write", self._on_fixed_order_size_symbol_changed)
+        self.trade_symbol.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.symbol.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.strategy_name.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.bar.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.signal_mode_label.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.trend_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.big_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.entry_reference_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.atr_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.stop_atr.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.risk_amount.trace_add("write", self._update_fixed_order_size_hint)
+        self.risk_amount.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.order_size.trace_add("write", self._update_fixed_order_size_hint)
         self.stop_atr.trace_add("write", self._update_launch_parameter_hint)
         self.take_atr.trace_add("write", self._update_launch_parameter_hint)
@@ -1907,7 +1930,9 @@ class QuantApp:
         self.time_stop_break_even_bars.trace_add("write", self._update_dynamic_protection_hint)
         self.time_stop_break_even_enabled.trace_add("write", lambda *_: self._sync_dynamic_take_profit_controls())
         self.run_mode_label.trace_add("write", lambda *_: self._sync_entry_side_mode_controls())
+        self.run_mode_label.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.tp_sl_mode_label.trace_add("write", lambda *_: self._sync_entry_side_mode_controls())
+        self.tp_sl_mode_label.trace_add("write", self._schedule_minimum_order_risk_hint_update)
 
         self.notify_enabled = BooleanVar(value=False)
         self.smtp_host = StringVar()
@@ -2197,6 +2222,7 @@ class QuantApp:
         tools_menu.add_command(label="打开无限下单", command=self.open_smart_order_window)
         tools_menu.add_command(label="打开回测窗口", command=self.open_backtest_window)
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
+        tools_menu.add_command(label="打开BTC行情分析", command=self.open_btc_market_analysis_window)
         tools_menu.add_command(label="打开信号观察台", command=self.open_signal_monitor_window)
         tools_menu.add_command(label="打开交易员管理台", command=self.open_trader_desk_window)
         tools_menu.add_command(label="打开波动率监控", command=self.open_deribit_volatility_monitor_window)
@@ -2451,6 +2477,14 @@ class QuantApp:
         ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         row += 1
+        ttk.Label(
+            start_frame,
+            textvariable=self.minimum_order_risk_hint_text,
+            justify="left",
+            wraplength=760,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        row += 1
         ttk.Label(start_frame, text="下单方向模式").grid(row=row, column=0, sticky="w", pady=(12, 0))
         self._entry_side_mode_combo = ttk.Combobox(
             start_frame,
@@ -2655,26 +2689,29 @@ class QuantApp:
         ttk.Button(control_row, text="\u5b9e\u65f6K\u7ebf\u56fe", command=self.open_selected_strategy_live_chart).grid(
             row=0, column=4, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u4fe1\u53f7\u89c2\u5bdf\u53f0", command=self.open_signal_monitor_window).grid(
+        ttk.Button(control_row, text="BTC行情分析", command=self.open_btc_market_analysis_window).grid(
             row=0, column=5, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u4ea4\u6613\u5458\u7ba1\u7406\u53f0", command=self.open_trader_desk_window).grid(
+        ttk.Button(control_row, text="\u4fe1\u53f7\u89c2\u5bdf\u53f0", command=self.open_signal_monitor_window).grid(
             row=0, column=6, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u6e05\u7a7a\u5df2\u505c\u6b62", command=self.clear_stopped_sessions).grid(
+        ttk.Button(control_row, text="\u4ea4\u6613\u5458\u7ba1\u7406\u53f0", command=self.open_trader_desk_window).grid(
             row=0, column=7, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u5386\u53f2\u7b56\u7565", command=self.open_strategy_history_window).grid(
+        ttk.Button(control_row, text="\u6e05\u7a7a\u5df2\u505c\u6b62", command=self.clear_stopped_sessions).grid(
             row=0, column=8, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u7b56\u7565\u603b\u8d26\u672c", command=self.open_strategy_book_window).grid(
+        ttk.Button(control_row, text="\u5386\u53f2\u7b56\u7565", command=self.open_strategy_history_window).grid(
             row=0, column=9, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u5bfc\u51fa\u9009\u4e2d\u53c2\u6570", command=self.export_selected_session_template).grid(
+        ttk.Button(control_row, text="\u7b56\u7565\u603b\u8d26\u672c", command=self.open_strategy_book_window).grid(
             row=0, column=10, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u5bfc\u5165\u7b56\u7565\u53c2\u6570", command=self.import_strategy_template).grid(
+        ttk.Button(control_row, text="\u5bfc\u51fa\u9009\u4e2d\u53c2\u6570", command=self.export_selected_session_template).grid(
             row=0, column=11, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="\u5bfc\u5165\u7b56\u7565\u53c2\u6570", command=self.import_strategy_template).grid(
+            row=0, column=12, padx=(8, 0)
         )
 
         detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)
@@ -7413,6 +7450,20 @@ class QuantApp:
             return
         self._backtest_compare_window = BacktestCompareOverviewWindow(self.root)
 
+    def open_btc_market_analysis_window(self) -> None:
+        if (
+            self._btc_market_analysis_window is not None
+            and self._btc_market_analysis_window.window.winfo_exists()
+        ):
+            self._btc_market_analysis_window.show()
+            return
+
+        self._btc_market_analysis_window = BtcMarketAnalysisWindow(
+            self.root,
+            self.client,
+            logger=self._enqueue_log,
+        )
+
     def open_signal_monitor_window(self) -> None:
         if self._signal_monitor_window is not None and self._signal_monitor_window.window.winfo_exists():
             self._signal_monitor_window.show()
@@ -8090,6 +8141,179 @@ class QuantApp:
         mode_hint = _build_order_size_mode_hint_text(self.risk_amount.get(), self.order_size.get())
         self.fixed_order_size_hint_text.set(f"{base_hint} {mode_hint}".strip())
 
+    def _schedule_minimum_order_risk_hint_update(self, *_: str) -> None:
+        if not hasattr(self, "root"):
+            return
+        if self._minimum_order_risk_hint_after_id is not None:
+            try:
+                self.root.after_cancel(self._minimum_order_risk_hint_after_id)
+            except Exception:
+                pass
+        self._minimum_order_risk_hint_after_id = self.root.after(250, self._update_minimum_order_risk_hint)
+
+    def _update_minimum_order_risk_hint(self) -> None:
+        self._minimum_order_risk_hint_after_id = None
+        signal_symbol = _normalize_symbol_input(self.symbol.get())
+        trade_symbol = _normalize_symbol_input(self.trade_symbol.get()) or signal_symbol
+        instrument = self._find_instrument_for_fixed_order_size_hint(trade_symbol, fetch_if_missing=True)
+        if not trade_symbol:
+            self.minimum_order_risk_hint_text.set("下单门槛：请先选择下单标的。")
+            return
+        request = self._build_minimum_order_risk_hint_request(signal_symbol, trade_symbol, instrument)
+        if request is None:
+            return
+        if instrument is None:
+            self.minimum_order_risk_hint_text.set(
+                _build_minimum_order_risk_hint_text(
+                    inst_id=trade_symbol,
+                    instrument=None,
+                    risk_amount_raw=self.risk_amount.get(),
+                    note=request["note"],
+                )
+            )
+            return
+        self.minimum_order_risk_hint_text.set(
+            _build_minimum_order_risk_hint_text(
+                inst_id=trade_symbol,
+                instrument=instrument,
+                risk_amount_raw=self.risk_amount.get(),
+                note=request["note"],
+                pending=request["pending"],
+            )
+        )
+        if not request["should_estimate"]:
+            return
+        self._minimum_order_risk_hint_request_serial += 1
+        request_serial = self._minimum_order_risk_hint_request_serial
+        self._minimum_order_risk_hint_active_request_serial = request_serial
+        threading.Thread(
+            target=self._estimate_minimum_order_risk_hint_worker,
+            args=(request_serial, request),
+            daemon=True,
+        ).start()
+
+    def _build_minimum_order_risk_hint_request(
+        self,
+        signal_symbol: str,
+        trade_symbol: str,
+        instrument: Instrument | None,
+    ) -> dict[str, object] | None:
+        run_mode = RUN_MODE_OPTIONS.get(self.run_mode_label.get(), "trade")
+        if run_mode != "trade":
+            return {
+                "note": "当前运行模式不下单，不需要最小下单门槛。",
+                "pending": False,
+                "should_estimate": False,
+            }
+        definition = self._selected_strategy_definition()
+        if instrument is None:
+            return {
+                "note": "正在读取该标的最小下单规格。",
+                "pending": False,
+                "should_estimate": False,
+            }
+        try:
+            config = StrategyConfig(
+                inst_id=signal_symbol or trade_symbol,
+                bar=self.bar.get().strip(),
+                ema_period=self._parse_nonnegative_int(self.ema_period.get(), "EMA小周期"),
+                trend_ema_period=self._parse_nonnegative_int(self.trend_ema_period.get(), "EMA中周期"),
+                big_ema_period=self._parse_nonnegative_int(self.big_ema_period.get(), "EMA大周期"),
+                atr_period=self._parse_nonnegative_int(self.atr_period.get(), "ATR周期"),
+                atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
+                atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
+                order_size=_parse_positive_decimal_hint(self.order_size.get()) or Decimal("1"),
+                trade_mode=TRADE_MODE_OPTIONS.get(self.trade_mode_label.get(), "cross"),
+                signal_mode=SIGNAL_LABEL_TO_VALUE.get(self.signal_mode_label.get(), definition.default_signal_mode),
+                position_mode=POSITION_MODE_OPTIONS.get(self.position_mode_label.get(), "net"),
+                environment=ENV_OPTIONS.get(self.environment_label.get(), "demo"),
+                tp_sl_trigger_type=TRIGGER_TYPE_OPTIONS.get(self.trigger_type_label.get(), "mark"),
+                strategy_id=definition.strategy_id,
+                risk_amount=_parse_positive_decimal_hint(self.risk_amount.get()),
+                trade_inst_id=trade_symbol,
+                tp_sl_mode=TP_SL_MODE_OPTIONS.get(self.tp_sl_mode_label.get(), "exchange"),
+                local_tp_sl_inst_id=_normalize_symbol_input(self.local_tp_sl_symbol.get()) or None,
+                run_mode=run_mode,
+                take_profit_mode=TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "dynamic"),
+                max_entries_per_trend=max(self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数"), 0),
+                entry_reference_ema_period=max(self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA"), 0),
+            )
+        except Exception as exc:
+            self.minimum_order_risk_hint_text.set(
+                _build_minimum_order_risk_hint_text(
+                    inst_id=trade_symbol,
+                    instrument=instrument,
+                    risk_amount_raw=self.risk_amount.get(),
+                    note=f"参数未填完整：{exc}",
+                )
+            )
+            return None
+        return {
+            "signal_symbol": signal_symbol or trade_symbol,
+            "trade_symbol": trade_symbol,
+            "instrument": instrument,
+            "config": config,
+            "risk_amount_raw": self.risk_amount.get(),
+            "note": "",
+            "pending": True,
+            "should_estimate": True,
+        }
+    def _estimate_minimum_order_risk_hint_worker(self, request_serial: int, request: dict[str, object]) -> None:
+        instrument = request["instrument"]
+        config = request["config"]
+        signal_symbol = str(request["signal_symbol"])
+        risk_amount_raw = str(request["risk_amount_raw"])
+        note = ""
+        minimum_risk_amount: Decimal | None = None
+        try:
+            minimum_risk_amount, note = _estimate_launcher_minimum_risk_amount(
+                client=self.client,
+                signal_inst_id=signal_symbol,
+                trade_instrument=instrument,
+                config=config,
+            )
+        except Exception as exc:
+            detail = str(exc).strip()
+            note = _format_network_error_message(detail) if detail else "读取下单门槛失败。"
+        try:
+            self.root.after(
+                0,
+                lambda: self._apply_minimum_order_risk_hint_result(
+                    request_serial=request_serial,
+                    trade_symbol=str(request["trade_symbol"]),
+                    instrument=instrument,
+                    risk_amount_raw=risk_amount_raw,
+                    minimum_risk_amount=minimum_risk_amount,
+                    note=note,
+                ),
+            )
+        except Exception:
+            pass
+    def _apply_minimum_order_risk_hint_result(
+        self,
+        *,
+        request_serial: int,
+        trade_symbol: str,
+        instrument: Instrument,
+        risk_amount_raw: str,
+        minimum_risk_amount: Decimal | None,
+        note: str,
+    ) -> None:
+        if request_serial != self._minimum_order_risk_hint_active_request_serial:
+            return
+        current_trade_symbol = _normalize_symbol_input(self.trade_symbol.get()) or _normalize_symbol_input(self.symbol.get())
+        if current_trade_symbol != trade_symbol:
+            return
+        self.minimum_order_risk_hint_text.set(
+            _build_minimum_order_risk_hint_text(
+                inst_id=trade_symbol,
+                instrument=instrument,
+                risk_amount_raw=risk_amount_raw,
+                minimum_risk_amount=minimum_risk_amount,
+                note=note,
+            )
+        )
+
     def _find_instrument_for_fixed_order_size_hint(
         self,
         inst_id: str,
@@ -8151,6 +8375,7 @@ class QuantApp:
         current_symbol = _normalize_symbol_input(self.trade_symbol.get()) or _normalize_symbol_input(self.symbol.get())
         if normalized and current_symbol == normalized:
             self._update_fixed_order_size_hint()
+            self._schedule_minimum_order_risk_hint_update()
 
     @staticmethod
     def _format_strategy_symbol_display(signal_symbol: str, trade_symbol: str | None) -> str:
@@ -8487,7 +8712,7 @@ class QuantApp:
         trade_inst_id = _session_trade_inst_id(session) or session.symbol
         return (
             f"{session.session_id} | {session.strategy_name} | {trade_inst_id} | "
-            f"?? {session.config.bar} | API {session.api_name} | ?? {session.run_mode_label}"
+            f"周期 {session.config.bar} | API {session.api_name} | 模式 {session.run_mode_label}"
         )
 
     def _latest_strategy_trade_ledger_record(self, session: StrategySession) -> StrategyTradeLedgerRecord | None:
@@ -8517,7 +8742,7 @@ class QuantApp:
                 markers.append(
                     StrategyLiveChartTimeMarker(
                         key=f"close:{latest_ledger.record_id}",
-                        label=f"?? {latest_ledger.closed_at.strftime('%m-%d %H:%M')}",
+                        label=f"平仓 {latest_ledger.closed_at.strftime('%m-%d %H:%M')}",
                         at=latest_ledger.closed_at,
                         color="#cf222e",
                         dash=(6, 3),
@@ -8606,7 +8831,7 @@ class QuantApp:
                 markers.append(
                     StrategyLiveChartTimeMarker(
                         key=f"add:{dedupe_key}",
-                        label=f"?? {event_at.strftime('%m-%d %H:%M')}",
+                        label=f"加仓 {event_at.strftime('%m-%d %H:%M')}",
                         at=event_at,
                         color="#1d4ed8",
                         dash=(2, 2),
@@ -8619,7 +8844,7 @@ class QuantApp:
                 markers.append(
                     StrategyLiveChartTimeMarker(
                         key=f"close-order:{dedupe_key}",
-                        label=f"?? {event_at.strftime('%m-%d %H:%M')}",
+                        label=f"平仓 {event_at.strftime('%m-%d %H:%M')}",
                         at=event_at,
                         color="#cf222e",
                         dash=(6, 3),
@@ -8631,7 +8856,7 @@ class QuantApp:
             markers.append(
                 StrategyLiveChartTimeMarker(
                     key=f"reduce:{dedupe_key}",
-                    label=f"?? {event_at.strftime('%m-%d %H:%M')}",
+                    label=f"减仓 {event_at.strftime('%m-%d %H:%M')}",
                     at=event_at,
                     color="#d97706",
                     dash=(3, 3),
@@ -9371,6 +9596,82 @@ class QuantApp:
             return False
         return trader_gate_allows_price(draft.gate, current_price)
 
+    @staticmethod
+    def _trader_wave_lock_signal_from_session(session: StrategySession) -> str:
+        signal_mode = str(getattr(getattr(session, "config", None), "signal_mode", "") or "").strip().lower()
+        if signal_mode == "long_only":
+            return "long"
+        if signal_mode == "short_only":
+            return "short"
+        direction_label = str(getattr(session, "direction_label", "") or "").strip()
+        if "只做多" in direction_label:
+            return "long"
+        if "只做空" in direction_label:
+            return "short"
+        return ""
+
+    def _is_trader_wave_lock_active(self, draft: TraderDraftRecord, run: TraderRunState) -> bool:
+        locked_signal = str(run.wave_lock_signal or "").strip().lower()
+        if locked_signal not in {"long", "short"}:
+            return False
+        record = _strategy_template_record_from_payload(draft.template_payload)
+        if record is None:
+            return False
+        config = replace(record.config, run_mode="trade")
+        strategy_id = str(config.strategy_id or "").strip()
+        if not strategy_id:
+            return False
+        if is_dynamic_strategy_id(strategy_id):
+            strategy = EmaDynamicOrderStrategy()
+            lookback = recommended_indicator_lookback(
+                config.ema_period,
+                config.trend_ema_period,
+                config.atr_period,
+                config.resolved_entry_reference_ema_period(),
+                DEFAULT_DEBUG_ATR_PERIOD,
+            )
+        elif strategy_id == STRATEGY_CROSS_ID:
+            strategy = EmaAtrStrategy()
+            lookback = recommended_indicator_lookback(
+                config.ema_period,
+                config.trend_ema_period,
+                config.big_ema_period,
+                config.atr_period,
+                DEFAULT_DEBUG_ATR_PERIOD,
+            )
+        elif strategy_id == STRATEGY_EMA5_EMA8_ID:
+            strategy = EmaCrossEmaStopStrategy()
+            lookback = recommended_indicator_lookback(
+                config.ema_period,
+                config.trend_ema_period,
+                config.big_ema_period,
+                config.atr_period,
+                DEFAULT_DEBUG_ATR_PERIOD,
+            )
+        else:
+            return False
+
+        try:
+            candles = self.client.get_candles(config.inst_id, config.bar, limit=lookback)
+        except Exception as exc:
+            self._enqueue_log(f"[交易员管理台] [{draft.trader_id}] 波段锁检查失败：{_format_network_error_message(str(exc))}")
+            return True
+        confirmed = [candle for candle in candles if candle.confirmed]
+        if len(confirmed) < 2:
+            return True
+        decision = strategy.evaluate(confirmed, config)
+        current_signal = str(decision.signal or "").strip().lower()
+        if current_signal == locked_signal:
+            return True
+        run.wave_lock_signal = ""
+        run.updated_at = datetime.now()
+        self._trader_desk_add_event(
+            draft.trader_id,
+            f"波段锁已解除 | 原锁方向={locked_signal.upper()} | 当前信号={current_signal.upper() or 'NONE'}",
+        )
+        self._save_trader_desk_snapshot()
+        return False
+
     def _trader_desk_start_slot(self, trader_id: str) -> bool:
         draft = self._trader_desk_draft_by_id(trader_id)
         run = self._trader_desk_run_by_id(trader_id, create=True)
@@ -9504,6 +9805,12 @@ class QuantApp:
         self._cleanup_stale_trader_watchers(trader_id)
         if trader_has_watching_slot(self._trader_desk_slots, trader_id):
             return
+        if self._is_trader_wave_lock_active(draft, run):
+            lock_signal = str(run.wave_lock_signal or "").strip().lower()
+            self._enqueue_log(
+                f"[交易员管理台] [{trader_id}] 波段锁生效，跳过补位 | 锁方向={lock_signal.upper() or '-'} | 等待当前波失效后再开新单"
+            )
+            return
         remaining = trader_remaining_quota_steps(draft, self._trader_desk_slots)
         if remaining <= 0:
             if run.status != "quota_exhausted":
@@ -9558,6 +9865,7 @@ class QuantApp:
         run.paused_reason = ""
         run.updated_at = now
         run.last_started_at = now
+        run.wave_lock_signal = ""
         self._trader_desk_add_event(trader_id, "已启动交易员。")
         self._save_trader_desk_snapshot()
         self._ensure_trader_watcher(trader_id)
@@ -11577,6 +11885,7 @@ class QuantApp:
         self._update_launch_parameter_hint()
         self._update_dynamic_protection_hint()
         self._on_fixed_order_size_symbol_changed()
+        self._schedule_minimum_order_risk_hint_update()
 
     def _sync_dynamic_take_profit_controls(self) -> None:
         if not hasattr(self, "_dynamic_two_r_break_even_check"):
@@ -11706,7 +12015,12 @@ class QuantApp:
             risk_amount = Decimal("10")
             order_size = Decimal("0")
 
-        credentials = Credentials(api_key=api_key, secret_key=secret_key, passphrase=passphrase)
+        credentials = Credentials(
+            api_key=api_key,
+            secret_key=secret_key,
+            passphrase=passphrase,
+            profile_name=self._current_credential_profile(),
+        )
         config = StrategyConfig(
             inst_id=symbol,
             bar=str(self._resolve_strategy_parameter_value(strategy_id, "bar", self.bar.get())),
@@ -11891,7 +12205,7 @@ class QuantApp:
             ]
         )
         notifier.send_signal(
-            strategy_name="????",
+            strategy_name="测试邮件",
             config=StrategyConfig(
                 inst_id=self.symbol.get().strip().upper() or "-",
                 bar=self.bar.get().strip() or "-",
@@ -11909,7 +12223,7 @@ class QuantApp:
             signal="long",
             trigger_symbol=self.symbol.get().strip().upper() or "-",
             entry_reference="-",
-            reason="????",
+            reason="仅用于验证邮件通道",
             api_name=self._current_credential_profile(),
             session_id="TEST",
             trader_id="",
@@ -12014,6 +12328,7 @@ class QuantApp:
             direction_label=direction_label,
             run_mode_label=run_mode_label,
             trader_id=trader_id,
+            api_name=api_name,
         )
 
     def _next_session_id(self) -> str:
@@ -12159,6 +12474,9 @@ class QuantApp:
         run = self._trader_desk_run_by_id(trader_id, create=True)
         if run is not None and run.armed_session_id == session.session_id:
             run.armed_session_id = ""
+            lock_signal = QuantApp._trader_wave_lock_signal_from_session(session)
+            if lock_signal:
+                run.wave_lock_signal = lock_signal
             run.last_event_at = datetime.now()
             run.updated_at = datetime.now()
         self._trader_desk_add_event(
@@ -14899,6 +15217,11 @@ class QuantApp:
             self._backtest_window.window.destroy()
         if self._backtest_compare_window is not None and self._backtest_compare_window.window.winfo_exists():
             self._backtest_compare_window.window.destroy()
+        if (
+            self._btc_market_analysis_window is not None
+            and self._btc_market_analysis_window.window.winfo_exists()
+        ):
+            self._btc_market_analysis_window.destroy()
         if self._signal_monitor_window is not None and self._signal_monitor_window.window.winfo_exists():
             self._signal_monitor_window.destroy()
         if self._trader_desk_window is not None and self._trader_desk_window.window.winfo_exists():
@@ -14995,6 +15318,156 @@ def _format_optional_usdt_precise(
     return text
 
 
+def _instrument_contract_value_snapshot(instrument: Instrument) -> tuple[Decimal | None, str | None]:
+    contract_value = (instrument.ct_val or Decimal("0")) * (instrument.ct_mult or Decimal("1"))
+    contract_ccy = (instrument.ct_val_ccy or "").strip().upper()
+    if not contract_ccy:
+        normalized_inst_id = instrument.inst_id.strip().upper()
+        if "-" in normalized_inst_id:
+            contract_ccy = normalized_inst_id.split("-", 1)[0]
+    if contract_value > 0:
+        return contract_value, contract_ccy or None
+    return None, contract_ccy or None
+
+
+def _format_contract_size_with_equivalent(instrument: Instrument, size: Decimal) -> str:
+    contract_value, contract_ccy = _instrument_contract_value_snapshot(instrument)
+    if instrument.inst_type in {"SWAP", "FUTURES", "OPTION"} and contract_value is not None and contract_ccy:
+        amount = abs(size) * contract_value
+        amount_text = format_decimal(amount)
+        if size < 0:
+            amount_text = f"-{amount_text}"
+        return f"{format_decimal(size)}张（折合{amount_text} {contract_ccy}）"
+    return format_decimal(size)
+
+
+def _parse_positive_decimal_hint(raw: str) -> Decimal | None:
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    try:
+        value = Decimal(cleaned)
+    except InvalidOperation:
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def _build_minimum_order_risk_hint_text(
+    *,
+    inst_id: str,
+    instrument: Instrument | None,
+    risk_amount_raw: str,
+    minimum_risk_amount: Decimal | None = None,
+    note: str = "",
+    pending: bool = False,
+) -> str:
+    normalized_inst_id = inst_id.strip().upper()
+    if not normalized_inst_id:
+        return "下单门槛：请先选择下单标的。"
+    if instrument is None:
+        return f"下单门槛：正在读取 {normalized_inst_id} 的最小下单规格。"
+    min_order_text = _format_contract_size_with_equivalent(instrument, instrument.min_size)
+    parts = [f"下单门槛：最小下单量 {min_order_text}。"]
+    if minimum_risk_amount is not None and minimum_risk_amount > 0:
+        current_risk_amount = _parse_positive_decimal_hint(risk_amount_raw)
+        threshold_text = format_decimal(minimum_risk_amount)
+        if current_risk_amount is None:
+            parts.append(f"按当前止损估算，至少需要风险金 {threshold_text}。")
+        elif current_risk_amount >= minimum_risk_amount:
+            parts.append(
+                f"按当前止损估算，至少需要风险金 {threshold_text}；你当前填写 {format_decimal(current_risk_amount)}，可以下最小一笔。"
+            )
+        else:
+            parts.append(
+                f"按当前止损估算，至少需要风险金 {threshold_text}；你当前填写 {format_decimal(current_risk_amount)}，还不够下最小一笔。"
+            )
+    elif pending:
+        parts.append("正在结合当前止损估算最低风险金...")
+    if note:
+        parts.append(note)
+    return " ".join(parts)
+
+
+def _estimate_launcher_minimum_risk_amount(
+    *,
+    client: OkxRestClient,
+    signal_inst_id: str,
+    trade_instrument: Instrument,
+    config: StrategyConfig,
+) -> tuple[Decimal | None, str]:
+    if config.run_mode != "trade":
+        return None, "当前运行模式不下单，不需要估算最低风险金。"
+    if trade_instrument.inst_type == "SPOT":
+        return None, f"现货按币数量下单，最小步长={format_decimal(trade_instrument.lot_size)}。"
+    contract_value, _ = _instrument_contract_value_snapshot(trade_instrument)
+    if contract_value is None or trade_instrument.min_size <= 0:
+        return None, "当前标的缺少合约面值或最小下单量信息，暂时无法估算。"
+
+    trigger_inst_id = (config.trade_inst_id or signal_inst_id).strip().upper()
+    if config.tp_sl_mode == "local_signal":
+        trigger_inst_id = signal_inst_id.strip().upper()
+    elif config.tp_sl_mode == "local_custom":
+        trigger_inst_id = (config.local_tp_sl_inst_id or "").strip().upper()
+    if trigger_inst_id and trigger_inst_id != trade_instrument.inst_id.strip().upper():
+        return None, "当前止盈止损参考的是其他标的，最低风险金暂不做联动估算。"
+
+    if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+        lookback = recommended_indicator_lookback(config.ema_period, config.trend_ema_period)
+        strategy = EmaCrossEmaStopStrategy()
+    elif is_dynamic_strategy_id(config.strategy_id):
+        lookback = recommended_indicator_lookback(
+            config.ema_period,
+            config.trend_ema_period,
+            config.atr_period,
+            config.resolved_entry_reference_ema_period(),
+        )
+        strategy = EmaDynamicOrderStrategy()
+    else:
+        lookback = recommended_indicator_lookback(
+            config.ema_period + 2,
+            config.trend_ema_period + 2,
+            config.big_ema_period + 2,
+            config.atr_period + 2,
+        )
+        strategy = EmaAtrStrategy()
+
+    candles = client.get_candles(signal_inst_id, config.bar, limit=lookback)
+    confirmed = [candle for candle in candles if candle.confirmed]
+    decision = strategy.evaluate(confirmed, config)
+    if decision.signal is None or decision.entry_reference is None or decision.candle_ts is None:
+        return None, "当前还没有有效信号，等出现可挂单的一波后再给出估算。"
+
+    if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+        _, stop_line = strategy.latest_stop_line(confirmed, config)
+        stop_loss = snap_to_increment(stop_line, trade_instrument.tick_size, "nearest")
+        minimum_risk_amount = abs(decision.entry_reference - stop_loss) * contract_value * trade_instrument.min_size
+        if minimum_risk_amount <= 0:
+            return None, "当前止损距离过小，暂时无法估算最低风险金。"
+        return minimum_risk_amount, "按最新 EMA 止损位估算。"
+
+    if decision.atr_value is None:
+        return None, "ATR 还没准备好，暂时无法估算最低风险金。"
+
+    protection = build_protection_plan(
+        instrument=trade_instrument,
+        config=config,
+        direction=decision.signal,
+        entry_reference=decision.entry_reference,
+        atr_value=decision.atr_value,
+        candle_ts=decision.candle_ts,
+        trigger_inst_id=trade_instrument.inst_id,
+        use_signal_extrema=config.strategy_id == STRATEGY_CROSS_ID,
+        signal_candle_high=decision.signal_candle_high,
+        signal_candle_low=decision.signal_candle_low,
+    )
+    minimum_risk_amount = (
+        abs(protection.entry_reference - protection.stop_loss) * contract_value * trade_instrument.min_size
+    )
+    if minimum_risk_amount <= 0:
+        return None, "当前止损距离过小，暂时无法估算最低风险金。"
+    return minimum_risk_amount, "按当前止损距离估算。"
 def _build_fixed_order_size_hint_text(inst_id: str, instrument: Instrument | None) -> str:
     prefix = "固定数量=OKX下单数量(sz)，不是USDT；若填写风险金，则优先按风险金计算。"
     normalized_inst_id = inst_id.strip().upper()

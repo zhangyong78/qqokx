@@ -30,6 +30,7 @@ from okx_quant.ui import (
     _build_group_row_values,
     _build_history_position_note_record,
     _build_launch_parameter_hint_text,
+    _build_minimum_order_risk_hint_text,
     _build_order_size_mode_hint_text,
     _build_dynamic_protection_hint_text,
     _build_strategy_start_confirmation_message,
@@ -133,6 +134,41 @@ HTTP 502: <!DOCTYPE html>
 
         self.assertIn("SOL-USDT-SWAP", hint)
         self.assertIn("不是USDT", hint)
+
+    def test_build_minimum_order_risk_hint_text_for_swap_under_threshold(self) -> None:
+        instrument = Instrument(
+            inst_id="BNB-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BNB",
+        )
+
+        hint = _build_minimum_order_risk_hint_text(
+            inst_id="BNB-USDT-SWAP",
+            instrument=instrument,
+            risk_amount_raw="0.2",
+            minimum_risk_amount=Decimal("0.5"),
+            note="按当前止损距离估算。",
+        )
+
+        self.assertIn("最小下单量 1张（折合0.01 BNB）", hint)
+        self.assertIn("至少需要风险金 0.5", hint)
+        self.assertIn("当前填写 0.2，还不够下最小一笔", hint)
+        self.assertIn("按当前止损距离估算。", hint)
+
+    def test_build_minimum_order_risk_hint_text_without_instrument_shows_loading(self) -> None:
+        hint = _build_minimum_order_risk_hint_text(
+            inst_id="ETH-USDT-SWAP",
+            instrument=None,
+            risk_amount_raw="",
+        )
+
+        self.assertIn("正在读取 ETH-USDT-SWAP 的最小下单规格", hint)
 
     def test_build_order_size_mode_hint_text_prefers_risk_amount_when_present(self) -> None:
         self.assertEqual(
@@ -830,6 +866,26 @@ HTTP 502: <!DOCTYPE html>
 
         self.assertEqual(avg_price, Decimal("120"))
         self.assertEqual(snapshot_at, refreshed_at)
+
+    def test_create_session_engine_seeds_api_name_for_notification_fallback(self) -> None:
+        app = QuantApp.__new__(QuantApp)
+        app.client = MagicMock()
+        app._make_session_logger = lambda *args, **kwargs: (lambda message: None)
+
+        engine = QuantApp._create_session_engine(
+            app,
+            strategy_id="ema_dynamic_order",
+            strategy_name="EMA 动态委托",
+            session_id="S35",
+            symbol="DOGE-USDT-SWAP",
+            api_name="QQzhangyong",
+            log_file_path=None,
+            notifier=None,
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+        )
+
+        self.assertEqual(engine._api_name, "QQzhangyong")
 
     def test_strategy_live_chart_event_time_markers_include_close_add_and_reduce(self) -> None:
         app = QuantApp.__new__(QuantApp)
@@ -2993,6 +3049,77 @@ class _SessionTreeStub:
 
     def see(self, iid: str) -> None:
         self.seen = iid
+
+
+class TraderWaveLockTest(TestCase):
+    def test_trader_wave_lock_signal_from_session_uses_signal_mode(self) -> None:
+        session = SimpleNamespace(config=SimpleNamespace(signal_mode="long_only"), direction_label="双向")
+
+        resolved = QuantApp._trader_wave_lock_signal_from_session(session)
+
+        self.assertEqual(resolved, "long")
+
+    def test_trader_desk_sync_open_trade_state_sets_wave_lock_signal(self) -> None:
+        run = TraderRunState(trader_id="T002", status="running", armed_session_id="S01")
+        slot = TraderSlotRecord(
+            slot_id="slot-1",
+            trader_id="T002",
+            session_id="S01",
+            api_name="moni",
+            strategy_name="EMA",
+            symbol="BTC-USDT-SWAP",
+            status="watching",
+        )
+        trade = StrategyTradeRuntimeState(
+            round_id="S01-1",
+            opened_logged_at=datetime(2026, 4, 30, 8, 37, 0),
+            entry_price=Decimal("95200"),
+            size=Decimal("0.01"),
+        )
+        session = SimpleNamespace(
+            session_id="S01",
+            trader_id="T002",
+            trader_slot_id="slot-1",
+            direction_label="只做多",
+            config=SimpleNamespace(signal_mode="long_only"),
+            active_trade=trade,
+        )
+        app = SimpleNamespace(
+            _trader_desk_slot_for_session=lambda session_id, trader_slot_id="": slot,
+            _trader_desk_run_by_id=lambda trader_id, create=False: run,
+            _trader_desk_add_event=lambda trader_id, message, level="info": None,
+            _save_trader_desk_snapshot=MagicMock(),
+            _ensure_trader_watcher=MagicMock(),
+        )
+
+        QuantApp._trader_desk_sync_open_trade_state(app, session)
+
+        self.assertEqual(run.armed_session_id, "")
+        self.assertEqual(run.wave_lock_signal, "long")
+        app._ensure_trader_watcher.assert_called_once_with("T002")
+
+    def test_ensure_trader_watcher_skips_start_when_wave_lock_active(self) -> None:
+        draft = TraderDraftRecord(
+            trader_id="T002",
+            template_payload={"strategy_id": "ema_dynamic_long"},
+            total_quota=Decimal("1"),
+            unit_quota=Decimal("0.1"),
+            quota_steps=10,
+        )
+        run = TraderRunState(trader_id="T002", status="running", wave_lock_signal="long")
+        app = SimpleNamespace(
+            _trader_desk_draft_by_id=lambda trader_id: draft,
+            _trader_desk_run_by_id=lambda trader_id: run,
+            _trader_desk_slots=[],
+            _cleanup_stale_trader_watchers=MagicMock(),
+            _is_trader_wave_lock_active=lambda _draft, _run: True,
+            _trader_desk_start_slot=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+
+        QuantApp._ensure_trader_watcher(app, "T002")
+
+        app._trader_desk_start_slot.assert_not_called()
 
 
 class PositionRealizedUsdtColumnTest(TestCase):
