@@ -124,6 +124,10 @@ class DynamicStopMonitorStepResult:
     amend_failures: int
 
 
+class OrderSizeTooSmallError(RuntimeError):
+    pass
+
+
 @dataclass
 class StartupSignalGateState:
     started_at_ms: int
@@ -143,6 +147,7 @@ class StrategyEngine:
         direction_label: str = "",
         run_mode_label: str = "",
         trader_id: str = "",
+        api_name: str = "",
     ) -> None:
         self._client = client
         self._logger = logger
@@ -152,7 +157,7 @@ class StrategyEngine:
         self._direction_label = direction_label.strip()
         self._run_mode_label = run_mode_label.strip()
         self._trader_id = trader_id.strip()
-        self._api_name = ""
+        self._api_name = api_name.strip()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -168,7 +173,9 @@ class StrategyEngine:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("策略已经在运行中")
             self._stop_event.clear()
-            self._api_name = credentials.profile_name.strip()
+            resolved_profile_name = credentials.profile_name.strip()
+            if resolved_profile_name:
+                self._api_name = resolved_profile_name
             self._thread = threading.Thread(
                 target=self._run,
                 args=(credentials, config),
@@ -472,17 +479,23 @@ class StrategyEngine:
                 self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                 continue
 
-            plan = build_order_plan(
-                instrument=instrument,
-                config=config,
-                order_size=config.order_size if config.order_size > 0 else None,
-                signal=decision.signal,
-                entry_reference=decision.entry_reference,
-                atr_value=decision.atr_value,
-                candle_ts=decision.candle_ts,
-                signal_candle_high=decision.signal_candle_high,
-                signal_candle_low=decision.signal_candle_low,
-            )
+            try:
+                plan = build_order_plan(
+                    instrument=instrument,
+                    config=config,
+                    order_size=config.order_size if config.order_size > 0 else None,
+                    signal=decision.signal,
+                    entry_reference=decision.entry_reference,
+                    atr_value=decision.atr_value,
+                    candle_ts=decision.candle_ts,
+                    signal_candle_high=decision.signal_candle_high,
+                    signal_candle_low=decision.signal_candle_low,
+                )
+            except OrderSizeTooSmallError as exc:
+                idle_signal_candle_ts = newest_ts
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前无法生成挂单 | {exc}")
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 准备挂单 | 方向={plan.signal.upper()} | "
                 f"第{current_wave_index}波 | 本波第{entries_in_current_wave + 1}次委托 | "
@@ -595,17 +608,22 @@ class StrategyEngine:
             if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
                 raise RuntimeError("策略返回的数据不完整，无法生成下单计划")
 
-            plan = build_order_plan(
-                instrument=instrument,
-                config=config,
-                order_size=config.order_size,
-                signal=decision.signal,
-                entry_reference=decision.entry_reference,
-                atr_value=decision.atr_value,
-                candle_ts=decision.candle_ts,
-                signal_candle_high=decision.signal_candle_high,
-                signal_candle_low=decision.signal_candle_low,
-            )
+            try:
+                plan = build_order_plan(
+                    instrument=instrument,
+                    config=config,
+                    order_size=config.order_size,
+                    signal=decision.signal,
+                    entry_reference=decision.entry_reference,
+                    atr_value=decision.atr_value,
+                    candle_ts=decision.candle_ts,
+                    signal_candle_high=decision.signal_candle_high,
+                    signal_candle_low=decision.signal_candle_low,
+                )
+            except OrderSizeTooSmallError as exc:
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前无法生成挂单 | {exc}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 准备市价单 | 方向={plan.signal.upper()} | "
                 f"参考入场价={format_decimal(plan.entry_reference)} | 数量={_format_size_with_contract_equivalent(instrument, plan.size)} | "
@@ -710,18 +728,23 @@ class StrategyEngine:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
-            position = self._open_local_position(
-                credentials,
-                config,
-                signal_instrument=signal_instrument,
-                trade_instrument=trade_instrument,
-                signal=decision.signal,
-                signal_entry_reference=decision.entry_reference,
-                signal_atr_value=decision.atr_value,
-                signal_candle_ts=decision.candle_ts,
-                signal_candle_high=decision.signal_candle_high,
-                signal_candle_low=decision.signal_candle_low,
-            )
+            try:
+                position = self._open_local_position(
+                    credentials,
+                    config,
+                    signal_instrument=signal_instrument,
+                    trade_instrument=trade_instrument,
+                    signal=decision.signal,
+                    signal_entry_reference=decision.entry_reference,
+                    signal_atr_value=decision.atr_value,
+                    signal_candle_ts=decision.candle_ts,
+                    signal_candle_high=decision.signal_candle_high,
+                    signal_candle_low=decision.signal_candle_low,
+                )
+            except OrderSizeTooSmallError as exc:
+                self._logger(f"{_fmt_ts(decision.candle_ts or newest_ts)} | 当前无法下单 | {exc}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
             protection = self._build_local_protection_plan(
                 config,
                 signal_instrument=signal_instrument,
@@ -828,18 +851,25 @@ class StrategyEngine:
                 f"{_fmt_ts(active_trigger.candle_ts)} | 信号标的已触发动态开仓条件 | "
                 f"当前价={format_decimal(current_signal_price)} | 目标价={format_decimal(active_trigger.entry_reference)}"
             )
-            position = self._open_local_position(
-                credentials,
-                config,
-                signal_instrument=signal_instrument,
-                trade_instrument=trade_instrument,
-                signal=active_trigger.signal,
-                signal_entry_reference=active_trigger.entry_reference,
-                signal_atr_value=active_trigger.atr_value,
-                signal_candle_ts=active_trigger.candle_ts,
-                signal_candle_high=active_trigger.signal_candle_high,
-                signal_candle_low=active_trigger.signal_candle_low,
-            )
+            try:
+                position = self._open_local_position(
+                    credentials,
+                    config,
+                    signal_instrument=signal_instrument,
+                    trade_instrument=trade_instrument,
+                    signal=active_trigger.signal,
+                    signal_entry_reference=active_trigger.entry_reference,
+                    signal_atr_value=active_trigger.atr_value,
+                    signal_candle_ts=active_trigger.candle_ts,
+                    signal_candle_high=active_trigger.signal_candle_high,
+                    signal_candle_low=active_trigger.signal_candle_low,
+                )
+            except OrderSizeTooSmallError as exc:
+                self._logger(f"{_fmt_ts(active_trigger.candle_ts)} | 当前无法下单 | {exc}")
+                active_trigger = None
+                idle_signal_candle_ts = newest_ts
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
             protection = self._build_local_protection_plan(
                 config,
                 signal_instrument=signal_instrument,
@@ -1089,18 +1119,25 @@ class StrategyEngine:
                 f"{_fmt_ts(active_trigger.candle_ts)} | 信号标的已触发动态开仓条件 | 当前价={format_decimal(current_signal_price)} | "
                 f"目标价={format_decimal(active_trigger.entry_reference)}"
             )
-            position = self._open_local_position(
-                credentials,
-                config,
-                signal_instrument=signal_instrument,
-                trade_instrument=trade_instrument,
-                signal=active_trigger.signal,
-                signal_entry_reference=active_trigger.entry_reference,
-                signal_atr_value=active_trigger.atr_value,
-                signal_candle_ts=active_trigger.candle_ts,
-                signal_candle_high=active_trigger.signal_candle_high,
-                signal_candle_low=active_trigger.signal_candle_low,
-            )
+            try:
+                position = self._open_local_position(
+                    credentials,
+                    config,
+                    signal_instrument=signal_instrument,
+                    trade_instrument=trade_instrument,
+                    signal=active_trigger.signal,
+                    signal_entry_reference=active_trigger.entry_reference,
+                    signal_atr_value=active_trigger.atr_value,
+                    signal_candle_ts=active_trigger.candle_ts,
+                    signal_candle_high=active_trigger.signal_candle_high,
+                    signal_candle_low=active_trigger.signal_candle_low,
+                )
+            except OrderSizeTooSmallError as exc:
+                self._logger(f"{_fmt_ts(active_trigger.candle_ts)} | ?????? | {exc}")
+                active_trigger = None
+                idle_signal_candle_ts = newest_ts
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
             protection = self._build_local_protection_plan(
                 config,
                 signal_instrument=signal_instrument,
@@ -1457,14 +1494,19 @@ class StrategyEngine:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
-            active_position = self._open_ema_stop_position(
-                credentials,
-                config,
-                trade_instrument=trade_instrument,
-                signal=decision.signal,
-                stop_loss=current_stop_line,
-                signal_candle_ts=decision.candle_ts or newest_ts,
-            )
+            try:
+                active_position = self._open_ema_stop_position(
+                    credentials,
+                    config,
+                    trade_instrument=trade_instrument,
+                    signal=decision.signal,
+                    stop_loss=current_stop_line,
+                    signal_candle_ts=decision.candle_ts or newest_ts,
+                )
+            except OrderSizeTooSmallError as exc:
+                self._logger(f"{_fmt_ts(decision.candle_ts or newest_ts)} | 当前无法下单 | {exc}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
             active_signal = decision.signal
             self._logger(
                 f"{_fmt_ts(decision.candle_ts or newest_ts)} | 动态 EMA 止损策略已开仓 | "
@@ -3926,8 +3968,32 @@ def _format_size_with_contract_equivalent(instrument: Instrument, size: Decimal)
         amount_text = format_decimal(amount)
         if size < 0:
             amount_text = f"-{amount_text}"
-        return f"{format_decimal(size)}\u5f20\uff08\u6298\u5408{amount_text} {contract_ccy}\uff09"
+        return f"{format_decimal(size)}张（折合{amount_text} {contract_ccy}）"
     return format_decimal(size)
+
+
+def _minimum_order_size_message(
+    instrument: Instrument,
+    *,
+    size: Decimal,
+    raw_size: Decimal | None = None,
+    risk_per_unit: Decimal | None = None,
+) -> str:
+    lot_text = _format_size_with_contract_equivalent(instrument, instrument.lot_size)
+    min_text = _format_size_with_contract_equivalent(instrument, instrument.min_size)
+    snapped_text = _format_size_with_contract_equivalent(instrument, size)
+    parts: list[str] = []
+    if raw_size is not None:
+        parts.append(
+            f"按风险金计算原始数量={format_decimal(raw_size)}张，按步长 {lot_text} 向下取整后={snapped_text}"
+        )
+        if risk_per_unit is not None and risk_per_unit > 0:
+            minimum_risk_amount = risk_per_unit * instrument.min_size
+            parts.append(f"当前至少需要风险金 {format_decimal(minimum_risk_amount)} 才能下最小一笔")
+    else:
+        parts.append(f"下单数量 {snapped_text}")
+    parts.append(f"小于最小下单量 {min_text}")
+    return " | ".join(parts)
 
 
 def determine_order_size(
@@ -3938,6 +4004,8 @@ def determine_order_size(
     stop_loss: Decimal,
     risk_price_compatible: bool,
 ) -> Decimal:
+    size_raw: Decimal | None = None
+    risk_per_unit: Decimal | None = None
     if config.risk_amount is not None and config.risk_amount > 0 and risk_price_compatible:
         risk_per_unit = abs(entry_price - stop_loss) * _instrument_price_delta_multiplier(instrument)
         if risk_per_unit <= 0:
@@ -3952,8 +4020,13 @@ def determine_order_size(
         size = snap_to_increment(config.order_size, instrument.lot_size, "down")
 
     if size < instrument.min_size:
-        raise RuntimeError(
-            f"下单数量 {format_decimal(size)} 小于最小下单量 {format_decimal(instrument.min_size)}"
+        raise OrderSizeTooSmallError(
+            _minimum_order_size_message(
+                instrument,
+                size=size,
+                raw_size=size_raw,
+                risk_per_unit=risk_per_unit,
+            )
         )
     return size
 

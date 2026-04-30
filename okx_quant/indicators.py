@@ -19,6 +19,71 @@ def ema(values: list[Decimal], period: int) -> list[Decimal]:
     return result
 
 
+def sma(values: list[Decimal], period: int) -> list[Decimal | None]:
+    if period <= 0:
+        raise ValueError("period must be positive")
+    if not values:
+        return []
+
+    result: list[Decimal | None] = [None] * len(values)
+    running_sum = Decimal("0")
+    for index, value in enumerate(values):
+        running_sum += value
+        if index >= period:
+            running_sum -= values[index - period]
+        if index >= period - 1:
+            result[index] = running_sum / Decimal(period)
+    return result
+
+
+def macd(
+    values: list[Decimal],
+    *,
+    fast_period: int = 12,
+    slow_period: int = 26,
+    signal_period: int = 9,
+) -> tuple[list[Decimal], list[Decimal], list[Decimal]]:
+    if fast_period <= 0 or slow_period <= 0 or signal_period <= 0:
+        raise ValueError("period must be positive")
+    if not values:
+        return [], [], []
+    if fast_period >= slow_period:
+        raise ValueError("fast_period must be less than slow_period")
+
+    fast_values = ema(values, fast_period)
+    slow_values = ema(values, slow_period)
+    macd_line = [fast - slow for fast, slow in zip(fast_values, slow_values)]
+    signal_line = ema(macd_line, signal_period)
+    histogram = [line - signal for line, signal in zip(macd_line, signal_line)]
+    return macd_line, signal_line, histogram
+
+
+def bollinger_bands(
+    values: list[Decimal],
+    *,
+    period: int = 20,
+    std_dev_multiplier: Decimal = Decimal("2"),
+) -> tuple[list[Decimal | None], list[Decimal | None], list[Decimal | None]]:
+    if period <= 0:
+        raise ValueError("period must be positive")
+    if not values:
+        return [], [], []
+
+    middle = sma(values, period)
+    upper: list[Decimal | None] = [None] * len(values)
+    lower: list[Decimal | None] = [None] * len(values)
+    for index in range(period - 1, len(values)):
+        window = values[index - period + 1 : index + 1]
+        mean = middle[index]
+        if mean is None:
+            continue
+        variance = sum((item - mean) * (item - mean) for item in window) / Decimal(period)
+        std_dev = variance.sqrt()
+        upper[index] = mean + (std_dev * std_dev_multiplier)
+        lower[index] = mean - (std_dev * std_dev_multiplier)
+    return middle, upper, lower
+
+
 def true_ranges(candles: list[Candle]) -> list[Decimal]:
     if not candles:
         return []

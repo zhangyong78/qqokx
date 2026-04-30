@@ -62,6 +62,7 @@ class TraderRunState:
     status: str = "idle"
     paused_reason: str = ""
     armed_session_id: str = ""
+    wave_lock_signal: str = ""
     last_started_at: datetime | None = None
     last_event_at: datetime | None = None
     updated_at: datetime | None = None
@@ -543,6 +544,7 @@ def _run_from_payload(payload: object) -> TraderRunState | None:
         status=status,
         paused_reason=str(payload.get("paused_reason") or "").strip(),
         armed_session_id=str(payload.get("armed_session_id") or "").strip(),
+        wave_lock_signal=str(payload.get("wave_lock_signal") or "").strip().lower(),
         last_started_at=_parse_time(payload.get("last_started_at")),
         last_event_at=_parse_time(payload.get("last_event_at")),
         updated_at=_parse_time(payload.get("updated_at")),
@@ -555,6 +557,7 @@ def _run_to_payload(run: TraderRunState) -> dict[str, object]:
         "status": run.status,
         "paused_reason": run.paused_reason,
         "armed_session_id": run.armed_session_id,
+        "wave_lock_signal": run.wave_lock_signal,
         "last_started_at": run.last_started_at.isoformat(timespec="seconds") if run.last_started_at else None,
         "last_event_at": run.last_event_at.isoformat(timespec="seconds") if run.last_event_at else None,
         "updated_at": run.updated_at.isoformat(timespec="seconds") if run.updated_at else None,

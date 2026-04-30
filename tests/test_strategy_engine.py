@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from okx_quant.engine import (
     OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES,
+    OrderSizeTooSmallError,
     FilledPosition,
     ManagedEntryOrder,
     StartupSignalGateState,
@@ -123,6 +124,50 @@ class StrategyEngineTest(TestCase):
         )
 
         self.assertEqual(size, Decimal("10"))
+
+    def test_determine_order_size_raises_nonfatal_error_when_below_min_contract(self) -> None:
+        instrument = Instrument(
+            inst_id="BNB-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            settle_ccy="USDT",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BNB",
+        )
+        config = StrategyConfig(
+            inst_id="BNB-USDT-SWAP",
+            bar="5m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("0.2"),
+        )
+
+        with self.assertRaises(OrderSizeTooSmallError) as ctx:
+            determine_order_size(
+                instrument=instrument,
+                config=config,
+                entry_price=Decimal("650"),
+                stop_loss=Decimal("700"),
+                risk_price_compatible=True,
+            )
+
+        detail = str(ctx.exception)
+        self.assertIn("小于最小下单量 1张（折合0.01 BNB）", detail)
+        self.assertIn("当前至少需要风险金 0.5 才能下最小一笔", detail)
 
     def test_format_size_with_contract_equivalent_for_linear_swap(self) -> None:
         instrument = Instrument(
@@ -974,7 +1019,7 @@ class StrategyEngineTest(TestCase):
                 ema_value=Decimal("2000"),
             )
 
-        with patch("okx_quant.engine.time.time", return_value=1000.0), patch(
+        with patch("okx_quant.engine.time.time", return_value=0.0), patch(
             "okx_quant.engine.EmaDynamicOrderStrategy.evaluate",
             new=_fake_evaluate,
         ):
@@ -1088,6 +1133,91 @@ class StrategyEngineTest(TestCase):
 
         self.assertEqual(submit_calls["count"], 1)
         self.assertTrue(any("固定数量=0.01" in message for message in messages))
+
+    def test_dynamic_exchange_strategy_skips_below_min_contract_without_stopping(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+        candles = self._make_candles([str(600 + index) for index in range(260)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+                self._wait_calls = 0
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, timeout: float) -> bool:
+                waits.append(timeout)
+                self._wait_calls += 1
+                if self._wait_calls >= 1:
+                    self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA ??????",
+            session_id="S11",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="BNB-USDT-SWAP",
+            bar="5m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_SHORT_ID,
+            poll_seconds=10,
+            risk_amount=Decimal("0.2"),
+            max_entries_per_trend=1,
+        )
+        instrument = Instrument(
+            inst_id="BNB-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            settle_ccy="USDT",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BNB",
+        )
+
+        def _fake_evaluate(_strategy, _candles, _config):  # noqa: ANN001
+            return SignalDecision(
+                signal="short",
+                reason="趋势成立",
+                candle_ts=_candles[-1].ts,
+                entry_reference=Decimal("650"),
+                atr_value=Decimal("25"),
+                ema_value=Decimal("648"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=0.0), patch(
+            "okx_quant.engine.EmaDynamicOrderStrategy.evaluate",
+            new=_fake_evaluate,
+        ):
+            engine._run_dynamic_exchange_strategy(None, config, instrument)  # type: ignore[arg-type]
+
+        self.assertTrue(any("当前无法生成挂单" in message for message in messages))
+        self.assertTrue(any("小于最小下单量 1张（折合0.01 BNB）" in message for message in messages))
+        self.assertFalse(any("策略停止" in message for message in messages))
+        self.assertEqual(len(waits), 1)
 
     def test_dynamic_local_strategy_v2_logs_no_signal_only_once_per_candle(self) -> None:
         messages: list[str] = []

@@ -191,6 +191,29 @@ class StrategyEngineNotificationTest(TestCase):
         self.assertEqual(notifier.send_trade_fill.call_args.kwargs["direction_label"], "只做空")
         self.assertEqual(notifier.send_trade_fill.call_args.kwargs["run_mode_label"], "交易并下单")
 
+    def test_trade_fill_notification_keeps_constructor_api_name_when_runtime_credentials_blank(self) -> None:
+        notifier = MagicMock()
+        engine = StrategyEngine(
+            MagicMock(),
+            lambda message: None,
+            notifier=notifier,
+            strategy_name="EMA 动态委托",
+            session_id="S06",
+            api_name="QQzhangyong",
+        )
+
+        engine._notify_trade_fill(
+            _make_strategy_config(),
+            title="开仓成交",
+            symbol="ETH-USDT-SWAP",
+            side="buy",
+            size=Decimal("1"),
+            price=Decimal("2500"),
+            reason="测试成交",
+        )
+
+        self.assertEqual(notifier.send_trade_fill.call_args.kwargs["api_name"], "QQzhangyong")
+
     def test_signal_notification_passes_runtime_context_to_notifier(self) -> None:
         notifier = MagicMock()
         engine = StrategyEngine(
@@ -263,8 +286,18 @@ class StrategyEngineNotificationTest(TestCase):
         self.assertEqual(notifier.send_trade_fill.call_args.kwargs["trade_pnl"], "-50")
 
     def test_trade_fill_pnl_text_for_close_uses_entry_direction(self) -> None:
-        long_position = SimpleNamespace(side="buy", size=Decimal("2"), entry_price=Decimal("2500"))
-        short_position = SimpleNamespace(side="sell", size=Decimal("2"), entry_price=Decimal("2500"))
+        long_position = SimpleNamespace(
+            side="buy",
+            size=Decimal("2"),
+            entry_price=Decimal("2500"),
+            price_delta_multiplier=Decimal("1"),
+        )
+        short_position = SimpleNamespace(
+            side="sell",
+            size=Decimal("2"),
+            entry_price=Decimal("2500"),
+            price_delta_multiplier=Decimal("1"),
+        )
 
         self.assertEqual(
             StrategyEngine._trade_fill_pnl_text_for_close(

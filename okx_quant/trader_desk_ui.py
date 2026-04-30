@@ -1013,7 +1013,7 @@ class TraderDeskWindow:
             sticky="w",
             pady=(10, 0),
         )
-        ttk.Checkbutton(right_top, text="单次止损后立即暂停补位", variable=self.pause_on_stop_loss_var).grid(
+        ttk.Checkbutton(right_top, text="单笔自动亏损结算后暂停补位", variable=self.pause_on_stop_loss_var).grid(
             row=5,
             column=0,
             columnspan=2,
