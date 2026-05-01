@@ -5,6 +5,8 @@ import os
 import queue
 import re
 import threading
+import time
+import uuid
 from dataclasses import MISSING, asdict, dataclass, field, fields as dataclass_fields, replace
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -20,16 +22,21 @@ from okx_quant.deribit_client import DeribitRestClient
 from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.engine import (
+    DEFAULT_DEBUG_ATR_PERIOD,
+    FilledPosition,
     StrategyEngine,
     build_protection_plan,
+    determine_order_size,
     fetch_hourly_ema_debug,
     fixed_entry_side_mode_support_reason,
     format_hourly_debug,
     recommended_indicator_lookback,
+    resolve_open_pos_side,
     supports_fixed_entry_side_mode,
 )
+from okx_quant.indicators import atr
 from okx_quant.log_utils import append_log_line, append_preformatted_log_line, strategy_session_log_file_path
-from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
+from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, OrderPlan, ProtectionPlan, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.option_roll import is_short_option_position
 from okx_quant.option_roll_ui import OptionRollSuggestionWindow
@@ -111,10 +118,22 @@ from okx_quant.smart_order_ui import SmartOrderWindow
 from okx_quant.strategy_live_chart import (
     DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT,
     DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS,
+    LINE_TRADING_DESK_CANDLE_TARGET,
+    StrategyLiveChartLayout,
     StrategyLiveChartSnapshot,
     StrategyLiveChartTimeMarker,
     build_strategy_live_chart_snapshot,
+    compute_strategy_live_chart_layout,
+    layout_bar_index_to_x_center,
+    layout_pixel_to_bar_index,
+    layout_price_to_y,
+    layout_y_to_price,
+    line_price_through_anchors,
+    line_trading_desk_max_view_start,
+    line_trading_desk_visible_bar_count,
     render_strategy_live_chart,
+    slice_strategy_live_chart_snapshot_with_desk_right_pad,
+    strategy_live_chart_price_bounds,
 )
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
@@ -683,6 +702,87 @@ class StrategyLiveChartWindowState:
     refresh_job: str | None = None
     refresh_inflight: bool = False
     last_snapshot: StrategyLiveChartSnapshot | None = None
+    line_annotations: list["LiveChartLineAnnotation"] = field(default_factory=list)
+    active_tool: str = "none"
+    draft_line_start: tuple[float, float] | None = None
+    draft_line_current: tuple[float, float] | None = None
+    trade_price_basis: StringVar | None = None
+    trade_stop_basis: StringVar | None = None
+    trade_order_mode: StringVar | None = None
+    trade_risk_mode: StringVar | None = None
+    trade_risk_amount: StringVar | None = None
+    trade_fixed_size: StringVar | None = None
+    trade_status_text: StringVar | None = None
+
+
+@dataclass
+class LiveChartLineAnnotation:
+    kind: str
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    color: str
+    label: str = ""
+    bar_a: float | None = None
+    price_a: Decimal | None = None
+    bar_b: float | None = None
+    price_b: Decimal | None = None
+    desk_ray_action: str = "notify"
+    desk_ray_triggered: bool = False
+    desk_ray_last_side: int | None = None
+
+
+@dataclass
+class DeskRiskRewardAnnotation:
+    rr_id: str
+    side: str
+    bar_entry: float
+    price_entry: Decimal
+    bar_stop: float
+    price_stop: Decimal
+    price_tp: Decimal
+    r_multiple: Decimal = field(default_factory=lambda: Decimal("2"))
+    locked: bool = False
+
+
+@dataclass
+class LineTradingDeskWindowState:
+    window: Toplevel
+    canvas: Canvas
+    symbol_var: StringVar
+    bar_var: StringVar
+    status_text: StringVar
+    position_tree: ttk.Treeview
+    api_profile_var: StringVar
+    param_atr_period: StringVar
+    param_atr_mult: StringVar
+    param_risk_amount: StringVar
+    param_cross_mode: StringVar
+    param_ray_action: StringVar
+    param_rr_r: StringVar
+    param_rr_side: StringVar
+    ray_tree: ttk.Treeview
+    rr_manage_tree: ttk.Treeview
+    refresh_job: str | None = None
+    last_snapshot: StrategyLiveChartSnapshot | None = None
+    latest_positions: list[OkxPosition] = field(default_factory=list)
+    line_annotations: list[LiveChartLineAnnotation] = field(default_factory=list)
+    rr_annotations: list[DeskRiskRewardAnnotation] = field(default_factory=list)
+    active_tool: str = "none"
+    draft_line_start: tuple[float, float] | None = None
+    draft_line_current: tuple[float, float] | None = None
+    desk_view_start: int = 0
+    desk_visible_bars: int = 200
+    desk_pan_origin: tuple[float, int] | None = None
+    last_desk_api_profile: str = ""
+    desk_initial_scroll_done: bool = False
+    rr_selected_id: str | None = None
+    rr_drag: tuple[str, str] | None = None
+    rr_pick: tuple[str, str, float, float] | None = None
+    desk_chart_paint_job: str | None = None
+    desk_last_chart_paint_t: float = 0.0
+    desk_range_zoom_active: bool = False
 
 
 @dataclass
@@ -1833,6 +1933,7 @@ class QuantApp:
         self._btc_market_analysis_window: BtcMarketAnalysisWindow | None = None
         self._signal_monitor_window: SignalMonitorWindow | None = None
         self._trader_desk_window: TraderDeskWindow | None = None
+        self._line_trading_desk_window: LineTradingDeskWindowState | None = None
         self._smart_order_window: SmartOrderWindow | None = None
         self._deribit_volatility_monitor_window: DeribitVolatilityMonitorWindow | None = None
         self._deribit_volatility_window: DeribitVolatilityWindow | None = None
@@ -2369,6 +2470,7 @@ class QuantApp:
         tools_menu.add_command(label="打开回测窗口", command=self.open_backtest_window)
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
         tools_menu.add_command(label="打开BTC行情分析", command=self.open_btc_market_analysis_window)
+        tools_menu.add_command(label="打开划线交易台", command=self.open_line_trading_desk_window)
         tools_menu.add_command(label="打开信号观察台", command=self.open_signal_monitor_window)
         tools_menu.add_command(label="打开交易员管理台", command=self.open_trader_desk_window)
         tools_menu.add_command(label="打开波动率监控", command=self.open_deribit_volatility_monitor_window)
@@ -6585,7 +6687,11 @@ class QuantApp:
     ) -> None:
         self._position_history_refreshing = False
         self._position_history_usdt_prices = dict(usdt_prices)
-        self._position_history_instruments = dict(instruments)
+        # Merge freshly fetched specs with local swap/option cache so legacy rows
+        # can still be converted to coin amounts instead of falling back to contracts.
+        instrument_map = {item.inst_id: item for item in self.instruments if item.inst_id}
+        instrument_map.update(instruments)
+        self._position_history_instruments = instrument_map
         self._position_history_last_refresh_at = datetime.now()
         self._positions_history_last_refresh_at = self._position_history_last_refresh_at
         self._position_history_profile_name = (credential_profile_name or self._current_credential_profile()).strip()
@@ -6602,9 +6708,9 @@ class QuantApp:
             dedup_fields=("update_time", "inst_id", "pos_side", "direction", "close_size", "close_avg_price"),
         )
         save_history_cache_records("positions", active_profile, active_environment, merged_records)
-        self._latest_position_history = [
-            item for record in merged_records if (item := _position_history_item_from_cache(record)) is not None
-        ]
+        parsed_items = [item for record in merged_records if (item := _position_history_item_from_cache(record)) is not None]
+        parsed_items.sort(key=lambda item: item.update_time or 0, reverse=True)
+        self._latest_position_history = parsed_items[: self._position_history_fetch_limit]
         history_summary = f"历史仓位：{len(self._latest_position_history)} 条 | 最近同步：{timestamp}"
         if note:
             history_summary = f"{history_summary} | {note}"
@@ -7686,6 +7792,248 @@ class QuantApp:
             self.client,
             logger=self._enqueue_log,
         )
+
+    def open_line_trading_desk_window(self) -> None:
+        existing = self._line_trading_desk_window
+        if existing is not None and _widget_exists(existing.window):
+            existing.window.deiconify()
+            existing.window.lift()
+            existing.window.focus_force()
+            self._request_line_trading_desk_refresh(immediate=True)
+            return
+
+        window = Toplevel(self.root)
+        apply_window_icon(window)
+        window.title("划线交易台")
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.84,
+            height_ratio=0.74,
+            min_width=1220,
+            min_height=760,
+            max_width=1880,
+            max_height=1240,
+        )
+        window.transient(self.root)
+
+        container = ttk.Frame(window, padding=10)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=3)
+        container.columnconfigure(1, weight=2)
+        container.rowconfigure(2, weight=1)
+
+        top_bar = ttk.Frame(container)
+        top_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        top_bar.columnconfigure(16, weight=1)
+        ttk.Label(top_bar, text="API").grid(row=0, column=0, sticky="w")
+        api_profile_var = StringVar(value=self._current_credential_profile())
+        api_combo = ttk.Combobox(top_bar, width=14, textvariable=api_profile_var, values=self._credential_profile_names())
+        api_combo.grid(row=0, column=1, padx=(4, 10))
+        ttk.Label(top_bar, text="标的").grid(row=0, column=2, sticky="w")
+        symbol_var = StringVar(value=self._default_line_trading_symbol())
+        symbol_box = ttk.Combobox(top_bar, width=18, textvariable=symbol_var)
+        symbol_box["values"] = self._line_trading_symbol_values()
+        symbol_box.grid(row=0, column=3, padx=(4, 8))
+        ttk.Label(top_bar, text="周期").grid(row=0, column=4, sticky="w")
+        bar_var = StringVar(value=self.bar.get() or "1H")
+        ttk.Combobox(top_bar, width=8, state="readonly", values=BAR_OPTIONS, textvariable=bar_var).grid(
+            row=0, column=5, padx=(4, 8)
+        )
+        ttk.Button(top_bar, text="刷新", command=lambda: self._request_line_trading_desk_refresh(immediate=True)).grid(
+            row=0, column=6, padx=(0, 6)
+        )
+        ttk.Button(top_bar, text="重置视图", command=self._line_trading_desk_reset_chart_view).grid(row=0, column=7, padx=(0, 6))
+        ttk.Button(top_bar, text="区间放大", command=lambda: self._set_line_trading_desk_tool("zoom_range")).grid(
+            row=0, column=8, padx=(0, 4)
+        )
+        ttk.Button(top_bar, text="趋势线(射线)", command=lambda: self._set_line_trading_desk_tool("line")).grid(
+            row=0, column=9, padx=(0, 4)
+        )
+        ttk.Button(top_bar, text="水平射线", command=lambda: self._set_line_trading_desk_tool("horizontal")).grid(
+            row=0, column=10, padx=(0, 4)
+        )
+        ttk.Button(top_bar, text="止损线", command=lambda: self._set_line_trading_desk_tool("stop")).grid(
+            row=0, column=11, padx=(0, 4)
+        )
+        ttk.Button(top_bar, text="盈亏比·多", command=lambda: self._set_line_trading_desk_rr_draw("long")).grid(
+            row=0, column=12, padx=(0, 2)
+        )
+        ttk.Button(top_bar, text="盈亏比·空", command=lambda: self._set_line_trading_desk_rr_draw("short")).grid(
+            row=0, column=13, padx=(0, 4)
+        )
+        ttk.Button(top_bar, text="清空线", command=self._clear_line_trading_desk_lines).grid(row=0, column=14, padx=(0, 4))
+        ttk.Button(top_bar, text="开多", command=lambda: self._submit_line_trading_desk_order("long")).grid(
+            row=0, column=15, padx=(8, 4)
+        )
+        ttk.Button(top_bar, text="开空", command=lambda: self._submit_line_trading_desk_order("short")).grid(
+            row=0, column=16, sticky="w"
+        )
+
+        param_card = ttk.LabelFrame(container, text="集中参数（开多/开空、射线触发、盈亏比预览共用）", padding=8)
+        param_card.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        for col in range(0, 12):
+            param_card.columnconfigure(col, weight=0)
+        param_atr_period = StringVar(value="10")
+        param_atr_mult = StringVar(value="1")
+        param_risk_amount = StringVar(value="100")
+        param_cross_mode = StringVar(value="tick_last")
+        param_ray_action = StringVar(value="notify")
+        param_rr_r = StringVar(value="2")
+        param_rr_side = StringVar(value="long")
+        pr = 0
+        ttk.Label(param_card, text="ATR周期").grid(row=pr, column=0, sticky="w")
+        ttk.Entry(param_card, width=6, textvariable=param_atr_period).grid(row=pr, column=1, padx=(4, 12))
+        ttk.Label(param_card, text="止损×ATR").grid(row=pr, column=2, sticky="w")
+        ttk.Entry(param_card, width=6, textvariable=param_atr_mult).grid(row=pr, column=3, padx=(4, 12))
+        ttk.Label(param_card, text="风险金(USDT)").grid(row=pr, column=4, sticky="w")
+        ttk.Entry(param_card, width=8, textvariable=param_risk_amount).grid(row=pr, column=5, padx=(4, 12))
+        ttk.Label(param_card, text="穿越判定").grid(row=pr, column=6, sticky="w")
+        ttk.Combobox(
+            param_card,
+            width=14,
+            state="readonly",
+            textvariable=param_cross_mode,
+            values=("tick_last", "close"),
+        ).grid(row=pr, column=7, padx=(4, 12))
+        ttk.Label(param_card, text="新射线默认").grid(row=pr, column=8, sticky="w")
+        ttk.Combobox(
+            param_card,
+            width=10,
+            state="readonly",
+            textvariable=param_ray_action,
+            values=("notify", "long", "short"),
+        ).grid(row=pr, column=9, padx=(4, 12))
+        ttk.Label(param_card, text="盈亏比R").grid(row=pr, column=10, sticky="w")
+        ttk.Entry(param_card, width=5, textvariable=param_rr_r).grid(row=pr, column=11, padx=(4, 0))
+        hint = ttk.Label(
+            param_card,
+            text="滚轮缩放；Shift+拖平移。区间放大后可在空白处按住左键拖动平移（最左侧K移出视窗），仍只显示当前窗口根数；Shift+拖亦可。「区间放大」横拖选K后远端隐藏；重置视图恢复。",
+            foreground="#555",
+        )
+        hint.grid(row=1, column=0, columnspan=14, sticky="w", pady=(6, 0))
+
+        chart_frame = ttk.Frame(container)
+        chart_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 8))
+        chart_frame.columnconfigure(0, weight=1)
+        chart_frame.rowconfigure(0, weight=1)
+        canvas = Canvas(chart_frame, background="#ffffff", highlightthickness=0, width=980, height=620)
+        canvas.grid(row=0, column=0, sticky="nsew")
+
+        right = ttk.Frame(container)
+        right.grid(row=2, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(3, weight=1)
+        status_text = StringVar(value="划线交易台已就绪。")
+        ttk.Label(right, textvariable=status_text, wraplength=420, justify="left").grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        ray_box = ttk.LabelFrame(right, text="射线触发（一次性）", padding=6)
+        ray_box.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ray_box.columnconfigure(0, weight=1)
+        ray_tree = ttk.Treeview(
+            ray_box,
+            columns=("kind", "action", "state"),
+            show="headings",
+            height=5,
+        )
+        for col, text, width in (("kind", "类型", 80), ("action", "动作", 70), ("state", "状态", 80)):
+            ray_tree.heading(col, text=text)
+            ray_tree.column(col, width=width, anchor="center")
+        ray_tree.grid(row=0, column=0, sticky="ew")
+
+        rr_box = ttk.LabelFrame(right, text="盈亏比（拖入场/止损/止盈线或风险区；锁后不可拖）", padding=6)
+        rr_box.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        rr_box.columnconfigure(0, weight=1)
+        rr_manage_tree = ttk.Treeview(
+            rr_box,
+            columns=("lock", "entry", "sl", "tp", "r"),
+            show="headings",
+            height=4,
+        )
+        for col, text, width in (
+            ("lock", "锁", 36),
+            ("entry", "入场", 72),
+            ("sl", "止损", 72),
+            ("tp", "止盈", 72),
+            ("r", "R", 36),
+        ):
+            rr_manage_tree.heading(col, text=text)
+            rr_manage_tree.column(col, width=width, anchor="center")
+        rr_manage_tree.grid(row=0, column=0, sticky="ew")
+        ttk.Button(rr_box, text="切换选中锁定", command=self._line_trading_desk_toggle_selected_rr_lock).grid(
+            row=1, column=0, sticky="w", pady=(4, 0)
+        )
+
+        positions_box = ttk.LabelFrame(right, text="持仓（简版）", padding=8)
+        positions_box.grid(row=3, column=0, sticky="nsew")
+        positions_box.columnconfigure(0, weight=1)
+        positions_box.rowconfigure(0, weight=1)
+        position_tree = ttk.Treeview(
+            positions_box,
+            columns=("inst_id", "pos_side", "size", "avg_price", "mark_price", "upl"),
+            show="headings",
+            height=12,
+        )
+        for col, text, width in (
+            ("inst_id", "合约", 160),
+            ("pos_side", "方向", 70),
+            ("size", "数量", 80),
+            ("avg_price", "开仓均价", 90),
+            ("mark_price", "标记价", 90),
+            ("upl", "浮盈亏", 90),
+        ):
+            position_tree.heading(col, text=text)
+            position_tree.column(col, width=width, anchor="center")
+        position_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll = ttk.Scrollbar(positions_box, orient="vertical", command=position_tree.yview)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        position_tree.configure(yscrollcommand=y_scroll.set)
+
+        action_row = ttk.Frame(right)
+        action_row.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(action_row, text="市价平仓选中", command=lambda: self._line_trading_desk_flatten_selected("market")).grid(
+            row=0, column=0, padx=(0, 4)
+        )
+        ttk.Button(action_row, text="挂买一/卖一平仓", command=lambda: self._line_trading_desk_flatten_selected("best_quote")).grid(
+            row=0, column=1, padx=(0, 4)
+        )
+        ttk.Button(action_row, text="关闭", command=self._close_line_trading_desk_window).grid(row=0, column=2)
+
+        state = LineTradingDeskWindowState(
+            window=window,
+            canvas=canvas,
+            symbol_var=symbol_var,
+            bar_var=bar_var,
+            status_text=status_text,
+            position_tree=position_tree,
+            api_profile_var=api_profile_var,
+            param_atr_period=param_atr_period,
+            param_atr_mult=param_atr_mult,
+            param_risk_amount=param_risk_amount,
+            param_cross_mode=param_cross_mode,
+            param_ray_action=param_ray_action,
+            param_rr_r=param_rr_r,
+            param_rr_side=param_rr_side,
+            ray_tree=ray_tree,
+            rr_manage_tree=rr_manage_tree,
+            desk_visible_bars=200,
+            desk_view_start=0,
+            last_desk_api_profile=api_profile_var.get().strip(),
+        )
+        self._line_trading_desk_window = state
+        rr_manage_tree.bind("<<TreeviewSelect>>", lambda _e: self._line_trading_desk_on_rr_tree_select())
+        window.protocol("WM_DELETE_WINDOW", self._close_line_trading_desk_window)
+        canvas.bind("<Configure>", lambda *_: self._render_line_trading_desk_chart())
+        canvas.bind("<ButtonPress-1>", self._on_line_trading_desk_button_press)
+        canvas.bind("<B1-Motion>", self._on_line_trading_desk_mouse_move)
+        canvas.bind("<ButtonRelease-1>", self._on_line_trading_desk_button_release)
+        canvas.bind("<MouseWheel>", self._on_line_trading_desk_mouse_wheel)
+        canvas.bind("<Button-4>", self._on_line_trading_desk_mouse_wheel)
+        canvas.bind("<Button-5>", self._on_line_trading_desk_mouse_wheel)
+        canvas.bind("<Enter>", lambda e: e.widget.focus_set())
+        symbol_var.trace_add("write", lambda *_: self._on_line_trading_desk_symbol_or_bar_changed())
+        bar_var.trace_add("write", lambda *_: self._on_line_trading_desk_symbol_or_bar_changed())
+        api_profile_var.trace_add("write", lambda *_: self._on_line_trading_desk_api_profile_changed())
+        self._request_line_trading_desk_refresh(immediate=True)
 
     def open_signal_monitor_window(self) -> None:
         if self._signal_monitor_window is not None and self._signal_monitor_window.window.winfo_exists():
@@ -8896,8 +9244,67 @@ class QuantApp:
         canvas = Canvas(chart_frame, background="#ffffff", highlightthickness=0, width=1120, height=620)
         canvas.grid(row=0, column=0, sticky="nsew")
 
+        tools_frame = ttk.Frame(container)
+        tools_frame.grid(row=2, column=0, sticky="ew", pady=(8, 4))
+        tools_frame.columnconfigure(11, weight=1)
+
+        ttk.Label(tools_frame, text="画线工具").grid(row=0, column=0, sticky="w")
+        ttk.Button(tools_frame, text="趋势线", command=lambda target_session_id=session_id: self._set_live_chart_tool(target_session_id, "line")).grid(row=0, column=1, padx=(6, 2))
+        ttk.Button(tools_frame, text="水平线", command=lambda target_session_id=session_id: self._set_live_chart_tool(target_session_id, "horizontal")).grid(row=0, column=2, padx=2)
+        ttk.Button(tools_frame, text="止损线", command=lambda target_session_id=session_id: self._set_live_chart_tool(target_session_id, "stop")).grid(row=0, column=3, padx=2)
+        ttk.Button(tools_frame, text="清空线", command=lambda target_session_id=session_id: self._clear_live_chart_annotations(target_session_id)).grid(row=0, column=4, padx=(2, 10))
+
+        ttk.Label(tools_frame, text="价格基准").grid(row=0, column=5, sticky="e")
+        trade_price_basis = StringVar(value="最新价格")
+        ttk.Combobox(
+            tools_frame,
+            width=9,
+            state="readonly",
+            values=("最新价格", "最新K线", "上一根K线"),
+            textvariable=trade_price_basis,
+        ).grid(row=0, column=6, padx=(4, 8))
+        ttk.Label(tools_frame, text="止损基准").grid(row=0, column=7, sticky="e")
+        trade_stop_basis = StringVar(value="上一根ATR")
+        ttk.Combobox(
+            tools_frame,
+            width=11,
+            state="readonly",
+            values=("上一根ATR", "前三根高低", "止损线"),
+            textvariable=trade_stop_basis,
+        ).grid(row=0, column=8, padx=(4, 8))
+        trade_order_mode = StringVar(value="限价挂单")
+        ttk.Combobox(
+            tools_frame,
+            width=9,
+            state="readonly",
+            values=("限价挂单", "对手价"),
+            textvariable=trade_order_mode,
+        ).grid(row=0, column=9, padx=(0, 8))
+        ttk.Button(tools_frame, text="开多", command=lambda target_session_id=session_id: self._submit_live_chart_trade(target_session_id, "long")).grid(row=0, column=10, padx=(0, 4))
+        ttk.Button(tools_frame, text="开空", command=lambda target_session_id=session_id: self._submit_live_chart_trade(target_session_id, "short")).grid(row=0, column=11, sticky="w")
+
+        trade_config_frame = ttk.Frame(container)
+        trade_config_frame.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(trade_config_frame, text="定量").grid(row=0, column=0, sticky="w")
+        trade_risk_mode = StringVar(value="以损定量")
+        ttk.Combobox(
+            trade_config_frame,
+            width=9,
+            state="readonly",
+            values=("以损定量", "固定张数"),
+            textvariable=trade_risk_mode,
+        ).grid(row=0, column=1, padx=(4, 8))
+        ttk.Label(trade_config_frame, text="风险金").grid(row=0, column=2, sticky="e")
+        trade_risk_amount = StringVar(value=format_decimal(session.config.risk_amount or Decimal("20")))
+        ttk.Entry(trade_config_frame, width=10, textvariable=trade_risk_amount).grid(row=0, column=3, padx=(4, 8))
+        ttk.Label(trade_config_frame, text="固定张数").grid(row=0, column=4, sticky="e")
+        trade_fixed_size = StringVar(value=format_decimal(session.config.order_size or Decimal("1")))
+        ttk.Entry(trade_config_frame, width=10, textvariable=trade_fixed_size).grid(row=0, column=5, padx=(4, 8))
+        trade_status_text = StringVar(value="划线交易待命。")
+        ttk.Label(trade_config_frame, textvariable=trade_status_text).grid(row=0, column=6, sticky="w")
+
         footer = ttk.Frame(container)
-        footer.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        footer.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         footer.columnconfigure(0, weight=1)
         ttk.Label(footer, textvariable=footer_text, justify="left", wraplength=980).grid(row=0, column=0, sticky="w")
         action_row = ttk.Frame(footer)
@@ -8922,16 +9329,412 @@ class QuantApp:
             headline_text=headline_text,
             status_text=status_text,
             footer_text=footer_text,
+            trade_price_basis=trade_price_basis,
+            trade_stop_basis=trade_stop_basis,
+            trade_order_mode=trade_order_mode,
+            trade_risk_mode=trade_risk_mode,
+            trade_risk_amount=trade_risk_amount,
+            trade_fixed_size=trade_fixed_size,
+            trade_status_text=trade_status_text,
         )
         self._strategy_live_chart_windows[session_id] = state
         window.protocol("WM_DELETE_WINDOW", lambda target_session_id=session_id: self._close_strategy_live_chart_window(target_session_id))
         canvas.bind("<Configure>", lambda *_args, target_session_id=session_id: self._render_strategy_live_chart_window(target_session_id))
+        canvas.bind("<ButtonPress-1>", lambda event, target_session_id=session_id: self._on_live_chart_mouse_down(target_session_id, event.x, event.y))
+        canvas.bind("<B1-Motion>", lambda event, target_session_id=session_id: self._on_live_chart_mouse_move(target_session_id, event.x, event.y))
+        canvas.bind("<ButtonRelease-1>", lambda event, target_session_id=session_id: self._on_live_chart_mouse_up(target_session_id, event.x, event.y))
         self._render_strategy_live_chart_window(session_id)
         self._request_strategy_live_chart_refresh(session_id, immediate=True)
 
     def _strategy_live_chart_window_title(self, session: StrategySession) -> str:
         trade_inst_id = _session_trade_inst_id(session) or session.symbol
         return f"\u5b9e\u65f6K\u7ebf\u56fe - {session.session_id} {trade_inst_id}"
+
+    def _set_live_chart_tool(self, session_id: str, tool: str) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None:
+            return
+        state.active_tool = tool
+        if state.trade_status_text is not None:
+            labels = {"line": "趋势线", "horizontal": "水平线", "stop": "止损线"}
+            state.trade_status_text.set(f"当前工具：{labels.get(tool, '无')}。")
+
+    def _clear_live_chart_annotations(self, session_id: str) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None:
+            return
+        state.line_annotations.clear()
+        state.draft_line_start = None
+        state.draft_line_current = None
+        self._render_strategy_live_chart_window(session_id)
+        if state.trade_status_text is not None:
+            state.trade_status_text.set("已清空画线。")
+
+    def _on_live_chart_mouse_down(self, session_id: str, x: float, y: float) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None or state.active_tool == "none":
+            return
+        state.draft_line_start = (x, y)
+        state.draft_line_current = (x, y)
+        self._render_strategy_live_chart_window(session_id)
+
+    def _on_live_chart_mouse_move(self, session_id: str, x: float, y: float) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None or state.draft_line_start is None:
+            return
+        state.draft_line_current = (x, y)
+        self._render_strategy_live_chart_window(session_id)
+
+    def _on_live_chart_mouse_up(self, session_id: str, x: float, y: float) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None or state.draft_line_start is None:
+            return
+        start = state.draft_line_start
+        end = (x, y)
+        color = "#1d4ed8"
+        label = ""
+        if state.active_tool == "stop":
+            color = "#cf222e"
+            label = "止损线"
+        elif state.active_tool == "horizontal":
+            end = (x, start[1])
+            color = "#7c3aed"
+            label = "水平线"
+        else:
+            label = "趋势线"
+        state.line_annotations.append(
+            LiveChartLineAnnotation(
+                kind=state.active_tool,
+                x1=start[0],
+                y1=start[1],
+                x2=end[0],
+                y2=end[1],
+                color=color,
+                label=label,
+            )
+        )
+        state.draft_line_start = None
+        state.draft_line_current = None
+        self._render_strategy_live_chart_window(session_id)
+        if state.trade_status_text is not None:
+            state.trade_status_text.set(f"已添加{label}。")
+
+    def _draw_live_chart_annotations(self, state: StrategyLiveChartWindowState) -> None:
+        self._draw_line_annotations(
+            state.canvas,
+            state.line_annotations,
+            state.draft_line_start,
+            state.draft_line_current,
+        )
+
+    def _draw_line_annotations(
+        self,
+        canvas: Canvas,
+        annotations: list[LiveChartLineAnnotation],
+        draft_start: tuple[float, float] | None,
+        draft_current: tuple[float, float] | None,
+    ) -> None:
+        canvas.delete("line_anno")
+        for item in annotations:
+            canvas.create_line(item.x1, item.y1, item.x2, item.y2, fill=item.color, width=2, tags=("line_anno",))
+            if item.label:
+                canvas.create_text(
+                    item.x2 + 4,
+                    item.y2 - 4,
+                    anchor="sw",
+                    text=item.label,
+                    fill=item.color,
+                    font=("Microsoft YaHei UI", 9),
+                    tags=("line_anno",),
+                )
+        if draft_start is not None and draft_current is not None:
+            x1, y1 = draft_start
+            x2, y2 = draft_current
+            canvas.create_line(x1, y1, x2, y2, fill="#6b7280", width=1, dash=(4, 3), tags=("line_anno",))
+
+    def _live_chart_stop_price_from_annotation(self, state: StrategyLiveChartWindowState) -> Decimal | None:
+        snapshot = state.last_snapshot
+        if snapshot is None or not snapshot.candles:
+            return None
+        low, high = strategy_live_chart_price_bounds(snapshot)
+        canvas_height = max(state.canvas.winfo_height(), 1)
+        top = 26
+        bottom = max(canvas_height - 44, top + 1)
+        chart_height = max(bottom - top, 1)
+        stop_lines = [line for line in state.line_annotations if line.kind == "stop"]
+        if not stop_lines:
+            return None
+        y = stop_lines[-1].y1
+        ratio = min(max((y - top) / chart_height, 0.0), 1.0)
+        return high - (high - low) * Decimal(str(ratio))
+
+    def _resolve_live_chart_trade_reference_price(self, state: StrategyLiveChartWindowState) -> Decimal | None:
+        snapshot = state.last_snapshot
+        if snapshot is None or not snapshot.candles:
+            return None
+        basis = state.trade_price_basis.get() if state.trade_price_basis is not None else "最新价格"
+        if basis == "最新价格":
+            return snapshot.latest_price or snapshot.candles[-1].close
+        if basis == "上一根K线" and len(snapshot.candles) >= 2:
+            return snapshot.candles[-2].close
+        return snapshot.candles[-1].close
+
+    def _resolve_live_chart_trade_stop_price(
+        self,
+        state: StrategyLiveChartWindowState,
+        entry_price: Decimal,
+        direction: str,
+    ) -> Decimal | None:
+        snapshot = state.last_snapshot
+        if snapshot is None or not snapshot.candles:
+            return None
+        stop_basis = state.trade_stop_basis.get() if state.trade_stop_basis is not None else "上一根ATR"
+        is_long = direction == "long"
+        if stop_basis == "止损线":
+            return self._live_chart_stop_price_from_annotation(state)
+        if stop_basis == "前三根高低" and len(snapshot.candles) >= 3:
+            window = snapshot.candles[-3:]
+            return min(item.low for item in window) if is_long else max(item.high for item in window)
+        if len(snapshot.candles) < 12:
+            return None
+        atr_values = atr(list(snapshot.candles), 10)
+        if not atr_values or atr_values[-1] is None or atr_values[-1] <= 0:
+            return None
+        atr_value = atr_values[-1]
+        return entry_price - atr_value if is_long else entry_price + atr_value
+
+    def _submit_live_chart_trade(self, session_id: str, direction: str) -> None:
+        session = self.sessions.get(session_id)
+        state = self._strategy_live_chart_windows.get(session_id)
+        if session is None or state is None:
+            return
+        credentials = self._credentials_for_profile_or_none(session.api_name)
+        if credentials is None:
+            if state.trade_status_text is not None:
+                state.trade_status_text.set("缺少 API 凭证，无法下单。")
+            return
+        trade_inst_id = _session_trade_inst_id(session) or session.symbol
+        try:
+            instrument = self.client.get_instrument(trade_inst_id)
+        except Exception as exc:
+            if state.trade_status_text is not None:
+                state.trade_status_text.set(f"读取标的失败：{exc}")
+            return
+        entry_price = self._resolve_live_chart_trade_reference_price(state)
+        if entry_price is None or entry_price <= 0:
+            if state.trade_status_text is not None:
+                state.trade_status_text.set("无法计算开仓价。")
+            return
+        stop_price = self._resolve_live_chart_trade_stop_price(state, entry_price, direction)
+        if stop_price is None or stop_price <= 0 or stop_price == entry_price:
+            if state.trade_status_text is not None:
+                state.trade_status_text.set("止损价无效，请检查止损基准。")
+            return
+
+        config = replace(session.config)
+        risk_mode = state.trade_risk_mode.get() if state.trade_risk_mode is not None else "以损定量"
+        if risk_mode == "固定张数":
+            fixed_size = _parse_decimal_or_none(state.trade_fixed_size.get() if state.trade_fixed_size is not None else "")
+            if fixed_size is None or fixed_size <= 0:
+                if state.trade_status_text is not None:
+                    state.trade_status_text.set("固定张数无效。")
+                return
+            size = fixed_size
+            config = replace(config, order_size=fixed_size, risk_amount=None)
+        else:
+            risk_amount = _parse_decimal_or_none(state.trade_risk_amount.get() if state.trade_risk_amount is not None else "")
+            if risk_amount is None or risk_amount <= 0:
+                if state.trade_status_text is not None:
+                    state.trade_status_text.set("风险金无效。")
+                return
+            config = replace(config, risk_amount=risk_amount, order_size=None)
+            try:
+                size = determine_order_size(
+                    instrument=instrument,
+                    config=config,
+                    entry_price=entry_price,
+                    stop_loss=stop_price,
+                    risk_price_compatible=True,
+                )
+            except Exception as exc:
+                if state.trade_status_text is not None:
+                    state.trade_status_text.set(f"以损定量失败：{exc}")
+                return
+
+        side = "buy" if direction == "long" else "sell"
+        pos_side = resolve_open_pos_side(config.position_mode, side)
+        order_mode = state.trade_order_mode.get() if state.trade_order_mode is not None else "限价挂单"
+        cl_ord_id = f"lt{session.session_id.lower()}{datetime.utcnow().strftime('%m%d%H%M%S%f')[-12:]}"
+        try:
+            if order_mode == "对手价":
+                result = self.client.place_aggressive_limit_order(
+                    credentials,
+                    config,
+                    instrument,
+                    side=side,
+                    size=size,
+                    pos_side=pos_side,
+                    cl_ord_id=cl_ord_id,
+                )
+            else:
+                result = self.client.place_simple_order(
+                    credentials,
+                    config,
+                    inst_id=instrument.inst_id,
+                    side=side,
+                    size=size,
+                    ord_type="limit",
+                    pos_side=pos_side,
+                    price=entry_price,
+                    cl_ord_id=cl_ord_id,
+                )
+        except Exception as exc:
+            if state.trade_status_text is not None:
+                state.trade_status_text.set(f"下单失败：{exc}")
+            return
+
+        if state.trade_status_text is not None:
+            state.trade_status_text.set(
+                f"已提交{('多' if direction == 'long' else '空')}单 | ordId={result.ord_id or '-'} | size={format_decimal(size)}"
+            )
+        self._enqueue_log(
+            f"[{session.session_id}] 划线交易已下单 | 方向={direction.upper()} | 标的={instrument.inst_id} | "
+            f"开仓价={format_decimal(entry_price)} | 止损={format_decimal(stop_price)} | 数量={format_decimal(size)} | ordId={result.ord_id or '-'}"
+        )
+        threading.Thread(
+            target=self._line_trade_post_entry_worker,
+            args=(
+                session,
+                credentials,
+                config,
+                instrument,
+                result.ord_id or "",
+                cl_ord_id,
+                side,
+                pos_side,
+                size,
+                entry_price,
+                stop_price,
+            ),
+            daemon=True,
+        ).start()
+
+    def _line_trade_post_entry_worker(
+        self,
+        session: StrategySession,
+        credentials: Credentials,
+        config: StrategyConfig,
+        instrument: Instrument,
+        ord_id: str,
+        cl_ord_id: str,
+        side: str,
+        pos_side: str | None,
+        size: Decimal,
+        entry_price: Decimal,
+        stop_price: Decimal,
+    ) -> None:
+        try:
+            if ord_id:
+                for _ in range(40):
+                    status = self.client.get_order(credentials, config, inst_id=instrument.inst_id, ord_id=ord_id, cl_ord_id=cl_ord_id)
+                    if status.state in {"filled", "partially_filled"}:
+                        fill_price = status.avg_price or status.price or entry_price
+                        fill_size = status.filled_size if status.filled_size and status.filled_size > 0 else size
+                        self.root.after(
+                            0,
+                            lambda sid=session.session_id: self._mark_line_trade_started(
+                                sid,
+                                instrument=instrument,
+                                side=side,
+                                pos_side=pos_side,
+                                size=fill_size,
+                                entry_price=fill_price,
+                                stop_price=stop_price,
+                                credentials=credentials,
+                                config=config,
+                                ord_id=ord_id,
+                                cl_ord_id=cl_ord_id,
+                            ),
+                        )
+                        return
+                    if status.state in {"canceled", "order_failed"}:
+                        self.root.after(0, lambda sid=session.session_id, st=status.state: self._mark_line_trade_status(sid, f"委托结束：{st}"))
+                        return
+                    threading.Event().wait(1.0)
+                self.root.after(0, lambda sid=session.session_id: self._mark_line_trade_status(sid, "委托未成交，等待手动处理。"))
+                return
+            self.root.after(0, lambda sid=session.session_id: self._mark_line_trade_status(sid, "委托缺少订单号，无法追踪。"))
+        except Exception as exc:
+            self.root.after(0, lambda sid=session.session_id, msg=str(exc): self._mark_line_trade_status(sid, f"委托追踪失败：{msg}"))
+
+    def _mark_line_trade_status(self, session_id: str, text: str) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is not None and state.trade_status_text is not None:
+            state.trade_status_text.set(text)
+        self._enqueue_log(f"[{session_id}] 划线交易 | {text}")
+
+    def _mark_line_trade_started(
+        self,
+        session_id: str,
+        *,
+        instrument: Instrument,
+        side: str,
+        pos_side: str | None,
+        size: Decimal,
+        entry_price: Decimal,
+        stop_price: Decimal,
+        credentials: Credentials,
+        config: StrategyConfig,
+        ord_id: str,
+        cl_ord_id: str,
+    ) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is not None and state.trade_status_text is not None:
+            state.trade_status_text.set(
+                f"已成交，启动动态管理 | entry={format_decimal(entry_price)} stop={format_decimal(stop_price)}"
+            )
+        self._enqueue_log(
+            f"[{session_id}] 划线交易成交 | ordId={ord_id or '-'} | side={side} | entry={format_decimal(entry_price)} | stop={format_decimal(stop_price)}"
+        )
+        direction = "long" if side == "buy" else "short"
+        risk_per_unit = abs(entry_price - stop_price)
+        take_profit = entry_price + (risk_per_unit * Decimal("4")) if direction == "long" else entry_price - (risk_per_unit * Decimal("4"))
+        protection = ProtectionPlan(
+            trigger_inst_id=instrument.inst_id,
+            trigger_price_type=config.tp_sl_trigger_type,
+            take_profit=take_profit,
+            stop_loss=stop_price,
+            entry_reference=entry_price,
+            atr_value=risk_per_unit,
+            direction=direction,
+            candle_ts=int(time.time() * 1000),
+        )
+        engine = StrategyEngine(
+            self.client,
+            lambda message: self.root.after(0, lambda text=message: self._enqueue_log(f"[{session_id}] 划线交易监控 | {text}")),
+            notifier=self._build_notifier(config),
+            strategy_name=f"{session_id} 划线交易",
+            session_id=session_id,
+            direction_label="只做多" if direction == "long" else "只做空",
+            run_mode_label="交易并下单",
+            trader_id="LINE",
+            api_name=(self.sessions.get(session_id).api_name if self.sessions.get(session_id) else ""),
+        )
+        position = FilledPosition(
+            ord_id=ord_id or cl_ord_id,
+            cl_ord_id=cl_ord_id,
+            inst_id=instrument.inst_id,
+            side=side,  # type: ignore[arg-type]
+            close_side="sell" if side == "buy" else "buy",  # type: ignore[arg-type]
+            pos_side=pos_side,  # type: ignore[arg-type]
+            size=size,
+            entry_price=entry_price,
+            entry_ts=int(time.time() * 1000),
+        )
+        threading.Thread(
+            target=lambda: engine._monitor_local_exit_v2(credentials, config, instrument, position, protection),
+            daemon=True,
+        ).start()
 
     def _strategy_live_chart_headline(self, session: StrategySession) -> str:
         trade_inst_id = _session_trade_inst_id(session) or session.symbol
@@ -9282,6 +10085,7 @@ class QuantApp:
                 note="\u6b63\u5728\u52a0\u8f7dK\u7ebf\u6570\u636e...",
             )
         render_strategy_live_chart(state.canvas, snapshot)
+        self._draw_live_chart_annotations(state)
 
     def _strategy_live_chart_pending_entry_prices(self, session: StrategySession) -> tuple[Decimal, ...]:
         prices: list[Decimal] = []
@@ -9727,7 +10531,44 @@ class QuantApp:
         )
         self._trader_desk_events.sort(key=lambda item: (item.created_at, item.event_id), reverse=True)
         self._trader_desk_events = self._trader_desk_events[:400]
-        self._enqueue_log(f"[交易员管理台] [{normalized}] {text}")
+        QuantApp._log_trader_desk_message(self, normalized, text)
+
+    def _trader_desk_log_api_name(self, trader_id: str) -> str:
+        normalized = str(trader_id or "").strip()
+        if not normalized:
+            return ""
+        draft = self._trader_desk_draft_by_id(normalized)
+        if draft is not None:
+            payload = draft.template_payload if isinstance(draft.template_payload, dict) else {}
+            api_name = str(payload.get("api_name") or "").strip()
+            if api_name:
+                return api_name
+        for slot in getattr(self, "_trader_desk_slots", []):
+            if slot.trader_id == normalized:
+                api_name = str(getattr(slot, "api_name", "") or "").strip()
+                if api_name:
+                    return api_name
+        sessions = getattr(self, "sessions", {})
+        for session in sessions.values() if isinstance(sessions, dict) else []:
+            if str(getattr(session, "trader_id", "") or "").strip() == normalized:
+                api_name = str(getattr(session, "api_name", "") or "").strip()
+                if api_name:
+                    return api_name
+        profile_getter = getattr(self, "_current_credential_profile", None)
+        if callable(profile_getter):
+            return str(profile_getter() or "").strip()
+        return ""
+
+    def _log_trader_desk_message(self, trader_id: str, message: str) -> None:
+        normalized = str(trader_id or "").strip()
+        text = str(message or "").strip()
+        if not normalized or not text:
+            return
+        api_name = QuantApp._trader_desk_log_api_name(self, normalized)
+        if api_name:
+            self._enqueue_log(f"[{api_name}] [交易员管理台] [{normalized}] {text}")
+        else:
+            self._enqueue_log(f"[交易员管理台] [{normalized}] {text}")
 
     @staticmethod
     def _expected_trader_stop_reason(reason: str) -> bool:
@@ -9770,6 +10611,7 @@ class QuantApp:
         draft = self._trader_desk_draft_by_id(trader_id)
         if draft is None:
             raise ValueError("未找到对应的交易员草稿。")
+        api_name = QuantApp._trader_desk_log_api_name(self, trader_id)
         self._cleanup_stale_trader_watchers(trader_id)
         active_sessions = [
             session
@@ -9786,7 +10628,10 @@ class QuantApp:
         self._trader_desk_slots = [item for item in self._trader_desk_slots if item.trader_id != trader_id]
         self._trader_desk_events = [item for item in self._trader_desk_events if item.trader_id != trader_id]
         self._save_trader_desk_snapshot()
-        self._enqueue_log(f"[交易员管理台] [{trader_id}] 已删除。")
+        if api_name:
+            self._enqueue_log(f"[{api_name}] [交易员管理台] [{trader_id}] 已删除。")
+        else:
+            QuantApp._log_trader_desk_message(self, trader_id, "已删除。")
 
     def _trader_desk_symbol_choices(self) -> list[str]:
         return list(dict.fromkeys(self._custom_trigger_symbol_values + self._default_symbol_values))
@@ -9879,7 +10724,11 @@ class QuantApp:
         try:
             candles = self.client.get_candles(config.inst_id, config.bar, limit=lookback)
         except Exception as exc:
-            self._enqueue_log(f"[交易员管理台] [{draft.trader_id}] 波段锁检查失败：{_format_network_error_message(str(exc))}")
+            QuantApp._log_trader_desk_message(
+                self,
+                draft.trader_id,
+                f"波段锁检查失败：{_format_network_error_message(str(exc))}",
+            )
             return True
         confirmed = [candle for candle in candles if candle.confirmed]
         if len(confirmed) < 2:
@@ -10032,8 +10881,10 @@ class QuantApp:
             return
         if self._is_trader_wave_lock_active(draft, run):
             lock_signal = str(run.wave_lock_signal or "").strip().lower()
-            self._enqueue_log(
-                f"[交易员管理台] [{trader_id}] 波段锁生效，跳过补位 | 锁方向={lock_signal.upper() or '-'} | 等待当前波失效后再开新单"
+            QuantApp._log_trader_desk_message(
+                self,
+                trader_id,
+                f"波段锁生效，跳过补位 | 锁方向={lock_signal.upper() or '-'} | 等待当前波失效后再开新单",
             )
             return
         remaining = trader_remaining_quota_steps(draft, self._trader_desk_slots)
@@ -15401,6 +16252,1216 @@ class QuantApp:
         self._refresh_strategy_book_window()
         self.root.after(500, self._refresh_status)
 
+    def _default_line_trading_symbol(self) -> str:
+        default_symbol = (self.symbol.get() or "").strip().upper()
+        if default_symbol:
+            return default_symbol
+        if self.instruments:
+            return self.instruments[0].inst_id
+        return "BTC-USDT-SWAP"
+
+    def _line_trading_symbol_values(self) -> tuple[str, ...]:
+        symbols = sorted({item.inst_id for item in self.instruments if item.inst_id})
+        if not symbols:
+            return (self._default_line_trading_symbol(),)
+        return tuple(symbols)
+
+    def _on_line_trading_desk_api_profile_changed(self) -> None:
+        state = self._line_trading_desk_window
+        if state is None or not _widget_exists(state.window):
+            return
+        current = state.api_profile_var.get().strip()
+        prev = (state.last_desk_api_profile or "").strip()
+        if prev and current != prev:
+            self._line_trading_desk_cancel_motion_chart_paint(state)
+            state.line_annotations.clear()
+            state.rr_annotations.clear()
+            state.draft_line_start = None
+            state.draft_line_current = None
+            state.rr_drag = None
+            state.rr_pick = None
+            state.rr_selected_id = None
+            state.desk_range_zoom_active = False
+        state.last_desk_api_profile = current
+        self._request_line_trading_desk_refresh(immediate=True)
+
+    def _line_trading_desk_reset_chart_view(self) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        state.desk_visible_bars = 200
+        state.desk_range_zoom_active = False
+        state.desk_initial_scroll_done = False
+        snap = state.last_snapshot
+        if snap and snap.candles:
+            n = len(snap.candles)
+            state.desk_view_start = max(0, n - min(state.desk_visible_bars, n))
+            state.desk_initial_scroll_done = True
+        else:
+            state.desk_view_start = 0
+        self._render_line_trading_desk_chart()
+
+    def _on_line_trading_desk_symbol_or_bar_changed(self) -> None:
+        state = self._line_trading_desk_window
+        if state is not None:
+            state.desk_initial_scroll_done = False
+            state.desk_range_zoom_active = False
+        self._request_line_trading_desk_refresh(immediate=True)
+
+    def _line_trading_desk_visible_snapshot(
+        self, state: LineTradingDeskWindowState
+    ) -> tuple[StrategyLiveChartSnapshot, int, int] | None:
+        snap = state.last_snapshot
+        if snap is None or not snap.candles:
+            return None
+        n = len(snap.candles)
+        min_vis = 5 if state.desk_range_zoom_active else 30
+        vb = line_trading_desk_visible_bar_count(n, state.desk_visible_bars, min_bars=min_vis)
+        state.desk_visible_bars = vb
+        vs_max = line_trading_desk_max_view_start(n, vb, min_visible_bars=min_vis)
+        vs = max(0, min(int(state.desk_view_start), vs_max))
+        state.desk_view_start = vs
+        sliced = slice_strategy_live_chart_snapshot_with_desk_right_pad(snap, vs, vb, min_visible_bars=min_vis)
+        return sliced, vs, vb
+
+    def _line_trading_desk_pixel_to_bar_price(
+        self, state: LineTradingDeskWindowState, x: float, y: float
+    ) -> tuple[float, Decimal] | None:
+        """与当前画布一致：按「可见切片」K 线换算 bar 与价格（全量布局会导致错位、线飞到图外）。"""
+        tup = self._line_trading_desk_visible_snapshot(state)
+        if tup is None or state.last_snapshot is None:
+            return None
+        sliced, vs, _vb = tup
+        if not sliced.candles:
+            return None
+        lay = compute_strategy_live_chart_layout(state.canvas, sliced)
+        if lay is None:
+            return None
+        rel_bar = layout_pixel_to_bar_index(lay, x)
+        n_vis = len(sliced.candles)
+        rel_bar = min(max(rel_bar, 0.0), float(max(0, n_vis - 1)))
+        abs_bar = float(vs) + rel_bar
+        price = layout_y_to_price(lay, y)
+        return abs_bar, price
+
+    def _line_trading_desk_slice_layout(self, state: LineTradingDeskWindowState) -> StrategyLiveChartLayout | None:
+        tup = self._line_trading_desk_visible_snapshot(state)
+        if tup is None:
+            return None
+        sliced, _vs, _vb = tup
+        return compute_strategy_live_chart_layout(state.canvas, sliced)
+
+    def _on_line_trading_desk_mouse_wheel(self, event) -> None:
+        state = self._line_trading_desk_window
+        if state is None or not _widget_exists(state.canvas):
+            return
+        snap = state.last_snapshot
+        if not snap or not snap.candles:
+            return
+        n = len(snap.candles)
+        delta = getattr(event, "delta", 0)
+        num = getattr(event, "num", 0)
+        zoom_in = delta > 0 or num == 4
+        floor_b = 5 if state.desk_range_zoom_active else 40
+        if zoom_in:
+            state.desk_visible_bars = max(floor_b, state.desk_visible_bars - max(5, state.desk_visible_bars // 12))
+        else:
+            state.desk_visible_bars = min(n, int(state.desk_visible_bars * 1.15) + 10)
+        self._line_trading_desk_clamp_view(state)
+        self._render_line_trading_desk_chart()
+
+    def _line_trading_desk_clamp_view(self, state: LineTradingDeskWindowState) -> None:
+        snap = state.last_snapshot
+        if not snap or not snap.candles:
+            state.desk_view_start = 0
+            return
+        n = len(snap.candles)
+        min_vis = 5 if state.desk_range_zoom_active else 30
+        vb = line_trading_desk_visible_bar_count(n, state.desk_visible_bars, min_bars=min_vis)
+        state.desk_visible_bars = vb
+        vs_max = line_trading_desk_max_view_start(n, vb, min_visible_bars=min_vis)
+        state.desk_view_start = max(0, min(int(state.desk_view_start), vs_max))
+
+    def _on_line_trading_desk_button_press(self, event) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        if getattr(event, "state", 0) & 0x0001:
+            self._line_trading_desk_clamp_view(state)
+            state.desk_pan_origin = (float(event.x), int(state.desk_view_start))
+            return
+        if state.active_tool != "none":
+            state.draft_line_start = (float(event.x), float(event.y))
+            state.draft_line_current = (float(event.x), float(event.y))
+            self._render_line_trading_desk_chart()
+            return
+        hit = self._line_trading_desk_rr_hit_test(state, float(event.x), float(event.y))
+        if hit is not None:
+            box, handle = hit
+            state.rr_selected_id = box.rr_id
+            if box.locked:
+                state.rr_pick = None
+            else:
+                state.rr_pick = (box.rr_id, handle, float(event.x), float(event.y))
+            self._line_trading_desk_refresh_rr_tree(state)
+            self._render_line_trading_desk_chart()
+            return
+        if state.desk_range_zoom_active:
+            self._line_trading_desk_clamp_view(state)
+            state.desk_pan_origin = (float(event.x), int(state.desk_view_start))
+            self._render_line_trading_desk_chart()
+            return
+        state.rr_selected_id = None
+        state.rr_pick = None
+        self._line_trading_desk_refresh_rr_tree(state)
+        self._render_line_trading_desk_chart()
+
+    def _on_line_trading_desk_button_release(self, event) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        if state.desk_pan_origin is not None:
+            state.desk_pan_origin = None
+            return
+        if state.rr_pick is not None:
+            state.rr_pick = None
+            self._line_trading_desk_refresh_rr_tree(state)
+            self._render_line_trading_desk_chart()
+            return
+        if state.rr_drag is not None:
+            rid, _handle = state.rr_drag
+            state.rr_drag = None
+            box = next((b for b in state.rr_annotations if b.rr_id == rid), None)
+            if box is not None:
+                self._line_trading_desk_rr_snap_prices(state, box)
+            self._line_trading_desk_refresh_rr_tree(state)
+            self._render_line_trading_desk_chart()
+            return
+        if state.draft_line_start is None:
+            return
+        self._line_trading_desk_complete_draw(state, float(event.x), float(event.y))
+        state.draft_line_start = None
+        state.draft_line_current = None
+        self._render_line_trading_desk_chart()
+
+    def _line_trading_desk_complete_draw(self, state: LineTradingDeskWindowState, x: float, y: float) -> None:
+        tool = state.active_tool
+        start = state.draft_line_start
+        if start is None or state.last_snapshot is None or not state.last_snapshot.candles:
+            return
+        end = (x, y)
+        if tool in ("horizontal", "zoom_range"):
+            end = (x, start[1])
+        color = "#1d4ed8"
+        label = "趋势线"
+        if tool == "horizontal":
+            color = "#7c3aed"
+            label = "水平射线"
+        elif tool == "zoom_range":
+            color = "#0f766e"
+            label = "区间放大"
+        elif tool == "stop":
+            color = "#cf222e"
+            label = "止损线"
+        elif tool == "rr":
+            color = "#0b7285"
+            label = "盈亏比"
+        p0 = self._line_trading_desk_pixel_to_bar_price(state, start[0], start[1])
+        p1 = self._line_trading_desk_pixel_to_bar_price(state, end[0], end[1])
+        if p0 is None or p1 is None:
+            state.status_text.set("无法在图上解析价格，请重试。")
+            return
+        bar_a, price_a = p0
+        bar_b, price_b = p1
+        if tool == "horizontal":
+            price_b = price_a = (price_a + price_b) / Decimal("2")
+        if tool == "zoom_range":
+            n_c = len(state.last_snapshot.candles)
+            ba = float(bar_a)
+            bb = float(bar_b)
+            a = max(0, min(int(round(min(ba, bb))), n_c - 1))
+            b = max(0, min(int(round(max(ba, bb))), n_c - 1))
+            if a > b:
+                a, b = b, a
+            span = b - a + 1
+            if span < 3:
+                state.status_text.set("请拖选稍长一些的区间（至少约 3 根K）。")
+                return
+            state.desk_range_zoom_active = True
+            state.desk_visible_bars = span
+            state.desk_view_start = a
+            state.active_tool = "none"
+            self._line_trading_desk_clamp_view(state)
+            state.status_text.set(
+                f"已局部放大：仅显示约第 {a + 1}～{b + 1} 根K（共 {span} 根），区间外已隐藏。点「重置视图」恢复。"
+            )
+            self._enqueue_log(f"[划线交易台] 区间放大 | bars {a}..{b} | span={span}")
+            return
+        if tool == "stop":
+            avg_p = (price_a + price_b) / Decimal("2")
+            state.line_annotations.append(
+                LiveChartLineAnnotation(
+                    kind="stop",
+                    x1=start[0],
+                    y1=start[1],
+                    x2=end[0],
+                    y2=end[1],
+                    color=color,
+                    label=label,
+                    bar_a=bar_a,
+                    price_a=avg_p,
+                    bar_b=bar_b,
+                    price_b=avg_p,
+                )
+            )
+            state.status_text.set("已添加止损线。")
+            return
+        if tool == "rr":
+            try:
+                r_mult = Decimal(str(state.param_rr_r.get().strip() or "2"))
+            except InvalidOperation:
+                r_mult = Decimal("2")
+            if r_mult <= 0:
+                r_mult = Decimal("2")
+            side = state.param_rr_side.get().strip().lower() or "long"
+            if side not in ("long", "short"):
+                side = "long"
+            if side == "long":
+                entry_p = max(price_a, price_b)
+                stop_p = min(price_a, price_b)
+                risk = entry_p - stop_p
+                if risk <= 0:
+                    state.status_text.set("多头盈亏比：止损价须低于入场价。")
+                    return
+                tp_p = entry_p + r_mult * risk
+            else:
+                entry_p = min(price_a, price_b)
+                stop_p = max(price_a, price_b)
+                risk = stop_p - entry_p
+                if risk <= 0:
+                    state.status_text.set("空头盈亏比：止损价须高于入场价。")
+                    return
+                tp_p = entry_p - r_mult * risk
+            bar_mid = (bar_a + bar_b) / 2.0
+            rid = uuid.uuid4().hex[:12]
+            state.rr_annotations.append(
+                DeskRiskRewardAnnotation(
+                    rr_id=rid,
+                    side=side,
+                    bar_entry=bar_mid,
+                    price_entry=entry_p,
+                    bar_stop=bar_mid,
+                    price_stop=stop_p,
+                    price_tp=tp_p,
+                    r_multiple=r_mult,
+                    locked=False,
+                )
+            )
+            state.rr_selected_id = rid
+            self._line_trading_desk_refresh_rr_tree(state)
+            state.active_tool = "none"
+            state.status_text.set(
+                f"已添加{('多' if side == 'long' else '空')}头盈亏框。工具已关闭；点框选中后可拖动；需要再画请再点「盈亏比·多/空」。"
+            )
+            self._enqueue_log(
+                f"[划线交易台] 盈亏比 | {side} | 入={format_decimal(entry_p)} | 损={format_decimal(stop_p)} | 盈={format_decimal(tp_p)} | R={format_decimal(r_mult)}"
+            )
+            return
+        ray_action = (state.param_ray_action.get() or "notify").strip().lower()
+        if ray_action not in ("notify", "long", "short"):
+            ray_action = "notify"
+        state.line_annotations.append(
+            LiveChartLineAnnotation(
+                kind=tool,
+                x1=start[0],
+                y1=start[1],
+                x2=end[0],
+                y2=end[1],
+                color=color,
+                label=label,
+                bar_a=bar_a,
+                price_a=price_a,
+                bar_b=bar_b,
+                price_b=price_b,
+                desk_ray_action=ray_action,
+                desk_ray_triggered=False,
+                desk_ray_last_side=None,
+            )
+        )
+        state.status_text.set(f"已添加{label}，射线默认动作={ray_action}。")
+
+    def _line_trading_desk_refresh_ray_tree(self, state: LineTradingDeskWindowState) -> None:
+        tree = state.ray_tree
+        tree.delete(*tree.get_children())
+        action_labels = {"notify": "仅站内", "long": "开多", "short": "开空"}
+        for index, ann in enumerate(state.line_annotations):
+            if ann.kind not in ("line", "horizontal"):
+                continue
+            if ann.bar_a is None:
+                continue
+            st = "已触发" if ann.desk_ray_triggered else "待命"
+            tree.insert("", END, iid=f"ray-{index}", values=(ann.label, action_labels.get(ann.desk_ray_action, ann.desk_ray_action), st))
+
+    def _line_trading_desk_refresh_rr_tree(self, state: LineTradingDeskWindowState) -> None:
+        tree = state.rr_manage_tree
+        tree.delete(*tree.get_children())
+        for box in state.rr_annotations:
+            tree.insert(
+                "",
+                END,
+                iid=box.rr_id,
+                values=(
+                    "锁" if box.locked else "",
+                    format_decimal(box.price_entry),
+                    format_decimal(box.price_stop),
+                    format_decimal(box.price_tp),
+                    format_decimal(box.r_multiple),
+                ),
+            )
+        if state.rr_selected_id and tree.exists(state.rr_selected_id):
+            tree.selection_set(state.rr_selected_id)
+
+    def _line_trading_desk_on_rr_tree_select(self) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        sel = state.rr_manage_tree.selection()
+        state.rr_selected_id = sel[0] if sel else None
+        self._render_line_trading_desk_chart()
+
+    def _line_trading_desk_toggle_selected_rr_lock(self) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        sel = state.rr_manage_tree.selection()
+        if not sel:
+            messagebox.showinfo("盈亏比", "请先在列表中选择一行。", parent=state.window)
+            return
+        rid = sel[0]
+        for box in state.rr_annotations:
+            if box.rr_id == rid:
+                box.locked = not box.locked
+                break
+        self._line_trading_desk_refresh_rr_tree(state)
+        self._render_line_trading_desk_chart()
+
+    def _line_trading_desk_rr_snap_prices(self, state: LineTradingDeskWindowState, box: DeskRiskRewardAnnotation) -> None:
+        symbol = state.symbol_var.get().strip().upper()
+        try:
+            inst = self.client.get_instrument(symbol)
+        except Exception:
+            return
+        tick = inst.tick_size
+        if tick and tick > 0:
+            box.price_entry = snap_to_increment(box.price_entry, tick, "nearest")
+            box.price_stop = snap_to_increment(box.price_stop, tick, "nearest")
+            box.price_tp = snap_to_increment(box.price_tp, tick, "nearest")
+
+    def _line_trading_desk_cancel_motion_chart_paint(self, state: LineTradingDeskWindowState) -> None:
+        jid = state.desk_chart_paint_job
+        if jid is not None:
+            try:
+                self.root.after_cancel(jid)
+            except Exception:
+                pass
+            state.desk_chart_paint_job = None
+
+    def _request_line_trading_desk_motion_chart_paint(self, state: LineTradingDeskWindowState) -> None:
+        """Pan / 草稿线 / 盈亏拖动时限制全图重绘频率，避免卡顿。"""
+        min_gap = 1.0 / 45.0
+        now = time.monotonic()
+        since = now - float(state.desk_last_chart_paint_t or 0.0)
+        if since >= min_gap:
+            self._line_trading_desk_cancel_motion_chart_paint(state)
+            state.desk_last_chart_paint_t = time.monotonic()
+            self._render_line_trading_desk_chart()
+            return
+        if state.desk_chart_paint_job is not None:
+            return
+        delay_ms = max(1, int((min_gap - since) * 1000))
+
+        def _fire() -> None:
+            state.desk_chart_paint_job = None
+            if self._line_trading_desk_window is not state:
+                return
+            state.desk_last_chart_paint_t = time.monotonic()
+            self._render_line_trading_desk_chart()
+
+        state.desk_chart_paint_job = self.root.after(delay_ms, _fire)
+
+    def _line_trading_desk_rr_hit_test(
+        self, state: LineTradingDeskWindowState, cx: float, cy: float, *, tol: float = 18.0
+    ) -> tuple[DeskRiskRewardAnnotation, str] | None:
+        lay = self._line_trading_desk_slice_layout(state)
+        if lay is None:
+            return None
+        tup = self._line_trading_desk_visible_snapshot(state)
+        if tup is None:
+            return None
+        _sliced, vs, _vb = tup
+        x_outer = 92.0
+        body_half_w = 58.0
+        body_y_pad = 12.0
+        for box in reversed(state.rr_annotations):
+            rel_e = box.bar_entry - float(vs)
+            x_mid = layout_bar_index_to_x_center(lay, rel_e)
+            if abs(cx - x_mid) > x_outer:
+                continue
+            ytp = float(layout_price_to_y(lay, box.price_tp))
+            yey = float(layout_price_to_y(lay, box.price_entry))
+            ysy = float(layout_price_to_y(lay, box.price_stop))
+            for name, yy in (("tp", ytp), ("entry", yey), ("sl", ysy)):
+                if abs(cy - yy) < tol:
+                    return box, name
+            y_top = min(ytp, yey, ysy)
+            y_bot = max(ytp, yey, ysy)
+            if abs(cx - x_mid) <= body_half_w and (y_top - body_y_pad) <= cy <= (y_bot + body_y_pad):
+                return box, "body"
+        return None
+
+    def _line_trading_desk_rr_drag_update(self, state: LineTradingDeskWindowState, cy: float) -> None:
+        if state.rr_drag is None:
+            return
+        rid, handle = state.rr_drag
+        box = next((b for b in state.rr_annotations if b.rr_id == rid), None)
+        if box is None:
+            return
+        lay = self._line_trading_desk_slice_layout(state)
+        if lay is None:
+            return
+        new_p = layout_y_to_price(lay, cy)
+        if box.side == "long":
+            if handle in ("body", "entry"):
+                delta = new_p - box.price_entry
+                box.price_entry += delta
+                box.price_stop += delta
+                box.price_tp += delta
+            elif handle == "sl":
+                stop_p = min(new_p, box.price_entry - Decimal("0.0001"))
+                if stop_p >= box.price_entry:
+                    return
+                box.price_stop = stop_p
+                risk = box.price_entry - box.price_stop
+                if risk > 0:
+                    box.price_tp = box.price_entry + box.r_multiple * risk
+            elif handle == "tp":
+                if new_p <= box.price_entry:
+                    return
+                box.price_tp = new_p
+                risk = box.price_entry - box.price_stop
+                if risk > 0:
+                    box.r_multiple = (box.price_tp - box.price_entry) / risk
+        else:
+            if handle in ("body", "entry"):
+                delta = new_p - box.price_entry
+                box.price_entry += delta
+                box.price_stop += delta
+                box.price_tp += delta
+            elif handle == "sl":
+                stop_p = max(new_p, box.price_entry + Decimal("0.0001"))
+                if stop_p <= box.price_entry:
+                    return
+                box.price_stop = stop_p
+                risk = box.price_stop - box.price_entry
+                if risk > 0:
+                    box.price_tp = box.price_entry - box.r_multiple * risk
+            elif handle == "tp":
+                if new_p >= box.price_entry:
+                    return
+                box.price_tp = new_p
+                risk = box.price_stop - box.price_entry
+                if risk > 0:
+                    box.r_multiple = (box.price_entry - box.price_tp) / risk
+
+    def _line_trading_desk_submit_rr_bracket_order(
+        self,
+        state: LineTradingDeskWindowState,
+        box: DeskRiskRewardAnnotation,
+        direction: str,
+    ) -> None:
+        if box.side != direction:
+            state.status_text.set(f"当前框为「{'多' if box.side == 'long' else '空'}头」计划，请用对应按钮。")
+            return
+        symbol = state.symbol_var.get().strip().upper()
+        profile = state.api_profile_var.get().strip()
+        credentials = self._credentials_for_profile_or_none(profile)
+        if credentials is None:
+            state.status_text.set("未配置API，无法下单。")
+            return
+        try:
+            instrument = self.client.get_instrument(symbol)
+        except Exception as exc:
+            state.status_text.set(f"读取标的失败：{exc}")
+            return
+        self._line_trading_desk_rr_snap_prices(state, box)
+        entry = box.price_entry
+        sl = box.price_stop
+        tp = box.price_tp
+        if direction == "long" and not (sl < entry < tp):
+            state.status_text.set("多头：须满足 止损 < 入场 < 止盈。")
+            return
+        if direction == "short" and not (tp < entry < sl):
+            state.status_text.set("空头：须满足 止盈 < 入场 < 止损。")
+            return
+        try:
+            risk_raw = str(state.param_risk_amount.get()).strip() or "0"
+            risk_amount = Decimal(risk_raw)
+        except InvalidOperation:
+            state.status_text.set("风险金格式无效。")
+            return
+        if risk_amount <= 0:
+            state.status_text.set("风险金必须大于0。")
+            return
+        config = replace(self._template_record_from_launcher().config, inst_id=symbol, trade_inst_id=symbol)
+        try:
+            size = determine_order_size(
+                instrument=instrument,
+                config=replace(config, risk_amount=risk_amount, order_size=None),
+                entry_price=entry,
+                stop_loss=sl,
+                risk_price_compatible=True,
+            )
+        except Exception as exc:
+            state.status_text.set(f"定量失败：{exc}")
+            return
+        side = "buy" if direction == "long" else "sell"
+        pos_side = resolve_open_pos_side(config.position_mode, side)
+        atr_period = max(1, int(str(state.param_atr_period.get()).strip() or "10"))
+        atr_vals = atr(list(state.last_snapshot.candles), atr_period) if state.last_snapshot else []
+        atr_val = atr_vals[-1] if atr_vals and atr_vals[-1] is not None else Decimal("1")
+        if atr_val <= 0:
+            atr_val = Decimal("1")
+        last_ts = state.last_snapshot.candles[-1].ts if state.last_snapshot and state.last_snapshot.candles else 0
+        plan = OrderPlan(
+            inst_id=symbol,
+            side=side,
+            pos_side=pos_side,
+            size=size,
+            take_profit=tp,
+            stop_loss=sl,
+            entry_reference=entry,
+            atr_value=atr_val,
+            signal="long" if direction == "long" else "short",
+            candle_ts=last_ts,
+            tp_sl_inst_id=symbol,
+            tp_sl_mode="exchange",
+        )
+        try:
+            result = self.client.place_limit_order(
+                credentials,
+                config,
+                plan,
+                include_take_profit=True,
+                include_attached_protection=True,
+            )
+        except Exception as exc:
+            state.status_text.set(f"条件限价单失败：{exc}")
+            return
+        state.status_text.set(
+            f"已提交限价+TP/SL | {symbol} | sz={format_decimal(size)} | ordId={result.ord_id or '-'}"
+        )
+        self._enqueue_log(
+            f"[划线交易台] 盈亏比限价+附带TP/SL | {direction.upper()} | {symbol} | 入={format_decimal(entry)} | "
+            f"损={format_decimal(sl)} | 盈={format_decimal(tp)} | sz={format_decimal(size)} | ordId={result.ord_id or '-'}"
+        )
+
+    def _line_trading_desk_draw_ray_on_canvas(
+        self,
+        state: LineTradingDeskWindowState,
+        ann: LiveChartLineAnnotation,
+        layout: StrategyLiveChartLayout,
+        view_start: int,
+    ) -> None:
+        if ann.bar_a is None or ann.price_a is None or ann.bar_b is None or ann.price_b is None:
+            canvas = state.canvas
+            canvas.create_line(ann.x1, ann.y1, ann.x2, ann.y2, fill=ann.color, width=2, tags=("desk_line",))
+            if ann.label:
+                canvas.create_text(
+                    ann.x2 + 4,
+                    ann.y2 - 4,
+                    anchor="sw",
+                    text=ann.label,
+                    fill=ann.color,
+                    font=("Microsoft YaHei UI", 9),
+                    tags=("desk_line",),
+                )
+            return
+        bar_a = ann.bar_a
+        bar_b = ann.bar_b
+        rel_a = bar_a - float(view_start)
+        rel_b = bar_b - float(view_start)
+        x_a = layout_bar_index_to_x_center(layout, rel_a)
+        x_b = layout_bar_index_to_x_center(layout, rel_b)
+        y_a = layout_price_to_y(layout, ann.price_a)
+        y_b = layout_price_to_y(layout, ann.price_b)
+        dx = x_b - x_a
+        dy = y_b - y_a
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return
+        big = float(max(layout.right - layout.left, layout.bottom - layout.top, 1.0)) * 4.0
+        if dx >= 0:
+            x_far = layout.right + big
+        else:
+            x_far = layout.left - big
+        if abs(dx) < 1e-9:
+            x2 = x_a
+            y2 = float(y_b + (y_b - y_a) * big)
+        else:
+            t = (x_far - x_b) / dx
+            x2 = x_far
+            y2 = float(y_b + t * dy)
+        canvas = state.canvas
+        canvas.create_line(x_a, y_a, x_b, y_b, fill=ann.color, width=2, tags=("desk_line",))
+        canvas.create_line(x_b, y_b, x2, y2, fill=ann.color, width=2, dash=(6, 4), tags=("desk_line",))
+        canvas.create_text(
+            min(x_b + 6, layout.right - 4),
+            y_b - 6,
+            anchor="sw",
+            text=ann.label,
+            fill=ann.color,
+            font=("Microsoft YaHei UI", 9),
+            tags=("desk_line",),
+        )
+
+    def _line_trading_desk_draw_rr_zones(
+        self, state: LineTradingDeskWindowState, layout: StrategyLiveChartLayout, view_start: int
+    ) -> None:
+        canvas = state.canvas
+        for box in state.rr_annotations:
+            rel_e = box.bar_entry - float(view_start)
+            rel_s = box.bar_stop - float(view_start)
+            x_mid = layout_bar_index_to_x_center(layout, (rel_e + rel_s) / 2)
+            entry_y = layout_price_to_y(layout, box.price_entry)
+            stop_y = layout_price_to_y(layout, box.price_stop)
+            profit_y = layout_price_to_y(layout, box.price_tp)
+            risk = abs(box.price_entry - box.price_stop)
+            if risk <= 0:
+                continue
+            sel = state.rr_selected_id == box.rr_id
+            ow = 3 if sel else 1
+            if box.side == "long":
+                top_y = min(entry_y, profit_y)
+                bot_y = max(stop_y, entry_y)
+                canvas.create_rectangle(
+                    x_mid - 36,
+                    top_y,
+                    x_mid + 36,
+                    entry_y,
+                    outline="#137333",
+                    width=ow,
+                    tags=("desk_rr",),
+                )
+                canvas.create_rectangle(
+                    x_mid - 36,
+                    entry_y,
+                    x_mid + 36,
+                    bot_y,
+                    outline="#cf222e",
+                    width=ow,
+                    tags=("desk_rr",),
+                )
+            else:
+                top_y = min(stop_y, entry_y)
+                bot_y = max(entry_y, profit_y)
+                canvas.create_rectangle(
+                    x_mid - 36,
+                    top_y,
+                    x_mid + 36,
+                    entry_y,
+                    outline="#cf222e",
+                    width=ow,
+                    tags=("desk_rr",),
+                )
+                canvas.create_rectangle(
+                    x_mid - 36,
+                    entry_y,
+                    x_mid + 36,
+                    bot_y,
+                    outline="#137333",
+                    width=ow,
+                    tags=("desk_rr",),
+                )
+            for y, dash in ((entry_y, (4, 2)), (stop_y, (2, 2)), (profit_y, (4, 4))):
+                canvas.create_line(
+                    x_mid - 40, y, x_mid + 40, y, fill="#374151", width=1, dash=dash, tags=("desk_rr",)
+                )
+            rr_txt = f"RR×{format_decimal(box.r_multiple)}{' 锁' if box.locked else ''}"
+            canvas.create_text(
+                x_mid, min(entry_y, stop_y, profit_y) - 12, text=rr_txt, fill="#0b7285", tags=("desk_rr",)
+            )
+
+    def _line_trading_desk_eval_ray_triggers(self, state: LineTradingDeskWindowState) -> None:
+        snap = state.last_snapshot
+        if not snap or len(snap.candles) < 2:
+            return
+        mode = (state.param_cross_mode.get() or "tick_last").strip()
+        if mode == "close":
+            px = snap.candles[-1].close
+        else:
+            px = snap.latest_price or snap.candles[-1].close
+        bar_now = float(len(snap.candles) - 1)
+        for ann in state.line_annotations:
+            if ann.kind not in ("line", "horizontal") or ann.desk_ray_triggered:
+                continue
+            if ann.bar_a is None or ann.price_a is None or ann.bar_b is None or ann.price_b is None:
+                continue
+            line_p = line_price_through_anchors(ann.bar_a, ann.price_a, ann.bar_b, ann.price_b, bar_now)
+            diff = px - line_p
+            side = 0 if diff == 0 else (1 if diff > 0 else -1)
+            if ann.desk_ray_last_side is None:
+                ann.desk_ray_last_side = side
+                continue
+            if side == 0:
+                continue
+            if side == ann.desk_ray_last_side:
+                continue
+            ann.desk_ray_triggered = True
+            self._line_trading_desk_fire_ray_trigger(state, ann, px, line_p)
+
+    def _line_trading_desk_fire_ray_trigger(
+        self,
+        state: LineTradingDeskWindowState,
+        ann: LiveChartLineAnnotation,
+        px: Decimal,
+        line_p: Decimal,
+    ) -> None:
+        sym = state.symbol_var.get().strip().upper()
+        action = (ann.desk_ray_action or "notify").strip().lower()
+        self._enqueue_log(
+            f"[划线交易台·触发] {sym} | {ann.label} | 价={format_decimal(px)} | 线≈{format_decimal(line_p)} | 动作={action}"
+        )
+        if action == "long":
+            self._submit_line_trading_desk_order("long")
+        elif action == "short":
+            self._submit_line_trading_desk_order("short")
+
+    def _close_line_trading_desk_window(self) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        self._line_trading_desk_cancel_motion_chart_paint(state)
+        if state.refresh_job is not None:
+            try:
+                self.root.after_cancel(state.refresh_job)
+            except Exception:
+                pass
+            state.refresh_job = None
+        if _widget_exists(state.window):
+            state.window.destroy()
+        self._line_trading_desk_window = None
+
+    def _request_line_trading_desk_refresh(self, *, immediate: bool = False) -> None:
+        state = self._line_trading_desk_window
+        if state is None or not _widget_exists(state.window):
+            return
+        if state.refresh_job is not None:
+            try:
+                self.root.after_cancel(state.refresh_job)
+            except Exception:
+                pass
+            state.refresh_job = None
+        delay = 10 if immediate else DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS
+        state.refresh_job = self.root.after(delay, self._run_line_trading_desk_refresh)
+
+    def _run_line_trading_desk_refresh(self) -> None:
+        state = self._line_trading_desk_window
+        if state is None or not _widget_exists(state.window):
+            return
+        state.refresh_job = None
+        symbol = state.symbol_var.get().strip().upper()
+        bar = state.bar_var.get().strip()
+        if not symbol or not bar:
+            state.status_text.set("请先选择标的和周期。")
+            return
+        profile = state.api_profile_var.get().strip()
+        credentials = self._credentials_for_profile_or_none(profile)
+        if credentials is None:
+            state.status_text.set("未配置所选 API 凭证。")
+            return
+        env_label = self._environment_label_for_profile(profile or self._current_credential_profile())
+        environment = ENV_OPTIONS[self._normalized_environment_label(env_label)]
+        state.status_text.set(f"正在刷新：{symbol} / {bar} | API={profile or '-'}")
+        threading.Thread(
+            target=self._line_trading_desk_refresh_worker,
+            args=(symbol, bar, credentials, environment, profile),
+            daemon=True,
+        ).start()
+
+    def _line_trading_desk_refresh_worker(
+        self,
+        symbol: str,
+        bar: str,
+        credentials: Credentials,
+        environment: str,
+        profile_name: str,
+    ) -> None:
+        try:
+            candles = self.client.get_candles_history(symbol, bar, limit=LINE_TRADING_DESK_CANDLE_TARGET)
+            latest_price = candles[-1].close if candles else None
+            try:
+                ticker = self.client.get_ticker(symbol)
+                if ticker.last is not None:
+                    latest_price = ticker.last
+            except Exception:
+                pass
+            snapshot = build_strategy_live_chart_snapshot(
+                session_id=f"desk:{symbol}",
+                candles=candles,
+                ema_period=21,
+                trend_ema_period=55,
+                reference_ema_period=21,
+                latest_price=latest_price,
+                note=f"划线交易台 | {symbol} | {bar} | API={profile_name or '-'} | K={len(candles)}",
+            )
+            positions = self.client.get_positions(credentials, environment=environment)
+        except Exception as exc:
+            self.root.after(0, lambda msg=str(exc): self._apply_line_trading_desk_error(msg))
+            return
+        self.root.after(0, lambda: self._apply_line_trading_desk_snapshot(snapshot, positions))
+
+    def _apply_line_trading_desk_error(self, message: str) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        state.status_text.set(f"刷新失败：{message}")
+        self._request_line_trading_desk_refresh(immediate=False)
+
+    def _apply_line_trading_desk_snapshot(
+        self,
+        snapshot: StrategyLiveChartSnapshot,
+        positions: list[OkxPosition],
+    ) -> None:
+        state = self._line_trading_desk_window
+        if state is None or not _widget_exists(state.window):
+            return
+        state.last_snapshot = snapshot
+        n = len(snapshot.candles)
+        if n > 0 and not state.desk_initial_scroll_done:
+            state.desk_view_start = max(0, n - min(state.desk_visible_bars, n))
+            state.desk_initial_scroll_done = True
+        self._line_trading_desk_clamp_view(state)
+        self._line_trading_desk_eval_ray_triggers(state)
+        state.latest_positions = [item for item in positions if item.inst_id == state.symbol_var.get().strip().upper()]
+        self._render_line_trading_desk_chart()
+        self._line_trading_desk_refresh_ray_tree(state)
+        self._line_trading_desk_refresh_rr_tree(state)
+        tree = state.position_tree
+        selected = tree.selection()[0] if tree.selection() else None
+        tree.delete(*tree.get_children())
+        for index, item in enumerate(state.latest_positions):
+            iid = f"desk-pos-{index}"
+            tree.insert(
+                "",
+                END,
+                iid=iid,
+                values=(
+                    item.inst_id,
+                    item.pos_side or "-",
+                    format_decimal(item.position),
+                    _format_optional_decimal(item.avg_price),
+                    _format_optional_decimal(item.mark_price),
+                    _format_optional_decimal(item.unrealized_pnl),
+                ),
+            )
+        if selected and tree.exists(selected):
+            tree.selection_set(selected)
+        elif tree.get_children():
+            tree.selection_set(tree.get_children()[0])
+        state.status_text.set(
+            f"已刷新 {state.symbol_var.get().strip().upper()} | K线 {len(snapshot.candles)} 根 | 持仓 {len(state.latest_positions)} 条"
+        )
+        self._request_line_trading_desk_refresh(immediate=False)
+
+    def _render_line_trading_desk_chart(self) -> None:
+        state = self._line_trading_desk_window
+        if state is None or not _widget_exists(state.canvas):
+            return
+        self._line_trading_desk_cancel_motion_chart_paint(state)
+        snapshot = state.last_snapshot
+        if snapshot is None:
+            snapshot = StrategyLiveChartSnapshot(
+                session_id="desk:empty",
+                candles=(),
+                note="等待加载K线...",
+            )
+            render_strategy_live_chart(state.canvas, snapshot)
+            return
+        if not snapshot.candles:
+            render_strategy_live_chart(state.canvas, snapshot)
+            return
+        tup = self._line_trading_desk_visible_snapshot(state)
+        if tup is None:
+            render_strategy_live_chart(state.canvas, snapshot)
+            return
+        sliced, vs, _vb = tup
+        render_strategy_live_chart(state.canvas, sliced)
+        layout = compute_strategy_live_chart_layout(state.canvas, sliced)
+        if layout is not None:
+            for ann in state.line_annotations:
+                if ann.kind in ("line", "horizontal"):
+                    self._line_trading_desk_draw_ray_on_canvas(state, ann, layout, vs)
+                elif ann.kind == "stop":
+                    self._line_trading_desk_draw_stop_line(state, ann, layout, vs)
+            self._line_trading_desk_draw_rr_zones(state, layout, vs)
+        self._draw_line_annotations(state.canvas, [], state.draft_line_start, state.draft_line_current)
+
+    def _line_trading_desk_draw_stop_line(
+        self,
+        state: LineTradingDeskWindowState,
+        ann: LiveChartLineAnnotation,
+        layout: StrategyLiveChartLayout,
+        view_start: int,
+    ) -> None:
+        canvas = state.canvas
+        if ann.price_a is not None:
+            y = layout_price_to_y(layout, ann.price_a)
+            canvas.create_line(layout.left, y, layout.right, y, fill=ann.color, width=2, dash=(5, 3), tags=("desk_line",))
+            canvas.create_text(
+                layout.right - 6,
+                y - 6,
+                anchor="e",
+                text=ann.label or "止损",
+                fill=ann.color,
+                font=("Microsoft YaHei UI", 9),
+                tags=("desk_line",),
+            )
+            return
+        canvas.create_line(ann.x1, ann.y1, ann.x2, ann.y2, fill=ann.color, width=2, tags=("desk_line",))
+
+    def _set_line_trading_desk_tool(self, tool: str) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        state.active_tool = tool
+        state.rr_pick = None
+        labels = {
+            "line": "趋势线(射线)",
+            "horizontal": "水平射线",
+            "stop": "止损线",
+            "zoom_range": "区间放大（横拖选定K线，远端隐藏）",
+            "none": "无（可选中拖动盈亏比框）",
+        }
+        state.status_text.set(f"当前画线工具：{labels.get(tool, tool)}")
+        self._render_line_trading_desk_chart()
+
+    def _set_line_trading_desk_rr_draw(self, side: str) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        side = side.strip().lower()
+        if side not in ("long", "short"):
+            side = "long"
+        state.param_rr_side.set(side)
+        state.active_tool = "rr"
+        state.rr_pick = None
+        state.draft_line_start = None
+        state.draft_line_current = None
+        lab = "多头" if side == "long" else "空头"
+        state.status_text.set(
+            f"{lab}盈亏比：拖一次定两点画好一张框（画完自动退出工具）；无工具时点框可选中，再按住拖动。"
+        )
+        self._render_line_trading_desk_chart()
+
+    def _clear_line_trading_desk_lines(self) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        self._line_trading_desk_cancel_motion_chart_paint(state)
+        state.line_annotations.clear()
+        state.rr_annotations.clear()
+        state.draft_line_start = None
+        state.draft_line_current = None
+        state.desk_pan_origin = None
+        state.rr_drag = None
+        state.rr_pick = None
+        state.rr_selected_id = None
+        self._line_trading_desk_refresh_rr_tree(state)
+        self._render_line_trading_desk_chart()
+        state.status_text.set("已清空画线。")
+
+    def _on_line_trading_desk_mouse_move(self, event) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        if state.desk_pan_origin is not None:
+            lay = self._line_trading_desk_slice_layout(state)
+            if lay is None:
+                return
+            x0, v0 = state.desk_pan_origin
+            delta_x = float(event.x) - x0
+            step = max(lay.candle_step, 1e-9)
+            dv = int(round(-delta_x / step))
+            state.desk_view_start = max(0, v0 + dv)
+            self._line_trading_desk_clamp_view(state)
+            self._request_line_trading_desk_motion_chart_paint(state)
+            return
+        if state.rr_pick is not None:
+            rid, handle, px, py = state.rr_pick
+            dx = float(event.x) - px
+            dy = float(event.y) - py
+            if dx * dx + dy * dy >= 36.0:
+                state.rr_drag = (rid, handle)
+                state.rr_pick = None
+                self._line_trading_desk_rr_drag_update(state, float(event.y))
+                self._request_line_trading_desk_motion_chart_paint(state)
+            return
+        if state.rr_drag is not None:
+            self._line_trading_desk_rr_drag_update(state, float(event.y))
+            self._request_line_trading_desk_motion_chart_paint(state)
+            return
+        if state.draft_line_start is None:
+            return
+        if state.active_tool == "zoom_range":
+            state.draft_line_current = (float(event.x), state.draft_line_start[1])
+        else:
+            state.draft_line_current = (float(event.x), float(event.y))
+        self._request_line_trading_desk_motion_chart_paint(state)
+
+    def _line_trading_desk_stop_price(self) -> Decimal | None:
+        state = self._line_trading_desk_window
+        if state is None or state.last_snapshot is None or not state.last_snapshot.candles:
+            return None
+        stop_lines = [item for item in state.line_annotations if item.kind == "stop"]
+        if not stop_lines:
+            return None
+        last = stop_lines[-1]
+        if last.price_a is not None:
+            if last.price_b is not None:
+                return (last.price_a + last.price_b) / Decimal("2")
+            return last.price_a
+        low, high = strategy_live_chart_price_bounds(state.last_snapshot)
+        canvas_height = max(state.canvas.winfo_height(), 1)
+        top = 26
+        bottom = max(canvas_height - 44, top + 1)
+        ratio = min(max((last.y1 - top) / max(bottom - top, 1), 0.0), 1.0)
+        return high - (high - low) * Decimal(str(ratio))
+
+    def _submit_line_trading_desk_order(self, direction: str) -> None:
+        state = self._line_trading_desk_window
+        if state is None or state.last_snapshot is None or not state.last_snapshot.candles:
+            return
+        profile = state.api_profile_var.get().strip()
+        credentials = self._credentials_for_profile_or_none(profile)
+        if credentials is None:
+            state.status_text.set("未配置API，无法下单。")
+            return
+        symbol = state.symbol_var.get().strip().upper()
+        try:
+            instrument = self.client.get_instrument(symbol)
+        except Exception as exc:
+            state.status_text.set(f"读取标的失败：{exc}")
+            return
+        if state.rr_selected_id:
+            rr_box = next((b for b in state.rr_annotations if b.rr_id == state.rr_selected_id), None)
+            if rr_box is not None:
+                self._line_trading_desk_submit_rr_bracket_order(state, rr_box, direction)
+                return
+        entry_price = state.last_snapshot.latest_price or state.last_snapshot.candles[-1].close
+        stop_price = self._line_trading_desk_stop_price()
+        if stop_price is None:
+            try:
+                atr_period = max(1, int(str(state.param_atr_period.get()).strip() or "10"))
+            except ValueError:
+                atr_period = 10
+            try:
+                atr_mult = Decimal(str(state.param_atr_mult.get()).strip() or "1")
+            except InvalidOperation:
+                atr_mult = Decimal("1")
+            atr_values = atr(list(state.last_snapshot.candles), atr_period)
+            if not atr_values or atr_values[-1] is None or atr_values[-1] <= 0:
+                state.status_text.set("缺少止损线且ATR不可用。")
+                return
+            atr_value = atr_values[-1] * atr_mult
+            prev = state.last_snapshot.candles[-2]
+            if direction == "long":
+                stop_price = prev.low - atr_value
+            else:
+                stop_price = prev.high + atr_value
+        config = replace(self._template_record_from_launcher().config, inst_id=symbol, trade_inst_id=symbol)
+        try:
+            risk_raw = str(state.param_risk_amount.get()).strip() or "0"
+            risk_amount = Decimal(risk_raw)
+        except InvalidOperation:
+            state.status_text.set("风险金格式无效。")
+            return
+        if risk_amount <= 0:
+            state.status_text.set("风险金必须大于0。")
+            return
+        try:
+            size = determine_order_size(
+                instrument=instrument,
+                config=replace(config, risk_amount=risk_amount, order_size=None),
+                entry_price=entry_price,
+                stop_loss=stop_price,
+                risk_price_compatible=True,
+            )
+        except Exception as exc:
+            state.status_text.set(f"定量失败：{exc}")
+            return
+        side = "buy" if direction == "long" else "sell"
+        pos_side = resolve_open_pos_side(config.position_mode, side)
+        try:
+            result = self.client.place_simple_order(
+                credentials,
+                config,
+                inst_id=symbol,
+                side=side,
+                size=size,
+                ord_type="limit",
+                pos_side=pos_side,
+                price=entry_price,
+            )
+        except Exception as exc:
+            state.status_text.set(f"下单失败：{exc}")
+            return
+        state.status_text.set(
+            f"已提交{('多' if direction == 'long' else '空')}单 | {symbol} | size={format_decimal(size)} | ordId={result.ord_id or '-'}"
+        )
+        self._enqueue_log(
+            f"[划线交易台] 提交{direction.upper()}单 | 标的={symbol} | 开仓价={format_decimal(entry_price)} | "
+            f"止损={format_decimal(stop_price)} | 数量={format_decimal(size)} | ordId={result.ord_id or '-'}"
+        )
+
+    def _line_trading_desk_selected_position(self) -> OkxPosition | None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return None
+        selection = state.position_tree.selection()
+        if not selection:
+            return None
+        index = _history_tree_index(selection[0], "desk-pos")
+        if index is None or index >= len(state.latest_positions):
+            return None
+        return state.latest_positions[index]
+
+    def _line_trading_desk_flatten_selected(self, flatten_mode: str) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        position = self._line_trading_desk_selected_position()
+        if position is None:
+            messagebox.showinfo("平仓", "请先在持仓列表里选中一条记录。", parent=state.window)
+            return
+        prev_ctx = self._positions_context_profile_name
+        try:
+            self._positions_context_profile_name = state.api_profile_var.get().strip()
+            result, price, normalized_flatten_mode = self._submit_selected_position_manual_flatten(position, flatten_mode)
+        except Exception as exc:
+            messagebox.showerror("平仓失败", str(exc), parent=state.window)
+            return
+        finally:
+            self._positions_context_profile_name = prev_ctx
+        mode_label = self._position_manual_flatten_mode_label(normalized_flatten_mode)
+        state.status_text.set(
+            f"已提交平仓 | {position.inst_id} | 方式={mode_label} | ordId={result.ord_id or '-'}"
+        )
+        self._enqueue_log(
+            f"[划线交易台] 提交平仓 | 合约={position.inst_id} | 方式={mode_label} | ordId={result.ord_id or '-'}"
+        )
+        if normalized_flatten_mode == "best_quote" and price is not None:
+            self._enqueue_log(f"[划线交易台] 平仓挂单价={format_decimal(price)}")
+        self._request_line_trading_desk_refresh(immediate=True)
+
     def _on_close(self) -> None:
         confirmed = messagebox.askyesno(
             "确认关闭",
@@ -15437,6 +17498,7 @@ class QuantApp:
         self._close_strategy_history_window()
         self._close_strategy_book_window()
         self._close_all_strategy_live_chart_windows()
+        self._close_line_trading_desk_window()
         self._close_settings_window()
         if self._backtest_window is not None and self._backtest_window.window.winfo_exists():
             self._backtest_window.window.destroy()
@@ -17569,11 +19631,27 @@ def _format_protection_trigger_price_type(trigger_price_type: str) -> str:
     return "标记价" if trigger_price_type == "mark" else "最新价"
 
 
+def _normalize_okx_timestamp_ms(timestamp_value: int | None) -> int | None:
+    if timestamp_value is None or timestamp_value <= 0:
+        return None
+    normalized = int(timestamp_value)
+    if normalized >= 1_000_000_000_000_000:
+        normalized //= 1_000_000
+    elif normalized >= 1_000_000_000_000:
+        normalized //= 1_000
+    if normalized < 100_000_000_000:
+        normalized *= 1000
+    if normalized < 1_262_304_000_000:
+        return None
+    return normalized
+
+
 def _format_okx_ms_timestamp(timestamp_ms: int | None) -> str:
-    if timestamp_ms is None or timestamp_ms <= 0:
+    normalized = _normalize_okx_timestamp_ms(timestamp_ms)
+    if normalized is None:
         return "-"
     try:
-        return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(normalized / 1000).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return "-"
 
@@ -18163,10 +20241,15 @@ def _history_display_amount(
     instrument = _resolve_history_instrument(inst_id=inst_id, inst_type=inst_type, instruments=instruments)
     if instrument is None or instrument.ct_val is None or instrument.ct_val <= 0 or not instrument.ct_val_ccy:
         normalized_type = (inst_type or "").upper()
+        quote_currency = (_extract_quote_key(inst_id) or "").upper()
+        base_currency = _extract_asset_key(inst_id).upper()
+        if normalized_type == "FUTURES" and quote_currency in {"USD", "USDT", "USDC"} and reference_price is not None and reference_price > 0 and base_currency:
+            # Expired futures may not be returned by public instrument list.
+            # For USD-like quoted futures, use notional/price fallback to show coin amount.
+            return abs(size) / reference_price, base_currency
         if normalized_type in {"SWAP", "FUTURES", "OPTION"}:
             return abs(size), "张"
-        asset_currency = _extract_asset_key(inst_id).upper()
-        return size, asset_currency if asset_currency else None
+        return size, base_currency if base_currency else None
 
     multiplier = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
     payout_currency = instrument.ct_val_ccy.upper()

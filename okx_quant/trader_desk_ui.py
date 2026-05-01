@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
@@ -1188,7 +1189,32 @@ class TraderDeskWindow:
         return f"T{self._trader_counter:03d}"
 
     def _append_log(self, message: str) -> None:
-        self._logger(f"[交易员管理台] {message}")
+        text = str(message or "").strip()
+        trader_id = self._extract_trader_id_from_log_message(text)
+        api_name = self._trader_api_name(trader_id) if trader_id else ""
+        if api_name:
+            self._logger(f"[{api_name}] [交易员管理台] {text}")
+        else:
+            self._logger(f"[交易员管理台] {text}")
+
+    @staticmethod
+    def _extract_trader_id_from_log_message(message: str) -> str:
+        match = re.search(r"\[(T\d{3})\]", str(message or ""))
+        if match is None:
+            return ""
+        return match.group(1)
+
+    def _trader_api_name(self, trader_id: str) -> str:
+        normalized = str(trader_id or "").strip()
+        if not normalized:
+            return ""
+        snapshot = getattr(self, "_snapshot", None)
+        drafts = getattr(snapshot, "drafts", ()) if snapshot is not None else ()
+        draft = next((item for item in drafts if item.trader_id == normalized), None)
+        if draft is None:
+            return ""
+        payload = draft.template_payload if isinstance(draft.template_payload, dict) else {}
+        return str(payload.get("api_name") or "").strip()
 
     def _clear_pending_delete(self, trader_id: str, *, reason: str = "") -> None:
         if self._pending_delete_trader_id != trader_id:

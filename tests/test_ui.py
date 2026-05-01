@@ -41,7 +41,9 @@ from okx_quant.ui import (
     _filter_position_history_items,
     _filter_positions,
     _format_network_error_message,
+    _format_okx_ms_timestamp,
     _format_position_note_summary,
+    _history_display_amount,
     _infer_session_runtime_status,
     _inherit_position_history_notes,
     _mark_refresh_health_failure,
@@ -109,6 +111,17 @@ class UiHelpersTest(TestCase):
         text = _format_trade_order_coin_size(order, {})  # type: ignore[arg-type]
         self.assertIn("20 张", text)
 
+    def test_history_display_amount_futures_without_instrument_prefers_coin_amount(self) -> None:
+        amount, currency = _history_display_amount(
+            inst_id="BTC-USDC-241227",
+            inst_type="FUTURES",
+            size=Decimal("100"),
+            reference_price=Decimal("25000"),
+            instruments={},
+        )
+        self.assertEqual(currency, "BTC")
+        self.assertEqual(amount, Decimal("0.004"))
+
     def test_merge_history_cache_records_prefers_remote_duplicates(self) -> None:
         local_records = [
             {"order_id": "1001", "inst_id": "BTC-USDT-SWAP", "state": "live"},
@@ -142,6 +155,19 @@ class UiHelpersTest(TestCase):
             _format_network_error_message("Remote end closed connection without response"),
             "\u4ea4\u6613\u6240\u63d0\u524d\u65ad\u5f00\u8fde\u63a5\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002",
         )
+
+    def test_format_okx_ms_timestamp_supports_second_and_microsecond(self) -> None:
+        self.assertEqual(
+            _format_okx_ms_timestamp(1710976500),
+            _format_okx_ms_timestamp(1710976500000),
+        )
+        self.assertEqual(
+            _format_okx_ms_timestamp(1710976500000000),
+            _format_okx_ms_timestamp(1710976500000),
+        )
+
+    def test_format_okx_ms_timestamp_filters_implausible_old_time(self) -> None:
+        self.assertEqual(_format_okx_ms_timestamp(1080000000000), "-")
 
     def test_format_network_error_message_summarizes_cloudflare_html_502(self) -> None:
         message = """

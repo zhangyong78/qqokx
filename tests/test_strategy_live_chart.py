@@ -9,6 +9,9 @@ from okx_quant.strategy_live_chart import (
     StrategyLiveChartSnapshot,
     StrategyLiveChartTimeMarker,
     build_strategy_live_chart_snapshot,
+    line_trading_desk_max_view_start,
+    line_trading_desk_visible_bar_count,
+    slice_strategy_live_chart_snapshot_with_desk_right_pad,
     strategy_live_chart_price_bounds,
 )
 
@@ -106,3 +109,56 @@ class StrategyLiveChartHelpersTest(TestCase):
 
         self.assertEqual(len(snapshot.time_markers), 1)
         self.assertEqual(snapshot.time_markers[0].label, "平仓 04-29 10:00")
+
+    def test_slice_with_desk_right_pad_fills_visible_width(self) -> None:
+        candles = [
+            Candle(ts=1000 + i * 60, open=Decimal("100"), high=Decimal("101"), low=Decimal("99"), close=Decimal("100"), volume=Decimal("1"), confirmed=True)
+            for i in range(80)
+        ]
+        snap = build_strategy_live_chart_snapshot(
+            session_id="desk",
+            candles=candles,
+            ema_period=None,
+            trend_ema_period=None,
+            reference_ema_period=None,
+        )
+        n = len(snap.candles)
+        vb = line_trading_desk_visible_bar_count(n, 30)
+        vs_max = line_trading_desk_max_view_start(n, vb)
+        self.assertGreaterEqual(vs_max, max(0, n - vb))
+        sliced = slice_strategy_live_chart_snapshot_with_desk_right_pad(snap, vs_max, vb)
+        self.assertEqual(len(sliced.candles), vb)
+        for s in sliced.series:
+            self.assertEqual(len(s.values), vb)
+
+    def test_slice_with_desk_right_pad_respects_low_min_visible(self) -> None:
+        candles = [
+            Candle(ts=1000 + i * 60, open=Decimal("100"), high=Decimal("101"), low=Decimal("99"), close=Decimal("100"), volume=Decimal("1"), confirmed=True)
+            for i in range(60)
+        ]
+        snap = build_strategy_live_chart_snapshot(
+            session_id="desk",
+            candles=candles,
+            ema_period=None,
+            trend_ema_period=None,
+            reference_ema_period=None,
+        )
+        sliced = slice_strategy_live_chart_snapshot_with_desk_right_pad(snap, 0, 12, min_visible_bars=5)
+        self.assertEqual(len(sliced.candles), 12)
+
+    def test_slice_with_right_pad_sets_series_plot_end(self) -> None:
+        candles = [
+            Candle(ts=1000 + i * 60, open=Decimal("100"), high=Decimal("101"), low=Decimal("99"), close=Decimal("100"), volume=Decimal("1"), confirmed=True)
+            for i in range(50)
+        ]
+        snap = build_strategy_live_chart_snapshot(
+            session_id="desk",
+            candles=candles,
+            ema_period=21,
+            trend_ema_period=None,
+            reference_ema_period=None,
+        )
+        sliced = slice_strategy_live_chart_snapshot_with_desk_right_pad(snap, 35, 30)
+        self.assertEqual(len(sliced.candles), 30)
+        self.assertIsNotNone(sliced.series_plot_end_index)
+        self.assertEqual(sliced.series_plot_end_index, 15)

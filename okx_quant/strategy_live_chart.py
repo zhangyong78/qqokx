@@ -11,6 +11,13 @@ from okx_quant.pricing import format_decimal
 
 DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT = 240
 DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS = 5000
+LINE_TRADING_DESK_CANDLE_TARGET = 1000
+LINE_TRADING_DESK_MAX_RIGHT_PAD_BARS = 240
+
+_CHART_INSET_LEFT = 76
+_CHART_INSET_RIGHT_PAD = 156
+_CHART_INSET_TOP = 40
+_CHART_INSET_BOTTOM = 56
 
 _GRID_COLOR = "#e9edf3"
 _TEXT_COLOR = "#2f3944"
@@ -60,6 +67,8 @@ class StrategyLiveChartSnapshot:
     latest_candle_time: datetime | None = None
     latest_candle_confirmed: bool = True
     note: str = ""
+    #: 若设置：均线等 overlay 只绘制到该索引之前（不含），用于右侧占位 K 不画均线。
+    series_plot_end_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -256,7 +265,12 @@ def render_strategy_live_chart(canvas: Canvas, snapshot: StrategyLiveChartSnapsh
             )
         return
 
-    bounds = _ChartBounds(left=76, top=40, right=width - 156, bottom=height - 56)
+    bounds = _ChartBounds(
+        left=float(_CHART_INSET_LEFT),
+        top=float(_CHART_INSET_TOP),
+        right=float(width - _CHART_INSET_RIGHT_PAD),
+        bottom=float(height - _CHART_INSET_BOTTOM),
+    )
     if bounds.width <= 24 or bounds.height <= 24:
         return
 
@@ -352,9 +366,14 @@ def render_strategy_live_chart(canvas: Canvas, snapshot: StrategyLiveChartSnapsh
             )
 
     legend_x = bounds.left
+    plot_end = len(snapshot.candles)
+    if snapshot.series_plot_end_index is not None:
+        plot_end = max(0, min(int(snapshot.series_plot_end_index), len(snapshot.candles)))
     for series in snapshot.series:
         points: list[float] = []
-        for index, value in enumerate(series.values):
+        n_pts = min(len(series.values), plot_end)
+        for index in range(n_pts):
+            value = series.values[index]
             x = bounds.left + (index + 0.5) * candle_step
             y = _price_to_y(value, lower, upper, bounds)
             points.extend((x, y))
@@ -487,3 +506,249 @@ def _candle_color(candle: Candle) -> str:
     if candle.close >= candle.open:
         return _CANDLE_RISE
     return _CANDLE_FALL
+
+
+@dataclass(frozen=True)
+class StrategyLiveChartLayout:
+    """Pixel + price mapping for the inner chart area (matches render_strategy_live_chart)."""
+
+    width: int
+    height: int
+    left: float
+    top: float
+    right: float
+    bottom: float
+    lower: Decimal
+    upper: Decimal
+    candle_step: float
+    candle_count: int
+
+
+def measure_strategy_live_chart_canvas(canvas: Canvas) -> tuple[int, int]:
+    width = max(int(canvas.winfo_width()), int(float(canvas.cget("width") or 0)), 640)
+    height = max(int(canvas.winfo_height()), int(float(canvas.cget("height") or 0)), 420)
+    return width, height
+
+
+def compute_strategy_live_chart_layout(
+    canvas: Canvas, snapshot: StrategyLiveChartSnapshot
+) -> StrategyLiveChartLayout | None:
+    if not snapshot.candles:
+        return None
+    width, height = measure_strategy_live_chart_canvas(canvas)
+    left = float(_CHART_INSET_LEFT)
+    top = float(_CHART_INSET_TOP)
+    right = float(width - _CHART_INSET_RIGHT_PAD)
+    bottom = float(height - _CHART_INSET_BOTTOM)
+    if right - left <= 24 or bottom - top <= 24:
+        return None
+    lower, upper = strategy_live_chart_price_bounds(snapshot)
+    n = len(snapshot.candles)
+    candle_step = (right - left) / max(n, 1)
+    return StrategyLiveChartLayout(
+        width=width,
+        height=height,
+        left=left,
+        top=top,
+        right=right,
+        bottom=bottom,
+        lower=lower,
+        upper=upper,
+        candle_step=candle_step,
+        candle_count=n,
+    )
+
+
+def slice_strategy_live_chart_snapshot(
+    snapshot: StrategyLiveChartSnapshot,
+    start: int,
+    count: int,
+) -> StrategyLiveChartSnapshot:
+    n = len(snapshot.candles)
+    if n == 0 or count <= 0:
+        return StrategyLiveChartSnapshot(
+            session_id=snapshot.session_id,
+            candles=(),
+            series=(),
+            markers=snapshot.markers,
+            time_markers=snapshot.time_markers,
+            latest_price=snapshot.latest_price,
+            latest_candle_time=snapshot.latest_candle_time,
+            latest_candle_confirmed=snapshot.latest_candle_confirmed,
+            note=snapshot.note,
+        )
+    start = max(0, min(int(start), max(0, n - 1)))
+    end = min(n, start + int(count))
+    candles = snapshot.candles[start:end]
+    new_series: list[StrategyLiveChartOverlaySeries] = []
+    for series in snapshot.series:
+        if len(series.values) == n:
+            new_series.append(
+                StrategyLiveChartOverlaySeries(
+                    key=series.key,
+                    label=series.label,
+                    color=series.color,
+                    values=series.values[start:end],
+                )
+            )
+    return StrategyLiveChartSnapshot(
+        session_id=snapshot.session_id,
+        candles=candles,
+        series=tuple(new_series),
+        markers=snapshot.markers,
+        time_markers=snapshot.time_markers,
+        latest_price=snapshot.latest_price,
+        latest_candle_time=snapshot.latest_candle_time,
+        latest_candle_confirmed=snapshot.latest_candle_confirmed,
+        note=snapshot.note,
+    )
+
+
+def line_trading_desk_visible_bar_count(
+    candle_count: int, desk_visible_bars: int, *, min_bars: int = 30
+) -> int:
+    if candle_count <= 0:
+        return 0
+    lo = max(1, int(min_bars))
+    return max(lo, min(int(desk_visible_bars), candle_count))
+
+
+def line_trading_desk_max_view_start(
+    candle_count: int,
+    visible_bars: int,
+    *,
+    max_right_pad_bars: int = LINE_TRADING_DESK_MAX_RIGHT_PAD_BARS,
+    min_visible_bars: int = 30,
+) -> int:
+    """允许向右拖出空白：view_start 可大于 n - visible_bars，上限受 max_right_pad_bars 约束。"""
+    n = candle_count
+    vb = line_trading_desk_visible_bar_count(n, visible_bars, min_bars=min_visible_bars)
+    if n <= 0 or vb <= 0:
+        return 0
+    tail = min(int(max_right_pad_bars), max(40, vb))
+    return min(max(0, n - 1), max(0, n - vb) + tail)
+
+
+def _infer_bar_interval_ts(candles: tuple[Candle, ...]) -> int:
+    if len(candles) >= 2:
+        return max(1, int(candles[-1].ts) - int(candles[-2].ts))
+    return 60_000
+
+
+def slice_strategy_live_chart_snapshot_with_desk_right_pad(
+    snapshot: StrategyLiveChartSnapshot,
+    view_start: int,
+    view_bars: int,
+    *,
+    max_right_pad_bars: int = LINE_TRADING_DESK_MAX_RIGHT_PAD_BARS,
+    min_visible_bars: int = 30,
+) -> StrategyLiveChartSnapshot:
+    """与 slice_strategy_live_chart_snapshot 类似，但右侧不足 view_bars 时用平盘占位 K 填满（画布留白）。"""
+    n = len(snapshot.candles)
+    vb = line_trading_desk_visible_bar_count(n, view_bars, min_bars=min_visible_bars)
+    if n == 0 or vb <= 0:
+        return StrategyLiveChartSnapshot(
+            session_id=snapshot.session_id,
+            candles=(),
+            series=(),
+            markers=snapshot.markers,
+            time_markers=snapshot.time_markers,
+            latest_price=snapshot.latest_price,
+            latest_candle_time=snapshot.latest_candle_time,
+            latest_candle_confirmed=snapshot.latest_candle_confirmed,
+            note=snapshot.note,
+            series_plot_end_index=None,
+        )
+    vs_max = line_trading_desk_max_view_start(
+        n, vb, max_right_pad_bars=max_right_pad_bars, min_visible_bars=min_visible_bars
+    )
+    vs = max(0, min(int(view_start), vs_max))
+    end_real = min(n, vs + vb)
+    real = list(snapshot.candles[vs:end_real])
+    pad_n = vb - len(real)
+    if pad_n <= 0:
+        return slice_strategy_live_chart_snapshot(snapshot, vs, vb)
+    anchor = real[-1] if real else snapshot.candles[-1]
+    p = anchor.close
+    gap = _infer_bar_interval_ts(snapshot.candles)
+    ghosts: list[Candle] = []
+    for i in range(1, pad_n + 1):
+        ts_i = int(anchor.ts) + i * gap
+        ghosts.append(
+            Candle(
+                ts=ts_i,
+                open=p,
+                high=p,
+                low=p,
+                close=p,
+                volume=Decimal("0"),
+                confirmed=True,
+            )
+        )
+    candles = tuple(real + ghosts)
+    new_series: list[StrategyLiveChartOverlaySeries] = []
+    for series in snapshot.series:
+        if len(series.values) != n:
+            continue
+        seg = list(series.values[vs:end_real])
+        if pad_n > 0:
+            pad_val = seg[-1] if seg else series.values[min(vs, n - 1)]
+            seg.extend([pad_val] * pad_n)
+        new_series.append(
+            StrategyLiveChartOverlaySeries(
+                key=series.key,
+                label=series.label,
+                color=series.color,
+                values=tuple(seg),
+            )
+        )
+    return StrategyLiveChartSnapshot(
+        session_id=snapshot.session_id,
+        candles=candles,
+        series=tuple(new_series),
+        markers=snapshot.markers,
+        time_markers=snapshot.time_markers,
+        latest_price=snapshot.latest_price,
+        latest_candle_time=snapshot.latest_candle_time,
+        latest_candle_confirmed=snapshot.latest_candle_confirmed,
+        note=snapshot.note,
+        series_plot_end_index=len(real),
+    )
+
+
+def layout_price_to_y(layout: StrategyLiveChartLayout, price: Decimal) -> float:
+    if layout.upper <= layout.lower:
+        return layout.top + (layout.bottom - layout.top) / 2
+    ratio = float((layout.upper - price) / (layout.upper - layout.lower))
+    ratio = min(max(ratio, 0.0), 1.0)
+    return layout.top + (layout.bottom - layout.top) * ratio
+
+
+def layout_y_to_price(layout: StrategyLiveChartLayout, y: float) -> Decimal:
+    h = layout.bottom - layout.top
+    if h <= 0:
+        return (layout.lower + layout.upper) / Decimal("2")
+    ratio = Decimal(str(min(max((y - layout.top) / h, 0.0), 1.0)))
+    return layout.upper - (layout.upper - layout.lower) * ratio
+
+
+def layout_bar_index_to_x_center(layout: StrategyLiveChartLayout, bar_index: float) -> float:
+    return layout.left + (bar_index + 0.5) * layout.candle_step
+
+
+def layout_pixel_to_bar_index(layout: StrategyLiveChartLayout, x: float) -> float:
+    return (x - layout.left) / layout.candle_step - 0.5
+
+
+def line_price_through_anchors(
+    bar_a: float,
+    price_a: Decimal,
+    bar_b: float,
+    price_b: Decimal,
+    bar_t: float,
+) -> Decimal:
+    da = Decimal(str(bar_b)) - Decimal(str(bar_a))
+    if da.copy_abs() < Decimal("1e-12"):
+        return price_a
+    dt = Decimal(str(bar_t)) - Decimal(str(bar_a))
+    return price_a + dt * (price_b - price_a) / da
