@@ -1420,6 +1420,77 @@ class OkxRestClient:
             fallback_cl_ord_id=cl_ord_id,
         )
 
+    def place_trigger_limit_algo_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        plan: OrderPlan,
+        *,
+        algo_cl_ord_id: str | None = None,
+        include_take_profit: bool = True,
+        stop_loss_algo_cl_ord_id: str | None = None,
+        include_attached_protection: bool = True,
+    ) -> OkxOrderResult:
+        """POST /api/v5/trade/order-algo — ordType=trigger: when triggerPx is touched, place a limit at orderPx (entry)."""
+        instrument = self.get_instrument(plan.inst_id)
+        if instrument.inst_type == "OPTION":
+            raise OkxApiError("OKX 期权不支持这里的触发限价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
+
+        tick = instrument.tick_size
+        if tick is None or tick <= 0:
+            raise OkxApiError(f"{plan.inst_id} 缺少有效 tick，无法计算触发价与限价关系")
+
+        entry = plan.entry_reference
+        if plan.side == "buy":
+            # OKX: buy stop — triggerPx must be strictly above orderPx (limit entry).
+            trigger_px = snap_to_increment(entry + tick, tick, "up")
+        elif plan.side == "sell":
+            # OKX: sell stop — triggerPx must be strictly below orderPx.
+            raw_trigger = entry - tick
+            if raw_trigger <= 0:
+                raise OkxApiError("触发价计算结果无效（入场价过低）")
+            trigger_px = snap_to_increment(raw_trigger, tick, "down")
+        else:
+            raise OkxApiError(f"不支持的订单方向：{plan.side}")
+
+        order: dict[str, Any] = {
+            "instId": plan.inst_id,
+            "tdMode": config.trade_mode,
+            "side": plan.side,
+            "ordType": "trigger",
+            "sz": format_decimal(plan.size),
+            "triggerPx": format_decimal(trigger_px),
+            "triggerPxType": config.tp_sl_trigger_type,
+            "orderPx": format_decimal(entry),
+        }
+        if include_attached_protection:
+            order["attachAlgoOrds"] = [
+                _build_attached_algo_order(
+                    config=config,
+                    plan=plan,
+                    include_take_profit=include_take_profit,
+                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                )
+            ]
+        if plan.pos_side:
+            order["posSide"] = plan.pos_side
+        if algo_cl_ord_id:
+            order["algoClOrdId"] = algo_cl_ord_id
+
+        payload = self._request(
+            "POST",
+            "/api/v5/trade/order-algo",
+            body=order,
+            auth=True,
+            credentials=credentials,
+            simulated=config.environment == "demo",
+        )
+        return self._parse_algo_order_result(
+            payload,
+            empty_message="OKX 返回了空的触发价算法单结果",
+            fallback_algo_cl_ord_id=algo_cl_ord_id,
+        )
+
     def place_simple_order(
         self,
         credentials: Credentials,

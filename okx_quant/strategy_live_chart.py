@@ -7,7 +7,7 @@ from tkinter import Canvas
 
 from okx_quant.indicators import ema
 from okx_quant.models import Candle
-from okx_quant.pricing import format_decimal
+from okx_quant.pricing import format_decimal, format_decimal_by_increment
 
 DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT = 240
 DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS = 5000
@@ -69,6 +69,8 @@ class StrategyLiveChartSnapshot:
     note: str = ""
     #: 若设置：均线等 overlay 只绘制到该索引之前（不含），用于右侧占位 K 不画均线。
     series_plot_end_index: int | None = None
+    #: 若设置：纵轴价签、右侧标记价等按该最小变动单位格式化（与合约 tick 一致）。
+    price_display_tick: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -221,6 +223,10 @@ def build_strategy_live_chart_snapshot(
     )
 
 
+def _format_snapshot_axis_price(snapshot: StrategyLiveChartSnapshot, price: Decimal) -> str:
+    return format_decimal_by_increment(price, snapshot.price_display_tick)
+
+
 def strategy_live_chart_price_bounds(snapshot: StrategyLiveChartSnapshot) -> tuple[Decimal, Decimal]:
     price_values: list[Decimal] = []
     for candle in snapshot.candles:
@@ -286,7 +292,7 @@ def render_strategy_live_chart(canvas: Canvas, snapshot: StrategyLiveChartSnapsh
         canvas.create_text(
             bounds.left - 8,
             y,
-            text=format_decimal(price),
+            text=_format_snapshot_axis_price(snapshot, price),
             fill=_MUTED_TEXT_COLOR,
             anchor="e",
             font=("Microsoft YaHei UI", 9),
@@ -399,7 +405,7 @@ def render_strategy_live_chart(canvas: Canvas, snapshot: StrategyLiveChartSnapsh
         if marker.dash:
             line_kwargs["dash"] = marker.dash
         canvas.create_line(bounds.left, y, bounds.right, y, **line_kwargs)
-        label_text = f"{marker.label} {format_decimal(marker.price)}"
+        label_text = f"{marker.label} {_format_snapshot_axis_price(snapshot, marker.price)}"
         text_width = max(len(label_text) * 7 + 14, 82)
         x1 = bounds.right + 10
         x2 = min(width - 8, x1 + text_width)
@@ -576,6 +582,7 @@ def slice_strategy_live_chart_snapshot(
             latest_candle_time=snapshot.latest_candle_time,
             latest_candle_confirmed=snapshot.latest_candle_confirmed,
             note=snapshot.note,
+            price_display_tick=snapshot.price_display_tick,
         )
     start = max(0, min(int(start), max(0, n - 1)))
     end = min(n, start + int(count))
@@ -601,6 +608,7 @@ def slice_strategy_live_chart_snapshot(
         latest_candle_time=snapshot.latest_candle_time,
         latest_candle_confirmed=snapshot.latest_candle_confirmed,
         note=snapshot.note,
+        price_display_tick=snapshot.price_display_tick,
     )
 
 
@@ -658,6 +666,7 @@ def slice_strategy_live_chart_snapshot_with_desk_right_pad(
             latest_candle_confirmed=snapshot.latest_candle_confirmed,
             note=snapshot.note,
             series_plot_end_index=None,
+            price_display_tick=snapshot.price_display_tick,
         )
     vs_max = line_trading_desk_max_view_start(
         n, vb, max_right_pad_bars=max_right_pad_bars, min_visible_bars=min_visible_bars
@@ -713,6 +722,7 @@ def slice_strategy_live_chart_snapshot_with_desk_right_pad(
         latest_candle_confirmed=snapshot.latest_candle_confirmed,
         note=snapshot.note,
         series_plot_end_index=len(real),
+        price_display_tick=snapshot.price_display_tick,
     )
 
 

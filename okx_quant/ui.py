@@ -92,7 +92,7 @@ from okx_quant.position_protection import (
     validate_live_protection_order_price_guard,
 )
 from okx_quant.protection_replay_ui import ProtectionReplayLaunchState, ProtectionReplayWindow
-from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
+from okx_quant.pricing import format_decimal, format_decimal_by_increment, format_decimal_fixed, snap_to_increment
 from okx_quant.signal_monitor_ui import SignalMonitorWindow
 from okx_quant.trader_desk import (
     TraderDeskSnapshot,
@@ -783,6 +783,10 @@ class LineTradingDeskWindowState:
     desk_chart_paint_job: str | None = None
     desk_last_chart_paint_t: float = 0.0
     desk_range_zoom_active: bool = False
+    desk_price_tick: Decimal | None = None
+    desk_tick_symbol: str | None = None
+    desk_canvas_configure_job: str | None = None
+    desk_canvas_last_wh: tuple[int, int] | None = None
 
 
 @dataclass
@@ -7835,7 +7839,7 @@ class QuantApp:
         symbol_box["values"] = self._line_trading_symbol_values()
         symbol_box.grid(row=0, column=3, padx=(4, 8))
         ttk.Label(top_bar, text="周期").grid(row=0, column=4, sticky="w")
-        bar_var = StringVar(value=self.bar.get() or "1H")
+        bar_var = StringVar(value="1H")
         ttk.Combobox(top_bar, width=8, state="readonly", values=BAR_OPTIONS, textvariable=bar_var).grid(
             row=0, column=5, padx=(4, 8)
         )
@@ -7907,7 +7911,7 @@ class QuantApp:
         ttk.Entry(param_card, width=5, textvariable=param_rr_r).grid(row=pr, column=11, padx=(4, 0))
         hint = ttk.Label(
             param_card,
-            text="滚轮缩放；Shift+拖平移。区间放大后可在空白处按住左键拖动平移（最左侧K移出视窗），仍只显示当前窗口根数；Shift+拖亦可。「区间放大」横拖选K后远端隐藏；重置视图恢复。",
+            text="标的默认可选5个主流永续；周期默认1H。K线纵轴价、盈亏比列表与持仓价等按所选合约最小变动单位(tick)显示小数。滚轮缩放；Shift+拖或区间放大后在空白处左键拖平移。",
             foreground="#555",
         )
         hint.grid(row=1, column=0, columnspan=14, sticky="w", pady=(6, 0))
@@ -7959,8 +7963,17 @@ class QuantApp:
             rr_manage_tree.heading(col, text=text)
             rr_manage_tree.column(col, width=width, anchor="center")
         rr_manage_tree.grid(row=0, column=0, sticky="ew")
-        ttk.Button(rr_box, text="切换选中锁定", command=self._line_trading_desk_toggle_selected_rr_lock).grid(
-            row=1, column=0, sticky="w", pady=(4, 0)
+        rr_btn_row = ttk.Frame(rr_box)
+        rr_btn_row.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        rr_btn_row.columnconfigure(3, weight=1)
+        ttk.Button(rr_btn_row, text="切换选中锁定", command=self._line_trading_desk_toggle_selected_rr_lock).grid(
+            row=0, column=0, padx=(0, 4)
+        )
+        ttk.Button(rr_btn_row, text="限价委托单", command=self._line_trading_desk_submit_rr_limit_order_from_tree).grid(
+            row=0, column=1, padx=(0, 4)
+        )
+        ttk.Button(rr_btn_row, text="触发价委托", command=self._line_trading_desk_submit_rr_trigger_order_from_tree).grid(
+            row=0, column=2, padx=(0, 4)
         )
 
         positions_box = ttk.LabelFrame(right, text="持仓（简版）", padding=8)
@@ -8020,9 +8033,10 @@ class QuantApp:
             last_desk_api_profile=api_profile_var.get().strip(),
         )
         self._line_trading_desk_window = state
+        self._line_trading_desk_update_price_tick(state)
         rr_manage_tree.bind("<<TreeviewSelect>>", lambda _e: self._line_trading_desk_on_rr_tree_select())
         window.protocol("WM_DELETE_WINDOW", self._close_line_trading_desk_window)
-        canvas.bind("<Configure>", lambda *_: self._render_line_trading_desk_chart())
+        canvas.bind("<Configure>", self._on_line_trading_desk_canvas_configure)
         canvas.bind("<ButtonPress-1>", self._on_line_trading_desk_button_press)
         canvas.bind("<B1-Motion>", self._on_line_trading_desk_mouse_move)
         canvas.bind("<ButtonRelease-1>", self._on_line_trading_desk_button_release)
@@ -16253,18 +16267,49 @@ class QuantApp:
         self.root.after(500, self._refresh_status)
 
     def _default_line_trading_symbol(self) -> str:
-        default_symbol = (self.symbol.get() or "").strip().upper()
-        if default_symbol:
-            return default_symbol
+        for sym in DEFAULT_LAUNCH_SYMBOLS:
+            if any(getattr(item, "inst_id", None) == sym for item in self.instruments):
+                return sym
+        fallback = (self.symbol.get() or "").strip().upper()
+        if fallback:
+            return fallback
         if self.instruments:
             return self.instruments[0].inst_id
-        return "BTC-USDT-SWAP"
+        return DEFAULT_LAUNCH_SYMBOLS[0]
 
     def _line_trading_symbol_values(self) -> tuple[str, ...]:
-        symbols = sorted({item.inst_id for item in self.instruments if item.inst_id})
-        if not symbols:
-            return (self._default_line_trading_symbol(),)
-        return tuple(symbols)
+        return tuple(DEFAULT_LAUNCH_SYMBOLS)
+
+    def _line_trading_desk_invalidate_price_tick(self, state: LineTradingDeskWindowState) -> None:
+        state.desk_tick_symbol = None
+
+    def _line_trading_desk_update_price_tick(self, state: LineTradingDeskWindowState, *, force: bool = False) -> None:
+        sym = state.symbol_var.get().strip().upper()
+        if not sym:
+            state.desk_price_tick = None
+            state.desk_tick_symbol = None
+            return
+        if (
+            not force
+            and state.desk_tick_symbol == sym
+            and state.desk_price_tick is not None
+        ):
+            return
+        try:
+            inst = self.client.get_instrument(sym)
+            ts = inst.tick_size
+            state.desk_price_tick = ts if ts is not None and ts > 0 else None
+            state.desk_tick_symbol = sym
+        except Exception:
+            state.desk_price_tick = None
+            state.desk_tick_symbol = sym
+
+    def _line_trading_desk_format_price(self, state: LineTradingDeskWindowState, value: Decimal | None) -> str:
+        if value is None:
+            return "-"
+        if state.desk_price_tick is not None:
+            return format_decimal_by_increment(value, state.desk_price_tick)
+        return format_decimal(value)
 
     def _on_line_trading_desk_api_profile_changed(self) -> None:
         state = self._line_trading_desk_window
@@ -16282,6 +16327,7 @@ class QuantApp:
             state.rr_pick = None
             state.rr_selected_id = None
             state.desk_range_zoom_active = False
+            self._line_trading_desk_invalidate_price_tick(state)
         state.last_desk_api_profile = current
         self._request_line_trading_desk_refresh(immediate=True)
 
@@ -16306,6 +16352,8 @@ class QuantApp:
         if state is not None:
             state.desk_initial_scroll_done = False
             state.desk_range_zoom_active = False
+            self._line_trading_desk_invalidate_price_tick(state)
+            self._line_trading_desk_update_price_tick(state)
         self._request_line_trading_desk_refresh(immediate=True)
 
     def _line_trading_desk_visible_snapshot(
@@ -16564,7 +16612,8 @@ class QuantApp:
                 f"已添加{('多' if side == 'long' else '空')}头盈亏框。工具已关闭；点框选中后可拖动；需要再画请再点「盈亏比·多/空」。"
             )
             self._enqueue_log(
-                f"[划线交易台] 盈亏比 | {side} | 入={format_decimal(entry_p)} | 损={format_decimal(stop_p)} | 盈={format_decimal(tp_p)} | R={format_decimal(r_mult)}"
+                f"[划线交易台] 盈亏比 | {side} | 入={self._line_trading_desk_format_price(state, entry_p)} | "
+                f"损={self._line_trading_desk_format_price(state, stop_p)} | 盈={self._line_trading_desk_format_price(state, tp_p)} | R={format_decimal(r_mult)}"
             )
             return
         ray_action = (state.param_ray_action.get() or "notify").strip().lower()
@@ -16612,9 +16661,9 @@ class QuantApp:
                 iid=box.rr_id,
                 values=(
                     "锁" if box.locked else "",
-                    format_decimal(box.price_entry),
-                    format_decimal(box.price_stop),
-                    format_decimal(box.price_tp),
+                    self._line_trading_desk_format_price(state, box.price_entry),
+                    self._line_trading_desk_format_price(state, box.price_stop),
+                    self._line_trading_desk_format_price(state, box.price_tp),
                     format_decimal(box.r_multiple),
                 ),
             )
@@ -16645,6 +16694,90 @@ class QuantApp:
         self._line_trading_desk_refresh_rr_tree(state)
         self._render_line_trading_desk_chart()
 
+    def _line_trading_desk_rr_selected_box(self, state: LineTradingDeskWindowState) -> DeskRiskRewardAnnotation | None:
+        sel = state.rr_manage_tree.selection()
+        if not sel:
+            messagebox.showinfo("盈亏比", "请先在列表中选择一行。", parent=state.window)
+            return None
+        rid = sel[0]
+        for box in state.rr_annotations:
+            if box.rr_id == rid:
+                return box
+        messagebox.showinfo("盈亏比", "选中的计划不存在。", parent=state.window)
+        return None
+
+    def _line_trading_desk_collect_rr_exchange_order(
+        self,
+        state: LineTradingDeskWindowState,
+        box: DeskRiskRewardAnnotation,
+        direction: str,
+    ) -> tuple[Credentials, StrategyConfig, OrderPlan, Decimal, str] | None:
+        symbol = state.symbol_var.get().strip().upper()
+        profile = state.api_profile_var.get().strip()
+        credentials = self._credentials_for_profile_or_none(profile)
+        if credentials is None:
+            state.status_text.set("未配置API，无法下单。")
+            return None
+        try:
+            instrument = self.client.get_instrument(symbol)
+        except Exception as exc:
+            state.status_text.set(f"读取标的失败：{exc}")
+            return None
+        self._line_trading_desk_rr_snap_prices(state, box)
+        entry = box.price_entry
+        sl = box.price_stop
+        tp = box.price_tp
+        if direction == "long" and not (sl < entry < tp):
+            state.status_text.set("多头：须满足 止损 < 入场 < 止盈。")
+            return None
+        if direction == "short" and not (tp < entry < sl):
+            state.status_text.set("空头：须满足 止盈 < 入场 < 止损。")
+            return None
+        try:
+            risk_raw = str(state.param_risk_amount.get()).strip() or "0"
+            risk_amount = Decimal(risk_raw)
+        except InvalidOperation:
+            state.status_text.set("风险金格式无效。")
+            return None
+        if risk_amount <= 0:
+            state.status_text.set("风险金必须大于0。")
+            return None
+        config = replace(self._template_record_from_launcher().config, inst_id=symbol, trade_inst_id=symbol)
+        try:
+            size = determine_order_size(
+                instrument=instrument,
+                config=replace(config, risk_amount=risk_amount, order_size=None),
+                entry_price=entry,
+                stop_loss=sl,
+                risk_price_compatible=True,
+            )
+        except Exception as exc:
+            state.status_text.set(f"定量失败：{exc}")
+            return None
+        side = "buy" if direction == "long" else "sell"
+        pos_side = resolve_open_pos_side(config.position_mode, side)
+        atr_period = max(1, int(str(state.param_atr_period.get()).strip() or "10"))
+        atr_vals = atr(list(state.last_snapshot.candles), atr_period) if state.last_snapshot else []
+        atr_val = atr_vals[-1] if atr_vals and atr_vals[-1] is not None else Decimal("1")
+        if atr_val <= 0:
+            atr_val = Decimal("1")
+        last_ts = state.last_snapshot.candles[-1].ts if state.last_snapshot and state.last_snapshot.candles else 0
+        plan = OrderPlan(
+            inst_id=symbol,
+            side=side,
+            pos_side=pos_side,
+            size=size,
+            take_profit=tp,
+            stop_loss=sl,
+            entry_reference=entry,
+            atr_value=atr_val,
+            signal="long" if direction == "long" else "short",
+            candle_ts=last_ts,
+            tp_sl_inst_id=symbol,
+            tp_sl_mode="exchange",
+        )
+        return credentials, config, plan, size, symbol
+
     def _line_trading_desk_rr_snap_prices(self, state: LineTradingDeskWindowState, box: DeskRiskRewardAnnotation) -> None:
         symbol = state.symbol_var.get().strip().upper()
         try:
@@ -16656,6 +16789,38 @@ class QuantApp:
             box.price_entry = snap_to_increment(box.price_entry, tick, "nearest")
             box.price_stop = snap_to_increment(box.price_stop, tick, "nearest")
             box.price_tp = snap_to_increment(box.price_tp, tick, "nearest")
+
+    def _line_trading_desk_cancel_canvas_configure_job(self, state: LineTradingDeskWindowState) -> None:
+        jid = state.desk_canvas_configure_job
+        if jid is not None:
+            try:
+                self.root.after_cancel(jid)
+            except Exception:
+                pass
+            state.desk_canvas_configure_job = None
+
+    def _on_line_trading_desk_canvas_configure(self, event) -> None:
+        state = self._line_trading_desk_window
+        if state is None or getattr(event, "widget", None) is not state.canvas:
+            return
+        try:
+            w = max(int(event.width), 1)
+            h = max(int(event.height), 1)
+        except (TclError, TypeError, ValueError):
+            return
+        last = state.desk_canvas_last_wh
+        if last is not None and abs(last[0] - w) < 2 and abs(last[1] - h) < 2:
+            return
+        state.desk_canvas_last_wh = (w, h)
+        self._line_trading_desk_cancel_canvas_configure_job(state)
+
+        def _fire() -> None:
+            state.desk_canvas_configure_job = None
+            if self._line_trading_desk_window is not state or not _widget_exists(state.canvas):
+                return
+            self._render_line_trading_desk_chart()
+
+        state.desk_canvas_configure_job = self.root.after(80, _fire)
 
     def _line_trading_desk_cancel_motion_chart_paint(self, state: LineTradingDeskWindowState) -> None:
         jid = state.desk_chart_paint_job
@@ -16782,70 +16947,13 @@ class QuantApp:
         if box.side != direction:
             state.status_text.set(f"当前框为「{'多' if box.side == 'long' else '空'}头」计划，请用对应按钮。")
             return
-        symbol = state.symbol_var.get().strip().upper()
-        profile = state.api_profile_var.get().strip()
-        credentials = self._credentials_for_profile_or_none(profile)
-        if credentials is None:
-            state.status_text.set("未配置API，无法下单。")
+        ctx = self._line_trading_desk_collect_rr_exchange_order(state, box, direction)
+        if ctx is None:
             return
-        try:
-            instrument = self.client.get_instrument(symbol)
-        except Exception as exc:
-            state.status_text.set(f"读取标的失败：{exc}")
-            return
-        self._line_trading_desk_rr_snap_prices(state, box)
+        credentials, config, plan, size, symbol = ctx
         entry = box.price_entry
         sl = box.price_stop
         tp = box.price_tp
-        if direction == "long" and not (sl < entry < tp):
-            state.status_text.set("多头：须满足 止损 < 入场 < 止盈。")
-            return
-        if direction == "short" and not (tp < entry < sl):
-            state.status_text.set("空头：须满足 止盈 < 入场 < 止损。")
-            return
-        try:
-            risk_raw = str(state.param_risk_amount.get()).strip() or "0"
-            risk_amount = Decimal(risk_raw)
-        except InvalidOperation:
-            state.status_text.set("风险金格式无效。")
-            return
-        if risk_amount <= 0:
-            state.status_text.set("风险金必须大于0。")
-            return
-        config = replace(self._template_record_from_launcher().config, inst_id=symbol, trade_inst_id=symbol)
-        try:
-            size = determine_order_size(
-                instrument=instrument,
-                config=replace(config, risk_amount=risk_amount, order_size=None),
-                entry_price=entry,
-                stop_loss=sl,
-                risk_price_compatible=True,
-            )
-        except Exception as exc:
-            state.status_text.set(f"定量失败：{exc}")
-            return
-        side = "buy" if direction == "long" else "sell"
-        pos_side = resolve_open_pos_side(config.position_mode, side)
-        atr_period = max(1, int(str(state.param_atr_period.get()).strip() or "10"))
-        atr_vals = atr(list(state.last_snapshot.candles), atr_period) if state.last_snapshot else []
-        atr_val = atr_vals[-1] if atr_vals and atr_vals[-1] is not None else Decimal("1")
-        if atr_val <= 0:
-            atr_val = Decimal("1")
-        last_ts = state.last_snapshot.candles[-1].ts if state.last_snapshot and state.last_snapshot.candles else 0
-        plan = OrderPlan(
-            inst_id=symbol,
-            side=side,
-            pos_side=pos_side,
-            size=size,
-            take_profit=tp,
-            stop_loss=sl,
-            entry_reference=entry,
-            atr_value=atr_val,
-            signal="long" if direction == "long" else "short",
-            candle_ts=last_ts,
-            tp_sl_inst_id=symbol,
-            tp_sl_mode="exchange",
-        )
         try:
             result = self.client.place_limit_order(
                 credentials,
@@ -16861,8 +16969,76 @@ class QuantApp:
             f"已提交限价+TP/SL | {symbol} | sz={format_decimal(size)} | ordId={result.ord_id or '-'}"
         )
         self._enqueue_log(
-            f"[划线交易台] 盈亏比限价+附带TP/SL | {direction.upper()} | {symbol} | 入={format_decimal(entry)} | "
-            f"损={format_decimal(sl)} | 盈={format_decimal(tp)} | sz={format_decimal(size)} | ordId={result.ord_id or '-'}"
+            f"[划线交易台] 盈亏比限价+附带TP/SL | {direction.upper()} | {symbol} | 入={self._line_trading_desk_format_price(state, entry)} | "
+            f"损={self._line_trading_desk_format_price(state, sl)} | 盈={self._line_trading_desk_format_price(state, tp)} | sz={format_decimal(size)} | ordId={result.ord_id or '-'}"
+        )
+
+    def _line_trading_desk_submit_rr_limit_order_from_tree(self) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        box = self._line_trading_desk_rr_selected_box(state)
+        if box is None:
+            return
+        ctx = self._line_trading_desk_collect_rr_exchange_order(state, box, box.side)
+        if ctx is None:
+            return
+        credentials, config, plan, size, symbol = ctx
+        entry = box.price_entry
+        sl = box.price_stop
+        tp = box.price_tp
+        direction = box.side
+        try:
+            result = self.client.place_limit_order(
+                credentials,
+                config,
+                plan,
+                include_take_profit=True,
+                include_attached_protection=True,
+            )
+        except Exception as exc:
+            state.status_text.set(f"限价委托失败：{exc}")
+            return
+        state.status_text.set(
+            f"已提交限价委托+TP/SL | {symbol} | sz={format_decimal(size)} | ordId={result.ord_id or '-'}"
+        )
+        self._enqueue_log(
+            f"[划线交易台] 限价委托单 | {direction.upper()} | {symbol} | 入={self._line_trading_desk_format_price(state, entry)} | "
+            f"损={self._line_trading_desk_format_price(state, sl)} | 盈={self._line_trading_desk_format_price(state, tp)} | sz={format_decimal(size)} | ordId={result.ord_id or '-'}"
+        )
+
+    def _line_trading_desk_submit_rr_trigger_order_from_tree(self) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        box = self._line_trading_desk_rr_selected_box(state)
+        if box is None:
+            return
+        ctx = self._line_trading_desk_collect_rr_exchange_order(state, box, box.side)
+        if ctx is None:
+            return
+        credentials, config, plan, size, symbol = ctx
+        entry = box.price_entry
+        sl = box.price_stop
+        tp = box.price_tp
+        direction = box.side
+        try:
+            result = self.client.place_trigger_limit_algo_order(
+                credentials,
+                config,
+                plan,
+                include_take_profit=True,
+                include_attached_protection=True,
+            )
+        except Exception as exc:
+            state.status_text.set(f"触发价委托失败：{exc}")
+            return
+        state.status_text.set(
+            f"已提交触发限价+TP/SL（算法单）| {symbol} | sz={format_decimal(size)} | algoId={result.ord_id or '-'}"
+        )
+        self._enqueue_log(
+            f"[划线交易台] 触发价委托 | {direction.upper()} | {symbol} | 入={self._line_trading_desk_format_price(state, entry)} | "
+            f"损={self._line_trading_desk_format_price(state, sl)} | 盈={self._line_trading_desk_format_price(state, tp)} | sz={format_decimal(size)} | algoId={result.ord_id or '-'}"
         )
 
     def _line_trading_desk_draw_ray_on_canvas(
@@ -17028,7 +17204,8 @@ class QuantApp:
         sym = state.symbol_var.get().strip().upper()
         action = (ann.desk_ray_action or "notify").strip().lower()
         self._enqueue_log(
-            f"[划线交易台·触发] {sym} | {ann.label} | 价={format_decimal(px)} | 线≈{format_decimal(line_p)} | 动作={action}"
+            f"[划线交易台·触发] {sym} | {ann.label} | 价={self._line_trading_desk_format_price(state, px)} | "
+            f"线≈{self._line_trading_desk_format_price(state, line_p)} | 动作={action}"
         )
         if action == "long":
             self._submit_line_trading_desk_order("long")
@@ -17040,6 +17217,7 @@ class QuantApp:
         if state is None:
             return
         self._line_trading_desk_cancel_motion_chart_paint(state)
+        self._line_trading_desk_cancel_canvas_configure_job(state)
         if state.refresh_job is not None:
             try:
                 self.root.after_cancel(state.refresh_job)
@@ -17135,6 +17313,7 @@ class QuantApp:
         if state is None or not _widget_exists(state.window):
             return
         state.last_snapshot = snapshot
+        self._line_trading_desk_update_price_tick(state)
         n = len(snapshot.candles)
         if n > 0 and not state.desk_initial_scroll_done:
             state.desk_view_start = max(0, n - min(state.desk_visible_bars, n))
@@ -17158,8 +17337,8 @@ class QuantApp:
                     item.inst_id,
                     item.pos_side or "-",
                     format_decimal(item.position),
-                    _format_optional_decimal(item.avg_price),
-                    _format_optional_decimal(item.mark_price),
+                    self._line_trading_desk_format_price(state, item.avg_price),
+                    self._line_trading_desk_format_price(state, item.mark_price),
                     _format_optional_decimal(item.unrealized_pnl),
                 ),
             )
@@ -17194,7 +17373,8 @@ class QuantApp:
             render_strategy_live_chart(state.canvas, snapshot)
             return
         sliced, vs, _vb = tup
-        render_strategy_live_chart(state.canvas, sliced)
+        to_draw = replace(sliced, price_display_tick=state.desk_price_tick)
+        render_strategy_live_chart(state.canvas, to_draw)
         layout = compute_strategy_live_chart_layout(state.canvas, sliced)
         if layout is not None:
             for ann in state.line_annotations:
@@ -17418,8 +17598,8 @@ class QuantApp:
             f"已提交{('多' if direction == 'long' else '空')}单 | {symbol} | size={format_decimal(size)} | ordId={result.ord_id or '-'}"
         )
         self._enqueue_log(
-            f"[划线交易台] 提交{direction.upper()}单 | 标的={symbol} | 开仓价={format_decimal(entry_price)} | "
-            f"止损={format_decimal(stop_price)} | 数量={format_decimal(size)} | ordId={result.ord_id or '-'}"
+            f"[划线交易台] 提交{direction.upper()}单 | 标的={symbol} | 开仓价={self._line_trading_desk_format_price(state, entry_price)} | "
+            f"止损={self._line_trading_desk_format_price(state, stop_price)} | 数量={format_decimal(size)} | ordId={result.ord_id or '-'}"
         )
 
     def _line_trading_desk_selected_position(self) -> OkxPosition | None:
@@ -17459,7 +17639,7 @@ class QuantApp:
             f"[划线交易台] 提交平仓 | 合约={position.inst_id} | 方式={mode_label} | ordId={result.ord_id or '-'}"
         )
         if normalized_flatten_mode == "best_quote" and price is not None:
-            self._enqueue_log(f"[划线交易台] 平仓挂单价={format_decimal(price)}")
+            self._enqueue_log(f"[划线交易台] 平仓挂单价={self._line_trading_desk_format_price(state, price)}")
         self._request_line_trading_desk_refresh(immediate=True)
 
     def _on_close(self) -> None:
