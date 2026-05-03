@@ -628,7 +628,7 @@ class BacktestTest(TestCase):
             atr_take_multiplier=Decimal("4"),
             order_size=Decimal("1"),
             trade_mode="cross",
-            signal_mode="both",
+            signal_mode="long_only",
             position_mode="net",
             environment="demo",
             tp_sl_trigger_type="mark",
@@ -771,7 +771,7 @@ class BacktestTest(TestCase):
             for candle in trade_candles
         ]
         client = DummyBacktestClient(candles, self._build_instrument())
-        config = self._build_config()
+        config = replace(self._build_config(), take_profit_mode="fixed")
 
         result = run_backtest(client, config, candle_limit=len(candles))
 
@@ -818,7 +818,7 @@ class BacktestTest(TestCase):
             for candle in trade_candles
         ]
         client = DummyBacktestClient(candles, self._build_instrument())
-        config = self._build_config()
+        config = replace(self._build_config(), take_profit_mode="fixed")
 
         no_fee_result = run_backtest(client, config, candle_limit=len(candles))
         fee_result = run_backtest(
@@ -839,6 +839,17 @@ class BacktestTest(TestCase):
             fee_result.report.total_fees,
             sum((trade.total_fee for trade in fee_result.trades), Decimal("0")),
         )
+
+    def test_cross_backtest_rejects_signal_mode_both(self) -> None:
+        candles = [
+            Candle(i, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True)
+            for i in range(1, 260)
+        ]
+        client = DummyBacktestClient(candles, self._build_instrument())
+        config = replace(self._build_config(), signal_mode="both")
+        with self.assertRaises(RuntimeError) as ctx:
+            run_backtest(client, config, candle_limit=len(candles))
+        self.assertIn("双向", str(ctx.exception))
 
     def test_backtest_supports_more_than_300_candles(self) -> None:
         candles = [

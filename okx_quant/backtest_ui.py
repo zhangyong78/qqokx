@@ -33,6 +33,7 @@ from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import (
     ALL_STRATEGY_DEFINITIONS,
     BACKTEST_STRATEGY_DEFINITIONS,
+    STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA5_EMA8_ID,
     StrategyDefinition,
@@ -145,6 +146,7 @@ class BacktestLaunchState:
     position_mode_label: str
     trigger_type_label: str
     environment_label: str
+    hold_close_exit_bars: str = "0"
     maker_fee_percent: str = DEFAULT_MAKER_FEE_PERCENT
     taker_fee_percent: str = DEFAULT_TAKER_FEE_PERCENT
     initial_capital: str = "10000"
@@ -411,7 +413,7 @@ def _build_backtest_param_summary(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> str:
-    if is_dynamic_strategy_id(config.strategy_id):
+    if is_dynamic_strategy_id(config.strategy_id) or config.strategy_id == STRATEGY_CROSS_ID:
         risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
         sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
         if config.backtest_sizing_mode == "risk_percent":
@@ -421,7 +423,6 @@ def _build_backtest_param_summary(
         else:
             sizing_text = f"{sizing_label}{risk_text}"
         take_profit_label = "动态止盈" if config.take_profit_mode == "dynamic" else "固定止盈"
-        max_entries_text = "不限" if config.max_entries_per_trend <= 0 else f"每波前{config.max_entries_per_trend}次"
         extra_parts = [take_profit_label]
         if config.take_profit_mode == "dynamic":
             extra_parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
@@ -429,11 +430,16 @@ def _build_backtest_param_summary(
             extra_parts.append(
                 f"时间保本{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
             )
-        extra_parts.append(max_entries_text)
+        if is_dynamic_strategy_id(config.strategy_id) or config.strategy_id == STRATEGY_CROSS_ID:
+            max_entries_text = "不限" if config.max_entries_per_trend <= 0 else f"每波前{config.max_entries_per_trend}次"
+            extra_parts.append(max_entries_text)
+        if config.strategy_id == STRATEGY_CROSS_ID and int(config.hold_close_exit_bars) > 0:
+            extra_parts.append(f"满{int(config.hold_close_exit_bars)}根收盘平仓")
         extra_text = " / ".join(extra_parts)
+        ref_ema_label = "穿越EMA" if config.strategy_id == STRATEGY_CROSS_ID else "挂单EMA"
         return (
             f"EMA{config.ema_period}/{config.trend_ema_period} / ATR{config.atr_period} / "
-            f"挂单EMA{config.resolved_entry_reference_ema_period()} / "
+            f"{ref_ema_label}{config.resolved_entry_reference_ema_period()} / "
             f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
             f"{extra_text} / "
             f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
@@ -880,6 +886,7 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "dynamic_fee_offset_enabled": config.dynamic_fee_offset_enabled,
         "time_stop_break_even_enabled": config.time_stop_break_even_enabled,
         "time_stop_break_even_bars": config.resolved_time_stop_break_even_bars(),
+        "hold_close_exit_bars": int(config.hold_close_exit_bars),
         "backtest_profile_id": config.backtest_profile_id,
         "backtest_profile_name": config.backtest_profile_name,
         "backtest_profile_summary": config.backtest_profile_summary,
@@ -942,6 +949,7 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         dynamic_fee_offset_enabled=bool(payload.get("dynamic_fee_offset_enabled", True)),
         time_stop_break_even_enabled=bool(payload.get("time_stop_break_even_enabled", False)),
         time_stop_break_even_bars=int(payload.get("time_stop_break_even_bars", 10)),
+        hold_close_exit_bars=int(payload.get("hold_close_exit_bars", 0)),
         backtest_profile_id=str(payload.get("backtest_profile_id", "")),
         backtest_profile_name=str(payload.get("backtest_profile_name", "")),
         backtest_profile_summary=str(payload.get("backtest_profile_summary", "")),
@@ -1218,7 +1226,7 @@ class BacktestWindow:
             width_ratio=0.8,
             height_ratio=0.88,
             min_width=1100,
-            min_height=840,
+            min_height=900,
             max_width=1580,
             max_height=1220,
         )
@@ -1253,6 +1261,7 @@ class BacktestWindow:
         self.dynamic_fee_offset_enabled = BooleanVar(value=initial_state.dynamic_fee_offset_enabled)
         self.time_stop_break_even_enabled = BooleanVar(value=initial_state.time_stop_break_even_enabled)
         self.time_stop_break_even_bars = StringVar(value=initial_state.time_stop_break_even_bars)
+        self.hold_close_exit_bars = StringVar(value=initial_state.hold_close_exit_bars)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
         self.position_mode_label = StringVar(value=initial_state.position_mode_label)
@@ -1334,6 +1343,10 @@ class BacktestWindow:
         return strategy_uses_parameter(strategy_id, "big_ema_period")
 
     @staticmethod
+    def _strategy_supports_dynamic_take_profit(strategy_id: str) -> bool:
+        return is_dynamic_strategy_id(strategy_id) or strategy_id == STRATEGY_CROSS_ID
+
+    @staticmethod
     def _set_field_state(widget: object, *, editable: bool) -> None:
         state = "normal" if editable else "readonly"
         if isinstance(widget, ttk.Combobox):
@@ -1371,6 +1384,7 @@ class BacktestWindow:
             "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
             "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
             "time_stop_break_even_bars": self.time_stop_break_even_bars,
+            "hold_close_exit_bars": self.hold_close_exit_bars,
         }
 
     def _capture_strategy_parameter_draft(self, strategy_id: str) -> dict[str, object]:
@@ -1435,6 +1449,10 @@ class BacktestWindow:
 
     def _apply_strategy_parameter_fixed_labels(self, strategy_id: str) -> None:
         fixed_suffix = "（本策略固定）"
+        if strategy_id == STRATEGY_CROSS_ID:
+            self.entry_reference_ema_caption.configure(text="穿越参考EMA周期")
+        else:
+            self.entry_reference_ema_caption.configure(text="挂单参考EMA")
         label_map = {
             "bar": (self.bar_caption, "K线周期"),
             "signal_mode": (self.signal_caption, "信号方向"),
@@ -1446,14 +1464,161 @@ class BacktestWindow:
             text = f"{base_text}{fixed_suffix}" if strategy_fixed_value(strategy_id, key) is not None else base_text
             widget.configure(text=text)
 
+    def _sync_backtest_params_viewport(self, event: object | None = None) -> None:
+        canvas = getattr(self, "_params_canvas", None)
+        scroll = getattr(self, "_params_scroll", None)
+        inner = getattr(self, "_params_inner", None)
+        inner_id = getattr(self, "_params_inner_window_id", None)
+        viewport = getattr(self, "_params_viewport", None)
+        if canvas is None or scroll is None or inner is None or inner_id is None:
+            return
+        if not self._widget_exists(canvas):
+            return
+        try:
+            self.window.update_idletasks()
+            canvas.update_idletasks()
+            if viewport is not None and self._widget_exists(viewport):
+                viewport.update_idletasks()
+        except Exception:
+            pass
+        try:
+            inner_w = int(canvas.winfo_width())
+        except Exception:
+            inner_w = 0
+        if event is not None and getattr(event, "widget", None) is canvas:
+            try:
+                inner_w = max(inner_w, int(getattr(event, "width", 0)))
+            except Exception:
+                pass
+        if inner_w <= 2 and viewport is not None and self._widget_exists(viewport):
+            try:
+                vw = max(int(viewport.winfo_width()), inner_w)
+            except Exception:
+                vw = inner_w
+            inner_w = vw
+            try:
+                if scroll.winfo_ismapped():
+                    inner_w -= int(scroll.winfo_width())
+            except Exception:
+                pass
+        inner_w = max(inner_w - 2, 0)
+        if inner_w > 2:
+            try:
+                canvas.itemconfigure(inner_id, width=inner_w)
+            except Exception:
+                pass
+        try:
+            inner_h = inner.winfo_reqheight()
+        except Exception:
+            return
+        try:
+            screen_h = max(int(self.window.winfo_screenheight()), 600)
+        except Exception:
+            screen_h = 800
+        cap = max(320, min(int(screen_h * 0.46), 920))
+        view_h = max(1, min(inner_h + 10, cap))
+        try:
+            canvas.configure(height=view_h)
+            bbox = canvas.bbox("all")
+            if bbox is not None:
+                canvas.configure(scrollregion=bbox)
+            else:
+                canvas.configure(scrollregion=(0, 0, int(canvas.cget("width") or 1), view_h))
+        except Exception:
+            return
+        shown = False
+        try:
+            content_bottom = float(bbox[3]) if bbox is not None else float(inner_h)
+            shown = content_bottom > float(view_h) + 2.0
+        except Exception:
+            shown = inner_h > view_h + 2
+        try:
+            if shown:
+                scroll.grid(row=0, column=1, sticky="ns")
+            else:
+                scroll.grid_remove()
+                canvas.yview_moveto(0.0)
+        except Exception:
+            pass
+
+    def _params_canvas_mousewheel(self, event: object) -> None:
+        canvas = getattr(self, "_params_canvas", None)
+        if canvas is None or not self._widget_exists(canvas):
+            return
+        try:
+            delta = int(getattr(event, "delta", 0) / 120)
+        except Exception:
+            delta = 0
+        if delta:
+            canvas.yview_scroll(-delta, "units")
+            return
+        num = getattr(event, "num", 0)
+        if num == 4:
+            canvas.yview_scroll(-3, "units")
+        elif num == 5:
+            canvas.yview_scroll(3, "units")
+
+    def _bind_params_canvas_mousewheel(self) -> None:
+        canvas = getattr(self, "_params_canvas", None)
+        if canvas is None:
+            return
+
+        def _enter(_e: object) -> None:
+            canvas.bind_all("<MouseWheel>", self._params_canvas_mousewheel)
+            canvas.bind_all("<Button-4>", self._params_canvas_mousewheel)
+            canvas.bind_all("<Button-5>", self._params_canvas_mousewheel)
+
+        def _leave(_e: object) -> None:
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _enter)
+        canvas.bind("<Leave>", _leave)
+
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
         self.window.rowconfigure(1, weight=1)
         self.window.rowconfigure(2, weight=3)
 
-        controls = ttk.LabelFrame(self.window, text="回测参数", padding=16)
-        controls.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        params_viewport = ttk.Frame(self.window)
+        params_viewport.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        params_viewport.columnconfigure(0, weight=1)
+        params_viewport.rowconfigure(0, weight=1)
+        params_viewport.bind("<Configure>", lambda _e: self._sync_backtest_params_viewport())
+        self._params_viewport = params_viewport
+
+        try:
+            _params_bg = self.window.cget("background")
+        except Exception:
+            _params_bg = ""
+
+        params_canvas = Canvas(
+            params_viewport,
+            highlightthickness=0,
+            bd=0,
+            background=_params_bg or "#f0f0f0",
+        )
+        params_canvas.grid(row=0, column=0, sticky="nsew")
+        params_scroll = ttk.Scrollbar(params_viewport, orient="vertical", command=params_canvas.yview)
+        params_canvas.configure(yscrollcommand=params_scroll.set)
+        self._params_canvas = params_canvas
+        self._params_scroll = params_scroll
+
+        params_inner = ttk.Frame(params_canvas)
+        self._params_inner_window_id = params_canvas.create_window((0, 0), window=params_inner, anchor="nw")
+        self._params_inner = params_inner
+        params_inner.columnconfigure(0, weight=1)
+        params_inner.bind("<Configure>", lambda _e: self._sync_backtest_params_viewport())
+        params_canvas.bind("<Configure>", self._sync_backtest_params_viewport)
+
+        controls = ttk.LabelFrame(params_inner, text="回测参数", padding=16)
+        controls.grid(row=0, column=0, sticky="ew")
         self._controls_frame = controls
+        self._bind_params_canvas_mousewheel()
+        self.window.after_idle(self._sync_backtest_params_viewport)
+        self.window.after(120, self._sync_backtest_params_viewport)
+
         for column in range(6):
             controls.columnconfigure(column, weight=1)
 
@@ -1484,6 +1649,7 @@ class BacktestWindow:
             state="readonly",
         )
         self.bar_combo.grid(row=row, column=5, sticky="ew")
+        row += 1
         self.ema_period_caption = ttk.Label(controls, text="EMA小周期")
         self.ema_period_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
         self.ema_period_entry = ttk.Entry(controls, textvariable=self.ema_period)
@@ -1572,6 +1738,18 @@ class BacktestWindow:
         self.time_stop_break_even_bars_label.grid(row=row, column=2, sticky="e", pady=(8, 0))
         self.time_stop_break_even_bars_entry = ttk.Entry(controls, textvariable=self.time_stop_break_even_bars)
         self.time_stop_break_even_bars_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
+
+        row += 1
+        self.hold_close_exit_bars_caption = ttk.Label(controls, text="满N根K线收盘价平仓")
+        self.hold_close_exit_bars_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.hold_close_exit_bars_entry = ttk.Entry(controls, textvariable=self.hold_close_exit_bars)
+        self.hold_close_exit_bars_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.hold_close_exit_hint = ttk.Label(
+            controls,
+            text="填0关闭；从开仓K线索引起计满N根已收盘K线后，当根按收盘价平仓。",
+            foreground="#57606a",
+        )
+        self.hold_close_exit_hint.grid(row=row, column=2, columnspan=4, sticky="w", pady=(8, 0))
 
         row += 1
         self.size_or_risk_label = ttk.Label(controls, text="固定风险金/数量")
@@ -2626,6 +2804,7 @@ class BacktestWindow:
     def _build_config(self) -> StrategyConfig:
         definition = self._selected_strategy_definition()
         dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
+        dynamic_tp_strategy = self._strategy_supports_dynamic_take_profit(definition.strategy_id)
         strategy_id = definition.strategy_id
         sizing_mode = BACKTEST_SIZING_OPTIONS[self.sizing_mode_label.get()]
         size_or_risk = self._parse_positive_decimal(self.risk_amount.get(), "固定风险金/数量")
@@ -2651,10 +2830,16 @@ class BacktestWindow:
         dynamic_fee_offset_enabled = False
         time_stop_break_even_enabled = False
         time_stop_break_even_bars = 0
-        if dynamic_strategy:
+        hold_close_exit_bars = 0
+        if strategy_uses_parameter(definition.strategy_id, "entry_reference_ema_period"):
+            entry_reference_ema_period = self._parse_nonnegative_int(
+                self.entry_reference_ema_period.get(),
+                "穿越参考EMA周期" if definition.strategy_id == STRATEGY_CROSS_ID else "挂单参考EMA",
+            )
+        if dynamic_tp_strategy:
             take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
-            max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
-            entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
+            if strategy_uses_parameter(definition.strategy_id, "max_entries_per_trend"):
+                max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
             dynamic_two_r_break_even = bool(self.dynamic_two_r_break_even.get())
             dynamic_fee_offset_enabled = bool(self.dynamic_fee_offset_enabled.get())
             time_stop_break_even_enabled = bool(self.time_stop_break_even_enabled.get())
@@ -2663,6 +2848,8 @@ class BacktestWindow:
                 if time_stop_break_even_enabled
                 else 0
             )
+        if strategy_uses_parameter(definition.strategy_id, "hold_close_exit_bars"):
+            hold_close_exit_bars = self._parse_nonnegative_int(self.hold_close_exit_bars.get(), "满N根K线收盘价平仓")
         entry_slippage_rate = self._parse_nonnegative_decimal(self.entry_slippage_percent.get(), "开仓滑点") / Decimal("100")
         exit_slippage_rate = self._parse_nonnegative_decimal(self.exit_slippage_percent.get(), "平仓滑点") / Decimal("100")
         return StrategyConfig(
@@ -2711,6 +2898,7 @@ class BacktestWindow:
             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
             time_stop_break_even_enabled=time_stop_break_even_enabled,
             time_stop_break_even_bars=time_stop_break_even_bars,
+            hold_close_exit_bars=hold_close_exit_bars,
             backtest_initial_capital=self._parse_positive_decimal(self.initial_capital.get(), "初始资金"),
             backtest_sizing_mode=sizing_mode,
             backtest_risk_percent=risk_percent,
@@ -2737,6 +2925,7 @@ class BacktestWindow:
             self._save_strategy_parameter_draft(previous_strategy_id)
         self._restore_strategy_parameter_draft(strategy_id)
         dynamic_strategy = is_dynamic_strategy_id(strategy_id)
+        dynamic_tp_strategy = self._strategy_supports_dynamic_take_profit(strategy_id)
         self.signal_combo["values"] = definition.allowed_signal_labels
         fixed_signal_mode = strategy_fixed_value(strategy_id, "signal_mode")
         if fixed_signal_mode is not None:
@@ -2765,8 +2954,6 @@ class BacktestWindow:
             dynamic_widgets = (
                 self.take_profit_mode_caption,
                 self.take_profit_mode_combo,
-                self.max_entries_caption,
-                self.max_entries_entry,
                 self.dynamic_two_r_break_even_check,
                 self.dynamic_fee_offset_check,
                 self.dynamic_fee_offset_hint_label,
@@ -2775,19 +2962,39 @@ class BacktestWindow:
                 self.time_stop_break_even_bars_entry,
             )
             for widget in dynamic_widgets:
-                if dynamic_strategy:
+                if dynamic_tp_strategy:
                     widget.grid()
                 else:
                     widget.grid_remove()
-            if not dynamic_strategy:
+            max_entries_widgets = (self.max_entries_caption, self.max_entries_entry)
+            for widget in max_entries_widgets:
+                if strategy_uses_parameter(strategy_id, "max_entries_per_trend"):
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            if not strategy_uses_parameter(strategy_id, "max_entries_per_trend"):
                 self.max_entries_caption.configure(text="每波最多开仓次数")
+            hold_close_widgets = (
+                self.hold_close_exit_bars_caption,
+                self.hold_close_exit_bars_entry,
+                self.hold_close_exit_hint,
+            )
+            for widget in hold_close_widgets:
+                if strategy_uses_parameter(strategy_id, "hold_close_exit_bars"):
+                    widget.grid()
+                else:
+                    widget.grid_remove()
             self._set_field_state(self.bar_combo, editable=strategy_is_parameter_editable(strategy_id, "bar", "backtest"))
             self._set_field_state(self.ema_period_entry, editable=strategy_is_parameter_editable(strategy_id, "ema_period", "backtest"))
             self._set_field_state(self.trend_ema_period_entry, editable=strategy_is_parameter_editable(strategy_id, "trend_ema_period", "backtest"))
             self._set_field_state(self.big_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "big_ema_period", "backtest"))
             self._set_field_state(self.signal_combo, editable=strategy_is_parameter_editable(strategy_id, "signal_mode", "backtest"))
+            self._set_field_state(
+                self.hold_close_exit_bars_entry,
+                editable=strategy_is_parameter_editable(strategy_id, "hold_close_exit_bars", "backtest"),
+            )
             self._apply_strategy_parameter_fixed_labels(strategy_id)
-        if dynamic_strategy and not self.entry_reference_ema_period.get().strip():
+        if dynamic_tp_strategy and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
         self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
@@ -2796,12 +3003,14 @@ class BacktestWindow:
             self.manual_summary.set("当前策略没有额外扩展统计。")
         if self._latest_result is None:
             self.manual_summary.set("当前策略没有额外扩展统计。")
+        if self._ui_alive():
+            self.window.after_idle(self._sync_backtest_params_viewport)
 
     def _sync_dynamic_take_profit_controls(self) -> None:
         if not hasattr(self, "dynamic_two_r_break_even_check"):
             return
         definition = self._selected_strategy_definition()
-        dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
+        dynamic_strategy = self._strategy_supports_dynamic_take_profit(definition.strategy_id)
         dynamic_take_profit = (
             dynamic_strategy and TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "fixed") == "dynamic"
         )

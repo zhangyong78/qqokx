@@ -93,6 +93,7 @@ class StrategyConfig:
     startup_chase_window_seconds: int = 0
     time_stop_break_even_enabled: bool = False
     time_stop_break_even_bars: int = 10
+    hold_close_exit_bars: int = 0
     trader_virtual_stop_loss: bool = False
     backtest_profile_id: str = ""
     backtest_profile_name: str = ""

@@ -65,12 +65,12 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     StrategyDefinition(
         strategy_id=STRATEGY_CROSS_ID,
         name="EMA 穿越策略",
-        summary="使用 EMA 穿越配合 ATR 止盈止损，适合作为基础趋势策略。",
+        summary="按穿越参考EMA的突破入场，配合 ATR 止盈止损，适合作为基础突破策略。",
         rule_description=(
-            "快 EMA 向上穿越慢 EMA 时做多，向下穿越时做空，"
-            "离场使用 ATR 止盈止损。"
+            "收盘价向上突破穿越参考 EMA 时做多，"
+            "止损按参考EMA减ATR，止盈按 ATR 倍数。"
         ),
-        parameter_hint="适合先做回测和 signal_only 观察，再决定是否进入交易。",
+        parameter_hint="优先关注穿越参考EMA周期、ATR周期与止盈止损倍数。",
         default_signal_label="双向",
         allowed_signal_labels=("双向", "只做多", "只做空"),
         supports_signal_only=True,

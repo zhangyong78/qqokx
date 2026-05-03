@@ -4,10 +4,65 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from okx_quant.models import Credentials, OrderPlan, StrategyConfig
-from okx_quant.okx_client import OkxApiError, OkxRestClient
+from okx_quant.okx_client import OkxApiError, OkxRestClient, _okx_trade_order_request_log_fragment
 
 
 class OkxClientOrderRequestTest(TestCase):
+    def test_parse_order_result_merges_attach_algo_errors(self) -> None:
+        client = OkxRestClient()
+        payload = {
+            "data": [
+                {
+                    "ordId": "",
+                    "clOrdId": "x",
+                    "sCode": "1",
+                    "sMsg": "操作全部失败",
+                    "attachAlgoOrds": [{"sCode": "59999", "sMsg": "子单说明"}],
+                }
+            ]
+        }
+        with self.assertRaises(OkxApiError) as ctx:
+            client._parse_order_result(payload, empty_message="empty")
+        msg = str(ctx.exception)
+        self.assertIn("附带TP/SL", msg)
+        self.assertIn("59999", msg)
+        self.assertIn("子单说明", msg)
+        self.assertIn("常见原因", msg)
+
+    def test_parse_order_result_bulk_fail_appends_raw_data(self) -> None:
+        client = OkxRestClient()
+        payload = {
+            "data": [{"ordId": "", "clOrdId": "c1", "sCode": "1", "sMsg": "操作全部失败"}]
+        }
+        with self.assertRaises(OkxApiError) as ctx:
+            client._parse_order_result(payload, empty_message="e")
+        msg = str(ctx.exception)
+        self.assertIn("常见原因", msg)
+        self.assertIn("data[0]=", msg)
+        self.assertIn("c1", msg)
+
+    def test_parse_order_result_accepts_integer_s_code(self) -> None:
+        client = OkxRestClient()
+        payload = {"data": [{"sCode": 1, "sMsg": "操作全部失败", "ordId": ""}]}
+        with self.assertRaises(OkxApiError) as ctx:
+            client._parse_order_result(payload, empty_message="e")
+        self.assertEqual(ctx.exception.code, "1")
+
+    def test_trade_order_request_log_fragment_includes_attach_tp_sl(self) -> None:
+        frag = _okx_trade_order_request_log_fragment(
+            {
+                "instId": "BTC-USDT-SWAP",
+                "tdMode": "cross",
+                "side": "buy",
+                "ordType": "limit",
+                "px": "76000",
+                "sz": "0.01",
+                "attachAlgoOrds": [{"tpTriggerPx": "77000", "slTriggerPx": "75000", "slTriggerPxType": "last"}],
+            }
+        )
+        self.assertIn("attach_tp_sl", frag)
+        self.assertIn("77000", frag)
+
     def test_get_order_book_empty_payload_uses_readable_error_message(self) -> None:
         client = OkxRestClient()
         client._request = lambda *args, **kwargs: {"data": []}  # type: ignore[method-assign]
@@ -109,6 +164,8 @@ class OkxClientOrderRequestTest(TestCase):
                         }
                     ]
                 }
+            if path == "/api/v5/account/config":
+                return {"data": [{"posMode": "long_short_mode"}]}
             captured["method"] = method
             captured["path"] = path
             captured["body"] = body
@@ -215,6 +272,8 @@ class OkxClientOrderRequestTest(TestCase):
                         }
                     ]
                 }
+            if path == "/api/v5/account/config":
+                return {"data": [{"posMode": "long_short_mode"}]}
             captured["method"] = method
             captured["path"] = path
             captured["body"] = body
@@ -313,6 +372,8 @@ class OkxClientOrderRequestTest(TestCase):
                         }
                     ]
                 }
+            if path == "/api/v5/account/config":
+                return {"data": [{"posMode": "long_short_mode"}]}
             captured["method"] = method
             captured["path"] = path
             captured["body"] = body
@@ -379,6 +440,78 @@ class OkxClientOrderRequestTest(TestCase):
         self.assertEqual(body["triggerPx"], "75000.1")
         self.assertEqual(body["triggerPxType"], "mark")
         self.assertEqual(len(body["attachAlgoOrds"]), 1)
+
+    def test_place_limit_net_mode_skips_pos_side_despite_launcher_long_short(self) -> None:
+        """OKX net_mode 下发 posSide 会拒单；须以账户 /account/config 为准。"""
+        client = OkxRestClient()
+        captured: dict[str, object] = {}
+
+        def _stub_request(method: str, path: str, params=None, body=None, **kwargs):
+            if path == "/api/v5/public/instruments":
+                return {
+                    "data": [
+                        {
+                            "instId": "BTC-USD-SWAP",
+                            "instType": "SWAP",
+                            "tickSz": "0.1",
+                            "lotSz": "0.1",
+                            "minSz": "0.1",
+                            "state": "live",
+                            "settleCcy": "BTC",
+                            "ctVal": "100",
+                            "ctMult": "1",
+                            "ctValCcy": "USD",
+                            "uly": "BTC-USD",
+                            "instFamily": "BTC-USD",
+                        }
+                    ]
+                }
+            if path == "/api/v5/account/config":
+                return {"data": [{"posMode": "net_mode"}]}
+            captured["method"] = method
+            captured["path"] = path
+            captured["body"] = body
+            return {"data": [{"ordId": "n1", "sCode": "0", "sMsg": ""}]}
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        config = StrategyConfig(
+            inst_id="BTC-USD-SWAP",
+            trade_inst_id="BTC-USD-SWAP",
+            local_tp_sl_inst_id="BTC-USD-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.1"),
+            trade_mode="isolated",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            tp_sl_mode="exchange",
+            take_profit_mode="dynamic",
+            risk_amount=Decimal("10"),
+        )
+        plan = OrderPlan(
+            inst_id="BTC-USD-SWAP",
+            side="buy",
+            pos_side="long",
+            size=Decimal("0.1"),
+            take_profit=Decimal("82000"),
+            stop_loss=Decimal("71000"),
+            entry_reference=Decimal("75000"),
+            atr_value=Decimal("1000"),
+            signal="long",
+            candle_ts=1710000000000,
+            tp_sl_inst_id="BTC-USD-SWAP",
+            tp_sl_mode="exchange",
+        )
+        client.place_limit_order(Credentials(api_key="", secret_key="", passphrase=""), config, plan, include_attached_protection=False)
+        body = captured["body"]
+        assert isinstance(body, dict)
+        self.assertNotIn("posSide", body)
+        self.assertEqual(body["ccy"], "BTC")
 
     def test_request_uses_code_when_okx_error_message_is_empty(self) -> None:
         client = OkxRestClient()

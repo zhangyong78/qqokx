@@ -2676,8 +2676,9 @@ class StrategyEngine:
             return (
                 f"OKX {label}被交易所拒绝 | 标的={inst_id} | clOrdId={cl_ord_id} | "
                 f"原始返回={normalized_detail}{code_text} | 常见原因："
-                "1) clOrdId 含非法字符；2) 保证金/可用余额不足；"
-                "3) 下单参数不合法（数量、价格精度、持仓模式）"
+                "1) clOrdId 含非法字符；2) 保证金/可用余额不足（含模拟盘虚拟金）；"
+                "3) 下单参数不合法（数量/张数步长、价格 tick、持仓模式 posSide）；"
+                "4) 附带止损/止盈与主单价位或触发类型不满足 OKX 规则（可在网页端用同参试挂对照）。"
             )
         return (
             f"OKX {label}失败 | 标的={inst_id} | clOrdId={cl_ord_id} | "

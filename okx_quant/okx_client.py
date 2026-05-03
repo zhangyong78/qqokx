@@ -9,6 +9,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import time
 from decimal import Decimal
 from typing import Any, Callable
 from urllib import error, parse, request
@@ -20,7 +21,7 @@ from okx_quant.candle_cache import (
     save_candle_cache,
 )
 from okx_quant.models import Candle, Credentials, Instrument, OrderPlan, StrategyConfig, TriggerPriceType
-from okx_quant.pricing import format_decimal, snap_to_increment
+from okx_quant.pricing import format_decimal, format_decimal_by_increment, snap_to_increment
 
 
 DEFAULT_HEADERS = {
@@ -44,6 +45,112 @@ class OkxApiError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.status = status
+
+
+def _okx_order_data_reject_message(item: dict[str, Any]) -> str:
+    """OKX /trade/order 等返回的 data[] 单项：主单失败或「操作全部失败」时尽量带出附带 TP/SL 子错误。"""
+    s_msg = str(item.get("sMsg") or "").strip() or "-"
+    s_code = str(item.get("sCode") if item.get("sCode") is not None else "").strip()
+    sub_code = str(item.get("subCode") if item.get("subCode") is not None else "").strip()
+    segments: list[str] = []
+    if s_msg and s_msg != "-":
+        segments.append(s_msg)
+    if s_code and s_code.lower() not in {"", "0", "none"}:
+        segments.append(f"sCode={s_code}")
+    if sub_code and sub_code.lower() not in {"", "none"}:
+        segments.append(f"subCode={sub_code}")
+
+    attach = item.get("attachAlgoOrds")
+    attach_had_detail = False
+    if isinstance(attach, list):
+        for idx, sub in enumerate(attach, start=1):
+            if not isinstance(sub, dict):
+                continue
+            sm = str(sub.get("sMsg") or "").strip()
+            sc = str(sub.get("sCode") if sub.get("sCode") is not None else "").strip()
+            if sm or (sc and sc.lower() not in {"", "0", "none"}):
+                attach_had_detail = True
+                segments.append(f"附带TP/SL[{idx}] sCode={sc or '-'} sMsg={sm or '-'}")
+
+    detail = " | ".join(segments) if segments else "OKX 订单请求被拒绝"
+    hint = _okx_order_reject_hint_by_code(s_code=s_code, sub_code=sub_code, item=item)
+    if hint:
+        detail += f" | 提示：{hint}"
+    if "操作全部失败" in s_msg:
+        detail += (
+            " | 常见原因：附带止盈止损价位或触发类型不符合规则；张数/tickSz 步长；"
+            "净持仓模式下误传 posSide（或双向模式漏传）；逐仓缺 ccy；模拟盘限制；保证金不足。"
+            "可在网页端用同价试挂对照。"
+        )
+    # OKX 有时只给笼统 sMsg，无 attach 子项：附上 data[0] 原文便于对照官方文档 / 工单
+    if "操作全部失败" in s_msg and not attach_had_detail:
+        try:
+            raw = json.dumps(item, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            raw = str(item)
+        if len(raw) > 700:
+            raw = raw[:700] + "…"
+        detail += f" | data[0]={raw}"
+    return detail
+
+
+def _okx_order_reject_hint_by_code(*, s_code: str, sub_code: str, item: dict[str, Any]) -> str:
+    code = (s_code or "").strip()
+    sub = (sub_code or "").strip()
+    msg = str(item.get("sMsg") or "").strip()
+    if code == "51008" or ("保证金" in msg and "不足" in msg):
+        return "账户保证金不足。请降低下单张数，或先撤掉占用保证金的挂单/仓位后再试。"
+    if code == "51000":
+        if "posSide" in msg:
+            return "posSide 与账户持仓模式不匹配。净持仓请勿传 posSide；双向持仓请传 long/short。"
+        if "clOrdId" in msg:
+            return "clOrdId 不符合规则。请只用英文/数字/短横线，长度控制在 32 字符以内。"
+        return "请求参数不合法。请检查 posSide、sz、px、tdMode 是否与账户设置一致。"
+    if code == "51121" or sub == "51121":
+        return "下单数量超出该合约或账户当前可下范围。请减小张数后重试。"
+    if code == "51131" or sub == "51131":
+        return "下单价格超出交易所允许范围。请贴近盘口价格后重试。"
+    if code == "50011":
+        return "请求过于频繁。请稍等 1-2 秒再重试。"
+    return ""
+
+
+def _okx_trade_order_request_log_fragment(order: dict[str, Any]) -> str:
+    """下单 POST body 摘要，便于对照 OKX 拒单原因（控制长度）。"""
+    keys = ("instId", "tdMode", "side", "ordType", "px", "sz", "posSide", "ccy", "clOrdId", "reduceOnly")
+    frag: dict[str, Any] = {k: order[k] for k in keys if k in order and order[k] is not None}
+    aa = order.get("attachAlgoOrds")
+    if isinstance(aa, list) and aa:
+        frag["attachAlgoOrds_n"] = len(aa)
+        first = aa[0] if isinstance(aa[0], dict) else None
+        if isinstance(first, dict):
+            frag["attach_tp_sl"] = {
+                k: first.get(k)
+                for k in (
+                    "tpTriggerPx",
+                    "slTriggerPx",
+                    "tpTriggerPxType",
+                    "slTriggerPxType",
+                    "tpOrdPx",
+                    "slOrdPx",
+                )
+                if first.get(k) not in (None, "")
+            }
+    try:
+        s = json.dumps(frag, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        s = str(frag)
+    if len(s) > 950:
+        s = s[:950] + "…"
+    return s
+
+
+def _raise_order_error_with_request(exc: OkxApiError, order: dict[str, Any]) -> None:
+    msg = str(exc)
+    if "请求=" in msg:
+        raise exc
+    req = _okx_trade_order_request_log_fragment(order)
+    raise OkxApiError(f"{msg} | 请求={req}", code=exc.code) from exc
 
 
 @dataclass
@@ -859,6 +966,62 @@ class OkxRestClient:
             raw=first,
         )
 
+    _ACCOUNT_CONFIG_CACHE_TTL_S = 45.0
+
+    def _get_account_config_cached(self, credentials: Credentials, config: StrategyConfig) -> OkxAccountConfig | None:
+        cache = getattr(self, "_account_config_posmode_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_account_config_posmode_cache", cache)
+        key = (credentials.profile_name or "", config.environment)
+        now = time.time()
+        hit = cache.get(key)
+        if hit is not None and now - hit[1] < self._ACCOUNT_CONFIG_CACHE_TTL_S:
+            return hit[0]
+        try:
+            cfg = self.get_account_config(credentials, environment=config.environment)
+        except OkxApiError:
+            # /account/config 偶发失败时，优先回退到最近一次可用缓存，
+            # 避免双向持仓账号因本次拿不到 posMode 而漏传 posSide 导致整单拒绝。
+            if hit is not None:
+                return hit[0]
+            return None
+        cache[key] = (cfg, now)
+        return cfg
+
+    def _derivative_order_pos_side(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        instrument: Instrument,
+        trade_side: str,
+        *,
+        plan_pos_side: str | None,
+    ) -> str | None:
+        """以 OKX 账户 posMode 为准，避免「界面净持仓 / 双向」与真实账户不一致导致整单被拒。"""
+        if instrument.inst_type not in {"SWAP", "FUTURES"}:
+            return plan_pos_side
+        acct = self._get_account_config_cached(credentials, config)
+        if acct is None:
+            # 请求 /account/config 失败时不猜 posSide，避免净持仓误传 long/short。
+            return None
+        mode = (acct.position_mode or "").strip().lower()
+        if mode == "long_short_mode":
+            return "long" if trade_side == "buy" else "short"
+        if mode == "net_mode":
+            return None
+        # 应答无 posMode 或未知枚举：退回启动器（老行为）；真正 net 双向用户请以 OKX 端为准勾选「净持仓」。
+        if config.position_mode == "long_short":
+            return "long" if trade_side == "buy" else "short"
+        return None
+
+    def _maybe_isolated_margin_ccy(self, order: dict[str, Any], *, instrument: Instrument, config: StrategyConfig) -> None:
+        if config.trade_mode != "isolated" or instrument.inst_type not in {"SWAP", "FUTURES"}:
+            return
+        cc = (instrument.settle_ccy or "").strip()
+        if cc:
+            order["ccy"] = cc
+
     def get_fills_history(
         self,
         credentials: Credentials,
@@ -1339,8 +1502,9 @@ class OkxRestClient:
             "tdMode": config.trade_mode,
             "side": plan.side,
             "ordType": "market",
-            "sz": format_decimal(plan.size),
+            "sz": _format_exchange_contract_sz(instrument, plan.size),
         }
+        tick = instrument.tick_size if instrument.tick_size and instrument.tick_size > 0 else None
         if include_attached_protection:
             order["attachAlgoOrds"] = [
                 _build_attached_algo_order(
@@ -1348,26 +1512,38 @@ class OkxRestClient:
                     plan=plan,
                     include_take_profit=include_take_profit,
                     stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                    tick_size=tick,
                 )
             ]
-        if plan.pos_side:
-            order["posSide"] = plan.pos_side
+        ps = self._derivative_order_pos_side(
+            credentials,
+            config,
+            instrument,
+            plan.side,
+            plan_pos_side=plan.pos_side,
+        )
+        if ps:
+            order["posSide"] = ps
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
         if cl_ord_id:
             order["clOrdId"] = cl_ord_id
 
-        payload = self._request(
-            "POST",
-            "/api/v5/trade/order",
-            body=order,
-            auth=True,
-            credentials=credentials,
-            simulated=config.environment == "demo",
-        )
-        return self._parse_order_result(
-            payload,
-            empty_message="OKX 返回了空的市价下单结果",
-            fallback_cl_ord_id=cl_ord_id,
-        )
+        try:
+            payload = self._request(
+                "POST",
+                "/api/v5/trade/order",
+                body=order,
+                auth=True,
+                credentials=credentials,
+                simulated=config.environment == "demo",
+            )
+            return self._parse_order_result(
+                payload,
+                empty_message="OKX 返回了空的市价下单结果",
+                fallback_cl_ord_id=cl_ord_id,
+            )
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
 
     def place_limit_order(
         self,
@@ -1384,13 +1560,19 @@ class OkxRestClient:
         if instrument.inst_type == "OPTION":
             raise OkxApiError("OKX 期权不支持这里的限价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
 
+        tick = instrument.tick_size
+        entry_px = plan.entry_reference
+        if tick is not None and tick > 0:
+            entry_px = snap_to_increment(entry_px, tick, "nearest")
+        px_txt = format_decimal(entry_px)
+        tick_opt = tick if tick is not None and tick > 0 else None
         order: dict[str, Any] = {
             "instId": plan.inst_id,
             "tdMode": config.trade_mode,
             "side": plan.side,
             "ordType": "limit",
-            "px": format_decimal(plan.entry_reference),
-            "sz": format_decimal(plan.size),
+            "px": px_txt,
+            "sz": _format_exchange_contract_sz(instrument, plan.size),
         }
         if include_attached_protection:
             order["attachAlgoOrds"] = [
@@ -1399,26 +1581,38 @@ class OkxRestClient:
                     plan=plan,
                     include_take_profit=include_take_profit,
                     stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                    tick_size=tick_opt,
                 )
             ]
-        if plan.pos_side:
-            order["posSide"] = plan.pos_side
+        ps = self._derivative_order_pos_side(
+            credentials,
+            config,
+            instrument,
+            plan.side,
+            plan_pos_side=plan.pos_side,
+        )
+        if ps:
+            order["posSide"] = ps
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
         if cl_ord_id:
             order["clOrdId"] = cl_ord_id
 
-        payload = self._request(
-            "POST",
-            "/api/v5/trade/order",
-            body=order,
-            auth=True,
-            credentials=credentials,
-            simulated=config.environment == "demo",
-        )
-        return self._parse_order_result(
-            payload,
-            empty_message="OKX 返回了空的限价下单结果",
-            fallback_cl_ord_id=cl_ord_id,
-        )
+        try:
+            payload = self._request(
+                "POST",
+                "/api/v5/trade/order",
+                body=order,
+                auth=True,
+                credentials=credentials,
+                simulated=config.environment == "demo",
+            )
+            return self._parse_order_result(
+                payload,
+                empty_message="OKX 返回了空的限价下单结果",
+                fallback_cl_ord_id=cl_ord_id,
+            )
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
 
     def place_trigger_limit_algo_order(
         self,
@@ -1440,7 +1634,7 @@ class OkxRestClient:
         if tick is None or tick <= 0:
             raise OkxApiError(f"{plan.inst_id} 缺少有效 tick，无法计算触发价与限价关系")
 
-        entry = plan.entry_reference
+        entry = snap_to_increment(plan.entry_reference, tick, "nearest")
         if plan.side == "buy":
             # OKX: buy stop — triggerPx must be strictly above orderPx (limit entry).
             trigger_px = snap_to_increment(entry + tick, tick, "up")
@@ -1453,12 +1647,13 @@ class OkxRestClient:
         else:
             raise OkxApiError(f"不支持的订单方向：{plan.side}")
 
+        tick_opt = tick
         order: dict[str, Any] = {
             "instId": plan.inst_id,
             "tdMode": config.trade_mode,
             "side": plan.side,
             "ordType": "trigger",
-            "sz": format_decimal(plan.size),
+            "sz": _format_exchange_contract_sz(instrument, plan.size),
             "triggerPx": format_decimal(trigger_px),
             "triggerPxType": config.tp_sl_trigger_type,
             "orderPx": format_decimal(entry),
@@ -1470,26 +1665,38 @@ class OkxRestClient:
                     plan=plan,
                     include_take_profit=include_take_profit,
                     stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                    tick_size=tick_opt,
                 )
             ]
-        if plan.pos_side:
-            order["posSide"] = plan.pos_side
+        ps = self._derivative_order_pos_side(
+            credentials,
+            config,
+            instrument,
+            plan.side,
+            plan_pos_side=plan.pos_side,
+        )
+        if ps:
+            order["posSide"] = ps
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
         if algo_cl_ord_id:
             order["algoClOrdId"] = algo_cl_ord_id
 
-        payload = self._request(
-            "POST",
-            "/api/v5/trade/order-algo",
-            body=order,
-            auth=True,
-            credentials=credentials,
-            simulated=config.environment == "demo",
-        )
-        return self._parse_algo_order_result(
-            payload,
-            empty_message="OKX 返回了空的触发价算法单结果",
-            fallback_algo_cl_ord_id=algo_cl_ord_id,
-        )
+        try:
+            payload = self._request(
+                "POST",
+                "/api/v5/trade/order-algo",
+                body=order,
+                auth=True,
+                credentials=credentials,
+                simulated=config.environment == "demo",
+            )
+            return self._parse_algo_order_result(
+                payload,
+                empty_message="OKX 返回了空的触发价算法单结果",
+                fallback_algo_cl_ord_id=algo_cl_ord_id,
+            )
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
 
     def place_simple_order(
         self,
@@ -1504,33 +1711,58 @@ class OkxRestClient:
         price: Decimal | None = None,
         cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
+        sz_txt = format_decimal(size)
         order: dict[str, Any] = {
             "instId": inst_id,
             "tdMode": config.trade_mode,
             "side": side,
             "ordType": ord_type,
-            "sz": format_decimal(size),
+            "sz": sz_txt,
         }
-        if pos_side:
-            order["posSide"] = pos_side
+        resolved_pos = pos_side
+        inst: Instrument | None = None
+        if infer_inst_type(inst_id) != "OPTION":
+            try:
+                inst = self.get_instrument(inst_id)
+            except OkxApiError:
+                inst = None
+            if inst is not None:
+                order["sz"] = _format_exchange_contract_sz(inst, size)
+                resolved_pos = self._derivative_order_pos_side(
+                    credentials,
+                    config,
+                    inst,
+                    side,
+                    plan_pos_side=pos_side,
+                )
+                self._maybe_isolated_margin_ccy(order, instrument=inst, config=config)
+        if resolved_pos:
+            order["posSide"] = resolved_pos
         if price is not None:
-            order["px"] = format_decimal(price)
+            if inst is not None and inst.tick_size is not None and inst.tick_size > 0:
+                px_snapped = snap_to_increment(price, inst.tick_size, "nearest")
+                order["px"] = format_decimal(px_snapped)
+            else:
+                order["px"] = format_decimal(price)
         if cl_ord_id:
             order["clOrdId"] = cl_ord_id
 
-        payload = self._request(
-            "POST",
-            "/api/v5/trade/order",
-            body=order,
-            auth=True,
-            credentials=credentials,
-            simulated=config.environment == "demo",
-        )
-        return self._parse_order_result(
-            payload,
-            empty_message="OKX 返回了空的下单结果",
-            fallback_cl_ord_id=cl_ord_id,
-        )
+        try:
+            payload = self._request(
+                "POST",
+                "/api/v5/trade/order",
+                body=order,
+                auth=True,
+                credentials=credentials,
+                simulated=config.environment == "demo",
+            )
+            return self._parse_order_result(
+                payload,
+                empty_message="OKX 返回了空的下单结果",
+                fallback_cl_ord_id=cl_ord_id,
+            )
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
 
     def place_aggressive_limit_order(
         self,
@@ -1742,8 +1974,9 @@ class OkxRestClient:
             raise OkxApiError(empty_message)
 
         first = payload["data"][0]
-        if first.get("sCode") not in {None, "", "0"}:
-            raise OkxApiError(first.get("sMsg", "OKX 订单请求被拒绝"), code=first.get("sCode"))
+        sc = first.get("sCode")
+        if str(sc).strip().lower() not in {"", "0", "none"}:
+            raise OkxApiError(_okx_order_data_reject_message(first), code=str(sc) if sc is not None else None)
 
         return OkxOrderResult(
             ord_id=first.get("ordId", ""),
@@ -1852,6 +2085,12 @@ class OkxRestClient:
 
         if payload.get("code") not in {None, "0"}:
             message = str(payload.get("msg") or "").strip() or f"OKX API 错误 code={payload.get('code')}"
+            data = payload.get("data")
+            first = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+            if isinstance(first, dict):
+                detail = _okx_order_data_reject_message(first)
+                if detail and detail not in message:
+                    message = f"{message} | {detail}"
             raise OkxApiError(message, code=payload.get("code"))
         return payload
 
@@ -1920,24 +2159,46 @@ def _to_bool(value: Any) -> bool | None:
     return None
 
 
+def _format_exchange_contract_sz(instrument: Instrument, size: Decimal) -> str:
+    """按 lotSz 步长格式化张数；OKX 对 sz 小数位不匹配时常返回笼统「操作全部失败」。"""
+    lot = instrument.lot_size
+    if instrument.inst_type in {"SWAP", "FUTURES"} and lot is not None and lot > 0:
+        snapped = snap_to_increment(size, lot, "down")
+        if snapped <= 0:
+            raise OkxApiError(
+                f"下单张数 {format_decimal(size)} 小于最小步长 {format_decimal_by_increment(lot, lot)}，请增大数量"
+            )
+        return format_decimal_by_increment(snapped, lot)
+    return format_decimal(size)
+
+
+def _format_okx_px_for_increment(value: Decimal, tick_size: Decimal | None) -> str:
+    if tick_size is not None and tick_size > 0:
+        snapped = snap_to_increment(value, tick_size, "nearest")
+        return format_decimal(snapped)
+    return format_decimal(value)
+
+
 def _build_attached_algo_order(
     *,
     config: StrategyConfig,
     plan: OrderPlan,
     include_take_profit: bool = True,
     stop_loss_algo_cl_ord_id: str | None = None,
+    tick_size: Decimal | None = None,
 ) -> dict[str, str]:
     order = {
-        "slTriggerPx": format_decimal(plan.stop_loss),
+        "slTriggerPx": _format_okx_px_for_increment(plan.stop_loss, tick_size),
         "slOrdPx": "-1",
         "slTriggerPxType": config.tp_sl_trigger_type,
     }
     if include_take_profit:
         order.update(
             {
-                "tpTriggerPx": format_decimal(plan.take_profit),
+                "tpTriggerPx": _format_okx_px_for_increment(plan.take_profit, tick_size),
                 "tpOrdPx": "-1",
                 "tpTriggerPxType": config.tp_sl_trigger_type,
+                "tpOrdKind": "condition",
             }
         )
     if stop_loss_algo_cl_ord_id:
@@ -1946,18 +2207,39 @@ def _build_attached_algo_order(
 
 
 def _extract_tp_sl_fields(item: dict[str, Any]) -> dict[str, Decimal | str | None]:
+    """合并主单字段与 attachAlgoOrds（可能多条：TP/SL 分站）。"""
+    take_profit_trigger_price = _first_decimal(item.get("tpTriggerPx"), item.get("takeProfitTriggerPrice"))
+    take_profit_order_price = _first_decimal(item.get("tpOrdPx"), item.get("takeProfitOrdPx"))
+    take_profit_trigger_price_type = item.get("tpTriggerPxType") or item.get("takeProfitTriggerPxType")
+    stop_loss_trigger_price = _first_decimal(item.get("slTriggerPx"), item.get("stopLossTriggerPrice"))
+    stop_loss_order_price = _first_decimal(item.get("slOrdPx"), item.get("stopLossOrdPx"))
+    stop_loss_trigger_price_type = item.get("slTriggerPxType") or item.get("stopLossTriggerPxType")
+
     attach_algo_orders = item.get("attachAlgoOrds")
-    if isinstance(attach_algo_orders, list) and attach_algo_orders:
-        source = attach_algo_orders[0] if isinstance(attach_algo_orders[0], dict) else item
-    else:
-        source = item
+    if isinstance(attach_algo_orders, list):
+        for raw in attach_algo_orders:
+            if not isinstance(raw, dict):
+                continue
+            if take_profit_trigger_price is None:
+                take_profit_trigger_price = _first_decimal(raw.get("tpTriggerPx"), raw.get("takeProfitTriggerPrice"))
+            if take_profit_order_price is None:
+                take_profit_order_price = _first_decimal(raw.get("tpOrdPx"), raw.get("takeProfitOrdPx"))
+            if take_profit_trigger_price_type is None:
+                take_profit_trigger_price_type = raw.get("tpTriggerPxType") or raw.get("takeProfitTriggerPxType")
+            if stop_loss_trigger_price is None:
+                stop_loss_trigger_price = _first_decimal(raw.get("slTriggerPx"), raw.get("stopLossTriggerPrice"))
+            if stop_loss_order_price is None:
+                stop_loss_order_price = _first_decimal(raw.get("slOrdPx"), raw.get("stopLossOrdPx"))
+            if stop_loss_trigger_price_type is None:
+                stop_loss_trigger_price_type = raw.get("slTriggerPxType") or raw.get("stopLossTriggerPxType")
+
     return {
-        "take_profit_trigger_price": _first_decimal(source.get("tpTriggerPx"), source.get("takeProfitTriggerPrice")),
-        "take_profit_order_price": _first_decimal(source.get("tpOrdPx"), source.get("takeProfitOrdPx")),
-        "take_profit_trigger_price_type": source.get("tpTriggerPxType") or source.get("takeProfitTriggerPxType"),
-        "stop_loss_trigger_price": _first_decimal(source.get("slTriggerPx"), source.get("stopLossTriggerPrice")),
-        "stop_loss_order_price": _first_decimal(source.get("slOrdPx"), source.get("stopLossOrdPx")),
-        "stop_loss_trigger_price_type": source.get("slTriggerPxType") or source.get("stopLossTriggerPxType"),
+        "take_profit_trigger_price": take_profit_trigger_price,
+        "take_profit_order_price": take_profit_order_price,
+        "take_profit_trigger_price_type": take_profit_trigger_price_type,
+        "stop_loss_trigger_price": stop_loss_trigger_price,
+        "stop_loss_order_price": stop_loss_order_price,
+        "stop_loss_trigger_price_type": stop_loss_trigger_price_type,
     }
 
 

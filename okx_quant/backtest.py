@@ -150,6 +150,7 @@ class BacktestResult:
     dynamic_fee_offset_enabled: bool = True
     time_stop_break_even_enabled: bool = False
     time_stop_break_even_bars: int = 0
+    hold_close_exit_bars: int = 0
     max_entries_per_trend: int = 1
     sizing_mode: str = "fixed_risk"
     compounding: bool = False
@@ -560,7 +561,7 @@ def _run_backtest_with_loaded_data(
     ema_values = ema([candle.close for candle in candles], config.ema_period) if candles else []
     trend_ema_values = ema([candle.close for candle in candles], config.trend_ema_period) if candles else []
     atr_values = atr(candles, config.atr_period) if candles else []
-    if is_dynamic_strategy_id(config.strategy_id):
+    if is_dynamic_strategy_id(config.strategy_id) or config.strategy_id == STRATEGY_CROSS_ID:
         big_ema_values: list[Decimal] = []
     else:
         big_ema_values = ema([candle.close for candle in candles], config.big_ema_period) if candles else []
@@ -611,6 +612,7 @@ def _run_backtest_with_loaded_data(
         dynamic_fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
         time_stop_break_even_enabled=bool(config.time_stop_break_even_enabled),
         time_stop_break_even_bars=int(config.resolved_time_stop_break_even_bars()),
+        hold_close_exit_bars=int(config.hold_close_exit_bars),
         max_entries_per_trend=int(config.max_entries_per_trend),
         sizing_mode=config.backtest_sizing_mode,
         compounding=config.backtest_compounding,
@@ -804,6 +806,22 @@ def format_backtest_report(result: BacktestResult) -> str:
             f"收盘价跌破/站回 EMA{result.trend_ema_period} 时按动态止损离场。"
         )
         lines.append("本策略不设固定止盈，回测使用收盘确认与收盘价离场。")
+    if result.strategy_id == STRATEGY_CROSS_ID:
+        lines.append(
+            f"交易逻辑：仅做多；收盘价上穿穿越参考EMA(EMA{result.entry_reference_ema_period})开仓，"
+            "止损=参考EMA-ATR×止损倍数，止盈=开仓价+ATR×止盈倍数。"
+        )
+        lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
+        if result.take_profit_mode == "dynamic":
+            lines.append(f"2R保本开关：{'开启' if result.dynamic_two_r_break_even else '关闭'}")
+            lines.append(f"手续费偏移开关：{'开启' if result.dynamic_fee_offset_enabled else '关闭'}")
+            lines.append(
+                "时间保本开关："
+                f"{'开启' if result.time_stop_break_even_enabled else '关闭'}"
+                f" | 阈值K线：{result.time_stop_break_even_bars if result.time_stop_break_even_bars > 0 else '未启用'}"
+            )
+        if result.hold_close_exit_bars > 0:
+            lines.append(f"持仓满 {result.hold_close_exit_bars} 根K线后按收盘价强制平仓（含平仓滑点）。")
     if report.profit_factor is None:
         lines.append("Profit Factor：无亏损交易")
     else:
@@ -908,9 +926,7 @@ def _load_backtest_candles(
 def _required_backtest_preload_candles(config: StrategyConfig) -> int:
     if config.strategy_id == STRATEGY_CROSS_ID:
         minimum = max(
-            config.ema_period + 2,
-            config.trend_ema_period + 2,
-            config.big_ema_period + 2,
+            config.resolved_entry_reference_ema_period() + 2,
             config.atr_period + 2,
         )
     elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
@@ -1065,12 +1081,16 @@ def _run_cross_backtest(
     *,
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> list[BacktestTrade]:
+    if config.signal_mode == "both":
+        raise RuntimeError("EMA 穿越回测不支持 signal_mode=双向，请使用只做多或只做空分别回测。")
     strategy = EmaAtrStrategy()
+    dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
+    eval_config = replace(config)
+    wanted_signal = "long" if config.signal_mode == "long_only" else "short"
+    reference_ema_period = eval_config.resolved_entry_reference_ema_period()
     minimum = max(
-        config.ema_period + 2,
-        config.trend_ema_period + 2,
-        config.big_ema_period + 2,
-        config.atr_period + 2,
+        reference_ema_period + 2,
+        eval_config.atr_period + 2,
     )
     if len(candles) < minimum:
         raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根。")
@@ -1080,6 +1100,8 @@ def _run_cross_backtest(
 
     trades: list[BacktestTrade] = []
     open_position: _OpenPosition | None = None
+    current_wave_signal: str | None = None
+    entries_in_current_wave = 0
 
     for index in range(trade_start_index, len(candles)):
         candle = candles[index]
@@ -1094,27 +1116,97 @@ def _run_cross_backtest(
             if closed_trade is not None:
                 trades.append(closed_trade)
                 open_position = None
+            elif (
+                int(config.hold_close_exit_bars) > 0
+                and index > open_position.entry_index
+                and _holding_bars_for_position(open_position, index) >= int(config.hold_close_exit_bars)
+            ):
+                exit_price_raw = candle.close
+                exit_price = _apply_slippage_price(
+                    exit_price_raw,
+                    signal=open_position.signal,
+                    tick_size=open_position.tick_size,
+                    slippage_rate=open_position.exit_slippage_rate,
+                    is_entry=False,
+                )
+                trades.append(
+                    _build_closed_trade(
+                        open_position,
+                        candle,
+                        index,
+                        exit_price_raw=exit_price_raw,
+                        exit_price=exit_price,
+                        exit_reason="hold_close_exit",
+                        exit_fee_rate=taker_fee_rate,
+                        exit_fee_type="taker",
+                    )
+                )
+                open_position = None
 
         if open_position is not None:
             continue
 
-        decision = strategy.evaluate(candles[: index + 1], config)
+        decision = strategy.evaluate(candles[: index + 1], eval_config)
         if decision.signal is None:
+            current_wave_signal = None
+            entries_in_current_wave = 0
+            continue
+        if decision.signal != wanted_signal:
+            continue
+        if current_wave_signal != decision.signal:
+            current_wave_signal = decision.signal
+            entries_in_current_wave = 0
+        if config.max_entries_per_trend > 0 and entries_in_current_wave >= config.max_entries_per_trend:
             continue
         if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
             continue
+        if decision.ema_value is None:
+            continue
 
-        resolved_config = _resolve_backtest_config(config, trades)
-        plan = _build_backtest_order_plan(
+        resolved_config = _resolve_backtest_config(eval_config, trades)
+        entry_reference = snap_to_increment(decision.entry_reference, instrument.tick_size, "nearest")
+        if wanted_signal == "long":
+            stop_loss_raw = decision.ema_value - (decision.atr_value * resolved_config.atr_stop_multiplier)
+            stop_loss = snap_to_increment(stop_loss_raw, instrument.tick_size, "up")
+            take_profit_raw = entry_reference + (decision.atr_value * resolved_config.atr_take_multiplier)
+            take_profit = snap_to_increment(take_profit_raw, instrument.tick_size, "down")
+            if stop_loss <= 0 or take_profit <= 0:
+                continue
+            side = "buy"
+            pos_side = None if resolved_config.position_mode != "long_short" else "long"
+            plan_signal = "long"
+        else:
+            stop_loss_raw = decision.ema_value + (decision.atr_value * resolved_config.atr_stop_multiplier)
+            stop_loss = snap_to_increment(stop_loss_raw, instrument.tick_size, "down")
+            take_profit_raw = entry_reference - (decision.atr_value * resolved_config.atr_take_multiplier)
+            take_profit = snap_to_increment(take_profit_raw, instrument.tick_size, "up")
+            if stop_loss <= 0 or take_profit <= 0:
+                continue
+            if stop_loss <= entry_reference or take_profit >= entry_reference:
+                continue
+            side = "sell"
+            pos_side = None if resolved_config.position_mode != "long_short" else "short"
+            plan_signal = "short"
+        size = _determine_backtest_order_size(
             instrument=instrument,
             config=resolved_config,
-            order_size=resolved_config.order_size,
-            signal=decision.signal,
-            entry_reference=decision.entry_reference,
+            entry_price=entry_reference,
+            stop_loss=stop_loss,
+            risk_price_compatible=True,
+        )
+        plan = OrderPlan(
+            inst_id=instrument.inst_id,
+            side=side,
+            pos_side=pos_side,
+            size=size,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            entry_reference=entry_reference,
             atr_value=decision.atr_value,
+            signal=plan_signal,
             candle_ts=decision.candle_ts,
-            signal_candle_high=decision.signal_candle_high,
-            signal_candle_low=decision.signal_candle_low,
+            tp_sl_inst_id=instrument.inst_id,
+            tp_sl_mode="exchange",
         )
         open_position = _create_open_position(
             instrument=instrument,
@@ -1129,10 +1221,17 @@ def _run_cross_backtest(
             entry_fee_rate=taker_fee_rate,
             exit_fee_rate=taker_fee_rate,
             entry_fee_type="taker",
-            entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
-            exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
-            funding_rate=config.backtest_funding_rate,
+            entry_slippage_rate=eval_config.resolved_backtest_entry_slippage_rate(),
+            exit_slippage_rate=eval_config.resolved_backtest_exit_slippage_rate(),
+            funding_rate=eval_config.backtest_funding_rate,
+            dynamic_take_profit_enabled=dynamic_take_profit_enabled,
+            dynamic_exit_fee_rate=taker_fee_rate,
+            dynamic_two_r_break_even=config.dynamic_two_r_break_even,
+            dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+            time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+            time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
         )
+        entries_in_current_wave += 1
 
     return trades
 

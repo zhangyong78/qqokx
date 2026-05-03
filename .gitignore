@@ -20,6 +20,8 @@ tests_artifacts/
 *.bak_*
 debug_*.txt
 dist/
+build/
+*.egg-info/
 reports/任务.txt
 reports/backtest_exports/batch_*.txt
 reports/backtest_exports/single_*.txt

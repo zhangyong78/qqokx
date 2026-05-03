@@ -6,6 +6,7 @@ import queue
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 from dataclasses import MISSING, asdict, dataclass, field, fields as dataclass_fields, replace
 from datetime import datetime, timedelta
@@ -25,6 +26,9 @@ from okx_quant.engine import (
     DEFAULT_DEBUG_ATR_PERIOD,
     FilledPosition,
     StrategyEngine,
+    _dynamic_two_taker_fee_offset_live,
+    _format_notify_size_with_unit,
+    _format_size_with_contract_equivalent,
     build_protection_plan,
     determine_order_size,
     fetch_hourly_ema_debug,
@@ -118,6 +122,7 @@ from okx_quant.smart_order_ui import SmartOrderWindow
 from okx_quant.strategy_live_chart import (
     DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT,
     DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS,
+    LINE_TRADING_DESK_CANDLE_INITIAL,
     LINE_TRADING_DESK_CANDLE_TARGET,
     StrategyLiveChartLayout,
     StrategyLiveChartSnapshot,
@@ -754,19 +759,25 @@ class LineTradingDeskWindowState:
     bar_var: StringVar
     status_text: StringVar
     position_tree: ttk.Treeview
+    pending_orders_tree: ttk.Treeview
+    order_history_tree: ttk.Treeview
     api_profile_var: StringVar
     param_atr_period: StringVar
     param_atr_mult: StringVar
     param_risk_amount: StringVar
     param_cross_mode: StringVar
     param_ray_action: StringVar
+    param_order_mode: StringVar
     param_rr_r: StringVar
     param_rr_side: StringVar
+    param_rr_fee_offset: BooleanVar
     ray_tree: ttk.Treeview
     rr_manage_tree: ttk.Treeview
     refresh_job: str | None = None
     last_snapshot: StrategyLiveChartSnapshot | None = None
     latest_positions: list[OkxPosition] = field(default_factory=list)
+    latest_pending_orders: list[OkxTradeOrderItem] = field(default_factory=list)
+    latest_order_history: list[OkxTradeOrderItem] = field(default_factory=list)
     line_annotations: list[LiveChartLineAnnotation] = field(default_factory=list)
     rr_annotations: list[DeskRiskRewardAnnotation] = field(default_factory=list)
     active_tool: str = "none"
@@ -787,6 +798,30 @@ class LineTradingDeskWindowState:
     desk_tick_symbol: str | None = None
     desk_canvas_configure_job: str | None = None
     desk_canvas_last_wh: tuple[int, int] | None = None
+    desk_refresh_generation: int = 0
+    desk_instrument_cache: dict[str, tuple[Instrument | None, float]] = field(default_factory=dict)
+    desk_submit_inflight: bool = False
+
+
+_LINE_DESK_INSTRUMENT_CACHE_TTL_S = 120.0
+
+
+# 划线交易台「新射线默认」下拉与内部 desk_ray_action（notify/long/short）对照
+# notify：只记日志/界面提示，不自动下单（不单独触发邮件；邮件仍看全局「启用邮件通知」等设置）
+_LINE_DESK_RAY_ACTION_LABEL_ZH = {"notify": "通知", "long": "开多", "short": "开空"}
+_LINE_DESK_RAY_ACTION_FROM_ZH = {v: k for k, v in _LINE_DESK_RAY_ACTION_LABEL_ZH.items()}
+
+
+def _line_trading_desk_normalize_ray_action(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return "notify"
+    low = s.lower()
+    if low in ("notify", "long", "short"):
+        return low
+    if s == "仅站内":
+        return "notify"
+    return _LINE_DESK_RAY_ACTION_FROM_ZH.get(s, "notify")
 
 
 @dataclass
@@ -1753,8 +1788,62 @@ def _sum_fill_pnl(fills: list[OkxFillHistoryItem]) -> Decimal | None:
     return total if seen else None
 
 
+_HISTORY_CACHE_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "inst_id": ("inst_id", "instId"),
+    "fill_time": ("fill_time", "fillTs", "fillTime", "ts"),
+    "order_id": ("order_id", "ordId"),
+    "trade_id": ("trade_id", "tradeId"),
+    "created_time": ("created_time", "cTime"),
+    "update_time": ("update_time", "uTime", "fillTime"),
+    "source_kind": ("source_kind",),
+    "client_order_id": ("client_order_id", "clOrdId"),
+    "algo_id": ("algo_id", "algoId"),
+    "algo_client_order_id": ("algo_client_order_id", "algoClOrdId"),
+    "side": ("side",),
+    "fill_size": ("fill_size", "fillSz", "sz"),
+    "fill_price": ("fill_price", "fillPx", "px"),
+    "pos_side": ("pos_side", "posSide"),
+    "direction": ("direction",),
+    "close_size": ("close_size", "closeSz", "sz"),
+    "close_avg_price": ("close_avg_price", "closeAvgPx", "avgPx"),
+}
+
+
+def _history_cache_field_str(record: dict[str, object], field: str) -> str:
+    if field == "source_kind":
+        for key in ("source_kind",):
+            value = record.get(key)
+            if value is not None and str(value).strip() != "":
+                return str(value)
+        raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
+        if record.get("algo_id") or record.get("algoId") or raw.get("algoId"):
+            return "algo"
+        return "normal"
+    for key in _HISTORY_CACHE_FIELD_ALIASES.get(field, (field,)):
+        value = record.get(key)
+        if value is None or value == "":
+            continue
+        return str(value)
+    return ""
+
+
 def _history_cache_key(record: dict[str, object], fields: tuple[str, ...]) -> str:
-    return "|".join(str(record.get(name, "") or "") for name in fields)
+    return "|".join(_history_cache_field_str(record, name) for name in fields)
+
+
+def _record_coalesce_int(record: dict[str, object], *keys: str) -> int | None:
+    for key in keys:
+        parsed = _parse_int_or_none(record.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _safe_build_history_instrument_map(client: OkxRestClient, inst_ids: list[str]) -> dict[str, Instrument]:
+    try:
+        return _build_history_instrument_map(client, inst_ids)
+    except Exception:
+        return {}
 
 
 def _merge_history_cache_records(
@@ -1803,11 +1892,11 @@ def _parse_int_or_none(value: object) -> int | None:
 
 
 def _order_item_from_cache(record: dict[str, object]) -> OkxTradeOrderItem | None:
-    inst_id = str(record.get("inst_id", "")).strip()
+    inst_id = str(record.get("inst_id") or record.get("instId") or "").strip().upper()
     if not inst_id:
         return None
-    created_time = _parse_int_or_none(record.get("created_time"))
-    update_time = _parse_int_or_none(record.get("update_time"))
+    created_time = _record_coalesce_int(record, "created_time", "cTime", "ts")
+    update_time = _record_coalesce_int(record, "update_time", "uTime", "fillTime")
     if created_time is None and update_time is None:
         return None
     return OkxTradeOrderItem(
@@ -1816,20 +1905,20 @@ def _order_item_from_cache(record: dict[str, object]) -> OkxTradeOrderItem | Non
         created_time=created_time,
         update_time=update_time,
         inst_id=inst_id,
-        inst_type=str(record.get("inst_type", "")),
+        inst_type=str(record.get("inst_type") or record.get("instType") or ""),
         side=str(record.get("side", "")) or None,
-        pos_side=str(record.get("pos_side", "")) or None,
-        td_mode=str(record.get("td_mode", "")) or None,
-        ord_type=str(record.get("ord_type", "")) or None,
+        pos_side=str(record.get("pos_side") or record.get("posSide") or "") or None,
+        td_mode=str(record.get("td_mode") or record.get("tdMode") or "") or None,
+        ord_type=str(record.get("ord_type") or record.get("ordType") or "") or None,
         state=str(record.get("state", "")) or None,
-        price=_parse_decimal_or_none(record.get("price")),
-        size=_parse_decimal_or_none(record.get("size")),
-        filled_size=_parse_decimal_or_none(record.get("filled_size")),
-        avg_price=_parse_decimal_or_none(record.get("avg_price")),
-        order_id=str(record.get("order_id", "")) or None,
-        algo_id=str(record.get("algo_id", "")) or None,
-        client_order_id=str(record.get("client_order_id", "")) or None,
-        algo_client_order_id=str(record.get("algo_client_order_id", "")) or None,
+        price=_parse_decimal_or_none(record.get("price")) or _parse_decimal_or_none(record.get("px")),
+        size=_parse_decimal_or_none(record.get("size")) or _parse_decimal_or_none(record.get("sz")),
+        filled_size=_parse_decimal_or_none(record.get("filled_size")) or _parse_decimal_or_none(record.get("accFillSz")),
+        avg_price=_parse_decimal_or_none(record.get("avg_price")) or _parse_decimal_or_none(record.get("avgPx")),
+        order_id=str(record.get("order_id") or record.get("ordId") or "") or None,
+        algo_id=str(record.get("algo_id") or record.get("algoId") or "") or None,
+        client_order_id=str(record.get("client_order_id") or record.get("clOrdId") or "") or None,
+        algo_client_order_id=str(record.get("algo_client_order_id") or record.get("algoClOrdId") or "") or None,
         pnl=_parse_decimal_or_none(record.get("pnl")),
         fee=_parse_decimal_or_none(record.get("fee")),
         fee_currency=str(record.get("fee_currency", "")) or None,
@@ -1851,31 +1940,31 @@ def _order_item_from_cache(record: dict[str, object]) -> OkxTradeOrderItem | Non
 
 
 def _fill_item_from_cache(record: dict[str, object]) -> OkxFillHistoryItem | None:
-    inst_id = str(record.get("inst_id", "")).strip()
-    fill_time = _parse_int_or_none(record.get("fill_time"))
+    inst_id = str(record.get("inst_id") or record.get("instId") or "").strip()
+    fill_time = _record_coalesce_int(record, "fill_time", "fillTs", "fillTime", "ts")
     if not inst_id or fill_time is None:
         return None
     return OkxFillHistoryItem(
         fill_time=fill_time,
         inst_id=inst_id,
-        inst_type=str(record.get("inst_type", "")),
+        inst_type=str(record.get("inst_type") or record.get("instType") or ""),
         side=str(record.get("side", "")) or None,
-        pos_side=str(record.get("pos_side", "")) or None,
-        fill_price=_parse_decimal_or_none(record.get("fill_price")),
-        fill_size=_parse_decimal_or_none(record.get("fill_size")),
-        fill_fee=_parse_decimal_or_none(record.get("fill_fee")),
-        fee_currency=str(record.get("fee_currency", "")) or None,
+        pos_side=str(record.get("pos_side") or record.get("posSide") or "") or None,
+        fill_price=_parse_decimal_or_none(record.get("fill_price")) or _parse_decimal_or_none(record.get("fillPx")),
+        fill_size=_parse_decimal_or_none(record.get("fill_size")) or _parse_decimal_or_none(record.get("fillSz")),
+        fill_fee=_parse_decimal_or_none(record.get("fill_fee")) or _parse_decimal_or_none(record.get("fillFee")),
+        fee_currency=str(record.get("fee_currency") or record.get("feeCcy") or record.get("fillFeeCcy") or "") or None,
         pnl=_parse_decimal_or_none(record.get("pnl")),
-        order_id=str(record.get("order_id", "")) or None,
-        trade_id=str(record.get("trade_id", "")) or None,
-        exec_type=str(record.get("exec_type", "")) or None,
+        order_id=str(record.get("order_id") or record.get("ordId") or "") or None,
+        trade_id=str(record.get("trade_id") or record.get("tradeId") or "") or None,
+        exec_type=str(record.get("exec_type") or record.get("execType") or "") or None,
         raw=record.get("raw") if isinstance(record.get("raw"), dict) else {},
     )
 
 
 def _position_history_item_from_cache(record: dict[str, object]) -> OkxPositionHistoryItem | None:
-    inst_id = str(record.get("inst_id", "")).strip()
-    update_time = _parse_int_or_none(record.get("update_time"))
+    inst_id = str(record.get("inst_id") or record.get("instId") or "").strip()
+    update_time = _record_coalesce_int(record, "update_time", "uTime", "ts")
     if not inst_id or update_time is None:
         return None
     return OkxPositionHistoryItem(
@@ -2031,6 +2120,9 @@ class QuantApp:
         self._pending_orders_last_refresh_at: datetime | None = None
         self._order_history_last_refresh_at: datetime | None = None
         self._fills_history_last_refresh_at: datetime | None = None
+        self._fills_history_from_local_only = False
+        self._fills_history_refresh_request: tuple[Credentials, str, str] | None = None
+        self._order_history_refresh_request: tuple[Credentials, str, str] | None = None
         self._position_history_last_refresh_at: datetime | None = None
         self._positions_zoom_column_groups: dict[str, dict[str, object]] = {}
         self._positions_zoom_column_vars: dict[str, dict[str, BooleanVar]] = {}
@@ -4186,6 +4278,8 @@ class QuantApp:
         if self._positions_zoom_window is not None and self._positions_zoom_window.winfo_exists():
             self._positions_zoom_window.focus_force()
             self._schedule_positions_zoom_sync()
+            self._load_local_history_cache()
+            self.refresh_positions()
             self.sync_positions_zoom_data()
             return
 
@@ -4365,7 +4459,11 @@ class QuantApp:
         history_actions = ttk.Frame(container)
         history_actions.grid(row=5, column=0, sticky="e", pady=(8, 0))
         ttk.Button(history_actions, text="同步历史委托", command=self.refresh_order_history).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(history_actions, text="同步历史成交", command=self.refresh_fill_history).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(
+            history_actions,
+            text="同步历史成交",
+            command=lambda: self.refresh_fill_history(sync_order_history=True),
+        ).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(history_actions, text="同步历史仓位", command=self.refresh_position_histories).grid(row=0, column=2, padx=(0, 6))
         ttk.Button(history_actions, text="同步全部历史", command=self.sync_all_histories).grid(row=0, column=3)
         if not self._positions_zoom_detail_collapsed:
@@ -4378,6 +4476,8 @@ class QuantApp:
             self.toggle_positions_zoom_fills_detail()
         if not self._positions_zoom_position_history_detail_collapsed:
             self.toggle_positions_zoom_position_history_detail()
+        self._load_local_history_cache()
+        self.refresh_positions()
         self.sync_positions_zoom_data()
         self._expand_to_screen(window)
         self._refresh_all_refresh_badges()
@@ -5583,6 +5683,7 @@ class QuantApp:
         self._start_pending_orders_refresh(credentials, environment)
         profile_name = credentials.profile_name or self._current_credential_profile()
         self._start_order_history_refresh(credentials, environment, profile_name)
+        self._start_fill_history_refresh(credentials, environment, profile_name)
 
     def refresh_pending_orders(self) -> None:
         credentials = self._current_credentials_or_none()
@@ -5610,6 +5711,7 @@ class QuantApp:
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
         profile_name = credentials.profile_name or self._current_credential_profile()
         self._start_order_history_refresh(credentials, environment, profile_name)
+        self._start_fill_history_refresh(credentials, environment, profile_name)
 
     def _active_history_scope(self) -> tuple[str, str]:
         credentials = self._current_credentials_or_none()
@@ -5627,6 +5729,8 @@ class QuantApp:
         self._latest_position_history = [
             item for record in position_records if (item := _position_history_item_from_cache(record)) is not None
         ]
+        self._fills_history_from_local_only = True
+        self._fills_history_last_refresh_at = None
         self._positions_zoom_order_history_base_summary = f"历史委托：{len(self._latest_order_history)} 条 | 本地缓存"
         self._positions_zoom_fills_summary_text.set(f"历史成交：{len(self._latest_fill_history)} 条 | 本地缓存")
         self._positions_zoom_position_history_base_summary = f"历史仓位：{len(self._latest_position_history)} 条 | 本地缓存"
@@ -6132,8 +6236,10 @@ class QuantApp:
 
     def _start_order_history_refresh(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         if self._order_history_refreshing:
+            self._order_history_refresh_request = (credentials, environment, profile_name)
             return
         self._order_history_refreshing = True
+        self._order_history_refresh_request = None
         self._positions_zoom_order_history_summary_text.set("正在同步历史委托...")
         threading.Thread(
             target=self._refresh_order_history_worker,
@@ -6167,7 +6273,7 @@ class QuantApp:
     def _refresh_order_history_worker(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         try:
             items = self.client.get_order_history(credentials, environment=environment, limit=200)
-            instruments = _build_history_instrument_map(self.client, [item.inst_id for item in items])
+            instruments = _safe_build_history_instrument_map(self.client, [item.inst_id for item in items])
             note = None
             effective_environment = environment
         except Exception as exc:
@@ -6176,16 +6282,21 @@ class QuantApp:
                 alternate = "live" if environment == "demo" else "demo"
                 try:
                     items = self.client.get_order_history(credentials, environment=alternate, limit=200)
-                    instruments = _build_history_instrument_map(self.client, [item.inst_id for item in items])
+                    instruments = _safe_build_history_instrument_map(self.client, [item.inst_id for item in items])
                     note = f"委托数据自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
                     effective_environment = alternate
                 except Exception:
-                    self.root.after(0, lambda: self._apply_order_history_error(message))
+                    self.root.after(0, lambda m=message: self._apply_order_history_error(m))
                     return
             else:
-                self.root.after(0, lambda: self._apply_order_history_error(message))
+                self.root.after(0, lambda m=message: self._apply_order_history_error(m))
                 return
-        self.root.after(0, lambda: self._apply_order_history(items, instruments, note, effective_environment, profile_name))
+        self.root.after(
+            0,
+            lambda i=items, ins=instruments, n=note, env=effective_environment, prof=profile_name: self._apply_order_history(
+                i, ins, n, env, prof
+            ),
+        )
 
     def _apply_pending_orders(
         self,
@@ -6219,29 +6330,41 @@ class QuantApp:
         profile_name: str | None = None,
     ) -> None:
         self._order_history_refreshing = False
-        active_profile = (profile_name or self._current_credential_profile()).strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
-        active_environment = effective_environment or self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
-        local_records = load_history_cache_records("orders", active_profile, active_environment)
-        merged_records = _merge_history_cache_records(
-            local_records=local_records,
-            remote_records=[_serialize_history_item(item) for item in items],
-            dedup_fields=("source_kind", "order_id", "algo_id", "client_order_id", "algo_client_order_id", "inst_id", "created_time"),
-        )
-        save_history_cache_records("orders", active_profile, active_environment, merged_records)
-        self._latest_order_history = [item for record in merged_records if (item := _order_item_from_cache(record)) is not None]
-        self._order_history_instruments = dict(instruments)
-        self._order_history_last_refresh_at = datetime.now()
-        _mark_refresh_health_success(self._order_history_refresh_health, at=self._order_history_last_refresh_at)
-        self._refresh_all_refresh_badges()
-        if effective_environment:
-            self._positions_effective_environment = effective_environment
-        timestamp = self._order_history_last_refresh_at.strftime("%H:%M:%S")
-        summary = f"历史委托：{len(self._latest_order_history)} 条 | 最近同步：{timestamp}"
-        if note:
-            summary = f"{summary} | {note}"
-        self._positions_zoom_order_history_base_summary = summary
-        self._positions_zoom_order_history_summary_text.set(summary)
-        self._render_order_history_view()
+        try:
+            active_profile = (profile_name or self._current_credential_profile()).strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
+            active_environment = effective_environment or self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+            local_records = load_history_cache_records("orders", active_profile, active_environment)
+            merged_records = _merge_history_cache_records(
+                local_records=local_records,
+                remote_records=[_serialize_history_item(item) for item in items],
+                dedup_fields=("source_kind", "order_id", "algo_id", "client_order_id", "algo_client_order_id", "inst_id", "created_time"),
+            )
+            save_history_cache_records("orders", active_profile, active_environment, merged_records)
+            self._latest_order_history = [item for record in merged_records if (item := _order_item_from_cache(record)) is not None]
+            self._latest_order_history.sort(key=lambda it: (it.update_time or it.created_time or 0), reverse=True)
+            self._order_history_instruments = dict(instruments)
+            self._order_history_last_refresh_at = datetime.now()
+            _mark_refresh_health_success(self._order_history_refresh_health, at=self._order_history_last_refresh_at)
+            self._refresh_all_refresh_badges()
+            if effective_environment:
+                self._positions_effective_environment = effective_environment
+            timestamp = self._order_history_last_refresh_at.strftime("%H:%M:%S")
+            summary = f"历史委托：{len(self._latest_order_history)} 条 | 最近同步：{timestamp}"
+            if not items:
+                summary = f"{summary} | 本次 API 返回 0 条（请核对模拟/实盘环境与 API 权限）"
+            if note:
+                summary = f"{summary} | {note}"
+            self._positions_zoom_order_history_base_summary = summary
+            self._positions_zoom_order_history_summary_text.set(summary)
+            self._render_order_history_view()
+        except Exception as exc:
+            self._apply_order_history_error(str(exc))
+            return
+        pending_order_refresh = self._order_history_refresh_request
+        self._order_history_refresh_request = None
+        if pending_order_refresh is not None:
+            pcred, penv, pprof = pending_order_refresh
+            self.root.after(0, lambda c=pcred, e=penv, p=pprof: self._start_order_history_refresh(c, e, p))
 
     def _apply_pending_orders_error(self, message: str) -> None:
         self._pending_orders_refreshing = False
@@ -6260,6 +6383,7 @@ class QuantApp:
 
     def _apply_order_history_error(self, message: str) -> None:
         self._order_history_refreshing = False
+        self._order_history_refresh_request = None
         friendly_message = _format_network_error_message(message)
         _mark_refresh_health_failure(self._order_history_refresh_health, friendly_message)
         self._refresh_all_refresh_badges()
@@ -6530,15 +6654,15 @@ class QuantApp:
         self._start_fill_history_refresh(credentials, environment, profile_name)
 
     def sync_all_histories(self) -> None:
-        self.refresh_order_history()
         self.refresh_position_histories()
+        self.refresh_order_history()
 
     def sync_positions_zoom_data(self) -> None:
         self.refresh_pending_orders()
-        self.refresh_order_history()
         self.refresh_position_histories()
+        self.refresh_order_history()
 
-    def refresh_fill_history(self) -> None:
+    def refresh_fill_history(self, *, sync_order_history: bool = False) -> None:
         credentials = self._current_credentials_or_none()
         if credentials is None:
             self._positions_zoom_fills_summary_text.set("未配置 API 凭证，无法读取历史成交。")
@@ -6546,6 +6670,8 @@ class QuantApp:
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
         profile_name = credentials.profile_name or self._current_credential_profile()
         self._start_fill_history_refresh(credentials, environment, profile_name)
+        if sync_order_history:
+            self._start_order_history_refresh(credentials, environment, profile_name)
 
     def expand_fill_history_limit(self) -> None:
         self._fill_history_fetch_limit, self._fill_history_load_more_clicks, next_label = _advance_fill_history_limit(
@@ -6571,8 +6697,10 @@ class QuantApp:
 
     def _start_fill_history_refresh(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         if self._fills_history_refreshing:
+            self._fills_history_refresh_request = (credentials, environment, profile_name)
             return
         self._fills_history_refreshing = True
+        self._fills_history_refresh_request = None
         self._positions_zoom_fills_summary_text.set("正在同步历史成交...")
         threading.Thread(
             target=self._refresh_fill_history_worker,
@@ -6594,7 +6722,7 @@ class QuantApp:
     def _refresh_fill_history_worker(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         try:
             fills = self.client.get_fills_history(credentials, environment=environment, limit=self._fill_history_fetch_limit)
-            instruments = _build_history_instrument_map(self.client, [item.inst_id for item in fills])
+            instruments = _safe_build_history_instrument_map(self.client, [item.inst_id for item in fills])
             note = None
             effective_environment = environment
         except Exception as exc:
@@ -6603,22 +6731,27 @@ class QuantApp:
                 alternate = "live" if environment == "demo" else "demo"
                 try:
                     fills = self.client.get_fills_history(credentials, environment=alternate, limit=self._fill_history_fetch_limit)
-                    instruments = _build_history_instrument_map(self.client, [item.inst_id for item in fills])
+                    instruments = _safe_build_history_instrument_map(self.client, [item.inst_id for item in fills])
                     note = f"历史数据自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
                     effective_environment = alternate
                 except Exception:
-                    self.root.after(0, lambda: self._apply_fill_history_error(message))
+                    self.root.after(0, lambda m=message: self._apply_fill_history_error(m))
                     return
             else:
-                self.root.after(0, lambda: self._apply_fill_history_error(message))
+                self.root.after(0, lambda m=message: self._apply_fill_history_error(m))
                 return
-        self.root.after(0, lambda: self._apply_fill_history(fills, instruments, note, effective_environment, profile_name))
+        self.root.after(
+            0,
+            lambda f=fills, ins=instruments, n=note, env=effective_environment, prof=profile_name: self._apply_fill_history(
+                f, ins, n, env, prof
+            ),
+        )
 
     def _refresh_position_history_worker(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         try:
             position_history = self.client.get_positions_history(credentials, environment=environment, limit=self._position_history_fetch_limit)
             usdt_prices = _build_position_history_usdt_price_map(self.client, position_history)
-            instruments = _build_history_instrument_map(self.client, [item.inst_id for item in position_history])
+            instruments = _safe_build_history_instrument_map(self.client, [item.inst_id for item in position_history])
             note = None
             effective_environment = environment
         except Exception as exc:
@@ -6628,7 +6761,7 @@ class QuantApp:
                 try:
                     position_history = self.client.get_positions_history(credentials, environment=alternate, limit=self._position_history_fetch_limit)
                     usdt_prices = _build_position_history_usdt_price_map(self.client, position_history)
-                    instruments = _build_history_instrument_map(self.client, [item.inst_id for item in position_history])
+                    instruments = _safe_build_history_instrument_map(self.client, [item.inst_id for item in position_history])
                     note = f"历史数据自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
                     effective_environment = alternate
                 except Exception:
@@ -6658,27 +6791,40 @@ class QuantApp:
         profile_name: str | None = None,
     ) -> None:
         self._fills_history_refreshing = False
-        active_profile = (profile_name or self._current_credential_profile()).strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
-        active_environment = effective_environment or self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
-        local_records = load_history_cache_records("fills", active_profile, active_environment)
-        merged_records = _merge_history_cache_records(
-            local_records=local_records,
-            remote_records=[_serialize_history_item(item) for item in fills],
-            dedup_fields=("trade_id", "order_id", "inst_id", "fill_time", "side", "fill_size", "fill_price"),
-        )
-        save_history_cache_records("fills", active_profile, active_environment, merged_records)
-        self._latest_fill_history = [item for record in merged_records if (item := _fill_item_from_cache(record)) is not None]
-        self._fill_history_instruments = dict(instruments)
-        self._fills_history_last_refresh_at = datetime.now()
-        self._positions_history_last_refresh_at = self._fills_history_last_refresh_at
-        if effective_environment:
-            self._positions_effective_environment = effective_environment
-        timestamp = self._fills_history_last_refresh_at.strftime("%H:%M:%S")
-        fill_summary = f"历史成交：{len(self._latest_fill_history)} 条 | 最近同步：{timestamp}"
-        if note:
-            fill_summary = f"{fill_summary} | {note}"
-        self._positions_zoom_fills_summary_text.set(fill_summary)
-        self._render_positions_zoom_fills_view()
+        self._fills_history_from_local_only = False
+        try:
+            active_profile = (profile_name or self._current_credential_profile()).strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
+            active_environment = effective_environment or self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+            local_records = load_history_cache_records("fills", active_profile, active_environment)
+            merged_records = _merge_history_cache_records(
+                local_records=local_records,
+                remote_records=[_serialize_history_item(item) for item in fills],
+                dedup_fields=("trade_id", "order_id", "inst_id", "fill_time", "side", "fill_size", "fill_price"),
+            )
+            save_history_cache_records("fills", active_profile, active_environment, merged_records)
+            self._latest_fill_history = [item for record in merged_records if (item := _fill_item_from_cache(record)) is not None]
+            self._latest_fill_history.sort(key=lambda it: (it.fill_time or 0), reverse=True)
+            self._fill_history_instruments = dict(instruments)
+            self._fills_history_last_refresh_at = datetime.now()
+            self._positions_history_last_refresh_at = self._fills_history_last_refresh_at
+            if effective_environment:
+                self._positions_effective_environment = effective_environment
+            timestamp = self._fills_history_last_refresh_at.strftime("%H:%M:%S")
+            fill_summary = f"历史成交：{len(self._latest_fill_history)} 条 | 最近同步：{timestamp}"
+            if not fills:
+                fill_summary = f"{fill_summary} | 本次 API 返回 0 条（请核对模拟/实盘环境与 API 权限）"
+            if note:
+                fill_summary = f"{fill_summary} | {note}"
+            self._positions_zoom_fills_summary_text.set(fill_summary)
+            self._render_positions_zoom_fills_view()
+        except Exception as exc:
+            self._apply_fill_history_error(str(exc))
+            return
+        pending_fill_refresh = self._fills_history_refresh_request
+        self._fills_history_refresh_request = None
+        if pending_fill_refresh is not None:
+            pcred, penv, pprof = pending_fill_refresh
+            self.root.after(0, lambda c=pcred, e=penv, p=pprof: self._start_fill_history_refresh(c, e, p))
 
     def _apply_position_history(
         self,
@@ -6730,6 +6876,7 @@ class QuantApp:
 
     def _apply_fill_history_error(self, message: str) -> None:
         self._fills_history_refreshing = False
+        self._fills_history_refresh_request = None
         self._positions_zoom_fills_summary_text.set(f"历史成交读取失败：{message}")
 
     def _apply_position_history_error(self, message: str) -> None:
@@ -6770,7 +6917,9 @@ class QuantApp:
                   ),
                   tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
               )
-        if self._fills_history_last_refresh_at is not None:
+        if self._fills_history_from_local_only:
+            summary = f"历史成交：{len(self._latest_fill_history)} 条 | 本地缓存"
+        elif self._fills_history_last_refresh_at is not None:
             timestamp = self._fills_history_last_refresh_at.strftime("%H:%M:%S")
             summary = f"历史成交：{len(self._latest_fill_history)} 条 | 最近刷新：{timestamp}"
         else:
@@ -7748,6 +7897,7 @@ class QuantApp:
                 dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get(),
                 time_stop_break_even_enabled=self.time_stop_break_even_enabled.get(),
                 time_stop_break_even_bars=self.time_stop_break_even_bars.get(),
+                hold_close_exit_bars="0",
                 signal_mode_label=self.signal_mode_label.get(),
                 trade_mode_label=self.trade_mode_label.get(),
                 position_mode_label=self.position_mode_label.get(),
@@ -7881,7 +8031,7 @@ class QuantApp:
         param_atr_mult = StringVar(value="1")
         param_risk_amount = StringVar(value="100")
         param_cross_mode = StringVar(value="tick_last")
-        param_ray_action = StringVar(value="notify")
+        param_ray_action = StringVar(value=_LINE_DESK_RAY_ACTION_LABEL_ZH["notify"])
         param_rr_r = StringVar(value="2")
         param_rr_side = StringVar(value="long")
         pr = 0
@@ -7905,16 +8055,31 @@ class QuantApp:
             width=10,
             state="readonly",
             textvariable=param_ray_action,
-            values=("notify", "long", "short"),
+            values=tuple(_LINE_DESK_RAY_ACTION_LABEL_ZH[k] for k in ("notify", "long", "short")),
         ).grid(row=pr, column=9, padx=(4, 12))
         ttk.Label(param_card, text="盈亏比R").grid(row=pr, column=10, sticky="w")
         ttk.Entry(param_card, width=5, textvariable=param_rr_r).grid(row=pr, column=11, padx=(4, 0))
+        param_order_mode = StringVar(value="限价挂单")
+        desk_pr2 = 1
+        ttk.Label(param_card, text="开仓方式").grid(row=desk_pr2, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(
+            param_card,
+            width=14,
+            state="readonly",
+            textvariable=param_order_mode,
+            values=("限价挂单", "对手价"),
+        ).grid(row=desk_pr2, column=1, padx=(4, 12), sticky="w", pady=(6, 0))
         hint = ttk.Label(
             param_card,
-            text="标的默认可选5个主流永续；周期默认1H。K线纵轴价、盈亏比列表与持仓价等按所选合约最小变动单位(tick)显示小数。滚轮缩放；Shift+拖或区间放大后在空白处左键拖平移。",
+            text=(
+                "标的默认可选5个主流永续；周期默认1H。右侧「账户」可切换当前持仓 / 当前委托 / 历史委托（均按当前标的过滤）。"
+                "K线纵轴价、盈亏比与持仓价等按 tick 显示。滚轮缩放；Shift+拖或区间放大后在空白处左键拖平移。"
+                "盈亏比列表有选中行时，开多/开空将按该行提交「限价+交易所止盈止损」（非单笔裸限价）。"
+                "开仓方式「对手价」为 IOC 吃单。"
+            ),
             foreground="#555",
         )
-        hint.grid(row=1, column=0, columnspan=14, sticky="w", pady=(6, 0))
+        hint.grid(row=2, column=0, columnspan=14, sticky="w", pady=(6, 0))
 
         chart_frame = ttk.Frame(container)
         chart_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 8))
@@ -7928,7 +8093,17 @@ class QuantApp:
         right.columnconfigure(0, weight=1)
         right.rowconfigure(3, weight=1)
         status_text = StringVar(value="划线交易台已就绪。")
-        ttk.Label(right, textvariable=status_text, wraplength=420, justify="left").grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        _desk_status_bg = ttk.Style(self.root).lookup("TFrame", "background") or "#ececec"
+        Label(
+            right,
+            textvariable=status_text,
+            wraplength=460,
+            justify="left",
+            anchor="nw",
+            height=3,
+            background=_desk_status_bg,
+            font=("Microsoft YaHei UI", 9),
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
         ray_box = ttk.LabelFrame(right, text="射线触发（一次性）", padding=6)
         ray_box.grid(row=1, column=0, sticky="ew", pady=(0, 6))
@@ -7975,13 +8150,25 @@ class QuantApp:
         ttk.Button(rr_btn_row, text="触发价委托", command=self._line_trading_desk_submit_rr_trigger_order_from_tree).grid(
             row=0, column=2, padx=(0, 4)
         )
+        param_rr_fee_offset = BooleanVar(value=True)
+        ttk.Checkbutton(
+            rr_btn_row,
+            text="启用手续费偏移（按2倍Taker手续费留缓冲）",
+            variable=param_rr_fee_offset,
+        ).grid(row=0, column=3, padx=(10, 0), sticky="w")
 
-        positions_box = ttk.LabelFrame(right, text="持仓（简版）", padding=8)
+        positions_box = ttk.LabelFrame(right, text="账户（持仓与委托）", padding=8)
         positions_box.grid(row=3, column=0, sticky="nsew")
         positions_box.columnconfigure(0, weight=1)
         positions_box.rowconfigure(0, weight=1)
+        desk_orders_nb = ttk.Notebook(positions_box)
+        desk_orders_nb.grid(row=0, column=0, sticky="nsew")
+
+        tab_pos = ttk.Frame(desk_orders_nb)
+        tab_pos.columnconfigure(0, weight=1)
+        tab_pos.rowconfigure(0, weight=1)
         position_tree = ttk.Treeview(
-            positions_box,
+            tab_pos,
             columns=("inst_id", "pos_side", "size", "avg_price", "mark_price", "upl"),
             show="headings",
             height=12,
@@ -7989,7 +8176,7 @@ class QuantApp:
         for col, text, width in (
             ("inst_id", "合约", 160),
             ("pos_side", "方向", 70),
-            ("size", "数量", 80),
+            ("size", "数量(币)", 80),
             ("avg_price", "开仓均价", 90),
             ("mark_price", "标记价", 90),
             ("upl", "浮盈亏", 90),
@@ -7997,9 +8184,52 @@ class QuantApp:
             position_tree.heading(col, text=text)
             position_tree.column(col, width=width, anchor="center")
         position_tree.grid(row=0, column=0, sticky="nsew")
-        y_scroll = ttk.Scrollbar(positions_box, orient="vertical", command=position_tree.yview)
-        y_scroll.grid(row=0, column=1, sticky="ns")
-        position_tree.configure(yscrollcommand=y_scroll.set)
+        pos_y_scroll = ttk.Scrollbar(tab_pos, orient="vertical", command=position_tree.yview)
+        pos_y_scroll.grid(row=0, column=1, sticky="ns")
+        position_tree.configure(yscrollcommand=pos_y_scroll.set)
+        desk_orders_nb.add(tab_pos, text="当前持仓")
+
+        order_headings = (
+            ("inst_id", "合约", 124),
+            ("side", "方向", 40),
+            ("ord_type", "类型", 56),
+            ("px", "价格", 74),
+            ("sz", "数量(币)", 92),
+            ("filled", "已成交", 88),
+            ("tp", "止盈", 128),
+            ("sl", "止损", 128),
+            ("state", "状态", 64),
+            ("src", "来源", 44),
+            ("ut", "更新", 86),
+        )
+        tab_pend = ttk.Frame(desk_orders_nb)
+        tab_pend.columnconfigure(0, weight=1)
+        tab_pend.rowconfigure(0, weight=1)
+        pending_orders_tree = ttk.Treeview(tab_pend, columns=tuple(c[0] for c in order_headings), show="headings", height=10)
+        for col, text, width in order_headings:
+            pending_orders_tree.heading(col, text=text)
+            pending_orders_tree.column(col, width=width, anchor="center")
+        pending_orders_tree.grid(row=0, column=0, sticky="nsew")
+        pend_y_scroll = ttk.Scrollbar(tab_pend, orient="vertical", command=pending_orders_tree.yview)
+        pend_y_scroll.grid(row=0, column=1, sticky="ns")
+        pending_orders_tree.configure(yscrollcommand=pend_y_scroll.set)
+        pend_toolbar = ttk.Frame(tab_pend)
+        pend_toolbar.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(pend_toolbar, text="刷新", command=self._line_trading_desk_refresh_pending_tab).pack(side="left")
+        desk_orders_nb.add(tab_pend, text="当前委托")
+
+        tab_hist = ttk.Frame(desk_orders_nb)
+        tab_hist.columnconfigure(0, weight=1)
+        tab_hist.rowconfigure(0, weight=1)
+        order_history_tree = ttk.Treeview(tab_hist, columns=tuple(c[0] for c in order_headings), show="headings", height=10)
+        for col, text, width in order_headings:
+            order_history_tree.heading(col, text=text)
+            order_history_tree.column(col, width=width, anchor="center")
+        order_history_tree.grid(row=0, column=0, sticky="nsew")
+        hist_y_scroll = ttk.Scrollbar(tab_hist, orient="vertical", command=order_history_tree.yview)
+        hist_y_scroll.grid(row=0, column=1, sticky="ns")
+        order_history_tree.configure(yscrollcommand=hist_y_scroll.set)
+        desk_orders_nb.add(tab_hist, text="历史委托")
 
         action_row = ttk.Frame(right)
         action_row.grid(row=4, column=0, sticky="ew", pady=(6, 0))
@@ -8009,7 +8239,10 @@ class QuantApp:
         ttk.Button(action_row, text="挂买一/卖一平仓", command=lambda: self._line_trading_desk_flatten_selected("best_quote")).grid(
             row=0, column=1, padx=(0, 4)
         )
-        ttk.Button(action_row, text="关闭", command=self._close_line_trading_desk_window).grid(row=0, column=2)
+        ttk.Button(action_row, text="撤销委托", command=self._line_trading_desk_cancel_selected_pending_order).grid(
+            row=0, column=2, padx=(0, 4)
+        )
+        ttk.Button(action_row, text="关闭", command=self._close_line_trading_desk_window).grid(row=0, column=3)
 
         state = LineTradingDeskWindowState(
             window=window,
@@ -8018,14 +8251,18 @@ class QuantApp:
             bar_var=bar_var,
             status_text=status_text,
             position_tree=position_tree,
+            pending_orders_tree=pending_orders_tree,
+            order_history_tree=order_history_tree,
             api_profile_var=api_profile_var,
             param_atr_period=param_atr_period,
             param_atr_mult=param_atr_mult,
             param_risk_amount=param_risk_amount,
             param_cross_mode=param_cross_mode,
             param_ray_action=param_ray_action,
+            param_order_mode=param_order_mode,
             param_rr_r=param_rr_r,
             param_rr_side=param_rr_side,
+            param_rr_fee_offset=param_rr_fee_offset,
             ray_tree=ray_tree,
             rr_manage_tree=rr_manage_tree,
             desk_visible_bars=200,
@@ -8047,7 +8284,8 @@ class QuantApp:
         symbol_var.trace_add("write", lambda *_: self._on_line_trading_desk_symbol_or_bar_changed())
         bar_var.trace_add("write", lambda *_: self._on_line_trading_desk_symbol_or_bar_changed())
         api_profile_var.trace_add("write", lambda *_: self._on_line_trading_desk_api_profile_changed())
-        self._request_line_trading_desk_refresh(immediate=True)
+        # 先让窗口完成布局与首帧绘制，再拉数据，避免打开瞬间主线程与网络叠加大卡顿。
+        self.root.after(16, lambda: self._request_line_trading_desk_refresh(immediate=True))
 
     def open_signal_monitor_window(self) -> None:
         if self._signal_monitor_window is not None and self._signal_monitor_window.window.winfo_exists():
@@ -9576,7 +9814,7 @@ class QuantApp:
                 return
 
         side = "buy" if direction == "long" else "sell"
-        pos_side = resolve_open_pos_side(config.position_mode, side)
+        pos_side = resolve_open_pos_side(config, side)
         order_mode = state.trade_order_mode.get() if state.trade_order_mode is not None else "限价挂单"
         cl_ord_id = f"lt{session.session_id.lower()}{datetime.utcnow().strftime('%m%d%H%M%S%f')[-12:]}"
         try:
@@ -9749,6 +9987,168 @@ class QuantApp:
             target=lambda: engine._monitor_local_exit_v2(credentials, config, instrument, position, protection),
             daemon=True,
         ).start()
+
+    def _mark_line_desk_trade_status(self, desk_ref: LineTradingDeskWindowState, text: str) -> None:
+        st = self._line_trading_desk_window
+        if st is not None and st is desk_ref and _widget_exists(st.window):
+            st.status_text.set(text)
+        pr = self._line_trading_desk_log_prefix(desk_ref)
+        self._enqueue_log(f"{pr} 开仓后续 | {text}")
+
+    def _mark_line_desk_trade_started(
+        self,
+        desk_ref: LineTradingDeskWindowState,
+        *,
+        session_log_tag: str,
+        instrument: Instrument,
+        side: str,
+        pos_side: str | None,
+        size: Decimal,
+        entry_price: Decimal,
+        stop_price: Decimal,
+        credentials: Credentials,
+        config: StrategyConfig,
+        ord_id: str,
+        cl_ord_id: str,
+        api_profile: str,
+    ) -> None:
+        st = self._line_trading_desk_window
+        if st is not None and st is desk_ref and _widget_exists(st.window):
+            st.status_text.set(
+                f"已成交，启动动态管理 | entry={format_decimal(entry_price)} stop={format_decimal(stop_price)}"
+            )
+        pr = self._line_trading_desk_log_prefix(desk_ref)
+        self._enqueue_log(
+            f"{pr} 成交监控 | [{session_log_tag}] ordId={ord_id or '-'} | side={side} | "
+            f"entry={format_decimal(entry_price)} | stop={format_decimal(stop_price)}"
+        )
+        direction = "long" if side == "buy" else "short"
+        risk_per_unit = abs(entry_price - stop_price)
+        take_profit = (
+            entry_price + (risk_per_unit * Decimal("4")) if direction == "long" else entry_price - (risk_per_unit * Decimal("4"))
+        )
+        protection = ProtectionPlan(
+            trigger_inst_id=instrument.inst_id,
+            trigger_price_type=config.tp_sl_trigger_type,
+            take_profit=take_profit,
+            stop_loss=stop_price,
+            entry_reference=entry_price,
+            atr_value=risk_per_unit,
+            direction=direction,
+            candle_ts=int(time.time() * 1000),
+        )
+        engine = StrategyEngine(
+            self.client,
+            lambda message: self.root.after(
+                0, lambda text=message: self._enqueue_log(f"[{session_log_tag}] 划线交易台监控 | {text}")
+            ),
+            notifier=self._build_notifier(config),
+            strategy_name=f"{session_log_tag} 划线交易台",
+            session_id=session_log_tag,
+            direction_label="只做多" if direction == "long" else "只做空",
+            run_mode_label="交易并下单",
+            trader_id="LINE_DESK",
+            api_name=api_profile,
+        )
+        position = FilledPosition(
+            ord_id=ord_id or cl_ord_id,
+            cl_ord_id=cl_ord_id,
+            inst_id=instrument.inst_id,
+            side=side,  # type: ignore[arg-type]
+            close_side="sell" if side == "buy" else "buy",  # type: ignore[arg-type]
+            pos_side=pos_side,  # type: ignore[arg-type]
+            size=size,
+            entry_price=entry_price,
+            entry_ts=int(time.time() * 1000),
+        )
+        threading.Thread(
+            target=lambda: engine._monitor_local_exit_v2(credentials, config, instrument, position, protection),
+            daemon=True,
+        ).start()
+
+    def _line_desk_post_entry_worker(
+        self,
+        desk_ref: LineTradingDeskWindowState,
+        credentials: Credentials,
+        config: StrategyConfig,
+        instrument: Instrument,
+        ord_id: str,
+        cl_ord_id: str,
+        side: str,
+        pos_side: str | None,
+        size: Decimal,
+        entry_price: Decimal,
+        stop_price: Decimal,
+        session_log_tag: str,
+        api_profile: str,
+    ) -> None:
+        try:
+            q_ord = ord_id.strip() if ord_id else ""
+            q_cl = cl_ord_id.strip() if cl_ord_id else ""
+            if q_ord or q_cl:
+                for _ in range(40):
+                    status = self.client.get_order(
+                        credentials,
+                        config,
+                        inst_id=instrument.inst_id,
+                        ord_id=q_ord or None,
+                        cl_ord_id=q_cl or None,
+                    )
+                    if status.state in {"filled", "partially_filled"}:
+                        fill_price = status.avg_price or status.price or entry_price
+                        fill_size = status.filled_size if status.filled_size and status.filled_size > 0 else size
+                        self.root.after(
+                            0,
+                            lambda dr=desk_ref,
+                            slt=session_log_tag,
+                            ins=instrument,
+                            sd=side,
+                            ps=pos_side,
+                            fs=fill_size,
+                            fp=fill_price,
+                            sp=stop_price,
+                            cred=credentials,
+                            cfg=config,
+                            oid=q_ord,
+                            cid=q_cl,
+                            ap=api_profile: self._mark_line_desk_trade_started(
+                                dr,
+                                session_log_tag=slt,
+                                instrument=ins,
+                                side=sd,
+                                pos_side=ps,
+                                size=fs,
+                                entry_price=fp,
+                                stop_price=sp,
+                                credentials=cred,
+                                config=cfg,
+                                ord_id=oid,
+                                cl_ord_id=cid,
+                                api_profile=ap,
+                            ),
+                        )
+                        return
+                    if status.state in {"canceled", "order_failed"}:
+                        self.root.after(
+                            0,
+                            lambda dr=desk_ref, stv=status.state: self._mark_line_desk_trade_status(dr, f"委托结束：{stv}"),
+                        )
+                        return
+                    threading.Event().wait(1.0)
+                self.root.after(
+                    0,
+                    lambda dr=desk_ref: self._mark_line_desk_trade_status(dr, "委托未成交，等待手动处理。"),
+                )
+                return
+            self.root.after(
+                0,
+                lambda dr=desk_ref: self._mark_line_desk_trade_status(dr, "委托缺少订单号，无法追踪。"),
+            )
+        except Exception as exc:
+            self.root.after(
+                0,
+                lambda dr=desk_ref, msg=str(exc): self._mark_line_desk_trade_status(dr, f"委托追踪失败：{msg}"),
+            )
 
     def _strategy_live_chart_headline(self, session: StrategySession) -> str:
         trade_inst_id = _session_trade_inst_id(session) or session.symbol
@@ -12790,7 +13190,11 @@ class QuantApp:
         if normalized_flatten_mode == "best_quote" and price is not None:
             message = f"{message}\n挂单价：{format_decimal(price)}"
         messagebox.showinfo("平仓已提交", message, parent=parent)
-        self._enqueue_log(f"已提交选中持仓平仓 | {position.inst_id} | 方式={mode_label} | ordId={order_id}")
+        profile_name = (self._positions_context_profile_name or self._current_credential_profile()).strip()
+        log_prefix = f"[{profile_name}] [当前持仓]" if profile_name else "[当前持仓]"
+        self._enqueue_log(
+            f"{log_prefix} 已提交选中持仓平仓 | {position.inst_id} | 方式={mode_label} | ordId={order_id}"
+        )
         self.refresh_positions()
         self.refresh_order_views()
 
@@ -16267,14 +16671,6 @@ class QuantApp:
         self.root.after(500, self._refresh_status)
 
     def _default_line_trading_symbol(self) -> str:
-        for sym in DEFAULT_LAUNCH_SYMBOLS:
-            if any(getattr(item, "inst_id", None) == sym for item in self.instruments):
-                return sym
-        fallback = (self.symbol.get() or "").strip().upper()
-        if fallback:
-            return fallback
-        if self.instruments:
-            return self.instruments[0].inst_id
         return DEFAULT_LAUNCH_SYMBOLS[0]
 
     def _line_trading_symbol_values(self) -> tuple[str, ...]:
@@ -16295,14 +16691,15 @@ class QuantApp:
             and state.desk_price_tick is not None
         ):
             return
-        try:
-            inst = self.client.get_instrument(sym)
-            ts = inst.tick_size
-            state.desk_price_tick = ts if ts is not None and ts > 0 else None
-            state.desk_tick_symbol = sym
-        except Exception:
+        inst = self._line_trading_desk_get_cached_instrument(state, sym)
+        if inst is None:
+            self._line_trading_desk_prefetch_instrument_async(state, sym)
             state.desk_price_tick = None
             state.desk_tick_symbol = sym
+            return
+        ts = inst.tick_size
+        state.desk_price_tick = ts if ts is not None and ts > 0 else None
+        state.desk_tick_symbol = sym
 
     def _line_trading_desk_format_price(self, state: LineTradingDeskWindowState, value: Decimal | None) -> str:
         if value is None:
@@ -16311,21 +16708,483 @@ class QuantApp:
             return format_decimal_by_increment(value, state.desk_price_tick)
         return format_decimal(value)
 
+    def _line_trading_desk_order_ts_cell(self, ts: int | None) -> str:
+        if ts is None or ts <= 0:
+            return "-"
+        try:
+            return datetime.fromtimestamp(ts / 1000).strftime("%m-%d %H:%M")
+        except (OverflowError, OSError, ValueError):
+            return "-"
+
+    def _line_trading_desk_order_price_cell(self, item: OkxTradeOrderItem) -> str:
+        for candidate in (item.price, item.order_price, item.trigger_price):
+            if candidate is not None and candidate > 0:
+                return format_decimal(candidate)
+        return "-"
+
+    def _line_trading_desk_order_src_cell(self, item: OkxTradeOrderItem) -> str:
+        if item.source_kind == "algo":
+            return "算法"
+        return "普通"
+
+    def _line_trading_desk_get_cached_instrument(
+        self,
+        state: LineTradingDeskWindowState,
+        inst_id: str,
+    ) -> Instrument | None:
+        key = inst_id.strip().upper()
+        if not key:
+            return None
+        now = time.monotonic()
+        hit = state.desk_instrument_cache.get(key)
+        if hit is None:
+            return None
+        inst, ts = hit
+        if now - float(ts) <= _LINE_DESK_INSTRUMENT_CACHE_TTL_S:
+            return inst
+        return None
+
+    def _line_trading_desk_prefetch_instrument_async(self, state: LineTradingDeskWindowState, inst_id: str) -> None:
+        key = inst_id.strip().upper()
+        if not key:
+            return
+        if self._line_trading_desk_get_cached_instrument(state, key) is not None:
+            return
+
+        def work() -> None:
+            inst: Instrument | None
+            try:
+                inst = self.client.get_instrument(key)
+            except Exception:
+                inst = None
+            now = time.monotonic()
+
+            def apply() -> None:
+                st = self._line_trading_desk_window
+                if st is not state or not _widget_exists(st.window):
+                    return
+                st.desk_instrument_cache[key] = (inst, now)
+                if st.symbol_var.get().strip().upper() == key:
+                    self._line_trading_desk_update_price_tick(st, force=True)
+
+            self.root.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _line_trading_desk_require_instrument_for_submit(
+        self,
+        state: LineTradingDeskWindowState,
+        symbol: str,
+    ) -> Instrument | None:
+        inst = self._line_trading_desk_get_cached_instrument(state, symbol)
+        if inst is not None:
+            return inst
+        self._line_trading_desk_prefetch_instrument_async(state, symbol)
+        state.status_text.set(f"正在加载 {symbol} 合约信息，请稍后再点一次。")
+        return None
+
+    def _line_trading_desk_instrument_for_order_row(
+        self,
+        state: LineTradingDeskWindowState,
+        inst_id: str,
+        cache: dict[str, Instrument | None],
+    ) -> Instrument | None:
+        key = inst_id.strip().upper()
+        if key in cache:
+            return cache[key]
+        inst = self._line_trading_desk_get_cached_instrument(state, key)
+        if inst is None:
+            # 表格渲染不走同步网络，避免点击下单后刷新时 UI 卡死；后台预热后下一轮自动补全单位显示。
+            self._line_trading_desk_prefetch_instrument_async(state, key)
+            cache[key] = None
+            return None
+        cache[key] = inst
+        return inst
+
+    def _line_trading_desk_order_qty_cell(
+        self,
+        state: LineTradingDeskWindowState,
+        item: OkxTradeOrderItem,
+        *,
+        qty: Decimal | None,
+        inst_cache: dict[str, Instrument | None],
+    ) -> str:
+        if qty is None:
+            return "-"
+        inst = self._line_trading_desk_instrument_for_order_row(state, item.inst_id, inst_cache)
+        if inst is None:
+            return format_decimal(qty)
+        return _format_notify_size_with_unit(inst, qty)
+
+    def _line_trading_desk_position_qty_cell(self, state: LineTradingDeskWindowState, pos: OkxPosition) -> str:
+        if pos.position is None:
+            return "-"
+        inst = self._line_trading_desk_get_cached_instrument(state, pos.inst_id)
+        if inst is None:
+            self._line_trading_desk_prefetch_instrument_async(state, pos.inst_id)
+            return format_decimal(pos.position)
+        return _format_notify_size_with_unit(inst, pos.position)
+
+    def _line_trading_desk_confirm_qty_line(self, state: LineTradingDeskWindowState, symbol: str, size: Decimal) -> str:
+        inst = self._line_trading_desk_get_cached_instrument(state, symbol.strip().upper())
+        if inst is not None:
+            return _format_notify_size_with_unit(inst, size)
+        return f"{format_decimal(size)} 张（合约）"
+
+    def _line_trading_desk_order_bracket_leg_cell(
+        self,
+        state: LineTradingDeskWindowState,
+        trigger_px: Decimal | None,
+        trigger_type: str | None,
+        order_px: Decimal | None,
+    ) -> str:
+        if trigger_px is None:
+            return "-"
+        line = self._line_trading_desk_format_price(state, trigger_px)
+        t = (trigger_type or "").strip().lower()
+        if t:
+            line = f"{line}·{t}"
+        if order_px is not None:
+            if order_px <= 0:
+                line += "→触发后市价"
+            else:
+                line += f"→{self._line_trading_desk_format_price(state, order_px)}"
+        return line
+
+    def _line_trading_desk_sync_tree_rows(
+        self,
+        tree: ttk.Treeview,
+        rows: list[tuple[str, tuple[object, ...]]],
+        *,
+        preserve_selected_iid: str | None = None,
+    ) -> None:
+        bases = [iid for iid, _vals in rows]
+        finals = _desk_tree_final_iids_from_bases(bases)
+        deduped_rows = [(fin, vals) for fin, (_b, vals) in zip(finals, rows)]
+        rows = deduped_rows
+        existing = list(tree.get_children())
+        existing_set = set(existing)
+        wanted = [iid for iid, _vals in rows]
+        wanted_set = set(wanted)
+        for iid in existing:
+            if iid not in wanted_set:
+                tree.delete(iid)
+        for iid, values in rows:
+            if iid in existing_set:
+                tree.item(iid, values=values)
+            else:
+                tree.insert("", END, iid=iid, values=values)
+        if preserve_selected_iid and tree.exists(preserve_selected_iid):
+            tree.selection_set(preserve_selected_iid)
+        elif wanted:
+            first = wanted[0]
+            if tree.exists(first):
+                tree.selection_set(first)
+
+    def _line_trading_desk_order_row_iid(self, item: OkxTradeOrderItem, index: int, *, prefix: str) -> str:
+        ident = (
+            str(item.order_id or "").strip()
+            or str(item.algo_id or "").strip()
+            or str(item.client_order_id or "").strip()
+            or f"{item.inst_id}|{item.side}|{item.ord_type}|{index}"
+        )
+        safe = "".join(ch if ch.isalnum() or ch in {"-", "_", ":", "|"} else "_" for ch in ident)
+        return f"{prefix}-{safe}"
+
+    def _line_trading_desk_position_row_iid(self, item: OkxPosition, index: int) -> str:
+        ident = (
+            f"{item.inst_id}|{item.pos_side or '-'}|"
+            f"{format_decimal(item.position) if item.position is not None else '-'}|{index}"
+        )
+        safe = "".join(ch if ch.isalnum() or ch in {"-", "_", ":", "|"} else "_" for ch in ident)
+        return f"desk-pos-{safe}"
+
+    def _line_trading_desk_refresh_pending_orders_tree(self, state: LineTradingDeskWindowState) -> None:
+        tree = state.pending_orders_tree
+        selected = tree.selection()[0] if tree.selection() else None
+        inst_cache: dict[str, Instrument | None] = {}
+        rows: list[tuple[str, tuple[object, ...]]] = []
+        for index, item in enumerate(state.latest_pending_orders):
+            iid = self._line_trading_desk_order_row_iid(item, index, prefix="desk-pend")
+            rows.append(
+                (
+                    iid,
+                    (
+                    item.inst_id,
+                    (item.side or "-").upper(),
+                    (item.ord_type or "-").lower(),
+                    self._line_trading_desk_order_price_cell(item),
+                    self._line_trading_desk_order_qty_cell(state, item, qty=item.size, inst_cache=inst_cache),
+                    self._line_trading_desk_order_qty_cell(state, item, qty=item.filled_size, inst_cache=inst_cache),
+                    self._line_trading_desk_order_bracket_leg_cell(
+                        state,
+                        item.take_profit_trigger_price,
+                        item.take_profit_trigger_price_type,
+                        item.take_profit_order_price,
+                    ),
+                    self._line_trading_desk_order_bracket_leg_cell(
+                        state,
+                        item.stop_loss_trigger_price,
+                        item.stop_loss_trigger_price_type,
+                        item.stop_loss_order_price,
+                    ),
+                    item.state or "-",
+                    self._line_trading_desk_order_src_cell(item),
+                    self._line_trading_desk_order_ts_cell(item.update_time or item.created_time),
+                ),
+                )
+            )
+        self._line_trading_desk_sync_tree_rows(tree, rows, preserve_selected_iid=selected)
+
+    def _line_trading_desk_refresh_order_history_tree(self, state: LineTradingDeskWindowState) -> None:
+        tree = state.order_history_tree
+        selected = tree.selection()[0] if tree.selection() else None
+        inst_cache: dict[str, Instrument | None] = {}
+        rows: list[tuple[str, tuple[object, ...]]] = []
+        for index, item in enumerate(state.latest_order_history):
+            iid = self._line_trading_desk_order_row_iid(item, index, prefix="desk-hist")
+            rows.append(
+                (
+                    iid,
+                    (
+                    item.inst_id,
+                    (item.side or "-").upper(),
+                    (item.ord_type or "-").lower(),
+                    self._line_trading_desk_order_price_cell(item),
+                    self._line_trading_desk_order_qty_cell(state, item, qty=item.size, inst_cache=inst_cache),
+                    self._line_trading_desk_order_qty_cell(state, item, qty=item.filled_size, inst_cache=inst_cache),
+                    self._line_trading_desk_order_bracket_leg_cell(
+                        state,
+                        item.take_profit_trigger_price,
+                        item.take_profit_trigger_price_type,
+                        item.take_profit_order_price,
+                    ),
+                    self._line_trading_desk_order_bracket_leg_cell(
+                        state,
+                        item.stop_loss_trigger_price,
+                        item.stop_loss_trigger_price_type,
+                        item.stop_loss_order_price,
+                    ),
+                    item.state or "-",
+                    self._line_trading_desk_order_src_cell(item),
+                    self._line_trading_desk_order_ts_cell(item.update_time or item.created_time),
+                ),
+                )
+            )
+        self._line_trading_desk_sync_tree_rows(tree, rows, preserve_selected_iid=selected)
+
+    def _line_trading_desk_refresh_pending_tab(self) -> None:
+        """仅重新拉取当前委托（不整图刷新 K 线），减轻请求量。"""
+        state = self._line_trading_desk_window
+        if state is None or not _widget_exists(state.window):
+            return
+        symbol = state.symbol_var.get().strip().upper()
+        if not symbol:
+            state.status_text.set("请先选择标的。")
+            return
+        profile = state.api_profile_var.get().strip()
+        credentials = self._credentials_for_profile_or_none(profile)
+        if credentials is None:
+            state.status_text.set("未配置所选 API 凭证，无法刷新委托。")
+            return
+        env_label = self._environment_label_for_profile(profile or self._current_credential_profile())
+        environment = ENV_OPTIONS[self._normalized_environment_label(env_label)]
+        desk_ref = state
+        state.status_text.set(f"正在刷新当前委托：{symbol}…")
+
+        def work() -> None:
+            try:
+                pending = self.client.get_pending_orders(credentials, environment=environment, limit=100)
+            except Exception as exc:
+                self.root.after(0, lambda msg=str(exc): self._line_trading_desk_apply_pending_only(desk_ref, None, msg))
+                return
+            self.root.after(0, lambda rows=pending: self._line_trading_desk_apply_pending_only(desk_ref, rows, None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _line_trading_desk_apply_pending_only(
+        self,
+        desk_ref: LineTradingDeskWindowState,
+        pending: list[OkxTradeOrderItem] | None,
+        err: str | None,
+    ) -> None:
+        st = self._line_trading_desk_window
+        if st is not desk_ref or not _widget_exists(st.window):
+            return
+        sym = st.symbol_var.get().strip().upper()
+        if err is not None:
+            st.status_text.set(f"刷新当前委托失败：{err}")
+            pr = self._line_trading_desk_log_prefix(st)
+            self._enqueue_log(f"{pr} 刷新当前委托失败 | {sym} | {err}")
+            return
+        filtered = [o for o in (pending or []) if o.inst_id.strip().upper() == sym]
+        st.latest_pending_orders = filtered
+        self._line_trading_desk_refresh_pending_orders_tree(st)
+        st.status_text.set(f"已刷新当前委托 | {sym} | {len(filtered)} 条")
+        pr = self._line_trading_desk_log_prefix(st)
+        self._enqueue_log(f"{pr} 已刷新当前委托 | {sym} | {len(filtered)} 条")
+
+    def _line_trading_desk_log_prefix(self, state: LineTradingDeskWindowState) -> str:
+        p = state.api_profile_var.get().strip()
+        if p:
+            return f"[{p}] [划线交易台]"
+        return "[划线交易台]"
+
+    def _line_trading_desk_sz_log_segment(self, inst_id: str, contracts: Decimal) -> str:
+        try:
+            inst = self.client.get_instrument(inst_id)
+        except Exception:
+            return f"sz={format_decimal(contracts)}"
+        return f"sz={_format_size_with_contract_equivalent(inst, contracts)}"
+
+    def _line_trading_desk_spawn_rr_limit_network(
+        self,
+        state: LineTradingDeskWindowState,
+        credentials: Credentials,
+        config: StrategyConfig,
+        plan: OrderPlan,
+        size: Decimal,
+        symbol: str,
+        entry: Decimal,
+        sl: Decimal,
+        tp: Decimal,
+        direction: str,
+        *,
+        desk_ref: LineTradingDeskWindowState,
+        busy_message: str,
+        error_prefix: str,
+        log_title: str,
+        id_label: str,
+        use_trigger_algo: bool,
+        success_status_for_rid: Callable[[str], str],
+    ) -> None:
+        if state.desk_submit_inflight:
+            state.status_text.set("已有委托正在提交，请稍候…")
+            return
+        state.desk_submit_inflight = True
+        state.status_text.set(busy_message)
+
+        def work() -> None:
+            plain_limit_fallback = False
+            retried_plain_limit = [False]
+            try:
+                if use_trigger_algo:
+                    result = self.client.place_trigger_limit_algo_order(
+                        credentials,
+                        config,
+                        plan,
+                        include_take_profit=True,
+                        include_attached_protection=True,
+                    )
+                else:
+                    try:
+                        result = self.client.place_limit_order(
+                            credentials,
+                            config,
+                            plan,
+                            include_take_profit=True,
+                            include_attached_protection=True,
+                        )
+                    except OkxApiError as bulk_exc:
+                        # OKX 常对「限价 + 交易所附带 TP/SL」整笔给 sCode=1 / 操作全部失败且无子项说明
+                        if "操作全部失败" in str(bulk_exc):
+                            retried_plain_limit[0] = True
+                            result = self.client.place_limit_order(
+                                credentials,
+                                config,
+                                plan,
+                                include_take_profit=False,
+                                include_attached_protection=False,
+                            )
+                            plain_limit_fallback = True
+                        else:
+                            raise
+            except Exception as exc:
+                err = str(exc).strip() or exc.__class__.__name__
+                if isinstance(exc, OkxApiError):
+                    code = getattr(exc, "code", None)
+                    if code not in (None, "", "-"):
+                        if f"code={code}" not in err:
+                            err = f"{err} | code={code}"
+                if retried_plain_limit[0]:
+                    err = f"{err} | 已去掉附带TP/SL重试仍失败"
+
+                def fail() -> None:
+                    st = self._line_trading_desk_window
+                    if st is not desk_ref or not _widget_exists(st.window):
+                        return
+                    st.desk_submit_inflight = False
+                    st.status_text.set(f"{error_prefix}：{err}")
+                    pr = self._line_trading_desk_log_prefix(st)
+                    self._enqueue_log(
+                        f"{pr} {log_title}失败 | {direction.upper()} | {symbol} | "
+                        f"入={self._line_trading_desk_format_price(st, entry)} | "
+                        f"损={self._line_trading_desk_format_price(st, sl)} | "
+                        f"盈={self._line_trading_desk_format_price(st, tp)} | {err}"
+                    )
+
+                self.root.after(0, fail)
+                return
+
+            rid = (result.ord_id or "-").strip() or "-"
+
+            def done() -> None:
+                st = self._line_trading_desk_window
+                if st is not desk_ref or not _widget_exists(st.window):
+                    return
+                st.desk_submit_inflight = False
+                if plain_limit_fallback:
+                    st.status_text.set(
+                        f"已提交限价开仓（未附带交易所TP/SL）| {symbol} | sz={format_decimal(size)} | ordId={rid}"
+                    )
+                else:
+                    st.status_text.set(success_status_for_rid(rid))
+                sz_seg = self._line_trading_desk_sz_log_segment(symbol, size)
+                pr = self._line_trading_desk_log_prefix(st)
+                self._enqueue_log(
+                    f"{pr} {log_title} | {direction.upper()} | {symbol} | "
+                    f"入={self._line_trading_desk_format_price(st, entry)} | "
+                    f"损={self._line_trading_desk_format_price(st, sl)} | 盈={self._line_trading_desk_format_price(st, tp)} | "
+                    f"{sz_seg} | {id_label}={rid}"
+                )
+                if plain_limit_fallback:
+                    self._enqueue_log(
+                        f"{pr} 说明：交易所拒绝了「限价+附带TP/SL」整笔，已自动改为**仅限价开仓**；"
+                        f"请在成交后于网页/APP 或「触发价委托」单独挂止盈止损。"
+                    )
+                self._request_line_trading_desk_refresh(immediate=False)
+
+            self.root.after(0, done)
+            self.root.after(
+                0,
+                lambda: (
+                    setattr(desk_ref, "desk_submit_inflight", False)
+                    if self._line_trading_desk_window is desk_ref and _widget_exists(desk_ref.window)
+                    else None
+                ),
+            )
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _on_line_trading_desk_api_profile_changed(self) -> None:
         state = self._line_trading_desk_window
         if state is None or not _widget_exists(state.window):
             return
         current = state.api_profile_var.get().strip()
         prev = (state.last_desk_api_profile or "").strip()
-        if prev and current != prev:
+        # Combobox 可能短暂写成空串再写回；仅当新旧均为非空且不同时才清空画线，避免误清盈亏比。
+        if prev and current and current != prev:
             self._line_trading_desk_cancel_motion_chart_paint(state)
             state.line_annotations.clear()
+            locked_rr = [b for b in state.rr_annotations if b.locked]
             state.rr_annotations.clear()
+            state.rr_annotations.extend(locked_rr)
             state.draft_line_start = None
             state.draft_line_current = None
             state.rr_drag = None
             state.rr_pick = None
-            state.rr_selected_id = None
+            if state.rr_selected_id and not any(b.rr_id == state.rr_selected_id for b in state.rr_annotations):
+                state.rr_selected_id = state.rr_annotations[0].rr_id if state.rr_annotations else None
             state.desk_range_zoom_active = False
             self._line_trading_desk_invalidate_price_tick(state)
         state.last_desk_api_profile = current
@@ -16354,6 +17213,9 @@ class QuantApp:
             state.desk_range_zoom_active = False
             self._line_trading_desk_invalidate_price_tick(state)
             self._line_trading_desk_update_price_tick(state)
+            symbol = state.symbol_var.get().strip().upper()
+            if symbol:
+                self._line_trading_desk_prefetch_instrument_async(state, symbol)
         self._request_line_trading_desk_refresh(immediate=True)
 
     def _line_trading_desk_visible_snapshot(
@@ -16543,7 +17405,9 @@ class QuantApp:
             state.status_text.set(
                 f"已局部放大：仅显示约第 {a + 1}～{b + 1} 根K（共 {span} 根），区间外已隐藏。点「重置视图」恢复。"
             )
-            self._enqueue_log(f"[划线交易台] 区间放大 | bars {a}..{b} | span={span}")
+            self._enqueue_log(
+                f"{self._line_trading_desk_log_prefix(state)} 区间放大 | bars {a}..{b} | span={span}"
+            )
             return
         if tool == "stop":
             avg_p = (price_a + price_b) / Decimal("2")
@@ -16612,13 +17476,18 @@ class QuantApp:
                 f"已添加{('多' if side == 'long' else '空')}头盈亏框。工具已关闭；点框选中后可拖动；需要再画请再点「盈亏比·多/空」。"
             )
             self._enqueue_log(
-                f"[划线交易台] 盈亏比 | {side} | 入={self._line_trading_desk_format_price(state, entry_p)} | "
+                f"{self._line_trading_desk_log_prefix(state)} 盈亏比 | {side} | 入={self._line_trading_desk_format_price(state, entry_p)} | "
                 f"损={self._line_trading_desk_format_price(state, stop_p)} | 盈={self._line_trading_desk_format_price(state, tp_p)} | R={format_decimal(r_mult)}"
             )
             return
-        ray_action = (state.param_ray_action.get() or "notify").strip().lower()
-        if ray_action not in ("notify", "long", "short"):
-            ray_action = "notify"
+        if tool == "line":
+            # 趋势线需明显拖拽，单击易误出一条短线；水平射线仍可「点两下」极小位移即成。
+            dx = float(end[0]) - float(start[0])
+            dy = float(end[1]) - float(start[1])
+            if dx * dx + dy * dy < 144.0:  # 约 12 像素半径
+                state.status_text.set("趋势线：请按住拖开一点再松开；误触太短已忽略。再画请再点「趋势线」。")
+                return
+        ray_action = _line_trading_desk_normalize_ray_action(state.param_ray_action.get())
         state.line_annotations.append(
             LiveChartLineAnnotation(
                 kind=tool,
@@ -16637,19 +17506,32 @@ class QuantApp:
                 desk_ray_last_side=None,
             )
         )
-        state.status_text.set(f"已添加{label}，射线默认动作={ray_action}。")
+        # 每笔只画一条，画完退回「无」工具，避免连点画布叠多条或与盈亏比拖拽冲突。
+        state.active_tool = "none"
+        state.status_text.set(
+            f"已添加{label}（工具已收起），射线默认动作={_LINE_DESK_RAY_ACTION_LABEL_ZH.get(ray_action, ray_action)}；"
+            "再画请重新点按钮。"
+        )
 
     def _line_trading_desk_refresh_ray_tree(self, state: LineTradingDeskWindowState) -> None:
         tree = state.ray_tree
         tree.delete(*tree.get_children())
-        action_labels = {"notify": "仅站内", "long": "开多", "short": "开空"}
         for index, ann in enumerate(state.line_annotations):
             if ann.kind not in ("line", "horizontal"):
                 continue
             if ann.bar_a is None:
                 continue
             st = "已触发" if ann.desk_ray_triggered else "待命"
-            tree.insert("", END, iid=f"ray-{index}", values=(ann.label, action_labels.get(ann.desk_ray_action, ann.desk_ray_action), st))
+            tree.insert(
+                "",
+                END,
+                iid=f"ray-{index}",
+                values=(
+                    ann.label,
+                    _LINE_DESK_RAY_ACTION_LABEL_ZH.get(ann.desk_ray_action, ann.desk_ray_action),
+                    st,
+                ),
+            )
 
     def _line_trading_desk_refresh_rr_tree(self, state: LineTradingDeskWindowState) -> None:
         tree = state.rr_manage_tree
@@ -16706,6 +17588,24 @@ class QuantApp:
         messagebox.showinfo("盈亏比", "选中的计划不存在。", parent=state.window)
         return None
 
+    def _line_trading_desk_strategy_config(self, symbol: str, profile: str) -> StrategyConfig:
+        """组装划线台下单用配置：标的对齐主界面收集逻辑，环境与所选 API profile 一致（避免 simulated 错位）。"""
+        normalized = _normalize_symbol_input(symbol)
+        old_symbol = self.symbol.get()
+        try:
+            self.symbol.set(normalized)
+            record = self._template_record_from_launcher()
+        finally:
+            self.symbol.set(old_symbol)
+        env_label = self._environment_label_for_profile(profile or self._current_credential_profile())
+        desk_env = ENV_OPTIONS[self._normalized_environment_label(env_label)]
+        return replace(
+            record.config,
+            inst_id=normalized,
+            trade_inst_id=normalized,
+            environment=desk_env,
+        )
+
     def _line_trading_desk_collect_rr_exchange_order(
         self,
         state: LineTradingDeskWindowState,
@@ -16718,11 +17618,10 @@ class QuantApp:
         if credentials is None:
             state.status_text.set("未配置API，无法下单。")
             return None
-        try:
-            instrument = self.client.get_instrument(symbol)
-        except Exception as exc:
-            state.status_text.set(f"读取标的失败：{exc}")
+        instrument = self._line_trading_desk_require_instrument_for_submit(state, symbol)
+        if instrument is None:
             return None
+        state.desk_instrument_cache[symbol.strip().upper()] = (instrument, time.monotonic())
         self._line_trading_desk_rr_snap_prices(state, box)
         entry = box.price_entry
         sl = box.price_stop
@@ -16742,7 +17641,11 @@ class QuantApp:
         if risk_amount <= 0:
             state.status_text.set("风险金必须大于0。")
             return None
-        config = replace(self._template_record_from_launcher().config, inst_id=symbol, trade_inst_id=symbol)
+        try:
+            config = self._line_trading_desk_strategy_config(symbol, profile)
+        except Exception as exc:
+            state.status_text.set(f"无法组装下单配置：{exc}")
+            return None
         try:
             size = determine_order_size(
                 instrument=instrument,
@@ -16754,8 +17657,22 @@ class QuantApp:
         except Exception as exc:
             state.status_text.set(f"定量失败：{exc}")
             return None
+        tp_for_plan = tp
+        if bool(state.param_rr_fee_offset.get()):
+            off = _dynamic_two_taker_fee_offset_live(entry, enabled=True)
+            if direction == "long":
+                tp_for_plan = tp + off
+            else:
+                tp_for_plan = tp - off
+            tick = instrument.tick_size
+            if tick is not None and tick > 0:
+                tp_for_plan = snap_to_increment(tp_for_plan, tick, "nearest")
+            if direction == "long" and not (sl < entry < tp_for_plan):
+                tp_for_plan = tp
+            elif direction == "short" and not (tp_for_plan < entry < sl):
+                tp_for_plan = tp
         side = "buy" if direction == "long" else "sell"
-        pos_side = resolve_open_pos_side(config.position_mode, side)
+        pos_side = resolve_open_pos_side(config, side)
         atr_period = max(1, int(str(state.param_atr_period.get()).strip() or "10"))
         atr_vals = atr(list(state.last_snapshot.candles), atr_period) if state.last_snapshot else []
         atr_val = atr_vals[-1] if atr_vals and atr_vals[-1] is not None else Decimal("1")
@@ -16767,7 +17684,7 @@ class QuantApp:
             side=side,
             pos_side=pos_side,
             size=size,
-            take_profit=tp,
+            take_profit=tp_for_plan,
             stop_loss=sl,
             entry_reference=entry,
             atr_value=atr_val,
@@ -16780,9 +17697,9 @@ class QuantApp:
 
     def _line_trading_desk_rr_snap_prices(self, state: LineTradingDeskWindowState, box: DeskRiskRewardAnnotation) -> None:
         symbol = state.symbol_var.get().strip().upper()
-        try:
-            inst = self.client.get_instrument(symbol)
-        except Exception:
+        inst = self._line_trading_desk_get_cached_instrument(state, symbol)
+        if inst is None:
+            self._line_trading_desk_prefetch_instrument_async(state, symbol)
             return
         tick = inst.tick_size
         if tick and tick > 0:
@@ -16807,6 +17724,9 @@ class QuantApp:
             w = max(int(event.width), 1)
             h = max(int(event.height), 1)
         except (TclError, TypeError, ValueError):
+            return
+        # 布局过程中宽高可能短暂为 1，全量重绘会导致闪白或错位，等尺寸稳定后再画。
+        if w < 24 or h < 24:
             return
         last = state.desk_canvas_last_wh
         if last is not None and abs(last[0] - w) < 2 and abs(last[1] - h) < 2:
@@ -16947,98 +17867,142 @@ class QuantApp:
         if box.side != direction:
             state.status_text.set(f"当前框为「{'多' if box.side == 'long' else '空'}头」计划，请用对应按钮。")
             return
+        state.status_text.set("正在准备附带 TP/SL 的限价单…")
         ctx = self._line_trading_desk_collect_rr_exchange_order(state, box, direction)
         if ctx is None:
             return
         credentials, config, plan, size, symbol = ctx
         entry = box.price_entry
         sl = box.price_stop
-        tp = box.price_tp
-        try:
-            result = self.client.place_limit_order(
-                credentials,
-                config,
-                plan,
-                include_take_profit=True,
-                include_attached_protection=True,
-            )
-        except Exception as exc:
-            state.status_text.set(f"条件限价单失败：{exc}")
-            return
-        state.status_text.set(
-            f"已提交限价+TP/SL | {symbol} | sz={format_decimal(size)} | ordId={result.ord_id or '-'}"
-        )
-        self._enqueue_log(
-            f"[划线交易台] 盈亏比限价+附带TP/SL | {direction.upper()} | {symbol} | 入={self._line_trading_desk_format_price(state, entry)} | "
-            f"损={self._line_trading_desk_format_price(state, sl)} | 盈={self._line_trading_desk_format_price(state, tp)} | sz={format_decimal(size)} | ordId={result.ord_id or '-'}"
+        tp = plan.take_profit
+        self._line_trading_desk_spawn_rr_limit_network(
+            state,
+            credentials,
+            config,
+            plan,
+            size,
+            symbol,
+            entry,
+            sl,
+            tp,
+            direction,
+            desk_ref=state,
+            busy_message="正在提交限价+TP/SL…",
+            error_prefix="条件限价单失败",
+            log_title="盈亏比限价+附带TP/SL",
+            id_label="ordId",
+            use_trigger_algo=False,
+            success_status_for_rid=lambda r: f"已提交限价+TP/SL | {symbol} | sz={format_decimal(size)} | ordId={r}",
         )
 
     def _line_trading_desk_submit_rr_limit_order_from_tree(self) -> None:
         state = self._line_trading_desk_window
         if state is None:
             return
+        if state.desk_submit_inflight:
+            state.status_text.set("已有委托正在提交，请稍候…")
+            return
         box = self._line_trading_desk_rr_selected_box(state)
         if box is None:
             return
+        state.status_text.set("正在准备限价委托…")
         ctx = self._line_trading_desk_collect_rr_exchange_order(state, box, box.side)
         if ctx is None:
             return
         credentials, config, plan, size, symbol = ctx
         entry = box.price_entry
         sl = box.price_stop
-        tp = box.price_tp
+        tp = plan.take_profit
         direction = box.side
-        try:
-            result = self.client.place_limit_order(
-                credentials,
-                config,
-                plan,
-                include_take_profit=True,
-                include_attached_protection=True,
-            )
-        except Exception as exc:
-            state.status_text.set(f"限价委托失败：{exc}")
+        qty_line = self._line_trading_desk_confirm_qty_line(state, symbol, size)
+        if not messagebox.askyesno(
+            "确认限价委托",
+            (
+                f"方向：{direction.upper()}\n"
+                f"标的：{symbol}\n"
+                f"入场：{self._line_trading_desk_format_price(state, entry)}\n"
+                f"止损：{self._line_trading_desk_format_price(state, sl)}\n"
+                f"止盈：{self._line_trading_desk_format_price(state, tp)}\n"
+                f"数量：{qty_line}\n\n"
+                "确认提交「限价委托单」吗？"
+            ),
+            parent=state.window,
+        ):
+            state.status_text.set("已取消限价委托提交。")
             return
-        state.status_text.set(
-            f"已提交限价委托+TP/SL | {symbol} | sz={format_decimal(size)} | ordId={result.ord_id or '-'}"
-        )
-        self._enqueue_log(
-            f"[划线交易台] 限价委托单 | {direction.upper()} | {symbol} | 入={self._line_trading_desk_format_price(state, entry)} | "
-            f"损={self._line_trading_desk_format_price(state, sl)} | 盈={self._line_trading_desk_format_price(state, tp)} | sz={format_decimal(size)} | ordId={result.ord_id or '-'}"
+        self._line_trading_desk_spawn_rr_limit_network(
+            state,
+            credentials,
+            config,
+            plan,
+            size,
+            symbol,
+            entry,
+            sl,
+            tp,
+            direction,
+            desk_ref=state,
+            busy_message="正在提交限价委托…",
+            error_prefix="限价委托失败",
+            log_title="限价委托单",
+            id_label="ordId",
+            use_trigger_algo=False,
+            success_status_for_rid=lambda r: f"已提交限价委托+TP/SL | {symbol} | sz={format_decimal(size)} | ordId={r}",
         )
 
     def _line_trading_desk_submit_rr_trigger_order_from_tree(self) -> None:
         state = self._line_trading_desk_window
         if state is None:
             return
+        if state.desk_submit_inflight:
+            state.status_text.set("已有委托正在提交，请稍候…")
+            return
         box = self._line_trading_desk_rr_selected_box(state)
         if box is None:
             return
+        state.status_text.set("正在准备触发价委托…")
         ctx = self._line_trading_desk_collect_rr_exchange_order(state, box, box.side)
         if ctx is None:
             return
         credentials, config, plan, size, symbol = ctx
         entry = box.price_entry
         sl = box.price_stop
-        tp = box.price_tp
+        tp = plan.take_profit
         direction = box.side
-        try:
-            result = self.client.place_trigger_limit_algo_order(
-                credentials,
-                config,
-                plan,
-                include_take_profit=True,
-                include_attached_protection=True,
-            )
-        except Exception as exc:
-            state.status_text.set(f"触发价委托失败：{exc}")
+        qty_line = self._line_trading_desk_confirm_qty_line(state, symbol, size)
+        if not messagebox.askyesno(
+            "确认触发价委托",
+            (
+                f"方向：{direction.upper()}\n"
+                f"标的：{symbol}\n"
+                f"入场：{self._line_trading_desk_format_price(state, entry)}\n"
+                f"止损：{self._line_trading_desk_format_price(state, sl)}\n"
+                f"止盈：{self._line_trading_desk_format_price(state, tp)}\n"
+                f"数量：{qty_line}\n\n"
+                "确认提交「触发价委托」吗？"
+            ),
+            parent=state.window,
+        ):
+            state.status_text.set("已取消触发价委托提交。")
             return
-        state.status_text.set(
-            f"已提交触发限价+TP/SL（算法单）| {symbol} | sz={format_decimal(size)} | algoId={result.ord_id or '-'}"
-        )
-        self._enqueue_log(
-            f"[划线交易台] 触发价委托 | {direction.upper()} | {symbol} | 入={self._line_trading_desk_format_price(state, entry)} | "
-            f"损={self._line_trading_desk_format_price(state, sl)} | 盈={self._line_trading_desk_format_price(state, tp)} | sz={format_decimal(size)} | algoId={result.ord_id or '-'}"
+        self._line_trading_desk_spawn_rr_limit_network(
+            state,
+            credentials,
+            config,
+            plan,
+            size,
+            symbol,
+            entry,
+            sl,
+            tp,
+            direction,
+            desk_ref=state,
+            busy_message="正在提交触发价委托…",
+            error_prefix="触发价委托失败",
+            log_title="触发价委托",
+            id_label="algoId",
+            use_trigger_algo=True,
+            success_status_for_rid=lambda r: f"已提交触发限价+TP/SL（算法单）| {symbol} | sz={format_decimal(size)} | algoId={r}",
         )
 
     def _line_trading_desk_draw_ray_on_canvas(
@@ -17161,6 +18125,22 @@ class QuantApp:
                 canvas.create_line(
                     x_mid - 40, y, x_mid + 40, y, fill="#374151", width=1, dash=dash, tags=("desk_rr",)
                 )
+            label_x = x_mid + 44
+            line_labels = (
+                (entry_y, box.price_entry, "开仓", "#1864ab"),
+                (stop_y, box.price_stop, "止损", "#c92a2a"),
+                (profit_y, box.price_tp, "止盈", "#2b8a3e"),
+            )
+            for ly, price, title, color in line_labels:
+                canvas.create_text(
+                    label_x,
+                    ly,
+                    anchor="w",
+                    text=f"{title} {self._line_trading_desk_format_price(state, price)}",
+                    fill=color,
+                    font=("Microsoft YaHei UI", 8),
+                    tags=("desk_rr",),
+                )
             rr_txt = f"RR×{format_decimal(box.r_multiple)}{' 锁' if box.locked else ''}"
             canvas.create_text(
                 x_mid, min(entry_y, stop_y, profit_y) - 12, text=rr_txt, fill="#0b7285", tags=("desk_rr",)
@@ -17202,10 +18182,11 @@ class QuantApp:
         line_p: Decimal,
     ) -> None:
         sym = state.symbol_var.get().strip().upper()
-        action = (ann.desk_ray_action or "notify").strip().lower()
+        action = _line_trading_desk_normalize_ray_action(ann.desk_ray_action or "notify")
+        action_zh = _LINE_DESK_RAY_ACTION_LABEL_ZH.get(action, action)
         self._enqueue_log(
-            f"[划线交易台·触发] {sym} | {ann.label} | 价={self._line_trading_desk_format_price(state, px)} | "
-            f"线≈{self._line_trading_desk_format_price(state, line_p)} | 动作={action}"
+            f"{self._line_trading_desk_log_prefix(state)} 射线触发 | {sym} | {ann.label} | 价={self._line_trading_desk_format_price(state, px)} | "
+            f"线≈{self._line_trading_desk_format_price(state, line_p)} | 动作={action_zh}"
         )
         if action == "long":
             self._submit_line_trading_desk_order("long")
@@ -17258,10 +18239,13 @@ class QuantApp:
             return
         env_label = self._environment_label_for_profile(profile or self._current_credential_profile())
         environment = ENV_OPTIONS[self._normalized_environment_label(env_label)]
-        state.status_text.set(f"正在刷新：{symbol} / {bar} | API={profile or '-'}")
+        self._line_trading_desk_prefetch_instrument_async(state, symbol)
+        state.status_text.set(f"正在刷新：{symbol} / {bar} | API={profile or '-'}（保留当前画面）")
+        state.desk_refresh_generation += 1
+        gen = state.desk_refresh_generation
         threading.Thread(
             target=self._line_trading_desk_refresh_worker,
-            args=(symbol, bar, credentials, environment, profile),
+            args=(symbol, bar, credentials, environment, profile, gen),
             daemon=True,
         ).start()
 
@@ -17272,9 +18256,10 @@ class QuantApp:
         credentials: Credentials,
         environment: str,
         profile_name: str,
+        generation: int,
     ) -> None:
         try:
-            candles = self.client.get_candles_history(symbol, bar, limit=LINE_TRADING_DESK_CANDLE_TARGET)
+            candles = self.client.get_candles_history(symbol, bar, limit=LINE_TRADING_DESK_CANDLE_INITIAL)
             latest_price = candles[-1].close if candles else None
             try:
                 ticker = self.client.get_ticker(symbol)
@@ -17291,63 +18276,159 @@ class QuantApp:
                 latest_price=latest_price,
                 note=f"划线交易台 | {symbol} | {bar} | API={profile_name or '-'} | K={len(candles)}",
             )
-            positions = self.client.get_positions(credentials, environment=environment)
         except Exception as exc:
-            self.root.after(0, lambda msg=str(exc): self._apply_line_trading_desk_error(msg))
+            self.root.after(
+                0,
+                lambda msg=str(exc), g=generation: self._apply_line_trading_desk_error(msg, generation=g),
+            )
             return
-        self.root.after(0, lambda: self._apply_line_trading_desk_snapshot(snapshot, positions))
 
-    def _apply_line_trading_desk_error(self, message: str) -> None:
+        self.root.after(
+            0,
+            lambda s=snapshot, g=generation: self._apply_line_trading_desk_chart_only(s, g, loading_account=True),
+        )
+
+        account_error: str | None = None
+        positions: list[OkxPosition] = []
+        pending_orders: list[OkxTradeOrderItem] = []
+        order_history: list[OkxTradeOrderItem] = []
+        try:
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                fut_pos = pool.submit(self.client.get_positions, credentials, environment=environment)
+                fut_pend = pool.submit(
+                    self.client.get_pending_orders, credentials, environment=environment, limit=100
+                )
+                fut_hist = pool.submit(self.client.get_order_history, credentials, environment=environment, limit=100)
+                positions = fut_pos.result()
+                pending_orders = fut_pend.result()
+                order_history = fut_hist.result()
+        except Exception as exc:
+            account_error = str(exc).strip() or exc.__class__.__name__
+
+        self.root.after(
+            0,
+            lambda p=positions, po=pending_orders, oh=order_history, g=generation, err=account_error: self._apply_line_trading_desk_account_only(
+                p, po, oh, g, account_error=err
+            ),
+        )
+
+        if len(candles) < LINE_TRADING_DESK_CANDLE_TARGET:
+            try:
+                more = self.client.get_candles_history(symbol, bar, limit=LINE_TRADING_DESK_CANDLE_TARGET)
+                if len(more) > len(candles):
+                    lp = more[-1].close if more else None
+                    try:
+                        tk2 = self.client.get_ticker(symbol)
+                        if tk2.last is not None:
+                            lp = tk2.last
+                    except Exception:
+                        pass
+                    snap_full = build_strategy_live_chart_snapshot(
+                        session_id=f"desk:{symbol}",
+                        candles=more,
+                        ema_period=21,
+                        trend_ema_period=55,
+                        reference_ema_period=21,
+                        latest_price=lp,
+                        note=f"划线交易台 | {symbol} | {bar} | API={profile_name or '-'} | K={len(more)}",
+                    )
+                    self.root.after(
+                        0,
+                        lambda s=snap_full, g=generation: self._apply_line_trading_desk_chart_only(s, g, loading_account=False),
+                    )
+            except Exception:
+                pass
+
+    def _apply_line_trading_desk_error(self, message: str, *, generation: int | None = None) -> None:
         state = self._line_trading_desk_window
         if state is None:
+            return
+        if generation is not None and state.desk_refresh_generation != generation:
             return
         state.status_text.set(f"刷新失败：{message}")
         self._request_line_trading_desk_refresh(immediate=False)
 
-    def _apply_line_trading_desk_snapshot(
+    def _apply_line_trading_desk_chart_only(
         self,
         snapshot: StrategyLiveChartSnapshot,
-        positions: list[OkxPosition],
+        generation: int,
+        *,
+        loading_account: bool = False,
     ) -> None:
         state = self._line_trading_desk_window
         if state is None or not _widget_exists(state.window):
             return
-        state.last_snapshot = snapshot
+        if state.desk_refresh_generation != generation:
+            return
+        chart_snapshot = snapshot
+        chart_note = ""
+        if not snapshot.candles and state.last_snapshot is not None and state.last_snapshot.candles:
+            chart_snapshot = state.last_snapshot
+            chart_note = " | 本次K线返回空数据，已保留上一画面"
+        state.last_snapshot = chart_snapshot
         self._line_trading_desk_update_price_tick(state)
-        n = len(snapshot.candles)
+        n = len(chart_snapshot.candles)
         if n > 0 and not state.desk_initial_scroll_done:
             state.desk_view_start = max(0, n - min(state.desk_visible_bars, n))
             state.desk_initial_scroll_done = True
         self._line_trading_desk_clamp_view(state)
         self._line_trading_desk_eval_ray_triggers(state)
-        state.latest_positions = [item for item in positions if item.inst_id == state.symbol_var.get().strip().upper()]
         self._render_line_trading_desk_chart()
         self._line_trading_desk_refresh_ray_tree(state)
         self._line_trading_desk_refresh_rr_tree(state)
+        sym = state.symbol_var.get().strip().upper()
+        if loading_account:
+            state.status_text.set(
+                f"已加载K线 {len(chart_snapshot.candles)} 根 | {sym}{chart_note} | 正在同步持仓/委托…"
+            )
+        # 后台补足 K 线根数时不再改写状态栏，避免覆盖「已刷新」摘要。
+
+    def _apply_line_trading_desk_account_only(
+        self,
+        positions: list[OkxPosition],
+        pending_orders: list[OkxTradeOrderItem],
+        order_history: list[OkxTradeOrderItem],
+        generation: int,
+        *,
+        account_error: str | None = None,
+    ) -> None:
+        state = self._line_trading_desk_window
+        if state is None or not _widget_exists(state.window):
+            return
+        if state.desk_refresh_generation != generation:
+            return
+        sym = state.symbol_var.get().strip().upper()
+        state.latest_positions = [item for item in positions if item.inst_id == sym]
+        for item in state.latest_positions:
+            self._line_trading_desk_prefetch_instrument_async(state, item.inst_id)
+        state.latest_pending_orders = [o for o in pending_orders if o.inst_id.strip().upper() == sym]
+        state.latest_order_history = [o for o in order_history if o.inst_id.strip().upper() == sym][:80]
         tree = state.position_tree
         selected = tree.selection()[0] if tree.selection() else None
-        tree.delete(*tree.get_children())
+        rows: list[tuple[str, tuple[object, ...]]] = []
         for index, item in enumerate(state.latest_positions):
-            iid = f"desk-pos-{index}"
-            tree.insert(
-                "",
-                END,
-                iid=iid,
-                values=(
-                    item.inst_id,
-                    item.pos_side or "-",
-                    format_decimal(item.position),
-                    self._line_trading_desk_format_price(state, item.avg_price),
-                    self._line_trading_desk_format_price(state, item.mark_price),
-                    _format_optional_decimal(item.unrealized_pnl),
-                ),
+            iid = self._line_trading_desk_position_row_iid(item, index)
+            rows.append(
+                (
+                    iid,
+                    (
+                        item.inst_id,
+                        item.pos_side or "-",
+                        self._line_trading_desk_position_qty_cell(state, item),
+                        self._line_trading_desk_format_price(state, item.avg_price),
+                        self._line_trading_desk_format_price(state, item.mark_price),
+                        _format_optional_decimal(item.unrealized_pnl),
+                    ),
+                )
             )
-        if selected and tree.exists(selected):
-            tree.selection_set(selected)
-        elif tree.get_children():
-            tree.selection_set(tree.get_children()[0])
+        self._line_trading_desk_sync_tree_rows(tree, rows, preserve_selected_iid=selected)
+        self._line_trading_desk_refresh_pending_orders_tree(state)
+        self._line_trading_desk_refresh_order_history_tree(state)
+        chart_n = len(state.last_snapshot.candles) if state.last_snapshot and state.last_snapshot.candles else 0
+        err_seg = f" | 持仓/委托：{account_error}" if account_error else ""
         state.status_text.set(
-            f"已刷新 {state.symbol_var.get().strip().upper()} | K线 {len(snapshot.candles)} 根 | 持仓 {len(state.latest_positions)} 条"
+            f"已刷新 {sym} | K线 {chart_n} 根 | 持仓 {len(state.latest_positions)} 条 | "
+            f"当前委托 {len(state.latest_pending_orders)} 条 | 历史委托 {len(state.latest_order_history)} 条（标的过滤）{err_seg}"
         )
         self._request_line_trading_desk_refresh(immediate=False)
 
@@ -17356,34 +18437,47 @@ class QuantApp:
         if state is None or not _widget_exists(state.canvas):
             return
         self._line_trading_desk_cancel_motion_chart_paint(state)
-        snapshot = state.last_snapshot
-        if snapshot is None:
-            snapshot = StrategyLiveChartSnapshot(
-                session_id="desk:empty",
+        try:
+            snapshot = state.last_snapshot
+            if snapshot is None:
+                snapshot = StrategyLiveChartSnapshot(
+                    session_id="desk:empty",
+                    candles=(),
+                    note="等待加载K线...",
+                )
+                render_strategy_live_chart(state.canvas, snapshot)
+                return
+            if not snapshot.candles:
+                render_strategy_live_chart(state.canvas, snapshot)
+                return
+            tup = self._line_trading_desk_visible_snapshot(state)
+            if tup is None:
+                render_strategy_live_chart(state.canvas, snapshot)
+                return
+            sliced, vs, _vb = tup
+            to_draw = replace(sliced, price_display_tick=state.desk_price_tick)
+            render_strategy_live_chart(state.canvas, to_draw)
+            layout = compute_strategy_live_chart_layout(state.canvas, sliced)
+            if layout is not None:
+                for ann in state.line_annotations:
+                    if ann.kind in ("line", "horizontal"):
+                        self._line_trading_desk_draw_ray_on_canvas(state, ann, layout, vs)
+                    elif ann.kind == "stop":
+                        self._line_trading_desk_draw_stop_line(state, ann, layout, vs)
+                self._line_trading_desk_draw_rr_zones(state, layout, vs)
+            self._draw_line_annotations(state.canvas, [], state.draft_line_start, state.draft_line_current)
+        except Exception as exc:
+            # 防止绘图链路偶发异常导致画布被清空后“整页消失”。
+            fallback = StrategyLiveChartSnapshot(
+                session_id="desk:render-error",
                 candles=(),
-                note="等待加载K线...",
+                note=f"绘图异常：{exc}",
             )
-            render_strategy_live_chart(state.canvas, snapshot)
-            return
-        if not snapshot.candles:
-            render_strategy_live_chart(state.canvas, snapshot)
-            return
-        tup = self._line_trading_desk_visible_snapshot(state)
-        if tup is None:
-            render_strategy_live_chart(state.canvas, snapshot)
-            return
-        sliced, vs, _vb = tup
-        to_draw = replace(sliced, price_display_tick=state.desk_price_tick)
-        render_strategy_live_chart(state.canvas, to_draw)
-        layout = compute_strategy_live_chart_layout(state.canvas, sliced)
-        if layout is not None:
-            for ann in state.line_annotations:
-                if ann.kind in ("line", "horizontal"):
-                    self._line_trading_desk_draw_ray_on_canvas(state, ann, layout, vs)
-                elif ann.kind == "stop":
-                    self._line_trading_desk_draw_stop_line(state, ann, layout, vs)
-            self._line_trading_desk_draw_rr_zones(state, layout, vs)
-        self._draw_line_annotations(state.canvas, [], state.draft_line_start, state.draft_line_current)
+            try:
+                render_strategy_live_chart(state.canvas, fallback)
+            except Exception:
+                pass
+            state.status_text.set(f"图表重绘异常：{exc}（可继续操作，系统会自动重试）")
 
     def _line_trading_desk_draw_stop_line(
         self,
@@ -17421,7 +18515,12 @@ class QuantApp:
             "zoom_range": "区间放大（横拖选定K线，远端隐藏）",
             "none": "无（可选中拖动盈亏比框）",
         }
-        state.status_text.set(f"当前画线工具：{labels.get(tool, tool)}")
+        base = f"当前画线工具：{labels.get(tool, tool)}"
+        if tool == "line":
+            base += " | 按住拖拽后松手画一条，画完自动退出；再画请重新点本按钮。"
+        elif tool == "horizontal":
+            base += " | 点按或横拖后松手画一条水平射线，画完自动退出；再画请重新点本按钮。"
+        state.status_text.set(base)
         self._render_line_trading_desk_chart()
 
     def _set_line_trading_desk_rr_draw(self, side: str) -> None:
@@ -17448,16 +18547,22 @@ class QuantApp:
             return
         self._line_trading_desk_cancel_motion_chart_paint(state)
         state.line_annotations.clear()
+        locked_rr = [b for b in state.rr_annotations if b.locked]
         state.rr_annotations.clear()
+        state.rr_annotations.extend(locked_rr)
         state.draft_line_start = None
         state.draft_line_current = None
         state.desk_pan_origin = None
         state.rr_drag = None
         state.rr_pick = None
-        state.rr_selected_id = None
+        if state.rr_selected_id and not any(b.rr_id == state.rr_selected_id for b in state.rr_annotations):
+            state.rr_selected_id = state.rr_annotations[0].rr_id if state.rr_annotations else None
         self._line_trading_desk_refresh_rr_tree(state)
         self._render_line_trading_desk_chart()
-        state.status_text.set("已清空画线。")
+        if locked_rr:
+            state.status_text.set(f"已清空未锁定画线；保留 {len(locked_rr)} 个已锁定盈亏比。")
+        else:
+            state.status_text.set("已清空画线。")
 
     def _on_line_trading_desk_mouse_move(self, event) -> None:
         state = self._line_trading_desk_window
@@ -17526,10 +18631,8 @@ class QuantApp:
             state.status_text.set("未配置API，无法下单。")
             return
         symbol = state.symbol_var.get().strip().upper()
-        try:
-            instrument = self.client.get_instrument(symbol)
-        except Exception as exc:
-            state.status_text.set(f"读取标的失败：{exc}")
+        instrument = self._line_trading_desk_require_instrument_for_submit(state, symbol)
+        if instrument is None:
             return
         if state.rr_selected_id:
             rr_box = next((b for b in state.rr_annotations if b.rr_id == state.rr_selected_id), None)
@@ -17557,7 +18660,11 @@ class QuantApp:
                 stop_price = prev.low - atr_value
             else:
                 stop_price = prev.high + atr_value
-        config = replace(self._template_record_from_launcher().config, inst_id=symbol, trade_inst_id=symbol)
+        try:
+            config = self._line_trading_desk_strategy_config(symbol, profile)
+        except Exception as exc:
+            state.status_text.set(f"无法组装下单配置：{exc}")
+            return
         try:
             risk_raw = str(state.param_risk_amount.get()).strip() or "0"
             risk_amount = Decimal(risk_raw)
@@ -17579,28 +18686,94 @@ class QuantApp:
             state.status_text.set(f"定量失败：{exc}")
             return
         side = "buy" if direction == "long" else "sell"
-        pos_side = resolve_open_pos_side(config.position_mode, side)
-        try:
-            result = self.client.place_simple_order(
-                credentials,
-                config,
-                inst_id=symbol,
-                side=side,
-                size=size,
-                ord_type="limit",
-                pos_side=pos_side,
-                price=entry_price,
-            )
-        except Exception as exc:
-            state.status_text.set(f"下单失败：{exc}")
-            return
-        state.status_text.set(
-            f"已提交{('多' if direction == 'long' else '空')}单 | {symbol} | size={format_decimal(size)} | ordId={result.ord_id or '-'}"
-        )
-        self._enqueue_log(
-            f"[划线交易台] 提交{direction.upper()}单 | 标的={symbol} | 开仓价={self._line_trading_desk_format_price(state, entry_price)} | "
-            f"止损={self._line_trading_desk_format_price(state, stop_price)} | 数量={format_decimal(size)} | ordId={result.ord_id or '-'}"
-        )
+        pos_side = resolve_open_pos_side(config, side)
+        order_mode = state.param_order_mode.get() if state.param_order_mode is not None else "限价挂单"
+        session_log_tag = f"desk:{_normalize_symbol_input(symbol)}"
+        api_profile = profile
+        cl_ord_id = f"ld{datetime.utcnow().strftime('%y%m%d%H%M%S%f')}"[:32]
+        desk_ref = state
+        state.status_text.set("正在提交委托…")
+
+        def work() -> None:
+            try:
+                if order_mode == "对手价":
+                    result = self.client.place_aggressive_limit_order(
+                        credentials,
+                        config,
+                        instrument,
+                        side=side,
+                        size=size,
+                        pos_side=pos_side,
+                        cl_ord_id=cl_ord_id,
+                    )
+                else:
+                    result = self.client.place_simple_order(
+                        credentials,
+                        config,
+                        inst_id=symbol,
+                        side=side,
+                        size=size,
+                        ord_type="limit",
+                        pos_side=pos_side,
+                        price=entry_price,
+                        cl_ord_id=cl_ord_id,
+                    )
+            except Exception as exc:
+                err = str(exc)
+
+                def fail() -> None:
+                    st = self._line_trading_desk_window
+                    if st is not desk_ref or not _widget_exists(st.window):
+                        return
+                    st.status_text.set(f"下单失败：{err}")
+
+                self.root.after(0, fail)
+                return
+
+            rid = (result.ord_id or "-").strip() or "-"
+            track_ord = (result.ord_id or "").strip()
+            track_cl = (result.cl_ord_id or cl_ord_id or "").strip()
+
+            def done() -> None:
+                st = self._line_trading_desk_window
+                if st is not desk_ref or not _widget_exists(st.window):
+                    return
+                mode_note = "对手价IOC" if order_mode == "对手价" else "限价"
+                st.status_text.set(
+                    f"已提交{('多' if direction == 'long' else '空')}单（{mode_note}）| {symbol} | "
+                    f"size={format_decimal(size)} | ordId={rid} | clOrdId={track_cl or '-'}"
+                )
+                sz_seg = self._line_trading_desk_sz_log_segment(symbol, size)
+                pr = self._line_trading_desk_log_prefix(st)
+                self._enqueue_log(
+                    f"{pr} 提交{direction.upper()}单 | 标的={symbol} | 方式={mode_note} | "
+                    f"开仓价={self._line_trading_desk_format_price(st, entry_price)} | "
+                    f"止损={self._line_trading_desk_format_price(st, stop_price)} | {sz_seg} | "
+                    f"ordId={rid} | clOrdId={track_cl or '-'}"
+                )
+                threading.Thread(
+                    target=self._line_desk_post_entry_worker,
+                    args=(
+                        desk_ref,
+                        credentials,
+                        config,
+                        instrument,
+                        track_ord,
+                        track_cl,
+                        side,
+                        pos_side,
+                        size,
+                        entry_price,
+                        stop_price,
+                        session_log_tag,
+                        api_profile,
+                    ),
+                    daemon=True,
+                ).start()
+
+            self.root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _line_trading_desk_selected_position(self) -> OkxPosition | None:
         state = self._line_trading_desk_window
@@ -17609,10 +18782,123 @@ class QuantApp:
         selection = state.position_tree.selection()
         if not selection:
             return None
-        index = _history_tree_index(selection[0], "desk-pos")
-        if index is None or index >= len(state.latest_positions):
+        sel = selection[0]
+        items = state.latest_positions
+        bases = [self._line_trading_desk_position_row_iid(it, i) for i, it in enumerate(items)]
+        for final_iid, it in zip(_desk_tree_final_iids_from_bases(bases), items):
+            if final_iid == sel:
+                return it
+        idx = _history_tree_index(sel, "desk-pos")
+        if idx is not None and 0 <= idx < len(items):
+            return items[idx]
+        return None
+
+    def _line_trading_desk_selected_pending_order(self) -> OkxTradeOrderItem | None:
+        state = self._line_trading_desk_window
+        if state is None:
             return None
-        return state.latest_positions[index]
+        selection = state.pending_orders_tree.selection()
+        if not selection:
+            return None
+        sel = selection[0]
+        items = state.latest_pending_orders
+        bases = [self._line_trading_desk_order_row_iid(it, i, prefix="desk-pend") for i, it in enumerate(items)]
+        for final_iid, it in zip(_desk_tree_final_iids_from_bases(bases), items):
+            if final_iid == sel:
+                return it
+        idx = _history_tree_index(sel, "desk-pend")
+        if idx is not None and 0 <= idx < len(items):
+            return items[idx]
+        return None
+
+    def _line_trading_desk_cancel_selected_pending_order(self) -> None:
+        state = self._line_trading_desk_window
+        if state is None:
+            return
+        item = self._line_trading_desk_selected_pending_order()
+        if item is None:
+            messagebox.showinfo("撤单", "请先在「当前委托」列表中选中一条记录。", parent=state.window)
+            return
+        profile = state.api_profile_var.get().strip()
+        credentials = self._credentials_for_profile_or_none(profile)
+        if credentials is None:
+            state.status_text.set("未配置API，无法撤单。")
+            return
+        env_label = self._environment_label_for_profile(profile or self._current_credential_profile())
+        environment = ENV_OPTIONS[self._normalized_environment_label(env_label)]
+        desk_ref = state
+        inst = item.inst_id
+        src = item.source_kind
+        state.status_text.set("正在撤销委托…")
+
+        def work() -> None:
+            try:
+                if item.source_kind == "algo":
+                    algo_id = (item.algo_id or "").strip()
+                    algo_cl = (item.algo_client_order_id or item.client_order_id or "").strip()
+                    if algo_id:
+                        result = self.client.cancel_algo_order(
+                            credentials,
+                            environment=environment,
+                            inst_id=item.inst_id,
+                            algo_id=algo_id,
+                        )
+                    elif algo_cl:
+                        result = self.client.cancel_algo_order(
+                            credentials,
+                            environment=environment,
+                            inst_id=item.inst_id,
+                            algo_cl_ord_id=algo_cl,
+                        )
+                    else:
+                        raise OkxApiError("算法委托缺少 algoId / algoClOrdId")
+                else:
+                    oid = (item.order_id or "").strip()
+                    cl = (item.client_order_id or "").strip()
+                    if oid:
+                        result = self.client.cancel_order_by_id(
+                            credentials,
+                            environment=environment,
+                            inst_id=item.inst_id,
+                            ord_id=oid,
+                        )
+                    elif cl:
+                        result = self.client.cancel_order_by_id(
+                            credentials,
+                            environment=environment,
+                            inst_id=item.inst_id,
+                            cl_ord_id=cl,
+                        )
+                    else:
+                        raise OkxApiError("普通委托缺少 ordId / clOrdId")
+            except Exception as exc:
+                err = str(exc)
+
+                def fail() -> None:
+                    st = self._line_trading_desk_window
+                    if st is not desk_ref or not _widget_exists(st.window):
+                        return
+                    st.status_text.set(f"撤单失败：{err}")
+
+                self.root.after(0, fail)
+                return
+
+            rid = (result.ord_id or "-").strip() or "-"
+
+            def ok() -> None:
+                st = self._line_trading_desk_window
+                if st is not desk_ref or not _widget_exists(st.window):
+                    return
+                st.status_text.set(f"已提交撤单 | {inst} | id={rid}")
+                pr = self._line_trading_desk_log_prefix(st)
+                self._enqueue_log(
+                    f"{pr} 撤销委托 | {inst} | 来源={src} | ordType={item.ord_type or '-'} | id={rid}"
+                )
+                self._request_line_trading_desk_refresh(immediate=True)
+
+            self.root.after(0, ok)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _line_trading_desk_flatten_selected(self, flatten_mode: str) -> None:
         state = self._line_trading_desk_window
@@ -17636,10 +18922,12 @@ class QuantApp:
             f"已提交平仓 | {position.inst_id} | 方式={mode_label} | ordId={result.ord_id or '-'}"
         )
         self._enqueue_log(
-            f"[划线交易台] 提交平仓 | 合约={position.inst_id} | 方式={mode_label} | ordId={result.ord_id or '-'}"
+            f"{self._line_trading_desk_log_prefix(state)} 提交平仓 | 合约={position.inst_id} | 方式={mode_label} | ordId={result.ord_id or '-'}"
         )
         if normalized_flatten_mode == "best_quote" and price is not None:
-            self._enqueue_log(f"[划线交易台] 平仓挂单价={self._line_trading_desk_format_price(state, price)}")
+            self._enqueue_log(
+                f"{self._line_trading_desk_log_prefix(state)} 平仓挂单价={self._line_trading_desk_format_price(state, price)}"
+            )
         self._request_line_trading_desk_refresh(immediate=True)
 
     def _on_close(self) -> None:
@@ -19839,6 +21127,20 @@ def _format_okx_ms_timestamp(timestamp_ms: int | None) -> str:
 def _format_history_side(side: str | None, pos_side: str | None) -> str:
     parts = [part for part in (side, pos_side) if part and part.lower() != "net"]
     return " / ".join(parts) if parts else (side or pos_side or "-")
+
+
+def _desk_tree_final_iids_from_bases(base_iids: list[str]) -> list[str]:
+    """与 `_line_trading_desk_sync_tree_rows` 一致：重复 base iid 时追加 __2、__3…"""
+    iid_seen: dict[str, int] = {}
+    out: list[str] = []
+    for base in base_iids:
+        cnt = iid_seen.get(base, 0)
+        iid_seen[base] = cnt + 1
+        if cnt > 0:
+            out.append(f"{base}__{cnt + 1}")
+        else:
+            out.append(base)
+    return out
 
 
 def _history_tree_index(item_id: str, prefix: str) -> int | None:

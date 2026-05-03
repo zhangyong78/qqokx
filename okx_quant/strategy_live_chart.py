@@ -11,7 +11,9 @@ from okx_quant.pricing import format_decimal, format_decimal_by_increment
 
 DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT = 240
 DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS = 5000
-LINE_TRADING_DESK_CANDLE_TARGET = 1000
+# 首屏先拉较少 K 线更快出图，后台再补足到 TARGET。
+LINE_TRADING_DESK_CANDLE_INITIAL = 280
+LINE_TRADING_DESK_CANDLE_TARGET = 500
 LINE_TRADING_DESK_MAX_RIGHT_PAD_BARS = 240
 
 _CHART_INSET_LEFT = 76
@@ -185,7 +187,7 @@ def build_strategy_live_chart_snapshot(
         label="最新价",
         price=latest_price,
         color="#bf8700",
-        dash=(2, 2),
+        dash=(10, 12),
     )
     resolved_time_markers: list[StrategyLiveChartTimeMarker] = list(time_markers)
     if entry_time is not None:

@@ -8,3 +8,7 @@ requires-python = ">=3.11"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+include = ["okx_quant*"]
+exclude = ["tests*", "tests_artifacts*"]
+
