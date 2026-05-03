@@ -144,6 +144,45 @@ class UiHelpersTest(TestCase):
         self.assertEqual(merged_by_key[("1002", "BTC-USDT-SWAP")]["state"], "filled")
         self.assertEqual(merged_by_key[("1003", "ETH-USDT-SWAP")]["state"], "live")
 
+    def test_line_trading_desk_refresh_order_history_tab_updates_filtered_rows(self) -> None:
+        calls: list[str] = []
+        state = SimpleNamespace(
+            window=object(),
+            symbol_var=_Var("BTC-USDT-SWAP"),
+            api_profile_var=_Var("moni"),
+            status_text=_Var(""),
+            latest_order_history=[],
+        )
+        app = SimpleNamespace(
+            _line_trading_desk_window=state,
+            client=SimpleNamespace(
+                get_order_history=lambda credentials, *, environment, limit: [
+                    SimpleNamespace(inst_id="BTC-USDT-SWAP"),
+                    SimpleNamespace(inst_id="ETH-USDT-SWAP"),
+                    SimpleNamespace(inst_id="BTC-USDT-SWAP"),
+                ]
+            ),
+            root=SimpleNamespace(after=lambda delay, callback: callback()),
+            _credentials_for_profile_or_none=lambda profile: object(),
+            _environment_label_for_profile=lambda profile: "模拟盘 demo",
+            _current_credential_profile=lambda: "moni",
+            _normalized_environment_label=lambda label: QuantApp._normalized_environment_label(SimpleNamespace(), label),
+            _line_trading_desk_refresh_order_history_tree=lambda st: calls.append("tree"),
+            _line_trading_desk_log_prefix=lambda st: "[desk]",
+            _enqueue_log=lambda message: calls.append(message),
+        )
+        app._line_trading_desk_apply_order_history_only = lambda desk_ref, history, err: (
+            QuantApp._line_trading_desk_apply_order_history_only(app, desk_ref, history, err)
+        )
+
+        with patch("okx_quant.ui._widget_exists", return_value=True):
+            QuantApp._line_trading_desk_refresh_order_history_tab(app)
+
+        self.assertEqual(len(state.latest_order_history), 2)
+        self.assertEqual(state.status_text.get(), "已刷新历史委托 | BTC-USDT-SWAP | 2 条")
+        self.assertIn("tree", calls)
+        self.assertIn("[desk] 已刷新历史委托 | BTC-USDT-SWAP | 2 条", calls)
+
     def test_format_network_error_message_read_timeout(self) -> None:
         self.assertEqual(
             _format_network_error_message("The read operation timed out"),

@@ -4605,6 +4605,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         hist_y_scroll = ttk.Scrollbar(tab_hist, orient="vertical", command=order_history_tree.yview)
         hist_y_scroll.grid(row=0, column=1, sticky="ns")
         order_history_tree.configure(yscrollcommand=hist_y_scroll.set)
+        hist_toolbar = ttk.Frame(tab_hist)
+        hist_toolbar.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(hist_toolbar, text="刷新", command=self._line_trading_desk_refresh_order_history_tab).pack(side="left")
         desk_orders_nb.add(tab_hist, text="历史委托")
 
         action_row = ttk.Frame(right)
@@ -6506,6 +6509,35 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _line_trading_desk_refresh_order_history_tab(self) -> None:
+        """仅重新拉取历史委托（不整图刷新 K 线），减轻请求量。"""
+        state = self._line_trading_desk_window
+        if state is None or not _widget_exists(state.window):
+            return
+        symbol = state.symbol_var.get().strip().upper()
+        if not symbol:
+            state.status_text.set("请先选择标的。")
+            return
+        profile = state.api_profile_var.get().strip()
+        credentials = self._credentials_for_profile_or_none(profile)
+        if credentials is None:
+            state.status_text.set("未配置所选 API 凭证，无法刷新历史委托。")
+            return
+        env_label = self._environment_label_for_profile(profile or self._current_credential_profile())
+        environment = ENV_OPTIONS[self._normalized_environment_label(env_label)]
+        desk_ref = state
+        state.status_text.set(f"正在刷新历史委托：{symbol}…")
+
+        def work() -> None:
+            try:
+                history = self.client.get_order_history(credentials, environment=environment, limit=100)
+            except Exception as exc:
+                self.root.after(0, lambda msg=str(exc): self._line_trading_desk_apply_order_history_only(desk_ref, None, msg))
+                return
+            self.root.after(0, lambda rows=history: self._line_trading_desk_apply_order_history_only(desk_ref, rows, None))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _line_trading_desk_apply_pending_only(
         self,
         desk_ref: LineTradingDeskWindowState,
@@ -6527,6 +6559,28 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         st.status_text.set(f"已刷新当前委托 | {sym} | {len(filtered)} 条")
         pr = self._line_trading_desk_log_prefix(st)
         self._enqueue_log(f"{pr} 已刷新当前委托 | {sym} | {len(filtered)} 条")
+
+    def _line_trading_desk_apply_order_history_only(
+        self,
+        desk_ref: LineTradingDeskWindowState,
+        history: list[OkxTradeOrderItem] | None,
+        err: str | None,
+    ) -> None:
+        st = self._line_trading_desk_window
+        if st is not desk_ref or not _widget_exists(st.window):
+            return
+        sym = st.symbol_var.get().strip().upper()
+        if err is not None:
+            st.status_text.set(f"刷新历史委托失败：{err}")
+            pr = self._line_trading_desk_log_prefix(st)
+            self._enqueue_log(f"{pr} 刷新历史委托失败 | {sym} | {err}")
+            return
+        filtered = [o for o in (history or []) if o.inst_id.strip().upper() == sym][:80]
+        st.latest_order_history = filtered
+        self._line_trading_desk_refresh_order_history_tree(st)
+        st.status_text.set(f"已刷新历史委托 | {sym} | {len(filtered)} 条")
+        pr = self._line_trading_desk_log_prefix(st)
+        self._enqueue_log(f"{pr} 已刷新历史委托 | {sym} | {len(filtered)} 条")
 
     def _line_trading_desk_log_prefix(self, state: LineTradingDeskWindowState) -> str:
         p = state.api_profile_var.get().strip()
