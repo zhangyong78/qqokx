@@ -2874,6 +2874,8 @@ class StrategyTradeTrackingTest(TestCase):
         app = SimpleNamespace(
             _selected_position_item=lambda: position,
             _position_action_parent=lambda: "parent-window",
+            _positions_context_profile_name=None,
+            _current_credential_profile=lambda: "test-profile",
             _position_manual_flatten_mode_label=QuantApp._position_manual_flatten_mode_label,
             _submit_selected_position_manual_flatten=lambda selected, flatten_mode: (
                 OkxOrderResult(
