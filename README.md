@@ -1,6 +1,6 @@
 # OKX 策略工作台
 
-当前版本：`v0.5.07`
+当前版本：`v0.5.08`
 
 这是一个面向 OKX 的桌面交易工作台，围绕“监控、交易、保护、回测、分析”构建。当前项目已经包含：
 
@@ -560,7 +560,14 @@ ATR 批量矩阵规则：
 - `.okx_quant_candle_cache/`
 
 ## 11. 更新日志
-当前版本：v0.5.07
+当前版本：v0.5.08
+
+### v0.5.08
+
+- 策略引擎（`StrategyEngine`）结构优化：将下单与恢复、读重试策略、会话主循环、策略分发路由拆到 `engine_order_service`、`engine_retry_policy`、`engine_session_runner`、`engine_strategy_router`，核心仍由 `engine.py` 组装，便于维护与单测收口。
+- 读重试层与 OKX 客户端对齐：`get_order`（支持 `cl_ordId`）、`get_pending_orders`（`inst_types`）、`get_positions`（`inst_type`）及多类触发价（`last`/`mark`/`index` 等）走统一重试封装；去掉 `engine.py` 里重复的 `_call_okx_read_with_retry` 定义。
+- 主界面代码已按领域拆分：`ui.py` 作为壳层转发至 `ui_shell` 与各 `ui_*` 模块，并修正拆分后的方法装饰器问题。
+- 划线交易台：订单历史区域支持刷新，与近期看盘习惯对齐。
 
 ### v0.5.07
 

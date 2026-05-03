@@ -20,6 +20,10 @@ from okx_quant.okx_client import (
     infer_inst_type,
 )
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
+from okx_quant.engine_order_service import EngineOrderService
+from okx_quant.engine_retry_policy import EngineRetryPolicy
+from okx_quant.engine_session_runner import EngineSessionRunner
+from okx_quant.engine_strategy_router import EngineStrategyRouter
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
@@ -162,84 +166,26 @@ class StrategyEngine:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._order_ref_counter = 0
+        self._session_runner = EngineSessionRunner(self)
+        self._strategy_router = EngineStrategyRouter(self)
+        self._retry_policy = EngineRetryPolicy(self)
+        self._order_service = EngineOrderService(self)
 
     @property
     def is_running(self) -> bool:
-        with self._lock:
-            return self._thread is not None and self._thread.is_alive()
+        return self._session_runner.is_running
 
     def start(self, credentials: Credentials, config: StrategyConfig) -> None:
-        with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                raise RuntimeError("策略已经在运行中")
-            self._stop_event.clear()
-            resolved_profile_name = credentials.profile_name.strip()
-            if resolved_profile_name:
-                self._api_name = resolved_profile_name
-            self._thread = threading.Thread(
-                target=self._run,
-                args=(credentials, config),
-                daemon=True,
-                name=f"okx-{config.strategy_id}",
-            )
-            self._thread.start()
+        self._session_runner.start(credentials, config)
 
     def stop(self) -> None:
-        self._stop_event.set()
+        self._session_runner.stop()
 
     def wait_stopped(self, timeout: float | None = None) -> bool:
-        with self._lock:
-            thread = self._thread
-        if thread is None:
-            return True
-        thread.join(timeout=timeout)
-        return not thread.is_alive()
+        return self._session_runner.wait_stopped(timeout=timeout)
 
     def _run(self, credentials: Credentials, config: StrategyConfig) -> None:
-        try:
-            signal_instrument = self._get_instrument_with_retry(config.inst_id)
-            if signal_instrument.state.lower() != "live":
-                raise RuntimeError(f"{signal_instrument.inst_id} 当前不可交易，状态：{signal_instrument.state}")
-
-            if config.run_mode == "signal_only":
-                if is_dynamic_strategy_id(config.strategy_id):
-                    self._run_dynamic_signal_only_v2(config, signal_instrument)
-                elif config.strategy_id == STRATEGY_CROSS_ID:
-                    self._run_cross_signal_only(config, signal_instrument)
-                elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
-                    self._run_ema5_ema8_signal_only(config, signal_instrument)
-                else:
-                    raise RuntimeError(f"未知策略：{config.strategy_id}")
-
-                return
-
-            trade_inst_id = resolve_trade_inst_id(config)
-            trade_instrument = self._get_instrument_with_retry(trade_inst_id)
-            if trade_instrument.state.lower() != "live":
-                raise RuntimeError(f"{trade_instrument.inst_id} 当前不可交易，状态：{trade_instrument.state}")
-            if trade_instrument.inst_type == "SPOT":
-                raise RuntimeError("当前版本只支持永续或期权下单，现货暂时仅支持作为触发价格来源")
-
-            validate_entry_side_mode_support(config)
-            if is_dynamic_strategy_id(config.strategy_id):
-                if can_use_exchange_managed_orders(config, signal_instrument, trade_instrument):
-                    self._run_dynamic_exchange_strategy(credentials, config, trade_instrument)
-                else:
-                    self._run_dynamic_local_strategy_v2(credentials, config, signal_instrument, trade_instrument)
-            elif config.strategy_id == STRATEGY_CROSS_ID:
-                if can_use_exchange_managed_orders(config, signal_instrument, trade_instrument):
-                    self._run_cross_exchange_strategy(credentials, config, signal_instrument)
-                else:
-                    self._run_cross_local_strategy(credentials, config, signal_instrument, trade_instrument)
-            elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
-                self._run_ema5_ema8_local_strategy(credentials, config, signal_instrument, trade_instrument)
-            else:
-                raise RuntimeError(f"未知策略：{config.strategy_id}")
-        except Exception as exc:
-            self._notify_error(config, str(exc))
-            self._logger(f"策略停止，原因：{exc}")
-        finally:
-            self._stop_event.set()
+        self._strategy_router.run(credentials, config)
 
     def _run_dynamic_exchange_strategy(
         self,
@@ -2384,84 +2330,13 @@ class StrategyEngine:
         return None
 
     def _call_okx_read_with_retry(self, label: str, fn: Callable[[], T]) -> T:
-        last_exc: OkxApiError | None = None
-        for attempt in range(1, OKX_READ_RETRY_ATTEMPTS + 1):
-            try:
-                return fn()
-            except Exception as exc:
-                okx_exc = _coerce_okx_read_exception(exc)
-                if okx_exc is None:
-                    raise
-                last_exc = okx_exc
-                detail = str(okx_exc).strip() or f"code={okx_exc.code or '-'}"
-                if (
-                    not _is_transient_okx_error(okx_exc)
-                    or attempt >= OKX_READ_RETRY_ATTEMPTS
-                    or self._stop_event.is_set()
-                ):
-                    self._logger(f"OKX 读取失败 | 操作={label} | {detail}")
-                    raise
-                self._logger(
-                    " | ".join(
-                        [
-                            "OKX 读取异常，准备重试",
-                            f"操作={label}",
-                            f"第{attempt}/{OKX_READ_RETRY_ATTEMPTS}次",
-                            detail,
-                        ]
-                    )
-                )
-                delay_seconds = min(OKX_READ_RETRY_BASE_DELAY_SECONDS * attempt, OKX_READ_RETRY_MAX_DELAY_SECONDS)
-                self._stop_event.wait(delay_seconds)
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError(f"OKX 读取失败：{label}")
-
-    def _call_okx_read_with_retry(self, label: str, fn: Callable[[], T]) -> T:
-        last_exc: OkxApiError | None = None
-        for attempt in range(1, OKX_READ_RETRY_ATTEMPTS + 1):
-            try:
-                return fn()
-            except Exception as exc:
-                okx_exc = _coerce_okx_read_exception(exc)
-                if okx_exc is None:
-                    raise
-                last_exc = okx_exc
-                detail = str(okx_exc).strip() or f"code={okx_exc.code or '-'}"
-                if (
-                    not _is_transient_okx_error(okx_exc)
-                    or attempt >= OKX_READ_RETRY_ATTEMPTS
-                    or self._stop_event.is_set()
-                ):
-                    self._logger(f"OKX 读取失败 | 操作={label} | {detail}")
-                    raise okx_exc
-                self._logger(
-                    " | ".join(
-                        [
-                            "OKX 读取异常，准备重试",
-                            f"操作={label}",
-                            f"第{attempt}/{OKX_READ_RETRY_ATTEMPTS}次",
-                            detail,
-                        ]
-                    )
-                )
-                delay_seconds = min(OKX_READ_RETRY_BASE_DELAY_SECONDS * attempt, OKX_READ_RETRY_MAX_DELAY_SECONDS)
-                self._stop_event.wait(delay_seconds)
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError(f"OKX 读取失败：{label}")
+        return self._retry_policy.call_okx_read_with_retry(label, fn)
 
     def _get_instrument_with_retry(self, inst_id: str) -> Instrument:
-        return self._call_okx_read_with_retry(
-            f"读取标的 {inst_id}",
-            lambda: self._client.get_instrument(inst_id),
-        )
+        return self._retry_policy.get_instrument(inst_id)
 
     def _get_candles_with_retry(self, inst_id: str, bar: str, *, limit: int) -> list:
-        return self._call_okx_read_with_retry(
-            f"读取K线 {inst_id} {bar}",
-            lambda: self._client.get_candles(inst_id, bar, limit=limit),
-        )
+        return self._retry_policy.get_candles(inst_id, bar, limit=limit)
 
     def _get_order_with_retry(
         self,
@@ -2472,22 +2347,16 @@ class StrategyEngine:
         ord_id: str | None = None,
         cl_ord_id: str | None = None,
     ):
-        return self._call_okx_read_with_retry(
-            f"读取订单状态 {inst_id}",
-            lambda: self._client.get_order(
-                credentials,
-                config,
-                inst_id=inst_id,
-                ord_id=ord_id,
-                cl_ord_id=cl_ord_id,
-            ),
+        return self._retry_policy.get_order(
+            credentials,
+            config,
+            inst_id=inst_id,
+            ord_id=ord_id,
+            cl_ord_id=cl_ord_id,
         )
 
     def _get_trigger_price_with_retry(self, inst_id: str, price_type: str) -> Decimal:
-        return self._call_okx_read_with_retry(
-            f"读取触发价格 {inst_id} {price_type}",
-            lambda: self._client.get_trigger_price(inst_id, price_type),
-        )
+        return self._retry_policy.get_trigger_price(inst_id, price_type)
 
     def _get_pending_orders_with_retry(
         self,
@@ -2497,14 +2366,11 @@ class StrategyEngine:
         inst_types: tuple[str, ...],
         limit: int,
     ):
-        return self._call_okx_read_with_retry(
-            f"读取挂单列表 {','.join(inst_types)}",
-            lambda: self._client.get_pending_orders(
-                credentials,
-                environment=config.environment,
-                inst_types=inst_types,
-                limit=limit,
-            ),
+        return self._retry_policy.get_pending_orders(
+            credentials,
+            config,
+            inst_types=inst_types,
+            limit=limit,
         )
 
     def _get_positions_with_retry(
@@ -2514,14 +2380,7 @@ class StrategyEngine:
         *,
         inst_type: str | None = None,
     ) -> list[OkxPosition]:
-        return self._call_okx_read_with_retry(
-            f"读取持仓 {inst_type or 'all'}",
-            lambda: self._client.get_positions(
-                credentials,
-                environment=config.environment,
-                inst_type=inst_type,
-            ),
-        )
+        return self._retry_policy.get_positions(credentials, config, inst_type=inst_type)
 
     def _fetch_atr_snapshot_with_retry(
         self,
@@ -2695,101 +2554,14 @@ class StrategyEngine:
         label: str,
         submit_fn: Callable[[], OkxOrderResult],
     ) -> OkxOrderResult:
-        try:
-            return submit_fn()
-        except OkxApiError as exc:
-            if not _is_transient_okx_error(exc):
-                detail = str(exc).strip() or f"code={exc.code or '-'}"
-                raise RuntimeError(
-                    self._build_okx_write_failure_message(
-                        label=label,
-                        inst_id=inst_id,
-                        cl_ord_id=cl_ord_id,
-                        detail=detail,
-                        code=exc.code,
-                    )
-                ) from exc
-            detail = str(exc).strip() or f"code={exc.code or '-'}"
-            self._logger(
-                " | ".join(
-                    [
-                        "OKX 下单请求响应异常，开始回查订单状态",
-                        f"操作={label}",
-                        f"标的={inst_id}",
-                        f"clOrdId={cl_ord_id}",
-                        detail,
-                    ]
-                )
-            )
-            recovered = self._recover_submitted_order_result(
-                credentials,
-                config,
-                inst_id=inst_id,
-                cl_ord_id=cl_ord_id,
-                label=label,
-            )
-            if recovered is not None:
-                self._logger(
-                    " | ".join(
-                        [
-                            "OKX 下单响应丢失，但回查确认委托已落地",
-                            f"操作={label}",
-                            f"标的={inst_id}",
-                            f"ordId={recovered.ord_id or '-'}",
-                            f"clOrdId={cl_ord_id}",
-                        ]
-                    )
-                )
-                return recovered
-
-            if self._stop_event.is_set():
-                raise RuntimeError(
-                    f"OKX {label}请求中断，且回查未确认订单状态 | clOrdId={cl_ord_id}"
-                ) from exc
-
-            self._logger(
-                " | ".join(
-                    [
-                        "OKX 下单回查未确认，准备使用同一 clOrdId 补发一次",
-                        f"操作={label}",
-                        f"标的={inst_id}",
-                        f"clOrdId={cl_ord_id}",
-                    ]
-                )
-            )
-            try:
-                return submit_fn()
-            except OkxApiError as retry_exc:
-                recovered = self._recover_submitted_order_result(
-                    credentials,
-                    config,
-                    inst_id=inst_id,
-                    cl_ord_id=cl_ord_id,
-                    label=label,
-                )
-                if recovered is not None:
-                    self._logger(
-                        " | ".join(
-                            [
-                                "OKX 下单补发响应异常，但回查确认委托已落地",
-                                f"操作={label}",
-                                f"标的={inst_id}",
-                                f"ordId={recovered.ord_id or '-'}",
-                                f"clOrdId={cl_ord_id}",
-                            ]
-                        )
-                    )
-                    return recovered
-                detail = str(retry_exc).strip() or f"code={retry_exc.code or '-'}"
-                raise RuntimeError(
-                    self._build_okx_write_failure_message(
-                        label=f"{label}失败且回查未确认订单状态",
-                        inst_id=inst_id,
-                        cl_ord_id=cl_ord_id,
-                        detail=detail,
-                        code=retry_exc.code,
-                    )
-                ) from retry_exc
+        return self._order_service.submit_order_with_recovery(
+            credentials,
+            config,
+            inst_id=inst_id,
+            cl_ord_id=cl_ord_id,
+            label=label,
+            submit_fn=submit_fn,
+        )
 
     def _does_pending_algo_stop_loss_match(
         self,
@@ -2924,40 +2696,15 @@ class StrategyEngine:
         cl_ord_id: str | None = None,
         label: str = "开仓报单",
     ) -> OkxOrderResult:
-        resolved_cl_ord_id = cl_ord_id or self._next_client_order_id(role="entry")
-        if trade_instrument.inst_type == "OPTION":
-            return self._submit_order_with_recovery(
-                credentials,
-                config,
-                inst_id=trade_instrument.inst_id,
-                cl_ord_id=resolved_cl_ord_id,
-                label=label,
-                submit_fn=lambda: self._client.place_aggressive_limit_order(
-                    credentials,
-                    config,
-                    trade_instrument,
-                    side=side,
-                    size=size,
-                    pos_side=pos_side,
-                    cl_ord_id=resolved_cl_ord_id,
-                ),
-            )
-        return self._submit_order_with_recovery(
+        return self._order_service.place_entry_order(
             credentials,
             config,
-            inst_id=trade_instrument.inst_id,
-            cl_ord_id=resolved_cl_ord_id,
+            trade_instrument,
+            side,
+            size,
+            pos_side,
+            cl_ord_id=cl_ord_id,
             label=label,
-            submit_fn=lambda: self._client.place_simple_order(
-                credentials,
-                config,
-                inst_id=trade_instrument.inst_id,
-                side=side,
-                size=size,
-                ord_type="market",
-                pos_side=pos_side,
-                cl_ord_id=resolved_cl_ord_id,
-            ),
         )
 
     def _place_exit_order(
@@ -2970,15 +2717,13 @@ class StrategyEngine:
         size: Decimal,
         pos_side: Literal["long", "short"] | None,
     ) -> OkxOrderResult:
-        return self._place_entry_order(
+        return self._order_service.place_exit_order(
             credentials,
             config,
-            trade_instrument,
-            side,
-            size,
-            pos_side,
-            cl_ord_id=self._next_client_order_id(role="exit"),
-            label="平仓报单",
+            trade_instrument=trade_instrument,
+            side=side,
+            size=size,
+            pos_side=pos_side,
         )
 
     def _wait_for_order_fill(
@@ -3039,13 +2784,7 @@ class StrategyEngine:
         raise RuntimeError(f"订单未成交，ordId={result.ord_id}，状态={latest_state or 'unknown'}")
 
     def _next_client_order_id(self, *, role: str) -> str:
-        self._order_ref_counter += 1
-        session_token = "".join(ch for ch in self._session_id.lower() if ch.isascii() and ch.isalnum())[:4] or "sess"
-        strategy_token = "".join(ch for ch in self._strategy_name.lower() if ch.isascii() and ch.isalnum())[:4] or "stg"
-        role_token = "".join(ch for ch in role.lower() if ch.isascii() and ch.isalnum())[:3] or "ord"
-        timestamp = datetime.utcnow().strftime("%m%d%H%M%S%f")[:-3]
-        suffix = f"{self._order_ref_counter % 100:02d}"
-        return f"{session_token}{strategy_token}{role_token}{timestamp}{suffix}"[:32]
+        return self._order_service.next_client_order_id(role=role)
 
     def _cancel_active_order(
         self,
