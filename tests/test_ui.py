@@ -69,6 +69,12 @@ from okx_quant.ui import (
 
 
 class UiHelpersTest(TestCase):
+    def test_ui_split_keeps_parse_positive_int_bound_to_app(self) -> None:
+        descriptor = QuantApp.__dict__["_parse_positive_int"]
+
+        self.assertFalse(isinstance(descriptor, staticmethod))
+        self.assertEqual(descriptor.__get__(SimpleNamespace(), QuantApp)("2", "field"), 2)
+
     def test_order_item_from_cache_returns_none_for_invalid_record(self) -> None:
         self.assertIsNone(_order_item_from_cache({"inst_id": "", "created_time": None, "update_time": None}))
 

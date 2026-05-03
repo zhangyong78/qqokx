@@ -3258,6 +3258,7 @@ class UiPositionsMixin:
         self._refresh_running_session_summary()
         self._refresh_selected_session_details()
 
+    @staticmethod
     def _session_counts_toward_running_summary(session: StrategySession) -> bool:
         return bool(
             session.engine.is_running
@@ -3381,6 +3382,7 @@ class UiPositionsMixin:
     def _session_has_duplicate_launch_conflict(self, session: StrategySession) -> bool:
         return bool(QuantApp._duplicate_launch_conflicts_for(self, session))
 
+    @staticmethod
     def _session_category_label(session: StrategySession) -> str:
         trader_id = str(getattr(session, "trader_id", "") or "").strip()
         if trader_id:
@@ -3416,6 +3418,7 @@ class UiPositionsMixin:
             return True
         return QuantApp._session_category_label(session) == selected_filter
 
+    @staticmethod
     def _build_duplicate_launch_conflict_warning(
         session: StrategySession,
         conflicts: list[StrategySession],
@@ -3760,12 +3763,14 @@ class UiPositionsMixin:
     def _position_action_parent(self):
         return self._positions_zoom_window or self.root
 
+    @staticmethod
     def _normalize_position_manual_flatten_mode(flatten_mode: str) -> str:
         normalized = str(flatten_mode or "").strip().lower()
         if normalized == "best_quote":
             return "best_quote"
         return "market"
 
+    @staticmethod
     def _position_manual_flatten_mode_label(flatten_mode: str) -> str:
         if QuantApp._normalize_position_manual_flatten_mode(flatten_mode) == "best_quote":
             return "挂买一/卖一平仓"

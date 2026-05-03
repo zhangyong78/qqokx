@@ -178,8 +178,21 @@ from okx_quant.ui_strategy_sessions import UiStrategySessionsMixin
 
 def _bind_mixin_to_shell_globals(mixin_cls):
     for name, value in tuple(mixin_cls.__dict__.items()):
-        if isinstance(value, FunctionType):
-            rebound = type(value)(
+        if isinstance(value, staticmethod):
+            func = value.__func__
+            rebound = FunctionType(
+                func.__code__,
+                globals(),
+                func.__name__,
+                func.__defaults__,
+                func.__closure__,
+            )
+            rebound.__kwdefaults__ = func.__kwdefaults__
+            rebound.__annotations__ = dict(getattr(func, "__annotations__", {}))
+            rebound.__dict__.update(getattr(func, "__dict__", {}))
+            setattr(mixin_cls, name, staticmethod(rebound))
+        elif isinstance(value, FunctionType):
+            rebound = FunctionType(
                 value.__code__,
                 globals(),
                 value.__name__,
@@ -5565,18 +5578,14 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self._update_fixed_order_size_hint()
             self._schedule_minimum_order_risk_hint_update()
 
-    @staticmethod
 
-    @staticmethod
 
 
 
 
 
 
-    @staticmethod
 
-    @staticmethod
 
 
 
@@ -5616,10 +5625,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
 
-    @staticmethod
 
 
 
@@ -5629,7 +5636,6 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
 
 
@@ -5642,16 +5648,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
-    @staticmethod
 
 
 
 
 
 
-    @staticmethod
 
 
 
@@ -5661,22 +5664,15 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
-    @staticmethod
 
-    @staticmethod
 
-    @staticmethod
 
-    @staticmethod
 
-    @staticmethod
 
 
 
 
-    @staticmethod
 
 
 
@@ -5696,11 +5692,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
-    @staticmethod
 
-    @staticmethod
 
 
 
@@ -5708,7 +5701,6 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
 
 
@@ -5716,12 +5708,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
 
 
 
-    @staticmethod
 
 
 
@@ -5733,9 +5723,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
-    @staticmethod
 
 
 
@@ -5778,7 +5766,6 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
 
 
@@ -5787,7 +5774,6 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
 
 
@@ -5795,17 +5781,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
-    @staticmethod
 
-    @staticmethod
 
-    @staticmethod
 
 
 
-    @staticmethod
 
 
 
@@ -5817,12 +5798,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
 
 
 
-    @staticmethod
 
 
 
@@ -5853,7 +5832,6 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
 
 
@@ -5861,7 +5839,6 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
 
 
@@ -5870,7 +5847,6 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
 
-    @staticmethod
 
 
 

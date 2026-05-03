@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 class UiStrategySessionsMixin:
+    @staticmethod
     def _format_strategy_symbol_display(signal_symbol: str, trade_symbol: str | None) -> str:
         normalized_signal = signal_symbol.strip().upper()
         normalized_trade = (trade_symbol or normalized_signal).strip().upper()
@@ -15,6 +16,7 @@ class UiStrategySessionsMixin:
             return normalized_signal
         return f"{normalized_signal} -> {normalized_trade}"
 
+    @staticmethod
     def _default_strategy_template_filename(record: StrategyTemplateRecord) -> str:
         raw = f"{record.strategy_name or record.strategy_id}_{record.symbol or 'strategy'}"
         sanitized = re.sub(r'[\\/:*?"<>|]+', "_", raw).strip(" ._")
@@ -169,9 +171,11 @@ class UiStrategySessionsMixin:
             api_note=api_note,
         )
 
+    @staticmethod
     def _session_blocks_duplicate_launch(session: StrategySession) -> bool:
         return session.engine.is_running or session.status in {"运行中", "停止中"}
 
+    @staticmethod
     def _format_duplicate_launch_block_message(session: StrategySession, *, imported: bool) -> str:
         headline = "已导入参数，但检测到重复策略：" if imported else "检测到重复策略启动："
         guidance = (
@@ -1359,6 +1363,7 @@ class UiStrategySessionsMixin:
         weighted_value = sum((abs(position.position) * (position.avg_price or Decimal("0")) for position in positions), Decimal("0"))
         return weighted_value / total_size, snapshot.refreshed_at
 
+    @staticmethod
     def _strategy_live_chart_canvas_note(
         *,
         pending_entry_count: int,
@@ -1406,6 +1411,7 @@ class UiStrategySessionsMixin:
             parts.append(f"\u6700\u8fd1\u6d88\u606f {last_message}")
         return " | ".join(parts)
 
+    @staticmethod
     def _strategy_live_chart_footer_text(
         *,
         session: StrategySession,
@@ -1604,6 +1610,7 @@ class UiStrategySessionsMixin:
         if changed:
             self._save_trader_desk_snapshot()
 
+    @staticmethod
     def _session_runtime_snapshot_for_ui(session: StrategySession) -> dict[str, object]:
         return {
             "session_id": session.session_id,
@@ -1781,6 +1788,7 @@ class UiStrategySessionsMixin:
         else:
             self._enqueue_log(f"[交易员管理台] [{normalized}] {text}")
 
+    @staticmethod
     def _expected_trader_stop_reason(reason: str) -> bool:
         normalized = str(reason or "").strip()
         if not normalized:
@@ -1797,6 +1805,7 @@ class UiStrategySessionsMixin:
         )
         return any(marker in normalized for marker in markers)
 
+    @staticmethod
     def _session_stop_reason_text(session: StrategySession) -> str:
         ended_reason = str(getattr(session, "ended_reason", "") or "").strip()
         if ended_reason:
@@ -1875,6 +1884,7 @@ class UiStrategySessionsMixin:
             return False
         return trader_gate_allows_price(draft.gate, current_price)
 
+    @staticmethod
     def _trader_wave_lock_signal_from_session(session: StrategySession) -> str:
         signal_mode = str(getattr(getattr(session, "config", None), "signal_mode", "") or "").strip().lower()
         if signal_mode == "long_only":
@@ -2244,6 +2254,7 @@ class UiStrategySessionsMixin:
         )
         self._save_trader_desk_snapshot()
 
+    @staticmethod
     def _trader_manual_flatten_open_side(
         config: StrategyConfig,
     ) -> tuple[str, str, str | None]:
@@ -2256,29 +2267,34 @@ class UiStrategySessionsMixin:
             return ("buy", "short", short_pos_side)
         raise ValueError("交易员手动平仓仅支持只做多或只做空策略。")
 
+    @staticmethod
     def _trader_position_closeable_size(position: OkxPosition) -> Decimal:
         base = position.avail_position
         if base is None or base == 0:
             base = position.position
         return abs(base)
 
+    @staticmethod
     def _trader_slot_flatten_size(slot: TraderSlotRecord, draft: TraderDraftRecord) -> Decimal:
         if slot.size is not None and slot.size > 0:
             return slot.size
         return draft.unit_quota
 
+    @staticmethod
     def _build_trader_manual_flatten_cl_ord_id(slot: TraderSlotRecord) -> str:
         session_token = "".join(ch for ch in slot.session_id.lower() if ch.isascii() and ch.isalnum())[:4] or "sess"
         strategy_token = "".join(ch for ch in slot.strategy_name.lower() if ch.isascii() and ch.isalnum())[:4] or "trdr"
         suffix = datetime.now().strftime("%m%d%H%M%S%f")[-15:]
         return f"{session_token}{strategy_token}exi{suffix}"[:32]
 
+    @staticmethod
     def _normalize_trader_manual_flatten_mode(flatten_mode: str) -> str:
         normalized = str(flatten_mode or "").strip().lower()
         if normalized == "best_quote":
             return "best_quote"
         return "market"
 
+    @staticmethod
     def _trader_manual_flatten_mode_label(flatten_mode: str) -> str:
         if QuantApp._normalize_trader_manual_flatten_mode(flatten_mode) == "best_quote":
             return "挂买一/卖一平仓"
@@ -2351,6 +2367,7 @@ class UiStrategySessionsMixin:
             raise ValueError(f"{instrument.inst_id} 当前缺少卖一价，无法按卖一挂平多单。")
         return snap_to_increment(raw_price, instrument.tick_size, "up")
 
+    @staticmethod
     def _clear_trader_manual_flatten_pending(slot: TraderSlotRecord) -> None:
         slot.pending_manual_exit_mode = ""
         slot.pending_manual_exit_inst_id = ""
@@ -3133,9 +3150,11 @@ class UiStrategySessionsMixin:
                 "请人工检查：\n- 当前委托是否仍有残留\n- 是否已经成交并留下仓位\n- OKX 托管止损是否仍在",
             )
 
+    @staticmethod
     def _session_can_be_cleared(session: StrategySession) -> bool:
         return session.status == "已停止" and not session.engine.is_running
 
+    @staticmethod
     def _next_session_selection_after_clear(
         selected_before: str | None,
         remaining_session_ids: tuple[str, ...] | list[str],
@@ -3144,6 +3163,7 @@ class UiStrategySessionsMixin:
             return selected_before
         return remaining_session_ids[0] if remaining_session_ids else None
 
+    @staticmethod
     def _next_history_selection_after_mutation(
         selected_before: str | None,
         remaining_record_ids: tuple[str, ...] | list[str],
@@ -3992,6 +4012,7 @@ class UiStrategySessionsMixin:
             snapshot.environment_note = f"本轮归因自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"
             return snapshot
 
+    @staticmethod
     def _is_funding_fee_bill(item: OkxAccountBillItem) -> bool:
         if (item.bill_sub_type or "").strip() in FUNDING_FEE_BILL_SUBTYPES:
             return True
@@ -4426,6 +4447,7 @@ class UiStrategySessionsMixin:
     def _on_session_selected(self, *_: object) -> None:
         self._refresh_selected_session_details()
 
+    @staticmethod
     def _session_tree_double_click_hint(column_id: str) -> str:
         return {
             "#1": "双击打开这条会话的独立日志",
@@ -4569,6 +4591,7 @@ class UiStrategySessionsMixin:
         )
         self._selected_session_detail_session_id = session.session_id
 
+    @staticmethod
     def _snapshot_optional_text(snapshot: dict[str, object], key: str) -> str | None:
         value = snapshot.get(key)
         if value is None:
@@ -4576,10 +4599,12 @@ class UiStrategySessionsMixin:
         text = str(value).strip()
         return text or None
 
+    @staticmethod
     def _snapshot_text(snapshot: dict[str, object], key: str, default: str = "-") -> str:
         value = QuantApp._snapshot_optional_text(snapshot, key)
         return value if value is not None else default
 
+    @staticmethod
     def _snapshot_int(snapshot: dict[str, object], key: str, default: int = 0) -> int:
         value = snapshot.get(key, default)
         try:
@@ -4587,6 +4612,7 @@ class UiStrategySessionsMixin:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
     def _bool_label(value: object) -> str:
         if isinstance(value, str):
             normalized = value.strip().lower()
@@ -4771,6 +4797,7 @@ class UiStrategySessionsMixin:
             updated_at=_parse_datetime_snapshot(payload.get("updated_at")),
         )
 
+    @staticmethod
     def _recoverable_strategy_record_payload(record: RecoverableStrategySessionRecord) -> dict[str, object]:
         return {
             "session_id": record.session_id,
@@ -4850,6 +4877,7 @@ class UiStrategySessionsMixin:
             last_close_reason=str(payload.get("last_close_reason", "")).strip(),
         )
 
+    @staticmethod
     def _history_record_payload(record: StrategyHistoryRecord) -> dict[str, object]:
         return {
             "record_id": record.record_id,
@@ -4928,6 +4956,7 @@ class UiStrategySessionsMixin:
             updated_at=_parse_datetime_snapshot(payload.get("updated_at")),
         )
 
+    @staticmethod
     def _trade_ledger_payload(record: StrategyTradeLedgerRecord) -> dict[str, object]:
         return {
             "record_id": record.record_id,
@@ -5835,6 +5864,7 @@ class UiStrategySessionsMixin:
         if session_id:
             self._focus_session_row(session_id)
 
+    @staticmethod
     def _strategy_book_tree_double_click_hint(column_id: str) -> str:
         return {
             "#2": "双击打开并定位对应交易员",
@@ -5959,6 +5989,7 @@ class UiStrategySessionsMixin:
             return "break"
         return None
 
+    @staticmethod
     def _session_blocks_history_deletion(session: StrategySession) -> bool:
         return session.engine.is_running or session.status in {"运行中", "停止中", "待恢复", "恢复中"}
 
@@ -6102,6 +6133,7 @@ class UiStrategySessionsMixin:
         self._strategy_history_selected_record_id = record.record_id if record is not None else None
         self._refresh_selected_strategy_history_details()
 
+    @staticmethod
     def _strategy_history_tree_double_click_hint(column_id: str) -> str:
         return {
             "#1": "双击打开这条历史策略的独立日志",
