@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
@@ -279,6 +280,31 @@ def run_backtest(
         end_ts=end_ts,
         preload_count=preload_count,
     )
+    cross_higher_tf_bias: list[str] | None = None
+    if (
+        config.strategy_id == STRATEGY_CROSS_ID
+        and int(config.cross_higher_tf_ref_ema_period) > 0
+        and (config.cross_higher_tf_inst_id or "").strip()
+        and (config.cross_higher_tf_bar or "").strip()
+    ):
+        inst_h = (config.cross_higher_tf_inst_id or config.inst_id).strip()
+        bar_h = (config.cross_higher_tf_bar or "").strip()
+        hi_limit = min(MAX_BACKTEST_CANDLES, max(800, len(candles) // 4 + 400))
+        hi_preload = max(0, int(config.cross_higher_tf_ref_ema_period) + 5)
+        higher = _load_backtest_candles(
+            client,
+            inst_h,
+            bar_h,
+            hi_limit,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            preload_count=hi_preload,
+        )
+        cross_higher_tf_bias = _build_cross_higher_tf_bias(
+            candles,
+            higher,
+            int(config.cross_higher_tf_ref_ema_period),
+        )
     return _run_backtest_with_loaded_data(
         candles,
         instrument,
@@ -286,6 +312,7 @@ def run_backtest(
         data_source_note=_build_backtest_data_source_note(client),
         maker_fee_rate=maker_fee_rate,
         taker_fee_rate=taker_fee_rate,
+        cross_higher_tf_bias=cross_higher_tf_bias,
     )
 
 
@@ -528,6 +555,7 @@ def _run_backtest_with_loaded_data(
     data_source_note: str = "",
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
+    cross_higher_tf_bias: list[str] | None = None,
 ) -> BacktestResult:
     terminal_open_position: BacktestOpenPosition | None = None
     manual_positions: list[BacktestManualPosition] = []
@@ -548,6 +576,7 @@ def _run_backtest_with_loaded_data(
             instrument,
             config,
             taker_fee_rate=taker_fee_rate,
+            higher_tf_bias=cross_higher_tf_bias,
         )
     elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         trades = _run_ema5_ema8_backtest(
@@ -923,6 +952,34 @@ def _load_backtest_candles(
     return candles if used_range_fetcher else candles[-candle_limit:]
 
 
+def _build_cross_higher_tf_bias(
+    primary: list[Candle],
+    higher: list[Candle],
+    ref_period: int,
+) -> list[str]:
+    """与 primary 等长：'long' / 'short' / 'both'（大周期 EMA 未就绪时不限制方向）。"""
+    if not primary or not higher or ref_period <= 0:
+        return ["both"] * len(primary)
+    minimum = ref_period + 2
+    closes_h = [candle.close for candle in higher]
+    ema_h = ema(closes_h, ref_period)
+    h_ts = [candle.ts for candle in higher]
+    out: list[str] = []
+    for pc in primary:
+        j = bisect.bisect_right(h_ts, pc.ts) - 1
+        if j < 0 or j < minimum:
+            out.append("both")
+            continue
+        ref = ema_h[j]
+        if higher[j].close > ref:
+            out.append("long")
+        elif higher[j].close < ref:
+            out.append("short")
+        else:
+            out.append("both")
+    return out
+
+
 def _required_backtest_preload_candles(config: StrategyConfig) -> int:
     if config.strategy_id == STRATEGY_CROSS_ID:
         minimum = max(
@@ -1080,6 +1137,7 @@ def _run_cross_backtest(
     config: StrategyConfig,
     *,
     taker_fee_rate: Decimal = Decimal("0"),
+    higher_tf_bias: list[str] | None = None,
 ) -> list[BacktestTrade]:
     if config.signal_mode == "both":
         raise RuntimeError("EMA 穿越回测不支持 signal_mode=双向，请使用只做多或只做空分别回测。")
@@ -1153,6 +1211,12 @@ def _run_cross_backtest(
             continue
         if decision.signal != wanted_signal:
             continue
+        if higher_tf_bias is not None and index < len(higher_tf_bias):
+            bias = higher_tf_bias[index]
+            if decision.signal == "long" and bias == "short":
+                continue
+            if decision.signal == "short" and bias == "long":
+                continue
         if current_wave_signal != decision.signal:
             current_wave_signal = decision.signal
             entries_in_current_wave = 0

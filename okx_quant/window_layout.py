@@ -64,6 +64,29 @@ def apply_adaptive_window_geometry(
     return width, height
 
 
+def toggle_toplevel_maximize(window: BaseWidget) -> bool:
+    """在系统标题栏无最大化（如 transient 子窗）时，用程序切换铺满屏幕。
+
+    优先使用 Windows ``state('zoomed')``；否则尝试 ``attributes('-zoomed')``。
+    返回是否使用了已知可用的 API（失败时返回 False，由调用方决定是否几何铺满兜底）。"""
+    try:
+        st = str(window.state() or "")
+        if st == "zoomed":
+            window.state("normal")
+            return True
+        window.state("zoomed")
+        return True
+    except Exception:
+        pass
+    try:
+        cur = bool(window.attributes("-zoomed"))
+        window.attributes("-zoomed", not cur)
+        return True
+    except Exception:
+        pass
+    return False
+
+
 def apply_fill_window_geometry(
     window: BaseWidget,
     *,

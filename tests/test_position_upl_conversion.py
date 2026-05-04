@@ -635,10 +635,10 @@ class PositionUplConversionTest(TestCase):
                 "theta_usdt": Decimal("-27.2"),
             },
         )
-        self.assertEqual(values[16], "-0.06947")
-        self.assertEqual(values[18], "+0.73992")
-        self.assertEqual(values[24], "1.23456")
-        self.assertEqual(values[28], "-27.20")
+        self.assertEqual(values[17], "-0.06947")
+        self.assertEqual(values[19], "+0.73992")
+        self.assertEqual(values[26], "1.23456")
+        self.assertEqual(values[30], "-27.20")
 
     def test_group_row_values_use_two_decimals_for_usdt_pnl(self) -> None:
         values = _build_group_row_values(
@@ -660,11 +660,11 @@ class PositionUplConversionTest(TestCase):
                 "theta_usdt": Decimal("123.456"),
             },
         )
-        self.assertEqual(values[14], "1 个持仓 | 250000 DOGE")
-        self.assertEqual(values[16], "-2733.75")
-        self.assertEqual(values[18], "-31.36")
-        self.assertEqual(values[24], "250000.00000")
-        self.assertEqual(values[28], "+123.46")
+        self.assertEqual(values[15], "1 个持仓 | 250000 DOGE")
+        self.assertEqual(values[17], "-2733.75")
+        self.assertEqual(values[19], "-31.36")
+        self.assertEqual(values[26], "250000.00000")
+        self.assertEqual(values[30], "+123.46")
 
     def test_format_group_position_size_accumulates_coin_quantity(self) -> None:
         positions = [

@@ -1,6 +1,6 @@
 # OKX 策略工作台
 
-当前版本：`v0.5.08`
+当前版本：`v0.5.09`
 
 这是一个面向 OKX 的桌面交易工作台，围绕“监控、交易、保护、回测、分析”构建。当前项目已经包含：
 
@@ -560,7 +560,15 @@ ATR 批量矩阵规则：
 - `.okx_quant_candle_cache/`
 
 ## 11. 更新日志
-当前版本：v0.5.08
+当前版本：v0.5.09
+
+### v0.5.09
+
+- 策略实盘图 / 划线交易台：`strategy_live_chart` 纵轴支持 `full` / `desk` 两种范围策略；desk 下弱化离群均线、纳入锚点价，轮询间隔单独为 `LINE_TRADING_DESK_POLL_MS`；小画布与价格映射边距保护更稳。
+- 划线交易台：标注持久化（`load/save_line_trading_desk_annotations_entries`）；运行日志支持划线台专用落盘与面板展示（`append_line_desk_log_line`、`read_daily_log_tail` 等）；历史委托刷新走 `_line_trading_desk_dual_log`。
+- 持仓视图：缩放表可选列增加 `open_value_usdt`（开仓价值 USDT）。
+- 回测：穿越策略可选「更高周期参考 EMA」偏置序列（`cross_higher_tf_*` 配置与加载逻辑）。
+- 其它：`persistence` / `models` 小扩展，`window_layout`、`trader_desk_ui` 等细节与相关单测调整。
 
 ### v0.5.08
 

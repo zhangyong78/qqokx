@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -298,9 +300,27 @@ class _BacktestSnapshotStore:
             "records": [_serialize_backtest_snapshot(self._snapshots[snapshot_id]) for snapshot_id in self._order],
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
-        temp_path = path.with_suffix(path.suffix + ".tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp_path.replace(path)
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        # 固定名 .tmp 多实例会互踩；replace 在 Windows 上遇杀软/占用易 PermissionError，故用随机临时名 + 短重试。
+        temp_path = path.with_name(f"{path.stem}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(body, encoding="utf-8")
+            last_err: PermissionError | None = None
+            for attempt in range(8):
+                try:
+                    temp_path.replace(path)
+                    return
+                except PermissionError as exc:
+                    last_err = exc
+                    time.sleep(0.05 * (attempt + 1))
+            if last_err is not None:
+                raise last_err
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
     @staticmethod
     def _extract_sequence(snapshot_id: str) -> int:

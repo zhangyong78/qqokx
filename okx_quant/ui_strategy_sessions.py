@@ -796,8 +796,7 @@ class UiStrategySessionsMixin:
         st = self._line_trading_desk_window
         if st is not None and st is desk_ref and _widget_exists(st.window):
             st.status_text.set(text)
-        pr = self._line_trading_desk_log_prefix(desk_ref)
-        self._enqueue_log(f"{pr} 开仓后续 | {text}")
+        self._line_trading_desk_dual_log(desk_ref, f"开仓后续 | {text}")
 
     def _mark_line_desk_trade_started(
         self,
@@ -815,6 +814,7 @@ class UiStrategySessionsMixin:
         ord_id: str,
         cl_ord_id: str,
         api_profile: str,
+        tp_r_multiple: Decimal | None = None,
     ) -> None:
         st = self._line_trading_desk_window
         if st is not None and st is desk_ref and _widget_exists(st.window):
@@ -822,14 +822,21 @@ class UiStrategySessionsMixin:
                 f"已成交，启动动态管理 | entry={format_decimal(entry_price)} stop={format_decimal(stop_price)}"
             )
         pr = self._line_trading_desk_log_prefix(desk_ref)
-        self._enqueue_log(
-            f"{pr} 成交监控 | [{session_log_tag}] ordId={ord_id or '-'} | side={side} | "
-            f"entry={format_decimal(entry_price)} | stop={format_decimal(stop_price)}"
+
+        def _desk_local_exit_log(message: str) -> None:
+            self._enqueue_log(f"{pr} 划线交易台监控 | [{session_log_tag}] {message}")
+            self._line_trading_desk_local_log(desk_ref, f"监控 | [{session_log_tag}] {message}")
+
+        self._line_trading_desk_dual_log(
+            desk_ref,
+            f"成交监控 | [{session_log_tag}] ordId={ord_id or '-'} | side={side} | "
+            f"entry={format_decimal(entry_price)} | stop={format_decimal(stop_price)}",
         )
         direction = "long" if side == "buy" else "short"
         risk_per_unit = abs(entry_price - stop_price)
+        r_mult = tp_r_multiple if tp_r_multiple is not None and tp_r_multiple > 0 else Decimal("4")
         take_profit = (
-            entry_price + (risk_per_unit * Decimal("4")) if direction == "long" else entry_price - (risk_per_unit * Decimal("4"))
+            entry_price + (risk_per_unit * r_mult) if direction == "long" else entry_price - (risk_per_unit * r_mult)
         )
         protection = ProtectionPlan(
             trigger_inst_id=instrument.inst_id,
@@ -843,9 +850,7 @@ class UiStrategySessionsMixin:
         )
         engine = StrategyEngine(
             self.client,
-            lambda message: self.root.after(
-                0, lambda text=message: self._enqueue_log(f"[{session_log_tag}] 划线交易台监控 | {text}")
-            ),
+            lambda message: self.root.after(0, lambda m=message: _desk_local_exit_log(m)),
             notifier=self._build_notifier(config),
             strategy_name=f"{session_log_tag} 划线交易台",
             session_id=session_log_tag,
@@ -885,6 +890,7 @@ class UiStrategySessionsMixin:
         stop_price: Decimal,
         session_log_tag: str,
         api_profile: str,
+        tp_r_multiple: Decimal | None = None,
     ) -> None:
         try:
             q_ord = ord_id.strip() if ord_id else ""
@@ -915,7 +921,8 @@ class UiStrategySessionsMixin:
                             cfg=config,
                             oid=q_ord,
                             cid=q_cl,
-                            ap=api_profile: self._mark_line_desk_trade_started(
+                            ap=api_profile,
+                            tpr=tp_r_multiple: self._mark_line_desk_trade_started(
                                 dr,
                                 session_log_tag=slt,
                                 instrument=ins,
@@ -929,6 +936,7 @@ class UiStrategySessionsMixin:
                                 ord_id=oid,
                                 cl_ord_id=cid,
                                 api_profile=ap,
+                                tp_r_multiple=tpr,
                             ),
                         )
                         return

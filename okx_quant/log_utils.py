@@ -72,6 +72,33 @@ def daily_log_file_path(
     return logs_dir(base_dir=base_dir) / f"{target_time.strftime('%Y-%m-%d')}.log"
 
 
+_LINE_DESK_LOG_SUBDIR = "line_desk"
+
+
+def line_desk_daily_log_path(
+    *, for_time: datetime | None = None, base_dir: str | Path | None = None
+) -> Path:
+    target_time = for_time or datetime.now()
+    return logs_dir(base_dir=base_dir) / _LINE_DESK_LOG_SUBDIR / f"{target_time.strftime('%Y-%m-%d')}.log"
+
+
+def append_line_desk_log_line(
+    line: str,
+    *,
+    now: datetime | None = None,
+    base_dir: str | Path | None = None,
+) -> str:
+    """Append one preformatted line (usually already timestamped) to the line-trading desk daily log."""
+    text = (line or "").strip()
+    if not text:
+        return text
+    path = line_desk_daily_log_path(for_time=now or datetime.now(), base_dir=base_dir)
+    with _LOG_FILE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _append_line_to_file(path, text)
+    return text
+
+
 def _append_line_to_file(path: Path, line: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as handle:
@@ -111,3 +138,36 @@ def append_log_line(
     with _LOG_FILE_LOCK:
         _append_line_to_file(path, line)
     return line
+
+
+_RUN_LOG_TAIL_MAX_READ_BYTES = 1_500_000
+
+
+def read_daily_log_tail(
+    max_lines: int = 500,
+    *,
+    for_time: datetime | None = None,
+    base_dir: str | Path | None = None,
+) -> list[str]:
+    """Return the last ``max_lines`` non-empty lines from today's daily log file (for UI bootstrap)."""
+    path = daily_log_file_path(for_time=for_time, base_dir=base_dir)
+    if not path.exists() or not path.is_file():
+        return []
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+            if size <= _RUN_LOG_TAIL_MAX_READ_BYTES:
+                text = handle.read()
+            else:
+                handle.seek(max(0, size - _RUN_LOG_TAIL_MAX_READ_BYTES))
+                handle.readline()
+                text = handle.read()
+    except OSError:
+        return []
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        return lines[-max_lines:]
+    return lines

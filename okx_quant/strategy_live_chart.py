@@ -11,6 +11,8 @@ from okx_quant.pricing import format_decimal, format_decimal_by_increment
 
 DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT = 240
 DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS = 5000
+# 划线交易台轮询略慢于策略图，减轻 OKX 与主线程压力。
+LINE_TRADING_DESK_POLL_MS = 7500
 # 首屏先拉较少 K 线更快出图，后台再补足到 TARGET。
 LINE_TRADING_DESK_CANDLE_INITIAL = 280
 LINE_TRADING_DESK_CANDLE_TARGET = 500
@@ -229,29 +231,102 @@ def _format_snapshot_axis_price(snapshot: StrategyLiveChartSnapshot, price: Deci
     return format_decimal_by_increment(price, snapshot.price_display_tick)
 
 
-def strategy_live_chart_price_bounds(snapshot: StrategyLiveChartSnapshot) -> tuple[Decimal, Decimal]:
-    price_values: list[Decimal] = []
+def strategy_live_chart_price_bounds(
+    snapshot: StrategyLiveChartSnapshot,
+    *,
+    bounds_policy: str = "full",
+    desk_anchor_prices: tuple[Decimal, ...] | None = None,
+) -> tuple[Decimal, Decimal]:
+    """纵轴价格范围。full：K+均线+全部标记；desk：以 K 线 OHLC 为核心，均线离群点剔除，标记仅靠近核心区域时纳入。
+    desk_anchor_prices：划线交易台用户画线/盈亏比锚点价，强制纳入 desk 纵轴，避免价在布局外被钳到图顶与 K 线脱节。"""
+    ohlc: list[Decimal] = []
     for candle in snapshot.candles:
-        price_values.append(candle.high)
-        price_values.append(candle.low)
+        ohlc.append(candle.high)
+        ohlc.append(candle.low)
+    if not ohlc:
+        return Decimal("0"), Decimal("1")
+    core_low = min(ohlc)
+    core_high = max(ohlc)
+    span0 = core_high - core_low
+    if span0 <= 0:
+        span0 = abs(core_low) * Decimal("0.0001") if core_low != 0 else Decimal("1")
+
+    price_values: list[Decimal] = list(ohlc)
     for series in snapshot.series:
-        price_values.extend(series.values)
-    for marker in snapshot.markers:
-        price_values.append(marker.price)
+        for raw in series.values:
+            if not isinstance(raw, Decimal):
+                continue
+            if bounds_policy == "desk":
+                lo_b = core_low - span0 * Decimal("2")
+                hi_b = core_high + span0 * Decimal("2")
+                if raw < lo_b or raw > hi_b:
+                    continue
+            price_values.append(raw)
+
     if not price_values:
         return Decimal("0"), Decimal("1")
-    lower = min(price_values)
-    upper = max(price_values)
+    core_low = min(price_values)
+    core_high = max(price_values)
+    if core_low == core_high:
+        padding = abs(core_low) * Decimal("0.02") if core_low != 0 else Decimal("1")
+        c_lo, c_hi = core_low - padding, core_high + padding
+    else:
+        pad = (core_high - core_low) * Decimal("0.08")
+        c_lo, c_hi = core_low - pad, core_high + pad
+    if bounds_policy != "desk":
+        merged = list(price_values)
+        for marker in snapshot.markers:
+            merged.append(marker.price)
+        lower = min(merged)
+        upper = max(merged)
+        if lower == upper:
+            padding = abs(lower) * Decimal("0.02") if lower != 0 else Decimal("1")
+            return lower - padding, upper + padding
+        padding = (upper - lower) * Decimal("0.08")
+        lo, hi = lower - padding, upper + padding
+        return (lo, hi) if lo <= hi else (hi, lo)
+    span = c_hi - c_lo
+    if span <= 0:
+        span = abs(c_lo) * Decimal("0.001") if c_lo != 0 else Decimal("1")
+    slack = span * Decimal("0.42")
+    extras: list[Decimal] = []
+    for marker in snapshot.markers:
+        if c_lo - slack <= marker.price <= c_hi + slack:
+            extras.append(marker.price)
+    merged = [c_lo, c_hi] + extras
+    for p in desk_anchor_prices or ():
+        merged.append(p)
+    lower = min(merged)
+    upper = max(merged)
     if lower == upper:
         padding = abs(lower) * Decimal("0.02") if lower != 0 else Decimal("1")
-        return lower - padding, upper + padding
-    padding = (upper - lower) * Decimal("0.08")
-    return lower - padding, upper + padding
+        lo, hi = lower - padding, upper + padding
+        return (lo, hi) if lo <= hi else (hi, lo)
+    padding = (upper - lower) * Decimal("0.04")
+    lo, hi = lower - padding, upper + padding
+    return (lo, hi) if lo <= hi else (hi, lo)
 
 
-def render_strategy_live_chart(canvas: Canvas, snapshot: StrategyLiveChartSnapshot) -> None:
+def render_strategy_live_chart(
+    canvas: Canvas,
+    snapshot: StrategyLiveChartSnapshot,
+    *,
+    bounds_policy: str = "full",
+    desk_anchor_prices: tuple[Decimal, ...] | None = None,
+) -> bool:
     width = max(int(canvas.winfo_width()), int(float(canvas.cget("width") or 0)), 640)
     height = max(int(canvas.winfo_height()), int(float(canvas.cget("height") or 0)), 420)
+    left = float(_CHART_INSET_LEFT)
+    top = float(_CHART_INSET_TOP)
+    right = float(width - _CHART_INSET_RIGHT_PAD)
+    bottom = float(height - _CHART_INSET_BOTTOM)
+    inner_w = right - left
+    inner_h = bottom - top
+
+    if snapshot.candles and (width < 200 or height < 200 or inner_w <= 24 or inner_h <= 24):
+        # 窗口尚未完成布局时跳过：避免清空画布后纵轴/网格在错误尺寸下计算，出现错乱与「过一会才好」。
+        return False
+
     canvas.delete("all")
     canvas.configure(background="#ffffff")
 
@@ -271,18 +346,13 @@ def render_strategy_live_chart(canvas: Canvas, snapshot: StrategyLiveChartSnapsh
                 fill=_MUTED_TEXT_COLOR,
                 font=("Microsoft YaHei UI", 10),
             )
-        return
+        return True
 
-    bounds = _ChartBounds(
-        left=float(_CHART_INSET_LEFT),
-        top=float(_CHART_INSET_TOP),
-        right=float(width - _CHART_INSET_RIGHT_PAD),
-        bottom=float(height - _CHART_INSET_BOTTOM),
+    bounds = _ChartBounds(left=left, top=top, right=right, bottom=bottom)
+
+    lower, upper = strategy_live_chart_price_bounds(
+        snapshot, bounds_policy=bounds_policy, desk_anchor_prices=desk_anchor_prices
     )
-    if bounds.width <= 24 or bounds.height <= 24:
-        return
-
-    lower, upper = strategy_live_chart_price_bounds(snapshot)
     candle_step = bounds.width / max(len(snapshot.candles), 1)
     candle_body_half_width = max(min(candle_step * 0.28, 12.0), 2.5)
 
@@ -400,6 +470,8 @@ def render_strategy_live_chart(canvas: Canvas, snapshot: StrategyLiveChartSnapsh
 
     for marker in snapshot.markers:
         y = _price_to_y(marker.price, lower, upper, bounds)
+        if bounds_policy == "desk":
+            y = min(max(y, bounds.top + 1.0), bounds.bottom - 1.0)
         line_kwargs = {
             "fill": marker.color,
             "width": marker.width,
@@ -408,6 +480,8 @@ def render_strategy_live_chart(canvas: Canvas, snapshot: StrategyLiveChartSnapsh
             line_kwargs["dash"] = marker.dash
         canvas.create_line(bounds.left, y, bounds.right, y, **line_kwargs)
         label_text = f"{marker.label} {_format_snapshot_axis_price(snapshot, marker.price)}"
+        if bounds_policy == "desk" and (marker.price < lower or marker.price > upper):
+            label_text = f"{label_text}·界外"
         text_width = max(len(label_text) * 7 + 14, 82)
         x1 = bounds.right + 10
         x2 = min(width - 8, x1 + text_width)
@@ -437,6 +511,7 @@ def render_strategy_live_chart(canvas: Canvas, snapshot: StrategyLiveChartSnapsh
         anchor="w",
         font=("Microsoft YaHei UI", 9),
     )
+    return True
 
 
 def _append_marker(
@@ -539,7 +614,11 @@ def measure_strategy_live_chart_canvas(canvas: Canvas) -> tuple[int, int]:
 
 
 def compute_strategy_live_chart_layout(
-    canvas: Canvas, snapshot: StrategyLiveChartSnapshot
+    canvas: Canvas,
+    snapshot: StrategyLiveChartSnapshot,
+    *,
+    bounds_policy: str = "full",
+    desk_anchor_prices: tuple[Decimal, ...] | None = None,
 ) -> StrategyLiveChartLayout | None:
     if not snapshot.candles:
         return None
@@ -550,7 +629,9 @@ def compute_strategy_live_chart_layout(
     bottom = float(height - _CHART_INSET_BOTTOM)
     if right - left <= 24 or bottom - top <= 24:
         return None
-    lower, upper = strategy_live_chart_price_bounds(snapshot)
+    lower, upper = strategy_live_chart_price_bounds(
+        snapshot, bounds_policy=bounds_policy, desk_anchor_prices=desk_anchor_prices
+    )
     n = len(snapshot.candles)
     candle_step = (right - left) / max(n, 1)
     return StrategyLiveChartLayout(
@@ -734,6 +815,15 @@ def layout_price_to_y(layout: StrategyLiveChartLayout, price: Decimal) -> float:
     ratio = float((layout.upper - price) / (layout.upper - layout.lower))
     ratio = min(max(ratio, 0.0), 1.0)
     return layout.top + (layout.bottom - layout.top) * ratio
+
+
+def layout_price_to_y_clamped(layout: StrategyLiveChartLayout, price: Decimal) -> float:
+    y = layout_price_to_y(layout, price)
+    t = float(layout.top) + 0.5
+    b = float(layout.bottom) - 0.5
+    if b <= t:
+        return float(layout.top + layout.bottom) / 2.0
+    return float(min(max(y, t), b))
 
 
 def layout_y_to_price(layout: StrategyLiveChartLayout, y: float) -> Decimal:

@@ -28,6 +28,7 @@ TRADER_DESK_FILE_NAME = "trader_desk.json"
 POSITION_NOTES_FILE_NAME = "position_notes.json"
 STRATEGY_PARAMETER_GLOBAL_DEFAULTS_FILE_NAME = "strategy_parameter_global_defaults.json"
 STRATEGY_PARAMETER_DRAFTS_FILE_NAME = "strategy_parameter_drafts.json"
+LINE_TRADING_DESK_ANNOTATIONS_FILE_NAME = "line_trading_desk_annotations.json"
 HISTORY_CACHE_DIR_NAME = "history"
 HISTORY_ORDER_FILE_NAME = "order_history.json"
 HISTORY_FILLS_FILE_NAME = "fills_history.json"
@@ -135,6 +136,50 @@ def strategy_parameter_drafts_file_path(base_dir: Path | None = None) -> Path:
     if base_dir is not None:
         return Path(base_dir) / STRATEGY_PARAMETER_DRAFTS_FILE_NAME
     return state_dir_path() / STRATEGY_PARAMETER_DRAFTS_FILE_NAME
+
+
+def line_trading_desk_annotations_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / LINE_TRADING_DESK_ANNOTATIONS_FILE_NAME
+    return state_dir_path() / LINE_TRADING_DESK_ANNOTATIONS_FILE_NAME
+
+
+def load_line_trading_desk_annotations_entries(path: Path | None = None) -> dict[str, dict[str, object]]:
+    """返回 { \"api|INST|bar\": {\"lines\": [...], \"rr\": [...]} }。条目为浅拷贝 dict，调用方可就地修改。"""
+    target = path or line_trading_desk_annotations_file_path()
+    if not target.exists():
+        return {}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    raw = payload.get("entries")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, object]] = {}
+    for k, v in raw.items():
+        key = str(k).strip()
+        if not key or not isinstance(v, dict):
+            continue
+        out[key] = dict(v)
+    return out
+
+
+def save_line_trading_desk_annotations_entries(entries: dict[str, dict[str, object]], path: Path | None = None) -> Path:
+    """整文件写入；entries 为 api|标的|周期 → {lines, rr}。"""
+    target = path or line_trading_desk_annotations_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "entries": dict(entries),
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
 
 
 def _normalize_history_profile_name(profile_name: object) -> str:

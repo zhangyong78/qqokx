@@ -98,6 +98,10 @@ class StrategyConfig:
     backtest_profile_id: str = ""
     backtest_profile_name: str = ""
     backtest_profile_summary: str = ""
+    # EMA 穿越：可选大周期过滤（例如 4H 收盘 vs 参考 EMA 决定只做多或只做空方向的 1H 穿越）
+    cross_higher_tf_inst_id: str | None = None
+    cross_higher_tf_bar: str | None = None
+    cross_higher_tf_ref_ema_period: int = 0
 
     def resolved_entry_reference_ema_period(self) -> int:
         if self.entry_reference_ema_period > 0:

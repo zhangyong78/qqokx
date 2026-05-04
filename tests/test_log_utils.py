@@ -6,10 +6,13 @@ from datetime import datetime
 from pathlib import Path
 
 from okx_quant.log_utils import (
+    append_line_desk_log_line,
     append_log_line,
     append_preformatted_log_line,
     daily_log_file_path,
     ensure_log_timestamp,
+    line_desk_daily_log_path,
+    read_daily_log_tail,
     strategy_session_log_file_path,
 )
 
@@ -62,6 +65,29 @@ class LogUtilsTest(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertTrue(line.startswith("[04-09 10:35:12] "))
             self.assertEqual(path.read_text(encoding="utf-8").splitlines(), [line])
+
+    def test_line_desk_daily_log_path(self) -> None:
+        target = datetime(2026, 5, 3, 21, 0, 0)
+        path = line_desk_daily_log_path(for_time=target, base_dir="D:/qqokx")
+        self.assertEqual(path, Path("D:/qqokx/logs/line_desk/2026-05-03.log"))
+
+    def test_append_line_desk_log_line_writes_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2026, 5, 3, 21, 0, 20)
+            line = "[05-03 21:00:20] BTC-USDT-SWAP | 射线触发 | test"
+            append_line_desk_log_line(line, now=now, base_dir=temp_dir)
+            path = Path(temp_dir) / "logs" / "line_desk" / "2026-05-03.log"
+            self.assertTrue(path.exists())
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), line)
+
+    def test_read_daily_log_tail_returns_last_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2026, 4, 9, 10, 35, 12)
+            for i in range(5):
+                append_log_line(f"line-{i}", now=now, base_dir=temp_dir)
+            tail = read_daily_log_tail(3, for_time=now, base_dir=temp_dir)
+            self.assertEqual(len(tail), 3)
+            self.assertTrue(tail[-1].endswith("line-4"))
 
     def test_append_log_line_preserves_existing_timestamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

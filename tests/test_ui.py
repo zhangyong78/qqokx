@@ -169,19 +169,21 @@ class UiHelpersTest(TestCase):
             _normalized_environment_label=lambda label: QuantApp._normalized_environment_label(SimpleNamespace(), label),
             _line_trading_desk_refresh_order_history_tree=lambda st: calls.append("tree"),
             _line_trading_desk_log_prefix=lambda st: "[desk]",
+            _line_trading_desk_dual_log=lambda st, msg: calls.append(msg),
             _enqueue_log=lambda message: calls.append(message),
         )
         app._line_trading_desk_apply_order_history_only = lambda desk_ref, history, err: (
             QuantApp._line_trading_desk_apply_order_history_only(app, desk_ref, history, err)
         )
 
-        with patch("okx_quant.ui._widget_exists", return_value=True):
+        with patch("okx_quant.ui_shell._widget_exists", return_value=True):
             QuantApp._line_trading_desk_refresh_order_history_tab(app)
 
         self.assertEqual(len(state.latest_order_history), 2)
         self.assertEqual(state.status_text.get(), "已刷新历史委托 | BTC-USDT-SWAP | 2 条")
         self.assertIn("tree", calls)
-        self.assertIn("[desk] 已刷新历史委托 | BTC-USDT-SWAP | 2 条", calls)
+        # `_line_trading_desk_dual_log` receives the detail line; prefix is added inside that method via `_enqueue_log`.
+        self.assertIn("已刷新历史委托 | BTC-USDT-SWAP | 2 条", calls)
 
     def test_format_network_error_message_read_timeout(self) -> None:
         self.assertEqual(
@@ -3286,8 +3288,8 @@ class PositionRealizedUsdtColumnTest(TestCase):
             },
         )
 
-        self.assertEqual(values[18], "+0.00100")
-        self.assertEqual(values[19], "+100")
+        self.assertEqual(values[19], "+0.00100")
+        self.assertEqual(values[20], "+100")
 
     def test_insert_position_row_includes_realized_usdt_value(self) -> None:
         app = SimpleNamespace(
@@ -3325,8 +3327,8 @@ class PositionRealizedUsdtColumnTest(TestCase):
 
         QuantApp._insert_position_row(app, "", position, "P01")
 
-        self.assertEqual(app.position_tree.rows["P01"]["values"][18], "+0.00100")
-        self.assertEqual(app.position_tree.rows["P01"]["values"][19], "+100")
+        self.assertEqual(app.position_tree.rows["P01"]["values"][19], "+0.00100")
+        self.assertEqual(app.position_tree.rows["P01"]["values"][20], "+100")
         self.assertEqual(app.position_tree.rows["P01"]["values"][-1], "减仓观察")
 
 

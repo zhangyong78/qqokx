@@ -1498,6 +1498,7 @@ class UiPositionsMixin:
             "ask_usdt",
             "mark_usdt",
             "avg_usdt",
+            "open_value_usdt",
             "upl_usdt",
             "realized_usdt",
             "theta_usdt",
@@ -3634,6 +3635,9 @@ class UiPositionsMixin:
                 _format_position_mark_price_usdt(position, self._upl_usdt_prices),
                 _format_position_avg_price(position, self._position_instruments),
                 _format_position_avg_price_usdt(position, self._upl_usdt_prices),
+                _format_optional_approx_usdt(
+                    _position_signed_open_value_approx_usdt(position, self._position_instruments, self._upl_usdt_prices)
+                ),
                 _format_position_size(position, self._position_instruments),
                 _format_option_trade_side_display(position),
                 _format_position_unrealized_pnl(position),
@@ -3811,7 +3815,13 @@ class UiPositionsMixin:
             base = position.position
         return abs(base)
 
-    def _submit_selected_position_manual_flatten(self, position: OkxPosition, flatten_mode: str) -> tuple[OkxOrderResult, Decimal | None, str]:
+    def _submit_selected_position_manual_flatten(
+        self,
+        position: OkxPosition,
+        flatten_mode: str,
+        *,
+        close_size: Decimal | None = None,
+    ) -> tuple[OkxOrderResult, Decimal | None, str]:
         profile_name = (self._positions_context_profile_name or self._current_credential_profile()).strip()
         credentials = self._credentials_for_profile_or_none(profile_name)
         if credentials is None:
@@ -3819,11 +3829,24 @@ class UiPositionsMixin:
         normalized_flatten_mode = self._normalize_position_manual_flatten_mode(flatten_mode)
         config = self._build_selected_position_manual_flatten_config(position)
         instrument = self.client.get_instrument(position.inst_id)
-        closeable_size = snap_to_increment(
+        max_close = snap_to_increment(
             self._selected_position_close_size(position),
             instrument.lot_size,
             "down",
         )
+        if max_close < instrument.min_size:
+            raise ValueError("当前选中持仓的可平数量不足最小下单量，无法直接平仓。")
+        if close_size is not None:
+            if close_size <= 0:
+                raise ValueError("平仓数量必须大于 0。")
+            req = snap_to_increment(close_size, instrument.lot_size, "down")
+            if req <= 0:
+                raise ValueError("平仓数量按合约最小变动单位向下取整后为 0，请加大数量。")
+            if req > max_close:
+                raise ValueError(f"平仓数量不能超过可平数量 {max_close}。")
+            closeable_size = req
+        else:
+            closeable_size = max_close
         if closeable_size < instrument.min_size:
             raise ValueError("当前选中持仓的可平数量不足最小下单量，无法直接平仓。")
         direction = derive_position_direction(position)

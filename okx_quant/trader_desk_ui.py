@@ -960,8 +960,9 @@ class TraderDeskWindow:
         header = ttk.Frame(self.window, padding=(16, 14, 16, 8))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
+
         ttk.Label(header, text="交易员管理台", font=("Microsoft YaHei UI", 18, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Label(header, textvariable=self._status_text).grid(row=0, column=1, sticky="e")
+        ttk.Label(header, textvariable=self._status_text).grid(row=0, column=1, sticky="e", padx=(12, 8))
         ttk.Label(
             header,
             text="固定数量下单、额度格占用、亏损记录、均价追踪、手动平仓都统一在这里完成，避免日志对不上。",
