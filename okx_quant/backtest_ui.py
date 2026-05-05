@@ -28,6 +28,7 @@ from okx_quant.backtest import (
 from okx_quant.backtest_audit import describe_backtest_export_artifacts
 from okx_quant.backtest_export import export_batch_backtest_report, export_single_backtest_report
 from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_pool_profile_name
+from okx_quant.candle_cache_verify import CacheVerifyOutcome, verify_and_repair_cached_candles
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import backtest_history_file_path, load_strategy_parameter_drafts, save_strategy_parameter_drafts
@@ -1297,7 +1298,7 @@ class BacktestWindow:
         self._strategy_parameter_scope = "backtest"
         self._last_strategy_parameter_strategy_id: str | None = None
         self.history_sync_status = StringVar(
-            value="填 0 = 全量；填 10000 = 最新往前 10000 根。可先点“同步历史数据”下载 5 个币种的 5m / 15m / 1H / 4H 全量缓存。"
+            value="填 0 = 全量；填 10000 = 最新往前 10000 根。可先点“同步历史数据”下载 5 个币种的 5m / 15m / 1H / 4H 全量缓存；点“校验数据”检查连续性并尝试补洞。"
         )
         self.report_summary = StringVar(value="点击“开始回测”后，会在这里显示报告摘要。")
         self.manual_summary = StringVar(value="当前策略没有额外扩展统计。")
@@ -1332,6 +1333,7 @@ class BacktestWindow:
         self._current_snapshot_id: str | None = None
         self._backtest_running = False
         self._history_sync_running = False
+        self._history_verify_running = False
         self._batch_sequence = 0
         self._batch_snapshot_groups: dict[str, list[str]] = {}
         self._snapshot_batch_labels: dict[str, str] = {}
@@ -1844,8 +1846,12 @@ class BacktestWindow:
             controls,
             text="填 0 = 全量；填 10000 = 最新往前 10000 根；正数上限 10000。",
         ).grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
-        self.sync_history_button = ttk.Button(controls, text="同步历史数据", command=self.sync_history_data)
-        self.sync_history_button.grid(row=row, column=4, sticky="e", pady=(12, 0), padx=(0, 8))
+        history_btn_frame = ttk.Frame(controls)
+        history_btn_frame.grid(row=row, column=4, sticky="e", pady=(12, 0), padx=(0, 4))
+        self.sync_history_button = ttk.Button(history_btn_frame, text="同步历史数据", command=self.sync_history_data)
+        self.verify_cache_button = ttk.Button(history_btn_frame, text="校验数据", command=self.verify_history_cache_data)
+        self.sync_history_button.pack(side=LEFT, padx=(0, 6))
+        self.verify_cache_button.pack(side=LEFT)
         self.batch_backtest_button = ttk.Button(controls, text="开始回测", command=self.start_backtest)
         self.batch_backtest_button.grid(row=row, column=5, sticky="e", pady=(12, 0))
 
@@ -2390,7 +2396,7 @@ class BacktestWindow:
         messagebox.showerror("回测失败", str(exc), parent=self.window)
 
     def start_backtest(self) -> None:
-        if self._backtest_running or self._history_sync_running:
+        if self._backtest_running or self._history_ui_busy():
             return
         if self._selected_strategy_definition().strategy_id == STRATEGY_EMA5_EMA8_ID:
             self.start_single_backtest()
@@ -2413,7 +2419,7 @@ class BacktestWindow:
         ).start()
 
     def start_single_backtest(self) -> None:
-        if self._backtest_running or self._history_sync_running:
+        if self._backtest_running or self._history_ui_busy():
             return
         try:
             config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts = self._build_backtest_request()
@@ -2611,17 +2617,26 @@ class BacktestWindow:
         self._history_sync_running = running
         self._refresh_action_button_states()
 
+    def _set_history_verify_running(self, running: bool) -> None:
+        self._history_verify_running = running
+        self._refresh_action_button_states()
+
+    def _history_ui_busy(self) -> bool:
+        return self._history_sync_running or self._history_verify_running
+
     def _refresh_action_button_states(self) -> None:
-        state = "disabled" if (self._backtest_running or self._history_sync_running) else "normal"
+        state = "disabled" if (self._backtest_running or self._history_ui_busy()) else "normal"
         if self._widget_exists(getattr(self, "single_backtest_button", None)):
             self.single_backtest_button.configure(state=state)
         if self._widget_exists(getattr(self, "batch_backtest_button", None)):
             self.batch_backtest_button.configure(state=state)
         if self._widget_exists(getattr(self, "sync_history_button", None)):
             self.sync_history_button.configure(state=state)
+        if self._widget_exists(getattr(self, "verify_cache_button", None)):
+            self.verify_cache_button.configure(state=state)
 
     def sync_history_data(self) -> None:
-        if self._backtest_running or self._history_sync_running:
+        if self._backtest_running or self._history_ui_busy():
             return
         tasks = [(symbol, bar) for symbol in BACKTEST_SYMBOL_OPTIONS for bar in BACKTEST_HISTORY_SYNC_BARS]
         self.history_sync_status.set(
@@ -2633,6 +2648,116 @@ class BacktestWindow:
             args=(tasks,),
             daemon=True,
         ).start()
+
+    def verify_history_cache_data(self) -> None:
+        if self._backtest_running or self._history_ui_busy():
+            return
+        tasks = [(symbol, bar) for symbol in BACKTEST_SYMBOL_OPTIONS for bar in BACKTEST_HISTORY_SYNC_BARS]
+        self.history_sync_status.set(
+            f"正在校验本地缓存（0/{len(tasks)}）：5 个币种 × 4 周期（5m/15m/1H/4H），检查连续性并尝试补洞…"
+        )
+        self._set_history_verify_running(True)
+        threading.Thread(
+            target=self._run_history_verify_worker,
+            args=(tasks,),
+            daemon=True,
+        ).start()
+
+    def _run_history_verify_worker(self, tasks: list[tuple[str, str]]) -> None:
+        results: list[CacheVerifyOutcome] = []
+        try:
+            total = len(tasks)
+            for index, (symbol, bar) in enumerate(tasks, start=1):
+                if self._ui_alive():
+                    progress_text = (
+                        f"正在校验本地缓存（{index}/{total}）："
+                        f"{symbol} | {_normalize_backtest_bar_label(bar)}"
+                    )
+                    self.window.after(0, lambda text=progress_text: self.history_sync_status.set(text))
+                try:
+                    outcome = verify_and_repair_cached_candles(self.client, symbol, bar)
+                    results.append(outcome)
+                except Exception as exc:
+                    results.append(
+                        CacheVerifyOutcome(
+                            inst_id=symbol,
+                            bar=bar,
+                            ok=False,
+                            candle_count_before=0,
+                            candle_count_after=0,
+                            missing_bars_before=0,
+                            missing_bars_after=0,
+                            gap_segments_before=0,
+                            gap_segments_after=0,
+                            range_fetch_calls=0,
+                            did_full_history_fetch=False,
+                            warnings=(),
+                            error=str(exc),
+                        )
+                    )
+            if self._ui_alive():
+                self.window.after(0, lambda: self._apply_history_verify_results(results))
+        except Exception as exc:
+            if self._ui_alive():
+                self.window.after(0, lambda error=exc: self._show_history_verify_error(error))
+
+    def _apply_history_verify_results(self, results: list[CacheVerifyOutcome]) -> None:
+        if not self._ui_alive():
+            return
+        self._set_history_verify_running(False)
+        ok_n = sum(1 for item in results if item.ok and not item.error)
+        bad_n = len(results) - ok_n
+        total_fetched = sum(item.range_fetch_calls for item in results)
+        full_n = sum(1 for item in results if item.did_full_history_fetch)
+        full_tail = f" 其中 {full_n} 组曾从空缓存全量拉取。" if full_n else ""
+        if bad_n:
+            self.history_sync_status.set(
+                f"校验完成：{ok_n} 组通过，{bad_n} 组仍有问题；累计区间拉取 {total_fetched} 次。{full_tail}"
+            )
+        else:
+            self.history_sync_status.set(
+                f"校验完成：{len(results)} 组均连续；区间拉取 {total_fetched} 次。{full_tail}"
+            )
+        lines = [
+            f"本次校验共 {len(results)} 组（与「同步历史数据」相同标的与周期）：通过 {ok_n} 组，未完全通过 {bad_n} 组。",
+            "",
+        ]
+        for item in results:
+            label = f"{item.inst_id} | {_normalize_backtest_bar_label(item.bar)}"
+            if item.error and not item.ok:
+                lines.append(f"{label} | 失败：{item.error}")
+            elif not item.ok:
+                lines.append(
+                    f"{label} | 仍有缺口 约 {item.missing_bars_after} 根（{item.gap_segments_after} 段）"
+                    f" | 缓存 {item.candle_count_before}→{item.candle_count_after} 根"
+                    f" | 区间拉取 {item.range_fetch_calls} 次"
+                )
+            else:
+                extra = ""
+                if item.missing_bars_before > 0:
+                    extra = f" | 曾缺约 {item.missing_bars_before} 根，已尝试补齐"
+                if item.did_full_history_fetch:
+                    extra += " | 空缓存已全量拉取"
+                lines.append(
+                    f"{label} | 通过{extra} | 缓存 {item.candle_count_before}→{item.candle_count_after} 根"
+                    f" | 区间拉取 {item.range_fetch_calls} 次"
+                )
+            if item.warnings:
+                for w in item.warnings[:5]:
+                    lines.append(f"    警告：{w}")
+                if len(item.warnings) > 5:
+                    lines.append(f"    … 另有 {len(item.warnings) - 5} 条警告未显示")
+        if bad_n:
+            messagebox.showwarning("校验数据", "\n".join(lines), parent=self.window)
+        else:
+            messagebox.showinfo("校验数据", "\n".join(lines), parent=self.window)
+
+    def _show_history_verify_error(self, exc: Exception) -> None:
+        if not self._ui_alive():
+            return
+        self._set_history_verify_running(False)
+        self.history_sync_status.set(f"校验数据失败：{exc}")
+        messagebox.showerror("校验数据失败", str(exc), parent=self.window)
 
     def _run_history_sync_worker(self, tasks: list[tuple[str, str]]) -> None:
         results: list[tuple[str, str, int, str | None]] = []

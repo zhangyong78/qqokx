@@ -1,6 +1,6 @@
 # OKX 策略工作台
 
-当前版本：`v0.5.10`
+当前版本：`v0.5.11`
 
 这是一个面向 OKX 的桌面交易工作台，围绕“监控、交易、保护、回测、分析”构建。当前项目已经包含：
 
@@ -561,7 +561,14 @@ ATR 批量矩阵规则：
 
 ## 11. 更新日志
 
-当前版本：v0.5.10
+当前版本：v0.5.11
+
+### v0.5.11
+
+- K 线缓存连续性：`candle_continuity` 按周期步长检测半开区间内的缺根；`candle_cache_verify` 对本地 `candle_cache` 做校验并按段调用 `get_candles_history_range` / 全量拉取尝试补洞，产出 `CacheVerifyOutcome`。
+- 回测窗口：在「同步历史数据」旁新增「**校验数据**」，对预设币种与周期批量跑上述校验/补洞；与同步任务互斥，避免并发写缓存。
+- 脚本：`scripts/check_local_candle_gaps.py`、`scripts/fill_local_candle_gaps.py` 用于命令行检查/补齐本地缓存（`--end-ms` 指定半开区间终点）；`ema_cross_practical_sweep.py` 为 EMA 突破/跌破极简扫参与 CSV 汇总。
+- 单测：`tests/test_candle_continuity.py`、`tests/test_candle_cache_verify.py` 覆盖缺口检测与校验流程。
 
 ### v0.5.10
 
