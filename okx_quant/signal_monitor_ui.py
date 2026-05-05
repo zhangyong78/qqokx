@@ -9,7 +9,7 @@ from tkinter import messagebox, ttk
 from typing import Callable
 
 from okx_quant.persistence import signal_observer_presets_file_path, signal_observer_templates_file_path
-from okx_quant.strategy_catalog import get_strategy_definition
+from okx_quant.strategy_catalog import get_strategy_definition, resolve_dynamic_signal_mode
 from okx_quant.strategy_parameters import (
     iter_strategy_parameter_keys,
     strategy_fixed_value,
@@ -132,6 +132,14 @@ def _normalize_template_payload(payload: dict[str, object]) -> dict[str, object]
         fixed_value = strategy_fixed_value(strategy_id, key)
         if fixed_value is not None:
             normalized_snapshot[key] = fixed_value
+    fixed_signal_mode = strategy_fixed_value(strategy_id, "signal_mode")
+    if fixed_signal_mode is not None:
+        normalized_snapshot["signal_mode"] = str(fixed_signal_mode)
+    else:
+        normalized_snapshot["signal_mode"] = resolve_dynamic_signal_mode(
+            strategy_id,
+            str(normalized_snapshot.get("signal_mode") or "both"),
+        )
     normalized["config_snapshot"] = normalized_snapshot
     normalized["strategy_id"] = strategy_id
     if not str(normalized.get("strategy_name") or "").strip():
@@ -139,9 +147,15 @@ def _normalize_template_payload(payload: dict[str, object]) -> dict[str, object]
             normalized["strategy_name"] = get_strategy_definition(strategy_id).name
         except KeyError:
             pass
-    fixed_signal_mode = strategy_fixed_value(strategy_id, "signal_mode")
     if fixed_signal_mode is not None:
         normalized["direction_label"] = _SIGNAL_MODE_VALUE_TO_LABEL.get(str(fixed_signal_mode), str(fixed_signal_mode))
+    else:
+        sm = str(normalized_snapshot.get("signal_mode") or "both")
+        try:
+            default_label = get_strategy_definition(strategy_id).default_signal_label
+        except KeyError:
+            default_label = sm
+        normalized["direction_label"] = _SIGNAL_MODE_VALUE_TO_LABEL.get(sm, default_label)
     if not str(normalized.get("run_mode_label") or "").strip():
         normalized["run_mode_label"] = "只发邮件"
     return normalized
@@ -909,6 +923,15 @@ class SignalMonitorWindow:
             else:
                 raw_value = str(variable.get()).strip()
             updated_snapshot[key] = raw_value
+        resolved_signal_mode = resolve_dynamic_signal_mode(
+            strategy_id,
+            str(updated_snapshot.get("signal_mode") or "both"),
+        )
+        updated_snapshot["signal_mode"] = resolved_signal_mode
+        direction_label = _SIGNAL_MODE_VALUE_TO_LABEL.get(
+            str(resolved_signal_mode),
+            definition.default_signal_label,
+        )
         payload["symbol"] = symbol
         payload["direction_label"] = direction_label or definition.default_signal_label
         payload["run_mode_label"] = "只发邮件"

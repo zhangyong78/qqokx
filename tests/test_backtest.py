@@ -75,6 +75,8 @@ from okx_quant.backtest import BacktestManualPosition, BacktestOpenPosition, Bac
 from okx_quant.models import Candle, Instrument, OrderPlan, StrategyConfig
 from okx_quant.strategy_catalog import (
     STRATEGY_CROSS_ID,
+    STRATEGY_EMA_BREAKDOWN_SHORT_ID,
+    STRATEGY_EMA_BREAKOUT_LONG_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA5_EMA8_ID,
 )
@@ -632,7 +634,7 @@ class BacktestTest(TestCase):
             position_mode="net",
             environment="demo",
             tp_sl_trigger_type="mark",
-            strategy_id=STRATEGY_CROSS_ID,
+            strategy_id=STRATEGY_EMA_BREAKOUT_LONG_ID,
             risk_amount=Decimal("100"),
         )
 
@@ -846,7 +848,11 @@ class BacktestTest(TestCase):
             for i in range(1, 260)
         ]
         client = DummyBacktestClient(candles, self._build_instrument())
-        config = replace(self._build_config(), signal_mode="both")
+        config = replace(
+            self._build_config(),
+            strategy_id=STRATEGY_CROSS_ID,
+            signal_mode="both",
+        )
         with self.assertRaises(RuntimeError) as ctx:
             run_backtest(client, config, candle_limit=len(candles))
         self.assertIn("双向", str(ctx.exception))
@@ -1670,7 +1676,7 @@ class BacktestTest(TestCase):
                 position_mode="net",
                 environment="demo",
                 tp_sl_trigger_type="mark",
-                strategy_id=STRATEGY_CROSS_ID,
+                strategy_id=STRATEGY_EMA_BREAKDOWN_SHORT_ID,
                 risk_amount=Decimal("200"),
             ),
             candle_limit=800,
@@ -1686,14 +1692,14 @@ class BacktestTest(TestCase):
                 instrument=self._build_instrument(),
                 ema_period=34,
                 trend_ema_period=89,
-                strategy_id=STRATEGY_CROSS_ID,
+                strategy_id=STRATEGY_EMA_BREAKDOWN_SHORT_ID,
             ),
         )
 
         detail = _build_backtest_compare_detail(snapshot)
 
         self.assertIn("编号：R009", detail)
-        self.assertIn("策略：EMA 穿越策略", detail)
+        self.assertIn("策略：EMA 跌破做空策略", detail)
         self.assertIn("K线周期：1小时", detail)
         self.assertIn("开始时间：2024-03-22 08:00", detail)
         self.assertIn("结束时间：2024-03-23 08:00", detail)
@@ -1737,7 +1743,7 @@ class BacktestTest(TestCase):
                 position_mode="net",
                 environment="demo",
                 tp_sl_trigger_type="mark",
-                strategy_id=STRATEGY_CROSS_ID,
+                strategy_id=STRATEGY_EMA_BREAKOUT_LONG_ID,
                 risk_amount=Decimal("100"),
             ),
             candle_limit=0,
@@ -1753,7 +1759,7 @@ class BacktestTest(TestCase):
                 instrument=self._build_instrument(),
                 ema_period=21,
                 trend_ema_period=55,
-                strategy_id=STRATEGY_CROSS_ID,
+                strategy_id=STRATEGY_EMA_BREAKOUT_LONG_ID,
             ),
         )
 
@@ -1805,7 +1811,7 @@ class BacktestTest(TestCase):
                     position_mode="net",
                     environment="demo",
                     tp_sl_trigger_type="mark",
-                    strategy_id=STRATEGY_CROSS_ID,
+                    strategy_id=STRATEGY_EMA_BREAKDOWN_SHORT_ID,
                     risk_amount=Decimal("200"),
                 ),
                 candle_limit=800,
@@ -1821,7 +1827,7 @@ class BacktestTest(TestCase):
                     instrument=self._build_instrument(),
                     ema_period=34,
                     trend_ema_period=89,
-                    strategy_id=STRATEGY_CROSS_ID,
+                    strategy_id=STRATEGY_EMA_BREAKDOWN_SHORT_ID,
                 ),
                 export_path=str(report_path),
             )

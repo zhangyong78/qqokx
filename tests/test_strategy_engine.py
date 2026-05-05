@@ -26,7 +26,7 @@ from okx_quant.models import Candle, Instrument, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxTradeOrderItem
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategy_catalog import (
-    STRATEGY_CROSS_ID,
+    STRATEGY_EMA_BREAKOUT_LONG_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
@@ -232,19 +232,24 @@ class StrategyEngineTest(TestCase):
             position_mode="net",
             environment="demo",
             tp_sl_trigger_type="mark",
+            entry_reference_ema_period=2,
         )
         decision = EmaAtrStrategy().evaluate(candles, config)
         self.assertEqual(decision.signal, "long")
         self.assertIsNotNone(decision.atr_value)
 
-    def test_cross_long_signal_is_blocked_when_below_ema55(self) -> None:
-        candles = self._make_candles(["100"] * 60 + ["50", "80"])
+    def test_long_breakout_blocked_when_small_ema_not_above_trend_ema(self) -> None:
+        seq = ["100"] * 35
+        for price in range(100, 59, -2):
+            seq.append(str(price))
+        seq.extend(["61", "88"])
+        candles = self._make_candles(seq)
         config = StrategyConfig(
             inst_id="BTC-USDT-SWAP",
             bar="15m",
-            ema_period=2,
-            trend_ema_period=5,
-            big_ema_period=6,
+            ema_period=5,
+            trend_ema_period=21,
+            big_ema_period=233,
             atr_period=2,
             atr_stop_multiplier=Decimal("2"),
             atr_take_multiplier=Decimal("4"),
@@ -254,12 +259,14 @@ class StrategyEngineTest(TestCase):
             position_mode="net",
             environment="demo",
             tp_sl_trigger_type="mark",
+            entry_reference_ema_period=10,
         )
 
         decision = EmaAtrStrategy().evaluate(candles, config)
 
         self.assertIsNone(decision.signal)
-        self.assertIn("EMA6", decision.reason)
+        self.assertIn("未在", decision.reason)
+        self.assertIn("EMA21", decision.reason)
 
     def test_order_plan_builds_tp_and_sl(self) -> None:
         instrument = Instrument(
@@ -649,7 +656,7 @@ class StrategyEngineTest(TestCase):
             state="live",
         )
 
-        def _fake_evaluate(_strategy, _candles, _config):  # noqa: ANN001
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
             return SignalDecision(
                 signal="long",
                 reason="趋势成立",
@@ -778,7 +785,7 @@ class StrategyEngineTest(TestCase):
             state="live",
         )
 
-        def _fake_evaluate(_strategy, _candles, _config):  # noqa: ANN001
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
             return SignalDecision(
                 signal="short",
                 reason="趋势成立",
@@ -919,7 +926,7 @@ class StrategyEngineTest(TestCase):
             state="live",
         )
 
-        def _fake_evaluate(_strategy, _candles, _config):  # noqa: ANN001
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
             return SignalDecision(
                 signal="long",
                 reason="趋势成立",
@@ -1007,7 +1014,7 @@ class StrategyEngineTest(TestCase):
             state="live",
         )
 
-        def _fake_evaluate(_strategy, _candles, _config):  # noqa: ANN001
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
             nonlocal evaluate_calls
             evaluate_calls += 1
             return SignalDecision(
@@ -1115,7 +1122,7 @@ class StrategyEngineTest(TestCase):
             state="live",
         )
 
-        def _fake_evaluate(_strategy, _candles, _config):  # noqa: ANN001
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
             return SignalDecision(
                 signal="long",
                 reason="趋势成立",
@@ -1198,7 +1205,7 @@ class StrategyEngineTest(TestCase):
             ct_val_ccy="BNB",
         )
 
-        def _fake_evaluate(_strategy, _candles, _config):  # noqa: ANN001
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
             return SignalDecision(
                 signal="short",
                 reason="趋势成立",
@@ -1280,7 +1287,7 @@ class StrategyEngineTest(TestCase):
             state="live",
         )
 
-        def _fake_evaluate(_strategy, _candles, _config):  # noqa: ANN001
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
             nonlocal evaluate_calls
             evaluate_calls += 1
             return SignalDecision(
@@ -2886,7 +2893,7 @@ class StrategyEngineTest(TestCase):
             position_mode="long_short",
             environment="demo",
             tp_sl_trigger_type="mark",
-            strategy_id=STRATEGY_CROSS_ID,
+            strategy_id=STRATEGY_EMA_BREAKOUT_LONG_ID,
         )
         plan = build_order_plan(
             instrument=instrument,

@@ -285,21 +285,6 @@ class UiPositionsMixin:
             self._render_positions_zoom_position_history_view()
             self._enqueue_log(f"已清空历史仓位备注：{item.inst_id}")
 
-    def clear_selected_position_history_note(self) -> None:
-        item = self._selected_position_history_item()
-        if item is None:
-            messagebox.showinfo("备注", "请先在历史仓位里选中一条记录。", parent=self._positions_zoom_window or self.root)
-            return
-        profile_name, environment = self._position_history_note_context()
-        record_key = _position_history_note_key(profile_name, environment, item)
-        if record_key not in self._position_history_notes:
-            messagebox.showinfo("备注", "当前历史仓位还没有备注。", parent=self._positions_zoom_window or self.root)
-            return
-        del self._position_history_notes[record_key]
-        self._save_position_notes()
-        self._render_positions_zoom_position_history_view()
-        self._enqueue_log(f"已清空历史仓位备注：{item.inst_id}")
-
     def _expand_to_screen(self, window: Toplevel, *, margin: int = 20) -> None:
         try:
             apply_fill_window_geometry(window, min_width=1200, min_height=800, margin=margin)
@@ -357,27 +342,39 @@ class UiPositionsMixin:
         ttk.Label(header, textvariable=self._positions_zoom_summary_text).grid(row=0, column=1, sticky="w")
         zoom_actions = ttk.Frame(header)
         zoom_actions.grid(row=0, column=2, sticky="e")
+        zoom_api = ttk.Frame(zoom_actions)
+        ttk.Label(zoom_api, text="API").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        self._positions_zoom_credential_profile_combo = ttk.Combobox(
+            zoom_api,
+            textvariable=self.api_profile_name,
+            values=self._credential_profile_names(),
+            state="readonly",
+            width=12,
+        )
+        self._positions_zoom_credential_profile_combo.grid(row=0, column=1, sticky="w")
+        self._positions_zoom_credential_profile_combo.bind("<<ComboboxSelected>>", self._on_api_profile_selected)
+        self._sync_credential_profile_combo()
+        zoom_api.grid(row=0, column=0, sticky="w", padx=(0, 10))
         ttk.Button(zoom_actions, text="刷新", command=self.refresh_positions).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(zoom_actions, text="账户信息", command=self.open_account_info_window).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(zoom_actions, text="平仓选中", command=self.flatten_selected_position).grid(row=0, column=2, padx=(0, 6))
         ttk.Button(zoom_actions, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(zoom_actions, text="清空备注", command=self.clear_selected_position_note).grid(row=0, column=4, padx=(0, 6))
         ttk.Button(zoom_actions, text="设置期权保护", command=self.open_position_protection_window).grid(
-            row=0, column=5, padx=(0, 6)
+            row=0, column=4, padx=(0, 6)
         )
         ttk.Button(zoom_actions, text="展期建议", command=self.open_option_roll_window).grid(
-            row=0, column=6, padx=(0, 6)
+            row=0, column=5, padx=(0, 6)
         )
-        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=7)
+        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=6)
         ttk.Button(zoom_actions, text="列设置", command=self.open_positions_zoom_column_window).grid(
-            row=0, column=8, padx=(0, 6)
+            row=0, column=7, padx=(0, 6)
         )
 
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_detail_toggle_text, command=self.toggle_positions_zoom_detail).grid(
-            row=0, column=9, padx=(0, 6)
+            row=0, column=8, padx=(0, 6)
         )
         ttk.Button(zoom_actions, textvariable=self._positions_zoom_history_toggle_text, command=self.toggle_positions_zoom_history).grid(
-            row=0, column=10
+            row=0, column=9
         )
         for column_index, child in enumerate(zoom_actions.winfo_children()):
             child.grid_configure(column=column_index)
@@ -935,14 +932,11 @@ class UiPositionsMixin:
         ttk.Button(header, text="编辑备注", command=self.edit_selected_position_history_note).grid(
             row=0, column=2, sticky="e", padx=(0, 6)
         )
-        ttk.Button(header, text="清空备注", command=self.clear_selected_position_history_note).grid(
-            row=0, column=3, sticky="e", padx=(0, 6)
-        )
         ttk.Button(
             header,
             textvariable=self._positions_zoom_position_history_detail_toggle_text,
             command=self.toggle_positions_zoom_position_history_detail,
-        ).grid(row=0, column=4, sticky="e")
+        ).grid(row=0, column=3, sticky="e")
         filter_row = ttk.Frame(parent)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         filter_row.columnconfigure(9, weight=1)
@@ -1098,6 +1092,7 @@ class UiPositionsMixin:
         if self._positions_zoom_window is not None and self._positions_zoom_window.winfo_exists():
             self._positions_zoom_window.destroy()
         self._positions_zoom_window = None
+        self._positions_zoom_credential_profile_combo = None
         self._positions_zoom_tree = None
         self._positions_zoom_detail = None
         self._positions_zoom_notebook = None

@@ -6,7 +6,12 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from okx_quant.signal_monitor_ui import SignalMonitorWindow, _ObserverDraft, _ObserverPreset, _normalize_template_payload
-from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_LONG_ID, STRATEGY_EMA5_EMA8_ID, get_strategy_definition
+from okx_quant.strategy_catalog import (
+    STRATEGY_DYNAMIC_LONG_ID,
+    STRATEGY_EMA5_EMA8_ID,
+    STRATEGY_EMA_BREAKOUT_LONG_ID,
+    get_strategy_definition,
+)
 from okx_quant.ui import QuantApp
 
 
@@ -85,7 +90,7 @@ class SignalObserverTemplateNormalizationTest(TestCase):
         draft = _ObserverDraft(
             draft_id="D001",
             template_payload={
-                "strategy_id": STRATEGY_CROSS_ID,
+                "strategy_id": STRATEGY_EMA_BREAKOUT_LONG_ID,
                 "strategy_name": "EMA 动态断层修复",
                 "symbol": "BTC-USDT-SWAP",
                 "api_name": "moni",
@@ -171,14 +176,14 @@ class SignalObserverTemplateNormalizationTest(TestCase):
         draft = _ObserverDraft(
             draft_id="D001",
             template_payload={
-                "strategy_id": STRATEGY_CROSS_ID,
-                "strategy_name": get_strategy_definition(STRATEGY_CROSS_ID).name,
+                "strategy_id": STRATEGY_EMA_BREAKOUT_LONG_ID,
+                "strategy_name": get_strategy_definition(STRATEGY_EMA_BREAKOUT_LONG_ID).name,
                 "api_name": "moni",
                 "direction_label": "双向",
                 "run_mode_label": "只发邮件",
                 "symbol": "BTC-USDT-SWAP",
                 "config_snapshot": {
-                    "strategy_id": STRATEGY_CROSS_ID,
+                    "strategy_id": STRATEGY_EMA_BREAKOUT_LONG_ID,
                     "inst_id": "BTC-USDT-SWAP",
                     "bar": "1H",
                     "signal_mode": "both",
@@ -234,13 +239,13 @@ class SignalObserverTemplateNormalizationTest(TestCase):
         draft = _ObserverDraft(
             draft_id="D002",
             template_payload={
-                "strategy_id": STRATEGY_CROSS_ID,
-                "strategy_name": get_strategy_definition(STRATEGY_CROSS_ID).name,
+                "strategy_id": STRATEGY_EMA_BREAKOUT_LONG_ID,
+                "strategy_name": get_strategy_definition(STRATEGY_EMA_BREAKOUT_LONG_ID).name,
                 "direction_label": "双向",
                 "run_mode_label": "只发邮件",
                 "symbol": "BTC-USDT-SWAP",
                 "config_snapshot": {
-                    "strategy_id": STRATEGY_CROSS_ID,
+                    "strategy_id": STRATEGY_EMA_BREAKOUT_LONG_ID,
                     "inst_id": "BTC-USDT-SWAP",
                     "bar": "4H",
                     "signal_mode": "both",
@@ -274,13 +279,13 @@ class SignalObserverTemplateNormalizationTest(TestCase):
         draft = _ObserverDraft(
             draft_id="D003",
             template_payload={
-                "strategy_id": STRATEGY_CROSS_ID,
-                "strategy_name": get_strategy_definition(STRATEGY_CROSS_ID).name,
+                "strategy_id": STRATEGY_EMA_BREAKOUT_LONG_ID,
+                "strategy_name": get_strategy_definition(STRATEGY_EMA_BREAKOUT_LONG_ID).name,
                 "direction_label": "双向",
                 "run_mode_label": "只发邮件",
                 "symbol": "ETH-USDT-SWAP",
                 "config_snapshot": {
-                    "strategy_id": STRATEGY_CROSS_ID,
+                    "strategy_id": STRATEGY_EMA_BREAKOUT_LONG_ID,
                     "inst_id": "ETH-USDT-SWAP",
                     "bar": "1H",
                     "signal_mode": "both",
@@ -295,16 +300,16 @@ class SignalObserverTemplateNormalizationTest(TestCase):
         preset = _ObserverPreset(
             preset_name="4H 趋势观察",
             template_payload={
-                "strategy_id": STRATEGY_CROSS_ID,
-                "strategy_name": get_strategy_definition(STRATEGY_CROSS_ID).name,
-                "direction_label": "只做空",
+                "strategy_id": STRATEGY_EMA_BREAKOUT_LONG_ID,
+                "strategy_name": get_strategy_definition(STRATEGY_EMA_BREAKOUT_LONG_ID).name,
+                "direction_label": "只做多",
                 "run_mode_label": "只发邮件",
                 "symbol": "BTC-USDT-SWAP",
                 "config_snapshot": {
-                    "strategy_id": STRATEGY_CROSS_ID,
+                    "strategy_id": STRATEGY_EMA_BREAKOUT_LONG_ID,
                     "inst_id": "BTC-USDT-SWAP",
                     "bar": "4H",
-                    "signal_mode": "short_only",
+                    "signal_mode": "long_only",
                     "ema_period": "34",
                     "trend_ema_period": "89",
                     "big_ema_period": "233",
@@ -330,9 +335,9 @@ class SignalObserverTemplateNormalizationTest(TestCase):
         self.assertEqual(draft.template_payload["symbol"], "ETH-USDT-SWAP")
         self.assertEqual(snapshot["inst_id"], "ETH-USDT-SWAP")
         self.assertEqual(snapshot["bar"], "4H")
-        self.assertEqual(snapshot["signal_mode"], "short_only")
+        self.assertEqual(snapshot["signal_mode"], "long_only")
         self.assertEqual(snapshot["ema_period"], "34")
-        self.assertEqual(draft.template_payload["direction_label"], "只做空")
+        self.assertEqual(draft.template_payload["direction_label"], "只做多")
         window._save_drafts.assert_called_once()
         window._refresh_views.assert_called_once()
         window._refresh_editor_from_selection.assert_called_once()

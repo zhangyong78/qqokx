@@ -6,9 +6,12 @@ from unittest import TestCase
 
 from okx_quant.models import Candle
 from okx_quant.strategy_live_chart import (
+    StrategyLiveChartLayout,
     StrategyLiveChartSnapshot,
     StrategyLiveChartTimeMarker,
     build_strategy_live_chart_snapshot,
+    layout_price_to_y,
+    layout_price_to_y_unclamped,
     line_trading_desk_max_view_start,
     line_trading_desk_visible_bar_count,
     slice_strategy_live_chart_snapshot_with_desk_right_pad,
@@ -162,3 +165,28 @@ class StrategyLiveChartHelpersTest(TestCase):
         self.assertEqual(len(sliced.candles), 30)
         self.assertIsNotNone(sliced.series_plot_end_index)
         self.assertEqual(sliced.series_plot_end_index, 15)
+
+    def test_layout_price_to_y_unclamped_extends_beyond_chart_for_out_of_band_prices(self) -> None:
+        lay = StrategyLiveChartLayout(
+            width=800,
+            height=600,
+            left=76.0,
+            top=40.0,
+            right=644.0,
+            bottom=544.0,
+            lower=Decimal("100"),
+            upper=Decimal("200"),
+            candle_step=4.0,
+            candle_count=10,
+        )
+        y_mid = layout_price_to_y_unclamped(lay, Decimal("150"))
+        self.assertGreater(y_mid, float(lay.top))
+        self.assertLess(y_mid, float(lay.bottom))
+        y_high = layout_price_to_y(lay, Decimal("300"))
+        y_high_u = layout_price_to_y_unclamped(lay, Decimal("300"))
+        self.assertAlmostEqual(y_high, float(lay.top), delta=1e-6)
+        self.assertLess(y_high_u, float(lay.top))
+        y_low = layout_price_to_y(lay, Decimal("0"))
+        y_low_u = layout_price_to_y_unclamped(lay, Decimal("0"))
+        self.assertAlmostEqual(y_low, float(lay.bottom), delta=1e-6)
+        self.assertGreater(y_low_u, float(lay.bottom))

@@ -1,5 +1,5 @@
 """
-由 EMA 穿越矩阵回测 CSV 行数据生成「五币种深度洞察」风格长文（客户沟通版）。
+由 EMA 突破/跌破矩阵回测 CSV 行数据生成「五币种深度洞察」风格长文（客户沟通版）。
 """
 
 from __future__ import annotations
@@ -169,11 +169,11 @@ def build_client_deep_insight(
     bars_disp: list[str] = list(spec.get("bars") or [b for b in bars_order if any(r.get("bar") == b for r in rows)])
 
     lines: list[str] = [
-        "五币种 EMA 穿越策略 · 全参数矩阵深度洞察报告（客户沟通版）",
+        "五币种 EMA 突破/跌破策略 · 全参数矩阵深度洞察报告（客户沟通版）",
         "",
         f"出具时间（UTC）：{utc_ts}",
-        f"数据来源：EMA 穿越矩阵回测全量 CSV（{'试跑子集' if smoke else '全量'}，共 {n} 组）。",
-        f"策略口径：{spec.get('strategy', 'EMA穿越')}；K 线目标 {spec.get('candle_limit', '?')} 根/组；"
+        f"数据来源：EMA 突破/跌破矩阵回测全量 CSV（{'试跑子集' if smoke else '全量'}，共 {n} 组）。",
+        f"策略口径：{spec.get('strategy', 'EMA突破跌破')}；K 线目标 {spec.get('candle_limit', '?')} 根/组；"
         f"开/平滑点各 {spec.get('slippage_each_side', '')}；手续费 Maker/Taker 见 JSON。",
         "",
         "一、先说最重要的结论",
@@ -203,7 +203,7 @@ def build_client_deep_insight(
     lines.extend(bar_dir_lines if bar_dir_lines else ["（当前子集无分周期数据）"])
     lines += [
         "",
-        "五、止损 ATR 与穿越参考 EMA 的全局规律",
+        "五、止损 ATR 与突破参考 EMA 的全局规律",
         f"1. 止损倍数平均盈亏排序已体现在第一节；可结合分周期章节判断「紧止损 vs 宽止损」是否在特定周期更占优。",
         f"2. {ema_cmp}",
         "3. 人话总结：若分周期里出现「短周期偏好宽止损、高周期偏好紧止损」的分化，与旧版动态委托报告的结论往往同向——本质是噪音 vs 趋势推进的差异。",

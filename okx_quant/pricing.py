@@ -43,6 +43,13 @@ def format_decimal_by_increment(value: Decimal, increment: Decimal | None) -> st
     return format(rounded, f".{places}f")
 
 
+def format_strategy_reason_price(value: Decimal, price_increment: Decimal | None) -> str:
+    """策略日志 / SignalDecision.reason 中的价格展示，与标的 tick 对齐；无 tick 时退回精简小数。"""
+    if price_increment is not None and price_increment > 0:
+        return format_decimal_by_increment(value, price_increment)
+    return format_decimal(value)
+
+
 def format_decimal_fixed(value: Decimal, places: int = 2) -> str:
     if places < 0:
         raise ValueError("places must be non-negative")

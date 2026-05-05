@@ -5,6 +5,8 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
+    STRATEGY_EMA_BREAKDOWN_SHORT_ID,
+    STRATEGY_EMA_BREAKOUT_LONG_ID,
 )
 from okx_quant.strategy_parameters import (
     iter_strategy_parameter_keys,
@@ -15,8 +17,17 @@ from okx_quant.strategy_parameters import (
 
 
 class StrategyParametersTest(TestCase):
-    def test_cross_strategy_uses_big_ema(self) -> None:
-        self.assertTrue(strategy_uses_parameter(STRATEGY_CROSS_ID, "big_ema_period"))
+    def test_breakout_long_and_breakdown_short_share_same_parameter_keys(self) -> None:
+        keys_long = set(iter_strategy_parameter_keys(STRATEGY_EMA_BREAKOUT_LONG_ID))
+        keys_short = set(iter_strategy_parameter_keys(STRATEGY_EMA_BREAKDOWN_SHORT_ID))
+        self.assertEqual(keys_long, keys_short)
+        self.assertIn("entry_reference_ema_period", keys_long)
+        self.assertIn("hold_close_exit_bars", keys_long)
+        self.assertNotIn("big_ema_period", keys_long)
+        self.assertNotIn("signal_mode", keys_long)
+
+    def test_legacy_cross_profile_keeps_signal_mode_key(self) -> None:
+        self.assertIn("signal_mode", iter_strategy_parameter_keys(STRATEGY_CROSS_ID))
 
     def test_dynamic_short_strategy_uses_entry_reference_parameter(self) -> None:
         self.assertTrue(strategy_uses_parameter(STRATEGY_DYNAMIC_SHORT_ID, "entry_reference_ema_period"))
@@ -34,5 +45,7 @@ class StrategyParametersTest(TestCase):
         self.assertFalse(strategy_is_parameter_editable(STRATEGY_EMA5_EMA8_ID, "ema_period", "launcher"))
 
     def test_strategy_parameter_keys_stay_strategy_specific(self) -> None:
-        self.assertNotIn("entry_reference_ema_period", iter_strategy_parameter_keys(STRATEGY_CROSS_ID))
+        self.assertIn("entry_reference_ema_period", iter_strategy_parameter_keys(STRATEGY_EMA_BREAKOUT_LONG_ID))
         self.assertIn("entry_reference_ema_period", iter_strategy_parameter_keys(STRATEGY_DYNAMIC_LONG_ID))
+        self.assertNotIn("hold_close_exit_bars", iter_strategy_parameter_keys(STRATEGY_DYNAMIC_LONG_ID))
+        self.assertIn("hold_close_exit_bars", iter_strategy_parameter_keys(STRATEGY_EMA_BREAKOUT_LONG_ID))

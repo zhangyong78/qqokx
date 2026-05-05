@@ -40,7 +40,7 @@ def main() -> None:
         smoke = bool(meta.get("smoke", smoke))
     if not spec:
         spec = {
-            "strategy": "EMA穿越",
+            "strategy": "EMA突破跌破",
             "coins": sorted({str(r.get("inst_id")) for r in rows if r.get("inst_id")}),
             "bars": sorted({str(r.get("bar")) for r in rows if r.get("bar")}),
             "candle_limit": int(rows[0]["candle_count"]) if rows else 0,

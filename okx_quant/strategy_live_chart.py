@@ -13,10 +13,13 @@ DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT = 240
 DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS = 5000
 # 划线交易台轮询略慢于策略图，减轻 OKX 与主线程压力。
 LINE_TRADING_DESK_POLL_MS = 7500
-# 首屏先拉较少 K 线更快出图，后台再补足到 TARGET。
-LINE_TRADING_DESK_CANDLE_INITIAL = 280
+# 划线交易台单次拉取根数（曾分 INITIAL+补足 两阶段，易与画线锚点不同步；现与 ui_shell 一致为一次拉满）。
+LINE_TRADING_DESK_CANDLE_INITIAL = 280  # 历史/脚本兼容参考，当前划线台 worker 不再使用。
 LINE_TRADING_DESK_CANDLE_TARGET = 500
 LINE_TRADING_DESK_MAX_RIGHT_PAD_BARS = 240
+# 已映射画布的最小像素：略低于 200 以兼容分屏/窄窗；仍须与内区 inset 检查一起通过才绘制 K 线。
+CHART_CANVAS_MIN_MAPPED_W = 100
+CHART_CANVAS_MIN_MAPPED_H = 100
 
 _CHART_INSET_LEFT = 76
 _CHART_INSET_RIGHT_PAD = 156
@@ -307,6 +310,19 @@ def strategy_live_chart_price_bounds(
     return (lo, hi) if lo <= hi else (hi, lo)
 
 
+def strategy_live_chart_canvas_layout(canvas: Canvas) -> tuple[int, int, bool]:
+    """返回 (宽, 高, 是否可用于 K 线布局)。
+
+    必须用 Tk 已映射的 ``winfo`` 尺寸。open+pack 后 ``winfo`` 常仍为 1，若用 ``cget`` 的默认
+    width/height（如 980×620）冒充，则按「假画布」算 candle_step 与纵轴，首帧会与真实窗口错位、闪动。
+    """
+    win_w = max(0, int(canvas.winfo_width()))
+    win_h = max(0, int(canvas.winfo_height()))
+    if win_w >= CHART_CANVAS_MIN_MAPPED_W and win_h >= CHART_CANVAS_MIN_MAPPED_H:
+        return win_w, win_h, True
+    return win_w or 1, win_h or 1, False
+
+
 def render_strategy_live_chart(
     canvas: Canvas,
     snapshot: StrategyLiveChartSnapshot,
@@ -314,8 +330,7 @@ def render_strategy_live_chart(
     bounds_policy: str = "full",
     desk_anchor_prices: tuple[Decimal, ...] | None = None,
 ) -> bool:
-    width = max(int(canvas.winfo_width()), int(float(canvas.cget("width") or 0)), 640)
-    height = max(int(canvas.winfo_height()), int(float(canvas.cget("height") or 0)), 420)
+    width, height, layout_ready = strategy_live_chart_canvas_layout(canvas)
     left = float(_CHART_INSET_LEFT)
     top = float(_CHART_INSET_TOP)
     right = float(width - _CHART_INSET_RIGHT_PAD)
@@ -323,9 +338,19 @@ def render_strategy_live_chart(
     inner_w = right - left
     inner_h = bottom - top
 
-    if snapshot.candles and (width < 200 or height < 200 or inner_w <= 24 or inner_h <= 24):
+    if snapshot.candles and (
+        not layout_ready
+        or width < CHART_CANVAS_MIN_MAPPED_W
+        or height < CHART_CANVAS_MIN_MAPPED_H
+        or inner_w <= 24
+        or inner_h <= 24
+    ):
         # 窗口尚未完成布局时跳过：避免清空画布后纵轴/网格在错误尺寸下计算，出现错乱与「过一会才好」。
         return False
+
+    if not snapshot.candles:
+        width = max(width, 320)
+        height = max(height, 240)
 
     canvas.delete("all")
     canvas.configure(background="#ffffff")
@@ -608,9 +633,10 @@ class StrategyLiveChartLayout:
 
 
 def measure_strategy_live_chart_canvas(canvas: Canvas) -> tuple[int, int]:
-    width = max(int(canvas.winfo_width()), int(float(canvas.cget("width") or 0)), 640)
-    height = max(int(canvas.winfo_height()), int(float(canvas.cget("height") or 0)), 420)
-    return width, height
+    w, h, ok = strategy_live_chart_canvas_layout(canvas)
+    if ok:
+        return w, h
+    return max(w, 1), max(h, 1)
 
 
 def compute_strategy_live_chart_layout(
@@ -815,6 +841,18 @@ def layout_price_to_y(layout: StrategyLiveChartLayout, price: Decimal) -> float:
     ratio = float((layout.upper - price) / (layout.upper - layout.lower))
     ratio = min(max(ratio, 0.0), 1.0)
     return layout.top + (layout.bottom - layout.top) * ratio
+
+
+def layout_price_to_y_unclamped(layout: StrategyLiveChartLayout, price: Decimal) -> float:
+    """与 `layout_price_to_y` 相同线性关系，但不把 ratio 限制在 0～1。
+
+    价落在当前纵轴上下界之外时，y 可超出图表内框，用于趋势线/射线在像素上保持真实斜率；
+    若用 `layout_price_to_y` 则两端常被钳到同一边，延伸段会变成水平折线。
+    """
+    if layout.upper <= layout.lower:
+        return float(layout.top + (layout.bottom - layout.top) / 2)
+    ratio = float((layout.upper - price) / (layout.upper - layout.lower))
+    return float(layout.top + (layout.bottom - layout.top) * ratio)
 
 
 def layout_price_to_y_clamped(layout: StrategyLiveChartLayout, price: Decimal) -> float:

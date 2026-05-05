@@ -98,7 +98,7 @@ class PersistenceTest(TestCase):
         save_strategy_parameter_drafts(
             {
                 "launcher": {
-                    "ema_cross_market": {
+                    "ema_breakout_long": {
                         "bar": "1H",
                         "ema_period": "21",
                         "trend_ema_period": "55",
@@ -116,8 +116,8 @@ class PersistenceTest(TestCase):
 
         snapshot = load_strategy_parameter_drafts(temp_path)
 
-        self.assertEqual(snapshot["launcher"]["ema_cross_market"]["bar"], "1H")
-        self.assertEqual(snapshot["launcher"]["ema_cross_market"]["ema_period"], "21")
+        self.assertEqual(snapshot["launcher"]["ema_breakout_long"]["bar"], "1H")
+        self.assertEqual(snapshot["launcher"]["ema_breakout_long"]["ema_period"], "21")
         self.assertEqual(snapshot["backtest"]["ema_dynamic_order_short"]["entry_reference_ema_period"], "21")
         self.assertEqual(snapshot["observer"], {})
 

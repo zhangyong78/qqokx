@@ -1,5 +1,5 @@
 """
-Batch EMA 穿越（永续）参数矩阵回测，并输出 CSV / JSON / TXT 报告。
+Batch EMA 突破/跌破（永续）参数矩阵回测，并输出 CSV / JSON / TXT 报告。
 
 默认与「新版全面回测」系列口径对齐：5 永续 × 4 周期 × 多空 × 参考 EMA 21/55 ×
 止损 ATR 1/1.5/2 × 止盈 ATR 1/2/3 × 固定/动态止盈 × 时间保本 1～10 根 ×
@@ -43,7 +43,7 @@ from okx_quant.backtest import (
 from okx_quant.ema_cross_insight_text import build_client_deep_insight
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import OkxRestClient
-from okx_quant.strategy_catalog import STRATEGY_CROSS_ID
+from okx_quant.strategy_catalog import STRATEGY_EMA_BREAKDOWN_SHORT_ID, STRATEGY_EMA_BREAKOUT_LONG_ID
 
 COINS = (
     "BTC-USDT-SWAP",
@@ -89,7 +89,7 @@ def _worst_case_preload_config() -> StrategyConfig:
         position_mode="net",
         environment="demo",
         tp_sl_trigger_type="mark",
-        strategy_id=STRATEGY_CROSS_ID,
+        strategy_id=STRATEGY_EMA_BREAKOUT_LONG_ID,
         risk_amount=RISK_AMOUNT,
         entry_reference_ema_period=55,
         take_profit_mode="dynamic",
@@ -132,7 +132,9 @@ def build_config(
         position_mode="net",
         environment="demo",
         tp_sl_trigger_type="mark",
-        strategy_id=STRATEGY_CROSS_ID,
+        strategy_id=STRATEGY_EMA_BREAKOUT_LONG_ID
+        if signal_mode == "long_only"
+        else STRATEGY_EMA_BREAKDOWN_SHORT_ID,
         risk_amount=RISK_AMOUNT,
         entry_reference_ema_period=entry_ref_ema,
         take_profit_mode=take_profit_mode,  # type: ignore[arg-type]
@@ -325,7 +327,7 @@ def run_matrix(
         "smoke": smoke,
         "total_runs": len(rows),
         "spec": {
-            "strategy": "EMA穿越",
+            "strategy": "ema_breakout_long+ema_breakdown_short",
             "coins": list(coins),
             "bars": list(bars),
             "directions": list(directions),
@@ -363,15 +365,15 @@ def run_matrix(
     json_path.write_text(json.dumps(_json_safe(summary), ensure_ascii=False, indent=2), encoding="utf-8")
 
     lines = [
-        f"EMA 穿越策略 · 全参数矩阵回测总报告（{'试跑' if smoke else '全量'}）",
+        f"EMA 突破/跌破策略 · 全参数矩阵回测总报告（{'试跑' if smoke else '全量'}）",
         "",
         f"出具时间（UTC）：{ts}",
         f"总运行组数：{len(rows)}",
         "",
         "一、测试范围（与需求对齐）",
-        "1. 策略：EMA 穿越；方向：只做多、只做空分别统计。",
+        "1. 策略：EMA 突破做多 / EMA 跌破做空（两个独立 strategy_id）；多须 EMA 小周期>中周期，空须 EMA 小周期<中周期；方向分表统计。",
         f"2. 币种（USDT 永续）：{', '.join(coins)}。",
-        f"3. 穿越参考 EMA 周期：{', '.join(str(x) for x in entry_emas)}。",
+        f"3. 突破参考 EMA 周期：{', '.join(str(x) for x in entry_emas)}。",
         f"4. K 线周期：{', '.join(BAR_LABEL_ZH.get(b, b) for b in bars)}。",
         f"5. 每组目标 {candle_limit} 根 K 线（实际根数见 CSV 的 candle_count / data_source_note）。",
         f"6. 止损 ATR：{', '.join(str(x) for x in stop_atrs)}；止盈 ATR（相对入场）：{', '.join(str(x) for x in take_atrs)}；"
@@ -424,7 +426,7 @@ def run_matrix(
 
     pos_count = sum(1 for r in rows if float(r["total_pnl"]) > 0)
     leader = [
-        "一页版摘要（EMA 穿越 · 矩阵回测）",
+        "一页版摘要（EMA 突破/跌破 · 矩阵回测）",
         "",
         f"出具时间（UTC）：{ts}",
         f"总组数：{len(rows)}；盈利组数：{pos_count}（{100.0 * pos_count / len(rows):.2f}%）" if rows else "",
@@ -463,7 +465,7 @@ def run_matrix(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="EMA 穿越矩阵回测报告")
+    parser = argparse.ArgumentParser(description="EMA 突破/跌破矩阵回测报告")
     parser.add_argument(
         "--out-dir",
         type=Path,

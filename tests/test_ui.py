@@ -9,7 +9,12 @@ from unittest.mock import MagicMock, patch
 
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import Instrument, OkxOrderResult, OkxOrderStatus, OkxPosition
-from okx_quant.strategy_catalog import STRATEGY_CROSS_ID, STRATEGY_DYNAMIC_LONG_ID, STRATEGY_DYNAMIC_SHORT_ID, STRATEGY_EMA5_EMA8_ID
+from okx_quant.strategy_catalog import (
+    STRATEGY_DYNAMIC_LONG_ID,
+    STRATEGY_DYNAMIC_SHORT_ID,
+    STRATEGY_EMA5_EMA8_ID,
+    STRATEGY_EMA_BREAKOUT_LONG_ID,
+)
 from okx_quant.trader_desk import TraderDraftRecord, TraderRunState, TraderSlotRecord
 from okx_quant.ui import (
     NormalStrategyBookFilters,
@@ -4342,7 +4347,7 @@ class StrategyParameterDraftRestoreTest(TestCase):
 
     def test_restore_strategy_parameter_draft_prefers_saved_cross_values(self) -> None:
         app = self._make_parameter_stub()
-        app._strategy_parameter_drafts["launcher"][STRATEGY_CROSS_ID] = {
+        app._strategy_parameter_drafts["launcher"][STRATEGY_EMA_BREAKOUT_LONG_ID] = {
             "bar": "1H",
             "ema_period": "34",
             "trend_ema_period": "89",
@@ -4350,7 +4355,7 @@ class StrategyParameterDraftRestoreTest(TestCase):
             "atr_period": "14",
         }
 
-        QuantApp._restore_strategy_parameter_draft(app, STRATEGY_CROSS_ID)
+        QuantApp._restore_strategy_parameter_draft(app, STRATEGY_EMA_BREAKOUT_LONG_ID)
 
         self.assertEqual(app.bar.get(), "1H")
         self.assertEqual(app.ema_period.get(), "34")

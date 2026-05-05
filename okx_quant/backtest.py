@@ -19,7 +19,10 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
+    STRATEGY_EMA_BREAKDOWN_SHORT_ID,
+    STRATEGY_EMA_BREAKOUT_LONG_ID,
     is_dynamic_strategy_id,
+    is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
 )
 
@@ -282,7 +285,7 @@ def run_backtest(
     )
     cross_higher_tf_bias: list[str] | None = None
     if (
-        config.strategy_id == STRATEGY_CROSS_ID
+        is_ema_atr_breakout_strategy(config.strategy_id)
         and int(config.cross_higher_tf_ref_ema_period) > 0
         and (config.cross_higher_tf_inst_id or "").strip()
         and (config.cross_higher_tf_bar or "").strip()
@@ -441,7 +444,7 @@ def _build_backtest_order_plan(
         atr_value=atr_value,
         candle_ts=candle_ts,
         trigger_inst_id=instrument.inst_id,
-        use_signal_extrema=config.strategy_id == STRATEGY_CROSS_ID,
+        use_signal_extrema=is_ema_atr_breakout_strategy(config.strategy_id),
         signal_candle_high=signal_candle_high,
         signal_candle_low=signal_candle_low,
     )
@@ -570,7 +573,7 @@ def _run_backtest_with_loaded_data(
             maker_fee_rate=maker_fee_rate,
             taker_fee_rate=taker_fee_rate,
         )
-    elif config.strategy_id == STRATEGY_CROSS_ID:
+    elif is_ema_atr_breakout_strategy(config.strategy_id):
         trades = _run_cross_backtest(
             candles,
             instrument,
@@ -590,7 +593,7 @@ def _run_backtest_with_loaded_data(
     ema_values = ema([candle.close for candle in candles], config.ema_period) if candles else []
     trend_ema_values = ema([candle.close for candle in candles], config.trend_ema_period) if candles else []
     atr_values = atr(candles, config.atr_period) if candles else []
-    if is_dynamic_strategy_id(config.strategy_id) or config.strategy_id == STRATEGY_CROSS_ID:
+    if is_dynamic_strategy_id(config.strategy_id) or is_ema_atr_breakout_strategy(config.strategy_id):
         big_ema_values: list[Decimal] = []
     else:
         big_ema_values = ema([candle.close for candle in candles], config.big_ema_period) if candles else []
@@ -835,11 +838,26 @@ def format_backtest_report(result: BacktestResult) -> str:
             f"收盘价跌破/站回 EMA{result.trend_ema_period} 时按动态止损离场。"
         )
         lines.append("本策略不设固定止盈，回测使用收盘确认与收盘价离场。")
-    if result.strategy_id == STRATEGY_CROSS_ID:
-        lines.append(
-            f"交易逻辑：仅做多；收盘价上穿穿越参考EMA(EMA{result.entry_reference_ema_period})开仓，"
-            "止损=参考EMA-ATR×止损倍数，止盈=开仓价+ATR×止盈倍数。"
-        )
+    if is_ema_atr_breakout_strategy(result.strategy_id):
+        if result.strategy_id == STRATEGY_EMA_BREAKOUT_LONG_ID:
+            lines.append(
+                f"交易逻辑：仅做多——收盘价向上突破参考EMA(EMA{result.entry_reference_ema_period})，"
+                f"且须 EMA{result.ema_period}>EMA{result.trend_ema_period}。"
+                "止损、止盈按 ATR 倍数与参考价、入场价计算。"
+            )
+        elif result.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID:
+            lines.append(
+                f"交易逻辑：仅做空——收盘价向下跌破参考EMA(EMA{result.entry_reference_ema_period})，"
+                f"且须 EMA{result.ema_period}<EMA{result.trend_ema_period}。"
+                "止损、止盈按 ATR 倍数与参考价、入场价计算。"
+            )
+        else:
+            lines.append(
+                f"交易逻辑（旧版入口）：多——向上突破参考EMA(EMA{result.entry_reference_ema_period})，"
+                f"且须 EMA{result.ema_period}>EMA{result.trend_ema_period}；"
+                f"空——向下跌破该参考EMA，且须 EMA{result.ema_period}<EMA{result.trend_ema_period}。"
+                "止损、止盈按 ATR 倍数与参考价、入场价计算。"
+            )
         lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
         if result.take_profit_mode == "dynamic":
             lines.append(f"2R保本开关：{'开启' if result.dynamic_two_r_break_even else '关闭'}")
@@ -981,10 +999,12 @@ def _build_cross_higher_tf_bias(
 
 
 def _required_backtest_preload_candles(config: StrategyConfig) -> int:
-    if config.strategy_id == STRATEGY_CROSS_ID:
+    if is_ema_atr_breakout_strategy(config.strategy_id):
         minimum = max(
             config.resolved_entry_reference_ema_period() + 2,
             config.atr_period + 2,
+            config.ema_period + 2,
+            config.trend_ema_period + 2,
         )
     elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         minimum = max(config.ema_period, config.trend_ema_period) + 1
@@ -1098,7 +1118,11 @@ def _run_ema5_ema8_backtest(
         if open_position is not None:
             continue
 
-        decision = strategy.evaluate(candles[: index + 1], config)
+        decision = strategy.evaluate(
+            candles[: index + 1],
+            config,
+            price_increment=instrument.tick_size,
+        )
         if decision.signal is None or decision.ema_value is None or decision.candle_ts is None:
             continue
 
@@ -1139,16 +1163,26 @@ def _run_cross_backtest(
     taker_fee_rate: Decimal = Decimal("0"),
     higher_tf_bias: list[str] | None = None,
 ) -> list[BacktestTrade]:
-    if config.signal_mode == "both":
-        raise RuntimeError("EMA 穿越回测不支持 signal_mode=双向，请使用只做多或只做空分别回测。")
+    if config.strategy_id == STRATEGY_CROSS_ID and config.signal_mode == "both":
+        raise RuntimeError(
+            "EMA 突破/跌破（旧版）回测不支持 signal_mode=双向；请分别回测或改用「EMA 突破做多」「EMA 跌破做空」策略。"
+        )
     strategy = EmaAtrStrategy()
     dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
-    eval_config = replace(config)
-    wanted_signal = "long" if config.signal_mode == "long_only" else "short"
+    effective_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
+    eval_config = replace(config, signal_mode=effective_mode)
+    if config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID:
+        wanted_signal = "short"
+    elif config.strategy_id == STRATEGY_EMA_BREAKOUT_LONG_ID:
+        wanted_signal = "long"
+    else:
+        wanted_signal = "long" if effective_mode == "long_only" else "short"
     reference_ema_period = eval_config.resolved_entry_reference_ema_period()
     minimum = max(
         reference_ema_period + 2,
         eval_config.atr_period + 2,
+        eval_config.ema_period + 2,
+        eval_config.trend_ema_period + 2,
     )
     if len(candles) < minimum:
         raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根。")
@@ -1204,7 +1238,11 @@ def _run_cross_backtest(
         if open_position is not None:
             continue
 
-        decision = strategy.evaluate(candles[: index + 1], eval_config)
+        decision = strategy.evaluate(
+            candles[: index + 1],
+            eval_config,
+            price_increment=instrument.tick_size,
+        )
         if decision.signal is None:
             current_wave_signal = None
             entries_in_current_wave = 0

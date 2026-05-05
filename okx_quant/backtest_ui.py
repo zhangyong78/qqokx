@@ -35,12 +35,13 @@ from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import (
     ALL_STRATEGY_DEFINITIONS,
     BACKTEST_STRATEGY_DEFINITIONS,
-    STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA5_EMA8_ID,
+    STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     StrategyDefinition,
     get_strategy_definition,
     is_dynamic_strategy_id,
+    is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
 )
 from okx_quant.strategy_parameters import (
@@ -433,7 +434,7 @@ def _build_backtest_param_summary(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> str:
-    if is_dynamic_strategy_id(config.strategy_id) or config.strategy_id == STRATEGY_CROSS_ID:
+    if is_dynamic_strategy_id(config.strategy_id) or is_ema_atr_breakout_strategy(config.strategy_id):
         risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
         sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
         if config.backtest_sizing_mode == "risk_percent":
@@ -450,13 +451,17 @@ def _build_backtest_param_summary(
             extra_parts.append(
                 f"时间保本{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
             )
-        if is_dynamic_strategy_id(config.strategy_id) or config.strategy_id == STRATEGY_CROSS_ID:
+        if is_dynamic_strategy_id(config.strategy_id) or is_ema_atr_breakout_strategy(config.strategy_id):
             max_entries_text = "不限" if config.max_entries_per_trend <= 0 else f"每波前{config.max_entries_per_trend}次"
             extra_parts.append(max_entries_text)
-        if config.strategy_id == STRATEGY_CROSS_ID and int(config.hold_close_exit_bars) > 0:
+        if is_ema_atr_breakout_strategy(config.strategy_id) and int(config.hold_close_exit_bars) > 0:
             extra_parts.append(f"满{int(config.hold_close_exit_bars)}根收盘平仓")
         extra_text = " / ".join(extra_parts)
-        ref_ema_label = "穿越EMA" if config.strategy_id == STRATEGY_CROSS_ID else "挂单EMA"
+        ref_ema_label = (
+            "跌破参考EMA"
+            if config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID
+            else ("突破参考EMA" if is_ema_atr_breakout_strategy(config.strategy_id) else "挂单EMA")
+        )
         return (
             f"EMA{config.ema_period}/{config.trend_ema_period} / ATR{config.atr_period} / "
             f"{ref_ema_label}{config.resolved_entry_reference_ema_period()} / "
@@ -1364,7 +1369,7 @@ class BacktestWindow:
 
     @staticmethod
     def _strategy_supports_dynamic_take_profit(strategy_id: str) -> bool:
-        return is_dynamic_strategy_id(strategy_id) or strategy_id == STRATEGY_CROSS_ID
+        return is_dynamic_strategy_id(strategy_id) or is_ema_atr_breakout_strategy(strategy_id)
 
     @staticmethod
     def _set_field_state(widget: object, *, editable: bool) -> None:
@@ -1469,8 +1474,10 @@ class BacktestWindow:
 
     def _apply_strategy_parameter_fixed_labels(self, strategy_id: str) -> None:
         fixed_suffix = "（本策略固定）"
-        if strategy_id == STRATEGY_CROSS_ID:
-            self.entry_reference_ema_caption.configure(text="穿越参考EMA周期")
+        if is_ema_atr_breakout_strategy(strategy_id):
+            self.entry_reference_ema_caption.configure(
+                text="跌破参考EMA周期" if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID else "突破参考EMA周期"
+            )
         else:
             self.entry_reference_ema_caption.configure(text="挂单参考EMA")
         label_map = {
@@ -2854,7 +2861,11 @@ class BacktestWindow:
         if strategy_uses_parameter(definition.strategy_id, "entry_reference_ema_period"):
             entry_reference_ema_period = self._parse_nonnegative_int(
                 self.entry_reference_ema_period.get(),
-                "穿越参考EMA周期" if definition.strategy_id == STRATEGY_CROSS_ID else "挂单参考EMA",
+                (
+                    "跌破参考EMA周期"
+                    if definition.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID
+                    else ("突破参考EMA周期" if is_ema_atr_breakout_strategy(definition.strategy_id) else "挂单参考EMA")
+                ),
             )
         if dynamic_tp_strategy:
             take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]

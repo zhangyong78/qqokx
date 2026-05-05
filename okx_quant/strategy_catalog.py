@@ -5,8 +5,20 @@ from dataclasses import dataclass
 STRATEGY_DYNAMIC_ID = "ema_dynamic_order"
 STRATEGY_DYNAMIC_LONG_ID = "ema_dynamic_order_long"
 STRATEGY_DYNAMIC_SHORT_ID = "ema_dynamic_order_short"
+# 仅兼容旧持久化 / 旧脚本，不在策略列表中展示
 STRATEGY_CROSS_ID = "ema_cross_market"
+STRATEGY_EMA_BREAKOUT_LONG_ID = "ema_breakout_long"
+STRATEGY_EMA_BREAKDOWN_SHORT_ID = "ema_breakdown_short"
 STRATEGY_EMA5_EMA8_ID = "ema5_ema8_cross_stop"
+
+
+def is_ema_atr_breakout_strategy(strategy_id: str) -> bool:
+    """EMA 突破/跌破类：参考 EMA 突破或跌破 + 小/中周期 EMA 过滤，共用 EmaAtrStrategy 与回测引擎。"""
+    return strategy_id in {
+        STRATEGY_EMA_BREAKOUT_LONG_ID,
+        STRATEGY_EMA_BREAKDOWN_SHORT_ID,
+        STRATEGY_CROSS_ID,
+    }
 
 
 @dataclass(frozen=True)
@@ -63,16 +75,45 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
         supports_trader_desk=True,
     ),
     StrategyDefinition(
-        strategy_id=STRATEGY_CROSS_ID,
-        name="EMA 穿越策略",
-        summary="按穿越参考EMA的突破入场，配合 ATR 止盈止损，适合作为基础突破策略。",
+        strategy_id=STRATEGY_EMA_BREAKOUT_LONG_ID,
+        name="EMA 突破做多策略",
+        summary="收盘价向上突破参考 EMA 时做多，且仅当 EMA(小周期) 在 EMA(中周期) 上方；ATR 止盈止损。",
         rule_description=(
-            "收盘价向上突破穿越参考 EMA 时做多，"
-            "止损按参考EMA减ATR，止盈按 ATR 倍数。"
+            "当收盘价向上突破参考 EMA，且 EMA(小周期) > EMA(中周期) 时开多；"
+            "止损、止盈按 ATR 倍数相对参考价与入场价计算。"
         ),
-        parameter_hint="优先关注穿越参考EMA周期、ATR周期与止盈止损倍数。",
-        default_signal_label="双向",
-        allowed_signal_labels=("双向", "只做多", "只做空"),
+        parameter_hint="关注小/中周期 EMA、突破参考 EMA 周期、ATR 与止盈止损倍数。",
+        default_signal_label="只做多",
+        allowed_signal_labels=("只做多",),
+        supports_signal_only=True,
+        supports_batch_observe=True,
+        supports_trader_desk=True,
+    ),
+    StrategyDefinition(
+        strategy_id=STRATEGY_EMA_BREAKDOWN_SHORT_ID,
+        name="EMA 跌破做空策略",
+        summary="收盘价向下跌破参考 EMA 时做空，且仅当 EMA(小周期) 在 EMA(中周期) 下方；ATR 止盈止损。",
+        rule_description=(
+            "当收盘价向下跌破参考 EMA，且 EMA(小周期) < EMA(中周期) 时开空；"
+            "止损、止盈按 ATR 倍数相对参考价与入场价计算。"
+        ),
+        parameter_hint="关注小/中周期 EMA、突破参考 EMA 周期、ATR 与止盈止损倍数。",
+        default_signal_label="只做空",
+        allowed_signal_labels=("只做空",),
+        supports_signal_only=True,
+        supports_batch_observe=True,
+        supports_trader_desk=True,
+    ),
+    StrategyDefinition(
+        strategy_id=STRATEGY_CROSS_ID,
+        name="EMA 突破/跌破（旧版）",
+        summary="兼容旧配置；请改用「EMA 突破做多策略」或「EMA 跌破做空策略」。",
+        rule_description=(
+            "与新版突破做多 / 跌破做空规则相同，按配置的信号方向（只做多或只做空）运行。"
+        ),
+        parameter_hint="请迁移到新策略入口；本入口仅用于读取旧持久化。",
+        default_signal_label="只做多",
+        allowed_signal_labels=("只做多", "只做空"),
         supports_signal_only=True,
         supports_batch_observe=True,
         supports_trader_desk=True,
@@ -105,8 +146,10 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     ),
 )
 
+_STRATEGY_IDS_HIDDEN_FROM_LAUNCHER: frozenset[str] = frozenset({STRATEGY_DYNAMIC_ID, STRATEGY_CROSS_ID})
+
 VISIBLE_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = tuple(
-    item for item in ALL_STRATEGY_DEFINITIONS if item.strategy_id != STRATEGY_DYNAMIC_ID
+    item for item in ALL_STRATEGY_DEFINITIONS if item.strategy_id not in _STRATEGY_IDS_HIDDEN_FROM_LAUNCHER
 )
 
 BACKTEST_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = tuple(
@@ -151,5 +194,9 @@ def resolve_dynamic_signal_mode(strategy_id: str, signal_mode: str) -> str:
     if strategy_id == STRATEGY_DYNAMIC_LONG_ID:
         return "long_only"
     if strategy_id == STRATEGY_DYNAMIC_SHORT_ID:
+        return "short_only"
+    if strategy_id == STRATEGY_EMA_BREAKOUT_LONG_ID:
+        return "long_only"
+    if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID:
         return "short_only"
     return signal_mode

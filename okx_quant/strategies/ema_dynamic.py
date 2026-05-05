@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from okx_quant.indicators import atr, ema
 from okx_quant.models import Candle, SignalDecision, StrategyConfig
+from okx_quant.pricing import format_strategy_reason_price
 from okx_quant.strategy_catalog import resolve_dynamic_signal_mode
 
 
 class EmaDynamicOrderStrategy:
     name = "ema_dynamic"
 
-    def evaluate(self, candles: list[Candle], config: StrategyConfig) -> SignalDecision:
+    def evaluate(
+        self,
+        candles: list[Candle],
+        config: StrategyConfig,
+        *,
+        price_increment: Decimal | None = None,
+    ) -> SignalDecision:
         entry_reference_ema_period = config.resolved_entry_reference_ema_period()
         minimum = max(
             config.ema_period,
@@ -55,6 +64,9 @@ class EmaDynamicOrderStrategy:
 
         effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
 
+        def px(value: Decimal) -> str:
+            return format_strategy_reason_price(value, price_increment)
+
         if effective_signal_mode == "long_only":
             if current_ema <= trend_ema:
                 return SignalDecision(
@@ -62,6 +74,7 @@ class EmaDynamicOrderStrategy:
                     reason=(
                         f"EMA{config.ema_period} 仍在 EMA{config.trend_ema_period} 下方，"
                         "当前不是有效多头趋势。"
+                        f"（快线={px(current_ema)} 慢线={px(trend_ema)} 收盘={px(current_candle.close)}）"
                     ),
                     candle_ts=current_candle.ts,
                     entry_reference=None,
@@ -76,6 +89,7 @@ class EmaDynamicOrderStrategy:
                     reason=(
                         f"收盘价仍在 EMA{config.trend_ema_period} 下方，"
                         "当前不是有效多头趋势。"
+                        f"（收盘={px(current_candle.close)} 慢线={px(trend_ema)}）"
                     ),
                     candle_ts=current_candle.ts,
                     entry_reference=None,
@@ -86,7 +100,8 @@ class EmaDynamicOrderStrategy:
                 )
             signal = "long"
             reason = (
-                f"多头趋势成立，以下一根的回调委托参考 EMA{entry_reference_ema_period} 作为挂单价。"
+                f"多头趋势成立，以下一根的回调委托参考 EMA{entry_reference_ema_period} 作为挂单价"
+                f"（委托价≈{px(current_entry_reference)}）。"
             )
         elif effective_signal_mode == "short_only":
             if current_ema >= trend_ema:
@@ -95,6 +110,7 @@ class EmaDynamicOrderStrategy:
                     reason=(
                         f"EMA{config.ema_period} 仍在 EMA{config.trend_ema_period} 上方，"
                         "当前不是有效空头趋势。"
+                        f"（快线={px(current_ema)} 慢线={px(trend_ema)} 收盘={px(current_candle.close)}）"
                     ),
                     candle_ts=current_candle.ts,
                     entry_reference=None,
@@ -109,6 +125,7 @@ class EmaDynamicOrderStrategy:
                     reason=(
                         f"收盘价仍在 EMA{config.trend_ema_period} 上方，"
                         "当前不是有效空头趋势。"
+                        f"（收盘={px(current_candle.close)} 慢线={px(trend_ema)}）"
                     ),
                     candle_ts=current_candle.ts,
                     entry_reference=None,
@@ -119,7 +136,8 @@ class EmaDynamicOrderStrategy:
                 )
             signal = "short"
             reason = (
-                f"空头趋势成立，以下一根的反弹委托参考 EMA{entry_reference_ema_period} 作为挂单价。"
+                f"空头趋势成立，以下一根的反弹委托参考 EMA{entry_reference_ema_period} 作为挂单价"
+                f"（委托价≈{px(current_entry_reference)}）。"
             )
         else:
             return SignalDecision(

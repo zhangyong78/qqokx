@@ -53,7 +53,15 @@ from okx_quant.log_utils import (
     read_daily_log_tail,
     strategy_session_log_file_path,
 )
-from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, OrderPlan, ProtectionPlan, StrategyConfig
+from okx_quant.models import (
+    Candle,
+    Credentials,
+    EmailNotificationConfig,
+    Instrument,
+    OrderPlan,
+    ProtectionPlan,
+    StrategyConfig,
+)
 from okx_quant.notifications import EmailNotifier
 from okx_quant.option_roll import is_short_option_position
 from okx_quant.option_roll_ui import OptionRollSuggestionWindow
@@ -136,7 +144,7 @@ from okx_quant.smart_order import SmartOrderRuntimeConfig
 from okx_quant.smart_order_ui import SmartOrderWindow
 from okx_quant.strategy_live_chart import (
     DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT,
-    LINE_TRADING_DESK_CANDLE_INITIAL,
+    DEFAULT_STRATEGY_LIVE_CHART_REFRESH_MS,
     LINE_TRADING_DESK_CANDLE_TARGET,
     LINE_TRADING_DESK_POLL_MS,
     StrategyLiveChartLayout,
@@ -147,12 +155,14 @@ from okx_quant.strategy_live_chart import (
     layout_bar_index_to_x_center,
     layout_pixel_to_bar_index,
     layout_price_to_y_clamped,
+    layout_price_to_y_unclamped,
     layout_y_to_price,
     line_price_through_anchors,
     line_trading_desk_max_view_start,
     line_trading_desk_visible_bar_count,
     render_strategy_live_chart,
     slice_strategy_live_chart_snapshot_with_desk_right_pad,
+    strategy_live_chart_canvas_layout,
     strategy_live_chart_price_bounds,
 )
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
@@ -161,14 +171,15 @@ from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_DEFINITIONS,
-    STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
+    STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     StrategyDefinition,
     get_strategy_definition,
     is_dynamic_strategy_id,
+    is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
     supports_signal_only,
 )
@@ -863,6 +874,9 @@ class LineTradingDeskWindowState:
     desk_log_text: Text | None = None
     desk_chart_throttle_job: str | None = None
     desk_last_chart_render_t: float = 0.0
+    desk_layout_retry_job: str | None = None
+    desk_layout_bootstrap_gen: int = 0
+    desk_map_render_job: str | None = None
     desk_annotation_store_key: str | None = None
     desk_annotation_save_job: str | None = None
 
@@ -2166,6 +2180,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._latest_account_overview: OkxAccountOverview | None = None
         self._latest_account_config: OkxAccountConfig | None = None
         self._positions_zoom_column_window: Toplevel | None = None
+        self._positions_zoom_credential_profile_combo: ttk.Combobox | None = None
         self._positions_zoom_detail_frame: ttk.LabelFrame | None = None
         self._positions_zoom_pending_orders_detail_frame: ttk.LabelFrame | None = None
         self._positions_zoom_order_history_detail_frame: ttk.LabelFrame | None = None
@@ -2645,7 +2660,6 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         tools_menu.add_command(label="打开波动率监控", command=self.open_deribit_volatility_monitor_window)
         tools_menu.add_command(label="打开Deribit波动率指数", command=self.open_deribit_volatility_window)
         tools_menu.add_command(label="打开期权策略计算器", command=self.open_option_strategy_window)
-        tools_menu.add_command(label="刷新账户持仓", command=self.refresh_positions)
         tools_menu.add_command(label="打开运行日志目录", command=self._open_run_logs_directory)
         menu_bar.add_cascade(label="工具", menu=tools_menu)
 
@@ -4796,9 +4810,19 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         canvas.bind("<Button-4>", self._on_line_trading_desk_mouse_wheel)
         canvas.bind("<Button-5>", self._on_line_trading_desk_mouse_wheel)
         canvas.bind("<Enter>", lambda e: e.widget.focus_set())
+        canvas.bind("<Map>", self._on_line_trading_desk_canvas_map_event, add="+")
         symbol_var.trace_add("write", lambda *_: self._on_line_trading_desk_symbol_or_bar_changed())
         bar_var.trace_add("write", lambda *_: self._on_line_trading_desk_symbol_or_bar_changed())
         api_profile_var.trace_add("write", lambda *_: self._on_line_trading_desk_api_profile_changed())
+        for _ in range(4):
+            try:
+                window.update_idletasks()
+            except Exception:
+                break
+        try:
+            window.wait_visibility()
+        except Exception:
+            pass
         # 先让窗口完成布局与首帧绘制，再拉数据，避免打开瞬间主线程与网络叠加大卡顿。
         self.root.after(16, lambda: self._request_line_trading_desk_refresh(immediate=True))
 
@@ -5057,6 +5081,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         header_width = max(8, min(14, max((len(item) for item in values), default=8) + 1))
         if self._header_credential_profile_combo is not None:
             self._header_credential_profile_combo.configure(values=values, width=header_width)
+        if self._positions_zoom_credential_profile_combo is not None:
+            self._positions_zoom_credential_profile_combo.configure(values=values, width=header_width)
         if self._credential_profile_combo is not None:
             self._credential_profile_combo.configure(values=values)
         current = self._current_credential_profile()
@@ -7199,29 +7225,25 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
     def _line_trading_desk_desk_anchor_prices(
         self, state: LineTradingDeskWindowState, *, sliced: StrategyLiveChartSnapshot | None = None
     ) -> tuple[Decimal, ...]:
-        """纳入 desk 纵轴计算。仅纳入与「当前可见切片」K 线 OHLC 同量级带宽内的锚点，避免远端线把蜡烛压成一条导致乱闪。"""
-        acc: list[Decimal] = []
+        """纳入 desk 纵轴计算。用户射线与盈亏比锚点价一律并入纵轴范围。
+
+        若按可见 OHLC 加宽边带过滤锚点价，新 K 线推动边带后锚点会反复进出过滤结果，
+        ``strategy_live_chart_price_bounds`` 的上下界随之跳变，同一组 (bar, price) 映射到像素会漂移，
+        表现为趋势线「自己挪动」。远端锚点宁可略压缩蜡烛视觉占比，也应保持几何稳定。
+        """
+        _ = sliced  # 保留参数供调用方按「当前切片」语义传入，纵轴不再按切片过滤锚点价。
+        line_prices: list[Decimal] = []
         for ann in state.line_annotations:
             if ann.price_a is not None:
-                acc.append(ann.price_a)
+                line_prices.append(ann.price_a)
             if ann.price_b is not None:
-                acc.append(ann.price_b)
+                line_prices.append(ann.price_b)
+        rr_prices: list[Decimal] = []
         for box in state.rr_annotations:
-            acc.append(box.price_entry)
-            acc.append(box.price_stop)
-            acc.append(box.price_tp)
-        if sliced is None or not sliced.candles:
-            return tuple(acc)
-        band: list[Decimal] = []
-        for c in sliced.candles:
-            band.extend((c.low, c.high))
-        lo, hi = min(band), max(band)
-        span = hi - lo
-        if span <= 0:
-            span = abs(lo) * Decimal("0.0001") if lo != 0 else Decimal("1")
-        margin = span * Decimal("3")
-        lo_b, hi_b = lo - margin, hi + margin
-        return tuple(p for p in acc if lo_b <= p <= hi_b)
+            rr_prices.append(box.price_entry)
+            rr_prices.append(box.price_stop)
+            rr_prices.append(box.price_tp)
+        return tuple(line_prices + rr_prices)
 
     def _line_trading_desk_visible_snapshot(
         self, state: LineTradingDeskWindowState
@@ -7304,6 +7326,77 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         state.desk_visible_bars = vb
         vs_max = line_trading_desk_max_view_start(n, vb, min_visible_bars=min_vis)
         state.desk_view_start = max(0, min(int(state.desk_view_start), vs_max))
+
+    def _line_trading_desk_closest_bar_index_for_ts(self, candles: tuple[Candle, ...], ts: int) -> int:
+        if not candles:
+            return 0
+        best_i = 0
+        best_d = abs(int(candles[0].ts) - int(ts))
+        for i, c in enumerate(candles):
+            d = abs(int(c.ts) - int(ts))
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i
+
+    def _line_trading_desk_remap_bar_coordinate(
+        self,
+        old_candles: tuple[Candle, ...],
+        new_candles: tuple[Candle, ...],
+        bar_f: float,
+    ) -> float:
+        if not new_candles:
+            return 0.0
+        hi_new = float(len(new_candles) - 1)
+        if not old_candles:
+            return min(max(float(bar_f), 0.0), hi_new)
+        max_old = float(len(old_candles) - 1)
+        clamped = min(max(float(bar_f), 0.0), max_old)
+        idx = int(round(clamped))
+        idx = max(0, min(idx, len(old_candles) - 1))
+        target_ts = int(old_candles[idx].ts)
+        j = self._line_trading_desk_closest_bar_index_for_ts(new_candles, target_ts)
+        return float(min(max(j, 0), len(new_candles) - 1))
+
+    def _line_trading_desk_should_remap_annotations_for_candle_change(
+        self,
+        state: LineTradingDeskWindowState,
+        old_candles: tuple[Candle, ...],
+        new_candles: tuple[Candle, ...],
+    ) -> bool:
+        """K 线根数变化（如先 280 再补到 500）时，绝对 bar 索引会错位，需按时间戳重绑。"""
+        if len(old_candles) != len(new_candles):
+            return True
+        n = len(new_candles)
+        if n == 0:
+            return False
+        hi = float(n - 1)
+        for ann in state.line_annotations:
+            for b in (ann.bar_a, ann.bar_b):
+                if b is None:
+                    continue
+                bf = float(b)
+                if bf < 0.0 or bf > hi:
+                    return True
+        for box in state.rr_annotations:
+            if float(box.bar_entry) < 0.0 or float(box.bar_entry) > hi or float(box.bar_stop) < 0.0 or float(box.bar_stop) > hi:
+                return True
+        return False
+
+    def _line_trading_desk_remap_annotations_bars_after_candle_reload(
+        self,
+        state: LineTradingDeskWindowState,
+        old_candles: tuple[Candle, ...],
+        new_candles: tuple[Candle, ...],
+    ) -> None:
+        for ann in state.line_annotations:
+            if ann.bar_a is not None:
+                ann.bar_a = self._line_trading_desk_remap_bar_coordinate(old_candles, new_candles, float(ann.bar_a))
+            if ann.bar_b is not None:
+                ann.bar_b = self._line_trading_desk_remap_bar_coordinate(old_candles, new_candles, float(ann.bar_b))
+        for box in state.rr_annotations:
+            box.bar_entry = self._line_trading_desk_remap_bar_coordinate(old_candles, new_candles, float(box.bar_entry))
+            box.bar_stop = self._line_trading_desk_remap_bar_coordinate(old_candles, new_candles, float(box.bar_stop))
 
     def _on_line_trading_desk_button_press(self, event) -> None:
         state = self._line_trading_desk_window
@@ -8037,13 +8130,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         tup = self._line_trading_desk_visible_snapshot(state)
         if tup is None:
             return None
-        _sliced, vs, _vb = tup
+        sliced0, vs, _vb = tup
         x_outer = 92.0
         body_half_w = 58.0
         body_y_pad = 12.0
         for box in reversed(state.rr_annotations):
-            rel_e = box.bar_entry - float(vs)
-            x_mid = layout_bar_index_to_x_center(lay, rel_e)
+            rel_mid = self._line_trading_desk_rr_layout_rel_mid_clamped(box, vs, sliced0, lay)
+            x_mid = layout_bar_index_to_x_center(lay, rel_mid)
             if abs(cx - x_mid) > x_outer:
                 continue
             ytp = float(layout_price_to_y_clamped(lay, box.price_tp))
@@ -8286,8 +8379,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         rel_b = bar_b - float(view_start)
         x_a = layout_bar_index_to_x_center(layout, rel_a)
         x_b = layout_bar_index_to_x_center(layout, rel_b)
-        y_a = layout_price_to_y_clamped(layout, ann.price_a)
-        y_b = layout_price_to_y_clamped(layout, ann.price_b)
+        # 趋势线用未钳价→像素，避免两端价都在界外时被钳到同一条边 dy=0 变成「折线+水平虚线」。
+        if ann.kind == "line":
+            y_a = float(layout_price_to_y_unclamped(layout, ann.price_a))
+            y_b = float(layout_price_to_y_unclamped(layout, ann.price_b))
+        else:
+            y_a = float(layout_price_to_y_clamped(layout, ann.price_a))
+            y_b = float(layout_price_to_y_clamped(layout, ann.price_b))
         dx = x_b - x_a
         dy = y_b - y_a
         if abs(dx) < 1e-6 and abs(dy) < 1e-6:
@@ -8301,11 +8399,18 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         t_bot = float(layout.bottom) - 0.5
         if abs(dx) < 1e-9:
             x2 = x_a
-            y2 = float(min(max(y_b + (y_b - y_a) * big, t_top), t_bot))
+            stretch = (y_b - y_a) * big
+            if ann.kind == "line":
+                y2 = float(y_b + stretch)
+            else:
+                y2 = float(min(max(y_b + stretch, t_top), t_bot))
         else:
             t = (x_far - x_b) / dx
             x2 = x_far
-            y2 = float(min(max(y_b + t * dy, t_top), t_bot))
+            if ann.kind == "line":
+                y2 = float(y_b + t * dy)
+            else:
+                y2 = float(min(max(y_b + t * dy, t_top), t_bot))
         canvas = state.canvas
         canvas.create_line(x_a, y_a, x_b, y_b, fill=ann.color, width=2, tags=("desk_line",))
         canvas.create_line(x_b, y_b, x2, y2, fill=ann.color, width=2, dash=(6, 4), tags=("desk_line",))
@@ -8319,14 +8424,43 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             tags=("desk_line",),
         )
 
+    def _line_trading_desk_slice_last_real_rel_hi(self, sliced: StrategyLiveChartSnapshot) -> float:
+        """当前可见切片里最后一根「真实」K 的相对下标上限（不含右侧平盘占位 ghost）。"""
+        n = len(sliced.candles)
+        if n <= 0:
+            return 0.0
+        pe = sliced.series_plot_end_index
+        if pe is None:
+            return float(n - 1)
+        cap = max(0, min(int(pe), n))
+        return float(max(0, cap - 1))
+
+    def _line_trading_desk_rr_layout_rel_mid_clamped(
+        self,
+        box: DeskRiskRewardAnnotation,
+        view_start: int,
+        sliced: StrategyLiveChartSnapshot,
+        layout: StrategyLiveChartLayout,
+    ) -> float:
+        rel_e = box.bar_entry - float(view_start)
+        rel_s = box.bar_stop - float(view_start)
+        rel_mid = (rel_e + rel_s) / 2.0
+        n_vis = max(1, int(layout.candle_count))
+        # 不画在右侧 ghost 空白里；索引越界时钳到真实 K 区间。
+        rel_hi = min(float(n_vis - 1), self._line_trading_desk_slice_last_real_rel_hi(sliced))
+        return min(max(rel_mid, 0.0), rel_hi)
+
     def _line_trading_desk_draw_rr_zones(
-        self, state: LineTradingDeskWindowState, layout: StrategyLiveChartLayout, view_start: int
+        self,
+        state: LineTradingDeskWindowState,
+        layout: StrategyLiveChartLayout,
+        view_start: int,
+        sliced: StrategyLiveChartSnapshot,
     ) -> None:
         canvas = state.canvas
         for box in state.rr_annotations:
-            rel_e = box.bar_entry - float(view_start)
-            rel_s = box.bar_stop - float(view_start)
-            x_mid = layout_bar_index_to_x_center(layout, (rel_e + rel_s) / 2)
+            rel_mid = self._line_trading_desk_rr_layout_rel_mid_clamped(box, view_start, sliced, layout)
+            x_mid = layout_bar_index_to_x_center(layout, rel_mid)
             entry_y = layout_price_to_y_clamped(layout, box.price_entry)
             stop_y = layout_price_to_y_clamped(layout, box.price_stop)
             profit_y = layout_price_to_y_clamped(layout, box.price_tp)
@@ -8494,10 +8628,80 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         ):
             self._line_trading_desk_dual_log(state, "射线自动开仓未送出委托，请查看状态栏具体原因。")
 
+    def _line_trading_desk_cancel_layout_retry_job(self, state: LineTradingDeskWindowState) -> None:
+        jid = state.desk_layout_retry_job
+        if jid is not None:
+            try:
+                self.root.after_cancel(jid)
+            except Exception:
+                pass
+            state.desk_layout_retry_job = None
+
+    def _line_trading_desk_cancel_desk_map_render_job(self, state: LineTradingDeskWindowState) -> None:
+        jid = state.desk_map_render_job
+        if jid is not None:
+            try:
+                self.root.after_cancel(jid)
+            except Exception:
+                pass
+            state.desk_map_render_job = None
+
+    def _line_trading_desk_invalidate_bootstrap_repaints(self, state: LineTradingDeskWindowState) -> None:
+        state.desk_layout_bootstrap_gen += 1
+        self._line_trading_desk_cancel_layout_retry_job(state)
+        self._line_trading_desk_cancel_desk_map_render_job(state)
+
+    def _line_trading_desk_start_bootstrap_repaints(self, state: LineTradingDeskWindowState) -> None:
+        """画布尚未映射出有效 winfo 时 render 会跳过；用短间隔多帧重试直到尺寸稳定。"""
+        self._line_trading_desk_cancel_layout_retry_job(state)
+        state.desk_layout_bootstrap_gen += 1
+        gen = state.desk_layout_bootstrap_gen
+        self._line_trading_desk_run_bootstrap_repaints(state, 0, gen)
+
+    def _line_trading_desk_run_bootstrap_repaints(self, state: LineTradingDeskWindowState, step: int, gen: int) -> None:
+        if self._line_trading_desk_window is not state or not _widget_exists(state.canvas):
+            state.desk_layout_retry_job = None
+            return
+        if state.desk_layout_bootstrap_gen != gen:
+            return
+        self._render_line_trading_desk_chart(force=True)
+        _w, _h, ok_now = strategy_live_chart_canvas_layout(state.canvas)
+        if ok_now:
+            state.desk_layout_retry_job = None
+            return
+        if step >= 5:
+            state.desk_layout_retry_job = None
+            return
+        delays_ms = (40, 80, 130, 210, 340)
+
+        def _next() -> None:
+            if self._line_trading_desk_window is not state or state.desk_layout_bootstrap_gen != gen:
+                return
+            self._line_trading_desk_run_bootstrap_repaints(state, step + 1, gen)
+
+        state.desk_layout_retry_job = self.root.after(delays_ms[step], _next)
+
+    def _on_line_trading_desk_canvas_map_event(self, event) -> None:
+        state = self._line_trading_desk_window
+        if state is None or getattr(event, "widget", None) is not state.canvas:
+            return
+        self._line_trading_desk_cancel_desk_map_render_job(state)
+        desk_ref = state
+
+        def _deferred() -> None:
+            st = self._line_trading_desk_window
+            if st is not desk_ref or not _widget_exists(desk_ref.canvas):
+                return
+            st.desk_map_render_job = None
+            self._line_trading_desk_start_bootstrap_repaints(st)
+
+        state.desk_map_render_job = self.root.after(24, _deferred)
+
     def _close_line_trading_desk_window(self) -> None:
         state = self._line_trading_desk_window
         if state is None:
             return
+        self._line_trading_desk_invalidate_bootstrap_repaints(state)
         self._line_trading_desk_cancel_motion_chart_paint(state)
         self._line_trading_desk_cancel_chart_throttle(state)
         self._line_trading_desk_cancel_canvas_configure_job(state)
@@ -8561,7 +8765,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         generation: int,
     ) -> None:
         try:
-            candles = self.client.get_candles_history(symbol, bar, limit=LINE_TRADING_DESK_CANDLE_INITIAL)
+            # 单次拉满目标根数，避免「先 280 再 500」两帧切换导致画线锚点与纵轴短暂错位、闪动。
+            candles = self.client.get_candles_history(symbol, bar, limit=LINE_TRADING_DESK_CANDLE_TARGET)
             latest_price = candles[-1].close if candles else None
             try:
                 ticker = self.client.get_ticker(symbol)
@@ -8614,33 +8819,6 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             ),
         )
 
-        if len(candles) < LINE_TRADING_DESK_CANDLE_TARGET:
-            try:
-                more = self.client.get_candles_history(symbol, bar, limit=LINE_TRADING_DESK_CANDLE_TARGET)
-                if len(more) > len(candles):
-                    lp = more[-1].close if more else None
-                    try:
-                        tk2 = self.client.get_ticker(symbol)
-                        if tk2.last is not None:
-                            lp = tk2.last
-                    except Exception:
-                        pass
-                    snap_full = build_strategy_live_chart_snapshot(
-                        session_id=f"desk:{symbol}",
-                        candles=more,
-                        ema_period=21,
-                        trend_ema_period=55,
-                        reference_ema_period=21,
-                        latest_price=lp,
-                        note=f"划线交易台 | {symbol} | {bar} | API={profile_name or '-'} | K={len(more)}",
-                    )
-                    self.root.after(
-                        0,
-                        lambda s=snap_full, g=generation: self._apply_line_trading_desk_chart_only(s, g, loading_account=False),
-                    )
-            except Exception:
-                pass
-
     def _apply_line_trading_desk_error(self, message: str, *, generation: int | None = None) -> None:
         state = self._line_trading_desk_window
         if state is None:
@@ -8667,6 +8845,19 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         if not snapshot.candles and state.last_snapshot is not None and state.last_snapshot.candles:
             chart_snapshot = state.last_snapshot
             chart_note = " | 本次K线返回空数据，已保留上一画面"
+        prev_snap = state.last_snapshot
+        if (
+            prev_snap is not None
+            and prev_snap.candles
+            and chart_snapshot.candles
+            and self._line_trading_desk_should_remap_annotations_for_candle_change(
+                state, prev_snap.candles, chart_snapshot.candles
+            )
+        ):
+            self._line_trading_desk_remap_annotations_bars_after_candle_reload(
+                state, prev_snap.candles, chart_snapshot.candles
+            )
+            self._line_trading_desk_schedule_annotation_persist(state)
         state.last_snapshot = chart_snapshot
         self._line_trading_desk_update_price_tick(state)
         n = len(chart_snapshot.candles)
@@ -8799,6 +8990,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             if not render_strategy_live_chart(
                 state.canvas, to_draw, bounds_policy="desk", desk_anchor_prices=anchors
             ):
+                if to_draw.candles:
+                    self._line_trading_desk_start_bootstrap_repaints(state)
                 return
             layout = compute_strategy_live_chart_layout(
                 state.canvas, to_draw, bounds_policy="desk", desk_anchor_prices=anchors
@@ -8809,7 +9002,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                         self._line_trading_desk_draw_ray_on_canvas(state, ann, layout, vs)
                     elif ann.kind == "stop":
                         self._line_trading_desk_draw_stop_line(state, ann, layout, vs)
-                self._line_trading_desk_draw_rr_zones(state, layout, vs)
+                self._line_trading_desk_draw_rr_zones(state, layout, vs, to_draw)
             self._draw_line_annotations(state.canvas, [], state.draft_line_start, state.draft_line_current)
         except Exception as exc:
             # 防止绘图链路偶发异常导致画布被清空后“整页消失”。
@@ -9636,7 +9829,7 @@ def _estimate_launcher_minimum_risk_amount(
 
     candles = client.get_candles(signal_inst_id, config.bar, limit=lookback)
     confirmed = [candle for candle in candles if candle.confirmed]
-    decision = strategy.evaluate(confirmed, config)
+    decision = strategy.evaluate(confirmed, config, price_increment=trade_instrument.tick_size)
     if decision.signal is None or decision.entry_reference is None or decision.candle_ts is None:
         return None, "当前还没有有效信号，等出现可挂单的一波后再给出估算。"
 
@@ -9659,7 +9852,7 @@ def _estimate_launcher_minimum_risk_amount(
         atr_value=decision.atr_value,
         candle_ts=decision.candle_ts,
         trigger_inst_id=trade_instrument.inst_id,
-        use_signal_extrema=config.strategy_id == STRATEGY_CROSS_ID,
+                use_signal_extrema=is_ema_atr_breakout_strategy(config.strategy_id),
         signal_candle_high=decision.signal_candle_high,
         signal_candle_low=decision.signal_candle_low,
     )
@@ -9763,8 +9956,16 @@ def _build_trend_parameter_hint_text(
         f"EMA小周期：{ema_period}=快线，负责捕捉最近节奏。",
         f"EMA中周期：{trend_ema_period}=趋势过滤线，用来判断当前方向是否还有效。",
     ]
-    if strategy_id == STRATEGY_CROSS_ID:
-        parts.append(f"EMA大周期：{big_ema_period}=大趋势过滤线，避免逆大方向开仓。")
+    if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID:
+        ref = entry_reference_ema_period if entry_reference_ema_period not in {"", "0"} else ema_period
+        parts.append(
+            f"参考EMA({ref})：收盘向下跌破该线触发做空，且须 EMA{ema_period}<EMA{trend_ema_period}。"
+        )
+    elif is_ema_atr_breakout_strategy(strategy_id):
+        ref = entry_reference_ema_period if entry_reference_ema_period not in {"", "0"} else ema_period
+        parts.append(
+            f"参考EMA({ref})：收盘向上突破该线触发做多，且须 EMA{ema_period}>EMA{trend_ema_period}。"
+        )
     elif strategy_id == STRATEGY_EMA5_EMA8_ID:
         parts.append(f"EMA大周期：{big_ema_period}=4H 大趋势过滤线。")
     if is_dynamic_strategy_id(strategy_id):

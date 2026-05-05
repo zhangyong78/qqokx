@@ -1926,7 +1926,7 @@ class UiStrategySessionsMixin:
                 config.resolved_entry_reference_ema_period(),
                 DEFAULT_DEBUG_ATR_PERIOD,
             )
-        elif strategy_id == STRATEGY_CROSS_ID:
+        elif is_ema_atr_breakout_strategy(strategy_id):
             strategy = EmaAtrStrategy()
             lookback = recommended_indicator_lookback(
                 config.ema_period,
@@ -1959,7 +1959,9 @@ class UiStrategySessionsMixin:
         confirmed = [candle for candle in candles if candle.confirmed]
         if len(confirmed) < 2:
             return True
-        decision = strategy.evaluate(confirmed, config)
+        hint_inst = self._find_instrument_for_fixed_order_size_hint(config.inst_id, fetch_if_missing=False)
+        price_inc = hint_inst.tick_size if hint_inst is not None else None
+        decision = strategy.evaluate(confirmed, config, price_increment=price_inc)
         current_signal = str(decision.signal or "").strip().lower()
         if current_signal == locked_signal:
             return True
@@ -3265,6 +3267,8 @@ class UiStrategySessionsMixin:
             self._save_strategy_parameter_draft(previous_strategy_id)
         self._restore_strategy_parameter_draft(strategy_id)
         dynamic_strategy = is_dynamic_strategy_id(strategy_id)
+        breakout_strategy = is_ema_atr_breakout_strategy(strategy_id)
+        dynamic_tp_controls = dynamic_strategy or breakout_strategy
         self.signal_combo["values"] = definition.allowed_signal_labels
         fixed_signal_mode = strategy_fixed_value(strategy_id, "signal_mode")
         if fixed_signal_mode is not None:
@@ -3278,14 +3282,11 @@ class UiStrategySessionsMixin:
             self.max_entries_per_trend.set("0")
             self.entry_side_mode_label.set("跟随信号")
             self.tp_sl_mode_label.set("按交易标的价格（本地）")
-        if dynamic_strategy:
+        if dynamic_tp_controls:
             self._take_profit_mode_label.grid()
             self._take_profit_mode_combo.grid()
             self._max_entries_per_trend_label.grid()
             self._max_entries_per_trend_entry.grid()
-            self._startup_chase_window_label.grid()
-            self._startup_chase_window_entry.grid()
-            self._startup_chase_window_hint_label.grid()
             self._dynamic_two_r_break_even_check.grid()
             self._dynamic_fee_offset_check.grid()
             self._dynamic_fee_offset_hint_label.grid()
@@ -3297,15 +3298,20 @@ class UiStrategySessionsMixin:
             self._take_profit_mode_combo.grid_remove()
             self._max_entries_per_trend_label.grid_remove()
             self._max_entries_per_trend_entry.grid_remove()
-            self._startup_chase_window_label.grid_remove()
-            self._startup_chase_window_entry.grid_remove()
-            self._startup_chase_window_hint_label.grid_remove()
             self._dynamic_two_r_break_even_check.grid_remove()
             self._dynamic_fee_offset_check.grid_remove()
             self._dynamic_fee_offset_hint_label.grid_remove()
             self._time_stop_break_even_check.grid_remove()
             self._time_stop_break_even_bars_label.grid_remove()
             self._time_stop_break_even_bars_entry.grid_remove()
+        if dynamic_strategy:
+            self._startup_chase_window_label.grid()
+            self._startup_chase_window_entry.grid()
+            self._startup_chase_window_hint_label.grid()
+        else:
+            self._startup_chase_window_label.grid_remove()
+            self._startup_chase_window_entry.grid_remove()
+            self._startup_chase_window_hint_label.grid_remove()
         if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
             self._entry_reference_ema_label.grid()
             self._entry_reference_ema_entry.grid()
@@ -3344,9 +3350,11 @@ class UiStrategySessionsMixin:
         if not hasattr(self, "_dynamic_two_r_break_even_check"):
             return
         definition = self._selected_strategy_definition()
-        dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
+        dynamic_tp_eligible = is_dynamic_strategy_id(definition.strategy_id) or is_ema_atr_breakout_strategy(
+            definition.strategy_id
+        )
         dynamic_take_profit = (
-            dynamic_strategy and TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "fixed") == "dynamic"
+            dynamic_tp_eligible and TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "fixed") == "dynamic"
         )
         self._dynamic_two_r_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self._dynamic_fee_offset_check.configure(state="normal" if dynamic_take_profit else "disabled")

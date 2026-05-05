@@ -168,3 +168,39 @@ class CandleCacheTest(TestCase):
         self.assertGreaterEqual(len(saved_snapshots), 3)
         self.assertEqual(saved_snapshots[0][1], 12000)
         self.assertEqual(saved_snapshots[-1][1], 12000)
+
+    def test_history_range_merges_local_cache_into_returned_series(self) -> None:
+        """区间拉取返回值应合并本地缓存，避免仅 API 子集导致回测缺根。"""
+        cached = [
+            _build_candle(900_000, "101"),
+            _build_candle(2_700_000, "103"),
+        ]
+        page_after_end = [
+            _build_okx_row(2_700_000, "203"),
+            _build_okx_row(1_800_000, "202"),
+        ]
+        client = DummyHistoryClient({"2700001": page_after_end, "1800000": []})
+        saved: list[list[Candle]] = []
+        original_load = okx_client_module.load_candle_cache
+        original_save = okx_client_module.save_candle_cache
+        okx_client_module.load_candle_cache = lambda inst_id, bar: list(cached)
+        okx_client_module.save_candle_cache = (
+            lambda inst_id, bar, candles, max_records=None: saved.append(list(candles))
+        )
+        try:
+            out = client.get_candles_history_range(
+                "BTC-USDT-SWAP",
+                "15m",
+                start_ts=900_000,
+                end_ts=2_700_000,
+                limit=50,
+                preload_count=0,
+            )
+        finally:
+            okx_client_module.load_candle_cache = original_load
+            okx_client_module.save_candle_cache = original_save
+
+        self.assertEqual([c.ts for c in out], [900_000, 1_800_000, 2_700_000])
+        self.assertTrue(saved)
+        merged_ts = {c.ts for c in saved[-1]}
+        self.assertEqual(merged_ts, {900_000, 1_800_000, 2_700_000})

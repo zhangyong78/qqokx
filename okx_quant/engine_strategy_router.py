@@ -4,9 +4,9 @@ from typing import TYPE_CHECKING
 
 from okx_quant.models import Credentials, StrategyConfig
 from okx_quant.strategy_catalog import (
-    STRATEGY_CROSS_ID,
     STRATEGY_EMA5_EMA8_ID,
     is_dynamic_strategy_id,
+    is_ema_atr_breakout_strategy,
 )
 
 if TYPE_CHECKING:
@@ -29,7 +29,7 @@ class EngineStrategyRouter:
             if config.run_mode == "signal_only":
                 if is_dynamic_strategy_id(config.strategy_id):
                     engine._run_dynamic_signal_only_v2(config, signal_instrument)
-                elif config.strategy_id == STRATEGY_CROSS_ID:
+                elif is_ema_atr_breakout_strategy(config.strategy_id):
                     engine._run_cross_signal_only(config, signal_instrument)
                 elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
                     engine._run_ema5_ema8_signal_only(config, signal_instrument)
@@ -51,7 +51,7 @@ class EngineStrategyRouter:
                     engine._run_dynamic_exchange_strategy(credentials, config, trade_instrument)
                 else:
                     engine._run_dynamic_local_strategy_v2(credentials, config, signal_instrument, trade_instrument)
-            elif config.strategy_id == STRATEGY_CROSS_ID:
+            elif is_ema_atr_breakout_strategy(config.strategy_id):
                 if engine_module.can_use_exchange_managed_orders(config, signal_instrument, trade_instrument):
                     engine._run_cross_exchange_strategy(credentials, config, signal_instrument)
                 else:

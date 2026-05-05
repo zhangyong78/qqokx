@@ -1,4 +1,5 @@
-﻿from decimal import Decimal
+﻿from dataclasses import replace
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock
@@ -6,6 +7,7 @@ from unittest.mock import MagicMock
 from okx_quant.engine import StrategyEngine
 from okx_quant.models import EmailNotificationConfig, StrategyConfig
 from okx_quant.notifications import EmailNotifier
+from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_LONG_ID, STRATEGY_EMA5_EMA8_ID
 
 
 def _make_strategy_config(*, run_mode: str = "trade") -> StrategyConfig:
@@ -262,6 +264,71 @@ class StrategyEngineNotificationTest(TestCase):
         self.assertEqual(notifier.send_signal.call_args.kwargs["direction_label"], "只做多")
         self.assertEqual(notifier.send_signal.call_args.kwargs["run_mode_label"], "交易并下单")
 
+    def test_signal_only_notification_appends_take_profit_mode_line(self) -> None:
+        notifier = MagicMock()
+        engine = StrategyEngine(
+            MagicMock(),
+            lambda message: None,
+            notifier=notifier,
+            strategy_name="EMA 突破做多",
+            session_id="S11",
+        )
+        cfg = replace(
+            _make_strategy_config(run_mode="signal_only"),
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            take_profit_mode="dynamic",
+        )
+        engine._notify_signal(
+            cfg,
+            signal="long",
+            trigger_symbol="ETH-USDT-SWAP",
+            entry_reference=Decimal("2500"),
+            reason="EMA 动态委托参考价已更新",
+        )
+        reason = notifier.send_signal.call_args.kwargs["reason"]
+        self.assertIn("EMA 动态委托参考价已更新", reason)
+        self.assertIn("止盈方式：动态止盈", reason)
+        self.assertIn("2R保本=", reason)
+
+    def test_signal_only_ema5_email_includes_distinct_take_profit_note(self) -> None:
+        notifier = MagicMock()
+        engine = StrategyEngine(
+            MagicMock(),
+            lambda message: None,
+            notifier=notifier,
+            strategy_name="EMA5/8",
+            session_id="S12",
+        )
+        cfg = replace(_make_strategy_config(run_mode="signal_only"), strategy_id=STRATEGY_EMA5_EMA8_ID)
+        engine._notify_signal(
+            cfg,
+            signal="long",
+            trigger_symbol="ETH-USDT-SWAP",
+            entry_reference=Decimal("2500"),
+            reason="金叉",
+        )
+        reason = notifier.send_signal.call_args.kwargs["reason"]
+        self.assertIn("金叉", reason)
+        self.assertIn("慢线 EMA", reason)
+
+    def test_trade_mode_signal_reason_not_appended_with_take_profit_block(self) -> None:
+        notifier = MagicMock()
+        engine = StrategyEngine(
+            MagicMock(),
+            lambda message: None,
+            notifier=notifier,
+            strategy_name="EMA 动态委托",
+            session_id="S13",
+        )
+        engine._notify_signal(
+            _make_strategy_config(run_mode="trade"),
+            signal="long",
+            trigger_symbol="ETH-USDT-SWAP",
+            entry_reference=Decimal("2500"),
+            reason="突破确认",
+        )
+        self.assertEqual(notifier.send_signal.call_args.kwargs["reason"], "突破确认")
+
     def test_signal_notification_formats_entry_reference_by_tick_size(self) -> None:
         notifier = MagicMock()
         engine = StrategyEngine(
@@ -282,6 +349,29 @@ class StrategyEngineNotificationTest(TestCase):
         )
 
         self.assertEqual(notifier.send_signal.call_args.kwargs["entry_reference"], "2500.1")
+
+    def test_trade_fill_notification_formats_price_by_tick_size(self) -> None:
+        notifier = MagicMock()
+        engine = StrategyEngine(
+            MagicMock(),
+            lambda message: None,
+            notifier=notifier,
+            strategy_name="EMA 动态委托",
+            session_id="S09",
+        )
+
+        engine._notify_trade_fill(
+            _make_strategy_config(),
+            title="开仓成交",
+            symbol="ETH-USDT-SWAP",
+            side="buy",
+            size=Decimal("1"),
+            price=Decimal("2366.9692729338256184"),
+            tick_size=Decimal("0.01"),
+            reason="测试成交",
+        )
+
+        self.assertEqual(notifier.send_trade_fill.call_args.kwargs["price"], "2366.97")
 
     def test_trade_error_notification_passes_api_name_to_notifier(self) -> None:
         notifier = MagicMock()

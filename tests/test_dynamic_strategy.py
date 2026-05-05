@@ -42,6 +42,7 @@ class DynamicStrategyTest(TestCase):
             environment="demo",
             tp_sl_trigger_type="mark",
             risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
         )
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)
         self.assertEqual(decision.signal, "long")
@@ -95,6 +96,7 @@ class DynamicStrategyTest(TestCase):
             environment="demo",
             tp_sl_trigger_type="mark",
             risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
         )
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)
         self.assertEqual(decision.signal, "long")
@@ -118,6 +120,7 @@ class DynamicStrategyTest(TestCase):
             environment="demo",
             tp_sl_trigger_type="mark",
             risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
         )
 
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)
@@ -143,6 +146,7 @@ class DynamicStrategyTest(TestCase):
             environment="demo",
             tp_sl_trigger_type="mark",
             risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
         )
 
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)
@@ -169,6 +173,7 @@ class DynamicStrategyTest(TestCase):
             environment="demo",
             tp_sl_trigger_type="mark",
             risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
         )
 
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)
@@ -195,6 +200,7 @@ class DynamicStrategyTest(TestCase):
             environment="demo",
             tp_sl_trigger_type="mark",
             risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
         )
 
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)
@@ -221,6 +227,7 @@ class DynamicStrategyTest(TestCase):
             environment="demo",
             tp_sl_trigger_type="mark",
             risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
         )
 
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)

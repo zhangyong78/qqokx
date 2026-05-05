@@ -28,18 +28,47 @@ from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategy_catalog import (
-    STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
     is_dynamic_strategy_id,
+    is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
 )
 
 
 Logger = Callable[[str], None]
 OKX_SINGLE_REQUEST_MAX_CANDLES = 300
+
+
+def _live_dynamic_take_profit_enabled(config: StrategyConfig) -> bool:
+    """与回测一致：EMA 动态委托与 EMA 突破/跌破在 take_profit_mode=dynamic 时启用动态止盈逻辑。"""
+    if str(config.take_profit_mode or "") != "dynamic":
+        return False
+    return is_dynamic_strategy_id(config.strategy_id) or is_ema_atr_breakout_strategy(config.strategy_id)
+
+
+def _take_profit_mode_description_for_signal_email(config: StrategyConfig) -> str:
+    """仅发信号邮件中附带的止盈方式说明（与当前模板配置一致）。"""
+    sid = str(config.strategy_id or "")
+    if sid == STRATEGY_EMA5_EMA8_ID:
+        return (
+            "止盈止损说明：本策略以快慢线交叉为信号、慢线 EMA 为止损参考；"
+            "与 ATR 固定/动态止盈倍数无关。"
+        )
+    if _live_dynamic_take_profit_enabled(config):
+        return (
+            "止盈方式：动态止盈（若在「交易」模式下按当前模板下单，将按此规则管理出场）| "
+            f"2R保本={config.dynamic_two_r_break_even_label()} | "
+            f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | "
+            f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
+        )
+    return (
+        "止盈方式：固定止盈 | "
+        f"ATR 止盈倍数×{format_decimal(config.atr_take_multiplier)} | "
+        f"ATR 止损倍数×{format_decimal(config.atr_stop_multiplier)}"
+    )
 DEFAULT_DEBUG_ATR_PERIOD = 10
 LIVE_DYNAMIC_MAKER_FEE_RATE = Decimal("0.00015")
 LIVE_DYNAMIC_TAKER_FEE_RATE = Decimal("0.00036")
@@ -326,6 +355,7 @@ class StrategyEngine:
                         size=filled_size,
                         size_text=_format_notify_size_with_unit(instrument, filled_size),
                         price=filled_price,
+                        tick_size=instrument.tick_size,
                         reason="EMA 动态委托出现部分成交，策略停止等待人工处理",
                     )
                     return
@@ -369,7 +399,9 @@ class StrategyEngine:
                     status = cancel_result.status
                     if status is None:
                         raise RuntimeError(f"旧挂单部分成交回查缺少订单状态，ordId={active_order.ord_id}")
-                    self._log_partial_dynamic_fill_and_stop(active_order, status, newest_ts, config)
+                    self._log_partial_dynamic_fill_and_stop(
+                        active_order, status, newest_ts, config, trade_instrument=instrument
+                    )
                     return
                 active_order = None
 
@@ -382,7 +414,7 @@ class StrategyEngine:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
-            decision = strategy.evaluate(confirmed, config)
+            decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
             last_candle_ts = newest_ts
             if decision.signal is None:
                 current_wave_signal = None
@@ -501,6 +533,7 @@ class StrategyEngine:
         instrument: Instrument,
     ) -> None:
         strategy = EmaAtrStrategy()
+        dynamic_stop_only = _live_dynamic_take_profit_enabled(config)
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
@@ -512,7 +545,21 @@ class StrategyEngine:
 
         self._log_strategy_start(config, instrument, instrument)
         self._logger("运行模式：同标的永续下单，止盈止损交给 OKX 托管")
-        self._logger("策略规则：最近一根已收盘 K 线上穿 EMA 做多，下穿 EMA 做空。")
+        self._logger(
+            "策略规则：最近一根已收盘 K 线向上突破参考 EMA 做多（须 EMA 小周期>中周期），"
+            "向下跌破参考 EMA 做空（须 EMA 小周期<中周期）。"
+        )
+        if dynamic_stop_only:
+            self._logger(
+                "止盈方式=动态止盈 | 初始仅挂止损，后续按 2R/3R… 在 OKX 上改价上移；"
+                f"2R保本={config.dynamic_two_r_break_even_label()} | "
+                f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | "
+                f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
+            )
+        else:
+            self._logger(
+                f"止盈方式=固定止盈（ATR×{format_decimal(config.atr_take_multiplier)}）| 开仓时一并挂好止盈止损"
+            )
         self._logger(
             f"方向={_format_signal_mode(config.signal_mode)} | 风险金={format_decimal(config.risk_amount or Decimal('0'))}"
         )
@@ -546,7 +593,7 @@ class StrategyEngine:
                 continue
             last_candle_ts = newest_ts
 
-            decision = strategy.evaluate(confirmed, config)
+            decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
             if decision.signal is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -574,9 +621,11 @@ class StrategyEngine:
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 准备市价单 | 方向={plan.signal.upper()} | "
                 f"参考入场价={format_decimal(plan.entry_reference)} | 数量={_format_size_with_contract_equivalent(instrument, plan.size)} | "
-                f"止损={format_decimal(plan.stop_loss)} | 止盈={format_decimal(plan.take_profit)}"
+                f"止损={format_decimal(plan.stop_loss)} | "
+                f"{'动态止盈=初始不挂止盈' if dynamic_stop_only else f'止盈={format_decimal(plan.take_profit)}'}"
             )
             cl_ord_id = self._next_client_order_id(role="entry")
+            stop_loss_algo_cl_ord_id = self._next_client_order_id(role="slg") if dynamic_stop_only else None
             result = self._submit_order_with_recovery(
                 credentials,
                 config,
@@ -588,6 +637,8 @@ class StrategyEngine:
                     config,
                     plan,
                     cl_ord_id=cl_ord_id,
+                    include_take_profit=not dynamic_stop_only,
+                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
                 ),
             )
             self._logger(
@@ -606,8 +657,14 @@ class StrategyEngine:
             )
             self._logger(
                 f"市价单成交 | ordId={filled.ord_id} | 标的={instrument.inst_id} | "
-                f"方向={filled.side.upper()} | 成交均价={format_decimal(filled.entry_price)} | "
+                f"方向={filled.side.upper()} | "
+                f"成交均价={_format_notify_price_by_tick_size(filled.entry_price, instrument.tick_size)} | "
                 f"成交数量={_format_size_with_contract_equivalent(instrument, filled.size)}"
+            )
+            fill_reason = (
+                "EMA 突破/跌破市价成交：初始止损已交 OKX，后续将按动态止盈规则改价上移"
+                if dynamic_stop_only
+                else "EMA 突破/跌破市价信号成交，止盈止损已交给 OKX 托管"
             )
             self._notify_trade_fill(
                 config,
@@ -617,8 +674,23 @@ class StrategyEngine:
                 size=filled.size,
                 size_text=_format_notify_size_with_unit(instrument, filled.size),
                 price=filled.entry_price,
-                reason="EMA 穿越市价信号成交，止盈止损已交给 OKX 托管",
+                tick_size=instrument.tick_size,
+                reason=fill_reason,
             )
+            if dynamic_stop_only and stop_loss_algo_cl_ord_id:
+                self._logger(
+                    f"初始 OKX 止损已提交 | algoClOrdId={stop_loss_algo_cl_ord_id} | "
+                    f"止损={format_decimal(plan.stop_loss)} | 启动动态上移监控"
+                )
+                self._monitor_exchange_dynamic_stop(
+                    credentials,
+                    config,
+                    trade_instrument=instrument,
+                    position=filled,
+                    initial_stop_loss=plan.stop_loss,
+                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                )
+                return
             self._logger("止盈止损已交由 OKX 托管，本次策略结束。")
             return
 
@@ -641,7 +713,21 @@ class StrategyEngine:
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
         self._log_local_mode_summary(config, signal_instrument, trade_instrument)
-        self._logger("策略规则：最近一根已收盘 K 线上穿 EMA 做多，下穿 EMA 做空，信号出现后立即对下单标的开仓。")
+        self._logger(
+            "策略规则：最近一根已收盘 K 线向上突破参考 EMA 做多（须 EMA 小周期>中周期），"
+            "向下跌破参考 EMA 做空（须 EMA 小周期<中周期）；信号出现后立即对下单标的开仓。"
+        )
+        if _live_dynamic_take_profit_enabled(config):
+            self._logger(
+                "止盈方式=动态止盈 | 本地监控触发价，规则与回测动态止盈一致 | "
+                f"2R保本={config.dynamic_two_r_break_even_label()} | "
+                f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | "
+                f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
+            )
+        else:
+            self._logger(
+                f"止盈方式=固定止盈（ATR×{format_decimal(config.atr_take_multiplier)}）| 本地按触发价监控固定止盈止损"
+            )
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
@@ -670,7 +756,7 @@ class StrategyEngine:
                 continue
             last_candle_ts = newest_ts
 
-            decision = strategy.evaluate(confirmed, config)
+            decision = strategy.evaluate(confirmed, config, price_increment=signal_instrument.tick_size)
             if decision.signal is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -765,7 +851,7 @@ class StrategyEngine:
                 self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                 continue
             if newest_ts != last_candle_ts or active_trigger is None:
-                decision = strategy.evaluate(confirmed, config)
+                decision = strategy.evaluate(confirmed, config, price_increment=signal_instrument.tick_size)
                 last_candle_ts = newest_ts
                 if decision.signal is None:
                     active_trigger = None
@@ -885,7 +971,7 @@ class StrategyEngine:
                 continue
             last_candle_ts = newest_ts
 
-            decision = strategy.evaluate(confirmed, config)
+            decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
             if decision.signal is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无动态委托信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -994,7 +1080,11 @@ class StrategyEngine:
                 self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                 continue
             if newest_ts != last_candle_ts or active_trigger is None:
-                decision = strategy.evaluate(confirmed, replace(config, signal_mode=effective_signal_mode))
+                decision = strategy.evaluate(
+                    confirmed,
+                    replace(config, signal_mode=effective_signal_mode),
+                    price_increment=signal_instrument.tick_size,
+                )
                 last_candle_ts = newest_ts
                 if decision.signal is None:
                     active_trigger = None
@@ -1172,7 +1262,11 @@ class StrategyEngine:
                 continue
             last_candle_ts = newest_ts
 
-            decision = strategy.evaluate(confirmed, replace(config, signal_mode=effective_signal_mode))
+            decision = strategy.evaluate(
+                confirmed,
+                replace(config, signal_mode=effective_signal_mode),
+                price_increment=instrument.tick_size,
+            )
             if decision.signal is None:
                 current_wave_signal = None
                 entries_in_current_wave = 0
@@ -1260,7 +1354,7 @@ class StrategyEngine:
         last_candle_ts: int | None = None
 
         self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
-        self._logger("运行模式：只监控信号，不下单；当 EMA 穿越信号出现时发送邮件通知。")
+        self._logger("运行模式：只监控信号，不下单；当 EMA 突破/跌破信号出现时发送邮件通知。")
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
@@ -1289,7 +1383,7 @@ class StrategyEngine:
                 continue
             last_candle_ts = newest_ts
 
-            decision = strategy.evaluate(confirmed, config)
+            decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
             if decision.signal is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -1311,7 +1405,7 @@ class StrategyEngine:
                 signal_candle_low=decision.signal_candle_low,
             )
             reason = (
-                "EMA 穿越信号已确认"
+                "EMA 突破/跌破信号已确认"
                 f" | 止损={format_decimal(protection.stop_loss)}"
                 f" | 止盈={format_decimal(protection.take_profit)}"
             )
@@ -1359,7 +1453,7 @@ class StrategyEngine:
                 continue
             last_candle_ts = newest_ts
 
-            decision = strategy.evaluate(confirmed, config)
+            decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
             if decision.signal is None or decision.entry_reference is None or decision.ema_value is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无 EMA5/EMA8 交叉信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -1440,7 +1534,7 @@ class StrategyEngine:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
-            decision = strategy.evaluate(confirmed, config)
+            decision = strategy.evaluate(confirmed, config, price_increment=signal_instrument.tick_size)
             if decision.signal is None or decision.entry_reference is None or decision.ema_value is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无 EMA5/EMA8 开仓信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -1504,7 +1598,8 @@ class StrategyEngine:
         )
         self._logger(
             f"EMA 交叉开仓已成交 | ordId={filled.ord_id} | 标的={trade_instrument.inst_id} | "
-            f"方向={trade_side.upper()} | 成交均价={format_decimal(filled.entry_price)} | "
+            f"方向={trade_side.upper()} | "
+            f"成交均价={_format_notify_price_by_tick_size(filled.entry_price, trade_instrument.tick_size)} | "
             f"成交数量={_format_size_with_contract_equivalent(trade_instrument, filled.size)}"
         )
         self._notify_trade_fill(
@@ -1515,6 +1610,7 @@ class StrategyEngine:
             size=filled.size,
             size_text=_format_notify_size_with_unit(trade_instrument, filled.size),
             price=filled.entry_price,
+            tick_size=trade_instrument.tick_size,
             reason=f"EMA{config.ema_period}/EMA{config.trend_ema_period} 交叉信号成交",
         )
         self._logger(f"委托追踪 | clOrdId={filled.cl_ord_id or '-'} | ordId={filled.ord_id}")
@@ -1576,7 +1672,8 @@ class StrategyEngine:
         )
         self._logger(
             f"本地下单成交 | ordId={filled.ord_id} | 标的={trade_instrument.inst_id} | "
-            f"方向={trade_side.upper()} | 成交均价={format_decimal(filled.entry_price)} | "
+            f"方向={trade_side.upper()} | "
+            f"成交均价={_format_notify_price_by_tick_size(filled.entry_price, trade_instrument.tick_size)} | "
             f"成交数量={_format_size_with_contract_equivalent(trade_instrument, filled.size)}"
         )
         self._notify_trade_fill(
@@ -1587,6 +1684,7 @@ class StrategyEngine:
             size=filled.size,
             size_text=_format_notify_size_with_unit(trade_instrument, filled.size),
             price=filled.entry_price,
+            tick_size=trade_instrument.tick_size,
             reason="本地下单成交",
         )
         self._logger(f"委托追踪 | clOrdId={filled.cl_ord_id or '-'} | ordId={filled.ord_id}")
@@ -1619,7 +1717,7 @@ class StrategyEngine:
                 atr_value=signal_atr_value,
                 candle_ts=signal_candle_ts,
                 trigger_inst_id=signal_instrument.inst_id,
-                use_signal_extrema=config.strategy_id == STRATEGY_CROSS_ID,
+                use_signal_extrema=is_ema_atr_breakout_strategy(config.strategy_id),
                 signal_candle_high=signal_candle_high,
                 signal_candle_low=signal_candle_low,
             )
@@ -1663,7 +1761,7 @@ class StrategyEngine:
         position: FilledPosition,
         protection: ProtectionPlan,
     ) -> None:
-        dynamic_take_profit_enabled = is_dynamic_strategy_id(config.strategy_id) and config.take_profit_mode == "dynamic"
+        dynamic_take_profit_enabled = _live_dynamic_take_profit_enabled(config)
         current_stop_loss = protection.stop_loss
         current_take_profit = protection.take_profit
         next_trigger_r = 2
@@ -1773,7 +1871,8 @@ class StrategyEngine:
             remaining -= filled.size
             self._logger(
                 f"本地{reason}平仓已成交 | ordId={filled.ord_id} | 标的={trade_instrument.inst_id} | "
-                f"方向={position.close_side.upper()} | 成交均价={format_decimal(filled.entry_price)} | "
+                f"方向={position.close_side.upper()} | "
+                f"成交均价={_format_notify_price_by_tick_size(filled.entry_price, trade_instrument.tick_size)} | "
                 f"成交数量={_format_size_with_contract_equivalent(trade_instrument, filled.size)} | 剩余={_format_size_with_contract_equivalent(trade_instrument, max(remaining, Decimal('0')))}"
             )
             self._notify_trade_fill(
@@ -1784,6 +1883,7 @@ class StrategyEngine:
                 size=filled.size,
                 size_text=_format_notify_size_with_unit(trade_instrument, filled.size),
                 price=filled.entry_price,
+                tick_size=trade_instrument.tick_size,
                 reason=f"本地{reason}触发后平仓成交",
                 trade_pnl=StrategyEngine._trade_fill_pnl_text_for_close(
                     position,
@@ -2954,7 +3054,8 @@ class StrategyEngine:
         if config.trader_virtual_stop_loss:
             self._logger(
                 f"{_fmt_ts(newest_ts)} | 挂单已成交 | ordId={ord_id} | "
-                f"开仓价={format_decimal(filled_price)} | 数量={_format_size_with_contract_equivalent(trade_instrument, filled_size)}"
+                f"开仓价={_format_notify_price_by_tick_size(filled_price, trade_instrument.tick_size)} | "
+                f"数量={_format_size_with_contract_equivalent(trade_instrument, filled_size)}"
             )
             self._notify_trade_fill(
                 config,
@@ -2964,6 +3065,7 @@ class StrategyEngine:
                 size=filled_size,
                 size_text=_format_notify_size_with_unit(trade_instrument, filled_size),
                 price=filled_price,
+                tick_size=trade_instrument.tick_size,
                 reason="交易员模式已开仓：止损价仅作触发参考，不向 OKX 挂真实止损。",
             )
             position = FilledPosition(
@@ -2990,7 +3092,8 @@ class StrategyEngine:
             return
         self._logger(
             f"{_fmt_ts(newest_ts)} | 挂单已成交 | ordId={ord_id} | "
-            f"开仓价={format_decimal(filled_price)} | 数量={_format_size_with_contract_equivalent(trade_instrument, filled_size)}"
+            f"开仓价={_format_notify_price_by_tick_size(filled_price, trade_instrument.tick_size)} | "
+            f"数量={_format_size_with_contract_equivalent(trade_instrument, filled_size)}"
         )
         fill_reason = (
             "EMA 动态委托已成交，初始止损已交给 OKX 托管，后续将动态上移"
@@ -3005,6 +3108,7 @@ class StrategyEngine:
             size=filled_size,
             size_text=_format_notify_size_with_unit(trade_instrument, filled_size),
             price=filled_price,
+            tick_size=trade_instrument.tick_size,
             reason=fill_reason,
         )
         position = FilledPosition(
@@ -3151,6 +3255,8 @@ class StrategyEngine:
         status: OkxOrderStatus,
         newest_ts: int,
         config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
     ) -> None:
         filled_price = status.avg_price or status.price or active_order.entry_reference
         filled_size = status.filled_size or status.size or active_order.size
@@ -3167,6 +3273,7 @@ class StrategyEngine:
             size=filled_size,
             size_text=_format_notify_size_with_unit(trade_instrument, filled_size),
             price=filled_price,
+            tick_size=trade_instrument.tick_size,
             reason="EMA 动态委托出现部分成交，策略停止等待人工处理",
         )
 
@@ -3244,13 +3351,16 @@ class StrategyEngine:
         if self._notifier is None:
             return
         entry_reference_text = _format_notify_price_by_tick_size(entry_reference, tick_size)
+        reason_for_email = reason
+        if config.run_mode == "signal_only":
+            reason_for_email = f"{reason}\n{_take_profit_mode_description_for_signal_email(config)}"
         self._notifier.send_signal(
             strategy_name=self._strategy_name,
             config=config,
             signal=signal,
             trigger_symbol=trigger_symbol,
             entry_reference=entry_reference_text,
-            reason=reason,
+            reason=reason_for_email,
             api_name=self._api_name,
             session_id=self._session_id,
             trader_id=self._trader_id,
@@ -3268,6 +3378,7 @@ class StrategyEngine:
         size: Decimal,
         size_text: str = "",
         price: Decimal,
+        tick_size: Decimal | None = None,
         reason: str,
         trade_pnl: str = "",
     ) -> None:
@@ -3280,7 +3391,7 @@ class StrategyEngine:
             symbol=symbol,
             side=side,
             size=size_text or format_decimal(size),
-            price=format_decimal(price),
+            price=_format_notify_price_by_tick_size(price, tick_size),
             reason=reason,
             trade_pnl=trade_pnl,
             api_name=self._api_name,
@@ -4041,7 +4152,7 @@ def build_order_plan(
         atr_value=atr_value,
         candle_ts=candle_ts,
         trigger_inst_id=instrument.inst_id,
-        use_signal_extrema=config.strategy_id == STRATEGY_CROSS_ID,
+        use_signal_extrema=is_ema_atr_breakout_strategy(config.strategy_id),
         signal_candle_high=signal_candle_high,
         signal_candle_low=signal_candle_low,
     )

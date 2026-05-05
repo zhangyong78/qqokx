@@ -4,12 +4,19 @@ from decimal import Decimal
 
 from okx_quant.indicators import ema
 from okx_quant.models import Candle, SignalDecision, StrategyConfig
+from okx_quant.pricing import format_strategy_reason_price
 
 
 class EmaCrossEmaStopStrategy:
     name = "ema5_ema8_cross_stop"
 
-    def evaluate(self, candles: list[Candle], config: StrategyConfig) -> SignalDecision:
+    def evaluate(
+        self,
+        candles: list[Candle],
+        config: StrategyConfig,
+        *,
+        price_increment: Decimal | None = None,
+    ) -> SignalDecision:
         minimum = max(config.ema_period, config.trend_ema_period) + 1
         if len(candles) < minimum:
             return SignalDecision(
@@ -27,12 +34,16 @@ class EmaCrossEmaStopStrategy:
         long_cross = previous_fast <= previous_slow and current_fast > current_slow
         short_cross = previous_fast >= previous_slow and current_fast < current_slow
 
+        def px(value: Decimal) -> str:
+            return format_strategy_reason_price(value, price_increment)
+
         if long_cross and config.signal_mode != "short_only":
             return SignalDecision(
                 signal="long",
                 reason=(
                     f"EMA{config.ema_period} 金叉 EMA{config.trend_ema_period}，"
                     f"按最新收盘价开多，EMA{config.trend_ema_period} 作为动态止损线"
+                    f"（收盘={px(current_candle.close)} 慢线={px(current_slow)}）。"
                 ),
                 candle_ts=current_candle.ts,
                 entry_reference=current_candle.close,
@@ -48,6 +59,7 @@ class EmaCrossEmaStopStrategy:
                 reason=(
                     f"EMA{config.ema_period} 死叉 EMA{config.trend_ema_period}，"
                     f"按最新收盘价开空，EMA{config.trend_ema_period} 作为动态止损线"
+                    f"（收盘={px(current_candle.close)} 慢线={px(current_slow)}）。"
                 ),
                 candle_ts=current_candle.ts,
                 entry_reference=current_candle.close,
@@ -61,7 +73,8 @@ class EmaCrossEmaStopStrategy:
             signal=None,
             reason=(
                 f"当前未出现 EMA{config.ema_period}/EMA{config.trend_ema_period} 金叉死叉，"
-                f"上一根快慢线={previous_fast}/{previous_slow}，当前快慢线={current_fast}/{current_slow}"
+                f"上一根快慢线={px(previous_fast)}/{px(previous_slow)}，"
+                f"当前快慢线={px(current_fast)}/{px(current_slow)}"
             ),
             candle_ts=current_candle.ts,
             entry_reference=None,
