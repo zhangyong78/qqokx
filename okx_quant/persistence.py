@@ -33,6 +33,7 @@ HISTORY_CACHE_DIR_NAME = "history"
 HISTORY_ORDER_FILE_NAME = "order_history.json"
 HISTORY_FILLS_FILE_NAME = "fills_history.json"
 HISTORY_POSITIONS_FILE_NAME = "position_history.json"
+POSITION_HISTORY_VIEW_PREFS_FILE_NAME = "position_history_view_prefs.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 PROFILE_ENVIRONMENTS = {"demo", "live"}
 
@@ -200,6 +201,47 @@ def history_cache_dir_path(
 ) -> Path:
     root = Path(base_dir) if base_dir is not None else state_dir_path()
     return root / HISTORY_CACHE_DIR_NAME / _normalize_history_profile_name(profile_name) / _normalize_history_environment(environment)
+
+
+def position_history_view_prefs_file_path(*, base_dir: Path | None = None) -> Path:
+    root = Path(base_dir) if base_dir is not None else state_dir_path()
+    return root / POSITION_HISTORY_VIEW_PREFS_FILE_NAME
+
+
+def load_position_history_view_prefs(path: Path | None = None) -> dict[str, str]:
+    target = path or position_history_view_prefs_file_path()
+    if not target.exists():
+        return {"local_range_start": "", "local_range_end": ""}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"local_range_start": "", "local_range_end": ""}
+    if not isinstance(payload, dict):
+        return {"local_range_start": "", "local_range_end": ""}
+    return {
+        "local_range_start": str(payload.get("local_range_start", "") or ""),
+        "local_range_end": str(payload.get("local_range_end", "") or ""),
+    }
+
+
+def save_position_history_view_prefs(
+    *,
+    local_range_start: str,
+    local_range_end: str,
+    path: Path | None = None,
+) -> Path:
+    target = path or position_history_view_prefs_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 2,
+        "local_range_start": str(local_range_start or ""),
+        "local_range_end": str(local_range_end or ""),
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
 
 
 def history_cache_file_path(

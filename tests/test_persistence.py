@@ -8,6 +8,7 @@ from okx_quant.persistence import (
     history_cache_dir_path,
     history_cache_file_path,
     load_history_cache_records,
+    load_position_history_view_prefs,
     load_credentials_snapshot,
     load_option_strategies_snapshot,
     load_strategy_parameter_drafts,
@@ -17,6 +18,7 @@ from okx_quant.persistence import (
     option_strategies_file_path,
     save_credentials_snapshot,
     save_history_cache_records,
+    save_position_history_view_prefs,
     save_option_strategies_snapshot,
     save_smart_order_favorites_snapshot,
     save_strategy_parameter_drafts,
@@ -370,3 +372,15 @@ class PersistenceTest(TestCase):
         records = load_history_cache_records("orders", "api3", "demo", base_dir=temp_dir)
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["order_id"], "1001")
+
+    def test_save_and_load_position_history_view_prefs(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        target = temp_dir / "position_history_view_prefs.json"
+        save_position_history_view_prefs(
+            local_range_start="2025-01-01",
+            local_range_end="2025-12-31",
+            path=target,
+        )
+        loaded = load_position_history_view_prefs(path=target)
+        self.assertEqual(loaded["local_range_start"], "2025-01-01")
+        self.assertEqual(loaded["local_range_end"], "2025-12-31")

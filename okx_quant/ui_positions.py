@@ -992,7 +992,18 @@ class UiPositionsMixin:
             filter_row,
             textvariable=self._positions_zoom_position_history_search_hint_text,
             foreground="#6b7280",
-        ).grid(row=1, column=8, columnspan=6, sticky="w", pady=(6, 0))
+        ).grid(row=1, column=0, columnspan=14, sticky="w", pady=(6, 0))
+        ttk.Label(filter_row, text="本地开始").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        range_start_entry = ttk.Entry(filter_row, textvariable=self.position_history_range_start, width=12)
+        range_start_entry.grid(row=2, column=1, sticky="w", padx=(6, 8), pady=(6, 0))
+        range_start_entry.bind("<KeyRelease>", self._on_position_history_filter_changed)
+        ttk.Label(filter_row, text="本地结束").grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
+        range_end_entry = ttk.Entry(filter_row, textvariable=self.position_history_range_end, width=12)
+        range_end_entry.grid(row=2, column=3, sticky="w", padx=(6, 12), pady=(6, 0))
+        range_end_entry.bind("<KeyRelease>", self._on_position_history_filter_changed)
+        ttk.Label(filter_row, text="YYYY-MM-DD，默认本年；两端留空则不过滤", foreground="#6b7280").grid(
+            row=2, column=4, columnspan=10, sticky="w", pady=(6, 0)
+        )
         tree_frame = ttk.Frame(parent)
         tree_frame.grid(row=2, column=0, sticky="nsew")
         tree_frame.columnconfigure(0, weight=1)
@@ -1142,7 +1153,7 @@ class UiPositionsMixin:
         self._positions_zoom_position_history_load_more_text.set("增加100条")
         self._fill_history_fetch_limit = 100
         self._fill_history_load_more_clicks = 0
-        self._position_history_fetch_limit = 100
+        self._position_history_fetch_limit = 300
         self._position_history_load_more_clicks = 0
         self._positions_zoom_option_search_hint_text.set("选中期权后，可一键带入合约或到期前缀。")
         self._positions_zoom_position_history_search_hint_text.set("选中历史期权后，可一键带入合约或到期前缀。")
@@ -2997,8 +3008,11 @@ class UiPositionsMixin:
         tree = self._positions_zoom_position_history_tree
         selected_before = tree.selection()[0] if tree.selection() else None
         tree.delete(*tree.get_children())
-        filtered_items = _filter_position_history_items(
-            self._latest_position_history,
+        start_d = _parse_position_history_local_date(self.position_history_range_start.get())
+        end_d = _parse_position_history_local_date(self.position_history_range_end.get())
+        if start_d is not None and end_d is not None and start_d > end_d:
+            start_d, end_d = end_d, start_d
+        filter_kwargs = dict(
             inst_type=POSITION_TYPE_OPTIONS.get(self.position_history_type_filter.get(), ""),
             margin_mode=HISTORY_MARGIN_MODE_FILTER_OPTIONS.get(self.position_history_margin_filter.get(), ""),
             asset=self.position_history_asset_filter.get(),
@@ -3006,6 +3020,20 @@ class UiPositionsMixin:
             keyword=self.position_history_keyword.get(),
             note_texts_by_index=self._position_history_note_text_map_by_index(),
         )
+        date_range_active = start_d is not None or end_d is not None
+        without_date_range = _filter_position_history_items(
+            self._latest_position_history,
+            **filter_kwargs,
+            range_start_local=None,
+            range_end_local=None,
+        )
+        filtered_items = _filter_position_history_items(
+            self._latest_position_history,
+            **filter_kwargs,
+            range_start_local=start_d,
+            range_end_local=end_d,
+        )
+        excluded_outside_range = (len(without_date_range) - len(filtered_items)) if date_range_active else 0
         for index, item in filtered_items:
             iid = f"ph-{index}"
             tree.insert(
@@ -3032,25 +3060,30 @@ class UiPositionsMixin:
                 tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
             )
         summary = self._positions_zoom_position_history_base_summary
-        if (
+        any_position_history_filter = bool(
             POSITION_TYPE_OPTIONS.get(self.position_history_type_filter.get(), "")
             or HISTORY_MARGIN_MODE_FILTER_OPTIONS.get(self.position_history_margin_filter.get(), "")
             or self.position_history_asset_filter.get().strip()
             or self.position_history_expiry_prefix_filter.get().strip()
             or self.position_history_keyword.get().strip()
-        ):
+            or date_range_active
+        )
+        if any_position_history_filter:
             summary = f"{summary} | 当前显示：{len(filtered_items)}/{len(self._latest_position_history)}"
+        if excluded_outside_range:
+            summary = f"{summary} | 日期范围外 {excluded_outside_range} 条未显示"
         if (
             POSITION_TYPE_OPTIONS.get(self.position_history_type_filter.get(), "")
             or HISTORY_MARGIN_MODE_FILTER_OPTIONS.get(self.position_history_margin_filter.get(), "")
             or self.position_history_asset_filter.get().strip()
             or self.position_history_expiry_prefix_filter.get().strip()
             or self.position_history_keyword.get().strip()
+            or date_range_active
         ):
             summary = (
                 f"{self._positions_zoom_position_history_base_summary} | \u5f53\u524d\u663e\u793a\uff1a{len(filtered_items)}/{len(self._latest_position_history)}"
-                f"\n\u7b5b\u9009\u7edf\u8ba1\uff1a"
-                f"{_format_position_history_filter_stats(filtered_items, self._position_history_usdt_prices)}"
+                + (f" | \u65e5\u671f\u8303\u56f4\u5916 {excluded_outside_range} \u6761\u672a\u663e\u793a" if excluded_outside_range else "")
+                + f"\n\u7b5b\u9009\u7edf\u8ba1\uff1a{_format_position_history_filter_stats(filtered_items, self._position_history_usdt_prices)}"
             )
         self._positions_zoom_position_history_summary_text.set(summary)
         if selected_before and tree.exists(selected_before):
@@ -3076,6 +3109,9 @@ class UiPositionsMixin:
         self.position_history_asset_filter.set("")
         self.position_history_expiry_prefix_filter.set("")
         self.position_history_keyword.set("")
+        range_start, range_end = _default_position_history_local_year_range_strings()
+        self.position_history_range_start.set(range_start)
+        self.position_history_range_end.set(range_end)
         self._render_positions_zoom_position_history_view()
 
     def _on_positions_zoom_position_history_selected(self, *_: object) -> None:

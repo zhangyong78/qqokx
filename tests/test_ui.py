@@ -44,6 +44,7 @@ from okx_quant.ui import (
     _build_fixed_order_size_hint_text,
     _coerce_log_file_path,
     _filter_position_history_items,
+    _parse_position_history_local_date,
     _filter_positions,
     _format_network_error_message,
     _format_okx_ms_timestamp,
@@ -3545,6 +3546,30 @@ class PositionNotesLifecycleTest(TestCase):
         )
 
         self.assertEqual(len(filtered), 1)
+
+    def test_parse_position_history_local_date(self) -> None:
+        self.assertIsNone(_parse_position_history_local_date(""))
+        self.assertIsNone(_parse_position_history_local_date("not-a-date"))
+        from datetime import date as date_cls
+
+        self.assertEqual(_parse_position_history_local_date(" 2025-01-01 "), date_cls(2025, 1, 1))
+
+    def test_filter_position_history_items_local_date_range_inclusive(self) -> None:
+        from datetime import date as date_cls
+        from datetime import datetime
+
+        d0 = int(datetime(2024, 12, 31, 12, 0, 0).timestamp() * 1000)
+        d1 = int(datetime(2025, 1, 2, 12, 0, 0).timestamp() * 1000)
+        a = self._make_position_history(update_time=d0)
+        b = self._make_position_history(update_time=d1, inst_id="BTC-USD-260501-78000-C")
+
+        filtered = _filter_position_history_items(
+            [a, b],
+            range_start_local=date_cls(2025, 1, 1),
+            range_end_local=date_cls(2025, 12, 31),
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0][1].inst_id, b.inst_id)
 
     def test_format_position_note_summary_truncates_multi_line_notes(self) -> None:
         summary = _format_position_note_summary("第一行\n第二行 gamma 观察", limit=10)

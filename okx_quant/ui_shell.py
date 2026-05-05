@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 import uuid
 from dataclasses import MISSING, asdict, dataclass, field, fields as dataclass_fields, replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from types import FunctionType
@@ -86,6 +86,7 @@ from okx_quant.persistence import (
     credentials_file_path,
     DEFAULT_CREDENTIAL_PROFILE_NAME,
     load_history_cache_records,
+    load_position_history_view_prefs,
     load_recoverable_strategy_sessions_snapshot,
     load_credentials_profiles_snapshot,
     load_notification_snapshot,
@@ -98,6 +99,7 @@ from okx_quant.persistence import (
     save_credentials_profiles_snapshot,
     save_notification_snapshot,
     save_history_cache_records,
+    save_position_history_view_prefs,
     save_line_trading_desk_annotations_entries,
     save_position_notes_snapshot,
     save_strategy_parameter_drafts,
@@ -2236,7 +2238,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._positions_zoom_position_history_base_summary = "历史仓位尚未读取。"
         self._fill_history_fetch_limit = 100
         self._fill_history_load_more_clicks = 0
-        self._position_history_fetch_limit = 100
+        self._position_history_fetch_limit = 300
         self._position_history_load_more_clicks = 0
         self._positions_zoom_summary_text = StringVar(value="当前尚未获取持仓。")
         self._positions_zoom_option_search_hint_text = StringVar(
@@ -2396,6 +2398,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.position_history_asset_filter = StringVar()
         self.position_history_expiry_prefix_filter = StringVar()
         self.position_history_keyword = StringVar()
+        self.position_history_range_start = StringVar(value="")
+        self.position_history_range_end = StringVar(value="")
         self.position_refresh_interval_label = StringVar(value="15秒")
         self.position_auto_refresh_button_text = StringVar(value="暂停自动刷新")
         self.position_auto_refresh_enabled = True
@@ -2497,10 +2501,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._settings_watch_enabled = False
         self._settings_save_job: str | None = None
         self._last_saved_notification_state: tuple[object, ...] | None = None
+        self._position_history_view_prefs_save_job: str | None = None
+        self._last_saved_position_history_view_prefs: tuple[str, str] | None = None
 
         self._load_saved_credentials()
         self._load_saved_notification_settings()
         self._load_position_notes()
+        self._load_position_history_view_prefs()
         self._line_trading_desk_annotation_entries: dict[str, dict[str, object]] = {}
         try:
             self._line_trading_desk_annotation_entries = load_line_trading_desk_annotations_entries()
@@ -5157,6 +5164,49 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._apply_profile_environment(self._current_credential_profile())
         self._last_saved_notification_state = self._current_notification_state()
 
+    def _load_position_history_view_prefs(self) -> None:
+        try:
+            snapshot = load_position_history_view_prefs()
+        except Exception as exc:
+            self._enqueue_log(f"读取历史仓位日期筛选配置失败：{exc}")
+            snapshot = {"local_range_start": "", "local_range_end": ""}
+        start = str(snapshot.get("local_range_start", "") or "")
+        end = str(snapshot.get("local_range_end", "") or "")
+        if not start.strip() and not end.strip():
+            start, end = _default_position_history_local_year_range_strings()
+        self.position_history_range_start.set(start)
+        self.position_history_range_end.set(end)
+        self._last_saved_position_history_view_prefs = (start, end)
+
+    def _schedule_save_position_history_view_prefs(self, *_: str) -> None:
+        if self._position_history_view_prefs_save_job is not None:
+            try:
+                self.root.after_cancel(self._position_history_view_prefs_save_job)
+            except Exception:
+                pass
+            self._position_history_view_prefs_save_job = None
+        self._position_history_view_prefs_save_job = self.root.after(800, self._save_position_history_view_prefs_now)
+
+    def _save_position_history_view_prefs_now(self) -> None:
+        if self._position_history_view_prefs_save_job is not None:
+            try:
+                self.root.after_cancel(self._position_history_view_prefs_save_job)
+            except Exception:
+                pass
+            self._position_history_view_prefs_save_job = None
+        current = (self.position_history_range_start.get(), self.position_history_range_end.get())
+        if current == self._last_saved_position_history_view_prefs:
+            return
+        try:
+            save_position_history_view_prefs(
+                local_range_start=current[0],
+                local_range_end=current[1],
+            )
+        except Exception as exc:
+            self._enqueue_log(f"保存历史仓位日期筛选失败：{exc}")
+            return
+        self._last_saved_position_history_view_prefs = current
+
     def _load_position_notes(self) -> None:
         try:
             snapshot = load_position_notes_snapshot()
@@ -5211,6 +5261,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self.notify_errors,
         ):
             variable.trace_add("write", self._on_notification_settings_changed)
+        self.position_history_range_start.trace_add("write", self._schedule_save_position_history_view_prefs)
+        self.position_history_range_end.trace_add("write", self._schedule_save_position_history_view_prefs)
         self._settings_watch_enabled = True
 
     def _on_credentials_changed(self, *_: str) -> None:
@@ -11847,6 +11899,51 @@ def _history_tree_index(item_id: str, prefix: str) -> int | None:
         return None
 
 
+def _default_position_history_local_year_range_strings() -> tuple[str, str]:
+    today = datetime.now().date()
+    start = date(today.year, 1, 1)
+    end = date(today.year, 12, 31)
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+
+def _parse_position_history_local_date(raw: str) -> date | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _position_history_local_date(update_time: int | None) -> date | None:
+    normalized = _normalize_okx_timestamp_ms(update_time)
+    if normalized is None:
+        return None
+    try:
+        return datetime.fromtimestamp(normalized / 1000).date()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _position_history_in_local_date_range(
+    item: OkxPositionHistoryItem,
+    *,
+    range_start_local: date | None,
+    range_end_local: date | None,
+) -> bool:
+    if range_start_local is None and range_end_local is None:
+        return True
+    local_d = _position_history_local_date(getattr(item, "update_time", None))
+    if local_d is None:
+        return True
+    if range_start_local is not None and local_d < range_start_local:
+        return False
+    if range_end_local is not None and local_d > range_end_local:
+        return False
+    return True
+
+
 def _filter_position_history_items(
     items: list[OkxPositionHistoryItem],
     *,
@@ -11856,6 +11953,8 @@ def _filter_position_history_items(
     expiry_prefix: str = "",
     keyword: str = "",
     note_texts_by_index: dict[int, str] | None = None,
+    range_start_local: date | None = None,
+    range_end_local: date | None = None,
 ) -> list[tuple[int, OkxPositionHistoryItem]]:
     normalized_inst_type = inst_type.strip().upper()
     normalized_margin_mode = margin_mode.strip().lower()
@@ -11888,6 +11987,12 @@ def _filter_position_history_items(
             ).lower()
             if normalized_keyword not in haystack:
                 continue
+        if not _position_history_in_local_date_range(
+            item,
+            range_start_local=range_start_local,
+            range_end_local=range_end_local,
+        ):
+            continue
         filtered.append((index, item))
     return filtered
 
