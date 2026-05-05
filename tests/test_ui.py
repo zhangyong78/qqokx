@@ -190,6 +190,66 @@ class UiHelpersTest(TestCase):
         # `_line_trading_desk_dual_log` receives the detail line; prefix is added inside that method via `_enqueue_log`.
         self.assertIn("已刷新历史委托 | BTC-USDT-SWAP | 2 条", calls)
 
+    def test_line_trading_desk_complete_draw_refreshes_ray_tree_immediately(self) -> None:
+        calls: list[str] = []
+        state = SimpleNamespace(
+            active_tool="line",
+            draft_line_start=(10.0, 20.0),
+            last_snapshot=SimpleNamespace(candles=(object(), object(), object())),
+            line_annotations=[],
+            rr_annotations=[],
+            status_text=_Var(""),
+            param_ray_action=_Var("open_long"),
+            param_rr_r=_Var("2"),
+            param_rr_side=_Var("long"),
+        )
+        app = SimpleNamespace(
+            _line_trading_desk_pixel_to_bar_price=lambda st, x, y: (
+                (1.0, Decimal("100")) if float(x) <= 10.0 else (2.0, Decimal("110"))
+            ),
+            _line_trading_desk_format_price=lambda st, value: str(value),
+            _line_trading_desk_dual_log=lambda st, msg: calls.append(f"log:{msg}"),
+            _line_trading_desk_refresh_ray_tree=lambda st: calls.append("refresh-ray"),
+            _line_trading_desk_schedule_annotation_persist=lambda st: calls.append("persist"),
+        )
+
+        QuantApp._line_trading_desk_complete_draw(app, state, 40.0, 70.0)
+
+        self.assertEqual(len(state.line_annotations), 1)
+        self.assertIn("refresh-ray", calls)
+        self.assertEqual(calls[-1], "persist")
+
+    def test_line_trading_desk_complete_draw_rr_schedules_persist(self) -> None:
+        calls: list[str] = []
+        state = SimpleNamespace(
+            active_tool="rr",
+            draft_line_start=(10.0, 20.0),
+            last_snapshot=SimpleNamespace(candles=(object(), object(), object())),
+            line_annotations=[],
+            rr_annotations=[],
+            rr_selected_id=None,
+            status_text=_Var(""),
+            param_ray_action=_Var("open_long"),
+            param_rr_r=_Var("2"),
+            param_rr_side=_Var("long"),
+        )
+        app = SimpleNamespace(
+            _line_trading_desk_pixel_to_bar_price=lambda st, x, y: (
+                (1.0, Decimal("100")) if float(y) <= 20.0 else (2.0, Decimal("95"))
+            ),
+            _line_trading_desk_format_price=lambda st, value: str(value),
+            _line_trading_desk_dual_log=lambda st, msg: calls.append(f"log:{msg}"),
+            _line_trading_desk_refresh_rr_tree=lambda st: calls.append("refresh-rr"),
+            _line_trading_desk_schedule_annotation_persist=lambda st: calls.append("persist"),
+        )
+
+        QuantApp._line_trading_desk_complete_draw(app, state, 30.0, 60.0)
+
+        self.assertEqual(len(state.rr_annotations), 1)
+        self.assertIsNotNone(state.rr_selected_id)
+        self.assertIn("refresh-rr", calls)
+        self.assertEqual(calls[-1], "persist")
+
     def test_format_network_error_message_read_timeout(self) -> None:
         self.assertEqual(
             _format_network_error_message("The read operation timed out"),

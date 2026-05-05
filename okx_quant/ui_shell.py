@@ -7541,6 +7541,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 state,
                 f"线 | 止损 | 参考价={self._line_trading_desk_format_price(state, avg_p)}",
             )
+            self._line_trading_desk_schedule_annotation_persist(state)
             return
         if tool == "rr":
             try:
@@ -7594,6 +7595,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 f"盈亏比 | {side} | 入={self._line_trading_desk_format_price(state, entry_p)} | "
                 f"损={self._line_trading_desk_format_price(state, stop_p)} | 盈={self._line_trading_desk_format_price(state, tp_p)} | R={format_decimal(r_mult)}",
             )
+            self._line_trading_desk_schedule_annotation_persist(state)
             return
         if tool == "line":
             # 趋势线需明显拖拽，单击易误出一条短线；水平射线仍可「点两下」极小位移即成。
@@ -7634,6 +7636,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             f"线 | {label} | 默认动作={_LINE_DESK_RAY_ACTION_LABEL_ZH.get(ray_action, ray_action)} | "
             f"端点价={self._line_trading_desk_format_price(state, price_a)}→{self._line_trading_desk_format_price(state, price_b)}",
         )
+        self._line_trading_desk_refresh_ray_tree(state)
+        self._line_trading_desk_schedule_annotation_persist(state)
 
     def _line_trading_desk_ray_horizontal_price_text(
         self, state: LineTradingDeskWindowState, ann: LiveChartLineAnnotation
