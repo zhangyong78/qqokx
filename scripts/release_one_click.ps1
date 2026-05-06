@@ -11,6 +11,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location -LiteralPath $repoRoot
 $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 function U([string]$s) {
     return [regex]::Unescape($s)
@@ -45,8 +46,38 @@ function Update-TextFile([string]$Path, [scriptblock]$Updater) {
     }
 }
 
+function Invoke-GitUtf8([string[]]$Arguments) {
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = "git"
+    $psi.Arguments = (($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') {
+            '"' + ($_ -replace '"', '\"') + '"'
+        }
+        else {
+            $_
+        }
+    }) -join ' ')
+    $psi.WorkingDirectory = $repoRoot
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = $utf8NoBom
+    $psi.StandardErrorEncoding = $utf8NoBom
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+
+    if ($process.ExitCode -ne 0) {
+        $message = if ([string]::IsNullOrWhiteSpace($stderr)) { $stdout } else { $stderr }
+        throw ("git " + ($Arguments -join " ") + " failed: " + $message.Trim())
+    }
+    return $stdout
+}
+
 function Get-ChangedFiles {
-    $raw = git ls-files -m -o --exclude-standard -z
+    $raw = Invoke-GitUtf8 @('-c', 'core.quotepath=false', 'ls-files', '-m', '-o', '--exclude-standard', '-z')
     if (-not $raw) {
         return @()
     }
@@ -108,7 +139,7 @@ function Build-ReleaseSummary([string[]]$Files, [string]$VersionText, [string]$B
     $summary += "### v$VersionText | $(Get-Date -Format 'yyyy-MM-dd') | $($topics -join '、')"
     foreach ($topic in $topics) { $summary += "- $topic" }
     $summary += "- 相关文件：$fileList"
-    $summary += "- 本次按 `$BumpLevel` 级别处理，版本已递进到 `v$VersionText`。"
+    $summary += "- 本次按 ``$BumpLevel`` 级别处理，版本已递进到 ``v$VersionText``。"
     if (-not [string]::IsNullOrWhiteSpace($CommitMessageText)) { $summary += "- 提交说明：$CommitMessageText" }
     return ($summary -join "`r`n")
 }

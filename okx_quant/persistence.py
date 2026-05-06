@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -31,6 +32,7 @@ STRATEGY_PARAMETER_GLOBAL_DEFAULTS_FILE_NAME = "strategy_parameter_global_defaul
 STRATEGY_PARAMETER_DRAFTS_FILE_NAME = "strategy_parameter_drafts.json"
 LINE_TRADING_DESK_ANNOTATIONS_FILE_NAME = "line_trading_desk_annotations.json"
 JOURNAL_ENTRIES_FILE_NAME = "journal_entries.json"
+BTC_RESEARCH_WORKBENCH_STATE_FILE_NAME = "btc_research_workbench_state.json"
 HISTORY_CACHE_DIR_NAME = "history"
 HISTORY_ORDER_FILE_NAME = "order_history.json"
 HISTORY_FILLS_FILE_NAME = "fills_history.json"
@@ -151,6 +153,14 @@ def journal_entries_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / JOURNAL_ENTRIES_FILE_NAME if base_dir is not None else state_dir_path() / JOURNAL_ENTRIES_FILE_NAME
 
 
+def btc_research_workbench_state_file_path(base_dir: Path | None = None) -> Path:
+    return (
+        Path(base_dir) / BTC_RESEARCH_WORKBENCH_STATE_FILE_NAME
+        if base_dir is not None
+        else state_dir_path() / BTC_RESEARCH_WORKBENCH_STATE_FILE_NAME
+    )
+
+
 def load_line_trading_desk_annotations_entries(path: Path | None = None) -> dict[str, dict[str, object]]:
     """返回 { \"api|INST|bar\": {\"lines\": [...], \"rr\": [...]} }。条目为浅拷贝 dict，调用方可就地修改。"""
     target = path or line_trading_desk_annotations_file_path()
@@ -255,6 +265,54 @@ def save_journal_entries_snapshot(entries: list[dict[str, object]], path: Path |
     temp_path = target.with_suffix(target.suffix + ".tmp")
     temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temp_path.replace(target)
+    return target
+
+
+def load_btc_research_workbench_state(path: Path | None = None) -> dict[str, object]:
+    target = path or btc_research_workbench_state_file_path()
+    if not target.exists():
+        return {"drawings": {}, "viewports": {}}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"drawings": {}, "viewports": {}}
+    if not isinstance(payload, dict):
+        return {"drawings": {}, "viewports": {}}
+    drawings = payload.get("drawings")
+    viewports = payload.get("viewports")
+    return {
+        "drawings": dict(drawings) if isinstance(drawings, dict) else {},
+        "viewports": dict(viewports) if isinstance(viewports, dict) else {},
+    }
+
+
+def save_btc_research_workbench_state(snapshot: dict[str, object], path: Path | None = None) -> Path:
+    target = path or btc_research_workbench_state_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "drawings": dict(snapshot.get("drawings", {})) if isinstance(snapshot, dict) else {},
+        "viewports": dict(snapshot.get("viewports", {})) if isinstance(snapshot, dict) else {},
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    raw_text = json.dumps(payload, ensure_ascii=False, indent=2)
+    last_error: PermissionError | None = None
+    for _attempt in range(4):
+        try:
+            temp_path.write_text(raw_text, encoding="utf-8")
+            temp_path.replace(target)
+            return target
+        except PermissionError as exc:
+            last_error = exc
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+            time.sleep(0.05)
+    if last_error is not None:
+        raise last_error
     return target
 
 

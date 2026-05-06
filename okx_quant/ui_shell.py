@@ -22,6 +22,7 @@ from tkinter import messagebox, ttk
 from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
 from okx_quant.backtest_ui import BacktestCompareOverviewWindow, BacktestLaunchState, BacktestWindow
 from okx_quant.btc_market_analysis_ui import BtcMarketAnalysisWindow
+from okx_quant.btc_research_workbench_ui import BtcResearchWorkbenchWindow
 from okx_quant.deribit_client import DeribitRestClient
 from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
@@ -2109,6 +2110,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._backtest_window: BacktestWindow | None = None
         self._backtest_compare_window: BacktestCompareOverviewWindow | None = None
         self._btc_market_analysis_window: BtcMarketAnalysisWindow | None = None
+        self._btc_research_workbench_window: BtcResearchWorkbenchWindow | None = None
         self._journal_window: JournalWindow | None = None
         self._signal_monitor_window: SignalMonitorWindow | None = None
         self._trader_desk_window: TraderDeskWindow | None = None
@@ -2663,6 +2665,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         tools_menu.add_command(label="打开回测窗口", command=self.open_backtest_window)
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
         tools_menu.add_command(label="打开BTC行情分析", command=self.open_btc_market_analysis_window)
+        tools_menu.add_command(label="打开BTC研究工作台", command=self.open_btc_research_workbench_window)
         tools_menu.add_command(label="打开行情日记", command=self.open_journal_window)
         tools_menu.add_command(label="打开划线交易台", command=self.open_line_trading_desk_window)
         tools_menu.add_command(label="打开信号观察台", command=self.open_signal_monitor_window)
@@ -4858,6 +4861,21 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             session_deleter=self._delete_signal_observer_sessions_by_id,
             session_log_opener=self.open_strategy_session_log,
             session_chart_opener=self.open_strategy_live_chart_window,
+        )
+
+    def open_btc_research_workbench_window(self) -> None:
+        if (
+            self._btc_research_workbench_window is not None
+            and self._btc_research_workbench_window.window.winfo_exists()
+        ):
+            self._btc_research_workbench_window.show()
+            return
+
+        self._btc_research_workbench_window = BtcResearchWorkbenchWindow(
+            self.root,
+            client=self.client,
+            deribit_client=self.deribit_client,
+            logger=self._enqueue_log,
         )
 
     def open_journal_window(self) -> None:
@@ -9685,6 +9703,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             and self._btc_market_analysis_window.window.winfo_exists()
         ):
             self._btc_market_analysis_window.destroy()
+        if (
+            self._btc_research_workbench_window is not None
+            and self._btc_research_workbench_window.window.winfo_exists()
+        ):
+            self._btc_research_workbench_window.destroy()
         if self._journal_window is not None and self._journal_window.window.winfo_exists():
             self._journal_window.destroy()
         if self._signal_monitor_window is not None and self._signal_monitor_window.window.winfo_exists():

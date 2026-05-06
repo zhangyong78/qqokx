@@ -5,9 +5,12 @@ from unittest import TestCase
 from uuid import uuid4
 
 from okx_quant.journal import (
+    JournalResearchSample,
+    build_research_sample_prompt,
     create_journal_entry,
     extract_journal_locally,
     parse_ai_extraction_paste,
+    parse_research_sample_paste,
 )
 from okx_quant.persistence import (
     journal_entries_file_path,
@@ -67,6 +70,150 @@ class JournalTest(TestCase):
         self.assertEqual(result.entry_zone_price, Decimal("62500"))
         self.assertEqual(result.invalidation_price, Decimal("61500"))
         self.assertEqual(result.review_questions, ("止跌形态如何确认？",))
+
+    def test_parse_ai_extraction_paste_accepts_full_research_sample(self) -> None:
+        result = parse_ai_extraction_paste(
+            """
+            {
+              "record_type": "market_view",
+              "symbol": "BTC-USDT-SWAP",
+              "timeframe": "1D",
+              "related_timeframes": ["4H"],
+              "market_phase": "trend_up",
+              "title": "日线看涨三天，出现看跌吞没则失效",
+              "raw_summary": "BTC日线看涨三天，近期创出两个月新高；如果日线出现阴线反包阳线则失效。",
+              "bias": "long",
+              "confidence": 0.64,
+              "priority": "medium",
+              "hypothesis": {
+                "type": "directional_view",
+                "statement": "基于日线走强并创出近两个月新高，未来三天行情更偏向延续看涨。"
+              },
+              "execution_plan": {
+                "intended_action": "observe",
+                "position_style": "unknown",
+                "position_size_note": "",
+                "entry_idea": "",
+                "trigger_conditions": [],
+                "invalidation_conditions": [
+                  {
+                    "type": "pattern_confirmation",
+                    "text": "日线出现看跌吞没（阴线反包阳线）则失效",
+                    "value": ""
+                  }
+                ],
+                "targets": [],
+                "risk_notes": "当前属于方向判断，不直接等同于具体交易执行。"
+              },
+              "observation": {
+                "key_levels": [],
+                "structure_notes": "日线偏强，近期创出两个月新高。",
+                "volatility_notes": "",
+                "program_disagreement_note": ""
+              },
+              "verification_plan": {
+                "status": "pending",
+                "verification_type": "market_outcome",
+                "success_criteria": ["未来三天整体走势维持偏强"],
+                "failure_criteria": ["未来三天内日线出现看跌吞没"],
+                "review_windows": ["3D"]
+              },
+              "method_tags": ["日线结构", "看跌吞没", "价格行为"],
+              "review_questions": ["看跌吞没是否只看实体反包？"],
+              "attachments": [],
+              "notes_for_me": ""
+            }
+            """
+        )
+
+        self.assertEqual(result.source, "ai_paste")
+        self.assertEqual(result.symbol, "BTC")
+        self.assertEqual(result.inst_id, "BTC-USDT-SWAP")
+        self.assertEqual(result.timeframes, ("1D", "4H"))
+        self.assertEqual(result.bias, "long")
+        self.assertEqual(result.planned_action, "observe")
+        self.assertIn("看跌吞没", result.invalidation_text)
+        self.assertEqual(result.raw_payload["record_type"], "market_view")
+        self.assertEqual(result.raw_payload["verification_plan"]["review_windows"], ["3D"])
+
+    def test_research_sample_round_trips_structured_fields(self) -> None:
+        sample = JournalResearchSample.from_dict(
+            {
+                "record_type": "market_view",
+                "symbol": "BTC-USDT-SWAP",
+                "timeframe": "1D",
+                "related_timeframes": ["4H"],
+                "market_phase": "trend_up",
+                "title": "daily bullish view",
+                "raw_summary": "daily structure stays bullish for three days",
+                "bias": "long",
+                "confidence": 0.64,
+                "priority": "medium",
+                "hypothesis": {"type": "directional_view", "statement": "new two-month high supports upside"},
+                "execution_plan": {
+                    "intended_action": "observe",
+                    "position_style": "unknown",
+                    "position_size_note": "",
+                    "entry_idea": "",
+                    "trigger_conditions": [],
+                    "invalidation_conditions": [
+                        {"type": "pattern_confirmation", "text": "daily bearish engulfing invalidates", "value": ""}
+                    ],
+                    "targets": [],
+                    "risk_notes": "not a direct trade plan",
+                },
+                "observation": {"key_levels": [], "structure_notes": "two-month high"},
+                "verification_plan": {
+                    "status": "pending",
+                    "verification_type": "market_outcome",
+                    "success_criteria": ["trend remains strong"],
+                    "failure_criteria": ["bearish engulfing appears"],
+                    "review_windows": ["3D"],
+                },
+                "method_tags": ["price_action"],
+                "review_questions": ["define bearish engulfing body/wick rule"],
+                "attachments": [],
+                "notes_for_me": "",
+            }
+        )
+
+        payload = sample.to_dict()
+
+        self.assertEqual(sample.record_type, "market_view")
+        self.assertEqual(sample.symbol, "BTC-USDT-SWAP")
+        self.assertEqual(sample.execution_plan.intended_action, "observe")
+        self.assertEqual(sample.execution_plan.invalidation_conditions[0].text, "daily bearish engulfing invalidates")
+        self.assertEqual(payload["verification_plan"]["review_windows"], ["3D"])
+
+    def test_parse_research_sample_paste_returns_full_sample(self) -> None:
+        sample = parse_research_sample_paste(
+            """
+            {
+              "record_type": "research_hypothesis",
+              "symbol": "BTC",
+              "timeframe": "4H",
+              "bias": "mixed",
+              "hypothesis": {"type": "method_hypothesis", "statement": "volatility expansion changes signal quality"},
+              "execution_plan": {"intended_action": "none"},
+              "verification_plan": {"status": "pending", "review_windows": ["20 bars"]},
+              "method_tags": ["volatility"]
+            }
+            """
+        )
+
+        self.assertEqual(sample.record_type, "research_hypothesis")
+        self.assertEqual(sample.symbol, "BTC")
+        self.assertEqual(sample.bias, "mixed")
+        self.assertEqual(sample.execution_plan.intended_action, "none")
+        self.assertEqual(sample.verification_plan.review_windows, ("20 bars",))
+
+    def test_build_research_sample_prompt_uses_full_schema(self) -> None:
+        prompt = build_research_sample_prompt("BTC 日线看涨三天")
+
+        self.assertIn("record_type", prompt)
+        self.assertIn("verification_plan", prompt)
+        self.assertIn("review_questions", prompt)
+        self.assertIn("BTC 日线看涨三天", prompt)
 
     def test_save_and_load_journal_entries_snapshot(self) -> None:
         temp_path = journal_entries_file_path(self._workspace_temp_dir())

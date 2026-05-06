@@ -4,9 +4,11 @@ from unittest import TestCase
 from uuid import uuid4
 
 from okx_quant.persistence import (
+    btc_research_workbench_state_file_path,
     credentials_file_path,
     history_cache_dir_path,
     history_cache_file_path,
+    load_btc_research_workbench_state,
     load_history_cache_records,
     load_position_history_view_prefs,
     load_credentials_snapshot,
@@ -16,6 +18,7 @@ from okx_quant.persistence import (
     load_strategy_history_snapshot,
     load_strategy_trade_ledger_snapshot,
     option_strategies_file_path,
+    save_btc_research_workbench_state,
     save_credentials_snapshot,
     save_history_cache_records,
     save_position_history_view_prefs,
@@ -46,6 +49,42 @@ class PersistenceTest(TestCase):
         self.assertEqual(snapshot["api_key"], "ak")
         self.assertEqual(snapshot["secret_key"], "sk")
         self.assertEqual(snapshot["passphrase"], "pp")
+
+    def test_save_and_load_btc_research_workbench_state(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        temp_path = btc_research_workbench_state_file_path(temp_dir)
+        save_btc_research_workbench_state(
+            {
+                "drawings": {
+                    "BTC-USDT-SWAP|4H": [
+                        {
+                            "tool": "trend_line",
+                            "start_index": 12,
+                            "end_index": 24,
+                            "price_a": 62500.0,
+                            "price_b": 63880.0,
+                        }
+                    ]
+                },
+                "viewports": {
+                    "BTC-USDT-SWAP|4H": {"start_index": 180, "visible_count": 220}
+                },
+            },
+            temp_path,
+        )
+
+        snapshot = load_btc_research_workbench_state(temp_path)
+
+        self.assertEqual(snapshot["drawings"]["BTC-USDT-SWAP|4H"][0]["tool"], "trend_line")
+        self.assertEqual(snapshot["viewports"]["BTC-USDT-SWAP|4H"]["start_index"], 180)
+
+    def test_load_btc_research_workbench_state_returns_defaults_when_missing(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        temp_path = btc_research_workbench_state_file_path(temp_dir)
+
+        snapshot = load_btc_research_workbench_state(temp_path)
+
+        self.assertEqual(snapshot, {"drawings": {}, "viewports": {}})
 
     def test_load_returns_empty_values_when_file_missing(self) -> None:
         temp_dir = self._workspace_temp_dir()

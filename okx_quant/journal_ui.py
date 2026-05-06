@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import END, StringVar, Text, Toplevel, filedialog
@@ -60,6 +61,9 @@ class JournalWindow:
         self.preview_action_text = StringVar(value="-")
         self.preview_position_text = StringVar(value="-")
         self.preview_source_text = StringVar(value="-")
+        self.preview_record_type_text = StringVar(value="-")
+        self.preview_hypothesis_text = StringVar(value="-")
+        self.preview_verification_text = StringVar(value="-")
 
         self._build_layout()
         self._load_entries(select_latest=False)
@@ -167,6 +171,7 @@ class JournalWindow:
         preview_box.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
         preview_box.columnconfigure(1, weight=1)
         preview_box.rowconfigure(8, weight=1)
+        preview_box.rowconfigure(15, weight=1)
 
         preview_rows = (
             ("状态", self.preview_status_text),
@@ -182,6 +187,17 @@ class JournalWindow:
         for index, (label, variable) in enumerate(preview_rows):
             ttk.Label(preview_box, text=label).grid(row=index, column=0, sticky="nw", padx=(0, 8), pady=2)
             ttk.Label(preview_box, textvariable=variable, justify="left").grid(row=index, column=1, sticky="nw", pady=2)
+        ttk.Label(preview_box, text="记录类型").grid(row=11, column=0, sticky="nw", padx=(0, 8), pady=2)
+        ttk.Label(preview_box, textvariable=self.preview_record_type_text, justify="left").grid(row=11, column=1, sticky="nw", pady=2)
+        ttk.Label(preview_box, text="核心假设").grid(row=12, column=0, sticky="nw", padx=(0, 8), pady=2)
+        ttk.Label(
+            preview_box,
+            textvariable=self.preview_hypothesis_text,
+            justify="left",
+            wraplength=680,
+        ).grid(row=12, column=1, sticky="nw", pady=2)
+        ttk.Label(preview_box, text="验证窗口").grid(row=13, column=0, sticky="nw", padx=(0, 8), pady=2)
+        ttk.Label(preview_box, textvariable=self.preview_verification_text, justify="left").grid(row=13, column=1, sticky="nw", pady=2)
         ttk.Label(preview_box, text="摘要").grid(row=9, column=0, sticky="nw", padx=(0, 8), pady=(8, 2))
         ttk.Label(
             preview_box,
@@ -196,6 +212,15 @@ class JournalWindow:
         review_scroll = ttk.Scrollbar(preview_box, orient="vertical", command=self.review_text.yview)
         review_scroll.grid(row=10, column=2, sticky="ns", pady=(8, 2))
         self.review_text.configure(yscrollcommand=review_scroll.set)
+
+        json_actions = ttk.Frame(preview_box)
+        json_actions.grid(row=14, column=1, sticky="ew", pady=(8, 2))
+        ttk.Button(json_actions, text="澶嶅埗瀹屾暣 JSON", command=self._copy_structured_json).grid(row=0, column=0)
+        self.structured_json_text = Text(preview_box, height=7, wrap="none", font=("Consolas", 9))
+        self.structured_json_text.grid(row=15, column=1, sticky="nsew", pady=(2, 0))
+        structured_scroll = ttk.Scrollbar(preview_box, orient="vertical", command=self.structured_json_text.yview)
+        structured_scroll.grid(row=15, column=2, sticky="ns", pady=(2, 0))
+        self.structured_json_text.configure(yscrollcommand=structured_scroll.set)
 
     def _load_entries(self, *, select_latest: bool) -> None:
         snapshot = load_journal_entries_snapshot()
@@ -264,6 +289,15 @@ class JournalWindow:
         self.window.clipboard_clear()
         self.window.clipboard_append(prompt)
         self.status_text.set("AI 提示词已复制到剪贴板。")
+
+    def _copy_structured_json(self) -> None:
+        content = self.structured_json_text.get("1.0", END).strip()
+        if not content:
+            messagebox.showinfo("Info", "No structured JSON to copy yet.", parent=self.window)
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(content)
+        self.status_text.set("Structured JSON copied to clipboard.")
 
     def _import_ai_paste(self) -> None:
         content = self.ai_text.get("1.0", END).strip()
@@ -352,8 +386,12 @@ class JournalWindow:
             self.preview_invalid_text.set("-")
             self.preview_action_text.set("-")
             self.preview_position_text.set("-")
+            self.preview_record_type_text.set("-")
+            self.preview_hypothesis_text.set("-")
+            self.preview_verification_text.set("-")
             self.preview_summary_text.set("")
             self._replace_text(self.review_text, "")
+            self._replace_text(self.structured_json_text, "")
             return
         self.preview_status_text.set("待确认" if extraction.needs_review else "已结构化")
         self.preview_source_text.set(_source_label(extraction.source))
@@ -370,8 +408,14 @@ class JournalWindow:
         )
         self.preview_action_text.set(_action_label(extraction.planned_action))
         self.preview_position_text.set(extraction.position_size_text or "-")
+        research_payload = extraction.raw_payload if isinstance(extraction.raw_payload, dict) else {}
+        self.preview_record_type_text.set(_record_type_label(str(research_payload.get("record_type", "") or "")))
+        self.preview_hypothesis_text.set(_hypothesis_statement(research_payload) or "-")
+        self.preview_verification_text.set(_verification_windows(research_payload) or "-")
         self.preview_summary_text.set(extraction.summary or "")
         self._replace_text(self.review_text, "\n".join(f"- {item}" for item in extraction.review_questions))
+        structured_json = json.dumps(extraction.raw_payload, ensure_ascii=False, indent=2) if research_payload else ""
+        self._replace_text(self.structured_json_text, structured_json)
 
     def _replace_text(self, widget: Text, content: str) -> None:
         widget.delete("1.0", END)
@@ -420,6 +464,33 @@ def _action_label(value: str) -> str:
         "observe": "继续观察",
         "unknown": "待确认",
     }.get(value, value or "待确认")
+
+
+def _record_type_label(value: str) -> str:
+    return {
+        "trade_plan": "交易计划",
+        "market_view": "市场观点",
+        "research_hypothesis": "研究假设",
+        "post_trade_review": "事后复盘",
+        "unknown": "待确认",
+    }.get(value, value or "-")
+
+
+def _hypothesis_statement(payload: dict[str, object]) -> str:
+    hypothesis = payload.get("hypothesis")
+    if not isinstance(hypothesis, dict):
+        return ""
+    return str(hypothesis.get("statement", "") or "").strip()
+
+
+def _verification_windows(payload: dict[str, object]) -> str:
+    verification_plan = payload.get("verification_plan")
+    if not isinstance(verification_plan, dict):
+        return ""
+    windows = verification_plan.get("review_windows")
+    if isinstance(windows, list):
+        return " / ".join(str(item).strip() for item in windows if str(item).strip())
+    return str(windows or "").strip()
 
 
 def _format_attachment_text(paths: list[str]) -> str:
