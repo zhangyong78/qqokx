@@ -1137,6 +1137,68 @@ class PositionProtectionTest(TestCase):
         self.assertTrue(any("持仓保护成交" in subject for subject, _ in notifier.messages))
         self.assertFalse(any("持仓保护异常" in subject for subject, _ in notifier.messages))
 
+    def test_manager_retries_missing_mark_price_polling_errors_until_protection_completes(self) -> None:
+        option_inst_id = "BTC-USD-20260327-70000-C"
+        client = _SimulatedProtectionClient(
+            initial_position=_make_option_position(inst_id=option_inst_id, position="2", pos_side="long"),
+            trigger_prices={
+                (option_inst_id, "mark"): [
+                    OkxApiError(f"OKX 未返回有效触发价：{option_inst_id} type=mark"),
+                    Decimal("0.0155"),
+                ],
+            },
+            order_results=[
+                {
+                    "state": "filled",
+                    "filled_size": Decimal("2"),
+                    "avg_price": Decimal("0.0152"),
+                    "price": Decimal("0.0152"),
+                    "size": Decimal("2"),
+                }
+            ],
+        )
+        notifier = _NotifierStub()
+        manager = PositionProtectionManager(
+            client,
+            lambda message: None,
+            notifier=notifier,
+            transient_alert_interval_seconds=999,
+            transient_status_interval_seconds=0,
+        )
+
+        session_id = manager.start(
+            _make_credentials(),
+            _make_strategy_config(),
+            OptionProtectionConfig(
+                option_inst_id=option_inst_id,
+                trigger_inst_id=option_inst_id,
+                trigger_price_type="mark",
+                direction="long",
+                pos_side="long",
+                take_profit_trigger=Decimal("0.0150"),
+                stop_loss_trigger=Decimal("0.0130"),
+                take_profit_order_mode="fixed_price",
+                take_profit_order_price=Decimal("0.0152"),
+                take_profit_slippage=Decimal("0"),
+                stop_loss_order_mode="fixed_price",
+                stop_loss_order_price=Decimal("0.0132"),
+                stop_loss_slippage=Decimal("0"),
+                poll_seconds=0.01,
+                trigger_label=f"{option_inst_id} mark",
+            ),
+        )
+
+        worker = manager._workers[session_id]
+        assert worker.thread is not None
+        worker.thread.join(timeout=2)
+
+        self.assertFalse(worker.thread.is_alive())
+        self.assertEqual(worker.status, "已完成")
+        self.assertEqual(client.current_position, Decimal("0"))
+        retry_subjects = [subject for subject, _ in notifier.messages if "网络重试" in subject]
+        self.assertEqual(len(retry_subjects), 1)
+        self.assertFalse(any("持仓保护异常" in subject for subject, _ in notifier.messages))
+
     def test_manager_retries_transient_close_errors_without_duplicate_trigger_notice(self) -> None:
         option_inst_id = "BTC-USD-20260327-70000-P"
         spot_inst_id = "BTC-USDT"

@@ -7,6 +7,14 @@ from pathlib import Path
 
 class UiStrategySessionsMixin:
     @staticmethod
+    def _entry_reference_ema_caption(strategy_id: str) -> str:
+        if is_dynamic_strategy_id(strategy_id):
+            return "挂单参考EMA"
+        if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(strategy_id):
+            return "突破参考EMA"
+        return "参考EMA周期"
+
+    @staticmethod
     def _format_strategy_symbol_display(signal_symbol: str, trade_symbol: str | None) -> str:
         normalized_signal = signal_symbol.strip().upper()
         normalized_trade = (trade_symbol or normalized_signal).strip().upper()
@@ -3223,13 +3231,18 @@ class UiStrategySessionsMixin:
             return
         ema_period = self._parse_positive_int(self.ema_period.get(), "EMA小周期")
         trend_ema_period = self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期")
+        strategy_id = self._selected_strategy_definition().strategy_id
         entry_reference_ema_period = 0
-        if is_dynamic_strategy_id(self._selected_strategy_definition().strategy_id):
-            entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
+        if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
+            entry_reference_ema_period = self._parse_nonnegative_int(
+                self.entry_reference_ema_period.get(),
+                self._entry_reference_ema_caption(strategy_id),
+            )
         if entry_reference_ema_period <= 0:
             entry_reference_ema_period = ema_period
         self._enqueue_log(
-            f"正在获取 {symbol} 的 1 小时调试值，EMA小周期={ema_period}，趋势EMA={trend_ema_period}，挂单参考EMA={entry_reference_ema_period} ..."
+            f"正在获取 {symbol} 的 1 小时调试值，EMA小周期={ema_period}，趋势EMA={trend_ema_period}，"
+            f"{self._entry_reference_ema_caption(strategy_id)}={entry_reference_ema_period} ..."
         )
         threading.Thread(
             target=self._debug_hourly_values_worker,
@@ -3304,7 +3317,7 @@ class UiStrategySessionsMixin:
             self._time_stop_break_even_check.grid_remove()
             self._time_stop_break_even_bars_label.grid_remove()
             self._time_stop_break_even_bars_entry.grid_remove()
-        if dynamic_strategy:
+        if dynamic_strategy or breakout_strategy:
             self._startup_chase_window_label.grid()
             self._startup_chase_window_entry.grid()
             self._startup_chase_window_hint_label.grid()
@@ -3313,6 +3326,7 @@ class UiStrategySessionsMixin:
             self._startup_chase_window_entry.grid_remove()
             self._startup_chase_window_hint_label.grid_remove()
         if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
+            self._entry_reference_ema_label.configure(text=self._entry_reference_ema_caption(strategy_id))
             self._entry_reference_ema_label.grid()
             self._entry_reference_ema_entry.grid()
         else:
@@ -3330,9 +3344,9 @@ class UiStrategySessionsMixin:
         self._set_field_state(self._big_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "big_ema_period", "launcher"))
         self._set_field_state(self.signal_combo, editable=strategy_is_parameter_editable(strategy_id, "signal_mode", "launcher"))
         self._apply_strategy_parameter_fixed_labels(strategy_id)
-        if dynamic_strategy and not self.entry_reference_ema_period.get().strip():
+        if strategy_uses_parameter(strategy_id, "entry_reference_ema_period") and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
-        if dynamic_strategy and not self.startup_chase_window_seconds.get().strip():
+        if (dynamic_strategy or breakout_strategy) and not self.startup_chase_window_seconds.get().strip():
             self.startup_chase_window_seconds.set("0")
         self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
@@ -3440,8 +3454,12 @@ class UiStrategySessionsMixin:
         max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
         startup_chase_window_seconds = 0
         entry_reference_ema_period = 0
-        if is_dynamic_strategy_id(strategy_id):
-            entry_reference_ema_period = self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA")
+        if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
+            entry_reference_ema_period = self._parse_nonnegative_int(
+                self.entry_reference_ema_period.get(),
+                self._entry_reference_ema_caption(strategy_id),
+            )
+        if is_dynamic_strategy_id(strategy_id) or is_ema_atr_breakout_strategy(strategy_id):
             startup_chase_window_seconds = self._parse_nonnegative_int(
                 self.startup_chase_window_seconds.get(),
                 "启动追单窗口(秒)",
@@ -4735,12 +4753,13 @@ class UiStrategySessionsMixin:
                 f"EMA中周期：{trend_ema_period or '-'}",
             ]
         )
-        if is_dynamic_strategy_id(strategy_id):
+        if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
             if entry_reference_ema_period > 0:
                 entry_reference_label = f"EMA{entry_reference_ema_period}"
             else:
                 entry_reference_label = f"跟随EMA小周期(EMA{ema_period or '-'})"
-            lines.append(f"挂单参考EMA：{entry_reference_label}")
+            lines.append(f"{self._entry_reference_ema_caption(strategy_id)}：{entry_reference_label}")
+        if is_dynamic_strategy_id(strategy_id) or is_ema_atr_breakout_strategy(strategy_id):
             startup_window_seconds = self._snapshot_int(snapshot, "startup_chase_window_seconds") or 0
             lines.append(
                 "启动追单窗口："

@@ -713,6 +713,10 @@ class PositionProtectionManager:
             return True
 
         message = str(exc).lower()
+        if isinstance(exc, OkxApiError) and any(
+            token in message for token in ("type=mark", "type=last", "type=index")
+        ):
+            return True
         transient_markers = (
             "网络错误",
             "timeout",
@@ -733,6 +737,11 @@ class PositionProtectionManager:
             "bad gateway",
             "service unavailable",
             "gateway timeout",
+            "未返回有效触发价",
+            "缺少标记价格",
+            "缺少最新成交价",
+            "缺少指数价格",
+            "无法触发",
             "握手",
             "超时",
         )
@@ -1805,6 +1814,10 @@ def _pp_is_transient_error(self: PositionProtectionManager, exc: Exception) -> b
     if isinstance(exc, OkxApiError) and exc.status is not None and exc.status >= 500:
         return True
     message = _repair_mojibake_text(str(exc)).lower()
+    if isinstance(exc, OkxApiError) and any(
+        token in message for token in ("type=mark", "type=last", "type=index")
+    ):
+        return True
     transient_markers = (
         "网络错误",
         "timeout",
@@ -1825,6 +1838,11 @@ def _pp_is_transient_error(self: PositionProtectionManager, exc: Exception) -> b
         "bad gateway",
         "service unavailable",
         "gateway timeout",
+        "未返回有效触发价",
+        "缺少标记价格",
+        "缺少最新成交价",
+        "缺少指数价格",
+        "无法触发",
         "握手",
         "超时",
     )

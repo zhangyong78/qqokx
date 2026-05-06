@@ -2870,7 +2870,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._big_ema_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
         self._big_ema_entry = ttk.Entry(start_frame, textvariable=self.big_ema_period)
         self._big_ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
-        self._entry_reference_ema_label = ttk.Label(start_frame, text="挂单参考EMA")
+        self._entry_reference_ema_label = ttk.Label(start_frame, text="参考EMA周期")
         self._entry_reference_ema_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
         self._entry_reference_ema_entry = ttk.Entry(start_frame, textvariable=self.entry_reference_ema_period)
         self._entry_reference_ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
@@ -5685,7 +5685,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 run_mode=run_mode,
                 take_profit_mode=TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "dynamic"),
                 max_entries_per_trend=max(self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数"), 0),
-                entry_reference_ema_period=max(self._parse_nonnegative_int(self.entry_reference_ema_period.get(), "挂单参考EMA"), 0),
+                entry_reference_ema_period=max(
+                    self._parse_nonnegative_int(
+                        self.entry_reference_ema_period.get(),
+                        _entry_reference_ema_caption(definition.strategy_id),
+                    ),
+                    0,
+                ),
             )
         except Exception as exc:
             self.minimum_order_risk_hint_text.set(
@@ -10070,6 +10076,14 @@ def _build_trend_parameter_hint_text(
     return "趋势参数： " + " ".join(parts)
 
 
+def _entry_reference_ema_caption(strategy_id: str) -> str:
+    if is_dynamic_strategy_id(strategy_id):
+        return "挂单参考EMA"
+    if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(strategy_id):
+        return "突破参考EMA"
+    return "参考EMA周期"
+
+
 def _build_dynamic_protection_hint_text(
     *,
     take_profit_mode_label: str,
@@ -10239,15 +10253,27 @@ def _build_strategy_start_confirmation_message(
     ]
     if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         lines.append(f"EMA大周期：{config.big_ema_period}（大趋势过滤线）")
-    if is_dynamic_strategy_id(config.strategy_id):
-        lines.extend(
-            [
-                f"挂单参考EMA：{config.entry_reference_ema_label()}（挂单价格锚点）",
-                f"止盈方式：{take_profit_mode_text}",
-                f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}（同一波最多允许开仓的次数）",
-                f"启动追单窗口：{_startup_chase_text()}",
-            ]
-        )
+    if config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(config.strategy_id):
+        lines.append(f"突破参考EMA：EMA{config.resolved_entry_reference_ema_period()}（已收盘K线的突破/跌破判断基准）")
+    if is_dynamic_strategy_id(config.strategy_id) or config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(config.strategy_id):
+        if is_dynamic_strategy_id(config.strategy_id):
+            lines.extend(
+                [
+                    f"挂单参考EMA：{config.entry_reference_ema_label()}（挂单价格锚点）",
+                    f"止盈方式：{take_profit_mode_text}",
+                    f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}（同一波最多允许开仓的次数）",
+                    f"启动追单窗口：{_startup_chase_text()}",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"突破参考EMA：EMA{config.resolved_entry_reference_ema_period()}（已收盘K线的突破/跌破判断基准）",
+                    f"止盈方式：{take_profit_mode_text}",
+                    f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}（同一波最多允许开仓的次数）",
+                    f"启动追单窗口：{_startup_chase_text()}",
+                ]
+            )
         if config.take_profit_mode == "dynamic":
             lines.extend(
                 [

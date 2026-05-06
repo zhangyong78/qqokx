@@ -534,6 +534,10 @@ class StrategyEngine:
     ) -> None:
         strategy = EmaAtrStrategy()
         dynamic_stop_only = _live_dynamic_take_profit_enabled(config)
+        startup_gate = StartupSignalGateState(
+            started_at_ms=int(time.time() * 1000),
+            chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+        )
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
@@ -563,6 +567,7 @@ class StrategyEngine:
         self._logger(
             f"方向={_format_signal_mode(config.signal_mode)} | 风险金={format_decimal(config.risk_amount or Decimal('0'))}"
         )
+        self._logger(f"启动追单窗口：{config.startup_chase_window_label()}")
         self._logger(f"指标回看数量：{lookback} 根 K 线")
 
         self._log_hourly_debug(
@@ -601,6 +606,18 @@ class StrategyEngine:
 
             if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
                 raise RuntimeError("策略返回的数据不完整，无法生成下单计划")
+
+            should_skip_startup_signal, startup_gate_message = _should_skip_startup_signal(
+                startup_gate,
+                signal=decision.signal,
+                candle_ts=decision.candle_ts,
+                bar=config.bar,
+            )
+            if startup_gate_message:
+                self._logger(startup_gate_message)
+            if should_skip_startup_signal:
+                self._stop_event.wait(config.poll_seconds)
+                continue
 
             try:
                 plan = build_order_plan(

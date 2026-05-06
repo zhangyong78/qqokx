@@ -570,6 +570,178 @@ class StrategyEngineTest(TestCase):
         self.assertIn("启动追单窗口内接管当前波段", message or "")
         self.assertIsNone(gate.blocked_signal)
 
+    def test_cross_exchange_strategy_skips_old_signal_when_startup_window_disabled(self) -> None:
+        messages: list[str] = []
+        submit_calls = {"count": 0}
+        candles = self._make_candles([str(2000 + index) for index in range(260)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+                self._wait_calls = 0
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, _timeout: float) -> bool:
+                self._wait_calls += 1
+                if self._wait_calls >= 2:
+                    self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 突破做多策略",
+            session_id="S-startup-skip",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._submit_order_with_recovery = lambda *_args, **_kwargs: submit_calls.__setitem__("count", submit_calls["count"] + 1)  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_EMA_BREAKOUT_LONG_ID,
+            poll_seconds=10,
+            risk_amount=Decimal("10"),
+            startup_chase_window_seconds=0,
+            take_profit_mode="fixed",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
+            return SignalDecision(
+                signal="long",
+                reason="突破成立",
+                candle_ts=60_000,
+                entry_reference=Decimal("2300"),
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2310"),
+                signal_candle_high=Decimal("2315"),
+                signal_candle_low=Decimal("2295"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=180.0), patch(
+            "okx_quant.engine.EmaAtrStrategy.evaluate",
+            new=_fake_evaluate,
+        ):
+            engine._run_cross_exchange_strategy(None, config, instrument)  # type: ignore[arg-type]
+
+        self.assertEqual(submit_calls["count"], 0)
+        self.assertTrue(any("启动默认不追老信号" in message for message in messages))
+
+    def test_cross_exchange_strategy_accepts_old_signal_within_startup_window(self) -> None:
+        messages: list[str] = []
+        submit_calls = {"count": 0}
+        candles = self._make_candles([str(2000 + index) for index in range(260)])
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 突破做多策略",
+            session_id="S-startup-chase",
+        )
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+
+        def _fake_submit(*_args, **_kwargs) -> OkxOrderResult:  # noqa: ANN001
+            submit_calls["count"] += 1
+            return OkxOrderResult(
+                ord_id="ord-cross-1",
+                cl_ord_id="cl-cross-1",
+                s_code="0",
+                s_msg="accepted",
+                raw={},
+            )
+
+        engine._submit_order_with_recovery = _fake_submit  # type: ignore[assignment]
+        engine._wait_for_order_fill = lambda *args, **kwargs: FilledPosition(  # type: ignore[assignment]
+            ord_id="ord-cross-1",
+            cl_ord_id="cl-cross-1",
+            inst_id="ETH-USDT-SWAP",
+            side="buy",
+            close_side="sell",
+            pos_side="long",
+            size=Decimal("0.01"),
+            entry_price=Decimal("2300"),
+            entry_ts=181_000,
+        )
+        engine._notify_trade_fill = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_EMA_BREAKOUT_LONG_ID,
+            poll_seconds=10,
+            risk_amount=Decimal("10"),
+            startup_chase_window_seconds=180,
+            take_profit_mode="fixed",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
+            return SignalDecision(
+                signal="long",
+                reason="突破成立",
+                candle_ts=60_000,
+                entry_reference=Decimal("2300"),
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2310"),
+                signal_candle_high=Decimal("2315"),
+                signal_candle_low=Decimal("2295"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=180.0), patch(
+            "okx_quant.engine.EmaAtrStrategy.evaluate",
+            new=_fake_evaluate,
+        ):
+            engine._run_cross_exchange_strategy(None, config, instrument)  # type: ignore[arg-type]
+
+        self.assertEqual(submit_calls["count"], 1)
+        self.assertTrue(any("启动追单窗口内接管当前波段" in message for message in messages))
+
     def test_dynamic_exchange_strategy_continues_after_round_trip_and_respects_wave_limit(self) -> None:
         messages: list[str] = []
         waits: list[float] = []

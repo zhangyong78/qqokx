@@ -10,7 +10,13 @@ from tkinter import messagebox, ttk
 from typing import Callable
 
 from okx_quant.pricing import format_decimal, format_decimal_fixed
-from okx_quant.strategy_catalog import get_strategy_definition, is_dynamic_strategy_id, supports_trader_desk
+from okx_quant.strategy_catalog import (
+    STRATEGY_EMA_BREAKDOWN_SHORT_ID,
+    get_strategy_definition,
+    is_dynamic_strategy_id,
+    is_ema_atr_breakout_strategy,
+    supports_trader_desk,
+)
 from okx_quant.trader_desk import (
     TRADER_DRAFT_STATUS_VALUES,
     TRADER_GATE_CONDITION_VALUES,
@@ -510,6 +516,14 @@ def _entry_reference_ema_label(snapshot: dict[str, object]) -> str:
     return f"跟随EMA小周期(EMA{ema_period})"
 
 
+def _entry_reference_ema_caption(strategy_id: str) -> str:
+    if is_dynamic_strategy_id(strategy_id):
+        return "挂单参考EMA"
+    if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(strategy_id):
+        return "突破参考EMA"
+    return "参考EMA周期"
+
+
 def _startup_chase_window_label(snapshot: dict[str, object]) -> str:
     raw_value = str(snapshot.get("startup_chase_window_seconds") or "").strip()
     if raw_value.isdigit() and int(raw_value) > 0:
@@ -579,8 +593,9 @@ def _build_trader_strategy_lines(
         f"止损={_snapshot_text(snapshot, 'atr_stop_multiplier')} | "
         f"止盈={_snapshot_text(snapshot, 'atr_take_multiplier')}"
     )
+    if is_dynamic_strategy_id(strategy_id) or strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(strategy_id):
+        lines.append(f"{_entry_reference_ema_caption(strategy_id)}：{_entry_reference_ema_label(snapshot)}")
     if is_dynamic_strategy_id(strategy_id):
-        lines.append(f"挂单参考EMA：{_entry_reference_ema_label(snapshot)}")
         take_profit_mode = "动态" if _snapshot_text(snapshot, "take_profit_mode", "dynamic") == "dynamic" else "固定"
         lines.append(
             f"止盈模式：{take_profit_mode} | "
