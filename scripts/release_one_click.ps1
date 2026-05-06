@@ -169,11 +169,13 @@ if ($changedFiles.Count -eq 0) { Write-Host (U '\u6ca1\u6709\u68c0\u6d4b\u5230\u
 $releaseSummary = Build-ReleaseSummary -Files $changedFiles -VersionText $nextVersionText -BumpLevel $Bump -CommitMessageText $CommitMessage
 
 if ($DryRun) {
-    Write-Host "DRY RUN v$nextVersionText"
+    Write-Host "=== DRY RUN v$nextVersionText ==="
     Write-Host "版本：v$nextVersionText"
-    Write-Host "摘要："
+    Write-Host ""
+    Write-Host "拟写更新日志摘要："
     Write-Host $releaseSummary
-    Write-Host "文件："
+    Write-Host ""
+    Write-Host "将收口的文件："
     $changedFiles | ForEach-Object { Write-Host " - $_" }
     exit 0
 }
