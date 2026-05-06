@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from okx_quant.app_paths import cache_dir_path, config_dir_path, reports_dir_path, state_dir_path
 
@@ -29,6 +30,7 @@ POSITION_NOTES_FILE_NAME = "position_notes.json"
 STRATEGY_PARAMETER_GLOBAL_DEFAULTS_FILE_NAME = "strategy_parameter_global_defaults.json"
 STRATEGY_PARAMETER_DRAFTS_FILE_NAME = "strategy_parameter_drafts.json"
 LINE_TRADING_DESK_ANNOTATIONS_FILE_NAME = "line_trading_desk_annotations.json"
+JOURNAL_ENTRIES_FILE_NAME = "journal_entries.json"
 HISTORY_CACHE_DIR_NAME = "history"
 HISTORY_ORDER_FILE_NAME = "order_history.json"
 HISTORY_FILLS_FILE_NAME = "fills_history.json"
@@ -145,6 +147,10 @@ def line_trading_desk_annotations_file_path(base_dir: Path | None = None) -> Pat
     return state_dir_path() / LINE_TRADING_DESK_ANNOTATIONS_FILE_NAME
 
 
+def journal_entries_file_path(base_dir: Path | None = None) -> Path:
+    return Path(base_dir) / JOURNAL_ENTRIES_FILE_NAME if base_dir is not None else state_dir_path() / JOURNAL_ENTRIES_FILE_NAME
+
+
 def load_line_trading_desk_annotations_entries(path: Path | None = None) -> dict[str, dict[str, object]]:
     """返回 { \"api|INST|bar\": {\"lines\": [...], \"rr\": [...]} }。条目为浅拷贝 dict，调用方可就地修改。"""
     target = path or line_trading_desk_annotations_file_path()
@@ -175,6 +181,75 @@ def save_line_trading_desk_annotations_entries(entries: dict[str, dict[str, obje
     payload = {
         "version": 1,
         "entries": dict(entries),
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
+def _normalize_journal_entry_record(item: object) -> dict[str, object] | None:
+    if not isinstance(item, dict):
+        return None
+    raw_text = str(item.get("raw_text", "") or "")
+    extraction = item.get("extraction")
+    if not raw_text.strip() and not isinstance(extraction, dict):
+        return None
+    entry_id = str(item.get("entry_id", "") or "").strip() or uuid4().hex
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    created_at = str(item.get("created_at", "") or "").strip() or now
+    updated_at = str(item.get("updated_at", "") or "").strip() or created_at
+    status = str(item.get("status", "draft") or "draft").strip()
+    if status not in {"draft", "review", "confirmed", "monitoring", "archived"}:
+        status = "draft"
+    attachments = [
+        str(attachment).strip()
+        for attachment in item.get("attachments", []) or []
+        if str(attachment).strip()
+    ]
+    return {
+        "entry_id": entry_id,
+        "raw_text": raw_text,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "attachments": attachments,
+        "status": status,
+        "extraction": dict(extraction) if isinstance(extraction, dict) else None,
+        "notes": str(item.get("notes", "") or ""),
+    }
+
+
+def load_journal_entries_snapshot(path: Path | None = None) -> dict[str, object]:
+    target = path or journal_entries_file_path()
+    if not target.exists():
+        return {"entries": []}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"entries": []}
+    raw_entries = payload.get("entries") if isinstance(payload, dict) else []
+    if not isinstance(raw_entries, list):
+        raw_entries = []
+    entries = [
+        normalized
+        for item in raw_entries
+        if (normalized := _normalize_journal_entry_record(item)) is not None
+    ]
+    entries.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
+    return {"entries": entries}
+
+
+def save_journal_entries_snapshot(entries: list[dict[str, object]], path: Path | None = None) -> Path:
+    target = path or journal_entries_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    normalized = [
+        item for entry in entries if (item := _normalize_journal_entry_record(entry)) is not None
+    ]
+    normalized.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
+    payload = {
+        "version": 1,
+        "entries": normalized,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     temp_path = target.with_suffix(target.suffix + ".tmp")

@@ -10,7 +10,6 @@ from okx_quant.indicators import atr, ema
 from okx_quant.models import Candle, Instrument, OrderPlan, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
-from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategy_catalog import (
@@ -1167,7 +1166,6 @@ def _run_cross_backtest(
         raise RuntimeError(
             "EMA 突破/跌破（旧版）回测不支持 signal_mode=双向；请分别回测或改用「EMA 突破做多」「EMA 跌破做空」策略。"
         )
-    strategy = EmaAtrStrategy()
     dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
     effective_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
     eval_config = replace(config, signal_mode=effective_mode)
@@ -1194,6 +1192,13 @@ def _run_cross_backtest(
     open_position: _OpenPosition | None = None
     current_wave_signal: str | None = None
     entries_in_current_wave = 0
+    closes = [candle.close for candle in candles]
+    ema_values = ema(closes, eval_config.ema_period)
+    trend_ema_values = ema(closes, eval_config.trend_ema_period)
+    reference_ema_values = (
+        ema_values if reference_ema_period == eval_config.ema_period else ema(closes, reference_ema_period)
+    )
+    atr_values = atr(candles, eval_config.atr_period)
 
     for index in range(trade_start_index, len(candles)):
         candle = candles[index]
@@ -1238,10 +1243,14 @@ def _run_cross_backtest(
         if open_position is not None:
             continue
 
-        decision = strategy.evaluate(
-            candles[: index + 1],
+        decision = _evaluate_cross_signal_precomputed(
+            candles,
+            index,
+            ema_values,
+            reference_ema_values,
+            trend_ema_values,
+            atr_values,
             eval_config,
-            price_increment=instrument.tick_size,
         )
         if decision.signal is None:
             current_wave_signal = None
@@ -1499,6 +1508,102 @@ def _run_dynamic_backtest(
         )
 
     return trades, terminal_open_position
+
+
+def _evaluate_cross_signal_precomputed(
+    candles: list[Candle],
+    index: int,
+    ema_values: list[Decimal],
+    reference_ema_values: list[Decimal],
+    trend_ema_values: list[Decimal],
+    atr_values: list[Decimal | None],
+    config: StrategyConfig,
+) -> SignalDecision:
+    previous_candle = candles[index - 1]
+    current_candle = candles[index]
+    previous_reference_ema = reference_ema_values[index - 1]
+    current_reference_ema = reference_ema_values[index]
+    current_atr = atr_values[index]
+    if current_atr is None:
+        return SignalDecision(
+            signal=None,
+            reason="atr_not_ready",
+            candle_ts=current_candle.ts,
+            entry_reference=None,
+            atr_value=None,
+            ema_value=current_reference_ema,
+            signal_candle_high=current_candle.high,
+            signal_candle_low=current_candle.low,
+        )
+
+    ema_small = ema_values[index]
+    ema_medium = trend_ema_values[index]
+    if config.ema_period == config.trend_ema_period:
+        ema_bias_allows_long = True
+        ema_bias_allows_short = True
+    else:
+        ema_bias_allows_long = ema_small > ema_medium
+        ema_bias_allows_short = ema_small < ema_medium
+
+    long_breakout = previous_candle.close <= previous_reference_ema and current_candle.close > current_reference_ema
+    short_breakdown = previous_candle.close >= previous_reference_ema and current_candle.close < current_reference_ema
+
+    if long_breakout and config.signal_mode != "short_only":
+        if not ema_bias_allows_long:
+            return SignalDecision(
+                signal=None,
+                reason="fast_ema_below_trend_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_reference_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
+        return SignalDecision(
+            signal="long",
+            reason="cross_long",
+            candle_ts=current_candle.ts,
+            entry_reference=current_candle.close,
+            atr_value=current_atr,
+            ema_value=current_reference_ema,
+            signal_candle_high=current_candle.high,
+            signal_candle_low=current_candle.low,
+        )
+
+    if short_breakdown and config.signal_mode != "long_only":
+        if not ema_bias_allows_short:
+            return SignalDecision(
+                signal=None,
+                reason="fast_ema_above_trend_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_reference_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
+        return SignalDecision(
+            signal="short",
+            reason="cross_short",
+            candle_ts=current_candle.ts,
+            entry_reference=current_candle.close,
+            atr_value=current_atr,
+            ema_value=current_reference_ema,
+            signal_candle_high=current_candle.high,
+            signal_candle_low=current_candle.low,
+        )
+
+    return SignalDecision(
+        signal=None,
+        reason="no_cross_signal",
+        candle_ts=current_candle.ts,
+        entry_reference=None,
+        atr_value=current_atr,
+        ema_value=current_reference_ema,
+        signal_candle_high=current_candle.high,
+        signal_candle_low=current_candle.low,
+    )
 
 
 def _evaluate_dynamic_signal_precomputed(

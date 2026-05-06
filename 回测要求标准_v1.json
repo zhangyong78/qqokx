@@ -1,0 +1,148 @@
+{
+  "version": "1.0",
+  "created_at": "2026-05-06",
+  "name": "EMA breakout/breakdown backtest requirements",
+  "symbols": [
+    "BTC-USDT-SWAP",
+    "ETH-USDT-SWAP",
+    "SOL-USDT-SWAP",
+    "DOGE-USDT-SWAP",
+    "BNB-USDT-SWAP"
+  ],
+  "strategies": [
+    {
+      "strategy_id": "ema_breakout_long",
+      "signal_mode": "long_only",
+      "description": "EMA突破做多"
+    },
+    {
+      "strategy_id": "ema_breakdown_short",
+      "signal_mode": "short_only",
+      "description": "EMA跌破做空"
+    }
+  ],
+  "bars": ["15m", "1H", "4H"],
+  "sample_policy": {
+    "main_matrix_candle_limit": 10000,
+    "long_sample": {
+      "15m": 30000,
+      "1H": 0,
+      "4H": 0
+    },
+    "zero_means_full_history": true
+  },
+  "capital_and_cost": {
+    "initial_capital": "10000",
+    "sizing_mode": "fixed_risk",
+    "risk_amount": "10",
+    "compounding": false,
+    "maker_fee_rate": "0.00015",
+    "taker_fee_rate": "0.00036",
+    "main_entry_slippage_rate": "0.0003",
+    "main_exit_slippage_rate": "0.0003",
+    "stress_entry_slippage_rate": "0.0005",
+    "stress_exit_slippage_rate": "0.0005",
+    "funding_rate": "0"
+  },
+  "base_strategy_config": {
+    "ema_period": 21,
+    "trend_ema_period": 55,
+    "big_ema_period": 233,
+    "atr_period": 10,
+    "trade_mode": "cross",
+    "position_mode": "net",
+    "environment": "demo",
+    "tp_sl_trigger_type": "mark",
+    "max_entries_per_trend": 1,
+    "time_stop_break_even_enabled": false,
+    "time_stop_break_even_bars": 10,
+    "hold_close_exit_bars": 0
+  },
+  "parameter_grid": {
+    "entry_reference_ema_period": [21, 55],
+    "atr_stop_multiplier": ["1", "1.5", "2"]
+  },
+  "take_profit_modes": [
+    {
+      "name": "dynamic_main",
+      "take_profit_mode": "dynamic",
+      "dynamic_two_r_break_even": true,
+      "dynamic_fee_offset_enabled": true,
+      "atr_take_multiplier": ["2", "3", "4"],
+      "note": "atr_take_multiplier是ATR倍数, 不一定等于R倍数"
+    },
+    {
+      "name": "fixed_rr_compare",
+      "take_profit_mode": "fixed",
+      "dynamic_two_r_break_even": false,
+      "dynamic_fee_offset_enabled": false,
+      "take_profit_r_multiple": ["1", "2", "3", "4"],
+      "atr_take_multiplier_formula": "atr_stop_multiplier * take_profit_r_multiple",
+      "note": "固定止盈对照必须按R倍数解释TP"
+    }
+  ],
+  "execution_stages": [
+    {
+      "stage": "main_dynamic_matrix",
+      "symbols": "all",
+      "strategies": "all",
+      "bars": "all",
+      "slippage_profile": "main",
+      "take_profit_profile": "dynamic_main",
+      "required": true
+    },
+    {
+      "stage": "fixed_rr_matrix",
+      "symbols": "all",
+      "strategies": "all",
+      "bars": "all",
+      "slippage_profile": "main",
+      "take_profit_profile": "fixed_rr_compare",
+      "required": true
+    },
+    {
+      "stage": "stress_slippage_confirmation",
+      "symbols": "A_and_key_B_candidates",
+      "strategies": "selected",
+      "bars": "selected",
+      "slippage_profile": "stress",
+      "required": true
+    },
+    {
+      "stage": "long_sample_confirmation",
+      "symbols": "A_and_key_B_candidates",
+      "strategies": "selected",
+      "bars": "selected",
+      "sample_policy": "long_sample",
+      "required": true
+    }
+  ],
+  "report_requirements": {
+    "formats": ["markdown", "json"],
+    "must_include": [
+      "winning_parameters",
+      "top_candidates",
+      "A_B_C_priority_groups",
+      "symbol_summary",
+      "strategy_direction_summary",
+      "bar_summary",
+      "trade_count",
+      "win_rate",
+      "total_pnl",
+      "profit_factor",
+      "average_r_multiple",
+      "max_drawdown",
+      "fees",
+      "slippage_costs",
+      "take_profit_hits",
+      "stop_loss_hits",
+      "data_source_note"
+    ]
+  },
+  "live_readiness_rules": {
+    "main_bars": ["1H", "4H"],
+    "exclude_first_stage_bars": ["15m"],
+    "do_not_say_live_ready_after_main_matrix_only": true,
+    "minimum_next_step": "stress_slippage_and_long_sample_confirmation"
+  }
+}
