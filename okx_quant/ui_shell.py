@@ -1752,6 +1752,7 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
         return "持仓监控中"
     if (
         "挂单已成交" in text
+        or "市价单成交" in text
         or "初始 OKX 止损已提交" in text
         or "动态止盈上移" in text
         or "OKX 动态止损已上移" in text
@@ -1766,7 +1767,9 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
         return "持仓监控中"
     if (
         "准备挂单" in text
+        or "准备市价单" in text
         or "挂单已提交到 OKX" in text
+        or "订单已提交到 OKX" in text
         or "委托追踪" in text
         or "检测到挂单状态已变更" in text
         or "挂单部分成交" in text
@@ -1776,6 +1779,8 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
     if "已提交启动请求" in text:
         return "启动中"
     if (
+        "当前无信号" in text
+        or
         "当前无法生成挂单" in text
         or "当前无法生成动态开仓价" in text
         or "当前无法生成本地开仓价" in text

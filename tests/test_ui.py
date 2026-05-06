@@ -898,8 +898,12 @@ HTTP 502: <!DOCTYPE html>
     def test_infer_session_runtime_status_maps_entry_and_position_phases(self) -> None:
         self.assertEqual(_infer_session_runtime_status("准备挂单 | 方向=LONG"), "开仓监控中")
         self.assertEqual(_infer_session_runtime_status("挂单已提交到 OKX | ordId=1"), "开仓监控中")
+        self.assertEqual(_infer_session_runtime_status("准备市价单 | 方向=LONG"), "开仓监控中")
+        self.assertEqual(_infer_session_runtime_status("订单已提交到 OKX | ordId=1"), "开仓监控中")
+        self.assertEqual(_infer_session_runtime_status("市价单成交 | ordId=1"), "持仓监控中")
         self.assertEqual(_infer_session_runtime_status("开始监控 OKX 动态止损 | 标的=BTC-USDT-SWAP"), "持仓监控中")
         self.assertEqual(_infer_session_runtime_status("当前无法生成挂单 | 趋势未确认"), "等待信号")
+        self.assertEqual(_infer_session_runtime_status("当前无信号 | EMA未突破"), "等待信号")
 
     def test_infer_session_runtime_status_maps_trader_virtual_stop_messages_to_position_monitoring(self) -> None:
         self.assertEqual(_infer_session_runtime_status("交易员虚拟止损监控启动 | 标的=ETH-USDT-SWAP"), "持仓监控中")
