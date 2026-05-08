@@ -19,6 +19,8 @@ from tkinter import TclError
 from tkinter import ttk
 from typing import Any, Callable
 
+from okx_quant.btc_market_analyzer import BtcMarketAnalyzerConfig, analyze_btc_market_at_time, save_btc_market_analysis
+from okx_quant.market_analysis import MarketAnalysisConfig
 from okx_quant.persistence import (
     analysis_report_dir_path,
     deribit_volatility_cache_file_path,
@@ -97,6 +99,20 @@ class HistoricalAnalysisMarker:
     direction: str
     score: int
     confidence: str
+    verdict: str = ""
+    return_24h_pct: str = ""
+
+
+@dataclass(frozen=True)
+class ReplayStatsRow:
+    signal_type: str
+    samples: int
+    effective: int
+    partial: int
+    invalid: int
+    pending: int
+    hit_rate: float
+    avg_24h_return_pct: float | None
 
 
 @dataclass
@@ -160,6 +176,8 @@ class BtcResearchWorkbenchWindow:
         self._chart_hover_indices: dict[int, int | None] = {}
         self._hover_canvas: Canvas | None = None
         self._hover_position: tuple[float, float] | None = None
+        self._last_selected_chart_candle: Candle | None = None
+        self._replay_request_token = 0
 
         self.window = Toplevel(parent)
         self.window.title("BTC研究工作台")
@@ -198,9 +216,13 @@ class BtcResearchWorkbenchWindow:
         self.preview_action_text = StringVar(value="-")
         self.preview_verification_text = StringVar(value="-")
         self.preview_summary_text = StringVar(value="")
+        self.replay_selection_text = StringVar(value="未选择K线")
+        self.replay_stats_summary_text = StringVar(value="等待加载复盘统计。")
+        self._replay_stats_tree: ttk.Treeview | None = None
 
         self._build_layout()
         self._load_entries(select_latest=True)
+        self._refresh_replay_statistics()
         if self._client is not None:
             self.window.after(120, self._load_chart_candles)
 
@@ -288,6 +310,7 @@ class BtcResearchWorkbenchWindow:
         ttk.Button(chart_header, text="加载K线", command=self._load_chart_candles).grid(row=0, column=3, padx=(8, 0))
         ttk.Button(chart_header, text="重置视图", command=self._reset_chart_view).grid(row=0, column=4, padx=(8, 0))
         ttk.Button(chart_header, text="刷新分析锚点", command=self._reload_historical_markers).grid(row=0, column=5, padx=(8, 0))
+        ttk.Button(chart_header, text="按当前K线复盘", command=self._replay_from_current_chart_point).grid(row=0, column=6, padx=(8, 0))
 
         notebook = ttk.Notebook(center)
         notebook.grid(row=1, column=0, sticky="nsew")
@@ -352,6 +375,47 @@ class BtcResearchWorkbenchWindow:
         self.overlay_vol_canvas.grid(row=1, column=0, sticky="nsew")
         overlay_pane.add(overlay_vol_frame, weight=2)
 
+        stats_tab = ttk.Frame(notebook, padding=10)
+        stats_tab.columnconfigure(0, weight=1)
+        stats_tab.rowconfigure(2, weight=1)
+        notebook.add(stats_tab, text="复盘统计")
+        self._stats_tab = stats_tab
+
+        stats_header = ttk.Frame(stats_tab)
+        stats_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        stats_header.columnconfigure(1, weight=1)
+        ttk.Label(stats_header, text="当前选中K线").grid(row=0, column=0, sticky="w")
+        ttk.Label(stats_header, textvariable=self.replay_selection_text, justify="left").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Button(stats_header, text="刷新统计", command=self._refresh_replay_statistics).grid(row=0, column=2, padx=(8, 0))
+
+        ttk.Label(stats_tab, textvariable=self.replay_stats_summary_text, justify="left", wraplength=860).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(0, 8),
+        )
+
+        replay_stats_tree = ttk.Treeview(
+            stats_tab,
+            columns=("signal_type", "samples", "effective", "partial", "invalid", "pending", "hit_rate", "avg24h"),
+            show="headings",
+            height=14,
+        )
+        replay_stats_tree.grid(row=2, column=0, sticky="nsew")
+        for key, label, width in (
+            ("signal_type", "信号类型", 180),
+            ("samples", "样本数", 76),
+            ("effective", "有效", 70),
+            ("partial", "部分有效", 78),
+            ("invalid", "无效", 70),
+            ("pending", "待验证", 70),
+            ("hit_rate", "命中率", 76),
+            ("avg24h", "24H均值", 90),
+        ):
+            replay_stats_tree.heading(key, text=label)
+            replay_stats_tree.column(key, width=width, anchor="center")
+        self._replay_stats_tree = replay_stats_tree
+
         for canvas in (self.chart_canvas, self.volatility_canvas, self.overlay_price_canvas, self.overlay_vol_canvas):
             canvas.bind("<Configure>", lambda _event: self._schedule_chart_redraw(), add="+")
             canvas.bind("<MouseWheel>", self._on_chart_mousewheel, add="+")
@@ -360,6 +424,8 @@ class BtcResearchWorkbenchWindow:
             canvas.bind("<Button-1>", self._on_chart_press, add="+")
             canvas.bind("<B1-Motion>", self._on_chart_drag, add="+")
             canvas.bind("<ButtonRelease-1>", self._on_chart_release, add="+")
+        self.chart_canvas.bind("<Double-Button-1>", self._on_main_chart_double_click, add="+")
+        for canvas in (self.volatility_canvas, self.overlay_price_canvas, self.overlay_vol_canvas):
             canvas.bind("<Double-Button-1>", lambda _event: self._reset_chart_view(), add="+")
 
         signal_box = ttk.LabelFrame(center, text="程序分析 / 波动率叠加", padding=10)
@@ -722,7 +788,98 @@ class BtcResearchWorkbenchWindow:
         timeframe = self._effective_chart_bar()
         self._historical_markers = _load_historical_analysis_markers("BTC-USDT-SWAP", timeframe)
         self._update_signal_text()
+        self._refresh_replay_statistics()
         self._schedule_chart_redraw()
+
+    def _refresh_replay_statistics(self) -> None:
+        timeframe = self._effective_chart_bar()
+        summary, rows = _load_replay_statistics("BTC-USDT-SWAP", timeframe)
+        self.replay_stats_summary_text.set(summary)
+        if self._replay_stats_tree is None:
+            return
+        self._replay_stats_tree.delete(*self._replay_stats_tree.get_children())
+        for row in rows:
+            self._replay_stats_tree.insert(
+                "",
+                END,
+                values=(
+                    row.signal_type,
+                    row.samples,
+                    row.effective,
+                    row.partial,
+                    row.invalid,
+                    row.pending,
+                    f"{row.hit_rate:.1f}%",
+                    "-" if row.avg_24h_return_pct is None else f"{row.avg_24h_return_pct:.2f}%",
+                ),
+            )
+
+    def _replay_from_current_chart_point(self) -> None:
+        if self._client is None:
+            messagebox.showinfo("提示", "当前未接入行情客户端，无法发起复盘。", parent=self.window)
+            return
+        candle = self._current_hovered_chart_candle()
+        if candle is None:
+            messagebox.showinfo("提示", "请先把十字光标移动到主图的某根K线上。", parent=self.window)
+            return
+        timeframe = self._effective_chart_bar()
+        analysis_dt = datetime.fromtimestamp(int(candle.ts) / 1000.0, tz=timezone.utc).astimezone(_CHINA_TZ)
+        config = BtcMarketAnalyzerConfig(
+            timeframes=(timeframe,),
+            history_limits=((timeframe, 5000),),
+            probability_config=MarketAnalysisConfig(direction_mode="close_to_close"),
+        )
+        self._replay_request_token += 1
+        request_token = self._replay_request_token
+        self.status_text.set(f"正在按 {timeframe} { _format_short_ts(int(candle.ts)) } 发起复盘，请稍候。")
+        self.replay_selection_text.set(f"{timeframe} | {_format_short_ts(int(candle.ts))} | C {candle.close}")
+
+        def worker() -> None:
+            try:
+                analysis = analyze_btc_market_at_time(
+                    self._client,
+                    symbol="BTC-USDT-SWAP",
+                    analysis_dt=analysis_dt,
+                    config=config,
+                )
+                report_path = save_btc_market_analysis(analysis)
+                self.window.after(0, lambda: self._on_replay_completed(request_token, analysis, report_path))
+            except Exception as exc:
+                self.window.after(0, lambda error=exc: self._on_replay_failed(request_token, error))
+
+        threading.Thread(target=worker, daemon=True, name="btc-research-replay").start()
+
+    def _on_main_chart_double_click(self, _event=None) -> None:
+        self._replay_from_current_chart_point()
+
+    def _on_replay_completed(self, request_token: int, analysis: Any, report_path: Path) -> None:
+        if request_token != self._replay_request_token:
+            return
+        self.status_text.set(
+            f"复盘完成 | {_format_short_ts(_analysis_primary_candle_ts(analysis) or 0)} | 方向 {analysis.direction} | 评分 {analysis.score}"
+        )
+        self._reload_historical_markers()
+        self._refresh_replay_statistics()
+        self._logger(f"[BTC研究工作台] 复盘完成 | 报告={report_path}")
+
+    def _on_replay_failed(self, request_token: int, exc: Exception) -> None:
+        if request_token != self._replay_request_token:
+            return
+        self.status_text.set(f"复盘失败：{exc}")
+        self._logger(f"[BTC研究工作台] 复盘失败 | {exc}")
+        messagebox.showerror("复盘失败", f"按当前K线发起复盘时出错：\n{exc}", parent=self.window)
+
+    def _current_hovered_chart_candle(self) -> Candle | None:
+        state = self._render_state_by_canvas.get(str(self.chart_canvas))
+        if state is not None:
+            hovered_index = self._chart_hover_indices.get(id(self.chart_canvas))
+            if hovered_index is not None:
+                candles = list(state.full_candles)
+                if 0 <= hovered_index < len(candles):
+                    candle = candles[hovered_index]
+                    self._last_selected_chart_candle = candle
+                    return candle
+        return self._last_selected_chart_candle
 
     def _update_signal_text(self) -> None:
         if len(self._candles) < 2:
@@ -1142,7 +1299,12 @@ class BtcResearchWorkbenchWindow:
             y = y_for(float(candle.high)) - 12
             color = {"long": "#16a34a", "short": "#dc2626", "neutral": "#b45309"}.get(marker.direction, "#2563eb")
             canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=color, outline=color)
-            canvas.create_text(x + 7, y - 2, text=f"{marker.timeframe} {marker.direction} {marker.score}", anchor="w", fill=color, font=("Consolas", 8, "bold"))
+            marker_text = f"{marker.timeframe} {marker.direction} {marker.score}"
+            if marker.verdict:
+                marker_text += f" | {marker.verdict}"
+            if marker.return_24h_pct:
+                marker_text += f" | 24H {marker.return_24h_pct}%"
+            canvas.create_text(x + 7, y - 2, text=marker_text, anchor="w", fill=color, font=("Consolas", 8, "bold"))
 
     def _on_chart_motion(self, event) -> None:
         if self._is_panning:
@@ -1165,6 +1327,13 @@ class BtcResearchWorkbenchWindow:
         if current == hover_index:
             return
         self._chart_hover_indices[id(canvas)] = hover_index
+        if canvas is self.chart_canvas:
+            candle = self._current_hovered_chart_candle()
+            if candle is not None:
+                self._last_selected_chart_candle = candle
+                self.replay_selection_text.set(
+                    f"{self._effective_chart_bar()} | {_format_short_ts(int(candle.ts))} | O {candle.open} C {candle.close}"
+                )
         self._draw_crosshair_overlay(canvas)
 
     def _on_chart_leave(self, event) -> None:
@@ -1994,6 +2163,18 @@ def _load_historical_analysis_markers(symbol: str, timeframe: str) -> list[Histo
         raw_timeframes = payload.get("timeframes")
         if not isinstance(raw_timeframes, list):
             continue
+        validation = payload.get("validation") if isinstance(payload.get("validation"), dict) else {}
+        verdict = str(validation.get("verdict", "") or "").strip()
+        return_24h_pct = ""
+        windows = validation.get("windows")
+        if isinstance(windows, list):
+            for window in windows:
+                if not isinstance(window, dict):
+                    continue
+                if int(window.get("hours", 0) or 0) != 24:
+                    continue
+                return_24h_pct = str(window.get("return_pct", "") or "").strip()
+                break
         for item in raw_timeframes:
             if not isinstance(item, dict):
                 continue
@@ -2012,7 +2193,149 @@ def _load_historical_analysis_markers(symbol: str, timeframe: str) -> list[Histo
                     direction=str(item.get("direction", "") or "").strip(),
                     score=int(item.get("score", 0) or 0),
                     confidence=str(item.get("confidence", "") or "").strip(),
+                    verdict=verdict,
+                    return_24h_pct=return_24h_pct,
                 )
             )
     markers.sort(key=lambda item: item.candle_ts)
     return markers
+
+
+def _analysis_primary_candle_ts(analysis: Any) -> int | None:
+    for item in getattr(analysis, "timeframes", ()) or ():
+        candle_ts = getattr(item, "candle_ts", None)
+        if candle_ts is not None:
+            try:
+                return int(candle_ts)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _load_replay_statistics(symbol: str, timeframe: str) -> tuple[str, list[ReplayStatsRow]]:
+    report_dir = analysis_report_dir_path()
+    if not report_dir.exists():
+        return "暂无复盘统计样本。", []
+    records: list[dict[str, object]] = []
+    for path in sorted(report_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("symbol", "") or "").strip().upper() != symbol.upper():
+            continue
+        if str(payload.get("mode", "") or "").strip() != "historical_replay":
+            continue
+        validation = payload.get("validation")
+        if not isinstance(validation, dict):
+            continue
+        tf_payload = _matching_timeframe_payload(payload, timeframe)
+        if tf_payload is None:
+            continue
+        records.append(
+            {
+                "signal_type": _primary_signal_type_from_report(payload, tf_payload),
+                "verdict": str(validation.get("verdict", "") or "").strip() or "pending",
+                "return_24h": _validation_24h_return(validation),
+            }
+        )
+    if not records:
+        return f"当前 {timeframe} 暂无复盘样本。", []
+
+    by_signal: dict[str, list[dict[str, object]]] = {}
+    for record in records:
+        by_signal.setdefault(str(record["signal_type"]), []).append(record)
+
+    rows: list[ReplayStatsRow] = []
+    for signal_type, items in by_signal.items():
+        effective = sum(1 for item in items if item["verdict"] == "effective")
+        partial = sum(1 for item in items if item["verdict"] == "partially_effective")
+        invalid = sum(1 for item in items if item["verdict"] == "invalid")
+        pending = sum(1 for item in items if item["verdict"] not in {"effective", "partially_effective", "invalid", "mixed"})
+        mixed = sum(1 for item in items if item["verdict"] == "mixed")
+        invalid += mixed
+        completed = max(len(items) - pending, 0)
+        hit_rate = ((effective + partial) / completed * 100.0) if completed > 0 else 0.0
+        returns = [float(item["return_24h"]) for item in items if isinstance(item.get("return_24h"), (int, float))]
+        avg_return = (sum(returns) / len(returns)) if returns else None
+        rows.append(
+            ReplayStatsRow(
+                signal_type=signal_type,
+                samples=len(items),
+                effective=effective,
+                partial=partial,
+                invalid=invalid,
+                pending=pending,
+                hit_rate=hit_rate,
+                avg_24h_return_pct=avg_return,
+            )
+        )
+
+    rows.sort(key=lambda item: (item.samples, item.hit_rate, 0.0 if item.avg_24h_return_pct is None else item.avg_24h_return_pct), reverse=True)
+    total = len(records)
+    total_effective = sum(item.effective for item in rows)
+    total_partial = sum(item.partial for item in rows)
+    total_pending = sum(item.pending for item in rows)
+    completed_total = max(total - total_pending, 0)
+    overall_hit = ((total_effective + total_partial) / completed_total * 100.0) if completed_total > 0 else 0.0
+    summary = (
+        f"{timeframe} 复盘样本 {total} 条 | 已完成 {completed_total} 条 | 命中率 {overall_hit:.1f}% | "
+        f"有效 {total_effective} | 部分有效 {total_partial} | 待验证 {total_pending}"
+    )
+    return summary, rows
+
+
+def _matching_timeframe_payload(payload: dict[str, object], timeframe: str) -> dict[str, object] | None:
+    raw_timeframes = payload.get("timeframes")
+    if not isinstance(raw_timeframes, list):
+        return None
+    for item in raw_timeframes:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("timeframe", "") or "").strip().upper() == timeframe.upper():
+            return item
+    return None
+
+
+def _primary_signal_type_from_report(payload: dict[str, object], timeframe_payload: dict[str, object]) -> str:
+    raw_signals = timeframe_payload.get("signals")
+    if isinstance(raw_signals, list):
+        for item in raw_signals:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or "").strip()
+            category = str(item.get("category", "") or "").strip()
+            if category == "resonance":
+                continue
+            if name:
+                return f"{category}:{name}" if category else name
+    top_level = payload.get("signals")
+    if isinstance(top_level, list):
+        for item in top_level:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or "").strip()
+            category = str(item.get("category", "") or "").strip()
+            if category == "resonance":
+                continue
+            if name:
+                return f"{category}:{name}" if category else name
+    return "unknown"
+
+
+def _validation_24h_return(validation: dict[str, object]) -> float | None:
+    windows = validation.get("windows")
+    if not isinstance(windows, list):
+        return None
+    for item in windows:
+        if not isinstance(item, dict):
+            continue
+        if int(item.get("hours", 0) or 0) != 24:
+            continue
+        try:
+            return float(item.get("return_pct"))
+        except (TypeError, ValueError):
+            return None
+    return None

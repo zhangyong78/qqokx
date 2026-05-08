@@ -14,6 +14,7 @@ from okx_quant.candle_patterns import (
     analyze_single_candle_patterns,
     single_candle_report_payload,
 )
+from okx_quant.btc_market_replay import ReplayValidation, build_replay_validation, replay_validation_payload
 from okx_quant.indicators import bollinger_bands, ema, macd
 from okx_quant.market_analysis import MarketAnalysisConfig, MarketAnalysisReport, build_market_analysis_report
 from okx_quant.models import Candle, EmailNotificationConfig
@@ -77,6 +78,12 @@ class BtcMarketAnalysis:
     signals: tuple[MarketSignal, ...]
     reason: tuple[str, ...]
     timeframes: tuple[TimeframeAnalysis, ...]
+    mode: str = "realtime"
+    analysis_timezone: str | None = None
+    analysis_point: str | None = None
+    analysis_point_utc: str | None = None
+    data_cutoff_rule: str | None = None
+    validation: ReplayValidation | None = None
 
 
 @dataclass(frozen=True)
@@ -113,7 +120,89 @@ def analyze_btc_market_from_client(
             timeframe,
             limit=_history_limit_for_timeframe(config, timeframe),
         )
-    return analyze_btc_market_from_candle_map(candle_map, symbol=symbol, config=config)
+    return analyze_btc_market_from_candle_map(candle_map, symbol=symbol, config=config, mode="realtime")
+
+
+def analyze_btc_market_at_time(
+    client: OkxRestClient,
+    *,
+    symbol: str = "BTC-USDT-SWAP",
+    analysis_dt: datetime,
+    config: BtcMarketAnalyzerConfig | None = None,
+    validation_windows_hours: tuple[int, ...] = (4, 12, 24),
+) -> BtcMarketAnalysis:
+    if analysis_dt.tzinfo is None:
+        raise ValueError("analysis_dt must be timezone-aware")
+    config = config or BtcMarketAnalyzerConfig()
+    analysis_dt_utc = analysis_dt.astimezone(timezone.utc)
+    end_ts = int(analysis_dt_utc.timestamp() * 1000)
+    preload_count = _indicator_preload_count(config)
+    candle_map: dict[str, list[Candle]] = {}
+    for timeframe in config.timeframes:
+        timeframe_ms = _timeframe_ms(timeframe)
+        history_limit = _history_limit_for_timeframe(config, timeframe)
+        selected_limit = history_limit if history_limit > 0 else max(preload_count + 240, 360)
+        start_ts = max(0, end_ts - ((selected_limit - 1) * timeframe_ms))
+        candle_map[timeframe] = client.get_candles_history_range(
+            symbol,
+            timeframe,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            limit=selected_limit,
+            preload_count=preload_count,
+        )
+        candle_map[timeframe] = [item for item in candle_map[timeframe] if int(item.ts) <= end_ts]
+    analysis = analyze_btc_market_from_candle_map(
+        candle_map,
+        symbol=symbol,
+        config=config,
+        mode="historical_replay",
+        analysis_timezone=str(analysis_dt.tzinfo),
+        analysis_point=analysis_dt.isoformat(timespec="seconds"),
+        analysis_point_utc=analysis_dt_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        data_cutoff_rule="close_time_lte_analysis_point",
+    )
+    primary = next((item for item in analysis.timeframes if item.candle_ts is not None and item.last_close is not None), None)
+    if primary is None:
+        return analysis
+    max_window_hours = max((hours for hours in validation_windows_hours if hours > 0), default=0)
+    future_candles: list[Candle] = []
+    if max_window_hours > 0:
+        future_candles = client.get_candles_history_range(
+            symbol,
+            primary.timeframe,
+            start_ts=primary.candle_ts + 1,
+            end_ts=primary.candle_ts + (max_window_hours * 3_600_000),
+            limit=0,
+            preload_count=0,
+        )
+        future_candles = [item for item in future_candles if int(item.ts) > int(primary.candle_ts)]
+    validation = build_replay_validation(
+        direction=analysis.direction,
+        timeframe=primary.timeframe,
+        entry_price=primary.last_close,
+        analysis_candle_ts=primary.candle_ts,
+        future_candles=future_candles,
+        timeframe_ms=_timeframe_ms(primary.timeframe),
+        windows_hours=validation_windows_hours,
+    )
+    return BtcMarketAnalysis(
+        symbol=analysis.symbol,
+        generated_at=analysis.generated_at,
+        direction=analysis.direction,
+        score=analysis.score,
+        confidence=analysis.confidence,
+        resonance=analysis.resonance,
+        signals=analysis.signals,
+        reason=analysis.reason,
+        timeframes=analysis.timeframes,
+        mode=analysis.mode,
+        analysis_timezone=analysis.analysis_timezone,
+        analysis_point=analysis.analysis_point,
+        analysis_point_utc=analysis.analysis_point_utc,
+        data_cutoff_rule=analysis.data_cutoff_rule,
+        validation=validation,
+    )
 
 
 def analyze_btc_market_from_candle_map(
@@ -121,6 +210,12 @@ def analyze_btc_market_from_candle_map(
     *,
     symbol: str = "BTC-USDT-SWAP",
     config: BtcMarketAnalyzerConfig | None = None,
+    mode: str = "realtime",
+    analysis_timezone: str | None = None,
+    analysis_point: str | None = None,
+    analysis_point_utc: str | None = None,
+    data_cutoff_rule: str | None = None,
+    validation: ReplayValidation | None = None,
 ) -> BtcMarketAnalysis:
     config = config or BtcMarketAnalyzerConfig()
     timeframe_results = tuple(
@@ -156,13 +251,24 @@ def analyze_btc_market_from_candle_map(
         signals=tuple(flattened_signals),
         reason=reason,
         timeframes=timeframe_results,
+        mode=mode,
+        analysis_timezone=analysis_timezone,
+        analysis_point=analysis_point,
+        analysis_point_utc=analysis_point_utc,
+        data_cutoff_rule=data_cutoff_rule,
+        validation=validation,
     )
 
 
 def btc_market_analysis_payload(analysis: BtcMarketAnalysis) -> dict[str, object]:
-    return {
+    payload = {
         "symbol": analysis.symbol,
         "generated_at": analysis.generated_at,
+        "mode": analysis.mode,
+        "analysis_timezone": analysis.analysis_timezone,
+        "analysis_point": analysis.analysis_point,
+        "analysis_point_utc": analysis.analysis_point_utc,
+        "data_cutoff_rule": analysis.data_cutoff_rule,
         "direction": analysis.direction,
         "score": analysis.score,
         "confidence": _decimal_text(analysis.confidence),
@@ -194,6 +300,10 @@ def btc_market_analysis_payload(analysis: BtcMarketAnalysis) -> dict[str, object
             for item in analysis.timeframes
         ],
     }
+    validation_payload = replay_validation_payload(analysis.validation)
+    if validation_payload is not None:
+        payload["validation"] = validation_payload
+    return payload
 
 
 def btc_market_analysis_json(analysis: BtcMarketAnalysis) -> str:
@@ -743,6 +853,26 @@ def _history_limit_for_timeframe(config: BtcMarketAnalyzerConfig, timeframe: str
         if key.strip().upper() == normalized:
             return value
     return config.default_history_limit
+
+
+def _indicator_preload_count(config: BtcMarketAnalyzerConfig) -> int:
+    indicator_max = max(
+        max(config.ema_periods),
+        config.macd_slow_period + config.macd_signal_period,
+        config.boll_period,
+    )
+    return max(indicator_max + 20, 80)
+
+
+def _timeframe_ms(timeframe: str) -> int:
+    normalized = timeframe.strip().upper()
+    if normalized.endswith("H"):
+        return int(normalized[:-1]) * 3_600_000
+    if normalized.endswith("D"):
+        return int(normalized[:-1]) * 86_400_000
+    if normalized.endswith("M"):
+        return int(normalized[:-1]) * 60_000
+    raise ValueError(f"Unsupported timeframe: {timeframe}")
 
 
 def _direction_from_score(score: int, threshold: int) -> AnalysisDirection:

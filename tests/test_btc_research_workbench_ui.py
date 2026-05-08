@@ -12,12 +12,13 @@ from zoneinfo import ZoneInfo
 
 from okx_quant.btc_research_workbench_ui import (
     _aggregate_deribit_candles,
-    _chart_hover_index_for_x,
     _default_chart_viewport,
     _align_overlay_candles,
     _build_realized_volatility_from_reference,
+    _chart_hover_index_for_x,
     _deribit_volatility_bucket_start_ms,
     _format_short_ts,
+    _load_replay_statistics,
     _load_historical_analysis_markers,
     _pan_chart_viewport,
     _slot_timestamp,
@@ -183,6 +184,50 @@ class BtcResearchWorkbenchHelpersTest(TestCase):
         self.assertEqual(markers[0].timeframe, "4H")
         self.assertEqual(markers[0].direction, "long")
         self.assertEqual(markers[0].score, 74)
+        self.assertEqual(markers[0].verdict, "")
+
+    def test_load_replay_statistics_groups_by_signal_type(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        report_dir = temp_dir / "reports" / "analysis"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        for index, verdict in enumerate(("effective", "partially_effective", "invalid"), start=1):
+            (report_dir / f"btc_replay_{index}.json").write_text(
+                json.dumps(
+                    {
+                        "symbol": "BTC-USDT-SWAP",
+                        "mode": "historical_replay",
+                        "signals": [{"name": "ema_bullish_alignment", "category": "indicator"}],
+                        "timeframes": [
+                            {
+                                "timeframe": "4H",
+                                "candle_ts": 1_700_000_000_000 + index,
+                                "direction": "long",
+                                "score": 70,
+                                "confidence": "0.7",
+                                "signals": [{"name": "ema_bullish_alignment", "category": "indicator"}],
+                            }
+                        ],
+                        "validation": {
+                            "verdict": verdict,
+                            "windows": [{"hours": 24, "return_pct": str(index)}],
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+        with patch("okx_quant.btc_research_workbench_ui.analysis_report_dir_path", return_value=report_dir):
+            summary, rows = _load_replay_statistics("BTC-USDT-SWAP", "4H")
+
+        self.assertIn("4H", summary)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].signal_type, "indicator:ema_bullish_alignment")
+        self.assertEqual(rows[0].samples, 3)
+        self.assertEqual(rows[0].effective, 1)
+        self.assertEqual(rows[0].partial, 1)
+        self.assertEqual(rows[0].invalid, 1)
 
     def test_viewport_matches_backtest_chart_windowing(self) -> None:
         start_index, visible_count = _default_chart_viewport(

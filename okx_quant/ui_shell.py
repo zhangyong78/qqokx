@@ -125,6 +125,7 @@ from okx_quant.position_protection import (
 from okx_quant.protection_replay_ui import ProtectionReplayLaunchState, ProtectionReplayWindow
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, format_decimal_fixed, snap_to_increment
 from okx_quant.signal_monitor_ui import SignalMonitorWindow
+from okx_quant.signal_replay_mock_ui import SignalReplayMockWindow
 from okx_quant.trader_desk import (
     TraderDeskSnapshot,
     TraderDraftRecord,
@@ -2116,6 +2117,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._backtest_compare_window: BacktestCompareOverviewWindow | None = None
         self._btc_market_analysis_window: BtcMarketAnalysisWindow | None = None
         self._btc_research_workbench_window: BtcResearchWorkbenchWindow | None = None
+        self._signal_replay_mock_window: SignalReplayMockWindow | None = None
         self._journal_window: JournalWindow | None = None
         self._signal_monitor_window: SignalMonitorWindow | None = None
         self._trader_desk_window: TraderDeskWindow | None = None
@@ -2672,6 +2674,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
         tools_menu.add_command(label="打开BTC行情分析", command=self.open_btc_market_analysis_window)
         tools_menu.add_command(label="打开BTC研究工作台", command=self.open_btc_research_workbench_window)
+        tools_menu.add_command(label="打开信号复盘实验室", command=self.open_signal_replay_mock_window)
         tools_menu.add_command(label="打开行情日记", command=self.open_journal_window)
         tools_menu.add_command(label="打开划线交易台", command=self.open_line_trading_desk_window)
         tools_menu.add_command(label="打开信号观察台", command=self.open_signal_monitor_window)
@@ -4891,6 +4894,17 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         self._journal_window = JournalWindow(
             self.root,
+            logger=self._enqueue_log,
+        )
+
+    def open_signal_replay_mock_window(self) -> None:
+        if self._signal_replay_mock_window is not None and self._signal_replay_mock_window.window.winfo_exists():
+            self._signal_replay_mock_window.show()
+            return
+
+        self._signal_replay_mock_window = SignalReplayMockWindow(
+            self.root,
+            client=self.client,
             logger=self._enqueue_log,
         )
 
@@ -9721,6 +9735,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             and self._btc_research_workbench_window.window.winfo_exists()
         ):
             self._btc_research_workbench_window.destroy()
+        if self._signal_replay_mock_window is not None and self._signal_replay_mock_window.window.winfo_exists():
+            self._signal_replay_mock_window.destroy()
         if self._journal_window is not None and self._journal_window.window.winfo_exists():
             self._journal_window.destroy()
         if self._signal_monitor_window is not None and self._signal_monitor_window.window.winfo_exists():
