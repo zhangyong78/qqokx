@@ -2,21 +2,52 @@ from __future__ import annotations
 
 import json
 import shutil
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from okx_quant.btc_research_workbench_ui import (
+    _aggregate_deribit_candles,
+    _chart_hover_index_for_x,
+    _default_chart_viewport,
     _align_overlay_candles,
     _build_realized_volatility_from_reference,
+    _deribit_volatility_bucket_start_ms,
+    _format_short_ts,
     _load_historical_analysis_markers,
+    _pan_chart_viewport,
+    _slot_timestamp,
 )
+from okx_quant.deribit_client import DeribitVolatilityCandle
 from okx_quant.models import Candle
 
 
 class BtcResearchWorkbenchHelpersTest(TestCase):
+    def test_aggregate_deribit_volatility_aligns_4h_to_beijing_bucket(self) -> None:
+        cn = ZoneInfo("Asia/Shanghai")
+        t0 = int(datetime(2024, 6, 1, 16, 0, tzinfo=cn).astimezone(timezone.utc).timestamp() * 1000)
+        t1 = int(datetime(2024, 6, 1, 17, 0, tzinfo=cn).astimezone(timezone.utc).timestamp() * 1000)
+        hourly = [
+            DeribitVolatilityCandle(ts=t0, open=Decimal("50"), high=Decimal("51"), low=Decimal("49"), close=Decimal("50.5")),
+            DeribitVolatilityCandle(ts=t1, open=Decimal("50.5"), high=Decimal("52"), low=Decimal("50"), close=Decimal("51.5")),
+        ]
+        out = _aggregate_deribit_candles(hourly, 14_400_000)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].ts, _deribit_volatility_bucket_start_ms(t0, 14_400_000))
+        self.assertEqual(out[0].open, Decimal("50"))
+        self.assertEqual(out[0].close, Decimal("51.5"))
+
+    def test_format_short_ts_uses_beijing_wall_clock(self) -> None:
+        cn = ZoneInfo("Asia/Shanghai")
+        dt = datetime(2024, 6, 1, 8, 30, tzinfo=cn)
+        ts_ms = int(dt.astimezone(timezone.utc).timestamp() * 1000)
+        self.assertIn("06-01", _format_short_ts(ts_ms))
+        self.assertIn("08:30", _format_short_ts(ts_ms))
+
     def _workspace_temp_dir(self) -> Path:
         temp_dir = Path("tests_artifacts") / uuid4().hex
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -152,3 +183,73 @@ class BtcResearchWorkbenchHelpersTest(TestCase):
         self.assertEqual(markers[0].timeframe, "4H")
         self.assertEqual(markers[0].direction, "long")
         self.assertEqual(markers[0].score, 74)
+
+    def test_viewport_matches_backtest_chart_windowing(self) -> None:
+        start_index, visible_count = _default_chart_viewport(
+            519,
+            220,
+            min_visible=36,
+        )
+
+        self.assertEqual(visible_count, 220)
+        self.assertEqual(start_index, 299)
+
+        moved_start = _pan_chart_viewport(
+            start_index,
+            visible_count,
+            519,
+            6,
+            min_visible=36,
+        )
+
+        self.assertEqual(moved_start, 299)
+
+    def test_slot_timestamp_extends_future_axis_from_last_candle(self) -> None:
+        candles = [
+            Candle(
+                ts=1_700_000_000_000,
+                open=Decimal("1"),
+                high=Decimal("1"),
+                low=Decimal("1"),
+                close=Decimal("1"),
+                volume=Decimal("0"),
+                confirmed=True,
+            ),
+            Candle(
+                ts=1_700_014_400_000,
+                open=Decimal("1"),
+                high=Decimal("1"),
+                low=Decimal("1"),
+                close=Decimal("1"),
+                volume=Decimal("0"),
+                confirmed=True,
+            ),
+        ]
+
+        future_ts = _slot_timestamp(candles, 4, 14_400_000)
+
+        self.assertEqual(future_ts, 1_700_057_600_000)
+
+    def test_chart_hover_index_for_x_snaps_to_nearest_candle_center(self) -> None:
+        self.assertEqual(
+            _chart_hover_index_for_x(
+                x=75.0,
+                left=50,
+                width=200,
+                start_index=10,
+                end_index=20,
+                candle_step=20.0,
+            ),
+            11,
+        )
+        self.assertEqual(
+            _chart_hover_index_for_x(
+                x=49.0,
+                left=50,
+                width=200,
+                start_index=10,
+                end_index=20,
+                candle_step=20.0,
+            ),
+            None,
+        )

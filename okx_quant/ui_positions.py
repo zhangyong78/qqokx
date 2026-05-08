@@ -305,8 +305,7 @@ class UiPositionsMixin:
             self._positions_zoom_window.focus_force()
             self._schedule_positions_zoom_sync()
             self._load_local_history_cache()
-            self.refresh_positions()
-            self.sync_positions_zoom_data()
+            self._refresh_positions_zoom_all()
             return
 
         window = Toplevel(self.root)
@@ -355,7 +354,7 @@ class UiPositionsMixin:
         self._positions_zoom_credential_profile_combo.bind("<<ComboboxSelected>>", self._on_api_profile_selected)
         self._sync_credential_profile_combo()
         zoom_api.grid(row=0, column=0, sticky="w", padx=(0, 10))
-        ttk.Button(zoom_actions, text="刷新", command=self.refresh_positions).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(zoom_actions, text="刷新", command=self._refresh_positions_zoom_all).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(zoom_actions, text="账户信息", command=self.open_account_info_window).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(zoom_actions, text="平仓选中", command=self.flatten_selected_position).grid(row=0, column=2, padx=(0, 6))
         ttk.Button(zoom_actions, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=3, padx=(0, 6))
@@ -1767,6 +1766,38 @@ class UiPositionsMixin:
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
         return profile_name or DEFAULT_CREDENTIAL_PROFILE_NAME, environment
 
+    def _refresh_positions_zoom_all(self) -> None:
+        """持仓大窗「刷新」：持仓 + 下方各历史/委托标签页一并从服务端同步。"""
+        self.refresh_positions()
+        self.sync_positions_zoom_data()
+
+    def _refresh_account_views_after_credential_profile_switch(self) -> None:
+        """切换 API 配置后刷新主界面与持仓大窗共用的委托/历史缓存与远端数据。"""
+        if getattr(self, "position_tree", None) is None:
+            return
+        try:
+            self._load_local_history_cache()
+        except Exception:
+            pass
+        try:
+            self._refresh_positions_zoom_all()
+        except Exception:
+            pass
+        account_win = getattr(self, "_account_info_window", None)
+        if account_win is not None:
+            try:
+                if account_win.winfo_exists():
+                    self.refresh_account_dashboard()
+            except Exception:
+                pass
+        zoom_win = getattr(self, "_positions_zoom_window", None)
+        if zoom_win is not None:
+            try:
+                if zoom_win.winfo_exists():
+                    self._schedule_positions_zoom_sync(15)
+            except Exception:
+                pass
+
     def _load_local_history_cache(self) -> None:
         profile_name, environment = self._active_history_scope()
         order_records = load_history_cache_records("orders", profile_name, environment)
@@ -2273,6 +2304,7 @@ class UiPositionsMixin:
 
     def _start_pending_orders_refresh(self, credentials: Credentials, environment: str) -> None:
         if self._pending_orders_refreshing:
+            self._pending_orders_refresh_queue = (credentials, environment)
             return
         self._pending_orders_refreshing = True
         self._positions_zoom_pending_orders_summary_text.set("正在刷新当前委托...")
@@ -2281,6 +2313,14 @@ class UiPositionsMixin:
             args=(credentials, environment),
             daemon=True,
         ).start()
+
+    def _drain_pending_orders_refresh_queue(self) -> None:
+        pending = self._pending_orders_refresh_queue
+        self._pending_orders_refresh_queue = None
+        if pending is None:
+            return
+        cred, env = pending
+        self._start_pending_orders_refresh(cred, env)
 
     def _start_order_history_refresh(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         if self._order_history_refreshing:
@@ -2368,6 +2408,7 @@ class UiPositionsMixin:
         self._positions_zoom_pending_orders_base_summary = summary
         self._positions_zoom_pending_orders_summary_text.set(summary)
         self._render_pending_orders_view()
+        self._drain_pending_orders_refresh_queue()
 
     def _apply_order_history(
         self,
@@ -2428,6 +2469,7 @@ class UiPositionsMixin:
         self._positions_zoom_pending_orders_base_summary = summary
         self._positions_zoom_pending_orders_summary_text.set(self._positions_zoom_pending_orders_base_summary)
         self._enqueue_log(summary)
+        self._drain_pending_orders_refresh_queue()
 
     def _apply_order_history_error(self, message: str) -> None:
         self._order_history_refreshing = False

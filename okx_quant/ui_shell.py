@@ -2209,6 +2209,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._fills_history_refreshing = False
         self._position_history_refreshing = False
         self._pending_orders_refreshing = False
+        self._pending_orders_refresh_queue: tuple[Credentials, str] | None = None
         self._pending_order_canceling = False
         self._order_history_refreshing = False
         self._pending_orders_last_refresh_at: datetime | None = None
@@ -5155,6 +5156,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._update_settings_summary()
         if log_change:
             self._enqueue_log(f"已切换 API 配置：{target}")
+        UiPositionsMixin._refresh_account_views_after_credential_profile_switch(self)
 
     def _load_saved_credentials(self) -> None:
         try:
@@ -10271,9 +10273,9 @@ def _build_strategy_start_confirmation_message(
                 ]
             )
         else:
+            # 突破参考 EMA 已在上方「参数说明」首段追加，此处勿重复
             lines.extend(
                 [
-                    f"突破参考EMA：EMA{config.resolved_entry_reference_ema_period()}（已收盘K线的突破/跌破判断基准）",
                     f"止盈方式：{take_profit_mode_text}",
                     f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}（同一波最多允许开仓的次数）",
                     f"启动追单窗口：{_startup_chase_text()}",
