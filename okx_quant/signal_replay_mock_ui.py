@@ -15,9 +15,13 @@ try:
 except Exception:  # pragma: no cover
     _CHINA_TZ = timezone(timedelta(hours=8))
 
+from okx_quant.btc_market_analyzer import load_btc_market_email_notifier
 from okx_quant.models import Candle
+from okx_quant.notifications import EmailNotifier
 from okx_quant.signal_replay_engine import SignalReplayConfig, SignalReplayDataset, SignalReplayPoint, build_signal_replay_dataset
 from okx_quant.window_layout import apply_adaptive_window_geometry, apply_fill_window_geometry, apply_window_icon, toggle_toplevel_maximize
+
+_AUTO_REFRESH_MS = 60_000
 
 
 @dataclass(frozen=True)
@@ -45,7 +49,11 @@ class SignalReplayMockWindow:
         self._logger = logger or (lambda _message: None)
         self._load_token = 0
         self._redraw_job: str | None = None
+        self._auto_refresh_job: str | None = None
         self._dataset: SignalReplayDataset | None = None
+        self._notifier: EmailNotifier | None = load_btc_market_email_notifier()
+        self._emailed_signal_keys: set[str] = set()
+        self._is_loading = False
         self._visible_start = 0
         self._visible_count = 180
         self._hover_index: int | None = None
@@ -89,6 +97,35 @@ class SignalReplayMockWindow:
         self.include_long = BooleanVar(value=True)
         self.include_short = BooleanVar(value=True)
         self.confirmed_only = BooleanVar(value=True)
+        self.enable_pattern_signals = BooleanVar(value=True)
+        self.auto_refresh_enabled = BooleanVar(value=True)
+        self.latest_signal_email_enabled = BooleanVar(value=True)
+        self.enable_big_bullish = BooleanVar(value=True)
+        self.enable_big_bearish = BooleanVar(value=True)
+        self.enable_long_upper_shadow = BooleanVar(value=True)
+        self.enable_long_lower_shadow = BooleanVar(value=True)
+        self.enable_false_breakdown = BooleanVar(value=True)
+        self.enable_false_breakout = BooleanVar(value=True)
+        self.enable_inside_bar = BooleanVar(value=True)
+        self.enable_top_fractal = BooleanVar(value=True)
+        self.enable_bottom_fractal = BooleanVar(value=True)
+        self.enable_large_move_gate = BooleanVar(value=True)
+        self.enable_large_move_mean = BooleanVar(value=True)
+        self.enable_large_move_atr = BooleanVar(value=True)
+        self.enable_large_move_body_ratio = BooleanVar(value=False)
+        self.enable_large_move_fixed = BooleanVar(value=False)
+        self.mean_body_period = StringVar(value="20")
+        self.mean_body_multiplier = StringVar(value="1.8")
+        self.large_move_atr_period = StringVar(value="14")
+        self.large_move_atr_multiplier = StringVar(value="1.2")
+        self.body_ratio_threshold = StringVar(value="0.6")
+        self.fixed_body_threshold = StringVar(value="0")
+        self.fractal_trend_lookback = StringVar(value="5")
+        self.fractal_trend_min_bars = StringVar(value="3")
+        self.false_break_reference_lookback = StringVar(value="6")
+        self.false_break_min_pct = StringVar(value="0.05")
+        self.false_break_atr_multiplier = StringVar(value="0.1")
+        self.false_break_reclaim_position = StringVar(value="0.6")
 
         self.status_text = StringVar(value="等待加载 1H K线。")
         self.summary_text = StringVar(value="BTC / 1H / EMA21-55 / MACD / 乖离率 / 成交量")
@@ -103,6 +140,7 @@ class SignalReplayMockWindow:
         self._apply_empty_state()
         if self._client is not None:
             self.window.after(100, self.load_replay_data)
+        self._schedule_auto_refresh()
 
     def show(self) -> None:
         self.window.deiconify()
@@ -110,6 +148,18 @@ class SignalReplayMockWindow:
         self.window.focus_force()
 
     def destroy(self) -> None:
+        if self._redraw_job is not None:
+            try:
+                self.window.after_cancel(self._redraw_job)
+            except Exception:
+                pass
+            self._redraw_job = None
+        if self._auto_refresh_job is not None:
+            try:
+                self.window.after_cancel(self._auto_refresh_job)
+            except Exception:
+                pass
+            self._auto_refresh_job = None
         if self.window.winfo_exists():
             self.window.destroy()
 
@@ -186,6 +236,69 @@ class SignalReplayMockWindow:
             ttk.Checkbutton(option_row, text=label, variable=variable, command=self.rebuild_signals).grid(
                 row=0, column=index, sticky="w", padx=(0, 14)
             )
+        base_column = len(options)
+        ttk.Checkbutton(option_row, text="自动刷新", variable=self.auto_refresh_enabled, command=self._schedule_auto_refresh).grid(
+            row=0, column=base_column, sticky="w", padx=(0, 14)
+        )
+        ttk.Checkbutton(option_row, text="最新K线邮件", variable=self.latest_signal_email_enabled).grid(
+            row=0, column=base_column + 1, sticky="w", padx=(0, 14)
+        )
+
+        pattern_row = ttk.Frame(filters)
+        pattern_row.grid(row=3, column=0, columnspan=11, sticky="ew", pady=(10, 0))
+        ttk.Label(pattern_row, text="K线信号").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        pattern_options = (
+            ("大阳", self.enable_big_bullish),
+            ("大阴", self.enable_big_bearish),
+            ("长上影", self.enable_long_upper_shadow),
+            ("长下影", self.enable_long_lower_shadow),
+            ("假跌破", self.enable_false_breakdown),
+            ("假突破", self.enable_false_breakout),
+            ("孕育", self.enable_inside_bar),
+            ("顶分型", self.enable_top_fractal),
+            ("底分型", self.enable_bottom_fractal),
+        )
+        ttk.Checkbutton(pattern_row, text="启用形态", variable=self.enable_pattern_signals, command=self.rebuild_signals).grid(
+            row=0, column=1, sticky="w", padx=(0, 12)
+        )
+        for index, (label, variable) in enumerate(pattern_options, start=2):
+            ttk.Checkbutton(pattern_row, text=label, variable=variable, command=self.rebuild_signals).grid(
+                row=0, column=index, sticky="w", padx=(0, 12)
+            )
+
+        large_row = ttk.Frame(filters)
+        large_row.grid(row=4, column=0, columnspan=11, sticky="ew", pady=(8, 0))
+        ttk.Label(large_row, text="大波动").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        large_options = (
+            ("门控", self.enable_large_move_gate),
+            ("均值", self.enable_large_move_mean),
+            ("ATR", self.enable_large_move_atr),
+            ("实体占比", self.enable_large_move_body_ratio),
+            ("固定阈值", self.enable_large_move_fixed),
+        )
+        for index, (label, variable) in enumerate(large_options, start=1):
+            ttk.Checkbutton(large_row, text=label, variable=variable, command=self.rebuild_signals).grid(
+                row=0, column=index, sticky="w", padx=(0, 10)
+            )
+        large_fields = (
+            ("均值N", self.mean_body_period, 5),
+            ("倍数", self.mean_body_multiplier, 5),
+            ("ATR N", self.large_move_atr_period, 5),
+            ("ATR倍数", self.large_move_atr_multiplier, 5),
+            ("占比", self.body_ratio_threshold, 5),
+            ("固定", self.fixed_body_threshold, 7),
+            ("分型前N", self.fractal_trend_lookback, 5),
+            ("同向数", self.fractal_trend_min_bars, 5),
+            ("假破N", self.false_break_reference_lookback, 5),
+            ("刺破%", self.false_break_min_pct, 5),
+            ("刺破ATR", self.false_break_atr_multiplier, 5),
+            ("收回位", self.false_break_reclaim_position, 5),
+        )
+        start_col = len(large_options) + 1
+        for offset, (label, variable, width) in enumerate(large_fields):
+            col = start_col + (offset * 2)
+            ttk.Label(large_row, text=label).grid(row=0, column=col, sticky="w", padx=(0, 4))
+            ttk.Entry(large_row, textvariable=variable, width=width).grid(row=0, column=col + 1, sticky="w", padx=(0, 8))
 
     def _build_left_panel(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -287,7 +400,7 @@ class SignalReplayMockWindow:
         samples.rowconfigure(0, weight=1)
         self.sample_tree = ttk.Treeview(
             samples,
-            columns=("time", "side", "score", "ret24"),
+            columns=("time", "pattern", "bars", "side", "score", "ret24"),
             show="headings",
             height=16,
         )
@@ -296,7 +409,9 @@ class SignalReplayMockWindow:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.sample_tree.configure(yscrollcommand=scrollbar.set)
         for key, label, width in (
-            ("time", "时间", 132),
+            ("time", "时间", 94),
+            ("pattern", "信号", 86),
+            ("bars", "K", 34),
             ("side", "方向", 54),
             ("score", "评分", 54),
             ("ret24", "24H", 68),
@@ -315,7 +430,46 @@ class SignalReplayMockWindow:
             canvas.bind("<ButtonRelease-1>", self._on_mouse_release, add="+")
         self.sample_tree.bind("<<TreeviewSelect>>", self._on_sample_selected, add="+")
 
+    def _load_replay_data(self, *, trigger_email: bool) -> None:
+        if self._client is None:
+            self.status_text.set("当前没有行情客户端，无法加载真实 K线。")
+            return
+        if self._is_loading:
+            return
+        symbol = self.symbol.get().strip().upper() or "BTC-USDT-SWAP"
+        try:
+            limit = max(120, min(int(self.lookback.get().strip() or "720"), 5000))
+        except ValueError:
+            messagebox.showerror("参数错误", "K线数量必须是整数。", parent=self.window)
+            return
+        self.lookback.set(str(limit))
+        self._load_token += 1
+        token = self._load_token
+        previous_latest_ts = self._dataset.candles[-1].ts if self._dataset is not None and self._dataset.candles else None
+        self._is_loading = True
+        self.status_text.set(f"正在加载 {symbol} 1H K线...")
+
+        def worker() -> None:
+            try:
+                candles = self._client.get_candles_history(symbol, "1H", limit=limit)
+            except Exception as exc:
+                self.window.after(0, lambda error=exc: self._apply_load_error_v2(token, error))
+                return
+            self.window.after(
+                0,
+                lambda result=candles, last_ts=previous_latest_ts, should_email=trigger_email: self._apply_loaded_candles_v2(
+                    token,
+                    result,
+                    previous_latest_ts=last_ts,
+                    trigger_email=should_email,
+                ),
+            )
+
+        threading.Thread(target=worker, daemon=True, name="signal-replay-load").start()
+
     def load_replay_data(self) -> None:
+        self._load_replay_data(trigger_email=False)
+        return
         if self._client is None:
             self.status_text.set("当前没有行情客户端，无法加载真实 K线。")
             return
@@ -340,14 +494,57 @@ class SignalReplayMockWindow:
 
         threading.Thread(target=worker, daemon=True, name="signal-replay-load").start()
 
-    def _apply_loaded_candles(self, token: int, candles: list[Candle]) -> None:
+    def _apply_loaded_candles_v2(
+        self,
+        token: int,
+        candles: list[Candle],
+        *,
+        previous_latest_ts: int | None,
+        trigger_email: bool,
+    ) -> None:
         if token != self._load_token:
             return
+        self._is_loading = False
+        try:
+            self._dataset = build_signal_replay_dataset(candles, config=self._current_config())
+        except Exception as exc:
+            self._apply_load_error_v2(token, exc)
+            return
+        latest_ts = self._dataset.candles[-1].ts if self._dataset.candles else None
+        self.reset_view()
+        count = len(self._dataset.candles)
+        self.summary_text.set(f"{self.symbol.get().strip().upper()} / 1H / K线 {count} / 信号 {len(self._dataset.signals)}")
+        self.status_text.set(f"已加载 {count} 根 1H K线，生成 {len(self._dataset.signals)} 个候选信号。")
+        self._refresh_side_panels()
+        self._schedule_redraw()
+        if trigger_email and latest_ts is not None and previous_latest_ts is not None and latest_ts > previous_latest_ts:
+            self._handle_latest_candle_refresh()
+        self._logger(f"[信号复盘实验室] 已加载 {self.symbol.get().strip().upper()} 1H K线 {count} 根")
+
+    def _apply_load_error_v2(self, token: int, exc: Exception) -> None:
+        if token != self._load_token:
+            return
+        self._is_loading = False
+        self.status_text.set(f"加载失败：{exc}")
+        messagebox.showerror("加载失败", f"加载信号复盘数据时出错：\n{exc}", parent=self.window)
+
+    def _apply_loaded_candles(
+        self,
+        token: int,
+        candles: list[Candle],
+        *,
+        previous_latest_ts: int | None = None,
+        trigger_email: bool = False,
+    ) -> None:
+        if token != self._load_token:
+            return
+        self._is_loading = False
         try:
             self._dataset = build_signal_replay_dataset(candles, config=self._current_config())
         except Exception as exc:
             self._apply_load_error(token, exc)
             return
+        latest_ts = self._dataset.candles[-1].ts if self._dataset.candles else None
         self.reset_view()
         count = len(self._dataset.candles)
         self.summary_text.set(f"{self.symbol.get().strip().upper()} / 1H / K线 {count} / 信号 {len(self._dataset.signals)}")
@@ -402,6 +599,33 @@ class SignalReplayMockWindow:
             include_long=self.include_long.get(),
             include_short=self.include_short.get(),
             confirmed_only=self.confirmed_only.get(),
+            enable_pattern_signals=self.enable_pattern_signals.get(),
+            enable_big_bullish=self.enable_big_bullish.get(),
+            enable_big_bearish=self.enable_big_bearish.get(),
+            enable_long_upper_shadow=self.enable_long_upper_shadow.get(),
+            enable_long_lower_shadow=self.enable_long_lower_shadow.get(),
+            enable_false_breakdown=self.enable_false_breakdown.get(),
+            enable_false_breakout=self.enable_false_breakout.get(),
+            enable_inside_bar=self.enable_inside_bar.get(),
+            enable_top_fractal=self.enable_top_fractal.get(),
+            enable_bottom_fractal=self.enable_bottom_fractal.get(),
+            enable_large_move_gate=self.enable_large_move_gate.get(),
+            enable_large_move_mean=self.enable_large_move_mean.get(),
+            enable_large_move_atr=self.enable_large_move_atr.get(),
+            enable_large_move_body_ratio=self.enable_large_move_body_ratio.get(),
+            enable_large_move_fixed=self.enable_large_move_fixed.get(),
+            mean_body_period=self._parse_int(self.mean_body_period.get(), 20, "均值N"),
+            mean_body_multiplier=self._parse_decimal(self.mean_body_multiplier.get(), Decimal("1.8"), "大波动均值倍数"),
+            large_move_atr_period=self._parse_int(self.large_move_atr_period.get(), 14, "大波动ATR周期"),
+            large_move_atr_multiplier=self._parse_decimal(self.large_move_atr_multiplier.get(), Decimal("1.2"), "大波动ATR倍数"),
+            body_ratio_threshold=self._parse_decimal(self.body_ratio_threshold.get(), Decimal("0.6"), "实体占比"),
+            fixed_body_threshold=self._parse_decimal(self.fixed_body_threshold.get(), Decimal("0"), "固定实体阈值"),
+            fractal_trend_lookback=self._parse_int(self.fractal_trend_lookback.get(), 5, "分型前N"),
+            fractal_trend_min_bars=self._parse_int(self.fractal_trend_min_bars.get(), 3, "同向数"),
+            false_break_reference_lookback=self._parse_int(self.false_break_reference_lookback.get(), 6, "假破N"),
+            false_break_min_pct=self._parse_decimal(self.false_break_min_pct.get(), Decimal("0.05"), "刺破%"),
+            false_break_atr_multiplier=self._parse_decimal(self.false_break_atr_multiplier.get(), Decimal("0.1"), "刺破ATR"),
+            false_break_reclaim_position=self._parse_decimal(self.false_break_reclaim_position.get(), Decimal("0.6"), "收回位"),
         )
 
     def _refresh_side_panels(self) -> None:
@@ -437,18 +661,21 @@ class SignalReplayMockWindow:
         target_signal = self._signal_at_index(self._selected_index) or self._signal_at_index(self._hover_index)
         latest = dataset.candles[-1] if dataset.candles else None
         if target_signal is not None:
-            self.card_title_vars[0].set(f"{_direction_label(target_signal.direction)}候选  {target_signal.score}分")
-            self.card_detail_vars[0].set(f"{_format_ts(target_signal.ts)} | {target_signal.setup}")
+            self.card_title_vars[0].set(f"{target_signal.pattern_name}  {target_signal.score}分")
+            self.card_detail_vars[0].set(
+                f"{_format_ts(target_signal.ts)} | {_direction_label(target_signal.direction)} | {target_signal.candle_count}根K线"
+            )
             self.card_title_vars[1].set("触发原因")
             self.card_detail_vars[1].set(target_signal.reason)
             validation = target_signal.validation
             self.card_title_vars[2].set("后验表现")
+            rule_text = "、".join(target_signal.large_move_rules) if target_signal.large_move_rules else "-"
             self.card_detail_vars[2].set(
                 f"4H {_fmt_optional_signed(validation.return_4h_pct)} | "
                 f"12H {_fmt_optional_signed(validation.return_12h_pct)} | "
                 f"24H {_fmt_optional_signed(validation.return_24h_pct)} | "
                 f"MFE {_fmt_optional_signed(validation.max_favorable_excursion_pct)} / "
-                f"MAE {_fmt_optional_signed(validation.max_adverse_excursion_pct)}"
+                f"MAE {_fmt_optional_signed(validation.max_adverse_excursion_pct)} | 大波动 {rule_text}"
             )
             return
         if latest is None:
@@ -478,7 +705,9 @@ class SignalReplayMockWindow:
                 iid=tree_id,
                 values=(
                     _format_ts(signal.ts, short=True),
-                    "多" if signal.direction == "long" else "空",
+                    signal.pattern_name,
+                    str(signal.candle_count),
+                    _direction_short_label(signal.direction),
                     str(signal.score),
                     _fmt_optional_signed(signal.validation.return_24h_pct),
                 ),
@@ -787,9 +1016,64 @@ class SignalReplayMockWindow:
         self.selected_signal_text.set(
             f"{_format_ts(signal.ts)}\n"
             f"{_direction_label(signal.direction)} | {signal.score}分\n"
-            f"{signal.setup}\n"
+            f"{signal.pattern_name} | {signal.candle_count}根K线\n"
             f"24H {_fmt_optional_signed(signal.validation.return_24h_pct)}"
         )
+
+    def _schedule_auto_refresh(self) -> None:
+        if self._auto_refresh_job is not None:
+            try:
+                self.window.after_cancel(self._auto_refresh_job)
+            except Exception:
+                pass
+            self._auto_refresh_job = None
+        if not self.auto_refresh_enabled.get() or not self.window.winfo_exists():
+            return
+        self._auto_refresh_job = self.window.after(_AUTO_REFRESH_MS, self._run_auto_refresh)
+
+    def _run_auto_refresh(self) -> None:
+        self._auto_refresh_job = None
+        if not self.window.winfo_exists():
+            return
+        if self.auto_refresh_enabled.get():
+            self._load_replay_data(trigger_email=True)
+        self._schedule_auto_refresh()
+
+    def _handle_latest_candle_refresh(self) -> None:
+        dataset = self._dataset
+        if dataset is None or not dataset.candles:
+            return
+        latest_ts = dataset.candles[-1].ts
+        latest_signals = [signal for signal in dataset.signals if signal.ts == latest_ts]
+        symbol = self.symbol.get().strip().upper() or "BTC-USDT-SWAP"
+        if not latest_signals:
+            self._logger(f"[信号复盘实验室] {symbol} 最新 1H K线无新信号")
+            return
+        self._logger(f"[信号复盘实验室] {symbol} 最新 1H K线生成 {len(latest_signals)} 个新信号")
+        if self.latest_signal_email_enabled.get():
+            self._send_latest_signal_emails(latest_signals)
+
+    def _send_latest_signal_emails(self, signals: list[SignalReplayPoint]) -> None:
+        notifier = self._notifier or load_btc_market_email_notifier()
+        self._notifier = notifier
+        if notifier is None or not notifier.signal_notifications_enabled:
+            self._logger("[信号复盘实验室] 最新K线信号邮件未发送：请检查全局邮件和信号通知设置")
+            return
+        symbol = self.symbol.get().strip().upper() or "BTC-USDT-SWAP"
+        bar = self.bar.get().strip() or "1H"
+        sent_count = 0
+        for signal in signals:
+            dedupe_key = _signal_dedupe_key(symbol, bar, signal)
+            if dedupe_key in self._emailed_signal_keys:
+                continue
+            notifier.notify_async(
+                _build_signal_email_subject(symbol, bar, signal),
+                _build_signal_email_body(symbol, bar, signal),
+            )
+            self._emailed_signal_keys.add(dedupe_key)
+            sent_count += 1
+        if sent_count > 0:
+            self._logger(f"[信号复盘实验室] {symbol} 最新K线信号邮件已发送 {sent_count} 封")
 
     @staticmethod
     def _parse_decimal(value: str, fallback: Decimal, label: str) -> Decimal:
@@ -798,9 +1082,31 @@ class SignalReplayMockWindow:
         except (InvalidOperation, ValueError):
             raise ValueError(f"{label} 必须是数字")
 
+    @staticmethod
+    def _parse_int(value: str, fallback: int, label: str) -> int:
+        try:
+            parsed = int(str(value).strip())
+        except ValueError:
+            raise ValueError(f"{label} 必须是整数")
+        if parsed <= 0:
+            raise ValueError(f"{label} 必须大于0")
+        return parsed
+
 
 def _direction_label(direction: str) -> str:
-    return "开多" if direction == "long" else "开空"
+    if direction == "long":
+        return "开多"
+    if direction == "short":
+        return "开空"
+    return "观察"
+
+
+def _direction_short_label(direction: str) -> str:
+    if direction == "long":
+        return "多"
+    if direction == "short":
+        return "空"
+    return "观"
 
 
 def _format_ts(ts: int, *, short: bool = False) -> str:

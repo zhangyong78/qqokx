@@ -1,10 +1,12 @@
 import http.client
+import os
 from decimal import Decimal
 from unittest import TestCase
 from unittest.mock import patch
 
 from okx_quant.engine import (
     OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES,
+    get_okx_read_retry_config,
     OrderSizeTooSmallError,
     FilledPosition,
     ManagedEntryOrder,
@@ -35,6 +37,34 @@ from okx_quant.strategy_catalog import (
 
 
 class StrategyEngineTest(TestCase):
+    def test_get_okx_read_retry_config_env_overrides(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "QQOKX_READ_RETRY_ATTEMPTS": "12",
+                "QQOKX_READ_RETRY_BASE_DELAY_SECONDS": "2",
+                "QQOKX_READ_RETRY_MAX_DELAY_SECONDS": "15",
+            },
+            clear=False,
+        ):
+            attempts, base, max_delay = get_okx_read_retry_config()
+        self.assertEqual(attempts, 12)
+        self.assertEqual(base, 2.0)
+        self.assertEqual(max_delay, 15.0)
+
+    def test_get_okx_read_retry_config_clamps_max_delay_to_at_least_base(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "QQOKX_READ_RETRY_BASE_DELAY_SECONDS": "5",
+                "QQOKX_READ_RETRY_MAX_DELAY_SECONDS": "2",
+            },
+            clear=False,
+        ):
+            _attempts, base, max_delay = get_okx_read_retry_config()
+        self.assertEqual(base, 5.0)
+        self.assertGreaterEqual(max_delay, base)
+
     def _make_candles(self, closes: list[str]) -> list[Candle]:
         candles: list[Candle] = []
         previous_close = Decimal(closes[0])

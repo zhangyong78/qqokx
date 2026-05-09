@@ -21,7 +21,8 @@ class EngineRetryPolicy:
 
         engine = self._engine
         last_exc: OkxApiError | None = None
-        for attempt in range(1, engine_module.OKX_READ_RETRY_ATTEMPTS + 1):
+        max_attempts, base_delay, max_delay = engine_module.get_okx_read_retry_config()
+        for attempt in range(1, max_attempts + 1):
             try:
                 return fn()
             except Exception as exc:
@@ -32,7 +33,7 @@ class EngineRetryPolicy:
                 detail = str(okx_exc).strip() or f"code={okx_exc.code or '-'}"
                 if (
                     not engine_module._is_transient_okx_error(okx_exc)
-                    or attempt >= engine_module.OKX_READ_RETRY_ATTEMPTS
+                    or attempt >= max_attempts
                     or engine._stop_event.is_set()
                 ):
                     engine._logger(f"OKX 读取失败 | 操作={label} | {detail}")
@@ -42,15 +43,12 @@ class EngineRetryPolicy:
                         [
                             "OKX 读取异常，准备重试",
                             f"操作={label}",
-                            f"第{attempt}/{engine_module.OKX_READ_RETRY_ATTEMPTS}次",
+                            f"第{attempt}/{max_attempts}次",
                             detail,
                         ]
                     )
                 )
-                delay_seconds = min(
-                    engine_module.OKX_READ_RETRY_BASE_DELAY_SECONDS * attempt,
-                    engine_module.OKX_READ_RETRY_MAX_DELAY_SECONDS,
-                )
+                delay_seconds = min(base_delay * attempt, max_delay)
                 engine._stop_event.wait(delay_seconds)
         if last_exc is not None:
             raise last_exc

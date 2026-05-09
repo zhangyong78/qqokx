@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -72,9 +73,53 @@ def _take_profit_mode_description_for_signal_email(config: StrategyConfig) -> st
 DEFAULT_DEBUG_ATR_PERIOD = 10
 LIVE_DYNAMIC_MAKER_FEE_RATE = Decimal("0.00015")
 LIVE_DYNAMIC_TAKER_FEE_RATE = Decimal("0.00036")
-OKX_READ_RETRY_ATTEMPTS = 4
-OKX_READ_RETRY_BASE_DELAY_SECONDS = 1.0
-OKX_READ_RETRY_MAX_DELAY_SECONDS = 5.0
+
+
+def _qqokx_env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw, 10)
+    except ValueError:
+        return default
+    return max(min_value, min(max_value, parsed))
+
+
+def _qqokx_env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return default
+    return max(min_value, min(max_value, parsed))
+
+
+def get_okx_read_retry_config() -> tuple[int, float, float]:
+    """OKX 读取重试：每次调用读取 os.environ，便于测试与部署后调参（弱网/VPN 可多试几次）。"""
+    base = _qqokx_env_float(
+        "QQOKX_READ_RETRY_BASE_DELAY_SECONDS",
+        1.0,
+        min_value=0.1,
+        max_value=60.0,
+    )
+    max_delay = _qqokx_env_float(
+        "QQOKX_READ_RETRY_MAX_DELAY_SECONDS",
+        8.0,
+        min_value=max(0.5, base),
+        max_value=120.0,
+    )
+    attempts = _qqokx_env_int(
+        "QQOKX_READ_RETRY_ATTEMPTS",
+        8,
+        min_value=1,
+        max_value=30,
+    )
+    return attempts, base, max_delay
+
+
 OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES = 6
 OKX_WRITE_RECONCILE_ATTEMPTS = 3
 OKX_WRITE_RECONCILE_BASE_DELAY_SECONDS = 1.0
