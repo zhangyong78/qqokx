@@ -669,6 +669,7 @@ class StrategyTradeRuntimeState:
     size: Decimal | None = None
     protective_algo_id: str = ""
     protective_algo_cl_ord_id: str = ""
+    initial_stop_price: Decimal | None = None
     current_stop_price: Decimal | None = None
     reconciliation_started: bool = False
 

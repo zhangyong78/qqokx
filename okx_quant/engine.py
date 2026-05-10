@@ -4323,3 +4323,72 @@ def _idle_signal_wait_seconds(
 def _fmt_ts(timestamp_ms: int) -> str:
     dt = datetime.fromtimestamp(timestamp_ms / 1000)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _coerce_okx_read_exception(exc: Exception) -> OkxApiError | None:
+    if isinstance(exc, OkxApiError):
+        return exc
+    detail = str(exc).strip()
+    lowered = detail.lower()
+    transient_markers = (
+        "network error",
+        "timeout",
+        "timed out",
+        "handshake",
+        "ssl",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "temporarily unavailable",
+        "temporary failure",
+        "read timed out",
+        "connect timeout",
+        "proxy error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "eof occurred",
+        "remote end closed connection without response",
+        "remotedisconnected",
+        "超时",
+        "握手",
+    )
+    if any(marker in lowered for marker in transient_markers):
+        return OkxApiError(f"网络错误：{detail or exc.__class__.__name__}")
+    return None
+
+
+def _is_transient_okx_error(exc: OkxApiError) -> bool:
+    if exc.status is not None:
+        return exc.status in {408, 409, 425, 429} or exc.status >= 500
+    detail = str(exc).strip().lower()
+    transient_markers = (
+        "网络错误",
+        "network error",
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "temporary failure",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "handshake",
+        "ssl",
+        "eof occurred",
+        "remote end closed connection without response",
+        "remotedisconnected",
+        "read timed out",
+        "connect timeout",
+        "proxy error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "未返回有效触发价",
+        "缺少标记价格",
+        "缺少最新成交价",
+        "缺少指数价格",
+        "无法触发",
+        "握手",
+        "超时",
+    )
+    return any(marker in detail for marker in transient_markers)

@@ -3109,3 +3109,77 @@ class StrategyEngineTest(TestCase):
         )
         self.assertEqual(plan.stop_loss, Decimal("2475.2"))
         self.assertEqual(plan.take_profit, Decimal("2540"))
+
+    def test_okx_read_retry_recovers_from_missing_mark_trigger_price(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+
+        attempts = {"count": 0}
+
+        def _flaky_read() -> Decimal:
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise OkxApiError("OKX 未返回有效触发价：ETH-USDT-SWAP type=mark")
+            return Decimal("2308.5")
+
+        result = engine._call_okx_read_with_retry("读取触发价格 ETH-USDT-SWAP mark", _flaky_read)
+
+        self.assertEqual(result, Decimal("2308.5"))
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(waits, [1.0, 2.0])
+        self.assertTrue(any("重试" in message for message in messages))
+
+    def test_okx_read_retry_recovers_from_vpn_proxy_error(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+
+        attempts = {"count": 0}
+
+        def _flaky_read() -> str:
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise RuntimeError("Proxy error while tunneling through VPN")
+            return "ok"
+
+        result = engine._call_okx_read_with_retry("读取触发价格 ETH-USDT-SWAP mark", _flaky_read)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(waits, [1.0, 2.0])
+        self.assertTrue(any("重试" in message for message in messages))
