@@ -64,6 +64,11 @@ from okx_quant.models import (
     ProtectionPlan,
     StrategyConfig,
 )
+from okx_quant.duration_input import (
+    format_duration_cn_compact,
+    parse_nonnegative_duration_seconds,
+    try_parse_nonnegative_duration_seconds,
+)
 from okx_quant.notifications import EmailNotifier
 from okx_quant.option_roll import is_short_option_position
 from okx_quant.option_roll_ui import OptionRollSuggestionWindow
@@ -303,6 +308,7 @@ POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
         "price",
         "size",
         "filled",
+        "fee",
         "tp_sl",
         "order_id",
         "cl_ord_id",
@@ -327,6 +333,7 @@ POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
         "open_avg",
         "close_avg",
         "close_size",
+        "fee",
         "pnl",
         "realized",
         "realized_usdt",
@@ -2012,8 +2019,8 @@ def _order_item_from_cache(record: dict[str, object]) -> OkxTradeOrderItem | Non
         client_order_id=str(record.get("client_order_id") or record.get("clOrdId") or "") or None,
         algo_client_order_id=str(record.get("algo_client_order_id") or record.get("algoClOrdId") or "") or None,
         pnl=_parse_decimal_or_none(record.get("pnl")),
-        fee=_parse_decimal_or_none(record.get("fee")),
-        fee_currency=str(record.get("fee_currency", "")) or None,
+        fee=_parse_decimal_or_none(record.get("fee")) or _parse_decimal_or_none(record.get("fillFee")),
+        fee_currency=str(record.get("fee_currency") or record.get("feeCcy") or record.get("fillFeeCcy") or "") or None,
         reduce_only=bool(record.get("reduce_only")) if record.get("reduce_only") is not None else None,
         trigger_price=_parse_decimal_or_none(record.get("trigger_price")),
         trigger_price_type=str(record.get("trigger_price_type", "")) or None,
@@ -2044,7 +2051,9 @@ def _fill_item_from_cache(record: dict[str, object]) -> OkxFillHistoryItem | Non
         pos_side=str(record.get("pos_side") or record.get("posSide") or "") or None,
         fill_price=_parse_decimal_or_none(record.get("fill_price")) or _parse_decimal_or_none(record.get("fillPx")),
         fill_size=_parse_decimal_or_none(record.get("fill_size")) or _parse_decimal_or_none(record.get("fillSz")),
-        fill_fee=_parse_decimal_or_none(record.get("fill_fee")) or _parse_decimal_or_none(record.get("fillFee")),
+        fill_fee=_parse_decimal_or_none(record.get("fill_fee"))
+        or _parse_decimal_or_none(record.get("fillFee"))
+        or _parse_decimal_or_none(record.get("fee")),
         fee_currency=str(record.get("fee_currency") or record.get("feeCcy") or record.get("fillFeeCcy") or "") or None,
         pnl=_parse_decimal_or_none(record.get("pnl")),
         order_id=str(record.get("order_id") or record.get("ordId") or "") or None,
@@ -2073,6 +2082,8 @@ def _position_history_item_from_cache(record: dict[str, object]) -> OkxPositionH
         realized_pnl=_parse_decimal_or_none(record.get("realized_pnl")),
         settle_pnl=_parse_decimal_or_none(record.get("settle_pnl")),
         raw=record.get("raw") if isinstance(record.get("raw"), dict) else {},
+        fee=_parse_decimal_or_none(record.get("fee")) or _parse_decimal_or_none(record.get("fillFee")),
+        fee_currency=str(record.get("fee_currency") or record.get("feeCcy") or record.get("ccy") or "") or None,
     )
 
 
@@ -2386,8 +2397,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.notify_signals = BooleanVar(value=True)
         self.notify_errors = BooleanVar(value=True)
         self.running_session_filter = StringVar(value="全部")
-        self.position_type_filter = StringVar(value="全部类型")
-        self.position_keyword = StringVar()
+        self.positions_zoom_type_filter = StringVar(value="全部类型")
+        self.positions_zoom_keyword = StringVar()
         self.pending_order_type_filter = StringVar(value="全部类型")
         self.pending_order_source_filter = StringVar(value="全部来源")
         self.pending_order_state_filter = StringVar(value="全部状态")
@@ -2800,13 +2811,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._max_entries_per_trend_entry.grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
         row += 1
-        self._startup_chase_window_label = ttk.Label(start_frame, text="启动追单窗口(秒)")
+        self._startup_chase_window_label = ttk.Label(start_frame, text="启动追单窗口")
         self._startup_chase_window_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
         self._startup_chase_window_entry = ttk.Entry(start_frame, textvariable=self.startup_chase_window_seconds)
         self._startup_chase_window_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
         self._startup_chase_window_hint_label = ttk.Label(
             start_frame,
-            text="0=不追单；300=只追启动前5分钟内刚确认的信号。",
+            text="0=不追单；可填秒数(如300)或时长写法(如5m、2h30m、1天)。",
         )
         self._startup_chase_window_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
 
@@ -3185,96 +3196,59 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._selected_session_detail.configure(yscrollcommand=detail_scroll.set)
         self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
 
-        positions_frame = ttk.LabelFrame(sessions_pane, text="账户持仓（仿 OKX 客户端风格）", padding=12)
+        positions_frame = ttk.LabelFrame(sessions_pane, text="账户持仓（仿 OKX 客户端风格）", padding=(6, 5))
         positions_frame.columnconfigure(0, weight=1)
-        positions_frame.rowconfigure(3, weight=1)
+        positions_frame.rowconfigure(2, weight=1)
         sessions_pane.add(positions_frame, weight=7)
 
         header_row = ttk.Frame(positions_frame)
-        header_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        header_row.columnconfigure(1, weight=1)
+        header_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        header_row.columnconfigure(2, weight=1)
         positions_badge = self._create_refresh_badge(
             header_row,
             self._positions_refresh_badge_text,
             self._positions_refresh_badges,
         )
-        positions_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(header_row, textvariable=self.positions_summary_text).grid(row=0, column=1, sticky="w")
-        action_row = ttk.Frame(header_row)
-        action_row.grid(row=0, column=2, sticky="e")
-        ttk.Button(action_row, text="刷新", command=self.refresh_positions).grid(row=0, column=0, padx=(0, 6))
-        ttk.Label(action_row, text="自动刷新").grid(row=0, column=1, padx=(0, 6))
-        position_refresh_interval_combo = ttk.Combobox(
-            action_row,
-            textvariable=self.position_refresh_interval_label,
-            values=list(POSITION_REFRESH_INTERVAL_OPTIONS.keys()),
-            state="readonly",
-            width=8,
-        )
-        position_refresh_interval_combo.grid(row=0, column=2, padx=(0, 6))
-        position_refresh_interval_combo.bind("<<ComboboxSelected>>", self._on_position_refresh_interval_changed)
-        ttk.Button(
-            action_row,
-            textvariable=self.position_auto_refresh_button_text,
-            command=self.toggle_position_auto_refresh,
-        ).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(action_row, text="账户信息", command=self.open_account_info_window).grid(row=0, column=4, padx=(0, 6))
-        ttk.Button(action_row, text="持仓大窗", command=self.open_positions_zoom_window).grid(row=0, column=5, padx=(0, 6))
-        ttk.Button(action_row, text="平仓选中", command=self.flatten_selected_position).grid(row=0, column=6, padx=(0, 6))
-        ttk.Button(action_row, text="设置期权保护", command=self.open_position_protection_window).grid(
-            row=0, column=7, padx=(0, 6)
-        )
-        ttk.Button(action_row, text="展期建议", command=self.open_option_roll_window).grid(
-            row=0, column=8, padx=(0, 6)
-        )
-        ttk.Button(action_row, text="全部展开", command=self.expand_all_position_groups).grid(
-            row=0, column=9, padx=(0, 6)
-        )
-        ttk.Button(action_row, text="折叠分组", command=self.collapse_position_groups).grid(
-            row=0, column=10, padx=(0, 6)
-        )
-        ttk.Button(action_row, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=11, padx=(0, 6))
-        ttk.Button(action_row, text="清空备注", command=self.clear_selected_position_note).grid(row=0, column=12, padx=(0, 6))
-        ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=13)
-
-        filter_row = ttk.Frame(positions_frame)
-        filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        filter_row.columnconfigure(3, weight=1)
-        ttk.Label(filter_row, text="类型").grid(row=0, column=0, sticky="w")
+        positions_badge.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        filter_compact = ttk.Frame(header_row)
+        ttk.Label(filter_compact, text="类型").pack(side="left")
         position_type_combo = ttk.Combobox(
-            filter_row,
-            textvariable=self.position_type_filter,
+            filter_compact,
+            textvariable=self.positions_zoom_type_filter,
             values=list(POSITION_TYPE_OPTIONS.keys()),
             state="readonly",
-            width=16,
+            width=11,
         )
-        position_type_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        position_type_combo.pack(side="left", padx=(4, 0))
         position_type_combo.bind("<<ComboboxSelected>>", self._on_position_filter_changed)
-        ttk.Label(filter_row, text="搜索").grid(row=0, column=2, sticky="w")
-        position_keyword_entry = ttk.Entry(filter_row, textvariable=self.position_keyword)
-        position_keyword_entry.grid(row=0, column=3, sticky="ew", padx=(6, 12))
-        position_keyword_entry.bind("<KeyRelease>", self._on_position_filter_changed)
-        ttk.Button(filter_row, text="应用筛选", command=self._render_positions_view).grid(
-            row=0, column=4, padx=(0, 6)
-        )
-        ttk.Button(filter_row, text="清空筛选", command=self.reset_position_filters).grid(row=0, column=5)
+        filter_compact.grid(row=0, column=1, sticky="w")
+        ttk.Label(
+            header_row,
+            textvariable=self.positions_summary_text,
+            font=("Microsoft YaHei UI", 9),
+        ).grid(row=0, column=2, sticky="ew", padx=(6, 6))
+        action_row = ttk.Frame(header_row)
+        action_row.grid(row=0, column=3, sticky="e")
+        ttk.Button(action_row, text="刷新", command=self.refresh_positions).grid(row=0, column=0, padx=(0, 4))
+        ttk.Button(action_row, text="持仓大窗", command=self.open_positions_zoom_window).grid(row=0, column=1, padx=(0, 4))
+        ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=2)
 
         overview_row = ttk.Frame(positions_frame)
-        overview_row.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        overview_row.grid(row=1, column=0, sticky="ew", pady=(0, 4))
         for column in range(9):
             overview_row.columnconfigure(column, weight=1)
-        self._build_metric_card(overview_row, 0, "持仓笔数", self.position_total_text)
-        self._build_metric_card(overview_row, 1, "浮动盈亏(USDT)", self.position_upl_text)
-        self._build_metric_card(overview_row, 2, "已实现盈亏", self.position_realized_text)
-        self._build_metric_card(overview_row, 3, "初始保证金(IMR)", self.position_margin_text)
-        self._build_metric_card(overview_row, 4, "Delta 合计", self.position_delta_text)
-        self._build_metric_card(overview_row, 5, "买购数量", self.position_long_call_text)
-        self._build_metric_card(overview_row, 6, "卖购数量", self.position_short_call_text)
-        self._build_metric_card(overview_row, 7, "买沽数量", self.position_long_put_text)
-        self._build_metric_card(overview_row, 8, "卖沽数量", self.position_short_put_text)
+        self._build_metric_card(overview_row, 0, "持仓笔数", self.position_total_text, compact=True)
+        self._build_metric_card(overview_row, 1, "浮动盈亏(USDT)", self.position_upl_text, compact=True)
+        self._build_metric_card(overview_row, 2, "已实现盈亏", self.position_realized_text, compact=True)
+        self._build_metric_card(overview_row, 3, "初始保证金(IMR)", self.position_margin_text, compact=True)
+        self._build_metric_card(overview_row, 4, "Delta 合计", self.position_delta_text, compact=True)
+        self._build_metric_card(overview_row, 5, "买购数量", self.position_long_call_text, compact=True)
+        self._build_metric_card(overview_row, 6, "卖购数量", self.position_short_call_text, compact=True)
+        self._build_metric_card(overview_row, 7, "买沽数量", self.position_long_put_text, compact=True)
+        self._build_metric_card(overview_row, 8, "卖沽数量", self.position_short_put_text, compact=True)
 
         position_table = ttk.Frame(positions_frame)
-        position_table.grid(row=3, column=0, sticky="nsew")
+        position_table.grid(row=2, column=0, sticky="nsew")
         position_table.columnconfigure(0, weight=1)
         position_table.rowconfigure(0, weight=1)
 
@@ -3553,13 +3527,25 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         except TclError:
             return
 
-    def _build_metric_card(self, parent: ttk.Frame, column: int, title: str, value_var: StringVar) -> None:
-        card = ttk.LabelFrame(parent, text=title, padding=(10, 8))
-        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 6, 0))
+    def _build_metric_card(
+        self,
+        parent: ttk.Frame,
+        column: int,
+        title: str,
+        value_var: StringVar,
+        *,
+        compact: bool = False,
+    ) -> None:
+        if compact:
+            card = ttk.LabelFrame(parent, text=title, padding=(5, 3))
+            card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 3, 0))
+            value_font = ("Microsoft YaHei UI", 10, "bold")
+        else:
+            card = ttk.LabelFrame(parent, text=title, padding=(10, 8))
+            card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 6, 0))
+            value_font = ("Microsoft YaHei UI", 11, "bold")
         card.columnconfigure(0, weight=1)
-        ttk.Label(card, textvariable=value_var, font=("Microsoft YaHei UI", 11, "bold")).grid(
-            row=0, column=0, sticky="w"
-        )
+        ttk.Label(card, textvariable=value_var, font=value_font).grid(row=0, column=0, sticky="w")
 
     def _create_trade_order_tree(
         self,
@@ -3569,7 +3555,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         column_group_key: str | None = None,
         title: str | None = None,
     ) -> ttk.Treeview:
-        columns = ("time", "source", "inst_type", "inst_id", "state", "side", "ord_type", "price", "size", "filled", "tp_sl", "order_id", "cl_ord_id")
+        columns = ("time", "source", "inst_type", "inst_id", "state", "side", "ord_type", "price", "size", "filled", "fee", "tp_sl", "order_id", "cl_ord_id")
         tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse")
         headings = {
             "time": "时间",
@@ -3582,6 +3568,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "price": "委托价",
             "size": "委托量",
             "filled": "已成交",
+            "fee": "手续费",
             "tp_sl": "TP/SL",
             "order_id": "订单ID",
             "cl_ord_id": "clOrdId",
@@ -3597,12 +3584,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             ("price", 100),
             ("size", 100),
             ("filled", 100),
+            ("fee", 110),
             ("tp_sl", 180),
             ("order_id", 120),
             ("cl_ord_id", 150),
         ):
             tree.heading(column_id, text=headings[column_id])
-            tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "filled"} else "center")
+            tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "filled", "fee"} else "center")
         tree.column("inst_id", anchor="w")
         tree.column("tp_sl", anchor="w")
         tree.column("cl_ord_id", anchor="w")
@@ -10059,7 +10047,17 @@ def _build_launch_parameter_hint_text(
     if startup_chase_window in {"", "0"}:
         parts.append("启动追单窗口：0=启动不追老信号，只等启动后的新波。")
     else:
-        parts.append(f"启动追单窗口：{startup_chase_window}秒=只接管启动前窗口内刚确认的波。")
+        resolved = try_parse_nonnegative_duration_seconds(startup_chase_window)
+        if resolved is None:
+            parts.append(f"启动追单窗口：{startup_chase_window}（无法换算，请检查写法）。")
+        elif resolved == 0:
+            parts.append("启动追单窗口：0=启动不追老信号，只等启动后的新波。")
+        else:
+            human = format_duration_cn_compact(resolved)
+            parts.append(
+                f"启动追单窗口：输入「{startup_chase_window}」等价 {resolved} 秒（{human}），"
+                f"只接管启动前该时长内刚确认的波。"
+            )
     return "参数速记： " + " ".join(parts)
 
 
@@ -12376,6 +12374,30 @@ def _position_manual_review_summary(position: OkxPosition) -> str:
     return f"{position.inst_id} [{side}] | 持仓量={format_decimal(position.position)} | 开仓均价={avg_price}"
 
 
+def _format_trade_order_fee_cell(item: OkxTradeOrderItem) -> str:
+    text = _format_optional_decimal(item.fee, with_sign=True)
+    ccy = (item.fee_currency or "").strip().upper()
+    if ccy and text != "-":
+        return f"{text} {ccy}"
+    return text
+
+
+def _format_position_history_fee_cell(item: OkxPositionHistoryItem) -> str:
+    text = _format_optional_decimal(item.fee, with_sign=True)
+    ccy = (item.fee_currency or "").strip().upper()
+    if ccy and text != "-":
+        return f"{text} {ccy}"
+    return text
+
+
+def _format_fill_history_fee_cell(item: OkxFillHistoryItem) -> str:
+    text = _format_optional_decimal(item.fill_fee, with_sign=True)
+    ccy = (item.fee_currency or "").strip().upper()
+    if ccy and text != "-":
+        return f"{text} {ccy}"
+    return text
+
+
 def _build_trade_order_detail_text(item: OkxTradeOrderItem) -> str:
     def _format_flag(value: bool | None) -> str:
         if value is True:
@@ -12844,7 +12866,7 @@ def _build_fill_history_detail_text(item: OkxFillHistoryItem, instruments: dict[
         f"方向：{_format_history_side(item.side, item.pos_side)}\n"
         f"成交价：{_format_fill_history_price(item)}\n"
         f"成交量：{_format_fill_history_size(item, instruments)}\n"
-        f"手续费：{_format_optional_decimal(item.fill_fee)} {item.fee_currency or ''}\n"
+        f"手续费：{_format_fill_history_fee_cell(item)}\n"
         f"已实现盈亏：{_format_fill_history_pnl(item)}\n"
         f"成交类型：{_format_fill_history_exec_type(item.exec_type)}\n"
         f"订单ID：{item.order_id or '-'}\n"
@@ -12869,6 +12891,7 @@ def _build_position_history_detail_text(
         f"开仓均价：{_format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type)}\n"
         f"平仓均价：{_format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type)}\n"
         f"平仓数量：{_format_position_history_size(item, instruments)}\n"
+        f"手续费：{_format_position_history_fee_cell(item)}\n"
         f"盈亏：{_format_position_history_pnl(item.pnl, item)}\n"
         f"已实现盈亏：{_format_position_history_pnl(item.realized_pnl, item, with_sign=True)}\n"
         f"结算盈亏：{_format_optional_decimal(item.settle_pnl)}"

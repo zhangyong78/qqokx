@@ -254,6 +254,8 @@ class OkxPositionHistoryItem:
     realized_pnl: Decimal | None
     settle_pnl: Decimal | None
     raw: dict[str, Any]
+    fee: Decimal | None = None
+    fee_currency: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1071,8 +1073,8 @@ class OkxRestClient:
                             pos_side=item.get("posSide"),
                             fill_price=_to_decimal(item.get("fillPx")),
                             fill_size=_to_decimal(item.get("fillSz")),
-                            fill_fee=_to_decimal(item.get("fillFee")),
-                            fee_currency=item.get("fillFeeCcy") or item.get("feeCcy"),
+                            fill_fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+                            fee_currency=item.get("feeCcy") or item.get("fillFeeCcy"),
                             pnl=_to_decimal(item.get("fillPnl")),
                             order_id=item.get("ordId"),
                             trade_id=item.get("tradeId"),
@@ -1269,6 +1271,8 @@ class OkxRestClient:
                         realized_pnl=_to_decimal(item.get("realizedPnl")),
                         settle_pnl=_to_decimal(item.get("settledPnl")),
                         raw=item,
+                        fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+                        fee_currency=(str(item.get("feeCcy") or item.get("ccy") or "").strip() or None),
                     )
                 )
         items.sort(key=lambda item: item.update_time or 0, reverse=True)
@@ -1473,8 +1477,8 @@ class OkxRestClient:
             client_order_id=item.get("clOrdId") or item.get("attachAlgoClOrdId"),
             algo_client_order_id=item.get("algoClOrdId"),
             pnl=_to_decimal(item.get("pnl")),
-            fee=_first_decimal(item.get("fee"), item.get("actualFee")),
-            fee_currency=item.get("feeCcy") or item.get("feeCurrency"),
+            fee=_first_decimal(item.get("fee"), item.get("actualFee"), item.get("fillFee")),
+            fee_currency=item.get("feeCcy") or item.get("feeCurrency") or item.get("fillFeeCcy"),
             reduce_only=_to_bool(item.get("reduceOnly")),
             trigger_price=_first_decimal(item.get("triggerPx"), item.get("activePx")),
             trigger_price_type=item.get("triggerPxType"),

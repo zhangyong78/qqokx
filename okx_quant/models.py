@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
 
+from okx_quant.duration_input import format_duration_cn_compact
+
 SignalMode = Literal["both", "long_only", "short_only"]
 PositionMode = Literal["net", "long_short"]
 EnvironmentMode = Literal["demo", "live"]
@@ -137,7 +139,10 @@ class StrategyConfig:
         seconds = self.resolved_startup_chase_window_seconds()
         if seconds <= 0:
             return "\u5173\u95ed\uff08\u542f\u52a8\u4e0d\u8ffd\u8001\u4fe1\u53f7\uff09"
-        return f"{seconds}\u79d2"
+        base = f"{seconds}\u79d2"
+        if seconds >= 60:
+            return f"{base}\uff08{format_duration_cn_compact(seconds)}\uff09"
+        return base
 
     def resolved_time_stop_break_even_bars(self) -> int:
         return max(int(self.time_stop_break_even_bars), 0)

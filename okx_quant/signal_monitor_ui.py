@@ -65,7 +65,7 @@ _OBSERVER_PARAMETER_LABELS = {
     "dynamic_fee_offset_enabled": "保本加手续费缓冲",
     "time_stop_break_even_enabled": "超时启用保本",
     "time_stop_break_even_bars": "超时K线根数",
-    "startup_chase_window_seconds": "启动追单窗口(秒)",
+    "startup_chase_window_seconds": "启动追单窗口",
 }
 _OBSERVER_PARAMETER_ORDER: tuple[str, ...] = tuple(_OBSERVER_PARAMETER_LABELS.keys())
 _OBSERVER_PARAMETER_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (

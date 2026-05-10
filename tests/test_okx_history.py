@@ -399,6 +399,8 @@ class OkxHistoryParsingTest(TestCase):
                             "pnl": "0.12",
                             "realizedPnl": "0.08",
                             "settledPnl": "0.01",
+                            "fee": "-0.0001",
+                            "ccy": "BTC",
                             "uTime": "1710000000300",
                         }
                     ]
@@ -416,6 +418,8 @@ class OkxHistoryParsingTest(TestCase):
                         "pnl": "0.001",
                         "realizedPnl": "0.0005",
                         "settledPnl": "0",
+                        "fee": "-0.0002",
+                        "ccy": "USDT",
                         "uTime": "1710000000200",
                     }
                 ]
@@ -432,7 +436,53 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0].inst_id, "BTC-USD-260626")
         self.assertEqual(items[0].close_size, Decimal("200"))
+        self.assertEqual(items[0].fee, Decimal("-0.0001"))
+        self.assertEqual(items[0].fee_currency, "BTC")
         self.assertEqual(items[1].mgn_mode, "isolated")
+        self.assertEqual(items[1].inst_id, "BTC-USD-260626-100000-C")
+        self.assertEqual(items[1].fee, Decimal("-0.0002"))
+        self.assertEqual(items[1].fee_currency, "USDT")
+
+    def test_get_fills_history_reads_fee_field_from_okx_response(self) -> None:
+        client = OkxRestClient()
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            self.assertIn(path, {"/api/v5/trade/fills-history", "/api/v5/account/bills"})
+            if path == "/api/v5/account/bills":
+                return {"data": []}
+            return {
+                "data": [
+                    {
+                        "side": "buy",
+                        "fillSz": "0.00192834",
+                        "fillPx": "51858",
+                        "fee": "-0.00000192834",
+                        "feeCcy": "BTC",
+                        "fillPnl": "0",
+                        "ordId": "680800019749904384",
+                        "instType": "SPOT",
+                        "instId": "BTC-USDT",
+                        "posSide": "net",
+                        "billId": "680800019754098688",
+                        "subType": "1",
+                        "fillTime": "1708587373361",
+                        "execType": "T",
+                        "tradeId": "744876980",
+                        "ts": "1708587373362",
+                    }
+                ]
+            }
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        items = client.get_fills_history(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            environment="live",
+            inst_types=("SPOT",),
+            limit=5,
+        )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].fill_fee, Decimal("-0.00000192834"))
+        self.assertEqual(items[0].fee_currency, "BTC")
 
     def test_get_tickers_parses_market_rows(self) -> None:
         client = OkxRestClient()
@@ -903,7 +953,7 @@ class OkxHistoryParsingTest(TestCase):
             ),
             {},
         )
-        self.assertEqual(text, "10.1235 BTC")
+        self.assertEqual(text, "0.0004 BTC")
 
     def test_position_history_formats_usdt_values_with_two_decimals(self) -> None:
         item = OkxPositionHistoryItem(

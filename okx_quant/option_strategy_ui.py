@@ -51,7 +51,7 @@ from okx_quant.window_layout import apply_adaptive_window_geometry
 
 Logger = Callable[[str], None]
 BAR_OPTIONS = ["1m", "3m", "5m", "15m", "1H", "4H"]
-DEFAULT_OPTION_FAMILY_OPTIONS = ("BTC-USD", "ETH-USD")
+DEFAULT_OPTION_FAMILY_OPTIONS = ("BTC-USD", "ETH-USD", "BTC-USDT", "ETH-USDT")
 MAX_OPTION_COMBO_CANDLES = 2000
 DERIBIT_OPTION_CHART_BAR_TO_RESOLUTION = {
     "1m": "3600",
@@ -60,6 +60,7 @@ DERIBIT_OPTION_CHART_BAR_TO_RESOLUTION = {
     "15m": "3600",
     "1H": "3600",
     "4H": "14400",
+    "1D": "86400",
 }
 
 
@@ -152,7 +153,9 @@ class OptionStrategyCalculatorWindow:
         self.payoff_summary_text = StringVar(value="加入策略腿后，可生成到期盈亏图。")
         self.combo_summary_text = StringVar(value="组合 K 线采用 OKX 期权标记价格。")
         self.volatility_summary_text = StringVar(value="波动率 K 线使用 Deribit 波动率指数缓存。")
-        self.overlay_summary_text = StringVar(value="叠加图使用左轴显示组合K线，右轴显示 Deribit 波动率指数K线。")
+        self.overlay_summary_text = StringVar(
+            value="叠加对比：组合 K 线、Deribit DVOL、标的现货 USDT K 线三图共用时间轴；周期在上方切换。"
+        )
 
         self._family_combo: ttk.Combobox | None = None
         self._expiry_combo: ttk.Combobox | None = None
@@ -169,6 +172,7 @@ class OptionStrategyCalculatorWindow:
         self._big_volatility_canvas: Canvas | None = None
         self._big_overlay_combo_canvas: Canvas | None = None
         self._big_overlay_volatility_canvas: Canvas | None = None
+        self._big_overlay_spot_canvas: Canvas | None = None
         self._big_chart_redraw_after_id: str | None = None
 
         self._all_option_instruments: list[Instrument] = []
@@ -203,6 +207,7 @@ class OptionStrategyCalculatorWindow:
         self._big_volatility_hover_state: ComboChartHoverState | None = None
         self._big_overlay_combo_hover_state: ComboChartHoverState | None = None
         self._big_overlay_volatility_hover_state: ComboChartHoverState | None = None
+        self._big_overlay_spot_hover_state: ComboChartHoverState | None = None
         self._kline_view_states: dict[str, KlineChartViewState] = {}
         self._kline_drag_states: dict[str, tuple[float, int, int]] = {}
         self._did_initial_chain_refresh = False
@@ -210,6 +215,18 @@ class OptionStrategyCalculatorWindow:
         self._chart_request_id = 0
         self._position_import_request_id = 0
         self._alias_counter = 0
+
+        self.overlay_comparison_bar = StringVar(value="1H")
+        self._overlay_chart_request_id = 0
+        self._overlay_chain_rows: list[tuple[Candle, Candle, Candle]] = []
+        self._overlay_combo_display_ccy = ""
+        self._overlay_spot_inst_id = ""
+        self._overlay_vol_currency = ""
+        self._overlay_deribit_resolution_label = ""
+        self._overlay_deribit_resolution_note = ""
+        self._overlay_refresh_inflight = False
+        self._overlay_data_signature = ""
+        self._overlay_refresh_failed_sig = ""
 
         self._load_saved_strategies()
         self._build_layout()
@@ -619,19 +636,33 @@ class OptionStrategyCalculatorWindow:
         normalized = family.strip().upper()
         if not normalized:
             return []
+        raw: list[Instrument] = []
         try:
-            return self.client.get_instruments("OPTION", uly=normalized)
+            raw = self.client.get_option_instruments(inst_family=normalized)
         except Exception:
-            return self.client.get_option_instruments(inst_family=normalized)
+            raw = []
+        if not raw:
+            try:
+                raw = self.client.get_instruments("OPTION", uly=normalized)
+            except Exception:
+                return []
+        return _filter_option_instruments_by_family(normalized, raw)
 
     def _fetch_family_tickers_remote(self, family: str) -> list[OkxTicker]:
         normalized = family.strip().upper()
         if not normalized:
             return []
+        raw: list[OkxTicker] = []
         try:
-            return self.client.get_tickers("OPTION", uly=normalized)
+            raw = self.client.get_tickers("OPTION", inst_family=normalized)
         except Exception:
-            return self.client.get_tickers("OPTION", inst_family=normalized)
+            raw = []
+        if not raw:
+            try:
+                raw = self.client.get_tickers("OPTION", uly=normalized)
+            except Exception:
+                return []
+        return _filter_option_tickers_by_family(normalized, raw)
 
     def _sync_expiry_options(self, *, preferred: str | None = None) -> None:
         family = self.option_family.get().strip().upper()
@@ -1401,23 +1432,41 @@ class OptionStrategyCalculatorWindow:
 
         overlay_tab = ttk.Frame(notebook, padding=12)
         overlay_tab.columnconfigure(0, weight=1)
-        overlay_tab.rowconfigure(1, weight=3)
-        overlay_tab.rowconfigure(2, weight=2)
+        overlay_tab.rowconfigure(3, weight=1)
+        overlay_tab.rowconfigure(4, weight=1)
+        overlay_tab.rowconfigure(5, weight=1)
+        overlay_toolbar = ttk.Frame(overlay_tab)
+        overlay_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(overlay_toolbar, text="叠加对比周期").pack(side="left")
+        for text, value in (("1小时", "1H"), ("4小时", "4H"), ("日线", "1D")):
+            ttk.Radiobutton(
+                overlay_toolbar,
+                text=text,
+                value=value,
+                variable=self.overlay_comparison_bar,
+                command=self._on_overlay_comparison_period_selected,
+            ).pack(side="left", padx=(10, 0))
         ttk.Label(overlay_tab, textvariable=self.overlay_summary_text, justify="left", wraplength=1260).grid(
-            row=0, column=0, sticky="w", pady=(0, 8)
+            row=1, column=0, sticky="w", pady=(0, 8)
         )
         overlay_combo_canvas = Canvas(overlay_tab, background="#ffffff", highlightthickness=0, cursor="crosshair")
-        overlay_combo_canvas.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        overlay_combo_canvas.grid(row=3, column=0, sticky="nsew", pady=(0, 6))
         overlay_combo_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
         overlay_combo_canvas.bind("<Motion>", self._on_big_overlay_combo_canvas_motion)
         overlay_combo_canvas.bind("<Leave>", self._clear_overlay_chart_hover)
         self._bind_kline_chart_interactions(overlay_combo_canvas, "big_overlay")
         overlay_volatility_canvas = Canvas(overlay_tab, background="#ffffff", highlightthickness=0, cursor="crosshair")
-        overlay_volatility_canvas.grid(row=2, column=0, sticky="nsew")
+        overlay_volatility_canvas.grid(row=4, column=0, sticky="nsew", pady=(0, 6))
         overlay_volatility_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
         overlay_volatility_canvas.bind("<Motion>", self._on_big_overlay_volatility_canvas_motion)
         overlay_volatility_canvas.bind("<Leave>", self._clear_overlay_chart_hover)
         self._bind_kline_chart_interactions(overlay_volatility_canvas, "big_overlay")
+        overlay_spot_canvas = Canvas(overlay_tab, background="#ffffff", highlightthickness=0, cursor="crosshair")
+        overlay_spot_canvas.grid(row=5, column=0, sticky="nsew")
+        overlay_spot_canvas.bind("<Configure>", self._schedule_big_chart_redraw)
+        overlay_spot_canvas.bind("<Motion>", self._on_big_overlay_spot_canvas_motion)
+        overlay_spot_canvas.bind("<Leave>", self._clear_overlay_chart_hover)
+        self._bind_kline_chart_interactions(overlay_spot_canvas, "big_overlay")
         notebook.add(overlay_tab, text="叠加对比")
 
         self._big_chart_window = window
@@ -1427,6 +1476,7 @@ class OptionStrategyCalculatorWindow:
         self._big_volatility_canvas = volatility_canvas
         self._big_overlay_combo_canvas = overlay_combo_canvas
         self._big_overlay_volatility_canvas = overlay_volatility_canvas
+        self._big_overlay_spot_canvas = overlay_spot_canvas
         return window
 
     def _selected_big_chart_tab(self) -> str:
@@ -1517,8 +1567,7 @@ class OptionStrategyCalculatorWindow:
         if key == "big_volatility":
             return self._current_volatility_candles()
         if key == "big_overlay":
-            combo_candles, _combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
-            return _align_overlay_candles(combo_candles, self._current_volatility_candles())
+            return list(self._overlay_chain_rows)
         return []
 
     def _apply_kline_view(self, key: str, items: list[Any]) -> list[Any]:
@@ -1592,30 +1641,15 @@ class OptionStrategyCalculatorWindow:
             self._draw_volatility_chart(self._big_volatility_canvas, visible, enable_hover=True, hover_target="big_volatility")
             return
         if key == "big_overlay":
-            if self._big_overlay_combo_canvas is None or self._big_overlay_volatility_canvas is None or not self._latest_combo_candles:
+            if (
+                self._big_overlay_combo_canvas is None
+                or self._big_overlay_volatility_canvas is None
+                or self._big_overlay_spot_canvas is None
+            ):
                 return
-            combo_candles, combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
-            aligned = _align_overlay_candles(combo_candles, self._current_volatility_candles())
-            if not aligned:
-                self._clear_canvas(self._big_overlay_combo_canvas, "暂无可用的叠加对比数据。")
-                self._clear_canvas(self._big_overlay_volatility_canvas, "暂无可用的叠加对比数据。")
+            if not self._overlay_chain_rows:
                 return
-            visible = self._apply_kline_view(key, aligned)
-            visible_combo = [item[0] for item in visible]
-            visible_volatility = [item[1] for item in visible]
-            self._draw_combo_chart(
-                self._big_overlay_combo_canvas,
-                visible_combo,
-                combo_ccy,
-                enable_hover=True,
-                hover_target="big_overlay_combo",
-            )
-            self._draw_volatility_chart(
-                self._big_overlay_volatility_canvas,
-                visible_volatility,
-                enable_hover=True,
-                hover_target="big_overlay_volatility",
-            )
+            self._render_overlay_comparison_charts()
 
     def _schedule_big_chart_redraw(self, _event=None) -> None:
         window = self._big_chart_window
@@ -1676,11 +1710,12 @@ class OptionStrategyCalculatorWindow:
             return
 
         volatility_candles = self._current_volatility_candles()
+        dvol_ccy = self._current_deribit_currency() or "—"
         if selected_tab == "波动率K线" and self._big_volatility_canvas is not None:
             if volatility_candles:
                 note_text = f" | {self._latest_deribit_resolution_note}" if self._latest_deribit_resolution_note else ""
                 self.volatility_summary_text.set(
-                    f"Deribit 波动率指数 K 线 | 周期 {self._latest_deribit_resolution_label}{note_text} | 根数 {len(volatility_candles)}"
+                    f"Deribit {dvol_ccy} DVOL 波动率指数 K 线 | 周期 {self._latest_deribit_resolution_label}{note_text} | 根数 {len(volatility_candles)}"
                 )
                 visible_volatility = self._apply_kline_view("big_volatility", volatility_candles)
                 self._draw_volatility_chart(
@@ -1688,9 +1723,12 @@ class OptionStrategyCalculatorWindow:
                     visible_volatility,
                     enable_hover=True,
                     hover_target="big_volatility",
+                    dvol_asset=dvol_ccy if dvol_ccy != "—" else None,
                 )
             else:
-                self.volatility_summary_text.set("Deribit 波动率指数 K 线暂无可用缓存；请先打开 Deribit 波动率指数窗口刷新数据。")
+                self.volatility_summary_text.set(
+                    f"Deribit {dvol_ccy} DVOL 暂无可用缓存；请在「Deribit 波动率指数」窗口选择 {dvol_ccy} 并刷新小时线数据。"
+                )
                 self._clear_canvas(self._big_volatility_canvas, "暂无可用的 Deribit 波动率指数 K 线数据。")
             return
 
@@ -1698,34 +1736,42 @@ class OptionStrategyCalculatorWindow:
             selected_tab == "叠加对比"
             and self._big_overlay_combo_canvas is not None
             and self._big_overlay_volatility_canvas is not None
+            and self._big_overlay_spot_canvas is not None
         ):
-            if self._latest_combo_candles and volatility_candles:
-                combo_candles, combo_ccy, _converted = self._combo_candles_for_display(self._latest_combo_candles)
-                aligned = _align_overlay_candles(combo_candles, volatility_candles)
-                note_text = f" | {self._latest_deribit_resolution_note}" if self._latest_deribit_resolution_note else ""
+            if not self._legs:
+                self.overlay_summary_text.set("叠加对比：请先加入策略腿并刷新图表后再查看。")
+                self._clear_canvas(self._big_overlay_combo_canvas, "请先加入策略腿。")
+                self._clear_canvas(self._big_overlay_volatility_canvas, "请先加入策略腿。")
+                self._clear_canvas(self._big_overlay_spot_canvas, "请先加入策略腿。")
+                return
+            if self._overlay_refresh_inflight and not self._overlay_chain_rows:
                 self.overlay_summary_text.set(
-                    f"叠加对比 | 上图=组合K线({combo_ccy}) | 下图=Deribit波动率指数(%) | 共用时间轴 | 周期 {self._latest_deribit_resolution_label}{note_text}"
+                    f"正在加载叠加对比（{self._overlay_period_display()}）…"
                 )
-                visible_aligned = self._apply_kline_view("big_overlay", aligned)
-                visible_combo = [item[0] for item in visible_aligned]
-                visible_volatility = [item[1] for item in visible_aligned]
-                self._draw_combo_chart(
-                    self._big_overlay_combo_canvas,
-                    visible_combo,
-                    combo_ccy,
-                    enable_hover=True,
-                    hover_target="big_overlay_combo",
-                )
-                self._draw_volatility_chart(
-                    self._big_overlay_volatility_canvas,
-                    visible_volatility,
-                    enable_hover=True,
-                    hover_target="big_overlay_volatility",
-                )
-            else:
-                self.overlay_summary_text.set("叠加对比需要同时具备组合K线与 Deribit 波动率指数数据。")
-                self._clear_canvas(self._big_overlay_combo_canvas, "暂无可用的叠加对比数据。")
-                self._clear_canvas(self._big_overlay_volatility_canvas, "暂无可用的叠加对比数据。")
+                self._clear_canvas(self._big_overlay_combo_canvas, "正在加载…")
+                self._clear_canvas(self._big_overlay_volatility_canvas, "正在加载…")
+                self._clear_canvas(self._big_overlay_spot_canvas, "正在加载…")
+                return
+            ctx_sig = self._overlay_context_signature()
+            if (
+                not self._overlay_chain_rows
+                and self._overlay_refresh_failed_sig
+                and self._overlay_refresh_failed_sig == ctx_sig
+            ):
+                return
+            if not self._overlay_chain_rows or self._overlay_data_signature != ctx_sig:
+                if not self._overlay_refresh_inflight:
+                    self._request_overlay_chart_refresh()
+                if not self._overlay_chain_rows:
+                    self.overlay_summary_text.set(
+                        f"叠加对比：正在准备数据（{self._overlay_period_display()}）…"
+                    )
+                    self._clear_canvas(self._big_overlay_combo_canvas, "正在加载叠加对比…")
+                    self._clear_canvas(self._big_overlay_volatility_canvas, "正在加载叠加对比…")
+                    self._clear_canvas(self._big_overlay_spot_canvas, "正在加载叠加对比…")
+                    return
+            self._render_overlay_comparison_charts()
+            return
 
     def _load_chart_worker(self, request_id: int, candle_limit: int, formula: str) -> None:
         try:
@@ -1871,6 +1917,233 @@ class OptionStrategyCalculatorWindow:
         except Exception as exc:  # noqa: BLE001
             self.window.after(0, lambda error=exc: self._show_chart_error(request_id, error))
 
+    def _overlay_context_signature(self) -> str:
+        active = [leg for leg in self._legs if leg.enabled]
+        legs_part = "|".join(f"{leg.alias}:{leg.inst_id}" for leg in active)
+        formula = (self._latest_chart_formula or self.formula.get().strip() or "").strip()
+        ccy = self.chart_display_ccy.get().strip().upper()
+        bar = self.overlay_comparison_bar.get().strip().upper()
+        lim = self.candle_limit.get().strip()
+        return f"{bar}|{formula}|{legs_part}|{ccy}|{lim}"
+
+    def _overlay_period_display(self) -> str:
+        raw = self.overlay_comparison_bar.get().strip().upper()
+        return {"1H": "1小时", "4H": "4小时", "1D": "日线"}.get(raw, raw or "-")
+
+    def _on_overlay_comparison_period_selected(self) -> None:
+        if self._big_chart_window is None or not self._big_chart_window.winfo_exists():
+            return
+        if self._selected_big_chart_tab() != "叠加对比":
+            return
+        self._request_overlay_chart_refresh()
+
+    def _request_overlay_chart_refresh(self) -> None:
+        if self._overlay_refresh_inflight:
+            return
+        if not self._legs:
+            return
+        self._overlay_refresh_failed_sig = ""
+        try:
+            candle_limit = self._parse_positive_int(self.candle_limit.get(), "K线数量")
+        except Exception:
+            candle_limit = 500
+        if candle_limit > MAX_OPTION_COMBO_CANDLES:
+            candle_limit = MAX_OPTION_COMBO_CANDLES
+        active_legs = [StrategyLegDefinition(**leg.__dict__) for leg in self._legs if leg.enabled]
+        if not active_legs:
+            return
+        formula = self._latest_chart_formula or self.formula.get().strip() or build_default_formula(self._legs)
+        try:
+            parse_linear_formula(formula, allowed_names={item.alias for item in active_legs if item.alias.strip()})
+        except Exception:
+            return
+        bar = self.overlay_comparison_bar.get().strip().upper()
+        if bar not in {"1H", "4H", "1D"}:
+            bar = "1H"
+        display_in_usdt = self._display_in_usdt()
+        self._overlay_chart_request_id += 1
+        request_id = self._overlay_chart_request_id
+        self._overlay_refresh_inflight = True
+        self._overlay_chain_rows = []
+        self._schedule_big_chart_redraw()
+        threading.Thread(
+            target=self._load_overlay_comparison_worker,
+            args=(request_id, bar, candle_limit, formula, display_in_usdt),
+            daemon=True,
+        ).start()
+
+    def _load_overlay_comparison_worker(
+        self,
+        request_id: int,
+        bar: str,
+        candle_limit: int,
+        formula: str,
+        display_in_usdt: bool,
+    ) -> None:
+        try:
+            active_legs = [StrategyLegDefinition(**leg.__dict__) for leg in self._legs if leg.enabled]
+            if not active_legs:
+                raise ValueError("请先启用至少一条策略腿。")
+            families = {parse_option_contract(item.inst_id).inst_family for item in active_legs}
+            if len(families) != 1:
+                raise ValueError("叠加对比仅支持同一期权系列的组合。")
+            family = next(iter(families))
+            spot_inst_id = _spot_usdt_inst_id(family)
+            if not spot_inst_id:
+                raise ValueError("当前期权系列无法映射到 USDT 现货 K 线（需要 BASE-USD 或 BASE-USDT 系列）。")
+            currency = family.strip().upper().split("-", 1)[0]
+            if not currency:
+                raise ValueError("无法解析期权标的币种。")
+
+            latest_quotes: dict[str, OptionQuote] = {}
+            candles_by_alias: dict[str, list[Candle]] = {}
+            for leg in active_legs:
+                instrument = self._instrument_map.get(leg.inst_id) or self.client.get_instrument(leg.inst_id)
+                ticker = self.client.get_ticker(leg.inst_id)
+                quote = _build_option_quote(instrument, ticker)
+                latest_quotes[leg.inst_id] = quote
+                if quote.reference_price is None:
+                    raise ValueError(f"{leg.inst_id} 当前缺少标记价 / 最新价，无法计算。")
+                candles = self.client.get_mark_price_candles(leg.inst_id, bar, limit=candle_limit)
+                candles_by_alias[leg.alias] = [item for item in candles if item.confirmed]
+
+            latest_values = {
+                leg.alias: latest_quotes[leg.inst_id].reference_price or Decimal("0")
+                for leg in active_legs
+            }
+            combo_candles = build_composite_candles(
+                formula,
+                candles_by_alias,
+                allowed_names=set(latest_values.keys()),
+            )
+            spot_candles = [
+                item
+                for item in self.client.get_candles_history(spot_inst_id, bar, limit=candle_limit)
+                if item.confirmed
+            ]
+            combo_ccy = _native_display_currency(active_legs, self._instrument_map)
+            if display_in_usdt:
+                converted = convert_candles_by_reference(combo_candles, spot_candles)
+                if converted:
+                    combo_candles = converted
+                    combo_ccy = "USDT"
+
+            vol_candles, resolution_label, resolution_note = _load_deribit_option_chart_candles(
+                currency,
+                bar=bar,
+                requested_limit=candle_limit,
+            )
+            triples = _align_overlay_three_series(combo_candles, vol_candles, spot_candles)
+            if not triples:
+                raise ValueError(
+                    "组合 K 线、Deribit DVOL 与现货在同一周期下没有可对齐的时间戳；"
+                    f"请确认已在「Deribit 波动率指数」窗口拉取过 {currency} 的小时线缓存，或尝试切换叠加周期。"
+                )
+
+            self.window.after(
+                0,
+                lambda: self._apply_overlay_chart_snapshot(
+                    request_id=request_id,
+                    triples=triples,
+                    combo_ccy=combo_ccy,
+                    spot_inst_id=spot_inst_id,
+                    vol_currency=currency,
+                    resolution_label=resolution_label,
+                    resolution_note=resolution_note,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.window.after(0, lambda error=exc: self._apply_overlay_chart_error(request_id, error))
+
+    def _apply_overlay_chart_snapshot(
+        self,
+        *,
+        request_id: int,
+        triples: list[tuple[Candle, Candle, Candle]],
+        combo_ccy: str,
+        spot_inst_id: str,
+        vol_currency: str,
+        resolution_label: str,
+        resolution_note: str,
+    ) -> None:
+        self._overlay_refresh_inflight = False
+        if request_id != self._overlay_chart_request_id or not self.window.winfo_exists():
+            return
+        self._overlay_refresh_failed_sig = ""
+        self._overlay_chain_rows = list(triples)
+        self._overlay_combo_display_ccy = combo_ccy
+        self._overlay_spot_inst_id = spot_inst_id
+        self._overlay_vol_currency = vol_currency
+        self._overlay_deribit_resolution_label = resolution_label
+        self._overlay_deribit_resolution_note = resolution_note
+        self._overlay_data_signature = self._overlay_context_signature()
+        view_state = self._kline_view_states.setdefault("big_overlay", KlineChartViewState())
+        view_state.start_index = 0
+        view_state.visible_count = None
+        view_state.auto_full = True
+        self._refresh_big_chart_window()
+
+    def _apply_overlay_chart_error(self, request_id: int, exc: Exception) -> None:
+        self._overlay_refresh_inflight = False
+        if request_id != self._overlay_chart_request_id or not self.window.winfo_exists():
+            return
+        self._overlay_chain_rows = []
+        self._overlay_refresh_failed_sig = self._overlay_context_signature()
+        self._overlay_data_signature = ""
+        self.overlay_summary_text.set(f"叠加对比加载失败：{exc}")
+        if self._big_overlay_combo_canvas is not None:
+            self._clear_canvas(self._big_overlay_combo_canvas, str(exc))
+        if self._big_overlay_volatility_canvas is not None:
+            self._clear_canvas(self._big_overlay_volatility_canvas, str(exc))
+        if self._big_overlay_spot_canvas is not None:
+            self._clear_canvas(self._big_overlay_spot_canvas, str(exc))
+
+    def _render_overlay_comparison_charts(self) -> None:
+        if (
+            self._big_overlay_combo_canvas is None
+            or self._big_overlay_volatility_canvas is None
+            or self._big_overlay_spot_canvas is None
+        ):
+            return
+        rows = self._overlay_chain_rows
+        if not rows:
+            return
+        combo_ccy = self._overlay_combo_display_ccy or _native_display_currency(self._legs, self._instrument_map)
+        vol_ccy = self._overlay_vol_currency or (self._current_deribit_currency() or "")
+        spot_label = self._overlay_spot_inst_id or "现货"
+        note_text = f" | {self._overlay_deribit_resolution_note}" if self._overlay_deribit_resolution_note else ""
+        period_text = self._overlay_period_display()
+        self.overlay_summary_text.set(
+            f"叠加对比 | 上=标记价格组合K线({combo_ccy}) | 中=Deribit {vol_ccy} DVOL (%) | 下={spot_label} 现货 | "
+            f"共用时间轴 | 周期 {period_text}{note_text} | 对齐 {len(rows)} 根"
+        )
+        visible = self._apply_kline_view("big_overlay", rows)
+        visible_combo = [item[0] for item in visible]
+        visible_vol = [item[1] for item in visible]
+        visible_spot = [item[2] for item in visible]
+        self._draw_combo_chart(
+            self._big_overlay_combo_canvas,
+            visible_combo,
+            combo_ccy,
+            enable_hover=True,
+            hover_target="big_overlay_combo",
+        )
+        self._draw_volatility_chart(
+            self._big_overlay_volatility_canvas,
+            visible_vol,
+            enable_hover=True,
+            hover_target="big_overlay_volatility",
+            dvol_asset=vol_ccy,
+        )
+        self._draw_combo_chart(
+            self._big_overlay_spot_canvas,
+            visible_spot,
+            "USDT",
+            enable_hover=True,
+            hover_target="big_overlay_spot",
+            chart_title=f"现货 {spot_label}",
+        )
+
     def _apply_chart_snapshot(
         self,
         *,
@@ -1918,6 +2191,12 @@ class OptionStrategyCalculatorWindow:
         self._refresh_payoff_simulation()
         self._refresh_chart_display(combo_only=True)
         self.status_text.set("期权策略图表已更新。")
+        if (
+            self._big_chart_window is not None
+            and self._big_chart_window.winfo_exists()
+            and self._selected_big_chart_tab() == "叠加对比"
+        ):
+            self._request_overlay_chart_refresh()
 
     def _apply_combo_chart_snapshot(
         self,
@@ -1951,6 +2230,12 @@ class OptionStrategyCalculatorWindow:
         self._refresh_strategy_summary()
         self._refresh_chart_display(combo_only=True)
         self.status_text.set("组合 K 线已更新。")
+        if (
+            self._big_chart_window is not None
+            and self._big_chart_window.winfo_exists()
+            and self._selected_big_chart_tab() == "叠加对比"
+        ):
+            self._request_overlay_chart_refresh()
 
     def _on_payoff_time_slider_changed(self, _value=None) -> None:
         self._update_payoff_simulation_labels()
@@ -2699,6 +2984,7 @@ class OptionStrategyCalculatorWindow:
         *,
         enable_hover: bool = True,
         hover_target: str = "main_combo",
+        chart_title: str | None = None,
     ) -> None:
         if not candles:
             self._clear_canvas(canvas, "没有可用的组合 K 线数据。")
@@ -2803,11 +3089,12 @@ class OptionStrategyCalculatorWindow:
             )
 
         latest = candles[-1]
+        title_prefix = chart_title if chart_title else f"标记价格组合K线 ({value_ccy})"
         canvas.create_text(
             width - right,
             top + 10,
             text=(
-                f"标记价格组合K线 ({value_ccy}) | 最新 O {_format_compact_number(latest.open)} "
+                f"{title_prefix} | 最新 O {_format_compact_number(latest.open)} "
                 f"H {_format_compact_number(latest.high)} L {_format_compact_number(latest.low)} C {_format_compact_number(latest.close)}"
             ),
             anchor="ne",
@@ -2829,6 +3116,8 @@ class OptionStrategyCalculatorWindow:
                 self._big_combo_hover_state = hover_state
             elif hover_target == "big_overlay_combo":
                 self._big_overlay_combo_hover_state = hover_state
+            elif hover_target == "big_overlay_spot":
+                self._big_overlay_spot_hover_state = hover_state
 
     def _draw_volatility_chart(
         self,
@@ -2837,6 +3126,7 @@ class OptionStrategyCalculatorWindow:
         *,
         enable_hover: bool = False,
         hover_target: str = "big_volatility",
+        dvol_asset: str | None = None,
     ) -> None:
         if not candles:
             self._clear_canvas(canvas, "暂无可用的 Deribit 波动率指数 K 线数据。")
@@ -2925,11 +3215,12 @@ class OptionStrategyCalculatorWindow:
             )
 
         latest = candles[-1]
+        asset_part = f"{dvol_asset.strip().upper()} " if (dvol_asset and dvol_asset.strip()) else ""
         canvas.create_text(
             width - right,
             top + 10,
             text=(
-                f"Deribit波动率指数K线 (%) | 最新 O {_format_compact_number(latest.open)} "
+                f"Deribit {asset_part}DVOL 波动率指数K线 (%) | 最新 O {_format_compact_number(latest.open)} "
                 f"H {_format_compact_number(latest.high)} L {_format_compact_number(latest.low)} C {_format_compact_number(latest.close)}"
             ),
             anchor="ne",
@@ -3147,22 +3438,13 @@ class OptionStrategyCalculatorWindow:
         self._handle_kline_canvas_motion(self._big_volatility_canvas, self._big_volatility_hover_state, event)
 
     def _on_big_overlay_combo_canvas_motion(self, event) -> None:
-        self._handle_overlay_kline_motion(
-            self._big_overlay_combo_canvas,
-            self._big_overlay_combo_hover_state,
-            self._big_overlay_volatility_canvas,
-            self._big_overlay_volatility_hover_state,
-            event,
-        )
+        self._handle_overlay_stack_motion(self._big_overlay_combo_canvas, self._big_overlay_combo_hover_state, event)
 
     def _on_big_overlay_volatility_canvas_motion(self, event) -> None:
-        self._handle_overlay_kline_motion(
-            self._big_overlay_volatility_canvas,
-            self._big_overlay_volatility_hover_state,
-            self._big_overlay_combo_canvas,
-            self._big_overlay_combo_hover_state,
-            event,
-        )
+        self._handle_overlay_stack_motion(self._big_overlay_volatility_canvas, self._big_overlay_volatility_hover_state, event)
+
+    def _on_big_overlay_spot_canvas_motion(self, event) -> None:
+        self._handle_overlay_stack_motion(self._big_overlay_spot_canvas, self._big_overlay_spot_hover_state, event)
 
     def _handle_kline_canvas_motion(self, canvas: Canvas | None, state: ComboChartHoverState | None, event) -> None:
         if canvas is None or state is None or not state.candles:
@@ -3173,24 +3455,28 @@ class OptionStrategyCalculatorWindow:
         index = _nearest_candle_index(float(event.x), state.bounds.left, state.candle_step, len(state.candles))
         self._draw_kline_hover_for_index(canvas, state, index)
 
-    def _handle_overlay_kline_motion(
+    def _handle_overlay_stack_motion(
         self,
         canvas: Canvas | None,
         state: ComboChartHoverState | None,
-        paired_canvas: Canvas | None,
-        paired_state: ComboChartHoverState | None,
         event,
     ) -> None:
         if canvas is None or state is None or not state.candles:
+            self._clear_overlay_chart_hover()
             return
         if not state.bounds.contains(float(event.x), float(event.y)):
             self._clear_overlay_chart_hover()
             return
         index = _nearest_candle_index(float(event.x), state.bounds.left, state.candle_step, len(state.candles))
-        self._draw_kline_hover_for_index(canvas, state, index)
-        if paired_canvas is not None and paired_state is not None and paired_state.candles:
-            paired_index = min(index, len(paired_state.candles) - 1)
-            self._draw_kline_hover_for_index(paired_canvas, paired_state, paired_index)
+        stack = (
+            (self._big_overlay_combo_canvas, self._big_overlay_combo_hover_state),
+            (self._big_overlay_volatility_canvas, self._big_overlay_volatility_hover_state),
+            (self._big_overlay_spot_canvas, self._big_overlay_spot_hover_state),
+        )
+        for target_canvas, target_state in stack:
+            if target_canvas is not None and target_state is not None and target_state.candles:
+                idx = min(index, len(target_state.candles) - 1)
+                self._draw_kline_hover_for_index(target_canvas, target_state, idx)
 
     def _draw_kline_hover_for_index(self, canvas: Canvas, state: ComboChartHoverState, index: int) -> None:
         candle = state.candles[index]
@@ -3216,6 +3502,8 @@ class OptionStrategyCalculatorWindow:
             self._clear_chart_hover(self._big_overlay_combo_canvas)
         if self._big_overlay_volatility_canvas is not None:
             self._clear_chart_hover(self._big_overlay_volatility_canvas)
+        if self._big_overlay_spot_canvas is not None:
+            self._clear_chart_hover(self._big_overlay_spot_canvas)
 
     def _draw_chart_hover_overlay(
         self,
@@ -3345,6 +3633,8 @@ class OptionStrategyCalculatorWindow:
             self._big_overlay_combo_hover_state = None
         elif canvas is self._big_overlay_volatility_canvas:
             self._big_overlay_volatility_hover_state = None
+        elif canvas is self._big_overlay_spot_canvas:
+            self._big_overlay_spot_hover_state = None
         width = max(canvas.winfo_width(), 900)
         height = max(canvas.winfo_height(), 360)
         canvas.create_rectangle(0, 0, width, height, outline="", fill="#ffffff")
@@ -3392,6 +3682,38 @@ def _build_option_quote(instrument: Instrument, ticker: OkxTicker | None) -> Opt
         last_price=ticker.last if ticker is not None else None,
         index_price=ticker.index if ticker is not None else None,
     )
+
+
+def _instrument_option_family(instrument: Instrument) -> str | None:
+    fam = (instrument.inst_family or "").strip().upper()
+    if fam:
+        return fam
+    try:
+        return parse_option_contract(instrument.inst_id).inst_family
+    except ValueError:
+        return None
+
+
+def _filter_option_instruments_by_family(family: str, instruments: list[Instrument]) -> list[Instrument]:
+    """OKX 用 uly 拉期权时可能混进币本位与 U 本位；只保留与所选 instFamily 一致的合约。"""
+    normalized = family.strip().upper()
+    if not normalized:
+        return []
+    return [item for item in instruments if _instrument_option_family(item) == normalized]
+
+
+def _filter_option_tickers_by_family(family: str, tickers: list[OkxTicker]) -> list[OkxTicker]:
+    normalized = family.strip().upper()
+    if not normalized:
+        return []
+    out: list[OkxTicker] = []
+    for ticker in tickers:
+        try:
+            if parse_option_contract(ticker.inst_id).inst_family == normalized:
+                out.append(ticker)
+        except ValueError:
+            continue
+    return out
 
 
 def _spot_usdt_inst_id(inst_family: str | None) -> str | None:
@@ -3617,14 +3939,22 @@ def _build_deribit_option_chart_candles(
     bar: str,
     requested_limit: int,
 ) -> tuple[list[Candle], str, str]:
-    normalized_bar = bar.strip()
-    resolution = DERIBIT_OPTION_CHART_BAR_TO_RESOLUTION.get(normalized_bar, "3600")
-    resolution_label = "4小时" if resolution == "14400" else "1小时"
-    resolution_note = "" if normalized_bar in {"1H", "4H"} else "Deribit 最小周期为1小时，当前按1小时指数显示"
+    normalized_bar = bar.strip().upper()
     selected = list(hourly_candles)
-    if resolution == "14400":
+    resolution_note = ""
+    if normalized_bar == "4H":
         selected = _aggregate_deribit_option_chart_candles(selected, 14_400_000)
-    if requested_limit > 0:
+        resolution_label = "4小时"
+    elif normalized_bar in {"1D", "1DAY"}:
+        selected = _aggregate_deribit_option_chart_candles(selected, 86_400_000)
+        resolution_label = "日线"
+        resolution_note = "Deribit 最小粒度为1小时，日线由小时线合成"
+    else:
+        resolution_label = "1小时"
+        if normalized_bar not in {"1H", ""}:
+            resolution_note = "Deribit 最小周期为1小时，当前按1小时指数显示"
+
+    if requested_limit > 0 and selected:
         selected = selected[-requested_limit:]
     chart_candles = [
         Candle(
@@ -3649,9 +3979,16 @@ def _load_deribit_option_chart_candles(
 ) -> tuple[list[Candle], str, str]:
     hourly_candles = _load_deribit_hourly_series_from_cache(currency)
     if not hourly_candles:
-        resolution = DERIBIT_OPTION_CHART_BAR_TO_RESOLUTION.get(bar.strip(), "3600")
-        resolution_label = "4小时" if resolution == "14400" else "1小时"
-        resolution_note = "" if bar.strip() in {"1H", "4H"} else "Deribit 最小周期为1小时，当前按1小时指数显示"
+        nb = bar.strip().upper()
+        if nb == "4H":
+            resolution_label = "4小时"
+            resolution_note = ""
+        elif nb in {"1D", "1DAY"}:
+            resolution_label = "日线"
+            resolution_note = "Deribit 最小粒度为1小时，日线由小时线合成"
+        else:
+            resolution_label = "1小时"
+            resolution_note = "" if nb in {"1H", ""} else "Deribit 最小周期为1小时，当前按1小时指数显示"
         return [], resolution_label, resolution_note
     return _build_deribit_option_chart_candles(
         hourly_candles,
@@ -3732,6 +4069,24 @@ def _align_overlay_candles(
         volatility_candle = volatility_by_ts.get(combo_candle.ts)
         if volatility_candle is not None:
             aligned.append((combo_candle, volatility_candle))
+    return aligned
+
+
+def _align_overlay_three_series(
+    combo_candles: list[Candle],
+    volatility_candles: list[Candle],
+    spot_candles: list[Candle],
+) -> list[tuple[Candle, Candle, Candle]]:
+    if not combo_candles or not volatility_candles or not spot_candles:
+        return []
+    volatility_by_ts = {item.ts: item for item in volatility_candles}
+    spot_by_ts = {item.ts: item for item in spot_candles}
+    aligned: list[tuple[Candle, Candle, Candle]] = []
+    for combo_candle in combo_candles:
+        volatility_candle = volatility_by_ts.get(combo_candle.ts)
+        spot_candle = spot_by_ts.get(combo_candle.ts)
+        if volatility_candle is not None and spot_candle is not None:
+            aligned.append((combo_candle, volatility_candle, spot_candle))
     return aligned
 
 

@@ -4,9 +4,13 @@ from unittest import TestCase
 
 from okx_quant.deribit_client import DeribitVolatilityCandle
 from okx_quant.models import Candle, Instrument
+from okx_quant.okx_client import OkxTicker
 from okx_quant.option_strategy_ui import (
     OptionStrategyCalculatorWindow,
     _align_overlay_candles,
+    _align_overlay_three_series,
+    _filter_option_instruments_by_family,
+    _filter_option_tickers_by_family,
     _aggregate_deribit_option_chart_candles,
     _annualization_factor_for_bar,
     _build_deribit_option_chart_candles,
@@ -241,6 +245,45 @@ class OptionStrategyTest(TestCase):
         self.assertEqual(len(aligned), 2)
         self.assertEqual([item[0].ts for item in aligned], [2000, 3000])
         self.assertEqual([item[1].ts for item in aligned], [2000, 3000])
+
+    def test_align_overlay_three_series_requires_all_timestamps(self) -> None:
+        combo_candles = [
+            Candle(ts=1000, open=Decimal("1"), high=Decimal("2"), low=Decimal("0.5"), close=Decimal("1.5"), volume=Decimal("0"), confirmed=True),
+            Candle(ts=2000, open=Decimal("1.5"), high=Decimal("2.2"), low=Decimal("1.2"), close=Decimal("2.0"), volume=Decimal("0"), confirmed=True),
+        ]
+        volatility_candles = [
+            Candle(ts=2000, open=Decimal("45"), high=Decimal("46"), low=Decimal("44"), close=Decimal("45.5"), volume=Decimal("0"), confirmed=True),
+        ]
+        spot_candles = [
+            Candle(ts=2000, open=Decimal("60000"), high=Decimal("61000"), low=Decimal("59000"), close=Decimal("60500"), volume=Decimal("0"), confirmed=True),
+        ]
+        aligned = _align_overlay_three_series(combo_candles, volatility_candles, spot_candles)
+        self.assertEqual(len(aligned), 1)
+        self.assertEqual(aligned[0][0].ts, 2000)
+        self.assertEqual(aligned[0][1].ts, 2000)
+        self.assertEqual(aligned[0][2].ts, 2000)
+
+    def test_build_deribit_option_chart_candles_daily_aggregate(self) -> None:
+        hourly = []
+        base_ts = 86_400_000
+        for hour in range(26):
+            hourly.append(
+                DeribitVolatilityCandle(
+                    ts=base_ts + hour * 3_600_000,
+                    open=Decimal("40") + Decimal(hour),
+                    high=Decimal("41") + Decimal(hour),
+                    low=Decimal("39") + Decimal(hour),
+                    close=Decimal("40.5") + Decimal(hour),
+                )
+            )
+        candles, resolution_label, resolution_note = _build_deribit_option_chart_candles(
+            hourly,
+            bar="1D",
+            requested_limit=100,
+        )
+        self.assertEqual(resolution_label, "日线")
+        self.assertIn("小时", resolution_note)
+        self.assertEqual(len(candles), 2)
 
     def test_normalized_kline_view_returns_full_when_auto_full(self) -> None:
         start, visible = _normalized_kline_view(200, 20, 50, auto_full=True)
@@ -626,3 +669,49 @@ class OptionStrategyTest(TestCase):
         self.assertIn("theta", greeks)
         self.assertIn("vega", greeks)
         self.assertGreater(greeks["delta"], Decimal("0"))
+
+    def test_filter_option_instruments_by_family_drops_usdt_when_usd_selected(self) -> None:
+        coin = _make_instrument("BTC-USD-260626-90000-C")
+        usdt_m = Instrument(
+            inst_id="BTC-USDT-260626-90000-C",
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("1"),
+            ct_mult=Decimal("0.1"),
+            ct_val_ccy="USDT",
+            inst_family="BTC-USDT",
+        )
+        mixed = [coin, usdt_m]
+        usd_only = _filter_option_instruments_by_family("BTC-USD", mixed)
+        self.assertEqual([i.inst_id for i in usd_only], ["BTC-USD-260626-90000-C"])
+        usdt_only = _filter_option_instruments_by_family("BTC-USDT", mixed)
+        self.assertEqual([i.inst_id for i in usdt_only], ["BTC-USDT-260626-90000-C"])
+
+    def test_filter_option_tickers_by_family_drops_other_settlement_line(self) -> None:
+        tickers = [
+            OkxTicker(
+                inst_id="BTC-USD-260626-90000-C",
+                last=None,
+                bid=None,
+                ask=None,
+                mark=Decimal("0.01"),
+                index=None,
+                raw={},
+            ),
+            OkxTicker(
+                inst_id="BTC-USDT-260626-90000-C",
+                last=None,
+                bid=None,
+                ask=None,
+                mark=Decimal("0.02"),
+                index=None,
+                raw={},
+            ),
+        ]
+        self.assertEqual(
+            [t.inst_id for t in _filter_option_tickers_by_family("BTC-USD", tickers)],
+            ["BTC-USD-260626-90000-C"],
+        )

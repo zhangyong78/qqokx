@@ -3460,9 +3460,9 @@ class UiStrategySessionsMixin:
                 self._entry_reference_ema_caption(strategy_id),
             )
         if is_dynamic_strategy_id(strategy_id) or is_ema_atr_breakout_strategy(strategy_id):
-            startup_chase_window_seconds = self._parse_nonnegative_int(
+            startup_chase_window_seconds = parse_nonnegative_duration_seconds(
                 self.startup_chase_window_seconds.get(),
-                "启动追单窗口(秒)",
+                field_name="启动追单窗口",
             )
 
         if not api_key or not secret_key or not passphrase:

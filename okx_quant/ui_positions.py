@@ -25,20 +25,10 @@ class UiPositionsMixin:
         else:
             self.position_auto_refresh_button_text.set("恢复自动刷新")
             self._enqueue_log("账户持仓已暂停自动刷新。需要更新时可以手动点“刷新”。")
-            self._update_position_summary(_filter_positions(
-                self._latest_positions,
-                inst_type=POSITION_TYPE_OPTIONS[self.position_type_filter.get()],
-                keyword=self.position_keyword.get(),
-                note_texts=self._current_position_note_text_map(),
-            ))
+            self._update_position_summary(self._main_visible_positions_unfiltered())
 
     def _on_position_refresh_interval_changed(self, *_: object) -> None:
-        visible_positions = _filter_positions(
-            self._latest_positions,
-            inst_type=POSITION_TYPE_OPTIONS[self.position_type_filter.get()],
-            keyword=self.position_keyword.get(),
-            note_texts=self._current_position_note_text_map(),
-        )
+        visible_positions = self._main_visible_positions_unfiltered()
         self._update_position_summary(visible_positions)
         self._enqueue_log(f"账户持仓自动刷新间隔已切换为：{self.position_refresh_interval_label.get()}")
 
@@ -46,9 +36,26 @@ class UiPositionsMixin:
         self._render_positions_view()
 
     def reset_position_filters(self) -> None:
-        self.position_type_filter.set("全部类型")
-        self.position_keyword.set("")
+        self.positions_zoom_type_filter.set("全部类型")
+        self.positions_zoom_keyword.set("")
         self._render_positions_view()
+
+    def _main_visible_positions_unfiltered(self) -> list[OkxPosition]:
+        """首页持仓树始终按「全部类型、无关键字」展示，避免与大窗筛选状态串扰。"""
+        return _filter_positions(
+            self._latest_positions,
+            inst_type="",
+            keyword="",
+            note_texts=self._current_position_note_text_map(),
+        )
+
+    def _positions_zoom_visible_positions(self) -> list[OkxPosition]:
+        return _filter_positions(
+            self._latest_positions,
+            inst_type=POSITION_TYPE_OPTIONS[self.positions_zoom_type_filter.get()],
+            keyword=self.positions_zoom_keyword.get(),
+            note_texts=self._current_position_note_text_map(),
+        )
 
     def expand_all_position_groups(self) -> None:
         for item_id in self.position_tree.get_children():
@@ -384,7 +391,7 @@ class UiPositionsMixin:
         ttk.Label(filter_row, text="类型").grid(row=0, column=0, sticky="w")
         zoom_position_type_combo = ttk.Combobox(
             filter_row,
-            textvariable=self.position_type_filter,
+            textvariable=self.positions_zoom_type_filter,
             values=list(POSITION_TYPE_OPTIONS.keys()),
             state="readonly",
             width=16,
@@ -392,7 +399,7 @@ class UiPositionsMixin:
         zoom_position_type_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
         zoom_position_type_combo.bind("<<ComboboxSelected>>", self._on_position_filter_changed)
         ttk.Label(filter_row, text="搜索").grid(row=0, column=2, sticky="w")
-        zoom_position_keyword_entry = ttk.Entry(filter_row, textvariable=self.position_keyword)
+        zoom_position_keyword_entry = ttk.Entry(filter_row, textvariable=self.positions_zoom_keyword)
         zoom_position_keyword_entry.grid(row=0, column=3, sticky="ew", padx=(6, 12))
         zoom_position_keyword_entry.bind("<KeyRelease>", self._on_position_filter_changed)
         self._positions_zoom_apply_contract_button = ttk.Button(
@@ -599,7 +606,7 @@ class UiPositionsMixin:
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
 
-        columns = ("time", "source", "inst_type", "inst_id", "state", "side", "ord_type", "price", "size", "filled", "tp_sl", "order_id", "cl_ord_id")
+        columns = ("time", "source", "inst_type", "inst_id", "state", "side", "ord_type", "price", "size", "filled", "fee", "tp_sl", "order_id", "cl_ord_id")
         tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
         self._positions_zoom_pending_orders_tree = tree
         headings = {
@@ -613,6 +620,7 @@ class UiPositionsMixin:
             "price": "委托价",
             "size": "委托量",
             "filled": "已成交",
+            "fee": "手续费",
             "tp_sl": "TP/SL",
             "order_id": "订单ID",
             "cl_ord_id": "clOrdId",
@@ -628,12 +636,13 @@ class UiPositionsMixin:
             ("price", 100),
             ("size", 100),
             ("filled", 100),
+            ("fee", 110),
             ("tp_sl", 180),
             ("order_id", 120),
             ("cl_ord_id", 150),
         ):
             tree.heading(column_id, text=headings[column_id])
-            tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "filled"} else "center")
+            tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "filled", "fee"} else "center")
         tree.column("inst_id", anchor="w")
         tree.column("tp_sl", anchor="w")
         tree.column("cl_ord_id", anchor="w")
@@ -731,7 +740,7 @@ class UiPositionsMixin:
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
 
-        columns = ("time", "source", "inst_type", "inst_id", "state", "side", "ord_type", "price", "size", "filled", "tp_sl", "order_id", "cl_ord_id")
+        columns = ("time", "source", "inst_type", "inst_id", "state", "side", "ord_type", "price", "size", "filled", "fee", "tp_sl", "order_id", "cl_ord_id")
         tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
         self._positions_zoom_order_history_tree = tree
         headings = {
@@ -745,6 +754,7 @@ class UiPositionsMixin:
             "price": "委托价",
             "size": "委托量",
             "filled": "已成交",
+            "fee": "手续费",
             "tp_sl": "TP/SL",
             "order_id": "订单ID",
             "cl_ord_id": "clOrdId",
@@ -760,12 +770,13 @@ class UiPositionsMixin:
             ("price", 100),
             ("size", 100),
             ("filled", 100),
+            ("fee", 110),
             ("tp_sl", 180),
             ("order_id", 120),
             ("cl_ord_id", 150),
         ):
             tree.heading(column_id, text=headings[column_id])
-            tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "filled"} else "center")
+            tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "filled", "fee"} else "center")
         tree.column("inst_id", anchor="w")
         tree.column("tp_sl", anchor="w")
         tree.column("cl_ord_id", anchor="w")
@@ -1017,6 +1028,7 @@ class UiPositionsMixin:
             "open_avg",
             "close_avg",
             "close_size",
+            "fee",
             "pnl",
             "realized",
             "realized_usdt",
@@ -1033,6 +1045,7 @@ class UiPositionsMixin:
             "open_avg": "开仓均价",
             "close_avg": "平仓均价",
             "close_size": "平仓数量",
+            "fee": "手续费",
             "pnl": "盈亏",
             "realized": "已实现盈亏",
             "note": "备注",
@@ -1047,6 +1060,7 @@ class UiPositionsMixin:
             ("open_avg", 100),
             ("close_avg", 100),
             ("close_size", 100),
+            ("fee", 110),
             ("pnl", 100),
             ("realized", 110),
             ("realized_usdt", 110),
@@ -1056,7 +1070,9 @@ class UiPositionsMixin:
             tree.column(
                 column_id,
                 width=width,
-                anchor="e" if column_id in {"open_avg", "close_avg", "close_size", "pnl", "realized", "realized_usdt"} else "center",
+                anchor="e"
+                if column_id in {"open_avg", "close_avg", "close_size", "fee", "pnl", "realized", "realized_usdt"}
+                else "center",
             )
         tree.column("inst_id", anchor="w")
         tree.column("note", anchor="w")
@@ -1389,22 +1405,8 @@ class UiPositionsMixin:
         zoom_tree = self._positions_zoom_tree
         self._sync_positions_zoom_columns_from_main()
         zoom_tree.delete(*zoom_tree.get_children())
-
-        def _copy_branch(source_parent: str, target_parent: str) -> None:
-            for item_id in self.position_tree.get_children(source_parent):
-                item = self.position_tree.item(item_id)
-                zoom_tree.insert(
-                    target_parent,
-                    END,
-                    iid=item_id,
-                    text=item.get("text", ""),
-                    values=item.get("values", ()),
-                    open=bool(item.get("open")),
-                    tags=item.get("tags", ()),
-                )
-                _copy_branch(item_id, item_id)
-
-        _copy_branch("", "")
+        zoom_visible = self._positions_zoom_visible_positions()
+        self._populate_positions_tree_from_groups(zoom_tree, zoom_visible)
         selected = self.position_tree.selection()
         if selected and zoom_tree.exists(selected[0]):
             if zoom_tree.selection() != (selected[0],):
@@ -1624,7 +1626,7 @@ class UiPositionsMixin:
         if not contract:
             messagebox.showinfo("快捷筛选", "请先在当前持仓里选中一条期权合约。")
             return
-        self.position_keyword.set(contract)
+        self.positions_zoom_keyword.set(contract)
         self._render_positions_view()
 
     def apply_selected_option_expiry_prefix_to_position_search(self) -> None:
@@ -1633,7 +1635,7 @@ class UiPositionsMixin:
         if not expiry_prefix:
             messagebox.showinfo("快捷筛选", "请先在当前持仓里选中一条期权合约。")
             return
-        self.position_keyword.set(expiry_prefix)
+        self.positions_zoom_keyword.set(expiry_prefix)
         self._render_positions_view()
 
     def apply_selected_option_to_position_history_search(self) -> None:
@@ -2578,6 +2580,7 @@ class UiPositionsMixin:
                             _format_trade_order_price(item.price, item.inst_id, item.inst_type),
                             _format_trade_order_coin_size(item, self._pending_order_instruments),
                             _format_trade_order_coin_filled_size(item, self._pending_order_instruments),
+                            _format_trade_order_fee_cell(item),
                             _format_trade_order_tp_sl(item),
                             item.order_id or item.algo_id or "-",
                             item.client_order_id or item.algo_client_order_id or "-",
@@ -2638,6 +2641,7 @@ class UiPositionsMixin:
                             _format_trade_order_price(item.price, item.inst_id, item.inst_type),
                             _format_trade_order_coin_size(item, self._order_history_instruments),
                             _format_trade_order_coin_filled_size(item, self._order_history_instruments),
+                            _format_trade_order_fee_cell(item),
                             _format_trade_order_tp_sl(item),
                             item.order_id or item.algo_id or "-",
                             item.client_order_id or item.algo_client_order_id or "-",
@@ -3001,7 +3005,7 @@ class UiPositionsMixin:
                     _format_history_side(item.side, item.pos_side),
                     _format_fill_history_price(item),
                     _format_fill_history_size(item, self._fill_history_instruments),
-                    _format_optional_decimal(item.fill_fee),
+                    _format_fill_history_fee_cell(item),
                     _format_fill_history_pnl(item),
                     _format_fill_history_exec_type(item.exec_type),
                   ),
@@ -3091,6 +3095,7 @@ class UiPositionsMixin:
                     _format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type),
                     _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
                     _format_position_history_size(item, self._position_history_instruments),
+                    _format_position_history_fee_cell(item),
                     _format_position_history_pnl(item.pnl, item),
                     _format_position_history_pnl(item.realized_pnl, item, with_sign=True),
                     _format_optional_usdt(
@@ -3572,6 +3577,59 @@ class UiPositionsMixin:
         self._refresh_running_session_tree()
         self._refresh_selected_session_details()
 
+    def _populate_positions_tree_from_groups(self, tree, visible_positions: list[OkxPosition]) -> None:
+        groups = _group_positions_for_tree(visible_positions)
+        for asset_label, buckets in groups.items():
+            asset_id = _asset_group_row_id(asset_label)
+            asset_positions = [item for bucket in buckets.values() for item in bucket]
+            asset_metrics = _aggregate_position_metrics(asset_positions, self._upl_usdt_prices, self._position_instruments)
+            asset_label_text = f"{asset_label} 风险单元"
+            tree.insert(
+                "",
+                END,
+                iid=asset_id,
+                text=asset_label_text,
+                values=_build_group_row_values("组合", asset_metrics),
+                open=True,
+                tags=("group", _pnl_tag(asset_metrics["upl"])),
+            )
+            self._position_row_payloads[asset_id] = {
+                "kind": "group",
+                "label": asset_label_text,
+                "item": asset_positions,
+                "metrics": asset_metrics,
+            }
+
+            for bucket_label, bucket_positions in buckets.items():
+                if bucket_label == "__DIRECT__":
+                    for position in bucket_positions:
+                        self._insert_position_row(tree, asset_id, position, _position_tree_row_id(position))
+                    continue
+
+                bucket_id = _bucket_group_row_id(asset_label, bucket_label)
+                bucket_metrics = _aggregate_position_metrics(
+                    bucket_positions,
+                    self._upl_usdt_prices,
+                    self._position_instruments,
+                )
+                tree.insert(
+                    asset_id,
+                    END,
+                    iid=bucket_id,
+                    text=bucket_label,
+                    values=_build_group_row_values("分组", bucket_metrics),
+                    open=True,
+                    tags=("group", _pnl_tag(bucket_metrics["upl"])),
+                )
+                self._position_row_payloads[bucket_id] = {
+                    "kind": "group",
+                    "label": bucket_label,
+                    "item": bucket_positions,
+                    "metrics": bucket_metrics,
+                }
+                for position in bucket_positions:
+                    self._insert_position_row(tree, bucket_id, position, _position_tree_row_id(position))
+
     def _render_positions_view(self) -> None:
         selected_before = self.position_tree.selection()[0] if self.position_tree.selection() else None
         selected_payload = self._selected_position_payload()
@@ -3585,64 +3643,8 @@ class UiPositionsMixin:
         try:
             self.position_tree.delete(*self.position_tree.get_children())
             self._position_row_payloads.clear()
-            visible_positions = _filter_positions(
-                self._latest_positions,
-                inst_type=POSITION_TYPE_OPTIONS[self.position_type_filter.get()],
-                keyword=self.position_keyword.get(),
-                note_texts=self._current_position_note_text_map(),
-            )
-            groups = _group_positions_for_tree(visible_positions)
-            for asset_label, buckets in groups.items():
-                asset_id = _asset_group_row_id(asset_label)
-                asset_positions = [item for bucket in buckets.values() for item in bucket]
-                asset_metrics = _aggregate_position_metrics(asset_positions, self._upl_usdt_prices, self._position_instruments)
-                asset_label_text = f"{asset_label} 风险单元"
-                self.position_tree.insert(
-                    "",
-                    END,
-                    iid=asset_id,
-                    text=asset_label_text,
-                    values=_build_group_row_values("组合", asset_metrics),
-                    open=True,
-                    tags=("group", _pnl_tag(asset_metrics["upl"])),
-                )
-                self._position_row_payloads[asset_id] = {
-                    "kind": "group",
-                    "label": asset_label_text,
-                    "item": asset_positions,
-                    "metrics": asset_metrics,
-                }
-
-                for bucket_label, bucket_positions in buckets.items():
-                    if bucket_label == "__DIRECT__":
-                        for position in bucket_positions:
-                            self._insert_position_row(asset_id, position, _position_tree_row_id(position))
-                        continue
-
-                    bucket_id = _bucket_group_row_id(asset_label, bucket_label)
-                    bucket_metrics = _aggregate_position_metrics(
-                        bucket_positions,
-                        self._upl_usdt_prices,
-                        self._position_instruments,
-                    )
-                    self.position_tree.insert(
-                        asset_id,
-                        END,
-                        iid=bucket_id,
-                        text=bucket_label,
-                        values=_build_group_row_values("分组", bucket_metrics),
-                        open=True,
-                        tags=("group", _pnl_tag(bucket_metrics["upl"])),
-                    )
-                    self._position_row_payloads[bucket_id] = {
-                        "kind": "group",
-                        "label": bucket_label,
-                        "item": bucket_positions,
-                        "metrics": bucket_metrics,
-                    }
-                    for position in bucket_positions:
-                        self._insert_position_row(bucket_id, position, _position_tree_row_id(position))
-
+            visible_positions = self._main_visible_positions_unfiltered()
+            self._populate_positions_tree_from_groups(self.position_tree, visible_positions)
             self._update_position_summary(visible_positions)
             self._update_position_metrics(visible_positions)
 
@@ -3663,12 +3665,12 @@ class UiPositionsMixin:
         self._sync_positions_zoom_window()
         self._refresh_protection_window_view()
 
-    def _insert_position_row(self, parent_id: str, position: OkxPosition, row_id: str) -> None:
+    def _insert_position_row(self, tree, parent_id: str, position: OkxPosition, row_id: str) -> None:
         label = position.inst_id
         if position.pos_side and position.pos_side.lower() != "net":
             label = f"{label} [{position.pos_side}]"
         tags = [tag for tag in (_pnl_tag(position.unrealized_pnl), _margin_mode_tag(position.mgn_mode)) if tag]
-        self.position_tree.insert(
+        tree.insert(
             parent_id,
             END,
             iid=row_id,
@@ -3756,8 +3758,8 @@ class UiPositionsMixin:
             parts.append("当前没有持仓")
 
         filter_text = _format_position_filter_summary(
-            self.position_type_filter.get(),
-            self.position_keyword.get(),
+            self.positions_zoom_type_filter.get(),
+            self.positions_zoom_keyword.get(),
         )
         if filter_text:
             parts.append(f"筛选：{filter_text}")

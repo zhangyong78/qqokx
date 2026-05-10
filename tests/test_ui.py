@@ -506,6 +506,17 @@ HTTP 502: <!DOCTYPE html>
         self.assertIn("每波最多开仓次数：1=同一波最多开 1 次。", hint)
         self.assertIn("启动追单窗口：0=启动不追老信号", hint)
 
+    def test_build_launch_parameter_hint_text_startup_chase_duration_phrase(self) -> None:
+        hint = _build_launch_parameter_hint_text(
+            stop_atr_raw="2",
+            take_atr_raw="4",
+            take_profit_mode_label="动态止盈",
+            max_entries_raw="1",
+            startup_chase_window_raw="5m",
+        )
+        self.assertIn("等价 300 秒", hint)
+        self.assertIn("5分", hint)
+
     def test_build_trend_parameter_hint_text_for_dynamic_strategy(self) -> None:
         hint = _build_trend_parameter_hint_text(
             strategy_id=STRATEGY_DYNAMIC_LONG_ID,
