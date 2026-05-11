@@ -3426,6 +3426,7 @@ class UiStrategySessionsMixin:
             fixed_size=fixed_size,
             custom_trigger_symbol=self.local_tp_sl_symbol.get().strip().upper(),
             instrument=instrument,
+            api_label=self._current_credential_profile(),
         )
         return messagebox.askokcancel(f"确认启动 {definition.name}", message)
 

@@ -336,7 +336,6 @@ POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
         "fee",
         "pnl",
         "realized",
-        "realized_usdt",
         "note",
     ),
 }
@@ -2172,6 +2171,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._account_info_refresh_health = RefreshHealthState("账户信息")
         self._upl_usdt_prices: dict[str, Decimal] = {}
         self._position_history_usdt_prices: dict[str, Decimal] = {}
+        self._order_history_usdt_prices: dict[str, Decimal] = {}
+        self._fill_history_usdt_prices: dict[str, Decimal] = {}
         self._position_instruments: dict[str, Instrument] = {}
         self._pending_order_instruments: dict[str, Instrument] = {}
         self._order_history_instruments: dict[str, Instrument] = {}
@@ -3585,7 +3586,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             ("price", 100),
             ("size", 100),
             ("filled", 100),
-            ("fee", 110),
+            ("fee", 220),
             ("tp_sl", 180),
             ("order_id", 120),
             ("cl_ord_id", 150),
@@ -10156,6 +10157,7 @@ def _build_strategy_start_confirmation_message(
     fixed_size: str,
     custom_trigger_symbol: str,
     instrument: Instrument | None = None,
+    api_label: str = "",
 ) -> str:
     def _signal_mode_text(label: str) -> str:
         description = {
@@ -10251,12 +10253,15 @@ def _build_strategy_start_confirmation_message(
         else f"{take_atr_text}（止盈距离 = {take_atr_text} × ATR）"
     )
 
+    api_text = (api_label or "").strip() or "-"
+
     lines = [
         f"策略：{strategy_name}",
         "",
         "基础信息：",
         f"运行模式：{run_mode_label}",
         f"交易环境：{environment_label}",
+        f"API：{api_text}",
         f"交易模式：{trade_mode_label}",
         f"持仓模式：{position_mode_label}",
         f"交易标的：{strategy_symbol}",
@@ -11266,7 +11271,14 @@ def _build_position_history_usdt_price_map(
     client: OkxRestClient,
     items: list[OkxPositionHistoryItem],
 ) -> dict[str, Decimal]:
-    currencies = {_infer_position_history_pnl_currency(item) for item in items if item.realized_pnl is not None}
+    currencies: set[str] = set()
+    for item in items:
+        if item.realized_pnl is not None:
+            currencies.add(_infer_position_history_pnl_currency(item))
+        if item.pnl is not None:
+            currencies.add(_infer_position_history_pnl_currency(item))
+        if item.fee is not None and item.fee_currency:
+            currencies.add(item.fee_currency.strip().upper())
     return _build_usdt_price_snapshot(client, currencies)
 
 
@@ -12375,28 +12387,64 @@ def _position_manual_review_summary(position: OkxPosition) -> str:
     return f"{position.inst_id} [{side}] | 持仓量={format_decimal(position.position)} | 开仓均价={avg_price}"
 
 
-def _format_trade_order_fee_cell(item: OkxTradeOrderItem) -> str:
+def _format_history_cell_with_approx_usdt(
+    native_display: str,
+    value: Decimal | None,
+    currency: str | None,
+    usdt_prices: dict[str, Decimal],
+) -> str:
+    """Append `(≈N USDT)` for non USDT-like fee/pnl cells when a spot index price exists."""
+    if not usdt_prices or native_display == "-" or value is None:
+        return native_display
+    ccy = (currency or "").strip().upper()
+    if not ccy or ccy in {"USDT", "USD", "USDC"}:
+        return native_display
+    price = usdt_prices.get(ccy)
+    if price is None:
+        return native_display
+    usdt_val = value * price
+    rounded = usdt_val.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    approx_num = format_decimal_fixed(rounded, 0)
+    return f"{native_display} (≈{approx_num} USDT)"
+
+
+def _format_trade_order_fee_cell(item: OkxTradeOrderItem, usdt_prices: dict[str, Decimal] | None = None) -> str:
     text = _format_optional_decimal(item.fee, with_sign=True)
     ccy = (item.fee_currency or "").strip().upper()
     if ccy and text != "-":
-        return f"{text} {ccy}"
-    return text
+        base = f"{text} {ccy}"
+    else:
+        base = text
+    if usdt_prices:
+        return _format_history_cell_with_approx_usdt(base, item.fee, ccy, usdt_prices)
+    return base
 
 
-def _format_position_history_fee_cell(item: OkxPositionHistoryItem) -> str:
+def _format_position_history_fee_cell(
+    item: OkxPositionHistoryItem,
+    usdt_prices: dict[str, Decimal] | None = None,
+) -> str:
     text = _format_optional_decimal(item.fee, with_sign=True)
     ccy = (item.fee_currency or "").strip().upper()
     if ccy and text != "-":
-        return f"{text} {ccy}"
-    return text
+        base = f"{text} {ccy}"
+    else:
+        base = text
+    if usdt_prices:
+        return _format_history_cell_with_approx_usdt(base, item.fee, ccy, usdt_prices)
+    return base
 
 
-def _format_fill_history_fee_cell(item: OkxFillHistoryItem) -> str:
+def _format_fill_history_fee_cell(item: OkxFillHistoryItem, usdt_prices: dict[str, Decimal] | None = None) -> str:
     text = _format_optional_decimal(item.fill_fee, with_sign=True)
     ccy = (item.fee_currency or "").strip().upper()
     if ccy and text != "-":
-        return f"{text} {ccy}"
-    return text
+        base = f"{text} {ccy}"
+    else:
+        base = text
+    if usdt_prices:
+        return _format_history_cell_with_approx_usdt(base, item.fill_fee, ccy, usdt_prices)
+    return base
 
 
 def _build_trade_order_detail_text(item: OkxTradeOrderItem) -> str:
@@ -12762,12 +12810,23 @@ def _format_position_history_pnl(
     item: OkxPositionHistoryItem,
     *,
     with_sign: bool = False,
+    usdt_prices: dict[str, Decimal] | None = None,
 ) -> str:
-    return _format_history_amount(value, _infer_position_history_pnl_currency(item), with_sign=with_sign)
+    currency = _infer_position_history_pnl_currency(item)
+    base = _format_history_amount(value, currency, with_sign=with_sign)
+    if usdt_prices:
+        return _format_history_cell_with_approx_usdt(base, value, currency, usdt_prices)
+    return base
 
 
-def _format_fill_history_pnl(item: OkxFillHistoryItem) -> str:
-    return _format_history_amount(item.pnl, _infer_fill_history_pnl_currency(item), with_sign=True)
+def _format_fill_history_pnl(item: OkxFillHistoryItem, usdt_prices: dict[str, Decimal] | None = None) -> str:
+    if item.pnl is not None and item.pnl == 0:
+        return ""
+    currency = _infer_fill_history_pnl_currency(item)
+    base = _format_history_amount(item.pnl, currency, with_sign=True)
+    if usdt_prices:
+        return _format_history_cell_with_approx_usdt(base, item.pnl, currency, usdt_prices)
+    return base
 
 
 def _normalize_fill_history_exec_type(value: object) -> str:
@@ -12892,9 +12951,9 @@ def _build_position_history_detail_text(
         f"开仓均价：{_format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type)}\n"
         f"平仓均价：{_format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type)}\n"
         f"平仓数量：{_format_position_history_size(item, instruments)}\n"
-        f"手续费：{_format_position_history_fee_cell(item)}\n"
-        f"盈亏：{_format_position_history_pnl(item.pnl, item)}\n"
-        f"已实现盈亏：{_format_position_history_pnl(item.realized_pnl, item, with_sign=True)}\n"
+        f"手续费：{_format_position_history_fee_cell(item, upl_usdt_prices)}\n"
+        f"盈亏：{_format_position_history_pnl(item.pnl, item, usdt_prices=upl_usdt_prices)}\n"
+        f"已实现盈亏：{_format_position_history_pnl(item.realized_pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"
         f"结算盈亏：{_format_optional_decimal(item.settle_pnl)}"
     )
 

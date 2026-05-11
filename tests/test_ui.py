@@ -481,9 +481,11 @@ HTTP 502: <!DOCTYPE html>
             fixed_size="1",
             custom_trigger_symbol="",
             instrument=instrument,
+            api_label="demo-api-1",
         )
 
         self.assertIn("基础信息：", message)
+        self.assertIn("API：demo-api-1", message)
         self.assertIn("信号方向：只做多（只接收多头信号）", message)
         self.assertIn("下单方向模式：跟随信号（多头买入，空头卖出）", message)
         self.assertIn("止损 ATR 倍数：2（止损距离 = 2 × ATR）", message)

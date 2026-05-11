@@ -770,7 +770,7 @@ class UiPositionsMixin:
             ("price", 100),
             ("size", 100),
             ("filled", 100),
-            ("fee", 110),
+            ("fee", 220),
             ("tp_sl", 180),
             ("order_id", 120),
             ("cl_ord_id", 150),
@@ -890,7 +890,6 @@ class UiPositionsMixin:
             "fee": "手续费",
             "pnl": "已实现盈亏",
             "exec_type": "成交类型",
-            "realized_usdt": "鎶樺悎USDT",
         }
         for column_id, width in (
             ("time", 150),
@@ -899,8 +898,8 @@ class UiPositionsMixin:
             ("side", 96),
             ("price", 100),
             ("size", 100),
-            ("fee", 100),
-            ("pnl", 110),
+            ("fee", 220),
+            ("pnl", 220),
             ("exec_type", 108),
         ):
             tree.heading(column_id, text=headings[column_id])
@@ -1031,7 +1030,6 @@ class UiPositionsMixin:
             "fee",
             "pnl",
             "realized",
-            "realized_usdt",
             "note",
         )
         tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
@@ -1050,7 +1048,6 @@ class UiPositionsMixin:
             "realized": "已实现盈亏",
             "note": "备注",
         }
-        headings["realized_usdt"] = "折合USDT"
         for column_id, width in (
             ("time", 150),
             ("inst_type", 72),
@@ -1060,10 +1057,9 @@ class UiPositionsMixin:
             ("open_avg", 100),
             ("close_avg", 100),
             ("close_size", 100),
-            ("fee", 110),
-            ("pnl", 100),
-            ("realized", 110),
-            ("realized_usdt", 110),
+            ("fee", 220),
+            ("pnl", 220),
+            ("realized", 240),
             ("note", 220),
         ):
             tree.heading(column_id, text=headings[column_id])
@@ -1071,7 +1067,7 @@ class UiPositionsMixin:
                 column_id,
                 width=width,
                 anchor="e"
-                if column_id in {"open_avg", "close_avg", "close_size", "fee", "pnl", "realized", "realized_usdt"}
+                if column_id in {"open_avg", "close_avg", "close_size", "fee", "pnl", "realized"}
                 else "center",
             )
         tree.column("inst_id", anchor="w")
@@ -1810,6 +1806,34 @@ class UiPositionsMixin:
         self._latest_position_history = [
             item for record in position_records if (item := _position_history_item_from_cache(record)) is not None
         ]
+        order_fee_ccys: set[str] = {
+            o.fee_currency.strip().upper()
+            for o in self._latest_order_history
+            if o.fee is not None and o.fee_currency and str(o.fee_currency).strip()
+        }
+        self._order_history_usdt_prices = (
+            _build_usdt_price_snapshot(self.client, order_fee_ccys) if order_fee_ccys else {}
+        )
+        fill_ccys_local: set[str] = set()
+        for fill in self._latest_fill_history:
+            if fill.fill_fee is not None and fill.fee_currency and str(fill.fee_currency).strip():
+                fill_ccys_local.add(fill.fee_currency.strip().upper())
+            if fill.pnl is not None:
+                fill_ccys_local.add(_infer_fill_history_pnl_currency(fill))
+        self._fill_history_usdt_prices = (
+            _build_usdt_price_snapshot(self.client, fill_ccys_local) if fill_ccys_local else {}
+        )
+        pos_ccys_local: set[str] = set()
+        for it in self._latest_position_history:
+            if it.realized_pnl is not None:
+                pos_ccys_local.add(_infer_position_history_pnl_currency(it))
+            if it.pnl is not None:
+                pos_ccys_local.add(_infer_position_history_pnl_currency(it))
+            if it.fee is not None and it.fee_currency and str(it.fee_currency).strip():
+                pos_ccys_local.add(it.fee_currency.strip().upper())
+        self._position_history_usdt_prices = (
+            _build_usdt_price_snapshot(self.client, pos_ccys_local) if pos_ccys_local else {}
+        )
         self._fills_history_from_local_only = True
         self._fills_history_last_refresh_at = None
         self._positions_zoom_order_history_base_summary = f"历史委托：{len(self._latest_order_history)} 条 | 本地缓存"
@@ -2434,6 +2458,14 @@ class UiPositionsMixin:
             self._latest_order_history = [item for record in merged_records if (item := _order_item_from_cache(record)) is not None]
             self._latest_order_history.sort(key=lambda it: (it.update_time or it.created_time or 0), reverse=True)
             self._order_history_instruments = dict(instruments)
+            fee_ccys: set[str] = {
+                o.fee_currency.strip().upper()
+                for o in self._latest_order_history
+                if o.fee is not None and o.fee_currency and str(o.fee_currency).strip()
+            }
+            self._order_history_usdt_prices = (
+                _build_usdt_price_snapshot(self.client, fee_ccys) if fee_ccys else {}
+            )
             self._order_history_last_refresh_at = datetime.now()
             _mark_refresh_health_success(self._order_history_refresh_health, at=self._order_history_last_refresh_at)
             self._refresh_all_refresh_badges()
@@ -2641,7 +2673,7 @@ class UiPositionsMixin:
                             _format_trade_order_price(item.price, item.inst_id, item.inst_type),
                             _format_trade_order_coin_size(item, self._order_history_instruments),
                             _format_trade_order_coin_filled_size(item, self._order_history_instruments),
-                            _format_trade_order_fee_cell(item),
+                            _format_trade_order_fee_cell(item, self._order_history_usdt_prices),
                             _format_trade_order_tp_sl(item),
                             item.order_id or item.algo_id or "-",
                             item.client_order_id or item.algo_client_order_id or "-",
@@ -2899,6 +2931,15 @@ class UiPositionsMixin:
             self._latest_fill_history = [item for record in merged_records if (item := _fill_item_from_cache(record)) is not None]
             self._latest_fill_history.sort(key=lambda it: (it.fill_time or 0), reverse=True)
             self._fill_history_instruments = dict(instruments)
+            fill_ccys: set[str] = set()
+            for fill in self._latest_fill_history:
+                if fill.fill_fee is not None and fill.fee_currency and str(fill.fee_currency).strip():
+                    fill_ccys.add(fill.fee_currency.strip().upper())
+                if fill.pnl is not None:
+                    fill_ccys.add(_infer_fill_history_pnl_currency(fill))
+            self._fill_history_usdt_prices = (
+                _build_usdt_price_snapshot(self.client, fill_ccys) if fill_ccys else {}
+            )
             self._fills_history_last_refresh_at = datetime.now()
             self._positions_history_last_refresh_at = self._fills_history_last_refresh_at
             if effective_environment:
@@ -2955,6 +2996,21 @@ class UiPositionsMixin:
         parsed_items = [item for record in merged_records if (item := _position_history_item_from_cache(record)) is not None]
         parsed_items.sort(key=lambda item: item.update_time or 0, reverse=True)
         self._latest_position_history = parsed_items[: self._position_history_fetch_limit]
+        extra_ccys: set[str] = set()
+        for it in self._latest_position_history:
+            if it.realized_pnl is not None:
+                extra_ccys.add(_infer_position_history_pnl_currency(it))
+            if it.pnl is not None:
+                extra_ccys.add(_infer_position_history_pnl_currency(it))
+            if it.fee is not None and it.fee_currency and str(it.fee_currency).strip():
+                extra_ccys.add(it.fee_currency.strip().upper())
+        missing_ccys = {
+            c
+            for c in extra_ccys
+            if c not in {"USDT", "USD", "USDC"} and c not in self._position_history_usdt_prices
+        }
+        if missing_ccys:
+            self._position_history_usdt_prices.update(_build_usdt_price_snapshot(self.client, missing_ccys))
         history_summary = f"历史仓位：{len(self._latest_position_history)} 条 | 最近同步：{timestamp}"
         if note:
             history_summary = f"{history_summary} | {note}"
@@ -3005,8 +3061,8 @@ class UiPositionsMixin:
                     _format_history_side(item.side, item.pos_side),
                     _format_fill_history_price(item),
                     _format_fill_history_size(item, self._fill_history_instruments),
-                    _format_fill_history_fee_cell(item),
-                    _format_fill_history_pnl(item),
+                    _format_fill_history_fee_cell(item, self._fill_history_usdt_prices),
+                    _format_fill_history_pnl(item, self._fill_history_usdt_prices),
                     _format_fill_history_exec_type(item.exec_type),
                   ),
                   tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
@@ -3095,12 +3151,13 @@ class UiPositionsMixin:
                     _format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type),
                     _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
                     _format_position_history_size(item, self._position_history_instruments),
-                    _format_position_history_fee_cell(item),
-                    _format_position_history_pnl(item.pnl, item),
-                    _format_position_history_pnl(item.realized_pnl, item, with_sign=True),
-                    _format_optional_usdt(
-                        _position_history_realized_pnl_usdt(item, self._position_history_usdt_prices),
+                    _format_position_history_fee_cell(item, self._position_history_usdt_prices),
+                    _format_position_history_pnl(item.pnl, item, usdt_prices=self._position_history_usdt_prices),
+                    _format_position_history_pnl(
+                        item.realized_pnl,
+                        item,
                         with_sign=True,
+                        usdt_prices=self._position_history_usdt_prices,
                     ),
                     self._position_history_note_summary(item),
                 ),
