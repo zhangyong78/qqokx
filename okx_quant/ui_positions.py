@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import time
+import traceback
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+
+from okx_quant.okx_client import OkxPosition, OkxTradeOrderItem
 
 
 class UiPositionsMixin:
@@ -361,27 +365,35 @@ class UiPositionsMixin:
         self._positions_zoom_credential_profile_combo.bind("<<ComboboxSelected>>", self._on_api_profile_selected)
         self._sync_credential_profile_combo()
         zoom_api.grid(row=0, column=0, sticky="w", padx=(0, 10))
+        # 子控件创建顺序决定最终列序：末尾会对 zoom_actions 子控件按顺序重设 column（0,1,2,…）。
+        # 布局逻辑：API → 同步与账户 → 列表/详情可见性（便于先定位合约）→ 对选中持仓的手工与程序操作
+        # （平仓、备注、接管、停止接管）→ 期权工具 → 列设置 → 关窗。
         ttk.Button(zoom_actions, text="刷新", command=self._refresh_positions_zoom_all).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(zoom_actions, text="账户信息", command=self.open_account_info_window).grid(row=0, column=1, padx=(0, 6))
-        ttk.Button(zoom_actions, text="平仓选中", command=self.flatten_selected_position).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(zoom_actions, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(zoom_actions, text="设置期权保护", command=self.open_position_protection_window).grid(
-            row=0, column=4, padx=(0, 6)
+        ttk.Button(zoom_actions, textvariable=self._positions_zoom_detail_toggle_text, command=self.toggle_positions_zoom_detail).grid(
+            row=0, column=2, padx=(0, 6)
         )
-        ttk.Button(zoom_actions, text="展期建议", command=self.open_option_roll_window).grid(
-            row=0, column=5, padx=(0, 6)
+        ttk.Button(
+            zoom_actions,
+            textvariable=self._positions_zoom_history_toggle_text,
+            command=self.toggle_positions_zoom_history,
+        ).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(zoom_actions, text="平仓选中", command=self.flatten_selected_position).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(zoom_actions, text="编辑备注", command=self.edit_selected_position_note).grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(zoom_actions, text="从选中持仓接管", command=self.open_position_takeover_dynamic_stop_dialog).grid(
+            row=0, column=6, padx=(0, 6)
         )
-        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=6)
-        ttk.Button(zoom_actions, text="列设置", command=self.open_positions_zoom_column_window).grid(
+        ttk.Button(zoom_actions, text="停止接管", command=self.stop_position_takeover_dynamic_stop).grid(
             row=0, column=7, padx=(0, 6)
         )
-
-        ttk.Button(zoom_actions, textvariable=self._positions_zoom_detail_toggle_text, command=self.toggle_positions_zoom_detail).grid(
+        ttk.Button(zoom_actions, text="设置期权保护", command=self.open_position_protection_window).grid(
             row=0, column=8, padx=(0, 6)
         )
-        ttk.Button(zoom_actions, textvariable=self._positions_zoom_history_toggle_text, command=self.toggle_positions_zoom_history).grid(
-            row=0, column=9
+        ttk.Button(zoom_actions, text="展期建议", command=self.open_option_roll_window).grid(row=0, column=9, padx=(0, 6))
+        ttk.Button(zoom_actions, text="列设置", command=self.open_positions_zoom_column_window).grid(
+            row=0, column=10, padx=(0, 6)
         )
+        ttk.Button(zoom_actions, text="关闭", command=self._close_positions_zoom_window).grid(row=0, column=11, padx=(0, 0))
         for column_index, child in enumerate(zoom_actions.winfo_children()):
             child.grid_configure(column=column_index)
 
@@ -480,6 +492,13 @@ class UiPositionsMixin:
         history_notebook.add(pending_orders_tab, text="当前委托")
         self._build_positions_zoom_pending_orders_tab(pending_orders_tab)
 
+        takeover_tab = ttk.Frame(history_notebook, padding=10)
+        takeover_tab.columnconfigure(0, weight=1)
+        takeover_tab.rowconfigure(3, weight=1)
+        # 使用 add 追加；部分 Windows Tk 上 insert(1, …) 会报 Slave index out of bounds
+        history_notebook.add(takeover_tab, text="动态止盈接管")
+        self._build_positions_zoom_takeover_tab(takeover_tab)
+
         order_history_tab = ttk.Frame(history_notebook, padding=10)
         order_history_tab.columnconfigure(0, weight=1)
         order_history_tab.rowconfigure(2, weight=1)
@@ -528,6 +547,7 @@ class UiPositionsMixin:
         self._update_positions_zoom_search_shortcuts()
         self._update_position_history_search_shortcuts()
         self._schedule_positions_zoom_sync(30)
+        self._refresh_positions_zoom_takeover_panel()
 
     def _build_positions_zoom_pending_orders_tab(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent)
@@ -541,17 +561,22 @@ class UiPositionsMixin:
         pending_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(header, textvariable=self._positions_zoom_pending_orders_summary_text).grid(row=0, column=1, sticky="w")
         ttk.Button(header, text="刷新", command=self.refresh_pending_orders).grid(row=0, column=2, sticky="e", padx=(0, 6))
+        ttk.Button(
+            header,
+            text="从选中条件单接管动态止盈",
+            command=self.open_takeover_from_selected_conditional_order,
+        ).grid(row=0, column=3, sticky="e", padx=(0, 6))
         ttk.Button(header, text="撤单选中", command=lambda: self.cancel_selected_pending_order("positions_zoom")).grid(
-            row=0, column=3, sticky="e", padx=(0, 6)
+            row=0, column=4, sticky="e", padx=(0, 6)
         )
         ttk.Button(header, text="批量撤当前筛选", command=lambda: self.cancel_filtered_pending_orders("positions_zoom")).grid(
-            row=0, column=4, sticky="e", padx=(0, 6)
+            row=0, column=5, sticky="e", padx=(0, 6)
         )
         ttk.Button(
             header,
             textvariable=self._positions_zoom_pending_orders_detail_toggle_text,
             command=self.toggle_positions_zoom_pending_orders_detail,
-        ).grid(row=0, column=5, sticky="e")
+        ).grid(row=0, column=6, sticky="e")
 
         filter_row = ttk.Frame(parent)
         filter_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -668,6 +693,54 @@ class UiPositionsMixin:
         detail_scroll.grid(row=0, column=1, sticky="ns")
         self._positions_zoom_pending_orders_detail.configure(yscrollcommand=detail_scroll.set)
         self._set_readonly_text(self._positions_zoom_pending_orders_detail, "这里会显示选中当前委托的详情。")
+
+    def _build_positions_zoom_takeover_tab(self, parent: ttk.Frame) -> None:
+        intro = (
+            "推荐：在「当前委托」里选中一条「条件 / 算法」止损委托，再点「从选中条件单接管动态止盈」。"
+            "程序会按该单的合约与平仓方向匹配持仓，并核对条件单数量不超过当前可平持仓后，再启动 OKX 止损动态上移。"
+            "（上方工具栏「从选中持仓接管」仍可在拉取候选后手工挑选止损单。）"
+        )
+        ttk.Label(parent, text=intro, justify="left", wraplength=1000).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(parent, textvariable=self._positions_zoom_takeover_status_text, foreground="#374151").grid(
+            row=1, column=0, sticky="w", pady=(0, 6)
+        )
+        btn_row = ttk.Frame(parent)
+        btn_row.grid(row=2, column=0, sticky="w", pady=(0, 8))
+        ttk.Button(
+            btn_row,
+            text="从选中条件单接管动态止盈",
+            command=self.open_takeover_from_selected_conditional_order,
+        ).pack(side="left", padx=(0, 10))
+        ttk.Button(btn_row, text="停止接管", command=self.stop_position_takeover_dynamic_stop).pack(side="left")
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        parent.rowconfigure(3, weight=1)
+        cols = ("session", "api", "inst", "template", "entry", "qty", "stop", "status")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=6, selectmode="browse")
+        self._positions_zoom_takeover_tree = tree
+        heads = {
+            "session": "会话",
+            "api": "API",
+            "inst": "合约",
+            "template": "模板",
+            "entry": "开仓均价",
+            "qty": "数量",
+            "stop": "初始止损",
+            "status": "状态",
+        }
+        widths = {"session": 72, "api": 110, "inst": 200, "template": 200, "entry": 120, "qty": 220, "stop": 120, "status": 300}
+        for cid in cols:
+            tree.heading(cid, text=heads[cid])
+            tree.column(cid, width=widths[cid], anchor="w")
+        tree.grid(row=0, column=0, sticky="nsew")
+        sy = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        sy.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=sy.set)
+        self._positions_zoom_takeover_status_text.set(self._positions_zoom_takeover_idle_caption())
+        self._refresh_positions_zoom_takeover_panel()
 
     def _build_positions_zoom_order_history_tab(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent)
@@ -1121,6 +1194,7 @@ class UiPositionsMixin:
         self._positions_zoom_selection_suppressed_item_id = None
         self._positions_zoom_pending_orders_tree = None
         self._positions_zoom_pending_orders_detail = None
+        self._positions_zoom_takeover_tree = None
         self._positions_zoom_order_history_tree = None
         self._positions_zoom_order_history_detail = None
         self._positions_zoom_fills_tree = None
@@ -1421,6 +1495,7 @@ class UiPositionsMixin:
             self._positions_zoom_selected_item_id = None
         self._refresh_positions_zoom_detail()
         self._update_positions_zoom_search_shortcuts()
+        self._refresh_positions_zoom_takeover_panel()
 
     def _sync_position_tree_selection(self, item_id: str) -> None:
         if self.position_tree is None or not self.position_tree.exists(item_id):
@@ -4146,6 +4221,861 @@ class UiPositionsMixin:
         summary = f"持仓读取失败：{friendly_message}{suffix}"
         self.positions_summary_text.set(summary)
         self._enqueue_log(summary)
+
+    @staticmethod
+    def _position_takeover_entry_ts_ms(position: OkxPosition) -> int:
+        """优先使用 OKX 返回的持仓创建时间（毫秒），供动态止盈里 holding_bars / 时间保本等逻辑使用。"""
+        raw = position.raw if isinstance(getattr(position, "raw", None), dict) else {}
+        for key in ("cTime", "CTime"):
+            val = raw.get(key)
+            if val is None:
+                continue
+            try:
+                ms = int(str(val).strip())
+            except (TypeError, ValueError):
+                continue
+            if ms <= 0:
+                continue
+            # OKX 账户持仓 cTime 一般为毫秒；若误为秒级时间戳则放大
+            if ms < 1_000_000_000_000:
+                ms *= 1000
+            return ms
+        return int(time.time() * 1000)
+
+    def _position_takeover_stop_algo_candidates(
+        self,
+        position: OkxPosition,
+        pending_orders: list,
+        *,
+        entry_price: Decimal,
+    ) -> list:
+        """筛选与当前持仓方向一致、疑似止损平仓的 OKX 算法委托（永续/交割）。"""
+        close_side = "sell" if derive_position_direction(position) == "long" else "buy"
+        pos_norm = (position.pos_side or "").strip().lower()
+        out: list = []
+        for item in pending_orders:
+            if not hasattr(item, "source_kind") or getattr(item, "source_kind", "") != "algo":
+                continue
+            if (getattr(item, "inst_id", "") or "").strip().upper() != position.inst_id.strip().upper():
+                continue
+            sl_px = getattr(item, "stop_loss_trigger_price", None) or getattr(item, "trigger_price", None)
+            if sl_px is None:
+                continue
+            side_raw = (getattr(item, "side", None) or "").strip().lower()
+            if side_raw and side_raw != close_side:
+                continue
+            item_ps = (getattr(item, "pos_side", None) or "").strip().lower()
+            if pos_norm in {"long", "short"} and item_ps and item_ps != pos_norm:
+                continue
+            if derive_position_direction(position) == "long":
+                if sl_px >= entry_price:
+                    continue
+            else:
+                if sl_px <= entry_price:
+                    continue
+            aid = (getattr(item, "algo_id", None) or "").strip()
+            if not aid and not (getattr(item, "algo_client_order_id", None) or "").strip():
+                continue
+            out.append(item)
+        return out
+
+    def _find_position_for_takeover_pending_algo(
+        self,
+        item: OkxTradeOrderItem,
+    ) -> tuple[OkxPosition, Decimal] | None:
+        """按算法止损委托反查账户中与之规则一致的永续/交割持仓（含止损价相对开仓方向校验）。"""
+        inst_id_item = (item.inst_id or "").strip().upper()
+        if not inst_id_item:
+            return None
+        for position in self._latest_positions:
+            if (position.inst_id or "").strip().upper() != inst_id_item:
+                continue
+            if infer_inst_type(position.inst_id) not in {"SWAP", "FUTURES"}:
+                continue
+            entry = position.avg_price
+            if entry is None or entry <= 0:
+                continue
+            if self._position_takeover_stop_algo_candidates(position, [item], entry_price=entry):
+                return position, entry
+        return None
+
+    def _position_takeover_algo_label(self, item) -> str:
+        aid = (getattr(item, "algo_id", None) or "").strip() or "-"
+        acl = (getattr(item, "algo_client_order_id", None) or "").strip() or "-"
+        sl_px = getattr(item, "stop_loss_trigger_price", None) or getattr(item, "trigger_price", None)
+        sl_txt = format_decimal(sl_px) if sl_px is not None else "-"
+        ot = (getattr(item, "ord_type", None) or "").strip() or "-"
+        return f"{ot} | 止损触发≈{sl_txt} | algoId={aid} | algoClOrdId={acl}"
+
+    def _positions_zoom_takeover_idle_caption(self) -> str:
+        return (
+            "当前无运行中的动态止盈接管。可在「当前委托」选中条件止损后点「从选中条件单接管」，"
+            "或使用工具栏「从选中持仓接管」在候选算法单中挑选；不同算法止损单可并行接管多条，"
+            "同一算法单仅允许一条；拉取委托在后台执行，避免大窗长时间卡住。"
+        )
+
+    @staticmethod
+    def _takeover_algo_busy_slot_key(inst_id: str, algo_id: str | None, algo_cl: str | None) -> str:
+        iu = (inst_id or "").strip().upper()
+        return f"{iu}|{(algo_id or '').strip()}|{(algo_cl or '').strip()}"
+
+    def _prune_dead_takeover_sessions(self) -> None:
+        """清理已结束但未从字典移除的接管会话（防御性，避免表格残留僵尸行）。"""
+        sessions = getattr(self, "_position_takeover_sessions", None)
+        if not isinstance(sessions, dict) or not sessions:
+            return
+        for sid in list(sessions.keys()):
+            st = sessions.get(sid)
+            if not isinstance(st, dict):
+                sessions.pop(sid, None)
+                continue
+            if not st.get("thread_started"):
+                continue
+            th = st.get("thread")
+            if th is None:
+                continue
+            if getattr(th, "is_alive", lambda: False)():
+                continue
+            sessions.pop(sid, None)
+
+    def _takeover_running_algo_session_id(
+        self,
+        inst_id: str,
+        algo_id: str | None,
+        algo_cl: str | None,
+    ) -> str | None:
+        """若同一合约、同一 algoId 或同一 algoClOrdId 已有监控线程在跑，返回其会话 id。"""
+        inst_u = (inst_id or "").strip().upper()
+        aid = (algo_id or "").strip()
+        acl = (algo_cl or "").strip()
+        sessions = getattr(self, "_position_takeover_sessions", None) or {}
+        for sid, st in sessions.items():
+            if not isinstance(st, dict):
+                continue
+            th = st.get("thread")
+            if th is None or not getattr(th, "is_alive", lambda: False)():
+                continue
+            if (st.get("inst_id") or "").strip().upper() != inst_u:
+                continue
+            st_aid = (st.get("algo_id") or "").strip()
+            st_acl = (st.get("algo_cl") or "").strip()
+            if aid and st_aid == aid:
+                return sid
+            if acl and st_acl == acl:
+                return sid
+        return None
+
+    def _takeover_running_session_ids(self) -> list[str]:
+        sessions = getattr(self, "_position_takeover_sessions", None) or {}
+        out: list[str] = []
+        for sid, st in sessions.items():
+            if not isinstance(st, dict):
+                continue
+            th = st.get("thread")
+            if th is not None and getattr(th, "is_alive", lambda: False)():
+                out.append(sid)
+        return out
+
+    def _refresh_positions_zoom_takeover_panel(self) -> None:
+        win = getattr(self, "_positions_zoom_window", None)
+        if win is None:
+            return
+        try:
+            if not win.winfo_exists():
+                return
+        except Exception:
+            return
+        self._prune_dead_takeover_sessions()
+        tv = getattr(self, "_positions_zoom_takeover_status_text", None)
+        tree = getattr(self, "_positions_zoom_takeover_tree", None)
+        sessions = getattr(self, "_position_takeover_sessions", None) or {}
+        if tree is not None and _widget_exists(tree):
+            try:
+                tree.delete(*tree.get_children())
+            except Exception:
+                pass
+        rows = 0
+        if tree is not None and _widget_exists(tree):
+            for sid, st in list(sessions.items()):
+                if not isinstance(st, dict):
+                    continue
+                th = st.get("thread")
+                if th is None or not getattr(th, "is_alive", lambda: False)():
+                    continue
+                summ = st.get("summary")
+                if not isinstance(summ, dict):
+                    continue
+                try:
+                    tree.insert(
+                        "",
+                        END,
+                        iid=sid,
+                        values=(
+                            str(summ.get("session_id") or sid),
+                            str(summ.get("api") or "-"),
+                            str(summ.get("inst_id") or "-"),
+                            str(summ.get("template") or "-"),
+                            str(summ.get("entry") or "-"),
+                            str(summ.get("size") or "-"),
+                            str(summ.get("stop") or "-"),
+                            str(summ.get("status") or "-"),
+                        ),
+                    )
+                    rows += 1
+                except Exception:
+                    pass
+        if tv is not None:
+            if rows == 0:
+                tv.set(self._positions_zoom_takeover_idle_caption())
+            elif rows == 1:
+                tv.set("当前有 1 条动态止盈接管在运行（见下表）；停止时请先选中该行再点「停止接管」。")
+            else:
+                tv.set(f"当前有 {rows} 条动态止盈接管在并行运行（见下表）；停止时请先选中要停的那一行再点「停止接管」。")
+
+    def _takeover_prefetch_worker(self, request_id: int) -> None:
+        ctx = getattr(self, "_takeover_prefetch_context", None)
+        if not isinstance(ctx, dict):
+            return
+        credentials = ctx["credentials"]
+        desk_env = ctx["desk_env"]
+        err: BaseException | None = None
+        pending: list | None = None
+        try:
+            pending = self.client.get_pending_orders(
+                credentials,
+                environment=desk_env,
+                inst_types=("SWAP", "FUTURES"),
+                limit=200,
+            )
+        except BaseException as exc:
+            err = exc
+        self.root.after(0, lambda: self._takeover_prefetch_apply_on_main(request_id, pending, err))
+
+    def _takeover_prefetch_apply_on_main(
+        self,
+        request_id: int,
+        pending: list | None,
+        err: BaseException | None,
+    ) -> None:
+        self._takeover_open_flow_busy = False
+        if request_id != getattr(self, "_takeover_prefetch_request_id", 0):
+            return
+        ctx = self._takeover_prefetch_context
+        self._takeover_prefetch_context = None
+        parent = self._position_action_parent()
+        if not isinstance(ctx, dict):
+            self._refresh_positions_zoom_takeover_panel()
+            return
+        position = ctx["position"]
+        entry = ctx["entry"]
+        record = ctx["record"]
+        config = ctx["config"]
+        if err is not None:
+            messagebox.showerror("接管动态止盈", f"读取当前委托失败：{err}", parent=parent)
+            self._refresh_positions_zoom_takeover_panel()
+            return
+        candidates = self._position_takeover_stop_algo_candidates(position, pending or [], entry_price=entry)
+        if not candidates:
+            messagebox.showinfo(
+                "接管动态止盈",
+                "未找到与当前持仓匹配的待触发止损类算法单。请确认已在 OKX 挂好止损，"
+                "或先在本窗口点「刷新」再试。",
+                parent=parent,
+            )
+            self._refresh_positions_zoom_takeover_panel()
+            return
+        self._positions_zoom_takeover_status_text.set(
+            f"已拉取委托列表（{len(candidates)} 条候选）。请在弹出窗口中选择要接管的止损算法单。"
+        )
+        self._takeover_show_pick_dialog_and_maybe_start(ctx, candidates)
+
+    def _takeover_fill_contract_size(self, position: OkxPosition, *, order_contracts: Decimal | None) -> Decimal:
+        """FilledPosition.size：默认整仓；若指定条件/算法单 sz（与 OKX 持仓同一合约单位），则不超过该单与当前可平张数。"""
+        pos_abs = abs(Decimal(str(position.position)))
+        if order_contracts is None or order_contracts <= 0:
+            return pos_abs
+        max_close = self._selected_position_close_size(position)
+        cap = min(pos_abs, max_close)
+        return min(order_contracts, cap)
+
+    def _takeover_enqueue_instrument_fetch(
+        self,
+        *,
+        credentials,
+        config,
+        record,
+        profile_name: str,
+        position: OkxPosition,
+        entry: Decimal,
+        sl_px: Decimal,
+        algo_id: str | None,
+        algo_cl: str | None,
+        order_contract_size: Decimal | None = None,
+    ) -> None:
+        direction = derive_position_direction(position)
+        open_side: str = "buy" if direction == "long" else "sell"
+        pos_side = resolve_open_pos_side(config, open_side)
+        close_side = "sell" if open_side == "buy" else "buy"
+        sz = self._takeover_fill_contract_size(position, order_contracts=order_contract_size)
+        parent = self._position_action_parent()
+        dup_sid = self._takeover_running_algo_session_id(position.inst_id, algo_id, algo_cl)
+        if dup_sid:
+            messagebox.showwarning(
+                "接管动态止盈",
+                f"该止损算法单已在接管中（会话 {dup_sid}）。请先停止该会话，再为同一算法委托启动新的接管。",
+                parent=parent,
+            )
+            return
+        slot = self._takeover_algo_busy_slot_key(position.inst_id, algo_id, algo_cl)
+        pending = getattr(self, "_takeover_instrument_pending_slots", None)
+        if not isinstance(pending, set):
+            pending = set()
+            self._takeover_instrument_pending_slots = pending
+        if slot in pending:
+            messagebox.showwarning(
+                "接管动态止盈",
+                "该止损算法单正在后台加载合约元数据，请稍候完成后再试。",
+                parent=parent,
+            )
+            return
+        pending.add(slot)
+        self._positions_zoom_takeover_status_text.set(
+            f"正在加载合约 {position.inst_id} 的元数据（后台请求），完成后自动启动接管线程…"
+        )
+
+        def _instrument_worker() -> None:
+            inst_err: BaseException | None = None
+            instrument = None
+            try:
+                instrument = self.client.get_instrument(position.inst_id)
+            except BaseException as exc:
+                inst_err = exc
+
+            def _apply() -> None:
+                try:
+                    self._takeover_commit_after_instrument(
+                        credentials=credentials,
+                        config=config,
+                        record=record,
+                        profile_name=profile_name,
+                        position=position,
+                        entry=entry,
+                        sl_px=sl_px,
+                        algo_id=algo_id,
+                        algo_cl=algo_cl,
+                        open_side=open_side,
+                        pos_side=pos_side,
+                        close_side=close_side,
+                        sz=sz,
+                        instrument=instrument,
+                        inst_err=inst_err,
+                    )
+                finally:
+                    pend = getattr(self, "_takeover_instrument_pending_slots", None)
+                    if isinstance(pend, set):
+                        pend.discard(slot)
+
+            self.root.after(0, _apply)
+
+        threading.Thread(target=_instrument_worker, name="position-takeover-instrument", daemon=True).start()
+
+    def _takeover_show_pick_dialog_and_maybe_start(self, ctx: dict, candidates: list) -> None:
+        position = ctx["position"]
+        parent = ctx["parent"]
+        record = ctx["record"]
+        config = ctx["config"]
+        entry = ctx["entry"]
+        credentials = ctx["credentials"]
+        profile_name = ctx["profile_name"]
+
+        dialog = Toplevel(parent)
+        dialog.title("接管动态止盈 — 选择止损单")
+        dialog.transient(parent)
+        dialog.grab_set()
+        ttk.Label(
+            dialog,
+            text=(
+                f"合约：{position.inst_id}  开仓均价≈{format_decimal(entry)}\n"
+                f"将沿用所选算法止损单，并按模板：{record.strategy_name} "
+                f"（{config.tp_sl_trigger_type} 触发、{config.bar}、2R保本与手续费偏移等）自动上移止损。"
+            ),
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+        frame = ttk.Frame(dialog)
+        frame.pack(fill="both", expand=True, padx=12, pady=6)
+        scrollbar = ttk.Scrollbar(frame)
+        scrollbar.pack(side="right", fill="y")
+        lb = Listbox(frame, height=min(12, max(4, len(candidates))), width=96, yscrollcommand=scrollbar.set)
+        lb.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=lb.yview)
+        for idx, item in enumerate(candidates):
+            lb.insert(END, f"{idx + 1}. {self._position_takeover_algo_label(item)}")
+        lb.selection_set(0)
+        chosen: list[int | None] = [None]
+
+        def on_ok() -> None:
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showinfo("接管动态止盈", "请先在列表中选择一条止损算法委托。", parent=dialog)
+                return
+            chosen[0] = int(sel[0])
+            dialog.destroy()
+
+        def on_cancel() -> None:
+            chosen[0] = None
+            dialog.destroy()
+
+        btn_row = ttk.Frame(dialog)
+        btn_row.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(btn_row, text="开始接管", command=on_ok).pack(side="right", padx=(6, 0))
+        ttk.Button(btn_row, text="取消", command=on_cancel).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+        dialog.wait_window()
+
+        pick = chosen[0]
+        if pick is None:
+            self._refresh_positions_zoom_takeover_panel()
+            return
+        item = candidates[pick]
+        sl_px = item.stop_loss_trigger_price or item.trigger_price
+        if sl_px is None:
+            messagebox.showerror("接管动态止盈", "所选委托缺少止损触发价。", parent=parent)
+            self._refresh_positions_zoom_takeover_panel()
+            return
+        algo_id = (item.algo_id or "").strip() or None
+        algo_cl = (item.algo_client_order_id or "").strip() or None
+        if not algo_id and not algo_cl:
+            messagebox.showerror("接管动态止盈", "所选委托缺少 algoId / algoClOrdId，无法改价。", parent=parent)
+            self._refresh_positions_zoom_takeover_panel()
+            return
+
+        order_contracts = item.size if item.size is not None and item.size > 0 else None
+        self._takeover_enqueue_instrument_fetch(
+            credentials=credentials,
+            config=config,
+            record=record,
+            profile_name=profile_name,
+            position=position,
+            entry=entry,
+            sl_px=sl_px,
+            algo_id=algo_id,
+            algo_cl=algo_cl,
+            order_contract_size=order_contracts,
+        )
+
+    def _takeover_commit_after_instrument(
+        self,
+        *,
+        credentials,
+        config,
+        record,
+        profile_name: str,
+        position: OkxPosition,
+        entry: Decimal,
+        sl_px: Decimal,
+        algo_id: str | None,
+        algo_cl: str | None,
+        open_side: str,
+        pos_side,
+        close_side: str,
+        sz: Decimal,
+        instrument,
+        inst_err: BaseException | None,
+    ) -> None:
+        parent = self._position_action_parent()
+        if inst_err is not None:
+            messagebox.showerror("接管动态止盈", f"加载合约信息失败：{inst_err}", parent=parent)
+            self._refresh_positions_zoom_takeover_panel()
+            return
+        if instrument is None:
+            messagebox.showerror("接管动态止盈", "加载合约信息失败：未返回合约数据。", parent=parent)
+            self._refresh_positions_zoom_takeover_panel()
+            return
+
+        dup_sid = self._takeover_running_algo_session_id(position.inst_id, algo_id, algo_cl)
+        if dup_sid:
+            messagebox.showwarning(
+                "接管动态止盈",
+                f"该止损算法单已在接管中（会话 {dup_sid}）。请先停止该会话，再为其它委托启动新的接管。",
+                parent=parent,
+            )
+            self._refresh_positions_zoom_takeover_panel()
+            return
+
+        filled = FilledPosition(
+            ord_id=f"takeover-{position.inst_id}",
+            cl_ord_id=None,
+            inst_id=position.inst_id,
+            side=open_side,
+            close_side=close_side,
+            pos_side=pos_side,
+            size=sz,
+            entry_price=entry,
+            entry_ts=self._position_takeover_entry_ts_ms(position),
+        )
+
+        api_log_name = (profile_name or getattr(credentials, "profile_name", "") or "").strip() or "-"
+        api_part = "" if api_log_name == "-" else api_log_name
+        takeover_session_id = self._next_session_id()
+        if api_part:
+            log_prefix = f"[{api_part}] [{takeover_session_id} {record.strategy_name} {position.inst_id}]"
+        else:
+            log_prefix = f"[{takeover_session_id} {record.strategy_name} {position.inst_id}]"
+
+        def _log_takeover(msg: str) -> None:
+            text = str(msg or "").strip()
+            if text:
+                self._enqueue_log(f"{log_prefix} {text}")
+
+        engine = StrategyEngine(
+            self.client,
+            _log_takeover,
+            strategy_name=record.strategy_name,
+            session_id=takeover_session_id,
+            api_name=api_part,
+        )
+
+        r_spread = abs(entry - sl_px)
+        side_zh = "多" if open_side == "buy" else "空"
+        size_text = _format_size_with_contract_equivalent(instrument, sz)
+        summary = {
+            "inst_id": position.inst_id,
+            "session_id": takeover_session_id,
+            "template": record.strategy_name,
+            "api": api_log_name,
+            "entry": format_decimal(entry),
+            "size": size_text,
+            "stop": format_decimal(sl_px),
+            "status": "OKX 动态止损监控中（轮询改价）",
+        }
+        if not hasattr(self, "_position_takeover_sessions") or self._position_takeover_sessions is None:
+            self._position_takeover_sessions = {}
+        self._position_takeover_sessions[takeover_session_id] = {
+            "thread": None,
+            "engine": engine,
+            "summary": summary,
+            "log_prefix": log_prefix,
+            "inst_id": position.inst_id,
+            "algo_id": algo_id,
+            "algo_cl": algo_cl,
+        }
+
+        def _run() -> None:
+            import traceback
+
+            try:
+                engine.run_takeover_exchange_dynamic_stop(
+                    credentials,
+                    config,
+                    trade_instrument=instrument,
+                    position=filled,
+                    initial_stop_loss=sl_px,
+                    stop_loss_algo_id=algo_id,
+                    stop_loss_algo_cl_ord_id=algo_cl,
+                )
+            except Exception as exc:
+                detail = traceback.format_exc()
+                self.root.after(
+                    0,
+                    lambda e=exc, d=detail, lp=log_prefix: self._enqueue_log(f"{lp} 异常结束：{e}\n{d}"),
+                )
+            finally:
+                self.root.after(0, lambda sid=takeover_session_id: self._position_takeover_finished(sid))
+
+        th = threading.Thread(
+            target=_run,
+            name=f"takeover-{takeover_session_id}",
+            daemon=True,
+        )
+        self._position_takeover_sessions[takeover_session_id]["thread"] = th
+        th.start()
+        self._position_takeover_sessions[takeover_session_id]["thread_started"] = True
+        self._refresh_positions_zoom_takeover_panel()
+        self._enqueue_log(
+            f"{log_prefix} 已启动 | 方向={side_zh}({open_side.upper()}) | posSide={(pos_side or '-')} | "
+            f"开仓均价={format_decimal(entry)} | 数量={size_text} | R价差={format_decimal(r_spread)} | "
+            f"止损触发={format_decimal(sl_px)} | algoId={algo_id or '-'} | algoClOrdId={algo_cl or '-'}"
+        )
+
+    def open_takeover_from_selected_conditional_order(self) -> None:
+        """从「当前委托」选中的条件/触发类算法止损单出发，反查持仓、核对数量后启动交易所动态止盈接管。"""
+        parent = self._pending_order_parent_for_view("positions_zoom")
+        item = self._selected_pending_order_item("positions_zoom")
+        if item is None:
+            item = self._selected_pending_order_item(None)
+        if item is None:
+            messagebox.showinfo(
+                "从条件单接管动态止盈",
+                "请先在「当前委托」里选中一条委托。",
+                parent=parent,
+            )
+            return
+        if (getattr(item, "source_kind", "") or "").strip().lower() != "algo":
+            messagebox.showinfo(
+                "从条件单接管动态止盈",
+                "请选中来源为「算法」的止损类委托（OKX 条件/触发单通常在此类）。",
+                parent=parent,
+            )
+            return
+        ot = (item.ord_type or "").strip().lower()
+        if ot and "conditional" not in ot and "trigger" not in ot and "oco" not in ot:
+            messagebox.showinfo(
+                "从条件单接管动态止盈",
+                f"当前委托类型为「{item.ord_type or '-'}」。此入口面向条件/触发/OCO 类止损；"
+                "其它类型请改用工具栏「从选中持仓接管」。",
+                parent=parent,
+            )
+            return
+        sl_px = item.stop_loss_trigger_price or item.trigger_price
+        if sl_px is None:
+            messagebox.showerror("从条件单接管动态止盈", "选中委托缺少止损或触发价。", parent=parent)
+            return
+        algo_id = (item.algo_id or "").strip() or None
+        algo_cl = (item.algo_client_order_id or "").strip() or None
+        if not algo_id and not algo_cl:
+            messagebox.showerror(
+                "从条件单接管动态止盈",
+                "选中委托缺少 algoId / algoClOrdId，无法在交易所侧改价。",
+                parent=parent,
+            )
+            return
+        if getattr(self, "_takeover_open_flow_busy", False):
+            messagebox.showinfo(
+                "从条件单接管动态止盈",
+                "正在拉取委托或等待上一步完成，请稍候再试。",
+                parent=parent,
+            )
+            return
+
+        found = self._find_position_for_takeover_pending_algo(item)
+        if found is None:
+            messagebox.showinfo(
+                "从条件单接管动态止盈",
+                "未找到与该算法止损委托匹配的永续/交割持仓（合约、平仓方向、止损价相对开仓等）。"
+                "请先确认已有对应方向的仓位与止损单，必要时刷新持仓与委托后再试。",
+                parent=parent,
+            )
+            return
+        position, entry = found
+
+        inst_kind = infer_inst_type(position.inst_id)
+        if inst_kind not in {"SWAP", "FUTURES"}:
+            messagebox.showinfo("从条件单接管动态止盈", "当前仅支持永续或交割合约对应的条件止损。", parent=parent)
+            return
+        profile_name = (self._positions_context_profile_name or self._current_credential_profile()).strip()
+        credentials = self._credentials_for_profile_or_none(profile_name)
+        if credentials is None:
+            messagebox.showerror("从条件单接管动态止盈", "当前 API 未配置有效凭证。", parent=parent)
+            return
+        try:
+            record = self._clone_template_record_for_symbol(self._template_record_from_launcher(), position.inst_id)
+        except Exception as exc:
+            messagebox.showerror("从条件单接管动态止盈", f"读取主界面策略模板失败：{exc}", parent=parent)
+            return
+        env_label = self._environment_label_for_profile(profile_name or self._current_credential_profile())
+        desk_env = ENV_OPTIONS[self._normalized_environment_label(env_label)]
+        position_mode = (
+            "long_short" if position.pos_side and str(position.pos_side).strip().lower() != "net" else "net"
+        )
+        config = replace(record.config, environment=desk_env, position_mode=position_mode)
+        if not live_exchange_dynamic_take_profit_template_enabled(config):
+            messagebox.showinfo(
+                "从条件单接管动态止盈",
+                "主界面当前策略模板须为「动态止盈」且非交易员虚拟止损，"
+                "并属于 EMA 动态委托或 EMA 突破类策略，才能与交易所止损改价逻辑对齐。",
+                parent=parent,
+            )
+            return
+        direction = derive_position_direction(position)
+        effective_mode = resolve_dynamic_signal_mode(record.strategy_id, config.signal_mode)
+        if effective_mode == "long_only" and direction != "long":
+            messagebox.showinfo("从条件单接管动态止盈", "模板为只做多，与匹配到的持仓方向不一致。", parent=parent)
+            return
+        if effective_mode == "short_only" and direction != "short":
+            messagebox.showinfo("从条件单接管动态止盈", "模板为只做空，与匹配到的持仓方向不一致。", parent=parent)
+            return
+
+        pos_sz = abs(Decimal(str(position.position)))
+        max_close = self._selected_position_close_size(position)
+        ord_sz = item.size
+        if ord_sz is not None and ord_sz > 0 and ord_sz > max_close:
+            messagebox.showerror(
+                "从条件单接管动态止盈",
+                f"该条件单委托量（{format_decimal(ord_sz)}，与 OKX 持仓同一合约单位）大于当前可平数量（{format_decimal(max_close)}；"
+                f"持仓总量 {format_decimal(pos_sz)}），请先核对仓位或其它挂单冻结后再试。",
+                parent=parent,
+            )
+            return
+
+        self._positions_zoom_takeover_status_text.set(
+            f"已根据条件单匹配 {position.inst_id} 持仓，正在拉取合约元数据并启动动态止盈接管…"
+        )
+        order_contracts = ord_sz if ord_sz is not None and ord_sz > 0 else None
+        self._takeover_enqueue_instrument_fetch(
+            credentials=credentials,
+            config=config,
+            record=record,
+            profile_name=profile_name,
+            position=position,
+            entry=entry,
+            sl_px=sl_px,
+            algo_id=algo_id,
+            algo_cl=algo_cl,
+            order_contract_size=order_contracts,
+        )
+
+    def open_position_takeover_dynamic_stop_dialog(self) -> None:
+        """从持仓大窗：选中永续/交割仓位，选择已有止损算法单，按主界面模板动态止盈规则接管改价。"""
+        position = self._selected_position_item()
+        parent = self._position_action_parent()
+        if position is None:
+            messagebox.showinfo("接管动态止盈", "请先在当前持仓里选中一条具体持仓。", parent=parent)
+            return
+        if getattr(self, "_takeover_open_flow_busy", False):
+            messagebox.showinfo(
+                "接管动态止盈",
+                "正在拉取委托或等待上一步完成，请稍候再试。",
+                parent=parent,
+            )
+            return
+        inst_kind = infer_inst_type(position.inst_id)
+        if inst_kind not in {"SWAP", "FUTURES"}:
+            messagebox.showinfo("接管动态止盈", "当前仅支持永续或交割合约持仓。", parent=parent)
+            return
+        profile_name = (self._positions_context_profile_name or self._current_credential_profile()).strip()
+        credentials = self._credentials_for_profile_or_none(profile_name)
+        if credentials is None:
+            messagebox.showerror("接管动态止盈", "当前 API 未配置有效凭证。", parent=parent)
+            return
+        try:
+            record = self._clone_template_record_for_symbol(self._template_record_from_launcher(), position.inst_id)
+        except Exception as exc:
+            messagebox.showerror("接管动态止盈", f"读取主界面策略模板失败：{exc}", parent=parent)
+            return
+        env_label = self._environment_label_for_profile(profile_name or self._current_credential_profile())
+        desk_env = ENV_OPTIONS[self._normalized_environment_label(env_label)]
+        position_mode = (
+            "long_short" if position.pos_side and str(position.pos_side).strip().lower() != "net" else "net"
+        )
+        config = replace(record.config, environment=desk_env, position_mode=position_mode)
+        if not live_exchange_dynamic_take_profit_template_enabled(config):
+            messagebox.showinfo(
+                "接管动态止盈",
+                "主界面当前策略模板须为「动态止盈」且非交易员虚拟止损，"
+                "并属于 EMA 动态委托或 EMA 突破类策略，才能与交易所止损改价逻辑对齐。",
+                parent=parent,
+            )
+            return
+        direction = derive_position_direction(position)
+        effective_mode = resolve_dynamic_signal_mode(record.strategy_id, config.signal_mode)
+        if effective_mode == "long_only" and direction != "long":
+            messagebox.showinfo("接管动态止盈", "模板为只做多，与当前空头持仓不一致。", parent=parent)
+            return
+        if effective_mode == "short_only" and direction != "short":
+            messagebox.showinfo("接管动态止盈", "模板为只做空，与当前多头持仓不一致。", parent=parent)
+            return
+        entry = position.avg_price
+        if entry is None or entry <= 0:
+            messagebox.showerror("接管动态止盈", "持仓缺少有效开仓均价，无法计算 R 与动态止损。", parent=parent)
+            return
+
+        self._takeover_prefetch_request_id = int(getattr(self, "_takeover_prefetch_request_id", 0)) + 1
+        rid = self._takeover_prefetch_request_id
+        self._takeover_prefetch_context = {
+            "position": position,
+            "record": record,
+            "config": config,
+            "credentials": credentials,
+            "desk_env": desk_env,
+            "profile_name": profile_name,
+            "parent": parent,
+            "entry": entry,
+            "direction": direction,
+        }
+        self._takeover_open_flow_busy = True
+        self._positions_zoom_takeover_status_text.set(
+            "正在从 OKX 拉取永续/交割待触发委托（后台线程）…\n"
+            "界面可继续操作；完成后会弹出选择止损单的窗口。"
+        )
+        threading.Thread(
+            target=self._takeover_prefetch_worker,
+            args=(rid,),
+            name="position-takeover-prefetch",
+            daemon=True,
+        ).start()
+
+    def _position_takeover_finished(self, session_id: str) -> None:
+        if hasattr(self, "_position_takeover_sessions") and isinstance(self._position_takeover_sessions, dict):
+            self._position_takeover_sessions.pop(session_id, None)
+        self._refresh_positions_zoom_takeover_panel()
+
+    def _stop_takeover_session(self, session_id: str, *, parent) -> None:
+        sessions = getattr(self, "_position_takeover_sessions", None) or {}
+        st = sessions.get(session_id)
+        if not isinstance(st, dict):
+            messagebox.showinfo("停止接管", "未找到该接管会话。", parent=parent)
+            return
+        eng = st.get("engine")
+        th = st.get("thread")
+        if eng is not None:
+            eng.interrupt_takeover_monitor()
+        st["engine"] = None
+        if th is None or not getattr(th, "is_alive", lambda: False)():
+            sessions.pop(session_id, None)
+            self._refresh_positions_zoom_takeover_panel()
+            return
+        th.join(timeout=8.0)
+        if th.is_alive():
+            pfx = str(st.get("log_prefix") or "").strip() or "[接管动态止盈]"
+            self._enqueue_log(f"{pfx} 停止信号已发送，后台线程仍在退出中；可稍后再次点击停止。")
+            summ = st.get("summary")
+            if isinstance(summ, dict):
+                st["summary"] = {**summ, "status": "已发送停止，等待后台线程退出…"}
+            self._refresh_positions_zoom_takeover_panel()
+            return
+        pfx = str(st.get("log_prefix") or "").strip() or "[接管动态止盈]"
+        self._enqueue_log(f"{pfx} 已停止接管，OKX 上保留当前止损触发价。")
+        sessions.pop(session_id, None)
+        self._refresh_positions_zoom_takeover_panel()
+
+    def stop_position_takeover_dynamic_stop(self) -> None:
+        parent = self._position_action_parent()
+        sessions = getattr(self, "_position_takeover_sessions", None) or {}
+        if not sessions:
+            messagebox.showinfo("停止接管", "当前没有动态止盈接管任务。", parent=parent)
+            return
+        alive = self._takeover_running_session_ids()
+        if not alive:
+            messagebox.showinfo("停止接管", "当前没有运行中的动态止盈接管任务。", parent=parent)
+            return
+        tree = getattr(self, "_positions_zoom_takeover_tree", None)
+        chosen_sid: str | None = None
+        if tree is not None and _widget_exists(tree):
+            try:
+                sel = tree.selection()
+                if sel:
+                    chosen_sid = sel[0]
+            except Exception:
+                chosen_sid = None
+        if chosen_sid:
+            if chosen_sid not in alive:
+                messagebox.showinfo(
+                    "停止接管",
+                    "所选行已非运行中任务；请在「动态止盈接管」表格中选中一条监控中的会话后再试。",
+                    parent=parent,
+                )
+                return
+            self._stop_takeover_session(chosen_sid, parent=parent)
+            return
+        if len(alive) == 1:
+            self._stop_takeover_session(alive[0], parent=parent)
+            return
+        messagebox.showinfo(
+            "停止接管",
+            f"当前有 {len(alive)} 条接管在并行运行。请在下方「动态止盈接管」表格中选中要停止的一行，再点「停止接管」。",
+            parent=parent,
+        )
 
     def _refresh_positions_periodic(self) -> None:
         if self.position_auto_refresh_enabled:

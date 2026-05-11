@@ -16,7 +16,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from types import FunctionType
 import tkinter.font as tkfont
-from tkinter import BooleanVar, Canvas, END, Label, Menu, StringVar, Text, TclError, Tk, Toplevel, filedialog, simpledialog
+from tkinter import BooleanVar, Canvas, END, Label, Listbox, Menu, StringVar, Text, TclError, Tk, Toplevel, filedialog, simpledialog
 from tkinter import messagebox, ttk
 
 from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
@@ -30,6 +30,7 @@ from okx_quant.engine import (
     DEFAULT_DEBUG_ATR_PERIOD,
     FilledPosition,
     StrategyEngine,
+    live_exchange_dynamic_take_profit_template_enabled,
     _dynamic_two_taker_fee_offset_live,
     _format_notify_size_with_unit,
     _format_size_with_contract_equivalent,
@@ -2144,6 +2145,18 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._protection_replay_window: ProtectionReplayWindow | None = None
         self._positions_refreshing = False
         self._positions_history_refreshing = False
+        self._positions_zoom_takeover_status_text = StringVar(
+            value="动态止盈接管：当前无运行中任务；请在大窗底部「动态止盈接管」选项卡查看列表与说明。"
+        )
+        # session_id -> {thread, engine, summary, log_prefix, inst_id, algo_id, algo_cl}
+        self._position_takeover_sessions: dict[str, dict[str, object]] = {}
+        self._takeover_prefetch_request_id = 0
+        self._takeover_prefetch_context: dict[str, object] | None = None
+        self._takeover_open_flow_busy = False
+        self._takeover_instrument_pending_slots: set[str] = set()
+        self._positions_zoom_takeover_tree: object | None = None
+        self._position_takeover_registry: list[dict[str, object]] = []
+        self._takeover_last_running_session_id: str | None = None
         self._default_symbol_values = list(DEFAULT_LAUNCH_SYMBOLS)
         self._custom_trigger_symbol_values = ["", *self._default_symbol_values]
         self._default_launch_symbol = (

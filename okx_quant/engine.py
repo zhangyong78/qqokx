@@ -50,6 +50,11 @@ def _live_dynamic_take_profit_enabled(config: StrategyConfig) -> bool:
     return is_dynamic_strategy_id(config.strategy_id) or is_ema_atr_breakout_strategy(config.strategy_id)
 
 
+def live_exchange_dynamic_take_profit_template_enabled(config: StrategyConfig) -> bool:
+    """主界面模板是否属于「交易所托管 + 动态止盈上移」口径（供持仓接管等入口复用）。"""
+    return _live_dynamic_take_profit_enabled(config) and not bool(config.trader_virtual_stop_loss)
+
+
 def _take_profit_mode_description_for_signal_email(config: StrategyConfig) -> str:
     """仅发信号邮件中附带的止盈方式说明（与当前模板配置一致）。"""
     sid = str(config.strategy_id or "")
@@ -1978,27 +1983,41 @@ class StrategyEngine:
         position: FilledPosition,
         initial_stop_loss: Decimal,
         stop_loss_algo_cl_ord_id: str | None,
+        stop_loss_algo_id: str | None = None,
     ) -> None:
-        if not stop_loss_algo_cl_ord_id:
-            raise RuntimeError("动态止盈模式缺少 OKX 止损委托标识，无法继续动态上移。")
+        algo_id_norm = (stop_loss_algo_id or "").strip()
+        algo_cl_norm = (stop_loss_algo_cl_ord_id or "").strip()
+        if not algo_id_norm and not algo_cl_norm:
+            raise RuntimeError("动态止盈模式缺少 OKX 止损委托标识（algoId 或 algoClOrdId），无法继续动态上移。")
 
         current_stop_loss = initial_stop_loss
         next_trigger_r = 2
         amend_failures = 0
         consecutive_read_failures = 0
         risk_per_unit = abs(position.entry_price - initial_stop_loss)
-        self._logger(
-            " | ".join(
-                [
-                    f"开始监控 OKX 动态止损 | 标的={trade_instrument.inst_id}",
-                    f"触发价格类型={config.tp_sl_trigger_type}",
-                    f"初始止损={format_decimal(initial_stop_loss)}",
-                    f"2R保本={config.dynamic_two_r_break_even_label()}",
-                    f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
-                    f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根",
-                ]
-            )
-        )
+        ref_parts: list[str] = []
+        if algo_cl_norm:
+            ref_parts.append(f"algoClOrdId={algo_cl_norm}")
+        if algo_id_norm:
+            ref_parts.append(f"algoId={algo_id_norm}")
+        ref_label = " | ".join(ref_parts) if ref_parts else "-"
+        pos_side_txt = (position.pos_side or "").strip()
+        api_txt = (self._api_name or "").strip() or "-"
+        pos_bits = [
+            f"开始监控 OKX 动态止损 | API={api_txt} | 标的={trade_instrument.inst_id}",
+            f"持仓方向={position.side.upper()}"
+            + (f" | posSide={pos_side_txt}" if pos_side_txt else ""),
+            f"开仓价={format_decimal(position.entry_price)}",
+            f"数量={_format_size_with_contract_equivalent(trade_instrument, position.size)}",
+            f"R价差(开仓-初始止损)={format_decimal(risk_per_unit)}",
+            ref_label,
+            f"触发价格类型={config.tp_sl_trigger_type}",
+            f"初始止损={format_decimal(initial_stop_loss)}",
+            f"2R保本={config.dynamic_two_r_break_even_label()}",
+            f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
+            f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根",
+        ]
+        self._logger(" | ".join(pos_bits))
 
         while not self._stop_event.is_set():
             try:
@@ -2007,7 +2026,8 @@ class StrategyEngine:
                     config,
                     trade_instrument=trade_instrument,
                     position=position,
-                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                    stop_loss_algo_cl_ord_id=algo_cl_norm or None,
+                    stop_loss_algo_id=algo_id_norm or None,
                     current_stop_loss=current_stop_loss,
                     next_trigger_r=next_trigger_r,
                     risk_per_unit=risk_per_unit,
@@ -2046,139 +2066,39 @@ class StrategyEngine:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
-            live_position = self._find_managed_position(credentials, config, trade_instrument, position)
-            if live_position is None:
-                self._logger("未检测到策略持仓，OKX 动态止损监控结束。")
-                return
-
-            direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
-            current_price = self._get_trigger_price_with_retry(trade_instrument.inst_id, config.tp_sl_trigger_type)
-            holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
-            updated_stop_loss, next_trigger_price, updated_trigger_r, moved = _advance_dynamic_stop_live(
-                direction=direction,
-                current_price=current_price,
-                entry_price=position.entry_price,
-                risk_per_unit=risk_per_unit,
-                current_stop_loss=current_stop_loss,
-                next_trigger_r=next_trigger_r,
-                tick_size=trade_instrument.tick_size,
-                two_r_break_even=config.dynamic_two_r_break_even,
-                dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
-                holding_bars=holding_bars,
-                time_stop_break_even_enabled=config.time_stop_break_even_enabled,
-                time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
-            )
-            should_amend = moved and (
-                updated_stop_loss > current_stop_loss if position.side == "buy" else updated_stop_loss < current_stop_loss
-            )
-            if should_amend:
-                fresh_price = self._get_trigger_price_with_retry(trade_instrument.inst_id, config.tp_sl_trigger_type)
-                if not _is_exchange_dynamic_stop_candidate_valid(
-                    direction=direction,
-                    current_price=fresh_price,
-                    candidate_stop_loss=updated_stop_loss,
-                ):
-                    self._logger(
-                        " | ".join(
-                            [
-                                "OKX 动态止损候选价已过期，跳过本次上移",
-                                f"当前价={format_decimal(fresh_price)}",
-                                f"当前止损={format_decimal(current_stop_loss)}",
-                                f"候选止损={format_decimal(updated_stop_loss)}",
-                                f"下一触发价={format_decimal(next_trigger_price)}",
-                                f"algoClOrdId={stop_loss_algo_cl_ord_id}",
-                            ]
-                        )
-                    )
-                    self._stop_event.wait(max(config.poll_seconds / 2, 0.5))
-                    continue
-                algo_order = self._find_pending_algo_order_by_client_id(
-                    credentials,
-                    config,
-                    trade_instrument=trade_instrument,
-                    algo_cl_ord_id=stop_loss_algo_cl_ord_id,
-                )
-                if algo_order is None:
-                    self._logger(
-                        " | ".join(
-                            [
-                                "OKX 动态止损委托暂未出现在挂单列表，稍后重试",
-                                f"候选止损={format_decimal(updated_stop_loss)}",
-                                f"algoClOrdId={stop_loss_algo_cl_ord_id}",
-                            ]
-                        )
-                    )
-                    self._stop_event.wait(max(config.poll_seconds / 2, 0.5))
-                    continue
-                try:
-                    self._amend_algo_order_with_recovery(
-                        credentials,
-                        config,
-                        trade_instrument=trade_instrument,
-                        algo_id=algo_order.algo_id,
-                        algo_cl_ord_id=stop_loss_algo_cl_ord_id,
-                        req_id=self._next_client_order_id(role="amd"),
-                        new_stop_loss_trigger_price=updated_stop_loss,
-                        new_stop_loss_trigger_price_type=config.tp_sl_trigger_type,
-                    )
-                except OkxApiError as exc:
-                    live_position = self._find_managed_position(credentials, config, trade_instrument, position)
-                    if live_position is None:
-                        self._logger("检测到持仓已关闭，停止 OKX 动态止损监控。")
-                        return
-                    latest_price = self._get_trigger_price_with_retry(
-                        trade_instrument.inst_id,
-                        config.tp_sl_trigger_type,
-                    )
-                    detail = str(exc).strip() or f"code={exc.code or '-'}"
-                    if not _is_exchange_dynamic_stop_candidate_valid(
-                        direction=direction,
-                        current_price=latest_price,
-                        candidate_stop_loss=updated_stop_loss,
-                    ):
-                        self._logger(
-                            " | ".join(
-                                [
-                                    "OKX 动态止损上移遇到快速回抽，本次改价已放弃",
-                                    f"当前价={format_decimal(latest_price)}",
-                                    f"候选止损={format_decimal(updated_stop_loss)}",
-                                    f"algoClOrdId={stop_loss_algo_cl_ord_id}",
-                                    detail,
-                                ]
-                            )
-                        )
-                        self._stop_event.wait(max(config.poll_seconds / 2, 0.5))
-                        continue
-                    amend_failures += 1
-                    if amend_failures < 4:
-                        self._logger(
-                            " | ".join(
-                                [
-                                    "OKX 动态止损上移失败，稍后重试",
-                                    f"当前价={format_decimal(latest_price)}",
-                                    f"候选止损={format_decimal(updated_stop_loss)}",
-                                    f"algoClOrdId={stop_loss_algo_cl_ord_id}",
-                                    detail,
-                                ]
-                            )
-                        )
-                        self._stop_event.wait(max(config.poll_seconds / 2, 0.5))
-                        continue
-                    raise RuntimeError(f"OKX 动态止损上移失败：{detail}") from exc
-
-                amend_failures = 0
-
-                current_stop_loss = updated_stop_loss
-                next_trigger_r = updated_trigger_r
-                self._logger(
-                    f"OKX 动态止损已上移 | 当前价={format_decimal(fresh_price)} | "
-                    f"新止损={format_decimal(current_stop_loss)} | 下一阶段={next_trigger_r}R | "
-                    f"algoClOrdId={stop_loss_algo_cl_ord_id} | holding_bars={holding_bars}"
-                )
-
-            self._stop_event.wait(config.poll_seconds)
-
         self._logger("策略已停止，保留当前 OKX 动态止损。")
+
+    def run_takeover_exchange_dynamic_stop(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        initial_stop_loss: Decimal,
+        stop_loss_algo_id: str | None,
+        stop_loss_algo_cl_ord_id: str | None,
+    ) -> None:
+        """持仓大窗「接管」：沿用已有 OKX 止损算法单，按模板动态止盈规则改价上移。"""
+        if not _live_dynamic_take_profit_enabled(config):
+            raise RuntimeError("当前策略模板未启用动态止盈，无法接管。")
+        if config.trader_virtual_stop_loss:
+            raise RuntimeError("交易员虚拟止损模式下不存在可接管的交易所止损单。")
+        if not (stop_loss_algo_id or "").strip() and not (stop_loss_algo_cl_ord_id or "").strip():
+            raise RuntimeError("缺少止损算法单 algoId / algoClOrdId。")
+        self._monitor_exchange_dynamic_stop(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            position=position,
+            initial_stop_loss=initial_stop_loss,
+            stop_loss_algo_cl_ord_id=(stop_loss_algo_cl_ord_id or "").strip() or None,
+            stop_loss_algo_id=(stop_loss_algo_id or "").strip() or None,
+        )
+
+    def interrupt_takeover_monitor(self) -> None:
+        """中断由 run_takeover_exchange_dynamic_stop 或独立引擎实例触发的动态止损轮询。"""
+        self._stop_event.set()
 
     def _monitor_exchange_dynamic_stop_once(
         self,
@@ -2187,12 +2107,18 @@ class StrategyEngine:
         *,
         trade_instrument: Instrument,
         position: FilledPosition,
-        stop_loss_algo_cl_ord_id: str,
+        stop_loss_algo_cl_ord_id: str | None,
+        stop_loss_algo_id: str | None,
         current_stop_loss: Decimal,
         next_trigger_r: int,
         risk_per_unit: Decimal,
         amend_failures: int,
     ) -> DynamicStopMonitorStepResult:
+        algo_ref = (
+            f"algoClOrdId={stop_loss_algo_cl_ord_id}"
+            if (stop_loss_algo_cl_ord_id or "").strip()
+            else f"algoId={stop_loss_algo_id or '-'}"
+        )
         live_position = self._find_managed_position(credentials, config, trade_instrument, position)
         if live_position is None:
             self._logger("未检测到策略持仓，OKX 动态止损监控结束。")
@@ -2245,7 +2171,7 @@ class StrategyEngine:
                         f"当前止损={format_decimal(current_stop_loss)}",
                         f"候选止损={format_decimal(updated_stop_loss)}",
                         f"下一触发价={format_decimal(next_trigger_price)}",
-                        f"algoClOrdId={stop_loss_algo_cl_ord_id}",
+                        algo_ref,
                     ]
                 )
             )
@@ -2257,11 +2183,12 @@ class StrategyEngine:
                 amend_failures=amend_failures,
             )
 
-        algo_order = self._find_pending_algo_order_by_client_id(
+        algo_order = self._find_pending_algo_order_for_dynamic_stop(
             credentials,
             config,
             trade_instrument=trade_instrument,
             algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+            algo_id=stop_loss_algo_id,
         )
         if algo_order is None:
             self._logger(
@@ -2269,7 +2196,7 @@ class StrategyEngine:
                     [
                         "OKX 动态止损委托暂未出现在挂单列表，稍后重试",
                         f"候选止损={format_decimal(updated_stop_loss)}",
-                        f"algoClOrdId={stop_loss_algo_cl_ord_id}",
+                        algo_ref,
                     ]
                 )
             )
@@ -2281,16 +2208,19 @@ class StrategyEngine:
                 amend_failures=amend_failures,
             )
 
+        amend_cl_ord = (algo_order.algo_client_order_id or stop_loss_algo_cl_ord_id or "").strip() or None
         try:
             self._amend_algo_order_with_recovery(
                 credentials,
                 config,
                 trade_instrument=trade_instrument,
                 algo_id=algo_order.algo_id,
-                algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                algo_cl_ord_id=amend_cl_ord,
                 req_id=self._next_client_order_id(role="amd"),
                 new_stop_loss_trigger_price=updated_stop_loss,
                 new_stop_loss_trigger_price_type=config.tp_sl_trigger_type,
+                recover_algo_id=(stop_loss_algo_id or "").strip() or None,
+                recover_algo_cl_ord_id=(stop_loss_algo_cl_ord_id or "").strip() or None,
             )
         except OkxApiError as exc:
             live_position = self._find_managed_position(credentials, config, trade_instrument, position)
@@ -2318,7 +2248,7 @@ class StrategyEngine:
                             "OKX 动态止损上移遇到快速回抽，本次改价已放弃",
                             f"当前价={format_decimal(latest_price)}",
                             f"候选止损={format_decimal(updated_stop_loss)}",
-                            f"algoClOrdId={stop_loss_algo_cl_ord_id}",
+                            algo_ref,
                             detail,
                         ]
                     )
@@ -2339,7 +2269,7 @@ class StrategyEngine:
                             "OKX 动态止损上移失败，稍后重试",
                             f"当前价={format_decimal(latest_price)}",
                             f"候选止损={format_decimal(updated_stop_loss)}",
-                            f"algoClOrdId={stop_loss_algo_cl_ord_id}",
+                            algo_ref,
                             detail,
                         ]
                     )
@@ -2356,7 +2286,7 @@ class StrategyEngine:
         self._logger(
             f"OKX 动态止损已上移 | 当前价={format_decimal(fresh_price)} | "
             f"新止损={format_decimal(updated_stop_loss)} | 下一阶段={updated_trigger_r}R | "
-            f"algoClOrdId={stop_loss_algo_cl_ord_id} | holding_bars={holding_bars}"
+            f"{algo_ref} | holding_bars={holding_bars}"
         )
         return DynamicStopMonitorStepResult(
             keep_monitoring=True,
@@ -2411,14 +2341,19 @@ class StrategyEngine:
 
         self._logger("策略已停止，保留当前 OKX 托管止盈止损。")
 
-    def _find_pending_algo_order_by_client_id(
+    def _find_pending_algo_order_for_dynamic_stop(
         self,
         credentials: Credentials,
         config: StrategyConfig,
         *,
         trade_instrument: Instrument,
-        algo_cl_ord_id: str,
-    ):
+        algo_cl_ord_id: str | None,
+        algo_id: str | None,
+    ) -> OkxTradeOrderItem | None:
+        aid = (algo_id or "").strip()
+        acid = (algo_cl_ord_id or "").strip()
+        if not aid and not acid:
+            return None
         pending_orders = self._get_pending_orders_with_retry(
             credentials,
             config,
@@ -2430,10 +2365,35 @@ class StrategyEngine:
                 continue
             if item.inst_id != trade_instrument.inst_id:
                 continue
-            if (item.algo_client_order_id or "").strip() != algo_cl_ord_id:
-                continue
-            return item
+            if aid and (item.algo_id or "").strip() == aid:
+                return item
+            if not aid and acid and (item.algo_client_order_id or "").strip() == acid:
+                return item
+        if aid and acid:
+            for item in pending_orders:
+                if item.source_kind != "algo":
+                    continue
+                if item.inst_id != trade_instrument.inst_id:
+                    continue
+                if (item.algo_client_order_id or "").strip() == acid:
+                    return item
         return None
+
+    def _find_pending_algo_order_by_client_id(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        algo_cl_ord_id: str,
+    ) -> OkxTradeOrderItem | None:
+        return self._find_pending_algo_order_for_dynamic_stop(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            algo_cl_ord_id=algo_cl_ord_id,
+            algo_id=None,
+        )
 
     def _find_pending_entry_order(
         self,
@@ -2745,22 +2705,31 @@ class StrategyEngine:
         *,
         trade_instrument: Instrument,
         algo_id: str | None,
-        algo_cl_ord_id: str,
+        algo_cl_ord_id: str | None,
         req_id: str,
         new_stop_loss_trigger_price: Decimal,
         new_stop_loss_trigger_price_type: str,
+        recover_algo_id: str | None = None,
+        recover_algo_cl_ord_id: str | None = None,
     ) -> None:
+        if not (algo_id or "").strip() and not (algo_cl_ord_id or "").strip():
+            raise ValueError("amend_algo_order 需要 algo_id 或 algo_cl_ord_id")
+
         def _submit() -> OkxOrderResult:
             return self._client.amend_algo_order(
                 credentials,
                 environment=config.environment,
                 inst_id=trade_instrument.inst_id,
-                algo_id=algo_id,
-                algo_cl_ord_id=algo_cl_ord_id,
+                algo_id=(algo_id or "").strip() or None,
+                algo_cl_ord_id=(algo_cl_ord_id or "").strip() or None,
                 req_id=req_id,
                 new_stop_loss_trigger_price=new_stop_loss_trigger_price,
                 new_stop_loss_trigger_price_type=new_stop_loss_trigger_price_type,
             )
+
+        rid = (recover_algo_id or "").strip() or (algo_id or "").strip() or None
+        rcid = (recover_algo_cl_ord_id or "").strip() or (algo_cl_ord_id or "").strip() or None
+        ref_log = f"algoClOrdId={rcid}" if rcid else f"algoId={rid or '-'}"
 
         try:
             _submit()
@@ -2774,17 +2743,18 @@ class StrategyEngine:
                     [
                         "OKX 动态止损改单响应异常，开始回查算法单状态",
                         f"标的={trade_instrument.inst_id}",
-                        f"algoClOrdId={algo_cl_ord_id}",
+                        ref_log,
                         f"候选止损={format_decimal(new_stop_loss_trigger_price)}",
                         detail,
                     ]
                 )
             )
-            recovered_order = self._find_pending_algo_order_by_client_id(
+            recovered_order = self._find_pending_algo_order_for_dynamic_stop(
                 credentials,
                 config,
                 trade_instrument=trade_instrument,
-                algo_cl_ord_id=algo_cl_ord_id,
+                algo_cl_ord_id=rcid,
+                algo_id=rid,
             )
             if self._does_pending_algo_stop_loss_match(
                 recovered_order,
@@ -2796,7 +2766,7 @@ class StrategyEngine:
                         [
                             "OKX 动态止损改单响应丢失，但回查显示已生效",
                             f"标的={trade_instrument.inst_id}",
-                            f"algoClOrdId={algo_cl_ord_id}",
+                            ref_log,
                             f"新止损={format_decimal(new_stop_loss_trigger_price)}",
                         ]
                     )
@@ -2805,7 +2775,7 @@ class StrategyEngine:
 
             if self._stop_event.is_set():
                 raise RuntimeError(
-                    f"OKX 动态止损改单中断，且回查未确认结果 | algoClOrdId={algo_cl_ord_id}"
+                    f"OKX 动态止损改单中断，且回查未确认结果 | {ref_log}"
                 ) from exc
 
             self._logger(
@@ -2813,7 +2783,7 @@ class StrategyEngine:
                     [
                         "OKX 动态止损改单回查未确认，准备使用同一 reqId 补发一次",
                         f"标的={trade_instrument.inst_id}",
-                        f"algoClOrdId={algo_cl_ord_id}",
+                        ref_log,
                         f"reqId={req_id}",
                     ]
                 )
@@ -2822,11 +2792,12 @@ class StrategyEngine:
                 _submit()
                 return
             except OkxApiError as retry_exc:
-                recovered_order = self._find_pending_algo_order_by_client_id(
+                recovered_order = self._find_pending_algo_order_for_dynamic_stop(
                     credentials,
                     config,
                     trade_instrument=trade_instrument,
-                    algo_cl_ord_id=algo_cl_ord_id,
+                    algo_cl_ord_id=rcid,
+                    algo_id=rid,
                 )
                 if self._does_pending_algo_stop_loss_match(
                     recovered_order,
@@ -2838,13 +2809,13 @@ class StrategyEngine:
                             [
                                 "OKX 动态止损改单补发响应异常，但回查显示已生效",
                                 f"标的={trade_instrument.inst_id}",
-                                f"algoClOrdId={algo_cl_ord_id}",
+                                ref_log,
                                 f"新止损={format_decimal(new_stop_loss_trigger_price)}",
                             ]
                         )
                     )
                     return
-                raise
+                raise retry_exc
 
     def _place_entry_order(
         self,

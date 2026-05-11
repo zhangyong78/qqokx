@@ -4494,3 +4494,61 @@ class StrategyParameterFixedLabelTest(TestCase):
         self.assertEqual(app._signal_label.text, "信号方向（本策略固定）")
         self.assertEqual(app._bar_label.text, "K线周期")
         self.assertEqual(app._ema_label.text, "EMA小周期")
+
+
+class PositionTakeoverEntryTsTest(TestCase):
+    def test_prefers_okx_ctime_ms(self) -> None:
+        pos = OkxPosition(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="long",
+            mgn_mode="cross",
+            position=Decimal("1"),
+            avail_position=Decimal("1"),
+            avg_price=Decimal("2319"),
+            mark_price=None,
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy=None,
+            last_price=None,
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={"cTime": "1704067200000"},
+        )
+        self.assertEqual(QuantApp._position_takeover_entry_ts_ms(pos), 1704067200000)
+
+    def test_scales_seconds_to_ms(self) -> None:
+        pos = OkxPosition(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="long",
+            mgn_mode="cross",
+            position=Decimal("1"),
+            avail_position=Decimal("1"),
+            avg_price=Decimal("2319"),
+            mark_price=None,
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy=None,
+            last_price=None,
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={"cTime": "1704067200"},
+        )
+        self.assertEqual(QuantApp._position_takeover_entry_ts_ms(pos), 1704067200000)
