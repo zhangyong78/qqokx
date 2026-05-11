@@ -1751,7 +1751,11 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
     text = str(message or "").strip()
     if not text:
         return None
-    if "OKX 读取异常，准备重试" in text or "OKX 读取失败" in text:
+    if (
+        "OKX 读取异常，准备重试" in text
+        or "OKX 读取异常，进入重试" in text
+        or "OKX 读取失败" in text
+    ):
         return current_status or "网络重试中"
     if (
         "开始监控 OKX 动态止损" in text

@@ -815,6 +815,43 @@ class OkxRestClient:
             raw=first,
         )
 
+    def get_order_algo(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        algo_id: str | None = None,
+        algo_cl_ord_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """GET /api/v5/trade/order-algo：查询单笔算法委托（含终态），用于判断止损是否已触发/撤单。
+
+        官方参数以 algoId 为主；若仅有 algoClOrdId，部分场景需附带 instId。
+        """
+        aid = (algo_id or "").strip()
+        acl = (algo_cl_ord_id or "").strip()
+        if not aid and not acl:
+            raise ValueError("get_order_algo 需要 algoId 或 algoClOrdId")
+        params: dict[str, str] = {}
+        if aid:
+            params["algoId"] = aid
+        else:
+            params["algoClOrdId"] = acl
+            params["instId"] = inst_id.strip().upper()
+        payload = self._request(
+            "GET",
+            "/api/v5/trade/order-algo",
+            params=params,
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        data = payload.get("data")
+        if not isinstance(data, list) or not data:
+            return None
+        first = data[0]
+        return first if isinstance(first, dict) else None
+
     def get_mark_price(self, inst_id: str) -> Decimal:
         payload = self._request(
             "GET",

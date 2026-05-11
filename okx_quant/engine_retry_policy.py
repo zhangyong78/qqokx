@@ -24,7 +24,18 @@ class EngineRetryPolicy:
         max_attempts, base_delay, max_delay = engine_module.get_okx_read_retry_config()
         for attempt in range(1, max_attempts + 1):
             try:
-                return fn()
+                result = fn()
+                if attempt > 1:
+                    engine._logger(
+                        " | ".join(
+                            [
+                                "OKX 读取已恢复",
+                                f"操作={label}",
+                                f"第{attempt}/{max_attempts}次成功",
+                            ]
+                        )
+                    )
+                return result
             except Exception as exc:
                 okx_exc = engine_module._coerce_okx_read_exception(exc)
                 if okx_exc is None:
@@ -36,18 +47,28 @@ class EngineRetryPolicy:
                     or attempt >= max_attempts
                     or engine._stop_event.is_set()
                 ):
-                    engine._logger(f"OKX 读取失败 | 操作={label} | {detail}")
+                    if (
+                        engine_module._is_transient_okx_error(okx_exc)
+                        and attempt >= max_attempts
+                        and max_attempts > 1
+                    ):
+                        engine._logger(
+                            f"OKX 读取失败 | 操作={label} | 共{max_attempts}次尝试仍失败 | {detail}"
+                        )
+                    else:
+                        engine._logger(f"OKX 读取失败 | 操作={label} | {detail}")
                     raise okx_exc
-                engine._logger(
-                    " | ".join(
-                        [
-                            "OKX 读取异常，准备重试",
-                            f"操作={label}",
-                            f"第{attempt}/{max_attempts}次",
-                            detail,
-                        ]
+                if attempt == 1:
+                    engine._logger(
+                        " | ".join(
+                            [
+                                "OKX 读取异常，进入重试",
+                                f"操作={label}",
+                                f"最多{max_attempts}次",
+                                detail,
+                            ]
+                        )
                     )
-                )
                 delay_seconds = min(base_delay * attempt, max_delay)
                 engine._stop_event.wait(delay_seconds)
         if last_exc is not None:

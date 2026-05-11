@@ -928,6 +928,16 @@ HTTP 502: <!DOCTYPE html>
             _infer_session_runtime_status("OKX 读取异常，准备重试 | 操作=读取持仓 SWAP", "持仓监控中"),
             "持仓监控中",
         )
+        self.assertEqual(
+            _infer_session_runtime_status("OKX 读取异常，进入重试 | 操作=读取持仓 SWAP", "持仓监控中"),
+            "持仓监控中",
+        )
+
+    def test_infer_session_runtime_status_preserves_phase_after_okx_read_recovery(self) -> None:
+        self.assertEqual(
+            _infer_session_runtime_status("OKX 读取已恢复 | 操作=读取K线 BTC-USDT-SWAP 4H | 第3/8次成功", "持仓监控中"),
+            "持仓监控中",
+        )
 
     def test_infer_session_runtime_status_maps_startup_gate_and_round_completion_to_waiting(self) -> None:
         self.assertEqual(_infer_session_runtime_status("启动默认不追老信号 | 方向=LONG"), "等待信号")

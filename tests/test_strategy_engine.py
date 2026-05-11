@@ -1551,7 +1551,8 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(attempts["count"], 3)
         self.assertEqual(waits, [1.0, 2.0])
-        self.assertTrue(any("准备重试" in message for message in messages))
+        self.assertTrue(any("OKX 读取异常，进入重试" in message for message in messages))
+        self.assertTrue(any("OKX 读取已恢复" in message for message in messages))
 
     def test_okx_read_retry_recovers_from_raw_timeout_error(self) -> None:
         messages: list[str] = []
@@ -1588,7 +1589,9 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(attempts["count"], 3)
         self.assertEqual(waits, [1.0, 2.0])
-        self.assertGreaterEqual(len(messages), 2)
+        self.assertEqual(len(messages), 2)
+        self.assertTrue(any("进入重试" in message for message in messages))
+        self.assertTrue(any("OKX 读取已恢复" in message for message in messages))
 
     def test_okx_read_retry_recovers_from_remote_end_closed_connection(self) -> None:
         messages: list[str] = []
@@ -1625,7 +1628,7 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(attempts["count"], 3)
         self.assertEqual(waits, [1.0, 2.0])
-        self.assertGreaterEqual(len(messages), 2)
+        self.assertEqual(len(messages), 2)
 
     def test_okx_read_retry_does_not_retry_non_transient_error(self) -> None:
         messages: list[str] = []
@@ -1657,6 +1660,47 @@ class StrategyEngineTest(TestCase):
 
         self.assertEqual(waits, [])
         self.assertTrue(any("OKX 读取失败" in message for message in messages))
+
+    def test_okx_read_retry_final_failure_logs_total_attempts(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+
+        class _StopStub:
+            @staticmethod
+            def is_set() -> bool:
+                return False
+
+            @staticmethod
+            def wait(timeout: float) -> bool:
+                waits.append(timeout)
+                return False
+
+        with patch.dict(
+            os.environ,
+            {
+                "QQOKX_READ_RETRY_ATTEMPTS": "2",
+                "QQOKX_READ_RETRY_BASE_DELAY_SECONDS": "0.1",
+            },
+            clear=False,
+        ):
+            engine = StrategyEngine(
+                None,  # type: ignore[arg-type]
+                messages.append,
+                strategy_name="EMA 动态委托-多头",
+                session_id="S01",
+            )
+            engine._stop_event = _StopStub()  # type: ignore[assignment]
+
+            with self.assertRaises(OkxApiError):
+                engine._call_okx_read_with_retry(
+                    "读取测试",
+                    lambda: (_ for _ in ()).throw(OkxApiError("网络错误：SSL handshake timed out")),
+                )
+
+        self.assertTrue(any("OKX 读取异常，进入重试" in message for message in messages))
+        self.assertTrue(any("共2次尝试仍失败" in message for message in messages))
+        self.assertFalse(any("OKX 读取已恢复" in message for message in messages))
+        self.assertEqual(waits, [0.1])
 
     def test_log_hourly_debug_retries_transient_okx_errors(self) -> None:
         messages: list[str] = []
@@ -1702,7 +1746,8 @@ class StrategyEngineTest(TestCase):
 
         self.assertEqual(client.calls, 3)
         self.assertEqual(waits, [1.0, 2.0])
-        self.assertTrue(any("OKX 读取异常，准备重试" in message for message in messages))
+        self.assertTrue(any("OKX 读取异常，进入重试" in message for message in messages))
+        self.assertTrue(any("OKX 读取已恢复" in message for message in messages))
         self.assertTrue(any("1H调试 | ETH-USDT-SWAP" in message for message in messages))
         self.assertFalse(any("1H调试值获取失败" in message for message in messages))
 
@@ -3145,7 +3190,8 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(result, Decimal("2308.5"))
         self.assertEqual(attempts["count"], 3)
         self.assertEqual(waits, [1.0, 2.0])
-        self.assertTrue(any("重试" in message for message in messages))
+        self.assertTrue(any("进入重试" in message for message in messages))
+        self.assertTrue(any("OKX 读取已恢复" in message for message in messages))
 
     def test_okx_read_retry_recovers_from_vpn_proxy_error(self) -> None:
         messages: list[str] = []
@@ -3182,4 +3228,5 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(attempts["count"], 3)
         self.assertEqual(waits, [1.0, 2.0])
-        self.assertTrue(any("重试" in message for message in messages))
+        self.assertTrue(any("进入重试" in message for message in messages))
+        self.assertTrue(any("OKX 读取已恢复" in message for message in messages))

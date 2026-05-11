@@ -126,12 +126,71 @@ def get_okx_read_retry_config() -> tuple[int, float, float]:
 
 
 OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES = 6
+# 挂单中连续若干轮找不到原算法止损后，结合持仓相对基准的缩量 / 行情与止损位推断已触发，结束接管监控（避免交易所已成交仍假死轮询）
+OKX_DYNAMIC_STOP_MISSING_ALGO_MIN_POLLS = 2
+OKX_DYNAMIC_STOP_MISSING_ALGO_PRICE_EXIT_POLLS = 12
+OKX_DYNAMIC_STOP_MISSING_ALGO_FORCE_EXIT_POLLS = 24
 OKX_WRITE_RECONCILE_ATTEMPTS = 3
 OKX_WRITE_RECONCILE_BASE_DELAY_SECONDS = 1.0
 OKX_WRITE_RECONCILE_MAX_DELAY_SECONDS = 3.0
 IDLE_SIGNAL_MAX_WAIT_SECONDS = 60.0
 
 T = TypeVar("T")
+
+
+def _dynamic_stop_infer_triggered_algo_not_in_book(
+    *,
+    direction: Literal["long", "short"],
+    live_abs: Decimal,
+    baseline_abs: Decimal | None,
+    monitored_sz: Decimal,
+    current_price: Decimal,
+    current_stop_loss: Decimal,
+    initial_stop_loss: Decimal,
+    missing_rounds: int,
+    lot_size: Decimal,
+) -> tuple[bool, str | None]:
+    """算法止损已从挂单消失若干轮后：用持仓缩量 / OKX 查询终态 / 行情与止损带推断已触发，避免监控永不退出。"""
+    if missing_rounds < OKX_DYNAMIC_STOP_MISSING_ALGO_MIN_POLLS:
+        return False, None
+    lot = lot_size if lot_size and lot_size > 0 else Decimal("0")
+    sz = monitored_sz if monitored_sz and monitored_sz > 0 else Decimal("0")
+    if sz > 0 and baseline_abs is not None and baseline_abs > 0:
+        reduced = baseline_abs - live_abs
+        thresh = max(sz - lot * Decimal("2"), sz * Decimal("0.65"))
+        if thresh > 0 and reduced >= thresh - lot:
+            return True, (
+                "监控的止损算法单已不在挂单列表，且持仓张数已减少 "
+                f"{format_decimal(reduced)}（基准 {format_decimal(baseline_abs)} → 当前 {format_decimal(live_abs)}），"
+                "推断该止损已触发，结束 OKX 动态止损监控。"
+            )
+    if missing_rounds >= OKX_DYNAMIC_STOP_MISSING_ALGO_PRICE_EXIT_POLLS:
+        # 多头止损上移后 current_stop_loss 常仍低于市价；用 max(初始, 当前) 作为「已上移后的有效触发带」上沿，
+        # 避免「市价已高于当前止损线」导致永远不命中旧推断条件。
+        if current_price and current_price > 0:
+            if direction == "long":
+                ref = current_stop_loss
+                if initial_stop_loss and initial_stop_loss > 0:
+                    ref = max(initial_stop_loss, current_stop_loss)
+                if current_price <= ref:
+                    return True, (
+                        "止损算法单已长期不在挂单列表，且触发价已不高于有效止损带（初始/当前较高线），"
+                        "推断已触发或该单已结束，停止监控。"
+                    )
+            else:
+                ref = current_stop_loss
+                if initial_stop_loss and initial_stop_loss > 0:
+                    ref = min(initial_stop_loss, current_stop_loss)
+                if current_price >= ref:
+                    return True, (
+                        "止损算法单已长期不在挂单列表，且触发价已不低于有效止损带（初始/当前较低线），"
+                        "推断已触发或该单已结束，停止监控。"
+                    )
+    if missing_rounds >= OKX_DYNAMIC_STOP_MISSING_ALGO_FORCE_EXIT_POLLS:
+        return True, (
+            "止损算法单持续不在挂单列表，停止监控以免界面假死；请在交易所核对实际成交与剩余持仓。"
+        )
+    return False, None
 
 
 @dataclass(frozen=True)
@@ -205,6 +264,8 @@ class DynamicStopMonitorStepResult:
     current_stop_loss: Decimal
     next_trigger_r: int
     amend_failures: int
+    missing_algo_strikes: int = 0
+    seed_baseline_abs: Decimal | None = None
 
 
 class OrderSizeTooSmallError(RuntimeError):
@@ -2019,6 +2080,9 @@ class StrategyEngine:
         ]
         self._logger(" | ".join(pos_bits))
 
+        baseline_abs: Decimal | None = None
+        missing_algo_strikes = 0
+
         while not self._stop_event.is_set():
             try:
                 should_continue = self._monitor_exchange_dynamic_stop_once(
@@ -2029,9 +2093,12 @@ class StrategyEngine:
                     stop_loss_algo_cl_ord_id=algo_cl_norm or None,
                     stop_loss_algo_id=algo_id_norm or None,
                     current_stop_loss=current_stop_loss,
+                    initial_stop_loss=initial_stop_loss,
                     next_trigger_r=next_trigger_r,
                     risk_per_unit=risk_per_unit,
                     amend_failures=amend_failures,
+                    missing_algo_strikes=missing_algo_strikes,
+                    baseline_abs_position=baseline_abs,
                 )
             except Exception as exc:
                 if self._stop_event.is_set():
@@ -2061,6 +2128,9 @@ class StrategyEngine:
                 current_stop_loss = should_continue.current_stop_loss
                 next_trigger_r = should_continue.next_trigger_r
                 amend_failures = should_continue.amend_failures
+                missing_algo_strikes = should_continue.missing_algo_strikes
+                if should_continue.seed_baseline_abs is not None:
+                    baseline_abs = should_continue.seed_baseline_abs
                 if not should_continue.keep_monitoring:
                     return
                 self._stop_event.wait(config.poll_seconds)
@@ -2100,6 +2170,46 @@ class StrategyEngine:
         """中断由 run_takeover_exchange_dynamic_stop 或独立引擎实例触发的动态止损轮询。"""
         self._stop_event.set()
 
+    def _resolve_algo_terminated_after_missing(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        algo_id: str | None,
+        algo_cl_ord_id: str | None,
+    ) -> tuple[bool, str | None]:
+        """挂单列表中已找不到该算法止损时，向 OKX 查询单笔委托：终态或不存在则结束监控。"""
+        aid = (algo_id or "").strip()
+        acl = (algo_cl_ord_id or "").strip()
+        if not aid and not acl:
+            return False, None
+        try:
+            row = self._client.get_order_algo(
+                credentials,
+                environment=config.environment,
+                inst_id=inst_id.strip().upper(),
+                algo_id=aid or None,
+                algo_cl_ord_id=acl or None,
+            )
+        except OkxApiError as exc:
+            text = str(exc).strip()
+            code = str(getattr(exc, "code", None) or "").strip()
+            low = text.lower()
+            if code in {"51620", "51621", "51400"} or "does not exist" in low or "不存在" in text:
+                return True, (
+                    f"OKX 查询算法止损不存在或已失效（code={code or '-'}），推断已触发或已撤单，结束动态止损监控：{text}"
+                )
+            return False, None
+        if row is None:
+            return True, "OKX 查询算法止损返回空记录，推断该委托已从账户移除，结束动态止损监控。"
+        state = (row.get("state") or "").strip().lower()
+        if state in {"canceled", "order_failed", "partially_failed"}:
+            return True, (
+                f"OKX 算法止损 state={state}（algoId={row.get('algoId') or '-'}），结束动态止损监控。"
+            )
+        return False, None
+
     def _monitor_exchange_dynamic_stop_once(
         self,
         credentials: Credentials,
@@ -2110,9 +2220,12 @@ class StrategyEngine:
         stop_loss_algo_cl_ord_id: str | None,
         stop_loss_algo_id: str | None,
         current_stop_loss: Decimal,
+        initial_stop_loss: Decimal,
         next_trigger_r: int,
         risk_per_unit: Decimal,
         amend_failures: int,
+        missing_algo_strikes: int = 0,
+        baseline_abs_position: Decimal | None = None,
     ) -> DynamicStopMonitorStepResult:
         algo_ref = (
             f"algoClOrdId={stop_loss_algo_cl_ord_id}"
@@ -2127,9 +2240,77 @@ class StrategyEngine:
                 current_stop_loss=current_stop_loss,
                 next_trigger_r=next_trigger_r,
                 amend_failures=amend_failures,
+                missing_algo_strikes=0,
+                seed_baseline_abs=None,
             )
 
+        seed_snap: Decimal | None = None
+        if baseline_abs_position is None:
+            seed_snap = abs(live_position.position)
+
         direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
+        pending_tracked = self._find_pending_algo_order_for_dynamic_stop(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+            algo_id=stop_loss_algo_id,
+        )
+        next_missing = 0 if pending_tracked is not None else missing_algo_strikes + 1
+        live_abs = abs(live_position.position)
+        # 止损算法单已从挂单消失时，必须先尝试「推断已触发 / 强制收口」，再读触发价做上移逻辑。
+        # 否则 _get_trigger_price 一旦连续失败，推断分支永远走不到，界面会长期显示监控中。
+        if pending_tracked is None:
+            if next_missing >= OKX_DYNAMIC_STOP_MISSING_ALGO_MIN_POLLS:
+                term, term_msg = self._resolve_algo_terminated_after_missing(
+                    credentials,
+                    config,
+                    inst_id=trade_instrument.inst_id,
+                    algo_id=stop_loss_algo_id,
+                    algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                )
+                if term:
+                    if term_msg:
+                        self._logger(term_msg)
+                    return DynamicStopMonitorStepResult(
+                        keep_monitoring=False,
+                        current_stop_loss=current_stop_loss,
+                        next_trigger_r=next_trigger_r,
+                        amend_failures=amend_failures,
+                        missing_algo_strikes=0,
+                        seed_baseline_abs=seed_snap,
+                    )
+            infer_price = Decimal("0")
+            if next_missing >= OKX_DYNAMIC_STOP_MISSING_ALGO_PRICE_EXIT_POLLS:
+                try:
+                    infer_price = self._get_trigger_price_with_retry(
+                        trade_instrument.inst_id, config.tp_sl_trigger_type
+                    )
+                except Exception:
+                    infer_price = Decimal("0")
+            should_end, why = _dynamic_stop_infer_triggered_algo_not_in_book(
+                direction=direction,
+                live_abs=live_abs,
+                baseline_abs=baseline_abs_position,
+                monitored_sz=position.size,
+                current_price=infer_price,
+                current_stop_loss=current_stop_loss,
+                initial_stop_loss=initial_stop_loss,
+                missing_rounds=next_missing,
+                lot_size=trade_instrument.lot_size,
+            )
+            if should_end:
+                if why:
+                    self._logger(why)
+                return DynamicStopMonitorStepResult(
+                    keep_monitoring=False,
+                    current_stop_loss=current_stop_loss,
+                    next_trigger_r=next_trigger_r,
+                    amend_failures=amend_failures,
+                    missing_algo_strikes=0,
+                    seed_baseline_abs=seed_snap,
+                )
+
         current_price = self._get_trigger_price_with_retry(trade_instrument.inst_id, config.tp_sl_trigger_type)
         holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
         updated_stop_loss, next_trigger_price, updated_trigger_r, moved = _advance_dynamic_stop_live(
@@ -2155,6 +2336,8 @@ class StrategyEngine:
                 current_stop_loss=current_stop_loss,
                 next_trigger_r=next_trigger_r,
                 amend_failures=0,
+                missing_algo_strikes=next_missing,
+                seed_baseline_abs=seed_snap,
             )
 
         fresh_price = self._get_trigger_price_with_retry(trade_instrument.inst_id, config.tp_sl_trigger_type)
@@ -2181,15 +2364,11 @@ class StrategyEngine:
                 current_stop_loss=current_stop_loss,
                 next_trigger_r=next_trigger_r,
                 amend_failures=amend_failures,
+                missing_algo_strikes=next_missing,
+                seed_baseline_abs=seed_snap,
             )
 
-        algo_order = self._find_pending_algo_order_for_dynamic_stop(
-            credentials,
-            config,
-            trade_instrument=trade_instrument,
-            algo_cl_ord_id=stop_loss_algo_cl_ord_id,
-            algo_id=stop_loss_algo_id,
-        )
+        algo_order = pending_tracked
         if algo_order is None:
             self._logger(
                 " | ".join(
@@ -2206,6 +2385,8 @@ class StrategyEngine:
                 current_stop_loss=current_stop_loss,
                 next_trigger_r=next_trigger_r,
                 amend_failures=amend_failures,
+                missing_algo_strikes=next_missing,
+                seed_baseline_abs=seed_snap,
             )
 
         amend_cl_ord = (algo_order.algo_client_order_id or stop_loss_algo_cl_ord_id or "").strip() or None
@@ -2231,6 +2412,8 @@ class StrategyEngine:
                     current_stop_loss=current_stop_loss,
                     next_trigger_r=next_trigger_r,
                     amend_failures=amend_failures,
+                    missing_algo_strikes=0,
+                    seed_baseline_abs=seed_snap,
                 )
             latest_price = self._get_trigger_price_with_retry(
                 trade_instrument.inst_id,
@@ -2259,6 +2442,8 @@ class StrategyEngine:
                     current_stop_loss=current_stop_loss,
                     next_trigger_r=next_trigger_r,
                     amend_failures=amend_failures,
+                    missing_algo_strikes=next_missing,
+                    seed_baseline_abs=seed_snap,
                 )
 
             next_amend_failures = amend_failures + 1
@@ -2280,6 +2465,8 @@ class StrategyEngine:
                     current_stop_loss=current_stop_loss,
                     next_trigger_r=next_trigger_r,
                     amend_failures=next_amend_failures,
+                    missing_algo_strikes=next_missing,
+                    seed_baseline_abs=seed_snap,
                 )
             raise RuntimeError(f"OKX 动态止损上移失败：{detail}") from exc
 
@@ -2293,6 +2480,8 @@ class StrategyEngine:
             current_stop_loss=updated_stop_loss,
             next_trigger_r=updated_trigger_r,
             amend_failures=0,
+            missing_algo_strikes=0,
+            seed_baseline_abs=seed_snap,
         )
 
     def _monitor_exchange_managed_position_until_closed(
