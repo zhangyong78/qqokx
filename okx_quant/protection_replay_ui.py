@@ -195,7 +195,7 @@ class ProtectionReplayWindow:
             )
             self.window.after(0, lambda: self._apply_replay_result(points, result))
         except Exception as exc:
-            self.window.after(0, lambda: self._show_replay_error(exc))
+            self.window.after(0, lambda err=exc: self._show_replay_error(err))
 
     def _load_replay_points(self, *, bar: str, candle_limit: int) -> list[ProtectionReplayPoint]:
         option_mark_candles = self.client.get_mark_price_candles(self.protection.option_inst_id, bar, limit=candle_limit)

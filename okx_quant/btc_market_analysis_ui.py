@@ -393,7 +393,7 @@ class BtcMarketAnalysisWindow:
                     ),
                 )
             except Exception as exc:
-                self.window.after(0, lambda: self._on_analysis_error(request_token, exc))
+                self.window.after(0, lambda token=request_token, err=exc: self._on_analysis_error(token, err))
 
         threading.Thread(target=_worker, daemon=True, name="btc-market-analysis").start()
 
@@ -408,7 +408,7 @@ class BtcMarketAnalysisWindow:
                 delivered = send_btc_market_analysis_email(self._analysis)
                 self.window.after(0, lambda: self._on_email_finished(delivered))
             except Exception as exc:
-                self.window.after(0, lambda: self._on_email_error(exc))
+                self.window.after(0, lambda err=exc: self._on_email_error(err))
 
         threading.Thread(target=_worker, daemon=True, name="btc-market-email").start()
 

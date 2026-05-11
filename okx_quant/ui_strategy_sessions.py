@@ -3064,7 +3064,10 @@ class UiStrategySessionsMixin:
         try:
             result = self._perform_stop_session_cleanup(session, credentials)
         except Exception as exc:
-            self.root.after(0, lambda: self._apply_stop_session_cleanup_error(session_id, str(exc)))
+            self.root.after(
+                0,
+                lambda sid=session_id, msg=str(exc): self._apply_stop_session_cleanup_error(sid, msg),
+            )
             return
         self.root.after(0, lambda: self._apply_stop_session_cleanup_result(result))
 

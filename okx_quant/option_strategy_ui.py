@@ -1265,7 +1265,7 @@ class OptionStrategyCalculatorWindow:
                 refreshed.append((leg.inst_id, instrument, quote))
             self.window.after(0, lambda: self._apply_refreshed_leg_quotes(refreshed))
         except Exception as exc:  # noqa: BLE001
-            self.window.after(0, lambda: messagebox.showerror("刷新腿报价失败", str(exc), parent=self.window))
+            self.window.after(0, lambda msg=str(exc): messagebox.showerror("刷新腿报价失败", msg, parent=self.window))
 
     def _apply_refreshed_leg_quotes(
         self,

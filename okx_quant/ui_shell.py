@@ -2726,6 +2726,35 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
     def show_version_info(self) -> None:
         messagebox.showinfo("版本信息", build_version_info_text(), parent=self.root)
 
+    def _on_strategy_launch_form_canvas_configure(self, event) -> None:
+        canvas = self._strategy_launch_form_canvas
+        if event.width > 1:
+            canvas.itemconfigure(self._strategy_launch_form_window, width=event.width)
+
+    def _on_strategy_launch_form_inner_configure(self, _event=None) -> None:
+        canvas = self._strategy_launch_form_canvas
+        bbox = canvas.bbox("all")
+        if bbox:
+            canvas.configure(scrollregion=bbox)
+
+    def _on_strategy_launch_form_mousewheel(self, event) -> None:
+        canvas = self._strategy_launch_form_canvas
+        if getattr(event, "num", None) == 5:
+            canvas.yview_scroll(1, "units")
+            return "break"
+        if getattr(event, "num", None) == 4:
+            canvas.yview_scroll(-1, "units")
+            return "break"
+        if event.delta:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _bind_strategy_launch_form_mousewheel(self, _event=None) -> None:
+        self._strategy_launch_form_canvas.bind_all("<MouseWheel>", self._on_strategy_launch_form_mousewheel)
+
+    def _unbind_strategy_launch_form_mousewheel(self, _event=None) -> None:
+        self._strategy_launch_form_canvas.unbind_all("<MouseWheel>")
+
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=4)
@@ -2775,28 +2804,59 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         body.add(sessions_frame, weight=3)
 
         launcher_frame.columnconfigure(0, weight=1)
+        launcher_frame.rowconfigure(0, weight=1)
         launcher_frame.rowconfigure(1, weight=0)
         sessions_frame.columnconfigure(0, weight=1)
         sessions_frame.rowconfigure(0, weight=1)
 
-        start_frame = ttk.LabelFrame(launcher_frame, text="策略启动", padding=16)
-        start_frame.grid(row=0, column=0, sticky="ew")
+        _lp = (6, 0)
+        _lp_tight = (4, 0)
+        _ix = (0, 10)
+        _hint_wrap = 520
+
+        start_frame = ttk.LabelFrame(launcher_frame, text="策略启动", padding=8)
+        start_frame.grid(row=0, column=0, sticky="nsew")
+        start_frame.columnconfigure(0, weight=1)
+        start_frame.rowconfigure(0, weight=1)
+        start_frame.rowconfigure(1, weight=0)
+
+        scroll_host = ttk.Frame(start_frame)
+        scroll_host.grid(row=0, column=0, sticky="nsew")
+        scroll_host.columnconfigure(0, weight=1)
+        scroll_host.rowconfigure(0, weight=1)
+        scroll_host.bind("<Enter>", self._bind_strategy_launch_form_mousewheel)
+        scroll_host.bind("<Leave>", self._unbind_strategy_launch_form_mousewheel)
+
+        launch_canvas = Canvas(scroll_host, highlightthickness=0, borderwidth=0)
+        launch_vsb = ttk.Scrollbar(scroll_host, orient="vertical", command=launch_canvas.yview)
+        launch_canvas.configure(yscrollcommand=launch_vsb.set)
+        launch_canvas.grid(row=0, column=0, sticky="nsew")
+        launch_vsb.grid(row=0, column=1, sticky="ns")
+
+        launch_form = ttk.Frame(launch_canvas, padding=(0, 0, 4, 0))
         for column in range(4):
-            start_frame.columnconfigure(column, weight=1)
+            launch_form.columnconfigure(column, weight=1)
+        launch_window = launch_canvas.create_window((0, 0), window=launch_form, anchor="nw")
+        self._strategy_launch_form_canvas = launch_canvas
+        self._strategy_launch_form_window = launch_window
+        launch_canvas.bind("<Configure>", self._on_strategy_launch_form_canvas_configure)
+        launch_form.bind("<Configure>", self._on_strategy_launch_form_inner_configure)
+        launch_form.bind("<Button-4>", self._on_strategy_launch_form_mousewheel)
+        launch_form.bind("<Button-5>", self._on_strategy_launch_form_mousewheel)
 
         row = 0
-        ttk.Label(start_frame, text="选择策略").grid(row=row, column=0, sticky="w")
+        ttk.Label(launch_form, text="选择策略").grid(row=row, column=0, sticky="w")
         self.strategy_combo = ttk.Combobox(
-            start_frame,
+            launch_form,
             textvariable=self.strategy_name,
             values=[item.name for item in STRATEGY_DEFINITIONS],
             state="readonly",
         )
-        self.strategy_combo.grid(row=row, column=1, sticky="ew", padx=(0, 16))
+        self.strategy_combo.grid(row=row, column=1, sticky="ew", padx=_ix)
         self.strategy_combo.bind("<<ComboboxSelected>>", self._on_strategy_selected)
-        ttk.Label(start_frame, text="交易标的").grid(row=row, column=2, sticky="w")
+        ttk.Label(launch_form, text="交易标的").grid(row=row, column=2, sticky="w")
         self.symbol_combo = ttk.Combobox(
-            start_frame,
+            launch_form,
             textvariable=self.symbol,
             values=self._default_symbol_values,
             state="readonly",
@@ -2804,223 +2864,224 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.symbol_combo.grid(row=row, column=3, sticky="ew")
 
         row += 1
-        self._bar_label = ttk.Label(start_frame, text="K线周期")
-        self._bar_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self._bar_combo = ttk.Combobox(start_frame, textvariable=self.bar, values=BAR_OPTIONS, state="readonly")
-        self._bar_combo.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
-        self._signal_label = ttk.Label(start_frame, text="信号方向")
-        self._signal_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self.signal_combo = ttk.Combobox(start_frame, textvariable=self.signal_mode_label, state="readonly")
-        self.signal_combo.grid(row=row, column=3, sticky="ew", pady=(12, 0))
+        self._bar_label = ttk.Label(launch_form, text="K线周期")
+        self._bar_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._bar_combo = ttk.Combobox(launch_form, textvariable=self.bar, values=BAR_OPTIONS, state="readonly")
+        self._bar_combo.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._signal_label = ttk.Label(launch_form, text="信号方向")
+        self._signal_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self.signal_combo = ttk.Combobox(launch_form, textvariable=self.signal_mode_label, state="readonly")
+        self.signal_combo.grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
-        self._take_profit_mode_label = ttk.Label(start_frame, text="止盈方式")
-        self._take_profit_mode_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self._take_profit_mode_label = ttk.Label(launch_form, text="止盈方式")
+        self._take_profit_mode_label.grid(row=row, column=0, sticky="w", pady=_lp)
         self._take_profit_mode_combo = ttk.Combobox(
-            start_frame,
+            launch_form,
             textvariable=self.take_profit_mode_label,
             values=list(TAKE_PROFIT_MODE_OPTIONS.keys()),
             state="readonly",
         )
-        self._take_profit_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
+        self._take_profit_mode_combo.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
         self._take_profit_mode_combo.bind("<<ComboboxSelected>>", lambda *_: self._sync_dynamic_take_profit_controls())
-        self._max_entries_per_trend_label = ttk.Label(start_frame, text="每波最多开仓次数")
-        self._max_entries_per_trend_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self._max_entries_per_trend_entry = ttk.Entry(start_frame, textvariable=self.max_entries_per_trend)
-        self._max_entries_per_trend_entry.grid(row=row, column=3, sticky="ew", pady=(12, 0))
+        self._max_entries_per_trend_label = ttk.Label(launch_form, text="每波最多开仓次数")
+        self._max_entries_per_trend_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._max_entries_per_trend_entry = ttk.Entry(launch_form, textvariable=self.max_entries_per_trend)
+        self._max_entries_per_trend_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
-        self._startup_chase_window_label = ttk.Label(start_frame, text="启动追单窗口")
-        self._startup_chase_window_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self._startup_chase_window_entry = ttk.Entry(start_frame, textvariable=self.startup_chase_window_seconds)
-        self._startup_chase_window_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
+        self._startup_chase_window_label = ttk.Label(launch_form, text="启动追单窗口")
+        self._startup_chase_window_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._startup_chase_window_entry = ttk.Entry(launch_form, textvariable=self.startup_chase_window_seconds)
+        self._startup_chase_window_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
         self._startup_chase_window_hint_label = ttk.Label(
-            start_frame,
+            launch_form,
             text="0=不追单；可填秒数(如300)或时长写法(如5m、2h30m、1天)。",
         )
-        self._startup_chase_window_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
+        self._startup_chase_window_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=_lp)
 
         row += 1
         self._dynamic_two_r_break_even_check = ttk.Checkbutton(
-            start_frame,
+            launch_form,
             text="启用2R保本（2R时先移到保本位）",
             variable=self.dynamic_two_r_break_even,
         )
-        self._dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        self._dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=_lp)
 
         row += 1
         self._dynamic_fee_offset_check = ttk.Checkbutton(
-            start_frame,
+            launch_form,
             text="启用手续费偏移（按2倍Taker手续费留缓冲）",
             variable=self.dynamic_fee_offset_enabled,
         )
-        self._dynamic_fee_offset_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self._dynamic_fee_offset_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=_lp_tight)
 
         row += 1
         self._dynamic_fee_offset_hint_label = ttk.Label(
-            start_frame,
+            launch_form,
             text="提示：保本位是否叠加手续费偏移，由下方开关决定；大部分组合开启更优，默认建议开启。",
         )
         self._dynamic_fee_offset_hint_label.grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         row += 1
         self._time_stop_break_even_check = ttk.Checkbutton(
-            start_frame,
+            launch_form,
             text="启用时间保本（持仓满指定K线且已达到净保本时，上移到保本位）",
             variable=self.time_stop_break_even_enabled,
         )
-        self._time_stop_break_even_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self._time_stop_break_even_bars_label = ttk.Label(start_frame, text="时间保本K线数")
-        self._time_stop_break_even_bars_label.grid(row=row, column=2, sticky="e", pady=(8, 0))
-        self._time_stop_break_even_bars_entry = ttk.Entry(start_frame, textvariable=self.time_stop_break_even_bars)
-        self._time_stop_break_even_bars_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
+        self._time_stop_break_even_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=_lp_tight)
+        self._time_stop_break_even_bars_label = ttk.Label(launch_form, text="时间保本K线数")
+        self._time_stop_break_even_bars_label.grid(row=row, column=2, sticky="e", pady=_lp_tight)
+        self._time_stop_break_even_bars_entry = ttk.Entry(launch_form, textvariable=self.time_stop_break_even_bars)
+        self._time_stop_break_even_bars_entry.grid(row=row, column=3, sticky="ew", pady=_lp_tight)
 
         row += 1
         ttk.Label(
-            start_frame,
+            launch_form,
             textvariable=self.dynamic_protection_hint_text,
             justify="left",
-            wraplength=760,
-        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            wraplength=_hint_wrap,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         row += 1
-        ttk.Label(start_frame, text="运行模式").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(launch_form, text="运行模式").grid(row=row, column=0, sticky="w", pady=_lp)
         ttk.Combobox(
-            start_frame,
+            launch_form,
             textvariable=self.run_mode_label,
             values=list(RUN_MODE_OPTIONS.keys()),
             state="readonly",
-        ).grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
-        ttk.Label(start_frame, text="轮询秒数").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(start_frame, textvariable=self.poll_seconds).grid(row=row, column=3, sticky="ew", pady=(12, 0))
+        ).grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        ttk.Label(launch_form, text="轮询秒数").grid(row=row, column=2, sticky="w", pady=_lp)
+        ttk.Entry(launch_form, textvariable=self.poll_seconds).grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
-        self._ema_label = ttk.Label(start_frame, text="EMA小周期")
-        self._ema_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self._ema_entry = ttk.Entry(start_frame, textvariable=self.ema_period)
-        self._ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
-        self._trend_ema_label = ttk.Label(start_frame, text="EMA中周期")
-        self._trend_ema_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self._trend_ema_entry = ttk.Entry(start_frame, textvariable=self.trend_ema_period)
-        self._trend_ema_entry.grid(row=row, column=3, sticky="ew", pady=(12, 0))
+        self._ema_label = ttk.Label(launch_form, text="EMA小周期")
+        self._ema_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._ema_entry = ttk.Entry(launch_form, textvariable=self.ema_period)
+        self._ema_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._trend_ema_label = ttk.Label(launch_form, text="EMA中周期")
+        self._trend_ema_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._trend_ema_entry = ttk.Entry(launch_form, textvariable=self.trend_ema_period)
+        self._trend_ema_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
-        self._big_ema_label = ttk.Label(start_frame, text="EMA大周期")
-        self._big_ema_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self._big_ema_entry = ttk.Entry(start_frame, textvariable=self.big_ema_period)
-        self._big_ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
-        self._entry_reference_ema_label = ttk.Label(start_frame, text="参考EMA周期")
-        self._entry_reference_ema_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self._entry_reference_ema_entry = ttk.Entry(start_frame, textvariable=self.entry_reference_ema_period)
-        self._entry_reference_ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
-        self._atr_label = ttk.Label(start_frame, text="ATR 周期")
-        self._atr_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self._atr_entry = ttk.Entry(start_frame, textvariable=self.atr_period)
-        self._atr_entry.grid(row=row, column=3, sticky="ew", pady=(12, 0))
+        self._big_ema_label = ttk.Label(launch_form, text="EMA大周期")
+        self._big_ema_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._big_ema_entry = ttk.Entry(launch_form, textvariable=self.big_ema_period)
+        self._big_ema_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._atr_label = ttk.Label(launch_form, text="ATR 周期")
+        self._atr_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._atr_entry = ttk.Entry(launch_form, textvariable=self.atr_period)
+        self._atr_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        self._entry_reference_ema_label = ttk.Label(launch_form, text="参考EMA周期")
+        self._entry_reference_ema_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._entry_reference_ema_entry = ttk.Entry(launch_form, textvariable=self.entry_reference_ema_period)
+        self._entry_reference_ema_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
 
         row += 1
         ttk.Label(
-            start_frame,
+            launch_form,
             textvariable=self.trend_parameter_hint_text,
             justify="left",
-            wraplength=760,
-        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            wraplength=_hint_wrap,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         row += 1
-        self._stop_atr_label = ttk.Label(start_frame, text="止损 ATR 倍数")
-        self._stop_atr_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self._stop_atr_entry = ttk.Entry(start_frame, textvariable=self.stop_atr)
-        self._stop_atr_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
-        self._take_atr_label = ttk.Label(start_frame, text="止盈 ATR 倍数")
-        self._take_atr_label.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self._take_atr_entry = ttk.Entry(start_frame, textvariable=self.take_atr)
-        self._take_atr_entry.grid(row=row, column=3, sticky="ew", pady=(12, 0))
+        self._stop_atr_label = ttk.Label(launch_form, text="止损 ATR 倍数")
+        self._stop_atr_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._stop_atr_entry = ttk.Entry(launch_form, textvariable=self.stop_atr)
+        self._stop_atr_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._take_atr_label = ttk.Label(launch_form, text="止盈 ATR 倍数")
+        self._take_atr_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._take_atr_entry = ttk.Entry(launch_form, textvariable=self.take_atr)
+        self._take_atr_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
         ttk.Label(
-            start_frame,
+            launch_form,
             textvariable=self.launch_parameter_hint_text,
             justify="left",
-            wraplength=760,
-        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            wraplength=_hint_wrap,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         row += 1
-        ttk.Label(start_frame, text="风险金").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(start_frame, textvariable=self.risk_amount).grid(
-            row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
+        ttk.Label(launch_form, text="风险金").grid(row=row, column=0, sticky="w", pady=_lp)
+        ttk.Entry(launch_form, textvariable=self.risk_amount).grid(
+            row=row, column=1, sticky="ew", padx=_ix, pady=_lp
         )
-        ttk.Label(start_frame, text="固定数量").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(start_frame, textvariable=self.order_size).grid(row=row, column=3, sticky="ew", pady=(12, 0))
+        ttk.Label(launch_form, text="固定数量").grid(row=row, column=2, sticky="w", pady=_lp)
+        ttk.Entry(launch_form, textvariable=self.order_size).grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
         ttk.Label(
-            start_frame,
+            launch_form,
             textvariable=self.fixed_order_size_hint_text,
             justify="left",
-            wraplength=760,
-        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            wraplength=_hint_wrap,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         row += 1
         ttk.Label(
-            start_frame,
+            launch_form,
             textvariable=self.minimum_order_risk_hint_text,
             justify="left",
-            wraplength=760,
-        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            wraplength=_hint_wrap,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         row += 1
-        ttk.Label(start_frame, text="下单方向模式").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(launch_form, text="下单方向模式").grid(row=row, column=0, sticky="w", pady=_lp)
         self._entry_side_mode_combo = ttk.Combobox(
-            start_frame,
+            launch_form,
             textvariable=self.entry_side_mode_label,
             values=list(ENTRY_SIDE_MODE_OPTIONS.keys()),
             state="readonly",
         )
-        self._entry_side_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
-        ttk.Label(start_frame, text="止盈止损模式").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self._entry_side_mode_combo.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        ttk.Label(launch_form, text="止盈止损模式").grid(row=row, column=2, sticky="w", pady=_lp)
         ttk.Combobox(
-            start_frame,
+            launch_form,
             textvariable=self.tp_sl_mode_label,
             values=LAUNCHER_TP_SL_MODE_LABELS,
             state="readonly",
-        ).grid(row=row, column=3, sticky="ew", pady=(12, 0))
+        ).grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
         ttk.Label(
-            start_frame,
+            launch_form,
             textvariable=self.entry_side_mode_hint_text,
             justify="left",
-            wraplength=760,
-        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            wraplength=_hint_wrap,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         row += 1
-        ttk.Label(start_frame, text="自定义触发标的").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(launch_form, text="自定义触发标的").grid(row=row, column=0, sticky="w", pady=_lp)
         self.local_tp_sl_symbol_combo = ttk.Combobox(
-            start_frame,
+            launch_form,
             textvariable=self.local_tp_sl_symbol,
             values=self._custom_trigger_symbol_values,
             state="readonly",
         )
         self.local_tp_sl_symbol_combo.grid(
-            row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
+            row=row, column=1, sticky="ew", padx=_ix, pady=_lp
         )
 
-        row += 1
-        button_row = ttk.Frame(start_frame)
-        button_row.grid(row=row, column=0, columnspan=4, sticky="w", pady=(16, 0))
+        launch_footer = ttk.Frame(start_frame)
+        launch_footer.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        button_row = ttk.Frame(launch_footer)
+        button_row.grid(row=0, column=0, sticky="w")
         ttk.Button(button_row, text="启动", command=self.start).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(button_row, text="加载 OKX SWAP", command=self.load_symbols).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(button_row, text="导出 1小时调试", command=self.debug_hourly_values).grid(row=0, column=2)
-
-        row += 1
         ttk.Label(
-            start_frame,
+            launch_footer,
             text="API、交易模式、持仓模式和邮件通知都已移动到菜单：设置 > API 与通知设置",
-            wraplength=820,
+            wraplength=520,
             justify="left",
-        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(14, 0))
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        strategy_info = ttk.LabelFrame(launcher_frame, text="策略说明", padding=16)
+        strategy_info = ttk.LabelFrame(launcher_frame, text="策略说明", padding=12)
         strategy_info.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         strategy_info.columnconfigure(0, weight=1)
 
