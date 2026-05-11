@@ -88,24 +88,22 @@ class EngineRetryPolicy:
         )
 
     def get_trigger_price(self, inst_id: str, price_type: str) -> Decimal:
-        def _read() -> Decimal:
-            ticker = self._engine._client.get_ticker(inst_id)
-            pt = (price_type or "last").strip().lower()
-            if pt == "mark":
-                raw = ticker.mark
-            elif pt == "index":
-                raw = ticker.index
-            elif pt == "bid":
-                raw = ticker.bid
-            elif pt == "ask":
-                raw = ticker.ask
-            else:
-                raw = ticker.last
-            if raw is None:
-                raise OkxApiError(f"OKX 未返回有效触发价：{inst_id} type={price_type}")
-            return raw
+        """与 `OkxRestClient.get_trigger_price` 对齐：`mark` 在 ticker 缺字段时会回退到 public mark-price。"""
+        pt = (price_type or "last").strip().lower()
+        if pt in {"bid", "ask"}:
+            # 客户端 `get_trigger_price` 未封装 bid/ask，仍走 ticker 单次读取
+            def _read_ba() -> Decimal:
+                ticker = self._engine._client.get_ticker(inst_id)
+                raw = ticker.bid if pt == "bid" else ticker.ask
+                if raw is None:
+                    raise OkxApiError(f"OKX 未返回有效触发价：{inst_id} type={price_type}")
+                return raw
 
-        return self.call_okx_read_with_retry(f"读取触发价格 {inst_id} {price_type}", _read)
+            return self.call_okx_read_with_retry(f"读取触发价格 {inst_id} {price_type}", _read_ba)
+        return self.call_okx_read_with_retry(
+            f"读取触发价格 {inst_id} {price_type}",
+            lambda: self._engine._client.get_trigger_price(inst_id, pt),  # type: ignore[arg-type]
+        )
 
     def get_pending_orders(
         self,
