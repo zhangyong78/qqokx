@@ -186,6 +186,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
+    STRATEGY_EMA_BREAKOUT_LONG_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     StrategyDefinition,
     get_strategy_definition,
@@ -667,6 +668,11 @@ class StrategyTradeRuntimeState:
     entry_client_order_id: str = ""
     entry_price: Decimal | None = None
     size: Decimal | None = None
+    pending_entry_reference: Decimal | None = None
+    pending_stop_price: Decimal | None = None
+    pending_take_profit: Decimal | None = None
+    pending_side: str = ""
+    pending_signal: str = ""
     protective_algo_id: str = ""
     protective_algo_cl_ord_id: str = ""
     initial_stop_price: Decimal | None = None
@@ -3258,6 +3264,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         ttk.Button(control_row, text="\u5bfc\u5165\u7b56\u7565\u53c2\u6570", command=self.import_strategy_template).grid(
             row=0, column=12, padx=(8, 0)
         )
+        ttk.Button(control_row, text="恢复选中策略", command=self.recover_selected_session).grid(
+            row=0, column=13, padx=(8, 0)
+        )
 
         detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)
         detail_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
@@ -3301,6 +3310,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         )
         position_type_combo.pack(side="left", padx=(4, 0))
         position_type_combo.bind("<<ComboboxSelected>>", self._on_position_filter_changed)
+        ttk.Label(filter_compact, text="搜索").pack(side="left", padx=(10, 0))
+        position_keyword_entry = ttk.Entry(filter_compact, textvariable=self.positions_zoom_keyword, width=24)
+        position_keyword_entry.pack(side="left", padx=(4, 0))
+        position_keyword_entry.bind("<KeyRelease>", self._on_position_filter_changed)
         filter_compact.grid(row=0, column=1, sticky="w")
         ttk.Label(
             header_row,
@@ -13105,6 +13118,58 @@ def _pnl_tag(value: Decimal | None) -> str:
     if value < 0:
         return "loss"
     return "group"
+
+
+def _refresh_status_with_recovery_support(self: QuantApp) -> None:
+    running_count = 0
+    self._refresh_session_live_pnl_cache()
+    for session in self.sessions.values():
+        if session.engine.is_running:
+            if session.status != "停止中":
+                session.status = "运行中"
+                if session.runtime_status in {"待恢复", "恢复中"} and not session.last_message:
+                    session.runtime_status = "运行中"
+                if session.ended_reason in {"应用关闭", "应用关闭后待恢复接管", "恢复中", "恢复启动失败"}:
+                    session.ended_reason = ""
+            running_count += 1
+        elif session.stop_cleanup_in_progress:
+            session.status = "停止中"
+        elif session.status == "恢复中":
+            session.status = "待恢复"
+            session.runtime_status = "待恢复"
+            if session.stopped_at is None:
+                session.stopped_at = datetime.now()
+            if not session.ended_reason or session.ended_reason == "恢复中":
+                session.ended_reason = "恢复启动失败"
+        elif session.status in {"运行中", "停止中"}:
+            active_trade = getattr(session, "active_trade", None)
+            if session.recovery_supported and active_trade is not None and not active_trade.reconciliation_started:
+                session.status = "待恢复"
+                session.runtime_status = "待恢复"
+                if session.stopped_at is None:
+                    session.stopped_at = datetime.now()
+                session.ended_reason = self._session_stop_reason_text(session) or "策略异常停止，待恢复接管"
+                self._upsert_recoverable_strategy_session(session)
+            else:
+                session.status = "已停止"
+                if session.stopped_at is None:
+                    session.stopped_at = datetime.now()
+                session.ended_reason = self._session_stop_reason_text(session)
+                self._remove_recoverable_strategy_session(session.session_id)
+                self._trader_desk_handle_stopped_session(session)
+        self._upsert_session_row(session)
+        self._sync_strategy_history_from_session(session)
+
+    self.status_text.set(f"运行中策略：{running_count}")
+    self._refresh_trader_desk_runtime()
+    self._refresh_running_session_summary()
+    self._update_settings_summary()
+    self._refresh_selected_session_details()
+    self._refresh_strategy_book_window()
+    self.root.after(500, self._refresh_status)
+
+
+QuantApp._refresh_status = _refresh_status_with_recovery_support
 
 
 def run_app() -> None:

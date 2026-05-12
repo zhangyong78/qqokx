@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
@@ -1920,6 +1921,11 @@ class StrategyTradeTrackingTest(TestCase):
                 trade_inst_id="ETH-USDT-SWAP",
                 inst_id="ETH-USDT-SWAP",
                 environment="demo",
+                tp_sl_mode="exchange",
+                take_profit_mode="dynamic",
+                position_mode="long_short",
+                signal_mode="long_only",
+                strategy_id="ema_dynamic_order_long",
             ),
             active_trade=None,
             trade_count=0,
@@ -1929,6 +1935,16 @@ class StrategyTradeTrackingTest(TestCase):
             funding_total=Decimal("0"),
             net_pnl_total=Decimal("0"),
             last_close_reason="",
+            started_at=datetime(2026, 4, 23, 8, 0, 0),
+            stopped_at=None,
+            ended_reason="",
+            runtime_status="待恢复",
+            status="待恢复",
+            recovery_supported=True,
+            recovery_root_dir=None,
+            log_file_path=None,
+            last_message="",
+            engine=SimpleNamespace(is_running=False),
         )
 
     def _make_app_for_tracking(self) -> SimpleNamespace:
@@ -1940,6 +1956,15 @@ class StrategyTradeTrackingTest(TestCase):
             signal_bar_at=signal_bar_at,
         )
         app._start_session_trade_reconciliation = MagicMock()
+        app._track_session_trade_runtime_with_observed_at = (
+            lambda session, message, observed_at: QuantApp._track_session_trade_runtime_with_observed_at(
+                app,
+                session,
+                message,
+                observed_at=observed_at,
+            )
+        )
+        app._parse_strategy_log_observed_at = lambda line: QuantApp._parse_strategy_log_observed_at(line)
         return app
 
     def test_track_session_trade_runtime_captures_entry_stop_and_close_trigger(self) -> None:
@@ -1978,8 +2003,326 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(session.active_trade.entry_price, Decimal("2358.42"))
         self.assertEqual(session.active_trade.size, Decimal("0.1"))
         self.assertEqual(session.active_trade.protective_algo_cl_ord_id, "s01emaslg042300000897344")
+        self.assertEqual(session.active_trade.initial_stop_price, Decimal("2320.66"))
         self.assertEqual(session.active_trade.current_stop_price, Decimal("2320.66"))
         app._start_session_trade_reconciliation.assert_called_once()
+
+    def test_track_session_trade_runtime_captures_pending_entry_snapshot(self) -> None:
+        session = self._make_session()
+        app = self._make_app_for_tracking()
+
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "2026-04-23 08:00:00 | 准备挂单 | 方向=LONG | 开仓价=2358.42 | 数量=0.1 | 止损=2320.66",
+        )
+
+        self.assertIsNotNone(session.active_trade)
+        assert session.active_trade is not None
+        self.assertEqual(session.active_trade.pending_signal, "long")
+        self.assertEqual(session.active_trade.pending_side, "buy")
+        self.assertEqual(session.active_trade.pending_entry_reference, Decimal("2358.42"))
+        self.assertEqual(session.active_trade.pending_stop_price, Decimal("2320.66"))
+        self.assertEqual(session.active_trade.size, Decimal("0.1"))
+
+    def test_restore_session_trade_runtime_from_log_recovers_initial_stop_and_latest_stop(self) -> None:
+        session = self._make_session()
+        app = self._make_app_for_tracking()
+
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "s01.log"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "[05-10 19:23:10] [moni] [S01 EMA ETH-USDT-SWAP] 2026-05-10 19:23:10 | 挂单已提交到 OKX | ordId=1001",
+                        "[05-10 19:23:10] [moni] [S01 EMA ETH-USDT-SWAP] 2026-05-10 19:23:10 | 委托追踪 | clOrdId=s01emaent0510192310",
+                        "[05-10 19:23:11] [moni] [S01 EMA ETH-USDT-SWAP] 2026-05-10 19:23:11 | 挂单已成交 | ordId=1001 | 开仓价=2358.42 | 数量=0.1",
+                        "[05-10 19:23:11] [moni] [S01 EMA ETH-USDT-SWAP] 初始 OKX 止损已提交 | algoClOrdId=s01emaslg0510192311 | 止损=2320.66 | 启动动态上移监控",
+                        "[05-10 19:35:00] [moni] [S01 EMA ETH-USDT-SWAP] OKX 动态止损已上移 | 当前价=2380 | 新止损=2342.10 | 下一阶段=3R",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            session.log_file_path = log_path
+            restored = QuantApp._restore_session_trade_runtime_from_log(app, session)
+
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        self.assertEqual(restored.entry_order_id, "1001")
+        self.assertEqual(restored.entry_client_order_id, "s01emaent0510192310")
+        self.assertEqual(restored.entry_price, Decimal("2358.42"))
+        self.assertEqual(restored.size, Decimal("0.1"))
+        self.assertEqual(restored.protective_algo_cl_ord_id, "s01emaslg0510192311")
+        self.assertEqual(restored.initial_stop_price, Decimal("2320.66"))
+        self.assertEqual(restored.current_stop_price, Decimal("2342.10"))
+
+    def test_recover_session_starts_exchange_dynamic_takeover_when_position_exists(self) -> None:
+        session = self._make_session()
+        start_custom = MagicMock()
+        session.engine = SimpleNamespace(
+            is_running=False,
+            start_custom=start_custom,
+            _get_instrument_with_retry=lambda _inst_id: Instrument(
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                tick_size=Decimal("0.01"),
+                lot_size=Decimal("0.01"),
+                min_size=Decimal("0.01"),
+                state="live",
+            ),
+            _monitor_exchange_dynamic_stop=MagicMock(),
+            _monitor_exchange_managed_position_until_closed=MagicMock(),
+            _logger=MagicMock(),
+            _notify_error=MagicMock(),
+        )
+        session.active_trade = StrategyTradeRuntimeState(
+            round_id="S01-1",
+            opened_logged_at=datetime(2026, 5, 10, 19, 23, 11),
+            entry_order_id="1001",
+            entry_client_order_id="s01emaent0510192310",
+            entry_price=Decimal("2358.42"),
+            size=Decimal("0.1"),
+            protective_algo_cl_ord_id="s01emaslg0510192311",
+            initial_stop_price=Decimal("2320.66"),
+            current_stop_price=Decimal("2342.10"),
+        )
+
+        credentials = SimpleNamespace(profile_name="moni")
+        position = OkxPosition(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="long",
+            mgn_mode="cross",
+            position=Decimal("0.1"),
+            avail_position=Decimal("0.1"),
+            avg_price=Decimal("2358.42"),
+            mark_price=Decimal("2360"),
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy=None,
+            last_price=Decimal("2361"),
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _recoverable_strategy_sessions={},
+            _credentials_for_profile_or_none=lambda _api_name: credentials,
+            _restore_session_trade_runtime_from_log=lambda session_: session_.active_trade,
+            _load_recoverable_live_positions=lambda *_args, **_kwargs: [position],
+            _select_recoverable_live_position=lambda *_args, **_kwargs: position,
+            _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
+            _find_recoverable_protective_order=lambda *_args, **_kwargs: None,
+            _build_recoverable_strategy_session_record=lambda session_: SimpleNamespace(session_id=session_.session_id, api_name=session_.api_name),
+            _upsert_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _remove_recoverable_strategy_session=MagicMock(),
+            _log_session_message=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+
+        result = QuantApp._recover_session(app, "S01", auto=False)
+
+        self.assertTrue(result)
+        self.assertEqual(session.status, "恢复中")
+        self.assertEqual(session.runtime_status, "恢复中")
+        start_custom.assert_called_once()
+
+    def test_recover_session_falls_back_to_managed_monitor_without_log_snapshot_or_protective_order(self) -> None:
+        session = self._make_session()
+        start_custom = MagicMock()
+        session.engine = SimpleNamespace(
+            is_running=False,
+            start_custom=start_custom,
+            _get_instrument_with_retry=lambda _inst_id: Instrument(
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                tick_size=Decimal("0.01"),
+                lot_size=Decimal("0.01"),
+                min_size=Decimal("0.01"),
+                state="live",
+            ),
+            _monitor_exchange_dynamic_stop=MagicMock(),
+            _monitor_exchange_managed_position_until_closed=MagicMock(),
+            _logger=MagicMock(),
+            _notify_error=MagicMock(),
+        )
+
+        credentials = SimpleNamespace(profile_name="moni")
+        position = OkxPosition(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="long",
+            mgn_mode="cross",
+            position=Decimal("0.1"),
+            avail_position=Decimal("0.1"),
+            avg_price=Decimal("2358.42"),
+            mark_price=Decimal("2360"),
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy=None,
+            last_price=Decimal("2361"),
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _recoverable_strategy_sessions={},
+            _credentials_for_profile_or_none=lambda _api_name: credentials,
+            _restore_session_trade_runtime_from_log=lambda _session: None,
+            _load_recoverable_live_positions=lambda *_args, **_kwargs: [position],
+            _select_recoverable_live_position=lambda *_args, **_kwargs: position,
+            _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
+            _find_recoverable_protective_order=lambda *_args, **_kwargs: None,
+            _build_recoverable_strategy_session_record=lambda session_: SimpleNamespace(session_id=session_.session_id, api_name=session_.api_name),
+            _upsert_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _remove_recoverable_strategy_session=MagicMock(),
+            _log_session_message=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+
+        result = QuantApp._recover_session(app, "S01", auto=False)
+
+        self.assertTrue(result)
+        self.assertIsNotNone(session.active_trade)
+        self.assertEqual(session.active_trade.entry_price, Decimal("2358.42"))
+        self.assertEqual(session.active_trade.size, Decimal("0.1"))
+        self.assertEqual(session.ended_reason, "恢复为托管持仓监控")
+        start_custom.assert_called_once()
+
+    def test_recover_session_starts_pending_order_takeover_when_order_is_still_live(self) -> None:
+        session = self._make_session()
+        start_custom = MagicMock()
+        session.engine = SimpleNamespace(
+            is_running=False,
+            start_custom=start_custom,
+            _get_order_with_retry=lambda *_args, **_kwargs: OkxOrderStatus(
+                ord_id="1001",
+                state="live",
+                side="buy",
+                ord_type="limit",
+                price=Decimal("2358.42"),
+                avg_price=None,
+                size=Decimal("0.1"),
+                filled_size=Decimal("0"),
+                raw={},
+            ),
+            _get_instrument_with_retry=lambda _inst_id: Instrument(
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                tick_size=Decimal("0.01"),
+                lot_size=Decimal("0.01"),
+                min_size=Decimal("0.01"),
+                state="live",
+            ),
+            resume_dynamic_exchange_pending_order=MagicMock(),
+            _monitor_exchange_dynamic_stop=MagicMock(),
+            _monitor_exchange_managed_position_until_closed=MagicMock(),
+            _logger=MagicMock(),
+            _notify_error=MagicMock(),
+            _stop_event=SimpleNamespace(set=lambda: None),
+        )
+        session.active_trade = StrategyTradeRuntimeState(
+            round_id="S01-1",
+            signal_bar_at=datetime(2026, 5, 12, 14, 28, 0),
+            entry_order_id="1001",
+            entry_client_order_id="s01emaent0512142800",
+            size=Decimal("0.1"),
+            pending_entry_reference=Decimal("2358.42"),
+            pending_stop_price=Decimal("2320.66"),
+            pending_side="buy",
+            pending_signal="long",
+        )
+
+        credentials = SimpleNamespace(profile_name="moni")
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _recoverable_strategy_sessions={},
+            _credentials_for_profile_or_none=lambda _api_name: credentials,
+            _restore_session_trade_runtime_from_log=lambda session_: session_.active_trade,
+            _load_recoverable_live_positions=lambda *_args, **_kwargs: [],
+            _select_recoverable_live_position=lambda *_args, **_kwargs: None,
+            _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
+            _find_recoverable_protective_order=lambda *_args, **_kwargs: None,
+            _build_recoverable_strategy_session_record=lambda session_: SimpleNamespace(session_id=session_.session_id, api_name=session_.api_name),
+            _upsert_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _remove_recoverable_strategy_session=MagicMock(),
+            _log_session_message=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+
+        result = QuantApp._recover_session(app, "S01", auto=False)
+
+        self.assertTrue(result)
+        self.assertEqual(session.status, "恢复中")
+        self.assertEqual(session.runtime_status, "恢复中")
+        start_custom.assert_called_once()
+
+    def test_select_recoverable_live_position_requires_matching_direction_when_strategy_is_directional(self) -> None:
+        session = self._make_session()
+        session.strategy_id = "ema_dynamic_order_long"
+        session.config = SimpleNamespace(
+            trade_inst_id="ETH-USDT-SWAP",
+            inst_id="ETH-USDT-SWAP",
+            signal_mode="long_only",
+        )
+        short_position = OkxPosition(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="short",
+            mgn_mode="cross",
+            position=Decimal("-45.66"),
+            avail_position=Decimal("-45.66"),
+            avg_price=Decimal("2290.14"),
+            mark_price=Decimal("2288"),
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy=None,
+            last_price=Decimal("2288"),
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+        app = SimpleNamespace(
+            _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
+        )
+
+        selected = QuantApp._select_recoverable_live_position(app, session, [short_position])
+
+        self.assertIsNone(selected)
 
     def test_handle_stopped_watcher_pauses_trader_on_unexpected_stop(self) -> None:
         draft = TraderDraftRecord(

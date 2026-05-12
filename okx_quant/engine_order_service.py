@@ -180,6 +180,7 @@ class EngineOrderService:
                 ord_type="market",
                 pos_side=pos_side,
                 cl_ord_id=resolved_cl_ord_id,
+                reduce_only=label == "平仓报单",
             ),
         )
 

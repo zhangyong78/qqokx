@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from okx_quant.models import Credentials, StrategyConfig
 
@@ -33,6 +33,19 @@ class EngineSessionRunner:
                 args=(credentials, config),
                 daemon=True,
                 name=f"okx-{config.strategy_id}",
+            )
+            engine._thread.start()
+
+    def start_custom(self, target: Callable[[], None], *, thread_name: str) -> None:
+        engine = self._engine
+        with engine._lock:
+            if engine._thread is not None and engine._thread.is_alive():
+                raise RuntimeError("策略已经在运行中")
+            engine._stop_event.clear()
+            engine._thread = threading.Thread(
+                target=target,
+                daemon=True,
+                name=thread_name,
             )
             engine._thread.start()
 

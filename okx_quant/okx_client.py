@@ -1760,6 +1760,7 @@ class OkxRestClient:
         pos_side: str | None = None,
         price: Decimal | None = None,
         cl_ord_id: str | None = None,
+        reduce_only: bool = False,
     ) -> OkxOrderResult:
         sz_txt = format_decimal(size)
         order: dict[str, Any] = {
@@ -1778,16 +1779,35 @@ class OkxRestClient:
                 inst = None
             if inst is not None:
                 order["sz"] = _format_exchange_contract_sz(inst, size)
-                resolved_pos = self._derivative_order_pos_side(
-                    credentials,
-                    config,
-                    inst,
-                    side,
-                    plan_pos_side=pos_side,
-                )
+                if reduce_only:
+                    normalized_plan_pos = (pos_side or "").strip().lower()
+                    acct = self._get_account_config_cached(credentials, config)
+                    acct_mode = (acct.position_mode or "").strip().lower() if acct is not None else ""
+                    if acct_mode == "net_mode":
+                        resolved_pos = None
+                    elif normalized_plan_pos in {"long", "short"}:
+                        resolved_pos = normalized_plan_pos
+                    else:
+                        resolved_pos = self._derivative_order_pos_side(
+                            credentials,
+                            config,
+                            inst,
+                            side,
+                            plan_pos_side=pos_side,
+                        )
+                else:
+                    resolved_pos = self._derivative_order_pos_side(
+                        credentials,
+                        config,
+                        inst,
+                        side,
+                        plan_pos_side=pos_side,
+                    )
                 self._maybe_isolated_margin_ccy(order, instrument=inst, config=config)
         if resolved_pos:
             order["posSide"] = resolved_pos
+        if reduce_only:
+            order["reduceOnly"] = True
         if price is not None:
             if inst is not None and inst.tick_size is not None and inst.tick_size > 0:
                 px_snapped = snap_to_increment(price, inst.tick_size, "nearest")

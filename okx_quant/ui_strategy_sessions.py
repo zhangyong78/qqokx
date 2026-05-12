@@ -146,7 +146,7 @@ class UiStrategySessionsMixin:
         except Exception as exc:
             messagebox.showerror("导出失败", f"写入策略参数文件失败：{exc}")
             return
-        self._enqueue_log(f"[{session.session_id}] 已导出策略参数：{target}")
+        self._enqueue_log(f"{session.log_prefix} 已导出策略参数：{target}")
         messagebox.showinfo(
             "导出完成",
             "已导出策略参数文件。\n\n文件不包含 API 密钥，可在其他机器导入后复用当前参数。",
@@ -567,6 +567,16 @@ class UiStrategySessionsMixin:
         atr_value = atr_values[-1]
         return entry_price - atr_value if is_long else entry_price + atr_value
 
+    def _strategy_chart_line_trade_log_prefix(self, session_id: str, inst_id: str = "") -> str:
+        """实盘图划线交易主日志前缀，与 `_make_session_logger` 形态一致：``[api] [sid 划线交易 标的]``。"""
+        sess = self.sessions.get(session_id)
+        api = (getattr(sess, "api_name", None) or "").strip() if sess is not None else ""
+        sym = (inst_id or "").strip()
+        if not sym and sess is not None:
+            sym = (_session_trade_inst_id(sess) or getattr(sess, "symbol", "") or "").strip()
+        core = f"{session_id} 划线交易 {sym}".strip() if sym else f"{session_id} 划线交易"
+        return f"[{api}] [{core}]" if api else f"[{core}]"
+
     def _submit_live_chart_trade(self, session_id: str, direction: str) -> None:
         session = self.sessions.get(session_id)
         state = self._strategy_live_chart_windows.get(session_id)
@@ -661,8 +671,9 @@ class UiStrategySessionsMixin:
             state.trade_status_text.set(
                 f"已提交{('多' if direction == 'long' else '空')}单 | ordId={result.ord_id or '-'} | size={format_decimal(size)}"
             )
+        lt_pre = self._strategy_chart_line_trade_log_prefix(session.session_id, instrument.inst_id)
         self._enqueue_log(
-            f"[{session.session_id}] 划线交易已下单 | 方向={direction.upper()} | 标的={instrument.inst_id} | "
+            f"{lt_pre} 已下单 | 方向={direction.upper()} | 标的={instrument.inst_id} | "
             f"开仓价={format_decimal(entry_price)} | 止损={format_decimal(stop_price)} | 数量={format_decimal(size)} | ordId={result.ord_id or '-'}"
         )
         threading.Thread(
@@ -735,7 +746,8 @@ class UiStrategySessionsMixin:
         state = self._strategy_live_chart_windows.get(session_id)
         if state is not None and state.trade_status_text is not None:
             state.trade_status_text.set(text)
-        self._enqueue_log(f"[{session_id}] 划线交易 | {text}")
+        lt_pre = self._strategy_chart_line_trade_log_prefix(session_id)
+        self._enqueue_log(f"{lt_pre} {text}")
 
     def _mark_line_trade_started(
         self,
@@ -757,8 +769,9 @@ class UiStrategySessionsMixin:
             state.trade_status_text.set(
                 f"已成交，启动动态管理 | entry={format_decimal(entry_price)} stop={format_decimal(stop_price)}"
             )
+        lt_pre = self._strategy_chart_line_trade_log_prefix(session_id, instrument.inst_id)
         self._enqueue_log(
-            f"[{session_id}] 划线交易成交 | ordId={ord_id or '-'} | side={side} | entry={format_decimal(entry_price)} | stop={format_decimal(stop_price)}"
+            f"{lt_pre} 已成交 | ordId={ord_id or '-'} | side={side} | entry={format_decimal(entry_price)} | stop={format_decimal(stop_price)}"
         )
         direction = "long" if side == "buy" else "short"
         risk_per_unit = abs(entry_price - stop_price)
@@ -773,16 +786,24 @@ class UiStrategySessionsMixin:
             direction=direction,
             candle_ts=int(time.time() * 1000),
         )
+        sess = self.sessions.get(session_id)
+        chart_line_logger = self._make_session_logger(
+            session_id,
+            "划线交易",
+            instrument.inst_id,
+            api_name=(sess.api_name if sess else "") or "",
+            log_file_path=(sess.log_file_path if sess else None),
+        )
         engine = StrategyEngine(
             self.client,
-            lambda message: self.root.after(0, lambda text=message: self._enqueue_log(f"[{session_id}] 划线交易监控 | {text}")),
+            chart_line_logger,
             notifier=self._build_notifier(config),
-            strategy_name=f"{session_id} 划线交易",
+            strategy_name="划线交易",
             session_id=session_id,
             direction_label="只做多" if direction == "long" else "只做空",
             run_mode_label="交易并下单",
             trader_id="LINE",
-            api_name=(self.sessions.get(session_id).api_name if self.sessions.get(session_id) else ""),
+            api_name=(sess.api_name if sess else "") or "",
         )
         position = FilledPosition(
             ord_id=ord_id or cl_ord_id,
@@ -2633,7 +2654,7 @@ class UiStrategySessionsMixin:
             if session is None:
                 continue
             if session.config.run_mode != "signal_only":
-                self._enqueue_log(f"[{session.session_id}] 仅支持由信号观察台停止 signal_only 会话。")
+                self._enqueue_log(f"{session.log_prefix} 仅支持由信号观察台停止 signal_only 会话。")
                 continue
             if session.stop_cleanup_in_progress:
                 continue
@@ -2783,6 +2804,8 @@ class UiStrategySessionsMixin:
             config=config,
             started_at=session_started_at,
             log_file_path=session_log_path,
+            recovery_root_dir=session_log_path.parent,
+            recovery_supported=self._strategy_session_supports_recovery(config),
             trader_id=trader_id.strip(),
             trader_slot_id=trader_slot_id.strip(),
         )
@@ -4883,8 +4906,937 @@ class UiStrategySessionsMixin:
 
     def _recover_session(self, session_id: str, *, auto: bool) -> bool:
         if not auto:
-            self._enqueue_log(f"[{session_id}] 旧版恢复接管逻辑已下线。")
+            sess = self.sessions.get(session_id)
+            pre = sess.log_prefix if sess is not None else f"[{session_id}]"
+            self._enqueue_log(f"{pre} 旧版恢复接管逻辑已下线。")
         return False
+
+    @staticmethod
+    def _strategy_session_supports_recovery(config: StrategyConfig) -> bool:
+        return (
+            str(getattr(config, "run_mode", "") or "").strip().lower() == "trade"
+            and str(getattr(config, "tp_sl_mode", "") or "").strip().lower() == "exchange"
+        )
+
+    @staticmethod
+    def _parse_strategy_log_observed_at(line: str) -> datetime | None:
+        match = re.match(r"^\[(?P<ts>(?:\d{4}-)?\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]", str(line or "").strip())
+        if match is None:
+            return None
+        raw = match.group("ts")
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%m-%d %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+            if fmt == "%m-%d %H:%M:%S":
+                return parsed.replace(year=datetime.now().year)
+            return parsed
+        return None
+
+    def _track_session_trade_runtime_with_observed_at(
+        self,
+        session: StrategySession,
+        message: str,
+        *,
+        observed_at: datetime,
+    ) -> None:
+        signal_bar_at = _extract_session_bar_time(message)
+        if "挂单已提交到 OKX" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            entry_order_id = _extract_log_field(message, "ordId")
+            if entry_order_id:
+                trade.entry_order_id = entry_order_id
+            return
+        if "委托追踪" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            client_order_id = _extract_log_field(message, "clOrdId")
+            if client_order_id:
+                trade.entry_client_order_id = client_order_id
+            return
+        if "挂单已成交" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            trade.opened_logged_at = observed_at
+            entry_order_id = _extract_log_field(message, "ordId")
+            if entry_order_id:
+                trade.entry_order_id = entry_order_id
+            entry_price = _extract_log_field_decimal(message, "开仓价")
+            if entry_price is not None:
+                trade.entry_price = entry_price
+            size = _extract_log_field_decimal(message, "数量")
+            if size is not None:
+                trade.size = size
+            QuantApp._trader_desk_sync_open_trade_state(self, session)
+            return
+        if "交易员虚拟止损监控启动" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            stop_price = _extract_log_field_decimal(message, "策略止损")
+            if stop_price is not None:
+                if trade.initial_stop_price is None:
+                    trade.initial_stop_price = stop_price
+                trade.current_stop_price = stop_price
+            return
+        if "交易员动态止盈保护价已上移" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            new_stop = _extract_log_field_decimal(message, "新保护价") or _extract_log_field_decimal(message, "保护价")
+            if new_stop is not None:
+                trade.current_stop_price = new_stop
+            return
+        if "交易员虚拟止损已触发（不平仓）" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            stop_price = _extract_log_field_decimal(message, "策略止损")
+            if stop_price is not None:
+                trade.current_stop_price = stop_price
+            return
+        if "初始 OKX 止损已提交" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            algo_cl_ord_id = _extract_log_field(message, "algoClOrdId")
+            if algo_cl_ord_id:
+                trade.protective_algo_cl_ord_id = algo_cl_ord_id
+            stop_price = _extract_log_field_decimal(message, "止损")
+            if stop_price is not None:
+                if trade.initial_stop_price is None:
+                    trade.initial_stop_price = stop_price
+                trade.current_stop_price = stop_price
+            return
+        if "OKX 动态止损已上移" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            new_stop = _extract_log_field_decimal(message, "新止损") or _extract_log_field_decimal(message, "止损")
+            if new_stop is not None:
+                trade.current_stop_price = new_stop
+            return
+        if "本轮持仓已结束，继续监控下一次信号。" in message:
+            trade = session.active_trade
+            if trade is None or trade.reconciliation_started:
+                return
+            trade.reconciliation_started = True
+            self._start_session_trade_reconciliation(session, trade)
+
+    def _track_session_trade_runtime(self, session: StrategySession, message: str) -> None:
+        self._track_session_trade_runtime_with_observed_at(
+            session,
+            message,
+            observed_at=datetime.now(),
+        )
+
+    def _start_session_trade_reconciliation(
+        self,
+        session: StrategySession,
+        trade: StrategyTradeRuntimeState,
+    ) -> None:
+        credentials = self._credentials_for_profile_or_none(session.api_name)
+        if credentials is None:
+            self._log_session_message(
+                session,
+                "检测到仓位已关闭，但未找到该会话对应的 API 凭证，无法自动归因与结算。",
+            )
+            if session.active_trade is not None and session.active_trade.round_id == trade.round_id:
+                session.active_trade = None
+            return
+        self._log_session_message(
+            session,
+            f"检测到仓位已关闭，开始归因 | 最近保护单={trade.protective_algo_cl_ord_id or '-'}",
+        )
+        trade_snapshot = StrategyTradeRuntimeState(
+            round_id=trade.round_id,
+            signal_bar_at=trade.signal_bar_at,
+            opened_logged_at=trade.opened_logged_at,
+            entry_order_id=trade.entry_order_id,
+            entry_client_order_id=trade.entry_client_order_id,
+            entry_price=trade.entry_price,
+            size=trade.size,
+            protective_algo_id=trade.protective_algo_id,
+            protective_algo_cl_ord_id=trade.protective_algo_cl_ord_id,
+            initial_stop_price=trade.initial_stop_price,
+            current_stop_price=trade.current_stop_price,
+            reconciliation_started=True,
+        )
+        threading.Thread(
+            target=self._reconcile_session_trade_worker,
+            args=(session.session_id, trade_snapshot, credentials),
+            daemon=True,
+        ).start()
+
+    def _restore_session_trade_runtime_from_log(self, session: StrategySession) -> StrategyTradeRuntimeState | None:
+        log_path = _coerce_log_file_path(session.log_file_path)
+        if log_path is None or not log_path.exists() or not log_path.is_file():
+            return session.active_trade
+        try:
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+        except Exception as exc:
+            self._enqueue_log(f"{session.log_prefix} 读取独立日志失败：{exc}")
+            return session.active_trade
+        session.active_trade = None
+        for line in lines:
+            text = str(line or "").strip()
+            if not text:
+                continue
+            observed_at = self._parse_strategy_log_observed_at(text) or session.started_at or datetime.now()
+            self._track_session_trade_runtime_with_observed_at(
+                session,
+                text,
+                observed_at=observed_at,
+            )
+        return session.active_trade
+
+    @staticmethod
+    def _recoverable_position_direction(position: OkxPosition) -> Literal["long", "short"] | None:
+        pos_side = str(position.pos_side or "").strip().lower()
+        if pos_side == "long":
+            return "long"
+        if pos_side == "short":
+            return "short"
+        if position.position > 0:
+            return "long"
+        if position.position < 0:
+            return "short"
+        return None
+
+    def _load_recoverable_live_positions(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_type: str,
+    ) -> list[OkxPosition]:
+        try:
+            return self.client.get_positions(credentials, environment=config.environment, inst_type=inst_type)
+        except Exception as exc:
+            message = str(exc)
+            if "50101" not in message or "current environment" not in message:
+                raise
+            alternate = "live" if config.environment == "demo" else "demo"
+            return self.client.get_positions(credentials, environment=alternate, inst_type=inst_type)
+
+    @staticmethod
+    def _recoverable_protective_order_direction(order: OkxTradeOrderItem) -> Literal["long", "short"] | None:
+        pos_side = str(order.pos_side or "").strip().lower()
+        if pos_side == "long":
+            return "long"
+        if pos_side == "short":
+            return "short"
+        side = str(order.side or order.actual_side or "").strip().lower()
+        if side == "sell":
+            return "long"
+        if side == "buy":
+            return "short"
+        return None
+
+    def _load_recoverable_pending_orders(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_type: str,
+    ) -> list[OkxTradeOrderItem]:
+        try:
+            return self.client.get_pending_orders(
+                credentials,
+                environment=config.environment,
+                inst_types=(inst_type,),
+                limit=200,
+            )
+        except Exception as exc:
+            message = str(exc)
+            if "50101" not in message or "current environment" not in message:
+                raise
+            alternate = "live" if config.environment == "demo" else "demo"
+            return self.client.get_pending_orders(
+                credentials,
+                environment=alternate,
+                inst_types=(inst_type,),
+                limit=200,
+            )
+
+    def _find_recoverable_protective_order(
+        self,
+        credentials: Credentials,
+        session: StrategySession,
+        *,
+        inst_type: str,
+        inst_id: str,
+        direction: Literal["long", "short"],
+    ) -> OkxTradeOrderItem | None:
+        try:
+            pending_orders = self._load_recoverable_pending_orders(
+                credentials,
+                session.config,
+                inst_type=inst_type,
+            )
+        except Exception:
+            return None
+        candidates = []
+        for item in pending_orders:
+            if str(item.inst_id or "").strip().upper() != inst_id:
+                continue
+            if (str(item.source_kind or "").strip().lower() != "algo"):
+                continue
+            if (item.stop_loss_trigger_price or item.trigger_price) is None:
+                continue
+            if not ((item.algo_id or "").strip() or (item.algo_client_order_id or "").strip()):
+                continue
+            item_direction = self._recoverable_protective_order_direction(item)
+            if item_direction is not None and item_direction != direction:
+                continue
+            candidates.append(item)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
+        return candidates[0]
+
+    def _select_recoverable_live_position(
+        self,
+        session: StrategySession,
+        positions: list[OkxPosition],
+    ) -> OkxPosition | None:
+        trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or "").strip().upper()
+        candidates = [
+            item
+            for item in positions
+            if item.inst_id.strip().upper() == trade_inst_id
+            and (item.avail_position if item.avail_position not in {None, Decimal("0")} else item.position) != 0
+        ]
+        if not candidates:
+            return None
+        preferred_direction: Literal["long", "short"] | None = None
+        strategy_id = str(session.strategy_id or "").strip()
+        if strategy_id in {STRATEGY_DYNAMIC_LONG_ID, STRATEGY_EMA_BREAKOUT_LONG_ID}:
+            preferred_direction = "long"
+        elif strategy_id in {STRATEGY_DYNAMIC_SHORT_ID, STRATEGY_EMA_BREAKDOWN_SHORT_ID}:
+            preferred_direction = "short"
+        else:
+            signal_mode = resolve_dynamic_signal_mode(strategy_id, session.config.signal_mode)
+            if signal_mode == "long_only":
+                preferred_direction = "long"
+            elif signal_mode == "short_only":
+                preferred_direction = "short"
+        if preferred_direction is not None:
+            directional = [item for item in candidates if self._recoverable_position_direction(item) == preferred_direction]
+            if not directional:
+                return None
+            candidates = directional
+        if len(candidates) == 1:
+            return candidates[0]
+        candidates.sort(
+            key=lambda item: abs(item.avail_position if item.avail_position not in {None, Decimal("0")} else item.position),
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
+
+    def _load_recoverable_strategy_sessions_registry(self) -> None:
+        self._recoverable_strategy_sessions = {}
+        try:
+            snapshot = load_recoverable_strategy_sessions_snapshot()
+        except Exception as exc:
+            self._enqueue_log(f"加载可恢复策略注册表失败：{exc}")
+            return
+        for payload in snapshot.get("sessions", []):
+            if not isinstance(payload, dict):
+                continue
+            record = self._recoverable_strategy_record_from_payload(payload)
+            if record is None or not record.session_id:
+                continue
+            self._recoverable_strategy_sessions[record.session_id] = record
+
+    def _save_recoverable_strategy_sessions_registry(self) -> None:
+        try:
+            save_recoverable_strategy_sessions_snapshot(
+                [self._recoverable_strategy_record_payload(record) for record in self._recoverable_strategy_sessions.values()]
+            )
+        except Exception as exc:
+            self._enqueue_log(f"保存可恢复策略注册表失败：{exc}")
+
+    def _build_recoverable_strategy_session_record(
+        self,
+        session: StrategySession,
+    ) -> RecoverableStrategySessionRecord | None:
+        if not session.recovery_supported:
+            return None
+        recovery_root_dir = _coerce_log_file_path(session.recovery_root_dir) or (
+            session.log_file_path.parent if session.log_file_path is not None else None
+        )
+        if recovery_root_dir is None:
+            return None
+        return RecoverableStrategySessionRecord(
+            session_id=session.session_id,
+            api_name=session.api_name,
+            strategy_id=session.strategy_id,
+            strategy_name=session.strategy_name,
+            symbol=session.symbol,
+            direction_label=session.direction_label,
+            run_mode_label=session.run_mode_label,
+            started_at=session.started_at,
+            history_record_id=session.history_record_id or "",
+            log_file_path=_coerce_log_file_path(session.log_file_path),
+            recovery_root_dir=recovery_root_dir,
+            config_snapshot=_serialize_strategy_config_snapshot(session.config),
+            updated_at=datetime.now(),
+        )
+
+    def _upsert_recoverable_strategy_session(self, session: StrategySession) -> None:
+        record = self._build_recoverable_strategy_session_record(session)
+        if record is None:
+            return
+        self._recoverable_strategy_sessions[record.session_id] = record
+        self._save_recoverable_strategy_sessions_registry()
+
+    def _remove_recoverable_strategy_session(self, session_id: str) -> None:
+        if self._recoverable_strategy_sessions.pop(session_id, None) is not None:
+            self._save_recoverable_strategy_sessions_registry()
+
+    def _hydrate_recoverable_strategy_sessions(self) -> None:
+        for record in list(self._recoverable_strategy_sessions.values()):
+            if record.session_id in self.sessions:
+                continue
+            config = _deserialize_strategy_config_snapshot(record.config_snapshot)
+            if config is None:
+                continue
+            try:
+                definition = get_strategy_definition(record.strategy_id)
+            except Exception:
+                continue
+            notifier = self._build_notifier(config)
+            session_notifier = self._build_session_notifier(config, record.session_id) if notifier is not None else None
+            session_symbol = record.symbol or self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
+            engine = self._create_session_engine(
+                strategy_id=record.strategy_id,
+                strategy_name=record.strategy_name or definition.name,
+                session_id=record.session_id,
+                symbol=session_symbol,
+                api_name=record.api_name,
+                log_file_path=record.log_file_path,
+                notifier=session_notifier,
+                direction_label=record.direction_label or definition.default_signal_label,
+                run_mode_label=record.run_mode_label or _reverse_lookup_label(RUN_MODE_OPTIONS, config.run_mode, ""),
+            )
+            session = StrategySession(
+                session_id=record.session_id,
+                api_name=record.api_name,
+                strategy_id=record.strategy_id,
+                strategy_name=record.strategy_name or definition.name,
+                symbol=session_symbol,
+                direction_label=record.direction_label or definition.default_signal_label,
+                run_mode_label=record.run_mode_label or _reverse_lookup_label(RUN_MODE_OPTIONS, config.run_mode, ""),
+                engine=engine,
+                config=config,
+                started_at=record.started_at,
+                status="待恢复",
+                history_record_id=record.history_record_id or None,
+                stopped_at=record.updated_at or record.started_at,
+                ended_reason="应用关闭后待恢复接管",
+                log_file_path=record.log_file_path,
+                runtime_status="待恢复",
+                recovery_root_dir=record.recovery_root_dir,
+                recovery_supported=self._strategy_session_supports_recovery(config),
+            )
+            self.sessions[record.session_id] = session
+            self._update_session_counter_from_session_id(record.session_id)
+            self._upsert_session_row(session)
+            self._sync_strategy_history_from_session(session)
+
+    def _attempt_auto_restore_recoverable_sessions(self) -> None:
+        for session_id in list(self._recoverable_strategy_sessions.keys()):
+            self._recover_session(session_id, auto=True)
+
+    def recover_selected_session(self) -> None:
+        session = self._selected_session()
+        if session is None:
+            messagebox.showinfo("提示", "请先在右侧选择一条待恢复会话。", parent=self.root)
+            return
+        if not self._recover_session(session.session_id, auto=False):
+            self._refresh_selected_session_details()
+
+    def _recover_session(self, session_id: str, *, auto: bool) -> bool:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return False
+        record = self._recoverable_strategy_sessions.get(session_id)
+        if record is None:
+            record = self._build_recoverable_strategy_session_record(session)
+            if record is not None:
+                self._recoverable_strategy_sessions[session_id] = record
+        if not session.recovery_supported:
+            if not auto:
+                self._enqueue_log(f"{session.log_prefix} 当前会话不支持恢复接管。")
+            return False
+        if session.engine.is_running:
+            return True
+        credentials = self._credentials_for_profile_or_none(session.api_name or (record.api_name if record is not None else ""))
+        if credentials is None:
+            if not auto:
+                self._enqueue_log(f"{session.log_prefix} 未找到该会话对应的 API 凭证，无法恢复接管。")
+            return False
+        trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or session.symbol).strip().upper()
+        if not trade_inst_id:
+            if not auto:
+                self._enqueue_log(f"{session.log_prefix} 缺少交易标的，无法恢复接管。")
+            return False
+        try:
+            inst_type = infer_inst_type(trade_inst_id)
+            positions = self._load_recoverable_live_positions(credentials, session.config, inst_type=inst_type)
+            live_position = self._select_recoverable_live_position(session, positions)
+        except Exception as exc:
+            if not auto:
+                self._enqueue_log(f"{session.log_prefix} 读取当前持仓失败，暂时无法恢复接管：{exc}")
+            return False
+        trade = self._restore_session_trade_runtime_from_log(session) or session.active_trade
+        if live_position is None:
+            pending_signal = str(trade.pending_signal or "").strip().lower() if trade is not None else ""
+            pending_side = str(trade.pending_side or "").strip().lower() if trade is not None else ""
+            can_recover_pending_entry = (
+                trade is not None
+                and trade.opened_logged_at is None
+                and bool((trade.entry_order_id or "").strip() or (trade.entry_client_order_id or "").strip())
+                and trade.pending_entry_reference is not None
+                and trade.pending_stop_price is not None
+                and trade.size is not None
+                and pending_signal in {"long", "short"}
+                and pending_side in {"buy", "sell"}
+            )
+            if can_recover_pending_entry:
+                try:
+                    pending_status = session.engine._get_order_with_retry(
+                        credentials,
+                        session.config,
+                        inst_id=trade_inst_id,
+                        ord_id=(trade.entry_order_id or "").strip() or None,
+                        cl_ord_id=(trade.entry_client_order_id or "").strip() or None,
+                    )
+                except Exception as exc:
+                    if not auto:
+                        self._enqueue_log(f"{session.log_prefix} 回查未成交挂单失败，暂时无法恢复接管：{exc}")
+                    return False
+                pending_state = str(pending_status.state or "").strip().lower()
+                if pending_state == "filled":
+                    try:
+                        positions = self._load_recoverable_live_positions(credentials, session.config, inst_type=inst_type)
+                        live_position = self._select_recoverable_live_position(session, positions)
+                    except Exception:
+                        live_position = None
+                if pending_state == "live":
+                    try:
+                        trade_instrument = session.engine._get_instrument_with_retry(trade_inst_id)
+                    except Exception as exc:
+                        if not auto:
+                            self._enqueue_log(f"{session.log_prefix} 读取交易标的信息失败，无法恢复挂单接管：{exc}")
+                        return False
+
+                    def _monitor_pending() -> None:
+                        session.engine._logger(
+                            "检测到现有 OKX 未成交挂单，开始恢复动态挂单接管"
+                            f" | 标的={trade_inst_id}"
+                            f" | ordId={trade.entry_order_id or '-'}"
+                            f" | clOrdId={trade.entry_client_order_id or '-'}"
+                            f" | 方向={pending_signal.upper()}"
+                            f" | 数量={format_decimal(trade.size)}"
+                            f" | 挂单价={format_decimal(trade.pending_entry_reference)}"
+                        )
+                        session.engine.resume_dynamic_exchange_pending_order(
+                            credentials,
+                            session.config,
+                            trade_instrument,
+                            ord_id=(pending_status.ord_id or trade.entry_order_id or "").strip(),
+                            cl_ord_id=(trade.entry_client_order_id or "").strip() or None,
+                            candle_ts=int((trade.signal_bar_at or session.started_at).timestamp() * 1000),
+                            entry_reference=trade.pending_entry_reference,
+                            stop_loss=trade.pending_stop_price,
+                            take_profit=trade.pending_take_profit or trade.pending_entry_reference,
+                            size=trade.size,
+                            side=pending_side,
+                            signal=pending_signal,
+                            stop_loss_algo_cl_ord_id=(trade.protective_algo_cl_ord_id or "").strip() or None,
+                            stop_loss_algo_id=(trade.protective_algo_id or "").strip() or None,
+                        )
+
+                    def _run_pending_recovery() -> None:
+                        try:
+                            _monitor_pending()
+                        except Exception as exc:
+                            session.engine._notify_error(session.config, str(exc))
+                            session.engine._logger(f"策略停止，原因：{exc}")
+                        finally:
+                            session.engine._stop_event.set()
+
+                    session.active_trade = trade
+                    session.status = "恢复中"
+                    session.runtime_status = "恢复中"
+                    session.stopped_at = None
+                    session.ended_reason = "恢复中"
+                    self._upsert_recoverable_strategy_session(session)
+                    self._upsert_session_row(session)
+                    self._sync_strategy_history_from_session(session)
+                    try:
+                        session.engine.start_custom(
+                            _run_pending_recovery,
+                            thread_name=f"okx-{session.config.strategy_id}-recover-pending",
+                        )
+                    except Exception as exc:
+                        session.status = "待恢复"
+                        session.runtime_status = "待恢复"
+                        session.stopped_at = datetime.now()
+                        session.ended_reason = "恢复启动失败"
+                        self._upsert_session_row(session)
+                        self._sync_strategy_history_from_session(session)
+                        if not auto:
+                            self._enqueue_log(f"{session.log_prefix} 恢复挂单接管启动失败：{exc}")
+                        return False
+                    return True
+            if trade is None and not auto:
+                self._enqueue_log(f"{session.log_prefix} 未能从独立日志恢复最近一笔持仓快照，且当前未检测到可接管仓位。")
+            session.status = "已停止"
+            session.runtime_status = "已停止"
+            session.stopped_at = datetime.now()
+            session.ended_reason = "恢复时未检测到可接管仓位"
+            self._remove_recoverable_strategy_session(session.session_id)
+            self._upsert_session_row(session)
+            self._sync_strategy_history_from_session(session)
+            self._log_session_message(session, "恢复接管结束：当前未检测到可接管仓位。")
+            return False
+        try:
+            trade_instrument = session.engine._get_instrument_with_retry(trade_inst_id)
+        except Exception as exc:
+            if not auto:
+                self._enqueue_log(f"{session.log_prefix} 读取交易标的信息失败，无法恢复接管：{exc}")
+            return False
+        direction = self._recoverable_position_direction(live_position)
+        if direction is None:
+            if not auto:
+                self._enqueue_log(f"{session.log_prefix} 无法判断当前持仓方向，恢复接管已跳过。")
+            return False
+        if trade is None:
+            trade = StrategyTradeRuntimeState(
+                round_id=f"{session.session_id}-recovered-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
+                opened_logged_at=session.started_at or datetime.now(),
+                entry_price=live_position.avg_price or live_position.mark_price or live_position.last_price,
+                size=abs(
+                    live_position.avail_position
+                    if live_position.avail_position not in {None, Decimal("0")}
+                    else live_position.position
+                ),
+            )
+        entry_price = trade.entry_price or live_position.avg_price or live_position.mark_price or live_position.last_price
+        if entry_price is None or entry_price <= 0:
+            if not auto:
+                self._enqueue_log(f"{session.log_prefix} 缺少有效开仓价，恢复接管已跳过。")
+            return False
+        size = abs(live_position.avail_position if live_position.avail_position not in {None, Decimal('0')} else live_position.position)
+        position = FilledPosition(
+            ord_id=trade.entry_order_id or f"recovered-{session.session_id}",
+            cl_ord_id=trade.entry_client_order_id or None,
+            inst_id=trade_inst_id,
+            side="buy" if direction == "long" else "sell",
+            close_side="sell" if direction == "long" else "buy",
+            pos_side=direction if session.config.position_mode == "long_short" else None,
+            size=size,
+            entry_price=entry_price,
+            entry_ts=int((trade.opened_logged_at or session.started_at).timestamp() * 1000),
+        )
+        take_profit_mode = str(session.config.take_profit_mode or "").strip().lower()
+        fallback_to_managed_monitor = False
+        if take_profit_mode == "dynamic":
+            protective_order = self._find_recoverable_protective_order(
+                credentials,
+                session,
+                inst_type=inst_type,
+                inst_id=trade_inst_id,
+                direction=direction,
+            )
+            if protective_order is not None:
+                stop_price = protective_order.stop_loss_trigger_price or protective_order.trigger_price
+                if stop_price is not None:
+                    if trade.initial_stop_price is None:
+                        trade.initial_stop_price = stop_price
+                    if trade.current_stop_price is None:
+                        trade.current_stop_price = stop_price
+                if not trade.protective_algo_id:
+                    trade.protective_algo_id = (protective_order.algo_id or "").strip() or None
+                if not trade.protective_algo_cl_ord_id:
+                    trade.protective_algo_cl_ord_id = (
+                        (protective_order.algo_client_order_id or protective_order.client_order_id or "").strip() or None
+                    )
+            if trade.initial_stop_price is None or not (trade.protective_algo_id or trade.protective_algo_cl_ord_id):
+                fallback_to_managed_monitor = True
+                start_message = (
+                    "检测到现有 OKX 仓位，但未找到可接管的止损算法单，恢复为托管持仓监控"
+                    f" | 标的={trade_inst_id}"
+                    f" | 方向={direction.upper()}"
+                    f" | 数量={format_decimal(size)}"
+                )
+
+                def _monitor() -> None:
+                    session.engine._monitor_exchange_managed_position_until_closed(
+                        credentials,
+                        session.config,
+                        trade_instrument=trade_instrument,
+                        position=position,
+                    )
+            else:
+                start_message = (
+                    "检测到现有 OKX 仓位，开始恢复动态止损接管"
+                    f" | 标的={trade_inst_id}"
+                    f" | 方向={direction.upper()}"
+                    f" | 数量={format_decimal(size)}"
+                    f" | 当前止损={format_decimal(trade.current_stop_price or trade.initial_stop_price)}"
+                    f" | algoClOrdId={trade.protective_algo_cl_ord_id or '-'}"
+                )
+
+                def _monitor() -> None:
+                    session.engine._monitor_exchange_dynamic_stop(
+                        credentials,
+                        session.config,
+                        trade_instrument=trade_instrument,
+                        position=position,
+                        initial_stop_loss=trade.initial_stop_price,
+                        stop_loss_algo_cl_ord_id=trade.protective_algo_cl_ord_id,
+                        stop_loss_algo_id=trade.protective_algo_id,
+                    )
+        else:
+            start_message = (
+                "检测到现有 OKX 仓位，开始恢复托管持仓监控"
+                f" | 标的={trade_inst_id}"
+                f" | 方向={direction.upper()}"
+                f" | 数量={format_decimal(size)}"
+            )
+
+            def _monitor() -> None:
+                session.engine._monitor_exchange_managed_position_until_closed(
+                    credentials,
+                    session.config,
+                    trade_instrument=trade_instrument,
+                    position=position,
+                )
+
+        def _run_recovery() -> None:
+            try:
+                session.engine._logger(start_message)
+                _monitor()
+            except Exception as exc:
+                session.engine._notify_error(session.config, str(exc))
+                session.engine._logger(f"策略停止，原因：{exc}")
+            finally:
+                session.engine._stop_event.set()
+
+        session.active_trade = trade
+        session.status = "恢复中"
+        session.runtime_status = "恢复中"
+        session.stopped_at = None
+        session.ended_reason = "恢复为托管持仓监控" if fallback_to_managed_monitor else "恢复中"
+        self._upsert_recoverable_strategy_session(session)
+        self._upsert_session_row(session)
+        self._sync_strategy_history_from_session(session)
+        try:
+            session.engine.start_custom(
+                _run_recovery,
+                thread_name=f"okx-{session.config.strategy_id}-recover",
+            )
+        except Exception as exc:
+            session.status = "待恢复"
+            session.runtime_status = "待恢复"
+            session.stopped_at = datetime.now()
+            session.ended_reason = "恢复启动失败"
+            self._upsert_session_row(session)
+            self._sync_strategy_history_from_session(session)
+            if not auto:
+                self._enqueue_log(f"{session.log_prefix} 恢复接管启动失败：{exc}")
+            return False
+        return True
+
+    def _track_session_trade_runtime_with_observed_at(
+        self,
+        session: StrategySession,
+        message: str,
+        *,
+        observed_at: datetime,
+    ) -> None:
+        signal_bar_at = _extract_session_bar_time(message)
+        if "准备挂单" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            entry_reference = _extract_log_field_decimal(message, "开仓价")
+            if entry_reference is not None:
+                trade.pending_entry_reference = entry_reference
+            stop_price = _extract_log_field_decimal(message, "止损")
+            if stop_price is not None:
+                trade.pending_stop_price = stop_price
+            take_profit = _extract_log_field_decimal(message, "止盈")
+            if take_profit is not None:
+                trade.pending_take_profit = take_profit
+            size = _extract_log_field_decimal(message, "数量")
+            if size is not None:
+                trade.size = size
+            direction = _extract_log_field(message, "方向")
+            if direction:
+                direction_norm = direction.strip().lower()
+                if direction_norm in {"long", "short"}:
+                    trade.pending_signal = direction_norm
+                    trade.pending_side = "buy" if direction_norm == "long" else "sell"
+            return
+        if "挂单已提交到 OKX" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            entry_order_id = _extract_log_field(message, "ordId")
+            if entry_order_id:
+                trade.entry_order_id = entry_order_id
+            return
+        if "委托追踪" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            client_order_id = _extract_log_field(message, "clOrdId")
+            if client_order_id:
+                trade.entry_client_order_id = client_order_id
+            return
+        if "挂单已成交" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            trade.opened_logged_at = observed_at
+            entry_order_id = _extract_log_field(message, "ordId")
+            if entry_order_id:
+                trade.entry_order_id = entry_order_id
+            entry_price = _extract_log_field_decimal(message, "开仓价")
+            if entry_price is not None:
+                trade.entry_price = entry_price
+            size = _extract_log_field_decimal(message, "数量")
+            if size is not None:
+                trade.size = size
+            if trade.pending_entry_reference is None and entry_price is not None:
+                trade.pending_entry_reference = entry_price
+            QuantApp._trader_desk_sync_open_trade_state(self, session)
+            return
+        if "交易员虚拟止损监控启动" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            stop_price = _extract_log_field_decimal(message, "策略止损")
+            if stop_price is not None:
+                if trade.initial_stop_price is None:
+                    trade.initial_stop_price = stop_price
+                trade.current_stop_price = stop_price
+            return
+        if "交易员动态止盈保护价已上移" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            new_stop = _extract_log_field_decimal(message, "新保护价") or _extract_log_field_decimal(message, "保护价")
+            if new_stop is not None:
+                trade.current_stop_price = new_stop
+            return
+        if "交易员虚拟止损已触发（不平仓）" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            stop_price = _extract_log_field_decimal(message, "策略止损")
+            if stop_price is not None:
+                trade.current_stop_price = stop_price
+            return
+        if "初始 OKX 止损已提交" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            algo_cl_ord_id = _extract_log_field(message, "algoClOrdId")
+            if algo_cl_ord_id:
+                trade.protective_algo_cl_ord_id = algo_cl_ord_id
+            stop_price = _extract_log_field_decimal(message, "止损")
+            if stop_price is not None:
+                if trade.initial_stop_price is None:
+                    trade.initial_stop_price = stop_price
+                trade.current_stop_price = stop_price
+            return
+        if "OKX 动态止损已上移" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            new_stop = _extract_log_field_decimal(message, "新止损") or _extract_log_field_decimal(message, "止损")
+            if new_stop is not None:
+                trade.current_stop_price = new_stop
+            return
+        if "本轮持仓已结束，继续监控下一次信号。" in message:
+            trade = session.active_trade
+            if trade is None or trade.reconciliation_started:
+                return
+            trade.reconciliation_started = True
+            self._start_session_trade_reconciliation(session, trade)
+
+    def _track_session_trade_runtime(self, session: StrategySession, message: str) -> None:
+        self._track_session_trade_runtime_with_observed_at(
+            session,
+            message,
+            observed_at=datetime.now(),
+        )
+
+    def _request_stop_strategy_session(
+        self,
+        session_id: str,
+        *,
+        ended_reason: str,
+        source_label: str,
+        show_dialog: bool,
+    ) -> bool:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return False
+        if session.stop_cleanup_in_progress:
+            if show_dialog:
+                messagebox.showinfo("提示", "这个策略正在执行停止清理，请稍等。")
+            return False
+        if not session.engine.is_running:
+            if session.status in {"待恢复", "恢复中"}:
+                session.stop_cleanup_in_progress = False
+                session.status = "已停止"
+                session.runtime_status = "已停止"
+                session.stopped_at = datetime.now()
+                session.ended_reason = ended_reason
+                session.active_trade = None
+                self._remove_recoverable_strategy_session(session.session_id)
+                self._upsert_session_row(session)
+                self._refresh_selected_session_details()
+                self._sync_strategy_history_from_session(session)
+                self._log_session_message(session, f"{source_label}，已放弃恢复接管并标记为已停止。")
+                return True
+            if show_dialog:
+                messagebox.showinfo("提示", "这个策略已经停止了。")
+            return False
+        if session.config.run_mode == "signal_only":
+            self._stop_sessions_by_id([session.session_id])
+            return True
+
+        credentials = self._credentials_for_profile_or_none(session.api_name)
+        session.status = "停止中"
+        session.stop_cleanup_in_progress = True
+        session.stop_result_show_dialog = show_dialog
+        session.ended_reason = ended_reason
+        session.engine.stop()
+        self._upsert_session_row(session)
+        self._refresh_selected_session_details()
+        self._sync_strategy_history_from_session(session)
+        self._log_session_message(session, f"{source_label}，正在检查本策略委托与持仓。")
+        if credentials is None:
+            session.stop_cleanup_in_progress = False
+            session.status = "已停止"
+            session.stopped_at = datetime.now()
+            session.ended_reason = f"{ended_reason}（未找到对应API凭证，未执行撤单检查）"
+            self._remove_recoverable_strategy_session(session.session_id)
+            self._upsert_session_row(session)
+            self._refresh_selected_session_details()
+            self._sync_strategy_history_from_session(session)
+            self._log_session_message(session, "停止清理失败：未找到该会话对应的 API 凭证，请人工检查委托与仓位。")
+            if show_dialog:
+                messagebox.showwarning(
+                    "停止提醒",
+                    "策略线程已收到停止请求，但当前找不到该会话对应的 API 凭证。\n\n请人工检查：\n- 当前委托是否还有残留\n- 是否已经成交并留下仓位",
+                )
+            return False
+        threading.Thread(
+            target=self._stop_session_cleanup_worker,
+            args=(session.session_id, credentials),
+            daemon=True,
+        ).start()
+        return True
 
     def _history_record_from_payload(self, payload: dict[str, object]) -> StrategyHistoryRecord | None:
         started_at = _parse_datetime_snapshot(payload.get("started_at"))

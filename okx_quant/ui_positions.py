@@ -29,10 +29,10 @@ class UiPositionsMixin:
         else:
             self.position_auto_refresh_button_text.set("恢复自动刷新")
             self._enqueue_log("账户持仓已暂停自动刷新。需要更新时可以手动点“刷新”。")
-            self._update_position_summary(self._main_visible_positions_unfiltered())
+            self._update_position_summary(self._positions_zoom_visible_positions())
 
     def _on_position_refresh_interval_changed(self, *_: object) -> None:
-        visible_positions = self._main_visible_positions_unfiltered()
+        visible_positions = self._positions_zoom_visible_positions()
         self._update_position_summary(visible_positions)
         self._enqueue_log(f"账户持仓自动刷新间隔已切换为：{self.position_refresh_interval_label.get()}")
 
@@ -43,15 +43,6 @@ class UiPositionsMixin:
         self.positions_zoom_type_filter.set("全部类型")
         self.positions_zoom_keyword.set("")
         self._render_positions_view()
-
-    def _main_visible_positions_unfiltered(self) -> list[OkxPosition]:
-        """首页持仓树始终按「全部类型、无关键字」展示，避免与大窗筛选状态串扰。"""
-        return _filter_positions(
-            self._latest_positions,
-            inst_type="",
-            keyword="",
-            note_texts=self._current_position_note_text_map(),
-        )
 
     def _positions_zoom_visible_positions(self) -> list[OkxPosition]:
         return _filter_positions(
@@ -3775,7 +3766,7 @@ class UiPositionsMixin:
         try:
             self.position_tree.delete(*self.position_tree.get_children())
             self._position_row_payloads.clear()
-            visible_positions = self._main_visible_positions_unfiltered()
+            visible_positions = self._positions_zoom_visible_positions()
             self._populate_positions_tree_from_groups(self.position_tree, visible_positions)
             self._update_position_summary(visible_positions)
             self._update_position_metrics(visible_positions)
@@ -4022,6 +4013,57 @@ class UiPositionsMixin:
             base = position.position
         return abs(base)
 
+    def _prepare_selected_position_manual_flatten(
+        self,
+        position: OkxPosition,
+        flatten_mode: str,
+        *,
+        close_size: Decimal | None = None,
+    ) -> tuple[Credentials, StrategyConfig, Instrument, Decimal, str, str | None, str, str]:
+        profile_name = (self._positions_context_profile_name or self._current_credential_profile()).strip()
+        credentials = self._credentials_for_profile_or_none(profile_name)
+        if credentials is None:
+            raise ValueError("当前持仓所属 API 未配置有效凭证，无法执行选中持仓平仓。")
+        normalized_flatten_mode = self._normalize_position_manual_flatten_mode(flatten_mode)
+        config = self._build_selected_position_manual_flatten_config(position)
+        instrument = self.client.get_instrument(position.inst_id)
+        max_close = snap_to_increment(
+            self._selected_position_close_size(position),
+            instrument.lot_size,
+            "down",
+        )
+        if max_close < instrument.min_size:
+            raise ValueError("当前选中持仓的可平数量不足最小下单量，无法直接平仓。")
+        if close_size is not None:
+            if close_size <= 0:
+                raise ValueError("平仓数量必须大于 0。")
+            req = snap_to_increment(close_size, instrument.lot_size, "down")
+            if req <= 0:
+                raise ValueError("平仓数量按合约最小变动单位向下取整后为 0，请加大数量。")
+            if req > max_close:
+                raise ValueError(f"平仓数量不能超过可平数量 {max_close}。")
+            closeable_size = req
+        else:
+            closeable_size = max_close
+        if closeable_size < instrument.min_size:
+            raise ValueError("当前选中持仓的可平数量不足最小下单量，无法直接平仓。")
+        direction = derive_position_direction(position)
+        close_side = "sell" if direction == "long" else "buy"
+        pos_side = None
+        if config.position_mode == "long_short":
+            normalized_pos_side = (position.pos_side or "").strip().lower()
+            pos_side = normalized_pos_side if normalized_pos_side in {"long", "short"} else direction
+        return (
+            credentials,
+            config,
+            instrument,
+            closeable_size,
+            close_side,
+            pos_side,
+            direction,
+            normalized_flatten_mode,
+        )
+
     def _submit_selected_position_manual_flatten(
         self,
         position: OkxPosition,
@@ -4073,6 +4115,7 @@ class UiPositionsMixin:
                 ord_type="limit",
                 pos_side=pos_side,
                 price=price,
+                reduce_only=True,
             )
             return result, price, normalized_flatten_mode
         result = self.client.place_simple_order(
@@ -4083,6 +4126,7 @@ class UiPositionsMixin:
             size=closeable_size,
             ord_type="market",
             pos_side=pos_side,
+            reduce_only=True,
         )
         return result, None, normalized_flatten_mode
 
@@ -4126,6 +4170,131 @@ class UiPositionsMixin:
         log_prefix = f"[{profile_name}] [当前持仓]" if profile_name else "[当前持仓]"
         self._enqueue_log(
             f"{log_prefix} 已提交选中持仓平仓 | {position.inst_id} | 方式={mode_label} | ordId={order_id}"
+        )
+        self.refresh_positions()
+        self.refresh_order_views()
+
+    def _submit_selected_position_manual_flatten(
+        self,
+        position: OkxPosition,
+        flatten_mode: str,
+        *,
+        close_size: Decimal | None = None,
+    ) -> tuple[OkxOrderResult, Decimal | None, str]:
+        (
+            credentials,
+            config,
+            instrument,
+            closeable_size,
+            close_side,
+            pos_side,
+            _direction,
+            normalized_flatten_mode,
+        ) = QuantApp._prepare_selected_position_manual_flatten(
+            self,
+            position,
+            flatten_mode,
+            close_size=close_size,
+        )
+        if normalized_flatten_mode == "best_quote":
+            price = self._resolve_trader_best_quote_flatten_price(instrument, side=close_side)
+            result = self.client.place_simple_order(
+                credentials,
+                config,
+                inst_id=position.inst_id,
+                side=close_side,
+                size=closeable_size,
+                ord_type="limit",
+                pos_side=pos_side,
+                price=price,
+                reduce_only=True,
+            )
+            return result, price, normalized_flatten_mode
+        result = self.client.place_simple_order(
+            credentials,
+            config,
+            inst_id=position.inst_id,
+            side=close_side,
+            size=closeable_size,
+            ord_type="market",
+            pos_side=pos_side,
+            reduce_only=True,
+        )
+        return result, None, normalized_flatten_mode
+
+    def flatten_selected_position(self) -> None:
+        position = self._selected_position_item()
+        parent = self._position_action_parent()
+        if position is None:
+            messagebox.showinfo("平仓", "请先在当前持仓里选中一条具体持仓。", parent=parent)
+            return
+        try:
+            (
+                _credentials,
+                _config,
+                _instrument,
+                preview_close_size,
+                preview_close_side,
+                _pos_side,
+                preview_direction,
+                _normalized_mode,
+            ) = QuantApp._prepare_selected_position_manual_flatten(self, position, "market")
+        except Exception as exc:
+            messagebox.showerror("平仓失败", str(exc), parent=parent)
+            return
+
+        direction_label = "多头" if preview_direction == "long" else "空头"
+        close_side_label = "SELL 卖出平仓" if preview_close_side == "sell" else "BUY 买入平仓"
+        hold_size_text = format_decimal(abs(position.position))
+        closeable_size_text = format_decimal(self._selected_position_close_size(position))
+        submit_size_text = format_decimal(preview_close_size)
+        choice = messagebox.askyesnocancel(
+            "选中持仓平仓方式",
+            "请选择这次对选中持仓的平仓方式。\n\n"
+            f"合约：{position.inst_id}\n"
+            f"方向：{direction_label}\n"
+            f"当前持仓：{hold_size_text}\n"
+            f"当前可平：{closeable_size_text}\n"
+            f"本次将报单平仓数量：{submit_size_text}\n"
+            f"实际报单方向：{close_side_label}\n\n"
+            "是：市价平仓\n"
+            "否：挂买一/卖一平仓\n"
+            "取消：不执行\n\n"
+            "说明：\n"
+            "1. 市价平仓会立即按市场可成交价格报单。\n"
+            "2. 挂买一/卖一平仓会先挂单，未成交前持仓不会消失。\n"
+            "3. 挂买一/卖一时，平多按卖一挂单，平空按买一挂单。",
+            parent=parent,
+        )
+        if choice is None:
+            return
+        flatten_mode = "market" if choice else "best_quote"
+        mode_label = self._position_manual_flatten_mode_label(flatten_mode)
+        try:
+            result, price, normalized_flatten_mode = self._submit_selected_position_manual_flatten(position, flatten_mode)
+        except Exception as exc:
+            messagebox.showerror("平仓失败", str(exc), parent=parent)
+            return
+        order_id = (result.ord_id or "-").strip() or "-"
+        client_order_id = (result.cl_ord_id or "-").strip() or "-"
+        message = (
+            f"已提交选中持仓平仓。\n\n"
+            f"合约：{position.inst_id}\n"
+            f"方向：{direction_label}\n"
+            f"平仓数量：{submit_size_text}\n"
+            f"报单方向：{close_side_label}\n"
+            f"方式：{mode_label}\n"
+            f"订单ID：{order_id}\n"
+            f"客户端单号：{client_order_id}"
+        )
+        if normalized_flatten_mode == "best_quote" and price is not None:
+            message = f"{message}\n挂单价：{format_decimal(price)}"
+        messagebox.showinfo("平仓已提交", message, parent=parent)
+        profile_name = (self._positions_context_profile_name or self._current_credential_profile()).strip()
+        log_prefix = f"[{profile_name}] [当前持仓]" if profile_name else "[当前持仓]"
+        self._enqueue_log(
+            f"{log_prefix} 已提交选中持仓平仓 | {position.inst_id} | 方向={direction_label} | "
+            f"数量={submit_size_text} | 报单方向={close_side_label} | 方式={mode_label} | ordId={order_id}"
         )
         self.refresh_positions()
         self.refresh_order_views()

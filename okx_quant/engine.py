@@ -226,6 +226,7 @@ class ManagedEntryOrder:
     size: Decimal
     side: Literal["buy", "sell"]
     signal: Literal["long", "short"]
+    stop_loss_algo_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -317,6 +318,9 @@ class StrategyEngine:
 
     def start(self, credentials: Credentials, config: StrategyConfig) -> None:
         self._session_runner.start(credentials, config)
+
+    def start_custom(self, target: Callable[[], None], *, thread_name: str) -> None:
+        self._session_runner.start_custom(target, thread_name=thread_name)
 
     def stop(self) -> None:
         self._session_runner.stop()
@@ -628,6 +632,7 @@ class StrategyEngine:
                 size=plan.size,
                 side=plan.side,
                 signal=plan.signal,
+                stop_loss_algo_id=None,
             )
             idle_signal_candle_ts = None
             self._logger(
@@ -636,6 +641,336 @@ class StrategyEngine:
             )
             self._logger(f"{_fmt_ts(plan.candle_ts)} | 委托追踪 | clOrdId={active_order.cl_ord_id or '-'}")
             self._stop_event.wait(config.poll_seconds)
+
+    def resume_dynamic_exchange_pending_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        instrument: Instrument,
+        *,
+        ord_id: str,
+        cl_ord_id: str | None,
+        candle_ts: int,
+        entry_reference: Decimal,
+        stop_loss: Decimal,
+        take_profit: Decimal,
+        size: Decimal,
+        side: Literal["buy", "sell"],
+        signal: Literal["long", "short"],
+        stop_loss_algo_cl_ord_id: str | None = None,
+        stop_loss_algo_id: str | None = None,
+    ) -> None:
+        active_order = ManagedEntryOrder(
+            ord_id=ord_id,
+            cl_ord_id=cl_ord_id,
+            candle_ts=candle_ts,
+            entry_reference=entry_reference,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+            size=size,
+            side=side,
+            signal=signal,
+            stop_loss_algo_id=stop_loss_algo_id,
+        )
+        self._resume_dynamic_exchange_pending_order_loop(
+            credentials,
+            config,
+            instrument,
+            active_order=active_order,
+        )
+
+    def _resume_dynamic_exchange_pending_order_loop(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        instrument: Instrument,
+        *,
+        active_order: ManagedEntryOrder,
+    ) -> None:
+        if config.signal_mode == "both":
+            raise RuntimeError("EMA 动态委托策略不支持双向，请选择只做多或只做空")
+
+        strategy = EmaDynamicOrderStrategy()
+        entry_reference_ema_period = config.resolved_entry_reference_ema_period()
+        lookback = recommended_indicator_lookback(
+            config.ema_period,
+            config.trend_ema_period,
+            config.atr_period,
+            entry_reference_ema_period,
+            DEFAULT_DEBUG_ATR_PERIOD,
+        )
+        last_candle_ts: int | None = active_order.candle_ts
+        idle_signal_candle_ts: int | None = None
+        dynamic_stop_only = config.take_profit_mode == "dynamic"
+
+        self._logger(
+            "恢复动态挂单接管 | "
+            f"标的={instrument.inst_id} | ordId={active_order.ord_id} | "
+            f"clOrdId={active_order.cl_ord_id or '-'} | 方向={active_order.signal.upper()} | "
+            f"挂单价={format_decimal(active_order.entry_reference)} | 数量={_format_size_with_contract_equivalent(instrument, active_order.size)}"
+        )
+
+        while not self._stop_event.is_set():
+            status = self._get_order_with_retry(
+                credentials,
+                config,
+                inst_id=config.inst_id,
+                ord_id=active_order.ord_id,
+                cl_ord_id=active_order.cl_ord_id,
+            )
+            state = status.state.lower()
+            newest_ts = int(time.time() * 1000)
+            if state == "filled":
+                if dynamic_stop_only and not (
+                    (active_order.stop_loss_algo_cl_ord_id or "").strip()
+                    or (active_order.stop_loss_algo_id or "").strip()
+                ):
+                    recovered_algo = self._find_latest_pending_stop_algo_order(
+                        credentials,
+                        config,
+                        trade_instrument=instrument,
+                        signal=active_order.signal,
+                    )
+                    if recovered_algo is not None:
+                        active_order = ManagedEntryOrder(
+                            ord_id=active_order.ord_id,
+                            cl_ord_id=active_order.cl_ord_id,
+                            candle_ts=active_order.candle_ts,
+                            entry_reference=active_order.entry_reference,
+                            stop_loss=active_order.stop_loss,
+                            take_profit=active_order.take_profit,
+                            stop_loss_algo_cl_ord_id=(
+                                (recovered_algo.algo_client_order_id or recovered_algo.client_order_id or "").strip()
+                                or active_order.stop_loss_algo_cl_ord_id
+                            ),
+                            size=active_order.size,
+                            side=active_order.side,
+                            signal=active_order.signal,
+                            stop_loss_algo_id=(recovered_algo.algo_id or "").strip() or active_order.stop_loss_algo_id,
+                        )
+                if dynamic_stop_only and not (
+                    (active_order.stop_loss_algo_cl_ord_id or "").strip()
+                    or (active_order.stop_loss_algo_id or "").strip()
+                ):
+                    filled_price = status.avg_price or status.price or active_order.entry_reference
+                    filled_size = status.filled_size or status.size or active_order.size
+                    position = FilledPosition(
+                        ord_id=status.ord_id or active_order.ord_id,
+                        cl_ord_id=active_order.cl_ord_id,
+                        inst_id=instrument.inst_id,
+                        side=active_order.side,
+                        close_side="sell" if active_order.side == "buy" else "buy",
+                        pos_side=resolve_open_pos_side(config, active_order.side),
+                        size=filled_size,
+                        entry_price=filled_price,
+                        entry_ts=int(time.time() * 1000),
+                        price_delta_multiplier=_instrument_price_delta_multiplier(instrument),
+                    )
+                    self._logger(
+                        "恢复中的挂单已成交，但未找到可接管的 OKX 止损算法单，恢复为托管持仓监控"
+                        f" | ordId={status.ord_id or active_order.ord_id}"
+                    )
+                    self._monitor_exchange_managed_position_until_closed(
+                        credentials,
+                        config,
+                        trade_instrument=instrument,
+                        position=position,
+                    )
+                    return
+                self._manage_filled_dynamic_entry(
+                    credentials,
+                    config,
+                    trade_instrument=instrument,
+                    active_order=active_order,
+                    status=status,
+                    newest_ts=newest_ts,
+                    dynamic_stop_only=dynamic_stop_only,
+                )
+                if self._stop_event.is_set():
+                    return
+                self._logger("本轮持仓已结束，继续监控下一次信号。")
+                return
+            if state == "partially_filled":
+                self._log_partial_dynamic_fill_and_stop(
+                    active_order,
+                    status,
+                    newest_ts,
+                    config,
+                    trade_instrument=instrument,
+                )
+                return
+            if state != "live":
+                self._logger(
+                    f"{_fmt_ts(newest_ts)} | 恢复接管的挂单状态已变更为 {status.state}，结束本次挂单恢复。"
+                )
+                return
+
+            candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            minimum = max(
+                config.ema_period,
+                config.trend_ema_period,
+                config.atr_period,
+                entry_reference_ema_period,
+            )
+            if len(confirmed) < minimum:
+                self._logger("已收盘 K 线数量不足，保留现有挂单继续等待更多数据...")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            newest_candle_ts = confirmed[-1].ts
+            candle_changed = newest_candle_ts != last_candle_ts
+            if candle_changed:
+                cancel_result = self._cancel_active_order(credentials, config, active_order, newest_candle_ts)
+                if cancel_result.action == "pending":
+                    self._stop_event.wait(config.poll_seconds)
+                    continue
+                if cancel_result.action == "filled":
+                    status = cancel_result.status
+                    if status is None:
+                        raise RuntimeError(f"旧挂单成交回查缺少订单状态，ordId={active_order.ord_id}")
+                    self._logger(
+                        f"{_fmt_ts(newest_candle_ts)} | 恢复中的旧挂单在撤单前已成交，转入持仓监控 | ordId={status.ord_id or active_order.ord_id}"
+                    )
+                    self._manage_filled_dynamic_entry(
+                        credentials,
+                        config,
+                        trade_instrument=instrument,
+                        active_order=active_order,
+                        status=status,
+                        newest_ts=newest_candle_ts,
+                        dynamic_stop_only=dynamic_stop_only,
+                    )
+                    return
+                if cancel_result.action == "partially_filled":
+                    status = cancel_result.status
+                    if status is None:
+                        raise RuntimeError(f"旧挂单部分成交回查缺少订单状态，ordId={active_order.ord_id}")
+                    self._log_partial_dynamic_fill_and_stop(
+                        active_order,
+                        status,
+                        newest_candle_ts,
+                        config,
+                        trade_instrument=instrument,
+                    )
+                    return
+
+                decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
+                last_candle_ts = newest_candle_ts
+                if decision.signal is None:
+                    idle_signal_candle_ts = newest_candle_ts
+                    self._logger(f"{_fmt_ts(newest_candle_ts)} | 当前无法生成挂单 | {decision.reason}")
+                    self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                    continue
+                if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
+                    raise RuntimeError("策略返回的数据不完整，无法生成挂单计划")
+                plan = build_order_plan(
+                    instrument=instrument,
+                    config=config,
+                    order_size=config.order_size if config.order_size > 0 else None,
+                    signal=decision.signal,
+                    entry_reference=decision.entry_reference,
+                    atr_value=decision.atr_value,
+                    candle_ts=decision.candle_ts,
+                    signal_candle_high=decision.signal_candle_high,
+                    signal_candle_low=decision.signal_candle_low,
+                )
+                cl_ord_id = self._next_client_order_id(role="entry")
+                stop_loss_algo_cl_ord_id = (
+                    self._next_client_order_id(role="slg") if dynamic_stop_only and not config.trader_virtual_stop_loss else None
+                )
+                result = self._submit_order_with_recovery(
+                    credentials,
+                    config,
+                    inst_id=plan.inst_id,
+                    cl_ord_id=cl_ord_id,
+                    label="动态限价挂单",
+                    submit_fn=lambda: self._client.place_limit_order(
+                        credentials,
+                        config,
+                        plan,
+                        cl_ord_id=cl_ord_id,
+                        include_take_profit=not dynamic_stop_only,
+                        stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                        include_attached_protection=not config.trader_virtual_stop_loss,
+                    ),
+                )
+                if not result.ord_id:
+                    raise RuntimeError("OKX 未返回挂单 ordId，无法继续监控该委托")
+                active_order = ManagedEntryOrder(
+                    ord_id=result.ord_id,
+                    cl_ord_id=result.cl_ord_id or cl_ord_id,
+                    candle_ts=plan.candle_ts,
+                    entry_reference=plan.entry_reference,
+                    stop_loss=plan.stop_loss,
+                    take_profit=plan.take_profit,
+                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                    size=plan.size,
+                    side=plan.side,
+                    signal=plan.signal,
+                    stop_loss_algo_id=None,
+                )
+                idle_signal_candle_ts = None
+                self._logger(
+                    f"{_fmt_ts(plan.candle_ts)} | 挂单已提交到 OKX | ordId={result.ord_id or '-'} | "
+                    f"sCode={result.s_code} | sMsg={result.s_msg or 'accepted'}"
+                )
+                self._logger(f"{_fmt_ts(plan.candle_ts)} | 委托追踪 | clOrdId={active_order.cl_ord_id or '-'}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            if idle_signal_candle_ts == newest_candle_ts:
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
+            self._stop_event.wait(config.poll_seconds)
+
+    @staticmethod
+    def _recoverable_algo_order_direction(order: OkxTradeOrderItem) -> Literal["long", "short"] | None:
+        pos_side = str(order.pos_side or "").strip().lower()
+        if pos_side == "long":
+            return "long"
+        if pos_side == "short":
+            return "short"
+        side = str(order.side or order.actual_side or "").strip().lower()
+        if side == "sell":
+            return "long"
+        if side == "buy":
+            return "short"
+        return None
+
+    def _find_latest_pending_stop_algo_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        signal: Literal["long", "short"],
+    ) -> OkxTradeOrderItem | None:
+        pending_orders = self._get_pending_orders_with_retry(
+            credentials,
+            config,
+            inst_types=(trade_instrument.inst_type,),
+            limit=200,
+        )
+        candidates = []
+        for item in pending_orders:
+            if item.source_kind != "algo":
+                continue
+            if item.inst_id != trade_instrument.inst_id:
+                continue
+            if (item.stop_loss_trigger_price or item.trigger_price) is None:
+                continue
+            if not ((item.algo_id or "").strip() or (item.algo_client_order_id or "").strip()):
+                continue
+            direction = self._recoverable_algo_order_direction(item)
+            if direction is not None and direction != signal:
+                continue
+            candidates.append(item)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
+        return candidates[0]
 
     def _run_cross_exchange_strategy(
         self,
@@ -3357,6 +3692,7 @@ class StrategyEngine:
                 position=position,
                 initial_stop_loss=active_order.stop_loss,
                 stop_loss_algo_cl_ord_id=active_order.stop_loss_algo_cl_ord_id,
+                stop_loss_algo_id=active_order.stop_loss_algo_id,
             )
         else:
             self._logger("止盈止损已附加到 OKX 主单，开始监控持仓是否结束。")
