@@ -1845,7 +1845,13 @@ def _extract_log_field_decimal(message: str, field_name: str) -> Decimal | None:
     try:
         return Decimal(raw)
     except (InvalidOperation, ValueError):
-        return None
+        match = re.search(r"[-+]?\d+(?:\.\d+)?", raw)
+        if match is None:
+            return None
+        try:
+            return Decimal(match.group(0))
+        except (InvalidOperation, ValueError):
+            return None
 
 
 def _trade_order_event_time(item: OkxTradeOrderItem) -> int:
@@ -13142,8 +13148,7 @@ def _refresh_status_with_recovery_support(self: QuantApp) -> None:
             if not session.ended_reason or session.ended_reason == "恢复中":
                 session.ended_reason = "恢复启动失败"
         elif session.status in {"运行中", "停止中"}:
-            active_trade = getattr(session, "active_trade", None)
-            if session.recovery_supported and active_trade is not None and not active_trade.reconciliation_started:
+            if self._session_should_transition_to_recoverable(session):
                 session.status = "待恢复"
                 session.runtime_status = "待恢复"
                 if session.stopped_at is None:

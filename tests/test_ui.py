@@ -72,6 +72,7 @@ from okx_quant.ui import (
     _strategy_template_record_from_payload,
     _trade_order_belongs_to_session,
     _trade_order_session_role,
+    _extract_log_field_decimal,
 )
 
 
@@ -84,6 +85,14 @@ class UiHelpersTest(TestCase):
 
     def test_order_item_from_cache_returns_none_for_invalid_record(self) -> None:
         self.assertIsNone(_order_item_from_cache({"inst_id": "", "created_time": None, "update_time": None}))
+
+    def test_extract_log_field_decimal_parses_leading_number_before_unit_text(self) -> None:
+        value = _extract_log_field_decimal(
+            "准备挂单 | 数量=39.68张（折合3.968 ETH） | 止损=2288.86",
+            "数量",
+        )
+
+        self.assertEqual(value, Decimal("39.68"))
 
     def test_position_history_item_from_cache_returns_none_for_invalid_record(self) -> None:
         self.assertIsNone(_position_history_item_from_cache({"inst_id": "BTC-USDT-SWAP", "update_time": ""}))
@@ -2025,6 +2034,30 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(session.active_trade.pending_stop_price, Decimal("2320.66"))
         self.assertEqual(session.active_trade.size, Decimal("0.1"))
 
+    def test_track_session_trade_runtime_starts_reconciliation_when_dynamic_stop_monitor_ends_without_position(self) -> None:
+        session = self._make_session()
+        app = self._make_app_for_tracking()
+        session.active_trade = StrategyTradeRuntimeState(
+            round_id="S01-1",
+            opened_logged_at=datetime(2026, 5, 12, 16, 52, 6),
+            entry_order_id="1001",
+            entry_client_order_id="s01emaent0512165206",
+            entry_price=Decimal("2290.14"),
+            size=Decimal("45.66"),
+            protective_algo_cl_ord_id="s160emaslg051208481138002",
+            initial_stop_price=Decimal("2292.33"),
+            current_stop_price=Decimal("2284.11"),
+        )
+
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "未检测到策略持仓，OKX 动态止损监控结束。",
+        )
+
+        self.assertTrue(session.active_trade.reconciliation_started)
+        app._start_session_trade_reconciliation.assert_called_once()
+
     def test_restore_session_trade_runtime_from_log_recovers_initial_stop_and_latest_stop(self) -> None:
         session = self._make_session()
         app = self._make_app_for_tracking()
@@ -2055,6 +2088,33 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(restored.protective_algo_cl_ord_id, "s01emaslg0510192311")
         self.assertEqual(restored.initial_stop_price, Decimal("2320.66"))
         self.assertEqual(restored.current_stop_price, Decimal("2342.10"))
+
+    def test_restore_session_trade_runtime_from_log_recovers_pending_entry_size_with_unit_suffix(self) -> None:
+        session = self._make_session()
+        app = self._make_app_for_tracking()
+
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "s162.log"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "[05-12 19:05:24] [moni] [S162 EMA ETH-USDT-SWAP] 2026-05-12 19:04:00 | 准备挂单 | 方向=SHORT | 第1波 | 本波第1次委托 | 开仓价=2286.34 | 数量=39.68张（折合3.968 ETH） | 止损=2288.86 | 动态止盈=初始不挂止盈",
+                        "[05-12 19:05:29] [moni] [S162 EMA ETH-USDT-SWAP] 2026-05-12 19:04:00 | 挂单已提交到 OKX | ordId=3559505474231050240 | sCode=0 | sMsg=下单成功",
+                        "[05-12 19:05:29] [moni] [S162 EMA ETH-USDT-SWAP] 2026-05-12 19:04:00 | 委托追踪 | clOrdId=s162emaent051211052415001",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            session.log_file_path = log_path
+            restored = QuantApp._restore_session_trade_runtime_from_log(app, session)
+
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        self.assertEqual(restored.pending_signal, "short")
+        self.assertEqual(restored.pending_side, "sell")
+        self.assertEqual(restored.pending_entry_reference, Decimal("2286.34"))
+        self.assertEqual(restored.pending_stop_price, Decimal("2288.86"))
+        self.assertEqual(restored.size, Decimal("39.68"))
 
     def test_recover_session_starts_exchange_dynamic_takeover_when_position_exists(self) -> None:
         session = self._make_session()
@@ -2119,6 +2179,7 @@ class StrategyTradeTrackingTest(TestCase):
             _recoverable_strategy_sessions={},
             _credentials_for_profile_or_none=lambda _api_name: credentials,
             _restore_session_trade_runtime_from_log=lambda session_: session_.active_trade,
+            _find_recovery_claim_conflict=lambda session_id, trade: None,
             _load_recoverable_live_positions=lambda *_args, **_kwargs: [position],
             _select_recoverable_live_position=lambda *_args, **_kwargs: position,
             _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
@@ -2191,6 +2252,7 @@ class StrategyTradeTrackingTest(TestCase):
             _recoverable_strategy_sessions={},
             _credentials_for_profile_or_none=lambda _api_name: credentials,
             _restore_session_trade_runtime_from_log=lambda _session: None,
+            _find_recovery_claim_conflict=lambda session_id, trade: None,
             _load_recoverable_live_positions=lambda *_args, **_kwargs: [position],
             _select_recoverable_live_position=lambda *_args, **_kwargs: position,
             _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
@@ -2263,6 +2325,7 @@ class StrategyTradeTrackingTest(TestCase):
             _recoverable_strategy_sessions={},
             _credentials_for_profile_or_none=lambda _api_name: credentials,
             _restore_session_trade_runtime_from_log=lambda session_: session_.active_trade,
+            _find_recovery_claim_conflict=lambda session_id, trade: None,
             _load_recoverable_live_positions=lambda *_args, **_kwargs: [],
             _select_recoverable_live_position=lambda *_args, **_kwargs: None,
             _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
@@ -2282,6 +2345,64 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(session.status, "恢复中")
         self.assertEqual(session.runtime_status, "恢复中")
         start_custom.assert_called_once()
+
+    def test_recover_session_skips_when_another_running_session_already_claims_same_algo_order(self) -> None:
+        session = self._make_session()
+        session.active_trade = StrategyTradeRuntimeState(
+            round_id="S160-1",
+            opened_logged_at=datetime(2026, 5, 12, 16, 52, 6),
+            entry_order_id="1001",
+            entry_client_order_id="s160emaent051208481138001",
+            entry_price=Decimal("2290.14"),
+            size=Decimal("45.66"),
+            protective_algo_cl_ord_id="s160emaslg051208481138002",
+            initial_stop_price=Decimal("2292.33"),
+            current_stop_price=Decimal("2284.11"),
+        )
+        session.log_prefix = "[S160]"
+        running_session = self._make_session()
+        running_session.session_id = "S161"
+        running_session.status = "运行中"
+        running_session.engine = SimpleNamespace(is_running=True)
+        running_session.log_prefix = "[S161]"
+        running_session.active_trade = StrategyTradeRuntimeState(
+            round_id="S161-1",
+            opened_logged_at=datetime(2026, 5, 12, 16, 52, 6),
+            entry_order_id="2001",
+            entry_client_order_id="s161emaent051208481138001",
+            entry_price=Decimal("2290.14"),
+            size=Decimal("45.66"),
+            protective_algo_cl_ord_id="s160emaslg051208481138002",
+            initial_stop_price=Decimal("2292.33"),
+            current_stop_price=Decimal("2284.11"),
+        )
+
+        credentials = SimpleNamespace(profile_name="moni")
+        app = SimpleNamespace(
+            sessions={"S160": session, "S161": running_session},
+            _recoverable_strategy_sessions={},
+            _credentials_for_profile_or_none=lambda _api_name: credentials,
+            _restore_session_trade_runtime_from_log=lambda session_: session_.active_trade,
+            _recovery_claim_tokens=lambda trade: QuantApp._recovery_claim_tokens(trade),
+            _load_recoverable_live_positions=lambda *_args, **_kwargs: [],
+            _select_recoverable_live_position=lambda *_args, **_kwargs: None,
+            _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
+            _find_recoverable_protective_order=lambda *_args, **_kwargs: None,
+            _find_recovery_claim_conflict=lambda session_id, trade: QuantApp._find_recovery_claim_conflict(app, session_id, trade),
+            _build_recoverable_strategy_session_record=lambda session_: SimpleNamespace(session_id=session_.session_id, api_name=session_.api_name),
+            _upsert_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _remove_recoverable_strategy_session=MagicMock(),
+            _log_session_message=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+
+        result = QuantApp._recover_session(app, "S160", auto=False)
+
+        self.assertFalse(result)
+        self.assertEqual(session.status, "已停止")
+        self.assertIn("S161", session.ended_reason)
 
     def test_select_recoverable_live_position_requires_matching_direction_when_strategy_is_directional(self) -> None:
         session = self._make_session()

@@ -5390,6 +5390,22 @@ class UiStrategySessionsMixin:
                 self._enqueue_log(f"{session.log_prefix} 读取当前持仓失败，暂时无法恢复接管：{exc}")
             return False
         trade = self._restore_session_trade_runtime_from_log(session) or session.active_trade
+        conflicting_session = self._find_recovery_claim_conflict(session_id, trade)
+        if conflicting_session is not None:
+            conflict_reason = (
+                f"恢复接管已跳过：检测到会话 {conflicting_session.session_id} 正在占用同一笔仓位/保护单。"
+            )
+            if not auto:
+                self._enqueue_log(f"{session.log_prefix} {conflict_reason}")
+            session.status = "已停止"
+            session.runtime_status = "已停止"
+            session.stopped_at = datetime.now()
+            session.ended_reason = conflict_reason
+            self._remove_recoverable_strategy_session(session.session_id)
+            self._upsert_session_row(session)
+            self._sync_strategy_history_from_session(session)
+            self._log_session_message(session, conflict_reason)
+            return False
         if live_position is None:
             pending_signal = str(trade.pending_signal or "").strip().lower() if trade is not None else ""
             pending_side = str(trade.pending_side or "").strip().lower() if trade is not None else ""
@@ -5651,6 +5667,63 @@ class UiStrategySessionsMixin:
             return False
         return True
 
+    @staticmethod
+    def _recovery_claim_tokens(trade: StrategyTradeRuntimeState | None) -> set[str]:
+        if trade is None:
+            return set()
+        tokens: set[str] = set()
+        for prefix, value in (
+            ("ord", trade.entry_order_id),
+            ("cl", trade.entry_client_order_id),
+            ("algo", trade.protective_algo_id),
+            ("algoCl", trade.protective_algo_cl_ord_id),
+        ):
+            normalized = str(value or "").strip()
+            if normalized:
+                tokens.add(f"{prefix}:{normalized}")
+        return tokens
+
+    def _find_recovery_claim_conflict(
+        self,
+        session_id: str,
+        trade: StrategyTradeRuntimeState | None,
+    ) -> StrategySession | None:
+        target_tokens = self._recovery_claim_tokens(trade)
+        if not target_tokens:
+            return None
+        for other_session_id, other_session in self.sessions.items():
+            if other_session_id == session_id:
+                continue
+            if not (
+                other_session.engine.is_running
+                or other_session.status in {"运行中", "恢复中"}
+            ):
+                continue
+            other_trade = other_session.active_trade
+            other_tokens = self._recovery_claim_tokens(other_trade)
+            if other_tokens and (target_tokens & other_tokens):
+                return other_session
+        return None
+
+    @staticmethod
+    def _session_should_transition_to_recoverable(session: StrategySession) -> bool:
+        if not session.recovery_supported:
+            return False
+        trade = session.active_trade
+        if trade is None or trade.reconciliation_started:
+            return False
+        last_message = str(getattr(session, "last_message", "") or "").strip()
+        terminal_markers = (
+            "未检测到策略持仓，OKX 动态止损监控结束。",
+            "未检测到策略持仓，交易员虚拟止损监控结束。",
+            "检测到 OKX 托管持仓已结束。",
+            "未再检测到策略持仓，视为本轮 OKX 托管持仓已结束。",
+            "本轮持仓已结束，继续监控下一次信号。",
+        )
+        if any(marker in last_message for marker in terminal_markers):
+            return False
+        return True
+
     def _track_session_trade_runtime_with_observed_at(
         self,
         session: StrategySession,
@@ -5756,6 +5829,18 @@ class UiStrategySessionsMixin:
                 trade.current_stop_price = new_stop
             return
         if "本轮持仓已结束，继续监控下一次信号。" in message:
+            trade = session.active_trade
+            if trade is None or trade.reconciliation_started:
+                return
+            trade.reconciliation_started = True
+            self._start_session_trade_reconciliation(session, trade)
+            return
+        if (
+            "未检测到策略持仓，OKX 动态止损监控结束。" in message
+            or "未检测到策略持仓，交易员虚拟止损监控结束。" in message
+            or "检测到 OKX 托管持仓已结束。" in message
+            or "未再检测到策略持仓，视为本轮 OKX 托管持仓已结束。" in message
+        ):
             trade = session.active_trade
             if trade is None or trade.reconciliation_started:
                 return
