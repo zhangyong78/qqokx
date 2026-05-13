@@ -513,6 +513,55 @@ class OkxClientOrderRequestTest(TestCase):
         self.assertNotIn("posSide", body)
         self.assertEqual(body["ccy"], "BTC")
 
+    def test_place_simple_option_order_does_not_send_pos_side(self) -> None:
+        client = OkxRestClient()
+        captured: dict[str, object] = {}
+
+        def _stub_request(method: str, path: str, params=None, body=None, **kwargs):
+            captured["method"] = method
+            captured["path"] = path
+            captured["body"] = body
+            return {"data": [{"ordId": "o1", "sCode": "0", "sMsg": ""}]}
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        config = StrategyConfig(
+            inst_id="BTC-USD-260515-81000-C",
+            trade_inst_id="BTC-USD-260515-81000-C",
+            local_tp_sl_inst_id="BTC-USD-260515-81000-C",
+            bar="1H",
+            ema_period=21,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            tp_sl_mode="exchange",
+            take_profit_mode="dynamic",
+            risk_amount=Decimal("10"),
+        )
+
+        client.place_simple_order(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            config,
+            inst_id="BTC-USD-260515-81000-C",
+            side="buy",
+            size=Decimal("1"),
+            ord_type="limit",
+            pos_side=None,
+            price=Decimal("0.01"),
+            cl_ord_id="test-option",
+        )
+
+        body = captured["body"]
+        assert isinstance(body, dict)
+        self.assertEqual("POST", captured["method"])
+        self.assertEqual("/api/v5/trade/order", captured["path"])
+        self.assertNotIn("posSide", body)
+
     def test_request_uses_code_when_okx_error_message_is_empty(self) -> None:
         client = OkxRestClient()
 

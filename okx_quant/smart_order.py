@@ -772,7 +772,7 @@ class SmartOrderManager:
     ) -> Literal["long", "short"] | None:
         if pos_side is not None:
             return pos_side
-        if task.instrument.inst_type == "SPOT" or task.runtime.position_mode != "long_short":
+        if task.instrument.inst_type in {"SPOT", "OPTION"} or task.runtime.position_mode != "long_short":
             return None
         if task.task_type == "grid":
             return "long" if task.initial_side == "buy" else "short"
@@ -2060,7 +2060,7 @@ class SmartOrderManager:
         return current_price >= trigger_price if trigger_direction == "above" else current_price <= trigger_price
 
     def _open_pos_side(self, task: _SmartOrderTask) -> Literal["long", "short"] | None:
-        if task.instrument.inst_type == "SPOT":
+        if task.instrument.inst_type in {"SPOT", "OPTION"}:
             return None
         if task.runtime.position_mode != "long_short":
             return None

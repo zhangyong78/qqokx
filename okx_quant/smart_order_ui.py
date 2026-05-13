@@ -1224,7 +1224,7 @@ class SmartOrderWindow:
         return self.manager._build_config(inst_id, runtime)
 
     def _manual_pos_side(self, instrument: Instrument, runtime: SmartOrderRuntimeConfig, side: str):
-        if instrument.inst_type == "SPOT" or runtime.position_mode != "long_short":
+        if instrument.inst_type in {"SPOT", "OPTION"} or runtime.position_mode != "long_short":
             return None
         return "long" if side == "buy" else "short"
 

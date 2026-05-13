@@ -930,5 +930,47 @@ class SmartOrderLogicTests(unittest.TestCase):
             finally:
                 manager.destroy()
 
+    def test_option_grid_long_short_does_not_send_pos_side(self) -> None:
+        client = _FakeClient()
+        with TemporaryDirectory() as temp_dir:
+            manager = SmartOrderManager(client, storage_path=Path(temp_dir) / ".okx_quant_smart_order_tasks.json")
+            try:
+                instrument = _make_option_instrument()
+                runtime = _make_runtime(position_mode="long_short")
+                task_id = manager.start_grid_task(
+                    instrument=instrument,
+                    runtime=runtime,
+                    side="buy",
+                    entry_price=Decimal("0.0100"),
+                    size=Decimal("1"),
+                    long_step=Decimal("0.0010"),
+                    short_step=Decimal("0.0010"),
+                    cycle_mode="counted",
+                    cycle_limit=1,
+                )
+                task = manager._tasks[task_id]
+                self.assertIsNone(client.placed_orders[0]["pos_side"])
+
+                manager._handle_order_filled(
+                    task,
+                    OkxOrderStatus(
+                        ord_id=task.active_order_id or "ord001",
+                        state="filled",
+                        side="buy",
+                        ord_type="limit",
+                        price=Decimal("0.0100"),
+                        avg_price=Decimal("0.0100"),
+                        size=Decimal("1"),
+                        filled_size=Decimal("1"),
+                        raw={},
+                    ),
+                )
+
+                self.assertEqual(2, len(client.placed_orders))
+                self.assertEqual("sell", client.placed_orders[1]["side"])
+                self.assertIsNone(client.placed_orders[1]["pos_side"])
+            finally:
+                manager.destroy()
+
 if __name__ == "__main__":
     unittest.main()
