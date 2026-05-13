@@ -32,6 +32,9 @@ POSITION_USAGE_REFRESH_SECONDS = 3.0
 WRITE_RECONCILE_ATTEMPTS = 3
 WRITE_RECONCILE_BASE_DELAY_SECONDS = 1.0
 WRITE_RECONCILE_MAX_DELAY_SECONDS = 3.0
+OPTION_LADDER_PRICE_SPLIT = Decimal("0.0050")
+OPTION_LADDER_LOW_TICK = Decimal("0.0001")
+OPTION_LADDER_HIGH_TICK = Decimal("0.0005")
 
 STATUS_READY = "\u51c6\u5907\u4e2d"
 STATUS_WAIT_TRIGGER = "\u7b49\u5f85\u89e6\u53d1"
@@ -204,6 +207,29 @@ def build_rule_ladder_prices(*, center_price: Decimal, tick_size: Decimal, level
     return prices
 
 
+def build_option_rule_ladder_prices(*, center_price: Decimal, levels_each_side: int) -> list[Decimal]:
+    if levels_each_side <= 0:
+        raise ValueError("levels_each_side must be positive")
+    center = _snap_option_ladder_price(center_price, side="neutral")
+    higher_prices: list[Decimal] = []
+    current = center
+    for _ in range(levels_each_side):
+        next_price = _next_option_ladder_price(current, direction="up")
+        if next_price is None:
+            break
+        higher_prices.append(next_price)
+        current = next_price
+    lower_prices: list[Decimal] = []
+    current = center
+    for _ in range(levels_each_side):
+        next_price = _next_option_ladder_price(current, direction="down")
+        if next_price is None:
+            break
+        lower_prices.append(next_price)
+        current = next_price
+    return [*reversed(higher_prices), center, *lower_prices]
+
+
 def _bucket_price(
     price: Decimal,
     increment: Decimal,
@@ -216,6 +242,61 @@ def _bucket_price(
     elif side == "sell":
         mode = "up"
     return snap_to_increment(price, increment, mode)
+
+
+def _option_ladder_tick_for_price(price: Decimal) -> Decimal:
+    return OPTION_LADDER_LOW_TICK if price < OPTION_LADDER_PRICE_SPLIT else OPTION_LADDER_HIGH_TICK
+
+
+def _snap_option_ladder_price(price: Decimal, *, side: Literal["buy", "sell", "neutral"]) -> Decimal:
+    if price <= 0:
+        return OPTION_LADDER_LOW_TICK
+    if side == "neutral":
+        down = _snap_option_ladder_price(price, side="buy")
+        up = _snap_option_ladder_price(price, side="sell")
+        return down if (price - down) <= (up - price) else up
+    if side == "buy":
+        if price >= OPTION_LADDER_PRICE_SPLIT:
+            return snap_to_increment(price, OPTION_LADDER_HIGH_TICK, "down")
+        return snap_to_increment(price, OPTION_LADDER_LOW_TICK, "down")
+    if price < OPTION_LADDER_PRICE_SPLIT:
+        candidate = snap_to_increment(price, OPTION_LADDER_LOW_TICK, "up")
+        if candidate < OPTION_LADDER_PRICE_SPLIT:
+            return candidate
+        return OPTION_LADDER_PRICE_SPLIT
+    return snap_to_increment(price, OPTION_LADDER_HIGH_TICK, "up")
+
+
+def _next_option_ladder_price(price: Decimal, *, direction: Literal["up", "down"]) -> Decimal | None:
+    if direction == "up":
+        candidate = price + _option_ladder_tick_for_price(price)
+        return _snap_option_ladder_price(candidate, side="sell")
+    step = OPTION_LADDER_HIGH_TICK if price > OPTION_LADDER_PRICE_SPLIT else OPTION_LADDER_LOW_TICK
+    candidate = price - step
+    if candidate <= 0:
+        return None
+    return _snap_option_ladder_price(candidate, side="buy")
+
+
+def _bucket_price_to_ladder(
+    price: Decimal,
+    ladder_prices: list[Decimal],
+    *,
+    side: Literal["buy", "sell", "neutral"],
+) -> Decimal:
+    if not ladder_prices:
+        raise ValueError("ladder_prices must not be empty")
+    if side == "buy":
+        for candidate in reversed(ladder_prices):
+            if candidate <= price:
+                return candidate
+        return ladder_prices[0]
+    if side == "sell":
+        for candidate in ladder_prices:
+            if candidate >= price:
+                return candidate
+        return ladder_prices[-1]
+    return min(ladder_prices, key=lambda candidate: (abs(candidate - price), abs(candidate)))
 
 
 def _fmt_optional(value: Decimal | None) -> str:
@@ -871,45 +952,80 @@ class SmartOrderManager:
         display_increment = price_increment if price_increment is not None and price_increment > 0 else instrument.tick_size
         if display_increment < instrument.tick_size:
             display_increment = instrument.tick_size
+        use_option_price_bands = instrument.inst_type == "OPTION" and price_increment is None
         center = ticker.last or ticker.bid or ticker.ask or ticker.mark or ticker.index or instrument.tick_size
         with self._lock:
             self._ladder_center_price = center
             tasks = list(self._tasks.values())
-        level_prices = build_rule_ladder_prices(
-            center_price=center,
-            tick_size=display_increment,
-            levels_each_side=levels_each_side,
-        )
+        if use_option_price_bands:
+            level_prices = build_option_rule_ladder_prices(
+                center_price=center,
+                levels_each_side=levels_each_side,
+            )
+        else:
+            level_prices = build_rule_ladder_prices(
+                center_price=center,
+                tick_size=display_increment,
+                levels_each_side=levels_each_side,
+            )
         buy_map: dict[Decimal, Decimal] = {}
         sell_map: dict[Decimal, Decimal] = {}
         label_map: dict[Decimal, list[str]] = {}
         if order_book is not None:
             for price, size in order_book.bids:
-                bucket = _bucket_price(price, display_increment, side="buy")
+                bucket = (
+                    _bucket_price_to_ladder(price, level_prices, side="buy")
+                    if use_option_price_bands
+                    else _bucket_price(price, display_increment, side="buy")
+                )
                 buy_map[bucket] = buy_map.get(bucket, Decimal("0")) + size
             for price, size in order_book.asks:
-                bucket = _bucket_price(price, display_increment, side="sell")
+                bucket = (
+                    _bucket_price_to_ladder(price, level_prices, side="sell")
+                    if use_option_price_bands
+                    else _bucket_price(price, display_increment, side="sell")
+                )
                 sell_map[bucket] = sell_map.get(bucket, Decimal("0")) + size
         for task in tasks:
             if task.inst_id != instrument.inst_id:
                 continue
             if not task.waiting_for_fill or task.active_order_price is None or task.active_order_size is None or task.active_order_side is None:
                 continue
-            price = _bucket_price(
-                task.active_order_price,
-                display_increment,
-                side="buy" if task.active_order_side == "buy" else "sell",
+            price = (
+                _bucket_price_to_ladder(
+                    task.active_order_price,
+                    level_prices,
+                    side="buy" if task.active_order_side == "buy" else "sell",
+                )
+                if use_option_price_bands
+                else _bucket_price(
+                    task.active_order_price,
+                    display_increment,
+                    side="buy" if task.active_order_side == "buy" else "sell",
+                )
             )
             label_map.setdefault(price, []).append(self._build_ladder_task_label(task))
         best_bid = order_book.bids[0][0] if order_book is not None and order_book.bids else ticker.bid
         best_ask = order_book.asks[0][0] if order_book is not None and order_book.asks else ticker.ask
         last_price = ticker.last
         if best_bid is not None:
-            best_bid = _bucket_price(best_bid, display_increment, side="buy")
+            best_bid = (
+                _bucket_price_to_ladder(best_bid, level_prices, side="buy")
+                if use_option_price_bands
+                else _bucket_price(best_bid, display_increment, side="buy")
+            )
         if best_ask is not None:
-            best_ask = _bucket_price(best_ask, display_increment, side="sell")
+            best_ask = (
+                _bucket_price_to_ladder(best_ask, level_prices, side="sell")
+                if use_option_price_bands
+                else _bucket_price(best_ask, display_increment, side="sell")
+            )
         if last_price is not None:
-            last_price = _bucket_price(last_price, display_increment, side="neutral")
+            last_price = (
+                _bucket_price_to_ladder(last_price, level_prices, side="neutral")
+                if use_option_price_bands
+                else _bucket_price(last_price, display_increment, side="neutral")
+            )
         return [
             SmartOrderLadderLevel(
                 price=price,

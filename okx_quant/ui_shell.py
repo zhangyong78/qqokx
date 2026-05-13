@@ -20,6 +20,8 @@ from tkinter import BooleanVar, Canvas, END, Label, Listbox, Menu, StringVar, Te
 from tkinter import messagebox, ttk
 
 from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
+from okx_quant.analysis import ChannelDetectionConfig, PivotDetectionConfig
+from okx_quant.auto_channel_preview import build_auto_channel_preview_snapshot
 from okx_quant.backtest_ui import BacktestCompareOverviewWindow, BacktestLaunchState, BacktestWindow
 from okx_quant.btc_market_analysis_ui import BtcMarketAnalysisWindow
 from okx_quant.btc_research_workbench_ui import BtcResearchWorkbenchWindow
@@ -161,6 +163,7 @@ from okx_quant.strategy_live_chart import (
     StrategyLiveChartLayout,
     StrategyLiveChartSnapshot,
     StrategyLiveChartTimeMarker,
+    build_auto_channel_live_chart_snapshot,
     build_strategy_live_chart_snapshot,
     compute_strategy_live_chart_layout,
     layout_bar_index_to_x_center,
@@ -2529,6 +2532,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._strategy_history_tree: ttk.Treeview | None = None
         self._strategy_history_detail: Text | None = None
         self._strategy_history_selected_record_id: str | None = None
+        self._auto_channel_preview_window: Toplevel | None = None
         self._strategy_book_window: Toplevel | None = None
         self._strategy_live_chart_windows: dict[str, StrategyLiveChartWindowState] = {}
         self._strategy_book_group_tree: ttk.Treeview | None = None
@@ -2720,6 +2724,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         tools_menu.add_command(label="打开行情日记", command=self.open_journal_window)
         tools_menu.add_command(label="打开划线交易台", command=self.open_line_trading_desk_window)
         tools_menu.add_command(label="打开信号观察台", command=self.open_signal_monitor_window)
+        tools_menu.add_command(label="打开自动通道预览", command=self.open_auto_channel_preview_window)
         tools_menu.add_command(label="打开交易员管理台", command=self.open_trader_desk_window)
         tools_menu.add_command(label="打开波动率监控", command=self.open_deribit_volatility_monitor_window)
         tools_menu.add_command(label="打开Deribit波动率指数", command=self.open_deribit_volatility_window)
@@ -4958,6 +4963,154 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             session_log_opener=self.open_strategy_session_log,
             session_chart_opener=self.open_strategy_live_chart_window,
         )
+
+    def open_auto_channel_preview_window(self) -> None:
+        existing = self._auto_channel_preview_window
+        if existing is not None and _widget_exists(existing):
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+
+        window = Toplevel(self.root)
+        self._auto_channel_preview_window = window
+        apply_window_icon(window)
+        window.title("自动通道预览")
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.76,
+            height_ratio=0.68,
+            min_width=1040,
+            min_height=660,
+            max_width=1760,
+            max_height=1120,
+        )
+        container = ttk.Frame(window, padding=10)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(1, weight=1)
+
+        top_bar = ttk.Frame(container)
+        top_bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(top_bar, text="样例").grid(row=0, column=0, sticky="w")
+        sample_var = StringVar(value="通道样例")
+        sample_box = ttk.Combobox(
+            top_bar,
+            width=12,
+            state="readonly",
+            textvariable=sample_var,
+            values=("通道样例", "箱体样例"),
+        )
+        sample_box.grid(row=0, column=1, padx=(6, 10))
+        ttk.Label(top_bar, text="标的").grid(row=0, column=2, sticky="w")
+        symbol_var = StringVar(value=self._default_line_trading_symbol())
+        symbol_box = ttk.Combobox(top_bar, width=18, textvariable=symbol_var, values=self._line_trading_symbol_values())
+        symbol_box.grid(row=0, column=3, padx=(6, 10))
+        ttk.Label(top_bar, text="周期").grid(row=0, column=4, sticky="w")
+        bar_var = StringVar(value="1H")
+        ttk.Combobox(top_bar, width=8, state="readonly", values=BAR_OPTIONS, textvariable=bar_var).grid(
+            row=0, column=5, padx=(6, 10)
+        )
+        ttk.Label(top_bar, text="K线").grid(row=0, column=6, sticky="w")
+        limit_var = StringVar(value="240")
+        ttk.Entry(top_bar, width=7, textvariable=limit_var).grid(row=0, column=7, padx=(6, 10))
+        status_text = StringVar(value="自动通道预览：仅用于看图验证，不会下单。")
+        ttk.Button(top_bar, text="刷新样例", command=lambda: refresh_sample()).grid(row=0, column=8, padx=(0, 8))
+        ttk.Button(top_bar, text="加载真实K线", command=lambda: load_real_candles()).grid(row=0, column=9, padx=(0, 10))
+        ttk.Label(top_bar, textvariable=status_text, foreground="#555").grid(row=0, column=10, sticky="w")
+        top_bar.columnconfigure(10, weight=1)
+
+        canvas = Canvas(container, background="#ffffff", highlightthickness=0, width=1120, height=640)
+        canvas.grid(row=1, column=0, sticky="nsew")
+        snapshot_box: dict[str, StrategyLiveChartSnapshot | None] = {"snapshot": None}
+        generation_box = {"value": 0}
+
+        def sample_key() -> str:
+            return "box" if sample_var.get() == "箱体样例" else "channel"
+
+        def redraw(_event=None) -> None:
+            snapshot = snapshot_box.get("snapshot")
+            if snapshot is not None:
+                render_strategy_live_chart(canvas, snapshot)
+
+        def refresh_sample() -> None:
+            generation_box["value"] += 1
+            snapshot = build_auto_channel_preview_snapshot(sample_key())
+            snapshot_box["snapshot"] = snapshot
+            status_text.set(snapshot.note or "自动通道预览已刷新")
+            redraw()
+
+        def load_real_candles() -> None:
+            generation_box["value"] += 1
+            generation = generation_box["value"]
+            symbol = symbol_var.get().strip().upper()
+            bar = bar_var.get().strip()
+            try:
+                limit = max(50, min(1000, int(limit_var.get().strip())))
+            except ValueError:
+                messagebox.showerror("参数错误", "K线数量必须是整数。", parent=window)
+                return
+            if not symbol:
+                messagebox.showerror("参数错误", "请填写标的。", parent=window)
+                return
+            limit_var.set(str(limit))
+            status_text.set(f"正在加载真实K线 | {symbol} | {bar} | {limit} 根...")
+
+            def worker() -> None:
+                try:
+                    candles = self.client.get_candles_history(symbol, bar, limit=limit)
+                    snapshot = build_auto_channel_live_chart_snapshot(
+                        session_id=f"auto-live:{symbol}:{bar}",
+                        candles=candles,
+                        channel_config=ChannelDetectionConfig(
+                            pivot=PivotDetectionConfig(
+                                left_bars=2,
+                                right_bars=2,
+                                atr_period=14,
+                                atr_multiplier=Decimal("0.25"),
+                                min_index_distance=2,
+                            ),
+                            min_anchor_distance=6,
+                            min_channel_bars=18,
+                            max_violations=8,
+                        ),
+                        right_pad_bars=50,
+                        channel_extend_bars=50,
+                        latest_price=candles[-1].close if candles else None,
+                        note=f"{symbol} | {bar} | 真实K线",
+                    )
+                    error = None
+                except Exception as exc:
+                    snapshot = None
+                    error = str(exc)
+
+                def apply_result() -> None:
+                    if generation_box["value"] != generation or not _widget_exists(window):
+                        return
+                    if error is not None:
+                        status_text.set(f"真实K线加载失败：{error}")
+                        self._enqueue_log(f"自动通道预览加载失败 | {symbol} | {bar} | {error}")
+                        return
+                    snapshot_box["snapshot"] = snapshot
+                    if snapshot is None:
+                        status_text.set("真实K线加载完成，但没有可绘制数据。")
+                    else:
+                        status_text.set(snapshot.note or f"已加载真实K线 | {symbol} | {bar}")
+                    redraw()
+
+                self.root.after(0, apply_result)
+
+            threading.Thread(target=worker, daemon=True, name="auto-channel-preview-load").start()
+
+        def close() -> None:
+            generation_box["value"] += 1
+            self._auto_channel_preview_window = None
+            window.destroy()
+
+        sample_box.bind("<<ComboboxSelected>>", lambda _event: refresh_sample())
+        canvas.bind("<Configure>", redraw)
+        window.protocol("WM_DELETE_WINDOW", close)
+        self.root.after(50, refresh_sample)
 
     def open_btc_research_workbench_window(self) -> None:
         if (

@@ -23,6 +23,7 @@ from okx_quant.smart_order import (
     SmartOrderManager,
     SmartOrderRuntimeConfig,
     _SmartOrderTask,
+    build_option_rule_ladder_prices,
     build_rule_ladder_prices,
     compute_next_grid_order_price,
     resolve_best_quote_price,
@@ -238,6 +239,24 @@ class SmartOrderLogicTests(unittest.TestCase):
             prices,
         )
 
+    def test_build_option_rule_ladder_prices_uses_price_bands(self) -> None:
+        prices = build_option_rule_ladder_prices(
+            center_price=Decimal("0.0050"),
+            levels_each_side=3,
+        )
+        self.assertEqual(
+            [
+                Decimal("0.0065"),
+                Decimal("0.0060"),
+                Decimal("0.0055"),
+                Decimal("0.0050"),
+                Decimal("0.0049"),
+                Decimal("0.0048"),
+                Decimal("0.0047"),
+            ],
+            prices,
+        )
+
     def test_manager_maps_exchange_book_and_task_labels_into_rule_ladder(self) -> None:
         client = _FakeClient()
         with TemporaryDirectory() as temp_dir:
@@ -285,7 +304,11 @@ class SmartOrderLogicTests(unittest.TestCase):
                     active_order_side="sell",
                     waiting_for_fill=True,
                 )
-                ladder = manager.build_ladder(instrument, levels_each_side=1)
+                ladder = manager.build_ladder(
+                    instrument,
+                    levels_each_side=1,
+                    price_increment=instrument.tick_size,
+                )
                 ladder_map = {item.price: item for item in ladder}
                 self.assertEqual(Decimal("8"), ladder_map[Decimal("0.0100")].buy_working)
                 self.assertEqual(Decimal("9"), ladder_map[Decimal("0.0101")].sell_working)
@@ -323,6 +346,23 @@ class SmartOrderLogicTests(unittest.TestCase):
                 self.assertEqual([Decimal("0.011"), Decimal("0.010"), Decimal("0.009")], [item.price for item in ladder])
                 self.assertEqual(Decimal("8"), ladder_map[Decimal("0.010")].buy_working)
                 self.assertEqual(Decimal("13"), ladder_map[Decimal("0.011")].sell_working)
+            finally:
+                manager.destroy()
+
+    def test_manager_uses_option_price_bands_in_auto_ladder(self) -> None:
+        client = _FakeClient()
+        with TemporaryDirectory() as temp_dir:
+            manager = SmartOrderManager(client, storage_path=Path(temp_dir) / ".okx_quant_smart_order_tasks.json")
+            try:
+                instrument = _make_option_instrument()
+                manager.set_contract(instrument)
+                manager.ensure_market_snapshot(instrument, force=True)
+                ladder = manager.build_ladder(instrument, levels_each_side=1, price_increment=None)
+                self.assertEqual([Decimal("0.0105"), Decimal("0.0100"), Decimal("0.0095")], [item.price for item in ladder])
+                ladder_map = {item.price: item for item in ladder}
+                self.assertEqual(Decimal("13"), ladder_map[Decimal("0.0105")].sell_working)
+                self.assertEqual(Decimal("13"), ladder_map[Decimal("0.0095")].buy_working)
+                self.assertTrue(ladder_map[Decimal("0.0100")].is_last_price)
             finally:
                 manager.destroy()
 

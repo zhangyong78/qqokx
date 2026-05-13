@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from decimal import Decimal, InvalidOperation
 from tkinter import BooleanVar, END, StringVar, Text, Toplevel
 from tkinter import messagebox, ttk
@@ -24,6 +25,9 @@ from okx_quant.window_layout import apply_adaptive_window_geometry
 
 RuntimeConfigProvider = Callable[[], SmartOrderRuntimeConfig | None]
 Logger = Callable[[str], None]
+REFRESH_INTERVAL_MS = 1200
+POSITION_LIMIT_REFRESH_SECONDS = 4.0
+LADDER_INTERACTION_PAUSE_SECONDS = 1.5
 
 INSTRUMENT_TYPE_OPTIONS = {
     "现货 SPOT": "SPOT",
@@ -67,6 +71,10 @@ class SmartOrderWindow:
         self._last_task_signature: tuple[tuple[object, ...], ...] = ()
         self._last_ladder_signature: tuple[tuple[object, ...], ...] = ()
         self._last_instrument_status: str = ""
+        self._last_position_limit_status: str = ""
+        self._next_position_limit_refresh_at: float = 0.0
+        self._ladder_refresh_paused_until: float = 0.0
+        self._ladder_row_ids: tuple[str, ...] = ()
         self._favorites = list(load_smart_order_favorites_snapshot().get("favorites", []))
         self.favorite_selection = StringVar()
         self._favorite_combo: ttk.Combobox | None = None
@@ -135,7 +143,8 @@ class SmartOrderWindow:
         self.grid_size_label_text = StringVar(value="下单数量（币）")
         self.quantity_hint_text = StringVar(value="期权数量按币数输入，系统会自动换算成张数。")
 
-        self._ladder_tree: ttk.Treeview | None = None
+        self._ladder_trees: dict[str, ttk.Treeview] = {}
+        self._ladder_scroll: ttk.Scrollbar | None = None
         self._task_tree: ttk.Treeview | None = None
         self._log_text: Text | None = None
         self._ladder_filter_combo: ttk.Combobox | None = None
@@ -153,7 +162,7 @@ class SmartOrderWindow:
         self.window.deiconify()
         self.window.lift()
         self.window.focus_force()
-        self._refresh_views()
+        self._refresh_views(force_position_limit=True)
 
     def _bootstrap_locked_contract(self) -> None:
         instrument = self.manager.locked_instrument
@@ -531,11 +540,12 @@ class SmartOrderWindow:
         ladder_tree.column("price", width=120, anchor="center")
         ladder_tree.column("sell", width=120, anchor="w")
         ladder_tree.column("working", width=260, anchor="w")
-        ladder_tree.tag_configure("ladder_last_price", background="#fff7d6")
-        ladder_tree.tag_configure("ladder_best_bid", background="#e8f7ea")
-        ladder_tree.tag_configure("ladder_best_ask", background="#fae7e7")
-        ladder_tree.tag_configure("ladder_last_bid", background="#e2f4da")
-        ladder_tree.tag_configure("ladder_last_ask", background="#fde8cf")
+        ladder_tree.tag_configure("ladder_last_price", background="#fff4bf", foreground="#7c5200")
+        ladder_tree.tag_configure("ladder_best_bid", background="#dff6e6", foreground="#0f5132")
+        ladder_tree.tag_configure("ladder_best_ask", background="#fde2e1", foreground="#9f1239")
+        ladder_tree.tag_configure("ladder_working", background="#e0ecff", foreground="#1d4ed8")
+        ladder_tree.tag_configure("ladder_working_bid", background="#d2f4dc", foreground="#166534")
+        ladder_tree.tag_configure("ladder_working_ask", background="#ffd9d6", foreground="#b42318")
         ladder_tree.tag_configure("ladder_even", background="#ffffff")
         ladder_tree.tag_configure("ladder_odd", background="#f1f5f9")
         ladder_tree.grid(row=1, column=0, sticky="nsew")
@@ -544,6 +554,64 @@ class SmartOrderWindow:
         ladder_tree.configure(yscrollcommand=ladder_scroll.set)
         ladder_tree.bind("<ButtonRelease-1>", self._on_ladder_click)
         self._ladder_tree = ladder_tree
+        ladder_tree.grid_remove()
+        ladder_scroll.grid_remove()
+
+
+        ladder_grid = ttk.Frame(ladder_frame)
+        ladder_grid.grid(row=1, column=0, sticky="nsew")
+        ladder_grid.columnconfigure(0, weight=2)
+        ladder_grid.columnconfigure(1, weight=2)
+        ladder_grid.columnconfigure(2, weight=2)
+        ladder_grid.columnconfigure(3, weight=3)
+        ladder_grid.rowconfigure(0, weight=1)
+
+        for column_index, (key, title, width, anchor) in enumerate(
+            (
+                ("buy", "\u4e70\u5165", 120, "e"),
+                ("price", "\u4ef7\u683c", 120, "center"),
+                ("sell", "\u5356\u51fa", 120, "w"),
+                ("working", "\u59d4\u6258\u6620\u5c04", 260, "w"),
+            )
+        ):
+            tree = ttk.Treeview(
+                ladder_grid,
+                columns=(key,),
+                show="headings",
+                selectmode="browse",
+                height=24,
+                style="SmartOrder.Treeview",
+            )
+            tree.heading(key, text=title)
+            tree.column(key, width=width, anchor=anchor)
+            tree.grid(row=0, column=column_index, sticky="nsew")
+            tree.bind("<ButtonRelease-1>", self._on_ladder_click)
+            tree.bind("<MouseWheel>", self._on_ladder_mousewheel)
+            tree.tag_configure("buy_even", background="#edf9f0", foreground="#166534")
+            tree.tag_configure("buy_odd", background="#e1f4e7", foreground="#166534")
+            tree.tag_configure("buy_best", background="#ccefd7", foreground="#14532d")
+            tree.tag_configure("buy_working", background="#bde7ca", foreground="#14532d")
+            tree.tag_configure("price_even", background="#ffffff", foreground="#1f2937")
+            tree.tag_configure("price_odd", background="#f1f5f9", foreground="#1f2937")
+            tree.tag_configure("price_last", background="#fff4bf", foreground="#7c5200")
+            tree.tag_configure("sell_even", background="#fff0f0", foreground="#b42318")
+            tree.tag_configure("sell_odd", background="#ffe3e1", foreground="#b42318")
+            tree.tag_configure("sell_best", background="#ffd2cf", foreground="#9f1239")
+            tree.tag_configure("sell_working", background="#ffc5c0", foreground="#9f1239")
+            tree.tag_configure("work_even", background="#ffffff", foreground="#1f2937")
+            tree.tag_configure("work_odd", background="#f1f5f9", foreground="#1f2937")
+            tree.tag_configure("work_last", background="#fff4bf", foreground="#7c5200")
+            tree.tag_configure("work_bid", background="#dff6e6", foreground="#0f5132")
+            tree.tag_configure("work_ask", background="#fde2e1", foreground="#9f1239")
+            tree.tag_configure("work_active", background="#e0ecff", foreground="#1d4ed8")
+            tree.tag_configure("work_active_bid", background="#d2f4dc", foreground="#166534")
+            tree.tag_configure("work_active_ask", background="#ffd9d6", foreground="#b42318")
+            self._ladder_trees[key] = tree
+
+        self._ladder_scroll = ttk.Scrollbar(ladder_frame, orient="vertical", command=self._on_ladder_scroll)
+        self._ladder_scroll.grid(row=1, column=1, sticky="ns")
+        for tree in self._ladder_trees.values():
+            tree.configure(yscrollcommand=self._on_ladder_yview)
 
         task_frame = ttk.LabelFrame(right, text="活动任务与日志", padding=12)
         task_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
@@ -718,7 +786,7 @@ class SmartOrderWindow:
             return None
         raw = self.ladder_price_filter.get().strip()
         if not raw or raw == "自动":
-            return self._instrument.tick_size
+            return None
         try:
             value = Decimal(raw)
         except InvalidOperation:
@@ -762,7 +830,7 @@ class SmartOrderWindow:
         self.manager.ensure_market_snapshot(instrument, force=True)
         self._last_ladder_signature = ()
         self._last_instrument_status = ""
-        self._refresh_views(force_ticker=True)
+        self._refresh_views(force_ticker=True, force_position_limit=True)
 
     def submit_manual_order(self) -> None:
         instrument = self._require_instrument()
@@ -833,7 +901,7 @@ class SmartOrderWindow:
             messagebox.showerror("下单失败", str(exc), parent=self.window)
             return
         messagebox.showinfo("提示", "委托已提交。", parent=self.window)
-        self._refresh_views(force_ticker=True)
+        self._refresh_views(force_ticker=True, force_position_limit=True)
 
     def start_condition_task(self) -> None:
         instrument = self._require_instrument()
@@ -861,7 +929,7 @@ class SmartOrderWindow:
             messagebox.showerror("创建条件单失败", str(exc), parent=self.window)
             return
         messagebox.showinfo("提示", f"条件单任务 {task_id} 已创建。", parent=self.window)
-        self._refresh_views()
+        self._refresh_views(force_position_limit=True)
 
     def start_tp_sl_task(self) -> None:
         instrument = self._require_instrument()
@@ -885,7 +953,7 @@ class SmartOrderWindow:
             messagebox.showerror("启动止盈止损失败", str(exc), parent=self.window)
             return
         messagebox.showinfo("提示", f"止盈止损任务 {task_id} 已创建。", parent=self.window)
-        self._refresh_views()
+        self._refresh_views(force_position_limit=True)
 
     def restart_selected_task(self) -> None:
         if self._task_tree is None:
@@ -901,7 +969,7 @@ class SmartOrderWindow:
             messagebox.showerror("重新启动失败", str(exc), parent=self.window)
             return
         messagebox.showinfo("提示", f"任务 {selection[0]} 已重新启动。", parent=self.window)
-        self._refresh_views(force_ticker=True)
+        self._refresh_views(force_ticker=True, force_position_limit=True)
 
     def stop_selected_task(self) -> None:
         if self._task_tree is None:
@@ -916,7 +984,7 @@ class SmartOrderWindow:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("停止失败", str(exc), parent=self.window)
             return
-        self._refresh_views()
+        self._refresh_views(force_position_limit=True)
 
     def stop_all_tasks(self) -> None:
         try:
@@ -925,7 +993,7 @@ class SmartOrderWindow:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("停止失败", str(exc), parent=self.window)
             return
-        self._refresh_views()
+        self._refresh_views(force_position_limit=True)
 
     def apply_position_limit_settings(self) -> None:
         try:
@@ -942,7 +1010,7 @@ class SmartOrderWindow:
             messagebox.showerror("应用限制失败", str(exc), parent=self.window)
             return
         self._sync_position_limit_fields_from_manager()
-        self._refresh_views()
+        self._refresh_views(force_position_limit=True)
 
     def remove_selected_task(self) -> None:
         if self._task_tree is None:
@@ -958,44 +1026,57 @@ class SmartOrderWindow:
             messagebox.showerror("删除失败", str(exc), parent=self.window)
             return
         self._last_task_signature = ()
-        self._refresh_views()
+        self._refresh_views(force_position_limit=True)
 
     def _schedule_refresh(self) -> None:
         if self._destroying:
             return
         self._refresh_views()
-        self._refresh_job = self.window.after(1200, self._schedule_refresh)
+        self._refresh_job = self.window.after(REFRESH_INTERVAL_MS, self._schedule_refresh)
 
-    def _refresh_views(self, *, force_ticker: bool = False) -> None:
+    def _refresh_views(self, *, force_ticker: bool = False, force_position_limit: bool = False) -> None:
         self._refresh_lock_state()
-        self._refresh_position_limit_status()
+        now = time.monotonic()
+        should_refresh_position_limit = force_position_limit or now >= self._next_position_limit_refresh_at
+        if should_refresh_position_limit:
+            self._refresh_position_limit_status(force=force_position_limit)
+            self._next_position_limit_refresh_at = now + POSITION_LIMIT_REFRESH_SECONDS
         self._refresh_task_tree()
         self._refresh_logs()
-        self._refresh_ladder(force_ticker=force_ticker)
+        should_refresh_ladder = force_ticker or now >= self._ladder_refresh_paused_until
+        if should_refresh_ladder:
+            self._refresh_ladder(force_ticker=force_ticker)
 
-    def _refresh_position_limit_status(self) -> None:
+    def _refresh_position_limit_status(self, *, force: bool = False) -> None:
         enabled, long_limit, short_limit = self.manager.get_position_limit_config()
         if not enabled:
-            self.position_limit_status.set("未启用总仓位限制。")
+            status_text = "未启用总仓位限制。"
+            if status_text != self._last_position_limit_status:
+                self.position_limit_status.set(status_text)
+                self._last_position_limit_status = status_text
             return
         if self._instrument is None:
             long_limit_text = "-" if long_limit is None else format_decimal(long_limit)
             short_limit_text = "-" if short_limit is None else format_decimal(short_limit)
-            self.position_limit_status.set(
-                f"已启用总仓位限制 | 多头上限={long_limit_text} | 空头上限={short_limit_text}"
-            )
+            status_text = f"已启用总仓位限制 | 多头上限={long_limit_text} | 空头上限={short_limit_text}"
+            if status_text != self._last_position_limit_status:
+                self.position_limit_status.set(status_text)
+                self._last_position_limit_status = status_text
             return
         try:
             runtime = self._require_runtime()
-            state = self.manager.get_position_limit_state(self._instrument, runtime)
+            state = self.manager.get_position_limit_state(self._instrument, runtime, force=force)
         except Exception as exc:  # noqa: BLE001
-            self.position_limit_status.set(f"仓位限制状态获取失败：{exc}")
+            status_text = f"仓位限制状态获取失败：{exc}"
+            if status_text != self._last_position_limit_status:
+                self.position_limit_status.set(status_text)
+                self._last_position_limit_status = status_text
             return
         long_limit_text = "-" if state.long_limit is None else self._convert_internal_size_to_display_size(state.long_limit)
         short_limit_text = "-" if state.short_limit is None else self._convert_internal_size_to_display_size(state.short_limit)
         long_available = "-" if state.available_long is None else self._convert_internal_size_to_display_size(state.available_long)
         short_available = "-" if state.available_short is None else self._convert_internal_size_to_display_size(state.available_short)
-        self.position_limit_status.set(
+        status_text = (
             "多头：实际 {actual_long} + 预留 {reserved_long} = 占用 {used_long} / 上限 {long_limit} / 可用 {long_available}\n"
             "空头：实际 {actual_short} + 预留 {reserved_short} = 占用 {used_short} / 上限 {short_limit} / 可用 {short_available}".format(
                 actual_long=self._convert_internal_size_to_display_size(state.actual_long) or "0",
@@ -1010,6 +1091,9 @@ class SmartOrderWindow:
                 short_available=short_available,
             )
         )
+        if status_text != self._last_position_limit_status:
+            self.position_limit_status.set(status_text)
+            self._last_position_limit_status = status_text
 
     def _refresh_lock_state(self) -> None:
         lock_id = self.manager.locked_inst_id
@@ -1038,12 +1122,14 @@ class SmartOrderWindow:
         self._last_task_signature = signature
         selection = self._task_tree.selection()
         selected_id = selection[0] if selection else None
-        self._task_tree.delete(*self._task_tree.get_children())
+        task_ids = tuple(item.task_id for item in tasks)
+        if tuple(self._task_tree.get_children()) != task_ids:
+            self._task_tree.delete(*self._task_tree.get_children())
+            for item in tasks:
+                self._task_tree.insert("", END, iid=item.task_id, values=("",))
         for item in tasks:
-            self._task_tree.insert(
-                "",
-                END,
-                iid=item.task_id,
+            self._task_tree.item(
+                item.task_id,
                 values=(
                     item.task_id,
                     item.task_type,
@@ -1065,14 +1151,28 @@ class SmartOrderWindow:
         logs = tuple(self.manager.list_logs())
         if logs == self._last_log_signature:
             return
+        previous_logs = self._last_log_signature
         self._last_log_signature = logs
+        if not previous_logs:
+            self._log_text.delete("1.0", END)
+            if logs:
+                self._log_text.insert(END, "\n".join(logs))
+                self._log_text.see(END)
+            return
+        if len(logs) >= len(previous_logs) and logs[: len(previous_logs)] == previous_logs:
+            appended = logs[len(previous_logs) :]
+            if appended:
+                prefix = "\n" if self._log_text.index("end-1c") != "1.0" else ""
+                self._log_text.insert(END, prefix + "\n".join(appended))
+                self._log_text.see(END)
+            return
         self._log_text.delete("1.0", END)
         if logs:
             self._log_text.insert(END, "\n".join(logs))
             self._log_text.see(END)
 
     def _refresh_ladder(self, *, force_ticker: bool = False) -> None:
-        if self._ladder_tree is None or self._instrument is None:
+        if not self._ladder_trees or self._instrument is None:
             return
         try:
             if force_ticker:
@@ -1092,10 +1192,10 @@ class SmartOrderWindow:
         ask1 = order_book.asks[0][0] if order_book is not None and order_book.asks else ticker.ask
         latest = ticker.last or ticker.mark or ticker.index
         status_text = (
-            f"{self._instrument.inst_id} | \u6700\u65b0={format_decimal_by_increment(latest, self._instrument.tick_size) if latest is not None else '-'}"
-            f" | \u4e70\u4e00={format_decimal_by_increment(bid1, self._instrument.tick_size) if bid1 is not None else '-'}"
-            f" | \u5356\u4e00={format_decimal_by_increment(ask1, self._instrument.tick_size) if ask1 is not None else '-'}"
-            f" | tick={format_decimal(self._instrument.tick_size)} | \u6700\u5c0f\u4e0b\u5355\u91cf={format_decimal(self._instrument.min_size)}"
+            f"{self._instrument.inst_id} | 最新={format_decimal_by_increment(latest, self._instrument.tick_size) if latest is not None else '-'}"
+            f" | 买一={format_decimal_by_increment(bid1, self._instrument.tick_size) if bid1 is not None else '-'}"
+            f" | 卖一={format_decimal_by_increment(ask1, self._instrument.tick_size) if ask1 is not None else '-'}"
+            f" | {self._format_ladder_tick_status()} | 最小下单量={format_decimal(self._instrument.min_size)}"
         )
         if status_text != self._last_instrument_status:
             self.instrument_status.set(status_text)
@@ -1115,52 +1215,151 @@ class SmartOrderWindow:
         if signature == self._last_ladder_signature:
             return
         self._last_ladder_signature = signature
-        selected = self._ladder_tree.selection()
-        selected_id = selected[0] if selected else None
-        self._ladder_tree.delete(*self._ladder_tree.get_children())
+        selected_id = self._selected_ladder_row_id()
+        row_payloads: list[dict[str, object]] = []
         for row_index, level in enumerate(ladder):
             iid = format_decimal_by_increment(level.price, self._instrument.tick_size)
             marker_labels: list[str] = []
-            tags: list[str] = ["ladder_even" if row_index % 2 == 0 else "ladder_odd"]
             if level.is_best_ask:
-                marker_labels.append("---- \u5356\u4e00")
-                tags.append("ladder_best_ask")
+                marker_labels.append("---- 卖一")
             if level.is_last_price:
-                marker_labels.append("---- \u6700\u65b0\u4ef7")
-                tags.append("ladder_last_price" if not level.is_best_ask else "ladder_last_ask")
+                marker_labels.append("---- 最新价")
             if level.is_best_bid:
-                marker_labels.append("---- \u4e70\u4e00")
-                tags.append("ladder_best_bid" if not level.is_last_price else "ladder_last_bid")
-            working_labels = [*marker_labels, *level.working_labels]
-            self._ladder_tree.insert(
-                "",
-                END,
-                iid=iid,
-                values=(
-                    "-" if level.buy_working is None else format_decimal(level.buy_working),
-                    iid,
-                    "-" if level.sell_working is None else format_decimal(level.sell_working),
-                    " | ".join(working_labels) if working_labels else "",
-                ),
-                tags=tuple(tags),
+                marker_labels.append("---- 买一")
+            working_text = " | ".join([*marker_labels, *level.working_labels]) if marker_labels or level.working_labels else ""
+            is_even = row_index % 2 == 0
+            row_payloads.append(
+                {
+                    "iid": iid,
+                    "buy": "-" if level.buy_working is None else format_decimal(level.buy_working),
+                    "price": iid,
+                    "sell": "-" if level.sell_working is None else format_decimal(level.sell_working),
+                    "working": working_text,
+                    "buy_tags": self._ladder_buy_tags(level, is_even),
+                    "price_tags": self._ladder_price_tags(level, is_even),
+                    "sell_tags": self._ladder_sell_tags(level, is_even),
+                    "working_tags": self._ladder_working_tags(level, is_even),
+                }
             )
-        if selected_id and self._ladder_tree.exists(selected_id):
-            self._ladder_tree.selection_set(selected_id)
-            self._ladder_tree.focus(selected_id)
+        self._apply_ladder_rows(row_payloads)
+        if selected_id and selected_id in self._ladder_row_ids:
+            self._select_ladder_row(selected_id)
+
+    def _selected_ladder_row_id(self) -> str | None:
+        for tree in self._ladder_trees.values():
+            selected = tree.selection()
+            if selected:
+                return selected[0]
+        return None
+
+    def _select_ladder_row(self, row_id: str) -> None:
+        for tree in self._ladder_trees.values():
+            if tree.exists(row_id):
+                tree.selection_set(row_id)
+                tree.focus(row_id)
+
+    def _pause_ladder_refresh(self, *, seconds: float = LADDER_INTERACTION_PAUSE_SECONDS) -> None:
+        self._ladder_refresh_paused_until = max(self._ladder_refresh_paused_until, time.monotonic() + seconds)
+
+    def _on_ladder_yview(self, first, last) -> None:
+        if self._ladder_scroll is not None:
+            self._ladder_scroll.set(first, last)
+
+    def _on_ladder_scroll(self, *args) -> None:
+        self._pause_ladder_refresh()
+        for tree in self._ladder_trees.values():
+            tree.yview(*args)
+
+    def _on_ladder_mousewheel(self, event):
+        delta = -1 if event.delta > 0 else 1
+        self._pause_ladder_refresh()
+        self._on_ladder_scroll("scroll", delta, "units")
+        return "break"
+
+    def _apply_ladder_rows(self, row_payloads: list[dict[str, object]]) -> None:
+        row_ids = tuple(str(item["iid"]) for item in row_payloads)
+        sample_tree = next(iter(self._ladder_trees.values()))
+        current_top = sample_tree.yview()[0] if sample_tree.yview() else 0.0
+        if row_ids != self._ladder_row_ids:
+            for tree in self._ladder_trees.values():
+                tree.delete(*tree.get_children())
+            for item in row_payloads:
+                iid = str(item["iid"])
+                self._ladder_trees["buy"].insert("", END, iid=iid, values=(item["buy"],), tags=tuple(item["buy_tags"]))
+                self._ladder_trees["price"].insert("", END, iid=iid, values=(item["price"],), tags=tuple(item["price_tags"]))
+                self._ladder_trees["sell"].insert("", END, iid=iid, values=(item["sell"],), tags=tuple(item["sell_tags"]))
+                self._ladder_trees["working"].insert("", END, iid=iid, values=(item["working"],), tags=tuple(item["working_tags"]))
+            self._ladder_row_ids = row_ids
+            if current_top > 0:
+                for tree in self._ladder_trees.values():
+                    tree.yview_moveto(current_top)
+            return
+        for item in row_payloads:
+            iid = str(item["iid"])
+            self._ladder_trees["buy"].item(iid, values=(item["buy"],), tags=tuple(item["buy_tags"]))
+            self._ladder_trees["price"].item(iid, values=(item["price"],), tags=tuple(item["price_tags"]))
+            self._ladder_trees["sell"].item(iid, values=(item["sell"],), tags=tuple(item["sell_tags"]))
+            self._ladder_trees["working"].item(iid, values=(item["working"],), tags=tuple(item["working_tags"]))
+
+    def _ladder_buy_tags(self, level, is_even: bool) -> tuple[str, ...]:
+        if level.buy_working is not None:
+            return ("buy_working",)
+        if level.is_best_bid:
+            return ("buy_best",)
+        return ("buy_even" if is_even else "buy_odd",)
+
+    def _ladder_price_tags(self, level, is_even: bool) -> tuple[str, ...]:
+        if level.is_last_price:
+            return ("price_last",)
+        return ("price_even" if is_even else "price_odd",)
+
+    def _ladder_sell_tags(self, level, is_even: bool) -> tuple[str, ...]:
+        if level.sell_working is not None:
+            return ("sell_working",)
+        if level.is_best_ask:
+            return ("sell_best",)
+        return ("sell_even" if is_even else "sell_odd",)
+
+    def _ladder_working_tags(self, level, is_even: bool) -> tuple[str, ...]:
+        if level.working_labels and level.is_best_bid:
+            return ("work_active_bid",)
+        if level.working_labels and level.is_best_ask:
+            return ("work_active_ask",)
+        if level.working_labels:
+            return ("work_active",)
+        if level.is_best_bid:
+            return ("work_bid",)
+        if level.is_best_ask:
+            return ("work_ask",)
+        if level.is_last_price:
+            return ("work_last",)
+        return ("work_even" if is_even else "work_odd",)
+
+    def _format_ladder_tick_status(self) -> str:
+        if self._instrument is None:
+            return "tick=-"
+        raw = self.ladder_price_filter.get().strip()
+        if self._instrument.inst_type == "OPTION" and (not raw or raw == "自动"):
+            return "盘口步长=0.0005(>=0.0050) / 0.0001(<0.0050)"
+        return f"tick={format_decimal(self._instrument.tick_size)}"
 
     def _on_ladder_click(self, event) -> None:
-        if self._ladder_tree is None or self._instrument is None:
+        if self._instrument is None:
             return
-        row_id = self._ladder_tree.identify_row(event.y)
-        column = self._ladder_tree.identify_column(event.x)
+        column_key = next((key for key, tree in self._ladder_trees.items() if tree is event.widget), None)
+        if column_key is None:
+            return
+        row_id = event.widget.identify_row(event.y)
         if not row_id:
             return
+        self._pause_ladder_refresh()
+        self._select_ladder_row(row_id)
         price = Decimal(row_id)
-        if not self.grid_enabled.get() or column not in {"#1", "#3"}:
+        if not self.grid_enabled.get() or column_key not in {"buy", "sell"}:
             self.manual_price.set(format_decimal_by_increment(price, self._instrument.tick_size))
-            if column == "#1":
+            if column_key == "buy":
                 self.manual_side.set("buy")
-            elif column == "#3":
+            elif column_key == "sell":
                 self.manual_side.set("sell")
             return
         try:
@@ -1168,7 +1367,7 @@ class SmartOrderWindow:
             task_id = self.manager.start_grid_task(
                 instrument=self._instrument,
                 runtime=runtime,
-                side="buy" if column == "#1" else "sell",
+                side="buy" if column_key == "buy" else "sell",
                 entry_price=price,
                 size=self._convert_input_size_to_order_size(self.grid_order_size.get(), self.grid_size_label_text.get(), self._instrument),
                 long_step=self._parse_positive_decimal(self.grid_long_step.get(), "多单参数"),
@@ -1180,7 +1379,7 @@ class SmartOrderWindow:
             messagebox.showerror("创建网格任务失败", str(exc), parent=self.window)
             return
         self._logger(f"[无限下单] 规则盘口点击创建网格任务 {task_id} | {self._instrument.inst_id} | 价格={format_decimal_by_increment(price, self._instrument.tick_size)}")
-        self._refresh_views()
+        self._refresh_views(force_position_limit=True)
 
     def _on_close(self) -> None:
         if self.manager.has_active_or_pending_tasks():

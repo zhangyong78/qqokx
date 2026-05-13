@@ -4,22 +4,166 @@ from datetime import datetime
 from decimal import Decimal
 from unittest import TestCase
 
+from okx_quant.analysis import BoxDetectionConfig, ChannelDetectionConfig, PivotDetectionConfig
+from okx_quant.analysis.structure_models import PriceLine
+from okx_quant.auto_channel_preview import build_auto_channel_preview_snapshot
 from okx_quant.models import Candle
 from okx_quant.strategy_live_chart import (
     StrategyLiveChartLayout,
+    StrategyLiveChartLineOverlay,
     StrategyLiveChartSnapshot,
     StrategyLiveChartTimeMarker,
+    build_auto_channel_live_chart_snapshot,
     build_strategy_live_chart_snapshot,
     layout_price_to_y,
     layout_price_to_y_unclamped,
     line_trading_desk_max_view_start,
     line_trading_desk_visible_bar_count,
+    slice_strategy_live_chart_snapshot,
     slice_strategy_live_chart_snapshot_with_desk_right_pad,
     strategy_live_chart_price_bounds,
 )
 
 
 class StrategyLiveChartHelpersTest(TestCase):
+    def test_build_auto_channel_snapshot_adds_structure_overlays(self) -> None:
+        candles = []
+        for index in range(16):
+            base = Decimal("10") + (Decimal("0.5") * Decimal(index))
+            low = base + Decimal("0.8")
+            high = base + Decimal("3")
+            if index in {2, 8}:
+                low = base
+            if index in {4, 10}:
+                high = base + Decimal("5")
+            close = (low + high) / Decimal("2")
+            candles.append(
+                Candle(
+                    ts=1714330800000 + index * 60_000,
+                    open=close,
+                    high=high,
+                    low=low,
+                    close=close,
+                    volume=Decimal("1"),
+                    confirmed=True,
+                )
+            )
+
+        snapshot = build_auto_channel_live_chart_snapshot(
+            session_id="auto",
+            candles=candles,
+            channel_config=ChannelDetectionConfig(
+                pivot=PivotDetectionConfig(
+                    left_bars=1,
+                    right_bars=1,
+                    atr_period=2,
+                    atr_multiplier=Decimal("0"),
+                    min_index_distance=1,
+                ),
+                min_anchor_distance=4,
+                min_channel_bars=8,
+                max_violations=0,
+            ),
+            box_config=BoxDetectionConfig(
+                pivot=PivotDetectionConfig(left_bars=1, right_bars=1, atr_period=2, atr_multiplier=Decimal("0")),
+                min_box_bars=8,
+            ),
+        )
+
+        self.assertEqual(len(snapshot.band_overlays), 1)
+        self.assertEqual(len(snapshot.line_overlays), 1)
+        self.assertTrue(snapshot.point_overlays)
+        self.assertIn("通道", snapshot.note)
+        lower, upper = strategy_live_chart_price_bounds(snapshot)
+        self.assertLessEqual(lower, Decimal("11"))
+        self.assertGreaterEqual(upper, Decimal("20"))
+
+    def test_auto_channel_preview_snapshots_are_renderable(self) -> None:
+        channel = build_auto_channel_preview_snapshot("channel")
+        box = build_auto_channel_preview_snapshot("box")
+
+        self.assertTrue(channel.candles)
+        self.assertTrue(channel.band_overlays or channel.box_overlays)
+        self.assertEqual(channel.right_pad_bars, 50)
+        if channel.band_overlays:
+            self.assertGreaterEqual(channel.band_overlays[0].end_index, len(channel.candles) + 49)
+        self.assertTrue(box.candles)
+        self.assertTrue(box.band_overlays or box.box_overlays)
+        self.assertIn("自动通道预览", channel.note)
+
+    def test_auto_channel_snapshot_can_reserve_future_blank_bars(self) -> None:
+        candles = []
+        for index in range(16):
+            base = Decimal("10") + (Decimal("0.5") * Decimal(index))
+            low = base + Decimal("0.8")
+            high = base + Decimal("3")
+            if index in {2, 8}:
+                low = base
+            if index in {4, 10}:
+                high = base + Decimal("5")
+            close = (low + high) / Decimal("2")
+            candles.append(
+                Candle(
+                    ts=1714330800000 + index * 60_000,
+                    open=close,
+                    high=high,
+                    low=low,
+                    close=close,
+                    volume=Decimal("1"),
+                    confirmed=True,
+                )
+            )
+
+        snapshot = build_auto_channel_live_chart_snapshot(
+            session_id="auto-pad",
+            candles=candles,
+            channel_config=ChannelDetectionConfig(
+                pivot=PivotDetectionConfig(
+                    left_bars=1,
+                    right_bars=1,
+                    atr_period=2,
+                    atr_multiplier=Decimal("0"),
+                    min_index_distance=1,
+                ),
+                min_anchor_distance=4,
+                min_channel_bars=8,
+                max_violations=0,
+            ),
+            right_pad_bars=50,
+            channel_extend_bars=50,
+        )
+
+        self.assertEqual(snapshot.right_pad_bars, 50)
+        self.assertEqual(len(snapshot.candles), 16)
+        self.assertEqual(len(snapshot.band_overlays), 1)
+        self.assertEqual(snapshot.band_overlays[0].end_index, 65)
+        self.assertEqual(snapshot.line_overlays[0].line.end_index, 65)
+
+    def test_slice_strategy_live_chart_snapshot_shifts_structure_overlays(self) -> None:
+        candles = [
+            Candle(ts=1000 + i * 60_000, open=Decimal("100"), high=Decimal("101"), low=Decimal("99"), close=Decimal("100"), volume=Decimal("1"), confirmed=True)
+            for i in range(20)
+        ]
+        snapshot = StrategyLiveChartSnapshot(
+            session_id="slice",
+            candles=tuple(candles),
+            line_overlays=(
+                StrategyLiveChartLineOverlay(
+                    key="line",
+                    label="line",
+                    line=PriceLine(5, Decimal("100"), 15, Decimal("110")),
+                    color="#2563eb",
+                ),
+            ),
+        )
+
+        sliced = slice_strategy_live_chart_snapshot(snapshot, 10, 5)
+
+        self.assertEqual(len(sliced.line_overlays), 1)
+        self.assertEqual(sliced.line_overlays[0].line.start_index, 0)
+        self.assertEqual(sliced.line_overlays[0].line.end_index, 4)
+        self.assertEqual(sliced.line_overlays[0].line.start_price, Decimal("105"))
+
     def test_build_strategy_live_chart_snapshot_deduplicates_duplicate_period_series_and_markers(self) -> None:
         candles = [
             Candle(ts=1, open=Decimal("100"), high=Decimal("102"), low=Decimal("99"), close=Decimal("101"), volume=Decimal("1"), confirmed=True),
