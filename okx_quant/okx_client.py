@@ -17,6 +17,7 @@ from urllib import error, parse, request
 from okx_quant.candle_cache import (
     DEFAULT_CANDLE_CACHE_CAPACITY,
     load_candle_cache,
+    load_candle_cache_range,
     merge_candles,
     save_candle_cache,
 )
@@ -439,7 +440,7 @@ class OkxRestClient:
     ) -> list[Candle]:
         fetch_full_history = limit <= 0
         requested_limit = 0 if fetch_full_history else max(1, limit)
-        cached = load_candle_cache(inst_id, bar)
+        cached = load_candle_cache(inst_id, bar, limit=None if fetch_full_history else requested_limit)
         cached_ts = {candle.ts for candle in cached}
         latest_added_ts: set[int] = set()
         older_added_ts: set[int] = set()
@@ -620,7 +621,14 @@ class OkxRestClient:
             if len(batch) < page_limit:
                 break
 
-        cached = load_candle_cache(inst_id, bar)
+        cached = load_candle_cache_range(
+            inst_id,
+            bar,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            limit=None if fetch_full_history else requested_limit,
+            preload_count=preload_limit,
+        )
         merged = merge_candles(cached, merge_candles(preload_collected, selected_collected))
 
         in_range = [candle for candle in merged if start_ts <= candle.ts <= end_ts]

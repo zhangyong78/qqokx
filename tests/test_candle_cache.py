@@ -1,9 +1,16 @@
+import json
 from decimal import Decimal
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 import okx_quant.okx_client as okx_client_module
-from okx_quant.candle_cache import load_candle_cache, merge_candles, save_candle_cache
+from okx_quant.candle_cache import (
+    candle_cache_file_path,
+    load_candle_cache,
+    load_candle_cache_range,
+    merge_candles,
+    save_candle_cache,
+)
 from okx_quant.models import Candle
 from okx_quant.okx_client import OkxRestClient
 
@@ -57,6 +64,62 @@ class CandleCacheTest(TestCase):
 
         self.assertEqual(loaded, candles)
 
+    def test_load_limit_returns_latest_cached_candles(self) -> None:
+        candles = [_build_candle(index, str(100 + index)) for index in range(1, 6)]
+
+        with TemporaryDirectory() as temp_dir:
+            save_candle_cache("BTC-USDT-SWAP", "15m", candles, base_dir=temp_dir)
+            loaded = load_candle_cache("BTC-USDT-SWAP", "15m", limit=2, base_dir=temp_dir)
+
+        self.assertEqual([candle.ts for candle in loaded], [4, 5])
+
+    def test_load_range_returns_preload_and_limited_selection(self) -> None:
+        candles = [_build_candle(index, str(100 + index)) for index in range(1, 8)]
+
+        with TemporaryDirectory() as temp_dir:
+            save_candle_cache("BTC-USDT-SWAP", "15m", candles, base_dir=temp_dir)
+            loaded = load_candle_cache_range(
+                "BTC-USDT-SWAP",
+                "15m",
+                start_ts=3,
+                end_ts=6,
+                limit=2,
+                preload_count=2,
+                base_dir=temp_dir,
+            )
+
+        self.assertEqual([candle.ts for candle in loaded], [1, 2, 5, 6])
+
+    def test_legacy_json_cache_migrates_to_sqlite(self) -> None:
+        payload = {
+            "inst_id": "BTC-USDT-SWAP",
+            "bar": "15m",
+            "candles": [
+                {
+                    "ts": 1,
+                    "open": "100.123456789",
+                    "high": "101.123456789",
+                    "low": "99.123456789",
+                    "close": "100.223456789",
+                    "volume": "1.5",
+                    "confirmed": False,
+                }
+            ],
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            legacy_path = candle_cache_file_path("BTC-USDT-SWAP", "15m", base_dir=temp_dir)
+            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            migrated = load_candle_cache("BTC-USDT-SWAP", "15m", base_dir=temp_dir)
+            legacy_path.unlink()
+            loaded_from_sqlite = load_candle_cache("BTC-USDT-SWAP", "15m", base_dir=temp_dir)
+
+        self.assertEqual(migrated, loaded_from_sqlite)
+        self.assertEqual(migrated[0].close, Decimal("100.223456789"))
+        self.assertFalse(migrated[0].confirmed)
+
     def test_merge_candles_dedupes_and_sorts(self) -> None:
         merged = merge_candles(
             [_build_candle(2, "102"), _build_candle(1, "101")],
@@ -74,7 +137,7 @@ class CandleCacheTest(TestCase):
 
         original_load = okx_client_module.load_candle_cache
         original_save = okx_client_module.save_candle_cache
-        okx_client_module.load_candle_cache = lambda inst_id, bar: list(cached)
+        okx_client_module.load_candle_cache = lambda inst_id, bar, **kwargs: list(cached)
         okx_client_module.save_candle_cache = (
             lambda inst_id, bar, candles, max_records=None: saved_snapshots.append(list(candles))
         )
@@ -105,7 +168,7 @@ class CandleCacheTest(TestCase):
 
         original_load = okx_client_module.load_candle_cache
         original_save = okx_client_module.save_candle_cache
-        okx_client_module.load_candle_cache = lambda inst_id, bar: []
+        okx_client_module.load_candle_cache = lambda inst_id, bar, **kwargs: []
         okx_client_module.save_candle_cache = (
             lambda inst_id, bar, candles, max_records=None: saved_snapshots.append((list(candles), max_records))
         )
@@ -143,7 +206,7 @@ class CandleCacheTest(TestCase):
         original_load = okx_client_module.load_candle_cache
         original_save = okx_client_module.save_candle_cache
         original_interval = okx_client_module.FULL_HISTORY_CHECKPOINT_PAGE_INTERVAL
-        okx_client_module.load_candle_cache = lambda inst_id, bar: []
+        okx_client_module.load_candle_cache = lambda inst_id, bar, **kwargs: []
         okx_client_module.save_candle_cache = (
             lambda inst_id, bar, candles, max_records=None: saved_snapshots.append((list(candles), max_records))
         )
@@ -182,8 +245,12 @@ class CandleCacheTest(TestCase):
         client = DummyHistoryClient({"2700001": page_after_end, "1800000": []})
         saved: list[list[Candle]] = []
         original_load = okx_client_module.load_candle_cache
+        original_load_range = okx_client_module.load_candle_cache_range
         original_save = okx_client_module.save_candle_cache
-        okx_client_module.load_candle_cache = lambda inst_id, bar: list(cached)
+        okx_client_module.load_candle_cache = lambda inst_id, bar, **kwargs: list(cached)
+        okx_client_module.load_candle_cache_range = (
+            lambda inst_id, bar, start_ts, end_ts, limit=None, preload_count=0: list(cached)
+        )
         okx_client_module.save_candle_cache = (
             lambda inst_id, bar, candles, max_records=None: saved.append(list(candles))
         )
@@ -198,6 +265,7 @@ class CandleCacheTest(TestCase):
             )
         finally:
             okx_client_module.load_candle_cache = original_load
+            okx_client_module.load_candle_cache_range = original_load_range
             okx_client_module.save_candle_cache = original_save
 
         self.assertEqual([c.ts for c in out], [900_000, 1_800_000, 2_700_000])

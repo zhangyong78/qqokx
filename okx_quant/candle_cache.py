@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import json
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 
-from decimal import Decimal
-
+from okx_quant.candle_store import (
+    get_candles,
+    get_candles_before,
+    migrate_json_cache_file,
+    upsert_candles,
+)
 from okx_quant.models import Candle
 from okx_quant.persistence import candle_cache_dir_path as _candle_cache_dir_path
 
@@ -43,39 +45,37 @@ def load_candle_cache(
     limit: int | None = None,
     base_dir: Path | None = None,
 ) -> list[Candle]:
-    target = candle_cache_file_path(inst_id, bar, base_dir)
-    if not target.exists():
-        return []
-    try:
-        payload = json.loads(target.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    rows = payload.get("candles") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
-        return []
+    _migrate_legacy_json_if_needed(inst_id, bar, base_dir)
+    return get_candles(inst_id, bar, limit=limit, base_dir=base_dir)
 
-    candles: list[Candle] = []
-    for item in rows:
-        if not isinstance(item, dict):
-            continue
-        try:
-            candles.append(
-                Candle(
-                    ts=int(item["ts"]),
-                    open=Decimal(str(item["open"])),
-                    high=Decimal(str(item["high"])),
-                    low=Decimal(str(item["low"])),
-                    close=Decimal(str(item["close"])),
-                    volume=Decimal(str(item.get("volume", "0"))),
-                    confirmed=bool(item.get("confirmed", True)),
-                )
-            )
-        except Exception:
-            continue
-    merged = merge_candles(candles)
-    if limit is not None:
-        return merged[-max(0, limit) :]
-    return merged
+
+def load_candle_cache_range(
+    inst_id: str,
+    bar: str,
+    *,
+    start_ts: int,
+    end_ts: int,
+    limit: int | None = None,
+    preload_count: int = 0,
+    base_dir: Path | None = None,
+) -> list[Candle]:
+    _migrate_legacy_json_if_needed(inst_id, bar, base_dir)
+    selected = get_candles(
+        inst_id,
+        bar,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        limit=limit,
+        base_dir=base_dir,
+    )
+    preload = get_candles_before(
+        inst_id,
+        bar,
+        before_ts=start_ts,
+        limit=max(0, preload_count),
+        base_dir=base_dir,
+    )
+    return merge_candles(preload, selected)
 
 
 def save_candle_cache(
@@ -89,24 +89,11 @@ def save_candle_cache(
     target = candle_cache_file_path(inst_id, bar, base_dir)
     target.parent.mkdir(parents=True, exist_ok=True)
     merged = merge_candles(candles, max_records=max_records)
-    payload = {
-        "inst_id": inst_id,
-        "bar": bar,
-        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        "candles": [
-            {
-                "ts": candle.ts,
-                "open": str(candle.open),
-                "high": str(candle.high),
-                "low": str(candle.low),
-                "close": str(candle.close),
-                "volume": str(candle.volume),
-                "confirmed": candle.confirmed,
-            }
-            for candle in merged
-        ],
-    }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
+    upsert_candles(inst_id, bar, merged, base_dir=base_dir)
     return target
+
+
+def _migrate_legacy_json_if_needed(inst_id: str, bar: str, base_dir: Path | None) -> None:
+    target = candle_cache_file_path(inst_id, bar, base_dir)
+    if target.exists():
+        migrate_json_cache_file(inst_id, bar, target, base_dir=base_dir)

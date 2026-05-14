@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Callable, Literal, TYPE_CHECKING
+import inspect
+from typing import TYPE_CHECKING, Callable, Literal
 
 from okx_quant.models import Credentials, Instrument, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderResult
@@ -171,7 +172,7 @@ class EngineOrderService:
             inst_id=trade_instrument.inst_id,
             cl_ord_id=resolved_cl_ord_id,
             label=label,
-            submit_fn=lambda: engine._client.place_simple_order(
+            submit_fn=lambda: self._place_simple_order_compat(
                 credentials,
                 config,
                 inst_id=trade_instrument.inst_id,
@@ -205,3 +206,33 @@ class EngineOrderService:
             cl_ord_id=engine._next_client_order_id(role="exit"),
             label="平仓报单",
         )
+
+    def _place_simple_order_compat(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        ord_type: str,
+        pos_side: Literal["long", "short"] | None,
+        cl_ord_id: str,
+        reduce_only: bool,
+    ) -> OkxOrderResult:
+        place_simple_order = self._engine._client.place_simple_order
+        kwargs = {
+            "inst_id": inst_id,
+            "side": side,
+            "size": size,
+            "ord_type": ord_type,
+            "pos_side": pos_side,
+            "cl_ord_id": cl_ord_id,
+        }
+        try:
+            parameters = inspect.signature(place_simple_order).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "reduce_only" in parameters:
+            kwargs["reduce_only"] = reduce_only
+        return place_simple_order(credentials, config, **kwargs)
