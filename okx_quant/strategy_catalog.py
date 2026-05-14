@@ -10,6 +10,7 @@ STRATEGY_CROSS_ID = "ema_cross_market"
 STRATEGY_EMA_BREAKOUT_LONG_ID = "ema_breakout_long"
 STRATEGY_EMA_BREAKDOWN_SHORT_ID = "ema_breakdown_short"
 STRATEGY_EMA5_EMA8_ID = "ema5_ema8_cross_stop"
+STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID = "adaptive_ema_rail_long"
 
 
 def is_ema_atr_breakout_strategy(strategy_id: str) -> bool:
@@ -19,6 +20,10 @@ def is_ema_atr_breakout_strategy(strategy_id: str) -> bool:
         STRATEGY_EMA_BREAKDOWN_SHORT_ID,
         STRATEGY_CROSS_ID,
     }
+
+
+def is_adaptive_ema_rail_strategy(strategy_id: str) -> bool:
+    return strategy_id == STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID
 
 
 @dataclass(frozen=True)
@@ -134,6 +139,21 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
         supports_trader_desk=True,
     ),
     StrategyDefinition(
+        strategy_id=STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+        name="Adaptive EMA Rail 做多",
+        summary="自动寻找当前被市场尊重的支撑型 EMA，并在轨道确认后按回踩委托做多。",
+        rule_description=(
+            "先用 EMA200 斜率与高低点结构过滤趋势，再对候选 EMA 计算 Respect Score；"
+            "当主导轨道完成至少两次有效反弹后，按当前主导 EMA 挂多头回踩委托。"
+        ),
+        parameter_hint="V1 固定候选 EMA 集合与 Respect Score 默认阈值，重点验证轨道识别和回测表现。",
+        default_signal_label="只做多",
+        allowed_signal_labels=("只做多",),
+        supports_trade=False,
+        supports_signal_only=False,
+        supports_backtest=True,
+    ),
+    StrategyDefinition(
         strategy_id=STRATEGY_DYNAMIC_ID,
         name="EMA 动态委托",
         summary="通用 EMA 动态委托策略入口，通常由做多/做空两个方向版本承接。",
@@ -146,14 +166,19 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     ),
 )
 
-_STRATEGY_IDS_HIDDEN_FROM_LAUNCHER: frozenset[str] = frozenset({STRATEGY_DYNAMIC_ID, STRATEGY_CROSS_ID})
+_STRATEGY_IDS_HIDDEN_FROM_LAUNCHER: frozenset[str] = frozenset(
+    {STRATEGY_DYNAMIC_ID, STRATEGY_CROSS_ID, STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID}
+)
+_STRATEGY_IDS_HIDDEN_FROM_BACKTEST: frozenset[str] = frozenset({STRATEGY_DYNAMIC_ID, STRATEGY_CROSS_ID})
 
 VISIBLE_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = tuple(
     item for item in ALL_STRATEGY_DEFINITIONS if item.strategy_id not in _STRATEGY_IDS_HIDDEN_FROM_LAUNCHER
 )
 
 BACKTEST_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = tuple(
-    item for item in VISIBLE_STRATEGY_DEFINITIONS if item.supports_backtest
+    item
+    for item in ALL_STRATEGY_DEFINITIONS
+    if item.supports_backtest and item.strategy_id not in _STRATEGY_IDS_HIDDEN_FROM_BACKTEST
 )
 
 STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = VISIBLE_STRATEGY_DEFINITIONS
@@ -199,4 +224,6 @@ def resolve_dynamic_signal_mode(strategy_id: str, signal_mode: str) -> str:
         return "long_only"
     if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID:
         return "short_only"
+    if strategy_id == STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID:
+        return "long_only"
     return signal_mode

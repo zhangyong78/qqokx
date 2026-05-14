@@ -16,6 +16,7 @@ from okx_quant.option_strategy_ui import (
     _build_deribit_option_chart_candles,
     _build_volatility_candles_from_reference,
     _normalized_kline_view,
+    _strategy_leg_quote_currency,
     _pan_kline_view,
     _zoom_kline_view,
 )
@@ -64,6 +65,69 @@ def _make_instrument(inst_id: str) -> Instrument:
 
 
 class OptionStrategyTest(TestCase):
+    def test_strategy_leg_quote_currency_prefers_instrument_and_falls_back_to_contract(self) -> None:
+        instrument = _make_instrument("BTC-USD-260626-90000-C")
+
+        self.assertEqual(
+            _strategy_leg_quote_currency(instrument.inst_id, {instrument.inst_id: instrument}),
+            "BTC",
+        )
+        self.assertEqual(_strategy_leg_quote_currency("ETH-USDT-260626-3000-C", {}), "ETH")
+
+    def test_option_value_approx_usdt_converts_coin_margined_leg(self) -> None:
+        window = OptionStrategyCalculatorWindow.__new__(OptionStrategyCalculatorWindow)
+        inst_id = "BTC-USD-260626-90000-C"
+        window._instrument_map = {inst_id: _make_instrument(inst_id)}
+        window._current_underlying_price = Decimal("65000")
+
+        self.assertEqual(window._option_value_approx_usdt(inst_id, Decimal("0.01")), Decimal("650.00"))
+
+    def test_option_value_approx_usdt_keeps_usdt_quote_value(self) -> None:
+        window = OptionStrategyCalculatorWindow.__new__(OptionStrategyCalculatorWindow)
+        inst_id = "BTC-USDT-260626-90000-C"
+        instrument = Instrument(
+            inst_id=inst_id,
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("1"),
+            ct_mult=Decimal("0.1"),
+            ct_val_ccy="USDT",
+            inst_family="BTC-USDT",
+        )
+        window._instrument_map = {inst_id: instrument}
+        window._current_underlying_price = Decimal("65000")
+
+        self.assertEqual(window._option_value_approx_usdt(inst_id, Decimal("123.45")), Decimal("123.45"))
+
+    def test_load_spot_reference_price_for_legs_uses_spot_ticker_fallback(self) -> None:
+        window = OptionStrategyCalculatorWindow.__new__(OptionStrategyCalculatorWindow)
+
+        class _Client:
+            def get_ticker(self, inst_id: str) -> OkxTicker:
+                self.last_inst_id = inst_id
+                return OkxTicker(
+                    inst_id=inst_id,
+                    last=Decimal("79441"),
+                    bid=Decimal("79440"),
+                    ask=Decimal("79442"),
+                    mark=None,
+                    index=None,
+                    raw={},
+                )
+
+        client = _Client()
+        window.client = client
+
+        value = window._load_spot_reference_price_for_legs(
+            [StrategyLegDefinition(alias="L1", inst_id="BTC-USD-260522-80000-C", side="buy", quantity=Decimal("1"))]
+        )
+
+        self.assertEqual(client.last_inst_id, "BTC-USDT")
+        self.assertEqual(value, Decimal("79441"))
+
     def test_refresh_leg_quotes_keeps_holding_price_and_updates_mark(self) -> None:
         window = OptionStrategyCalculatorWindow.__new__(OptionStrategyCalculatorWindow)
         leg = StrategyLegDefinition(
@@ -103,6 +167,56 @@ class OptionStrategyTest(TestCase):
         self.assertEqual(window._leg_mark_price(leg.inst_id), Decimal("0.0345"))
         self.assertEqual(window._current_underlying_price, Decimal("65000"))
         self.assertEqual(window.status_text.value, "策略腿报价已刷新。")
+
+    def test_refresh_leg_quotes_falls_back_to_spot_price_when_option_index_missing(self) -> None:
+        window = OptionStrategyCalculatorWindow.__new__(OptionStrategyCalculatorWindow)
+        leg = StrategyLegDefinition(
+            alias="L1",
+            inst_id="BTC-USD-260626-90000-C",
+            side="buy",
+            quantity=Decimal("2"),
+            premium=Decimal("0.0123"),
+        )
+        instrument = _make_instrument("BTC-USD-260626-90000-C")
+        quote = OptionQuote(
+            instrument=instrument,
+            mark_price=Decimal("0.0345"),
+            bid_price=Decimal("0.0340"),
+            ask_price=Decimal("0.0350"),
+            index_price=None,
+        )
+
+        class _Status:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        class _Client:
+            def get_ticker(self, inst_id: str) -> OkxTicker:
+                return OkxTicker(
+                    inst_id=inst_id,
+                    last=Decimal("79441"),
+                    bid=Decimal("79440"),
+                    ask=Decimal("79442"),
+                    mark=None,
+                    index=None,
+                    raw={},
+                )
+
+        window.client = _Client()
+        window._instrument_map = {}
+        window._quotes_by_inst_id = {}
+        window._legs = [leg]
+        window._current_underlying_price = None
+        window._render_legs = lambda: None
+        window._refresh_strategy_summary = lambda: None
+        window.status_text = _Status()
+
+        window._apply_refreshed_leg_quotes([(leg.inst_id, instrument, quote)])
+
+        self.assertEqual(window._current_underlying_price, Decimal("79441"))
 
     def test_refresh_leg_greeks_populates_values_when_quote_and_underlying_exist(self) -> None:
         window = OptionStrategyCalculatorWindow.__new__(OptionStrategyCalculatorWindow)

@@ -424,12 +424,15 @@ class OptionStrategyCalculatorWindow:
                 "side",
                 "qty",
                 "premium",
+                "premium_usdt",
                 "mark",
+                "mark_usdt",
                 "contract",
                 "premium_total",
                 "delta",
                 "gamma",
                 "theta",
+                "theta_usdt",
                 "vega",
             ),
             show="headings",
@@ -444,12 +447,15 @@ class OptionStrategyCalculatorWindow:
             ("side", "买卖", 64, "center"),
             ("qty", "数量", 70, "e"),
             ("premium", "持仓价", 90, "e"),
+            ("premium_usdt", "持仓价≈USDT", 108, "e"),
             ("mark", "标记价", 90, "e"),
+            ("mark_usdt", "标记价≈USDT", 108, "e"),
             ("contract", "每张面值", 90, "e"),
             ("premium_total", "权利金合计", 110, "e"),
             ("delta", "Delta", 88, "e"),
             ("gamma", "Gamma", 88, "e"),
             ("theta", "Theta", 88, "e"),
+            ("theta_usdt", "Theta≈USDT", 108, "e"),
             ("vega", "Vega", 88, "e"),
         ):
             legs_tree.heading(column, text=label)
@@ -925,6 +931,8 @@ class OptionStrategyCalculatorWindow:
             self._alias_counter,
             max((int(leg.alias[1:]) for leg, *_ in imported if leg.alias.startswith("L") and leg.alias[1:].isdigit()), default=0),
         )
+        if self._current_underlying_price is None:
+            self._current_underlying_price = self._load_spot_reference_price_for_legs(self._legs)
 
         should_reset_formula = not self.formula.get().strip() or self.formula.get().strip() == old_default_formula
         if should_reset_formula:
@@ -1052,6 +1060,8 @@ class OptionStrategyCalculatorWindow:
         self._instrument_map[quote.instrument.inst_id] = quote.instrument
         if quote.reference_price is not None:
             self._quotes_by_inst_id[quote.instrument.inst_id] = quote
+        if self._current_underlying_price is None:
+            self._current_underlying_price = quote.index_price or self._load_spot_reference_price_for_legs([leg])
         if not self.formula.get().strip():
             self.formula.set(build_default_formula(self._legs))
         self._refresh_leg_greeks()
@@ -1172,6 +1182,9 @@ class OptionStrategyCalculatorWindow:
             parsed = parse_option_contract(leg.inst_id)
             premium = leg.premium
             mark_price = self._leg_mark_price(leg.inst_id)
+            premium_usdt = self._option_value_approx_usdt(leg.inst_id, premium)
+            mark_price_usdt = self._option_value_approx_usdt(leg.inst_id, mark_price)
+            theta_usdt = self._option_value_approx_usdt(leg.inst_id, leg.theta)
             contract_value = option_contract_value(instrument) if instrument is not None else Decimal("1")
             premium_total = premium * contract_value * leg.quantity if premium is not None else None
             self._legs_tree.insert(
@@ -1187,12 +1200,15 @@ class OptionStrategyCalculatorWindow:
                     "买入" if leg.side == "buy" else "卖出",
                     format_decimal(leg.quantity),
                     _format_price(premium, instrument.tick_size if instrument is not None else None),
+                    _format_compact_number(premium_usdt),
                     _format_price(mark_price, instrument.tick_size if instrument is not None else None),
+                    _format_compact_number(mark_price_usdt),
                     format_decimal(contract_value),
                     format_decimal(premium_total) if premium_total is not None else "-",
                     _format_compact_number(leg.delta),
                     _format_compact_number(leg.gamma),
                     _format_compact_number(leg.theta),
+                    _format_compact_number(theta_usdt),
                     _format_compact_number(leg.vega),
                 ),
             )
@@ -1202,6 +1218,17 @@ class OptionStrategyCalculatorWindow:
         if quote is None:
             return None
         return quote.reference_price
+
+    def _option_value_approx_usdt(self, inst_id: str, value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return None
+        quote_currency = _strategy_leg_quote_currency(inst_id, self._instrument_map)
+        if quote_currency in {"USDT", "USD", "USDC"}:
+            return value
+        reference_price = self._current_underlying_price
+        if reference_price is None or reference_price <= 0:
+            return None
+        return value * reference_price
 
     def _refresh_leg_greeks(self) -> None:
         valuation_time = datetime.now()
@@ -1276,6 +1303,9 @@ class OptionStrategyCalculatorWindow:
             self._quotes_by_inst_id[inst_id] = quote
             if self._current_underlying_price is None and quote.index_price is not None:
                 self._current_underlying_price = quote.index_price
+        if self._current_underlying_price is None:
+            self._current_underlying_price = self._load_spot_reference_price_for_legs(self._legs)
+        self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
         self.status_text.set("策略腿报价已刷新。")
@@ -2441,6 +2471,19 @@ class OptionStrategyCalculatorWindow:
         except Exception:
             spot_candles = []
         return spot_price, spot_candles
+
+    def _load_spot_reference_price_for_legs(self, active_legs: list[StrategyLegDefinition]) -> Decimal | None:
+        families = {parse_option_contract(item.inst_id).inst_family for item in active_legs}
+        if len(families) != 1:
+            return None
+        spot_inst_id = _spot_usdt_inst_id(next(iter(families)))
+        if not spot_inst_id:
+            return None
+        try:
+            spot_ticker = self.client.get_ticker(spot_inst_id)
+        except Exception:
+            return None
+        return spot_ticker.last or spot_ticker.bid or spot_ticker.ask
 
     def _show_chart_error(self, request_id: int, exc: Exception) -> None:
         if request_id != self._chart_request_id:
@@ -3776,6 +3819,18 @@ def _native_display_currency(
         if instrument.ct_val_ccy:
             return instrument.ct_val_ccy.upper()
     return "结算币"
+
+
+def _strategy_leg_quote_currency(inst_id: str, instrument_map: dict[str, Instrument]) -> str:
+    instrument = instrument_map.get(inst_id)
+    if instrument is not None and instrument.ct_val_ccy:
+        return instrument.ct_val_ccy.strip().upper()
+    try:
+        parsed = parse_option_contract(inst_id)
+    except ValueError:
+        return ""
+    family_parts = parsed.inst_family.split("-", 1)
+    return family_parts[0].strip().upper() if family_parts else ""
 
 
 def _format_price(value: Decimal | None, tick_size: Decimal | None) -> str:

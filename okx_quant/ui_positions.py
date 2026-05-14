@@ -3446,6 +3446,7 @@ class UiPositionsMixin:
                 positions=list(positions),
                 upl_usdt_prices=dict(upl_usdt_prices or {}),
                 refreshed_at=self._positions_last_refresh_at,
+                position_instruments=dict(position_instruments or {}),
             )
         if profile_name and effective_environment:
             self._sync_position_note_state_for_positions(

@@ -104,6 +104,16 @@ class StrategyConfig:
     cross_higher_tf_inst_id: str | None = None
     cross_higher_tf_bar: str | None = None
     cross_higher_tf_ref_ema_period: int = 0
+    rail_candidate_ema_periods: tuple[int, ...] = (5, 8, 13, 21, 34, 55, 89, 144, 233)
+    rail_touch_atr_ratio: Decimal = Decimal("0.2")
+    rail_bounce_atr_ratio: Decimal = Decimal("0.6")
+    rail_bounce_confirm_bars: int = 3
+    rail_break_atr_ratio: Decimal = Decimal("1.0")
+    rail_reclaim_bars: int = 2
+    rail_score_lookback_bars: int = 60
+    rail_switch_min_score_delta: Decimal = Decimal("8")
+    rail_min_touches: int = 2
+    rail_min_bounces: int = 1
 
     def resolved_entry_reference_ema_period(self) -> int:
         if self.entry_reference_ema_period > 0:

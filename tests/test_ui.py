@@ -24,6 +24,7 @@ from okx_quant.ui import (
     QuantApp,
     RefreshHealthState,
     StrategyHistoryRecord,
+    StrategyHistoryFilters,
     StrategyTradeLedgerRecord,
     StrategyStopCleanupResult,
     StrategyTradeReconciliationSnapshot,
@@ -37,6 +38,7 @@ from okx_quant.ui import (
     _build_history_position_note_record,
     _build_launch_parameter_hint_text,
     _build_minimum_order_risk_hint_text,
+    _build_strategy_history_filter_options,
     _build_order_size_mode_hint_text,
     _build_dynamic_protection_hint_text,
     _build_strategy_start_confirmation_message,
@@ -1522,6 +1524,7 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         app = SimpleNamespace(
             session_tree=_SessionTreeStub(),
             _session_live_pnl_snapshot=lambda _session: (None, None),
+            _session_open_position_amount_text=lambda _session: "-",
             sessions={"S01": session, "S02": peer},
             notify_enabled=_Var(True),
         )
@@ -1534,7 +1537,8 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         self.assertEqual(app.session_tree.rows["S01"]["values"][1], "-")
         self.assertEqual(app.session_tree.rows["S01"]["values"][2], "开")
         self.assertEqual(app.session_tree.rows["S01"]["values"][4], "普通量化")
-        self.assertEqual(app.session_tree.rows["S01"]["values"][7], "1H")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][6], "交易并下单")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][8], "1H")
     def test_session_trader_label_prefers_trader_id_and_falls_back_to_dash(self) -> None:
         trader_session = SimpleNamespace(trader_id="T001")
         plain_session = SimpleNamespace(trader_id="")
@@ -1632,7 +1636,7 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
             open_strategy_live_chart_window=lambda session_id: opened.append(session_id),
         )
 
-        tree.identify_column = lambda _x: "#7"
+        tree.identify_column = lambda _x: "#8"
         tree.identify_row = lambda _y: "S01"
         result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=48, y=12))
 
@@ -1695,7 +1699,7 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         self.assertEqual(QuantApp._session_tree_double_click_hint("#1"), "双击打开这条会话的独立日志")
         self.assertEqual(QuantApp._session_tree_double_click_hint("#2"), "双击打开并定位对应交易员")
         self.assertEqual(QuantApp._session_tree_double_click_hint("#3"), "双击切换当前会话发邮件开关")
-        self.assertEqual(QuantApp._session_tree_double_click_hint("#7"), "双击打开这条策略的实时K线图")
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#8"), "双击打开这条策略的实时K线图")
         self.assertEqual(QuantApp._session_tree_double_click_hint("#4"), "")
 
     def test_strategy_history_tree_double_click_hint_maps_supported_columns(self) -> None:
@@ -1723,7 +1727,13 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
             _strategy_history_tree=tree,
             _strategy_history_records=[record],
             _strategy_history_selected_record_id=None,
+            _strategy_history_sort_column="started",
+            _strategy_history_sort_descending=True,
             _next_history_selection_after_mutation=lambda _selected_before, _remaining_ids: None,
+            _refresh_strategy_history_filter_controls=lambda: None,
+            _refresh_strategy_history_tree_headings=lambda: None,
+            _current_strategy_history_filters=lambda: StrategyHistoryFilters(),
+            _strategy_history_sort_key=QuantApp._strategy_history_sort_key,
             _refresh_selected_strategy_history_details=lambda: None,
         )
 
@@ -1731,6 +1741,107 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
 
         self.assertEqual(tree.rows["R01"]["values"][0], "S01")
         self.assertEqual(tree.rows["R01"]["values"][2], "EMA 动态委托做空")
+
+    def test_strategy_history_filter_options_include_mode_and_pnl(self) -> None:
+        records = [
+            StrategyHistoryRecord(
+                record_id="R01",
+                session_id="S01",
+                api_name="moni",
+                strategy_id="ema_dynamic_short",
+                strategy_name="EMA 动态委托做空",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做空",
+                run_mode_label="交易并下单",
+                status="已停止",
+                started_at=datetime(2026, 4, 24, 13, 20, 0),
+                net_pnl_total=Decimal("12.5"),
+            ),
+            StrategyHistoryRecord(
+                record_id="R02",
+                session_id="S02",
+                api_name="demo",
+                strategy_id="ema_dynamic_long",
+                strategy_name="EMA 动态委托做多",
+                symbol="BTC-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="只发信号邮件",
+                status="异常结束",
+                started_at=datetime(2026, 4, 24, 13, 21, 0),
+                net_pnl_total=Decimal("-1"),
+            ),
+        ]
+
+        options = _build_strategy_history_filter_options(records)
+
+        self.assertIn("交易并下单", options["run_mode_label"])
+        self.assertIn("只发信号邮件", options["run_mode_label"])
+        self.assertEqual(options["pnl_bucket"], ("全部净盈亏", "盈利", "亏损", "持平"))
+
+    def test_render_strategy_history_view_applies_filters_and_sorting(self) -> None:
+        earlier = StrategyHistoryRecord(
+            record_id="R01",
+            session_id="S01",
+            api_name="moni",
+            strategy_id="ema_dynamic_short",
+            strategy_name="EMA 动态委托做空",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+            status="已停止",
+            started_at=datetime(2026, 4, 24, 13, 20, 0),
+            net_pnl_total=Decimal("1.2"),
+        )
+        later = StrategyHistoryRecord(
+            record_id="R02",
+            session_id="S02",
+            api_name="moni",
+            strategy_id="ema_dynamic_short",
+            strategy_name="EMA 动态委托做空",
+            symbol="BTC-USDT-SWAP",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+            status="已停止",
+            started_at=datetime(2026, 4, 24, 13, 25, 0),
+            net_pnl_total=Decimal("5.0"),
+        )
+        filtered_out = StrategyHistoryRecord(
+            record_id="R03",
+            session_id="S03",
+            api_name="demo",
+            strategy_id="ema_dynamic_long",
+            strategy_name="EMA 动态委托做多",
+            symbol="SOL-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="只发信号邮件",
+            status="异常结束",
+            started_at=datetime(2026, 4, 24, 13, 30, 0),
+            net_pnl_total=Decimal("-2"),
+        )
+        tree = _SessionTreeStub()
+        app = SimpleNamespace(
+            _strategy_history_tree=tree,
+            _strategy_history_records=[earlier, later, filtered_out],
+            _strategy_history_selected_record_id=None,
+            _strategy_history_sort_column="pnl",
+            _strategy_history_sort_descending=True,
+            _next_history_selection_after_mutation=lambda _selected_before, remaining_ids: remaining_ids[0] if remaining_ids else None,
+            _refresh_strategy_history_filter_controls=lambda: None,
+            _refresh_strategy_history_tree_headings=lambda: None,
+            _current_strategy_history_filters=lambda: StrategyHistoryFilters(
+                api_name="moni",
+                run_mode_label="交易并下单",
+                pnl_bucket="盈利",
+            ),
+            _strategy_history_sort_key=QuantApp._strategy_history_sort_key,
+            _refresh_selected_strategy_history_details=lambda: None,
+        )
+
+        QuantApp._render_strategy_history_view(app)
+
+        self.assertEqual(tuple(tree.rows.keys()), ("R02", "R01"))
+        self.assertEqual(tree.focused, "R02")
+        self.assertEqual(app._strategy_history_selected_record_id, "R02")
 
     def test_strategy_history_tree_double_click_opens_log_on_session_column(self) -> None:
         record = SimpleNamespace(record_id="R01")
@@ -3682,6 +3793,7 @@ class _SessionTreeStub:
         self._selection: list[str] = []
         self.focused: str | None = None
         self.seen: str | None = None
+        self.headings: dict[str, dict[str, object]] = {}
 
     @staticmethod
     def winfo_exists() -> bool:
@@ -3743,6 +3855,9 @@ class _SessionTreeStub:
 
     def see(self, iid: str) -> None:
         self.seen = iid
+
+    def heading(self, column: str, **kwargs: object) -> None:
+        self.headings[column] = kwargs
 
 
 class TraderWaveLockTest(TestCase):
@@ -4336,6 +4451,130 @@ class SelectedSessionDetailRefreshTest(TestCase):
 
 
 class SessionLivePnlSummaryTest(TestCase):
+    def test_session_open_position_amount_text_uses_signed_coin_size(self) -> None:
+        snapshot = ProfilePositionSnapshot(
+            api_name="moni",
+            effective_environment="demo",
+            positions=[
+                OkxPosition(
+                    inst_id="ETH-USDT-SWAP",
+                    inst_type="SWAP",
+                    pos_side="long",
+                    mgn_mode="cross",
+                    position=Decimal("10"),
+                    avail_position=Decimal("10"),
+                    avg_price=Decimal("2500"),
+                    mark_price=Decimal("2500"),
+                    unrealized_pnl=Decimal("5"),
+                    unrealized_pnl_ratio=None,
+                    liquidation_price=None,
+                    leverage=None,
+                    margin_ccy="USDT",
+                    last_price=Decimal("2500"),
+                    realized_pnl=None,
+                    margin_ratio=None,
+                    initial_margin=None,
+                    maintenance_margin=None,
+                    delta=None,
+                    gamma=None,
+                    vega=None,
+                    theta=None,
+                    raw={},
+                )
+            ],
+            upl_usdt_prices={"USDT": Decimal("1")},
+            refreshed_at=datetime(2026, 4, 23, 19, 5, 0),
+            position_instruments={
+                "ETH-USDT-SWAP": Instrument(
+                    inst_id="ETH-USDT-SWAP",
+                    inst_type="SWAP",
+                    tick_size=Decimal("0.1"),
+                    lot_size=Decimal("1"),
+                    min_size=Decimal("1"),
+                    state="live",
+                    settle_ccy="USDT",
+                    ct_val=Decimal("0.1"),
+                    ct_mult=Decimal("1"),
+                    ct_val_ccy="ETH",
+                )
+            },
+        )
+        session = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            config=SimpleNamespace(trade_inst_id="ETH-USDT-SWAP", inst_id="ETH-USDT-SWAP", environment="demo", signal_mode="long_only"),
+        )
+        app = SimpleNamespace(
+            _position_instruments={},
+            _positions_snapshot_for_session=lambda current: snapshot if current is session else None,
+        )
+
+        text = QuantApp._session_open_position_amount_text(app, session)
+
+        self.assertEqual(text, "1 ETH")
+
+    def test_session_open_position_amount_text_returns_negative_for_short(self) -> None:
+        snapshot = ProfilePositionSnapshot(
+            api_name="moni",
+            effective_environment="demo",
+            positions=[
+                OkxPosition(
+                    inst_id="BTC-USDT-SWAP",
+                    inst_type="SWAP",
+                    pos_side="short",
+                    mgn_mode="cross",
+                    position=Decimal("20"),
+                    avail_position=Decimal("20"),
+                    avg_price=Decimal("100000"),
+                    mark_price=Decimal("100000"),
+                    unrealized_pnl=Decimal("-5"),
+                    unrealized_pnl_ratio=None,
+                    liquidation_price=None,
+                    leverage=None,
+                    margin_ccy="USDT",
+                    last_price=Decimal("100000"),
+                    realized_pnl=None,
+                    margin_ratio=None,
+                    initial_margin=None,
+                    maintenance_margin=None,
+                    delta=None,
+                    gamma=None,
+                    vega=None,
+                    theta=None,
+                    raw={},
+                )
+            ],
+            upl_usdt_prices={"USDT": Decimal("1")},
+            refreshed_at=datetime(2026, 4, 23, 19, 5, 0),
+            position_instruments={
+                "BTC-USDT-SWAP": Instrument(
+                    inst_id="BTC-USDT-SWAP",
+                    inst_type="SWAP",
+                    tick_size=Decimal("0.1"),
+                    lot_size=Decimal("1"),
+                    min_size=Decimal("1"),
+                    state="live",
+                    settle_ccy="USDT",
+                    ct_val=Decimal("0.01"),
+                    ct_mult=Decimal("1"),
+                    ct_val_ccy="BTC",
+                )
+            },
+        )
+        session = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            config=SimpleNamespace(trade_inst_id="BTC-USDT-SWAP", inst_id="BTC-USDT-SWAP", environment="demo", signal_mode="short_only"),
+        )
+        app = SimpleNamespace(
+            _position_instruments={},
+            _positions_snapshot_for_session=lambda current: snapshot if current is session else None,
+        )
+
+        text = QuantApp._session_open_position_amount_text(app, session)
+
+        self.assertEqual(text, "-0.2 BTC")
+
     def test_refresh_session_live_pnl_cache_allocates_same_position_by_trade_size(self) -> None:
         refreshed_at = datetime(2026, 4, 23, 19, 5, 0)
         snapshot = ProfilePositionSnapshot(
@@ -4480,6 +4719,7 @@ class RunningSessionFilterTest(TestCase):
             session_tree=tree,
             running_session_filter=_Var("交易员策略"),
             _session_live_pnl_snapshot=lambda _session: (None, None),
+            _session_open_position_amount_text=lambda _session: "-",
             sessions={"S01": session},
         )
 

@@ -41,6 +41,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     StrategyDefinition,
     get_strategy_definition,
+    is_adaptive_ema_rail_strategy,
     is_dynamic_strategy_id,
     is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
@@ -1371,7 +1372,11 @@ class BacktestWindow:
 
     @staticmethod
     def _strategy_supports_dynamic_take_profit(strategy_id: str) -> bool:
-        return is_dynamic_strategy_id(strategy_id) or is_ema_atr_breakout_strategy(strategy_id)
+        return (
+            is_dynamic_strategy_id(strategy_id)
+            or is_ema_atr_breakout_strategy(strategy_id)
+            or is_adaptive_ema_rail_strategy(strategy_id)
+        )
 
     @staticmethod
     def _set_field_state(widget: object, *, editable: bool) -> None:

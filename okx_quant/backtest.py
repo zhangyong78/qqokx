@@ -12,6 +12,13 @@ from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
+from okx_quant.strategies.adaptive_ema_rail import (
+    ADAPTIVE_RAIL_STATE_BROKEN,
+    adaptive_rail_candidate_periods,
+    adaptive_rail_minimum_candles,
+    evaluate_adaptive_rail_signal,
+    is_adaptive_rail_hard_break,
+)
 from okx_quant.strategy_catalog import (
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
@@ -20,6 +27,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA5_EMA8_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
+    is_adaptive_ema_rail_strategy,
     is_dynamic_strategy_id,
     is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
@@ -363,7 +371,7 @@ def build_parameter_batch_configs(
     take_ratios: tuple[Decimal, ...] = ATR_BATCH_TAKE_RATIOS,
     max_entries_options: tuple[int, ...] = BATCH_MAX_ENTRIES_OPTIONS,
 ) -> list[StrategyConfig]:
-    if not is_dynamic_strategy_id(base_config.strategy_id):
+    if not (is_dynamic_strategy_id(base_config.strategy_id) or is_adaptive_ema_rail_strategy(base_config.strategy_id)):
         return build_atr_batch_configs(
             base_config,
             atr_multipliers=atr_multipliers,
@@ -572,6 +580,14 @@ def _run_backtest_with_loaded_data(
             maker_fee_rate=maker_fee_rate,
             taker_fee_rate=taker_fee_rate,
         )
+    elif is_adaptive_ema_rail_strategy(config.strategy_id):
+        trades, terminal_open_position = _run_adaptive_rail_backtest(
+            candles,
+            instrument,
+            config,
+            maker_fee_rate=maker_fee_rate,
+            taker_fee_rate=taker_fee_rate,
+        )
     elif is_ema_atr_breakout_strategy(config.strategy_id):
         trades = _run_cross_backtest(
             candles,
@@ -592,7 +608,11 @@ def _run_backtest_with_loaded_data(
     ema_values = ema([candle.close for candle in candles], config.ema_period) if candles else []
     trend_ema_values = ema([candle.close for candle in candles], config.trend_ema_period) if candles else []
     atr_values = atr(candles, config.atr_period) if candles else []
-    if is_dynamic_strategy_id(config.strategy_id) or is_ema_atr_breakout_strategy(config.strategy_id):
+    if (
+        is_dynamic_strategy_id(config.strategy_id)
+        or is_ema_atr_breakout_strategy(config.strategy_id)
+        or is_adaptive_ema_rail_strategy(config.strategy_id)
+    ):
         big_ema_values: list[Decimal] = []
     else:
         big_ema_values = ema([candle.close for candle in candles], config.big_ema_period) if candles else []
@@ -831,6 +851,18 @@ def format_backtest_report(result: BacktestResult) -> str:
         else:
             lines.append("止盈说明：固定止盈为 ATR 倍数止盈。")
         lines.append("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓")
+    if is_adaptive_ema_rail_strategy(result.strategy_id):
+        lines.append(
+            "交易逻辑：Adaptive EMA Rail 仅做多；先用 EMA200 与高低点结构过滤趋势，"
+            "再从固定 EMA 候选池中选择 Respect Score 最高的支撑轨道。"
+        )
+        lines.append(
+            "委托规则：主导轨道至少完成两次有效反弹后，每根新 K 线按当前主导 EMA 重新挂回踩买单；"
+            "若轨道发生有效跌破，则按轨道失效退出或停止继续挂单。"
+        )
+        lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
+        lines.append(f"每条轨道最多开仓次数：{result.max_entries_per_trend if result.max_entries_per_trend > 0 else '不限'}")
+        lines.append("同K线撮合：沿用动态委托撮合口径，未成交委托不跨 K 线保留。")
     if result.strategy_id == STRATEGY_EMA5_EMA8_ID:
         lines.append(
             f"交易逻辑：固定 4H EMA{result.ema_period}/EMA{result.trend_ema_period} 金叉死叉开仓，"
@@ -1005,6 +1037,8 @@ def _required_backtest_preload_candles(config: StrategyConfig) -> int:
             config.ema_period + 2,
             config.trend_ema_period + 2,
         )
+    elif is_adaptive_ema_rail_strategy(config.strategy_id):
+        minimum = adaptive_rail_minimum_candles(config)
     elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         minimum = max(config.ema_period, config.trend_ema_period) + 1
     else:
@@ -1347,6 +1381,165 @@ def _run_cross_backtest(
     return trades
 
 
+def _run_adaptive_rail_backtest(
+    candles: list[Candle],
+    instrument: Instrument,
+    config: StrategyConfig,
+    *,
+    maker_fee_rate: Decimal = Decimal("0"),
+    taker_fee_rate: Decimal = Decimal("0"),
+) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
+    minimum = adaptive_rail_minimum_candles(config)
+    if len(candles) < minimum + 1:
+        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum + 1} 根。")
+    trade_start_index = _backtest_trade_start_index(minimum)
+    if len(candles) <= trade_start_index:
+        return [], None
+
+    closes = [candle.close for candle in candles]
+    candidate_periods = adaptive_rail_candidate_periods(config)
+    ema_by_period = {period: ema(closes, period) for period in candidate_periods}
+    ema200_values = ema_by_period.get(200) or ema(closes, 200)
+    atr_values = atr(candles, config.atr_period)
+    trades: list[BacktestTrade] = []
+    open_position: _OpenPosition | None = None
+    active_plan = None
+    current_rail_period: int | None = None
+    open_position_rail_period: int | None = None
+    entries_on_current_rail = 0
+    entry_sequence = 0
+    dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
+
+    for index in range(trade_start_index, len(candles)):
+        candle = candles[index]
+
+        if open_position is not None:
+            closed_trade = _try_close_position(
+                open_position,
+                candle,
+                index,
+                exit_fee_rate=taker_fee_rate,
+                exit_fee_type="taker",
+            )
+            if closed_trade is not None:
+                trades.append(closed_trade)
+                open_position = None
+                open_position_rail_period = None
+
+        if open_position is not None and open_position_rail_period in ema_by_period:
+            atr_value = atr_values[index]
+            if is_adaptive_rail_hard_break(
+                candle,
+                ema_value=ema_by_period[open_position_rail_period][index],
+                atr_value=atr_value,
+                config=config,
+            ):
+                exit_price_raw = snap_to_increment(candle.close, instrument.tick_size, "nearest")
+                exit_price = _apply_slippage_price(
+                    exit_price_raw,
+                    signal=open_position.signal,
+                    tick_size=instrument.tick_size,
+                    slippage_rate=config.resolved_backtest_exit_slippage_rate(),
+                    is_entry=False,
+                )
+                trades.append(
+                    _build_closed_trade(
+                        open_position,
+                        candle,
+                        index,
+                        exit_price_raw=exit_price_raw,
+                        exit_price=exit_price,
+                        exit_reason="rail_broken",
+                        exit_fee_rate=taker_fee_rate,
+                        exit_fee_type="taker",
+                    )
+                )
+                open_position = None
+                open_position_rail_period = None
+
+        if active_plan is not None and open_position is None:
+            plan_rail_period = current_rail_period
+            filled_position = _try_fill_dynamic_order(
+                instrument,
+                active_plan,
+                candle,
+                index,
+                entry_fee_rate=maker_fee_rate,
+                entry_fee_type="maker",
+                entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
+                exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
+                funding_rate=config.backtest_funding_rate,
+                entry_sequence=entry_sequence + 1,
+                dynamic_take_profit_enabled=dynamic_take_profit_enabled,
+                dynamic_exit_fee_rate=taker_fee_rate,
+                dynamic_two_r_break_even=config.dynamic_two_r_break_even,
+                dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+                time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+                immediate_entry_fee_rate=taker_fee_rate,
+                immediate_entry_fee_type="taker",
+            )
+            active_plan = None
+            if filled_position is not None:
+                entry_sequence += 1
+                entries_on_current_rail += 1
+                closed_trade = _try_close_position_same_candle_after_fill(
+                    filled_position,
+                    candle,
+                    index,
+                    exit_fee_rate=taker_fee_rate,
+                    exit_fee_type="taker",
+                )
+                if closed_trade is not None:
+                    trades.append(closed_trade)
+                else:
+                    open_position = filled_position
+                    open_position_rail_period = plan_rail_period
+
+        if open_position is not None or index >= len(candles) - 1:
+            continue
+
+        snapshot = evaluate_adaptive_rail_signal(
+            candles,
+            index,
+            ema_by_period=ema_by_period,
+            ema200_values=ema200_values,
+            atr_values=atr_values,
+            config=config,
+            current_period=current_rail_period,
+        )
+        if snapshot.state == ADAPTIVE_RAIL_STATE_BROKEN:
+            active_plan = None
+            entries_on_current_rail = 0
+            current_rail_period = None
+            continue
+        if snapshot.dominant_period != current_rail_period:
+            current_rail_period = snapshot.dominant_period
+            entries_on_current_rail = 0
+        decision = snapshot.decision
+        if decision.signal is None:
+            continue
+        if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
+            continue
+        if config.max_entries_per_trend > 0 and entries_on_current_rail >= config.max_entries_per_trend:
+            continue
+
+        resolved_config = _resolve_backtest_config(config, trades)
+        active_plan = _build_backtest_order_plan(
+            instrument=instrument,
+            config=resolved_config,
+            order_size=resolved_config.order_size,
+            signal=decision.signal,
+            entry_reference=decision.entry_reference,
+            atr_value=decision.atr_value,
+            candle_ts=decision.candle_ts,
+            signal_candle_high=decision.signal_candle_high,
+            signal_candle_low=decision.signal_candle_low,
+        )
+
+    return trades, _build_terminal_open_position(open_position, candles)
+
+
 def _run_dynamic_backtest(
     candles: list[Candle],
     instrument: Instrument,
@@ -1508,6 +1701,45 @@ def _run_dynamic_backtest(
         )
 
     return trades, terminal_open_position
+
+
+def _build_terminal_open_position(
+    open_position: _OpenPosition | None,
+    candles: list[Candle],
+) -> BacktestOpenPosition | None:
+    if open_position is None or not candles:
+        return None
+    last_candle = candles[-1]
+    current_price = last_candle.close
+    if open_position.signal == "long":
+        gross_pnl = (current_price - open_position.entry_price) * open_position.size
+    else:
+        gross_pnl = (open_position.entry_price - current_price) * open_position.size
+    entry_fee = abs(open_position.entry_price * open_position.size) * open_position.entry_fee_rate
+    funding_periods = Decimal(str(max(last_candle.ts - open_position.entry_ts, 0))) / Decimal("28800000")
+    funding_cost = abs(open_position.entry_price * open_position.size) * open_position.funding_rate * funding_periods
+    pnl = gross_pnl - entry_fee - funding_cost
+    risk_value = _position_initial_risk_value(open_position)
+    r_multiple = Decimal("0") if risk_value == 0 else pnl / risk_value
+    return BacktestOpenPosition(
+        signal=open_position.signal,
+        entry_index=open_position.entry_index,
+        entry_ts=open_position.entry_ts,
+        current_ts=last_candle.ts,
+        entry_price=open_position.entry_price,
+        current_price=current_price,
+        stop_loss=open_position.stop_loss,
+        take_profit=open_position.take_profit,
+        initial_stop_loss=open_position.initial_stop_loss,
+        initial_take_profit=open_position.initial_take_profit,
+        size=open_position.size,
+        gross_pnl=gross_pnl,
+        pnl=pnl,
+        risk_value=risk_value,
+        r_multiple=r_multiple,
+        entry_fee=entry_fee,
+        funding_cost=funding_cost,
+    )
 
 
 def _evaluate_cross_signal_precomputed(

@@ -6,6 +6,8 @@ from typing import Literal
 
 PivotKind = Literal["high", "low"]
 ChannelKind = Literal["ascending", "descending"]
+TrendlineKind = Literal["support", "resistance"]
+TriangleKind = Literal["symmetrical", "ascending", "descending"]
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,41 @@ class ChannelCandidate:
     @property
     def slope(self) -> Decimal:
         return self.base_line.slope
+
+
+@dataclass(frozen=True)
+class TrendlineCandidate:
+    kind: TrendlineKind
+    start_index: int
+    end_index: int
+    line: PriceLine
+    pivots: tuple[PivotPoint, ...]
+    touches: int
+    violations: int
+    score: Decimal
+
+    @property
+    def slope(self) -> Decimal:
+        return self.line.slope
+
+
+@dataclass(frozen=True)
+class TriangleCandidate:
+    kind: TriangleKind
+    start_index: int
+    end_index: int
+    apex_index: int
+    upper_line: PriceLine
+    lower_line: PriceLine
+    high_pivots: tuple[PivotPoint, ...]
+    low_pivots: tuple[PivotPoint, ...]
+    touches: int
+    violations: int
+    score: Decimal
+
+    @property
+    def width(self) -> Decimal:
+        return self.upper_line.value_at(self.start_index) - self.lower_line.value_at(self.start_index)
 
 
 @dataclass(frozen=True)

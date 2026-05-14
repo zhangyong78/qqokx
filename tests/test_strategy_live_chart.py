@@ -10,9 +10,13 @@ from okx_quant.auto_channel_preview import build_auto_channel_preview_snapshot
 from okx_quant.models import Candle
 from okx_quant.strategy_live_chart import (
     StrategyLiveChartLayout,
+    StrategyLiveChartMarker,
     StrategyLiveChartLineOverlay,
     StrategyLiveChartSnapshot,
     StrategyLiveChartTimeMarker,
+    _ChartBounds,
+    _layout_marker_label_positions,
+    append_candles_to_snapshot,
     build_auto_channel_live_chart_snapshot,
     build_strategy_live_chart_snapshot,
     layout_price_to_y,
@@ -71,7 +75,7 @@ class StrategyLiveChartHelpersTest(TestCase):
         )
 
         self.assertEqual(len(snapshot.band_overlays), 1)
-        self.assertEqual(len(snapshot.line_overlays), 1)
+        self.assertGreaterEqual(len(snapshot.line_overlays), 1)
         self.assertTrue(snapshot.point_overlays)
         self.assertIn("通道", snapshot.note)
         lower, upper = strategy_live_chart_price_bounds(snapshot)
@@ -137,7 +141,7 @@ class StrategyLiveChartHelpersTest(TestCase):
         self.assertEqual(len(snapshot.candles), 16)
         self.assertEqual(len(snapshot.band_overlays), 1)
         self.assertEqual(snapshot.band_overlays[0].end_index, 65)
-        self.assertEqual(snapshot.line_overlays[0].line.end_index, 65)
+        self.assertGreaterEqual(max(item.line.end_index for item in snapshot.line_overlays), 65)
 
     def test_slice_strategy_live_chart_snapshot_shifts_structure_overlays(self) -> None:
         candles = [
@@ -163,6 +167,38 @@ class StrategyLiveChartHelpersTest(TestCase):
         self.assertEqual(sliced.line_overlays[0].line.start_index, 0)
         self.assertEqual(sliced.line_overlays[0].line.end_index, 4)
         self.assertEqual(sliced.line_overlays[0].line.start_price, Decimal("105"))
+
+    def test_append_candles_to_snapshot_preserves_structure_lines(self) -> None:
+        base = StrategyLiveChartSnapshot(
+            session_id="append",
+            candles=(
+                Candle(ts=1, open=Decimal("10"), high=Decimal("12"), low=Decimal("9"), close=Decimal("11"), volume=Decimal("1"), confirmed=True),
+                Candle(ts=2, open=Decimal("11"), high=Decimal("13"), low=Decimal("10"), close=Decimal("12"), volume=Decimal("1"), confirmed=True),
+            ),
+            line_overlays=(
+                StrategyLiveChartLineOverlay(
+                    key="line",
+                    label="line",
+                    line=PriceLine(0, Decimal("10"), 10, Decimal("20")),
+                    color="#2563eb",
+                ),
+            ),
+            right_pad_bars=50,
+        )
+
+        updated = append_candles_to_snapshot(
+            base,
+            [
+                Candle(ts=2, open=Decimal("11"), high=Decimal("13"), low=Decimal("10"), close=Decimal("12.2"), volume=Decimal("1"), confirmed=True),
+                Candle(ts=3, open=Decimal("12"), high=Decimal("14"), low=Decimal("11"), close=Decimal("13"), volume=Decimal("1"), confirmed=True),
+            ],
+        )
+
+        self.assertEqual(len(updated.candles), 3)
+        self.assertEqual(updated.candles[-1].ts, 3)
+        self.assertEqual(updated.candles[1].close, Decimal("12.2"))
+        self.assertEqual(updated.line_overlays[0].line.end_index, 10)
+        self.assertEqual(updated.right_pad_bars, 50)
 
     def test_build_strategy_live_chart_snapshot_deduplicates_duplicate_period_series_and_markers(self) -> None:
         candles = [
@@ -334,3 +370,26 @@ class StrategyLiveChartHelpersTest(TestCase):
         y_low_u = layout_price_to_y_unclamped(lay, Decimal("0"))
         self.assertAlmostEqual(y_low, float(lay.bottom), delta=1e-6)
         self.assertGreater(y_low_u, float(lay.bottom))
+
+    def test_marker_labels_are_staggered_when_prices_are_close(self) -> None:
+        bounds = _ChartBounds(left=76.0, top=40.0, right=644.0, bottom=544.0)
+        markers = (
+            StrategyLiveChartMarker(key="entry", label="开仓均价", price=Decimal("95.00"), color="#6f42c1"),
+            StrategyLiveChartMarker(key="stop", label="当前止损", price=Decimal("95.03"), color="#cf222e"),
+        )
+
+        placements = _layout_marker_label_positions(
+            markers,
+            Decimal("90"),
+            Decimal("100"),
+            bounds,
+            height=600,
+            bounds_policy="full",
+        )
+
+        self.assertEqual(len(placements), 2)
+        top_item, bottom_item = placements
+        self.assertLess(top_item[2], bottom_item[2])
+        self.assertGreaterEqual(bottom_item[2] - top_item[2], 24.0)
+        moved_count = sum(1 for _, line_y, label_y in placements if abs(line_y - label_y) > 0.5)
+        self.assertGreaterEqual(moved_count, 1)

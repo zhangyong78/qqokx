@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
@@ -191,6 +192,23 @@ STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
             "trend_ema_period": 8,
             "big_ema_period": 233,
         },
+    ),
+    STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID: StrategyParameterProfile(
+        strategy_id=STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+        parameter_keys=(
+            "bar",
+            "atr_period",
+            "atr_stop_multiplier",
+            "atr_take_multiplier",
+            "take_profit_mode",
+            "max_entries_per_trend",
+            "dynamic_two_r_break_even",
+            "dynamic_fee_offset_enabled",
+            "time_stop_break_even_enabled",
+            "time_stop_break_even_bars",
+            "hold_close_exit_bars",
+        ),
+        fixed_values={"signal_mode": "long_only"},
     ),
 }
 

@@ -1127,3 +1127,46 @@ def _fmt_optional_signed(value: Decimal | None) -> str:
     if value is None:
         return "-"
     return f"{_fmt_signed(value, 2)}%"
+
+
+def _signal_dedupe_key(symbol: str, bar: str, signal: SignalReplayPoint) -> str:
+    return "|".join(
+        (
+            symbol.strip().upper(),
+            bar.strip().upper(),
+            str(signal.ts),
+            signal.direction,
+            signal.pattern_id,
+            str(signal.candle_count),
+        )
+    )
+
+
+def _build_signal_email_subject(symbol: str, bar: str, signal: SignalReplayPoint) -> str:
+    direction = _direction_label(signal.direction)
+    return f"[信号复盘实验室] {symbol} {bar} {direction} {signal.pattern_name}"
+
+
+def _build_signal_email_body(symbol: str, bar: str, signal: SignalReplayPoint) -> str:
+    validation = signal.validation
+    lines = [
+        "最新K线信号通知",
+        "",
+        f"交易对: {symbol}",
+        f"周期: {bar}",
+        f"时间: {_format_ts(signal.ts)}",
+        f"方向: {_direction_label(signal.direction)}",
+        f"模式: {signal.pattern_name} ({signal.pattern_id})",
+        f"评分: {signal.score}",
+        f"K线数量: {signal.candle_count}",
+        f"触发原因: {signal.reason}",
+        f"配置名称: {signal.setup}",
+        f"4H回报: {_fmt_optional_signed(validation.return_4h_pct)}",
+        f"12H回报: {_fmt_optional_signed(validation.return_12h_pct)}",
+        f"24H回报: {_fmt_optional_signed(validation.return_24h_pct)}",
+        f"最大有利波动: {_fmt_optional_signed(validation.max_favorable_excursion_pct)}",
+        f"最大不利波动: {_fmt_optional_signed(validation.max_adverse_excursion_pct)}",
+    ]
+    if signal.large_move_rules:
+        lines.append(f"大波动规则: {', '.join(signal.large_move_rules)}")
+    return "\n".join(lines)

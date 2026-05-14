@@ -4473,6 +4473,7 @@ class UiStrategySessionsMixin:
                 self.session_tree.delete(session.session_id)
             return
         live_pnl, _ = self._session_live_pnl_snapshot(session)
+        open_qty_text = self._session_open_position_amount_text(session)
         source_type = QuantApp._session_category_label(session)
         trader_label = QuantApp._session_trader_label(self, session)
         email_label = QuantApp._session_email_status_label(self, session)
@@ -4485,10 +4486,11 @@ class UiStrategySessionsMixin:
             session.api_name or "-",
             source_type,
             session.strategy_name,
+            session.run_mode_label,
             session.symbol,
             bar_label,
             session.direction_label,
-            session.run_mode_label,
+            open_qty_text,
             _format_optional_usdt_precise(live_pnl, places=2),
             _format_optional_usdt_precise(session.net_pnl_total, places=2),
             session.display_status,
@@ -4514,8 +4516,46 @@ class UiStrategySessionsMixin:
             "#1": "双击打开这条会话的独立日志",
             "#2": "双击打开并定位对应交易员",
             "#3": "双击切换当前会话发邮件开关",
-            "#7": "双击打开这条策略的实时K线图",
+            "#8": "双击打开这条策略的实时K线图",
         }.get(str(column_id or "").strip(), "")
+
+    def _session_open_position_amount_text(self, session: StrategySession) -> str:
+        snapshot = self._positions_snapshot_for_session(session)
+        if snapshot is None:
+            return "-"
+        matched_positions = [
+            position
+            for position in snapshot.positions
+            if (
+                position.position != 0
+                and _position_matches_session_live_pnl(
+                    position,
+                    trade_inst_id=_session_trade_inst_id(session),
+                    expected_sides=_session_expected_position_sides(session),
+                )
+            )
+        ]
+        if not matched_positions:
+            return "-"
+        totals: dict[str, Decimal] = {}
+        instruments = dict(getattr(snapshot, "position_instruments", {}) or {})
+        if not instruments:
+            instruments = dict(getattr(self, "_position_instruments", {}) or {})
+        for position in matched_positions:
+            amount, currency = _position_signed_display_amount(position, instruments)
+            if amount is None:
+                continue
+            normalized_currency = str(currency or "").strip().upper()
+            key = normalized_currency or _extract_asset_key(position.inst_id).upper() or position.inst_id
+            totals[key] = totals.get(key, Decimal("0")) + amount
+        if not totals:
+            return "-"
+        parts: list[str] = []
+        for currency in sorted(totals.keys()):
+            amount = totals[currency]
+            amount_text = _format_optional_decimal_capped(amount, places=4)
+            parts.append(f"{amount_text} {currency}".strip())
+        return " / ".join(parts)
 
     def _show_session_tree_hover_tip(self, text: str, *, x_root: int, y_root: int) -> None:
         if not text:
@@ -4595,7 +4635,7 @@ class UiStrategySessionsMixin:
         if column_id == "#3":
             self._set_selected_session_email_notifications(not bool(getattr(session, "email_notifications_enabled", True)))
             return "break"
-        if column_id == "#7":
+        if column_id == "#8":
             self.open_strategy_live_chart_window(session.session_id)
             return "break"
         return None
@@ -6351,8 +6391,8 @@ class UiStrategySessionsMixin:
         container = ttk.Frame(window, padding=12)
         container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(1, weight=1)
         container.rowconfigure(2, weight=1)
+        container.rowconfigure(3, weight=1)
 
         header = ttk.Frame(container)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -6381,8 +6421,100 @@ class UiStrategySessionsMixin:
         )
         ttk.Button(action_row, text="关闭", command=self._close_strategy_history_window).grid(row=0, column=5)
 
+        filter_frame = ttk.LabelFrame(container, text="筛选条件", padding=12)
+        filter_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        for column in range(8):
+            filter_frame.columnconfigure(column, weight=1 if column % 2 == 1 else 0)
+
+        ttk.Label(filter_frame, text="API").grid(row=0, column=0, sticky="w")
+        self._strategy_history_api_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_history_api_filter,
+            state="readonly",
+            width=14,
+        )
+        self._strategy_history_api_combo.grid(row=0, column=1, sticky="ew", padx=(6, 12))
+
+        ttk.Label(filter_frame, text="策略").grid(row=0, column=2, sticky="w")
+        self._strategy_history_strategy_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_history_strategy_filter,
+            state="readonly",
+            width=20,
+        )
+        self._strategy_history_strategy_combo.grid(row=0, column=3, sticky="ew", padx=(6, 12))
+
+        ttk.Label(filter_frame, text="标的").grid(row=0, column=4, sticky="w")
+        self._strategy_history_symbol_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_history_symbol_filter,
+            state="readonly",
+            width=18,
+        )
+        self._strategy_history_symbol_combo.grid(row=0, column=5, sticky="ew", padx=(6, 12))
+
+        ttk.Label(filter_frame, text="方向").grid(row=0, column=6, sticky="w")
+        self._strategy_history_direction_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_history_direction_filter,
+            state="readonly",
+            width=14,
+        )
+        self._strategy_history_direction_combo.grid(row=0, column=7, sticky="ew", padx=(6, 0))
+
+        ttk.Label(filter_frame, text="模式").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self._strategy_history_mode_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_history_mode_filter,
+            state="readonly",
+            width=14,
+        )
+        self._strategy_history_mode_combo.grid(row=1, column=1, sticky="ew", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(filter_frame, text="净盈亏").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        self._strategy_history_pnl_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_history_pnl_filter,
+            state="readonly",
+            width=14,
+        )
+        self._strategy_history_pnl_combo.grid(row=1, column=3, sticky="ew", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(filter_frame, text="状态").grid(row=1, column=4, sticky="w", pady=(8, 0))
+        self._strategy_history_status_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.strategy_history_status_filter,
+            state="readonly",
+            width=18,
+        )
+        self._strategy_history_status_combo.grid(row=1, column=5, sticky="ew", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(filter_frame, text="排序：点击表头切换升序 / 降序").grid(
+            row=1,
+            column=6,
+            sticky="w",
+            pady=(8, 0),
+        )
+        ttk.Button(filter_frame, text="重置筛选", command=self._reset_strategy_history_filters).grid(
+            row=1,
+            column=7,
+            sticky="e",
+            pady=(8, 0),
+        )
+
+        for combo in (
+            self._strategy_history_api_combo,
+            self._strategy_history_strategy_combo,
+            self._strategy_history_symbol_combo,
+            self._strategy_history_direction_combo,
+            self._strategy_history_mode_combo,
+            self._strategy_history_pnl_combo,
+            self._strategy_history_status_combo,
+        ):
+            combo.bind("<<ComboboxSelected>>", self._on_strategy_history_filter_changed)
+
         list_frame = ttk.LabelFrame(container, text="历史策略列表", padding=12)
-        list_frame.grid(row=1, column=0, sticky="nsew")
+        list_frame.grid(row=2, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
 
@@ -6393,16 +6525,7 @@ class UiStrategySessionsMixin:
             selectmode="browse",
         )
         tree = self._strategy_history_tree
-        tree.heading("session", text="会话(双击日志)")
-        tree.heading("api", text="API")
-        tree.heading("strategy", text="策略")
-        tree.heading("symbol", text="标的(双击K线)")
-        tree.heading("direction", text="方向")
-        tree.heading("mode", text="模式")
-        tree.heading("pnl", text="净盈亏")
-        tree.heading("status", text="状态")
-        tree.heading("started", text="启动时间")
-        tree.heading("stopped", text="停止时间")
+        self._refresh_strategy_history_tree_headings()
         tree.column("session", width=76, anchor="center")
         tree.column("api", width=88, anchor="center")
         tree.column("strategy", width=138, anchor="w")
@@ -6423,7 +6546,7 @@ class UiStrategySessionsMixin:
         tree.configure(yscrollcommand=history_scroll.set)
 
         detail_frame = ttk.LabelFrame(container, text="选中历史记录详情", padding=12)
-        detail_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        detail_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
         detail_frame.columnconfigure(0, weight=1)
         detail_frame.rowconfigure(0, weight=1)
 
@@ -6448,6 +6571,167 @@ class UiStrategySessionsMixin:
         self._strategy_history_tree = None
         self._strategy_history_detail = None
         self._strategy_history_selected_record_id = None
+        self._strategy_history_api_combo = None
+        self._strategy_history_strategy_combo = None
+        self._strategy_history_symbol_combo = None
+        self._strategy_history_direction_combo = None
+        self._strategy_history_mode_combo = None
+        self._strategy_history_pnl_combo = None
+        self._strategy_history_status_combo = None
+
+    def _current_strategy_history_filters(self) -> StrategyHistoryFilters:
+        return StrategyHistoryFilters(
+            api_name=_strategy_book_filter_normalized(
+                self.strategy_history_api_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_API,
+            ),
+            strategy_name=_strategy_book_filter_normalized(
+                self.strategy_history_strategy_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_STRATEGY,
+            ),
+            symbol=_strategy_book_filter_normalized(
+                self.strategy_history_symbol_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_SYMBOL,
+            ),
+            direction_label=_strategy_book_filter_normalized(
+                self.strategy_history_direction_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_DIRECTION,
+            ),
+            run_mode_label=_strategy_book_filter_normalized(
+                self.strategy_history_mode_filter.get(),
+                STRATEGY_HISTORY_FILTER_ALL_MODE,
+            ),
+            pnl_bucket=_strategy_book_filter_normalized(
+                self.strategy_history_pnl_filter.get(),
+                STRATEGY_HISTORY_FILTER_ALL_PNL,
+            ),
+            status=_strategy_book_filter_normalized(
+                self.strategy_history_status_filter.get(),
+                STRATEGY_BOOK_FILTER_ALL_STATUS,
+            ),
+        )
+
+    def _reset_strategy_history_filters(self) -> None:
+        self.strategy_history_api_filter.set(STRATEGY_BOOK_FILTER_ALL_API)
+        self.strategy_history_strategy_filter.set(STRATEGY_BOOK_FILTER_ALL_STRATEGY)
+        self.strategy_history_symbol_filter.set(STRATEGY_BOOK_FILTER_ALL_SYMBOL)
+        self.strategy_history_direction_filter.set(STRATEGY_BOOK_FILTER_ALL_DIRECTION)
+        self.strategy_history_mode_filter.set(STRATEGY_HISTORY_FILTER_ALL_MODE)
+        self.strategy_history_pnl_filter.set(STRATEGY_HISTORY_FILTER_ALL_PNL)
+        self.strategy_history_status_filter.set(STRATEGY_BOOK_FILTER_ALL_STATUS)
+        self._render_strategy_history_view()
+
+    def _on_strategy_history_filter_changed(self, *_: object) -> None:
+        self._render_strategy_history_view()
+
+    def _refresh_strategy_history_filter_controls(self) -> None:
+        options = _build_strategy_history_filter_options(self._strategy_history_records)
+        control_specs = (
+            (
+                self._strategy_history_api_combo,
+                self.strategy_history_api_filter,
+                options["api_name"],
+                STRATEGY_BOOK_FILTER_ALL_API,
+            ),
+            (
+                self._strategy_history_strategy_combo,
+                self.strategy_history_strategy_filter,
+                options["strategy_name"],
+                STRATEGY_BOOK_FILTER_ALL_STRATEGY,
+            ),
+            (
+                self._strategy_history_symbol_combo,
+                self.strategy_history_symbol_filter,
+                options["symbol"],
+                STRATEGY_BOOK_FILTER_ALL_SYMBOL,
+            ),
+            (
+                self._strategy_history_direction_combo,
+                self.strategy_history_direction_filter,
+                options["direction_label"],
+                STRATEGY_BOOK_FILTER_ALL_DIRECTION,
+            ),
+            (
+                self._strategy_history_mode_combo,
+                self.strategy_history_mode_filter,
+                options["run_mode_label"],
+                STRATEGY_HISTORY_FILTER_ALL_MODE,
+            ),
+            (
+                self._strategy_history_pnl_combo,
+                self.strategy_history_pnl_filter,
+                options["pnl_bucket"],
+                STRATEGY_HISTORY_FILTER_ALL_PNL,
+            ),
+            (
+                self._strategy_history_status_combo,
+                self.strategy_history_status_filter,
+                options["status"],
+                STRATEGY_BOOK_FILTER_ALL_STATUS,
+            ),
+        )
+        for combo, variable, values, default_value in control_specs:
+            if combo is None or not _widget_exists(combo):
+                continue
+            combo.configure(values=values)
+            current_value = variable.get()
+            variable.set(current_value if current_value in values else default_value)
+
+    def _refresh_strategy_history_tree_headings(self) -> None:
+        tree = self._strategy_history_tree
+        if tree is None or not _widget_exists(tree):
+            return
+        headings = {
+            "session": "会话(双击日志)",
+            "api": "API",
+            "strategy": "策略",
+            "symbol": "标的(双击K线)",
+            "direction": "方向",
+            "mode": "模式",
+            "pnl": "净盈亏",
+            "status": "状态",
+            "started": "启动时间",
+            "stopped": "停止时间",
+        }
+        for column_id, label in headings.items():
+            text = label
+            if column_id == self._strategy_history_sort_column:
+                text = f"{label} {'▼' if self._strategy_history_sort_descending else '▲'}"
+            tree.heading(
+                column_id,
+                text=text,
+                command=lambda value=column_id: self._on_strategy_history_sort_requested(value),
+            )
+
+    def _on_strategy_history_sort_requested(self, column_id: str) -> None:
+        if self._strategy_history_sort_column == column_id:
+            self._strategy_history_sort_descending = not self._strategy_history_sort_descending
+        else:
+            self._strategy_history_sort_column = column_id
+            self._strategy_history_sort_descending = column_id not in {"session", "strategy", "symbol", "direction", "mode", "status"}
+        self._render_strategy_history_view()
+
+    @staticmethod
+    def _strategy_history_sort_key(record: StrategyHistoryRecord, column_id: str) -> object:
+        if column_id == "session":
+            return record.session_id or ""
+        if column_id == "api":
+            return record.api_name or ""
+        if column_id == "strategy":
+            return record.strategy_name or ""
+        if column_id == "symbol":
+            return record.symbol or ""
+        if column_id == "direction":
+            return record.direction_label or ""
+        if column_id == "mode":
+            return record.run_mode_label or ""
+        if column_id == "pnl":
+            return record.net_pnl_total or Decimal("0")
+        if column_id == "status":
+            return record.status or ""
+        if column_id == "stopped":
+            return record.stopped_at or datetime.min
+        return record.started_at
 
     def _selected_strategy_history_record(self) -> StrategyHistoryRecord | None:
         tree = self._strategy_history_tree
@@ -7341,6 +7625,16 @@ class UiStrategySessionsMixin:
         tree = self._strategy_history_tree
         if tree is None or not _widget_exists(tree):
             return
+        self._refresh_strategy_history_filter_controls()
+        self._refresh_strategy_history_tree_headings()
+        filters = self._current_strategy_history_filters()
+        visible_records = [
+            record for record in self._strategy_history_records if _strategy_history_record_matches(record, filters)
+        ]
+        visible_records.sort(
+            key=lambda record: (self._strategy_history_sort_key(record, self._strategy_history_sort_column), record.record_id),
+            reverse=self._strategy_history_sort_descending,
+        )
         if selected_before is None:
             try:
                 current_selection = tree.selection()
@@ -7349,7 +7643,7 @@ class UiStrategySessionsMixin:
                 selected_before = self._strategy_history_selected_record_id
         for item_id in tree.get_children():
             tree.delete(item_id)
-        for record in self._strategy_history_records:
+        for record in visible_records:
             tree.insert(
                 "",
                 END,
@@ -7367,7 +7661,7 @@ class UiStrategySessionsMixin:
                     _format_history_datetime(record.stopped_at),
                 ),
             )
-        remaining_ids = tuple(record.record_id for record in self._strategy_history_records)
+        remaining_ids = tuple(record.record_id for record in visible_records)
         target = self._next_history_selection_after_mutation(selected_before, remaining_ids)
         if target is not None and tree.exists(target):
             tree.selection_set(target)

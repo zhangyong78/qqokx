@@ -5,9 +5,13 @@ from okx_quant.analysis import (
     BoxDetectionConfig,
     ChannelDetectionConfig,
     PivotDetectionConfig,
+    TrendlineDetectionConfig,
+    TriangleDetectionConfig,
     detect_boxes,
     detect_channels,
     detect_pivots,
+    detect_trendlines,
+    detect_triangles,
 )
 from okx_quant.models import Candle
 
@@ -124,3 +128,57 @@ class AutoChannelAnalysisTest(TestCase):
         self.assertGreaterEqual(best.upper_touches, 2)
         self.assertGreaterEqual(best.lower_touches, 2)
         self.assertEqual(best.violations, 0)
+
+    def test_detect_trendlines_finds_descending_resistance(self) -> None:
+        candles = [
+            _candle(0, "10", "15"),
+            _candle(1, "12", "20"),
+            _candle(2, "11", "14"),
+            _candle(3, "13", "18"),
+            _candle(4, "12", "13"),
+            _candle(5, "14", "16"),
+            _candle(6, "13", "12"),
+        ]
+
+        trendlines = detect_trendlines(
+            candles,
+            TrendlineDetectionConfig(
+                pivot=PivotDetectionConfig(left_bars=1, right_bars=1, atr_period=2, atr_multiplier=Decimal("0")),
+                min_anchor_distance=2,
+                min_line_bars=5,
+                max_violations=1,
+            ),
+        )
+
+        self.assertTrue(trendlines)
+        self.assertEqual(trendlines[0].kind, "resistance")
+        self.assertLess(trendlines[0].slope, 0)
+        self.assertGreaterEqual(trendlines[0].touches, 2)
+
+    def test_detect_triangles_finds_symmetrical_triangle(self) -> None:
+        candles = [
+            _candle(0, "11", "17"),
+            _candle(1, "12", "20"),
+            _candle(2, "10", "16"),
+            _candle(3, "13", "18"),
+            _candle(4, "12.5", "15"),
+            _candle(5, "14", "16"),
+            _candle(6, "12", "14.5"),
+            _candle(7, "13", "14.2"),
+        ]
+
+        triangles = detect_triangles(
+            candles,
+            TriangleDetectionConfig(
+                pivot=PivotDetectionConfig(left_bars=1, right_bars=1, atr_period=2, atr_multiplier=Decimal("0")),
+                min_anchor_distance=2,
+                min_triangle_bars=6,
+                max_violations=2,
+            ),
+        )
+
+        self.assertTrue(triangles)
+        best = triangles[0]
+        self.assertEqual(best.kind, "symmetrical")
+        self.assertGreater(best.apex_index, best.end_index)
+        self.assertGreaterEqual(best.touches, 4)

@@ -5,8 +5,25 @@ from datetime import datetime
 from decimal import Decimal
 from tkinter import Canvas
 
-from okx_quant.analysis import BoxDetectionConfig, ChannelDetectionConfig, detect_boxes, detect_channels, detect_pivots
-from okx_quant.analysis.structure_models import BoxCandidate, ChannelCandidate, PivotPoint, PriceLine
+from okx_quant.analysis import (
+    BoxDetectionConfig,
+    ChannelDetectionConfig,
+    TrendlineDetectionConfig,
+    TriangleDetectionConfig,
+    detect_boxes,
+    detect_channels,
+    detect_pivots,
+    detect_trendlines,
+    detect_triangles,
+)
+from okx_quant.analysis.structure_models import (
+    BoxCandidate,
+    ChannelCandidate,
+    PivotPoint,
+    PriceLine,
+    TrendlineCandidate,
+    TriangleCandidate,
+)
 from okx_quant.indicators import ema
 from okx_quant.models import Candle
 from okx_quant.pricing import format_decimal, format_decimal_by_increment
@@ -35,6 +52,9 @@ _PRICE_LABEL_BG = "#ffffff"
 _CANDLE_RISE = "#137333"
 _CANDLE_FALL = "#cf222e"
 _CANDLE_PENDING = "#b08800"
+_MARKER_LABEL_HALF_HEIGHT = 10.0
+_MARKER_LABEL_MIN_GAP = 24.0
+_MARKER_LABEL_CANVAS_MARGIN = 6.0
 
 
 @dataclass(frozen=True)
@@ -289,8 +309,12 @@ def build_auto_channel_live_chart_snapshot(
     candles: list[Candle] | tuple[Candle, ...],
     channel_config: ChannelDetectionConfig | None = None,
     box_config: BoxDetectionConfig | None = None,
+    trendline_config: TrendlineDetectionConfig | None = None,
+    triangle_config: TriangleDetectionConfig | None = None,
     max_channels: int = 1,
     max_boxes: int = 1,
+    max_trendlines: int = 2,
+    max_triangles: int = 1,
     show_pivots: bool = True,
     right_pad_bars: int = 0,
     channel_extend_bars: int = 0,
@@ -310,8 +334,17 @@ def build_auto_channel_live_chart_snapshot(
     if not candle_items:
         return base
 
+    resolved_trendline_config = trendline_config
+    if resolved_trendline_config is None and channel_config is not None:
+        resolved_trendline_config = TrendlineDetectionConfig(pivot=channel_config.pivot)
+    resolved_triangle_config = triangle_config
+    if resolved_triangle_config is None and channel_config is not None:
+        resolved_triangle_config = TriangleDetectionConfig(pivot=channel_config.pivot)
+
     channels = tuple(detect_channels(candle_items, channel_config))[: max(0, max_channels)]
     boxes = tuple(detect_boxes(candle_items, box_config))[: max(0, max_boxes)]
+    trendlines = tuple(detect_trendlines(candle_items, resolved_trendline_config))[: max(0, max_trendlines)]
+    triangles = tuple(detect_triangles(candle_items, resolved_triangle_config))[: max(0, max_triangles)]
     pivot_config = channel_config.pivot if channel_config is not None else None
     pivots = tuple(detect_pivots(candle_items, pivot_config)) if show_pivots else ()
 
@@ -321,7 +354,7 @@ def build_auto_channel_live_chart_snapshot(
         _channel_to_band_overlay(index, channel, extend_bars=extend_bars)
         for index, channel in enumerate(channels, start=1)
     )
-    line_overlays = tuple(
+    line_overlays = list(
         StrategyLiveChartLineOverlay(
             key=f"auto_channel_{index}_mid",
             label="通道中轴",
@@ -332,9 +365,21 @@ def build_auto_channel_live_chart_snapshot(
         )
         for index, channel in enumerate(channels, start=1)
     )
+    line_overlays.extend(
+        _trendline_to_overlay(index, trendline, extend_bars=extend_bars)
+        for index, trendline in enumerate(trendlines, start=1)
+    )
+    line_overlays.extend(
+        _triangle_upper_overlay(index, triangle, extend_bars=extend_bars)
+        for index, triangle in enumerate(triangles, start=1)
+    )
+    line_overlays.extend(
+        _triangle_lower_overlay(index, triangle, extend_bars=extend_bars)
+        for index, triangle in enumerate(triangles, start=1)
+    )
     box_overlays = tuple(_box_to_overlay(index, box) for index, box in enumerate(boxes, start=1))
     point_overlays = tuple(_pivot_to_point_overlay(index, pivot) for index, pivot in enumerate(pivots, start=1))
-    summary = _auto_channel_snapshot_note(channels, boxes, note)
+    summary = _auto_channel_snapshot_note(channels, boxes, trendlines, triangles, note)
 
     return StrategyLiveChartSnapshot(
         session_id=base.session_id,
@@ -342,7 +387,7 @@ def build_auto_channel_live_chart_snapshot(
         series=base.series,
         markers=base.markers,
         time_markers=base.time_markers,
-        line_overlays=line_overlays,
+        line_overlays=tuple(line_overlays),
         band_overlays=band_overlays,
         box_overlays=box_overlays,
         point_overlays=point_overlays,
@@ -397,6 +442,41 @@ def _box_to_overlay(index: int, box: BoxCandidate) -> StrategyLiveChartBoxOverla
     )
 
 
+def _trendline_to_overlay(index: int, trendline: TrendlineCandidate, *, extend_bars: int = 0) -> StrategyLiveChartLineOverlay:
+    color = "#f59e0b" if trendline.kind == "resistance" else "#10b981"
+    label = "趋势压力线" if trendline.kind == "resistance" else "趋势支撑线"
+    return StrategyLiveChartLineOverlay(
+        key=f"trendline_{index}",
+        label=label,
+        line=_extend_price_line(trendline.line, end_index=trendline.end_index + max(0, int(extend_bars))),
+        color=color,
+        dash=(8, 4),
+        width=2,
+    )
+
+
+def _triangle_upper_overlay(index: int, triangle: TriangleCandidate, *, extend_bars: int = 0) -> StrategyLiveChartLineOverlay:
+    return StrategyLiveChartLineOverlay(
+        key=f"triangle_{index}_upper",
+        label="三角形上沿",
+        line=_extend_price_line(triangle.upper_line, end_index=triangle.end_index + max(0, int(extend_bars))),
+        color="#ec4899",
+        dash=(3, 3),
+        width=2,
+    )
+
+
+def _triangle_lower_overlay(index: int, triangle: TriangleCandidate, *, extend_bars: int = 0) -> StrategyLiveChartLineOverlay:
+    return StrategyLiveChartLineOverlay(
+        key=f"triangle_{index}_lower",
+        label="三角形下沿",
+        line=_extend_price_line(triangle.lower_line, end_index=triangle.end_index + max(0, int(extend_bars))),
+        color="#ec4899",
+        dash=(3, 3),
+        width=2,
+    )
+
+
 def _pivot_to_point_overlay(index: int, pivot: PivotPoint) -> StrategyLiveChartPointOverlay:
     return StrategyLiveChartPointOverlay(
         key=f"pivot_{index}",
@@ -419,6 +499,8 @@ def _channel_upper_lower_lines(channel: ChannelCandidate) -> tuple[PriceLine, Pr
 def _auto_channel_snapshot_note(
     channels: tuple[ChannelCandidate, ...],
     boxes: tuple[BoxCandidate, ...],
+    trendlines: tuple[TrendlineCandidate, ...],
+    triangles: tuple[TriangleCandidate, ...],
     note: str,
 ) -> str:
     parts: list[str] = []
@@ -433,8 +515,20 @@ def _auto_channel_snapshot_note(
         parts.append(
             f"箱体 | 上沿触碰={main_box.upper_touches} | 下沿触碰={main_box.lower_touches} | 评分={format_decimal(main_box.score)}"
         )
-    if not channels and not boxes:
-        parts.append("暂无有效通道/箱体")
+    if trendlines:
+        main_line = trendlines[0]
+        label = "趋势压力线" if main_line.kind == "resistance" else "趋势支撑线"
+        parts.append(f"{label} | 触碰={main_line.touches} | 评分={format_decimal(main_line.score)}")
+    if triangles:
+        main_triangle = triangles[0]
+        triangle_label = {
+            "symmetrical": "对称三角形",
+            "ascending": "上升三角形",
+            "descending": "下降三角形",
+        }.get(main_triangle.kind, "三角形")
+        parts.append(f"{triangle_label} | 触碰={main_triangle.touches} | 评分={format_decimal(main_triangle.score)}")
+    if not channels and not boxes and not trendlines and not triangles:
+        parts.append("暂无有效通道/箱体/三角形/趋势线")
     return " | ".join(parts)
 
 
@@ -739,10 +833,15 @@ def render_strategy_live_chart(
     for point_overlay in snapshot.point_overlays:
         _draw_point_overlay(canvas, point_overlay, lower, upper, bounds, candle_step)
 
-    for marker in snapshot.markers:
-        y = _price_to_y(marker.price, lower, upper, bounds)
-        if bounds_policy == "desk":
-            y = min(max(y, bounds.top + 1.0), bounds.bottom - 1.0)
+    marker_layouts = _layout_marker_label_positions(
+        snapshot.markers,
+        lower,
+        upper,
+        bounds,
+        height=height,
+        bounds_policy=bounds_policy,
+    )
+    for marker, y, label_y in marker_layouts:
         line_kwargs = {
             "fill": marker.color,
             "width": marker.width,
@@ -756,12 +855,14 @@ def render_strategy_live_chart(
         text_width = max(len(label_text) * 7 + 14, 82)
         x1 = bounds.right + 10
         x2 = min(width - 8, x1 + text_width)
-        y1 = max(6, y - 10)
-        y2 = min(height - 6, y + 10)
+        y1 = max(_MARKER_LABEL_CANVAS_MARGIN, label_y - _MARKER_LABEL_HALF_HEIGHT)
+        y2 = min(height - _MARKER_LABEL_CANVAS_MARGIN, label_y + _MARKER_LABEL_HALF_HEIGHT)
+        if abs(label_y - y) > 0.5:
+            canvas.create_line(bounds.right, y, x1, label_y, fill=marker.color, width=1)
         canvas.create_rectangle(x1, y1, x2, y2, outline=marker.color, fill=_PRICE_LABEL_BG)
         canvas.create_text(
             x1 + 6,
-            y,
+            label_y,
             text=label_text,
             fill=marker.color,
             anchor="w",
@@ -946,6 +1047,46 @@ def _price_to_y(price: Decimal, lower: Decimal, upper: Decimal, bounds: _ChartBo
     return bounds.top + bounds.height * ratio
 
 
+def _layout_marker_label_positions(
+    markers: tuple[StrategyLiveChartMarker, ...],
+    lower: Decimal,
+    upper: Decimal,
+    bounds: _ChartBounds,
+    *,
+    height: int,
+    bounds_policy: str,
+) -> list[tuple[StrategyLiveChartMarker, float, float]]:
+    if not markers:
+        return []
+    top_limit = max(_MARKER_LABEL_CANVAS_MARGIN + _MARKER_LABEL_HALF_HEIGHT, bounds.top)
+    bottom_limit = min(height - _MARKER_LABEL_CANVAS_MARGIN - _MARKER_LABEL_HALF_HEIGHT, bounds.bottom)
+    if bottom_limit < top_limit:
+        fallback = bounds.top + bounds.height / 2
+        return [(marker, fallback, fallback) for marker in markers]
+
+    placements: list[list[object]] = []
+    for marker in markers:
+        line_y = _price_to_y(marker.price, lower, upper, bounds)
+        if bounds_policy == "desk":
+            line_y = min(max(line_y, bounds.top + 1.0), bounds.bottom - 1.0)
+        label_y = min(max(line_y, top_limit), bottom_limit)
+        placements.append([marker, line_y, label_y])
+    placements.sort(key=lambda item: float(item[2]))
+
+    for index in range(1, len(placements)):
+        prev_y = float(placements[index - 1][2])
+        current_y = float(placements[index][2])
+        if current_y - prev_y < _MARKER_LABEL_MIN_GAP:
+            placements[index][2] = min(bottom_limit, prev_y + _MARKER_LABEL_MIN_GAP)
+    for index in range(len(placements) - 2, -1, -1):
+        next_y = float(placements[index + 1][2])
+        current_y = float(placements[index][2])
+        if next_y - current_y < _MARKER_LABEL_MIN_GAP:
+            placements[index][2] = max(top_limit, next_y - _MARKER_LABEL_MIN_GAP)
+
+    return [(item[0], float(item[1]), float(item[2])) for item in placements]
+
+
 def _time_marker_x(
     at: datetime,
     snapshot: StrategyLiveChartSnapshot,
@@ -1030,6 +1171,78 @@ def compute_strategy_live_chart_layout(
         candle_step=candle_step,
         candle_count=n + max(0, int(snapshot.right_pad_bars)),
     )
+
+
+def append_candles_to_snapshot(
+    snapshot: StrategyLiveChartSnapshot,
+    candles: list[Candle] | tuple[Candle, ...],
+) -> StrategyLiveChartSnapshot:
+    merged = {item.ts: item for item in snapshot.candles}
+    for candle in candles:
+        merged[int(candle.ts)] = candle
+    candle_items = tuple(sorted(merged.values(), key=lambda item: item.ts))
+    latest_price = snapshot.latest_price
+    latest_candle_time = snapshot.latest_candle_time
+    latest_candle_confirmed = snapshot.latest_candle_confirmed
+    if candle_items:
+        latest_price = candle_items[-1].close
+        latest_candle_time = datetime.fromtimestamp(candle_items[-1].ts / 1000)
+        latest_candle_confirmed = candle_items[-1].confirmed
+    markers = tuple(_replace_last_price_marker(snapshot.markers, latest_price))
+    return StrategyLiveChartSnapshot(
+        session_id=snapshot.session_id,
+        candles=candle_items,
+        series=snapshot.series,
+        markers=markers,
+        time_markers=snapshot.time_markers,
+        line_overlays=snapshot.line_overlays,
+        band_overlays=snapshot.band_overlays,
+        box_overlays=snapshot.box_overlays,
+        point_overlays=snapshot.point_overlays,
+        latest_price=latest_price,
+        latest_candle_time=latest_candle_time,
+        latest_candle_confirmed=latest_candle_confirmed,
+        note=snapshot.note,
+        series_plot_end_index=snapshot.series_plot_end_index,
+        price_display_tick=snapshot.price_display_tick,
+        right_pad_bars=snapshot.right_pad_bars,
+    )
+
+
+def _replace_last_price_marker(
+    markers: tuple[StrategyLiveChartMarker, ...],
+    latest_price: Decimal | None,
+) -> list[StrategyLiveChartMarker]:
+    if latest_price is None:
+        return list(markers)
+    out: list[StrategyLiveChartMarker] = []
+    replaced = False
+    for marker in markers:
+        if marker.key == "last":
+            out.append(
+                StrategyLiveChartMarker(
+                    key=marker.key,
+                    label=marker.label,
+                    price=latest_price,
+                    color=marker.color,
+                    dash=marker.dash,
+                    width=marker.width,
+                )
+            )
+            replaced = True
+        else:
+            out.append(marker)
+    if not replaced:
+        out.append(
+            StrategyLiveChartMarker(
+                key="last",
+                label="最新价",
+                price=latest_price,
+                color="#bf8700",
+                dash=(10, 12),
+            )
+        )
+    return out
 
 
 def _slice_price_line(line: PriceLine, start: int, end: int) -> PriceLine | None:

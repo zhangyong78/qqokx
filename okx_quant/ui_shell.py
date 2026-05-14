@@ -20,8 +20,20 @@ from tkinter import BooleanVar, Canvas, END, Label, Listbox, Menu, StringVar, Te
 from tkinter import messagebox, ttk
 
 from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
-from okx_quant.analysis import ChannelDetectionConfig, PivotDetectionConfig
-from okx_quant.auto_channel_preview import build_auto_channel_preview_snapshot
+from okx_quant.analysis import (
+    BoxDetectionConfig,
+    ChannelDetectionConfig,
+    PivotDetectionConfig,
+    TrendlineDetectionConfig,
+    TriangleDetectionConfig,
+)
+from okx_quant.auto_channel_preview import sample_auto_channel_candles
+from okx_quant.auto_channel_storage import (
+    build_auto_channel_snapshot_record,
+    deserialize_strategy_live_chart_snapshot,
+    load_auto_channel_snapshots,
+    save_auto_channel_snapshots,
+)
 from okx_quant.backtest_ui import BacktestCompareOverviewWindow, BacktestLaunchState, BacktestWindow
 from okx_quant.btc_market_analysis_ui import BtcMarketAnalysisWindow
 from okx_quant.btc_research_workbench_ui import BtcResearchWorkbenchWindow
@@ -163,6 +175,7 @@ from okx_quant.strategy_live_chart import (
     StrategyLiveChartLayout,
     StrategyLiveChartSnapshot,
     StrategyLiveChartTimeMarker,
+    append_candles_to_snapshot,
     build_auto_channel_live_chart_snapshot,
     build_strategy_live_chart_snapshot,
     compute_strategy_live_chart_layout,
@@ -412,6 +425,11 @@ STRATEGY_BOOK_FILTER_ALL_SYMBOL = "全部标的"
 STRATEGY_BOOK_FILTER_ALL_BAR = "全部周期"
 STRATEGY_BOOK_FILTER_ALL_DIRECTION = "全部方向"
 STRATEGY_BOOK_FILTER_ALL_STATUS = "全部状态"
+STRATEGY_HISTORY_FILTER_ALL_MODE = "全部模式"
+STRATEGY_HISTORY_FILTER_ALL_PNL = "全部净盈亏"
+STRATEGY_HISTORY_FILTER_PNL_PROFIT = "盈利"
+STRATEGY_HISTORY_FILTER_PNL_LOSS = "亏损"
+STRATEGY_HISTORY_FILTER_PNL_FLAT = "持平"
 POSITION_TYPE_OPTIONS = {
     "全部类型": "",
     "永续 SWAP": "SWAP",
@@ -660,6 +678,7 @@ class ProfilePositionSnapshot:
     positions: list[OkxPosition]
     upl_usdt_prices: dict[str, Decimal]
     refreshed_at: datetime
+    position_instruments: dict[str, Instrument] = field(default_factory=dict)
 
 
 @dataclass
@@ -1000,6 +1019,17 @@ class NormalStrategyBookFilters:
     symbol: str = ""
     bar: str = ""
     direction_label: str = ""
+    status: str = ""
+
+
+@dataclass(frozen=True)
+class StrategyHistoryFilters:
+    api_name: str = ""
+    strategy_name: str = ""
+    symbol: str = ""
+    direction_label: str = ""
+    run_mode_label: str = ""
+    pnl_bucket: str = ""
     status: str = ""
 
 
@@ -1494,6 +1524,59 @@ def _strategy_book_filter_normalized(value: str, all_label: str) -> str:
 
 def _strategy_book_filter_match(actual: str, expected: str) -> bool:
     return not expected or actual == expected
+
+
+def _strategy_history_pnl_bucket(record: StrategyHistoryRecord) -> str:
+    pnl = record.net_pnl_total or Decimal("0")
+    if pnl > 0:
+        return STRATEGY_HISTORY_FILTER_PNL_PROFIT
+    if pnl < 0:
+        return STRATEGY_HISTORY_FILTER_PNL_LOSS
+    return STRATEGY_HISTORY_FILTER_PNL_FLAT
+
+
+def _strategy_history_record_matches(record: StrategyHistoryRecord, filters: StrategyHistoryFilters) -> bool:
+    return (
+        _strategy_book_filter_match(record.api_name or "-", filters.api_name)
+        and _strategy_book_filter_match(record.strategy_name or "-", filters.strategy_name)
+        and _strategy_book_filter_match(record.symbol or "-", filters.symbol)
+        and _strategy_book_filter_match(record.direction_label or "-", filters.direction_label)
+        and _strategy_book_filter_match(record.run_mode_label or "-", filters.run_mode_label)
+        and _strategy_book_filter_match(_strategy_history_pnl_bucket(record), filters.pnl_bucket)
+        and _strategy_book_filter_match(record.status or "-", filters.status)
+    )
+
+
+def _build_strategy_history_filter_options(records: list[StrategyHistoryRecord]) -> dict[str, tuple[str, ...]]:
+    ordered = sorted(records, key=lambda item: (item.started_at, item.record_id), reverse=True)
+
+    def _sorted_with_all(all_label: str, values: set[str]) -> tuple[str, ...]:
+        cleaned = sorted(value for value in values if str(value or "").strip())
+        return (all_label, *cleaned)
+
+    return {
+        "api_name": _sorted_with_all(STRATEGY_BOOK_FILTER_ALL_API, {record.api_name or "-" for record in ordered}),
+        "strategy_name": _sorted_with_all(
+            STRATEGY_BOOK_FILTER_ALL_STRATEGY,
+            {record.strategy_name or "-" for record in ordered},
+        ),
+        "symbol": _sorted_with_all(STRATEGY_BOOK_FILTER_ALL_SYMBOL, {record.symbol or "-" for record in ordered}),
+        "direction_label": _sorted_with_all(
+            STRATEGY_BOOK_FILTER_ALL_DIRECTION,
+            {record.direction_label or "-" for record in ordered},
+        ),
+        "run_mode_label": _sorted_with_all(
+            STRATEGY_HISTORY_FILTER_ALL_MODE,
+            {record.run_mode_label or "-" for record in ordered},
+        ),
+        "pnl_bucket": (
+            STRATEGY_HISTORY_FILTER_ALL_PNL,
+            STRATEGY_HISTORY_FILTER_PNL_PROFIT,
+            STRATEGY_HISTORY_FILTER_PNL_LOSS,
+            STRATEGY_HISTORY_FILTER_PNL_FLAT,
+        ),
+        "status": _sorted_with_all(STRATEGY_BOOK_FILTER_ALL_STATUS, {record.status or "-" for record in ordered}),
+    }
 
 
 def _normal_strategy_history_records(records: list[StrategyHistoryRecord]) -> list[StrategyHistoryRecord]:
@@ -2485,6 +2568,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.selected_session_text = StringVar(value=self._default_selected_session_text())
         self._selected_session_detail_session_id: str | None = None
         self.strategy_history_text = StringVar(value=self._default_strategy_history_text())
+        self.strategy_history_api_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_API)
+        self.strategy_history_strategy_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_STRATEGY)
+        self.strategy_history_symbol_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_SYMBOL)
+        self.strategy_history_direction_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_DIRECTION)
+        self.strategy_history_mode_filter = StringVar(value=STRATEGY_HISTORY_FILTER_ALL_MODE)
+        self.strategy_history_pnl_filter = StringVar(value=STRATEGY_HISTORY_FILTER_ALL_PNL)
+        self.strategy_history_status_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_STATUS)
         self.strategy_book_summary_text = StringVar(value="普通量化策略总账本尚未打开。")
         self.strategy_book_api_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_API)
         self.strategy_book_trader_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_TRADER)
@@ -2532,6 +2622,15 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._strategy_history_tree: ttk.Treeview | None = None
         self._strategy_history_detail: Text | None = None
         self._strategy_history_selected_record_id: str | None = None
+        self._strategy_history_api_combo: ttk.Combobox | None = None
+        self._strategy_history_strategy_combo: ttk.Combobox | None = None
+        self._strategy_history_symbol_combo: ttk.Combobox | None = None
+        self._strategy_history_direction_combo: ttk.Combobox | None = None
+        self._strategy_history_mode_combo: ttk.Combobox | None = None
+        self._strategy_history_pnl_combo: ttk.Combobox | None = None
+        self._strategy_history_status_combo: ttk.Combobox | None = None
+        self._strategy_history_sort_column = "started"
+        self._strategy_history_sort_descending = True
         self._auto_channel_preview_window: Toplevel | None = None
         self._strategy_book_window: Toplevel | None = None
         self._strategy_live_chart_windows: dict[str, StrategyLiveChartWindowState] = {}
@@ -3181,10 +3280,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 "api",
                 "source_type",
                 "strategy",
+                "mode",
                 "symbol",
                 "bar",
                 "direction",
-                "mode",
+                "open_qty",
                 "live_pnl",
                 "pnl",
                 "status",
@@ -3199,10 +3299,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("api", text="API")
         self.session_tree.heading("source_type", text="来源类型")
         self.session_tree.heading("strategy", text="策略")
+        self.session_tree.heading("mode", text="模式")
         self.session_tree.heading("symbol", text="标的(双击K线)")
         self.session_tree.heading("bar", text="周期")
         self.session_tree.heading("direction", text="方向")
-        self.session_tree.heading("mode", text="模式")
+        self.session_tree.heading("open_qty", text="开位数量")
         self.session_tree.heading("live_pnl", text="实时浮盈亏")
         self.session_tree.heading("pnl", text="净盈亏")
         self.session_tree.heading("status", text="状态")
@@ -3213,10 +3314,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.column("api", width=80, anchor="center")
         self.session_tree.column("source_type", width=98, anchor="center")
         self.session_tree.column("strategy", width=120, anchor="w")
+        self.session_tree.column("mode", width=96, anchor="center")
         self.session_tree.column("symbol", width=156, anchor="w")
         self.session_tree.column("bar", width=68, anchor="center")
         self.session_tree.column("direction", width=82, anchor="center")
-        self.session_tree.column("mode", width=96, anchor="center")
+        self.session_tree.column("open_qty", width=112, anchor="e")
         self.session_tree.column("live_pnl", width=112, anchor="e")
         self.session_tree.column("pnl", width=104, anchor="e")
         self.session_tree.column("status", width=108, anchor="center")
@@ -4978,17 +5080,17 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         window.title("自动通道预览")
         apply_adaptive_window_geometry(
             window,
-            width_ratio=0.76,
-            height_ratio=0.68,
-            min_width=1040,
-            min_height=660,
-            max_width=1760,
-            max_height=1120,
+            width_ratio=0.78,
+            height_ratio=0.7,
+            min_width=1120,
+            min_height=720,
+            max_width=1800,
+            max_height=1160,
         )
         container = ttk.Frame(window, padding=10)
         container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(1, weight=1)
+        container.rowconfigure(3, weight=1)
 
         top_bar = ttk.Frame(container)
         top_bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -5004,8 +5106,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         sample_box.grid(row=0, column=1, padx=(6, 10))
         ttk.Label(top_bar, text="标的").grid(row=0, column=2, sticky="w")
         symbol_var = StringVar(value=self._default_line_trading_symbol())
-        symbol_box = ttk.Combobox(top_bar, width=18, textvariable=symbol_var, values=self._line_trading_symbol_values())
-        symbol_box.grid(row=0, column=3, padx=(6, 10))
+        ttk.Combobox(top_bar, width=18, textvariable=symbol_var, values=self._line_trading_symbol_values()).grid(
+            row=0, column=3, padx=(6, 10)
+        )
         ttk.Label(top_bar, text="周期").grid(row=0, column=4, sticky="w")
         bar_var = StringVar(value="1H")
         ttk.Combobox(top_bar, width=8, state="readonly", values=BAR_OPTIONS, textvariable=bar_var).grid(
@@ -5015,34 +5118,455 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         limit_var = StringVar(value="240")
         ttk.Entry(top_bar, width=7, textvariable=limit_var).grid(row=0, column=7, padx=(6, 10))
         status_text = StringVar(value="自动通道预览：仅用于看图验证，不会下单。")
-        ttk.Button(top_bar, text="刷新样例", command=lambda: refresh_sample()).grid(row=0, column=8, padx=(0, 8))
-        ttk.Button(top_bar, text="加载真实K线", command=lambda: load_real_candles()).grid(row=0, column=9, padx=(0, 10))
-        ttk.Label(top_bar, textvariable=status_text, foreground="#555").grid(row=0, column=10, sticky="w")
         top_bar.columnconfigure(10, weight=1)
 
+        param_bar = ttk.LabelFrame(container, text="识别参数", padding=(10, 8))
+        param_bar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        pivot_left_var = StringVar(value="1")
+        pivot_right_var = StringVar(value="1")
+        pivot_gap_var = StringVar(value="1")
+        atr_period_var = StringVar(value="3")
+        atr_multiplier_var = StringVar(value="0")
+        min_anchor_var = StringVar(value="6")
+        min_span_var = StringVar(value="18")
+        max_violations_var = StringVar(value="8")
+        show_channels_var = BooleanVar(value=True)
+        show_boxes_var = BooleanVar(value=True)
+        show_trendlines_var = BooleanVar(value=True)
+        show_triangles_var = BooleanVar(value=True)
+        show_pivots_var = BooleanVar(value=True)
+
+        ttk.Label(param_bar, text="Pivot左").grid(row=0, column=0, sticky="w")
+        ttk.Entry(param_bar, width=5, textvariable=pivot_left_var).grid(row=0, column=1, padx=(6, 10))
+        ttk.Label(param_bar, text="Pivot右").grid(row=0, column=2, sticky="w")
+        ttk.Entry(param_bar, width=5, textvariable=pivot_right_var).grid(row=0, column=3, padx=(6, 10))
+        ttk.Label(param_bar, text="最小间距").grid(row=0, column=4, sticky="w")
+        ttk.Entry(param_bar, width=5, textvariable=pivot_gap_var).grid(row=0, column=5, padx=(6, 10))
+        ttk.Label(param_bar, text="ATR周期").grid(row=0, column=6, sticky="w")
+        ttk.Entry(param_bar, width=6, textvariable=atr_period_var).grid(row=0, column=7, padx=(6, 10))
+        ttk.Label(param_bar, text="ATR过滤").grid(row=0, column=8, sticky="w")
+        ttk.Entry(param_bar, width=7, textvariable=atr_multiplier_var).grid(row=0, column=9, padx=(6, 10))
+        ttk.Label(param_bar, text="最小跨度").grid(row=0, column=10, sticky="w")
+        ttk.Entry(param_bar, width=6, textvariable=min_span_var).grid(row=0, column=11, padx=(6, 10))
+
+        ttk.Label(param_bar, text="锚点间距").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(param_bar, width=5, textvariable=min_anchor_var).grid(row=1, column=1, padx=(6, 10), pady=(8, 0))
+        ttk.Label(param_bar, text="最大穿越").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(param_bar, width=5, textvariable=max_violations_var).grid(
+            row=1,
+            column=3,
+            padx=(6, 10),
+            pady=(8, 0),
+        )
+        ttk.Checkbutton(param_bar, text="通道", variable=show_channels_var).grid(row=1, column=4, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(param_bar, text="箱体", variable=show_boxes_var).grid(row=1, column=5, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(param_bar, text="趋势线", variable=show_trendlines_var).grid(
+            row=1,
+            column=6,
+            sticky="w",
+            pady=(8, 0),
+        )
+        ttk.Checkbutton(param_bar, text="三角形", variable=show_triangles_var).grid(
+            row=1,
+            column=7,
+            sticky="w",
+            pady=(8, 0),
+        )
+        ttk.Checkbutton(param_bar, text="枢轴点", variable=show_pivots_var).grid(row=1, column=8, sticky="w", pady=(8, 0))
+        param_bar.columnconfigure(12, weight=1)
+
+        history_bar = ttk.Frame(container)
+        history_bar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(history_bar, text="历史划线").grid(row=0, column=0, sticky="w")
+        saved_var = StringVar(value="")
+        saved_combo = ttk.Combobox(history_bar, width=42, textvariable=saved_var, state="readonly")
+        saved_combo.grid(row=0, column=1, padx=(6, 8))
+        history_bar.columnconfigure(4, weight=1)
+
         canvas = Canvas(container, background="#ffffff", highlightthickness=0, width=1120, height=640)
-        canvas.grid(row=1, column=0, sticky="nsew")
+        canvas.grid(row=3, column=0, sticky="nsew")
         snapshot_box: dict[str, StrategyLiveChartSnapshot | None] = {"snapshot": None}
-        generation_box = {"value": 0}
+        load_generation_box = {"value": 0}
+        append_generation_box = {"value": 0}
+        append_after_box: dict[str, str | None] = {"job": None}
+        saved_records_box = {"records": load_auto_channel_snapshots()}
+        source_state: dict[str, object] = {
+            "mode": "sample",
+            "symbol": "",
+            "bar": "",
+            "limit": 0,
+            "api_profile": "",
+            "label": "",
+        }
 
         def sample_key() -> str:
             return "box" if sample_var.get() == "箱体样例" else "channel"
+
+        def parse_positive_int(raw: str, label: str) -> int:
+            try:
+                value = int(raw.strip())
+            except ValueError as exc:
+                raise ValueError(f"{label}必须是整数。") from exc
+            if value <= 0:
+                raise ValueError(f"{label}必须大于 0。")
+            return value
+
+        def parse_nonnegative_int(raw: str, label: str) -> int:
+            try:
+                value = int(raw.strip())
+            except ValueError as exc:
+                raise ValueError(f"{label}必须是整数。") from exc
+            if value < 0:
+                raise ValueError(f"{label}不能小于 0。")
+            return value
+
+        def parse_nonnegative_decimal(raw: str, label: str) -> Decimal:
+            try:
+                value = Decimal(raw.strip())
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError(f"{label}必须是数字。") from exc
+            if value < 0:
+                raise ValueError(f"{label}不能小于 0。")
+            return value
+
+        def build_detection_settings() -> dict[str, object]:
+            pivot = PivotDetectionConfig(
+                left_bars=parse_positive_int(pivot_left_var.get(), "Pivot左"),
+                right_bars=parse_positive_int(pivot_right_var.get(), "Pivot右"),
+                atr_period=parse_positive_int(atr_period_var.get(), "ATR周期"),
+                atr_multiplier=parse_nonnegative_decimal(atr_multiplier_var.get(), "ATR过滤"),
+                min_index_distance=parse_nonnegative_int(pivot_gap_var.get(), "最小间距"),
+            )
+            min_anchor_distance = parse_positive_int(min_anchor_var.get(), "锚点间距")
+            min_span = parse_positive_int(min_span_var.get(), "最小跨度")
+            max_violations = parse_nonnegative_int(max_violations_var.get(), "最大穿越")
+            return {
+                "channel_config": ChannelDetectionConfig(
+                    pivot=pivot,
+                    min_anchor_distance=min_anchor_distance,
+                    min_channel_bars=max(3, min_span),
+                    max_violations=max_violations,
+                ),
+                "box_config": BoxDetectionConfig(
+                    pivot=pivot,
+                    min_box_bars=max(3, min_span),
+                    min_touches_per_side=2,
+                    max_violations=max_violations,
+                ),
+                "trendline_config": TrendlineDetectionConfig(
+                    pivot=pivot,
+                    min_anchor_distance=min_anchor_distance,
+                    min_line_bars=max(3, min_span),
+                    max_violations=max_violations,
+                ),
+                "triangle_config": TriangleDetectionConfig(
+                    pivot=pivot,
+                    min_anchor_distance=max(2, min_anchor_distance),
+                    min_triangle_bars=max(3, min_span),
+                    max_violations=max_violations,
+                ),
+                "show_channels": bool(show_channels_var.get()),
+                "show_boxes": bool(show_boxes_var.get()),
+                "show_trendlines": bool(show_trendlines_var.get()),
+                "show_triangles": bool(show_triangles_var.get()),
+                "show_pivots": bool(show_pivots_var.get()),
+            }
+
+        def apply_parameter_preset(preset: str) -> None:
+            if preset == "conservative":
+                pivot_left_var.set("3")
+                pivot_right_var.set("3")
+                pivot_gap_var.set("2")
+                atr_period_var.set("14")
+                atr_multiplier_var.set("0.5")
+                min_anchor_var.set("8")
+                min_span_var.set("28")
+                max_violations_var.set("4")
+                label = "保守"
+            elif preset == "aggressive":
+                pivot_left_var.set("1")
+                pivot_right_var.set("1")
+                pivot_gap_var.set("1")
+                atr_period_var.set("7")
+                atr_multiplier_var.set("0")
+                min_anchor_var.set("4")
+                min_span_var.set("14")
+                max_violations_var.set("10")
+                label = "激进"
+            else:
+                pivot_left_var.set("2")
+                pivot_right_var.set("2")
+                pivot_gap_var.set("2")
+                atr_period_var.set("14")
+                atr_multiplier_var.set("0.25")
+                min_anchor_var.set("6")
+                min_span_var.set("20")
+                max_violations_var.set("6")
+                label = "平衡"
+            show_channels_var.set(True)
+            show_boxes_var.set(True)
+            show_trendlines_var.set(True)
+            show_triangles_var.set(True)
+            show_pivots_var.set(True)
+            status_text.set(f"已切换到{label}预设。图形暂不变化，点击“按当前参数重算”后生效。")
+
+        def build_snapshot_from_candles(
+            *,
+            session_id: str,
+            candles: list[Candle] | tuple[Candle, ...],
+            note: str,
+            settings: dict[str, object] | None = None,
+        ) -> StrategyLiveChartSnapshot:
+            resolved_settings = settings or build_detection_settings()
+            candle_items = list(candles)
+            return build_auto_channel_live_chart_snapshot(
+                session_id=session_id,
+                candles=candle_items,
+                channel_config=resolved_settings["channel_config"],
+                box_config=resolved_settings["box_config"],
+                trendline_config=resolved_settings["trendline_config"],
+                triangle_config=resolved_settings["triangle_config"],
+                max_channels=1 if resolved_settings["show_channels"] else 0,
+                max_boxes=1 if resolved_settings["show_boxes"] else 0,
+                max_trendlines=2 if resolved_settings["show_trendlines"] else 0,
+                max_triangles=1 if resolved_settings["show_triangles"] else 0,
+                show_pivots=bool(resolved_settings["show_pivots"]),
+                right_pad_bars=50,
+                channel_extend_bars=50,
+                latest_price=candle_items[-1].close if candle_items else None,
+                note=note,
+            )
+
+        def format_candle_ts(value: object) -> str:
+            try:
+                normalized = int(value)
+            except (TypeError, ValueError):
+                return "-" if value in (None, "") else str(value)
+            try:
+                return datetime.fromtimestamp(normalized / 1000).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                return str(normalized)
+
+        def format_saved_at(value: object) -> str:
+            raw = str(value or "").strip()
+            if not raw:
+                return ""
+            try:
+                normalized = raw.replace("Z", "+00:00")
+                return datetime.fromisoformat(normalized).astimezone().strftime("%m-%d %H:%M")
+            except Exception:
+                return raw
+
+        def record_option_text(record: dict[str, object]) -> str:
+            label = str(record.get("label", "") or "").strip() or "未命名"
+            symbol = str(record.get("symbol", "") or "").strip()
+            bar = str(record.get("bar", "") or "").strip()
+            last_candle_text = format_candle_ts(record.get("last_candle_ts"))
+            saved_at = format_saved_at(record.get("saved_at"))
+            if symbol and bar:
+                base = f"{symbol} | {bar} | {last_candle_text}"
+            else:
+                base = label
+            if saved_at:
+                return f"{base} | 保存 {saved_at}"
+            return base
+
+        def refresh_saved_options(select_record_id: str | None = None) -> None:
+            records = saved_records_box["records"]
+            values = [record_option_text(item) for item in records]
+            saved_combo.configure(values=values)
+            if not values:
+                saved_var.set("")
+                return
+            if select_record_id:
+                for item, text in zip(records, values):
+                    if str(item.get("record_id", "")) == select_record_id:
+                        saved_var.set(text)
+                        return
+            if saved_var.get() not in values:
+                saved_var.set(values[0])
 
         def redraw(_event=None) -> None:
             snapshot = snapshot_box.get("snapshot")
             if snapshot is not None:
                 render_strategy_live_chart(canvas, snapshot)
 
+        def cancel_auto_append() -> None:
+            append_generation_box["value"] += 1
+            job = append_after_box.get("job")
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+            append_after_box["job"] = None
+
+        def schedule_auto_append() -> None:
+            if source_state.get("mode") != "real":
+                return
+            generation = append_generation_box["value"]
+
+            def kick() -> None:
+                run_auto_append_poll(generation)
+
+            append_after_box["job"] = self.root.after(15_000, kick)
+
+        def run_auto_append_poll(generation: int) -> None:
+            if generation != append_generation_box["value"] or source_state.get("mode") != "real":
+                return
+            symbol = str(source_state.get("symbol", "") or "")
+            bar = str(source_state.get("bar", "") or "")
+            limit = int(source_state.get("limit", 0) or 0)
+            if not symbol or not bar or limit <= 0:
+                return
+
+            def worker() -> None:
+                try:
+                    candles = self.client.get_candles_history(symbol, bar, limit=limit)
+                    error = None
+                except Exception as exc:
+                    candles = None
+                    error = str(exc)
+
+                def apply_result() -> None:
+                    if generation != append_generation_box["value"] or not _widget_exists(window):
+                        return
+                    append_after_box["job"] = None
+                    if error is not None:
+                        status_text.set(f"追加K线失败：{error}")
+                        schedule_auto_append()
+                        return
+                    current = snapshot_box.get("snapshot")
+                    if current is not None and candles:
+                        snapshot_box["snapshot"] = append_candles_to_snapshot(current, candles)
+                        redraw()
+                    schedule_auto_append()
+
+                self.root.after(0, apply_result)
+
+            threading.Thread(target=worker, daemon=True, name="auto-channel-preview-append").start()
+
         def refresh_sample() -> None:
-            generation_box["value"] += 1
-            snapshot = build_auto_channel_preview_snapshot(sample_key())
+            load_generation_box["value"] += 1
+            cancel_auto_append()
+            try:
+                snapshot = build_snapshot_from_candles(
+                    session_id=f"auto-{sample_key()}",
+                    candles=sample_auto_channel_candles(sample_key()),
+                    note="自动通道预览",
+                )
+            except ValueError as exc:
+                messagebox.showerror("参数错误", str(exc), parent=window)
+                return
             snapshot_box["snapshot"] = snapshot
+            source_state.update(
+                {
+                    "mode": "sample",
+                    "symbol": "",
+                    "bar": "",
+                    "limit": 0,
+                    "api_profile": "",
+                    "label": sample_var.get(),
+                }
+            )
             status_text.set(snapshot.note or "自动通道预览已刷新")
             redraw()
 
+        def save_current_snapshot() -> None:
+            snapshot = snapshot_box.get("snapshot")
+            if snapshot is None or not snapshot.candles:
+                messagebox.showwarning("无法保存", "当前没有可保存的结构图。", parent=window)
+                return
+            symbol = str(source_state.get("symbol", "") or symbol_var.get().strip().upper() or sample_key())
+            bar = str(source_state.get("bar", "") or bar_var.get().strip() or "-")
+            last_ts = snapshot.candles[-1].ts
+            default_label = f"{symbol} | {bar} | {format_candle_ts(last_ts)}"
+            label = simpledialog.askstring("保存结构", "请输入保存名称：", initialvalue=default_label, parent=window)
+            if label is None:
+                return
+            record = build_auto_channel_snapshot_record(
+                snapshot=snapshot,
+                source_mode=str(source_state.get("mode", "sample") or "sample"),
+                symbol=symbol,
+                bar=bar,
+                label=label,
+                api_profile=str(source_state.get("api_profile", "") or ""),
+                candle_limit=int(source_state.get("limit", 0) or 0),
+            )
+            saved_records_box["records"].insert(0, record)
+            save_auto_channel_snapshots(saved_records_box["records"])
+            refresh_saved_options(str(record.get("record_id", "")))
+            status_text.set(f"已保存结构 | {label} | 最后K线={format_candle_ts(last_ts)}")
+
+        def load_saved_snapshot() -> None:
+            selected = saved_var.get().strip()
+            if not selected:
+                messagebox.showwarning("无法加载", "请先选择一条历史划线。", parent=window)
+                return
+            record = next((item for item in saved_records_box["records"] if record_option_text(item) == selected), None)
+            if record is None:
+                messagebox.showwarning("无法加载", "没有找到对应的历史划线记录。", parent=window)
+                return
+            payload = record.get("snapshot")
+            if not isinstance(payload, dict):
+                messagebox.showwarning("无法加载", "该记录缺少图表快照。", parent=window)
+                return
+            load_generation_box["value"] += 1
+            cancel_auto_append()
+            snapshot = deserialize_strategy_live_chart_snapshot(payload)
+            snapshot_box["snapshot"] = snapshot
+            source_state.update(
+                {
+                    "mode": "saved",
+                    "symbol": str(record.get("symbol", "") or ""),
+                    "bar": str(record.get("bar", "") or ""),
+                    "limit": int(record.get("candle_limit", 0) or 0),
+                    "api_profile": str(record.get("api_profile", "") or ""),
+                    "label": str(record.get("label", "") or ""),
+                }
+            )
+            if source_state["symbol"]:
+                symbol_var.set(str(source_state["symbol"]))
+            if source_state["bar"]:
+                bar_var.set(str(source_state["bar"]))
+            if source_state["limit"]:
+                limit_var.set(str(source_state["limit"]))
+            status_text.set(
+                f"已加载历史结构 | {record.get('label', '')} | 最后K线={format_candle_ts(record.get('last_candle_ts'))}"
+            )
+            redraw()
+
+        def rebuild_current_snapshot() -> None:
+            mode = str(source_state.get("mode", "") or "")
+            if mode == "real":
+                load_real_candles()
+                return
+            if mode == "sample":
+                refresh_sample()
+                return
+            snapshot = snapshot_box.get("snapshot")
+            if snapshot is None or not snapshot.candles:
+                messagebox.showwarning("无法重算", "当前没有可重算的K线数据。", parent=window)
+                return
+            load_generation_box["value"] += 1
+            cancel_auto_append()
+            try:
+                rebuilt = build_snapshot_from_candles(
+                    session_id=f"auto-saved:{source_state.get('label', 'snapshot')}",
+                    candles=snapshot.candles,
+                    note=str(source_state.get("label", "历史结构") or "历史结构"),
+                )
+            except ValueError as exc:
+                messagebox.showerror("参数错误", str(exc), parent=window)
+                return
+            snapshot_box["snapshot"] = rebuilt
+            status_text.set(f"已按当前参数重算 | {source_state.get('label', '历史结构')} | 图形仍保持冻结。")
+            redraw()
+
         def load_real_candles() -> None:
-            generation_box["value"] += 1
-            generation = generation_box["value"]
+            load_generation_box["value"] += 1
+            cancel_auto_append()
+            generation = load_generation_box["value"]
             symbol = symbol_var.get().strip().upper()
             bar = bar_var.get().strip()
             try:
@@ -5053,31 +5577,22 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             if not symbol:
                 messagebox.showerror("参数错误", "请填写标的。", parent=window)
                 return
+            try:
+                detection_settings = build_detection_settings()
+            except ValueError as exc:
+                messagebox.showerror("参数错误", str(exc), parent=window)
+                return
             limit_var.set(str(limit))
             status_text.set(f"正在加载真实K线 | {symbol} | {bar} | {limit} 根...")
 
             def worker() -> None:
                 try:
                     candles = self.client.get_candles_history(symbol, bar, limit=limit)
-                    snapshot = build_auto_channel_live_chart_snapshot(
+                    snapshot = build_snapshot_from_candles(
                         session_id=f"auto-live:{symbol}:{bar}",
                         candles=candles,
-                        channel_config=ChannelDetectionConfig(
-                            pivot=PivotDetectionConfig(
-                                left_bars=2,
-                                right_bars=2,
-                                atr_period=14,
-                                atr_multiplier=Decimal("0.25"),
-                                min_index_distance=2,
-                            ),
-                            min_anchor_distance=6,
-                            min_channel_bars=18,
-                            max_violations=8,
-                        ),
-                        right_pad_bars=50,
-                        channel_extend_bars=50,
-                        latest_price=candles[-1].close if candles else None,
                         note=f"{symbol} | {bar} | 真实K线",
+                        settings=detection_settings,
                     )
                     error = None
                 except Exception as exc:
@@ -5085,31 +5600,93 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                     error = str(exc)
 
                 def apply_result() -> None:
-                    if generation_box["value"] != generation or not _widget_exists(window):
+                    if load_generation_box["value"] != generation or not _widget_exists(window):
                         return
                     if error is not None:
                         status_text.set(f"真实K线加载失败：{error}")
                         self._enqueue_log(f"自动通道预览加载失败 | {symbol} | {bar} | {error}")
                         return
                     snapshot_box["snapshot"] = snapshot
+                    source_state.update(
+                        {
+                            "mode": "real",
+                            "symbol": symbol,
+                            "bar": bar,
+                            "limit": limit,
+                            "api_profile": self._current_credential_profile(),
+                            "label": f"{symbol} | {bar}",
+                        }
+                    )
                     if snapshot is None:
                         status_text.set("真实K线加载完成，但没有可绘制数据。")
                     else:
-                        status_text.set(snapshot.note or f"已加载真实K线 | {symbol} | {bar}")
+                        status_text.set((snapshot.note or f"已加载真实K线 | {symbol} | {bar}") + " | 结构冻结，后续仅追加K线。")
+                        schedule_auto_append()
                     redraw()
 
                 self.root.after(0, apply_result)
 
             threading.Thread(target=worker, daemon=True, name="auto-channel-preview-load").start()
 
+        ttk.Button(top_bar, text="刷新样例", command=refresh_sample).grid(row=0, column=8, padx=(0, 8))
+        ttk.Button(top_bar, text="加载真实K线", command=load_real_candles).grid(row=0, column=9, padx=(0, 8))
+        ttk.Label(top_bar, textvariable=status_text, foreground="#555").grid(row=0, column=10, sticky="w")
+        ttk.Button(param_bar, text="保守", command=lambda: apply_parameter_preset("conservative")).grid(
+            row=2,
+            column=0,
+            padx=(0, 8),
+            pady=(10, 0),
+            sticky="w",
+        )
+        ttk.Button(param_bar, text="平衡", command=lambda: apply_parameter_preset("balanced")).grid(
+            row=2,
+            column=1,
+            padx=(0, 8),
+            pady=(10, 0),
+            sticky="w",
+        )
+        ttk.Button(param_bar, text="激进", command=lambda: apply_parameter_preset("aggressive")).grid(
+            row=2,
+            column=2,
+            padx=(0, 12),
+            pady=(10, 0),
+            sticky="w",
+        )
+        ttk.Label(param_bar, text="预设只改参数，不会自动改图。", foreground="#666").grid(
+            row=2,
+            column=3,
+            columnspan=4,
+            sticky="w",
+            pady=(10, 0),
+        )
+        ttk.Button(param_bar, text="按当前参数重算", command=rebuild_current_snapshot).grid(
+            row=1,
+            column=9,
+            padx=(12, 8),
+            pady=(8, 0),
+            sticky="w",
+        )
+        ttk.Label(param_bar, text="参数变更后只有手动重算才会改图。", foreground="#666").grid(
+            row=1,
+            column=10,
+            columnspan=3,
+            sticky="w",
+            pady=(8, 0),
+        )
+        ttk.Button(history_bar, text="保存当前结构", command=save_current_snapshot).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(history_bar, text="加载历史结构", command=load_saved_snapshot).grid(row=0, column=3, padx=(0, 8))
+        ttk.Label(history_bar, text="保存会带上最后一根K线时间。", foreground="#666").grid(row=0, column=4, sticky="w")
+
         def close() -> None:
-            generation_box["value"] += 1
+            load_generation_box["value"] += 1
+            cancel_auto_append()
             self._auto_channel_preview_window = None
             window.destroy()
 
         sample_box.bind("<<ComboboxSelected>>", lambda _event: refresh_sample())
         canvas.bind("<Configure>", redraw)
         window.protocol("WM_DELETE_WINDOW", close)
+        refresh_saved_options()
         self.root.after(50, refresh_sample)
 
     def open_btc_research_workbench_window(self) -> None:
