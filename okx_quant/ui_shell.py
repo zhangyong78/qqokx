@@ -3303,7 +3303,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("symbol", text="标的(双击K线)")
         self.session_tree.heading("bar", text="周期")
         self.session_tree.heading("direction", text="方向")
-        self.session_tree.heading("open_qty", text="开位数量")
+        self.session_tree.heading("open_qty", text="开仓数量")
         self.session_tree.heading("live_pnl", text="实时浮盈亏")
         self.session_tree.heading("pnl", text="净盈亏")
         self.session_tree.heading("status", text="状态")
