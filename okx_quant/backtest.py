@@ -12,6 +12,7 @@ from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
+from okx_quant.strategies.ema_dynamic_multi_timeframe import filter_bias_allows_signal
 from okx_quant.strategies.adaptive_ema_rail import (
     ADAPTIVE_RAIL_STATE_BROKEN,
     adaptive_rail_candidate_periods,
@@ -23,11 +24,14 @@ from okx_quant.strategy_catalog import (
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
+    STRATEGY_DYNAMIC_MTF_LONG_ID,
+    STRATEGY_DYNAMIC_MTF_SHORT_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
     is_adaptive_ema_rail_strategy,
+    is_dynamic_mtf_strategy_id,
     is_dynamic_strategy_id,
     is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
@@ -149,6 +153,11 @@ class BacktestResult:
     big_ema_period: int = 233
     atr_period: int = 10
     strategy_id: str = STRATEGY_DYNAMIC_ID
+    bar: str = ""
+    mtf_filter_bar: str = ""
+    mtf_filter_fast_ema_period: int = 0
+    mtf_filter_slow_ema_period: int = 0
+    mtf_reversal_mode: str = "block_new_entries"
     data_source_note: str = ""
     maker_fee_rate: Decimal = Decimal("0")
     taker_fee_rate: Decimal = Decimal("0")
@@ -290,6 +299,21 @@ def run_backtest(
         end_ts=end_ts,
         preload_count=preload_count,
     )
+    mtf_filter_candles: list[Candle] | None = None
+    if is_dynamic_mtf_strategy_id(config.strategy_id):
+        filter_inst_id = config.resolved_mtf_filter_inst_id()
+        filter_bar = config.resolved_mtf_filter_bar()
+        filter_preload = _required_mtf_filter_preload_candles(config)
+        filter_limit = min(MAX_BACKTEST_CANDLES, max(800, candle_limit if candle_limit > 0 else len(candles)))
+        mtf_filter_candles = _load_backtest_candles(
+            client,
+            filter_inst_id,
+            filter_bar,
+            filter_limit,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            preload_count=filter_preload,
+        )
     cross_higher_tf_bias: list[str] | None = None
     if (
         is_ema_atr_breakout_strategy(config.strategy_id)
@@ -323,6 +347,7 @@ def run_backtest(
         maker_fee_rate=maker_fee_rate,
         taker_fee_rate=taker_fee_rate,
         cross_higher_tf_bias=cross_higher_tf_bias,
+        mtf_filter_candles=mtf_filter_candles,
     )
 
 
@@ -371,7 +396,11 @@ def build_parameter_batch_configs(
     take_ratios: tuple[Decimal, ...] = ATR_BATCH_TAKE_RATIOS,
     max_entries_options: tuple[int, ...] = BATCH_MAX_ENTRIES_OPTIONS,
 ) -> list[StrategyConfig]:
-    if not (is_dynamic_strategy_id(base_config.strategy_id) or is_adaptive_ema_rail_strategy(base_config.strategy_id)):
+    if not (
+        is_dynamic_strategy_id(base_config.strategy_id)
+        or is_dynamic_mtf_strategy_id(base_config.strategy_id)
+        or is_adaptive_ema_rail_strategy(base_config.strategy_id)
+    ):
         return build_atr_batch_configs(
             base_config,
             atr_multipliers=atr_multipliers,
@@ -538,6 +567,18 @@ def run_backtest_batch(
         end_ts=end_ts,
         preload_count=preload_count,
     )
+    mtf_filter_candles: list[Candle] | None = None
+    if is_dynamic_mtf_strategy_id(sample_config.strategy_id):
+        filter_limit = min(MAX_BACKTEST_CANDLES, max(800, candle_limit if candle_limit > 0 else len(candles)))
+        mtf_filter_candles = _load_backtest_candles(
+            client,
+            sample_config.resolved_mtf_filter_inst_id(),
+            sample_config.resolved_mtf_filter_bar(),
+            filter_limit,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            preload_count=max(_required_mtf_filter_preload_candles(config) for config in batch_configs),
+        )
     data_source_note = _build_backtest_data_source_note(client)
     results: list[tuple[StrategyConfig, BacktestResult]] = []
     for config in batch_configs:
@@ -551,6 +592,7 @@ def run_backtest_batch(
                     data_source_note=data_source_note,
                     maker_fee_rate=maker_fee_rate,
                     taker_fee_rate=taker_fee_rate,
+                    mtf_filter_candles=mtf_filter_candles,
                 ),
             )
         )
@@ -566,13 +608,31 @@ def _run_backtest_with_loaded_data(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
     cross_higher_tf_bias: list[str] | None = None,
+    mtf_filter_candles: list[Candle] | None = None,
 ) -> BacktestResult:
     terminal_open_position: BacktestOpenPosition | None = None
     manual_positions: list[BacktestManualPosition] = []
     manual_handoffs = 0
     max_manual_positions = 0
     max_total_occupied_slots = 0
-    if is_dynamic_strategy_id(config.strategy_id):
+    if is_dynamic_mtf_strategy_id(config.strategy_id):
+        if mtf_filter_candles is None:
+            raise RuntimeError("多周期动态策略缺少高周期 K 线数据")
+        mtf_filter_bias = _build_mtf_filter_bias(
+            candles,
+            mtf_filter_candles,
+            int(config.mtf_filter_fast_ema_period),
+            int(config.mtf_filter_slow_ema_period),
+        )
+        trades, terminal_open_position = _run_dynamic_backtest(
+            candles,
+            instrument,
+            config,
+            maker_fee_rate=maker_fee_rate,
+            taker_fee_rate=taker_fee_rate,
+            mtf_filter_bias=mtf_filter_bias,
+        )
+    elif is_dynamic_strategy_id(config.strategy_id):
         trades, terminal_open_position = _run_dynamic_backtest(
             candles,
             instrument,
@@ -610,6 +670,7 @@ def _run_backtest_with_loaded_data(
     atr_values = atr(candles, config.atr_period) if candles else []
     if (
         is_dynamic_strategy_id(config.strategy_id)
+        or is_dynamic_mtf_strategy_id(config.strategy_id)
         or is_ema_atr_breakout_strategy(config.strategy_id)
         or is_adaptive_ema_rail_strategy(config.strategy_id)
     ):
@@ -651,6 +712,15 @@ def _run_backtest_with_loaded_data(
         big_ema_period=config.big_ema_period,
         atr_period=config.atr_period,
         strategy_id=config.strategy_id,
+        bar=config.bar,
+        mtf_filter_bar=config.resolved_mtf_filter_bar() if is_dynamic_mtf_strategy_id(config.strategy_id) else "",
+        mtf_filter_fast_ema_period=(
+            int(config.mtf_filter_fast_ema_period) if is_dynamic_mtf_strategy_id(config.strategy_id) else 0
+        ),
+        mtf_filter_slow_ema_period=(
+            int(config.mtf_filter_slow_ema_period) if is_dynamic_mtf_strategy_id(config.strategy_id) else 0
+        ),
+        mtf_reversal_mode=str(config.mtf_reversal_mode),
         data_source_note=data_source_note,
         maker_fee_rate=maker_fee_rate,
         taker_fee_rate=taker_fee_rate,
@@ -806,11 +876,25 @@ def format_backtest_report(result: BacktestResult) -> str:
         f"止盈触发次数：{report.take_profit_hits}",
         f"止损触发次数：{report.stop_loss_hits}",
     ]
-    if is_dynamic_strategy_id(result.strategy_id):
-        direction_text = "做多" if result.strategy_id == STRATEGY_DYNAMIC_LONG_ID else "做空" if result.strategy_id == STRATEGY_DYNAMIC_SHORT_ID else "按方向参数"
+    if is_dynamic_strategy_id(result.strategy_id) or is_dynamic_mtf_strategy_id(result.strategy_id):
+        direction_text = (
+            "做多"
+            if result.strategy_id in {STRATEGY_DYNAMIC_LONG_ID, STRATEGY_DYNAMIC_MTF_LONG_ID}
+            else "做空"
+            if result.strategy_id in {STRATEGY_DYNAMIC_SHORT_ID, STRATEGY_DYNAMIC_MTF_SHORT_ID}
+            else "按方向参数"
+        )
         lines.append(
             f"趋势过滤：EMA{result.ema_period} 与 EMA{result.trend_ema_period} 组成趋势过滤，当前策略方向={direction_text}"
         )
+        if is_dynamic_mtf_strategy_id(result.strategy_id):
+            reversal_text = "停止新增仓位" if result.mtf_reversal_mode == "block_new_entries" else "不处理"
+            lines.append(
+                f"多周期过滤：低周期={result.bar} | "
+                f"高周期={result.mtf_filter_bar} | "
+                f"高周期EMA{result.mtf_filter_fast_ema_period}/EMA{result.mtf_filter_slow_ema_period} | "
+                f"反转处理={reversal_text}"
+            )
         lines.append(f"挂单参考EMA：EMA{result.entry_reference_ema_period}")
         lines.append(
             f"委托规则：每根新 K 线按最新 EMA{result.entry_reference_ema_period} 重新撤旧挂新；若新 K 线开盘已优于挂单价，则按开盘价即时成交，否则仅在盘中触及挂单价时成交，未成交委托不跨 K 线保留"
@@ -1027,6 +1111,47 @@ def _build_cross_higher_tf_bias(
         else:
             out.append("both")
     return out
+
+
+def _build_mtf_filter_bias(
+    entry_candles: list[Candle],
+    filter_candles: list[Candle],
+    fast_period: int,
+    slow_period: int,
+) -> list[str]:
+    """与 entry_candles 等长：'long' / 'short' / 'neutral'。"""
+    confirmed_filter_candles = [candle for candle in filter_candles if candle.confirmed]
+    if not entry_candles or not confirmed_filter_candles or fast_period <= 0 or slow_period <= 0:
+        return ["neutral"] * len(entry_candles)
+
+    minimum = max(fast_period, slow_period)
+    closes_h = [candle.close for candle in confirmed_filter_candles]
+    fast_ema = ema(closes_h, fast_period)
+    slow_ema = ema(closes_h, slow_period)
+    h_ts = [candle.ts for candle in confirmed_filter_candles]
+    out: list[str] = []
+    for entry_candle in entry_candles:
+        j = bisect.bisect_right(h_ts, entry_candle.ts) - 1
+        if j < minimum - 1:
+            out.append("neutral")
+            continue
+        fast = fast_ema[j]
+        slow = slow_ema[j]
+        if fast > slow:
+            out.append("long")
+        elif fast < slow:
+            out.append("short")
+        else:
+            out.append("neutral")
+    return out
+
+
+def _required_mtf_filter_preload_candles(config: StrategyConfig) -> int:
+    return max(
+        int(config.mtf_filter_fast_ema_period),
+        int(config.mtf_filter_slow_ema_period),
+        0,
+    ) + 5
 
 
 def _required_backtest_preload_candles(config: StrategyConfig) -> int:
@@ -1547,6 +1672,7 @@ def _run_dynamic_backtest(
     *,
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
+    mtf_filter_bias: list[str] | None = None,
 ) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
     entry_reference_ema_period = config.resolved_entry_reference_ema_period()
     minimum = max(
@@ -1646,6 +1772,10 @@ def _run_dynamic_backtest(
             continue
         if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
             continue
+
+        if mtf_filter_bias is not None and index < len(mtf_filter_bias):
+            if not filter_bias_allows_signal(mtf_filter_bias[index], decision.signal):
+                continue
 
         if current_wave_signal != decision.signal:
             current_wave_signal = decision.signal

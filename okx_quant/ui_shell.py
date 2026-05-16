@@ -195,6 +195,7 @@ from okx_quant.strategy_live_chart import (
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
+from okx_quant.strategies.ema_dynamic_multi_timeframe import EmaDynamicMultiTimeframeStrategy
 from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_DEFINITIONS,
@@ -206,6 +207,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     StrategyDefinition,
     get_strategy_definition,
+    is_dynamic_mtf_strategy_id,
     is_dynamic_strategy_id,
     is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
@@ -413,6 +415,10 @@ TAKE_PROFIT_MODE_OPTIONS = {
     "固定止盈": "fixed",
     "动态止盈": "dynamic",
 }
+MTF_REVERSAL_MODE_OPTIONS = {
+    "只过滤新开仓": "block_new_entries",
+}
+MTF_REVERSAL_MODE_VALUE_TO_LABEL = {value: label for label, value in MTF_REVERSAL_MODE_OPTIONS.items()}
 RUN_MODE_OPTIONS = {
     "交易并下单": "trade",
     "只发信号邮件": "signal_only",
@@ -1316,6 +1322,22 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
         backtest_profile_summary=_coerce_snapshot_text(
             payload.get("backtest_profile_summary"),
             str(_strategy_config_default("backtest_profile_summary")),
+        ),
+        mtf_filter_inst_id=_coerce_snapshot_optional_text(payload.get("mtf_filter_inst_id")),
+        mtf_filter_bar=_coerce_snapshot_optional_text(payload.get("mtf_filter_bar")),
+        mtf_filter_fast_ema_period=_coerce_snapshot_int(
+            payload.get("mtf_filter_fast_ema_period"),
+            int(_strategy_config_default("mtf_filter_fast_ema_period")),
+            minimum=1,
+        ),
+        mtf_filter_slow_ema_period=_coerce_snapshot_int(
+            payload.get("mtf_filter_slow_ema_period"),
+            int(_strategy_config_default("mtf_filter_slow_ema_period")),
+            minimum=1,
+        ),
+        mtf_reversal_mode=_coerce_snapshot_text(
+            payload.get("mtf_reversal_mode"),
+            str(_strategy_config_default("mtf_reversal_mode")),
         ),
     )
 
@@ -2438,6 +2460,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.trend_ema_period = StringVar(value="55")
         self.big_ema_period = StringVar(value="233")
         self.entry_reference_ema_period = StringVar(value="55")
+        self.mtf_filter_bar = StringVar(value="1H")
+        self.mtf_filter_fast_ema_period = StringVar(value="21")
+        self.mtf_filter_slow_ema_period = StringVar(value="55")
+        self.mtf_reversal_mode_label = StringVar(value=MTF_REVERSAL_MODE_VALUE_TO_LABEL["block_new_entries"])
         self.atr_period = StringVar(value="10")
         self.stop_atr = StringVar(value="2")
         self.take_atr = StringVar(value="4")
@@ -2477,6 +2503,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.trend_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.big_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.entry_reference_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.mtf_filter_bar.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.mtf_filter_fast_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.mtf_filter_slow_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.atr_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.stop_atr.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.risk_amount.trace_add("write", self._update_fixed_order_size_hint)
@@ -2492,6 +2521,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.trend_ema_period.trace_add("write", self._update_trend_parameter_hint)
         self.big_ema_period.trace_add("write", self._update_trend_parameter_hint)
         self.entry_reference_ema_period.trace_add("write", self._update_trend_parameter_hint)
+        self.mtf_filter_bar.trace_add("write", self._update_trend_parameter_hint)
+        self.mtf_filter_fast_ema_period.trace_add("write", self._update_trend_parameter_hint)
+        self.mtf_filter_slow_ema_period.trace_add("write", self._update_trend_parameter_hint)
         self.dynamic_two_r_break_even.trace_add("write", self._update_dynamic_protection_hint)
         self.dynamic_fee_offset_enabled.trace_add("write", self._update_dynamic_protection_hint)
         self.time_stop_break_even_enabled.trace_add("write", self._update_dynamic_protection_hint)
@@ -2727,6 +2759,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "atr_stop_multiplier": self.stop_atr,
             "atr_take_multiplier": self.take_atr,
             "entry_reference_ema_period": self.entry_reference_ema_period,
+            "mtf_filter_bar": self.mtf_filter_bar,
+            "mtf_filter_fast_ema_period": self.mtf_filter_fast_ema_period,
+            "mtf_filter_slow_ema_period": self.mtf_filter_slow_ema_period,
+            "mtf_reversal_mode": self.mtf_reversal_mode_label,
             "take_profit_mode": self.take_profit_mode_label,
             "max_entries_per_trend": self.max_entries_per_trend,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
@@ -2773,6 +2809,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 variable.set(_reverse_lookup_label(SIGNAL_LABEL_TO_VALUE, str(default_value), definition.default_signal_label))
             elif key == "take_profit_mode":
                 variable.set(_reverse_lookup_label(TAKE_PROFIT_MODE_OPTIONS, str(default_value), self.take_profit_mode_label.get()))
+            elif key == "mtf_reversal_mode":
+                variable.set(_reverse_lookup_label(MTF_REVERSAL_MODE_OPTIONS, str(default_value), self.mtf_reversal_mode_label.get()))
             else:
                 variable.set(default_value)
         for key in iter_strategy_parameter_keys(strategy_id):
@@ -2784,6 +2822,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 continue
             if key == "signal_mode":
                 variable.set(_reverse_lookup_label(SIGNAL_LABEL_TO_VALUE, str(fixed_value), definition.default_signal_label))
+            elif key == "mtf_reversal_mode":
+                variable.set(_reverse_lookup_label(MTF_REVERSAL_MODE_OPTIONS, str(fixed_value), self.mtf_reversal_mode_label.get()))
             else:
                 variable.set(fixed_value)
 
@@ -3095,6 +3135,36 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._entry_reference_ema_label.grid(row=row, column=0, sticky="w", pady=_lp)
         self._entry_reference_ema_entry = ttk.Entry(launch_form, textvariable=self.entry_reference_ema_period)
         self._entry_reference_ema_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+
+        row += 1
+        self._mtf_filter_bar_label = ttk.Label(launch_form, text="高周期K线")
+        self._mtf_filter_bar_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._mtf_filter_bar_combo = ttk.Combobox(
+            launch_form,
+            textvariable=self.mtf_filter_bar,
+            values=BAR_OPTIONS,
+            state="readonly",
+        )
+        self._mtf_filter_bar_combo.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._mtf_filter_fast_ema_label = ttk.Label(launch_form, text="高周期快EMA")
+        self._mtf_filter_fast_ema_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._mtf_filter_fast_ema_entry = ttk.Entry(launch_form, textvariable=self.mtf_filter_fast_ema_period)
+        self._mtf_filter_fast_ema_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        self._mtf_filter_slow_ema_label = ttk.Label(launch_form, text="高周期慢EMA")
+        self._mtf_filter_slow_ema_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._mtf_filter_slow_ema_entry = ttk.Entry(launch_form, textvariable=self.mtf_filter_slow_ema_period)
+        self._mtf_filter_slow_ema_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._mtf_reversal_mode_label = ttk.Label(launch_form, text="高周期反向处理")
+        self._mtf_reversal_mode_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._mtf_reversal_mode_combo = ttk.Combobox(
+            launch_form,
+            textvariable=self.mtf_reversal_mode_label,
+            values=list(MTF_REVERSAL_MODE_OPTIONS.keys()),
+            state="readonly",
+        )
+        self._mtf_reversal_mode_combo.grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
         ttk.Label(
@@ -6296,6 +6366,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             profiles[next_profile] = _blank_credential_profile_snapshot(
                 environment=self._environment_value_from_label(self.environment_label.get())
             )
+            if is_dynamic_mtf_strategy_id(config.strategy_id):
+                lines.append(
+                    f"高周期过滤：{config.resolved_mtf_filter_bar()} EMA{config.mtf_filter_fast_ema_period}/"
+                    f"EMA{config.mtf_filter_slow_ema_period}（只过滤新开仓）"
+                )
         else:
             next_profile = sorted(profiles.keys())[0]
 
@@ -6404,6 +6479,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 trend_ema_period_raw=self.trend_ema_period.get(),
                 big_ema_period_raw=self.big_ema_period.get(),
                 entry_reference_ema_period_raw=self.entry_reference_ema_period.get(),
+                mtf_filter_bar_raw=self.mtf_filter_bar.get(),
+                mtf_filter_fast_ema_period_raw=self.mtf_filter_fast_ema_period.get(),
+                mtf_filter_slow_ema_period_raw=self.mtf_filter_slow_ema_period.get(),
             )
         )
 
@@ -10750,14 +10828,14 @@ def _estimate_launcher_minimum_risk_amount(
     if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         lookback = recommended_indicator_lookback(config.ema_period, config.trend_ema_period)
         strategy = EmaCrossEmaStopStrategy()
-    elif is_dynamic_strategy_id(config.strategy_id):
+    elif is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id):
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
             config.atr_period,
             config.resolved_entry_reference_ema_period(),
         )
-        strategy = EmaDynamicOrderStrategy()
+        strategy = EmaDynamicMultiTimeframeStrategy() if is_dynamic_mtf_strategy_id(config.strategy_id) else EmaDynamicOrderStrategy()
     else:
         lookback = recommended_indicator_lookback(
             config.ema_period + 2,
@@ -10769,7 +10847,24 @@ def _estimate_launcher_minimum_risk_amount(
 
     candles = client.get_candles(signal_inst_id, config.bar, limit=lookback)
     confirmed = [candle for candle in candles if candle.confirmed]
-    decision = strategy.evaluate(confirmed, config, price_increment=trade_instrument.tick_size)
+    if is_dynamic_mtf_strategy_id(config.strategy_id):
+        filter_lookback = recommended_indicator_lookback(
+            config.mtf_filter_fast_ema_period,
+            config.mtf_filter_slow_ema_period,
+        )
+        filter_candles = client.get_candles(
+            config.resolved_mtf_filter_inst_id(),
+            config.resolved_mtf_filter_bar(),
+            limit=filter_lookback,
+        )
+        decision = strategy.evaluate(
+            confirmed,
+            [candle for candle in filter_candles if candle.confirmed],
+            config,
+            price_increment=trade_instrument.tick_size,
+        )
+    else:
+        decision = strategy.evaluate(confirmed, config, price_increment=trade_instrument.tick_size)
     if decision.signal is None or decision.entry_reference is None or decision.candle_ts is None:
         return None, "当前还没有有效信号，等出现可挂单的一波后再给出估算。"
 
@@ -10897,6 +10992,9 @@ def _build_trend_parameter_hint_text(
     trend_ema_period_raw: str,
     big_ema_period_raw: str,
     entry_reference_ema_period_raw: str,
+    mtf_filter_bar_raw: str = "",
+    mtf_filter_fast_ema_period_raw: str = "",
+    mtf_filter_slow_ema_period_raw: str = "",
 ) -> str:
     ema_period = ema_period_raw.strip() or "?"
     trend_ema_period = trend_ema_period_raw.strip() or "?"
@@ -10918,11 +11016,18 @@ def _build_trend_parameter_hint_text(
         )
     elif strategy_id == STRATEGY_EMA5_EMA8_ID:
         parts.append(f"EMA大周期：{big_ema_period}=4H 大趋势过滤线。")
-    if is_dynamic_strategy_id(strategy_id):
+    if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id):
         if entry_reference_ema_period in {"", "0"}:
             parts.append(f"挂单参考EMA：0=跟随EMA小周期，当前按 EMA{ema_period} 作为挂单价格锚点。")
         else:
             parts.append(f"挂单参考EMA：{entry_reference_ema_period}=挂单价格锚点，价格会围绕 EMA{entry_reference_ema_period} 重挂。")
+    if is_dynamic_mtf_strategy_id(strategy_id):
+        mtf_bar = mtf_filter_bar_raw.strip() or "?"
+        mtf_fast = mtf_filter_fast_ema_period_raw.strip() or "?"
+        mtf_slow = mtf_filter_slow_ema_period_raw.strip() or "?"
+        parts.append(
+            f"高周期过滤：{mtf_bar} EMA{mtf_fast}/EMA{mtf_slow} 只决定是否允许低周期新开仓，不改变原有止损止盈逻辑。"
+        )
     return "趋势参数： " + " ".join(parts)
 
 
@@ -11004,7 +11109,9 @@ def _build_strategy_start_confirmation_message(
 
     def _tp_sl_mode_text() -> str:
         if config.tp_sl_mode == "exchange":
-            if is_dynamic_strategy_id(config.strategy_id) and config.take_profit_mode == "dynamic":
+            if (
+                is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id)
+            ) and config.take_profit_mode == "dynamic":
                 return f"{tp_sl_mode_label}（开仓后由 OKX 托管初始止损，后续本地动态上移保护价）"
             return f"{tp_sl_mode_label}（开仓后由 OKX 托管止损/止盈）"
         if config.tp_sl_mode == "local_trade":
@@ -11109,8 +11216,8 @@ def _build_strategy_start_confirmation_message(
         lines.append(f"EMA大周期：{config.big_ema_period}（大趋势过滤线）")
     if config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(config.strategy_id):
         lines.append(f"突破参考EMA：EMA{config.resolved_entry_reference_ema_period()}（已收盘K线的突破/跌破判断基准）")
-    if is_dynamic_strategy_id(config.strategy_id) or config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(config.strategy_id):
-        if is_dynamic_strategy_id(config.strategy_id):
+    if is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id) or config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(config.strategy_id):
+        if is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id):
             lines.extend(
                 [
                     f"挂单参考EMA：{config.entry_reference_ema_label()}（挂单价格锚点）",

@@ -15,6 +15,7 @@ from okx_quant.backtest import (
     _create_open_position,
     _build_drawdown_curves,
     _build_equity_curve,
+    _build_mtf_filter_bias,
     _build_period_stats,
     _determine_backtest_order_size,
     _advance_dynamic_stop,
@@ -78,6 +79,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
     STRATEGY_DYNAMIC_ID,
+    STRATEGY_DYNAMIC_MTF_LONG_ID,
     STRATEGY_EMA5_EMA8_ID,
 )
 
@@ -147,6 +149,88 @@ class BacktestTest(TestCase):
     def test_backtest_default_fee_percents(self) -> None:
         self.assertEqual(DEFAULT_MAKER_FEE_PERCENT, "0.015")
         self.assertEqual(DEFAULT_TAKER_FEE_PERCENT, "0.036")
+
+    def test_mtf_filter_bias_uses_latest_closed_filter_candle_by_time(self) -> None:
+        entry_candles = [
+            Candle(1000, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(1500, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(2500, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(3500, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+        ]
+        filter_candles = [
+            Candle(1000, Decimal("110"), Decimal("111"), Decimal("109"), Decimal("110"), Decimal("1"), True),
+            Candle(2000, Decimal("100"), Decimal("111"), Decimal("99"), Decimal("105"), Decimal("1"), True),
+            Candle(3000, Decimal("105"), Decimal("121"), Decimal("104"), Decimal("120"), Decimal("1"), True),
+        ]
+
+        bias = _build_mtf_filter_bias(entry_candles, filter_candles, fast_period=1, slow_period=2)
+
+        self.assertEqual(bias[1], "neutral")
+        self.assertEqual(bias[2], "short")
+        self.assertEqual(bias[3], "long")
+
+    def test_run_backtest_loads_multi_timeframe_filter_candles(self) -> None:
+        start_ts = 1711929600000
+        low_candles = [
+            Candle(
+                start_ts + (index * 300000),
+                Decimal("100"),
+                Decimal("102"),
+                Decimal("99"),
+                Decimal("101"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(220)
+        ]
+        high_candles = [
+            Candle(
+                start_ts + (index * 3600000),
+                Decimal("100"),
+                Decimal("105"),
+                Decimal("99"),
+                Decimal(str(100 + index)),
+                Decimal("1"),
+                True,
+            )
+            for index in range(24)
+        ]
+
+        class _MtfClient(DummyBacktestClient):
+            def __init__(self) -> None:
+                super().__init__(low_candles, self_outer._build_instrument())
+                self.requested_bars: list[str] = []
+
+            def get_candles_history(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
+                self.requested_bars.append(bar)
+                self.last_candle_history_stats = {
+                    "requested_count": limit,
+                    "returned_count": len(high_candles if bar == "1H" else low_candles),
+                    "full_history": False,
+                }
+                source = high_candles if bar == "1H" else low_candles
+                return source[-limit:]
+
+        self_outer = self
+        client = _MtfClient()
+        config = replace(
+            self._build_config(),
+            strategy_id=STRATEGY_DYNAMIC_MTF_LONG_ID,
+            ema_period=2,
+            trend_ema_period=3,
+            atr_period=2,
+            entry_reference_ema_period=0,
+            mtf_filter_bar="1H",
+            mtf_filter_fast_ema_period=1,
+            mtf_filter_slow_ema_period=2,
+        )
+
+        result = run_backtest(client, config, candle_limit=220)
+
+        self.assertEqual(result.strategy_id, STRATEGY_DYNAMIC_MTF_LONG_ID)
+        self.assertIn("15m", client.requested_bars)
+        self.assertIn("1H", client.requested_bars)
+        self.assertEqual(result.mtf_filter_bar, "1H")
 
     def test_dynamic_backtest_stop_locks_1r_at_2r(self) -> None:
         position = _OpenPosition(
@@ -2124,6 +2208,38 @@ class BacktestTest(TestCase):
         self.assertEqual(config.resolved_backtest_entry_slippage_rate(), Decimal("0.0005"))
         self.assertEqual(config.resolved_backtest_exit_slippage_rate(), Decimal("0.0005"))
 
+    def test_backtest_ui_serializes_multi_timeframe_parameters(self) -> None:
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_MTF_LONG_ID,
+            risk_amount=Decimal("100"),
+            mtf_filter_bar="4H",
+            mtf_filter_fast_ema_period=13,
+            mtf_filter_slow_ema_period=34,
+            mtf_reversal_mode="block_new_entries",
+        )
+
+        payload = backtest_ui_module._serialize_strategy_config(config)
+        restored = backtest_ui_module._deserialize_strategy_config(payload)
+
+        self.assertEqual(restored.strategy_id, STRATEGY_DYNAMIC_MTF_LONG_ID)
+        self.assertEqual(restored.mtf_filter_bar, "4H")
+        self.assertEqual(restored.mtf_filter_fast_ema_period, 13)
+        self.assertEqual(restored.mtf_filter_slow_ema_period, 34)
+        self.assertEqual(restored.mtf_reversal_mode, "block_new_entries")
+
     def test_export_batch_backtest_report_writes_matrix_summary(self) -> None:
         with TemporaryDirectory() as temp_dir:
             original_export_dir = backtest_export_module.backtest_report_export_dir_path
@@ -3059,6 +3175,3 @@ def _slot_test_candles(sequence: list[tuple[str, str, str, str]], *, start_ts: i
             )
         )
     return candles
-
-
-

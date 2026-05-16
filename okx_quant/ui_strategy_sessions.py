@@ -8,7 +8,7 @@ from pathlib import Path
 class UiStrategySessionsMixin:
     @staticmethod
     def _entry_reference_ema_caption(strategy_id: str) -> str:
-        if is_dynamic_strategy_id(strategy_id):
+        if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id):
             return "挂单参考EMA"
         if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(strategy_id):
             return "突破参考EMA"
@@ -1250,6 +1250,10 @@ class UiStrategySessionsMixin:
                 live_pnl_refreshed_at=live_pnl_refreshed_at,
                 stop_price=stop_price,
             ),
+            mtf_filter_bar=mtf_filter_bar,
+            mtf_filter_fast_ema_period=mtf_filter_fast_ema_period,
+            mtf_filter_slow_ema_period=mtf_filter_slow_ema_period,
+            mtf_reversal_mode=mtf_reversal_mode,
         )
         status_text = self._strategy_live_chart_status_text(
             session,
@@ -3305,7 +3309,7 @@ class UiStrategySessionsMixin:
         if previous_strategy_id and previous_strategy_id != strategy_id:
             self._save_strategy_parameter_draft(previous_strategy_id)
         self._restore_strategy_parameter_draft(strategy_id)
-        dynamic_strategy = is_dynamic_strategy_id(strategy_id)
+        dynamic_strategy = is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id)
         breakout_strategy = is_ema_atr_breakout_strategy(strategy_id)
         dynamic_tp_controls = dynamic_strategy or breakout_strategy
         self.signal_combo["values"] = definition.allowed_signal_labels
@@ -3364,11 +3368,30 @@ class UiStrategySessionsMixin:
         else:
             self._big_ema_label.grid_remove()
             self._big_ema_entry.grid_remove()
+        mtf_widgets = (
+            self._mtf_filter_bar_label,
+            self._mtf_filter_bar_combo,
+            self._mtf_filter_fast_ema_label,
+            self._mtf_filter_fast_ema_entry,
+            self._mtf_filter_slow_ema_label,
+            self._mtf_filter_slow_ema_entry,
+            self._mtf_reversal_mode_label,
+            self._mtf_reversal_mode_combo,
+        )
+        for widget in mtf_widgets:
+            if is_dynamic_mtf_strategy_id(strategy_id):
+                widget.grid()
+            else:
+                widget.grid_remove()
         self._set_field_state(self._bar_combo, editable=strategy_is_parameter_editable(strategy_id, "bar", "launcher"))
         self._set_field_state(self._ema_entry, editable=strategy_is_parameter_editable(strategy_id, "ema_period", "launcher"))
         self._set_field_state(self._trend_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "trend_ema_period", "launcher"))
         self._set_field_state(self._big_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "big_ema_period", "launcher"))
         self._set_field_state(self.signal_combo, editable=strategy_is_parameter_editable(strategy_id, "signal_mode", "launcher"))
+        self._set_field_state(self._mtf_filter_bar_combo, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_bar", "launcher"))
+        self._set_field_state(self._mtf_filter_fast_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_fast_ema_period", "launcher"))
+        self._set_field_state(self._mtf_filter_slow_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_slow_ema_period", "launcher"))
+        self._set_field_state(self._mtf_reversal_mode_combo, editable=strategy_is_parameter_editable(strategy_id, "mtf_reversal_mode", "launcher"))
         self._apply_strategy_parameter_fixed_labels(strategy_id)
         if strategy_uses_parameter(strategy_id, "entry_reference_ema_period") and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
@@ -3390,8 +3413,10 @@ class UiStrategySessionsMixin:
         if not hasattr(self, "_dynamic_two_r_break_even_check"):
             return
         definition = self._selected_strategy_definition()
-        dynamic_tp_eligible = is_dynamic_strategy_id(definition.strategy_id) or is_ema_atr_breakout_strategy(
-            definition.strategy_id
+        dynamic_tp_eligible = (
+            is_dynamic_strategy_id(definition.strategy_id)
+            or is_dynamic_mtf_strategy_id(definition.strategy_id)
+            or is_ema_atr_breakout_strategy(definition.strategy_id)
         )
         dynamic_take_profit = (
             dynamic_tp_eligible and TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "fixed") == "dynamic"
@@ -3481,12 +3506,44 @@ class UiStrategySessionsMixin:
         max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
         startup_chase_window_seconds = 0
         entry_reference_ema_period = 0
+        mtf_filter_bar = None
+        mtf_filter_fast_ema_period = 21
+        mtf_filter_slow_ema_period = 55
+        mtf_reversal_mode = "block_new_entries"
         if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
             entry_reference_ema_period = self._parse_nonnegative_int(
                 self.entry_reference_ema_period.get(),
                 self._entry_reference_ema_caption(strategy_id),
             )
-        if is_dynamic_strategy_id(strategy_id) or is_ema_atr_breakout_strategy(strategy_id):
+        if strategy_uses_parameter(strategy_id, "mtf_filter_bar"):
+            mtf_filter_bar = str(
+                self._resolve_strategy_parameter_value(strategy_id, "mtf_filter_bar", self.mtf_filter_bar.get())
+            ).strip()
+        if strategy_uses_parameter(strategy_id, "mtf_filter_fast_ema_period"):
+            mtf_filter_fast_ema_period = int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "mtf_filter_fast_ema_period",
+                    self._parse_positive_int(self.mtf_filter_fast_ema_period.get(), "高周期快EMA"),
+                )
+            )
+        if strategy_uses_parameter(strategy_id, "mtf_filter_slow_ema_period"):
+            mtf_filter_slow_ema_period = int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "mtf_filter_slow_ema_period",
+                    self._parse_positive_int(self.mtf_filter_slow_ema_period.get(), "高周期慢EMA"),
+                )
+            )
+        if strategy_uses_parameter(strategy_id, "mtf_reversal_mode"):
+            mtf_reversal_mode = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "mtf_reversal_mode",
+                    MTF_REVERSAL_MODE_OPTIONS.get(self.mtf_reversal_mode_label.get(), "block_new_entries"),
+                )
+            )
+        if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id) or is_ema_atr_breakout_strategy(strategy_id):
             startup_chase_window_seconds = parse_nonnegative_duration_seconds(
                 self.startup_chase_window_seconds.get(),
                 field_name="启动追单窗口",
@@ -3571,19 +3628,22 @@ class UiStrategySessionsMixin:
             run_mode=run_mode,
             take_profit_mode=TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()],
             max_entries_per_trend=max_entries_per_trend,
-            startup_chase_window_seconds=startup_chase_window_seconds if is_dynamic_strategy_id(strategy_id) else 0,
+            startup_chase_window_seconds=startup_chase_window_seconds
+            if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id)
+            else 0,
             dynamic_two_r_break_even=self.dynamic_two_r_break_even.get()
-            if is_dynamic_strategy_id(strategy_id)
+            if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id)
             else False,
             dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get()
-            if is_dynamic_strategy_id(strategy_id)
+            if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id)
             else False,
             time_stop_break_even_enabled=self.time_stop_break_even_enabled.get()
-            if is_dynamic_strategy_id(strategy_id)
+            if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id)
             else False,
             time_stop_break_even_bars=(
                 self._parse_positive_int(self.time_stop_break_even_bars.get(), "时间保本K线数")
-                if is_dynamic_strategy_id(strategy_id) and self.time_stop_break_even_enabled.get()
+                if (is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id))
+                and self.time_stop_break_even_enabled.get()
                 else 0
             ),
         )
@@ -5758,6 +5818,7 @@ class UiStrategySessionsMixin:
             "未检测到策略持仓，交易员虚拟止损监控结束。",
             "检测到 OKX 托管持仓已结束。",
             "未再检测到策略持仓，视为本轮 OKX 托管持仓已结束。",
+            "推断该止损已触发，结束 OKX 动态止损监控。",
             "本轮持仓已结束，继续监控下一次信号。",
         )
         if any(marker in last_message for marker in terminal_markers):
@@ -5880,6 +5941,7 @@ class UiStrategySessionsMixin:
             or "未检测到策略持仓，交易员虚拟止损监控结束。" in message
             or "检测到 OKX 托管持仓已结束。" in message
             or "未再检测到策略持仓，视为本轮 OKX 托管持仓已结束。" in message
+            or "推断该止损已触发，结束 OKX 动态止损监控。" in message
         ):
             trade = session.active_trade
             if trade is None or trade.reconciliation_started:

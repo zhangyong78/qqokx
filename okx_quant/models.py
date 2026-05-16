@@ -18,6 +18,7 @@ EntrySideMode = Literal["follow_signal", "fixed_buy", "fixed_sell"]
 RunMode = Literal["trade", "signal_only"]
 BacktestSizingMode = Literal["fixed_risk", "fixed_size", "risk_percent"]
 TakeProfitMode = Literal["fixed", "dynamic"]
+MtfReversalMode = Literal["ignore", "block_new_entries"]
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,11 @@ class StrategyConfig:
     cross_higher_tf_inst_id: str | None = None
     cross_higher_tf_bar: str | None = None
     cross_higher_tf_ref_ema_period: int = 0
+    mtf_filter_inst_id: str | None = None
+    mtf_filter_bar: str | None = None
+    mtf_filter_fast_ema_period: int = 21
+    mtf_filter_slow_ema_period: int = 55
+    mtf_reversal_mode: MtfReversalMode = "block_new_entries"
     rail_candidate_ema_periods: tuple[int, ...] = (5, 8, 13, 21, 34, 55, 89, 144, 233)
     rail_touch_atr_ratio: Decimal = Decimal("0.2")
     rail_bounce_atr_ratio: Decimal = Decimal("0.6")
@@ -119,6 +125,12 @@ class StrategyConfig:
         if self.entry_reference_ema_period > 0:
             return self.entry_reference_ema_period
         return self.ema_period
+
+    def resolved_mtf_filter_inst_id(self) -> str:
+        return (self.mtf_filter_inst_id or self.inst_id).strip()
+
+    def resolved_mtf_filter_bar(self) -> str:
+        return (self.mtf_filter_bar or self.bar).strip()
 
     def resolved_backtest_entry_slippage_rate(self) -> Decimal:
         if self.backtest_entry_slippage_rate > 0 or self.backtest_exit_slippage_rate > 0:

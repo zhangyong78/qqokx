@@ -12,6 +12,7 @@ from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import Instrument, OkxOrderResult, OkxOrderStatus, OkxPosition
 from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_LONG_ID,
+    STRATEGY_DYNAMIC_MTF_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
@@ -543,6 +544,21 @@ HTTP 502: <!DOCTYPE html>
         self.assertIn("EMA小周期：21=快线", hint)
         self.assertIn("EMA中周期：55=趋势过滤线", hint)
         self.assertIn("挂单参考EMA：0=跟随EMA小周期，当前按 EMA21 作为挂单价格锚点。", hint)
+
+    def test_build_trend_parameter_hint_text_for_dynamic_mtf_strategy_includes_filter(self) -> None:
+        hint = _build_trend_parameter_hint_text(
+            strategy_id=STRATEGY_DYNAMIC_MTF_LONG_ID,
+            ema_period_raw="21",
+            trend_ema_period_raw="55",
+            big_ema_period_raw="233",
+            entry_reference_ema_period_raw="55",
+            mtf_filter_bar_raw="4H",
+            mtf_filter_fast_ema_period_raw="21",
+            mtf_filter_slow_ema_period_raw="55",
+        )
+
+        self.assertIn("高周期过滤：4H EMA21/EMA55", hint)
+        self.assertIn("只决定是否允许低周期新开仓", hint)
 
     def test_build_dynamic_protection_hint_text_for_enabled_dynamic_mode(self) -> None:
         hint = _build_dynamic_protection_hint_text(
@@ -2168,6 +2184,39 @@ class StrategyTradeTrackingTest(TestCase):
 
         self.assertTrue(session.active_trade.reconciliation_started)
         app._start_session_trade_reconciliation.assert_called_once()
+
+    def test_track_session_trade_runtime_starts_reconciliation_when_dynamic_stop_is_inferred_triggered(self) -> None:
+        session = self._make_session()
+        app = self._make_app_for_tracking()
+        session.active_trade = StrategyTradeRuntimeState(
+            round_id="S01-1",
+            opened_logged_at=datetime(2026, 5, 15, 9, 0, 20),
+            entry_order_id="3566984396112191488",
+            entry_price=Decimal("2291.83"),
+            size=Decimal("7.77"),
+            protective_algo_cl_ord_id="s166emaslg051501001329002",
+            initial_stop_price=Decimal("2264.51"),
+            current_stop_price=Decimal("2264.51"),
+        )
+
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "监控的止损算法单已不在挂单列表，且持仓张数已减少 7.77（基准 14.17 → 当前 6.4），推断该止损已触发，结束 OKX 动态止损监控。",
+        )
+
+        self.assertTrue(session.active_trade.reconciliation_started)
+        app._start_session_trade_reconciliation.assert_called_once()
+
+    def test_session_should_not_transition_to_recoverable_after_inferred_dynamic_stop_trigger(self) -> None:
+        session = self._make_session()
+        session.active_trade = StrategyTradeRuntimeState(round_id="S01-1")
+        session.last_message = (
+            "监控的止损算法单已不在挂单列表，且持仓张数已减少 7.77（基准 14.17 → 当前 6.4），"
+            "推断该止损已触发，结束 OKX 动态止损监控。"
+        )
+
+        self.assertFalse(QuantApp._session_should_transition_to_recoverable(session))
 
     def test_restore_session_trade_runtime_from_log_recovers_initial_stop_and_latest_stop(self) -> None:
         session = self._make_session()
@@ -5139,6 +5188,10 @@ class StrategyParameterDraftRestoreTest(TestCase):
             stop_atr=_Var(""),
             take_atr=_Var(""),
             entry_reference_ema_period=_Var(""),
+            mtf_filter_bar=_Var(""),
+            mtf_filter_fast_ema_period=_Var(""),
+            mtf_filter_slow_ema_period=_Var(""),
+            mtf_reversal_mode_label=_Var(""),
             take_profit_mode_label=_Var(""),
             max_entries_per_trend=_Var(""),
             dynamic_two_r_break_even=_Var(False),
@@ -5177,6 +5230,17 @@ class StrategyParameterDraftRestoreTest(TestCase):
         self.assertEqual(app.ema_period.get(), "34")
         self.assertEqual(app.trend_ema_period.get(), "89")
         self.assertEqual(app.atr_period.get(), "14")
+
+    def test_restore_strategy_parameter_draft_applies_multi_timeframe_defaults(self) -> None:
+        app = self._make_parameter_stub()
+
+        QuantApp._restore_strategy_parameter_draft(app, STRATEGY_DYNAMIC_MTF_LONG_ID)
+
+        self.assertEqual(app.signal_mode_label.get(), "只做多")
+        self.assertEqual(app.mtf_filter_bar.get(), "1H")
+        self.assertEqual(app.mtf_filter_fast_ema_period.get(), 21)
+        self.assertEqual(app.mtf_filter_slow_ema_period.get(), 55)
+        self.assertEqual(app.mtf_reversal_mode_label.get(), "只过滤新开仓")
 
 
 class StrategyParameterFixedLabelTest(TestCase):

@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Callable, Literal, TypeVar
 
 from okx_quant.indicators import atr, ema
-from okx_quant.models import Credentials, Instrument, OrderPlan, ProtectionPlan, StrategyConfig
+from okx_quant.models import Credentials, Instrument, OrderPlan, ProtectionPlan, SignalDecision, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.okx_client import (
     OkxApiError,
@@ -28,11 +28,13 @@ from okx_quant.engine_strategy_router import EngineStrategyRouter
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
+from okx_quant.strategies.ema_dynamic_multi_timeframe import EmaDynamicMultiTimeframeStrategy
 from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
+    is_dynamic_mtf_strategy_id,
     is_dynamic_strategy_id,
     is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
@@ -47,7 +49,11 @@ def _live_dynamic_take_profit_enabled(config: StrategyConfig) -> bool:
     """与回测一致：EMA 动态委托与 EMA 突破/跌破在 take_profit_mode=dynamic 时启用动态止盈逻辑。"""
     if str(config.take_profit_mode or "") != "dynamic":
         return False
-    return is_dynamic_strategy_id(config.strategy_id) or is_ema_atr_breakout_strategy(config.strategy_id)
+    return (
+        is_dynamic_strategy_id(config.strategy_id)
+        or is_dynamic_mtf_strategy_id(config.strategy_id)
+        or is_ema_atr_breakout_strategy(config.strategy_id)
+    )
 
 
 def live_exchange_dynamic_take_profit_template_enabled(config: StrategyConfig) -> bool:
@@ -331,20 +337,64 @@ class StrategyEngine:
     def _run(self, credentials: Credentials, config: StrategyConfig) -> None:
         self._strategy_router.run(credentials, config)
 
+    def _load_mtf_filter_confirmed_candles(self, config: StrategyConfig) -> list:
+        lookback = recommended_indicator_lookback(
+            int(config.mtf_filter_fast_ema_period),
+            int(config.mtf_filter_slow_ema_period),
+        )
+        candles = self._get_candles_with_retry(
+            config.resolved_mtf_filter_inst_id(),
+            config.resolved_mtf_filter_bar(),
+            limit=lookback,
+        )
+        return [candle for candle in candles if candle.confirmed]
+
+    def _evaluate_dynamic_signal_decision(
+        self,
+        confirmed: list,
+        config: StrategyConfig,
+        *,
+        effective_signal_mode: str,
+        price_increment: Decimal | None,
+    ) -> SignalDecision:
+        eval_config = replace(config, signal_mode=effective_signal_mode)
+        if is_dynamic_mtf_strategy_id(config.strategy_id):
+            return EmaDynamicMultiTimeframeStrategy().evaluate(
+                confirmed,
+                self._load_mtf_filter_confirmed_candles(config),
+                eval_config,
+                price_increment=price_increment,
+            )
+        return EmaDynamicOrderStrategy().evaluate(
+            confirmed,
+            eval_config,
+            price_increment=price_increment,
+        )
+
+    def _append_dynamic_mtf_mode_parts(self, config: StrategyConfig, mode_parts: list[str]) -> None:
+        if not is_dynamic_mtf_strategy_id(config.strategy_id):
+            return
+        reversal_text = "停止新增仓位" if config.mtf_reversal_mode == "block_new_entries" else "不处理"
+        mode_parts.append(
+            f"高周期过滤={config.resolved_mtf_filter_inst_id()}/{config.resolved_mtf_filter_bar()} "
+            f"EMA{config.mtf_filter_fast_ema_period}/EMA{config.mtf_filter_slow_ema_period}"
+        )
+        mode_parts.append(f"高周期反转={reversal_text}")
+
     def _run_dynamic_exchange_strategy(
         self,
         credentials: Credentials,
         config: StrategyConfig,
         instrument: Instrument,
     ) -> None:
-        if config.signal_mode == "both":
+        effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
+        if effective_signal_mode == "both":
             raise RuntimeError("EMA 动态委托策略不支持双向，请选择只做多或只做空")
         has_risk_amount = config.risk_amount is not None and config.risk_amount > 0
         has_fixed_size = config.order_size > 0
         if not has_risk_amount and not has_fixed_size:
             raise RuntimeError("风险金必须大于 0，或固定数量必须大于 0")
 
-        strategy = EmaDynamicOrderStrategy()
         entry_reference_ema_period = config.resolved_entry_reference_ema_period()
         lookback = recommended_indicator_lookback(
             config.ema_period,
@@ -388,6 +438,7 @@ class StrategyEngine:
             f"每波最多开仓次数={config.max_entries_per_trend or 0}",
             f"启动追单窗口={config.startup_chase_window_label()}",
         ]
+        self._append_dynamic_mtf_mode_parts(config, mode_parts)
         self._logger(" | ".join(mode_parts))
         if dynamic_stop_only and trader_virtual_stop_loss_enabled:
             self._logger(
@@ -529,7 +580,12 @@ class StrategyEngine:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
-            decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
+            decision = self._evaluate_dynamic_signal_decision(
+                confirmed,
+                config,
+                effective_signal_mode=effective_signal_mode,
+                price_increment=instrument.tick_size,
+            )
             last_candle_ts = newest_ts
             if decision.signal is None:
                 current_wave_signal = None
@@ -688,10 +744,10 @@ class StrategyEngine:
         *,
         active_order: ManagedEntryOrder,
     ) -> None:
-        if config.signal_mode == "both":
+        effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
+        if effective_signal_mode == "both":
             raise RuntimeError("EMA 动态委托策略不支持双向，请选择只做多或只做空")
 
-        strategy = EmaDynamicOrderStrategy()
         entry_reference_ema_period = config.resolved_entry_reference_ema_period()
         lookback = recommended_indicator_lookback(
             config.ema_period,
@@ -856,7 +912,12 @@ class StrategyEngine:
                     )
                     return
 
-                decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
+                decision = self._evaluate_dynamic_signal_decision(
+                    confirmed,
+                    config,
+                    effective_signal_mode=effective_signal_mode,
+                    price_increment=instrument.tick_size,
+                )
                 last_candle_ts = newest_candle_ts
                 if decision.signal is None:
                     idle_signal_candle_ts = newest_candle_ts
@@ -1268,7 +1329,6 @@ class StrategyEngine:
         if config.signal_mode == "both":
             raise RuntimeError("EMA 动态委托策略不支持双向，请选择只做多或只做空")
 
-        strategy = EmaDynamicOrderStrategy()
         entry_reference_ema_period = config.resolved_entry_reference_ema_period()
         lookback = recommended_indicator_lookback(
             config.ema_period,
@@ -1391,7 +1451,6 @@ class StrategyEngine:
         if config.signal_mode == "both":
             raise RuntimeError("EMA 动态委托策略不支持双向，请选择只做多或只做空")
 
-        strategy = EmaDynamicOrderStrategy()
         entry_reference_ema_period = config.resolved_entry_reference_ema_period()
         lookback = recommended_indicator_lookback(
             config.ema_period,
@@ -1514,6 +1573,7 @@ class StrategyEngine:
             f"挂单参考={_dynamic_entry_reference_ema_text(config)}",
             f"启动追单窗口={config.startup_chase_window_label()}",
         ]
+        self._append_dynamic_mtf_mode_parts(config, mode_parts)
         if config.take_profit_mode == "dynamic":
             mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
             mode_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
@@ -1543,9 +1603,10 @@ class StrategyEngine:
                 self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                 continue
             if newest_ts != last_candle_ts or active_trigger is None:
-                decision = strategy.evaluate(
+                decision = self._evaluate_dynamic_signal_decision(
                     confirmed,
-                    replace(config, signal_mode=effective_signal_mode),
+                    config,
+                    effective_signal_mode=effective_signal_mode,
                     price_increment=signal_instrument.tick_size,
                 )
                 last_candle_ts = newest_ts
@@ -1695,6 +1756,7 @@ class StrategyEngine:
             f"挂单参考={_dynamic_entry_reference_ema_text(config)}",
             f"启动追单窗口={config.startup_chase_window_label()}",
         ]
+        self._append_dynamic_mtf_mode_parts(config, mode_parts)
         if config.take_profit_mode == "dynamic":
             mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
             mode_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
@@ -1725,9 +1787,10 @@ class StrategyEngine:
                 continue
             last_candle_ts = newest_ts
 
-            decision = strategy.evaluate(
+            decision = self._evaluate_dynamic_signal_decision(
                 confirmed,
-                replace(config, signal_mode=effective_signal_mode),
+                config,
+                effective_signal_mode=effective_signal_mode,
                 price_increment=instrument.tick_size,
             )
             if decision.signal is None:

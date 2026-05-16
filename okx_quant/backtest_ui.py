@@ -42,6 +42,7 @@ from okx_quant.strategy_catalog import (
     StrategyDefinition,
     get_strategy_definition,
     is_adaptive_ema_rail_strategy,
+    is_dynamic_mtf_strategy_id,
     is_dynamic_strategy_id,
     is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
@@ -108,6 +109,10 @@ TAKE_PROFIT_MODE_OPTIONS = {
     "固定止盈": "fixed",
     "动态止盈": "dynamic",
 }
+MTF_REVERSAL_MODE_OPTIONS = {
+    "只过滤新开仓": "block_new_entries",
+}
+MTF_REVERSAL_MODE_VALUE_TO_LABEL = {value: label for label, value in MTF_REVERSAL_MODE_OPTIONS.items()}
 MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT = Decimal("0.50")
 TAKE_PROFIT_MODE_VALUE_TO_LABEL = {value: label for label, value in TAKE_PROFIT_MODE_OPTIONS.items()}
 MANUAL_FILTER_OPTIONS = {
@@ -136,6 +141,10 @@ class BacktestLaunchState:
     trend_ema_period: str
     big_ema_period: str
     entry_reference_ema_period: str
+    mtf_filter_bar: str
+    mtf_filter_fast_ema_period: str
+    mtf_filter_slow_ema_period: str
+    mtf_reversal_mode_label: str
     atr_period: str
     stop_atr: str
     take_atr: str
@@ -846,7 +855,7 @@ def _batch_mode_for_snapshots(snapshots: list[_BacktestSnapshot]) -> str:
     config = snapshots[0].config
     if is_strategy_pool_config(config):
         return "strategy_pool"
-    if is_dynamic_strategy_id(config.strategy_id):
+    if is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id):
         if config.take_profit_mode == "dynamic":
             return "dynamic_entries"
         return "fixed_entries"
@@ -914,6 +923,11 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "time_stop_break_even_enabled": config.time_stop_break_even_enabled,
         "time_stop_break_even_bars": config.resolved_time_stop_break_even_bars(),
         "hold_close_exit_bars": int(config.hold_close_exit_bars),
+        "mtf_filter_inst_id": config.mtf_filter_inst_id,
+        "mtf_filter_bar": config.mtf_filter_bar,
+        "mtf_filter_fast_ema_period": config.mtf_filter_fast_ema_period,
+        "mtf_filter_slow_ema_period": config.mtf_filter_slow_ema_period,
+        "mtf_reversal_mode": config.mtf_reversal_mode,
         "backtest_profile_id": config.backtest_profile_id,
         "backtest_profile_name": config.backtest_profile_name,
         "backtest_profile_summary": config.backtest_profile_summary,
@@ -977,6 +991,13 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         time_stop_break_even_enabled=bool(payload.get("time_stop_break_even_enabled", False)),
         time_stop_break_even_bars=int(payload.get("time_stop_break_even_bars", 10)),
         hold_close_exit_bars=int(payload.get("hold_close_exit_bars", 0)),
+        mtf_filter_inst_id=None
+        if payload.get("mtf_filter_inst_id") in (None, "")
+        else str(payload.get("mtf_filter_inst_id")),
+        mtf_filter_bar=None if payload.get("mtf_filter_bar") in (None, "") else str(payload.get("mtf_filter_bar")),
+        mtf_filter_fast_ema_period=int(payload.get("mtf_filter_fast_ema_period", 21)),
+        mtf_filter_slow_ema_period=int(payload.get("mtf_filter_slow_ema_period", 55)),
+        mtf_reversal_mode=str(payload.get("mtf_reversal_mode", "block_new_entries")),
         backtest_profile_id=str(payload.get("backtest_profile_id", "")),
         backtest_profile_name=str(payload.get("backtest_profile_name", "")),
         backtest_profile_summary=str(payload.get("backtest_profile_summary", "")),
@@ -1267,6 +1288,10 @@ class BacktestWindow:
         self.trend_ema_period = StringVar(value=initial_state.trend_ema_period)
         self.big_ema_period = StringVar(value=initial_state.big_ema_period)
         self.entry_reference_ema_period = StringVar(value=initial_state.entry_reference_ema_period)
+        self.mtf_filter_bar = StringVar(value=initial_state.mtf_filter_bar)
+        self.mtf_filter_fast_ema_period = StringVar(value=initial_state.mtf_filter_fast_ema_period)
+        self.mtf_filter_slow_ema_period = StringVar(value=initial_state.mtf_filter_slow_ema_period)
+        self.mtf_reversal_mode_label = StringVar(value=initial_state.mtf_reversal_mode_label)
         self.atr_period = StringVar(value=initial_state.atr_period)
         self.stop_atr = StringVar(value=initial_state.stop_atr)
         self.take_atr = StringVar(value=initial_state.take_atr)
@@ -1374,6 +1399,7 @@ class BacktestWindow:
     def _strategy_supports_dynamic_take_profit(strategy_id: str) -> bool:
         return (
             is_dynamic_strategy_id(strategy_id)
+            or is_dynamic_mtf_strategy_id(strategy_id)
             or is_ema_atr_breakout_strategy(strategy_id)
             or is_adaptive_ema_rail_strategy(strategy_id)
         )
@@ -1410,6 +1436,10 @@ class BacktestWindow:
             "atr_stop_multiplier": self.stop_atr,
             "atr_take_multiplier": self.take_atr,
             "entry_reference_ema_period": self.entry_reference_ema_period,
+            "mtf_filter_bar": self.mtf_filter_bar,
+            "mtf_filter_fast_ema_period": self.mtf_filter_fast_ema_period,
+            "mtf_filter_slow_ema_period": self.mtf_filter_slow_ema_period,
+            "mtf_reversal_mode": self.mtf_reversal_mode_label,
             "take_profit_mode": self.take_profit_mode_label,
             "max_entries_per_trend": self.max_entries_per_trend,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
@@ -1458,6 +1488,8 @@ class BacktestWindow:
                 variable.set(SIGNAL_VALUE_TO_LABEL.get(str(default_value), definition.default_signal_label))
             elif key == "take_profit_mode":
                 variable.set(TAKE_PROFIT_MODE_VALUE_TO_LABEL.get(str(default_value), self.take_profit_mode_label.get()))
+            elif key == "mtf_reversal_mode":
+                variable.set(MTF_REVERSAL_MODE_VALUE_TO_LABEL.get(str(default_value), self.mtf_reversal_mode_label.get()))
             else:
                 variable.set(default_value)
         for key in iter_strategy_parameter_keys(strategy_id):
@@ -1470,6 +1502,8 @@ class BacktestWindow:
                     variable.set(_normalize_backtest_bar_label(str(fixed_value)))
                 elif key == "signal_mode":
                     variable.set(SIGNAL_VALUE_TO_LABEL.get(str(fixed_value), definition.default_signal_label))
+                elif key == "mtf_reversal_mode":
+                    variable.set(MTF_REVERSAL_MODE_VALUE_TO_LABEL.get(str(fixed_value), self.mtf_reversal_mode_label.get()))
                 else:
                     variable.set(fixed_value)
 
@@ -1720,6 +1754,36 @@ class BacktestWindow:
         self.entry_reference_ema_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
         self.entry_reference_ema_entry = ttk.Entry(controls, textvariable=self.entry_reference_ema_period)
         self.entry_reference_ema_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+
+        row += 1
+        self.mtf_filter_bar_caption = ttk.Label(controls, text="高周期K线")
+        self.mtf_filter_bar_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self.mtf_filter_bar_combo = ttk.Combobox(
+            controls,
+            textvariable=self.mtf_filter_bar,
+            values=list(BACKTEST_BAR_LABEL_TO_VALUE.keys()),
+            state="readonly",
+        )
+        self.mtf_filter_bar_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.mtf_filter_fast_ema_caption = ttk.Label(controls, text="高周期快EMA")
+        self.mtf_filter_fast_ema_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
+        self.mtf_filter_fast_ema_entry = ttk.Entry(controls, textvariable=self.mtf_filter_fast_ema_period)
+        self.mtf_filter_fast_ema_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.mtf_filter_slow_ema_caption = ttk.Label(controls, text="高周期慢EMA")
+        self.mtf_filter_slow_ema_caption.grid(row=row, column=4, sticky="w", pady=(12, 0))
+        self.mtf_filter_slow_ema_entry = ttk.Entry(controls, textvariable=self.mtf_filter_slow_ema_period)
+        self.mtf_filter_slow_ema_entry.grid(row=row, column=5, sticky="ew", pady=(12, 0))
+
+        row += 1
+        self.mtf_reversal_mode_caption = ttk.Label(controls, text="高周期反向处理")
+        self.mtf_reversal_mode_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.mtf_reversal_mode_combo = ttk.Combobox(
+            controls,
+            textvariable=self.mtf_reversal_mode_label,
+            values=list(MTF_REVERSAL_MODE_OPTIONS.keys()),
+            state="readonly",
+        )
+        self.mtf_reversal_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
 
         row += 1
         self.take_profit_mode_caption = ttk.Label(controls, text="止盈方式")
@@ -2960,7 +3024,7 @@ class BacktestWindow:
 
     def _build_config(self) -> StrategyConfig:
         definition = self._selected_strategy_definition()
-        dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id)
+        dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id) or is_dynamic_mtf_strategy_id(definition.strategy_id)
         dynamic_tp_strategy = self._strategy_supports_dynamic_take_profit(definition.strategy_id)
         strategy_id = definition.strategy_id
         sizing_mode = BACKTEST_SIZING_OPTIONS[self.sizing_mode_label.get()]
@@ -2983,6 +3047,10 @@ class BacktestWindow:
         take_profit_mode = "fixed"
         max_entries_per_trend = 0
         entry_reference_ema_period = 0
+        mtf_filter_bar = None
+        mtf_filter_fast_ema_period = 21
+        mtf_filter_slow_ema_period = 55
+        mtf_reversal_mode = "block_new_entries"
         dynamic_two_r_break_even = False
         dynamic_fee_offset_enabled = False
         time_stop_break_even_enabled = False
@@ -2996,6 +3064,38 @@ class BacktestWindow:
                     if definition.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID
                     else ("突破参考EMA周期" if is_ema_atr_breakout_strategy(definition.strategy_id) else "挂单参考EMA")
                 ),
+            )
+        if strategy_uses_parameter(definition.strategy_id, "mtf_filter_bar"):
+            mtf_filter_bar = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "mtf_filter_bar",
+                    _backtest_bar_value_from_label(self.mtf_filter_bar.get()),
+                )
+            )
+        if strategy_uses_parameter(definition.strategy_id, "mtf_filter_fast_ema_period"):
+            mtf_filter_fast_ema_period = int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "mtf_filter_fast_ema_period",
+                    self._parse_positive_int(self.mtf_filter_fast_ema_period.get(), "高周期快EMA"),
+                )
+            )
+        if strategy_uses_parameter(definition.strategy_id, "mtf_filter_slow_ema_period"):
+            mtf_filter_slow_ema_period = int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "mtf_filter_slow_ema_period",
+                    self._parse_positive_int(self.mtf_filter_slow_ema_period.get(), "高周期慢EMA"),
+                )
+            )
+        if strategy_uses_parameter(definition.strategy_id, "mtf_reversal_mode"):
+            mtf_reversal_mode = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "mtf_reversal_mode",
+                    MTF_REVERSAL_MODE_OPTIONS.get(self.mtf_reversal_mode_label.get(), "block_new_entries"),
+                )
             )
         if dynamic_tp_strategy:
             take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
@@ -3060,6 +3160,10 @@ class BacktestWindow:
             time_stop_break_even_enabled=time_stop_break_even_enabled,
             time_stop_break_even_bars=time_stop_break_even_bars,
             hold_close_exit_bars=hold_close_exit_bars,
+            mtf_filter_bar=mtf_filter_bar,
+            mtf_filter_fast_ema_period=mtf_filter_fast_ema_period,
+            mtf_filter_slow_ema_period=mtf_filter_slow_ema_period,
+            mtf_reversal_mode=mtf_reversal_mode,
             backtest_initial_capital=self._parse_positive_decimal(self.initial_capital.get(), "初始资金"),
             backtest_sizing_mode=sizing_mode,
             backtest_risk_percent=risk_percent,
@@ -3112,6 +3216,21 @@ class BacktestWindow:
                     widget.grid()
                 else:
                     widget.grid_remove()
+            mtf_widgets = (
+                self.mtf_filter_bar_caption,
+                self.mtf_filter_bar_combo,
+                self.mtf_filter_fast_ema_caption,
+                self.mtf_filter_fast_ema_entry,
+                self.mtf_filter_slow_ema_caption,
+                self.mtf_filter_slow_ema_entry,
+                self.mtf_reversal_mode_caption,
+                self.mtf_reversal_mode_combo,
+            )
+            for widget in mtf_widgets:
+                if is_dynamic_mtf_strategy_id(strategy_id):
+                    widget.grid()
+                else:
+                    widget.grid_remove()
             dynamic_widgets = (
                 self.take_profit_mode_caption,
                 self.take_profit_mode_combo,
@@ -3150,6 +3269,10 @@ class BacktestWindow:
             self._set_field_state(self.trend_ema_period_entry, editable=strategy_is_parameter_editable(strategy_id, "trend_ema_period", "backtest"))
             self._set_field_state(self.big_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "big_ema_period", "backtest"))
             self._set_field_state(self.signal_combo, editable=strategy_is_parameter_editable(strategy_id, "signal_mode", "backtest"))
+            self._set_field_state(self.mtf_filter_bar_combo, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_bar", "backtest"))
+            self._set_field_state(self.mtf_filter_fast_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_fast_ema_period", "backtest"))
+            self._set_field_state(self.mtf_filter_slow_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_slow_ema_period", "backtest"))
+            self._set_field_state(self.mtf_reversal_mode_combo, editable=strategy_is_parameter_editable(strategy_id, "mtf_reversal_mode", "backtest"))
             self._set_field_state(
                 self.hold_close_exit_bars_entry,
                 editable=strategy_is_parameter_editable(strategy_id, "hold_close_exit_bars", "backtest"),

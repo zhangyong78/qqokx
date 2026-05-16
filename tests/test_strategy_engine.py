@@ -24,13 +24,15 @@ from okx_quant.engine import (
     supports_fixed_entry_side_mode,
     validate_entry_side_mode_support,
 )
-from okx_quant.models import Candle, Instrument, SignalDecision, StrategyConfig
+from okx_quant.engine_strategy_router import EngineStrategyRouter
+from okx_quant.models import Candle, Credentials, Instrument, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxTradeOrderItem
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategy_catalog import (
     STRATEGY_EMA_BREAKOUT_LONG_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
+    STRATEGY_DYNAMIC_MTF_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
 )
@@ -76,6 +78,107 @@ class StrategyEngineTest(TestCase):
             candles.append(Candle(index, open_price, high, low, close, Decimal("1"), True))
             previous_close = close
         return candles
+
+    def test_dynamic_mtf_live_decision_loads_filter_candles_and_blocks_mismatch(self) -> None:
+        requested: list[tuple[str, str, int]] = []
+        filter_candles = self._make_candles(["110", "106", "103", "101", "100"])
+
+        class _StubClient:
+            def get_candles(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
+                requested.append((inst_id, bar, limit))
+                return filter_candles[-limit:]
+
+        engine = StrategyEngine(_StubClient(), lambda _message: None)
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=2,
+            trend_ema_period=3,
+            big_ema_period=4,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_MTF_LONG_ID,
+            risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
+            mtf_filter_bar="1H",
+            mtf_filter_fast_ema_period=2,
+            mtf_filter_slow_ema_period=3,
+        )
+
+        decision = engine._evaluate_dynamic_signal_decision(
+            self._make_candles(["100", "101", "103", "106", "110"]),
+            config,
+            effective_signal_mode="long_only",
+            price_increment=Decimal("0.1"),
+        )
+
+        self.assertIsNone(decision.signal)
+        self.assertIn("高周期过滤未放行", decision.reason)
+        self.assertEqual(requested[0][0], "BTC-USDT-SWAP")
+        self.assertEqual(requested[0][1], "1H")
+
+    def test_router_runs_dynamic_mtf_signal_only_as_dynamic_strategy(self) -> None:
+        calls: list[str] = []
+
+        class _StopEvent:
+            def set(self) -> None:
+                calls.append("stopped")
+
+        class _StubEngine:
+            _stop_event = _StopEvent()
+
+            def _get_instrument_with_retry(self, inst_id: str) -> Instrument:
+                return Instrument(
+                    inst_id=inst_id,
+                    inst_type="SWAP",
+                    tick_size=Decimal("0.1"),
+                    lot_size=Decimal("1"),
+                    min_size=Decimal("1"),
+                    state="live",
+                )
+
+            def _run_dynamic_signal_only_v2(self, config: StrategyConfig, instrument: Instrument) -> None:
+                calls.append(f"dynamic:{config.strategy_id}:{instrument.inst_id}")
+
+            def _notify_error(self, config: StrategyConfig, message: str) -> None:
+                calls.append(f"error:{message}")
+
+            def _logger(self, message: str) -> None:
+                calls.append(f"log:{message}")
+
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=2,
+            trend_ema_period=3,
+            big_ema_period=4,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_MTF_LONG_ID,
+            run_mode="signal_only",
+        )
+
+        EngineStrategyRouter(_StubEngine()).run(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            config,
+        )
+
+        self.assertIn("dynamic:ema_dynamic_mtf_long:BTC-USDT-SWAP", calls)
+        self.assertNotIn("error:", "".join(calls))
 
     def test_determine_order_size_uses_contract_value_for_linear_swap_risk_amount(self) -> None:
         instrument = Instrument(

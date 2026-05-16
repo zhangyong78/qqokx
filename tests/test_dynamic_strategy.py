@@ -4,6 +4,8 @@ from unittest import TestCase
 from okx_quant.engine import build_order_plan
 from okx_quant.models import Candle, Instrument, StrategyConfig
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
+from okx_quant.strategies.ema_dynamic_multi_timeframe import EmaDynamicMultiTimeframeStrategy
+from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_MTF_LONG_ID
 
 
 class DynamicStrategyTest(TestCase):
@@ -234,6 +236,69 @@ class DynamicStrategyTest(TestCase):
 
         self.assertEqual(decision.signal, "short")
         self.assertEqual(decision.entry_reference, decision.ema_value)
+
+    def test_multi_timeframe_long_allows_entry_when_filter_is_bullish(self) -> None:
+        entry_candles = self._make_candles(["100", "101", "103", "106", "110"])
+        filter_candles = self._make_candles(["100", "101", "103", "106", "110"])
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=2,
+            trend_ema_period=3,
+            big_ema_period=4,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
+            strategy_id=STRATEGY_DYNAMIC_MTF_LONG_ID,
+            mtf_filter_bar="1H",
+            mtf_filter_fast_ema_period=2,
+            mtf_filter_slow_ema_period=3,
+        )
+
+        decision = EmaDynamicMultiTimeframeStrategy().evaluate(entry_candles, filter_candles, config)
+
+        self.assertEqual(decision.signal, "long")
+        self.assertIsNotNone(decision.entry_reference)
+        self.assertIn("高周期过滤通过", decision.reason)
+
+    def test_multi_timeframe_long_blocks_entry_when_filter_is_bearish(self) -> None:
+        entry_candles = self._make_candles(["100", "101", "103", "106", "110"])
+        filter_candles = self._make_candles(["110", "106", "103", "101", "100"])
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=2,
+            trend_ema_period=3,
+            big_ema_period=4,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
+            strategy_id=STRATEGY_DYNAMIC_MTF_LONG_ID,
+            mtf_filter_bar="1H",
+            mtf_filter_fast_ema_period=2,
+            mtf_filter_slow_ema_period=3,
+        )
+
+        decision = EmaDynamicMultiTimeframeStrategy().evaluate(entry_candles, filter_candles, config)
+
+        self.assertIsNone(decision.signal)
+        self.assertIn("高周期过滤未放行", decision.reason)
 
     def test_risk_amount_controls_order_size(self) -> None:
         instrument = Instrument(

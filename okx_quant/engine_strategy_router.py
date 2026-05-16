@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from okx_quant.models import Credentials, StrategyConfig
 from okx_quant.strategy_catalog import (
     STRATEGY_EMA5_EMA8_ID,
+    is_dynamic_mtf_strategy_id,
     is_dynamic_strategy_id,
     is_ema_atr_breakout_strategy,
 )
@@ -27,7 +28,7 @@ class EngineStrategyRouter:
                 raise RuntimeError(f"{signal_instrument.inst_id} 当前不可交易，状态：{signal_instrument.state}")
 
             if config.run_mode == "signal_only":
-                if is_dynamic_strategy_id(config.strategy_id):
+                if is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id):
                     engine._run_dynamic_signal_only_v2(config, signal_instrument)
                 elif is_ema_atr_breakout_strategy(config.strategy_id):
                     engine._run_cross_signal_only(config, signal_instrument)
@@ -46,7 +47,7 @@ class EngineStrategyRouter:
                 raise RuntimeError("当前版本只支持永续或期权下单，现货暂时仅支持作为触发价格来源")
 
             engine_module.validate_entry_side_mode_support(config)
-            if is_dynamic_strategy_id(config.strategy_id):
+            if is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id):
                 if engine_module.can_use_exchange_managed_orders(config, signal_instrument, trade_instrument):
                     engine._run_dynamic_exchange_strategy(credentials, config, trade_instrument)
                 else:
