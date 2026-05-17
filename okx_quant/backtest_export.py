@@ -13,7 +13,7 @@ from okx_quant.backtest_audit import (
     single_backtest_artifact_paths,
 )
 from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_pool_profile_name
-from okx_quant.models import StrategyConfig
+from okx_quant.models import StrategyConfig, moving_average_display_label
 from okx_quant.persistence import backtest_report_export_dir_path
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import BACKTEST_STRATEGY_DEFINITIONS, is_dynamic_strategy_id
@@ -44,6 +44,21 @@ FEE_TYPE_TO_LABEL = {
 
 def _format_candle_limit_text(candle_limit: int) -> str:
     return "全量" if candle_limit <= 0 else str(candle_limit)
+
+
+def _config_fast_label(config: StrategyConfig) -> str:
+    return moving_average_display_label(config.resolved_ema_type(), config.ema_period)
+
+
+def _config_trend_label(config: StrategyConfig) -> str:
+    return moving_average_display_label(config.resolved_trend_ema_type(), config.trend_ema_period)
+
+
+def _config_reference_label(config: StrategyConfig) -> str:
+    return moving_average_display_label(
+        config.resolved_entry_reference_ema_type(),
+        config.resolved_entry_reference_ema_period(),
+    )
 
 
 def export_single_backtest_report(
@@ -339,7 +354,7 @@ def _build_batch_result_title(index: int, config: StrategyConfig, batch_mode: st
     if batch_mode == "strategy_pool":
         return (
             f"[{index}] {strategy_pool_profile_name(config)} | "
-            f"EMA{config.ema_period}/{config.trend_ema_period} | "
+            f"{_config_fast_label(config)}/{_config_trend_label(config)} | "
             f"ATR{config.atr_period} | "
             f"SL x{format_decimal(config.atr_stop_multiplier)} | "
             f"TP x{format_decimal(config.atr_take_multiplier)}"
@@ -405,7 +420,7 @@ def _build_batch_scope_line(
     if batch_mode == "dynamic_entries":
         return (
             "参数范围：动态止盈；"
-            f"挂单参考EMA = EMA{results[0][0].resolved_entry_reference_ema_period()}；"
+            f"挂单参考线 = {_config_reference_label(results[0][0])}；"
             "SL = 1/1.5/2 ATR；"
             "每波最多开仓次数 = 0/1/2/3；"
             f"2R保本 = {results[0][0].dynamic_two_r_break_even_label()}；"
@@ -414,7 +429,7 @@ def _build_batch_scope_line(
         )
     if batch_mode == "fixed_entries":
         return (
-            f"参数范围：挂单参考EMA = EMA{results[0][0].resolved_entry_reference_ema_period()}；"
+            f"参数范围：挂单参考线 = {_config_reference_label(results[0][0])}；"
             "每波最多开仓次数 = 0/1/2/3；"
             "SL = 1/1.5/2 ATR；"
             "TP = SL x1/x2/x3；"
@@ -432,7 +447,7 @@ def _build_batch_matrix_lines(results: list[tuple[StrategyConfig, BacktestResult
                     [
                         strategy_pool_profile_name(config),
                         (
-                            f"EMA{config.ema_period}/{config.trend_ema_period} "
+                            f"{_config_fast_label(config)}/{_config_trend_label(config)} "
                             f"ATR{config.atr_period} "
                             f"SLx{format_decimal(config.atr_stop_multiplier)} "
                             f"TPx{format_decimal(config.atr_take_multiplier)}"
@@ -518,7 +533,7 @@ def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
         sizing_text = f"固定风险金{format_decimal(config.risk_amount or Decimal('0'))}"
     parts = [
         f"EMA{config.ema_period}",
-        f"趋势EMA{config.trend_ema_period}",
+        f"趋势线{_config_trend_label(config)}",
         f"ATR{config.atr_period}",
         f"SL x{format_decimal(config.atr_stop_multiplier)}",
         f"TP x{format_decimal(config.atr_take_multiplier)}",
@@ -526,7 +541,7 @@ def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
     if config.backtest_profile_name:
         parts.insert(0, f"候选{config.backtest_profile_name}")
     if is_dynamic_strategy_id(config.strategy_id):
-        parts.insert(2, f"挂单EMA{config.resolved_entry_reference_ema_period()}")
+        parts.insert(2, f"挂单参考线{_config_reference_label(config)}")
         parts.append(f"止盈方式{'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}")
         if config.take_profit_mode == "dynamic":
             parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")

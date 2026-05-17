@@ -29,7 +29,7 @@ from okx_quant.backtest_audit import describe_backtest_export_artifacts
 from okx_quant.backtest_export import export_batch_backtest_report, export_single_backtest_report
 from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_pool_profile_name
 from okx_quant.candle_cache_verify import CacheVerifyOutcome, verify_and_repair_cached_candles
-from okx_quant.models import StrategyConfig
+from okx_quant.models import StrategyConfig, moving_average_display_label
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import backtest_history_file_path, load_strategy_parameter_drafts, save_strategy_parameter_drafts
 from okx_quant.pricing import format_decimal, format_decimal_fixed
@@ -115,6 +115,7 @@ MTF_REVERSAL_MODE_OPTIONS = {
 MTF_REVERSAL_MODE_VALUE_TO_LABEL = {value: label for label, value in MTF_REVERSAL_MODE_OPTIONS.items()}
 MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT = Decimal("0.50")
 TAKE_PROFIT_MODE_VALUE_TO_LABEL = {value: label for label, value in TAKE_PROFIT_MODE_OPTIONS.items()}
+MOVING_AVERAGE_TYPE_OPTIONS = ("EMA", "MA")
 MANUAL_FILTER_OPTIONS = {
     "全部": "all",
     "仅接近保本": "near_break_even",
@@ -137,9 +138,12 @@ class BacktestLaunchState:
     strategy_name: str
     symbol: str
     bar: str
+    ema_type: str
     ema_period: str
+    trend_ema_type: str
     trend_ema_period: str
     big_ema_period: str
+    entry_reference_ema_type: str
     entry_reference_ema_period: str
     mtf_filter_bar: str
     mtf_filter_fast_ema_period: str
@@ -445,6 +449,9 @@ def _build_backtest_param_summary(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> str:
+    fast_label = config.ema_label()
+    trend_label = config.trend_ema_label()
+    reference_label = config.entry_reference_line_label()
     if is_dynamic_strategy_id(config.strategy_id) or is_ema_atr_breakout_strategy(config.strategy_id):
         risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
         sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
@@ -462,20 +469,19 @@ def _build_backtest_param_summary(
             extra_parts.append(
                 f"时间保本{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
             )
-        if is_dynamic_strategy_id(config.strategy_id) or is_ema_atr_breakout_strategy(config.strategy_id):
-            max_entries_text = "不限" if config.max_entries_per_trend <= 0 else f"每波前{config.max_entries_per_trend}次"
-            extra_parts.append(max_entries_text)
+        max_entries_text = "不限" if config.max_entries_per_trend <= 0 else f"每波前{config.max_entries_per_trend}次"
+        extra_parts.append(max_entries_text)
         if is_ema_atr_breakout_strategy(config.strategy_id) and int(config.hold_close_exit_bars) > 0:
             extra_parts.append(f"满{int(config.hold_close_exit_bars)}根收盘平仓")
         extra_text = " / ".join(extra_parts)
-        ref_ema_label = (
-            "跌破参考EMA"
+        ref_line_label = (
+            "跌破参考线"
             if config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID
-            else ("突破参考EMA" if is_ema_atr_breakout_strategy(config.strategy_id) else "挂单EMA")
+            else ("突破参考线" if is_ema_atr_breakout_strategy(config.strategy_id) else "挂单参考线")
         )
         return (
-            f"EMA{config.ema_period}/{config.trend_ema_period} / ATR{config.atr_period} / "
-            f"{ref_ema_label}{config.resolved_entry_reference_ema_period()} / "
+            f"{fast_label}/{trend_label} / ATR{config.atr_period} / "
+            f"{ref_line_label}{reference_label} / "
             f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
             f"{extra_text} / "
             f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
@@ -495,8 +501,8 @@ def _build_backtest_param_summary(
         else:
             sizing_text = f"{sizing_label}{format_decimal(config.risk_amount or Decimal('0'))}"
         return (
-            f"4H固定 / EMA{config.ema_period}/{config.trend_ema_period}/{config.big_ema_period} / "
-            f"EMA{config.trend_ema_period}动态止损 / 方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / "
+            f"4H固定 / {fast_label}/{trend_label}/EMA{config.big_ema_period} / "
+            f"{trend_label}动态止损 / 方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / "
             f"仓位{sizing_text} / 本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
             f"{'复利' if config.backtest_compounding else '不复利'} / "
             f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
@@ -513,7 +519,7 @@ def _build_backtest_param_summary(
     else:
         sizing_text = f"{sizing_label}{risk_text}"
     return (
-        f"EMA{config.ema_period}/{config.trend_ema_period}/{config.big_ema_period} / ATR{config.atr_period} / "
+        f"{fast_label}/{trend_label}/EMA{config.big_ema_period} / ATR{config.atr_period} / "
         f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
         f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
         f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
@@ -561,6 +567,54 @@ def _format_trade_exit_reason(exit_reason: str) -> str:
         "stop_loss": "止损",
         "signal_profit_exit": "信号失效盈利平仓",
     }.get(exit_reason, exit_reason)
+
+
+def _build_trade_tree_rows(result: BacktestResult) -> list[tuple[str, tuple[str | int, ...]]]:
+    rows: list[tuple[str, tuple[str | int, ...]]] = []
+    for index, trade in enumerate(result.trades, start=1):
+        rows.append(
+            (
+                f"T{index:03d}",
+                (
+                    index,
+                    "做多" if trade.signal == "long" else "做空",
+                    _format_chart_timestamp(trade.entry_ts),
+                    format_decimal_fixed(trade.entry_price, 4),
+                    format_decimal_fixed(trade.stop_loss, 4),
+                    format_decimal_fixed(trade.atr_value, 4),
+                    format_decimal_fixed(trade.size, 4),
+                    _format_chart_timestamp(trade.exit_ts),
+                    format_decimal_fixed(trade.exit_price, 4),
+                    format_decimal_fixed(trade.total_fee, 4),
+                    _format_trade_exit_reason(trade.exit_reason),
+                    format_decimal_fixed(trade.pnl, 4),
+                    format_decimal_fixed(trade.r_multiple, 4),
+                ),
+            )
+        )
+    if result.open_position is not None:
+        open_position = result.open_position
+        rows.append(
+            (
+                "OPEN",
+                (
+                    "OPEN",
+                    "做多" if open_position.signal in ("buy", "long") else "做空",
+                    _format_chart_timestamp(open_position.entry_ts),
+                    format_decimal_fixed(open_position.entry_price, 4),
+                    format_decimal_fixed(open_position.stop_loss, 4),
+                    "-",
+                    format_decimal_fixed(open_position.size, 4),
+                    _format_chart_timestamp(open_position.current_ts),
+                    format_decimal_fixed(open_position.current_price, 4),
+                    format_decimal_fixed(open_position.entry_fee, 4),
+                    "未平仓快照",
+                    format_decimal_fixed(open_position.pnl, 4),
+                    format_decimal_fixed(open_position.r_multiple, 4),
+                ),
+            )
+        )
+    return rows
 
 
 def _manual_position_break_even_gap_pct(manual_position: BacktestManualPosition) -> Decimal:
@@ -756,6 +810,20 @@ def _has_extension_stats(result: BacktestResult | None) -> bool:
     )
 
 
+def _build_open_position_summary(result: BacktestResult) -> str:
+    open_position = result.open_position
+    if open_position is None:
+        return ""
+    direction_text = "做多" if open_position.signal in ("buy", "long") else "做空"
+    return (
+        "期末未平仓："
+        f"{direction_text} | 开仓={_format_chart_timestamp(open_position.entry_ts)} | "
+        f"当前={format_decimal_fixed(open_position.current_price, 4)} | "
+        f"浮盈亏={format_decimal_fixed(open_position.pnl, 4)} | "
+        f"R={format_decimal_fixed(open_position.r_multiple, 4)}"
+    )
+
+
 def _build_manual_pool_summary(
     result: BacktestResult,
     config: StrategyConfig,
@@ -895,9 +963,12 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
     return {
         "inst_id": config.inst_id,
         "bar": config.bar,
+        "ema_type": config.resolved_ema_type(),
         "ema_period": config.ema_period,
+        "trend_ema_type": config.resolved_trend_ema_type(),
         "trend_ema_period": config.trend_ema_period,
         "big_ema_period": config.big_ema_period,
+        "entry_reference_ema_type": config.resolved_entry_reference_ema_type(),
         "entry_reference_ema_period": config.entry_reference_ema_period,
         "atr_period": config.atr_period,
         "atr_stop_multiplier": str(config.atr_stop_multiplier),
@@ -959,9 +1030,12 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
     return StrategyConfig(
         inst_id=str(payload.get("inst_id", "")),
         bar=str(payload.get("bar", "15m")),
+        ema_type=str(payload.get("ema_type", "ema")),
         ema_period=int(payload.get("ema_period", 21)),
+        trend_ema_type=str(payload.get("trend_ema_type", "ema")),
         trend_ema_period=int(payload.get("trend_ema_period", 55)),
         big_ema_period=int(payload.get("big_ema_period", 233)),
+        entry_reference_ema_type=str(payload.get("entry_reference_ema_type", payload.get("ema_type", "ema"))),
         entry_reference_ema_period=int(payload.get("entry_reference_ema_period", 55)),
         atr_period=int(payload.get("atr_period", 14)),
         atr_stop_multiplier=Decimal(str(payload.get("atr_stop_multiplier", "1.5"))),
@@ -1284,9 +1358,12 @@ class BacktestWindow:
         self.strategy_name = StringVar(value=initial_state.strategy_name)
         self.symbol = StringVar(value=initial_state.symbol)
         self.bar_label = StringVar(value=_normalize_backtest_bar_label(initial_state.bar))
+        self.ema_type = StringVar(value=(initial_state.ema_type or "EMA").upper())
         self.ema_period = StringVar(value=initial_state.ema_period)
+        self.trend_ema_type = StringVar(value=(initial_state.trend_ema_type or "EMA").upper())
         self.trend_ema_period = StringVar(value=initial_state.trend_ema_period)
         self.big_ema_period = StringVar(value=initial_state.big_ema_period)
+        self.entry_reference_ema_type = StringVar(value=(initial_state.entry_reference_ema_type or "EMA").upper())
         self.entry_reference_ema_period = StringVar(value=initial_state.entry_reference_ema_period)
         self.mtf_filter_bar = StringVar(value=initial_state.mtf_filter_bar)
         self.mtf_filter_fast_ema_period = StringVar(value=initial_state.mtf_filter_fast_ema_period)
@@ -1429,12 +1506,15 @@ class BacktestWindow:
         return {
             "bar": self.bar_label,
             "signal_mode": self.signal_mode_label,
+            "ema_type": self.ema_type,
             "ema_period": self.ema_period,
+            "trend_ema_type": self.trend_ema_type,
             "trend_ema_period": self.trend_ema_period,
             "big_ema_period": self.big_ema_period,
             "atr_period": self.atr_period,
             "atr_stop_multiplier": self.stop_atr,
             "atr_take_multiplier": self.take_atr,
+            "entry_reference_ema_type": self.entry_reference_ema_type,
             "entry_reference_ema_period": self.entry_reference_ema_period,
             "mtf_filter_bar": self.mtf_filter_bar,
             "mtf_filter_fast_ema_period": self.mtf_filter_fast_ema_period,
@@ -1490,6 +1570,8 @@ class BacktestWindow:
                 variable.set(TAKE_PROFIT_MODE_VALUE_TO_LABEL.get(str(default_value), self.take_profit_mode_label.get()))
             elif key == "mtf_reversal_mode":
                 variable.set(MTF_REVERSAL_MODE_VALUE_TO_LABEL.get(str(default_value), self.mtf_reversal_mode_label.get()))
+            elif key.endswith("_type"):
+                variable.set(str(default_value).upper())
             else:
                 variable.set(default_value)
         for key in iter_strategy_parameter_keys(strategy_id):
@@ -1504,6 +1586,8 @@ class BacktestWindow:
                     variable.set(SIGNAL_VALUE_TO_LABEL.get(str(fixed_value), definition.default_signal_label))
                 elif key == "mtf_reversal_mode":
                     variable.set(MTF_REVERSAL_MODE_VALUE_TO_LABEL.get(str(fixed_value), self.mtf_reversal_mode_label.get()))
+                elif key.endswith("_type"):
+                    variable.set(str(fixed_value).upper())
                 else:
                     variable.set(fixed_value)
 
@@ -1517,16 +1601,16 @@ class BacktestWindow:
         fixed_suffix = "（本策略固定）"
         if is_ema_atr_breakout_strategy(strategy_id):
             self.entry_reference_ema_caption.configure(
-                text="跌破参考EMA周期" if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID else "突破参考EMA周期"
+                text="跌破参考线周期" if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID else "突破参考线周期"
             )
         else:
-            self.entry_reference_ema_caption.configure(text="挂单参考EMA")
+            self.entry_reference_ema_caption.configure(text="挂单参考线")
         label_map = {
             "bar": (self.bar_caption, "K线周期"),
             "signal_mode": (self.signal_caption, "信号方向"),
-            "ema_period": (self.ema_period_caption, "EMA小周期"),
-            "trend_ema_period": (self.trend_ema_period_caption, "EMA中周期"),
-            "big_ema_period": (self.big_ema_caption, "EMA大周期"),
+            "ema_period": (self.ema_period_caption, "快线均线"),
+            "trend_ema_period": (self.trend_ema_period_caption, "趋势均线"),
+            "big_ema_period": (self.big_ema_caption, "大周期均线"),
         }
         for key, (widget, base_text) in label_map.items():
             text = f"{base_text}{fixed_suffix}" if strategy_fixed_value(strategy_id, key) is not None else base_text
@@ -1718,15 +1802,37 @@ class BacktestWindow:
         )
         self.bar_combo.grid(row=row, column=5, sticky="ew")
         row += 1
-        self.ema_period_caption = ttk.Label(controls, text="EMA小周期")
+        self.ema_period_caption = ttk.Label(controls, text="快线均线")
         self.ema_period_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self.ema_period_entry = ttk.Entry(controls, textvariable=self.ema_period)
-        self.ema_period_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        self.trend_ema_period_caption = ttk.Label(controls, text="EMA中周期")
+        self.ema_period_frame = ttk.Frame(controls)
+        self.ema_period_frame.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.ema_period_frame.columnconfigure(1, weight=1)
+        self.ema_type_combo = ttk.Combobox(
+            self.ema_period_frame,
+            textvariable=self.ema_type,
+            values=MOVING_AVERAGE_TYPE_OPTIONS,
+            state="readonly",
+            width=6,
+        )
+        self.ema_type_combo.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.ema_period_entry = ttk.Entry(self.ema_period_frame, textvariable=self.ema_period)
+        self.ema_period_entry.grid(row=0, column=1, sticky="ew")
+        self.trend_ema_period_caption = ttk.Label(controls, text="趋势均线")
         self.trend_ema_period_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self.trend_ema_period_entry = ttk.Entry(controls, textvariable=self.trend_ema_period)
-        self.trend_ema_period_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
-        self.big_ema_caption = ttk.Label(controls, text="EMA大周期")
+        self.trend_ema_period_frame = ttk.Frame(controls)
+        self.trend_ema_period_frame.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.trend_ema_period_frame.columnconfigure(1, weight=1)
+        self.trend_ema_type_combo = ttk.Combobox(
+            self.trend_ema_period_frame,
+            textvariable=self.trend_ema_type,
+            values=MOVING_AVERAGE_TYPE_OPTIONS,
+            state="readonly",
+            width=6,
+        )
+        self.trend_ema_type_combo.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.trend_ema_period_entry = ttk.Entry(self.trend_ema_period_frame, textvariable=self.trend_ema_period)
+        self.trend_ema_period_entry.grid(row=0, column=1, sticky="ew")
+        self.big_ema_caption = ttk.Label(controls, text="大周期均线")
         self.big_ema_caption.grid(row=row, column=4, sticky="w", pady=(12, 0))
         self.big_ema_entry = ttk.Entry(controls, textvariable=self.big_ema_period)
         self.big_ema_entry.grid(row=row, column=5, sticky="ew", pady=(12, 0))
@@ -1750,10 +1856,24 @@ class BacktestWindow:
         self.signal_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
         self.signal_combo = ttk.Combobox(controls, textvariable=self.signal_mode_label, state="readonly")
         self.signal_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        self.entry_reference_ema_caption = ttk.Label(controls, text="挂单参考EMA")
+        self.entry_reference_ema_caption = ttk.Label(controls, text="挂单参考线")
         self.entry_reference_ema_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self.entry_reference_ema_entry = ttk.Entry(controls, textvariable=self.entry_reference_ema_period)
-        self.entry_reference_ema_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.entry_reference_ema_frame = ttk.Frame(controls)
+        self.entry_reference_ema_frame.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.entry_reference_ema_frame.columnconfigure(1, weight=1)
+        self.entry_reference_ema_type_combo = ttk.Combobox(
+            self.entry_reference_ema_frame,
+            textvariable=self.entry_reference_ema_type,
+            values=MOVING_AVERAGE_TYPE_OPTIONS,
+            state="readonly",
+            width=6,
+        )
+        self.entry_reference_ema_type_combo.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.entry_reference_ema_entry = ttk.Entry(
+            self.entry_reference_ema_frame,
+            textvariable=self.entry_reference_ema_period,
+        )
+        self.entry_reference_ema_entry.grid(row=0, column=1, sticky="ew")
 
         row += 1
         self.mtf_filter_bar_caption = ttk.Label(controls, text="高周期K线")
@@ -2330,7 +2450,7 @@ class BacktestWindow:
         manual_tree_scroll_y.grid(row=0, column=1, sticky="ns")
         manual_tree_scroll_x.grid(row=1, column=0, sticky="ew")
 
-        trades_notebook.add(trade_tab, text="已平仓")
+        trades_notebook.add(trade_tab, text="交易流水")
 
         self.chart_frame = ttk.LabelFrame(self.window, text="K线图、资金曲线与止盈止损触发位置 | 暂无选中回测", padding=12)
         self.chart_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
@@ -2642,6 +2762,11 @@ class BacktestWindow:
                     format_decimal_fixed(trade.r_multiple, 4),
                 ),
             )
+
+    def _populate_trade_tree_with_result(self, result: BacktestResult) -> None:
+        self.trade_tree.delete(*self.trade_tree.get_children())
+        for item_id, values in _build_trade_tree_rows(result):
+            self.trade_tree.insert("", END, iid=item_id, values=values)
 
     def _populate_manual_tree(self, result: BacktestResult, config: StrategyConfig) -> None:
         previous_selected = self._selected_manual_position()
@@ -3056,13 +3181,24 @@ class BacktestWindow:
         time_stop_break_even_enabled = False
         time_stop_break_even_bars = 0
         hold_close_exit_bars = 0
+        ema_type = str(self._resolve_strategy_parameter_value(strategy_id, "ema_type", self.ema_type.get().strip().lower()))
+        trend_ema_type = str(
+            self._resolve_strategy_parameter_value(strategy_id, "trend_ema_type", self.trend_ema_type.get().strip().lower())
+        )
+        entry_reference_ema_type = str(
+            self._resolve_strategy_parameter_value(
+                strategy_id,
+                "entry_reference_ema_type",
+                self.entry_reference_ema_type.get().strip().lower(),
+            )
+        )
         if strategy_uses_parameter(definition.strategy_id, "entry_reference_ema_period"):
             entry_reference_ema_period = self._parse_nonnegative_int(
                 self.entry_reference_ema_period.get(),
                 (
-                    "跌破参考EMA周期"
+                    "跌破参考线周期"
                     if definition.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID
-                    else ("突破参考EMA周期" if is_ema_atr_breakout_strategy(definition.strategy_id) else "挂单参考EMA")
+                    else ("突破参考线周期" if is_ema_atr_breakout_strategy(definition.strategy_id) else "挂单参考线")
                 ),
             )
         if strategy_uses_parameter(definition.strategy_id, "mtf_filter_bar"):
@@ -3116,20 +3252,22 @@ class BacktestWindow:
         return StrategyConfig(
             inst_id=self.symbol.get().strip().upper(),
             bar=str(self._resolve_strategy_parameter_value(strategy_id, "bar", _backtest_bar_value_from_label(self.bar_label.get()))),
+            ema_type=ema_type,
             ema_period=int(
                 self._resolve_strategy_parameter_value(
                     strategy_id,
                     "ema_period",
-                    self._parse_positive_int(self.ema_period.get(), "EMA小周期"),
+                    self._parse_positive_int(self.ema_period.get(), "快线均线周期"),
                 )
             ),
             trend_ema_period=int(
                 self._resolve_strategy_parameter_value(
                     strategy_id,
                     "trend_ema_period",
-                    self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期"),
+                    self._parse_positive_int(self.trend_ema_period.get(), "趋势均线周期"),
                 )
             ),
+            trend_ema_type=trend_ema_type,
             big_ema_period=(
                 int(
                     self._resolve_strategy_parameter_value(
@@ -3141,6 +3279,7 @@ class BacktestWindow:
                 if self._strategy_uses_big_ema(strategy_id)
                 else 0
             ),
+            entry_reference_ema_type=entry_reference_ema_type,
             entry_reference_ema_period=entry_reference_ema_period,
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
@@ -3265,7 +3404,12 @@ class BacktestWindow:
                 else:
                     widget.grid_remove()
             self._set_field_state(self.bar_combo, editable=strategy_is_parameter_editable(strategy_id, "bar", "backtest"))
+            self._set_field_state(self.ema_type_combo, editable=strategy_is_parameter_editable(strategy_id, "ema_type", "backtest"))
             self._set_field_state(self.ema_period_entry, editable=strategy_is_parameter_editable(strategy_id, "ema_period", "backtest"))
+            self._set_field_state(
+                self.trend_ema_type_combo,
+                editable=strategy_is_parameter_editable(strategy_id, "trend_ema_type", "backtest"),
+            )
             self._set_field_state(self.trend_ema_period_entry, editable=strategy_is_parameter_editable(strategy_id, "trend_ema_period", "backtest"))
             self._set_field_state(self.big_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "big_ema_period", "backtest"))
             self._set_field_state(self.signal_combo, editable=strategy_is_parameter_editable(strategy_id, "signal_mode", "backtest"))
@@ -3273,6 +3417,10 @@ class BacktestWindow:
             self._set_field_state(self.mtf_filter_fast_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_fast_ema_period", "backtest"))
             self._set_field_state(self.mtf_filter_slow_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_slow_ema_period", "backtest"))
             self._set_field_state(self.mtf_reversal_mode_combo, editable=strategy_is_parameter_editable(strategy_id, "mtf_reversal_mode", "backtest"))
+            self._set_field_state(
+                self.entry_reference_ema_type_combo,
+                editable=strategy_is_parameter_editable(strategy_id, "entry_reference_ema_type", "backtest"),
+            )
             self._set_field_state(
                 self.hold_close_exit_bars_entry,
                 editable=strategy_is_parameter_editable(strategy_id, "hold_close_exit_bars", "backtest"),
@@ -3618,7 +3766,7 @@ class BacktestWindow:
                 frame,
                 text=(
                     f"{snapshot.config.backtest_profile_summary}\n"
-                    f"EMA{snapshot.config.ema_period}/{snapshot.config.trend_ema_period} | "
+                    f"{snapshot.config.ema_label()}/{snapshot.config.trend_ema_label()} | "
                     f"ATR{snapshot.config.atr_period} | "
                     f"SL x{format_decimal(snapshot.config.atr_stop_multiplier)} | "
                     f"TP x{format_decimal(snapshot.config.atr_take_multiplier)}"
@@ -3703,7 +3851,7 @@ class BacktestWindow:
             ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
             ttk.Label(
                 param_frame,
-                text=f"挂单EMA\nEMA{entry_reference_ema}",
+                text=f"挂单参考线\n{current_snapshot.config.entry_reference_line_label()}",
                 anchor="center",
                 justify="center",
                 relief="ridge",
@@ -4185,6 +4333,9 @@ class BacktestWindow:
             f"\u5f00\u59cb\uff1a{start_text} | \u7ed3\u675f\uff1a{end_text} | "
             f"\u4fe1\u53f7\u65b9\u5411\uff1a{signal_label} | \u4ea4\u6613\u6b21\u6570\uff1a{result.report.total_trades}"
         )
+        open_position_summary = _build_open_position_summary(result)
+        if open_position_summary:
+            summary_text = f"{summary_text}\n{open_position_summary}"
         if result.data_source_note:
             summary_text = f"{summary_text}\n{result.data_source_note}"
         export_lines = _backtest_export_detail_lines(snapshot.export_path)
@@ -4193,7 +4344,7 @@ class BacktestWindow:
         self.report_summary.set(summary_text)
         self.report_text.delete("1.0", END)
         self.report_text.insert("1.0", format_backtest_report(result))
-        self._populate_trade_tree(result.trades)
+        self._populate_trade_tree_with_result(result)
         self._populate_manual_tree(result, snapshot.config)
         if self.compare_tree.exists(snapshot.snapshot_id):
             self.compare_tree.selection_set(snapshot.snapshot_id)
@@ -4389,6 +4540,7 @@ class BacktestWindow:
         visible_candles = candles[start_index:end_index]
         visible_ema = result.ema_values[start_index:end_index]
         visible_trend_ema = result.trend_ema_values[start_index:end_index]
+        visible_reference_ema = result.entry_reference_ema_values[start_index:end_index]
         visible_big_ema = (
             result.big_ema_values[start_index:end_index]
             if self._strategy_uses_big_ema(result.strategy_id)
@@ -4406,9 +4558,10 @@ class BacktestWindow:
         )
 
         plotted_prices = [float(candle.high) for candle in visible_candles] + [float(candle.low) for candle in visible_candles]
-        plotted_prices.extend(float(value) for value in visible_ema)
-        plotted_prices.extend(float(value) for value in visible_trend_ema)
-        plotted_prices.extend(float(value) for value in visible_big_ema)
+        plotted_prices.extend(float(value) for value in visible_ema if value is not None)
+        plotted_prices.extend(float(value) for value in visible_trend_ema if value is not None)
+        plotted_prices.extend(float(value) for value in visible_reference_ema if value is not None)
+        plotted_prices.extend(float(value) for value in visible_big_ema if value is not None)
         for trade in result.trades:
             if trade.exit_index < start_index or trade.entry_index >= end_index:
                 continue
@@ -4527,18 +4680,32 @@ class BacktestWindow:
         ema_points: list[float] = []
         if visible_ema:
             for index, ema_value in enumerate(visible_ema, start=start_index):
+                if ema_value is None:
+                    continue
                 x = x_for(index)
                 ema_points.extend((x, y_for(ema_value)))
 
         trend_ema_points: list[float] = []
         if visible_trend_ema:
             for index, trend_ema_value in enumerate(visible_trend_ema, start=start_index):
+                if trend_ema_value is None:
+                    continue
                 x = x_for(index)
                 trend_ema_points.extend((x, y_for(trend_ema_value)))
+
+        reference_ema_points: list[float] = []
+        if visible_reference_ema:
+            for index, reference_ema_value in enumerate(visible_reference_ema, start=start_index):
+                if reference_ema_value is None:
+                    continue
+                x = x_for(index)
+                reference_ema_points.extend((x, y_for(reference_ema_value)))
 
         big_ema_points: list[float] = []
         if visible_big_ema:
             for index, big_ema_value in enumerate(visible_big_ema, start=start_index):
+                if big_ema_value is None:
+                    continue
                 x = x_for(index)
                 big_ema_points.extend((x, y_for(big_ema_value)))
 
@@ -4599,6 +4766,51 @@ class BacktestWindow:
                     text="TP" if trade.exit_reason == "take_profit" else "SL",
                     anchor="w",
                     fill=exit_color,
+                )
+
+        if result.open_position is not None and result.candles:
+            open_position = result.open_position
+            current_index = len(result.candles) - 1
+            entry_visible = start_index <= open_position.entry_index < end_index
+            current_visible = start_index <= current_index < end_index
+            if entry_visible or current_visible:
+                entry_x = x_for(open_position.entry_index) if entry_visible else left
+                current_x = x_for(current_index) if current_visible else (width - right)
+                entry_y = y_for(open_position.entry_price)
+                current_y = y_for(open_position.current_price)
+                open_color = "#bc4c00" if open_position.signal == "short" else "#0b7285"
+                pnl_color = "#1a7f37" if open_position.pnl >= 0 else "#d1242f"
+                if entry_visible:
+                    canvas.create_oval(
+                        entry_x - 5,
+                        entry_y - 5,
+                        entry_x + 5,
+                        entry_y + 5,
+                        fill=open_color,
+                        outline="",
+                    )
+                canvas.create_line(entry_x, entry_y, current_x, current_y, fill=open_color, width=3, dash=(6, 3))
+                canvas.create_polygon(
+                    current_x,
+                    current_y - 8,
+                    current_x - 7,
+                    current_y,
+                    current_x,
+                    current_y + 8,
+                    current_x + 7,
+                    current_y,
+                    fill=open_color,
+                    outline="",
+                )
+                label_anchor = "w" if current_x < (width - right - 42) else "e"
+                label_x = current_x + 10 if label_anchor == "w" else current_x - 10
+                canvas.create_text(
+                    label_x,
+                    current_y - 12,
+                    text=f"OPEN {format_decimal_fixed(open_position.pnl, 2)}",
+                    anchor=label_anchor,
+                    fill=pnl_color,
+                    font=("Microsoft YaHei UI", 10, "bold"),
                 )
 
         selected_manual_position = self._selected_manual_position()
@@ -4694,7 +4906,7 @@ class BacktestWindow:
             canvas.create_text(
                 width - right,
                 top + 12,
-                text=f"EMA({result.ema_period})",
+                text=f"{result.ema_type.upper()}({result.ema_period})",
                 anchor="ne",
                 fill="#ff8c00",
                 font=("Microsoft YaHei UI", 10, "bold"),
@@ -4704,16 +4916,39 @@ class BacktestWindow:
             canvas.create_text(
                 width - right,
                 top + 30,
-                text=f"EMA({result.trend_ema_period})",
+                text=f"{result.trend_ema_type.upper()}({result.trend_ema_period})",
                 anchor="ne",
                 fill="#0a7f5a",
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
+        if (
+            len(reference_ema_points) >= 4
+            and not (
+                result.entry_reference_ema_period == result.ema_period
+                and str(result.entry_reference_ema_type).lower() == str(result.ema_type).lower()
+            )
+        ):
+            canvas.create_line(*reference_ema_points, fill="#7c3aed", width=2, dash=(6, 3), smooth=not fast_mode)
+            canvas.create_text(
+                width - right,
+                top + 48,
+                text=f"{result.entry_reference_ema_type.upper()}({result.entry_reference_ema_period})",
+                anchor="ne",
+                fill="#7c3aed",
                 font=("Microsoft YaHei UI", 10, "bold"),
             )
         if len(big_ema_points) >= 4:
             canvas.create_line(*big_ema_points, fill="#8b5cf6", width=2, smooth=not fast_mode)
             canvas.create_text(
                 width - right,
-                top + 48,
+                top + (
+                    66
+                    if not (
+                        result.entry_reference_ema_period == result.ema_period
+                        and str(result.entry_reference_ema_type).lower() == str(result.ema_type).lower()
+                    )
+                    else 48
+                ),
                 text=f"EMA({result.big_ema_period})",
                 anchor="ne",
                 fill="#8b5cf6",
@@ -4757,12 +4992,17 @@ class BacktestWindow:
         ema_value = (
             self._latest_result.ema_values[hover_index]
             if hover_index < len(self._latest_result.ema_values)
-            else Decimal("0")
+            else None
         )
         trend_ema_value = (
             self._latest_result.trend_ema_values[hover_index]
             if hover_index < len(self._latest_result.trend_ema_values)
-            else Decimal("0")
+            else None
+        )
+        reference_ema_value = (
+            self._latest_result.entry_reference_ema_values[hover_index]
+            if hover_index < len(self._latest_result.entry_reference_ema_values)
+            else None
         )
         atr_value = (
             self._latest_result.atr_values[hover_index]
@@ -4795,12 +5035,17 @@ class BacktestWindow:
             candle=candle,
             ema_value=ema_value,
             trend_ema_value=trend_ema_value,
+            reference_ema_value=reference_ema_value,
             big_ema_value=big_ema_value,
             atr_value=atr_value,
             equity_value=equity_value,
             drawdown_pct_value=drawdown_pct_value,
+            ema_type=str(self._latest_result.ema_type),
             ema_period=str(self._latest_result.ema_period),
+            trend_ema_type=str(self._latest_result.trend_ema_type),
             trend_ema_period=str(self._latest_result.trend_ema_period),
+            reference_ema_type=str(self._latest_result.entry_reference_ema_type),
+            reference_ema_period=str(self._latest_result.entry_reference_ema_period),
             big_ema_period=big_ema_period,
             atr_period=str(self._latest_result.atr_period),
             tick_size=self._latest_result.instrument.tick_size,
@@ -4911,8 +5156,8 @@ class BacktestWindow:
             f"K线：{_normalize_backtest_bar_label(config.bar)} | 方向：{signal_label}"
         )
         metrics_parts = [
-            f"挂单EMA：EMA{entry_reference_ema}",
-            f"指标：EMA{result.ema_period} / 趋势EMA{result.trend_ema_period} / ATR{result.atr_period}",
+            f"挂单参考线：{config.entry_reference_line_label()}",
+            f"指标：{moving_average_display_label(result.ema_type, result.ema_period)} / {moving_average_display_label(result.trend_ema_type, result.trend_ema_period)} / ATR{result.atr_period}",
             f"止损：{format_decimal(config.atr_stop_multiplier)} ATR",
             f"止盈：{take_profit_label}",
         ]
@@ -5238,42 +5483,19 @@ def _chart_hover_index_for_x(
 def _format_chart_hover_lines(
     *,
     candle,
-    ema_value: Decimal,
-    trend_ema_value: Decimal,
-    big_ema_value: Decimal,
-    equity_value: Decimal,
-    drawdown_pct_value: Decimal,
-    ema_period: str,
-    trend_ema_period: str,
-    big_ema_period: str,
-    tick_size: Decimal,
-) -> list[str]:
-    return [
-        f"时间: {_format_chart_timestamp(candle.ts)}",
-        (
-            "开/高/低/收: "
-            f"{format_decimal(candle.open)} / {format_decimal(candle.high)} / "
-            f"{format_decimal(candle.low)} / {format_decimal(candle.close)}"
-        ),
-        f"EMA({ema_period}): {_format_price_by_tick_size(ema_value, tick_size)}",
-        f"EMA({trend_ema_period}): {_format_price_by_tick_size(trend_ema_value, tick_size)}",
-        f"EMA({big_ema_period}): {_format_price_by_tick_size(big_ema_value, tick_size)}",
-        f"净值曲线: {format_decimal_fixed(equity_value, 2)}",
-        f"当前回撤: {format_decimal_fixed(drawdown_pct_value, 2)}%",
-    ]
-
-
-def _format_chart_hover_lines(
-    *,
-    candle,
-    ema_value: Decimal,
-    trend_ema_value: Decimal,
+    ema_value: Decimal | None,
+    trend_ema_value: Decimal | None,
+    reference_ema_value: Decimal | None,
     big_ema_value: Decimal | None,
     atr_value: Decimal | None,
     equity_value: Decimal,
     drawdown_pct_value: Decimal,
+    ema_type: str,
     ema_period: str,
+    trend_ema_type: str,
     trend_ema_period: str,
+    reference_ema_type: str,
+    reference_ema_period: str,
     big_ema_period: str | None,
     atr_period: str,
     tick_size: Decimal,
@@ -5285,9 +5507,24 @@ def _format_chart_hover_lines(
             f"{format_decimal(candle.open)} / {format_decimal(candle.high)} / "
             f"{format_decimal(candle.low)} / {format_decimal(candle.close)}"
         ),
-        f"EMA({ema_period}): {_format_price_by_tick_size(ema_value, tick_size)}",
-        f"EMA({trend_ema_period}): {_format_price_by_tick_size(trend_ema_value, tick_size)}",
     ]
+    if ema_value is not None:
+        lines.append(f"{str(ema_type).upper()}({ema_period}): {_format_price_by_tick_size(ema_value, tick_size)}")
+    if trend_ema_value is not None:
+        lines.append(
+            f"{str(trend_ema_type).upper()}({trend_ema_period}): {_format_price_by_tick_size(trend_ema_value, tick_size)}"
+        )
+    if (
+        reference_ema_value is not None
+        and not (
+            str(reference_ema_type).lower() == str(ema_type).lower()
+            and str(reference_ema_period) == str(ema_period)
+        )
+    ):
+        lines.append(
+            f"{str(reference_ema_type).upper()}({reference_ema_period}): "
+            f"{_format_price_by_tick_size(reference_ema_value, tick_size)}"
+        )
     if atr_value is not None:
         lines.append(f"ATR({atr_period}): {_format_price_by_tick_size(atr_value, tick_size)}")
     if big_ema_value is not None and big_ema_period:

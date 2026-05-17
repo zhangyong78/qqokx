@@ -3910,8 +3910,7 @@ class StrategyEngine:
         )
         if is_dynamic_strategy_id(config.strategy_id):
             message = (
-                f"{message} | 趋势EMA={config.trend_ema_period} | "
-                f"挂单参考EMA={config.resolved_entry_reference_ema_period()}"
+                f"{message} | 趋势均线={config.trend_ema_label()} | 挂单参考线={config.entry_reference_line_label()}"
             )
         self._logger(message)
 
@@ -4674,7 +4673,7 @@ def recommended_indicator_lookback(*periods: int) -> int:
 
 
 def _dynamic_entry_reference_ema_text(config: StrategyConfig) -> str:
-    return f"EMA{config.resolved_entry_reference_ema_period()}"
+    return config.entry_reference_line_label()
 
 
 def _decimal_places_for_tick_size(tick_size: Decimal) -> int:

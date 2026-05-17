@@ -24,8 +24,8 @@ from okx_quant.analysis.structure_models import (
     TrendlineCandidate,
     TriangleCandidate,
 )
-from okx_quant.indicators import ema
-from okx_quant.models import Candle
+from okx_quant.indicators import moving_average
+from okx_quant.models import Candle, moving_average_display_label
 from okx_quant.pricing import format_decimal, format_decimal_by_increment
 
 DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT = 240
@@ -62,7 +62,7 @@ class StrategyLiveChartOverlaySeries:
     key: str
     label: str
     color: str
-    values: tuple[Decimal, ...]
+    values: tuple[Decimal | None, ...]
 
 
 @dataclass(frozen=True)
@@ -173,8 +173,11 @@ def build_strategy_live_chart_snapshot(
     *,
     session_id: str,
     candles: list[Candle] | tuple[Candle, ...],
+    ema_type: str = "ema",
     ema_period: int | None = None,
+    trend_ema_type: str = "ema",
     trend_ema_period: int | None = None,
+    reference_ema_type: str = "ema",
     reference_ema_period: int | None = None,
     pending_entry_prices: tuple[Decimal, ...] = (),
     entry_price: Decimal | None = None,
@@ -187,30 +190,31 @@ def build_strategy_live_chart_snapshot(
 ) -> StrategyLiveChartSnapshot:
     candle_items = tuple(candles)
     series: list[StrategyLiveChartOverlaySeries] = []
-    used_periods: set[int] = set()
+    used_lines: set[tuple[str, int]] = set()
     close_values = [item.close for item in candle_items]
-    for key, period, color in (
-        ("ema_fast", ema_period, "#f59f00"),
-        ("ema_trend", trend_ema_period, "#0b7285"),
-        ("ema_reference", reference_ema_period, "#7c3aed"),
+    for key, ma_type, period, color in (
+        ("ema_fast", ema_type, ema_period, "#f59f00"),
+        ("ema_trend", trend_ema_type, trend_ema_period, "#0b7285"),
+        ("ema_reference", reference_ema_type, reference_ema_period, "#7c3aed"),
     ):
         if not candle_items:
             break
         normalized_period = _normalize_period(period)
-        if normalized_period is None or normalized_period in used_periods:
+        normalized_type = str(ma_type or "ema").strip().lower()
+        if normalized_period is None or (normalized_type, normalized_period) in used_lines:
             continue
-        values = tuple(ema(close_values, normalized_period))
+        values = tuple(moving_average(close_values, normalized_period, normalized_type))
         if len(values) != len(candle_items):
             continue
         series.append(
             StrategyLiveChartOverlaySeries(
                 key=key,
-                label=f"EMA{normalized_period}",
+                label=moving_average_display_label(normalized_type, normalized_period),
                 color=color,
                 values=values,
             )
         )
-        used_periods.add(normalized_period)
+        used_lines.add((normalized_type, normalized_period))
 
     markers: list[StrategyLiveChartMarker] = []
     seen_marker_keys: set[tuple[str, Decimal]] = set()
@@ -796,6 +800,8 @@ def render_strategy_live_chart(
         n_pts = min(len(series.values), plot_end)
         for index in range(n_pts):
             value = series.values[index]
+            if not isinstance(value, Decimal):
+                continue
             x = bounds.left + (index + 0.5) * candle_step
             y = _price_to_y(value, lower, upper, bounds)
             points.extend((x, y))

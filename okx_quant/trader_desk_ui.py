@@ -513,15 +513,15 @@ def _entry_reference_ema_label(snapshot: dict[str, object]) -> str:
     if raw_period.isdigit() and int(raw_period) > 0:
         return f"EMA{int(raw_period)}"
     ema_period = _snapshot_text(snapshot, "ema_period")
-    return f"跟随EMA小周期(EMA{ema_period})"
+    return f"跟随快线(EMA{ema_period})"
 
 
 def _entry_reference_ema_caption(strategy_id: str) -> str:
     if is_dynamic_strategy_id(strategy_id):
-        return "挂单参考EMA"
+        return "挂单参考线"
     if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(strategy_id):
-        return "突破参考EMA"
-    return "参考EMA周期"
+        return "突破参考线"
+    return "参考线周期"
 
 
 def _startup_chase_window_label(snapshot: dict[str, object]) -> str:

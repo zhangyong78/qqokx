@@ -19,6 +19,21 @@ RunMode = Literal["trade", "signal_only"]
 BacktestSizingMode = Literal["fixed_risk", "fixed_size", "risk_percent"]
 TakeProfitMode = Literal["fixed", "dynamic"]
 MtfReversalMode = Literal["ignore", "block_new_entries"]
+MovingAverageType = Literal["ema", "ma"]
+
+
+def normalize_moving_average_type(value: str | None) -> MovingAverageType:
+    return "ma" if str(value or "").strip().lower() == "ma" else "ema"
+
+
+def moving_average_display_label(
+    ma_type: str | None,
+    period: int,
+    *,
+    with_parentheses: bool = False,
+) -> str:
+    prefix = "MA" if normalize_moving_average_type(ma_type) == "ma" else "EMA"
+    return f"{prefix}({period})" if with_parentheses else f"{prefix}{period}"
 
 
 @dataclass(frozen=True)
@@ -70,7 +85,9 @@ class StrategyConfig:
     position_mode: PositionMode
     environment: EnvironmentMode
     tp_sl_trigger_type: TriggerPriceType
+    ema_type: MovingAverageType = "ema"
     trend_ema_period: int = 55
+    trend_ema_type: MovingAverageType = "ema"
     big_ema_period: int = 233
     strategy_id: str = "ema_dynamic_order"
     poll_seconds: float = 3.0
@@ -91,6 +108,7 @@ class StrategyConfig:
     take_profit_mode: TakeProfitMode = "dynamic"
     max_entries_per_trend: int = 1
     entry_reference_ema_period: int = 55
+    entry_reference_ema_type: MovingAverageType = "ema"
     dynamic_two_r_break_even: bool = True
     dynamic_fee_offset_enabled: bool = True
     startup_chase_window_seconds: int = 0
@@ -126,6 +144,23 @@ class StrategyConfig:
             return self.entry_reference_ema_period
         return self.ema_period
 
+    def resolved_ema_type(self) -> MovingAverageType:
+        return normalize_moving_average_type(self.ema_type)
+
+    def resolved_trend_ema_type(self) -> MovingAverageType:
+        return normalize_moving_average_type(self.trend_ema_type)
+
+    def resolved_entry_reference_ema_type(self) -> MovingAverageType:
+        if self.entry_reference_ema_period > 0:
+            return normalize_moving_average_type(self.entry_reference_ema_type)
+        return self.resolved_ema_type()
+
+    def ema_label(self) -> str:
+        return moving_average_display_label(self.resolved_ema_type(), self.ema_period)
+
+    def trend_ema_label(self) -> str:
+        return moving_average_display_label(self.resolved_trend_ema_type(), self.trend_ema_period)
+
     def resolved_mtf_filter_inst_id(self) -> str:
         return (self.mtf_filter_inst_id or self.inst_id).strip()
 
@@ -142,11 +177,18 @@ class StrategyConfig:
             return self.backtest_exit_slippage_rate
         return self.backtest_slippage_rate
 
+    def entry_reference_line_label(self) -> str:
+        resolved_period = self.resolved_entry_reference_ema_period()
+        resolved_type = self.resolved_entry_reference_ema_type()
+        if self.entry_reference_ema_period > 0:
+            return moving_average_display_label(resolved_type, resolved_period)
+        return f"跟随快线({moving_average_display_label(resolved_type, resolved_period)})"
+
     def entry_reference_ema_label(self) -> str:
         resolved_period = self.resolved_entry_reference_ema_period()
         if self.entry_reference_ema_period > 0:
             return f"EMA{resolved_period}"
-        return f"跟随EMA小周期(EMA{resolved_period})"
+        return f"跟随快线(EMA{resolved_period})"
 
     def dynamic_two_r_break_even_label(self) -> str:
         return "\u5f00\u542f" if self.dynamic_two_r_break_even else "\u5173\u95ed"

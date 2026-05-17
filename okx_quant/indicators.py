@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from okx_quant.models import Candle
+from okx_quant.models import Candle, normalize_moving_average_type
 
 
 def ema(values: list[Decimal], period: int) -> list[Decimal]:
@@ -34,6 +34,13 @@ def sma(values: list[Decimal], period: int) -> list[Decimal | None]:
         if index >= period - 1:
             result[index] = running_sum / Decimal(period)
     return result
+
+
+def moving_average(values: list[Decimal], period: int, ma_type: str = "ema") -> list[Decimal | None]:
+    normalized_type = normalize_moving_average_type(ma_type)
+    if normalized_type == "ma":
+        return sma(values, period)
+    return list(ema(values, period))
 
 
 def macd(

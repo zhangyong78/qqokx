@@ -47,6 +47,7 @@ from okx_quant.backtest_ui import (
     _build_backtest_symbol_options,
     _build_backtest_compare_detail,
     _build_backtest_compare_row,
+    _build_open_position_summary,
     _filter_manual_positions,
     _has_extension_stats,
     _build_manual_pool_summary,
@@ -878,6 +879,72 @@ class BacktestTest(TestCase):
         self.assertIn(f"预热K线：前 {BACKTEST_RESERVED_CANDLES} 根", format_backtest_report(result))
         self.assertEqual(client.history_limits, [len(candles)])
 
+    def test_cross_backtest_preserves_terminal_open_position_for_audit_exports(self) -> None:
+        warmup_candles = [
+            Candle(index, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True)
+            for index in range(1, BACKTEST_RESERVED_CANDLES + 1)
+        ]
+        terminal_entry_candles = [
+            Candle(1, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(2, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(3, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+            Candle(4, Decimal("99"), Decimal("100"), Decimal("98"), Decimal("99"), Decimal("1"), True),
+        ]
+        candles = warmup_candles + [
+            Candle(
+                BACKTEST_RESERVED_CANDLES + candle.ts,
+                candle.open,
+                candle.high,
+                candle.low,
+                candle.close,
+                candle.volume,
+                candle.confirmed,
+            )
+            for candle in terminal_entry_candles
+        ]
+        client = DummyBacktestClient(candles, self._build_instrument())
+        config = replace(
+            self._build_config(ema_period=2, atr_period=2),
+            strategy_id=STRATEGY_EMA_BREAKDOWN_SHORT_ID,
+            signal_mode="short_only",
+            trend_ema_period=3,
+            big_ema_period=0,
+            entry_reference_ema_period=2,
+            take_profit_mode="dynamic",
+            max_entries_per_trend=0,
+            order_size=Decimal("0"),
+            risk_amount=Decimal("10"),
+        )
+
+        result = run_backtest(client, config, candle_limit=len(candles))
+
+        self.assertIsNotNone(result.open_position)
+        assert result.open_position is not None
+        self.assertEqual(result.open_position.signal, "short")
+        self.assertEqual(result.open_position.entry_index, len(candles) - 1)
+        self.assertEqual(result.report.total_trades, 0)
+
+        with TemporaryDirectory() as temp_dir:
+            original_export_dir = backtest_export_module.backtest_report_export_dir_path
+            backtest_export_module.backtest_report_export_dir_path = lambda base_dir=None: Path(temp_dir)
+            try:
+                exported = export_single_backtest_report(
+                    result,
+                    config,
+                    len(candles),
+                    exported_at=datetime(2026, 5, 17, 12, 0, 0),
+                )
+                artifact_paths = single_backtest_artifact_paths(exported)
+                operations_text = artifact_paths["operations"].read_text(encoding="utf-8-sig")
+                capital_text = artifact_paths["capital"].read_text(encoding="utf-8-sig")
+                manifest_payload = json.loads(artifact_paths["manifest"].read_text(encoding="utf-8"))
+            finally:
+                backtest_export_module.backtest_report_export_dir_path = original_export_dir
+
+        self.assertIn("open_position_snapshot", operations_text)
+        self.assertEqual(manifest_payload["counts"]["terminal_open_position_count"], 1)
+        self.assertIn(",1,0,1", capital_text)
+
     def test_cross_backtest_applies_taker_fees_on_entry_and_exit(self) -> None:
         warmup_candles = [
             Candle(index, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True)
@@ -1018,6 +1085,131 @@ class BacktestTest(TestCase):
         self.assertIn("当前时间：", report_text)
         self.assertIn("开仓数量：2.0000", report_text)
         self.assertIn("浮动盈亏：9.5000", report_text)
+
+    def test_build_open_position_summary_highlights_terminal_position(self) -> None:
+        result = BacktestResult(
+            candles=[
+                Candle(1730000000000, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+                Candle(1730003600000, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+            ],
+            trades=[],
+            report=BacktestReport(
+                total_trades=0,
+                win_trades=0,
+                loss_trades=0,
+                breakeven_trades=0,
+                win_rate=Decimal("0"),
+                total_pnl=Decimal("0"),
+                average_pnl=Decimal("0"),
+                gross_profit=Decimal("0"),
+                gross_loss=Decimal("0"),
+                profit_factor=None,
+                average_win=Decimal("0"),
+                average_loss=Decimal("0"),
+                profit_loss_ratio=None,
+                average_r_multiple=Decimal("0"),
+                max_drawdown=Decimal("0"),
+            ),
+            instrument=self._build_instrument(),
+            open_position=BacktestOpenPosition(
+                signal="short",
+                entry_index=0,
+                entry_ts=1730000000000,
+                current_ts=1730003600000,
+                entry_price=Decimal("100"),
+                current_price=Decimal("95"),
+                stop_loss=Decimal("105"),
+                take_profit=Decimal("90"),
+                initial_stop_loss=Decimal("105"),
+                initial_take_profit=Decimal("90"),
+                size=Decimal("2"),
+                gross_pnl=Decimal("10"),
+                pnl=Decimal("9.5"),
+                risk_value=Decimal("10"),
+                r_multiple=Decimal("0.95"),
+                entry_fee=Decimal("0.5"),
+                funding_cost=Decimal("0.1"),
+            ),
+        )
+
+        summary_text = _build_open_position_summary(result)
+
+        self.assertIn("期末未平仓", summary_text)
+        self.assertIn("做空", summary_text)
+        self.assertIn("浮盈亏=9.5000", summary_text)
+
+    def test_build_trade_tree_rows_appends_open_position_snapshot(self) -> None:
+        trade = BacktestTrade(
+            signal="short",
+            entry_index=0,
+            exit_index=1,
+            entry_ts=1730000000000,
+            exit_ts=1730003600000,
+            entry_price=Decimal("100"),
+            exit_price=Decimal("98"),
+            stop_loss=Decimal("105"),
+            take_profit=Decimal("90"),
+            size=Decimal("2"),
+            gross_pnl=Decimal("4"),
+            pnl=Decimal("3.5"),
+            risk_value=Decimal("10"),
+            r_multiple=Decimal("0.35"),
+            exit_reason="stop_loss",
+            atr_value=Decimal("1.5"),
+            total_fee=Decimal("0.5"),
+        )
+        result = BacktestResult(
+            candles=[
+                Candle(1730000000000, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+                Candle(1730003600000, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+            ],
+            trades=[trade],
+            report=BacktestReport(
+                total_trades=1,
+                win_trades=0,
+                loss_trades=1,
+                breakeven_trades=0,
+                win_rate=Decimal("0"),
+                total_pnl=Decimal("3.5"),
+                average_pnl=Decimal("3.5"),
+                gross_profit=Decimal("0"),
+                gross_loss=Decimal("3.5"),
+                profit_factor=None,
+                average_win=Decimal("0"),
+                average_loss=Decimal("3.5"),
+                profit_loss_ratio=None,
+                average_r_multiple=Decimal("0.35"),
+                max_drawdown=Decimal("0"),
+            ),
+            instrument=self._build_instrument(),
+            open_position=BacktestOpenPosition(
+                signal="short",
+                entry_index=1,
+                entry_ts=1730003600000,
+                current_ts=1730003600000,
+                entry_price=Decimal("101"),
+                current_price=Decimal("95"),
+                stop_loss=Decimal("105"),
+                take_profit=Decimal("90"),
+                initial_stop_loss=Decimal("105"),
+                initial_take_profit=Decimal("90"),
+                size=Decimal("2"),
+                gross_pnl=Decimal("12"),
+                pnl=Decimal("11.5"),
+                risk_value=Decimal("8"),
+                r_multiple=Decimal("1.4375"),
+                entry_fee=Decimal("0.5"),
+                funding_cost=Decimal("0"),
+            ),
+        )
+
+        rows = backtest_ui_module._build_trade_tree_rows(result)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[-1][0], "OPEN")
+        self.assertEqual(rows[-1][1][0], "OPEN")
+        self.assertEqual(rows[-1][1][7], _format_chart_timestamp(1730003600000))
+        self.assertEqual(rows[-1][1][11], "11.5000")
 
     def test_backtest_rejects_more_than_10000_candles(self) -> None:
         candles = [
@@ -1497,6 +1689,42 @@ class BacktestTest(TestCase):
         report_text = format_backtest_report(result)
         self.assertIn("EMA2/EMA3", report_text)
         self.assertIn("动态止损", report_text)
+
+    def test_ema5_ema8_backtest_preserves_terminal_open_position(self) -> None:
+        warmup_candles = [
+            Candle(index, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True)
+            for index in range(1, BACKTEST_RESERVED_CANDLES + 1)
+        ]
+        terminal_entry_candles = [
+            Candle(1, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(2, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(3, Decimal("99"), Decimal("100"), Decimal("98"), Decimal("99"), Decimal("1"), True),
+            Candle(4, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+        ]
+        candles = warmup_candles + [
+            Candle(
+                BACKTEST_RESERVED_CANDLES + candle.ts,
+                candle.open,
+                candle.high,
+                candle.low,
+                candle.close,
+                candle.volume,
+                candle.confirmed,
+            )
+            for candle in terminal_entry_candles
+        ]
+        client = DummyBacktestClient(candles, self._build_instrument())
+
+        result = run_backtest(
+            client,
+            replace(self._build_ema5_ema8_config(signal_mode="long_only"), risk_amount=Decimal("10")),
+            candle_limit=len(candles),
+        )
+
+        self.assertIsNotNone(result.open_position)
+        assert result.open_position is not None
+        self.assertEqual(result.open_position.signal, "long")
+        self.assertEqual(result.open_position.entry_index, len(candles) - 1)
 
     def test_same_candle_short_fill_on_bullish_candle_does_not_take_profit_before_entry(self) -> None:
         position = _OpenPosition(

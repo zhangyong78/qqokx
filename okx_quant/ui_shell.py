@@ -415,6 +415,7 @@ TAKE_PROFIT_MODE_OPTIONS = {
     "固定止盈": "fixed",
     "动态止盈": "dynamic",
 }
+MOVING_AVERAGE_TYPE_OPTIONS = ("EMA", "MA")
 MTF_REVERSAL_MODE_OPTIONS = {
     "只过滤新开仓": "block_new_entries",
 }
@@ -1198,6 +1199,7 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
     return StrategyConfig(
         inst_id=inst_id,
         bar=bar,
+        ema_type=_coerce_snapshot_text(payload.get("ema_type"), "ema"),
         ema_period=_coerce_snapshot_int(payload.get("ema_period"), 21, minimum=1),
         atr_period=_coerce_snapshot_int(payload.get("atr_period"), 10, minimum=1),
         atr_stop_multiplier=_coerce_snapshot_decimal(payload.get("atr_stop_multiplier"), Decimal("2")),
@@ -1208,6 +1210,7 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
         position_mode=_coerce_snapshot_text(payload.get("position_mode"), "net"),
         environment=_coerce_snapshot_text(payload.get("environment"), "demo"),
         tp_sl_trigger_type=_coerce_snapshot_text(payload.get("tp_sl_trigger_type"), "mark"),
+        trend_ema_type=_coerce_snapshot_text(payload.get("trend_ema_type"), "ema"),
         trend_ema_period=_coerce_snapshot_int(
             payload.get("trend_ema_period"),
             int(_strategy_config_default("trend_ema_period")),
@@ -1284,6 +1287,10 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             payload.get("entry_reference_ema_period"),
             int(_strategy_config_default("entry_reference_ema_period")),
             minimum=1,
+        ),
+        entry_reference_ema_type=_coerce_snapshot_text(
+            payload.get("entry_reference_ema_type"),
+            _coerce_snapshot_text(payload.get("ema_type"), "ema"),
         ),
         dynamic_two_r_break_even=_coerce_snapshot_bool(
             payload.get("dynamic_two_r_break_even"),
@@ -2456,9 +2463,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.trade_symbol = StringVar(value=self._default_launch_symbol)
         self.local_tp_sl_symbol = StringVar(value="")
         self.bar = StringVar(value="15m")
+        self.ema_type = StringVar(value="EMA")
         self.ema_period = StringVar(value="21")
+        self.trend_ema_type = StringVar(value="EMA")
         self.trend_ema_period = StringVar(value="55")
         self.big_ema_period = StringVar(value="233")
+        self.entry_reference_ema_type = StringVar(value="EMA")
         self.entry_reference_ema_period = StringVar(value="55")
         self.mtf_filter_bar = StringVar(value="1H")
         self.mtf_filter_fast_ema_period = StringVar(value="21")
@@ -2499,9 +2509,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.strategy_name.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.bar.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.signal_mode_label.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.ema_type.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.trend_ema_type.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.trend_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.big_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.entry_reference_ema_type.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.entry_reference_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.mtf_filter_bar.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.mtf_filter_fast_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
@@ -2517,9 +2530,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.take_profit_mode_label.trace_add("write", self._update_dynamic_protection_hint)
         self.max_entries_per_trend.trace_add("write", self._update_launch_parameter_hint)
         self.startup_chase_window_seconds.trace_add("write", self._update_launch_parameter_hint)
+        self.ema_type.trace_add("write", self._update_trend_parameter_hint)
         self.ema_period.trace_add("write", self._update_trend_parameter_hint)
+        self.trend_ema_type.trace_add("write", self._update_trend_parameter_hint)
         self.trend_ema_period.trace_add("write", self._update_trend_parameter_hint)
         self.big_ema_period.trace_add("write", self._update_trend_parameter_hint)
+        self.entry_reference_ema_type.trace_add("write", self._update_trend_parameter_hint)
         self.entry_reference_ema_period.trace_add("write", self._update_trend_parameter_hint)
         self.mtf_filter_bar.trace_add("write", self._update_trend_parameter_hint)
         self.mtf_filter_fast_ema_period.trace_add("write", self._update_trend_parameter_hint)
@@ -2752,12 +2768,15 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         return {
             "bar": self.bar,
             "signal_mode": self.signal_mode_label,
+            "ema_type": self.ema_type,
             "ema_period": self.ema_period,
+            "trend_ema_type": self.trend_ema_type,
             "trend_ema_period": self.trend_ema_period,
             "big_ema_period": self.big_ema_period,
             "atr_period": self.atr_period,
             "atr_stop_multiplier": self.stop_atr,
             "atr_take_multiplier": self.take_atr,
+            "entry_reference_ema_type": self.entry_reference_ema_type,
             "entry_reference_ema_period": self.entry_reference_ema_period,
             "mtf_filter_bar": self.mtf_filter_bar,
             "mtf_filter_fast_ema_period": self.mtf_filter_fast_ema_period,
@@ -2811,6 +2830,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 variable.set(_reverse_lookup_label(TAKE_PROFIT_MODE_OPTIONS, str(default_value), self.take_profit_mode_label.get()))
             elif key == "mtf_reversal_mode":
                 variable.set(_reverse_lookup_label(MTF_REVERSAL_MODE_OPTIONS, str(default_value), self.mtf_reversal_mode_label.get()))
+            elif key.endswith("_type"):
+                variable.set(str(default_value).upper())
             else:
                 variable.set(default_value)
         for key in iter_strategy_parameter_keys(strategy_id):
@@ -2824,6 +2845,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 variable.set(_reverse_lookup_label(SIGNAL_LABEL_TO_VALUE, str(fixed_value), definition.default_signal_label))
             elif key == "mtf_reversal_mode":
                 variable.set(_reverse_lookup_label(MTF_REVERSAL_MODE_OPTIONS, str(fixed_value), self.mtf_reversal_mode_label.get()))
+            elif key.endswith("_type"):
+                variable.set(str(fixed_value).upper())
             else:
                 variable.set(fixed_value)
 
@@ -2838,9 +2861,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         label_map = {
             "bar": (self._bar_label, "K线周期"),
             "signal_mode": (self._signal_label, "信号方向"),
-            "ema_period": (self._ema_label, "EMA小周期"),
-            "trend_ema_period": (self._trend_ema_label, "EMA中周期"),
-            "big_ema_period": (self._big_ema_label, "EMA大周期"),
+            "ema_period": (self._ema_label, "快线均线"),
+            "trend_ema_period": (self._trend_ema_label, "趋势均线"),
+            "big_ema_period": (self._big_ema_label, "大周期均线"),
         }
         for key, (widget, base_text) in label_map.items():
             text = f"{base_text}{fixed_suffix}" if strategy_fixed_value(strategy_id, key) is not None else base_text
@@ -3111,17 +3134,39 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         ttk.Entry(launch_form, textvariable=self.poll_seconds).grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
-        self._ema_label = ttk.Label(launch_form, text="EMA小周期")
+        self._ema_label = ttk.Label(launch_form, text="快线均线")
         self._ema_label.grid(row=row, column=0, sticky="w", pady=_lp)
-        self._ema_entry = ttk.Entry(launch_form, textvariable=self.ema_period)
-        self._ema_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
-        self._trend_ema_label = ttk.Label(launch_form, text="EMA中周期")
+        self._ema_frame = ttk.Frame(launch_form)
+        self._ema_frame.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._ema_frame.columnconfigure(1, weight=1)
+        self._ema_type_combo = ttk.Combobox(
+            self._ema_frame,
+            textvariable=self.ema_type,
+            values=MOVING_AVERAGE_TYPE_OPTIONS,
+            state="readonly",
+            width=6,
+        )
+        self._ema_type_combo.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self._ema_entry = ttk.Entry(self._ema_frame, textvariable=self.ema_period)
+        self._ema_entry.grid(row=0, column=1, sticky="ew")
+        self._trend_ema_label = ttk.Label(launch_form, text="趋势均线")
         self._trend_ema_label.grid(row=row, column=2, sticky="w", pady=_lp)
-        self._trend_ema_entry = ttk.Entry(launch_form, textvariable=self.trend_ema_period)
-        self._trend_ema_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
+        self._trend_ema_frame = ttk.Frame(launch_form)
+        self._trend_ema_frame.grid(row=row, column=3, sticky="ew", pady=_lp)
+        self._trend_ema_frame.columnconfigure(1, weight=1)
+        self._trend_ema_type_combo = ttk.Combobox(
+            self._trend_ema_frame,
+            textvariable=self.trend_ema_type,
+            values=MOVING_AVERAGE_TYPE_OPTIONS,
+            state="readonly",
+            width=6,
+        )
+        self._trend_ema_type_combo.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self._trend_ema_entry = ttk.Entry(self._trend_ema_frame, textvariable=self.trend_ema_period)
+        self._trend_ema_entry.grid(row=0, column=1, sticky="ew")
 
         row += 1
-        self._big_ema_label = ttk.Label(launch_form, text="EMA大周期")
+        self._big_ema_label = ttk.Label(launch_form, text="大周期均线")
         self._big_ema_label.grid(row=row, column=0, sticky="w", pady=_lp)
         self._big_ema_entry = ttk.Entry(launch_form, textvariable=self.big_ema_period)
         self._big_ema_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
@@ -3131,10 +3176,21 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._atr_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
-        self._entry_reference_ema_label = ttk.Label(launch_form, text="参考EMA周期")
+        self._entry_reference_ema_label = ttk.Label(launch_form, text="参考线周期")
         self._entry_reference_ema_label.grid(row=row, column=0, sticky="w", pady=_lp)
-        self._entry_reference_ema_entry = ttk.Entry(launch_form, textvariable=self.entry_reference_ema_period)
-        self._entry_reference_ema_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._entry_reference_ema_frame = ttk.Frame(launch_form)
+        self._entry_reference_ema_frame.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._entry_reference_ema_frame.columnconfigure(1, weight=1)
+        self._entry_reference_ema_type_combo = ttk.Combobox(
+            self._entry_reference_ema_frame,
+            textvariable=self.entry_reference_ema_type,
+            values=MOVING_AVERAGE_TYPE_OPTIONS,
+            state="readonly",
+            width=6,
+        )
+        self._entry_reference_ema_type_combo.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self._entry_reference_ema_entry = ttk.Entry(self._entry_reference_ema_frame, textvariable=self.entry_reference_ema_period)
+        self._entry_reference_ema_entry.grid(row=0, column=1, sticky="ew")
 
         row += 1
         self._mtf_filter_bar_label = ttk.Label(launch_form, text="高周期K线")
@@ -6475,9 +6531,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.trend_parameter_hint_text.set(
             _build_trend_parameter_hint_text(
                 strategy_id=definition.strategy_id,
+                ema_type_raw=self.ema_type.get(),
                 ema_period_raw=self.ema_period.get(),
+                trend_ema_type_raw=self.trend_ema_type.get(),
                 trend_ema_period_raw=self.trend_ema_period.get(),
                 big_ema_period_raw=self.big_ema_period.get(),
+                entry_reference_ema_type_raw=self.entry_reference_ema_type.get(),
                 entry_reference_ema_period_raw=self.entry_reference_ema_period.get(),
                 mtf_filter_bar_raw=self.mtf_filter_bar.get(),
                 mtf_filter_fast_ema_period_raw=self.mtf_filter_fast_ema_period.get(),
@@ -6581,8 +6640,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             config = StrategyConfig(
                 inst_id=signal_symbol or trade_symbol,
                 bar=self.bar.get().strip(),
-                ema_period=self._parse_nonnegative_int(self.ema_period.get(), "EMA小周期"),
-                trend_ema_period=self._parse_nonnegative_int(self.trend_ema_period.get(), "EMA中周期"),
+                ema_type=self.ema_type.get().strip().lower(),
+                ema_period=self._parse_nonnegative_int(self.ema_period.get(), "快线均线周期"),
+                trend_ema_type=self.trend_ema_type.get().strip().lower(),
+                trend_ema_period=self._parse_nonnegative_int(self.trend_ema_period.get(), "趋势均线周期"),
                 big_ema_period=self._parse_nonnegative_int(self.big_ema_period.get(), "EMA大周期"),
                 atr_period=self._parse_nonnegative_int(self.atr_period.get(), "ATR周期"),
                 atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
@@ -6601,6 +6662,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 run_mode=run_mode,
                 take_profit_mode=TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "dynamic"),
                 max_entries_per_trend=max(self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数"), 0),
+                entry_reference_ema_type=self.entry_reference_ema_type.get().strip().lower(),
                 entry_reference_ema_period=max(
                     self._parse_nonnegative_int(
                         self.entry_reference_ema_period.get(),
@@ -10988,55 +11050,59 @@ def _build_launch_parameter_hint_text(
 def _build_trend_parameter_hint_text(
     *,
     strategy_id: str,
+    ema_type_raw: str,
     ema_period_raw: str,
+    trend_ema_type_raw: str,
     trend_ema_period_raw: str,
     big_ema_period_raw: str,
+    entry_reference_ema_type_raw: str,
     entry_reference_ema_period_raw: str,
     mtf_filter_bar_raw: str = "",
     mtf_filter_fast_ema_period_raw: str = "",
     mtf_filter_slow_ema_period_raw: str = "",
 ) -> str:
+    ema_type = (ema_type_raw or "EMA").strip().upper()
     ema_period = ema_period_raw.strip() or "?"
+    trend_ema_type = (trend_ema_type_raw or "EMA").strip().upper()
     trend_ema_period = trend_ema_period_raw.strip() or "?"
     big_ema_period = big_ema_period_raw.strip() or "?"
+    entry_reference_ema_type = (entry_reference_ema_type_raw or ema_type).strip().upper()
     entry_reference_ema_period = entry_reference_ema_period_raw.strip() or "0"
+    fast_label = f"{ema_type}{ema_period}"
+    trend_label = f"{trend_ema_type}{trend_ema_period}"
+    reference_label = (
+        f"{entry_reference_ema_type}{entry_reference_ema_period}"
+        if entry_reference_ema_period not in {"", "0"}
+        else f"跟随快线({fast_label})"
+    )
     parts = [
-        f"EMA小周期：{ema_period}=快线，负责捕捉最近节奏。",
-        f"EMA中周期：{trend_ema_period}=趋势过滤线，用来判断当前方向是否还有效。",
+        f"快线均线：{fast_label}，负责捕捉最近节奏。",
+        f"趋势均线：{trend_label}，用来判断当前方向是否仍然有效。",
     ]
     if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID:
-        ref = entry_reference_ema_period if entry_reference_ema_period not in {"", "0"} else ema_period
-        parts.append(
-            f"参考EMA({ref})：收盘向下跌破该线触发做空，且须 EMA{ema_period}<EMA{trend_ema_period}。"
-        )
+        ref = reference_label if entry_reference_ema_period not in {"", "0"} else fast_label
+        parts.append(f"突破参考线：{ref}，收盘向下跌破该线触发做空，且需 {fast_label}<{trend_label}。")
     elif is_ema_atr_breakout_strategy(strategy_id):
-        ref = entry_reference_ema_period if entry_reference_ema_period not in {"", "0"} else ema_period
-        parts.append(
-            f"参考EMA({ref})：收盘向上突破该线触发做多，且须 EMA{ema_period}>EMA{trend_ema_period}。"
-        )
+        ref = reference_label if entry_reference_ema_period not in {"", "0"} else fast_label
+        parts.append(f"突破参考线：{ref}，收盘向上突破该线触发做多，且需 {fast_label}>{trend_label}。")
     elif strategy_id == STRATEGY_EMA5_EMA8_ID:
-        parts.append(f"EMA大周期：{big_ema_period}=4H 大趋势过滤线。")
+        parts.append(f"大周期均线：EMA{big_ema_period}，用于 4H 大趋势过滤。")
     if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id):
-        if entry_reference_ema_period in {"", "0"}:
-            parts.append(f"挂单参考EMA：0=跟随EMA小周期，当前按 EMA{ema_period} 作为挂单价格锚点。")
-        else:
-            parts.append(f"挂单参考EMA：{entry_reference_ema_period}=挂单价格锚点，价格会围绕 EMA{entry_reference_ema_period} 重挂。")
+        parts.append(f"挂单参考线：{reference_label}，价格会围绕这条线动态重挂。")
     if is_dynamic_mtf_strategy_id(strategy_id):
         mtf_bar = mtf_filter_bar_raw.strip() or "?"
         mtf_fast = mtf_filter_fast_ema_period_raw.strip() or "?"
         mtf_slow = mtf_filter_slow_ema_period_raw.strip() or "?"
-        parts.append(
-            f"高周期过滤：{mtf_bar} EMA{mtf_fast}/EMA{mtf_slow} 只决定是否允许低周期新开仓，不改变原有止损止盈逻辑。"
-        )
-    return "趋势参数： " + " ".join(parts)
+        parts.append(f"高周期过滤：{mtf_bar} EMA{mtf_fast}/EMA{mtf_slow} 只决定是否允许低周期新开仓。")
+    return "趋势参数：" + " ".join(parts)
 
 
 def _entry_reference_ema_caption(strategy_id: str) -> str:
     if is_dynamic_strategy_id(strategy_id):
-        return "挂单参考EMA"
+        return "挂单参考线"
     if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(strategy_id):
-        return "突破参考EMA"
-    return "参考EMA周期"
+        return "突破参考线"
+    return "参考线周期"
 
 
 def _build_dynamic_protection_hint_text(
@@ -11209,18 +11275,18 @@ def _build_strategy_start_confirmation_message(
         f"自定义触发标的：{_custom_trigger_text()}",
         "",
         "参数说明：",
-        f"EMA小周期：{config.ema_period}（快线）",
-        f"EMA中周期：{config.trend_ema_period}（趋势过滤线）",
+        f"快线均线：{config.ema_label()}",
+        f"趋势均线：{config.trend_ema_label()}",
     ]
     if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         lines.append(f"EMA大周期：{config.big_ema_period}（大趋势过滤线）")
     if config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(config.strategy_id):
-        lines.append(f"突破参考EMA：EMA{config.resolved_entry_reference_ema_period()}（已收盘K线的突破/跌破判断基准）")
+        lines.append(f"突破参考线：{config.entry_reference_line_label()}（已收盘K线的突破/跌破判断基准）")
     if is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id) or config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(config.strategy_id):
         if is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id):
             lines.extend(
                 [
-                    f"挂单参考EMA：{config.entry_reference_ema_label()}（挂单价格锚点）",
+                    f"挂单参考线：{config.entry_reference_line_label()}（挂单价格锚点）",
                     f"止盈方式：{take_profit_mode_text}",
                     f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}（同一波最多允许开仓的次数）",
                     f"启动追单窗口：{_startup_chase_text()}",

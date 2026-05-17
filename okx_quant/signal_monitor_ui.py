@@ -58,7 +58,7 @@ _OBSERVER_PARAMETER_LABELS = {
     "atr_period": "ATR周期",
     "atr_stop_multiplier": "止损 ATR 倍数",
     "atr_take_multiplier": "止盈 ATR 倍数",
-    "entry_reference_ema_period": "进场参考EMA",
+    "entry_reference_ema_period": "进场参考线",
     "take_profit_mode": "出场方式",
     "max_entries_per_trend": "单波最多开仓次数",
     "dynamic_two_r_break_even": "2R后保本",

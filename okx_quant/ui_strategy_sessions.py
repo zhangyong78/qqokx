@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
@@ -9,10 +9,10 @@ class UiStrategySessionsMixin:
     @staticmethod
     def _entry_reference_ema_caption(strategy_id: str) -> str:
         if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id):
-            return "挂单参考EMA"
+            return "挂单参考线"
         if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(strategy_id):
-            return "突破参考EMA"
-        return "参考EMA周期"
+            return "突破参考线"
+        return "参考线周期"
 
     @staticmethod
     def _format_strategy_symbol_display(signal_symbol: str, trade_symbol: str | None) -> str:
@@ -79,9 +79,12 @@ class UiStrategySessionsMixin:
         self.trade_symbol.set(launch_symbol)
         self.local_tp_sl_symbol.set(custom_symbol)
         self.bar.set(record.config.bar)
+        self.ema_type.set(str(record.config.resolved_ema_type()).upper())
         self.ema_period.set(str(record.config.ema_period))
+        self.trend_ema_type.set(str(record.config.resolved_trend_ema_type()).upper())
         self.trend_ema_period.set(str(record.config.trend_ema_period))
         self.big_ema_period.set(str(record.config.big_ema_period))
+        self.entry_reference_ema_type.set(str(record.config.resolved_entry_reference_ema_type()).upper())
         self.entry_reference_ema_period.set(str(record.config.entry_reference_ema_period))
         self.atr_period.set(str(record.config.atr_period))
         self.stop_atr.set(_format_entry_decimal(record.config.atr_stop_multiplier))
@@ -1235,8 +1238,11 @@ class UiStrategySessionsMixin:
             session_id=session.session_id,
             candles=candles,
             ema_period=session.config.ema_period,
+            ema_type=session.config.resolved_ema_type(),
             trend_ema_period=session.config.trend_ema_period,
+            trend_ema_type=session.config.resolved_trend_ema_type(),
             reference_ema_period=session.config.resolved_entry_reference_ema_period(),
+            reference_ema_type=session.config.resolved_entry_reference_ema_type(),
             pending_entry_prices=pending_entry_prices,
             entry_price=entry_price,
             entry_time=entry_time,
@@ -1250,10 +1256,6 @@ class UiStrategySessionsMixin:
                 live_pnl_refreshed_at=live_pnl_refreshed_at,
                 stop_price=stop_price,
             ),
-            mtf_filter_bar=mtf_filter_bar,
-            mtf_filter_fast_ema_period=mtf_filter_fast_ema_period,
-            mtf_filter_slow_ema_period=mtf_filter_slow_ema_period,
-            mtf_reversal_mode=mtf_reversal_mode,
         )
         status_text = self._strategy_live_chart_status_text(
             session,
@@ -3259,8 +3261,8 @@ class UiStrategySessionsMixin:
         if not symbol:
             messagebox.showerror("提示", "请先选择交易标的")
             return
-        ema_period = self._parse_positive_int(self.ema_period.get(), "EMA小周期")
-        trend_ema_period = self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期")
+        ema_period = self._parse_positive_int(self.ema_period.get(), "快线均线周期")
+        trend_ema_period = self._parse_positive_int(self.trend_ema_period.get(), "趋势均线周期")
         strategy_id = self._selected_strategy_definition().strategy_id
         entry_reference_ema_period = 0
         if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
@@ -3271,7 +3273,7 @@ class UiStrategySessionsMixin:
         if entry_reference_ema_period <= 0:
             entry_reference_ema_period = ema_period
         self._enqueue_log(
-            f"正在获取 {symbol} 的 1 小时调试值，EMA小周期={ema_period}，趋势EMA={trend_ema_period}，"
+            f"正在获取 {symbol} 的 1 小时调试值，快线均线={ema_period}，趋势均线={trend_ema_period}，"
             f"{self._entry_reference_ema_caption(strategy_id)}={entry_reference_ema_period} ..."
         )
         threading.Thread(
@@ -3587,18 +3589,28 @@ class UiStrategySessionsMixin:
         config = StrategyConfig(
             inst_id=symbol,
             bar=str(self._resolve_strategy_parameter_value(strategy_id, "bar", self.bar.get())),
+            ema_type=str(
+                self._resolve_strategy_parameter_value(strategy_id, "ema_type", self.ema_type.get().strip().lower())
+            ),
             ema_period=int(
                 self._resolve_strategy_parameter_value(
                     strategy_id,
                     "ema_period",
-                    self._parse_positive_int(self.ema_period.get(), "EMA小周期"),
+                    self._parse_positive_int(self.ema_period.get(), "快线均线周期"),
+                )
+            ),
+            trend_ema_type=str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "trend_ema_type",
+                    self.trend_ema_type.get().strip().lower(),
                 )
             ),
             trend_ema_period=int(
                 self._resolve_strategy_parameter_value(
                     strategy_id,
                     "trend_ema_period",
-                    self._parse_positive_int(self.trend_ema_period.get(), "EMA中周期"),
+                    self._parse_positive_int(self.trend_ema_period.get(), "趋势均线周期"),
                 )
             ),
             big_ema_period=int(
@@ -3606,6 +3618,13 @@ class UiStrategySessionsMixin:
                     strategy_id,
                     "big_ema_period",
                     self._parse_positive_int(self.big_ema_period.get(), "EMA大周期"),
+                )
+            ),
+            entry_reference_ema_type=str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "entry_reference_ema_type",
+                    self.entry_reference_ema_type.get().strip().lower(),
                 )
             ),
             entry_reference_ema_period=entry_reference_ema_period,
@@ -4876,15 +4895,25 @@ class UiStrategySessionsMixin:
                 f"交易标的：{display_symbol or '-'}",
                 f"方向：{direction_label or '-'}",
                 f"K线周期：{self._snapshot_text(snapshot, 'bar')}",
-                f"EMA小周期：{ema_period or '-'}",
-                f"EMA中周期：{trend_ema_period or '-'}",
+                f"快线均线：{(self._snapshot_text(snapshot, 'ema_type', 'ema') or 'ema').upper()}{ema_period or '-'}",
+                f"趋势均线：{(self._snapshot_text(snapshot, 'trend_ema_type', 'ema') or 'ema').upper()}{trend_ema_period or '-'}",
             ]
         )
         if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
+            entry_reference_type = (
+                self._snapshot_text(
+                    snapshot,
+                    "entry_reference_ema_type",
+                    self._snapshot_text(snapshot, "ema_type", "ema"),
+                )
+                or self._snapshot_text(snapshot, "ema_type", "ema")
+                or "ema"
+            ).upper()
             if entry_reference_ema_period > 0:
-                entry_reference_label = f"EMA{entry_reference_ema_period}"
+                entry_reference_label = f"{entry_reference_type}{entry_reference_ema_period}"
             else:
-                entry_reference_label = f"跟随EMA小周期(EMA{ema_period or '-'})"
+                fast_type = (self._snapshot_text(snapshot, "ema_type", "ema") or "ema").upper()
+                entry_reference_label = f"跟随快线({fast_type}{ema_period or '-'})"
             lines.append(f"{self._entry_reference_ema_caption(strategy_id)}：{entry_reference_label}")
         if is_dynamic_strategy_id(strategy_id) or is_ema_atr_breakout_strategy(strategy_id):
             startup_window_seconds = self._snapshot_int(snapshot, "startup_chase_window_seconds") or 0
