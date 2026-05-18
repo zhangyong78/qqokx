@@ -5,7 +5,7 @@ import re
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
-from tkinter import BooleanVar, END, StringVar, Text, Toplevel
+from tkinter import BooleanVar, END, StringVar, Text, Toplevel, filedialog
 from tkinter import messagebox, ttk
 from typing import Callable
 
@@ -237,6 +237,16 @@ def _format_optional_pnl(value: Decimal | None) -> str:
         return "-"
     decimal_value = value if isinstance(value, Decimal) else Decimal(str(value))
     return format_decimal_fixed(decimal_value, 2)
+
+
+def _shared_draft_value(drafts: list[TraderDraftRecord], extractor: Callable[[TraderDraftRecord], object]) -> object | None:
+    if not drafts:
+        return None
+    first = extractor(drafts[0])
+    for draft in drafts[1:]:
+        if extractor(draft) != first:
+            return None
+    return first
 
 
 def _replace_text_preserving_scroll(widget: Text, content: str) -> None:
@@ -1007,6 +1017,8 @@ class TraderDeskWindow:
         ttk.Button(toolbar, text="强制清格", command=self.force_cleanup_selected_trader).grid(row=0, column=6, padx=(8, 0))
         ttk.Button(toolbar, text="辞退交易员", command=self.delete_selected_draft).grid(row=0, column=7, padx=(8, 0))
         ttk.Button(toolbar, text="交易员账本", command=self.open_book_window).grid(row=0, column=8, padx=(8, 0))
+        ttk.Button(toolbar, text="导出选中组合包", command=self.export_selected_draft_bundle).grid(row=0, column=9, padx=(8, 0))
+        ttk.Button(toolbar, text="导出全部组合包", command=self.export_all_draft_bundle).grid(row=0, column=10, padx=(8, 0))
 
         self.tree = ttk.Treeview(
             left,
@@ -1204,6 +1216,10 @@ class TraderDeskWindow:
         self._trader_counter += 1
         return f"T{self._trader_counter:03d}"
 
+    @staticmethod
+    def _default_bundle_filename() -> str:
+        return f"trader_desk_bundle_{datetime.now():%Y%m%d_%H%M%S}.json"
+
     def _append_log(self, message: str) -> None:
         text = str(message or "").strip()
         trader_id = self._extract_trader_id_from_log_message(text)
@@ -1275,6 +1291,83 @@ class TraderDeskWindow:
             return
         self._append_log(f"[{draft.trader_id}] 已招募交易员。")
         self._refresh_views(select_id=draft.trader_id)
+
+    def _export_draft_bundle(self, drafts: list[TraderDraftRecord], *, selected_only: bool) -> None:
+        if not drafts:
+            message = "请先选中一条交易员草稿。" if selected_only else "当前没有可导出的交易员草稿。"
+            messagebox.showinfo("提示", message, parent=self.window)
+            return
+        payload_items: list[dict[str, object]] = []
+        for draft in drafts:
+            payload = draft.template_payload if isinstance(draft.template_payload, dict) else {}
+            validated = _validate_trader_desk_payload(payload)
+            item: dict[str, object] = {
+                "template_payload": validated,
+                "total_quota": _normalize_decimal_text(draft.total_quota),
+                "unit_quota": _normalize_decimal_text(draft.unit_quota),
+                "quota_steps": draft.quota_steps,
+                "status": draft.status,
+                "auto_restart_on_profit": draft.auto_restart_on_profit,
+                "pause_on_stop_loss": draft.pause_on_stop_loss,
+            }
+            if draft.notes.strip():
+                item["notes"] = draft.notes.strip()
+            payload_items.append(item)
+        shared_total = _shared_draft_value(drafts, lambda item: _normalize_decimal_text(item.total_quota))
+        shared_unit = _shared_draft_value(drafts, lambda item: _normalize_decimal_text(item.unit_quota))
+        shared_steps = _shared_draft_value(drafts, lambda item: item.quota_steps)
+        shared_status = _shared_draft_value(drafts, lambda item: item.status)
+        shared_restart = _shared_draft_value(drafts, lambda item: item.auto_restart_on_profit)
+        shared_pause = _shared_draft_value(drafts, lambda item: item.pause_on_stop_loss)
+        selected_draft = self._selected_draft()
+        package_name = (
+            f"交易员组合包_{selected_draft.trader_id}"
+            if selected_draft is not None
+            else f"交易员组合包_{datetime.now():%Y%m%d_%H%M%S}"
+        )
+        bundle_payload = {
+            "schema_version": 1,
+            "package_name": package_name,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "auto_start_on_import": False,
+            "defaults": {
+                "total_quota": shared_total or "1",
+                "unit_quota": shared_unit or "0.1",
+                "quota_steps": shared_steps if shared_steps is not None else 10,
+                "status": shared_status or "draft",
+                "auto_restart_on_profit": True if shared_restart is None else bool(shared_restart),
+                "pause_on_stop_loss": True if shared_pause is None else bool(shared_pause),
+            },
+            "strategies": payload_items,
+        }
+        target = filedialog.asksaveasfilename(
+            parent=self.window,
+            title="导出选中组合包" if selected_only else "导出全部组合包",
+            defaultextension=".json",
+            filetypes=(("JSON 文件", "*.json"), ("所有文件", "*.*")),
+            initialfile=self._default_bundle_filename(),
+        )
+        if not target:
+            return
+        try:
+            with open(target, "w", encoding="utf-8") as fh:
+                json.dump(bundle_payload, fh, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc), parent=self.window)
+            return
+        self._append_log(f"已导出组合包：{target}")
+        messagebox.showinfo(
+            "导出完成",
+            f"已导出 {len(drafts)} 条交易员草稿到组合包。\n\n文件：{target}",
+            parent=self.window,
+        )
+
+    def export_selected_draft_bundle(self) -> None:
+        draft = self._selected_draft()
+        self._export_draft_bundle([draft] if draft is not None else [], selected_only=True)
+
+    def export_all_draft_bundle(self) -> None:
+        self._export_draft_bundle(list(self._snapshot.drafts), selected_only=False)
 
     def clone_selected_to_target(self) -> None:
         draft = self._selected_draft()

@@ -211,6 +211,7 @@ from okx_quant.strategy_catalog import (
     is_dynamic_strategy_id,
     is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
+    supports_trader_desk,
     supports_signal_only,
 )
 from okx_quant.strategy_parameters import (
@@ -1069,6 +1070,25 @@ class StrategyTemplateRecord:
     exported_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class StrategyTemplateBundleItem:
+    record: StrategyTemplateRecord
+    total_quota: Decimal = Decimal("1")
+    unit_quota: Decimal = Decimal("0.1")
+    quota_steps: int = 10
+    status: str = "draft"
+    auto_restart_on_profit: bool = True
+    pause_on_stop_loss: bool = True
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class StrategyTemplateBundleImport:
+    package_name: str
+    items: tuple[StrategyTemplateBundleItem, ...]
+    auto_start_on_import: bool = False
+
+
 class PositionNoteEditorDialog(simpledialog.Dialog):
     def __init__(self, parent: Tk | Toplevel, *, title: str, prompt: str, initial_value: str = "") -> None:
         self._prompt = prompt
@@ -1471,6 +1491,247 @@ def _resolve_import_api_profile(source_api_name: str, current_api_name: str, ava
     if current:
         return current, f"继续使用当前 API：{current}"
     return "", "当前未选择 API，请先确认本机 API 配置。"
+
+
+def _strategy_template_payload_label(payload: dict[str, object]) -> str:
+    strategy_name = str(payload.get("strategy_name") or "").strip()
+    strategy_id = str(payload.get("strategy_id") or "").strip()
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    core = strategy_name or strategy_id or "未命名策略"
+    return f"{core} {symbol}".strip()
+
+
+def _validate_trader_template_payload(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise ValueError("当前参数缺少可保存的策略模板。")
+    strategy_id = str(payload.get("strategy_id") or "").strip()
+    if not strategy_id:
+        raise ValueError("当前参数缺少策略标识，无法加入交易员管理台。")
+    try:
+        if not supports_trader_desk(strategy_id):
+            raise ValueError(f"{_strategy_template_payload_label(payload)} 暂不支持加入交易员管理台。")
+    except KeyError as exc:
+        raise ValueError(f"当前版本不认识这个策略：{strategy_id}") from exc
+    return payload
+
+
+def _strategy_template_payload_identity(payload: dict[str, object]) -> str:
+    identity_payload = {
+        "api_name": str(payload.get("api_name") or "").strip(),
+        "strategy_id": str(payload.get("strategy_id") or "").strip(),
+        "direction_label": str(payload.get("direction_label") or "").strip(),
+        "run_mode_label": str(payload.get("run_mode_label") or "").strip(),
+        "symbol": str(payload.get("symbol") or "").strip().upper(),
+        "config_snapshot": payload.get("config_snapshot"),
+    }
+    return json.dumps(identity_payload, ensure_ascii=False, sort_keys=True)
+
+
+def _strategy_template_bundle_item_from_payload(
+    raw_item: object,
+    *,
+    default_total_quota: str,
+    default_unit_quota: str,
+    default_quota_steps: str,
+    default_status: str,
+    default_auto_restart_on_profit: bool,
+    default_pause_on_stop_loss: bool,
+    default_notes: str,
+    item_index: int,
+) -> StrategyTemplateBundleItem:
+    if not isinstance(raw_item, dict):
+        raise ValueError(f"第 {item_index} 条策略不是有效对象。")
+    raw_template = raw_item.get("template_payload")
+    template_payload = dict(raw_template) if isinstance(raw_template, dict) else dict(raw_item)
+    for key in ("api_name", "strategy_id", "strategy_name", "direction_label", "run_mode_label", "symbol"):
+        value = raw_item.get(key)
+        if value not in (None, "") and key not in template_payload:
+            template_payload[key] = value
+    record = _strategy_template_record_from_payload(template_payload)
+    if record is None:
+        raise ValueError(f"第 {item_index} 条策略缺少有效的 config_snapshot。")
+    normalized = normalize_trader_draft_inputs(
+        total_quota=str(raw_item.get("total_quota", default_total_quota) or default_total_quota),
+        unit_quota=str(raw_item.get("unit_quota", default_unit_quota) or default_unit_quota),
+        quota_steps=str(raw_item.get("quota_steps", default_quota_steps) or default_quota_steps),
+        status=str(raw_item.get("status", default_status) or default_status),
+        gate_enabled=False,
+        gate_condition="always",
+        gate_trigger_inst_id="",
+        gate_trigger_price_type="mark",
+        gate_lower_price="",
+        gate_upper_price="",
+    )
+    return StrategyTemplateBundleItem(
+        record=record,
+        total_quota=normalized["total_quota"],
+        unit_quota=normalized["unit_quota"],
+        quota_steps=normalized["quota_steps"],
+        status=str(normalized["status"]),
+        auto_restart_on_profit=_coerce_snapshot_bool(
+            raw_item.get("auto_restart_on_profit"),
+            default_auto_restart_on_profit,
+        ),
+        pause_on_stop_loss=_coerce_snapshot_bool(
+            raw_item.get("pause_on_stop_loss"),
+            default_pause_on_stop_loss,
+        ),
+        notes=str(raw_item.get("notes", default_notes) or default_notes).strip(),
+    )
+
+
+def _strategy_template_bundle_from_payload(
+    payload: object,
+    *,
+    default_package_name: str = "",
+) -> StrategyTemplateBundleImport | None:
+    if not isinstance(payload, dict):
+        return None
+    raw_items = payload.get("strategies")
+    if not isinstance(raw_items, list) or not raw_items:
+        return None
+    defaults = payload.get("defaults")
+    default_block = defaults if isinstance(defaults, dict) else {}
+    default_total_quota = str(default_block.get("total_quota", "1") or "1")
+    default_unit_quota = str(default_block.get("unit_quota", "0.1") or "0.1")
+    default_quota_steps = str(default_block.get("quota_steps", "10") or "10")
+    default_status = str(default_block.get("status", "draft") or "draft")
+    default_auto_restart_on_profit = _coerce_snapshot_bool(
+        default_block.get("auto_restart_on_profit"),
+        True,
+    )
+    default_pause_on_stop_loss = _coerce_snapshot_bool(
+        default_block.get("pause_on_stop_loss"),
+        True,
+    )
+    default_notes = str(default_block.get("notes", "") or "").strip()
+    items = tuple(
+        _strategy_template_bundle_item_from_payload(
+            raw_item,
+            default_total_quota=default_total_quota,
+            default_unit_quota=default_unit_quota,
+            default_quota_steps=default_quota_steps,
+            default_status=default_status,
+            default_auto_restart_on_profit=default_auto_restart_on_profit,
+            default_pause_on_stop_loss=default_pause_on_stop_loss,
+            default_notes=default_notes,
+            item_index=index,
+        )
+        for index, raw_item in enumerate(raw_items, start=1)
+    )
+    package_name = str(
+        payload.get("package_name")
+        or payload.get("name")
+        or default_package_name
+        or "策略组合包"
+    ).strip()
+    auto_start_on_import = _coerce_snapshot_bool(payload.get("auto_start_on_import"), False)
+    return StrategyTemplateBundleImport(
+        package_name=package_name,
+        items=items,
+        auto_start_on_import=auto_start_on_import,
+    )
+
+
+class StrategyBundleImportDialog(simpledialog.Dialog):
+    def __init__(
+        self,
+        parent: Tk | Toplevel,
+        *,
+        package_name: str,
+        source_apis: tuple[str, ...],
+        available_profiles: tuple[str, ...],
+        current_api_name: str,
+        auto_start_default: bool = False,
+    ) -> None:
+        self._package_name = package_name
+        self._source_apis = source_apis
+        self._available_profiles = available_profiles
+        self._current_api_name = current_api_name
+        initial_mode = "preserve" if len(source_apis) <= 1 else "selected"
+        initial_api = current_api_name or (available_profiles[0] if available_profiles else "")
+        self.mode_var = StringVar(value=initial_mode)
+        self.api_var = StringVar(value=initial_api)
+        self.auto_start_var = BooleanVar(value=auto_start_default)
+        self.result_payload: dict[str, str] | None = None
+        self._api_combo: ttk.Combobox | None = None
+        super().__init__(parent, "导入策略组合")
+
+    def body(self, master: ttk.Frame):
+        master.columnconfigure(0, weight=1)
+        summary_lines = [
+            f"组合包：{self._package_name}",
+            f"文件里的 API：{', '.join(self._source_apis) if self._source_apis else '未填写'}",
+            f"本机可用 API：{', '.join(self._available_profiles) if self._available_profiles else '无'}",
+        ]
+        ttk.Label(master, text="\n".join(summary_lines), justify="left", wraplength=520).grid(
+            row=0,
+            column=0,
+            sticky="w",
+            pady=(0, 10),
+        )
+        options = ttk.LabelFrame(master, text="导入时 API 处理", padding=10)
+        options.grid(row=1, column=0, sticky="ew")
+        options.columnconfigure(0, weight=1)
+        ttk.Radiobutton(
+            options,
+            text="按文件里的 API 分配（本机不存在时回退到当前 API）",
+            value="preserve",
+            variable=self.mode_var,
+            command=self._refresh_api_combo_state,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            options,
+            text="全部改成当前 API",
+            value="current",
+            variable=self.mode_var,
+            command=self._refresh_api_combo_state,
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Radiobutton(
+            options,
+            text="全部改成我指定的 API",
+            value="selected",
+            variable=self.mode_var,
+            command=self._refresh_api_combo_state,
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        combo = ttk.Combobox(
+            options,
+            state="readonly",
+            textvariable=self.api_var,
+            values=self._available_profiles,
+        )
+        combo.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self._api_combo = combo
+        self._refresh_api_combo_state()
+        ttk.Checkbutton(
+            master,
+            text="导入后自动启动策略",
+            variable=self.auto_start_var,
+        ).grid(row=2, column=0, sticky="w", pady=(10, 0))
+        return combo
+
+    def _refresh_api_combo_state(self) -> None:
+        if self._api_combo is None:
+            return
+        mode = self.mode_var.get().strip()
+        state = "readonly" if mode == "selected" else "disabled"
+        self._api_combo.configure(state=state)
+
+    def validate(self) -> bool:
+        mode = self.mode_var.get().strip()
+        api_name = self.api_var.get().strip()
+        if mode == "selected" and not api_name:
+            messagebox.showerror("提示", "请选择一个目标 API。", parent=self)
+            return False
+        if mode == "current" and not self._current_api_name:
+            messagebox.showerror("提示", "当前没有选中 API，不能使用“全部改成当前 API”。", parent=self)
+            return False
+        self.result_payload = {
+            "mode": mode,
+            "api_name": api_name,
+            "auto_start": "1" if self.auto_start_var.get() else "0",
+        }
+        return True
 
 
 def _parse_datetime_snapshot(value: object) -> datetime | None:
@@ -3503,8 +3764,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         ttk.Button(control_row, text="\u5bfc\u5165\u7b56\u7565\u53c2\u6570", command=self.import_strategy_template).grid(
             row=0, column=12, padx=(8, 0)
         )
-        ttk.Button(control_row, text="恢复选中策略", command=self.recover_selected_session).grid(
+        ttk.Button(control_row, text="导入策略组合", command=self.import_strategy_template_bundle).grid(
             row=0, column=13, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="恢复选中策略", command=self.recover_selected_session).grid(
+            row=0, column=14, padx=(8, 0)
         )
 
         detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)

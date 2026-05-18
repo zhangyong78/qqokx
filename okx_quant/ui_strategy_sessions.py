@@ -182,6 +182,295 @@ class UiStrategySessionsMixin:
             api_note=api_note,
         )
 
+    def _next_trader_desk_import_id(self) -> str:
+        max_index = 0
+        for collection in (
+            getattr(self, "_trader_desk_drafts", []),
+            getattr(self, "_trader_desk_runs", []),
+            getattr(self, "_trader_desk_slots", []),
+            getattr(self, "_trader_desk_events", []),
+        ):
+            for item in collection:
+                trader_id = str(getattr(item, "trader_id", "") or "").strip().upper()
+                match = re.fullmatch(r"T(\d+)", trader_id)
+                if match is not None:
+                    max_index = max(max_index, int(match.group(1)))
+        return f"T{max_index + 1:03d}"
+
+    def _resolve_bundle_import_api(
+        self,
+        record: StrategyTemplateRecord,
+        *,
+        mode: str,
+        selected_api_name: str,
+    ) -> tuple[str, str]:
+        available_profiles = set(self._credential_profiles.keys())
+        current_api_name = self._current_credential_profile()
+        normalized_mode = str(mode or "preserve").strip().lower()
+        if normalized_mode == "current":
+            if current_api_name:
+                return current_api_name, f"全部改为当前 API：{current_api_name}"
+            return "", "当前没有选中 API。"
+        if normalized_mode == "selected":
+            normalized_api = selected_api_name.strip()
+            if normalized_api and normalized_api in available_profiles:
+                return normalized_api, f"全部改为指定 API：{normalized_api}"
+            return "", f"指定 API 不存在：{normalized_api or '-'}"
+        return _resolve_import_api_profile(record.api_name, current_api_name, available_profiles)
+
+    def _focus_first_session_for_traders(self, trader_ids: list[str]) -> bool:
+        normalized_ids = {str(item or "").strip() for item in trader_ids if str(item or "").strip()}
+        if not normalized_ids:
+            return False
+        running_filter = getattr(self, "running_session_filter", None)
+        if hasattr(running_filter, "set"):
+            try:
+                running_filter.set("交易员策略")
+                self._refresh_running_session_summary()
+            except Exception:
+                pass
+        candidates = [
+            session
+            for session in self.sessions.values()
+            if str(getattr(session, "trader_id", "") or "").strip() in normalized_ids
+        ]
+        if not candidates:
+            return False
+        preferred = sorted(
+            candidates,
+            key=lambda session: (
+                1 if (session.engine.is_running or session.status in {"运行中", "停止中"}) else 0,
+                session.started_at,
+                session.session_id,
+            ),
+            reverse=True,
+        )[0]
+        self._focus_session_row(preferred.session_id)
+        return True
+
+    def _focus_first_running_session(self, session_ids: list[str], *, filter_label: str) -> bool:
+        normalized_ids = {str(item or "").strip() for item in session_ids if str(item or "").strip()}
+        if not normalized_ids:
+            return False
+        running_filter = getattr(self, "running_session_filter", None)
+        if hasattr(running_filter, "set"):
+            try:
+                running_filter.set(filter_label)
+                self._refresh_running_session_summary()
+            except Exception:
+                pass
+        candidates = [session for session in self.sessions.values() if session.session_id in normalized_ids]
+        if not candidates:
+            return False
+        preferred = sorted(
+            candidates,
+            key=lambda session: (
+                1 if (session.engine.is_running or session.status in {"运行中", "停止中"}) else 0,
+                session.started_at,
+                session.session_id,
+            ),
+            reverse=True,
+        )[0]
+        self._focus_session_row(preferred.session_id)
+        return True
+
+    def import_strategy_template_bundle(self) -> None:
+        source = filedialog.askopenfilename(
+            parent=self.root,
+            title="导入策略组合",
+            filetypes=(("JSON 文件", "*.json"), ("所有文件", "*.*")),
+        )
+        if not source:
+            return
+        source_path = Path(source)
+        try:
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            messagebox.showerror("导入失败", f"组合包解析失败：{exc}")
+            return
+
+        try:
+            bundle = _strategy_template_bundle_from_payload(payload, default_package_name=source_path.stem)
+            if bundle is None:
+                single_record = _strategy_template_record_from_payload(payload)
+                if single_record is None:
+                    raise ValueError("文件既不是单策略模板，也不是策略组合包。")
+                bundle = StrategyTemplateBundleImport(
+                    package_name=source_path.stem or "单策略导入",
+                    items=(StrategyTemplateBundleItem(record=single_record),),
+                )
+        except Exception as exc:
+            messagebox.showerror("导入失败", str(exc))
+            return
+
+        current_api_name = self._current_credential_profile()
+        available_profiles = tuple(sorted(str(name).strip() for name in self._credential_profiles.keys() if str(name).strip()))
+        source_apis = tuple(
+            sorted(
+                {
+                    record.record.api_name.strip()
+                    for record in bundle.items
+                    if record.record.api_name.strip()
+                }
+            )
+        )
+        dialog = StrategyBundleImportDialog(
+            self.root,
+            package_name=bundle.package_name,
+            source_apis=source_apis,
+            available_profiles=available_profiles,
+            current_api_name=current_api_name,
+            auto_start_default=bundle.auto_start_on_import,
+        )
+        selection = dialog.result_payload
+        if not selection:
+            return
+
+        imported_labels: list[str] = []
+        started_session_ids: list[str] = []
+        skipped_summaries: list[str] = []
+        start_failed_summaries: list[str] = []
+        api_notes: list[str] = []
+
+        auto_start_enabled = _coerce_snapshot_bool(selection.get("auto_start"), False)
+        if auto_start_enabled:
+            for item in bundle.items:
+                resolved_api_name, api_note = self._resolve_bundle_import_api(
+                    item.record,
+                    mode=str(selection.get("mode", "preserve")),
+                    selected_api_name=str(selection.get("api_name", "")),
+                )
+                if api_note and api_note not in api_notes:
+                    api_notes.append(api_note)
+                if str(selection.get("mode", "")).strip().lower() in {"current", "selected"} and not resolved_api_name:
+                    skipped_summaries.append(f"{item.record.strategy_name or item.record.strategy_id} {item.record.symbol}：目标 API 不可用")
+                    continue
+                resolved_config = item.record.config
+                has_risk_amount = resolved_config.risk_amount is not None and resolved_config.risk_amount > 0
+                has_fixed_size = resolved_config.order_size is not None and resolved_config.order_size > 0
+                if not has_risk_amount and not has_fixed_size and item.unit_quota > 0:
+                    resolved_config = replace(
+                        resolved_config,
+                        risk_amount=None,
+                        order_size=item.unit_quota,
+                    )
+                resolved_record = replace(
+                    item.record,
+                    api_name=resolved_api_name or item.record.api_name,
+                    config=resolved_config,
+                )
+                try:
+                    definition = self._resolve_strategy_template_definition(resolved_record)
+                    credentials = self._credentials_for_profile_or_none(resolved_record.api_name)
+                    if credentials is None:
+                        raise ValueError(f"未找到 API：{resolved_record.api_name or '-'}")
+                    notifier = self._build_notifier(resolved_record.config)
+                    session_id = self._start_strategy_session(
+                        definition=definition,
+                        credentials=credentials,
+                        config=resolved_record.config,
+                        notifier=notifier,
+                        api_name=resolved_record.api_name,
+                        direction_label=resolved_record.direction_label or definition.default_signal_label,
+                        run_mode_label=resolved_record.run_mode_label,
+                        source_label=f"组合包 {bundle.package_name}",
+                        select_session=False,
+                        allow_duplicate_launch=False,
+                    )
+                except Exception as exc:
+                    start_failed_summaries.append(
+                        f"{resolved_record.strategy_name or resolved_record.strategy_id} {resolved_record.symbol}：{exc}"
+                    )
+                else:
+                    imported_labels.append(f"{resolved_record.strategy_name or resolved_record.strategy_id} {resolved_record.symbol}")
+                    started_session_ids.append(session_id)
+        else:
+            first_item = bundle.items[0] if bundle.items else None
+            if first_item is not None:
+                resolved_api_name, api_note = self._resolve_bundle_import_api(
+                    first_item.record,
+                    mode=str(selection.get("mode", "preserve")),
+                    selected_api_name=str(selection.get("api_name", "")),
+                )
+                if api_note and api_note not in api_notes:
+                    api_notes.append(api_note)
+                if str(selection.get("mode", "")).strip().lower() in {"current", "selected"} and not resolved_api_name:
+                    skipped_summaries.append(f"{first_item.record.strategy_name or first_item.record.strategy_id} {first_item.record.symbol}：目标 API 不可用")
+                else:
+                    resolved_config = first_item.record.config
+                    has_risk_amount = resolved_config.risk_amount is not None and resolved_config.risk_amount > 0
+                    has_fixed_size = resolved_config.order_size is not None and resolved_config.order_size > 0
+                    if not has_risk_amount and not has_fixed_size and first_item.unit_quota > 0:
+                        resolved_config = replace(
+                            resolved_config,
+                            risk_amount=None,
+                            order_size=first_item.unit_quota,
+                        )
+                    resolved_record = replace(
+                        first_item.record,
+                        api_name=resolved_api_name or first_item.record.api_name,
+                        config=resolved_config,
+                    )
+                    try:
+                        definition, applied_api, _ = self._apply_strategy_template_record(resolved_record)
+                    except Exception as exc:
+                        start_failed_summaries.append(
+                            f"{resolved_record.strategy_name or resolved_record.strategy_id} {resolved_record.symbol}：{exc}"
+                        )
+                    else:
+                        imported_labels.append(f"{definition.name} {resolved_record.symbol}")
+                        if applied_api:
+                            api_notes.append(f"首条已回填到启动区，当前 API：{applied_api}")
+
+        summary_lines = [
+            f"组合包：{bundle.package_name}",
+            f"组合条数：{len(bundle.items)} 条",
+            f"自动启动：{len(started_session_ids)} 条" if auto_start_enabled else "自动启动：未启用（已回填首条到启动区）",
+            f"跳过：{len(skipped_summaries)} 条",
+            f"失败：{len(start_failed_summaries)} 条",
+        ]
+        if imported_labels:
+            summary_lines.append(f"已处理：{', '.join(imported_labels[:5])}{' ...' if len(imported_labels) > 5 else ''}")
+        if api_notes:
+            summary_lines.append("")
+            summary_lines.append("API 处理：")
+            summary_lines.extend(f"- {text}" for text in api_notes[:3])
+        quota_mapped_count = sum(
+            1
+            for item in bundle.items
+            if (item.record.config.risk_amount is None or item.record.config.risk_amount <= 0)
+            and (item.record.config.order_size is None or item.record.config.order_size <= 0)
+            and item.unit_quota > 0
+        )
+        if quota_mapped_count > 0:
+            summary_lines.append("")
+            summary_lines.append(f"仓位映射：{quota_mapped_count} 条策略已把组合包单次额度映射为普通策略固定数量。")
+        if skipped_summaries:
+            summary_lines.append("")
+            summary_lines.append("跳过项：")
+            summary_lines.extend(f"- {text}" for text in skipped_summaries[:5])
+        if start_failed_summaries:
+            summary_lines.append("")
+            summary_lines.append("失败项：")
+            summary_lines.extend(f"- {text}" for text in start_failed_summaries[:5])
+
+        if started_session_ids:
+            focused = self._focus_first_running_session(started_session_ids, filter_label="普通量化")
+            summary_lines.append("")
+            summary_lines.append(
+                "运行中策略：已自动定位到首条已启动普通策略。"
+                if focused
+                else "运行中策略：已启动普通策略，但当前未能自动定位，请手动查看运行中策略列表。"
+            )
+        elif not auto_start_enabled and imported_labels:
+            summary_lines.append("")
+            summary_lines.append("说明：普通策略在未勾选自动启动时，不会进入运行中列表；本次只把首条回填到启动区。")
+
+        if not imported_labels and not started_session_ids and not skipped_summaries and not start_failed_summaries:
+            messagebox.showwarning("导入完成", "\n".join(summary_lines))
+            return
+        messagebox.showinfo("导入完成", "\n".join(summary_lines))
+
     @staticmethod
     def _session_blocks_duplicate_launch(session: StrategySession) -> bool:
         return session.engine.is_running or session.status in {"运行中", "停止中"}
