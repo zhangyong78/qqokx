@@ -9,6 +9,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA5_EMA8_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
+    get_strategy_definition,
 )
 from okx_quant.strategy_parameters import (
     iter_strategy_parameter_keys,
@@ -63,3 +64,8 @@ class StrategyParametersTest(TestCase):
         self.assertIn("entry_reference_ema_period", iter_strategy_parameter_keys(STRATEGY_DYNAMIC_LONG_ID))
         self.assertNotIn("hold_close_exit_bars", iter_strategy_parameter_keys(STRATEGY_DYNAMIC_LONG_ID))
         self.assertIn("hold_close_exit_bars", iter_strategy_parameter_keys(STRATEGY_EMA_BREAKOUT_LONG_ID))
+
+    def test_strategy_definition_exposes_backward_compatible_default_signal_mode(self) -> None:
+        self.assertEqual(get_strategy_definition(STRATEGY_DYNAMIC_LONG_ID).default_signal_mode, "long_only")
+        self.assertEqual(get_strategy_definition(STRATEGY_DYNAMIC_SHORT_ID).default_signal_mode, "short_only")
+        self.assertEqual(get_strategy_definition(STRATEGY_EMA5_EMA8_ID).default_signal_mode, "both")

@@ -50,6 +50,15 @@ class StrategyDefinition:
     supports_batch_observe: bool = False
     supports_trader_desk: bool = False
 
+    @property
+    def default_signal_mode(self) -> str:
+        """Backward-compatible signal mode value for older launcher/import paths."""
+        if self.default_signal_label == "只做多":
+            return "long_only"
+        if self.default_signal_label == "只做空":
+            return "short_only"
+        return "both"
+
 
 ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     StrategyDefinition(
