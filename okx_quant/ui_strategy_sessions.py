@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -23,6 +23,25 @@ class UiStrategySessionsMixin:
         if normalized_trade == normalized_signal:
             return normalized_signal
         return f"{normalized_signal} -> {normalized_trade}"
+
+    @staticmethod
+    def _format_optional_positive_entry_decimal(value: Decimal | None) -> str:
+        if value is None or value <= 0:
+            return ""
+        return _format_entry_decimal(value)
+
+    @staticmethod
+    def _parse_optional_nonnegative_decimal_input(raw: str, field_name: str) -> Decimal | None:
+        cleaned = raw.strip()
+        if not cleaned:
+            return None
+        try:
+            value = Decimal(cleaned)
+        except InvalidOperation as exc:
+            raise ValueError(f"{field_name} 不是有效数字") from exc
+        if value < 0:
+            raise ValueError(f"{field_name} 不能小于 0")
+        return value
 
     @staticmethod
     def _default_strategy_template_filename(record: StrategyTemplateRecord) -> str:
@@ -89,8 +108,8 @@ class UiStrategySessionsMixin:
         self.atr_period.set(str(record.config.atr_period))
         self.stop_atr.set(_format_entry_decimal(record.config.atr_stop_multiplier))
         self.take_atr.set(_format_entry_decimal(record.config.atr_take_multiplier))
-        self.risk_amount.set(_format_entry_decimal(record.config.risk_amount))
-        self.order_size.set(_format_entry_decimal(record.config.order_size))
+        self.risk_amount.set(self._format_optional_positive_entry_decimal(record.config.risk_amount))
+        self.order_size.set(self._format_optional_positive_entry_decimal(record.config.order_size))
         self.poll_seconds.set(_format_entry_float(record.config.poll_seconds))
         self.signal_mode_label.set(
             _strategy_template_direction_label(
@@ -3986,7 +4005,7 @@ class UiStrategySessionsMixin:
         if fixed_signal_mode is not None:
             effective_signal_mode = str(fixed_signal_mode)
         risk_amount = self._parse_optional_positive_decimal(self.risk_amount.get(), "风险金")
-        order_size = self._parse_optional_positive_decimal(self.order_size.get(), "固定数量") or Decimal("0")
+        order_size = self._parse_optional_nonnegative_decimal_input(self.order_size.get(), "固定数量") or Decimal("0")
         max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
         startup_chase_window_seconds = 0
         entry_reference_ema_period = 0
