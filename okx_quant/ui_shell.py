@@ -707,6 +707,10 @@ class StrategyTradeRuntimeState:
     protective_algo_cl_ord_id: str = ""
     initial_stop_price: Decimal | None = None
     current_stop_price: Decimal | None = None
+    management_mode: str = "auto"
+    manual_reason: str = ""
+    manual_override_stop_price: Decimal | None = None
+    manual_override_at: datetime | None = None
     reconciliation_started: bool = False
 
 
@@ -3724,51 +3728,58 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         control_row = ttk.Frame(running_frame)
         control_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Button(control_row, text="\u505c\u6b62\u9009\u4e2d\u7b56\u7565", command=self.stop_selected_session).grid(row=0, column=0)
+        ttk.Button(control_row, text="提前平仓", command=self.manual_flatten_selected_session).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(control_row, text="修改止损", command=self.manual_adjust_selected_session_stop_loss).grid(
+            row=0, column=2, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="恢复自动", command=self.resume_selected_session_auto_management).grid(
+            row=0, column=3, padx=(8, 0)
+        )
         ttk.Button(control_row, textvariable=self.global_email_toggle_text, command=self.toggle_global_email_notifications).grid(
-            row=0, column=1, padx=(8, 0)
+            row=0, column=4, padx=(8, 0)
         )
         ttk.Button(control_row, text="\u5f00\u542f\u90ae\u4ef6", command=self.enable_selected_session_email_notifications).grid(
             row=0,
-            column=2,
+            column=5,
             padx=(8, 0),
         )
         ttk.Button(control_row, text="\u5173\u95ed\u90ae\u4ef6", command=self.disable_selected_session_email_notifications).grid(
             row=0,
-            column=3,
+            column=6,
             padx=(8, 0),
         )
         ttk.Button(control_row, text="\u5b9e\u65f6K\u7ebf\u56fe", command=self.open_selected_strategy_live_chart).grid(
-            row=0, column=4, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="BTC行情分析", command=self.open_btc_market_analysis_window).grid(
-            row=0, column=5, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="\u4fe1\u53f7\u89c2\u5bdf\u53f0", command=self.open_signal_monitor_window).grid(
-            row=0, column=6, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="\u4ea4\u6613\u5458\u7ba1\u7406\u53f0", command=self.open_trader_desk_window).grid(
             row=0, column=7, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u6e05\u7a7a\u5df2\u505c\u6b62", command=self.clear_stopped_sessions).grid(
+        ttk.Button(control_row, text="BTC行情分析", command=self.open_btc_market_analysis_window).grid(
             row=0, column=8, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u5386\u53f2\u7b56\u7565", command=self.open_strategy_history_window).grid(
+        ttk.Button(control_row, text="\u4fe1\u53f7\u89c2\u5bdf\u53f0", command=self.open_signal_monitor_window).grid(
             row=0, column=9, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u7b56\u7565\u603b\u8d26\u672c", command=self.open_strategy_book_window).grid(
+        ttk.Button(control_row, text="\u4ea4\u6613\u5458\u7ba1\u7406\u53f0", command=self.open_trader_desk_window).grid(
             row=0, column=10, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u5bfc\u51fa\u9009\u4e2d\u53c2\u6570", command=self.export_selected_session_template).grid(
+        ttk.Button(control_row, text="\u6e05\u7a7a\u5df2\u505c\u6b62", command=self.clear_stopped_sessions).grid(
             row=0, column=11, padx=(8, 0)
         )
-        ttk.Button(control_row, text="\u5bfc\u5165\u7b56\u7565\u53c2\u6570", command=self.import_strategy_template).grid(
+        ttk.Button(control_row, text="\u5386\u53f2\u7b56\u7565", command=self.open_strategy_history_window).grid(
             row=0, column=12, padx=(8, 0)
         )
-        ttk.Button(control_row, text="导入策略组合", command=self.import_strategy_template_bundle).grid(
+        ttk.Button(control_row, text="\u7b56\u7565\u603b\u8d26\u672c", command=self.open_strategy_book_window).grid(
             row=0, column=13, padx=(8, 0)
         )
-        ttk.Button(control_row, text="恢复选中策略", command=self.recover_selected_session).grid(
+        ttk.Button(control_row, text="\u5bfc\u51fa\u9009\u4e2d\u53c2\u6570", command=self.export_selected_session_template).grid(
             row=0, column=14, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="\u5bfc\u5165\u7b56\u7565\u53c2\u6570", command=self.import_strategy_template).grid(
+            row=0, column=15, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="导入策略组合", command=self.import_strategy_template_bundle).grid(
+            row=0, column=16, padx=(8, 0)
+        )
+        ttk.Button(control_row, text="恢复选中策略", command=self.recover_selected_session).grid(
+            row=0, column=17, padx=(8, 0)
         )
 
         detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)

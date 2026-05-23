@@ -17,6 +17,35 @@ function U([string]$s) {
     return [regex]::Unescape($s)
 }
 
+function Resolve-GitExecutable {
+    $command = Get-Command git -ErrorAction SilentlyContinue
+    if ($command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
+        return $command.Source
+    }
+
+    $candidates = @(
+        (Join-Path $env:ProgramFiles 'Git\cmd\git.exe'),
+        (Join-Path $env:ProgramFiles 'Git\bin\git.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Git\cmd\git.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Git\bin\git.exe'),
+        (Join-Path $env:LocalAppData 'Programs\Git\cmd\git.exe'),
+        (Join-Path $env:LocalAppData 'Programs\Git\bin\git.exe')
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
+    if ($candidates.Count -gt 0) {
+        return $candidates[0]
+    }
+
+    throw (U '\u672a\u627e\u5230 git \u53ef\u6267\u884c\u6587\u4ef6\u3002\u8bf7\u5148\u5b89\u88c5 Git\uff0c\u6216\u628a git.exe \u52a0\u5165 PATH \u540e\u518d\u6267\u884c\u53d1\u7248\u811a\u672c\u3002')
+}
+
+function Invoke-GitCommand([string[]]$Arguments) {
+    & $script:GitExe @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw ("git " + ($Arguments -join " ") + " failed with exit code $LASTEXITCODE.")
+    }
+}
+
 function Get-CurrentVersion {
     $pyproject = Join-Path $repoRoot "pyproject.toml"
     $match = Select-String -Path $pyproject -Pattern '^\s*version\s*=\s*"(?<version>\d+\.\d+\.\d+)"\s*$' | Select-Object -First 1
@@ -48,7 +77,7 @@ function Update-TextFile([string]$Path, [scriptblock]$Updater) {
 
 function Invoke-GitUtf8([string[]]$Arguments) {
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = "git"
+    $psi.FileName = $script:GitExe
     $psi.Arguments = (($Arguments | ForEach-Object {
         if ($_ -match '[\s"]') {
             '"' + ($_ -replace '"', '\"') + '"'
@@ -75,6 +104,8 @@ function Invoke-GitUtf8([string[]]$Arguments) {
     }
     return $stdout
 }
+
+$script:GitExe = Resolve-GitExecutable
 
 function Get-ChangedFiles {
     $raw = Invoke-GitUtf8 @('-c', 'core.quotepath=false', 'ls-files', '-m', '-o', '--exclude-standard', '-z')
@@ -213,23 +244,21 @@ if ($DryRun) {
 
 Update-Version-Files -oldVersionText $currentVersionText -newVersionText $nextVersionText -releaseSummary $releaseSummary
 if (-not $SkipBuild) { python scripts\build_server_package.py }
-git add -u
-if ($LASTEXITCODE -ne 0) { throw (U '\u6253\u5305\u6210\u529f\uff0c\u4f46 git add -u \u5931\u8d25\u3002') }
+Invoke-GitCommand @('add', '-u')
 $changedFiles = Get-ChangedFiles
 if ($changedFiles.Count -gt 0) {
     $tempList = [System.IO.Path]::GetTempFileName()
     try {
         [System.IO.File]::WriteAllText($tempList, ($changedFiles -join "`0") + "`0", [System.Text.UTF8Encoding]::new($false))
-        git add --pathspec-from-file=$tempList --pathspec-file-nul
-        if ($LASTEXITCODE -ne 0) { throw (U '\u6253\u5305\u6210\u529f\uff0c\u4f46 git add \u65b0\u6587\u4ef6\u5931\u8d25\u3002') }
+        Invoke-GitCommand @("add", "--pathspec-from-file=$tempList", '--pathspec-file-nul')
     }
     finally {
         Remove-Item -LiteralPath $tempList -ErrorAction SilentlyContinue
     }
 }
-git diff --cached --quiet
+& $script:GitExe 'diff' '--cached' '--quiet'
 if ($LASTEXITCODE -eq 0) { Write-Host (U '\u6ca1\u6709\u53ef\u63d0\u4ea4\u7684\u6587\u4ef6\u3002'); exit 0 }
 if ([string]::IsNullOrWhiteSpace($CommitMessage)) { $CommitMessage = "release: v$nextVersionText automated one-click release" }
-git commit -m $CommitMessage
-if (-not $SkipPush) { git push origin main }
+Invoke-GitCommand @('commit', '-m', $CommitMessage)
+if (-not $SkipPush) { Invoke-GitCommand @('push', 'origin', 'main') }
 Write-Host "DONE v$nextVersionText"

@@ -3161,6 +3161,199 @@ class UiStrategySessionsMixin:
             show_dialog=True,
         )
 
+    def _clear_session_manual_management_state(self, session: StrategySession) -> None:
+        trade = session.active_trade
+        if trade is not None:
+            trade.management_mode = "auto"
+            trade.manual_reason = ""
+            trade.manual_override_stop_price = None
+            trade.manual_override_at = None
+        try:
+            session.engine.resume_automatic_trade_management()
+        except Exception:
+            pass
+
+    def _set_session_manual_management_state(
+        self,
+        session: StrategySession,
+        *,
+        reason: str,
+        stop_price: Decimal | None,
+        runtime_status: str,
+    ) -> None:
+        trade = session.active_trade
+        if trade is not None:
+            trade.management_mode = "manual"
+            trade.manual_reason = reason
+            trade.manual_override_stop_price = stop_price
+            trade.manual_override_at = datetime.now()
+            if stop_price is not None:
+                trade.current_stop_price = stop_price
+        session.runtime_status = runtime_status
+        self._upsert_session_row(session)
+        self._refresh_selected_session_details()
+
+    def _selected_session_live_position(self, session: StrategySession) -> OkxPosition | None:
+        credentials = self._credentials_for_profile_or_none(session.api_name)
+        if credentials is None:
+            raise ValueError("未找到该会话对应的 API 凭证。")
+        positions = self.client.get_positions(credentials, environment=session.config.environment)
+        trade_inst_id = _session_trade_inst_id(session)
+        expected_sides = _session_expected_position_sides(session)
+        matches = [
+            position
+            for position in positions
+            if position.position != 0
+            and _position_matches_session_live_pnl(
+                position,
+                trade_inst_id=trade_inst_id,
+                expected_sides=expected_sides,
+            )
+        ]
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        trade = session.active_trade
+        trade_size = abs(trade.size) if trade is not None and trade.size is not None else None
+        if trade_size is not None:
+            for position in matches:
+                avail = abs(position.avail_position or position.position or Decimal("0"))
+                total = abs(position.position or Decimal("0"))
+                if trade_size in {avail, total}:
+                    return position
+        return sorted(matches, key=lambda item: abs(item.position), reverse=True)[0]
+
+    def manual_flatten_selected_session(self) -> None:
+        session = self._selected_session()
+        if session is None:
+            messagebox.showinfo("提示", "请先在右侧选择一个策略会话。", parent=self.root)
+            return
+        if session.active_trade is None:
+            messagebox.showinfo("提示", "当前选中策略没有处于管理中的持仓。", parent=self.root)
+            return
+        confirmed = messagebox.askyesno(
+            "确认提前平仓",
+            f"确认对会话 {session.session_id} 当前持仓执行市价提前平仓吗？\n\n策略不会停止，当前轮结束后会继续等待下一轮信号。",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        try:
+            position = self._selected_session_live_position(session)
+            if position is None:
+                raise ValueError("当前没有检测到可平的真实持仓。")
+            previous_profile = self._positions_context_profile_name
+            self._positions_context_profile_name = session.api_name
+            try:
+                result, _price, normalized_mode = self._submit_selected_position_manual_flatten(position, "market")
+            finally:
+                self._positions_context_profile_name = previous_profile
+            session.engine.mark_manual_flatten()
+            self._set_session_manual_management_state(
+                session,
+                reason="manual_flatten",
+                stop_price=None,
+                runtime_status="人工平仓中",
+            )
+            mode_label = self._position_manual_flatten_mode_label(normalized_mode)
+            self._log_session_message(
+                session,
+                f"人工提前平仓已提交 | 方式={mode_label} | ordId={result.ord_id or '-'} | 当前轮转入人工接管收尾。",
+            )
+        except Exception as exc:
+            messagebox.showerror("提前平仓失败", str(exc), parent=self.root)
+
+    def manual_adjust_selected_session_stop_loss(self) -> None:
+        session = self._selected_session()
+        if session is None:
+            messagebox.showinfo("提示", "请先在右侧选择一个策略会话。", parent=self.root)
+            return
+        trade = session.active_trade
+        if trade is None:
+            messagebox.showinfo("提示", "当前选中策略没有处于管理中的持仓。", parent=self.root)
+            return
+        try:
+            position = self._selected_session_live_position(session)
+            if position is None:
+                raise ValueError("当前没有检测到真实持仓，不能修改止损。")
+            current_stop = trade.current_stop_price or trade.initial_stop_price
+            if current_stop is None or current_stop <= 0:
+                raise ValueError("当前轮缺少有效止损价，暂时不能修改。")
+            current_price = self.client.get_trigger_price(_session_trade_inst_id(session), session.config.tp_sl_trigger_type)
+            raw = simpledialog.askstring(
+                "修改止损",
+                f"请输入新的止损价。\n当前止损：{format_decimal(current_stop)}\n当前价格：{format_decimal(current_price)}",
+                initialvalue=format_decimal(current_stop),
+                parent=self.root,
+            )
+            if raw is None:
+                return
+            try:
+                new_stop = Decimal(str(raw).strip())
+            except InvalidOperation as exc:
+                raise ValueError("止损价格格式无效。") from exc
+            if new_stop <= 0:
+                raise ValueError("止损价格必须大于 0。")
+            direction = derive_position_direction(position)
+            if direction == "long":
+                if new_stop >= current_price:
+                    raise ValueError("多头止损必须低于当前价格。")
+                if new_stop < current_stop:
+                    raise ValueError("当前版本只允许把多头止损收紧，不能放宽。")
+            else:
+                if new_stop <= current_price:
+                    raise ValueError("空头止损必须高于当前价格。")
+                if new_stop > current_stop:
+                    raise ValueError("当前版本只允许把空头止损收紧，不能放宽。")
+
+            if session.config.tp_sl_mode == "exchange" and not session.config.trader_virtual_stop_loss:
+                credentials = self._credentials_for_profile_or_none(session.api_name)
+                if credentials is None:
+                    raise ValueError("未找到该会话对应的 API 凭证。")
+                instrument = self.client.get_instrument(_session_trade_inst_id(session))
+                session.engine.amend_exchange_manual_stop_loss(
+                    credentials,
+                    session.config,
+                    trade_instrument=instrument,
+                    algo_id=(trade.protective_algo_id or "").strip() or None,
+                    algo_cl_ord_id=(trade.protective_algo_cl_ord_id or "").strip() or None,
+                    stop_loss=new_stop,
+                )
+            else:
+                session.engine.set_manual_stop_loss_override(new_stop)
+
+            self._set_session_manual_management_state(
+                session,
+                reason="manual_stop_loss",
+                stop_price=new_stop,
+                runtime_status="持仓人工接管中",
+            )
+            self._log_session_message(
+                session,
+                f"人工止损已改为 {format_decimal(new_stop)}，当前轮暂停自动止损管理。",
+            )
+        except Exception as exc:
+            messagebox.showerror("修改止损失败", str(exc), parent=self.root)
+
+    def resume_selected_session_auto_management(self) -> None:
+        session = self._selected_session()
+        if session is None:
+            messagebox.showinfo("提示", "请先在右侧选择一个策略会话。", parent=self.root)
+            return
+        trade = session.active_trade
+        if trade is None:
+            messagebox.showinfo("提示", "当前选中策略没有处于管理中的持仓。", parent=self.root)
+            return
+        if str(trade.management_mode or "auto").strip().lower() != "manual":
+            messagebox.showinfo("提示", "当前轮已经处于自动管理状态。", parent=self.root)
+            return
+        self._clear_session_manual_management_state(session)
+        session.runtime_status = "持仓监控中"
+        self._upsert_session_row(session)
+        self._refresh_selected_session_details()
+        self._log_session_message(session, "当前轮已恢复自动管理，动态止损继续接管。")
+
     def _request_stop_strategy_session(
         self,
         session_id: str,
@@ -4239,6 +4432,7 @@ class UiStrategySessionsMixin:
                 signal_bar_at=signal_bar_at,
             )
             session.active_trade = current
+            self._clear_session_manual_management_state(session)
         elif signal_bar_at is not None and current.signal_bar_at is None:
             current.signal_bar_at = signal_bar_at
         return current
@@ -4372,6 +4566,7 @@ class UiStrategySessionsMixin:
                 "检测到仓位已关闭，但未找到该会话对应的 API 凭证，无法自动归因与结算。",
             )
             if session.active_trade is not None and session.active_trade.round_id == trade.round_id:
+                self._clear_session_manual_management_state(session)
                 session.active_trade = None
             return
         self._log_session_message(
@@ -4752,6 +4947,7 @@ class UiStrategySessionsMixin:
         if session is None:
             return
         if session.active_trade is not None and session.active_trade.round_id == result.round_id:
+            self._clear_session_manual_management_state(session)
             session.active_trade = None
         if result.environment_note:
             self._log_session_message(session, result.environment_note)
@@ -5459,6 +5655,7 @@ class UiStrategySessionsMixin:
                 "检测到仓位已关闭，但未找到该会话对应的 API 凭证，无法自动归因与结算。",
             )
             if session.active_trade is not None and session.active_trade.round_id == trade.round_id:
+                self._clear_session_manual_management_state(session)
                 session.active_trade = None
             return
         self._log_session_message(
@@ -5494,6 +5691,7 @@ class UiStrategySessionsMixin:
         except Exception as exc:
             self._enqueue_log(f"{session.log_prefix} 读取独立日志失败：{exc}")
             return session.active_trade
+        self._clear_session_manual_management_state(session)
         session.active_trade = None
         for line in lines:
             text = str(line or "").strip()
@@ -6296,6 +6494,7 @@ class UiStrategySessionsMixin:
                 session.runtime_status = "已停止"
                 session.stopped_at = datetime.now()
                 session.ended_reason = ended_reason
+                self._clear_session_manual_management_state(session)
                 session.active_trade = None
                 self._remove_recoverable_strategy_session(session.session_id)
                 self._upsert_session_row(session)

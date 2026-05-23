@@ -286,6 +286,14 @@ class StartupSignalGateState:
     blocked_signal: Literal["long", "short"] | None = None
 
 
+@dataclass(frozen=True)
+class ManualTradeControlState:
+    management_mode: Literal["auto", "manual"] = "auto"
+    manual_reason: str = ""
+    stop_loss: Decimal | None = None
+    updated_at_ms: int = 0
+
+
 class StrategyEngine:
     def __init__(
         self,
@@ -313,6 +321,7 @@ class StrategyEngine:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._order_ref_counter = 0
+        self._manual_trade_control = ManualTradeControlState()
         self._session_runner = EngineSessionRunner(self)
         self._strategy_router = EngineStrategyRouter(self)
         self._retry_policy = EngineRetryPolicy(self)
@@ -333,6 +342,62 @@ class StrategyEngine:
 
     def wait_stopped(self, timeout: float | None = None) -> bool:
         return self._session_runner.wait_stopped(timeout=timeout)
+
+    def get_manual_trade_control(self) -> ManualTradeControlState:
+        with self._lock:
+            return self._manual_trade_control
+
+    def set_manual_stop_loss_override(self, stop_loss: Decimal, *, reason: str = "manual_stop_loss") -> ManualTradeControlState:
+        state = ManualTradeControlState(
+            management_mode="manual",
+            manual_reason=str(reason or "manual_stop_loss").strip() or "manual_stop_loss",
+            stop_loss=stop_loss,
+            updated_at_ms=int(time.time() * 1000),
+        )
+        with self._lock:
+            self._manual_trade_control = state
+        return state
+
+    def mark_manual_flatten(self) -> ManualTradeControlState:
+        state = ManualTradeControlState(
+            management_mode="manual",
+            manual_reason="manual_flatten",
+            stop_loss=None,
+            updated_at_ms=int(time.time() * 1000),
+        )
+        with self._lock:
+            self._manual_trade_control = state
+        return state
+
+    def resume_automatic_trade_management(self) -> ManualTradeControlState:
+        state = ManualTradeControlState(updated_at_ms=int(time.time() * 1000))
+        with self._lock:
+            self._manual_trade_control = state
+        return state
+
+    def amend_exchange_manual_stop_loss(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        algo_id: str | None,
+        algo_cl_ord_id: str | None,
+        stop_loss: Decimal,
+    ) -> None:
+        self._amend_algo_order_with_recovery(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            algo_id=algo_id,
+            algo_cl_ord_id=algo_cl_ord_id,
+            req_id=self._next_client_order_id(role="msl"),
+            new_stop_loss_trigger_price=stop_loss,
+            new_stop_loss_trigger_price_type=config.tp_sl_trigger_type,
+            recover_algo_id=algo_id,
+            recover_algo_cl_ord_id=algo_cl_ord_id,
+        )
+        self.set_manual_stop_loss_override(stop_loss)
 
     def _run(self, credentials: Credentials, config: StrategyConfig) -> None:
         self._strategy_router.run(credentials, config)
@@ -846,6 +911,7 @@ class StrategyEngine:
                 if self._stop_event.is_set():
                     return
                 self._logger("本轮持仓已结束，继续监控下一次信号。")
+                self.resume_automatic_trade_management()
                 return
             if state == "partially_filled":
                 self._log_partial_dynamic_fill_and_stop(
@@ -2310,7 +2376,14 @@ class StrategyEngine:
                 protection.trigger_inst_id,
                 protection.trigger_price_type,
             )
-            if dynamic_take_profit_enabled:
+            manual_control = self.get_manual_trade_control()
+            manual_mode = manual_control.management_mode == "manual"
+            if manual_mode and manual_control.stop_loss is not None:
+                current_stop_loss = manual_control.stop_loss
+            if dynamic_take_profit_enabled and manual_mode:
+                stop_hit = current_price <= current_stop_loss if protection.direction == "long" else current_price >= current_stop_loss
+                take_hit = False
+            elif dynamic_take_profit_enabled:
                 holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
                 updated_stop_loss, updated_take_profit, updated_trigger_r, moved = _advance_dynamic_stop_live(
                     direction=protection.direction,
@@ -2352,6 +2425,7 @@ class StrategyEngine:
                     f"止损={format_decimal(current_stop_loss)} | 止盈={format_decimal(current_take_profit)}"
                 )
                 self._close_position(credentials, config, trade_instrument, position, reason)
+                self.resume_automatic_trade_management()
                 return
             self._stop_event.wait(config.poll_seconds)
 
@@ -2530,6 +2604,7 @@ class StrategyEngine:
                 if should_continue.seed_baseline_abs is not None:
                     baseline_abs = should_continue.seed_baseline_abs
                 if not should_continue.keep_monitoring:
+                    self.resume_automatic_trade_management()
                     return
                 self._stop_event.wait(config.poll_seconds)
                 continue
@@ -2645,6 +2720,18 @@ class StrategyEngine:
         seed_snap: Decimal | None = None
         if baseline_abs_position is None:
             seed_snap = abs(live_position.position)
+
+        manual_control = self.get_manual_trade_control()
+        if manual_control.management_mode == "manual":
+            manual_stop_loss = manual_control.stop_loss
+            return DynamicStopMonitorStepResult(
+                keep_monitoring=True,
+                current_stop_loss=manual_stop_loss if manual_stop_loss is not None else current_stop_loss,
+                next_trigger_r=next_trigger_r,
+                amend_failures=0,
+                missing_algo_strikes=0,
+                seed_baseline_abs=seed_snap,
+            )
 
         direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
         pending_tracked = self._find_pending_algo_order_for_dynamic_stop(
@@ -3906,7 +3993,7 @@ class StrategyEngine:
     ) -> None:
         message = (
             f"启动策略 | 信号标的={signal_instrument.inst_id} | 下单标的={trade_instrument.inst_id} | "
-            f"K线周期={config.bar} | EMA={config.ema_period} | ATR={config.atr_period}"
+            f"K线周期={config.bar} | 快线均线={config.ema_label()} | ATR={config.atr_period}"
         )
         if is_dynamic_strategy_id(config.strategy_id):
             message = (

@@ -39,6 +39,44 @@ from okx_quant.strategy_catalog import (
 
 
 class StrategyEngineTest(TestCase):
+    def test_log_strategy_start_uses_actual_moving_average_labels(self) -> None:
+        messages: list[str] = []
+        engine = StrategyEngine(object(), messages.append)
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_type="ma",
+            ema_period=21,
+            trend_ema_type="ema",
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            entry_reference_ema_period=0,
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+
+        engine._log_strategy_start(config, instrument, instrument)
+
+        self.assertEqual(len(messages), 1)
+        self.assertIn("快线均线=MA21", messages[0])
+        self.assertIn("趋势均线=EMA55", messages[0])
+        self.assertIn("挂单参考线=跟随快线(MA21)", messages[0])
+
     def test_get_okx_read_retry_config_env_overrides(self) -> None:
         with patch.dict(
             os.environ,
