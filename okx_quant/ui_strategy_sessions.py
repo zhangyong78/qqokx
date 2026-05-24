@@ -6109,14 +6109,35 @@ class UiStrategySessionsMixin:
                             stop_loss_algo_id=(trade.protective_algo_id or "").strip() or None,
                         )
 
+                    def _mark_recovery_back_to_running(status_note: str) -> None:
+                        session.status = "运行中"
+                        session.runtime_status = "等待信号"
+                        session.stopped_at = None
+                        session.ended_reason = ""
+                        self._remove_recoverable_strategy_session(session.session_id)
+                        self._upsert_session_row(session)
+                        self._sync_strategy_history_from_session(session)
+                        self._log_session_message(session, status_note)
+
                     def _run_pending_recovery() -> None:
+                        continue_main_loop = False
                         try:
                             _monitor_pending()
+                            if not session.engine._stop_event.is_set():
+                                continue_main_loop = True
+                                self.root.after(
+                                    0,
+                                    lambda: _mark_recovery_back_to_running(
+                                        "恢复挂单接管已完成，已切回主策略循环，继续监控下一次信号。"
+                                    ),
+                                )
+                                session.engine._run(credentials, session.config)
                         except Exception as exc:
                             session.engine._notify_error(session.config, str(exc))
                             session.engine._logger(f"策略停止，原因：{exc}")
                         finally:
-                            session.engine._stop_event.set()
+                            if not continue_main_loop or session.engine._stop_event.is_set():
+                                session.engine._stop_event.set()
 
                     session.active_trade = trade
                     session.status = "恢复中"
@@ -6267,15 +6288,36 @@ class UiStrategySessionsMixin:
                     position=position,
                 )
 
+        def _mark_recovery_back_to_running(status_note: str) -> None:
+            session.status = "运行中"
+            session.runtime_status = "等待信号"
+            session.stopped_at = None
+            session.ended_reason = ""
+            self._remove_recoverable_strategy_session(session.session_id)
+            self._upsert_session_row(session)
+            self._sync_strategy_history_from_session(session)
+            self._log_session_message(session, status_note)
+
         def _run_recovery() -> None:
+            continue_main_loop = False
             try:
                 session.engine._logger(start_message)
                 _monitor()
+                if not session.engine._stop_event.is_set():
+                    continue_main_loop = True
+                    self.root.after(
+                        0,
+                        lambda: _mark_recovery_back_to_running(
+                            "恢复持仓接管已完成，已切回主策略循环，继续监控下一次信号。"
+                        ),
+                    )
+                    session.engine._run(credentials, session.config)
             except Exception as exc:
                 session.engine._notify_error(session.config, str(exc))
                 session.engine._logger(f"策略停止，原因：{exc}")
             finally:
-                session.engine._stop_event.set()
+                if not continue_main_loop or session.engine._stop_event.is_set():
+                    session.engine._stop_event.set()
 
         session.active_trade = trade
         session.status = "恢复中"

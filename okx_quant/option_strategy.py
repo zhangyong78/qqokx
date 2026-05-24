@@ -146,6 +146,39 @@ def shift_candles(candles: list[Candle], *, offset: Decimal) -> list[Candle]:
     ]
 
 
+def scale_candles(candles: list[Candle], *, factor: Decimal) -> list[Candle]:
+    return [
+        Candle(
+            ts=item.ts,
+            open=item.open * factor,
+            high=item.high * factor,
+            low=item.low * factor,
+            close=item.close * factor,
+            volume=item.volume,
+            confirmed=item.confirmed,
+        )
+        for item in candles
+    ]
+
+
+def build_option_pnl_candles(
+    candles: list[Candle],
+    *,
+    entry_price: Decimal,
+    contract_value: Decimal,
+) -> list[Candle]:
+    return scale_candles(shift_candles(candles, offset=-entry_price), factor=contract_value)
+
+
+def build_option_pnl_value(
+    option_price: Decimal,
+    *,
+    entry_price: Decimal,
+    contract_value: Decimal,
+) -> Decimal:
+    return (option_price - entry_price) * contract_value
+
+
 def convert_candles_by_reference(candles: list[Candle], reference_candles: list[Candle]) -> list[Candle]:
     reference_map = {item.ts: item for item in reference_candles if item.confirmed}
     converted: list[Candle] = []

@@ -23,6 +23,8 @@ from okx_quant.option_strategy import (
     StrategyLegDefinition,
     StrategyPayoffPoint,
     StrategyPayoffSnapshot,
+    build_option_pnl_candles,
+    build_option_pnl_value,
     build_composite_candles,
     build_default_formula,
     build_option_chain_rows,
@@ -151,7 +153,7 @@ class OptionStrategyCalculatorWindow:
         self.chain_selection_text = StringVar(value="选择一个行权价后，可把认购 / 认沽直接加入策略腿。")
         self.strategy_summary_text = StringVar(value="暂无策略腿。")
         self.payoff_summary_text = StringVar(value="加入策略腿后，可生成到期盈亏图。")
-        self.combo_summary_text = StringVar(value="组合 K 线采用 OKX 期权标记价格。")
+        self.combo_summary_text = StringVar(value="组合浮盈亏 K 线按 持仓价差*张数*每张面值 计算；上涨代表盈利，回落代表亏损。")
         self.volatility_summary_text = StringVar(value="波动率 K 线使用 Deribit 波动率指数缓存。")
         self.overlay_summary_text = StringVar(
             value="叠加对比：组合 K 线、Deribit DVOL、标的现货 USDT K 线三图共用时间轴；周期在上方切换。"
@@ -343,7 +345,7 @@ class OptionStrategyCalculatorWindow:
         )
         ttk.Label(
             formula_panel,
-            text="公式支持线性表达式，例如 L1 - 2*L2 + 0.5；K 线周期和数量在“组合K线”页签切换。",
+            text="公式支持线性表达式，例如 L1 - 2*L2 + 0.5；组合浮盈亏 K 线会按 (标记价-持仓价)*张数*每张面值 自动换算，K 线周期和数量在“组合K线”页签切换。",
             wraplength=1240,
             justify="left",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
@@ -585,7 +587,7 @@ class OptionStrategyCalculatorWindow:
         if self._payoff_canvas is not None:
             self._clear_canvas(self._payoff_canvas, "加入策略腿后，可生成到期盈亏图。")
         if self._combo_canvas is not None:
-            self._clear_canvas(self._combo_canvas, "组合 K 线使用期权标记价格；先加入策略腿再生成。")
+            self._clear_canvas(self._combo_canvas, "组合浮盈亏 K 线按持仓价差计算；先加入策略腿再生成。")
 
     def _load_saved_strategies(self) -> None:
         try:
@@ -1169,9 +1171,9 @@ class OptionStrategyCalculatorWindow:
         if self._payoff_canvas is not None:
             self._clear_canvas(self._payoff_canvas, "加入策略腿后，可生成到期盈亏图。")
         if self._combo_canvas is not None:
-            self._clear_canvas(self._combo_canvas, "组合 K 线使用期权标记价格；先加入策略腿再生成。")
+            self._clear_canvas(self._combo_canvas, "组合浮盈亏 K 线按持仓价差计算；先加入策略腿再生成。")
         self.payoff_summary_text.set("加入策略腿后，可生成到期盈亏图。")
-        self.combo_summary_text.set("组合 K 线采用 OKX 期权标记价格。")
+        self.combo_summary_text.set("组合浮盈亏 K 线按 持仓价差*张数*每张面值 计算；上涨代表盈利，回落代表亏损。")
 
     def _render_legs(self) -> None:
         if self._legs_tree is None:
@@ -1736,7 +1738,7 @@ class OptionStrategyCalculatorWindow:
                     hover_target="big_combo",
                 )
             else:
-                self._clear_canvas(self._big_combo_canvas, "组合 K 线使用期权标记价格；先加入策略腿再生成。")
+                self._clear_canvas(self._big_combo_canvas, "组合浮盈亏 K 线按持仓价差计算；先加入策略腿再生成。")
             return
 
         volatility_candles = self._current_volatility_candles()
@@ -1826,11 +1828,19 @@ class OptionStrategyCalculatorWindow:
                 latest_quotes[leg.inst_id] = quote
                 if quote.reference_price is None:
                     raise ValueError(f"{leg.inst_id} 当前缺少标记价 / 最新价，无法计算。")
+                if leg.premium is None:
+                    raise ValueError(f"{leg.inst_id} 缺少持仓价，无法生成组合浮盈亏 K 线。")
                 if current_underlying_price is None and quote.index_price is not None:
                     current_underlying_price = quote.index_price
                 resolved_legs.append(resolve_strategy_leg(leg, instrument))
+                contract_value = option_contract_value(instrument)
                 candles = self.client.get_mark_price_candles(leg.inst_id, self.bar.get().strip(), limit=candle_limit)
-                candles_by_alias[leg.alias] = [item for item in candles if item.confirmed]
+                confirmed_candles = [item for item in candles if item.confirmed]
+                candles_by_alias[leg.alias] = build_option_pnl_candles(
+                    confirmed_candles,
+                    entry_price=leg.premium,
+                    contract_value=contract_value,
+                )
 
             spot_usdt_price, spot_usdt_candles = self._load_usdt_reference_context(
                 active_legs,
@@ -1861,7 +1871,13 @@ class OptionStrategyCalculatorWindow:
                 for alias, value in implied_volatility_by_alias.items()
             }
             latest_values = {
-                leg.alias: latest_quotes[leg.inst_id].reference_price or Decimal("0")
+                leg.alias: build_option_pnl_value(
+                    latest_quotes[leg.inst_id].reference_price or Decimal("0"),
+                    entry_price=leg.premium or Decimal("0"),
+                    contract_value=option_contract_value(
+                        self._instrument_map.get(leg.inst_id) or latest_quotes[leg.inst_id].instrument
+                    ),
+                )
                 for leg in active_legs
             }
             combo_candles = build_composite_candles(
@@ -1909,13 +1925,27 @@ class OptionStrategyCalculatorWindow:
                 latest_quotes[leg.inst_id] = quote
                 if quote.reference_price is None:
                     raise ValueError(f"{leg.inst_id} 当前缺少标记价 / 最新价，无法计算。")
+                if leg.premium is None:
+                    raise ValueError(f"{leg.inst_id} 缺少持仓价，无法生成组合浮盈亏 K 线。")
                 if current_underlying_price is None and quote.index_price is not None:
                     current_underlying_price = quote.index_price
+                contract_value = option_contract_value(instrument)
                 candles = self.client.get_mark_price_candles(leg.inst_id, self.bar.get().strip(), limit=candle_limit)
-                candles_by_alias[leg.alias] = [item for item in candles if item.confirmed]
+                confirmed_candles = [item for item in candles if item.confirmed]
+                candles_by_alias[leg.alias] = build_option_pnl_candles(
+                    confirmed_candles,
+                    entry_price=leg.premium,
+                    contract_value=contract_value,
+                )
 
             latest_values = {
-                leg.alias: latest_quotes[leg.inst_id].reference_price or Decimal("0")
+                leg.alias: build_option_pnl_value(
+                    latest_quotes[leg.inst_id].reference_price or Decimal("0"),
+                    entry_price=leg.premium or Decimal("0"),
+                    contract_value=option_contract_value(
+                        self._instrument_map.get(leg.inst_id) or latest_quotes[leg.inst_id].instrument
+                    ),
+                )
                 for leg in active_legs
             }
             combo_candles = build_composite_candles(
@@ -2034,11 +2064,25 @@ class OptionStrategyCalculatorWindow:
                 latest_quotes[leg.inst_id] = quote
                 if quote.reference_price is None:
                     raise ValueError(f"{leg.inst_id} 当前缺少标记价 / 最新价，无法计算。")
+                if leg.premium is None:
+                    raise ValueError(f"{leg.inst_id} 缺少持仓价，无法生成组合浮盈亏 K 线。")
+                contract_value = option_contract_value(instrument)
                 candles = self.client.get_mark_price_candles(leg.inst_id, bar, limit=candle_limit)
-                candles_by_alias[leg.alias] = [item for item in candles if item.confirmed]
+                confirmed_candles = [item for item in candles if item.confirmed]
+                candles_by_alias[leg.alias] = build_option_pnl_candles(
+                    confirmed_candles,
+                    entry_price=leg.premium,
+                    contract_value=contract_value,
+                )
 
             latest_values = {
-                leg.alias: latest_quotes[leg.inst_id].reference_price or Decimal("0")
+                leg.alias: build_option_pnl_value(
+                    latest_quotes[leg.inst_id].reference_price or Decimal("0"),
+                    entry_price=leg.premium or Decimal("0"),
+                    contract_value=option_contract_value(
+                        self._instrument_map.get(leg.inst_id) or latest_quotes[leg.inst_id].instrument
+                    ),
+                )
                 for leg in active_legs
             }
             combo_candles = build_composite_candles(
@@ -2144,7 +2188,7 @@ class OptionStrategyCalculatorWindow:
         note_text = f" | {self._overlay_deribit_resolution_note}" if self._overlay_deribit_resolution_note else ""
         period_text = self._overlay_period_display()
         self.overlay_summary_text.set(
-            f"叠加对比 | 上=标记价格组合K线({combo_ccy}) | 中=Deribit {vol_ccy} DVOL (%) | 下={spot_label} 现货 | "
+            f"叠加对比 | 上=组合浮盈亏K线({combo_ccy}) | 中=Deribit {vol_ccy} DVOL (%) | 下={spot_label} 现货 | "
             f"共用时间轴 | 周期 {period_text}{note_text} | 对齐 {len(rows)} 根"
         )
         visible = self._apply_kline_view("big_overlay", rows)
@@ -2392,7 +2436,7 @@ class OptionStrategyCalculatorWindow:
                 f"O {_format_compact_number(latest_candle.open)} / H {_format_compact_number(latest_candle.high)} / "
                 f"L {_format_compact_number(latest_candle.low)} / C {_format_compact_number(latest_candle.close)}"
                 if latest_candle is not None
-                else "暂无组合 K 线"
+                else "暂无组合浮盈亏 K 线"
             )
             note = ""
             if self._display_in_usdt() and not converted:
@@ -2410,7 +2454,7 @@ class OptionStrategyCalculatorWindow:
                     alignment_note = f" | {requested_text}，{actual_text}"
             self.combo_summary_text.set(
                 f"公式: {formula}\n"
-                f"周期 {self.bar.get().strip()} | 根数 {len(combo_candles)} | 单位 {combo_ccy} | 最新组合值 {latest_value_text} | {latest_candle_text}{note}{alignment_note}"
+                f"周期 {self.bar.get().strip()} | 根数 {len(combo_candles)} | 单位 {combo_ccy} | 最新组合浮盈亏 {latest_value_text} | {latest_candle_text} | 口径 (标记价-持仓价)*张数*每张面值{note}{alignment_note}"
             )
             if self._combo_canvas is not None:
                 visible_combo_candles = self._apply_kline_view("main_combo", combo_candles)
@@ -2784,10 +2828,22 @@ class OptionStrategyCalculatorWindow:
         aliases = {item.alias for item in self._legs if item.alias.strip()}
         combo_value: str = "-"
         try:
-            latest_values = {
-                leg.alias: (self._quotes_by_inst_id.get(leg.inst_id).reference_price if self._quotes_by_inst_id.get(leg.inst_id) else leg.premium)
-                for leg in self._legs
-            }
+            latest_values: dict[str, Decimal | None] = {}
+            for leg in self._legs:
+                quote = self._quotes_by_inst_id.get(leg.inst_id)
+                reference_value = quote.reference_price if quote is not None else leg.premium
+                instrument = self._instrument_map.get(leg.inst_id)
+                if reference_value is None or leg.premium is None:
+                    latest_values[leg.alias] = None
+                    continue
+                if instrument is None:
+                    latest_values[leg.alias] = reference_value - leg.premium
+                    continue
+                latest_values[leg.alias] = build_option_pnl_value(
+                    reference_value,
+                    entry_price=leg.premium,
+                    contract_value=option_contract_value(instrument),
+                )
             if all(value is not None for value in latest_values.values()):
                 combo_value = _format_compact_number(
                     evaluate_linear_formula(
@@ -2827,7 +2883,7 @@ class OptionStrategyCalculatorWindow:
             else ""
         )
         self.strategy_summary_text.set(
-            f"策略腿 {len(self._legs)} 条 | 净权利金 {premium_text} | 当前组合值 {combo_value}{underlying_text}\n"
+            f"策略腿 {len(self._legs)} 条 | 净权利金 {premium_text} | 当前组合浮盈亏 {combo_value}{underlying_text}\n"
             f"组合公式 {formula or '-'}"
         )
 
@@ -3052,7 +3108,9 @@ class OptionStrategyCalculatorWindow:
         height = max(canvas.winfo_height(), 420)
         left = 62
         right = 24
-        top = 22
+        header_height = 28
+        header_gap = 8
+        top = 22 + header_height + header_gap
         bottom = 38
         inner_width = width - left - right
         inner_height = height - top - bottom
@@ -3076,6 +3134,8 @@ class OptionStrategyCalculatorWindow:
             return top + float(ratio) * inner_height
 
         bounds = ChartBounds(left=float(left), top=float(top), right=float(width - right), bottom=float(height - bottom))
+        header_bottom = top - header_gap
+        canvas.create_rectangle(left, 22, width - right, header_bottom, outline="", fill="#ffffff")
         canvas.create_rectangle(left, top, width - right, height - bottom, outline="#d0d7de")
 
         for price_value in _axis_values(price_min, price_max, steps=4):
@@ -3132,10 +3192,10 @@ class OptionStrategyCalculatorWindow:
             )
 
         latest = candles[-1]
-        title_prefix = chart_title if chart_title else f"标记价格组合K线 ({value_ccy})"
+        title_prefix = chart_title if chart_title else f"组合浮盈亏K线 ({value_ccy})"
         canvas.create_text(
             width - right,
-            top + 10,
+            22 + (header_height / 2),
             text=(
                 f"{title_prefix} | 最新 O {_format_compact_number(latest.open)} "
                 f"H {_format_compact_number(latest.high)} L {_format_compact_number(latest.low)} C {_format_compact_number(latest.close)}"
@@ -3423,7 +3483,7 @@ class OptionStrategyCalculatorWindow:
             width - right,
             top + 10,
             text=(
-                f"叠加对比 | 左轴=组合K线({combo_ccy}) C {_format_compact_number(latest_combo.close)} "
+                f"叠加对比 | 左轴=组合浮盈亏K线({combo_ccy}) C {_format_compact_number(latest_combo.close)} "
                 f"| 右轴=Deribit波动率指数(%) C {_format_compact_number(latest_vol.close)}"
             ),
             anchor="ne",

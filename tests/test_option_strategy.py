@@ -25,6 +25,8 @@ from okx_quant.option_strategy import (
     StrategyLegDefinition,
     StrategyPayoffPoint,
     StrategyPayoffSnapshot,
+    build_option_pnl_candles,
+    build_option_pnl_value,
     build_composite_candles,
     build_default_formula,
     build_option_chain_rows,
@@ -44,6 +46,7 @@ from okx_quant.option_strategy import (
     parse_option_contract,
     parse_option_expiry_datetime,
     resolve_strategy_leg,
+    scale_candles,
     shift_candles,
     simulated_option_value,
 )
@@ -491,6 +494,105 @@ class OptionStrategyTest(TestCase):
         self.assertEqual(candles[0].close, Decimal("6"))
         self.assertEqual(candles[0].high, Decimal("9"))
         self.assertEqual(candles[0].low, Decimal("3"))
+
+    def test_scale_candles_multiplies_ohlc_values(self) -> None:
+        scaled = scale_candles(
+            [
+                Candle(
+                    ts=1,
+                    open=Decimal("10"),
+                    high=Decimal("12"),
+                    low=Decimal("9"),
+                    close=Decimal("11"),
+                    volume=Decimal("5"),
+                    confirmed=True,
+                )
+            ],
+            factor=Decimal("0.1"),
+        )
+        self.assertEqual(len(scaled), 1)
+        self.assertEqual(scaled[0].open, Decimal("1.0"))
+        self.assertEqual(scaled[0].high, Decimal("1.2"))
+        self.assertEqual(scaled[0].low, Decimal("0.9"))
+        self.assertEqual(scaled[0].close, Decimal("1.1"))
+        self.assertEqual(scaled[0].volume, Decimal("5"))
+
+    def test_build_option_pnl_candles_uses_entry_price_and_contract_value(self) -> None:
+        pnl_candles = build_option_pnl_candles(
+            [
+                Candle(
+                    ts=1,
+                    open=Decimal("0.10"),
+                    high=Decimal("0.11"),
+                    low=Decimal("0.09"),
+                    close=Decimal("0.12"),
+                    volume=Decimal("0"),
+                    confirmed=True,
+                )
+            ],
+            entry_price=Decimal("0.08"),
+            contract_value=Decimal("0.01"),
+        )
+        self.assertEqual(pnl_candles[0].open, Decimal("0.0002"))
+        self.assertEqual(pnl_candles[0].high, Decimal("0.0003"))
+        self.assertEqual(pnl_candles[0].low, Decimal("0.0001"))
+        self.assertEqual(pnl_candles[0].close, Decimal("0.0004"))
+
+    def test_combo_formula_tracks_short_premium_decay_as_profit(self) -> None:
+        combo = build_composite_candles(
+            "-L1 - L2",
+            {
+                "L1": build_option_pnl_candles(
+                    [
+                        Candle(
+                            ts=1,
+                            open=Decimal("0.10"),
+                            high=Decimal("0.11"),
+                            low=Decimal("0.04"),
+                            close=Decimal("0.05"),
+                            volume=Decimal("0"),
+                            confirmed=True,
+                        )
+                    ],
+                    entry_price=Decimal("0.10"),
+                    contract_value=Decimal("0.01"),
+                ),
+                "L2": build_option_pnl_candles(
+                    [
+                        Candle(
+                            ts=1,
+                            open=Decimal("0.08"),
+                            high=Decimal("0.09"),
+                            low=Decimal("0.03"),
+                            close=Decimal("0.04"),
+                            volume=Decimal("0"),
+                            confirmed=True,
+                        )
+                    ],
+                    entry_price=Decimal("0.08"),
+                    contract_value=Decimal("0.01"),
+                ),
+            },
+            allowed_names={"L1", "L2"},
+        )
+        latest = evaluate_linear_formula(
+            "-L1 - L2",
+            {
+                "L1": build_option_pnl_value(
+                    Decimal("0.05"),
+                    entry_price=Decimal("0.10"),
+                    contract_value=Decimal("0.01"),
+                ),
+                "L2": build_option_pnl_value(
+                    Decimal("0.04"),
+                    entry_price=Decimal("0.08"),
+                    contract_value=Decimal("0.01"),
+                ),
+            },
+            allowed_names={"L1", "L2"},
+        )
+        self.assertEqual(combo[0].close, Decimal("0.0009"))
+        self.assertEqual(latest, Decimal("0.0009"))
 
     def test_option_contract_value_uses_ct_val_and_ct_mult(self) -> None:
         value = option_contract_value(_make_instrument("BTC-USD-260626-90000-C"))
