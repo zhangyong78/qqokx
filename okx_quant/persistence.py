@@ -957,6 +957,7 @@ def _normalize_strategy_trade_ledger_record(item: object) -> dict[str, object] |
         "record_id": record_id,
         "history_record_id": str(item.get("history_record_id", "")).strip(),
         "session_id": session_id,
+        "round_id": str(item.get("round_id", "")).strip(),
         "api_name": str(item.get("api_name", "")).strip(),
         "strategy_id": str(item.get("strategy_id", "")).strip(),
         "strategy_name": strategy_name,

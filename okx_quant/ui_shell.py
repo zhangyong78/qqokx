@@ -727,6 +727,7 @@ class StrategyTradeLedgerRecord:
     run_mode_label: str
     environment: str
     closed_at: datetime
+    round_id: str = ""
     signal_bar_at: datetime | None = None
     opened_at: datetime | None = None
     entry_order_id: str = ""

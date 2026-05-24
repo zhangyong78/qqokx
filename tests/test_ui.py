@@ -3776,18 +3776,68 @@ class StrategyTradeTrackingTest(TestCase):
             ],
         )
         app = SimpleNamespace(
-            _next_strategy_trade_ledger_record_id=lambda session_, closed_at: "T01",
+            _next_strategy_trade_ledger_record_id=lambda session_, round_id, closed_at: "T01",
             _is_funding_fee_bill=QuantApp._is_funding_fee_bill,
         )
 
         result = QuantApp._build_strategy_trade_reconciliation_result(app, session, trade, snapshot)
 
         self.assertEqual(result.ledger_record.record_id, "T01")
+        self.assertEqual(result.ledger_record.round_id, "round-1")
         self.assertEqual(result.ledger_record.close_reason, "OKX止损触发")
         self.assertEqual(result.ledger_record.gross_pnl, Decimal("-3.78"))
         self.assertEqual(result.ledger_record.net_pnl, Decimal("-3.87"))
         self.assertIn("原因=OKX止损触发", result.attribution_summary)
         self.assertIn("累计净盈亏=-3.87", result.cumulative_summary)
+
+    def test_upsert_strategy_trade_ledger_record_dedupes_same_round(self) -> None:
+        existing = StrategyTradeLedgerRecord(
+            record_id="legacy-1",
+            history_record_id="H01",
+            session_id="S01",
+            api_name="moni",
+            strategy_id="ema_dynamic_order_long",
+            strategy_name="EMA dynamic",
+            symbol="ETH-USDT-SWAP",
+            direction_label="long_only",
+            run_mode_label="demo",
+            environment="demo",
+            closed_at=datetime(2026, 5, 23, 2, 45, 32),
+            round_id="S01-1",
+            opened_at=datetime(2026, 5, 22, 0, 36, 57),
+            entry_order_id="1001",
+            exit_order_id="2001",
+        )
+        incoming = StrategyTradeLedgerRecord(
+            record_id="S01-1",
+            history_record_id="H01",
+            session_id="S01",
+            api_name="moni",
+            strategy_id="ema_dynamic_order_long",
+            strategy_name="EMA dynamic",
+            symbol="ETH-USDT-SWAP",
+            direction_label="long_only",
+            run_mode_label="demo",
+            environment="demo",
+            closed_at=datetime(2026, 5, 23, 2, 45, 32),
+            round_id="S01-1",
+            opened_at=datetime(2026, 5, 22, 0, 36, 57),
+            entry_order_id="1001",
+            exit_order_id="2001",
+        )
+        app = SimpleNamespace(
+            _strategy_trade_ledger_records=[existing],
+            _strategy_trade_ledger_by_id={existing.record_id: existing},
+            _save_strategy_trade_ledger_records=MagicMock(),
+            _strategy_trade_ledger_business_key=lambda record: QuantApp._strategy_trade_ledger_business_key(record),
+        )
+
+        QuantApp._upsert_strategy_trade_ledger_record(app, incoming)
+
+        self.assertEqual(len(app._strategy_trade_ledger_records), 1)
+        self.assertEqual(app._strategy_trade_ledger_records[0].record_id, "S01-1")
+        self.assertEqual(set(app._strategy_trade_ledger_by_id.keys()), {"S01-1"})
+        app._save_strategy_trade_ledger_records.assert_called_once()
 
     def test_apply_financial_totals_keeps_decimal_zero_when_trade_ledger_is_empty(self) -> None:
         target = SimpleNamespace(

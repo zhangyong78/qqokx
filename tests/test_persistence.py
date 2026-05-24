@@ -352,6 +352,7 @@ class PersistenceTest(TestCase):
                     "record_id": "20260423170920000000-S01",
                     "history_record_id": "20260423081513000000-S01",
                     "session_id": "S01",
+                    "round_id": "S01-20260423080000000000",
                     "api_name": "QQzhangyong",
                     "strategy_id": "ema_dynamic_order_long",
                     "strategy_name": "EMA 动态委托-多头",
@@ -389,6 +390,7 @@ class PersistenceTest(TestCase):
         self.assertEqual(len(snapshot["records"]), 1)
         record = snapshot["records"][0]
         self.assertEqual(record["record_id"], "20260423170920000000-S01")
+        self.assertEqual(record["round_id"], "S01-20260423080000000000")
         self.assertEqual(record["close_reason"], "OKX止损触发")
         self.assertEqual(record["net_pnl"], "-3.87")
 

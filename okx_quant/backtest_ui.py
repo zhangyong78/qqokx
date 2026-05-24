@@ -1345,11 +1345,11 @@ class BacktestWindow:
         self.window.protocol("WM_DELETE_WINDOW", self._close)
         apply_adaptive_window_geometry(
             self.window,
-            width_ratio=0.8,
+            width_ratio=0.86,
             height_ratio=0.88,
             min_width=1100,
             min_height=900,
-            max_width=1580,
+            max_width=1720,
             max_height=1220,
         )
 
@@ -1480,6 +1480,31 @@ class BacktestWindow:
             or is_ema_atr_breakout_strategy(strategy_id)
             or is_adaptive_ema_rail_strategy(strategy_id)
         )
+
+    def _bind_responsive_wrap(
+        self,
+        label: ttk.Label,
+        container: object,
+        *,
+        padding: int = 40,
+        min_wrap: int = 220,
+    ) -> None:
+        def _apply_wrap(_event: object | None = None) -> None:
+            if not self._widget_exists(label):
+                return
+            try:
+                width = int(container.winfo_width())
+            except Exception:
+                return
+            if width <= 1:
+                return
+            label.configure(wraplength=max(width - padding, min_wrap))
+
+        try:
+            container.bind("<Configure>", _apply_wrap, add="+")
+        except Exception:
+            pass
+        self.window.after_idle(_apply_wrap)
 
     @staticmethod
     def _set_field_state(widget: object, *, editable: bool) -> None:
@@ -2031,37 +2056,62 @@ class BacktestWindow:
         row += 1
         ttk.Label(controls, text="回测K线数").grid(row=row, column=0, sticky="w", pady=(12, 0))
         ttk.Entry(controls, textvariable=self.candle_limit).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        ttk.Label(
+        self._candle_limit_hint_label = ttk.Label(
             controls,
             text="填 0 = 全量；填 10000 = 最新往前 10000 根；正数上限 10000。",
-        ).grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
-        history_btn_frame = ttk.Frame(controls)
-        history_btn_frame.grid(row=row, column=4, sticky="e", pady=(12, 0), padx=(0, 4))
+            justify="left",
+        )
+        self._candle_limit_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
+        self._bind_responsive_wrap(self._candle_limit_hint_label, controls, padding=48, min_wrap=280)
+        row += 1
+        actions_bar = ttk.Frame(controls)
+        actions_bar.grid(row=row, column=0, columnspan=6, sticky="ew", pady=(10, 0))
+        actions_bar.columnconfigure(0, weight=1)
+        history_btn_frame = ttk.Frame(actions_bar)
+        history_btn_frame.grid(row=0, column=0, sticky="w", padx=(0, 12))
         self.sync_history_button = ttk.Button(history_btn_frame, text="同步历史数据", command=self.sync_history_data)
         self.verify_cache_button = ttk.Button(history_btn_frame, text="校验数据", command=self.verify_history_cache_data)
         self.sync_history_button.pack(side=LEFT, padx=(0, 6))
         self.verify_cache_button.pack(side=LEFT)
+        run_btn_frame = ttk.Frame(actions_bar)
+        run_btn_frame.grid(row=0, column=1, sticky="e")
+        self.single_backtest_button = ttk.Button(
+            run_btn_frame,
+            text="\u5f53\u524d\u53c2\u6570\u5355\u7ec4\u56de\u6d4b",
+            command=self.start_single_backtest,
+        )
+        self.single_backtest_button.pack(side=LEFT, padx=(0, 8))
         self.batch_backtest_button = ttk.Button(controls, text="开始回测", command=self.start_backtest)
         self.batch_backtest_button.grid(row=row, column=5, sticky="e", pady=(12, 0))
+        self.batch_backtest_button.grid_remove()
+        self.batch_backtest_button = ttk.Button(run_btn_frame, text="开始回测", command=self.start_backtest)
+        self.batch_backtest_button.pack(side=LEFT)
 
         row += 1
         batch_note = ttk.Frame(controls)
         batch_note.grid(row=row, column=0, columnspan=6, sticky="ew", pady=(8, 0))
         batch_note.columnconfigure(0, weight=1)
-        ttk.Label(
+        self._batch_mode_hint_label = ttk.Label(
             batch_note,
             text="\u201c\u5f00\u59cb\u56de\u6d4b\u201d\u4f1a\u56fa\u5b9a\u8fd0\u884c SL x 1/1.5/2\uff0c\u6bcf\u4e00\u884c\u518d\u6309 TP = SL x 1/2/3 \u751f\u6210 9 \u7ec4\u6279\u91cf\u56de\u6d4b\u3002",
-        ).grid(row=0, column=0, sticky="w")
+            justify="left",
+        )
+        self._batch_mode_hint_label.grid(row=0, column=0, sticky="w")
+        self._bind_responsive_wrap(self._batch_mode_hint_label, batch_note, padding=36, min_wrap=360)
         self.single_backtest_button = ttk.Button(
             batch_note,
             text="\u5f53\u524d\u53c2\u6570\u5355\u7ec4\u56de\u6d4b",
             command=self.start_single_backtest,
         )
         self.single_backtest_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
-        ttk.Label(
+        self.single_backtest_button.grid_remove()
+        self._history_sync_status_label = ttk.Label(
             batch_note,
             textvariable=self.history_sync_status,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            justify="left",
+        )
+        self._history_sync_status_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self._bind_responsive_wrap(self._history_sync_status_label, batch_note, padding=36, min_wrap=360)
 
         report_frame = ttk.Panedwindow(self.window, orient="horizontal")
         report_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
@@ -2082,9 +2132,9 @@ class BacktestWindow:
         report_tab = ttk.Frame(report_notebook, padding=8)
         report_tab.columnconfigure(0, weight=1)
         report_tab.rowconfigure(1, weight=1)
-        ttk.Label(report_tab, textvariable=self.report_summary, wraplength=480, justify="left").grid(
-            row=0, column=0, sticky="w", pady=(0, 10)
-        )
+        self._report_summary_label = ttk.Label(report_tab, textvariable=self.report_summary, justify="left")
+        self._report_summary_label.grid(row=0, column=0, sticky="w", pady=(0, 10))
+        self._bind_responsive_wrap(self._report_summary_label, report_tab, padding=28, min_wrap=280)
         self.report_text = Text(report_tab, height=16, wrap="word", font=("Consolas", 10))
         self.report_text.grid(row=1, column=0, sticky="nsew")
         report_notebook.add(report_tab, text="当前报告")
@@ -2337,9 +2387,9 @@ class BacktestWindow:
         trade_tree_scroll_y.grid(row=0, column=1, sticky="ns")
         trade_tree_scroll_x.grid(row=1, column=0, sticky="ew")
 
-        ttk.Label(manual_tab, textvariable=self.manual_summary, wraplength=520, justify="left").grid(
-            row=0, column=0, sticky="w", pady=(0, 10)
-        )
+        self._manual_summary_label = ttk.Label(manual_tab, textvariable=self.manual_summary, justify="left")
+        self._manual_summary_label.grid(row=0, column=0, sticky="w", pady=(0, 10))
+        self._bind_responsive_wrap(self._manual_summary_label, manual_tab, padding=28, min_wrap=300)
 
         manual_toolbar = ttk.Frame(manual_tab)
         manual_toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -2460,12 +2510,17 @@ class BacktestWindow:
         chart_toolbar = ttk.Frame(self.chart_frame)
         chart_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         chart_toolbar.columnconfigure(0, weight=1)
-        ttk.Label(
+        self._chart_toolbar_hint_label = ttk.Label(
             chart_toolbar,
             text="支持滚轮缩放、按住左键拖动平移；上方显示K线与EMA，下方显示资金曲线，可使用“图表大窗”或双击主图放大观察。",
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Button(chart_toolbar, text="重置视图", command=self.reset_main_chart_view).grid(row=0, column=1, sticky="e", padx=(0, 8))
-        ttk.Button(chart_toolbar, text="图表大窗", command=self.open_chart_zoom_window).grid(row=0, column=2, sticky="e")
+            justify="left",
+        )
+        self._chart_toolbar_hint_label.grid(row=0, column=0, sticky="ew")
+        self._bind_responsive_wrap(self._chart_toolbar_hint_label, chart_toolbar, padding=32, min_wrap=360)
+        chart_actions = ttk.Frame(chart_toolbar)
+        chart_actions.grid(row=1, column=0, sticky="e", pady=(8, 0))
+        ttk.Button(chart_actions, text="重置视图", command=self.reset_main_chart_view).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(chart_actions, text="图表大窗", command=self.open_chart_zoom_window).pack(side=LEFT)
 
         self.chart_canvas = Canvas(self.chart_frame, background="#ffffff", highlightthickness=0)
         self.chart_canvas.grid(row=1, column=0, sticky="nsew")

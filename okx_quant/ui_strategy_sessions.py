@@ -4877,7 +4877,7 @@ class UiStrategySessionsMixin:
             net_pnl = matched_position_history.realized_pnl
 
         ledger_record = StrategyTradeLedgerRecord(
-            record_id=self._next_strategy_trade_ledger_record_id(session, closed_at),
+            record_id=self._next_strategy_trade_ledger_record_id(session, trade.round_id, closed_at),
             history_record_id=session.history_record_id or "",
             session_id=session.session_id,
             api_name=session.api_name,
@@ -4890,6 +4890,7 @@ class UiStrategySessionsMixin:
             signal_bar_at=trade.signal_bar_at,
             opened_at=trade.opened_logged_at,
             closed_at=closed_at,
+            round_id=trade.round_id,
             entry_order_id=trade.entry_order_id or (entry_order.order_id if entry_order is not None else ""),
             entry_client_order_id=trade.entry_client_order_id,
             exit_order_id=close_order.order_id if close_order is not None and close_order.order_id is not None else "",
@@ -6693,6 +6694,7 @@ class UiStrategySessionsMixin:
             signal_bar_at=_parse_datetime_snapshot(payload.get("signal_bar_at")),
             opened_at=_parse_datetime_snapshot(payload.get("opened_at")),
             closed_at=closed_at,
+            round_id=str(payload.get("round_id", "")).strip(),
             entry_order_id=str(payload.get("entry_order_id", "")).strip(),
             entry_client_order_id=str(payload.get("entry_client_order_id", "")).strip(),
             exit_order_id=str(payload.get("exit_order_id", "")).strip(),
@@ -6718,6 +6720,7 @@ class UiStrategySessionsMixin:
             "record_id": record.record_id,
             "history_record_id": record.history_record_id,
             "session_id": record.session_id,
+            "round_id": record.round_id,
             "api_name": record.api_name,
             "strategy_id": record.strategy_id,
             "strategy_name": record.strategy_name,
@@ -6777,11 +6780,50 @@ class UiStrategySessionsMixin:
                 record = self._trade_ledger_record_from_payload(item)
                 if record is not None:
                     records.append(record)
-        self._strategy_trade_ledger_records = records
-        self._strategy_trade_ledger_by_id = {record.record_id: record for record in records}
+        deduped_records = self._dedupe_strategy_trade_ledger_records(records)
+        self._strategy_trade_ledger_records = deduped_records
+        self._strategy_trade_ledger_by_id = {record.record_id: record for record in self._strategy_trade_ledger_records}
+        if len(deduped_records) != len(records):
+            self._save_strategy_trade_ledger_records()
         self._rebuild_history_financials_from_trade_ledger()
 
-    def _next_strategy_trade_ledger_record_id(self, session: StrategySession, closed_at: datetime) -> str:
+    @staticmethod
+    def _strategy_trade_ledger_business_key(record: StrategyTradeLedgerRecord) -> tuple[str, ...]:
+        round_id = str(record.round_id or "").strip()
+        if round_id:
+            return ("round", str(record.session_id or "").strip(), round_id)
+        return (
+            "legacy",
+            str(record.session_id or "").strip(),
+            str(record.symbol or "").strip().upper(),
+            record.opened_at.isoformat(timespec="seconds") if record.opened_at is not None else "",
+            record.closed_at.isoformat(timespec="seconds"),
+            str(record.entry_order_id or "").strip(),
+            str(record.exit_order_id or "").strip(),
+            str(record.protective_algo_id or "").strip(),
+            format(record.size, "f") if record.size is not None else "",
+            format(record.entry_price, "f") if record.entry_price is not None else "",
+            format(record.exit_price, "f") if record.exit_price is not None else "",
+        )
+
+    def _dedupe_strategy_trade_ledger_records(
+        self,
+        records: list[StrategyTradeLedgerRecord],
+    ) -> list[StrategyTradeLedgerRecord]:
+        deduped: dict[tuple[str, ...], StrategyTradeLedgerRecord] = {}
+        for record in records:
+            deduped[self._strategy_trade_ledger_business_key(record)] = record
+        merged = list(deduped.values())
+        merged.sort(
+            key=lambda item: (item.closed_at.isoformat(timespec="seconds"), item.record_id),
+            reverse=True,
+        )
+        return merged
+
+    def _next_strategy_trade_ledger_record_id(self, session: StrategySession, round_id: str, closed_at: datetime) -> str:
+        normalized_round_id = str(round_id or "").strip()
+        if normalized_round_id:
+            return normalized_round_id
         base = f"{closed_at.strftime('%Y%m%d%H%M%S%f')}-{session.session_id}"
         record_id = base
         suffix = 2
@@ -6792,10 +6834,21 @@ class UiStrategySessionsMixin:
 
     def _upsert_strategy_trade_ledger_record(self, record: StrategyTradeLedgerRecord) -> None:
         existing = self._strategy_trade_ledger_by_id.get(record.record_id)
+        existing_business_key = self._strategy_trade_ledger_business_key(record)
+        replaced_by_business_key = False
+        if existing is None:
+            for index, item in enumerate(self._strategy_trade_ledger_records):
+                if self._strategy_trade_ledger_business_key(item) != existing_business_key:
+                    continue
+                existing = item
+                self._strategy_trade_ledger_by_id.pop(item.record_id, None)
+                self._strategy_trade_ledger_records[index] = record
+                replaced_by_business_key = True
+                break
         self._strategy_trade_ledger_by_id[record.record_id] = record
         if existing is None:
             self._strategy_trade_ledger_records.append(record)
-        else:
+        elif not replaced_by_business_key:
             for index, item in enumerate(self._strategy_trade_ledger_records):
                 if item.record_id == record.record_id:
                     self._strategy_trade_ledger_records[index] = record
