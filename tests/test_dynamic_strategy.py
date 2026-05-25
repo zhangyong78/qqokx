@@ -45,6 +45,7 @@ class DynamicStrategyTest(TestCase):
             tp_sl_trigger_type="mark",
             risk_amount=Decimal("100"),
             entry_reference_ema_period=0,
+            trend_ema_slope_filter_enabled=False,
         )
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)
         self.assertEqual(decision.signal, "long")
@@ -99,10 +100,39 @@ class DynamicStrategyTest(TestCase):
             tp_sl_trigger_type="mark",
             risk_amount=Decimal("100"),
             entry_reference_ema_period=0,
+            trend_ema_slope_filter_enabled=False,
         )
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)
         self.assertEqual(decision.signal, "long")
         self.assertEqual(decision.entry_reference, decision.ema_value)
+
+    def test_long_mode_can_filter_negative_trend_slope(self) -> None:
+        candles = self._make_candles(["100"] * 10 + ["95", "90", "85", "80", "78", "88"])
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=2,
+            trend_ema_period=5,
+            trend_ema_type="ma",
+            big_ema_period=6,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
+            trend_ema_slope_filter_enabled=True,
+        )
+
+        decision = EmaDynamicOrderStrategy().evaluate(candles, config)
+
+        self.assertIsNone(decision.signal)
+        self.assertIn("regression slope filter", decision.reason)
 
     def test_long_mode_is_blocked_when_price_is_below_medium_trend_ema(self) -> None:
         candles = self._make_candles(["100"] * 60 + ["50", "80"])
@@ -123,6 +153,7 @@ class DynamicStrategyTest(TestCase):
             tp_sl_trigger_type="mark",
             risk_amount=Decimal("100"),
             entry_reference_ema_period=0,
+            trend_ema_slope_filter_enabled=False,
         )
 
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)
@@ -149,6 +180,7 @@ class DynamicStrategyTest(TestCase):
             tp_sl_trigger_type="mark",
             risk_amount=Decimal("100"),
             entry_reference_ema_period=0,
+            trend_ema_slope_filter_enabled=False,
         )
 
         decision = EmaDynamicOrderStrategy().evaluate(candles, config)
@@ -236,6 +268,34 @@ class DynamicStrategyTest(TestCase):
 
         self.assertEqual(decision.signal, "short")
         self.assertEqual(decision.entry_reference, decision.ema_value)
+
+    def test_short_mode_can_filter_positive_trend_slope(self) -> None:
+        candles = self._make_candles(["100"] * 10 + ["105", "110", "115", "120", "122", "112"])
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=2,
+            trend_ema_period=5,
+            trend_ema_type="ma",
+            big_ema_period=6,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("100"),
+            entry_reference_ema_period=0,
+            trend_ema_slope_filter_enabled=True,
+        )
+
+        decision = EmaDynamicOrderStrategy().evaluate(candles, config)
+
+        self.assertIsNone(decision.signal)
+        self.assertIn("regression slope filter", decision.reason)
 
     def test_multi_timeframe_long_allows_entry_when_filter_is_bullish(self) -> None:
         entry_candles = self._make_candles(["100", "101", "103", "106", "110"])

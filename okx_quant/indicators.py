@@ -43,6 +43,21 @@ def moving_average(values: list[Decimal], period: int, ma_type: str = "ema") -> 
     return list(ema(values, period))
 
 
+def linear_regression_slope(values: list[Decimal]) -> Decimal | None:
+    if len(values) < 2:
+        return None
+
+    count = Decimal(len(values))
+    x_values = [Decimal(index) for index in range(len(values))]
+    x_mean = sum(x_values, Decimal("0")) / count
+    y_mean = sum(values, Decimal("0")) / count
+    numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, values))
+    denominator = sum((x - x_mean) * (x - x_mean) for x in x_values)
+    if denominator == 0:
+        return None
+    return numerator / denominator
+
+
 def macd(
     values: list[Decimal],
     *,

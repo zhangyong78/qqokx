@@ -5,6 +5,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from okx_quant.engine import (
+    CancelActiveOrderResult,
     OKX_DYNAMIC_STOP_MONITOR_MAX_READ_FAILURES,
     get_okx_read_retry_config,
     OrderSizeTooSmallError,
@@ -1149,6 +1150,113 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(captured_position["entry_price"], Decimal("2315.11"))
         self.assertEqual(captured_position["size"], Decimal("0.01"))
         self.assertTrue(any("旧挂单在撤单前已成交，转入持仓监控" in message for message in messages))
+
+    def test_resume_dynamic_exchange_pending_order_logs_tracking_price_after_takeover_reentry(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+        next_candles = self._make_candles([str(2000 + index) for index in range(81)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, timeout: float) -> bool:
+                waits.append(timeout)
+                self._stopped = True
+                return True
+
+        stop_stub = _StopStub()
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 鍔ㄦ€佸鎵?澶氬ご",
+            session_id="S01",
+        )
+        engine._stop_event = stop_stub  # type: ignore[assignment]
+        engine._get_order_with_retry = lambda *args, **kwargs: OkxOrderStatus(  # type: ignore[assignment]
+            ord_id="ord-old",
+            state="live",
+            side="buy",
+            ord_type="limit",
+            price=Decimal("2300"),
+            avg_price=None,
+            size=Decimal("0.01"),
+            filled_size=Decimal("0"),
+            raw={},
+        )
+        engine._get_candles_with_retry = lambda *args, **kwargs: next_candles  # type: ignore[assignment]
+        engine._cancel_active_order = lambda *args, **kwargs: CancelActiveOrderResult("canceled")  # type: ignore[assignment]
+        engine._evaluate_dynamic_signal_decision = lambda *args, **kwargs: SignalDecision(  # type: ignore[assignment]
+            signal="long",
+            reason="瓒嬪娍鎴愮珛",
+            candle_ts=next_candles[-1].ts,
+            entry_reference=Decimal("2310.5"),
+            atr_value=Decimal("10"),
+            ema_value=Decimal("2315"),
+        )
+        engine._submit_order_with_recovery = lambda *args, **kwargs: OkxOrderResult(  # type: ignore[assignment]
+            ord_id="ord-new",
+            cl_ord_id="cl-new",
+            s_code="0",
+            s_msg="accepted",
+            raw={},
+        )
+        engine._next_client_order_id = lambda *, role: f"{role}-generated"  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            take_profit_mode="fixed",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        active_order = ManagedEntryOrder(
+            ord_id="ord-old",
+            cl_ord_id="cl-old",
+            candle_ts=next_candles[-2].ts,
+            entry_reference=Decimal("2300"),
+            stop_loss=Decimal("2280"),
+            take_profit=Decimal("2340"),
+            stop_loss_algo_cl_ord_id=None,
+            size=Decimal("0.01"),
+            side="buy",
+            signal="long",
+        )
+
+        engine._resume_dynamic_exchange_pending_order_loop(
+            None,  # type: ignore[arg-type]
+            config,
+            instrument,
+            active_order=active_order,
+        )
+
+        tracked_messages = [message for message in messages if "clOrdId=cl-new" in message]
+        self.assertTrue(tracked_messages)
+        self.assertTrue(any("2310.5" in message for message in tracked_messages))
+        self.assertEqual(waits, [10])
 
     def test_dynamic_exchange_strategy_trader_virtual_mode_skips_exchange_stop_and_uses_virtual_monitor(self) -> None:
         messages: list[str] = []

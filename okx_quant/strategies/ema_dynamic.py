@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from okx_quant.indicators import atr, moving_average
+from okx_quant.indicators import atr, linear_regression_slope, moving_average
 from okx_quant.models import Candle, SignalDecision, StrategyConfig
 from okx_quant.pricing import format_strategy_reason_price
 from okx_quant.strategy_catalog import resolve_dynamic_signal_mode
@@ -19,6 +19,12 @@ class EmaDynamicOrderStrategy:
         price_increment: Decimal | None = None,
     ) -> SignalDecision:
         entry_reference_period = config.resolved_entry_reference_ema_period()
+        effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
+        trend_slope_filter_enabled = bool(config.trend_ema_slope_filter_enabled) and effective_signal_mode == "long_only"
+        if effective_signal_mode == "short_only":
+            trend_slope_filter_enabled = bool(config.trend_ema_slope_filter_enabled)
+        trend_slope_lookback = max(2, int(config.trend_ema_slope_filter_lookback_bars))
+        trend_slope_min_ratio = Decimal(str(config.trend_ema_slope_filter_min_ratio))
         minimum = max(
             config.ema_period,
             config.trend_ema_period,
@@ -54,8 +60,24 @@ class EmaDynamicOrderStrategy:
         current_fast = fast_values[-1]
         current_entry_reference = entry_reference_values[-1]
         current_trend = trend_values[-1]
+        trend_window = trend_values[-trend_slope_lookback:] if trend_slope_filter_enabled else []
+        trend_window_ready = bool(trend_window) and all(value is not None for value in trend_window)
+        trend_slope = (
+            linear_regression_slope([value for value in trend_window if value is not None])
+            if trend_window_ready
+            else None
+        )
+        trend_slope_ratio = (
+            trend_slope / current_trend
+            if trend_slope is not None and current_trend is not None and current_trend != 0
+            else None
+        )
         current_atr = atr_values[-1]
-        if current_fast is None or current_entry_reference is None or current_trend is None:
+        if (
+            current_fast is None
+            or current_entry_reference is None
+            or current_trend is None
+        ):
             return SignalDecision(
                 signal=None,
                 reason="均线数据尚未准备好，请等待更多已收盘K线。",
@@ -78,7 +100,6 @@ class EmaDynamicOrderStrategy:
                 signal_candle_low=current_candle.low,
             )
 
-        effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
         fast_label = config.ema_label()
         trend_label = config.trend_ema_label()
         reference_label = config.entry_reference_line_label()
@@ -115,6 +136,24 @@ class EmaDynamicOrderStrategy:
                     signal_candle_high=current_candle.high,
                     signal_candle_low=current_candle.low,
                 )
+            if (
+                trend_slope_filter_enabled
+                and trend_slope_ratio is not None
+                and trend_slope_ratio < trend_slope_min_ratio
+            ):
+                return SignalDecision(
+                    signal=None,
+                    reason=(
+                        f"{trend_label} regression slope filter blocks the long entry "
+                        f"(lookback={trend_slope_lookback} slope_ratio={trend_slope_ratio:.6f} threshold={trend_slope_min_ratio:.6f})."
+                    ),
+                    candle_ts=current_candle.ts,
+                    entry_reference=None,
+                    atr_value=current_atr,
+                    ema_value=current_fast,
+                    signal_candle_high=current_candle.high,
+                    signal_candle_low=current_candle.low,
+                )
             signal = "long"
             reason = (
                 f"多头趋势成立，以下一根的回调委托参考 {reference_label} 作为挂单价"
@@ -141,6 +180,24 @@ class EmaDynamicOrderStrategy:
                     reason=(
                         f"收盘价仍在 {trend_label} 上方，当前不是有效空头趋势。"
                         f"（收盘={px(current_candle.close)} 慢线={px(current_trend)}）"
+                    ),
+                    candle_ts=current_candle.ts,
+                    entry_reference=None,
+                    atr_value=current_atr,
+                    ema_value=current_fast,
+                    signal_candle_high=current_candle.high,
+                    signal_candle_low=current_candle.low,
+                )
+            if (
+                trend_slope_filter_enabled
+                and trend_slope_ratio is not None
+                and trend_slope_ratio > abs(trend_slope_min_ratio)
+            ):
+                return SignalDecision(
+                    signal=None,
+                    reason=(
+                        f"{trend_label} regression slope filter blocks the short entry "
+                        f"(lookback={trend_slope_lookback} slope_ratio={trend_slope_ratio:.6f} threshold={abs(trend_slope_min_ratio):.6f})."
                     ),
                     candle_ts=current_candle.ts,
                     entry_reference=None,

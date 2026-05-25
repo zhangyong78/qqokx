@@ -1310,6 +1310,15 @@ class UiStrategySessionsMixin:
         )
 
     def _latest_strategy_trade_ledger_record(self, session: StrategySession) -> StrategyTradeLedgerRecord | None:
+        matched = self._strategy_live_chart_ledger_records(session)
+        if not matched:
+            return None
+        return max(matched, key=lambda item: (item.closed_at, item.record_id))
+
+    def _strategy_live_chart_ledger_records(
+        self,
+        session: StrategySession,
+    ) -> list[StrategyTradeLedgerRecord]:
         matched: list[StrategyTradeLedgerRecord] = []
         if session.history_record_id:
             matched = [
@@ -1319,9 +1328,26 @@ class UiStrategySessionsMixin:
             ]
         if not matched:
             matched = [item for item in self._strategy_trade_ledger_records if item.session_id == session.session_id]
-        if not matched:
-            return None
-        return max(matched, key=lambda item: (item.closed_at, item.record_id))
+        matched.sort(
+            key=lambda item: (
+                item.opened_at or item.closed_at or datetime.min,
+                item.closed_at or datetime.min,
+                item.record_id,
+            )
+        )
+        return matched
+
+    def _strategy_live_chart_entry_context(
+        self,
+        session: StrategySession,
+    ) -> tuple[Decimal | None, datetime | None]:
+        trade = session.active_trade
+        if trade is not None:
+            return trade.entry_price, trade.opened_logged_at
+        latest_ledger = self._latest_strategy_trade_ledger_record(session)
+        if latest_ledger is None:
+            return None, None
+        return latest_ledger.entry_price, latest_ledger.opened_at
 
     def _strategy_live_chart_event_time_markers(
         self,
@@ -1330,14 +1356,26 @@ class UiStrategySessionsMixin:
     ) -> tuple[StrategyLiveChartTimeMarker, ...]:
         markers: list[StrategyLiveChartTimeMarker] = []
         trade = session.active_trade
+        ledger_records = self._strategy_live_chart_ledger_records(session)
         latest_ledger = self._latest_strategy_trade_ledger_record(session)
-        if latest_ledger is not None and latest_ledger.opened_at and latest_ledger.closed_at:
-            if latest_ledger.closed_at >= latest_ledger.opened_at:
+        for ledger in ledger_records:
+            if ledger.opened_at is not None:
                 markers.append(
                     StrategyLiveChartTimeMarker(
-                        key=f"close:{latest_ledger.record_id}",
-                        label=f"平仓 {latest_ledger.closed_at.strftime('%m-%d %H:%M')}",
-                        at=latest_ledger.closed_at,
+                        key=f"open:{ledger.record_id}",
+                        label=f"开仓 {ledger.opened_at.strftime('%m-%d %H:%M')}",
+                        at=ledger.opened_at,
+                        color="#6f42c1",
+                        dash=(4, 3),
+                        width=2,
+                    )
+                )
+            if ledger.opened_at and ledger.closed_at and ledger.closed_at >= ledger.opened_at:
+                markers.append(
+                    StrategyLiveChartTimeMarker(
+                        key=f"close:{ledger.record_id}",
+                        label=f"平仓 {ledger.closed_at.strftime('%m-%d %H:%M')}",
+                        at=ledger.closed_at,
                         color="#cf222e",
                         dash=(6, 3),
                         width=2,
@@ -1538,8 +1576,9 @@ class UiStrategySessionsMixin:
         position_avg_price, position_refreshed_at = self._strategy_live_chart_position_avg_price(session)
         live_pnl, live_pnl_refreshed_at = self._session_live_pnl_snapshot(session)
         stop_price = self._strategy_live_chart_stop_price(session)
-        entry_price = session.active_trade.entry_price if session.active_trade is not None else None
-        entry_time = session.active_trade.opened_logged_at if session.active_trade is not None else None
+        entry_price, entry_time = self._strategy_live_chart_entry_context(session)
+        if session.active_trade is None:
+            entry_time = None
         time_markers = self._strategy_live_chart_event_time_markers(session, trade_inst_id)
         chart_refreshed_at = datetime.now()
         snapshot = build_strategy_live_chart_snapshot(
@@ -5981,8 +6020,104 @@ class UiStrategySessionsMixin:
             self._sync_strategy_history_from_session(session)
 
     def _attempt_auto_restore_recoverable_sessions(self) -> None:
-        for session_id in list(self._recoverable_strategy_sessions.keys()):
+        session_ids = list(self._recoverable_strategy_sessions.keys())
+        if not session_ids:
+            return
+        started_running: list[str] = []
+        started_restoring: list[str] = []
+        still_pending: list[str] = []
+        stopped: list[str] = []
+        for session_id in session_ids:
             self._recover_session(session_id, auto=True)
+            session = self.sessions.get(session_id)
+            label = self._auto_restore_summary_label(session_id)
+            if session is None:
+                stopped.append(label)
+                continue
+            if session.engine.is_running or session.status == "运行中":
+                if session.status == "恢复中":
+                    started_restoring.append(label)
+                else:
+                    started_running.append(label)
+            elif session.status == "恢复中":
+                started_restoring.append(label)
+            elif session.status == "待恢复":
+                still_pending.append(label)
+            else:
+                stopped.append(label)
+        summary_parts: list[str] = []
+        if started_running:
+            summary_parts.append(f"已切回运行 {len(started_running)} 条：{', '.join(started_running)}")
+        if started_restoring:
+            summary_parts.append(f"仍在恢复中 {len(started_restoring)} 条：{', '.join(started_restoring)}")
+        if still_pending:
+            summary_parts.append(f"仍待恢复 {len(still_pending)} 条：{', '.join(still_pending)}")
+        if stopped:
+            summary_parts.append(f"未迁移成功 {len(stopped)} 条：{', '.join(stopped)}")
+        if summary_parts:
+            self._enqueue_log("程序升级后自动迁移结果：" + "；".join(summary_parts))
+
+    def _auto_restore_summary_label(self, session_id: str) -> str:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return session_id
+        symbol = str(getattr(session, "symbol", "") or "").strip()
+        if symbol:
+            return f"{session_id}({symbol})"
+        return session_id
+
+    def _restart_recoverable_signal_monitoring(self, session: StrategySession, credentials: Credentials) -> bool:
+        def _mark_recovery_back_to_running(status_note: str) -> None:
+            session.status = "运行中"
+            session.runtime_status = "等待信号"
+            session.stopped_at = None
+            session.ended_reason = ""
+            session.active_trade = None
+            self._remove_recoverable_strategy_session(session.session_id)
+            self._upsert_session_row(session)
+            self._sync_strategy_history_from_session(session)
+            self._log_session_message(session, status_note)
+
+        def _run_signal_recovery() -> None:
+            entered_main_loop = False
+            try:
+                session.engine._logger("未检测到现有 OKX 仓位或挂单，恢复为信号监听。")
+                self.root.after(
+                    0,
+                    lambda: _mark_recovery_back_to_running("恢复信号监听已完成，继续监控下一次信号。"),
+                )
+                entered_main_loop = True
+                session.engine._run(credentials, session.config)
+            except Exception as exc:
+                session.engine._notify_error(session.config, str(exc))
+                session.engine._logger(f"策略停止，原因：{exc}")
+            finally:
+                if not entered_main_loop or session.engine._stop_event.is_set():
+                    session.engine._stop_event.set()
+
+        session.active_trade = None
+        session.status = "恢复中"
+        session.runtime_status = "恢复中"
+        session.stopped_at = None
+        session.ended_reason = "恢复中"
+        self._upsert_recoverable_strategy_session(session)
+        self._upsert_session_row(session)
+        self._sync_strategy_history_from_session(session)
+        try:
+            session.engine.start_custom(
+                _run_signal_recovery,
+                thread_name=f"okx-{session.config.strategy_id}-recover-signal",
+            )
+        except Exception as exc:
+            session.status = "待恢复"
+            session.runtime_status = "待恢复"
+            session.stopped_at = datetime.now()
+            session.ended_reason = "恢复启动失败"
+            self._upsert_session_row(session)
+            self._sync_strategy_history_from_session(session)
+            self._enqueue_log(f"{session.log_prefix} 恢复信号监听启动失败：{exc}")
+            return False
+        return True
 
     def recover_selected_session(self) -> None:
         session = self._selected_session()
@@ -6164,8 +6299,10 @@ class UiStrategySessionsMixin:
                             self._enqueue_log(f"{session.log_prefix} 恢复挂单接管启动失败：{exc}")
                         return False
                     return True
-            if trade is None and not auto:
-                self._enqueue_log(f"{session.log_prefix} 未能从独立日志恢复最近一笔持仓快照，且当前未检测到可接管仓位。")
+            if trade is None:
+                if not auto:
+                    self._enqueue_log(f"{session.log_prefix} 未检测到现有仓位或挂单，恢复为信号监听。")
+                return self._restart_recoverable_signal_monitoring(session, credentials)
             session.status = "已停止"
             session.runtime_status = "已停止"
             session.stopped_at = datetime.now()

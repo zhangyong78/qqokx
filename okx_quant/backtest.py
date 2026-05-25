@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from okx_quant.engine import build_protection_plan, determine_order_size
-from okx_quant.indicators import atr, ema, moving_average
+from okx_quant.indicators import atr, ema, linear_regression_slope, moving_average
 from okx_quant.models import (
     Candle,
     Instrument,
@@ -1206,6 +1206,10 @@ def _required_backtest_preload_candles(config: StrategyConfig) -> int:
     elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
         minimum = max(config.ema_period, config.trend_ema_period) + 1
     else:
+        trend_slope_filter_enabled = (
+            bool(config.trend_ema_slope_filter_enabled)
+            and resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode) == "long_only"
+        )
         minimum = max(
             config.ema_period,
             config.trend_ema_period,
@@ -1719,6 +1723,10 @@ def _run_dynamic_backtest(
     mtf_filter_bias: list[str] | None = None,
 ) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
     entry_reference_ema_period = config.resolved_entry_reference_ema_period()
+    trend_slope_filter_enabled = (
+        bool(config.trend_ema_slope_filter_enabled)
+        and resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode) == "long_only"
+    )
     minimum = max(
         config.ema_period,
         config.trend_ema_period,
@@ -2049,8 +2057,32 @@ def _evaluate_dynamic_signal_precomputed(
     current_ema = ema_values[index]
     current_entry_reference = entry_reference_ema_values[index]
     trend_ema = trend_ema_values[index]
+    effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
+    trend_slope_filter_enabled = bool(config.trend_ema_slope_filter_enabled) and effective_signal_mode in {"long_only", "short_only"}
+    trend_slope_lookback = max(2, int(config.trend_ema_slope_filter_lookback_bars))
+    trend_slope_min_ratio = Decimal(str(config.trend_ema_slope_filter_min_ratio))
+    trend_window = (
+        trend_ema_values[index - trend_slope_lookback + 1 : index + 1]
+        if trend_slope_filter_enabled and index >= trend_slope_lookback - 1
+        else []
+    )
+    trend_window_ready = bool(trend_window) and all(value is not None for value in trend_window)
+    trend_slope = (
+        linear_regression_slope([value for value in trend_window if value is not None])
+        if trend_window_ready
+        else None
+    )
+    trend_slope_ratio = (
+        trend_slope / trend_ema
+        if trend_slope is not None and trend_ema is not None and trend_ema != 0
+        else None
+    )
     current_atr = atr_values[index]
-    if current_ema is None or current_entry_reference is None or trend_ema is None:
+    if (
+        current_ema is None
+        or current_entry_reference is None
+        or trend_ema is None
+    ):
         return SignalDecision(
             signal=None,
             reason="moving_average_not_ready",
@@ -2073,8 +2105,6 @@ def _evaluate_dynamic_signal_precomputed(
             signal_candle_low=current_candle.low,
         )
 
-    effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
-
     if effective_signal_mode == "long_only":
         if current_ema <= trend_ema:
             return SignalDecision(
@@ -2091,6 +2121,21 @@ def _evaluate_dynamic_signal_precomputed(
             return SignalDecision(
                 signal=None,
                 reason="close_below_trend_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
+        if (
+            trend_slope_filter_enabled
+            and trend_slope_ratio is not None
+            and trend_slope_ratio < trend_slope_min_ratio
+        ):
+            return SignalDecision(
+                signal=None,
+                reason="trend_ema_negative_regression_slope",
                 candle_ts=current_candle.ts,
                 entry_reference=None,
                 atr_value=current_atr,
@@ -2125,6 +2170,21 @@ def _evaluate_dynamic_signal_precomputed(
             return SignalDecision(
                 signal=None,
                 reason="close_above_trend_ema",
+                candle_ts=current_candle.ts,
+                entry_reference=None,
+                atr_value=current_atr,
+                ema_value=current_ema,
+                signal_candle_high=current_candle.high,
+                signal_candle_low=current_candle.low,
+            )
+        if (
+            trend_slope_filter_enabled
+            and trend_slope_ratio is not None
+            and trend_slope_ratio > abs(trend_slope_min_ratio)
+        ):
+            return SignalDecision(
+                signal=None,
+                reason="trend_ema_positive_regression_slope",
                 candle_ts=current_candle.ts,
                 entry_reference=None,
                 atr_value=current_atr,

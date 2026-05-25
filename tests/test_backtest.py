@@ -2457,6 +2457,9 @@ class BacktestTest(TestCase):
             mtf_filter_fast_ema_period=13,
             mtf_filter_slow_ema_period=34,
             mtf_reversal_mode="block_new_entries",
+            trend_ema_slope_filter_enabled=True,
+            trend_ema_slope_filter_lookback_bars=7,
+            trend_ema_slope_filter_min_ratio=Decimal("-0.0005"),
         )
 
         payload = backtest_ui_module._serialize_strategy_config(config)
@@ -2467,6 +2470,9 @@ class BacktestTest(TestCase):
         self.assertEqual(restored.mtf_filter_fast_ema_period, 13)
         self.assertEqual(restored.mtf_filter_slow_ema_period, 34)
         self.assertEqual(restored.mtf_reversal_mode, "block_new_entries")
+        self.assertTrue(restored.trend_ema_slope_filter_enabled)
+        self.assertEqual(restored.trend_ema_slope_filter_lookback_bars, 7)
+        self.assertEqual(restored.trend_ema_slope_filter_min_ratio, Decimal("-0.0005"))
 
     def test_export_batch_backtest_report_writes_matrix_summary(self) -> None:
         with TemporaryDirectory() as temp_dir:

@@ -34,6 +34,9 @@ from okx_quant.ui import (
     _build_normal_strategy_book_group_rows,
     _build_normal_strategy_book_ledger_rows,
     _build_normal_strategy_book_summary,
+    _build_app_restart_command,
+    _build_deploy_upgrade_confirmation_message,
+    _build_upgrade_confirmation_message,
     _build_current_position_note_record,
     _build_group_row_values,
     _build_history_position_note_record,
@@ -75,6 +78,8 @@ from okx_quant.ui import (
     _strategy_template_record_from_payload,
     _trade_order_belongs_to_session,
     _trade_order_session_role,
+    _app_restart_workdir,
+    _resolve_upgrade_candidate_root,
     _extract_log_field_decimal,
 )
 
@@ -146,6 +151,69 @@ class UiHelpersTest(TestCase):
         )
         self.assertEqual(currency, "BTC")
         self.assertEqual(amount, Decimal("0.004"))
+
+    def test_build_app_restart_command_uses_script_and_data_dir_when_not_frozen(self) -> None:
+        command = _build_app_restart_command(
+            executable=r"C:\Python311\python.exe",
+            argv0=r"D:\qqokx\main.py",
+            frozen=False,
+            data_dir=r"D:\qqokx_data",
+        )
+
+        self.assertEqual(
+            [
+                str(Path(r"C:\Python311\python.exe").resolve()),
+                str(Path(r"D:\qqokx\main.py").resolve()),
+                "--data-dir",
+                str(Path(r"D:\qqokx_data").resolve()),
+            ],
+            command,
+        )
+
+    def test_app_restart_workdir_uses_script_parent_when_not_frozen(self) -> None:
+        workdir = _app_restart_workdir(argv0=r"D:\qqokx\main.py", frozen=False)
+
+        self.assertEqual(str(Path(r"D:\qqokx").resolve()), workdir)
+
+    def test_build_upgrade_confirmation_message_includes_migration_counts(self) -> None:
+        message = _build_upgrade_confirmation_message(
+            running_count=3,
+            migratable_count=2,
+            unsupported_count=1,
+            data_dir=r"D:\qqokx_data",
+        )
+
+        self.assertIn("新版本代码已经覆盖", message)
+        self.assertIn("当前检测到 3 条运行中策略", message)
+        self.assertIn("可自动迁移：2 条", message)
+        self.assertIn("不支持自动迁移：1 条", message)
+        self.assertIn(str(Path(r"D:\qqokx_data").resolve()), message)
+
+    def test_build_deploy_upgrade_confirmation_message_includes_source(self) -> None:
+        message = _build_deploy_upgrade_confirmation_message(
+            source_label=r"D:\dist\qqokx_server_package_v0.6.04.zip",
+            source_version="0.6.04",
+            running_count=1,
+            migratable_count=1,
+            unsupported_count=0,
+            data_dir=r"D:\qqokx_data",
+        )
+
+        self.assertIn("升级来源", message)
+        self.assertIn("候选版本：0.6.04", message)
+        self.assertIn("自动覆盖代码目录", message)
+
+    def test_resolve_upgrade_candidate_root_accepts_nested_package_dir(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_dir = root / "qqokx_server_package_v0.6.04"
+            package_dir.mkdir()
+            (package_dir / "main.py").write_text("print('ok')", encoding="utf-8")
+            (package_dir / "okx_quant").mkdir()
+
+            resolved = _resolve_upgrade_candidate_root(root)
+
+            self.assertEqual(package_dir.resolve(), resolved)
 
     def test_merge_history_cache_records_prefers_remote_duplicates(self) -> None:
         local_records = [
@@ -2505,6 +2573,99 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(session.status, "恢复中")
         self.assertEqual(session.runtime_status, "恢复中")
         start_custom.assert_called_once()
+
+    def test_recover_session_restarts_signal_monitoring_when_trade_is_idle(self) -> None:
+        session = self._make_session()
+        start_custom = MagicMock()
+        session.active_trade = None
+        session.log_prefix = "[S01]"
+        session.engine = SimpleNamespace(
+            is_running=False,
+            start_custom=start_custom,
+            _run=MagicMock(),
+            _logger=MagicMock(),
+            _notify_error=MagicMock(),
+            _stop_event=SimpleNamespace(is_set=lambda: False, set=lambda: None),
+        )
+
+        credentials = SimpleNamespace(profile_name="moni")
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _recoverable_strategy_sessions={},
+            _build_recoverable_strategy_session_record=lambda _session: None,
+            _credentials_for_profile_or_none=lambda _api_name: credentials,
+            _restore_session_trade_runtime_from_log=lambda _session: None,
+            _find_recovery_claim_conflict=lambda session_id, trade: None,
+            _load_recoverable_live_positions=lambda *_args, **_kwargs: [],
+            _select_recoverable_live_position=lambda *_args, **_kwargs: None,
+            _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
+            _find_recoverable_protective_order=lambda *_args, **_kwargs: None,
+            _restart_recoverable_signal_monitoring=lambda session_, credentials_: QuantApp._restart_recoverable_signal_monitoring(
+                app,
+                session_,
+                credentials_,
+            ),
+            _upsert_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _remove_recoverable_strategy_session=MagicMock(),
+            _log_session_message=MagicMock(),
+            _enqueue_log=MagicMock(),
+            root=SimpleNamespace(after=lambda _delay, callback: callback()),
+        )
+
+        result = QuantApp._recover_session(app, "S01", auto=False)
+
+        self.assertTrue(result)
+        self.assertEqual(session.status, session.runtime_status)
+        start_custom.assert_called_once()
+
+    def test_attempt_auto_restore_recoverable_sessions_logs_summary(self) -> None:
+        running_session = self._make_session()
+        running_session.session_id = "S01"
+        running_session.symbol = "BTC-USDT-SWAP"
+        running_session.status = "运行中"
+        running_session.engine = SimpleNamespace(is_running=True)
+
+        restoring_session = self._make_session()
+        restoring_session.session_id = "S02"
+        restoring_session.symbol = "ETH-USDT-SWAP"
+        restoring_session.status = "恢复中"
+        restoring_session.engine = SimpleNamespace(is_running=True)
+
+        pending_session = self._make_session()
+        pending_session.session_id = "S03"
+        pending_session.symbol = "SOL-USDT-SWAP"
+        pending_session.status = "待恢复"
+        pending_session.engine = SimpleNamespace(is_running=False)
+
+        stopped_session = self._make_session()
+        stopped_session.session_id = "S04"
+        stopped_session.symbol = "DOGE-USDT-SWAP"
+        stopped_session.status = "已停止"
+        stopped_session.engine = SimpleNamespace(is_running=False)
+
+        app = SimpleNamespace(
+            sessions={
+                "S01": running_session,
+                "S02": restoring_session,
+                "S03": pending_session,
+                "S04": stopped_session,
+            },
+            _recoverable_strategy_sessions={key: object() for key in ("S01", "S02", "S03", "S04")},
+            _recover_session=lambda session_id, auto: False if session_id == "S04" else True,
+            _auto_restore_summary_label=lambda session_id: QuantApp._auto_restore_summary_label(app, session_id),
+            _enqueue_log=MagicMock(),
+        )
+
+        QuantApp._attempt_auto_restore_recoverable_sessions(app)
+
+        logged = app._enqueue_log.call_args[0][0]
+        self.assertIn("程序升级后自动迁移结果", logged)
+        self.assertIn("已切回运行 1 条", logged)
+        self.assertIn("仍在恢复中 1 条", logged)
+        self.assertIn("仍待恢复 1 条", logged)
+        self.assertIn("未迁移成功 1 条", logged)
 
     def test_recover_session_skips_when_another_running_session_already_claims_same_algo_order(self) -> None:
         session = self._make_session()

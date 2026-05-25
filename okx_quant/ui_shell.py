@@ -6,8 +6,11 @@ import queue
 import subprocess
 import sys
 import re
+import shutil
 import threading
 import time
+import tempfile
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 import uuid
 from dataclasses import MISSING, asdict, dataclass, field, fields as dataclass_fields, replace
@@ -19,6 +22,7 @@ import tkinter.font as tkfont
 from tkinter import BooleanVar, Canvas, END, Label, Listbox, Menu, StringVar, Text, TclError, Tk, Toplevel, filedialog, simpledialog
 from tkinter import messagebox, ttk
 
+from okx_quant.app_paths import configured_data_root, data_root
 from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
 from okx_quant.analysis import (
     BoxDetectionConfig,
@@ -260,6 +264,159 @@ def _bind_mixin_to_shell_globals(mixin_cls):
             rebound.__dict__.update(getattr(value, "__dict__", {}))
             setattr(mixin_cls, name, rebound)
     return mixin_cls
+
+
+def _build_app_restart_command(
+    *,
+    executable: str | None = None,
+    argv0: str | None = None,
+    frozen: bool | None = None,
+    data_dir: str | Path | None = None,
+) -> list[str]:
+    resolved_executable = str(Path(executable or sys.executable).resolve())
+    is_frozen = bool(getattr(sys, "frozen", False) if frozen is None else frozen)
+    command = [resolved_executable]
+    if not is_frozen:
+        resolved_argv0 = str(Path(argv0 or sys.argv[0]).resolve())
+        command.append(resolved_argv0)
+    resolved_data_dir = Path(data_dir).resolve() if data_dir is not None else (configured_data_root() or data_root())
+    command.extend(["--data-dir", str(resolved_data_dir)])
+    return command
+
+
+def _app_restart_workdir(*, argv0: str | None = None, frozen: bool | None = None) -> str:
+    is_frozen = bool(getattr(sys, "frozen", False) if frozen is None else frozen)
+    target = Path(sys.executable if is_frozen else (argv0 or sys.argv[0])).resolve()
+    return str(target.parent)
+
+
+UPGRADE_ALLOWED_DIR_NAMES = ("okx_quant", "export", "research", "stats", "utils", "scripts")
+UPGRADE_ALLOWED_FILE_NAMES = (
+    "main.py",
+    "pyproject.toml",
+    "requirements.txt",
+    "README.md",
+    ".env.example",
+    "RUN.bat",
+    "RUN.ps1",
+    "start.sh",
+    "DEPLOY.txt",
+    "软件开发指南.md",
+    "线程工作流模板.md",
+    "发版协作约定.md",
+    "发版待打包清单.md",
+)
+
+
+def _looks_like_upgrade_root(path: Path) -> bool:
+    return path.is_dir() and (path / "main.py").is_file() and (path / "okx_quant").is_dir()
+
+
+def _resolve_upgrade_candidate_root(path: str | Path) -> Path:
+    candidate = Path(path).expanduser().resolve()
+    if not candidate.exists():
+        raise ValueError(f"升级来源不存在：{candidate}")
+    if candidate.is_file():
+        raise ValueError("目录升级需要选择文件夹，不是单个文件。")
+    if _looks_like_upgrade_root(candidate):
+        return candidate
+    child_dirs = [child for child in candidate.iterdir() if child.is_dir()]
+    direct_matches = [child for child in child_dirs if _looks_like_upgrade_root(child)]
+    if len(direct_matches) == 1:
+        return direct_matches[0]
+    if len(child_dirs) == 1 and _looks_like_upgrade_root(child_dirs[0]):
+        return child_dirs[0]
+    raise ValueError("所选目录里没有找到可升级的程序包。请选包含 main.py 和 okx_quant/ 的版本目录。")
+
+
+def _read_upgrade_candidate_version(source_root: Path) -> str:
+    pyproject_path = source_root / "pyproject.toml"
+    if pyproject_path.exists():
+        try:
+            text = pyproject_path.read_text(encoding="utf-8")
+        except Exception:
+            text = ""
+        match = re.search(r'^\s*version\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+        if match is not None:
+            return str(match.group(1)).strip()
+    return source_root.name
+
+
+def _build_upgrade_copy_plan(source_root: Path) -> tuple[list[str], list[str]]:
+    dir_names = [name for name in UPGRADE_ALLOWED_DIR_NAMES if (source_root / name).is_dir()]
+    file_names = [name for name in UPGRADE_ALLOWED_FILE_NAMES if (source_root / name).is_file()]
+    if not (source_root / "main.py").is_file() or not (source_root / "okx_quant").is_dir():
+        raise ValueError("升级包缺少 main.py 或 okx_quant/，无法继续。")
+    if "main.py" not in file_names:
+        file_names.insert(0, "main.py")
+    if "okx_quant" not in dir_names:
+        dir_names.insert(0, "okx_quant")
+    return dir_names, file_names
+
+
+def _ps_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _ps_array(values: list[str]) -> str:
+    return "@(" + ", ".join(_ps_quote(value) for value in values) + ")"
+
+
+def _build_upgrade_confirmation_message(
+    *,
+    running_count: int,
+    migratable_count: int,
+    unsupported_count: int,
+    data_dir: str | Path,
+) -> str:
+    resolved_data_dir = str(Path(data_dir).resolve())
+    lines = [
+        "程序会关闭当前窗口并自动拉起新进程。",
+        "",
+        "升级前请先确认：新版本代码已经覆盖到当前程序目录。",
+        "如果代码还没更新，现在取消即可；否则重新打开的仍会是旧版本。",
+        "",
+        f"共享数据目录：{resolved_data_dir}",
+    ]
+    if running_count > 0:
+        lines.extend(
+            [
+                "",
+                f"当前检测到 {running_count} 条运行中策略。",
+                f"- 可自动迁移：{migratable_count} 条",
+                f"- 不支持自动迁移：{unsupported_count} 条",
+            ]
+        )
+        if migratable_count > 0:
+            lines.append("可迁移策略里，有持仓/挂单的会继续接管，纯等待信号的会自动恢复监听。")
+        if unsupported_count > 0:
+            lines.append("不支持自动迁移的策略会先停止，需要升级后手工重新启动。")
+    lines.extend(["", "现在开始程序升级吗？"])
+    return "\n".join(lines)
+
+
+def _build_deploy_upgrade_confirmation_message(
+    *,
+    source_label: str,
+    source_version: str,
+    running_count: int,
+    migratable_count: int,
+    unsupported_count: int,
+    data_dir: str | Path,
+) -> str:
+    base = _build_upgrade_confirmation_message(
+        running_count=running_count,
+        migratable_count=migratable_count,
+        unsupported_count=unsupported_count,
+        data_dir=data_dir,
+    )
+    return (
+        f"升级来源：{source_label}\n"
+        f"候选版本：{source_version}\n\n"
+        "程序会在退出后自动覆盖代码目录，再拉起新版本。\n"
+        "如果你选的是压缩包，会先自动解压再升级。\n\n"
+        f"{base}"
+    )
 
 
 UiBacktestEntryMixin = _bind_mixin_to_shell_globals(UiBacktestEntryMixin)
@@ -1324,6 +1481,19 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
         dynamic_fee_offset_enabled=_coerce_snapshot_bool(
             payload.get("dynamic_fee_offset_enabled"),
             bool(_strategy_config_default("dynamic_fee_offset_enabled")),
+        ),
+        trend_ema_slope_filter_enabled=_coerce_snapshot_bool(
+            payload.get("trend_ema_slope_filter_enabled"),
+            bool(_strategy_config_default("trend_ema_slope_filter_enabled")),
+        ),
+        trend_ema_slope_filter_lookback_bars=_coerce_snapshot_int(
+            payload.get("trend_ema_slope_filter_lookback_bars"),
+            int(_strategy_config_default("trend_ema_slope_filter_lookback_bars")),
+            minimum=2,
+        ),
+        trend_ema_slope_filter_min_ratio=_coerce_snapshot_decimal(
+            payload.get("trend_ema_slope_filter_min_ratio"),
+            Decimal(str(_strategy_config_default("trend_ema_slope_filter_min_ratio"))),
         ),
         startup_chase_window_seconds=_coerce_snapshot_int(
             payload.get("startup_chase_window_seconds"),
@@ -2514,6 +2684,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._strategy_trade_ledger_records: list[StrategyTradeLedgerRecord] = []
         self._strategy_trade_ledger_by_id: dict[str, StrategyTradeLedgerRecord] = {}
         self._recoverable_strategy_sessions: dict[str, RecoverableStrategySessionRecord] = {}
+        self._close_confirmation_required = True
+        self._restart_command_on_close: list[str] | None = None
+        self._upgrade_worker_command_on_close: list[str] | None = None
         self._trader_desk_drafts: list[TraderDraftRecord] = []
         self._trader_desk_runs: list[TraderRunState] = []
         self._trader_desk_slots: list[TraderSlotRecord] = []
@@ -3162,6 +3335,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         system_menu = Menu(menu_bar, tearoff=False)
         system_menu.add_command(label=f"版本信息 (v{APP_VERSION})", command=self.show_version_info)
+        system_menu.add_command(label="一键升级（压缩包）", command=self.upgrade_program_from_zip)
+        system_menu.add_command(label="一键升级（目录）", command=self.upgrade_program_from_directory)
+        system_menu.add_command(label="程序升级", command=self.upgrade_program)
         system_menu.add_separator()
         system_menu.add_command(label="退出", command=self._on_close)
         menu_bar.add_cascade(label="系统", menu=system_menu)
@@ -3170,6 +3346,226 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
     def show_version_info(self) -> None:
         messagebox.showinfo("版本信息", build_version_info_text(), parent=self.root)
+
+    def open_one_click_upgrade(self) -> None:
+        selected = messagebox.askyesnocancel(
+            "一键升级",
+            "选择升级来源：\n\n是：从压缩包升级\n否：从目录升级\n取消：不执行",
+            parent=self.root,
+        )
+        if selected is None:
+            return
+        if selected:
+            self.upgrade_program_from_zip()
+            return
+        self.upgrade_program_from_directory()
+
+    def upgrade_program_from_zip(self) -> None:
+        source = filedialog.askopenfilename(
+            parent=self.root,
+            title="选择升级压缩包",
+            initialdir=str((Path(_app_restart_workdir()) / "dist").resolve()) if (Path(_app_restart_workdir()) / "dist").exists() else _app_restart_workdir(),
+            filetypes=(("ZIP 压缩包", "*.zip"), ("所有文件", "*.*")),
+        )
+        if not source:
+            return
+        extraction_dir: Path | None = None
+        try:
+            extraction_dir = Path(tempfile.mkdtemp(prefix="qqokx-upgrade-zip-"))
+            with zipfile.ZipFile(source) as archive:
+                archive.extractall(extraction_dir)
+            source_root = _resolve_upgrade_candidate_root(extraction_dir)
+            started = self._prepare_deploy_upgrade(
+                source_root=source_root,
+                source_label=str(Path(source).resolve()),
+                cleanup_dir=extraction_dir,
+            )
+            if not started:
+                shutil.rmtree(extraction_dir, ignore_errors=True)
+        except Exception as exc:
+            if extraction_dir is not None:
+                shutil.rmtree(extraction_dir, ignore_errors=True)
+            messagebox.showerror("升级失败", str(exc), parent=self.root)
+
+    def upgrade_program_from_directory(self) -> None:
+        source = filedialog.askdirectory(
+            parent=self.root,
+            title="选择升级目录",
+            initialdir=str((Path(_app_restart_workdir()) / "dist").resolve()) if (Path(_app_restart_workdir()) / "dist").exists() else _app_restart_workdir(),
+            mustexist=True,
+        )
+        if not source:
+            return
+        try:
+            source_root = _resolve_upgrade_candidate_root(source)
+            self._prepare_deploy_upgrade(
+                source_root=source_root,
+                source_label=str(source_root),
+                cleanup_dir=None,
+            )
+        except Exception as exc:
+            messagebox.showerror("升级失败", str(exc), parent=self.root)
+
+    def _prepare_deploy_upgrade(
+        self,
+        *,
+        source_root: Path,
+        source_label: str,
+        cleanup_dir: Path | None,
+    ) -> bool:
+        target_root = Path(_app_restart_workdir()).resolve()
+        if source_root.resolve() == target_root:
+            raise ValueError("不能把当前正在运行的代码目录当成升级来源。请选新版本目录或打包 zip。")
+        dir_names, file_names = _build_upgrade_copy_plan(source_root)
+        running_sessions = [session for session in self.sessions.values() if session.engine.is_running]
+        running_count = len(running_sessions)
+        migratable_count = sum(1 for session in running_sessions if session.recovery_supported)
+        unsupported_count = max(0, running_count - migratable_count)
+        source_version = _read_upgrade_candidate_version(source_root)
+        message = _build_deploy_upgrade_confirmation_message(
+            source_label=source_label,
+            source_version=source_version,
+            running_count=running_count,
+            migratable_count=migratable_count,
+            unsupported_count=unsupported_count,
+            data_dir=configured_data_root() or data_root(),
+        )
+        confirmed = messagebox.askyesno("一键升级确认", message, parent=self.root)
+        if not confirmed:
+            return False
+        worker_command = self._build_upgrade_worker_command(
+            source_root=source_root,
+            cleanup_dir=cleanup_dir,
+            target_root=target_root,
+            dir_names=dir_names,
+            file_names=file_names,
+        )
+        self._enqueue_log(f"一键升级开始：来源={source_label} | 候选版本={source_version}")
+        self._enqueue_log(f"一键升级复制计划：目录 {', '.join(dir_names)} | 文件 {', '.join(file_names)}")
+        self._upgrade_worker_command_on_close = worker_command
+        self._restart_command_on_close = None
+        self._close_confirmation_required = False
+        self._on_close()
+        return True
+
+    def _build_upgrade_worker_command(
+        self,
+        *,
+        source_root: Path,
+        cleanup_dir: Path | None,
+        target_root: Path,
+        dir_names: list[str],
+        file_names: list[str],
+    ) -> list[str]:
+        worker_dir = Path(tempfile.mkdtemp(prefix="qqokx-upgrade-worker-"))
+        script_path = worker_dir / "run_upgrade.ps1"
+        launch_command = _build_app_restart_command()
+        script_text = self._build_upgrade_worker_script(
+            wait_pid=os.getpid(),
+            source_root=source_root,
+            cleanup_dir=cleanup_dir,
+            target_root=target_root,
+            dir_names=dir_names,
+            file_names=file_names,
+            launch_command=launch_command,
+        )
+        script_path.write_text(script_text, encoding="utf-8")
+        return [
+            "powershell",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+        ]
+
+    def _build_upgrade_worker_script(
+        self,
+        *,
+        wait_pid: int,
+        source_root: Path,
+        cleanup_dir: Path | None,
+        target_root: Path,
+        dir_names: list[str],
+        file_names: list[str],
+        launch_command: list[str],
+    ) -> str:
+        cleanup_text = str(cleanup_dir.resolve()) if cleanup_dir is not None else ""
+        return f"""$ErrorActionPreference = 'Stop'
+$waitPid = {int(wait_pid)}
+$sourceRoot = {_ps_quote(str(source_root.resolve()))}
+$targetRoot = {_ps_quote(str(target_root.resolve()))}
+$cleanupDir = {_ps_quote(cleanup_text)}
+$dirNames = {_ps_array(dir_names)}
+$fileNames = {_ps_array(file_names)}
+$launchCommand = {_ps_array(launch_command)}
+
+for ($attempt = 0; $attempt -lt 240; $attempt++) {{
+    if (-not (Get-Process -Id $waitPid -ErrorAction SilentlyContinue)) {{
+        break
+    }}
+    Start-Sleep -Milliseconds 500
+}}
+if (Get-Process -Id $waitPid -ErrorAction SilentlyContinue) {{
+    throw "等待旧进程退出超时：PID=$waitPid"
+}}
+
+foreach ($name in $dirNames) {{
+    $src = Join-Path $sourceRoot $name
+    if (-not (Test-Path -LiteralPath $src)) {{
+        continue
+    }}
+    $dst = Join-Path $targetRoot $name
+    if (Test-Path -LiteralPath $dst) {{
+        Remove-Item -LiteralPath $dst -Recurse -Force
+    }}
+    Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force
+}}
+
+foreach ($name in $fileNames) {{
+    $src = Join-Path $sourceRoot $name
+    if (-not (Test-Path -LiteralPath $src)) {{
+        continue
+    }}
+    $dst = Join-Path $targetRoot $name
+    Copy-Item -LiteralPath $src -Destination $dst -Force
+}}
+
+if ($cleanupDir) {{
+    Remove-Item -LiteralPath $cleanupDir -Recurse -Force -ErrorAction SilentlyContinue
+}}
+
+$exe = $launchCommand[0]
+$args = @()
+if ($launchCommand.Count -gt 1) {{
+    $args = $launchCommand[1..($launchCommand.Count - 1)]
+}}
+Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -WindowStyle Hidden
+"""
+
+    def upgrade_program(self) -> None:
+        running_sessions = [session for session in self.sessions.values() if session.engine.is_running]
+        running_count = len(running_sessions)
+        migratable_count = sum(1 for session in running_sessions if session.recovery_supported)
+        unsupported_count = max(0, running_count - migratable_count)
+        message = _build_upgrade_confirmation_message(
+            running_count=running_count,
+            migratable_count=migratable_count,
+            unsupported_count=unsupported_count,
+            data_dir=configured_data_root() or data_root(),
+        )
+        confirmed = messagebox.askyesno("程序升级", message, parent=self.root)
+        if not confirmed:
+            return
+        if migratable_count > 0:
+            session_labels = ", ".join(session.session_id for session in running_sessions if session.recovery_supported)
+            self._enqueue_log(f"程序升级开始：准备迁移 {migratable_count} 条策略 -> {session_labels}")
+        if unsupported_count > 0:
+            session_labels = ", ".join(session.session_id for session in running_sessions if not session.recovery_supported)
+            self._enqueue_log(f"程序升级提示：有 {unsupported_count} 条策略不支持自动迁移，升级后需要手工重启 -> {session_labels}")
+        self._upgrade_worker_command_on_close = None
+        self._restart_command_on_close = _build_app_restart_command()
+        self._close_confirmation_required = False
+        self._on_close()
 
     def _on_strategy_launch_form_canvas_configure(self, event) -> None:
         canvas = self._strategy_launch_form_canvas
@@ -10917,13 +11313,19 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._request_line_trading_desk_refresh(immediate=True)
 
     def _on_close(self) -> None:
-        confirmed = messagebox.askyesno(
-            "确认关闭",
-            "是否要关闭主界面？",
-            parent=self.root,
-        )
-        if not confirmed:
-            return
+        if self._close_confirmation_required:
+            confirmed = messagebox.askyesno(
+                "确认关闭",
+                "是否要关闭主界面？",
+                parent=self.root,
+            )
+            if not confirmed:
+                return
+        self._close_confirmation_required = True
+        upgrade_worker_command = self._upgrade_worker_command_on_close
+        self._upgrade_worker_command_on_close = None
+        restart_command = self._restart_command_on_close
+        self._restart_command_on_close = None
         self._save_strategy_parameter_draft()
         self._save_credentials_now(silent=True)
         self._save_notification_settings_now(silent=True)
@@ -10993,6 +11395,30 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self._protection_replay_window.window.destroy()
         self._close_positions_zoom_window()
         self._close_position_protection_window()
+        post_close_command = upgrade_worker_command or restart_command
+        post_close_error_title = "一键升级失败" if upgrade_worker_command is not None else "程序升级失败"
+        post_close_error_message = (
+            "旧程序已经关闭运行线程，但自动升级助手启动失败了。\n\n请手动重新打开程序。"
+            if upgrade_worker_command is not None
+            else "旧程序已经关闭运行线程，但自动拉起新程序失败了。\n\n请手动重新打开程序。"
+        )
+        if post_close_command is not None:
+            try:
+                creationflags = 0
+                if os.name == "nt":
+                    creationflags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                    creationflags |= int(getattr(subprocess, "DETACHED_PROCESS", 0))
+                popen_kwargs: dict[str, object] = {"cwd": _app_restart_workdir()}
+                if creationflags:
+                    popen_kwargs["creationflags"] = creationflags
+                subprocess.Popen(post_close_command, **popen_kwargs)
+            except Exception as exc:
+                messagebox.showerror(
+                    post_close_error_title,
+                    post_close_error_message + "\n\n"
+                    f"请手动重新打开程序。\n\n错误信息：{exc}",
+                    parent=self.root,
+                )
         self.root.destroy()
 
 def _format_optional_decimal(value: Decimal | None, *, with_sign: bool = False) -> str:

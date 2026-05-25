@@ -1,7 +1,7 @@
 from decimal import Decimal
 from unittest import TestCase
 
-from okx_quant.indicators import atr, bollinger_bands, ema, macd, sma
+from okx_quant.indicators import atr, bollinger_bands, ema, linear_regression_slope, macd, sma
 from okx_quant.models import Candle
 
 
@@ -48,3 +48,10 @@ class IndicatorsTest(TestCase):
         self.assertIsNotNone(upper[-1])
         self.assertIsNotNone(lower[-1])
         self.assertTrue(upper[-1] > middle[-1] > lower[-1])
+
+    def test_linear_regression_slope_detects_direction(self) -> None:
+        falling = [Decimal("10"), Decimal("8"), Decimal("6"), Decimal("4"), Decimal("2")]
+        rising = [Decimal("2"), Decimal("4"), Decimal("6"), Decimal("8"), Decimal("10")]
+
+        self.assertLess(linear_regression_slope(falling), Decimal("0"))
+        self.assertGreater(linear_regression_slope(rising), Decimal("0"))

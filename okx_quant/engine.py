@@ -436,6 +436,19 @@ class StrategyEngine:
             price_increment=price_increment,
         )
 
+    def _log_entry_order_tracking(
+        self,
+        candle_ts: int,
+        *,
+        cl_ord_id: str | None,
+        entry_reference: Decimal,
+        price_label: str = "挂单价",
+    ) -> None:
+        self._logger(
+            f"{_fmt_ts(candle_ts)} | 委托追踪 | clOrdId={cl_ord_id or '-'} | "
+            f"{price_label}={format_decimal(entry_reference)}"
+        )
+
     def _append_dynamic_mtf_mode_parts(self, config: StrategyConfig, mode_parts: list[str]) -> None:
         if not is_dynamic_mtf_strategy_id(config.strategy_id):
             return
@@ -760,7 +773,11 @@ class StrategyEngine:
                 f"{_fmt_ts(plan.candle_ts)} | 挂单已提交到 OKX | ordId={result.ord_id or '-'} | "
                 f"sCode={result.s_code} | sMsg={result.s_msg or 'accepted'}"
             )
-            self._logger(f"{_fmt_ts(plan.candle_ts)} | 委托追踪 | clOrdId={active_order.cl_ord_id or '-'}")
+            self._log_entry_order_tracking(
+                plan.candle_ts,
+                cl_ord_id=active_order.cl_ord_id,
+                entry_reference=active_order.entry_reference,
+            )
             self._stop_event.wait(config.poll_seconds)
 
     def resume_dynamic_exchange_pending_order(
@@ -1043,7 +1060,11 @@ class StrategyEngine:
                     f"{_fmt_ts(plan.candle_ts)} | 挂单已提交到 OKX | ordId={result.ord_id or '-'} | "
                     f"sCode={result.s_code} | sMsg={result.s_msg or 'accepted'}"
                 )
-                self._logger(f"{_fmt_ts(plan.candle_ts)} | 委托追踪 | clOrdId={active_order.cl_ord_id or '-'}")
+                self._log_entry_order_tracking(
+                    plan.candle_ts,
+                    cl_ord_id=active_order.cl_ord_id,
+                    entry_reference=active_order.entry_reference,
+                )
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
@@ -1235,7 +1256,12 @@ class StrategyEngine:
                 f"订单已提交到 OKX | ordId={result.ord_id or '-'} | "
                 f"sCode={result.s_code} | sMsg={result.s_msg or 'accepted'}"
             )
-            self._logger(f"{_fmt_ts(plan.candle_ts)} | 委托追踪 | clOrdId={result.cl_ord_id or cl_ord_id or '-'}")
+            self._log_entry_order_tracking(
+                plan.candle_ts,
+                cl_ord_id=result.cl_ord_id or cl_ord_id,
+                entry_reference=plan.entry_reference,
+                price_label="参考入场价",
+            )
             filled = self._wait_for_order_fill(
                 credentials,
                 config,

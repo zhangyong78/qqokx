@@ -991,6 +991,9 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "max_entries_per_trend": config.max_entries_per_trend,
         "dynamic_two_r_break_even": config.dynamic_two_r_break_even,
         "dynamic_fee_offset_enabled": config.dynamic_fee_offset_enabled,
+        "trend_ema_slope_filter_enabled": config.trend_ema_slope_filter_enabled,
+        "trend_ema_slope_filter_lookback_bars": config.trend_ema_slope_filter_lookback_bars,
+        "trend_ema_slope_filter_min_ratio": str(config.trend_ema_slope_filter_min_ratio),
         "time_stop_break_even_enabled": config.time_stop_break_even_enabled,
         "time_stop_break_even_bars": config.resolved_time_stop_break_even_bars(),
         "hold_close_exit_bars": int(config.hold_close_exit_bars),
@@ -1027,6 +1030,18 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         if payload.get("backtest_exit_slippage_rate") in (None, "")
         else Decimal(str(payload.get("backtest_exit_slippage_rate")))
     )
+    def coerce_bool(value: object, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        raw = str(value).strip().lower()
+        if raw in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if raw in {"0", "false", "no", "off", "disabled"}:
+            return False
+        return default
+
     return StrategyConfig(
         inst_id=str(payload.get("inst_id", "")),
         bar=str(payload.get("bar", "15m")),
@@ -1062,6 +1077,9 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         max_entries_per_trend=int(payload.get("max_entries_per_trend", 1)),
         dynamic_two_r_break_even=bool(payload.get("dynamic_two_r_break_even", True)),
         dynamic_fee_offset_enabled=bool(payload.get("dynamic_fee_offset_enabled", True)),
+        trend_ema_slope_filter_enabled=coerce_bool(payload.get("trend_ema_slope_filter_enabled"), True),
+        trend_ema_slope_filter_lookback_bars=int(payload.get("trend_ema_slope_filter_lookback_bars", 5)),
+        trend_ema_slope_filter_min_ratio=Decimal(str(payload.get("trend_ema_slope_filter_min_ratio", "0"))),
         time_stop_break_even_enabled=bool(payload.get("time_stop_break_even_enabled", False)),
         time_stop_break_even_bars=int(payload.get("time_stop_break_even_bars", 10)),
         hold_close_exit_bars=int(payload.get("hold_close_exit_bars", 0)),
