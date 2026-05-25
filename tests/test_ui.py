@@ -2161,14 +2161,16 @@ class StrategyTradeTrackingTest(TestCase):
         )
         app._start_session_trade_reconciliation = MagicMock()
         app._track_session_trade_runtime_with_observed_at = (
-            lambda session, message, observed_at: QuantApp._track_session_trade_runtime_with_observed_at(
+            lambda session, message, observed_at, allow_reconciliation=True: QuantApp._track_session_trade_runtime_with_observed_at(
                 app,
                 session,
                 message,
                 observed_at=observed_at,
+                allow_reconciliation=allow_reconciliation,
             )
         )
         app._parse_strategy_log_observed_at = lambda line: QuantApp._parse_strategy_log_observed_at(line)
+        app._clear_session_manual_management_state = lambda _session: None
         return app
 
     def test_track_session_trade_runtime_captures_entry_stop_and_close_trigger(self) -> None:
@@ -2343,6 +2345,33 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(restored.pending_entry_reference, Decimal("2286.34"))
         self.assertEqual(restored.pending_stop_price, Decimal("2288.86"))
         self.assertEqual(restored.size, Decimal("39.68"))
+
+    def test_restore_session_trade_runtime_from_log_does_not_reconcile_historical_closed_rounds(self) -> None:
+        session = self._make_session()
+        app = self._make_app_for_tracking()
+
+        with TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "s186.log"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "[05-24 22:12:45] [moni] [S186 EMA SOL-USDT-SWAP] 2026-05-24 22:12:45 | 准备挂单 | 方向=LONG | 开仓价=85.28 | 数量=32.25 | 止损=84.10",
+                        "[05-24 22:12:46] [moni] [S186 EMA SOL-USDT-SWAP] 2026-05-24 22:12:46 | 挂单已提交到 OKX | ordId=1001",
+                        "[05-24 22:12:47] [moni] [S186 EMA SOL-USDT-SWAP] 2026-05-24 22:12:47 | 挂单已成交 | ordId=1001 | 开仓价=85.28 | 数量=32.25",
+                        "[05-25 04:50:24] [moni] [S186 EMA SOL-USDT-SWAP] 本轮持仓已结束，继续监控下一次信号。",
+                        "[05-25 00:00:24] [moni] [S186 EMA SOL-USDT-SWAP] 准备挂单 | 方向=LONG | 开仓价=85.21 | 数量=29.41 | 止损=84.05",
+                        "[05-25 00:00:25] [moni] [S186 EMA SOL-USDT-SWAP] 挂单已提交到 OKX | ordId=1002",
+                        "[05-25 00:00:26] [moni] [S186 EMA SOL-USDT-SWAP] 挂单已成交 | ordId=1002 | 开仓价=85.21 | 数量=29.41",
+                        "[05-25 04:50:24] [moni] [S186 EMA SOL-USDT-SWAP] 本轮持仓已结束，继续监控下一次信号。",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            session.log_file_path = log_path
+            restored = QuantApp._restore_session_trade_runtime_from_log(app, session)
+
+        self.assertIsNone(restored)
+        app._start_session_trade_reconciliation.assert_not_called()
 
     def test_recover_session_starts_exchange_dynamic_takeover_when_position_exists(self) -> None:
         session = self._make_session()

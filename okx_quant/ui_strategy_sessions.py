@@ -5613,6 +5613,7 @@ class UiStrategySessionsMixin:
         message: str,
         *,
         observed_at: datetime,
+        allow_reconciliation: bool = True,
     ) -> None:
         signal_bar_at = _extract_session_bar_time(message)
         if "挂单已提交到 OKX" in message:
@@ -5761,6 +5762,7 @@ class UiStrategySessionsMixin:
                 session,
                 text,
                 observed_at=observed_at,
+                allow_reconciliation=False,
             )
         return session.active_trade
 
@@ -6546,6 +6548,7 @@ class UiStrategySessionsMixin:
         message: str,
         *,
         observed_at: datetime,
+        allow_reconciliation: bool = True,
     ) -> None:
         signal_bar_at = _extract_session_bar_time(message)
         if "准备挂单" in message:
@@ -6648,6 +6651,10 @@ class UiStrategySessionsMixin:
             trade = session.active_trade
             if trade is None or trade.reconciliation_started:
                 return
+            if not allow_reconciliation:
+                self._clear_session_manual_management_state(session)
+                session.active_trade = None
+                return
             trade.reconciliation_started = True
             self._start_session_trade_reconciliation(session, trade)
             return
@@ -6660,6 +6667,10 @@ class UiStrategySessionsMixin:
         ):
             trade = session.active_trade
             if trade is None or trade.reconciliation_started:
+                return
+            if not allow_reconciliation:
+                self._clear_session_manual_management_state(session)
+                session.active_trade = None
                 return
             trade.reconciliation_started = True
             self._start_session_trade_reconciliation(session, trade)
