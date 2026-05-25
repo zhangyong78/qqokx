@@ -81,7 +81,7 @@ def main() -> None:
             comparison_rows.append(row)
             all_results[(config.name, cost_name)] = (config, trades, metrics)
 
-    comparison = pd.DataFrame(comparison_rows)
+    comparison = add_rank_scores(pd.DataFrame(comparison_rows))
     comparison.to_csv(REPORT_DIR / "strategy_comparison.csv", index=False, encoding="utf-8-sig")
 
     stability = build_parameter_stability(comparison)
@@ -272,7 +272,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["long_upper"] = (out["upper_body_ratio"] > 1.5) & (out["close_pos"] <= 0.5)
     out["bearish_engulf"] = (
         out["bearish"]
-        & out["bullish"].shift(1).fillna(False)
+        & out["bullish"].shift(1, fill_value=False).astype(bool)
         & (out["open"] >= out["close"].shift(1))
         & (out["close"] <= out["open"].shift(1))
     )
@@ -318,7 +318,7 @@ def rsi(series: pd.Series, period: int) -> pd.Series:
 
 def add_mtf_features(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     base = df.set_index("timestamp")[["open", "high", "low", "close", "volume"]]
-    mtf = base.resample(rule, label="left", closed="left").agg(
+    mtf = base.resample(rule.lower(), label="left", closed="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     )
     mtf = mtf.dropna().reset_index()
@@ -364,8 +364,8 @@ def add_mtf_features(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 
 def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out["filter_htf_short"] = out["h4_short_trend"].fillna(False)
-    out["filter_daily_not_strong_bull"] = ~out["d1_strong_bull"].fillna(False)
+    out["filter_htf_short"] = out["h4_short_trend"].fillna(False).astype(bool)
+    out["filter_daily_not_strong_bull"] = ~out["d1_strong_bull"].fillna(False).astype(bool)
     out["filter_no_chase"] = out["dist_ema50_atr"] > -2.0
     out["filter_atr50"] = out["atr_pct100"] > 0.5
 
@@ -846,7 +846,12 @@ def flatten_metrics(
 
 
 def rank_configs(comparison: pd.DataFrame) -> pd.DataFrame:
-    ranked = comparison.copy()
+    ranked = add_rank_scores(comparison.copy())
+    return ranked.sort_values("score", ascending=False)
+
+
+def add_rank_scores(frame: pd.DataFrame) -> pd.DataFrame:
+    ranked = frame.copy()
     ranked["score"] = (
         ranked["test_profit_factor"].clip(upper=3) * 2.0
         + ranked["validation_profit_factor"].clip(upper=3)
@@ -857,7 +862,7 @@ def rank_configs(comparison: pd.DataFrame) -> pd.DataFrame:
     ranked.loc[ranked["test_trade_count"] < 20, "score"] -= 3
     ranked.loc[ranked["validation_trade_count"] < 20, "score"] -= 2
     ranked.loc[ranked["test_profit_factor"] < 1.0, "score"] -= 2
-    return ranked.sort_values("score", ascending=False)
+    return ranked
 
 
 def build_parameter_stability(comparison: pd.DataFrame) -> pd.DataFrame:
@@ -950,7 +955,7 @@ def monthly_returns(trades: pd.DataFrame) -> pd.DataFrame:
     if trades.empty:
         return pd.DataFrame(columns=["month", "return_pct", "trade_count"])
     frame = trades.copy()
-    frame["month"] = pd.to_datetime(frame["exit_time"]).dt.to_period("M").astype(str)
+    frame["month"] = pd.to_datetime(frame["exit_time"]).dt.tz_convert(None).dt.to_period("M").astype(str)
     return (
         frame.groupby("month")
         .agg(return_pct=("return_pct", lambda s: float(np.prod(1 + s) - 1)), trade_count=("return_pct", "count"))
@@ -1025,7 +1030,7 @@ def plot_trade_chart(df: pd.DataFrame, trade: pd.Series, path: Path) -> None:
     start = max(0, entry_idx - 40)
     end = min(len(df), exit_idx + 41)
     window = df.iloc[start:end].copy()
-    dates = mdates.date2num(pd.to_datetime(window["timestamp"]).dt.to_pydatetime())
+    dates = mdates.date2num(np.array(pd.to_datetime(window["timestamp"]).dt.to_pydatetime()))
 
     fig, ax = plt.subplots(figsize=(12, 6))
     width = 0.025
