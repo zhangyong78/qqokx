@@ -603,22 +603,28 @@ HTTP 502: <!DOCTYPE html>
     def test_build_trend_parameter_hint_text_for_dynamic_strategy(self) -> None:
         hint = _build_trend_parameter_hint_text(
             strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            ema_type_raw="EMA",
             ema_period_raw="21",
+            trend_ema_type_raw="EMA",
             trend_ema_period_raw="55",
             big_ema_period_raw="233",
+            entry_reference_ema_type_raw="EMA",
             entry_reference_ema_period_raw="0",
         )
 
-        self.assertIn("EMA小周期：21=快线", hint)
-        self.assertIn("EMA中周期：55=趋势过滤线", hint)
-        self.assertIn("挂单参考EMA：0=跟随EMA小周期，当前按 EMA21 作为挂单价格锚点。", hint)
+        self.assertIn("EMA21", hint)
+        self.assertIn("EMA55", hint)
+        self.assertIn("EMA21", hint)
 
     def test_build_trend_parameter_hint_text_for_dynamic_mtf_strategy_includes_filter(self) -> None:
         hint = _build_trend_parameter_hint_text(
             strategy_id=STRATEGY_DYNAMIC_MTF_LONG_ID,
+            ema_type_raw="EMA",
             ema_period_raw="21",
+            trend_ema_type_raw="EMA",
             trend_ema_period_raw="55",
             big_ema_period_raw="233",
+            entry_reference_ema_type_raw="EMA",
             entry_reference_ema_period_raw="55",
             mtf_filter_bar_raw="4H",
             mtf_filter_fast_ema_period_raw="21",
@@ -1274,7 +1280,7 @@ HTTP 502: <!DOCTYPE html>
 
         markers = QuantApp._strategy_live_chart_event_time_markers(app, session, "SOL-USDT-SWAP")
 
-        self.assertEqual([marker.key for marker in markers], ["close:L01", "add:ent002", "reduce:red001"])
+        self.assertEqual([marker.key for marker in markers], ["open:L01", "close:L01", "add:ent002", "reduce:red001"])
 
     def test_session_can_be_cleared_only_when_stopped_and_not_running(self) -> None:
         stopped = SimpleNamespace(status="\u5df2\u505c\u6b62", engine=SimpleNamespace(is_running=False))
@@ -1447,9 +1453,12 @@ class StrategyTemplateImportExportTest(TestCase):
             trade_symbol=_Var(),
             local_tp_sl_symbol=_Var(),
             bar=_Var(),
+            ema_type=_Var(),
             ema_period=_Var(),
+            trend_ema_type=_Var(),
             trend_ema_period=_Var(),
             big_ema_period=_Var(),
+            entry_reference_ema_type=_Var(),
             entry_reference_ema_period=_Var(),
             atr_period=_Var(),
             stop_atr=_Var(),
@@ -1474,6 +1483,7 @@ class StrategyTemplateImportExportTest(TestCase):
             environment_label=_Var("实盘 live"),
         )
         app._resolve_strategy_template_definition = lambda item: QuantApp._resolve_strategy_template_definition(app, item)
+        app._format_optional_positive_entry_decimal = lambda value: QuantApp._format_optional_positive_entry_decimal(value)
 
         definition, resolved_api_name, api_note = QuantApp._apply_strategy_template_record(app, record)
 
@@ -3321,7 +3331,7 @@ class StrategyTradeTrackingTest(TestCase):
                     )
                 ]
 
-            def place_simple_order(self, credentials, config, *, inst_id: str, side: str, size: Decimal, ord_type: str, pos_side=None, price=None, cl_ord_id=None):  # noqa: ANN001,E501
+            def place_simple_order(self, credentials, config, *, inst_id: str, side: str, size: Decimal, ord_type: str, pos_side=None, price=None, cl_ord_id=None, reduce_only=None):  # noqa: ANN001,E501
                 self.orders.append(
                     {
                         "inst_id": inst_id,
@@ -3518,7 +3528,7 @@ class StrategyTradeTrackingTest(TestCase):
             def get_ticker(inst_id: str):  # noqa: ANN001
                 return SimpleNamespace(inst_id=inst_id, bid=Decimal("2299.10"), ask=Decimal("2299.20"))
 
-            def place_simple_order(self, credentials, config, *, inst_id: str, side: str, size: Decimal, ord_type: str, pos_side=None, price=None, cl_ord_id=None):  # noqa: ANN001,E501
+            def place_simple_order(self, credentials, config, *, inst_id: str, side: str, size: Decimal, ord_type: str, pos_side=None, price=None, cl_ord_id=None, reduce_only=None):  # noqa: ANN001,E501
                 self.orders.append(
                     {
                         "inst_id": inst_id,
@@ -3744,7 +3754,7 @@ class StrategyTradeTrackingTest(TestCase):
             def get_ticker(inst_id: str):  # noqa: ANN001
                 return SimpleNamespace(inst_id=inst_id, bid=Decimal("2299.10"), ask=Decimal("2299.20"))
 
-            def place_simple_order(self, credentials, config, *, inst_id: str, side: str, size: Decimal, ord_type: str, pos_side=None, price=None, cl_ord_id=None):  # noqa: ANN001,E501
+            def place_simple_order(self, credentials, config, *, inst_id: str, side: str, size: Decimal, ord_type: str, pos_side=None, price=None, cl_ord_id=None, reduce_only=None):  # noqa: ANN001,E501
                 self.orders.append(
                     {
                         "inst_id": inst_id,
@@ -3825,12 +3835,21 @@ class StrategyTradeTrackingTest(TestCase):
             theta=None,
             raw={},
         )
+        client = SimpleNamespace(get_instrument=lambda inst_id: Instrument(inst_id=inst_id, inst_type="SWAP", tick_size=Decimal("0.01"), lot_size=Decimal("0.1"), min_size=Decimal("0.1"), state="live"))
+
         app = SimpleNamespace(
             _selected_position_item=lambda: position,
+            client=client,
             _position_action_parent=lambda: "parent-window",
             _positions_context_profile_name=None,
             _current_credential_profile=lambda: "test-profile",
+            _credentials_for_profile_or_none=lambda profile_name: SimpleNamespace(profile_name=profile_name),
+            _normalize_position_manual_flatten_mode=QuantApp._normalize_position_manual_flatten_mode,
             _position_manual_flatten_mode_label=QuantApp._position_manual_flatten_mode_label,
+            _positions_effective_environment="demo",
+            environment_label=_Var("???"),
+            _selected_position_close_size=lambda selected: QuantApp._selected_position_close_size(app, selected),
+            _build_selected_position_manual_flatten_config=lambda selected: QuantApp._build_selected_position_manual_flatten_config(app, selected),
             _submit_selected_position_manual_flatten=lambda selected, flatten_mode: (
                 OkxOrderResult(
                     ord_id="ord-position-2",
@@ -4286,7 +4305,7 @@ class PositionRealizedUsdtColumnTest(TestCase):
             margin_ccy="BTC",
         )
 
-        QuantApp._insert_position_row(app, "", position, "P01")
+        QuantApp._insert_position_row(app, app.position_tree, "", position, "P01")
 
         self.assertEqual(app.position_tree.rows["P01"]["values"][19], "+0.00100")
         self.assertEqual(app.position_tree.rows["P01"]["values"][20], "+100")
@@ -4738,6 +4757,93 @@ class SelectedSessionDetailRefreshTest(TestCase):
         )
         self.assertEqual(app._selected_session_detail_session_id, "S02")
 
+    def test_build_strategy_detail_text_groups_running_parameters_and_shows_max_entries(self) -> None:
+        snapshot = {
+            "environment": "demo",
+            "trade_mode": "cross",
+            "position_mode": "net",
+            "signal_mode": "short_only",
+            "bar": "4H",
+            "ema_type": "ema",
+            "ema_period": 21,
+            "trend_ema_type": "ema",
+            "trend_ema_period": 55,
+            "entry_reference_ema_type": "ema",
+            "entry_reference_ema_period": 55,
+            "take_profit_mode": "dynamic",
+            "max_entries_per_trend": 2,
+            "startup_chase_window_seconds": 0,
+            "dynamic_two_r_break_even": True,
+            "dynamic_fee_offset_enabled": True,
+            "time_stop_break_even_enabled": False,
+            "time_stop_break_even_bars": 10,
+            "atr_period": 10,
+            "atr_stop_multiplier": "2",
+            "atr_take_multiplier": "4",
+            "risk_amount": "20",
+            "order_size": "1",
+            "entry_side_mode": "follow_signal",
+            "tp_sl_mode": "exchange",
+            "tp_sl_trigger_type": "mark",
+            "local_tp_sl_inst_id": "",
+            "poll_seconds": "8",
+        }
+        app = SimpleNamespace(
+            _snapshot_optional_text=lambda payload, key: QuantApp._snapshot_optional_text(payload, key),
+            _snapshot_text=lambda payload, key, default="-": QuantApp._snapshot_text(payload, key, default),
+            _snapshot_int=lambda payload, key, default=0: QuantApp._snapshot_int(payload, key, default),
+            _format_strategy_symbol_display=lambda signal_symbol, trade_symbol: QuantApp._format_strategy_symbol_display(
+                signal_symbol,
+                trade_symbol,
+            ),
+            _entry_reference_ema_caption=lambda strategy_id: QuantApp._entry_reference_ema_caption(strategy_id),
+            _strategy_uses_big_ema=lambda _strategy_id: False,
+            _bool_label=lambda value: QuantApp._bool_label(value),
+            _max_entries_detail_label=lambda value: QuantApp._max_entries_detail_label(value),
+            _startup_chase_window_detail_label=lambda value: QuantApp._startup_chase_window_detail_label(value),
+        )
+
+        text = QuantApp._build_strategy_detail_text(
+            app,
+            session_id="S188",
+            api_name="QQzhangyong",
+            status="运行中",
+            runtime_status="等待信号",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            strategy_name="EMA 动态委托做多",
+            symbol="DOGE-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            started_at=datetime(2026, 5, 26, 16, 9, 46),
+            stopped_at=None,
+            ended_reason="",
+            config_snapshot=snapshot,
+            log_file_path="",
+            last_message="等待信号",
+            trade_count=3,
+            win_count=2,
+            gross_pnl_total=Decimal("2.6"),
+            fee_total=Decimal("0.4"),
+            funding_total=Decimal("0"),
+            net_pnl_total=Decimal("2.2"),
+            last_close_reason="",
+            live_pnl=Decimal("1.25"),
+            live_pnl_refreshed_at=datetime(2026, 5, 26, 16, 34, 17),
+            duplicate_warning="",
+            email_status_label="开",
+            global_email_enabled=True,
+        )
+
+        self.assertIn("【运行概览】", text)
+        self.assertIn("【收益概览】", text)
+        self.assertIn("【当前参数】", text)
+        self.assertIn("邮件通知：开（全局开启）", text)
+        self.assertIn("最近运行状态：等待信号", text)
+        self.assertIn("每波最多开仓次数：2次", text)
+        self.assertIn("止盈方式：动态止盈", text)
+        self.assertIn("启动追单窗口：关闭（启动不追老信号）", text)
+        self.assertIn("实时浮盈亏：+1.25（参考持仓 16:34:17）", text)
+
 
 class SessionLivePnlSummaryTest(TestCase):
     def test_session_open_position_amount_text_uses_signed_coin_size(self) -> None:
@@ -5064,6 +5170,9 @@ class CredentialProfileEnvironmentTest(TestCase):
             _sync_credential_profile_combo=MagicMock(),
             _update_settings_summary=MagicMock(),
             _enqueue_log=MagicMock(),
+            _api_sender_email_overrides={},
+            _api_sender_override_watch_enabled=False,
+            api_sender_email_override=_Var(),
         )
 
         def _set_credentials_fields(snapshot: dict[str, str]) -> None:
@@ -5072,6 +5181,13 @@ class CredentialProfileEnvironmentTest(TestCase):
             app.passphrase.set(snapshot["passphrase"])
 
         app._set_credentials_fields = _set_credentials_fields
+        app._normalized_api_sender_email_overrides = lambda: QuantApp._normalized_api_sender_email_overrides(app)
+        app._resolved_api_sender_email_override = (
+            lambda profile_name=None: QuantApp._resolved_api_sender_email_override(app, profile_name)
+        )
+        app._sync_current_api_sender_email_override = (
+            lambda profile_name=None: QuantApp._sync_current_api_sender_email_override(app, profile_name)
+        )
         app._normalized_environment_label = lambda label, fallback=None: QuantApp._normalized_environment_label(
             app, label, fallback=fallback
         )
@@ -5144,6 +5260,66 @@ class CredentialProfileEnvironmentTest(TestCase):
         self.assertEqual(root.calls, [(600, save_credentials), (600, save_settings)])
         self.assertEqual(app._credential_save_job, "job-1")
         self.assertEqual(app._settings_save_job, "job-2")
+
+    def test_collect_notification_config_prefers_api_sender_override(self) -> None:
+        app = SimpleNamespace(
+            smtp_port=_Var("465"),
+            recipient_emails=_Var("ops@example.com"),
+            notify_enabled=_Var(True),
+            smtp_host=_Var("smtp.example.com"),
+            smtp_username=_Var("smtp-user"),
+            smtp_password=_Var("secret"),
+            sender_email=_Var("global@example.com"),
+            use_ssl=_Var(True),
+            notify_trade_fills=_Var(True),
+            notify_signals=_Var(True),
+            notify_errors=_Var(True),
+            _api_sender_email_overrides={"api2": "api2@example.com"},
+        )
+        app._parse_optional_port = lambda raw: QuantApp._parse_optional_port(app, raw)
+        app._split_recipients = lambda raw: QuantApp._split_recipients(app, raw)
+        app._normalized_api_sender_email_overrides = lambda: QuantApp._normalized_api_sender_email_overrides(app)
+        app._resolved_api_sender_email_override = (
+            lambda profile_name=None: QuantApp._resolved_api_sender_email_override(app, profile_name)
+        )
+
+        overridden = QuantApp._collect_notification_config(app, validate_if_enabled=True, api_profile_name="api2")
+        fallback = QuantApp._collect_notification_config(app, validate_if_enabled=True, api_profile_name="api1")
+
+        self.assertEqual(overridden.sender_email, "api2@example.com")
+        self.assertEqual(fallback.sender_email, "global@example.com")
+
+    def test_rename_current_api_profile_moves_sender_override(self) -> None:
+        app = SimpleNamespace(
+            _credential_profiles={
+                "api1": {
+                    "api_key": "key",
+                    "secret_key": "secret",
+                    "passphrase": "pass",
+                    "environment": "demo",
+                }
+            },
+            _api_sender_email_overrides={"api1": "desk@example.com"},
+            _editing_credential_profile=lambda: "api1",
+            _save_credentials_now=MagicMock(),
+            _save_notification_settings_now=MagicMock(),
+            _apply_credentials_profile=MagicMock(),
+            _enqueue_log=MagicMock(),
+            _settings_window=None,
+            root=object(),
+        )
+
+        with patch("okx_quant.ui.simpledialog.askstring", return_value="desk"), patch(
+            "okx_quant.ui.save_credentials_profiles_snapshot"
+        ) as save_snapshot:
+            QuantApp._rename_current_api_profile(app)
+
+        self.assertEqual(app._api_sender_email_overrides, {"desk": "desk@example.com"})
+        self.assertIn("desk", app._credential_profiles)
+        self.assertNotIn("api1", app._credential_profiles)
+        app._save_notification_settings_now.assert_any_call(silent=True)
+        app._apply_credentials_profile.assert_called_once_with("desk", log_change=True)
+        save_snapshot.assert_called_once()
 
 
 class StrategyStopCleanupTest(TestCase):
@@ -5421,12 +5597,15 @@ class StrategyParameterDraftRestoreTest(TestCase):
             _strategy_parameter_scope="launcher",
             bar=_Var(""),
             signal_mode_label=_Var(""),
+            ema_type=_Var(""),
             ema_period=_Var(""),
+            trend_ema_type=_Var(""),
             trend_ema_period=_Var(""),
             big_ema_period=_Var(""),
             atr_period=_Var(""),
             stop_atr=_Var(""),
             take_atr=_Var(""),
+            entry_reference_ema_type=_Var(""),
             entry_reference_ema_period=_Var(""),
             mtf_filter_bar=_Var(""),
             mtf_filter_fast_ema_period=_Var(""),
@@ -5499,9 +5678,9 @@ class StrategyParameterFixedLabelTest(TestCase):
         QuantApp._apply_strategy_parameter_fixed_labels(app, STRATEGY_EMA5_EMA8_ID)
 
         self.assertEqual(app._bar_label.text, "K线周期（本策略固定）")
-        self.assertEqual(app._ema_label.text, "EMA小周期（本策略固定）")
-        self.assertEqual(app._trend_ema_label.text, "EMA中周期（本策略固定）")
-        self.assertEqual(app._big_ema_label.text, "EMA大周期（本策略固定）")
+        self.assertEqual(app._ema_label.text, "快线均线（本策略固定）")
+        self.assertEqual(app._trend_ema_label.text, "趋势均线（本策略固定）")
+        self.assertEqual(app._big_ema_label.text, "大周期均线（本策略固定）")
         self.assertEqual(app._signal_label.text, "信号方向")
 
     def test_apply_strategy_parameter_fixed_labels_marks_dynamic_direction_only(self) -> None:
@@ -5511,7 +5690,7 @@ class StrategyParameterFixedLabelTest(TestCase):
 
         self.assertEqual(app._signal_label.text, "信号方向（本策略固定）")
         self.assertEqual(app._bar_label.text, "K线周期")
-        self.assertEqual(app._ema_label.text, "EMA小周期")
+        self.assertEqual(app._ema_label.text, "快线均线")
 
 
 class PositionTakeoverEntryTsTest(TestCase):

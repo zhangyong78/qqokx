@@ -383,7 +383,7 @@ class UiStrategySessionsMixin:
                     credentials = self._credentials_for_profile_or_none(resolved_record.api_name)
                     if credentials is None:
                         raise ValueError(f"未找到 API：{resolved_record.api_name or '-'}")
-                    notifier = self._build_notifier(resolved_record.config)
+                    notifier = self._build_notifier(resolved_record.config, resolved_record.api_name)
                     session_id = self._start_strategy_session(
                         definition=definition,
                         credentials=credentials,
@@ -1108,7 +1108,7 @@ class UiStrategySessionsMixin:
         engine = StrategyEngine(
             self.client,
             chart_line_logger,
-            notifier=self._build_notifier(config),
+            notifier=self._build_notifier(config, (sess.api_name if sess else "") or None),
             strategy_name="划线交易",
             session_id=session_id,
             direction_label="只做多" if direction == "long" else "只做空",
@@ -1191,7 +1191,7 @@ class UiStrategySessionsMixin:
         engine = StrategyEngine(
             self.client,
             lambda message: self.root.after(0, lambda m=message: _desk_local_exit_log(m)),
-            notifier=self._build_notifier(config),
+            notifier=self._build_notifier(config, api_profile),
             strategy_name=f"{session_log_tag} 划线交易台",
             session_id=session_log_tag,
             direction_label="只做多" if direction == "long" else "只做空",
@@ -2415,7 +2415,7 @@ class UiStrategySessionsMixin:
             order_size=draft.unit_quota,
             trader_virtual_stop_loss=True,
         )
-        notifier = self._build_notifier(config)
+        notifier = self._build_notifier(config, target_api_name)
         run.armed_session_id = "__starting__"
         try:
             session_id = self._start_strategy_session(
@@ -3080,7 +3080,7 @@ class UiStrategySessionsMixin:
             raise ValueError(f"{definition.name} 当前不支持只发信号邮件模式。")
         if ask_confirm and not self._confirm_start(definition, config):
             raise ValueError("已取消启动。")
-        notifier = self._build_notifier(config)
+        notifier = self._build_notifier(config, target_api_name)
         self._save_credentials_now(silent=True)
         self._save_notification_settings_now(silent=True)
         return self._start_strategy_session(
@@ -3132,7 +3132,9 @@ class UiStrategySessionsMixin:
             symbol=session_symbol,
             api_name=api_name,
         ).resolve()
-        session_notifier = self._build_session_notifier(config, session_id) if notifier is not None else None
+        session_notifier = (
+            self._build_session_notifier(config, session_id, api_name) if notifier is not None else None
+        )
         engine = self._create_session_engine(
             strategy_id=definition.strategy_id,
             strategy_name=definition.name,
@@ -3187,7 +3189,7 @@ class UiStrategySessionsMixin:
         try:
             definition = self._selected_strategy_definition()
             credentials, config = self._collect_inputs(definition)
-            notifier = self._build_notifier(config)
+            notifier = self._build_notifier(config, credentials.profile_name or self._current_credential_profile())
             if not self._confirm_start(definition, config):
                 return
 
@@ -4260,8 +4262,16 @@ class UiStrategySessionsMixin:
     def disable_selected_session_email_notifications(self) -> None:
         self._set_selected_session_email_notifications(False)
 
-    def _build_session_notifier(self, config: StrategyConfig, session_id: str) -> EmailNotifier | None:
-        notification_config = self._collect_notification_config(validate_if_enabled=True)
+    def _build_session_notifier(
+        self,
+        config: StrategyConfig,
+        session_id: str,
+        api_profile_name: str | None = None,
+    ) -> EmailNotifier | None:
+        notification_config = self._collect_notification_config(
+            validate_if_enabled=True,
+            api_profile_name=api_profile_name,
+        )
         if not notification_config.enabled:
             return None
         return EmailNotifier(
@@ -4270,16 +4280,22 @@ class UiStrategySessionsMixin:
             delivery_policy=lambda kind, sid=session_id: self._session_email_runtime_enabled(sid, kind),
         )
 
-    def _collect_notification_config(self, *, validate_if_enabled: bool) -> EmailNotificationConfig:
+    def _collect_notification_config(
+        self,
+        *,
+        validate_if_enabled: bool,
+        api_profile_name: str | None = None,
+    ) -> EmailNotificationConfig:
         smtp_port = self._parse_optional_port(self.smtp_port.get())
         recipients = tuple(self._split_recipients(self.recipient_emails.get()))
+        sender_email = self._resolved_api_sender_email_override(api_profile_name) or self.sender_email.get().strip()
         config = EmailNotificationConfig(
             enabled=self.notify_enabled.get(),
             smtp_host=self.smtp_host.get().strip(),
             smtp_port=smtp_port,
             smtp_username=self.smtp_username.get().strip(),
             smtp_password=self.smtp_password.get(),
-            sender_email=self.sender_email.get().strip(),
+            sender_email=sender_email,
             recipient_emails=recipients,
             use_ssl=self.use_ssl.get(),
             notify_trade_fills=self.notify_trade_fills.get(),
@@ -4295,8 +4311,11 @@ class UiStrategySessionsMixin:
                 raise ValueError("已启用邮件通知，请填写发件邮箱或 SMTP 用户名")
         return config
 
-    def _build_notifier(self, config: StrategyConfig) -> EmailNotifier | None:
-        notification_config = self._collect_notification_config(validate_if_enabled=True)
+    def _build_notifier(self, config: StrategyConfig, api_profile_name: str | None = None) -> EmailNotifier | None:
+        notification_config = self._collect_notification_config(
+            validate_if_enabled=True,
+            api_profile_name=api_profile_name,
+        )
         if not notification_config.enabled:
             return None
         return EmailNotifier(
@@ -4304,15 +4323,18 @@ class UiStrategySessionsMixin:
             logger=self._make_system_logger(f"邮件 {config.strategy_id}"),
         )
 
-    def _build_signal_monitor_notifier(self) -> EmailNotifier | None:
-        notification_config = self._collect_notification_config(validate_if_enabled=True)
+    def _build_signal_monitor_notifier(self, api_profile_name: str | None = None) -> EmailNotifier | None:
+        notification_config = self._collect_notification_config(
+            validate_if_enabled=True,
+            api_profile_name=api_profile_name,
+        )
         if not notification_config.enabled:
             return None
         return EmailNotifier(notification_config, logger=self._make_system_logger("邮件 信号监控"))
 
     def send_test_email(self) -> None:
         try:
-            notifier = self._build_signal_monitor_notifier()
+            notifier = self._build_signal_monitor_notifier(self._current_credential_profile())
         except Exception as exc:
             messagebox.showerror("测试邮件失败", str(exc), parent=self._settings_window or self.root)
             return
@@ -5343,6 +5365,16 @@ class UiStrategySessionsMixin:
             return "开启" if normalized in {"1", "true", "yes", "on", "开启"} else "关闭"
         return "开启" if bool(value) else "关闭"
 
+    @staticmethod
+    def _max_entries_detail_label(value: int) -> str:
+        return "不限" if value <= 0 else f"{value}次"
+
+    @staticmethod
+    def _startup_chase_window_detail_label(seconds: int) -> str:
+        if seconds <= 0:
+            return "关闭（启动不追老信号）"
+        return f"{seconds}秒"
+
     def _build_strategy_detail_text(
         self,
         *,
@@ -5392,57 +5424,110 @@ class UiStrategySessionsMixin:
         ema_period = self._snapshot_int(snapshot, "ema_period")
         trend_ema_period = self._snapshot_int(snapshot, "trend_ema_period")
         entry_reference_ema_period = self._snapshot_int(snapshot, "entry_reference_ema_period")
-        lines = []
+        environment_label = _reverse_lookup_label(
+            ENV_OPTIONS,
+            self._snapshot_text(snapshot, "environment", ""),
+            self._snapshot_text(snapshot, "environment"),
+        )
+        trade_mode_label = _reverse_lookup_label(
+            TRADE_MODE_OPTIONS,
+            self._snapshot_text(snapshot, "trade_mode", ""),
+            self._snapshot_text(snapshot, "trade_mode"),
+        )
+        position_mode_label = _reverse_lookup_label(
+            POSITION_MODE_OPTIONS,
+            self._snapshot_text(snapshot, "position_mode", ""),
+            self._snapshot_text(snapshot, "position_mode"),
+        )
+        signal_mode_label = _reverse_lookup_label(
+            SIGNAL_LABEL_TO_VALUE,
+            self._snapshot_text(snapshot, "signal_mode", ""),
+            direction_label or self._snapshot_text(snapshot, "signal_mode"),
+        )
+        trigger_type_label = _reverse_lookup_label(
+            TRIGGER_TYPE_OPTIONS,
+            self._snapshot_text(snapshot, "tp_sl_trigger_type", ""),
+            self._snapshot_text(snapshot, "tp_sl_trigger_type"),
+        )
+        entry_side_mode_label = _reverse_lookup_label(
+            ENTRY_SIDE_MODE_OPTIONS,
+            self._snapshot_text(snapshot, "entry_side_mode", ""),
+            self._snapshot_text(snapshot, "entry_side_mode"),
+        )
+        take_profit_mode_label = _reverse_lookup_label(
+            TAKE_PROFIT_MODE_OPTIONS,
+            self._snapshot_text(snapshot, "take_profit_mode", "dynamic"),
+            self._snapshot_text(snapshot, "take_profit_mode", "dynamic"),
+        )
+        tp_sl_mode_label = _launcher_tp_sl_mode_label(self._snapshot_text(snapshot, "tp_sl_mode"))
+        max_entries_per_trend = self._snapshot_int(snapshot, "max_entries_per_trend")
+        startup_window_seconds = self._snapshot_int(snapshot, "startup_chase_window_seconds") or 0
+
+        lines: list[str] = []
+
+        def add_section(title: str, rows: list[str]) -> None:
+            visible_rows = [row for row in rows if row]
+            if not visible_rows:
+                return
+            if lines:
+                lines.append("")
+            lines.append(f"【{title}】")
+            lines.extend(visible_rows)
+
+        overview_rows = []
         if record_id:
-            lines.append(f"记录ID：{record_id}")
-        lines.extend(
+            overview_rows.append(f"记录ID：{record_id}")
+        overview_rows.extend(
             [
                 f"会话：{session_id or '-'}",
+                f"策略：{strategy_name or '-'}",
                 f"API配置：{api_name or '-'}",
                 f"状态：{status or '-'}",
+                f"最近运行状态：{runtime_status}" if runtime_status and status == "运行中" else "",
+                f"运行模式：{run_mode_label or '-'}",
+                f"交易环境：{environment_label or '-'}",
+                f"邮件通知：{email_status_label or '-'}（全局{'开启' if global_email_enabled else '关闭'}）"
+                if record_id is None
+                else "",
+                f"启动时间：{_format_history_datetime(started_at)}",
+                f"停止时间：{_format_history_datetime(stopped_at)}" if stopped_at is not None else "",
+                f"最近更新：{_format_history_datetime(updated_at)}" if updated_at is not None else "",
                 f"独立日志：{_coerce_log_file_path(log_file_path) or '-'}",
+                f"最近日志：{last_message}" if last_message else "",
+                f"结束原因：{ended_reason}" if ended_reason else "",
+                duplicate_warning,
             ]
         )
-        if runtime_status and status == "运行中":
-            lines.append(f"最近运行状态：{runtime_status}")
-        if duplicate_warning:
-            lines.append(duplicate_warning)
-        if last_message:
-            lines.append(f"最近日志：{last_message}")
-        if ended_reason:
-            lines.append(f"结束原因：{ended_reason}")
-        lines.extend(
-            [
-                f"交易次数：{trade_count}",
-                f"胜率：{_format_ratio(Decimal(win_count) / Decimal(trade_count), places=2) if trade_count else '-'}",
-            ]
-        )
+        add_section("运行概览", overview_rows)
+
+        pnl_rows = [
+            f"交易次数：{trade_count}",
+            f"胜率：{_format_ratio(Decimal(win_count) / Decimal(trade_count), places=2) if trade_count else '-'}",
+        ]
         if record_id is None:
             live_pnl_text = _format_optional_usdt_precise(live_pnl, places=2)
             if live_pnl_refreshed_at is not None:
                 live_pnl_text += f"（参考持仓 {live_pnl_refreshed_at.strftime('%H:%M:%S')}）"
-            lines.append(f"实时浮盈亏：{live_pnl_text}")
-        lines.extend(
+            pnl_rows.append(f"实时浮盈亏：{live_pnl_text}")
+        pnl_rows.extend(
             [
                 f"毛盈亏：{_format_optional_usdt_precise(gross_pnl_total, places=2)}",
                 f"手续费：{_format_optional_usdt_precise(fee_total, places=2)}",
                 f"资金费：{_format_optional_usdt_precise(funding_total, places=2)}",
                 f"净盈亏：{_format_optional_usdt_precise(net_pnl_total, places=2)}",
+                f"最近结论：{last_close_reason}" if last_close_reason else "",
             ]
         )
-        if last_close_reason:
-            lines.append(f"最近结论：{last_close_reason}")
-        lines.extend(
-            [
-                f"策略：{strategy_name}",
-                f"运行模式：{run_mode_label or '-'}",
-                f"交易标的：{display_symbol or '-'}",
-                f"方向：{direction_label or '-'}",
-                f"K线周期：{self._snapshot_text(snapshot, 'bar')}",
-                f"快线均线：{(self._snapshot_text(snapshot, 'ema_type', 'ema') or 'ema').upper()}{ema_period or '-'}",
-                f"趋势均线：{(self._snapshot_text(snapshot, 'trend_ema_type', 'ema') or 'ema').upper()}{trend_ema_period or '-'}",
-            ]
-        )
+        add_section("收益概览", pnl_rows)
+
+        parameter_rows = [
+            f"交易标的：{display_symbol or '-'}",
+            f"方向：{signal_mode_label or direction_label or '-'}",
+            f"交易模式 / 持仓模式：{trade_mode_label or '-'} / {position_mode_label or '-'}",
+            f"K线周期：{self._snapshot_text(snapshot, 'bar')}",
+            f"快线均线：{(self._snapshot_text(snapshot, 'ema_type', 'ema') or 'ema').upper()}{ema_period or '-'}",
+            f"趋势均线：{(self._snapshot_text(snapshot, 'trend_ema_type', 'ema') or 'ema').upper()}{trend_ema_period or '-'}",
+        ]
         if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
             entry_reference_type = (
                 self._snapshot_text(
@@ -5458,50 +5543,72 @@ class UiStrategySessionsMixin:
             else:
                 fast_type = (self._snapshot_text(snapshot, "ema_type", "ema") or "ema").upper()
                 entry_reference_label = f"跟随快线({fast_type}{ema_period or '-'})"
-            lines.append(f"{self._entry_reference_ema_caption(strategy_id)}：{entry_reference_label}")
-        if is_dynamic_strategy_id(strategy_id) or is_ema_atr_breakout_strategy(strategy_id):
-            startup_window_seconds = self._snapshot_int(snapshot, "startup_chase_window_seconds") or 0
-            lines.append(
-                "启动追单窗口："
-                + ("关闭（启动不追老信号）" if startup_window_seconds <= 0 else f"{startup_window_seconds}秒")
+            parameter_rows.append(f"{self._entry_reference_ema_caption(strategy_id)}：{entry_reference_label}")
+        if self._strategy_uses_big_ema(strategy_id):
+            parameter_rows.append(f"EMA大周期：{self._snapshot_int(snapshot, 'big_ema_period') or '-'}")
+        if strategy_uses_parameter(strategy_id, "mtf_filter_bar"):
+            parameter_rows.append(
+                "高周期过滤："
+                f"{self._snapshot_text(snapshot, 'mtf_filter_bar')} "
+                f"EMA{self._snapshot_text(snapshot, 'mtf_filter_fast_ema_period')} / "
+                f"EMA{self._snapshot_text(snapshot, 'mtf_filter_slow_ema_period')}"
             )
-            if self._snapshot_text(snapshot, "take_profit_mode", "dynamic") == "dynamic":
-                lines.append(f"2R保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}")
-                lines.append(f"手续费偏移开关：{self._bool_label(snapshot.get('dynamic_fee_offset_enabled', True))}")
-                lines.append(
+        if strategy_uses_parameter(strategy_id, "mtf_reversal_mode"):
+            parameter_rows.append(
+                "高周期反向处理："
+                + _reverse_lookup_label(
+                    MTF_REVERSAL_MODE_OPTIONS,
+                    self._snapshot_text(snapshot, "mtf_reversal_mode", ""),
+                    self._snapshot_text(snapshot, "mtf_reversal_mode"),
+                )
+            )
+        if strategy_uses_parameter(strategy_id, "take_profit_mode"):
+            parameter_rows.append(f"止盈方式：{take_profit_mode_label}")
+        if strategy_uses_parameter(strategy_id, "max_entries_per_trend"):
+            parameter_rows.append(
+                f"每波最多开仓次数：{self._max_entries_detail_label(max_entries_per_trend)}"
+            )
+        if strategy_uses_parameter(strategy_id, "startup_chase_window_seconds"):
+            parameter_rows.append(
+                f"启动追单窗口：{self._startup_chase_window_detail_label(startup_window_seconds)}"
+            )
+        if strategy_uses_parameter(strategy_id, "take_profit_mode") and self._snapshot_text(
+            snapshot,
+            "take_profit_mode",
+            "dynamic",
+        ) == "dynamic":
+            parameter_rows.extend(
+                [
+                    f"2R保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}",
+                    f"手续费偏移开关：{self._bool_label(snapshot.get('dynamic_fee_offset_enabled', True))}",
                     "时间保本："
                     f"{self._bool_label(snapshot.get('time_stop_break_even_enabled', False))} / "
-                    f"{self._snapshot_text(snapshot, 'time_stop_break_even_bars', '10')}根"
-                )
-        if self._strategy_uses_big_ema(strategy_id):
-            lines.append(f"EMA大周期：{self._snapshot_int(snapshot, 'big_ema_period') or '-'}")
-        lines.extend(
+                    f"{self._snapshot_text(snapshot, 'time_stop_break_even_bars', '10')}根",
+                ]
+            )
+        parameter_rows.extend(
             [
                 f"ATR 周期：{self._snapshot_text(snapshot, 'atr_period')}",
                 f"止损 ATR 倍数：{self._snapshot_text(snapshot, 'atr_stop_multiplier')}",
                 f"止盈 ATR 倍数：{self._snapshot_text(snapshot, 'atr_take_multiplier')}",
                 f"风险金：{self._snapshot_text(snapshot, 'risk_amount')}",
                 f"固定数量：{self._snapshot_text(snapshot, 'order_size')}",
-                f"下单方向模式：{self._snapshot_text(snapshot, 'entry_side_mode')}",
-                f"止盈止损模式：{self._snapshot_text(snapshot, 'tp_sl_mode')}",
+                f"下单方向模式：{entry_side_mode_label or '-'}",
+                f"止盈止损模式：{tp_sl_mode_label or '-'}",
+                f"触发价格类型：{trigger_type_label or '-'}",
                 f"自定义触发标的：{self._snapshot_text(snapshot, 'local_tp_sl_inst_id')}",
                 f"轮询秒数：{self._snapshot_text(snapshot, 'poll_seconds')}",
-                f"启动时间：{_format_history_datetime(started_at)}",
             ]
         )
-        if stopped_at is not None:
-            lines.append(f"停止时间：{_format_history_datetime(stopped_at)}")
-        if updated_at is not None:
-            lines.append(f"最近更新：{_format_history_datetime(updated_at)}")
-        lines.extend(
+        add_section("当前参数", parameter_rows)
+
+        add_section(
+            "策略说明",
             [
-                "",
                 f"策略简介：{summary}",
-                "",
                 f"规则说明：{rule_description}",
-                "",
                 f"参数提示：{parameter_hint}",
-            ]
+            ],
         )
         return "\n".join(lines)
 
@@ -5982,8 +6089,12 @@ class UiStrategySessionsMixin:
                 definition = get_strategy_definition(record.strategy_id)
             except Exception:
                 continue
-            notifier = self._build_notifier(config)
-            session_notifier = self._build_session_notifier(config, record.session_id) if notifier is not None else None
+            notifier = self._build_notifier(config, record.api_name)
+            session_notifier = (
+                self._build_session_notifier(config, record.session_id, record.api_name)
+                if notifier is not None
+                else None
+            )
             session_symbol = record.symbol or self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
             engine = self._create_session_engine(
                 strategy_id=record.strategy_id,

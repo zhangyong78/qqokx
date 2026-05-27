@@ -60,6 +60,13 @@ ATR_BATCH_TAKE_RATIOS: tuple[Decimal, ...] = (
 BATCH_MAX_ENTRIES_OPTIONS: tuple[int, ...] = (0, 1, 2, 3)
 MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT = Decimal("0.50")
 
+EXIT_REASON_LABELS = {
+    "take_profit": "止盈",
+    "stop_loss": "止损",
+    "signal_profit_exit": "信号失效盈利平仓",
+    "break_even_stop": "保本",
+}
+
 
 @dataclass(frozen=True)
 class BacktestTrade:
@@ -280,6 +287,61 @@ class _ManualPosition:
     handoff_ts: int
     handoff_price_raw: Decimal
     handoff_reason: str
+
+
+def _is_locked_r_exit_reason(exit_reason: str) -> bool:
+    return exit_reason.startswith("locked_") and exit_reason.endswith("r_stop")
+
+
+def _locked_r_from_exit_reason(exit_reason: str) -> int | None:
+    if not _is_locked_r_exit_reason(exit_reason):
+        return None
+    raw = exit_reason.removeprefix("locked_").removesuffix("r_stop")
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def is_stop_exit_reason(exit_reason: str) -> bool:
+    return exit_reason in {"stop_loss", "break_even_stop"} or _is_locked_r_exit_reason(exit_reason)
+
+
+def format_trade_exit_reason(exit_reason: str) -> str:
+    locked_r = _locked_r_from_exit_reason(exit_reason)
+    if locked_r is not None:
+        return f"{locked_r}R"
+    return EXIT_REASON_LABELS.get(exit_reason, exit_reason)
+
+
+def summarize_trade_exit_reasons(trades: list[BacktestTrade]) -> list[tuple[str, int]]:
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for trade in trades:
+        label = format_trade_exit_reason(trade.exit_reason)
+        if label not in counts:
+            counts[label] = 0
+            order.append(label)
+        counts[label] += 1
+    preferred = ["保本"]
+    locked_labels = sorted(
+        (
+            label
+            for label in order
+            if label.endswith("R") and label[:-1].isdigit()
+        ),
+        key=lambda item: int(item[:-1]),
+    )
+    preferred.extend(locked_labels)
+    preferred.extend(["止损", "止盈", "信号失效盈利平仓"])
+    ranked: list[str] = []
+    for label in preferred:
+        if label in counts and label not in ranked:
+            ranked.append(label)
+    for label in order:
+        if label not in ranked:
+            ranked.append(label)
+    return [(label, counts[label]) for label in ranked]
 
 
 def run_backtest(
@@ -866,6 +928,7 @@ def format_backtest_report(result: BacktestResult) -> str:
     fee_to_capital_pct = (
         Decimal("0") if result.initial_capital <= 0 else (report.total_fees / result.initial_capital) * Decimal("100")
     )
+    exit_reason_summary = summarize_trade_exit_reasons(result.trades)
     lines = [
         f"回测K线数：{len(result.candles)}",
         f"开始时间：{start_time}",
@@ -909,6 +972,10 @@ def format_backtest_report(result: BacktestResult) -> str:
         f"止盈触发次数：{report.take_profit_hits}",
         f"止损触发次数：{report.stop_loss_hits}",
     ]
+    if exit_reason_summary:
+        lines.append(
+            "平仓原因统计：" + " | ".join(f"{label} {count}" for label, count in exit_reason_summary)
+        )
     fast_label = moving_average_display_label(result.ema_type, result.ema_period)
     trend_label = moving_average_display_label(result.trend_ema_type, result.trend_ema_period)
     reference_label = moving_average_display_label(
@@ -2629,6 +2696,21 @@ def _time_stop_break_even_price(position: _OpenPosition) -> Decimal:
     return snap_to_increment(raw, position.tick_size, rounding)
 
 
+def _dynamic_stop_exit_reason(position: _OpenPosition) -> str:
+    if not position.dynamic_take_profit_enabled:
+        return "stop_loss"
+    if position.stop_loss == position.initial_stop_loss:
+        return "stop_loss"
+    if position.time_stop_break_even_enabled and position.stop_loss == _time_stop_break_even_price(position):
+        return "break_even_stop"
+    for trigger_r in range(2, position.next_dynamic_trigger_r):
+        if position.stop_loss != _dynamic_stop_price(position, trigger_r):
+            continue
+        locked_r = 0 if (position.dynamic_two_r_break_even and trigger_r == 2) else max(trigger_r - 1, 0)
+        return "break_even_stop" if locked_r <= 0 else f"locked_{locked_r}r_stop"
+    return "stop_loss"
+
+
 def _holding_bars_for_position(position: _OpenPosition, candle_index: int) -> int:
     return max(candle_index - position.entry_index, 0)
 
@@ -2728,13 +2810,13 @@ def _process_dynamic_position_segment(
     if position.signal == "long":
         if end < start:
             if _segment_contains_price(start, end, position.stop_loss):
-                return position.stop_loss, "stop_loss"
+                return position.stop_loss, _dynamic_stop_exit_reason(position)
             return None
         _advance_dynamic_stop(position, end, holding_bars=holding_bars)
         return None
     if end > start:
         if _segment_contains_price(start, end, position.stop_loss):
-            return position.stop_loss, "stop_loss"
+            return position.stop_loss, _dynamic_stop_exit_reason(position)
         return None
     _advance_dynamic_stop(position, end, holding_bars=holding_bars)
     return None
@@ -3173,7 +3255,7 @@ def _build_report(
         max_drawdown=max_drawdown,
         max_drawdown_pct=max_drawdown_pct,
         take_profit_hits=sum(1 for trade in trades if trade.exit_reason == "take_profit"),
-        stop_loss_hits=sum(1 for trade in trades if trade.exit_reason == "stop_loss"),
+        stop_loss_hits=sum(1 for trade in trades if is_stop_exit_reason(trade.exit_reason)),
         ending_equity=ending_equity,
         total_return_pct=total_return_pct,
         maker_fees=maker_fees,

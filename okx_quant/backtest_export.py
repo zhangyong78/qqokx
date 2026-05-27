@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
-from okx_quant.backtest import BacktestResult, format_backtest_report
+from okx_quant.backtest import BacktestResult, format_backtest_report, format_trade_exit_reason
 from okx_quant.backtest_audit import (
     batch_backtest_artifact_paths,
     export_batch_backtest_manifest,
@@ -30,10 +30,6 @@ SIGNAL_VALUE_TO_LABEL = {
     "both": "双向",
     "long_only": "只做多",
     "short_only": "只做空",
-}
-EXIT_REASON_TO_LABEL = {
-    "take_profit": "止盈",
-    "stop_loss": "止损",
 }
 FEE_TYPE_TO_LABEL = {
     "maker": "Maker",
@@ -290,7 +286,7 @@ def _build_trade_lines(result: BacktestResult) -> str:
     ]
     for trade in result.trades:
         direction = "做多" if trade.signal == "long" else "做空"
-        reason = EXIT_REASON_TO_LABEL.get(trade.exit_reason, trade.exit_reason)
+        reason = format_trade_exit_reason(trade.exit_reason)
         fee_note = (
             f"{format_decimal_fixed(trade.total_fee, 4)}"
             f" ({FEE_TYPE_TO_LABEL.get(trade.entry_fee_type, trade.entry_fee_type)}/"

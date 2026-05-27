@@ -270,6 +270,58 @@ class EmailNotifier:
         )
         self.notify_async(subject, body)
 
+    def send_trade_close(
+        self,
+        *,
+        strategy_name: str,
+        config: StrategyConfig,
+        symbol: str,
+        side: str,
+        size: str,
+        entry_price: str = "",
+        exit_price: str = "",
+        trigger_reason: str,
+        detail: str,
+        trade_pnl: str = "",
+        api_name: str = "",
+        session_id: str = "",
+        trader_id: str = "",
+        direction_label: str = "",
+        run_mode_label: str = "",
+        price_label: str = "平仓价格",
+    ) -> None:
+        if not self._kind_enabled("trade_fill"):
+            return
+        subject = self._subject_with_context(
+            f"[QQOKX] 平仓通知 | {trigger_reason} | {symbol}",
+            api_name=api_name,
+            session_id=session_id,
+            trader_id=trader_id,
+        )
+        lines = [
+            *self._build_base_lines(
+                strategy_name=strategy_name,
+                config=config,
+                api_name=api_name,
+                session_id=session_id,
+                trader_id=trader_id,
+                direction_label=direction_label,
+                run_mode_label=run_mode_label,
+            ),
+            f"平仓标的：{symbol}",
+            f"平仓方向：{self._trade_side_label(side)}",
+            f"平仓数量：{size}",
+            f"触发原因：{trigger_reason}",
+        ]
+        if entry_price.strip():
+            lines.append(f"开仓价格：{entry_price}")
+        if exit_price.strip():
+            lines.append(f"{price_label}：{exit_price}")
+        if trade_pnl.strip():
+            lines.append(f"本笔盈亏：{trade_pnl}")
+        lines.append(f"说明：{detail}")
+        self.notify_async(subject, "\n".join(lines))
+
     def send_error(
         self,
         *,

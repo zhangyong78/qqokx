@@ -2995,6 +2995,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.smtp_username = StringVar()
         self.smtp_password = StringVar()
         self.sender_email = StringVar()
+        self.api_sender_email_override = StringVar()
         self.recipient_emails = StringVar()
         self.use_ssl = BooleanVar(value=True)
         self.notify_trade_fills = BooleanVar(value=True)
@@ -3143,8 +3144,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._session_live_pnl_cache: dict[str, tuple[Decimal | None, datetime | None]] = {}
 
         self._settings_watch_enabled = False
+        self._api_sender_override_watch_enabled = False
         self._settings_save_job: str | None = None
         self._last_saved_notification_state: tuple[object, ...] | None = None
+        self._api_sender_email_overrides: dict[str, str] = {}
         self._position_history_view_prefs_save_job: str | None = None
         self._last_saved_position_history_view_prefs: tuple[str, str] | None = None
 
@@ -5406,6 +5409,15 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         ttk.Entry(mail_frame, textvariable=self.recipient_emails).grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
         row += 1
+        ttk.Label(mail_frame, text="当前 API 专属发件邮箱").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(mail_frame, textvariable=self.api_sender_email_override).grid(
+            row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
+        )
+        ttk.Label(mail_frame, text="留空则使用全局发件邮箱", justify="left").grid(
+            row=row, column=2, columnspan=2, sticky="w", pady=(12, 0)
+        )
+
+        row += 1
         ttk.Checkbutton(mail_frame, text="异常邮件", variable=self.notify_errors).grid(
             row=row, column=0, sticky="w", pady=(12, 0)
         )
@@ -6673,6 +6685,7 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
     def _close_settings_window(self) -> None:
         self._save_credentials_now(silent=True)
         self._save_notification_settings_now(silent=True)
+        self._save_notification_settings_now(silent=True)
         if self._settings_window is not None and self._settings_window.winfo_exists():
             self._settings_window.destroy()
         self._settings_window = None
@@ -6773,6 +6786,7 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         self._loaded_credential_profile_name = target
         self.api_profile_name.set(target)
         self._set_credentials_fields(snapshot)
+        self._sync_current_api_sender_email_override(target)
         self._last_saved_credentials = (
             target,
             snapshot["api_key"],
@@ -6786,6 +6800,27 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         if log_change:
             self._enqueue_log(f"已切换 API 配置：{target}")
         UiPositionsMixin._refresh_account_views_after_credential_profile_switch(self)
+
+    def _normalized_api_sender_email_overrides(self) -> dict[str, str]:
+        return {
+            str(key).strip(): str(value).strip()
+            for key, value in self._api_sender_email_overrides.items()
+            if str(key).strip() and str(value).strip()
+        }
+
+    def _resolved_api_sender_email_override(self, profile_name: str | None = None) -> str:
+        target = (profile_name or self._current_credential_profile()).strip()
+        if not target:
+            return ""
+        return self._normalized_api_sender_email_overrides().get(target, "")
+
+    def _sync_current_api_sender_email_override(self, profile_name: str | None = None) -> None:
+        target = (profile_name or self._current_credential_profile()).strip()
+        value = self._resolved_api_sender_email_override(target)
+        was_enabled = self._api_sender_override_watch_enabled
+        self._api_sender_override_watch_enabled = False
+        self.api_sender_email_override.set(value)
+        self._api_sender_override_watch_enabled = was_enabled
 
     def _load_saved_credentials(self) -> None:
         try:
@@ -6820,11 +6855,17 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         self.smtp_username.set(str(snapshot["smtp_username"]))
         self.smtp_password.set(str(snapshot["smtp_password"]))
         self.sender_email.set(str(snapshot["sender_email"]))
+        self._api_sender_email_overrides = {
+            str(key).strip(): str(value).strip()
+            for key, value in dict(snapshot.get("api_sender_email_overrides", {})).items()
+            if str(key).strip() and str(value).strip()
+        }
         self.recipient_emails.set(str(snapshot["recipient_emails"]))
         self.use_ssl.set(bool(snapshot["use_ssl"]))
         self.notify_trade_fills.set(bool(snapshot["notify_trade_fills"]))
         self.notify_signals.set(bool(snapshot["notify_signals"]))
         self.notify_errors.set(bool(snapshot["notify_errors"]))
+        self._sync_current_api_sender_email_override(self._current_credential_profile())
         self._refresh_global_email_toggle_text()
         self._default_environment_label = self._normalized_environment_label(str(snapshot["environment_label"]))
         self.environment_label.set(self._default_environment_label)
@@ -6928,9 +6969,11 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
             self.notify_errors,
         ):
             variable.trace_add("write", self._on_notification_settings_changed)
+        self.api_sender_email_override.trace_add("write", self._on_api_sender_email_override_changed)
         self.position_history_range_start.trace_add("write", self._schedule_save_position_history_view_prefs)
         self.position_history_range_end.trace_add("write", self._schedule_save_position_history_view_prefs)
         self._settings_watch_enabled = True
+        self._api_sender_override_watch_enabled = True
 
     def _on_credentials_changed(self, *_: str) -> None:
         if not self._credential_watch_enabled:
@@ -6949,6 +6992,17 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         if self._settings_save_job is not None:
             self.root.after_cancel(self._settings_save_job)
         self._settings_save_job = self.root.after(600, self._save_notification_settings_now)
+
+    def _on_api_sender_email_override_changed(self, *_: str) -> None:
+        if not self._api_sender_override_watch_enabled:
+            return
+        profile_name = self._current_credential_profile()
+        override = self.api_sender_email_override.get().strip()
+        if override:
+            self._api_sender_email_overrides[profile_name] = override
+        else:
+            self._api_sender_email_overrides.pop(profile_name, None)
+        self._on_notification_settings_changed()
 
     def _on_settings_changed(self, *_: str) -> None:
         self._update_settings_summary()
@@ -7067,15 +7121,20 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
             return
 
         self._save_credentials_now(silent=True)
+        self._save_notification_settings_now(silent=True)
         profiles = dict(self._credential_profiles)
         profile_payload = profiles.pop(current_name, _blank_credential_profile_snapshot())
         profiles[target_name] = profile_payload
         self._credential_profiles = profiles
+        override = self._api_sender_email_overrides.pop(current_name, "").strip()
+        if override:
+            self._api_sender_email_overrides[target_name] = override
         save_credentials_profiles_snapshot(
             selected_profile=target_name,
             profiles=self._credential_profiles,
         )
         self._apply_credentials_profile(target_name, log_change=True)
+        self._save_notification_settings_now(silent=True)
         self._enqueue_log(f"已将 API 配置 {current_name} 重命名为：{target_name}")
 
     def _delete_current_api_profile(self) -> None:
@@ -7103,11 +7162,13 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
             next_profile = sorted(profiles.keys())[0]
 
         self._credential_profiles = profiles
+        self._api_sender_email_overrides.pop(profile_name, None)
         save_credentials_profiles_snapshot(
             selected_profile=next_profile,
             profiles=self._credential_profiles,
         )
         self._apply_credentials_profile(next_profile, log_change=True)
+        self._save_notification_settings_now(silent=True)
         self._enqueue_log(f"已删除 API 配置：{profile_name}")
 
     def _save_notification_settings_now(self, silent: bool = False) -> None:
@@ -7136,6 +7197,7 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
                 smtp_password=self.smtp_password.get(),
                 sender_email=self.sender_email.get(),
                 recipient_emails=self.recipient_emails.get(),
+                api_sender_email_overrides=self._api_sender_email_overrides,
                 use_ssl=self.use_ssl.get(),
                 notify_trade_fills=self.notify_trade_fills.get(),
                 notify_signals=self.notify_signals.get(),
@@ -7848,6 +7910,7 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
             self.smtp_username.get().strip(),
             self.smtp_password.get(),
             self.sender_email.get().strip(),
+            tuple(sorted(self._normalized_api_sender_email_overrides().items())),
             self.recipient_emails.get().strip(),
             self.use_ssl.get(),
             self.notify_trade_fills.get(),

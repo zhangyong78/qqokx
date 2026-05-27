@@ -672,6 +672,7 @@ def load_notification_snapshot(path: Path | None = None) -> dict[str, object]:
             "smtp_password": "",
             "sender_email": "",
             "recipient_emails": "",
+            "api_sender_email_overrides": {},
             "use_ssl": True,
             "notify_trade_fills": True,
             "notify_signals": True,
@@ -679,6 +680,9 @@ def load_notification_snapshot(path: Path | None = None) -> dict[str, object]:
         }
 
     payload = json.loads(target.read_text(encoding="utf-8"))
+    raw_overrides = payload.get("api_sender_email_overrides", {})
+    if not isinstance(raw_overrides, dict):
+        raw_overrides = {}
     return {
         "environment_label": str(payload.get("environment_label", "模拟盘 demo")),
         "trade_mode_label": str(payload.get("trade_mode_label", "全仓 cross")),
@@ -691,6 +695,11 @@ def load_notification_snapshot(path: Path | None = None) -> dict[str, object]:
         "smtp_password": str(payload.get("smtp_password", "")),
         "sender_email": str(payload.get("sender_email", "")),
         "recipient_emails": str(payload.get("recipient_emails", "")),
+        "api_sender_email_overrides": {
+            str(key).strip(): str(value).strip()
+            for key, value in raw_overrides.items()
+            if str(key).strip() and str(value).strip()
+        },
         "use_ssl": bool(payload.get("use_ssl", True)),
         "notify_trade_fills": bool(payload.get("notify_trade_fills", True)),
         "notify_signals": bool(payload.get("notify_signals", True)),
@@ -711,6 +720,7 @@ def save_notification_snapshot(
     smtp_password: str,
     sender_email: str,
     recipient_emails: str,
+    api_sender_email_overrides: dict[str, str] | None = None,
     use_ssl: bool,
     notify_trade_fills: bool,
     notify_signals: bool,
@@ -731,6 +741,11 @@ def save_notification_snapshot(
         "smtp_password": smtp_password.strip(),
         "sender_email": sender_email.strip(),
         "recipient_emails": recipient_emails.strip(),
+        "api_sender_email_overrides": {
+            str(key).strip(): str(value).strip()
+            for key, value in (api_sender_email_overrides or {}).items()
+            if str(key).strip() and str(value).strip()
+        },
         "use_ssl": use_ssl,
         "notify_trade_fills": notify_trade_fills,
         "notify_signals": notify_signals,

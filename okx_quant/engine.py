@@ -2444,7 +2444,24 @@ class StrategyEngine:
                     take_profit=current_take_profit,
                 )
             if stop_hit or take_hit:
-                reason = "止损" if stop_hit else "止盈"
+                reason = "止盈"
+                if stop_hit:
+                    reason = (
+                        _classify_live_dynamic_close_reason(
+                            direction=protection.direction,
+                            entry_price=position.entry_price,
+                            initial_stop_loss=protection.stop_loss,
+                            current_stop_loss=current_stop_loss,
+                            risk_per_unit=risk_per_unit,
+                            next_trigger_r=next_trigger_r,
+                            tick_size=trade_instrument.tick_size,
+                            two_r_break_even=config.dynamic_two_r_break_even,
+                            dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                            time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+                        )
+                        if dynamic_take_profit_enabled
+                        else "止损"
+                    )
                 self._logger(
                     f"本地{reason}触发 | 触发标的={protection.trigger_inst_id} | "
                     f"当前价={format_decimal(current_price)} | "
@@ -2501,16 +2518,17 @@ class StrategyEngine:
                 f"成交均价={_format_notify_price_by_tick_size(filled.entry_price, trade_instrument.tick_size)} | "
                 f"成交数量={_format_size_with_contract_equivalent(trade_instrument, filled.size)} | 剩余={_format_size_with_contract_equivalent(trade_instrument, max(remaining, Decimal('0')))}"
             )
-            self._notify_trade_fill(
+            self._notify_trade_close(
                 config,
-                title=f"{reason}平仓成交",
                 symbol=trade_instrument.inst_id,
                 side=position.close_side,
                 size=filled.size,
                 size_text=_format_notify_size_with_unit(trade_instrument, filled.size),
-                price=filled.entry_price,
+                entry_price=position.entry_price,
+                exit_price=filled.entry_price,
                 tick_size=trade_instrument.tick_size,
-                reason=f"本地{reason}触发后平仓成交",
+                trigger_reason=reason,
+                detail=f"本地{reason}触发后平仓成交",
                 trade_pnl=StrategyEngine._trade_fill_pnl_text_for_close(
                     position,
                     fill_size=filled.size,
@@ -2734,6 +2752,16 @@ class StrategyEngine:
         live_position = self._find_managed_position(credentials, config, trade_instrument, position)
         if live_position is None:
             self._logger("未检测到策略持仓，OKX 动态止损监控结束。")
+            self._notify_exchange_dynamic_stop_close(
+                config,
+                trade_instrument=trade_instrument,
+                position=position,
+                initial_stop_loss=initial_stop_loss,
+                current_stop_loss=current_stop_loss,
+                risk_per_unit=risk_per_unit,
+                next_trigger_r=next_trigger_r,
+                detail="未检测到策略持仓，推断 OKX 动态止损已完成平仓。",
+            )
             return DynamicStopMonitorStepResult(
                 keep_monitoring=False,
                 current_stop_loss=current_stop_loss,
@@ -2783,6 +2811,16 @@ class StrategyEngine:
                 if term:
                     if term_msg:
                         self._logger(term_msg)
+                    self._notify_exchange_dynamic_stop_close(
+                        config,
+                        trade_instrument=trade_instrument,
+                        position=position,
+                        initial_stop_loss=initial_stop_loss,
+                        current_stop_loss=current_stop_loss,
+                        risk_per_unit=risk_per_unit,
+                        next_trigger_r=next_trigger_r,
+                        detail=term_msg or "OKX 动态止损委托已结束，推断持仓已平仓。",
+                    )
                     return DynamicStopMonitorStepResult(
                         keep_monitoring=False,
                         current_stop_loss=current_stop_loss,
@@ -2813,6 +2851,16 @@ class StrategyEngine:
             if should_end:
                 if why:
                     self._logger(why)
+                self._notify_exchange_dynamic_stop_close(
+                    config,
+                    trade_instrument=trade_instrument,
+                    position=position,
+                    initial_stop_loss=initial_stop_loss,
+                    current_stop_loss=current_stop_loss,
+                    risk_per_unit=risk_per_unit,
+                    next_trigger_r=next_trigger_r,
+                    detail=why or "OKX 动态止损委托已不在挂单列表，推断持仓已平仓。",
+                )
                 return DynamicStopMonitorStepResult(
                     keep_monitoring=False,
                     current_stop_loss=current_stop_loss,
@@ -2918,6 +2966,16 @@ class StrategyEngine:
             live_position = self._find_managed_position(credentials, config, trade_instrument, position)
             if live_position is None:
                 self._logger("检测到持仓已关闭，停止 OKX 动态止损监控。")
+                self._notify_exchange_dynamic_stop_close(
+                    config,
+                    trade_instrument=trade_instrument,
+                    position=position,
+                    initial_stop_loss=initial_stop_loss,
+                    current_stop_loss=current_stop_loss,
+                    risk_per_unit=risk_per_unit,
+                    next_trigger_r=next_trigger_r,
+                    detail="改单异常后检测到持仓已关闭，推断 OKX 动态止损已完成平仓。",
+                )
                 return DynamicStopMonitorStepResult(
                     keep_monitoring=False,
                     current_stop_loss=current_stop_loss,
@@ -3034,6 +3092,17 @@ class StrategyEngine:
                     self._logger("检测到 OKX 托管持仓已结束。")
                 else:
                     self._logger("未再检测到策略持仓，视为本轮 OKX 托管持仓已结束。")
+                self._notify_trade_close(
+                    config,
+                    symbol=trade_instrument.inst_id,
+                    side=position.close_side,
+                    size=position.size,
+                    size_text=_format_notify_size_with_unit(trade_instrument, position.size),
+                    entry_price=position.entry_price,
+                    tick_size=trade_instrument.tick_size,
+                    trigger_reason="OKX托管平仓（原因待确认）",
+                    detail="OKX 托管止盈止损持仓已结束；当前监控链路无法区分具体由止盈还是止损触发，请以 OKX 成交明细为准。",
+                )
                 return
 
             saw_live_position = True
@@ -4134,6 +4203,82 @@ class StrategyEngine:
             run_mode_label=self._run_mode_label,
         )
 
+    def _notify_trade_close(
+        self,
+        config: StrategyConfig,
+        *,
+        symbol: str,
+        side: str,
+        size: Decimal,
+        entry_price: Decimal,
+        trigger_reason: str,
+        detail: str,
+        exit_price: Decimal | None = None,
+        tick_size: Decimal | None = None,
+        trade_pnl: str = "",
+        price_label: str = "平仓价格",
+        size_text: str = "",
+    ) -> None:
+        if self._notifier is None:
+            return
+        self._notifier.send_trade_close(
+            strategy_name=self._strategy_name,
+            config=config,
+            symbol=symbol,
+            side=side,
+            size=size_text or format_decimal(size),
+            entry_price=_format_notify_price_by_tick_size(entry_price, tick_size),
+            exit_price=_format_notify_price_by_tick_size(exit_price, tick_size) if exit_price is not None else "",
+            trigger_reason=trigger_reason,
+            detail=detail,
+            trade_pnl=trade_pnl,
+            api_name=self._api_name,
+            session_id=self._session_id,
+            trader_id=self._trader_id,
+            direction_label=self._direction_label,
+            run_mode_label=self._run_mode_label,
+            price_label=price_label,
+        )
+
+    def _notify_exchange_dynamic_stop_close(
+        self,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        initial_stop_loss: Decimal,
+        current_stop_loss: Decimal,
+        risk_per_unit: Decimal,
+        next_trigger_r: int,
+        detail: str,
+    ) -> None:
+        direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
+        trigger_reason = _classify_live_dynamic_close_reason(
+            direction=direction,
+            entry_price=position.entry_price,
+            initial_stop_loss=initial_stop_loss,
+            current_stop_loss=current_stop_loss,
+            risk_per_unit=risk_per_unit,
+            next_trigger_r=next_trigger_r,
+            tick_size=trade_instrument.tick_size,
+            two_r_break_even=config.dynamic_two_r_break_even,
+            dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+            time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+        )
+        self._notify_trade_close(
+            config,
+            symbol=trade_instrument.inst_id,
+            side=position.close_side,
+            size=position.size,
+            size_text=_format_notify_size_with_unit(trade_instrument, position.size),
+            entry_price=position.entry_price,
+            exit_price=current_stop_loss,
+            tick_size=trade_instrument.tick_size,
+            trigger_reason=trigger_reason,
+            detail=detail,
+            price_label="触发止损价",
+        )
+
     @staticmethod
     def _trade_fill_pnl_text_for_close(position: FilledPosition, *, fill_size: Decimal, fill_price: Decimal) -> str:
         matched_size = min(abs(fill_size), abs(position.size))
@@ -4471,6 +4616,45 @@ def _is_profit_protecting_stop(
     if direction == "long":
         return stop_loss >= entry_price
     return stop_loss <= entry_price
+
+
+def _classify_live_dynamic_close_reason(
+    *,
+    direction: Literal["long", "short"],
+    entry_price: Decimal,
+    initial_stop_loss: Decimal,
+    current_stop_loss: Decimal,
+    risk_per_unit: Decimal,
+    next_trigger_r: int,
+    tick_size: Decimal,
+    two_r_break_even: bool,
+    dynamic_fee_offset_enabled: bool,
+    time_stop_break_even_enabled: bool,
+) -> str:
+    if current_stop_loss == initial_stop_loss:
+        return "止损"
+    if time_stop_break_even_enabled and current_stop_loss == _time_stop_break_even_price_live(
+        direction=direction,
+        entry_price=entry_price,
+        tick_size=tick_size,
+        dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+    ):
+        return "保本"
+    for trigger_r in range(2, next_trigger_r):
+        candidate = _dynamic_stop_price_live(
+            direction=direction,
+            entry_price=entry_price,
+            risk_per_unit=risk_per_unit,
+            trigger_r=trigger_r,
+            tick_size=tick_size,
+            two_r_break_even=two_r_break_even,
+            dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+        )
+        if candidate != current_stop_loss:
+            continue
+        locked_r = 0 if (two_r_break_even and trigger_r == 2) else max(trigger_r - 1, 0)
+        return "保本" if locked_r <= 0 else f"{locked_r}R"
+    return "止损"
 
 
 def _reset_startup_signal_gate(gate_state: StartupSignalGateState) -> None:

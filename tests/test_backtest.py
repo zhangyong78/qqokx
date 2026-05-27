@@ -22,6 +22,7 @@ from okx_quant.backtest import (
     _dynamic_stop_price,
     _dynamic_trigger_price,
     _load_backtest_candles,
+    _process_dynamic_position_segment,
     _position_initial_risk_value,
     _backtest_trade_start_index,
     _format_backtest_timestamp,
@@ -31,8 +32,10 @@ from okx_quant.backtest import (
     build_atr_batch_configs,
     build_parameter_batch_configs,
     format_backtest_report,
+    format_trade_exit_reason,
     run_backtest,
     run_backtest_batch,
+    summarize_trade_exit_reasons,
 )
 import okx_quant.backtest_export as backtest_export_module
 from okx_quant.backtest_audit import batch_backtest_artifact_paths, single_backtest_artifact_paths
@@ -3059,7 +3062,206 @@ class BacktestTest(TestCase):
     def test_format_trade_exit_reason_handles_signal_profit_exit(self) -> None:
         self.assertEqual(_format_trade_exit_reason("signal_profit_exit"), "信号失效盈利平仓")
         self.assertEqual(_format_trade_exit_reason("take_profit"), "止盈")
+        self.assertEqual(_format_trade_exit_reason("break_even_stop"), "保本")
+        self.assertEqual(_format_trade_exit_reason("locked_3r_stop"), "3R")
         self.assertEqual(_format_trade_exit_reason("custom_reason"), "custom_reason")
+
+    def test_dynamic_stop_exit_reason_uses_break_even_label(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=10,
+            entry_ts=1710976500000,
+            entry_price=Decimal("100"),
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("90"),
+            initial_stop_loss=Decimal("90"),
+            take_profit=Decimal("120"),
+            initial_take_profit=Decimal("120"),
+            size=Decimal("1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            dynamic_take_profit_enabled=True,
+            next_dynamic_trigger_r=2,
+            dynamic_two_r_break_even=True,
+        )
+
+        _advance_dynamic_stop(position, Decimal("120"))
+        exit_info = _process_dynamic_position_segment(position, Decimal("120"), Decimal("99"))
+
+        self.assertEqual(exit_info, (Decimal("100"), "break_even_stop"))
+
+    def test_dynamic_stop_exit_reason_uses_locked_r_label(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=10,
+            entry_ts=1710976500000,
+            entry_price=Decimal("100"),
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("90"),
+            initial_stop_loss=Decimal("90"),
+            take_profit=Decimal("120"),
+            initial_take_profit=Decimal("120"),
+            size=Decimal("1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            dynamic_take_profit_enabled=True,
+            next_dynamic_trigger_r=2,
+            dynamic_two_r_break_even=True,
+        )
+
+        _advance_dynamic_stop(position, Decimal("130"))
+        exit_info = _process_dynamic_position_segment(position, Decimal("130"), Decimal("119"))
+
+        self.assertEqual(exit_info, (Decimal("120"), "locked_2r_stop"))
+
+    def test_summarize_trade_exit_reasons_orders_break_even_then_locked_r_then_stop(self) -> None:
+        self.assertEqual(format_trade_exit_reason("locked_2r_stop"), "2R")
+        trades = [
+            BacktestTrade(
+                signal="long",
+                entry_index=0,
+                exit_index=1,
+                entry_ts=1,
+                exit_ts=2,
+                entry_price=Decimal("100"),
+                exit_price=Decimal("100"),
+                stop_loss=Decimal("90"),
+                take_profit=Decimal("120"),
+                size=Decimal("1"),
+                gross_pnl=Decimal("0"),
+                pnl=Decimal("0"),
+                risk_value=Decimal("10"),
+                r_multiple=Decimal("0"),
+                exit_reason="break_even_stop",
+            ),
+            BacktestTrade(
+                signal="long",
+                entry_index=2,
+                exit_index=3,
+                entry_ts=3,
+                exit_ts=4,
+                entry_price=Decimal("100"),
+                exit_price=Decimal("120"),
+                stop_loss=Decimal("90"),
+                take_profit=Decimal("120"),
+                size=Decimal("1"),
+                gross_pnl=Decimal("20"),
+                pnl=Decimal("20"),
+                risk_value=Decimal("10"),
+                r_multiple=Decimal("2"),
+                exit_reason="locked_2r_stop",
+            ),
+            BacktestTrade(
+                signal="long",
+                entry_index=4,
+                exit_index=5,
+                entry_ts=5,
+                exit_ts=6,
+                entry_price=Decimal("100"),
+                exit_price=Decimal("90"),
+                stop_loss=Decimal("90"),
+                take_profit=Decimal("120"),
+                size=Decimal("1"),
+                gross_pnl=Decimal("-10"),
+                pnl=Decimal("-10"),
+                risk_value=Decimal("10"),
+                r_multiple=Decimal("-1"),
+                exit_reason="stop_loss",
+            ),
+        ]
+
+        self.assertEqual(
+            summarize_trade_exit_reasons(trades),
+            [("保本", 1), ("2R", 1), ("止损", 1)],
+        )
+
+    def test_format_backtest_report_includes_exit_reason_summary(self) -> None:
+        result = BacktestResult(
+            candles=[
+                Candle(1, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+                Candle(2, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            ],
+            trades=[
+                BacktestTrade(
+                    signal="long",
+                    entry_index=0,
+                    exit_index=1,
+                    entry_ts=1,
+                    exit_ts=2,
+                    entry_price=Decimal("100"),
+                    exit_price=Decimal("100"),
+                    stop_loss=Decimal("90"),
+                    take_profit=Decimal("120"),
+                    size=Decimal("1"),
+                    gross_pnl=Decimal("0"),
+                    pnl=Decimal("0"),
+                    risk_value=Decimal("10"),
+                    r_multiple=Decimal("0"),
+                    exit_reason="break_even_stop",
+                ),
+                BacktestTrade(
+                    signal="long",
+                    entry_index=0,
+                    exit_index=1,
+                    entry_ts=1,
+                    exit_ts=2,
+                    entry_price=Decimal("100"),
+                    exit_price=Decimal("120"),
+                    stop_loss=Decimal("90"),
+                    take_profit=Decimal("120"),
+                    size=Decimal("1"),
+                    gross_pnl=Decimal("20"),
+                    pnl=Decimal("20"),
+                    risk_value=Decimal("10"),
+                    r_multiple=Decimal("2"),
+                    exit_reason="locked_2r_stop",
+                ),
+                BacktestTrade(
+                    signal="long",
+                    entry_index=0,
+                    exit_index=1,
+                    entry_ts=1,
+                    exit_ts=2,
+                    entry_price=Decimal("100"),
+                    exit_price=Decimal("90"),
+                    stop_loss=Decimal("90"),
+                    take_profit=Decimal("120"),
+                    size=Decimal("1"),
+                    gross_pnl=Decimal("-10"),
+                    pnl=Decimal("-10"),
+                    risk_value=Decimal("10"),
+                    r_multiple=Decimal("-1"),
+                    exit_reason="stop_loss",
+                ),
+            ],
+            report=BacktestReport(
+                total_trades=3,
+                win_trades=1,
+                loss_trades=1,
+                breakeven_trades=1,
+                win_rate=Decimal("33.33"),
+                total_pnl=Decimal("10"),
+                average_pnl=Decimal("3.3333"),
+                gross_profit=Decimal("20"),
+                gross_loss=Decimal("10"),
+                profit_factor=Decimal("2"),
+                average_win=Decimal("20"),
+                average_loss=Decimal("10"),
+                profit_loss_ratio=Decimal("2"),
+                average_r_multiple=Decimal("0.3333"),
+                max_drawdown=Decimal("10"),
+                max_drawdown_pct=Decimal("0.10"),
+                take_profit_hits=0,
+                stop_loss_hits=2,
+                ending_equity=Decimal("10010"),
+                total_return_pct=Decimal("0.10"),
+            ),
+            instrument=self._build_instrument(),
+        )
+
+        report_text = format_backtest_report(result)
+
+        self.assertIn("平仓原因统计：保本 1 | 2R 1 | 止损 1", report_text)
 
     def test_chart_price_axis_values_builds_even_grid(self) -> None:
         values = _chart_price_axis_values(Decimal("100"), Decimal("200"))

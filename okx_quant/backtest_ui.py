@@ -22,6 +22,8 @@ from okx_quant.backtest import (
     MAX_BACKTEST_CANDLES,
     build_parameter_batch_configs,
     format_backtest_report,
+    format_trade_exit_reason,
+    is_stop_exit_reason,
     run_backtest,
     run_backtest_batch,
 )
@@ -562,11 +564,7 @@ def _build_backtest_compare_detail(snapshot: _BacktestSnapshot) -> str:
 
 
 def _format_trade_exit_reason(exit_reason: str) -> str:
-    return {
-        "take_profit": "止盈",
-        "stop_loss": "止损",
-        "signal_profit_exit": "信号失效盈利平仓",
-    }.get(exit_reason, exit_reason)
+    return format_trade_exit_reason(exit_reason)
 
 
 def _build_trade_tree_rows(result: BacktestResult) -> list[tuple[str, tuple[str | int, ...]]]:
@@ -2619,10 +2617,7 @@ class BacktestWindow:
         self.report_text.insert("1.0", format_backtest_report(result))
         self.trade_tree.delete(*self.trade_tree.get_children())
         for index, trade in enumerate(result.trades, start=1):
-            exit_reason = {
-                "take_profit": "止盈",
-                "stop_loss": "止损",
-            }.get(trade.exit_reason, trade.exit_reason)
+            exit_reason = _format_trade_exit_reason(trade.exit_reason)
             self.trade_tree.insert(
                 "",
                 END,
@@ -4825,7 +4820,7 @@ class BacktestWindow:
             stop_y = y_for(trade.stop_loss)
             take_y = y_for(trade.take_profit)
             trade_color = "#0969da" if trade.signal == "long" else "#8250df"
-            exit_color = "#1a7f37" if trade.exit_reason == "take_profit" else "#d1242f"
+            exit_color = "#1a7f37" if not is_stop_exit_reason(trade.exit_reason) else "#d1242f"
 
             canvas.create_line(entry_x, entry_y, exit_x, exit_y, fill=trade_color, width=2)
             canvas.create_line(entry_x, stop_y, exit_x, stop_y, fill="#d1242f", dash=(4, 2))
@@ -4836,7 +4831,7 @@ class BacktestWindow:
                 canvas.create_text(
                     exit_x + 8,
                     exit_y,
-                    text="TP" if trade.exit_reason == "take_profit" else "SL",
+                    text="TP" if trade.exit_reason == "take_profit" else ("BE" if trade.exit_reason == "break_even_stop" else "SL"),
                     anchor="w",
                     fill=exit_color,
                 )

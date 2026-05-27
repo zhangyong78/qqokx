@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock
 
-from okx_quant.engine import StrategyEngine
+from okx_quant.engine import StrategyEngine, _classify_live_dynamic_close_reason
 from okx_quant.models import EmailNotificationConfig, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_LONG_ID, STRATEGY_EMA5_EMA8_ID
@@ -179,6 +179,32 @@ class EmailNotifierTest(TestCase):
         )
 
         _, body = notifier.notify_async.call_args.args
+        self.assertIn("本笔盈亏：+50", body)
+
+    def test_send_trade_close_includes_trigger_reason_and_prices(self) -> None:
+        notifier = self._make_notifier()
+
+        notifier.send_trade_close(
+            strategy_name="EMA 动态委托",
+            config=_make_strategy_config(),
+            symbol="ETH-USDT-SWAP",
+            side="sell",
+            size="1",
+            entry_price="2500",
+            exit_price="2550",
+            trigger_reason="3R",
+            detail="动态止损保护价触发后平仓成交",
+            trade_pnl="+50",
+            api_name="moni",
+            session_id="S18",
+        )
+
+        subject, body = notifier.notify_async.call_args.args
+        self.assertIn("平仓通知", subject)
+        self.assertIn("3R", subject)
+        self.assertIn("触发原因：3R", body)
+        self.assertIn("开仓价格：2500", body)
+        self.assertIn("平仓价格：2550", body)
         self.assertIn("本笔盈亏：+50", body)
 
 
@@ -415,6 +441,47 @@ class StrategyEngineNotificationTest(TestCase):
         )
 
         self.assertEqual(notifier.send_trade_fill.call_args.kwargs["trade_pnl"], "-50")
+
+    def test_trade_close_notification_passes_trigger_reason_to_notifier(self) -> None:
+        notifier = MagicMock()
+        engine = StrategyEngine(
+            MagicMock(),
+            lambda message: None,
+            notifier=notifier,
+            strategy_name="EMA 动态委托",
+            session_id="S19",
+        )
+
+        engine._notify_trade_close(
+            _make_strategy_config(),
+            symbol="ETH-USDT-SWAP",
+            side="sell",
+            size=Decimal("1"),
+            entry_price=Decimal("2500"),
+            exit_price=Decimal("2550"),
+            trigger_reason="保本",
+            detail="本地保本触发后平仓成交",
+            trade_pnl="50",
+        )
+
+        self.assertEqual(notifier.send_trade_close.call_args.kwargs["trigger_reason"], "保本")
+        self.assertEqual(notifier.send_trade_close.call_args.kwargs["trade_pnl"], "50")
+
+    def test_classify_live_dynamic_close_reason_returns_locked_r(self) -> None:
+        reason = _classify_live_dynamic_close_reason(
+            direction="long",
+            entry_price=Decimal("100"),
+            initial_stop_loss=Decimal("90"),
+            current_stop_loss=Decimal("120"),
+            risk_per_unit=Decimal("10"),
+            next_trigger_r=4,
+            tick_size=Decimal("0.1"),
+            two_r_break_even=True,
+            dynamic_fee_offset_enabled=False,
+            time_stop_break_even_enabled=False,
+        )
+
+        self.assertEqual(reason, "2R")
 
     def test_trade_fill_pnl_text_for_close_uses_entry_direction(self) -> None:
         long_position = SimpleNamespace(

@@ -602,7 +602,10 @@ class UiProtectionMixin:
         )
 
     def _build_optional_protection_notifier(self) -> EmailNotifier | None:
-        notification_config = self._collect_notification_config(validate_if_enabled=False)
+        notification_config = self._collect_notification_config(
+            validate_if_enabled=False,
+            api_profile_name=self._current_credential_profile(),
+        )
         if not notification_config.enabled:
             return None
         return EmailNotifier(notification_config, logger=self._make_system_logger("邮件 持仓保护"))
