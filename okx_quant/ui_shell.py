@@ -109,6 +109,8 @@ from okx_quant.okx_client import (
     infer_option_family,
 )
 from okx_quant.persistence import (
+    build_profile_switch_password_snapshot,
+    credential_profile_has_switch_password,
     credentials_file_path,
     DEFAULT_CREDENTIAL_PROFILE_NAME,
     load_history_cache_records,
@@ -134,6 +136,7 @@ from okx_quant.persistence import (
     strategy_history_file_path,
     strategy_trade_ledger_file_path,
     save_strategy_trade_ledger_snapshot,
+    verify_profile_switch_password,
 )
 from okx_quant.position_protection import (
     OptionProtectionConfig,
@@ -169,6 +172,8 @@ from okx_quant.trader_desk import (
     trader_used_quota_steps,
 )
 from okx_quant.trader_desk_ui import TraderDeskWindow
+from okx_quant.arbitrage.models import ArbitrageTradeRuntime
+from okx_quant.arbitrage_ui import ArbitrageWindow
 from okx_quant.smart_order import SmartOrderRuntimeConfig
 from okx_quant.smart_order_ui import SmartOrderWindow
 from okx_quant.strategy_live_chart import (
@@ -541,6 +546,9 @@ def _blank_credential_profile_snapshot(*, environment: str = "") -> dict[str, st
         "api_key": "",
         "secret_key": "",
         "passphrase": "",
+        "switch_password_hash": "",
+        "switch_password_salt": "",
+        "switch_password_iterations": "",
     }
     if environment in {"demo", "live"}:
         snapshot["environment"] = environment
@@ -2705,6 +2713,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._trader_desk_window: TraderDeskWindow | None = None
         self._line_trading_desk_window: LineTradingDeskWindowState | None = None
         self._smart_order_window: SmartOrderWindow | None = None
+        self._arbitrage_window: ArbitrageWindow | None = None
         self._deribit_volatility_monitor_window: DeribitVolatilityMonitorWindow | None = None
         self._deribit_volatility_window: DeribitVolatilityWindow | None = None
         self._option_strategy_window: OptionStrategyCalculatorWindow | None = None
@@ -2896,6 +2905,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.secret_key = StringVar()
         self.passphrase = StringVar()
         self.api_profile_name = StringVar(value=DEFAULT_CREDENTIAL_PROFILE_NAME)
+        self.credential_profile_password_status_text = StringVar(value="切换密码：未设置")
         self.environment_label = StringVar(value="模拟盘 demo")
 
         self.symbol = StringVar(value=self._default_launch_symbol)
@@ -3103,6 +3113,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._last_saved_credentials: tuple[str, str, str, str, str] | None = None
         self._auto_save_notice_shown = False
         self._credential_profiles: dict[str, dict[str, str]] = {}
+        self._locked_credential_profiles: set[str] = set()
         self._header_credential_profile_combo: ttk.Combobox | None = None
         self._credential_profile_combo: ttk.Combobox | None = None
         self._loaded_credential_profile_name = DEFAULT_CREDENTIAL_PROFILE_NAME
@@ -3320,6 +3331,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         tools_menu = Menu(menu_bar, tearoff=False)
         tools_menu.add_command(label="打开无限下单", command=self.open_smart_order_window)
+        tools_menu.add_command(label="打开现货套利", command=self.open_arbitrage_window)
         tools_menu.add_command(label="打开回测窗口", command=self.open_backtest_window)
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
         tools_menu.add_command(label="打开BTC行情分析", command=self.open_btc_market_analysis_window)
@@ -5315,6 +5327,24 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         self._sync_credential_profile_combo()
 
         row += 1
+        ttk.Label(account_frame, text="切换密码").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(
+            account_frame,
+            textvariable=self.credential_profile_password_status_text,
+        ).grid(row=row, column=1, sticky="w", padx=(0, 16), pady=(12, 0))
+        password_buttons = ttk.Frame(account_frame)
+        password_buttons.grid(row=row, column=2, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(password_buttons, text="解锁当前", command=self._unlock_current_api_profile).grid(
+            row=0, column=0, padx=(0, 8)
+        )
+        ttk.Button(password_buttons, text="设置/更新密码", command=self._set_current_api_profile_switch_password).grid(
+            row=0, column=1, padx=(0, 8)
+        )
+        ttk.Button(password_buttons, text="清除密码", command=self._clear_current_api_profile_switch_password).grid(
+            row=0, column=2
+        )
+
+        row += 1
         ttk.Label(account_frame, text="API Key").grid(row=row, column=0, sticky="w")
         ttk.Entry(account_frame, textvariable=self.api_key).grid(row=row, column=1, sticky="ew", padx=(0, 16))
         ttk.Label(account_frame, text="Passphrase").grid(row=row, column=2, sticky="w")
@@ -5359,7 +5389,7 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         ).grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
         ttk.Label(
             account_frame,
-            text=f"凭证自动保存到：{credentials_file_path().name}（支持多个 API 配置）",
+            text=f"凭证会加密保存到：{credentials_file_path().name}（支持多个 API 配置）",
             justify="left",
         ).grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
 
@@ -6762,6 +6792,23 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         self.passphrase.set(snapshot["passphrase"])
         self._credential_watch_enabled = was_enabled
 
+    def _credential_profile_requires_switch_password(self, profile_name: str) -> bool:
+        snapshot = self._credential_profiles.get(profile_name.strip(), {})
+        return credential_profile_has_switch_password(snapshot)
+
+    def _credential_profile_is_locked(self, profile_name: str) -> bool:
+        return profile_name.strip() in self._locked_credential_profiles
+
+    def _update_current_api_profile_password_status(self, profile_name: str | None = None) -> None:
+        target = (profile_name or self._current_credential_profile()).strip()
+        if self._credential_profile_is_locked(target):
+            status_text = "切换密码：已设置（未解锁）"
+        elif self._credential_profile_requires_switch_password(target):
+            status_text = "切换密码：已设置"
+        else:
+            status_text = "切换密码：未设置"
+        self.credential_profile_password_status_text.set(status_text)
+
     def _sync_credential_profile_combo(self) -> None:
         values = self._credential_profile_names()
         header_width = max(8, min(14, max((len(item) for item in values), default=8) + 1))
@@ -6783,10 +6830,12 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         stored_environment = str(snapshot.get("environment", "")).strip().lower()
         if stored_environment not in {"demo", "live"}:
             stored_environment = ""
+        self._locked_credential_profiles.discard(target)
         self._loaded_credential_profile_name = target
         self.api_profile_name.set(target)
         self._set_credentials_fields(snapshot)
         self._sync_current_api_sender_email_override(target)
+        self._update_current_api_profile_password_status(target)
         self._last_saved_credentials = (
             target,
             snapshot["api_key"],
@@ -6800,6 +6849,20 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         if log_change:
             self._enqueue_log(f"已切换 API 配置：{target}")
         UiPositionsMixin._refresh_account_views_after_credential_profile_switch(self)
+
+    def _apply_locked_credentials_profile(self, profile_name: str) -> None:
+        target = profile_name.strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
+        snapshot = self._credential_profiles.get(target, _blank_credential_profile_snapshot())
+        self._locked_credential_profiles.add(target)
+        self._loaded_credential_profile_name = ""
+        self.api_profile_name.set(target)
+        self._set_credentials_fields(_blank_credential_profile_snapshot())
+        self._sync_current_api_sender_email_override(target)
+        self._last_saved_credentials = None
+        self._apply_profile_environment(target)
+        self._sync_credential_profile_combo()
+        self._update_settings_summary()
+        self._update_current_api_profile_password_status(target)
 
     def _normalized_api_sender_email_overrides(self) -> dict[str, str]:
         return {
@@ -6835,7 +6898,15 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         startup_profile = self._startup_credential_profile_name(
             str(snapshot.get("selected_profile", DEFAULT_CREDENTIAL_PROFILE_NAME))
         )
-        self._apply_credentials_profile(startup_profile)
+        if self._credential_profile_requires_switch_password(startup_profile):
+            if self._confirm_credential_profile_switch(startup_profile):
+                self._apply_credentials_profile(startup_profile)
+            else:
+                self._apply_locked_credentials_profile(startup_profile)
+                self._enqueue_log(f"启动时未解锁 API 配置：{startup_profile}")
+                return
+        else:
+            self._apply_credentials_profile(startup_profile)
         if any(self._current_credentials_state()[1:4]):
             self._enqueue_log(f"已自动读取本地凭证文件：{credentials_file_path().name}")
 
@@ -7031,14 +7102,20 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         current = self._current_credentials_state()
         if current == self._last_saved_credentials:
             return
+        if self._credential_profile_is_locked(current[0]):
+            return
 
         try:
             profile_name, api_key, secret_key, passphrase, environment = current
+            existing_snapshot = self._credential_profiles.get(profile_name, {})
             self._credential_profiles[profile_name] = {
                 "api_key": api_key,
                 "secret_key": secret_key,
                 "passphrase": passphrase,
                 "environment": environment,
+                "switch_password_hash": str(existing_snapshot.get("switch_password_hash", "") or ""),
+                "switch_password_salt": str(existing_snapshot.get("switch_password_salt", "") or ""),
+                "switch_password_iterations": str(existing_snapshot.get("switch_password_iterations", "") or ""),
             }
             save_credentials_profiles_snapshot(
                 selected_profile=profile_name,
@@ -7065,11 +7142,128 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
                 return candidate
             index += 1
 
+    def _active_settings_parent(self) -> object:
+        if self._settings_window is not None and _widget_exists(self._settings_window):
+            return self._settings_window
+        return self.root
+
+    def _restore_loaded_credential_profile_selection(self) -> None:
+        loaded = self._loaded_credential_profile_name.strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
+        if self.api_profile_name.get().strip() != loaded:
+            self.api_profile_name.set(loaded)
+
+    def _restore_profile_selection(self, profile_name: str) -> None:
+        target = profile_name.strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
+        if self.api_profile_name.get().strip() != target:
+            self.api_profile_name.set(target)
+
+    def _confirm_credential_profile_switch(self, profile_name: str) -> bool:
+        target = profile_name.strip()
+        if not target or not self._credential_profile_requires_switch_password(target):
+            return True
+        parent = self._active_settings_parent()
+        password = simpledialog.askstring(
+            "输入 API 切换密码",
+            f"API 配置 {target} 已设置切换密码，请输入后继续：",
+            show="*",
+            parent=parent,
+        )
+        if password is None:
+            return False
+        if verify_profile_switch_password(self._credential_profiles.get(target, {}), password):
+            return True
+        messagebox.showerror("密码错误", f"API 配置 {target} 的切换密码不正确。", parent=parent)
+        return False
+
+    def _unlock_current_api_profile(self) -> None:
+        profile_name = self._current_credential_profile()
+        if not profile_name:
+            return
+        if self._credential_profile_is_locked(profile_name):
+            if not self._confirm_credential_profile_switch(profile_name):
+                self._restore_profile_selection(profile_name)
+                return
+            self._apply_credentials_profile(profile_name, log_change=False)
+            self._enqueue_log(f"已解锁 API 配置：{profile_name}")
+            return
+        if (
+            profile_name == self._loaded_credential_profile_name
+            and not self._credential_profile_requires_switch_password(profile_name)
+        ):
+            return
+        self._apply_credentials_profile(profile_name, log_change=True)
+
+    def _set_current_api_profile_switch_password(self) -> None:
+        profile_name = self._editing_credential_profile()
+        parent = self._active_settings_parent()
+        password = simpledialog.askstring(
+            "设置 API 切换密码",
+            f"给 API 配置 {profile_name} 设置切换密码：",
+            show="*",
+            parent=parent,
+        )
+        if password is None:
+            return
+        if not str(password).strip():
+            messagebox.showerror("设置失败", "API 切换密码不能为空。", parent=parent)
+            return
+        confirm = simpledialog.askstring(
+            "确认 API 切换密码",
+            f"请再次输入 API 配置 {profile_name} 的切换密码：",
+            show="*",
+            parent=parent,
+        )
+        if confirm is None:
+            return
+        if password != confirm:
+            messagebox.showerror("设置失败", "两次输入的密码不一致。", parent=parent)
+            return
+        snapshot = dict(self._credential_profiles.get(profile_name, _blank_credential_profile_snapshot()))
+        snapshot.update(build_profile_switch_password_snapshot(password))
+        self._credential_profiles[profile_name] = snapshot
+        save_credentials_profiles_snapshot(
+            selected_profile=self._current_credential_profile(),
+            profiles=self._credential_profiles,
+        )
+        self._update_current_api_profile_password_status(profile_name)
+        self._enqueue_log(f"已为 API 配置 {profile_name} 设置切换密码")
+
+    def _clear_current_api_profile_switch_password(self) -> None:
+        profile_name = self._editing_credential_profile()
+        if not self._credential_profile_requires_switch_password(profile_name):
+            return
+        parent = self._active_settings_parent()
+        if not messagebox.askyesno(
+            "清除 API 切换密码",
+            f"确认清除 API 配置 {profile_name} 的切换密码吗？",
+            parent=parent,
+        ):
+            return
+        snapshot = dict(self._credential_profiles.get(profile_name, _blank_credential_profile_snapshot()))
+        snapshot.update(
+            {
+                "switch_password_hash": "",
+                "switch_password_salt": "",
+                "switch_password_iterations": "",
+            }
+        )
+        self._locked_credential_profiles.discard(profile_name)
+        self._credential_profiles[profile_name] = snapshot
+        save_credentials_profiles_snapshot(
+            selected_profile=self._current_credential_profile(),
+            profiles=self._credential_profiles,
+        )
+        self._update_current_api_profile_password_status(profile_name)
+        self._enqueue_log(f"已清除 API 配置 {profile_name} 的切换密码")
+
     def _on_api_profile_selected(self, *_: object) -> None:
         selected = self.api_profile_name.get().strip()
         if not selected:
             return
         if selected == self._loaded_credential_profile_name:
+            return
+        if not self._confirm_credential_profile_switch(selected):
+            self._restore_loaded_credential_profile_selection()
             return
         self._save_credentials_now(silent=True)
         if selected not in self._credential_profiles:
@@ -7884,6 +8078,18 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         if credentials is None:
             return None
         return SmartOrderRuntimeConfig(
+            credentials=credentials,
+            environment=ENV_OPTIONS[self.environment_label.get()],
+            trade_mode=TRADE_MODE_OPTIONS[self.trade_mode_label.get()],
+            position_mode=POSITION_MODE_OPTIONS[self.position_mode_label.get()],
+            credential_profile_name=self._loaded_credential_profile_name,
+        )
+
+    def _build_arbitrage_trade_runtime_or_none(self) -> ArbitrageTradeRuntime | None:
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            return None
+        return ArbitrageTradeRuntime(
             credentials=credentials,
             environment=ENV_OPTIONS[self.environment_label.get()],
             trade_mode=TRADE_MODE_OPTIONS[self.trade_mode_label.get()],
@@ -11443,6 +11649,8 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
             self._trader_desk_window.destroy()
         if self._smart_order_window is not None and self._smart_order_window.window.winfo_exists():
             self._smart_order_window.destroy()
+        if self._arbitrage_window is not None and self._arbitrage_window.window.winfo_exists():
+            self._arbitrage_window.destroy()
         if (
             self._deribit_volatility_monitor_window is not None
             and self._deribit_volatility_monitor_window.window.winfo_exists()

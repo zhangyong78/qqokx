@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import Instrument, OkxOrderResult, OkxOrderStatus, OkxPosition
+from okx_quant.persistence import build_profile_switch_password_snapshot
 from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_MTF_LONG_ID,
@@ -5160,10 +5161,12 @@ class CredentialProfileEnvironmentTest(TestCase):
                 }
             },
             _loaded_credential_profile_name="real",
+            _locked_credential_profiles=set(),
             api_profile_name=_Var("real"),
             api_key=_Var(),
             secret_key=_Var(),
             passphrase=_Var(),
+            credential_profile_password_status_text=_Var(),
             environment_label=_Var("\u5b9e\u76d8 live"),
             _default_environment_label="\u5b9e\u76d8 live",
             _positions_effective_environment="live",
@@ -5193,12 +5196,20 @@ class CredentialProfileEnvironmentTest(TestCase):
         )
         app._environment_label_for_profile = lambda profile_name: QuantApp._environment_label_for_profile(app, profile_name)
         app._apply_profile_environment = lambda profile_name: QuantApp._apply_profile_environment(app, profile_name)
+        app._credential_profile_requires_switch_password = lambda profile_name: QuantApp._credential_profile_requires_switch_password(
+            app, profile_name
+        )
+        app._credential_profile_is_locked = lambda profile_name: QuantApp._credential_profile_is_locked(app, profile_name)
+        app._update_current_api_profile_password_status = (
+            lambda profile_name=None: QuantApp._update_current_api_profile_password_status(app, profile_name)
+        )
 
         QuantApp._apply_credentials_profile(app, "moni", log_change=True)
 
         self.assertEqual(app.api_profile_name.get(), "moni")
         self.assertEqual(app.environment_label.get(), "\u6a21\u62df\u76d8 demo")
         self.assertIsNone(app._positions_effective_environment)
+        self.assertEqual(app.credential_profile_password_status_text.get(), "\u5207\u6362\u5bc6\u7801\uff1a\u672a\u8bbe\u7f6e")
         self.assertEqual(
             app._last_saved_credentials,
             ("moni", "demo-key", "demo-secret", "demo-pass", "demo"),
@@ -5206,16 +5217,19 @@ class CredentialProfileEnvironmentTest(TestCase):
         app._enqueue_log.assert_called_once_with("\u5df2\u5207\u6362 API \u914d\u7f6e\uff1amoni")
 
     def test_save_credentials_now_persists_environment_with_profile(self) -> None:
+        password_snapshot = build_profile_switch_password_snapshot("desk-pass")
         app = SimpleNamespace(
             _credential_save_job=None,
             _current_credentials_state=lambda: ("real", "live-key", "live-secret", "live-pass", "live"),
             _last_saved_credentials=None,
-            _credential_profiles={},
+            _credential_profiles={"real": dict(password_snapshot)},
+            _locked_credential_profiles=set(),
             _auto_save_notice_shown=False,
             _sync_credential_profile_combo=MagicMock(),
             _update_settings_summary=MagicMock(),
             _enqueue_log=MagicMock(),
         )
+        app._credential_profile_is_locked = lambda profile_name: QuantApp._credential_profile_is_locked(app, profile_name)
 
         with patch("okx_quant.ui.save_credentials_profiles_snapshot") as save_snapshot:
             QuantApp._save_credentials_now(app, silent=True)
@@ -5227,6 +5241,7 @@ class CredentialProfileEnvironmentTest(TestCase):
                 "secret_key": "live-secret",
                 "passphrase": "live-pass",
                 "environment": "live",
+                **password_snapshot,
             },
         )
         save_snapshot.assert_called_once()
@@ -5320,6 +5335,262 @@ class CredentialProfileEnvironmentTest(TestCase):
         app._save_notification_settings_now.assert_any_call(silent=True)
         app._apply_credentials_profile.assert_called_once_with("desk", log_change=True)
         save_snapshot.assert_called_once()
+
+    def test_on_api_profile_selected_requires_password_before_switch(self) -> None:
+        password_snapshot = build_profile_switch_password_snapshot("desk-pass")
+        app = SimpleNamespace(
+            api_profile_name=_Var("desk"),
+            _loaded_credential_profile_name="api1",
+            _credential_profiles={
+                "api1": {"api_key": "k1", "secret_key": "s1", "passphrase": "p1", "environment": "demo"},
+                "desk": {
+                    "api_key": "k2",
+                    "secret_key": "s2",
+                    "passphrase": "p2",
+                    "environment": "live",
+                    **password_snapshot,
+                },
+            },
+            _settings_window=None,
+            root=object(),
+            _save_credentials_now=MagicMock(),
+            _apply_credentials_profile=MagicMock(),
+            _environment_value_from_label=lambda _label: "demo",
+            environment_label=_Var("模拟盘 demo"),
+        )
+        app._credential_profile_requires_switch_password = lambda profile_name: QuantApp._credential_profile_requires_switch_password(
+            app, profile_name
+        )
+        app._active_settings_parent = lambda: QuantApp._active_settings_parent(app)
+        app._confirm_credential_profile_switch = lambda profile_name: QuantApp._confirm_credential_profile_switch(app, profile_name)
+        app._restore_loaded_credential_profile_selection = lambda: QuantApp._restore_loaded_credential_profile_selection(app)
+
+        with patch("okx_quant.ui.simpledialog.askstring", return_value="wrong-pass"), patch(
+            "okx_quant.ui.messagebox.showerror"
+        ) as showerror:
+            QuantApp._on_api_profile_selected(app)
+
+        self.assertEqual(app.api_profile_name.get(), "api1")
+        app._save_credentials_now.assert_not_called()
+        app._apply_credentials_profile.assert_not_called()
+        showerror.assert_called_once()
+
+    def test_on_api_profile_selected_switches_after_correct_password(self) -> None:
+        password_snapshot = build_profile_switch_password_snapshot("desk-pass")
+        app = SimpleNamespace(
+            api_profile_name=_Var("desk"),
+            _loaded_credential_profile_name="api1",
+            _credential_profiles={
+                "api1": {"api_key": "k1", "secret_key": "s1", "passphrase": "p1", "environment": "demo"},
+                "desk": {
+                    "api_key": "k2",
+                    "secret_key": "s2",
+                    "passphrase": "p2",
+                    "environment": "live",
+                    **password_snapshot,
+                },
+            },
+            _settings_window=None,
+            root=object(),
+            _save_credentials_now=MagicMock(),
+            _apply_credentials_profile=MagicMock(),
+            _environment_value_from_label=lambda _label: "demo",
+            environment_label=_Var("模拟盘 demo"),
+        )
+        app._credential_profile_requires_switch_password = lambda profile_name: QuantApp._credential_profile_requires_switch_password(
+            app, profile_name
+        )
+        app._active_settings_parent = lambda: QuantApp._active_settings_parent(app)
+        app._confirm_credential_profile_switch = lambda profile_name: QuantApp._confirm_credential_profile_switch(app, profile_name)
+        app._restore_loaded_credential_profile_selection = lambda: QuantApp._restore_loaded_credential_profile_selection(app)
+
+        with patch("okx_quant.ui.simpledialog.askstring", return_value="desk-pass"):
+            QuantApp._on_api_profile_selected(app)
+
+        app._save_credentials_now.assert_called_once_with(silent=True)
+        app._apply_credentials_profile.assert_called_once_with("desk", log_change=True)
+
+    def test_load_saved_credentials_unlocks_protected_startup_profile(self) -> None:
+        password_snapshot = build_profile_switch_password_snapshot("desk-pass")
+        app = SimpleNamespace(
+            _credential_profiles={},
+            _locked_credential_profiles=set(),
+            _loaded_credential_profile_name="",
+            api_profile_name=_Var(""),
+            api_key=_Var(),
+            secret_key=_Var(),
+            passphrase=_Var(),
+            credential_profile_password_status_text=_Var(),
+            environment_label=_Var("模拟盘 demo"),
+            _default_environment_label="模拟盘 demo",
+            _positions_effective_environment=None,
+            _sync_credential_profile_combo=MagicMock(),
+            _update_settings_summary=MagicMock(),
+            _enqueue_log=MagicMock(),
+            _api_sender_email_overrides={},
+            _api_sender_override_watch_enabled=False,
+            api_sender_email_override=_Var(),
+            _settings_window=None,
+            root=object(),
+        )
+
+        def _set_credentials_fields(snapshot: dict[str, str]) -> None:
+            app.api_key.set(snapshot["api_key"])
+            app.secret_key.set(snapshot["secret_key"])
+            app.passphrase.set(snapshot["passphrase"])
+
+        app._set_credentials_fields = _set_credentials_fields
+        app._normalized_api_sender_email_overrides = lambda: QuantApp._normalized_api_sender_email_overrides(app)
+        app._resolved_api_sender_email_override = (
+            lambda profile_name=None: QuantApp._resolved_api_sender_email_override(app, profile_name)
+        )
+        app._sync_current_api_sender_email_override = (
+            lambda profile_name=None: QuantApp._sync_current_api_sender_email_override(app, profile_name)
+        )
+        app._normalized_environment_label = lambda label, fallback=None: QuantApp._normalized_environment_label(
+            app, label, fallback=fallback
+        )
+        app._environment_label_for_profile = lambda profile_name: QuantApp._environment_label_for_profile(app, profile_name)
+        app._apply_profile_environment = lambda profile_name: QuantApp._apply_profile_environment(app, profile_name)
+        app._credential_profile_requires_switch_password = lambda profile_name: QuantApp._credential_profile_requires_switch_password(
+            app, profile_name
+        )
+        app._credential_profile_is_locked = lambda profile_name: QuantApp._credential_profile_is_locked(app, profile_name)
+        app._update_current_api_profile_password_status = (
+            lambda profile_name=None: QuantApp._update_current_api_profile_password_status(app, profile_name)
+        )
+        app._startup_credential_profile_name = lambda selected_profile: QuantApp._startup_credential_profile_name(
+            app, selected_profile
+        )
+        app._current_credential_profile = lambda: QuantApp._current_credential_profile(app)
+        app._editing_credential_profile = lambda: QuantApp._editing_credential_profile(app)
+        app._environment_value_from_label = lambda label: QuantApp._environment_value_from_label(app, label)
+        app._current_credentials_state = lambda: QuantApp._current_credentials_state(app)
+        app._apply_credentials_profile = lambda profile_name, log_change=False: QuantApp._apply_credentials_profile(
+            app, profile_name, log_change=log_change
+        )
+        app._apply_locked_credentials_profile = lambda profile_name: QuantApp._apply_locked_credentials_profile(app, profile_name)
+        app._active_settings_parent = lambda: QuantApp._active_settings_parent(app)
+        app._confirm_credential_profile_switch = lambda profile_name: QuantApp._confirm_credential_profile_switch(app, profile_name)
+
+        with patch(
+            "okx_quant.ui.load_credentials_profiles_snapshot",
+            return_value={
+                "selected_profile": "desk",
+                "profiles": {
+                    "desk": {
+                        "api_key": "k2",
+                        "secret_key": "s2",
+                        "passphrase": "p2",
+                        "environment": "live",
+                        **password_snapshot,
+                    }
+                },
+            },
+        ), patch("okx_quant.ui.simpledialog.askstring", return_value="desk-pass"), patch(
+            "okx_quant.ui.credentials_file_path",
+            return_value=Path("credentials.json"),
+        ):
+            QuantApp._load_saved_credentials(app)
+
+        self.assertEqual(app.api_profile_name.get(), "desk")
+        self.assertEqual(app.api_key.get(), "k2")
+        self.assertEqual(app.secret_key.get(), "s2")
+        self.assertEqual(app.passphrase.get(), "p2")
+        self.assertEqual(app.environment_label.get(), "实盘 live")
+        self.assertEqual(app.credential_profile_password_status_text.get(), "切换密码：已设置")
+        self.assertEqual(app._loaded_credential_profile_name, "desk")
+        self.assertNotIn("desk", app._locked_credential_profiles)
+
+    def test_load_saved_credentials_keeps_startup_profile_locked_when_not_unlocked(self) -> None:
+        password_snapshot = build_profile_switch_password_snapshot("desk-pass")
+        app = SimpleNamespace(
+            _credential_profiles={},
+            _locked_credential_profiles=set(),
+            _loaded_credential_profile_name="",
+            api_profile_name=_Var(""),
+            api_key=_Var("old-key"),
+            secret_key=_Var("old-secret"),
+            passphrase=_Var("old-pass"),
+            credential_profile_password_status_text=_Var(),
+            environment_label=_Var("模拟盘 demo"),
+            _default_environment_label="模拟盘 demo",
+            _positions_effective_environment="demo",
+            _sync_credential_profile_combo=MagicMock(),
+            _update_settings_summary=MagicMock(),
+            _enqueue_log=MagicMock(),
+            _api_sender_email_overrides={},
+            _api_sender_override_watch_enabled=False,
+            api_sender_email_override=_Var(),
+            _settings_window=None,
+            root=object(),
+        )
+
+        def _set_credentials_fields(snapshot: dict[str, str]) -> None:
+            app.api_key.set(snapshot["api_key"])
+            app.secret_key.set(snapshot["secret_key"])
+            app.passphrase.set(snapshot["passphrase"])
+
+        app._set_credentials_fields = _set_credentials_fields
+        app._normalized_api_sender_email_overrides = lambda: QuantApp._normalized_api_sender_email_overrides(app)
+        app._resolved_api_sender_email_override = (
+            lambda profile_name=None: QuantApp._resolved_api_sender_email_override(app, profile_name)
+        )
+        app._sync_current_api_sender_email_override = (
+            lambda profile_name=None: QuantApp._sync_current_api_sender_email_override(app, profile_name)
+        )
+        app._normalized_environment_label = lambda label, fallback=None: QuantApp._normalized_environment_label(
+            app, label, fallback=fallback
+        )
+        app._environment_label_for_profile = lambda profile_name: QuantApp._environment_label_for_profile(app, profile_name)
+        app._apply_profile_environment = lambda profile_name: QuantApp._apply_profile_environment(app, profile_name)
+        app._credential_profile_requires_switch_password = lambda profile_name: QuantApp._credential_profile_requires_switch_password(
+            app, profile_name
+        )
+        app._credential_profile_is_locked = lambda profile_name: QuantApp._credential_profile_is_locked(app, profile_name)
+        app._update_current_api_profile_password_status = (
+            lambda profile_name=None: QuantApp._update_current_api_profile_password_status(app, profile_name)
+        )
+        app._startup_credential_profile_name = lambda selected_profile: QuantApp._startup_credential_profile_name(
+            app, selected_profile
+        )
+        app._current_credential_profile = lambda: QuantApp._current_credential_profile(app)
+        app._editing_credential_profile = lambda: QuantApp._editing_credential_profile(app)
+        app._environment_value_from_label = lambda label: QuantApp._environment_value_from_label(app, label)
+        app._current_credentials_state = lambda: QuantApp._current_credentials_state(app)
+        app._apply_credentials_profile = lambda profile_name, log_change=False: QuantApp._apply_credentials_profile(
+            app, profile_name, log_change=log_change
+        )
+        app._apply_locked_credentials_profile = lambda profile_name: QuantApp._apply_locked_credentials_profile(app, profile_name)
+        app._active_settings_parent = lambda: QuantApp._active_settings_parent(app)
+        app._confirm_credential_profile_switch = lambda profile_name: QuantApp._confirm_credential_profile_switch(app, profile_name)
+
+        with patch(
+            "okx_quant.ui.load_credentials_profiles_snapshot",
+            return_value={
+                "selected_profile": "desk",
+                "profiles": {
+                    "desk": {
+                        "api_key": "k2",
+                        "secret_key": "s2",
+                        "passphrase": "p2",
+                        "environment": "live",
+                        **password_snapshot,
+                    }
+                },
+            },
+        ), patch("okx_quant.ui.simpledialog.askstring", return_value=None):
+            QuantApp._load_saved_credentials(app)
+
+        self.assertEqual(app.api_profile_name.get(), "desk")
+        self.assertEqual(app.api_key.get(), "")
+        self.assertEqual(app.secret_key.get(), "")
+        self.assertEqual(app.passphrase.get(), "")
+        self.assertEqual(app.environment_label.get(), "实盘 live")
+        self.assertEqual(app.credential_profile_password_status_text.get(), "切换密码：已设置（未解锁）")
+        self.assertEqual(app._loaded_credential_profile_name, "")
+        self.assertIn("desk", app._locked_credential_profiles)
+        app._enqueue_log.assert_called_once_with("启动时未解锁 API 配置：desk")
 
 
 class StrategyStopCleanupTest(TestCase):

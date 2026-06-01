@@ -77,6 +77,7 @@ class BtcMarketAnalyzerTest(TestCase):
         self.assertEqual(payload["direction"], "long")
         self.assertEqual(payload["resonance"]["direction"], "long")
         self.assertEqual(payload["mode"], "realtime")
+        self.assertIn("focus_events", payload["timeframes"][0])
 
     def test_save_and_email_body_are_ready_for_delivery(self) -> None:
         candles = _bullish_trend_candles()
@@ -94,7 +95,11 @@ class BtcMarketAnalyzerTest(TestCase):
         self.assertEqual(saved_path, output_path)
         self.assertEqual(persisted["symbol"], "BTC-USDT-SWAP")
         self.assertIn("generated_at", persisted)
-        self.assertIn("[1H]", email_body)
+        self.assertIn("最简结论：", email_body)
+        self.assertIn("重点变化：", email_body)
+        self.assertIn("当前快照：", email_body)
+        self.assertIn("1小时", email_body)
+        self.assertIn("4小时", email_body)
 
     def test_historical_replay_only_uses_candles_before_selected_point(self) -> None:
         analysis_dt = datetime(2026, 5, 7, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))

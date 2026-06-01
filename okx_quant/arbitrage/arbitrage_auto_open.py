@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Callable
+
+from okx_quant.arbitrage.arbitrage_executor import ArbitrageExecutor, ArbitrageOpenRequest, ArbitrageOpenResult
+from okx_quant.arbitrage.basis_calculator import mid_price
+from okx_quant.arbitrage.models import ArbitrageTradeRuntime
+from okx_quant.okx_client import OkxRestClient
+
+Logger = Callable[[str], None]
+MonitorPollSeconds = 2.0
+
+
+@dataclass
+class ArbitrageAutoOpenSession:
+    request: ArbitrageOpenRequest
+    runtime: ArbitrageTradeRuntime
+    status: str = "监控中"
+    last_spread_pct: Decimal | None = None
+    last_spot_mid: Decimal | None = None
+    last_deriv_mid: Decimal | None = None
+    triggered: bool = False
+    result: ArbitrageOpenResult | None = None
+
+
+class ArbitrageAutoOpenService:
+    def __init__(
+        self,
+        client: OkxRestClient,
+        *,
+        executor: ArbitrageExecutor | None = None,
+        logger: Logger | None = None,
+    ) -> None:
+        self._client = client
+        self._executor = executor or ArbitrageExecutor(client, logger=logger)
+        self._logger = logger or (lambda _message: None)
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._session: ArbitrageAutoOpenSession | None = None
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def session(self) -> ArbitrageAutoOpenSession | None:
+        with self._lock:
+            return self._session
+
+    def start(self, request: ArbitrageOpenRequest, runtime: ArbitrageTradeRuntime) -> None:
+        with self._lock:
+            if self.is_running:
+                raise RuntimeError("已有自动开仓任务在运行，请先停止。")
+            self._stop_event.clear()
+            self._session = ArbitrageAutoOpenSession(request=request, runtime=runtime)
+            self._thread = threading.Thread(target=self._run, name="arbitrage-auto-open", daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        with self._lock:
+            if self._session is not None and not self._session.triggered:
+                self._session.status = "已停止"
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=MonitorPollSeconds + 1.0)
+
+    def _run(self) -> None:
+        self._logger("自动开仓监控已启动。")
+        while not self._stop_event.is_set():
+            session = self.session
+            if session is None:
+                return
+            try:
+                if self._should_trigger(session):
+                    session.status = "条件满足，正在开仓…"
+                    self._logger(
+                        f"触发自动开仓：当前价差 {session.last_spread_pct!s}% "
+                        f"(现货 {session.last_spot_mid!s} / 衍生品 {session.last_deriv_mid!s})"
+                    )
+                    session.triggered = True
+                    result = self._executor.open_cash_and_carry(session.request, runtime=session.runtime)
+                    session.result = result
+                    session.status = "已完成" if result.success else f"失败：{result.message}"
+                    self._logger(session.status)
+                    return
+                self._refresh_quote(session)
+            except Exception as exc:
+                session.status = f"异常：{exc}"
+                self._logger(f"自动开仓监控异常：{exc}")
+                return
+            time.sleep(MonitorPollSeconds)
+        session = self.session
+        if session is not None and not session.triggered:
+            session.status = "已停止"
+
+    def _refresh_quote(self, session: ArbitrageAutoOpenSession) -> None:
+        spot_ticker = self._client.get_ticker(session.request.spot_inst_id)
+        deriv_ticker = self._client.get_ticker(session.request.derivative_inst_id)
+        spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask)
+        deriv_mid = mid_price(deriv_ticker.bid, deriv_ticker.ask)
+        if spot_mid is None or deriv_mid is None or spot_mid <= 0:
+            session.status = "等待有效报价…"
+            return
+        spread_pct = (deriv_mid - spot_mid) / spot_mid * Decimal("100")
+        session.last_spot_mid = spot_mid
+        session.last_deriv_mid = deriv_mid
+        session.last_spread_pct = spread_pct
+        session.status = f"监控中 | 价差 {spread_pct:.4f}%"
+
+    def _should_trigger(self, session: ArbitrageAutoOpenSession) -> bool:
+        request = session.request
+        spot_ticker = self._client.get_ticker(request.spot_inst_id)
+        deriv_ticker = self._client.get_ticker(request.derivative_inst_id)
+        spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask)
+        deriv_mid = mid_price(deriv_ticker.bid, deriv_ticker.ask)
+        if spot_mid is None or deriv_mid is None or spot_mid <= 0:
+            return False
+        spread_pct = (deriv_mid - spot_mid) / spot_mid * Decimal("100")
+        session.last_spot_mid = spot_mid
+        session.last_deriv_mid = deriv_mid
+        session.last_spread_pct = spread_pct
+
+        if request.trigger_mode == "spread":
+            if request.open_spread_pct_max is None:
+                return False
+            return spread_pct <= request.open_spread_pct_max
+
+        spot_ok = True
+        deriv_ok = True
+        if request.spot_limit_price is not None and request.spot_limit_price > 0:
+            ask = spot_ticker.ask
+            spot_ok = ask is not None and ask > 0 and ask <= request.spot_limit_price
+        if request.derivative_limit_price is not None and request.derivative_limit_price > 0:
+            bid = deriv_ticker.bid
+            deriv_ok = bid is not None and bid > 0 and bid >= request.derivative_limit_price
+        return spot_ok and deriv_ok

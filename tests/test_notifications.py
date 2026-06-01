@@ -5,8 +5,9 @@ from unittest import TestCase
 from unittest.mock import MagicMock
 
 from okx_quant.engine import StrategyEngine, _classify_live_dynamic_close_reason
-from okx_quant.models import EmailNotificationConfig, StrategyConfig
+from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
+from okx_quant.okx_client import OkxPositionHistoryItem
 from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_LONG_ID, STRATEGY_EMA5_EMA8_ID
 
 
@@ -209,6 +210,19 @@ class EmailNotifierTest(TestCase):
 
 
 class StrategyEngineNotificationTest(TestCase):
+    def _make_credentials(self) -> Credentials:
+        return Credentials(api_key="key", secret_key="secret", passphrase="pass")
+
+    def _make_trade_instrument(self) -> Instrument:
+        return Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+
     def test_trade_fill_notification_passes_runtime_context_to_notifier(self) -> None:
         notifier = MagicMock()
         engine = StrategyEngine(
@@ -466,6 +480,97 @@ class StrategyEngineNotificationTest(TestCase):
 
         self.assertEqual(notifier.send_trade_close.call_args.kwargs["trigger_reason"], "保本")
         self.assertEqual(notifier.send_trade_close.call_args.kwargs["trade_pnl"], "50")
+
+    def test_exchange_dynamic_stop_close_notification_uses_position_history_pnl(self) -> None:
+        client = MagicMock()
+        client.get_positions_history.return_value = [
+            OkxPositionHistoryItem(
+                update_time=None,
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                mgn_mode="cross",
+                pos_side="long",
+                direction="net",
+                open_avg_price=Decimal("2500"),
+                close_avg_price=Decimal("2550"),
+                close_size=Decimal("1"),
+                pnl=Decimal("47.5"),
+                realized_pnl=Decimal("48.5"),
+                settle_pnl=Decimal("0"),
+                raw={},
+                fee=Decimal("-1"),
+                fee_currency="USDT",
+            )
+        ]
+        notifier = MagicMock()
+        engine = StrategyEngine(client, lambda message: None, notifier=notifier, strategy_name="EMA 动态委托")
+
+        engine._notify_exchange_dynamic_stop_close(
+            self._make_credentials(),
+            _make_strategy_config(),
+            trade_instrument=self._make_trade_instrument(),
+            position=SimpleNamespace(
+                inst_id="ETH-USDT-SWAP",
+                side="buy",
+                close_side="sell",
+                pos_side="long",
+                size=Decimal("1"),
+                entry_price=Decimal("2500"),
+            ),
+            initial_stop_loss=Decimal("2400"),
+            current_stop_loss=Decimal("2550"),
+            risk_per_unit=Decimal("100"),
+            next_trigger_r=3,
+            detail="OKX 动态止损平仓",
+        )
+
+        self.assertEqual(notifier.send_trade_close.call_args.kwargs["trade_pnl"], "+48.5")
+        client.get_positions_history.assert_called_once()
+
+    def test_exchange_dynamic_stop_close_notification_skips_unmatched_history_pnl(self) -> None:
+        client = MagicMock()
+        client.get_positions_history.return_value = [
+            OkxPositionHistoryItem(
+                update_time=None,
+                inst_id="BTC-USDT-SWAP",
+                inst_type="SWAP",
+                mgn_mode="cross",
+                pos_side="short",
+                direction="net",
+                open_avg_price=Decimal("70000"),
+                close_avg_price=Decimal("69000"),
+                close_size=Decimal("1"),
+                pnl=Decimal("100"),
+                realized_pnl=Decimal("100"),
+                settle_pnl=Decimal("0"),
+                raw={},
+                fee=Decimal("-1"),
+                fee_currency="USDT",
+            )
+        ]
+        notifier = MagicMock()
+        engine = StrategyEngine(client, lambda message: None, notifier=notifier, strategy_name="EMA 动态委托")
+
+        engine._notify_exchange_dynamic_stop_close(
+            self._make_credentials(),
+            _make_strategy_config(),
+            trade_instrument=self._make_trade_instrument(),
+            position=SimpleNamespace(
+                inst_id="ETH-USDT-SWAP",
+                side="buy",
+                close_side="sell",
+                pos_side="long",
+                size=Decimal("1"),
+                entry_price=Decimal("2500"),
+            ),
+            initial_stop_loss=Decimal("2400"),
+            current_stop_loss=Decimal("2550"),
+            risk_per_unit=Decimal("100"),
+            next_trigger_r=3,
+            detail="OKX 动态止损平仓",
+        )
+
+        self.assertEqual(notifier.send_trade_close.call_args.kwargs["trade_pnl"], "")
 
     def test_classify_live_dynamic_close_reason_returns_locked_r(self) -> None:
         reason = _classify_live_dynamic_close_reason(

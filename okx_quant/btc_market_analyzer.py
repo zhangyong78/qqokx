@@ -11,6 +11,7 @@ from typing import Literal
 from okx_quant.candle_patterns import (
     PatternBias,
     SingleCandlePatternReport,
+    analyze_single_candle_pattern_history,
     analyze_single_candle_patterns,
     single_candle_report_payload,
 )
@@ -20,13 +21,41 @@ from okx_quant.market_analysis import MarketAnalysisConfig, MarketAnalysisReport
 from okx_quant.models import Candle, EmailNotificationConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.okx_client import OkxRestClient
-from okx_quant.persistence import analysis_report_dir_path, load_notification_snapshot
+from okx_quant.persistence import (
+    analysis_report_dir_path,
+    load_btc_market_email_state,
+    load_notification_snapshot,
+    save_btc_market_email_state,
+)
+from okx_quant.signal_replay_engine import SignalReplayConfig, build_signal_replay_dataset
 
 AnalysisDirection = Literal["long", "short", "neutral"]
 SignalBias = Literal["long", "short", "caution", "neutral"]
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
+FOCUS_EMAIL_TIMEFRAMES = {"4H", "1H"}
+FOCUS_PATTERN_IDS = {
+    "false_breakdown",
+    "false_breakout",
+    "top_fractal",
+    "bottom_fractal",
+    "big_bullish",
+    "big_bearish",
+    "long_upper_shadow",
+    "long_lower_shadow",
+    "inside_bar",
+}
+FOCUS_SINGLE_CANDLE_PATTERNS = {
+    "hammer",
+    "hanging_man",
+    "inverted_hammer",
+    "shooting_star",
+    "bullish_marubozu",
+    "bearish_marubozu",
+    "dragonfly_doji",
+    "gravestone_doji",
+}
 
 
 @dataclass(frozen=True)
@@ -38,6 +67,20 @@ class MarketSignal:
     score: int
     strength: Decimal
     trend_context: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class PatternFocusEvent:
+    timeframe: str
+    ts: int
+    pattern_id: str
+    label: str
+    direction: SignalBias
+    score: int
+    candle_count: int
+    source: str
+    summary: str
     reason: str
 
 
@@ -56,6 +99,7 @@ class TimeframeAnalysis:
     probability: dict[str, object]
     indicators: dict[str, object]
     pattern: dict[str, object]
+    focus_events: tuple[PatternFocusEvent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -296,6 +340,7 @@ def btc_market_analysis_payload(analysis: BtcMarketAnalysis) -> dict[str, object
                 "probability": item.probability,
                 "indicators": item.indicators,
                 "pattern": item.pattern,
+                "focus_events": [_focus_event_payload(event) for event in item.focus_events],
             }
             for item in analysis.timeframes
         ],
@@ -333,7 +378,23 @@ def build_btc_market_analysis_email_subject(analysis: BtcMarketAnalysis) -> str:
     return f"[QQOKX] BTC 行情分析 | {analysis.symbol} | {analysis.direction} | {confidence}"
 
 
-def build_btc_market_analysis_email_body(analysis: BtcMarketAnalysis) -> str:
+def build_btc_market_analysis_email_body(
+    analysis: BtcMarketAnalysis,
+    *,
+    last_sent_at: datetime | None = None,
+) -> str:
+    lines = [
+        "最简结论：",
+        *_build_simple_email_summary(analysis, last_sent_at=last_sent_at),
+        "",
+        "重点变化：",
+        *_build_focus_section(analysis, last_sent_at=last_sent_at),
+        "",
+        "当前快照：",
+        *_build_current_snapshot_section(analysis),
+    ]
+    return "\n".join(lines)
+
     lines = [
         f"标的：{analysis.symbol}",
         f"生成时间(UTC)：{analysis.generated_at}",
@@ -384,19 +445,283 @@ def load_btc_market_email_notifier() -> EmailNotifier | None:
 
 def send_btc_market_analysis_email(
     analysis: BtcMarketAnalysis,
+    *,
     notifier: EmailNotifier | None = None,
+    report_path: Path | None = None,
 ) -> bool:
     resolved_notifier = notifier or load_btc_market_email_notifier()
     if resolved_notifier is None or not resolved_notifier.enabled:
         return False
+    email_state = load_btc_market_email_state()
+    last_sent_at = _parse_iso_datetime(email_state.get("last_sent_at", ""))
     subject = build_btc_market_analysis_email_subject(analysis)
-    body = build_btc_market_analysis_email_body(analysis)
+    body = build_btc_market_analysis_email_body(analysis, last_sent_at=last_sent_at)
     sender = getattr(resolved_notifier, "_send", None)
     if callable(sender):
         sender(subject, body)
+        _save_email_delivery_state(subject=subject, report_path=report_path)
         return True
     resolved_notifier.notify_async(subject, body)
+    _save_email_delivery_state(subject=subject, report_path=report_path)
     return True
+
+
+def _build_simple_email_summary(
+    analysis: BtcMarketAnalysis,
+    *,
+    last_sent_at: datetime | None,
+) -> list[str]:
+    lines = [f"- 大方向：{_direction_text(analysis.direction)}。"]
+    for timeframe in ("4H", "1H"):
+        item = _find_timeframe_analysis(analysis, timeframe)
+        if item is None:
+            continue
+        recent_events = _recent_focus_events(item, last_sent_at=last_sent_at)
+        tf_label = _timeframe_display_label(timeframe)
+        if recent_events:
+            lines.append(f"- {tf_label}：{_direction_text(item.direction)}，新出了{recent_events[0].label}。")
+        else:
+            lines.append(f"- {tf_label}：{_direction_text(item.direction)}，这段时间没有新的代表性K线。")
+    return lines
+
+
+def _build_focus_section(
+    analysis: BtcMarketAnalysis,
+    *,
+    last_sent_at: datetime | None,
+) -> list[str]:
+    lines: list[str] = []
+    if last_sent_at is None:
+        lines.append("- 这是首次定时简报，下面列最近识别到的代表性形态。")
+    else:
+        lines.append(f"- 对比基线：{_format_local_datetime(last_sent_at)}")
+    for timeframe in ("4H", "1H"):
+        item = _find_timeframe_analysis(analysis, timeframe)
+        if item is None:
+            continue
+        lines.append(f"- {_timeframe_display_label(timeframe)}：")
+        recent_events = _recent_focus_events(item, last_sent_at=last_sent_at)
+        if not recent_events:
+            lines.append("  没有新的代表性K线。")
+            continue
+        for event in recent_events[:4]:
+            lines.append(f"  {_format_local_timestamp(event.ts)} {event.label}：{event.summary}")
+    return lines
+
+
+def _build_current_snapshot_section(analysis: BtcMarketAnalysis) -> list[str]:
+    lines = [
+        f"- 标的：{analysis.symbol}",
+        f"- 生成时间：{analysis.generated_at}",
+        f"- 综合方向：{analysis.direction} | 评分={analysis.score} | 置信度={_format_pct(analysis.confidence)}",
+        f"- 多周期共振：{analysis.resonance.summary}",
+    ]
+    for timeframe in ("4H", "1H", "1D"):
+        item = _find_timeframe_analysis(analysis, timeframe)
+        if item is None:
+            continue
+        lines.append(
+            f"- [{item.timeframe}] {item.direction} | 评分={item.score} | 置信度={_format_pct(item.confidence)} | 核心：{_top_reason_text(item.reason)}"
+        )
+    return lines
+
+
+def _build_focus_events(candles: list[Candle], *, timeframe: str) -> tuple[PatternFocusEvent, ...]:
+    if timeframe not in FOCUS_EMAIL_TIMEFRAMES:
+        return ()
+    events = [
+        *_replay_focus_events(candles, timeframe=timeframe),
+        *_single_candle_focus_events(candles, timeframe=timeframe),
+    ]
+    unique: dict[tuple[int, str, str], PatternFocusEvent] = {}
+    for event in events:
+        key = (event.ts, event.pattern_id, event.source)
+        current = unique.get(key)
+        if current is None or event.score > current.score:
+            unique[key] = event
+    ordered = sorted(unique.values(), key=lambda item: (item.ts, item.score, item.candle_count, item.label), reverse=True)
+    return tuple(ordered[:12])
+
+
+def _replay_focus_events(candles: list[Candle], *, timeframe: str) -> list[PatternFocusEvent]:
+    dataset = build_signal_replay_dataset(
+        candles,
+        config=SignalReplayConfig(
+            include_long=False,
+            include_short=False,
+            enable_trend_filter=False,
+            enable_pullback_trigger=False,
+            enable_macd_filter=False,
+            enable_volume_filter=False,
+            enable_bias_filter=False,
+            enable_near_ema_filter=False,
+            enable_atr_filter=False,
+            enable_large_move_gate=False,
+        ),
+    )
+    events: list[PatternFocusEvent] = []
+    for signal in dataset.signals:
+        if signal.pattern_id not in FOCUS_PATTERN_IDS:
+            continue
+        events.append(
+            PatternFocusEvent(
+                timeframe=timeframe,
+                ts=signal.ts,
+                pattern_id=signal.pattern_id,
+                label=_pattern_label(signal.pattern_id, signal.pattern_name),
+                direction=_signal_direction_text(signal.direction),
+                score=signal.score,
+                candle_count=signal.candle_count,
+                source="replay",
+                summary=_pattern_summary(signal.pattern_id, signal.direction),
+                reason=signal.reason,
+            )
+        )
+    return events
+
+
+def _single_candle_focus_events(candles: list[Candle], *, timeframe: str) -> list[PatternFocusEvent]:
+    events: list[PatternFocusEvent] = []
+    for report in analyze_single_candle_pattern_history(candles, inst_id="BTC-USDT-SWAP"):
+        if not report.matches or report.candle_ts is None:
+            continue
+        primary = report.matches[0]
+        if primary.pattern not in FOCUS_SINGLE_CANDLE_PATTERNS:
+            continue
+        direction = _signal_bias_from_pattern(primary.bias)
+        events.append(
+            PatternFocusEvent(
+                timeframe=timeframe,
+                ts=report.candle_ts,
+                pattern_id=primary.pattern,
+                label=_pattern_label(primary.pattern, primary.pattern),
+                direction=direction,
+                score=2,
+                candle_count=1,
+                source="single",
+                summary=_single_pattern_summary(primary.pattern, direction),
+                reason=primary.reason,
+            )
+        )
+    return events
+
+
+def _recent_focus_events(item: TimeframeAnalysis, *, last_sent_at: datetime | None) -> list[PatternFocusEvent]:
+    if last_sent_at is None:
+        return list(item.focus_events[:4])
+    threshold_ms = int(last_sent_at.astimezone(timezone.utc).timestamp() * 1000)
+    events = [event for event in item.focus_events if event.ts > threshold_ms]
+    return events[:4]
+
+
+def _find_timeframe_analysis(analysis: BtcMarketAnalysis, timeframe: str) -> TimeframeAnalysis | None:
+    for item in analysis.timeframes:
+        if item.timeframe == timeframe:
+            return item
+    return None
+
+
+def _top_reason_text(reasons: tuple[str, ...]) -> str:
+    return reasons[0] if reasons else "暂无明显主导信号"
+
+
+def _direction_text(direction: str) -> str:
+    return {
+        "long": "偏多",
+        "short": "偏空",
+        "neutral": "震荡偏中性",
+    }.get(str(direction), str(direction))
+
+
+def _signal_direction_text(direction: str) -> SignalBias:
+    if direction == "long":
+        return "long"
+    if direction == "short":
+        return "short"
+    return "neutral"
+
+
+def _timeframe_display_label(timeframe: str) -> str:
+    return {"4H": "4小时", "1H": "1小时", "1D": "日线"}.get(timeframe, timeframe)
+
+
+def _pattern_label(pattern_id: str, fallback: str) -> str:
+    return {
+        "false_breakdown": "双线反转看多",
+        "false_breakout": "双线反转看空",
+        "top_fractal": "顶分型",
+        "bottom_fractal": "底分型",
+        "inside_bar": "孕线",
+        "big_bullish": "大阳线",
+        "big_bearish": "大阴线",
+        "long_upper_shadow": "长上影",
+        "long_lower_shadow": "长下影",
+        "hammer": "锤子线",
+        "hanging_man": "上吊线",
+        "inverted_hammer": "倒锤子",
+        "shooting_star": "流星线",
+        "bullish_marubozu": "光头阳线",
+        "bearish_marubozu": "光头阴线",
+        "dragonfly_doji": "蜻蜓十字",
+        "gravestone_doji": "墓碑十字",
+    }.get(pattern_id, fallback)
+
+
+def _pattern_summary(pattern_id: str, direction: str) -> str:
+    return {
+        "false_breakdown": "先跌破又收回，短线更像止跌反抽。",
+        "false_breakout": "先冲高又收回，短线更像冲高回落。",
+        "top_fractal": "三根K线做出局部高点，短线要防回落。",
+        "bottom_fractal": "三根K线做出局部低点，短线先看反弹。",
+        "inside_bar": "波动先收住了，后面容易选方向。",
+        "big_bullish": "单根阳线很强，买盘发力明显。",
+        "big_bearish": "单根阴线很强，卖盘发力明显。",
+        "long_upper_shadow": "上去后被压回来了，上方抛压明显。",
+        "long_lower_shadow": "下去后被拉回来了，下方承接明显。",
+    }.get(pattern_id, f"出现了偏{_direction_text(direction)}的代表性K线。")
+
+
+def _single_pattern_summary(pattern_id: str, direction: SignalBias) -> str:
+    return {
+        "hammer": "下探后被拉回，像是在试底。",
+        "hanging_man": "冲高后留下下影，强势里开始有分歧。",
+        "inverted_hammer": "下跌后向上试探，像是在试反转。",
+        "shooting_star": "冲高后回落，短线偏弱。",
+        "bullish_marubozu": "整根阳线很干净，买盘占优。",
+        "bearish_marubozu": "整根阴线很干净，卖盘占优。",
+        "dragonfly_doji": "下影很长，低位有承接。",
+        "gravestone_doji": "上影很长，高位有压制。",
+    }.get(pattern_id, f"出现了偏{_direction_text(direction)}的单K信号。")
+
+
+def _format_local_timestamp(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone().strftime("%m-%d %H:%M")
+
+
+def _format_local_datetime(value: datetime) -> str:
+    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _parse_iso_datetime(raw_value: str) -> datetime | None:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+    normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _save_email_delivery_state(*, subject: str, report_path: Path | None) -> None:
+    save_btc_market_email_state(
+        last_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        last_subject=subject,
+        last_report_path=str(report_path) if report_path is not None else "",
+    )
 
 
 def _analyze_timeframe(
@@ -422,6 +747,7 @@ def _analyze_timeframe(
             probability={},
             indicators={},
             pattern={},
+            focus_events=(),
         )
 
     indicator_snapshot, indicator_signals, indicator_trend_context = _build_indicator_snapshot(
@@ -441,6 +767,7 @@ def _analyze_timeframe(
     )
     pattern_report = analyze_single_candle_patterns(ordered, inst_id=symbol)
     pattern_snapshot, pattern_signals = _build_pattern_snapshot(pattern_report, timeframe=timeframe)
+    focus_events = _build_focus_events(ordered, timeframe=timeframe)
 
     signals = _sorted_signals(indicator_signals + probability_signals + pattern_signals)
     score = sum(item.score for item in signals)
@@ -463,6 +790,7 @@ def _analyze_timeframe(
         probability=probability_snapshot,
         indicators=indicator_snapshot,
         pattern=pattern_snapshot,
+        focus_events=focus_events,
     )
 
 
@@ -1013,6 +1341,21 @@ def _signal_payload(signal: MarketSignal) -> dict[str, object]:
         "strength": _decimal_text(signal.strength),
         "trend_context": signal.trend_context,
         "reason": signal.reason,
+    }
+
+
+def _focus_event_payload(event: PatternFocusEvent) -> dict[str, object]:
+    return {
+        "timeframe": event.timeframe,
+        "ts": event.ts,
+        "pattern_id": event.pattern_id,
+        "label": event.label,
+        "direction": event.direction,
+        "score": event.score,
+        "candle_count": event.candle_count,
+        "source": event.source,
+        "summary": event.summary,
+        "reason": event.reason,
     }
 
 

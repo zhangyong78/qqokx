@@ -8,20 +8,27 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from okx_quant.btc_market_analyzer import (
-    BtcMarketAnalyzerConfig,
-    analyze_btc_market_from_client,
-    btc_market_analysis_json,
-    save_btc_market_analysis,
-    send_btc_market_analysis_email,
-)
+from okx_quant.btc_market_analyzer import BtcMarketAnalyzerConfig
 from okx_quant.market_analysis import MarketAnalysisConfig
+from okx_quant.multi_coin_market_digest import (
+    DEFAULT_DIGEST_SYMBOLS,
+    analyze_multi_coin_market,
+    multi_coin_market_digest_json,
+    save_multi_coin_market_digest,
+    send_multi_coin_market_email,
+)
 from okx_quant.okx_client import OkxRestClient
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run BTC market analysis for 1H / 4H / 1D.")
-    parser.add_argument("--symbol", default="BTC-USDT-SWAP", help="Instrument id to analyze.")
+    parser = argparse.ArgumentParser(description="Run multi-coin market digest for 1H / 4H / 1D.")
+    parser.add_argument(
+        "--symbol",
+        action="append",
+        dest="symbols",
+        default=[],
+        help="Instrument id to analyze. Can be repeated. Defaults to BTC/ETH/BNB/SOL/DOGE swaps.",
+    )
     parser.add_argument(
         "--timeframe",
         action="append",
@@ -35,33 +42,26 @@ def main() -> None:
         default="close_to_close",
         help="How bullish/bearish probability streaks are defined.",
     )
-    parser.add_argument(
-        "--send-email",
-        action="store_true",
-        help="Send the analysis summary using the existing QQOKX email settings.",
-    )
-    parser.add_argument(
-        "--print-json",
-        action="store_true",
-        help="Print the JSON payload to stdout after saving the report.",
-    )
+    parser.add_argument("--send-email", action="store_true", help="Send the combined digest email.")
+    parser.add_argument("--print-json", action="store_true", help="Print the JSON payload to stdout after saving the report.")
     args = parser.parse_args()
 
+    symbols = tuple(args.symbols or DEFAULT_DIGEST_SYMBOLS)
     timeframes = tuple(args.timeframes or ["1H", "4H", "1D"])
     config = BtcMarketAnalyzerConfig(
         timeframes=timeframes,
         probability_config=MarketAnalysisConfig(direction_mode=args.direction_mode),
     )
     client = OkxRestClient()
-    analysis = analyze_btc_market_from_client(client, symbol=args.symbol, config=config)
-    output_path = save_btc_market_analysis(analysis)
+    digest = analyze_multi_coin_market(client, symbols=symbols, config=config)
+    output_path = save_multi_coin_market_digest(digest)
     print(output_path)
 
     if args.print_json:
-        print(btc_market_analysis_json(analysis))
+        print(multi_coin_market_digest_json(digest))
 
     if args.send_email:
-        delivered = send_btc_market_analysis_email(analysis, report_path=output_path)
+        delivered = send_multi_coin_market_email(digest, report_path=output_path)
         print("email_sent" if delivered else "email_not_sent")
 
 

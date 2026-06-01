@@ -1787,6 +1787,8 @@ class OkxRestClient:
                 inst = None
             if inst is not None:
                 order["sz"] = _format_exchange_contract_sz(inst, size)
+                if inst.inst_type == "SPOT":
+                    order["tdMode"] = "cash"
                 if reduce_only:
                     normalized_plan_pos = (pos_side or "").strip().lower()
                     acct = self._get_account_config_cached(credentials, config)

@@ -4,12 +4,15 @@ from pathlib import Path
 from unittest import TestCase
 
 from okx_quant.persistence import (
+    build_profile_switch_password_snapshot,
+    credential_profile_has_switch_password,
     load_credentials_profiles_snapshot,
     load_credentials_snapshot,
     load_position_notes_snapshot,
     save_credentials_profiles_snapshot,
     save_credentials_snapshot,
     save_position_notes_snapshot,
+    verify_profile_switch_password,
 )
 
 
@@ -38,6 +41,9 @@ class CredentialProfilesPersistenceTest(TestCase):
                     "secret_key": "legacy-secret",
                     "passphrase": "legacy-pass",
                     "environment": "",
+                    "switch_password_hash": "",
+                    "switch_password_salt": "",
+                    "switch_password_iterations": "",
                 },
             )
 
@@ -148,6 +154,39 @@ class CredentialProfilesPersistenceTest(TestCase):
             snapshot = load_credentials_snapshot(path, profile_name="demo")
 
             self.assertEqual(snapshot["environment"], "demo")
+
+    def test_save_credentials_profiles_snapshot_encrypts_values_at_rest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".okx_quant_credentials.json"
+            save_credentials_profiles_snapshot(
+                selected_profile="desk",
+                profiles={
+                    "desk": {
+                        "api_key": "plain-api-key",
+                        "secret_key": "plain-secret-key",
+                        "passphrase": "plain-passphrase",
+                        "environment": "demo",
+                    }
+                },
+                path=path,
+            )
+
+            raw = path.read_text(encoding="utf-8")
+            snapshot = load_credentials_snapshot(path, profile_name="desk")
+
+            self.assertNotIn("plain-api-key", raw)
+            self.assertNotIn("plain-secret-key", raw)
+            self.assertNotIn("plain-passphrase", raw)
+            self.assertEqual(snapshot["api_key"], "plain-api-key")
+            self.assertEqual(snapshot["secret_key"], "plain-secret-key")
+            self.assertEqual(snapshot["passphrase"], "plain-passphrase")
+
+    def test_profile_switch_password_snapshot_can_roundtrip(self) -> None:
+        password_snapshot = build_profile_switch_password_snapshot("desk-123")
+
+        self.assertTrue(credential_profile_has_switch_password(password_snapshot))
+        self.assertTrue(verify_profile_switch_password(password_snapshot, "desk-123"))
+        self.assertFalse(verify_profile_switch_password(password_snapshot, "desk-456"))
 
 
 class PositionNotesPersistenceTest(TestCase):

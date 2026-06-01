@@ -16,6 +16,7 @@ from okx_quant.okx_client import (
     OkxOrderResult,
     OkxOrderStatus,
     OkxPosition,
+    OkxPositionHistoryItem,
     OkxRestClient,
     OkxTradeOrderItem,
     infer_inst_type,
@@ -2753,6 +2754,7 @@ class StrategyEngine:
         if live_position is None:
             self._logger("未检测到策略持仓，OKX 动态止损监控结束。")
             self._notify_exchange_dynamic_stop_close(
+                credentials,
                 config,
                 trade_instrument=trade_instrument,
                 position=position,
@@ -2812,6 +2814,7 @@ class StrategyEngine:
                     if term_msg:
                         self._logger(term_msg)
                     self._notify_exchange_dynamic_stop_close(
+                        credentials,
                         config,
                         trade_instrument=trade_instrument,
                         position=position,
@@ -2852,6 +2855,7 @@ class StrategyEngine:
                 if why:
                     self._logger(why)
                 self._notify_exchange_dynamic_stop_close(
+                    credentials,
                     config,
                     trade_instrument=trade_instrument,
                     position=position,
@@ -2967,6 +2971,7 @@ class StrategyEngine:
             if live_position is None:
                 self._logger("检测到持仓已关闭，停止 OKX 动态止损监控。")
                 self._notify_exchange_dynamic_stop_close(
+                    credentials,
                     config,
                     trade_instrument=trade_instrument,
                     position=position,
@@ -3220,6 +3225,104 @@ class StrategyEngine:
             return item
         return None
 
+    def _lookup_recent_position_close_history(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        max_attempts: int = 3,
+        delay_seconds: float = 1.0,
+    ) -> OkxPositionHistoryItem | None:
+        for attempt in range(max_attempts):
+            items = self._get_positions_history_with_retry(
+                credentials,
+                config,
+                inst_types=(trade_instrument.inst_type,),
+                limit=30,
+            )
+            matched = self._match_recent_position_close_history(
+                items,
+                position=position,
+            )
+            if matched is not None:
+                return matched
+            if attempt + 1 < max_attempts:
+                self._stop_event.wait(delay_seconds)
+        return None
+
+    @staticmethod
+    def _match_recent_position_close_history(
+        items: list[OkxPositionHistoryItem],
+        *,
+        position: FilledPosition,
+    ) -> OkxPositionHistoryItem | None:
+        expected_pos_side = (position.pos_side or "").strip().lower()
+        expected_size = abs(position.size)
+        expected_entry = position.entry_price if position.entry_price > 0 else None
+        now_ms = int(time.time() * 1000)
+        best_item: OkxPositionHistoryItem | None = None
+        best_score = -1
+        for item in items:
+            if item.inst_id != position.inst_id:
+                continue
+
+            score = 100
+            item_pos_side = (item.pos_side or "").strip().lower()
+            if expected_pos_side and item_pos_side:
+                if item_pos_side != expected_pos_side:
+                    continue
+                score += 40
+
+            if item.close_size is not None and expected_size > 0:
+                close_size = abs(item.close_size)
+                diff_ratio = abs(close_size - expected_size) / expected_size
+                if diff_ratio <= Decimal("0.02"):
+                    score += 40
+                elif diff_ratio <= Decimal("0.10"):
+                    score += 20
+                elif close_size < expected_size * Decimal("0.5"):
+                    continue
+
+            if item.open_avg_price is not None and expected_entry is not None:
+                diff_ratio = abs(item.open_avg_price - expected_entry) / expected_entry
+                if diff_ratio <= Decimal("0.002"):
+                    score += 30
+                elif diff_ratio <= Decimal("0.02"):
+                    score += 15
+                elif diff_ratio > Decimal("0.08"):
+                    score -= 20
+
+            if item.update_time is not None:
+                age_ms = max(0, now_ms - item.update_time)
+                if age_ms <= 5 * 60 * 1000:
+                    score += 20
+                elif age_ms <= 60 * 60 * 1000:
+                    score += 10
+                elif age_ms > 3 * 24 * 60 * 60 * 1000:
+                    score -= 30
+
+            if item.realized_pnl is not None or item.pnl is not None:
+                score += 5
+
+            if score > best_score:
+                best_item = item
+                best_score = score
+        return best_item if best_score >= 100 else None
+
+    @staticmethod
+    def _position_history_close_pnl_text(item: OkxPositionHistoryItem | None) -> str:
+        if item is None:
+            return ""
+        value = item.realized_pnl if item.realized_pnl is not None else item.pnl
+        if value is None:
+            return ""
+        text = format_decimal(value)
+        if value > 0:
+            return f"+{text}"
+        return text
+
     def _call_okx_read_with_retry(self, label: str, fn: Callable[[], T]) -> T:
         return self._retry_policy.call_okx_read_with_retry(label, fn)
 
@@ -3272,6 +3375,21 @@ class StrategyEngine:
         inst_type: str | None = None,
     ) -> list[OkxPosition]:
         return self._retry_policy.get_positions(credentials, config, inst_type=inst_type)
+
+    def _get_positions_history_with_retry(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_types: tuple[str, ...],
+        limit: int,
+    ) -> list[OkxPositionHistoryItem]:
+        return self._retry_policy.get_positions_history(
+            credentials,
+            config,
+            inst_types=inst_types,
+            limit=limit,
+        )
 
     def _fetch_atr_snapshot_with_retry(
         self,
@@ -4242,6 +4360,7 @@ class StrategyEngine:
 
     def _notify_exchange_dynamic_stop_close(
         self,
+        credentials: Credentials,
         config: StrategyConfig,
         *,
         trade_instrument: Instrument,
@@ -4265,6 +4384,12 @@ class StrategyEngine:
             dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
         )
+        history_item = self._lookup_recent_position_close_history(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            position=position,
+        )
         self._notify_trade_close(
             config,
             symbol=trade_instrument.inst_id,
@@ -4276,6 +4401,7 @@ class StrategyEngine:
             tick_size=trade_instrument.tick_size,
             trigger_reason=trigger_reason,
             detail=detail,
+            trade_pnl=self._position_history_close_pnl_text(history_item),
             price_label="触发止损价",
         )
 

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import base64
+import ctypes
+import hashlib
 import json
+import secrets
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +28,8 @@ STRATEGY_TRADE_LEDGER_FILE_NAME = "strategy_trade_ledger.json"
 RECOVERABLE_STRATEGY_SESSIONS_FILE_NAME = "recoverable_strategy_sessions.json"
 SMART_ORDER_TASKS_FILE_NAME = "smart_order_tasks.json"
 SMART_ORDER_FAVORITES_FILE_NAME = "smart_order_favorites.json"
+ARBITRAGE_LEDGER_FILE_NAME = "arbitrage_ledger.json"
+ARBITRAGE_SETTINGS_FILE_NAME = "arbitrage_settings.json"
 OPTION_STRATEGIES_FILE_NAME = "option_strategies.json"
 SIGNAL_OBSERVER_TEMPLATES_FILE_NAME = "signal_observer_templates.json"
 SIGNAL_OBSERVER_PRESETS_FILE_NAME = "signal_observer_presets.json"
@@ -33,6 +40,7 @@ STRATEGY_PARAMETER_DRAFTS_FILE_NAME = "strategy_parameter_drafts.json"
 LINE_TRADING_DESK_ANNOTATIONS_FILE_NAME = "line_trading_desk_annotations.json"
 JOURNAL_ENTRIES_FILE_NAME = "journal_entries.json"
 BTC_RESEARCH_WORKBENCH_STATE_FILE_NAME = "btc_research_workbench_state.json"
+BTC_MARKET_EMAIL_STATE_FILE_NAME = "btc_market_email_state.json"
 HISTORY_CACHE_DIR_NAME = "history"
 HISTORY_ORDER_FILE_NAME = "order_history.json"
 HISTORY_FILLS_FILE_NAME = "fills_history.json"
@@ -40,6 +48,15 @@ HISTORY_POSITIONS_FILE_NAME = "position_history.json"
 POSITION_HISTORY_VIEW_PREFS_FILE_NAME = "position_history_view_prefs.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 PROFILE_ENVIRONMENTS = {"demo", "live"}
+_CREDENTIAL_CIPHER_PREFIX = "dpapi:"
+_PROFILE_PASSWORD_ITERATIONS = 200_000
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", ctypes.c_ulong),
+        ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
 
 
 def credentials_file_path(base_dir: Path | None = None) -> Path:
@@ -111,6 +128,66 @@ def smart_order_favorites_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / SMART_ORDER_FAVORITES_FILE_NAME if base_dir is not None else state_dir_path() / SMART_ORDER_FAVORITES_FILE_NAME
 
 
+def arbitrage_ledger_file_path(base_dir: Path | None = None) -> Path:
+    return Path(base_dir) / ARBITRAGE_LEDGER_FILE_NAME if base_dir is not None else state_dir_path() / ARBITRAGE_LEDGER_FILE_NAME
+
+
+def arbitrage_settings_file_path(base_dir: Path | None = None) -> Path:
+    return Path(base_dir) / ARBITRAGE_SETTINGS_FILE_NAME if base_dir is not None else state_dir_path() / ARBITRAGE_SETTINGS_FILE_NAME
+
+
+def load_arbitrage_ledger_snapshot(path: Path | None = None) -> dict[str, object]:
+    target = path or arbitrage_ledger_file_path()
+    if not target.exists():
+        return {"entries": []}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"entries": []}
+    entries = payload.get("entries") if isinstance(payload, dict) else []
+    if not isinstance(entries, list):
+        entries = []
+    return {"entries": entries}
+
+
+def save_arbitrage_ledger_snapshot(*, entries: list[dict[str, object]], path: Path | None = None) -> Path:
+    target = path or arbitrage_ledger_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "entries": entries,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
+def load_arbitrage_settings_snapshot(path: Path | None = None) -> dict[str, object]:
+    target = path or arbitrage_settings_file_path()
+    if not target.exists():
+        return {}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_arbitrage_settings_snapshot(settings: dict[str, object], path: Path | None = None) -> Path:
+    target = path or arbitrage_settings_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        **settings,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
 def option_strategies_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / OPTION_STRATEGIES_FILE_NAME if base_dir is not None else state_dir_path() / OPTION_STRATEGIES_FILE_NAME
 
@@ -158,6 +235,14 @@ def btc_research_workbench_state_file_path(base_dir: Path | None = None) -> Path
         Path(base_dir) / BTC_RESEARCH_WORKBENCH_STATE_FILE_NAME
         if base_dir is not None
         else state_dir_path() / BTC_RESEARCH_WORKBENCH_STATE_FILE_NAME
+    )
+
+
+def btc_market_email_state_file_path(base_dir: Path | None = None) -> Path:
+    return (
+        Path(base_dir) / BTC_MARKET_EMAIL_STATE_FILE_NAME
+        if base_dir is not None
+        else state_dir_path() / BTC_MARKET_EMAIL_STATE_FILE_NAME
     )
 
 
@@ -313,6 +398,44 @@ def save_btc_research_workbench_state(snapshot: dict[str, object], path: Path | 
             time.sleep(0.05)
     if last_error is not None:
         raise last_error
+    return target
+
+
+def load_btc_market_email_state(path: Path | None = None) -> dict[str, str]:
+    target = path or btc_market_email_state_file_path()
+    if not target.exists():
+        return {"last_sent_at": "", "last_subject": "", "last_report_path": ""}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"last_sent_at": "", "last_subject": "", "last_report_path": ""}
+    if not isinstance(payload, dict):
+        return {"last_sent_at": "", "last_subject": "", "last_report_path": ""}
+    return {
+        "last_sent_at": str(payload.get("last_sent_at", "") or "").strip(),
+        "last_subject": str(payload.get("last_subject", "") or "").strip(),
+        "last_report_path": str(payload.get("last_report_path", "") or "").strip(),
+    }
+
+
+def save_btc_market_email_state(
+    *,
+    last_sent_at: str,
+    last_subject: str,
+    last_report_path: str,
+    path: Path | None = None,
+) -> Path:
+    target = path or btc_market_email_state_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "last_sent_at": str(last_sent_at or "").strip(),
+        "last_subject": str(last_subject or "").strip(),
+        "last_report_path": str(last_report_path or "").strip(),
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
     return target
 
 
@@ -518,7 +641,138 @@ def _empty_credentials_snapshot() -> dict[str, str]:
         "secret_key": "",
         "passphrase": "",
         "environment": "",
+        "switch_password_hash": "",
+        "switch_password_salt": "",
+        "switch_password_iterations": "",
     }
+
+
+def _protect_windows_bytes(raw: bytes) -> bytes:
+    if sys.platform != "win32":
+        return raw
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    if not raw:
+        raw = b"\0"
+    source_buffer = ctypes.create_string_buffer(raw, len(raw))
+    source_blob = _DataBlob(len(raw), ctypes.cast(source_buffer, ctypes.POINTER(ctypes.c_ubyte)))
+    target_blob = _DataBlob()
+    if not crypt32.CryptProtectData(ctypes.byref(source_blob), "okx_quant.credentials", None, None, None, 0x01, ctypes.byref(target_blob)):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(target_blob.pbData, target_blob.cbData)
+    finally:
+        if target_blob.pbData:
+            kernel32.LocalFree(target_blob.pbData)
+
+
+def _unprotect_windows_bytes(raw: bytes) -> bytes:
+    if sys.platform != "win32":
+        return raw
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    if not raw:
+        return b""
+    source_buffer = ctypes.create_string_buffer(raw, len(raw))
+    source_blob = _DataBlob(len(raw), ctypes.cast(source_buffer, ctypes.POINTER(ctypes.c_ubyte)))
+    target_blob = _DataBlob()
+    if not crypt32.CryptUnprotectData(ctypes.byref(source_blob), None, None, None, None, 0x01, ctypes.byref(target_blob)):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(target_blob.pbData, target_blob.cbData)
+    finally:
+        if target_blob.pbData:
+            kernel32.LocalFree(target_blob.pbData)
+
+
+def _encrypt_credential_text(value: object) -> str:
+    plain = str(value or "")
+    if not plain:
+        return ""
+    protected = _protect_windows_bytes(plain.encode("utf-8"))
+    return _CREDENTIAL_CIPHER_PREFIX + base64.b64encode(protected).decode("ascii")
+
+
+def _decrypt_credential_text(value: object) -> str:
+    raw = str(value or "")
+    if not raw:
+        return ""
+    if not raw.startswith(_CREDENTIAL_CIPHER_PREFIX):
+        return raw
+    payload = raw[len(_CREDENTIAL_CIPHER_PREFIX) :]
+    try:
+        protected = base64.b64decode(payload.encode("ascii"))
+        plain = _unprotect_windows_bytes(protected)
+        return plain.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _normalize_profile_switch_password(payload: object) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        return {
+            "switch_password_hash": "",
+            "switch_password_salt": "",
+            "switch_password_iterations": "",
+        }
+    password_hash = str(payload.get("switch_password_hash", "") or "").strip()
+    password_salt = str(payload.get("switch_password_salt", "") or "").strip()
+    iterations_raw = str(payload.get("switch_password_iterations", "") or "").strip()
+    try:
+        iterations = int(iterations_raw) if iterations_raw else 0
+    except (TypeError, ValueError):
+        iterations = 0
+    if not password_hash or not password_salt or iterations <= 0:
+        return {
+            "switch_password_hash": "",
+            "switch_password_salt": "",
+            "switch_password_iterations": "",
+        }
+    return {
+        "switch_password_hash": password_hash,
+        "switch_password_salt": password_salt,
+        "switch_password_iterations": str(iterations),
+    }
+
+
+def credential_profile_has_switch_password(payload: object) -> bool:
+    password_snapshot = _normalize_profile_switch_password(payload)
+    return bool(password_snapshot["switch_password_hash"])
+
+
+def build_profile_switch_password_snapshot(password: str) -> dict[str, str]:
+    normalized = str(password or "")
+    if not normalized.strip():
+        raise ValueError("API 切换密码不能为空。")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        normalized.encode("utf-8"),
+        salt,
+        _PROFILE_PASSWORD_ITERATIONS,
+    )
+    return {
+        "switch_password_hash": base64.b64encode(digest).decode("ascii"),
+        "switch_password_salt": base64.b64encode(salt).decode("ascii"),
+        "switch_password_iterations": str(_PROFILE_PASSWORD_ITERATIONS),
+    }
+
+
+def verify_profile_switch_password(payload: object, password: str) -> bool:
+    password_snapshot = _normalize_profile_switch_password(payload)
+    if not password_snapshot["switch_password_hash"]:
+        return True
+    candidate = str(password or "")
+    if not candidate:
+        return False
+    try:
+        salt = base64.b64decode(password_snapshot["switch_password_salt"].encode("ascii"))
+        expected = base64.b64decode(password_snapshot["switch_password_hash"].encode("ascii"))
+        iterations = int(password_snapshot["switch_password_iterations"])
+    except Exception:
+        return False
+    derived = hashlib.pbkdf2_hmac("sha256", candidate.encode("utf-8"), salt, iterations)
+    return secrets.compare_digest(derived, expected)
 
 
 def _normalize_credentials_environment(payload: object) -> str:
@@ -539,10 +793,22 @@ def _normalize_credentials_profile(payload: object) -> dict[str, str]:
     if not isinstance(payload, dict):
         return _empty_credentials_snapshot()
     return {
-        "api_key": str(payload.get("api_key", "")),
-        "secret_key": str(payload.get("secret_key", "")),
-        "passphrase": str(payload.get("passphrase", "")),
+        "api_key": _decrypt_credential_text(payload.get("api_key", "")),
+        "secret_key": _decrypt_credential_text(payload.get("secret_key", "")),
+        "passphrase": _decrypt_credential_text(payload.get("passphrase", "")),
         "environment": _normalize_credentials_environment(payload),
+        **_normalize_profile_switch_password(payload),
+    }
+
+
+def _serialize_credentials_profile(payload: object) -> dict[str, str]:
+    normalized = _normalize_credentials_profile(payload)
+    return {
+        "api_key": _encrypt_credential_text(normalized.get("api_key", "")),
+        "secret_key": _encrypt_credential_text(normalized.get("secret_key", "")),
+        "passphrase": _encrypt_credential_text(normalized.get("passphrase", "")),
+        "environment": str(normalized.get("environment", "") or "").strip().lower(),
+        **_normalize_profile_switch_password(normalized),
     }
 
 
@@ -594,7 +860,7 @@ def save_credentials_profiles_snapshot(
     target = path or credentials_file_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     normalized_profiles = {
-        str(name).strip(): _normalize_credentials_profile(profile)
+        str(name).strip(): _serialize_credentials_profile(profile)
         for name, profile in profiles.items()
         if str(name).strip()
     }

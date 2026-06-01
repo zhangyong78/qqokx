@@ -74,6 +74,17 @@ class UiBacktestEntryMixin:
             logger=self._enqueue_log,
         )
 
+    def open_arbitrage_window(self) -> None:
+        if self._arbitrage_window is not None and self._arbitrage_window.window.winfo_exists():
+            self._arbitrage_window.show()
+            return
+        self._arbitrage_window = ArbitrageWindow(
+            self.root,
+            self.client,
+            runtime_config_provider=self._build_arbitrage_trade_runtime_or_none,
+            logger=self._enqueue_log,
+        )
+
     def open_backtest_compare_window(self) -> None:
         if self._backtest_compare_window is not None and self._backtest_compare_window.window.winfo_exists():
             self._backtest_compare_window.show()

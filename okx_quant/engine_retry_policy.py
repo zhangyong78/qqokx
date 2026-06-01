@@ -4,7 +4,13 @@ from decimal import Decimal
 from typing import Callable, TYPE_CHECKING, TypeVar
 
 from okx_quant.models import Credentials, Instrument, StrategyConfig
-from okx_quant.okx_client import OkxApiError, OkxOrderStatus, OkxPosition, OkxTradeOrderItem
+from okx_quant.okx_client import (
+    OkxApiError,
+    OkxOrderStatus,
+    OkxPosition,
+    OkxPositionHistoryItem,
+    OkxTradeOrderItem,
+)
 
 if TYPE_CHECKING:
     from okx_quant.engine import StrategyEngine
@@ -157,5 +163,23 @@ class EngineRetryPolicy:
                 credentials,
                 environment=config.environment,
                 inst_type=inst_type,
+            ),
+        )
+
+    def get_positions_history(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_types: tuple[str, ...],
+        limit: int,
+    ) -> list[OkxPositionHistoryItem]:
+        return self.call_okx_read_with_retry(
+            "读取历史仓位",
+            lambda: self._engine._client.get_positions_history(
+                credentials,
+                environment=config.environment,
+                inst_types=inst_types,
+                limit=limit,
             ),
         )
