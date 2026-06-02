@@ -5696,10 +5696,25 @@ class UiStrategySessionsMixin:
 
     @staticmethod
     def _strategy_session_supports_recovery(config: StrategyConfig) -> bool:
+        run_mode = str(getattr(config, "run_mode", "") or "").strip().lower()
+        return run_mode in {"trade", "signal_only"}
+
+    @staticmethod
+    def _strategy_session_supports_position_recovery(config: StrategyConfig) -> bool:
         return (
             str(getattr(config, "run_mode", "") or "").strip().lower() == "trade"
             and str(getattr(config, "tp_sl_mode", "") or "").strip().lower() == "exchange"
         )
+
+    def _session_can_auto_migrate_on_close(self, session: StrategySession) -> bool:
+        if not session.recovery_supported:
+            return False
+        trade = session.active_trade
+        if trade is None:
+            return True
+        if trade.reconciliation_started:
+            return False
+        return self._strategy_session_supports_position_recovery(session.config)
 
     @staticmethod
     def _parse_strategy_log_observed_at(line: str) -> datetime | None:
@@ -6277,6 +6292,7 @@ class UiStrategySessionsMixin:
                 self._enqueue_log(f"{session.log_prefix} 读取当前持仓失败，暂时无法恢复接管：{exc}")
             return False
         trade = self._restore_session_trade_runtime_from_log(session) or session.active_trade
+        supports_position_recovery = self._strategy_session_supports_position_recovery(session.config)
         conflicting_session = self._find_recovery_claim_conflict(session_id, trade)
         if conflicting_session is not None:
             conflict_reason = (
@@ -6306,7 +6322,7 @@ class UiStrategySessionsMixin:
                 and pending_signal in {"long", "short"}
                 and pending_side in {"buy", "sell"}
             )
-            if can_recover_pending_entry:
+            if can_recover_pending_entry and supports_position_recovery:
                 try:
                     pending_status = session.engine._get_order_with_retry(
                         credentials,
@@ -6419,6 +6435,19 @@ class UiStrategySessionsMixin:
                 if not auto:
                     self._enqueue_log(f"{session.log_prefix} 未检测到现有仓位或挂单，恢复为信号监听。")
                 return self._restart_recoverable_signal_monitoring(session, credentials)
+            if not supports_position_recovery:
+                reason = "恢复接管结束：该模式仅支持空闲等待信号自动重启，不支持未完成持仓/挂单自动接管。"
+                session.status = "已停止"
+                session.runtime_status = "已停止"
+                session.stopped_at = datetime.now()
+                session.ended_reason = reason
+                self._remove_recoverable_strategy_session(session.session_id)
+                self._upsert_session_row(session)
+                self._sync_strategy_history_from_session(session)
+                self._log_session_message(session, reason)
+                if not auto:
+                    self._enqueue_log(f"{session.log_prefix} {reason}")
+                return False
             session.status = "已停止"
             session.runtime_status = "已停止"
             session.stopped_at = datetime.now()
@@ -6427,6 +6456,19 @@ class UiStrategySessionsMixin:
             self._upsert_session_row(session)
             self._sync_strategy_history_from_session(session)
             self._log_session_message(session, "恢复接管结束：当前未检测到可接管仓位。")
+            return False
+        if not supports_position_recovery:
+            reason = "恢复接管结束：该模式仅支持空闲等待信号自动重启，不支持持仓中的自动接管。"
+            session.status = "已停止"
+            session.runtime_status = "已停止"
+            session.stopped_at = datetime.now()
+            session.ended_reason = reason
+            self._remove_recoverable_strategy_session(session.session_id)
+            self._upsert_session_row(session)
+            self._sync_strategy_history_from_session(session)
+            self._log_session_message(session, reason)
+            if not auto:
+                self._enqueue_log(f"{session.log_prefix} {reason}")
             return False
         try:
             trade_instrument = session.engine._get_instrument_with_retry(trade_inst_id)
@@ -6642,6 +6684,8 @@ class UiStrategySessionsMixin:
             return False
         trade = session.active_trade
         if trade is None or trade.reconciliation_started:
+            return False
+        if not QuantApp._strategy_session_supports_position_recovery(session.config):
             return False
         last_message = str(getattr(session, "last_message", "") or "").strip()
         terminal_markers = (

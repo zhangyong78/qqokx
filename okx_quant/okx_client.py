@@ -25,6 +25,7 @@ from okx_quant.candle_cache import (
 )
 from okx_quant.models import Candle, Credentials, Instrument, OrderPlan, StrategyConfig, TriggerPriceType
 from okx_quant.okx_private_ws import OkxPrivateWsConnection, OkxPrivateWsConnectionUnavailable
+from okx_quant.okx_public_ws import OkxPublicWsConnection, OkxPublicWsConnectionUnavailable
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, snap_to_increment
 
 
@@ -375,6 +376,9 @@ class OkxRestClient:
 
     def __init__(self, *, logger: Callable[[str], None] | None = None) -> None:
         self._logger = logger or (lambda _message: None)
+        self._public_ws_lock = threading.Lock()
+        self._public_ws_connections: dict[str, OkxPublicWsConnection] = {}
+        self._public_ws_error_once: set[str] = set()
         self._private_ws_lock = threading.Lock()
         self._private_ws_connections: dict[tuple[str, str, str], OkxPrivateWsConnection] = {}
         self._private_ws_error_once: set[tuple[str, str, str]] = set()
@@ -792,15 +796,7 @@ class OkxRestClient:
         if not payload["data"]:
             raise OkxApiError(f"OKX 鏈繑鍥炶鎯咃細{inst_id}")
         first = payload["data"][0]
-        return OkxTicker(
-            inst_id=inst_id,
-            last=_to_decimal(first.get("last")),
-            bid=_to_decimal(first.get("bidPx")),
-            ask=_to_decimal(first.get("askPx")),
-            mark=_to_decimal(first.get("markPx")),
-            index=_to_decimal(first.get("idxPx")),
-            raw=first,
-        )
+        return self._build_ticker_from_public_item(inst_id=inst_id, item=first)
 
     def get_order_book(self, inst_id: str, depth: int = 50) -> OkxOrderBook:
         size = max(1, min(depth, 400))
@@ -808,9 +804,89 @@ class OkxRestClient:
         if not payload["data"]:
             raise OkxApiError(f"OKX 未返回盘口：{inst_id}")
         first = payload["data"][0]
+        return self._build_order_book_from_public_item(inst_id=inst_id, item=first)
+
+    def ensure_public_ws_market_watch(self, inst_id: str, *, environment: str) -> None:
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return
+        connection.watch_inst_id(inst_id)
+
+    def get_cached_public_ticker(
+        self,
+        inst_id: str,
+        *,
+        environment: str,
+    ) -> tuple[int, OkxTicker] | None:
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_ticker(inst_id)
+        if payload is None:
+            return None
+        version, item = payload
+        return version, self._build_ticker_from_public_item(inst_id=inst_id, item=item)
+
+    def get_cached_public_order_book(
+        self,
+        inst_id: str,
+        *,
+        environment: str,
+    ) -> tuple[int, OkxOrderBook] | None:
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_order_book(inst_id)
+        if payload is None:
+            return None
+        version, item = payload
+        return version, self._build_order_book_from_public_item(inst_id=inst_id, item=item)
+
+    def get_public_ws_debug_status(self, *, environment: str) -> dict[str, Any]:
+        if not self._public_ws_enabled():
+            return {
+                "enabled": False,
+                "available": False,
+                "connected": False,
+                "watch_count": 0,
+                "ticker_count": 0,
+                "order_book_count": 0,
+                "last_error": "",
+                "reason": "disabled",
+            }
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return {
+                "enabled": True,
+                "available": False,
+                "connected": False,
+                "watch_count": 0,
+                "ticker_count": 0,
+                "order_book_count": 0,
+                "last_error": "",
+                "reason": "unavailable",
+            }
+        status = connection.debug_status()
+        status["enabled"] = True
+        status["available"] = True
+        status["reason"] = ""
+        return status
+
+    def _build_ticker_from_public_item(self, *, inst_id: str, item: dict[str, Any]) -> OkxTicker:
+        return OkxTicker(
+            inst_id=inst_id,
+            last=_to_decimal(item.get("last")),
+            bid=_to_decimal(item.get("bidPx")),
+            ask=_to_decimal(item.get("askPx")),
+            mark=_to_decimal(item.get("markPx")),
+            index=_first_decimal(item.get("idxPx"), item.get("indexPx")),
+            raw=item,
+        )
+
+    def _build_order_book_from_public_item(self, *, inst_id: str, item: dict[str, Any]) -> OkxOrderBook:
         bids: list[tuple[Decimal, Decimal]] = []
         asks: list[tuple[Decimal, Decimal]] = []
-        for row in first.get("bids", []):
+        for row in item.get("bids", []):
             if len(row) < 2:
                 continue
             price = _to_decimal(row[0])
@@ -818,7 +894,7 @@ class OkxRestClient:
             if price is None or book_size is None:
                 continue
             bids.append((price, book_size))
-        for row in first.get("asks", []):
+        for row in item.get("asks", []):
             if len(row) < 2:
                 continue
             price = _to_decimal(row[0])
@@ -830,7 +906,7 @@ class OkxRestClient:
             inst_id=inst_id,
             bids=tuple(bids),
             asks=tuple(asks),
-            raw=first,
+            raw=item,
         )
 
     def get_order_algo(
@@ -1168,6 +1244,33 @@ class OkxRestClient:
     def _private_ws_enabled(self) -> bool:
         value = os.getenv("QQOKX_PRIVATE_WS_ENABLED", "1").strip().lower()
         return value not in {"0", "false", "no", "off"}
+
+    def _public_ws_enabled(self) -> bool:
+        value = os.getenv("QQOKX_PUBLIC_WS_ENABLED", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _public_ws_connection_for(self, *, environment: str) -> OkxPublicWsConnection | None:
+        if not self._public_ws_enabled():
+            return None
+        key = environment.strip().lower() or "demo"
+        with self._public_ws_lock:
+            connection = self._public_ws_connections.get(key)
+            if connection is None:
+                connection = OkxPublicWsConnection(environment=key, logger=self._logger)
+                self._public_ws_connections[key] = connection
+            try:
+                connection.start()
+            except OkxPublicWsConnectionUnavailable as exc:
+                if key not in self._public_ws_error_once:
+                    self._logger(f"OKX 公共 WS 不可用，继续回退 REST：{exc}")
+                    self._public_ws_error_once.add(key)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                if key not in self._public_ws_error_once:
+                    self._logger(f"OKX 公共 WS 启动失败，继续回退 REST：{exc}")
+                    self._public_ws_error_once.add(key)
+                return None
+        return connection
 
     def _private_ws_connection_for(
         self,

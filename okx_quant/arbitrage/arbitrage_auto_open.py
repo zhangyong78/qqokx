@@ -44,6 +44,24 @@ class ArbitrageAutoOpenService:
         self._thread: threading.Thread | None = None
         self._session: ArbitrageAutoOpenSession | None = None
 
+    def _get_live_ticker(self, inst_id: str, *, environment: str):
+        ensure_watch = getattr(self._client, "ensure_public_ws_market_watch", None)
+        if callable(ensure_watch):
+            try:
+                ensure_watch(inst_id, environment=environment)
+            except Exception:
+                pass
+        get_cached = getattr(self._client, "get_cached_public_ticker", None)
+        if callable(get_cached):
+            try:
+                payload = get_cached(inst_id, environment=environment)
+            except Exception:
+                payload = None
+            if payload is not None:
+                _, ticker = payload
+                return ticker
+        return self._client.get_ticker(inst_id)
+
     @property
     def is_running(self) -> bool:
         with self._lock:
@@ -107,8 +125,8 @@ class ArbitrageAutoOpenService:
             session.status = "已停止"
 
     def _refresh_quote(self, session: ArbitrageAutoOpenSession) -> None:
-        spot_ticker = self._client.get_ticker(session.request.spot_inst_id)
-        deriv_ticker = self._client.get_ticker(session.request.derivative_inst_id)
+        spot_ticker = self._get_live_ticker(session.request.spot_inst_id, environment=session.runtime.environment)
+        deriv_ticker = self._get_live_ticker(session.request.derivative_inst_id, environment=session.runtime.environment)
         spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask)
         deriv_mid = mid_price(deriv_ticker.bid, deriv_ticker.ask)
         if spot_mid is None or deriv_mid is None or spot_mid <= 0:
@@ -124,8 +142,10 @@ class ArbitrageAutoOpenService:
 
     def _should_trigger(self, session: ArbitrageAutoOpenSession) -> bool:
         request = session.request
-        spot_ticker = self._client.get_ticker(request.spot_inst_id)
-        deriv_ticker = self._client.get_ticker(request.derivative_inst_id)
+        runtime = getattr(session, "runtime", None)
+        environment = getattr(runtime, "environment", "demo")
+        spot_ticker = self._get_live_ticker(request.spot_inst_id, environment=environment)
+        deriv_ticker = self._get_live_ticker(request.derivative_inst_id, environment=environment)
         spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask)
         deriv_mid = mid_price(deriv_ticker.bid, deriv_ticker.ask)
         if spot_mid is None or deriv_mid is None or spot_mid <= 0:

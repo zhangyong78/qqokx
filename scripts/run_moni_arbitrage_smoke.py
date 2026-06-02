@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import sys
 import time
 import traceback
 import threading
@@ -24,11 +23,10 @@ from okx_quant.arbitrage.position_ledger import find_ledger_entry, load_open_led
 from okx_quant.arbitrage_ui import (
     ArbitrageWindow,
     _build_spot_positions_from_account,
-    _pair_position_base_ccy,
     _pair_position_direction,
     _pair_spot_qty_from_derivative_qty,
 )
-from okx_quant.models import Credentials, Instrument
+from okx_quant.models import Credentials
 from okx_quant.okx_client import OkxRestClient, OkxPosition
 from okx_quant.persistence import load_credentials_snapshot
 from okx_quant.pricing import format_decimal, snap_to_increment
@@ -38,9 +36,16 @@ PROFILE_NAME = "moni"
 ENVIRONMENT = "demo"
 BASE_CCY = "BTC"
 SPOT_INST_ID = "BTC-USDT"
-DERIVATIVE_INST_ID = "BTC-USD-260626"
+OPEN_DERIVATIVE_INST_ID = "BTC-USDT-260626"
+PAIR_CLOSE_DERIVATIVE_INST_ID = "BTC-USD-260626"
 MAX_SLIPPAGE = Decimal("0.0015")
 REPORT_PATH = Path("D:/qqokx/reports/arbitrage_moni_test_report.html")
+
+EXECUTION_MODES: list[tuple[str, str]] = [
+    ("双腿吃单", "dual_taker"),
+    ("现货挂单/合约吃单", "spot_maker_derivative_taker"),
+    ("合约挂单/现货吃单", "derivative_maker_spot_taker"),
+]
 
 
 class _Var:
@@ -78,122 +83,145 @@ class HtmlReport:
         self.sections.append((title, rows))
 
     def save(self, path: Path, *, started_at: str, finished_at: str) -> None:
-        blocks = []
+        blocks: list[str] = []
         for section_title, rows in self.sections:
-            row_html = []
+            cards: list[str] = []
             for row in rows:
-                status = "通过" if row.success else "失败"
-                cls = "ok" if row.success else "bad"
-                row_html.append(
-                    "<article class='row'>"
-                    f"<div class='head'><h3>{html.escape(row.title)}</h3><span class='{cls}'>{status}</span></div>"
+                status_text = "通过" if row.success else "失败"
+                status_class = "ok" if row.success else "bad"
+                cards.append(
+                    "<article class='card'>"
+                    f"<div class='head'><h3>{html.escape(row.title)}</h3>"
+                    f"<span class='status {status_class}'>{status_text}</span></div>"
                     f"<pre>{html.escape(row.details)}</pre>"
                     "</article>"
                 )
             blocks.append(
                 "<section class='section'>"
                 f"<h2>{html.escape(section_title)}</h2>"
-                + "".join(row_html)
-                + "</section>"
+                f"<div class='grid'>{''.join(cards)}</div>"
+                "</section>"
             )
+
         content = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>moni 套利测试报告</title>
+  <title>moni 账户套利测试报告</title>
   <style>
+    :root {{
+      --bg: #f5f7fb;
+      --paper: rgba(255, 255, 255, 0.96);
+      --ink: #1f2937;
+      --muted: #6b7280;
+      --line: #dde5ef;
+      --ok: #166534;
+      --ok-bg: #dcfce7;
+      --bad: #991b1b;
+      --bad-bg: #fee2e2;
+      --info: #075985;
+      --info-bg: #e0f2fe;
+      --shadow: 0 18px 40px rgba(31, 41, 55, 0.08);
+    }}
+    * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      font-family: "Microsoft YaHei UI", sans-serif;
-      background: linear-gradient(180deg, #f4f7fb, #eef4f1);
-      color: #17212b;
+      font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top right, rgba(59, 130, 246, 0.08), transparent 26%),
+        radial-gradient(circle at left 20%, rgba(16, 185, 129, 0.08), transparent 22%),
+        var(--bg);
+      line-height: 1.65;
     }}
     .page {{
-      max-width: 1180px;
+      max-width: 1220px;
       margin: 0 auto;
       padding: 28px 18px 60px;
     }}
     .hero, .section {{
-      background: rgba(255,255,255,0.94);
-      border: 1px solid #d8e1ea;
-      border-radius: 22px;
-      box-shadow: 0 18px 40px rgba(23, 33, 43, 0.08);
-      padding: 22px 24px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      padding: 24px 26px;
       margin-bottom: 18px;
     }}
     .hero h1 {{
-      margin: 0 0 10px;
-      font-size: 34px;
+      margin: 0;
+      font-size: 36px;
+      line-height: 1.2;
     }}
     .hero p {{
-      margin: 6px 0;
-      color: #536171;
+      margin: 10px 0 0;
+      color: var(--muted);
     }}
-    .meta {{
+    .chips {{
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      margin-top: 14px;
+      margin-top: 16px;
     }}
     .chip {{
       padding: 8px 12px;
       border-radius: 999px;
-      background: #e8f6f1;
-      color: #0f766e;
       font-size: 13px;
       font-weight: 700;
+      background: var(--info-bg);
+      color: var(--info);
     }}
     .section h2 {{
       margin: 0 0 12px;
-      font-size: 22px;
+      font-size: 24px;
     }}
-    .row {{
-      border-top: 1px solid #e7edf3;
-      padding-top: 14px;
-      margin-top: 14px;
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 16px;
     }}
-    .row:first-of-type {{
-      border-top: 0;
-      padding-top: 0;
-      margin-top: 0;
+    .card {{
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+      background: #fff;
     }}
     .head {{
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 12px;
-      margin-bottom: 8px;
+      margin-bottom: 10px;
     }}
-    h3 {{
+    .card h3 {{
       margin: 0;
-      font-size: 17px;
+      font-size: 18px;
     }}
-    .ok, .bad {{
+    .status {{
       display: inline-block;
       padding: 6px 10px;
       border-radius: 999px;
       font-size: 12px;
       font-weight: 700;
     }}
-    .ok {{
-      color: #166534;
-      background: #dcfce7;
-    }}
-    .bad {{
-      color: #991b1b;
-      background: #fee2e2;
-    }}
+    .ok {{ color: var(--ok); background: var(--ok-bg); }}
+    .bad {{ color: var(--bad); background: var(--bad-bg); }}
     pre {{
+      margin: 0;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid #e9eef5;
+      background: #f8fafc;
       white-space: pre-wrap;
       word-break: break-word;
-      background: #f7fafc;
-      border: 1px solid #e6edf5;
-      border-radius: 14px;
-      padding: 14px;
-      margin: 0;
       font-size: 13px;
       line-height: 1.6;
+    }}
+    @media (max-width: 920px) {{
+      .grid {{
+        grid-template-columns: 1fr;
+      }}
     }}
   </style>
 </head>
@@ -202,12 +230,13 @@ class HtmlReport:
     <section class="hero">
       <h1>moni 账户套利功能测试报告</h1>
       <p>账户：<strong>{PROFILE_NAME}</strong> | 环境：<strong>{ENVIRONMENT}</strong></p>
-      <p>测试范围：机会扫描、套利开仓三种数量单位、套利平仓、自动开平仓脚本、持仓配对平仓手动/自动链路。</p>
-      <div class="meta">
+      <p>覆盖范围：机会扫描、套利开仓三种数量单位、三种执行方式、套利平仓、自动开平仓、持仓配对平仓手动/自动链路。</p>
+      <div class="chips">
         <span class="chip">开始：{html.escape(started_at)}</span>
         <span class="chip">结束：{html.escape(finished_at)}</span>
-        <span class="chip">现货：{SPOT_INST_ID}</span>
-        <span class="chip">合约：{DERIVATIVE_INST_ID}</span>
+        <span class="chip">开平仓现货：{SPOT_INST_ID}</span>
+        <span class="chip">套利开平仓合约：{OPEN_DERIVATIVE_INST_ID}</span>
+        <span class="chip">配对平仓合约：{PAIR_CLOSE_DERIVATIVE_INST_ID}</span>
       </div>
     </section>
     {''.join(blocks)}
@@ -257,9 +286,9 @@ def account_spot_positions(client: OkxRestClient, runtime: ArbitrageTradeRuntime
     return _build_spot_positions_from_account(overview, client)
 
 
-def current_spread_abs(client: OkxRestClient) -> Decimal:
+def current_spread_abs(client: OkxRestClient, derivative_inst_id: str) -> Decimal:
     spot = client.get_ticker(SPOT_INST_ID)
-    derivative = client.get_ticker(DERIVATIVE_INST_ID)
+    derivative = client.get_ticker(derivative_inst_id)
     spot_mid = mid_price(spot.bid, spot.ask)
     derivative_mid = mid_price(derivative.bid, derivative.ask)
     if spot_mid is None or derivative_mid is None:
@@ -267,11 +296,19 @@ def current_spread_abs(client: OkxRestClient) -> Decimal:
     return derivative_mid - spot_mid
 
 
-def make_open_request(size: Decimal, unit: str) -> ArbitrageOpenRequest:
+def make_open_request(
+    size: Decimal,
+    unit: str,
+    *,
+    derivative_inst_id: str = OPEN_DERIVATIVE_INST_ID,
+    execution_mode: str = "dual_taker",
+    maker_wait_seconds: float = 4.0,
+    chase_limit: int = 2,
+) -> ArbitrageOpenRequest:
     return ArbitrageOpenRequest(
         base_ccy=BASE_CCY,
         spot_inst_id=SPOT_INST_ID,
-        derivative_inst_id=DERIVATIVE_INST_ID,
+        derivative_inst_id=derivative_inst_id,
         size=size,
         size_unit=unit,
         trigger_mode="spread_abs",
@@ -281,6 +318,28 @@ def make_open_request(size: Decimal, unit: str) -> ArbitrageOpenRequest:
         derivative_limit_price=None,
         use_limit_orders=False,
         max_slippage=MAX_SLIPPAGE,
+        execution_mode=execution_mode,
+        maker_wait_seconds=maker_wait_seconds,
+        chase_limit=chase_limit,
+    )
+
+
+def make_close_request(
+    entry_id: str,
+    *,
+    execution_mode: str = "dual_taker",
+    maker_wait_seconds: float = 4.0,
+    chase_limit: int = 2,
+    close_derivative_qty: Decimal | None = None,
+) -> ArbitrageCloseRequest:
+    return ArbitrageCloseRequest(
+        entry_id=entry_id,
+        max_slippage=MAX_SLIPPAGE,
+        use_limit_orders=False,
+        execution_mode=execution_mode,
+        maker_wait_seconds=maker_wait_seconds,
+        chase_limit=chase_limit,
+        close_derivative_qty=close_derivative_qty,
     )
 
 
@@ -307,19 +366,36 @@ def open_and_close_manual(
     title: str,
     size: Decimal,
     unit: str,
+    derivative_inst_id: str = OPEN_DERIVATIVE_INST_ID,
+    open_execution_mode: str = "dual_taker",
+    close_execution_mode: str = "dual_taker",
 ) -> StepResult:
     try:
-        request = make_open_request(size, unit)
-        preview = manager.preview_size(base_ccy=BASE_CCY, derivative_inst_id=DERIVATIVE_INST_ID, size=size, unit=unit)  # type: ignore[arg-type]
+        request = make_open_request(size, unit, derivative_inst_id=derivative_inst_id, execution_mode=open_execution_mode)
+        preview = manager.preview_size(
+            base_ccy=BASE_CCY,
+            derivative_inst_id=derivative_inst_id,
+            size=size,
+            unit=unit,
+        )
         opened = manager.open_now(request, runtime=runtime)
-        if not opened.success:
-            return StepResult(title, False, f"开仓失败\npreview_spot={preview.spot_base_qty}\npreview_contracts={preview.swap_contracts}\nmessage={opened.message}")
+        if not opened.success or not opened.ledger_entry_id:
+            return StepResult(
+                title,
+                False,
+                "\n".join(
+                    [
+                        f"size={size} | unit={unit}",
+                        f"derivative_inst={derivative_inst_id}",
+                        f"open_execution_mode={open_execution_mode}",
+                        f"preview_spot={format_decimal(preview.spot_base_qty)}",
+                        f"preview_contracts={format_decimal(preview.swap_contracts)}",
+                        f"message={opened.message}",
+                    ]
+                ),
+            )
         close_result = manager.close_now(
-            ArbitrageCloseRequest(
-                entry_id=opened.ledger_entry_id,
-                max_slippage=MAX_SLIPPAGE,
-                use_limit_orders=False,
-            ),
+            make_close_request(opened.ledger_entry_id, execution_mode=close_execution_mode),
             runtime=runtime,
         )
         return StepResult(
@@ -328,6 +404,9 @@ def open_and_close_manual(
             "\n".join(
                 [
                     f"size={size} | unit={unit}",
+                    f"derivative_inst={derivative_inst_id}",
+                    f"open_execution_mode={open_execution_mode}",
+                    f"close_execution_mode={close_execution_mode}",
                     f"preview_spot={format_decimal(preview.spot_base_qty)}",
                     f"preview_contracts={format_decimal(preview.swap_contracts)}",
                     f"open_success={opened.success}",
@@ -342,9 +421,14 @@ def open_and_close_manual(
         return StepResult(title, False, f"{exc}\n\n{traceback.format_exc()}")
 
 
-def test_manual_partial_close(manager: ArbitrageManager, runtime: ArbitrageTradeRuntime) -> StepResult:
+def test_manual_partial_close(
+    manager: ArbitrageManager,
+    runtime: ArbitrageTradeRuntime,
+    *,
+    derivative_inst_id: str = OPEN_DERIVATIVE_INST_ID,
+) -> StepResult:
     try:
-        opened = manager.open_now(make_open_request(Decimal("6"), "contracts"), runtime=runtime)
+        opened = manager.open_now(make_open_request(Decimal("6"), "contracts", derivative_inst_id=derivative_inst_id), runtime=runtime)
         if not opened.success or not opened.ledger_entry_id:
             return StepResult("套利平仓：部分平仓", False, f"建测试仓失败：{opened.message}")
         entry = find_ledger_entry(opened.ledger_entry_id)
@@ -352,29 +436,18 @@ def test_manual_partial_close(manager: ArbitrageManager, runtime: ArbitrageTrade
             return StepResult("套利平仓：部分平仓", False, "开仓成功但账本找不到记录。")
         partial_qty = snap_to_increment(entry.derivative_qty / Decimal("2"), Decimal("0.1"), "down")
         partial = manager.close_now(
-            ArbitrageCloseRequest(
-                entry_id=entry.entry_id,
-                max_slippage=MAX_SLIPPAGE,
-                use_limit_orders=False,
-                close_derivative_qty=partial_qty,
-            ),
+            make_close_request(entry.entry_id, close_derivative_qty=partial_qty),
             runtime=runtime,
         )
         remaining_entry = find_ledger_entry(entry.entry_id)
-        final_close = manager.close_now(
-            ArbitrageCloseRequest(
-                entry_id=entry.entry_id,
-                max_slippage=MAX_SLIPPAGE,
-                use_limit_orders=False,
-            ),
-            runtime=runtime,
-        )
+        final_close = manager.close_now(make_close_request(entry.entry_id), runtime=runtime)
         return StepResult(
             "套利平仓：部分平仓",
             partial.success and final_close.success,
             "\n".join(
                 [
                     f"entry_id={entry.entry_id}",
+                    f"derivative_inst={derivative_inst_id}",
                     f"initial_derivative_qty={format_decimal(entry.derivative_qty)}",
                     f"partial_qty={format_decimal(partial_qty)}",
                     f"partial_message={partial.message}",
@@ -391,13 +464,19 @@ def test_manual_partial_close(manager: ArbitrageManager, runtime: ArbitrageTrade
         return StepResult("套利平仓：部分平仓", False, f"{exc}\n\n{traceback.format_exc()}")
 
 
-def test_auto_open_close(manager: ArbitrageManager, client: OkxRestClient, runtime: ArbitrageTradeRuntime) -> StepResult:
+def test_auto_open_close(
+    manager: ArbitrageManager,
+    client: OkxRestClient,
+    runtime: ArbitrageTradeRuntime,
+    *,
+    derivative_inst_id: str = OPEN_DERIVATIVE_INST_ID,
+) -> StepResult:
     try:
-        spread_abs = current_spread_abs(client)
+        spread_abs = current_spread_abs(client, derivative_inst_id)
         request = ArbitrageOpenRequest(
             base_ccy=BASE_CCY,
             spot_inst_id=SPOT_INST_ID,
-            derivative_inst_id=DERIVATIVE_INST_ID,
+            derivative_inst_id=derivative_inst_id,
             size=Decimal("2"),
             size_unit="contracts",
             trigger_mode="spread_abs",
@@ -407,6 +486,9 @@ def test_auto_open_close(manager: ArbitrageManager, client: OkxRestClient, runti
             derivative_limit_price=None,
             use_limit_orders=False,
             max_slippage=MAX_SLIPPAGE,
+            execution_mode="dual_taker",
+            maker_wait_seconds=4.0,
+            chase_limit=2,
         )
         manager.start_auto_open(request, runtime=runtime)
         if not wait_for(lambda: manager.auto_open.session is not None and manager.auto_open.session.result is not None, timeout_seconds=150):
@@ -418,11 +500,7 @@ def test_auto_open_close(manager: ArbitrageManager, client: OkxRestClient, runti
         if open_result is None or not open_result.success or not open_result.ledger_entry_id:
             return StepResult("套利脚本：自动开平仓", False, f"自动开仓失败：{open_session.status}")
         manager.start_auto_close(
-            request=ArbitrageCloseRequest(
-                entry_id=open_result.ledger_entry_id,
-                max_slippage=MAX_SLIPPAGE,
-                use_limit_orders=False,
-            ),
+            request=make_close_request(open_result.ledger_entry_id),
             runtime=runtime,
             close_trigger_mode="spread_abs",
             close_spread_pct_min=None,
@@ -441,6 +519,7 @@ def test_auto_open_close(manager: ArbitrageManager, client: OkxRestClient, runti
             success,
             "\n".join(
                 [
+                    f"derivative_inst={derivative_inst_id}",
                     f"spread_abs_at_start={format_decimal(spread_abs)}",
                     f"auto_open_status={open_session.status}",
                     f"open_message={open_result.message}",
@@ -463,60 +542,91 @@ def test_auto_open_close(manager: ArbitrageManager, client: OkxRestClient, runti
             pass
 
 
-def place_raw_pair(client: OkxRestClient, runtime: ArbitrageTradeRuntime, contracts: Decimal) -> tuple[Decimal, Decimal]:
+def _submit_market_order(
+    client: OkxRestClient,
+    runtime: ArbitrageTradeRuntime,
+    *,
+    inst_id: str,
+    side: str,
+    size: Decimal,
+) -> None:
+    if size <= 0:
+        return
+    config = _build_strategy_config(inst_id, runtime)
+    order = client.place_simple_order(
+        runtime.credentials,
+        config,
+        inst_id=inst_id,
+        side=side,
+        size=size,
+        ord_type="market",
+    )
+    _wait_order_fill(
+        client,
+        credentials=runtime.credentials,
+        config=config,
+        inst_id=inst_id,
+        ord_id=order.ord_id,
+        expected_size=size,
+        logger=lambda _message: None,
+        label=f"cleanup {inst_id}",
+    )
+
+
+def cleanup_direct_positions(
+    client: OkxRestClient,
+    runtime: ArbitrageTradeRuntime,
+    *,
+    derivative_inst_ids: tuple[str, ...],
+) -> None:
+    positions = list(client.get_positions(runtime.credentials, environment=runtime.environment))
+    positions.extend(account_spot_positions(client, runtime))
+    for item in positions:
+        if item.inst_id == SPOT_INST_ID and item.inst_type == "SPOT":
+            if item.position > 0:
+                try:
+                    _submit_market_order(client, runtime, inst_id=SPOT_INST_ID, side="sell", size=item.position)
+                except Exception:
+                    pass
+            elif item.position < 0:
+                try:
+                    _submit_market_order(client, runtime, inst_id=SPOT_INST_ID, side="buy", size=abs(item.position))
+                except Exception:
+                    pass
+        if item.inst_id in derivative_inst_ids and item.inst_type in {"FUTURES", "SWAP"}:
+            qty = abs(item.avail_position or item.position)
+            if qty <= 0:
+                continue
+            side = "buy" if item.position < 0 else "sell"
+            try:
+                _submit_market_order(client, runtime, inst_id=item.inst_id, side=side, size=qty)
+            except Exception:
+                pass
+
+
+def place_raw_pair(
+    client: OkxRestClient,
+    runtime: ArbitrageTradeRuntime,
+    *,
+    derivative_inst_id: str,
+    contracts: Decimal,
+) -> tuple[Decimal, Decimal]:
     spot_inst = client.get_instrument(SPOT_INST_ID)
-    derivative_inst = client.get_instrument(DERIVATIVE_INST_ID)
+    derivative_inst = client.get_instrument(derivative_inst_id)
     spot_ticker = client.get_ticker(SPOT_INST_ID)
-    derivative_ticker = client.get_ticker(DERIVATIVE_INST_ID)
+    derivative_ticker = client.get_ticker(derivative_inst_id)
     spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask)
     derivative_mid = mid_price(derivative_ticker.bid, derivative_ticker.ask)
     if spot_mid is None or derivative_mid is None:
         raise RuntimeError("无法计算参考价格。")
-    reference_price = derivative_mid
     spot_qty = _pair_spot_qty_from_derivative_qty(
         contracts,
         spot_instrument=spot_inst,
         derivative_instrument=derivative_inst,
-        reference_price=reference_price,
+        reference_price=derivative_mid,
     )
-    spot_config = _build_strategy_config(SPOT_INST_ID, runtime)
-    derivative_config = _build_strategy_config(DERIVATIVE_INST_ID, runtime)
-    spot_order = client.place_simple_order(
-        runtime.credentials,
-        spot_config,
-        inst_id=SPOT_INST_ID,
-        side="buy",
-        size=spot_qty,
-        ord_type="market",
-    )
-    _wait_order_fill(
-        client,
-        credentials=runtime.credentials,
-        config=spot_config,
-        inst_id=SPOT_INST_ID,
-        ord_id=spot_order.ord_id,
-        expected_size=spot_qty,
-        logger=lambda _message: None,
-        label="raw spot open",
-    )
-    derivative_order = client.place_simple_order(
-        runtime.credentials,
-        derivative_config,
-        inst_id=DERIVATIVE_INST_ID,
-        side="sell",
-        size=contracts,
-        ord_type="market",
-    )
-    _wait_order_fill(
-        client,
-        credentials=runtime.credentials,
-        config=derivative_config,
-        inst_id=DERIVATIVE_INST_ID,
-        ord_id=derivative_order.ord_id,
-        expected_size=contracts,
-        logger=lambda _message: None,
-        label="raw derivative open",
-    )
+    _submit_market_order(client, runtime, inst_id=SPOT_INST_ID, side="buy", size=spot_qty)
+    _submit_market_order(client, runtime, inst_id=derivative_inst_id, side="sell", size=contracts)
     return contracts, spot_qty
 
 
@@ -563,14 +673,21 @@ def build_pair_close_harness(client: OkxRestClient, runtime: ArbitrageTradeRunti
     return harness
 
 
-def attach_live_pair_to_harness(harness, client: OkxRestClient, runtime: ArbitrageTradeRuntime, derivative_qty: Decimal) -> tuple[str, str]:
+def attach_live_pair_to_harness(
+    harness,
+    client: OkxRestClient,
+    runtime: ArbitrageTradeRuntime,
+    *,
+    derivative_inst_id: str,
+    derivative_qty: Decimal,
+) -> tuple[str, str]:
     positions = list(client.get_positions(runtime.credentials, environment=runtime.environment))
     positions.extend(account_spot_positions(client, runtime))
     spot_positions = [item for item in positions if item.inst_id == SPOT_INST_ID and item.inst_type == "SPOT" and item.position > 0]
     derivative_positions = [
         item
         for item in positions
-        if item.inst_id == DERIVATIVE_INST_ID and item.inst_type in {"FUTURES", "SWAP"} and item.position < 0
+        if item.inst_id == derivative_inst_id and item.inst_type in {"FUTURES", "SWAP"} and item.position < 0
     ]
     if not spot_positions or not derivative_positions:
         raise RuntimeError("没有找到可用于配对平仓测试的现货/合约持仓。")
@@ -579,7 +696,7 @@ def attach_live_pair_to_harness(harness, client: OkxRestClient, runtime: Arbitra
     harness._pair_close_positions = [spot_position, derivative_position]
     harness._pair_close_instruments = {
         SPOT_INST_ID: client.get_instrument(SPOT_INST_ID),
-        DERIVATIVE_INST_ID: client.get_instrument(DERIVATIVE_INST_ID),
+        derivative_inst_id: client.get_instrument(derivative_inst_id),
     }
     spot_label = "spot-test"
     derivative_label = "derivative-test"
@@ -593,11 +710,16 @@ def attach_live_pair_to_harness(harness, client: OkxRestClient, runtime: Arbitra
     return _pair_position_direction(spot_position), _pair_position_direction(derivative_position)
 
 
-def positions_for_instruments(client: OkxRestClient, runtime: ArbitrageTradeRuntime) -> list[str]:
+def positions_for_instruments(
+    client: OkxRestClient,
+    runtime: ArbitrageTradeRuntime,
+    *,
+    derivative_inst_ids: tuple[str, ...],
+) -> list[str]:
     positions = list(client.get_positions(runtime.credentials, environment=runtime.environment))
     rows = []
     for item in positions:
-        if item.inst_id in {SPOT_INST_ID, DERIVATIVE_INST_ID}:
+        if item.inst_id in set(derivative_inst_ids):
             rows.append(f"{item.inst_id} | pos={item.position} | avail={item.avail_position} | side={item.pos_side}")
     for item in account_spot_positions(client, runtime):
         if item.inst_id == SPOT_INST_ID:
@@ -605,55 +727,86 @@ def positions_for_instruments(client: OkxRestClient, runtime: ArbitrageTradeRunt
     return rows
 
 
-def test_pair_close_manual(client: OkxRestClient, runtime: ArbitrageTradeRuntime) -> StepResult:
+def test_pair_close_manual(
+    client: OkxRestClient,
+    runtime: ArbitrageTradeRuntime,
+    *,
+    execution_label: str,
+    execution_mode: str,
+    derivative_inst_id: str = PAIR_CLOSE_DERIVATIVE_INST_ID,
+) -> StepResult:
     try:
+        cleanup_direct_positions(client, runtime, derivative_inst_ids=(OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID))
         contracts = Decimal("4")
-        place_raw_pair(client, runtime, contracts)
+        place_raw_pair(client, runtime, derivative_inst_id=derivative_inst_id, contracts=contracts)
         harness = build_pair_close_harness(client, runtime)
-        spot_direction, derivative_direction = attach_live_pair_to_harness(harness, client, runtime, contracts)
+        harness.pair_close_execution_mode_label.set(execution_label)
+        spot_direction, derivative_direction = attach_live_pair_to_harness(
+            harness,
+            client,
+            runtime,
+            derivative_inst_id=derivative_inst_id,
+            derivative_qty=contracts,
+        )
         message = harness._execute_pair_close_batches(  # noqa: SLF001
             runtime,
             spot_inst_id=SPOT_INST_ID,
-            derivative_inst_id=DERIVATIVE_INST_ID,
+            derivative_inst_id=derivative_inst_id,
             spot_direction=spot_direction,
             derivative_direction=derivative_direction,
             total_derivative_qty=contracts,
             planned_batches=[Decimal("2"), Decimal("2")],
-            execution_mode="dual_taker",
+            execution_mode=execution_mode,
         )
-        remaining = positions_for_instruments(client, runtime)
+        remaining = positions_for_instruments(client, runtime, derivative_inst_ids=(derivative_inst_id,))
         return StepResult(
-            "持仓配对平仓：手动批次执行",
+            f"持仓配对平仓：手动批次执行 | {execution_label}",
             len(remaining) == 0,
             "\n".join(
                 [
                     f"open_contracts={format_decimal(contracts)}",
+                    f"derivative_inst={derivative_inst_id}",
                     message,
                     "remaining_positions=" + ("无" if not remaining else "; ".join(remaining)),
                 ]
             ),
         )
     except Exception as exc:
-        return StepResult("持仓配对平仓：手动批次执行", False, f"{exc}\n\n{traceback.format_exc()}")
+        return StepResult(f"持仓配对平仓：手动批次执行 | {execution_label}", False, f"{exc}\n\n{traceback.format_exc()}")
+    finally:
+        cleanup_direct_positions(client, runtime, derivative_inst_ids=(OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID))
 
 
-def test_pair_close_auto(client: OkxRestClient, runtime: ArbitrageTradeRuntime) -> StepResult:
+def test_pair_close_auto(
+    client: OkxRestClient,
+    runtime: ArbitrageTradeRuntime,
+    *,
+    derivative_inst_id: str = PAIR_CLOSE_DERIVATIVE_INST_ID,
+) -> StepResult:
     try:
+        cleanup_direct_positions(client, runtime, derivative_inst_ids=(OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID))
         contracts = Decimal("4")
-        place_raw_pair(client, runtime, contracts)
+        place_raw_pair(client, runtime, derivative_inst_id=derivative_inst_id, contracts=contracts)
         harness = build_pair_close_harness(client, runtime)
-        attach_live_pair_to_harness(harness, client, runtime, contracts)
-        harness.pair_close_spread_abs_min.set(format_decimal(current_spread_abs(client) + Decimal("20")))
+        attach_live_pair_to_harness(
+            harness,
+            client,
+            runtime,
+            derivative_inst_id=derivative_inst_id,
+            derivative_qty=contracts,
+        )
+        harness.pair_close_spread_abs_min.set(format_decimal(current_spread_abs(client, derivative_inst_id) + Decimal("20")))
         harness._start_pair_close_auto()  # noqa: SLF001
         if not wait_for(lambda: not harness._is_pair_close_auto_running(), timeout_seconds=150, interval_seconds=1.0):  # noqa: SLF001
             harness._stop_pair_close_auto(silent=True)  # noqa: SLF001
             return StepResult("持仓配对平仓：自动执行", False, "自动配对平仓线程超时未结束。")
-        remaining = positions_for_instruments(client, runtime)
+        remaining = positions_for_instruments(client, runtime, derivative_inst_ids=(derivative_inst_id,))
         return StepResult(
             "持仓配对平仓：自动执行",
             len(remaining) == 0,
             "\n".join(
                 [
+                    f"derivative_inst={derivative_inst_id}",
                     f"status={harness.pair_close_status_text.get()}",
                     "logs=",
                     *harness._append_log_records,
@@ -663,34 +816,50 @@ def test_pair_close_auto(client: OkxRestClient, runtime: ArbitrageTradeRuntime) 
         )
     except Exception as exc:
         return StepResult("持仓配对平仓：自动执行", False, f"{exc}\n\n{traceback.format_exc()}")
+    finally:
+        cleanup_direct_positions(client, runtime, derivative_inst_ids=(OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID))
 
 
 def cleanup_open_ledger(manager: ArbitrageManager, runtime: ArbitrageTradeRuntime) -> None:
     for entry in load_open_ledger_entries():
-        if entry.base_ccy != BASE_CCY or entry.derivative_inst_id != DERIVATIVE_INST_ID:
+        if entry.base_ccy != BASE_CCY or entry.derivative_inst_id not in {OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID}:
             continue
         try:
-            manager.close_now(
-                ArbitrageCloseRequest(
-                    entry_id=entry.entry_id,
-                    max_slippage=MAX_SLIPPAGE,
-                    use_limit_orders=False,
-                ),
-                runtime=runtime,
-            )
+            manager.close_now(make_close_request(entry.entry_id), runtime=runtime)
         except Exception:
             pass
+
+
+def execution_mode_rows(manager: ArbitrageManager, runtime: ArbitrageTradeRuntime) -> list[StepResult]:
+    rows: list[StepResult] = []
+    for label, mode in EXECUTION_MODES:
+        rows.append(
+            open_and_close_manual(
+                manager,
+                runtime,
+                title=f"执行方式={label}",
+                size=Decimal("2"),
+                unit="contracts",
+                derivative_inst_id=OPEN_DERIVATIVE_INST_ID,
+                open_execution_mode=mode,
+                close_execution_mode=mode,
+            )
+        )
+    return rows
 
 
 def main() -> int:
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     report = HtmlReport()
     client, manager, runtime = load_runtime()
+    cleanup_open_ledger(manager, runtime)
+    cleanup_direct_positions(client, runtime, derivative_inst_ids=(OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID))
     try:
         initial_positions, initial_labels = position_snapshot(client, runtime)
         snapshot_lines = [f"open_positions_count={len(initial_positions)}"]
         snapshot_lines.extend(initial_labels if initial_labels else ["当前没有衍生品持仓。"])
-        snapshot_lines.append(f"current_spread_abs={format_decimal(current_spread_abs(client))}")
+        snapshot_lines.append(f"current_spread_abs_open={format_decimal(current_spread_abs(client, OPEN_DERIVATIVE_INST_ID))}")
+        snapshot_lines.append(f"current_spread_abs_pair_close={format_decimal(current_spread_abs(client, PAIR_CLOSE_DERIVATIVE_INST_ID))}")
         report.add_section(
             "测试前状态",
             [
@@ -713,7 +882,7 @@ def main() -> int:
                         [f"机会数量={len(scan_rows)}"]
                         + [
                             f"{item.base_ccy} | {item.pair_kind_label} | {item.spot_inst_id} | {item.derivative_inst_id} | abs={format_decimal(item.basis_abs)} | net={format_decimal(item.net_annual_pct)}%"
-                            for item in scan_rows[:8]
+                            for item in scan_rows[:10]
                         ]
                     ),
                 )
@@ -727,6 +896,11 @@ def main() -> int:
                 open_and_close_manual(manager, runtime, title="投入数量=USDT金额", size=Decimal("150"), unit="usdt"),
                 open_and_close_manual(manager, runtime, title="投入数量=合约张数", size=Decimal("3"), unit="contracts"),
             ],
+        )
+
+        report.add_section(
+            "套利开平仓：三种执行方式",
+            execution_mode_rows(manager, runtime),
         )
 
         report.add_section(
@@ -746,12 +920,16 @@ def main() -> int:
         report.add_section(
             "持仓配对平仓",
             [
-                test_pair_close_manual(client, runtime),
+                *[
+                    test_pair_close_manual(client, runtime, execution_label=label, execution_mode=mode)
+                    for label, mode in EXECUTION_MODES
+                ],
                 test_pair_close_auto(client, runtime),
             ],
         )
     finally:
         cleanup_open_ledger(manager, runtime)
+        cleanup_direct_positions(client, runtime, derivative_inst_ids=(OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID))
     finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
     report.save(REPORT_PATH, started_at=started_at, finished_at=finished_at)

@@ -47,6 +47,24 @@ class ArbitrageAutoCloseService:
         self._thread: threading.Thread | None = None
         self._session: ArbitrageAutoCloseSession | None = None
 
+    def _get_live_ticker(self, inst_id: str, *, environment: str):
+        ensure_watch = getattr(self._client, "ensure_public_ws_market_watch", None)
+        if callable(ensure_watch):
+            try:
+                ensure_watch(inst_id, environment=environment)
+            except Exception:
+                pass
+        get_cached = getattr(self._client, "get_cached_public_ticker", None)
+        if callable(get_cached):
+            try:
+                payload = get_cached(inst_id, environment=environment)
+            except Exception:
+                payload = None
+            if payload is not None:
+                _, ticker = payload
+                return ticker
+        return self._client.get_ticker(inst_id)
+
     @property
     def is_running(self) -> bool:
         with self._lock:
@@ -134,8 +152,8 @@ class ArbitrageAutoCloseService:
         if entry is None:
             session.status = "没有可平仓持仓"
             return None, None
-        spot_ticker = self._client.get_ticker(entry.spot_inst_id)
-        deriv_ticker = self._client.get_ticker(entry.derivative_inst_id)
+        spot_ticker = self._get_live_ticker(entry.spot_inst_id, environment=session.runtime.environment)
+        deriv_ticker = self._get_live_ticker(entry.derivative_inst_id, environment=session.runtime.environment)
         spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask)
         deriv_mid = mid_price(deriv_ticker.bid, deriv_ticker.ask)
         if spot_mid is None or deriv_mid is None or spot_mid <= 0:

@@ -135,6 +135,40 @@ class OkxClientOrderRequestTest(TestCase):
         self.assertTrue(status["connected"])
         self.assertEqual(status["positions_version"], 7)
 
+    def test_get_cached_public_market_snapshots_use_ws_payloads(self) -> None:
+        client = OkxRestClient()
+
+        class _StubPublicWs:
+            def get_latest_ticker(self, inst_id: str):
+                return 5, {"instId": inst_id, "last": "70000", "bidPx": "69999", "askPx": "70001"}
+
+            def get_latest_order_book(self, inst_id: str):
+                return 6, {"bids": [["69999", "1.2"]], "asks": [["70001", "0.8"]]}
+
+        client._public_ws_connection_for = lambda **kwargs: _StubPublicWs()  # type: ignore[method-assign]
+
+        ticker_payload = client.get_cached_public_ticker("BTC-USDT-SWAP", environment="demo")
+        book_payload = client.get_cached_public_order_book("BTC-USDT-SWAP", environment="demo")
+
+        assert ticker_payload is not None
+        assert book_payload is not None
+        ticker_version, ticker = ticker_payload
+        book_version, book = book_payload
+        self.assertEqual(ticker_version, 5)
+        self.assertEqual(book_version, 6)
+        self.assertEqual(ticker.last, Decimal("70000"))
+        self.assertEqual(book.bids[0][0], Decimal("69999"))
+        self.assertEqual(book.asks[0][1], Decimal("0.8"))
+
+    def test_get_public_ws_debug_status_reports_disabled_mode(self) -> None:
+        client = OkxRestClient()
+
+        with patch.dict("os.environ", {"QQOKX_PUBLIC_WS_ENABLED": "0"}):
+            status = client.get_public_ws_debug_status(environment="live")
+
+        self.assertFalse(status["enabled"])
+        self.assertEqual(status["reason"], "disabled")
+
     def test_parse_order_result_merges_attach_algo_errors(self) -> None:
         client = OkxRestClient()
         payload = {

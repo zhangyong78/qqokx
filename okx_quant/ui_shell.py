@@ -3436,7 +3436,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         dir_names, file_names = _build_upgrade_copy_plan(source_root)
         running_sessions = [session for session in self.sessions.values() if session.engine.is_running]
         running_count = len(running_sessions)
-        migratable_count = sum(1 for session in running_sessions if session.recovery_supported)
+        migratable_count = sum(1 for session in running_sessions if self._session_can_auto_migrate_on_close(session))
         unsupported_count = max(0, running_count - migratable_count)
         source_version = _read_upgrade_candidate_version(source_root)
         message = _build_deploy_upgrade_confirmation_message(
@@ -3562,7 +3562,7 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
     def upgrade_program(self) -> None:
         running_sessions = [session for session in self.sessions.values() if session.engine.is_running]
         running_count = len(running_sessions)
-        migratable_count = sum(1 for session in running_sessions if session.recovery_supported)
+        migratable_count = sum(1 for session in running_sessions if self._session_can_auto_migrate_on_close(session))
         unsupported_count = max(0, running_count - migratable_count)
         message = _build_upgrade_confirmation_message(
             running_count=running_count,
@@ -3574,10 +3574,16 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         if not confirmed:
             return
         if migratable_count > 0:
-            session_labels = ", ".join(session.session_id for session in running_sessions if session.recovery_supported)
+            session_labels = ", ".join(
+                session.session_id for session in running_sessions if self._session_can_auto_migrate_on_close(session)
+            )
             self._enqueue_log(f"程序升级开始：准备迁移 {migratable_count} 条策略 -> {session_labels}")
         if unsupported_count > 0:
-            session_labels = ", ".join(session.session_id for session in running_sessions if not session.recovery_supported)
+            session_labels = ", ".join(
+                session.session_id
+                for session in running_sessions
+                if not self._session_can_auto_migrate_on_close(session)
+            )
             self._enqueue_log(f"程序升级提示：有 {unsupported_count} 条策略不支持自动迁移，升级后需要手工重启 -> {session_labels}")
         self._upgrade_worker_command_on_close = None
         self._restart_command_on_close = _build_app_restart_command()
@@ -11625,7 +11631,7 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         closed_at = datetime.now()
         for session in self.sessions.values():
             if session.status in {"运行中", "停止中"} or session.engine.is_running:
-                if session.recovery_supported:
+                if self._session_can_auto_migrate_on_close(session):
                     session.status = "待恢复"
                     session.runtime_status = "待恢复"
                     session.ended_reason = "应用关闭后待恢复接管"

@@ -2640,6 +2640,7 @@ class StrategyTradeTrackingTest(TestCase):
             _select_recoverable_live_position=lambda *_args, **_kwargs: None,
             _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
             _find_recoverable_protective_order=lambda *_args, **_kwargs: None,
+            _strategy_session_supports_position_recovery=lambda config: QuantApp._strategy_session_supports_position_recovery(config),
             _restart_recoverable_signal_monitoring=lambda session_, credentials_: QuantApp._restart_recoverable_signal_monitoring(
                 app,
                 session_,
@@ -2659,6 +2660,87 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertTrue(result)
         self.assertEqual(session.status, session.runtime_status)
         start_custom.assert_called_once()
+
+    def test_recover_session_restarts_idle_trade_even_with_local_tp_sl_mode(self) -> None:
+        session = self._make_session()
+        session.config.tp_sl_mode = "local"
+        session.active_trade = None
+        session.log_prefix = "[S01]"
+        start_custom = MagicMock()
+        session.engine = SimpleNamespace(
+            is_running=False,
+            start_custom=start_custom,
+            _run=MagicMock(),
+            _logger=MagicMock(),
+            _notify_error=MagicMock(),
+            _stop_event=SimpleNamespace(is_set=lambda: False, set=lambda: None),
+        )
+
+        credentials = SimpleNamespace(profile_name="moni")
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _recoverable_strategy_sessions={},
+            _build_recoverable_strategy_session_record=lambda _session: None,
+            _credentials_for_profile_or_none=lambda _api_name: credentials,
+            _restore_session_trade_runtime_from_log=lambda _session: None,
+            _find_recovery_claim_conflict=lambda session_id, trade: None,
+            _load_recoverable_live_positions=lambda *_args, **_kwargs: [],
+            _select_recoverable_live_position=lambda *_args, **_kwargs: None,
+            _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
+            _find_recoverable_protective_order=lambda *_args, **_kwargs: None,
+            _strategy_session_supports_position_recovery=lambda config: QuantApp._strategy_session_supports_position_recovery(config),
+            _restart_recoverable_signal_monitoring=lambda session_, credentials_: QuantApp._restart_recoverable_signal_monitoring(
+                app,
+                session_,
+                credentials_,
+            ),
+            _upsert_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _remove_recoverable_strategy_session=MagicMock(),
+            _log_session_message=MagicMock(),
+            _enqueue_log=MagicMock(),
+            root=SimpleNamespace(after=lambda _delay, callback: callback()),
+        )
+
+        result = QuantApp._recover_session(app, "S01", auto=False)
+
+        self.assertTrue(result)
+        self.assertEqual(session.status, session.runtime_status)
+        start_custom.assert_called_once()
+
+    def test_session_can_auto_migrate_on_close_only_allows_active_trade_for_exchange_mode(self) -> None:
+        idle_signal = self._make_session()
+        idle_signal.config.run_mode = "signal_only"
+        idle_signal.config.tp_sl_mode = "local"
+        idle_signal.active_trade = None
+        idle_signal.recovery_supported = True
+
+        active_local = self._make_session()
+        active_local.config.run_mode = "trade"
+        active_local.config.tp_sl_mode = "local"
+        active_local.active_trade = StrategyTradeRuntimeState(
+            round_id="S01-1",
+            opened_logged_at=datetime(2026, 4, 23, 8, 0, 0),
+        )
+        active_local.recovery_supported = True
+
+        active_exchange = self._make_session()
+        active_exchange.config.run_mode = "trade"
+        active_exchange.config.tp_sl_mode = "exchange"
+        active_exchange.active_trade = StrategyTradeRuntimeState(
+            round_id="S02-1",
+            opened_logged_at=datetime(2026, 4, 23, 8, 0, 0),
+        )
+        active_exchange.recovery_supported = True
+
+        app = SimpleNamespace(
+            _strategy_session_supports_position_recovery=lambda config: QuantApp._strategy_session_supports_position_recovery(config)
+        )
+
+        self.assertTrue(QuantApp._session_can_auto_migrate_on_close(app, idle_signal))
+        self.assertFalse(QuantApp._session_can_auto_migrate_on_close(app, active_local))
+        self.assertTrue(QuantApp._session_can_auto_migrate_on_close(app, active_exchange))
 
     def test_attempt_auto_restore_recoverable_sessions_logs_summary(self) -> None:
         running_session = self._make_session()

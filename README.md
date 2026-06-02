@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.08`
+当前版本：`v0.6.09`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -84,7 +84,7 @@ python main.py
 
 - `config/`：API 凭证、用户设置、通知配置
 - `cache/`：K 线缓存、Deribit 波动率缓存
-- `state/`：策略状态、回测历史、Smart Order 任务
+- `state/`：策略状态、回测历史、Smart Order 任务、可恢复会话注册表
 - `logs/`：运行日志与策略日志
 - `reports/`：研究导出、分析报告、实盘导出
 
@@ -92,6 +92,13 @@ python main.py
 
 - 首次启动会尝试迁移旧版 `.okx_quant_*` 文件以及原有 `logs/`、`reports/`
 - 升级时建议只替换代码目录，保留原 `qqokx_data/`
+
+升级恢复说明：
+
+- 程序关闭或升级重启后，空闲中的策略会话会优先按可恢复注册表自动拉起
+- `等待信号` / `signal_only` 这类未持仓的监听任务，重启后会继续恢复监听
+- 已有持仓或未完成挂单的会话，仅在当前模式支持安全接管时才自动恢复
+- 不满足安全接管条件的会话不会强行恢复持仓监控，避免升级后误接管
 
 ## API 与通知配置
 
@@ -115,11 +122,12 @@ python main.py
 - [okx_quant/ui_positions.py](/D:/qqokx/okx_quant/ui_positions.py)：账户持仓、历史成交、历史仓位与持仓 WS 缓存状态展示
 - [okx_quant/smart_order.py](/D:/qqokx/okx_quant/smart_order.py)：Smart Order 任务执行
 - [okx_quant/trader_desk.py](/D:/qqokx/okx_quant/trader_desk.py)：交易台能力
-- [okx_quant/arbitrage_ui.py](/D:/qqokx/okx_quant/arbitrage_ui.py)：现货套利窗口，包含机会扫描、套利开仓/平仓、持仓配对平仓、K 线图表与 API 切换
+- [okx_quant/arbitrage_ui.py](/D:/qqokx/okx_quant/arbitrage_ui.py)：现货套利窗口，包含机会扫描、套利开仓/平仓、交割合约移仓、持仓配对平仓、K 线图表与 API 切换
 - [okx_quant/arbitrage/arbitrage_manager.py](/D:/qqokx/okx_quant/arbitrage/arbitrage_manager.py)：套利扫描、开平仓、自动监控总入口
 - [okx_quant/arbitrage/arbitrage_executor.py](/D:/qqokx/okx_quant/arbitrage/arbitrage_executor.py)：套利开仓/平仓执行、部分平仓与成交回报校验
 - [okx_quant/arbitrage/arbitrage_scanner.py](/D:/qqokx/okx_quant/arbitrage/arbitrage_scanner.py)：现货 vs 永续 / 交割扫描、年化比较与类型标签生成
 - [okx_quant/okx_private_ws.py](/D:/qqokx/okx_quant/okx_private_ws.py)：OKX 私有 WebSocket 缓存层，当前用于订单、持仓、账户状态加速
+- [okx_quant/okx_public_ws.py](/D:/qqokx/okx_quant/okx_public_ws.py)：OKX 公共 WebSocket 行情缓存层，当前用于本地现货套利窗口双盘口实时刷新
 
 ### 回测与研究
 
@@ -164,9 +172,16 @@ python main.py
 4. 先点“刷新预览”确认现货腿、合约腿和名义价值，再根据需要选择：
    - “立即开仓”：手动执行一次
    - “启动自动开仓”：按设定价差持续监控并触发
+   - `分批次数 / 每批张数`：开仓会先换算总合约张数，再按这里拆批执行
+   - `双腿执行`：支持 `双腿吃单`、`现货挂单/合约吃单`、`合约挂单/现货吃单`
+   - `挂单等待 / 追单次数`：只在挂单腿 + 吃单腿模式下生效
 5. 开仓后可在“套利平仓”页基于套利账本做平仓；如果仓位不是本工具开的，去“持仓配对平仓”页，直接从当前账户持仓里选择 `现货腿 + 交割/永续腿` 配对平仓。
+   - `套利平仓` 现在也支持 `分批次数 / 每批张数`，会按你这次要平的总张数拆批执行
 6. “持仓配对平仓”支持手动平仓，也支持设置 `绝对价差 < 阈值` 自动平仓；还可以配置 `分批次数 / 每批张数 / 执行方式 / 挂单等待 / 追单次数`。
-7. 如果想观察两条腿走势，可在“套利图表”页加载 `现货 K 线`、`衍生品 K 线` 和 `绝对价差 K 线`。
+7. “交割移仓”页可以基于已有交割合约套利持仓，把旧交割合约回补掉，再开出更远的交割合约；现货腿不动，支持 `分批次数 / 每批张数 / 双腿吃单 / 一腿挂单一腿吃单`。
+8. “套利开仓 / 套利平仓 / 持仓配对平仓 / 交割移仓”都带双盘口，优先走 `公共 WS` 实时刷新，拿不到时会自动回退 `REST`。
+9. `自动开仓 / 自动平仓 / 自动配对平仓` 的价差判断现在也会优先使用 `公共 WS` 缓存行情，再回退到 `REST`。
+10. 如果想观察两条腿走势，可在“套利图表”页加载 `现货 K 线`、`衍生品 K 线` 和 `绝对价差 K 线`。
 
 更详细的字段说明和演示请直接打开 [reports/arbitrage_user_guide.html](/D:/qqokx/reports/arbitrage_user_guide.html)。
 
@@ -214,12 +229,13 @@ python -m py_compile D:\qqokx\okx_quant\arbitrage_ui.py D:\qqokx\okx_quant\okx_c
 | `QQOKX_READ_RETRY_BASE_DELAY_SECONDS` | `1.5` | 初始退避秒数 |
 | `QQOKX_READ_RETRY_MAX_DELAY_SECONDS` | `24` | 最大退避秒数 |
 | `QQOKX_PRIVATE_WS_ENABLED` | `1` | 是否启用 OKX 私有 WebSocket 加速订单/持仓/账户状态；设为 `0` 时完全回退 REST |
+| `QQOKX_PUBLIC_WS_ENABLED` | `1` | 是否启用 OKX 公共 WebSocket 加速本地套利窗口盘口；设为 `0` 时回退 REST 轮询 |
 
 当前推荐架构是：
 
 - `1H` 级主策略、K 线驱动、普通扫描：继续使用 `REST`
 - `订单状态 / 成交回报 / 持仓变化`：优先使用 `私有 WS`
-- `本地现货套利窗口盘口`：当前仍是 `REST 轮询`
+- `本地现货套利窗口盘口`：优先使用 `公共 WS`，失败时自动回退 `REST`
 
 这样可以尽量减少服务器端复杂度，同时把最有价值的“交易后状态”先提速。
 

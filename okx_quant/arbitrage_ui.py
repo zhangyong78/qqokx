@@ -5,17 +5,23 @@ import time
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 from tkinter import BooleanVar, Canvas, END, StringVar, Text, Toplevel
 from tkinter import messagebox, ttk
 from typing import Callable, Literal
 
 from okx_quant.arbitrage.basis_calculator import mid_price
-from okx_quant.arbitrage.arbitrage_executor import ArbitrageCloseRequest, ArbitrageOpenRequest, _wait_order_fill
+from okx_quant.arbitrage.arbitrage_executor import (
+    ArbitrageCloseRequest,
+    ArbitrageOpenRequest,
+    ArbitrageRollRequest,
+    _wait_order_fill,
+)
 from okx_quant.arbitrage.fill_reconciler import spot_base_from_derivative_fill
 from okx_quant.arbitrage.arbitrage_manager import ArbitrageManager
 from okx_quant.arbitrage.models import ArbitrageOpportunity, ArbitrageTradeRuntime
 from okx_quant.models import Candle, Credentials, Instrument, StrategyConfig
-from okx_quant.okx_client import OkxApiError, OkxOrderBook, OkxPosition, OkxTicker
+from okx_quant.okx_client import OkxApiError, OkxOrderBook, OkxPosition, OkxTicker, infer_inst_type
 from okx_quant.persistence import (
     DEFAULT_CREDENTIAL_PROFILE_NAME,
     load_arbitrage_settings_snapshot,
@@ -33,7 +39,8 @@ RuntimeConfigProvider = Callable[[], ArbitrageTradeRuntime | None]
 REFRESH_INTERVAL_MS = 5000
 MONITOR_UI_REFRESH_MS = 1000
 PAIR_CLOSE_MONITOR_POLL_SECONDS = 2.0
-MARKET_PANEL_REFRESH_MS = 1000
+MARKET_PANEL_WS_REFRESH_MS = 250
+MARKET_PANEL_REST_REFRESH_MS = 1000
 MARKET_PANEL_DEPTH = 10
 _CHART_BAR_OPTIONS = ("1m", "5m", "15m", "1H", "4H", "1D")
 _SIZE_UNIT_OPTIONS = {
@@ -54,6 +61,12 @@ _PAIR_CLOSE_EXECUTION_MODE_OPTIONS = {
     "双腿吃单": "dual_taker",
     "现货挂单/合约吃单": "spot_maker_derivative_taker",
     "合约挂单/现货吃单": "derivative_maker_spot_taker",
+}
+_ARBITRAGE_EXECUTION_MODE_OPTIONS = _PAIR_CLOSE_EXECUTION_MODE_OPTIONS
+_ROLL_EXECUTION_MODE_OPTIONS = {
+    "双腿吃单": "dual_taker",
+    "旧合约挂单/新合约吃单": "old_maker_new_taker",
+    "新合约挂单/旧合约吃单": "new_maker_old_taker",
 }
 
 
@@ -327,6 +340,54 @@ def _build_spot_positions_from_account(overview, client) -> list[OkxPosition]:
     return positions
 
 
+def _future_family_key(inst_id: str) -> str | None:
+    normalized = inst_id.strip().upper()
+    if infer_inst_type(normalized) != "FUTURES":
+        return None
+    parts = [part for part in normalized.split("-") if part]
+    if len(parts) < 3:
+        return None
+    expiry = parts[-1]
+    if len(expiry) != 6 or not expiry.isdigit():
+        return None
+    return "-".join(parts[:-1])
+
+
+def _future_expiry_code(inst_id: str) -> str | None:
+    normalized = inst_id.strip().upper()
+    if infer_inst_type(normalized) != "FUTURES":
+        return None
+    parts = [part for part in normalized.split("-") if part]
+    if len(parts) < 3:
+        return None
+    expiry = parts[-1]
+    if len(expiry) != 6 or not expiry.isdigit():
+        return None
+    return expiry
+
+
+def _roll_target_future_candidates(current_inst_id: str, instruments: list[Instrument]) -> list[str]:
+    current_family = _future_family_key(current_inst_id)
+    current_expiry = _future_expiry_code(current_inst_id)
+    if current_family is None or current_expiry is None:
+        return []
+    candidates: list[str] = []
+    for instrument in instruments:
+        inst_id = instrument.inst_id.strip().upper()
+        if inst_id == current_inst_id.strip().upper():
+            continue
+        if instrument.state and instrument.state.lower() not in {"live", "test"}:
+            continue
+        if _future_family_key(inst_id) != current_family:
+            continue
+        expiry = _future_expiry_code(inst_id)
+        if expiry is None or expiry <= current_expiry:
+            continue
+        candidates.append(inst_id)
+    candidates.sort(key=lambda item: (_future_expiry_code(item) or "", item))
+    return candidates
+
+
 def _pair_max_derivative_close_qty(
     spot_position: OkxPosition,
     derivative_position: OkxPosition,
@@ -566,6 +627,7 @@ class ArbitrageWindow:
         self._market_panel_job: str | None = None
         self._market_panel_refresh_busy = False
         self._market_panel_refresh_token = 0
+        self._market_panel_refresh_interval_ms = MARKET_PANEL_REST_REFRESH_MS
         self._opportunities: list[ArbitrageOpportunity] = []
         self._scan_display_rows: list[ArbitrageOpportunity] = []
         self._selected_opportunity: ArbitrageOpportunity | None = None
@@ -573,13 +635,18 @@ class ArbitrageWindow:
         self._ledger_entry_by_id: dict[str, object] = {}
         self._open_ledger_entries: list = []
         self._close_entry_display_to_id: dict[str, str] = {}
+        self._roll_entry_display_to_id: dict[str, str] = {}
         self._trade_tab = None
         self._close_tab = None
         self._chart_tab = None
         self._pair_close_tab = None
+        self._roll_tab = None
         self._derivative_inst_id = StringVar(value="")
         self._close_entry_label = StringVar(value="")
+        self._roll_entry_label = StringVar(value="")
         self.close_contract_qty = StringVar(value="")
+        self.roll_target_derivative_inst_id = StringVar(value="")
+        self.roll_contract_qty = StringVar(value="")
         self._chart_load_token = 0
         self._spot_chart_snapshot: StrategyLiveChartSnapshot | None = None
         self._derivative_chart_snapshot: StrategyLiveChartSnapshot | None = None
@@ -588,6 +655,13 @@ class ArbitrageWindow:
         self._pair_close_position_by_key: dict[str, OkxPosition] = {}
         self._pair_close_instruments: dict[str, Instrument] = {}
         self._pair_close_reference_prices: dict[str, Decimal] = {}
+        self._roll_positions: list[OkxPosition] = []
+        self._roll_position_by_key: dict[str, OkxPosition] = {}
+        self._roll_instruments: dict[str, Instrument] = {}
+        self._roll_reference_prices: dict[str, Decimal] = {}
+        self._roll_spot_by_base: dict[str, OkxPosition] = {}
+        self._roll_source_entry_id: str | None = None
+        self._roll_future_instruments: list[Instrument] = []
         self._pair_close_spot_key = StringVar(value="")
         self._pair_close_derivative_key = StringVar(value="")
         self.pair_close_derivative_qty = StringVar(value="")
@@ -598,6 +672,7 @@ class ArbitrageWindow:
         self._trade_market_panel: ArbitrageMarketPanel | None = None
         self._close_market_panel: ArbitrageMarketPanel | None = None
         self._pair_close_market_panel: ArbitrageMarketPanel | None = None
+        self._roll_market_panel: ArbitrageMarketPanel | None = None
 
         settings = load_arbitrage_settings_snapshot()
         profiles_snapshot = load_credentials_profiles_snapshot()
@@ -649,6 +724,21 @@ class ArbitrageWindow:
         )
         self.pair_close_batch_count = StringVar(value=str(settings.get("pair_close_batch_count", "1")))
         self.pair_close_batch_qty = StringVar(value=str(settings.get("pair_close_batch_qty", "")))
+        self.open_batch_count = StringVar(value=str(settings.get("open_batch_count", "1")))
+        self.open_batch_qty = StringVar(value=str(settings.get("open_batch_qty", "")))
+        self.open_execution_mode_label = StringVar(value=str(settings.get("open_execution_mode_label", "双腿吃单")))
+        self.open_maker_wait_seconds = StringVar(value=str(settings.get("open_maker_wait_seconds", "6")))
+        self.open_chase_limit = StringVar(value=str(settings.get("open_chase_limit", "3")))
+        self.close_batch_count = StringVar(value=str(settings.get("close_batch_count", "1")))
+        self.close_batch_qty = StringVar(value=str(settings.get("close_batch_qty", "")))
+        self.close_execution_mode_label = StringVar(value=str(settings.get("close_execution_mode_label", "双腿吃单")))
+        self.close_maker_wait_seconds = StringVar(value=str(settings.get("close_maker_wait_seconds", "6")))
+        self.close_chase_limit = StringVar(value=str(settings.get("close_chase_limit", "3")))
+        self.roll_batch_count = StringVar(value=str(settings.get("roll_batch_count", "1")))
+        self.roll_batch_qty = StringVar(value=str(settings.get("roll_batch_qty", "")))
+        self.roll_execution_mode_label = StringVar(value=str(settings.get("roll_execution_mode_label", "双腿吃单")))
+        self.roll_maker_wait_seconds = StringVar(value=str(settings.get("roll_maker_wait_seconds", "6")))
+        self.roll_chase_limit = StringVar(value=str(settings.get("roll_chase_limit", "3")))
         self.pair_close_execution_mode_label = StringVar(
             value=str(settings.get("pair_close_execution_mode_label", "双腿吃单"))
         )
@@ -656,6 +746,8 @@ class ArbitrageWindow:
         self.pair_close_chase_limit = StringVar(value=str(settings.get("pair_close_chase_limit", "3")))
         self.spot_limit_price = StringVar(value=str(settings.get("spot_limit_price", "")))
         self.derivative_limit_price = StringVar(value=str(settings.get("derivative_limit_price", "")))
+        self.roll_current_limit_price = StringVar(value=str(settings.get("roll_current_limit_price", "")))
+        self.roll_target_limit_price = StringVar(value=str(settings.get("roll_target_limit_price", "")))
         self.use_limit_orders = BooleanVar(value=bool(settings.get("use_limit_orders", False)))
         self.chart_bar = StringVar(value=str(settings.get("chart_bar", "15m")))
         self.chart_candle_limit = StringVar(value=str(settings.get("chart_candle_limit", "240")))
@@ -675,6 +767,9 @@ class ArbitrageWindow:
         self.preview_text = StringVar(value="选择机会或填写参数后，可预览现货/合约换算。")
         self.close_position_summary_text = StringVar(value="暂无未平仓套利持仓。")
         self.close_preview_text = StringVar(value="请先选择一条未平仓套利持仓。")
+        self.roll_position_summary_text = StringVar(value="请先选择一条未平仓交割合约持仓。")
+        self.roll_preview_text = StringVar(value="请选择当前交割合约持仓，并填写更远交割合约。")
+        self.roll_status_text = StringVar(value="尚未执行移仓。")
         self.chart_status_text = StringVar(value="选择现货/衍生品后加载 K 线。")
         self.spot_chart_status_text = StringVar(value="现货图未加载")
         self.derivative_chart_status_text = StringVar(value="衍生品图未加载")
@@ -775,11 +870,28 @@ class ArbitrageWindow:
                 "pair_close_spread_abs_min": self.pair_close_spread_abs_min.get().strip(),
                 "pair_close_batch_count": self.pair_close_batch_count.get().strip(),
                 "pair_close_batch_qty": self.pair_close_batch_qty.get().strip(),
+                "open_batch_count": self.open_batch_count.get().strip(),
+                "open_batch_qty": self.open_batch_qty.get().strip(),
+                "open_execution_mode_label": self.open_execution_mode_label.get().strip(),
+                "open_maker_wait_seconds": self.open_maker_wait_seconds.get().strip(),
+                "open_chase_limit": self.open_chase_limit.get().strip(),
+                "close_batch_count": self.close_batch_count.get().strip(),
+                "close_batch_qty": self.close_batch_qty.get().strip(),
+                "close_execution_mode_label": self.close_execution_mode_label.get().strip(),
+                "close_maker_wait_seconds": self.close_maker_wait_seconds.get().strip(),
+                "close_chase_limit": self.close_chase_limit.get().strip(),
+                "roll_batch_count": self.roll_batch_count.get().strip(),
+                "roll_batch_qty": self.roll_batch_qty.get().strip(),
+                "roll_execution_mode_label": self.roll_execution_mode_label.get().strip(),
+                "roll_maker_wait_seconds": self.roll_maker_wait_seconds.get().strip(),
+                "roll_chase_limit": self.roll_chase_limit.get().strip(),
                 "pair_close_execution_mode_label": self.pair_close_execution_mode_label.get().strip(),
                 "pair_close_maker_wait_seconds": self.pair_close_maker_wait_seconds.get().strip(),
                 "pair_close_chase_limit": self.pair_close_chase_limit.get().strip(),
                 "spot_limit_price": self.spot_limit_price.get().strip(),
                 "derivative_limit_price": self.derivative_limit_price.get().strip(),
+                "roll_current_limit_price": self.roll_current_limit_price.get().strip(),
+                "roll_target_limit_price": self.roll_target_limit_price.get().strip(),
                 "use_limit_orders": self.use_limit_orders.get(),
                 "chart_bar": self.chart_bar.get().strip(),
                 "chart_candle_limit": self.chart_candle_limit.get().strip(),
@@ -822,6 +934,7 @@ class ArbitrageWindow:
         self._build_chart_tab(notebook)
         self._build_trade_tab(notebook)
         self._build_pair_close_tab(notebook)
+        self._build_roll_tab(notebook)
         self._build_close_tab(notebook)
         self._build_ledger_tab(notebook)
         self._build_log_tab(notebook)
@@ -1168,10 +1281,43 @@ class ArbitrageWindow:
         ttk.Entry(exec_row, textvariable=self.max_slippage_percent, width=8).pack(side="left", padx=(4, 0))
         row += 1
 
+        ttk.Label(frame, text="分批执行").grid(row=row, column=0, sticky="w", pady=4)
+        batch_row = ttk.Frame(frame)
+        batch_row.grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Label(batch_row, text="分批次数").pack(side="left")
+        ttk.Entry(batch_row, textvariable=self.open_batch_count, width=6).pack(side="left", padx=(4, 10))
+        ttk.Label(batch_row, text="每批张数").pack(side="left")
+        ttk.Entry(batch_row, textvariable=self.open_batch_qty, width=8).pack(side="left", padx=(4, 0))
+        row += 1
+
         self._add_inline_hint(
             frame,
             row=row,
-            text="只想做“价差到位就进”时，限价条件通常可以留空；不勾“按限价挂单”会更偏向直接成交；最大滑点留默认 0.15 即可。",
+            text="开仓分批按合约张数拆分。数量单位就算选了币数或 USDT，系统也会先换算总张数，再按这里的分批次数或每批张数执行。",
+            wraplength=760,
+        )
+        row += 1
+
+        ttk.Label(frame, text="双腿执行").grid(row=row, column=0, sticky="w", pady=4)
+        dual_exec_row = ttk.Frame(frame)
+        dual_exec_row.grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Combobox(
+            dual_exec_row,
+            textvariable=self.open_execution_mode_label,
+            values=list(_ARBITRAGE_EXECUTION_MODE_OPTIONS.keys()),
+            state="readonly",
+            width=22,
+        ).pack(side="left")
+        ttk.Label(dual_exec_row, text="挂单等待(s)").pack(side="left", padx=(10, 0))
+        ttk.Entry(dual_exec_row, textvariable=self.open_maker_wait_seconds, width=6).pack(side="left", padx=(4, 10))
+        ttk.Label(dual_exec_row, text="追单次数").pack(side="left")
+        ttk.Entry(dual_exec_row, textvariable=self.open_chase_limit, width=6).pack(side="left", padx=(4, 0))
+        row += 1
+
+        self._add_inline_hint(
+            frame,
+            row=row,
+            text="想稳一点可以选“现货挂单/合约吃单”或“合约挂单/现货吃单”。挂单腿会等、会追；双腿吃单时仍按滑点控制，‘按限价挂单’主要作用在双腿吃单路径。",
             wraplength=760,
         )
         row += 1
@@ -1383,6 +1529,127 @@ class ArbitrageWindow:
             pady=(12, 0),
         )
 
+    def _build_roll_tab(self, notebook: ttk.Notebook) -> None:
+        frame = ttk.Frame(notebook, padding=12)
+        self._roll_tab = frame
+        notebook.add(frame, text="交割移仓")
+        frame.columnconfigure(1, weight=1)
+
+        row = 0
+        ttk.Label(frame, text="当前套利持仓").grid(row=row, column=0, sticky="w", pady=4)
+        select_row = ttk.Frame(frame)
+        select_row.grid(row=row, column=1, sticky="ew", pady=4)
+        self.roll_entry_combo = ttk.Combobox(
+            select_row,
+            textvariable=self._roll_entry_label,
+            state="readonly",
+            width=56,
+        )
+        self.roll_entry_combo.pack(side="left", fill="x", expand=True)
+        self.roll_entry_combo.bind("<<ComboboxSelected>>", self._on_roll_entry_selected)
+        ttk.Button(select_row, text="刷新当前持仓", command=self._refresh_roll_positions).pack(side="left", padx=(8, 0))
+        ttk.Button(select_row, text="带入账本选中", command=self._load_roll_from_ledger_selection).pack(side="left", padx=(8, 0))
+        ttk.Button(select_row, text="刷新持仓", command=self._reload_ledger).pack(side="left", padx=(8, 0))
+        row += 1
+
+        ttk.Label(frame, text="移仓概览").grid(row=row, column=0, sticky="nw", pady=4)
+        ttk.Label(frame, textvariable=self.roll_position_summary_text, wraplength=820, justify="left").grid(
+            row=row, column=1, sticky="w", pady=4
+        )
+        row += 1
+
+        ttk.Label(frame, text="目标交割合约").grid(row=row, column=0, sticky="w", pady=4)
+        target_row = ttk.Frame(frame)
+        target_row.grid(row=row, column=1, sticky="w", pady=4)
+        self.roll_target_derivative_combo = ttk.Combobox(
+            target_row,
+            textvariable=self.roll_target_derivative_inst_id,
+            state="readonly",
+            width=36,
+        )
+        self.roll_target_derivative_combo.pack(side="left")
+        self.roll_target_derivative_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_roll_preview())
+        ttk.Button(target_row, text="刷新目标", command=lambda: self._refresh_roll_target_options(fetch=True)).pack(side="left", padx=(8, 0))
+        row += 1
+
+        ttk.Label(frame, text="移仓数量").grid(row=row, column=0, sticky="w", pady=4)
+        qty_row = ttk.Frame(frame)
+        qty_row.grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Entry(qty_row, textvariable=self.roll_contract_qty, width=16).pack(side="left")
+        ttk.Label(qty_row, text="张").pack(side="left", padx=(6, 0))
+        ttk.Button(qty_row, text="最大", command=self._fill_roll_qty_with_max).pack(side="left", padx=(10, 0))
+        ttk.Button(qty_row, text="刷新预览", command=self._refresh_roll_preview).pack(side="left", padx=(8, 0))
+        row += 1
+
+        ttk.Label(frame, text="移仓预览").grid(row=row, column=0, sticky="nw", pady=(8, 4))
+        ttk.Label(frame, textvariable=self.roll_preview_text, wraplength=820, justify="left").grid(
+            row=row, column=1, sticky="w", pady=(8, 4)
+        )
+        row += 1
+
+        self._roll_market_panel = self._build_dual_market_panel(
+            frame,
+            row=row,
+            title="当前合约 / 目标合约盘口",
+            wraplength=920,
+        )
+        row += 1
+
+        ttk.Label(frame, text="执行方式").grid(row=row, column=0, sticky="w", pady=4)
+        exec_row = ttk.Frame(frame)
+        exec_row.grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(exec_row, text="按限价挂单", variable=self.use_limit_orders).pack(side="left", padx=(0, 12))
+        ttk.Label(exec_row, text="最大滑点(%)").pack(side="left")
+        ttk.Entry(exec_row, textvariable=self.max_slippage_percent, width=8).pack(side="left", padx=(4, 0))
+        row += 1
+
+        ttk.Label(frame, text="分批执行").grid(row=row, column=0, sticky="w", pady=4)
+        batch_row = ttk.Frame(frame)
+        batch_row.grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Label(batch_row, text="分批次数").pack(side="left")
+        ttk.Entry(batch_row, textvariable=self.roll_batch_count, width=6).pack(side="left", padx=(4, 10))
+        ttk.Label(batch_row, text="每批张数").pack(side="left")
+        ttk.Entry(batch_row, textvariable=self.roll_batch_qty, width=8).pack(side="left", padx=(4, 10))
+        ttk.Label(batch_row, text="执行方式").pack(side="left")
+        ttk.Combobox(
+            batch_row,
+            textvariable=self.roll_execution_mode_label,
+            values=list(_ROLL_EXECUTION_MODE_OPTIONS.keys()),
+            state="readonly",
+            width=22,
+        ).pack(side="left", padx=(4, 10))
+        ttk.Label(batch_row, text="挂单等待(s)").pack(side="left")
+        ttk.Entry(batch_row, textvariable=self.roll_maker_wait_seconds, width=6).pack(side="left", padx=(4, 10))
+        ttk.Label(batch_row, text="追单次数").pack(side="left")
+        ttk.Entry(batch_row, textvariable=self.roll_chase_limit, width=6).pack(side="left", padx=(4, 0))
+        row += 1
+
+        ttk.Label(frame, text="限价条件").grid(row=row, column=0, sticky="w", pady=4)
+        limit_row = ttk.Frame(frame)
+        limit_row.grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Label(limit_row, text="旧合约买入 ≤").pack(side="left")
+        ttk.Entry(limit_row, textvariable=self.roll_current_limit_price, width=12).pack(side="left", padx=(4, 12))
+        ttk.Label(limit_row, text="新合约卖出 ≥").pack(side="left")
+        ttk.Entry(limit_row, textvariable=self.roll_target_limit_price, width=12).pack(side="left", padx=(4, 0))
+        row += 1
+
+        self._add_inline_hint(
+            frame,
+            row=row,
+            text="移仓会保留现货腿不动，只做旧交割合约回补 + 新交割合约开出。分批、挂单等待、追单次数都按合约张数生效。",
+            wraplength=820,
+        )
+        row += 1
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=row, column=1, sticky="w", pady=(10, 4))
+        ttk.Button(btn_row, text="执行移仓", command=self._submit_roll).pack(side="left")
+        row += 1
+
+        ttk.Label(frame, textvariable=self.roll_status_text, wraplength=820, justify="left").grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(12, 0)
+        )
+
     def _build_close_tab(self, notebook: ttk.Notebook) -> None:
         frame = ttk.Frame(notebook, padding=12)
         self._close_tab = frame
@@ -1477,10 +1744,43 @@ class ArbitrageWindow:
         ttk.Entry(exec_row, textvariable=self.max_slippage_percent, width=8).pack(side="left", padx=(4, 0))
         row += 1
 
+        ttk.Label(frame, text="分批执行").grid(row=row, column=0, sticky="w", pady=4)
+        batch_row = ttk.Frame(frame)
+        batch_row.grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Label(batch_row, text="分批次数").pack(side="left")
+        ttk.Entry(batch_row, textvariable=self.close_batch_count, width=6).pack(side="left", padx=(4, 10))
+        ttk.Label(batch_row, text="每批张数").pack(side="left")
+        ttk.Entry(batch_row, textvariable=self.close_batch_qty, width=8).pack(side="left", padx=(4, 0))
+        row += 1
+
         self._add_inline_hint(
             frame,
             row=row,
-            text="想快一点平仓时，可以不勾“按限价挂单”，只保留滑点控制；最大滑点默认 0.15 通常够用。",
+            text="平仓分批也按合约张数拆。你在上面填的是本次总平仓数量，这里再决定它是一次性平掉，还是拆成多批慢慢平。",
+            wraplength=760,
+        )
+        row += 1
+
+        ttk.Label(frame, text="双腿执行").grid(row=row, column=0, sticky="w", pady=4)
+        dual_exec_row = ttk.Frame(frame)
+        dual_exec_row.grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Combobox(
+            dual_exec_row,
+            textvariable=self.close_execution_mode_label,
+            values=list(_ARBITRAGE_EXECUTION_MODE_OPTIONS.keys()),
+            state="readonly",
+            width=22,
+        ).pack(side="left")
+        ttk.Label(dual_exec_row, text="挂单等待(s)").pack(side="left", padx=(10, 0))
+        ttk.Entry(dual_exec_row, textvariable=self.close_maker_wait_seconds, width=6).pack(side="left", padx=(4, 10))
+        ttk.Label(dual_exec_row, text="追单次数").pack(side="left")
+        ttk.Entry(dual_exec_row, textvariable=self.close_chase_limit, width=6).pack(side="left", padx=(4, 0))
+        row += 1
+
+        self._add_inline_hint(
+            frame,
+            row=row,
+            text="平仓也可以让一腿先挂、另一腿再市价跟。双腿吃单时仍按滑点控制；挂单等待和追单次数主要在挂单/吃单模式下生效。",
             wraplength=760,
         )
         row += 1
@@ -1562,7 +1862,7 @@ class ArbitrageWindow:
     def _on_notebook_tab_changed(self, _event=None) -> None:
         self._schedule_market_panel_refresh(initial_delay_ms=50)
 
-    def _schedule_market_panel_refresh(self, *, initial_delay_ms: int = MARKET_PANEL_REFRESH_MS) -> None:
+    def _schedule_market_panel_refresh(self, *, initial_delay_ms: int | None = None) -> None:
         if self._destroying or not self.window.winfo_exists():
             return
         if self._market_panel_job is not None:
@@ -1571,7 +1871,7 @@ class ArbitrageWindow:
             except Exception:
                 pass
             self._market_panel_job = None
-        delay = max(int(initial_delay_ms), 50)
+        delay = self._market_panel_refresh_interval_ms if initial_delay_ms is None else max(int(initial_delay_ms), 50)
         self._market_panel_job = self.window.after(delay, self._run_market_panel_refresh)
 
     def _run_market_panel_refresh(self) -> None:
@@ -1598,10 +1898,10 @@ class ArbitrageWindow:
             name=f"market-panel-{context['panel_key']}",
             daemon=True,
         ).start()
-        self._schedule_market_panel_refresh()
 
     def _active_market_panel_context(self):
         current_tab = self._notebook.select()
+        environment = self._selected_api_environment()
         if self._trade_tab is not None and current_tab == str(self._trade_tab):
             panel = self._trade_market_panel
             base = self.base_ccy.get().strip().upper()
@@ -1612,6 +1912,7 @@ class ArbitrageWindow:
                 return panel, None, "请先选择或填写衍生品合约。"
             return panel, {
                 "panel_key": "trade",
+                "environment": environment,
                 "spot_inst_id": f"{base}-USDT",
                 "derivative_inst_id": derivative_inst_id,
                 "spot_side": "buy",
@@ -1625,6 +1926,7 @@ class ArbitrageWindow:
                 return panel, None, "请先选择一条未平仓套利持仓。"
             return panel, {
                 "panel_key": "close",
+                "environment": environment,
                 "spot_inst_id": entry.spot_inst_id,
                 "derivative_inst_id": entry.derivative_inst_id,
                 "spot_side": "sell",
@@ -1639,11 +1941,29 @@ class ArbitrageWindow:
             spot_position, derivative_position = selected
             return panel, {
                 "panel_key": "pair_close",
+                "environment": environment,
                 "spot_inst_id": spot_position.inst_id,
                 "derivative_inst_id": derivative_position.inst_id,
                 "spot_side": _pair_position_close_side(spot_position),
                 "derivative_side": _pair_position_close_side(derivative_position),
                 "detail_label": "配对平仓可执行价差",
+            }, ""
+        if self._roll_tab is not None and current_tab == str(self._roll_tab):
+            panel = self._roll_market_panel
+            entry = self._selected_roll_entry()
+            target_derivative_inst_id = self.roll_target_derivative_inst_id.get().strip().upper()
+            if entry is None:
+                return panel, None, "请先选择一条未平仓交割合约持仓。"
+            if not target_derivative_inst_id:
+                return panel, None, "请先填写更远交割合约。"
+            return panel, {
+                "panel_key": "roll",
+                "environment": environment,
+                "spot_inst_id": entry.derivative_inst_id,
+                "derivative_inst_id": target_derivative_inst_id,
+                "spot_side": "buy",
+                "derivative_side": "sell",
+                "detail_label": "移仓可执行价差",
             }, ""
         return None, None, ""
 
@@ -1658,14 +1978,53 @@ class ArbitrageWindow:
     def _fetch_market_panel_snapshot_worker(self, refresh_token: int, context) -> None:
         panel_key = str(context["panel_key"])
         try:
+            environment = str(context.get("environment") or "demo")
             spot_inst_id = str(context["spot_inst_id"])
             derivative_inst_id = str(context["derivative_inst_id"])
             spot_instrument = self._get_cached_market_instrument(spot_inst_id)
             derivative_instrument = self._get_cached_market_instrument(derivative_inst_id)
-            spot_ticker = self.client.get_ticker(spot_inst_id)
-            derivative_ticker = self.client.get_ticker(derivative_inst_id)
-            spot_order_book = self.client.get_order_book(spot_inst_id, depth=MARKET_PANEL_DEPTH)
-            derivative_order_book = self.client.get_order_book(derivative_inst_id, depth=MARKET_PANEL_DEPTH)
+            self.client.ensure_public_ws_market_watch(spot_inst_id, environment=environment)
+            self.client.ensure_public_ws_market_watch(derivative_inst_id, environment=environment)
+            spot_ticker_payload = self.client.get_cached_public_ticker(spot_inst_id, environment=environment)
+            derivative_ticker_payload = self.client.get_cached_public_ticker(derivative_inst_id, environment=environment)
+            spot_order_book_payload = self.client.get_cached_public_order_book(spot_inst_id, environment=environment)
+            derivative_order_book_payload = self.client.get_cached_public_order_book(derivative_inst_id, environment=environment)
+            using_public_ws = all(
+                payload is not None
+                for payload in (
+                    spot_ticker_payload,
+                    derivative_ticker_payload,
+                    spot_order_book_payload,
+                    derivative_order_book_payload,
+                )
+            )
+            if using_public_ws:
+                assert spot_ticker_payload is not None
+                assert derivative_ticker_payload is not None
+                assert spot_order_book_payload is not None
+                assert derivative_order_book_payload is not None
+                _, spot_ticker = spot_ticker_payload
+                _, derivative_ticker = derivative_ticker_payload
+                _, spot_order_book = spot_order_book_payload
+                _, derivative_order_book = derivative_order_book_payload
+                source_mode = "WS"
+                status_text = f"公共 WS 实时 | 最后更新：{time.strftime('%H:%M:%S')}"
+                refresh_interval_ms = MARKET_PANEL_WS_REFRESH_MS
+            else:
+                spot_ticker = self.client.get_ticker(spot_inst_id)
+                derivative_ticker = self.client.get_ticker(derivative_inst_id)
+                spot_order_book = self.client.get_order_book(spot_inst_id, depth=MARKET_PANEL_DEPTH)
+                derivative_order_book = self.client.get_order_book(derivative_inst_id, depth=MARKET_PANEL_DEPTH)
+                ws_status = self.client.get_public_ws_debug_status(environment=environment)
+                if ws_status.get("enabled") and ws_status.get("available"):
+                    source_note = "公共 WS 预热中，暂用 REST"
+                elif ws_status.get("enabled"):
+                    source_note = "公共 WS 不可用，已回退 REST"
+                else:
+                    source_note = "公共 WS 已关闭，使用 REST"
+                source_mode = "REST"
+                status_text = f"{source_note} | 最后更新：{time.strftime('%H:%M:%S')}"
+                refresh_interval_ms = MARKET_PANEL_REST_REFRESH_MS
 
             spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask) or spot_ticker.last
             derivative_mid = mid_price(derivative_ticker.bid, derivative_ticker.ask) or derivative_ticker.last
@@ -1693,48 +2052,58 @@ class ArbitrageWindow:
                 spread_text += " | 价差率：-"
             snapshot = {
                 "panel_key": panel_key,
-                "spot_title": f"{spot_inst_id} 盘口",
+                "spot_title": f"{spot_inst_id} 盘口 [{source_mode}]",
                 "spot_quote": (
                     f"价格({spot_quote_ccy}) / 数量({spot_base_ccy}) | "
                     f"最新 {format_decimal(spot_ticker.last) if spot_ticker.last is not None else '-'} | "
                     f"买一 {format_decimal(spot_ticker.bid) if spot_ticker.bid is not None else '-'} | "
                     f"卖一 {format_decimal(spot_ticker.ask) if spot_ticker.ask is not None else '-'}"
                 ),
-                "derivative_title": f"{derivative_inst_id} 盘口",
+                "derivative_title": f"{derivative_inst_id} 盘口 [{source_mode}]",
                 "derivative_quote": (
                     f"价格({derivative_quote_ccy}) / 数量({derivative_base_ccy}) | "
                     f"最新 {format_decimal(derivative_ticker.last) if derivative_ticker.last is not None else '-'} | "
                     f"买一 {format_decimal(derivative_ticker.bid) if derivative_ticker.bid is not None else '-'} | "
                     f"卖一 {format_decimal(derivative_ticker.ask) if derivative_ticker.ask is not None else '-'}"
                 ),
-                "spread_text": spread_text,
+                "spread_text": f"[{source_mode}] {spread_text}",
                 "detail_text": (
                     f"{context['detail_label']}：{format_decimal(actionable_abs) if actionable_abs is not None else '-'}"
                     f" | 现货 {context['spot_side']} / 合约 {context['derivative_side']}"
                 ),
-                "status_text": f"最后更新：{time.strftime('%H:%M:%S')}",
+                "status_text": status_text,
                 "spot_rows": _market_depth_rows(spot_order_book, instrument=spot_instrument),
                 "derivative_rows": _market_depth_rows(derivative_order_book, instrument=derivative_instrument),
                 "spot_headers": (f"价格({spot_quote_ccy})", f"数量({spot_base_ccy})"),
                 "derivative_headers": (f"价格({derivative_quote_ccy})", f"数量({derivative_base_ccy})"),
+                "refresh_interval_ms": refresh_interval_ms,
             }
         except Exception as exc:
-            snapshot = {"panel_key": panel_key, "error": str(exc)}
+            snapshot = {
+                "panel_key": panel_key,
+                "error": str(exc),
+                "refresh_interval_ms": MARKET_PANEL_REST_REFRESH_MS,
+            }
 
         def _apply() -> None:
             if self._destroying or not self.window.winfo_exists():
                 return
             if refresh_token != self._market_panel_refresh_token:
                 self._market_panel_refresh_busy = False
+                self._schedule_market_panel_refresh()
                 return
             self._market_panel_refresh_busy = False
+            self._market_panel_refresh_interval_ms = int(snapshot.get("refresh_interval_ms", MARKET_PANEL_REST_REFRESH_MS))
             panel = self._panel_for_key(panel_key)
             if panel is None:
+                self._schedule_market_panel_refresh()
                 return
             if "error" in snapshot:
                 self._clear_market_panel(panel, message=f"盘口刷新失败：{snapshot['error']}")
+                self._schedule_market_panel_refresh()
                 return
             self._apply_market_panel_snapshot(panel, snapshot)
+            self._schedule_market_panel_refresh()
 
         try:
             self.window.after(0, _apply)
@@ -1823,6 +2192,10 @@ class ArbitrageWindow:
             return self._api_profile_names[0]
         return DEFAULT_CREDENTIAL_PROFILE_NAME
 
+    def _selected_api_environment(self) -> str:
+        profile_snapshot = load_credentials_snapshot(profile_name=self._selected_api_profile_name())
+        return _credential_profile_environment(profile_snapshot, fallback="demo")
+
     def _sync_api_profile_controls(self) -> None:
         snapshot = load_credentials_profiles_snapshot()
         self._api_profile_names = _credential_profile_names_from_snapshot(snapshot)
@@ -1856,6 +2229,27 @@ class ArbitrageWindow:
         if self._pair_close_market_panel is not None:
             self._clear_market_panel(self._pair_close_market_panel, message="请先刷新并选择一组当前持仓。")
 
+    def _clear_roll_selection(self) -> None:
+        self._roll_positions = []
+        self._roll_position_by_key = {}
+        self._roll_instruments = {}
+        self._roll_reference_prices = {}
+        self._roll_spot_by_base = {}
+        self._roll_source_entry_id = None
+        self._roll_future_instruments = []
+        self._roll_entry_label.set("")
+        self.roll_target_derivative_inst_id.set("")
+        self.roll_contract_qty.set("")
+        if hasattr(self, "roll_entry_combo"):
+            self.roll_entry_combo.configure(values=())
+        if hasattr(self, "roll_target_derivative_combo"):
+            self.roll_target_derivative_combo.configure(values=())
+        self.roll_position_summary_text.set("请先刷新并选择一条当前交割合约持仓。")
+        self.roll_preview_text.set("请选择当前交割合约持仓，并填写更远交割合约。")
+        self.roll_status_text.set("已切换 API，请重新刷新当前持仓。")
+        if self._roll_market_panel is not None:
+            self._clear_market_panel(self._roll_market_panel, message="请先刷新并选择一条当前交割合约持仓。")
+
     def _on_api_profile_selected(self, _event=None) -> None:
         selected = self.api_profile_name.get().strip()
         if not selected:
@@ -1872,7 +2266,8 @@ class ArbitrageWindow:
         current = self._selected_api_profile_name()
         self.status_text.set(f"API 已切换：{current} | {self.api_environment_text.get()}")
         self._clear_pair_close_selection()
-        for panel in (self._trade_market_panel, self._close_market_panel, self._pair_close_market_panel):
+        self._clear_roll_selection()
+        for panel in (self._trade_market_panel, self._close_market_panel, self._pair_close_market_panel, self._roll_market_panel):
             if panel is not None:
                 self._clear_market_panel(panel, message="API 已切换，正在等待新的产品选择。")
         self._schedule_market_panel_refresh(initial_delay_ms=50)
@@ -1981,6 +2376,15 @@ class ArbitrageWindow:
 
     def _current_pair_close_execution_mode(self) -> str:
         return _PAIR_CLOSE_EXECUTION_MODE_OPTIONS.get(self.pair_close_execution_mode_label.get().strip(), "dual_taker")
+
+    def _current_open_execution_mode(self) -> str:
+        return _ARBITRAGE_EXECUTION_MODE_OPTIONS.get(self.open_execution_mode_label.get().strip(), "dual_taker")
+
+    def _current_close_execution_mode(self) -> str:
+        return _ARBITRAGE_EXECUTION_MODE_OPTIONS.get(self.close_execution_mode_label.get().strip(), "dual_taker")
+
+    def _current_roll_execution_mode(self) -> str:
+        return _ROLL_EXECUTION_MODE_OPTIONS.get(self.roll_execution_mode_label.get().strip(), "dual_taker")
 
     def _sync_spread_trigger_controls(self) -> None:
         open_mode = self._current_open_trigger_mode()
@@ -2273,6 +2677,580 @@ class ArbitrageWindow:
             return
         self._set_close_entry(entry.entry_id, fill_max=True, focus_tab=True)
 
+    def _selected_roll_entry_id(self) -> str | None:
+        return self._roll_entry_display_to_id.get(self._roll_entry_label.get().strip())
+
+    def _selected_roll_entry(self):
+        entry_id = self._selected_roll_entry_id()
+        if not entry_id:
+            return None
+        entry = self._ledger_entry_by_id.get(entry_id)
+        if entry is None or getattr(entry, "close_mode", "") != "open":
+            return None
+        return entry
+
+    def _refresh_roll_entry_options(self) -> None:
+        current_entry_id = self._selected_roll_entry_id()
+        candidates = [
+            item
+            for item in self._ledger_entries
+            if item.close_mode == "open" and infer_inst_type(item.derivative_inst_id) == "FUTURES"
+        ]
+        labels = [self._close_entry_option_label(item) for item in candidates]
+        self._roll_entry_display_to_id = {
+            label: entry.entry_id for label, entry in zip(labels, candidates, strict=False)
+        }
+        self.roll_entry_combo.configure(values=labels)
+        if not labels:
+            self._roll_entry_label.set("")
+            self.roll_contract_qty.set("")
+            self.roll_position_summary_text.set("暂无可移仓的交割合约套利持仓。")
+            self.roll_preview_text.set("请先开出或导入一条交割合约套利持仓。")
+            if self._roll_market_panel is not None:
+                self._clear_market_panel(self._roll_market_panel, message="暂无可移仓的交割合约套利持仓。")
+            return
+        target_entry_id = current_entry_id if current_entry_id in {item.entry_id for item in candidates} else candidates[0].entry_id
+        self._set_roll_entry(target_entry_id, fill_max=False, focus_tab=False)
+
+    def _set_roll_entry(self, entry_id: str, *, fill_max: bool, focus_tab: bool) -> None:
+        entry = self._ledger_entry_by_id.get(entry_id)
+        if entry is None or getattr(entry, "close_mode", "") != "open":
+            return
+        for label, mapped_entry_id in self._roll_entry_display_to_id.items():
+            if mapped_entry_id == entry_id:
+                self._roll_entry_label.set(label)
+                break
+        if fill_max or not self.roll_contract_qty.get().strip():
+            self.roll_contract_qty.set(format_decimal(entry.derivative_qty))
+        if focus_tab and self._roll_tab is not None:
+            self._notebook.select(self._roll_tab)
+        self._refresh_roll_preview()
+
+    def _on_roll_entry_selected(self, _event=None) -> None:
+        entry = self._selected_roll_entry()
+        if entry is None:
+            self.roll_position_summary_text.set("暂无可移仓的交割合约套利持仓。")
+            self.roll_preview_text.set("请先选择一条未平仓交割合约持仓。")
+            if self._roll_market_panel is not None:
+                self._clear_market_panel(self._roll_market_panel, message="请先选择一条未平仓交割合约持仓。")
+            return
+        if not self.roll_contract_qty.get().strip():
+            self.roll_contract_qty.set(format_decimal(entry.derivative_qty))
+        self._refresh_roll_preview()
+        self._schedule_market_panel_refresh(initial_delay_ms=50)
+
+    def _fill_roll_qty_with_max(self) -> None:
+        entry = self._selected_roll_entry()
+        if entry is None:
+            messagebox.showwarning("提示", "请先选择一条未平仓交割合约持仓。", parent=self.window)
+            return
+        self.roll_contract_qty.set(format_decimal(entry.derivative_qty))
+        self._refresh_roll_preview()
+
+    def _load_roll_from_ledger_selection(self) -> None:
+        entry = self._selected_ledger_entry()
+        if entry is None:
+            messagebox.showwarning("提示", "请先在账本中选择一条未平仓记录。", parent=self.window)
+            return
+        if infer_inst_type(entry.derivative_inst_id) != "FUTURES":
+            messagebox.showwarning("提示", "当前只支持交割合约移仓。", parent=self.window)
+            return
+        self._set_roll_entry(entry.entry_id, fill_max=True, focus_tab=True)
+
+    def _selected_roll_position(self) -> OkxPosition | None:
+        position = self._roll_position_by_key.get(self._roll_entry_label.get().strip())
+        return position if isinstance(position, OkxPosition) else None
+
+    def _selected_roll_positions(self) -> tuple[OkxPosition, OkxPosition] | None:
+        derivative_position = self._selected_roll_position()
+        if derivative_position is None:
+            return None
+        spot_position = self._roll_spot_by_base.get(_pair_position_base_ccy(derivative_position))
+        if not isinstance(spot_position, OkxPosition):
+            return None
+        return spot_position, derivative_position
+
+    def _roll_reference_price(self, position: OkxPosition, instrument: Instrument) -> Decimal | None:
+        reference_price = position.mark_price or position.last_price
+        if reference_price is not None and reference_price > 0:
+            return reference_price
+        cached = self._roll_reference_prices.get(instrument.inst_id)
+        if cached is not None and cached > 0:
+            return cached
+        return None
+
+    def _current_roll_source_entry(self, spot_position: OkxPosition, derivative_position: OkxPosition):
+        entry_id = self._roll_source_entry_id
+        if not entry_id:
+            return None
+        entry = self._ledger_entry_by_id.get(entry_id)
+        if entry is None or getattr(entry, "close_mode", "") != "open":
+            return None
+        if entry.spot_inst_id != spot_position.inst_id or entry.derivative_inst_id != derivative_position.inst_id:
+            return None
+        return entry
+
+    def _estimate_roll_spot_qty(
+        self,
+        *,
+        spot_position: OkxPosition,
+        derivative_position: OkxPosition,
+        spot_instrument: Instrument,
+        derivative_instrument: Instrument,
+        derivative_qty: Decimal,
+        source_entry=None,
+    ) -> Decimal:
+        spot_available = snap_to_increment(_pair_position_closeable_size(spot_position), spot_instrument.lot_size, "down")
+        if spot_available <= 0:
+            return Decimal("0")
+        if source_entry is not None and getattr(source_entry, "derivative_qty", Decimal("0")) > 0:
+            if derivative_qty >= source_entry.derivative_qty:
+                planned = source_entry.spot_qty
+            else:
+                planned = source_entry.spot_qty * derivative_qty / max(source_entry.derivative_qty, Decimal("1e-18"))
+            return snap_to_increment(min(spot_available, planned), spot_instrument.lot_size, "down")
+        reference_price = self._roll_reference_price(derivative_position, derivative_instrument)
+        total_exposure = _pair_position_base_exposure(
+            derivative_position,
+            derivative_instrument,
+            reference_price=reference_price,
+        )
+        if total_exposure is None or total_exposure <= 0:
+            return spot_available
+        total_derivative_qty = max(_pair_position_closeable_size(derivative_position), Decimal("1e-18"))
+        planned = total_exposure if derivative_qty >= total_derivative_qty else total_exposure * derivative_qty / total_derivative_qty
+        return snap_to_increment(min(spot_available, planned), spot_instrument.lot_size, "down")
+
+    def _selected_roll_entry(self):
+        selected = self._selected_roll_positions()
+        if selected is None:
+            return None
+        spot_position, derivative_position = selected
+        spot_instrument = self._roll_instruments.get(spot_position.inst_id)
+        derivative_instrument = self._roll_instruments.get(derivative_position.inst_id)
+        if spot_instrument is None or derivative_instrument is None:
+            return None
+        source_entry = self._current_roll_source_entry(spot_position, derivative_position)
+        derivative_qty = snap_to_increment(
+            _pair_position_closeable_size(derivative_position),
+            derivative_instrument.lot_size,
+            "down",
+        )
+        if source_entry is not None:
+            derivative_qty = min(derivative_qty, source_entry.derivative_qty)
+        if derivative_qty <= 0:
+            return None
+        spot_qty = self._estimate_roll_spot_qty(
+            spot_position=spot_position,
+            derivative_position=derivative_position,
+            spot_instrument=spot_instrument,
+            derivative_instrument=derivative_instrument,
+            derivative_qty=derivative_qty,
+            source_entry=source_entry,
+        )
+        return SimpleNamespace(
+            entry_id=(source_entry.entry_id if source_entry is not None else ""),
+            base_ccy=_pair_position_base_ccy(derivative_position),
+            pair_kind=(source_entry.pair_kind if source_entry is not None else "spot_future"),
+            spot_inst_id=spot_position.inst_id,
+            derivative_inst_id=derivative_position.inst_id,
+            spot_qty=spot_qty,
+            derivative_qty=derivative_qty,
+            open_spot_price=(getattr(source_entry, "open_spot_price", None) if source_entry is not None else None),
+            open_derivative_price=(getattr(source_entry, "open_derivative_price", None) if source_entry is not None else None),
+            notes=(getattr(source_entry, "notes", "") if source_entry is not None else "live_roll_source"),
+        )
+
+    def _refresh_roll_positions(self) -> None:
+        runtime = self._runtime_or_warn()
+        if runtime is None:
+            return
+        self.roll_status_text.set("正在读取当前持仓…")
+
+        def _worker() -> None:
+            error: str | None = None
+            positions: list[OkxPosition] = []
+            instruments: dict[str, Instrument] = {}
+            reference_prices: dict[str, Decimal] = {}
+            try:
+                derivative_positions = self.client.get_positions(runtime.credentials, environment=runtime.environment)
+                overview = self.client.get_account_overview(runtime.credentials, environment=runtime.environment)
+                spot_positions = _build_spot_positions_from_account(overview, self.client)
+                positions = spot_positions + [item for item in derivative_positions if item.inst_type == "FUTURES"]
+                for position in positions:
+                    try:
+                        instrument = self.client.get_instrument(position.inst_id)
+                    except Exception:
+                        instrument = None
+                    if instrument is not None:
+                        instruments[position.inst_id] = instrument
+                    if position.inst_type != "FUTURES":
+                        continue
+                    reference_price = position.mark_price or position.last_price
+                    if (reference_price is None or reference_price <= 0) and instrument is not None:
+                        try:
+                            ticker = self.client.get_ticker(position.inst_id)
+                        except Exception:
+                            ticker = None
+                        if ticker is not None:
+                            for candidate in (ticker.last, getattr(ticker, "mark_price", None), ticker.bid, ticker.ask):
+                                if candidate is not None and candidate > 0:
+                                    reference_price = candidate
+                                    break
+                    if reference_price is not None and reference_price > 0:
+                        reference_prices[position.inst_id] = reference_price
+            except Exception as exc:
+                error = str(exc)
+
+            def _apply() -> None:
+                if error is not None:
+                    self.roll_status_text.set(f"当前持仓读取失败：{error}")
+                    return
+                self._roll_positions = positions
+                self._roll_instruments = instruments
+                self._roll_reference_prices = reference_prices
+                self._refresh_roll_entry_options()
+                self.roll_status_text.set(f"已读取当前持仓 {len(positions)} 条。")
+                self._schedule_market_panel_refresh(initial_delay_ms=50)
+
+            try:
+                self.window.after(0, _apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, name="roll-positions", daemon=True).start()
+
+    def _selected_roll_entry_id(self) -> str | None:
+        entry = self._selected_roll_entry()
+        if entry is None or not getattr(entry, "entry_id", ""):
+            return None
+        return str(entry.entry_id)
+
+    def _refresh_roll_entry_options(self) -> None:
+        selected_position = self._selected_roll_position()
+        selected_inst_id = selected_position.inst_id if selected_position is not None else ""
+        spot_by_base: dict[str, OkxPosition] = {}
+        for position in self._roll_positions:
+            if position.inst_type != "SPOT" or _pair_position_closeable_size(position) <= 0:
+                continue
+            spot_by_base.setdefault(_pair_position_base_ccy(position), position)
+        option_map: dict[str, OkxPosition] = {}
+        derivative_values: list[str] = []
+        for position in self._roll_positions:
+            if position.inst_type != "FUTURES" or _pair_position_closeable_size(position) <= 0:
+                continue
+            if _pair_position_base_ccy(position) not in spot_by_base:
+                continue
+            instrument = self._roll_instruments.get(position.inst_id)
+            label = _pair_position_label(position, instrument)
+            option_map[label] = position
+            derivative_values.append(label)
+        self._roll_spot_by_base = spot_by_base
+        self._roll_position_by_key = option_map
+        if hasattr(self, "roll_entry_combo"):
+            self.roll_entry_combo.configure(values=derivative_values)
+        if not derivative_values:
+            self._roll_entry_label.set("")
+            self.roll_contract_qty.set("")
+            self.roll_position_summary_text.set("当前没有可用于移仓的现货/交割合约持仓。")
+            self.roll_preview_text.set("请先刷新当前持仓，或确认账户里有对应现货和交割合约。")
+            if self._roll_market_panel is not None:
+                self._clear_market_panel(self._roll_market_panel, message="当前没有可用于移仓的现货/交割合约持仓。")
+            return
+        target_label = next(
+            (label for label, position in option_map.items() if position.inst_id == selected_inst_id),
+            derivative_values[0],
+        )
+        self._roll_entry_label.set(target_label)
+        self._refresh_roll_target_options()
+        self._refresh_roll_preview()
+
+    def _apply_roll_target_options(self, instruments: list[Instrument]) -> None:
+        self._roll_future_instruments = instruments
+        current_position = self._selected_roll_position()
+        candidates = (
+            _roll_target_future_candidates(current_position.inst_id, instruments)
+            if isinstance(current_position, OkxPosition)
+            else []
+        )
+        if hasattr(self, "roll_target_derivative_combo"):
+            self.roll_target_derivative_combo.configure(values=candidates)
+        selected_target = self.roll_target_derivative_inst_id.get().strip().upper()
+        if selected_target in candidates:
+            self.roll_target_derivative_inst_id.set(selected_target)
+            return
+        if candidates:
+            self.roll_target_derivative_inst_id.set(candidates[0])
+            return
+        self.roll_target_derivative_inst_id.set("")
+
+    def _refresh_roll_target_options(self, *, fetch: bool = False) -> None:
+        current_position = self._selected_roll_position()
+        if current_position is None:
+            self._apply_roll_target_options(self._roll_future_instruments)
+            return
+        if not fetch and self._roll_future_instruments:
+            self._apply_roll_target_options(self._roll_future_instruments)
+            return
+        self.roll_status_text.set("正在刷新目标交割合约…")
+
+        def _worker() -> None:
+            error: str | None = None
+            instruments: list[Instrument] = []
+            try:
+                instruments = self.client.get_instruments("FUTURES")
+            except Exception as exc:
+                error = str(exc)
+
+            def _apply() -> None:
+                if error is not None:
+                    self.roll_status_text.set(f"目标交割合约刷新失败：{error}")
+                    return
+                self._apply_roll_target_options(instruments)
+                candidate_count = len(
+                    _roll_target_future_candidates(current_position.inst_id, instruments)
+                    if isinstance(current_position, OkxPosition)
+                    else []
+                )
+                selected_target = self.roll_target_derivative_inst_id.get().strip().upper()
+                if selected_target:
+                    self.roll_status_text.set(f"已刷新目标交割合约，共 {candidate_count} 个候选。")
+                else:
+                    self.roll_status_text.set("当前没有更远的同系列交割合约可选。")
+                self._refresh_roll_preview()
+
+            try:
+                self.window.after(0, _apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, name="roll-target-futures", daemon=True).start()
+
+    def _set_roll_entry(self, entry_id: str, *, fill_max: bool, focus_tab: bool) -> None:
+        entry = self._ledger_entry_by_id.get(entry_id)
+        if entry is None or getattr(entry, "close_mode", "") != "open":
+            return
+        if infer_inst_type(entry.derivative_inst_id) != "FUTURES":
+            return
+        target_label = next(
+            (
+                label
+                for label, position in self._roll_position_by_key.items()
+                if position.inst_id == entry.derivative_inst_id and _pair_position_base_ccy(position) == entry.base_ccy
+            ),
+            "",
+        )
+        if not target_label:
+            self.roll_status_text.set("账本记录已定位，但当前账户里没有找到对应的交割持仓，请先刷新当前持仓。")
+            return
+        self._roll_source_entry_id = entry.entry_id
+        self._roll_entry_label.set(target_label)
+        if fill_max or not self.roll_contract_qty.get().strip():
+            position = self._roll_position_by_key.get(target_label)
+            max_qty = entry.derivative_qty
+            if isinstance(position, OkxPosition):
+                instrument = self._roll_instruments.get(position.inst_id)
+                if instrument is not None:
+                    live_qty = snap_to_increment(_pair_position_closeable_size(position), instrument.lot_size, "down")
+                    max_qty = min(max_qty, live_qty)
+            self.roll_contract_qty.set(format_decimal(max_qty))
+        if focus_tab and self._roll_tab is not None:
+            self._notebook.select(self._roll_tab)
+        self._refresh_roll_target_options()
+        self._refresh_roll_preview()
+
+    def _on_roll_entry_selected(self, _event=None) -> None:
+        selected = self._selected_roll_positions()
+        if selected is None:
+            self.roll_position_summary_text.set("请先刷新并选择一条当前交割合约持仓。")
+            self.roll_preview_text.set("请选择一条当前交割合约持仓。")
+            if self._roll_market_panel is not None:
+                self._clear_market_panel(self._roll_market_panel, message="请选择一条当前交割合约持仓。")
+            return
+        spot_position, derivative_position = selected
+        source_entry = self._current_roll_source_entry(spot_position, derivative_position)
+        if source_entry is None:
+            self._roll_source_entry_id = None
+        if not self.roll_contract_qty.get().strip():
+            entry = self._selected_roll_entry()
+            if entry is not None:
+                self.roll_contract_qty.set(format_decimal(entry.derivative_qty))
+        self._refresh_roll_target_options()
+        self._refresh_roll_preview()
+        self._schedule_market_panel_refresh(initial_delay_ms=50)
+
+    def _fill_roll_qty_with_max(self) -> None:
+        entry = self._selected_roll_entry()
+        if entry is None:
+            messagebox.showwarning("提示", "请先刷新并选择一条当前交割合约持仓。", parent=self.window)
+            return
+        self.roll_contract_qty.set(format_decimal(entry.derivative_qty))
+        self._refresh_roll_preview()
+
+    def _load_roll_from_ledger_selection(self) -> None:
+        entry = self._selected_ledger_entry()
+        if entry is None:
+            messagebox.showwarning("提示", "请先在账本中选择一条未平仓记录。", parent=self.window)
+            return
+        if infer_inst_type(entry.derivative_inst_id) != "FUTURES":
+            messagebox.showwarning("提示", "当前只支持交割合约移仓。", parent=self.window)
+            return
+        if not self._roll_position_by_key:
+            messagebox.showwarning("提示", "请先刷新当前持仓，再按账本定位。", parent=self.window)
+            return
+        self._set_roll_entry(entry.entry_id, fill_max=True, focus_tab=True)
+
+    def _refresh_roll_preview(self) -> None:
+        selected = self._selected_roll_positions()
+        entry = self._selected_roll_entry()
+        if selected is None or entry is None:
+            self.roll_position_summary_text.set("请先刷新并选择一条当前交割合约持仓。")
+            self.roll_preview_text.set("请选择当前交割合约持仓，并填写更远交割合约。")
+            self._schedule_market_panel_refresh(initial_delay_ms=50)
+            return
+        spot_position, derivative_position = selected
+        spot_instrument = self._roll_instruments.get(spot_position.inst_id)
+        derivative_instrument = self._roll_instruments.get(derivative_position.inst_id)
+        if spot_instrument is None or derivative_instrument is None:
+            self.roll_preview_text.set("当前缺少持仓对应的合约元数据，请先刷新当前持仓。")
+            self._schedule_market_panel_refresh(initial_delay_ms=50)
+            return
+        source_entry = self._current_roll_source_entry(spot_position, derivative_position)
+        self.roll_position_summary_text.set(
+            "\n".join(
+                [
+                    f"现货持仓：{_pair_position_label(spot_position, spot_instrument)}",
+                    f"当前交割：{_pair_position_label(derivative_position, derivative_instrument)}",
+                    ("账本关联：已关联当前账本选中记录" if source_entry is not None else "账本关联：未绑定，将按现有持仓直接移仓"),
+                ]
+            )
+        )
+        target_derivative_inst_id = self.roll_target_derivative_inst_id.get().strip().upper()
+        if not target_derivative_inst_id:
+            self.roll_preview_text.set("请先填写更远交割合约。")
+            self._schedule_market_panel_refresh(initial_delay_ms=50)
+            return
+        try:
+            derivative_qty = self._parse_roll_derivative_qty(entry)
+            target_instrument = self.manager.get_instrument(target_derivative_inst_id)
+            if target_instrument.inst_type != "FUTURES":
+                raise ValueError("当前移仓只支持更远交割合约作为目标。")
+            if _pair_position_base_ccy(derivative_position) != target_derivative_inst_id.split("-")[0].strip().upper():
+                raise ValueError("目标交割合约的币种必须和当前持仓一致。")
+            current_ticker = self.client.get_ticker(entry.derivative_inst_id)
+            target_ticker = self.client.get_ticker(target_derivative_inst_id)
+            current_buy = current_ticker.ask or current_ticker.last
+            target_sell = target_ticker.bid or target_ticker.last
+            if current_buy is None or target_sell is None:
+                raise ValueError("当前缺少有效盘口，无法预估移仓价差。")
+            roll_spot_qty = self._estimate_roll_spot_qty(
+                spot_position=spot_position,
+                derivative_position=derivative_position,
+                spot_instrument=spot_instrument,
+                derivative_instrument=derivative_instrument,
+                derivative_qty=derivative_qty,
+                source_entry=source_entry,
+            )
+            spread_abs = target_sell - current_buy
+            planned_batches = _split_pair_close_batches(
+                derivative_qty,
+                derivative_instrument=derivative_instrument,
+                batch_count=self._parse_roll_batch_count(),
+                batch_qty=self._parse_roll_batch_qty(),
+            )
+        except (InvalidOperation, ValueError, Exception) as exc:
+            self.roll_preview_text.set(f"预览失败：{exc}")
+            self._schedule_market_panel_refresh(initial_delay_ms=50)
+            return
+        self.roll_preview_text.set(
+            "\n".join(
+                [
+                    f"本次移仓：回补 {entry.derivative_inst_id} {format_decimal(derivative_qty)} 张",
+                    f"并开出 {target_derivative_inst_id} {format_decimal(derivative_qty)} 张",
+                    f"对应继续占用现货：{format_decimal(roll_spot_qty)} {entry.base_ccy}",
+                    f"当前移仓绝对价差：{format_decimal(spread_abs)}",
+                    f"分批计划：{len(planned_batches)} 批 | {', '.join(format_decimal(item) for item in planned_batches)}",
+                    f"执行方式：{self.roll_execution_mode_label.get().strip()} | 最大滑点：{self.max_slippage_percent.get().strip()}%",
+                ]
+            )
+        )
+        self._schedule_market_panel_refresh(initial_delay_ms=50)
+
+    def _build_roll_request(self, *, entry, roll_derivative_qty: Decimal) -> ArbitrageRollRequest:
+        selected = self._selected_roll_positions()
+        if selected is None:
+            raise ValueError("请先刷新并选择一条当前交割合约持仓。")
+        spot_position, derivative_position = selected
+        return ArbitrageRollRequest(
+            entry_id=(entry.entry_id or None),
+            target_derivative_inst_id=self.roll_target_derivative_inst_id.get().strip().upper(),
+            max_slippage=self._parse_max_slippage(),
+            use_limit_orders=self.use_limit_orders.get(),
+            roll_derivative_qty=roll_derivative_qty,
+            current_derivative_limit_price=self._parse_optional_decimal(self.roll_current_limit_price.get()),
+            target_derivative_limit_price=self._parse_optional_decimal(self.roll_target_limit_price.get()),
+            batch_count=self._parse_roll_batch_count(),
+            batch_contract_qty=self._parse_roll_batch_qty(),
+            execution_mode=self._current_roll_execution_mode(),
+            maker_wait_seconds=self._parse_roll_maker_wait_seconds(),
+            chase_limit=self._parse_roll_chase_limit(),
+            base_ccy=entry.base_ccy,
+            spot_inst_id=spot_position.inst_id,
+            current_derivative_inst_id=derivative_position.inst_id,
+            spot_qty=entry.spot_qty,
+            current_derivative_qty=entry.derivative_qty,
+        )
+
+    def _submit_roll(self) -> None:
+        runtime = self._runtime_or_warn()
+        if runtime is None:
+            return
+        entry = self._selected_roll_entry()
+        if entry is None:
+            messagebox.showwarning("提示", "请先刷新并选择一条当前交割合约持仓。", parent=self.window)
+            return
+        try:
+            roll_qty = self._parse_roll_derivative_qty(entry)
+            request = self._build_roll_request(entry=entry, roll_derivative_qty=roll_qty)
+        except (InvalidOperation, ValueError) as exc:
+            messagebox.showwarning("参数错误", str(exc), parent=self.window)
+            return
+        if not request.target_derivative_inst_id:
+            messagebox.showwarning("提示", "请先填写更远交割合约。", parent=self.window)
+            return
+        if not messagebox.askyesno(
+            "确认移仓",
+            (
+                f"将回补 {entry.derivative_inst_id} {format_decimal(roll_qty)} 张，\n"
+                f"并开出 {request.target_derivative_inst_id} 对应数量。\n确认继续？"
+            ),
+            parent=self.window,
+        ):
+            return
+
+        self.roll_status_text.set("正在执行移仓…")
+        self._append_log("交割合约移仓：提交中…")
+
+        def _worker() -> None:
+            result = self.manager.roll_now(request, runtime=runtime)
+
+            def _apply() -> None:
+                self.roll_status_text.set(result.message)
+                self._append_log(result.message)
+                if result.success:
+                    self._reload_ledger()
+                    self._refresh_roll_positions()
+                    messagebox.showinfo("移仓完成", result.message, parent=self.window)
+                else:
+                    messagebox.showerror("移仓失败", result.message, parent=self.window)
+
+            try:
+                self.window.after(0, _apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, name="arbitrage-roll-now", daemon=True).start()
+
     def _refresh_pair_close_positions(self) -> None:
         runtime = self._runtime_or_warn()
         if runtime is None:
@@ -2432,6 +3410,87 @@ class ArbitrageWindow:
             batch_qty=batch_qty,
         )
 
+    def _parse_open_batch_count(self) -> int:
+        batch_count = int(self.open_batch_count.get().strip() or "1")
+        if batch_count <= 0:
+            raise ValueError("开仓分批次数必须大于 0。")
+        return batch_count
+
+    def _parse_open_batch_qty(self) -> Decimal | None:
+        batch_qty_text = self.open_batch_qty.get().strip()
+        if not batch_qty_text:
+            return None
+        batch_qty = Decimal(batch_qty_text)
+        if batch_qty <= 0:
+            raise ValueError("开仓每批张数必须大于 0。")
+        return batch_qty
+
+    def _parse_close_batch_count(self) -> int:
+        batch_count = int(self.close_batch_count.get().strip() or "1")
+        if batch_count <= 0:
+            raise ValueError("平仓分批次数必须大于 0。")
+        return batch_count
+
+    def _parse_close_batch_qty(self) -> Decimal | None:
+        batch_qty_text = self.close_batch_qty.get().strip()
+        if not batch_qty_text:
+            return None
+        batch_qty = Decimal(batch_qty_text)
+        if batch_qty <= 0:
+            raise ValueError("平仓每批张数必须大于 0。")
+        return batch_qty
+
+    def _parse_roll_batch_count(self) -> int:
+        batch_count = int(self.roll_batch_count.get().strip() or "1")
+        if batch_count <= 0:
+            raise ValueError("移仓分批次数必须大于 0。")
+        return batch_count
+
+    def _parse_roll_batch_qty(self) -> Decimal | None:
+        batch_qty_text = self.roll_batch_qty.get().strip()
+        if not batch_qty_text:
+            return None
+        batch_qty = Decimal(batch_qty_text)
+        if batch_qty <= 0:
+            raise ValueError("移仓每批张数必须大于 0。")
+        return batch_qty
+
+    def _parse_open_maker_wait_seconds(self) -> float:
+        wait_seconds = float(self.open_maker_wait_seconds.get().strip() or "6")
+        if wait_seconds <= 0:
+            raise ValueError("开仓挂单等待秒数必须大于 0。")
+        return wait_seconds
+
+    def _parse_open_chase_limit(self) -> int:
+        chase_limit = int(self.open_chase_limit.get().strip() or "3")
+        if chase_limit < 0:
+            raise ValueError("开仓追单次数不能小于 0。")
+        return chase_limit
+
+    def _parse_close_maker_wait_seconds(self) -> float:
+        wait_seconds = float(self.close_maker_wait_seconds.get().strip() or "6")
+        if wait_seconds <= 0:
+            raise ValueError("平仓挂单等待秒数必须大于 0。")
+        return wait_seconds
+
+    def _parse_close_chase_limit(self) -> int:
+        chase_limit = int(self.close_chase_limit.get().strip() or "3")
+        if chase_limit < 0:
+            raise ValueError("平仓追单次数不能小于 0。")
+        return chase_limit
+
+    def _parse_roll_maker_wait_seconds(self) -> float:
+        wait_seconds = float(self.roll_maker_wait_seconds.get().strip() or "6")
+        if wait_seconds <= 0:
+            raise ValueError("移仓挂单等待秒数必须大于 0。")
+        return wait_seconds
+
+    def _parse_roll_chase_limit(self) -> int:
+        chase_limit = int(self.roll_chase_limit.get().strip() or "3")
+        if chase_limit < 0:
+            raise ValueError("移仓追单次数不能小于 0。")
+        return chase_limit
+
     def _parse_pair_close_maker_wait_seconds(self) -> float:
         wait_seconds = float(self.pair_close_maker_wait_seconds.get().strip() or "6")
         if wait_seconds <= 0:
@@ -2445,8 +3504,26 @@ class ArbitrageWindow:
         return chase_limit
 
     def _refresh_pair_close_live_spread(self, spot_inst_id: str, derivative_inst_id: str) -> tuple[Decimal | None, Decimal | None]:
-        spot_ticker = self.client.get_ticker(spot_inst_id)
-        derivative_ticker = self.client.get_ticker(derivative_inst_id)
+        environment = self._selected_api_environment()
+        try:
+            self.client.ensure_public_ws_market_watch(spot_inst_id, environment=environment)
+            self.client.ensure_public_ws_market_watch(derivative_inst_id, environment=environment)
+        except Exception:
+            pass
+        spot_payload = None
+        derivative_payload = None
+        try:
+            spot_payload = self.client.get_cached_public_ticker(spot_inst_id, environment=environment)
+            derivative_payload = self.client.get_cached_public_ticker(derivative_inst_id, environment=environment)
+        except Exception:
+            spot_payload = None
+            derivative_payload = None
+        if spot_payload is not None and derivative_payload is not None:
+            _, spot_ticker = spot_payload
+            _, derivative_ticker = derivative_payload
+        else:
+            spot_ticker = self.client.get_ticker(spot_inst_id)
+            derivative_ticker = self.client.get_ticker(derivative_inst_id)
         spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask)
         derivative_mid = mid_price(derivative_ticker.bid, derivative_ticker.ask)
         if spot_mid is None or derivative_mid is None or spot_mid <= 0:
@@ -3226,6 +4303,18 @@ class ArbitrageWindow:
             raise ValueError(f"平仓数量不能超过当前持仓 {format_decimal(entry.derivative_qty)} 张。")
         return requested_qty
 
+    def _parse_roll_derivative_qty(self, entry) -> Decimal:
+        instrument = self.manager.get_instrument(entry.derivative_inst_id)
+        text = self.roll_contract_qty.get().strip()
+        if not text:
+            return entry.derivative_qty
+        requested_qty = snap_to_increment(Decimal(text), instrument.lot_size, "down")
+        if requested_qty <= 0:
+            raise ValueError("移仓数量按合约最小变动单位向下取整后为 0，请加大数量。")
+        if requested_qty > entry.derivative_qty:
+            raise ValueError(f"移仓数量不能超过当前持仓 {format_decimal(entry.derivative_qty)} 张。")
+        return requested_qty
+
     def _refresh_close_preview(self) -> None:
         entry = self._selected_close_entry()
         if entry is None:
@@ -3267,6 +4356,69 @@ class ArbitrageWindow:
                     f"对应现货卖出：{format_decimal(spot_qty)}",
                     f"平仓后剩余：{format_decimal(remaining_contracts)} 张",
                     f"执行方式：{'限价挂单' if self.use_limit_orders.get() else '市价成交'} | 最大滑点：{self.max_slippage_percent.get().strip()}%",
+                ]
+            )
+        )
+        self._schedule_market_panel_refresh(initial_delay_ms=50)
+
+    def _refresh_roll_preview(self) -> None:
+        entry = self._selected_roll_entry()
+        if entry is None:
+            self.roll_position_summary_text.set("暂无可移仓的交割合约套利持仓。")
+            self.roll_preview_text.set("请先选择一条未平仓交割合约持仓。")
+            self._schedule_market_panel_refresh(initial_delay_ms=50)
+            return
+        self.roll_position_summary_text.set(
+            "\n".join(
+                [
+                    f"币种：{entry.base_ccy}",
+                    f"现货持仓：{format_decimal(entry.spot_qty)} | 当前交割持仓：{format_decimal(entry.derivative_qty)} 张",
+                    f"现货：{entry.spot_inst_id} | 当前交割：{entry.derivative_inst_id}",
+                ]
+            )
+        )
+        target_derivative_inst_id = self.roll_target_derivative_inst_id.get().strip().upper()
+        if not target_derivative_inst_id:
+            self.roll_preview_text.set("请先填写更远交割合约。")
+            self._schedule_market_panel_refresh(initial_delay_ms=50)
+            return
+        try:
+            derivative_qty = self._parse_roll_derivative_qty(entry)
+            current_instrument = self.manager.get_instrument(entry.derivative_inst_id)
+            target_instrument = self.manager.get_instrument(target_derivative_inst_id)
+            if target_instrument.inst_type != "FUTURES":
+                raise ValueError("当前移仓页只支持交割合约作为目标。")
+            current_ticker = self.client.get_ticker(entry.derivative_inst_id)
+            target_ticker = self.client.get_ticker(target_derivative_inst_id)
+            current_buy = current_ticker.ask or current_ticker.last
+            target_sell = target_ticker.bid or target_ticker.last
+            if current_buy is None or target_sell is None:
+                raise ValueError("当前缺少有效盘口，无法预估移仓价差。")
+            roll_spot_qty = snap_to_increment(
+                entry.spot_qty if derivative_qty >= entry.derivative_qty else entry.spot_qty * derivative_qty / max(entry.derivative_qty, Decimal("1e-18")),
+                self.manager.get_instrument(entry.spot_inst_id).lot_size,
+                "down",
+            )
+            spread_abs = target_sell - current_buy
+            planned_batches = _split_pair_close_batches(
+                derivative_qty,
+                derivative_instrument=current_instrument,
+                batch_count=self._parse_roll_batch_count(),
+                batch_qty=self._parse_roll_batch_qty(),
+            )
+        except (InvalidOperation, ValueError, Exception) as exc:
+            self.roll_preview_text.set(f"预览失败：{exc}")
+            self._schedule_market_panel_refresh(initial_delay_ms=50)
+            return
+        self.roll_preview_text.set(
+            "\n".join(
+                [
+                    f"本次移仓：回补 {entry.derivative_inst_id} {format_decimal(derivative_qty)} 张",
+                    f"并开出 {target_derivative_inst_id} {format_decimal(derivative_qty)} 张",
+                    f"对应继续占用现货：{format_decimal(roll_spot_qty)}",
+                    f"当前移仓价差：{format_decimal(spread_abs)}",
+                    f"分批计划：{len(planned_batches)} 批 | {', '.join(format_decimal(item) for item in planned_batches)}",
+                    f"执行方式：{self.roll_execution_mode_label.get().strip()} | 最大滑点：{self.max_slippage_percent.get().strip()}%",
                 ]
             )
         )
@@ -3330,6 +4482,11 @@ class ArbitrageWindow:
             derivative_limit_price=self._parse_optional_decimal(self.derivative_limit_price.get()),
             use_limit_orders=self.use_limit_orders.get(),
             max_slippage=self._parse_max_slippage(),
+            batch_count=self._parse_open_batch_count(),
+            batch_contract_qty=self._parse_open_batch_qty(),
+            execution_mode=self._current_open_execution_mode(),
+            maker_wait_seconds=self._parse_open_maker_wait_seconds(),
+            chase_limit=self._parse_open_chase_limit(),
         )
 
     def _parse_close_trigger_threshold(self) -> tuple[str, Decimal | None, Decimal | None]:
@@ -3464,7 +4621,228 @@ class ArbitrageWindow:
             spot_limit_price=self._parse_optional_decimal(self.spot_limit_price.get()),
             derivative_limit_price=self._parse_optional_decimal(self.derivative_limit_price.get()),
             close_derivative_qty=close_derivative_qty,
+            batch_count=self._parse_close_batch_count(),
+            batch_contract_qty=self._parse_close_batch_qty(),
+            execution_mode=self._current_close_execution_mode(),
+            maker_wait_seconds=self._parse_close_maker_wait_seconds(),
+            chase_limit=self._parse_close_chase_limit(),
         )
+
+    def _build_roll_request(self, *, entry_id: str, roll_derivative_qty: Decimal) -> ArbitrageRollRequest:
+        return ArbitrageRollRequest(
+            entry_id=entry_id,
+            target_derivative_inst_id=self.roll_target_derivative_inst_id.get().strip().upper(),
+            max_slippage=self._parse_max_slippage(),
+            use_limit_orders=self.use_limit_orders.get(),
+            roll_derivative_qty=roll_derivative_qty,
+            current_derivative_limit_price=self._parse_optional_decimal(self.roll_current_limit_price.get()),
+            target_derivative_limit_price=self._parse_optional_decimal(self.roll_target_limit_price.get()),
+            batch_count=self._parse_roll_batch_count(),
+            batch_contract_qty=self._parse_roll_batch_qty(),
+            execution_mode=self._current_roll_execution_mode(),
+            maker_wait_seconds=self._parse_roll_maker_wait_seconds(),
+            chase_limit=self._parse_roll_chase_limit(),
+        )
+
+    def _submit_roll(self) -> None:
+        runtime = self._runtime_or_warn()
+        if runtime is None:
+            return
+        entry = self._selected_roll_entry()
+        if entry is None:
+            messagebox.showwarning("提示", "请先选择一条未平仓交割合约持仓。", parent=self.window)
+            return
+        try:
+            roll_qty = self._parse_roll_derivative_qty(entry)
+            request = self._build_roll_request(entry_id=entry.entry_id, roll_derivative_qty=roll_qty)
+        except (InvalidOperation, ValueError) as exc:
+            messagebox.showwarning("参数错误", str(exc), parent=self.window)
+            return
+        if not request.target_derivative_inst_id:
+            messagebox.showwarning("提示", "请先填写更远交割合约。", parent=self.window)
+            return
+        if not messagebox.askyesno(
+            "确认移仓",
+            (
+                f"将回补 {entry.derivative_inst_id} {format_decimal(roll_qty)} 张，\n"
+                f"并开出 {request.target_derivative_inst_id} 对应数量。\n确认继续？"
+            ),
+            parent=self.window,
+        ):
+            return
+
+        self.roll_status_text.set("正在执行移仓…")
+        self._append_log("交割合约移仓：提交中…")
+
+        def _worker() -> None:
+            result = self.manager.roll_now(request, runtime=runtime)
+
+            def _apply() -> None:
+                self.roll_status_text.set(result.message)
+                self._append_log(result.message)
+                self._reload_ledger()
+                if result.success:
+                    messagebox.showinfo("移仓完成", result.message, parent=self.window)
+                else:
+                    messagebox.showerror("移仓失败", result.message, parent=self.window)
+
+            try:
+                self.window.after(0, _apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, name="arbitrage-roll", daemon=True).start()
+
+    def _refresh_roll_preview(self) -> None:
+        selected = self._selected_roll_positions()
+        entry = self._selected_roll_entry()
+        if selected is None or entry is None:
+            self.roll_position_summary_text.set("请先刷新并选择一条当前交割合约持仓。")
+            self.roll_preview_text.set("请选择当前交割合约持仓，并填写更远交割合约。")
+            self._schedule_market_panel_refresh(initial_delay_ms=50)
+            return
+        spot_position, derivative_position = selected
+        spot_instrument = self._roll_instruments.get(spot_position.inst_id)
+        derivative_instrument = self._roll_instruments.get(derivative_position.inst_id)
+        if spot_instrument is None or derivative_instrument is None:
+            self.roll_preview_text.set("当前缺少持仓对应的合约元数据，请先刷新当前持仓。")
+            self._schedule_market_panel_refresh(initial_delay_ms=50)
+            return
+        source_entry = self._current_roll_source_entry(spot_position, derivative_position)
+        self.roll_position_summary_text.set(
+            "\n".join(
+                [
+                    f"现货持仓：{_pair_position_label(spot_position, spot_instrument)}",
+                    f"当前交割：{_pair_position_label(derivative_position, derivative_instrument)}",
+                    ("账本关联：已关联当前账本选中记录" if source_entry is not None else "账本关联：未绑定，将按现有持仓直接移仓"),
+                ]
+            )
+        )
+        target_derivative_inst_id = self.roll_target_derivative_inst_id.get().strip().upper()
+        if not target_derivative_inst_id:
+            self.roll_preview_text.set("请先填写更远交割合约。")
+            self._schedule_market_panel_refresh(initial_delay_ms=50)
+            return
+        try:
+            derivative_qty = self._parse_roll_derivative_qty(entry)
+            target_instrument = self.manager.get_instrument(target_derivative_inst_id)
+            if target_instrument.inst_type != "FUTURES":
+                raise ValueError("当前移仓只支持更远交割合约作为目标。")
+            if _pair_position_base_ccy(derivative_position) != target_derivative_inst_id.split("-")[0].strip().upper():
+                raise ValueError("目标交割合约的币种必须和当前持仓一致。")
+            current_ticker = self.client.get_ticker(entry.derivative_inst_id)
+            target_ticker = self.client.get_ticker(target_derivative_inst_id)
+            current_buy = current_ticker.ask or current_ticker.last
+            target_sell = target_ticker.bid or target_ticker.last
+            if current_buy is None or target_sell is None:
+                raise ValueError("当前缺少有效盘口，无法预估移仓价差。")
+            roll_spot_qty = self._estimate_roll_spot_qty(
+                spot_position=spot_position,
+                derivative_position=derivative_position,
+                spot_instrument=spot_instrument,
+                derivative_instrument=derivative_instrument,
+                derivative_qty=derivative_qty,
+                source_entry=source_entry,
+            )
+            spread_abs = target_sell - current_buy
+            planned_batches = _split_pair_close_batches(
+                derivative_qty,
+                derivative_instrument=derivative_instrument,
+                batch_count=self._parse_roll_batch_count(),
+                batch_qty=self._parse_roll_batch_qty(),
+            )
+        except (InvalidOperation, ValueError, Exception) as exc:
+            self.roll_preview_text.set(f"预览失败：{exc}")
+            self._schedule_market_panel_refresh(initial_delay_ms=50)
+            return
+        self.roll_preview_text.set(
+            "\n".join(
+                [
+                    f"本次移仓：回补 {entry.derivative_inst_id} {format_decimal(derivative_qty)} 张",
+                    f"并开出 {target_derivative_inst_id} {format_decimal(derivative_qty)} 张",
+                    f"对应继续占用现货：{format_decimal(roll_spot_qty)} {entry.base_ccy}",
+                    f"当前移仓绝对价差：{format_decimal(spread_abs)}",
+                    f"分批计划：{len(planned_batches)} 批 | {', '.join(format_decimal(item) for item in planned_batches)}",
+                    f"执行方式：{self.roll_execution_mode_label.get().strip()} | 最大滑点：{self.max_slippage_percent.get().strip()}%",
+                ]
+            )
+        )
+        self._schedule_market_panel_refresh(initial_delay_ms=50)
+
+    def _build_roll_request(self, *, entry, roll_derivative_qty: Decimal) -> ArbitrageRollRequest:
+        selected = self._selected_roll_positions()
+        if selected is None:
+            raise ValueError("请先刷新并选择一条当前交割合约持仓。")
+        spot_position, derivative_position = selected
+        return ArbitrageRollRequest(
+            entry_id=(entry.entry_id or None),
+            target_derivative_inst_id=self.roll_target_derivative_inst_id.get().strip().upper(),
+            max_slippage=self._parse_max_slippage(),
+            use_limit_orders=self.use_limit_orders.get(),
+            roll_derivative_qty=roll_derivative_qty,
+            current_derivative_limit_price=self._parse_optional_decimal(self.roll_current_limit_price.get()),
+            target_derivative_limit_price=self._parse_optional_decimal(self.roll_target_limit_price.get()),
+            batch_count=self._parse_roll_batch_count(),
+            batch_contract_qty=self._parse_roll_batch_qty(),
+            execution_mode=self._current_roll_execution_mode(),
+            maker_wait_seconds=self._parse_roll_maker_wait_seconds(),
+            chase_limit=self._parse_roll_chase_limit(),
+            base_ccy=entry.base_ccy,
+            spot_inst_id=spot_position.inst_id,
+            current_derivative_inst_id=derivative_position.inst_id,
+            spot_qty=entry.spot_qty,
+            current_derivative_qty=entry.derivative_qty,
+        )
+
+    def _submit_roll(self) -> None:
+        runtime = self._runtime_or_warn()
+        if runtime is None:
+            return
+        entry = self._selected_roll_entry()
+        if entry is None:
+            messagebox.showwarning("提示", "请先刷新并选择一条当前交割合约持仓。", parent=self.window)
+            return
+        try:
+            roll_qty = self._parse_roll_derivative_qty(entry)
+            request = self._build_roll_request(entry=entry, roll_derivative_qty=roll_qty)
+        except (InvalidOperation, ValueError) as exc:
+            messagebox.showwarning("参数错误", str(exc), parent=self.window)
+            return
+        if not request.target_derivative_inst_id:
+            messagebox.showwarning("提示", "请先填写更远交割合约。", parent=self.window)
+            return
+        if not messagebox.askyesno(
+            "确认移仓",
+            (
+                f"将回补 {entry.derivative_inst_id} {format_decimal(roll_qty)} 张，\n"
+                f"并开出 {request.target_derivative_inst_id} 对应数量。\n确认继续？"
+            ),
+            parent=self.window,
+        ):
+            return
+
+        self.roll_status_text.set("正在执行移仓…")
+        self._append_log("交割合约移仓：提交中…")
+
+        def _worker() -> None:
+            result = self.manager.roll_now(request, runtime=runtime)
+
+            def _apply() -> None:
+                self.roll_status_text.set(result.message)
+                self._append_log(result.message)
+                self._reload_ledger()
+                self._refresh_roll_positions()
+                if result.success:
+                    messagebox.showinfo("移仓完成", result.message, parent=self.window)
+                else:
+                    messagebox.showerror("移仓失败", result.message, parent=self.window)
+
+            try:
+                self.window.after(0, _apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, name="arbitrage-roll", daemon=True).start()
 
     def _start_auto_close(self, *, entry_id: str | None = None) -> None:
         runtime = self._runtime_or_warn()
@@ -3789,6 +5167,7 @@ class ArbitrageWindow:
         if not entries:
             self.ledger_tree.insert("", END, iid="placeholder", values=("—", "暂无套利账本记录", "", "", "", "", "", "", "", ""))
             self._refresh_close_entry_options()
+            self._refresh_roll_entry_options()
             return
         for item in entries:
             self.ledger_tree.insert(
@@ -3808,3 +5187,4 @@ class ArbitrageWindow:
                 ),
             )
         self._refresh_close_entry_options()
+        self._refresh_roll_entry_options()

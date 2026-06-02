@@ -11,6 +11,8 @@ from okx_quant.arbitrage.arbitrage_executor import (
     ArbitrageExecutor,
     ArbitrageOpenRequest,
     ArbitrageOpenResult,
+    ArbitrageRollRequest,
+    ArbitrageRollResult,
 )
 from okx_quant.arbitrage.arbitrage_scanner import ArbitrageScanner
 from okx_quant.arbitrage.models import (
@@ -109,6 +111,9 @@ class ArbitrageManager:
 
     def close_now(self, request: ArbitrageCloseRequest, *, runtime: ArbitrageTradeRuntime) -> ArbitrageCloseResult:
         return self._executor.close_cash_and_carry(request, runtime=runtime)
+
+    def roll_now(self, request: ArbitrageRollRequest, *, runtime: ArbitrageTradeRuntime) -> ArbitrageRollResult:
+        return self._executor.roll_cash_and_carry(request, runtime=runtime)
 
     def start_auto_open(self, request: ArbitrageOpenRequest, *, runtime: ArbitrageTradeRuntime) -> None:
         self._auto_open.start(request, runtime)
