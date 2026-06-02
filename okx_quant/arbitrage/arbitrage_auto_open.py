@@ -21,6 +21,7 @@ class ArbitrageAutoOpenSession:
     runtime: ArbitrageTradeRuntime
     status: str = "监控中"
     last_spread_pct: Decimal | None = None
+    last_spread_abs: Decimal | None = None
     last_spot_mid: Decimal | None = None
     last_deriv_mid: Decimal | None = None
     triggered: bool = False
@@ -80,8 +81,13 @@ class ArbitrageAutoOpenService:
             try:
                 if self._should_trigger(session):
                     session.status = "条件满足，正在开仓…"
+                    spread_text = (
+                        f"价差率 {session.last_spread_pct:.4f}% | 绝对价差 {session.last_spread_abs:.6f}"
+                        if session.last_spread_pct is not None and session.last_spread_abs is not None
+                        else f"价差率 {session.last_spread_pct!s}%"
+                    )
                     self._logger(
-                        f"触发自动开仓：当前价差 {session.last_spread_pct!s}% "
+                        f"触发自动开仓：当前{spread_text} "
                         f"(现货 {session.last_spot_mid!s} / 衍生品 {session.last_deriv_mid!s})"
                     )
                     session.triggered = True
@@ -108,11 +114,13 @@ class ArbitrageAutoOpenService:
         if spot_mid is None or deriv_mid is None or spot_mid <= 0:
             session.status = "等待有效报价…"
             return
+        spread_abs = deriv_mid - spot_mid
         spread_pct = (deriv_mid - spot_mid) / spot_mid * Decimal("100")
         session.last_spot_mid = spot_mid
         session.last_deriv_mid = deriv_mid
         session.last_spread_pct = spread_pct
-        session.status = f"监控中 | 价差 {spread_pct:.4f}%"
+        session.last_spread_abs = spread_abs
+        session.status = f"监控中 | 价差率 {spread_pct:.4f}% | 绝对价差 {spread_abs:.6f}"
 
     def _should_trigger(self, session: ArbitrageAutoOpenSession) -> bool:
         request = session.request
@@ -122,15 +130,21 @@ class ArbitrageAutoOpenService:
         deriv_mid = mid_price(deriv_ticker.bid, deriv_ticker.ask)
         if spot_mid is None or deriv_mid is None or spot_mid <= 0:
             return False
+        spread_abs = deriv_mid - spot_mid
         spread_pct = (deriv_mid - spot_mid) / spot_mid * Decimal("100")
         session.last_spot_mid = spot_mid
         session.last_deriv_mid = deriv_mid
         session.last_spread_pct = spread_pct
+        session.last_spread_abs = spread_abs
 
         if request.trigger_mode == "spread":
             if request.open_spread_pct_max is None:
                 return False
             return spread_pct <= request.open_spread_pct_max
+        if request.trigger_mode == "spread_abs":
+            if request.open_spread_abs_max is None:
+                return False
+            return spread_abs >= request.open_spread_abs_max
 
         spot_ok = True
         deriv_ok = True

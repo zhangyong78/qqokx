@@ -36,6 +36,7 @@ class ArbitrageOpenRequest:
     size_unit: SizeUnit
     trigger_mode: str
     open_spread_pct_max: Decimal | None
+    open_spread_abs_max: Decimal | None
     spot_limit_price: Decimal | None
     derivative_limit_price: Decimal | None
     use_limit_orders: bool
@@ -49,6 +50,7 @@ class ArbitrageCloseRequest:
     use_limit_orders: bool
     spot_limit_price: Decimal | None = None
     derivative_limit_price: Decimal | None = None
+    close_derivative_qty: Decimal | None = None
 
 
 @dataclass
@@ -122,6 +124,67 @@ def _wait_order_fill(
         logger(f"{label} 等待超时，已部分成交 {format_decimal(last_filled)}。")
         return last_filled, avg_price
     raise OkxApiError(f"{label} 等待成交超时。")
+
+
+def _wait_order_fill_with_private_ws(
+    client: OkxRestClient,
+    *,
+    credentials,
+    config: StrategyConfig,
+    inst_id: str,
+    ord_id: str,
+    expected_size: Decimal,
+    logger: Logger,
+    label: str,
+) -> tuple[Decimal, Decimal | None]:
+    deadline = time.time() + FillWaitSeconds
+    last_filled = Decimal("0")
+    avg_price: Decimal | None = None
+    ws_version = 0
+    while time.time() < deadline:
+        remaining = max(0.0, deadline - time.time())
+        status = None
+        wait_private_update = getattr(client, "wait_private_order_update", None)
+        if callable(wait_private_update):
+            timeout_seconds = min(remaining, PollSeconds)
+            if timeout_seconds > 0:
+                try:
+                    ws_payload = wait_private_update(
+                        credentials,
+                        environment=config.environment,
+                        inst_id=inst_id,
+                        ord_id=ord_id,
+                        after_version=ws_version,
+                        timeout=timeout_seconds,
+                    )
+                except Exception:  # noqa: BLE001
+                    ws_payload = None
+                if ws_payload is not None:
+                    ws_version, status = ws_payload
+        if status is None:
+            status = client.get_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
+        filled = status.filled_size or Decimal("0")
+        avg_price = status.avg_price
+        state = (status.state or "").lower()
+        if filled > last_filled:
+            logger(f"{label} 成交进度 {format_decimal(filled)} / {format_decimal(expected_size)}")
+            last_filled = filled
+        if state == "filled" or filled >= expected_size:
+            return filled, avg_price
+        if state in {"canceled", "cancelled"}:
+            if filled > 0:
+                return filled, avg_price
+            raise OkxApiError(f"{label} 订单已撤销，未成交。")
+        if ws_version > 0:
+            continue
+        time.sleep(PollSeconds)
+    if last_filled > 0:
+        logger(f"{label} 等待超时，已部分成交 {format_decimal(last_filled)}。")
+        return last_filled, avg_price
+    raise OkxApiError(f"{label} 等待成交超时。")
+
+
+_wait_order_fill = _wait_order_fill_with_private_ws
 
 
 class ArbitrageExecutor:
@@ -280,6 +343,12 @@ class ArbitrageExecutor:
         *,
         runtime: ArbitrageTradeRuntime,
     ) -> ArbitrageCloseResult:
+        if request.close_derivative_qty is not None and not request.entry_id:
+            return ArbitrageCloseResult(
+                success=False,
+                message="指定平仓数量时，请先选择一条具体的套利持仓。",
+                closed_count=0,
+            )
         targets = load_open_ledger_entries()
         if request.entry_id:
             targets = [item for item in targets if item.entry_id == request.entry_id]
@@ -326,6 +395,15 @@ class ArbitrageExecutor:
         deriv_inst = self._client.get_instrument(entry.derivative_inst_id)
         deriv_ticker = self._client.get_ticker(entry.derivative_inst_id)
         spot_ticker = self._client.get_ticker(entry.spot_inst_id)
+        planned_derivative_qty = self._resolve_close_derivative_qty(entry, request, deriv_inst)
+        planned_spot_qty = snap_to_increment(
+            spot_base_from_derivative_fill(
+                derivative_filled_contracts=planned_derivative_qty,
+                derivative_instrument=deriv_inst,
+            ),
+            spot_inst.lot_size,
+            "down",
+        )
 
         deriv_price = self._resolve_derivative_buy_price(request, deriv_inst, deriv_ticker)
         spot_price = self._resolve_spot_sell_price(request, spot_inst, spot_ticker)
@@ -337,8 +415,8 @@ class ArbitrageExecutor:
 
         self._logger(
             f"套利平仓 {entry.base_ccy}："
-            f"合约买入 {format_decimal(entry.derivative_qty)} 张 @ {format_decimal(deriv_price)}，"
-            f"现货卖出 {format_decimal(entry.spot_qty)} @ {format_decimal(spot_price)}"
+            f"合约买入 {format_decimal(planned_derivative_qty)} 张 @ {format_decimal(deriv_price)}，"
+            f"现货卖出 {format_decimal(planned_spot_qty)} @ {format_decimal(spot_price)}"
         )
 
         deriv_result = self._client.place_simple_order(
@@ -346,7 +424,7 @@ class ArbitrageExecutor:
             deriv_config,
             inst_id=entry.derivative_inst_id,
             side="buy",
-            size=entry.derivative_qty,
+            size=planned_derivative_qty,
             ord_type=deriv_ord_type,
             price=deriv_price if deriv_ord_type == "limit" else None,
             reduce_only=True,
@@ -359,12 +437,12 @@ class ArbitrageExecutor:
             config=deriv_config,
             inst_id=entry.derivative_inst_id,
             ord_id=deriv_result.ord_id,
-            expected_size=entry.derivative_qty,
+            expected_size=planned_derivative_qty,
             logger=self._logger,
             label="平仓合约腿",
         )
         deriv_reconciled = reconcile_fill(
-            planned_size=entry.derivative_qty,
+            planned_size=planned_derivative_qty,
             filled_size=deriv_filled,
             avg_price=deriv_avg,
         )
@@ -414,30 +492,97 @@ class ArbitrageExecutor:
             derivative_qty=deriv_reconciled.filled_size,
         )
         closed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        updated = ArbitrageLedgerEntry(
-            entry_id=entry.entry_id,
-            base_ccy=entry.base_ccy,
-            pair_kind=entry.pair_kind,
-            spot_inst_id=entry.spot_inst_id,
-            derivative_inst_id=entry.derivative_inst_id,
-            spot_qty=spot_reconciled.filled_size,
-            derivative_qty=deriv_reconciled.filled_size,
-            open_spot_price=entry.open_spot_price,
-            open_derivative_price=entry.open_derivative_price,
-            close_spot_price=spot_avg,
-            close_derivative_price=deriv_avg,
-            basis_at_open_pct=entry.basis_at_open_pct,
-            fee_total=entry.fee_total,
-            funding_total=entry.funding_total,
-            realized_pnl=pnl,
-            close_mode="full",
-            opened_at=entry.opened_at,
-            closed_at=closed_at,
-            notes=(entry.notes + " | 已平仓") if entry.notes else "已平仓",
+        remaining_derivative_qty = snap_to_increment(
+            max(entry.derivative_qty - deriv_reconciled.filled_size, Decimal("0")),
+            deriv_inst.lot_size,
+            "down",
         )
-        upsert_ledger_entry(updated)
+        remaining_spot_qty = snap_to_increment(
+            max(entry.spot_qty - spot_reconciled.filled_size, Decimal("0")),
+            spot_inst.lot_size,
+            "down",
+        )
+        has_remaining_pair = remaining_derivative_qty > 0 and remaining_spot_qty > 0
+        if has_remaining_pair:
+            open_entry = ArbitrageLedgerEntry(
+                entry_id=entry.entry_id,
+                base_ccy=entry.base_ccy,
+                pair_kind=entry.pair_kind,
+                spot_inst_id=entry.spot_inst_id,
+                derivative_inst_id=entry.derivative_inst_id,
+                spot_qty=remaining_spot_qty,
+                derivative_qty=remaining_derivative_qty,
+                open_spot_price=entry.open_spot_price,
+                open_derivative_price=entry.open_derivative_price,
+                close_spot_price=None,
+                close_derivative_price=None,
+                basis_at_open_pct=entry.basis_at_open_pct,
+                fee_total=entry.fee_total,
+                funding_total=entry.funding_total,
+                realized_pnl=None,
+                close_mode="open",
+                opened_at=entry.opened_at,
+                closed_at=None,
+                notes=entry.notes,
+            )
+            upsert_ledger_entry(open_entry)
+            closed_entry = ArbitrageLedgerEntry(
+                entry_id=uuid.uuid4().hex,
+                base_ccy=entry.base_ccy,
+                pair_kind=entry.pair_kind,
+                spot_inst_id=entry.spot_inst_id,
+                derivative_inst_id=entry.derivative_inst_id,
+                spot_qty=spot_reconciled.filled_size,
+                derivative_qty=deriv_reconciled.filled_size,
+                open_spot_price=entry.open_spot_price,
+                open_derivative_price=entry.open_derivative_price,
+                close_spot_price=spot_avg,
+                close_derivative_price=deriv_avg,
+                basis_at_open_pct=entry.basis_at_open_pct,
+                fee_total=Decimal("0"),
+                funding_total=Decimal("0"),
+                realized_pnl=pnl,
+                close_mode="partial",
+                opened_at=entry.opened_at,
+                closed_at=closed_at,
+                notes=(entry.notes + " | 部分平仓") if entry.notes else "部分平仓",
+            )
+            upsert_ledger_entry(closed_entry)
+        else:
+            updated = ArbitrageLedgerEntry(
+                entry_id=entry.entry_id,
+                base_ccy=entry.base_ccy,
+                pair_kind=entry.pair_kind,
+                spot_inst_id=entry.spot_inst_id,
+                derivative_inst_id=entry.derivative_inst_id,
+                spot_qty=spot_reconciled.filled_size,
+                derivative_qty=deriv_reconciled.filled_size,
+                open_spot_price=entry.open_spot_price,
+                open_derivative_price=entry.open_derivative_price,
+                close_spot_price=spot_avg,
+                close_derivative_price=deriv_avg,
+                basis_at_open_pct=entry.basis_at_open_pct,
+                fee_total=entry.fee_total,
+                funding_total=entry.funding_total,
+                realized_pnl=pnl,
+                close_mode="full",
+                opened_at=entry.opened_at,
+                closed_at=closed_at,
+                notes=(entry.notes + " | 已平仓") if entry.notes else "已平仓",
+            )
+            upsert_ledger_entry(updated)
         self._logger(f"{entry.base_ccy} 平仓完成，盈亏约 {format_decimal(pnl) if pnl is not None else '-'} USDT")
         return pnl
+
+    def _resolve_close_derivative_qty(self, entry: ArbitrageLedgerEntry, request: ArbitrageCloseRequest, instrument) -> Decimal:
+        if request.close_derivative_qty is None:
+            return entry.derivative_qty
+        requested_qty = snap_to_increment(request.close_derivative_qty, instrument.lot_size, "down")
+        if requested_qty <= 0:
+            raise OkxApiError("平仓数量按合约最小变动单位向下取整后为 0，请加大数量。")
+        if requested_qty > entry.derivative_qty:
+            raise OkxApiError(f"平仓数量不能超过当前持仓 {format_decimal(entry.derivative_qty)} 张。")
+        return requested_qty
 
     def _resolve_spot_buy_price(self, request: ArbitrageOpenRequest, instrument, ticker) -> Decimal:
         if request.spot_limit_price is not None and request.spot_limit_price > 0:

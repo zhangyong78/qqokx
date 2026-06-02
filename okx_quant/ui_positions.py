@@ -20,6 +20,44 @@ class UiPositionsMixin:
     def _position_refresh_interval_ms(self) -> int:
         return POSITION_REFRESH_INTERVAL_OPTIONS.get(self.position_refresh_interval_label.get(), 15_000)
 
+    def _format_private_ws_cache_note(self, credentials: Credentials, environment: str) -> str:
+        try:
+            status = self.client.get_private_ws_debug_status(credentials, environment=environment)
+        except Exception:
+            return ""
+        if not status.get("enabled", False):
+            return "持仓WS：已关闭，当前使用 REST"
+        if not status.get("available", False):
+            return "持仓WS：当前不可用，已回退 REST"
+        positions_version = int(status.get("positions_version") or 0)
+        positions_received_at = status.get("positions_received_at")
+        account_version = int(status.get("account_version") or 0)
+        account_received_at = status.get("account_received_at")
+        connected = bool(status.get("connected"))
+        last_error = str(status.get("last_error") or "").strip()
+        parts: list[str] = []
+        if positions_version > 0:
+            text = f"持仓WS v{positions_version}"
+            if isinstance(positions_received_at, (int, float)) and positions_received_at > 0:
+                text += f" @{datetime.fromtimestamp(positions_received_at).strftime('%H:%M:%S')}"
+            parts.append(text)
+        if account_version > 0:
+            text = f"账户WS v{account_version}"
+            if isinstance(account_received_at, (int, float)) and account_received_at > 0:
+                text += f" @{datetime.fromtimestamp(account_received_at).strftime('%H:%M:%S')}"
+            parts.append(text)
+        if parts:
+            if not connected and last_error:
+                return " | ".join(parts) + f" | 连接重试中：{last_error}"
+            if not connected:
+                return " | ".join(parts) + " | 连接重试中"
+            return " | ".join(parts)
+        if connected:
+            return "持仓WS：已连接，等待首包缓存"
+        if last_error:
+            return f"持仓WS：连接中断，已回退 REST（{last_error}）"
+        return "持仓WS：未拿到缓存，当前使用 REST"
+
     def toggle_position_auto_refresh(self) -> None:
         self.position_auto_refresh_enabled = not self.position_auto_refresh_enabled
         if self.position_auto_refresh_enabled:
@@ -3370,6 +3408,7 @@ class UiPositionsMixin:
     def _refresh_positions_worker(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         try:
             positions = self.client.get_positions(credentials, environment=environment)
+            ws_cache_note = self._format_private_ws_cache_note(credentials, environment)
             upl_usdt_prices = _build_upl_usdt_price_map(self.client, positions)
             position_instruments = _build_position_instrument_map(self.client, positions)
             position_tickers = _build_position_ticker_map(self.client, positions)
@@ -3379,6 +3418,7 @@ class UiPositionsMixin:
                 alternate = "live" if environment == "demo" else "demo"
                 try:
                     positions = self.client.get_positions(credentials, environment=alternate)
+                    ws_cache_note = self._format_private_ws_cache_note(credentials, alternate)
                     upl_usdt_prices = _build_upl_usdt_price_map(self.client, positions)
                     position_instruments = _build_position_instrument_map(self.client, positions)
                     position_tickers = _build_position_ticker_map(self.client, positions)
@@ -3396,6 +3436,7 @@ class UiPositionsMixin:
                         summary=summary,
                         effective_environment=alternate,
                         credential_profile_name=profile_name,
+                        ws_cache_note=ws_cache_note,
                         upl_usdt_prices=upl_usdt_prices,
                         position_instruments=position_instruments,
                         position_tickers=position_tickers,
@@ -3411,6 +3452,7 @@ class UiPositionsMixin:
                 summary=None,
                 effective_environment=environment,
                 credential_profile_name=profile_name,
+                ws_cache_note=ws_cache_note,
                 upl_usdt_prices=upl_usdt_prices,
                 position_instruments=position_instruments,
                 position_tickers=position_tickers,
@@ -3423,6 +3465,7 @@ class UiPositionsMixin:
         summary: str | None = None,
         effective_environment: str | None = None,
         credential_profile_name: str | None = None,
+        ws_cache_note: str = "",
         upl_usdt_prices: dict[str, Decimal] | None = None,
         position_instruments: dict[str, Instrument] | None = None,
         position_tickers: dict[str, OkxTicker] | None = None,
@@ -3430,6 +3473,7 @@ class UiPositionsMixin:
         self._positions_refreshing = False
         self._latest_positions = list(positions)
         self._positions_context_note = summary
+        self._positions_ws_cache_note = ws_cache_note
         self._positions_last_refresh_at = datetime.now()
         self._positions_effective_environment = effective_environment
         self._positions_context_profile_name = (credential_profile_name or self._current_credential_profile()).strip()
@@ -3447,6 +3491,7 @@ class UiPositionsMixin:
                 upl_usdt_prices=dict(upl_usdt_prices or {}),
                 refreshed_at=self._positions_last_refresh_at,
                 position_instruments=dict(position_instruments or {}),
+                ws_cache_note=ws_cache_note,
             )
         if profile_name and effective_environment:
             self._sync_position_note_state_for_positions(
@@ -3481,6 +3526,34 @@ class UiPositionsMixin:
         if expected_environment and effective_environment and expected_environment != effective_environment:
             return None
         return snapshot
+
+    def _session_position_cache_note(self, session: StrategySession) -> str:
+        snapshot = self._positions_snapshot_for_session(session)
+        if snapshot is None:
+            return "持仓缓存：尚未同步"
+        note = str(getattr(snapshot, "ws_cache_note", "") or "").strip()
+        if note:
+            return f"持仓缓存：{note}"
+        return f"持仓缓存：最近刷新 {snapshot.refreshed_at.strftime('%H:%M:%S')}"
+
+    def _running_session_position_cache_summary(self, sessions: list[StrategySession]) -> str:
+        notes: list[str] = []
+        seen: set[str] = set()
+        for session in sessions:
+            snapshot = self._positions_snapshot_for_session(session)
+            if snapshot is None:
+                continue
+            profile_name = str(snapshot.api_name or session.api_name or "-").strip() or "-"
+            environment = str(snapshot.effective_environment or getattr(session.config, "environment", "") or "-").strip() or "-"
+            note = str(getattr(snapshot, "ws_cache_note", "") or "").strip() or f"最近刷新 {snapshot.refreshed_at.strftime('%H:%M:%S')}"
+            text = f"{profile_name}/{environment}: {note}"
+            if text in seen:
+                continue
+            seen.add(text)
+            notes.append(text)
+        if notes:
+            return "持仓缓存 " + "；".join(notes[:3])
+        return "持仓缓存待同步"
 
     def _refresh_session_live_pnl_cache(self) -> None:
         cache: dict[str, tuple[Decimal | None, datetime | None]] = {
@@ -3673,6 +3746,7 @@ class UiPositionsMixin:
         if selected_filter != "全部":
             visible_count = sum(1 for session in active_sessions if QuantApp._session_matches_running_filter(self, session))
             parts.append(f"当前筛选 {selected_filter} {visible_count}条")
+        parts.append(self._running_session_position_cache_summary(active_sessions))
         if latest_refresh_at is not None:
             parts.append(f"参考持仓 {latest_refresh_at.strftime('%H:%M:%S')}")
         else:
@@ -3870,6 +3944,8 @@ class UiPositionsMixin:
         if self._positions_context_note:
             parts.append(self._positions_context_note)
         parts.append(f"API配置：{self._current_credential_profile()}")
+        if getattr(self, "_positions_ws_cache_note", ""):
+            parts.append(self._positions_ws_cache_note)
 
         total_count = len(self._latest_positions)
         visible_count = len(visible_positions)
@@ -4367,6 +4443,7 @@ class UiPositionsMixin:
             return
         self._latest_positions = []
         self._positions_context_note = None
+        self._positions_ws_cache_note = ""
         self._positions_context_profile_name = None
         self._positions_last_refresh_at = None
         self._positions_effective_environment = None

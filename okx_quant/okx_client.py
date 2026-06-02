@@ -6,7 +6,9 @@ import hashlib
 import hmac
 import http.client
 import json
+import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import time
@@ -22,6 +24,7 @@ from okx_quant.candle_cache import (
     save_candle_cache,
 )
 from okx_quant.models import Candle, Credentials, Instrument, OrderPlan, StrategyConfig, TriggerPriceType
+from okx_quant.okx_private_ws import OkxPrivateWsConnection, OkxPrivateWsConnectionUnavailable
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, snap_to_increment
 
 
@@ -37,6 +40,7 @@ DEFAULT_HEADERS = {
 }
 
 OPTION_ID_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+-\d{6}-[0-9]+-[CP]$")
+FUTURES_ID_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+-\d{6}$")
 MAX_PUBLIC_CANDLE_LIMIT = 300
 FULL_HISTORY_CHECKPOINT_PAGE_INTERVAL = 25
 
@@ -368,6 +372,12 @@ class OkxAccountConfig:
 
 class OkxRestClient:
     base_url = "https://www.okx.com"
+
+    def __init__(self, *, logger: Callable[[str], None] | None = None) -> None:
+        self._logger = logger or (lambda _message: None)
+        self._private_ws_lock = threading.Lock()
+        self._private_ws_connections: dict[tuple[str, str, str], OkxPrivateWsConnection] = {}
+        self._private_ws_error_once: set[tuple[str, str, str]] = set()
 
     def get_instruments(
         self,
@@ -898,6 +908,16 @@ class OkxRestClient:
         environment: str,
         inst_type: str | None = None,
     ) -> list[OkxPosition]:
+        cached_positions = self.get_cached_private_positions(
+            credentials,
+            environment=environment,
+        )
+        if cached_positions is not None:
+            _, positions = cached_positions
+            if inst_type:
+                inst_type_upper = inst_type.upper()
+                return [item for item in positions if item.inst_type.upper() == inst_type_upper]
+            return positions
         params: dict[str, str] | None = None
         if inst_type:
             params = {"instType": inst_type.upper()}
@@ -951,6 +971,13 @@ class OkxRestClient:
         *,
         environment: str,
     ) -> OkxAccountOverview:
+        cached_overview = self.get_cached_private_account_overview(
+            credentials,
+            environment=environment,
+        )
+        if cached_overview is not None:
+            _, overview = cached_overview
+            return overview
         payload = self._request(
             "GET",
             "/api/v5/account/balance",
@@ -1022,7 +1049,158 @@ class OkxRestClient:
             raw=first,
         )
 
+    def wait_private_order_update(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+        after_version: int = 0,
+        timeout: float = 1.0,
+    ) -> tuple[int, OkxOrderStatus] | None:
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.wait_for_order_update(
+            ord_id=ord_id,
+            cl_ord_id=cl_ord_id,
+            after_version=after_version,
+            timeout=timeout,
+        )
+        if payload is None:
+            return None
+        version, item = payload
+        return version, _build_okx_order_status_from_ws_item(item, fallback_ord_id=ord_id, fallback_inst_id=inst_id)
+
+    def get_cached_private_order_status(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+    ) -> tuple[int, OkxOrderStatus] | None:
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_order(ord_id=ord_id, cl_ord_id=cl_ord_id)
+        if payload is None:
+            return None
+        version, item = payload
+        return version, _build_okx_order_status_from_ws_item(item, fallback_ord_id=ord_id, fallback_inst_id=inst_id)
+
+    def get_cached_private_positions(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> tuple[int, list[OkxPosition]] | None:
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_positions()
+        if payload is None:
+            return None
+        version, items = payload
+        positions = [_build_okx_position(item) for item in items if _position_has_nonzero_size(item)]
+        positions.sort(key=lambda item: (item.inst_type, item.inst_id, item.pos_side))
+        return version, positions
+
+    def get_cached_private_account_overview(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> tuple[int, OkxAccountOverview] | None:
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_account()
+        if payload is None:
+            return None
+        version, items = payload
+        if not items:
+            return None
+        return version, _build_okx_account_overview(items[0])
+
+    def get_private_ws_debug_status(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> dict[str, Any]:
+        if not self._private_ws_enabled():
+            return {
+                "enabled": False,
+                "available": False,
+                "connected": False,
+                "positions_version": 0,
+                "positions_received_at": None,
+                "account_version": 0,
+                "account_received_at": None,
+                "last_error": "",
+                "reason": "disabled",
+            }
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return {
+                "enabled": True,
+                "available": False,
+                "connected": False,
+                "positions_version": 0,
+                "positions_received_at": None,
+                "account_version": 0,
+                "account_received_at": None,
+                "last_error": "",
+                "reason": "unavailable",
+            }
+        status = connection.debug_status()
+        status["enabled"] = True
+        status["available"] = True
+        status["reason"] = ""
+        return status
+
     _ACCOUNT_CONFIG_CACHE_TTL_S = 45.0
+
+    def _private_ws_enabled(self) -> bool:
+        value = os.getenv("QQOKX_PRIVATE_WS_ENABLED", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _private_ws_connection_for(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> OkxPrivateWsConnection | None:
+        if not self._private_ws_enabled():
+            return None
+        profile_name = (credentials.profile_name or "").strip()
+        key = (credentials.api_key, profile_name, environment)
+        with self._private_ws_lock:
+            connection = self._private_ws_connections.get(key)
+            if connection is None:
+                connection = OkxPrivateWsConnection(
+                    credentials,
+                    environment=environment,
+                    logger=self._logger,
+                )
+                self._private_ws_connections[key] = connection
+            try:
+                connection.start()
+            except OkxPrivateWsConnectionUnavailable as exc:
+                if key not in self._private_ws_error_once:
+                    self._logger(f"OKX 私有 WS 不可用，继续回退 REST：{exc}")
+                    self._private_ws_error_once.add(key)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                if key not in self._private_ws_error_once:
+                    self._logger(f"OKX 私有 WS 启动失败，继续回退 REST：{exc}")
+                    self._private_ws_error_once.add(key)
+                return None
+        return connection
 
     def _get_account_config_cached(self, credentials: Credentials, config: StrategyConfig) -> OkxAccountConfig | None:
         cache = getattr(self, "_account_config_posmode_cache", None)
@@ -2181,6 +2359,8 @@ def infer_inst_type(inst_id: str) -> str:
         return "SWAP"
     if OPTION_ID_PATTERN.match(normalized):
         return "OPTION"
+    if FUTURES_ID_PATTERN.match(normalized):
+        return "FUTURES"
     return "SPOT"
 
 
@@ -2321,6 +2501,97 @@ def _extract_tp_sl_fields(item: dict[str, Any]) -> dict[str, Decimal | str | Non
         "stop_loss_order_price": stop_loss_order_price,
         "stop_loss_trigger_price_type": stop_loss_trigger_price_type,
     }
+
+
+def _build_okx_order_status_from_ws_item(
+    item: dict[str, Any],
+    *,
+    fallback_ord_id: str | None,
+    fallback_inst_id: str,
+) -> OkxOrderStatus:
+    return OkxOrderStatus(
+        ord_id=str(item.get("ordId") or fallback_ord_id or ""),
+        state=str(item.get("state") or ""),
+        side=item.get("side"),
+        ord_type=item.get("ordType"),
+        price=_to_decimal(item.get("px")),
+        avg_price=_to_decimal(item.get("avgPx")),
+        size=_first_decimal(item.get("sz"), item.get("origSz")),
+        filled_size=_first_decimal(item.get("accFillSz"), item.get("fillSz")),
+        raw={"instId": item.get("instId", fallback_inst_id), **item},
+    )
+
+
+def _position_has_nonzero_size(item: dict[str, Any]) -> bool:
+    position = _to_decimal(item.get("pos")) or Decimal("0")
+    return position != 0
+
+
+def _build_okx_position(item: dict[str, Any]) -> OkxPosition:
+    position = _to_decimal(item.get("pos")) or Decimal("0")
+    return OkxPosition(
+        inst_id=item.get("instId", ""),
+        inst_type=item.get("instType", ""),
+        pos_side=item.get("posSide", ""),
+        mgn_mode=item.get("mgnMode", ""),
+        position=position,
+        avail_position=_to_decimal(item.get("availPos")),
+        avg_price=_to_decimal(item.get("avgPx")),
+        mark_price=_to_decimal(item.get("markPx")),
+        unrealized_pnl=_to_decimal(item.get("upl")),
+        unrealized_pnl_ratio=_to_decimal(item.get("uplRatio")),
+        liquidation_price=_to_decimal(item.get("liqPx")),
+        leverage=_to_decimal(item.get("lever")),
+        margin_ccy=item.get("ccy"),
+        last_price=_to_decimal(item.get("last")),
+        realized_pnl=_to_decimal(item.get("realizedPnl")),
+        margin_ratio=_to_decimal(item.get("mgnRatio")),
+        initial_margin=_to_decimal(item.get("imr")),
+        maintenance_margin=_to_decimal(item.get("mmr")),
+        delta=_first_decimal(item.get("deltaPA"), item.get("deltaBS")),
+        gamma=_first_decimal(item.get("gammaPA"), item.get("gammaBS")),
+        vega=_first_decimal(item.get("vegaPA"), item.get("vegaBS")),
+        theta=_first_decimal(item.get("thetaPA"), item.get("thetaBS")),
+        raw=item,
+    )
+
+
+def _build_okx_account_overview(item: dict[str, Any]) -> OkxAccountOverview:
+    details: list[OkxAccountAssetItem] = []
+    for asset in item.get("details", []):
+        if not isinstance(asset, dict):
+            continue
+        details.append(
+            OkxAccountAssetItem(
+                ccy=asset.get("ccy", ""),
+                equity=_first_decimal(asset.get("eq"), asset.get("cashBal")),
+                equity_usd=_to_decimal(asset.get("eqUsd")),
+                cash_balance=_to_decimal(asset.get("cashBal")),
+                available_balance=_to_decimal(asset.get("availBal")),
+                available_equity=_to_decimal(asset.get("availEq")),
+                frozen_balance=_first_decimal(asset.get("frozenBal"), asset.get("ordFrozen"), asset.get("fixedBal")),
+                unrealized_pnl=_to_decimal(asset.get("upl")),
+                discount_equity=_to_decimal(asset.get("disEq")),
+                liability=_first_decimal(asset.get("liab"), asset.get("uplLiab")),
+                cross_liability=_to_decimal(asset.get("crossLiab")),
+                interest=_to_decimal(asset.get("interest")),
+                raw=asset,
+            )
+        )
+    details.sort(key=lambda asset: (asset.equity_usd or Decimal("0"), asset.equity or Decimal("0")), reverse=True)
+    return OkxAccountOverview(
+        total_equity=_to_decimal(item.get("totalEq")),
+        adjusted_equity=_to_decimal(item.get("adjEq")),
+        isolated_equity=_to_decimal(item.get("isoEq")),
+        available_equity=_to_decimal(item.get("availEq")),
+        unrealized_pnl=_to_decimal(item.get("upl")),
+        initial_margin=_to_decimal(item.get("imr")),
+        maintenance_margin=_to_decimal(item.get("mmr")),
+        order_frozen=_first_decimal(item.get("ordFroz"), item.get("frozenBal")),
+        notional_usd=_to_decimal(item.get("notionalUsd")),
+        details=tuple(details),
+        raw=item,
+    )
 
 
 def _fill_history_dedupe_key(item: OkxFillHistoryItem) -> tuple[Any, ...]:

@@ -5336,6 +5336,89 @@ class CredentialProfileEnvironmentTest(TestCase):
         app._apply_credentials_profile.assert_called_once_with("desk", log_change=True)
         save_snapshot.assert_called_once()
 
+    def test_set_current_api_profile_switch_password_requires_old_password(self) -> None:
+        password_snapshot = build_profile_switch_password_snapshot("old-pass")
+        app = SimpleNamespace(
+            _credential_profiles={
+                "desk": {
+                    "api_key": "k",
+                    "secret_key": "s",
+                    "passphrase": "p",
+                    "environment": "demo",
+                    **password_snapshot,
+                }
+            },
+            _locked_credential_profiles=set(),
+            _settings_window=None,
+            root=object(),
+            credential_profile_password_status_text=_Var(),
+            _enqueue_log=MagicMock(),
+            _editing_credential_profile=lambda: "desk",
+            _current_credential_profile=lambda: "desk",
+        )
+        app._active_settings_parent = lambda: QuantApp._active_settings_parent(app)
+        app._credential_profile_requires_switch_password = lambda profile_name: QuantApp._credential_profile_requires_switch_password(
+            app, profile_name
+        )
+        app._confirm_existing_api_profile_password = lambda profile_name, action_label: QuantApp._confirm_existing_api_profile_password(
+            app, profile_name, action_label=action_label
+        )
+        app._credential_profile_is_locked = lambda profile_name: QuantApp._credential_profile_is_locked(app, profile_name)
+        app._update_current_api_profile_password_status = (
+            lambda profile_name=None: QuantApp._update_current_api_profile_password_status(app, profile_name)
+        )
+
+        with patch("okx_quant.ui.simpledialog.askstring", return_value="wrong-old-pass"), patch(
+            "okx_quant.ui.messagebox.showerror"
+        ) as showerror, patch("okx_quant.ui.save_credentials_profiles_snapshot") as save_snapshot:
+            QuantApp._set_current_api_profile_switch_password(app)
+
+        save_snapshot.assert_not_called()
+        showerror.assert_called_once()
+        self.assertTrue(QuantApp._credential_profile_requires_switch_password(app, "desk"))
+
+    def test_clear_current_api_profile_switch_password_requires_old_password_then_clears(self) -> None:
+        password_snapshot = build_profile_switch_password_snapshot("old-pass")
+        app = SimpleNamespace(
+            _credential_profiles={
+                "desk": {
+                    "api_key": "k",
+                    "secret_key": "s",
+                    "passphrase": "p",
+                    "environment": "demo",
+                    **password_snapshot,
+                }
+            },
+            _locked_credential_profiles=set(),
+            _settings_window=None,
+            root=object(),
+            credential_profile_password_status_text=_Var(),
+            _enqueue_log=MagicMock(),
+            _editing_credential_profile=lambda: "desk",
+            _current_credential_profile=lambda: "desk",
+        )
+        app._active_settings_parent = lambda: QuantApp._active_settings_parent(app)
+        app._credential_profile_requires_switch_password = lambda profile_name: QuantApp._credential_profile_requires_switch_password(
+            app, profile_name
+        )
+        app._confirm_existing_api_profile_password = lambda profile_name, action_label: QuantApp._confirm_existing_api_profile_password(
+            app, profile_name, action_label=action_label
+        )
+        app._credential_profile_is_locked = lambda profile_name: QuantApp._credential_profile_is_locked(app, profile_name)
+        app._update_current_api_profile_password_status = (
+            lambda profile_name=None: QuantApp._update_current_api_profile_password_status(app, profile_name)
+        )
+
+        with patch("okx_quant.ui.simpledialog.askstring", return_value="old-pass"), patch(
+            "okx_quant.ui.messagebox.askyesno", return_value=True
+        ), patch("okx_quant.ui.save_credentials_profiles_snapshot") as save_snapshot:
+            QuantApp._clear_current_api_profile_switch_password(app)
+
+        save_snapshot.assert_called_once()
+        self.assertFalse(QuantApp._credential_profile_requires_switch_password(app, "desk"))
+        self.assertEqual(app.credential_profile_password_status_text.get(), "切换密码：未设置")
+        app._enqueue_log.assert_called_once_with("已清除 API 配置 desk 的切换密码")
+
     def test_on_api_profile_selected_requires_password_before_switch(self) -> None:
         password_snapshot = build_profile_switch_password_snapshot("desk-pass")
         app = SimpleNamespace(

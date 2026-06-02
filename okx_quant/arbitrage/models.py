@@ -7,11 +7,11 @@ from typing import Literal
 
 from okx_quant.models import Credentials, EnvironmentMode, PositionMode, TradeMode
 
-ArbitragePairKind = Literal["spot_swap", "spot_quarter", "spot_next_quarter"]
+ArbitragePairKind = Literal["spot_swap", "spot_quarter", "spot_next_quarter", "spot_future"]
 ArbitrageDirection = Literal["cash_and_carry", "reverse_cash_and_carry"]
 SizeUnit = Literal["coin", "usdt", "contracts"]
 LedgerCloseMode = Literal["full", "partial", "open"]
-ArbitrageTriggerMode = Literal["spread", "limit_price"]
+ArbitrageTriggerMode = Literal["spread", "spread_abs", "limit_price"]
 
 
 @dataclass(frozen=True)

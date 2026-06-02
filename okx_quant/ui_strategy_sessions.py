@@ -5325,6 +5325,7 @@ class UiStrategySessionsMixin:
                 last_close_reason=session.last_close_reason,
                 live_pnl=live_pnl,
                 live_pnl_refreshed_at=live_pnl_refreshed_at,
+                position_cache_note=self._session_position_cache_note(session),
                 duplicate_warning=duplicate_warning,
                 email_status_label=QuantApp._session_email_status_label(self, session),
                 global_email_enabled=self.notify_enabled.get(),
@@ -5404,6 +5405,7 @@ class UiStrategySessionsMixin:
         last_close_reason: str = "",
         live_pnl: Decimal | None = None,
         live_pnl_refreshed_at: datetime | None = None,
+        position_cache_note: str = "",
         duplicate_warning: str = "",
         email_status_label: str = "-",
         global_email_enabled: bool = False,
@@ -5486,6 +5488,7 @@ class UiStrategySessionsMixin:
                 f"最近运行状态：{runtime_status}" if runtime_status and status == "运行中" else "",
                 f"运行模式：{run_mode_label or '-'}",
                 f"交易环境：{environment_label or '-'}",
+                position_cache_note or "",
                 f"邮件通知：{email_status_label or '-'}（全局{'开启' if global_email_enabled else '关闭'}）"
                 if record_id is None
                 else "",

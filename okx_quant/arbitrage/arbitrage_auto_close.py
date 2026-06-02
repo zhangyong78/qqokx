@@ -20,10 +20,13 @@ MonitorPollSeconds = 2.0
 class ArbitrageAutoCloseSession:
     request: ArbitrageCloseRequest
     runtime: ArbitrageTradeRuntime
-    close_spread_pct_min: Decimal
+    close_trigger_mode: str
+    close_spread_pct_min: Decimal | None
+    close_spread_abs_min: Decimal | None
     entry_id: str | None
     status: str = "监控中"
     last_spread_pct: Decimal | None = None
+    last_spread_abs: Decimal | None = None
     triggered: bool = False
     result: ArbitrageCloseResult | None = None
 
@@ -59,7 +62,9 @@ class ArbitrageAutoCloseService:
         *,
         request: ArbitrageCloseRequest,
         runtime: ArbitrageTradeRuntime,
-        close_spread_pct_min: Decimal,
+        close_trigger_mode: str,
+        close_spread_pct_min: Decimal | None,
+        close_spread_abs_min: Decimal | None,
         entry_id: str | None = None,
     ) -> None:
         with self._lock:
@@ -69,7 +74,9 @@ class ArbitrageAutoCloseService:
             self._session = ArbitrageAutoCloseSession(
                 request=request,
                 runtime=runtime,
+                close_trigger_mode=close_trigger_mode,
                 close_spread_pct_min=close_spread_pct_min,
+                close_spread_abs_min=close_spread_abs_min,
                 entry_id=entry_id,
             )
             self._thread = threading.Thread(target=self._run, name="arbitrage-auto-close", daemon=True)
@@ -91,11 +98,23 @@ class ArbitrageAutoCloseService:
             if session is None:
                 return
             try:
-                spread_pct = self._refresh_spread(session)
-                if spread_pct is not None and spread_pct >= session.close_spread_pct_min:
+                spread_pct, spread_abs = self._refresh_spread(session)
+                should_trigger = False
+                if session.close_trigger_mode == "spread_abs":
+                    should_trigger = spread_abs is not None and session.close_spread_abs_min is not None and spread_abs <= session.close_spread_abs_min
+                else:
+                    should_trigger = spread_pct is not None and session.close_spread_pct_min is not None and spread_pct <= session.close_spread_pct_min
+                if should_trigger:
                     session.status = "条件满足，正在平仓…"
                     session.triggered = True
-                    self._logger(f"触发自动平仓：当前价差 {spread_pct:.4f}% >= {session.close_spread_pct_min}%")
+                    if session.close_trigger_mode == "spread_abs":
+                        self._logger(
+                            f"触发自动平仓：当前绝对价差 {spread_abs:.6f} <= {session.close_spread_abs_min}"
+                        )
+                    else:
+                        self._logger(
+                            f"触发自动平仓：当前价差率 {spread_pct:.4f}% <= {session.close_spread_pct_min}%"
+                        )
                     result = self._executor.close_cash_and_carry(session.request, runtime=session.runtime)
                     session.result = result
                     session.status = "已完成" if result.success else f"失败：{result.message}"
@@ -110,22 +129,24 @@ class ArbitrageAutoCloseService:
         if session is not None and not session.triggered:
             session.status = "已停止"
 
-    def _refresh_spread(self, session: ArbitrageAutoCloseSession) -> Decimal | None:
+    def _refresh_spread(self, session: ArbitrageAutoCloseSession) -> tuple[Decimal | None, Decimal | None]:
         entry = self._resolve_target_entry(session.entry_id)
         if entry is None:
             session.status = "没有可平仓持仓"
-            return None
+            return None, None
         spot_ticker = self._client.get_ticker(entry.spot_inst_id)
         deriv_ticker = self._client.get_ticker(entry.derivative_inst_id)
         spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask)
         deriv_mid = mid_price(deriv_ticker.bid, deriv_ticker.ask)
         if spot_mid is None or deriv_mid is None or spot_mid <= 0:
             session.status = "等待有效报价…"
-            return None
+            return None, None
+        spread_abs = deriv_mid - spot_mid
         spread_pct = (deriv_mid - spot_mid) / spot_mid * Decimal("100")
         session.last_spread_pct = spread_pct
-        session.status = f"监控中 | 价差 {spread_pct:.4f}%"
-        return spread_pct
+        session.last_spread_abs = spread_abs
+        session.status = f"监控中 | 价差率 {spread_pct:.4f}% | 绝对价差 {spread_abs:.6f}"
+        return spread_pct, spread_abs
 
     def _resolve_target_entry(self, entry_id: str | None):
         if entry_id:

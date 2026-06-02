@@ -61,9 +61,14 @@ class ArbitrageManager:
     def last_opportunities(self) -> tuple[ArbitrageOpportunity, ...]:
         return tuple(self._last_opportunities)
 
-    def scan_opportunities(self) -> list[ArbitrageOpportunity]:
+    def scan_opportunities(
+        self,
+        *,
+        include_swap: bool = True,
+        include_futures: bool = True,
+    ) -> list[ArbitrageOpportunity]:
         self._logger("套利扫描：开始拉取现货/永续/交割行情…")
-        rows = self._scanner.scan()
+        rows = self._scanner.scan(include_swap=include_swap, include_futures=include_futures)
         self._last_opportunities = rows
         self._logger(f"套利扫描：完成，共 {len(rows)} 条机会。")
         return rows
@@ -116,13 +121,17 @@ class ArbitrageManager:
         *,
         request: ArbitrageCloseRequest,
         runtime: ArbitrageTradeRuntime,
-        close_spread_pct_min: Decimal,
+        close_trigger_mode: str,
+        close_spread_pct_min: Decimal | None,
+        close_spread_abs_min: Decimal | None,
         entry_id: str | None = None,
     ) -> None:
         self._auto_close.start(
             request=request,
             runtime=runtime,
+            close_trigger_mode=close_trigger_mode,
             close_spread_pct_min=close_spread_pct_min,
+            close_spread_abs_min=close_spread_abs_min,
             entry_id=entry_id,
         )
 

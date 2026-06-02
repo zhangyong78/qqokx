@@ -2087,6 +2087,64 @@ def wait_order_fill(
     raise ProtectionCloseRetryError(f"保护平仓订单未成交，ordId={ord_id}，状态={latest_state or 'unknown'}")
 
 
+def _wait_order_fill_with_private_ws(
+    *,
+    client: OkxRestClient,
+    credentials: Credentials,
+    config: StrategyConfig,
+    inst_id: str,
+    ord_id: str | None,
+    estimated_price: Decimal,
+    wait_seconds: float,
+    stop_event: threading.Event,
+) -> tuple[Decimal, Decimal]:
+    if not ord_id:
+        raise RuntimeError("OKX 未返回 ordId，无法确认保护平仓结果。")
+
+    latest_state = ""
+    ws_version = 0
+    for _ in range(12):
+        status = None
+        wait_private_update = getattr(client, "wait_private_order_update", None)
+        if callable(wait_private_update):
+            try:
+                ws_payload = wait_private_update(
+                    credentials,
+                    environment=config.environment,
+                    inst_id=inst_id,
+                    ord_id=ord_id,
+                    after_version=ws_version,
+                    timeout=max(wait_seconds, 0.0),
+                )
+            except Exception:  # noqa: BLE001
+                ws_payload = None
+            if ws_payload is not None:
+                ws_version, status = ws_payload
+        if status is None:
+            status = client.get_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
+        latest_state = (status.state or "").lower()
+        filled_size = status.filled_size or Decimal("0")
+        resolved_price = status.avg_price or status.price or estimated_price
+        if latest_state == "filled":
+            return filled_size if filled_size > 0 else status.size or Decimal("0"), resolved_price
+        if latest_state == "partially_filled" and filled_size > 0:
+            return filled_size, resolved_price
+        if latest_state in {"canceled", "order_failed", "mmp_canceled"}:
+            if filled_size > 0:
+                return filled_size, resolved_price
+            raise ProtectionCloseRetryError(
+                f"保护平仓订单未成交，ordId={ord_id}，状态={latest_state or 'unknown'}"
+            )
+        if ws_version > 0:
+            continue
+        stop_event.wait(wait_seconds)
+
+    raise ProtectionCloseRetryError(f"保护平仓订单未成交，ordId={ord_id}，状态={latest_state or 'unknown'}")
+
+
+wait_order_fill = _wait_order_fill_with_private_ws
+
+
 def _pp_wait_for_write_reconcile(worker: _ProtectionWorker, attempt: int) -> None:
     delay_seconds = min(
         WRITE_RECONCILE_BASE_DELAY_SECONDS * attempt,

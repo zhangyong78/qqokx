@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.07`
+当前版本：`v0.6.08`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -11,6 +11,7 @@
 - 多策略会话运行与恢复接管
 - 持仓、历史成交、历史仓位查看
 - Smart Order、条件单、网格类交易辅助
+- 现货套利：机会扫描、套利开仓/平仓、持仓配对平仓、套利图表
 - 期权仓位保护、期权策略计算、展期建议
 - Deribit 波动率查看与监控
 - 回测、参数矩阵对比、结果持久化
@@ -111,8 +112,14 @@ python main.py
 
 - [okx_quant/engine.py](/D:/qqokx/okx_quant/engine.py)：策略执行与交易主引擎
 - [okx_quant/ui_strategy_sessions.py](/D:/qqokx/okx_quant/ui_strategy_sessions.py)：策略会话管理界面
+- [okx_quant/ui_positions.py](/D:/qqokx/okx_quant/ui_positions.py)：账户持仓、历史成交、历史仓位与持仓 WS 缓存状态展示
 - [okx_quant/smart_order.py](/D:/qqokx/okx_quant/smart_order.py)：Smart Order 任务执行
 - [okx_quant/trader_desk.py](/D:/qqokx/okx_quant/trader_desk.py)：交易台能力
+- [okx_quant/arbitrage_ui.py](/D:/qqokx/okx_quant/arbitrage_ui.py)：现货套利窗口，包含机会扫描、套利开仓/平仓、持仓配对平仓、K 线图表与 API 切换
+- [okx_quant/arbitrage/arbitrage_manager.py](/D:/qqokx/okx_quant/arbitrage/arbitrage_manager.py)：套利扫描、开平仓、自动监控总入口
+- [okx_quant/arbitrage/arbitrage_executor.py](/D:/qqokx/okx_quant/arbitrage/arbitrage_executor.py)：套利开仓/平仓执行、部分平仓与成交回报校验
+- [okx_quant/arbitrage/arbitrage_scanner.py](/D:/qqokx/okx_quant/arbitrage/arbitrage_scanner.py)：现货 vs 永续 / 交割扫描、年化比较与类型标签生成
+- [okx_quant/okx_private_ws.py](/D:/qqokx/okx_quant/okx_private_ws.py)：OKX 私有 WebSocket 缓存层，当前用于订单、持仓、账户状态加速
 
 ### 回测与研究
 
@@ -135,10 +142,33 @@ python main.py
 - `scripts/release_one_click.ps1`：一键发版
 - `scripts/release_one_click.bat`：Windows 命令行发版入口
 - `scripts/build_server_package.py`：打包
+- `scripts/run_moni_arbitrage_smoke.py`：`moni/demo` 账户现货套利冒烟测试脚本
 - `scripts/run_btc_market_analysis.py`：BTC 研究分析入口
 - `scripts/generate_comprehensive_backtest_report.py`：综合回测报告生成
 - `scripts/check_local_candle_gaps.py`：本地 K 线缺口检查
 - `scripts/fill_local_candle_gaps.py`：本地 K 线缺口补齐
+
+## 现货套利快速上手
+
+适合第一次使用现货套利窗口时快速走通主流程：
+
+1. 启动主程序后，打开“现货套利”窗口，并先在顶部切换好 `API profile` 与 `实盘 / 模拟盘`。
+2. 在“机会扫描”页勾选 `永续` 或 `交割`，按需要选择 `币种`、排序列，然后点击“立即扫描”查看机会列表。
+3. 在“套利开仓”页填写：
+   - `币种`：例如 `BTC`
+   - `衍生品`：例如 `BTC-USD-260925` 或 `BTC-USDT-SWAP`
+   - `投入数量`：支持按 `币数 / USDT / 合约张数`
+   - `触发方式`：默认 `绝对价差触发`
+   - `开仓绝对价差 >`：价差扩大到阈值以上时开仓
+   - `平仓绝对价差 <`：价差收敛到阈值以下时平仓
+4. 先点“刷新预览”确认现货腿、合约腿和名义价值，再根据需要选择：
+   - “立即开仓”：手动执行一次
+   - “启动自动开仓”：按设定价差持续监控并触发
+5. 开仓后可在“套利平仓”页基于套利账本做平仓；如果仓位不是本工具开的，去“持仓配对平仓”页，直接从当前账户持仓里选择 `现货腿 + 交割/永续腿` 配对平仓。
+6. “持仓配对平仓”支持手动平仓，也支持设置 `绝对价差 < 阈值` 自动平仓；还可以配置 `分批次数 / 每批张数 / 执行方式 / 挂单等待 / 追单次数`。
+7. 如果想观察两条腿走势，可在“套利图表”页加载 `现货 K 线`、`衍生品 K 线` 和 `绝对价差 K 线`。
+
+更详细的字段说明和演示请直接打开 [reports/arbitrage_user_guide.html](/D:/qqokx/reports/arbitrage_user_guide.html)。
 
 ## 测试
 
@@ -157,6 +187,19 @@ python -m pytest tests/test_trader_desk.py
 python -m pytest tests/test_backtest.py
 ```
 
+如果这次改动涉及：
+
+- 现货套利
+- OKX 私有 WebSocket
+- 持仓 / 会话状态展示
+
+建议额外执行：
+
+```powershell
+python -m unittest tests.test_okx_client_orders tests.test_arbitrage tests.test_position_protection -v
+python -m py_compile D:\qqokx\okx_quant\arbitrage_ui.py D:\qqokx\okx_quant\okx_client.py D:\qqokx\okx_quant\ui_positions.py D:\qqokx\okx_quant\ui_strategy_sessions.py
+```
+
 测试文件位于 [tests](/D:/qqokx/tests)。
 
 ## 环境变量
@@ -170,6 +213,15 @@ python -m pytest tests/test_backtest.py
 | `QQOKX_READ_RETRY_ATTEMPTS` | `16` | 最大重试次数 |
 | `QQOKX_READ_RETRY_BASE_DELAY_SECONDS` | `1.5` | 初始退避秒数 |
 | `QQOKX_READ_RETRY_MAX_DELAY_SECONDS` | `24` | 最大退避秒数 |
+| `QQOKX_PRIVATE_WS_ENABLED` | `1` | 是否启用 OKX 私有 WebSocket 加速订单/持仓/账户状态；设为 `0` 时完全回退 REST |
+
+当前推荐架构是：
+
+- `1H` 级主策略、K 线驱动、普通扫描：继续使用 `REST`
+- `订单状态 / 成交回报 / 持仓变化`：优先使用 `私有 WS`
+- `本地现货套利窗口盘口`：当前仍是 `REST 轮询`
+
+这样可以尽量减少服务器端复杂度，同时把最有价值的“交易后状态”先提速。
 
 PowerShell 示例：
 
@@ -204,7 +256,14 @@ scripts\release_one_click.bat
 
 需要查看更细的业务说明、研究记录或协作文档时，可以从以下文件继续进入：
 
+- [reports/arbitrage_user_guide.html](/D:/qqokx/reports/arbitrage_user_guide.html)
+  ：现货套利使用说明，包含各填写框解释与开仓/平仓/持仓配对平仓演示
+- [reports/arbitrage_moni_test_report.html](/D:/qqokx/reports/arbitrage_moni_test_report.html)
+  ：`moni/demo` 账户真实测试报告，记录机会扫描、套利开仓、套利平仓与持仓配对平仓验证结果
+- [reports/server_upgrade_checklist.html](/D:/qqokx/reports/server_upgrade_checklist.html)
+  ：服务器升级操作清单，适合按实盘环境灰度启用私有 WS 加速
 - [软件开发指南.md](/D:/qqokx/软件开发指南.md)
+  ：开发维护说明，已补充私有 WS、现货套利增强、持仓缓存状态提示和本轮回归建议
 - [线程工作流模板.md](/D:/qqokx/线程工作流模板.md)
 - [自动通道系统_v1_产品需求与技术路线.md](/D:/qqokx/自动通道系统_v1_产品需求与技术路线.md)
 - [BTC研究工作台开发记录.md](/D:/qqokx/BTC研究工作台开发记录.md)

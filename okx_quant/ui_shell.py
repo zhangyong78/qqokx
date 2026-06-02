@@ -852,6 +852,7 @@ class ProfilePositionSnapshot:
     upl_usdt_prices: dict[str, Decimal]
     refreshed_at: datetime
     position_instruments: dict[str, Instrument] = field(default_factory=dict)
+    ws_cache_note: str = ""
 
 
 @dataclass
@@ -2751,6 +2752,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._position_current_notes: dict[str, dict[str, object]] = {}
         self._position_history_notes: dict[str, dict[str, object]] = {}
         self._positions_context_note: str | None = None
+        self._positions_ws_cache_note = ""
         self._positions_context_profile_name: str | None = None
         self._positions_last_refresh_at: datetime | None = None
         self._positions_history_last_refresh_at: datetime | None = None
@@ -7175,6 +7177,24 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         messagebox.showerror("密码错误", f"API 配置 {target} 的切换密码不正确。", parent=parent)
         return False
 
+    def _confirm_existing_api_profile_password(self, profile_name: str, *, action_label: str) -> bool:
+        target = profile_name.strip()
+        if not target or not self._credential_profile_requires_switch_password(target):
+            return True
+        parent = self._active_settings_parent()
+        password = simpledialog.askstring(
+            "验证旧密码",
+            f"API 配置 {target} 已设置切换密码。\n请先输入旧密码，再{action_label}：",
+            show="*",
+            parent=parent,
+        )
+        if password is None:
+            return False
+        if verify_profile_switch_password(self._credential_profiles.get(target, {}), password):
+            return True
+        messagebox.showerror("密码错误", f"API 配置 {target} 的旧密码不正确。", parent=parent)
+        return False
+
     def _unlock_current_api_profile(self) -> None:
         profile_name = self._current_credential_profile()
         if not profile_name:
@@ -7196,6 +7216,8 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
     def _set_current_api_profile_switch_password(self) -> None:
         profile_name = self._editing_credential_profile()
         parent = self._active_settings_parent()
+        if not self._confirm_existing_api_profile_password(profile_name, action_label="更新切换密码"):
+            return
         password = simpledialog.askstring(
             "设置 API 切换密码",
             f"给 API 配置 {profile_name} 设置切换密码：",
@@ -7233,6 +7255,8 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         if not self._credential_profile_requires_switch_password(profile_name):
             return
         parent = self._active_settings_parent()
+        if not self._confirm_existing_api_profile_password(profile_name, action_label="清除切换密码"):
+            return
         if not messagebox.askyesno(
             "清除 API 切换密码",
             f"确认清除 API 配置 {profile_name} 的切换密码吗？",

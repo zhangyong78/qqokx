@@ -4,10 +4,137 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from okx_quant.models import Credentials, OrderPlan, StrategyConfig
-from okx_quant.okx_client import OkxApiError, OkxRestClient, _okx_trade_order_request_log_fragment
+from okx_quant.okx_client import OkxApiError, OkxOrderStatus, OkxRestClient, _okx_trade_order_request_log_fragment
 
 
 class OkxClientOrderRequestTest(TestCase):
+    def test_get_positions_prefers_ws_snapshot_when_available(self) -> None:
+        client = OkxRestClient()
+        client.get_cached_private_positions = lambda credentials, environment: (  # type: ignore[method-assign]
+            3,
+            [
+                type("P", (), {"inst_type": "SWAP", "inst_id": "BTC-USDT-SWAP", "pos_side": "net"})(),
+                type("P", (), {"inst_type": "OPTION", "inst_id": "BTC-USD-260626-80000-C", "pos_side": "long"})(),
+            ],
+        )
+        client._request = lambda *args, **kwargs: self.fail("should not call REST positions")  # type: ignore[method-assign]
+
+        positions = client.get_positions(
+            Credentials(api_key="k", secret_key="s", passphrase="p"),
+            environment="live",
+            inst_type="OPTION",
+        )
+
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0].inst_id, "BTC-USD-260626-80000-C")
+
+    def test_get_account_overview_prefers_ws_snapshot_when_available(self) -> None:
+        client = OkxRestClient()
+        overview = object()
+        client.get_cached_private_account_overview = lambda credentials, environment: (1, overview)  # type: ignore[method-assign]
+        client._request = lambda *args, **kwargs: self.fail("should not call REST account overview")  # type: ignore[method-assign]
+
+        result = client.get_account_overview(
+            Credentials(api_key="k", secret_key="s", passphrase="p"),
+            environment="demo",
+        )
+
+        self.assertIs(result, overview)
+
+    def test_wait_private_order_update_uses_ws_snapshot_when_available(self) -> None:
+        client = OkxRestClient()
+
+        class _StubWs:
+            def wait_for_order_update(self, **kwargs):  # noqa: ANN003
+                self.kwargs = kwargs
+                return (
+                    7,
+                    {
+                        "ordId": "123",
+                        "instId": "BTC-USDT-SWAP",
+                        "state": "filled",
+                        "side": "sell",
+                        "ordType": "limit",
+                        "px": "70000",
+                        "avgPx": "70001",
+                        "sz": "2",
+                        "accFillSz": "2",
+                    },
+                )
+
+        stub = _StubWs()
+        client._private_ws_connection_for = lambda *args, **kwargs: stub  # type: ignore[method-assign]
+
+        result = client.wait_private_order_update(
+            Credentials(api_key="k", secret_key="s", passphrase="p"),
+            environment="demo",
+            inst_id="BTC-USDT-SWAP",
+            ord_id="123",
+            timeout=0.1,
+        )
+
+        assert result is not None
+        version, status = result
+        self.assertEqual(version, 7)
+        self.assertIsInstance(status, OkxOrderStatus)
+        self.assertEqual(status.ord_id, "123")
+        self.assertEqual(status.state, "filled")
+        self.assertEqual(status.filled_size, Decimal("2"))
+        self.assertEqual(stub.kwargs["ord_id"], "123")
+
+    def test_wait_private_order_update_returns_none_when_ws_disabled(self) -> None:
+        client = OkxRestClient()
+        with patch.dict("os.environ", {"QQOKX_PRIVATE_WS_ENABLED": "0"}):
+            result = client.wait_private_order_update(
+                Credentials(api_key="k", secret_key="s", passphrase="p"),
+                environment="live",
+                inst_id="BTC-USDT-SWAP",
+                ord_id="123",
+                timeout=0.1,
+            )
+        self.assertIsNone(result)
+
+    def test_get_private_ws_debug_status_reports_disabled_mode(self) -> None:
+        client = OkxRestClient()
+
+        with patch.dict("os.environ", {"QQOKX_PRIVATE_WS_ENABLED": "0"}):
+            status = client.get_private_ws_debug_status(
+                Credentials(api_key="k", secret_key="s", passphrase="p"),
+                environment="live",
+            )
+
+        self.assertFalse(status["enabled"])
+        self.assertEqual(status["reason"], "disabled")
+
+    def test_get_private_ws_debug_status_uses_connection_snapshot(self) -> None:
+        client = OkxRestClient()
+
+        class _StubWs:
+            @staticmethod
+            def debug_status():
+                return {
+                    "connected": True,
+                    "last_error": "",
+                    "version": 9,
+                    "positions_version": 7,
+                    "positions_received_at": 1700000000.0,
+                    "account_version": 8,
+                    "account_received_at": 1700000001.0,
+                    "environment": "demo",
+                }
+
+        client._private_ws_connection_for = lambda *args, **kwargs: _StubWs()  # type: ignore[method-assign]
+
+        status = client.get_private_ws_debug_status(
+            Credentials(api_key="k", secret_key="s", passphrase="p"),
+            environment="demo",
+        )
+
+        self.assertTrue(status["enabled"])
+        self.assertTrue(status["available"])
+        self.assertTrue(status["connected"])
+        self.assertEqual(status["positions_version"], 7)
+
     def test_parse_order_result_merges_attach_algo_errors(self) -> None:
         client = OkxRestClient()
         payload = {
