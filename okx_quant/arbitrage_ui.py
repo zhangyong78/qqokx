@@ -11,6 +11,7 @@ from tkinter import messagebox, ttk
 from typing import Callable, Literal
 
 from okx_quant.arbitrage.basis_calculator import mid_price
+from okx_quant.arbitrage.models import ArbitrageFeeProfile
 from okx_quant.arbitrage.arbitrage_executor import (
     ArbitrageCloseRequest,
     ArbitrageOpenRequest,
@@ -114,6 +115,39 @@ class ArbitrageMarketPanel:
 
 def _spread_abs(spot_price: Decimal, derivative_price: Decimal) -> Decimal:
     return derivative_price - spot_price
+
+
+def _estimated_dual_leg_fee_pct(
+    *,
+    panel_key: str,
+    execution_mode: str,
+    fee_profile: ArbitrageFeeProfile | None = None,
+) -> Decimal:
+    profile = fee_profile or ArbitrageFeeProfile()
+    if panel_key == "roll":
+        if execution_mode == "old_maker_new_taker":
+            return (profile.swap_maker + profile.swap_taker) * Decimal("100")
+        if execution_mode == "new_maker_old_taker":
+            return (profile.swap_taker + profile.swap_maker) * Decimal("100")
+        return (profile.swap_taker * Decimal("2")) * Decimal("100")
+    if execution_mode == "spot_maker_derivative_taker":
+        return (profile.spot_maker + profile.swap_taker) * Decimal("100")
+    if execution_mode == "derivative_maker_spot_taker":
+        return (profile.spot_taker + profile.swap_maker) * Decimal("100")
+    return (profile.spot_taker + profile.swap_taker) * Decimal("100")
+
+
+def _estimated_one_coin_taker_fee_usdt(
+    *,
+    instrument: Instrument,
+    reference_price: Decimal | None,
+    fee_profile: ArbitrageFeeProfile | None = None,
+) -> Decimal | None:
+    if reference_price is None or reference_price <= 0:
+        return None
+    profile = fee_profile or ArbitrageFeeProfile()
+    rate = profile.spot_taker if instrument.inst_type == "SPOT" else profile.swap_taker
+    return reference_price * rate
 
 
 def _instrument_quote_ccy(inst_id: str) -> str:
@@ -1917,6 +1951,7 @@ class ArbitrageWindow:
                 "derivative_inst_id": derivative_inst_id,
                 "spot_side": "buy",
                 "derivative_side": "sell",
+                "execution_mode": self._current_open_execution_mode(),
                 "detail_label": "开仓可执行价差",
             }, ""
         if self._close_tab is not None and current_tab == str(self._close_tab):
@@ -1931,6 +1966,7 @@ class ArbitrageWindow:
                 "derivative_inst_id": entry.derivative_inst_id,
                 "spot_side": "sell",
                 "derivative_side": "buy",
+                "execution_mode": self._current_close_execution_mode(),
                 "detail_label": "平仓可执行价差",
             }, ""
         if self._pair_close_tab is not None and current_tab == str(self._pair_close_tab):
@@ -1946,6 +1982,7 @@ class ArbitrageWindow:
                 "derivative_inst_id": derivative_position.inst_id,
                 "spot_side": _pair_position_close_side(spot_position),
                 "derivative_side": _pair_position_close_side(derivative_position),
+                "execution_mode": self._current_pair_close_execution_mode(),
                 "detail_label": "配对平仓可执行价差",
             }, ""
         if self._roll_tab is not None and current_tab == str(self._roll_tab):
@@ -1963,6 +2000,7 @@ class ArbitrageWindow:
                 "derivative_inst_id": target_derivative_inst_id,
                 "spot_side": "buy",
                 "derivative_side": "sell",
+                "execution_mode": self._current_roll_execution_mode(),
                 "detail_label": "移仓可执行价差",
             }, ""
         return None, None, ""
@@ -2041,6 +2079,23 @@ class ArbitrageWindow:
                 spot_side=context["spot_side"],
                 derivative_side=context["derivative_side"],
             )
+            fee_pct = _estimated_dual_leg_fee_pct(
+                panel_key=panel_key,
+                execution_mode=str(context.get("execution_mode") or "dual_taker"),
+            )
+            left_one_coin_fee = _estimated_one_coin_taker_fee_usdt(
+                instrument=spot_instrument,
+                reference_price=spot_mid or spot_ticker.last or spot_ticker.ask or spot_ticker.bid,
+            )
+            right_one_coin_fee = _estimated_one_coin_taker_fee_usdt(
+                instrument=derivative_instrument,
+                reference_price=derivative_mid or derivative_ticker.last or derivative_ticker.ask or derivative_ticker.bid,
+            )
+            one_coin_fee_total = None
+            if left_one_coin_fee is not None and right_one_coin_fee is not None:
+                one_coin_fee_total = left_one_coin_fee + right_one_coin_fee
+            left_fee_label = "现货" if spot_instrument.inst_type == "SPOT" else "旧合约"
+            right_fee_label = "目标合约" if panel_key == "roll" else "交割"
             spot_quote_ccy = _instrument_quote_ccy(spot_inst_id)
             derivative_quote_ccy = _instrument_quote_ccy(derivative_inst_id)
             spot_base_ccy = spot_inst_id.split("-")[0]
@@ -2070,6 +2125,10 @@ class ArbitrageWindow:
                 "detail_text": (
                     f"{context['detail_label']}：{format_decimal(actionable_abs) if actionable_abs is not None else '-'}"
                     f" | 现货 {context['spot_side']} / 合约 {context['derivative_side']}"
+                    f" | 估算双向手续费 {format_decimal_fixed(fee_pct, 4)}%"
+                    f" | 按1币吃单：{left_fee_label} {format_decimal(left_one_coin_fee) if left_one_coin_fee is not None else '-'} USDT"
+                    f" / {right_fee_label} {format_decimal(right_one_coin_fee) if right_one_coin_fee is not None else '-'} USDT"
+                    f" / 合计 {format_decimal(one_coin_fee_total) if one_coin_fee_total is not None else '-'} USDT"
                 ),
                 "status_text": status_text,
                 "spot_rows": _market_depth_rows(spot_order_book, instrument=spot_instrument),
@@ -2117,6 +2176,8 @@ class ArbitrageWindow:
             return self._close_market_panel
         if panel_key == "pair_close":
             return self._pair_close_market_panel
+        if panel_key == "roll":
+            return self._roll_market_panel
         return None
 
     def _clear_market_panel(self, panel: ArbitrageMarketPanel, *, message: str) -> None:

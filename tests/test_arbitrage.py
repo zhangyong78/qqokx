@@ -18,6 +18,8 @@ from okx_quant.arbitrage.arbitrage_executor import (
 from okx_quant.arbitrage_ui import (
     _actionable_spread_abs,
     _build_spread_candles,
+    _estimated_dual_leg_fee_pct,
+    _estimated_one_coin_taker_fee_usdt,
     _pair_derivative_base_qty_from_contracts,
     _pair_derivative_qty_from_spot_qty,
     _roll_target_future_candidates,
@@ -1093,6 +1095,50 @@ class ArbitrageChartHelperTest(unittest.TestCase):
         self.assertEqual(
             _roll_target_future_candidates("BTC-USD-260626", instruments),
             ["BTC-USD-260925", "BTC-USD-261225"],
+        )
+
+    def test_estimated_dual_leg_fee_pct_supports_roll_and_maker_taker_modes(self) -> None:
+        self.assertEqual(
+            _estimated_dual_leg_fee_pct(panel_key="trade", execution_mode="dual_taker"),
+            Decimal("0.1060"),
+        )
+        self.assertEqual(
+            _estimated_dual_leg_fee_pct(panel_key="pair_close", execution_mode="spot_maker_derivative_taker"),
+            Decimal("0.0850"),
+        )
+        self.assertEqual(
+            _estimated_dual_leg_fee_pct(panel_key="roll", execution_mode="dual_taker"),
+            Decimal("0.1400"),
+        )
+
+    def test_estimated_one_coin_taker_fee_usdt_uses_spot_and_derivative_taker_rates(self) -> None:
+        self.assertEqual(
+            _estimated_one_coin_taker_fee_usdt(
+                instrument=Instrument(
+                    inst_id="BTC-USDT",
+                    inst_type="SPOT",
+                    tick_size=Decimal("0.01"),
+                    lot_size=Decimal("0.0001"),
+                    min_size=Decimal("0.0001"),
+                    state="live",
+                ),
+                reference_price=Decimal("55555.55"),
+            ),
+            Decimal("19.9999980"),
+        )
+        self.assertEqual(
+            _estimated_one_coin_taker_fee_usdt(
+                instrument=Instrument(
+                    inst_id="BTC-USD-260626",
+                    inst_type="FUTURES",
+                    tick_size=Decimal("0.1"),
+                    lot_size=Decimal("1"),
+                    min_size=Decimal("1"),
+                    state="live",
+                ),
+                reference_price=Decimal("14285.71428571428571428571429"),
+            ),
+            Decimal("10.00000000000000000000000000"),
         )
 
 

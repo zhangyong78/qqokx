@@ -943,6 +943,8 @@ def load_notification_snapshot(path: Path | None = None) -> dict[str, object]:
             "notify_trade_fills": True,
             "notify_signals": True,
             "notify_errors": True,
+            "upgrade_launch_mode": "",
+            "upgrade_custom_launch_path": "",
         }
 
     payload = json.loads(target.read_text(encoding="utf-8"))
@@ -970,6 +972,8 @@ def load_notification_snapshot(path: Path | None = None) -> dict[str, object]:
         "notify_trade_fills": bool(payload.get("notify_trade_fills", True)),
         "notify_signals": bool(payload.get("notify_signals", True)),
         "notify_errors": bool(payload.get("notify_errors", True)),
+        "upgrade_launch_mode": str(payload.get("upgrade_launch_mode", "")),
+        "upgrade_custom_launch_path": str(payload.get("upgrade_custom_launch_path", "")),
     }
 
 
@@ -991,6 +995,8 @@ def save_notification_snapshot(
     notify_trade_fills: bool,
     notify_signals: bool,
     notify_errors: bool,
+    upgrade_launch_mode: str = "",
+    upgrade_custom_launch_path: str = "",
     path: Path | None = None,
 ) -> Path:
     target = path or settings_file_path()
@@ -1016,6 +1022,8 @@ def save_notification_snapshot(
         "notify_trade_fills": notify_trade_fills,
         "notify_signals": notify_signals,
         "notify_errors": notify_errors,
+        "upgrade_launch_mode": upgrade_launch_mode.strip(),
+        "upgrade_custom_launch_path": upgrade_custom_launch_path.strip(),
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     temp_path = target.with_suffix(target.suffix + ".tmp")

@@ -11,12 +11,19 @@ from unittest.mock import MagicMock, patch
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import Instrument, OkxOrderResult, OkxOrderStatus, OkxPosition
 from okx_quant.persistence import build_profile_switch_password_snapshot
+from okx_quant.persistence import load_notification_snapshot, save_notification_snapshot
 from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_MTF_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
+)
+from okx_quant.upgrade_launch import (
+    UPGRADE_LAUNCH_MODE_AUTO,
+    UPGRADE_LAUNCH_MODE_CUSTOM,
+    UPGRADE_LAUNCH_MODE_NONE,
+    UpgradeLaunchManager,
 )
 from okx_quant.trader_desk import TraderDraftRecord, TraderRunState, TraderSlotRecord
 from okx_quant.ui import (
@@ -36,7 +43,6 @@ from okx_quant.ui import (
     _build_normal_strategy_book_ledger_rows,
     _build_normal_strategy_book_summary,
     _build_app_restart_command,
-    _build_deploy_upgrade_confirmation_message,
     _build_upgrade_confirmation_message,
     _build_current_position_note_record,
     _build_group_row_values,
@@ -80,7 +86,6 @@ from okx_quant.ui import (
     _trade_order_belongs_to_session,
     _trade_order_session_role,
     _app_restart_workdir,
-    _resolve_upgrade_candidate_root,
     _extract_log_field_decimal,
 )
 
@@ -171,6 +176,69 @@ class UiHelpersTest(TestCase):
             command,
         )
 
+    def test_upgrade_launch_manager_defaults_to_none_in_dev_mode(self) -> None:
+        self.assertEqual(UPGRADE_LAUNCH_MODE_NONE, UpgradeLaunchManager.default_mode(frozen=False))
+
+    def test_upgrade_launch_manager_defaults_to_auto_in_frozen_mode(self) -> None:
+        self.assertEqual(UPGRADE_LAUNCH_MODE_AUTO, UpgradeLaunchManager.default_mode(frozen=True))
+
+    def test_upgrade_launch_manager_resolves_directory_to_qqokx_exe(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            target_dir = Path(temp_dir) / "正式版"
+            target_dir.mkdir()
+            target_exe = target_dir / "qqokx.exe"
+            target_exe.write_text("", encoding="utf-8")
+
+            plan = UpgradeLaunchManager.build_plan(
+                mode=UPGRADE_LAUNCH_MODE_CUSTOM,
+                current_version_command=["python", "main.py"],
+                current_version_workdir=temp_dir,
+                custom_launch_path=str(target_dir),
+            )
+
+            self.assertEqual((str(target_exe.resolve()),), plan.command)
+            self.assertEqual(str(target_dir.resolve()), plan.working_directory)
+
+    def test_upgrade_launch_manager_none_mode_skips_launch(self) -> None:
+        plan = UpgradeLaunchManager.build_plan(
+            mode=UPGRADE_LAUNCH_MODE_NONE,
+            current_version_command=["python", "main.py"],
+            current_version_workdir=r"D:\qqokx",
+        )
+
+        self.assertIsNone(plan.command)
+        self.assertFalse(plan.should_launch)
+
+    def test_notification_snapshot_persists_upgrade_launch_settings(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "settings.json"
+            save_notification_snapshot(
+                environment_label="模拟盘 demo",
+                trade_mode_label="全仓 cross",
+                position_mode_label="净持仓 net",
+                trigger_type_label="标记价格 mark",
+                enabled=False,
+                smtp_host="",
+                smtp_port=465,
+                smtp_username="",
+                smtp_password="",
+                sender_email="",
+                recipient_emails="",
+                api_sender_email_overrides={},
+                use_ssl=True,
+                notify_trade_fills=True,
+                notify_signals=True,
+                notify_errors=True,
+                upgrade_launch_mode=UPGRADE_LAUNCH_MODE_CUSTOM,
+                upgrade_custom_launch_path=r"D:\QQOKX\正式版\qqokx.exe",
+                path=target,
+            )
+
+            snapshot = load_notification_snapshot(target)
+
+            self.assertEqual(UPGRADE_LAUNCH_MODE_CUSTOM, snapshot["upgrade_launch_mode"])
+            self.assertEqual(r"D:\QQOKX\正式版\qqokx.exe", snapshot["upgrade_custom_launch_path"])
+
     def test_app_restart_workdir_uses_script_parent_when_not_frozen(self) -> None:
         workdir = _app_restart_workdir(argv0=r"D:\qqokx\main.py", frozen=False)
 
@@ -189,32 +257,6 @@ class UiHelpersTest(TestCase):
         self.assertIn("可自动迁移：2 条", message)
         self.assertIn("不支持自动迁移：1 条", message)
         self.assertIn(str(Path(r"D:\qqokx_data").resolve()), message)
-
-    def test_build_deploy_upgrade_confirmation_message_includes_source(self) -> None:
-        message = _build_deploy_upgrade_confirmation_message(
-            source_label=r"D:\dist\qqokx_server_package_v0.6.04.zip",
-            source_version="0.6.04",
-            running_count=1,
-            migratable_count=1,
-            unsupported_count=0,
-            data_dir=r"D:\qqokx_data",
-        )
-
-        self.assertIn("升级来源", message)
-        self.assertIn("候选版本：0.6.04", message)
-        self.assertIn("自动覆盖代码目录", message)
-
-    def test_resolve_upgrade_candidate_root_accepts_nested_package_dir(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            package_dir = root / "qqokx_server_package_v0.6.04"
-            package_dir.mkdir()
-            (package_dir / "main.py").write_text("print('ok')", encoding="utf-8")
-            (package_dir / "okx_quant").mkdir()
-
-            resolved = _resolve_upgrade_candidate_root(root)
-
-            self.assertEqual(package_dir.resolve(), resolved)
 
     def test_merge_history_cache_records_prefers_remote_duplicates(self) -> None:
         local_records = [

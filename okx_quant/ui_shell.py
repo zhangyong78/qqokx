@@ -6,11 +6,9 @@ import queue
 import subprocess
 import sys
 import re
-import shutil
 import threading
 import time
 import tempfile
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 import uuid
 from dataclasses import MISSING, asdict, dataclass, field, fields as dataclass_fields, replace
@@ -205,6 +203,14 @@ from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategies.ema_dynamic_multi_timeframe import EmaDynamicMultiTimeframeStrategy
+from okx_quant.upgrade_launch import (
+    UPGRADE_CUSTOM_EXECUTABLE_NAME,
+    UPGRADE_LAUNCH_MODE_AUTO,
+    UPGRADE_LAUNCH_MODE_CUSTOM,
+    UPGRADE_LAUNCH_MODE_NONE,
+    UpgradeLaunchManager,
+    UpgradeLaunchPlan,
+)
 from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_DEFINITIONS,
@@ -295,69 +301,6 @@ def _app_restart_workdir(*, argv0: str | None = None, frozen: bool | None = None
     return str(target.parent)
 
 
-UPGRADE_ALLOWED_DIR_NAMES = ("okx_quant", "export", "research", "stats", "utils", "scripts")
-UPGRADE_ALLOWED_FILE_NAMES = (
-    "main.py",
-    "pyproject.toml",
-    "requirements.txt",
-    "README.md",
-    ".env.example",
-    "RUN.bat",
-    "RUN.ps1",
-    "start.sh",
-    "DEPLOY.txt",
-    "软件开发指南.md",
-    "线程工作流模板.md",
-    "发版协作约定.md",
-    "发版待打包清单.md",
-)
-
-
-def _looks_like_upgrade_root(path: Path) -> bool:
-    return path.is_dir() and (path / "main.py").is_file() and (path / "okx_quant").is_dir()
-
-
-def _resolve_upgrade_candidate_root(path: str | Path) -> Path:
-    candidate = Path(path).expanduser().resolve()
-    if not candidate.exists():
-        raise ValueError(f"升级来源不存在：{candidate}")
-    if candidate.is_file():
-        raise ValueError("目录升级需要选择文件夹，不是单个文件。")
-    if _looks_like_upgrade_root(candidate):
-        return candidate
-    child_dirs = [child for child in candidate.iterdir() if child.is_dir()]
-    direct_matches = [child for child in child_dirs if _looks_like_upgrade_root(child)]
-    if len(direct_matches) == 1:
-        return direct_matches[0]
-    if len(child_dirs) == 1 and _looks_like_upgrade_root(child_dirs[0]):
-        return child_dirs[0]
-    raise ValueError("所选目录里没有找到可升级的程序包。请选包含 main.py 和 okx_quant/ 的版本目录。")
-
-
-def _read_upgrade_candidate_version(source_root: Path) -> str:
-    pyproject_path = source_root / "pyproject.toml"
-    if pyproject_path.exists():
-        try:
-            text = pyproject_path.read_text(encoding="utf-8")
-        except Exception:
-            text = ""
-        match = re.search(r'^\s*version\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
-        if match is not None:
-            return str(match.group(1)).strip()
-    return source_root.name
-
-
-def _build_upgrade_copy_plan(source_root: Path) -> tuple[list[str], list[str]]:
-    dir_names = [name for name in UPGRADE_ALLOWED_DIR_NAMES if (source_root / name).is_dir()]
-    file_names = [name for name in UPGRADE_ALLOWED_FILE_NAMES if (source_root / name).is_file()]
-    if not (source_root / "main.py").is_file() or not (source_root / "okx_quant").is_dir():
-        raise ValueError("升级包缺少 main.py 或 okx_quant/，无法继续。")
-    if "main.py" not in file_names:
-        file_names.insert(0, "main.py")
-    if "okx_quant" not in dir_names:
-        dir_names.insert(0, "okx_quant")
-    return dir_names, file_names
-
 
 def _ps_quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
@@ -365,6 +308,102 @@ def _ps_quote(value: str) -> str:
 
 def _ps_array(values: list[str]) -> str:
     return "@(" + ", ".join(_ps_quote(value) for value in values) + ")"
+
+
+def _build_upgrade_launch_log_message(plan: UpgradeLaunchPlan) -> str:
+    if plan.mode == UPGRADE_LAUNCH_MODE_NONE:
+        return "升级完成后不启动任何程序。"
+    if plan.mode == UPGRADE_LAUNCH_MODE_CUSTOM:
+        return f"升级完成后启动指定版本：{plan.resolved_executable or '-'}"
+    return "升级完成后自动启动当前版本。"
+
+
+def _build_upgrade_launch_worker_script(
+    *,
+    wait_pid: int,
+    plan: UpgradeLaunchPlan,
+    log_file_path: Path,
+) -> str:
+    launch_command = list(plan.command or [])
+    working_directory = plan.working_directory or ""
+    return f"""$ErrorActionPreference = 'Stop'
+$waitPid = {int(wait_pid)}
+$launchMode = {_ps_quote(plan.mode)}
+$launchCommand = {_ps_array(launch_command)}
+$launchWorkingDirectory = {_ps_quote(working_directory)}
+$logFile = {_ps_quote(str(log_file_path.resolve()))}
+
+function Write-UpgradeLaunchLog([string]$message) {{
+    $timestamp = Get-Date -Format 'MM-dd HH:mm:ss'
+    $line = "[$timestamp] $message"
+    $logDir = Split-Path -Parent $logFile
+    if ($logDir) {{
+        New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    }}
+    Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
+}}
+
+for ($attempt = 0; $attempt -lt 240; $attempt++) {{
+    if (-not (Get-Process -Id $waitPid -ErrorAction SilentlyContinue)) {{
+        break
+    }}
+    Start-Sleep -Milliseconds 500
+}}
+if (Get-Process -Id $waitPid -ErrorAction SilentlyContinue) {{
+    throw "等待旧进程退出超时：PID=$waitPid"
+}}
+
+if ($launchMode -eq 'none') {{
+    Write-UpgradeLaunchLog '升级完成后按配置不启动程序。'
+    exit 0
+}}
+
+if (-not $launchCommand -or $launchCommand.Count -eq 0) {{
+    throw '升级启动命令为空。'
+}}
+
+$exe = $launchCommand[0]
+$args = @()
+if ($launchCommand.Count -gt 1) {{
+    $args = $launchCommand[1..($launchCommand.Count - 1)]
+}}
+
+try {{
+    Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $launchWorkingDirectory -WindowStyle Hidden
+    Write-UpgradeLaunchLog ("升级完成后启动成功：模式=" + $launchMode + " | 目标=" + $exe)
+}} catch {{
+    Write-UpgradeLaunchLog ("升级完成后启动失败：模式=" + $launchMode + " | 目标=" + $exe + " | 原因=" + $_.Exception.Message)
+    throw
+}}
+"""
+
+
+def _build_upgrade_launch_worker_command(
+    *,
+    plan: UpgradeLaunchPlan,
+    log_file_path: Path,
+) -> list[str] | None:
+    import tempfile as _tempfile
+
+    if not plan.should_launch and plan.mode != UPGRADE_LAUNCH_MODE_NONE:
+        raise ValueError("升级启动计划无效。")
+    worker_dir = Path(_tempfile.mkdtemp(prefix="qqokx-launch-worker-"))
+    script_path = worker_dir / "run_upgrade_launch.ps1"
+    script_path.write_text(
+        _build_upgrade_launch_worker_script(
+            wait_pid=os.getpid(),
+            plan=plan,
+            log_file_path=log_file_path,
+        ),
+        encoding="utf-8",
+    )
+    return [
+        "powershell",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script_path),
+    ]
 
 
 def _build_upgrade_confirmation_message(
@@ -398,30 +437,6 @@ def _build_upgrade_confirmation_message(
             lines.append("不支持自动迁移的策略会先停止，需要升级后手工重新启动。")
     lines.extend(["", "现在开始程序升级吗？"])
     return "\n".join(lines)
-
-
-def _build_deploy_upgrade_confirmation_message(
-    *,
-    source_label: str,
-    source_version: str,
-    running_count: int,
-    migratable_count: int,
-    unsupported_count: int,
-    data_dir: str | Path,
-) -> str:
-    base = _build_upgrade_confirmation_message(
-        running_count=running_count,
-        migratable_count=migratable_count,
-        unsupported_count=unsupported_count,
-        data_dir=data_dir,
-    )
-    return (
-        f"升级来源：{source_label}\n"
-        f"候选版本：{source_version}\n\n"
-        "程序会在退出后自动覆盖代码目录，再拉起新版本。\n"
-        "如果你选的是压缩包，会先自动解压再升级。\n\n"
-        f"{base}"
-    )
 
 
 UiBacktestEntryMixin = _bind_mixin_to_shell_globals(UiBacktestEntryMixin)
@@ -3013,6 +3028,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.notify_trade_fills = BooleanVar(value=True)
         self.notify_signals = BooleanVar(value=True)
         self.notify_errors = BooleanVar(value=True)
+        self._upgrade_launch_mode_setting = UpgradeLaunchManager.default_mode()
+        self._upgrade_custom_launch_path_setting = ""
+        self._pending_upgrade_launch_settings: tuple[str, str] | None = None
         self.running_session_filter = StringVar(value="全部")
         self.positions_zoom_type_filter = StringVar(value="全部类型")
         self.positions_zoom_keyword = StringVar()
@@ -3352,8 +3370,6 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         system_menu = Menu(menu_bar, tearoff=False)
         system_menu.add_command(label=f"版本信息 (v{APP_VERSION})", command=self.show_version_info)
-        system_menu.add_command(label="一键升级（压缩包）", command=self.upgrade_program_from_zip)
-        system_menu.add_command(label="一键升级（目录）", command=self.upgrade_program_from_directory)
         system_menu.add_command(label="程序升级", command=self.upgrade_program)
         system_menu.add_separator()
         system_menu.add_command(label="退出", command=self._on_close)
@@ -3364,202 +3380,146 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
     def show_version_info(self) -> None:
         messagebox.showinfo("版本信息", build_version_info_text(), parent=self.root)
 
-    def open_one_click_upgrade(self) -> None:
-        selected = messagebox.askyesnocancel(
-            "一键升级",
-            "选择升级来源：\n\n是：从压缩包升级\n否：从目录升级\n取消：不执行",
-            parent=self.root,
-        )
-        if selected is None:
-            return
-        if selected:
-            self.upgrade_program_from_zip()
-            return
-        self.upgrade_program_from_directory()
+    def _save_upgrade_launch_settings(self, *, mode: str, custom_launch_path: str) -> None:
+        self._upgrade_launch_mode_setting = UpgradeLaunchManager.normalize_mode(mode)
+        self._upgrade_custom_launch_path_setting = UpgradeLaunchManager.normalize_custom_launch_path(custom_launch_path)
+        self._save_notification_settings_now(silent=True)
 
-    def upgrade_program_from_zip(self) -> None:
-        source = filedialog.askopenfilename(
-            parent=self.root,
-            title="选择升级压缩包",
-            initialdir=str((Path(_app_restart_workdir()) / "dist").resolve()) if (Path(_app_restart_workdir()) / "dist").exists() else _app_restart_workdir(),
-            filetypes=(("ZIP 压缩包", "*.zip"), ("所有文件", "*.*")),
-        )
-        if not source:
+    def _commit_pending_upgrade_launch_settings(self) -> None:
+        pending = self._pending_upgrade_launch_settings
+        self._pending_upgrade_launch_settings = None
+        if pending is None:
             return
-        extraction_dir: Path | None = None
-        try:
-            extraction_dir = Path(tempfile.mkdtemp(prefix="qqokx-upgrade-zip-"))
-            with zipfile.ZipFile(source) as archive:
-                archive.extractall(extraction_dir)
-            source_root = _resolve_upgrade_candidate_root(extraction_dir)
-            started = self._prepare_deploy_upgrade(
-                source_root=source_root,
-                source_label=str(Path(source).resolve()),
-                cleanup_dir=extraction_dir,
+        self._save_upgrade_launch_settings(mode=pending[0], custom_launch_path=pending[1])
+
+    def _prompt_upgrade_launch_settings(self) -> tuple[str, str, bool] | None:
+        window = Toplevel(self.root)
+        window.title("升级完成后的处理")
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.grab_set()
+
+        mode_var = StringVar(value=self._upgrade_launch_mode_setting)
+        path_var = StringVar(value=self._upgrade_custom_launch_path_setting)
+        remember_var = BooleanVar(value=False)
+
+        body = ttk.Frame(window, padding=16)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(body, text="升级完成后的处理：").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            body,
+            text="自动启动当前版本",
+            variable=mode_var,
+            value=UPGRADE_LAUNCH_MODE_AUTO,
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Radiobutton(
+            body,
+            text="启动指定目录版本",
+            variable=mode_var,
+            value=UPGRADE_LAUNCH_MODE_CUSTOM,
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+        custom_row = ttk.Frame(body)
+        custom_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        custom_row.columnconfigure(0, weight=1)
+        custom_path_entry = ttk.Entry(custom_row, textvariable=path_var, width=56)
+        custom_path_entry.grid(row=0, column=0, sticky="ew")
+
+        def browse_custom_dir() -> None:
+            current_text = path_var.get().strip()
+            initial_dir = ""
+            if current_text:
+                current_path = Path(current_text).expanduser()
+                if current_path.exists():
+                    initial_dir = str(current_path if current_path.is_dir() else current_path.parent)
+            selected = filedialog.askdirectory(
+                parent=window,
+                title="请选择启动目录",
+                initialdir=initial_dir or _app_restart_workdir(),
+                mustexist=True,
             )
-            if not started:
-                shutil.rmtree(extraction_dir, ignore_errors=True)
-        except Exception as exc:
-            if extraction_dir is not None:
-                shutil.rmtree(extraction_dir, ignore_errors=True)
-            messagebox.showerror("升级失败", str(exc), parent=self.root)
+            if not selected:
+                return
+            selected_path = Path(selected).resolve()
+            candidate = selected_path / UPGRADE_CUSTOM_EXECUTABLE_NAME
+            path_var.set(str(candidate if candidate.exists() else selected_path))
 
-    def upgrade_program_from_directory(self) -> None:
-        source = filedialog.askdirectory(
-            parent=self.root,
-            title="选择升级目录",
-            initialdir=str((Path(_app_restart_workdir()) / "dist").resolve()) if (Path(_app_restart_workdir()) / "dist").exists() else _app_restart_workdir(),
-            mustexist=True,
+        browse_button = ttk.Button(custom_row, text="选择目录", command=browse_custom_dir)
+        browse_button.grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(
+            body,
+            text=f"会自动查找 {UPGRADE_CUSTOM_EXECUTABLE_NAME}，也可以直接填写 exe 路径。",
+        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Radiobutton(
+            body,
+            text="升级完成后不启动",
+            variable=mode_var,
+            value=UPGRADE_LAUNCH_MODE_NONE,
+        ).grid(row=5, column=0, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(body, text="记住本次选择", variable=remember_var).grid(row=6, column=0, sticky="w", pady=(12, 0))
+
+        result: dict[str, object] = {"value": None}
+
+        def refresh_custom_state(*_args: object) -> None:
+            is_custom = mode_var.get() == UPGRADE_LAUNCH_MODE_CUSTOM
+            entry_state = "normal" if is_custom else "disabled"
+            button_state = "normal" if is_custom else "disabled"
+            custom_path_entry.configure(state=entry_state)
+            browse_button.configure(state=button_state)
+
+        def confirm() -> None:
+            mode = UpgradeLaunchManager.normalize_mode(mode_var.get())
+            custom_path = path_var.get().strip()
+            if mode == UPGRADE_LAUNCH_MODE_CUSTOM:
+                try:
+                    resolved = UpgradeLaunchManager.resolve_custom_launch_path(custom_path)
+                except Exception as exc:
+                    messagebox.showerror("启动目录无效", str(exc), parent=window)
+                    return
+                custom_path = str(resolved)
+            result["value"] = (mode, custom_path, remember_var.get())
+            window.destroy()
+
+        def cancel() -> None:
+            window.destroy()
+
+        button_row = ttk.Frame(body)
+        button_row.grid(row=7, column=0, sticky="e", pady=(16, 0))
+        ttk.Button(button_row, text="取消", command=cancel).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(button_row, text="确定", command=confirm).grid(row=0, column=1)
+
+        mode_var.trace_add("write", refresh_custom_state)
+        refresh_custom_state()
+        window.protocol("WM_DELETE_WINDOW", cancel)
+        self.root.wait_window(window)
+        value = result["value"]
+        if not isinstance(value, tuple):
+            return None
+        return value  # type: ignore[return-value]
+
+    def _resolve_upgrade_launch_plan(self) -> UpgradeLaunchPlan | None:
+        self._pending_upgrade_launch_settings = None
+        selection = self._prompt_upgrade_launch_settings()
+        if selection is None:
+            return None
+        mode, custom_launch_path, remember_selection = selection
+        plan = UpgradeLaunchManager.build_plan(
+            mode=mode,
+            current_version_command=_build_app_restart_command(),
+            current_version_workdir=_app_restart_workdir(),
+            custom_launch_path=custom_launch_path,
         )
-        if not source:
-            return
-        try:
-            source_root = _resolve_upgrade_candidate_root(source)
-            self._prepare_deploy_upgrade(
-                source_root=source_root,
-                source_label=str(source_root),
-                cleanup_dir=None,
-            )
-        except Exception as exc:
-            messagebox.showerror("升级失败", str(exc), parent=self.root)
-
-    def _prepare_deploy_upgrade(
-        self,
-        *,
-        source_root: Path,
-        source_label: str,
-        cleanup_dir: Path | None,
-    ) -> bool:
-        target_root = Path(_app_restart_workdir()).resolve()
-        if source_root.resolve() == target_root:
-            raise ValueError("不能把当前正在运行的代码目录当成升级来源。请选新版本目录或打包 zip。")
-        dir_names, file_names = _build_upgrade_copy_plan(source_root)
-        running_sessions = [session for session in self.sessions.values() if session.engine.is_running]
-        running_count = len(running_sessions)
-        migratable_count = sum(1 for session in running_sessions if self._session_can_auto_migrate_on_close(session))
-        unsupported_count = max(0, running_count - migratable_count)
-        source_version = _read_upgrade_candidate_version(source_root)
-        message = _build_deploy_upgrade_confirmation_message(
-            source_label=source_label,
-            source_version=source_version,
-            running_count=running_count,
-            migratable_count=migratable_count,
-            unsupported_count=unsupported_count,
-            data_dir=configured_data_root() or data_root(),
-        )
-        confirmed = messagebox.askyesno("一键升级确认", message, parent=self.root)
-        if not confirmed:
-            return False
-        worker_command = self._build_upgrade_worker_command(
-            source_root=source_root,
-            cleanup_dir=cleanup_dir,
-            target_root=target_root,
-            dir_names=dir_names,
-            file_names=file_names,
-        )
-        self._enqueue_log(f"一键升级开始：来源={source_label} | 候选版本={source_version}")
-        self._enqueue_log(f"一键升级复制计划：目录 {', '.join(dir_names)} | 文件 {', '.join(file_names)}")
-        self._upgrade_worker_command_on_close = worker_command
-        self._restart_command_on_close = None
-        self._close_confirmation_required = False
-        self._on_close()
-        return True
-
-    def _build_upgrade_worker_command(
-        self,
-        *,
-        source_root: Path,
-        cleanup_dir: Path | None,
-        target_root: Path,
-        dir_names: list[str],
-        file_names: list[str],
-    ) -> list[str]:
-        worker_dir = Path(tempfile.mkdtemp(prefix="qqokx-upgrade-worker-"))
-        script_path = worker_dir / "run_upgrade.ps1"
-        launch_command = _build_app_restart_command()
-        script_text = self._build_upgrade_worker_script(
-            wait_pid=os.getpid(),
-            source_root=source_root,
-            cleanup_dir=cleanup_dir,
-            target_root=target_root,
-            dir_names=dir_names,
-            file_names=file_names,
-            launch_command=launch_command,
-        )
-        script_path.write_text(script_text, encoding="utf-8")
-        return [
-            "powershell",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(script_path),
-        ]
-
-    def _build_upgrade_worker_script(
-        self,
-        *,
-        wait_pid: int,
-        source_root: Path,
-        cleanup_dir: Path | None,
-        target_root: Path,
-        dir_names: list[str],
-        file_names: list[str],
-        launch_command: list[str],
-    ) -> str:
-        cleanup_text = str(cleanup_dir.resolve()) if cleanup_dir is not None else ""
-        return f"""$ErrorActionPreference = 'Stop'
-$waitPid = {int(wait_pid)}
-$sourceRoot = {_ps_quote(str(source_root.resolve()))}
-$targetRoot = {_ps_quote(str(target_root.resolve()))}
-$cleanupDir = {_ps_quote(cleanup_text)}
-$dirNames = {_ps_array(dir_names)}
-$fileNames = {_ps_array(file_names)}
-$launchCommand = {_ps_array(launch_command)}
-
-for ($attempt = 0; $attempt -lt 240; $attempt++) {{
-    if (-not (Get-Process -Id $waitPid -ErrorAction SilentlyContinue)) {{
-        break
-    }}
-    Start-Sleep -Milliseconds 500
-}}
-if (Get-Process -Id $waitPid -ErrorAction SilentlyContinue) {{
-    throw "等待旧进程退出超时：PID=$waitPid"
-}}
-
-foreach ($name in $dirNames) {{
-    $src = Join-Path $sourceRoot $name
-    if (-not (Test-Path -LiteralPath $src)) {{
-        continue
-    }}
-    $dst = Join-Path $targetRoot $name
-    if (Test-Path -LiteralPath $dst) {{
-        Remove-Item -LiteralPath $dst -Recurse -Force
-    }}
-    Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force
-}}
-
-foreach ($name in $fileNames) {{
-    $src = Join-Path $sourceRoot $name
-    if (-not (Test-Path -LiteralPath $src)) {{
-        continue
-    }}
-    $dst = Join-Path $targetRoot $name
-    Copy-Item -LiteralPath $src -Destination $dst -Force
-}}
-
-if ($cleanupDir) {{
-    Remove-Item -LiteralPath $cleanupDir -Recurse -Force -ErrorAction SilentlyContinue
-}}
-
-$exe = $launchCommand[0]
-$args = @()
-if ($launchCommand.Count -gt 1) {{
-    $args = $launchCommand[1..($launchCommand.Count - 1)]
-}}
-Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -WindowStyle Hidden
-"""
+        if remember_selection:
+            self._pending_upgrade_launch_settings = (mode, custom_launch_path)
+        self._enqueue_log(_build_upgrade_launch_log_message(plan))
+        return plan
 
     def upgrade_program(self) -> None:
+        launch_plan = self._resolve_upgrade_launch_plan()
+        if launch_plan is None:
+            return
         running_sessions = [session for session in self.sessions.values() if session.engine.is_running]
         running_count = len(running_sessions)
         migratable_count = sum(1 for session in running_sessions if self._session_can_auto_migrate_on_close(session))
@@ -3572,7 +3532,9 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         )
         confirmed = messagebox.askyesno("程序升级", message, parent=self.root)
         if not confirmed:
+            self._pending_upgrade_launch_settings = None
             return
+        self._commit_pending_upgrade_launch_settings()
         if migratable_count > 0:
             session_labels = ", ".join(
                 session.session_id for session in running_sessions if self._session_can_auto_migrate_on_close(session)
@@ -3586,7 +3548,10 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
             )
             self._enqueue_log(f"程序升级提示：有 {unsupported_count} 条策略不支持自动迁移，升级后需要手工重启 -> {session_labels}")
         self._upgrade_worker_command_on_close = None
-        self._restart_command_on_close = _build_app_restart_command()
+        self._restart_command_on_close = _build_upgrade_launch_worker_command(
+            plan=launch_plan,
+            log_file_path=daily_log_file_path(base_dir=configured_data_root() or data_root()),
+        )
         self._close_confirmation_required = False
         self._on_close()
 
@@ -6944,6 +6909,10 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
         self.notify_trade_fills.set(bool(snapshot["notify_trade_fills"]))
         self.notify_signals.set(bool(snapshot["notify_signals"]))
         self.notify_errors.set(bool(snapshot["notify_errors"]))
+        self._upgrade_launch_mode_setting = UpgradeLaunchManager.normalize_mode(snapshot.get("upgrade_launch_mode"))
+        self._upgrade_custom_launch_path_setting = UpgradeLaunchManager.normalize_custom_launch_path(
+            snapshot.get("upgrade_custom_launch_path", "")
+        )
         self._sync_current_api_sender_email_override(self._current_credential_profile())
         self._refresh_global_email_toggle_text()
         self._default_environment_label = self._normalized_environment_label(str(snapshot["environment_label"]))
@@ -7426,6 +7395,8 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
                 notify_trade_fills=self.notify_trade_fills.get(),
                 notify_signals=self.notify_signals.get(),
                 notify_errors=self.notify_errors.get(),
+                upgrade_launch_mode=self._upgrade_launch_mode_setting,
+                upgrade_custom_launch_path=self._upgrade_custom_launch_path_setting,
             )
         except Exception as exc:
             if not silent:
@@ -8152,6 +8123,8 @@ Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $targetRoot -
             self.notify_trade_fills.get(),
             self.notify_signals.get(),
             self.notify_errors.get(),
+            self._upgrade_launch_mode_setting,
+            self._upgrade_custom_launch_path_setting,
         )
 
     def _enqueue_log(self, message: str) -> None:
