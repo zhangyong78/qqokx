@@ -4,10 +4,10 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from types import SimpleNamespace
 from tkinter import BooleanVar, Canvas, END, StringVar, Text, Toplevel
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from typing import Callable, Literal
 
 from okx_quant.arbitrage.basis_calculator import mid_price
@@ -20,15 +20,17 @@ from okx_quant.arbitrage.arbitrage_executor import (
 )
 from okx_quant.arbitrage.fill_reconciler import spot_base_from_derivative_fill
 from okx_quant.arbitrage.arbitrage_manager import ArbitrageManager
-from okx_quant.arbitrage.models import ArbitrageOpportunity, ArbitrageTradeRuntime
+from okx_quant.arbitrage.models import ArbitrageOpportunity, ArbitrageRuntimeConfig, ArbitrageTradeRuntime
 from okx_quant.models import Candle, Credentials, Instrument, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderBook, OkxPosition, OkxTicker, infer_inst_type
 from okx_quant.persistence import (
     DEFAULT_CREDENTIAL_PROFILE_NAME,
+    credential_profile_has_switch_password,
     load_arbitrage_settings_snapshot,
     load_credentials_profiles_snapshot,
     load_credentials_snapshot,
     save_arbitrage_settings_snapshot,
+    verify_profile_switch_password,
 )
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.strategy_live_chart import StrategyLiveChartSnapshot, build_strategy_live_chart_snapshot, render_strategy_live_chart
@@ -101,6 +103,18 @@ class PairCloseAutoSession:
 
 
 @dataclass
+class RollAutoSession:
+    current_derivative_inst_id: str
+    target_derivative_inst_id: str
+    target_derivative_qty: Decimal
+    trigger_spread_abs_min: Decimal
+    status: str = "监控中"
+    last_spread_pct: Decimal | None = None
+    last_spread_abs: Decimal | None = None
+    triggered: bool = False
+
+
+@dataclass
 class ArbitrageMarketPanel:
     spot_title_text: StringVar
     spot_quote_text: StringVar
@@ -137,17 +151,51 @@ def _estimated_dual_leg_fee_pct(
     return (profile.spot_taker + profile.swap_taker) * Decimal("100")
 
 
-def _estimated_one_coin_taker_fee_usdt(
+def _market_panel_fee_labels_and_liquidity(
+    *,
+    panel_key: str,
+    execution_mode: str,
+) -> tuple[tuple[str, str], tuple[str, str]]:
+    if panel_key == "roll":
+        if execution_mode == "old_maker_new_taker":
+            return ("旧合约挂单", "maker"), ("新合约吃单", "taker")
+        if execution_mode == "new_maker_old_taker":
+            return ("旧合约吃单", "taker"), ("新合约挂单", "maker")
+        return ("旧合约吃单", "taker"), ("新合约吃单", "taker")
+    if execution_mode == "spot_maker_derivative_taker":
+        return ("现货挂单", "maker"), ("交割吃单", "taker")
+    if execution_mode == "derivative_maker_spot_taker":
+        return ("现货吃单", "taker"), ("交割挂单", "maker")
+    return ("现货吃单", "taker"), ("交割吃单", "taker")
+
+
+def _market_panel_side_labels(panel_key: str) -> tuple[str, str]:
+    if panel_key == "roll":
+        return "旧合约", "新合约"
+    return "现货", "合约"
+
+
+def _estimated_one_coin_fee_usdt(
     *,
     instrument: Instrument,
     reference_price: Decimal | None,
+    liquidity: str = "taker",
     fee_profile: ArbitrageFeeProfile | None = None,
 ) -> Decimal | None:
     if reference_price is None or reference_price <= 0:
         return None
     profile = fee_profile or ArbitrageFeeProfile()
-    rate = profile.spot_taker if instrument.inst_type == "SPOT" else profile.swap_taker
+    if instrument.inst_type == "SPOT":
+        rate = profile.spot_maker if liquidity == "maker" else profile.spot_taker
+    else:
+        rate = profile.swap_maker if liquidity == "maker" else profile.swap_taker
     return reference_price * rate
+
+
+def _format_fee_amount_usdt_rounded(amount: Decimal | None) -> str:
+    if amount is None:
+        return "-"
+    return format_decimal_fixed(amount.quantize(Decimal("1"), rounding=ROUND_HALF_UP), 0)
 
 
 def _instrument_quote_ccy(inst_id: str) -> str:
@@ -545,6 +593,22 @@ def _split_pair_close_batches(
     return batches
 
 
+def _format_batch_plan_summary(planned_batches: list[Decimal], *, preview_items: int = 6) -> str:
+    if not planned_batches:
+        return "0 批"
+    if len(planned_batches) <= preview_items * 2:
+        return f"{len(planned_batches)} 批 | {', '.join(format_decimal(item) for item in planned_batches)}"
+    head = ", ".join(format_decimal(item) for item in planned_batches[:preview_items])
+    tail = ", ".join(format_decimal(item) for item in planned_batches[-preview_items:])
+    min_batch = min(planned_batches)
+    max_batch = max(planned_batches)
+    if min_batch == max_batch:
+        range_text = f"每批约 {format_decimal(min_batch)}"
+    else:
+        range_text = f"每批 {format_decimal(min_batch)}~{format_decimal(max_batch)}"
+    return f"{len(planned_batches)} 批 | {range_text} | 前 {preview_items} 批: {head} | 后 {preview_items} 批: {tail}"
+
+
 def _build_pair_close_strategy_config(position: OkxPosition, *, environment: str) -> StrategyConfig:
     normalized_mgn_mode = (position.mgn_mode or "").strip().lower()
     trade_mode = normalized_mgn_mode if normalized_mgn_mode in {"cross", "isolated", "cash"} else "cross"
@@ -586,6 +650,29 @@ def _credential_profile_environment(profile_snapshot: dict[str, str] | None, *, 
     if environment in {"demo", "live"}:
         return environment
     return fallback if fallback in {"demo", "live"} else "demo"
+
+
+def _decimal_fee_rate_from_profile(
+    profile_snapshot: dict[str, str] | None,
+    key: str,
+    fallback_percent: str,
+) -> Decimal:
+    raw = str((profile_snapshot or {}).get(key, "") or "").strip()
+    if not raw:
+        return Decimal(fallback_percent) / Decimal("100")
+    try:
+        return Decimal(raw) / Decimal("100")
+    except (InvalidOperation, ValueError):
+        return Decimal(fallback_percent) / Decimal("100")
+
+
+def _arbitrage_fee_profile_from_snapshot(profile_snapshot: dict[str, str] | None) -> ArbitrageFeeProfile:
+    return ArbitrageFeeProfile(
+        spot_maker=_decimal_fee_rate_from_profile(profile_snapshot, "spot_maker_fee_rate", "0.0600"),
+        spot_taker=_decimal_fee_rate_from_profile(profile_snapshot, "spot_taker_fee_rate", "0.0700"),
+        swap_maker=_decimal_fee_rate_from_profile(profile_snapshot, "futures_maker_fee_rate", "0.0150"),
+        swap_taker=_decimal_fee_rate_from_profile(profile_snapshot, "futures_taker_fee_rate", "0.0360"),
+    )
 
 
 def _environment_label(environment: str) -> str:
@@ -653,6 +740,8 @@ class ArbitrageWindow:
         self._runtime_config_provider = runtime_config_provider
         self._logger = logger or (lambda _message: None)
         self.manager = ArbitrageManager(client, logger=self._append_log)
+        self._api_profile_snapshots: dict[str, dict[str, str]] = {}
+        self._unlocked_api_profiles: set[str] = set()
         self._scan_thread: threading.Thread | None = None
         self._scan_busy = False
         self._destroying = False
@@ -702,6 +791,9 @@ class ArbitrageWindow:
         self._pair_close_auto_thread: threading.Thread | None = None
         self._pair_close_auto_stop_event = threading.Event()
         self._pair_close_auto_session: PairCloseAutoSession | None = None
+        self._roll_auto_thread: threading.Thread | None = None
+        self._roll_auto_stop_event = threading.Event()
+        self._roll_auto_session: RollAutoSession | None = None
         self._market_instrument_cache: dict[str, Instrument] = {}
         self._trade_market_panel: ArbitrageMarketPanel | None = None
         self._close_market_panel: ArbitrageMarketPanel | None = None
@@ -719,9 +811,11 @@ class ArbitrageWindow:
                 runtime = None
             if runtime is not None:
                 runtime_profile_name = runtime.credential_profile_name.strip()
-        selected_api_profile = str(settings.get("api_profile_name", "") or "").strip()
+        if runtime_profile_name:
+            self._unlocked_api_profiles.add(runtime_profile_name)
+        selected_api_profile = runtime_profile_name or str(settings.get("api_profile_name", "") or "").strip()
         if not selected_api_profile:
-            selected_api_profile = runtime_profile_name or str(profiles_snapshot.get("selected_profile", "") or "").strip()
+            selected_api_profile = str(profiles_snapshot.get("selected_profile", "") or "").strip()
         if selected_api_profile not in self._api_profile_names:
             selected_api_profile = self._api_profile_names[0]
         self.api_profile_name = StringVar(value=selected_api_profile)
@@ -773,6 +867,7 @@ class ArbitrageWindow:
         self.roll_execution_mode_label = StringVar(value=str(settings.get("roll_execution_mode_label", "双腿吃单")))
         self.roll_maker_wait_seconds = StringVar(value=str(settings.get("roll_maker_wait_seconds", "6")))
         self.roll_chase_limit = StringVar(value=str(settings.get("roll_chase_limit", "3")))
+        self.roll_auto_spread_abs_min = StringVar(value=str(settings.get("roll_auto_spread_abs_min", "")))
         self.pair_close_execution_mode_label = StringVar(
             value=str(settings.get("pair_close_execution_mode_label", "双腿吃单"))
         )
@@ -851,6 +946,7 @@ class ArbitrageWindow:
             self.manager.stop_auto_open()
             self.manager.stop_auto_close()
             self._stop_pair_close_auto(silent=True)
+            self._stop_auto_roll(silent=True)
         except Exception:
             pass
         if self._refresh_job is not None:
@@ -919,6 +1015,7 @@ class ArbitrageWindow:
                 "roll_execution_mode_label": self.roll_execution_mode_label.get().strip(),
                 "roll_maker_wait_seconds": self.roll_maker_wait_seconds.get().strip(),
                 "roll_chase_limit": self.roll_chase_limit.get().strip(),
+                "roll_auto_spread_abs_min": self.roll_auto_spread_abs_min.get().strip(),
                 "pair_close_execution_mode_label": self.pair_close_execution_mode_label.get().strip(),
                 "pair_close_maker_wait_seconds": self.pair_close_maker_wait_seconds.get().strip(),
                 "pair_close_chase_limit": self.pair_close_chase_limit.get().strip(),
@@ -1044,7 +1141,11 @@ class ArbitrageWindow:
         derivative_tree = self._build_market_book_tree(right)
         derivative_tree.grid(row=2, column=0, sticky="nsew")
 
-        ttk.Label(frame, textvariable=spread_text).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        summary_row = ttk.Frame(frame)
+        summary_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 2))
+        summary_row.columnconfigure(0, weight=1)
+        ttk.Label(summary_row, textvariable=spread_text).grid(row=0, column=0, sticky="w")
+        ttk.Button(summary_row, text="价差图", command=self._open_chart_from_market_panel).grid(row=0, column=1, sticky="e")
         ttk.Label(frame, textvariable=detail_text, style="Hint.TLabel", wraplength=wraplength, justify="left").grid(
             row=2, column=0, columnspan=2, sticky="w"
         )
@@ -1667,17 +1768,27 @@ class ArbitrageWindow:
         ttk.Entry(limit_row, textvariable=self.roll_target_limit_price, width=12).pack(side="left", padx=(4, 0))
         row += 1
 
+        ttk.Label(frame, text="自动移仓").grid(row=row, column=0, sticky="w", pady=4)
+        auto_row = ttk.Frame(frame)
+        auto_row.grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Label(auto_row, text="绝对价差 >=").pack(side="left")
+        ttk.Entry(auto_row, textvariable=self.roll_auto_spread_abs_min, width=10).pack(side="left", padx=(4, 4))
+        ttk.Label(auto_row, text="时执行").pack(side="left")
+        row += 1
+
         self._add_inline_hint(
             frame,
             row=row,
-            text="移仓会保留现货腿不动，只做旧交割合约回补 + 新交割合约开出。分批、挂单等待、追单次数都按合约张数生效。",
+            text="移仓会保留现货腿不动，只做旧交割合约回补 + 新交割合约开出。分批、挂单等待、追单次数都按合约张数生效；自动移仓按“新合约买一 - 旧合约卖一”的绝对价差监控。",
             wraplength=820,
         )
         row += 1
 
         btn_row = ttk.Frame(frame)
         btn_row.grid(row=row, column=1, sticky="w", pady=(10, 4))
-        ttk.Button(btn_row, text="执行移仓", command=self._submit_roll).pack(side="left")
+        ttk.Button(btn_row, text="执行移仓", command=self._submit_roll).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="启动自动移仓", command=self._start_auto_roll).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="停止自动移仓", command=self._stop_auto_roll).pack(side="left")
         row += 1
 
         ttk.Label(frame, textvariable=self.roll_status_text, wraplength=820, justify="left").grid(
@@ -2079,23 +2190,33 @@ class ArbitrageWindow:
                 spot_side=context["spot_side"],
                 derivative_side=context["derivative_side"],
             )
+            fee_profile = self._selected_api_fee_profile()
             fee_pct = _estimated_dual_leg_fee_pct(
                 panel_key=panel_key,
                 execution_mode=str(context.get("execution_mode") or "dual_taker"),
+                fee_profile=fee_profile,
             )
-            left_one_coin_fee = _estimated_one_coin_taker_fee_usdt(
+            execution_mode = str(context.get("execution_mode") or "dual_taker")
+            (left_fee_label, left_liquidity), (right_fee_label, right_liquidity) = _market_panel_fee_labels_and_liquidity(
+                panel_key=panel_key,
+                execution_mode=execution_mode,
+            )
+            left_one_coin_fee = _estimated_one_coin_fee_usdt(
                 instrument=spot_instrument,
                 reference_price=spot_mid or spot_ticker.last or spot_ticker.ask or spot_ticker.bid,
+                liquidity=left_liquidity,
+                fee_profile=fee_profile,
             )
-            right_one_coin_fee = _estimated_one_coin_taker_fee_usdt(
+            right_one_coin_fee = _estimated_one_coin_fee_usdt(
                 instrument=derivative_instrument,
                 reference_price=derivative_mid or derivative_ticker.last or derivative_ticker.ask or derivative_ticker.bid,
+                liquidity=right_liquidity,
+                fee_profile=fee_profile,
             )
             one_coin_fee_total = None
             if left_one_coin_fee is not None and right_one_coin_fee is not None:
                 one_coin_fee_total = left_one_coin_fee + right_one_coin_fee
-            left_fee_label = "现货" if spot_instrument.inst_type == "SPOT" else "旧合约"
-            right_fee_label = "目标合约" if panel_key == "roll" else "交割"
+            left_side_label, right_side_label = _market_panel_side_labels(panel_key)
             spot_quote_ccy = _instrument_quote_ccy(spot_inst_id)
             derivative_quote_ccy = _instrument_quote_ccy(derivative_inst_id)
             spot_base_ccy = spot_inst_id.split("-")[0]
@@ -2124,11 +2245,11 @@ class ArbitrageWindow:
                 "spread_text": f"[{source_mode}] {spread_text}",
                 "detail_text": (
                     f"{context['detail_label']}：{format_decimal(actionable_abs) if actionable_abs is not None else '-'}"
-                    f" | 现货 {context['spot_side']} / 合约 {context['derivative_side']}"
+                    f" | {left_side_label} {context['spot_side']} / {right_side_label} {context['derivative_side']}"
                     f" | 估算双向手续费 {format_decimal_fixed(fee_pct, 4)}%"
-                    f" | 按1币吃单：{left_fee_label} {format_decimal(left_one_coin_fee) if left_one_coin_fee is not None else '-'} USDT"
-                    f" / {right_fee_label} {format_decimal(right_one_coin_fee) if right_one_coin_fee is not None else '-'} USDT"
-                    f" / 合计 {format_decimal(one_coin_fee_total) if one_coin_fee_total is not None else '-'} USDT"
+                    f" | 按1币估算：{left_fee_label}：{_format_fee_amount_usdt_rounded(left_one_coin_fee)} USDT"
+                    f" / {right_fee_label}：{_format_fee_amount_usdt_rounded(right_one_coin_fee)} USDT"
+                    f" / 合计 {_format_fee_amount_usdt_rounded(one_coin_fee_total)} USDT"
                 ),
                 "status_text": status_text,
                 "spot_rows": _market_depth_rows(spot_order_book, instrument=spot_instrument),
@@ -2245,6 +2366,17 @@ class ArbitrageWindow:
         except Exception:
             pass
 
+    def _set_roll_status_async(self, message: str) -> None:
+        def _apply() -> None:
+            if self._destroying or not self.window.winfo_exists():
+                return
+            self.roll_status_text.set(message)
+
+        try:
+            self.window.after(0, _apply)
+        except Exception:
+            pass
+
     def _selected_api_profile_name(self) -> str:
         profile_name = self.api_profile_name.get().strip()
         if profile_name in self._api_profile_names:
@@ -2253,13 +2385,72 @@ class ArbitrageWindow:
             return self._api_profile_names[0]
         return DEFAULT_CREDENTIAL_PROFILE_NAME
 
+    def _selected_api_profile_snapshot(self) -> dict[str, str]:
+        profile_name = self._selected_api_profile_name()
+        snapshot = self._api_profile_snapshots.get(profile_name)
+        if isinstance(snapshot, dict):
+            return snapshot
+        return load_credentials_snapshot(profile_name=profile_name)
+
+    def _api_profile_requires_switch_password(self, profile_name: str) -> bool:
+        snapshot = self._api_profile_snapshots.get(profile_name.strip(), {})
+        return credential_profile_has_switch_password(snapshot)
+
+    def _api_profile_is_unlocked(self, profile_name: str) -> bool:
+        target = profile_name.strip()
+        return bool(target) and target in self._unlocked_api_profiles
+
+    def _ensure_api_profile_unlocked(self, profile_name: str, *, interactive: bool) -> bool:
+        target = profile_name.strip()
+        if not target:
+            return False
+        if not self._api_profile_requires_switch_password(target):
+            self._unlocked_api_profiles.add(target)
+            return True
+        if self._api_profile_is_unlocked(target):
+            return True
+        if not interactive:
+            return False
+        password = simpledialog.askstring(
+            "输入 API 切换密码",
+            f"API 配置 {target} 已设置切换密码，请输入后继续：",
+            show="*",
+            parent=self.window,
+        )
+        if password is None:
+            return False
+        profile_snapshot = self._api_profile_snapshots.get(target, {})
+        if verify_profile_switch_password(profile_snapshot, password):
+            self._unlocked_api_profiles.add(target)
+            return True
+        messagebox.showerror("密码错误", f"API 配置 {target} 的切换密码不正确。", parent=self.window)
+        return False
+
     def _selected_api_environment(self) -> str:
-        profile_snapshot = load_credentials_snapshot(profile_name=self._selected_api_profile_name())
+        profile_snapshot = self._selected_api_profile_snapshot()
         return _credential_profile_environment(profile_snapshot, fallback="demo")
+
+    def _selected_api_fee_profile(self) -> ArbitrageFeeProfile:
+        profile_snapshot = self._selected_api_profile_snapshot()
+        return _arbitrage_fee_profile_from_snapshot(profile_snapshot)
+
+    def _rebuild_manager_for_selected_api(self) -> None:
+        self.manager = ArbitrageManager(
+            self.client,
+            config=ArbitrageRuntimeConfig(fee_profile=self._selected_api_fee_profile()),
+            logger=self._append_log,
+        )
 
     def _sync_api_profile_controls(self) -> None:
         snapshot = load_credentials_profiles_snapshot()
+        profiles = snapshot.get("profiles", {})
+        self._api_profile_snapshots = {
+            str(name).strip(): dict(profile)
+            for name, profile in profiles.items()
+            if str(name).strip() and isinstance(profile, dict)
+        } if isinstance(profiles, dict) else {}
         self._api_profile_names = _credential_profile_names_from_snapshot(snapshot)
+        self._unlocked_api_profiles.intersection_update(self._api_profile_names)
         current = self._selected_api_profile_name()
         if current not in self._api_profile_names:
             current = self._api_profile_names[0]
@@ -2268,9 +2459,10 @@ class ArbitrageWindow:
             self._api_profile_combo.configure(values=self._api_profile_names, width=combo_width)
         if self.api_profile_name.get().strip() != current:
             self.api_profile_name.set(current)
-        profile_snapshot = load_credentials_snapshot(profile_name=current)
+        profile_snapshot = self._api_profile_snapshots.get(current, load_credentials_snapshot(profile_name=current))
         environment = _credential_profile_environment(profile_snapshot, fallback="demo")
         self.api_environment_text.set(_environment_label(environment))
+        self.manager = ArbitrageManager(self.client, config=ArbitrageRuntimeConfig(fee_profile=_arbitrage_fee_profile_from_snapshot(profile_snapshot)), logger=self._append_log)
         self._last_api_profile_name = current
 
     def _clear_pair_close_selection(self) -> None:
@@ -2317,10 +2509,16 @@ class ArbitrageWindow:
             self.api_profile_name.set(self._last_api_profile_name)
             return
         if selected == self._last_api_profile_name:
+            if not self._ensure_api_profile_unlocked(selected, interactive=True):
+                self.api_profile_name.set(self._last_api_profile_name)
+                return
             self._sync_api_profile_controls()
             return
-        if self.manager.auto_open.is_running or self.manager.auto_close.is_running or self._is_pair_close_auto_running():
-            messagebox.showwarning("提示", "请先停止自动开仓/自动平仓/自动配对平仓监控，再切换 API。", parent=self.window)
+        if self.manager.auto_open.is_running or self.manager.auto_close.is_running or self._is_pair_close_auto_running() or self._is_roll_auto_running():
+            messagebox.showwarning("提示", "请先停止自动开仓/自动平仓/自动配对平仓/自动移仓监控，再切换 API。", parent=self.window)
+            self.api_profile_name.set(self._last_api_profile_name)
+            return
+        if not self._ensure_api_profile_unlocked(selected, interactive=True):
             self.api_profile_name.set(self._last_api_profile_name)
             return
         self._sync_api_profile_controls()
@@ -2641,6 +2839,25 @@ class ArbitrageWindow:
         opp = self._selected_opportunity
         self.chart_spot_inst_id.set(opp.spot_inst_id)
         self.chart_derivative_inst_id.set(opp.derivative_inst_id)
+        if self._chart_tab is not None:
+            self._notebook.select(self._chart_tab)
+        self._load_arbitrage_charts()
+
+    def _open_chart_from_market_panel(self) -> None:
+        panel, context, empty_message = self._active_market_panel_context()
+        if panel is None:
+            messagebox.showwarning("提示", "当前页没有可查看的双腿盘口。", parent=self.window)
+            return
+        if context is None:
+            messagebox.showwarning("提示", empty_message or "请先选择产品后再查看价差图。", parent=self.window)
+            return
+        spot_inst_id = str(context.get("spot_inst_id") or "").strip().upper()
+        derivative_inst_id = str(context.get("derivative_inst_id") or "").strip().upper()
+        if not spot_inst_id or not derivative_inst_id:
+            messagebox.showwarning("提示", "当前双腿产品不完整，暂时无法打开价差图。", parent=self.window)
+            return
+        self.chart_spot_inst_id.set(spot_inst_id)
+        self.chart_derivative_inst_id.set(derivative_inst_id)
         if self._chart_tab is not None:
             self._notebook.select(self._chart_tab)
         self._load_arbitrage_charts()
@@ -3230,7 +3447,7 @@ class ArbitrageWindow:
                     f"并开出 {target_derivative_inst_id} {format_decimal(derivative_qty)} 张",
                     f"对应继续占用现货：{format_decimal(roll_spot_qty)} {entry.base_ccy}",
                     f"当前移仓绝对价差：{format_decimal(spread_abs)}",
-                    f"分批计划：{len(planned_batches)} 批 | {', '.join(format_decimal(item) for item in planned_batches)}",
+                    f"分批计划：{_format_batch_plan_summary(planned_batches)}",
                     f"执行方式：{self.roll_execution_mode_label.get().strip()} | 最大滑点：{self.max_slippage_percent.get().strip()}%",
                 ]
             )
@@ -3516,6 +3733,13 @@ class ArbitrageWindow:
             raise ValueError("移仓每批张数必须大于 0。")
         return batch_qty
 
+    def _parse_roll_auto_spread_abs_min(self) -> Decimal:
+        threshold_text = self.roll_auto_spread_abs_min.get().strip()
+        if not threshold_text:
+            raise ValueError("请先填写自动移仓绝对价差。")
+        threshold = Decimal(threshold_text)
+        return threshold
+
     def _parse_open_maker_wait_seconds(self) -> float:
         wait_seconds = float(self.open_maker_wait_seconds.get().strip() or "6")
         if wait_seconds <= 0:
@@ -3551,6 +3775,21 @@ class ArbitrageWindow:
         if chase_limit < 0:
             raise ValueError("移仓追单次数不能小于 0。")
         return chase_limit
+
+    def _refresh_roll_live_spread(
+        self,
+        current_derivative_inst_id: str,
+        target_derivative_inst_id: str,
+    ) -> tuple[Decimal | None, Decimal | None]:
+        current_ticker = self.client.get_ticker(current_derivative_inst_id)
+        target_ticker = self.client.get_ticker(target_derivative_inst_id)
+        current_buy = current_ticker.ask or current_ticker.last
+        target_sell = target_ticker.bid or target_ticker.last
+        if current_buy is None or current_buy <= 0 or target_sell is None:
+            return None, None
+        spread_abs = target_sell - current_buy
+        spread_pct = spread_abs / current_buy * Decimal("100")
+        return spread_pct, spread_abs
 
     def _parse_pair_close_maker_wait_seconds(self) -> float:
         wait_seconds = float(self.pair_close_maker_wait_seconds.get().strip() or "6")
@@ -4235,7 +4474,7 @@ class ArbitrageWindow:
         runtime = self._runtime_or_warn()
         if runtime is None:
             return
-        if self.manager.auto_open.is_running or self.manager.auto_close.is_running:
+        if self.manager.auto_open.is_running or self.manager.auto_close.is_running or self._is_roll_auto_running():
             messagebox.showwarning("提示", "请先停止其他自动开平仓监控。", parent=self.window)
             return
         if self._is_pair_close_auto_running():
@@ -4351,6 +4590,116 @@ class ArbitrageWindow:
         if not silent:
             self.pair_close_status_text.set("自动配对平仓监控已停止。")
             self._append_log("已停止自动配对平仓监控。")
+
+    def _is_roll_auto_running(self) -> bool:
+        return self._roll_auto_thread is not None and self._roll_auto_thread.is_alive()
+
+    def _start_auto_roll(self) -> None:
+        runtime = self._runtime_or_warn()
+        if runtime is None:
+            return
+        if self.manager.auto_open.is_running or self.manager.auto_close.is_running or self._is_pair_close_auto_running():
+            messagebox.showwarning("提示", "请先停止其他自动开平仓监控。", parent=self.window)
+            return
+        if self._is_roll_auto_running():
+            messagebox.showwarning("提示", "自动移仓监控已经在运行。", parent=self.window)
+            return
+        entry = self._selected_roll_entry()
+        if entry is None:
+            messagebox.showwarning("提示", "请先刷新并选择一条当前交割合约持仓。", parent=self.window)
+            return
+        try:
+            roll_qty = self._parse_roll_derivative_qty(entry)
+            request = self._build_roll_request(entry=entry, roll_derivative_qty=roll_qty)
+            trigger_spread_abs_min = self._parse_roll_auto_spread_abs_min()
+        except (InvalidOperation, ValueError) as exc:
+            messagebox.showwarning("参数错误", str(exc), parent=self.window)
+            return
+        if not request.target_derivative_inst_id:
+            messagebox.showwarning("提示", "请先填写更远交割合约。", parent=self.window)
+            return
+
+        session = RollAutoSession(
+            current_derivative_inst_id=request.current_derivative_inst_id,
+            target_derivative_inst_id=request.target_derivative_inst_id,
+            target_derivative_qty=roll_qty,
+            trigger_spread_abs_min=trigger_spread_abs_min,
+            status="监控中",
+        )
+        self._roll_auto_stop_event.clear()
+        self._roll_auto_session = session
+        self.roll_status_text.set("自动移仓监控已启动。")
+        self._append_log(
+            f"已启动自动移仓监控 | 当前={request.current_derivative_inst_id} | 目标={request.target_derivative_inst_id} "
+            f"| 数量={format_decimal(roll_qty)} 张 | 触发绝对价差>={format_decimal(trigger_spread_abs_min)}"
+        )
+
+        def _worker() -> None:
+            message = ""
+            error: Exception | None = None
+            try:
+                while not self._roll_auto_stop_event.is_set():
+                    spread_pct, spread_abs = self._refresh_roll_live_spread(
+                        session.current_derivative_inst_id,
+                        session.target_derivative_inst_id,
+                    )
+                    session.last_spread_pct = spread_pct
+                    session.last_spread_abs = spread_abs
+                    session.status = (
+                        f"监控中 | 绝对价差 {format_decimal(spread_abs) if spread_abs is not None else '-'}"
+                        f" / 触发值 {format_decimal(session.trigger_spread_abs_min)}"
+                    )
+                    self._set_roll_status_async(session.status)
+                    if spread_abs is not None and spread_abs >= session.trigger_spread_abs_min:
+                        session.triggered = True
+                        session.status = "条件满足，开始执行自动移仓…"
+                        self._set_roll_status_async(session.status)
+                        self._append_log(session.status)
+                        result = self.manager.roll_now(request, runtime=runtime)
+                        message = result.message
+                        if not result.success:
+                            raise RuntimeError(result.message)
+                        break
+                    time.sleep(PAIR_CLOSE_MONITOR_POLL_SECONDS)
+                if self._roll_auto_stop_event.is_set() and not session.triggered:
+                    message = "自动移仓监控已停止。"
+            except Exception as exc:
+                message = str(exc)
+                error = exc
+
+            def _apply() -> None:
+                if not self.window.winfo_exists():
+                    return
+                self._roll_auto_thread = None
+                self._roll_auto_session = None
+                self.roll_status_text.set(message or "自动移仓监控已结束。")
+                self._append_log(message or "自动移仓监控已结束。")
+                if error is None and session.triggered:
+                    self._reload_ledger()
+                    self._refresh_roll_positions()
+                    messagebox.showinfo("自动移仓完成", message, parent=self.window)
+                elif error is not None:
+                    self._refresh_roll_positions()
+                    messagebox.showerror("自动移仓失败", message, parent=self.window)
+
+            try:
+                self.window.after(0, _apply)
+            except Exception:
+                pass
+
+        self._roll_auto_thread = threading.Thread(target=_worker, name="roll-auto", daemon=True)
+        self._roll_auto_thread.start()
+
+    def _stop_auto_roll(self, *, silent: bool = False) -> None:
+        self._roll_auto_stop_event.set()
+        thread = self._roll_auto_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=PAIR_CLOSE_MONITOR_POLL_SECONDS + 1.0)
+        self._roll_auto_thread = None
+        self._roll_auto_session = None
+        if not silent:
+            self.roll_status_text.set("自动移仓监控已停止。")
+            self._append_log("已停止自动移仓监控。")
 
     def _parse_close_derivative_qty(self, entry) -> Decimal:
         instrument = self.manager.get_instrument(entry.derivative_inst_id)
@@ -4478,7 +4827,7 @@ class ArbitrageWindow:
                     f"并开出 {target_derivative_inst_id} {format_decimal(derivative_qty)} 张",
                     f"对应继续占用现货：{format_decimal(roll_spot_qty)}",
                     f"当前移仓价差：{format_decimal(spread_abs)}",
-                    f"分批计划：{len(planned_batches)} 批 | {', '.join(format_decimal(item) for item in planned_batches)}",
+                    f"分批计划：{_format_batch_plan_summary(planned_batches)}",
                     f"执行方式：{self.roll_execution_mode_label.get().strip()} | 最大滑点：{self.max_slippage_percent.get().strip()}%",
                 ]
             )
@@ -4488,7 +4837,10 @@ class ArbitrageWindow:
     def _runtime_or_warn(self) -> ArbitrageTradeRuntime | None:
         fallback_runtime = self._runtime_config_provider() if self._runtime_config_provider is not None else None
         profile_name = self._selected_api_profile_name()
-        profile_snapshot = load_credentials_snapshot(profile_name=profile_name)
+        if not self._ensure_api_profile_unlocked(profile_name, interactive=False):
+            messagebox.showwarning("提示", f"请先切换并解锁 API 配置 {profile_name}。", parent=self.window)
+            return None
+        profile_snapshot = self._selected_api_profile_snapshot()
         runtime = _build_runtime_for_profile(
             profile_name,
             profile_snapshot=profile_snapshot,
@@ -4615,6 +4967,9 @@ class ArbitrageWindow:
         if self._is_pair_close_auto_running():
             messagebox.showwarning("提示", "自动配对平仓监控运行中，请先停止。", parent=self.window)
             return
+        if self._is_roll_auto_running():
+            messagebox.showwarning("提示", "自动移仓监控运行中，请先停止。", parent=self.window)
+            return
         try:
             self.manager.start_auto_open(request, runtime=runtime)
         except Exception as exc:
@@ -4627,6 +4982,7 @@ class ArbitrageWindow:
         self.manager.stop_auto_open()
         self.manager.stop_auto_close()
         self._stop_pair_close_auto(silent=True)
+        self._stop_auto_roll(silent=True)
         self.trade_status_text.set("监控已停止。")
         self.monitor_status_text.set("已停止")
         self._append_log("已停止套利监控。")
@@ -4823,7 +5179,7 @@ class ArbitrageWindow:
                     f"并开出 {target_derivative_inst_id} {format_decimal(derivative_qty)} 张",
                     f"对应继续占用现货：{format_decimal(roll_spot_qty)} {entry.base_ccy}",
                     f"当前移仓绝对价差：{format_decimal(spread_abs)}",
-                    f"分批计划：{len(planned_batches)} 批 | {', '.join(format_decimal(item) for item in planned_batches)}",
+                    f"分批计划：{_format_batch_plan_summary(planned_batches)}",
                     f"执行方式：{self.roll_execution_mode_label.get().strip()} | 最大滑点：{self.max_slippage_percent.get().strip()}%",
                 ]
             )
@@ -4927,6 +5283,9 @@ class ArbitrageWindow:
             return
         if self._is_pair_close_auto_running():
             messagebox.showwarning("提示", "自动配对平仓监控运行中，请先停止。", parent=self.window)
+            return
+        if self._is_roll_auto_running():
+            messagebox.showwarning("提示", "自动移仓监控运行中，请先停止。", parent=self.window)
             return
         try:
             request = self._build_close_request(entry_id=selected_entry_id)

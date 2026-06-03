@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import random
@@ -18,12 +19,15 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from okx_quant.app_paths import configure_data_root, data_root
 from okx_quant.candle_cache import load_candle_cache
 
 REPORT_DIR = ROOT / "reports"
 SAMPLE_CHART_DIR = REPORT_DIR / "sample_charts"
 INST_ID = "BTC-USDT-SWAP"
 BAR = "1H"
+DATA_SOURCE_KIND = "local_okx_candle_cache"
+DATA_ROOT_IN_USE: Path | None = None
 INITIAL_EQUITY = 100_000.0
 RISK_PCT = 0.005
 MAX_NOTIONAL_MULT = 2.5
@@ -44,9 +48,65 @@ class StrategyConfig:
     trail_atr: float = 2.0
 
 
-def main() -> None:
-    REPORT_DIR.mkdir(exist_ok=True)
-    SAMPLE_CHART_DIR.mkdir(exist_ok=True)
+@dataclass(frozen=True)
+class RuntimeArgs:
+    inst_id: str
+    bar: str
+    data_dir: Path | None
+    report_dir: Path
+
+
+def parse_args(argv: list[str] | None = None) -> RuntimeArgs:
+    parser = argparse.ArgumentParser(description="Run BTC EMA short research from local OKX candle cache")
+    parser.add_argument("--inst-id", default=INST_ID, help="Instrument id in local OKX candle cache, e.g. BTC-USDT-SWAP")
+    parser.add_argument("--bar", default=BAR, help="Bar size in local OKX candle cache, e.g. 1H / 4H / 15m")
+    parser.add_argument(
+        "--data-dir",
+        help="QQOKX data root. Defaults to QQOKX_DATA_DIR or the sibling qqokx_data directory.",
+    )
+    parser.add_argument(
+        "--report-dir",
+        help="Directory for research outputs. Defaults to the repo reports directory.",
+    )
+    args = parser.parse_args(argv)
+    return RuntimeArgs(
+        inst_id=str(args.inst_id).strip().upper(),
+        bar=str(args.bar).strip(),
+        data_dir=Path(args.data_dir).expanduser().resolve() if args.data_dir else None,
+        report_dir=(Path(args.report_dir).expanduser().resolve() if args.report_dir else ROOT / "reports"),
+    )
+
+
+def configure_runtime(args: RuntimeArgs) -> None:
+    global INST_ID, BAR, REPORT_DIR, SAMPLE_CHART_DIR, DATA_ROOT_IN_USE
+    INST_ID = args.inst_id
+    BAR = args.bar
+    configure_data_root(args.data_dir)
+    DATA_ROOT_IN_USE = data_root()
+    REPORT_DIR = args.report_dir
+    SAMPLE_CHART_DIR = REPORT_DIR / "sample_charts"
+
+
+def write_runtime_context_report() -> None:
+    lines = [
+        "# Research Runtime Context",
+        "",
+        f"- data_source: `{DATA_SOURCE_KIND}`",
+        f"- data_root: `{DATA_ROOT_IN_USE}`",
+        f"- inst_id: `{INST_ID}`",
+        f"- bar: `{BAR}`",
+        f"- report_dir: `{REPORT_DIR}`",
+    ]
+    (REPORT_DIR / "research_runtime_context.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def main(argv: list[str] | None = None) -> None:
+    runtime = parse_args(argv)
+    configure_runtime(runtime)
+
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    SAMPLE_CHART_DIR.mkdir(parents=True, exist_ok=True)
+    write_runtime_context_report()
 
     candles = load_candle_cache(INST_ID, BAR, limit=None)
     if not candles:
@@ -140,7 +200,14 @@ def main() -> None:
         best_trades=best_trades,
     )
 
-    print(f"Research complete. Reports written to {REPORT_DIR}")
+    print(
+        "Research complete. "
+        f"source={DATA_SOURCE_KIND} "
+        f"data_root={DATA_ROOT_IN_USE} "
+        f"inst_id={INST_ID} "
+        f"bar={BAR} "
+        f"reports={REPORT_DIR}"
+    )
 
 
 def candles_to_frame(candles: list[object]) -> pd.DataFrame:
@@ -1221,7 +1288,7 @@ def write_html_report(
 </head>
 <body>
   <h1>BTC 1H Short-only 策略研究报告</h1>
-  <p class="note">数据：{INST_ID} {BAR}，{quality['rows']} 根，{quality['start']} 至 {quality['end']}。最终排序采用保守成本。</p>
+  <p class="note">数据源：{DATA_SOURCE_KIND} | 数据根目录：{DATA_ROOT_IN_USE} | 数据：{INST_ID} {BAR}，{quality['rows']} 根，{quality['start']} 至 {quality['end']}。最终排序采用保守成本。</p>
   <h2>最佳配置</h2>
   <pre>{json.dumps(asdict(best_config), ensure_ascii=False, indent=2)}</pre>
   <h2>最佳配置分集指标</h2>

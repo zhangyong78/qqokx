@@ -16,10 +16,15 @@ ArbitrageTriggerMode = Literal["spread", "spread_abs", "limit_price"]
 
 @dataclass(frozen=True)
 class ArbitrageFeeProfile:
-    spot_maker: Decimal = Decimal("0.00015")
-    spot_taker: Decimal = Decimal("0.00036")
-    swap_maker: Decimal = Decimal("0.00060")
-    swap_taker: Decimal = Decimal("0.00070")
+    # Default estimation follows the current OKX VIP 2 reference fee page:
+    # spot maker 0.0675%, spot taker 0.0700%,
+    # futures/swap maker 0.0130%, taker 0.0350%.
+    # This keeps "spot taker fee > futures taker fee" for the same 1-coin notional,
+    # which matches the UI explanation users expect to see.
+    spot_maker: Decimal = Decimal("0.000675")
+    spot_taker: Decimal = Decimal("0.000700")
+    swap_maker: Decimal = Decimal("0.000130")
+    swap_taker: Decimal = Decimal("0.000350")
 
 
 @dataclass(frozen=True)

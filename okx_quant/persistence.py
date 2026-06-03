@@ -641,6 +641,12 @@ def _empty_credentials_snapshot() -> dict[str, str]:
         "secret_key": "",
         "passphrase": "",
         "environment": "",
+        "spot_maker_fee_rate": "",
+        "spot_taker_fee_rate": "",
+        "futures_maker_fee_rate": "",
+        "futures_taker_fee_rate": "",
+        "option_maker_fee_rate": "",
+        "option_taker_fee_rate": "",
         "switch_password_hash": "",
         "switch_password_salt": "",
         "switch_password_iterations": "",
@@ -797,6 +803,12 @@ def _normalize_credentials_profile(payload: object) -> dict[str, str]:
         "secret_key": _decrypt_credential_text(payload.get("secret_key", "")),
         "passphrase": _decrypt_credential_text(payload.get("passphrase", "")),
         "environment": _normalize_credentials_environment(payload),
+        "spot_maker_fee_rate": str(payload.get("spot_maker_fee_rate", "") or "").strip(),
+        "spot_taker_fee_rate": str(payload.get("spot_taker_fee_rate", "") or "").strip(),
+        "futures_maker_fee_rate": str(payload.get("futures_maker_fee_rate", "") or "").strip(),
+        "futures_taker_fee_rate": str(payload.get("futures_taker_fee_rate", "") or "").strip(),
+        "option_maker_fee_rate": str(payload.get("option_maker_fee_rate", "") or "").strip(),
+        "option_taker_fee_rate": str(payload.get("option_taker_fee_rate", "") or "").strip(),
         **_normalize_profile_switch_password(payload),
     }
 
@@ -808,6 +820,12 @@ def _serialize_credentials_profile(payload: object) -> dict[str, str]:
         "secret_key": _encrypt_credential_text(normalized.get("secret_key", "")),
         "passphrase": _encrypt_credential_text(normalized.get("passphrase", "")),
         "environment": str(normalized.get("environment", "") or "").strip().lower(),
+        "spot_maker_fee_rate": str(normalized.get("spot_maker_fee_rate", "") or "").strip(),
+        "spot_taker_fee_rate": str(normalized.get("spot_taker_fee_rate", "") or "").strip(),
+        "futures_maker_fee_rate": str(normalized.get("futures_maker_fee_rate", "") or "").strip(),
+        "futures_taker_fee_rate": str(normalized.get("futures_taker_fee_rate", "") or "").strip(),
+        "option_maker_fee_rate": str(normalized.get("option_maker_fee_rate", "") or "").strip(),
+        "option_taker_fee_rate": str(normalized.get("option_taker_fee_rate", "") or "").strip(),
         **_normalize_profile_switch_password(normalized),
     }
 
@@ -910,10 +928,19 @@ def save_credentials_snapshot(
     if not isinstance(profiles, dict):
         profiles = {}
     target_profile = (profile_name or str(snapshot["selected_profile"])).strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
+    existing = _normalize_credentials_profile(profiles.get(target_profile, {}))
     profiles[target_profile] = {
         "api_key": api_key.strip(),
         "secret_key": secret_key.strip(),
         "passphrase": passphrase.strip(),
+        "environment": existing.get("environment", ""),
+        "spot_maker_fee_rate": existing.get("spot_maker_fee_rate", ""),
+        "spot_taker_fee_rate": existing.get("spot_taker_fee_rate", ""),
+        "futures_maker_fee_rate": existing.get("futures_maker_fee_rate", ""),
+        "futures_taker_fee_rate": existing.get("futures_taker_fee_rate", ""),
+        "option_maker_fee_rate": existing.get("option_maker_fee_rate", ""),
+        "option_taker_fee_rate": existing.get("option_taker_fee_rate", ""),
+        **_normalize_profile_switch_password(existing),
     }
     selected_profile = target_profile if select_profile else str(snapshot["selected_profile"])
     return save_credentials_profiles_snapshot(

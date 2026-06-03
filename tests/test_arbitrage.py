@@ -17,9 +17,11 @@ from okx_quant.arbitrage.arbitrage_executor import (
 )
 from okx_quant.arbitrage_ui import (
     _actionable_spread_abs,
+    _arbitrage_fee_profile_from_snapshot,
     _build_spread_candles,
     _estimated_dual_leg_fee_pct,
     _estimated_one_coin_taker_fee_usdt,
+    _format_fee_amount_usdt_rounded,
     _pair_derivative_base_qty_from_contracts,
     _pair_derivative_qty_from_spot_qty,
     _roll_target_future_candidates,
@@ -65,7 +67,7 @@ class ArbitrageCalculatorTest(unittest.TestCase):
 
     def test_round_trip_fee_vip2(self) -> None:
         fee = round_trip_fee_pct(fee_profile=ArbitrageFeeProfile(), assume_taker=True)
-        expected = Decimal("0.00036") * 2 + Decimal("0.00070") * 2
+        expected = Decimal("0.000700") * 2 + Decimal("0.000350") * 2
         self.assertEqual(fee, expected)
 
     def test_net_carry(self) -> None:
@@ -1100,16 +1102,30 @@ class ArbitrageChartHelperTest(unittest.TestCase):
     def test_estimated_dual_leg_fee_pct_supports_roll_and_maker_taker_modes(self) -> None:
         self.assertEqual(
             _estimated_dual_leg_fee_pct(panel_key="trade", execution_mode="dual_taker"),
-            Decimal("0.1060"),
+            Decimal("0.1050"),
         )
         self.assertEqual(
             _estimated_dual_leg_fee_pct(panel_key="pair_close", execution_mode="spot_maker_derivative_taker"),
-            Decimal("0.0850"),
+            Decimal("0.1025"),
         )
         self.assertEqual(
             _estimated_dual_leg_fee_pct(panel_key="roll", execution_mode="dual_taker"),
-            Decimal("0.1400"),
+            Decimal("0.0700"),
         )
+
+    def test_arbitrage_fee_profile_from_snapshot_uses_api_profile_overrides(self) -> None:
+        profile = _arbitrage_fee_profile_from_snapshot(
+            {
+                "spot_maker_fee_rate": "0.0600",
+                "spot_taker_fee_rate": "0.0700",
+                "futures_maker_fee_rate": "0.0150",
+                "futures_taker_fee_rate": "0.0360",
+            }
+        )
+        self.assertEqual(profile.spot_maker, Decimal("0.000600"))
+        self.assertEqual(profile.spot_taker, Decimal("0.000700"))
+        self.assertEqual(profile.swap_maker, Decimal("0.000150"))
+        self.assertEqual(profile.swap_taker, Decimal("0.000360"))
 
     def test_estimated_one_coin_taker_fee_usdt_uses_spot_and_derivative_taker_rates(self) -> None:
         self.assertEqual(
@@ -1122,9 +1138,9 @@ class ArbitrageChartHelperTest(unittest.TestCase):
                     min_size=Decimal("0.0001"),
                     state="live",
                 ),
-                reference_price=Decimal("55555.55"),
+                reference_price=Decimal("20000"),
             ),
-            Decimal("19.9999980"),
+            Decimal("14.00000"),
         )
         self.assertEqual(
             _estimated_one_coin_taker_fee_usdt(
@@ -1136,10 +1152,43 @@ class ArbitrageChartHelperTest(unittest.TestCase):
                     min_size=Decimal("1"),
                     state="live",
                 ),
-                reference_price=Decimal("14285.71428571428571428571429"),
+                reference_price=Decimal("20000"),
             ),
-            Decimal("10.00000000000000000000000000"),
+            Decimal("7.00000"),
         )
+
+    def test_format_fee_amount_usdt_rounded_keeps_integer_display(self) -> None:
+        self.assertEqual(_format_fee_amount_usdt_rounded(Decimal("24.963246")), "25")
+        self.assertEqual(_format_fee_amount_usdt_rounded(Decimal("48.520745")), "49")
+
+    def test_estimated_one_coin_taker_fee_spot_is_higher_than_futures_at_same_price(self) -> None:
+        reference_price = Decimal("70000")
+        spot_fee = _estimated_one_coin_taker_fee_usdt(
+            instrument=Instrument(
+                inst_id="BTC-USDT",
+                inst_type="SPOT",
+                tick_size=Decimal("0.01"),
+                lot_size=Decimal("0.0001"),
+                min_size=Decimal("0.0001"),
+                state="live",
+            ),
+            reference_price=reference_price,
+        )
+        futures_fee = _estimated_one_coin_taker_fee_usdt(
+            instrument=Instrument(
+                inst_id="BTC-USD-260626",
+                inst_type="FUTURES",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+            ),
+            reference_price=reference_price,
+        )
+
+        assert spot_fee is not None
+        assert futures_fee is not None
+        self.assertGreater(spot_fee, futures_fee)
 
 
 class ArbitrageMarketPanelHelperTest(unittest.TestCase):

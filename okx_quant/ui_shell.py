@@ -561,6 +561,12 @@ def _blank_credential_profile_snapshot(*, environment: str = "") -> dict[str, st
         "api_key": "",
         "secret_key": "",
         "passphrase": "",
+        "spot_maker_fee_rate": "",
+        "spot_taker_fee_rate": "",
+        "futures_maker_fee_rate": "",
+        "futures_taker_fee_rate": "",
+        "option_maker_fee_rate": "",
+        "option_taker_fee_rate": "",
         "switch_password_hash": "",
         "switch_password_salt": "",
         "switch_password_iterations": "",
@@ -1114,6 +1120,7 @@ class LineTradingDeskWindowState:
     desk_map_render_job: str | None = None
     desk_annotation_store_key: str | None = None
     desk_annotation_save_job: str | None = None
+    desk_api_switch_guard: bool = False
 
 
 _LINE_DESK_INSTRUMENT_CACHE_TTL_S = 120.0
@@ -2921,6 +2928,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.api_key = StringVar()
         self.secret_key = StringVar()
         self.passphrase = StringVar()
+        self.spot_maker_fee_rate = StringVar(value="0.0600")
+        self.spot_taker_fee_rate = StringVar(value="0.0700")
+        self.futures_maker_fee_rate = StringVar(value="0.0150")
+        self.futures_taker_fee_rate = StringVar(value="0.0360")
+        self.option_maker_fee_rate = StringVar(value="0.0250")
+        self.option_taker_fee_rate = StringVar(value="0.0300")
         self.api_profile_name = StringVar(value=DEFAULT_CREDENTIAL_PROFILE_NAME)
         self.credential_profile_password_status_text = StringVar(value="切换密码：未设置")
         self.environment_label = StringVar(value="模拟盘 demo")
@@ -5337,20 +5350,39 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         ).grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
         row += 1
-        ttk.Label(account_frame, text="交易模式").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(account_frame, text="Trade Mode").grid(row=row, column=0, sticky="w", pady=(12, 0))
         ttk.Combobox(
             account_frame,
             textvariable=self.trade_mode_label,
             values=list(TRADE_MODE_OPTIONS.keys()),
             state="readonly",
         ).grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0))
-        ttk.Label(account_frame, text="持仓模式").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        ttk.Label(account_frame, text="Position Mode").grid(row=row, column=2, sticky="w", pady=(12, 0))
         ttk.Combobox(
             account_frame,
             textvariable=self.position_mode_label,
             values=list(POSITION_MODE_OPTIONS.keys()),
             state="readonly",
         ).grid(row=row, column=3, sticky="ew", pady=(12, 0))
+
+        row += 1
+        fee_frame = ttk.LabelFrame(account_frame, text="Custom Fee (%)", padding=12)
+        fee_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        for fee_column in range(3):
+            fee_frame.columnconfigure(fee_column, weight=1)
+        ttk.Label(fee_frame, text="Type").grid(row=0, column=0, sticky="w")
+        ttk.Label(fee_frame, text="Maker").grid(row=0, column=1, sticky="w")
+        ttk.Label(fee_frame, text="Taker").grid(row=0, column=2, sticky="w")
+        ttk.Label(fee_frame, text="Spot").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(fee_frame, textvariable=self.spot_maker_fee_rate).grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        ttk.Entry(fee_frame, textvariable=self.spot_taker_fee_rate).grid(row=1, column=2, sticky="ew", pady=(8, 0))
+        ttk.Label(fee_frame, text="Futures").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(fee_frame, textvariable=self.futures_maker_fee_rate).grid(row=2, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        ttk.Entry(fee_frame, textvariable=self.futures_taker_fee_rate).grid(row=2, column=2, sticky="ew", pady=(8, 0))
+        ttk.Label(fee_frame, text="Option").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(fee_frame, textvariable=self.option_maker_fee_rate).grid(row=3, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        ttk.Entry(fee_frame, textvariable=self.option_taker_fee_rate).grid(row=3, column=2, sticky="ew", pady=(8, 0))
+
 
         row += 1
         ttk.Label(account_frame, text="TP/SL 触发价格类型").grid(row=row, column=0, sticky="w", pady=(12, 0))
@@ -6748,13 +6780,19 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._positions_effective_environment = None
         self.environment_label.set(self._environment_label_for_profile(profile_name))
 
-    def _current_credentials_state(self) -> tuple[str, str, str, str, str]:
+    def _current_credentials_state(self) -> tuple[str, str, str, str, str, str, str, str, str, str, str]:
         return (
             self._editing_credential_profile(),
             self.api_key.get().strip(),
             self.secret_key.get().strip(),
             self.passphrase.get().strip(),
             self._environment_value_from_label(self.environment_label.get()),
+            self.spot_maker_fee_rate.get().strip(),
+            self.spot_taker_fee_rate.get().strip(),
+            self.futures_maker_fee_rate.get().strip(),
+            self.futures_taker_fee_rate.get().strip(),
+            self.option_maker_fee_rate.get().strip(),
+            self.option_taker_fee_rate.get().strip(),
         )
 
     def _set_credentials_fields(self, snapshot: dict[str, str]) -> None:
@@ -6763,6 +6801,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.api_key.set(snapshot["api_key"])
         self.secret_key.set(snapshot["secret_key"])
         self.passphrase.set(snapshot["passphrase"])
+        self.spot_maker_fee_rate.set(str(snapshot.get("spot_maker_fee_rate", "") or "0.0600"))
+        self.spot_taker_fee_rate.set(str(snapshot.get("spot_taker_fee_rate", "") or "0.0700"))
+        self.futures_maker_fee_rate.set(str(snapshot.get("futures_maker_fee_rate", "") or "0.0150"))
+        self.futures_taker_fee_rate.set(str(snapshot.get("futures_taker_fee_rate", "") or "0.0360"))
+        self.option_maker_fee_rate.set(str(snapshot.get("option_maker_fee_rate", "") or "0.0250"))
+        self.option_taker_fee_rate.set(str(snapshot.get("option_taker_fee_rate", "") or "0.0300"))
         self._credential_watch_enabled = was_enabled
 
     def _credential_profile_requires_switch_password(self, profile_name: str) -> bool:
@@ -6810,12 +6854,18 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._sync_current_api_sender_email_override(target)
         self._update_current_api_profile_password_status(target)
         self._last_saved_credentials = (
-            target,
-            snapshot["api_key"],
-            snapshot["secret_key"],
-            snapshot["passphrase"],
-            stored_environment,
-        )
+                target,
+                snapshot["api_key"],
+                snapshot["secret_key"],
+                snapshot["passphrase"],
+                stored_environment,
+                str(snapshot.get("spot_maker_fee_rate", "") or ""),
+                str(snapshot.get("spot_taker_fee_rate", "") or ""),
+                str(snapshot.get("futures_maker_fee_rate", "") or ""),
+                str(snapshot.get("futures_taker_fee_rate", "") or ""),
+                str(snapshot.get("option_maker_fee_rate", "") or ""),
+                str(snapshot.get("option_taker_fee_rate", "") or ""),
+            )
         self._apply_profile_environment(target)
         self._sync_credential_profile_combo()
         self._update_settings_summary()
@@ -6997,6 +7047,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.api_key.trace_add("write", self._on_credentials_changed)
         self.secret_key.trace_add("write", self._on_credentials_changed)
         self.passphrase.trace_add("write", self._on_credentials_changed)
+        self.spot_maker_fee_rate.trace_add("write", self._on_credentials_changed)
+        self.spot_taker_fee_rate.trace_add("write", self._on_credentials_changed)
+        self.futures_maker_fee_rate.trace_add("write", self._on_credentials_changed)
+        self.futures_taker_fee_rate.trace_add("write", self._on_credentials_changed)
+        self.option_maker_fee_rate.trace_add("write", self._on_credentials_changed)
+        self.option_taker_fee_rate.trace_add("write", self._on_credentials_changed)
         self.environment_label.trace_add("write", self._on_environment_label_changed)
         self.trade_mode_label.trace_add("write", self._on_settings_changed)
         self.position_mode_label.trace_add("write", self._on_settings_changed)
@@ -7083,13 +7139,31 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             return
 
         try:
-            profile_name, api_key, secret_key, passphrase, environment = current
+            (
+                profile_name,
+                api_key,
+                secret_key,
+                passphrase,
+                environment,
+                spot_maker_fee_rate,
+                spot_taker_fee_rate,
+                futures_maker_fee_rate,
+                futures_taker_fee_rate,
+                option_maker_fee_rate,
+                option_taker_fee_rate,
+            ) = current
             existing_snapshot = self._credential_profiles.get(profile_name, {})
             self._credential_profiles[profile_name] = {
                 "api_key": api_key,
                 "secret_key": secret_key,
                 "passphrase": passphrase,
                 "environment": environment,
+                "spot_maker_fee_rate": spot_maker_fee_rate,
+                "spot_taker_fee_rate": spot_taker_fee_rate,
+                "futures_maker_fee_rate": futures_maker_fee_rate,
+                "futures_taker_fee_rate": futures_taker_fee_rate,
+                "option_maker_fee_rate": option_maker_fee_rate,
+                "option_taker_fee_rate": option_taker_fee_rate,
                 "switch_password_hash": str(existing_snapshot.get("switch_password_hash", "") or ""),
                 "switch_password_salt": str(existing_snapshot.get("switch_password_salt", "") or ""),
                 "switch_password_iterations": str(existing_snapshot.get("switch_password_iterations", "") or ""),
@@ -9176,8 +9250,19 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         state = self._line_trading_desk_window
         if state is None or not _widget_exists(state.window):
             return
+        if state.desk_api_switch_guard:
+            return
         current = state.api_profile_var.get().strip()
         prev = (state.last_desk_api_profile or "").strip()
+        if not current:
+            return
+        if current != prev and not self._confirm_credential_profile_switch(current):
+            state.desk_api_switch_guard = True
+            try:
+                state.api_profile_var.set(prev or self._current_credential_profile())
+            finally:
+                state.desk_api_switch_guard = False
+            return
         # Combobox 可能短暂写成空串再写回；仅当新旧均为非空且不同时才清空画线，避免误清盈亏比。
         if prev and current and current != prev:
             self._line_trading_desk_cancel_annotation_persist_job(state)
