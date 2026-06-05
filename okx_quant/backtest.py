@@ -27,20 +27,17 @@ from okx_quant.strategies.adaptive_ema_rail import (
     evaluate_adaptive_rail_signal,
     is_adaptive_rail_hard_break,
 )
+from okx_quant.strategy_runtime_registry import (
+    get_strategy_runtime_profile,
+    strategy_is_cross_family,
+    strategy_preferred_direction,
+    strategy_uses_signal_extrema,
+)
+from okx_quant.strategy_ui_schema import build_strategy_widget_visibility
 from okx_quant.strategy_catalog import (
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
-    STRATEGY_DYNAMIC_LONG_ID,
-    STRATEGY_DYNAMIC_MTF_LONG_ID,
-    STRATEGY_DYNAMIC_MTF_SHORT_ID,
-    STRATEGY_DYNAMIC_SHORT_ID,
-    STRATEGY_EMA5_EMA8_ID,
-    STRATEGY_EMA_BREAKDOWN_SHORT_ID,
-    STRATEGY_EMA_BREAKOUT_LONG_ID,
     is_adaptive_ema_rail_strategy,
-    is_dynamic_mtf_strategy_id,
-    is_dynamic_strategy_id,
-    is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
 )
 
@@ -65,6 +62,7 @@ EXIT_REASON_LABELS = {
     "stop_loss": "止损",
     "signal_profit_exit": "信号失效盈利平仓",
     "break_even_stop": "保本",
+    "slope_turn_positive": "斜率转正平仓",
 }
 
 
@@ -188,6 +186,7 @@ class BacktestResult:
     dynamic_fee_offset_enabled: bool = True
     time_stop_break_even_enabled: bool = False
     time_stop_break_even_bars: int = 0
+    trend_ema_slope_filter_min_ratio: Decimal = Decimal("0")
     hold_close_exit_bars: int = 0
     max_entries_per_trend: int = 1
     sizing_mode: str = "fixed_risk"
@@ -373,7 +372,7 @@ def run_backtest(
         preload_count=preload_count,
     )
     mtf_filter_candles: list[Candle] | None = None
-    if is_dynamic_mtf_strategy_id(config.strategy_id):
+    if _backtest_uses_mtf_filter(config.strategy_id):
         filter_inst_id = config.resolved_mtf_filter_inst_id()
         filter_bar = config.resolved_mtf_filter_bar()
         filter_preload = _required_mtf_filter_preload_candles(config)
@@ -389,7 +388,7 @@ def run_backtest(
         )
     cross_higher_tf_bias: list[str] | None = None
     if (
-        is_ema_atr_breakout_strategy(config.strategy_id)
+        strategy_is_cross_family(config.strategy_id)
         and int(config.cross_higher_tf_ref_ema_period) > 0
         and (config.cross_higher_tf_inst_id or "").strip()
         and (config.cross_higher_tf_bar or "").strip()
@@ -462,6 +461,26 @@ def build_dynamic_entry_batch_configs(
     return configs
 
 
+def _backtest_strategy_family(strategy_id: str) -> str:
+    if is_adaptive_ema_rail_strategy(strategy_id):
+        return "adaptive_ema_rail"
+    return get_strategy_runtime_profile(strategy_id).family
+
+
+def _backtest_uses_dynamic_orders(strategy_id: str) -> bool:
+    try:
+        return get_strategy_runtime_profile(strategy_id).uses_dynamic_orders
+    except KeyError:
+        return False
+
+
+def _backtest_uses_mtf_filter(strategy_id: str) -> bool:
+    try:
+        return get_strategy_runtime_profile(strategy_id).uses_mtf_filter
+    except KeyError:
+        return False
+
+
 def build_parameter_batch_configs(
     base_config: StrategyConfig,
     *,
@@ -469,11 +488,10 @@ def build_parameter_batch_configs(
     take_ratios: tuple[Decimal, ...] = ATR_BATCH_TAKE_RATIOS,
     max_entries_options: tuple[int, ...] = BATCH_MAX_ENTRIES_OPTIONS,
 ) -> list[StrategyConfig]:
-    if not (
-        is_dynamic_strategy_id(base_config.strategy_id)
-        or is_dynamic_mtf_strategy_id(base_config.strategy_id)
-        or is_adaptive_ema_rail_strategy(base_config.strategy_id)
-    ):
+    family = _backtest_strategy_family(base_config.strategy_id)
+    if family == "ema55_slope_short":
+        return [base_config]
+    if family not in {"dynamic_order", "adaptive_ema_rail"}:
         return build_atr_batch_configs(
             base_config,
             atr_multipliers=atr_multipliers,
@@ -553,7 +571,7 @@ def _build_backtest_order_plan(
         atr_value=atr_value,
         candle_ts=candle_ts,
         trigger_inst_id=instrument.inst_id,
-        use_signal_extrema=is_ema_atr_breakout_strategy(config.strategy_id),
+        use_signal_extrema=strategy_uses_signal_extrema(config.strategy_id),
         signal_candle_high=signal_candle_high,
         signal_candle_low=signal_candle_low,
     )
@@ -611,7 +629,7 @@ def run_backtest_batch(
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
 ) -> list[tuple[StrategyConfig, BacktestResult]]:
-    if base_config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+    if _backtest_strategy_family(base_config.strategy_id) == "ema5_ema8":
         raise RuntimeError("4H EMA5/EMA8 金叉死叉策略不参与 ATR 批量矩阵回测，请使用单组回测。")
     if candle_limit < 0:
         raise ValueError("\u56de\u6d4b K \u7ebf\u6570\u91cf\u4e0d\u80fd\u5c0f\u4e8e 0")
@@ -641,7 +659,7 @@ def run_backtest_batch(
         preload_count=preload_count,
     )
     mtf_filter_candles: list[Candle] | None = None
-    if is_dynamic_mtf_strategy_id(sample_config.strategy_id):
+    if _backtest_uses_mtf_filter(sample_config.strategy_id):
         filter_limit = min(MAX_BACKTEST_CANDLES, max(800, candle_limit if candle_limit > 0 else len(candles)))
         mtf_filter_candles = _load_backtest_candles(
             client,
@@ -688,7 +706,8 @@ def _run_backtest_with_loaded_data(
     manual_handoffs = 0
     max_manual_positions = 0
     max_total_occupied_slots = 0
-    if is_dynamic_mtf_strategy_id(config.strategy_id):
+    family = _backtest_strategy_family(config.strategy_id)
+    if _backtest_uses_mtf_filter(config.strategy_id):
         if mtf_filter_candles is None:
             raise RuntimeError("多周期动态策略缺少高周期 K 线数据")
         mtf_filter_bias = _build_mtf_filter_bias(
@@ -705,7 +724,7 @@ def _run_backtest_with_loaded_data(
             taker_fee_rate=taker_fee_rate,
             mtf_filter_bias=mtf_filter_bias,
         )
-    elif is_dynamic_strategy_id(config.strategy_id):
+    elif family == "dynamic_order":
         trades, terminal_open_position = _run_dynamic_backtest(
             candles,
             instrument,
@@ -713,7 +732,7 @@ def _run_backtest_with_loaded_data(
             maker_fee_rate=maker_fee_rate,
             taker_fee_rate=taker_fee_rate,
         )
-    elif is_adaptive_ema_rail_strategy(config.strategy_id):
+    elif family == "adaptive_ema_rail":
         trades, terminal_open_position = _run_adaptive_rail_backtest(
             candles,
             instrument,
@@ -721,7 +740,14 @@ def _run_backtest_with_loaded_data(
             maker_fee_rate=maker_fee_rate,
             taker_fee_rate=taker_fee_rate,
         )
-    elif is_ema_atr_breakout_strategy(config.strategy_id):
+    elif family == "ema55_slope_short":
+        trades, terminal_open_position = _run_ema55_slope_short_backtest(
+            candles,
+            instrument,
+            config,
+            taker_fee_rate=taker_fee_rate,
+        )
+    elif strategy_is_cross_family(config.strategy_id):
         trades, terminal_open_position = _run_cross_backtest(
             candles,
             instrument,
@@ -729,7 +755,7 @@ def _run_backtest_with_loaded_data(
             taker_fee_rate=taker_fee_rate,
             higher_tf_bias=cross_higher_tf_bias,
         )
-    elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+    elif family == "ema5_ema8":
         trades, terminal_open_position = _run_ema5_ema8_backtest(
             candles,
             instrument,
@@ -759,12 +785,7 @@ def _run_backtest_with_loaded_data(
         )
     )
     atr_values = atr(candles, config.atr_period) if candles else []
-    if (
-        is_dynamic_strategy_id(config.strategy_id)
-        or is_dynamic_mtf_strategy_id(config.strategy_id)
-        or is_ema_atr_breakout_strategy(config.strategy_id)
-        or is_adaptive_ema_rail_strategy(config.strategy_id)
-    ):
+    if not build_strategy_widget_visibility(config.strategy_id, "backtest").show_big_ema:
         big_ema_values: list[Decimal | None] = []
     else:
         big_ema_values = list(ema(closes, config.big_ema_period)) if candles else []
@@ -808,12 +829,12 @@ def _run_backtest_with_loaded_data(
         atr_period=config.atr_period,
         strategy_id=config.strategy_id,
         bar=config.bar,
-        mtf_filter_bar=config.resolved_mtf_filter_bar() if is_dynamic_mtf_strategy_id(config.strategy_id) else "",
+        mtf_filter_bar=config.resolved_mtf_filter_bar() if _backtest_uses_mtf_filter(config.strategy_id) else "",
         mtf_filter_fast_ema_period=(
-            int(config.mtf_filter_fast_ema_period) if is_dynamic_mtf_strategy_id(config.strategy_id) else 0
+            int(config.mtf_filter_fast_ema_period) if _backtest_uses_mtf_filter(config.strategy_id) else 0
         ),
         mtf_filter_slow_ema_period=(
-            int(config.mtf_filter_slow_ema_period) if is_dynamic_mtf_strategy_id(config.strategy_id) else 0
+            int(config.mtf_filter_slow_ema_period) if _backtest_uses_mtf_filter(config.strategy_id) else 0
         ),
         mtf_reversal_mode=str(config.mtf_reversal_mode),
         data_source_note=data_source_note,
@@ -828,6 +849,7 @@ def _run_backtest_with_loaded_data(
         dynamic_fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
         time_stop_break_even_enabled=bool(config.time_stop_break_even_enabled),
         time_stop_break_even_bars=int(config.resolved_time_stop_break_even_bars()),
+        trend_ema_slope_filter_min_ratio=Decimal(str(config.trend_ema_slope_filter_min_ratio)),
         hold_close_exit_bars=int(config.hold_close_exit_bars),
         max_entries_per_trend=int(config.max_entries_per_trend),
         sizing_mode=config.backtest_sizing_mode,
@@ -982,114 +1004,13 @@ def format_backtest_report(result: BacktestResult) -> str:
         result.entry_reference_ema_type,
         result.entry_reference_ema_period,
     )
-    if is_dynamic_strategy_id(result.strategy_id) or is_dynamic_mtf_strategy_id(result.strategy_id):
-        direction_text = (
-            "做多"
-            if result.strategy_id in {STRATEGY_DYNAMIC_LONG_ID, STRATEGY_DYNAMIC_MTF_LONG_ID}
-            else "做空"
-            if result.strategy_id in {STRATEGY_DYNAMIC_SHORT_ID, STRATEGY_DYNAMIC_MTF_SHORT_ID}
-            else "按方向参数"
-        )
-        lines.append(
-            f"趋势过滤：{fast_label} 与 {trend_label} 组成趋势过滤，当前策略方向={direction_text}"
-        )
-        if is_dynamic_mtf_strategy_id(result.strategy_id):
-            reversal_text = "停止新增仓位" if result.mtf_reversal_mode == "block_new_entries" else "不处理"
-            lines.append(
-                f"多周期过滤：低周期={result.bar} | "
-                f"高周期={result.mtf_filter_bar} | "
-                f"高周期EMA{result.mtf_filter_fast_ema_period}/EMA{result.mtf_filter_slow_ema_period} | "
-                f"反转处理={reversal_text}"
-            )
-        lines.append(f"挂单参考线：{reference_label}")
-        lines.append(
-            f"委托规则：每根新 K 线按最新 {reference_label} 重新撤旧挂新；若新 K 线开盘已优于挂单价，则按开盘价即时成交，否则仅在盘中触及挂单价时成交，未成交委托不跨 K 线保留"
-        )
-        lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
-        lines.append(f"每波最多开仓次数：{result.max_entries_per_trend if result.max_entries_per_trend > 0 else '不限'}")
-        if result.take_profit_mode == "dynamic":
-            lines.append(
-                f"2R保本开关：{'开启' if result.dynamic_two_r_break_even else '关闭'}"
-            )
-            lines.append(
-                f"手续费偏移开关：{'开启' if result.dynamic_fee_offset_enabled else '关闭'}"
-            )
-            lines.append(
-                "时间保本开关："
-                f"{'开启' if result.time_stop_break_even_enabled else '关闭'}"
-                f" | 阈值K线：{result.time_stop_break_even_bars if result.time_stop_break_even_bars > 0 else '未启用'}"
-            )
-            if result.dynamic_two_r_break_even:
-                description = (
-                    "止盈说明：动态止盈在 2R 时先上移到开仓价+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
-                    if result.dynamic_fee_offset_enabled
-                    else "止盈说明：动态止盈在 2R 时先上移到开仓价，3R 起按 n-1R 递推；固定止盈为 ATR 倍数止盈。"
-                )
-            else:
-                description = (
-                    "止盈说明：动态止盈在 2R 时上移到 1R+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
-                    if result.dynamic_fee_offset_enabled
-                    else "止盈说明：动态止盈在 2R 时上移到 1R，3R 起按 n-1R 递推；固定止盈为 ATR 倍数止盈。"
-                )
-            lines.append(description)
-            if result.time_stop_break_even_enabled and result.time_stop_break_even_bars > 0:
-                lines.append(
-                    "时间保本说明：持仓满 "
-                    f"{result.time_stop_break_even_bars} 根K线后，若价格已达到净保本区间，则把止损合并上移到开仓价±2倍Taker手续费；"
-                    "该止损只会朝有利方向推进，不会回退。"
-                )
-        else:
-            lines.append("止盈说明：固定止盈为 ATR 倍数止盈。")
-        lines.append("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓")
-    if is_adaptive_ema_rail_strategy(result.strategy_id):
-        lines.append(
-            "交易逻辑：Adaptive EMA Rail 仅做多；先用 EMA200 与高低点结构过滤趋势，"
-            "再从固定 EMA 候选池中选择 Respect Score 最高的支撑轨道。"
-        )
-        lines.append(
-            "委托规则：主导轨道至少完成两次有效反弹后，每根新 K 线按当前主导 EMA 重新挂回踩买单；"
-            "若轨道发生有效跌破，则按轨道失效退出或停止继续挂单。"
-        )
-        lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
-        lines.append(f"每条轨道最多开仓次数：{result.max_entries_per_trend if result.max_entries_per_trend > 0 else '不限'}")
-        lines.append("同K线撮合：沿用动态委托撮合口径，未成交委托不跨 K 线保留。")
-    if result.strategy_id == STRATEGY_EMA5_EMA8_ID:
-        lines.append(
-            f"交易逻辑：固定 4H EMA{result.ema_period}/EMA{result.trend_ema_period} 金叉死叉开仓，"
-            f"收盘价跌破/站回 EMA{result.trend_ema_period} 时按动态止损离场。"
-        )
-        lines.append("本策略不设固定止盈，回测使用收盘确认与收盘价离场。")
-    if is_ema_atr_breakout_strategy(result.strategy_id):
-        if result.strategy_id == STRATEGY_EMA_BREAKOUT_LONG_ID:
-            lines.append(
-                f"交易逻辑：仅做多——收盘价向上突破参考线({reference_label})，"
-                f"且须 {fast_label}>{trend_label}。"
-                "止损、止盈按 ATR 倍数与参考价、入场价计算。"
-            )
-        elif result.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID:
-            lines.append(
-                f"交易逻辑：仅做空——收盘价向下跌破参考线({reference_label})，"
-                f"且须 {fast_label}<{trend_label}。"
-                "止损、止盈按 ATR 倍数与参考价、入场价计算。"
-            )
-        else:
-            lines.append(
-                f"交易逻辑（旧版入口）：多——向上突破参考线({reference_label})，"
-                f"且须 {fast_label}>{trend_label}；"
-                f"空——向下跌破该参考线，且须 {fast_label}<{trend_label}。"
-                "止损、止盈按 ATR 倍数与参考价、入场价计算。"
-            )
-        lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
-        if result.take_profit_mode == "dynamic":
-            lines.append(f"2R保本开关：{'开启' if result.dynamic_two_r_break_even else '关闭'}")
-            lines.append(f"手续费偏移开关：{'开启' if result.dynamic_fee_offset_enabled else '关闭'}")
-            lines.append(
-                "时间保本开关："
-                f"{'开启' if result.time_stop_break_even_enabled else '关闭'}"
-                f" | 阈值K线：{result.time_stop_break_even_bars if result.time_stop_break_even_bars > 0 else '未启用'}"
-            )
-        if result.hold_close_exit_bars > 0:
-            lines.append(f"持仓满 {result.hold_close_exit_bars} 根K线后按收盘价强制平仓（含平仓滑点）。")
+    _append_backtest_strategy_notes(
+        lines,
+        result,
+        fast_label=fast_label,
+        trend_label=trend_label,
+        reference_label=reference_label,
+    )
     if report.profit_factor is None:
         lines.append("Profit Factor：无亏损交易")
     else:
@@ -1261,16 +1182,19 @@ def _required_mtf_filter_preload_candles(config: StrategyConfig) -> int:
 
 
 def _required_backtest_preload_candles(config: StrategyConfig) -> int:
-    if is_ema_atr_breakout_strategy(config.strategy_id):
+    family = _backtest_strategy_family(config.strategy_id)
+    if strategy_is_cross_family(config.strategy_id):
         minimum = max(
             config.resolved_entry_reference_ema_period() + 2,
             config.atr_period + 2,
             config.ema_period + 2,
             config.trend_ema_period + 2,
         )
-    elif is_adaptive_ema_rail_strategy(config.strategy_id):
+    elif family == "ema55_slope_short":
+        minimum = max(config.ema_period, 2) + 1
+    elif family == "adaptive_ema_rail":
         minimum = adaptive_rail_minimum_candles(config)
-    elif config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+    elif family == "ema5_ema8":
         minimum = max(config.ema_period, config.trend_ema_period) + 1
     else:
         trend_slope_filter_enabled = (
@@ -1431,16 +1355,17 @@ def _run_cross_backtest(
     taker_fee_rate: Decimal = Decimal("0"),
     higher_tf_bias: list[str] | None = None,
 ) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
-    if config.strategy_id == STRATEGY_CROSS_ID and config.signal_mode == "both":
+    family = _backtest_strategy_family(config.strategy_id)
+    if family == "cross_legacy" and config.signal_mode == "both":
         raise RuntimeError(
             "EMA 突破/跌破（旧版）回测不支持 signal_mode=双向；请分别回测或改用「EMA 突破做多」「EMA 跌破做空」策略。"
         )
     dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
     effective_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
     eval_config = replace(config, signal_mode=effective_mode)
-    if config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID:
+    if family == "cross_breakdown_short":
         wanted_signal = "short"
-    elif config.strategy_id == STRATEGY_EMA_BREAKOUT_LONG_ID:
+    elif family == "cross_breakout_long":
         wanted_signal = "long"
     else:
         wanted_signal = "long" if effective_mode == "long_only" else "short"
@@ -1617,6 +1542,126 @@ def _run_cross_backtest(
             time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
         )
         entries_in_current_wave += 1
+
+    return trades, _build_terminal_open_position(open_position, candles)
+
+
+def _run_ema55_slope_short_backtest(
+    candles: list[Candle],
+    instrument: Instrument,
+    config: StrategyConfig,
+    *,
+    taker_fee_rate: Decimal = Decimal("0"),
+) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
+    minimum = max(int(config.ema_period), int(config.trend_ema_period), int(config.atr_period), 2) + 1
+    if len(candles) < minimum:
+        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根。")
+    trade_start_index = _backtest_trade_start_index(minimum)
+    if len(candles) <= trade_start_index:
+        return [], None
+
+    closes = [candle.close for candle in candles]
+    ema_values = moving_average(closes, int(config.ema_period), "ema")
+    atr_values = atr(candles, int(config.atr_period))
+    trades: list[BacktestTrade] = []
+    open_position: _OpenPosition | None = None
+    entry_slope_threshold_ratio = Decimal(str(config.trend_ema_slope_filter_min_ratio))
+    dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
+
+    for index in range(trade_start_index, len(candles)):
+        candle = candles[index]
+        current_ema = ema_values[index]
+        previous_ema = ema_values[index - 1] if index > 0 else None
+        atr_value = atr_values[index] if index < len(atr_values) else None
+        if current_ema is None or previous_ema is None or atr_value is None or atr_value <= 0:
+            continue
+
+        slope = current_ema - previous_ema
+        slope_ratio = slope / current_ema if current_ema != 0 else None
+
+        if open_position is not None:
+            closed_trade = _try_close_position(
+                open_position,
+                candle,
+                index,
+                exit_fee_rate=taker_fee_rate,
+                exit_fee_type="taker",
+            )
+            if closed_trade is not None:
+                trades.append(closed_trade)
+                open_position = None
+
+        if open_position is not None and slope > 0:
+            exit_price_raw = snap_to_increment(candle.close, instrument.tick_size, "nearest")
+            exit_price = _apply_slippage_price(
+                exit_price_raw,
+                signal=open_position.signal,
+                tick_size=open_position.tick_size,
+                slippage_rate=open_position.exit_slippage_rate,
+                is_entry=False,
+            )
+            trades.append(
+                _build_closed_trade(
+                    open_position,
+                    candle,
+                    index,
+                    exit_price_raw=exit_price_raw,
+                    exit_price=exit_price,
+                    exit_reason="slope_turn_positive",
+                    exit_fee_rate=taker_fee_rate,
+                    exit_fee_type="taker",
+                )
+            )
+            open_position = None
+
+        if (
+            open_position is not None
+            or slope_ratio is None
+            or slope_ratio > entry_slope_threshold_ratio
+        ):
+            continue
+
+        protection = build_protection_plan(
+            instrument=instrument,
+            config=config,
+            direction="short",
+            entry_reference=candle.close,
+            atr_value=atr_value,
+            candle_ts=candle.ts,
+            trigger_inst_id=instrument.inst_id,
+        )
+        entry_price_raw = protection.entry_reference
+        size = _determine_backtest_order_size(
+            instrument=instrument,
+            config=config,
+            entry_price=protection.entry_reference,
+            stop_loss=protection.stop_loss,
+            risk_price_compatible=bool(config.risk_amount is not None and config.risk_amount > 0),
+        )
+        open_position = _create_open_position(
+            instrument=instrument,
+            signal="short",
+            entry_index=index,
+            entry_ts=candle.ts,
+            entry_price_raw=entry_price_raw,
+            stop_loss=protection.stop_loss,
+            take_profit=protection.take_profit,
+            atr_value=protection.atr_value,
+            size=size,
+            entry_fee_rate=taker_fee_rate,
+            exit_fee_rate=taker_fee_rate,
+            entry_fee_type="taker",
+            entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
+            exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
+            funding_rate=config.backtest_funding_rate,
+            dynamic_take_profit_enabled=dynamic_take_profit_enabled,
+            dynamic_exit_fee_rate=taker_fee_rate,
+            dynamic_two_r_break_even=config.dynamic_two_r_break_even,
+            dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+            time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+            time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+            apply_entry_slippage=True,
+        )
 
     return trades, _build_terminal_open_position(open_position, candles)
 
@@ -3288,3 +3333,121 @@ def _format_backtest_sizing_mode(value: str) -> str:
     if value == "risk_percent":
         return "风险百分比"
     return value
+
+
+def _append_backtest_dynamic_take_profit_lines(lines: list[str], result: BacktestResult) -> None:
+    lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
+    if result.take_profit_mode != "dynamic":
+        lines.append("止盈说明：固定止盈为 ATR 倍数止盈。")
+        return
+    lines.append(f"2R保本开关：{'开启' if result.dynamic_two_r_break_even else '关闭'}")
+    lines.append(f"手续费偏移开关：{'开启' if result.dynamic_fee_offset_enabled else '关闭'}")
+    lines.append(
+        "时间保本开关："
+        f"{'开启' if result.time_stop_break_even_enabled else '关闭'}"
+        f" | 阈值K线：{result.time_stop_break_even_bars if result.time_stop_break_even_bars > 0 else '未启用'}"
+    )
+    if result.dynamic_two_r_break_even:
+        description = (
+            "止盈说明：动态止盈在 2R 时先上移到开仓价+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
+            if result.dynamic_fee_offset_enabled
+            else "止盈说明：动态止盈在 2R 时先上移到开仓价，3R 起按 n-1R 递推；固定止盈为 ATR 倍数止盈。"
+        )
+    else:
+        description = (
+            "止盈说明：动态止盈在 2R 时上移到 1R+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
+            if result.dynamic_fee_offset_enabled
+            else "止盈说明：动态止盈在 2R 时上移到 1R，3R 起按 n-1R 递推；固定止盈为 ATR 倍数止盈。"
+        )
+    lines.append(description)
+    if result.time_stop_break_even_enabled and result.time_stop_break_even_bars > 0:
+        lines.append(
+            "时间保本说明：持仓满 "
+            f"{result.time_stop_break_even_bars} 根K线后，若价格已达到净保本区间，则把止损合并上移到开仓价±2倍Taker手续费；"
+            "该止损只会朝有利方向推进，不会回退。"
+        )
+
+
+def _backtest_dynamic_direction_text(result: BacktestResult) -> str:
+    preferred_direction = strategy_preferred_direction(result.strategy_id, str(getattr(result, "signal_mode", "") or ""))
+    if preferred_direction == "long":
+        return "做多"
+    if preferred_direction == "short":
+        return "做空"
+    return "按方向参数"
+
+
+def _append_backtest_strategy_notes(
+    lines: list[str],
+    result: BacktestResult,
+    *,
+    fast_label: str,
+    trend_label: str,
+    reference_label: str,
+) -> None:
+    family = _backtest_strategy_family(result.strategy_id)
+    if family == "dynamic_order":
+        lines.append(
+            f"趋势过滤：{fast_label} 与 {trend_label} 组成趋势过滤，当前策略方向={_backtest_dynamic_direction_text(result)}"
+        )
+        if _backtest_uses_mtf_filter(result.strategy_id):
+            reversal_text = "停止新增仓位" if result.mtf_reversal_mode == "block_new_entries" else "不处理"
+            lines.append(
+                f"多周期过滤：低周期={result.bar} | "
+                f"高周期={result.mtf_filter_bar} | "
+                f"高周期EMA{result.mtf_filter_fast_ema_period}/EMA{result.mtf_filter_slow_ema_period} | "
+                f"反转处理={reversal_text}"
+            )
+        lines.append(f"挂单参考线：{reference_label}")
+        lines.append(
+            f"委托规则：每根新 K 线按最新 {reference_label} 重新撤旧挂新；若新 K 线开盘已优于挂单价，则按开盘价即时成交，否则仅在盘中触及挂单价时成交，未成交委托不跨 K 线保留"
+        )
+        _append_backtest_dynamic_take_profit_lines(lines, result)
+        lines.append(f"每波最多开仓次数：{result.max_entries_per_trend if result.max_entries_per_trend > 0 else '不限'}")
+        lines.append("同K线撮合：阳线按 O→L→H→C，阴线按 O→H→L→C，十字线不做同K线平仓")
+        return
+    if family == "adaptive_ema_rail":
+        lines.append(
+            "交易逻辑：Adaptive EMA Rail 仅做多；先用 EMA200 与高低点结构过滤趋势，再从固定 EMA 候选池中选择 Respect Score 最高的支撑轨道。"
+        )
+        lines.append(
+            "委托规则：主导轨道至少完成两次有效反弹后，每根新 K 线按当前主导 EMA 重新挂回踩买单；若轨道发生有效跌破，则按轨道失效退出或停止继续挂单。"
+        )
+        _append_backtest_dynamic_take_profit_lines(lines, result)
+        lines.append(f"每条轨道最多开仓次数：{result.max_entries_per_trend if result.max_entries_per_trend > 0 else '不限'}")
+        lines.append("同K线撮合：沿用动态委托撮合口径，未成交委托不跨 K 线保留。")
+        return
+    if family == "ema5_ema8":
+        lines.append(
+            f"交易逻辑：固定 4H EMA{result.ema_period}/EMA{result.trend_ema_period} 金叉死叉开仓，收盘价跌破/站回 EMA{result.trend_ema_period} 时按动态止损离场。"
+        )
+        lines.append("本策略不设固定止盈，回测使用收盘确认与收盘价离场。")
+        return
+    if family == "ema55_slope_short":
+        lines.append(
+            f"交易逻辑：固定 {fast_label}；当 {fast_label} 单根斜率比例小于等于阈值时按收盘价开空，持仓后继续按 ATR 止损/固定或动态止盈管理；若 {fast_label} 斜率重新转正，则按收盘价平仓。"
+        )
+        lines.append(
+            "开空阈值："
+            f"{format_decimal_fixed(result.trend_ema_slope_filter_min_ratio, 6)}"
+            "（按单根 EMA 斜率 / 当前 EMA 计算，需小于等于该负值才开空）"
+        )
+        _append_backtest_dynamic_take_profit_lines(lines, result)
+        lines.append("方向说明：本策略只做空，不做多。")
+        return
+    if family in {"cross_breakout_long", "cross_breakdown_short", "cross_legacy"}:
+        if family == "cross_breakout_long":
+            lines.append(
+                f"交易逻辑：仅做多——收盘价向上突破参考线({reference_label})，且须 {fast_label}>{trend_label}。止损、止盈按 ATR 倍数与参考价、入场价计算。"
+            )
+        elif family == "cross_breakdown_short":
+            lines.append(
+                f"交易逻辑：仅做空——收盘价向下跌破参考线({reference_label})，且须 {fast_label}<{trend_label}。止损、止盈按 ATR 倍数与参考价、入场价计算。"
+            )
+        else:
+            lines.append(
+                f"交易逻辑（旧版入口）：多——向上突破参考线({reference_label})，且须 {fast_label}>{trend_label}；空——向下跌破该参考线，且须 {fast_label}<{trend_label}。止损、止盈按 ATR 倍数与参考价、入场价计算。"
+            )
+        _append_backtest_dynamic_take_profit_lines(lines, result)
+        if result.hold_close_exit_bars > 0:
+            lines.append(f"持仓满 {result.hold_close_exit_bars} 根K线后按收盘价强制平仓（含平仓滑点）。")

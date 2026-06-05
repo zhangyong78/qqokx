@@ -565,6 +565,24 @@ class OkxHistoryParsingTest(TestCase):
         )
         self.assertEqual(_position_history_realized_pnl_usdt(item, {"BTC": Decimal("80000")}), Decimal("40"))
 
+    def test_position_history_realized_pnl_usdt_uses_okx_ccy_for_coin_margined_futures(self) -> None:
+        item = OkxPositionHistoryItem(
+            update_time=1710000000300,
+            inst_id="BTC-USD-260626",
+            inst_type="FUTURES",
+            mgn_mode="cross",
+            pos_side="short",
+            direction=None,
+            open_avg_price=Decimal("70000"),
+            close_avg_price=Decimal("69000"),
+            close_size=Decimal("200"),
+            pnl=Decimal("0.12"),
+            realized_pnl=Decimal("0.08"),
+            settle_pnl=Decimal("0.01"),
+            raw={"ccy": "BTC"},
+        )
+        self.assertEqual(_position_history_realized_pnl_usdt(item, {"BTC": Decimal("80000")}), Decimal("6400"))
+
     def test_position_history_realized_pnl_usdt_keeps_usdt_value(self) -> None:
         item = OkxPositionHistoryItem(
             update_time=1710000000300,
@@ -581,7 +599,7 @@ class OkxHistoryParsingTest(TestCase):
             settle_pnl=Decimal("0"),
             raw={},
         )
-        self.assertIsNone(_position_history_realized_pnl_usdt(item, {"BTC": Decimal("80000")}))
+        self.assertEqual(_position_history_realized_pnl_usdt(item, {"BTC": Decimal("80000")}), Decimal("8.5"))
 
     def test_build_position_history_usdt_price_map_uses_current_spot_snapshot(self) -> None:
         client = OkxRestClient()
@@ -976,6 +994,25 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(_format_position_history_pnl(item.pnl, item), "12.30")
         self.assertEqual(_format_position_history_pnl(item.realized_pnl, item, with_sign=True), "+8.50")
 
+    def test_position_history_formats_coin_margined_futures_pnl_using_okx_currency(self) -> None:
+        item = OkxPositionHistoryItem(
+            update_time=1710000000300,
+            inst_id="BTC-USD-260626",
+            inst_type="FUTURES",
+            mgn_mode="cross",
+            pos_side="short",
+            direction=None,
+            open_avg_price=Decimal("70000"),
+            close_avg_price=Decimal("69000"),
+            close_size=Decimal("200"),
+            pnl=Decimal("0.12"),
+            realized_pnl=Decimal("0.08"),
+            settle_pnl=Decimal("0.01"),
+            raw={"ccy": "BTC"},
+        )
+        self.assertEqual(_format_position_history_pnl(item.pnl, item), "0.12")
+        self.assertEqual(_format_position_history_pnl(item.realized_pnl, item, with_sign=True), "+0.08")
+
     def test_position_history_size_converts_coin_margined_futures_contracts_to_coin_amount(self) -> None:
         detail = _build_position_history_detail_text(
             OkxPositionHistoryItem(
@@ -1285,7 +1322,7 @@ class OkxHistoryParsingTest(TestCase):
 
         self.assertIn("盈亏合计 USDT +12.30 / BTC +0.001", summary)
         self.assertIn("已实现合计 USDT +8.50 / BTC +0.0005", summary)
-        self.assertIn("折合USDT合计 +40", summary)
+        self.assertIn("折合USDT合计 +49", summary)
 
     def test_build_account_config_detail_text_contains_translated_labels(self) -> None:
         text = _build_account_config_detail_text(

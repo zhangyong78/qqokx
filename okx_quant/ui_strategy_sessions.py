@@ -4,15 +4,17 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from okx_quant.strategy_runtime_registry import (
+    get_strategy_runtime_profile,
+    strategy_entry_reference_period_caption,
+    strategy_preferred_direction,
+)
+
 
 class UiStrategySessionsMixin:
     @staticmethod
     def _entry_reference_ema_caption(strategy_id: str) -> str:
-        if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id):
-            return "挂单参考线"
-        if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(strategy_id):
-            return "突破参考线"
-        return "参考线周期"
+        return strategy_entry_reference_period_caption(strategy_id)
 
     @staticmethod
     def _format_strategy_symbol_display(signal_symbol: str, trade_symbol: str | None) -> str:
@@ -122,6 +124,7 @@ class UiStrategySessionsMixin:
             _reverse_lookup_label(TAKE_PROFIT_MODE_OPTIONS, record.config.take_profit_mode, "动态止盈")
         )
         self.max_entries_per_trend.set(str(record.config.max_entries_per_trend))
+        self.trend_ema_slope_filter_min_ratio.set(_format_entry_decimal(record.config.trend_ema_slope_filter_min_ratio))
         self.startup_chase_window_seconds.set(str(record.config.startup_chase_window_seconds))
         self.dynamic_two_r_break_even.set(record.config.dynamic_two_r_break_even)
         self.dynamic_fee_offset_enabled.set(record.config.dynamic_fee_offset_enabled)
@@ -140,6 +143,12 @@ class UiStrategySessionsMixin:
             _reverse_lookup_label(ENTRY_SIDE_MODE_OPTIONS, record.config.entry_side_mode, "跟随信号")
         )
         self.environment_label.set(_reverse_lookup_label(ENV_OPTIONS, record.config.environment, "模拟盘 demo"))
+        if strategy_forces_local_trade(definition.strategy_id):
+            self.trade_symbol.set(launch_symbol)
+            self.local_tp_sl_symbol.set(launch_symbol)
+            self.tp_sl_mode_label.set("按交易标的价格（本地）")
+        if strategy_forces_follow_signal(definition.strategy_id):
+            self.entry_side_mode_label.set("跟随信号")
         self._sync_dynamic_take_profit_controls()
         QuantApp._sync_entry_side_mode_controls(self)
         return definition, resolved_api_name, api_note
@@ -2276,7 +2285,15 @@ class UiStrategySessionsMixin:
 
     @staticmethod
     def _trader_wave_lock_signal_from_session(session: StrategySession) -> str:
+        strategy_id = str(getattr(session, "strategy_id", "") or "").strip()
         signal_mode = str(getattr(getattr(session, "config", None), "signal_mode", "") or "").strip().lower()
+        if strategy_id:
+            try:
+                preferred_direction = strategy_preferred_direction(strategy_id, signal_mode)
+            except KeyError:
+                preferred_direction = None
+            if preferred_direction is not None:
+                return preferred_direction
         if signal_mode == "long_only":
             return "long"
         if signal_mode == "short_only":
@@ -2299,7 +2316,11 @@ class UiStrategySessionsMixin:
         strategy_id = str(config.strategy_id or "").strip()
         if not strategy_id:
             return False
-        if is_dynamic_strategy_id(strategy_id):
+        try:
+            family = get_strategy_runtime_profile(strategy_id).family
+        except KeyError:
+            return False
+        if family == "dynamic_order":
             strategy = EmaDynamicOrderStrategy()
             lookback = recommended_indicator_lookback(
                 config.ema_period,
@@ -2308,7 +2329,7 @@ class UiStrategySessionsMixin:
                 config.resolved_entry_reference_ema_period(),
                 DEFAULT_DEBUG_ATR_PERIOD,
             )
-        elif is_ema_atr_breakout_strategy(strategy_id):
+        elif family in {"cross_breakout_long", "cross_breakdown_short"}:
             strategy = EmaAtrStrategy()
             lookback = recommended_indicator_lookback(
                 config.ema_period,
@@ -2317,7 +2338,7 @@ class UiStrategySessionsMixin:
                 config.atr_period,
                 DEFAULT_DEBUG_ATR_PERIOD,
             )
-        elif strategy_id == STRATEGY_EMA5_EMA8_ID:
+        elif family == "ema5_ema8":
             strategy = EmaCrossEmaStopStrategy()
             lookback = recommended_indicator_lookback(
                 config.ema_period,
@@ -3849,27 +3870,63 @@ class UiStrategySessionsMixin:
     def _apply_selected_strategy_definition(self) -> None:
         definition = self._selected_strategy_definition()
         strategy_id = definition.strategy_id
+        has_saved_draft = strategy_id in self._strategy_parameter_scope_drafts()
         previous_strategy_id = self._last_strategy_parameter_strategy_id
         if previous_strategy_id and previous_strategy_id != strategy_id:
             self._save_strategy_parameter_draft(previous_strategy_id)
         self._restore_strategy_parameter_draft(strategy_id)
-        dynamic_strategy = is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id)
-        breakout_strategy = is_ema_atr_breakout_strategy(strategy_id)
-        dynamic_tp_controls = dynamic_strategy or breakout_strategy
+        visibility = build_strategy_widget_visibility(strategy_id, "launcher")
         self.signal_combo["values"] = definition.allowed_signal_labels
         fixed_signal_mode = strategy_fixed_value(strategy_id, "signal_mode")
         if fixed_signal_mode is not None:
             self.signal_mode_label.set(_reverse_lookup_label(SIGNAL_LABEL_TO_VALUE, str(fixed_signal_mode), definition.default_signal_label))
         elif self.signal_mode_label.get() not in definition.allowed_signal_labels:
             self.signal_mode_label.set(definition.default_signal_label)
-        if strategy_id == STRATEGY_EMA5_EMA8_ID:
-            self.entry_reference_ema_period.set("0")
-            self.risk_amount.set("10")
-            self.take_profit_mode_label.set("固定止盈")
-            self.max_entries_per_trend.set("0")
+        if not has_saved_draft:
+            extra_defaults = strategy_ui_extra_defaults(strategy_id, "launcher")
+            risk_amount = extra_defaults.get("risk_amount")
+            if risk_amount is not None:
+                self.risk_amount.set(str(risk_amount))
+            order_size = extra_defaults.get("order_size")
+            if order_size is not None:
+                self.order_size.set(str(order_size))
+            poll_seconds = extra_defaults.get("poll_seconds")
+            if poll_seconds is not None:
+                self.poll_seconds.set(str(poll_seconds))
+            trade_mode = extra_defaults.get("trade_mode")
+            if trade_mode is not None:
+                self.trade_mode_label.set(_reverse_lookup_label(TRADE_MODE_OPTIONS, str(trade_mode), self.trade_mode_label.get()))
+            position_mode = extra_defaults.get("position_mode")
+            if position_mode is not None:
+                self.position_mode_label.set(
+                    _reverse_lookup_label(POSITION_MODE_OPTIONS, str(position_mode), self.position_mode_label.get())
+                )
+            trigger_type = extra_defaults.get("trigger_type")
+            if trigger_type is not None:
+                self.trigger_type_label.set(
+                    _reverse_lookup_label(TRIGGER_TYPE_OPTIONS, str(trigger_type), self.trigger_type_label.get())
+                )
+            entry_side_mode = extra_defaults.get("entry_side_mode")
+            if entry_side_mode is not None:
+                self.entry_side_mode_label.set(
+                    _reverse_lookup_label(ENTRY_SIDE_MODE_OPTIONS, str(entry_side_mode), self.entry_side_mode_label.get())
+                )
+            take_profit_mode = extra_defaults.get("take_profit_mode")
+            if take_profit_mode is not None:
+                self.take_profit_mode_label.set(
+                    _reverse_lookup_label(TAKE_PROFIT_MODE_OPTIONS, str(take_profit_mode), self.take_profit_mode_label.get())
+                )
+            max_entries_per_trend = extra_defaults.get("max_entries_per_trend")
+            if max_entries_per_trend is not None:
+                self.max_entries_per_trend.set(str(max_entries_per_trend))
+            tp_sl_mode = extra_defaults.get("tp_sl_mode")
+            if tp_sl_mode is not None:
+                self.tp_sl_mode_label.set(_launcher_tp_sl_mode_label(str(tp_sl_mode)))
+        if strategy_forces_follow_signal(strategy_id):
             self.entry_side_mode_label.set("跟随信号")
+        if strategy_forces_local_trade(strategy_id):
             self.tp_sl_mode_label.set("按交易标的价格（本地）")
-        if dynamic_tp_controls:
+        if visibility.show_dynamic_take_profit:
             self._take_profit_mode_label.grid()
             self._take_profit_mode_combo.grid()
             self._max_entries_per_trend_label.grid()
@@ -3891,7 +3948,7 @@ class UiStrategySessionsMixin:
             self._time_stop_break_even_check.grid_remove()
             self._time_stop_break_even_bars_label.grid_remove()
             self._time_stop_break_even_bars_entry.grid_remove()
-        if dynamic_strategy or breakout_strategy:
+        if visibility.show_startup_chase_window:
             self._startup_chase_window_label.grid()
             self._startup_chase_window_entry.grid()
             self._startup_chase_window_hint_label.grid()
@@ -3899,14 +3956,24 @@ class UiStrategySessionsMixin:
             self._startup_chase_window_label.grid_remove()
             self._startup_chase_window_entry.grid_remove()
             self._startup_chase_window_hint_label.grid_remove()
-        if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
+        if visibility.show_entry_reference:
             self._entry_reference_ema_label.configure(text=self._entry_reference_ema_caption(strategy_id))
             self._entry_reference_ema_label.grid()
             self._entry_reference_ema_entry.grid()
         else:
             self._entry_reference_ema_label.grid_remove()
             self._entry_reference_ema_entry.grid_remove()
-        if self._strategy_uses_big_ema(strategy_id):
+        slope_widgets = (
+            self._slope_threshold_label,
+            self._slope_threshold_entry,
+            self._slope_threshold_hint_label,
+        )
+        for widget in slope_widgets:
+            if visibility.show_slope_threshold:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        if visibility.show_big_ema:
             self._big_ema_label.grid()
             self._big_ema_entry.grid()
         else:
@@ -3923,7 +3990,7 @@ class UiStrategySessionsMixin:
             self._mtf_reversal_mode_combo,
         )
         for widget in mtf_widgets:
-            if is_dynamic_mtf_strategy_id(strategy_id):
+            if visibility.show_mtf_controls:
                 widget.grid()
             else:
                 widget.grid_remove()
@@ -3936,10 +4003,23 @@ class UiStrategySessionsMixin:
         self._set_field_state(self._mtf_filter_fast_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_fast_ema_period", "launcher"))
         self._set_field_state(self._mtf_filter_slow_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_slow_ema_period", "launcher"))
         self._set_field_state(self._mtf_reversal_mode_combo, editable=strategy_is_parameter_editable(strategy_id, "mtf_reversal_mode", "launcher"))
+        self._set_field_state(
+            self._slope_threshold_entry,
+            editable=strategy_is_parameter_editable(strategy_id, "trend_ema_slope_filter_min_ratio", "launcher"),
+        )
         self._apply_strategy_parameter_fixed_labels(strategy_id)
-        if strategy_uses_parameter(strategy_id, "entry_reference_ema_period") and not self.entry_reference_ema_period.get().strip():
+        if hasattr(self, "_entry_side_mode_combo") and hasattr(self, "_tp_sl_mode_combo"):
+            if strategy_forces_follow_signal(strategy_id):
+                self._entry_side_mode_combo.configure(values=("跟随信号",), state="disabled")
+            else:
+                self._entry_side_mode_combo.configure(values=list(ENTRY_SIDE_MODE_OPTIONS.keys()), state="readonly")
+            if strategy_forces_local_trade(strategy_id):
+                self._tp_sl_mode_combo.configure(values=("按交易标的价格（本地）",), state="disabled")
+            else:
+                self._tp_sl_mode_combo.configure(values=LAUNCHER_TP_SL_MODE_LABELS, state="readonly")
+        if visibility.show_entry_reference and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
-        if (dynamic_strategy or breakout_strategy) and not self.startup_chase_window_seconds.get().strip():
+        if visibility.show_startup_chase_window and not self.startup_chase_window_seconds.get().strip():
             self.startup_chase_window_seconds.set("0")
         self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
@@ -3957,11 +4037,7 @@ class UiStrategySessionsMixin:
         if not hasattr(self, "_dynamic_two_r_break_even_check"):
             return
         definition = self._selected_strategy_definition()
-        dynamic_tp_eligible = (
-            is_dynamic_strategy_id(definition.strategy_id)
-            or is_dynamic_mtf_strategy_id(definition.strategy_id)
-            or is_ema_atr_breakout_strategy(definition.strategy_id)
-        )
+        dynamic_tp_eligible = strategy_supports_dynamic_take_profit(definition.strategy_id)
         dynamic_take_profit = (
             dynamic_tp_eligible and TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "fixed") == "dynamic"
         )
@@ -4087,11 +4163,19 @@ class UiStrategySessionsMixin:
                     MTF_REVERSAL_MODE_OPTIONS.get(self.mtf_reversal_mode_label.get(), "block_new_entries"),
                 )
             )
-        if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id) or is_ema_atr_breakout_strategy(strategy_id):
+        if strategy_uses_startup_chase_window(strategy_id):
             startup_chase_window_seconds = parse_nonnegative_duration_seconds(
                 self.startup_chase_window_seconds.get(),
                 field_name="启动追单窗口",
             )
+        trend_ema_slope_filter_min_ratio = Decimal("0")
+        if strategy_uses_parameter(strategy_id, "trend_ema_slope_filter_min_ratio"):
+            try:
+                trend_ema_slope_filter_min_ratio = Decimal(self.trend_ema_slope_filter_min_ratio.get().strip() or "0")
+            except InvalidOperation as exc:
+                raise ValueError("开空斜率阈值不是有效数字") from exc
+            if trend_ema_slope_filter_min_ratio > 0:
+                raise ValueError("开空斜率阈值必须小于或等于 0")
 
         if not api_key or not secret_key or not passphrase:
             raise ValueError("请先在 菜单 > 设置 > API 与通知设置 中填写 API 凭证")
@@ -4115,12 +4199,18 @@ class UiStrategySessionsMixin:
             if not notification_config.notify_signals:
                 raise ValueError("只发信号邮件模式需要勾选“信号邮件”")
 
-        if strategy_id == STRATEGY_EMA5_EMA8_ID:
+        if strategy_forces_local_trade(strategy_id):
             trade_symbol = symbol
             local_tp_sl_symbol = symbol
             tp_sl_mode = "local_trade"
-            risk_amount = Decimal("10")
-            order_size = Decimal("0")
+        fixed_risk_amount = strategy_ui_fixed_extra_value(strategy_id, "risk_amount", "launcher")
+        if fixed_risk_amount is not None:
+            risk_amount = Decimal(str(fixed_risk_amount))
+        fixed_order_size = strategy_ui_fixed_extra_value(strategy_id, "order_size", "launcher")
+        if fixed_order_size is not None:
+            order_size = Decimal(str(fixed_order_size))
+        if strategy_forces_follow_signal(strategy_id):
+            entry_side_mode = "follow_signal"
 
         credentials = Credentials(
             api_key=api_key,
@@ -4189,21 +4279,22 @@ class UiStrategySessionsMixin:
             run_mode=run_mode,
             take_profit_mode=TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()],
             max_entries_per_trend=max_entries_per_trend,
+            trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
             startup_chase_window_seconds=startup_chase_window_seconds
-            if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id)
+            if strategy_uses_startup_chase_window(strategy_id)
             else 0,
             dynamic_two_r_break_even=self.dynamic_two_r_break_even.get()
-            if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id)
+            if strategy_supports_dynamic_take_profit(strategy_id)
             else False,
             dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get()
-            if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id)
+            if strategy_supports_dynamic_take_profit(strategy_id)
             else False,
             time_stop_break_even_enabled=self.time_stop_break_even_enabled.get()
-            if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id)
+            if strategy_supports_dynamic_take_profit(strategy_id)
             else False,
             time_stop_break_even_bars=(
                 self._parse_positive_int(self.time_stop_break_even_bars.get(), "时间保本K线数")
-                if (is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id))
+                if strategy_supports_dynamic_take_profit(strategy_id)
                 and self.time_stop_break_even_enabled.get()
                 else 0
             ),
@@ -6010,18 +6101,11 @@ class UiStrategySessionsMixin:
         ]
         if not candidates:
             return None
-        preferred_direction: Literal["long", "short"] | None = None
         strategy_id = str(session.strategy_id or "").strip()
-        if strategy_id in {STRATEGY_DYNAMIC_LONG_ID, STRATEGY_EMA_BREAKOUT_LONG_ID}:
-            preferred_direction = "long"
-        elif strategy_id in {STRATEGY_DYNAMIC_SHORT_ID, STRATEGY_EMA_BREAKDOWN_SHORT_ID}:
-            preferred_direction = "short"
-        else:
-            signal_mode = resolve_dynamic_signal_mode(strategy_id, session.config.signal_mode)
-            if signal_mode == "long_only":
-                preferred_direction = "long"
-            elif signal_mode == "short_only":
-                preferred_direction = "short"
+        try:
+            preferred_direction = strategy_preferred_direction(strategy_id, session.config.signal_mode)
+        except KeyError:
+            preferred_direction = None
         if preferred_direction is not None:
             directional = [item for item in candidates if self._recoverable_position_direction(item) == preferred_direction]
             if not directional:

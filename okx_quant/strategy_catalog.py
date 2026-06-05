@@ -13,6 +13,7 @@ STRATEGY_EMA_BREAKOUT_LONG_ID = "ema_breakout_long"
 STRATEGY_EMA_BREAKDOWN_SHORT_ID = "ema_breakdown_short"
 STRATEGY_EMA5_EMA8_ID = "ema5_ema8_cross_stop"
 STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID = "adaptive_ema_rail_long"
+STRATEGY_EMA55_SLOPE_SHORT_ID = "ema55_slope_short"
 
 
 def is_ema_atr_breakout_strategy(strategy_id: str) -> bool:
@@ -26,6 +27,10 @@ def is_ema_atr_breakout_strategy(strategy_id: str) -> bool:
 
 def is_adaptive_ema_rail_strategy(strategy_id: str) -> bool:
     return strategy_id == STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID
+
+
+def is_ema55_slope_short_strategy(strategy_id: str) -> bool:
+    return strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID
 
 
 def is_dynamic_mtf_strategy_id(strategy_id: str) -> bool:
@@ -218,9 +223,27 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
         parameter_hint="V1 固定候选 EMA 集合与 Respect Score 默认阈值，重点验证轨道识别和回测表现。",
         default_signal_label="只做多",
         allowed_signal_labels=("只做多",),
-        supports_trade=False,
-        supports_signal_only=False,
+        supports_trade=True,
+        supports_signal_only=True,
         supports_backtest=True,
+    ),
+    StrategyDefinition(
+        strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+        name="EMA55 斜率做空",
+        summary="EMA55 斜率达到负阈值时做空，搭配 2ATR 止损、2R 保本后逐级锁盈与 ATR 分位过滤。",
+        rule_description=(
+            "流程：固定使用 EMA55；当最新一根已收盘 K 线的 EMA55 斜率比例小于等于开空阈值时，"
+            "若当前空仓则按该根 K 线收盘价开空。默认使用 2ATR 初始止损、动态逐级锁盈、2R 保本，"
+            "并通过 ATR 分位过滤较高波动环境。斜率转正平仓作为可选防守条件，默认关闭。"
+        ),
+        parameter_hint="实盘默认：1H、EMA55、斜率阈值 -0.0005、2ATR 止损、动态止盈、2R 保本、ATR 分位≤50%、每笔风险10U。",
+        default_signal_label="只做空",
+        allowed_signal_labels=("只做空",),
+        supports_trade=True,
+        supports_signal_only=True,
+        supports_backtest=True,
+        supports_batch_observe=True,
+        supports_trader_desk=True,
     ),
     StrategyDefinition(
         strategy_id=STRATEGY_DYNAMIC_ID,
@@ -241,7 +264,11 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
 )
 
 _STRATEGY_IDS_HIDDEN_FROM_LAUNCHER: frozenset[str] = frozenset(
-    {STRATEGY_DYNAMIC_ID, STRATEGY_CROSS_ID, STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID}
+    {
+        STRATEGY_DYNAMIC_ID,
+        STRATEGY_CROSS_ID,
+        STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+    }
 )
 _STRATEGY_IDS_HIDDEN_FROM_BACKTEST: frozenset[str] = frozenset({STRATEGY_DYNAMIC_ID, STRATEGY_CROSS_ID})
 
@@ -304,4 +331,6 @@ def resolve_dynamic_signal_mode(strategy_id: str, signal_mode: str) -> str:
         return "short_only"
     if strategy_id == STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID:
         return "long_only"
+    if strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
+        return "short_only"
     return signal_mode

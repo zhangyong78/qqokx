@@ -80,6 +80,7 @@ from okx_quant.backtest import BacktestManualPosition, BacktestOpenPosition, Bac
 from okx_quant.models import Candle, Instrument, OrderPlan, StrategyConfig
 from okx_quant.strategy_catalog import (
     STRATEGY_CROSS_ID,
+    STRATEGY_EMA55_SLOPE_SHORT_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
     STRATEGY_DYNAMIC_ID,
@@ -745,6 +746,139 @@ class BacktestTest(TestCase):
             strategy_id=STRATEGY_EMA5_EMA8_ID,
             risk_amount=Decimal("100"),
         )
+
+    def test_ema55_slope_short_backtest_opens_on_negative_slope_and_closes_on_positive_slope(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(BACKTEST_RESERVED_CANDLES)
+        ]
+        candles.extend(
+            [
+                Candle(1_000, Decimal("99"), Decimal("99"), Decimal("99"), Decimal("99"), Decimal("1"), True),
+                Candle(2_000, Decimal("98"), Decimal("98"), Decimal("98"), Decimal("98"), Decimal("1"), True),
+                Candle(3_000, Decimal("101"), Decimal("101"), Decimal("101"), Decimal("101"), Decimal("1"), True),
+            ]
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=55,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("200"),
+            atr_take_multiplier=Decimal("500"),
+            order_size=Decimal("2"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            backtest_sizing_mode="fixed_size",
+            take_profit_mode="fixed",
+            risk_amount=None,
+            backtest_entry_slippage_rate=Decimal("0"),
+            backtest_exit_slippage_rate=Decimal("0"),
+            backtest_funding_rate=Decimal("0"),
+        )
+
+        result = run_backtest(
+            DummyBacktestClient(candles, self._build_instrument()),
+            config,
+            candle_limit=0,
+            taker_fee_rate=Decimal("0"),
+        )
+
+        self.assertEqual(result.strategy_id, STRATEGY_EMA55_SLOPE_SHORT_ID)
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0].signal, "short")
+        self.assertEqual(result.trades[0].entry_price, Decimal("99"))
+        self.assertEqual(result.trades[0].exit_price, Decimal("101"))
+        self.assertEqual(result.trades[0].size, Decimal("2"))
+        self.assertEqual(result.trades[0].pnl, Decimal("-4"))
+        self.assertEqual(result.trades[0].exit_reason, "slope_turn_positive")
+        self.assertEqual(result.sizing_mode, "fixed_size")
+        self.assertIsNone(result.open_position)
+
+    def test_ema55_slope_short_batch_configs_stay_single(self) -> None:
+        config = replace(
+            self._build_config(),
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            signal_mode="short_only",
+            ema_period=55,
+            trend_ema_period=55,
+        )
+
+        configs = build_parameter_batch_configs(config)
+
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0].strategy_id, STRATEGY_EMA55_SLOPE_SHORT_ID)
+
+    def test_ema55_slope_short_backtest_respects_adjustable_negative_slope_threshold(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(BACKTEST_RESERVED_CANDLES)
+        ]
+        candles.extend(
+            [
+                Candle(1_000, Decimal("99"), Decimal("99"), Decimal("99"), Decimal("99"), Decimal("1"), True),
+                Candle(2_000, Decimal("98"), Decimal("98"), Decimal("98"), Decimal("98"), Decimal("1"), True),
+                Candle(3_000, Decimal("101"), Decimal("101"), Decimal("101"), Decimal("101"), Decimal("1"), True),
+            ]
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=55,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("200"),
+            atr_take_multiplier=Decimal("500"),
+            order_size=Decimal("2"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            backtest_sizing_mode="fixed_size",
+            take_profit_mode="fixed",
+            risk_amount=None,
+            trend_ema_slope_filter_min_ratio=Decimal("-0.0005"),
+            backtest_entry_slippage_rate=Decimal("0"),
+            backtest_exit_slippage_rate=Decimal("0"),
+            backtest_funding_rate=Decimal("0"),
+        )
+
+        result = run_backtest(
+            DummyBacktestClient(candles, self._build_instrument()),
+            config,
+            candle_limit=0,
+            taker_fee_rate=Decimal("0"),
+        )
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0].entry_index, BACKTEST_RESERVED_CANDLES + 1)
+        self.assertEqual(result.trades[0].entry_price, Decimal("98"))
+        self.assertEqual(result.trades[0].exit_price, Decimal("101"))
 
     def test_dynamic_backtest_short_gap_fill_regression_uses_next_candle_open_for_sol_4h(self) -> None:
         target_entry_ts = 1645747200000  # 2022-02-25 08:00:00

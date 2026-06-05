@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.11`
+当前版本：`v0.6.12`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -16,6 +16,25 @@
 - Deribit 波动率查看与监控
 - 回测、参数矩阵对比、结果持久化
 - BTC 研究工作台与报告导出
+
+## 近期更新
+
+`v0.6.12` 之后这一轮版本内容比较集中，重点新增和调整如下：
+
+- 新增 `EMA55 斜率做空` 策略：
+  - 规则：`EMA55` 单根斜率比例小于等于阈值时开空，斜率重新转正时平仓
+  - 支持 launcher / backtest 双端参数
+  - 斜率阈值可调，默认值为 `-0.0005`
+- `EMA55 斜率做空` 的回测与研究能力补齐：
+  - 支持固定风险金、固定数量、风险百分比三类仓位口径
+  - 支持 `2R 保本`、手续费偏移、时间保本、动态止盈
+  - 输出了独立 HTML 研究报告与多组研究脚本
+- 策略接入结构做了 B 方案重构：
+  - 新增 `strategy_ui_schema.py`，集中声明策略 UI 默认值、显示隐藏、强制只读/强制行为
+  - 新增 `strategy_runtime_registry.py`，集中声明策略 family、运行入口、方向偏好、参考线标题等
+  - launcher / backtest / engine / router 开始共用 schema / registry，不再靠大量 `if strategy_id == ...`
+- 修复了新策略接入引发的启动崩溃问题，并补充了启动烟测、策略切换回归和运行路由测试
+- 回测说明、参数矩阵、标题文案、方向偏好等逻辑开始按 runtime family 统一分流，减少主程序与具体策略的强耦合
 
 主应用代码位于 [okx_quant](/D:/qqokx/okx_quant)，研究与统计相关代码位于 [research](/D:/qqokx/research)、[stats](/D:/qqokx/stats)、[export](/D:/qqokx/export)。
 
@@ -118,10 +137,14 @@ python main.py
 ### 策略与交易
 
 - [okx_quant/engine.py](/D:/qqokx/okx_quant/engine.py)：策略执行与交易主引擎
+- [okx_quant/engine_strategy_router.py](/D:/qqokx/okx_quant/engine_strategy_router.py)：实盘策略运行路由，按 runtime registry 选择 signal/local/exchange 入口
 - [okx_quant/ui_strategy_sessions.py](/D:/qqokx/okx_quant/ui_strategy_sessions.py)：策略会话管理界面
 - [okx_quant/ui_positions.py](/D:/qqokx/okx_quant/ui_positions.py)：账户持仓、历史成交、历史仓位与持仓 WS 缓存状态展示
 - [okx_quant/smart_order.py](/D:/qqokx/okx_quant/smart_order.py)：Smart Order 任务执行
 - [okx_quant/trader_desk.py](/D:/qqokx/okx_quant/trader_desk.py)：交易台能力
+- [okx_quant/strategy_ui_schema.py](/D:/qqokx/okx_quant/strategy_ui_schema.py)：策略 UI schema，负责默认值、控件显示隐藏、强制行为
+- [okx_quant/strategy_runtime_registry.py](/D:/qqokx/okx_quant/strategy_runtime_registry.py)：策略 runtime registry，负责 family、执行入口、方向偏好、标题 helper
+- [okx_quant/strategies/ema55_slope_short.py](/D:/qqokx/okx_quant/strategies/ema55_slope_short.py)：EMA55 斜率做空信号逻辑
 - [okx_quant/arbitrage_ui.py](/D:/qqokx/okx_quant/arbitrage_ui.py)：现货套利窗口，包含机会扫描、套利开仓/平仓、交割合约移仓、持仓配对平仓、K 线图表与 API 切换
 - [okx_quant/arbitrage/arbitrage_manager.py](/D:/qqokx/okx_quant/arbitrage/arbitrage_manager.py)：套利扫描、开平仓、自动监控总入口
 - [okx_quant/arbitrage/arbitrage_executor.py](/D:/qqokx/okx_quant/arbitrage/arbitrage_executor.py)：套利开仓/平仓执行、部分平仓与成交回报校验
@@ -133,6 +156,8 @@ python main.py
 
 - [okx_quant/backtest.py](/D:/qqokx/okx_quant/backtest.py)：回测核心逻辑
 - [okx_quant/backtest_ui.py](/D:/qqokx/okx_quant/backtest_ui.py)：回测界面
+- [reports/ema55_slope_short_research_report.html](/D:/qqokx/reports/ema55_slope_short_research_report.html)：EMA55 斜率做空研究报告（HTML）
+- [scripts/run_ema55_slope_short_research_report.py](/D:/qqokx/scripts/run_ema55_slope_short_research_report.py)：EMA55 斜率做空研究复跑脚本
 - [okx_quant/btc_market_analyzer.py](/D:/qqokx/okx_quant/btc_market_analyzer.py)：BTC 市场研究分析
 - [okx_quant/btc_research_workbench_ui.py](/D:/qqokx/okx_quant/btc_research_workbench_ui.py)：BTC 研究工作台
 
@@ -155,6 +180,7 @@ python main.py
 - `scripts/generate_comprehensive_backtest_report.py`：综合回测报告生成
 - `scripts/check_local_candle_gaps.py`：本地 K 线缺口检查
 - `scripts/fill_local_candle_gaps.py`：本地 K 线缺口补齐
+- `scripts/run_ema55_slope_short_research_report.py`：EMA55 斜率做空研究报告复跑
 
 ## 现货套利快速上手
 
@@ -279,7 +305,13 @@ scripts\release_one_click.bat
 - [reports/server_upgrade_checklist.html](/D:/qqokx/reports/server_upgrade_checklist.html)
   ：服务器升级操作清单，适合按实盘环境灰度启用私有 WS 加速
 - [软件开发指南.md](/D:/qqokx/软件开发指南.md)
-  ：开发维护说明，已补充私有 WS、现货套利增强、持仓缓存状态提示和本轮回归建议
+  ：开发维护说明，已补充策略 schema / runtime registry、EMA55 斜率做空、回测与 UI 接入约定
+- [版本开发日志_v0.6.12.md](/D:/qqokx/版本开发日志_v0.6.12.md)
+  ：本轮版本开发日志，归档 EMA55 策略、研究报告、B 方案结构重构与验证结果
+- [reports/strategy_ui_schema_b_impl.md](/D:/qqokx/reports/strategy_ui_schema_b_impl.md)
+  ：B 方案实施说明，记录 schema / registry 这一轮已经解掉的耦合和剩余尾项
+- [reports/strategy_isolation_plan.md](/D:/qqokx/reports/strategy_isolation_plan.md)
+  ：“新策略与主程序解耦”设计方案与推进顺序
 - [线程工作流模板.md](/D:/qqokx/线程工作流模板.md)
 - [自动通道系统_v1_产品需求与技术路线.md](/D:/qqokx/自动通道系统_v1_产品需求与技术路线.md)
 - [BTC研究工作台开发记录.md](/D:/qqokx/BTC研究工作台开发记录.md)

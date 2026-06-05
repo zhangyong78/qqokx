@@ -505,7 +505,7 @@ class PositionUplConversionTest(TestCase):
         self.assertEqual(_format_optional_usdt(Decimal("123.6")), "+124")
         self.assertEqual(_format_optional_usdt_precise(Decimal("-27.2"), places=2), "-27.20")
         self.assertEqual(_format_optional_integer(Decimal("41735.8515")), "41736")
-        self.assertEqual(_group_pnl_places("BTC"), 5)
+        self.assertEqual(_group_pnl_places("BTC"), 8)
         self.assertEqual(_group_pnl_places("USDT"), 2)
 
     def test_position_unrealized_pnl_formats_with_currency_and_ratio(self) -> None:
@@ -513,7 +513,7 @@ class PositionUplConversionTest(TestCase):
         position = OkxPosition(**{**position.__dict__, "unrealized_pnl_ratio": Decimal("-0.4975")})
         self.assertEqual(_format_position_unrealized_pnl(position), "-0.00450000 BTC（-49.75%）")
 
-    def test_swap_and_futures_unrealized_pnl_use_two_decimals(self) -> None:
+    def test_swap_and_coin_margined_futures_unrealized_pnl_follow_pnl_currency_precision(self) -> None:
         swap = _make_position(inst_id="OKB-USDT-SWAP", upl="-2733.7537", margin_ccy="USDT")
         swap = OkxPosition(
             **{
@@ -531,7 +531,7 @@ class PositionUplConversionTest(TestCase):
             }
         )
         self.assertEqual(_format_position_unrealized_pnl(swap), "-2733.75 USDT（-38.97%）")
-        self.assertEqual(_format_position_unrealized_pnl(futures), "+0.11 BTC（13.66%）")
+        self.assertEqual(_format_position_unrealized_pnl(futures), "+0.10909674 BTC（13.66%）")
 
     def test_swap_and_futures_avg_price_follow_tick_size(self) -> None:
         swap = _make_position(inst_id="OKB-USDT-SWAP", upl="0", margin_ccy="USDT")
@@ -635,8 +635,8 @@ class PositionUplConversionTest(TestCase):
                 "theta_usdt": Decimal("-27.2"),
             },
         )
-        self.assertEqual(values[17], "-0.06947")
-        self.assertEqual(values[19], "+0.73992")
+        self.assertEqual(values[17], "-0.06947484")
+        self.assertEqual(values[19], "+0.73991882")
         self.assertEqual(values[26], "1.23456")
         self.assertEqual(values[30], "-27.20")
 

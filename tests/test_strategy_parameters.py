@@ -7,6 +7,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_MTF_SHORT_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
+    STRATEGY_EMA55_SLOPE_SHORT_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
     get_strategy_definition,
@@ -69,3 +70,21 @@ class StrategyParametersTest(TestCase):
         self.assertEqual(get_strategy_definition(STRATEGY_DYNAMIC_LONG_ID).default_signal_mode, "long_only")
         self.assertEqual(get_strategy_definition(STRATEGY_DYNAMIC_SHORT_ID).default_signal_mode, "short_only")
         self.assertEqual(get_strategy_definition(STRATEGY_EMA5_EMA8_ID).default_signal_mode, "both")
+
+    def test_ema55_slope_short_strategy_fixes_signal_and_ema55_parameters(self) -> None:
+        keys = set(iter_strategy_parameter_keys(STRATEGY_EMA55_SLOPE_SHORT_ID))
+
+        self.assertIn("bar", keys)
+        self.assertIn("atr_period", keys)
+        self.assertIn("atr_stop_multiplier", keys)
+        self.assertIn("atr_take_multiplier", keys)
+        self.assertIn("take_profit_mode", keys)
+        self.assertIn("dynamic_two_r_break_even", keys)
+        self.assertIn("dynamic_fee_offset_enabled", keys)
+        self.assertIn("trend_ema_slope_filter_min_ratio", keys)
+        self.assertIn("time_stop_break_even_enabled", keys)
+        self.assertIn("time_stop_break_even_bars", keys)
+        self.assertEqual(strategy_fixed_value(STRATEGY_EMA55_SLOPE_SHORT_ID, "signal_mode"), "short_only")
+        self.assertEqual(strategy_fixed_value(STRATEGY_EMA55_SLOPE_SHORT_ID, "ema_period"), 55)
+        self.assertEqual(strategy_fixed_value(STRATEGY_EMA55_SLOPE_SHORT_ID, "trend_ema_period"), 55)
+        self.assertFalse(strategy_is_parameter_editable(STRATEGY_EMA55_SLOPE_SHORT_ID, "ema_period", "backtest"))

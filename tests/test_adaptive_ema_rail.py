@@ -12,6 +12,7 @@ from okx_quant.strategies.adaptive_ema_rail import (
 from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+    STRATEGY_EMA55_SLOPE_SHORT_ID,
     STRATEGY_DEFINITIONS,
 )
 
@@ -126,6 +127,8 @@ class AdaptiveEmaRailTest(TestCase):
 
         self.assertNotIn(STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID, launcher_ids)
         self.assertIn(STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID, backtest_ids)
+        self.assertIn(STRATEGY_EMA55_SLOPE_SHORT_ID, launcher_ids)
+        self.assertIn(STRATEGY_EMA55_SLOPE_SHORT_ID, backtest_ids)
 
     def test_adaptive_rail_runs_through_public_backtest_entry(self) -> None:
         instrument = Instrument(

@@ -30,16 +30,22 @@ from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategies.ema_dynamic_multi_timeframe import EmaDynamicMultiTimeframeStrategy
+from okx_quant.strategies.ema55_slope_short import (
+    ema55_slope_short_exit_ready,
+    evaluate_ema55_slope_short_signal,
+)
 from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
-    STRATEGY_EMA5_EMA8_ID,
-    is_dynamic_mtf_strategy_id,
-    is_dynamic_strategy_id,
-    is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
 )
+from okx_quant.strategy_runtime_registry import (
+    get_strategy_runtime_profile,
+    strategy_uses_mtf_filter,
+    strategy_uses_signal_extrema,
+)
+from okx_quant.strategy_ui_schema import strategy_forces_follow_signal, strategy_supports_dynamic_take_profit
 
 
 Logger = Callable[[str], None]
@@ -50,11 +56,7 @@ def _live_dynamic_take_profit_enabled(config: StrategyConfig) -> bool:
     """与回测一致：EMA 动态委托与 EMA 突破/跌破在 take_profit_mode=dynamic 时启用动态止盈逻辑。"""
     if str(config.take_profit_mode or "") != "dynamic":
         return False
-    return (
-        is_dynamic_strategy_id(config.strategy_id)
-        or is_dynamic_mtf_strategy_id(config.strategy_id)
-        or is_ema_atr_breakout_strategy(config.strategy_id)
-    )
+    return strategy_supports_dynamic_take_profit(config.strategy_id)
 
 
 def live_exchange_dynamic_take_profit_template_enabled(config: StrategyConfig) -> bool:
@@ -64,8 +66,7 @@ def live_exchange_dynamic_take_profit_template_enabled(config: StrategyConfig) -
 
 def _take_profit_mode_description_for_signal_email(config: StrategyConfig) -> str:
     """仅发信号邮件中附带的止盈方式说明（与当前模板配置一致）。"""
-    sid = str(config.strategy_id or "")
-    if sid == STRATEGY_EMA5_EMA8_ID:
+    if get_strategy_runtime_profile(config.strategy_id).family == "ema5_ema8":
         return (
             "止盈止损说明：本策略以快慢线交叉为信号、慢线 EMA 为止损参考；"
             "与 ATR 固定/动态止盈倍数无关。"
@@ -424,7 +425,7 @@ class StrategyEngine:
         price_increment: Decimal | None,
     ) -> SignalDecision:
         eval_config = replace(config, signal_mode=effective_signal_mode)
-        if is_dynamic_mtf_strategy_id(config.strategy_id):
+        if strategy_uses_mtf_filter(config.strategy_id):
             return EmaDynamicMultiTimeframeStrategy().evaluate(
                 confirmed,
                 self._load_mtf_filter_confirmed_candles(config),
@@ -451,7 +452,7 @@ class StrategyEngine:
         )
 
     def _append_dynamic_mtf_mode_parts(self, config: StrategyConfig, mode_parts: list[str]) -> None:
-        if not is_dynamic_mtf_strategy_id(config.strategy_id):
+        if not strategy_uses_mtf_filter(config.strategy_id):
             return
         reversal_text = "停止新增仓位" if config.mtf_reversal_mode == "block_new_entries" else "不处理"
         mode_parts.append(
@@ -1412,6 +1413,118 @@ class StrategyEngine:
             self._monitor_local_exit(credentials, config, trade_instrument, position, protection)
             return
 
+    def _run_ema55_slope_short_local_strategy(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        signal_instrument: Instrument,
+        trade_instrument: Instrument,
+    ) -> None:
+        if resolve_trade_inst_id(config) != config.inst_id:
+            raise RuntimeError("EMA55 斜率做空当前只支持信号标的与下单标的相同。")
+
+        lookback = recommended_indicator_lookback(
+            config.ema_period,
+            config.trend_ema_period,
+            config.atr_period,
+            DEFAULT_DEBUG_ATR_PERIOD,
+        ) + 1
+        last_candle_ts: int | None = None
+
+        self._log_strategy_start(config, signal_instrument, trade_instrument)
+        self._log_local_mode_summary(config, signal_instrument, trade_instrument)
+        self._logger(
+            "策略规则：只做空；当最新已收盘K线的 EMA55 单根斜率比例小于等于阈值时按收盘价开空，"
+            "持仓后继续监控 ATR 止损/止盈；若后续 EMA55 斜率重新转正，则本地市价平仓。"
+        )
+        self._logger(
+            " | ".join(
+                [
+                    f"开空阈值={Decimal(str(config.trend_ema_slope_filter_min_ratio)):.6f}",
+                    f"止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}",
+                    f"2R保本={config.dynamic_two_r_break_even_label()}",
+                    f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
+                    (
+                        f"时间保本={config.time_stop_break_even_enabled_label()}/"
+                        f"{config.resolved_time_stop_break_even_bars()}根"
+                    ),
+                ]
+            )
+        )
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            current_bar=config.bar,
+            trend_ema_period=config.trend_ema_period,
+        )
+
+        while not self._stop_event.is_set():
+            candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period) + 1
+            if len(confirmed) < minimum:
+                self._logger("已收盘 K 线数量不足，继续等待更多数据...")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            newest_ts = confirmed[-1].ts
+            if newest_ts == last_candle_ts:
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            last_candle_ts = newest_ts
+
+            decision = evaluate_ema55_slope_short_signal(
+                confirmed,
+                config,
+                price_increment=signal_instrument.tick_size,
+            )
+            if decision.signal is None:
+                self._logger(f"{_fmt_ts(newest_ts)} | 当前无开空信号 | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            try:
+                position = self._open_local_position(
+                    credentials,
+                    config,
+                    signal_instrument=signal_instrument,
+                    trade_instrument=trade_instrument,
+                    signal=decision.signal,
+                    signal_entry_reference=decision.entry_reference,
+                    signal_atr_value=decision.atr_value,
+                    signal_candle_ts=decision.candle_ts,
+                    signal_candle_high=decision.signal_candle_high,
+                    signal_candle_low=decision.signal_candle_low,
+                )
+            except OrderSizeTooSmallError as exc:
+                self._logger(f"{_fmt_ts(decision.candle_ts or newest_ts)} | 当前无法下单 | {exc}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            protection = self._build_local_protection_plan(
+                config,
+                signal_instrument=signal_instrument,
+                trade_instrument=trade_instrument,
+                signal=decision.signal,
+                trade_side=position.side,
+                estimated_trade_entry=position.entry_price,
+                signal_entry_reference=decision.entry_reference,
+                signal_atr_value=decision.atr_value,
+                signal_candle_ts=decision.candle_ts,
+                signal_candle_high=decision.signal_candle_high,
+                signal_candle_low=decision.signal_candle_low,
+            )
+            self._monitor_ema55_slope_short_local_exit(
+                credentials,
+                config,
+                signal_instrument=signal_instrument,
+                trade_instrument=trade_instrument,
+                position=position,
+                protection=protection,
+                lookback=lookback,
+            )
+            return
+
     def _run_dynamic_local_strategy(
         self,
         credentials: Credentials,
@@ -2042,6 +2155,88 @@ class StrategyEngine:
             )
             self._stop_event.wait(config.poll_seconds)
 
+    def _run_ema55_slope_short_signal_only(
+        self,
+        config: StrategyConfig,
+        instrument: Instrument,
+    ) -> None:
+        lookback = recommended_indicator_lookback(
+            config.ema_period,
+            config.trend_ema_period,
+            config.atr_period,
+            DEFAULT_DEBUG_ATR_PERIOD,
+        ) + 1
+        last_candle_ts: int | None = None
+
+        self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
+        self._logger(
+            "运行模式：只监控信号，不下单；当 EMA55 单根斜率比例达到开空阈值时发送做空提示。"
+        )
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            current_bar=config.bar,
+            trend_ema_period=config.trend_ema_period,
+        )
+
+        while not self._stop_event.is_set():
+            candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period) + 1
+            if len(confirmed) < minimum:
+                self._logger("已收盘 K 线数量不足，继续等待更多数据...")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            newest_ts = confirmed[-1].ts
+            if newest_ts == last_candle_ts:
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            last_candle_ts = newest_ts
+
+            decision = evaluate_ema55_slope_short_signal(
+                confirmed,
+                config,
+                price_increment=instrument.tick_size,
+            )
+            if decision.signal is None or decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
+                self._logger(f"{_fmt_ts(newest_ts)} | 当前无开空信号 | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            protection = build_protection_plan(
+                instrument=instrument,
+                config=config,
+                direction=decision.signal,
+                entry_reference=decision.entry_reference,
+                atr_value=decision.atr_value,
+                candle_ts=decision.candle_ts,
+                trigger_inst_id=instrument.inst_id,
+            )
+            if config.take_profit_mode == "dynamic":
+                reason = (
+                    f"{decision.reason} | 止损={format_decimal(protection.stop_loss)} | "
+                    "止盈方式=动态止盈（2R保本后逐级抬止损）"
+                )
+            else:
+                reason = (
+                    f"{decision.reason} | 止损={format_decimal(protection.stop_loss)} | "
+                    f"止盈={format_decimal(protection.take_profit)}"
+                )
+            self._logger(
+                f"{_fmt_ts(decision.candle_ts)} | 信号触发 | 方向=SHORT | "
+                f"参考价={format_decimal(decision.entry_reference)} | {reason}"
+            )
+            self._notify_signal(
+                config,
+                signal=decision.signal,
+                trigger_symbol=instrument.inst_id,
+                entry_reference=decision.entry_reference,
+                tick_size=instrument.tick_size,
+                reason=reason,
+            )
+            self._stop_event.wait(config.poll_seconds)
+
     def _run_ema5_ema8_signal_only(
         self,
         config: StrategyConfig,
@@ -2336,7 +2531,7 @@ class StrategyEngine:
                 atr_value=signal_atr_value,
                 candle_ts=signal_candle_ts,
                 trigger_inst_id=signal_instrument.inst_id,
-                use_signal_extrema=is_ema_atr_breakout_strategy(config.strategy_id),
+                use_signal_extrema=strategy_uses_signal_extrema(config.strategy_id),
                 signal_candle_high=signal_candle_high,
                 signal_candle_low=signal_candle_low,
             )
@@ -2471,6 +2666,130 @@ class StrategyEngine:
                 self._close_position(credentials, config, trade_instrument, position, reason)
                 self.resume_automatic_trade_management()
                 return
+            self._stop_event.wait(config.poll_seconds)
+
+    def _monitor_ema55_slope_short_local_exit(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        signal_instrument: Instrument,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        protection: ProtectionPlan,
+        lookback: int,
+    ) -> None:
+        dynamic_take_profit_enabled = _live_dynamic_take_profit_enabled(config)
+        current_stop_loss = protection.stop_loss
+        current_take_profit = protection.take_profit
+        next_trigger_r = 2
+        risk_per_unit = abs(position.entry_price - protection.stop_loss)
+        last_checked_candle_ts: int | None = None
+        monitor_parts = [
+            f"开始本地止盈止损监控 | 触发标的={protection.trigger_inst_id}",
+            f"斜率退出标的={signal_instrument.inst_id}",
+            f"触发价格类型={protection.trigger_price_type}",
+            f"止损={format_decimal(protection.stop_loss)}",
+            f"止盈={format_decimal(protection.take_profit)}",
+        ]
+        if dynamic_take_profit_enabled:
+            monitor_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
+            monitor_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
+            monitor_parts.append(
+                f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
+            )
+        self._logger(" | ".join(monitor_parts))
+
+        while not self._stop_event.is_set():
+            current_price = self._get_trigger_price_with_retry(
+                protection.trigger_inst_id,
+                protection.trigger_price_type,
+            )
+            manual_control = self.get_manual_trade_control()
+            manual_mode = manual_control.management_mode == "manual"
+            if manual_mode and manual_control.stop_loss is not None:
+                current_stop_loss = manual_control.stop_loss
+            if dynamic_take_profit_enabled and manual_mode:
+                stop_hit = current_price <= current_stop_loss if protection.direction == "long" else current_price >= current_stop_loss
+                take_hit = False
+            elif dynamic_take_profit_enabled:
+                holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
+                updated_stop_loss, updated_take_profit, updated_trigger_r, moved = _advance_dynamic_stop_live(
+                    direction=protection.direction,
+                    current_price=current_price,
+                    entry_price=position.entry_price,
+                    risk_per_unit=risk_per_unit,
+                    current_stop_loss=current_stop_loss,
+                    next_trigger_r=next_trigger_r,
+                    tick_size=trade_instrument.tick_size,
+                    two_r_break_even=config.dynamic_two_r_break_even,
+                    dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                    holding_bars=holding_bars,
+                    time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+                    time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+                )
+                if moved:
+                    current_stop_loss = updated_stop_loss
+                    current_take_profit = updated_take_profit
+                    next_trigger_r = updated_trigger_r
+                    self._logger(
+                        f"动态止盈上移 | 当前价={format_decimal(current_price)} | "
+                        f"新止损={format_decimal(current_stop_loss)} | 下一阶段={next_trigger_r}R | "
+                        f"holding_bars={holding_bars}"
+                    )
+                stop_hit = current_price <= current_stop_loss if protection.direction == "long" else current_price >= current_stop_loss
+                take_hit = False
+            else:
+                stop_hit, take_hit = evaluate_local_exit(
+                    direction=protection.direction,
+                    current_price=current_price,
+                    stop_loss=current_stop_loss,
+                    take_profit=current_take_profit,
+                )
+            if stop_hit or take_hit:
+                reason = "止盈"
+                if stop_hit:
+                    reason = (
+                        _classify_live_dynamic_close_reason(
+                            direction=protection.direction,
+                            entry_price=position.entry_price,
+                            initial_stop_loss=protection.stop_loss,
+                            current_stop_loss=current_stop_loss,
+                            risk_per_unit=risk_per_unit,
+                            next_trigger_r=next_trigger_r,
+                            tick_size=trade_instrument.tick_size,
+                            two_r_break_even=config.dynamic_two_r_break_even,
+                            dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                            time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+                        )
+                        if dynamic_take_profit_enabled
+                        else "止损"
+                    )
+                self._logger(
+                    f"本地{reason}触发 | 触发标的={protection.trigger_inst_id} | "
+                    f"当前价={format_decimal(current_price)} | "
+                    f"止损={format_decimal(current_stop_loss)} | 止盈={format_decimal(current_take_profit)}"
+                )
+                self._close_position(credentials, config, trade_instrument, position, reason)
+                self.resume_automatic_trade_management()
+                return
+
+            candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            if confirmed:
+                newest_ts = confirmed[-1].ts
+                if newest_ts != last_checked_candle_ts:
+                    last_checked_candle_ts = newest_ts
+                    exit_ready, exit_candle, _ema_value, slope_ratio = ema55_slope_short_exit_ready(confirmed, config)
+                    if exit_ready and exit_candle is not None:
+                        slope_text = f"{slope_ratio:.6f}" if slope_ratio is not None else "-"
+                        self._logger(
+                            f"{_fmt_ts(exit_candle.ts)} | EMA55 斜率转正平仓 | 斜率比例={slope_text}"
+                        )
+                        self._close_position(credentials, config, trade_instrument, position, "斜率转正")
+                        self.resume_automatic_trade_management()
+                        return
+
             self._stop_event.wait(config.poll_seconds)
 
     def _close_position(
@@ -4208,7 +4527,7 @@ class StrategyEngine:
             f"启动策略 | 信号标的={signal_instrument.inst_id} | 下单标的={trade_instrument.inst_id} | "
             f"K线周期={config.bar} | 快线均线={config.ema_label()} | ATR={config.atr_period}"
         )
-        if is_dynamic_strategy_id(config.strategy_id):
+        if get_strategy_runtime_profile(config.strategy_id).family in {"dynamic_order", "cross_breakout_long", "cross_breakdown_short", "cross_legacy"}:
             message = (
                 f"{message} | 趋势均线={config.trend_ema_label()} | 挂单参考线={config.entry_reference_line_label()}"
             )
@@ -4451,7 +4770,7 @@ def supports_fixed_entry_side_mode(strategy_id: str, run_mode: str, tp_sl_mode: 
     normalized_tp_sl_mode = str(tp_sl_mode or "").strip().lower()
     return (
         normalized_run_mode == "trade"
-        and strategy_id != STRATEGY_EMA5_EMA8_ID
+        and not strategy_forces_follow_signal(strategy_id)
         and normalized_tp_sl_mode == "local_trade"
     )
 
@@ -4463,8 +4782,8 @@ def fixed_entry_side_mode_support_reason(strategy_id: str, run_mode: str, tp_sl_
     normalized_tp_sl_mode = str(tp_sl_mode or "").strip().lower()
     if normalized_run_mode != "trade":
         return "只发信号邮件模式不下单，下单方向模式已固定为跟随信号。"
-    if strategy_id == STRATEGY_EMA5_EMA8_ID:
-        return "EMA5/EMA8 策略当前只支持跟随信号。"
+    if strategy_forces_follow_signal(strategy_id):
+        return "当前策略只支持跟随信号。"
     if normalized_tp_sl_mode == "exchange":
         return "OKX 托管模式当前只支持跟随信号；如需固定买入/固定卖出，请切到按交易标的价格（本地）。"
     if normalized_tp_sl_mode == "local_signal":
@@ -5195,7 +5514,7 @@ def build_order_plan(
         atr_value=atr_value,
         candle_ts=candle_ts,
         trigger_inst_id=instrument.inst_id,
-        use_signal_extrema=is_ema_atr_breakout_strategy(config.strategy_id),
+        use_signal_extrema=strategy_uses_signal_extrema(config.strategy_id),
         signal_candle_high=signal_candle_high,
         signal_candle_low=signal_candle_low,
     )

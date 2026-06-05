@@ -17,6 +17,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_MTF_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
+    STRATEGY_EMA55_SLOPE_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
 )
 from okx_quant.upgrade_launch import (
@@ -6093,6 +6094,7 @@ class StrategyParameterDraftRestoreTest(TestCase):
             max_entries_per_trend=_Var(""),
             dynamic_two_r_break_even=_Var(False),
             dynamic_fee_offset_enabled=_Var(False),
+            trend_ema_slope_filter_min_ratio=_Var(""),
             time_stop_break_even_enabled=_Var(False),
             time_stop_break_even_bars=_Var(""),
             startup_chase_window_seconds=_Var(""),
@@ -6138,6 +6140,21 @@ class StrategyParameterDraftRestoreTest(TestCase):
         self.assertEqual(app.mtf_filter_fast_ema_period.get(), 21)
         self.assertEqual(app.mtf_filter_slow_ema_period.get(), 55)
         self.assertEqual(app.mtf_reversal_mode_label.get(), "只过滤新开仓")
+
+    def test_restore_strategy_parameter_draft_uses_slope_strategy_schema_defaults(self) -> None:
+        app = self._make_parameter_stub()
+
+        QuantApp._restore_strategy_parameter_draft(app, STRATEGY_EMA55_SLOPE_SHORT_ID)
+
+        self.assertEqual(app.bar.get(), "1H")
+        self.assertEqual(app.atr_period.get(), 14)
+        self.assertEqual(app.stop_atr.get(), "2")
+        self.assertEqual(app.take_atr.get(), "4")
+        self.assertTrue(app.dynamic_two_r_break_even.get())
+        self.assertTrue(app.dynamic_fee_offset_enabled.get())
+        self.assertFalse(app.time_stop_break_even_enabled.get())
+        self.assertEqual(app.time_stop_break_even_bars.get(), 10)
+        self.assertEqual(app.trend_ema_slope_filter_min_ratio.get(), "-0.0005")
 
 
 class StrategyParameterFixedLabelTest(TestCase):

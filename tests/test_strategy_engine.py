@@ -36,6 +36,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_MTF_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
     STRATEGY_EMA5_EMA8_ID,
+    STRATEGY_EMA55_SLOPE_SHORT_ID,
 )
 
 
@@ -217,6 +218,75 @@ class StrategyEngineTest(TestCase):
         )
 
         self.assertIn("dynamic:ema_dynamic_mtf_long:BTC-USDT-SWAP", calls)
+        self.assertNotIn("error:", "".join(calls))
+
+    def test_router_runs_ema55_slope_short_local_strategy_via_registry(self) -> None:
+        calls: list[str] = []
+
+        class _StopEvent:
+            def set(self) -> None:
+                calls.append("stopped")
+
+        class _StubEngine:
+            _stop_event = _StopEvent()
+
+            def _get_instrument_with_retry(self, inst_id: str) -> Instrument:
+                return Instrument(
+                    inst_id=inst_id,
+                    inst_type="SWAP",
+                    tick_size=Decimal("0.1"),
+                    lot_size=Decimal("1"),
+                    min_size=Decimal("1"),
+                    state="live",
+                )
+
+            def _run_ema55_slope_short_local_strategy(
+                self,
+                credentials: Credentials,
+                config: StrategyConfig,
+                signal_instrument: Instrument,
+                trade_instrument: Instrument,
+            ) -> None:
+                calls.append(
+                    f"slope-local:{config.strategy_id}:{signal_instrument.inst_id}:{trade_instrument.inst_id}"
+                )
+
+            def _notify_error(self, config: StrategyConfig, message: str) -> None:
+                calls.append(f"error:{message}")
+
+            def _logger(self, message: str) -> None:
+                calls.append(f"log:{message}")
+
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            trade_inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=55,
+            trend_ema_period=55,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            tp_sl_mode="local_trade",
+            entry_side_mode="follow_signal",
+            run_mode="trade",
+        )
+
+        EngineStrategyRouter(_StubEngine()).run(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            config,
+        )
+
+        self.assertIn(
+            "slope-local:ema55_slope_short:BTC-USDT-SWAP:BTC-USDT-SWAP",
+            calls,
+        )
         self.assertNotIn("error:", "".join(calls))
 
     def test_determine_order_size_uses_contract_value_for_linear_swap_risk_amount(self) -> None:
@@ -586,6 +656,10 @@ class StrategyEngineTest(TestCase):
         reason = fixed_entry_side_mode_support_reason(STRATEGY_DYNAMIC_ID, "trade", "exchange")
         self.assertIsNotNone(reason)
         self.assertIn("OKX 托管模式当前只支持跟随信号", str(reason))
+
+    def test_fixed_entry_side_mode_support_reason_uses_generic_follow_signal_lock(self) -> None:
+        reason = fixed_entry_side_mode_support_reason(STRATEGY_EMA5_EMA8_ID, "trade", "local_trade")
+        self.assertEqual(reason, "当前策略只支持跟随信号。")
 
     def test_validate_entry_side_mode_support_rejects_fixed_sell_in_okx_managed_mode(self) -> None:
         config = StrategyConfig(

@@ -111,6 +111,8 @@ class StrategyConfig:
     entry_reference_ema_type: MovingAverageType = "ema"
     dynamic_two_r_break_even: bool = True
     dynamic_fee_offset_enabled: bool = True
+    ema55_slope_exit_enabled: bool = True
+    atr_percentile_filter_max: Decimal = Decimal("0")
     trend_ema_slope_filter_enabled: bool = True
     trend_ema_slope_filter_lookback_bars: int = 5
     trend_ema_slope_filter_min_ratio: Decimal = Decimal("0")

@@ -45,6 +45,7 @@ class UiBacktestEntryMixin:
                 time_stop_break_even_enabled=self.time_stop_break_even_enabled.get(),
                 time_stop_break_even_bars=self.time_stop_break_even_bars.get(),
                 hold_close_exit_bars="0",
+                trend_ema_slope_filter_min_ratio="0",
                 signal_mode_label=self.signal_mode_label.get(),
                 trade_mode_label=self.trade_mode_label.get(),
                 position_mode_label=self.position_mode_label.get(),

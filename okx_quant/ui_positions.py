@@ -378,9 +378,28 @@ class UiPositionsMixin:
             self._positions_refresh_badges,
         )
         zoom_positions_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(header, textvariable=self._positions_zoom_summary_text).grid(row=0, column=1, sticky="w")
+        self._positions_zoom_api_switch_badge_label = Label(
+            header,
+            textvariable=self._positions_zoom_api_switch_badge_text,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            padx=10,
+            pady=2,
+            bd=0,
+            relief="flat",
+            bg="#e5e7eb",
+            fg="#111827",
+        )
+        self._positions_zoom_api_switch_badge_label.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self._positions_zoom_summary_label = Label(
+            header,
+            textvariable=self._positions_zoom_summary_text,
+            anchor="w",
+            justify="left",
+            fg="#111827",
+        )
+        self._positions_zoom_summary_label.grid(row=0, column=2, sticky="w")
         zoom_actions = ttk.Frame(header)
-        zoom_actions.grid(row=0, column=2, sticky="e")
+        zoom_actions.grid(row=0, column=3, sticky="e")
         zoom_api = ttk.Frame(zoom_actions)
         ttk.Label(zoom_api, text="API").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self._positions_zoom_credential_profile_combo = ttk.Combobox(
@@ -506,6 +525,7 @@ class UiPositionsMixin:
         self._positions_zoom_detail.configure(yscrollcommand=detail_scroll.set)
         self._set_readonly_text(self._positions_zoom_detail, self.position_detail_text.get())
         self._positions_zoom_summary_text.set("正在打开持仓大窗...")
+        self._refresh_api_switch_status_colors()
         self._set_readonly_text(
             self._positions_zoom_detail,
             "大窗已经创建，正在同步当前持仓视图。若你的持仓较多，会在一瞬间完成填充。",
@@ -1210,12 +1230,21 @@ class UiPositionsMixin:
             except Exception:
                 pass
         self._positions_zoom_sync_job = None
+        post_switch_job = getattr(self, "_positions_zoom_post_switch_refresh_job", None)
+        if post_switch_job is not None:
+            try:
+                self.root.after_cancel(post_switch_job)
+            except Exception:
+                pass
+        self._positions_zoom_post_switch_refresh_job = None
         if self._positions_zoom_column_window is not None and self._positions_zoom_column_window.winfo_exists():
             self._positions_zoom_column_window.destroy()
         self._positions_zoom_column_window = None
         if self._positions_zoom_window is not None and self._positions_zoom_window.winfo_exists():
             self._positions_zoom_window.destroy()
         self._positions_zoom_window = None
+        self._positions_zoom_api_switch_badge_label = None
+        self._positions_zoom_summary_label = None
         self._positions_zoom_credential_profile_combo = None
         self._positions_zoom_tree = None
         self._positions_zoom_detail = None
@@ -1873,23 +1902,336 @@ class UiPositionsMixin:
         self.refresh_positions()
         self.sync_positions_zoom_data()
 
+    def _positions_zoom_active_tab_label(self) -> str | None:
+        notebook = getattr(self, "_positions_zoom_notebook", None)
+        if notebook is None:
+            return None
+        try:
+            selected = notebook.select()
+            if not selected:
+                return None
+            return str(notebook.tab(selected, "text") or "").strip() or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _api_switch_refresh_step_label(step: str) -> str:
+        return {
+            "positions": "持仓",
+            "account_info": "账户信息",
+            "pending_orders": "当前委托",
+            "order_history": "历史委托",
+            "fills": "历史成交",
+            "position_history": "历史仓位",
+        }.get(step, step)
+
+    def _enqueue_api_switch_refresh_log_once(self, key: str, message: str) -> None:
+        seen = getattr(self, "_api_switch_refresh_log_seen", None)
+        if not isinstance(seen, set):
+            seen = set()
+            self._api_switch_refresh_log_seen = seen
+        if key in seen:
+            return
+        seen.add(key)
+        self._enqueue_log(message)
+
+    def _log_api_switch_refresh_event(self, step: str, status: str, detail: str = "", *, dedupe_key: str | None = None) -> None:
+        label = self._api_switch_refresh_step_label(step)
+        message = f"API切换刷新 | {label} | {status}"
+        if detail:
+            message = f"{message} | {detail}"
+        self._enqueue_api_switch_refresh_log_once(dedupe_key or f"{step}:{status}:{detail}", message)
+
+    @staticmethod
+    def _api_switch_refresh_step_for_tab(tab_label: str | None) -> str | None:
+        label = str(tab_label or "").strip()
+        return {
+            "当前委托": "pending_orders",
+            "历史委托": "order_history",
+            "历史成交": "fills",
+            "历史仓位": "position_history",
+        }.get(label)
+
+    def _refresh_position_switch_status_views(self) -> None:
+        if getattr(self, "position_tree", None) is None:
+            return
+        try:
+            self._update_position_summary(self._positions_zoom_visible_positions())
+        except Exception:
+            pass
+        try:
+            self._refresh_api_switch_status_badges()
+        except Exception:
+            pass
+        try:
+            self._refresh_api_switch_status_colors()
+        except Exception:
+            pass
+
+    def _api_switch_refresh_badge_text(self) -> str:
+        steps = getattr(self, "_api_switch_refresh_steps", None)
+        if not isinstance(steps, dict) or not steps:
+            return ""
+        values = tuple(str(state) for state in steps.values())
+        total = len(values)
+        completed = sum(1 for state in values if state in {"done", "failed"})
+        if any(state == "failed" for state in values):
+            return f"有失败 {completed}/{total}"
+        if total and all(state == "done" for state in values):
+            return f"已完成 {completed}/{total}"
+        if any(state == "running" for state in values):
+            return f"同步中 {completed}/{total}"
+        return f"排队中 {completed}/{total}"
+
+    def _refresh_api_switch_status_badges(self) -> None:
+        text = self._api_switch_refresh_badge_text()
+        for var_name in (
+            "_positions_api_switch_badge_text",
+            "_positions_zoom_api_switch_badge_text",
+            "_account_info_api_switch_badge_text",
+        ):
+            badge_var = getattr(self, var_name, None)
+            if badge_var is not None:
+                try:
+                    badge_var.set(text)
+                except Exception:
+                    pass
+
+    def _api_switch_refresh_status_color(self) -> str:
+        steps = getattr(self, "_api_switch_refresh_steps", None)
+        if not isinstance(steps, dict) or not steps:
+            return "#111827"
+        values = tuple(str(state) for state in steps.values())
+        if any(state == "failed" for state in values):
+            return "#c23b3b"
+        if values and all(state == "done" for state in values):
+            return "#13803d"
+        if any(state == "running" for state in values):
+            return "#b45309"
+        return "#111827"
+
+    def _refresh_api_switch_status_colors(self) -> None:
+        color = self._api_switch_refresh_status_color()
+        default_text_color = "#111827"
+        default_badge_bg = "#e5e7eb"
+        badge_text = self._api_switch_refresh_badge_text()
+        positions_label = getattr(self, "_positions_summary_label", None)
+        if positions_label is not None:
+            try:
+                positions_label.configure(fg=default_text_color)
+            except Exception:
+                pass
+        zoom_label = getattr(self, "_positions_zoom_summary_label", None)
+        if zoom_label is not None:
+            try:
+                zoom_label.configure(fg=default_text_color)
+            except Exception:
+                pass
+        account_label = getattr(self, "_account_info_summary_label", None)
+        if account_label is not None:
+            try:
+                account_label.configure(fg=default_text_color)
+            except Exception:
+                pass
+        for label_name in (
+            "_positions_api_switch_badge_label",
+            "_positions_zoom_api_switch_badge_label",
+            "_account_info_api_switch_badge_label",
+        ):
+            badge_label = getattr(self, label_name, None)
+            if badge_label is not None:
+                try:
+                    badge_label.configure(
+                        fg=("white" if badge_text else default_text_color),
+                        bg=(color if badge_text else default_badge_bg),
+                    )
+                except Exception:
+                    pass
+        try:
+            self._sync_positions_zoom_window()
+        except Exception:
+            pass
+
+    def _compose_api_switch_refresh_status_text(self) -> str:
+        steps = getattr(self, "_api_switch_refresh_steps", None)
+        if not isinstance(steps, dict) or not steps:
+            return ""
+        running = [self._api_switch_refresh_step_label(step) for step, state in steps.items() if state == "running"]
+        pending = [self._api_switch_refresh_step_label(step) for step, state in steps.items() if state == "pending"]
+        failed = [self._api_switch_refresh_step_label(step) for step, state in steps.items() if state == "failed"]
+        completed = sum(1 for state in steps.values() if state in {"done", "failed"})
+        total = len(steps)
+        if completed >= total and not failed:
+            return f"切换同步：已完成 {completed}/{total}"
+        parts: list[str] = []
+        if running:
+            parts.append("进行中 " + "、".join(running))
+        if pending:
+            parts.append("排队 " + "、".join(pending))
+        if failed:
+            parts.append("失败 " + "、".join(failed))
+        progress = f"完成 {completed}/{total}"
+        if parts:
+            return "切换同步：" + " | ".join([progress, *parts])
+        return f"切换同步：{progress}"
+
+    def _begin_api_switch_refresh_cycle(self, active_label: str | None) -> None:
+        clear_job = getattr(self, "_api_switch_refresh_clear_job", None)
+        if clear_job is not None:
+            try:
+                self.root.after_cancel(clear_job)
+            except Exception:
+                pass
+        self._api_switch_refresh_clear_job = None
+        self._api_switch_refresh_log_seen = set()
+        steps: dict[str, str] = {"positions": "pending"}
+        account_win = getattr(self, "_account_info_window", None)
+        if account_win is not None:
+            try:
+                if account_win.winfo_exists():
+                    steps["account_info"] = "pending"
+            except Exception:
+                pass
+        zoom_win = getattr(self, "_positions_zoom_window", None)
+        if zoom_win is not None:
+            try:
+                if zoom_win.winfo_exists():
+                    active_step = self._api_switch_refresh_step_for_tab(active_label)
+                    if active_step:
+                        steps[active_step] = "pending"
+                    for step in ("pending_orders", "order_history", "fills", "position_history"):
+                        steps.setdefault(step, "pending")
+            except Exception:
+                pass
+        self._api_switch_refresh_steps = steps
+        active_text = str(active_label or "").strip() or "当前页"
+        self._enqueue_api_switch_refresh_log_once(
+            "switch:start",
+            f"API切换刷新 | 已启动 | 优先=持仓+{active_text} | 其余页签稍后同步",
+        )
+        self._refresh_position_switch_status_views()
+
+    def _schedule_clear_api_switch_refresh_cycle(self, delay_ms: int = 2500) -> None:
+        clear_job = getattr(self, "_api_switch_refresh_clear_job", None)
+        if clear_job is not None:
+            try:
+                self.root.after_cancel(clear_job)
+            except Exception:
+                pass
+        self._api_switch_refresh_clear_job = self.root.after(delay_ms, self._clear_api_switch_refresh_cycle)
+
+    def _clear_api_switch_refresh_cycle(self) -> None:
+        if getattr(self, "_api_switch_refresh_steps", None):
+            badge = self._api_switch_refresh_badge_text()
+            if badge:
+                self._enqueue_api_switch_refresh_log_once("switch:done", f"API切换刷新 | {badge}")
+        self._api_switch_refresh_clear_job = None
+        self._api_switch_refresh_steps = {}
+        self._refresh_position_switch_status_views()
+
+    def _mark_api_switch_refresh_step(self, step: str, state: str) -> None:
+        steps = getattr(self, "_api_switch_refresh_steps", None)
+        if not isinstance(steps, dict) or step not in steps:
+            return
+        steps[step] = state
+        self._refresh_position_switch_status_views()
+        if steps and all(item in {"done", "failed"} for item in steps.values()):
+            self._schedule_clear_api_switch_refresh_cycle()
+
+    def _refresh_positions_zoom_tab_by_label(self, tab_label: str | None) -> None:
+        label = str(tab_label or "").strip()
+        if not label:
+            return
+        if label == "当前委托":
+            self.refresh_pending_orders()
+            return
+        if label == "历史委托":
+            credentials = self._current_credentials_or_none()
+            if credentials is None:
+                return
+            environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+            profile_name = credentials.profile_name or self._current_credential_profile()
+            self._start_order_history_refresh(credentials, environment, profile_name)
+            return
+        if label == "历史成交":
+            self.refresh_fill_history(sync_order_history=False)
+            return
+        if label == "历史仓位":
+            credentials = self._current_credentials_or_none()
+            if credentials is None:
+                return
+            environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+            profile_name = credentials.profile_name or self._current_credential_profile()
+            self._start_position_history_refresh(credentials, environment, profile_name)
+            return
+        if label == "动态止盈接管":
+            self._refresh_positions_zoom_takeover_panel()
+
+    def _refresh_positions_zoom_remaining_tabs_after_switch(self, active_label: str | None) -> None:
+        active = str(active_label or "").strip()
+        for label in ("当前委托", "历史委托", "历史成交", "历史仓位"):
+            if label == active:
+                continue
+            self._refresh_positions_zoom_tab_by_label(label)
+
+    def _schedule_positions_zoom_remaining_tabs_after_switch(self, active_label: str | None, delay_ms: int = 1200) -> None:
+        previous_job = getattr(self, "_positions_zoom_post_switch_refresh_job", None)
+        if previous_job is not None:
+            try:
+                self.root.after_cancel(previous_job)
+            except Exception:
+                pass
+        self._positions_zoom_post_switch_refresh_job = self.root.after(
+            delay_ms,
+            lambda: (
+                setattr(self, "_positions_zoom_post_switch_refresh_job", None),
+                self._refresh_positions_zoom_remaining_tabs_after_switch(active_label),
+            ),
+        )
+
+    def _set_api_switch_refresh_hint(self, active_label: str | None) -> None:
+        active = str(active_label or "").strip()
+        active_text = active or "当前页"
+        self.positions_summary_text.set(
+            f"已切换 API，正在优先刷新持仓与{active_text}；其余页签稍后自动同步。"
+        )
+        zoom_win = getattr(self, "_positions_zoom_window", None)
+        if zoom_win is not None:
+            try:
+                if zoom_win.winfo_exists():
+                    self._positions_zoom_summary_text.set(
+                        f"已切换 API，正在优先刷新持仓与{active_text}；其余页签稍后自动同步。"
+                    )
+            except Exception:
+                pass
+        account_win = getattr(self, "_account_info_window", None)
+        if account_win is not None:
+            try:
+                if account_win.winfo_exists():
+                    self.account_info_summary_text.set("已切换 API，正在优先刷新账户信息；其他数据稍后同步。")
+            except Exception:
+                pass
+
     def _refresh_account_views_after_credential_profile_switch(self) -> None:
         """切换 API 配置后刷新主界面与持仓大窗共用的委托/历史缓存与远端数据。"""
         if getattr(self, "position_tree", None) is None:
             return
+        active_label = self._positions_zoom_active_tab_label()
+        self._begin_api_switch_refresh_cycle(active_label)
+        self._set_api_switch_refresh_hint(active_label)
         try:
             self._load_local_history_cache()
         except Exception:
             pass
         try:
-            self._refresh_positions_zoom_all()
+            self.refresh_positions()
         except Exception:
             pass
         account_win = getattr(self, "_account_info_window", None)
         if account_win is not None:
             try:
                 if account_win.winfo_exists():
-                    self.refresh_account_dashboard()
+                    self.refresh_account_info()
             except Exception:
                 pass
         zoom_win = getattr(self, "_positions_zoom_window", None)
@@ -1897,6 +2239,8 @@ class UiPositionsMixin:
             try:
                 if zoom_win.winfo_exists():
                     self._schedule_positions_zoom_sync(15)
+                    self._refresh_positions_zoom_tab_by_label(active_label)
+                    self._schedule_positions_zoom_remaining_tabs_after_switch(active_label)
             except Exception:
                 pass
 
@@ -1910,34 +2254,9 @@ class UiPositionsMixin:
         self._latest_position_history = [
             item for record in position_records if (item := _position_history_item_from_cache(record)) is not None
         ]
-        order_fee_ccys: set[str] = {
-            o.fee_currency.strip().upper()
-            for o in self._latest_order_history
-            if o.fee is not None and o.fee_currency and str(o.fee_currency).strip()
-        }
-        self._order_history_usdt_prices = (
-            _build_usdt_price_snapshot(self.client, order_fee_ccys) if order_fee_ccys else {}
-        )
-        fill_ccys_local: set[str] = set()
-        for fill in self._latest_fill_history:
-            if fill.fill_fee is not None and fill.fee_currency and str(fill.fee_currency).strip():
-                fill_ccys_local.add(fill.fee_currency.strip().upper())
-            if fill.pnl is not None:
-                fill_ccys_local.add(_infer_fill_history_pnl_currency(fill))
-        self._fill_history_usdt_prices = (
-            _build_usdt_price_snapshot(self.client, fill_ccys_local) if fill_ccys_local else {}
-        )
-        pos_ccys_local: set[str] = set()
-        for it in self._latest_position_history:
-            if it.realized_pnl is not None:
-                pos_ccys_local.add(_infer_position_history_pnl_currency(it))
-            if it.pnl is not None:
-                pos_ccys_local.add(_infer_position_history_pnl_currency(it))
-            if it.fee is not None and it.fee_currency and str(it.fee_currency).strip():
-                pos_ccys_local.add(it.fee_currency.strip().upper())
-        self._position_history_usdt_prices = (
-            _build_usdt_price_snapshot(self.client, pos_ccys_local) if pos_ccys_local else {}
-        )
+        self._order_history_usdt_prices = {}
+        self._fill_history_usdt_prices = {}
+        self._position_history_usdt_prices = {}
         self._fills_history_from_local_only = True
         self._fills_history_last_refresh_at = None
         self._positions_zoom_order_history_base_summary = f"历史委托：{len(self._latest_order_history)} 条 | 本地缓存"
@@ -2437,6 +2756,7 @@ class UiPositionsMixin:
             self._pending_orders_refresh_queue = (credentials, environment)
             return
         self._pending_orders_refreshing = True
+        self._mark_api_switch_refresh_step("pending_orders", "running")
         self._positions_zoom_pending_orders_summary_text.set("正在刷新当前委托...")
         threading.Thread(
             target=self._refresh_pending_orders_worker,
@@ -2458,6 +2778,7 @@ class UiPositionsMixin:
             return
         self._order_history_refreshing = True
         self._order_history_refresh_request = None
+        self._mark_api_switch_refresh_step("order_history", "running")
         self._positions_zoom_order_history_summary_text.set("正在同步历史委托...")
         threading.Thread(
             target=self._refresh_order_history_worker,
@@ -2524,6 +2845,7 @@ class UiPositionsMixin:
         effective_environment: str | None = None,
     ) -> None:
         self._pending_orders_refreshing = False
+        self._mark_api_switch_refresh_step("pending_orders", "done")
         self._latest_pending_orders = list(items)
         self._pending_order_instruments = dict(instruments)
         self._pending_orders_last_refresh_at = datetime.now()
@@ -2535,6 +2857,7 @@ class UiPositionsMixin:
         summary = f"当前委托：{len(items)} 条 | 最近刷新：{timestamp}"
         if note:
             summary = f"{summary} | {note}"
+            self._log_api_switch_refresh_event("pending_orders", "环境切换", note, dedupe_key=f"pending_orders:note:{note}")
         self._positions_zoom_pending_orders_base_summary = summary
         self._positions_zoom_pending_orders_summary_text.set(summary)
         self._render_pending_orders_view()
@@ -2549,6 +2872,7 @@ class UiPositionsMixin:
         profile_name: str | None = None,
     ) -> None:
         self._order_history_refreshing = False
+        self._mark_api_switch_refresh_step("order_history", "done")
         try:
             active_profile = (profile_name or self._current_credential_profile()).strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
             active_environment = effective_environment or self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
@@ -2581,6 +2905,7 @@ class UiPositionsMixin:
                 summary = f"{summary} | 本次 API 返回 0 条（请核对模拟/实盘环境与 API 权限）"
             if note:
                 summary = f"{summary} | {note}"
+                self._log_api_switch_refresh_event("order_history", "环境切换", note, dedupe_key=f"order_history:note:{note}")
             self._positions_zoom_order_history_base_summary = summary
             self._positions_zoom_order_history_summary_text.set(summary)
             self._render_order_history_view()
@@ -2595,6 +2920,7 @@ class UiPositionsMixin:
 
     def _apply_pending_orders_error(self, message: str) -> None:
         self._pending_orders_refreshing = False
+        self._mark_api_switch_refresh_step("pending_orders", "failed")
         friendly_message = _format_network_error_message(message)
         _mark_refresh_health_failure(self._pending_orders_refresh_health, friendly_message)
         self._refresh_all_refresh_badges()
@@ -2606,12 +2932,13 @@ class UiPositionsMixin:
             summary = f"当前委托读取失败：{friendly_message}{suffix}"
         self._positions_zoom_pending_orders_base_summary = summary
         self._positions_zoom_pending_orders_summary_text.set(self._positions_zoom_pending_orders_base_summary)
-        self._enqueue_log(summary)
+        self._log_api_switch_refresh_event("pending_orders", "失败", friendly_message, dedupe_key=f"pending_orders:error:{friendly_message}")
         self._drain_pending_orders_refresh_queue()
 
     def _apply_order_history_error(self, message: str) -> None:
         self._order_history_refreshing = False
         self._order_history_refresh_request = None
+        self._mark_api_switch_refresh_step("order_history", "failed")
         friendly_message = _format_network_error_message(message)
         _mark_refresh_health_failure(self._order_history_refresh_health, friendly_message)
         self._refresh_all_refresh_badges()
@@ -2623,7 +2950,7 @@ class UiPositionsMixin:
             summary = f"历史委托读取失败：{friendly_message}{suffix}"
         self._positions_zoom_order_history_base_summary = summary
         self._positions_zoom_order_history_summary_text.set(self._positions_zoom_order_history_base_summary)
-        self._enqueue_log(summary)
+        self._log_api_switch_refresh_event("order_history", "失败", friendly_message, dedupe_key=f"order_history:error:{friendly_message}")
 
     def _on_pending_order_filter_changed(self, *_: object) -> None:
         self._render_pending_orders_view()
@@ -2931,6 +3258,7 @@ class UiPositionsMixin:
             return
         self._fills_history_refreshing = True
         self._fills_history_refresh_request = None
+        self._mark_api_switch_refresh_step("fills", "running")
         self._positions_zoom_fills_summary_text.set("正在同步历史成交...")
         threading.Thread(
             target=self._refresh_fill_history_worker,
@@ -2942,6 +3270,7 @@ class UiPositionsMixin:
         if self._position_history_refreshing:
             return
         self._position_history_refreshing = True
+        self._mark_api_switch_refresh_step("position_history", "running")
         self._positions_zoom_position_history_summary_text.set("正在同步历史仓位...")
         threading.Thread(
             target=self._refresh_position_history_worker,
@@ -3021,6 +3350,7 @@ class UiPositionsMixin:
         profile_name: str | None = None,
     ) -> None:
         self._fills_history_refreshing = False
+        self._mark_api_switch_refresh_step("fills", "done")
         self._fills_history_from_local_only = False
         try:
             active_profile = (profile_name or self._current_credential_profile()).strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
@@ -3054,6 +3384,7 @@ class UiPositionsMixin:
                 fill_summary = f"{fill_summary} | 本次 API 返回 0 条（请核对模拟/实盘环境与 API 权限）"
             if note:
                 fill_summary = f"{fill_summary} | {note}"
+                self._log_api_switch_refresh_event("fills", "环境切换", note, dedupe_key=f"fills:note:{note}")
             self._positions_zoom_fills_summary_text.set(fill_summary)
             self._render_positions_zoom_fills_view()
         except Exception as exc:
@@ -3075,6 +3406,7 @@ class UiPositionsMixin:
         credential_profile_name: str | None = None,
     ) -> None:
         self._position_history_refreshing = False
+        self._mark_api_switch_refresh_step("position_history", "done")
         self._position_history_usdt_prices = dict(usdt_prices)
         # Merge freshly fetched specs with local swap/option cache so legacy rows
         # can still be converted to coin amounts instead of falling back to contracts.
@@ -3131,12 +3463,21 @@ class UiPositionsMixin:
     def _apply_fill_history_error(self, message: str) -> None:
         self._fills_history_refreshing = False
         self._fills_history_refresh_request = None
+        self._mark_api_switch_refresh_step("fills", "failed")
         self._positions_zoom_fills_summary_text.set(f"历史成交读取失败：{message}")
+        self._log_api_switch_refresh_event("fills", "失败", _format_network_error_message(message), dedupe_key=f"fills:error:{message}")
 
     def _apply_position_history_error(self, message: str) -> None:
         self._position_history_refreshing = False
+        self._mark_api_switch_refresh_step("position_history", "failed")
         self._positions_zoom_position_history_base_summary = f"历史仓位读取失败：{message}"
         self._positions_zoom_position_history_summary_text.set(self._positions_zoom_position_history_base_summary)
+        self._log_api_switch_refresh_event(
+            "position_history",
+            "失败",
+            _format_network_error_message(message),
+            dedupe_key=f"position_history:error:{message}",
+        )
 
     def _render_positions_zoom_fills_view(self) -> None:
         if self._positions_zoom_fills_tree is None:
@@ -3396,6 +3737,7 @@ class UiPositionsMixin:
             return
 
         self._positions_refreshing = True
+        self._mark_api_switch_refresh_step("positions", "running")
         self.positions_summary_text.set("正在刷新账户持仓...")
         environment = ENV_OPTIONS[self.environment_label.get()]
         profile_name = credentials.profile_name or self._current_credential_profile()
@@ -3471,6 +3813,7 @@ class UiPositionsMixin:
         position_tickers: dict[str, OkxTicker] | None = None,
     ) -> None:
         self._positions_refreshing = False
+        self._mark_api_switch_refresh_step("positions", "done")
         self._latest_positions = list(positions)
         self._positions_context_note = summary
         self._positions_ws_cache_note = ws_cache_note
@@ -3915,7 +4258,7 @@ class UiPositionsMixin:
                 _format_option_trade_side_display(position),
                 _format_position_unrealized_pnl(position),
                 _format_optional_usdt(_position_unrealized_pnl_usdt(position, self._upl_usdt_prices)),
-                _format_optional_decimal_fixed(position.realized_pnl, places=5, with_sign=True),
+                _format_position_realized_pnl(position),
                 _format_optional_usdt(_position_realized_pnl_usdt(position, self._upl_usdt_prices)),
                 _format_position_market_value(position, self._position_instruments, self._upl_usdt_prices),
                 _format_optional_decimal(position.liquidation_price),
@@ -4434,12 +4777,13 @@ class UiPositionsMixin:
             or self._positions_last_refresh_at is not None
         )
         self._positions_refreshing = False
+        self._mark_api_switch_refresh_step("positions", "failed")
         if has_previous_positions:
             summary = f"持仓刷新失败，继续显示上一份缓存：{friendly_message}{suffix}"
             self.positions_summary_text.set(summary)
             self._sync_positions_zoom_window()
             self._refresh_positions_zoom_detail()
-            self._enqueue_log(summary)
+            self._log_api_switch_refresh_event("positions", "失败", f"继续显示缓存 | {friendly_message}", dedupe_key=f"positions:error:{friendly_message}")
             return
         self._latest_positions = []
         self._positions_context_note = None
@@ -4467,7 +4811,7 @@ class UiPositionsMixin:
         self._refresh_positions_zoom_detail()
         summary = f"持仓读取失败：{friendly_message}{suffix}"
         self.positions_summary_text.set(summary)
-        self._enqueue_log(summary)
+        self._log_api_switch_refresh_event("positions", "失败", friendly_message, dedupe_key=f"positions:error:{friendly_message}")
 
     @staticmethod
     def _position_takeover_entry_ts_ms(position: OkxPosition) -> int:

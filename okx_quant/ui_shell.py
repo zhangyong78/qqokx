@@ -203,6 +203,7 @@ from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategies.ema_dynamic_multi_timeframe import EmaDynamicMultiTimeframeStrategy
+from okx_quant.strategies.ema55_slope_short import evaluate_ema55_slope_short_signal
 from okx_quant.upgrade_launch import (
     UPGRADE_CUSTOM_EXECUTABLE_NAME,
     UPGRADE_LAUNCH_MODE_AUTO,
@@ -215,16 +216,8 @@ from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_DEFINITIONS,
     STRATEGY_DYNAMIC_ID,
-    STRATEGY_DYNAMIC_LONG_ID,
-    STRATEGY_DYNAMIC_SHORT_ID,
-    STRATEGY_EMA5_EMA8_ID,
-    STRATEGY_EMA_BREAKOUT_LONG_ID,
-    STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     StrategyDefinition,
     get_strategy_definition,
-    is_dynamic_mtf_strategy_id,
-    is_dynamic_strategy_id,
-    is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
     supports_trader_desk,
     supports_signal_only,
@@ -233,8 +226,25 @@ from okx_quant.strategy_parameters import (
     iter_strategy_parameter_keys,
     strategy_fixed_value,
     strategy_is_parameter_editable,
-    strategy_parameter_default_value,
     strategy_uses_parameter,
+)
+from okx_quant.strategy_ui_schema import (
+    build_strategy_widget_visibility,
+    strategy_forces_follow_signal,
+    strategy_forces_local_trade,
+    strategy_parameter_default_for_scope,
+    strategy_supports_dynamic_take_profit,
+    strategy_ui_extra_defaults,
+    strategy_ui_fixed_extra_value,
+    strategy_uses_startup_chase_window,
+)
+from okx_quant.strategy_runtime_registry import (
+    get_strategy_runtime_profile,
+    strategy_entry_reference_caption,
+    strategy_entry_reference_period_caption,
+    strategy_preferred_direction,
+    strategy_uses_mtf_filter,
+    strategy_uses_signal_extrema,
 )
 from okx_quant.window_layout import (
     apply_adaptive_window_geometry,
@@ -2882,6 +2892,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._position_history_fetch_limit = 300
         self._position_history_load_more_clicks = 0
         self._positions_zoom_summary_text = StringVar(value="当前尚未获取持仓。")
+        self._positions_zoom_api_switch_badge_text = StringVar(value="")
         self._positions_zoom_option_search_hint_text = StringVar(
             value="\u9009\u4e2d\u671f\u6743\u540e\uff0c\u53ef\u4e00\u952e\u5e26\u5165\u5408\u7ea6\u6216\u5230\u671f\u524d\u7f00\u3002"
         )
@@ -2953,6 +2964,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.mtf_filter_fast_ema_period = StringVar(value="21")
         self.mtf_filter_slow_ema_period = StringVar(value="55")
         self.mtf_reversal_mode_label = StringVar(value=MTF_REVERSAL_MODE_VALUE_TO_LABEL["block_new_entries"])
+        self.trend_ema_slope_filter_min_ratio = StringVar(value="0")
         self.atr_period = StringVar(value="10")
         self.stop_atr = StringVar(value="2")
         self.take_atr = StringVar(value="4")
@@ -2998,6 +3010,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.mtf_filter_bar.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.mtf_filter_fast_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.mtf_filter_slow_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.trend_ema_slope_filter_min_ratio.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.atr_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.stop_atr.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.risk_amount.trace_add("write", self._update_fixed_order_size_hint)
@@ -3115,6 +3128,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.strategy_book_direction_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_DIRECTION)
         self.strategy_book_status_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_STATUS)
         self.positions_summary_text = StringVar(value="当前尚未获取持仓。")
+        self._positions_api_switch_badge_text = StringVar(value="")
         self._positions_refresh_badge_text = StringVar(value="未读")
         self.position_total_text = StringVar(value="-")
         self.position_upl_text = StringVar(value="-")
@@ -3127,6 +3141,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.position_long_put_text = StringVar(value="-")
         self.position_detail_text = StringVar(value=self._default_position_detail_text())
         self.account_info_summary_text = StringVar(value="尚未读取账户信息。")
+        self._account_info_api_switch_badge_text = StringVar(value="")
         self._account_info_refresh_badge_text = StringVar(value="未读")
         self._pending_orders_refresh_badge_text = StringVar(value="未读")
         self._order_history_refresh_badge_text = StringVar(value="未读")
@@ -3268,6 +3283,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "mtf_filter_fast_ema_period": self.mtf_filter_fast_ema_period,
             "mtf_filter_slow_ema_period": self.mtf_filter_slow_ema_period,
             "mtf_reversal_mode": self.mtf_reversal_mode_label,
+            "trend_ema_slope_filter_min_ratio": self.trend_ema_slope_filter_min_ratio,
             "take_profit_mode": self.take_profit_mode_label,
             "max_entries_per_trend": self.max_entries_per_trend,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
@@ -3307,7 +3323,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             if key in draft:
                 variable.set(draft[key])
                 continue
-            default_value = strategy_parameter_default_value(key)
+            default_value = strategy_parameter_default_for_scope(strategy_id, key, self._strategy_parameter_scope)
             if default_value is None:
                 continue
             if key == "signal_mode":
@@ -3856,6 +3872,17 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._entry_reference_ema_entry.grid(row=0, column=1, sticky="ew")
 
         row += 1
+        self._slope_threshold_label = ttk.Label(launch_form, text="开空斜率阈值")
+        self._slope_threshold_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._slope_threshold_entry = ttk.Entry(launch_form, textvariable=self.trend_ema_slope_filter_min_ratio)
+        self._slope_threshold_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._slope_threshold_hint_label = ttk.Label(
+            launch_form,
+            text="按单根 EMA55 斜率 / 当前 EMA55 计算；填负数，越小越严格，例如 -0.0005。",
+        )
+        self._slope_threshold_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=_lp)
+
+        row += 1
         self._mtf_filter_bar_label = ttk.Label(launch_form, text="高周期K线")
         self._mtf_filter_bar_label.grid(row=row, column=0, sticky="w", pady=_lp)
         self._mtf_filter_bar_combo = ttk.Combobox(
@@ -4227,13 +4254,29 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         position_keyword_entry.pack(side="left", padx=(4, 0))
         position_keyword_entry.bind("<KeyRelease>", self._on_position_filter_changed)
         filter_compact.grid(row=0, column=1, sticky="w")
-        ttk.Label(
+        self._positions_api_switch_badge_label = Label(
+            header_row,
+            textvariable=self._positions_api_switch_badge_text,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            padx=10,
+            pady=2,
+            bd=0,
+            relief="flat",
+            bg="#e5e7eb",
+            fg="#111827",
+        )
+        self._positions_api_switch_badge_label.grid(row=0, column=2, sticky="w", padx=(6, 0))
+        self._positions_summary_label = Label(
             header_row,
             textvariable=self.positions_summary_text,
             font=("Microsoft YaHei UI", 9),
-        ).grid(row=0, column=2, sticky="ew", padx=(6, 6))
+            anchor="w",
+            justify="left",
+            fg="#111827",
+        )
+        self._positions_summary_label.grid(row=0, column=3, sticky="ew", padx=(6, 6))
         action_row = ttk.Frame(header_row)
-        action_row.grid(row=0, column=3, sticky="e")
+        action_row.grid(row=0, column=4, sticky="e")
         ttk.Button(action_row, text="刷新", command=self.refresh_positions).grid(row=0, column=0, padx=(0, 4))
         ttk.Button(action_row, text="持仓大窗", command=self.open_positions_zoom_window).grid(row=0, column=1, padx=(0, 4))
         ttk.Button(action_row, text="复制合约", command=self.copy_selected_position_symbol).grid(row=0, column=2)
@@ -4650,9 +4693,29 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self._account_info_refresh_badges,
         )
         account_badge.grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(header, textvariable=self.account_info_summary_text, justify="left").grid(row=0, column=1, sticky="w")
+        self._account_info_api_switch_badge_label = Label(
+            header,
+            textvariable=self._account_info_api_switch_badge_text,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            padx=10,
+            pady=2,
+            bd=0,
+            relief="flat",
+            bg="#e5e7eb",
+            fg="#111827",
+        )
+        self._account_info_api_switch_badge_label.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self._account_info_summary_label = Label(
+            header,
+            textvariable=self.account_info_summary_text,
+            justify="left",
+            anchor="w",
+            fg="#111827",
+        )
+        self._account_info_summary_label.grid(row=0, column=2, sticky="w")
+        self._refresh_api_switch_status_colors()
         action_row = ttk.Frame(header)
-        action_row.grid(row=0, column=2, sticky="e")
+        action_row.grid(row=0, column=3, sticky="e")
         ttk.Button(action_row, text="刷新全部", command=self.refresh_account_dashboard).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(action_row, text="关闭", command=self._close_account_info_window).grid(row=0, column=1)
 
@@ -4772,6 +4835,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         if self._account_info_window is not None and self._account_info_window.winfo_exists():
             self._account_info_window.destroy()
         self._account_info_window = None
+        self._account_info_api_switch_badge_label = None
+        self._account_info_summary_label = None
         self._account_info_tree = None
         self._account_info_detail_panel = None
         self._account_info_config_panel = None
@@ -4794,6 +4859,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self._refresh_all_refresh_badges()
             return
         self._account_info_refreshing = True
+        self._mark_api_switch_refresh_step("account_info", "running")
         self.account_info_summary_text.set("正在刷新账户信息...")
         environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
         threading.Thread(
@@ -4834,6 +4900,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         effective_environment: str,
     ) -> None:
         self._account_info_refreshing = False
+        self._mark_api_switch_refresh_step("account_info", "done")
         self._latest_account_overview = overview
         self._latest_account_config = config
         _mark_refresh_health_success(self._account_info_refresh_health)
@@ -4895,6 +4962,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
     def _apply_account_info_error(self, message: str) -> None:
         self._account_info_refreshing = False
+        self._mark_api_switch_refresh_step("account_info", "failed")
         friendly_message = _format_network_error_message(message)
         _mark_refresh_health_failure(self._account_info_refresh_health, friendly_message)
         self._refresh_all_refresh_badges()
@@ -6870,7 +6938,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._sync_credential_profile_combo()
         self._update_settings_summary()
         if log_change:
-            self._enqueue_log(f"已切换 API 配置：{target}")
+            self._enqueue_log(f"API切换 | 配置={target}")
         UiPositionsMixin._refresh_account_views_after_credential_profile_switch(self)
 
     def _apply_locked_credentials_profile(self, profile_name: str) -> None:
@@ -7420,7 +7488,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             profiles[next_profile] = _blank_credential_profile_snapshot(
                 environment=self._environment_value_from_label(self.environment_label.get())
             )
-            if is_dynamic_mtf_strategy_id(config.strategy_id):
+            if strategy_uses_mtf_filter(config.strategy_id):
                 lines.append(
                     f"高周期过滤：{config.resolved_mtf_filter_bar()} EMA{config.mtf_filter_fast_ema_period}/"
                     f"EMA{config.mtf_filter_slow_ema_period}（只过滤新开仓）"
@@ -7640,6 +7708,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 "should_estimate": False,
             }
         try:
+            trend_ema_slope_filter_min_ratio = Decimal(str(self.trend_ema_slope_filter_min_ratio.get()).strip() or "0")
+            if trend_ema_slope_filter_min_ratio > 0:
+                raise ValueError("开空斜率阈值必须小于或等于 0")
             config = StrategyConfig(
                 inst_id=signal_symbol or trade_symbol,
                 bar=self.bar.get().strip(),
@@ -7664,6 +7735,15 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 local_tp_sl_inst_id=_normalize_symbol_input(self.local_tp_sl_symbol.get()) or None,
                 run_mode=run_mode,
                 take_profit_mode=TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "dynamic"),
+                dynamic_two_r_break_even=bool(self.dynamic_two_r_break_even.get()),
+                dynamic_fee_offset_enabled=bool(self.dynamic_fee_offset_enabled.get()),
+                trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
+                time_stop_break_even_enabled=bool(self.time_stop_break_even_enabled.get()),
+                time_stop_break_even_bars=(
+                    self._parse_nonnegative_int(self.time_stop_break_even_bars.get(), "鏃堕棿淇濇湰K绾挎暟")
+                    if self.time_stop_break_even_enabled.get()
+                    else 0
+                ),
                 max_entries_per_trend=max(self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数"), 0),
                 entry_reference_ema_type=self.entry_reference_ema_type.get().strip().lower(),
                 entry_reference_ema_period=max(
@@ -11948,17 +12028,26 @@ def _estimate_launcher_minimum_risk_amount(
     if trigger_inst_id and trigger_inst_id != trade_instrument.inst_id.strip().upper():
         return None, "当前止盈止损参考的是其他标的，最低风险金暂不做联动估算。"
 
-    if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+    profile = get_strategy_runtime_profile(config.strategy_id)
+    if profile.family == "ema5_ema8":
         lookback = recommended_indicator_lookback(config.ema_period, config.trend_ema_period)
         strategy = EmaCrossEmaStopStrategy()
-    elif is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id):
+    elif profile.family == "ema55_slope_short":
+        lookback = recommended_indicator_lookback(
+            config.ema_period,
+            config.trend_ema_period,
+            config.atr_period,
+            DEFAULT_DEBUG_ATR_PERIOD,
+        ) + 1
+        strategy = None
+    elif profile.uses_dynamic_orders:
         lookback = recommended_indicator_lookback(
             config.ema_period,
             config.trend_ema_period,
             config.atr_period,
             config.resolved_entry_reference_ema_period(),
         )
-        strategy = EmaDynamicMultiTimeframeStrategy() if is_dynamic_mtf_strategy_id(config.strategy_id) else EmaDynamicOrderStrategy()
+        strategy = EmaDynamicMultiTimeframeStrategy() if profile.uses_mtf_filter else EmaDynamicOrderStrategy()
     else:
         lookback = recommended_indicator_lookback(
             config.ema_period + 2,
@@ -11970,7 +12059,7 @@ def _estimate_launcher_minimum_risk_amount(
 
     candles = client.get_candles(signal_inst_id, config.bar, limit=lookback)
     confirmed = [candle for candle in candles if candle.confirmed]
-    if is_dynamic_mtf_strategy_id(config.strategy_id):
+    if profile.uses_mtf_filter:
         filter_lookback = recommended_indicator_lookback(
             config.mtf_filter_fast_ema_period,
             config.mtf_filter_slow_ema_period,
@@ -11986,12 +12075,18 @@ def _estimate_launcher_minimum_risk_amount(
             config,
             price_increment=trade_instrument.tick_size,
         )
+    elif profile.family == "ema55_slope_short":
+        decision = evaluate_ema55_slope_short_signal(
+            confirmed,
+            config,
+            price_increment=trade_instrument.tick_size,
+        )
     else:
         decision = strategy.evaluate(confirmed, config, price_increment=trade_instrument.tick_size)
     if decision.signal is None or decision.entry_reference is None or decision.candle_ts is None:
         return None, "当前还没有有效信号，等出现可挂单的一波后再给出估算。"
 
-    if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+    if profile.family == "ema5_ema8":
         _, stop_line = strategy.latest_stop_line(confirmed, config)
         stop_loss = snap_to_increment(stop_line, trade_instrument.tick_size, "nearest")
         minimum_risk_amount = abs(decision.entry_reference - stop_loss) * contract_value * trade_instrument.min_size
@@ -12010,7 +12105,7 @@ def _estimate_launcher_minimum_risk_amount(
         atr_value=decision.atr_value,
         candle_ts=decision.candle_ts,
         trigger_inst_id=trade_instrument.inst_id,
-                use_signal_extrema=is_ema_atr_breakout_strategy(config.strategy_id),
+                use_signal_extrema=strategy_uses_signal_extrema(config.strategy_id),
         signal_candle_high=decision.signal_candle_high,
         signal_candle_low=decision.signal_candle_low,
     )
@@ -12122,6 +12217,7 @@ def _build_trend_parameter_hint_text(
     mtf_filter_fast_ema_period_raw: str = "",
     mtf_filter_slow_ema_period_raw: str = "",
 ) -> str:
+    profile = get_strategy_runtime_profile(strategy_id)
     ema_type = (ema_type_raw or "EMA").strip().upper()
     ema_period = ema_period_raw.strip() or "?"
     trend_ema_type = (trend_ema_type_raw or "EMA").strip().upper()
@@ -12140,17 +12236,17 @@ def _build_trend_parameter_hint_text(
         f"快线均线：{fast_label}，负责捕捉最近节奏。",
         f"趋势均线：{trend_label}，用来判断当前方向是否仍然有效。",
     ]
-    if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID:
+    if profile.family == "cross_breakdown_short":
         ref = reference_label if entry_reference_ema_period not in {"", "0"} else fast_label
         parts.append(f"突破参考线：{ref}，收盘向下跌破该线触发做空，且需 {fast_label}<{trend_label}。")
-    elif is_ema_atr_breakout_strategy(strategy_id):
+    elif profile.family == "cross_breakout_long":
         ref = reference_label if entry_reference_ema_period not in {"", "0"} else fast_label
         parts.append(f"突破参考线：{ref}，收盘向上突破该线触发做多，且需 {fast_label}>{trend_label}。")
-    elif strategy_id == STRATEGY_EMA5_EMA8_ID:
+    elif profile.family == "ema5_ema8":
         parts.append(f"大周期均线：EMA{big_ema_period}，用于 4H 大趋势过滤。")
-    if is_dynamic_strategy_id(strategy_id) or is_dynamic_mtf_strategy_id(strategy_id):
+    if profile.uses_dynamic_orders:
         parts.append(f"挂单参考线：{reference_label}，价格会围绕这条线动态重挂。")
-    if is_dynamic_mtf_strategy_id(strategy_id):
+    if profile.uses_mtf_filter:
         mtf_bar = mtf_filter_bar_raw.strip() or "?"
         mtf_fast = mtf_filter_fast_ema_period_raw.strip() or "?"
         mtf_slow = mtf_filter_slow_ema_period_raw.strip() or "?"
@@ -12159,11 +12255,7 @@ def _build_trend_parameter_hint_text(
 
 
 def _entry_reference_ema_caption(strategy_id: str) -> str:
-    if is_dynamic_strategy_id(strategy_id):
-        return "挂单参考线"
-    if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(strategy_id):
-        return "突破参考线"
-    return "参考线周期"
+    return strategy_entry_reference_caption(strategy_id)
 
 
 def _build_dynamic_protection_hint_text(
@@ -12236,9 +12328,7 @@ def _build_strategy_start_confirmation_message(
 
     def _tp_sl_mode_text() -> str:
         if config.tp_sl_mode == "exchange":
-            if (
-                is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id)
-            ) and config.take_profit_mode == "dynamic":
+            if strategy_supports_dynamic_take_profit(config.strategy_id) and config.take_profit_mode == "dynamic":
                 return f"{tp_sl_mode_label}（开仓后由 OKX 托管初始止损，后续本地动态上移保护价）"
             return f"{tp_sl_mode_label}（开仓后由 OKX 托管止损/止盈）"
         if config.tp_sl_mode == "local_trade":
@@ -12314,6 +12404,8 @@ def _build_strategy_start_confirmation_message(
         else f"{take_atr_text}（止盈距离 = {take_atr_text} × ATR）"
     )
 
+    profile = get_strategy_runtime_profile(config.strategy_id)
+    visibility = build_strategy_widget_visibility(config.strategy_id, "launcher")
     api_text = (api_label or "").strip() or "-"
 
     lines = [
@@ -12339,12 +12431,12 @@ def _build_strategy_start_confirmation_message(
         f"快线均线：{config.ema_label()}",
         f"趋势均线：{config.trend_ema_label()}",
     ]
-    if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+    if visibility.show_big_ema:
         lines.append(f"EMA大周期：{config.big_ema_period}（大趋势过滤线）")
-    if config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(config.strategy_id):
+    if profile.family in {"cross_breakout_long", "cross_breakdown_short"}:
         lines.append(f"突破参考线：{config.entry_reference_line_label()}（已收盘K线的突破/跌破判断基准）")
-    if is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id) or config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID or is_ema_atr_breakout_strategy(config.strategy_id):
-        if is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id):
+    if profile.uses_dynamic_orders or profile.family in {"cross_breakout_long", "cross_breakdown_short"}:
+        if profile.uses_dynamic_orders:
             lines.extend(
                 [
                     f"挂单参考线：{config.entry_reference_line_label()}（挂单价格锚点）",
@@ -12362,6 +12454,53 @@ def _build_strategy_start_confirmation_message(
                     f"启动追单窗口：{_startup_chase_text()}",
                 ]
             )
+        if config.take_profit_mode == "dynamic":
+            lines.extend(
+                [
+                    f"2R保本开关：{config.dynamic_two_r_break_even_label()}（浮盈达到 2R 后止损抬到保本）",
+                    f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}（保本位预留双边手续费）",
+                    (
+                        f"时间保本：{config.time_stop_break_even_enabled_label()} / "
+                        f"{config.resolved_time_stop_break_even_bars()}根（持仓满指定K线且达到净保本时再抬止损）"
+                    ),
+                ]
+            )
+    if profile.family == "ema55_slope_short":
+        """
+        lines.extend(
+            [
+                (
+                    "寮€绌烘枩鐜囬槇鍊硷細"
+                    f"{format_decimal_fixed(Decimal(str(config.trend_ema_slope_filter_min_ratio)), 6)}"
+                    "锛圗MA55 鍗曟牴鏂滅巼 / 褰撳墠 EMA55锛屽皬浜庣瓑浜庤璐熷€兼墠寮€绌猴級"
+                ),
+                f"姝㈢泩鏂瑰紡锛歿take_profit_mode_text}",
+                "骞充粨淇″彿锛欵MA55 鏂滅巼杞鍚庯紝鏈湴鎸夋敹鐩樼‘璁ゅ钩浠?),
+            ]
+        )
+        if config.take_profit_mode == "dynamic":
+            lines.extend(
+                [
+                    f"2R淇濇湰寮€鍏筹細{config.dynamic_two_r_break_even_label()}锛堟诞鐩堣揪鍒?2R 鍚庢鎹熸姮鍒颁繚鏈級",
+                    f"鎵嬬画璐瑰亸绉诲紑鍏筹細{config.dynamic_fee_offset_enabled_label()}锛堜繚鏈綅棰勭暀鍙岃竟鎵嬬画璐癸級",
+                    (
+                        f"鏃堕棿淇濇湰锛歿config.time_stop_break_even_enabled_label()} / "
+                        f"{config.resolved_time_stop_break_even_bars()}鏍癸紙鎸佷粨婊℃寚瀹欿绾夸笖杈惧埌鍑€淇濇湰鏃跺啀鎶鎹燂級"
+                    ),
+                ]
+            )
+        """
+        lines.extend(
+            [
+                (
+                    "开空斜率阈值："
+                    f"{format_decimal_fixed(Decimal(str(config.trend_ema_slope_filter_min_ratio)), 6)}"
+                    "（EMA55 单根斜率 / 当前 EMA55，小于等于该负值才开空）"
+                ),
+                f"止盈方式：{take_profit_mode_text}",
+                "平仓信号：EMA55 斜率转正后，本地按收盘确认平仓",
+            ]
+        )
         if config.take_profit_mode == "dynamic":
             lines.extend(
                 [
@@ -13148,11 +13287,15 @@ def _infer_upl_currency(position: OkxPosition) -> str:
     return _extract_asset_key(position.inst_id).upper()
 
 
-def _group_pnl_places(currency: object) -> int:
+def _pnl_display_places(currency: object) -> int:
     text = str(currency).strip().upper() if currency is not None else ""
     if text in {"USDT", "USD", "USDC"}:
         return 2
-    return 5
+    return 8
+
+
+def _group_pnl_places(currency: object) -> int:
+    return _pnl_display_places(currency)
 
 
 def _position_contract_amount(
@@ -13266,9 +13409,9 @@ def _format_position_market_value(
 def _format_position_unrealized_pnl(position: OkxPosition) -> str:
     if position.unrealized_pnl is None:
         return "-"
-    places = 2 if position.inst_type in {"FUTURES", "SWAP"} else 8
-    amount_text = _format_optional_decimal_fixed(position.unrealized_pnl, places=places, with_sign=True)
     currency = _infer_upl_currency(position)
+    places = _pnl_display_places(currency)
+    amount_text = _format_optional_decimal_fixed(position.unrealized_pnl, places=places, with_sign=True)
     if currency:
         amount_text = f"{amount_text} {currency}"
     if position.unrealized_pnl_ratio is not None:
@@ -13813,7 +13956,7 @@ def _build_position_detail_text(
         f"浮盈亏 / 浮盈≈USDT：{_format_position_unrealized_pnl(position)} / "
         f"{_format_optional_usdt(_position_unrealized_pnl_usdt(position, upl_usdt_prices))}\n"
         f"已实现盈亏 / 已实现≈USDT："
-        f"{_format_optional_decimal_fixed(position.realized_pnl, places=5, with_sign=True)} / "
+        f"{_format_position_realized_pnl(position)} / "
         f"{_format_optional_usdt(_position_realized_pnl_usdt(position, upl_usdt_prices))}\n"
         f"强平价：{_format_optional_decimal(position.liquidation_price)}\n"
         f"保证金币种：{position.margin_ccy or '-'}\n"
@@ -14624,18 +14767,29 @@ def _format_position_history_filter_stats(
 
 
 def _infer_position_history_pnl_currency(item: OkxPositionHistoryItem) -> str:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    raw_currency = str(raw.get("ccy") or raw.get("pnlCcy") or raw.get("feeCcy") or "").strip().upper()
+    if raw_currency:
+        return raw_currency
     quote_currency = _extract_quote_key(item.inst_id)
     if item.inst_type in {"SWAP", "SPOT", "FUTURES"} and quote_currency in {"USDT", "USD", "USDC"}:
         return quote_currency
     return _extract_asset_key(item.inst_id).upper()
 
 
+def _format_position_realized_pnl(position: OkxPosition) -> str:
+    currency = _infer_upl_currency(position)
+    return _format_optional_decimal_fixed(
+        position.realized_pnl,
+        places=_pnl_display_places(currency),
+        with_sign=True,
+    )
+
+
 def _position_history_realized_pnl_usdt(
     item: OkxPositionHistoryItem,
     upl_usdt_prices: dict[str, Decimal],
 ) -> Decimal | None:
-    if item.inst_type != "OPTION":
-        return None
     if item.realized_pnl is None:
         return None
     currency = _infer_position_history_pnl_currency(item)

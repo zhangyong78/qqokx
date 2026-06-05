@@ -39,22 +39,29 @@ from okx_quant.strategy_catalog import (
     ALL_STRATEGY_DEFINITIONS,
     BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_DYNAMIC_ID,
-    STRATEGY_EMA5_EMA8_ID,
-    STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     StrategyDefinition,
     get_strategy_definition,
-    is_adaptive_ema_rail_strategy,
-    is_dynamic_mtf_strategy_id,
-    is_dynamic_strategy_id,
-    is_ema_atr_breakout_strategy,
     resolve_dynamic_signal_mode,
+)
+from okx_quant.strategy_runtime_registry import (
+    get_strategy_runtime_profile,
+    strategy_entry_reference_caption,
+    strategy_entry_reference_period_caption,
+    strategy_is_cross_family,
+    strategy_uses_dynamic_orders,
 )
 from okx_quant.strategy_parameters import (
     iter_strategy_parameter_keys,
     strategy_fixed_value,
     strategy_is_parameter_editable,
-    strategy_parameter_default_value,
     strategy_uses_parameter,
+)
+from okx_quant.strategy_ui_schema import (
+    build_strategy_widget_visibility,
+    strategy_parameter_default_for_scope,
+    strategy_supports_dynamic_take_profit,
+    strategy_ui_extra_defaults,
+    strategy_ui_fixed_extra_value,
 )
 from okx_quant.window_layout import apply_adaptive_window_geometry
 
@@ -167,6 +174,9 @@ class BacktestLaunchState:
     trigger_type_label: str
     environment_label: str
     hold_close_exit_bars: str = "0"
+    trend_ema_slope_filter_min_ratio: str = "0"
+    atr_percentile_filter_max: str = "0"
+    ema55_slope_exit_enabled: bool = True
     maker_fee_percent: str = DEFAULT_MAKER_FEE_PERCENT
     taker_fee_percent: str = DEFAULT_TAKER_FEE_PERCENT
     initial_capital: str = "10000"
@@ -454,7 +464,8 @@ def _build_backtest_param_summary(
     fast_label = config.ema_label()
     trend_label = config.trend_ema_label()
     reference_label = config.entry_reference_line_label()
-    if is_dynamic_strategy_id(config.strategy_id) or is_ema_atr_breakout_strategy(config.strategy_id):
+    profile = get_strategy_runtime_profile(config.strategy_id)
+    if profile.uses_dynamic_orders or strategy_is_cross_family(config.strategy_id):
         risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
         sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
         if config.backtest_sizing_mode == "risk_percent":
@@ -473,14 +484,10 @@ def _build_backtest_param_summary(
             )
         max_entries_text = "不限" if config.max_entries_per_trend <= 0 else f"每波前{config.max_entries_per_trend}次"
         extra_parts.append(max_entries_text)
-        if is_ema_atr_breakout_strategy(config.strategy_id) and int(config.hold_close_exit_bars) > 0:
+        if strategy_is_cross_family(config.strategy_id) and int(config.hold_close_exit_bars) > 0:
             extra_parts.append(f"满{int(config.hold_close_exit_bars)}根收盘平仓")
         extra_text = " / ".join(extra_parts)
-        ref_line_label = (
-            "跌破参考线"
-            if config.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID
-            else ("突破参考线" if is_ema_atr_breakout_strategy(config.strategy_id) else "挂单参考线")
-        )
+        ref_line_label = strategy_entry_reference_caption(config.strategy_id)
         return (
             f"{fast_label}/{trend_label} / ATR{config.atr_period} / "
             f"{ref_line_label}{reference_label} / "
@@ -494,7 +501,7 @@ def _build_backtest_param_summary(
             f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
         )
 
-    if config.strategy_id == STRATEGY_EMA5_EMA8_ID:
+    if profile.family == "ema5_ema8":
         sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
         if config.backtest_sizing_mode == "risk_percent":
             sizing_text = f"{sizing_label}{format_decimal(config.backtest_risk_percent or Decimal('0'))}%"
@@ -921,7 +928,7 @@ def _batch_mode_for_snapshots(snapshots: list[_BacktestSnapshot]) -> str:
     config = snapshots[0].config
     if is_strategy_pool_config(config):
         return "strategy_pool"
-    if is_dynamic_strategy_id(config.strategy_id) or is_dynamic_mtf_strategy_id(config.strategy_id):
+    if strategy_uses_dynamic_orders(config.strategy_id):
         if config.take_profit_mode == "dynamic":
             return "dynamic_entries"
         return "fixed_entries"
@@ -1407,6 +1414,9 @@ class BacktestWindow:
         self.time_stop_break_even_enabled = BooleanVar(value=initial_state.time_stop_break_even_enabled)
         self.time_stop_break_even_bars = StringVar(value=initial_state.time_stop_break_even_bars)
         self.hold_close_exit_bars = StringVar(value=initial_state.hold_close_exit_bars)
+        self.trend_ema_slope_filter_min_ratio = StringVar(value=initial_state.trend_ema_slope_filter_min_ratio)
+        self.atr_percentile_filter_max = StringVar(value=initial_state.atr_percentile_filter_max)
+        self.ema55_slope_exit_enabled = BooleanVar(value=initial_state.ema55_slope_exit_enabled)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
         self.position_mode_label = StringVar(value=initial_state.position_mode_label)
@@ -1490,12 +1500,7 @@ class BacktestWindow:
 
     @staticmethod
     def _strategy_supports_dynamic_take_profit(strategy_id: str) -> bool:
-        return (
-            is_dynamic_strategy_id(strategy_id)
-            or is_dynamic_mtf_strategy_id(strategy_id)
-            or is_ema_atr_breakout_strategy(strategy_id)
-            or is_adaptive_ema_rail_strategy(strategy_id)
-        )
+        return strategy_supports_dynamic_take_profit(strategy_id)
 
     def _bind_responsive_wrap(
         self,
@@ -1565,6 +1570,9 @@ class BacktestWindow:
             "max_entries_per_trend": self.max_entries_per_trend,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
             "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
+            "trend_ema_slope_filter_min_ratio": self.trend_ema_slope_filter_min_ratio,
+            "atr_percentile_filter_max": self.atr_percentile_filter_max,
+            "ema55_slope_exit_enabled": self.ema55_slope_exit_enabled,
             "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
             "time_stop_break_even_bars": self.time_stop_break_even_bars,
             "hold_close_exit_bars": self.hold_close_exit_bars,
@@ -1600,7 +1608,7 @@ class BacktestWindow:
             if key in draft:
                 variable.set(draft[key])
                 continue
-            default_value = strategy_parameter_default_value(key)
+            default_value = strategy_parameter_default_for_scope(strategy_id, key, self._strategy_parameter_scope)
             if default_value is None:
                 continue
             if key == "bar":
@@ -1640,12 +1648,7 @@ class BacktestWindow:
 
     def _apply_strategy_parameter_fixed_labels(self, strategy_id: str) -> None:
         fixed_suffix = "（本策略固定）"
-        if is_ema_atr_breakout_strategy(strategy_id):
-            self.entry_reference_ema_caption.configure(
-                text="跌破参考线周期" if strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID else "突破参考线周期"
-            )
-        else:
-            self.entry_reference_ema_caption.configure(text="挂单参考线")
+        self.entry_reference_ema_caption.configure(text=strategy_entry_reference_period_caption(strategy_id))
         label_map = {
             "bar": (self.bar_caption, "K线周期"),
             "signal_mode": (self.signal_caption, "信号方向"),
@@ -1915,6 +1918,18 @@ class BacktestWindow:
             textvariable=self.entry_reference_ema_period,
         )
         self.entry_reference_ema_entry.grid(row=0, column=1, sticky="ew")
+
+        row += 1
+        self.slope_threshold_caption = ttk.Label(controls, text="开空斜率阈值(负数)")
+        self.slope_threshold_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self.slope_threshold_entry = ttk.Entry(controls, textvariable=self.trend_ema_slope_filter_min_ratio)
+        self.slope_threshold_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.slope_threshold_hint = ttk.Label(
+            controls,
+            text="填 0 表示只要 EMA55 斜率转负就开空；例如填 -0.0005 表示需要更陡的负斜率才开空。",
+            foreground="#57606a",
+        )
+        self.slope_threshold_hint.grid(row=row, column=2, columnspan=4, sticky="w", pady=(12, 0))
 
         row += 1
         self.mtf_filter_bar_caption = ttk.Label(controls, text="高周期K线")
@@ -2545,7 +2560,6 @@ class BacktestWindow:
         self._bind_chart_interactions(self.chart_canvas)
 
     def _update_sizing_mode_widgets(self) -> None:
-        definition = self._selected_strategy_definition()
         self.sizing_mode_combo.configure(state="readonly")
         mode = BACKTEST_SIZING_OPTIONS.get(self.sizing_mode_label.get(), "fixed_risk")
         if mode == "fixed_size":
@@ -2655,14 +2669,20 @@ class BacktestWindow:
     def start_backtest(self) -> None:
         if self._backtest_running or self._history_ui_busy():
             return
-        if self._selected_strategy_definition().strategy_id == STRATEGY_EMA5_EMA8_ID:
-            self.start_single_backtest()
-            return
         try:
             config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts = self._build_backtest_request()
             batch_count = len(build_parameter_batch_configs(config))
         except Exception as exc:
             messagebox.showerror("回测参数错误", str(exc), parent=self.window)
+            return
+        if batch_count <= 1:
+            self._prepare_backtest_output("正在单组回测，请稍候...")
+            self._set_backtest_running(True)
+            threading.Thread(
+                target=self._run_backtest_worker,
+                args=(config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts),
+                daemon=True,
+            ).start()
             return
 
         summary_text = f"正在批量回测 {batch_count} 组参数组合，请稍候..."
@@ -3217,7 +3237,7 @@ class BacktestWindow:
 
     def _build_config(self) -> StrategyConfig:
         definition = self._selected_strategy_definition()
-        dynamic_strategy = is_dynamic_strategy_id(definition.strategy_id) or is_dynamic_mtf_strategy_id(definition.strategy_id)
+        dynamic_strategy = strategy_uses_dynamic_orders(definition.strategy_id)
         dynamic_tp_strategy = self._strategy_supports_dynamic_take_profit(definition.strategy_id)
         strategy_id = definition.strategy_id
         sizing_mode = BACKTEST_SIZING_OPTIONS[self.sizing_mode_label.get()]
@@ -3231,9 +3251,12 @@ class BacktestWindow:
             risk_percent = self._parse_positive_decimal(self.risk_percent.get(), "风险百分比")
         else:
             risk_amount = size_or_risk
-        if definition.strategy_id == STRATEGY_EMA5_EMA8_ID:
-            risk_amount = Decimal("100")
-            order_size = Decimal("0")
+        fixed_risk_amount = strategy_ui_fixed_extra_value(strategy_id, "risk_amount", "backtest")
+        if fixed_risk_amount is not None:
+            risk_amount = Decimal(str(fixed_risk_amount))
+        fixed_order_size = strategy_ui_fixed_extra_value(strategy_id, "order_size", "backtest")
+        if fixed_order_size is not None:
+            order_size = Decimal(str(fixed_order_size))
         signal_mode = SIGNAL_LABEL_TO_VALUE[self.signal_mode_label.get()]
         if dynamic_strategy:
             signal_mode = resolve_dynamic_signal_mode(definition.strategy_id, signal_mode)
@@ -3246,6 +3269,7 @@ class BacktestWindow:
         mtf_reversal_mode = "block_new_entries"
         dynamic_two_r_break_even = False
         dynamic_fee_offset_enabled = False
+        trend_ema_slope_filter_min_ratio = Decimal("0")
         time_stop_break_even_enabled = False
         time_stop_break_even_bars = 0
         hold_close_exit_bars = 0
@@ -3263,12 +3287,15 @@ class BacktestWindow:
         if strategy_uses_parameter(definition.strategy_id, "entry_reference_ema_period"):
             entry_reference_ema_period = self._parse_nonnegative_int(
                 self.entry_reference_ema_period.get(),
-                (
-                    "跌破参考线周期"
-                    if definition.strategy_id == STRATEGY_EMA_BREAKDOWN_SHORT_ID
-                    else ("突破参考线周期" if is_ema_atr_breakout_strategy(definition.strategy_id) else "挂单参考线")
-                ),
+                strategy_entry_reference_period_caption(definition.strategy_id),
             )
+        if strategy_uses_parameter(definition.strategy_id, "trend_ema_slope_filter_min_ratio"):
+            trend_ema_slope_filter_min_ratio = self._parse_decimal(
+                self.trend_ema_slope_filter_min_ratio.get(),
+                "开空斜率阈值",
+            )
+            if trend_ema_slope_filter_min_ratio > 0:
+                raise ValueError("开空斜率阈值必须小于或等于 0")
         if strategy_uses_parameter(definition.strategy_id, "mtf_filter_bar"):
             mtf_filter_bar = str(
                 self._resolve_strategy_parameter_value(
@@ -3364,6 +3391,7 @@ class BacktestWindow:
             max_entries_per_trend=max_entries_per_trend,
             dynamic_two_r_break_even=dynamic_two_r_break_even,
             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+            trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
             time_stop_break_even_enabled=time_stop_break_even_enabled,
             time_stop_break_even_bars=time_stop_break_even_bars,
             hold_close_exit_bars=hold_close_exit_bars,
@@ -3392,25 +3420,30 @@ class BacktestWindow:
     def _apply_selected_strategy_definition(self) -> None:
         definition = self._selected_strategy_definition()
         strategy_id = definition.strategy_id
+        has_saved_draft = strategy_id in self._strategy_parameter_scope_drafts()
         previous_strategy_id = self._last_strategy_parameter_strategy_id
         if previous_strategy_id and previous_strategy_id != strategy_id:
             self._save_strategy_parameter_draft(previous_strategy_id)
         self._restore_strategy_parameter_draft(strategy_id)
-        dynamic_strategy = is_dynamic_strategy_id(strategy_id)
-        dynamic_tp_strategy = self._strategy_supports_dynamic_take_profit(strategy_id)
+        visibility = build_strategy_widget_visibility(strategy_id, "backtest")
         self.signal_combo["values"] = definition.allowed_signal_labels
         fixed_signal_mode = strategy_fixed_value(strategy_id, "signal_mode")
         if fixed_signal_mode is not None:
             self.signal_mode_label.set(SIGNAL_VALUE_TO_LABEL.get(str(fixed_signal_mode), definition.default_signal_label))
         elif self.signal_mode_label.get() not in definition.allowed_signal_labels:
             self.signal_mode_label.set(definition.default_signal_label)
-        if strategy_id == STRATEGY_EMA5_EMA8_ID:
-            self.entry_reference_ema_period.set("0")
-            self.risk_amount.set("100")
+        if not has_saved_draft:
+            extra_defaults = strategy_ui_extra_defaults(strategy_id, "backtest")
+            sizing_mode = extra_defaults.get("sizing_mode")
+            if sizing_mode is not None:
+                self.sizing_mode_label.set(BACKTEST_SIZING_VALUE_TO_LABEL.get(str(sizing_mode), str(sizing_mode)))
+            risk_amount = extra_defaults.get("risk_amount")
+            if risk_amount is not None:
+                self.risk_amount.set(str(risk_amount))
         if hasattr(self, "_controls_frame"):
             big_ema_widgets = (self.big_ema_caption, self.big_ema_entry)
             for widget in big_ema_widgets:
-                if self._strategy_uses_big_ema(strategy_id):
+                if visibility.show_big_ema:
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -3419,7 +3452,17 @@ class BacktestWindow:
                 self.entry_reference_ema_entry,
             )
             for widget in entry_reference_widgets:
-                if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
+                if visibility.show_entry_reference:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            slope_threshold_widgets = (
+                self.slope_threshold_caption,
+                self.slope_threshold_entry,
+                self.slope_threshold_hint,
+            )
+            for widget in slope_threshold_widgets:
+                if visibility.show_slope_threshold:
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -3434,7 +3477,7 @@ class BacktestWindow:
                 self.mtf_reversal_mode_combo,
             )
             for widget in mtf_widgets:
-                if is_dynamic_mtf_strategy_id(strategy_id):
+                if visibility.show_mtf_controls:
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -3449,17 +3492,17 @@ class BacktestWindow:
                 self.time_stop_break_even_bars_entry,
             )
             for widget in dynamic_widgets:
-                if dynamic_tp_strategy:
+                if visibility.show_dynamic_take_profit:
                     widget.grid()
                 else:
                     widget.grid_remove()
             max_entries_widgets = (self.max_entries_caption, self.max_entries_entry)
             for widget in max_entries_widgets:
-                if strategy_uses_parameter(strategy_id, "max_entries_per_trend"):
+                if visibility.show_max_entries:
                     widget.grid()
                 else:
                     widget.grid_remove()
-            if not strategy_uses_parameter(strategy_id, "max_entries_per_trend"):
+            if not visibility.show_max_entries:
                 self.max_entries_caption.configure(text="每波最多开仓次数")
             hold_close_widgets = (
                 self.hold_close_exit_bars_caption,
@@ -3467,7 +3510,7 @@ class BacktestWindow:
                 self.hold_close_exit_hint,
             )
             for widget in hold_close_widgets:
-                if strategy_uses_parameter(strategy_id, "hold_close_exit_bars"):
+                if visibility.show_hold_close_exit:
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -3490,17 +3533,19 @@ class BacktestWindow:
                 editable=strategy_is_parameter_editable(strategy_id, "entry_reference_ema_type", "backtest"),
             )
             self._set_field_state(
+                self.slope_threshold_entry,
+                editable=strategy_is_parameter_editable(strategy_id, "trend_ema_slope_filter_min_ratio", "backtest"),
+            )
+            self._set_field_state(
                 self.hold_close_exit_bars_entry,
                 editable=strategy_is_parameter_editable(strategy_id, "hold_close_exit_bars", "backtest"),
             )
             self._apply_strategy_parameter_fixed_labels(strategy_id)
-        if dynamic_tp_strategy and not self.entry_reference_ema_period.get().strip():
+        if visibility.show_entry_reference and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
         self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
         self._update_sizing_mode_widgets()
-        if self._latest_result is None:
-            self.manual_summary.set("当前策略没有额外扩展统计。")
         if self._latest_result is None:
             self.manual_summary.set("当前策略没有额外扩展统计。")
         if self._ui_alive():
@@ -3592,7 +3637,7 @@ class BacktestWindow:
             self._show_batch_matrix(None)
             return
         snapshot = self._backtest_snapshots.get(snapshot_id)
-        if snapshot is not None and is_dynamic_strategy_id(snapshot.config.strategy_id) and snapshot.config.take_profit_mode != "dynamic":
+        if snapshot is not None and strategy_uses_dynamic_orders(snapshot.config.strategy_id) and snapshot.config.take_profit_mode != "dynamic":
             self.batch_entries_layer_label.set(_batch_entries_label(snapshot.config.max_entries_per_trend))
         self._show_batch_matrix(self._snapshot_batch_labels.get(snapshot_id))
 
@@ -5365,6 +5410,12 @@ class BacktestWindow:
         if value <= 0:
             raise ValueError(f"{field_name} 必须大于 0")
         return value
+
+    def _parse_decimal(self, raw: str, field_name: str) -> Decimal:
+        try:
+            return Decimal(raw)
+        except InvalidOperation as exc:
+            raise ValueError(f"{field_name} 不是有效数字") from exc
 
     def _parse_nonnegative_decimal(self, raw: str, field_name: str) -> Decimal:
         try:
