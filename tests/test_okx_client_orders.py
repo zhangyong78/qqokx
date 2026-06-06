@@ -160,6 +160,72 @@ class OkxClientOrderRequestTest(TestCase):
         self.assertEqual(book.bids[0][0], Decimal("69999"))
         self.assertEqual(book.asks[0][1], Decimal("0.8"))
 
+    def test_get_trigger_price_prefers_cached_public_ticker_when_available(self) -> None:
+        client = OkxRestClient()
+        watched: list[tuple[str, str]] = []
+
+        client.ensure_public_ws_market_watch = lambda inst_id, environment: watched.append((inst_id, environment))  # type: ignore[method-assign]
+        client.get_cached_public_ticker = lambda inst_id, environment: (  # type: ignore[method-assign]
+            5,
+            type(
+                "Ticker",
+                (),
+                {
+                    "inst_id": inst_id,
+                    "last": Decimal("70000"),
+                    "bid": Decimal("69999"),
+                    "ask": Decimal("70001"),
+                    "mark": Decimal("69998"),
+                    "index": Decimal("69997"),
+                    "raw": {},
+                },
+            )(),
+        )
+        client.get_ticker = lambda inst_id: self.fail(f"should not call REST ticker for {inst_id}")  # type: ignore[method-assign]
+
+        price = client.get_trigger_price("BTC-USDT-SWAP", "last", environment="demo")
+
+        self.assertEqual(price, Decimal("70000"))
+        self.assertEqual(watched, [("BTC-USDT-SWAP", "demo")])
+
+    def test_get_trigger_price_falls_back_to_rest_when_cached_mark_is_missing(self) -> None:
+        client = OkxRestClient()
+        client.ensure_public_ws_market_watch = lambda inst_id, environment: None  # type: ignore[method-assign]
+        client.get_cached_public_ticker = lambda inst_id, environment: (  # type: ignore[method-assign]
+            5,
+            type(
+                "Ticker",
+                (),
+                {
+                    "inst_id": inst_id,
+                    "last": Decimal("70000"),
+                    "bid": Decimal("69999"),
+                    "ask": Decimal("70001"),
+                    "mark": None,
+                    "index": Decimal("69997"),
+                    "raw": {},
+                },
+            )(),
+        )
+        client.get_ticker = lambda inst_id: type(  # type: ignore[method-assign]
+            "Ticker",
+            (),
+            {
+                "inst_id": inst_id,
+                "last": Decimal("70000"),
+                "bid": Decimal("69999"),
+                "ask": Decimal("70001"),
+                "mark": None,
+                "index": Decimal("69997"),
+                "raw": {},
+            },
+        )()
+        client.get_mark_price = lambda inst_id: Decimal("69995")  # type: ignore[method-assign]
+
+        price = client.get_trigger_price("BTC-USDT-SWAP", "mark", environment="live")
+
+        self.assertEqual(price, Decimal("69995"))
+
     def test_get_public_ws_debug_status_reports_disabled_mode(self) -> None:
         client = OkxRestClient()
 

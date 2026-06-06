@@ -130,7 +130,7 @@ class OptionProtectionConfig:
     stop_loss_order_mode: ClosePriceMode
     stop_loss_order_price: Decimal | None
     stop_loss_slippage: Decimal
-    poll_seconds: float = 3.0
+    poll_seconds: float = 10.0
     trigger_label: str = ""
 
 
@@ -350,6 +350,7 @@ class PositionProtectionManager:
                 current_price = self._client.get_trigger_price(
                     protection.trigger_inst_id,
                     protection.trigger_price_type,
+                    environment=worker.config.environment,
                 )
                 worker.last_trigger_price = current_price
                 stop_hit, take_hit = evaluate_protection_trigger(
@@ -1474,6 +1475,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
             current_price = self._client.get_trigger_price(
                 protection.trigger_inst_id,
                 protection.trigger_price_type,
+                environment=worker.config.environment,
             )
             worker.last_trigger_price = current_price
             stop_hit, take_hit = evaluate_protection_trigger(
@@ -2411,6 +2413,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
             current_price = self._client.get_trigger_price(
                 protection.trigger_inst_id,
                 protection.trigger_price_type,
+                environment=worker.config.environment,
             )
             worker.last_trigger_price = current_price
             stop_hit, take_hit = evaluate_protection_trigger(

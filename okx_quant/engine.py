@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Callable, Literal, TypeVar
 
 from okx_quant.indicators import atr, ema
+from okx_quant.market_data_hub import MarketDataHub
 from okx_quant.models import Credentials, Instrument, OrderPlan, ProtectionPlan, SignalDecision, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.okx_client import (
@@ -302,6 +303,7 @@ class StrategyEngine:
         client: OkxRestClient,
         logger: Logger,
         *,
+        market_data_hub: MarketDataHub | None = None,
         notifier: EmailNotifier | None = None,
         strategy_name: str = "Strategy",
         session_id: str = "",
@@ -312,6 +314,7 @@ class StrategyEngine:
     ) -> None:
         self._client = client
         self._logger = logger
+        self._market_data_hub = market_data_hub
         self._notifier = notifier
         self._strategy_name = strategy_name
         self._session_id = session_id
@@ -1605,7 +1608,11 @@ class StrategyEngine:
                     f"下单标的={trade_instrument.inst_id}"
                 )
 
-            current_signal_price = self._get_trigger_price_with_retry(config.inst_id, "last")
+            current_signal_price = self._get_trigger_price_with_retry(
+                config.inst_id,
+                "last",
+                environment=config.environment,
+            )
             if not local_entry_trigger_hit(active_trigger.signal, current_signal_price, active_trigger.entry_reference):
                 self._stop_event.wait(config.poll_seconds)
                 continue
@@ -1879,7 +1886,11 @@ class StrategyEngine:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
-            current_signal_price = self._get_trigger_price_with_retry(config.inst_id, "last")
+            current_signal_price = self._get_trigger_price_with_retry(
+                config.inst_id,
+                "last",
+                environment=config.environment,
+            )
             if not local_entry_trigger_hit(active_trigger.signal, current_signal_price, active_trigger.entry_reference):
                 self._stop_event.wait(config.poll_seconds)
                 continue
@@ -2597,6 +2608,7 @@ class StrategyEngine:
             current_price = self._get_trigger_price_with_retry(
                 protection.trigger_inst_id,
                 protection.trigger_price_type,
+                environment=config.environment,
             )
             manual_control = self.get_manual_trade_control()
             manual_mode = manual_control.management_mode == "manual"
@@ -2704,6 +2716,7 @@ class StrategyEngine:
             current_price = self._get_trigger_price_with_retry(
                 protection.trigger_inst_id,
                 protection.trigger_price_type,
+                environment=config.environment,
             )
             manual_control = self.get_manual_trade_control()
             manual_mode = manual_control.management_mode == "manual"
@@ -3155,7 +3168,9 @@ class StrategyEngine:
             if next_missing >= OKX_DYNAMIC_STOP_MISSING_ALGO_PRICE_EXIT_POLLS:
                 try:
                     infer_price = self._get_trigger_price_with_retry(
-                        trade_instrument.inst_id, config.tp_sl_trigger_type
+                        trade_instrument.inst_id,
+                        config.tp_sl_trigger_type,
+                        environment=config.environment,
                     )
                 except Exception:
                     infer_price = Decimal("0")
@@ -3193,7 +3208,11 @@ class StrategyEngine:
                     seed_baseline_abs=seed_snap,
                 )
 
-        current_price = self._get_trigger_price_with_retry(trade_instrument.inst_id, config.tp_sl_trigger_type)
+        current_price = self._get_trigger_price_with_retry(
+            trade_instrument.inst_id,
+            config.tp_sl_trigger_type,
+            environment=config.environment,
+        )
         holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
         updated_stop_loss, next_trigger_price, updated_trigger_r, moved = _advance_dynamic_stop_live(
             direction=direction,
@@ -3222,7 +3241,11 @@ class StrategyEngine:
                 seed_baseline_abs=seed_snap,
             )
 
-        fresh_price = self._get_trigger_price_with_retry(trade_instrument.inst_id, config.tp_sl_trigger_type)
+        fresh_price = self._get_trigger_price_with_retry(
+            trade_instrument.inst_id,
+            config.tp_sl_trigger_type,
+            environment=config.environment,
+        )
         if not _is_exchange_dynamic_stop_candidate_valid(
             direction=direction,
             current_price=fresh_price,
@@ -3311,6 +3334,7 @@ class StrategyEngine:
             latest_price = self._get_trigger_price_with_retry(
                 trade_instrument.inst_id,
                 config.tp_sl_trigger_type,
+                environment=config.environment,
             )
             detail = str(exc).strip() or f"code={exc.code or '-'}"
             if not _is_exchange_dynamic_stop_candidate_valid(
@@ -3649,6 +3673,8 @@ class StrategyEngine:
         return self._retry_policy.get_instrument(inst_id)
 
     def _get_candles_with_retry(self, inst_id: str, bar: str, *, limit: int) -> list:
+        if self._market_data_hub is not None:
+            return self._market_data_hub.get_candles(inst_id, bar, limit=limit)
         return self._retry_policy.get_candles(inst_id, bar, limit=limit)
 
     def _get_order_with_retry(
@@ -3668,8 +3694,14 @@ class StrategyEngine:
             cl_ord_id=cl_ord_id,
         )
 
-    def _get_trigger_price_with_retry(self, inst_id: str, price_type: str) -> Decimal:
-        return self._retry_policy.get_trigger_price(inst_id, price_type)
+    def _get_trigger_price_with_retry(
+        self,
+        inst_id: str,
+        price_type: str,
+        *,
+        environment: str | None = None,
+    ) -> Decimal:
+        return self._retry_policy.get_trigger_price(inst_id, price_type, environment=environment)
 
     def _get_pending_orders_with_retry(
         self,
@@ -4426,7 +4458,11 @@ class StrategyEngine:
                 self._logger("未检测到策略持仓，交易员虚拟止损监控结束。")
                 return
 
-            current_price = self._get_trigger_price_with_retry(trade_instrument.inst_id, config.tp_sl_trigger_type)
+            current_price = self._get_trigger_price_with_retry(
+                trade_instrument.inst_id,
+                config.tp_sl_trigger_type,
+                environment=config.environment,
+            )
             if dynamic_take_profit_enabled:
                 holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
                 updated_stop_loss, next_trigger_price, updated_trigger_r, moved = _advance_dynamic_stop_live(

@@ -98,7 +98,7 @@ class _StubPriceClient:
     def __init__(self, mark_price: Decimal) -> None:
         self._mark_price = mark_price
 
-    def get_trigger_price(self, inst_id: str, price_type: str) -> Decimal:
+    def get_trigger_price(self, inst_id: str, price_type: str, *, environment: str | None = None) -> Decimal:
         assert inst_id
         assert price_type == "mark"
         return self._mark_price
@@ -135,7 +135,7 @@ class _PriceGuardClient:
         self._option_quote = _TickerQuote(last=option_last, bid=option_bid, ask=option_ask, mark=option_mark_price)
         self._tick_size = tick_size
 
-    def get_trigger_price(self, inst_id: str, price_type: str) -> Decimal:
+    def get_trigger_price(self, inst_id: str, price_type: str, *, environment: str | None = None) -> Decimal:
         if price_type == "mark":
             return self._option_mark_price
         return self._spot_price
@@ -162,7 +162,7 @@ class _PriceGuardClient:
 
 
 class _MissingMarkPriceClient:
-    def get_trigger_price(self, inst_id: str, price_type: str) -> Decimal:
+    def get_trigger_price(self, inst_id: str, price_type: str, *, environment: str | None = None) -> Decimal:
         raise OkxApiError(f"{inst_id} 缺少标记价格，无法触发。")
 
 
@@ -213,7 +213,7 @@ class _SimulatedProtectionClient:
             inst_family="BTC-USD",
         )
 
-    def get_trigger_price(self, inst_id: str, price_type: str) -> Decimal:
+    def get_trigger_price(self, inst_id: str, price_type: str, *, environment: str | None = None) -> Decimal:
         self.price_requests.append((inst_id, price_type))
         key = (inst_id, price_type)
         if key not in self._trigger_prices and price_type == "last":
@@ -1683,5 +1683,4 @@ class PositionProtectionTest(TestCase):
         self.assertFalse(worker.thread.is_alive())
         self.assertEqual(manager.clear_finished(), 1)
         self.assertEqual(len(manager._workers), 0)
-
 

@@ -1007,6 +1007,30 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "mtf_filter_fast_ema_period": config.mtf_filter_fast_ema_period,
         "mtf_filter_slow_ema_period": config.mtf_filter_slow_ema_period,
         "mtf_reversal_mode": config.mtf_reversal_mode,
+        "daily_filter_inst_id": config.daily_filter_inst_id,
+        "daily_filter_bar": config.daily_filter_bar,
+        "daily_filter_boundary": config.daily_filter_boundary,
+        "daily_filter_enabled": config.daily_filter_enabled,
+        "daily_filter_mode": config.daily_filter_mode,
+        "daily_filter_scope": config.daily_filter_scope,
+        "daily_filter_ma_type": config.daily_filter_ma_type,
+        "daily_filter_period": config.daily_filter_period,
+        "rail_candidate_ema_periods": list(config.rail_candidate_ema_periods),
+        "rail_touch_atr_ratio": str(config.rail_touch_atr_ratio),
+        "rail_bounce_atr_ratio": str(config.rail_bounce_atr_ratio),
+        "rail_bounce_confirm_bars": config.rail_bounce_confirm_bars,
+        "rail_break_atr_ratio": str(config.rail_break_atr_ratio),
+        "rail_reclaim_bars": config.rail_reclaim_bars,
+        "rail_score_lookback_bars": config.rail_score_lookback_bars,
+        "rail_switch_min_score_delta": str(config.rail_switch_min_score_delta),
+        "rail_min_touches": config.rail_min_touches,
+        "rail_min_bounces": config.rail_min_bounces,
+        "rail_fast_gate_enabled": config.rail_fast_gate_enabled,
+        "rail_fast_gate_period": config.rail_fast_gate_period,
+        "rail_fast_min_gap_ema200_atr": str(config.rail_fast_min_gap_ema200_atr),
+        "rail_fast_min_spread_trend_atr": str(config.rail_fast_min_spread_trend_atr),
+        "rail_fast_max_recent_range_atr": str(config.rail_fast_max_recent_range_atr),
+        "rail_fast_recent_range_bars": config.rail_fast_recent_range_bars,
         "backtest_profile_id": config.backtest_profile_id,
         "backtest_profile_name": config.backtest_profile_name,
         "backtest_profile_summary": config.backtest_profile_summary,
@@ -1047,6 +1071,15 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
             return False
         return default
 
+    rail_candidate_periods_raw = payload.get("rail_candidate_ema_periods", (21, 34, 55, 89))
+    rail_candidate_periods: tuple[int, ...]
+    if isinstance(rail_candidate_periods_raw, (list, tuple)):
+        rail_candidate_periods = tuple(
+            int(item) for item in rail_candidate_periods_raw if str(item).strip() and int(item) > 0
+        )
+    else:
+        rail_candidate_periods = (21, 34, 55, 89)
+
     return StrategyConfig(
         inst_id=str(payload.get("inst_id", "")),
         bar=str(payload.get("bar", "15m")),
@@ -1067,7 +1100,7 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         environment=str(payload.get("environment", "demo")),
         tp_sl_trigger_type=str(payload.get("tp_sl_trigger_type", "mark")),
         strategy_id=str(payload.get("strategy_id", STRATEGY_DYNAMIC_ID)),
-        poll_seconds=float(payload.get("poll_seconds", 3.0)),
+        poll_seconds=float(payload.get("poll_seconds", 10.0)),
         risk_amount=None
         if payload.get("risk_amount") in (None, "")
         else Decimal(str(payload.get("risk_amount"))),
@@ -1095,6 +1128,32 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         mtf_filter_fast_ema_period=int(payload.get("mtf_filter_fast_ema_period", 21)),
         mtf_filter_slow_ema_period=int(payload.get("mtf_filter_slow_ema_period", 55)),
         mtf_reversal_mode=str(payload.get("mtf_reversal_mode", "block_new_entries")),
+        daily_filter_inst_id=None
+        if payload.get("daily_filter_inst_id") in (None, "")
+        else str(payload.get("daily_filter_inst_id")),
+        daily_filter_bar=None if payload.get("daily_filter_bar") in (None, "") else str(payload.get("daily_filter_bar")),
+        daily_filter_boundary=str(payload.get("daily_filter_boundary", "exchange")),
+        daily_filter_enabled=coerce_bool(payload.get("daily_filter_enabled"), False),
+        daily_filter_mode=str(payload.get("daily_filter_mode", "disabled")),
+        daily_filter_scope=str(payload.get("daily_filter_scope", "both")),
+        daily_filter_ma_type=str(payload.get("daily_filter_ma_type", "ema")),
+        daily_filter_period=int(payload.get("daily_filter_period", 5)),
+        rail_candidate_ema_periods=rail_candidate_periods,
+        rail_touch_atr_ratio=Decimal(str(payload.get("rail_touch_atr_ratio", "0.2"))),
+        rail_bounce_atr_ratio=Decimal(str(payload.get("rail_bounce_atr_ratio", "0.6"))),
+        rail_bounce_confirm_bars=int(payload.get("rail_bounce_confirm_bars", 3)),
+        rail_break_atr_ratio=Decimal(str(payload.get("rail_break_atr_ratio", "1.0"))),
+        rail_reclaim_bars=int(payload.get("rail_reclaim_bars", 2)),
+        rail_score_lookback_bars=int(payload.get("rail_score_lookback_bars", 60)),
+        rail_switch_min_score_delta=Decimal(str(payload.get("rail_switch_min_score_delta", "8"))),
+        rail_min_touches=int(payload.get("rail_min_touches", 2)),
+        rail_min_bounces=int(payload.get("rail_min_bounces", 1)),
+        rail_fast_gate_enabled=coerce_bool(payload.get("rail_fast_gate_enabled"), True),
+        rail_fast_gate_period=int(payload.get("rail_fast_gate_period", 21)),
+        rail_fast_min_gap_ema200_atr=Decimal(str(payload.get("rail_fast_min_gap_ema200_atr", "5.0"))),
+        rail_fast_min_spread_trend_atr=Decimal(str(payload.get("rail_fast_min_spread_trend_atr", "1.5"))),
+        rail_fast_max_recent_range_atr=Decimal(str(payload.get("rail_fast_max_recent_range_atr", "3.0"))),
+        rail_fast_recent_range_bars=int(payload.get("rail_fast_recent_range_bars", 8)),
         backtest_profile_id=str(payload.get("backtest_profile_id", "")),
         backtest_profile_name=str(payload.get("backtest_profile_name", "")),
         backtest_profile_summary=str(payload.get("backtest_profile_summary", "")),
@@ -5604,21 +5663,22 @@ def _format_chart_hover_lines(
     candle,
     ema_value: Decimal | None,
     trend_ema_value: Decimal | None,
-    reference_ema_value: Decimal | None,
+    reference_ema_value: Decimal | None = None,
     big_ema_value: Decimal | None,
     atr_value: Decimal | None,
     equity_value: Decimal,
     drawdown_pct_value: Decimal,
-    ema_type: str,
+    ema_type: str = "ema",
     ema_period: str,
-    trend_ema_type: str,
+    trend_ema_type: str = "ema",
     trend_ema_period: str,
-    reference_ema_type: str,
-    reference_ema_period: str,
+    reference_ema_type: str = "ema",
+    reference_ema_period: str | None = None,
     big_ema_period: str | None,
     atr_period: str,
     tick_size: Decimal,
 ) -> list[str]:
+    reference_period = ema_period if reference_ema_period is None else str(reference_ema_period)
     lines = [
         f"时间: {_format_chart_timestamp(candle.ts)}",
         (
@@ -5637,11 +5697,11 @@ def _format_chart_hover_lines(
         reference_ema_value is not None
         and not (
             str(reference_ema_type).lower() == str(ema_type).lower()
-            and str(reference_ema_period) == str(ema_period)
+            and reference_period == str(ema_period)
         )
     ):
         lines.append(
-            f"{str(reference_ema_type).upper()}({reference_ema_period}): "
+            f"{str(reference_ema_type).upper()}({reference_period}): "
             f"{_format_price_by_tick_size(reference_ema_value, tick_size)}"
         )
     if atr_value is not None:

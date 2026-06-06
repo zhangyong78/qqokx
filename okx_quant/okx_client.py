@@ -959,21 +959,50 @@ class OkxRestClient:
             raise OkxApiError(f"{inst_id} 缺少标记价格，无法触发")
         return mark_price
 
-    def get_trigger_price(self, inst_id: str, price_type: TriggerPriceType) -> Decimal:
+    @staticmethod
+    def _trigger_price_from_ticker(ticker: OkxTicker, inst_id: str, price_type: TriggerPriceType) -> Decimal | None:
+        if price_type == "last":
+            if ticker.last is None:
+                raise OkxApiError(f"{inst_id} ????????????")
+            return ticker.last
+        if price_type == "mark":
+            return ticker.mark
+        if price_type == "index":
+            if ticker.index is None:
+                raise OkxApiError(f"{inst_id} ???????????")
+            return ticker.index
+        raise ValueError(f"Unsupported trigger price type: {price_type}")
+
+    def get_trigger_price(
+        self,
+        inst_id: str,
+        price_type: TriggerPriceType,
+        *,
+        environment: str | None = None,
+    ) -> Decimal:
+        env = str(environment or "").strip().lower()
+        if env:
+            self.ensure_public_ws_market_watch(inst_id, environment=env)
+            cached_payload = self.get_cached_public_ticker(inst_id, environment=env)
+            if cached_payload is not None:
+                _version, cached_ticker = cached_payload
+                cached_price = self._trigger_price_from_ticker(cached_ticker, inst_id, price_type)
+                if cached_price is not None:
+                    return cached_price
         ticker = self.get_ticker(inst_id)
         if price_type == "mark" and ticker.mark is None:
             return self.get_mark_price(inst_id)
         if price_type == "last":
             if ticker.last is None:
-                raise OkxApiError(f"{inst_id} 缺少最新成交价，无法触发")
+                raise OkxApiError(f"{inst_id} ????????????")
             return ticker.last
         if price_type == "mark":
             if ticker.mark is None:
-                raise OkxApiError(f"{inst_id} 缺少标记价格，无法触发")
+                raise OkxApiError(f"{inst_id} ???????????")
             return ticker.mark
         if price_type == "index":
             if ticker.index is None:
-                raise OkxApiError(f"{inst_id} 缺少指数价格，无法触发")
+                raise OkxApiError(f"{inst_id} ???????????")
             return ticker.index
         raise ValueError(f"Unsupported trigger price type: {price_type}")
 

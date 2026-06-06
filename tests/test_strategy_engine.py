@@ -40,6 +40,12 @@ from okx_quant.strategy_catalog import (
 )
 
 
+class _HistoryClient:
+    @staticmethod
+    def get_positions_history(credentials, *, environment: str, inst_types: tuple[str, ...], limit: int):  # noqa: ANN001,ARG004
+        return []
+
+
 class StrategyEngineTest(TestCase):
     def test_log_strategy_start_uses_actual_moving_average_labels(self) -> None:
         messages: list[str] = []
@@ -760,8 +766,13 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(next_trigger_r, 3)
 
     def test_engine_client_order_id_uses_ascii_only_tokens(self) -> None:
+        class _HistoryClient:
+            @staticmethod
+            def get_positions_history(credentials, *, environment: str, inst_types: tuple[str, ...], limit: int):  # noqa: ANN001,ARG004
+                return []
+
         engine = StrategyEngine(
-            None,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
             lambda *_: None,
             strategy_name="EMA 动态委托-多头",
             session_id="S01-测试",
@@ -835,8 +846,13 @@ class StrategyEngineTest(TestCase):
                     self._stopped = True
                 return self._stopped
 
+        class _HistoryClient:
+            @staticmethod
+            def get_positions_history(credentials, *, environment: str, inst_types: tuple[str, ...], limit: int):  # noqa: ANN001,ARG004
+                return []
+
         engine = StrategyEngine(
-            None,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
             messages.append,
             strategy_name="EMA 突破做多策略",
             session_id="S-startup-skip",
@@ -904,7 +920,7 @@ class StrategyEngineTest(TestCase):
         candles = self._make_candles([str(2000 + index) for index in range(260)])
 
         engine = StrategyEngine(
-            None,  # type: ignore[arg-type]
+            _HistoryClient(),  # type: ignore[arg-type]
             messages.append,
             strategy_name="EMA 突破做多策略",
             session_id="S-startup-chase",
@@ -1009,8 +1025,13 @@ class StrategyEngineTest(TestCase):
                     self._stopped = True
                 return self._stopped
 
+        class _HistoryClient:
+            @staticmethod
+            def get_positions_history(credentials, *, environment: str, inst_types: tuple[str, ...], limit: int):  # noqa: ANN001,ARG004
+                return []
+
         engine = StrategyEngine(
-            None,  # type: ignore[arg-type]
+            _HistoryClient(),  # type: ignore[arg-type]
             messages.append,
             strategy_name="EMA 动态委托-多头",
             session_id="S01",
@@ -1243,8 +1264,13 @@ class StrategyEngineTest(TestCase):
                 return True
 
         stop_stub = _StopStub()
+        class _HistoryClient:
+            @staticmethod
+            def get_positions_history(credentials, *, environment: str, inst_types: tuple[str, ...], limit: int):  # noqa: ANN001,ARG004
+                return []
+
         engine = StrategyEngine(
-            None,  # type: ignore[arg-type]
+            _HistoryClient(),  # type: ignore[arg-type]
             messages.append,
             strategy_name="EMA 鍔ㄦ€佸鎵?澶氬ご",
             session_id="S01",
@@ -2153,8 +2179,13 @@ class StrategyEngineTest(TestCase):
             entry_price=Decimal("75000"),
             entry_ts=0,
         )
+        class _HistoryClient:
+            @staticmethod
+            def get_positions_history(credentials, *, environment: str, inst_types: tuple[str, ...], limit: int):  # noqa: ANN001,ARG004
+                return []
+
         engine = StrategyEngine(
-            None,  # type: ignore[arg-type]
+            _HistoryClient(),  # type: ignore[arg-type]
             messages.append,
             strategy_name="EMA 动态委托-多头",
             session_id="S01",
@@ -2170,6 +2201,7 @@ class StrategyEngineTest(TestCase):
             return None
 
         engine._find_managed_position = _find_position  # type: ignore[method-assign]
+        engine._notify_exchange_dynamic_stop_close = lambda *args, **kwargs: None  # type: ignore[assignment]
 
         engine._monitor_exchange_dynamic_stop(
             None,  # type: ignore[arg-type]

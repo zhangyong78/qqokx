@@ -20,6 +20,9 @@ BacktestSizingMode = Literal["fixed_risk", "fixed_size", "risk_percent"]
 TakeProfitMode = Literal["fixed", "dynamic"]
 MtfReversalMode = Literal["ignore", "block_new_entries"]
 MovingAverageType = Literal["ema", "ma"]
+DailyFilterBoundary = Literal["exchange", "bjt_00", "bjt_08"]
+DailyFilterMode = Literal["disabled", "close_vs_ma", "weak_day"]
+DailyFilterScope = Literal["both", "long_only", "short_only"]
 
 
 def normalize_moving_average_type(value: str | None) -> MovingAverageType:
@@ -90,7 +93,7 @@ class StrategyConfig:
     trend_ema_type: MovingAverageType = "ema"
     big_ema_period: int = 233
     strategy_id: str = "ema_dynamic_order"
-    poll_seconds: float = 3.0
+    poll_seconds: float = 10.0
     risk_amount: Decimal | None = None
     trade_inst_id: str | None = None
     tp_sl_mode: TpSlMode = "exchange"
@@ -133,7 +136,15 @@ class StrategyConfig:
     mtf_filter_fast_ema_period: int = 21
     mtf_filter_slow_ema_period: int = 55
     mtf_reversal_mode: MtfReversalMode = "block_new_entries"
-    rail_candidate_ema_periods: tuple[int, ...] = (5, 8, 13, 21, 34, 55, 89, 144, 233)
+    daily_filter_enabled: bool = False
+    daily_filter_inst_id: str | None = None
+    daily_filter_bar: str | None = None
+    daily_filter_boundary: DailyFilterBoundary = "exchange"
+    daily_filter_mode: DailyFilterMode = "disabled"
+    daily_filter_scope: DailyFilterScope = "both"
+    daily_filter_ma_type: MovingAverageType = "ema"
+    daily_filter_period: int = 5
+    rail_candidate_ema_periods: tuple[int, ...] = (21, 34, 55, 89)
     rail_touch_atr_ratio: Decimal = Decimal("0.2")
     rail_bounce_atr_ratio: Decimal = Decimal("0.6")
     rail_bounce_confirm_bars: int = 3
@@ -143,6 +154,12 @@ class StrategyConfig:
     rail_switch_min_score_delta: Decimal = Decimal("8")
     rail_min_touches: int = 2
     rail_min_bounces: int = 1
+    rail_fast_gate_enabled: bool = True
+    rail_fast_gate_period: int = 21
+    rail_fast_min_gap_ema200_atr: Decimal = Decimal("5.0")
+    rail_fast_min_spread_trend_atr: Decimal = Decimal("1.5")
+    rail_fast_max_recent_range_atr: Decimal = Decimal("3.0")
+    rail_fast_recent_range_bars: int = 8
 
     def resolved_entry_reference_ema_period(self) -> int:
         if self.entry_reference_ema_period > 0:
@@ -171,6 +188,12 @@ class StrategyConfig:
 
     def resolved_mtf_filter_bar(self) -> str:
         return (self.mtf_filter_bar or self.bar).strip()
+
+    def resolved_daily_filter_inst_id(self) -> str:
+        return (self.daily_filter_inst_id or self.inst_id).strip()
+
+    def resolved_daily_filter_bar(self) -> str:
+        return (self.daily_filter_bar or "1D").strip()
 
     def resolved_backtest_entry_slippage_rate(self) -> Decimal:
         if self.backtest_entry_slippage_rate > 0 or self.backtest_exit_slippage_rate > 0:

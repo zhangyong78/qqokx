@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from okx_quant.engine import StrategyEngine
 
 T = TypeVar("T")
+_TERMINAL_ORDER_STATES = {"filled", "canceled", "cancelled", "mmp_canceled", "order_failed", "partially_failed"}
+_PRIVATE_ORDER_WS_WAIT_SECONDS = 0.2
 
 
 class EngineRetryPolicy:
@@ -103,6 +105,15 @@ class EngineRetryPolicy:
         cl_ord_id: str | None = None,
     ) -> OkxOrderStatus:
         key = ord_id or cl_ord_id or "-"
+        ws_status = self._get_order_from_private_ws(
+            credentials,
+            config,
+            inst_id=inst_id,
+            ord_id=ord_id,
+            cl_ord_id=cl_ord_id,
+        )
+        if ws_status is not None:
+            return ws_status
         return self.call_okx_read_with_retry(
             f"读取订单状态 {inst_id} {key}",
             lambda: self._engine._client.get_order(
@@ -114,12 +125,72 @@ class EngineRetryPolicy:
             ),
         )
 
-    def get_trigger_price(self, inst_id: str, price_type: str) -> Decimal:
+    def _get_order_from_private_ws(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+    ) -> OkxOrderStatus | None:
+        environment = str(config.environment or "").strip().lower()
+        if not environment:
+            return None
+        get_cached_status = getattr(self._engine._client, "get_cached_private_order_status", None)
+        wait_order_update = getattr(self._engine._client, "wait_private_order_update", None)
+        if not callable(get_cached_status) and not callable(wait_order_update):
+            return None
+
+        after_version = 0
+        if callable(get_cached_status):
+            cached = get_cached_status(
+                credentials,
+                environment=environment,
+                inst_id=inst_id,
+                ord_id=ord_id,
+                cl_ord_id=cl_ord_id,
+            )
+            if cached is not None:
+                after_version, cached_status = cached
+                if self._is_terminal_order_state(cached_status.state):
+                    return cached_status
+
+        if not callable(wait_order_update):
+            return None
+        waited = wait_order_update(
+            credentials,
+            environment=environment,
+            inst_id=inst_id,
+            ord_id=ord_id,
+            cl_ord_id=cl_ord_id,
+            after_version=after_version,
+            timeout=_PRIVATE_ORDER_WS_WAIT_SECONDS,
+        )
+        if waited is None:
+            return None
+        _version, waited_status = waited
+        return waited_status
+
+    @staticmethod
+    def _is_terminal_order_state(state: str | None) -> bool:
+        return str(state or "").strip().lower() in _TERMINAL_ORDER_STATES
+
+    def get_trigger_price(self, inst_id: str, price_type: str, *, environment: str | None = None) -> Decimal:
         """与 `OkxRestClient.get_trigger_price` 对齐：`mark` 在 ticker 缺字段时会回退到 public mark-price。"""
         pt = (price_type or "last").strip().lower()
         if pt in {"bid", "ask"}:
             # 客户端 `get_trigger_price` 未封装 bid/ask，仍走 ticker 单次读取
             def _read_ba() -> Decimal:
+                env = str(environment or "").strip().lower()
+                if env:
+                    self._engine._client.ensure_public_ws_market_watch(inst_id, environment=env)
+                    cached_payload = self._engine._client.get_cached_public_ticker(inst_id, environment=env)
+                    if cached_payload is not None:
+                        _version, cached_ticker = cached_payload
+                        raw_cached = cached_ticker.bid if pt == "bid" else cached_ticker.ask
+                        if raw_cached is not None:
+                            return raw_cached
                 ticker = self._engine._client.get_ticker(inst_id)
                 raw = ticker.bid if pt == "bid" else ticker.ask
                 if raw is None:
@@ -129,7 +200,7 @@ class EngineRetryPolicy:
             return self.call_okx_read_with_retry(f"读取触发价格 {inst_id} {price_type}", _read_ba)
         return self.call_okx_read_with_retry(
             f"读取触发价格 {inst_id} {price_type}",
-            lambda: self._engine._client.get_trigger_price(inst_id, pt),  # type: ignore[arg-type]
+            lambda: self._engine._client.get_trigger_price(inst_id, pt, environment=environment),  # type: ignore[arg-type]
         )
 
     def get_pending_orders(

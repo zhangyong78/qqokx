@@ -15,6 +15,7 @@ from okx_quant.backtest import (
     _create_open_position,
     _build_drawdown_curves,
     _build_equity_curve,
+    _combine_direction_filter_bias,
     _build_mtf_filter_bias,
     _build_period_stats,
     _determine_backtest_order_size,
@@ -79,6 +80,7 @@ from okx_quant.indicators import atr, ema
 from okx_quant.backtest import BacktestManualPosition, BacktestOpenPosition, BacktestReport, BacktestResult, BacktestTrade
 from okx_quant.models import Candle, Instrument, OrderPlan, StrategyConfig
 from okx_quant.strategy_catalog import (
+    STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
@@ -161,6 +163,7 @@ class BacktestTest(TestCase):
             Candle(1500, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
             Candle(2500, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
             Candle(3500, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(4500, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
         ]
         filter_candles = [
             Candle(1000, Decimal("110"), Decimal("111"), Decimal("109"), Decimal("110"), Decimal("1"), True),
@@ -171,8 +174,17 @@ class BacktestTest(TestCase):
         bias = _build_mtf_filter_bias(entry_candles, filter_candles, fast_period=1, slow_period=2)
 
         self.assertEqual(bias[1], "neutral")
-        self.assertEqual(bias[2], "short")
-        self.assertEqual(bias[3], "long")
+        self.assertEqual(bias[2], "neutral")
+        self.assertEqual(bias[3], "short")
+        self.assertEqual(bias[4], "long")
+
+    def test_combine_direction_filter_bias_requires_same_direction(self) -> None:
+        combined = _combine_direction_filter_bias(
+            ["long", "short", "neutral", "long"],
+            ["long", "neutral", "short", "short"],
+        )
+
+        self.assertEqual(combined, ["long", "neutral", "neutral", "neutral"])
 
     def test_run_backtest_loads_multi_timeframe_filter_candles(self) -> None:
         start_ts = 1711929600000
@@ -2594,6 +2606,14 @@ class BacktestTest(TestCase):
             mtf_filter_fast_ema_period=13,
             mtf_filter_slow_ema_period=34,
             mtf_reversal_mode="block_new_entries",
+            daily_filter_inst_id="BTC-USDT-SWAP",
+            daily_filter_bar="1D",
+            daily_filter_boundary="bjt_08",
+            daily_filter_enabled=True,
+            daily_filter_mode="close_vs_ma",
+            daily_filter_scope="long_only",
+            daily_filter_ma_type="ema",
+            daily_filter_period=5,
             trend_ema_slope_filter_enabled=True,
             trend_ema_slope_filter_lookback_bars=7,
             trend_ema_slope_filter_min_ratio=Decimal("-0.0005"),
@@ -2607,9 +2627,47 @@ class BacktestTest(TestCase):
         self.assertEqual(restored.mtf_filter_fast_ema_period, 13)
         self.assertEqual(restored.mtf_filter_slow_ema_period, 34)
         self.assertEqual(restored.mtf_reversal_mode, "block_new_entries")
+        self.assertEqual(restored.daily_filter_inst_id, "BTC-USDT-SWAP")
+        self.assertEqual(restored.daily_filter_bar, "1D")
+        self.assertEqual(restored.daily_filter_boundary, "bjt_08")
+        self.assertTrue(restored.daily_filter_enabled)
+        self.assertEqual(restored.daily_filter_mode, "close_vs_ma")
+        self.assertEqual(restored.daily_filter_scope, "long_only")
+        self.assertEqual(restored.daily_filter_ma_type, "ema")
+        self.assertEqual(restored.daily_filter_period, 5)
         self.assertTrue(restored.trend_ema_slope_filter_enabled)
         self.assertEqual(restored.trend_ema_slope_filter_lookback_bars, 7)
         self.assertEqual(restored.trend_ema_slope_filter_min_ratio, Decimal("-0.0005"))
+
+    def test_backtest_ui_serializes_adaptive_rail_defaults(self) -> None:
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="4H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("1.5"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+            risk_amount=Decimal("100"),
+        )
+
+        payload = backtest_ui_module._serialize_strategy_config(config)
+        restored = backtest_ui_module._deserialize_strategy_config(payload)
+
+        self.assertEqual(restored.rail_candidate_ema_periods, (21, 34, 55, 89))
+        self.assertTrue(restored.rail_fast_gate_enabled)
+        self.assertEqual(restored.rail_fast_gate_period, 21)
+        self.assertEqual(restored.rail_fast_min_gap_ema200_atr, Decimal("5.0"))
+        self.assertEqual(restored.rail_fast_min_spread_trend_atr, Decimal("1.5"))
+        self.assertEqual(restored.rail_fast_max_recent_range_atr, Decimal("3.0"))
+        self.assertEqual(restored.rail_fast_recent_range_bars, 8)
 
     def test_export_batch_backtest_report_writes_matrix_summary(self) -> None:
         with TemporaryDirectory() as temp_dir:

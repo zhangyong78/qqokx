@@ -37,6 +37,8 @@ TRADER_DESK_FILE_NAME = "trader_desk.json"
 POSITION_NOTES_FILE_NAME = "position_notes.json"
 STRATEGY_PARAMETER_GLOBAL_DEFAULTS_FILE_NAME = "strategy_parameter_global_defaults.json"
 STRATEGY_PARAMETER_DRAFTS_FILE_NAME = "strategy_parameter_drafts.json"
+STRATEGY_PROFILE_LIBRARY_FILE_NAME = "strategy_profile_library.json"
+STRATEGY_BUNDLE_EXPORT_DIR_NAME = "strategy_bundles"
 LINE_TRADING_DESK_ANNOTATIONS_FILE_NAME = "line_trading_desk_annotations.json"
 JOURNAL_ENTRIES_FILE_NAME = "journal_entries.json"
 BTC_RESEARCH_WORKBENCH_STATE_FILE_NAME = "btc_research_workbench_state.json"
@@ -218,6 +220,18 @@ def strategy_parameter_drafts_file_path(base_dir: Path | None = None) -> Path:
     if base_dir is not None:
         return Path(base_dir) / STRATEGY_PARAMETER_DRAFTS_FILE_NAME
     return state_dir_path() / STRATEGY_PARAMETER_DRAFTS_FILE_NAME
+
+
+def strategy_profile_library_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / STRATEGY_PROFILE_LIBRARY_FILE_NAME
+    return state_dir_path() / STRATEGY_PROFILE_LIBRARY_FILE_NAME
+
+
+def strategy_bundle_export_dir_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / "reports" / STRATEGY_BUNDLE_EXPORT_DIR_NAME
+    return reports_dir_path() / STRATEGY_BUNDLE_EXPORT_DIR_NAME
 
 
 def line_trading_desk_annotations_file_path(base_dir: Path | None = None) -> Path:

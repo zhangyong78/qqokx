@@ -17,15 +17,17 @@ from okx_quant.models import (
 )
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
+from okx_quant.timeframe import closed_candle_available_timestamps
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategies.ema_dynamic_multi_timeframe import filter_bias_allows_signal
 from okx_quant.strategies.adaptive_ema_rail import (
+    ADAPTIVE_RAIL_STATE_CONFIRMED,
     ADAPTIVE_RAIL_STATE_BROKEN,
     adaptive_rail_candidate_periods,
     adaptive_rail_minimum_candles,
     evaluate_adaptive_rail_signal,
-    is_adaptive_rail_hard_break,
+    is_adaptive_rail_hard_break_at,
 )
 from okx_quant.strategy_runtime_registry import (
     get_strategy_runtime_profile,
@@ -92,6 +94,7 @@ class BacktestTrade:
     exit_fee_type: str = "none"
     slippage_cost: Decimal = Decimal("0")
     funding_cost: Decimal = Decimal("0")
+    adaptive_rail_period: int | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +143,28 @@ class BacktestPeriodStat:
     end_equity: Decimal
     max_drawdown: Decimal
     max_drawdown_pct: Decimal
+
+
+@dataclass(frozen=True)
+class AdaptiveRailPeriodFrequency:
+    period: int
+    bars: int
+    share_pct: Decimal
+
+
+@dataclass(frozen=True)
+class AdaptiveRailBacktestStats:
+    evaluation_bars: int
+    confirmed_bars: int
+    confirmed_coverage_pct: Decimal
+    broken_state_bars: int
+    broken_state_pct: Decimal
+    dominant_rail_switches: int
+    average_dominant_rail_hold_bars: Decimal
+    max_dominant_rail_hold_bars: int
+    rail_broken_exit_count: int
+    rail_broken_exit_pct: Decimal
+    dominant_period_frequencies: tuple[AdaptiveRailPeriodFrequency, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -196,6 +221,13 @@ class BacktestResult:
     backtest_profile_summary: str = ""
     open_position: "BacktestOpenPosition | None" = None
     manual_positions: list["BacktestManualPosition"] = field(default_factory=list)
+    adaptive_rail_stats: AdaptiveRailBacktestStats | None = None
+    rail_fast_gate_enabled: bool = False
+    rail_fast_gate_period: int = 21
+    rail_fast_min_gap_ema200_atr: Decimal = Decimal("0")
+    rail_fast_min_spread_trend_atr: Decimal = Decimal("0")
+    rail_fast_max_recent_range_atr: Decimal = Decimal("0")
+    rail_fast_recent_range_bars: int = 8
 
 
 @dataclass(frozen=True)
@@ -217,6 +249,7 @@ class BacktestOpenPosition:
     r_multiple: Decimal
     entry_fee: Decimal = Decimal("0")
     funding_cost: Decimal = Decimal("0")
+    adaptive_rail_period: int | None = None
 
 
 @dataclass(frozen=True)
@@ -277,6 +310,7 @@ class _OpenPosition:
     exit_slippage_rate: Decimal = Decimal("0")
     slippage_rate: Decimal = Decimal("0")
     funding_rate: Decimal = Decimal("0")
+    adaptive_rail_period: int | None = None
 
 
 @dataclass
@@ -700,8 +734,10 @@ def _run_backtest_with_loaded_data(
     taker_fee_rate: Decimal = Decimal("0"),
     cross_higher_tf_bias: list[str] | None = None,
     mtf_filter_candles: list[Candle] | None = None,
+    direction_filter_bias: list[str] | None = None,
 ) -> BacktestResult:
     terminal_open_position: BacktestOpenPosition | None = None
+    adaptive_rail_stats: AdaptiveRailBacktestStats | None = None
     manual_positions: list[BacktestManualPosition] = []
     manual_handoffs = 0
     max_manual_positions = 0
@@ -716,6 +752,8 @@ def _run_backtest_with_loaded_data(
             int(config.mtf_filter_fast_ema_period),
             int(config.mtf_filter_slow_ema_period),
         )
+        if direction_filter_bias is not None:
+            mtf_filter_bias = _combine_direction_filter_bias(mtf_filter_bias, direction_filter_bias)
         trades, terminal_open_position = _run_dynamic_backtest(
             candles,
             instrument,
@@ -731,9 +769,10 @@ def _run_backtest_with_loaded_data(
             config,
             maker_fee_rate=maker_fee_rate,
             taker_fee_rate=taker_fee_rate,
+            mtf_filter_bias=direction_filter_bias,
         )
     elif family == "adaptive_ema_rail":
-        trades, terminal_open_position = _run_adaptive_rail_backtest(
+        trades, terminal_open_position, adaptive_rail_stats = _run_adaptive_rail_backtest(
             candles,
             instrument,
             config,
@@ -746,6 +785,7 @@ def _run_backtest_with_loaded_data(
             instrument,
             config,
             taker_fee_rate=taker_fee_rate,
+            direction_filter_bias=direction_filter_bias,
         )
     elif strategy_is_cross_family(config.strategy_id):
         trades, terminal_open_position = _run_cross_backtest(
@@ -859,6 +899,13 @@ def _run_backtest_with_loaded_data(
         backtest_profile_summary=config.backtest_profile_summary,
         open_position=terminal_open_position,
         manual_positions=manual_positions,
+        adaptive_rail_stats=adaptive_rail_stats,
+        rail_fast_gate_enabled=bool(config.rail_fast_gate_enabled),
+        rail_fast_gate_period=int(config.rail_fast_gate_period),
+        rail_fast_min_gap_ema200_atr=Decimal(str(config.rail_fast_min_gap_ema200_atr)),
+        rail_fast_min_spread_trend_atr=Decimal(str(config.rail_fast_min_spread_trend_atr)),
+        rail_fast_max_recent_range_atr=Decimal(str(config.rail_fast_max_recent_range_atr)),
+        rail_fast_recent_range_bars=int(config.rail_fast_recent_range_bars),
     )
 
 
@@ -1123,7 +1170,7 @@ def _build_cross_higher_tf_bias(
     minimum = ref_period + 2
     closes_h = [candle.close for candle in higher]
     ema_h = ema(closes_h, ref_period)
-    h_ts = [candle.ts for candle in higher]
+    h_ts = closed_candle_available_timestamps(higher)
     out: list[str] = []
     for pc in primary:
         j = bisect.bisect_right(h_ts, pc.ts) - 1
@@ -1155,7 +1202,7 @@ def _build_mtf_filter_bias(
     closes_h = [candle.close for candle in confirmed_filter_candles]
     fast_ema = ema(closes_h, fast_period)
     slow_ema = ema(closes_h, slow_period)
-    h_ts = [candle.ts for candle in confirmed_filter_candles]
+    h_ts = closed_candle_available_timestamps(confirmed_filter_candles)
     out: list[str] = []
     for entry_candle in entry_candles:
         j = bisect.bisect_right(h_ts, entry_candle.ts) - 1
@@ -1171,6 +1218,25 @@ def _build_mtf_filter_bias(
         else:
             out.append("neutral")
     return out
+
+
+def _combine_direction_filter_bias(primary: list[str], secondary: list[str]) -> list[str]:
+    size = min(len(primary), len(secondary))
+    combined: list[str] = []
+    for index in range(size):
+        first = primary[index]
+        second = secondary[index]
+        if first == second:
+            combined.append(first)
+        elif first == "neutral" or second == "neutral":
+            combined.append("neutral")
+        else:
+            combined.append("neutral")
+    if len(primary) > size:
+        combined.extend(primary[size:])
+    elif len(secondary) > size:
+        combined.extend(secondary[size:])
+    return combined
 
 
 def _required_mtf_filter_preload_candles(config: StrategyConfig) -> int:
@@ -1552,6 +1618,7 @@ def _run_ema55_slope_short_backtest(
     config: StrategyConfig,
     *,
     taker_fee_rate: Decimal = Decimal("0"),
+    direction_filter_bias: list[str] | None = None,
 ) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
     minimum = max(int(config.ema_period), int(config.trend_ema_period), int(config.atr_period), 2) + 1
     if len(candles) < minimum:
@@ -1620,6 +1687,9 @@ def _run_ema55_slope_short_backtest(
             or slope_ratio > entry_slope_threshold_ratio
         ):
             continue
+        if direction_filter_bias is not None and index < len(direction_filter_bias):
+            if not filter_bias_allows_signal(direction_filter_bias[index], "short"):
+                continue
 
         protection = build_protection_plan(
             instrument=instrument,
@@ -1673,7 +1743,7 @@ def _run_adaptive_rail_backtest(
     *,
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
-) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
+) -> tuple[list[BacktestTrade], BacktestOpenPosition | None, AdaptiveRailBacktestStats]:
     minimum = adaptive_rail_minimum_candles(config)
     if len(candles) < minimum + 1:
         raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum + 1} 根。")
@@ -1683,7 +1753,11 @@ def _run_adaptive_rail_backtest(
 
     closes = [candle.close for candle in candles]
     candidate_periods = adaptive_rail_candidate_periods(config)
-    ema_by_period = {period: ema(closes, period) for period in candidate_periods}
+    ema_periods = {period for period in candidate_periods if period > 0}
+    ema_periods.add(int(config.trend_ema_period))
+    if bool(config.rail_fast_gate_enabled) and int(config.rail_fast_gate_period) > 0:
+        ema_periods.add(int(config.rail_fast_gate_period))
+    ema_by_period = {period: ema(closes, period) for period in sorted(ema_periods)}
     ema200_values = ema_by_period.get(200) or ema(closes, 200)
     atr_values = atr(candles, config.atr_period)
     trades: list[BacktestTrade] = []
@@ -1691,9 +1765,11 @@ def _run_adaptive_rail_backtest(
     active_plan = None
     current_rail_period: int | None = None
     open_position_rail_period: int | None = None
+    stats_current_rail_period: int | None = None
     entries_on_current_rail = 0
     entry_sequence = 0
     dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
+    stats_history: list[tuple[str, int | None]] = []
 
     for index in range(trade_start_index, len(candles)):
         candle = candles[index]
@@ -1713,10 +1789,11 @@ def _run_adaptive_rail_backtest(
 
         if open_position is not None and open_position_rail_period in ema_by_period:
             atr_value = atr_values[index]
-            if is_adaptive_rail_hard_break(
-                candle,
-                ema_value=ema_by_period[open_position_rail_period][index],
-                atr_value=atr_value,
+            if is_adaptive_rail_hard_break_at(
+                candles,
+                index,
+                ema_values=ema_by_period[open_position_rail_period],
+                atr_values=atr_values,
                 config=config,
             ):
                 exit_price_raw = snap_to_increment(candle.close, instrument.tick_size, "nearest")
@@ -1742,6 +1819,21 @@ def _run_adaptive_rail_backtest(
                 open_position = None
                 open_position_rail_period = None
 
+        stats_snapshot = evaluate_adaptive_rail_signal(
+            candles,
+            index,
+            ema_by_period=ema_by_period,
+            ema200_values=ema200_values,
+            atr_values=atr_values,
+            config=config,
+            current_period=stats_current_rail_period,
+        )
+        if stats_snapshot.state == ADAPTIVE_RAIL_STATE_BROKEN:
+            stats_current_rail_period = None
+        elif stats_snapshot.dominant_period is not None:
+            stats_current_rail_period = stats_snapshot.dominant_period
+        stats_history.append((stats_snapshot.state, stats_snapshot.dominant_period))
+
         if active_plan is not None and open_position is None:
             plan_rail_period = current_rail_period
             filled_position = _try_fill_dynamic_order(
@@ -1763,6 +1855,7 @@ def _run_adaptive_rail_backtest(
                 time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
                 immediate_entry_fee_rate=taker_fee_rate,
                 immediate_entry_fee_type="taker",
+                adaptive_rail_period=plan_rail_period,
             )
             active_plan = None
             if filled_position is not None:
@@ -1822,7 +1915,91 @@ def _run_adaptive_rail_backtest(
             signal_candle_low=decision.signal_candle_low,
         )
 
-    return trades, _build_terminal_open_position(open_position, candles)
+    return trades, _build_terminal_open_position(open_position, candles), _build_adaptive_rail_backtest_stats(
+        stats_history,
+        trades,
+    )
+
+
+def _build_adaptive_rail_backtest_stats(
+    history: list[tuple[str, int | None]],
+    trades: list[BacktestTrade],
+) -> AdaptiveRailBacktestStats:
+    evaluation_bars = len(history)
+    confirmed_entries = [
+        (state, period) for state, period in history if state == ADAPTIVE_RAIL_STATE_CONFIRMED and period is not None
+    ]
+    confirmed_bars = len(confirmed_entries)
+    broken_state_bars = sum(1 for state, _ in history if state == ADAPTIVE_RAIL_STATE_BROKEN)
+    confirmed_coverage_pct = (
+        Decimal("0")
+        if evaluation_bars <= 0
+        else (Decimal(confirmed_bars) / Decimal(evaluation_bars)) * Decimal("100")
+    )
+    broken_state_pct = (
+        Decimal("0")
+        if evaluation_bars <= 0
+        else (Decimal(broken_state_bars) / Decimal(evaluation_bars)) * Decimal("100")
+    )
+
+    switch_count = 0
+    hold_lengths: list[int] = []
+    period_counts: dict[int, int] = {}
+    active_period: int | None = None
+    active_hold = 0
+
+    for _, period in confirmed_entries:
+        period_counts[period] = period_counts.get(period, 0) + 1
+        if active_period is None:
+            active_period = period
+            active_hold = 1
+            continue
+        if period == active_period:
+            active_hold += 1
+            continue
+        hold_lengths.append(active_hold)
+        switch_count += 1
+        active_period = period
+        active_hold = 1
+    if active_period is not None and active_hold > 0:
+        hold_lengths.append(active_hold)
+
+    average_hold = Decimal("0")
+    if hold_lengths:
+        average_hold = Decimal(sum(hold_lengths)) / Decimal(len(hold_lengths))
+    max_hold = max(hold_lengths, default=0)
+    frequencies = tuple(
+        AdaptiveRailPeriodFrequency(
+            period=period,
+            bars=bars,
+            share_pct=(Decimal(bars) / Decimal(confirmed_bars)) * Decimal("100"),
+        )
+        for period, bars in sorted(
+            period_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    )
+
+    rail_broken_exit_count = sum(1 for trade in trades if trade.exit_reason == "rail_broken")
+    rail_broken_exit_pct = (
+        Decimal("0")
+        if not trades
+        else (Decimal(rail_broken_exit_count) / Decimal(len(trades))) * Decimal("100")
+    )
+
+    return AdaptiveRailBacktestStats(
+        evaluation_bars=evaluation_bars,
+        confirmed_bars=confirmed_bars,
+        confirmed_coverage_pct=confirmed_coverage_pct,
+        broken_state_bars=broken_state_bars,
+        broken_state_pct=broken_state_pct,
+        dominant_rail_switches=switch_count,
+        average_dominant_rail_hold_bars=average_hold,
+        max_dominant_rail_hold_bars=max_hold,
+        rail_broken_exit_count=rail_broken_exit_count,
+        rail_broken_exit_pct=rail_broken_exit_pct,
+        dominant_period_frequencies=frequencies,
+    )
 
 
 def _run_dynamic_backtest(
@@ -1997,6 +2174,7 @@ def _run_dynamic_backtest(
             r_multiple=r_multiple,
             entry_fee=entry_fee,
             funding_cost=funding_cost,
+            adaptive_rail_period=open_position.adaptive_rail_period,
         )
 
     return trades, terminal_open_position
@@ -2038,6 +2216,7 @@ def _build_terminal_open_position(
         r_multiple=r_multiple,
         entry_fee=entry_fee,
         funding_cost=funding_cost,
+        adaptive_rail_period=open_position.adaptive_rail_period,
     )
 
 
@@ -2403,6 +2582,7 @@ def _create_open_position(
     filled_entry_price: Decimal | None = None,
     entry_path_price: Decimal | None = None,
     apply_entry_slippage: bool = True,
+    adaptive_rail_period: int | None = None,
 ) -> _OpenPosition:
     strategy_entry_price = entry_price_raw
     if filled_entry_price is not None:
@@ -2455,6 +2635,7 @@ def _create_open_position(
         exit_slippage_rate=exit_slippage_rate,
         slippage_rate=exit_slippage_rate,
         funding_rate=funding_rate if instrument.inst_type == "SWAP" else Decimal("0"),
+        adaptive_rail_period=adaptive_rail_period,
     )
     if current_take_profit is None and dynamic_take_profit_enabled:
         open_position.take_profit = _dynamic_trigger_price(open_position, next_dynamic_trigger_r)
@@ -2623,6 +2804,7 @@ def _try_fill_dynamic_order(
     time_stop_break_even_bars: int = 0,
     immediate_entry_fee_rate: Decimal = Decimal("0"),
     immediate_entry_fee_type: str = "none",
+    adaptive_rail_period: int | None = None,
 ) -> _OpenPosition | None:
     open_price = snap_to_increment(candle.open, instrument.tick_size, "nearest")
     marketable_at_open = (
@@ -2670,6 +2852,7 @@ def _try_fill_dynamic_order(
         time_stop_break_even_enabled=time_stop_break_even_enabled,
         time_stop_break_even_bars=time_stop_break_even_bars,
         apply_entry_slippage=False,
+        adaptive_rail_period=adaptive_rail_period,
     )
 
 
@@ -2916,6 +3099,7 @@ def _build_closed_trade(
         exit_fee_type=exit_fee_type,
         slippage_cost=slippage_cost,
         funding_cost=funding_cost,
+        adaptive_rail_period=position.adaptive_rail_period,
     )
 
 
@@ -3398,7 +3582,7 @@ def _append_backtest_strategy_notes(
                 f"高周期EMA{result.mtf_filter_fast_ema_period}/EMA{result.mtf_filter_slow_ema_period} | "
                 f"反转处理={reversal_text}"
             )
-        lines.append(f"挂单参考线：{reference_label}")
+        lines.append(f"挂单参考EMA：{reference_label}")
         lines.append(
             f"委托规则：每根新 K 线按最新 {reference_label} 重新撤旧挂新；若新 K 线开盘已优于挂单价，则按开盘价即时成交，否则仅在盘中触及挂单价时成交，未成交委托不跨 K 线保留"
         )
@@ -3413,6 +3597,37 @@ def _append_backtest_strategy_notes(
         lines.append(
             "委托规则：主导轨道至少完成两次有效反弹后，每根新 K 线按当前主导 EMA 重新挂回踩买单；若轨道发生有效跌破，则按轨道失效退出或停止继续挂单。"
         )
+        if result.adaptive_rail_stats is not None:
+            stats = result.adaptive_rail_stats
+            lines.append(
+                "轨道统计："
+                f"确认轨道 {stats.confirmed_bars}/{stats.evaluation_bars} 根 "
+                f"({format_decimal_fixed(stats.confirmed_coverage_pct, 2)}%) | "
+                f"轨道切换 {stats.dominant_rail_switches} 次 | "
+                f"失效状态 {stats.broken_state_bars} 根 "
+                f"({format_decimal_fixed(stats.broken_state_pct, 2)}%)"
+            )
+            lines.append(
+                "主导轨道持续："
+                f"平均 {format_decimal_fixed(stats.average_dominant_rail_hold_bars, 2)} 根 | "
+                f"最长 {stats.max_dominant_rail_hold_bars} 根 | "
+                f"rail_broken 平仓 {stats.rail_broken_exit_count} 次 "
+                f"({format_decimal_fixed(stats.rail_broken_exit_pct, 2)}%)"
+            )
+            if stats.dominant_period_frequencies:
+                top_periods = " | ".join(
+                    f"EMA{item.period} {item.bars} 根 ({format_decimal_fixed(item.share_pct, 2)}%)"
+                    for item in stats.dominant_period_frequencies[:5]
+                )
+                lines.append(f"主导EMA分布：{top_periods}")
+        if result.rail_fast_gate_enabled:
+            lines.append(
+                "EMA21门槛："
+                f"EMA{result.rail_fast_gate_period} 仅在 "
+                f"close-EMA200 >= {format_decimal_fixed(result.rail_fast_min_gap_ema200_atr, 2)} ATR、"
+                f"EMA{result.rail_fast_gate_period}-{trend_label} >= {format_decimal_fixed(result.rail_fast_min_spread_trend_atr, 2)} ATR、"
+                f"最近 {result.rail_fast_recent_range_bars} 根振幅 <= {format_decimal_fixed(result.rail_fast_max_recent_range_atr, 2)} ATR 时允许参与竞争"
+            )
         _append_backtest_dynamic_take_profit_lines(lines, result)
         lines.append(f"每条轨道最多开仓次数：{result.max_entries_per_trend if result.max_entries_per_trend > 0 else '不限'}")
         lines.append("同K线撮合：沿用动态委托撮合口径，未成交委托不跨 K 线保留。")

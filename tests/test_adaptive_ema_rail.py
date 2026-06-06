@@ -2,12 +2,13 @@ from decimal import Decimal
 from unittest import TestCase
 
 from okx_quant.indicators import atr, ema
-from okx_quant.backtest import run_backtest
+from okx_quant.backtest import format_backtest_report, run_backtest
 from okx_quant.models import Candle, Instrument, StrategyConfig
 from okx_quant.strategies.adaptive_ema_rail import (
     adaptive_rail_candidate_periods,
     evaluate_adaptive_rail_signal,
     is_adaptive_rail_hard_break,
+    is_adaptive_rail_hard_break_at,
 )
 from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
@@ -100,6 +101,32 @@ class AdaptiveEmaRailTest(TestCase):
         self.assertIsNotNone(snapshot.metrics)
         self.assertGreaterEqual(snapshot.metrics.bounce_count, 2)
 
+    def test_fast_rail_gate_can_block_ema21_signal(self) -> None:
+        config = _make_config(
+            rail_candidate_ema_periods=(21,),
+            rail_fast_gate_enabled=True,
+            rail_fast_gate_period=21,
+            rail_fast_min_gap_ema200_atr=Decimal("50"),
+            rail_fast_min_spread_trend_atr=Decimal("0"),
+            rail_fast_max_recent_range_atr=Decimal("0"),
+        )
+        candles = _uptrend_candles()
+        closes = [candle.close for candle in candles]
+        ema_by_period = {
+            21: ema(closes, 21),
+            55: ema(closes, 55),
+        }
+        snapshot = evaluate_adaptive_rail_signal(
+            candles,
+            len(candles) - 2,
+            ema_by_period=ema_by_period,
+            ema200_values=ema(closes, 200),
+            atr_values=atr(candles, config.atr_period),
+            config=config,
+        )
+
+        self.assertIsNone(snapshot.decision.signal)
+
     def test_hard_break_uses_close_below_ema_minus_atr_band(self) -> None:
         config = _make_config(rail_break_atr_ratio=Decimal("1"))
         candle = Candle(
@@ -117,6 +144,35 @@ class AdaptiveEmaRailTest(TestCase):
                 candle,
                 ema_value=Decimal("100"),
                 atr_value=Decimal("1"),
+                config=config,
+            )
+        )
+
+    def test_hard_break_can_trigger_after_consecutive_failed_reclaims(self) -> None:
+        config = _make_config(rail_break_atr_ratio=Decimal("3"), rail_reclaim_bars=2)
+        candles = [
+            Candle(ts=0, open=Decimal("100"), high=Decimal("101"), low=Decimal("99"), close=Decimal("100.5"), volume=Decimal("1"), confirmed=True),
+            Candle(ts=1, open=Decimal("100"), high=Decimal("100.5"), low=Decimal("98.5"), close=Decimal("99.4"), volume=Decimal("1"), confirmed=True),
+            Candle(ts=2, open=Decimal("99.4"), high=Decimal("100"), low=Decimal("98"), close=Decimal("99.3"), volume=Decimal("1"), confirmed=True),
+        ]
+        ema_values = [Decimal("100"), Decimal("100"), Decimal("100")]
+        atr_values = [Decimal("1"), Decimal("1"), Decimal("1")]
+
+        self.assertFalse(
+            is_adaptive_rail_hard_break_at(
+                candles,
+                1,
+                ema_values=ema_values,
+                atr_values=atr_values,
+                config=config,
+            )
+        )
+        self.assertTrue(
+            is_adaptive_rail_hard_break_at(
+                candles,
+                2,
+                ema_values=ema_values,
+                atr_values=atr_values,
                 config=config,
             )
         )
@@ -147,3 +203,28 @@ class AdaptiveEmaRailTest(TestCase):
 
         self.assertEqual(result.strategy_id, STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID)
         self.assertGreater(len(result.candles), 0)
+        self.assertIsNotNone(result.adaptive_rail_stats)
+        assert result.adaptive_rail_stats is not None
+        self.assertGreater(result.adaptive_rail_stats.evaluation_bars, 0)
+        self.assertGreaterEqual(result.adaptive_rail_stats.confirmed_bars, 0)
+        self.assertGreaterEqual(result.adaptive_rail_stats.dominant_rail_switches, 0)
+
+    def test_adaptive_rail_report_includes_structure_stats(self) -> None:
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        result = run_backtest(
+            _DummyBacktestClient(_uptrend_candles(), instrument),
+            _make_config(risk_amount=Decimal("100"), order_size=Decimal("0")),
+            candle_limit=0,
+        )
+
+        report_text = format_backtest_report(result)
+        self.assertIn("轨道统计：", report_text)
+        self.assertIn("主导轨道持续：", report_text)
+        self.assertIn("主导EMA分布：", report_text)

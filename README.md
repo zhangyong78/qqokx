@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.12`
+当前版本：`v0.6.13`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -19,7 +19,7 @@
 
 ## 近期更新
 
-`v0.6.12` 之后这一轮版本内容比较集中，重点新增和调整如下：
+`v0.6.13` 之后这一轮版本内容比较集中，重点新增和调整如下：
 
 - 新增 `EMA55 斜率做空` 策略：
   - 规则：`EMA55` 单根斜率比例小于等于阈值时开空，斜率重新转正时平仓
@@ -35,6 +35,10 @@
   - launcher / backtest / engine / router 开始共用 schema / registry，不再靠大量 `if strategy_id == ...`
 - 修复了新策略接入引发的启动崩溃问题，并补充了启动烟测、策略切换回归和运行路由测试
 - 回测说明、参数矩阵、标题文案、方向偏好等逻辑开始按 runtime family 统一分流，减少主程序与具体策略的强耦合
+- 实盘轮询链路补了三项轻量扩容优化：
+  - 默认轮询间隔从 `3s` 调整为 `10s`
+  - 新增 `market_data_hub`，同进程内相同 `instId + bar` 的 K 线共享读取
+  - 触发价优先走 `公共 WS ticker`，订单状态优先走 `私有 WS orders`，失败时自动回退 `REST`
 
 主应用代码位于 [okx_quant](/D:/qqokx/okx_quant)，研究与统计相关代码位于 [research](/D:/qqokx/research)、[stats](/D:/qqokx/stats)、[export](/D:/qqokx/export)。
 
@@ -94,6 +98,24 @@ python main.py
 ```
 
 应用入口位于 [main.py](/D:/qqokx/main.py)，数据目录逻辑位于 [okx_quant/app_paths.py](/D:/qqokx/okx_quant/app_paths.py)。
+
+## 实盘运行建议
+
+当前策略引擎仍然是“多会话 + 定时轮询”的架构，但已经补上了共享行情与 WS 优先的轻量优化，适合中低频实盘。
+
+- 默认轮询：新建策略和保护任务默认 `poll_seconds=10`
+- K 线读取：相同 `instId + bar` 在同一进程内共享
+- 触发价读取：优先 `公共 WS ticker`，失败时回退 `REST`
+- 订单状态：优先 `私有 WS orders`，失败时回退 `REST`
+- 持仓 / 账户概览：优先 `私有 WS positions/account`，失败时回退 `REST`
+
+对 `2核 2G` 服务器的建议边界：
+
+- `2 套 API + 1H + 20` 个左右 session：可作为推荐起步规模
+- `5 套 API + 5 币种 + 1H + 多空`：可以尝试，但建议先灰度放量
+- 再叠加一整套独立 `4H` session：不建议直接在 `2核 2G` 上长期运行
+
+如果是 `1H` 主策略带 `4H` 过滤，而不是再额外开一套完整 `4H` 会话，资源压力会更小一些。
 
 ## 数据目录
 
@@ -237,8 +259,8 @@ python -m pytest tests/test_backtest.py
 建议额外执行：
 
 ```powershell
-python -m unittest tests.test_okx_client_orders tests.test_arbitrage tests.test_position_protection -v
-python -m py_compile D:\qqokx\okx_quant\arbitrage_ui.py D:\qqokx\okx_quant\okx_client.py D:\qqokx\okx_quant\ui_positions.py D:\qqokx\okx_quant\ui_strategy_sessions.py
+python -m unittest tests.test_okx_client_orders tests.test_engine_retry_policy tests.test_market_data_hub tests.test_arbitrage tests.test_position_protection -v
+python -m py_compile D:\qqokx\okx_quant\arbitrage_ui.py D:\qqokx\okx_quant\okx_client.py D:\qqokx\okx_quant\engine_retry_policy.py D:\qqokx\okx_quant\market_data_hub.py D:\qqokx\okx_quant\ui_positions.py D:\qqokx\okx_quant\ui_strategy_sessions.py
 ```
 
 测试文件位于 [tests](/D:/qqokx/tests)。
@@ -261,7 +283,8 @@ python -m py_compile D:\qqokx\okx_quant\arbitrage_ui.py D:\qqokx\okx_quant\okx_c
 
 - `1H` 级主策略、K 线驱动、普通扫描：继续使用 `REST`
 - `订单状态 / 成交回报 / 持仓变化`：优先使用 `私有 WS`
-- `本地现货套利窗口盘口`：优先使用 `公共 WS`，失败时自动回退 `REST`
+- `触发价 / 公共 ticker / 本地现货套利窗口盘口`：优先使用 `公共 WS`，失败时自动回退 `REST`
+- `同一币种同一周期 K 线`：优先使用进程内共享 `market_data_hub`，底层仍按需回退 `REST`
 
 这样可以尽量减少服务器端复杂度，同时把最有价值的“交易后状态”先提速。
 
@@ -306,7 +329,7 @@ scripts\release_one_click.bat
   ：服务器升级操作清单，适合按实盘环境灰度启用私有 WS 加速
 - [软件开发指南.md](/D:/qqokx/软件开发指南.md)
   ：开发维护说明，已补充策略 schema / runtime registry、EMA55 斜率做空、回测与 UI 接入约定
-- [版本开发日志_v0.6.12.md](/D:/qqokx/版本开发日志_v0.6.12.md)
+- [版本开发日志_v0.6.13.md](/D:/qqokx/版本开发日志_v0.6.13.md)
   ：本轮版本开发日志，归档 EMA55 策略、研究报告、B 方案结构重构与验证结果
 - [reports/strategy_ui_schema_b_impl.md](/D:/qqokx/reports/strategy_ui_schema_b_impl.md)
   ：B 方案实施说明，记录 schema / registry 这一轮已经解掉的耦合和剩余尾项

@@ -72,6 +72,7 @@ from okx_quant.log_utils import (
     read_daily_log_tail,
     strategy_session_log_file_path,
 )
+from okx_quant.market_data_hub import MarketDataHub
 from okx_quant.models import (
     Candle,
     Credentials,
@@ -149,6 +150,7 @@ from okx_quant.position_protection import (
 )
 from okx_quant.protection_replay_ui import ProtectionReplayLaunchState, ProtectionReplayWindow
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, format_decimal_fixed, snap_to_increment
+from okx_quant.strategy_profiles import StrategyProfile, build_strategy_profile_from_config
 from okx_quant.signal_monitor_ui import SignalMonitorWindow
 from okx_quant.signal_replay_mock_ui import SignalReplayMockWindow
 from okx_quant.trader_desk import (
@@ -1582,6 +1584,33 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             payload.get("mtf_reversal_mode"),
             str(_strategy_config_default("mtf_reversal_mode")),
         ),
+        daily_filter_inst_id=_coerce_snapshot_optional_text(payload.get("daily_filter_inst_id")),
+        daily_filter_bar=_coerce_snapshot_optional_text(payload.get("daily_filter_bar")),
+        daily_filter_boundary=_coerce_snapshot_text(
+            payload.get("daily_filter_boundary"),
+            str(_strategy_config_default("daily_filter_boundary")),
+        ),
+        daily_filter_enabled=_coerce_snapshot_bool(
+            payload.get("daily_filter_enabled"),
+            bool(_strategy_config_default("daily_filter_enabled")),
+        ),
+        daily_filter_mode=_coerce_snapshot_text(
+            payload.get("daily_filter_mode"),
+            str(_strategy_config_default("daily_filter_mode")),
+        ),
+        daily_filter_scope=_coerce_snapshot_text(
+            payload.get("daily_filter_scope"),
+            str(_strategy_config_default("daily_filter_scope")),
+        ),
+        daily_filter_ma_type=_coerce_snapshot_text(
+            payload.get("daily_filter_ma_type"),
+            str(_strategy_config_default("daily_filter_ma_type")),
+        ),
+        daily_filter_period=_coerce_snapshot_int(
+            payload.get("daily_filter_period"),
+            int(_strategy_config_default("daily_filter_period")),
+            minimum=1,
+        ),
     )
 
 
@@ -1623,6 +1652,16 @@ def _format_entry_float(value: float) -> str:
 
 
 def _build_strategy_template_payload(session: StrategySession) -> dict[str, object]:
+    strategy_profile = build_strategy_profile_from_config(
+        profile_id=f"{session.strategy_id}:{session.symbol}:{session.api_name or '-'}",
+        profile_name=f"{session.strategy_name} | {session.symbol}",
+        strategy_id=session.strategy_id,
+        symbol=session.symbol,
+        config=session.config,
+        api_name=session.api_name,
+        direction_label=session.direction_label,
+        run_mode_label=session.run_mode_label,
+    )
     return {
         "schema_version": STRATEGY_TEMPLATE_SCHEMA_VERSION,
         "exported_at": datetime.now().isoformat(timespec="seconds"),
@@ -1635,10 +1674,21 @@ def _build_strategy_template_payload(session: StrategySession) -> dict[str, obje
         "symbol": session.symbol,
         "includes_credentials": False,
         "config_snapshot": _serialize_strategy_config_snapshot(session.config),
+        "strategy_profile": strategy_profile.to_payload(),
     }
 
 
 def _build_strategy_template_payload_from_record(record: StrategyTemplateRecord) -> dict[str, object]:
+    strategy_profile = build_strategy_profile_from_config(
+        profile_id=f"{record.strategy_id}:{record.symbol}:{record.api_name or '-'}",
+        profile_name=f"{record.strategy_name} | {record.symbol}",
+        strategy_id=record.strategy_id,
+        symbol=record.symbol,
+        config=record.config,
+        api_name=record.api_name,
+        direction_label=record.direction_label,
+        run_mode_label=record.run_mode_label,
+    )
     return {
         "schema_version": STRATEGY_TEMPLATE_SCHEMA_VERSION,
         "exported_at": datetime.now().isoformat(timespec="seconds"),
@@ -1651,6 +1701,7 @@ def _build_strategy_template_payload_from_record(record: StrategyTemplateRecord)
         "symbol": record.symbol,
         "includes_credentials": False,
         "config_snapshot": _serialize_strategy_config_snapshot(record.config),
+        "strategy_profile": strategy_profile.to_payload(),
     }
 
 
@@ -1805,7 +1856,26 @@ def _strategy_template_bundle_from_payload(
         return None
     raw_items = payload.get("strategies")
     if not isinstance(raw_items, list) or not raw_items:
-        return None
+        raw_profiles = payload.get("profiles")
+        if isinstance(raw_profiles, list) and raw_profiles:
+            converted_items: list[dict[str, object]] = []
+            for raw_profile in raw_profiles:
+                profile = StrategyProfile.from_payload(raw_profile)
+                converted_items.append(
+                    {
+                        "api_name": profile.api_name,
+                        "strategy_id": profile.strategy_id,
+                        "strategy_name": profile.profile_name,
+                        "direction_label": profile.direction_label,
+                        "run_mode_label": profile.run_mode_label,
+                        "symbol": profile.symbol,
+                        "config_snapshot": dict(profile.config_snapshot),
+                        "strategy_profile": profile.to_payload(),
+                    }
+                )
+            raw_items = converted_items
+        else:
+            return None
     defaults = payload.get("defaults")
     default_block = defaults if isinstance(defaults, dict) else {}
     default_total_quota = str(default_block.get("total_quota", "1") or "1")
@@ -2711,6 +2781,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.root.minsize(1420, 900)
 
         self.client = OkxRestClient()
+        self.market_data_hub = MarketDataHub(self.client, logger=self._enqueue_log)
         self.deribit_client = DeribitRestClient()
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.instruments: list[Instrument] = []
@@ -11787,6 +11858,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 self._sync_strategy_history_from_session(session)
             session.engine.stop()
             session.engine.wait_stopped(timeout=1.5)
+        self.market_data_hub.stop()
         self._protection_manager.stop_all()
         self._close_strategy_history_window()
         self._close_strategy_book_window()

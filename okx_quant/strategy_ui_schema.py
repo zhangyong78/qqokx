@@ -83,6 +83,12 @@ STRATEGY_UI_SCHEMAS: dict[str, StrategyUiSchema] = {
     ),
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID: StrategyUiSchema(
         strategy_id=STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+        parameter_defaults={
+            _SCOPE_BACKTEST: {
+                "bar": "4H",
+                "atr_stop_multiplier": "1.5",
+            },
+        },
         supports_dynamic_take_profit=True,
     ),
     STRATEGY_EMA5_EMA8_ID: StrategyUiSchema(

@@ -92,7 +92,22 @@ def evaluate_adaptive_rail_signal(
         for period in adaptive_rail_candidate_periods(config)
         if period in ema_by_period
     ]
-    qualifying = [item for item in metrics_by_period if _metrics_confirmed(item, config)]
+    trend_ema_values = ema_by_period.get(int(config.trend_ema_period))
+    qualifying = [
+        item
+        for item in metrics_by_period
+        if _metrics_confirmed(item, config)
+        and _fast_period_gate_allows(
+            candles,
+            index,
+            period=item.period,
+            ema_values=ema_by_period[item.period],
+            trend_ema_values=trend_ema_values,
+            ema200_values=ema200_values,
+            atr_values=atr_values,
+            config=config,
+        )
+    ]
     if not qualifying:
         best = max(metrics_by_period, key=lambda item: item.score, default=None)
         return _snapshot_without_signal(
@@ -167,6 +182,29 @@ def is_adaptive_rail_hard_break(
     if atr_value is None or atr_value <= 0:
         return False
     return candle.close < ema_value - (Decimal(config.rail_break_atr_ratio) * atr_value)
+
+
+def is_adaptive_rail_hard_break_at(
+    candles: list[Candle],
+    index: int,
+    *,
+    ema_values: list[Decimal],
+    atr_values: list[Decimal | None],
+    config: StrategyConfig,
+) -> bool:
+    atr_value = atr_values[index]
+    if is_adaptive_rail_hard_break(
+        candles[index],
+        ema_value=ema_values[index],
+        atr_value=atr_value,
+        config=config,
+    ):
+        return True
+    reclaim_bars = max(int(config.rail_reclaim_bars), 0)
+    if reclaim_bars <= 1 or index - reclaim_bars + 1 < 0:
+        return False
+    start = index - reclaim_bars + 1
+    return all(candles[bar_index].close < ema_values[bar_index] for bar_index in range(start, index + 1))
 
 
 def _snapshot_without_signal(
@@ -252,7 +290,13 @@ def _score_period(
 
         if _is_fake_break(candles, bar_index, index, ema_values, atr_values, config):
             fake_break_count += 1
-        if is_adaptive_rail_hard_break(candle, ema_value=ema_value, atr_value=atr_value, config=config):
+        if is_adaptive_rail_hard_break_at(
+            candles,
+            bar_index,
+            ema_values=ema_values,
+            atr_values=atr_values,
+            config=config,
+        ):
             hard_break_count += 1
 
     slope_past_index = max(start, index - ADAPTIVE_RAIL_SLOPE_LOOKBACK)
@@ -270,11 +314,11 @@ def _score_period(
         slope_strength=slope_strength,
         last_touch_age=last_touch_age,
     )
-    latest_atr = atr_values[index]
-    latest_hard_break = is_adaptive_rail_hard_break(
-        candles[index],
-        ema_value=ema_values[index],
-        atr_value=latest_atr,
+    latest_hard_break = is_adaptive_rail_hard_break_at(
+        candles,
+        index,
+        ema_values=ema_values,
+        atr_values=atr_values,
         config=config,
     )
     return AdaptiveRailMetrics(
@@ -297,6 +341,54 @@ def _metrics_confirmed(metrics: AdaptiveRailMetrics, config: StrategyConfig) -> 
         and metrics.bounce_count >= int(config.rail_min_bounces)
         and metrics.slope_strength > 0
     )
+
+
+def _fast_period_gate_allows(
+    candles: list[Candle],
+    index: int,
+    *,
+    period: int,
+    ema_values: list[Decimal],
+    trend_ema_values: list[Decimal] | None,
+    ema200_values: list[Decimal],
+    atr_values: list[Decimal | None],
+    config: StrategyConfig,
+) -> bool:
+    if not bool(config.rail_fast_gate_enabled):
+        return True
+    if period != int(config.rail_fast_gate_period):
+        return True
+
+    atr_value = atr_values[index]
+    if atr_value is None or atr_value <= 0:
+        return False
+
+    min_gap_ema200 = Decimal(config.rail_fast_min_gap_ema200_atr)
+    if min_gap_ema200 > 0:
+        gap_ema200_atr = (candles[index].close - ema200_values[index]) / atr_value
+        if gap_ema200_atr < min_gap_ema200:
+            return False
+
+    min_spread_trend = Decimal(config.rail_fast_min_spread_trend_atr)
+    if min_spread_trend > 0:
+        if trend_ema_values is None:
+            return False
+        spread_trend_atr = (ema_values[index] - trend_ema_values[index]) / atr_value
+        if spread_trend_atr < min_spread_trend:
+            return False
+
+    max_recent_range = Decimal(config.rail_fast_max_recent_range_atr)
+    if max_recent_range > 0:
+        range_bars = max(int(config.rail_fast_recent_range_bars), 1)
+        start = max(0, index - range_bars + 1)
+        window = candles[start : index + 1]
+        if not window:
+            return False
+        recent_range_atr = (max(item.high for item in window) - min(item.low for item in window)) / atr_value
+        if recent_range_atr > max_recent_range:
+            return False
+
+    return True
 
 
 def _respect_score(
@@ -344,10 +436,11 @@ def _touch_bounced(
     target = ema_values[touch_index] + (Decimal(config.rail_bounce_atr_ratio) * touch_atr)
     for bar_index in range(touch_index, end_index + 1):
         atr_value = atr_values[bar_index]
-        if is_adaptive_rail_hard_break(
-            candles[bar_index],
-            ema_value=ema_values[bar_index],
-            atr_value=atr_value,
+        if is_adaptive_rail_hard_break_at(
+            candles,
+            bar_index,
+            ema_values=ema_values,
+            atr_values=atr_values,
             config=config,
         ):
             return False

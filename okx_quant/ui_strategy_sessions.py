@@ -1117,6 +1117,7 @@ class UiStrategySessionsMixin:
         engine = StrategyEngine(
             self.client,
             chart_line_logger,
+            market_data_hub=self.market_data_hub,
             notifier=self._build_notifier(config, (sess.api_name if sess else "") or None),
             strategy_name="划线交易",
             session_id=session_id,
@@ -1200,6 +1201,7 @@ class UiStrategySessionsMixin:
         engine = StrategyEngine(
             self.client,
             lambda message: self.root.after(0, lambda m=message: _desk_local_exit_log(m)),
+            market_data_hub=self.market_data_hub,
             notifier=self._build_notifier(config, api_profile),
             strategy_name=f"{session_log_tag} 划线交易台",
             session_id=session_log_tag,
@@ -4560,6 +4562,7 @@ class UiStrategySessionsMixin:
         return StrategyEngine(
             self.client,
             session_logger,
+            market_data_hub=self.market_data_hub,
             notifier=notifier,
             strategy_name=strategy_name,
             session_id=session_id,

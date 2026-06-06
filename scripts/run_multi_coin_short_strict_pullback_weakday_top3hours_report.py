@@ -1,0 +1,663 @@
+from __future__ import annotations
+
+import base64
+import html
+import io
+import json
+import math
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from okx_quant.candle_cache import load_candle_cache
+from okx_quant.timeframe import closed_candle_available_timestamps
+
+
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
+
+
+REPORT_DIR = ROOT / "reports"
+ENTRY_BAR = "1H"
+FILTER_BAR = "1D"
+SOURCE_RECOMMEND_CSV = REPORT_DIR / "multi_coin_short_recommendation_table.csv"
+SOURCE_STRICT_CSV = REPORT_DIR / "multi_coin_short_strict_pullback_10u_by_coin.csv"
+SOURCE_WEAKDAY6_CSV = REPORT_DIR / "multi_coin_short_strict_pullback_weakday_hourfilter_by_coin.csv"
+
+HTML_PATH = REPORT_DIR / "multi_coin_short_strict_pullback_weakday_top3hours_report.html"
+CSV_PATH = REPORT_DIR / "multi_coin_short_strict_pullback_weakday_top3hours_by_coin.csv"
+TRADES_CSV_PATH = REPORT_DIR / "multi_coin_short_strict_pullback_weakday_top3hours_trades.csv"
+JSON_PATH = REPORT_DIR / "multi_coin_short_strict_pullback_weakday_top3hours_summary.json"
+
+RISK_PER_TRADE_U = 10.0
+TAKER_FEE_RATE = 0.00036
+ATR_PERIOD = 14
+ATR_PERCENTILE_LOOKBACK = 100
+ATR_PERCENTILE_MAX = 0.50
+SLOPE_THRESHOLD_RATIO = -0.0005
+BREAKDOWN_ATR_MULT = 0.2
+RETEST_ATR_MULT = 0.3
+STOP_BUFFER_ATR_MULT = 0.3
+WATCH_BARS = 6
+BODY_RECLAIM_MAX_RATIO = 0.5
+BLOCK_TOP_HOURS = 3
+
+
+@dataclass(frozen=True)
+class Recommendation:
+    symbol: str
+    coin: str
+    strategy_key: str
+    strategy_label: str
+    daily_filter_key: str
+    daily_filter_label: str
+
+
+def main() -> None:
+    REPORT_DIR.mkdir(exist_ok=True)
+    recommendations = load_recommendations()
+    strict_reference = pd.read_csv(SOURCE_STRICT_CSV)
+    weakday6_reference = pd.read_csv(SOURCE_WEAKDAY6_CSV)
+
+    rows: list[dict[str, object]] = []
+    trades_out: list[dict[str, object]] = []
+    blocked_hours_by_coin: dict[str, list[int]] = {}
+
+    for item in recommendations:
+        entry_candles = [c for c in load_candle_cache(item.symbol, ENTRY_BAR, limit=None) if c.confirmed]
+        daily_candles = [c for c in load_candle_cache(item.symbol, FILTER_BAR, limit=None) if c.confirmed]
+        if not entry_candles or not daily_candles:
+            continue
+
+        frame = build_entry_frame(entry_candles)
+        ma_type, period = parse_strategy_key(item.strategy_key)
+        add_indicators(frame, ma_type=ma_type, period=period)
+        daily_info = build_daily_info(entry_candles, daily_candles, item.daily_filter_key)
+        blocked_hours = detect_blocked_hours(frame, top_n=BLOCK_TOP_HOURS)
+        blocked_hours_by_coin[item.coin] = blocked_hours
+        trades = simulate_variant(
+            frame,
+            ma_column=ma_column_name(ma_type, period),
+            daily_info=daily_info,
+            blocked_hours=set(blocked_hours),
+        )
+        trades["symbol"] = item.symbol
+        trades["coin"] = item.coin
+        trades["strategy_label"] = item.strategy_label
+        trades["daily_filter_label"] = item.daily_filter_label
+        trades_out.extend(trades.to_dict("records"))
+        rows.append(build_metrics_row(item, trades, blocked_hours))
+
+    result_frame = pd.DataFrame(rows).sort_values("coin").reset_index(drop=True)
+    trades_frame = pd.DataFrame(trades_out).sort_values(["exit_ts", "entry_ts", "coin"]).reset_index(drop=True)
+    result_frame.to_csv(CSV_PATH, index=False, encoding="utf-8-sig")
+    trades_frame.to_csv(TRADES_CSV_PATH, index=False, encoding="utf-8-sig")
+
+    merged = result_frame.merge(
+        strict_reference[["coin", "test_trades", "test_pnl_u", "test_profit_factor", "test_max_drawdown_u"]].rename(
+            columns={
+                "test_trades": "strict_test_trades",
+                "test_pnl_u": "strict_test_pnl_u",
+                "test_profit_factor": "strict_test_profit_factor",
+                "test_max_drawdown_u": "strict_test_max_drawdown_u",
+            }
+        ),
+        on="coin",
+        how="left",
+    ).merge(
+        weakday6_reference[["coin", "test_trades", "test_pnl_u", "test_profit_factor", "test_max_drawdown_u"]].rename(
+            columns={
+                "test_trades": "weakday6_test_trades",
+                "test_pnl_u": "weakday6_test_pnl_u",
+                "test_profit_factor": "weakday6_test_profit_factor",
+                "test_max_drawdown_u": "weakday6_test_max_drawdown_u",
+            }
+        ),
+        on="coin",
+        how="left",
+    )
+
+    payload = {
+        "created_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "assumptions": {
+            "strict_pullback": "反抽收盘不能收回破位阴线实体超过50%",
+            "weak_day": "日线收阴，且收盘低于对应日线过滤均线",
+            "hour_filter": f"屏蔽每个币历史最躁动的前{BLOCK_TOP_HOURS}个UTC小时",
+        },
+        "blocked_hours_by_coin": blocked_hours_by_coin,
+        "aggregate": {
+            "strict_pnl": float(merged["strict_test_pnl_u"].sum()),
+            "strict_dd": float(merged["strict_test_max_drawdown_u"].sum()),
+            "weakday6_pnl": float(merged["weakday6_test_pnl_u"].sum()),
+            "weakday6_dd": float(merged["weakday6_test_max_drawdown_u"].sum()),
+            "top3_pnl": float(merged["test_pnl_u"].sum()),
+            "top3_dd": float(merged["test_max_drawdown_u"].sum()),
+        },
+    }
+    JSON_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    summary_chart = render_summary_chart(merged)
+    coin_chart = render_coin_chart(merged)
+    equity_chart = render_equity_chart(trades_frame)
+    HTML_PATH.write_text(
+        build_html(
+            merged=merged,
+            payload=payload,
+            summary_chart=summary_chart,
+            coin_chart=coin_chart,
+            equity_chart=equity_chart,
+        ),
+        encoding="utf-8",
+    )
+    print(HTML_PATH)
+
+
+def load_recommendations() -> list[Recommendation]:
+    frame = pd.read_csv(SOURCE_RECOMMEND_CSV)
+    return [
+        Recommendation(
+            symbol=str(row["symbol"]),
+            coin=str(row["coin"]),
+            strategy_key=str(row["strategy_key"]),
+            strategy_label=str(row["strategy_label"]),
+            daily_filter_key=str(row["daily_filter_key"]),
+            daily_filter_label=str(row["daily_filter_label"]),
+        )
+        for row in frame.to_dict("records")
+    ]
+
+
+def build_entry_frame(candles: list[object]) -> pd.DataFrame:
+    rows = [
+        {
+            "ts": int(c.ts),
+            "timestamp": pd.to_datetime(int(c.ts), unit="ms", utc=True),
+            "open": float(c.open),
+            "high": float(c.high),
+            "low": float(c.low),
+            "close": float(c.close),
+        }
+        for c in candles
+    ]
+    frame = pd.DataFrame(rows).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+    frame["utc_hour"] = frame["timestamp"].dt.hour.astype(int)
+    return frame
+
+
+def add_indicators(df: pd.DataFrame, *, ma_type: str, period: int) -> None:
+    ma_col = ma_column_name(ma_type, period)
+    if ma_type == "ema":
+        df[ma_col] = df["close"].ewm(span=period, adjust=False, min_periods=period).mean()
+    else:
+        df[ma_col] = df["close"].rolling(period, min_periods=period).mean()
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    df["atr14"] = tr.ewm(alpha=1 / ATR_PERIOD, adjust=False, min_periods=ATR_PERIOD).mean()
+    df["atr_pct"] = rolling_percentile(df["atr14"], ATR_PERCENTILE_LOOKBACK)
+
+
+def rolling_percentile(series: pd.Series, lookback: int) -> pd.Series:
+    return series.rolling(lookback, min_periods=lookback).apply(lambda x: float(np.mean(x <= x[-1])), raw=True)
+
+
+def build_daily_info(entry_candles: list[object], daily_candles: list[object], filter_key: str) -> list[dict[str, object]]:
+    daily_frame = pd.DataFrame(
+        {
+            "ts": [int(c.ts) for c in daily_candles],
+            "open": [float(c.open) for c in daily_candles],
+            "close": [float(c.close) for c in daily_candles],
+        }
+    )
+    if filter_key == "none":
+        line = daily_frame["close"].copy()
+    else:
+        ma_type, period = parse_filter_key(filter_key)
+        if ma_type == "ema":
+            line = daily_frame["close"].ewm(span=period, adjust=False, min_periods=period).mean()
+        else:
+            line = daily_frame["close"].rolling(period, min_periods=period).mean()
+    daily_available_ts = closed_candle_available_timestamps(daily_candles)
+    out: list[dict[str, object]] = []
+    for candle in entry_candles:
+        idx = np.searchsorted(daily_available_ts, int(candle.ts), side="right") - 1
+        if idx < 0:
+            out.append({"weak_day": False})
+            continue
+        line_value = float(line.iloc[idx]) if pd.notna(line.iloc[idx]) else math.nan
+        day_open = float(daily_frame["open"].iloc[idx])
+        day_close = float(daily_frame["close"].iloc[idx])
+        weak_day = np.isfinite(line_value) and day_close < day_open and day_close < line_value
+        out.append({"weak_day": bool(weak_day)})
+    return out
+
+
+def detect_blocked_hours(frame: pd.DataFrame, *, top_n: int) -> list[int]:
+    tmp = frame.copy()
+    tmp["body_ratio"] = (tmp["close"] - tmp["open"]).abs() / tmp["open"].replace(0, np.nan)
+    stat = tmp.groupby("utc_hour")["body_ratio"].median().sort_values(ascending=False)
+    return [int(hour) for hour in stat.head(top_n).index.tolist()]
+
+
+def simulate_variant(
+    frame: pd.DataFrame,
+    *,
+    ma_column: str,
+    daily_info: list[dict[str, object]],
+    blocked_hours: set[int],
+) -> pd.DataFrame:
+    open_values = frame["open"].to_numpy(dtype=float)
+    high_values = frame["high"].to_numpy(dtype=float)
+    low_values = frame["low"].to_numpy(dtype=float)
+    close_values = frame["close"].to_numpy(dtype=float)
+    ts_values = frame["ts"].to_numpy(dtype=np.int64)
+    hour_values = frame["utc_hour"].to_numpy(dtype=int)
+    line_values = frame[ma_column].to_numpy(dtype=float)
+    atr_values = frame["atr14"].to_numpy(dtype=float)
+    atr_pct_values = frame["atr_pct"].to_numpy(dtype=float)
+
+    trades: list[dict[str, object]] = []
+    position: dict[str, float | int | str] | None = None
+    pending: dict[str, float | int] | None = None
+    start_index = max(ATR_PERCENTILE_LOOKBACK, 60)
+
+    for index in range(start_index, len(frame)):
+        line_value = line_values[index]
+        prev_line = line_values[index - 1]
+        atr_value = atr_values[index]
+        atr_pct = atr_pct_values[index]
+        candle_open = open_values[index]
+        candle_high = high_values[index]
+        candle_low = low_values[index]
+        candle_close = close_values[index]
+        candle_hour = int(hour_values[index])
+        if any(math.isnan(v) for v in [line_value, prev_line, atr_value, atr_pct]):
+            continue
+        slope_ratio = (line_value - prev_line) / line_value if line_value else math.nan
+
+        if position is not None:
+            exited = process_open_short(
+                position,
+                candle_open=candle_open,
+                candle_high=candle_high,
+                candle_low=candle_low,
+                candle_close=candle_close,
+                candle_ts=int(ts_values[index]),
+                index=index,
+                trades=trades,
+            )
+            if exited:
+                position = None
+
+        if position is not None:
+            continue
+
+        if pending is not None:
+            age = index - int(pending["index"])
+            if age > WATCH_BARS:
+                pending = None
+            else:
+                near_line = candle_high >= (line_value - RETEST_ATR_MULT * atr_value)
+                still_below = candle_close < line_value
+                bearish_close = candle_close < candle_open
+                midpoint_ok = candle_close <= float(pending["max_reclaim_close"])
+                weak_day_ok = bool(daily_info[index]["weak_day"])
+                hour_ok = candle_hour not in blocked_hours
+                if near_line and still_below and bearish_close and midpoint_ok and weak_day_ok and hour_ok:
+                    risk_per_unit = max((candle_high + STOP_BUFFER_ATR_MULT * atr_value) - candle_close, atr_value * 0.5)
+                    if risk_per_unit > 0 and np.isfinite(risk_per_unit):
+                        fee_offset = candle_close * TAKER_FEE_RATE * 2.0
+                        position = {
+                            "entry_index": index,
+                            "entry_ts": int(ts_values[index]),
+                            "entry_price": candle_close,
+                            "risk_per_unit": risk_per_unit,
+                            "stop": candle_close + risk_per_unit,
+                            "stop_reason": "stop_loss",
+                            "fee_offset": fee_offset,
+                            "next_dynamic_r": 2.0,
+                        }
+                        pending = None
+                        continue
+
+        if pending is not None:
+            continue
+        if not np.isfinite(slope_ratio) or slope_ratio > SLOPE_THRESHOLD_RATIO:
+            continue
+        if atr_pct > ATR_PERCENTILE_MAX:
+            continue
+        if candle_close >= line_value - BREAKDOWN_ATR_MULT * atr_value:
+            continue
+        if candle_close >= candle_open:
+            continue
+        if not bool(daily_info[index]["weak_day"]):
+            continue
+        if candle_hour in blocked_hours:
+            continue
+        body_mid = candle_close + (candle_open - candle_close) * BODY_RECLAIM_MAX_RATIO
+        pending = {"index": index, "max_reclaim_close": body_mid}
+
+    return pd.DataFrame(trades)
+
+
+def process_open_short(
+    position: dict[str, float | int | str],
+    *,
+    candle_open: float,
+    candle_high: float,
+    candle_low: float,
+    candle_close: float,
+    candle_ts: int,
+    index: int,
+    trades: list[dict[str, object]],
+) -> bool:
+    path = candle_path_points(candle_open=candle_open, candle_high=candle_high, candle_low=candle_low, candle_close=candle_close)
+    for start, end in zip(path, path[1:]):
+        if end > start:
+            stop_price = float(position["stop"])
+            if start <= stop_price <= end:
+                trades.append(close_trade(position, index, candle_ts, stop_price, str(position["stop_reason"])))
+                return True
+        else:
+            advance_step_dynamic(position, end)
+    return False
+
+
+def candle_path_points(*, candle_open: float, candle_high: float, candle_low: float, candle_close: float) -> tuple[float, float, float, float]:
+    if candle_close >= candle_open:
+        return candle_open, candle_low, candle_high, candle_close
+    return candle_open, candle_high, candle_low, candle_close
+
+
+def advance_step_dynamic(position: dict[str, float | int | str], favorable_price: float) -> None:
+    entry = float(position["entry_price"])
+    risk = float(position["risk_per_unit"])
+    fee_offset = float(position["fee_offset"])
+    while True:
+        next_r = float(position["next_dynamic_r"])
+        trigger = entry - risk * next_r - fee_offset
+        if favorable_price > trigger:
+            break
+        if math.isclose(next_r, 2.0):
+            locked_r = 0.0
+            reason = "break_even_stop"
+        else:
+            locked_r = max(next_r - 1.0, 0.0)
+            reason = f"locked_{int(round(locked_r))}r_stop"
+        candidate_stop = entry - risk * locked_r - fee_offset
+        if candidate_stop < float(position["stop"]):
+            position["stop"] = candidate_stop
+            position["stop_reason"] = reason
+        position["next_dynamic_r"] = next_r + 1.0
+
+
+def close_trade(position: dict[str, float | int | str], exit_index: int, exit_ts: int, exit_price: float, exit_reason: str) -> dict[str, object]:
+    entry = float(position["entry_price"])
+    risk = float(position["risk_per_unit"])
+    quantity = RISK_PER_TRADE_U / risk if risk > 0 else 0.0
+    pnl_per_unit = (entry - exit_price) - TAKER_FEE_RATE * (entry + exit_price)
+    pnl_u = pnl_per_unit * quantity
+    return {
+        "entry_index": int(position["entry_index"]),
+        "exit_index": exit_index,
+        "entry_ts": int(position["entry_ts"]),
+        "exit_ts": exit_ts,
+        "pnl_u": pnl_u,
+        "r_multiple": pnl_u / RISK_PER_TRADE_U,
+        "exit_reason": exit_reason,
+    }
+
+
+def build_metrics_row(item: Recommendation, trades: pd.DataFrame, blocked_hours: list[int]) -> dict[str, object]:
+    test = split_test_trades(trades)
+    metrics = compute_metrics(test)
+    return {
+        "symbol": item.symbol,
+        "coin": item.coin,
+        "strategy_label": item.strategy_label,
+        "daily_filter_label": item.daily_filter_label,
+        "blocked_hours_utc": ",".join(str(hour) for hour in blocked_hours),
+        "test_trades": int(metrics["trades"]),
+        "test_pnl_u": metrics["pnl"],
+        "test_profit_factor": metrics["profit_factor"],
+        "test_max_drawdown_u": metrics["drawdown"],
+        "test_win_rate": metrics["win_rate"],
+    }
+
+
+def split_test_trades(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return trades.copy()
+    start = int(trades["exit_index"].max() * 0.8)
+    return trades[trades["exit_index"] >= start].copy()
+
+
+def compute_metrics(trades: pd.DataFrame) -> dict[str, float]:
+    if trades.empty:
+        return {"trades": 0.0, "pnl": 0.0, "profit_factor": 0.0, "drawdown": 0.0, "win_rate": 0.0}
+    pnls = trades["pnl_u"].astype(float)
+    gross_profit = float(pnls[pnls > 0].sum())
+    gross_loss = abs(float(pnls[pnls < 0].sum()))
+    curve = pnls.cumsum()
+    return {
+        "trades": float(len(trades)),
+        "pnl": float(pnls.sum()),
+        "profit_factor": gross_profit / gross_loss if gross_loss > 0 else 0.0,
+        "drawdown": float((curve.cummax() - curve).max()),
+        "win_rate": float((pnls > 0).mean()),
+    }
+
+
+def render_summary_chart(merged: pd.DataFrame) -> str:
+    labels = ["严格反抽版", "弱势日+前6小时过滤", "弱势日+前3小时过滤"]
+    pnl_values = [
+        float(merged["strict_test_pnl_u"].sum()),
+        float(merged["weakday6_test_pnl_u"].sum()),
+        float(merged["test_pnl_u"].sum()),
+    ]
+    dd_values = [
+        float(merged["strict_test_max_drawdown_u"].sum()),
+        float(merged["weakday6_test_max_drawdown_u"].sum()),
+        float(merged["test_max_drawdown_u"].sum()),
+    ]
+    x = np.arange(len(labels))
+    width = 0.34
+    fig, ax = plt.subplots(figsize=(9.2, 5.2))
+    ax.bar(x - width / 2, pnl_values, width, label="测试收益U", color="#16423C")
+    ax.bar(x + width / 2, dd_values, width, label="测试回撤U", color="#C84B31")
+    ax.set_xticks(x, labels)
+    ax.set_title("三版本总览")
+    ax.legend()
+    fig.tight_layout()
+    return figure_to_base64(fig)
+
+
+def render_coin_chart(merged: pd.DataFrame) -> str:
+    fig, ax = plt.subplots(figsize=(10.5, 5.8))
+    x = np.arange(len(merged))
+    width = 0.25
+    ax.bar(x - width, merged["strict_test_pnl_u"].astype(float), width, label="严格反抽版", color="#6A9C89")
+    ax.bar(x, merged["weakday6_test_pnl_u"].astype(float), width, label="前6小时过滤", color="#C84B31")
+    ax.bar(x + width, merged["test_pnl_u"].astype(float), width, label="前3小时过滤", color="#355F2E")
+    ax.set_xticks(x, merged["coin"].tolist())
+    ax.set_ylabel("PnL (U)")
+    ax.set_title("各币测试收益对比")
+    ax.legend()
+    fig.tight_layout()
+    return figure_to_base64(fig)
+
+
+def render_equity_chart(trades_frame: pd.DataFrame) -> str:
+    if trades_frame.empty:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, "No trades", ha="center", va="center")
+        ax.axis("off")
+        return figure_to_base64(fig)
+    ordered = trades_frame.sort_values(["exit_ts", "entry_ts", "coin"]).reset_index(drop=True).copy()
+    ordered["equity"] = ordered["pnl_u"].astype(float).cumsum()
+    ordered["dd"] = ordered["equity"].cummax() - ordered["equity"]
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    axes[0].plot(ordered["equity"].to_numpy(), color="#355F2E", linewidth=1.5)
+    axes[0].set_title("前3小时过滤版累计收益")
+    axes[1].fill_between(np.arange(len(ordered)), ordered["dd"].to_numpy(), color="#C84B31", alpha=0.28)
+    axes[1].set_title("前3小时过滤版回撤")
+    axes[1].set_xlabel("Trade Sequence")
+    fig.tight_layout()
+    return figure_to_base64(fig)
+
+
+def build_html(*, merged: pd.DataFrame, payload: dict[str, object], summary_chart: str, coin_chart: str, equity_chart: str) -> str:
+    agg = payload["aggregate"]
+    blocked_list = "".join(
+        f"<li><strong>{html.escape(coin)}</strong>: UTC {', '.join(str(v) for v in hours)}</li>"
+        for coin, hours in payload["blocked_hours_by_coin"].items()
+    )
+    table = dataframe_to_html(
+        merged[
+            [
+                "coin",
+                "strategy_label",
+                "daily_filter_label",
+                "blocked_hours_utc",
+                "strict_test_pnl_u",
+                "strict_test_max_drawdown_u",
+                "weakday6_test_pnl_u",
+                "weakday6_test_max_drawdown_u",
+                "test_pnl_u",
+                "test_max_drawdown_u",
+                "test_trades",
+                "test_profit_factor",
+            ]
+        ],
+        float_cols={
+            "strict_test_pnl_u": 1,
+            "strict_test_max_drawdown_u": 1,
+            "weakday6_test_pnl_u": 1,
+            "weakday6_test_max_drawdown_u": 1,
+            "test_pnl_u": 1,
+            "test_max_drawdown_u": 1,
+            "test_profit_factor": 2,
+        },
+    )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>反抽50% + 日线弱势日 + 前3高波动小时过滤</title>
+  <style>
+    :root {{ --bg:#f5f2ec; --ink:#1f1f1f; --muted:#5f6f68; --card:rgba(255,255,255,.84); --line:rgba(22,66,60,.12); --a:#16423c; --b:#355f2e; --c:#c84b31; --r:24px; --s:0 18px 42px rgba(22,66,60,.10); }}
+    * {{ box-sizing:border-box; }} body {{ margin:0; font-family:"Microsoft YaHei","PingFang SC",sans-serif; color:var(--ink); background:linear-gradient(180deg,#faf7f2 0%,var(--bg) 100%); }}
+    .wrap {{ width:min(1180px,calc(100vw - 28px)); margin:0 auto; padding:28px 0 56px; }}
+    .hero {{ padding:34px; border-radius:32px; color:#fffdf9; background:linear-gradient(135deg, rgba(22,66,60,.96), rgba(53,95,46,.88)); box-shadow:var(--s); }}
+    .eyebrow {{ letter-spacing:.16em; text-transform:uppercase; font-size:12px; opacity:.88; }} h1,h2,p {{ margin:0; }} h1 {{ margin-top:12px; font-size:clamp(28px,4vw,44px); line-height:1.06; }} .hero p {{ margin-top:14px; line-height:1.72; max-width:860px; color:rgba(255,253,249,.90); }}
+    .grid {{ display:grid; grid-template-columns:repeat(12,1fr); gap:18px; margin-top:20px; }} .card {{ background:var(--card); border:1px solid var(--line); border-radius:var(--r); box-shadow:var(--s); padding:22px; }}
+    .stat {{ grid-column:span 3; }} .wide {{ grid-column:span 6; }} .full {{ grid-column:1 / -1; }} .value {{ margin-top:8px; font-size:32px; font-weight:700; color:var(--a); }} .muted {{ color:var(--muted); }}
+    ul {{ margin:0; padding-left:18px; line-height:1.8; }} img {{ width:100%; border-radius:18px; border:1px solid var(--line); background:#fff; }}
+    table {{ width:100%; border-collapse:collapse; font-size:13px; }} th,td {{ text-align:left; padding:10px 8px; border-bottom:1px solid rgba(22,66,60,.10); }} th {{ color:var(--muted); background:rgba(22,66,60,.03); }}
+    @media (max-width: 960px) {{ .stat,.wide {{ grid-column:1 / -1; }} }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <div class="eyebrow">10U 战神 / Top 3 Hours</div>
+      <h1>反抽不收回 50% + 只做日线弱势日 + 只屏蔽最躁动前 3 小时</h1>
+      <p>这一版是在前 6 小时过滤太严格的基础上，往回放松到前 3 小时，目标是尽量保住 ETH / SOL 的修复，同时别把 BTC / DOGE / BNB 的机会砍得太狠。</p>
+    </section>
+    <section class="grid">
+      <div class="card stat"><div class="muted">严格反抽版</div><div class="value">{agg["strict_pnl"]:.1f}U</div><div class="muted">测试总收益</div></div>
+      <div class="card stat"><div class="muted">前6小时过滤</div><div class="value">{agg["weakday6_pnl"]:.1f}U</div><div class="muted">测试总收益</div></div>
+      <div class="card stat"><div class="muted">前3小时过滤</div><div class="value">{agg["top3_pnl"]:.1f}U</div><div class="muted">测试总收益</div></div>
+      <div class="card stat"><div class="muted">前3小时过滤</div><div class="value">{agg["top3_dd"]:.1f}U</div><div class="muted">测试总回撤</div></div>
+
+      <div class="card wide">
+        <h2>这版想解决什么</h2>
+        <ul>
+          <li>前 6 小时过滤把很多机会直接砍没了，尤其是 BNB。</li>
+          <li>这次只屏蔽最躁动的前 3 个 UTC 小时，理论上更平衡。</li>
+          <li>重点看它是不是能比“前6小时过滤版”更像一个可交易模型。</li>
+        </ul>
+      </div>
+      <div class="card wide">
+        <h2>假设</h2>
+        <ul>
+          <li>{html.escape(str(payload["assumptions"]["strict_pullback"]))}</li>
+          <li>{html.escape(str(payload["assumptions"]["weak_day"]))}</li>
+          <li>{html.escape(str(payload["assumptions"]["hour_filter"]))}</li>
+        </ul>
+      </div>
+
+      <div class="card wide"><h2>总览图</h2><img src="data:image/png;base64,{summary_chart}" alt="summary"></div>
+      <div class="card wide"><h2>各币收益图</h2><img src="data:image/png;base64,{coin_chart}" alt="coin"></div>
+      <div class="card full"><h2>资金曲线</h2><img src="data:image/png;base64,{equity_chart}" alt="equity"></div>
+      <div class="card full"><h2>被屏蔽的前3个 UTC 小时</h2><ul>{blocked_list}</ul></div>
+      <div class="card full"><h2>逐币对比</h2><div style="overflow:auto;">{table}</div></div>
+    </section>
+  </div>
+</body>
+</html>"""
+
+
+def dataframe_to_html(frame: pd.DataFrame, *, float_cols: dict[str, int]) -> str:
+    headers = "".join(f"<th>{html.escape(str(col))}</th>" for col in frame.columns)
+    body = []
+    for _, row in frame.iterrows():
+        cells = []
+        for col in frame.columns:
+            value = row[col]
+            text = f"{float(value):.{float_cols[col]}f}" if col in float_cols else str(value)
+            cells.append(f"<td>{html.escape(text)}</td>")
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    return f"<table><thead><tr>{headers}</tr></thead><tbody>{''.join(body)}</tbody></table>"
+
+
+def figure_to_base64(fig: plt.Figure) -> str:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def parse_strategy_key(strategy_key: str) -> tuple[str, int]:
+    if strategy_key == "ma55":
+        return "ma", 55
+    if strategy_key == "ma20":
+        return "ma", 20
+    if strategy_key == "ema21":
+        return "ema", 21
+    if strategy_key == "ema34":
+        return "ema", 34
+    return "ema", 55
+
+
+def parse_filter_key(filter_key: str) -> tuple[str, int]:
+    if filter_key == "ma20":
+        return "ma", 20
+    if filter_key == "ema55":
+        return "ema", 55
+    return "ema", 21
+
+
+def ma_column_name(ma_type: str, period: int) -> str:
+    return f"{ma_type}{period}"
+
+
+if __name__ == "__main__":
+    main()
