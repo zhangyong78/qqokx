@@ -14,6 +14,7 @@ STRATEGY_EMA_BREAKDOWN_SHORT_ID = "ema_breakdown_short"
 STRATEGY_EMA5_EMA8_ID = "ema5_ema8_cross_stop"
 STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID = "adaptive_ema_rail_long"
 STRATEGY_EMA55_SLOPE_SHORT_ID = "ema55_slope_short"
+STRATEGY_BODY_RETEST_SHORT_ID = "body_retest_short"
 
 
 def is_ema_atr_breakout_strategy(strategy_id: str) -> bool:
@@ -31,6 +32,10 @@ def is_adaptive_ema_rail_strategy(strategy_id: str) -> bool:
 
 def is_ema55_slope_short_strategy(strategy_id: str) -> bool:
     return strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID
+
+
+def is_body_retest_short_strategy(strategy_id: str) -> bool:
+    return strategy_id == STRATEGY_BODY_RETEST_SHORT_ID
 
 
 def is_dynamic_mtf_strategy_id(strategy_id: str) -> bool:
@@ -246,6 +251,26 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
         supports_trader_desk=True,
     ),
     StrategyDefinition(
+        strategy_id=STRATEGY_BODY_RETEST_SHORT_ID,
+        name="Body/ATR 回抽做空",
+        summary="先等阴线破位，再在限定K线内等回抽确认做空；默认配合日线弱日过滤。",
+        rule_description=(
+            "流程：先确认参考均线斜率转弱、ATR 分位不过热，并出现一根实体不过大的阴线向下破位；"
+            "破位后不立即追空，而是在限定 K 线内等待价格回抽到均线附近、收盘仍压在均线下方且再次收阴时做空。"
+            "入场后沿用 ATR 风控、2R 保本和逐级锁盈。"
+        ),
+        parameter_hint=(
+            "核心参数：参考均线类型/周期、破位 ATR、回抽 ATR、止损缓冲 ATR、body/ATR 上限、等待K线数、"
+            "ATR 分位上限、斜率阈值，以及是否启用 Weak Day 日线过滤。"
+        ),
+        default_signal_label="鍙仛绌?",
+        allowed_signal_labels=("鍙仛绌?",),
+        supports_trade=True,
+        supports_signal_only=True,
+        supports_backtest=True,
+        supports_batch_observe=True,
+    ),
+    StrategyDefinition(
         strategy_id=STRATEGY_DYNAMIC_ID,
         name="EMA 动态委托",
         summary="通用 EMA 动态委托策略入口，通常由做多/做空两个方向版本承接。",
@@ -332,5 +357,7 @@ def resolve_dynamic_signal_mode(strategy_id: str, signal_mode: str) -> str:
     if strategy_id == STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID:
         return "long_only"
     if strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
+        return "short_only"
+    if strategy_id == STRATEGY_BODY_RETEST_SHORT_ID:
         return "short_only"
     return signal_mode

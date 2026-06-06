@@ -6,6 +6,11 @@ from datetime import datetime
 from decimal import Decimal
 
 from okx_quant.engine import build_protection_plan, determine_order_size
+from okx_quant.daily_filters import (
+    aggregate_candles_to_daily_boundary,
+    build_daily_close_vs_ma_bias,
+    build_daily_weak_day_flags,
+)
 from okx_quant.indicators import atr, ema, linear_regression_slope, moving_average
 from okx_quant.models import (
     Candle,
@@ -21,6 +26,13 @@ from okx_quant.timeframe import closed_candle_available_timestamps
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategies.ema_dynamic_multi_timeframe import filter_bias_allows_signal
+from okx_quant.strategies.body_retest_short import (
+    BODY_RETEST_ATR_PERCENTILE_LOOKBACK,
+    body_retest_short_bias_allows_short,
+    body_retest_short_minimum_candles,
+    build_body_retest_short_protection_plan,
+    rolling_body_retest_percentile,
+)
 from okx_quant.strategies.adaptive_ema_rail import (
     ADAPTIVE_RAIL_STATE_CONFIRMED,
     ADAPTIVE_RAIL_STATE_BROKEN,
@@ -46,6 +58,8 @@ from okx_quant.strategy_catalog import (
 
 MAX_BACKTEST_CANDLES = 10000
 BACKTEST_RESERVED_CANDLES = 200
+HOUR_MS = 60 * 60 * 1000
+DAY_MS = 24 * HOUR_MS
 ATR_BATCH_MULTIPLIERS: tuple[Decimal, ...] = (
     Decimal("1"),
     Decimal("1.5"),
@@ -199,6 +213,13 @@ class BacktestResult:
     mtf_filter_fast_ema_period: int = 0
     mtf_filter_slow_ema_period: int = 0
     mtf_reversal_mode: str = "block_new_entries"
+    daily_filter_enabled: bool = False
+    daily_filter_boundary: str = "exchange"
+    daily_filter_mode: str = "disabled"
+    daily_filter_scope: str = "both"
+    daily_filter_ma_type: str = "ema"
+    daily_filter_period: int = 0
+    direction_filter_bias: list[str] = field(default_factory=list)
     data_source_note: str = ""
     maker_fee_rate: Decimal = Decimal("0")
     taker_fee_rate: Decimal = Decimal("0")
@@ -212,6 +233,12 @@ class BacktestResult:
     time_stop_break_even_enabled: bool = False
     time_stop_break_even_bars: int = 0
     trend_ema_slope_filter_min_ratio: Decimal = Decimal("0")
+    atr_percentile_filter_max: Decimal = Decimal("0")
+    body_retest_breakdown_atr_multiplier: Decimal = Decimal("0")
+    body_retest_retest_atr_multiplier: Decimal = Decimal("0")
+    body_retest_stop_buffer_atr_multiplier: Decimal = Decimal("0")
+    body_retest_body_atr_limit: Decimal = Decimal("0")
+    body_retest_watch_bars: int = 0
     hold_close_exit_bars: int = 0
     max_entries_per_trend: int = 1
     sizing_mode: str = "fixed_risk"
@@ -420,6 +447,18 @@ def run_backtest(
             end_ts=end_ts,
             preload_count=filter_preload,
         )
+    direction_filter_bias: list[str] | None = None
+    if _backtest_uses_daily_filter(config) and candles:
+        daily_filter_candles = _load_daily_filter_candles(
+            client,
+            config,
+            entry_candles=candles,
+        )
+        direction_filter_bias = _build_daily_direction_filter_bias(
+            candles,
+            daily_filter_candles,
+            config,
+        )
     cross_higher_tf_bias: list[str] | None = None
     if (
         strategy_is_cross_family(config.strategy_id)
@@ -454,6 +493,7 @@ def run_backtest(
         taker_fee_rate=taker_fee_rate,
         cross_higher_tf_bias=cross_higher_tf_bias,
         mtf_filter_candles=mtf_filter_candles,
+        direction_filter_bias=direction_filter_bias,
     )
 
 
@@ -515,6 +555,85 @@ def _backtest_uses_mtf_filter(strategy_id: str) -> bool:
         return False
 
 
+def _backtest_uses_daily_filter(config: StrategyConfig) -> bool:
+    return bool(config.uses_daily_filter())
+
+
+def _load_daily_filter_candles(
+    client: OkxRestClient,
+    config: StrategyConfig,
+    *,
+    entry_candles: list[Candle],
+) -> list[Candle]:
+    if not entry_candles:
+        return []
+    preload_days = max(int(config.daily_filter_period), 1) + 5
+    start_ts = max(entry_candles[0].ts - (preload_days * DAY_MS), 0)
+    end_ts = entry_candles[-1].ts
+    boundary = str(config.daily_filter_boundary or "exchange").strip().lower()
+    filter_inst_id = config.resolved_daily_filter_inst_id()
+    if boundary == "exchange":
+        return _load_backtest_candles(
+            client,
+            filter_inst_id,
+            config.resolved_daily_filter_bar(),
+            0,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+    if filter_inst_id == config.inst_id and str(config.bar or "").strip().upper() == "1H":
+        hourly_candles = [candle for candle in entry_candles if candle.confirmed]
+    else:
+        hourly_candles = _load_backtest_candles(
+            client,
+            filter_inst_id,
+            "1H",
+            0,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+    aggregated, _ = aggregate_candles_to_daily_boundary(hourly_candles, boundary=boundary)
+    return aggregated
+
+
+def _expand_direction_filter_bias_scope(base_bias: list[str], scope: str) -> list[str]:
+    normalized_scope = str(scope or "both").strip().lower()
+    if normalized_scope == "both":
+        return list(base_bias)
+    expanded: list[str] = []
+    for bias in base_bias:
+        if normalized_scope == "long_only":
+            expanded.append("both" if bias == "long" else "short")
+        elif normalized_scope == "short_only":
+            expanded.append("both" if bias == "short" else "long")
+        else:
+            expanded.append(bias)
+    return expanded
+
+
+def _build_daily_direction_filter_bias(
+    entry_candles: list[Candle],
+    daily_candles: list[Candle],
+    config: StrategyConfig,
+) -> list[str]:
+    if not entry_candles:
+        return []
+    mode = str(config.daily_filter_mode or "disabled").strip().lower()
+    if not daily_candles or mode == "disabled":
+        return ["neutral"] * len(entry_candles)
+    if mode == "weak_day":
+        weak_day_flags = build_daily_weak_day_flags(entry_candles, daily_candles)
+        base_bias = ["short" if is_weak else "long" for is_weak in weak_day_flags]
+    else:
+        base_bias = build_daily_close_vs_ma_bias(
+            entry_candles,
+            daily_candles,
+            ma_type=str(config.daily_filter_ma_type or "ema").strip().lower(),
+            period=max(int(config.daily_filter_period), 1),
+        )
+    return _expand_direction_filter_bias_scope(base_bias, config.daily_filter_scope)
+
+
 def build_parameter_batch_configs(
     base_config: StrategyConfig,
     *,
@@ -524,6 +643,8 @@ def build_parameter_batch_configs(
 ) -> list[StrategyConfig]:
     family = _backtest_strategy_family(base_config.strategy_id)
     if family == "ema55_slope_short":
+        return [base_config]
+    if family == "body_retest_short":
         return [base_config]
     if family not in {"dynamic_order", "adaptive_ema_rail"}:
         return build_atr_batch_configs(
@@ -704,9 +825,47 @@ def run_backtest_batch(
             end_ts=end_ts,
             preload_count=max(_required_mtf_filter_preload_candles(config) for config in batch_configs),
         )
+    daily_filter_bias_by_key: dict[tuple[object, ...], list[str]] = {}
+    if candles:
+        for config in batch_configs:
+            if not _backtest_uses_daily_filter(config):
+                continue
+            cache_key = (
+                config.resolved_daily_filter_inst_id(),
+                str(config.daily_filter_boundary or "exchange").strip().lower(),
+                config.resolved_daily_filter_bar(),
+                str(config.daily_filter_mode or "disabled").strip().lower(),
+                str(config.daily_filter_scope or "both").strip().lower(),
+                str(config.daily_filter_ma_type or "ema").strip().lower(),
+                max(int(config.daily_filter_period), 1),
+            )
+            if cache_key in daily_filter_bias_by_key:
+                continue
+            daily_filter_candles = _load_daily_filter_candles(
+                client,
+                config,
+                entry_candles=candles,
+            )
+            daily_filter_bias_by_key[cache_key] = _build_daily_direction_filter_bias(
+                candles,
+                daily_filter_candles,
+                config,
+            )
     data_source_note = _build_backtest_data_source_note(client)
     results: list[tuple[StrategyConfig, BacktestResult]] = []
     for config in batch_configs:
+        direction_filter_bias = None
+        if _backtest_uses_daily_filter(config):
+            cache_key = (
+                config.resolved_daily_filter_inst_id(),
+                str(config.daily_filter_boundary or "exchange").strip().lower(),
+                config.resolved_daily_filter_bar(),
+                str(config.daily_filter_mode or "disabled").strip().lower(),
+                str(config.daily_filter_scope or "both").strip().lower(),
+                str(config.daily_filter_ma_type or "ema").strip().lower(),
+                max(int(config.daily_filter_period), 1),
+            )
+            direction_filter_bias = daily_filter_bias_by_key.get(cache_key)
         results.append(
             (
                 config,
@@ -718,6 +877,7 @@ def run_backtest_batch(
                     maker_fee_rate=maker_fee_rate,
                     taker_fee_rate=taker_fee_rate,
                     mtf_filter_candles=mtf_filter_candles,
+                    direction_filter_bias=direction_filter_bias,
                 ),
             )
         )
@@ -781,6 +941,14 @@ def _run_backtest_with_loaded_data(
         )
     elif family == "ema55_slope_short":
         trades, terminal_open_position = _run_ema55_slope_short_backtest(
+            candles,
+            instrument,
+            config,
+            taker_fee_rate=taker_fee_rate,
+            direction_filter_bias=direction_filter_bias,
+        )
+    elif family == "body_retest_short":
+        trades, terminal_open_position = _run_body_retest_short_backtest(
             candles,
             instrument,
             config,
@@ -877,6 +1045,13 @@ def _run_backtest_with_loaded_data(
             int(config.mtf_filter_slow_ema_period) if _backtest_uses_mtf_filter(config.strategy_id) else 0
         ),
         mtf_reversal_mode=str(config.mtf_reversal_mode),
+        daily_filter_enabled=bool(config.uses_daily_filter()),
+        daily_filter_boundary=str(config.daily_filter_boundary),
+        daily_filter_mode=str(config.daily_filter_mode),
+        daily_filter_scope=str(config.daily_filter_scope),
+        daily_filter_ma_type=str(config.daily_filter_ma_type),
+        daily_filter_period=int(config.daily_filter_period),
+        direction_filter_bias=list(direction_filter_bias or []),
         data_source_note=data_source_note,
         maker_fee_rate=maker_fee_rate,
         taker_fee_rate=taker_fee_rate,
@@ -890,6 +1065,12 @@ def _run_backtest_with_loaded_data(
         time_stop_break_even_enabled=bool(config.time_stop_break_even_enabled),
         time_stop_break_even_bars=int(config.resolved_time_stop_break_even_bars()),
         trend_ema_slope_filter_min_ratio=Decimal(str(config.trend_ema_slope_filter_min_ratio)),
+        atr_percentile_filter_max=Decimal(str(config.atr_percentile_filter_max)),
+        body_retest_breakdown_atr_multiplier=Decimal(str(config.body_retest_breakdown_atr_multiplier)),
+        body_retest_retest_atr_multiplier=Decimal(str(config.body_retest_retest_atr_multiplier)),
+        body_retest_stop_buffer_atr_multiplier=Decimal(str(config.body_retest_stop_buffer_atr_multiplier)),
+        body_retest_body_atr_limit=Decimal(str(config.body_retest_body_atr_limit)),
+        body_retest_watch_bars=int(config.body_retest_watch_bars),
         hold_close_exit_bars=int(config.hold_close_exit_bars),
         max_entries_per_trend=int(config.max_entries_per_trend),
         sizing_mode=config.backtest_sizing_mode,
@@ -1045,6 +1226,26 @@ def format_backtest_report(result: BacktestResult) -> str:
         lines.append(
             "平仓原因统计：" + " | ".join(f"{label} {count}" for label, count in exit_reason_summary)
         )
+    if result.daily_filter_enabled:
+        boundary_labels = {
+            "exchange": "交易所1D",
+            "bjt_00": "北京时间0点",
+            "bjt_08": "北京时间8点",
+        }
+        scope_labels = {
+            "both": "多空都过滤",
+            "long_only": "只过滤多头",
+            "short_only": "只过滤空头",
+        }
+        boundary_label = boundary_labels.get(result.daily_filter_boundary, result.daily_filter_boundary)
+        scope_label = scope_labels.get(result.daily_filter_scope, result.daily_filter_scope)
+        if result.daily_filter_mode == "weak_day":
+            lines.append(f"日线过滤：{boundary_label} 弱日规则 | {scope_label}")
+        else:
+            lines.append(
+                f"日线过滤：{boundary_label} {str(result.daily_filter_ma_type).upper()}"
+                f"{result.daily_filter_period} close-vs-MA | {scope_label}"
+            )
     fast_label = moving_average_display_label(result.ema_type, result.ema_period)
     trend_label = moving_average_display_label(result.trend_ema_type, result.trend_ema_period)
     reference_label = moving_average_display_label(
@@ -1224,19 +1425,42 @@ def _combine_direction_filter_bias(primary: list[str], secondary: list[str]) -> 
     size = min(len(primary), len(secondary))
     combined: list[str] = []
     for index in range(size):
-        first = primary[index]
-        second = secondary[index]
-        if first == second:
-            combined.append(first)
-        elif first == "neutral" or second == "neutral":
-            combined.append("neutral")
-        else:
-            combined.append("neutral")
+        allowed = _direction_filter_bias_allowed_signals(primary[index]).intersection(
+            _direction_filter_bias_allowed_signals(secondary[index])
+        )
+        combined.append(_direction_filter_bias_from_allowed_signals(allowed))
     if len(primary) > size:
         combined.extend(primary[size:])
     elif len(secondary) > size:
         combined.extend(secondary[size:])
     return combined
+
+
+def _direction_filter_bias_allowed_signals(bias: str) -> set[str]:
+    normalized = str(bias or "neutral").strip().lower()
+    if normalized == "both":
+        return {"long", "short"}
+    if normalized == "long":
+        return {"long"}
+    if normalized == "short":
+        return {"short"}
+    return set()
+
+
+def _direction_filter_bias_from_allowed_signals(allowed: set[str]) -> str:
+    if allowed == {"long", "short"}:
+        return "both"
+    if allowed == {"long"}:
+        return "long"
+    if allowed == {"short"}:
+        return "short"
+    return "neutral"
+
+
+def _direction_filter_allows_signal(bias: str, signal: str | None) -> bool:
+    if signal not in {"long", "short"}:
+        return False
+    return signal in _direction_filter_bias_allowed_signals(bias)
 
 
 def _required_mtf_filter_preload_candles(config: StrategyConfig) -> int:
@@ -1258,6 +1482,8 @@ def _required_backtest_preload_candles(config: StrategyConfig) -> int:
         )
     elif family == "ema55_slope_short":
         minimum = max(config.ema_period, 2) + 1
+    elif family == "body_retest_short":
+        minimum = body_retest_short_minimum_candles(config)
     elif family == "adaptive_ema_rail":
         minimum = adaptive_rail_minimum_candles(config)
     elif family == "ema5_ema8":
@@ -1688,7 +1914,7 @@ def _run_ema55_slope_short_backtest(
         ):
             continue
         if direction_filter_bias is not None and index < len(direction_filter_bias):
-            if not filter_bias_allows_signal(direction_filter_bias[index], "short"):
+            if not _direction_filter_allows_signal(direction_filter_bias[index], "short"):
                 continue
 
         protection = build_protection_plan(
@@ -1732,6 +1958,141 @@ def _run_ema55_slope_short_backtest(
             time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
             apply_entry_slippage=True,
         )
+
+    return trades, _build_terminal_open_position(open_position, candles)
+
+
+def _run_body_retest_short_backtest(
+    candles: list[Candle],
+    instrument: Instrument,
+    config: StrategyConfig,
+    *,
+    taker_fee_rate: Decimal = Decimal("0"),
+    direction_filter_bias: list[str] | None = None,
+) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
+    minimum = body_retest_short_minimum_candles(config)
+    if len(candles) < minimum:
+        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根。")
+    trade_start_index = _backtest_trade_start_index(minimum)
+    if len(candles) <= trade_start_index:
+        return [], None
+
+    closes = [candle.close for candle in candles]
+    line_values = moving_average(closes, int(config.ema_period), config.resolved_ema_type())
+    atr_values = atr(candles, int(config.atr_period))
+    atr_percentiles = rolling_body_retest_percentile(
+        atr_values,
+        BODY_RETEST_ATR_PERCENTILE_LOOKBACK,
+    )
+    trades: list[BacktestTrade] = []
+    open_position: _OpenPosition | None = None
+    dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
+    slope_threshold = Decimal(str(config.trend_ema_slope_filter_min_ratio))
+    breakdown_mult = Decimal(str(config.body_retest_breakdown_atr_multiplier))
+    retest_mult = Decimal(str(config.body_retest_retest_atr_multiplier))
+    body_atr_limit = Decimal(str(config.body_retest_body_atr_limit))
+    atr_percentile_limit = Decimal(str(config.atr_percentile_filter_max))
+    watch_bars = max(int(config.body_retest_watch_bars), 1)
+    pending_index: int | None = None
+    pending_reclaim_close: Decimal | None = None
+
+    for index in range(trade_start_index, len(candles)):
+        candle = candles[index]
+        line_value = line_values[index]
+        prev_line = line_values[index - 1] if index > 0 else None
+        atr_value = atr_values[index] if index < len(atr_values) else None
+        atr_pct = atr_percentiles[index] if index < len(atr_percentiles) else None
+        if line_value is None or prev_line is None or atr_value is None or atr_value <= 0 or atr_pct is None:
+            continue
+        slope_ratio = (line_value - prev_line) / line_value if line_value != 0 else None
+        if slope_ratio is None:
+            continue
+
+        if open_position is not None:
+            closed_trade = _try_close_position(
+                open_position,
+                candle,
+                index,
+                exit_fee_rate=taker_fee_rate,
+                exit_fee_type="taker",
+            )
+            if closed_trade is not None:
+                trades.append(closed_trade)
+                open_position = None
+
+        if open_position is not None:
+            continue
+
+        if pending_index is not None and pending_reclaim_close is not None:
+            age = index - pending_index
+            if age > watch_bars:
+                pending_index = None
+                pending_reclaim_close = None
+            else:
+                bearish_close = candle.close < candle.open
+                near_line = candle.high >= (line_value - retest_mult * atr_value)
+                still_below = candle.close < line_value
+                reclaim_ok = candle.close <= pending_reclaim_close
+                bias_ok = body_retest_short_bias_allows_short(direction_filter_bias, index)
+                if near_line and still_below and bearish_close and reclaim_ok and bias_ok:
+                    protection = build_body_retest_short_protection_plan(
+                        instrument=instrument,
+                        config=config,
+                        entry_reference=candle.close,
+                        signal_candle_high=candle.high,
+                        signal_candle_close=candle.close,
+                        atr_value=atr_value,
+                        candle_ts=candle.ts,
+                        trigger_inst_id=instrument.inst_id,
+                    )
+                    size = _determine_backtest_order_size(
+                        instrument=instrument,
+                        config=config,
+                        entry_price=protection.entry_reference,
+                        stop_loss=protection.stop_loss,
+                        risk_price_compatible=bool(config.risk_amount is not None and config.risk_amount > 0),
+                    )
+                    open_position = _create_open_position(
+                        instrument=instrument,
+                        signal="short",
+                        entry_index=index,
+                        entry_ts=candle.ts,
+                        entry_price_raw=protection.entry_reference,
+                        stop_loss=protection.stop_loss,
+                        take_profit=protection.take_profit,
+                        atr_value=protection.atr_value,
+                        size=size,
+                        entry_fee_rate=taker_fee_rate,
+                        exit_fee_rate=taker_fee_rate,
+                        entry_fee_type="taker",
+                        entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
+                        exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
+                        funding_rate=config.backtest_funding_rate,
+                        dynamic_take_profit_enabled=dynamic_take_profit_enabled,
+                        dynamic_exit_fee_rate=taker_fee_rate,
+                        dynamic_two_r_break_even=config.dynamic_two_r_break_even,
+                        dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                        time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+                        time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+                        apply_entry_slippage=True,
+                    )
+                    pending_index = None
+                    pending_reclaim_close = None
+                    continue
+
+        if pending_index is not None:
+            continue
+        if slope_ratio > slope_threshold or atr_pct > atr_percentile_limit:
+            continue
+        if candle.close >= line_value - breakdown_mult * atr_value or candle.close >= candle.open:
+            continue
+        if not body_retest_short_bias_allows_short(direction_filter_bias, index):
+            continue
+        body_size = abs(candle.open - candle.close)
+        if (body_size / atr_value) > body_atr_limit:
+            continue
+        pending_index = index
+        pending_reclaim_close = candle.close + (candle.open - candle.close) * Decimal("0.5")
 
     return trades, _build_terminal_open_position(open_position, candles)
 
@@ -2120,7 +2481,7 @@ def _run_dynamic_backtest(
             continue
 
         if mtf_filter_bias is not None and index < len(mtf_filter_bias):
-            if not filter_bias_allows_signal(mtf_filter_bias[index], decision.signal):
+            if not _direction_filter_allows_signal(mtf_filter_bias[index], decision.signal):
                 continue
 
         if current_wave_signal != decision.signal:
@@ -3646,6 +4007,26 @@ def _append_backtest_strategy_notes(
             "开空阈值："
             f"{format_decimal_fixed(result.trend_ema_slope_filter_min_ratio, 6)}"
             "（按单根 EMA 斜率 / 当前 EMA 计算，需小于等于该负值才开空）"
+        )
+        _append_backtest_dynamic_take_profit_lines(lines, result)
+        lines.append("方向说明：本策略只做空，不做多。")
+        return
+    if family == "body_retest_short":
+        lines.append(
+            f"交易逻辑：先要求 {fast_label} 单根斜率比例小于等于阈值，并出现一根向下破位的阴线；随后仅在限定观察窗口内，等待价格回抽靠近 {fast_label} 后再次收阴时按收盘价开空。"
+        )
+        lines.append(
+            "Body/ATR 条件："
+            f"breakdown={format_decimal_fixed(result.body_retest_breakdown_atr_multiplier, 2)} ATR | "
+            f"retest={format_decimal_fixed(result.body_retest_retest_atr_multiplier, 2)} ATR | "
+            f"stop_buffer={format_decimal_fixed(result.body_retest_stop_buffer_atr_multiplier, 2)} ATR | "
+            f"body_limit={format_decimal_fixed(result.body_retest_body_atr_limit, 2)} ATR | "
+            f"watch_bars={result.body_retest_watch_bars}"
+        )
+        lines.append(
+            "过滤条件："
+            f"斜率阈值={format_decimal_fixed(result.trend_ema_slope_filter_min_ratio, 6)} | "
+            f"ATR分位上限={format_decimal_fixed(result.atr_percentile_filter_max, 2)}"
         )
         _append_backtest_dynamic_take_profit_lines(lines, result)
         lines.append("方向说明：本策略只做空，不做多。")

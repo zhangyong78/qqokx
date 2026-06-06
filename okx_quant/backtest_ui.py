@@ -9,7 +9,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, BooleanVar, Canvas, StringVar, Text, Toplevel, X, Y
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from okx_quant.backtest import (
     ATR_BATCH_MULTIPLIERS,
@@ -35,6 +35,7 @@ from okx_quant.models import StrategyConfig, moving_average_display_label
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import backtest_history_file_path, load_strategy_parameter_drafts, save_strategy_parameter_drafts
 from okx_quant.pricing import format_decimal, format_decimal_fixed
+from okx_quant.strategy_profiles import StrategyProfile, read_strategy_bundle
 from okx_quant.strategy_catalog import (
     ALL_STRATEGY_DEFINITIONS,
     BACKTEST_STRATEGY_DEFINITIONS,
@@ -125,6 +126,26 @@ MTF_REVERSAL_MODE_VALUE_TO_LABEL = {value: label for label, value in MTF_REVERSA
 MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT = Decimal("0.50")
 TAKE_PROFIT_MODE_VALUE_TO_LABEL = {value: label for label, value in TAKE_PROFIT_MODE_OPTIONS.items()}
 MOVING_AVERAGE_TYPE_OPTIONS = ("EMA", "MA")
+DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE = {
+    "交易所1D": "exchange",
+    "北京时间0点": "bjt_00",
+    "北京时间8点": "bjt_08",
+}
+DAILY_FILTER_BOUNDARY_VALUE_TO_LABEL = {
+    value: label for label, value in DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE.items()
+}
+DAILY_FILTER_MODE_LABEL_TO_VALUE = {
+    "关闭": "disabled",
+    "close vs MA/EMA": "close_vs_ma",
+    "弱日规则": "weak_day",
+}
+DAILY_FILTER_MODE_VALUE_TO_LABEL = {value: label for label, value in DAILY_FILTER_MODE_LABEL_TO_VALUE.items()}
+DAILY_FILTER_SCOPE_LABEL_TO_VALUE = {
+    "多空都过滤": "both",
+    "只过滤多头": "long_only",
+    "只过滤空头": "short_only",
+}
+DAILY_FILTER_SCOPE_VALUE_TO_LABEL = {value: label for label, value in DAILY_FILTER_SCOPE_LABEL_TO_VALUE.items()}
 MANUAL_FILTER_OPTIONS = {
     "全部": "all",
     "仅接近保本": "near_break_even",
@@ -176,6 +197,11 @@ class BacktestLaunchState:
     hold_close_exit_bars: str = "0"
     trend_ema_slope_filter_min_ratio: str = "0"
     atr_percentile_filter_max: str = "0"
+    body_retest_breakdown_atr_multiplier: str = "0.2"
+    body_retest_retest_atr_multiplier: str = "0.3"
+    body_retest_stop_buffer_atr_multiplier: str = "0.3"
+    body_retest_body_atr_limit: str = "1.0"
+    body_retest_watch_bars: str = "6"
     ema55_slope_exit_enabled: bool = True
     maker_fee_percent: str = DEFAULT_MAKER_FEE_PERCENT
     taker_fee_percent: str = DEFAULT_TAKER_FEE_PERCENT
@@ -189,6 +215,15 @@ class BacktestLaunchState:
     start_time_text: str = ""
     end_time_text: str = ""
     candle_limit: str = "10000"
+    daily_filter_enabled: bool = False
+    daily_filter_boundary_label: str = "交易所1D"
+    daily_filter_mode_label: str = "关闭"
+    daily_filter_scope_label: str = "多空都过滤"
+    daily_filter_ma_type: str = "EMA"
+    daily_filter_period: str = "5"
+    backtest_profile_id: str = ""
+    backtest_profile_name: str = ""
+    backtest_profile_summary: str = ""
 
 
 @dataclass
@@ -377,6 +412,14 @@ def _normalize_backtest_bar_label(value: str) -> str:
 
 def _backtest_bar_value_from_label(label: str) -> str:
     return BACKTEST_BAR_LABEL_TO_VALUE[_normalize_backtest_bar_label(label)]
+
+
+def _reverse_lookup_label(mapping: dict[str, str], value: str, default: str) -> str:
+    normalized = str(value or "").strip()
+    for label, candidate in mapping.items():
+        if candidate == normalized:
+            return label
+    return default
 
 
 def _format_backtest_candle_limit(candle_limit: int) -> str:
@@ -999,6 +1042,12 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "trend_ema_slope_filter_enabled": config.trend_ema_slope_filter_enabled,
         "trend_ema_slope_filter_lookback_bars": config.trend_ema_slope_filter_lookback_bars,
         "trend_ema_slope_filter_min_ratio": str(config.trend_ema_slope_filter_min_ratio),
+        "atr_percentile_filter_max": str(config.atr_percentile_filter_max),
+        "body_retest_breakdown_atr_multiplier": str(config.body_retest_breakdown_atr_multiplier),
+        "body_retest_retest_atr_multiplier": str(config.body_retest_retest_atr_multiplier),
+        "body_retest_stop_buffer_atr_multiplier": str(config.body_retest_stop_buffer_atr_multiplier),
+        "body_retest_body_atr_limit": str(config.body_retest_body_atr_limit),
+        "body_retest_watch_bars": int(config.body_retest_watch_bars),
         "time_stop_break_even_enabled": config.time_stop_break_even_enabled,
         "time_stop_break_even_bars": config.resolved_time_stop_break_even_bars(),
         "hold_close_exit_bars": int(config.hold_close_exit_bars),
@@ -1118,6 +1167,14 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         trend_ema_slope_filter_enabled=coerce_bool(payload.get("trend_ema_slope_filter_enabled"), True),
         trend_ema_slope_filter_lookback_bars=int(payload.get("trend_ema_slope_filter_lookback_bars", 5)),
         trend_ema_slope_filter_min_ratio=Decimal(str(payload.get("trend_ema_slope_filter_min_ratio", "0"))),
+        atr_percentile_filter_max=Decimal(str(payload.get("atr_percentile_filter_max", "0"))),
+        body_retest_breakdown_atr_multiplier=Decimal(str(payload.get("body_retest_breakdown_atr_multiplier", "0.2"))),
+        body_retest_retest_atr_multiplier=Decimal(str(payload.get("body_retest_retest_atr_multiplier", "0.3"))),
+        body_retest_stop_buffer_atr_multiplier=Decimal(
+            str(payload.get("body_retest_stop_buffer_atr_multiplier", "0.3"))
+        ),
+        body_retest_body_atr_limit=Decimal(str(payload.get("body_retest_body_atr_limit", "1.0"))),
+        body_retest_watch_bars=int(payload.get("body_retest_watch_bars", 6)),
         time_stop_break_even_enabled=bool(payload.get("time_stop_break_even_enabled", False)),
         time_stop_break_even_bars=int(payload.get("time_stop_break_even_bars", 10)),
         hold_close_exit_bars=int(payload.get("hold_close_exit_bars", 0)),
@@ -1451,6 +1508,12 @@ class BacktestWindow:
         self.mtf_filter_fast_ema_period = StringVar(value=initial_state.mtf_filter_fast_ema_period)
         self.mtf_filter_slow_ema_period = StringVar(value=initial_state.mtf_filter_slow_ema_period)
         self.mtf_reversal_mode_label = StringVar(value=initial_state.mtf_reversal_mode_label)
+        self.daily_filter_enabled = BooleanVar(value=initial_state.daily_filter_enabled)
+        self.daily_filter_boundary_label = StringVar(value=initial_state.daily_filter_boundary_label)
+        self.daily_filter_mode_label = StringVar(value=initial_state.daily_filter_mode_label)
+        self.daily_filter_scope_label = StringVar(value=initial_state.daily_filter_scope_label)
+        self.daily_filter_ma_type = StringVar(value=(initial_state.daily_filter_ma_type or "EMA").upper())
+        self.daily_filter_period = StringVar(value=initial_state.daily_filter_period)
         self.atr_period = StringVar(value=initial_state.atr_period)
         self.stop_atr = StringVar(value=initial_state.stop_atr)
         self.take_atr = StringVar(value=initial_state.take_atr)
@@ -1475,6 +1538,11 @@ class BacktestWindow:
         self.hold_close_exit_bars = StringVar(value=initial_state.hold_close_exit_bars)
         self.trend_ema_slope_filter_min_ratio = StringVar(value=initial_state.trend_ema_slope_filter_min_ratio)
         self.atr_percentile_filter_max = StringVar(value=initial_state.atr_percentile_filter_max)
+        self.body_retest_breakdown_atr_multiplier = StringVar(value=initial_state.body_retest_breakdown_atr_multiplier)
+        self.body_retest_retest_atr_multiplier = StringVar(value=initial_state.body_retest_retest_atr_multiplier)
+        self.body_retest_stop_buffer_atr_multiplier = StringVar(value=initial_state.body_retest_stop_buffer_atr_multiplier)
+        self.body_retest_body_atr_limit = StringVar(value=initial_state.body_retest_body_atr_limit)
+        self.body_retest_watch_bars = StringVar(value=initial_state.body_retest_watch_bars)
         self.ema55_slope_exit_enabled = BooleanVar(value=initial_state.ema55_slope_exit_enabled)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
@@ -1482,6 +1550,10 @@ class BacktestWindow:
         self.trigger_type_label = StringVar(value=initial_state.trigger_type_label)
         self.environment_label = StringVar(value=initial_state.environment_label)
         self.candle_limit = StringVar(value=initial_state.candle_limit)
+        self.backtest_profile_id = StringVar(value=initial_state.backtest_profile_id)
+        self.backtest_profile_name = StringVar(value=initial_state.backtest_profile_name)
+        self.backtest_profile_summary = StringVar(value=initial_state.backtest_profile_summary)
+        self.profile_summary_text = StringVar(value=self._build_profile_summary_text())
         self._strategy_parameter_drafts = load_strategy_parameter_drafts()
         self._strategy_parameter_scope = "backtest"
         self._last_strategy_parameter_strategy_id: str | None = None
@@ -1600,6 +1672,18 @@ class BacktestWindow:
             except Exception:
                 pass
 
+    def _build_profile_summary_text(self) -> str:
+        name = self.backtest_profile_name.get().strip()
+        summary = self.backtest_profile_summary.get().strip()
+        if not name and not summary:
+            return "未加载 Profile，当前可直接手填参数，或导入 Profile/Bundle 自动填充。"
+        if name and summary:
+            return f"当前 Profile：{name} | {summary}"
+        return f"当前 Profile：{name or summary}"
+
+    def _refresh_profile_summary_text(self) -> None:
+        self.profile_summary_text.set(self._build_profile_summary_text())
+
     def _strategy_parameter_scope_drafts(self) -> dict[str, object]:
         drafts = self._strategy_parameter_drafts.get(self._strategy_parameter_scope)
         if not isinstance(drafts, dict):
@@ -1625,12 +1709,24 @@ class BacktestWindow:
             "mtf_filter_fast_ema_period": self.mtf_filter_fast_ema_period,
             "mtf_filter_slow_ema_period": self.mtf_filter_slow_ema_period,
             "mtf_reversal_mode": self.mtf_reversal_mode_label,
+            "daily_filter_enabled": self.daily_filter_enabled,
+            "daily_filter_bar": None,
+            "daily_filter_boundary": self.daily_filter_boundary_label,
+            "daily_filter_mode": self.daily_filter_mode_label,
+            "daily_filter_scope": self.daily_filter_scope_label,
+            "daily_filter_ma_type": self.daily_filter_ma_type,
+            "daily_filter_period": self.daily_filter_period,
             "take_profit_mode": self.take_profit_mode_label,
             "max_entries_per_trend": self.max_entries_per_trend,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
             "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
             "trend_ema_slope_filter_min_ratio": self.trend_ema_slope_filter_min_ratio,
             "atr_percentile_filter_max": self.atr_percentile_filter_max,
+            "body_retest_breakdown_atr_multiplier": self.body_retest_breakdown_atr_multiplier,
+            "body_retest_retest_atr_multiplier": self.body_retest_retest_atr_multiplier,
+            "body_retest_stop_buffer_atr_multiplier": self.body_retest_stop_buffer_atr_multiplier,
+            "body_retest_body_atr_limit": self.body_retest_body_atr_limit,
+            "body_retest_watch_bars": self.body_retest_watch_bars,
             "ema55_slope_exit_enabled": self.ema55_slope_exit_enabled,
             "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
             "time_stop_break_even_bars": self.time_stop_break_even_bars,
@@ -1904,6 +2000,27 @@ class BacktestWindow:
             state="readonly",
         )
         self.bar_combo.grid(row=row, column=5, sticky="ew")
+
+        row += 1
+        self.profile_summary_caption = ttk.Label(controls, text="Profile")
+        self.profile_summary_caption.grid(row=row, column=0, sticky="w", pady=(10, 0))
+        self.profile_summary_label = ttk.Label(
+            controls,
+            textvariable=self.profile_summary_text,
+            justify="left",
+            foreground="#57606a",
+        )
+        self.profile_summary_label.grid(row=row, column=1, columnspan=3, sticky="w", pady=(10, 0))
+        self._bind_responsive_wrap(self.profile_summary_label, controls, padding=180, min_wrap=260)
+        self.import_profile_button = ttk.Button(
+            controls,
+            text="导入 Profile/Bundle",
+            command=self.import_backtest_profile_bundle,
+        )
+        self.import_profile_button.grid(row=row, column=4, sticky="e", pady=(10, 0), padx=(0, 8))
+        self.clear_profile_button = ttk.Button(controls, text="清除来源", command=self.clear_backtest_profile_origin)
+        self.clear_profile_button.grid(row=row, column=5, sticky="ew", pady=(10, 0))
+
         row += 1
         self.ema_period_caption = ttk.Label(controls, text="快线均线")
         self.ema_period_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
@@ -1993,6 +2110,39 @@ class BacktestWindow:
         row += 1
         self.mtf_filter_bar_caption = ttk.Label(controls, text="高周期K线")
         self.mtf_filter_bar_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self.atr_percentile_filter_caption = ttk.Label(controls, text="ATR percentile max")
+        self.atr_percentile_filter_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.atr_percentile_filter_entry = ttk.Entry(controls, textvariable=self.atr_percentile_filter_max)
+        self.atr_percentile_filter_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.body_retest_breakdown_caption = ttk.Label(controls, text="Breakdown ATR")
+        self.body_retest_breakdown_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.body_retest_breakdown_entry = ttk.Entry(controls, textvariable=self.body_retest_breakdown_atr_multiplier)
+        self.body_retest_breakdown_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.body_retest_retest_caption = ttk.Label(controls, text="Retest ATR")
+        self.body_retest_retest_caption.grid(row=row, column=4, sticky="w", pady=(8, 0))
+        self.body_retest_retest_entry = ttk.Entry(controls, textvariable=self.body_retest_retest_atr_multiplier)
+        self.body_retest_retest_entry.grid(row=row, column=5, sticky="ew", pady=(8, 0))
+
+        row += 1
+        self.body_retest_stop_buffer_caption = ttk.Label(controls, text="Stop buffer ATR")
+        self.body_retest_stop_buffer_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.body_retest_stop_buffer_entry = ttk.Entry(
+            controls,
+            textvariable=self.body_retest_stop_buffer_atr_multiplier,
+        )
+        self.body_retest_stop_buffer_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.body_retest_body_limit_caption = ttk.Label(controls, text="Body ATR limit")
+        self.body_retest_body_limit_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.body_retest_body_limit_entry = ttk.Entry(controls, textvariable=self.body_retest_body_atr_limit)
+        self.body_retest_body_limit_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.body_retest_watch_bars_caption = ttk.Label(controls, text="Watch bars")
+        self.body_retest_watch_bars_caption.grid(row=row, column=4, sticky="w", pady=(8, 0))
+        self.body_retest_watch_bars_entry = ttk.Entry(controls, textvariable=self.body_retest_watch_bars)
+        self.body_retest_watch_bars_entry.grid(row=row, column=5, sticky="ew", pady=(8, 0))
+
+        row += 1
+        self.mtf_filter_bar_caption_row = ttk.Label(controls, text="Higher TF bar")
+        self.mtf_filter_bar_caption_row.grid(row=row, column=0, sticky="w", pady=(12, 0))
         self.mtf_filter_bar_combo = ttk.Combobox(
             controls,
             textvariable=self.mtf_filter_bar,
@@ -2019,6 +2169,67 @@ class BacktestWindow:
             state="readonly",
         )
         self.mtf_reversal_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+
+        row += 1
+        self.daily_filter_enabled_check = ttk.Checkbutton(
+            controls,
+            text="启用日线过滤（仅使用当时已收盘的上一根日线）",
+            variable=self.daily_filter_enabled,
+            command=self._sync_daily_filter_controls,
+        )
+        self.daily_filter_enabled_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.daily_filter_boundary_caption = ttk.Label(controls, text="日线标准")
+        self.daily_filter_boundary_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.daily_filter_boundary_combo = ttk.Combobox(
+            controls,
+            textvariable=self.daily_filter_boundary_label,
+            values=list(DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE.keys()),
+            state="readonly",
+        )
+        self.daily_filter_boundary_combo.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.daily_filter_scope_caption = ttk.Label(controls, text="过滤方向")
+        self.daily_filter_scope_caption.grid(row=row, column=4, sticky="w", pady=(8, 0))
+        self.daily_filter_scope_combo = ttk.Combobox(
+            controls,
+            textvariable=self.daily_filter_scope_label,
+            values=list(DAILY_FILTER_SCOPE_LABEL_TO_VALUE.keys()),
+            state="readonly",
+        )
+        self.daily_filter_scope_combo.grid(row=row, column=5, sticky="ew", pady=(8, 0))
+
+        row += 1
+        self.daily_filter_mode_caption = ttk.Label(controls, text="过滤规则")
+        self.daily_filter_mode_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.daily_filter_mode_combo = ttk.Combobox(
+            controls,
+            textvariable=self.daily_filter_mode_label,
+            values=list(DAILY_FILTER_MODE_LABEL_TO_VALUE.keys()),
+            state="readonly",
+        )
+        self.daily_filter_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.daily_filter_mode_combo.bind("<<ComboboxSelected>>", lambda *_: self._sync_daily_filter_controls())
+        self.daily_filter_ma_caption = ttk.Label(controls, text="均线类型")
+        self.daily_filter_ma_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.daily_filter_ma_combo = ttk.Combobox(
+            controls,
+            textvariable=self.daily_filter_ma_type,
+            values=MOVING_AVERAGE_TYPE_OPTIONS,
+            state="readonly",
+            width=6,
+        )
+        self.daily_filter_ma_combo.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.daily_filter_period_caption = ttk.Label(controls, text="均线周期")
+        self.daily_filter_period_caption.grid(row=row, column=4, sticky="w", pady=(8, 0))
+        self.daily_filter_period_entry = ttk.Entry(controls, textvariable=self.daily_filter_period)
+        self.daily_filter_period_entry.grid(row=row, column=5, sticky="ew", pady=(8, 0))
+
+        row += 1
+        self.daily_filter_hint = ttk.Label(
+            controls,
+            text="北京时间0点/8点日线会从 1H 已收盘K线重采样；交易所1D 直接使用 OKX 已收盘日线。",
+            foreground="#57606a",
+        )
+        self.daily_filter_hint.grid(row=row, column=0, columnspan=6, sticky="w", pady=(2, 0))
 
         row += 1
         self.take_profit_mode_caption = ttk.Label(controls, text="止盈方式")
@@ -3326,9 +3537,21 @@ class BacktestWindow:
         mtf_filter_fast_ema_period = 21
         mtf_filter_slow_ema_period = 55
         mtf_reversal_mode = "block_new_entries"
+        daily_filter_enabled = False
+        daily_filter_boundary = "exchange"
+        daily_filter_mode = "disabled"
+        daily_filter_scope = "both"
+        daily_filter_ma_type = "ema"
+        daily_filter_period = 5
         dynamic_two_r_break_even = False
         dynamic_fee_offset_enabled = False
         trend_ema_slope_filter_min_ratio = Decimal("0")
+        atr_percentile_filter_max = Decimal("0")
+        body_retest_breakdown_atr_multiplier = Decimal("0.2")
+        body_retest_retest_atr_multiplier = Decimal("0.3")
+        body_retest_stop_buffer_atr_multiplier = Decimal("0.3")
+        body_retest_body_atr_limit = Decimal("1.0")
+        body_retest_watch_bars = 6
         time_stop_break_even_enabled = False
         time_stop_break_even_bars = 0
         hold_close_exit_bars = 0
@@ -3355,6 +3578,36 @@ class BacktestWindow:
             )
             if trend_ema_slope_filter_min_ratio > 0:
                 raise ValueError("开空斜率阈值必须小于或等于 0")
+        if strategy_uses_parameter(definition.strategy_id, "atr_percentile_filter_max"):
+            atr_percentile_filter_max = self._parse_nonnegative_decimal(
+                self.atr_percentile_filter_max.get(),
+                "ATR percentile max",
+            )
+        if strategy_uses_parameter(definition.strategy_id, "body_retest_breakdown_atr_multiplier"):
+            body_retest_breakdown_atr_multiplier = self._parse_nonnegative_decimal(
+                self.body_retest_breakdown_atr_multiplier.get(),
+                "Breakdown ATR",
+            )
+        if strategy_uses_parameter(definition.strategy_id, "body_retest_retest_atr_multiplier"):
+            body_retest_retest_atr_multiplier = self._parse_nonnegative_decimal(
+                self.body_retest_retest_atr_multiplier.get(),
+                "Retest ATR",
+            )
+        if strategy_uses_parameter(definition.strategy_id, "body_retest_stop_buffer_atr_multiplier"):
+            body_retest_stop_buffer_atr_multiplier = self._parse_nonnegative_decimal(
+                self.body_retest_stop_buffer_atr_multiplier.get(),
+                "Stop buffer ATR",
+            )
+        if strategy_uses_parameter(definition.strategy_id, "body_retest_body_atr_limit"):
+            body_retest_body_atr_limit = self._parse_nonnegative_decimal(
+                self.body_retest_body_atr_limit.get(),
+                "Body ATR limit",
+            )
+        if strategy_uses_parameter(definition.strategy_id, "body_retest_watch_bars"):
+            body_retest_watch_bars = self._parse_positive_int(
+                self.body_retest_watch_bars.get(),
+                "Watch bars",
+            )
         if strategy_uses_parameter(definition.strategy_id, "mtf_filter_bar"):
             mtf_filter_bar = str(
                 self._resolve_strategy_parameter_value(
@@ -3387,6 +3640,44 @@ class BacktestWindow:
                     MTF_REVERSAL_MODE_OPTIONS.get(self.mtf_reversal_mode_label.get(), "block_new_entries"),
                 )
             )
+        if strategy_uses_parameter(definition.strategy_id, "daily_filter_enabled"):
+            daily_filter_enabled = bool(self.daily_filter_enabled.get())
+            daily_filter_boundary = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "daily_filter_boundary",
+                    DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE.get(self.daily_filter_boundary_label.get(), "exchange"),
+                )
+            )
+            daily_filter_mode = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "daily_filter_mode",
+                    DAILY_FILTER_MODE_LABEL_TO_VALUE.get(self.daily_filter_mode_label.get(), "disabled"),
+                )
+            )
+            daily_filter_scope = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "daily_filter_scope",
+                    DAILY_FILTER_SCOPE_LABEL_TO_VALUE.get(self.daily_filter_scope_label.get(), "both"),
+                )
+            )
+            daily_filter_ma_type = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "daily_filter_ma_type",
+                    self.daily_filter_ma_type.get().strip().lower(),
+                )
+            )
+            if daily_filter_mode == "close_vs_ma":
+                daily_filter_period = int(
+                    self._resolve_strategy_parameter_value(
+                        strategy_id,
+                        "daily_filter_period",
+                        self._parse_positive_int(self.daily_filter_period.get(), "日线均线周期"),
+                    )
+                )
         if dynamic_tp_strategy:
             take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
             if strategy_uses_parameter(definition.strategy_id, "max_entries_per_trend"):
@@ -3451,6 +3742,12 @@ class BacktestWindow:
             dynamic_two_r_break_even=dynamic_two_r_break_even,
             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
             trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
+            atr_percentile_filter_max=atr_percentile_filter_max,
+            body_retest_breakdown_atr_multiplier=body_retest_breakdown_atr_multiplier,
+            body_retest_retest_atr_multiplier=body_retest_retest_atr_multiplier,
+            body_retest_stop_buffer_atr_multiplier=body_retest_stop_buffer_atr_multiplier,
+            body_retest_body_atr_limit=body_retest_body_atr_limit,
+            body_retest_watch_bars=body_retest_watch_bars,
             time_stop_break_even_enabled=time_stop_break_even_enabled,
             time_stop_break_even_bars=time_stop_break_even_bars,
             hold_close_exit_bars=hold_close_exit_bars,
@@ -3458,6 +3755,12 @@ class BacktestWindow:
             mtf_filter_fast_ema_period=mtf_filter_fast_ema_period,
             mtf_filter_slow_ema_period=mtf_filter_slow_ema_period,
             mtf_reversal_mode=mtf_reversal_mode,
+            daily_filter_enabled=daily_filter_enabled,
+            daily_filter_boundary=daily_filter_boundary,
+            daily_filter_mode=daily_filter_mode,
+            daily_filter_scope=daily_filter_scope,
+            daily_filter_ma_type=daily_filter_ma_type,
+            daily_filter_period=daily_filter_period,
             backtest_initial_capital=self._parse_positive_decimal(self.initial_capital.get(), "初始资金"),
             backtest_sizing_mode=sizing_mode,
             backtest_risk_percent=risk_percent,
@@ -3467,6 +3770,9 @@ class BacktestWindow:
             backtest_slippage_rate=exit_slippage_rate,
             backtest_funding_rate=self._parse_nonnegative_decimal(self.funding_rate_percent.get(), "资金费率/8h")
             / Decimal("100"),
+            backtest_profile_id=self.backtest_profile_id.get().strip(),
+            backtest_profile_name=self.backtest_profile_name.get().strip(),
+            backtest_profile_summary=self.backtest_profile_summary.get().strip(),
         )
 
     def _selected_strategy_definition(self) -> StrategyDefinition:
@@ -3540,6 +3846,25 @@ class BacktestWindow:
                     widget.grid()
                 else:
                     widget.grid_remove()
+            daily_filter_widgets = (
+                self.daily_filter_enabled_check,
+                self.daily_filter_boundary_caption,
+                self.daily_filter_boundary_combo,
+                self.daily_filter_scope_caption,
+                self.daily_filter_scope_combo,
+                self.daily_filter_mode_caption,
+                self.daily_filter_mode_combo,
+                self.daily_filter_ma_caption,
+                self.daily_filter_ma_combo,
+                self.daily_filter_period_caption,
+                self.daily_filter_period_entry,
+                self.daily_filter_hint,
+            )
+            for widget in daily_filter_widgets:
+                if visibility.show_daily_filter_controls:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
             dynamic_widgets = (
                 self.take_profit_mode_caption,
                 self.take_profit_mode_combo,
@@ -3587,6 +3912,14 @@ class BacktestWindow:
             self._set_field_state(self.mtf_filter_fast_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_fast_ema_period", "backtest"))
             self._set_field_state(self.mtf_filter_slow_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_slow_ema_period", "backtest"))
             self._set_field_state(self.mtf_reversal_mode_combo, editable=strategy_is_parameter_editable(strategy_id, "mtf_reversal_mode", "backtest"))
+            if visibility.show_daily_filter_controls:
+                self.daily_filter_enabled_check.configure(
+                    state=(
+                        "normal"
+                        if strategy_is_parameter_editable(strategy_id, "daily_filter_enabled", "backtest")
+                        else "disabled"
+                    )
+                )
             self._set_field_state(
                 self.entry_reference_ema_type_combo,
                 editable=strategy_is_parameter_editable(strategy_id, "entry_reference_ema_type", "backtest"),
@@ -3594,6 +3927,50 @@ class BacktestWindow:
             self._set_field_state(
                 self.slope_threshold_entry,
                 editable=strategy_is_parameter_editable(strategy_id, "trend_ema_slope_filter_min_ratio", "backtest"),
+            )
+            self._set_field_state(
+                self.atr_percentile_filter_entry,
+                editable=strategy_is_parameter_editable(strategy_id, "atr_percentile_filter_max", "backtest"),
+            )
+            self._set_field_state(
+                self.body_retest_breakdown_entry,
+                editable=strategy_is_parameter_editable(
+                    strategy_id,
+                    "body_retest_breakdown_atr_multiplier",
+                    "backtest",
+                ),
+            )
+            self._set_field_state(
+                self.body_retest_retest_entry,
+                editable=strategy_is_parameter_editable(
+                    strategy_id,
+                    "body_retest_retest_atr_multiplier",
+                    "backtest",
+                ),
+            )
+            self._set_field_state(
+                self.body_retest_stop_buffer_entry,
+                editable=strategy_is_parameter_editable(
+                    strategy_id,
+                    "body_retest_stop_buffer_atr_multiplier",
+                    "backtest",
+                ),
+            )
+            self._set_field_state(
+                self.body_retest_body_limit_entry,
+                editable=strategy_is_parameter_editable(
+                    strategy_id,
+                    "body_retest_body_atr_limit",
+                    "backtest",
+                ),
+            )
+            self._set_field_state(
+                self.body_retest_watch_bars_entry,
+                editable=strategy_is_parameter_editable(
+                    strategy_id,
+                    "body_retest_watch_bars",
+                    "backtest",
+                ),
             )
             self._set_field_state(
                 self.hold_close_exit_bars_entry,
@@ -3604,6 +3981,8 @@ class BacktestWindow:
             self.entry_reference_ema_period.set("55")
         self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
+        self._sync_daily_filter_controls()
+        self._refresh_profile_summary_text()
         self._update_sizing_mode_widgets()
         if self._latest_result is None:
             self.manual_summary.set("当前策略没有额外扩展统计。")
@@ -3625,6 +4004,160 @@ class BacktestWindow:
         self.time_stop_break_even_bars_entry.configure(
             state="normal" if dynamic_take_profit and self.time_stop_break_even_enabled.get() else "disabled"
         )
+
+    def _sync_daily_filter_controls(self) -> None:
+        if not hasattr(self, "daily_filter_enabled_check"):
+            return
+        enabled = bool(self.daily_filter_enabled.get())
+        mode = DAILY_FILTER_MODE_LABEL_TO_VALUE.get(self.daily_filter_mode_label.get(), "disabled")
+        mode_active = enabled and mode != "disabled"
+        ma_active = mode_active and mode == "close_vs_ma"
+        self._set_field_state(self.daily_filter_boundary_combo, editable=mode_active)
+        self._set_field_state(self.daily_filter_scope_combo, editable=mode_active)
+        self._set_field_state(self.daily_filter_mode_combo, editable=enabled)
+        self._set_field_state(self.daily_filter_ma_combo, editable=ma_active)
+        self._set_field_state(self.daily_filter_period_entry, editable=ma_active)
+
+    def clear_backtest_profile_origin(self) -> None:
+        self.backtest_profile_id.set("")
+        self.backtest_profile_name.set("")
+        self.backtest_profile_summary.set("")
+        self._refresh_profile_summary_text()
+
+    def import_backtest_profile_bundle(self) -> None:
+        source = filedialog.askopenfilename(
+            parent=self.window,
+            title="导入 Backtest Profile / Bundle",
+            filetypes=(("JSON 文件", "*.json"), ("所有文件", "*.*")),
+        )
+        if not source:
+            return
+        source_path = Path(source)
+        try:
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
+            profiles: list[StrategyProfile] = []
+            if isinstance(payload, dict) and isinstance(payload.get("profiles"), list):
+                bundle = read_strategy_bundle(source_path)
+                profiles = list(bundle.profiles)
+            elif isinstance(payload, dict) and "profile_id" in payload and "config_snapshot" in payload:
+                profiles = [StrategyProfile.from_payload(payload)]
+            elif isinstance(payload, dict) and isinstance(payload.get("strategy_profile"), dict):
+                profiles = [StrategyProfile.from_payload(payload.get("strategy_profile"))]
+            else:
+                config = _deserialize_strategy_config(payload if isinstance(payload, dict) else {})
+                if config is None:
+                    raise ValueError("文件里没有可识别的 Profile / Bundle / 回测参数快照。")
+                definition = get_strategy_definition(str(config.strategy_id or "").strip())
+                profiles = [
+                    StrategyProfile(
+                        profile_id=f"{config.strategy_id}:{config.inst_id}",
+                        profile_name=f"{definition.name} | {config.inst_id}",
+                        strategy_id=str(config.strategy_id or "").strip(),
+                        symbol=str(config.inst_id or "").strip().upper(),
+                        config_snapshot=_serialize_strategy_config(config),
+                    )
+                ]
+            if not profiles:
+                raise ValueError("导入文件里没有可用的 Profile。")
+            self._apply_backtest_profile(self._select_profile_for_backtest_import(profiles))
+        except Exception as exc:
+            messagebox.showerror("导入失败", str(exc), parent=self.window)
+            return
+        self.report_summary.set(
+            f"已导入 Profile：{self.backtest_profile_name.get().strip() or '-'} | 来源：{source_path.name}"
+        )
+
+    def _select_profile_for_backtest_import(self, profiles: list[StrategyProfile]) -> StrategyProfile:
+        current_strategy_id = self._selected_strategy_definition().strategy_id
+        current_symbol = self.symbol.get().strip().upper()
+        exact = [item for item in profiles if item.strategy_id == current_strategy_id and item.symbol == current_symbol]
+        if exact:
+            return exact[0]
+        same_strategy = [item for item in profiles if item.strategy_id == current_strategy_id]
+        if len(same_strategy) == 1:
+            return same_strategy[0]
+        same_symbol = [item for item in profiles if item.symbol == current_symbol]
+        if len(same_symbol) == 1:
+            return same_symbol[0]
+        return profiles[0]
+
+    def _apply_backtest_profile(self, profile: StrategyProfile) -> None:
+        config = _deserialize_strategy_config(dict(profile.config_snapshot))
+        if config is None:
+            raise ValueError("Profile 缺少有效的回测配置快照。")
+        definition = get_strategy_definition(profile.strategy_id)
+        self.strategy_name.set(definition.name)
+        self._apply_selected_strategy_definition()
+        self.symbol.set(str(profile.symbol or config.inst_id).strip().upper())
+        self.symbol_combo.configure(values=_build_backtest_symbol_options(self.symbol.get()))
+        self.bar_label.set(_normalize_backtest_bar_label(config.bar))
+        self.ema_type.set(str(config.resolved_ema_type()).upper())
+        self.ema_period.set(str(config.ema_period))
+        self.trend_ema_type.set(str(config.resolved_trend_ema_type()).upper())
+        self.trend_ema_period.set(str(config.trend_ema_period))
+        self.big_ema_period.set(str(config.big_ema_period))
+        self.entry_reference_ema_type.set(str(config.resolved_entry_reference_ema_type()).upper())
+        self.entry_reference_ema_period.set(str(config.entry_reference_ema_period))
+        self.mtf_filter_bar.set(_normalize_backtest_bar_label(config.resolved_mtf_filter_bar()))
+        self.mtf_filter_fast_ema_period.set(str(config.mtf_filter_fast_ema_period))
+        self.mtf_filter_slow_ema_period.set(str(config.mtf_filter_slow_ema_period))
+        self.daily_filter_enabled.set(bool(config.daily_filter_enabled))
+        self.daily_filter_boundary_label.set(
+            DAILY_FILTER_BOUNDARY_VALUE_TO_LABEL.get(str(config.daily_filter_boundary), "交易所1D")
+        )
+        self.daily_filter_mode_label.set(
+            DAILY_FILTER_MODE_VALUE_TO_LABEL.get(str(config.daily_filter_mode), "关闭")
+        )
+        self.daily_filter_scope_label.set(
+            DAILY_FILTER_SCOPE_VALUE_TO_LABEL.get(str(config.daily_filter_scope), "多空都过滤")
+        )
+        self.daily_filter_ma_type.set(str(config.daily_filter_ma_type or "ema").upper())
+        self.daily_filter_period.set(str(config.daily_filter_period))
+        self.atr_period.set(str(config.atr_period))
+        self.stop_atr.set(format_decimal(config.atr_stop_multiplier))
+        self.take_atr.set(format_decimal(config.atr_take_multiplier))
+        self.risk_amount.set("" if config.risk_amount is None else format_decimal(config.risk_amount))
+        self.take_profit_mode_label.set(
+            TAKE_PROFIT_MODE_VALUE_TO_LABEL.get(str(config.take_profit_mode), self.take_profit_mode_label.get())
+        )
+        self.max_entries_per_trend.set(str(config.max_entries_per_trend))
+        self.dynamic_two_r_break_even.set(bool(config.dynamic_two_r_break_even))
+        self.dynamic_fee_offset_enabled.set(bool(config.dynamic_fee_offset_enabled))
+        self.time_stop_break_even_enabled.set(bool(config.time_stop_break_even_enabled))
+        self.time_stop_break_even_bars.set(str(config.time_stop_break_even_bars))
+        self.hold_close_exit_bars.set(str(config.hold_close_exit_bars))
+        self.trend_ema_slope_filter_min_ratio.set(format_decimal(config.trend_ema_slope_filter_min_ratio))
+        self.atr_percentile_filter_max.set(format_decimal(config.atr_percentile_filter_max))
+        self.body_retest_breakdown_atr_multiplier.set(format_decimal(config.body_retest_breakdown_atr_multiplier))
+        self.body_retest_retest_atr_multiplier.set(format_decimal(config.body_retest_retest_atr_multiplier))
+        self.body_retest_stop_buffer_atr_multiplier.set(format_decimal(config.body_retest_stop_buffer_atr_multiplier))
+        self.body_retest_body_atr_limit.set(format_decimal(config.body_retest_body_atr_limit))
+        self.body_retest_watch_bars.set(str(config.body_retest_watch_bars))
+        self.signal_mode_label.set(SIGNAL_VALUE_TO_LABEL.get(str(config.signal_mode), self.signal_mode_label.get()))
+        self.trade_mode_label.set(_reverse_lookup_label(TRADE_MODE_OPTIONS, config.trade_mode, self.trade_mode_label.get()))
+        self.position_mode_label.set(
+            _reverse_lookup_label(POSITION_MODE_OPTIONS, config.position_mode, self.position_mode_label.get())
+        )
+        self.trigger_type_label.set(
+            _reverse_lookup_label(TRIGGER_TYPE_OPTIONS, config.tp_sl_trigger_type, self.trigger_type_label.get())
+        )
+        self.environment_label.set(_reverse_lookup_label(ENV_OPTIONS, config.environment, self.environment_label.get()))
+        self.initial_capital.set(format_decimal(config.backtest_initial_capital))
+        self.sizing_mode_label.set(
+            BACKTEST_SIZING_VALUE_TO_LABEL.get(str(config.backtest_sizing_mode), self.sizing_mode_label.get())
+        )
+        self.risk_percent.set("" if config.backtest_risk_percent is None else format_decimal(config.backtest_risk_percent))
+        self.compounding_enabled.set(bool(config.backtest_compounding))
+        self.entry_slippage_percent.set(format_decimal(config.resolved_backtest_entry_slippage_rate() * Decimal("100")))
+        self.exit_slippage_percent.set(format_decimal(config.resolved_backtest_exit_slippage_rate() * Decimal("100")))
+        self.funding_rate_percent.set(format_decimal(config.backtest_funding_rate * Decimal("100")))
+        self.backtest_profile_id.set(profile.profile_id)
+        self.backtest_profile_name.set(profile.profile_name)
+        self.backtest_profile_summary.set(config.daily_filter_summary())
+        self._refresh_profile_summary_text()
+        self._sync_daily_filter_controls()
+        self._sync_dynamic_take_profit_controls()
+        self._update_sizing_mode_widgets()
 
     def _append_backtest_snapshot(
         self,
@@ -4807,6 +5340,41 @@ class BacktestWindow:
             fill="#57606a",
             font=("Microsoft YaHei UI", 9),
         )
+        if result.daily_filter_enabled:
+            boundary_labels = {
+                "exchange": "Exchange 1D",
+                "bjt_00": "BJT 00:00",
+                "bjt_08": "BJT 08:00",
+            }
+            scope_labels = {
+                "both": "Both",
+                "long_only": "Long Only",
+                "short_only": "Short Only",
+            }
+            if result.daily_filter_mode == "weak_day":
+                filter_text = (
+                    f"Daily Filter: {boundary_labels.get(result.daily_filter_boundary, result.daily_filter_boundary)} | "
+                    f"Weak Day | {scope_labels.get(result.daily_filter_scope, result.daily_filter_scope)}"
+                )
+            else:
+                filter_text = (
+                    f"Daily Filter: {boundary_labels.get(result.daily_filter_boundary, result.daily_filter_boundary)} | "
+                    f"{str(result.daily_filter_ma_type).upper()}{result.daily_filter_period} close-vs-MA | "
+                    f"{scope_labels.get(result.daily_filter_scope, result.daily_filter_scope)}"
+                )
+            visible_bias = result.direction_filter_bias[start_index:end_index] if result.direction_filter_bias else []
+            if visible_bias:
+                allowed_long = sum(1 for item in visible_bias if item in {"long", "both"})
+                allowed_short = sum(1 for item in visible_bias if item in {"short", "both"})
+                filter_text = f"{filter_text} | L {allowed_long} / S {allowed_short}"
+            canvas.create_text(
+                left,
+                top + 8,
+                text=filter_text,
+                anchor="nw",
+                fill="#7c3aed",
+                font=("Microsoft YaHei UI", 9, "bold"),
+            )
         axis_steps = 2 if fast_mode else 4
         for price_value in _chart_price_axis_values(Decimal(str(price_min)), Decimal(str(price_max)), steps=axis_steps):
             y = y_for(price_value)
@@ -5193,6 +5761,11 @@ class BacktestWindow:
             if self._latest_result.drawdown_pct_curve
             else Decimal("0")
         )
+        direction_bias = (
+            self._latest_result.direction_filter_bias[hover_index]
+            if hover_index < len(self._latest_result.direction_filter_bias)
+            else None
+        )
         x = state.left + ((hover_index - state.start_index) * state.candle_step) + (state.candle_step / 2)
         canvas.create_line(
             x,
@@ -5221,6 +5794,7 @@ class BacktestWindow:
             big_ema_period=big_ema_period,
             atr_period=str(self._latest_result.atr_period),
             tick_size=self._latest_result.instrument.tick_size,
+            direction_filter_bias=direction_bias,
         )
         text_item = canvas.create_text(
             state.left + 10,
@@ -5333,6 +5907,8 @@ class BacktestWindow:
             f"止损：{format_decimal(config.atr_stop_multiplier)} ATR",
             f"止盈：{take_profit_label}",
         ]
+        if config.uses_daily_filter():
+            metrics_parts.append(config.daily_filter_summary())
         if config.take_profit_mode == "dynamic":
             metrics_parts.append(f"2R保本：{config.dynamic_two_r_break_even_label()}")
             metrics_parts.append(f"手续费偏移：{config.dynamic_fee_offset_enabled_label()}")
@@ -5677,6 +6253,7 @@ def _format_chart_hover_lines(
     big_ema_period: str | None,
     atr_period: str,
     tick_size: Decimal,
+    direction_filter_bias: str | None = None,
 ) -> list[str]:
     reference_period = ema_period if reference_ema_period is None else str(reference_ema_period)
     lines = [
@@ -5708,6 +6285,14 @@ def _format_chart_hover_lines(
         lines.append(f"ATR({atr_period}): {_format_price_by_tick_size(atr_value, tick_size)}")
     if big_ema_value is not None and big_ema_period:
         lines.append(f"EMA({big_ema_period}): {_format_price_by_tick_size(big_ema_value, tick_size)}")
+    if direction_filter_bias:
+        bias_labels = {
+            "long": "只允许做多",
+            "short": "只允许做空",
+            "both": "多空都允许",
+            "neutral": "当前都不允许",
+        }
+        lines.append(f"日线过滤: {bias_labels.get(direction_filter_bias, direction_filter_bias)}")
     lines.extend(
         [
             f"净值曲线: {format_decimal_fixed(equity_value, 2)}",

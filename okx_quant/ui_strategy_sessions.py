@@ -125,7 +125,43 @@ class UiStrategySessionsMixin:
         )
         self.max_entries_per_trend.set(str(record.config.max_entries_per_trend))
         self.trend_ema_slope_filter_min_ratio.set(_format_entry_decimal(record.config.trend_ema_slope_filter_min_ratio))
+        self.atr_percentile_filter_max.set(_format_entry_decimal(record.config.atr_percentile_filter_max))
+        self.body_retest_breakdown_atr_multiplier.set(
+            _format_entry_decimal(record.config.body_retest_breakdown_atr_multiplier)
+        )
+        self.body_retest_retest_atr_multiplier.set(
+            _format_entry_decimal(record.config.body_retest_retest_atr_multiplier)
+        )
+        self.body_retest_stop_buffer_atr_multiplier.set(
+            _format_entry_decimal(record.config.body_retest_stop_buffer_atr_multiplier)
+        )
+        self.body_retest_body_atr_limit.set(_format_entry_decimal(record.config.body_retest_body_atr_limit))
+        self.body_retest_watch_bars.set(str(record.config.body_retest_watch_bars))
         self.startup_chase_window_seconds.set(str(record.config.startup_chase_window_seconds))
+        self.daily_filter_enabled.set(bool(record.config.daily_filter_enabled))
+        self.daily_filter_boundary_label.set(
+            _reverse_lookup_label(
+                DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE,
+                str(record.config.daily_filter_boundary),
+                "交易所1D",
+            )
+        )
+        self.daily_filter_mode_label.set(
+            _reverse_lookup_label(
+                DAILY_FILTER_MODE_LABEL_TO_VALUE,
+                str(record.config.daily_filter_mode),
+                "关闭",
+            )
+        )
+        self.daily_filter_scope_label.set(
+            _reverse_lookup_label(
+                DAILY_FILTER_SCOPE_LABEL_TO_VALUE,
+                str(record.config.daily_filter_scope),
+                "多空都过滤",
+            )
+        )
+        self.daily_filter_ma_type.set(str(record.config.daily_filter_ma_type).upper())
+        self.daily_filter_period.set(str(record.config.daily_filter_period))
         self.dynamic_two_r_break_even.set(record.config.dynamic_two_r_break_even)
         self.dynamic_fee_offset_enabled.set(record.config.dynamic_fee_offset_enabled)
         self.time_stop_break_even_enabled.set(record.config.time_stop_break_even_enabled)
@@ -150,6 +186,7 @@ class UiStrategySessionsMixin:
         if strategy_forces_follow_signal(definition.strategy_id):
             self.entry_side_mode_label.set("跟随信号")
         self._sync_dynamic_take_profit_controls()
+        QuantApp._sync_daily_filter_controls(self)
         QuantApp._sync_entry_side_mode_controls(self)
         return definition, resolved_api_name, api_note
 
@@ -345,6 +382,7 @@ class UiStrategySessionsMixin:
         dialog = StrategyBundleImportDialog(
             self.root,
             package_name=bundle.package_name,
+            items=bundle.items,
             source_apis=source_apis,
             available_profiles=available_profiles,
             current_api_name=current_api_name,
@@ -353,25 +391,69 @@ class UiStrategySessionsMixin:
         selection = dialog.result_payload
         if not selection:
             return
+        selected_indices_raw = str(selection.get("selected_indices", "") or "").strip()
+        selected_indices = {
+            int(item)
+            for item in selected_indices_raw.split(",")
+            if str(item).strip().isdigit()
+        }
+        selected_items = tuple(
+            item for index, item in enumerate(bundle.items) if not selected_indices or index in selected_indices
+        )
+        if not selected_items:
+            messagebox.showinfo("提示", "这次没有选中任何策略。")
+            return
+        per_item_api_map_raw = str(selection.get("per_item_api_map", "") or "").strip()
+        per_item_api_map: dict[int, str] = {}
+        if per_item_api_map_raw:
+            for chunk in per_item_api_map_raw.split(";"):
+                left, sep, right = chunk.partition("=")
+                if not sep:
+                    continue
+                if not left.strip().isdigit():
+                    continue
+                api_name = right.strip()
+                if api_name:
+                    per_item_api_map[int(left.strip())] = api_name
 
         imported_labels: list[str] = []
         started_session_ids: list[str] = []
         skipped_summaries: list[str] = []
         start_failed_summaries: list[str] = []
         api_notes: list[str] = []
+        api_summary_counts: dict[str, dict[str, int]] = {}
+
+        def _record_api_outcome(api_name: str, outcome: str) -> None:
+            normalized_api = (api_name or "-").strip() or "-"
+            stats = api_summary_counts.setdefault(
+                normalized_api,
+                {"started": 0, "applied": 0, "skipped": 0, "failed": 0},
+            )
+            stats[outcome] = stats.get(outcome, 0) + 1
 
         auto_start_enabled = _coerce_snapshot_bool(selection.get("auto_start"), False)
         if auto_start_enabled:
-            for item in bundle.items:
+            for original_index, item in enumerate(bundle.items):
+                if item not in selected_items:
+                    continue
+                selected_mode = str(selection.get("mode", "preserve")).strip().lower()
+                selected_api_name = (
+                    per_item_api_map.get(original_index, "")
+                    if selected_mode == "per_item"
+                    else str(selection.get("api_name", ""))
+                )
                 resolved_api_name, api_note = self._resolve_bundle_import_api(
                     item.record,
-                    mode=str(selection.get("mode", "preserve")),
-                    selected_api_name=str(selection.get("api_name", "")),
+                    mode="selected" if selected_mode == "per_item" else selected_mode,
+                    selected_api_name=selected_api_name,
                 )
+                if selected_mode == "per_item" and selected_api_name:
+                    api_note = f"逐条指定 API：{item.record.strategy_name or item.record.strategy_id} -> {selected_api_name}"
                 if api_note and api_note not in api_notes:
                     api_notes.append(api_note)
-                if str(selection.get("mode", "")).strip().lower() in {"current", "selected"} and not resolved_api_name:
+                if selected_mode in {"current", "selected", "per_item"} and not resolved_api_name:
                     skipped_summaries.append(f"{item.record.strategy_name or item.record.strategy_id} {item.record.symbol}：目标 API 不可用")
+                    _record_api_outcome(selected_api_name or item.record.api_name, "skipped")
                     continue
                 resolved_config = item.record.config
                 has_risk_amount = resolved_config.risk_amount is not None and resolved_config.risk_amount > 0
@@ -409,21 +491,36 @@ class UiStrategySessionsMixin:
                     start_failed_summaries.append(
                         f"{resolved_record.strategy_name or resolved_record.strategy_id} {resolved_record.symbol}：{exc}"
                     )
+                    _record_api_outcome(resolved_record.api_name, "failed")
                 else:
                     imported_labels.append(f"{resolved_record.strategy_name or resolved_record.strategy_id} {resolved_record.symbol}")
                     started_session_ids.append(session_id)
+                    _record_api_outcome(resolved_record.api_name, "started")
         else:
-            first_item = bundle.items[0] if bundle.items else None
+            first_item = selected_items[0] if selected_items else None
             if first_item is not None:
+                first_index = next(
+                    (index for index, item in enumerate(bundle.items) if item == first_item),
+                    0,
+                )
+                selected_mode = str(selection.get("mode", "preserve")).strip().lower()
+                selected_api_name = (
+                    per_item_api_map.get(first_index, "")
+                    if selected_mode == "per_item"
+                    else str(selection.get("api_name", ""))
+                )
                 resolved_api_name, api_note = self._resolve_bundle_import_api(
                     first_item.record,
-                    mode=str(selection.get("mode", "preserve")),
-                    selected_api_name=str(selection.get("api_name", "")),
+                    mode="selected" if selected_mode == "per_item" else selected_mode,
+                    selected_api_name=selected_api_name,
                 )
+                if selected_mode == "per_item" and selected_api_name:
+                    api_note = f"逐条指定 API：{first_item.record.strategy_name or first_item.record.strategy_id} -> {selected_api_name}"
                 if api_note and api_note not in api_notes:
                     api_notes.append(api_note)
-                if str(selection.get("mode", "")).strip().lower() in {"current", "selected"} and not resolved_api_name:
+                if selected_mode in {"current", "selected", "per_item"} and not resolved_api_name:
                     skipped_summaries.append(f"{first_item.record.strategy_name or first_item.record.strategy_id} {first_item.record.symbol}：目标 API 不可用")
+                    _record_api_outcome(selected_api_name or first_item.record.api_name, "skipped")
                 else:
                     resolved_config = first_item.record.config
                     has_risk_amount = resolved_config.risk_amount is not None and resolved_config.risk_amount > 0
@@ -445,14 +542,16 @@ class UiStrategySessionsMixin:
                         start_failed_summaries.append(
                             f"{resolved_record.strategy_name or resolved_record.strategy_id} {resolved_record.symbol}：{exc}"
                         )
+                        _record_api_outcome(resolved_record.api_name, "failed")
                     else:
                         imported_labels.append(f"{definition.name} {resolved_record.symbol}")
                         if applied_api:
                             api_notes.append(f"首条已回填到启动区，当前 API：{applied_api}")
+                        _record_api_outcome(applied_api or resolved_record.api_name, "applied")
 
         summary_lines = [
             f"组合包：{bundle.package_name}",
-            f"组合条数：{len(bundle.items)} 条",
+            f"组合条数：{len(selected_items)} / {len(bundle.items)} 条",
             f"自动启动：{len(started_session_ids)} 条" if auto_start_enabled else "自动启动：未启用（已回填首条到启动区）",
             f"跳过：{len(skipped_summaries)} 条",
             f"失败：{len(start_failed_summaries)} 条",
@@ -463,9 +562,24 @@ class UiStrategySessionsMixin:
             summary_lines.append("")
             summary_lines.append("API 处理：")
             summary_lines.extend(f"- {text}" for text in api_notes[:3])
+        if api_summary_counts:
+            summary_lines.append("")
+            summary_lines.append("按 API 汇总：")
+            for api_name in sorted(api_summary_counts):
+                stats = api_summary_counts[api_name]
+                parts = []
+                if stats.get("started", 0):
+                    parts.append(f"启动 {stats['started']}")
+                if stats.get("applied", 0):
+                    parts.append(f"回填 {stats['applied']}")
+                if stats.get("skipped", 0):
+                    parts.append(f"跳过 {stats['skipped']}")
+                if stats.get("failed", 0):
+                    parts.append(f"失败 {stats['failed']}")
+                summary_lines.append(f"- {api_name}：{' / '.join(parts) if parts else '0'}")
         quota_mapped_count = sum(
             1
-            for item in bundle.items
+            for item in selected_items
             if (item.record.config.risk_amount is None or item.record.config.risk_amount <= 0)
             and (item.record.config.order_size is None or item.record.config.order_size <= 0)
             and item.unit_quota > 0
@@ -494,10 +608,61 @@ class UiStrategySessionsMixin:
             summary_lines.append("")
             summary_lines.append("说明：普通策略在未勾选自动启动时，不会进入运行中列表；本次只把首条回填到启动区。")
 
+        detail_lines = [
+            f"组合包：{bundle.package_name}",
+            f"处理模式：{'自动启动' if auto_start_enabled else '仅回填首条到启动区'}",
+            f"选择条数：{len(selected_items)} / {len(bundle.items)}",
+        ]
+        if imported_labels:
+            detail_lines.append("")
+            detail_lines.append("已处理条目：")
+            detail_lines.extend(f"- {text}" for text in imported_labels)
+        if started_session_ids:
+            detail_lines.append("")
+            detail_lines.append("已启动会话：")
+            detail_lines.extend(f"- {session_id}" for session_id in started_session_ids)
+        if api_notes:
+            detail_lines.append("")
+            detail_lines.append("API 处理：")
+            detail_lines.extend(f"- {text}" for text in api_notes)
+        if api_summary_counts:
+            detail_lines.append("")
+            detail_lines.append("按 API 汇总：")
+            for api_name in sorted(api_summary_counts):
+                stats = api_summary_counts[api_name]
+                parts = []
+                if stats.get("started", 0):
+                    parts.append(f"启动 {stats['started']}")
+                if stats.get("applied", 0):
+                    parts.append(f"回填 {stats['applied']}")
+                if stats.get("skipped", 0):
+                    parts.append(f"跳过 {stats['skipped']}")
+                if stats.get("failed", 0):
+                    parts.append(f"失败 {stats['failed']}")
+                detail_lines.append(f"- {api_name}：{' / '.join(parts) if parts else '0'}")
+        if quota_mapped_count > 0:
+            detail_lines.append("")
+            detail_lines.append("仓位映射：")
+            detail_lines.append(f"- {quota_mapped_count} 条策略已把组合包单次额度映射为普通策略固定数量。")
+        if skipped_summaries:
+            detail_lines.append("")
+            detail_lines.append("跳过项：")
+            detail_lines.extend(f"- {text}" for text in skipped_summaries)
+        if start_failed_summaries:
+            detail_lines.append("")
+            detail_lines.append("失败项：")
+            detail_lines.extend(f"- {text}" for text in start_failed_summaries)
         if not imported_labels and not started_session_ids and not skipped_summaries and not start_failed_summaries:
-            messagebox.showwarning("导入完成", "\n".join(summary_lines))
-            return
-        messagebox.showinfo("导入完成", "\n".join(summary_lines))
+            detail_lines.append("")
+            detail_lines.append("说明：当前没有实际导入、回填或启动的条目。")
+
+        _show_strategy_bundle_import_result_dialog(
+            self.root,
+            title="导入完成",
+            summary_lines=summary_lines,
+            detail_lines=detail_lines,
+            warning=bool(skipped_summaries or start_failed_summaries or (not imported_labels and not started_session_ids)),
+        )
 
     @staticmethod
     def _session_blocks_duplicate_launch(session: StrategySession) -> bool:
@@ -724,6 +889,17 @@ class UiStrategySessionsMixin:
         self._strategy_live_chart_windows[session_id] = state
         window.protocol("WM_DELETE_WINDOW", lambda target_session_id=session_id: self._close_strategy_live_chart_window(target_session_id))
         canvas.bind("<Configure>", lambda *_args, target_session_id=session_id: self._render_strategy_live_chart_window(target_session_id))
+        canvas.bind(
+            "<Motion>",
+            lambda event, target_session_id=session_id: self._on_live_chart_hover(
+                target_session_id,
+                event.x,
+                event.y,
+                event.x_root,
+                event.y_root,
+            ),
+        )
+        canvas.bind("<Leave>", lambda *_args, target_session_id=session_id: self._on_live_chart_hover_leave(target_session_id))
         canvas.bind("<ButtonPress-1>", lambda event, target_session_id=session_id: self._on_live_chart_mouse_down(target_session_id, event.x, event.y))
         canvas.bind("<B1-Motion>", lambda event, target_session_id=session_id: self._on_live_chart_mouse_move(target_session_id, event.x, event.y))
         canvas.bind("<ButtonRelease-1>", lambda event, target_session_id=session_id: self._on_live_chart_mouse_up(target_session_id, event.x, event.y))
@@ -758,6 +934,7 @@ class UiStrategySessionsMixin:
         state = self._strategy_live_chart_windows.get(session_id)
         if state is None or state.active_tool == "none":
             return
+        self._hide_strategy_live_chart_hover_tip(session_id)
         state.draft_line_start = (x, y)
         state.draft_line_current = (x, y)
         self._render_strategy_live_chart_window(session_id)
@@ -810,6 +987,134 @@ class UiStrategySessionsMixin:
             state.draft_line_start,
             state.draft_line_current,
         )
+
+    def _show_strategy_live_chart_hover_tip(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        marker_key: str,
+        x_root: int,
+        y_root: int,
+    ) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None:
+            return
+        if not text:
+            self._hide_strategy_live_chart_hover_tip(session_id)
+            return
+        if state.hover_tip_window is None or not state.hover_tip_window.winfo_exists():
+            window = Toplevel(self.root)
+            window.withdraw()
+            window.overrideredirect(True)
+            window.attributes("-topmost", True)
+            label = ttk.Label(window, text=text, padding=(8, 4), relief="solid", borderwidth=1, justify="left")
+            label.pack()
+            state.hover_tip_window = window
+            state.hover_tip_label = label
+        else:
+            window = state.hover_tip_window
+            label = state.hover_tip_label
+            if label is not None:
+                label.configure(text=text)
+        state.hover_tip_marker_key = marker_key
+        if state.hover_tip_window is None:
+            return
+        state.hover_tip_window.geometry(f"+{x_root + 12}+{y_root + 16}")
+        state.hover_tip_window.deiconify()
+
+    def _hide_strategy_live_chart_hover_tip(self, session_id: str, *, destroy: bool = False) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None:
+            return
+        window = state.hover_tip_window
+        if window is not None and window.winfo_exists():
+            if destroy:
+                window.destroy()
+            else:
+                window.withdraw()
+        if destroy:
+            state.hover_tip_window = None
+            state.hover_tip_label = None
+        state.hover_tip_marker_key = ""
+
+    def _resolve_daily_filter_hover_marker(
+        self,
+        session_id: str,
+        x: float,
+    ) -> StrategyLiveChartTimeMarker | None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None or state.last_snapshot is None or not state.last_snapshot.candles:
+            return None
+        snapshot = state.last_snapshot
+        markers = tuple(marker for marker in snapshot.time_markers if marker.key.startswith("daily-filter:"))
+        if not markers:
+            return None
+        layout = compute_strategy_live_chart_layout(state.canvas, snapshot)
+        if layout is None:
+            return None
+        if x < layout.left - 12 or x > layout.right + 12:
+            return None
+        best_marker: StrategyLiveChartTimeMarker | None = None
+        best_distance: float | None = None
+        for marker in markers:
+            target_ms = marker.at.timestamp() * 1000
+            closest_index = min(
+                range(len(snapshot.candles)),
+                key=lambda index: abs(snapshot.candles[index].ts - target_ms),
+            )
+            marker_x = layout_bar_index_to_x_center(layout, float(closest_index))
+            distance = abs(marker_x - x)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_marker = marker
+        if best_distance is None or best_distance > 10:
+            return None
+        return best_marker
+
+    def _daily_filter_hover_text(
+        self,
+        session: StrategySession,
+        marker: StrategyLiveChartTimeMarker,
+    ) -> str:
+        config_summary = session.config.daily_filter_summary()
+        effective_at = marker.at.strftime("%Y-%m-%d %H:%M")
+        return (
+            f"{config_summary}\n"
+            f"边界：{marker.label} @ {effective_at}\n"
+            "说明：从这个时间点开始，只能读取新切换后的上一根已收盘日线。"
+        )
+
+    def _on_live_chart_hover(
+        self,
+        session_id: str,
+        x: float,
+        y: float,
+        x_root: int,
+        y_root: int,
+    ) -> None:
+        state = self._strategy_live_chart_windows.get(session_id)
+        if state is None or state.draft_line_start is not None:
+            self._hide_strategy_live_chart_hover_tip(session_id)
+            return
+        session = self.sessions.get(session_id)
+        if session is None or not session.config.uses_daily_filter():
+            self._hide_strategy_live_chart_hover_tip(session_id)
+            return
+        marker = self._resolve_daily_filter_hover_marker(session_id, x)
+        if marker is None:
+            self._hide_strategy_live_chart_hover_tip(session_id)
+            return
+        self._show_strategy_live_chart_hover_tip(
+            session_id,
+            self._daily_filter_hover_text(session, marker),
+            marker_key=marker.key,
+            x_root=x_root,
+            y_root=y_root,
+        )
+
+    def _on_live_chart_hover_leave(self, session_id: str) -> None:
+        self._hide_strategy_live_chart_hover_tip(session_id)
 
     def _draw_line_annotations(
         self,
@@ -1315,10 +1620,13 @@ class UiStrategySessionsMixin:
 
     def _strategy_live_chart_headline(self, session: StrategySession) -> str:
         trade_inst_id = _session_trade_inst_id(session) or session.symbol
-        return (
+        headline = (
             f"{session.session_id} | {session.strategy_name} | {trade_inst_id} | "
             f"周期 {session.config.bar} | API {session.api_name} | 模式 {session.run_mode_label}"
         )
+        if session.config.uses_daily_filter():
+            headline = f"{headline} | {session.config.daily_filter_summary()}"
+        return headline
 
     def _latest_strategy_trade_ledger_record(self, session: StrategySession) -> StrategyTradeLedgerRecord | None:
         matched = self._strategy_live_chart_ledger_records(session)
@@ -1507,6 +1815,19 @@ class UiStrategySessionsMixin:
             )
         return tuple(markers)
 
+    @staticmethod
+    def _strategy_live_chart_daily_filter_time_markers(
+        session: StrategySession,
+        candles: list[Candle] | tuple[Candle, ...],
+    ) -> tuple[StrategyLiveChartTimeMarker, ...]:
+        if not session.config.uses_daily_filter():
+            return ()
+        return _build_daily_filter_boundary_time_markers(
+            candles,
+            boundary=str(session.config.daily_filter_boundary),
+            key_prefix=f"daily-filter:{session.session_id}",
+        )
+
     def _close_strategy_live_chart_window(self, session_id: str) -> None:
         state = self._strategy_live_chart_windows.pop(session_id, None)
         if state is None:
@@ -1517,6 +1838,11 @@ class UiStrategySessionsMixin:
             except TclError:
                 pass
             state.refresh_job = None
+        if state.hover_tip_window is not None and state.hover_tip_window.winfo_exists():
+            state.hover_tip_window.destroy()
+        state.hover_tip_window = None
+        state.hover_tip_label = None
+        state.hover_tip_marker_key = ""
         if _widget_exists(state.window):
             state.window.destroy()
 
@@ -1591,6 +1917,10 @@ class UiStrategySessionsMixin:
         if session.active_trade is None:
             entry_time = None
         time_markers = self._strategy_live_chart_event_time_markers(session, trade_inst_id)
+        time_markers = (
+            *time_markers,
+            *self._strategy_live_chart_daily_filter_time_markers(session, candles),
+        )
         chart_refreshed_at = datetime.now()
         snapshot = build_strategy_live_chart_snapshot(
             session_id=session.session_id,
@@ -1805,6 +2135,8 @@ class UiStrategySessionsMixin:
             parts.append("\u5f53\u524d\u65e0\u6301\u4ed3/\u6302\u5355")
         if stop_price is not None:
             parts.append(f"\u6b62\u635f {format_decimal(stop_price)}")
+        if session.config.uses_daily_filter():
+            parts.append(session.config.daily_filter_summary())
         last_message = (session.last_message or "").strip()
         if last_message:
             if len(last_message) > 72:
@@ -1836,6 +2168,8 @@ class UiStrategySessionsMixin:
             parts.append(f"\u6301\u4ed3\u7f13\u5b58 {position_refreshed_at.strftime('%H:%M:%S')}")
         if live_pnl_refreshed_at is not None and live_pnl_refreshed_at != position_refreshed_at:
             parts.append(f"\u6d6e\u76c8\u7f13\u5b58 {live_pnl_refreshed_at.strftime('%H:%M:%S')}")
+        if session.config.uses_daily_filter():
+            parts.append(session.config.daily_filter_summary())
         return " | ".join(parts)
 
     def _finish_strategy_template_import(
@@ -3996,6 +4330,25 @@ class UiStrategySessionsMixin:
                 widget.grid()
             else:
                 widget.grid_remove()
+        daily_filter_widgets = (
+            self._daily_filter_enabled_check,
+            self._daily_filter_boundary_label,
+            self._daily_filter_boundary_combo,
+            self._daily_filter_scope_label,
+            self._daily_filter_scope_combo,
+            self._daily_filter_mode_caption,
+            self._daily_filter_mode_combo,
+            self._daily_filter_ma_label,
+            self._daily_filter_ma_combo,
+            self._daily_filter_period_label,
+            self._daily_filter_period_entry,
+            self._daily_filter_hint_label,
+        )
+        for widget in daily_filter_widgets:
+            if visibility.show_daily_filter_controls:
+                widget.grid()
+            else:
+                widget.grid_remove()
         self._set_field_state(self._bar_combo, editable=strategy_is_parameter_editable(strategy_id, "bar", "launcher"))
         self._set_field_state(self._ema_entry, editable=strategy_is_parameter_editable(strategy_id, "ema_period", "launcher"))
         self._set_field_state(self._trend_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "trend_ema_period", "launcher"))
@@ -4005,9 +4358,56 @@ class UiStrategySessionsMixin:
         self._set_field_state(self._mtf_filter_fast_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_fast_ema_period", "launcher"))
         self._set_field_state(self._mtf_filter_slow_ema_entry, editable=strategy_is_parameter_editable(strategy_id, "mtf_filter_slow_ema_period", "launcher"))
         self._set_field_state(self._mtf_reversal_mode_combo, editable=strategy_is_parameter_editable(strategy_id, "mtf_reversal_mode", "launcher"))
+        self._daily_filter_enabled_check.configure(
+            state="normal" if strategy_is_parameter_editable(strategy_id, "daily_filter_enabled", "launcher") else "disabled"
+        )
         self._set_field_state(
             self._slope_threshold_entry,
             editable=strategy_is_parameter_editable(strategy_id, "trend_ema_slope_filter_min_ratio", "launcher"),
+        )
+        self._set_field_state(
+            self._atr_percentile_filter_entry,
+            editable=strategy_is_parameter_editable(strategy_id, "atr_percentile_filter_max", "launcher"),
+        )
+        self._set_field_state(
+            self._body_retest_breakdown_entry,
+            editable=strategy_is_parameter_editable(
+                strategy_id,
+                "body_retest_breakdown_atr_multiplier",
+                "launcher",
+            ),
+        )
+        self._set_field_state(
+            self._body_retest_retest_entry,
+            editable=strategy_is_parameter_editable(
+                strategy_id,
+                "body_retest_retest_atr_multiplier",
+                "launcher",
+            ),
+        )
+        self._set_field_state(
+            self._body_retest_stop_buffer_entry,
+            editable=strategy_is_parameter_editable(
+                strategy_id,
+                "body_retest_stop_buffer_atr_multiplier",
+                "launcher",
+            ),
+        )
+        self._set_field_state(
+            self._body_retest_body_limit_entry,
+            editable=strategy_is_parameter_editable(
+                strategy_id,
+                "body_retest_body_atr_limit",
+                "launcher",
+            ),
+        )
+        self._set_field_state(
+            self._body_retest_watch_bars_entry,
+            editable=strategy_is_parameter_editable(
+                strategy_id,
+                "body_retest_watch_bars",
+                "launcher",
+            ),
         )
         self._apply_strategy_parameter_fixed_labels(strategy_id)
         if hasattr(self, "_entry_side_mode_combo") and hasattr(self, "_tp_sl_mode_combo"):
@@ -4025,6 +4425,7 @@ class UiStrategySessionsMixin:
             self.startup_chase_window_seconds.set("0")
         self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
+        self._sync_daily_filter_controls()
         QuantApp._sync_entry_side_mode_controls(self)
         self.strategy_summary_text.set(definition.summary)
         self.strategy_rule_text.set(definition.rule_description)
@@ -4050,6 +4451,19 @@ class UiStrategySessionsMixin:
         self._time_stop_break_even_bars_entry.configure(
             state="normal" if dynamic_take_profit and self.time_stop_break_even_enabled.get() else "disabled"
         )
+
+    def _sync_daily_filter_controls(self) -> None:
+        if not hasattr(self, "_daily_filter_enabled_check"):
+            return
+        enabled = bool(self.daily_filter_enabled.get())
+        mode = DAILY_FILTER_MODE_LABEL_TO_VALUE.get(self.daily_filter_mode_label.get(), "disabled")
+        mode_active = enabled and mode != "disabled"
+        ma_active = mode_active and mode == "close_vs_ma"
+        self._set_field_state(self._daily_filter_boundary_combo, editable=mode_active)
+        self._set_field_state(self._daily_filter_scope_combo, editable=mode_active)
+        self._set_field_state(self._daily_filter_mode_combo, editable=enabled)
+        self._set_field_state(self._daily_filter_ma_combo, editable=ma_active)
+        self._set_field_state(self._daily_filter_period_entry, editable=ma_active)
 
     def _sync_entry_side_mode_controls(self) -> None:
         if not hasattr(self, "_entry_side_mode_combo"):
@@ -4132,6 +4546,12 @@ class UiStrategySessionsMixin:
         mtf_filter_fast_ema_period = 21
         mtf_filter_slow_ema_period = 55
         mtf_reversal_mode = "block_new_entries"
+        daily_filter_enabled = False
+        daily_filter_boundary = "exchange"
+        daily_filter_mode = "disabled"
+        daily_filter_scope = "both"
+        daily_filter_ma_type = "ema"
+        daily_filter_period = 5
         if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
             entry_reference_ema_period = self._parse_nonnegative_int(
                 self.entry_reference_ema_period.get(),
@@ -4165,6 +4585,44 @@ class UiStrategySessionsMixin:
                     MTF_REVERSAL_MODE_OPTIONS.get(self.mtf_reversal_mode_label.get(), "block_new_entries"),
                 )
             )
+        if strategy_uses_parameter(strategy_id, "daily_filter_enabled"):
+            daily_filter_enabled = bool(self.daily_filter_enabled.get())
+            daily_filter_boundary = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "daily_filter_boundary",
+                    DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE.get(self.daily_filter_boundary_label.get(), "exchange"),
+                )
+            )
+            daily_filter_mode = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "daily_filter_mode",
+                    DAILY_FILTER_MODE_LABEL_TO_VALUE.get(self.daily_filter_mode_label.get(), "disabled"),
+                )
+            )
+            daily_filter_scope = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "daily_filter_scope",
+                    DAILY_FILTER_SCOPE_LABEL_TO_VALUE.get(self.daily_filter_scope_label.get(), "both"),
+                )
+            )
+            daily_filter_ma_type = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "daily_filter_ma_type",
+                    self.daily_filter_ma_type.get().strip().lower(),
+                )
+            )
+            if daily_filter_mode == "close_vs_ma":
+                daily_filter_period = int(
+                    self._resolve_strategy_parameter_value(
+                        strategy_id,
+                        "daily_filter_period",
+                        self._parse_positive_int(self.daily_filter_period.get(), "日线均线周期"),
+                    )
+                )
         if strategy_uses_startup_chase_window(strategy_id):
             startup_chase_window_seconds = parse_nonnegative_duration_seconds(
                 self.startup_chase_window_seconds.get(),
@@ -4178,6 +4636,42 @@ class UiStrategySessionsMixin:
                 raise ValueError("开空斜率阈值不是有效数字") from exc
             if trend_ema_slope_filter_min_ratio > 0:
                 raise ValueError("开空斜率阈值必须小于或等于 0")
+        atr_percentile_filter_max = Decimal("0")
+        body_retest_breakdown_atr_multiplier = Decimal("0.2")
+        body_retest_retest_atr_multiplier = Decimal("0.3")
+        body_retest_stop_buffer_atr_multiplier = Decimal("0.3")
+        body_retest_body_atr_limit = Decimal("1.0")
+        body_retest_watch_bars = 6
+        if strategy_uses_parameter(strategy_id, "atr_percentile_filter_max"):
+            atr_percentile_filter_max = self._parse_nonnegative_decimal(
+                self.atr_percentile_filter_max.get(),
+                "ATR percentile max",
+            )
+        if strategy_uses_parameter(strategy_id, "body_retest_breakdown_atr_multiplier"):
+            body_retest_breakdown_atr_multiplier = self._parse_nonnegative_decimal(
+                self.body_retest_breakdown_atr_multiplier.get(),
+                "Breakdown ATR",
+            )
+        if strategy_uses_parameter(strategy_id, "body_retest_retest_atr_multiplier"):
+            body_retest_retest_atr_multiplier = self._parse_nonnegative_decimal(
+                self.body_retest_retest_atr_multiplier.get(),
+                "Retest ATR",
+            )
+        if strategy_uses_parameter(strategy_id, "body_retest_stop_buffer_atr_multiplier"):
+            body_retest_stop_buffer_atr_multiplier = self._parse_nonnegative_decimal(
+                self.body_retest_stop_buffer_atr_multiplier.get(),
+                "Stop buffer ATR",
+            )
+        if strategy_uses_parameter(strategy_id, "body_retest_body_atr_limit"):
+            body_retest_body_atr_limit = self._parse_nonnegative_decimal(
+                self.body_retest_body_atr_limit.get(),
+                "Body ATR limit",
+            )
+        if strategy_uses_parameter(strategy_id, "body_retest_watch_bars"):
+            body_retest_watch_bars = self._parse_nonnegative_int(
+                self.body_retest_watch_bars.get(),
+                "Watch bars",
+            )
 
         if not api_key or not secret_key or not passphrase:
             raise ValueError("请先在 菜单 > 设置 > API 与通知设置 中填写 API 凭证")
@@ -4282,6 +4776,19 @@ class UiStrategySessionsMixin:
             take_profit_mode=TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()],
             max_entries_per_trend=max_entries_per_trend,
             trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
+            atr_percentile_filter_max=atr_percentile_filter_max,
+            body_retest_breakdown_atr_multiplier=body_retest_breakdown_atr_multiplier,
+            body_retest_retest_atr_multiplier=body_retest_retest_atr_multiplier,
+            body_retest_stop_buffer_atr_multiplier=body_retest_stop_buffer_atr_multiplier,
+            body_retest_body_atr_limit=body_retest_body_atr_limit,
+            body_retest_watch_bars=body_retest_watch_bars,
+            daily_filter_enabled=daily_filter_enabled,
+            daily_filter_bar="1D",
+            daily_filter_boundary=daily_filter_boundary,
+            daily_filter_mode=daily_filter_mode,
+            daily_filter_scope=daily_filter_scope,
+            daily_filter_ma_type=daily_filter_ma_type,
+            daily_filter_period=daily_filter_period,
             startup_chase_window_seconds=startup_chase_window_seconds
             if strategy_uses_startup_chase_window(strategy_id)
             else 0,
@@ -5659,6 +6166,27 @@ class UiStrategySessionsMixin:
                     self._snapshot_text(snapshot, "mtf_reversal_mode"),
                 )
             )
+        daily_filter_enabled = bool(snapshot.get("daily_filter_enabled", False))
+        daily_filter_mode = (self._snapshot_text(snapshot, "daily_filter_mode", "disabled") or "disabled").strip()
+        if daily_filter_enabled and daily_filter_mode != "disabled":
+            boundary_label = _reverse_lookup_label(
+                DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE,
+                self._snapshot_text(snapshot, "daily_filter_boundary", "exchange"),
+                self._snapshot_text(snapshot, "daily_filter_boundary", "exchange"),
+            )
+            scope_label = _reverse_lookup_label(
+                DAILY_FILTER_SCOPE_LABEL_TO_VALUE,
+                self._snapshot_text(snapshot, "daily_filter_scope", "both"),
+                self._snapshot_text(snapshot, "daily_filter_scope", "both"),
+            )
+            if daily_filter_mode == "weak_day":
+                parameter_rows.append(f"日线过滤：{boundary_label} / Weak Day / {scope_label}")
+            else:
+                daily_ma_type = (self._snapshot_text(snapshot, "daily_filter_ma_type", "ema") or "ema").upper()
+                daily_period = self._snapshot_text(snapshot, "daily_filter_period", "5")
+                parameter_rows.append(
+                    f"日线过滤：{boundary_label} / {daily_ma_type}{daily_period} close-vs-MA / {scope_label}"
+                )
         if strategy_uses_parameter(strategy_id, "take_profit_mode"):
             parameter_rows.append(f"止盈方式：{take_profit_mode_label}")
         if strategy_uses_parameter(strategy_id, "max_entries_per_trend"):

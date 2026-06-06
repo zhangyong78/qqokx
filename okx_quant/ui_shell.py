@@ -42,6 +42,7 @@ from okx_quant.btc_research_workbench_ui import BtcResearchWorkbenchWindow
 from okx_quant.deribit_client import DeribitRestClient
 from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
+from okx_quant.daily_filters import daily_boundary_anchor_offset_ms
 from okx_quant.engine import (
     DEFAULT_DEBUG_ATR_PERIOD,
     FilledPosition,
@@ -316,6 +317,44 @@ def _app_restart_workdir(*, argv0: str | None = None, frozen: bool | None = None
 
 def _ps_quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _build_daily_filter_boundary_time_markers(
+    candles: list[Candle] | tuple[Candle, ...],
+    *,
+    boundary: str,
+    key_prefix: str,
+    max_markers: int = 16,
+) -> tuple[StrategyLiveChartTimeMarker, ...]:
+    normalized_boundary = str(boundary or "exchange").strip().lower()
+    if not candles:
+        return ()
+    labels = {
+        "exchange": "1D",
+        "bjt_00": "BJT 00",
+        "bjt_08": "BJT 08",
+    }
+    offset_ms = daily_boundary_anchor_offset_ms(normalized_boundary)  # type: ignore[arg-type]
+    day_ms = 86_400_000
+    markers: list[StrategyLiveChartTimeMarker] = []
+    previous_bucket: int | None = None
+    for candle in candles:
+        candle_ts = int(candle.ts)
+        bucket_open_ts = ((candle_ts - offset_ms) // day_ms) * day_ms + offset_ms
+        if previous_bucket is None or bucket_open_ts != previous_bucket:
+            marker_at = datetime.fromtimestamp(candle_ts / 1000)
+            markers.append(
+                StrategyLiveChartTimeMarker(
+                    key=f"{key_prefix}:{bucket_open_ts}",
+                    label=labels.get(normalized_boundary, normalized_boundary),
+                    at=marker_at,
+                    color="#7c3aed",
+                    dash=(2, 6),
+                    width=1,
+                )
+            )
+            previous_bucket = bucket_open_ts
+    return tuple(markers[-max_markers:])
 
 
 def _ps_array(values: list[str]) -> str:
@@ -619,6 +658,28 @@ MTF_REVERSAL_MODE_OPTIONS = {
     "只过滤新开仓": "block_new_entries",
 }
 MTF_REVERSAL_MODE_VALUE_TO_LABEL = {value: label for label, value in MTF_REVERSAL_MODE_OPTIONS.items()}
+DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE = {
+    "Exchange 1D": "exchange",
+    "BJT 00:00": "bjt_00",
+    "BJT 08:00": "bjt_08",
+}
+DAILY_FILTER_BOUNDARY_VALUE_TO_LABEL = {
+    value: label for label, value in DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE.items()
+}
+DAILY_FILTER_MODE_LABEL_TO_VALUE = {
+    "Disabled": "disabled",
+    "close vs MA/EMA": "close_vs_ma",
+    "Weak Day": "weak_day",
+}
+DAILY_FILTER_MODE_VALUE_TO_LABEL = {value: label for label, value in DAILY_FILTER_MODE_LABEL_TO_VALUE.items()}
+DAILY_FILTER_SCOPE_LABEL_TO_VALUE = {
+    "Both": "both",
+    "Long Only": "long_only",
+    "Short Only": "short_only",
+}
+DAILY_FILTER_SCOPE_VALUE_TO_LABEL = {
+    value: label for label, value in DAILY_FILTER_SCOPE_LABEL_TO_VALUE.items()
+}
 RUN_MODE_OPTIONS = {
     "交易并下单": "trade",
     "只发信号邮件": "signal_only",
@@ -1038,6 +1099,9 @@ class StrategyLiveChartWindowState:
     trade_risk_amount: StringVar | None = None
     trade_fixed_size: StringVar | None = None
     trade_status_text: StringVar | None = None
+    hover_tip_window: Toplevel | None = None
+    hover_tip_label: ttk.Label | None = None
+    hover_tip_marker_key: str = ""
 
 
 @dataclass
@@ -1538,6 +1602,31 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             payload.get("trend_ema_slope_filter_min_ratio"),
             Decimal(str(_strategy_config_default("trend_ema_slope_filter_min_ratio"))),
         ),
+        atr_percentile_filter_max=_coerce_snapshot_decimal(
+            payload.get("atr_percentile_filter_max"),
+            Decimal(str(_strategy_config_default("atr_percentile_filter_max"))),
+        ),
+        body_retest_breakdown_atr_multiplier=_coerce_snapshot_decimal(
+            payload.get("body_retest_breakdown_atr_multiplier"),
+            Decimal(str(_strategy_config_default("body_retest_breakdown_atr_multiplier"))),
+        ),
+        body_retest_retest_atr_multiplier=_coerce_snapshot_decimal(
+            payload.get("body_retest_retest_atr_multiplier"),
+            Decimal(str(_strategy_config_default("body_retest_retest_atr_multiplier"))),
+        ),
+        body_retest_stop_buffer_atr_multiplier=_coerce_snapshot_decimal(
+            payload.get("body_retest_stop_buffer_atr_multiplier"),
+            Decimal(str(_strategy_config_default("body_retest_stop_buffer_atr_multiplier"))),
+        ),
+        body_retest_body_atr_limit=_coerce_snapshot_decimal(
+            payload.get("body_retest_body_atr_limit"),
+            Decimal(str(_strategy_config_default("body_retest_body_atr_limit"))),
+        ),
+        body_retest_watch_bars=_coerce_snapshot_int(
+            payload.get("body_retest_watch_bars"),
+            int(_strategy_config_default("body_retest_watch_bars")),
+            minimum=0,
+        ),
         startup_chase_window_seconds=_coerce_snapshot_int(
             payload.get("startup_chase_window_seconds"),
             int(_strategy_config_default("startup_chase_window_seconds")),
@@ -1925,22 +2014,28 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
         parent: Tk | Toplevel,
         *,
         package_name: str,
+        items: tuple[StrategyTemplateBundleItem, ...],
         source_apis: tuple[str, ...],
         available_profiles: tuple[str, ...],
         current_api_name: str,
         auto_start_default: bool = False,
     ) -> None:
         self._package_name = package_name
+        self._items = items
         self._source_apis = source_apis
         self._available_profiles = available_profiles
         self._current_api_name = current_api_name
         initial_mode = "preserve" if len(source_apis) <= 1 else "selected"
         initial_api = current_api_name or (available_profiles[0] if available_profiles else "")
+        self._initial_api = initial_api
         self.mode_var = StringVar(value=initial_mode)
         self.api_var = StringVar(value=initial_api)
         self.auto_start_var = BooleanVar(value=auto_start_default)
         self.result_payload: dict[str, str] | None = None
         self._api_combo: ttk.Combobox | None = None
+        self._item_vars: list[BooleanVar] = []
+        self._item_api_vars: list[StringVar] = []
+        self._item_api_combos: list[ttk.Combobox] = []
         super().__init__(parent, "导入策略组合")
 
     def body(self, master: ttk.Frame):
@@ -1980,13 +2075,20 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
             variable=self.mode_var,
             command=self._refresh_api_combo_state,
         ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Radiobutton(
+            options,
+            text="逐条指定 API（只对勾选且导入的条目生效）",
+            value="per_item",
+            variable=self.mode_var,
+            command=self._refresh_api_combo_state,
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
         combo = ttk.Combobox(
             options,
             state="readonly",
             textvariable=self.api_var,
             values=self._available_profiles,
         )
-        combo.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        combo.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         self._api_combo = combo
         self._refresh_api_combo_state()
         ttk.Checkbutton(
@@ -1994,7 +2096,47 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
             text="导入后自动启动策略",
             variable=self.auto_start_var,
         ).grid(row=2, column=0, sticky="w", pady=(10, 0))
+        item_box = ttk.LabelFrame(master, text=f"导入条目（共 {len(self._items)} 条）", padding=10)
+        item_box.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        item_box.columnconfigure(0, weight=1)
+        item_box.columnconfigure(1, weight=0)
+        self._item_vars = []
+        self._item_api_vars = []
+        self._item_api_combos = []
+        for index, item in enumerate(self._items, start=1):
+            var = BooleanVar(value=True)
+            self._item_vars.append(var)
+            default_api = item.record.api_name.strip()
+            if not default_api or default_api not in self._available_profiles:
+                default_api = self._initial_api
+            api_var = StringVar(value=default_api)
+            self._item_api_vars.append(api_var)
+            preview_text = self._bundle_item_preview_text(index, item)
+            ttk.Checkbutton(
+                item_box,
+                text=preview_text,
+                variable=var,
+            ).grid(row=index - 1, column=0, sticky="w", pady=(0 if index == 1 else 6, 0))
+            api_combo = ttk.Combobox(
+                item_box,
+                state="disabled",
+                textvariable=api_var,
+                values=self._available_profiles,
+                width=16,
+            )
+            api_combo.grid(row=index - 1, column=1, sticky="e", padx=(12, 0), pady=(0 if index == 1 else 6, 0))
+            self._item_api_combos.append(api_combo)
         return combo
+
+    @staticmethod
+    def _bundle_item_preview_text(index: int, item: StrategyTemplateBundleItem) -> str:
+        record = item.record
+        strategy_name = record.strategy_name or record.strategy_id
+        daily_summary = record.config.daily_filter_summary()
+        return (
+            f"{index}. {strategy_name} | {record.symbol} | {record.direction_label or '-'} | "
+            f"API={record.api_name or '-'} | {daily_summary}"
+        )
 
     def _refresh_api_combo_state(self) -> None:
         if self._api_combo is None:
@@ -2002,6 +2144,9 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
         mode = self.mode_var.get().strip()
         state = "readonly" if mode == "selected" else "disabled"
         self._api_combo.configure(state=state)
+        item_state = "readonly" if mode == "per_item" else "disabled"
+        for combo in self._item_api_combos:
+            combo.configure(state=item_state)
 
     def validate(self) -> bool:
         mode = self.mode_var.get().strip()
@@ -2009,15 +2154,114 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
         if mode == "selected" and not api_name:
             messagebox.showerror("提示", "请选择一个目标 API。", parent=self)
             return False
+        if mode == "per_item":
+            for index, variable in enumerate(self._item_vars):
+                if not variable.get():
+                    continue
+                selected_api = self._item_api_vars[index].get().strip()
+                if not selected_api:
+                    messagebox.showerror("提示", f"请为第 {index + 1} 条策略选择 API。", parent=self)
+                    return False
         if mode == "current" and not self._current_api_name:
             messagebox.showerror("提示", "当前没有选中 API，不能使用“全部改成当前 API”。", parent=self)
             return False
+        selected_indices = [str(index) for index, variable in enumerate(self._item_vars) if variable.get()]
+        if not selected_indices:
+            messagebox.showerror("提示", "请至少勾选一条策略。", parent=self)
+            return False
+        per_item_api_map = ";".join(
+            f"{index}={self._item_api_vars[index].get().strip()}"
+            for index, variable in enumerate(self._item_vars)
+            if variable.get() and self._item_api_vars[index].get().strip()
+        )
         self.result_payload = {
             "mode": mode,
             "api_name": api_name,
             "auto_start": "1" if self.auto_start_var.get() else "0",
+            "selected_indices": ",".join(selected_indices),
+            "per_item_api_map": per_item_api_map,
         }
         return True
+
+
+def _show_strategy_bundle_import_result_dialog(
+    parent: Tk | Toplevel,
+    *,
+    title: str,
+    summary_lines: list[str] | tuple[str, ...],
+    detail_lines: list[str] | tuple[str, ...],
+    warning: bool = False,
+) -> None:
+    window = Toplevel(parent)
+    apply_window_icon(window)
+    window.title(title)
+    apply_adaptive_window_geometry(
+        window,
+        width_ratio=0.54,
+        height_ratio=0.56,
+        min_width=760,
+        min_height=520,
+        max_width=1280,
+        max_height=960,
+    )
+    window.transient(parent)
+    window.grab_set()
+
+    container = ttk.Frame(window, padding=12)
+    container.pack(fill="both", expand=True)
+    container.columnconfigure(0, weight=1)
+    container.rowconfigure(2, weight=1)
+
+    headline = "组合包处理完成，请核对下面的摘要和明细。" if not warning else "组合包处理完成，但存在需要留意的跳过或失败项。"
+    ttk.Label(
+        container,
+        text=headline,
+        justify="left",
+        wraplength=880,
+        font=("Microsoft YaHei UI", 10, "bold"),
+    ).grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        container,
+        text="\n".join(str(line) for line in summary_lines if str(line).strip()),
+        justify="left",
+        wraplength=880,
+    ).grid(row=1, column=0, sticky="ew", pady=(8, 10))
+
+    detail_frame = ttk.LabelFrame(container, text="详细结果", padding=8)
+    detail_frame.grid(row=2, column=0, sticky="nsew")
+    detail_frame.columnconfigure(0, weight=1)
+    detail_frame.rowconfigure(0, weight=1)
+
+    detail_text = Text(
+        detail_frame,
+        wrap="word",
+        height=18,
+        font=("Consolas", 10),
+        undo=False,
+    )
+    detail_text.grid(row=0, column=0, sticky="nsew")
+    detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=detail_text.yview)
+    detail_scroll.grid(row=0, column=1, sticky="ns")
+    detail_text.configure(yscrollcommand=detail_scroll.set)
+    detail_payload = "\n".join(str(line) for line in detail_lines if str(line).strip()) or "无更多明细。"
+    detail_text.insert("1.0", detail_payload)
+    detail_text.configure(state="disabled")
+
+    action_row = ttk.Frame(container)
+    action_row.grid(row=3, column=0, sticky="e", pady=(10, 0))
+
+    def _copy_details() -> None:
+        try:
+            window.clipboard_clear()
+            window.clipboard_append(detail_payload)
+            window.update_idletasks()
+        except TclError:
+            return
+
+    ttk.Button(action_row, text="复制明细", command=_copy_details).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(action_row, text="关闭", command=window.destroy).grid(row=0, column=1)
+    window.protocol("WM_DELETE_WINDOW", window.destroy)
+    window.wait_window()
 
 
 def _parse_datetime_snapshot(value: object) -> datetime | None:
@@ -3035,7 +3279,19 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.mtf_filter_fast_ema_period = StringVar(value="21")
         self.mtf_filter_slow_ema_period = StringVar(value="55")
         self.mtf_reversal_mode_label = StringVar(value=MTF_REVERSAL_MODE_VALUE_TO_LABEL["block_new_entries"])
+        self.daily_filter_enabled = BooleanVar(value=False)
+        self.daily_filter_boundary_label = StringVar(value=DAILY_FILTER_BOUNDARY_VALUE_TO_LABEL["exchange"])
+        self.daily_filter_mode_label = StringVar(value=DAILY_FILTER_MODE_VALUE_TO_LABEL["disabled"])
+        self.daily_filter_scope_label = StringVar(value=DAILY_FILTER_SCOPE_VALUE_TO_LABEL["both"])
+        self.daily_filter_ma_type = StringVar(value="EMA")
+        self.daily_filter_period = StringVar(value="5")
         self.trend_ema_slope_filter_min_ratio = StringVar(value="0")
+        self.atr_percentile_filter_max = StringVar(value="0")
+        self.body_retest_breakdown_atr_multiplier = StringVar(value="0.2")
+        self.body_retest_retest_atr_multiplier = StringVar(value="0.3")
+        self.body_retest_stop_buffer_atr_multiplier = StringVar(value="0.3")
+        self.body_retest_body_atr_limit = StringVar(value="1.0")
+        self.body_retest_watch_bars = StringVar(value="6")
         self.atr_period = StringVar(value="10")
         self.stop_atr = StringVar(value="2")
         self.take_atr = StringVar(value="4")
@@ -3081,7 +3337,19 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.mtf_filter_bar.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.mtf_filter_fast_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.mtf_filter_slow_ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.daily_filter_enabled.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.daily_filter_boundary_label.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.daily_filter_mode_label.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.daily_filter_scope_label.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.daily_filter_ma_type.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.daily_filter_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.trend_ema_slope_filter_min_ratio.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.atr_percentile_filter_max.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.body_retest_breakdown_atr_multiplier.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.body_retest_retest_atr_multiplier.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.body_retest_stop_buffer_atr_multiplier.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.body_retest_body_atr_limit.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.body_retest_watch_bars.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.atr_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.stop_atr.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.risk_amount.trace_add("write", self._update_fixed_order_size_hint)
@@ -3103,6 +3371,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.mtf_filter_bar.trace_add("write", self._update_trend_parameter_hint)
         self.mtf_filter_fast_ema_period.trace_add("write", self._update_trend_parameter_hint)
         self.mtf_filter_slow_ema_period.trace_add("write", self._update_trend_parameter_hint)
+        self.daily_filter_enabled.trace_add("write", self._update_trend_parameter_hint)
+        self.daily_filter_boundary_label.trace_add("write", self._update_trend_parameter_hint)
+        self.daily_filter_mode_label.trace_add("write", self._update_trend_parameter_hint)
+        self.daily_filter_scope_label.trace_add("write", self._update_trend_parameter_hint)
+        self.daily_filter_ma_type.trace_add("write", self._update_trend_parameter_hint)
+        self.daily_filter_period.trace_add("write", self._update_trend_parameter_hint)
         self.dynamic_two_r_break_even.trace_add("write", self._update_dynamic_protection_hint)
         self.dynamic_fee_offset_enabled.trace_add("write", self._update_dynamic_protection_hint)
         self.time_stop_break_even_enabled.trace_add("write", self._update_dynamic_protection_hint)
@@ -3354,7 +3628,20 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "mtf_filter_fast_ema_period": self.mtf_filter_fast_ema_period,
             "mtf_filter_slow_ema_period": self.mtf_filter_slow_ema_period,
             "mtf_reversal_mode": self.mtf_reversal_mode_label,
+            "daily_filter_enabled": self.daily_filter_enabled,
+            "daily_filter_bar": None,
+            "daily_filter_boundary": self.daily_filter_boundary_label,
+            "daily_filter_mode": self.daily_filter_mode_label,
+            "daily_filter_scope": self.daily_filter_scope_label,
+            "daily_filter_ma_type": self.daily_filter_ma_type,
+            "daily_filter_period": self.daily_filter_period,
             "trend_ema_slope_filter_min_ratio": self.trend_ema_slope_filter_min_ratio,
+            "atr_percentile_filter_max": self.atr_percentile_filter_max,
+            "body_retest_breakdown_atr_multiplier": self.body_retest_breakdown_atr_multiplier,
+            "body_retest_retest_atr_multiplier": self.body_retest_retest_atr_multiplier,
+            "body_retest_stop_buffer_atr_multiplier": self.body_retest_stop_buffer_atr_multiplier,
+            "body_retest_body_atr_limit": self.body_retest_body_atr_limit,
+            "body_retest_watch_bars": self.body_retest_watch_bars,
             "take_profit_mode": self.take_profit_mode_label,
             "max_entries_per_trend": self.max_entries_per_trend,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
@@ -3956,6 +4243,47 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         row += 1
         self._mtf_filter_bar_label = ttk.Label(launch_form, text="高周期K线")
         self._mtf_filter_bar_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._atr_percentile_filter_label = ttk.Label(launch_form, text="ATR percentile max")
+        self._atr_percentile_filter_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._atr_percentile_filter_entry = ttk.Entry(launch_form, textvariable=self.atr_percentile_filter_max)
+        self._atr_percentile_filter_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._body_retest_breakdown_label = ttk.Label(launch_form, text="Breakdown ATR")
+        self._body_retest_breakdown_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._body_retest_breakdown_entry = ttk.Entry(
+            launch_form,
+            textvariable=self.body_retest_breakdown_atr_multiplier,
+        )
+        self._body_retest_breakdown_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        self._body_retest_retest_label = ttk.Label(launch_form, text="Retest ATR")
+        self._body_retest_retest_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._body_retest_retest_entry = ttk.Entry(
+            launch_form,
+            textvariable=self.body_retest_retest_atr_multiplier,
+        )
+        self._body_retest_retest_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._body_retest_stop_buffer_label = ttk.Label(launch_form, text="Stop buffer ATR")
+        self._body_retest_stop_buffer_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._body_retest_stop_buffer_entry = ttk.Entry(
+            launch_form,
+            textvariable=self.body_retest_stop_buffer_atr_multiplier,
+        )
+        self._body_retest_stop_buffer_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        self._body_retest_body_limit_label = ttk.Label(launch_form, text="Body ATR limit")
+        self._body_retest_body_limit_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._body_retest_body_limit_entry = ttk.Entry(launch_form, textvariable=self.body_retest_body_atr_limit)
+        self._body_retest_body_limit_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._body_retest_watch_bars_label = ttk.Label(launch_form, text="Watch bars")
+        self._body_retest_watch_bars_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._body_retest_watch_bars_entry = ttk.Entry(launch_form, textvariable=self.body_retest_watch_bars)
+        self._body_retest_watch_bars_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        self._mtf_filter_bar_label_row = ttk.Label(launch_form, text="Higher TF bar")
+        self._mtf_filter_bar_label_row.grid(row=row, column=0, sticky="w", pady=_lp)
         self._mtf_filter_bar_combo = ttk.Combobox(
             launch_form,
             textvariable=self.mtf_filter_bar,
@@ -3982,6 +4310,67 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             state="readonly",
         )
         self._mtf_reversal_mode_combo.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        self._daily_filter_enabled_check = ttk.Checkbutton(
+            launch_form,
+            text="鍚敤鏃ョ嚎杩囨护锛堜粎浣跨敤褰撴椂宸叉敹鐩樼殑涓婁竴鏍规棩绾匡級",
+            variable=self.daily_filter_enabled,
+            command=self._sync_daily_filter_controls,
+        )
+        self._daily_filter_enabled_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=_lp)
+
+        row += 1
+        self._daily_filter_boundary_label = ttk.Label(launch_form, text="鏃ョ嚎鏍囧噯")
+        self._daily_filter_boundary_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._daily_filter_boundary_combo = ttk.Combobox(
+            launch_form,
+            textvariable=self.daily_filter_boundary_label,
+            values=list(DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE.keys()),
+            state="readonly",
+        )
+        self._daily_filter_boundary_combo.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._daily_filter_scope_label = ttk.Label(launch_form, text="杩囨护鏂瑰悜")
+        self._daily_filter_scope_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._daily_filter_scope_combo = ttk.Combobox(
+            launch_form,
+            textvariable=self.daily_filter_scope_label,
+            values=list(DAILY_FILTER_SCOPE_LABEL_TO_VALUE.keys()),
+            state="readonly",
+        )
+        self._daily_filter_scope_combo.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        self._daily_filter_mode_caption = ttk.Label(launch_form, text="杩囨护瑙勫垯")
+        self._daily_filter_mode_caption.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._daily_filter_mode_combo = ttk.Combobox(
+            launch_form,
+            textvariable=self.daily_filter_mode_label,
+            values=list(DAILY_FILTER_MODE_LABEL_TO_VALUE.keys()),
+            state="readonly",
+        )
+        self._daily_filter_mode_combo.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._daily_filter_mode_combo.bind("<<ComboboxSelected>>", lambda *_: self._sync_daily_filter_controls())
+        self._daily_filter_ma_label = ttk.Label(launch_form, text="鏃ョ嚎鍧囩嚎绫诲瀷")
+        self._daily_filter_ma_label.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._daily_filter_ma_combo = ttk.Combobox(
+            launch_form,
+            textvariable=self.daily_filter_ma_type,
+            values=MOVING_AVERAGE_TYPE_OPTIONS,
+            state="readonly",
+        )
+        self._daily_filter_ma_combo.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        self._daily_filter_period_label = ttk.Label(launch_form, text="鏃ョ嚎鍧囩嚎鍛ㄦ湡")
+        self._daily_filter_period_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._daily_filter_period_entry = ttk.Entry(launch_form, textvariable=self.daily_filter_period)
+        self._daily_filter_period_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._daily_filter_hint_label = ttk.Label(
+            launch_form,
+            text="鍖椾含鏃堕棿0鐐?8鐐规棩绾块兘浠庢湰鍦?1H 宸茬‘璁绾块噸閲囨牱锛屼笉鐩存帴璇诲彇浜ゆ槗鎵€褰撳ぉ鏈敹鐩樼殑1D銆?",
+        )
+        self._daily_filter_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=_lp)
 
         row += 1
         ttk.Label(
@@ -7683,6 +8072,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 mtf_filter_bar_raw=self.mtf_filter_bar.get(),
                 mtf_filter_fast_ema_period_raw=self.mtf_filter_fast_ema_period.get(),
                 mtf_filter_slow_ema_period_raw=self.mtf_filter_slow_ema_period.get(),
+                daily_filter_enabled=self.daily_filter_enabled.get(),
+                daily_filter_boundary_label=self.daily_filter_boundary_label.get(),
+                daily_filter_mode_label=self.daily_filter_mode_label.get(),
+                daily_filter_scope_label=self.daily_filter_scope_label.get(),
+                daily_filter_ma_type_raw=self.daily_filter_ma_type.get(),
+                daily_filter_period_raw=self.daily_filter_period.get(),
             )
         )
 
@@ -7782,6 +8177,18 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             trend_ema_slope_filter_min_ratio = Decimal(str(self.trend_ema_slope_filter_min_ratio.get()).strip() or "0")
             if trend_ema_slope_filter_min_ratio > 0:
                 raise ValueError("开空斜率阈值必须小于或等于 0")
+            atr_percentile_filter_max = Decimal(str(self.atr_percentile_filter_max.get()).strip() or "0")
+            body_retest_breakdown_atr_multiplier = Decimal(
+                str(self.body_retest_breakdown_atr_multiplier.get()).strip() or "0.2"
+            )
+            body_retest_retest_atr_multiplier = Decimal(
+                str(self.body_retest_retest_atr_multiplier.get()).strip() or "0.3"
+            )
+            body_retest_stop_buffer_atr_multiplier = Decimal(
+                str(self.body_retest_stop_buffer_atr_multiplier.get()).strip() or "0.3"
+            )
+            body_retest_body_atr_limit = Decimal(str(self.body_retest_body_atr_limit.get()).strip() or "1.0")
+            body_retest_watch_bars = self._parse_nonnegative_int(self.body_retest_watch_bars.get(), "Watch bars")
             config = StrategyConfig(
                 inst_id=signal_symbol or trade_symbol,
                 bar=self.bar.get().strip(),
@@ -7809,6 +8216,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 dynamic_two_r_break_even=bool(self.dynamic_two_r_break_even.get()),
                 dynamic_fee_offset_enabled=bool(self.dynamic_fee_offset_enabled.get()),
                 trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
+                atr_percentile_filter_max=atr_percentile_filter_max,
+                body_retest_breakdown_atr_multiplier=body_retest_breakdown_atr_multiplier,
+                body_retest_retest_atr_multiplier=body_retest_retest_atr_multiplier,
+                body_retest_stop_buffer_atr_multiplier=body_retest_stop_buffer_atr_multiplier,
+                body_retest_body_atr_limit=body_retest_body_atr_limit,
+                body_retest_watch_bars=body_retest_watch_bars,
                 time_stop_break_even_enabled=bool(self.time_stop_break_even_enabled.get()),
                 time_stop_break_even_bars=(
                     self._parse_nonnegative_int(self.time_stop_break_even_bars.get(), "鏃堕棿淇濇湰K绾挎暟")
@@ -12288,6 +12701,12 @@ def _build_trend_parameter_hint_text(
     mtf_filter_bar_raw: str = "",
     mtf_filter_fast_ema_period_raw: str = "",
     mtf_filter_slow_ema_period_raw: str = "",
+    daily_filter_enabled: bool = False,
+    daily_filter_boundary_label: str = "",
+    daily_filter_mode_label: str = "",
+    daily_filter_scope_label: str = "",
+    daily_filter_ma_type_raw: str = "",
+    daily_filter_period_raw: str = "",
 ) -> str:
     profile = get_strategy_runtime_profile(strategy_id)
     ema_type = (ema_type_raw or "EMA").strip().upper()
@@ -12323,6 +12742,18 @@ def _build_trend_parameter_hint_text(
         mtf_fast = mtf_filter_fast_ema_period_raw.strip() or "?"
         mtf_slow = mtf_filter_slow_ema_period_raw.strip() or "?"
         parts.append(f"高周期过滤：{mtf_bar} EMA{mtf_fast}/EMA{mtf_slow} 只决定是否允许低周期新开仓。")
+    daily_mode = DAILY_FILTER_MODE_LABEL_TO_VALUE.get(daily_filter_mode_label, "disabled")
+    if daily_filter_enabled and daily_mode != "disabled":
+        boundary = daily_filter_boundary_label.strip() or "交易所1D"
+        scope = daily_filter_scope_label.strip() or "多空都过滤"
+        if daily_mode == "weak_day":
+            parts.append(f"日线过滤：{boundary} 弱日规则，只使用当时已收盘的上一根日线，{scope}。")
+        else:
+            daily_ma_type = (daily_filter_ma_type_raw or "EMA").strip().upper()
+            daily_period = daily_filter_period_raw.strip() or "?"
+            parts.append(
+                f"日线过滤：{boundary} close vs {daily_ma_type}{daily_period}，只使用当时已收盘的上一根日线，{scope}。"
+            )
     return "趋势参数：" + " ".join(parts)
 
 
@@ -12503,6 +12934,8 @@ def _build_strategy_start_confirmation_message(
         f"快线均线：{config.ema_label()}",
         f"趋势均线：{config.trend_ema_label()}",
     ]
+    if config.uses_daily_filter():
+        lines.append(config.daily_filter_summary())
     if visibility.show_big_ema:
         lines.append(f"EMA大周期：{config.big_ema_period}（大趋势过滤线）")
     if profile.family in {"cross_breakout_long", "cross_breakdown_short"}:

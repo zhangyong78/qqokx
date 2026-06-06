@@ -8,6 +8,11 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Callable, Literal, TypeVar
 
+from okx_quant.daily_filters import (
+    aggregate_candles_to_daily_boundary,
+    build_daily_close_vs_ma_bias,
+    build_daily_weak_day_flags,
+)
 from okx_quant.indicators import atr, ema
 from okx_quant.market_data_hub import MarketDataHub
 from okx_quant.models import Credentials, Instrument, OrderPlan, ProtectionPlan, SignalDecision, StrategyConfig
@@ -35,7 +40,13 @@ from okx_quant.strategies.ema55_slope_short import (
     ema55_slope_short_exit_ready,
     evaluate_ema55_slope_short_signal,
 )
+from okx_quant.strategies.body_retest_short import (
+    body_retest_short_minimum_candles,
+    build_body_retest_short_protection_plan,
+    evaluate_body_retest_short_signal,
+)
 from okx_quant.strategy_catalog import (
+    STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
@@ -51,6 +62,7 @@ from okx_quant.strategy_ui_schema import strategy_forces_follow_signal, strategy
 
 Logger = Callable[[str], None]
 OKX_SINGLE_REQUEST_MAX_CANDLES = 300
+_HOUR_MS = 3_600_000
 
 
 def _live_dynamic_take_profit_enabled(config: StrategyConfig) -> bool:
@@ -419,6 +431,129 @@ class StrategyEngine:
         )
         return [candle for candle in candles if candle.confirmed]
 
+    def _get_candles_history_range_with_retry(
+        self,
+        inst_id: str,
+        bar: str,
+        *,
+        start_ts: int,
+        end_ts: int,
+        preload_count: int = 0,
+    ) -> list:
+        return self._retry_policy.call_okx_read_with_retry(
+            f"读取历史K线 {inst_id} {bar}",
+            lambda: self._client.get_candles_history_range(
+                inst_id,
+                bar,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                limit=0,
+                preload_count=preload_count,
+            ),
+        )
+
+    def _load_daily_filter_confirmed_candles(
+        self,
+        config: StrategyConfig,
+        entry_candles: list,
+    ) -> list:
+        if not config.uses_daily_filter() or not entry_candles:
+            return []
+        inst_id = config.resolved_daily_filter_inst_id()
+        boundary = str(config.daily_filter_boundary or "exchange").strip().lower()
+        period = max(int(config.daily_filter_period), 1)
+        daily_lookback = max(recommended_indicator_lookback(period), period + 5)
+        if boundary == "exchange":
+            candles = self._get_candles_with_retry(
+                inst_id,
+                config.resolved_daily_filter_bar(),
+                limit=daily_lookback,
+            )
+            return [candle for candle in candles if candle.confirmed]
+
+        end_ts = int(entry_candles[-1].ts)
+        hourly_lookback = max((daily_lookback + 2) * 24, 72)
+        start_ts = end_ts - (hourly_lookback - 1) * _HOUR_MS
+        hourly_candles = self._get_candles_history_range_with_retry(
+            inst_id,
+            "1H",
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        confirmed_hourly = [candle for candle in hourly_candles if candle.confirmed]
+        daily_candles, _audits = aggregate_candles_to_daily_boundary(
+            confirmed_hourly,
+            boundary=boundary,
+        )
+        return daily_candles
+
+    def _expand_daily_filter_bias_scope(self, base_bias: list[str], scope: str) -> list[str]:
+        normalized_scope = str(scope or "both").strip().lower()
+        expanded: list[str] = []
+        for bias in base_bias:
+            if normalized_scope == "long_only":
+                expanded.append("both" if bias == "long" else "short")
+            elif normalized_scope == "short_only":
+                expanded.append("both" if bias == "short" else "long")
+            else:
+                expanded.append(bias)
+        return expanded
+
+    def _build_live_daily_direction_filter_bias(
+        self,
+        entry_candles: list,
+        config: StrategyConfig,
+    ) -> list[str]:
+        if not entry_candles:
+            return []
+        mode = str(config.daily_filter_mode or "disabled").strip().lower()
+        if mode == "disabled":
+            return ["neutral"] * len(entry_candles)
+        daily_candles = self._load_daily_filter_confirmed_candles(config, entry_candles)
+        if not daily_candles:
+            return ["neutral"] * len(entry_candles)
+        if mode == "weak_day":
+            weak_day_flags = build_daily_weak_day_flags(entry_candles, daily_candles)
+            base_bias = ["short" if is_weak else "long" for is_weak in weak_day_flags]
+        else:
+            base_bias = build_daily_close_vs_ma_bias(
+                entry_candles,
+                daily_candles,
+                ma_type=str(config.daily_filter_ma_type or "ema").strip().lower(),
+                period=max(int(config.daily_filter_period), 1),
+            )
+        return self._expand_daily_filter_bias_scope(base_bias, config.daily_filter_scope)
+
+    @staticmethod
+    def _daily_filter_allows_signal(direction_filter_bias: str | None, signal: str | None) -> bool:
+        if signal is None:
+            return True
+        if direction_filter_bias == "both":
+            return True
+        if signal == "long":
+            return direction_filter_bias == "long"
+        if signal == "short":
+            return direction_filter_bias == "short"
+        return True
+
+    def _apply_live_daily_filter_to_decision(
+        self,
+        entry_candles: list,
+        config: StrategyConfig,
+        decision: SignalDecision,
+    ) -> SignalDecision:
+        if not config.uses_daily_filter() or decision.signal is None:
+            return decision
+        bias = self._build_live_daily_direction_filter_bias(entry_candles, config)
+        latest_bias = bias[-1] if bias else "neutral"
+        if self._daily_filter_allows_signal(latest_bias, decision.signal):
+            return decision
+        return replace(
+            decision,
+            signal=None,
+            reason=f"{decision.reason} | 日线过滤未放行（{config.daily_filter_summary()} | 当前={latest_bias}）",
+        )
+
     def _evaluate_dynamic_signal_decision(
         self,
         confirmed: list,
@@ -429,17 +564,19 @@ class StrategyEngine:
     ) -> SignalDecision:
         eval_config = replace(config, signal_mode=effective_signal_mode)
         if strategy_uses_mtf_filter(config.strategy_id):
-            return EmaDynamicMultiTimeframeStrategy().evaluate(
+            decision = EmaDynamicMultiTimeframeStrategy().evaluate(
                 confirmed,
                 self._load_mtf_filter_confirmed_candles(config),
                 eval_config,
                 price_increment=price_increment,
             )
-        return EmaDynamicOrderStrategy().evaluate(
+            return self._apply_live_daily_filter_to_decision(confirmed, config, decision)
+        decision = EmaDynamicOrderStrategy().evaluate(
             confirmed,
             eval_config,
             price_increment=price_increment,
         )
+        return self._apply_live_daily_filter_to_decision(confirmed, config, decision)
 
     def _log_entry_order_tracking(
         self,
@@ -463,6 +600,12 @@ class StrategyEngine:
             f"EMA{config.mtf_filter_fast_ema_period}/EMA{config.mtf_filter_slow_ema_period}"
         )
         mode_parts.append(f"高周期反转={reversal_text}")
+
+    @staticmethod
+    def _append_daily_filter_mode_parts(config: StrategyConfig, mode_parts: list[str]) -> None:
+        if not config.uses_daily_filter():
+            return
+        mode_parts.append(config.daily_filter_summary())
 
     def _run_dynamic_exchange_strategy(
         self,
@@ -522,6 +665,7 @@ class StrategyEngine:
             f"启动追单窗口={config.startup_chase_window_label()}",
         ]
         self._append_dynamic_mtf_mode_parts(config, mode_parts)
+        self._append_daily_filter_mode_parts(config, mode_parts)
         self._logger(" | ".join(mode_parts))
         if dynamic_stop_only and trader_virtual_stop_loss_enabled:
             self._logger(
@@ -1198,6 +1342,7 @@ class StrategyEngine:
             last_candle_ts = newest_ts
 
             decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
+            decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -1378,6 +1523,7 @@ class StrategyEngine:
             last_candle_ts = newest_ts
 
             decision = strategy.evaluate(confirmed, config, price_increment=signal_instrument.tick_size)
+            decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -1481,6 +1627,7 @@ class StrategyEngine:
                 config,
                 price_increment=signal_instrument.tick_size,
             )
+            decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无开空信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -1526,6 +1673,110 @@ class StrategyEngine:
                 protection=protection,
                 lookback=lookback,
             )
+            return
+
+    def _run_body_retest_short_local_strategy(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        signal_instrument: Instrument,
+        trade_instrument: Instrument,
+    ) -> None:
+        if resolve_trade_inst_id(config) != config.inst_id:
+            raise RuntimeError("Body/ATR 回抽做空当前只支持信号标的与下单标的相同。")
+
+        lookback = body_retest_short_minimum_candles(config) + max(int(config.body_retest_watch_bars), 1)
+        last_candle_ts: int | None = None
+
+        self._log_strategy_start(config, signal_instrument, trade_instrument)
+        self._log_local_mode_summary(config, signal_instrument, trade_instrument)
+        self._logger(
+            "策略规则：只做空；先等弱势破位阴线，再在限定K线内等待回抽确认做空；"
+            "入场后按自定义初始止损、动态止盈、2R保本和逐级锁盈管理。"
+        )
+        self._logger(
+            " | ".join(
+                [
+                    f"破位阈值={Decimal(str(config.body_retest_breakdown_atr_multiplier)):.2f}ATR",
+                    f"回抽阈值={Decimal(str(config.body_retest_retest_atr_multiplier)):.2f}ATR",
+                    f"止损缓冲={Decimal(str(config.body_retest_stop_buffer_atr_multiplier)):.2f}ATR",
+                    f"body/ATR上限={Decimal(str(config.body_retest_body_atr_limit)):.2f}",
+                    f"观察窗口={max(int(config.body_retest_watch_bars), 1)}根",
+                    f"斜率阈值={Decimal(str(config.trend_ema_slope_filter_min_ratio)):.6f}",
+                    f"ATR分位上限={Decimal(str(config.atr_percentile_filter_max)):.2f}",
+                ]
+            )
+        )
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            current_bar=config.bar,
+            trend_ema_period=config.trend_ema_period,
+        )
+
+        while not self._stop_event.is_set():
+            candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            minimum = body_retest_short_minimum_candles(config)
+            if len(confirmed) < minimum:
+                self._logger("已收盘K线数量不足，继续等待更多数据...")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            newest_ts = confirmed[-1].ts
+            if newest_ts == last_candle_ts:
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            last_candle_ts = newest_ts
+
+            direction_filter_bias = (
+                self._build_live_daily_direction_filter_bias(confirmed, config)
+                if config.uses_daily_filter()
+                else None
+            )
+            decision = evaluate_body_retest_short_signal(
+                confirmed,
+                config,
+                direction_filter_bias=direction_filter_bias,
+                price_increment=signal_instrument.tick_size,
+            )
+            if decision.signal is None:
+                self._logger(f"{_fmt_ts(newest_ts)} | 当前无开空信号 | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            try:
+                position = self._open_local_position(
+                    credentials,
+                    config,
+                    signal_instrument=signal_instrument,
+                    trade_instrument=trade_instrument,
+                    signal=decision.signal,
+                    signal_entry_reference=decision.entry_reference,
+                    signal_atr_value=decision.atr_value,
+                    signal_candle_ts=decision.candle_ts,
+                    signal_candle_high=decision.signal_candle_high,
+                    signal_candle_low=decision.signal_candle_low,
+                )
+            except OrderSizeTooSmallError as exc:
+                self._logger(f"{_fmt_ts(decision.candle_ts or newest_ts)} | 当前无法下单 | {exc}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            protection = self._build_local_protection_plan(
+                config,
+                signal_instrument=signal_instrument,
+                trade_instrument=trade_instrument,
+                signal=decision.signal,
+                trade_side=position.side,
+                estimated_trade_entry=position.entry_price,
+                signal_entry_reference=decision.entry_reference,
+                signal_atr_value=decision.atr_value,
+                signal_candle_ts=decision.candle_ts,
+                signal_candle_high=decision.signal_candle_high,
+                signal_candle_low=decision.signal_candle_low,
+            )
+            self._monitor_local_exit(credentials, config, trade_instrument, position, protection)
             return
 
     def _run_dynamic_local_strategy(
@@ -1584,6 +1835,7 @@ class StrategyEngine:
                 continue
             if newest_ts != last_candle_ts or active_trigger is None:
                 decision = strategy.evaluate(confirmed, config, price_increment=signal_instrument.tick_size)
+                decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
                 last_candle_ts = newest_ts
                 if decision.signal is None:
                     active_trigger = None
@@ -1707,6 +1959,7 @@ class StrategyEngine:
             last_candle_ts = newest_ts
 
             decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
+            decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无动态委托信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -1787,6 +2040,7 @@ class StrategyEngine:
             f"启动追单窗口={config.startup_chase_window_label()}",
         ]
         self._append_dynamic_mtf_mode_parts(config, mode_parts)
+        self._append_daily_filter_mode_parts(config, mode_parts)
         if config.take_profit_mode == "dynamic":
             mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
             mode_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
@@ -1974,6 +2228,7 @@ class StrategyEngine:
             f"启动追单窗口={config.startup_chase_window_label()}",
         ]
         self._append_dynamic_mtf_mode_parts(config, mode_parts)
+        self._append_daily_filter_mode_parts(config, mode_parts)
         if config.take_profit_mode == "dynamic":
             mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
             mode_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
@@ -2127,6 +2382,7 @@ class StrategyEngine:
             last_candle_ts = newest_ts
 
             decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
+            decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -2210,6 +2466,7 @@ class StrategyEngine:
                 config,
                 price_increment=instrument.tick_size,
             )
+            decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None or decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无开空信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -2220,6 +2477,88 @@ class StrategyEngine:
                 config=config,
                 direction=decision.signal,
                 entry_reference=decision.entry_reference,
+                atr_value=decision.atr_value,
+                candle_ts=decision.candle_ts,
+                trigger_inst_id=instrument.inst_id,
+            )
+            if config.take_profit_mode == "dynamic":
+                reason = (
+                    f"{decision.reason} | 止损={format_decimal(protection.stop_loss)} | "
+                    "止盈方式=动态止盈（2R保本后逐级抬止损）"
+                )
+            else:
+                reason = (
+                    f"{decision.reason} | 止损={format_decimal(protection.stop_loss)} | "
+                    f"止盈={format_decimal(protection.take_profit)}"
+                )
+            self._logger(
+                f"{_fmt_ts(decision.candle_ts)} | 信号触发 | 方向=SHORT | "
+                f"参考价={format_decimal(decision.entry_reference)} | {reason}"
+            )
+            self._notify_signal(
+                config,
+                signal=decision.signal,
+                trigger_symbol=instrument.inst_id,
+                entry_reference=decision.entry_reference,
+                tick_size=instrument.tick_size,
+                reason=reason,
+            )
+            self._stop_event.wait(config.poll_seconds)
+
+    def _run_body_retest_short_signal_only(
+        self,
+        config: StrategyConfig,
+        instrument: Instrument,
+    ) -> None:
+        lookback = body_retest_short_minimum_candles(config) + max(int(config.body_retest_watch_bars), 1)
+        last_candle_ts: int | None = None
+
+        self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
+        self._logger("运行模式：只监控信号，不下单；当 body/ATR 破位回抽空头条件成立时发送做空提示。")
+        self._log_hourly_debug(
+            config.inst_id,
+            config.ema_period,
+            current_bar=config.bar,
+            trend_ema_period=config.trend_ema_period,
+        )
+
+        while not self._stop_event.is_set():
+            candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            minimum = body_retest_short_minimum_candles(config)
+            if len(confirmed) < minimum:
+                self._logger("已收盘K线数量不足，继续等待更多数据...")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            newest_ts = confirmed[-1].ts
+            if newest_ts == last_candle_ts:
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            last_candle_ts = newest_ts
+
+            direction_filter_bias = (
+                self._build_live_daily_direction_filter_bias(confirmed, config)
+                if config.uses_daily_filter()
+                else None
+            )
+            decision = evaluate_body_retest_short_signal(
+                confirmed,
+                config,
+                direction_filter_bias=direction_filter_bias,
+                price_increment=instrument.tick_size,
+            )
+            if decision.signal is None or decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
+                self._logger(f"{_fmt_ts(newest_ts)} | 当前无开空信号 | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            protection = build_body_retest_short_protection_plan(
+                instrument=instrument,
+                config=config,
+                entry_reference=decision.entry_reference,
+                signal_candle_high=decision.signal_candle_high or decision.entry_reference,
+                signal_candle_close=decision.entry_reference,
                 atr_value=decision.atr_value,
                 candle_ts=decision.candle_ts,
                 trigger_inst_id=instrument.inst_id,
@@ -2279,6 +2618,7 @@ class StrategyEngine:
             last_candle_ts = newest_ts
 
             decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
+            decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None or decision.entry_reference is None or decision.ema_value is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无 EMA5/EMA8 交叉信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -2360,6 +2700,7 @@ class StrategyEngine:
                 continue
 
             decision = strategy.evaluate(confirmed, config, price_increment=signal_instrument.tick_size)
+            decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None or decision.entry_reference is None or decision.ema_value is None:
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无 EMA5/EMA8 开仓信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
@@ -2531,6 +2872,31 @@ class StrategyEngine:
         signal_candle_low: Decimal | None,
     ) -> ProtectionPlan:
         mode = config.tp_sl_mode
+        if config.strategy_id == STRATEGY_BODY_RETEST_SHORT_ID:
+            if signal_entry_reference is None or signal_atr_value is None or signal_candle_ts is None or signal_candle_high is None:
+                raise RuntimeError("Body/ATR 回抽做空缺少信号K线高点、ATR或入场参考价，无法计算保护价。")
+            if mode == "local_signal":
+                return build_body_retest_short_protection_plan(
+                    instrument=signal_instrument,
+                    config=config,
+                    entry_reference=signal_entry_reference,
+                    signal_candle_high=signal_candle_high,
+                    signal_candle_close=signal_entry_reference,
+                    atr_value=signal_atr_value,
+                    candle_ts=signal_candle_ts,
+                    trigger_inst_id=signal_instrument.inst_id,
+                )
+            if mode in {"exchange", "local_trade"}:
+                return build_body_retest_short_protection_plan(
+                    instrument=trade_instrument,
+                    config=config,
+                    entry_reference=estimated_trade_entry,
+                    signal_candle_high=signal_candle_high,
+                    signal_candle_close=signal_entry_reference,
+                    atr_value=signal_atr_value,
+                    candle_ts=signal_candle_ts,
+                    trigger_inst_id=trade_instrument.inst_id,
+                )
         if mode == "local_signal":
             if signal_entry_reference is None or signal_atr_value is None or signal_candle_ts is None:
                 raise RuntimeError("信号标的止盈止损缺少入场参考价或 ATR 数据")
@@ -4567,6 +4933,8 @@ class StrategyEngine:
             message = (
                 f"{message} | 趋势均线={config.trend_ema_label()} | 挂单参考线={config.entry_reference_line_label()}"
             )
+        if config.uses_daily_filter():
+            message = f"{message} | {config.daily_filter_summary()}"
         self._logger(message)
 
     def _log_local_mode_summary(

@@ -186,6 +186,14 @@ class BacktestTest(TestCase):
 
         self.assertEqual(combined, ["long", "neutral", "neutral", "neutral"])
 
+    def test_combine_direction_filter_bias_supports_partial_scope_both(self) -> None:
+        combined = _combine_direction_filter_bias(
+            ["both", "short", "both", "long"],
+            ["long", "both", "neutral", "long"],
+        )
+
+        self.assertEqual(combined, ["long", "short", "neutral", "long"])
+
     def test_run_backtest_loads_multi_timeframe_filter_candles(self) -> None:
         start_ts = 1711929600000
         low_candles = [
@@ -248,6 +256,98 @@ class BacktestTest(TestCase):
         self.assertIn("15m", client.requested_bars)
         self.assertIn("1H", client.requested_bars)
         self.assertEqual(result.mtf_filter_bar, "1H")
+
+    def test_run_backtest_loads_hourly_candles_for_bjt_daily_filter(self) -> None:
+        start_ts = 1711929600000
+        low_candles = [
+            Candle(
+                start_ts + (index * 900000),
+                Decimal("100"),
+                Decimal("102"),
+                Decimal("99"),
+                Decimal(str(100 + (index % 8))),
+                Decimal("1"),
+                True,
+            )
+            for index in range(240)
+        ]
+        hourly_candles = [
+            Candle(
+                start_ts + (index * 3600000),
+                Decimal("100"),
+                Decimal("106"),
+                Decimal("98"),
+                Decimal(str(100 + index)),
+                Decimal("1"),
+                True,
+            )
+            for index in range(90)
+        ]
+
+        class _DailyBoundaryClient(DummyBacktestClient):
+            def __init__(self) -> None:
+                super().__init__(low_candles, self_outer._build_instrument())
+                self.requested_bars: list[str] = []
+
+            def get_candles_history(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
+                self.requested_bars.append(f"history:{bar}")
+                source = hourly_candles if bar == "1H" else low_candles
+                self.last_candle_history_stats = {
+                    "requested_count": limit,
+                    "returned_count": len(source if limit <= 0 else source[-limit:]),
+                    "full_history": limit <= 0,
+                }
+                return list(source) if limit <= 0 else source[-limit:]
+
+            def get_candles_history_range(
+                self,
+                inst_id: str,
+                bar: str,
+                *,
+                start_ts: int,
+                end_ts: int,
+                limit: int = 200,
+                preload_count: int = 0,
+            ) -> list[Candle]:
+                self.requested_bars.append(f"range:{bar}")
+                source = hourly_candles if bar == "1H" else low_candles
+                filtered = [candle for candle in source if start_ts <= candle.ts <= end_ts]
+                selected = list(filtered) if limit <= 0 else filtered[-limit:]
+                self.last_candle_history_stats = {
+                    "range_mode": True,
+                    "requested_count": limit,
+                    "selected_count": len(selected),
+                    "returned_count": len(selected),
+                    "full_history": limit <= 0,
+                }
+                return selected
+
+        self_outer = self
+        client = _DailyBoundaryClient()
+        config = replace(
+            self._build_config(),
+            strategy_id=STRATEGY_DYNAMIC_ID,
+            bar="15m",
+            ema_period=2,
+            trend_ema_period=3,
+            atr_period=2,
+            entry_reference_ema_period=0,
+            daily_filter_enabled=True,
+            daily_filter_boundary="bjt_08",
+            daily_filter_mode="close_vs_ma",
+            daily_filter_scope="long_only",
+            daily_filter_ma_type="ema",
+            daily_filter_period=2,
+        )
+
+        result = run_backtest(client, config, candle_limit=220)
+
+        self.assertIn("history:15m", client.requested_bars)
+        self.assertIn("range:1H", client.requested_bars)
+        self.assertTrue(result.daily_filter_enabled)
+        self.assertEqual(result.daily_filter_boundary, "bjt_08")
+        self.assertEqual(result.daily_filter_scope, "long_only")
+        self.assertEqual(len(result.direction_filter_bias), len(result.candles))
 
     def test_dynamic_backtest_stop_locks_1r_at_2r(self) -> None:
         position = _OpenPosition(

@@ -119,6 +119,11 @@ class StrategyConfig:
     trend_ema_slope_filter_enabled: bool = True
     trend_ema_slope_filter_lookback_bars: int = 5
     trend_ema_slope_filter_min_ratio: Decimal = Decimal("0")
+    body_retest_breakdown_atr_multiplier: Decimal = Decimal("0.2")
+    body_retest_retest_atr_multiplier: Decimal = Decimal("0.3")
+    body_retest_stop_buffer_atr_multiplier: Decimal = Decimal("0.3")
+    body_retest_body_atr_limit: Decimal = Decimal("1.0")
+    body_retest_watch_bars: int = 6
     startup_chase_window_seconds: int = 0
     time_stop_break_even_enabled: bool = False
     time_stop_break_even_bars: int = 10
@@ -194,6 +199,32 @@ class StrategyConfig:
 
     def resolved_daily_filter_bar(self) -> str:
         return (self.daily_filter_bar or "1D").strip()
+
+    def uses_daily_filter(self) -> bool:
+        return bool(self.daily_filter_enabled and self.daily_filter_mode != "disabled")
+
+    def daily_filter_summary(self) -> str:
+        if not self.uses_daily_filter():
+            return "日线过滤：关闭"
+        boundary_labels = {
+            "exchange": "交易所1D",
+            "bjt_00": "北京时间0点",
+            "bjt_08": "北京时间8点",
+        }
+        scope_labels = {
+            "both": "多空都过滤",
+            "long_only": "只过滤多头",
+            "short_only": "只过滤空头",
+        }
+        mode = str(self.daily_filter_mode or "disabled").strip().lower()
+        boundary_label = boundary_labels.get(str(self.daily_filter_boundary or "exchange"), str(self.daily_filter_boundary or "exchange"))
+        scope_label = scope_labels.get(str(self.daily_filter_scope or "both"), str(self.daily_filter_scope or "both"))
+        if mode == "weak_day":
+            return f"日线过滤：{boundary_label} 弱日规则 | {scope_label}"
+        return (
+            f"日线过滤：{boundary_label} {str(self.daily_filter_ma_type or 'ema').upper()}"
+            f"{max(int(self.daily_filter_period), 1)} close-vs-MA | {scope_label}"
+        )
 
     def resolved_backtest_entry_slippage_rate(self) -> Decimal:
         if self.backtest_entry_slippage_rate > 0 or self.backtest_exit_slippage_rate > 0:

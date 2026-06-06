@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_EMA5_EMA8_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
@@ -22,6 +23,7 @@ StrategyRuntimeFamily = Literal[
     "cross_breakout_long",
     "cross_breakdown_short",
     "ema55_slope_short",
+    "body_retest_short",
     "ema5_ema8",
 ]
 
@@ -88,6 +90,11 @@ _EMA55_SLOPE_SHORT_PROFILE = StrategyRuntimeProfile(
     signal_only_handler="_run_ema55_slope_short_signal_only",
     local_trade_handler="_run_ema55_slope_short_local_strategy",
 )
+_BODY_RETEST_SHORT_PROFILE = StrategyRuntimeProfile(
+    family="body_retest_short",
+    signal_only_handler="_run_body_retest_short_signal_only",
+    local_trade_handler="_run_body_retest_short_local_strategy",
+)
 _EMA5_EMA8_PROFILE = StrategyRuntimeProfile(
     family="ema5_ema8",
     signal_only_handler="_run_ema5_ema8_signal_only",
@@ -108,6 +115,8 @@ def get_strategy_runtime_profile(strategy_id: str) -> StrategyRuntimeProfile:
         return _CROSS_BREAKOUT_LONG_PROFILE
     if strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
         return _EMA55_SLOPE_SHORT_PROFILE
+    if strategy_id == STRATEGY_BODY_RETEST_SHORT_ID:
+        return _BODY_RETEST_SHORT_PROFILE
     if strategy_id == STRATEGY_EMA5_EMA8_ID:
         return _EMA5_EMA8_PROFILE
     raise KeyError(f"unknown strategy runtime profile: {strategy_id}")
@@ -143,7 +152,7 @@ def strategy_preferred_direction(strategy_id: str, signal_mode: str) -> Strategy
     profile = get_strategy_runtime_profile(strategy_id)
     if profile.family == "cross_breakout_long":
         return "long"
-    if profile.family in {"cross_breakdown_short", "ema55_slope_short"}:
+    if profile.family in {"cross_breakdown_short", "ema55_slope_short", "body_retest_short"}:
         return "short"
     normalized_signal_mode = resolve_dynamic_signal_mode(strategy_id, signal_mode)
     if normalized_signal_mode == "long_only":

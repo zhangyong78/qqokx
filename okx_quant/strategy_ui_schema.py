@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+    STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_MTF_LONG_ID,
     STRATEGY_DYNAMIC_MTF_SHORT_ID,
@@ -23,6 +24,7 @@ from okx_quant.strategy_parameters import (
 
 @dataclass(frozen=True)
 class StrategyWidgetVisibility:
+    show_daily_filter_controls: bool
     show_big_ema: bool
     show_dynamic_take_profit: bool
     show_entry_reference: bool
@@ -174,6 +176,66 @@ STRATEGY_UI_SCHEMAS: dict[str, StrategyUiSchema] = {
         force_local_trade=True,
         supports_dynamic_take_profit=True,
     ),
+    STRATEGY_BODY_RETEST_SHORT_ID: StrategyUiSchema(
+        strategy_id=STRATEGY_BODY_RETEST_SHORT_ID,
+        parameter_defaults={
+            _SCOPE_LAUNCHER: {
+                "atr_period": 14,
+                "atr_stop_multiplier": "2",
+                "atr_take_multiplier": "4",
+                "atr_percentile_filter_max": "0.5",
+                "bar": "1H",
+                "body_retest_body_atr_limit": "1.0",
+                "body_retest_breakdown_atr_multiplier": "0.2",
+                "body_retest_retest_atr_multiplier": "0.3",
+                "body_retest_stop_buffer_atr_multiplier": "0.3",
+                "body_retest_watch_bars": 6,
+                "dynamic_fee_offset_enabled": True,
+                "dynamic_two_r_break_even": True,
+                "take_profit_mode": "dynamic",
+                "time_stop_break_even_bars": 10,
+                "time_stop_break_even_enabled": False,
+                "trend_ema_slope_filter_min_ratio": "-0.0005",
+            },
+            _SCOPE_BACKTEST: {
+                "atr_period": 14,
+                "atr_stop_multiplier": "2",
+                "atr_take_multiplier": "4",
+                "atr_percentile_filter_max": "0.5",
+                "bar": "1H",
+                "body_retest_body_atr_limit": "1.0",
+                "body_retest_breakdown_atr_multiplier": "0.2",
+                "body_retest_retest_atr_multiplier": "0.3",
+                "body_retest_stop_buffer_atr_multiplier": "0.3",
+                "body_retest_watch_bars": 6,
+                "dynamic_fee_offset_enabled": True,
+                "dynamic_two_r_break_even": True,
+                "take_profit_mode": "dynamic",
+                "time_stop_break_even_bars": 10,
+                "time_stop_break_even_enabled": False,
+                "trend_ema_slope_filter_min_ratio": "-0.0005",
+            },
+        },
+        extra_defaults={
+            _SCOPE_LAUNCHER: {
+                "entry_side_mode": "follow_signal",
+                "order_size": "0",
+                "poll_seconds": "10",
+                "position_mode": "net",
+                "risk_amount": "100",
+                "tp_sl_mode": "local_trade",
+                "trade_mode": "cross",
+                "trigger_type": "mark",
+            },
+            _SCOPE_BACKTEST: {
+                "risk_amount": "100",
+                "sizing_mode": "fixed_risk",
+            },
+        },
+        force_follow_signal=True,
+        force_local_trade=True,
+        supports_dynamic_take_profit=True,
+    ),
 }
 
 
@@ -217,6 +279,7 @@ def strategy_forces_local_trade(strategy_id: str) -> bool:
 
 def build_strategy_widget_visibility(strategy_id: str, scope: PageScope) -> StrategyWidgetVisibility:
     return StrategyWidgetVisibility(
+        show_daily_filter_controls=strategy_uses_parameter(strategy_id, "daily_filter_enabled"),
         show_big_ema=strategy_uses_parameter(strategy_id, "big_ema_period"),
         show_dynamic_take_profit=strategy_supports_dynamic_take_profit(strategy_id),
         show_entry_reference=strategy_uses_parameter(strategy_id, "entry_reference_ema_period"),

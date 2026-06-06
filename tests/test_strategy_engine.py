@@ -85,6 +85,47 @@ class StrategyEngineTest(TestCase):
         self.assertIn("趋势均线=EMA55", messages[0])
         self.assertIn("挂单参考线=跟随快线(MA21)", messages[0])
 
+    def test_log_strategy_start_includes_daily_filter_summary(self) -> None:
+        messages: list[str] = []
+        engine = StrategyEngine(object(), messages.append)
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            entry_reference_ema_period=0,
+            daily_filter_enabled=True,
+            daily_filter_boundary="bjt_08",
+            daily_filter_mode="close_vs_ma",
+            daily_filter_scope="long_only",
+            daily_filter_ma_type="ma",
+            daily_filter_period=5,
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+
+        engine._log_strategy_start(config, instrument, instrument)
+
+        self.assertEqual(len(messages), 1)
+        self.assertIn("日线过滤", messages[0])
+        self.assertIn("北京时间8点", messages[0])
+
     def test_get_okx_read_retry_config_env_overrides(self) -> None:
         with patch.dict(
             os.environ,
@@ -167,6 +208,122 @@ class StrategyEngineTest(TestCase):
 
         self.assertIsNone(decision.signal)
         self.assertIn("高周期过滤未放行", decision.reason)
+        self.assertEqual(requested[0][0], "BTC-USDT-SWAP")
+        self.assertEqual(requested[0][1], "1H")
+
+    def test_apply_live_daily_filter_to_decision_blocks_disallowed_signal(self) -> None:
+        engine = StrategyEngine(object(), lambda _message: None)
+        engine._build_live_daily_direction_filter_bias = lambda entry_candles, config: ["short"] * len(entry_candles)  # type: ignore[assignment]
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            daily_filter_enabled=True,
+            daily_filter_boundary="exchange",
+            daily_filter_mode="close_vs_ma",
+            daily_filter_scope="both",
+            daily_filter_ma_type="ema",
+            daily_filter_period=5,
+        )
+        candles = self._make_candles(["100", "101", "102"])
+        decision = SignalDecision(
+            signal="long",
+            reason="base signal",
+            candle_ts=candles[-1].ts,
+            entry_reference=Decimal("102"),
+            atr_value=Decimal("1"),
+            ema_value=Decimal("101"),
+        )
+
+        filtered = engine._apply_live_daily_filter_to_decision(candles, config, decision)
+
+        self.assertIsNone(filtered.signal)
+        self.assertIn("日线过滤未放行", filtered.reason)
+
+    def test_load_daily_filter_confirmed_candles_uses_hourly_history_for_bjt_boundary(self) -> None:
+        requested: list[tuple[str, str, int, int]] = []
+
+        class _StubClient:
+            def get_candles_history_range(
+                self,
+                inst_id: str,
+                bar: str,
+                *,
+                start_ts: int,
+                end_ts: int,
+                limit: int = 0,
+                preload_count: int = 0,
+            ) -> list[Candle]:
+                requested.append((inst_id, bar, start_ts, end_ts))
+                candles: list[Candle] = []
+                base_ts = 1_700_000_000_000
+                for index in range(24 * 10):
+                    ts = base_ts + index * 3_600_000
+                    open_price = Decimal("100") + Decimal(index)
+                    close_price = open_price + Decimal("1")
+                    candles.append(
+                        Candle(
+                            ts=ts,
+                            open=open_price,
+                            high=close_price + Decimal("1"),
+                            low=open_price - Decimal("1"),
+                            close=close_price,
+                            volume=Decimal("1"),
+                            confirmed=True,
+                        )
+                    )
+                return candles
+
+        engine = StrategyEngine(_StubClient(), lambda _message: None)
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="15m",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            daily_filter_enabled=True,
+            daily_filter_boundary="bjt_08",
+            daily_filter_mode="close_vs_ma",
+            daily_filter_scope="long_only",
+            daily_filter_ma_type="ema",
+            daily_filter_period=5,
+        )
+        entry_candles = [
+            Candle(
+                ts=1_700_000_000_000 + index * 900_000,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+                confirmed=True,
+            )
+            for index in range(20)
+        ]
+
+        daily_candles = engine._load_daily_filter_confirmed_candles(config, entry_candles)
+
+        self.assertTrue(daily_candles)
         self.assertEqual(requested[0][0], "BTC-USDT-SWAP")
         self.assertEqual(requested[0][1], "1H")
 
