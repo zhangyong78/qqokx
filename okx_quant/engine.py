@@ -28,6 +28,7 @@ from okx_quant.okx_client import (
     infer_inst_type,
 )
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
+from okx_quant.protection_validation import InvalidProtectionPlanError, validate_protection_prices
 from okx_quant.engine_order_service import EngineOrderService
 from okx_quant.engine_retry_policy import EngineRetryPolicy
 from okx_quant.engine_session_runner import EngineSessionRunner
@@ -868,7 +869,7 @@ class StrategyEngine:
                     signal_candle_high=decision.signal_candle_high,
                     signal_candle_low=decision.signal_candle_low,
                 )
-            except OrderSizeTooSmallError as exc:
+            except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
                 idle_signal_candle_ts = newest_ts
                 self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前无法生成挂单 | {exc}")
                 self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
@@ -1375,7 +1376,7 @@ class StrategyEngine:
                     signal_candle_high=decision.signal_candle_high,
                     signal_candle_low=decision.signal_candle_low,
                 )
-            except OrderSizeTooSmallError as exc:
+            except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
                 self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前无法生成挂单 | {exc}")
                 self._stop_event.wait(config.poll_seconds)
                 continue
@@ -1542,7 +1543,7 @@ class StrategyEngine:
                     signal_candle_high=decision.signal_candle_high,
                     signal_candle_low=decision.signal_candle_low,
                 )
-            except OrderSizeTooSmallError as exc:
+            except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
                 self._logger(f"{_fmt_ts(decision.candle_ts or newest_ts)} | 当前无法下单 | {exc}")
                 self._stop_event.wait(config.poll_seconds)
                 continue
@@ -1570,7 +1571,7 @@ class StrategyEngine:
         trade_instrument: Instrument,
     ) -> None:
         if resolve_trade_inst_id(config) != config.inst_id:
-            raise RuntimeError("EMA55 斜率做空当前只支持信号标的与下单标的相同。")
+            raise RuntimeError("均线斜率做空当前只支持信号标的与下单标的相同。")
 
         lookback = recommended_indicator_lookback(
             config.ema_period,
@@ -1582,9 +1583,10 @@ class StrategyEngine:
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
         self._log_local_mode_summary(config, signal_instrument, trade_instrument)
+        line_label = config.ema_label()
         self._logger(
-            "策略规则：只做空；当最新已收盘K线的 EMA55 单根斜率比例小于等于阈值时按收盘价开空，"
-            "持仓后继续监控 ATR 止损/止盈；若后续 EMA55 斜率重新转正，则本地市价平仓。"
+            f"策略规则：只做空；当最新已收盘K线的 {line_label} 单根斜率比例小于等于阈值时按收盘价开空，"
+            f"持仓后继续监控 ATR 止损/止盈；若后续 {line_label} 斜率重新转正，则本地市价平仓。"
         )
         self._logger(
             " | ".join(
@@ -1646,7 +1648,7 @@ class StrategyEngine:
                     signal_candle_high=decision.signal_candle_high,
                     signal_candle_low=decision.signal_candle_low,
                 )
-            except OrderSizeTooSmallError as exc:
+            except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
                 self._logger(f"{_fmt_ts(decision.candle_ts or newest_ts)} | 当前无法下单 | {exc}")
                 self._stop_event.wait(config.poll_seconds)
                 continue
@@ -1758,7 +1760,7 @@ class StrategyEngine:
                     signal_candle_high=decision.signal_candle_high,
                     signal_candle_low=decision.signal_candle_low,
                 )
-            except OrderSizeTooSmallError as exc:
+            except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
                 self._logger(f"{_fmt_ts(decision.candle_ts or newest_ts)} | 当前无法下单 | {exc}")
                 self._stop_event.wait(config.poll_seconds)
                 continue
@@ -1886,7 +1888,7 @@ class StrategyEngine:
                     signal_candle_high=active_trigger.signal_candle_high,
                     signal_candle_low=active_trigger.signal_candle_low,
                 )
-            except OrderSizeTooSmallError as exc:
+            except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
                 self._logger(f"{_fmt_ts(active_trigger.candle_ts)} | 当前无法下单 | {exc}")
                 active_trigger = None
                 idle_signal_candle_ts = newest_ts
@@ -1968,15 +1970,20 @@ class StrategyEngine:
             if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
                 raise RuntimeError("策略返回的数据不完整，无法生成信号邮件")
 
-            protection = build_protection_plan(
-                instrument=instrument,
-                config=config,
-                direction=decision.signal,
-                entry_reference=decision.entry_reference,
-                atr_value=decision.atr_value,
-                candle_ts=decision.candle_ts,
-                trigger_inst_id=instrument.inst_id,
-            )
+            try:
+                protection = build_protection_plan(
+                    instrument=instrument,
+                    config=config,
+                    direction=decision.signal,
+                    entry_reference=decision.entry_reference,
+                    atr_value=decision.atr_value,
+                    candle_ts=decision.candle_ts,
+                    trigger_inst_id=instrument.inst_id,
+                )
+            except InvalidProtectionPlanError as exc:
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前信号保护价非法，已跳过 | {exc}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
             reason = (
                 "EMA 动态委托参考价已更新"
                 f" | 止损={format_decimal(protection.stop_loss)}"
@@ -2166,7 +2173,7 @@ class StrategyEngine:
                     signal_candle_high=active_trigger.signal_candle_high,
                     signal_candle_low=active_trigger.signal_candle_low,
                 )
-            except OrderSizeTooSmallError as exc:
+            except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
                 self._logger(f"{_fmt_ts(active_trigger.candle_ts)} | ?????? | {exc}")
                 active_trigger = None
                 idle_signal_candle_ts = newest_ts
@@ -2304,15 +2311,20 @@ class StrategyEngine:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
-            protection = build_protection_plan(
-                instrument=instrument,
-                config=config,
-                direction=decision.signal,
-                entry_reference=decision.entry_reference,
-                atr_value=decision.atr_value,
-                candle_ts=decision.candle_ts,
-                trigger_inst_id=instrument.inst_id,
-            )
+            try:
+                protection = build_protection_plan(
+                    instrument=instrument,
+                    config=config,
+                    direction=decision.signal,
+                    entry_reference=decision.entry_reference,
+                    atr_value=decision.atr_value,
+                    candle_ts=decision.candle_ts,
+                    trigger_inst_id=instrument.inst_id,
+                )
+            except InvalidProtectionPlanError as exc:
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前信号保护价非法，已跳过 | {exc}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
             if config.take_profit_mode == "dynamic":
                 reason = f"EMA 动态委托参考价已更新 | 止损={format_decimal(protection.stop_loss)} | 止盈方式=动态止盈"
             else:
@@ -2391,18 +2403,23 @@ class StrategyEngine:
             if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
                 raise RuntimeError("策略返回的数据不完整，无法生成信号邮件")
 
-            protection = build_protection_plan(
-                instrument=instrument,
-                config=config,
-                direction=decision.signal,
-                entry_reference=decision.entry_reference,
-                atr_value=decision.atr_value,
-                candle_ts=decision.candle_ts,
-                trigger_inst_id=instrument.inst_id,
-                use_signal_extrema=True,
-                signal_candle_high=decision.signal_candle_high,
-                signal_candle_low=decision.signal_candle_low,
-            )
+            try:
+                protection = build_protection_plan(
+                    instrument=instrument,
+                    config=config,
+                    direction=decision.signal,
+                    entry_reference=decision.entry_reference,
+                    atr_value=decision.atr_value,
+                    candle_ts=decision.candle_ts,
+                    trigger_inst_id=instrument.inst_id,
+                    use_signal_extrema=True,
+                    signal_candle_high=decision.signal_candle_high,
+                    signal_candle_low=decision.signal_candle_low,
+                )
+            except InvalidProtectionPlanError as exc:
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前信号保护价非法，已跳过 | {exc}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
             reason = (
                 "EMA 突破/跌破信号已确认"
                 f" | 止损={format_decimal(protection.stop_loss)}"
@@ -2436,9 +2453,8 @@ class StrategyEngine:
         last_candle_ts: int | None = None
 
         self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
-        self._logger(
-            "运行模式：只监控信号，不下单；当 EMA55 单根斜率比例达到开空阈值时发送做空提示。"
-        )
+        line_label = config.ema_label()
+        self._logger(f"运行模式：只监控信号，不下单；当 {line_label} 单根斜率比例达到开空阈值时发送做空提示。")
         self._log_hourly_debug(
             config.inst_id,
             config.ema_period,
@@ -2472,15 +2488,20 @@ class StrategyEngine:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
-            protection = build_protection_plan(
-                instrument=instrument,
-                config=config,
-                direction=decision.signal,
-                entry_reference=decision.entry_reference,
-                atr_value=decision.atr_value,
-                candle_ts=decision.candle_ts,
-                trigger_inst_id=instrument.inst_id,
-            )
+            try:
+                protection = build_protection_plan(
+                    instrument=instrument,
+                    config=config,
+                    direction=decision.signal,
+                    entry_reference=decision.entry_reference,
+                    atr_value=decision.atr_value,
+                    candle_ts=decision.candle_ts,
+                    trigger_inst_id=instrument.inst_id,
+                )
+            except InvalidProtectionPlanError as exc:
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前信号保护价非法，已跳过 | {exc}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
             if config.take_profit_mode == "dynamic":
                 reason = (
                     f"{decision.reason} | 止损={format_decimal(protection.stop_loss)} | "
@@ -2715,7 +2736,7 @@ class StrategyEngine:
                     stop_loss=current_stop_line,
                     signal_candle_ts=decision.candle_ts or newest_ts,
                 )
-            except OrderSizeTooSmallError as exc:
+            except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
                 self._logger(f"{_fmt_ts(decision.candle_ts or newest_ts)} | 当前无法下单 | {exc}")
                 self._stop_event.wait(config.poll_seconds)
                 continue
@@ -3162,8 +3183,9 @@ class StrategyEngine:
                     exit_ready, exit_candle, _ema_value, slope_ratio = ema55_slope_short_exit_ready(confirmed, config)
                     if exit_ready and exit_candle is not None:
                         slope_text = f"{slope_ratio:.6f}" if slope_ratio is not None else "-"
+                        line_label = config.ema_label()
                         self._logger(
-                            f"{_fmt_ts(exit_candle.ts)} | EMA55 斜率转正平仓 | 斜率比例={slope_text}"
+                            f"{_fmt_ts(exit_candle.ts)} | {line_label} 斜率转正平仓 | 斜率比例={slope_text}"
                         )
                         self._close_position(credentials, config, trade_instrument, position, "斜率转正")
                         self.resume_automatic_trade_management()
@@ -5795,8 +5817,12 @@ def build_protection_plan(
         take_profit = snap_to_increment(take_profit_raw, instrument.tick_size, "up")
         stop_loss = snap_to_increment(stop_loss_raw, instrument.tick_size, "down")
 
-    if take_profit <= 0 or stop_loss <= 0:
-        raise RuntimeError("计算出来的止盈止损价格必须大于 0")
+    validate_protection_prices(
+        direction=direction,
+        entry_reference=reference_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
 
     return ProtectionPlan(
         trigger_inst_id=trigger_inst_id,

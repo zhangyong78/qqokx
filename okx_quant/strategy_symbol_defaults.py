@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Literal
 
-from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_LONG_ID
+from okx_quant.strategy_catalog import (
+    STRATEGY_BODY_RETEST_SHORT_ID,
+    STRATEGY_DYNAMIC_LONG_ID,
+    STRATEGY_EMA55_SLOPE_SHORT_ID,
+)
 
 
 PageScope = Literal["launcher", "backtest"]
@@ -87,6 +91,164 @@ _DYNAMIC_LONG_4COIN_DEFAULTS: dict[str, dict[str, object]] = {
     },
 }
 
+_SLOPE_SHORT_SYMBOL_DEFAULTS: dict[str, dict[str, object]] = {
+    "BTC-USDT-SWAP": {
+        "bar": "1H",
+        "ema_type": "ema",
+        "ema_period": 55,
+        "trend_ema_type": "ema",
+        "trend_ema_period": 55,
+        "atr_period": 14,
+        "atr_stop_multiplier": "2",
+        "atr_take_multiplier": "4",
+        "atr_percentile_filter_max": "0.5",
+        "take_profit_mode": "dynamic",
+        "dynamic_two_r_break_even": True,
+        "dynamic_fee_offset_enabled": True,
+        "ema55_slope_exit_enabled": False,
+        "time_stop_break_even_enabled": False,
+        "time_stop_break_even_bars": 10,
+        "trend_ema_slope_filter_min_ratio": "-0.0005",
+        "daily_filter_enabled": False,
+        "daily_filter_boundary": "bjt_08",
+        "daily_filter_mode": "disabled",
+        "daily_filter_scope": "short_only",
+        "daily_filter_ma_type": "ema",
+        "daily_filter_period": 21,
+        "risk_amount": "10",
+    },
+    "ETH-USDT-SWAP": {
+        "bar": "1H",
+        "ema_type": "ma",
+        "ema_period": 34,
+        "trend_ema_type": "ma",
+        "trend_ema_period": 34,
+        "atr_period": 14,
+        "atr_stop_multiplier": "2",
+        "atr_take_multiplier": "4",
+        "atr_percentile_filter_max": "0.5",
+        "take_profit_mode": "dynamic",
+        "dynamic_two_r_break_even": True,
+        "dynamic_fee_offset_enabled": True,
+        "ema55_slope_exit_enabled": False,
+        "time_stop_break_even_enabled": False,
+        "time_stop_break_even_bars": 10,
+        "trend_ema_slope_filter_min_ratio": "-0.0005",
+        "daily_filter_enabled": False,
+        "daily_filter_boundary": "bjt_08",
+        "daily_filter_mode": "disabled",
+        "daily_filter_scope": "short_only",
+        "daily_filter_ma_type": "ema",
+        "daily_filter_period": 21,
+        "risk_amount": "10",
+    },
+    "SOL-USDT-SWAP": {
+        "bar": "1H",
+        "ema_type": "ma",
+        "ema_period": 20,
+        "trend_ema_type": "ma",
+        "trend_ema_period": 20,
+        "atr_period": 14,
+        "atr_stop_multiplier": "2",
+        "atr_take_multiplier": "4",
+        "atr_percentile_filter_max": "0.5",
+        "take_profit_mode": "dynamic",
+        "dynamic_two_r_break_even": True,
+        "dynamic_fee_offset_enabled": True,
+        "ema55_slope_exit_enabled": False,
+        "time_stop_break_even_enabled": False,
+        "time_stop_break_even_bars": 10,
+        "trend_ema_slope_filter_min_ratio": "-0.0005",
+        "daily_filter_enabled": False,
+        "daily_filter_boundary": "bjt_08",
+        "daily_filter_mode": "disabled",
+        "daily_filter_scope": "short_only",
+        "daily_filter_ma_type": "ema",
+        "daily_filter_period": 21,
+        "risk_amount": "10",
+    },
+    "BNB-USDT-SWAP": {
+        "bar": "1H",
+        "ema_type": "ma",
+        "ema_period": 34,
+        "trend_ema_type": "ma",
+        "trend_ema_period": 34,
+        "atr_period": 14,
+        "atr_stop_multiplier": "2",
+        "atr_take_multiplier": "4",
+        "atr_percentile_filter_max": "0.5",
+        "take_profit_mode": "dynamic",
+        "dynamic_two_r_break_even": True,
+        "dynamic_fee_offset_enabled": True,
+        "ema55_slope_exit_enabled": False,
+        "time_stop_break_even_enabled": False,
+        "time_stop_break_even_bars": 10,
+        "trend_ema_slope_filter_min_ratio": "-0.0005",
+        "daily_filter_enabled": False,
+        "daily_filter_boundary": "bjt_08",
+        "daily_filter_mode": "disabled",
+        "daily_filter_scope": "short_only",
+        "daily_filter_ma_type": "ema",
+        "daily_filter_period": 21,
+        "risk_amount": "10",
+    },
+    "DOGE-USDT-SWAP": {
+        "bar": "1H",
+        "ema_type": "ma",
+        "ema_period": 55,
+        "trend_ema_type": "ma",
+        "trend_ema_period": 55,
+        "atr_period": 14,
+        "atr_stop_multiplier": "2",
+        "atr_take_multiplier": "4",
+        "atr_percentile_filter_max": "0.5",
+        "take_profit_mode": "dynamic",
+        "dynamic_two_r_break_even": True,
+        "dynamic_fee_offset_enabled": True,
+        "ema55_slope_exit_enabled": False,
+        "time_stop_break_even_enabled": False,
+        "time_stop_break_even_bars": 10,
+        "trend_ema_slope_filter_min_ratio": "-0.0005",
+        "daily_filter_enabled": False,
+        "daily_filter_boundary": "bjt_08",
+        "daily_filter_mode": "disabled",
+        "daily_filter_scope": "short_only",
+        "daily_filter_ma_type": "ma",
+        "daily_filter_period": 20,
+        "risk_amount": "10",
+    },
+}
+
+_BODY_RETEST_SHORT_SYMBOL_DEFAULTS: dict[str, dict[str, object]] = {
+    "BNB-USDT-SWAP": {
+        "bar": "1H",
+        "ema_type": "ma",
+        "ema_period": 20,
+        "trend_ema_type": "ma",
+        "trend_ema_period": 20,
+        "atr_period": 14,
+        "atr_stop_multiplier": "2",
+        "atr_take_multiplier": "4",
+        "atr_percentile_filter_max": "0.5",
+        "take_profit_mode": "dynamic",
+        "dynamic_two_r_break_even": True,
+        "dynamic_fee_offset_enabled": True,
+        "time_stop_break_even_enabled": False,
+        "time_stop_break_even_bars": 10,
+        "trend_ema_slope_filter_min_ratio": "-0.0005",
+        "body_retest_breakdown_atr_multiplier": "0.2",
+        "body_retest_retest_atr_multiplier": "0.3",
+        "body_retest_stop_buffer_atr_multiplier": "0.3",
+        "body_retest_body_atr_limit": "1.0",
+        "body_retest_watch_bars": 6,
+        "daily_filter_enabled": False,
+        "daily_filter_boundary": "bjt_08",
+        "daily_filter_mode": "disabled",
+        "daily_filter_scope": "short_only",
+        "risk_amount": "10",
+    },
+}
+
 
 def get_strategy_symbol_parameter_defaults(
     strategy_id: str,
@@ -94,12 +256,19 @@ def get_strategy_symbol_parameter_defaults(
     scope: PageScope,
 ) -> dict[str, object]:
     normalized_symbol = str(symbol or "").strip().upper()
-    if strategy_id != STRATEGY_DYNAMIC_LONG_ID:
-        return {}
-    defaults = _DYNAMIC_LONG_4COIN_DEFAULTS.get(normalized_symbol)
+    if strategy_id == STRATEGY_DYNAMIC_LONG_ID:
+        defaults = _DYNAMIC_LONG_4COIN_DEFAULTS.get(normalized_symbol)
+    elif strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
+        defaults = _SLOPE_SHORT_SYMBOL_DEFAULTS.get(normalized_symbol)
+    elif strategy_id == STRATEGY_BODY_RETEST_SHORT_ID:
+        defaults = _BODY_RETEST_SHORT_SYMBOL_DEFAULTS.get(normalized_symbol)
+    else:
+        defaults = None
     if not defaults:
         return {}
     scoped = dict(defaults)
     if scope == "backtest":
         scoped.pop("startup_chase_window_seconds", None)
+        if "risk_amount" in scoped:
+            scoped["risk_amount"] = "100"
     return scoped

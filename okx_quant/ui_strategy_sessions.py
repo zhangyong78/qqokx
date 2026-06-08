@@ -3,6 +3,7 @@
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+import threading
 
 from okx_quant.strategy_runtime_registry import (
     get_strategy_runtime_profile,
@@ -5163,6 +5164,29 @@ class UiStrategySessionsMixin:
         if inferred:
             session.runtime_status = inferred
         self._track_session_trade_runtime(session, text)
+        pending_updates = getattr(self, "_pending_runtime_session_updates", None)
+        if not isinstance(pending_updates, set):
+            pending_updates = set()
+            self._pending_runtime_session_updates = pending_updates
+        pending_updates.add(session_id)
+
+    def _drain_pending_runtime_session_updates(self) -> None:
+        pending_updates = getattr(self, "_pending_runtime_session_updates", None)
+        if not isinstance(pending_updates, set) or not pending_updates:
+            return
+        session_ids = list(pending_updates)
+        pending_updates.clear()
+        selected_session_id = getattr(self, "_selected_session_detail_session_id", None)
+        selected_changed = False
+        for session_id in session_ids:
+            session = self.sessions.get(session_id)
+            if session is None:
+                continue
+            self._upsert_session_row(session)
+            if session_id == selected_session_id:
+                selected_changed = True
+        if selected_changed:
+            self._refresh_selected_session_details()
 
     def _ensure_session_trade_runtime(
         self,
@@ -5800,7 +5824,11 @@ class UiStrategySessionsMixin:
             session.run_mode_label,
             session.symbol,
             bar_label,
-            session.direction_label,
+            _normalize_strategy_direction_label(
+                session.strategy_id,
+                getattr(session, "config", None),
+                fallback=session.direction_label,
+            ),
             open_qty_text,
             _format_optional_usdt_precise(live_pnl, places=2),
             _format_optional_usdt_precise(session.net_pnl_total, places=2),
@@ -6401,7 +6429,7 @@ class UiStrategySessionsMixin:
             return True
         if trade.reconciliation_started:
             return False
-        return self._strategy_session_supports_position_recovery(session.config)
+        return UiStrategySessionsMixin._strategy_session_supports_position_recovery(session.config)
 
     @staticmethod
     def _parse_strategy_log_observed_at(line: str) -> datetime | None:
@@ -6834,12 +6862,154 @@ class UiStrategySessionsMixin:
         session_ids = list(self._recoverable_strategy_sessions.keys())
         if not session_ids:
             return
+        root = getattr(self, "root", None)
+        if root is None or not hasattr(root, "after"):
+            UiStrategySessionsMixin._run_auto_restore_batch_sync(self, session_ids)
+            return
+        if getattr(self, "_auto_restore_batch_pending", None):
+            return
+        self._auto_restore_batch_session_ids = session_ids
+        self._auto_restore_batch_pending = set(session_ids)
+        self._auto_restore_probe_cache = {}
+        for session_id in session_ids:
+            self._dispatch_auto_restore_probe(session_id)
+
+    def _run_auto_restore_batch_sync(self, session_ids: list[str]) -> None:
+        for session_id in session_ids:
+            self._recover_session(session_id, auto=True)
+        UiStrategySessionsMixin._log_auto_restore_summary(self, session_ids)
+
+    def _dispatch_auto_restore_probe(self, session_id: str) -> None:
+        def _worker() -> None:
+            probe_result = self._probe_recoverable_session_for_auto_restore(session_id)
+            root = getattr(self, "root", None)
+            if root is None or not hasattr(root, "after"):
+                return
+            try:
+                root.after(
+                    0,
+                    lambda sid=session_id, result=probe_result: self._apply_auto_restore_probe_result(sid, result),
+                )
+            except Exception:
+                pending = getattr(self, "_auto_restore_batch_pending", None)
+                if isinstance(pending, set):
+                    pending.discard(session_id)
+
+        threading.Thread(
+            target=_worker,
+            name=f"okx-auto-restore-probe-{session_id.lower()}",
+            daemon=True,
+        ).start()
+
+    def _probe_recoverable_session_for_auto_restore(self, session_id: str) -> dict[str, object]:
+        session = self.sessions.get(session_id)
+        if session is None or session.engine.is_running or not session.recovery_supported:
+            return {"ready": False}
+        record = self._recoverable_strategy_sessions.get(session_id)
+        credentials = self._credentials_for_profile_or_none(session.api_name or (record.api_name if record is not None else ""))
+        if credentials is None:
+            return {"ready": False}
+        trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or session.symbol).strip().upper()
+        if not trade_inst_id:
+            return {"ready": False}
+        try:
+            inst_type = infer_inst_type(trade_inst_id)
+            positions = self._load_recoverable_live_positions(credentials, session.config, inst_type=inst_type)
+            live_position = self._select_recoverable_live_position(session, positions)
+            trade = self._restore_session_trade_runtime_from_log(session) or session.active_trade
+            supports_position_recovery = UiStrategySessionsMixin._strategy_session_supports_position_recovery(session.config)
+            probe: dict[str, object] = {
+                "ready": True,
+                "credentials": credentials,
+                "trade_inst_id": trade_inst_id,
+                "inst_type": inst_type,
+                "positions": positions,
+                "live_position": live_position,
+                "trade": trade,
+                "supports_position_recovery": supports_position_recovery,
+            }
+            if live_position is None:
+                pending_signal = str(trade.pending_signal or "").strip().lower() if trade is not None else ""
+                pending_side = str(trade.pending_side or "").strip().lower() if trade is not None else ""
+                can_recover_pending_entry = (
+                    trade is not None
+                    and trade.opened_logged_at is None
+                    and bool((trade.entry_order_id or "").strip() or (trade.entry_client_order_id or "").strip())
+                    and trade.pending_entry_reference is not None
+                    and trade.pending_stop_price is not None
+                    and trade.size is not None
+                    and pending_signal in {"long", "short"}
+                    and pending_side in {"buy", "sell"}
+                )
+                if can_recover_pending_entry and supports_position_recovery:
+                    pending_status = session.engine._get_order_with_retry(
+                        credentials,
+                        session.config,
+                        inst_id=trade_inst_id,
+                        ord_id=(trade.entry_order_id or "").strip() or None,
+                        cl_ord_id=(trade.entry_client_order_id or "").strip() or None,
+                    )
+                    probe["pending_status_checked"] = True
+                    probe["pending_status"] = pending_status
+                    pending_state = str(pending_status.state or "").strip().lower()
+                    if pending_state == "filled":
+                        positions = self._load_recoverable_live_positions(
+                            credentials,
+                            session.config,
+                            inst_type=inst_type,
+                        )
+                        live_position = self._select_recoverable_live_position(session, positions)
+                        probe["positions"] = positions
+                        probe["live_position"] = live_position
+                    elif pending_state == "live":
+                        probe["trade_instrument_checked"] = True
+                        probe["trade_instrument"] = session.engine._get_instrument_with_retry(trade_inst_id)
+                return probe
+            if supports_position_recovery:
+                direction = self._recoverable_position_direction(live_position)
+                probe["direction"] = direction
+                probe["trade_instrument_checked"] = True
+                probe["trade_instrument"] = session.engine._get_instrument_with_retry(trade_inst_id)
+                if str(session.config.take_profit_mode or "").strip().lower() == "dynamic" and direction is not None:
+                    probe["protective_order_checked"] = True
+                    probe["protective_order"] = self._find_recoverable_protective_order(
+                        credentials,
+                        session,
+                        inst_type=inst_type,
+                        inst_id=trade_inst_id,
+                        direction=direction,
+                    )
+            return probe
+        except Exception:
+            return {"ready": False}
+
+    def _apply_auto_restore_probe_result(self, session_id: str, probe_result: dict[str, object]) -> None:
+        try:
+            if probe_result.get("ready"):
+                cache = getattr(self, "_auto_restore_probe_cache", None)
+                if not isinstance(cache, dict):
+                    cache = {}
+                    self._auto_restore_probe_cache = cache
+                cache[session_id] = probe_result
+                self._recover_session(session_id, auto=True)
+        finally:
+            pending = getattr(self, "_auto_restore_batch_pending", None)
+            if not isinstance(pending, set):
+                return
+            pending.discard(session_id)
+            if pending:
+                return
+            batch_session_ids = list(getattr(self, "_auto_restore_batch_session_ids", []))
+            self._auto_restore_batch_pending = set()
+            self._auto_restore_batch_session_ids = []
+            UiStrategySessionsMixin._log_auto_restore_summary(self, batch_session_ids)
+
+    def _log_auto_restore_summary(self, session_ids: list[str]) -> None:
         started_running: list[str] = []
         started_restoring: list[str] = []
         still_pending: list[str] = []
         stopped: list[str] = []
         for session_id in session_ids:
-            self._recover_session(session_id, auto=True)
             session = self.sessions.get(session_id)
             label = self._auto_restore_summary_label(session_id)
             if session is None:
@@ -6943,6 +7113,13 @@ class UiStrategySessionsMixin:
         if session is None:
             return False
         record = self._recoverable_strategy_sessions.get(session_id)
+        auto_restore_probe: dict[str, object] | None = None
+        if auto:
+            probe_cache = getattr(self, "_auto_restore_probe_cache", None)
+            if isinstance(probe_cache, dict):
+                cached_probe = probe_cache.pop(session_id, None)
+                if isinstance(cached_probe, dict):
+                    auto_restore_probe = cached_probe
         if record is None:
             record = self._build_recoverable_strategy_session_record(session)
             if record is not None:
@@ -6953,26 +7130,52 @@ class UiStrategySessionsMixin:
             return False
         if session.engine.is_running:
             return True
-        credentials = self._credentials_for_profile_or_none(session.api_name or (record.api_name if record is not None else ""))
+        credentials = (
+            auto_restore_probe.get("credentials")
+            if auto_restore_probe is not None and auto_restore_probe.get("credentials") is not None
+            else self._credentials_for_profile_or_none(session.api_name or (record.api_name if record is not None else ""))
+        )
         if credentials is None:
             if not auto:
                 self._enqueue_log(f"{session.log_prefix} 未找到该会话对应的 API 凭证，无法恢复接管。")
             return False
-        trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or session.symbol).strip().upper()
+        trade_inst_id = str(
+            (
+                auto_restore_probe.get("trade_inst_id")
+                if auto_restore_probe is not None and auto_restore_probe.get("trade_inst_id")
+                else (session.config.trade_inst_id or session.config.inst_id or session.symbol)
+            )
+            or ""
+        ).strip().upper()
         if not trade_inst_id:
             if not auto:
                 self._enqueue_log(f"{session.log_prefix} 缺少交易标的，无法恢复接管。")
             return False
-        try:
-            inst_type = infer_inst_type(trade_inst_id)
-            positions = self._load_recoverable_live_positions(credentials, session.config, inst_type=inst_type)
-            live_position = self._select_recoverable_live_position(session, positions)
-        except Exception as exc:
-            if not auto:
-                self._enqueue_log(f"{session.log_prefix} 读取当前持仓失败，暂时无法恢复接管：{exc}")
-            return False
-        trade = self._restore_session_trade_runtime_from_log(session) or session.active_trade
-        supports_position_recovery = self._strategy_session_supports_position_recovery(session.config)
+        inst_type = (
+            auto_restore_probe.get("inst_type")
+            if auto_restore_probe is not None and auto_restore_probe.get("inst_type") is not None
+            else infer_inst_type(trade_inst_id)
+        )
+        if auto_restore_probe is not None and "live_position" in auto_restore_probe:
+            live_position = auto_restore_probe.get("live_position")
+        else:
+            try:
+                positions = self._load_recoverable_live_positions(credentials, session.config, inst_type=inst_type)
+                live_position = self._select_recoverable_live_position(session, positions)
+            except Exception as exc:
+                if not auto:
+                    self._enqueue_log(f"{session.log_prefix} 读取当前持仓失败，暂时无法恢复接管：{exc}")
+                return False
+        trade = (
+            auto_restore_probe.get("trade")
+            if auto_restore_probe is not None and "trade" in auto_restore_probe
+            else self._restore_session_trade_runtime_from_log(session) or session.active_trade
+        )
+        supports_position_recovery = (
+            bool(auto_restore_probe.get("supports_position_recovery"))
+            if auto_restore_probe is not None and "supports_position_recovery" in auto_restore_probe
+            else UiStrategySessionsMixin._strategy_session_supports_position_recovery(session.config)
+        )
         conflicting_session = self._find_recovery_claim_conflict(session_id, trade)
         if conflicting_session is not None:
             conflict_reason = (
@@ -7003,32 +7206,43 @@ class UiStrategySessionsMixin:
                 and pending_side in {"buy", "sell"}
             )
             if can_recover_pending_entry and supports_position_recovery:
-                try:
-                    pending_status = session.engine._get_order_with_retry(
-                        credentials,
-                        session.config,
-                        inst_id=trade_inst_id,
-                        ord_id=(trade.entry_order_id or "").strip() or None,
-                        cl_ord_id=(trade.entry_client_order_id or "").strip() or None,
-                    )
-                except Exception as exc:
-                    if not auto:
-                        self._enqueue_log(f"{session.log_prefix} 回查未成交挂单失败，暂时无法恢复接管：{exc}")
+                if auto_restore_probe is not None and auto_restore_probe.get("pending_status_checked"):
+                    pending_status = auto_restore_probe.get("pending_status")
+                else:
+                    try:
+                        pending_status = session.engine._get_order_with_retry(
+                            credentials,
+                            session.config,
+                            inst_id=trade_inst_id,
+                            ord_id=(trade.entry_order_id or "").strip() or None,
+                            cl_ord_id=(trade.entry_client_order_id or "").strip() or None,
+                        )
+                    except Exception as exc:
+                        if not auto:
+                            self._enqueue_log(f"{session.log_prefix} 回查未成交挂单失败，暂时无法恢复接管：{exc}")
+                        return False
+                if pending_status is None:
                     return False
                 pending_state = str(pending_status.state or "").strip().lower()
-                if pending_state == "filled":
+                if pending_state == "filled" and live_position is None:
                     try:
                         positions = self._load_recoverable_live_positions(credentials, session.config, inst_type=inst_type)
                         live_position = self._select_recoverable_live_position(session, positions)
                     except Exception:
                         live_position = None
                 if pending_state == "live":
-                    try:
-                        trade_instrument = session.engine._get_instrument_with_retry(trade_inst_id)
-                    except Exception as exc:
-                        if not auto:
-                            self._enqueue_log(f"{session.log_prefix} 读取交易标的信息失败，无法恢复挂单接管：{exc}")
-                        return False
+                    trade_instrument = (
+                        auto_restore_probe.get("trade_instrument")
+                        if auto_restore_probe is not None and auto_restore_probe.get("trade_instrument_checked")
+                        else None
+                    )
+                    if trade_instrument is None:
+                        try:
+                            trade_instrument = session.engine._get_instrument_with_retry(trade_inst_id)
+                        except Exception as exc:
+                            if not auto:
+                                self._enqueue_log(f"{session.log_prefix} 读取交易标的信息失败，无法恢复挂单接管：{exc}")
+                            return False
 
                     def _monitor_pending() -> None:
                         session.engine._logger(
@@ -7150,13 +7364,23 @@ class UiStrategySessionsMixin:
             if not auto:
                 self._enqueue_log(f"{session.log_prefix} {reason}")
             return False
-        try:
-            trade_instrument = session.engine._get_instrument_with_retry(trade_inst_id)
-        except Exception as exc:
-            if not auto:
-                self._enqueue_log(f"{session.log_prefix} 读取交易标的信息失败，无法恢复接管：{exc}")
-            return False
-        direction = self._recoverable_position_direction(live_position)
+        trade_instrument = (
+            auto_restore_probe.get("trade_instrument")
+            if auto_restore_probe is not None and auto_restore_probe.get("trade_instrument_checked")
+            else None
+        )
+        if trade_instrument is None:
+            try:
+                trade_instrument = session.engine._get_instrument_with_retry(trade_inst_id)
+            except Exception as exc:
+                if not auto:
+                    self._enqueue_log(f"{session.log_prefix} 读取交易标的信息失败，无法恢复接管：{exc}")
+                return False
+        direction = (
+            auto_restore_probe.get("direction")
+            if auto_restore_probe is not None and auto_restore_probe.get("direction") is not None
+            else self._recoverable_position_direction(live_position)
+        )
         if direction is None:
             if not auto:
                 self._enqueue_log(f"{session.log_prefix} 无法判断当前持仓方向，恢复接管已跳过。")
@@ -7192,13 +7416,16 @@ class UiStrategySessionsMixin:
         take_profit_mode = str(session.config.take_profit_mode or "").strip().lower()
         fallback_to_managed_monitor = False
         if take_profit_mode == "dynamic":
-            protective_order = self._find_recoverable_protective_order(
-                credentials,
-                session,
-                inst_type=inst_type,
-                inst_id=trade_inst_id,
-                direction=direction,
-            )
+            if auto_restore_probe is not None and auto_restore_probe.get("protective_order_checked"):
+                protective_order = auto_restore_probe.get("protective_order")
+            else:
+                protective_order = self._find_recoverable_protective_order(
+                    credentials,
+                    session,
+                    inst_type=inst_type,
+                    inst_id=trade_inst_id,
+                    direction=direction,
+                )
             if protective_order is not None:
                 stop_price = protective_order.stop_loss_trigger_price or protective_order.trigger_price
                 if stop_price is not None:

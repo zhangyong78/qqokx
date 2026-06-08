@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_MTF_LONG_ID,
@@ -70,8 +71,9 @@ class StrategyParametersTest(TestCase):
         self.assertEqual(get_strategy_definition(STRATEGY_DYNAMIC_LONG_ID).default_signal_mode, "long_only")
         self.assertEqual(get_strategy_definition(STRATEGY_DYNAMIC_SHORT_ID).default_signal_mode, "short_only")
         self.assertEqual(get_strategy_definition(STRATEGY_EMA5_EMA8_ID).default_signal_mode, "both")
+        self.assertEqual(get_strategy_definition(STRATEGY_BODY_RETEST_SHORT_ID).default_signal_mode, "short_only")
 
-    def test_ema55_slope_short_strategy_fixes_signal_and_ema55_parameters(self) -> None:
+    def test_ema55_slope_short_strategy_keeps_signal_fixed_but_allows_coin_specific_ma_params(self) -> None:
         keys = set(iter_strategy_parameter_keys(STRATEGY_EMA55_SLOPE_SHORT_ID))
 
         self.assertIn("bar", keys)
@@ -85,6 +87,6 @@ class StrategyParametersTest(TestCase):
         self.assertIn("time_stop_break_even_enabled", keys)
         self.assertIn("time_stop_break_even_bars", keys)
         self.assertEqual(strategy_fixed_value(STRATEGY_EMA55_SLOPE_SHORT_ID, "signal_mode"), "short_only")
-        self.assertEqual(strategy_fixed_value(STRATEGY_EMA55_SLOPE_SHORT_ID, "ema_period"), 55)
-        self.assertEqual(strategy_fixed_value(STRATEGY_EMA55_SLOPE_SHORT_ID, "trend_ema_period"), 55)
-        self.assertFalse(strategy_is_parameter_editable(STRATEGY_EMA55_SLOPE_SHORT_ID, "ema_period", "backtest"))
+        self.assertIsNone(strategy_fixed_value(STRATEGY_EMA55_SLOPE_SHORT_ID, "ema_period"))
+        self.assertIsNone(strategy_fixed_value(STRATEGY_EMA55_SLOPE_SHORT_ID, "trend_ema_period"))
+        self.assertTrue(strategy_is_parameter_editable(STRATEGY_EMA55_SLOPE_SHORT_ID, "ema_period", "backtest"))

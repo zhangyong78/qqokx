@@ -5,6 +5,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from okx_quant.models import Candle, Instrument, StrategyConfig
+from okx_quant.protection_validation import InvalidProtectionPlanError
 from okx_quant.strategies.body_retest_short import (
     build_body_retest_short_protection_plan,
     evaluate_body_retest_short_signal,
@@ -112,3 +113,25 @@ class BodyRetestShortStrategyTest(TestCase):
         self.assertEqual(protection.take_profit, Decimal("96.8"))
         self.assertEqual(protection.atr_value, Decimal("2"))
         self.assertEqual(protection.candle_ts, 123456)
+
+    def test_build_body_retest_short_protection_plan_rejects_invalid_price_range(self) -> None:
+        instrument = Instrument(
+            inst_id="DOGE-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+
+        with self.assertRaises(InvalidProtectionPlanError):
+            build_body_retest_short_protection_plan(
+                instrument=instrument,
+                config=_body_retest_config(),
+                entry_reference=Decimal("0.2"),
+                signal_candle_high=Decimal("0.3"),
+                signal_candle_close=Decimal("0.2"),
+                atr_value=Decimal("0.2"),
+                candle_ts=123456,
+                trigger_inst_id="DOGE-USDT-SWAP",
+            )

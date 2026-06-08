@@ -83,6 +83,7 @@ from okx_quant.models import (
     ProtectionPlan,
     StrategyConfig,
 )
+from okx_quant.minimum_risk_recommendations import format_risk_recommendation, recommended_minimum_risk_amount_for_strategy
 from okx_quant.duration_input import (
     format_duration_cn_compact,
     parse_nonnegative_duration_seconds,
@@ -1717,6 +1718,12 @@ def _strategy_template_direction_label(strategy_id: str, config: StrategyConfig,
     return definition.default_signal_label
 
 
+def _normalize_strategy_direction_label(strategy_id: str, config: StrategyConfig | None, fallback: str = "") -> str:
+    if config is None:
+        return str(fallback or "").strip()
+    return _strategy_template_direction_label(strategy_id, config, fallback=fallback)
+
+
 def _launcher_symbol_from_strategy_config(strategy_id: str, config: StrategyConfig) -> str:
     del strategy_id
     return (config.trade_inst_id or config.inst_id or "").strip().upper()
@@ -2706,6 +2713,8 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
         return "启动中"
     if (
         "当前无信号" in text
+        or "当前无开多信号" in text
+        or "当前无开空信号" in text
         or
         "当前无法生成挂单" in text
         or "当前无法生成动态开仓价" in text
@@ -3301,7 +3310,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.fixed_order_size_hint_text = StringVar(
             value="固定数量=OKX下单数量(sz)，不是USDT；若填写风险金，则优先按风险金计算。"
         )
-        self.minimum_order_risk_hint_text = StringVar(value="下单门槛：请先选择下单标的。")
+        self.minimum_order_risk_hint_text = StringVar(value="回测参考：请先选择标的。")
         self.launch_parameter_hint_text = StringVar(value="")
         self.trend_parameter_hint_text = StringVar(value="")
         self.dynamic_protection_hint_text = StringVar(value="")
@@ -4238,7 +4247,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._slope_threshold_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
         self._slope_threshold_hint_label = ttk.Label(
             launch_form,
-            text="按单根 EMA55 斜率 / 当前 EMA55 计算；填负数，越小越严格，例如 -0.0005。",
+            text="按单根均线斜率 / 当前均线值计算；填负数，越小越严格，例如 -0.0005。",
         )
         self._slope_threshold_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=_lp)
 
@@ -8118,42 +8127,20 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._minimum_order_risk_hint_after_id = None
         signal_symbol = _normalize_symbol_input(self.symbol.get())
         trade_symbol = _normalize_symbol_input(self.trade_symbol.get()) or signal_symbol
-        instrument = self._find_instrument_for_fixed_order_size_hint(trade_symbol, fetch_if_missing=True)
+        definition = self._selected_strategy_definition()
+        signal_mode = SIGNAL_LABEL_TO_VALUE.get(self.signal_mode_label.get(), definition.default_signal_mode)
         if not trade_symbol:
-            self.minimum_order_risk_hint_text.set("下单门槛：请先选择下单标的。")
-            return
-        request = self._build_minimum_order_risk_hint_request(signal_symbol, trade_symbol, instrument)
-        if request is None:
-            return
-        if instrument is None:
-            self.minimum_order_risk_hint_text.set(
-                _build_minimum_order_risk_hint_text(
-                    inst_id=trade_symbol,
-                    instrument=None,
-                    risk_amount_raw=self.risk_amount.get(),
-                    note=request["note"],
-                )
-            )
+            self.minimum_order_risk_hint_text.set("回测参考：请先选择标的。")
             return
         self.minimum_order_risk_hint_text.set(
             _build_minimum_order_risk_hint_text(
                 inst_id=trade_symbol,
-                instrument=instrument,
+                instrument=None,
                 risk_amount_raw=self.risk_amount.get(),
-                note=request["note"],
-                pending=request["pending"],
+                strategy_id=definition.strategy_id,
+                signal_mode=signal_mode,
             )
         )
-        if not request["should_estimate"]:
-            return
-        self._minimum_order_risk_hint_request_serial += 1
-        request_serial = self._minimum_order_risk_hint_request_serial
-        self._minimum_order_risk_hint_active_request_serial = request_serial
-        threading.Thread(
-            target=self._estimate_minimum_order_risk_hint_worker,
-            args=(request_serial, request),
-            daemon=True,
-        ).start()
 
     def _build_minimum_order_risk_hint_request(
         self,
@@ -8246,6 +8233,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                     inst_id=trade_symbol,
                     instrument=instrument,
                     risk_amount_raw=self.risk_amount.get(),
+                    strategy_id=definition.strategy_id,
+                    signal_mode=SIGNAL_LABEL_TO_VALUE.get(self.signal_mode_label.get(), definition.default_signal_mode),
                     note=f"参数未填完整：{exc}",
                 )
             )
@@ -8311,6 +8300,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 inst_id=trade_symbol,
                 instrument=instrument,
                 risk_amount_raw=risk_amount_raw,
+                strategy_id=config.strategy_id,
+                signal_mode=config.signal_mode,
                 minimum_risk_amount=minimum_risk_amount,
                 note=note,
             )
@@ -8775,6 +8766,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             line = self.log_queue.get_nowait()
             self.log_text.insert(END, line + "\n")
             self.log_text.see(END)
+        self._drain_pending_runtime_session_updates()
         self.root.after(250, self._drain_log_queue)
 
     def _trader_desk_handle_stopped_session(self, session: StrategySession) -> None:
@@ -12461,35 +12453,19 @@ def _build_minimum_order_risk_hint_text(
     inst_id: str,
     instrument: Instrument | None,
     risk_amount_raw: str,
+    strategy_id: str = "",
+    signal_mode: str = "both",
     minimum_risk_amount: Decimal | None = None,
     note: str = "",
     pending: bool = False,
 ) -> str:
     normalized_inst_id = inst_id.strip().upper()
     if not normalized_inst_id:
-        return "下单门槛：请先选择下单标的。"
-    if instrument is None:
-        return f"下单门槛：正在读取 {normalized_inst_id} 的最小下单规格。"
-    min_order_text = _format_contract_size_with_equivalent(instrument, instrument.min_size)
-    parts = [f"下单门槛：最小下单量 {min_order_text}。"]
-    if minimum_risk_amount is not None and minimum_risk_amount > 0:
-        current_risk_amount = _parse_positive_decimal_hint(risk_amount_raw)
-        threshold_text = format_decimal(minimum_risk_amount)
-        if current_risk_amount is None:
-            parts.append(f"按当前止损估算，至少需要风险金 {threshold_text}。")
-        elif current_risk_amount >= minimum_risk_amount:
-            parts.append(
-                f"按当前止损估算，至少需要风险金 {threshold_text}；你当前填写 {format_decimal(current_risk_amount)}，可以下最小一笔。"
-            )
-        else:
-            parts.append(
-                f"按当前止损估算，至少需要风险金 {threshold_text}；你当前填写 {format_decimal(current_risk_amount)}，还不够下最小一笔。"
-            )
-    elif pending:
-        parts.append("正在结合当前止损估算最低风险金...")
-    if note:
-        parts.append(note)
-    return " ".join(parts)
+        return "回测参考：请先选择标的。"
+    recommendation = recommended_minimum_risk_amount_for_strategy(strategy_id, normalized_inst_id, signal_mode)
+    if recommendation is not None:
+        return f"回测参考：{normalized_inst_id} {format_risk_recommendation(recommendation)}。"
+    return f"回测参考：{normalized_inst_id} 暂无推荐值。"
 
 
 def _estimate_launcher_minimum_risk_amount(
@@ -12891,6 +12867,30 @@ def _build_strategy_start_confirmation_message(
             return f"{fixed_size}（OKX 下单数量 sz；当前按固定数量下单{_fixed_size_example_text()}）"
         return "-"
 
+    def _minimum_order_text() -> str:
+        recommendation = recommended_minimum_risk_amount_for_strategy(
+            config.strategy_id,
+            strategy_symbol or config.inst_id,
+            config.signal_mode,
+        )
+        if recommendation is not None:
+            return format_risk_recommendation(recommendation)
+        if instrument is None:
+            return "-（当前未读取到合约最小下单规格）"
+        min_order_text = _format_contract_size_with_equivalent(instrument, instrument.min_size)
+        if config.run_mode == "signal_only":
+            return f"{min_order_text}（当前仅发信号，不下单）"
+        current_risk_amount = _parse_positive_decimal_hint(risk_value)
+        current_fixed_size = _parse_positive_decimal_hint(fixed_size)
+        if current_risk_amount is not None:
+            return (
+                f"{min_order_text}（当前风险金 {format_decimal(current_risk_amount)}；"
+                "若止损过宽，仍可能被最小单量顶到最小仓位）"
+            )
+        if current_fixed_size is not None and current_fixed_size < instrument.min_size:
+            return f"{min_order_text}（当前固定数量 {format_decimal(current_fixed_size)} 低于最小下单量）"
+        return min_order_text
+
     def _custom_trigger_text() -> str:
         if config.tp_sl_mode != "local_custom":
             return "-（当前模式未使用）"
@@ -12997,15 +12997,16 @@ def _build_strategy_start_confirmation_message(
                 ]
             )
         """
+        line_label = config.ema_label()
         lines.extend(
             [
                 (
                     "开空斜率阈值："
                     f"{format_decimal_fixed(Decimal(str(config.trend_ema_slope_filter_min_ratio)), 6)}"
-                    "（EMA55 单根斜率 / 当前 EMA55，小于等于该负值才开空）"
+                    f"（{line_label} 单根斜率 / 当前 {line_label}，小于等于该负值才开空）"
                 ),
                 f"止盈方式：{take_profit_mode_text}",
-                "平仓信号：EMA55 斜率转正后，本地按收盘确认平仓",
+                f"平仓信号：{line_label} 斜率转正后，本地按收盘确认平仓",
             ]
         )
         if config.take_profit_mode == "dynamic":
@@ -13028,6 +13029,7 @@ def _build_strategy_start_confirmation_message(
             f"固定数量：{_fixed_size_text()}",
             "",
             "策略规则：",
+            f"回测参考：{_minimum_order_text()}",
             rule_description,
             "",
             "确认启动这个策略吗？",

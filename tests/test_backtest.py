@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 
 from okx_quant.backtest import (
     ATR_BATCH_MULTIPLIERS,
@@ -48,6 +49,8 @@ from okx_quant.backtest_ui import (
     _backtest_candle_color,
     _backtest_bar_value_from_label,
     _BacktestSnapshotStore,
+    _build_backtest_minimum_order_hint_text,
+    _build_backtest_minimum_order_sample_summary,
     _build_backtest_symbol_options,
     _build_backtest_compare_detail,
     _build_backtest_compare_row,
@@ -78,7 +81,7 @@ from okx_quant.backtest_ui import (
 )
 from okx_quant.indicators import atr, ema
 from okx_quant.backtest import BacktestManualPosition, BacktestOpenPosition, BacktestReport, BacktestResult, BacktestTrade
-from okx_quant.models import Candle, Instrument, OrderPlan, StrategyConfig
+from okx_quant.models import Candle, Instrument, OrderPlan, SignalDecision, StrategyConfig
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
     STRATEGY_CROSS_ID,
@@ -1743,6 +1746,55 @@ class BacktestTest(TestCase):
         self.assertEqual(results[-1][0].atr_take_multiplier, Decimal("6"))
         self.assertTrue(all(len(result.candles) == 500 for _, result in results))
 
+    def test_run_backtest_batch_skips_configs_with_only_invalid_protection_prices(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("0.02"),
+                Decimal("0.02"),
+                Decimal("0.02"),
+                Decimal("0.02"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(1, 221)
+        ]
+        instrument = Instrument(
+            inst_id="DOGE-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+        client = DummyBacktestClient(candles, instrument)
+        config = replace(
+            self._build_config(),
+            inst_id="DOGE-USDT-SWAP",
+            entry_reference_ema_period=2,
+            atr_take_multiplier=Decimal("1"),
+        )
+        decision = SignalDecision(
+            signal="long",
+            reason="mock_signal",
+            candle_ts=candles[-2].ts,
+            entry_reference=Decimal("0.02"),
+            atr_value=Decimal("0.01"),
+            ema_value=Decimal("0.02"),
+        )
+
+        with patch("okx_quant.backtest._evaluate_cross_signal_precomputed", return_value=decision):
+            results = run_backtest_batch(
+                client,
+                config,
+                candle_limit=220,
+                atr_multipliers=(Decimal("1"), Decimal("2")),
+                take_ratios=(Decimal("1"),),
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0].atr_stop_multiplier, Decimal("1"))
+
     def test_run_backtest_batch_for_dynamic_fixed_take_profit_returns_thirty_six_results(self) -> None:
         candles = [
             Candle(
@@ -2738,6 +2790,171 @@ class BacktestTest(TestCase):
         self.assertTrue(restored.trend_ema_slope_filter_enabled)
         self.assertEqual(restored.trend_ema_slope_filter_lookback_bars, 7)
         self.assertEqual(restored.trend_ema_slope_filter_min_ratio, Decimal("-0.0005"))
+
+    def test_build_backtest_minimum_order_hint_text_for_fixed_risk_mode(self) -> None:
+        instrument = Instrument(
+            inst_id="BNB-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BNB",
+        )
+
+        hint = _build_backtest_minimum_order_hint_text(
+            inst_id="BNB-USDT-SWAP",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            signal_mode="short_only",
+            instrument=instrument,
+            sizing_mode_label="固定风险金",
+            size_or_risk_raw="10",
+        )
+
+        self.assertEqual(hint, "回测参考：BNB-USDT-SWAP 建议 30U，最佳 90U。")
+
+    def test_build_backtest_minimum_order_hint_text_for_fixed_size_mode(self) -> None:
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+        )
+
+        hint = _build_backtest_minimum_order_hint_text(
+            inst_id="BTC-USDT-SWAP",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            signal_mode="short_only",
+            instrument=instrument,
+            sizing_mode_label="固定数量",
+            size_or_risk_raw="0.001",
+        )
+
+        self.assertEqual(hint, "回测参考：BTC-USDT-SWAP 建议 25U，最佳 50U。")
+
+    def test_build_backtest_minimum_order_sample_summary_reports_bind_ratio(self) -> None:
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            risk_amount=Decimal("10"),
+            backtest_sizing_mode="fixed_risk",
+        )
+        report = BacktestReport(
+            total_trades=2,
+            win_trades=1,
+            loss_trades=1,
+            breakeven_trades=0,
+            win_rate=Decimal("50"),
+            total_pnl=Decimal("0"),
+            average_pnl=Decimal("0"),
+            gross_profit=Decimal("0"),
+            gross_loss=Decimal("0"),
+            profit_factor=None,
+            average_win=Decimal("0"),
+            average_loss=Decimal("0"),
+            profit_loss_ratio=None,
+            average_r_multiple=Decimal("0"),
+            max_drawdown=Decimal("0"),
+        )
+        trades = [
+            BacktestTrade(
+                signal="long",
+                entry_index=0,
+                exit_index=1,
+                entry_ts=1,
+                exit_ts=2,
+                entry_price=Decimal("100"),
+                exit_price=Decimal("110"),
+                stop_loss=Decimal("90"),
+                take_profit=Decimal("120"),
+                size=Decimal("0.02"),
+                gross_pnl=Decimal("0"),
+                pnl=Decimal("0"),
+                risk_value=Decimal("0.8"),
+                r_multiple=Decimal("0"),
+                exit_reason="take_profit",
+            ),
+            BacktestTrade(
+                signal="long",
+                entry_index=2,
+                exit_index=3,
+                entry_ts=3,
+                exit_ts=4,
+                entry_price=Decimal("200"),
+                exit_price=Decimal("180"),
+                stop_loss=Decimal("150"),
+                take_profit=Decimal("260"),
+                size=Decimal("0.01"),
+                gross_pnl=Decimal("0"),
+                pnl=Decimal("0"),
+                risk_value=Decimal("12"),
+                r_multiple=Decimal("0"),
+                exit_reason="stop_loss",
+            ),
+        ]
+        result = BacktestResult(
+            candles=[],
+            trades=trades,
+            report=report,
+            instrument=instrument,
+        )
+
+        summary = _build_backtest_minimum_order_sample_summary(result, config)
+
+        self.assertEqual(summary, "历史推荐：BTC-USDT-SWAP 建议 25U，最佳 50U。")
+
+    def test_build_backtest_minimum_order_hint_text_uses_backtest_value_for_sol(self) -> None:
+        instrument = Instrument(
+            inst_id="SOL-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+            ct_val=Decimal("1"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="SOL",
+        )
+
+        hint = _build_backtest_minimum_order_hint_text(
+            inst_id="SOL-USDT-SWAP",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            signal_mode="short_only",
+            instrument=instrument,
+            sizing_mode_label="固定风险金",
+            size_or_risk_raw="10",
+        )
+
+        self.assertEqual(hint, "回测参考：SOL-USDT-SWAP 建议 0.1U，最佳 0.3U。")
 
     def test_backtest_ui_serializes_adaptive_rail_defaults(self) -> None:
         config = StrategyConfig(

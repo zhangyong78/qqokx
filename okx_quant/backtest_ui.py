@@ -31,7 +31,12 @@ from okx_quant.backtest_audit import describe_backtest_export_artifacts
 from okx_quant.backtest_export import export_batch_backtest_report, export_single_backtest_report
 from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_pool_profile_name
 from okx_quant.candle_cache_verify import CacheVerifyOutcome, verify_and_repair_cached_candles
-from okx_quant.models import StrategyConfig, moving_average_display_label
+from okx_quant.models import Instrument, StrategyConfig, moving_average_display_label
+from okx_quant.minimum_risk_recommendations import (
+    format_risk_recommendation,
+    recommended_minimum_risk_amount_for_config,
+    recommended_minimum_risk_amount_for_strategy,
+)
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import backtest_history_file_path, load_strategy_parameter_drafts, save_strategy_parameter_drafts
 from okx_quant.pricing import format_decimal, format_decimal_fixed
@@ -413,6 +418,87 @@ def _normalize_backtest_bar_label(value: str) -> str:
 
 def _backtest_bar_value_from_label(label: str) -> str:
     return BACKTEST_BAR_LABEL_TO_VALUE[_normalize_backtest_bar_label(label)]
+
+
+def _parse_positive_decimal_hint(raw: str) -> Decimal | None:
+    cleaned = str(raw or "").strip()
+    if not cleaned:
+        return None
+    try:
+        value = Decimal(cleaned)
+    except InvalidOperation:
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def _backtest_instrument_contract_value_snapshot(instrument: Instrument) -> tuple[Decimal | None, str | None]:
+    ct_val = instrument.ct_val if instrument.ct_val is not None and instrument.ct_val > 0 else None
+    if ct_val is None:
+        return None, None
+    ct_mult = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
+    contract_ccy = (instrument.ct_val_ccy or "").strip().upper()
+    if not contract_ccy and "-" in instrument.inst_id:
+        contract_ccy = instrument.inst_id.split("-", 1)[0]
+    return ct_val * ct_mult, contract_ccy or None
+
+
+def _format_backtest_contract_size_with_equivalent(instrument: Instrument, size: Decimal) -> str:
+    contract_value, contract_ccy = _backtest_instrument_contract_value_snapshot(instrument)
+    if contract_value is not None and contract_value > 0 and contract_ccy:
+        amount = size * contract_value
+        return f"{format_decimal(size)}张（折合{format_decimal(amount)} {contract_ccy}）"
+    return format_decimal(size)
+
+
+def _build_backtest_minimum_order_hint_text(
+    *,
+    inst_id: str,
+    strategy_id: str,
+    signal_mode: str,
+    instrument: Instrument | None,
+    sizing_mode_label: str,
+    size_or_risk_raw: str,
+) -> str:
+    normalized_inst_id = inst_id.strip().upper()
+    if not normalized_inst_id:
+        return "回测参考：请先选择标的。"
+    recommendation = recommended_minimum_risk_amount_for_strategy(strategy_id, normalized_inst_id, signal_mode)
+    if recommendation is None:
+        return f"回测参考：{normalized_inst_id} 暂无推荐值。"
+    return f"回测参考：{normalized_inst_id} {format_risk_recommendation(recommendation)}。"
+
+
+def _required_minimum_risk_amount_for_trade(trade: BacktestTrade, min_size: Decimal) -> Decimal | None:
+    trade_size = abs(trade.size)
+    if trade_size <= 0 or min_size <= 0:
+        return None
+    return (trade.risk_value / trade_size) * min_size
+
+
+def _percentile_decimal(values: list[Decimal], percentile: float) -> Decimal:
+    if not values:
+        return Decimal("0")
+    ordered = sorted(values)
+    index = max(0, min(int(len(ordered) * percentile) - 1, len(ordered) - 1))
+    return ordered[index]
+
+
+def _build_backtest_minimum_order_sample_summary(result: BacktestResult, config: StrategyConfig) -> str:
+    recommendation = recommended_minimum_risk_amount_for_config(config)
+    if recommendation is not None:
+        return f"历史推荐：{config.inst_id} {format_risk_recommendation(recommendation)}。"
+    if not result.trades or result.instrument.min_size <= 0:
+        return ""
+    required_risk_amounts = [
+        amount
+        for amount in (_required_minimum_risk_amount_for_trade(trade, result.instrument.min_size) for trade in result.trades)
+        if amount is not None and amount > 0
+    ]
+    if not required_risk_amounts:
+        return ""
+    return f"历史推荐：{config.inst_id} 样本内最低风险金 P95={format_decimal(_percentile_decimal(required_risk_amounts, 0.95))}U。"
 
 
 def _reverse_lookup_label(mapping: dict[str, str], value: str, default: str) -> str:
@@ -1391,8 +1477,13 @@ class BacktestCompareOverviewWindow:
         ttk.Button(header, text="刷新", command=self._refresh).grid(row=0, column=1, sticky="e", padx=(8, 8))
         ttk.Button(header, text="清空全部历史", command=self._clear_all).grid(row=0, column=2, sticky="e")
 
+        tree_frame = ttk.Frame(self.window)
+        tree_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
         self.tree = ttk.Treeview(
-            self.window,
+            tree_frame,
             columns=("id", "time", "start", "end", "strategy", "symbol", "bar", "params", "trades", "win_rate", "pnl", "drawdown"),
             show="headings",
             selectmode="browse",
@@ -1421,7 +1512,15 @@ class BacktestCompareOverviewWindow:
         self.tree.column("win_rate", width=80, anchor="e")
         self.tree.column("pnl", width=110, anchor="e")
         self.tree.column("drawdown", width=110, anchor="e")
-        self.tree.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        tree_scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        tree_scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(
+            yscrollcommand=tree_scroll_y.set,
+            xscrollcommand=tree_scroll_x.set,
+        )
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll_y.grid(row=0, column=1, sticky="ns")
+        tree_scroll_x.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_selected)
 
         detail_frame = ttk.LabelFrame(self.window, text="记录详情", padding=12)
@@ -1555,6 +1654,7 @@ class BacktestWindow:
         self.backtest_profile_name = StringVar(value=initial_state.backtest_profile_name)
         self.backtest_profile_summary = StringVar(value=initial_state.backtest_profile_summary)
         self.profile_summary_text = StringVar(value=self._build_profile_summary_text())
+        self.minimum_order_hint_text = StringVar(value="回测参考：请先选择标的。")
         self._strategy_parameter_drafts = load_strategy_parameter_drafts()
         self._strategy_parameter_scope = "backtest"
         self._last_strategy_parameter_strategy_id: str | None = None
@@ -1599,11 +1699,22 @@ class BacktestWindow:
         self._batch_snapshot_groups: dict[str, list[str]] = {}
         self._snapshot_batch_labels: dict[str, str] = {}
         self._current_matrix_batch_label: str | None = None
+        self._content_pane_initialized = False
+        self._backtest_hint_instrument_cache: dict[str, Instrument] = {}
+        self._backtest_hint_fetching_symbols: set[str] = set()
+        self._backtest_hint_after_id: str | None = None
+
+        self.strategy_name.trace_add("write", self._schedule_backtest_minimum_order_hint_update)
+        self.symbol.trace_add("write", self._schedule_backtest_minimum_order_hint_update)
+        self.signal_mode_label.trace_add("write", self._schedule_backtest_minimum_order_hint_update)
+        self.risk_amount.trace_add("write", self._schedule_backtest_minimum_order_hint_update)
+        self.sizing_mode_label.trace_add("write", self._schedule_backtest_minimum_order_hint_update)
 
         self._build_layout()
         self._update_batch_layer_controls("none", [])
         self._apply_selected_strategy_definition()
         self._update_sizing_mode_widgets()
+        self._update_backtest_minimum_order_hint()
 
     @staticmethod
     def _widget_exists(widget: object) -> bool:
@@ -1867,7 +1978,7 @@ class BacktestWindow:
             screen_h = max(int(self.window.winfo_screenheight()), 600)
         except Exception:
             screen_h = 800
-        cap = max(320, min(int(screen_h * 0.46), 920))
+        cap = max(280, min(int(screen_h * 0.36), 520))
         view_h = max(1, min(inner_h + 10, cap))
         try:
             canvas.configure(height=view_h)
@@ -1892,6 +2003,26 @@ class BacktestWindow:
                 canvas.yview_moveto(0.0)
         except Exception:
             pass
+
+    def _initialize_backtest_content_pane(self) -> None:
+        if self._content_pane_initialized:
+            return
+        content_pane = getattr(self, "_content_pane", None)
+        if content_pane is None or not self._widget_exists(content_pane):
+            return
+        try:
+            self.window.update_idletasks()
+            total_h = max(int(content_pane.winfo_height()), int(content_pane.winfo_reqheight()))
+        except Exception:
+            return
+        if total_h <= 1:
+            return
+        upper_height = max(240, min(int(total_h * 0.42), total_h - 220))
+        try:
+            content_pane.sashpos(0, upper_height)
+        except Exception:
+            return
+        self._content_pane_initialized = True
 
     def _params_canvas_mousewheel(self, event: object) -> None:
         canvas = getattr(self, "_params_canvas", None)
@@ -1931,10 +2062,9 @@ class BacktestWindow:
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
         self.window.rowconfigure(1, weight=1)
-        self.window.rowconfigure(2, weight=3)
 
         params_viewport = ttk.Frame(self.window)
-        params_viewport.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        params_viewport.grid(row=0, column=0, sticky="nsew", padx=16, pady=(16, 8))
         params_viewport.columnconfigure(0, weight=1)
         params_viewport.rowconfigure(0, weight=1)
         params_viewport.bind("<Configure>", lambda _e: self._sync_backtest_params_viewport())
@@ -2104,7 +2234,7 @@ class BacktestWindow:
         self.slope_threshold_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
         self.slope_threshold_hint = ttk.Label(
             controls,
-            text="填 0 表示只要 EMA55 斜率转负就开空；例如填 -0.0005 表示需要更陡的负斜率才开空。",
+            text="填 0 表示只要均线斜率转负就开空；例如填 -0.0005 表示需要更陡的负斜率才开空。",
             foreground="#57606a",
         )
         self.slope_threshold_hint.grid(row=row, column=2, columnspan=4, sticky="w", pady=(12, 0))
@@ -2326,6 +2456,16 @@ class BacktestWindow:
         self.risk_percent_entry.grid(row=row, column=5, sticky="ew", pady=(12, 0))
 
         row += 1
+        self._minimum_order_hint_label = ttk.Label(
+            controls,
+            textvariable=self.minimum_order_hint_text,
+            justify="left",
+            foreground="#57606a",
+        )
+        self._minimum_order_hint_label.grid(row=row, column=0, columnspan=6, sticky="w", pady=(2, 0))
+        self._bind_responsive_wrap(self._minimum_order_hint_label, controls, padding=48, min_wrap=280)
+
+        row += 1
         ttk.Label(controls, text="开仓滑点(%)").grid(row=row, column=0, sticky="w", pady=(12, 0))
         ttk.Entry(controls, textvariable=self.entry_slippage_percent).grid(
             row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0)
@@ -2416,13 +2556,17 @@ class BacktestWindow:
         self._history_sync_status_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
         self._bind_responsive_wrap(self._history_sync_status_label, batch_note, padding=36, min_wrap=360)
 
-        report_frame = ttk.Panedwindow(self.window, orient="horizontal")
-        report_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        content_pane = ttk.Panedwindow(self.window, orient="vertical")
+        content_pane.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        self._content_pane = content_pane
+
+        report_frame = ttk.Panedwindow(content_pane, orient="horizontal")
 
         summary_frame = ttk.LabelFrame(report_frame, text="回测报告", padding=12)
         trades_frame = ttk.LabelFrame(report_frame, text="交易明细", padding=12)
         report_frame.add(summary_frame, weight=1)
         report_frame.add(trades_frame, weight=1)
+        content_pane.add(report_frame, weight=2)
 
         summary_frame.columnconfigure(0, weight=1)
         summary_frame.rowconfigure(0, weight=1)
@@ -2438,7 +2582,7 @@ class BacktestWindow:
         self._report_summary_label = ttk.Label(report_tab, textvariable=self.report_summary, justify="left")
         self._report_summary_label.grid(row=0, column=0, sticky="w", pady=(0, 10))
         self._bind_responsive_wrap(self._report_summary_label, report_tab, padding=28, min_wrap=280)
-        self.report_text = Text(report_tab, height=16, wrap="word", font=("Consolas", 10))
+        self.report_text = Text(report_tab, height=11, wrap="word", font=("Consolas", 10))
         self.report_text.grid(row=1, column=0, sticky="nsew")
         report_notebook.add(report_tab, text="当前报告")
 
@@ -2496,7 +2640,7 @@ class BacktestWindow:
         self.compare_tree.bind("<<TreeviewSelect>>", self._on_compare_tree_selected)
         self.compare_tree.bind("<Double-Button-1>", lambda *_: self.load_selected_snapshot())
 
-        self.compare_detail_text = Text(compare_tab, height=8, wrap="word", font=("Consolas", 10))
+        self.compare_detail_text = Text(compare_tab, height=6, wrap="word", font=("Consolas", 10))
         self.compare_detail_text.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
         report_notebook.add(compare_tab, text="回测对比")
 
@@ -2805,10 +2949,10 @@ class BacktestWindow:
 
         trades_notebook.add(trade_tab, text="交易流水")
 
-        self.chart_frame = ttk.LabelFrame(self.window, text="K线图、资金曲线与止盈止损触发位置 | 暂无选中回测", padding=12)
-        self.chart_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        self.chart_frame = ttk.LabelFrame(content_pane, text="K线图、资金曲线与止盈止损触发位置 | 暂无选中回测", padding=12)
         self.chart_frame.columnconfigure(0, weight=1)
         self.chart_frame.rowconfigure(1, weight=1)
+        content_pane.add(self.chart_frame, weight=3)
 
         chart_toolbar = ttk.Frame(self.chart_frame)
         chart_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -2830,6 +2974,7 @@ class BacktestWindow:
         self.chart_canvas.bind("<Double-Button-1>", lambda *_: self.open_chart_zoom_window())
         self.chart_canvas.bind("<Configure>", self._schedule_chart_redraw)
         self._bind_chart_interactions(self.chart_canvas)
+        self.window.after_idle(self._initialize_backtest_content_pane)
 
     def _update_sizing_mode_widgets(self) -> None:
         self.sizing_mode_combo.configure(state="readonly")
@@ -2846,6 +2991,73 @@ class BacktestWindow:
             self.size_or_risk_label.configure(text="固定风险金")
             self.size_or_risk_entry.configure(state="normal")
             self.risk_percent_entry.configure(state="disabled")
+        self._schedule_backtest_minimum_order_hint_update()
+
+    def _schedule_backtest_minimum_order_hint_update(self, *_: str) -> None:
+        if not self._ui_alive():
+            return
+        if self._backtest_hint_after_id is not None:
+            try:
+                self.window.after_cancel(self._backtest_hint_after_id)
+            except Exception:
+                pass
+        self._backtest_hint_after_id = self.window.after(120, self._update_backtest_minimum_order_hint)
+
+    def _find_instrument_for_backtest_hint(
+        self,
+        inst_id: str,
+        *,
+        fetch_if_missing: bool = False,
+    ) -> Instrument | None:
+        normalized_inst_id = inst_id.strip().upper()
+        if not normalized_inst_id:
+            return None
+        cached = self._backtest_hint_instrument_cache.get(normalized_inst_id)
+        if cached is not None:
+            return cached
+        if fetch_if_missing:
+            self._ensure_backtest_hint_instrument_async(normalized_inst_id)
+        return None
+
+    def _ensure_backtest_hint_instrument_async(self, inst_id: str) -> None:
+        normalized_inst_id = inst_id.strip().upper()
+        if not normalized_inst_id or normalized_inst_id in self._backtest_hint_fetching_symbols:
+            return
+        self._backtest_hint_fetching_symbols.add(normalized_inst_id)
+
+        def worker() -> None:
+            instrument: Instrument | None = None
+            try:
+                instrument = self.client.get_instrument(normalized_inst_id)
+            except Exception:
+                instrument = None
+
+            def apply() -> None:
+                self._backtest_hint_fetching_symbols.discard(normalized_inst_id)
+                if instrument is not None:
+                    self._backtest_hint_instrument_cache[normalized_inst_id] = instrument
+                self._update_backtest_minimum_order_hint()
+
+            if self._ui_alive():
+                self.window.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_backtest_minimum_order_hint(self) -> None:
+        self._backtest_hint_after_id = None
+        inst_id = self.symbol.get().strip().upper()
+        definition = self._selected_strategy_definition()
+        signal_mode = SIGNAL_LABEL_TO_VALUE.get(self.signal_mode_label.get(), definition.default_signal_mode)
+        self.minimum_order_hint_text.set(
+            _build_backtest_minimum_order_hint_text(
+                inst_id=inst_id,
+                strategy_id=definition.strategy_id,
+                signal_mode=signal_mode,
+                instrument=None,
+                sizing_mode_label=self.sizing_mode_label.get(),
+                size_or_risk_raw=self.risk_amount.get(),
+            )
+        )
 
     def start_backtest(self) -> None:
         try:
@@ -2943,11 +3155,11 @@ class BacktestWindow:
             return
         try:
             config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts = self._build_backtest_request()
-            batch_count = len(build_parameter_batch_configs(config))
+            raw_batch_count = len(build_parameter_batch_configs(config))
         except Exception as exc:
             messagebox.showerror("回测参数错误", str(exc), parent=self.window)
             return
-        if batch_count <= 1:
+        if raw_batch_count <= 1:
             self._prepare_backtest_output("正在单组回测，请稍候...")
             self._set_backtest_running(True)
             threading.Thread(
@@ -2957,13 +3169,13 @@ class BacktestWindow:
             ).start()
             return
 
-        summary_text = f"正在批量回测 {batch_count} 组参数组合，请稍候..."
+        summary_text = f"正在准备批量回测：原始矩阵 {raw_batch_count} 组，正在排除无效组合，请稍候..."
         self._prepare_backtest_output(summary_text)
         self._set_backtest_running(True)
         batch_label = self._next_batch_label()
         threading.Thread(
             target=self._run_batch_backtest_worker,
-            args=(config, candle_limit, batch_label, maker_fee_rate, taker_fee_rate, start_ts, end_ts),
+            args=(config, candle_limit, batch_label, raw_batch_count, maker_fee_rate, taker_fee_rate, start_ts, end_ts),
             daemon=True,
         ).start()
 
@@ -3398,6 +3610,7 @@ class BacktestWindow:
         config: StrategyConfig,
         candle_limit: int,
         batch_label: str,
+        raw_batch_count: int,
         maker_fee_rate: Decimal,
         taker_fee_rate: Decimal,
         start_ts: int | None,
@@ -3414,7 +3627,15 @@ class BacktestWindow:
                 taker_fee_rate=taker_fee_rate,
             )
             if self._ui_alive():
-                self.window.after(0, lambda: self._apply_batch_backtest_results(results, candle_limit, batch_label))
+                self.window.after(
+                    0,
+                    lambda: self._apply_batch_backtest_results(
+                        results,
+                        candle_limit,
+                        batch_label,
+                        raw_batch_count=raw_batch_count,
+                    ),
+                )
         except Exception as exc:
             if self._ui_alive():
                 self.window.after(0, lambda error=exc: self._show_backtest_error(error))
@@ -3461,9 +3682,13 @@ class BacktestWindow:
         results: list[tuple[StrategyConfig, BacktestResult]],
         candle_limit: int,
         batch_label: str,
+        *,
+        raw_batch_count: int,
     ) -> None:
         if not self._ui_alive():
             return
+        valid_batch_count = len(results)
+        skipped_batch_count = max(raw_batch_count - valid_batch_count, 0)
         export_path = None
         try:
             export_path = str(
@@ -3484,8 +3709,27 @@ class BacktestWindow:
                 batch_label=batch_label,
                 export_path=export_path,
             )
+        batch_summary_line = (
+            f"批量回测完成：原始矩阵 {raw_batch_count} 组 | "
+            f"有效组合 {valid_batch_count} 组 | 已排除 {skipped_batch_count} 组无效组合"
+        )
+        if last_snapshot is None:
+            self.report_summary.set(f"{batch_summary_line}\n当前样本内没有可执行的有效组合。")
+            self.report_text.delete("1.0", END)
+            self._clear_detail_tables()
+            self._populate_period_stats(self.monthly_stats_tree, [])
+            self._populate_period_stats(self.yearly_stats_tree, [])
+            self._show_batch_matrix(None)
+            self._set_chart_title("K线图、资金曲线与止盈止损触发位置 | 当前没有可执行的有效组合")
+            self._clear_chart_canvas(self.chart_canvas)
+            if self._chart_zoom_canvas is not None and self._chart_zoom_canvas.winfo_exists():
+                self._clear_chart_canvas(self._chart_zoom_canvas)
+            self._refresh_zoom_chart_header()
+            self._set_backtest_running(False)
+            return
         if last_snapshot is not None:
             self._load_snapshot(last_snapshot.snapshot_id)
+            self.report_summary.set(f"{batch_summary_line}\n{self.report_summary.get()}")
             self._show_batch_matrix(batch_label)
         self._set_backtest_running(False)
 
@@ -5108,6 +5352,9 @@ class BacktestWindow:
         open_position_summary = _build_open_position_summary(result)
         if open_position_summary:
             summary_text = f"{summary_text}\n{open_position_summary}"
+        minimum_order_summary = _build_backtest_minimum_order_sample_summary(result, snapshot.config)
+        if minimum_order_summary:
+            summary_text = f"{summary_text}\n{minimum_order_summary}"
         if result.data_source_note:
             summary_text = f"{summary_text}\n{result.data_source_note}"
         export_lines = _backtest_export_detail_lines(snapshot.export_path)

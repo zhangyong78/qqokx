@@ -6,6 +6,7 @@ from decimal import Decimal
 from okx_quant.indicators import atr, moving_average
 from okx_quant.models import Candle, Instrument, ProtectionPlan, SignalDecision, StrategyConfig
 from okx_quant.pricing import format_strategy_reason_price, snap_to_increment
+from okx_quant.protection_validation import validate_protection_prices
 
 
 BODY_RETEST_ATR_PERCENTILE_LOOKBACK = 100
@@ -215,6 +216,12 @@ def build_body_retest_short_protection_plan(
         else Decimal("2")
     )
     take_profit = snap_to_increment(reference_price - (risk_distance * reward_multiple), instrument.tick_size, "up")
+    validate_protection_prices(
+        direction="short",
+        entry_reference=reference_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
     return ProtectionPlan(
         trigger_inst_id=trigger_inst_id,
         trigger_price_type=config.tp_sl_trigger_type,

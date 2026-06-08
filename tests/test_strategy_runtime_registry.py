@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_MTF_LONG_ID,
@@ -55,6 +56,10 @@ class StrategyRuntimeRegistryTest(TestCase):
         self.assertEqual(ema5_8_profile.family, "ema5_ema8")
         self.assertFalse(ema5_8_profile.supports_exchange_trade)
 
+        adaptive_rail_profile = get_strategy_runtime_profile(STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID)
+        self.assertEqual(adaptive_rail_profile.family, "adaptive_ema_rail")
+        self.assertFalse(adaptive_rail_profile.supports_exchange_trade)
+
     def test_entry_reference_captions_follow_runtime_family(self) -> None:
         self.assertEqual(strategy_entry_reference_caption(STRATEGY_DYNAMIC_LONG_ID), "挂单参考线")
         self.assertEqual(strategy_entry_reference_caption(STRATEGY_EMA_BREAKOUT_LONG_ID), "突破参考线")
@@ -67,6 +72,12 @@ class StrategyRuntimeRegistryTest(TestCase):
         self.assertEqual(strategy_entry_reference_period_caption(STRATEGY_CROSS_ID), "参考线周期")
         self.assertEqual(strategy_entry_reference_period_caption(STRATEGY_EMA5_EMA8_ID), "参考线周期")
 
+    def test_adaptive_rail_runtime_profile_uses_generic_reference_caption(self) -> None:
+        self.assertEqual(
+            strategy_entry_reference_period_caption(STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID),
+            "参考线周期",
+        )
+
     def test_preferred_direction_follows_runtime_family_and_signal_mode(self) -> None:
         self.assertEqual(strategy_preferred_direction(STRATEGY_CROSS_ID, "long_only"), "long")
         self.assertEqual(strategy_preferred_direction(STRATEGY_CROSS_ID, "short_only"), "short")
@@ -78,6 +89,7 @@ class StrategyRuntimeRegistryTest(TestCase):
         self.assertEqual(strategy_preferred_direction(STRATEGY_DYNAMIC_SHORT_ID, "both"), "short")
         self.assertEqual(strategy_preferred_direction(STRATEGY_DYNAMIC_MTF_LONG_ID, "both"), "long")
         self.assertEqual(strategy_preferred_direction(STRATEGY_DYNAMIC_MTF_SHORT_ID, "both"), "short")
+        self.assertEqual(strategy_preferred_direction(STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID, "both"), "long")
         self.assertIsNone(strategy_preferred_direction(STRATEGY_EMA5_EMA8_ID, "both"))
 
     def test_cross_helpers_and_signal_extrema_flags_follow_runtime_profile(self) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 STRATEGY_DYNAMIC_ID = "ema_dynamic_order"
 STRATEGY_DYNAMIC_LONG_ID = "ema_dynamic_order_long"
@@ -234,14 +234,14 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     ),
     StrategyDefinition(
         strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
-        name="EMA55 斜率做空",
-        summary="EMA55 斜率达到负阈值时做空，搭配 2ATR 止损、2R 保本后逐级锁盈与 ATR 分位过滤。",
+        name="均线斜率做空",
+        summary="均线斜率达到负阈值时做空，搭配 2ATR 止损、2R 保本后逐级锁盈与 ATR 分位过滤。",
         rule_description=(
-            "流程：固定使用 EMA55；当最新一根已收盘 K 线的 EMA55 斜率比例小于等于开空阈值时，"
+            "流程：按策略参数指定的 EMA 或 MA 周期计算斜率；当最新一根已收盘 K 线的均线斜率比例小于等于开空阈值时，"
             "若当前空仓则按该根 K 线收盘价开空。默认使用 2ATR 初始止损、动态逐级锁盈、2R 保本，"
             "并通过 ATR 分位过滤较高波动环境。斜率转正平仓作为可选防守条件，默认关闭。"
         ),
-        parameter_hint="实盘默认：1H、EMA55、斜率阈值 -0.0005、2ATR 止损、动态止盈、2R 保本、ATR 分位≤50%、每笔风险10U。",
+        parameter_hint="实盘默认：1H、均线斜率阈值 -0.0005、2ATR 止损、动态止盈、2R 保本、ATR 分位≤50%、每笔风险10U；不同币种可使用不同 EMA/MA 周期。",
         default_signal_label="只做空",
         allowed_signal_labels=("只做空",),
         supports_trade=True,
@@ -287,6 +287,20 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
         supports_backtest=False,
     ),
 )
+
+
+def _normalize_strategy_definition(item: StrategyDefinition) -> StrategyDefinition:
+    if item.strategy_id == STRATEGY_BODY_RETEST_SHORT_ID:
+        if item.default_signal_label != "只做空" or item.allowed_signal_labels != ("只做空",):
+            return replace(
+                item,
+                default_signal_label="只做空",
+                allowed_signal_labels=("只做空",),
+            )
+    return item
+
+
+ALL_STRATEGY_DEFINITIONS = tuple(_normalize_strategy_definition(item) for item in ALL_STRATEGY_DEFINITIONS)
 
 _STRATEGY_IDS_HIDDEN_FROM_LAUNCHER: frozenset[str] = frozenset(
     {

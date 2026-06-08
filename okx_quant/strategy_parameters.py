@@ -387,10 +387,6 @@ STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
         ),
         fixed_values={
             "signal_mode": "short_only",
-            "ema_type": "ema",
-            "ema_period": 55,
-            "trend_ema_type": "ema",
-            "trend_ema_period": 55,
         },
     ),
     STRATEGY_BODY_RETEST_SHORT_ID: StrategyParameterProfile(

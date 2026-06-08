@@ -46,7 +46,7 @@ class UiBacktestEntryMixin:
                 atr_period=self.atr_period.get(),
                 stop_atr=self.stop_atr.get(),
                 take_atr=self.take_atr.get(),
-                risk_amount=self.risk_amount.get(),
+                risk_amount="100",
                 take_profit_mode_label=self.take_profit_mode_label.get(),
                 max_entries_per_trend=self.max_entries_per_trend.get(),
                 dynamic_two_r_break_even=self.dynamic_two_r_break_even.get(),

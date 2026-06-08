@@ -157,6 +157,7 @@ function Get-ReleaseTopics([string[]]$Files) {
             'scripts/run_*.py' { Push-Topic (U '\u65b0\u589e\u5206\u6790\u6216\u62a5\u8868\u811a\u672c'); continue }
             'scripts/build_server_package.py' { Push-Topic (U '\u8c03\u6574\u6253\u5305\u811a\u672c'); continue }
             'btc_analysis_alignment_checklist_v1.md' { Push-Topic (U '\u65b0\u589e BTC \u5206\u6790\u5bf9\u9f50\u6e05\u5355'); continue }
+            'docs/archive/btc_analysis_alignment_checklist_v1.md' { Push-Topic (U '\u65b0\u589e BTC \u5206\u6790\u5bf9\u9f50\u6e05\u5355'); continue }
         }
     }
     if ($topics.Count -eq 0) { Push-Topic (U '\u6536\u53e3\u5f53\u524d\u5de5\u4f5c\u533a\u6539\u52a8') }

@@ -55,6 +55,10 @@ _CANDLE_PENDING = "#b08800"
 _MARKER_LABEL_HALF_HEIGHT = 10.0
 _MARKER_LABEL_MIN_GAP = 24.0
 _MARKER_LABEL_CANVAS_MARGIN = 6.0
+_TIME_MARKER_LABEL_MIN_GAP = 8.0
+_TIME_MARKER_LABEL_ROW_HEIGHT = 22.0
+_LEGEND_BASELINE_Y = 18.0
+_LEGEND_LABEL_HALF_HEIGHT = 8.0
 
 
 @dataclass(frozen=True)
@@ -725,8 +729,12 @@ def render_strategy_live_chart(
             font=("Microsoft YaHei UI", 9),
         )
 
-    for time_marker in snapshot.time_markers:
-        x = _time_marker_x(time_marker.at, snapshot, bounds, candle_step)
+    for time_marker, x, x1, x2, y1, y2 in _layout_time_marker_label_positions(
+        snapshot.time_markers,
+        snapshot,
+        bounds,
+        candle_step,
+    ):
         line_kwargs = {
             "fill": time_marker.color,
             "width": time_marker.width,
@@ -734,17 +742,11 @@ def render_strategy_live_chart(
         if time_marker.dash:
             line_kwargs["dash"] = time_marker.dash
         canvas.create_line(x, bounds.top, x, bounds.bottom, **line_kwargs)
-        label_text = time_marker.label
-        text_width = max(len(label_text) * 7 + 14, 88)
-        x1 = min(max(bounds.left, x - text_width / 2), max(bounds.left, bounds.right - text_width))
-        x2 = x1 + text_width
-        y1 = max(6, bounds.top - 28)
-        y2 = y1 + 18
         canvas.create_rectangle(x1, y1, x2, y2, outline=time_marker.color, fill=_PRICE_LABEL_BG)
         canvas.create_text(
             x1 + 6,
             y1 + 9,
-            text=label_text,
+            text=time_marker.label,
             fill=time_marker.color,
             anchor="w",
             font=("Microsoft YaHei UI", 9),
@@ -1091,6 +1093,65 @@ def _layout_marker_label_positions(
             placements[index][2] = max(top_limit, next_y - _MARKER_LABEL_MIN_GAP)
 
     return [(item[0], float(item[1]), float(item[2])) for item in placements]
+
+
+def _layout_time_marker_label_positions(
+    time_markers: tuple[StrategyLiveChartTimeMarker, ...],
+    snapshot: StrategyLiveChartSnapshot,
+    bounds: _ChartBounds,
+    candle_step: float,
+) -> list[tuple[StrategyLiveChartTimeMarker, float, float, float, float, float]]:
+    if not time_markers:
+        return []
+    placements: list[dict[str, object]] = []
+    base_y1 = max(
+        _LEGEND_BASELINE_Y + _LEGEND_LABEL_HALF_HEIGHT + 8.0,
+        bounds.top - 6.0,
+    )
+    for marker in time_markers:
+        label_text = marker.label
+        text_width = max(len(label_text) * 7 + 14, 88)
+        x = _time_marker_x(marker.at, snapshot, bounds, candle_step)
+        max_left = max(bounds.left, bounds.right - text_width)
+        x1 = min(max(bounds.left, x - text_width / 2), max_left)
+        placements.append(
+            {
+                "marker": marker,
+                "x": x,
+                "x1": x1,
+                "x2": x1 + text_width,
+            }
+        )
+    placements.sort(key=lambda item: (float(item["x1"]), float(item["x"])))
+
+    row_right_edges: list[float] = []
+    for item in placements:
+        x1 = float(item["x1"])
+        x2 = float(item["x2"])
+        assigned_row = None
+        for row_index, row_right in enumerate(row_right_edges):
+            if x1 >= row_right + _TIME_MARKER_LABEL_MIN_GAP:
+                assigned_row = row_index
+                row_right_edges[row_index] = x2
+                break
+        if assigned_row is None:
+            assigned_row = len(row_right_edges)
+            row_right_edges.append(x2)
+        y1 = base_y1 + assigned_row * _TIME_MARKER_LABEL_ROW_HEIGHT
+        item["y1"] = y1
+        item["y2"] = y1 + 18.0
+
+    return [
+        (
+            item["marker"],
+            float(item["x"]),
+            float(item["x1"]),
+            float(item["x2"]),
+            float(item["y1"]),
+            float(item["y2"]),
+        )
+        for item in placements
+    ]
 
 
 def _time_marker_x(

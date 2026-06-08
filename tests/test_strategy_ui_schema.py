@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_EMA5_EMA8_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
@@ -41,7 +42,7 @@ class StrategyUiSchemaTest(TestCase):
         self.assertEqual(launcher_defaults["entry_side_mode"], "follow_signal")
         self.assertEqual(strategy_ui_fixed_extra_value(STRATEGY_EMA5_EMA8_ID, "risk_amount", "launcher"), "10")
         self.assertEqual(strategy_ui_fixed_extra_value(STRATEGY_EMA5_EMA8_ID, "order_size", "launcher"), "0")
-        self.assertEqual(strategy_ui_fixed_extra_value(STRATEGY_EMA5_EMA8_ID, "risk_amount", "backtest"), "100")
+        self.assertEqual(strategy_ui_fixed_extra_value(STRATEGY_EMA5_EMA8_ID, "risk_amount", "backtest"), "10")
         self.assertIsNone(strategy_ui_fixed_extra_value(STRATEGY_EMA55_SLOPE_SHORT_ID, "risk_amount", "launcher"))
 
     def test_slope_strategy_launcher_schema_exposes_reviewed_defaults(self) -> None:
@@ -62,10 +63,19 @@ class StrategyUiSchemaTest(TestCase):
             14,
         )
         launcher_defaults = strategy_ui_extra_defaults(STRATEGY_EMA55_SLOPE_SHORT_ID, "launcher")
-        self.assertEqual(launcher_defaults["risk_amount"], "100")
+        self.assertEqual(launcher_defaults["risk_amount"], "10")
         self.assertEqual(launcher_defaults["poll_seconds"], "10")
         self.assertEqual(launcher_defaults["tp_sl_mode"], "local_trade")
         self.assertEqual(launcher_defaults["entry_side_mode"], "follow_signal")
+        backtest_defaults = strategy_ui_extra_defaults(STRATEGY_EMA55_SLOPE_SHORT_ID, "backtest")
+        self.assertEqual(backtest_defaults["risk_amount"], "10")
+
+    def test_body_retest_strategy_schema_uses_10u_for_launcher_and_backtest(self) -> None:
+        launcher_defaults = strategy_ui_extra_defaults(STRATEGY_BODY_RETEST_SHORT_ID, "launcher")
+        backtest_defaults = strategy_ui_extra_defaults(STRATEGY_BODY_RETEST_SHORT_ID, "backtest")
+
+        self.assertEqual(launcher_defaults["risk_amount"], "10")
+        self.assertEqual(backtest_defaults["risk_amount"], "10")
 
     def test_schema_flags_capture_strategy_runtime_constraints(self) -> None:
         self.assertTrue(strategy_supports_dynamic_take_profit(STRATEGY_EMA55_SLOPE_SHORT_ID))

@@ -22,6 +22,7 @@ from okx_quant.models import (
 )
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
+from okx_quant.protection_validation import InvalidProtectionPlanError, validate_protection_prices
 from okx_quant.timeframe import closed_candle_available_timestamps
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
@@ -80,6 +81,10 @@ EXIT_REASON_LABELS = {
     "break_even_stop": "保本",
     "slope_turn_positive": "斜率转正平仓",
 }
+
+
+class BacktestInvalidConfigError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -735,6 +740,20 @@ def _determine_backtest_order_size(
     )
 
 
+def _raise_if_only_invalid_protection_configs(
+    *,
+    config: StrategyConfig,
+    invalid_protection_count: int,
+    valid_entry_plan_count: int,
+) -> None:
+    if invalid_protection_count <= 0 or valid_entry_plan_count > 0:
+        return
+    raise BacktestInvalidConfigError(
+        "参数组合无效：当前样本中所有候选信号的止盈/止损价格都落入非法区间，"
+        f"已排除该组合。inst_id={config.inst_id} strategy_id={config.strategy_id}"
+    )
+
+
 def _build_backtest_order_plan(
     *,
     instrument: Instrument,
@@ -895,21 +914,20 @@ def run_backtest_batch(
                 max(int(config.daily_filter_period), 1),
             )
             direction_filter_bias = daily_filter_bias_by_key.get(cache_key)
-        results.append(
-            (
+        try:
+            result = _run_backtest_with_loaded_data(
+                candles,
+                instrument,
                 config,
-                _run_backtest_with_loaded_data(
-                    candles,
-                    instrument,
-                    config,
-                    data_source_note=data_source_note,
-                    maker_fee_rate=maker_fee_rate,
-                    taker_fee_rate=taker_fee_rate,
-                    mtf_filter_candles=mtf_filter_candles,
-                    direction_filter_bias=direction_filter_bias,
-                ),
+                data_source_note=data_source_note,
+                maker_fee_rate=maker_fee_rate,
+                taker_fee_rate=taker_fee_rate,
+                mtf_filter_candles=mtf_filter_candles,
+                direction_filter_bias=direction_filter_bias,
             )
-        )
+        except BacktestInvalidConfigError:
+            continue
+        results.append((config, result))
     return results
 
 
@@ -1717,6 +1735,8 @@ def _run_cross_backtest(
     open_position: _OpenPosition | None = None
     current_wave_signal: str | None = None
     entries_in_current_wave = 0
+    valid_entry_plan_count = 0
+    invalid_protection_count = 0
     closes = [candle.close for candle in candles]
     ema_values = moving_average(closes, eval_config.ema_period, eval_config.resolved_ema_type())
     trend_ema_values = moving_average(closes, eval_config.trend_ema_period, eval_config.resolved_trend_ema_type())
@@ -1811,8 +1831,6 @@ def _run_cross_backtest(
             stop_loss = snap_to_increment(stop_loss_raw, instrument.tick_size, "up")
             take_profit_raw = entry_reference + (decision.atr_value * resolved_config.atr_take_multiplier)
             take_profit = snap_to_increment(take_profit_raw, instrument.tick_size, "down")
-            if stop_loss <= 0 or take_profit <= 0:
-                continue
             side = "buy"
             pos_side = None if resolved_config.position_mode != "long_short" else "long"
             plan_signal = "long"
@@ -1821,13 +1839,20 @@ def _run_cross_backtest(
             stop_loss = snap_to_increment(stop_loss_raw, instrument.tick_size, "down")
             take_profit_raw = entry_reference - (decision.atr_value * resolved_config.atr_take_multiplier)
             take_profit = snap_to_increment(take_profit_raw, instrument.tick_size, "up")
-            if stop_loss <= 0 or take_profit <= 0:
-                continue
-            if stop_loss <= entry_reference or take_profit >= entry_reference:
-                continue
             side = "sell"
             pos_side = None if resolved_config.position_mode != "long_short" else "short"
             plan_signal = "short"
+        try:
+            validate_protection_prices(
+                direction=plan_signal,
+                entry_reference=entry_reference,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+            )
+        except InvalidProtectionPlanError:
+            invalid_protection_count += 1
+            continue
+        valid_entry_plan_count += 1
         size = _determine_backtest_order_size(
             instrument=instrument,
             config=resolved_config,
@@ -1874,6 +1899,11 @@ def _run_cross_backtest(
         )
         entries_in_current_wave += 1
 
+    _raise_if_only_invalid_protection_configs(
+        config=config,
+        invalid_protection_count=invalid_protection_count,
+        valid_entry_plan_count=valid_entry_plan_count,
+    )
     return trades, _build_terminal_open_position(open_position, candles)
 
 
@@ -1893,7 +1923,7 @@ def _run_ema55_slope_short_backtest(
         return [], None
 
     closes = [candle.close for candle in candles]
-    ema_values = moving_average(closes, int(config.ema_period), "ema")
+    ema_values = moving_average(closes, int(config.ema_period), config.resolved_ema_type())
     ema21_values = moving_average(closes, 21, "ema")
     atr_values = atr(candles, int(config.atr_period))
     trades: list[BacktestTrade] = []
@@ -1903,6 +1933,8 @@ def _run_ema55_slope_short_backtest(
     reentry_reclaim_state: str | None = None
     reentry_ema21_near_state: str | None = None
     reentry_bearish_bar_required = False
+    valid_entry_plan_count = 0
+    invalid_protection_count = 0
 
     for index in range(trade_start_index, len(candles)):
         candle = candles[index]
@@ -2009,15 +2041,20 @@ def _run_ema55_slope_short_backtest(
         if reentry_bearish_bar_required and candle.close >= candle.open:
             continue
 
-        protection = build_protection_plan(
-            instrument=instrument,
-            config=config,
-            direction="short",
-            entry_reference=candle.close,
-            atr_value=atr_value,
-            candle_ts=candle.ts,
-            trigger_inst_id=instrument.inst_id,
-        )
+        try:
+            protection = build_protection_plan(
+                instrument=instrument,
+                config=config,
+                direction="short",
+                entry_reference=candle.close,
+                atr_value=atr_value,
+                candle_ts=candle.ts,
+                trigger_inst_id=instrument.inst_id,
+            )
+        except InvalidProtectionPlanError:
+            invalid_protection_count += 1
+            continue
+        valid_entry_plan_count += 1
         entry_price_raw = protection.entry_reference
         size = _determine_backtest_order_size(
             instrument=instrument,
@@ -2054,6 +2091,11 @@ def _run_ema55_slope_short_backtest(
         if reentry_bearish_bar_required and candle.close < candle.open:
             reentry_bearish_bar_required = False
 
+    _raise_if_only_invalid_protection_configs(
+        config=config,
+        invalid_protection_count=invalid_protection_count,
+        valid_entry_plan_count=valid_entry_plan_count,
+    )
     return trades, _build_terminal_open_position(open_position, candles)
 
 
@@ -2090,6 +2132,8 @@ def _run_body_retest_short_backtest(
     watch_bars = max(int(config.body_retest_watch_bars), 1)
     pending_index: int | None = None
     pending_reclaim_close: Decimal | None = None
+    valid_entry_plan_count = 0
+    invalid_protection_count = 0
 
     for index in range(trade_start_index, len(candles)):
         candle = candles[index]
@@ -2130,16 +2174,23 @@ def _run_body_retest_short_backtest(
                 reclaim_ok = candle.close <= pending_reclaim_close
                 bias_ok = body_retest_short_bias_allows_short(direction_filter_bias, index)
                 if near_line and still_below and bearish_close and reclaim_ok and bias_ok:
-                    protection = build_body_retest_short_protection_plan(
-                        instrument=instrument,
-                        config=config,
-                        entry_reference=candle.close,
-                        signal_candle_high=candle.high,
-                        signal_candle_close=candle.close,
-                        atr_value=atr_value,
-                        candle_ts=candle.ts,
-                        trigger_inst_id=instrument.inst_id,
-                    )
+                    try:
+                        protection = build_body_retest_short_protection_plan(
+                            instrument=instrument,
+                            config=config,
+                            entry_reference=candle.close,
+                            signal_candle_high=candle.high,
+                            signal_candle_close=candle.close,
+                            atr_value=atr_value,
+                            candle_ts=candle.ts,
+                            trigger_inst_id=instrument.inst_id,
+                        )
+                    except InvalidProtectionPlanError:
+                        invalid_protection_count += 1
+                        pending_index = None
+                        pending_reclaim_close = None
+                        continue
+                    valid_entry_plan_count += 1
                     size = _determine_backtest_order_size(
                         instrument=instrument,
                         config=config,
@@ -2189,6 +2240,11 @@ def _run_body_retest_short_backtest(
         pending_index = index
         pending_reclaim_close = candle.close + (candle.open - candle.close) * Decimal("0.5")
 
+    _raise_if_only_invalid_protection_configs(
+        config=config,
+        invalid_protection_count=invalid_protection_count,
+        valid_entry_plan_count=valid_entry_plan_count,
+    )
     return trades, _build_terminal_open_position(open_position, candles)
 
 
@@ -2225,6 +2281,8 @@ def _run_adaptive_rail_backtest(
     entries_on_current_rail = 0
     entry_sequence = 0
     dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
+    valid_entry_plan_count = 0
+    invalid_protection_count = 0
     stats_history: list[tuple[str, int | None]] = []
 
     for index in range(trade_start_index, len(candles)):
@@ -2359,18 +2417,28 @@ def _run_adaptive_rail_backtest(
             continue
 
         resolved_config = _resolve_backtest_config(config, trades)
-        active_plan = _build_backtest_order_plan(
-            instrument=instrument,
-            config=resolved_config,
-            order_size=resolved_config.order_size,
-            signal=decision.signal,
-            entry_reference=decision.entry_reference,
-            atr_value=decision.atr_value,
-            candle_ts=decision.candle_ts,
-            signal_candle_high=decision.signal_candle_high,
-            signal_candle_low=decision.signal_candle_low,
-        )
+        try:
+            active_plan = _build_backtest_order_plan(
+                instrument=instrument,
+                config=resolved_config,
+                order_size=resolved_config.order_size,
+                signal=decision.signal,
+                entry_reference=decision.entry_reference,
+                atr_value=decision.atr_value,
+                candle_ts=decision.candle_ts,
+                signal_candle_high=decision.signal_candle_high,
+                signal_candle_low=decision.signal_candle_low,
+            )
+        except InvalidProtectionPlanError:
+            invalid_protection_count += 1
+            continue
+        valid_entry_plan_count += 1
 
+    _raise_if_only_invalid_protection_configs(
+        config=config,
+        invalid_protection_count=invalid_protection_count,
+        valid_entry_plan_count=valid_entry_plan_count,
+    )
     return trades, _build_terminal_open_position(open_position, candles), _build_adaptive_rail_backtest_stats(
         stats_history,
         trades,
@@ -2503,6 +2571,8 @@ def _run_dynamic_backtest(
     entries_in_current_wave = 0
     entry_sequence = 0
     dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
+    valid_entry_plan_count = 0
+    invalid_protection_count = 0
 
     for index in range(trade_start_index, len(candles)):
         candle = candles[index]
@@ -2586,17 +2656,22 @@ def _run_dynamic_backtest(
             continue
 
         resolved_config = _resolve_backtest_config(config, trades)
-        active_plan = _build_backtest_order_plan(
-            instrument=instrument,
-            config=resolved_config,
-            order_size=resolved_config.order_size,
-            signal=decision.signal,
-            entry_reference=decision.entry_reference,
-            atr_value=decision.atr_value,
-            candle_ts=decision.candle_ts,
-            signal_candle_high=decision.signal_candle_high,
-            signal_candle_low=decision.signal_candle_low,
-        )
+        try:
+            active_plan = _build_backtest_order_plan(
+                instrument=instrument,
+                config=resolved_config,
+                order_size=resolved_config.order_size,
+                signal=decision.signal,
+                entry_reference=decision.entry_reference,
+                atr_value=decision.atr_value,
+                candle_ts=decision.candle_ts,
+                signal_candle_high=decision.signal_candle_high,
+                signal_candle_low=decision.signal_candle_low,
+            )
+        except InvalidProtectionPlanError:
+            invalid_protection_count += 1
+            continue
+        valid_entry_plan_count += 1
 
     terminal_open_position: BacktestOpenPosition | None = None
     if open_position is not None and candles:
@@ -2633,6 +2708,11 @@ def _run_dynamic_backtest(
             adaptive_rail_period=open_position.adaptive_rail_period,
         )
 
+    _raise_if_only_invalid_protection_configs(
+        config=config,
+        invalid_protection_count=invalid_protection_count,
+        valid_entry_plan_count=valid_entry_plan_count,
+    )
     return trades, terminal_open_position
 
 
@@ -4107,7 +4187,9 @@ def _append_backtest_strategy_notes(
         if result.ema55_slope_same_bar_reentry_block:
             lines.append("再入场约束：本根 K 线若刚刚平仓，则本根禁止再次开空。")
         if result.ema55_slope_dynamic_exit_requires_ema_reclaim:
-            lines.append("再入场约束：若因保本或锁盈类动态保护平仓，必须先重新站上 EMA55，再次跌回 EMA55 下方后才允许重开。")
+            lines.append(
+                f"再入场约束：若因保本或锁盈类动态保护平仓，必须先重新站上 {fast_label}，再次跌回 {fast_label} 下方后才允许重开。"
+            )
         if result.ema55_slope_locked_reentry_requires_ema21_near:
             min_r = max(int(result.ema55_slope_locked_reentry_min_r), 1)
             max_r = int(result.ema55_slope_locked_reentry_max_r)

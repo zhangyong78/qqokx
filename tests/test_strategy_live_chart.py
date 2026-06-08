@@ -16,6 +16,7 @@ from okx_quant.strategy_live_chart import (
     StrategyLiveChartTimeMarker,
     _ChartBounds,
     _layout_marker_label_positions,
+    _layout_time_marker_label_positions,
     append_candles_to_snapshot,
     build_auto_channel_live_chart_snapshot,
     build_strategy_live_chart_snapshot,
@@ -393,3 +394,66 @@ class StrategyLiveChartHelpersTest(TestCase):
         self.assertGreaterEqual(bottom_item[2] - top_item[2], 24.0)
         moved_count = sum(1 for _, line_y, label_y in placements if abs(line_y - label_y) > 0.5)
         self.assertGreaterEqual(moved_count, 1)
+
+    def test_time_marker_labels_wrap_to_multiple_rows_when_x_positions_overlap(self) -> None:
+        bounds = _ChartBounds(left=76.0, top=40.0, right=476.0, bottom=544.0)
+        candles = tuple(
+            Candle(
+                ts=1714330800000 + index * 3_600_000,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+                confirmed=True,
+            )
+            for index in range(10)
+        )
+        snapshot = StrategyLiveChartSnapshot(session_id="S01", candles=candles)
+        time_markers = (
+            StrategyLiveChartTimeMarker(key="m1", label="BJT 08", at=datetime.fromtimestamp(candles[0].ts / 1000), color="#7c3aed"),
+            StrategyLiveChartTimeMarker(key="m2", label="BJT 08", at=datetime.fromtimestamp(candles[1].ts / 1000), color="#7c3aed"),
+            StrategyLiveChartTimeMarker(key="m3", label="BJT 08", at=datetime.fromtimestamp(candles[2].ts / 1000), color="#7c3aed"),
+        )
+
+        placements = _layout_time_marker_label_positions(
+            time_markers,
+            snapshot,
+            bounds,
+            candle_step=40.0,
+        )
+
+        self.assertEqual(len(placements), 3)
+        y_positions = {placement[4] for placement in placements}
+        self.assertGreaterEqual(len(y_positions), 2)
+        self.assertGreaterEqual(min(y_positions), 34.0)
+
+    def test_time_marker_labels_share_row_when_x_positions_are_far_enough_apart(self) -> None:
+        bounds = _ChartBounds(left=76.0, top=40.0, right=676.0, bottom=544.0)
+        candles = tuple(
+            Candle(
+                ts=1714330800000 + index * 3_600_000,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+                confirmed=True,
+            )
+            for index in range(20)
+        )
+        snapshot = StrategyLiveChartSnapshot(session_id="S01", candles=candles)
+        time_markers = (
+            StrategyLiveChartTimeMarker(key="m1", label="BJT 08", at=datetime.fromtimestamp(candles[0].ts / 1000), color="#7c3aed"),
+            StrategyLiveChartTimeMarker(key="m2", label="BJT 08", at=datetime.fromtimestamp(candles[8].ts / 1000), color="#7c3aed"),
+        )
+
+        placements = _layout_time_marker_label_positions(
+            time_markers,
+            snapshot,
+            bounds,
+            candle_step=40.0,
+        )
+
+        self.assertEqual(len(placements), 2)
+        self.assertEqual({placement[4] for placement in placements}, {34.0})

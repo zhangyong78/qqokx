@@ -13,6 +13,7 @@ def evaluate_ema55_slope_short_signal(
     *,
     price_increment: Decimal | None = None,
 ) -> SignalDecision:
+    line_label = config.ema_label()
     minimum = max(int(config.ema_period), int(config.atr_period), int(config.trend_ema_period)) + 1
     if len(candles) < minimum:
         return SignalDecision(
@@ -39,7 +40,7 @@ def evaluate_ema55_slope_short_signal(
     if current_ema is None or previous_ema is None:
         return SignalDecision(
             signal=None,
-            reason="EMA55 尚未准备完成。",
+            reason=f"{line_label} 尚未准备完成。",
             candle_ts=current_candle.ts,
             entry_reference=None,
             atr_value=current_atr,
@@ -68,7 +69,7 @@ def evaluate_ema55_slope_short_signal(
     if slope_ratio is None:
         return SignalDecision(
             signal=None,
-            reason="EMA55 当前值为 0，无法计算斜率比例。",
+            reason=f"{line_label} 当前值为 0，无法计算斜率比例。",
             candle_ts=current_candle.ts,
             entry_reference=None,
             atr_value=current_atr,
@@ -81,7 +82,7 @@ def evaluate_ema55_slope_short_signal(
         return SignalDecision(
             signal="short",
             reason=(
-                f"EMA55 斜率比例={slope_ratio:.6f}，达到开空阈值 {threshold:.6f}，"
+                f"{line_label} 斜率比例={slope_ratio:.6f}，达到开空阈值 {threshold:.6f}，"
                 f"按收盘价 {px(current_candle.close)} 做空。"
             ),
             candle_ts=current_candle.ts,
@@ -95,7 +96,7 @@ def evaluate_ema55_slope_short_signal(
     return SignalDecision(
         signal=None,
         reason=(
-            f"EMA55 斜率比例={slope_ratio:.6f}，尚未达到开空阈值 {threshold:.6f}。"
+            f"{line_label} 斜率比例={slope_ratio:.6f}，尚未达到开空阈值 {threshold:.6f}。"
         ),
         candle_ts=current_candle.ts,
         entry_reference=None,

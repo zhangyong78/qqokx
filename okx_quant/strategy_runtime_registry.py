@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_EMA5_EMA8_ID,
@@ -19,6 +20,7 @@ EngineExchangeInstrumentRole = Literal["signal", "trade"]
 StrategyPreferredDirection = Literal["long", "short"]
 StrategyRuntimeFamily = Literal[
     "dynamic_order",
+    "adaptive_ema_rail",
     "cross_legacy",
     "cross_breakout_long",
     "cross_breakdown_short",
@@ -100,6 +102,11 @@ _EMA5_EMA8_PROFILE = StrategyRuntimeProfile(
     signal_only_handler="_run_ema5_ema8_signal_only",
     local_trade_handler="_run_ema5_ema8_local_strategy",
 )
+_ADAPTIVE_EMA_RAIL_PROFILE = StrategyRuntimeProfile(
+    family="adaptive_ema_rail",
+    signal_only_handler="_run_adaptive_ema_rail_signal_only",
+    local_trade_handler="_run_adaptive_ema_rail_local_strategy",
+)
 
 
 def get_strategy_runtime_profile(strategy_id: str) -> StrategyRuntimeProfile:
@@ -119,6 +126,8 @@ def get_strategy_runtime_profile(strategy_id: str) -> StrategyRuntimeProfile:
         return _BODY_RETEST_SHORT_PROFILE
     if strategy_id == STRATEGY_EMA5_EMA8_ID:
         return _EMA5_EMA8_PROFILE
+    if strategy_id == STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID:
+        return _ADAPTIVE_EMA_RAIL_PROFILE
     raise KeyError(f"unknown strategy runtime profile: {strategy_id}")
 
 
@@ -151,6 +160,8 @@ def strategy_entry_reference_period_caption(strategy_id: str) -> str:
 def strategy_preferred_direction(strategy_id: str, signal_mode: str) -> StrategyPreferredDirection | None:
     profile = get_strategy_runtime_profile(strategy_id)
     if profile.family == "cross_breakout_long":
+        return "long"
+    if profile.family == "adaptive_ema_rail":
         return "long"
     if profile.family in {"cross_breakdown_short", "ema55_slope_short", "body_retest_short"}:
         return "short"

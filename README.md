@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.15`
+当前版本：`v0.6.16`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -19,7 +19,7 @@
 
 ## 近期更新
 
-`v0.6.15` 之后这一轮版本内容比较集中，重点新增和调整如下：
+`v0.6.16` 之后这一轮版本内容比较集中，重点新增和调整如下：
 
 - 新增 `EMA55 斜率做空` 策略：
   - 规则：`EMA55` 单根斜率比例小于等于阈值时开空，斜率重新转正时平仓
@@ -35,6 +35,10 @@
   - launcher / backtest / engine / router 开始共用 schema / registry，不再靠大量 `if strategy_id == ...`
 - 修复了新策略接入引发的启动崩溃问题，并补充了启动烟测、策略切换回归和运行路由测试
 - 回测说明、参数矩阵、标题文案、方向偏好等逻辑开始按 runtime family 统一分流，减少主程序与具体策略的强耦合
+- 启动区与回测区补充了轻量风险金参考提示：
+  - 现在不再主打“最小下单门槛动态估算”，而是直接显示基于历史回测整理的 `回测参考`
+  - 当前先覆盖 `EMA55 斜率做空` 与 `EMA 动态委托做多`
+  - 文案口径统一为 `建议 XXU，最佳 YYU`；其中 `建议` 偏实用，`最佳` 偏更稳覆盖
 - 实盘轮询链路补了三项轻量扩容优化：
   - 默认轮询间隔从 `3s` 调整为 `10s`
   - 新增 `market_data_hub`，同进程内相同 `instId + bar` 的 K 线共享读取
@@ -329,13 +333,13 @@ scripts\release_one_click.bat
   ：服务器升级操作清单，适合按实盘环境灰度启用私有 WS 加速
 - [软件开发指南.md](/D:/qqokx/软件开发指南.md)
   ：开发维护说明，已补充策略 schema / runtime registry、EMA55 斜率做空、回测与 UI 接入约定
-- [版本开发日志_v0.6.15.md](/D:/qqokx/版本开发日志_v0.6.15.md)
+- [版本开发日志_v0.6.16.md](/D:/qqokx/版本开发日志_v0.6.16.md)
   ：本轮版本开发日志，归档 EMA55 策略、研究报告、B 方案结构重构与验证结果
 - [reports/strategy_ui_schema_b_impl.md](/D:/qqokx/reports/strategy_ui_schema_b_impl.md)
   ：B 方案实施说明，记录 schema / registry 这一轮已经解掉的耦合和剩余尾项
 - [reports/strategy_isolation_plan.md](/D:/qqokx/reports/strategy_isolation_plan.md)
   ：“新策略与主程序解耦”设计方案与推进顺序
 - [线程工作流模板.md](/D:/qqokx/线程工作流模板.md)
-- [自动通道系统_v1_产品需求与技术路线.md](/D:/qqokx/自动通道系统_v1_产品需求与技术路线.md)
-- [BTC研究工作台开发记录.md](/D:/qqokx/BTC研究工作台开发记录.md)
-- [交易员晨会解读.md](/D:/qqokx/交易员晨会解读.md)
+- [docs/archive/自动通道系统_v1_产品需求与技术路线.md](/D:/qqokx/docs/archive/自动通道系统_v1_产品需求与技术路线.md)
+- [docs/archive/BTC研究工作台开发记录.md](/D:/qqokx/docs/archive/BTC研究工作台开发记录.md)
+- [docs/archive/交易员晨会解读.md](/D:/qqokx/docs/archive/交易员晨会解读.md)

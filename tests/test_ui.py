@@ -478,23 +478,35 @@ HTTP 502: <!DOCTYPE html>
             inst_id="BNB-USDT-SWAP",
             instrument=instrument,
             risk_amount_raw="0.2",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            signal_mode="short_only",
             minimum_risk_amount=Decimal("0.5"),
             note="按当前止损距离估算。",
         )
 
-        self.assertIn("最小下单量 1张（折合0.01 BNB）", hint)
-        self.assertIn("至少需要风险金 0.5", hint)
-        self.assertIn("当前填写 0.2，还不够下最小一笔", hint)
-        self.assertIn("按当前止损距离估算。", hint)
+        self.assertEqual(hint, "回测参考：BNB-USDT-SWAP 建议 30U，最佳 90U。")
 
     def test_build_minimum_order_risk_hint_text_without_instrument_shows_loading(self) -> None:
         hint = _build_minimum_order_risk_hint_text(
             inst_id="ETH-USDT-SWAP",
             instrument=None,
             risk_amount_raw="",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            signal_mode="long_only",
         )
 
-        self.assertIn("正在读取 ETH-USDT-SWAP 的最小下单规格", hint)
+        self.assertEqual(hint, "回测参考：ETH-USDT-SWAP 建议 1U，最佳 2U。")
+
+    def test_build_minimum_order_risk_hint_text_uses_backtest_value_for_doge(self) -> None:
+        hint = _build_minimum_order_risk_hint_text(
+            inst_id="DOGE-USDT-SWAP",
+            instrument=None,
+            risk_amount_raw="",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            signal_mode="long_only",
+        )
+
+        self.assertEqual(hint, "回测参考：DOGE-USDT-SWAP 建议 0.001U。")
 
     def test_build_order_size_mode_hint_text_prefers_risk_amount_when_present(self) -> None:
         self.assertEqual(
@@ -617,6 +629,7 @@ HTTP 502: <!DOCTYPE html>
         self.assertIn("止盈 ATR 倍数：4（当前为动态止盈，初始不直接挂止盈）", message)
         self.assertIn("风险金：20（按止损距离反推仓位）", message)
         self.assertIn("固定数量：1（OKX 下单数量 sz；当前已填写风险金，仅作备用；BTC-USDT-SWAP 下 1=0.01 BTC）", message)
+        self.assertIn("回测参考：建议 10U，最佳 15U", message)
         self.assertIn("启动追单窗口：关闭（启动不追老信号，只等新波）", message)
 
     def test_build_launch_parameter_hint_text_for_dynamic_take_profit(self) -> None:
@@ -1063,6 +1076,8 @@ HTTP 502: <!DOCTYPE html>
         self.assertEqual(_infer_session_runtime_status("开始监控 OKX 动态止损 | 标的=BTC-USDT-SWAP"), "持仓监控中")
         self.assertEqual(_infer_session_runtime_status("当前无法生成挂单 | 趋势未确认"), "等待信号")
         self.assertEqual(_infer_session_runtime_status("当前无信号 | EMA未突破"), "等待信号")
+        self.assertEqual(_infer_session_runtime_status("当前无开空信号 | EMA55 斜率未转空"), "等待信号")
+        self.assertEqual(_infer_session_runtime_status("当前无开多信号 | EMA55 斜率未转多"), "等待信号")
 
     def test_infer_session_runtime_status_maps_trader_virtual_stop_messages_to_position_monitoring(self) -> None:
         self.assertEqual(_infer_session_runtime_status("交易员虚拟止损监控启动 | 标的=ETH-USDT-SWAP"), "持仓监控中")
@@ -1090,10 +1105,40 @@ HTTP 502: <!DOCTYPE html>
         self.assertEqual(_infer_session_runtime_status("启动追单窗口已过期，当前不追单 | 方向=LONG"), "等待信号")
         self.assertEqual(_infer_session_runtime_status("本轮持仓已结束，继续监控下一次信号。"), "等待信号")
 
+    def test_record_session_runtime_message_marks_session_for_ui_refresh(self) -> None:
+        session = SimpleNamespace(session_id="S01", runtime_status="启动中", last_message="")
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _track_session_trade_runtime=MagicMock(),
+        )
+
+        QuantApp._record_session_runtime_message(app, "S01", "当前无开空信号 | EMA55 斜率未转空")
+
+        self.assertEqual(session.runtime_status, "等待信号")
+        self.assertEqual(session.last_message, "当前无开空信号 | EMA55 斜率未转空")
+        self.assertEqual(app._pending_runtime_session_updates, {"S01"})
+
+    def test_drain_pending_runtime_session_updates_refreshes_rows_and_selected_details(self) -> None:
+        session = SimpleNamespace(session_id="S01")
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _pending_runtime_session_updates={"S01"},
+            _selected_session_detail_session_id="S01",
+            _upsert_session_row=MagicMock(),
+            _refresh_selected_session_details=MagicMock(),
+        )
+
+        QuantApp._drain_pending_runtime_session_updates(app)
+
+        app._upsert_session_row.assert_called_once_with(session)
+        app._refresh_selected_session_details.assert_called_once_with()
+        self.assertEqual(app._pending_runtime_session_updates, set())
+
     def test_create_session_engine_carries_email_runtime_context(self) -> None:
         app = SimpleNamespace(
             client=MagicMock(),
             _make_session_logger=lambda *args, **kwargs: (lambda message: None),
+            market_data_hub=None,
         )
 
         engine = QuantApp._create_session_engine(
@@ -1245,6 +1290,7 @@ HTTP 502: <!DOCTYPE html>
         app = QuantApp.__new__(QuantApp)
         app.client = MagicMock()
         app._make_session_logger = lambda *args, **kwargs: (lambda message: None)
+        app.market_data_hub = None
 
         engine = QuantApp._create_session_engine(
             app,
@@ -2179,6 +2225,7 @@ class StrategyTradeTrackingTest(TestCase):
                 trade_inst_id="ETH-USDT-SWAP",
                 inst_id="ETH-USDT-SWAP",
                 environment="demo",
+                run_mode="trade",
                 tp_sl_mode="exchange",
                 take_profit_mode="dynamic",
                 position_mode="long_short",
@@ -2831,6 +2878,117 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertIn("仍在恢复中 1 条", logged)
         self.assertIn("仍待恢复 1 条", logged)
         self.assertIn("未迁移成功 1 条", logged)
+
+    def test_attempt_auto_restore_recoverable_sessions_dispatches_background_probes_when_root_exists(self) -> None:
+        app = SimpleNamespace(
+            root=SimpleNamespace(after=MagicMock()),
+            _recoverable_strategy_sessions={key: object() for key in ("S01", "S02")},
+            _dispatch_auto_restore_probe=MagicMock(),
+        )
+
+        QuantApp._attempt_auto_restore_recoverable_sessions(app)
+
+        self.assertEqual(app._auto_restore_batch_session_ids, ["S01", "S02"])
+        self.assertEqual(app._auto_restore_batch_pending, {"S01", "S02"})
+        self.assertEqual(app._dispatch_auto_restore_probe.call_count, 2)
+        self.assertEqual(app._dispatch_auto_restore_probe.call_args_list[0].args, ("S01",))
+        self.assertEqual(app._dispatch_auto_restore_probe.call_args_list[1].args, ("S02",))
+
+    def test_recover_session_auto_restore_uses_cached_probe_without_repeating_network_queries(self) -> None:
+        session = self._make_session()
+        start_custom = MagicMock()
+        trade_instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        session.engine = SimpleNamespace(
+            is_running=False,
+            start_custom=start_custom,
+            _get_instrument_with_retry=MagicMock(side_effect=AssertionError("should use cached instrument")),
+            _monitor_exchange_dynamic_stop=MagicMock(),
+            _monitor_exchange_managed_position_until_closed=MagicMock(),
+            _logger=MagicMock(),
+            _notify_error=MagicMock(),
+        )
+        trade = StrategyTradeRuntimeState(
+            round_id="S01-1",
+            opened_logged_at=datetime(2026, 5, 10, 19, 23, 11),
+            entry_order_id="1001",
+            entry_client_order_id="s01emaent0510192310",
+            entry_price=Decimal("2358.42"),
+            size=Decimal("0.1"),
+        )
+        position = OkxPosition(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="long",
+            mgn_mode="cross",
+            position=Decimal("0.1"),
+            avail_position=Decimal("0.1"),
+            avg_price=Decimal("2358.42"),
+            mark_price=Decimal("2360"),
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy=None,
+            last_price=Decimal("2361"),
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+        probe = {
+            "ready": True,
+            "credentials": SimpleNamespace(profile_name="moni"),
+            "trade_inst_id": "ETH-USDT-SWAP",
+            "inst_type": "SWAP",
+            "live_position": position,
+            "trade": trade,
+            "supports_position_recovery": True,
+            "trade_instrument_checked": True,
+            "trade_instrument": trade_instrument,
+            "direction": "long",
+            "protective_order_checked": True,
+            "protective_order": None,
+        }
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _recoverable_strategy_sessions={},
+            _auto_restore_probe_cache={"S01": probe},
+            _credentials_for_profile_or_none=MagicMock(side_effect=AssertionError("should use cached credentials")),
+            _restore_session_trade_runtime_from_log=MagicMock(side_effect=AssertionError("should use cached trade")),
+            _find_recovery_claim_conflict=lambda session_id, trade: None,
+            _load_recoverable_live_positions=MagicMock(side_effect=AssertionError("should use cached positions")),
+            _select_recoverable_live_position=MagicMock(side_effect=AssertionError("should use cached positions")),
+            _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
+            _find_recoverable_protective_order=MagicMock(side_effect=AssertionError("should use cached protective order")),
+            _build_recoverable_strategy_session_record=lambda session_: SimpleNamespace(session_id=session_.session_id, api_name=session_.api_name),
+            _strategy_session_supports_position_recovery=lambda config: True,
+            _upsert_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _remove_recoverable_strategy_session=MagicMock(),
+            _log_session_message=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+
+        result = QuantApp._recover_session(app, "S01", auto=True)
+
+        self.assertTrue(result)
+        self.assertEqual(session.status, "恢复中")
+        self.assertEqual(session.ended_reason, "恢复为托管持仓监控")
+        self.assertEqual(app._auto_restore_probe_cache, {})
+        start_custom.assert_called_once()
 
     def test_recover_session_skips_when_another_running_session_already_claims_same_algo_order(self) -> None:
         session = self._make_session()
@@ -4806,6 +4964,7 @@ class SelectedSessionDetailRefreshTest(TestCase):
             _selected_session_detail=SimpleNamespace(),
             _selected_session_detail_session_id="S01",
             _session_live_pnl_snapshot=lambda _session: (None, None),
+            _session_position_cache_note=lambda _session: "",
             _build_strategy_detail_text=MagicMock(return_value="detail"),
             _set_readonly_text=MagicMock(),
             notify_enabled=_Var(True),
@@ -4860,6 +5019,7 @@ class SelectedSessionDetailRefreshTest(TestCase):
             _selected_session_detail=SimpleNamespace(),
             _selected_session_detail_session_id="S01",
             _session_live_pnl_snapshot=lambda _session: (None, None),
+            _session_position_cache_note=lambda _session: "",
             _build_strategy_detail_text=MagicMock(return_value="detail"),
             _set_readonly_text=MagicMock(),
             notify_enabled=_Var(True),
@@ -6094,7 +6254,19 @@ class StrategyParameterDraftRestoreTest(TestCase):
             max_entries_per_trend=_Var(""),
             dynamic_two_r_break_even=_Var(False),
             dynamic_fee_offset_enabled=_Var(False),
+            daily_filter_enabled=_Var(False),
+            daily_filter_boundary_label=_Var(""),
+            daily_filter_mode_label=_Var(""),
+            daily_filter_scope_label=_Var(""),
+            daily_filter_ma_type=_Var(""),
+            daily_filter_period=_Var(""),
             trend_ema_slope_filter_min_ratio=_Var(""),
+            atr_percentile_filter_max=_Var(""),
+            body_retest_breakdown_atr_multiplier=_Var(""),
+            body_retest_retest_atr_multiplier=_Var(""),
+            body_retest_stop_buffer_atr_multiplier=_Var(""),
+            body_retest_body_atr_limit=_Var(""),
+            body_retest_watch_bars=_Var(""),
             time_stop_break_even_enabled=_Var(False),
             time_stop_break_even_bars=_Var(""),
             startup_chase_window_seconds=_Var(""),
