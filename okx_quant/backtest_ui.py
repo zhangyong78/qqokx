@@ -51,6 +51,7 @@ from okx_quant.strategy_runtime_registry import (
     strategy_is_cross_family,
     strategy_uses_dynamic_orders,
 )
+from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
 from okx_quant.strategy_parameters import (
     iter_strategy_parameter_keys,
     strategy_fixed_value,
@@ -1676,7 +1677,7 @@ class BacktestWindow:
         name = self.backtest_profile_name.get().strip()
         summary = self.backtest_profile_summary.get().strip()
         if not name and not summary:
-            return "未加载 Profile，当前可直接手填参数，或导入 Profile/Bundle 自动填充。"
+            return "当前未加载参数模板。可直接手填参数，或先选择策略和币种自动带出默认参数，也可导入参数模板覆盖当前设置。"
         if name and summary:
             return f"当前 Profile：{name} | {summary}"
         return f"当前 Profile：{name or summary}"
@@ -1991,6 +1992,7 @@ class BacktestWindow:
             state="readonly",
         )
         self.symbol_combo.grid(row=row, column=3, sticky="ew", padx=(0, 12))
+        self.symbol_combo.bind("<<ComboboxSelected>>", self._on_symbol_selected)
         self.bar_caption = ttk.Label(controls, text="K线周期")
         self.bar_caption.grid(row=row, column=4, sticky="w")
         self.bar_combo = ttk.Combobox(
@@ -2014,11 +2016,11 @@ class BacktestWindow:
         self._bind_responsive_wrap(self.profile_summary_label, controls, padding=180, min_wrap=260)
         self.import_profile_button = ttk.Button(
             controls,
-            text="导入 Profile/Bundle",
+            text="导入参数模板",
             command=self.import_backtest_profile_bundle,
         )
         self.import_profile_button.grid(row=row, column=4, sticky="e", pady=(10, 0), padx=(0, 8))
-        self.clear_profile_button = ttk.Button(controls, text="清除来源", command=self.clear_backtest_profile_origin)
+        self.clear_profile_button = ttk.Button(controls, text="清除模板来源", command=self.clear_backtest_profile_origin)
         self.clear_profile_button.grid(row=row, column=5, sticky="ew", pady=(10, 0))
 
         row += 1
@@ -3782,6 +3784,9 @@ class BacktestWindow:
     def _on_strategy_selected(self, *_: object) -> None:
         self._apply_selected_strategy_definition()
 
+    def _on_symbol_selected(self, *_: object) -> None:
+        self._apply_symbol_specific_defaults_if_needed(clear_profile_origin=True)
+
     def _apply_selected_strategy_definition(self) -> None:
         definition = self._selected_strategy_definition()
         strategy_id = definition.strategy_id
@@ -3805,6 +3810,7 @@ class BacktestWindow:
             risk_amount = extra_defaults.get("risk_amount")
             if risk_amount is not None:
                 self.risk_amount.set(str(risk_amount))
+        self._apply_symbol_specific_defaults_if_needed()
         if hasattr(self, "_controls_frame"):
             big_ema_widgets = (self.big_ema_caption, self.big_ema_entry)
             for widget in big_ema_widgets:
@@ -3833,6 +3839,7 @@ class BacktestWindow:
                     widget.grid_remove()
             mtf_widgets = (
                 self.mtf_filter_bar_caption,
+                self.mtf_filter_bar_caption_row,
                 self.mtf_filter_bar_combo,
                 self.mtf_filter_fast_ema_caption,
                 self.mtf_filter_fast_ema_entry,
@@ -3862,6 +3869,34 @@ class BacktestWindow:
             )
             for widget in daily_filter_widgets:
                 if visibility.show_daily_filter_controls:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            atr_percentile_widgets = (
+                self.atr_percentile_filter_caption,
+                self.atr_percentile_filter_entry,
+            )
+            show_atr_percentile = strategy_uses_parameter(strategy_id, "atr_percentile_filter_max")
+            for widget in atr_percentile_widgets:
+                if show_atr_percentile:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            body_retest_widgets = (
+                self.body_retest_breakdown_caption,
+                self.body_retest_breakdown_entry,
+                self.body_retest_retest_caption,
+                self.body_retest_retest_entry,
+                self.body_retest_stop_buffer_caption,
+                self.body_retest_stop_buffer_entry,
+                self.body_retest_body_limit_caption,
+                self.body_retest_body_limit_entry,
+                self.body_retest_watch_bars_caption,
+                self.body_retest_watch_bars_entry,
+            )
+            show_body_retest = strategy_uses_parameter(strategy_id, "body_retest_breakdown_atr_multiplier")
+            for widget in body_retest_widgets:
+                if show_body_retest:
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -3988,6 +4023,38 @@ class BacktestWindow:
             self.manual_summary.set("当前策略没有额外扩展统计。")
         if self._ui_alive():
             self.window.after_idle(self._sync_backtest_params_viewport)
+
+    def _apply_symbol_specific_defaults_if_needed(self, *, clear_profile_origin: bool = False) -> None:
+        definition = self._selected_strategy_definition()
+        defaults = get_strategy_symbol_parameter_defaults(
+            definition.strategy_id,
+            self.symbol.get(),
+            "backtest",
+        )
+        if not defaults:
+            return
+        bindings = self._strategy_parameter_bindings()
+        for key, value in defaults.items():
+            variable = bindings.get(key)
+            if variable is None:
+                continue
+            if key == "bar":
+                variable.set(_normalize_backtest_bar_label(str(value)))
+            elif key == "take_profit_mode":
+                variable.set(TAKE_PROFIT_MODE_VALUE_TO_LABEL.get(str(value), self.take_profit_mode_label.get()))
+            elif key == "mtf_reversal_mode":
+                variable.set(MTF_REVERSAL_MODE_VALUE_TO_LABEL.get(str(value), self.mtf_reversal_mode_label.get()))
+            elif key.endswith("_type"):
+                variable.set(str(value).upper())
+            else:
+                variable.set(value)
+        if clear_profile_origin:
+            self.backtest_profile_id.set("")
+            self.backtest_profile_name.set("")
+            self.backtest_profile_summary.set("")
+        self._sync_dynamic_take_profit_controls()
+        self._sync_daily_filter_controls()
+        self._refresh_profile_summary_text()
 
     def _sync_dynamic_take_profit_controls(self) -> None:
         if not hasattr(self, "dynamic_two_r_break_even_check"):

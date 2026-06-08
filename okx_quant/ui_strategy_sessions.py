@@ -9,6 +9,7 @@ from okx_quant.strategy_runtime_registry import (
     strategy_entry_reference_period_caption,
     strategy_preferred_direction,
 )
+from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
 
 
 class UiStrategySessionsMixin:
@@ -552,7 +553,11 @@ class UiStrategySessionsMixin:
         summary_lines = [
             f"组合包：{bundle.package_name}",
             f"组合条数：{len(selected_items)} / {len(bundle.items)} 条",
-            f"自动启动：{len(started_session_ids)} 条" if auto_start_enabled else "自动启动：未启用（已回填首条到启动区）",
+            (
+                f"自动启动：已启动 {len(started_session_ids)} 条，策略会进入运行中列表"
+                if auto_start_enabled
+                else "自动启动：未启用，本次不会进入运行中列表，只会回填首条到启动区"
+            ),
             f"跳过：{len(skipped_summaries)} 条",
             f"失败：{len(start_failed_summaries)} 条",
         ]
@@ -600,17 +605,17 @@ class UiStrategySessionsMixin:
             focused = self._focus_first_running_session(started_session_ids, filter_label="普通量化")
             summary_lines.append("")
             summary_lines.append(
-                "运行中策略：已自动定位到首条已启动普通策略。"
+                "运行中策略：已自动定位到首条已启动策略。"
                 if focused
-                else "运行中策略：已启动普通策略，但当前未能自动定位，请手动查看运行中策略列表。"
+                else "运行中策略：策略已经启动，但当前未能自动定位，请手动查看运行中策略列表。"
             )
         elif not auto_start_enabled and imported_labels:
             summary_lines.append("")
-            summary_lines.append("说明：普通策略在未勾选自动启动时，不会进入运行中列表；本次只把首条回填到启动区。")
+            summary_lines.append("说明：这次没有勾选自动启动，所以策略不会进入运行中列表；本次只把首条回填到启动区。")
 
         detail_lines = [
             f"组合包：{bundle.package_name}",
-            f"处理模式：{'自动启动' if auto_start_enabled else '仅回填首条到启动区'}",
+            f"处理模式：{'自动启动并进入运行中列表' if auto_start_enabled else '仅回填首条到启动区，不进入运行中列表'}",
             f"选择条数：{len(selected_items)} / {len(bundle.items)}",
         ]
         if imported_labels:
@@ -4258,6 +4263,7 @@ class UiStrategySessionsMixin:
             tp_sl_mode = extra_defaults.get("tp_sl_mode")
             if tp_sl_mode is not None:
                 self.tp_sl_mode_label.set(_launcher_tp_sl_mode_label(str(tp_sl_mode)))
+        self._apply_symbol_specific_defaults_if_needed()
         if strategy_forces_follow_signal(strategy_id):
             self.entry_side_mode_label.set("跟随信号")
         if strategy_forces_local_trade(strategy_id):
@@ -4317,6 +4323,7 @@ class UiStrategySessionsMixin:
             self._big_ema_entry.grid_remove()
         mtf_widgets = (
             self._mtf_filter_bar_label,
+            self._mtf_filter_bar_label_row,
             self._mtf_filter_bar_combo,
             self._mtf_filter_fast_ema_label,
             self._mtf_filter_fast_ema_entry,
@@ -4346,6 +4353,34 @@ class UiStrategySessionsMixin:
         )
         for widget in daily_filter_widgets:
             if visibility.show_daily_filter_controls:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        atr_percentile_widgets = (
+            self._atr_percentile_filter_label,
+            self._atr_percentile_filter_entry,
+        )
+        show_atr_percentile = strategy_uses_parameter(strategy_id, "atr_percentile_filter_max")
+        for widget in atr_percentile_widgets:
+            if show_atr_percentile:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        body_retest_widgets = (
+            self._body_retest_breakdown_label,
+            self._body_retest_breakdown_entry,
+            self._body_retest_retest_label,
+            self._body_retest_retest_entry,
+            self._body_retest_stop_buffer_label,
+            self._body_retest_stop_buffer_entry,
+            self._body_retest_body_limit_label,
+            self._body_retest_body_limit_entry,
+            self._body_retest_watch_bars_label,
+            self._body_retest_watch_bars_entry,
+        )
+        show_body_retest = strategy_uses_parameter(strategy_id, "body_retest_breakdown_atr_multiplier")
+        for widget in body_retest_widgets:
+            if show_body_retest:
                 widget.grid()
             else:
                 widget.grid_remove()
@@ -4435,6 +4470,36 @@ class UiStrategySessionsMixin:
         self._update_dynamic_protection_hint()
         self._on_fixed_order_size_symbol_changed()
         self._schedule_minimum_order_risk_hint_update()
+
+    def _on_strategy_symbol_selected(self, *_: object) -> None:
+        self._apply_symbol_specific_defaults_if_needed()
+
+    def _apply_symbol_specific_defaults_if_needed(self) -> None:
+        definition = self._selected_strategy_definition()
+        defaults = get_strategy_symbol_parameter_defaults(
+            definition.strategy_id,
+            self.symbol.get(),
+            "launcher",
+        )
+        if not defaults:
+            return
+        bindings = self._strategy_parameter_bindings()
+        for key, value in defaults.items():
+            variable = bindings.get(key)
+            if variable is None:
+                continue
+            if key == "signal_mode":
+                variable.set(_reverse_lookup_label(SIGNAL_LABEL_TO_VALUE, str(value), definition.default_signal_label))
+            elif key == "take_profit_mode":
+                variable.set(_reverse_lookup_label(TAKE_PROFIT_MODE_OPTIONS, str(value), self.take_profit_mode_label.get()))
+            elif key == "mtf_reversal_mode":
+                variable.set(_reverse_lookup_label(MTF_REVERSAL_MODE_OPTIONS, str(value), self.mtf_reversal_mode_label.get()))
+            elif key.endswith("_type"):
+                variable.set(str(value).upper())
+            else:
+                variable.set(value)
+        self._sync_dynamic_take_profit_controls()
+        self._sync_daily_filter_controls()
 
     def _sync_dynamic_take_profit_controls(self) -> None:
         if not hasattr(self, "_dynamic_two_r_break_even_check"):

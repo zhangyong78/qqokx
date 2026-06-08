@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from shutil import copyfile
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -60,15 +61,18 @@ plt.rcParams["axes.unicode_minus"] = False
 
 REPORT_DIR = analysis_report_dir_path()
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
+PROJECT_REPORT_DIR = ROOT / "reports"
+PROJECT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 STAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
-REPORT_BASENAME = f"multi_coin_slope_vs_dynamic_long_daily_filter_10u_{STAMP}"
+REPORT_BASENAME = f"multi_coin_slope_vs_dynamic_long_daily_filter_full_10u_{STAMP}"
 HTML_PATH = REPORT_DIR / f"{REPORT_BASENAME}.html"
 CSV_PATH = REPORT_DIR / f"{REPORT_BASENAME}.csv"
 JSON_PATH = REPORT_DIR / f"{REPORT_BASENAME}.json"
+PROJECT_HTML_PATH = PROJECT_REPORT_DIR / "multi_coin_slope_vs_dynamic_long_daily_filter_full_10u.html"
 
 SYMBOLS = tuple(LONG_PROFILES.keys())
-ENTRY_LIMIT = 10000
+ENTRY_LIMIT: int | None = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +196,12 @@ def build_data_note(symbol: str, entry_count: int, filter_count: int) -> str:
         f"local candle_cache full history | {symbol} {ENTRY_BAR} candles={entry_count} | "
         f"{FILTER_BAR} candles={filter_count}"
     )
+
+
+def entry_limit_label() -> str:
+    if ENTRY_LIMIT is None:
+        return "全历史"
+    return f"最多 {ENTRY_LIMIT} 根"
 
 
 def run_slope_long_with_bias(
@@ -921,8 +931,8 @@ def build_html(strategy_studies: list[StrategyStudy], summary_frame: pd.DataFram
   <div class="wrap">
     <section class="hero">
       <h1>5币 10U 做多线对比</h1>
-      <p>对象：<strong>EMA55 斜率镜像做多</strong> vs <strong>EMA 动态委托做多</strong>。两条线都额外接上 <strong>日线方向过滤</strong>，并在 5 个币种上全量回测。</p>
-      <p>口径：{ENTRY_BAR} 入场，{FILTER_BAR} 过滤，固定风险金 <strong>{RISK_AMOUNT}U</strong>，初始资金 <strong>{INITIAL_CAPITAL}U</strong>，本地全历史缓存，单币最多读取 <strong>{ENTRY_LIMIT}</strong> 根 {ENTRY_BAR} K 线。</p>
+      <p>对象：<strong>EMA55 斜率镜像做多</strong> vs <strong>EMA 动态委托做多</strong>。两条线都额外接上 <strong>日线方向过滤</strong>，并在 5 个币种上全历史回测。</p>
+      <p>口径：{ENTRY_BAR} 入场，{FILTER_BAR} 过滤，固定风险金 <strong>{RISK_AMOUNT}U</strong>，初始资金 <strong>{INITIAL_CAPITAL}U</strong>，本地缓存读取 <strong>{entry_limit_label()}</strong> {ENTRY_BAR} K 线。</p>
     </section>
 
     <div class="grid">
@@ -1055,7 +1065,9 @@ def main() -> None:
     payload["yearly_rows"] = yearly_frame.to_dict("records")
     JSON_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     HTML_PATH.write_text(build_html(strategy_studies, summary_frame, yearly_frame), encoding="utf-8")
+    copyfile(HTML_PATH, PROJECT_HTML_PATH)
     print(HTML_PATH)
+    print(PROJECT_HTML_PATH)
 
 
 if __name__ == "__main__":

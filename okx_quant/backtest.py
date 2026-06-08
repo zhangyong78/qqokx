@@ -230,6 +230,14 @@ class BacktestResult:
     take_profit_mode: str = "fixed"
     dynamic_two_r_break_even: bool = False
     dynamic_fee_offset_enabled: bool = True
+    ema55_slope_same_bar_reentry_block: bool = False
+    ema55_slope_dynamic_exit_requires_ema_reclaim: bool = False
+    ema55_slope_locked_reentry_requires_ema21_near: bool = False
+    ema55_slope_locked_reentry_min_r: int = 0
+    ema55_slope_locked_reentry_max_r: int = 0
+    ema55_slope_dynamic_exit_bull_bar_requires_bear_reentry: bool = False
+    ema55_slope_dynamic_exit_bull_bar_reentry_min_r: int = 0
+    ema55_slope_dynamic_exit_bull_bar_reentry_max_r: int = 0
     time_stop_break_even_enabled: bool = False
     time_stop_break_even_bars: int = 0
     trend_ema_slope_filter_min_ratio: Decimal = Decimal("0")
@@ -365,6 +373,27 @@ def _locked_r_from_exit_reason(exit_reason: str) -> int | None:
 
 def is_stop_exit_reason(exit_reason: str) -> bool:
     return exit_reason in {"stop_loss", "break_even_stop"} or _is_locked_r_exit_reason(exit_reason)
+
+
+def is_dynamic_protect_exit_reason(exit_reason: str) -> bool:
+    return exit_reason == "break_even_stop" or _is_locked_r_exit_reason(exit_reason)
+
+
+def _locked_r_matches_reentry_window(exit_reason: str, *, min_r: int, max_r: int) -> bool:
+    locked_r = _locked_r_from_exit_reason(exit_reason)
+    if locked_r is None:
+        return False
+    if locked_r < max(min_r, 1):
+        return False
+    if max_r > 0 and locked_r > max_r:
+        return False
+    return True
+
+
+def _dynamic_exit_matches_bull_bar_reentry_window(exit_reason: str, *, min_r: int, max_r: int) -> bool:
+    if max(min_r, 0) <= 0 and max_r <= 0:
+        return is_dynamic_protect_exit_reason(exit_reason)
+    return _locked_r_matches_reentry_window(exit_reason, min_r=min_r, max_r=max_r)
 
 
 def format_trade_exit_reason(exit_reason: str) -> str:
@@ -1062,6 +1091,16 @@ def _run_backtest_with_loaded_data(
         take_profit_mode=str(config.take_profit_mode),
         dynamic_two_r_break_even=bool(config.dynamic_two_r_break_even),
         dynamic_fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+        ema55_slope_same_bar_reentry_block=bool(config.ema55_slope_same_bar_reentry_block),
+        ema55_slope_dynamic_exit_requires_ema_reclaim=bool(config.ema55_slope_dynamic_exit_requires_ema_reclaim),
+        ema55_slope_locked_reentry_requires_ema21_near=bool(config.ema55_slope_locked_reentry_requires_ema21_near),
+        ema55_slope_locked_reentry_min_r=int(config.ema55_slope_locked_reentry_min_r),
+        ema55_slope_locked_reentry_max_r=int(config.ema55_slope_locked_reentry_max_r),
+        ema55_slope_dynamic_exit_bull_bar_requires_bear_reentry=bool(
+            config.ema55_slope_dynamic_exit_bull_bar_requires_bear_reentry
+        ),
+        ema55_slope_dynamic_exit_bull_bar_reentry_min_r=int(config.ema55_slope_dynamic_exit_bull_bar_reentry_min_r),
+        ema55_slope_dynamic_exit_bull_bar_reentry_max_r=int(config.ema55_slope_dynamic_exit_bull_bar_reentry_max_r),
         time_stop_break_even_enabled=bool(config.time_stop_break_even_enabled),
         time_stop_break_even_bars=int(config.resolved_time_stop_break_even_bars()),
         trend_ema_slope_filter_min_ratio=Decimal(str(config.trend_ema_slope_filter_min_ratio)),
@@ -1855,22 +1894,28 @@ def _run_ema55_slope_short_backtest(
 
     closes = [candle.close for candle in candles]
     ema_values = moving_average(closes, int(config.ema_period), "ema")
+    ema21_values = moving_average(closes, 21, "ema")
     atr_values = atr(candles, int(config.atr_period))
     trades: list[BacktestTrade] = []
     open_position: _OpenPosition | None = None
     entry_slope_threshold_ratio = Decimal(str(config.trend_ema_slope_filter_min_ratio))
     dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
+    reentry_reclaim_state: str | None = None
+    reentry_ema21_near_state: str | None = None
+    reentry_bearish_bar_required = False
 
     for index in range(trade_start_index, len(candles)):
         candle = candles[index]
         current_ema = ema_values[index]
+        current_ema21 = ema21_values[index] if index < len(ema21_values) else None
         previous_ema = ema_values[index - 1] if index > 0 else None
         atr_value = atr_values[index] if index < len(atr_values) else None
-        if current_ema is None or previous_ema is None or atr_value is None or atr_value <= 0:
+        if current_ema is None or previous_ema is None or current_ema21 is None or atr_value is None or atr_value <= 0:
             continue
 
         slope = current_ema - previous_ema
         slope_ratio = slope / current_ema if current_ema != 0 else None
+        exited_this_bar = False
 
         if open_position is not None:
             closed_trade = _try_close_position(
@@ -1883,6 +1928,31 @@ def _run_ema55_slope_short_backtest(
             if closed_trade is not None:
                 trades.append(closed_trade)
                 open_position = None
+                exited_this_bar = True
+                if (
+                    config.ema55_slope_dynamic_exit_requires_ema_reclaim
+                    and is_dynamic_protect_exit_reason(closed_trade.exit_reason)
+                ):
+                    reentry_reclaim_state = "await_reclaim_above_ema"
+                if (
+                    config.ema55_slope_locked_reentry_requires_ema21_near
+                    and _locked_r_matches_reentry_window(
+                        closed_trade.exit_reason,
+                        min_r=int(config.ema55_slope_locked_reentry_min_r),
+                        max_r=int(config.ema55_slope_locked_reentry_max_r),
+                    )
+                ):
+                    reentry_ema21_near_state = "await_near_ema21"
+                if (
+                    config.ema55_slope_dynamic_exit_bull_bar_requires_bear_reentry
+                    and _dynamic_exit_matches_bull_bar_reentry_window(
+                        closed_trade.exit_reason,
+                        min_r=int(config.ema55_slope_dynamic_exit_bull_bar_reentry_min_r),
+                        max_r=int(config.ema55_slope_dynamic_exit_bull_bar_reentry_max_r),
+                    )
+                    and candle.close > candle.open
+                ):
+                    reentry_bearish_bar_required = True
 
         if open_position is not None and slope > 0:
             exit_price_raw = snap_to_increment(candle.close, instrument.tick_size, "nearest")
@@ -1906,6 +1976,7 @@ def _run_ema55_slope_short_backtest(
                 )
             )
             open_position = None
+            exited_this_bar = True
 
         if (
             open_position is not None
@@ -1913,9 +1984,30 @@ def _run_ema55_slope_short_backtest(
             or slope_ratio > entry_slope_threshold_ratio
         ):
             continue
+        if config.ema55_slope_same_bar_reentry_block and exited_this_bar:
+            continue
+        if reentry_reclaim_state is not None:
+            if reentry_reclaim_state == "await_reclaim_above_ema":
+                if candle.close >= current_ema:
+                    reentry_reclaim_state = "await_rebreak_below_ema"
+                continue
+            if reentry_reclaim_state == "await_rebreak_below_ema" and candle.close >= current_ema:
+                continue
+            reentry_reclaim_state = None
+        if reentry_ema21_near_state is not None:
+            near_threshold = atr_value * Decimal("0.3")
+            if reentry_ema21_near_state == "await_near_ema21":
+                if abs(candle.close - current_ema21) <= near_threshold:
+                    reentry_ema21_near_state = "await_rebreak_below_ema21"
+                continue
+            if reentry_ema21_near_state == "await_rebreak_below_ema21" and candle.close >= current_ema21:
+                continue
+            reentry_ema21_near_state = None
         if direction_filter_bias is not None and index < len(direction_filter_bias):
             if not _direction_filter_allows_signal(direction_filter_bias[index], "short"):
                 continue
+        if reentry_bearish_bar_required and candle.close >= candle.open:
+            continue
 
         protection = build_protection_plan(
             instrument=instrument,
@@ -1958,6 +2050,9 @@ def _run_ema55_slope_short_backtest(
             time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
             apply_entry_slippage=True,
         )
+        reentry_reclaim_state = None
+        if reentry_bearish_bar_required and candle.close < candle.open:
+            reentry_bearish_bar_required = False
 
     return trades, _build_terminal_open_position(open_position, candles)
 
@@ -4009,6 +4104,31 @@ def _append_backtest_strategy_notes(
             "（按单根 EMA 斜率 / 当前 EMA 计算，需小于等于该负值才开空）"
         )
         _append_backtest_dynamic_take_profit_lines(lines, result)
+        if result.ema55_slope_same_bar_reentry_block:
+            lines.append("再入场约束：本根 K 线若刚刚平仓，则本根禁止再次开空。")
+        if result.ema55_slope_dynamic_exit_requires_ema_reclaim:
+            lines.append("再入场约束：若因保本或锁盈类动态保护平仓，必须先重新站上 EMA55，再次跌回 EMA55 下方后才允许重开。")
+        if result.ema55_slope_locked_reentry_requires_ema21_near:
+            min_r = max(int(result.ema55_slope_locked_reentry_min_r), 1)
+            max_r = int(result.ema55_slope_locked_reentry_max_r)
+            range_text = f"{min_r}R+" if max_r <= 0 else (f"{min_r}R" if max_r == min_r else f"{min_r}R-{max_r}R")
+            lines.append(
+                "再入场约束：若因锁盈类动态保护平仓，且锁盈档位命中 "
+                f"{range_text}，则必须先反抽接近 EMA21（距离不超过 0.3 ATR），再次跌回 EMA21 下方后才允许重开。"
+            )
+        if result.ema55_slope_dynamic_exit_bull_bar_requires_bear_reentry:
+            min_r = max(int(result.ema55_slope_dynamic_exit_bull_bar_reentry_min_r), 0)
+            max_r = int(result.ema55_slope_dynamic_exit_bull_bar_reentry_max_r)
+            if min_r <= 0 and max_r <= 0:
+                prefix = "若因保本或锁盈类动态保护平仓"
+            else:
+                range_text = f"{max(min_r, 1)}R+" if max_r <= 0 else (
+                    f"{max(min_r, 1)}R" if max_r == max(min_r, 1) else f"{max(min_r, 1)}R-{max_r}R"
+                )
+                prefix = f"若因锁盈类动态保护平仓，且锁盈档位命中 {range_text}"
+            lines.append(
+                f"再入场约束：{prefix}，且当根 K 线收阳，则后续必须等到新的阴线且做空条件仍成立时才允许重开；若当根收阴，则仍按原逻辑允许继续做空。"
+            )
         lines.append("方向说明：本策略只做空，不做多。")
         return
     if family == "body_retest_short":

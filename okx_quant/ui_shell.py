@@ -231,6 +231,7 @@ from okx_quant.strategy_parameters import (
     strategy_is_parameter_editable,
     strategy_uses_parameter,
 )
+from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
 from okx_quant.strategy_ui_schema import (
     build_strategy_widget_visibility,
     strategy_forces_follow_signal,
@@ -2093,7 +2094,7 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
         self._refresh_api_combo_state()
         ttk.Checkbutton(
             master,
-            text="导入后自动启动策略",
+            text="导入后自动启动策略（启动后会进入运行中策略）",
             variable=self.auto_start_var,
         ).grid(row=2, column=0, sticky="w", pady=(10, 0))
         item_box = ttk.LabelFrame(master, text=f"导入条目（共 {len(self._items)} 条）", padding=10)
@@ -4078,6 +4079,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             state="readonly",
         )
         self.symbol_combo.grid(row=row, column=3, sticky="ew")
+        self.symbol_combo.bind("<<ComboboxSelected>>", self._on_strategy_symbol_selected)
 
         row += 1
         self._bar_label = ttk.Label(launch_form, text="K线周期")
