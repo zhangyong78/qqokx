@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, BooleanVar, Canvas, StringVar, Text, Toplevel, X, Y
+from tkinter import BOTH, END, LEFT, RIGHT, BooleanVar, Canvas, PanedWindow, StringVar, Text, Toplevel, X, Y
 from tkinter import filedialog, messagebox, ttk
 
 from okx_quant.backtest import (
@@ -27,8 +28,12 @@ from okx_quant.backtest import (
     run_backtest,
     run_backtest_batch,
 )
-from okx_quant.backtest_audit import describe_backtest_export_artifacts
-from okx_quant.backtest_export import export_batch_backtest_report, export_single_backtest_report
+from okx_quant.backtest_audit import describe_backtest_export_artifacts, single_backtest_artifact_paths
+from okx_quant.backtest_export import (
+    build_backtest_focus_lines,
+    export_batch_backtest_report,
+    export_single_backtest_report,
+)
 from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_pool_profile_name
 from okx_quant.candle_cache_verify import CacheVerifyOutcome, verify_and_repair_cached_candles
 from okx_quant.models import Instrument, StrategyConfig, moving_average_display_label
@@ -44,6 +49,7 @@ from okx_quant.strategy_profiles import StrategyProfile, read_strategy_bundle
 from okx_quant.strategy_catalog import (
     ALL_STRATEGY_DEFINITIONS,
     BACKTEST_STRATEGY_DEFINITIONS,
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_DYNAMIC_ID,
     StrategyDefinition,
     get_strategy_definition,
@@ -130,6 +136,9 @@ MTF_REVERSAL_MODE_OPTIONS = {
 }
 MTF_REVERSAL_MODE_VALUE_TO_LABEL = {value: label for label, value in MTF_REVERSAL_MODE_OPTIONS.items()}
 MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT = Decimal("0.50")
+DEFAULT_BACKTEST_CHART_VISIBLE_CANDLES = 900
+BACKTEST_CHART_FAST_RENDER_CANDLES = 800
+BACKTEST_CHART_FULL_RENDER_CANDLES = 2200
 TAKE_PROFIT_MODE_VALUE_TO_LABEL = {value: label for label, value in TAKE_PROFIT_MODE_OPTIONS.items()}
 MOVING_AVERAGE_TYPE_OPTIONS = ("EMA", "MA")
 DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE = {
@@ -209,6 +218,8 @@ class BacktestLaunchState:
     body_retest_body_atr_limit: str = "1.0"
     body_retest_watch_bars: str = "6"
     ema55_slope_exit_enabled: bool = True
+    ema55_slope_lock_profit_enabled: bool = True
+    ema55_slope_lock_profit_trigger_r: str = "2"
     maker_fee_percent: str = DEFAULT_MAKER_FEE_PERCENT
     taker_fee_percent: str = DEFAULT_TAKER_FEE_PERCENT
     initial_capital: str = "10000"
@@ -561,18 +572,48 @@ def _backtest_snapshot_range_text(snapshot: _BacktestSnapshot) -> tuple[str, str
     return start_text, end_text
 
 
+def _build_backtest_candle_scope_text(snapshot: _BacktestSnapshot) -> str:
+    candle_count_text = f"{snapshot.candle_count:,}根"
+    if snapshot.candle_limit <= 0:
+        return f"{candle_count_text}（全量）"
+    if snapshot.candle_count == snapshot.candle_limit:
+        return candle_count_text
+    return f"{candle_count_text}（上限 {snapshot.candle_limit:,}）"
+
+
+def _build_backtest_period_summary(snapshot: _BacktestSnapshot) -> str:
+    start_text, end_text = _backtest_snapshot_range_text(snapshot)
+    return (
+        f"{start_text} -> {end_text} | "
+        f"{_normalize_backtest_bar_label(snapshot.config.bar)} | "
+        f"{_build_backtest_candle_scope_text(snapshot)}"
+    )
+
+
+def _build_backtest_header_summary(snapshot: _BacktestSnapshot) -> str:
+    report = snapshot.report
+    start_text, end_text = _backtest_snapshot_range_text(snapshot)
+    signal_label = SIGNAL_VALUE_TO_LABEL.get(snapshot.config.signal_mode, snapshot.config.signal_mode)
+    return (
+        f"编号：{snapshot.snapshot_id} | 时间：{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
+        f"策略：{_strategy_display_name(snapshot.config)} | 交易对：{snapshot.config.inst_id} | "
+        f"区间：{start_text} -> {end_text} | K线：{_normalize_backtest_bar_label(snapshot.config.bar)} | "
+        f"样本：{_build_backtest_candle_scope_text(snapshot)} | 方向：{signal_label} | "
+        f"交易次数：{report.total_trades} | 胜率：{format_decimal_fixed(report.win_rate, 2)}% | "
+        f"总盈亏：{format_decimal_fixed(report.total_pnl, 4)} | "
+        f"最大回撤：{format_decimal_fixed(report.max_drawdown, 4)}"
+    )
+
+
 def _build_backtest_compare_row(snapshot: _BacktestSnapshot) -> tuple[str, ...]:
     report = snapshot.report
     config = snapshot.config
-    start_text, end_text = _backtest_snapshot_range_text(snapshot)
     return (
         snapshot.snapshot_id,
-        snapshot.created_at.strftime("%m-%d %H:%M:%S"),
-        start_text,
-        end_text,
+        snapshot.created_at.strftime("%m-%d %H:%M"),
         _strategy_display_name(config),
         config.inst_id,
-        _normalize_backtest_bar_label(config.bar),
+        _build_backtest_period_summary(snapshot),
         _build_backtest_param_summary(
             config,
             maker_fee_rate=snapshot.maker_fee_rate,
@@ -585,6 +626,37 @@ def _build_backtest_compare_row(snapshot: _BacktestSnapshot) -> tuple[str, ...]:
     )
 
 
+def _configure_backtest_compare_tree(tree: ttk.Treeview) -> None:
+    columns = (
+        ("id", "编号", 54, "center", False),
+        ("time", "回测时间", 112, "center", False),
+        ("strategy", "策略", 150, "w", False),
+        ("symbol", "交易对", 122, "center", False),
+        ("period", "回测区间 / K线", 320, "w", True),
+        ("params", "参数摘要", 520, "w", True),
+        ("trades", "交易数", 68, "e", False),
+        ("win_rate", "胜率", 80, "e", False),
+        ("pnl", "总盈亏", 100, "e", False),
+        ("drawdown", "最大回撤", 100, "e", False),
+    )
+    for column_id, heading, width, anchor, stretch in columns:
+        tree.heading(column_id, text=heading)
+        tree.column(column_id, width=width, anchor=anchor, stretch=stretch)
+
+
+def _btc_ema55_slope_exit_summary(config: StrategyConfig) -> str:
+    trigger_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
+    slope_exit = "开" if config.ema55_slope_exit_enabled else "关"
+    lock_profit = "开" if config.ema55_slope_lock_profit_enabled else "关"
+    return f"斜率转正平仓={slope_exit} / {trigger_r}R锁盈利+双向手续费={lock_profit}"
+
+
+def _backtest_exit_mode_label(config: StrategyConfig) -> str:
+    if config.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
+        return _btc_ema55_slope_exit_summary(config)
+    return "动态止盈" if config.take_profit_mode == "dynamic" else "固定止盈"
+
+
 def _build_backtest_param_summary(
     config: StrategyConfig,
     *,
@@ -595,17 +667,31 @@ def _build_backtest_param_summary(
     trend_label = config.trend_ema_label()
     reference_label = config.entry_reference_line_label()
     profile = get_strategy_runtime_profile(config.strategy_id)
+
+    risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
+    sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
+    if config.backtest_sizing_mode == "risk_percent":
+        sizing_text = f"{sizing_label}{format_decimal(config.backtest_risk_percent or Decimal('0'))}%"
+    elif config.backtest_sizing_mode == "fixed_size":
+        sizing_text = f"{sizing_label}{format_decimal(config.order_size)}"
+    else:
+        sizing_text = f"{sizing_label}{risk_text}"
+
+    if config.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
+        return (
+            f"{fast_label}/{trend_label} / ATR{config.atr_period} / "
+            f"SLx{format_decimal(config.atr_stop_multiplier)} / "
+            f"平仓规则{_btc_ema55_slope_exit_summary(config)} / "
+            f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
+            f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
+            f"{'复利' if config.backtest_compounding else '不复利'} / "
+            f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
+            f"{_format_backtest_slippage_summary(config)} / "
+            f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
+        )
+
     if profile.uses_dynamic_orders or strategy_is_cross_family(config.strategy_id):
-        risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
-        sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
-        if config.backtest_sizing_mode == "risk_percent":
-            sizing_text = f"{sizing_label}{format_decimal(config.backtest_risk_percent or Decimal('0'))}%"
-        elif config.backtest_sizing_mode == "fixed_size":
-            sizing_text = f"{sizing_label}{format_decimal(config.order_size)}"
-        else:
-            sizing_text = f"{sizing_label}{risk_text}"
-        take_profit_label = "动态止盈" if config.take_profit_mode == "dynamic" else "固定止盈"
-        extra_parts = [take_profit_label]
+        extra_parts = [_backtest_exit_mode_label(config)]
         if config.take_profit_mode == "dynamic":
             extra_parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
             extra_parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
@@ -632,13 +718,6 @@ def _build_backtest_param_summary(
         )
 
     if profile.family == "ema5_ema8":
-        sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
-        if config.backtest_sizing_mode == "risk_percent":
-            sizing_text = f"{sizing_label}{format_decimal(config.backtest_risk_percent or Decimal('0'))}%"
-        elif config.backtest_sizing_mode == "fixed_size":
-            sizing_text = f"{sizing_label}{format_decimal(config.order_size)}"
-        else:
-            sizing_text = f"{sizing_label}{format_decimal(config.risk_amount or Decimal('0'))}"
         return (
             f"4H固定 / {fast_label}/{trend_label}/EMA{config.big_ema_period} / "
             f"{trend_label}动态止损 / 方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / "
@@ -649,14 +728,6 @@ def _build_backtest_param_summary(
             f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
         )
 
-    risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
-    sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
-    if config.backtest_sizing_mode == "risk_percent":
-        sizing_text = f"{sizing_label}{format_decimal(config.backtest_risk_percent or Decimal('0'))}%"
-    elif config.backtest_sizing_mode == "fixed_size":
-        sizing_text = f"{sizing_label}{format_decimal(config.order_size)}"
-    else:
-        sizing_text = f"{sizing_label}{risk_text}"
     return (
         f"{fast_label}/{trend_label}/EMA{config.big_ema_period} / ATR{config.atr_period} / "
         f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
@@ -667,7 +738,6 @@ def _build_backtest_param_summary(
         f"{_format_backtest_slippage_summary(config)} / "
         f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
     )
-
 def _backtest_export_detail_lines(export_path: str | None) -> list[str]:
     if not export_path:
         return []
@@ -686,17 +756,46 @@ def _build_backtest_compare_detail(snapshot: _BacktestSnapshot) -> str:
         f"回测时间：{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
         f"策略：{strategy_name}",
         f"交易对：{config.inst_id}",
+        f"回测区间：{start_text} -> {end_text}",
         f"K线周期：{_normalize_backtest_bar_label(config.bar)}",
-        f"回测K线数：{_format_backtest_candle_limit(snapshot.candle_limit)}",
+        f"K线根数：{_build_backtest_candle_scope_text(snapshot)}",
         f"参数：{_build_backtest_param_summary(config, maker_fee_rate=snapshot.maker_fee_rate, taker_fee_rate=snapshot.taker_fee_rate)}",
-        f"开始时间：{start_text}",
-        f"结束时间：{end_text}",
     ]
     lines.extend(_backtest_export_detail_lines(snapshot.export_path))
     lines.extend([
         "",
         snapshot.report_text,
     ])
+    return "\n".join(lines)
+
+
+def _build_backtest_report_copy_text(snapshot: _BacktestSnapshot) -> str:
+    if snapshot.result is None:
+        return snapshot.report_text
+    report_path = Path(snapshot.export_path) if snapshot.export_path else None
+    artifact_paths = None
+    if report_path is not None:
+        try:
+            artifact_paths = single_backtest_artifact_paths(report_path)
+        except Exception:
+            artifact_paths = None
+    lines = [
+        "交易员速览",
+        "=" * 72,
+        *build_backtest_focus_lines(
+            snapshot.result,
+            snapshot.config,
+            snapshot.candle_limit,
+            exported_at=snapshot.created_at,
+            snapshot_id=snapshot.snapshot_id,
+            report_path=report_path,
+            artifact_paths=artifact_paths,
+        ),
+        "",
+        "完整明细",
+        "-" * 72,
+        format_backtest_report(snapshot.result),
+    ]
     return "\n".join(lines)
 
 
@@ -1058,6 +1157,8 @@ def _batch_mode_for_snapshots(snapshots: list[_BacktestSnapshot]) -> str:
     config = snapshots[0].config
     if is_strategy_pool_config(config):
         return "strategy_pool"
+    if get_strategy_runtime_profile(config.strategy_id).family == "ema55_slope_short":
+        return "atr_period_matrix"
     if strategy_uses_dynamic_orders(config.strategy_id):
         if config.take_profit_mode == "dynamic":
             return "dynamic_entries"
@@ -1091,6 +1192,8 @@ def _snapshot_sort_key(snapshot: _BacktestSnapshot, batch_mode: str) -> tuple[ob
             config.atr_stop_multiplier,
             config.atr_take_multiplier,
         )
+    if batch_mode == "atr_period_matrix":
+        return (config.atr_stop_multiplier, config.atr_period)
     return (config.atr_stop_multiplier, config.atr_take_multiplier)
 
 
@@ -1126,6 +1229,9 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "max_entries_per_trend": config.max_entries_per_trend,
         "dynamic_two_r_break_even": config.dynamic_two_r_break_even,
         "dynamic_fee_offset_enabled": config.dynamic_fee_offset_enabled,
+        "ema55_slope_exit_enabled": config.ema55_slope_exit_enabled,
+        "ema55_slope_lock_profit_enabled": config.ema55_slope_lock_profit_enabled,
+        "ema55_slope_lock_profit_trigger_r": int(config.ema55_slope_lock_profit_trigger_r),
         "trend_ema_slope_filter_enabled": config.trend_ema_slope_filter_enabled,
         "trend_ema_slope_filter_lookback_bars": config.trend_ema_slope_filter_lookback_bars,
         "trend_ema_slope_filter_min_ratio": str(config.trend_ema_slope_filter_min_ratio),
@@ -1251,6 +1357,9 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         max_entries_per_trend=int(payload.get("max_entries_per_trend", 1)),
         dynamic_two_r_break_even=bool(payload.get("dynamic_two_r_break_even", True)),
         dynamic_fee_offset_enabled=bool(payload.get("dynamic_fee_offset_enabled", True)),
+        ema55_slope_exit_enabled=coerce_bool(payload.get("ema55_slope_exit_enabled"), True),
+        ema55_slope_lock_profit_enabled=coerce_bool(payload.get("ema55_slope_lock_profit_enabled"), False),
+        ema55_slope_lock_profit_trigger_r=int(payload.get("ema55_slope_lock_profit_trigger_r", 2)),
         trend_ema_slope_filter_enabled=coerce_bool(payload.get("trend_ema_slope_filter_enabled"), True),
         trend_ema_slope_filter_lookback_bars=int(payload.get("trend_ema_slope_filter_lookback_bars", 5)),
         trend_ema_slope_filter_min_ratio=Decimal(str(payload.get("trend_ema_slope_filter_min_ratio", "0"))),
@@ -1484,34 +1593,11 @@ class BacktestCompareOverviewWindow:
 
         self.tree = ttk.Treeview(
             tree_frame,
-            columns=("id", "time", "start", "end", "strategy", "symbol", "bar", "params", "trades", "win_rate", "pnl", "drawdown"),
+            columns=("id", "time", "strategy", "symbol", "period", "params", "trades", "win_rate", "pnl", "drawdown"),
             show="headings",
             selectmode="browse",
         )
-        self.tree.heading("id", text="编号")
-        self.tree.heading("time", text="回测时间")
-        self.tree.heading("start", text="开始时间")
-        self.tree.heading("end", text="结束时间")
-        self.tree.heading("strategy", text="策略")
-        self.tree.heading("symbol", text="交易对")
-        self.tree.heading("bar", text="周期")
-        self.tree.heading("params", text="参数摘要")
-        self.tree.heading("trades", text="交易数")
-        self.tree.heading("win_rate", text="胜率")
-        self.tree.heading("pnl", text="总盈亏")
-        self.tree.heading("drawdown", text="最大回撤")
-        self.tree.column("id", width=70, anchor="center")
-        self.tree.column("time", width=150, anchor="center")
-        self.tree.column("start", width=145, anchor="center")
-        self.tree.column("end", width=145, anchor="center")
-        self.tree.column("strategy", width=120, anchor="center")
-        self.tree.column("symbol", width=140, anchor="center")
-        self.tree.column("bar", width=70, anchor="center")
-        self.tree.column("params", width=280, anchor="w")
-        self.tree.column("trades", width=70, anchor="e")
-        self.tree.column("win_rate", width=80, anchor="e")
-        self.tree.column("pnl", width=110, anchor="e")
-        self.tree.column("drawdown", width=110, anchor="e")
+        _configure_backtest_compare_tree(self.tree)
         tree_scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         tree_scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(
@@ -1644,6 +1730,8 @@ class BacktestWindow:
         self.body_retest_body_atr_limit = StringVar(value=initial_state.body_retest_body_atr_limit)
         self.body_retest_watch_bars = StringVar(value=initial_state.body_retest_watch_bars)
         self.ema55_slope_exit_enabled = BooleanVar(value=initial_state.ema55_slope_exit_enabled)
+        self.ema55_slope_lock_profit_enabled = BooleanVar(value=initial_state.ema55_slope_lock_profit_enabled)
+        self.ema55_slope_lock_profit_trigger_r = StringVar(value=initial_state.ema55_slope_lock_profit_trigger_r)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
         self.position_mode_label = StringVar(value=initial_state.position_mode_label)
@@ -1680,6 +1768,7 @@ class BacktestWindow:
         self._chart_zoom_metrics_label: ttk.Label | None = None
         self._chart_redraw_job: str | None = None
         self._chart_canvas_redraw_jobs: dict[int, str] = {}
+        self._chart_canvas_finalize_jobs: dict[int, str] = {}
         self._main_chart_view = _ChartViewport()
         self._zoom_chart_view = _ChartViewport()
         self._chart_render_states: dict[int, _ChartRenderState] = {}
@@ -1729,6 +1818,20 @@ class BacktestWindow:
     def _close(self) -> None:
         self._save_strategy_parameter_draft()
         self._closed = True
+        if self._chart_redraw_job is not None and self._widget_exists(self.window):
+            try:
+                self.window.after_cancel(self._chart_redraw_job)
+            except Exception:
+                pass
+            self._chart_redraw_job = None
+        if self._widget_exists(self.window):
+            for job_map in (self._chart_canvas_redraw_jobs, self._chart_canvas_finalize_jobs):
+                for job in list(job_map.values()):
+                    try:
+                        self.window.after_cancel(job)
+                    except Exception:
+                        pass
+                job_map.clear()
         if self._widget_exists(getattr(self, "_chart_zoom_window", None)):
             try:
                 self._chart_zoom_window.destroy()
@@ -1744,6 +1847,20 @@ class BacktestWindow:
     @staticmethod
     def _strategy_supports_dynamic_take_profit(strategy_id: str) -> bool:
         return strategy_supports_dynamic_take_profit(strategy_id)
+
+    @staticmethod
+    def _build_backtest_panedwindow(parent: object, *, orient: str) -> PanedWindow:
+        # 关闭实时重排，拖动 sash 时只显示预览，避免 Treeview 和图表在拖动期间连续重布局。
+        return PanedWindow(
+            parent,
+            orient=orient,
+            opaqueresize=False,
+            sashwidth=10,
+            sashrelief="flat",
+            bd=0,
+            relief="flat",
+            bg="#d8dee4",
+        )
 
     def _bind_responsive_wrap(
         self,
@@ -1840,6 +1957,8 @@ class BacktestWindow:
             "body_retest_body_atr_limit": self.body_retest_body_atr_limit,
             "body_retest_watch_bars": self.body_retest_watch_bars,
             "ema55_slope_exit_enabled": self.ema55_slope_exit_enabled,
+            "ema55_slope_lock_profit_enabled": self.ema55_slope_lock_profit_enabled,
+            "ema55_slope_lock_profit_trigger_r": self.ema55_slope_lock_profit_trigger_r,
             "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
             "time_stop_break_even_bars": self.time_stop_break_even_bars,
             "hold_close_exit_bars": self.hold_close_exit_bars,
@@ -2416,6 +2535,40 @@ class BacktestWindow:
         self.time_stop_break_even_bars_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
 
         row += 1
+        self.ema55_slope_exit_conditions_caption = ttk.Label(controls, text="平仓条件")
+        self.ema55_slope_exit_conditions_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.ema55_slope_exit_enabled_check = ttk.Checkbutton(
+            controls,
+            text="EMA55 斜率重新转正时，按收盘价平仓",
+            variable=self.ema55_slope_exit_enabled,
+        )
+        self.ema55_slope_exit_enabled_check.grid(row=row, column=1, columnspan=5, sticky="w", pady=(8, 0))
+
+        row += 1
+        self.ema55_slope_lock_profit_enabled_check = ttk.Checkbutton(
+            controls,
+            text="启用 N R 锁盈利 + 双向手续费",
+            variable=self.ema55_slope_lock_profit_enabled,
+            command=self._sync_ema55_slope_exit_condition_controls,
+        )
+        self.ema55_slope_lock_profit_enabled_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.ema55_slope_lock_profit_trigger_r_label = ttk.Label(controls, text="锁盈利触发R")
+        self.ema55_slope_lock_profit_trigger_r_label.grid(row=row, column=2, sticky="e", pady=(8, 0))
+        self.ema55_slope_lock_profit_trigger_r_entry = ttk.Entry(
+            controls,
+            textvariable=self.ema55_slope_lock_profit_trigger_r,
+        )
+        self.ema55_slope_lock_profit_trigger_r_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
+
+        row += 1
+        self.ema55_slope_exit_conditions_hint = ttk.Label(
+            controls,
+            text="锁盈利规则：价格先到 N R，再把止损上移到 (N-1)R + 双向 Taker 手续费；后续每新增 1R，继续逐级上移。",
+            foreground="#57606a",
+        )
+        self.ema55_slope_exit_conditions_hint.grid(row=row, column=0, columnspan=6, sticky="w", pady=(2, 0))
+
+        row += 1
         self.hold_close_exit_bars_caption = ttk.Label(controls, text="满N根K线收盘价平仓")
         self.hold_close_exit_bars_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
         self.hold_close_exit_bars_entry = ttk.Entry(controls, textvariable=self.hold_close_exit_bars)
@@ -2556,34 +2709,35 @@ class BacktestWindow:
         self._history_sync_status_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
         self._bind_responsive_wrap(self._history_sync_status_label, batch_note, padding=36, min_wrap=360)
 
-        content_pane = ttk.Panedwindow(self.window, orient="vertical")
+        content_pane = self._build_backtest_panedwindow(self.window, orient="vertical")
         content_pane.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
         self._content_pane = content_pane
 
-        report_frame = ttk.Panedwindow(content_pane, orient="horizontal")
+        report_frame = self._build_backtest_panedwindow(content_pane, orient="horizontal")
 
         summary_frame = ttk.LabelFrame(report_frame, text="回测报告", padding=12)
         trades_frame = ttk.LabelFrame(report_frame, text="交易明细", padding=12)
-        report_frame.add(summary_frame, weight=1)
-        report_frame.add(trades_frame, weight=1)
-        content_pane.add(report_frame, weight=2)
+        report_frame.add(summary_frame, stretch="always")
+        report_frame.add(trades_frame, stretch="always")
+        content_pane.add(report_frame, stretch="always")
 
         summary_frame.columnconfigure(0, weight=1)
-        summary_frame.rowconfigure(0, weight=1)
+        summary_frame.rowconfigure(1, weight=1)
         trades_frame.columnconfigure(0, weight=1)
         trades_frame.rowconfigure(0, weight=1)
 
+        self._report_summary_label = ttk.Label(summary_frame, textvariable=self.report_summary, justify="left")
+        self._report_summary_label.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self._bind_responsive_wrap(self._report_summary_label, summary_frame, padding=28, min_wrap=280)
+
         report_notebook = ttk.Notebook(summary_frame)
-        report_notebook.grid(row=0, column=0, sticky="nsew")
+        report_notebook.grid(row=1, column=0, sticky="nsew")
 
         report_tab = ttk.Frame(report_notebook, padding=8)
         report_tab.columnconfigure(0, weight=1)
-        report_tab.rowconfigure(1, weight=1)
-        self._report_summary_label = ttk.Label(report_tab, textvariable=self.report_summary, justify="left")
-        self._report_summary_label.grid(row=0, column=0, sticky="w", pady=(0, 10))
-        self._bind_responsive_wrap(self._report_summary_label, report_tab, padding=28, min_wrap=280)
+        report_tab.rowconfigure(0, weight=1)
         self.report_text = Text(report_tab, height=11, wrap="word", font=("Consolas", 10))
-        self.report_text.grid(row=1, column=0, sticky="nsew")
+        self.report_text.grid(row=0, column=0, sticky="nsew")
         report_notebook.add(report_tab, text="当前报告")
 
         compare_tab = ttk.Frame(report_notebook, padding=8)
@@ -2605,34 +2759,11 @@ class BacktestWindow:
 
         self.compare_tree = ttk.Treeview(
             compare_tree_frame,
-            columns=("id", "time", "start", "end", "strategy", "symbol", "bar", "params", "trades", "win_rate", "pnl", "drawdown"),
+            columns=("id", "time", "strategy", "symbol", "period", "params", "trades", "win_rate", "pnl", "drawdown"),
             show="headings",
             selectmode="browse",
         )
-        self.compare_tree.heading("id", text="编号")
-        self.compare_tree.heading("time", text="回测时间")
-        self.compare_tree.heading("start", text="开始时间")
-        self.compare_tree.heading("end", text="结束时间")
-        self.compare_tree.heading("strategy", text="策略")
-        self.compare_tree.heading("symbol", text="交易对")
-        self.compare_tree.heading("bar", text="周期")
-        self.compare_tree.heading("params", text="参数摘要")
-        self.compare_tree.heading("trades", text="交易数")
-        self.compare_tree.heading("win_rate", text="胜率")
-        self.compare_tree.heading("pnl", text="总盈亏")
-        self.compare_tree.heading("drawdown", text="最大回撤")
-        self.compare_tree.column("id", width=60, anchor="center")
-        self.compare_tree.column("time", width=140, anchor="center")
-        self.compare_tree.column("start", width=135, anchor="center")
-        self.compare_tree.column("end", width=135, anchor="center")
-        self.compare_tree.column("strategy", width=110, anchor="center")
-        self.compare_tree.column("symbol", width=130, anchor="center")
-        self.compare_tree.column("bar", width=70, anchor="center")
-        self.compare_tree.column("params", width=220, anchor="w")
-        self.compare_tree.column("trades", width=70, anchor="e")
-        self.compare_tree.column("win_rate", width=80, anchor="e")
-        self.compare_tree.column("pnl", width=100, anchor="e")
-        self.compare_tree.column("drawdown", width=100, anchor="e")
+        _configure_backtest_compare_tree(self.compare_tree)
         compare_tree_xscroll = ttk.Scrollbar(compare_tree_frame, orient="horizontal", command=self.compare_tree.xview)
         self.compare_tree.configure(xscrollcommand=compare_tree_xscroll.set)
         self.compare_tree.grid(row=0, column=0, sticky="nsew")
@@ -2952,7 +3083,7 @@ class BacktestWindow:
         self.chart_frame = ttk.LabelFrame(content_pane, text="K线图、资金曲线与止盈止损触发位置 | 暂无选中回测", padding=12)
         self.chart_frame.columnconfigure(0, weight=1)
         self.chart_frame.rowconfigure(1, weight=1)
-        content_pane.add(self.chart_frame, weight=3)
+        content_pane.add(self.chart_frame, stretch="always")
 
         chart_toolbar = ttk.Frame(self.chart_frame)
         chart_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -2972,7 +3103,7 @@ class BacktestWindow:
         self.chart_canvas = Canvas(self.chart_frame, background="#ffffff", highlightthickness=0)
         self.chart_canvas.grid(row=1, column=0, sticky="nsew")
         self.chart_canvas.bind("<Double-Button-1>", lambda *_: self.open_chart_zoom_window())
-        self.chart_canvas.bind("<Configure>", self._schedule_chart_redraw)
+        self.chart_canvas.bind("<Configure>", lambda _event, target=self.chart_canvas: self._on_chart_canvas_configure(target))
         self._bind_chart_interactions(self.chart_canvas)
         self.window.after_idle(self._initialize_backtest_content_pane)
 
@@ -3112,7 +3243,7 @@ class BacktestWindow:
             f"交易次数：{result.report.total_trades}"
         )
         self.report_text.delete("1.0", END)
-        self.report_text.insert("1.0", format_backtest_report(result))
+        self.report_text.insert("1.0", _build_backtest_report_copy_text(snapshot))
         self.trade_tree.delete(*self.trade_tree.get_children())
         for index, trade in enumerate(result.trades, start=1):
             exit_reason = _format_trade_exit_reason(trade.exit_reason)
@@ -3201,8 +3332,9 @@ class BacktestWindow:
         end_ts = self._parse_optional_datetime(self.end_time_text.get(), "结束时间", end_of_day=True)
         if start_ts is not None and end_ts is not None and start_ts > end_ts:
             raise ValueError("开始时间不能晚于结束时间")
+        config = self._build_config()
         return (
-            self._build_config(),
+            config,
             self._parse_backtest_candle_limit(self.candle_limit.get()),
             self._parse_fee_percent(self.maker_fee_percent.get(), "Maker手续费"),
             self._parse_fee_percent(self.taker_fee_percent.get(), "Taker手续费"),
@@ -3801,6 +3933,9 @@ class BacktestWindow:
         time_stop_break_even_enabled = False
         time_stop_break_even_bars = 0
         hold_close_exit_bars = 0
+        ema55_slope_exit_enabled = True
+        ema55_slope_lock_profit_enabled = False
+        ema55_slope_lock_profit_trigger_r = 2
         ema_type = str(self._resolve_strategy_parameter_value(strategy_id, "ema_type", self.ema_type.get().strip().lower()))
         trend_ema_type = str(
             self._resolve_strategy_parameter_value(strategy_id, "trend_ema_type", self.trend_ema_type.get().strip().lower())
@@ -3938,6 +4073,15 @@ class BacktestWindow:
             )
         if strategy_uses_parameter(definition.strategy_id, "hold_close_exit_bars"):
             hold_close_exit_bars = self._parse_nonnegative_int(self.hold_close_exit_bars.get(), "满N根K线收盘价平仓")
+        if strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
+            ema55_slope_exit_enabled = bool(self.ema55_slope_exit_enabled.get())
+            ema55_slope_lock_profit_enabled = bool(self.ema55_slope_lock_profit_enabled.get())
+            ema55_slope_lock_profit_trigger_r = self._parse_positive_int(
+                self.ema55_slope_lock_profit_trigger_r.get(),
+                "锁盈利触发R",
+            )
+            if ema55_slope_lock_profit_trigger_r < 2:
+                raise ValueError("锁盈利触发R 不能小于 2")
         entry_slippage_rate = self._parse_nonnegative_decimal(self.entry_slippage_percent.get(), "开仓滑点") / Decimal("100")
         exit_slippage_rate = self._parse_nonnegative_decimal(self.exit_slippage_percent.get(), "平仓滑点") / Decimal("100")
         return StrategyConfig(
@@ -3987,6 +4131,9 @@ class BacktestWindow:
             max_entries_per_trend=max_entries_per_trend,
             dynamic_two_r_break_even=dynamic_two_r_break_even,
             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+            ema55_slope_exit_enabled=ema55_slope_exit_enabled,
+            ema55_slope_lock_profit_enabled=ema55_slope_lock_profit_enabled,
+            ema55_slope_lock_profit_trigger_r=ema55_slope_lock_profit_trigger_r,
             trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
             atr_percentile_filter_max=atr_percentile_filter_max,
             body_retest_breakdown_atr_multiplier=body_retest_breakdown_atr_multiplier,
@@ -4159,6 +4306,20 @@ class BacktestWindow:
                     widget.grid()
                 else:
                     widget.grid_remove()
+            btc_slope_exit_widgets = (
+                self.ema55_slope_exit_conditions_caption,
+                self.ema55_slope_exit_enabled_check,
+                self.ema55_slope_lock_profit_enabled_check,
+                self.ema55_slope_lock_profit_trigger_r_label,
+                self.ema55_slope_lock_profit_trigger_r_entry,
+                self.ema55_slope_exit_conditions_hint,
+            )
+            show_btc_slope_exit_widgets = strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID
+            for widget in btc_slope_exit_widgets:
+                if show_btc_slope_exit_widgets:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
             max_entries_widgets = (self.max_entries_caption, self.max_entries_entry)
             for widget in max_entries_widgets:
                 if visibility.show_max_entries:
@@ -4260,6 +4421,7 @@ class BacktestWindow:
             self.entry_reference_ema_period.set("55")
         self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
+        self._sync_ema55_slope_exit_condition_controls()
         self._sync_daily_filter_controls()
         self._refresh_profile_summary_text()
         self._update_sizing_mode_widgets()
@@ -4297,6 +4459,7 @@ class BacktestWindow:
             self.backtest_profile_name.set("")
             self.backtest_profile_summary.set("")
         self._sync_dynamic_take_profit_controls()
+        self._sync_ema55_slope_exit_condition_controls()
         self._sync_daily_filter_controls()
         self._refresh_profile_summary_text()
 
@@ -4315,6 +4478,18 @@ class BacktestWindow:
         self.time_stop_break_even_bars_entry.configure(
             state="normal" if dynamic_take_profit and self.time_stop_break_even_enabled.get() else "disabled"
         )
+
+    def _sync_ema55_slope_exit_condition_controls(self) -> None:
+        if not hasattr(self, "ema55_slope_lock_profit_trigger_r_entry"):
+            return
+        definition = self._selected_strategy_definition()
+        enabled = (
+            definition.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID
+            and bool(self.ema55_slope_lock_profit_enabled.get())
+        )
+        state = "normal" if enabled else "disabled"
+        self.ema55_slope_lock_profit_trigger_r_label.configure(state=state)
+        self.ema55_slope_lock_profit_trigger_r_entry.configure(state=state)
 
     def _sync_daily_filter_controls(self) -> None:
         if not hasattr(self, "daily_filter_enabled_check"):
@@ -4444,6 +4619,9 @@ class BacktestWindow:
         self.body_retest_stop_buffer_atr_multiplier.set(format_decimal(config.body_retest_stop_buffer_atr_multiplier))
         self.body_retest_body_atr_limit.set(format_decimal(config.body_retest_body_atr_limit))
         self.body_retest_watch_bars.set(str(config.body_retest_watch_bars))
+        self.ema55_slope_exit_enabled.set(bool(config.ema55_slope_exit_enabled))
+        self.ema55_slope_lock_profit_enabled.set(bool(config.ema55_slope_lock_profit_enabled))
+        self.ema55_slope_lock_profit_trigger_r.set(str(max(int(config.ema55_slope_lock_profit_trigger_r), 2)))
         self.signal_mode_label.set(SIGNAL_VALUE_TO_LABEL.get(str(config.signal_mode), self.signal_mode_label.get()))
         self.trade_mode_label.set(_reverse_lookup_label(TRADE_MODE_OPTIONS, config.trade_mode, self.trade_mode_label.get()))
         self.position_mode_label.set(
@@ -4468,6 +4646,7 @@ class BacktestWindow:
         self._refresh_profile_summary_text()
         self._sync_daily_filter_controls()
         self._sync_dynamic_take_profit_controls()
+        self._sync_ema55_slope_exit_condition_controls()
         self._update_sizing_mode_widgets()
 
     def _append_backtest_snapshot(
@@ -4824,11 +5003,7 @@ class BacktestWindow:
             bar_text = _normalize_backtest_bar_label(current_snapshot.config.bar)
             strategy_name = _strategy_display_name(current_snapshot.config)
             entry_reference_ema = current_snapshot.config.resolved_entry_reference_ema_period()
-            take_profit_label = (
-                "动态止盈"
-                if current_snapshot.config.take_profit_mode == "dynamic"
-                else f"固定止盈 TP x{format_decimal(current_snapshot.config.atr_take_multiplier)}"
-            )
+            take_profit_label = _backtest_exit_mode_label(current_snapshot.config)
             max_entries_label = (
                 "不限(0)"
                 if current_snapshot.config.max_entries_per_trend <= 0
@@ -4841,9 +5016,8 @@ class BacktestWindow:
             )
             start_text, end_text = _backtest_snapshot_range_text(current_snapshot)
             self.matrix_summary.set(
-                f"当前参数单组回测：交易对：{symbol_text} ｜ 周期：{bar_text} ｜ 参数摘要：{param_text} ｜ "
-                f"信号方向：{signal_label} ｜ 开始时间：{start_text} ｜ 结束时间：{end_text}。"
-                "当前只保留 1 组结果，因此这里展示单组摘要卡；批量回测时会自动生成参数矩阵。"
+                "当前只保留 1 组结果，因此这里展示单组参数卡；"
+                "批量回测时会自动生成参数矩阵。"
             )
             self.matrix_grid_frame.columnconfigure(0, weight=1)
             self.matrix_grid_frame.columnconfigure(1, weight=1)
@@ -4955,6 +5129,60 @@ class BacktestWindow:
                 f"共 {len(ordered_snapshots)} 组候选，批量深测固定使用 5m 候选参数，仅保留你的方向、槽位和费用设定。"
             )
             self._render_strategy_pool_matrix(ordered_snapshots)
+            self._show_batch_heatmap_v2(batch_label)
+            return
+
+        if batch_mode == "atr_period_matrix":
+            atr_periods = sorted({snapshot.config.atr_period for snapshot in ordered_snapshots})
+            strategy_name = _strategy_display_name(ordered_snapshots[0].config)
+            self.matrix_summary.set(
+                f"{strategy_name}矩阵：{batch_label} | 交易对：{symbol_text} | 周期：{bar_text} | 参数摘要：{param_text} | "
+                f"信号方向：{signal_label} | 开始时间：{start_text} | 结束时间：{end_text} | 共 {len(ordered_snapshots)} 组结果，"
+                "行为 ATR 止损倍数 SL x1/1.5/2，列为 ATR 周期 ATR10/ATR14。单元格显示“总盈亏 | 胜率 | 交易数”，点击可加载对应回测。"
+            )
+            self.matrix_grid_frame.columnconfigure(0, weight=0)
+            ttk.Label(self.matrix_grid_frame, text="SL \\\\ ATR", anchor="center").grid(
+                row=0, column=0, sticky="nsew", padx=4, pady=4
+            )
+            for column, atr_period in enumerate(atr_periods, start=1):
+                self.matrix_grid_frame.columnconfigure(column, weight=1)
+                ttk.Label(
+                    self.matrix_grid_frame,
+                    text=f"ATR{atr_period}",
+                    anchor="center",
+                ).grid(row=0, column=column, sticky="nsew", padx=4, pady=4)
+            snapshot_map = {
+                (snapshot.config.atr_stop_multiplier, snapshot.config.atr_period): snapshot
+                for snapshot in ordered_snapshots
+            }
+            for row, stop_multiplier in enumerate(ATR_BATCH_MULTIPLIERS, start=1):
+                ttk.Label(
+                    self.matrix_grid_frame,
+                    text=f"SL x{format_decimal(stop_multiplier)}",
+                    anchor="center",
+                ).grid(row=row, column=0, sticky="nsew", padx=4, pady=4)
+                self.matrix_grid_frame.rowconfigure(row, weight=1)
+                for column, atr_period in enumerate(atr_periods, start=1):
+                    snapshot = snapshot_map.get((stop_multiplier, atr_period))
+                    if snapshot is None:
+                        ttk.Label(
+                            self.matrix_grid_frame,
+                            text="--",
+                            anchor="center",
+                            relief="groove",
+                            padding=8,
+                        ).grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
+                        continue
+                    cell_text = (
+                        f"{format_decimal_fixed(snapshot.report.total_pnl, 4)} | "
+                        f"{format_decimal_fixed(snapshot.report.win_rate, 2)}% | "
+                        f"{snapshot.report.total_trades}笔"
+                    )
+                    ttk.Button(
+                        self.matrix_grid_frame,
+                        text=cell_text,
+                        command=lambda sid=snapshot.snapshot_id: self._load_snapshot(sid),
+                    ).grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
             self._show_batch_heatmap_v2(batch_label)
             return
 
@@ -5128,6 +5356,13 @@ class BacktestWindow:
                 f"批次：{batch_label} | 交易对：{symbol_text} | 周期：{bar_text} | 方向：{signal_label} | "
                 f"指标：{metric_label} | 当前为 5m 候选策略池。"
             )
+        elif batch_mode == "atr_period_matrix":
+            render_snapshots = ordered_snapshots
+            strategy_name = _strategy_display_name(ordered_snapshots[0].config)
+            self.heatmap_summary.set(
+                f"批次：{batch_label} | 交易对：{symbol_text} | 周期：{bar_text} | 信号方向：{signal_label} | "
+                f"指标：{metric_label} | 当前为 {strategy_name} 矩阵，按 ATR 周期 x ATR 止损倍数显示 2 x 3 对比。"
+            )
         elif batch_mode == "dynamic_entries":
             render_snapshots = ordered_snapshots
             self.heatmap_summary.set(
@@ -5183,6 +5418,59 @@ class BacktestWindow:
                 )
                 canvas.tag_bind(item_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
                 canvas.tag_bind(text_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+            return
+
+        if batch_mode == "atr_period_matrix":
+            atr_periods = sorted({snapshot.config.atr_period for snapshot in render_snapshots})
+            cell_width = grid_width / max(len(atr_periods), 1)
+            cell_height = grid_height / max(len(ATR_BATCH_MULTIPLIERS), 1)
+            snapshot_map = {
+                (snapshot.config.atr_stop_multiplier, snapshot.config.atr_period): snapshot
+                for snapshot in render_snapshots
+            }
+            for column, atr_period in enumerate(atr_periods):
+                x1 = left + (column * cell_width)
+                x2 = x1 + cell_width
+                canvas.create_text(
+                    (x1 + x2) / 2,
+                    top - 22,
+                    text=f"ATR{atr_period}",
+                    fill="#57606a",
+                    font=("Microsoft YaHei UI", 10, "bold"),
+                )
+            for row, stop_multiplier in enumerate(ATR_BATCH_MULTIPLIERS):
+                y1 = top + (row * cell_height)
+                y2 = y1 + cell_height
+                canvas.create_text(
+                    left - 12,
+                    (y1 + y2) / 2,
+                    text=f"SL x{format_decimal(stop_multiplier)}",
+                    anchor="e",
+                    fill="#57606a",
+                    font=("Microsoft YaHei UI", 10, "bold"),
+                )
+                for column, atr_period in enumerate(atr_periods):
+                    x1 = left + (column * cell_width)
+                    x2 = x1 + cell_width
+                    snapshot = snapshot_map.get((stop_multiplier, atr_period))
+                    fill = "#f3f4f6"
+                    text = "--"
+                    if snapshot is not None:
+                        value = _heatmap_metric_value(snapshot, metric_label)
+                        fill = _heatmap_fill_color(value, min_value, max_value)
+                        text = _heatmap_metric_text(snapshot, metric_label)
+                    item_id = canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="#d0d7de")
+                    text_id = canvas.create_text(
+                        (x1 + x2) / 2,
+                        (y1 + y2) / 2,
+                        text=text,
+                        width=cell_width - 14,
+                        fill="#24292f",
+                        font=("Microsoft YaHei UI", 11),
+                    )
+                    if snapshot is not None:
+                        canvas.tag_bind(item_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+                        canvas.tag_bind(text_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
             return
 
         if batch_mode == "dynamic_entries":
@@ -5339,30 +5627,9 @@ class BacktestWindow:
         self._reset_chart_views()
         self._set_chart_title(self._build_chart_title_for_snapshot(snapshot))
         self._refresh_zoom_chart_header()
-        signal_label = SIGNAL_VALUE_TO_LABEL.get(snapshot.config.signal_mode, snapshot.config.signal_mode)
-        start_text, end_text = _backtest_snapshot_range_text(snapshot)
-        summary_text = (
-            f"\u7f16\u53f7\uff1a{snapshot.snapshot_id} | \u65f6\u95f4\uff1a{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
-            f"\u7b56\u7565\uff1a{_strategy_display_name(snapshot.config)} | "
-            f"\u4ea4\u6613\u5bf9\uff1a{snapshot.config.inst_id} | K\u7ebf\uff1a{_normalize_backtest_bar_label(snapshot.config.bar)} | "
-            f"M费\uff1a{_format_fee_rate_percent(snapshot.maker_fee_rate)} | T费\uff1a{_format_fee_rate_percent(snapshot.taker_fee_rate)} | "
-            f"\u5f00\u59cb\uff1a{start_text} | \u7ed3\u675f\uff1a{end_text} | "
-            f"\u4fe1\u53f7\u65b9\u5411\uff1a{signal_label} | \u4ea4\u6613\u6b21\u6570\uff1a{result.report.total_trades}"
-        )
-        open_position_summary = _build_open_position_summary(result)
-        if open_position_summary:
-            summary_text = f"{summary_text}\n{open_position_summary}"
-        minimum_order_summary = _build_backtest_minimum_order_sample_summary(result, snapshot.config)
-        if minimum_order_summary:
-            summary_text = f"{summary_text}\n{minimum_order_summary}"
-        if result.data_source_note:
-            summary_text = f"{summary_text}\n{result.data_source_note}"
-        export_lines = _backtest_export_detail_lines(snapshot.export_path)
-        if export_lines:
-            summary_text = f"{summary_text}\n" + "\n".join(export_lines)
-        self.report_summary.set(summary_text)
+        self.report_summary.set(_build_backtest_header_summary(snapshot))
         self.report_text.delete("1.0", END)
-        self.report_text.insert("1.0", format_backtest_report(result))
+        self.report_text.insert("1.0", _build_backtest_report_copy_text(snapshot))
         self._populate_trade_tree_with_result(result)
         self._populate_manual_tree(result, snapshot.config)
         if self.compare_tree.exists(snapshot.snapshot_id):
@@ -5463,7 +5730,7 @@ class BacktestWindow:
         if next_start_index == viewport.start_index:
             return
         viewport.start_index = next_start_index
-        self._schedule_canvas_redraw(canvas, delay_ms=8, fast_mode=True)
+        self._schedule_canvas_redraw(canvas, delay_ms=24, fast_mode=True)
 
     def _on_chart_release(self, canvas: Canvas) -> None:
         viewport = self._viewport_for_canvas(canvas)
@@ -5493,6 +5760,13 @@ class BacktestWindow:
     def _clear_chart_hover(self, canvas: Canvas) -> None:
         self._chart_hover_indices[id(canvas)] = None
         canvas.delete("chart-hover")
+
+    def _on_chart_canvas_configure(self, canvas: Canvas) -> None:
+        if self._latest_result is None or not self._widget_exists(canvas):
+            return
+        self._clear_chart_hover(canvas)
+        self._schedule_canvas_redraw(canvas, delay_ms=48, fast_mode=True)
+        self._schedule_canvas_finalize_redraw(canvas, delay_ms=180)
 
     def _draw_chart(self, result: BacktestResult, canvas: Canvas, *, fast_mode: bool = False) -> None:
         canvas.delete("all")
@@ -5531,11 +5805,17 @@ class BacktestWindow:
             drawdown_bottom = height - bottom
 
         viewport = self._viewport_for_canvas(canvas)
-        start_index, visible_count = _normalize_chart_viewport(
-            viewport.start_index,
-            viewport.visible_count,
-            len(candles),
-        )
+        if viewport.visible_count is None:
+            start_index, visible_count = _default_chart_viewport(
+                len(candles),
+                DEFAULT_BACKTEST_CHART_VISIBLE_CANDLES,
+            )
+        else:
+            start_index, visible_count = _normalize_chart_viewport(
+                viewport.start_index,
+                viewport.visible_count,
+                len(candles),
+            )
         viewport.start_index = start_index
         viewport.visible_count = visible_count
         end_index = start_index + visible_count
@@ -5575,15 +5855,27 @@ class BacktestWindow:
             if result.drawdown_pct_curve
             else [Decimal("0") for _ in visible_candles]
         )
+        visible_trades = [
+            trade
+            for trade in result.trades
+            if not (trade.exit_index < start_index or trade.entry_index >= end_index)
+        ]
+        visible_manual_positions = [
+            manual_position
+            for manual_position in result.manual_positions
+            if not (manual_position.handoff_index < start_index or manual_position.entry_index >= end_index)
+        ]
+        max_render_candles = BACKTEST_CHART_FAST_RENDER_CANDLES if fast_mode else BACKTEST_CHART_FULL_RENDER_CANDLES
+        render_stride = max(1, int(math.ceil(visible_count / max_render_candles)))
+        dense_fast_mode = fast_mode and (visible_count >= 220 or len(visible_trades) >= 80)
+        dense_display_mode = dense_fast_mode or render_stride > 1
 
         plotted_prices = [float(candle.high) for candle in visible_candles] + [float(candle.low) for candle in visible_candles]
         plotted_prices.extend(float(value) for value in visible_ema if value is not None)
         plotted_prices.extend(float(value) for value in visible_trend_ema if value is not None)
         plotted_prices.extend(float(value) for value in visible_reference_ema if value is not None)
         plotted_prices.extend(float(value) for value in visible_big_ema if value is not None)
-        for trade in result.trades:
-            if trade.exit_index < start_index or trade.entry_index >= end_index:
-                continue
+        for trade in visible_trades:
             plotted_prices.extend(
                 [
                     float(trade.entry_price),
@@ -5592,9 +5884,7 @@ class BacktestWindow:
                     float(trade.take_profit),
                 ]
             )
-        for manual_position in result.manual_positions:
-            if manual_position.handoff_index < start_index or manual_position.entry_index >= end_index:
-                continue
+        for manual_position in visible_manual_positions:
             plotted_prices.extend(
                 [
                     float(manual_position.entry_price),
@@ -5689,7 +5979,7 @@ class BacktestWindow:
                 fill="#7c3aed",
                 font=("Microsoft YaHei UI", 9, "bold"),
             )
-        axis_steps = 2 if fast_mode else 4
+        axis_steps = 1 if dense_fast_mode else (2 if fast_mode else 4)
         for price_value in _chart_price_axis_values(Decimal(str(price_min)), Decimal(str(price_max)), steps=axis_steps):
             y = y_for(price_value)
             canvas.create_line(left, y, width - right, y, fill="#eaeef2", dash=(2, 4))
@@ -5719,7 +6009,11 @@ class BacktestWindow:
             zero_y = y_for_net_value(Decimal("0"))
             canvas.create_line(left, zero_y, width - right, zero_y, fill="#8c959f", dash=(4, 3))
 
-        for drawdown_value in _chart_price_axis_values(Decimal(str(drawdown_min)), Decimal("0"), steps=2 if fast_mode else 3):
+        for drawdown_value in _chart_price_axis_values(
+            Decimal(str(drawdown_min)),
+            Decimal("0"),
+            steps=1 if dense_fast_mode else (2 if fast_mode else 3),
+        ):
             y = y_for_drawdown(drawdown_value)
             canvas.create_line(left, y, width - right, y, fill="#eef2f7", dash=(2, 4))
             canvas.create_text(
@@ -5734,6 +6028,8 @@ class BacktestWindow:
         ema_points: list[float] = []
         if visible_ema:
             for index, ema_value in enumerate(visible_ema, start=start_index):
+                if (index - start_index) % render_stride != 0 and index != end_index - 1:
+                    continue
                 if ema_value is None:
                     continue
                 x = x_for(index)
@@ -5742,6 +6038,8 @@ class BacktestWindow:
         trend_ema_points: list[float] = []
         if visible_trend_ema:
             for index, trend_ema_value in enumerate(visible_trend_ema, start=start_index):
+                if (index - start_index) % render_stride != 0 and index != end_index - 1:
+                    continue
                 if trend_ema_value is None:
                     continue
                 x = x_for(index)
@@ -5750,6 +6048,8 @@ class BacktestWindow:
         reference_ema_points: list[float] = []
         if visible_reference_ema:
             for index, reference_ema_value in enumerate(visible_reference_ema, start=start_index):
+                if (index - start_index) % render_stride != 0 and index != end_index - 1:
+                    continue
                 if reference_ema_value is None:
                     continue
                 x = x_for(index)
@@ -5758,6 +6058,8 @@ class BacktestWindow:
         big_ema_points: list[float] = []
         if visible_big_ema:
             for index, big_ema_value in enumerate(visible_big_ema, start=start_index):
+                if (index - start_index) % render_stride != 0 and index != end_index - 1:
+                    continue
                 if big_ema_value is None:
                     continue
                 x = x_for(index)
@@ -5766,22 +6068,31 @@ class BacktestWindow:
         net_value_points: list[float] = []
         if visible_net_value:
             for index, net_value in enumerate(visible_net_value, start=start_index):
+                if (index - start_index) % render_stride != 0 and index != end_index - 1:
+                    continue
                 x = x_for(index)
                 net_value_points.extend((x, y_for_net_value(net_value)))
 
         drawdown_points: list[float] = []
         if visible_drawdown:
             for index, drawdown_value in enumerate(visible_drawdown, start=start_index):
+                if (index - start_index) % render_stride != 0 and index != end_index - 1:
+                    continue
                 x = x_for(index)
                 drawdown_points.extend((x, y_for_drawdown(drawdown_value)))
 
         for index, candle in enumerate(visible_candles, start=start_index):
+            if (index - start_index) % render_stride != 0 and index != end_index - 1:
+                continue
             x = x_for(index)
             open_y = y_for(candle.open)
             close_y = y_for(candle.close)
             high_y = y_for(candle.high)
             low_y = y_for(candle.low)
             color = _backtest_candle_color(candle.open, candle.close)
+            if dense_display_mode:
+                canvas.create_line(x, high_y, x, low_y, fill=color, width=max(1, int(round(min(body_width, 3.0)))))
+                continue
             canvas.create_line(x, high_y, x, low_y, fill=color, width=1)
             body_top = min(open_y, close_y)
             body_bottom = max(open_y, close_y)
@@ -5796,9 +6107,7 @@ class BacktestWindow:
                 fill=color,
             )
 
-        for trade in result.trades:
-            if trade.exit_index < start_index or trade.entry_index >= end_index:
-                continue
+        for trade in visible_trades:
             entry_x = x_for(trade.entry_index)
             exit_x = x_for(trade.exit_index)
             entry_y = y_for(trade.entry_price)
@@ -5809,18 +6118,22 @@ class BacktestWindow:
             exit_color = "#1a7f37" if not is_stop_exit_reason(trade.exit_reason) else "#d1242f"
 
             canvas.create_line(entry_x, entry_y, exit_x, exit_y, fill=trade_color, width=2)
+            if fast_mode:
+                if not dense_fast_mode:
+                    canvas.create_oval(entry_x - 3, entry_y - 3, entry_x + 3, entry_y + 3, fill=trade_color, outline="")
+                    canvas.create_oval(exit_x - 4, exit_y - 4, exit_x + 4, exit_y + 4, fill=exit_color, outline="")
+                continue
             canvas.create_line(entry_x, stop_y, exit_x, stop_y, fill="#d1242f", dash=(4, 2))
             canvas.create_line(entry_x, take_y, exit_x, take_y, fill="#1a7f37", dash=(4, 2))
             canvas.create_oval(entry_x - 4, entry_y - 4, entry_x + 4, entry_y + 4, fill=trade_color, outline="")
             canvas.create_oval(exit_x - 5, exit_y - 5, exit_x + 5, exit_y + 5, fill=exit_color, outline="")
-            if not fast_mode:
-                canvas.create_text(
-                    exit_x + 8,
-                    exit_y,
-                    text="TP" if trade.exit_reason == "take_profit" else ("BE" if trade.exit_reason == "break_even_stop" else "SL"),
-                    anchor="w",
-                    fill=exit_color,
-                )
+            canvas.create_text(
+                exit_x + 8,
+                exit_y,
+                text=_format_backtest_trade_exit_label(trade),
+                anchor="w",
+                fill=exit_color,
+            )
 
         if result.open_position is not None and result.candles:
             open_position = result.open_position
@@ -5867,16 +6180,26 @@ class BacktestWindow:
                     font=("Microsoft YaHei UI", 10, "bold"),
                 )
 
-        selected_manual_position = self._selected_manual_position()
-        for manual_position in result.manual_positions:
-            if manual_position.handoff_index < start_index or manual_position.entry_index >= end_index:
-                continue
+        selected_manual_position = None if fast_mode else self._selected_manual_position()
+        for manual_position in visible_manual_positions:
             entry_visible = start_index <= manual_position.entry_index < end_index
             handoff_visible = start_index <= manual_position.handoff_index < end_index
             if not entry_visible and not handoff_visible:
                 continue
             manual_color = "#9a6700" if manual_position.signal == "long" else "#bc4c00"
             highlight_width = 3 if manual_position == selected_manual_position else 2
+            if fast_mode:
+                if entry_visible and handoff_visible:
+                    canvas.create_line(
+                        x_for(manual_position.entry_index),
+                        y_for(manual_position.entry_price),
+                        x_for(manual_position.handoff_index),
+                        y_for(manual_position.handoff_price),
+                        fill=manual_color,
+                        width=highlight_width,
+                        dash=(4, 3),
+                    )
+                continue
             if entry_visible:
                 entry_x = x_for(manual_position.entry_index)
                 entry_y = y_for(manual_position.entry_price)
@@ -5941,7 +6264,7 @@ class BacktestWindow:
                     dash=(4, 3),
                 )
 
-        time_label_target = 4 if fast_mode else 6
+        time_label_target = 3 if dense_fast_mode else (4 if fast_mode else 6)
         for time_index in _chart_time_label_indices(start_index, end_index, target_labels=time_label_target):
             x = x_for(time_index)
             canvas.create_line(x, top, x, drawdown_bottom, fill="#f3f4f6", dash=(2, 4))
@@ -6182,11 +6505,29 @@ class BacktestWindow:
             lambda target=canvas, target_id=canvas_id, fast=fast_mode: self._run_canvas_redraw(target, target_id, fast),
         )
 
+    def _schedule_canvas_finalize_redraw(self, canvas: Canvas, *, delay_ms: int = 160) -> None:
+        if self._latest_result is None:
+            return
+        canvas_id = id(canvas)
+        existing_job = self._chart_canvas_finalize_jobs.get(canvas_id)
+        if existing_job is not None:
+            self.window.after_cancel(existing_job)
+        self._chart_canvas_finalize_jobs[canvas_id] = self.window.after(
+            delay_ms,
+            lambda target=canvas, target_id=canvas_id: self._run_canvas_finalize_redraw(target, target_id),
+        )
+
     def _run_canvas_redraw(self, canvas: Canvas, canvas_id: int, fast_mode: bool) -> None:
         self._chart_canvas_redraw_jobs.pop(canvas_id, None)
         if self._latest_result is None or not canvas.winfo_exists():
             return
         self._draw_chart(self._latest_result, canvas, fast_mode=fast_mode)
+
+    def _run_canvas_finalize_redraw(self, canvas: Canvas, canvas_id: int) -> None:
+        self._chart_canvas_finalize_jobs.pop(canvas_id, None)
+        if self._latest_result is None or not canvas.winfo_exists():
+            return
+        self._draw_chart(self._latest_result, canvas, fast_mode=False)
 
     def _redraw_all_charts(self) -> None:
         self._chart_redraw_job = None
@@ -6199,8 +6540,8 @@ class BacktestWindow:
     def _build_zoom_chart_header_lines(self, snapshot: _BacktestSnapshot | None) -> tuple[str, str]:
         if snapshot is None or snapshot.result is None:
             return (
-                "暂无选中回测",
-                "运行或切换回测后，这里会显示策略、方向、挂单 EMA、止损、止盈方式、每波开仓次数和关键绩效。",
+                "暂无回测",
+                "执行回测后，这里会显示策略、参数与结果摘要。",
             )
 
         config = snapshot.config
@@ -6208,8 +6549,8 @@ class BacktestWindow:
         report = result.report
         strategy_name = _strategy_display_name(config)
         signal_label = SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)
-        entry_reference_ema = config.resolved_entry_reference_ema_period()
-        take_profit_label = "动态止盈" if config.take_profit_mode == "dynamic" else f"固定止盈(TP x{format_decimal(config.atr_take_multiplier)})"
+        exit_label = _backtest_exit_mode_label(config)
+        exit_metric_label = "平仓" if config.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID else "止盈"
         max_entries_label = "不限(0)" if config.max_entries_per_trend <= 0 else str(config.max_entries_per_trend)
         context_line = (
             f"编号：{snapshot.snapshot_id} | 策略：{strategy_name} | 交易对：{config.inst_id} | "
@@ -6219,11 +6560,11 @@ class BacktestWindow:
             f"挂单参考线：{config.entry_reference_line_label()}",
             f"指标：{moving_average_display_label(result.ema_type, result.ema_period)} / {moving_average_display_label(result.trend_ema_type, result.trend_ema_period)} / ATR{result.atr_period}",
             f"止损：{format_decimal(config.atr_stop_multiplier)} ATR",
-            f"止盈：{take_profit_label}",
+            f"{exit_metric_label}：{exit_label}",
         ]
         if config.uses_daily_filter():
             metrics_parts.append(config.daily_filter_summary())
-        if config.take_profit_mode == "dynamic":
+        if config.strategy_id != STRATEGY_BTC_EMA55_SLOPE_SHORT_ID and config.take_profit_mode == "dynamic":
             metrics_parts.append(f"2R保本：{config.dynamic_two_r_break_even_label()}")
             metrics_parts.append(f"手续费偏移：{config.dynamic_fee_offset_enabled_label()}")
             metrics_parts.append(
@@ -6240,7 +6581,6 @@ class BacktestWindow:
         )
         metrics_line = " | ".join(metrics_parts)
         return context_line, metrics_line
-
     def _refresh_zoom_chart_header(self) -> None:
         snapshot = self._backtest_snapshots.get(self._current_snapshot_id) if self._current_snapshot_id else None
         context_line, metrics_line = self._build_zoom_chart_header_lines(snapshot)
@@ -6302,7 +6642,7 @@ class BacktestWindow:
 
         zoom_canvas = Canvas(zoom_window, background="#ffffff", highlightthickness=0)
         zoom_canvas.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
-        zoom_canvas.bind("<Configure>", self._schedule_chart_redraw)
+        zoom_canvas.bind("<Configure>", lambda _event, target=zoom_canvas: self._on_chart_canvas_configure(target))
         self._bind_chart_interactions(zoom_canvas)
 
         self._chart_zoom_window = zoom_window
@@ -6329,6 +6669,9 @@ class BacktestWindow:
             scheduled_job = self._chart_canvas_redraw_jobs.pop(id(zoom_canvas), None)
             if scheduled_job is not None:
                 self.window.after_cancel(scheduled_job)
+            finalize_job = self._chart_canvas_finalize_jobs.pop(id(zoom_canvas), None)
+            if finalize_job is not None:
+                self.window.after_cancel(finalize_job)
 
     def _parse_positive_int(self, raw: str, field_name: str) -> int:
         value = int(raw)
@@ -6423,6 +6766,23 @@ def _normalize_chart_viewport(
     return normalized_start, normalized_visible
 
 
+def _default_chart_viewport(
+    total_count: int,
+    requested_visible: int = DEFAULT_BACKTEST_CHART_VISIBLE_CANDLES,
+    *,
+    min_visible: int = 20,
+) -> tuple[int, int]:
+    if total_count <= 0:
+        return 0, 0
+    _, visible_count = _normalize_chart_viewport(
+        0,
+        requested_visible,
+        total_count,
+        min_visible=min_visible,
+    )
+    return max(total_count - visible_count, 0), visible_count
+
+
 def _zoom_chart_viewport(
     *,
     start_index: int,
@@ -6497,6 +6857,24 @@ def _format_chart_axis_price(value: Decimal) -> str:
     else:
         places = 5
     return format_decimal_fixed(value, places)
+
+
+def _format_backtest_stop_r_label(r_multiple: Decimal) -> str:
+    if r_multiple <= 0:
+        return "SL"
+    places = 1 if abs(r_multiple) >= Decimal("1") else 2
+    text = format_decimal_fixed(r_multiple, places).rstrip("0").rstrip(".")
+    return f"{text}R"
+
+
+def _format_backtest_trade_exit_label(trade: BacktestTrade) -> str:
+    if trade.exit_reason == "take_profit":
+        return "TP"
+    if trade.exit_reason == "break_even_stop":
+        return "BE"
+    if is_stop_exit_reason(trade.exit_reason):
+        return _format_backtest_stop_r_label(trade.r_multiple)
+    return "SL"
 
 
 def _backtest_candle_color(open_price: Decimal, close_price: Decimal) -> str:

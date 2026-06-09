@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from html import escape
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -14,11 +15,14 @@ from okx_quant.btc_market_analyzer import (
     btc_market_analysis_payload,
     load_btc_market_email_notifier,
 )
+from okx_quant.mini_chart import LINE_COLORS, MiniChartOverlay, render_candles_png_base64
+from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import (
     analysis_report_dir_path,
     load_btc_market_email_state,
     save_btc_market_email_state,
 )
+from okx_quant.strategy_profiles import read_strategy_bundle
 
 
 DEFAULT_DIGEST_SYMBOLS: tuple[str, ...] = (
@@ -124,6 +128,89 @@ def build_multi_coin_market_email_body(digest: MultiCoinMarketDigest) -> str:
     return "\n".join(lines)
 
 
+def build_multi_coin_market_email_html(
+    digest: MultiCoinMarketDigest,
+    *,
+    chart_image_map: dict[str, dict[str, str]] | None = None,
+    overlay_legend_map: dict[str, dict[str, str]] | None = None,
+) -> str:
+    email_state = load_btc_market_email_state()
+    last_sent_at = _parse_iso_datetime(email_state.get("last_sent_at", ""))
+    strongest_long_asset = digest.strongest_long.label.upper()
+    weakest_short_asset = digest.weakest_short.label.upper()
+    summary_rows = [
+        ("做多最强", _leader_headline(digest.strongest_long)),
+        ("做空最弱", _leader_headline(digest.weakest_short)),
+        ("最值得跟踪做单", f"{digest.best_trade_candidate.label}。{digest.best_trade_candidate.summary}"),
+    ]
+    summary_html = "".join(
+        f"""
+        <tr>
+            <td style="padding: 6px 0; color: #34495e; font-size: 14px; line-height: 1.7;">
+                - <strong>{escape(label)}</strong>：{escape(content)}
+            </td>
+        </tr>
+        """
+        for label, content in summary_rows
+    )
+    coin_cards_html = "".join(
+        _build_coin_card_html(
+            analysis,
+            last_sent_at=last_sent_at,
+            strongest_long_asset=strongest_long_asset,
+            weakest_short_asset=weakest_short_asset,
+            chart_image_map=chart_image_map or {},
+            overlay_legend_map=overlay_legend_map or {},
+        )
+        for analysis in digest.analyses
+    )
+    headline = build_multi_coin_market_email_subject(digest)
+    generated_at = _format_generated_at_display(digest.generated_at)
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{escape(headline)}</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Microsoft YaHei', Arial, sans-serif; background-color: #f5f7fa;">
+    <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #f5f7fa;">
+        <tr>
+            <td align="center" style="padding: 20px 0;">
+                <table width="650" border="0" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
+                    <tr>
+                        <td style="background-color: #2c3e50; padding: 18px 24px;">
+                            <h1 style="margin: 0; color: #ffffff; font-size: 20px; font-weight: 600;">{escape(headline)}</h1>
+                            <p style="margin: 8px 0 0 0; color: #bdc3c7; font-size: 14px;">生成时间：{escape(generated_at)}</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 20px 24px; background-color: #e8f4fd;">
+                            <h2 style="margin: 0 0 12px 0; color: #2980b9; font-size: 16px; font-weight: 600;">简明结论</h2>
+                            <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                                {summary_html}
+                            </table>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 24px;">
+                            <h2 style="margin: 0 0 16px 0; color: #2c3e50; font-size: 16px; font-weight: 600;">分币摘要</h2>
+                            {coin_cards_html}
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 16px 24px; background-color: #f8f9fa; text-align: center; font-size: 12px; color: #95a5a6;">
+                            本简报仅供参考，不构成任何投资建议。请结合自身风险承受能力理性决策。
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>"""
+
+
 def send_multi_coin_market_email(
     digest: MultiCoinMarketDigest,
     *,
@@ -134,15 +221,38 @@ def send_multi_coin_market_email(
         return False
     subject = build_multi_coin_market_email_subject(digest)
     body = build_multi_coin_market_email_body(digest)
+    overlay_map = build_multi_coin_overlay_map(digest)
+    chart_image_map = build_multi_coin_chart_image_map(digest, overlay_map=overlay_map)
+    overlay_legend_map = {
+        symbol: {
+            "1H": build_overlay_legend_html(overlays.get("1H", default_symbol_overlays())),
+            "4H": build_overlay_legend_html(overlays.get("4H", default_4h_overlays())),
+            "1D": build_overlay_legend_html(overlays.get("1D", default_4h_overlays())),
+            "1W": build_overlay_legend_html(overlays.get("1W", default_4h_overlays())),
+        }
+        for symbol, overlays in overlay_map.items()
+    }
+    html_body = build_multi_coin_market_email_html(
+        digest,
+        chart_image_map=chart_image_map,
+        overlay_legend_map=overlay_legend_map,
+    )
+    archive_path = archive_multi_coin_market_email(
+        digest,
+        subject=subject,
+        body=body,
+        html_body=html_body,
+        report_path=report_path,
+    )
     sender = getattr(notifier, "_send", None)
     if callable(sender):
-        sender(subject, body)
+        sender(subject, body, html_body=html_body)
     else:
-        notifier.notify_async(subject, body)
+        notifier.notify_async(subject, body, html_body=html_body)
     save_btc_market_email_state(
         last_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         last_subject=subject,
-        last_report_path=str(report_path) if report_path is not None else "",
+        last_report_path=str(archive_path if archive_path is not None else report_path) if (archive_path is not None or report_path is not None) else "",
     )
     return True
 
@@ -298,6 +408,388 @@ def _timeframe_line(item: TimeframeAnalysis | None) -> str:
     return f"{_direction_label(item.direction)} | 分数={item.score} | 核心={item.reason[0] if item.reason else '暂无'}"
 
 
+def _build_coin_card_html(
+    analysis: BtcMarketAnalysis,
+    *,
+    last_sent_at: datetime | None,
+    strongest_long_asset: str,
+    weakest_short_asset: str,
+    chart_image_map: dict[str, dict[str, str]],
+    overlay_legend_map: dict[str, dict[str, str]],
+) -> str:
+    asset = _asset_name(analysis.symbol)
+    tf4h = _find_timeframe(analysis, "4H")
+    tf1h = _find_timeframe(analysis, "1H")
+    border_color, header_bg, title_color, accent_color = _coin_card_palette(
+        asset=asset,
+        strongest_long_asset=strongest_long_asset,
+        weakest_short_asset=weakest_short_asset,
+    )
+    recent_events = _collect_recent_events((tf4h, tf1h), last_sent_at=last_sent_at)
+    recent_events_text = "; ".join(recent_events[:3]) if recent_events else "上次发送后没有新的代表性K线"
+    header_summary = f"综合={_direction_label(analysis.direction)} | 分数={analysis.score} | 置信度={_pct(analysis.confidence)}"
+    chart_html = _build_coin_chart_html(
+        asset=asset,
+        symbol=analysis.symbol,
+        chart_image_map=chart_image_map,
+        overlay_legends=overlay_legend_map.get(analysis.symbol, {}),
+    )
+    return f"""
+    <table width="100%" border="0" cellspacing="0" cellpadding="0" style="border: 1px solid {border_color}; border-radius: 6px; margin-bottom: 16px;">
+        <tr>
+            <td style="padding: 12px 16px; background-color: {header_bg}; border-bottom: 1px solid {border_color};">
+                <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                    <tr>
+                        <td style="font-size: 15px; font-weight: 600; color: {title_color};">{escape(asset)}</td>
+                        <td align="right" style="font-size: 13px; color: {accent_color};">{escape(header_summary)}</td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+        <tr>
+            <td style="padding: 16px;">
+                {chart_html}
+                <table width="100%" border="0" cellspacing="0" cellpadding="0" style="font-size: 13px; color: #34495e; line-height: 1.7;">
+                    <tr>
+                        <td style="padding: 4px 0;"><strong>4H 周期：</strong>{escape(_timeframe_line(tf4h))}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 4px 0;"><strong>1H 周期：</strong>{escape(_timeframe_line(tf1h))}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 4px 0;"><strong>跟踪提示：</strong>{escape(_coin_tracking_summary(analysis, tf4h, tf1h))}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 4px 0;"><strong>关注新形态：</strong>{escape(recent_events_text)}</td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+    """
+
+
+def _coin_card_palette(
+    *,
+    asset: str,
+    strongest_long_asset: str,
+    weakest_short_asset: str,
+) -> tuple[str, str, str, str]:
+    if asset == weakest_short_asset:
+        return "#e74c3c", "#fef5f5", "#e74c3c", "#e74c3c"
+    if asset == strongest_long_asset:
+        return "#27ae60", "#f4fdf4", "#27ae60", "#7f8c8d"
+    return "#e0e6ed", "#f8f9fa", "#2c3e50", "#7f8c8d"
+
+
+def archive_multi_coin_market_email(
+    digest: MultiCoinMarketDigest,
+    *,
+    subject: str,
+    body: str,
+    html_body: str,
+    report_path: Path | None,
+) -> Path:
+    archive_dir = analysis_report_dir_path() / "email_archives"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base_name = f"multi_coin_market_digest_email_{stamp}"
+    html_path = archive_dir / f"{base_name}.html"
+    text_path = archive_dir / f"{base_name}.txt"
+    meta_path = archive_dir / f"{base_name}.json"
+    html_path.write_text(html_body, encoding="utf-8")
+    text_path.write_text(body, encoding="utf-8")
+    metadata = {
+        "subject": subject,
+        "generated_at": digest.generated_at,
+        "symbols": list(digest.symbols),
+        "archive_html_path": str(html_path),
+        "archive_text_path": str(text_path),
+        "report_path": str(report_path) if report_path is not None else "",
+        "archived_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    return html_path
+
+
+def build_multi_coin_chart_image_map(
+    digest: MultiCoinMarketDigest,
+    *,
+    client: OkxRestClient | None = None,
+    overlay_map: dict[str, dict[str, tuple[MiniChartOverlay, ...]]] | None = None,
+    timeframes: tuple[str, ...] = ("1H", "4H", "1D", "1W"),
+    visible_limit: int = 72,
+) -> dict[str, dict[str, str]]:
+    resolved_client = client or OkxRestClient()
+    resolved_overlay_map = overlay_map or {}
+    images: dict[str, dict[str, str]] = {}
+    for analysis in digest.analyses:
+        symbol_images: dict[str, str] = {}
+        for timeframe in timeframes:
+            symbol_overlays = _resolve_chart_overlays_for_timeframe(
+                resolved_overlay_map.get(analysis.symbol, {}),
+                timeframe,
+            )
+            preload_limit = visible_limit + max((item.period for item in symbol_overlays), default=55)
+            try:
+                candles = resolved_client.get_candles_history(analysis.symbol, timeframe, limit=preload_limit)
+            except Exception:
+                continue
+            if not candles:
+                continue
+            try:
+                symbol_images[timeframe] = render_candles_png_base64(
+                    candles,
+                    width=320,
+                    height=160,
+                    max_candles=visible_limit,
+                    overlays=symbol_overlays,
+                )
+            except Exception:
+                continue
+        if symbol_images:
+            images[analysis.symbol] = symbol_images
+    return images
+
+
+def _build_coin_chart_html(
+    *,
+    asset: str,
+    symbol: str,
+    chart_image_map: dict[str, dict[str, str]],
+    overlay_legends: dict[str, str],
+) -> str:
+    symbol_images = chart_image_map.get(symbol, {})
+    encoded_1h = symbol_images.get("1H", "").strip()
+    encoded_4h = symbol_images.get("4H", "").strip()
+    encoded_1d = symbol_images.get("1D", "").strip()
+    encoded_1w = symbol_images.get("1W", "").strip()
+    if not encoded_1h and not encoded_4h and not encoded_1d and not encoded_1w:
+        return """
+        <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-bottom: 12px;">
+            <tr>
+                <td style="padding: 10px 12px; border: 1px dashed #d8e1ea; border-radius: 6px; background-color: #fbfcfe; font-size: 12px; color: #7f8c8d; text-align: center;">
+                    缩略 K 线暂不可用
+                </td>
+            </tr>
+        </table>
+        """
+    image_1h_html = _build_single_chart_cell(asset=asset, timeframe="1H", encoded=encoded_1h)
+    image_4h_html = _build_single_chart_cell(asset=asset, timeframe="4H", encoded=encoded_4h)
+    image_1d_html = _build_single_chart_cell(asset=asset, timeframe="1D", encoded=encoded_1d)
+    image_1w_html = _build_single_chart_cell(asset=asset, timeframe="1W", encoded=encoded_1w)
+    overlay_1h = overlay_legends.get("1H", build_overlay_legend_html(default_symbol_overlays()))
+    overlay_4h = overlay_legends.get("4H", build_overlay_legend_html(default_4h_overlays()))
+    overlay_1d = overlay_legends.get("1D", build_overlay_legend_html(default_4h_overlays()))
+    overlay_1w = overlay_legends.get("1W", build_overlay_legend_html(default_4h_overlays()))
+    return f"""
+    <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-bottom: 12px;">
+        <tr>
+            <td style="font-size: 12px; color: #7f8c8d; padding: 0 0 6px 0;">{escape(asset)} 最近 72 根 1H / 4H / 1D / 1W K 线</td>
+        </tr>
+        <tr>
+            <td>
+                <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                    <tr>
+                        <td width="50%" valign="top" style="padding: 0 6px 0 0;">{image_1h_html.replace('__OVERLAY_LEGEND__', overlay_1h)}</td>
+                        <td width="50%" valign="top" style="padding: 0 0 0 6px;">{image_4h_html.replace('__OVERLAY_LEGEND__', overlay_4h)}</td>
+                    </tr>
+                    <tr>
+                        <td width="50%" valign="top" style="padding: 12px 6px 0 0;">{image_1d_html.replace('__OVERLAY_LEGEND__', overlay_1d)}</td>
+                        <td width="50%" valign="top" style="padding: 12px 0 0 6px;">{image_1w_html.replace('__OVERLAY_LEGEND__', overlay_1w)}</td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+    """
+
+
+def _build_single_chart_cell(*, asset: str, timeframe: str, encoded: str) -> str:
+    if not encoded.strip():
+        return f"""
+        <table width="100%" border="0" cellspacing="0" cellpadding="0">
+            <tr>
+                <td style="font-size: 12px; color: #7f8c8d; padding: 0 0 6px 0;">{escape(timeframe)}</td>
+            </tr>
+            <tr>
+                <td style="font-size: 11px; color: #94a3b8; padding: 0 0 6px 0;">__OVERLAY_LEGEND__</td>
+            </tr>
+            <tr>
+                <td style="padding: 10px 12px; border: 1px dashed #d8e1ea; border-radius: 6px; background-color: #fbfcfe; font-size: 12px; color: #94a3b8; text-align: center;">
+                    {escape(timeframe)} 图暂不可用
+                </td>
+            </tr>
+        </table>
+        """
+    return f"""
+    <table width="100%" border="0" cellspacing="0" cellpadding="0">
+        <tr>
+            <td style="font-size: 12px; color: #7f8c8d; padding: 0 0 6px 0;">{escape(timeframe)}</td>
+        </tr>
+        <tr>
+            <td style="font-size: 11px; color: #94a3b8; padding: 0 0 6px 0;">__OVERLAY_LEGEND__</td>
+        </tr>
+        <tr>
+            <td>
+                <img
+                    src="data:image/png;base64,{encoded}"
+                    alt="{escape(asset)} recent {escape(timeframe)} candles"
+                    style="display: block; width: 100%; max-width: 100%; height: auto; border: 1px solid #e0e6ed; border-radius: 6px; background-color: #f8fafc;"
+                >
+            </td>
+        </tr>
+    </table>
+    """
+
+
+def build_multi_coin_overlay_map(
+    digest: MultiCoinMarketDigest,
+    *,
+    bundle_path: Path | None = None,
+) -> dict[str, dict[str, tuple[MiniChartOverlay, ...]]]:
+    resolved_bundle_path = bundle_path or (analysis_report_dir_path() / "packages" / "最佳参数组合包.json")
+    overlays_by_symbol: dict[str, dict[str, list[MiniChartOverlay]]] = {
+        analysis.symbol: {
+            "1H": [],
+            "4H": list(default_4h_overlays()),
+            "1D": list(default_4h_overlays()),
+            "1W": list(default_4h_overlays()),
+        }
+        for analysis in digest.analyses
+    }
+    if not resolved_bundle_path.exists():
+        return {
+            symbol: {
+                "1H": tuple(items["1H"]) if items["1H"] else default_symbol_overlays(),
+                "4H": tuple(items["4H"]),
+                "1D": tuple(items["1D"]),
+                "1W": tuple(items["1W"]),
+            }
+            for symbol, items in overlays_by_symbol.items()
+        }
+    try:
+        bundle = read_strategy_bundle(resolved_bundle_path)
+    except Exception:
+        return {
+            symbol: {
+                "1H": tuple(items["1H"]) if items["1H"] else default_symbol_overlays(),
+                "4H": tuple(items["4H"]),
+                "1D": tuple(items["1D"]),
+                "1W": tuple(items["1W"]),
+            }
+            for symbol, items in overlays_by_symbol.items()
+        }
+    for profile in bundle.profiles:
+        symbol = profile.symbol.strip().upper()
+        if symbol not in overlays_by_symbol:
+            continue
+        overlays_by_symbol[symbol]["1H"] = _merge_overlays(
+            overlays_by_symbol[symbol]["1H"],
+            _extract_symbol_overlays_from_snapshot(profile.config_snapshot),
+        )
+    return {
+        symbol: {
+            "1H": tuple(items["1H"]) if items["1H"] else default_symbol_overlays(),
+            "4H": tuple(items["4H"]),
+            "1D": tuple(items["1D"]),
+            "1W": tuple(items["1W"]),
+        }
+        for symbol, items in overlays_by_symbol.items()
+    }
+
+
+def default_symbol_overlays() -> tuple[MiniChartOverlay, ...]:
+    return (
+        MiniChartOverlay(period=21, ma_type="ema"),
+        MiniChartOverlay(period=55, ma_type="ema"),
+    )
+
+
+def default_4h_overlays() -> tuple[MiniChartOverlay, ...]:
+    return default_symbol_overlays()
+
+
+def _extract_symbol_overlays_from_snapshot(snapshot: dict[str, object]) -> tuple[MiniChartOverlay, ...]:
+    rows: list[MiniChartOverlay] = []
+    main_period = _to_positive_int(snapshot.get("ema_period"))
+    if main_period > 0:
+        rows.append(MiniChartOverlay(period=main_period, ma_type=str(snapshot.get("ema_type", "ema") or "ema")))
+    trend_period = _to_positive_int(snapshot.get("trend_ema_period"))
+    if trend_period > 0:
+        rows.append(
+            MiniChartOverlay(period=trend_period, ma_type=str(snapshot.get("trend_ema_type", "ema") or "ema"))
+        )
+    if not rows:
+        return default_symbol_overlays()
+    deduped: list[MiniChartOverlay] = []
+    seen: set[tuple[str, int]] = set()
+    for item in rows:
+        key = (item.normalized_type, item.period)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return tuple(deduped)
+
+
+def _merge_overlays(
+    existing: list[MiniChartOverlay],
+    incoming: tuple[MiniChartOverlay, ...],
+) -> list[MiniChartOverlay]:
+    merged = list(existing)
+    seen = {(item.normalized_type, item.period) for item in merged}
+    for item in incoming:
+        key = (item.normalized_type, item.period)
+        if key in seen:
+            continue
+        merged.append(item)
+        seen.add(key)
+    return sorted(merged, key=lambda item: (item.period, item.normalized_type))
+
+
+def format_overlay_labels(overlays: tuple[MiniChartOverlay, ...]) -> str:
+    if not overlays:
+        overlays = default_symbol_overlays()
+    return " / ".join(item.resolved_label for item in overlays)
+
+
+def build_overlay_legend_html(overlays: tuple[MiniChartOverlay, ...]) -> str:
+    if not overlays:
+        overlays = default_symbol_overlays()
+    parts = []
+    for index, item in enumerate(overlays):
+        color = _rgb_to_hex(item.color or LINE_COLORS[index % len(LINE_COLORS)])
+        parts.append(
+            f'<span style="display:inline-block; margin-right:8px; white-space:nowrap;">'
+            f'<span style="display:inline-block; width:8px; height:8px; border-radius:999px; background:{color}; margin-right:4px; vertical-align:middle;"></span>'
+            f'<span style="vertical-align:middle;">{escape(item.resolved_label)}</span>'
+            f"</span>"
+        )
+    return "叠加：" + "".join(parts)
+
+
+def _resolve_chart_overlays_for_timeframe(
+    overlay_map: dict[str, tuple[MiniChartOverlay, ...]],
+    timeframe: str,
+) -> tuple[MiniChartOverlay, ...]:
+    if timeframe == "1H":
+        return overlay_map.get("1H", default_symbol_overlays())
+    return overlay_map.get(timeframe, default_4h_overlays())
+
+
+def _to_positive_int(value: object) -> int:
+    try:
+        resolved = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(resolved, 0)
+
+
+def _rgb_to_hex(color: tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*color)
+
+
 def _leader_payload(leader: DigestLeader) -> dict[str, object]:
     return {
         "symbol": leader.symbol,
@@ -338,3 +830,11 @@ def _parse_iso_datetime(raw_value: object) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _format_generated_at_display(raw_value: str) -> str:
+    parsed = _parse_iso_datetime(raw_value)
+    if parsed is None:
+        return raw_value
+    china_time = parsed.astimezone(timezone(timedelta(hours=8)))
+    return china_time.strftime("%Y-%m-%d %H:%M UTC+8")

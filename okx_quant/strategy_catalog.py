@@ -14,6 +14,7 @@ STRATEGY_EMA_BREAKDOWN_SHORT_ID = "ema_breakdown_short"
 STRATEGY_EMA5_EMA8_ID = "ema5_ema8_cross_stop"
 STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID = "adaptive_ema_rail_long"
 STRATEGY_EMA55_SLOPE_SHORT_ID = "ema55_slope_short"
+STRATEGY_BTC_EMA55_SLOPE_SHORT_ID = "btc_ema55_slope_short"
 STRATEGY_BODY_RETEST_SHORT_ID = "body_retest_short"
 
 
@@ -32,6 +33,10 @@ def is_adaptive_ema_rail_strategy(strategy_id: str) -> bool:
 
 def is_ema55_slope_short_strategy(strategy_id: str) -> bool:
     return strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID
+
+
+def is_btc_ema55_slope_short_strategy(strategy_id: str) -> bool:
+    return strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID
 
 
 def is_body_retest_short_strategy(strategy_id: str) -> bool:
@@ -251,6 +256,24 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
         supports_trader_desk=True,
     ),
     StrategyDefinition(
+        strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+        name="BTC EMA55 斜率做空",
+        summary="BTC 专用 EMA55 斜率做空：负斜率直接开空，ATR10 以损定量，出场只看止损和斜率走平。",
+        rule_description=(
+            "当最新已收盘 K 线的 EMA55 单根斜率比例小于等于阈值时直接开空；"
+            "仓位按 ATR10 风险定量，初始止损按 ATR 倍数设置。"
+            "持仓后不使用固定止盈或动态止盈，只在触发止损，或 EMA55 斜率走平/转正时平仓。"
+        ),
+        parameter_hint="默认 1H、EMA55、ATR10、止损 2ATR、斜率阈值 -0.0005；止损倍数和斜率阈值可调。",
+        default_signal_label="只做空",
+        allowed_signal_labels=("只做空",),
+        supports_trade=True,
+        supports_signal_only=True,
+        supports_backtest=True,
+        supports_batch_observe=True,
+        supports_trader_desk=True,
+    ),
+    StrategyDefinition(
         strategy_id=STRATEGY_BODY_RETEST_SHORT_ID,
         name="Body/ATR 回抽做空",
         summary="先等阴线破位，再在限定K线内等回抽确认做空；默认配合日线弱日过滤。",
@@ -371,6 +394,8 @@ def resolve_dynamic_signal_mode(strategy_id: str, signal_mode: str) -> str:
     if strategy_id == STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID:
         return "long_only"
     if strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
+        return "short_only"
+    if strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
         return "short_only"
     if strategy_id == STRATEGY_BODY_RETEST_SHORT_ID:
         return "short_only"

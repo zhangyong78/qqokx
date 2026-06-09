@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_LONG_ID,
@@ -90,3 +91,17 @@ class StrategyParametersTest(TestCase):
         self.assertIsNone(strategy_fixed_value(STRATEGY_EMA55_SLOPE_SHORT_ID, "ema_period"))
         self.assertIsNone(strategy_fixed_value(STRATEGY_EMA55_SLOPE_SHORT_ID, "trend_ema_period"))
         self.assertTrue(strategy_is_parameter_editable(STRATEGY_EMA55_SLOPE_SHORT_ID, "ema_period", "backtest"))
+
+    def test_btc_ema55_slope_short_strategy_keeps_only_core_parameters(self) -> None:
+        keys = set(iter_strategy_parameter_keys(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID))
+
+        self.assertIn("atr_period", keys)
+        self.assertIn("atr_stop_multiplier", keys)
+        self.assertIn("ema55_slope_exit_enabled", keys)
+        self.assertIn("ema55_slope_lock_profit_enabled", keys)
+        self.assertIn("ema55_slope_lock_profit_trigger_r", keys)
+        self.assertIn("trend_ema_slope_filter_min_ratio", keys)
+        self.assertNotIn("atr_take_multiplier", keys)
+        self.assertNotIn("take_profit_mode", keys)
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "signal_mode"), "short_only")
+        self.assertTrue(strategy_is_parameter_editable(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "ema_period", "launcher"))

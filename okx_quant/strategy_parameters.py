@@ -5,6 +5,7 @@ from typing import Literal
 
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
@@ -69,6 +70,8 @@ PARAMETERS: dict[str, ParameterDefinition] = {
     "dynamic_two_r_break_even": ParameterDefinition(key="dynamic_two_r_break_even", default=True),
     "dynamic_fee_offset_enabled": ParameterDefinition(key="dynamic_fee_offset_enabled", default=True),
     "ema55_slope_exit_enabled": ParameterDefinition(key="ema55_slope_exit_enabled", default=True),
+    "ema55_slope_lock_profit_enabled": ParameterDefinition(key="ema55_slope_lock_profit_enabled", default=False),
+    "ema55_slope_lock_profit_trigger_r": ParameterDefinition(key="ema55_slope_lock_profit_trigger_r", default=2),
     "atr_percentile_filter_max": ParameterDefinition(key="atr_percentile_filter_max", default="0"),
     "trend_ema_slope_filter_min_ratio": ParameterDefinition(key="trend_ema_slope_filter_min_ratio", default="0"),
     "body_retest_breakdown_atr_multiplier": ParameterDefinition(key="body_retest_breakdown_atr_multiplier", default="0.2"),
@@ -384,6 +387,26 @@ STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
             "daily_filter_scope",
             "daily_filter_ma_type",
             "daily_filter_period",
+        ),
+        fixed_values={
+            "signal_mode": "short_only",
+        },
+    ),
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID: StrategyParameterProfile(
+        strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+        parameter_keys=(
+            "bar",
+            "signal_mode",
+            "ema_type",
+            "ema_period",
+            "trend_ema_type",
+            "trend_ema_period",
+            "atr_period",
+            "atr_stop_multiplier",
+            "ema55_slope_exit_enabled",
+            "ema55_slope_lock_profit_enabled",
+            "ema55_slope_lock_profit_trigger_r",
+            "trend_ema_slope_filter_min_ratio",
         ),
         fixed_values={
             "signal_mode": "short_only",

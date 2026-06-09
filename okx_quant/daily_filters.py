@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
 from decimal import Decimal
 
 from okx_quant.indicators import moving_average
 from okx_quant.models import Candle, DailyFilterBoundary, MovingAverageType
-from okx_quant.timeframe import latest_closed_candle_index
+from okx_quant.timeframe import closed_candle_available_timestamps
 
 
 DAY_MS = 86_400_000
@@ -81,9 +82,10 @@ def build_daily_close_vs_ma_bias(
         return ["neutral"] * len(entry_candles)
     closes = [candle.close for candle in daily_candles]
     line_values = moving_average(closes, int(period), ma_type)
+    available_ts = closed_candle_available_timestamps(daily_candles)
     bias: list[str] = []
     for entry_candle in entry_candles:
-        index = latest_closed_candle_index(daily_candles, int(entry_candle.ts))
+        index = bisect.bisect_right(available_ts, int(entry_candle.ts)) - 1
         if index < 0 or index >= len(line_values):
             bias.append("neutral")
             continue
@@ -104,9 +106,10 @@ def build_daily_close_vs_ma_bias(
 def build_daily_weak_day_flags(entry_candles: list[Candle], daily_candles: list[Candle]) -> list[bool]:
     if not entry_candles or not daily_candles:
         return [False] * len(entry_candles)
+    available_ts = closed_candle_available_timestamps(daily_candles)
     flags: list[bool] = []
     for entry_candle in entry_candles:
-        index = latest_closed_candle_index(daily_candles, int(entry_candle.ts))
+        index = bisect.bisect_right(available_ts, int(entry_candle.ts)) - 1
         if index < 0 or index >= len(daily_candles):
             flags.append(False)
             continue

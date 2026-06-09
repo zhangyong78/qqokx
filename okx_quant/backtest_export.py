@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
-from okx_quant.backtest import BacktestResult, format_backtest_report, format_trade_exit_reason
+from okx_quant.backtest import BACKTEST_RESERVED_CANDLES, BacktestResult, format_backtest_report, format_trade_exit_reason
 from okx_quant.backtest_audit import (
     batch_backtest_artifact_paths,
     export_batch_backtest_manifest,
@@ -13,10 +13,15 @@ from okx_quant.backtest_audit import (
     single_backtest_artifact_paths,
 )
 from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_pool_profile_name
+from okx_quant.minimum_risk_recommendations import format_risk_recommendation, recommended_minimum_risk_amount_for_config
 from okx_quant.models import StrategyConfig, moving_average_display_label
 from okx_quant.persistence import backtest_report_export_dir_path
 from okx_quant.pricing import format_decimal, format_decimal_fixed
-from okx_quant.strategy_catalog import BACKTEST_STRATEGY_DEFINITIONS, is_dynamic_strategy_id
+from okx_quant.strategy_catalog import (
+    BACKTEST_STRATEGY_DEFINITIONS,
+    is_dynamic_strategy_id,
+)
+from okx_quant.strategy_runtime_registry import get_strategy_runtime_profile
 
 
 STRATEGY_ID_TO_NAME = {item.strategy_id: item.name for item in BACKTEST_STRATEGY_DEFINITIONS}
@@ -83,6 +88,7 @@ def export_single_backtest_report(
             config,
             candle_limit,
             exported_at,
+            report_path=target,
             artifact_paths=artifact_paths,
         ),
         encoding="utf-8-sig",
@@ -146,6 +152,7 @@ def export_batch_backtest_report(
                 config,
                 candle_limit,
                 exported_at,
+                report_path=detail_path,
                 artifact_paths=detail_artifact_paths,
             ),
             encoding="utf-8-sig",
@@ -182,36 +189,25 @@ def _build_single_backtest_report_text(
     candle_limit: int,
     exported_at: datetime,
     *,
+    report_path: Path | None = None,
     artifact_paths: dict[str, Path] | None = None,
 ) -> str:
-    strategy_name = STRATEGY_ID_TO_NAME.get(config.strategy_id, config.strategy_id)
     lines = [
-        "策略回测报告",
+        "交易员速览",
         "=" * 72,
-        f"导出时间：{exported_at.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"策略：{strategy_name}",
-        f"交易对：{config.inst_id}",
-        f"周期：{BAR_VALUE_TO_LABEL.get(config.bar, config.bar)}",
-        f"信号方向：{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)}",
-        f"回测K线数：{_format_candle_limit_text(candle_limit)}",
-        f"开始时间：{_format_result_start(result)}",
-        f"结束时间：{_format_result_end(result)}",
-        f"参数摘要：{_build_param_summary(config, result)}",
+        *build_backtest_focus_lines(
+            result,
+            config,
+            candle_limit,
+            exported_at=exported_at,
+            report_path=report_path,
+            artifact_paths=artifact_paths,
+        ),
     ]
-    if result.data_source_note:
-        lines.append(f"数据来源：{result.data_source_note}")
-    if artifact_paths is not None:
-        lines.extend(
-            [
-                f"资金审计文件：{artifact_paths['capital']}",
-                f"操作日志文件：{artifact_paths['operations']}",
-                f"审计清单：{artifact_paths['manifest']}",
-            ]
-        )
     lines.extend(
         [
             "",
-            "回测报告",
+            "完整明细",
             "-" * 72,
             format_backtest_report(result),
             "",
@@ -221,6 +217,81 @@ def _build_single_backtest_report_text(
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
+
+
+def build_backtest_focus_lines(
+    result: BacktestResult,
+    config: StrategyConfig,
+    candle_limit: int,
+    *,
+    exported_at: datetime | None = None,
+    snapshot_id: str | None = None,
+    report_path: Path | None = None,
+    artifact_paths: dict[str, Path] | None = None,
+) -> list[str]:
+    report = result.report
+    strategy_name = STRATEGY_ID_TO_NAME.get(config.strategy_id, config.strategy_id)
+    start_text = _format_result_start(result)
+    end_text = _format_result_end(result)
+    warmup_count = min(BACKTEST_RESERVED_CANDLES, len(result.candles))
+    fee_to_net_pct = None if report.total_pnl == 0 else (report.total_fees / abs(report.total_pnl)) * Decimal("100")
+    recommendation = recommended_minimum_risk_amount_for_config(config)
+    exit_reason_summary = _build_exit_reason_summary_text(result)
+    if report_path is not None and artifact_paths is None:
+        artifact_paths = single_backtest_artifact_paths(report_path)
+    identity_parts = []
+    if snapshot_id:
+        identity_parts.append(f"编号：{snapshot_id}")
+    if exported_at is not None:
+        identity_parts.append(f"时间：{exported_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    identity_parts.extend(
+        [
+            f"策略：{strategy_name}",
+            f"交易对：{config.inst_id}",
+            f"K线：{BAR_VALUE_TO_LABEL.get(config.bar, config.bar)}",
+            f"方向：{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)}",
+        ]
+    )
+    lines = [
+        " | ".join(identity_parts),
+        (
+            f"区间：{start_text} -> {end_text} | 样本：{len(result.candles):,}根 | "
+            f"设置：{_format_candle_limit_text(candle_limit)} | 预热：前 {warmup_count} 根 | "
+            f"交易：{report.total_trades}笔 | 胜率：{format_decimal_fixed(report.win_rate, 2)}%"
+        ),
+        (
+            f"结果：总盈亏 {format_decimal_fixed(report.total_pnl, 4)} | "
+            f"收益率 {format_decimal_fixed(report.total_return_pct, 2)}% | "
+            f"最大回撤 {format_decimal_fixed(report.max_drawdown, 4)} "
+            f"({format_decimal_fixed(report.max_drawdown_pct, 2)}%) | "
+            f"PF {_format_optional_ratio(report.profit_factor)} | "
+            f"盈亏比 {_format_optional_ratio(report.profit_loss_ratio)}"
+        ),
+        f"参数摘要：{_build_param_summary(config, result)}",
+        (
+            f"费用：Maker {_format_percent(result.maker_fee_rate)} | "
+            f"Taker {_format_percent(result.taker_fee_rate)} | "
+            f"手续费合计 {format_decimal_fixed(report.total_fees, 4)} | "
+            f"手续费占净盈亏 {_format_optional_pct(fee_to_net_pct)}"
+        ),
+    ]
+    if exit_reason_summary:
+        lines.append(f"平仓统计：{exit_reason_summary}")
+    if recommendation is not None:
+        lines.append(f"历史推荐：{config.inst_id} {format_risk_recommendation(recommendation)}。")
+    if result.data_source_note:
+        lines.append(f"数据来源：{result.data_source_note}")
+    if report_path is not None:
+        lines.append(f"报告文件：{report_path}")
+    if artifact_paths is not None:
+        lines.extend(
+            [
+                f"资本审计：{artifact_paths['capital']}",
+                f"操作日志：{artifact_paths['operations']}",
+                f"审计清单：{artifact_paths['manifest']}",
+            ]
+        )
+    return lines
 
 
 def _build_batch_backtest_report_text(
@@ -314,6 +385,8 @@ def _build_trade_lines(result: BacktestResult) -> str:
 def _resolve_batch_mode(config: StrategyConfig) -> str:
     if is_strategy_pool_config(config):
         return "strategy_pool"
+    if get_strategy_runtime_profile(config.strategy_id).family == "ema55_slope_short":
+        return "atr_period_matrix"
     if is_dynamic_strategy_id(config.strategy_id):
         if config.take_profit_mode == "dynamic":
             return "dynamic_entries"
@@ -339,6 +412,8 @@ def _batch_result_sort_key(config: StrategyConfig, batch_mode: str) -> tuple[obj
             config.atr_stop_multiplier,
             config.atr_take_multiplier,
         )
+    if batch_mode == "atr_period_matrix":
+        return (config.atr_stop_multiplier, config.atr_period)
     return (config.atr_stop_multiplier, config.atr_take_multiplier)
 
 
@@ -366,6 +441,8 @@ def _build_batch_result_title(index: int, config: StrategyConfig, batch_mode: st
             f"SL x{format_decimal(config.atr_stop_multiplier)} | "
             f"TP x{format_decimal(config.atr_take_multiplier)}"
         )
+    if batch_mode == "atr_period_matrix":
+        return f"[{index}] ATR{config.atr_period} | SL x{format_decimal(config.atr_stop_multiplier)}"
     return (
         f"[{index}] SL x{format_decimal(config.atr_stop_multiplier)} | "
         f"TP x{format_decimal(config.atr_take_multiplier)}"
@@ -390,6 +467,8 @@ def _build_batch_detail_file_name(index: int, config: StrategyConfig, batch_mode
             f"sl_x{format_decimal(config.atr_stop_multiplier)}_"
             f"tp_x{format_decimal(config.atr_take_multiplier)}"
         )
+    elif batch_mode == "atr_period_matrix":
+        suffix = f"atr_{config.atr_period}_sl_x{format_decimal(config.atr_stop_multiplier)}"
     else:
         suffix = (
             f"sl_x{format_decimal(config.atr_stop_multiplier)}_"
@@ -429,6 +508,59 @@ def _build_batch_scope_line(
             "每波最多开仓次数 = 0/1/2/3；"
             "SL = 1/1.5/2 ATR；"
             "TP = SL x1/x2/x3；"
+            f"手续费 M/T = {maker_fee} / {taker_fee}"
+        )
+    return f"参数范围：SL = 1/1.5/2 ATR；TP = SL x1/x2/x3；手续费 M/T = {maker_fee} / {taker_fee}"
+
+
+    if batch_mode == "atr_period_matrix":
+        return (
+            "鍙傛暟鑼冨洿锛欰TR 鍛ㄦ湡 = 10 / 14锛?"
+            "SL = 1/1.5/2 ATR锛?"
+            "ATR 止盈鍙綔淇濇姢浠峰悎娉曞崰浣嶏紝绛栫暐浠呯敤 ATR 姝㈡崯 + 鏂滅巼骞冲潶绂诲満锛?"
+            f"鎵嬬画璐?M/T = {maker_fee} / {taker_fee}"
+        )
+    return f"鍙傛暟鑼冨洿锛歋L = 1/1.5/2 ATR锛汿P = SL x1/x2/x3锛涙墜缁垂 M/T = {maker_fee} / {taker_fee}"
+
+
+def _build_batch_scope_line(
+    results: list[tuple[StrategyConfig, BacktestResult]],
+    batch_mode: str,
+) -> str:
+    maker_fee = _format_percent(results[0][1].maker_fee_rate)
+    taker_fee = _format_percent(results[0][1].taker_fee_rate)
+    if batch_mode == "strategy_pool":
+        first_config = results[0][0]
+        return (
+            "参数范围：5m 候选策略池；"
+            f"候选数 = {len(results)}；"
+            f"最大加仓 = {first_config.max_entries_per_trend}；"
+            f"单次下单量 = {format_decimal(first_config.order_size)}；"
+            f"手续费 M/T = {maker_fee} / {taker_fee}"
+        )
+    if batch_mode == "dynamic_entries":
+        return (
+            "参数范围：动态止盈；"
+            f"挂单参考线 = {_config_reference_label(results[0][0])}；"
+            "SL = 1/1.5/2 ATR；"
+            "每波最大开仓次数 = 0/1/2/3；"
+            f"2R 保本 = {results[0][0].dynamic_two_r_break_even_label()}；"
+            f"手续费偏移 = {results[0][0].dynamic_fee_offset_enabled_label()}；"
+            f"手续费 M/T = {maker_fee} / {taker_fee}"
+        )
+    if batch_mode == "fixed_entries":
+        return (
+            f"参数范围：挂单参考线 = {_config_reference_label(results[0][0])}；"
+            "每波最大开仓次数 = 0/1/2/3；"
+            "SL = 1/1.5/2 ATR；"
+            "TP = SL x1/x2/x3；"
+            f"手续费 M/T = {maker_fee} / {taker_fee}"
+        )
+    if batch_mode == "atr_period_matrix":
+        return (
+            "参数范围：ATR 周期 = 10 / 14；"
+            "SL = 1/1.5/2 ATR；"
+            "ATR 止盈仅作保护价格占位，策略实际只使用 ATR 止损 + EMA55 斜率走平离场；"
             f"手续费 M/T = {maker_fee} / {taker_fee}"
         )
     return f"参数范围：SL = 1/1.5/2 ATR；TP = SL x1/x2/x3；手续费 M/T = {maker_fee} / {taker_fee}"
@@ -487,6 +619,25 @@ def _build_batch_matrix_lines(results: list[tuple[StrategyConfig, BacktestResult
             lines.append(_build_matrix_lines(group))
             lines.append("")
         return "\n".join(lines).rstrip()
+    if batch_mode == "atr_period_matrix":
+        atr_periods = sorted({config.atr_period for config, _ in results})
+        header = ["SL \\\\ ATR", *[f"ATR{period}" for period in atr_periods]]
+        rows = [" | ".join(header)]
+        stop_values = sorted({config.atr_stop_multiplier for config, _ in results})
+        for stop_value in stop_values:
+            cells = [f"SL x{format_decimal(stop_value)}"]
+            for atr_period in atr_periods:
+                matched = next(
+                    (
+                        result
+                        for config, result in results
+                        if config.atr_stop_multiplier == stop_value and config.atr_period == atr_period
+                    ),
+                    None,
+                )
+                cells.append("-" if matched is None else _build_matrix_cell_text(matched))
+            rows.append(" | ".join(cells))
+        return "\n".join(rows)
 
     return _build_matrix_lines(results)
 
@@ -518,6 +669,17 @@ def _build_matrix_cell_text(result: BacktestResult) -> str:
         f"{format_decimal_fixed(result.report.win_rate, 2)}% | "
         f"{result.report.total_trades}笔"
     )
+
+
+def _build_exit_reason_summary_text(result: BacktestResult) -> str:
+    counts: dict[str, int] = {}
+    for trade in result.trades:
+        label = format_trade_exit_reason(trade.exit_reason)
+        counts[label] = counts.get(label, 0) + 1
+    if not counts:
+        return ""
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return " | ".join(f"{label} {count}" for label, count in ordered)
 
 
 def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
@@ -581,6 +743,18 @@ def _format_timestamp(ts: int) -> str:
 
 def _format_percent(rate: Decimal) -> str:
     return f"{format_decimal_fixed(rate * 100, 4)}%"
+
+
+def _format_optional_ratio(value: Decimal | None) -> str:
+    if value is None:
+        return "无亏损交易"
+    return format_decimal_fixed(value, 4)
+
+
+def _format_optional_pct(value: Decimal | None) -> str:
+    if value is None:
+        return "无"
+    return f"{format_decimal_fixed(value, 2)}%"
 
 
 def _sanitize_filename_part(text: str) -> str:

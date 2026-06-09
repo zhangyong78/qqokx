@@ -1250,8 +1250,19 @@ def save_review_html(
         [entryCandle.t.slice(0, 16).replace("T", " "), trade.entry_price],
         [exitCandle.t.slice(0, 16).replace("T", " "), trade.exit_price],
       ];
+      const formatRTag = (rValue) => {{
+        if (!Number.isFinite(rValue) || rValue <= 0) {{
+          return "SL";
+        }}
+        const decimals = Math.abs(rValue) >= 1 ? 1 : 2;
+        const text = rValue.toFixed(decimals).replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1");
+        return `${{text}}R`;
+      }};
       const slMarkerData = (trade.exit_reason === "stop_loss" || trade.exit_reason === "managed_stop")
-        ? [[exitCandle.t.slice(0, 16).replace("T", " "), trade.exit_price]]
+        ? [{{
+            value: [exitCandle.t.slice(0, 16).replace("T", " "), trade.exit_price],
+            label: {{ formatter: formatRTag(Number(trade.r_multiple ?? 0)) }},
+          }}]
         : [];
       const beMarkerData = trade.exit_reason === "breakeven_stop"
         ? [[exitCandle.t.slice(0, 16).replace("T", " "), trade.exit_price]]
@@ -1522,7 +1533,7 @@ def save_review_html(
             itemStyle: {{ color: "#d14e2f" }},
             label: {{
               show: true,
-              formatter: "SL",
+              formatter: (params) => params.data?.label?.formatter ?? "SL",
               position: "right",
               color: "#d14e2f",
               fontWeight: 700,
@@ -2249,6 +2260,14 @@ def build_review_page_html(
       const startPercent = 0;
       const endPercent = 100;
       const visualTrades = isFocusMode ? [trade] : strategyTrades();
+      const formatRTag = (rValue) => {{
+        if (!Number.isFinite(rValue) || rValue <= 0) {{
+          return "SL";
+        }}
+        const decimals = Math.abs(rValue) >= 1 ? 1 : 2;
+        const text = rValue.toFixed(decimals).replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1");
+        return `${{text}}R`;
+      }};
 
       const buildTradeVisuals = (list) => {{
         const visuals = {{
@@ -2310,7 +2329,10 @@ def build_review_page_html(
           visuals.exit.push([exitX, item.exit_price]);
 
           if (item.exit_reason === "stop_loss" || item.exit_reason === "managed_stop") {{
-            visuals.slTag.push([exitX, item.exit_price]);
+            visuals.slTag.push({{
+              value: [exitX, item.exit_price],
+              label: {{ formatter: formatRTag(Number(item.r_multiple ?? 0)) }},
+            }});
           }} else if (item.exit_reason === "breakeven_stop") {{
             visuals.beTag.push([exitX, item.exit_price]);
           }} else if (item.pnl_amount > 0) {{
@@ -2483,7 +2505,7 @@ def build_review_page_html(
             itemStyle: {{ color: "#d14e2f" }},
             label: {{
               show: true,
-              formatter: "SL",
+              formatter: (params) => params.data?.label?.formatter ?? "SL",
               position: "right",
               color: "#d14e2f",
               fontWeight: 700,
@@ -2770,7 +2792,7 @@ def build_review_page_html(
             itemStyle: {{ color: "#d14e2f" }},
             label: {{
               show: true,
-              formatter: "SL",
+              formatter: (params) => params.data?.label?.formatter ?? "SL",
               position: "right",
               color: "#d14e2f",
               fontWeight: 700,
@@ -2839,6 +2861,14 @@ def build_review_page_html(
           (item.entry_index >= zoomStartIndex && item.entry_index <= zoomEndIndex)
           || (item.exit_index >= zoomStartIndex && item.exit_index <= zoomEndIndex)
         ));
+      const formatRTag = (rValue) => {{
+        if (!Number.isFinite(rValue) || rValue <= 0) {{
+          return "SL";
+        }}
+        const decimals = Math.abs(rValue) >= 1 ? 1 : 2;
+        const text = rValue.toFixed(decimals).replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1");
+        return `${{text}}R`;
+      }};
 
       const visuals = {{
         pathSegments: [],
@@ -2896,7 +2926,10 @@ def build_review_page_html(
         visuals.exit.push([exitX, item.exit_price]);
 
         if (item.exit_reason === "stop_loss" || item.exit_reason === "managed_stop") {{
-          visuals.slTag.push([exitX, item.exit_price]);
+          visuals.slTag.push({{
+            value: [exitX, item.exit_price],
+            label: {{ formatter: formatRTag(Number(item.r_multiple ?? 0)) }},
+          }});
         }} else if (item.exit_reason === "breakeven_stop") {{
           visuals.beTag.push([exitX, item.exit_price]);
         }} else if (item.pnl_amount > 0) {{

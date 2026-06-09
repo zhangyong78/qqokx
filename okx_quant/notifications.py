@@ -354,17 +354,17 @@ class EmailNotifier:
         lines.append(f"异常：{message}")
         self.notify_async(subject, "\n".join(lines))
 
-    def notify_async(self, subject: str, body: str) -> None:
+    def notify_async(self, subject: str, body: str, html_body: str | None = None) -> None:
         if not self.enabled:
             return
         threading.Thread(
             target=self._send,
-            args=(subject, body),
+            args=(subject, body, html_body),
             daemon=True,
             name="qqokx-email-notifier",
         ).start()
 
-    def _send(self, subject: str, body: str) -> None:
+    def _send(self, subject: str, body: str, html_body: str | None = None) -> None:
         sender = (self._config.sender_email or self._config.smtp_username).strip()
         recipients = self._recipients()
         if not sender or not recipients:
@@ -375,6 +375,8 @@ class EmailNotifier:
         message["To"] = ", ".join(recipients)
         message["Subject"] = subject
         message.set_content(body)
+        if html_body and html_body.strip():
+            message.add_alternative(html_body, subtype="html")
 
         try:
             if self._config.use_ssl:
@@ -382,9 +384,13 @@ class EmailNotifier:
                     self._login_and_send(smtp, sender, recipients, message)
             else:
                 with smtplib.SMTP(self._config.smtp_host, self._config.smtp_port, timeout=20) as smtp:
+                    smtp.ehlo()
                     smtp.starttls()
+                    smtp.ehlo()
                     self._login_and_send(smtp, sender, recipients, message)
             self._log(f"邮件已发送 | {subject}")
+        except smtplib.SMTPAuthenticationError as exc:
+            self._log(f"邮件发送失败 | {subject} | {self._format_auth_error(exc, sender)}")
         except Exception as exc:
             self._log(f"邮件发送失败 | {subject} | {exc}")
 
@@ -395,9 +401,45 @@ class EmailNotifier:
         recipients: list[str],
         message: EmailMessage,
     ) -> None:
-        if self._config.smtp_username.strip():
-            smtp.login(self._config.smtp_username.strip(), self._config.smtp_password)
+        login_username = (self._config.smtp_username or sender).strip()
+        if login_username and self._config.smtp_password:
+            smtp.login(login_username, self._config.smtp_password)
         smtp.send_message(message, from_addr=sender, to_addrs=recipients)
+
+    @staticmethod
+    def _mask_mailbox(value: str) -> str:
+        text = (value or "").strip()
+        if not text:
+            return "-"
+        if "@" in text:
+            local_part, domain = text.split("@", 1)
+            if len(local_part) <= 2:
+                masked_local = f"{local_part[:1]}***"
+            else:
+                masked_local = f"{local_part[:2]}***"
+            return f"{masked_local}@{domain}"
+        if len(text) <= 3:
+            return "*" * len(text)
+        return f"{text[:2]}***{text[-1]}"
+
+    def _format_auth_error(self, exc: smtplib.SMTPAuthenticationError, sender: str) -> str:
+        smtp_code = getattr(exc, "smtp_code", "")
+        smtp_error = getattr(exc, "smtp_error", "")
+        if isinstance(smtp_error, bytes):
+            detail = smtp_error.decode("utf-8", errors="ignore").strip()
+        else:
+            detail = str(smtp_error).strip()
+        if not detail:
+            detail = str(exc)
+        login_username = (self._config.smtp_username or sender).strip()
+        return (
+            f"SMTP认证失败({smtp_code})：{detail}；请检查 SMTP 用户名、SMTP 密码/授权码，"
+            f"以及 SSL/端口组合是否匹配（常见为 SSL=465，STARTTLS=587）。"
+            f" 当前主机={self._config.smtp_host}:{self._config.smtp_port}"
+            f"，SSL={'开' if self._config.use_ssl else '关'}"
+            f"，用户名={self._mask_mailbox(login_username)}"
+            f"，发件邮箱={self._mask_mailbox(sender)}"
+        )
 
     def _recipients(self) -> list[str]:
         return [item.strip() for item in self._config.recipient_emails if item.strip()]

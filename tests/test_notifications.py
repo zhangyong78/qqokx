@@ -1,8 +1,9 @@
 ﻿from dataclasses import replace
 from decimal import Decimal
+import smtplib
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from okx_quant.engine import StrategyEngine, _classify_live_dynamic_close_reason
 from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
@@ -207,6 +208,58 @@ class EmailNotifierTest(TestCase):
         self.assertIn("开仓价格：2500", body)
         self.assertIn("平仓价格：2550", body)
         self.assertIn("本笔盈亏：+50", body)
+
+    def test_login_uses_sender_email_when_username_blank(self) -> None:
+        notifier = EmailNotifier(
+            EmailNotificationConfig(
+                enabled=True,
+                smtp_host="smtp.example.com",
+                smtp_password="app-password",
+                sender_email="sender@example.com",
+                recipient_emails=("receiver@example.com",),
+            )
+        )
+        smtp = MagicMock()
+
+        notifier._login_and_send(
+            smtp,
+            "sender@example.com",
+            ["receiver@example.com"],
+            MagicMock(),
+        )
+
+        smtp.login.assert_called_once_with("sender@example.com", "app-password")
+        smtp.send_message.assert_called_once()
+
+    def test_send_logs_auth_guidance_for_smtp_535(self) -> None:
+        logger = MagicMock()
+        notifier = EmailNotifier(
+            EmailNotificationConfig(
+                enabled=True,
+                smtp_host="smtp.example.com",
+                smtp_port=465,
+                smtp_username="alerts@example.com",
+                smtp_password="bad-password",
+                sender_email="sender@example.com",
+                recipient_emails=("receiver@example.com",),
+                use_ssl=True,
+            ),
+            logger=logger,
+        )
+        auth_error = smtplib.SMTPAuthenticationError(535, b"Error: authentication failed")
+        smtp_context = MagicMock()
+        smtp_context.__enter__.return_value = MagicMock()
+        smtp_context.__exit__.return_value = False
+        notifier._login_and_send = MagicMock(side_effect=auth_error)
+
+        with patch("okx_quant.notifications.smtplib.SMTP_SSL", return_value=smtp_context):
+            notifier._send("[QQOKX] test", "body")
+
+        logged_message = logger.call_args.args[0]
+        self.assertIn("SMTP认证失败(535)", logged_message)
+        self.assertIn("SMTP 密码/授权码", logged_message)
+        self.assertIn("SSL=开", logged_message)
+        self.assertIn("用户名=al***@example.com", logged_message)
 
 
 class StrategyEngineNotificationTest(TestCase):

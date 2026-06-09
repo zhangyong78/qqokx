@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Literal
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
@@ -219,6 +220,23 @@ _SLOPE_SHORT_SYMBOL_DEFAULTS: dict[str, dict[str, object]] = {
     },
 }
 
+_BTC_EMA55_SLOPE_SHORT_SYMBOL_DEFAULTS: dict[str, dict[str, object]] = {
+    "BTC-USDT-SWAP": {
+        "bar": "1H",
+        "ema_type": "ema",
+        "ema_period": 55,
+        "trend_ema_type": "ema",
+        "trend_ema_period": 55,
+        "atr_period": 14,
+        "atr_stop_multiplier": "1.5",
+        "ema55_slope_exit_enabled": True,
+        "ema55_slope_lock_profit_enabled": True,
+        "ema55_slope_lock_profit_trigger_r": 2,
+        "trend_ema_slope_filter_min_ratio": "-0.0005",
+        "risk_amount": "10",
+    },
+}
+
 _BODY_RETEST_SHORT_SYMBOL_DEFAULTS: dict[str, dict[str, object]] = {
     "BNB-USDT-SWAP": {
         "bar": "1H",
@@ -258,6 +276,8 @@ def get_strategy_symbol_parameter_defaults(
     normalized_symbol = str(symbol or "").strip().upper()
     if strategy_id == STRATEGY_DYNAMIC_LONG_ID:
         defaults = _DYNAMIC_LONG_4COIN_DEFAULTS.get(normalized_symbol)
+    elif strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
+        defaults = _BTC_EMA55_SLOPE_SHORT_SYMBOL_DEFAULTS.get(normalized_symbol)
     elif strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
         defaults = _SLOPE_SHORT_SYMBOL_DEFAULTS.get(normalized_symbol)
     elif strategy_id == STRATEGY_BODY_RETEST_SHORT_ID:

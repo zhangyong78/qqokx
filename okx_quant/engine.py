@@ -51,6 +51,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
+    is_btc_ema55_slope_short_strategy,
     resolve_dynamic_signal_mode,
 )
 from okx_quant.strategy_runtime_registry import (
@@ -71,6 +72,18 @@ def _live_dynamic_take_profit_enabled(config: StrategyConfig) -> bool:
     if str(config.take_profit_mode or "") != "dynamic":
         return False
     return strategy_supports_dynamic_take_profit(config.strategy_id)
+
+
+def _live_ema55_slope_lock_profit_enabled(config: StrategyConfig) -> bool:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return bool(config.ema55_slope_lock_profit_enabled)
+    return _live_dynamic_take_profit_enabled(config)
+
+
+def _live_ema55_slope_lock_profit_trigger_r(config: StrategyConfig) -> int:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return max(int(config.ema55_slope_lock_profit_trigger_r), 2)
+    return 2
 
 
 def live_exchange_dynamic_take_profit_template_enabled(config: StrategyConfig) -> bool:
@@ -340,6 +353,7 @@ class StrategyEngine:
         self._lock = threading.Lock()
         self._order_ref_counter = 0
         self._manual_trade_control = ManualTradeControlState()
+        self._ema55_slope_same_bar_reentry_block_ts: dict[tuple[str, str, str, str], int] = {}
         self._session_runner = EngineSessionRunner(self)
         self._strategy_router = EngineStrategyRouter(self)
         self._retry_policy = EngineRetryPolicy(self)
@@ -392,6 +406,47 @@ class StrategyEngine:
         with self._lock:
             self._manual_trade_control = state
         return state
+
+    def _ema55_slope_same_bar_reentry_key(self, credentials: Credentials, config: StrategyConfig) -> tuple[str, str, str, str]:
+        return (
+            str(credentials.profile_name or "").strip(),
+            str(config.environment or "").strip(),
+            str(config.strategy_id or "").strip(),
+            str(config.inst_id or "").strip(),
+        )
+
+    def _get_ema55_slope_same_bar_reentry_block_ts(self, credentials: Credentials, config: StrategyConfig) -> int | None:
+        key = self._ema55_slope_same_bar_reentry_key(credentials, config)
+        with self._lock:
+            return self._ema55_slope_same_bar_reentry_block_ts.get(key)
+
+    def _mark_ema55_slope_same_bar_reentry_block(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        candle_ts: int | None,
+    ) -> None:
+        if candle_ts is None:
+            return
+        key = self._ema55_slope_same_bar_reentry_key(credentials, config)
+        with self._lock:
+            self._ema55_slope_same_bar_reentry_block_ts[key] = candle_ts
+
+    def _clear_ema55_slope_same_bar_reentry_block_if_advanced(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        candle_ts: int | None,
+    ) -> None:
+        if candle_ts is None:
+            return
+        key = self._ema55_slope_same_bar_reentry_key(credentials, config)
+        with self._lock:
+            blocked_ts = self._ema55_slope_same_bar_reentry_block_ts.get(key)
+            if blocked_ts is not None and candle_ts > blocked_ts:
+                self._ema55_slope_same_bar_reentry_block_ts.pop(key, None)
 
     def amend_exchange_manual_stop_loss(
         self,
@@ -1578,7 +1633,7 @@ class StrategyEngine:
             config.trend_ema_period,
             config.atr_period,
             DEFAULT_DEBUG_ATR_PERIOD,
-        ) + 1
+        ) + (2 if is_btc_ema55_slope_short_strategy(config.strategy_id) else 1)
         last_candle_ts: int | None = None
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
@@ -1612,7 +1667,9 @@ class StrategyEngine:
         while not self._stop_event.is_set():
             candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period) + 1
+            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period) + (
+                2 if is_btc_ema55_slope_short_strategy(config.strategy_id) else 1
+            )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -1623,6 +1680,18 @@ class StrategyEngine:
                 self._stop_event.wait(config.poll_seconds)
                 continue
             last_candle_ts = newest_ts
+            self._clear_ema55_slope_same_bar_reentry_block_if_advanced(
+                credentials,
+                config,
+                candle_ts=newest_ts,
+            )
+            if (
+                config.ema55_slope_same_bar_reentry_block
+                and newest_ts == self._get_ema55_slope_same_bar_reentry_block_ts(credentials, config)
+            ):
+                self._logger(f"{_fmt_ts(newest_ts)} | 本根K线刚平仓，禁止同K线再次开空")
+                self._stop_event.wait(config.poll_seconds)
+                continue
 
             decision = evaluate_ema55_slope_short_signal(
                 confirmed,
@@ -2973,10 +3042,11 @@ class StrategyEngine:
         position: FilledPosition,
         protection: ProtectionPlan,
     ) -> None:
-        dynamic_take_profit_enabled = _live_dynamic_take_profit_enabled(config)
+        uses_flat_exit = is_btc_ema55_slope_short_strategy(config.strategy_id)
+        dynamic_take_profit_enabled = _live_ema55_slope_lock_profit_enabled(config)
         current_stop_loss = protection.stop_loss
         current_take_profit = protection.take_profit
-        next_trigger_r = 2
+        next_trigger_r = _live_ema55_slope_lock_profit_trigger_r(config) if uses_flat_exit else 2
         risk_per_unit = abs(position.entry_price - protection.stop_loss)
         monitor_parts = [
             f"开始本地止盈止损监控 | 触发标的={protection.trigger_inst_id}",
@@ -3031,6 +3101,9 @@ class StrategyEngine:
                     )
                 stop_hit = current_price <= current_stop_loss if protection.direction == "long" else current_price >= current_stop_loss
                 take_hit = False
+            elif uses_flat_exit:
+                stop_hit = current_price <= current_stop_loss if protection.direction == "long" else current_price >= current_stop_loss
+                take_hit = False
             else:
                 stop_hit, take_hit = evaluate_local_exit(
                     direction=protection.direction,
@@ -3078,10 +3151,11 @@ class StrategyEngine:
         protection: ProtectionPlan,
         lookback: int,
     ) -> None:
-        dynamic_take_profit_enabled = _live_dynamic_take_profit_enabled(config)
+        uses_flat_exit = is_btc_ema55_slope_short_strategy(config.strategy_id)
+        dynamic_take_profit_enabled = _live_ema55_slope_lock_profit_enabled(config)
         current_stop_loss = protection.stop_loss
         current_take_profit = protection.take_profit
-        next_trigger_r = 2
+        next_trigger_r = _live_ema55_slope_lock_profit_trigger_r(config) if uses_flat_exit else 2
         risk_per_unit = abs(position.entry_price - protection.stop_loss)
         last_checked_candle_ts: int | None = None
         monitor_parts = [
@@ -3139,6 +3213,9 @@ class StrategyEngine:
                     )
                 stop_hit = current_price <= current_stop_loss if protection.direction == "long" else current_price >= current_stop_loss
                 take_hit = False
+            elif uses_flat_exit:
+                stop_hit = current_price <= current_stop_loss if protection.direction == "long" else current_price >= current_stop_loss
+                take_hit = False
             else:
                 stop_hit, take_hit = evaluate_local_exit(
                     direction=protection.direction,
@@ -3170,6 +3247,11 @@ class StrategyEngine:
                     f"当前价={format_decimal(current_price)} | "
                     f"止损={format_decimal(current_stop_loss)} | 止盈={format_decimal(current_take_profit)}"
                 )
+                self._mark_ema55_slope_same_bar_reentry_block(
+                    credentials,
+                    config,
+                    candle_ts=last_checked_candle_ts or protection.candle_ts,
+                )
                 self._close_position(credentials, config, trade_instrument, position, reason)
                 self.resume_automatic_trade_management()
                 return
@@ -3186,6 +3268,11 @@ class StrategyEngine:
                         line_label = config.ema_label()
                         self._logger(
                             f"{_fmt_ts(exit_candle.ts)} | {line_label} 斜率转正平仓 | 斜率比例={slope_text}"
+                        )
+                        self._mark_ema55_slope_same_bar_reentry_block(
+                            credentials,
+                            config,
+                            candle_ts=exit_candle.ts,
                         )
                         self._close_position(credentials, config, trade_instrument, position, "斜率转正")
                         self.resume_automatic_trade_management()

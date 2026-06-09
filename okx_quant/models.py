@@ -115,7 +115,11 @@ class StrategyConfig:
     dynamic_two_r_break_even: bool = True
     dynamic_fee_offset_enabled: bool = True
     ema55_slope_exit_enabled: bool = True
+    ema55_slope_lock_profit_enabled: bool = False
+    ema55_slope_lock_profit_trigger_r: int = 2
     ema55_slope_same_bar_reentry_block: bool = False
+    ema55_slope_dynamic_exit_requires_bear_reentry: bool = False
+    ema55_slope_dynamic_exit_bear_reentry_break_prev_low: bool = False
     ema55_slope_dynamic_exit_requires_ema_reclaim: bool = False
     ema55_slope_locked_reentry_requires_ema21_near: bool = False
     ema55_slope_locked_reentry_min_r: int = 0

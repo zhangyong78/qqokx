@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_MTF_LONG_ID,
@@ -214,6 +215,55 @@ STRATEGY_UI_SCHEMAS: dict[str, StrategyUiSchema] = {
         force_follow_signal=True,
         force_local_trade=True,
         supports_dynamic_take_profit=True,
+    ),
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID: StrategyUiSchema(
+        strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+        parameter_defaults={
+            _SCOPE_LAUNCHER: {
+                "bar": "1H",
+                "ema_type": "ema",
+                "ema_period": 55,
+                "trend_ema_type": "ema",
+                "trend_ema_period": 55,
+                "atr_period": 14,
+                "atr_stop_multiplier": "1.5",
+                "ema55_slope_exit_enabled": True,
+                "ema55_slope_lock_profit_enabled": True,
+                "ema55_slope_lock_profit_trigger_r": 2,
+                "trend_ema_slope_filter_min_ratio": "-0.0005",
+            },
+            _SCOPE_BACKTEST: {
+                "bar": "1H",
+                "ema_type": "ema",
+                "ema_period": 55,
+                "trend_ema_type": "ema",
+                "trend_ema_period": 55,
+                "atr_period": 14,
+                "atr_stop_multiplier": "1.5",
+                "ema55_slope_exit_enabled": True,
+                "ema55_slope_lock_profit_enabled": True,
+                "ema55_slope_lock_profit_trigger_r": 2,
+                "trend_ema_slope_filter_min_ratio": "-0.0005",
+            },
+        },
+        extra_defaults={
+            _SCOPE_LAUNCHER: {
+                "entry_side_mode": "follow_signal",
+                "order_size": "0",
+                "poll_seconds": "10",
+                "position_mode": "net",
+                "risk_amount": "10",
+                "tp_sl_mode": "local_trade",
+                "trade_mode": "cross",
+                "trigger_type": "mark",
+            },
+            _SCOPE_BACKTEST: {
+                "risk_amount": "100",
+                "sizing_mode": "fixed_risk",
+            },
+        },
+        force_follow_signal=True,
+        force_local_trade=True,
     ),
     STRATEGY_BODY_RETEST_SHORT_ID: StrategyUiSchema(
         strategy_id=STRATEGY_BODY_RETEST_SHORT_ID,

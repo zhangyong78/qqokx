@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
@@ -68,3 +69,14 @@ class StrategySymbolDefaultsTest(TestCase):
         definition = get_strategy_definition(STRATEGY_EMA55_SLOPE_SHORT_ID)
 
         self.assertEqual(definition.name, "均线斜率做空")
+    def test_btc_ema55_slope_short_defaults_use_atr10(self) -> None:
+        defaults = get_strategy_symbol_parameter_defaults(
+            STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+            "BTC-USDT-SWAP",
+            "launcher",
+        )
+
+        self.assertEqual(defaults["ema_period"], 55)
+        self.assertEqual(defaults["trend_ema_period"], 55)
+        self.assertEqual(defaults["atr_period"], 10)
+        self.assertEqual(defaults["atr_stop_multiplier"], "2")

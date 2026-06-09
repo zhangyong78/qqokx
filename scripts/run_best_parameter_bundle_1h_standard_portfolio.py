@@ -435,6 +435,14 @@ def deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         trend_ema_slope_filter_enabled=coerce_bool(payload.get("trend_ema_slope_filter_enabled"), True),
         ema55_slope_exit_enabled=coerce_bool(payload.get("ema55_slope_exit_enabled"), True),
         ema55_slope_same_bar_reentry_block=coerce_bool(payload.get("ema55_slope_same_bar_reentry_block"), False),
+        ema55_slope_dynamic_exit_requires_bear_reentry=coerce_bool(
+            payload.get("ema55_slope_dynamic_exit_requires_bear_reentry"),
+            False,
+        ),
+        ema55_slope_dynamic_exit_bear_reentry_break_prev_low=coerce_bool(
+            payload.get("ema55_slope_dynamic_exit_bear_reentry_break_prev_low"),
+            False,
+        ),
         ema55_slope_dynamic_exit_requires_ema_reclaim=coerce_bool(
             payload.get("ema55_slope_dynamic_exit_requires_ema_reclaim"),
             False,
@@ -528,6 +536,7 @@ def simulate_portfolio(
     fixed_risk_amount: Decimal | None = None,
     fee_multiplier: Decimal = Decimal("1"),
     slippage_multiplier: Decimal = Decimal("1"),
+    preserve_candidate_size: bool = False,
 ) -> dict[str, Any]:
     ordered = sorted(candidates, key=lambda item: (item.entry_ts, item.strategy_name, item.symbol, item.side))
     open_positions: list[dict[str, Any]] = []
@@ -611,8 +620,12 @@ def simulate_portfolio(
         else:
             reject_reason = ""
 
-        target_risk = fixed_risk_amount if fixed_risk_amount is not None else (equity * risk_per_trade if equity > 0 else Decimal("0"))
-        scale = Decimal("0") if target_risk <= 0 else target_risk / candidate.base_risk_value
+        if preserve_candidate_size:
+            target_risk = candidate.base_risk_value
+            scale = Decimal("1")
+        else:
+            target_risk = fixed_risk_amount if fixed_risk_amount is not None else (equity * risk_per_trade if equity > 0 else Decimal("0"))
+            scale = Decimal("0") if target_risk <= 0 else target_risk / candidate.base_risk_value
         scaled_notional = candidate.base_notional * scale
 
         if not reject_reason and total_notional + scaled_notional > equity * max_total_exposure:
@@ -644,8 +657,16 @@ def simulate_portfolio(
         scaled_total_fee = candidate.base_total_fee * scale * fee_multiplier
         scaled_slippage_cost = candidate.base_slippage_cost * scale * slippage_multiplier
         scaled_funding_cost = candidate.base_funding_cost * scale
-        scaled_gross_pnl = candidate.base_gross_pnl * scale
-        scaled_pnl = scaled_gross_pnl - scaled_total_fee - scaled_slippage_cost - scaled_funding_cost
+
+        # BacktestTrade.gross_pnl is already based on slipped entry/exit prices.
+        # base_pnl therefore already includes the baseline slippage effect, while
+        # slippage_cost is kept separately for reporting and stress adjustments.
+        baseline_gross_pnl = candidate.base_gross_pnl * scale
+        baseline_pnl = candidate.base_pnl * scale
+        fee_delta = (fee_multiplier - Decimal("1")) * candidate.base_total_fee * scale
+        slippage_delta = (slippage_multiplier - Decimal("1")) * candidate.base_slippage_cost * scale
+        scaled_gross_pnl = baseline_gross_pnl - slippage_delta
+        scaled_pnl = baseline_pnl - fee_delta - slippage_delta
         open_positions.append(
             {
                 "trade_no": trade_no,
@@ -1976,6 +1997,95 @@ def build_executed_trade_frame_from_export(trades_export: pd.DataFrame) -> pd.Da
             "funding_cost": 0.0,
         }
     )
+
+
+def build_period_profit_breakdown(trades: pd.DataFrame, *, period: str) -> pd.DataFrame:
+    columns = ["期间", "方向", "币种", "项目", "交易次数", "胜率", "Profit Factor", "当期利润U", "累计利润U"]
+    if trades.empty:
+        return pd.DataFrame(columns=columns)
+
+    freq = "M" if period == "monthly" else "Y"
+    label_fmt = "%Y-%m" if period == "monthly" else "%Y"
+    frame = trades.copy()
+    frame["period_dt"] = pd.to_datetime(frame["exit_time_bjt"]).dt.to_period(freq).dt.to_timestamp()
+    frame["期间"] = frame["period_dt"].dt.strftime(label_fmt)
+
+    rows: list[dict[str, Any]] = []
+    for period_dt, period_subset in frame.groupby("period_dt", sort=True):
+        period_label = period_dt.strftime(label_fmt)
+        for side in ("多头", "空头"):
+            side_subset = period_subset[period_subset["side"] == side]
+            for coin in sorted(side_subset["coin"].dropna().unique()):
+                coin_subset = side_subset[side_subset["coin"] == coin]
+                metrics = compute_trade_metrics(coin_subset, INITIAL_CAPITAL)
+                rows.append(
+                    {
+                        "期间": period_label,
+                        "方向": side,
+                        "币种": coin,
+                        "项目": "分项",
+                        "交易次数": metrics["trades"],
+                        "胜率": round(metrics["win_rate"] * 100.0, 2),
+                        "Profit Factor": round(metrics["profit_factor"], 4),
+                        "当期利润U": round(metrics["total_pnl"], 2),
+                    }
+                )
+            if not side_subset.empty:
+                side_metrics = compute_trade_metrics(side_subset, INITIAL_CAPITAL)
+                rows.append(
+                    {
+                        "期间": period_label,
+                        "方向": side,
+                        "币种": "合计",
+                        "项目": "总项",
+                        "交易次数": side_metrics["trades"],
+                        "胜率": round(side_metrics["win_rate"] * 100.0, 2),
+                        "Profit Factor": round(side_metrics["profit_factor"], 4),
+                        "当期利润U": round(side_metrics["total_pnl"], 2),
+                    }
+                )
+
+        total_metrics = compute_trade_metrics(period_subset, INITIAL_CAPITAL)
+        rows.append(
+            {
+                "期间": period_label,
+                "方向": "合计",
+                "币种": "合计",
+                "项目": "总项",
+                "交易次数": total_metrics["trades"],
+                "胜率": round(total_metrics["win_rate"] * 100.0, 2),
+                "Profit Factor": round(total_metrics["profit_factor"], 4),
+                "当期利润U": round(total_metrics["total_pnl"], 2),
+            }
+        )
+
+    breakdown = pd.DataFrame(rows)
+    breakdown["累计利润U"] = (
+        breakdown.sort_values(["方向", "币种", "项目", "期间"])
+        .groupby(["方向", "币种", "项目"])["当期利润U"]
+        .cumsum()
+        .round(2)
+    )
+    return breakdown[columns].sort_values(["期间", "方向", "项目", "币种"]).reset_index(drop=True)
+
+
+def build_html_report_extended(
+    *,
+    monthly_breakdown: pd.DataFrame,
+    yearly_breakdown: pd.DataFrame,
+    **kwargs: Any,
+) -> str:
+    html_text = build_html_report(**kwargs)
+    extra_section = f"""
+    <section class="section">
+      <h2>月度利润拆分</h2>
+      <p class="muted">按平仓时间归属。项目=分项表示单币种，项目=总项表示方向合计或组合合计。</p>
+      {render_table(monthly_breakdown)}
+      <h3>年度利润拆分</h3>
+      {render_table(yearly_breakdown)}
+    </section>
+    """
+    return html_text.replace("</body>", f"{extra_section}\n</body>")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from typing import Literal
 
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_EMA5_EMA8_ID,
@@ -120,7 +121,7 @@ def get_strategy_runtime_profile(strategy_id: str) -> StrategyRuntimeProfile:
         return _CROSS_BREAKDOWN_SHORT_PROFILE
     if is_ema_atr_breakout_strategy(strategy_id):
         return _CROSS_BREAKOUT_LONG_PROFILE
-    if strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
+    if strategy_id in {STRATEGY_EMA55_SLOPE_SHORT_ID, STRATEGY_BTC_EMA55_SLOPE_SHORT_ID}:
         return _EMA55_SLOPE_SHORT_PROFILE
     if strategy_id == STRATEGY_BODY_RETEST_SHORT_ID:
         return _BODY_RETEST_SHORT_PROFILE

@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_EMA5_EMA8_ID,
@@ -96,3 +97,15 @@ class StrategyUiSchemaTest(TestCase):
         self.assertFalse(launcher_visibility.show_hold_close_exit)
         self.assertTrue(backtest_visibility.show_dynamic_take_profit)
         self.assertTrue(backtest_visibility.show_slope_threshold)
+
+    def test_btc_ema55_slope_short_schema_hides_dynamic_take_profit_controls(self) -> None:
+        self.assertFalse(strategy_supports_dynamic_take_profit(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID))
+        launcher_defaults = strategy_ui_extra_defaults(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "launcher")
+        self.assertEqual(launcher_defaults["risk_amount"], "10")
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "atr_period", "launcher"),
+            10,
+        )
+        visibility = build_strategy_widget_visibility(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "launcher")
+        self.assertFalse(visibility.show_dynamic_take_profit)
+        self.assertTrue(visibility.show_slope_threshold)

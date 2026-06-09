@@ -50,9 +50,11 @@ from okx_quant.strategy_runtime_registry import (
 )
 from okx_quant.strategy_ui_schema import build_strategy_widget_visibility
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
     is_adaptive_ema_rail_strategy,
+    is_btc_ema55_slope_short_strategy,
     resolve_dynamic_signal_mode,
 )
 
@@ -71,6 +73,7 @@ ATR_BATCH_TAKE_RATIOS: tuple[Decimal, ...] = (
     Decimal("2"),
     Decimal("3"),
 )
+ATR_PERIOD_BATCH_OPTIONS: tuple[int, ...] = (10, 14)
 BATCH_MAX_ENTRIES_OPTIONS: tuple[int, ...] = (0, 1, 2, 3)
 MANUAL_NEAR_BREAK_EVEN_THRESHOLD_PCT = Decimal("0.50")
 
@@ -235,7 +238,12 @@ class BacktestResult:
     take_profit_mode: str = "fixed"
     dynamic_two_r_break_even: bool = False
     dynamic_fee_offset_enabled: bool = True
+    ema55_slope_exit_enabled: bool = True
+    ema55_slope_lock_profit_enabled: bool = False
+    ema55_slope_lock_profit_trigger_r: int = 2
     ema55_slope_same_bar_reentry_block: bool = False
+    ema55_slope_dynamic_exit_requires_bear_reentry: bool = False
+    ema55_slope_dynamic_exit_bear_reentry_break_prev_low: bool = False
     ema55_slope_dynamic_exit_requires_ema_reclaim: bool = False
     ema55_slope_locked_reentry_requires_ema21_near: bool = False
     ema55_slope_locked_reentry_min_r: int = 0
@@ -336,6 +344,7 @@ class _OpenPosition:
     tick_size: Decimal = Decimal("0.1")
     entry_sequence: int = 0
     dynamic_take_profit_enabled: bool = False
+    take_profit_enabled: bool = True
     next_dynamic_trigger_r: int = 2
     dynamic_exit_fee_rate: Decimal = Decimal("0")
     dynamic_two_r_break_even: bool = False
@@ -399,6 +408,44 @@ def _dynamic_exit_matches_bull_bar_reentry_window(exit_reason: str, *, min_r: in
     if max(min_r, 0) <= 0 and max_r <= 0:
         return is_dynamic_protect_exit_reason(exit_reason)
     return _locked_r_matches_reentry_window(exit_reason, min_r=min_r, max_r=max_r)
+
+
+def _should_require_bearish_reentry_after_dynamic_exit(config: StrategyConfig, exit_reason: str) -> bool:
+    return bool(config.ema55_slope_dynamic_exit_requires_bear_reentry and is_dynamic_protect_exit_reason(exit_reason))
+
+
+def _ema55_slope_entry_uses_negative_turn(config: StrategyConfig) -> bool:
+    return is_btc_ema55_slope_short_strategy(config.strategy_id)
+
+
+def _ema55_slope_exit_condition_enabled(config: StrategyConfig) -> bool:
+    return bool(config.ema55_slope_exit_enabled)
+
+
+def _ema55_slope_lock_profit_enabled(config: StrategyConfig) -> bool:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return bool(config.ema55_slope_lock_profit_enabled)
+    return str(config.take_profit_mode or "") == "dynamic"
+
+
+def _ema55_slope_lock_profit_trigger_r(config: StrategyConfig) -> int:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return max(int(config.ema55_slope_lock_profit_trigger_r), 2)
+    return 2
+
+
+def _ema55_slope_entry_triggered(
+    config: StrategyConfig,
+    *,
+    current_slope_ratio: Decimal | None,
+    previous_slope_ratio: Decimal | None,
+    threshold: Decimal,
+) -> bool:
+    if current_slope_ratio is None or current_slope_ratio > threshold:
+        return False
+    if not _ema55_slope_entry_uses_negative_turn(config):
+        return True
+    return previous_slope_ratio is not None and previous_slope_ratio >= 0
 
 
 def format_trade_exit_reason(exit_reason: str) -> str:
@@ -550,6 +597,36 @@ def build_atr_batch_configs(
     return configs
 
 
+def build_btc_slope_short_batch_configs(
+    base_config: StrategyConfig,
+    *,
+    atr_periods: tuple[int, ...] = ATR_PERIOD_BATCH_OPTIONS,
+    atr_multipliers: tuple[Decimal, ...] = ATR_BATCH_MULTIPLIERS,
+) -> list[StrategyConfig]:
+    configs: list[StrategyConfig] = []
+    seen: set[tuple[int, Decimal]] = set()
+    take_multiplier = (
+        base_config.atr_take_multiplier
+        if base_config.atr_take_multiplier > 0
+        else base_config.atr_stop_multiplier
+    )
+    for atr_period in atr_periods:
+        for stop_multiplier in atr_multipliers:
+            key = (int(atr_period), stop_multiplier)
+            if key in seen:
+                continue
+            seen.add(key)
+            configs.append(
+                replace(
+                    base_config,
+                    atr_period=max(int(atr_period), 1),
+                    atr_stop_multiplier=stop_multiplier,
+                    atr_take_multiplier=take_multiplier,
+                )
+            )
+    return configs
+
+
 def build_dynamic_entry_batch_configs(
     base_config: StrategyConfig,
     *,
@@ -676,8 +753,16 @@ def build_parameter_batch_configs(
     max_entries_options: tuple[int, ...] = BATCH_MAX_ENTRIES_OPTIONS,
 ) -> list[StrategyConfig]:
     family = _backtest_strategy_family(base_config.strategy_id)
+    if is_btc_ema55_slope_short_strategy(base_config.strategy_id):
+        return build_btc_slope_short_batch_configs(
+            base_config,
+            atr_multipliers=atr_multipliers,
+        )
     if family == "ema55_slope_short":
-        return [base_config]
+        return build_btc_slope_short_batch_configs(
+            base_config,
+            atr_multipliers=atr_multipliers,
+        )
     if family == "body_retest_short":
         return [base_config]
     if family not in {"dynamic_order", "adaptive_ema_rail"}:
@@ -1109,7 +1194,14 @@ def _run_backtest_with_loaded_data(
         take_profit_mode=str(config.take_profit_mode),
         dynamic_two_r_break_even=bool(config.dynamic_two_r_break_even),
         dynamic_fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+        ema55_slope_exit_enabled=bool(config.ema55_slope_exit_enabled),
+        ema55_slope_lock_profit_enabled=bool(config.ema55_slope_lock_profit_enabled),
+        ema55_slope_lock_profit_trigger_r=max(int(config.ema55_slope_lock_profit_trigger_r), 2),
         ema55_slope_same_bar_reentry_block=bool(config.ema55_slope_same_bar_reentry_block),
+        ema55_slope_dynamic_exit_requires_bear_reentry=bool(config.ema55_slope_dynamic_exit_requires_bear_reentry),
+        ema55_slope_dynamic_exit_bear_reentry_break_prev_low=bool(
+            config.ema55_slope_dynamic_exit_bear_reentry_break_prev_low
+        ),
         ema55_slope_dynamic_exit_requires_ema_reclaim=bool(config.ema55_slope_dynamic_exit_requires_ema_reclaim),
         ema55_slope_locked_reentry_requires_ema21_near=bool(config.ema55_slope_locked_reentry_requires_ema21_near),
         ema55_slope_locked_reentry_min_r=int(config.ema55_slope_locked_reentry_min_r),
@@ -1915,7 +2007,10 @@ def _run_ema55_slope_short_backtest(
     taker_fee_rate: Decimal = Decimal("0"),
     direction_filter_bias: list[str] | None = None,
 ) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
-    minimum = max(int(config.ema_period), int(config.trend_ema_period), int(config.atr_period), 2) + 1
+    entry_requires_negative_turn = _ema55_slope_entry_uses_negative_turn(config)
+    minimum = max(int(config.ema_period), int(config.trend_ema_period), int(config.atr_period), 2) + (
+        2 if entry_requires_negative_turn else 1
+    )
     if len(candles) < minimum:
         raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根。")
     trade_start_index = _backtest_trade_start_index(minimum)
@@ -1929,7 +2024,11 @@ def _run_ema55_slope_short_backtest(
     trades: list[BacktestTrade] = []
     open_position: _OpenPosition | None = None
     entry_slope_threshold_ratio = Decimal(str(config.trend_ema_slope_filter_min_ratio))
-    dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
+    uses_flat_exit = is_btc_ema55_slope_short_strategy(config.strategy_id)
+    slope_exit_enabled = _ema55_slope_exit_condition_enabled(config)
+    dynamic_take_profit_enabled = _ema55_slope_lock_profit_enabled(config)
+    dynamic_trigger_r = _ema55_slope_lock_profit_trigger_r(config)
+    take_profit_enabled = not uses_flat_exit
     reentry_reclaim_state: str | None = None
     reentry_ema21_near_state: str | None = None
     reentry_bearish_bar_required = False
@@ -1941,12 +2040,16 @@ def _run_ema55_slope_short_backtest(
         current_ema = ema_values[index]
         current_ema21 = ema21_values[index] if index < len(ema21_values) else None
         previous_ema = ema_values[index - 1] if index > 0 else None
+        pre_previous_ema = ema_values[index - 2] if index > 1 else None
         atr_value = atr_values[index] if index < len(atr_values) else None
         if current_ema is None or previous_ema is None or current_ema21 is None or atr_value is None or atr_value <= 0:
             continue
 
         slope = current_ema - previous_ema
         slope_ratio = slope / current_ema if current_ema != 0 else None
+        previous_slope_ratio = None
+        if pre_previous_ema is not None and previous_ema != 0:
+            previous_slope_ratio = (previous_ema - pre_previous_ema) / previous_ema
         exited_this_bar = False
 
         if open_position is not None:
@@ -1961,6 +2064,8 @@ def _run_ema55_slope_short_backtest(
                 trades.append(closed_trade)
                 open_position = None
                 exited_this_bar = True
+                if _should_require_bearish_reentry_after_dynamic_exit(config, closed_trade.exit_reason):
+                    reentry_bearish_bar_required = True
                 if (
                     config.ema55_slope_dynamic_exit_requires_ema_reclaim
                     and is_dynamic_protect_exit_reason(closed_trade.exit_reason)
@@ -1986,7 +2091,7 @@ def _run_ema55_slope_short_backtest(
                 ):
                     reentry_bearish_bar_required = True
 
-        if open_position is not None and slope > 0:
+        if open_position is not None and slope_exit_enabled and (((slope >= 0) if uses_flat_exit else (slope > 0))):
             exit_price_raw = snap_to_increment(candle.close, instrument.tick_size, "nearest")
             exit_price = _apply_slippage_price(
                 exit_price_raw,
@@ -2012,8 +2117,12 @@ def _run_ema55_slope_short_backtest(
 
         if (
             open_position is not None
-            or slope_ratio is None
-            or slope_ratio > entry_slope_threshold_ratio
+            or not _ema55_slope_entry_triggered(
+                config,
+                current_slope_ratio=slope_ratio,
+                previous_slope_ratio=previous_slope_ratio,
+                threshold=entry_slope_threshold_ratio,
+            )
         ):
             continue
         if config.ema55_slope_same_bar_reentry_block and exited_this_bar:
@@ -2038,7 +2147,13 @@ def _run_ema55_slope_short_backtest(
         if direction_filter_bias is not None and index < len(direction_filter_bias):
             if not _direction_filter_allows_signal(direction_filter_bias[index], "short"):
                 continue
-        if reentry_bearish_bar_required and candle.close >= candle.open:
+        if reentry_bearish_bar_required and (exited_this_bar or candle.close >= candle.open):
+            continue
+        if (
+            reentry_bearish_bar_required
+            and config.ema55_slope_dynamic_exit_bear_reentry_break_prev_low
+            and (index <= 0 or candle.close >= candles[index - 1].low)
+        ):
             continue
 
         try:
@@ -2080,11 +2195,13 @@ def _run_ema55_slope_short_backtest(
             exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
             funding_rate=config.backtest_funding_rate,
             dynamic_take_profit_enabled=dynamic_take_profit_enabled,
+            take_profit_enabled=take_profit_enabled,
             dynamic_exit_fee_rate=taker_fee_rate,
             dynamic_two_r_break_even=config.dynamic_two_r_break_even,
             dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
             time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+            next_dynamic_trigger_r=dynamic_trigger_r,
             apply_entry_slippage=True,
         )
         reentry_reclaim_state = None
@@ -3108,6 +3225,7 @@ def _create_open_position(
     funding_rate: Decimal,
     entry_sequence: int = 0,
     dynamic_take_profit_enabled: bool = False,
+    take_profit_enabled: bool = True,
     dynamic_exit_fee_rate: Decimal = Decimal("0"),
     dynamic_two_r_break_even: bool = False,
     dynamic_fee_offset_enabled: bool = True,
@@ -3157,6 +3275,7 @@ def _create_open_position(
         tick_size=instrument.tick_size,
         entry_sequence=entry_sequence,
         dynamic_take_profit_enabled=dynamic_take_profit_enabled,
+        take_profit_enabled=take_profit_enabled,
         next_dynamic_trigger_r=next_dynamic_trigger_r,
         dynamic_exit_fee_rate=dynamic_exit_fee_rate,
         dynamic_two_r_break_even=dynamic_two_r_break_even,
@@ -3782,7 +3901,7 @@ def _try_close_position(
 
     if position.signal == "long":
         stop_hit = candle.low <= position.stop_loss
-        take_hit = candle.high >= position.take_profit
+        take_hit = position.take_profit_enabled and candle.high >= position.take_profit
         if stop_hit:
             exit_price_raw = position.stop_loss
             exit_reason = "stop_loss"
@@ -3793,7 +3912,7 @@ def _try_close_position(
             return None
     else:
         stop_hit = candle.high >= position.stop_loss
-        take_hit = candle.low <= position.take_profit
+        take_hit = position.take_profit_enabled and candle.low <= position.take_profit
         if stop_hit:
             exit_price_raw = position.stop_loss
             exit_reason = "stop_loss"
@@ -4056,6 +4175,21 @@ def _format_backtest_sizing_mode(value: str) -> str:
 
 
 def _append_backtest_dynamic_take_profit_lines(lines: list[str], result: BacktestResult) -> None:
+    if result.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
+        lines.append(
+            "平仓条件："
+            f"斜率转正平仓={'开启' if result.ema55_slope_exit_enabled else '关闭'} | "
+            f"{result.ema55_slope_lock_profit_trigger_r}R锁盈利+双向手续费="
+            f"{'开启' if result.ema55_slope_lock_profit_enabled else '关闭'}"
+        )
+        lines.append("止损说明：该策略始终使用 ATR 止损。")
+        if result.ema55_slope_lock_profit_enabled:
+            lines.append(
+                "锁盈说明：价格先达到设定 R 倍数后，把止损上移到已锁定 "
+                f"{max(result.ema55_slope_lock_profit_trigger_r - 1, 1)}R + 双向 Taker 手续费；"
+                "此后每多走 1R，止损继续按 1R 台阶递进。"
+            )
+        return
     lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
     if result.take_profit_mode != "dynamic":
         lines.append("止盈说明：固定止盈为 ATR 倍数止盈。")
@@ -4175,9 +4309,14 @@ def _append_backtest_strategy_notes(
         lines.append("本策略不设固定止盈，回测使用收盘确认与收盘价离场。")
         return
     if family == "ema55_slope_short":
-        lines.append(
-            f"交易逻辑：固定 {fast_label}；当 {fast_label} 单根斜率比例小于等于阈值时按收盘价开空，持仓后继续按 ATR 止损/固定或动态止盈管理；若 {fast_label} 斜率重新转正，则按收盘价平仓。"
-        )
+        if result.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
+            lines.append(
+                f"交易逻辑：固定 {fast_label}；只有当 {fast_label} 先处于上升或走平，随后单根斜率首次转负且比例小于等于阈值时，才按收盘价开空。持仓后始终按 ATR 止损管理；若勾选对应平仓条件，则再叠加 {fast_label} 斜率转正平仓，以及 N R 锁盈利+双向手续费。"
+            )
+        else:
+            lines.append(
+                f"交易逻辑：固定 {fast_label}；当 {fast_label} 单根斜率比例小于等于阈值时按收盘价开空，持仓后继续按 ATR 止损/固定或动态止盈管理；若开启斜率转正平仓条件，则在 {fast_label} 斜率重新转正时按收盘价平仓。"
+            )
         lines.append(
             "开空阈值："
             f"{format_decimal_fixed(result.trend_ema_slope_filter_min_ratio, 6)}"
@@ -4186,6 +4325,12 @@ def _append_backtest_strategy_notes(
         _append_backtest_dynamic_take_profit_lines(lines, result)
         if result.ema55_slope_same_bar_reentry_block:
             lines.append("再入场约束：本根 K 线若刚刚平仓，则本根禁止再次开空。")
+        if result.ema55_slope_dynamic_exit_requires_bear_reentry:
+            lines.append(
+                "再入场约束：若因保本或锁盈类动态保护平仓，则必须等待后续新的阴线，且该阴线当下仍满足做空条件，才允许重开。"
+            )
+        if result.ema55_slope_dynamic_exit_bear_reentry_break_prev_low:
+            lines.append("再入场细化：等待中的新阴线还必须收盘跌破前一根 K 线低点，才允许重新开空。")
         if result.ema55_slope_dynamic_exit_requires_ema_reclaim:
             lines.append(
                 f"再入场约束：若因保本或锁盈类动态保护平仓，必须先重新站上 {fast_label}，再次跌回 {fast_label} 下方后才允许重开。"

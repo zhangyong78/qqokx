@@ -27,6 +27,8 @@ SUMMARY_CSV = OUTPUT_DIR / "summary.csv"
 EQUITY_CURVE_CSV = OUTPUT_DIR / "equity_curve.csv"
 MONTHLY_RETURNS_CSV = OUTPUT_DIR / "monthly_returns.csv"
 YEARLY_RETURNS_CSV = OUTPUT_DIR / "yearly_returns.csv"
+MONTHLY_BREAKDOWN_CSV = OUTPUT_DIR / "monthly_side_coin_breakdown.csv"
+YEARLY_BREAKDOWN_CSV = OUTPUT_DIR / "yearly_side_coin_breakdown.csv"
 
 INITIAL_CAPITAL = Decimal("10000")
 FIXED_RISK_AMOUNT = Decimal("100")
@@ -62,6 +64,7 @@ def main() -> None:
         max_total_exposure=Decimal("1000000"),
         max_symbol_exposure=Decimal("1000000"),
         fixed_risk_amount=FIXED_RISK_AMOUNT,
+        preserve_candidate_size=True,
     )
 
     start_ts = min(item["start_ts"] for item in data_ranges.values())
@@ -76,6 +79,9 @@ def main() -> None:
 
     executed_df = base.build_executed_trade_frame(simulation["executed_trades"])
     trades_export = base.build_trades_export(executed_df)
+    if "累计利润" not in trades_export.columns and "盈亏" in trades_export.columns:
+        insert_at = trades_export.columns.get_loc("盈亏") + 1
+        trades_export.insert(insert_at, "累计利润", trades_export["盈亏"].astype(float).cumsum().round(2))
     trades_export.to_csv(TRADES_CSV, index=False, encoding="utf-8-sig")
 
     overall_metrics = base.compute_trade_metrics(executed_df, INITIAL_CAPITAL)
@@ -88,8 +94,12 @@ def main() -> None:
     )
     monthly_wide, monthly_detail = base.build_monthly_returns_table(equity_hourly)
     yearly_table = base.build_yearly_returns_table(equity_hourly, executed_df)
+    monthly_breakdown = base.build_period_profit_breakdown(executed_df, period="monthly")
+    yearly_breakdown = base.build_period_profit_breakdown(executed_df, period="yearly")
     monthly_wide.to_csv(MONTHLY_RETURNS_CSV, index=False, encoding="utf-8-sig")
     yearly_table.to_csv(YEARLY_RETURNS_CSV, index=False, encoding="utf-8-sig")
+    monthly_breakdown.to_csv(MONTHLY_BREAKDOWN_CSV, index=False, encoding="utf-8-sig")
+    yearly_breakdown.to_csv(YEARLY_BREAKDOWN_CSV, index=False, encoding="utf-8-sig")
 
     side_summary = base.build_side_summary(executed_df)
     symbol_summary = base.build_symbol_summary(executed_df)
@@ -128,7 +138,7 @@ def main() -> None:
     )
 
     REPORT_HTML.write_text(
-        base.build_html_report(
+        base.build_html_report_extended(
             bundle_name=f"{bundle.bundle_name} | 标准100U口径",
             assumptions=assumptions,
             data_ranges=data_ranges,
@@ -149,6 +159,8 @@ def main() -> None:
             trades_export=trades_export,
             equity_hourly=equity_hourly,
             monthly_detail=monthly_detail,
+            monthly_breakdown=monthly_breakdown,
+            yearly_breakdown=yearly_breakdown,
         ),
         encoding="utf-8",
     )
@@ -162,6 +174,8 @@ def main() -> None:
         "equity_curve_csv": str(EQUITY_CURVE_CSV),
         "monthly_returns_csv": str(MONTHLY_RETURNS_CSV),
         "yearly_returns_csv": str(YEARLY_RETURNS_CSV),
+        "monthly_breakdown_csv": str(MONTHLY_BREAKDOWN_CSV),
+        "yearly_breakdown_csv": str(YEARLY_BREAKDOWN_CSV),
         "initial_capital": str(INITIAL_CAPITAL),
         "risk_amount": str(FIXED_RISK_AMOUNT),
         "constraints_enabled": False,

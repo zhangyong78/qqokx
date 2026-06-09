@@ -2,6 +2,7 @@ from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_MTF_LONG_ID,
@@ -51,6 +52,9 @@ class StrategyRuntimeRegistryTest(TestCase):
         self.assertEqual(slope_profile.family, "ema55_slope_short")
         self.assertFalse(slope_profile.supports_exchange_trade)
         self.assertEqual(slope_profile.local_trade_handler, "_run_ema55_slope_short_local_strategy")
+        btc_slope_profile = get_strategy_runtime_profile(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID)
+        self.assertEqual(btc_slope_profile.family, "ema55_slope_short")
+        self.assertEqual(btc_slope_profile.local_trade_handler, "_run_ema55_slope_short_local_strategy")
 
         ema5_8_profile = get_strategy_runtime_profile(STRATEGY_EMA5_EMA8_ID)
         self.assertEqual(ema5_8_profile.family, "ema5_ema8")
@@ -85,6 +89,7 @@ class StrategyRuntimeRegistryTest(TestCase):
         self.assertEqual(strategy_preferred_direction(STRATEGY_EMA_BREAKOUT_LONG_ID, "both"), "long")
         self.assertEqual(strategy_preferred_direction(STRATEGY_EMA_BREAKDOWN_SHORT_ID, "both"), "short")
         self.assertEqual(strategy_preferred_direction(STRATEGY_EMA55_SLOPE_SHORT_ID, "both"), "short")
+        self.assertEqual(strategy_preferred_direction(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "both"), "short")
         self.assertEqual(strategy_preferred_direction(STRATEGY_DYNAMIC_LONG_ID, "both"), "long")
         self.assertEqual(strategy_preferred_direction(STRATEGY_DYNAMIC_SHORT_ID, "both"), "short")
         self.assertEqual(strategy_preferred_direction(STRATEGY_DYNAMIC_MTF_LONG_ID, "both"), "long")
@@ -97,7 +102,9 @@ class StrategyRuntimeRegistryTest(TestCase):
         self.assertTrue(strategy_is_cross_family(STRATEGY_EMA_BREAKOUT_LONG_ID))
         self.assertTrue(strategy_is_cross_family(STRATEGY_EMA_BREAKDOWN_SHORT_ID))
         self.assertFalse(strategy_is_cross_family(STRATEGY_EMA55_SLOPE_SHORT_ID))
+        self.assertFalse(strategy_is_cross_family(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID))
         self.assertTrue(strategy_uses_signal_extrema(STRATEGY_CROSS_ID))
         self.assertTrue(strategy_uses_signal_extrema(STRATEGY_EMA_BREAKOUT_LONG_ID))
         self.assertTrue(strategy_uses_signal_extrema(STRATEGY_EMA_BREAKDOWN_SHORT_ID))
         self.assertFalse(strategy_uses_signal_extrema(STRATEGY_EMA55_SLOPE_SHORT_ID))
+        self.assertFalse(strategy_uses_signal_extrema(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID))

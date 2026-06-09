@@ -28,6 +28,7 @@ from okx_quant.backtest import (
     _position_initial_risk_value,
     _backtest_trade_start_index,
     _format_backtest_timestamp,
+    _should_require_bearish_reentry_after_dynamic_exit,
     _try_close_position,
     _try_close_position_same_candle_after_fill,
     _try_fill_dynamic_order,
@@ -41,6 +42,7 @@ from okx_quant.backtest import (
 )
 import okx_quant.backtest_export as backtest_export_module
 from okx_quant.backtest_audit import batch_backtest_artifact_paths, single_backtest_artifact_paths
+import okx_quant.daily_filters as daily_filters_module
 import okx_quant.backtest_ui as backtest_ui_module
 from okx_quant.backtest_export import export_batch_backtest_report, export_single_backtest_report
 from okx_quant.backtest_ui import (
@@ -49,6 +51,7 @@ from okx_quant.backtest_ui import (
     _backtest_candle_color,
     _backtest_bar_value_from_label,
     _BacktestSnapshotStore,
+    _build_backtest_param_summary,
     _build_backtest_minimum_order_hint_text,
     _build_backtest_minimum_order_sample_summary,
     _build_backtest_symbol_options,
@@ -74,6 +77,7 @@ from okx_quant.backtest_ui import (
     _manual_row_tag,
     _normalize_backtest_bar_label,
     _normalize_chart_viewport,
+    _default_chart_viewport,
     _sorted_manual_positions,
     _pan_chart_viewport,
     _zoom_chart_viewport,
@@ -84,6 +88,7 @@ from okx_quant.backtest import BacktestManualPosition, BacktestOpenPosition, Bac
 from okx_quant.models import Candle, Instrument, OrderPlan, SignalDecision, StrategyConfig
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
@@ -351,6 +356,56 @@ class BacktestTest(TestCase):
         self.assertEqual(result.daily_filter_boundary, "bjt_08")
         self.assertEqual(result.daily_filter_scope, "long_only")
         self.assertEqual(len(result.direction_filter_bias), len(result.candles))
+
+    def test_daily_filter_bias_precomputes_closed_daily_timestamps_once(self) -> None:
+        start_ts = 1711929600000
+        entry_candles = [
+            Candle(
+                start_ts + (index * 3600000),
+                Decimal("100"),
+                Decimal("102"),
+                Decimal("99"),
+                Decimal("101"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(72)
+        ]
+        daily_candles = [
+            Candle(
+                start_ts + (index * 86400000),
+                Decimal("100"),
+                Decimal("105"),
+                Decimal("95"),
+                Decimal(str(98 + index)),
+                Decimal("24"),
+                True,
+            )
+            for index in range(8)
+        ]
+
+        with patch.object(
+            daily_filters_module,
+            "closed_candle_available_timestamps",
+            wraps=daily_filters_module.closed_candle_available_timestamps,
+        ) as spy:
+            daily_filters_module.build_daily_close_vs_ma_bias(
+                entry_candles,
+                daily_candles,
+                ma_type="ema",
+                period=2,
+            )
+
+        self.assertEqual(spy.call_count, 1)
+
+        with patch.object(
+            daily_filters_module,
+            "closed_candle_available_timestamps",
+            wraps=daily_filters_module.closed_candle_available_timestamps,
+        ) as spy:
+            daily_filters_module.build_daily_weak_day_flags(entry_candles, daily_candles)
+
+        self.assertEqual(spy.call_count, 1)
 
     def test_dynamic_backtest_stop_locks_1r_at_2r(self) -> None:
         position = _OpenPosition(
@@ -994,6 +1049,161 @@ class BacktestTest(TestCase):
         self.assertEqual(result.trades[0].entry_index, BACKTEST_RESERVED_CANDLES + 1)
         self.assertEqual(result.trades[0].entry_price, Decimal("98"))
         self.assertEqual(result.trades[0].exit_price, Decimal("101"))
+
+    def test_ema55_slope_short_dynamic_protect_exit_can_require_bearish_reentry(self) -> None:
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=55,
+            trend_ema_period=55,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            ema55_slope_dynamic_exit_requires_bear_reentry=True,
+        )
+
+        self.assertTrue(_should_require_bearish_reentry_after_dynamic_exit(config, "break_even_stop"))
+        self.assertTrue(_should_require_bearish_reentry_after_dynamic_exit(config, "locked_2r_stop"))
+        self.assertFalse(_should_require_bearish_reentry_after_dynamic_exit(config, "stop_loss"))
+
+    def test_btc_ema55_slope_short_waits_for_first_negative_turn_after_flat_or_rising_slope(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(BACKTEST_RESERVED_CANDLES)
+        ]
+        candles.extend(
+            [
+                Candle(1_000, Decimal("99.8"), Decimal("99.8"), Decimal("99.8"), Decimal("99.8"), Decimal("1"), True),
+                Candle(2_000, Decimal("99"), Decimal("99"), Decimal("99"), Decimal("99"), Decimal("1"), True),
+                Candle(3_000, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100"), Decimal("1"), True),
+                Candle(4_000, Decimal("98"), Decimal("98"), Decimal("98"), Decimal("98"), Decimal("1"), True),
+                Candle(5_000, Decimal("101"), Decimal("101"), Decimal("101"), Decimal("101"), Decimal("1"), True),
+            ]
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=2,
+            trend_ema_period=2,
+            big_ema_period=233,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("200"),
+            atr_take_multiplier=Decimal("1"),
+            order_size=Decimal("2"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+            backtest_sizing_mode="fixed_size",
+            take_profit_mode="fixed",
+            risk_amount=None,
+            trend_ema_slope_filter_min_ratio=Decimal("-0.0015"),
+            backtest_entry_slippage_rate=Decimal("0"),
+            backtest_exit_slippage_rate=Decimal("0"),
+            backtest_funding_rate=Decimal("0"),
+        )
+
+        result = run_backtest(
+            DummyBacktestClient(candles, self._build_instrument()),
+            config,
+            candle_limit=0,
+            taker_fee_rate=Decimal("0"),
+        )
+
+        self.assertEqual(result.strategy_id, STRATEGY_BTC_EMA55_SLOPE_SHORT_ID)
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0].entry_price, Decimal("98"))
+        self.assertEqual(result.trades[0].entry_index, BACKTEST_RESERVED_CANDLES + 3)
+        self.assertEqual(result.trades[0].exit_price, Decimal("101"))
+        self.assertEqual(result.trades[0].exit_reason, "slope_turn_positive")
+
+    def test_btc_ema55_slope_short_lock_profit_uses_configurable_trigger_r(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("100"),
+                Decimal("101"),
+                Decimal("99"),
+                Decimal("100"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(BACKTEST_RESERVED_CANDLES)
+        ]
+        candles.extend(
+            [
+                Candle(1_000, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+                Candle(2_000, Decimal("99"), Decimal("100"), Decimal("98"), Decimal("99"), Decimal("1"), True),
+                Candle(3_000, Decimal("99"), Decimal("100"), Decimal("94"), Decimal("94"), Decimal("1"), True),
+                Candle(4_000, Decimal("94"), Decimal("100"), Decimal("94"), Decimal("97"), Decimal("1"), True),
+                Candle(5_000, Decimal("97"), Decimal("98"), Decimal("93"), Decimal("93"), Decimal("1"), True),
+                Candle(6_000, Decimal("93"), Decimal("100"), Decimal("93"), Decimal("96"), Decimal("1"), True),
+            ]
+        )
+        instrument = self._build_custom_instrument(
+            inst_id="BTC-USDT-SWAP",
+            tick_size="1",
+            lot_size="1",
+            min_size="1",
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=2,
+            trend_ema_period=2,
+            big_ema_period=233,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("1"),
+            atr_take_multiplier=Decimal("1"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+            backtest_sizing_mode="fixed_size",
+            take_profit_mode="fixed",
+            risk_amount=None,
+            trend_ema_slope_filter_min_ratio=Decimal("-0.005"),
+            backtest_entry_slippage_rate=Decimal("0"),
+            backtest_exit_slippage_rate=Decimal("0"),
+            backtest_funding_rate=Decimal("0"),
+            ema55_slope_exit_enabled=False,
+            ema55_slope_lock_profit_enabled=True,
+            ema55_slope_lock_profit_trigger_r=3,
+            dynamic_two_r_break_even=False,
+            dynamic_fee_offset_enabled=False,
+        )
+
+        result = run_backtest(
+            DummyBacktestClient(candles, instrument),
+            config,
+            candle_limit=0,
+            taker_fee_rate=Decimal("0"),
+        )
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0].entry_price, Decimal("99"))
+        self.assertEqual(result.trades[0].exit_price, Decimal("95"))
+        self.assertEqual(result.trades[0].exit_reason, "locked_2r_stop")
 
     def test_dynamic_backtest_short_gap_fill_regression_uses_next_candle_open_for_sol_4h(self) -> None:
         target_entry_ts = 1645747200000  # 2022-02-25 08:00:00
@@ -1720,6 +1930,69 @@ class BacktestTest(TestCase):
         self.assertEqual(configs[-1].atr_stop_multiplier, ATR_BATCH_MULTIPLIERS[-1])
         self.assertEqual(configs[-1].max_entries_per_trend, 3)
 
+    def test_build_parameter_batch_configs_for_btc_slope_short_returns_atr_period_matrix(self) -> None:
+        base_config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+            risk_amount=Decimal("100"),
+        )
+
+        configs = build_parameter_batch_configs(base_config)
+
+        self.assertEqual(len(configs), 6)
+        self.assertEqual({config.atr_period for config in configs}, {10, 14})
+        self.assertEqual({config.atr_stop_multiplier for config in configs}, set(ATR_BATCH_MULTIPLIERS))
+        self.assertEqual(
+            {(config.atr_period, config.atr_stop_multiplier) for config in configs},
+            {
+                (10, Decimal("1")),
+                (10, Decimal("1.5")),
+                (10, Decimal("2")),
+                (14, Decimal("1")),
+                (14, Decimal("1.5")),
+                (14, Decimal("2")),
+            },
+        )
+
+    def test_build_parameter_batch_configs_for_slope_short_returns_atr_period_matrix(self) -> None:
+        base_config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=34,
+            trend_ema_period=34,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            risk_amount=Decimal("100"),
+        )
+
+        configs = build_parameter_batch_configs(base_config)
+
+        self.assertEqual(len(configs), 6)
+        self.assertEqual({config.atr_period for config in configs}, {10, 14})
+        self.assertEqual({config.atr_stop_multiplier for config in configs}, set(ATR_BATCH_MULTIPLIERS))
+        self.assertTrue(all(config.atr_take_multiplier == Decimal("4") for config in configs))
+
     def test_run_backtest_batch_returns_nine_results_and_reuses_history_fetch(self) -> None:
         candles = [
             Candle(
@@ -1744,6 +2017,47 @@ class BacktestTest(TestCase):
         self.assertEqual(results[0][0].atr_take_multiplier, Decimal("1"))
         self.assertEqual(results[-1][0].atr_stop_multiplier, Decimal("2"))
         self.assertEqual(results[-1][0].atr_take_multiplier, Decimal("6"))
+        self.assertTrue(all(len(result.candles) == 500 for _, result in results))
+
+    def test_run_backtest_batch_for_btc_slope_short_returns_six_results_and_reuses_history_fetch(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("100"),
+                Decimal("101"),
+                Decimal("99"),
+                Decimal("100"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(1, 701)
+        ]
+        client = DummyBacktestClient(candles, self._build_instrument())
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+            risk_amount=Decimal("100"),
+        )
+
+        results = run_backtest_batch(client, config, candle_limit=500)
+
+        self.assertEqual(len(results), 6)
+        self.assertEqual(client.history_limits, [500])
+        self.assertEqual({item[0].atr_period for item in results}, {10, 14})
+        self.assertEqual({item[0].atr_stop_multiplier for item in results}, set(ATR_BATCH_MULTIPLIERS))
         self.assertTrue(all(len(result.candles) == 500 for _, result in results))
 
     def test_run_backtest_batch_skips_configs_with_only_invalid_protection_prices(self) -> None:
@@ -2243,14 +2557,45 @@ class BacktestTest(TestCase):
         row = _build_backtest_compare_row(snapshot)
 
         self.assertEqual(row[0], "R001")
-        self.assertEqual(row[2], "2024-03-23 08:00")
-        self.assertEqual(row[3], "2024-03-24 08:00")
-        self.assertIn("EMA 动态委托", row[4])
-        self.assertEqual(row[5], "BTC-USDT-SWAP")
-        self.assertEqual(row[6], "15分钟")
-        self.assertIn("EMA21", row[7])
-        self.assertEqual(row[8], "3")
-        self.assertEqual(row[9], "66.67%")
+        self.assertEqual(row[1], "03-23 12:30")
+        self.assertIn("EMA 动态委托", row[2])
+        self.assertEqual(row[3], "BTC-USDT-SWAP")
+        self.assertIn("2024-03-23 08:00 -> 2024-03-24 08:00", row[4])
+        self.assertIn("15分钟", row[4])
+        self.assertIn("500根", row[4])
+        self.assertIn("EMA21", row[5])
+        self.assertEqual(row[6], "3")
+        self.assertEqual(row[7], "66.67%")
+
+    def test_build_backtest_param_summary_for_btc_slope_short_includes_exit_toggles(self) -> None:
+        summary = _build_backtest_param_summary(
+            StrategyConfig(
+                inst_id="BTC-USDT-SWAP",
+                bar="1H",
+                ema_period=55,
+                trend_ema_period=55,
+                big_ema_period=233,
+                atr_period=10,
+                atr_stop_multiplier=Decimal("2"),
+                atr_take_multiplier=Decimal("4"),
+                order_size=Decimal("1"),
+                trade_mode="cross",
+                signal_mode="short_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+                strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+                backtest_sizing_mode="fixed_size",
+                risk_amount=None,
+                ema55_slope_exit_enabled=True,
+                ema55_slope_lock_profit_enabled=True,
+                ema55_slope_lock_profit_trigger_r=3,
+            )
+        )
+
+        self.assertIn("3R", summary)
+        self.assertIn("斜率转正", summary)
+        self.assertIn("双向手续费", summary)
 
     def test_build_backtest_compare_detail_contains_snapshot_metadata(self) -> None:
         report = BacktestReport(
@@ -2313,10 +2658,9 @@ class BacktestTest(TestCase):
 
         self.assertIn("编号：R009", detail)
         self.assertIn("策略：EMA 跌破做空策略", detail)
+        self.assertIn("回测区间：2024-03-22 08:00 -> 2024-03-23 08:00", detail)
         self.assertIn("K线周期：1小时", detail)
-        self.assertIn("开始时间：2024-03-22 08:00", detail)
-        self.assertIn("结束时间：2024-03-23 08:00", detail)
-        self.assertIn("回测K线数：800", detail)
+        self.assertIn("K线根数：800根", detail)
         self.assertIn("方向只做空", detail)
 
     def test_build_backtest_compare_detail_formats_zero_candle_limit_as_full_history(self) -> None:
@@ -2378,7 +2722,7 @@ class BacktestTest(TestCase):
 
         detail = _build_backtest_compare_detail(snapshot)
 
-        self.assertIn("回测K线数：全量", detail)
+        self.assertIn("K线根数：1,200根（全量）", detail)
 
     def test_build_backtest_compare_detail_includes_audit_file_paths(self) -> None:
         report = BacktestReport(
@@ -2503,6 +2847,99 @@ class BacktestTest(TestCase):
         )
 
         self.assertEqual(backtest_ui_module._batch_mode_for_snapshots([snapshot]), "strategy_pool")
+
+    def test_batch_mode_for_btc_slope_short_snapshot_returns_atr_period_matrix(self) -> None:
+        snapshot = _BacktestSnapshot(
+            snapshot_id="R889",
+            created_at=datetime(2026, 6, 9, 10, 30, 0),
+            config=StrategyConfig(
+                inst_id="BTC-USDT-SWAP",
+                bar="1H",
+                ema_period=21,
+                trend_ema_period=55,
+                big_ema_period=233,
+                atr_period=10,
+                atr_stop_multiplier=Decimal("1"),
+                atr_take_multiplier=Decimal("1"),
+                order_size=Decimal("0"),
+                trade_mode="cross",
+                signal_mode="short_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+                strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+                risk_amount=Decimal("100"),
+            ),
+            candle_limit=10000,
+            candle_count=10000,
+            report=BacktestReport(
+                total_trades=0,
+                win_trades=0,
+                loss_trades=0,
+                breakeven_trades=0,
+                win_rate=Decimal("0"),
+                total_pnl=Decimal("0"),
+                average_pnl=Decimal("0"),
+                gross_profit=Decimal("0"),
+                gross_loss=Decimal("0"),
+                profit_factor=None,
+                average_win=Decimal("0"),
+                average_loss=Decimal("0"),
+                profit_loss_ratio=None,
+                average_r_multiple=Decimal("0"),
+                max_drawdown=Decimal("0"),
+            ),
+            report_text="demo",
+            result=None,
+        )
+
+        self.assertEqual(backtest_ui_module._batch_mode_for_snapshots([snapshot]), "atr_period_matrix")
+
+    def test_batch_mode_for_slope_short_snapshot_returns_atr_period_matrix(self) -> None:
+        snapshot = _BacktestSnapshot(
+            snapshot_id="R890",
+            created_at=datetime(2026, 6, 9, 10, 35, 0),
+            config=StrategyConfig(
+                inst_id="ETH-USDT-SWAP",
+                bar="1H",
+                ema_period=34,
+                trend_ema_period=34,
+                atr_period=14,
+                atr_stop_multiplier=Decimal("1.5"),
+                atr_take_multiplier=Decimal("4"),
+                order_size=Decimal("0"),
+                trade_mode="cross",
+                signal_mode="short_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+                strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+                risk_amount=Decimal("100"),
+            ),
+            candle_limit=10000,
+            candle_count=10000,
+            report=BacktestReport(
+                total_trades=0,
+                win_trades=0,
+                loss_trades=0,
+                breakeven_trades=0,
+                win_rate=Decimal("0"),
+                total_pnl=Decimal("0"),
+                average_pnl=Decimal("0"),
+                gross_profit=Decimal("0"),
+                gross_loss=Decimal("0"),
+                profit_factor=None,
+                average_win=Decimal("0"),
+                average_loss=Decimal("0"),
+                profit_loss_ratio=None,
+                average_r_multiple=Decimal("0"),
+                max_drawdown=Decimal("0"),
+            ),
+            report_text="demo",
+            result=None,
+        )
+
+        self.assertEqual(backtest_ui_module._batch_mode_for_snapshots([snapshot]), "atr_period_matrix")
 
     def test_backtest_report_contains_fee_lines(self) -> None:
         report = BacktestReport(
@@ -2629,6 +3066,11 @@ class BacktestTest(TestCase):
                 self.assertTrue(exported.exists())
                 self.assertIn("single_20260326_203000", exported.name)
                 content = exported.read_text(encoding="utf-8-sig")
+                self.assertIn("交易员速览", content)
+                self.assertIn("结果：总盈亏 12.3400", content)
+                self.assertIn("参数摘要：", content)
+                self.assertIn("历史推荐：BTC-USDT-SWAP", content)
+                self.assertIn("报告文件：", content)
                 self.assertIn("BTC-USDT-SWAP", content)
                 self.assertIn("EMA21", content)
                 self.assertIn("10000", content)
@@ -2706,7 +3148,7 @@ class BacktestTest(TestCase):
                 )
 
                 content = exported.read_text(encoding="utf-8-sig")
-                self.assertIn("回测K线数：全量", content)
+                self.assertIn("设置：全量", content)
             finally:
                 backtest_export_module.backtest_report_export_dir_path = original_export_dir
 
@@ -3090,6 +3532,86 @@ class BacktestTest(TestCase):
                 manifest_payload = json.loads(artifact_paths["manifest"].read_text(encoding="utf-8"))
                 self.assertEqual(manifest_payload["export_scope"], "batch")
                 self.assertEqual(manifest_payload["result_count"], len(results))
+            finally:
+                backtest_export_module.backtest_report_export_dir_path = original_export_dir
+
+    def test_export_batch_backtest_report_writes_atr_period_matrix_summary(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            original_export_dir = backtest_export_module.backtest_report_export_dir_path
+            backtest_export_module.backtest_report_export_dir_path = lambda base_dir=None: Path(temp_dir)
+            try:
+                results = []
+                for atr_period in (10, 14):
+                    for stop_multiplier, total_pnl in (
+                        (Decimal("1"), Decimal("100")),
+                        (Decimal("1.5"), Decimal("150")),
+                        (Decimal("2"), Decimal("220")),
+                    ):
+                        config = StrategyConfig(
+                            inst_id="BTC-USDT-SWAP",
+                            bar="1H",
+                            ema_period=21,
+                            trend_ema_period=55,
+                            big_ema_period=233,
+                            atr_period=atr_period,
+                            atr_stop_multiplier=stop_multiplier,
+                            atr_take_multiplier=stop_multiplier,
+                            order_size=Decimal("0"),
+                            trade_mode="cross",
+                            signal_mode="short_only",
+                            position_mode="net",
+                            environment="demo",
+                            tp_sl_trigger_type="mark",
+                            strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+                            risk_amount=Decimal("100"),
+                        )
+                        result = BacktestResult(
+                            candles=[
+                                Candle(1710976500000, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+                                Candle(1711062900000, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+                            ],
+                            trades=[],
+                            report=BacktestReport(
+                                total_trades=10,
+                                win_trades=4,
+                                loss_trades=6,
+                                breakeven_trades=0,
+                                win_rate=Decimal("40"),
+                                total_pnl=total_pnl + Decimal(str(atr_period)),
+                                average_pnl=Decimal("10"),
+                                gross_profit=Decimal("150"),
+                                gross_loss=Decimal("50"),
+                                profit_factor=Decimal("3"),
+                                average_win=Decimal("37.5"),
+                                average_loss=Decimal("8.3333"),
+                                profit_loss_ratio=Decimal("4.5"),
+                                average_r_multiple=Decimal("0.5"),
+                                max_drawdown=Decimal("20"),
+                                take_profit_hits=0,
+                                stop_loss_hits=6,
+                            ),
+                            instrument=self._build_instrument(),
+                            ema_period=21,
+                            trend_ema_period=55,
+                            strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+                            maker_fee_rate=Decimal("0.00015"),
+                            taker_fee_rate=Decimal("0.00036"),
+                            take_profit_mode="fixed",
+                        )
+                        results.append((config, result))
+
+                exported = export_batch_backtest_report(
+                    results,
+                    10000,
+                    batch_label="B003",
+                    exported_at=datetime(2026, 6, 9, 10, 45, 0),
+                )
+
+                content = exported.read_text(encoding="utf-8-sig")
+                self.assertIn("SL \\\\ ATR", content)
+                self.assertIn("ATR10", content)
+                self.assertIn("ATR14", content)
+                self.assertIn("ATR 周期 = 10 / 14", content)
             finally:
                 backtest_export_module.backtest_report_export_dir_path = original_export_dir
 
@@ -3989,6 +4511,10 @@ class BacktestTest(TestCase):
         self.assertEqual(_normalize_chart_viewport(50, 120, 100), (0, 100))
         self.assertEqual(_normalize_chart_viewport(-5, 30, 100), (0, 30))
         self.assertEqual(_normalize_chart_viewport(95, 20, 100), (80, 20))
+
+    def test_default_chart_viewport_focuses_recent_window(self) -> None:
+        self.assertEqual(_default_chart_viewport(50000, 900), (49100, 900))
+        self.assertEqual(_default_chart_viewport(300, 900), (0, 300))
 
     def test_zoom_chart_viewport_zooms_around_anchor(self) -> None:
         start_index, visible_count = _zoom_chart_viewport(
