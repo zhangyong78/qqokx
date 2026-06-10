@@ -376,6 +376,7 @@ STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
             "take_profit_mode",
             "dynamic_two_r_break_even",
             "dynamic_fee_offset_enabled",
+            "ema55_slope_lock_profit_trigger_r",
             "ema55_slope_exit_enabled",
             "atr_percentile_filter_max",
             "trend_ema_slope_filter_min_ratio",
@@ -411,6 +412,8 @@ STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
             "trend_ema_slope_filter_min_ratio",
         ),
         fixed_values={
+            "ema_type": "ema",
+            "ema_period": 55,
             "signal_mode": "short_only",
         },
     ),

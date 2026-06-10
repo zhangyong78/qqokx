@@ -19,6 +19,7 @@ from okx_quant.persistence import backtest_report_export_dir_path
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
+    STRATEGY_EMA55_SLOPE_SHORT_ID,
     is_dynamic_strategy_id,
 )
 from okx_quant.strategy_runtime_registry import get_strategy_runtime_profile
@@ -705,6 +706,12 @@ def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
             parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
             parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
         parts.append(f"每波最多开仓次数{_format_max_entries_label(config.max_entries_per_trend)}")
+    if config.strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
+        parts.append(f"止盈方式{'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}")
+        if config.take_profit_mode == "dynamic":
+            parts.append(f"动态止盈首档{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}R")
+            parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
+            parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
     parts.extend(
         [
             f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)}",

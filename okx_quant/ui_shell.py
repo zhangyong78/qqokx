@@ -1588,6 +1588,15 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             payload.get("dynamic_two_r_break_even"),
             bool(_strategy_config_default("dynamic_two_r_break_even")),
         ),
+        ema55_slope_exit_enabled=_coerce_snapshot_bool(
+            payload.get("ema55_slope_exit_enabled"),
+            bool(_strategy_config_default("ema55_slope_exit_enabled")),
+        ),
+        ema55_slope_lock_profit_trigger_r=_coerce_snapshot_int(
+            payload.get("ema55_slope_lock_profit_trigger_r"),
+            int(_strategy_config_default("ema55_slope_lock_profit_trigger_r")),
+            minimum=2,
+        ),
         dynamic_fee_offset_enabled=_coerce_snapshot_bool(
             payload.get("dynamic_fee_offset_enabled"),
             bool(_strategy_config_default("dynamic_fee_offset_enabled")),
@@ -3343,7 +3352,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.max_entries_per_trend = StringVar(value="1")
         self.startup_chase_current_signal = BooleanVar(value=False)
         self.startup_chase_window_seconds = StringVar(value="0")
+        self.ema55_slope_exit_enabled = BooleanVar(value=True)
         self.dynamic_two_r_break_even = BooleanVar(value=True)
+        self.ema55_slope_lock_profit_trigger_r = StringVar(value="2")
         self.dynamic_fee_offset_enabled = BooleanVar(value=True)
         self.time_stop_break_even_enabled = BooleanVar(value=False)
         self.time_stop_break_even_bars = StringVar(value="10")
@@ -3412,6 +3423,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.daily_filter_ma_type.trace_add("write", self._update_trend_parameter_hint)
         self.daily_filter_period.trace_add("write", self._update_trend_parameter_hint)
         self.dynamic_two_r_break_even.trace_add("write", self._update_dynamic_protection_hint)
+        self.ema55_slope_lock_profit_trigger_r.trace_add("write", self._update_dynamic_protection_hint)
         self.dynamic_fee_offset_enabled.trace_add("write", self._update_dynamic_protection_hint)
         self.time_stop_break_even_enabled.trace_add("write", self._update_dynamic_protection_hint)
         self.time_stop_break_even_bars.trace_add("write", self._update_dynamic_protection_hint)
@@ -3679,7 +3691,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "body_retest_watch_bars": self.body_retest_watch_bars,
             "take_profit_mode": self.take_profit_mode_label,
             "max_entries_per_trend": self.max_entries_per_trend,
+            "ema55_slope_exit_enabled": self.ema55_slope_exit_enabled,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
+            "ema55_slope_lock_profit_trigger_r": self.ema55_slope_lock_profit_trigger_r,
             "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
             "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
             "time_stop_break_even_bars": self.time_stop_break_even_bars,
@@ -3736,6 +3750,16 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             if supports_startup_chase_current_signal(strategy_id)
             else False
         )
+        self._apply_strategy_parameter_fixed_values(strategy_id, definition=definition)
+
+    def _apply_strategy_parameter_fixed_values(
+        self,
+        strategy_id: str,
+        *,
+        definition: StrategyDefinition | None = None,
+    ) -> None:
+        bindings = self._strategy_parameter_bindings()
+        resolved_definition = definition or get_strategy_definition(strategy_id)
         for key in iter_strategy_parameter_keys(strategy_id):
             fixed_value = strategy_fixed_value(strategy_id, key)
             if fixed_value is None:
@@ -3744,7 +3768,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             if variable is None:
                 continue
             if key == "signal_mode":
-                variable.set(_reverse_lookup_label(SIGNAL_LABEL_TO_VALUE, str(fixed_value), definition.default_signal_label))
+                variable.set(
+                    _reverse_lookup_label(
+                        SIGNAL_LABEL_TO_VALUE,
+                        str(fixed_value),
+                        resolved_definition.default_signal_label,
+                    )
+                )
             elif key == "mtf_reversal_mode":
                 variable.set(_reverse_lookup_label(MTF_REVERSAL_MODE_OPTIONS, str(fixed_value), self.mtf_reversal_mode_label.get()))
             elif key.endswith("_type"):
@@ -4160,12 +4190,29 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._startup_chase_window_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=_lp)
 
         row += 1
+        self._ema55_slope_exit_conditions_caption = ttk.Label(launch_form, text="平仓条件")
+        self._ema55_slope_exit_conditions_caption.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._ema55_slope_exit_enabled_check = ttk.Checkbutton(
+            launch_form,
+            text="均线斜率重新转正时，按收盘价平仓",
+            variable=self.ema55_slope_exit_enabled,
+        )
+        self._ema55_slope_exit_enabled_check.grid(row=row, column=1, columnspan=3, sticky="w", pady=_lp)
+
+        row += 1
         self._dynamic_two_r_break_even_check = ttk.Checkbutton(
             launch_form,
-            text="启用2R保本（2R时先移到保本位）",
+            text="启用首档保本特例（首档触发R=2时，先移到保本位）",
             variable=self.dynamic_two_r_break_even,
         )
-        self._dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=_lp)
+        self._dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=_lp)
+        self._ema55_slope_lock_profit_trigger_r_label = ttk.Label(launch_form, text="首档触发R")
+        self._ema55_slope_lock_profit_trigger_r_label.grid(row=row, column=2, sticky="e", pady=_lp)
+        self._ema55_slope_lock_profit_trigger_r_entry = ttk.Entry(
+            launch_form,
+            textvariable=self.ema55_slope_lock_profit_trigger_r,
+        )
+        self._ema55_slope_lock_profit_trigger_r_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
         self._dynamic_fee_offset_check = ttk.Checkbutton(
@@ -8182,10 +8229,14 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         )
 
     def _update_dynamic_protection_hint(self, *_: str) -> None:
+        strategy_id = self._strategy_name_to_id.get(self.strategy_name.get(), "")
+        profile = get_strategy_runtime_profile(strategy_id) if strategy_id else None
         self.dynamic_protection_hint_text.set(
             _build_dynamic_protection_hint_text(
                 take_profit_mode_label=self.take_profit_mode_label.get(),
                 dynamic_two_r_break_even_enabled=self.dynamic_two_r_break_even.get(),
+                break_even_trigger_r_raw=self.ema55_slope_lock_profit_trigger_r.get(),
+                break_even_trigger_r_configurable=bool(profile and profile.family == "ema55_slope_short"),
                 dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get(),
                 time_stop_break_even_enabled=self.time_stop_break_even_enabled.get(),
                 time_stop_break_even_bars_raw=self.time_stop_break_even_bars.get(),
@@ -8267,6 +8318,18 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             )
             body_retest_body_atr_limit = Decimal(str(self.body_retest_body_atr_limit.get()).strip() or "1.0")
             body_retest_watch_bars = self._parse_nonnegative_int(self.body_retest_watch_bars.get(), "Watch bars")
+            ema55_slope_exit_enabled = (
+                bool(self.ema55_slope_exit_enabled.get())
+                if strategy_uses_parameter(definition.strategy_id, "ema55_slope_exit_enabled")
+                else True
+            )
+            ema55_slope_lock_profit_trigger_r = (
+                self._parse_nonnegative_int(self.ema55_slope_lock_profit_trigger_r.get(), "首档触发R")
+                if strategy_uses_parameter(definition.strategy_id, "ema55_slope_lock_profit_trigger_r")
+                else 2
+            )
+            if ema55_slope_lock_profit_trigger_r < 2:
+                raise ValueError("首档触发R 不能小于 2")
             config = StrategyConfig(
                 inst_id=signal_symbol or trade_symbol,
                 bar=self.bar.get().strip(),
@@ -8291,7 +8354,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 local_tp_sl_inst_id=_normalize_symbol_input(self.local_tp_sl_symbol.get()) or None,
                 run_mode=run_mode,
                 take_profit_mode=TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "dynamic"),
+                ema55_slope_exit_enabled=ema55_slope_exit_enabled,
                 dynamic_two_r_break_even=bool(self.dynamic_two_r_break_even.get()),
+                ema55_slope_lock_profit_trigger_r=ema55_slope_lock_profit_trigger_r,
                 dynamic_fee_offset_enabled=bool(self.dynamic_fee_offset_enabled.get()),
                 trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
                 atr_percentile_filter_max=atr_percentile_filter_max,
@@ -12837,19 +12902,41 @@ def _build_dynamic_protection_hint_text(
     *,
     take_profit_mode_label: str,
     dynamic_two_r_break_even_enabled: bool,
+    break_even_trigger_r_raw: str = "2",
+    break_even_trigger_r_configurable: bool = False,
     dynamic_fee_offset_enabled: bool,
     time_stop_break_even_enabled: bool,
     time_stop_break_even_bars_raw: str,
 ) -> str:
     if take_profit_mode_label != "动态止盈":
-        return "动态保护：当前为固定止盈，2R保本 / 手续费偏移 / 时间保本都不生效。"
+        return "动态保护：当前为固定止盈，首档触发R / 首档保本特例 / 手续费偏移 / 时间保本都不生效。"
+    trigger_r_raw = break_even_trigger_r_raw.strip() or "2"
+    try:
+        trigger_r = max(int(trigger_r_raw), 2)
+    except ValueError:
+        trigger_r = 2
     time_stop_bars = time_stop_break_even_bars_raw.strip() or "0"
-    parts = [
-        (
+    if break_even_trigger_r_configurable:
+        if dynamic_two_r_break_even_enabled and trigger_r == 2:
+            first_leg_text = "首档保本特例：开启，首档触发R=2 时先把止损抬到保本位。"
+        elif dynamic_two_r_break_even_enabled:
+            first_leg_text = (
+                f"首档保本特例：开启，但首档触发R={trigger_r}；因此会沿用 BTC 斜率做空逻辑，"
+                f"在 {trigger_r}R 时先抬到 {trigger_r - 1}R 位。"
+            )
+        else:
+            first_leg_text = (
+                f"首档保本特例：关闭，价格达到首档 {trigger_r}R 后，止损先抬到 {trigger_r - 1}R 位。"
+            )
+    else:
+        first_leg_text = (
             "2R保本：开启，浮盈达到 2R 后先把止损抬到保本位。"
             if dynamic_two_r_break_even_enabled
             else "2R保本：关闭，浮盈达到 2R 也不会自动抬到保本位。"
-        ),
+        )
+    parts = [
+        (f"首档触发R：{trigger_r}。" if break_even_trigger_r_configurable else "首档触发R：固定为 2。"),
+        first_leg_text,
         (
             "手续费偏移：开启，保本位会额外预留双边手续费缓冲。"
             if dynamic_fee_offset_enabled
@@ -13111,20 +13198,42 @@ def _build_strategy_start_confirmation_message(
                 f"止盈方式：{take_profit_mode_text}",
                 f"启动追单窗口：{_startup_chase_text()}",
                 f"追当前信号：{_startup_chase_current_signal_text()}",
-                f"平仓信号：{line_label} 斜率转正后，本地按收盘确认平仓",
+                (
+                    f"平仓信号：{line_label} 斜率转正后，本地按收盘确认平仓"
+                    if config.ema55_slope_exit_enabled
+                    else "平仓信号：已关闭斜率转正平仓，仅保留 ATR 止损与动态保护离场"
+                ),
             ]
         )
         if config.take_profit_mode == "dynamic":
-            lines.extend(
-                [
-                    f"2R保本开关：{config.dynamic_two_r_break_even_label()}（浮盈达到 2R 后止损抬到保本）",
-                    f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}（保本位预留双边手续费）",
-                    (
-                        f"时间保本：{config.time_stop_break_even_enabled_label()} / "
-                        f"{config.resolved_time_stop_break_even_bars()}根（持仓满指定K线且达到净保本时再抬止损）"
-                    ),
-                ]
-            )
+            if profile.family == "ema55_slope_short":
+                trigger_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
+                lines.extend(
+                    [
+                        f"首档触发R：{trigger_r}（与 BTC 斜率做空一致，首档保护从这里开始）",
+                        (
+                            "首档保本特例：开启（仅当首档触发R=2时，2R 先抬到保本位）"
+                            if config.dynamic_two_r_break_even
+                            else "首档保本特例：关闭（首档触发后直接按已锁定R上移止损）"
+                        ),
+                        f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}（保本位预留双边手续费）",
+                        (
+                            f"时间保本：{config.time_stop_break_even_enabled_label()} / "
+                            f"{config.resolved_time_stop_break_even_bars()}根（持仓满指定K线且达到净保本时再抬止损）"
+                        ),
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        f"2R保本开关：{config.dynamic_two_r_break_even_label()}（浮盈达到 2R 后止损抬到保本）",
+                        f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}（保本位预留双边手续费）",
+                        (
+                            f"时间保本：{config.time_stop_break_even_enabled_label()} / "
+                            f"{config.resolved_time_stop_break_even_bars()}根（持仓满指定K线且达到净保本时再抬止损）"
+                        ),
+                    ]
+                )
     lines.extend(
         [
             f"ATR周期：{config.atr_period}（波动计算周期）",

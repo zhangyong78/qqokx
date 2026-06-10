@@ -2658,6 +2658,98 @@ class BacktestTest(TestCase):
         self.assertIn("双向手续费", summary)
         self.assertIn("连续负斜率3根", summary)
 
+    def test_build_backtest_param_summary_for_generic_slope_short_includes_dynamic_trigger_r(self) -> None:
+        summary = _build_backtest_param_summary(
+            StrategyConfig(
+                inst_id="BTC-USDT-SWAP",
+                bar="1H",
+                ema_period=55,
+                trend_ema_period=55,
+                big_ema_period=233,
+                atr_period=10,
+                atr_stop_multiplier=Decimal("2"),
+                atr_take_multiplier=Decimal("4"),
+                order_size=Decimal("1"),
+                trade_mode="cross",
+                signal_mode="short_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+                strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+                take_profit_mode="dynamic",
+                backtest_sizing_mode="fixed_size",
+                ema55_slope_exit_enabled=True,
+                ema55_slope_lock_profit_trigger_r=3,
+                dynamic_two_r_break_even=True,
+                dynamic_fee_offset_enabled=True,
+                time_stop_break_even_enabled=False,
+                time_stop_break_even_bars=10,
+            )
+        )
+
+        self.assertIn("首档触发R3", summary)
+        self.assertIn("首档保本特例开", summary)
+        self.assertIn("动态止盈", summary)
+
+    def test_export_param_summary_for_slope_short_includes_dynamic_trigger_r(self) -> None:
+        summary = backtest_export_module._build_param_summary(
+            StrategyConfig(
+                inst_id="BTC-USDT-SWAP",
+                bar="1H",
+                ema_period=55,
+                trend_ema_period=55,
+                big_ema_period=233,
+                atr_period=10,
+                atr_stop_multiplier=Decimal("2"),
+                atr_take_multiplier=Decimal("4"),
+                order_size=Decimal("1"),
+                trade_mode="cross",
+                signal_mode="short_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+                strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+                take_profit_mode="dynamic",
+                backtest_sizing_mode="fixed_size",
+                ema55_slope_lock_profit_trigger_r=3,
+            ),
+            BacktestResult(
+                candles=[],
+                trades=[],
+                report=BacktestReport(
+                    total_trades=0,
+                    win_trades=0,
+                    loss_trades=0,
+                    breakeven_trades=0,
+                    win_rate=Decimal("0"),
+                    total_pnl=Decimal("0"),
+                    average_pnl=Decimal("0"),
+                    gross_profit=Decimal("0"),
+                    gross_loss=Decimal("0"),
+                    profit_factor=None,
+                    average_win=Decimal("0"),
+                    average_loss=Decimal("0"),
+                    profit_loss_ratio=None,
+                    average_r_multiple=Decimal("0"),
+                    max_drawdown=Decimal("0"),
+                    take_profit_hits=0,
+                    stop_loss_hits=0,
+                ),
+                instrument=Instrument(
+                    inst_id="BTC-USDT-SWAP",
+                    inst_type="SWAP",
+                    tick_size=Decimal("0.1"),
+                    lot_size=Decimal("0.001"),
+                    min_size=Decimal("0.001"),
+                    state="live",
+                ),
+                maker_fee_rate=Decimal("0.0002"),
+                taker_fee_rate=Decimal("0.0005"),
+            ),
+        )
+
+        self.assertIn("动态止盈首档3R", summary)
+
     def test_build_backtest_compare_detail_contains_snapshot_metadata(self) -> None:
         report = BacktestReport(
             total_trades=0,

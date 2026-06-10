@@ -168,7 +168,9 @@ class UiStrategySessionsMixin:
         )
         self.daily_filter_ma_type.set(str(record.config.daily_filter_ma_type).upper())
         self.daily_filter_period.set(str(record.config.daily_filter_period))
+        self.ema55_slope_exit_enabled.set(bool(record.config.ema55_slope_exit_enabled))
         self.dynamic_two_r_break_even.set(record.config.dynamic_two_r_break_even)
+        self.ema55_slope_lock_profit_trigger_r.set(str(max(int(record.config.ema55_slope_lock_profit_trigger_r), 2)))
         self.dynamic_fee_offset_enabled.set(record.config.dynamic_fee_offset_enabled)
         self.time_stop_break_even_enabled.set(record.config.time_stop_break_even_enabled)
         self.time_stop_break_even_bars.set(str(record.config.time_stop_break_even_bars))
@@ -191,6 +193,7 @@ class UiStrategySessionsMixin:
             self.tp_sl_mode_label.set("按交易标的价格（本地）")
         if strategy_forces_follow_signal(definition.strategy_id):
             self.entry_side_mode_label.set("跟随信号")
+        self._apply_strategy_parameter_fixed_values(definition.strategy_id, definition=definition)
         self._sync_dynamic_take_profit_controls()
         QuantApp._sync_daily_filter_controls(self)
         QuantApp._sync_entry_side_mode_controls(self)
@@ -4350,12 +4353,23 @@ class UiStrategySessionsMixin:
             self.entry_side_mode_label.set("跟随信号")
         if strategy_forces_local_trade(strategy_id):
             self.tp_sl_mode_label.set("按交易标的价格（本地）")
+        show_slope_exit_widgets = strategy_uses_parameter(strategy_id, "ema55_slope_exit_enabled")
+        for widget in (
+            self._ema55_slope_exit_conditions_caption,
+            self._ema55_slope_exit_enabled_check,
+        ):
+            if show_slope_exit_widgets:
+                widget.grid()
+            else:
+                widget.grid_remove()
         if visibility.show_dynamic_take_profit:
             self._take_profit_mode_label.grid()
             self._take_profit_mode_combo.grid()
             self._max_entries_per_trend_label.grid()
             self._max_entries_per_trend_entry.grid()
             self._dynamic_two_r_break_even_check.grid()
+            self._ema55_slope_lock_profit_trigger_r_label.grid()
+            self._ema55_slope_lock_profit_trigger_r_entry.grid()
             self._dynamic_fee_offset_check.grid()
             self._dynamic_fee_offset_hint_label.grid()
             self._time_stop_break_even_check.grid()
@@ -4367,6 +4381,8 @@ class UiStrategySessionsMixin:
             self._max_entries_per_trend_label.grid_remove()
             self._max_entries_per_trend_entry.grid_remove()
             self._dynamic_two_r_break_even_check.grid_remove()
+            self._ema55_slope_lock_profit_trigger_r_label.grid_remove()
+            self._ema55_slope_lock_profit_trigger_r_entry.grid_remove()
             self._dynamic_fee_offset_check.grid_remove()
             self._dynamic_fee_offset_hint_label.grid_remove()
             self._time_stop_break_even_check.grid_remove()
@@ -4593,7 +4609,14 @@ class UiStrategySessionsMixin:
         dynamic_take_profit = (
             dynamic_tp_eligible and TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "fixed") == "dynamic"
         )
+        is_slope_short = get_strategy_runtime_profile(definition.strategy_id).family == "ema55_slope_short"
         self._dynamic_two_r_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
+        self._ema55_slope_lock_profit_trigger_r_label.configure(
+            state="normal" if dynamic_take_profit and is_slope_short else "disabled"
+        )
+        self._ema55_slope_lock_profit_trigger_r_entry.configure(
+            state="normal" if dynamic_take_profit and is_slope_short else "disabled"
+        )
         self._dynamic_fee_offset_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self._time_stop_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self._time_stop_break_even_bars_label.configure(state="normal" if dynamic_take_profit else "disabled")
@@ -4947,6 +4970,15 @@ class UiStrategySessionsMixin:
             startup_chase_window_seconds=startup_chase_window_seconds
             if strategy_uses_startup_chase_window(strategy_id)
             else 0,
+            ema55_slope_exit_enabled=bool(self.ema55_slope_exit_enabled.get())
+            if strategy_uses_parameter(strategy_id, "ema55_slope_exit_enabled")
+            else True,
+            ema55_slope_lock_profit_trigger_r=max(
+                self._parse_positive_int(self.ema55_slope_lock_profit_trigger_r.get() or "2", "首档触发R"),
+                2,
+            )
+            if strategy_uses_parameter(strategy_id, "ema55_slope_lock_profit_trigger_r")
+            else 2,
             dynamic_two_r_break_even=self.dynamic_two_r_break_even.get()
             if strategy_supports_dynamic_take_profit(strategy_id)
             else False,
@@ -6396,6 +6428,10 @@ class UiStrategySessionsMixin:
                     f"{self._bool_label(snapshot.get('time_stop_break_even_enabled', False))} / "
                     f"{self._snapshot_text(snapshot, 'time_stop_break_even_bars', '10')}根",
                 ]
+            )
+        if strategy_uses_parameter(strategy_id, "ema55_slope_exit_enabled"):
+            parameter_rows.append(
+                f"斜率转正平仓：{self._bool_label(snapshot.get('ema55_slope_exit_enabled', True))}"
             )
         parameter_rows.extend(
             [

@@ -442,9 +442,7 @@ def _ema55_slope_lock_profit_enabled(config: StrategyConfig) -> bool:
 
 
 def _ema55_slope_lock_profit_trigger_r(config: StrategyConfig) -> int:
-    if is_btc_ema55_slope_short_strategy(config.strategy_id):
-        return max(int(config.ema55_slope_lock_profit_trigger_r), 2)
-    return 2
+    return max(int(config.ema55_slope_lock_profit_trigger_r), 2)
 
 
 def _ema55_slope_entry_triggered(
@@ -4201,18 +4199,21 @@ def _append_backtest_dynamic_take_profit_lines(lines: list[str], result: Backtes
                 "此后每多走 1R，止损继续按 1R 台阶递进。"
             )
         return
+    dynamic_trigger_r = max(int(result.ema55_slope_lock_profit_trigger_r), 2)
+    lines.append(f"斜率转正平仓：{'开启' if result.ema55_slope_exit_enabled else '关闭'}")
     lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
     if result.take_profit_mode != "dynamic":
         lines.append("止盈说明：固定止盈为 ATR 倍数止盈。")
         return
-    lines.append(f"2R保本开关：{'开启' if result.dynamic_two_r_break_even else '关闭'}")
+    lines.append(f"首档触发R：{dynamic_trigger_r}")
+    lines.append(f"首档保本特例：{'开启' if result.dynamic_two_r_break_even else '关闭'}")
     lines.append(f"手续费偏移开关：{'开启' if result.dynamic_fee_offset_enabled else '关闭'}")
     lines.append(
         "时间保本开关："
         f"{'开启' if result.time_stop_break_even_enabled else '关闭'}"
         f" | 阈值K线：{result.time_stop_break_even_bars if result.time_stop_break_even_bars > 0 else '未启用'}"
     )
-    if result.dynamic_two_r_break_even:
+    if result.dynamic_two_r_break_even and dynamic_trigger_r == 2:
         description = (
             "止盈说明：动态止盈在 2R 时先上移到开仓价+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
             if result.dynamic_fee_offset_enabled
@@ -4220,9 +4221,11 @@ def _append_backtest_dynamic_take_profit_lines(lines: list[str], result: Backtes
         )
     else:
         description = (
-            "止盈说明：动态止盈在 2R 时上移到 1R+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
+            f"止盈说明：动态止盈在 {dynamic_trigger_r}R 时先上移到 {max(dynamic_trigger_r - 1, 0)}R+2倍Taker手续费，"
+            "此后每多走 1R，止损继续按 1R 台阶递进；固定止盈为 ATR 倍数止盈。"
             if result.dynamic_fee_offset_enabled
-            else "止盈说明：动态止盈在 2R 时上移到 1R，3R 起按 n-1R 递推；固定止盈为 ATR 倍数止盈。"
+            else f"止盈说明：动态止盈在 {dynamic_trigger_r}R 时先上移到 {max(dynamic_trigger_r - 1, 0)}R，"
+            "此后每多走 1R，止损继续按 1R 台阶递进；固定止盈为 ATR 倍数止盈。"
         )
     lines.append(description)
     if result.time_stop_break_even_enabled and result.time_stop_break_even_bars > 0:
@@ -4322,12 +4325,17 @@ def _append_backtest_strategy_notes(
     if family == "ema55_slope_short":
         if result.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
             lines.append(
-                f"交易逻辑：固定 {fast_label}；只要连续 {result.ema55_slope_negative_entry_bars} 根单根斜率比例小于等于阈值，就按收盘价开空，不再要求前一根斜率先回到正数或走平。持仓后始终按 ATR 止损管理；若勾选对应平仓条件，则再叠加 {fast_label} 斜率转正平仓，以及 N R 锁盈利+双向手续费。"
+                f"交易逻辑：固定 {fast_label}；只要连续 {result.ema55_slope_negative_entry_bars} 根单根斜率比例小于等于阈值，就按收盘价开空，不再要求前一根斜率先回到正数或走平。默认不附带额外再入场纪律；持仓后始终按 ATR 止损管理，若勾选对应平仓条件，则再叠加 {fast_label} 斜率转正平仓，以及 N R 锁盈利+双向手续费。"
             )
         else:
-            lines.append(
-                f"交易逻辑：固定 {fast_label}；当 {fast_label} 单根斜率比例小于等于阈值时按收盘价开空，持仓后继续按 ATR 止损/固定或动态止盈管理；若开启斜率转正平仓条件，则在 {fast_label} 斜率重新转正时按收盘价平仓。"
-            )
+            if result.ema55_slope_exit_enabled:
+                lines.append(
+                    f"交易逻辑：固定 {fast_label}；当 {fast_label} 单根斜率比例小于等于阈值时按收盘价开空，持仓后继续按 ATR 止损/固定或动态止盈管理；若开启斜率转正平仓条件，则在 {fast_label} 斜率重新转正时按收盘价平仓。"
+                )
+            else:
+                lines.append(
+                    f"交易逻辑：固定 {fast_label}；当 {fast_label} 单根斜率比例小于等于阈值时按收盘价开空，持仓后继续按 ATR 止损/固定或动态止盈管理；当前已关闭斜率转正平仓，只依靠 ATR 止损与动态保护离场。"
+                )
         if result.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
             lines.append(f"开仓确认：连续负斜率 {result.ema55_slope_negative_entry_bars} 根，且不要求前一根斜率先转正。")
         lines.append(
@@ -4336,6 +4344,16 @@ def _append_backtest_strategy_notes(
             "（按单根 EMA 斜率 / 当前 EMA 计算，需小于等于该负值才开空）"
         )
         _append_backtest_dynamic_take_profit_lines(lines, result)
+        if (
+            result.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID
+            and not result.ema55_slope_same_bar_reentry_block
+            and not result.ema55_slope_dynamic_exit_requires_bear_reentry
+            and not result.ema55_slope_dynamic_exit_bear_reentry_break_prev_low
+            and not result.ema55_slope_dynamic_exit_requires_ema_reclaim
+            and not result.ema55_slope_locked_reentry_requires_ema21_near
+            and not result.ema55_slope_dynamic_exit_bull_bar_requires_bear_reentry
+        ):
+            lines.append("再入场：当前配置未启用额外约束；平仓后只要再次满足连续负斜率开空条件，就允许重新开空。")
         if result.ema55_slope_same_bar_reentry_block:
             lines.append("再入场约束：本根 K 线若刚刚平仓，则本根禁止再次开空。")
         if result.ema55_slope_dynamic_exit_requires_bear_reentry:
