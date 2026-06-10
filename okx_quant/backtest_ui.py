@@ -220,6 +220,7 @@ class BacktestLaunchState:
     ema55_slope_exit_enabled: bool = True
     ema55_slope_lock_profit_enabled: bool = True
     ema55_slope_lock_profit_trigger_r: str = "2"
+    ema55_slope_negative_entry_bars: str = "1"
     maker_fee_percent: str = DEFAULT_MAKER_FEE_PERCENT
     taker_fee_percent: str = DEFAULT_TAKER_FEE_PERCENT
     initial_capital: str = "10000"
@@ -681,6 +682,7 @@ def _build_backtest_param_summary(
         return (
             f"{fast_label}/{trend_label} / ATR{config.atr_period} / "
             f"SLx{format_decimal(config.atr_stop_multiplier)} / "
+            f"开仓连续负斜率{max(int(config.ema55_slope_negative_entry_bars), 1)}根 / "
             f"平仓规则{_btc_ema55_slope_exit_summary(config)} / "
             f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
             f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
@@ -1232,6 +1234,7 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "ema55_slope_exit_enabled": config.ema55_slope_exit_enabled,
         "ema55_slope_lock_profit_enabled": config.ema55_slope_lock_profit_enabled,
         "ema55_slope_lock_profit_trigger_r": int(config.ema55_slope_lock_profit_trigger_r),
+        "ema55_slope_negative_entry_bars": int(config.ema55_slope_negative_entry_bars),
         "trend_ema_slope_filter_enabled": config.trend_ema_slope_filter_enabled,
         "trend_ema_slope_filter_lookback_bars": config.trend_ema_slope_filter_lookback_bars,
         "trend_ema_slope_filter_min_ratio": str(config.trend_ema_slope_filter_min_ratio),
@@ -1360,6 +1363,7 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         ema55_slope_exit_enabled=coerce_bool(payload.get("ema55_slope_exit_enabled"), True),
         ema55_slope_lock_profit_enabled=coerce_bool(payload.get("ema55_slope_lock_profit_enabled"), False),
         ema55_slope_lock_profit_trigger_r=int(payload.get("ema55_slope_lock_profit_trigger_r", 2)),
+        ema55_slope_negative_entry_bars=int(payload.get("ema55_slope_negative_entry_bars", 1)),
         trend_ema_slope_filter_enabled=coerce_bool(payload.get("trend_ema_slope_filter_enabled"), True),
         trend_ema_slope_filter_lookback_bars=int(payload.get("trend_ema_slope_filter_lookback_bars", 5)),
         trend_ema_slope_filter_min_ratio=Decimal(str(payload.get("trend_ema_slope_filter_min_ratio", "0"))),
@@ -1732,6 +1736,7 @@ class BacktestWindow:
         self.ema55_slope_exit_enabled = BooleanVar(value=initial_state.ema55_slope_exit_enabled)
         self.ema55_slope_lock_profit_enabled = BooleanVar(value=initial_state.ema55_slope_lock_profit_enabled)
         self.ema55_slope_lock_profit_trigger_r = StringVar(value=initial_state.ema55_slope_lock_profit_trigger_r)
+        self.ema55_slope_negative_entry_bars = StringVar(value=initial_state.ema55_slope_negative_entry_bars)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
         self.position_mode_label = StringVar(value=initial_state.position_mode_label)
@@ -1959,6 +1964,7 @@ class BacktestWindow:
             "ema55_slope_exit_enabled": self.ema55_slope_exit_enabled,
             "ema55_slope_lock_profit_enabled": self.ema55_slope_lock_profit_enabled,
             "ema55_slope_lock_profit_trigger_r": self.ema55_slope_lock_profit_trigger_r,
+            "ema55_slope_negative_entry_bars": self.ema55_slope_negative_entry_bars,
             "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
             "time_stop_break_even_bars": self.time_stop_break_even_bars,
             "hold_close_exit_bars": self.hold_close_exit_bars,
@@ -2357,6 +2363,24 @@ class BacktestWindow:
             foreground="#57606a",
         )
         self.slope_threshold_hint.grid(row=row, column=2, columnspan=4, sticky="w", pady=(12, 0))
+
+        row += 1
+        self.ema55_slope_negative_entry_bars_caption = ttk.Label(
+            controls,
+            text="连续负斜率根数",
+        )
+        self.ema55_slope_negative_entry_bars_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.ema55_slope_negative_entry_bars_entry = ttk.Entry(
+            controls,
+            textvariable=self.ema55_slope_negative_entry_bars,
+        )
+        self.ema55_slope_negative_entry_bars_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.ema55_slope_negative_entry_bars_hint = ttk.Label(
+            controls,
+            text="仅 BTC EMA55 斜率做空使用；只有当 EMA55 先为非负斜率，再连续 N 根负斜率同时满足阈值时才开空。",
+            foreground="#57606a",
+        )
+        self.ema55_slope_negative_entry_bars_hint.grid(row=row, column=2, columnspan=4, sticky="w", pady=(8, 0))
 
         row += 1
         self.mtf_filter_bar_caption = ttk.Label(controls, text="高周期K线")
@@ -3936,6 +3960,7 @@ class BacktestWindow:
         ema55_slope_exit_enabled = True
         ema55_slope_lock_profit_enabled = False
         ema55_slope_lock_profit_trigger_r = 2
+        ema55_slope_negative_entry_bars = 1
         ema_type = str(self._resolve_strategy_parameter_value(strategy_id, "ema_type", self.ema_type.get().strip().lower()))
         trend_ema_type = str(
             self._resolve_strategy_parameter_value(strategy_id, "trend_ema_type", self.trend_ema_type.get().strip().lower())
@@ -3959,6 +3984,11 @@ class BacktestWindow:
             )
             if trend_ema_slope_filter_min_ratio > 0:
                 raise ValueError("开空斜率阈值必须小于或等于 0")
+        if strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
+            ema55_slope_negative_entry_bars = self._parse_positive_int(
+                self.ema55_slope_negative_entry_bars.get(),
+                "连续负斜率根数",
+            )
         if strategy_uses_parameter(definition.strategy_id, "atr_percentile_filter_max"):
             atr_percentile_filter_max = self._parse_nonnegative_decimal(
                 self.atr_percentile_filter_max.get(),
@@ -4134,6 +4164,7 @@ class BacktestWindow:
             ema55_slope_exit_enabled=ema55_slope_exit_enabled,
             ema55_slope_lock_profit_enabled=ema55_slope_lock_profit_enabled,
             ema55_slope_lock_profit_trigger_r=ema55_slope_lock_profit_trigger_r,
+            ema55_slope_negative_entry_bars=ema55_slope_negative_entry_bars,
             trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
             atr_percentile_filter_max=atr_percentile_filter_max,
             body_retest_breakdown_atr_multiplier=body_retest_breakdown_atr_multiplier,
@@ -4225,6 +4256,17 @@ class BacktestWindow:
             )
             for widget in slope_threshold_widgets:
                 if visibility.show_slope_threshold:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            btc_slope_entry_widgets = (
+                self.ema55_slope_negative_entry_bars_caption,
+                self.ema55_slope_negative_entry_bars_entry,
+                self.ema55_slope_negative_entry_bars_hint,
+            )
+            show_btc_slope_entry_widgets = strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID
+            for widget in btc_slope_entry_widgets:
+                if show_btc_slope_entry_widgets:
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -4622,6 +4664,7 @@ class BacktestWindow:
         self.ema55_slope_exit_enabled.set(bool(config.ema55_slope_exit_enabled))
         self.ema55_slope_lock_profit_enabled.set(bool(config.ema55_slope_lock_profit_enabled))
         self.ema55_slope_lock_profit_trigger_r.set(str(max(int(config.ema55_slope_lock_profit_trigger_r), 2)))
+        self.ema55_slope_negative_entry_bars.set(str(max(int(config.ema55_slope_negative_entry_bars), 1)))
         self.signal_mode_label.set(SIGNAL_VALUE_TO_LABEL.get(str(config.signal_mode), self.signal_mode_label.get()))
         self.trade_mode_label.set(_reverse_lookup_label(TRADE_MODE_OPTIONS, config.trade_mode, self.trade_mode_label.get()))
         self.position_mode_label.set(

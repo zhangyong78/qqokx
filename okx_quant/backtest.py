@@ -241,6 +241,7 @@ class BacktestResult:
     ema55_slope_exit_enabled: bool = True
     ema55_slope_lock_profit_enabled: bool = False
     ema55_slope_lock_profit_trigger_r: int = 2
+    ema55_slope_negative_entry_bars: int = 1
     ema55_slope_same_bar_reentry_block: bool = False
     ema55_slope_dynamic_exit_requires_bear_reentry: bool = False
     ema55_slope_dynamic_exit_bear_reentry_break_prev_low: bool = False
@@ -410,12 +411,24 @@ def _dynamic_exit_matches_bull_bar_reentry_window(exit_reason: str, *, min_r: in
     return _locked_r_matches_reentry_window(exit_reason, min_r=min_r, max_r=max_r)
 
 
+def _ema55_slope_ratio_from_series(ema_values: list[Decimal | None], index: int) -> Decimal | None:
+    if index <= 0 or index >= len(ema_values):
+        return None
+    current_ema = ema_values[index]
+    previous_ema = ema_values[index - 1]
+    if current_ema is None or previous_ema is None or current_ema == 0:
+        return None
+    return (current_ema - previous_ema) / current_ema
+
+
 def _should_require_bearish_reentry_after_dynamic_exit(config: StrategyConfig, exit_reason: str) -> bool:
     return bool(config.ema55_slope_dynamic_exit_requires_bear_reentry and is_dynamic_protect_exit_reason(exit_reason))
 
 
-def _ema55_slope_entry_uses_negative_turn(config: StrategyConfig) -> bool:
-    return is_btc_ema55_slope_short_strategy(config.strategy_id)
+def _ema55_slope_negative_entry_bars(config: StrategyConfig) -> int:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return max(int(config.ema55_slope_negative_entry_bars), 1)
+    return 1
 
 
 def _ema55_slope_exit_condition_enabled(config: StrategyConfig) -> bool:
@@ -437,15 +450,15 @@ def _ema55_slope_lock_profit_trigger_r(config: StrategyConfig) -> int:
 def _ema55_slope_entry_triggered(
     config: StrategyConfig,
     *,
-    current_slope_ratio: Decimal | None,
-    previous_slope_ratio: Decimal | None,
+    recent_slope_ratios: list[Decimal | None],
     threshold: Decimal,
 ) -> bool:
-    if current_slope_ratio is None or current_slope_ratio > threshold:
+    required_negative_bars = _ema55_slope_negative_entry_bars(config)
+    if len(recent_slope_ratios) < required_negative_bars:
         return False
-    if not _ema55_slope_entry_uses_negative_turn(config):
-        return True
-    return previous_slope_ratio is not None and previous_slope_ratio >= 0
+    if any(slope_ratio is None or slope_ratio > threshold for slope_ratio in recent_slope_ratios[-required_negative_bars:]):
+        return False
+    return True
 
 
 def format_trade_exit_reason(exit_reason: str) -> str:
@@ -1197,6 +1210,7 @@ def _run_backtest_with_loaded_data(
         ema55_slope_exit_enabled=bool(config.ema55_slope_exit_enabled),
         ema55_slope_lock_profit_enabled=bool(config.ema55_slope_lock_profit_enabled),
         ema55_slope_lock_profit_trigger_r=max(int(config.ema55_slope_lock_profit_trigger_r), 2),
+        ema55_slope_negative_entry_bars=max(int(config.ema55_slope_negative_entry_bars), 1),
         ema55_slope_same_bar_reentry_block=bool(config.ema55_slope_same_bar_reentry_block),
         ema55_slope_dynamic_exit_requires_bear_reentry=bool(config.ema55_slope_dynamic_exit_requires_bear_reentry),
         ema55_slope_dynamic_exit_bear_reentry_break_prev_low=bool(
@@ -2007,10 +2021,8 @@ def _run_ema55_slope_short_backtest(
     taker_fee_rate: Decimal = Decimal("0"),
     direction_filter_bias: list[str] | None = None,
 ) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
-    entry_requires_negative_turn = _ema55_slope_entry_uses_negative_turn(config)
-    minimum = max(int(config.ema_period), int(config.trend_ema_period), int(config.atr_period), 2) + (
-        2 if entry_requires_negative_turn else 1
-    )
+    negative_entry_bars = _ema55_slope_negative_entry_bars(config)
+    minimum = max(int(config.ema_period), int(config.trend_ema_period), int(config.atr_period), 2) + 1
     if len(candles) < minimum:
         raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根。")
     trade_start_index = _backtest_trade_start_index(minimum)
@@ -2039,17 +2051,17 @@ def _run_ema55_slope_short_backtest(
         candle = candles[index]
         current_ema = ema_values[index]
         current_ema21 = ema21_values[index] if index < len(ema21_values) else None
-        previous_ema = ema_values[index - 1] if index > 0 else None
-        pre_previous_ema = ema_values[index - 2] if index > 1 else None
         atr_value = atr_values[index] if index < len(atr_values) else None
-        if current_ema is None or previous_ema is None or current_ema21 is None or atr_value is None or atr_value <= 0:
+        if current_ema is None or current_ema21 is None or atr_value is None or atr_value <= 0:
             continue
 
-        slope = current_ema - previous_ema
-        slope_ratio = slope / current_ema if current_ema != 0 else None
-        previous_slope_ratio = None
-        if pre_previous_ema is not None and previous_ema != 0:
-            previous_slope_ratio = (previous_ema - pre_previous_ema) / previous_ema
+        previous_ema = ema_values[index - 1] if index > 0 else None
+        slope = (current_ema - previous_ema) if previous_ema is not None else Decimal("0")
+        slope_ratio = _ema55_slope_ratio_from_series(ema_values, index)
+        recent_slope_ratios = [
+            _ema55_slope_ratio_from_series(ema_values, slope_index)
+            for slope_index in range(index - negative_entry_bars + 1, index + 1)
+        ]
         exited_this_bar = False
 
         if open_position is not None:
@@ -2119,8 +2131,7 @@ def _run_ema55_slope_short_backtest(
             open_position is not None
             or not _ema55_slope_entry_triggered(
                 config,
-                current_slope_ratio=slope_ratio,
-                previous_slope_ratio=previous_slope_ratio,
+                recent_slope_ratios=recent_slope_ratios,
                 threshold=entry_slope_threshold_ratio,
             )
         ):
@@ -4311,12 +4322,14 @@ def _append_backtest_strategy_notes(
     if family == "ema55_slope_short":
         if result.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
             lines.append(
-                f"交易逻辑：固定 {fast_label}；只有当 {fast_label} 先处于上升或走平，随后单根斜率首次转负且比例小于等于阈值时，才按收盘价开空。持仓后始终按 ATR 止损管理；若勾选对应平仓条件，则再叠加 {fast_label} 斜率转正平仓，以及 N R 锁盈利+双向手续费。"
+                f"交易逻辑：固定 {fast_label}；只要连续 {result.ema55_slope_negative_entry_bars} 根单根斜率比例小于等于阈值，就按收盘价开空，不再要求前一根斜率先回到正数或走平。持仓后始终按 ATR 止损管理；若勾选对应平仓条件，则再叠加 {fast_label} 斜率转正平仓，以及 N R 锁盈利+双向手续费。"
             )
         else:
             lines.append(
                 f"交易逻辑：固定 {fast_label}；当 {fast_label} 单根斜率比例小于等于阈值时按收盘价开空，持仓后继续按 ATR 止损/固定或动态止盈管理；若开启斜率转正平仓条件，则在 {fast_label} 斜率重新转正时按收盘价平仓。"
             )
+        if result.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
+            lines.append(f"开仓确认：连续负斜率 {result.ema55_slope_negative_entry_bars} 根，且不要求前一根斜率先转正。")
         lines.append(
             "开空阈值："
             f"{format_decimal_fixed(result.trend_ema_slope_filter_min_ratio, 6)}"

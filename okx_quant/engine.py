@@ -86,6 +86,12 @@ def _live_ema55_slope_lock_profit_trigger_r(config: StrategyConfig) -> int:
     return 2
 
 
+def _live_ema55_slope_negative_entry_bars(config: StrategyConfig) -> int:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return max(int(config.ema55_slope_negative_entry_bars), 1)
+    return 1
+
+
 def live_exchange_dynamic_take_profit_template_enabled(config: StrategyConfig) -> bool:
     """主界面模板是否属于「交易所托管 + 动态止盈上移」口径（供持仓接管等入口复用）。"""
     return _live_dynamic_take_profit_enabled(config) and not bool(config.trader_virtual_stop_loss)
@@ -312,6 +318,7 @@ class OrderSizeTooSmallError(RuntimeError):
 class StartupSignalGateState:
     started_at_ms: int
     chase_window_seconds: int
+    chase_current_signal: bool = False
     blocked_signal: Literal["long", "short"] | None = None
 
 
@@ -696,6 +703,7 @@ class StrategyEngine:
         startup_gate = StartupSignalGateState(
             started_at_ms=int(time.time() * 1000),
             chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+            chase_current_signal=config.startup_chase_current_signal,
         )
 
         self._log_strategy_start(config, instrument, instrument)
@@ -1336,6 +1344,7 @@ class StrategyEngine:
         startup_gate = StartupSignalGateState(
             started_at_ms=int(time.time() * 1000),
             chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+            chase_current_signal=config.startup_chase_current_signal,
         )
         lookback = recommended_indicator_lookback(
             config.ema_period,
@@ -1532,6 +1541,11 @@ class StrategyEngine:
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = None
+        startup_gate = StartupSignalGateState(
+            started_at_ms=int(time.time() * 1000),
+            chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+            chase_current_signal=config.startup_chase_current_signal,
+        )
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
         self._log_local_mode_summary(config, signal_instrument, trade_instrument)
@@ -1581,7 +1595,23 @@ class StrategyEngine:
             decision = strategy.evaluate(confirmed, config, price_increment=signal_instrument.tick_size)
             decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None:
+                _reset_startup_signal_gate(startup_gate)
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无信号 | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            if decision.candle_ts is None:
+                raise RuntimeError("策略返回的信号时间缺失，无法判断启动是否追当前信号。")
+
+            should_skip_startup_signal, startup_gate_message = _should_skip_startup_signal(
+                startup_gate,
+                signal=decision.signal,
+                candle_ts=decision.candle_ts,
+                bar=config.bar,
+            )
+            if startup_gate_message:
+                self._logger(startup_gate_message)
+            if should_skip_startup_signal:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
@@ -1633,8 +1663,13 @@ class StrategyEngine:
             config.trend_ema_period,
             config.atr_period,
             DEFAULT_DEBUG_ATR_PERIOD,
-        ) + (2 if is_btc_ema55_slope_short_strategy(config.strategy_id) else 1)
+        ) + 1
         last_candle_ts: int | None = None
+        startup_gate = StartupSignalGateState(
+            started_at_ms=int(time.time() * 1000),
+            chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+            chase_current_signal=config.startup_chase_current_signal,
+        )
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
         self._log_local_mode_summary(config, signal_instrument, trade_instrument)
@@ -1667,9 +1702,7 @@ class StrategyEngine:
         while not self._stop_event.is_set():
             candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period) + (
-                2 if is_btc_ema55_slope_short_strategy(config.strategy_id) else 1
-            )
+            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period) + 1
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -1700,7 +1733,23 @@ class StrategyEngine:
             )
             decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None:
+                _reset_startup_signal_gate(startup_gate)
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无开空信号 | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            if decision.candle_ts is None:
+                raise RuntimeError("策略返回的信号时间缺失，无法判断启动是否追当前信号。")
+
+            should_skip_startup_signal, startup_gate_message = _should_skip_startup_signal(
+                startup_gate,
+                signal=decision.signal,
+                candle_ts=decision.candle_ts,
+                bar=config.bar,
+            )
+            if startup_gate_message:
+                self._logger(startup_gate_message)
+            if should_skip_startup_signal:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
@@ -1996,6 +2045,11 @@ class StrategyEngine:
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = None
+        startup_gate = StartupSignalGateState(
+            started_at_ms=int(time.time() * 1000),
+            chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+            chase_current_signal=config.startup_chase_current_signal,
+        )
 
         self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
         self._logger(
@@ -2101,6 +2155,7 @@ class StrategyEngine:
         startup_gate = StartupSignalGateState(
             started_at_ms=int(time.time() * 1000),
             chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+            chase_current_signal=config.startup_chase_current_signal,
         )
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
@@ -2292,6 +2347,7 @@ class StrategyEngine:
         startup_gate = StartupSignalGateState(
             started_at_ms=int(time.time() * 1000),
             chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+            chase_current_signal=config.startup_chase_current_signal,
         )
 
         self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
@@ -2465,12 +2521,25 @@ class StrategyEngine:
             decision = strategy.evaluate(confirmed, config, price_increment=instrument.tick_size)
             decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None:
+                _reset_startup_signal_gate(startup_gate)
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无信号 | {decision.reason}")
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
             if decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
                 raise RuntimeError("策略返回的数据不完整，无法生成信号邮件")
+
+            should_skip_startup_signal, startup_gate_message = _should_skip_startup_signal(
+                startup_gate,
+                signal=decision.signal,
+                candle_ts=decision.candle_ts,
+                bar=config.bar,
+            )
+            if startup_gate_message:
+                self._logger(startup_gate_message)
+            if should_skip_startup_signal:
+                self._stop_event.wait(config.poll_seconds)
+                continue
 
             try:
                 protection = build_protection_plan(
@@ -2520,6 +2589,11 @@ class StrategyEngine:
             DEFAULT_DEBUG_ATR_PERIOD,
         ) + 1
         last_candle_ts: int | None = None
+        startup_gate = StartupSignalGateState(
+            started_at_ms=int(time.time() * 1000),
+            chase_window_seconds=config.resolved_startup_chase_window_seconds(),
+            chase_current_signal=config.startup_chase_current_signal,
+        )
 
         self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
         line_label = config.ema_label()
@@ -2553,7 +2627,20 @@ class StrategyEngine:
             )
             decision = self._apply_live_daily_filter_to_decision(confirmed, config, decision)
             if decision.signal is None or decision.entry_reference is None or decision.atr_value is None or decision.candle_ts is None:
+                _reset_startup_signal_gate(startup_gate)
                 self._logger(f"{_fmt_ts(newest_ts)} | 当前无开空信号 | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            should_skip_startup_signal, startup_gate_message = _should_skip_startup_signal(
+                startup_gate,
+                signal=decision.signal,
+                candle_ts=decision.candle_ts,
+                bar=config.bar,
+            )
+            if startup_gate_message:
+                self._logger(startup_gate_message)
+            if should_skip_startup_signal:
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
@@ -5637,6 +5724,12 @@ def _should_skip_startup_signal(
         return False, None
 
     signal_age_seconds = max((gate_state.started_at_ms - confirmation_ts) // 1000, 0)
+    if gate_state.chase_current_signal:
+        return (
+            False,
+            f"{_fmt_ts(candle_ts)} | 启动追当前信号，本次接管当前波段 | 方向={signal.upper()} | "
+            f"信号年龄={signal_age_seconds}秒",
+        )
     window_seconds = max(int(gate_state.chase_window_seconds), 0)
     if window_seconds > 0 and signal_age_seconds <= window_seconds:
         return (

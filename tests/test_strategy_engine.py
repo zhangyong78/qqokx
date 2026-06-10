@@ -984,6 +984,24 @@ class StrategyEngineTest(TestCase):
         self.assertIn("启动追单窗口内接管当前波段", message or "")
         self.assertIsNone(gate.blocked_signal)
 
+    def test_startup_signal_gate_allows_old_signal_when_chase_current_signal_enabled(self) -> None:
+        gate = StartupSignalGateState(
+            started_at_ms=180_000,
+            chase_window_seconds=0,
+            chase_current_signal=True,
+        )
+
+        should_skip, message = _should_skip_startup_signal(
+            gate,
+            signal="short",
+            candle_ts=60_000,
+            bar="1m",
+        )
+
+        self.assertFalse(should_skip)
+        self.assertIn("启动追当前信号，本次接管当前波段", message or "")
+        self.assertIsNone(gate.blocked_signal)
+
     def test_cross_exchange_strategy_skips_old_signal_when_startup_window_disabled(self) -> None:
         messages: list[str] = []
         submit_calls = {"count": 0}
@@ -1160,6 +1178,84 @@ class StrategyEngineTest(TestCase):
 
         self.assertEqual(submit_calls["count"], 1)
         self.assertTrue(any("启动追单窗口内接管当前波段" in message for message in messages))
+
+    def test_ema55_slope_signal_only_accepts_old_signal_when_chase_current_signal_enabled(self) -> None:
+        messages: list[str] = []
+        notify_calls = {"count": 0}
+        candles = self._make_candles([str(2000 + index) for index in range(120)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, _timeout: float) -> bool:
+                self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            object(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="均线斜率做空",
+            session_id="S-slope-chase",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._notify_signal = lambda *args, **kwargs: notify_calls.__setitem__("count", notify_calls["count"] + 1)  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            poll_seconds=10,
+            risk_amount=Decimal("10"),
+            startup_chase_current_signal=True,
+            startup_chase_window_seconds=0,
+            take_profit_mode="dynamic",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        def _fake_evaluate(_candles, _config, **_kw):  # noqa: ANN001
+            return SignalDecision(
+                signal="short",
+                reason="斜率转空",
+                candle_ts=60_000,
+                entry_reference=Decimal("2300"),
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2310"),
+                signal_candle_high=Decimal("2315"),
+                signal_candle_low=Decimal("2295"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=180.0), patch(
+            "okx_quant.engine.evaluate_ema55_slope_short_signal",
+            new=_fake_evaluate,
+        ):
+            engine._run_ema55_slope_short_signal_only(config, instrument)
+
+        self.assertEqual(notify_calls["count"], 1)
+        self.assertTrue(any("启动追当前信号，本次接管当前波段" in message for message in messages))
 
     def test_dynamic_exchange_strategy_continues_after_round_trip_and_respects_wave_limit(self) -> None:
         messages: list[str] = []

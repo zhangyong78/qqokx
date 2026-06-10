@@ -117,6 +117,7 @@ class StrategyConfig:
     ema55_slope_exit_enabled: bool = True
     ema55_slope_lock_profit_enabled: bool = False
     ema55_slope_lock_profit_trigger_r: int = 2
+    ema55_slope_negative_entry_bars: int = 1
     ema55_slope_same_bar_reentry_block: bool = False
     ema55_slope_dynamic_exit_requires_bear_reentry: bool = False
     ema55_slope_dynamic_exit_bear_reentry_break_prev_low: bool = False
@@ -136,6 +137,7 @@ class StrategyConfig:
     body_retest_stop_buffer_atr_multiplier: Decimal = Decimal("0.3")
     body_retest_body_atr_limit: Decimal = Decimal("1.0")
     body_retest_watch_bars: int = 6
+    startup_chase_current_signal: bool = False
     startup_chase_window_seconds: int = 0
     time_stop_break_even_enabled: bool = False
     time_stop_break_even_bars: int = 10
@@ -269,6 +271,9 @@ class StrategyConfig:
 
     def resolved_startup_chase_window_seconds(self) -> int:
         return max(int(self.startup_chase_window_seconds), 0)
+
+    def startup_chase_current_signal_label(self) -> str:
+        return "\u5f00\u542f" if self.startup_chase_current_signal else "\u5173\u95ed"
 
     def startup_chase_window_label(self) -> str:
         seconds = self.resolved_startup_chase_window_seconds()

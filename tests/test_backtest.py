@@ -1134,6 +1134,65 @@ class BacktestTest(TestCase):
         self.assertEqual(result.trades[0].exit_price, Decimal("101"))
         self.assertEqual(result.trades[0].exit_reason, "slope_turn_positive")
 
+    def test_btc_ema55_slope_short_waits_for_configured_consecutive_negative_bars(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(BACKTEST_RESERVED_CANDLES)
+        ]
+        candles.extend(
+            [
+                Candle(1_000, Decimal("100.5"), Decimal("100.5"), Decimal("100.5"), Decimal("100.5"), Decimal("1"), True),
+                Candle(2_000, Decimal("99"), Decimal("99"), Decimal("99"), Decimal("99"), Decimal("1"), True),
+                Candle(3_000, Decimal("98"), Decimal("98"), Decimal("98"), Decimal("98"), Decimal("1"), True),
+                Candle(4_000, Decimal("101"), Decimal("101"), Decimal("101"), Decimal("101"), Decimal("1"), True),
+            ]
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=2,
+            trend_ema_period=2,
+            big_ema_period=233,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("200"),
+            atr_take_multiplier=Decimal("1"),
+            order_size=Decimal("2"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+            backtest_sizing_mode="fixed_size",
+            take_profit_mode="fixed",
+            risk_amount=None,
+            trend_ema_slope_filter_min_ratio=Decimal("-0.0015"),
+            ema55_slope_negative_entry_bars=2,
+            backtest_entry_slippage_rate=Decimal("0"),
+            backtest_exit_slippage_rate=Decimal("0"),
+            backtest_funding_rate=Decimal("0"),
+        )
+
+        result = run_backtest(
+            DummyBacktestClient(candles, self._build_instrument()),
+            config,
+            candle_limit=0,
+            taker_fee_rate=Decimal("0"),
+        )
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0].entry_price, Decimal("98"))
+        self.assertEqual(result.trades[0].entry_index, BACKTEST_RESERVED_CANDLES + 2)
+        self.assertEqual(result.trades[0].exit_reason, "slope_turn_positive")
+
     def test_btc_ema55_slope_short_lock_profit_uses_configurable_trigger_r(self) -> None:
         candles = [
             Candle(
@@ -2590,12 +2649,14 @@ class BacktestTest(TestCase):
                 ema55_slope_exit_enabled=True,
                 ema55_slope_lock_profit_enabled=True,
                 ema55_slope_lock_profit_trigger_r=3,
+                ema55_slope_negative_entry_bars=3,
             )
         )
 
         self.assertIn("3R", summary)
         self.assertIn("斜率转正", summary)
         self.assertIn("双向手续费", summary)
+        self.assertIn("连续负斜率3根", summary)
 
     def test_build_backtest_compare_detail_contains_snapshot_metadata(self) -> None:
         report = BacktestReport(

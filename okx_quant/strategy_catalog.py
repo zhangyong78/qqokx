@@ -50,6 +50,16 @@ def is_dynamic_mtf_strategy_id(strategy_id: str) -> bool:
     }
 
 
+def supports_startup_chase_current_signal(strategy_id: str) -> bool:
+    return strategy_id in {
+        STRATEGY_DYNAMIC_LONG_ID,
+        STRATEGY_DYNAMIC_SHORT_ID,
+        STRATEGY_EMA_BREAKOUT_LONG_ID,
+        STRATEGY_EMA_BREAKDOWN_SHORT_ID,
+        STRATEGY_EMA55_SLOPE_SHORT_ID,
+    }
+
+
 @dataclass(frozen=True)
 class StrategyDefinition:
     strategy_id: str

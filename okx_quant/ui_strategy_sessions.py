@@ -10,6 +10,7 @@ from okx_quant.strategy_runtime_registry import (
     strategy_entry_reference_period_caption,
     strategy_preferred_direction,
 )
+from okx_quant.strategy_catalog import supports_startup_chase_current_signal
 from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
 
 
@@ -89,6 +90,8 @@ class UiStrategySessionsMixin:
             and resolved_api_name in self._credential_profiles
             and resolved_api_name != self._current_credential_profile()
         ):
+            if not self._ensure_credential_profile_access(resolved_api_name, prompt=True):
+                raise ValueError(f"API 配置 {resolved_api_name} 未完成密码验证。")
             self._apply_credentials_profile(resolved_api_name, log_change=False)
 
         self.strategy_name.set(definition.name)
@@ -139,6 +142,7 @@ class UiStrategySessionsMixin:
         )
         self.body_retest_body_atr_limit.set(_format_entry_decimal(record.config.body_retest_body_atr_limit))
         self.body_retest_watch_bars.set(str(record.config.body_retest_watch_bars))
+        self.startup_chase_current_signal.set(bool(record.config.startup_chase_current_signal))
         self.startup_chase_window_seconds.set(str(record.config.startup_chase_window_seconds))
         self.daily_filter_enabled.set(bool(record.config.daily_filter_enabled))
         self.daily_filter_boundary_label.set(
@@ -285,6 +289,46 @@ class UiStrategySessionsMixin:
             return "", f"指定 API 不存在：{normalized_api or '-'}"
         return _resolve_import_api_profile(record.api_name, current_api_name, available_profiles)
 
+    def _confirm_bundle_import_api_access(
+        self,
+        bundle: StrategyTemplateBundleImport,
+        *,
+        selection: dict[str, str],
+        selected_items: tuple[StrategyTemplateBundleItem, ...],
+        per_item_api_map: dict[int, str],
+    ) -> bool:
+        selected_mode = str(selection.get("mode", "preserve")).strip().lower()
+        auto_start_enabled = _coerce_snapshot_bool(selection.get("auto_start"), False)
+        target_items = [
+            (index, item)
+            for index, item in enumerate(bundle.items)
+            if item in selected_items
+        ]
+        if not auto_start_enabled:
+            target_items = target_items[:1]
+        checked_profiles: set[str] = set()
+        current_api_name = self._current_credential_profile().strip()
+        for original_index, item in target_items:
+            selected_api_name = (
+                per_item_api_map.get(original_index, "")
+                if selected_mode == "per_item"
+                else str(selection.get("api_name", ""))
+            )
+            resolved_api_name, _ = self._resolve_bundle_import_api(
+                item.record,
+                mode="selected" if selected_mode == "per_item" else selected_mode,
+                selected_api_name=selected_api_name,
+            )
+            if selected_mode in {"current", "selected", "per_item"} and not resolved_api_name:
+                continue
+            target_api_name = (resolved_api_name or item.record.api_name).strip()
+            if not target_api_name or target_api_name in checked_profiles:
+                continue
+            checked_profiles.add(target_api_name)
+            if not self._ensure_credential_profile_access(target_api_name, prompt=True):
+                return False
+        return True
+
     def _focus_first_session_for_traders(self, trader_ids: list[str]) -> bool:
         normalized_ids = {str(item or "").strip() for item in trader_ids if str(item or "").strip()}
         if not normalized_ids:
@@ -417,6 +461,21 @@ class UiStrategySessionsMixin:
                 api_name = right.strip()
                 if api_name:
                     per_item_api_map[int(left.strip())] = api_name
+        per_item_chase_map_raw = str(selection.get("per_item_chase_map", "") or "").strip()
+        per_item_chase_map: dict[int, bool] = {}
+        if per_item_chase_map_raw:
+            for chunk in per_item_chase_map_raw.split(";"):
+                left, sep, right = chunk.partition("=")
+                if not sep or not left.strip().isdigit():
+                    continue
+                per_item_chase_map[int(left.strip())] = _coerce_snapshot_bool(right.strip(), False)
+        if not self._confirm_bundle_import_api_access(
+            bundle,
+            selection=selection,
+            selected_items=selected_items,
+            per_item_api_map=per_item_api_map,
+        ):
+            return
 
         imported_labels: list[str] = []
         started_session_ids: list[str] = []
@@ -466,6 +525,14 @@ class UiStrategySessionsMixin:
                         risk_amount=None,
                         order_size=item.unit_quota,
                     )
+                resolved_config = replace(
+                    resolved_config,
+                    startup_chase_current_signal=(
+                        per_item_chase_map.get(original_index, resolved_config.startup_chase_current_signal)
+                        if supports_startup_chase_current_signal(item.record.strategy_id)
+                        else False
+                    ),
+                )
                 resolved_record = replace(
                     item.record,
                     api_name=resolved_api_name or item.record.api_name,
@@ -533,6 +600,14 @@ class UiStrategySessionsMixin:
                             risk_amount=None,
                             order_size=first_item.unit_quota,
                         )
+                    resolved_config = replace(
+                        resolved_config,
+                        startup_chase_current_signal=(
+                            per_item_chase_map.get(first_index, resolved_config.startup_chase_current_signal)
+                            if supports_startup_chase_current_signal(first_item.record.strategy_id)
+                            else False
+                        ),
+                    )
                     resolved_record = replace(
                         first_item.record,
                         api_name=resolved_api_name or first_item.record.api_name,
@@ -3835,6 +3910,11 @@ class UiStrategySessionsMixin:
 
     def _credentials_for_profile_or_none(self, profile_name: str) -> Credentials | None:
         target = profile_name.strip() or self._current_credential_profile()
+        prompt = threading.current_thread() is threading.main_thread()
+        ensure_access = getattr(self, "_ensure_credential_profile_access", None)
+        if callable(ensure_access):
+            if not ensure_access(target, prompt=prompt):
+                return None
         current_profile = self._current_credential_profile()
         if target == current_profile:
             current_credentials = self._current_credentials_or_none()
@@ -4225,6 +4305,7 @@ class UiStrategySessionsMixin:
         elif self.signal_mode_label.get() not in definition.allowed_signal_labels:
             self.signal_mode_label.set(definition.default_signal_label)
         if not has_saved_draft:
+            self.startup_chase_current_signal.set(False)
             extra_defaults = strategy_ui_extra_defaults(strategy_id, "launcher")
             risk_amount = extra_defaults.get("risk_amount")
             if risk_amount is not None:
@@ -4457,6 +4538,8 @@ class UiStrategySessionsMixin:
                 self._tp_sl_mode_combo.configure(values=LAUNCHER_TP_SL_MODE_LABELS, state="readonly")
         if visibility.show_entry_reference and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
+        if not supports_startup_chase_current_signal(strategy_id):
+            self.startup_chase_current_signal.set(False)
         if visibility.show_startup_chase_window and not self.startup_chase_window_seconds.get().strip():
             self.startup_chase_window_seconds.set("0")
         self._last_strategy_parameter_strategy_id = strategy_id
@@ -4694,6 +4777,11 @@ class UiStrategySessionsMixin:
                 self.startup_chase_window_seconds.get(),
                 field_name="启动追单窗口",
             )
+        startup_chase_current_signal = (
+            bool(self.startup_chase_current_signal.get())
+            if supports_startup_chase_current_signal(strategy_id)
+            else False
+        )
         trend_ema_slope_filter_min_ratio = Decimal("0")
         if strategy_uses_parameter(strategy_id, "trend_ema_slope_filter_min_ratio"):
             try:
@@ -4855,6 +4943,7 @@ class UiStrategySessionsMixin:
             daily_filter_scope=daily_filter_scope,
             daily_filter_ma_type=daily_filter_ma_type,
             daily_filter_period=daily_filter_period,
+            startup_chase_current_signal=startup_chase_current_signal,
             startup_chase_window_seconds=startup_chase_window_seconds
             if strategy_uses_startup_chase_window(strategy_id)
             else 0,
@@ -6289,6 +6378,10 @@ class UiStrategySessionsMixin:
         if strategy_uses_parameter(strategy_id, "startup_chase_window_seconds"):
             parameter_rows.append(
                 f"启动追单窗口：{self._startup_chase_window_detail_label(startup_window_seconds)}"
+            )
+        if supports_startup_chase_current_signal(strategy_id):
+            parameter_rows.append(
+                f"追当前信号：{self._bool_label(snapshot.get('startup_chase_current_signal', False))}"
             )
         if strategy_uses_parameter(strategy_id, "take_profit_mode") and self._snapshot_text(
             snapshot,

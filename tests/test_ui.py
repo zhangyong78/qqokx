@@ -584,6 +584,7 @@ HTTP 502: <!DOCTYPE html>
             entry_reference_ema_period=21,
             dynamic_two_r_break_even=True,
             dynamic_fee_offset_enabled=True,
+            startup_chase_current_signal=True,
             startup_chase_window_seconds=0,
             time_stop_break_even_enabled=False,
             time_stop_break_even_bars=0,
@@ -631,6 +632,7 @@ HTTP 502: <!DOCTYPE html>
         self.assertIn("固定数量：1（OKX 下单数量 sz；当前已填写风险金，仅作备用；BTC-USDT-SWAP 下 1=0.01 BTC）", message)
         self.assertIn("回测参考：建议 10U，最佳 15U", message)
         self.assertIn("启动追单窗口：关闭（启动不追老信号，只等新波）", message)
+        self.assertIn("追当前信号：开启（导入启动时若当前信号仍有效，本次直接接管）", message)
 
     def test_build_launch_parameter_hint_text_for_dynamic_take_profit(self) -> None:
         hint = _build_launch_parameter_hint_text(
@@ -1105,6 +1107,12 @@ HTTP 502: <!DOCTYPE html>
         self.assertEqual(_infer_session_runtime_status("启动追单窗口已过期，当前不追单 | 方向=LONG"), "等待信号")
         self.assertEqual(_infer_session_runtime_status("本轮持仓已结束，继续监控下一次信号。"), "等待信号")
 
+    def test_infer_session_runtime_status_maps_startup_chase_current_signal_to_entry_monitoring(self) -> None:
+        self.assertEqual(
+            _infer_session_runtime_status("启动追当前信号，本次接管当前波段 | 方向=LONG"),
+            "开仓监控中",
+        )
+
     def test_record_session_runtime_message_marks_session_for_ui_refresh(self) -> None:
         session = SimpleNamespace(session_id="S01", runtime_status="启动中", last_message="")
         app = SimpleNamespace(
@@ -1451,6 +1459,7 @@ class StrategyTemplateImportExportTest(TestCase):
             entry_reference_ema_period=55,
             dynamic_two_r_break_even=True,
             dynamic_fee_offset_enabled=True,
+            startup_chase_current_signal=True,
             startup_chase_window_seconds=300,
             time_stop_break_even_enabled=False,
             time_stop_break_even_bars=0,
@@ -1477,6 +1486,7 @@ class StrategyTemplateImportExportTest(TestCase):
         self.assertEqual(record.strategy_name, "EMA 动态委托做空")
         self.assertEqual(record.direction_label, "只做空")
         self.assertEqual(record.symbol, "SOL-USDT-SWAP")
+        self.assertTrue(record.config.startup_chase_current_signal)
         self.assertEqual(record.config.startup_chase_window_seconds, 300)
         self.assertEqual(record.config.trade_inst_id, "SOL-USDT-SWAP")
         self.assertEqual(record.config.take_profit_mode, "dynamic")
@@ -1523,6 +1533,7 @@ class StrategyTemplateImportExportTest(TestCase):
                 "entry_reference_ema_period": 55,
                 "dynamic_two_r_break_even": True,
                 "dynamic_fee_offset_enabled": True,
+                "startup_chase_current_signal": True,
                 "startup_chase_window_seconds": 0,
                 "time_stop_break_even_enabled": False,
                 "time_stop_break_even_bars": 0,
@@ -1559,7 +1570,21 @@ class StrategyTemplateImportExportTest(TestCase):
             signal_mode_label=_Var(),
             take_profit_mode_label=_Var(),
             max_entries_per_trend=_Var(),
+            trend_ema_slope_filter_min_ratio=_Var(),
+            atr_percentile_filter_max=_Var(),
+            body_retest_breakdown_atr_multiplier=_Var(),
+            body_retest_retest_atr_multiplier=_Var(),
+            body_retest_stop_buffer_atr_multiplier=_Var(),
+            body_retest_body_atr_limit=_Var(),
+            body_retest_watch_bars=_Var(),
+            startup_chase_current_signal=_Var(False),
             startup_chase_window_seconds=_Var(),
+            daily_filter_enabled=_Var(False),
+            daily_filter_boundary_label=_Var(),
+            daily_filter_mode_label=_Var(),
+            daily_filter_scope_label=_Var(),
+            daily_filter_ma_type=_Var(),
+            daily_filter_period=_Var(),
             dynamic_two_r_break_even=_Var(False),
             dynamic_fee_offset_enabled=_Var(False),
             time_stop_break_even_enabled=_Var(False),
@@ -1583,10 +1608,154 @@ class StrategyTemplateImportExportTest(TestCase):
         self.assertEqual(app.strategy_name.get(), "EMA 动态委托做空")
         self.assertEqual(app.symbol.get(), "SOL-USDT-SWAP")
         self.assertEqual(app.risk_amount.get(), "10")
+        self.assertTrue(app.startup_chase_current_signal.get())
         self.assertEqual(app.tp_sl_mode_label.get(), "OKX 托管（仅同标的永续）")
         self.assertEqual(app.environment_label.get(), "模拟盘 demo")
         app._apply_credentials_profile.assert_not_called()
         app._ensure_importable_strategy_symbols.assert_called_once_with("SOL-USDT-SWAP", "")
+
+
+    def test_confirm_bundle_import_api_access_skips_prompt_for_unlocked_current_protected_api(self) -> None:
+        item = SimpleNamespace(
+            record=SimpleNamespace(
+                api_name="desk",
+                strategy_name="Demo",
+                strategy_id=STRATEGY_DYNAMIC_SHORT_ID,
+            )
+        )
+        bundle = SimpleNamespace(items=(item,))
+        app = SimpleNamespace(
+            _credential_profiles={"desk": {"api_key": "k", "secret_key": "s", "passphrase": "p"}},
+            _current_credential_profile=lambda: "desk",
+            _ensure_credential_profile_access=MagicMock(return_value=True),
+        )
+        app._resolve_bundle_import_api = lambda record, *, mode, selected_api_name: QuantApp._resolve_bundle_import_api(
+            app,
+            record,
+            mode=mode,
+            selected_api_name=selected_api_name,
+        )
+
+        allowed = QuantApp._confirm_bundle_import_api_access(
+            app,
+            bundle,
+            selection={"mode": "current", "auto_start": "0"},
+            selected_items=(item,),
+            per_item_api_map={},
+        )
+
+        self.assertTrue(allowed)
+        app._ensure_credential_profile_access.assert_called_once_with("desk", prompt=True)
+
+    def test_apply_strategy_template_record_blocks_protected_api_until_password_confirmed(self) -> None:
+        payload = {
+            "strategy_id": STRATEGY_DYNAMIC_SHORT_ID,
+            "strategy_name": "EMA 动态委托做空",
+            "api_name": "desk",
+            "direction_label": "只做空",
+            "run_mode_label": "交易并下单",
+            "symbol": "SOL-USDT-SWAP",
+            "config_snapshot": {
+                "inst_id": "SOL-USDT-SWAP",
+                "bar": "1H",
+                "ema_period": 21,
+                "atr_period": 10,
+                "atr_stop_multiplier": "2",
+                "atr_take_multiplier": "4",
+                "order_size": "58.82",
+                "trade_mode": "cross",
+                "signal_mode": "short_only",
+                "position_mode": "net",
+                "environment": "demo",
+                "tp_sl_trigger_type": "mark",
+                "trend_ema_period": 55,
+                "big_ema_period": 233,
+                "strategy_id": STRATEGY_DYNAMIC_SHORT_ID,
+                "poll_seconds": 10,
+                "risk_amount": "10",
+                "trade_inst_id": "SOL-USDT-SWAP",
+                "tp_sl_mode": "exchange",
+                "entry_side_mode": "follow_signal",
+                "run_mode": "trade",
+                "take_profit_mode": "dynamic",
+                "max_entries_per_trend": 1,
+                "entry_reference_ema_period": 55,
+                "dynamic_two_r_break_even": True,
+                "dynamic_fee_offset_enabled": True,
+                "startup_chase_current_signal": True,
+                "startup_chase_window_seconds": 0,
+                "time_stop_break_even_enabled": False,
+                "time_stop_break_even_bars": 0,
+            },
+        }
+        record = _strategy_template_record_from_payload(payload)
+        assert record is not None
+        app = SimpleNamespace(
+            _strategy_name_to_id={"EMA 动态委托做空": STRATEGY_DYNAMIC_SHORT_ID},
+            _credential_profiles={
+                "desk": {"api_key": "k", "secret_key": "s", "passphrase": "p", "environment": "demo"},
+                "moni": {"api_key": "k2", "secret_key": "s2", "passphrase": "p2", "environment": "demo"},
+            },
+            _current_credential_profile=lambda: "moni",
+            _ensure_credential_profile_access=MagicMock(return_value=False),
+            _apply_credentials_profile=MagicMock(),
+        )
+        app._resolve_strategy_template_definition = lambda item: QuantApp._resolve_strategy_template_definition(app, item)
+
+        with self.assertRaisesRegex(ValueError, "未完成密码验证"):
+            QuantApp._apply_strategy_template_record(app, record)
+
+        app._ensure_credential_profile_access.assert_called_once_with("desk", prompt=True)
+        app._apply_credentials_profile.assert_not_called()
+
+    def test_import_strategy_template_bundle_stops_when_protected_api_password_not_confirmed(self) -> None:
+        item = SimpleNamespace(
+            record=SimpleNamespace(
+                api_name="desk",
+                strategy_name="Demo",
+                strategy_id=STRATEGY_DYNAMIC_SHORT_ID,
+                config=SimpleNamespace(startup_chase_current_signal=False),
+                symbol="SOL-USDT-SWAP",
+            )
+        )
+        bundle = SimpleNamespace(
+            package_name="测试组合包",
+            items=(item,),
+            auto_start_on_import=False,
+        )
+        dialog = SimpleNamespace(
+            result_payload={
+                "mode": "selected",
+                "api_name": "desk",
+                "auto_start": "0",
+                "selected_indices": "0",
+            }
+        )
+        app = SimpleNamespace(
+            root=object(),
+            _credential_profiles={
+                "desk": {"api_key": "k", "secret_key": "s", "passphrase": "p"},
+                "moni": {"api_key": "k2", "secret_key": "s2", "passphrase": "p2"},
+            },
+            _current_credential_profile=lambda: "moni",
+            _confirm_bundle_import_api_access=MagicMock(return_value=False),
+            _apply_strategy_template_record=MagicMock(),
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            bundle_path = Path(temp_dir) / "bundle.json"
+            bundle_path.write_text("{}", encoding="utf-8")
+            import_globals = QuantApp.import_strategy_template_bundle.__globals__
+            patched_globals = {
+                "filedialog": SimpleNamespace(askopenfilename=lambda **_: str(bundle_path)),
+                "_strategy_template_bundle_from_payload": lambda payload, **_: bundle,
+                "StrategyBundleImportDialog": lambda *args, **kwargs: dialog,
+            }
+            with patch.dict(import_globals, patched_globals):
+                QuantApp.import_strategy_template_bundle(app)
+
+        app._confirm_bundle_import_api_access.assert_called_once()
+        app._apply_strategy_template_record.assert_not_called()
 
 
 class StrategyDuplicateLaunchGuardTest(TestCase):
@@ -6269,6 +6438,7 @@ class StrategyParameterDraftRestoreTest(TestCase):
             body_retest_watch_bars=_Var(""),
             time_stop_break_even_enabled=_Var(False),
             time_stop_break_even_bars=_Var(""),
+            startup_chase_current_signal=_Var(False),
             startup_chase_window_seconds=_Var(""),
         )
         app._strategy_parameter_scope_drafts = lambda: QuantApp._strategy_parameter_scope_drafts(app)

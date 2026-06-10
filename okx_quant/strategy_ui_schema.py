@@ -230,6 +230,7 @@ STRATEGY_UI_SCHEMAS: dict[str, StrategyUiSchema] = {
                 "ema55_slope_exit_enabled": True,
                 "ema55_slope_lock_profit_enabled": True,
                 "ema55_slope_lock_profit_trigger_r": 2,
+                "ema55_slope_negative_entry_bars": 1,
                 "trend_ema_slope_filter_min_ratio": "-0.0005",
             },
             _SCOPE_BACKTEST: {
@@ -243,6 +244,7 @@ STRATEGY_UI_SCHEMAS: dict[str, StrategyUiSchema] = {
                 "ema55_slope_exit_enabled": True,
                 "ema55_slope_lock_profit_enabled": True,
                 "ema55_slope_lock_profit_trigger_r": 2,
+                "ema55_slope_negative_entry_bars": 1,
                 "trend_ema_slope_filter_min_ratio": "-0.0005",
             },
         },

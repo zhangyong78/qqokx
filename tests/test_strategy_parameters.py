@@ -100,6 +100,7 @@ class StrategyParametersTest(TestCase):
         self.assertIn("ema55_slope_exit_enabled", keys)
         self.assertIn("ema55_slope_lock_profit_enabled", keys)
         self.assertIn("ema55_slope_lock_profit_trigger_r", keys)
+        self.assertIn("ema55_slope_negative_entry_bars", keys)
         self.assertIn("trend_ema_slope_filter_min_ratio", keys)
         self.assertNotIn("atr_take_multiplier", keys)
         self.assertNotIn("take_profit_mode", keys)

@@ -72,6 +72,7 @@ PARAMETERS: dict[str, ParameterDefinition] = {
     "ema55_slope_exit_enabled": ParameterDefinition(key="ema55_slope_exit_enabled", default=True),
     "ema55_slope_lock_profit_enabled": ParameterDefinition(key="ema55_slope_lock_profit_enabled", default=False),
     "ema55_slope_lock_profit_trigger_r": ParameterDefinition(key="ema55_slope_lock_profit_trigger_r", default=2),
+    "ema55_slope_negative_entry_bars": ParameterDefinition(key="ema55_slope_negative_entry_bars", default=1),
     "atr_percentile_filter_max": ParameterDefinition(key="atr_percentile_filter_max", default="0"),
     "trend_ema_slope_filter_min_ratio": ParameterDefinition(key="trend_ema_slope_filter_min_ratio", default="0"),
     "body_retest_breakdown_atr_multiplier": ParameterDefinition(key="body_retest_breakdown_atr_multiplier", default="0.2"),
@@ -406,6 +407,7 @@ STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
             "ema55_slope_exit_enabled",
             "ema55_slope_lock_profit_enabled",
             "ema55_slope_lock_profit_trigger_r",
+            "ema55_slope_negative_entry_bars",
             "trend_ema_slope_filter_min_ratio",
         ),
         fixed_values={

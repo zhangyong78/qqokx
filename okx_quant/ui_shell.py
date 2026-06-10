@@ -223,6 +223,7 @@ from okx_quant.strategy_catalog import (
     StrategyDefinition,
     get_strategy_definition,
     resolve_dynamic_signal_mode,
+    supports_startup_chase_current_signal,
     supports_trader_desk,
     supports_signal_only,
 )
@@ -1629,6 +1630,10 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             int(_strategy_config_default("body_retest_watch_bars")),
             minimum=0,
         ),
+        startup_chase_current_signal=_coerce_snapshot_bool(
+            payload.get("startup_chase_current_signal"),
+            bool(_strategy_config_default("startup_chase_current_signal")),
+        ),
         startup_chase_window_seconds=_coerce_snapshot_int(
             payload.get("startup_chase_window_seconds"),
             int(_strategy_config_default("startup_chase_window_seconds")),
@@ -2044,6 +2049,7 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
         self._item_vars: list[BooleanVar] = []
         self._item_api_vars: list[StringVar] = []
         self._item_api_combos: list[ttk.Combobox] = []
+        self._item_chase_vars: list[BooleanVar] = []
         super().__init__(parent, "导入策略组合")
 
     def body(self, master: ttk.Frame):
@@ -2108,9 +2114,11 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
         item_box.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         item_box.columnconfigure(0, weight=1)
         item_box.columnconfigure(1, weight=0)
+        item_box.columnconfigure(2, weight=0)
         self._item_vars = []
         self._item_api_vars = []
         self._item_api_combos = []
+        self._item_chase_vars = []
         for index, item in enumerate(self._items, start=1):
             var = BooleanVar(value=True)
             self._item_vars.append(var)
@@ -2134,6 +2142,14 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
             )
             api_combo.grid(row=index - 1, column=1, sticky="e", padx=(12, 0), pady=(0 if index == 1 else 6, 0))
             self._item_api_combos.append(api_combo)
+            chase_var = BooleanVar(value=bool(getattr(item.record.config, "startup_chase_current_signal", False)))
+            self._item_chase_vars.append(chase_var)
+            if supports_startup_chase_current_signal(item.record.strategy_id):
+                ttk.Checkbutton(
+                    item_box,
+                    text="追当前信号",
+                    variable=chase_var,
+                ).grid(row=index - 1, column=2, sticky="e", padx=(12, 0), pady=(0 if index == 1 else 6, 0))
         return combo
 
     @staticmethod
@@ -2182,12 +2198,18 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
             for index, variable in enumerate(self._item_vars)
             if variable.get() and self._item_api_vars[index].get().strip()
         )
+        per_item_chase_map = ";".join(
+            f"{index}={'1' if self._item_chase_vars[index].get() else '0'}"
+            for index, variable in enumerate(self._item_vars)
+            if variable.get() and supports_startup_chase_current_signal(self._items[index].record.strategy_id)
+        )
         self.result_payload = {
             "mode": mode,
             "api_name": api_name,
             "auto_start": "1" if self.auto_start_var.get() else "0",
             "selected_indices": ",".join(selected_indices),
             "per_item_api_map": per_item_api_map,
+            "per_item_chase_map": per_item_chase_map,
         }
         return True
 
@@ -2707,6 +2729,7 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
         or "检测到挂单状态已变更" in text
         or "挂单部分成交" in text
         or "启动追单窗口内接管当前波段" in text
+        or "启动追当前信号，本次接管当前波段" in text
     ):
         return "开仓监控中"
     if "已提交启动请求" in text:
@@ -3318,6 +3341,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.signal_mode_label = StringVar(value=STRATEGY_DEFINITIONS[0].default_signal_label)
         self.take_profit_mode_label = StringVar(value="动态止盈")
         self.max_entries_per_trend = StringVar(value="1")
+        self.startup_chase_current_signal = BooleanVar(value=False)
         self.startup_chase_window_seconds = StringVar(value="0")
         self.dynamic_two_r_break_even = BooleanVar(value=True)
         self.dynamic_fee_offset_enabled = BooleanVar(value=True)
@@ -3517,6 +3541,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._auto_save_notice_shown = False
         self._credential_profiles: dict[str, dict[str, str]] = {}
         self._locked_credential_profiles: set[str] = set()
+        self._credential_access_granted_profiles: set[str] = set()
         self._header_credential_profile_combo: ttk.Combobox | None = None
         self._credential_profile_combo: ttk.Combobox | None = None
         self._loaded_credential_profile_name = DEFAULT_CREDENTIAL_PROFILE_NAME
@@ -3669,6 +3694,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             if variable is None:
                 continue
             values[key] = variable.get()
+        if supports_startup_chase_current_signal(strategy_id):
+            values["startup_chase_current_signal"] = bool(self.startup_chase_current_signal.get())
         return values
 
     def _save_strategy_parameter_draft(self, strategy_id: str | None = None) -> None:
@@ -3704,6 +3731,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 variable.set(str(default_value).upper())
             else:
                 variable.set(default_value)
+        self.startup_chase_current_signal.set(
+            bool(draft.get("startup_chase_current_signal", False))
+            if supports_startup_chase_current_signal(strategy_id)
+            else False
+        )
         for key in iter_strategy_parameter_keys(strategy_id):
             fixed_value = strategy_fixed_value(strategy_id, key)
             if fixed_value is None:
@@ -7355,6 +7387,43 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
     def _credential_profile_is_locked(self, profile_name: str) -> bool:
         return profile_name.strip() in self._locked_credential_profiles
 
+    def _credential_profile_access_granted(self, profile_name: str) -> bool:
+        return profile_name.strip() in getattr(self, "_credential_access_granted_profiles", set())
+
+    def _grant_credential_profile_access(self, profile_name: str) -> None:
+        target = profile_name.strip()
+        if not target:
+            return
+        if not hasattr(self, "_credential_access_granted_profiles"):
+            self._credential_access_granted_profiles = set()
+        self._credential_access_granted_profiles.add(target)
+
+    def _revoke_credential_profile_access(self, profile_name: str) -> None:
+        target = profile_name.strip()
+        if not target:
+            return
+        getattr(self, "_credential_access_granted_profiles", set()).discard(target)
+
+    def _ensure_credential_profile_access(self, profile_name: str, *, prompt: bool = True) -> bool:
+        target = profile_name.strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
+        if not target:
+            return False
+        if not self._credential_profile_requires_switch_password(target):
+            return True
+        if self._credential_profile_access_granted(target):
+            return True
+        current = self._current_credential_profile().strip()
+        if (
+            target == current
+            and not self._credential_profile_is_locked(target)
+            and self._loaded_credential_profile_name.strip() == target
+        ):
+            self._grant_credential_profile_access(target)
+            return True
+        if not prompt:
+            return False
+        return self._confirm_credential_profile_switch(target)
+
     def _update_current_api_profile_password_status(self, profile_name: str | None = None) -> None:
         target = (profile_name or self._current_credential_profile()).strip()
         if self._credential_profile_is_locked(target):
@@ -7387,6 +7456,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         if stored_environment not in {"demo", "live"}:
             stored_environment = ""
         self._locked_credential_profiles.discard(target)
+        if not self._credential_profile_requires_switch_password(target):
+            granted_profiles = getattr(self, "_credential_access_granted_profiles", None)
+            if granted_profiles is None:
+                granted_profiles = set()
+                self._credential_access_granted_profiles = granted_profiles
+            granted_profiles.add(target)
         self._loaded_credential_profile_name = target
         self.api_profile_name.set(target)
         self._set_credentials_fields(snapshot)
@@ -7416,6 +7491,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         target = profile_name.strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
         snapshot = self._credential_profiles.get(target, _blank_credential_profile_snapshot())
         self._locked_credential_profiles.add(target)
+        getattr(self, "_credential_access_granted_profiles", set()).discard(target)
         self._loaded_credential_profile_name = ""
         self.api_profile_name.set(target)
         self._set_credentials_fields(_blank_credential_profile_snapshot())
@@ -7761,6 +7837,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         if password is None:
             return False
         if verify_profile_switch_password(self._credential_profiles.get(target, {}), password):
+            granted_profiles = getattr(self, "_credential_access_granted_profiles", None)
+            if granted_profiles is None:
+                granted_profiles = set()
+                self._credential_access_granted_profiles = granted_profiles
+            granted_profiles.add(target)
             return True
         messagebox.showerror("密码错误", f"API 配置 {target} 的切换密码不正确。", parent=parent)
         return False
@@ -7831,6 +7912,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         snapshot = dict(self._credential_profiles.get(profile_name, _blank_credential_profile_snapshot()))
         snapshot.update(build_profile_switch_password_snapshot(password))
         self._credential_profiles[profile_name] = snapshot
+        getattr(self, "_credential_access_granted_profiles", set()).discard(profile_name)
         save_credentials_profiles_snapshot(
             selected_profile=self._current_credential_profile(),
             profiles=self._credential_profiles,
@@ -7860,6 +7942,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             }
         )
         self._locked_credential_profiles.discard(profile_name)
+        getattr(self, "_credential_access_granted_profiles", set()).discard(profile_name)
         self._credential_profiles[profile_name] = snapshot
         save_credentials_profiles_snapshot(
             selected_profile=self._current_credential_profile(),
@@ -7935,6 +8018,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         override = self._api_sender_email_overrides.pop(current_name, "").strip()
         if override:
             self._api_sender_email_overrides[target_name] = override
+        granted_profiles = getattr(self, "_credential_access_granted_profiles", set())
+        if current_name in granted_profiles:
+            granted_profiles.discard(current_name)
+            granted_profiles.add(target_name)
         save_credentials_profiles_snapshot(
             selected_profile=target_name,
             profiles=self._credential_profiles,
@@ -7969,6 +8056,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         self._credential_profiles = profiles
         self._api_sender_email_overrides.pop(profile_name, None)
+        self._locked_credential_profiles.discard(profile_name)
+        getattr(self, "_credential_access_granted_profiles", set()).discard(profile_name)
         save_credentials_profiles_snapshot(
             selected_profile=next_profile,
             profiles=self._credential_profiles,
@@ -8693,6 +8782,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         return [item.strip() for item in re.split(r"[,\n;]+", raw) if item.strip()]
 
     def _current_credentials_or_none(self) -> Credentials | None:
+        prompt = threading.current_thread() is threading.main_thread()
+        ensure_access = getattr(self, "_ensure_credential_profile_access", None)
+        if callable(ensure_access):
+            if not ensure_access(self._current_credential_profile(), prompt=prompt):
+                return None
         api_key = self.api_key.get().strip()
         secret_key = self.secret_key.get().strip()
         passphrase = self.passphrase.get().strip()
@@ -12834,6 +12928,13 @@ def _build_strategy_start_confirmation_message(
             return "关闭（启动不追老信号，只等新波）"
         return f"{seconds}秒（只接管启动前窗口内刚确认的波）"
 
+    def _startup_chase_current_signal_text() -> str:
+        if not supports_startup_chase_current_signal(config.strategy_id):
+            return "-"
+        if config.startup_chase_current_signal:
+            return "开启（导入启动时若当前信号仍有效，本次直接接管）"
+        return "关闭（导入启动时不接当前波，只等下一次新信号）"
+
     def _risk_amount_text() -> str:
         if config.run_mode == "signal_only":
             return "-（当前仅发信号，不下单）"
@@ -12950,6 +13051,7 @@ def _build_strategy_start_confirmation_message(
                     f"止盈方式：{take_profit_mode_text}",
                     f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}（同一波最多允许开仓的次数）",
                     f"启动追单窗口：{_startup_chase_text()}",
+                    f"追当前信号：{_startup_chase_current_signal_text()}",
                 ]
             )
         else:
@@ -12959,6 +13061,7 @@ def _build_strategy_start_confirmation_message(
                     f"止盈方式：{take_profit_mode_text}",
                     f"每波最多开仓次数：{config.max_entries_per_trend if config.max_entries_per_trend > 0 else '不限'}（同一波最多允许开仓的次数）",
                     f"启动追单窗口：{_startup_chase_text()}",
+                    f"追当前信号：{_startup_chase_current_signal_text()}",
                 ]
             )
         if config.take_profit_mode == "dynamic":
@@ -13006,6 +13109,8 @@ def _build_strategy_start_confirmation_message(
                     f"（{line_label} 单根斜率 / 当前 {line_label}，小于等于该负值才开空）"
                 ),
                 f"止盈方式：{take_profit_mode_text}",
+                f"启动追单窗口：{_startup_chase_text()}",
+                f"追当前信号：{_startup_chase_current_signal_text()}",
                 f"平仓信号：{line_label} 斜率转正后，本地按收盘确认平仓",
             ]
         )
