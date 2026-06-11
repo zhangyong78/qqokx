@@ -11,6 +11,7 @@ from typing import Callable
 
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import (
+    STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     get_strategy_definition,
     is_dynamic_strategy_id,
@@ -607,9 +608,15 @@ def _build_trader_strategy_lines(
         lines.append(f"{_entry_reference_ema_caption(strategy_id)}：{_entry_reference_ema_label(snapshot)}")
     if is_dynamic_strategy_id(strategy_id):
         take_profit_mode = "动态" if _snapshot_text(snapshot, "take_profit_mode", "dynamic") == "dynamic" else "固定"
+        dynamic_break_even_text = (
+            f"首档触发R={max(int(snapshot.get('ema55_slope_lock_profit_trigger_r', 2) or 2), 2)} | "
+            f"nR保本={_bool_label(snapshot.get('dynamic_two_r_break_even', True))}"
+            if strategy_id == STRATEGY_DYNAMIC_LONG_ID
+            else f"2R保本={_bool_label(snapshot.get('dynamic_two_r_break_even', True))}"
+        )
         lines.append(
             f"止盈模式：{take_profit_mode} | "
-            f"2R保本={_bool_label(snapshot.get('dynamic_two_r_break_even', True))} | "
+            f"{dynamic_break_even_text} | "
             f"手续费偏移={_bool_label(snapshot.get('dynamic_fee_offset_enabled', True))}"
         )
         lines.append(

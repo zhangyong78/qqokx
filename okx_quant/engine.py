@@ -59,6 +59,7 @@ from okx_quant.strategy_runtime_registry import (
     strategy_uses_mtf_filter,
     strategy_uses_signal_extrema,
 )
+from okx_quant.strategy_parameters import strategy_uses_parameter
 from okx_quant.strategy_ui_schema import strategy_forces_follow_signal, strategy_supports_dynamic_take_profit
 
 
@@ -80,8 +81,36 @@ def _live_ema55_slope_lock_profit_enabled(config: StrategyConfig) -> bool:
     return _live_dynamic_take_profit_enabled(config)
 
 
+def _live_ema55_slope_dynamic_two_r_break_even_enabled(config: StrategyConfig) -> bool:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return bool(config.ema55_slope_lock_profit_enabled)
+    return bool(config.dynamic_two_r_break_even)
+
+
+def _live_ema55_slope_dynamic_fee_offset_enabled(config: StrategyConfig) -> bool:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return bool(config.ema55_slope_lock_profit_enabled)
+    return bool(config.dynamic_fee_offset_enabled)
+
+
 def _live_ema55_slope_lock_profit_trigger_r(config: StrategyConfig) -> int:
     return max(int(config.ema55_slope_lock_profit_trigger_r), 2)
+
+
+def _live_dynamic_break_even_uses_trigger_r(config: StrategyConfig) -> bool:
+    return _live_dynamic_take_profit_enabled(config) and strategy_uses_parameter(
+        config.strategy_id,
+        "ema55_slope_lock_profit_trigger_r",
+    )
+
+
+def _live_dynamic_break_even_summary(config: StrategyConfig) -> str:
+    if _live_dynamic_break_even_uses_trigger_r(config):
+        return (
+            f"首档触发R={_live_ema55_slope_lock_profit_trigger_r(config)} | "
+            f"nR保本={config.dynamic_two_r_break_even_label()}"
+        )
+    return f"2R保本={config.dynamic_two_r_break_even_label()}"
 
 
 def _live_ema55_slope_negative_entry_bars(config: StrategyConfig) -> int:
@@ -103,10 +132,12 @@ def _take_profit_mode_description_for_signal_email(config: StrategyConfig) -> st
             "与 ATR 固定/动态止盈倍数无关。"
         )
     if _live_dynamic_take_profit_enabled(config):
+        dynamic_two_r_break_even = _live_ema55_slope_dynamic_two_r_break_even_enabled(config)
+        dynamic_fee_offset_enabled = _live_ema55_slope_dynamic_fee_offset_enabled(config)
         return (
             "止盈方式：动态止盈（若在「交易」模式下按当前模板下单，将按此规则管理出场）| "
-            f"2R保本={config.dynamic_two_r_break_even_label()} | "
-            f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | "
+            f"{_live_dynamic_break_even_summary(config).replace(config.dynamic_two_r_break_even_label(), '开启' if dynamic_two_r_break_even else '关闭')} | "
+            f"手续费偏移={'开启' if dynamic_fee_offset_enabled else '关闭'} | "
             f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
         )
     return (
@@ -731,14 +762,14 @@ class StrategyEngine:
         self._logger(" | ".join(mode_parts))
         if dynamic_stop_only and trader_virtual_stop_loss_enabled:
             self._logger(
-                f"动态止盈已启用 | 2R保本={config.dynamic_two_r_break_even_label()} | "
+                f"动态止盈已启用 | {_live_dynamic_break_even_summary(config)} | "
                 f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | "
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根 | "
                 "交易员模式：止损价只做触发参考，不会直接平仓。"
             )
         elif dynamic_stop_only:
             self._logger(
-                f"动态止盈已启用 | 2R保本={config.dynamic_two_r_break_even_label()} | "
+                f"动态止盈已启用 | {_live_dynamic_break_even_summary(config)} | "
                 f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | "
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根 | "
                 "初始仅在 OKX 挂止损"
@@ -1361,8 +1392,8 @@ class StrategyEngine:
         )
         if dynamic_stop_only:
             self._logger(
-                "止盈方式=动态止盈 | 初始仅挂止损，后续按 2R/3R… 在 OKX 上改价上移；"
-                f"2R保本={config.dynamic_two_r_break_even_label()} | "
+                "止盈方式=动态止盈 | 初始仅挂止损，后续按 nR 逐级在 OKX 上改价上移；"
+                f"{_live_dynamic_break_even_summary(config)} | "
                 f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | "
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
             )
@@ -1554,7 +1585,7 @@ class StrategyEngine:
         if _live_dynamic_take_profit_enabled(config):
             self._logger(
                 "止盈方式=动态止盈 | 本地监控触发价，规则与回测动态止盈一致 | "
-                f"2R保本={config.dynamic_two_r_break_even_label()} | "
+                f"{_live_dynamic_break_even_summary(config)} | "
                 f"手续费偏移={config.dynamic_fee_offset_enabled_label()} | "
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
             )
@@ -1643,7 +1674,15 @@ class StrategyEngine:
                 signal_candle_high=decision.signal_candle_high,
                 signal_candle_low=decision.signal_candle_low,
             )
-            self._monitor_local_exit(credentials, config, trade_instrument, position, protection)
+            self._monitor_ema55_slope_short_local_exit(
+                credentials,
+                config,
+                signal_instrument=signal_instrument,
+                trade_instrument=trade_instrument,
+                position=position,
+                protection=protection,
+                lookback=lookback,
+            )
             return
 
     def _run_ema55_slope_short_local_strategy(
@@ -1682,7 +1721,7 @@ class StrategyEngine:
                     f"开空阈值={Decimal(str(config.trend_ema_slope_filter_min_ratio)):.6f}",
                     f"止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}",
                     f"首档触发R={_live_ema55_slope_lock_profit_trigger_r(config)}",
-                    f"首档保本特例={config.dynamic_two_r_break_even_label()}",
+                    f"nR保本={config.dynamic_two_r_break_even_label()}",
                     f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
                     (
                         f"时间保本={config.time_stop_break_even_enabled_label()}/"
@@ -1811,7 +1850,7 @@ class StrategyEngine:
         self._log_local_mode_summary(config, signal_instrument, trade_instrument)
         self._logger(
             "策略规则：只做空；先等弱势破位阴线，再在限定K线内等待回抽确认做空；"
-            "入场后按自定义初始止损、动态止盈、2R保本和逐级锁盈管理。"
+            "入场后按自定义初始止损、动态止盈、nR保本和逐级锁盈管理。"
         )
         self._logger(
             " | ".join(
@@ -2172,7 +2211,7 @@ class StrategyEngine:
         self._append_dynamic_mtf_mode_parts(config, mode_parts)
         self._append_daily_filter_mode_parts(config, mode_parts)
         if config.take_profit_mode == "dynamic":
-            mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
+            mode_parts.append(_live_dynamic_break_even_summary(config))
             mode_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
             mode_parts.append(
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
@@ -2361,7 +2400,7 @@ class StrategyEngine:
         self._append_dynamic_mtf_mode_parts(config, mode_parts)
         self._append_daily_filter_mode_parts(config, mode_parts)
         if config.take_profit_mode == "dynamic":
-            mode_parts.append(f"2R保本={config.dynamic_two_r_break_even_label()}")
+            mode_parts.append(_live_dynamic_break_even_summary(config))
             mode_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
             mode_parts.append(
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
@@ -2660,7 +2699,7 @@ class StrategyEngine:
             if config.take_profit_mode == "dynamic":
                 reason = (
                     f"{decision.reason} | 止损={format_decimal(protection.stop_loss)} | "
-                    "止盈方式=动态止盈（2R保本后逐级抬止损）"
+                    "止盈方式=动态止盈（按 nR 逐级抬止损）"
                 )
             else:
                 reason = (
@@ -2742,7 +2781,7 @@ class StrategyEngine:
             if config.take_profit_mode == "dynamic":
                 reason = (
                     f"{decision.reason} | 止损={format_decimal(protection.stop_loss)} | "
-                    "止盈方式=动态止盈（2R保本后逐级抬止损）"
+                    "止盈方式=动态止盈（按 nR 逐级抬止损）"
                 )
             else:
                 reason = (
@@ -3130,6 +3169,8 @@ class StrategyEngine:
     ) -> None:
         uses_flat_exit = is_btc_ema55_slope_short_strategy(config.strategy_id)
         dynamic_take_profit_enabled = _live_ema55_slope_lock_profit_enabled(config)
+        dynamic_two_r_break_even = _live_ema55_slope_dynamic_two_r_break_even_enabled(config)
+        dynamic_fee_offset_enabled = _live_ema55_slope_dynamic_fee_offset_enabled(config)
         current_stop_loss = protection.stop_loss
         current_take_profit = protection.take_profit
         next_trigger_r = _live_ema55_slope_lock_profit_trigger_r(config)
@@ -3142,8 +3183,8 @@ class StrategyEngine:
         ]
         if dynamic_take_profit_enabled:
             monitor_parts.append(f"首档触发R={next_trigger_r}")
-            monitor_parts.append(f"首档保本特例={config.dynamic_two_r_break_even_label()}")
-            monitor_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
+            monitor_parts.append(f"nR保本={'开启' if dynamic_two_r_break_even else '关闭'}")
+            monitor_parts.append(f"手续费偏移={'开启' if dynamic_fee_offset_enabled else '关闭'}")
             monitor_parts.append(
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
             )
@@ -3171,8 +3212,8 @@ class StrategyEngine:
                     current_stop_loss=current_stop_loss,
                     next_trigger_r=next_trigger_r,
                     tick_size=trade_instrument.tick_size,
-                    two_r_break_even=config.dynamic_two_r_break_even,
-                    dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                    two_r_break_even=dynamic_two_r_break_even,
+                    dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
                     holding_bars=holding_bars,
                     time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                     time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
@@ -3210,8 +3251,8 @@ class StrategyEngine:
                             risk_per_unit=risk_per_unit,
                             next_trigger_r=next_trigger_r,
                             tick_size=trade_instrument.tick_size,
-                            two_r_break_even=config.dynamic_two_r_break_even,
-                            dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                            two_r_break_even=dynamic_two_r_break_even,
+                            dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
                             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                         )
                         if dynamic_take_profit_enabled
@@ -3240,6 +3281,8 @@ class StrategyEngine:
     ) -> None:
         uses_flat_exit = is_btc_ema55_slope_short_strategy(config.strategy_id)
         dynamic_take_profit_enabled = _live_ema55_slope_lock_profit_enabled(config)
+        dynamic_two_r_break_even = _live_ema55_slope_dynamic_two_r_break_even_enabled(config)
+        dynamic_fee_offset_enabled = _live_ema55_slope_dynamic_fee_offset_enabled(config)
         current_stop_loss = protection.stop_loss
         current_take_profit = protection.take_profit
         next_trigger_r = _live_ema55_slope_lock_profit_trigger_r(config)
@@ -3254,8 +3297,8 @@ class StrategyEngine:
         ]
         if dynamic_take_profit_enabled:
             monitor_parts.append(f"首档触发R={next_trigger_r}")
-            monitor_parts.append(f"首档保本特例={config.dynamic_two_r_break_even_label()}")
-            monitor_parts.append(f"手续费偏移={config.dynamic_fee_offset_enabled_label()}")
+            monitor_parts.append(f"nR保本={'开启' if dynamic_two_r_break_even else '关闭'}")
+            monitor_parts.append(f"手续费偏移={'开启' if dynamic_fee_offset_enabled else '关闭'}")
             monitor_parts.append(
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
             )
@@ -3284,8 +3327,8 @@ class StrategyEngine:
                     current_stop_loss=current_stop_loss,
                     next_trigger_r=next_trigger_r,
                     tick_size=trade_instrument.tick_size,
-                    two_r_break_even=config.dynamic_two_r_break_even,
-                    dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                    two_r_break_even=dynamic_two_r_break_even,
+                    dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
                     holding_bars=holding_bars,
                     time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                     time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
@@ -3323,8 +3366,8 @@ class StrategyEngine:
                             risk_per_unit=risk_per_unit,
                             next_trigger_r=next_trigger_r,
                             tick_size=trade_instrument.tick_size,
-                            two_r_break_even=config.dynamic_two_r_break_even,
-                            dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                            two_r_break_even=dynamic_two_r_break_even,
+                            dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
                             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                         )
                         if dynamic_take_profit_enabled
@@ -3486,7 +3529,7 @@ class StrategyEngine:
             ref_label,
             f"触发价格类型={config.tp_sl_trigger_type}",
             f"初始止损={format_decimal(initial_stop_loss)}",
-            f"2R保本={config.dynamic_two_r_break_even_label()}",
+            _live_dynamic_break_even_summary(config),
             f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
             f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根",
         ]
@@ -3785,8 +3828,8 @@ class StrategyEngine:
             current_stop_loss=current_stop_loss,
             next_trigger_r=next_trigger_r,
             tick_size=trade_instrument.tick_size,
-            two_r_break_even=config.dynamic_two_r_break_even,
-            dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+            two_r_break_even=_live_ema55_slope_dynamic_two_r_break_even_enabled(config),
+            dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
             holding_bars=holding_bars,
             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
             time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
@@ -5006,7 +5049,7 @@ class StrategyEngine:
             monitor_parts.extend(
                 [
                     "止盈方式=动态",
-                    f"2R保本={config.dynamic_two_r_break_even_label()}",
+                    _live_dynamic_break_even_summary(config),
                     f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
                     f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根",
                 ]
@@ -5036,8 +5079,8 @@ class StrategyEngine:
                     current_stop_loss=current_stop_loss,
                     next_trigger_r=next_trigger_r,
                     tick_size=trade_instrument.tick_size,
-                    two_r_break_even=config.dynamic_two_r_break_even,
-                    dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                    two_r_break_even=_live_ema55_slope_dynamic_two_r_break_even_enabled(config),
+                    dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
                     holding_bars=holding_bars,
                     time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                     time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
@@ -5300,8 +5343,8 @@ class StrategyEngine:
             risk_per_unit=risk_per_unit,
             next_trigger_r=next_trigger_r,
             tick_size=trade_instrument.tick_size,
-            two_r_break_even=config.dynamic_two_r_break_even,
-            dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+            two_r_break_even=_live_ema55_slope_dynamic_two_r_break_even_enabled(config),
+            dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
         )
         history_item = self._lookup_recent_position_close_history(

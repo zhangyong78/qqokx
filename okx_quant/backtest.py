@@ -240,7 +240,7 @@ class BacktestResult:
     dynamic_fee_offset_enabled: bool = True
     ema55_slope_exit_enabled: bool = True
     ema55_slope_lock_profit_enabled: bool = False
-    ema55_slope_lock_profit_trigger_r: int = 2
+    ema55_slope_lock_profit_trigger_r: int = 5
     ema55_slope_negative_entry_bars: int = 1
     ema55_slope_same_bar_reentry_block: bool = False
     ema55_slope_dynamic_exit_requires_bear_reentry: bool = False
@@ -439,6 +439,18 @@ def _ema55_slope_lock_profit_enabled(config: StrategyConfig) -> bool:
     if is_btc_ema55_slope_short_strategy(config.strategy_id):
         return bool(config.ema55_slope_lock_profit_enabled)
     return str(config.take_profit_mode or "") == "dynamic"
+
+
+def _ema55_slope_dynamic_two_r_break_even_enabled(config: StrategyConfig) -> bool:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return bool(config.ema55_slope_lock_profit_enabled)
+    return bool(config.dynamic_two_r_break_even)
+
+
+def _ema55_slope_dynamic_fee_offset_enabled(config: StrategyConfig) -> bool:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return bool(config.ema55_slope_lock_profit_enabled)
+    return bool(config.dynamic_fee_offset_enabled)
 
 
 def _ema55_slope_lock_profit_trigger_r(config: StrategyConfig) -> int:
@@ -1203,8 +1215,8 @@ def _run_backtest_with_loaded_data(
         slippage_rate=config.resolved_backtest_exit_slippage_rate(),
         funding_rate=config.backtest_funding_rate,
         take_profit_mode=str(config.take_profit_mode),
-        dynamic_two_r_break_even=bool(config.dynamic_two_r_break_even),
-        dynamic_fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+        dynamic_two_r_break_even=_ema55_slope_dynamic_two_r_break_even_enabled(config),
+        dynamic_fee_offset_enabled=_ema55_slope_dynamic_fee_offset_enabled(config),
         ema55_slope_exit_enabled=bool(config.ema55_slope_exit_enabled),
         ema55_slope_lock_profit_enabled=bool(config.ema55_slope_lock_profit_enabled),
         ema55_slope_lock_profit_trigger_r=max(int(config.ema55_slope_lock_profit_trigger_r), 2),
@@ -2037,6 +2049,8 @@ def _run_ema55_slope_short_backtest(
     uses_flat_exit = is_btc_ema55_slope_short_strategy(config.strategy_id)
     slope_exit_enabled = _ema55_slope_exit_condition_enabled(config)
     dynamic_take_profit_enabled = _ema55_slope_lock_profit_enabled(config)
+    dynamic_two_r_break_even = _ema55_slope_dynamic_two_r_break_even_enabled(config)
+    dynamic_fee_offset_enabled = _ema55_slope_dynamic_fee_offset_enabled(config)
     dynamic_trigger_r = _ema55_slope_lock_profit_trigger_r(config)
     take_profit_enabled = not uses_flat_exit
     reentry_reclaim_state: str | None = None
@@ -2206,8 +2220,8 @@ def _run_ema55_slope_short_backtest(
             dynamic_take_profit_enabled=dynamic_take_profit_enabled,
             take_profit_enabled=take_profit_enabled,
             dynamic_exit_fee_rate=taker_fee_rate,
-            dynamic_two_r_break_even=config.dynamic_two_r_break_even,
-            dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+            dynamic_two_r_break_even=dynamic_two_r_break_even,
+            dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
             time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
             next_dynamic_trigger_r=dynamic_trigger_r,
@@ -2250,6 +2264,8 @@ def _run_body_retest_short_backtest(
     trades: list[BacktestTrade] = []
     open_position: _OpenPosition | None = None
     dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
+    slope_exit_enabled = bool(config.ema55_slope_exit_enabled)
+    dynamic_trigger_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
     slope_threshold = Decimal(str(config.trend_ema_slope_filter_min_ratio))
     breakdown_mult = Decimal(str(config.body_retest_breakdown_atr_multiplier))
     retest_mult = Decimal(str(config.body_retest_retest_atr_multiplier))
@@ -2270,6 +2286,7 @@ def _run_body_retest_short_backtest(
         if line_value is None or prev_line is None or atr_value is None or atr_value <= 0 or atr_pct is None:
             continue
         slope_ratio = (line_value - prev_line) / line_value if line_value != 0 else None
+        line_slope = line_value - prev_line
         if slope_ratio is None:
             continue
 
@@ -2284,6 +2301,29 @@ def _run_body_retest_short_backtest(
             if closed_trade is not None:
                 trades.append(closed_trade)
                 open_position = None
+
+        if open_position is not None and slope_exit_enabled and line_slope > 0:
+            exit_price_raw = snap_to_increment(candle.close, instrument.tick_size, "nearest")
+            exit_price = _apply_slippage_price(
+                exit_price_raw,
+                signal=open_position.signal,
+                tick_size=open_position.tick_size,
+                slippage_rate=open_position.exit_slippage_rate,
+                is_entry=False,
+            )
+            trades.append(
+                _build_closed_trade(
+                    open_position,
+                    candle,
+                    index,
+                    exit_price_raw=exit_price_raw,
+                    exit_price=exit_price,
+                    exit_reason="slope_turn_positive",
+                    exit_fee_rate=taker_fee_rate,
+                    exit_fee_type="taker",
+                )
+            )
+            open_position = None
 
         if open_position is not None:
             continue
@@ -2346,6 +2386,7 @@ def _run_body_retest_short_backtest(
                         dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
                         time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                         time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+                        next_dynamic_trigger_r=dynamic_trigger_r,
                         apply_entry_slippage=True,
                     )
                     pending_index = None
@@ -4188,15 +4229,15 @@ def _append_backtest_dynamic_take_profit_lines(lines: list[str], result: Backtes
         lines.append(
             "平仓条件："
             f"斜率转正平仓={'开启' if result.ema55_slope_exit_enabled else '关闭'} | "
-            f"{result.ema55_slope_lock_profit_trigger_r}R锁盈利+双向手续费="
+            f"nR保本+双向手续费="
             f"{'开启' if result.ema55_slope_lock_profit_enabled else '关闭'}"
         )
         lines.append("止损说明：该策略始终使用 ATR 止损。")
         if result.ema55_slope_lock_profit_enabled:
             lines.append(
-                "锁盈说明：价格先达到设定 R 倍数后，把止损上移到已锁定 "
-                f"{max(result.ema55_slope_lock_profit_trigger_r - 1, 1)}R + 双向 Taker 手续费；"
-                "此后每多走 1R，止损继续按 1R 台阶递进。"
+                f"锁盈说明：nR保本已开启；首档触发R={result.ema55_slope_lock_profit_trigger_r}。"
+                "若首档触发R=2，则 2R 时先把止损上移到保本 - 双向 Taker 手续费；"
+                "此后每多走 1R，止损继续按 n-1R - 双向 Taker 手续费递进。"
             )
         return
     dynamic_trigger_r = max(int(result.ema55_slope_lock_profit_trigger_r), 2)
@@ -4206,7 +4247,7 @@ def _append_backtest_dynamic_take_profit_lines(lines: list[str], result: Backtes
         lines.append("止盈说明：固定止盈为 ATR 倍数止盈。")
         return
     lines.append(f"首档触发R：{dynamic_trigger_r}")
-    lines.append(f"首档保本特例：{'开启' if result.dynamic_two_r_break_even else '关闭'}")
+    lines.append(f"nR保本：{'开启' if result.dynamic_two_r_break_even else '关闭'}")
     lines.append(f"手续费偏移开关：{'开启' if result.dynamic_fee_offset_enabled else '关闭'}")
     lines.append(
         "时间保本开关："

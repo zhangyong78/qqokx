@@ -22,6 +22,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA55_SLOPE_SHORT_ID,
     is_dynamic_strategy_id,
 )
+from okx_quant.strategy_parameters import strategy_uses_parameter
 from okx_quant.strategy_runtime_registry import get_strategy_runtime_profile
 
 
@@ -60,6 +61,13 @@ def _config_reference_label(config: StrategyConfig) -> str:
     return moving_average_display_label(
         config.resolved_entry_reference_ema_type(),
         config.resolved_entry_reference_ema_period(),
+    )
+
+
+def _uses_dynamic_break_even_trigger_r(config: StrategyConfig) -> bool:
+    return config.take_profit_mode == "dynamic" and strategy_uses_parameter(
+        config.strategy_id,
+        "ema55_slope_lock_profit_trigger_r",
     )
 
 
@@ -494,12 +502,18 @@ def _build_batch_scope_line(
             f"手续费 M/T = {maker_fee} / {taker_fee}"
         )
     if batch_mode == "dynamic_entries":
+        config = results[0][0]
+        break_even_text = (
+            f"nR保本 = {config.dynamic_two_r_break_even_label()}；首档触发R = {max(int(config.ema55_slope_lock_profit_trigger_r), 2)}；"
+            if _uses_dynamic_break_even_trigger_r(config)
+            else f"2R保本 = {config.dynamic_two_r_break_even_label()}；"
+        )
         return (
             "参数范围：动态止盈；"
             f"挂单参考线 = {_config_reference_label(results[0][0])}；"
             "SL = 1/1.5/2 ATR；"
             "每波最多开仓次数 = 0/1/2/3；"
-            f"2R保本 = {results[0][0].dynamic_two_r_break_even_label()}；"
+            f"{break_even_text}"
             f"手续费偏移 = {results[0][0].dynamic_fee_offset_enabled_label()}；"
             f"手续费 M/T = {maker_fee} / {taker_fee}"
         )
@@ -703,14 +717,18 @@ def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
         parts.insert(2, f"挂单参考线{_config_reference_label(config)}")
         parts.append(f"止盈方式{'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}")
         if config.take_profit_mode == "dynamic":
-            parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
+            if _uses_dynamic_break_even_trigger_r(config):
+                parts.append(f"首档触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}")
+                parts.append(f"nR保本{config.dynamic_two_r_break_even_label()}")
+            else:
+                parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
             parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
         parts.append(f"每波最多开仓次数{_format_max_entries_label(config.max_entries_per_trend)}")
     if config.strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
         parts.append(f"止盈方式{'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}")
         if config.take_profit_mode == "dynamic":
             parts.append(f"动态止盈首档{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}R")
-            parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
+            parts.append(f"nR保本{config.dynamic_two_r_break_even_label()}")
             parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
     parts.extend(
         [

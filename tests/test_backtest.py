@@ -1264,6 +1264,75 @@ class BacktestTest(TestCase):
         self.assertEqual(result.trades[0].exit_price, Decimal("95"))
         self.assertEqual(result.trades[0].exit_reason, "locked_2r_stop")
 
+    def test_btc_ema55_slope_short_lock_profit_uses_break_even_at_2r_even_when_hidden_flags_are_off(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("100"),
+                Decimal("101"),
+                Decimal("99"),
+                Decimal("100"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(BACKTEST_RESERVED_CANDLES)
+        ]
+        candles.extend(
+            [
+                Candle(1_000, Decimal("101"), Decimal("102"), Decimal("100"), Decimal("101"), Decimal("1"), True),
+                Candle(2_000, Decimal("99"), Decimal("100"), Decimal("98"), Decimal("99"), Decimal("1"), True),
+                Candle(3_000, Decimal("99"), Decimal("99"), Decimal("93.8"), Decimal("93.8"), Decimal("1"), True),
+                Candle(4_000, Decimal("93.8"), Decimal("99.0"), Decimal("93.8"), Decimal("98.8"), Decimal("1"), True),
+            ]
+        )
+        instrument = self._build_custom_instrument(
+            inst_id="BTC-USDT-SWAP",
+            tick_size="0.1",
+            lot_size="0.1",
+            min_size="0.1",
+        )
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=2,
+            trend_ema_period=2,
+            big_ema_period=233,
+            atr_period=2,
+            atr_stop_multiplier=Decimal("1"),
+            atr_take_multiplier=Decimal("1"),
+            order_size=Decimal("0.1"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+            backtest_sizing_mode="fixed_size",
+            take_profit_mode="fixed",
+            risk_amount=None,
+            trend_ema_slope_filter_min_ratio=Decimal("-0.005"),
+            backtest_entry_slippage_rate=Decimal("0"),
+            backtest_exit_slippage_rate=Decimal("0"),
+            backtest_funding_rate=Decimal("0"),
+            ema55_slope_exit_enabled=False,
+            ema55_slope_lock_profit_enabled=True,
+            ema55_slope_lock_profit_trigger_r=2,
+            dynamic_two_r_break_even=False,
+            dynamic_fee_offset_enabled=False,
+        )
+
+        result = run_backtest(
+            DummyBacktestClient(candles, instrument),
+            config,
+            candle_limit=0,
+            taker_fee_rate=Decimal("0.001"),
+        )
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0].entry_price, Decimal("99"))
+        self.assertEqual(result.trades[0].exit_price, Decimal("98.8"))
+        self.assertEqual(result.trades[0].exit_reason, "break_even_stop")
+
     def test_dynamic_backtest_short_gap_fill_regression_uses_next_candle_open_for_sol_4h(self) -> None:
         target_entry_ts = 1645747200000  # 2022-02-25 08:00:00
         candles = self._load_cached_candles("SOL-USDT-SWAP__4H.json", end_ts=1645819200000)
@@ -2688,7 +2757,7 @@ class BacktestTest(TestCase):
         )
 
         self.assertIn("首档触发R3", summary)
-        self.assertIn("首档保本特例开", summary)
+        self.assertIn("nR保本开", summary)
         self.assertIn("动态止盈", summary)
 
     def test_export_param_summary_for_slope_short_includes_dynamic_trigger_r(self) -> None:

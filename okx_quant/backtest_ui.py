@@ -50,6 +50,7 @@ from okx_quant.strategy_catalog import (
     ALL_STRATEGY_DEFINITIONS,
     BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+    STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
     StrategyDefinition,
@@ -220,7 +221,7 @@ class BacktestLaunchState:
     body_retest_watch_bars: str = "6"
     ema55_slope_exit_enabled: bool = True
     ema55_slope_lock_profit_enabled: bool = True
-    ema55_slope_lock_profit_trigger_r: str = "2"
+    ema55_slope_lock_profit_trigger_r: str = "5"
     ema55_slope_negative_entry_bars: str = "1"
     maker_fee_percent: str = DEFAULT_MAKER_FEE_PERCENT
     taker_fee_percent: str = DEFAULT_TAKER_FEE_PERCENT
@@ -649,8 +650,8 @@ def _configure_backtest_compare_tree(tree: ttk.Treeview) -> None:
 def _btc_ema55_slope_exit_summary(config: StrategyConfig) -> str:
     trigger_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
     slope_exit = "开" if config.ema55_slope_exit_enabled else "关"
-    lock_profit = "开" if config.ema55_slope_lock_profit_enabled else "关"
-    return f"斜率转正平仓={slope_exit} / {trigger_r}R锁盈利+双向手续费={lock_profit}"
+    lock_profit = "nR保本开启" if config.ema55_slope_lock_profit_enabled else "nR保本关闭"
+    return f"斜率转正平仓={slope_exit} / 首档触发R={trigger_r} / {lock_profit}"
 
 
 def _btc_ema55_slope_reentry_summary(config: StrategyConfig) -> str:
@@ -675,14 +676,21 @@ def _btc_ema55_slope_reentry_summary(config: StrategyConfig) -> str:
 def _backtest_exit_mode_label(config: StrategyConfig) -> str:
     if config.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
         return _btc_ema55_slope_exit_summary(config)
-    if config.strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID and config.take_profit_mode == "dynamic":
+    if config.strategy_id in {STRATEGY_EMA55_SLOPE_SHORT_ID, STRATEGY_BODY_RETEST_SHORT_ID} and config.take_profit_mode == "dynamic":
         trigger_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
         slope_exit = "开" if config.ema55_slope_exit_enabled else "关"
         return f"动态止盈 / 斜率转正平仓={slope_exit} / 首档触发R={trigger_r}"
-    if config.strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
+    if config.strategy_id in {STRATEGY_EMA55_SLOPE_SHORT_ID, STRATEGY_BODY_RETEST_SHORT_ID}:
         slope_exit = "开" if config.ema55_slope_exit_enabled else "关"
         return f"固定止盈 / 斜率转正平仓={slope_exit}"
     return "动态止盈" if config.take_profit_mode == "dynamic" else "固定止盈"
+
+
+def _uses_dynamic_break_even_trigger_r(config: StrategyConfig) -> bool:
+    return config.take_profit_mode == "dynamic" and strategy_uses_parameter(
+        config.strategy_id,
+        "ema55_slope_lock_profit_trigger_r",
+    )
 
 
 def _build_backtest_param_summary(
@@ -720,11 +728,11 @@ def _build_backtest_param_summary(
             f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
         )
 
-    if config.strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
+    if config.strategy_id in {STRATEGY_EMA55_SLOPE_SHORT_ID, STRATEGY_BODY_RETEST_SHORT_ID}:
         extra_parts = [_backtest_exit_mode_label(config)]
         if config.take_profit_mode == "dynamic":
             extra_parts.append(f"首档触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}")
-            extra_parts.append(f"首档保本特例{config.dynamic_two_r_break_even_label()}")
+            extra_parts.append(f"nR保本{config.dynamic_two_r_break_even_label()}")
             extra_parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
             extra_parts.append(
                 f"时间保本{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
@@ -745,9 +753,9 @@ def _build_backtest_param_summary(
     if profile.uses_dynamic_orders or strategy_is_cross_family(config.strategy_id):
         extra_parts = [_backtest_exit_mode_label(config)]
         if config.take_profit_mode == "dynamic":
-            if config.strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
+            if _uses_dynamic_break_even_trigger_r(config):
                 extra_parts.append(f"首档触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}")
-                extra_parts.append(f"首档保本特例{config.dynamic_two_r_break_even_label()}")
+                extra_parts.append(f"nR保本{config.dynamic_two_r_break_even_label()}")
             else:
                 extra_parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
             extra_parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
@@ -1390,7 +1398,7 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         entry_reference_ema_type=str(payload.get("entry_reference_ema_type", payload.get("ema_type", "ema"))),
         entry_reference_ema_period=int(payload.get("entry_reference_ema_period", 55)),
         atr_period=int(payload.get("atr_period", 14)),
-        atr_stop_multiplier=Decimal(str(payload.get("atr_stop_multiplier", "1.5"))),
+        atr_stop_multiplier=Decimal(str(payload.get("atr_stop_multiplier", "2"))),
         atr_take_multiplier=Decimal(str(payload.get("atr_take_multiplier", "4"))),
         order_size=Decimal(str(payload.get("order_size", "0"))),
         trade_mode=str(payload.get("trade_mode", "cross")),
@@ -1416,7 +1424,7 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         dynamic_fee_offset_enabled=bool(payload.get("dynamic_fee_offset_enabled", True)),
         ema55_slope_exit_enabled=coerce_bool(payload.get("ema55_slope_exit_enabled"), True),
         ema55_slope_lock_profit_enabled=coerce_bool(payload.get("ema55_slope_lock_profit_enabled"), False),
-        ema55_slope_lock_profit_trigger_r=int(payload.get("ema55_slope_lock_profit_trigger_r", 2)),
+        ema55_slope_lock_profit_trigger_r=int(payload.get("ema55_slope_lock_profit_trigger_r", 5)),
         ema55_slope_negative_entry_bars=int(payload.get("ema55_slope_negative_entry_bars", 1)),
         trend_ema_slope_filter_enabled=coerce_bool(payload.get("trend_ema_slope_filter_enabled"), True),
         trend_ema_slope_filter_lookback_bars=int(payload.get("trend_ema_slope_filter_lookback_bars", 5)),
@@ -2589,7 +2597,7 @@ class BacktestWindow:
         row += 1
         self.dynamic_two_r_break_even_check = ttk.Checkbutton(
             controls,
-            text="启用首档保本特例（首档触发R=2时，先移到保本位）",
+            text="启用 nR保本特例（首档触发R=2时，先移到保本位）",
             variable=self.dynamic_two_r_break_even,
         )
         self.dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
@@ -4030,7 +4038,7 @@ class BacktestWindow:
         hold_close_exit_bars = 0
         ema55_slope_exit_enabled = True
         ema55_slope_lock_profit_enabled = False
-        ema55_slope_lock_profit_trigger_r = 2
+        ema55_slope_lock_profit_trigger_r = 5
         ema55_slope_negative_entry_bars = 1
         ema_type = str(self._resolve_strategy_parameter_value(strategy_id, "ema_type", self.ema_type.get().strip().lower()))
         trend_ema_type = str(
@@ -4427,7 +4435,10 @@ class BacktestWindow:
                 self.dynamic_break_even_trigger_r_label,
                 self.dynamic_break_even_trigger_r_entry,
             )
-            show_generic_slope_trigger_widgets = strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID
+            show_generic_slope_trigger_widgets = strategy_uses_parameter(
+                strategy_id,
+                "ema55_slope_lock_profit_trigger_r",
+            )
             for widget in generic_slope_trigger_widgets:
                 if visibility.show_dynamic_take_profit and show_generic_slope_trigger_widgets:
                     widget.grid()
@@ -4437,7 +4448,11 @@ class BacktestWindow:
                 self.ema55_slope_exit_conditions_caption,
                 self.ema55_slope_exit_enabled_check,
             )
-            show_slope_exit_widgets = strategy_id in {STRATEGY_EMA55_SLOPE_SHORT_ID, STRATEGY_BTC_EMA55_SLOPE_SHORT_ID}
+            show_slope_exit_widgets = strategy_id in {
+                STRATEGY_EMA55_SLOPE_SHORT_ID,
+                STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
+                STRATEGY_BODY_RETEST_SHORT_ID,
+            }
             for widget in slope_exit_widgets:
                 if show_slope_exit_widgets:
                     widget.grid()
@@ -4606,13 +4621,16 @@ class BacktestWindow:
         dynamic_take_profit = (
             dynamic_strategy and TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "fixed") == "dynamic"
         )
-        generic_slope_short = definition.strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID
+        uses_dynamic_trigger_r = strategy_uses_parameter(
+            definition.strategy_id,
+            "ema55_slope_lock_profit_trigger_r",
+        )
         self.dynamic_two_r_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self.dynamic_break_even_trigger_r_label.configure(
-            state="normal" if dynamic_take_profit and generic_slope_short else "disabled"
+            state="normal" if dynamic_take_profit and uses_dynamic_trigger_r else "disabled"
         )
         self.dynamic_break_even_trigger_r_entry.configure(
-            state="normal" if dynamic_take_profit and generic_slope_short else "disabled"
+            state="normal" if dynamic_take_profit and uses_dynamic_trigger_r else "disabled"
         )
         self.dynamic_fee_offset_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self.time_stop_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
@@ -6709,9 +6727,9 @@ class BacktestWindow:
         if config.uses_daily_filter():
             metrics_parts.append(config.daily_filter_summary())
         if config.strategy_id != STRATEGY_BTC_EMA55_SLOPE_SHORT_ID and config.take_profit_mode == "dynamic":
-            if config.strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
+            if _uses_dynamic_break_even_trigger_r(config):
                 metrics_parts.append(f"首档触发R：{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}")
-                metrics_parts.append(f"首档保本特例：{config.dynamic_two_r_break_even_label()}")
+                metrics_parts.append(f"nR保本：{config.dynamic_two_r_break_even_label()}")
             else:
                 metrics_parts.append(f"2R保本：{config.dynamic_two_r_break_even_label()}")
             metrics_parts.append(f"手续费偏移：{config.dynamic_fee_offset_enabled_label()}")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,7 +14,7 @@ if str(ROOT) not in sys.path:
 from okx_quant.models import StrategyConfig
 from okx_quant.persistence import analysis_report_dir_path
 from okx_quant.strategy_catalog import (
-    STRATEGY_BODY_RETEST_SHORT_ID,
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
 )
@@ -25,192 +26,67 @@ from okx_quant.strategy_profiles import (
 )
 
 
+BUNDLE_NAME = "\u6700\u4f73\u53c2\u6570\u7ec4\u5408\u5305"
+HTML_NAME = "\u6700\u4f73\u53c2\u6570\u7ec4\u5408\u5305\u8bf4\u660e.html"
 PACKAGE_DIR = analysis_report_dir_path() / "packages"
 PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
-TARGET_PATH = PACKAGE_DIR / "最佳参数组合包.json"
-PROJECT_REPORT_DIR = ROOT / "reports"
-PROJECT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
-HTML_PATH = PROJECT_REPORT_DIR / "最佳参数组合包说明.html"
+JSON_PATH = PACKAGE_DIR / f"{BUNDLE_NAME}.json"
+HTML_PATH = PACKAGE_DIR / HTML_NAME
+REPORTS_DIR = ROOT / "reports"
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+LEGACY_HTML_PATH = REPORTS_DIR / HTML_NAME
 
 
 @dataclass(frozen=True)
-class LongSpec:
-    symbol: str
-    profile_id: str
-    profile_name: str
-    ema_period: int
-    ema_type: str
-    trend_ema_period: int
-    trend_ema_type: str
-    entry_reference_ema_period: int
-    entry_reference_ema_type: str
-    atr_stop_multiplier: Decimal
-    atr_take_multiplier: Decimal
-    notes: str
-
-
-@dataclass(frozen=True)
-class ShortSpec:
+class BundleSpec:
+    side: str
     symbol: str
     profile_id: str
     profile_name: str
     strategy_id: str
-    ema_period: int
-    ema_type: str
-    trend_ema_period: int
-    trend_ema_type: str
-    daily_filter_mode: str
-    daily_filter_ma_type: str
-    daily_filter_period: int
-    notes: str
+    strategy_label: str
+    core_label: str
+    protection_label: str
+    note: str
+    config: StrategyConfig
 
 
-LONG_SPECS = (
-    LongSpec(
-        symbol="BTC-USDT-SWAP",
-        profile_id="dynamic_long_best_btc",
-        profile_name="BTC 动态委托做多 最佳参数",
-        ema_period=21,
-        ema_type="ema",
-        trend_ema_period=50,
-        trend_ema_type="ma",
-        entry_reference_ema_period=50,
-        entry_reference_ema_type="ma",
-        atr_stop_multiplier=Decimal("2"),
-        atr_take_multiplier=Decimal("2"),
-        notes="固定研究口径：EMA21 / MA50 / 挂单 MA50 / SL2 / 动态止盈 / 10U 风险 / 不加日线过滤。",
-    ),
-    LongSpec(
-        symbol="ETH-USDT-SWAP",
-        profile_id="dynamic_long_best_eth",
-        profile_name="ETH 动态委托做多 最佳参数",
-        ema_period=21,
-        ema_type="ma",
-        trend_ema_period=55,
-        trend_ema_type="ema",
-        entry_reference_ema_period=55,
-        entry_reference_ema_type="ma",
-        atr_stop_multiplier=Decimal("2"),
-        atr_take_multiplier=Decimal("2"),
-        notes="固定研究口径：MA21 / EMA55 / 挂单 MA55 / SL2 / 动态止盈 / 10U 风险 / 不加日线过滤。",
-    ),
-    LongSpec(
-        symbol="SOL-USDT-SWAP",
-        profile_id="dynamic_long_best_sol",
-        profile_name="SOL 动态委托做多 最佳参数",
-        ema_period=21,
-        ema_type="ma",
-        trend_ema_period=55,
-        trend_ema_type="ma",
-        entry_reference_ema_period=55,
-        entry_reference_ema_type="ma",
-        atr_stop_multiplier=Decimal("1"),
-        atr_take_multiplier=Decimal("1"),
-        notes="固定研究口径：MA21 / MA55 / 挂单 MA55 / SL1 / 动态止盈 / 10U 风险 / 不加日线过滤。",
-    ),
-    LongSpec(
-        symbol="BNB-USDT-SWAP",
-        profile_id="dynamic_long_best_bnb",
-        profile_name="BNB 动态委托做多 最佳参数",
-        ema_period=21,
-        ema_type="ma",
-        trend_ema_period=55,
-        trend_ema_type="ma",
-        entry_reference_ema_period=55,
-        entry_reference_ema_type="ma",
-        atr_stop_multiplier=Decimal("1.5"),
-        atr_take_multiplier=Decimal("6"),
-        notes="固定研究口径：MA21 / MA55 / 挂单 MA55 / SL1.5 / 动态止盈 / 10U 风险 / 不加日线过滤。",
-    ),
-)
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-SHORT_SPECS = (
-    ShortSpec(
-        symbol="BTC-USDT-SWAP",
-        profile_id="slope_short_best_btc",
-        profile_name="BTC 斜率做空 最佳参数",
-        strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
-        ema_period=55,
-        ema_type="ema",
-        trend_ema_period=55,
-        trend_ema_type="ema",
-        daily_filter_mode="disabled",
-        daily_filter_ma_type="ema",
-        daily_filter_period=21,
-        notes="100U 深度研究定稿：EMA55 斜率做空，不加日线过滤，ATR14 止损2，ATR分位<=0.5，动态止盈，2R 保本。",
-    ),
-    ShortSpec(
-        symbol="ETH-USDT-SWAP",
-        profile_id="slope_short_best_eth",
-        profile_name="ETH 斜率做空 最佳参数",
-        strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
-        ema_period=34,
-        ema_type="ma",
-        trend_ema_period=34,
-        trend_ema_type="ma",
-        daily_filter_mode="disabled",
-        daily_filter_ma_type="ema",
-        daily_filter_period=21,
-        notes="100U 深度研究定稿：MA34 斜率做空，不加日线过滤，ATR14 止损2，ATR分位<=0.5，动态止盈，2R 保本。",
-    ),
-    ShortSpec(
-        symbol="SOL-USDT-SWAP",
-        profile_id="slope_short_best_sol",
-        profile_name="SOL 斜率做空 最佳参数",
-        strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
-        ema_period=20,
-        ema_type="ma",
-        trend_ema_period=20,
-        trend_ema_type="ma",
-        daily_filter_mode="disabled",
-        daily_filter_ma_type="ema",
-        daily_filter_period=21,
-        notes="100U 深度研究定稿：MA20 斜率做空，不加日线过滤，ATR14 止损2，ATR分位<=0.5，动态止盈，2R 保本。",
-    ),
-    ShortSpec(
-        symbol="BNB-USDT-SWAP",
-        profile_id="body_retest_short_best_bnb",
-        profile_name="BNB 回抽做空 最佳参数",
-        strategy_id=STRATEGY_BODY_RETEST_SHORT_ID,
-        ema_period=20,
-        ema_type="ma",
-        trend_ema_period=20,
-        trend_ema_type="ma",
-        daily_filter_mode="disabled",
-        daily_filter_ma_type="ema",
-        daily_filter_period=21,
-        notes="100U 深度研究定稿：Body/ATR 回抽做空，不加日线过滤，ATR14 止损2，ATR分位<=0.5，动态止盈，2R 保本。",
-    ),
-    ShortSpec(
-        symbol="DOGE-USDT-SWAP",
-        profile_id="slope_short_best_doge",
-        profile_name="DOGE 斜率做空 最佳参数",
-        strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
-        ema_period=55,
-        ema_type="ma",
-        trend_ema_period=55,
-        trend_ema_type="ma",
-        daily_filter_mode="disabled",
-        daily_filter_ma_type="ma",
-        daily_filter_period=20,
-        notes="100U 深度研究定稿：MA55 斜率做空，不加日线过滤，ATR14 止损2，ATR分位<=0.5，动态止盈，2R 保本。",
-    ),
-)
+def _fmt_decimal(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
 
 
-def build_dynamic_long_config(spec: LongSpec) -> StrategyConfig:
+def _html_text(text: str) -> str:
+    escaped = html.escape(text, quote=True)
+    return "".join(f"&#x{ord(ch):X};" if ord(ch) > 127 else ch for ch in escaped)
+
+
+def build_dynamic_long_config(
+    *,
+    symbol: str,
+    ema_period: int,
+    trend_ema_period: int,
+    entry_reference_ema_period: int,
+    atr_stop_multiplier: Decimal,
+    trigger_r: int,
+) -> StrategyConfig:
     return StrategyConfig(
-        inst_id=spec.symbol,
+        inst_id=symbol,
         bar="1H",
-        ema_period=spec.ema_period,
-        ema_type=spec.ema_type,
-        trend_ema_period=spec.trend_ema_period,
-        trend_ema_type=spec.trend_ema_type,
+        ema_period=ema_period,
+        ema_type="ema",
+        trend_ema_period=trend_ema_period,
+        trend_ema_type="ema",
         big_ema_period=233,
         atr_period=10,
-        atr_stop_multiplier=spec.atr_stop_multiplier,
-        atr_take_multiplier=spec.atr_take_multiplier,
+        atr_stop_multiplier=atr_stop_multiplier,
+        atr_take_multiplier=atr_stop_multiplier * Decimal("2"),
         order_size=Decimal("0"),
         trade_mode="cross",
         signal_mode="long_only",
@@ -221,26 +97,36 @@ def build_dynamic_long_config(spec: LongSpec) -> StrategyConfig:
         risk_amount=Decimal("100"),
         backtest_initial_capital=Decimal("10000"),
         backtest_sizing_mode="fixed_risk",
-        entry_reference_ema_period=spec.entry_reference_ema_period,
-        entry_reference_ema_type=spec.entry_reference_ema_type,
+        entry_reference_ema_period=entry_reference_ema_period,
         take_profit_mode="dynamic",
         max_entries_per_trend=1,
         dynamic_two_r_break_even=True,
         dynamic_fee_offset_enabled=True,
+        ema55_slope_lock_profit_trigger_r=trigger_r,
         time_stop_break_even_enabled=False,
         time_stop_break_even_bars=0,
+        startup_chase_window_seconds=0,
+        tp_sl_mode="exchange",
+        run_mode="trade",
+        entry_side_mode="follow_signal",
     )
 
 
-def build_slope_short_config(spec: ShortSpec) -> StrategyConfig:
-    daily_enabled = str(spec.daily_filter_mode).strip().lower() != "disabled"
+def build_slope_short_config(
+    *,
+    symbol: str,
+    ema_period: int,
+    ema_type: str,
+    trend_ema_period: int,
+    trend_ema_type: str,
+) -> StrategyConfig:
     return StrategyConfig(
-        inst_id=spec.symbol,
+        inst_id=symbol,
         bar="1H",
-        ema_period=spec.ema_period,
-        ema_type=spec.ema_type,
-        trend_ema_period=spec.trend_ema_period,
-        trend_ema_type=spec.trend_ema_type,
+        ema_period=ema_period,
+        ema_type=ema_type,
+        trend_ema_period=trend_ema_period,
+        trend_ema_type=trend_ema_type,
         big_ema_period=233,
         atr_period=14,
         atr_stop_multiplier=Decimal("2"),
@@ -251,40 +137,39 @@ def build_slope_short_config(spec: ShortSpec) -> StrategyConfig:
         position_mode="net",
         environment="live",
         tp_sl_trigger_type="mark",
-        strategy_id=spec.strategy_id,
+        strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
         risk_amount=Decimal("100"),
         backtest_initial_capital=Decimal("10000"),
         backtest_sizing_mode="fixed_risk",
         take_profit_mode="dynamic",
         dynamic_two_r_break_even=True,
         dynamic_fee_offset_enabled=True,
-        ema55_slope_exit_enabled=False,
-        ema55_slope_same_bar_reentry_block=True,
-        ema55_slope_dynamic_exit_requires_bear_reentry=False,
-        ema55_slope_dynamic_exit_bear_reentry_break_prev_low=False,
+        ema55_slope_exit_enabled=True,
+        ema55_slope_lock_profit_trigger_r=5,
         atr_percentile_filter_max=Decimal("0.5"),
         trend_ema_slope_filter_min_ratio=Decimal("-0.0005"),
         time_stop_break_even_enabled=False,
         time_stop_break_even_bars=10,
-        daily_filter_enabled=daily_enabled,
-        daily_filter_bar="1D" if daily_enabled else None,
+        tp_sl_mode="exchange",
+        run_mode="trade",
+        entry_side_mode="follow_signal",
+        daily_filter_enabled=False,
         daily_filter_boundary="bjt_08",
-        daily_filter_mode=spec.daily_filter_mode,
+        daily_filter_mode="disabled",
         daily_filter_scope="short_only",
-        daily_filter_ma_type=spec.daily_filter_ma_type,
-        daily_filter_period=spec.daily_filter_period,
+        daily_filter_ma_type="ema",
+        daily_filter_period=21,
     )
 
 
-def build_body_retest_short_config(spec: ShortSpec) -> StrategyConfig:
-    daily_enabled = str(spec.daily_filter_mode).strip().lower() != "disabled"
+def build_btc_slope_short_config() -> StrategyConfig:
     return StrategyConfig(
-        inst_id=spec.symbol,
+        inst_id="BTC-USDT-SWAP",
         bar="1H",
-        ema_period=spec.ema_period,
-        ema_type=spec.ema_type,
-        trend_ema_period=spec.trend_ema_period,
-        trend_ema_type=spec.trend_ema_type,
+        ema_period=55,
+        ema_type="ema",
+        trend_ema_period=55,
+        trend_ema_type="ema",
         big_ema_period=233,
         atr_period=14,
         atr_stop_multiplier=Decimal("2"),
@@ -295,228 +180,389 @@ def build_body_retest_short_config(spec: ShortSpec) -> StrategyConfig:
         position_mode="net",
         environment="live",
         tp_sl_trigger_type="mark",
-        strategy_id=spec.strategy_id,
+        strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
         risk_amount=Decimal("100"),
         backtest_initial_capital=Decimal("10000"),
         backtest_sizing_mode="fixed_risk",
         take_profit_mode="dynamic",
         dynamic_two_r_break_even=True,
         dynamic_fee_offset_enabled=True,
-        atr_percentile_filter_max=Decimal("0.5"),
+        ema55_slope_exit_enabled=True,
+        ema55_slope_lock_profit_enabled=True,
+        ema55_slope_lock_profit_trigger_r=5,
+        ema55_slope_negative_entry_bars=1,
         trend_ema_slope_filter_min_ratio=Decimal("-0.0005"),
         time_stop_break_even_enabled=False,
         time_stop_break_even_bars=10,
-        daily_filter_enabled=daily_enabled,
-        daily_filter_bar="1D" if daily_enabled else None,
-        daily_filter_boundary="bjt_08",
-        daily_filter_mode=spec.daily_filter_mode,
-        daily_filter_scope="short_only",
-        daily_filter_ma_type=spec.daily_filter_ma_type,
-        daily_filter_period=spec.daily_filter_period,
-        body_retest_breakdown_atr_multiplier=Decimal("0.2"),
-        body_retest_retest_atr_multiplier=Decimal("0.3"),
-        body_retest_stop_buffer_atr_multiplier=Decimal("0.3"),
-        body_retest_body_atr_limit=Decimal("1.0"),
-        body_retest_watch_bars=6,
+        tp_sl_mode="exchange",
+        run_mode="trade",
+        entry_side_mode="follow_signal",
     )
 
 
-def cleanup_old_package_files(target_path: Path) -> list[Path]:
-    removed: list[Path] = []
-    for path in PACKAGE_DIR.iterdir():
-        if path.resolve() == target_path.resolve():
-            continue
-        if path.is_file():
-            path.unlink()
-            removed.append(path)
-    return removed
-
-
-def _fmt_decimal(value: Decimal) -> str:
-    normalized = format(value, "f")
-    if "." in normalized:
-        normalized = normalized.rstrip("0").rstrip(".")
-    return normalized
-
-
-def _short_filter_label(spec: ShortSpec) -> str:
-    if str(spec.daily_filter_mode).strip().lower() == "disabled":
-        return "不加日线过滤"
-    return f"北京时间8点日线 {spec.daily_filter_ma_type.upper()}{spec.daily_filter_period}"
-
-
-def _long_row_html(spec: LongSpec) -> str:
+def build_specs() -> tuple[BundleSpec, ...]:
     return (
-        "<tr>"
-        f"<td>做多</td>"
-        f"<td>{html.escape(spec.symbol.replace('-USDT-SWAP', ''))}</td>"
-        f"<td>EMA 动态委托做多</td>"
-        f"<td>{html.escape(spec.ema_type.upper())}{spec.ema_period}</td>"
-        f"<td>{html.escape(spec.trend_ema_type.upper())}{spec.trend_ema_period}</td>"
-        f"<td>{html.escape(spec.entry_reference_ema_type.upper())}{spec.entry_reference_ema_period}</td>"
-        f"<td>ATR10 / SL {_fmt_decimal(spec.atr_stop_multiplier)} / TP {_fmt_decimal(spec.atr_take_multiplier)}</td>"
-        f"<td>不加日线过滤</td>"
-        f"<td>{html.escape(spec.notes)}</td>"
-        "</tr>"
-    )
-
-
-def _short_row_html(spec: ShortSpec) -> str:
-    line_label = f"{spec.ema_type.upper()}{spec.ema_period}"
-    strategy_label = "Body/ATR 回抽做空" if spec.strategy_id == STRATEGY_BODY_RETEST_SHORT_ID else "EMA 斜率做空"
-    return (
-        "<tr>"
-        f"<td>做空</td>"
-        f"<td>{html.escape(spec.symbol.replace('-USDT-SWAP', ''))}</td>"
-        f"<td>{html.escape(strategy_label)}</td>"
-        f"<td>{html.escape(line_label)}</td>"
-        f"<td>{html.escape(spec.trend_ema_type.upper())}{spec.trend_ema_period}</td>"
-        f"<td>-</td>"
-        f"<td>ATR14 / SL 2 / TP 4</td>"
-        f"<td>{html.escape(_short_filter_label(spec))}</td>"
-        f"<td>{html.escape(spec.notes)}</td>"
-        "</tr>"
-    )
-
-
-def write_bundle_html() -> Path:
-    rows = [_long_row_html(spec) for spec in LONG_SPECS] + [_short_row_html(spec) for spec in SHORT_SPECS]
-    html_text = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <title>最佳参数组合包说明</title>
-  <style>
-    body {{
-      font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
-      margin: 24px;
-      color: #1f2328;
-      background: #f7f4ee;
-      line-height: 1.6;
-    }}
-    h1, h2 {{ margin: 0 0 12px; }}
-    .card {{
-      background: #fffdf8;
-      border: 1px solid #e6dccb;
-      border-radius: 14px;
-      padding: 18px 20px;
-      margin-bottom: 18px;
-    }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      background: #fff;
-    }}
-    th, td {{
-      border: 1px solid #e8dfd2;
-      padding: 10px 12px;
-      text-align: left;
-      vertical-align: top;
-    }}
-    th {{
-      background: #f1e7d7;
-    }}
-    code {{
-      background: #f3eee4;
-      padding: 1px 5px;
-      border-radius: 6px;
-    }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>最佳参数组合包说明</h1>
-    <p>对应文件：<code>{html.escape(str(TARGET_PATH))}</code></p>
-    <p>这份组合包当前包含 <strong>9 条</strong> 策略：<strong>4 条 EMA 动态委托做多</strong> + <strong>5 条做空定稿版</strong>。导入时支持部分勾选、全选、改当前 API、指定 API、逐条指定 API，并默认勾选自动启动。</p>
-  </div>
-  <div class="card">
-    <h2>做空命名说明</h2>
-    <p><strong>EMA55 斜率做空</strong> 在界面里已经统一改名为 <strong>EMA 斜率做空</strong>。但不是所有币都以斜率版本定稿：按 100U 深度研究结果分别是 <code>BTC EMA55</code>、<code>ETH MA34</code>、<code>SOL MA20</code>、<code>BNB Body/ATR 回抽</code>、<code>DOGE MA55</code>。</p>
-  </div>
-  <div class="card">
-    <h2>条目明细</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>方向</th>
-          <th>币种</th>
-          <th>策略</th>
-          <th>快线</th>
-          <th>趋势线</th>
-          <th>挂单参考</th>
-          <th>风控</th>
-          <th>日线过滤</th>
-          <th>说明</th>
-        </tr>
-      </thead>
-      <tbody>
-        {''.join(rows)}
-      </tbody>
-    </table>
-  </div>
-</body>
-</html>
-"""
-    HTML_PATH.write_text(html_text, encoding="utf-8")
-    return HTML_PATH
-
-
-def build_bundle() -> StrategyBundle:
-    long_profiles = tuple(
-        build_strategy_profile_from_config(
-            profile_id=spec.profile_id,
-            profile_name=spec.profile_name,
+        BundleSpec(
+            side="\u505a\u591a",
+            symbol="BTC-USDT-SWAP",
+            profile_id="dynamic_long_best_btc_v2",
+            profile_name="BTC \u52a8\u6001\u59d4\u6258\u505a\u591a \u6700\u4f73\u53c2\u6570",
             strategy_id=STRATEGY_DYNAMIC_LONG_ID,
-            symbol=spec.symbol,
-            config=build_dynamic_long_config(spec),
-            api_name="",
-            direction_label="只做多",
-            run_mode_label="交易并下单",
-            tags=("最佳参数", "EMA动态委托做多", "固定研究"),
-            notes=spec.notes,
-            source_report="D:/qqokx/reports/ema_dynamic_long_fixed_research_log_4coins_10u.html",
-        )
-        for spec in LONG_SPECS
-    )
-    short_profiles = tuple(
-        build_strategy_profile_from_config(
-            profile_id=spec.profile_id,
-            profile_name=spec.profile_name,
-            strategy_id=spec.strategy_id,
-            symbol=spec.symbol,
-            config=(
-                build_body_retest_short_config(spec)
-                if spec.strategy_id == STRATEGY_BODY_RETEST_SHORT_ID
-                else build_slope_short_config(spec)
+            strategy_label="EMA \u52a8\u6001\u59d4\u6258\u505a\u591a",
+            core_label="EMA5 / EMA13 / \u5165\u573a\u8ddf\u968f EMA5",
+            protection_label="ATR10 / SL1 / 6R \u5f00\u542f nR \u4fdd\u672c / \u53cc\u5411\u624b\u7eed\u8d39",
+            note="BTC \u591a\u5934\u56de\u6d4b\u4e2d 6R \u6536\u76ca\u6700\u597d\uff0c\u4fdd\u7559\u66f4\u591a\u8d8b\u52bf\u7a7a\u95f4\u3002",
+            config=build_dynamic_long_config(
+                symbol="BTC-USDT-SWAP",
+                ema_period=5,
+                trend_ema_period=13,
+                entry_reference_ema_period=0,
+                atr_stop_multiplier=Decimal("1"),
+                trigger_r=6,
             ),
-            api_name="",
-            direction_label="只做空",
-            run_mode_label="交易并下单",
-            tags=("最佳参数", "100U研究", "做空定稿"),
-            notes=spec.notes,
-            source_report="D:/qqokx/reports/multi_coin_short_slope_deep_research_100u.html",
-        )
-        for spec in SHORT_SPECS
+        ),
+        BundleSpec(
+            side="\u505a\u591a",
+            symbol="ETH-USDT-SWAP",
+            profile_id="dynamic_long_best_eth_v2",
+            profile_name="ETH \u52a8\u6001\u59d4\u6258\u505a\u591a \u6700\u4f73\u53c2\u6570",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            strategy_label="EMA \u52a8\u6001\u59d4\u6258\u505a\u591a",
+            core_label="EMA21 / EMA55 / \u5165\u573a EMA34",
+            protection_label="ATR10 / SL1.5 / 3R \u5f00\u542f nR \u4fdd\u672c / \u53cc\u5411\u624b\u7eed\u8d39",
+            note="ETH \u591a\u5934 3R \u6536\u76ca\u4e0e PF \u6700\u597d\uff0c\u4e0d\u8ffd\u9ad8 R\u3002",
+            config=build_dynamic_long_config(
+                symbol="ETH-USDT-SWAP",
+                ema_period=21,
+                trend_ema_period=55,
+                entry_reference_ema_period=34,
+                atr_stop_multiplier=Decimal("1.5"),
+                trigger_r=3,
+            ),
+        ),
+        BundleSpec(
+            side="\u505a\u591a",
+            symbol="SOL-USDT-SWAP",
+            profile_id="dynamic_long_best_sol_v2",
+            profile_name="SOL \u52a8\u6001\u59d4\u6258\u505a\u591a \u6700\u4f73\u53c2\u6570",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            strategy_label="EMA \u52a8\u6001\u59d4\u6258\u505a\u591a",
+            core_label="EMA21 / EMA55 / \u5165\u573a EMA13",
+            protection_label="ATR10 / SL1 / 3R \u5f00\u542f nR \u4fdd\u672c / \u53cc\u5411\u624b\u7eed\u8d39",
+            note="SOL \u591a\u5934 3R \u6536\u76ca\u6700\u597d\uff0c\u4e14\u6bd4\u9ad8 R \u56de\u64a4\u66f4\u53ef\u63a7\u3002",
+            config=build_dynamic_long_config(
+                symbol="SOL-USDT-SWAP",
+                ema_period=21,
+                trend_ema_period=55,
+                entry_reference_ema_period=13,
+                atr_stop_multiplier=Decimal("1"),
+                trigger_r=3,
+            ),
+        ),
+        BundleSpec(
+            side="\u505a\u591a",
+            symbol="DOGE-USDT-SWAP",
+            profile_id="dynamic_long_best_doge_v2",
+            profile_name="DOGE \u52a8\u6001\u59d4\u6258\u505a\u591a \u6700\u4f73\u53c2\u6570",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            strategy_label="EMA \u52a8\u6001\u59d4\u6258\u505a\u591a",
+            core_label="EMA5 / EMA13 / \u5165\u573a\u8ddf\u968f EMA5",
+            protection_label="ATR10 / SL1.5 / 6R \u5f00\u542f nR \u4fdd\u672c / \u53cc\u5411\u624b\u7eed\u8d39",
+            note="DOGE \u591a\u5934 6R \u6536\u76ca\u6700\u597d\uff0c8R PF \u66f4\u9ad8\u4f46\u66f4\u504f\u8fdb\u653b\u3002",
+            config=build_dynamic_long_config(
+                symbol="DOGE-USDT-SWAP",
+                ema_period=5,
+                trend_ema_period=13,
+                entry_reference_ema_period=0,
+                atr_stop_multiplier=Decimal("1.5"),
+                trigger_r=6,
+            ),
+        ),
+        BundleSpec(
+            side="\u505a\u7a7a",
+            symbol="BTC-USDT-SWAP",
+            profile_id="slope_short_best_btc_v2",
+            profile_name="BTC \u5747\u7ebf\u659c\u7387\u505a\u7a7a \u6700\u4f73\u53c2\u6570",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            strategy_label="\u5747\u7ebf\u659c\u7387\u505a\u7a7a",
+            core_label="EMA55 / EMA55",
+            protection_label="ATR14 / SL2 / 5R \u5f00\u542f nR \u4fdd\u672c / \u53cc\u5411\u624b\u7eed\u8d39 / \u659c\u7387\u8f6c\u6b63\u5e73\u4ed3",
+            note="BTC \u7a7a\u5934\u6539\u4e3a\u901a\u7528\u5747\u7ebf\u659c\u7387\u505a\u7a7a\uff1bBTC EMA55 \u4e13\u7528\u7b56\u7565\u4ec5\u4fdd\u7559\u4e3a\u7814\u7a76\u7528\u3002",
+            config=build_slope_short_config(
+                symbol="BTC-USDT-SWAP",
+                ema_period=55,
+                ema_type="ema",
+                trend_ema_period=55,
+                trend_ema_type="ema",
+            ),
+        ),
+        BundleSpec(
+            side="\u505a\u7a7a",
+            symbol="ETH-USDT-SWAP",
+            profile_id="slope_short_best_eth_v2",
+            profile_name="ETH \u5747\u7ebf\u659c\u7387\u505a\u7a7a \u6700\u4f73\u53c2\u6570",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            strategy_label="\u5747\u7ebf\u659c\u7387\u505a\u7a7a",
+            core_label="MA60 / MA60",
+            protection_label="ATR14 / SL2 / 5R \u5f00\u542f nR \u4fdd\u672c / \u53cc\u5411\u624b\u7eed\u8d39 / \u659c\u7387\u8f6c\u6b63\u5e73\u4ed3",
+            note="ETH \u7a7a\u5934\u5747\u7ebf\u66ff\u6362\u5b9e\u9a8c\u4e2d MA60 \u6536\u76ca\u548c PF \u6700\u597d\u3002",
+            config=build_slope_short_config(
+                symbol="ETH-USDT-SWAP",
+                ema_period=60,
+                ema_type="ma",
+                trend_ema_period=60,
+                trend_ema_type="ma",
+            ),
+        ),
+        BundleSpec(
+            side="\u505a\u7a7a",
+            symbol="SOL-USDT-SWAP",
+            profile_id="slope_short_best_sol_v2",
+            profile_name="SOL \u5747\u7ebf\u659c\u7387\u505a\u7a7a \u6700\u4f73\u53c2\u6570",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            strategy_label="\u5747\u7ebf\u659c\u7387\u505a\u7a7a",
+            core_label="MA20 / MA20",
+            protection_label="ATR14 / SL2 / 5R \u5f00\u542f nR \u4fdd\u672c / \u53cc\u5411\u624b\u7eed\u8d39 / \u659c\u7387\u8f6c\u6b63\u5e73\u4ed3",
+            note="\u4f7f\u7528\u5f53\u524d SOL \u7a7a\u5934\u5b9a\u7a3f\u53c2\u6570\u3002",
+            config=build_slope_short_config(
+                symbol="SOL-USDT-SWAP",
+                ema_period=20,
+                ema_type="ma",
+                trend_ema_period=20,
+                trend_ema_type="ma",
+            ),
+        ),
+        BundleSpec(
+            side="\u505a\u7a7a",
+            symbol="DOGE-USDT-SWAP",
+            profile_id="slope_short_best_doge_v2",
+            profile_name="DOGE \u5747\u7ebf\u659c\u7387\u505a\u7a7a \u6700\u4f73\u53c2\u6570",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            strategy_label="\u5747\u7ebf\u659c\u7387\u505a\u7a7a",
+            core_label="MA21 / MA21",
+            protection_label="ATR14 / SL2 / 5R \u5f00\u542f nR \u4fdd\u672c / \u53cc\u5411\u624b\u7eed\u8d39 / \u659c\u7387\u8f6c\u6b63\u5e73\u4ed3",
+            note="DOGE \u7a7a\u5934\u6539\u7528 MA21\uff1a\u6536\u76ca\u66f4\u9ad8\uff0cPF \u7565\u4f4e\u4e8e\u539f MA55\u3002",
+            config=build_slope_short_config(
+                symbol="DOGE-USDT-SWAP",
+                ema_period=21,
+                ema_type="ma",
+                trend_ema_period=21,
+                trend_ema_type="ma",
+            ),
+        ),
     )
+
+
+def build_bundle(specs: tuple[BundleSpec, ...]) -> StrategyBundle:
+    profiles = []
+    for spec in specs:
+        profiles.append(
+            build_strategy_profile_from_config(
+                profile_id=spec.profile_id,
+                profile_name=spec.profile_name,
+                strategy_id=spec.strategy_id,
+                symbol=spec.symbol,
+                config=spec.config,
+                direction_label=spec.side,
+                run_mode_label="\u4ea4\u6613\u5e76\u4e0b\u5355",
+                enabled=True,
+                tags=(
+                    "best-parameter-bundle",
+                    "2026-06-11",
+                    "long" if spec.side == "\u505a\u591a" else "short",
+                ),
+                notes=spec.note,
+                source_report=str(ROOT / "scripts" / "build_best_parameter_bundle.py"),
+            )
+        )
     return StrategyBundle(
         bundle_version=STRATEGY_PROFILE_SCHEMA_VERSION,
-        bundle_name="最佳参数组合包",
-        profiles=long_profiles + short_profiles,
-        source_report="D:/qqokx/reports/multi_coin_short_slope_deep_research_100u.html",
+        bundle_name=BUNDLE_NAME,
+        profiles=tuple(profiles),
+        created_at=_utc_now(),
+        source_report=str(ROOT / "scripts" / "build_best_parameter_bundle.py"),
         auto_start_on_import=True,
     )
 
 
+def build_html(specs: tuple[BundleSpec, ...]) -> str:
+    long_count = sum(1 for spec in specs if spec.side == "\u505a\u591a")
+    short_count = len(specs) - long_count
+    rows = []
+    for spec in specs:
+        symbol_label = spec.symbol.replace("-USDT-SWAP", "")
+        row = (
+            "<tr>"
+            f"<td>{_html_text(spec.side)}</td>"
+            f"<td>{_html_text(symbol_label)}</td>"
+            f"<td>{_html_text(spec.strategy_label)}</td>"
+            f"<td>{_html_text(spec.core_label)}</td>"
+            f"<td>{_html_text(spec.protection_label)}</td>"
+            f"<td>{_html_text(spec.note)}</td>"
+            "</tr>"
+        )
+        rows.append(row)
+
+    bullets = [
+        "\u7ec4\u5408\u5df2\u6539\u4e3a 4 \u4e2a\u505a\u591a + 4 \u4e2a\u505a\u7a7a\uff0c\u5df2\u79fb\u9664 BNB\u3002",
+        "\u505a\u591a\u9996\u6863 R\uff1aBTC=6R\uff0cETH=3R\uff0cSOL=3R\uff0cDOGE=6R\uff0c\u5168\u90e8\u4fdd\u7559 nR \u4fdd\u672c+\u53cc\u5411\u624b\u7eed\u8d39\u3002",
+        "\u505a\u7a7a\u9ed8\u8ba4\u4e3a\uff1aATR \u6b62\u635f=2\uff0c\u659c\u7387\u8f6c\u6b63\u5e73\u4ed3=\u5f00\uff0c5R \u5f00\u542f nR \u4fdd\u672c+\u53cc\u5411\u624b\u7eed\u8d39\u3002",
+        "BTC \u7a7a\u5934\u4f7f\u7528\u901a\u7528\u5747\u7ebf\u659c\u7387\u505a\u7a7a EMA55\uff0cETH \u6539 MA60\uff0cSOL \u4fdd\u7559 MA20\uff0cDOGE \u6539 MA21\u3002",
+    ]
+
+    bullet_html = "".join(f"<li>{_html_text(item)}</li>" for item in bullets)
+    title = _html_text("\u6700\u4f73\u53c2\u6570\u7ec4\u5408\u5305\u8bf4\u660e")
+    generated_at = _html_text(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    json_path = _html_text(str(JSON_PATH))
+    summary_text = _html_text(f"\u672c\u6b21\u5b9a\u7a3f\uff1a{long_count} \u4e2a\u505a\u591a + {short_count} \u4e2a\u505a\u7a7a")
+    intro_text = _html_text("\u6b64\u6587\u4ef6\u5bf9\u5e94\u7684 JSON \u7ec4\u5408\u5305\u53ef\u76f4\u63a5\u5bfc\u5165\u3002")
+    generated_label = _html_text("\u751f\u6210\u65f6\u95f4")
+    json_label = _html_text("JSON \u8def\u5f84")
+    core_change_label = _html_text("\u6838\u5fc3\u6539\u52a8")
+    core_change_text = _html_text(
+        "\u79fb\u9664 BNB\uff0cDOGE \u8865\u5165\u505a\u591a\u7ec4\u5408\uff1b\u505a\u591a\u5206\u5e01\u79cd\u8bbe\u7f6e 6R/3R/3R/6R\uff0c\u505a\u7a7a\u5747\u4f7f\u7528\u901a\u7528\u5747\u7ebf\u659c\u7387\u505a\u7a7a\uff1aBTC EMA55 / ETH MA60 / SOL MA20 / DOGE MA21\u3002"
+    )
+    overview_label = _html_text("\u7ec4\u5408\u6982\u8981")
+    detail_label = _html_text("\u7b56\u7565\u660e\u7ec6")
+    direction_label = _html_text("\u65b9\u5411")
+    symbol_label = _html_text("\u5e01\u79cd")
+    strategy_label = _html_text("\u7b56\u7565")
+    core_label = _html_text("\u6838\u5fc3\u53c2\u6570")
+    protection_label = _html_text("\u4fdd\u62a4\u903b\u8f91")
+    note_label = _html_text("\u5907\u6ce8")
+    rows_html = "".join(rows)
+    body = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{title}</title>
+  <style>
+    :root {{
+      --bg: #f7f2e8;
+      --panel: #fffaf0;
+      --line: #dccfb7;
+      --ink: #1f2a30;
+      --accent: #0f766e;
+      --accent-soft: #e6f4ef;
+      --warn: #9a3412;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      padding: 28px;
+      background:
+        radial-gradient(circle at top right, rgba(15,118,110,0.12), transparent 28%),
+        radial-gradient(circle at top left, rgba(217,119,6,0.10), transparent 24%),
+        var(--bg);
+      color: var(--ink);
+      font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+      line-height: 1.6;
+    }}
+    .hero, .panel {{
+      max-width: 1360px;
+      margin: 0 auto 18px auto;
+      background: rgba(255, 250, 240, 0.92);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 22px 24px;
+      box-shadow: 0 18px 50px rgba(44, 38, 26, 0.08);
+      backdrop-filter: blur(6px);
+    }}
+    h1, h2 {{ margin: 0 0 12px 0; }}
+    h1 {{ font-size: 40px; color: #0b5d58; }}
+    h2 {{ font-size: 22px; color: #7c2d12; }}
+    p {{ margin: 0 0 10px 0; }}
+    ul {{ margin: 0; padding-left: 20px; }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 15px;
+    }}
+    th, td {{
+      border-bottom: 1px solid var(--line);
+      padding: 12px 10px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    th {{
+      background: rgba(230, 244, 239, 0.85);
+      color: #0b5d58;
+      position: sticky;
+      top: 0;
+    }}
+    .meta {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }}
+    .chip {{
+      background: var(--accent-soft);
+      border: 1px solid rgba(15,118,110,0.18);
+      border-radius: 14px;
+      padding: 12px 14px;
+    }}
+    .summary {{
+      color: var(--warn);
+      font-weight: 700;
+    }}
+  </style>
+</head>
+<body>
+  <section class="hero">
+    <h1>{title}</h1>
+    <p class="summary">{summary_text}</p>
+    <p>{intro_text}</p>
+    <div class="meta">
+      <div class="chip"><strong>{generated_label}</strong><br>{generated_at}</div>
+      <div class="chip"><strong>{json_label}</strong><br>{json_path}</div>
+      <div class="chip"><strong>{core_change_label}</strong><br>{core_change_text}</div>
+    </div>
+  </section>
+  <section class="panel">
+    <h2>{overview_label}</h2>
+    <ul>{bullet_html}</ul>
+  </section>
+  <section class="panel">
+    <h2>{detail_label}</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>{direction_label}</th>
+          <th>{symbol_label}</th>
+          <th>{strategy_label}</th>
+          <th>{core_label}</th>
+          <th>{protection_label}</th>
+          <th>{note_label}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows_html}
+      </tbody>
+    </table>
+  </section>
+</body>
+</html>
+"""
+    return body
+
+
+def write_outputs() -> tuple[Path, Path, Path]:
+    specs = build_specs()
+    bundle = build_bundle(specs)
+    write_strategy_bundle(bundle, JSON_PATH)
+    JSON_PATH.write_text(JSON_PATH.read_text(encoding="utf-8"), encoding="utf-8-sig")
+    html_text = build_html(specs)
+    HTML_PATH.write_text(html_text, encoding="utf-8-sig")
+    LEGACY_HTML_PATH.write_text(html_text, encoding="utf-8-sig")
+    return JSON_PATH, HTML_PATH, LEGACY_HTML_PATH
+
+
 def main() -> None:
-    removed = cleanup_old_package_files(TARGET_PATH)
-    bundle = build_bundle()
-    write_strategy_bundle(bundle, TARGET_PATH)
-    html_path = write_bundle_html()
-    print(f"written: {TARGET_PATH}")
-    print(f"html: {html_path}")
-    print(f"removed: {len(removed)}")
-    for path in removed:
-        print(f" - {path.name}")
+    json_path, html_path, legacy_html_path = write_outputs()
+    print(json_path)
+    print(html_path)
+    print(legacy_html_path)
 
 
 if __name__ == "__main__":

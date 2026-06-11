@@ -61,7 +61,7 @@ _OBSERVER_PARAMETER_LABELS = {
     "entry_reference_ema_period": "进场参考线",
     "take_profit_mode": "出场方式",
     "max_entries_per_trend": "单波最多开仓次数",
-    "dynamic_two_r_break_even": "2R后保本",
+    "dynamic_two_r_break_even": "nR保本",
     "dynamic_fee_offset_enabled": "保本加手续费缓冲",
     "time_stop_break_even_enabled": "超时启用保本",
     "time_stop_break_even_bars": "超时K线根数",

@@ -381,7 +381,8 @@ class StrategyEngineNotificationTest(TestCase):
         reason = notifier.send_signal.call_args.kwargs["reason"]
         self.assertIn("EMA 动态委托参考价已更新", reason)
         self.assertIn("止盈方式：动态止盈", reason)
-        self.assertIn("2R保本=", reason)
+        self.assertIn("首档触发R=", reason)
+        self.assertIn("nR保本=", reason)
 
     def test_signal_only_ema5_email_includes_distinct_take_profit_note(self) -> None:
         notifier = MagicMock()

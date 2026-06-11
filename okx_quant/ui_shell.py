@@ -3152,6 +3152,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._pending_orders_refresh_health = RefreshHealthState("当前委托")
         self._order_history_refresh_health = RefreshHealthState("历史委托")
         self._account_info_refresh_health = RefreshHealthState("账户信息")
+        self._positions_refresh_generation = 0
+        self._positions_active_generation = 0
+        self._positions_enrichment_refreshing = False
+        self._positions_enrichment_request: tuple[int, list[OkxPosition], str, str] | None = None
         self._upl_usdt_prices: dict[str, Decimal] = {}
         self._position_history_usdt_prices: dict[str, Decimal] = {}
         self._order_history_usdt_prices: dict[str, Decimal] = {}
@@ -3354,7 +3358,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.startup_chase_window_seconds = StringVar(value="0")
         self.ema55_slope_exit_enabled = BooleanVar(value=True)
         self.dynamic_two_r_break_even = BooleanVar(value=True)
-        self.ema55_slope_lock_profit_trigger_r = StringVar(value="2")
+        self.ema55_slope_lock_profit_trigger_r = StringVar(value="5")
         self.dynamic_fee_offset_enabled = BooleanVar(value=True)
         self.time_stop_break_even_enabled = BooleanVar(value=False)
         self.time_stop_break_even_bars = StringVar(value="10")
@@ -4202,7 +4206,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         row += 1
         self._dynamic_two_r_break_even_check = ttk.Checkbutton(
             launch_form,
-            text="启用首档保本特例（首档触发R=2时，先移到保本位）",
+            text="启用 nR保本特例（首档触发R=2时，先移到保本位）",
             variable=self.dynamic_two_r_break_even,
         )
         self._dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=_lp)
@@ -12909,7 +12913,7 @@ def _build_dynamic_protection_hint_text(
     time_stop_break_even_bars_raw: str,
 ) -> str:
     if take_profit_mode_label != "动态止盈":
-        return "动态保护：当前为固定止盈，首档触发R / 首档保本特例 / 手续费偏移 / 时间保本都不生效。"
+        return "动态保护：当前为固定止盈，首档触发R / nR保本 / 手续费偏移 / 时间保本都不生效。"
     trigger_r_raw = break_even_trigger_r_raw.strip() or "2"
     try:
         trigger_r = max(int(trigger_r_raw), 2)
@@ -12918,15 +12922,15 @@ def _build_dynamic_protection_hint_text(
     time_stop_bars = time_stop_break_even_bars_raw.strip() or "0"
     if break_even_trigger_r_configurable:
         if dynamic_two_r_break_even_enabled and trigger_r == 2:
-            first_leg_text = "首档保本特例：开启，首档触发R=2 时先把止损抬到保本位。"
+            first_leg_text = "nR保本：开启，首档触发R=2 时先把止损抬到保本位。"
         elif dynamic_two_r_break_even_enabled:
             first_leg_text = (
-                f"首档保本特例：开启，但首档触发R={trigger_r}；因此会沿用 BTC 斜率做空逻辑，"
+                f"nR保本：开启，首档触发R={trigger_r}；因此会沿用 BTC 斜率做空逻辑，"
                 f"在 {trigger_r}R 时先抬到 {trigger_r - 1}R 位。"
             )
         else:
             first_leg_text = (
-                f"首档保本特例：关闭，价格达到首档 {trigger_r}R 后，止损先抬到 {trigger_r - 1}R 位。"
+                f"nR保本：关闭，价格达到首档 {trigger_r}R 后，止损先抬到 {trigger_r - 1}R 位。"
             )
     else:
         first_leg_text = (
@@ -13154,7 +13158,13 @@ def _build_strategy_start_confirmation_message(
         if config.take_profit_mode == "dynamic":
             lines.extend(
                 [
-                    f"2R保本开关：{config.dynamic_two_r_break_even_label()}（浮盈达到 2R 后止损抬到保本）",
+                    (
+                        f"首档触发R：{max(int(config.ema55_slope_lock_profit_trigger_r), 2)} / "
+                        f"nR保本：{config.dynamic_two_r_break_even_label()}（到 nR 后先移到 {max(int(config.ema55_slope_lock_profit_trigger_r), 2) - 1}R，"
+                        "若首档触发R=2则先移到保本）"
+                    )
+                    if strategy_uses_parameter(config.strategy_id, "ema55_slope_lock_profit_trigger_r")
+                    else f"2R保本开关：{config.dynamic_two_r_break_even_label()}（浮盈达到 2R 后止损抬到保本）",
                     f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}（保本位预留双边手续费）",
                     (
                         f"时间保本：{config.time_stop_break_even_enabled_label()} / "
@@ -13212,9 +13222,9 @@ def _build_strategy_start_confirmation_message(
                     [
                         f"首档触发R：{trigger_r}（与 BTC 斜率做空一致，首档保护从这里开始）",
                         (
-                            "首档保本特例：开启（仅当首档触发R=2时，2R 先抬到保本位）"
+                            "nR保本：开启（仅当首档触发R=2时，2R 先抬到保本位）"
                             if config.dynamic_two_r_break_even
-                            else "首档保本特例：关闭（首档触发后直接按已锁定R上移止损）"
+                            else "nR保本：关闭（首档触发后直接按已锁定R上移止损）"
                         ),
                         f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}（保本位预留双边手续费）",
                         (
@@ -13226,7 +13236,13 @@ def _build_strategy_start_confirmation_message(
             else:
                 lines.extend(
                     [
-                        f"2R保本开关：{config.dynamic_two_r_break_even_label()}（浮盈达到 2R 后止损抬到保本）",
+                        (
+                            f"首档触发R：{max(int(config.ema55_slope_lock_profit_trigger_r), 2)} / "
+                            f"nR保本：{config.dynamic_two_r_break_even_label()}（到 nR 后先移到 {max(int(config.ema55_slope_lock_profit_trigger_r), 2) - 1}R，"
+                            "若首档触发R=2则先移到保本）"
+                        )
+                        if strategy_uses_parameter(config.strategy_id, "ema55_slope_lock_profit_trigger_r")
+                        else f"2R保本开关：{config.dynamic_two_r_break_even_label()}（浮盈达到 2R 后止损抬到保本）",
                         f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}（保本位预留双边手续费）",
                         (
                             f"时间保本：{config.time_stop_break_even_enabled_label()} / "
@@ -14262,9 +14278,37 @@ def _build_position_instrument_map(client: OkxRestClient, positions: list[OkxPos
 
 def _build_position_ticker_map(client: OkxRestClient, positions: list[OkxPosition]) -> dict[str, OkxTicker]:
     result: dict[str, OkxTicker] = {}
-    for inst_id in sorted({position.inst_id for position in positions}):
+    needed_ids = {position.inst_id for position in positions if position.inst_id}
+    if not needed_ids:
+        return result
+
+    option_families = sorted(
+        {
+            infer_option_family(position.inst_id)
+            for position in positions
+            if position.inst_type == "OPTION" and infer_option_family(position.inst_id)
+        }
+    )
+    for family in option_families:
         try:
-            result[inst_id] = client.get_ticker(inst_id)
+            for ticker in client.get_tickers("OPTION", inst_family=family):
+                if ticker.inst_id in needed_ids:
+                    result[ticker.inst_id] = ticker
+        except Exception:
+            continue
+
+    for inst_type in ("SWAP", "FUTURES", "SPOT", "MARGIN"):
+        type_needed_ids = {
+            position.inst_id
+            for position in positions
+            if position.inst_id and str(position.inst_type or "").upper() == inst_type
+        }
+        if not type_needed_ids:
+            continue
+        try:
+            for ticker in client.get_tickers(inst_type):
+                if ticker.inst_id in type_needed_ids:
+                    result[ticker.inst_id] = ticker
         except Exception:
             continue
     return result

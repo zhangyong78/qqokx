@@ -50,6 +50,7 @@ from okx_quant.ui import (
     _build_history_position_note_record,
     _build_launch_parameter_hint_text,
     _build_minimum_order_risk_hint_text,
+    _build_position_ticker_map,
     _build_strategy_history_filter_options,
     _build_order_size_mode_hint_text,
     _build_dynamic_protection_hint_text,
@@ -209,6 +210,217 @@ class UiHelpersTest(TestCase):
 
         self.assertIsNone(plan.command)
         self.assertFalse(plan.should_launch)
+
+    def test_begin_api_switch_refresh_cycle_only_tracks_active_zoom_tab(self) -> None:
+        account_window = SimpleNamespace(winfo_exists=lambda: True)
+        zoom_window = SimpleNamespace(winfo_exists=lambda: True)
+        app = SimpleNamespace(
+            root=SimpleNamespace(after_cancel=MagicMock()),
+            _api_switch_refresh_clear_job="clear-job",
+            _positions_zoom_post_switch_refresh_job="post-job",
+            _account_info_window=account_window,
+            _positions_zoom_window=zoom_window,
+            _api_switch_refresh_step_for_tab=QuantApp._api_switch_refresh_step_for_tab,
+            _enqueue_api_switch_refresh_log_once=MagicMock(),
+            _refresh_position_switch_status_views=MagicMock(),
+        )
+
+        QuantApp._begin_api_switch_refresh_cycle(app, "历史成交")
+
+        self.assertEqual(
+            {
+                "positions": "pending",
+                "account_info": "pending",
+                "fills": "pending",
+            },
+            app._api_switch_refresh_steps,
+        )
+        self.assertIsNone(app._api_switch_refresh_clear_job)
+        self.assertIsNone(app._positions_zoom_post_switch_refresh_job)
+        self.assertEqual(2, app.root.after_cancel.call_count)
+
+    def test_api_switch_refresh_badge_text_uses_plain_language(self) -> None:
+        app = SimpleNamespace(_api_switch_refresh_steps={"positions": "running", "fills": "pending"})
+        self.assertEqual("刷新中", QuantApp._api_switch_refresh_badge_text(app))
+
+        app._api_switch_refresh_steps = {"positions": "done", "fills": "done"}
+        self.assertEqual("刷新完成", QuantApp._api_switch_refresh_badge_text(app))
+
+        app._api_switch_refresh_steps = {"positions": "failed", "fills": "done"}
+        self.assertEqual("刷新异常", QuantApp._api_switch_refresh_badge_text(app))
+
+        app._api_switch_refresh_steps = {"positions": "pending", "fills": "pending"}
+        self.assertEqual("准备刷新", QuantApp._api_switch_refresh_badge_text(app))
+
+    def test_refresh_account_views_after_switch_skips_background_history_fanout(self) -> None:
+        zoom_window = SimpleNamespace(winfo_exists=lambda: True)
+        app = SimpleNamespace(
+            position_tree=object(),
+            _positions_zoom_window=zoom_window,
+            _account_info_window=None,
+            _positions_zoom_active_tab_label=lambda: "历史成交",
+            _begin_api_switch_refresh_cycle=MagicMock(),
+            _set_api_switch_refresh_hint=MagicMock(),
+            _load_local_history_cache=MagicMock(),
+            refresh_positions=MagicMock(),
+            refresh_account_info=MagicMock(),
+            _schedule_positions_zoom_sync=MagicMock(),
+            _refresh_positions_zoom_tab_by_label=MagicMock(),
+            _schedule_positions_zoom_remaining_tabs_after_switch=MagicMock(),
+        )
+
+        QuantApp._refresh_account_views_after_credential_profile_switch(app)
+
+        app._begin_api_switch_refresh_cycle.assert_called_once_with("历史成交")
+        app._refresh_positions_zoom_tab_by_label.assert_called_once_with("历史成交")
+        app._schedule_positions_zoom_sync.assert_called_once_with(15)
+        app._schedule_positions_zoom_remaining_tabs_after_switch.assert_not_called()
+
+    def test_refresh_positions_zoom_all_only_refreshes_positions_and_active_tab(self) -> None:
+        app = SimpleNamespace(
+            refresh_positions=MagicMock(),
+            _positions_zoom_active_tab_label=MagicMock(return_value="历史成交"),
+            _refresh_positions_zoom_tab_by_label=MagicMock(),
+        )
+        app._refresh_positions_zoom_primary_views = (
+            lambda: QuantApp._refresh_positions_zoom_primary_views(app)
+        )
+
+        QuantApp._refresh_positions_zoom_all(app)
+
+        app.refresh_positions.assert_called_once_with()
+        app._positions_zoom_active_tab_label.assert_called_once_with()
+        app._refresh_positions_zoom_tab_by_label.assert_called_once_with("历史成交")
+
+    def test_build_position_ticker_map_uses_bulk_ticker_queries(self) -> None:
+        option = OkxPosition(
+            inst_id="BTC-USD-260626-70000-C",
+            inst_type="OPTION",
+            pos_side="long",
+            mgn_mode="cross",
+            position=Decimal("1"),
+            avail_position=Decimal("1"),
+            avg_price=Decimal("0.01"),
+            mark_price=Decimal("0.02"),
+            unrealized_pnl=Decimal("0.1"),
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy="BTC",
+            last_price=Decimal("0.02"),
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+        swap = OkxPosition(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="long",
+            mgn_mode="cross",
+            position=Decimal("1"),
+            avail_position=Decimal("1"),
+            avg_price=Decimal("2500"),
+            mark_price=Decimal("2501"),
+            unrealized_pnl=Decimal("1"),
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy="USDT",
+            last_price=Decimal("2501"),
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+        client = SimpleNamespace(
+            get_tickers=MagicMock(
+                side_effect=lambda inst_type, **kwargs: [
+                    SimpleNamespace(inst_id="BTC-USD-260626-70000-C"),
+                ]
+                if inst_type == "OPTION"
+                else [SimpleNamespace(inst_id="ETH-USDT-SWAP")]
+            )
+        )
+
+        result = _build_position_ticker_map(client, [option, swap])
+
+        self.assertEqual({"BTC-USD-260626-70000-C", "ETH-USDT-SWAP"}, set(result.keys()))
+        self.assertEqual(2, client.get_tickers.call_count)
+
+    def test_apply_positions_keeps_existing_enrichment_until_background_finishes(self) -> None:
+        app = SimpleNamespace(
+            _positions_refreshing=True,
+            _mark_api_switch_refresh_step=MagicMock(),
+            _latest_positions=[],
+            _positions_context_note=None,
+            _positions_ws_cache_note="",
+            _positions_last_refresh_at=None,
+            _positions_effective_environment=None,
+            _positions_context_profile_name="",
+            _current_credential_profile=lambda: "moni",
+            _positions_refresh_health=RefreshHealthState("持仓"),
+            _refresh_all_refresh_badges=MagicMock(),
+            _upl_usdt_prices={"USDT": Decimal("1")},
+            _position_instruments={"ETH-USDT-SWAP": Instrument(inst_id="ETH-USDT-SWAP", inst_type="SWAP", tick_size=Decimal("0.1"), lot_size=Decimal("1"), min_size=Decimal("1"), state="live")},
+            _position_tickers={"ETH-USDT-SWAP": SimpleNamespace(inst_id="ETH-USDT-SWAP")},
+            _positions_snapshot_by_profile={},
+            _sync_position_note_state_for_positions=MagicMock(),
+            _render_positions_view=MagicMock(),
+            _refresh_session_live_pnl_cache=MagicMock(),
+            sessions={},
+            _refresh_running_session_summary=MagicMock(),
+            _refresh_selected_session_details=MagicMock(),
+            _start_positions_enrichment_refresh=MagicMock(),
+        )
+        position = OkxPosition(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="long",
+            mgn_mode="cross",
+            position=Decimal("1"),
+            avail_position=Decimal("1"),
+            avg_price=Decimal("2500"),
+            mark_price=Decimal("2501"),
+            unrealized_pnl=Decimal("1"),
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy="USDT",
+            last_price=Decimal("2501"),
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+
+        QuantApp._apply_positions(
+            app,
+            [position],
+            effective_environment="demo",
+            credential_profile_name="moni",
+            refresh_generation=3,
+        )
+
+        self.assertEqual({"USDT": Decimal("1")}, app._upl_usdt_prices)
+        self.assertIn("ETH-USDT-SWAP", app._position_instruments)
+        self.assertIn("ETH-USDT-SWAP", app._position_tickers)
+        app._start_positions_enrichment_refresh.assert_called_once()
 
     def test_notification_snapshot_persists_upgrade_launch_settings(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -703,6 +915,7 @@ HTTP 502: <!DOCTYPE html>
         )
 
         self.assertIn("2R保本：开启", hint)
+        self.assertIn("首档触发R：固定为 2。", hint)
         self.assertIn("手续费偏移：开启", hint)
         self.assertIn("时间保本：关闭（当前设定 10 根", hint)
 

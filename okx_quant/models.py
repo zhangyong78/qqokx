@@ -116,7 +116,7 @@ class StrategyConfig:
     dynamic_fee_offset_enabled: bool = True
     ema55_slope_exit_enabled: bool = True
     ema55_slope_lock_profit_enabled: bool = False
-    ema55_slope_lock_profit_trigger_r: int = 2
+    ema55_slope_lock_profit_trigger_r: int = 5
     ema55_slope_negative_entry_bars: int = 1
     ema55_slope_same_bar_reentry_block: bool = False
     ema55_slope_dynamic_exit_requires_bear_reentry: bool = False

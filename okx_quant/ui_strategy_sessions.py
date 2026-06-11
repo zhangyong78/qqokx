@@ -11,6 +11,7 @@ from okx_quant.strategy_runtime_registry import (
     strategy_preferred_direction,
 )
 from okx_quant.strategy_catalog import supports_startup_chase_current_signal
+from okx_quant.strategy_parameters import strategy_uses_parameter
 from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
 
 
@@ -4609,13 +4610,16 @@ class UiStrategySessionsMixin:
         dynamic_take_profit = (
             dynamic_tp_eligible and TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "fixed") == "dynamic"
         )
-        is_slope_short = get_strategy_runtime_profile(definition.strategy_id).family == "ema55_slope_short"
+        uses_dynamic_trigger_r = strategy_uses_parameter(
+            definition.strategy_id,
+            "ema55_slope_lock_profit_trigger_r",
+        )
         self._dynamic_two_r_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self._ema55_slope_lock_profit_trigger_r_label.configure(
-            state="normal" if dynamic_take_profit and is_slope_short else "disabled"
+            state="normal" if dynamic_take_profit and uses_dynamic_trigger_r else "disabled"
         )
         self._ema55_slope_lock_profit_trigger_r_entry.configure(
-            state="normal" if dynamic_take_profit and is_slope_short else "disabled"
+            state="normal" if dynamic_take_profit and uses_dynamic_trigger_r else "disabled"
         )
         self._dynamic_fee_offset_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self._time_stop_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
@@ -4974,7 +4978,7 @@ class UiStrategySessionsMixin:
             if strategy_uses_parameter(strategy_id, "ema55_slope_exit_enabled")
             else True,
             ema55_slope_lock_profit_trigger_r=max(
-                self._parse_positive_int(self.ema55_slope_lock_profit_trigger_r.get() or "2", "首档触发R"),
+                self._parse_positive_int(self.ema55_slope_lock_profit_trigger_r.get() or "5", "首档触发R"),
                 2,
             )
             if strategy_uses_parameter(strategy_id, "ema55_slope_lock_profit_trigger_r")
@@ -6422,7 +6426,12 @@ class UiStrategySessionsMixin:
         ) == "dynamic":
             parameter_rows.extend(
                 [
-                    f"2R保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}",
+                    (
+                        f"首档触发R：{max(int(snapshot.get('ema55_slope_lock_profit_trigger_r', 2) or 2), 2)} / "
+                        f"nR保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}"
+                    )
+                    if "ema55_slope_lock_profit_trigger_r" in snapshot
+                    else f"2R保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}",
                     f"手续费偏移开关：{self._bool_label(snapshot.get('dynamic_fee_offset_enabled', True))}",
                     "时间保本："
                     f"{self._bool_label(snapshot.get('time_stop_break_even_enabled', False))} / "

@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.19`
+当前版本：`v0.6.20`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -29,26 +29,42 @@
 
 ## 近期更新
 
-`v0.6.19` 这一轮版本内容比较集中，重点新增和调整如下：
+`v0.6.20` 这一轮版本内容比较集中，重点新增和调整如下：
 
 - 新增 `EMA55 斜率做空` 策略：
   - 规则：`EMA55` 单根斜率比例小于等于阈值时开空，斜率重新转正时平仓
   - 支持 launcher / backtest 双端参数
   - 斜率阈值可调，默认值为 `-0.0005`
+- 动态保护口径开始从 `2R 保本` 统一升级为 `nR 保本`：
+  - 支持按策略配置单独指定 `首档触发R`
+  - 当 `首档触发R = 2` 时，仍保留“先抬到保本位”的特例
+  - 启动确认、参数摘要、回测说明、导出报告文案已统一改成 `nR 保本`
 - `EMA55 斜率做空` 的动态保护与离场参数继续补齐并正式贯通：
   - 启动区、会话恢复、回测区、导出报告现在共用同一套配置
   - 新增 `首档触发R`，不再只固定按 `2R` 起跳
-  - `首档保本特例` 会根据 `首档触发R` 判断是否先移到保本位
+  - `nR 保本` 会根据 `首档触发R` 判断是否先移到保本位
   - 现在可以显式开启/关闭 `斜率转正平仓`
   - 上述参数都会进入启动确认、参数摘要、回测说明和导出报告
 - `EMA55 斜率做空` 的回测与研究能力补齐：
   - 支持固定风险金、固定数量、风险百分比三类仓位口径
-  - 支持 `2R 保本`、手续费偏移、时间保本、动态止盈
+  - 支持 `nR 保本`、手续费偏移、时间保本、动态止盈
   - 输出了独立 HTML 研究报告与多组研究脚本
 - `EMA55 斜率做空` 的通用版本默认值更新：
   - 固定使用 `EMA55`
   - 默认启用 `斜率转正平仓`
-  - 默认 `首档触发R = 2`
+  - 默认 `首档触发R = 5`
+- `BTC EMA55 斜率做空` 的研究口径同步调整：
+  - 默认改为 `ATR14 + 2ATR 止损`
+  - 默认 `5R` 触发 `nR 保本`
+  - 描述文案从“2R 保本”切到“可选 nR 保本”
+- 多币种默认模板更新了一轮：
+  - 做多默认模板改成 `BTC / ETH / SOL / DOGE`
+  - 原 `BNB` 做多模板移出
+  - 多空模板都开始记录各币种独立的 `首档触发R`
+- 持仓大窗刷新体验优化：
+  - 打开和刷新时优先更新持仓主视图与当前页签，不再一次性同步所有历史页
+  - 下方各标签页改为切换到该页时再刷新
+  - 持仓主数据和盈亏折算/合约信息/盘口价格改成分阶段补全，减少主界面阻塞感
 - 策略接入结构做了 B 方案重构：
   - 新增 `strategy_ui_schema.py`，集中声明策略 UI 默认值、显示隐藏、强制只读/强制行为
   - 新增 `strategy_runtime_registry.py`，集中声明策略 family、运行入口、方向偏好、参考线标题等
@@ -63,6 +79,12 @@
   - `S089` 日线 EMA 对比
   - `S096/S097` 距离确认、最小距离窗口、远距入场提前保护、亏损形态、保护后再入场
   - 对应结果已在 `reports/` 下沉淀为 `latest` 报告与时间戳产物
+- 新增最佳参数组合与策略实验脚本：
+  - 最佳参数组合包改成 `4 多 + 4 空`
+  - 新增 `best_long_trigger_r_experiment`，对比多头策略不同 `首档触发R`
+  - 新增 `best_short_line_experiment`，对比空头策略不同均线口径
+  - 新增 `best_parameter_bundle_overall`，汇总整组组合包的总体表现
+  - 新增 `S140-S160` 策略分析报告脚本
 - 实盘轮询链路补了三项轻量扩容优化：
   - 默认轮询间隔从 `3s` 调整为 `10s`
   - 新增 `market_data_hub`，同进程内相同 `instId + bar` 的 K 线共享读取
@@ -204,7 +226,7 @@ python main.py
 
 ### 回测与研究
 
-- [okx_quant/backtest.py](/D:/qqokx/okx_quant/backtest.py)：回测核心逻辑
+- [okx_quant/backtest.py](/D:/qqokx/okx_quant/backtest.py)：回测核心逻辑，当前已统一支持 `nR 保本`、`首档触发R` 与斜率策略差异化说明
 - [okx_quant/backtest_ui.py](/D:/qqokx/okx_quant/backtest_ui.py)：回测界面，当前已支持 `EMA55 斜率做空` 的 `首档触发R`、`首档保本特例`、`斜率转正平仓` 等参数联动
 - [reports/ema55_slope_short_research_report.html](/D:/qqokx/reports/ema55_slope_short_research_report.html)：EMA55 斜率做空研究报告（HTML）
 - [scripts/run_ema55_slope_short_research_report.py](/D:/qqokx/scripts/run_ema55_slope_short_research_report.py)：EMA55 斜率做空研究复跑脚本
@@ -237,6 +259,11 @@ python main.py
 - `scripts/research_btc_s097_far_entry_early_protection_report.py`：`S097` 远距入场提前保护研究
 - `scripts/research_btc_s097_loss_archetype_report.py`：`S097` 亏损形态归因研究
 - `scripts/research_btc_s097_protective_reentry_report.py`：`S097` 保护后再入场研究
+- `scripts/build_best_parameter_bundle.py`：生成最佳参数组合包与对应 HTML 说明
+- `scripts/run_best_long_trigger_r_experiment.py`：最佳多头组合的 `首档触发R` 对比实验
+- `scripts/run_best_short_line_experiment.py`：最佳空头组合的均线类型 / 周期对比实验
+- `scripts/run_best_parameter_bundle_overall_report.py`：最佳参数组合包整体表现汇总
+- `scripts/generate_s140_s160_strategy_analysis.py`：`S140-S160` 策略分析报告
 
 ## 现货套利快速上手
 
@@ -363,7 +390,7 @@ scripts\release_one_click.bat
   ：服务器升级操作清单，适合按实盘环境灰度启用私有 WS 加速
 - [软件开发指南.md](/D:/qqokx/软件开发指南.md)
   ：开发维护说明，已补充策略 schema / runtime registry、EMA55 斜率做空、回测与 UI 接入约定
-- [版本开发日志_v0.6.19.md](/D:/qqokx/版本开发日志_v0.6.19.md)
+- [版本开发日志_v0.6.20.md](/D:/qqokx/版本开发日志_v0.6.20.md)
   ：本轮版本开发日志，归档 EMA55 策略、研究报告、B 方案结构重构与验证结果
 - [reports/strategy_ui_schema_b_impl.md](/D:/qqokx/reports/strategy_ui_schema_b_impl.md)
   ：B 方案实施说明，记录 schema / registry 这一轮已经解掉的耦合和剩余尾项

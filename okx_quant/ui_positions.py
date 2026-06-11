@@ -345,7 +345,7 @@ class UiPositionsMixin:
             self._positions_zoom_window.focus_force()
             self._schedule_positions_zoom_sync()
             self._load_local_history_cache()
-            self._refresh_positions_zoom_all()
+            self._refresh_positions_zoom_primary_views()
             return
 
         window = Toplevel(self.root)
@@ -533,6 +533,7 @@ class UiPositionsMixin:
         history_notebook = ttk.Notebook(container)
         history_notebook.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
         self._positions_zoom_notebook = history_notebook
+        history_notebook.bind("<<NotebookTabChanged>>", self._on_positions_zoom_tab_changed)
 
         pending_orders_tab = ttk.Frame(history_notebook, padding=10)
         pending_orders_tab.columnconfigure(0, weight=1)
@@ -589,8 +590,7 @@ class UiPositionsMixin:
         if not self._positions_zoom_position_history_detail_collapsed:
             self.toggle_positions_zoom_position_history_detail()
         self._load_local_history_cache()
-        self.refresh_positions()
-        self.sync_positions_zoom_data()
+        self._refresh_positions_zoom_primary_views()
         self._expand_to_screen(window)
         self._refresh_all_refresh_badges()
         self._update_positions_zoom_search_shortcuts()
@@ -1898,9 +1898,12 @@ class UiPositionsMixin:
         return profile_name or DEFAULT_CREDENTIAL_PROFILE_NAME, environment
 
     def _refresh_positions_zoom_all(self) -> None:
-        """持仓大窗「刷新」：持仓 + 下方各历史/委托标签页一并从服务端同步。"""
+        """持仓大窗「刷新」：优先刷新持仓与当前页签，避免一次性同步全部历史页。"""
+        self._refresh_positions_zoom_primary_views()
+
+    def _refresh_positions_zoom_primary_views(self) -> None:
         self.refresh_positions()
-        self.sync_positions_zoom_data()
+        self._refresh_positions_zoom_tab_by_label(self._positions_zoom_active_tab_label())
 
     def _positions_zoom_active_tab_label(self) -> str | None:
         notebook = getattr(self, "_positions_zoom_notebook", None)
@@ -1913,6 +1916,9 @@ class UiPositionsMixin:
             return str(notebook.tab(selected, "text") or "").strip() or None
         except Exception:
             return None
+
+    def _on_positions_zoom_tab_changed(self, *_: object) -> None:
+        self._refresh_positions_zoom_tab_by_label(self._positions_zoom_active_tab_label())
 
     @staticmethod
     def _api_switch_refresh_step_label(step: str) -> str:
@@ -1974,14 +1980,13 @@ class UiPositionsMixin:
             return ""
         values = tuple(str(state) for state in steps.values())
         total = len(values)
-        completed = sum(1 for state in values if state in {"done", "failed"})
         if any(state == "failed" for state in values):
-            return f"有失败 {completed}/{total}"
+            return "刷新异常"
         if total and all(state == "done" for state in values):
-            return f"已完成 {completed}/{total}"
+            return "刷新完成"
         if any(state == "running" for state in values):
-            return f"同步中 {completed}/{total}"
-        return f"排队中 {completed}/{total}"
+            return "刷新中"
+        return "准备刷新"
 
     def _refresh_api_switch_status_badges(self) -> None:
         text = self._api_switch_refresh_badge_text()
@@ -2083,6 +2088,13 @@ class UiPositionsMixin:
             except Exception:
                 pass
         self._api_switch_refresh_clear_job = None
+        post_switch_job = getattr(self, "_positions_zoom_post_switch_refresh_job", None)
+        if post_switch_job is not None:
+            try:
+                self.root.after_cancel(post_switch_job)
+            except Exception:
+                pass
+        self._positions_zoom_post_switch_refresh_job = None
         self._api_switch_refresh_log_seen = set()
         steps: dict[str, str] = {"positions": "pending"}
         account_win = getattr(self, "_account_info_window", None)
@@ -2099,8 +2111,6 @@ class UiPositionsMixin:
                     active_step = self._api_switch_refresh_step_for_tab(active_label)
                     if active_step:
                         steps[active_step] = "pending"
-                    for step in ("pending_orders", "order_history", "fills", "position_history"):
-                        steps.setdefault(step, "pending")
             except Exception:
                 pass
         self._api_switch_refresh_steps = steps
@@ -2240,7 +2250,6 @@ class UiPositionsMixin:
                 if zoom_win.winfo_exists():
                     self._schedule_positions_zoom_sync(15)
                     self._refresh_positions_zoom_tab_by_label(active_label)
-                    self._schedule_positions_zoom_remaining_tabs_after_switch(active_label)
             except Exception:
                 pass
 
@@ -3737,23 +3746,28 @@ class UiPositionsMixin:
             return
 
         self._positions_refreshing = True
+        generation = int(getattr(self, "_positions_refresh_generation", 0)) + 1
+        self._positions_refresh_generation = generation
         self._mark_api_switch_refresh_step("positions", "running")
         self.positions_summary_text.set("正在刷新账户持仓...")
         environment = ENV_OPTIONS[self.environment_label.get()]
         profile_name = credentials.profile_name or self._current_credential_profile()
         threading.Thread(
             target=self._refresh_positions_worker,
-            args=(credentials, environment, profile_name),
+            args=(credentials, environment, profile_name, generation),
             daemon=True,
         ).start()
 
-    def _refresh_positions_worker(self, credentials: Credentials, environment: str, profile_name: str) -> None:
+    def _refresh_positions_worker(
+        self,
+        credentials: Credentials,
+        environment: str,
+        profile_name: str,
+        generation: int,
+    ) -> None:
         try:
             positions = self.client.get_positions(credentials, environment=environment)
             ws_cache_note = self._format_private_ws_cache_note(credentials, environment)
-            upl_usdt_prices = _build_upl_usdt_price_map(self.client, positions)
-            position_instruments = _build_position_instrument_map(self.client, positions)
-            position_tickers = _build_position_ticker_map(self.client, positions)
         except Exception as exc:
             message = str(exc)
             if "50101" in message and "current environment" in message:
@@ -3761,9 +3775,6 @@ class UiPositionsMixin:
                 try:
                     positions = self.client.get_positions(credentials, environment=alternate)
                     ws_cache_note = self._format_private_ws_cache_note(credentials, alternate)
-                    upl_usdt_prices = _build_upl_usdt_price_map(self.client, positions)
-                    position_instruments = _build_position_instrument_map(self.client, positions)
-                    position_tickers = _build_position_ticker_map(self.client, positions)
                 except Exception:
                     self.root.after(0, lambda: self._apply_positions_error(message))
                     return
@@ -3779,9 +3790,7 @@ class UiPositionsMixin:
                         effective_environment=alternate,
                         credential_profile_name=profile_name,
                         ws_cache_note=ws_cache_note,
-                        upl_usdt_prices=upl_usdt_prices,
-                        position_instruments=position_instruments,
-                        position_tickers=position_tickers,
+                        refresh_generation=generation,
                     ),
                 )
                 return
@@ -3795,9 +3804,7 @@ class UiPositionsMixin:
                 effective_environment=environment,
                 credential_profile_name=profile_name,
                 ws_cache_note=ws_cache_note,
-                upl_usdt_prices=upl_usdt_prices,
-                position_instruments=position_instruments,
-                position_tickers=position_tickers,
+                refresh_generation=generation,
             ),
         )
 
@@ -3811,6 +3818,7 @@ class UiPositionsMixin:
         upl_usdt_prices: dict[str, Decimal] | None = None,
         position_instruments: dict[str, Instrument] | None = None,
         position_tickers: dict[str, OkxTicker] | None = None,
+        refresh_generation: int | None = None,
     ) -> None:
         self._positions_refreshing = False
         self._mark_api_switch_refresh_step("positions", "done")
@@ -3820,20 +3828,27 @@ class UiPositionsMixin:
         self._positions_last_refresh_at = datetime.now()
         self._positions_effective_environment = effective_environment
         self._positions_context_profile_name = (credential_profile_name or self._current_credential_profile()).strip()
+        if refresh_generation is not None:
+            self._positions_active_generation = refresh_generation
         _mark_refresh_health_success(self._positions_refresh_health, at=self._positions_last_refresh_at)
         self._refresh_all_refresh_badges()
-        self._upl_usdt_prices = dict(upl_usdt_prices or {})
-        self._position_instruments = dict(position_instruments or {})
-        self._position_tickers = dict(position_tickers or {})
+        if upl_usdt_prices is not None:
+            self._upl_usdt_prices = dict(upl_usdt_prices)
+        if position_instruments is not None:
+            self._position_instruments = dict(position_instruments)
+        if position_tickers is not None:
+            self._position_tickers = dict(position_tickers)
         profile_name = self._positions_context_profile_name
         if profile_name:
             self._positions_snapshot_by_profile[profile_name] = ProfilePositionSnapshot(
                 api_name=profile_name,
                 effective_environment=effective_environment,
                 positions=list(positions),
-                upl_usdt_prices=dict(upl_usdt_prices or {}),
+                upl_usdt_prices=dict(upl_usdt_prices if upl_usdt_prices is not None else self._upl_usdt_prices),
                 refreshed_at=self._positions_last_refresh_at,
-                position_instruments=dict(position_instruments or {}),
+                position_instruments=dict(
+                    position_instruments if position_instruments is not None else self._position_instruments
+                ),
                 ws_cache_note=ws_cache_note,
             )
         if profile_name and effective_environment:
@@ -3848,6 +3863,123 @@ class UiPositionsMixin:
             self._upsert_session_row(session)
         self._refresh_running_session_summary()
         self._refresh_selected_session_details()
+        active_environment = effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        self._start_positions_enrichment_refresh(
+            positions=list(positions),
+            environment=active_environment,
+            profile_name=profile_name,
+            generation=self._positions_active_generation,
+        )
+
+    def _start_positions_enrichment_refresh(
+        self,
+        *,
+        positions: list[OkxPosition],
+        environment: str,
+        profile_name: str,
+        generation: int,
+    ) -> None:
+        if self._positions_enrichment_refreshing:
+            self._positions_enrichment_request = (generation, list(positions), environment, profile_name)
+            return
+        self._positions_enrichment_refreshing = True
+        self._positions_enrichment_request = None
+        threading.Thread(
+            target=self._refresh_positions_enrichment_worker,
+            args=(list(positions), environment, profile_name, generation),
+            daemon=True,
+        ).start()
+
+    def _refresh_positions_enrichment_worker(
+        self,
+        positions: list[OkxPosition],
+        environment: str,
+        profile_name: str,
+        generation: int,
+    ) -> None:
+        upl_usdt_prices: dict[str, Decimal] = {}
+        position_instruments: dict[str, Instrument] = {}
+        position_tickers: dict[str, OkxTicker] = {}
+        warnings: list[str] = []
+        try:
+            upl_usdt_prices = _build_upl_usdt_price_map(self.client, positions)
+        except Exception as exc:
+            warnings.append(f"盈亏折算补全失败：{_format_network_error_message(str(exc))}")
+        try:
+            position_instruments = _build_position_instrument_map(self.client, positions)
+        except Exception as exc:
+            warnings.append(f"合约信息补全失败：{_format_network_error_message(str(exc))}")
+        try:
+            position_tickers = _build_position_ticker_map(self.client, positions)
+        except Exception as exc:
+            warnings.append(f"盘口价格补全失败：{_format_network_error_message(str(exc))}")
+        self.root.after(
+            0,
+            lambda: self._apply_positions_enrichment(
+                generation=generation,
+                positions=positions,
+                environment=environment,
+                profile_name=profile_name,
+                upl_usdt_prices=upl_usdt_prices,
+                position_instruments=position_instruments,
+                position_tickers=position_tickers,
+                warnings=warnings,
+            ),
+        )
+
+    def _apply_positions_enrichment(
+        self,
+        *,
+        generation: int,
+        positions: list[OkxPosition],
+        environment: str,
+        profile_name: str,
+        upl_usdt_prices: dict[str, Decimal],
+        position_instruments: dict[str, Instrument],
+        position_tickers: dict[str, OkxTicker],
+        warnings: list[str],
+    ) -> None:
+        self._positions_enrichment_refreshing = False
+        pending_request = self._positions_enrichment_request
+        self._positions_enrichment_request = None
+        if generation != getattr(self, "_positions_active_generation", 0):
+            if pending_request is not None:
+                next_generation, next_positions, next_environment, next_profile_name = pending_request
+                self._start_positions_enrichment_refresh(
+                    positions=next_positions,
+                    environment=next_environment,
+                    profile_name=next_profile_name,
+                    generation=next_generation,
+                )
+            return
+        if upl_usdt_prices:
+            self._upl_usdt_prices = dict(upl_usdt_prices)
+        if position_instruments:
+            self._position_instruments = dict(position_instruments)
+        if position_tickers:
+            self._position_tickers = dict(position_tickers)
+        if profile_name:
+            snapshot = self._positions_snapshot_by_profile.get(profile_name)
+            if snapshot is not None and str(snapshot.effective_environment or "") == str(environment or ""):
+                snapshot.upl_usdt_prices = dict(self._upl_usdt_prices)
+                snapshot.position_instruments = dict(self._position_instruments)
+                snapshot.positions = list(positions)
+                snapshot.refreshed_at = self._positions_last_refresh_at or snapshot.refreshed_at
+                snapshot.ws_cache_note = self._positions_ws_cache_note
+        self._render_positions_view()
+        self._refresh_session_live_pnl_cache()
+        self._refresh_running_session_summary()
+        self._refresh_selected_session_details()
+        for message in warnings:
+            self._enqueue_api_switch_refresh_log_once(f"positions:enrichment:{message}", f"持仓补全 | {message}")
+        if pending_request is not None:
+            next_generation, next_positions, next_environment, next_profile_name = pending_request
+            self._start_positions_enrichment_refresh(
+                positions=next_positions,
+                environment=next_environment,
+                profile_name=next_profile_name,
+                generation=next_generation,
+            )
 
     @staticmethod
     def _session_counts_toward_running_summary(session: StrategySession) -> bool:
@@ -5188,7 +5320,7 @@ class UiPositionsMixin:
             text=(
                 f"合约：{position.inst_id}  开仓均价≈{format_decimal(entry)}\n"
                 f"将沿用所选算法止损单，并按模板：{record.strategy_name} "
-                f"（{config.tp_sl_trigger_type} 触发、{config.bar}、2R保本与手续费偏移等）自动上移止损。"
+                f"（{config.tp_sl_trigger_type} 触发、{config.bar}、nR保本与手续费偏移等）自动上移止损。"
             ),
             wraplength=520,
             justify="left",

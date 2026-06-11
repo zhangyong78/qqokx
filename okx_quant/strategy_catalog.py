@@ -250,13 +250,13 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     StrategyDefinition(
         strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
         name="均线斜率做空",
-        summary="均线斜率达到负阈值时做空，搭配 2ATR 止损、2R 保本后逐级锁盈与 ATR 分位过滤。",
+        summary="均线斜率达到负阈值时做空，搭配 2ATR 止损、nR 保本后逐级锁盈与 ATR 分位过滤。",
         rule_description=(
             "流程：按策略参数指定的 EMA 或 MA 周期计算斜率；当最新一根已收盘 K 线的均线斜率比例小于等于开空阈值时，"
-            "若当前空仓则按该根 K 线收盘价开空。默认使用 2ATR 初始止损、动态逐级锁盈、2R 保本，"
+            "若当前空仓则按该根 K 线收盘价开空。默认使用 2ATR 初始止损、动态逐级锁盈、nR 保本，"
             "并通过 ATR 分位过滤较高波动环境。斜率转正平仓作为可选防守条件，默认关闭。"
         ),
-        parameter_hint="实盘默认：1H、均线斜率阈值 -0.0005、2ATR 止损、动态止盈、2R 保本、ATR 分位≤50%、每笔风险10U；不同币种可使用不同 EMA/MA 周期。",
+        parameter_hint="实盘默认：1H、均线斜率阈值 -0.0005、2ATR 止损、动态止盈、nR 保本、ATR 分位≤50%、每笔风险10U；不同币种可使用不同 EMA/MA 周期。",
         default_signal_label="只做空",
         allowed_signal_labels=("只做空",),
         supports_trade=True,
@@ -268,13 +268,14 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     StrategyDefinition(
         strategy_id=STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
         name="BTC EMA55 斜率做空",
-        summary="BTC 专用 EMA55 斜率做空：负斜率直接开空，ATR10 以损定量，出场只看止损和斜率走平。",
+        summary="BTC 专用 EMA55 斜率做空：负斜率直接开空，ATR14 以损定量，出场可选 nR 保本与斜率走平。",
         rule_description=(
             "当最新已收盘 K 线的 EMA55 单根斜率比例小于等于阈值时直接开空；"
-            "仓位按 ATR10 风险定量，初始止损按 ATR 倍数设置。"
-            "持仓后不使用固定止盈或动态止盈，只在触发止损，或 EMA55 斜率走平/转正时平仓。"
+            "仓位按 ATR14 风险定量，初始止损按 ATR 倍数设置。"
+            "持仓后始终使用 ATR 止损；若开启 nR 保本，则达到首档 R 后按 n-1R 逐级上移止损，并叠加双向手续费；"
+            "若开启斜率转正平仓，则 EMA55 斜率走平或转正时平仓。"
         ),
-        parameter_hint="默认 1H、EMA55、ATR10、止损 2ATR、斜率阈值 -0.0005；止损倍数和斜率阈值可调。",
+        parameter_hint="默认 1H、EMA55、ATR14、止损 1.5ATR、斜率阈值 -0.0005；止损倍数、斜率阈值和 nR 保本触发档位可调。",
         default_signal_label="只做空",
         allowed_signal_labels=("只做空",),
         supports_trade=True,
