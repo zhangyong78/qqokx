@@ -13597,6 +13597,10 @@ def _position_signed_display_amount(
         amount = abs(position.position) * instrument.ct_val * multiplier * sign
         return amount, quote_currency
 
+    if position.inst_type in {"OPTION", "SWAP", "FUTURES"}:
+        # Without contract specs, raw derivative size is contracts, not base coin.
+        return abs(position.position) * sign, "张"
+
     asset_currency = _extract_asset_key(position.inst_id).upper()
     return abs(position.position) * sign, asset_currency if asset_currency else None
 
@@ -14246,7 +14250,7 @@ def _build_usdt_price_snapshot(client: OkxRestClient, currencies: set[str]) -> d
 
 
 def _build_position_instrument_map(client: OkxRestClient, positions: list[OkxPosition]) -> dict[str, Instrument]:
-    needed_ids = {position.inst_id for position in positions}
+    needed_ids = {position.inst_id for position in positions if position.inst_id}
     result: dict[str, Instrument] = {}
 
     option_families = sorted(
@@ -14257,21 +14261,39 @@ def _build_position_instrument_map(client: OkxRestClient, positions: list[OkxPos
         }
     )
     for family in option_families:
-        for instrument in client.get_option_instruments(inst_family=family):
-            if instrument.inst_id in needed_ids:
-                result[instrument.inst_id] = instrument
+        try:
+            for instrument in client.get_option_instruments(inst_family=family):
+                if instrument.inst_id in needed_ids:
+                    result[instrument.inst_id] = instrument
+        except Exception:
+            continue
 
     swap_ids = {position.inst_id for position in positions if position.inst_type == "SWAP"}
     if swap_ids:
-        for instrument in client.get_swap_instruments():
-            if instrument.inst_id in swap_ids:
-                result[instrument.inst_id] = instrument
+        try:
+            for instrument in client.get_swap_instruments():
+                if instrument.inst_id in swap_ids:
+                    result[instrument.inst_id] = instrument
+        except Exception:
+            pass
 
     futures_ids = {position.inst_id for position in positions if position.inst_type == "FUTURES"}
     if futures_ids:
-        for instrument in client.get_instruments("FUTURES"):
-            if instrument.inst_id in futures_ids:
-                result[instrument.inst_id] = instrument
+        try:
+            for instrument in client.get_instruments("FUTURES"):
+                if instrument.inst_id in futures_ids:
+                    result[instrument.inst_id] = instrument
+        except Exception:
+            pass
+
+    missing_ids = needed_ids.difference(result.keys())
+    for inst_id in sorted(missing_ids):
+        try:
+            instrument = client.get_instrument(inst_id)
+        except Exception:
+            continue
+        if instrument.inst_id in needed_ids:
+            result[instrument.inst_id] = instrument
 
     return result
 

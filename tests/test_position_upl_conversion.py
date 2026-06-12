@@ -6,6 +6,7 @@ from okx_quant.okx_client import OkxPosition, OkxRestClient, OkxTicker
 from okx_quant.ui import (
     POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS,
     _aggregate_position_metrics,
+    _build_position_instrument_map,
     _build_upl_usdt_price_map,
     _build_group_row_values,
     _format_margin_mode,
@@ -144,6 +145,12 @@ class PositionUplConversionTest(TestCase):
         )
         text = _format_position_size(position, {instrument.inst_id: instrument})
         self.assertEqual(text, "-0.2 BTC (short)")
+
+    def test_format_position_size_without_option_contract_specs_uses_contract_unit(self) -> None:
+        position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
+        position = OkxPosition(**{**position.__dict__, "position": Decimal("25"), "pos_side": "net"})
+
+        self.assertEqual(_format_position_size(position, {}), "25 张 (long)")
 
     def test_format_position_size_returns_dash_for_zero_position(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
@@ -372,6 +379,46 @@ class PositionUplConversionTest(TestCase):
             _format_position_quote_price_usdt(position, {position.inst_id: ticker}, {"BTC": Decimal("80000")}, side="ask"),
             "16",
         )
+
+    def test_build_position_instrument_map_falls_back_to_single_instrument_lookup(self) -> None:
+        target = Instrument(
+            inst_id="BTC-USD-260626-100000-C",
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            settle_ccy="BTC",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+            uly="BTC-USD",
+            inst_family="BTC-USD",
+        )
+
+        class _StubClient:
+            @staticmethod
+            def get_option_instruments(*, inst_family: str):
+                raise RuntimeError(f"family lookup failed: {inst_family}")
+
+            @staticmethod
+            def get_swap_instruments():
+                return []
+
+            @staticmethod
+            def get_instruments(inst_type: str):
+                return []
+
+            @staticmethod
+            def get_instrument(inst_id: str) -> Instrument:
+                self.assertEqual(inst_id, target.inst_id)
+                return target
+
+        position = _make_position(inst_id=target.inst_id, upl="0", margin_ccy="BTC")
+        instruments = _build_position_instrument_map(_StubClient(), [position])
+
+        self.assertEqual(instruments[target.inst_id], target)
+        self.assertEqual(_format_position_size(position, instruments), "0.01 BTC (long)")
 
     def test_positions_zoom_defaults_show_bid_ask_before_mark(self) -> None:
         columns = POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS["positions"]

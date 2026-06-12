@@ -26,6 +26,7 @@ from okx_quant.candle_cache import (
 from okx_quant.models import Candle, Credentials, Instrument, OrderPlan, StrategyConfig, TriggerPriceType
 from okx_quant.okx_private_ws import OkxPrivateWsConnection, OkxPrivateWsConnectionUnavailable
 from okx_quant.okx_public_ws import OkxPublicWsConnection, OkxPublicWsConnectionUnavailable
+from okx_quant.persistence import instrument_metadata_cache_file_path
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, snap_to_increment
 
 
@@ -382,6 +383,9 @@ class OkxRestClient:
         self._private_ws_lock = threading.Lock()
         self._private_ws_connections: dict[tuple[str, str, str], OkxPrivateWsConnection] = {}
         self._private_ws_error_once: set[tuple[str, str, str]] = set()
+        self._instrument_cache_lock = threading.Lock()
+        self._instrument_cache_loaded = False
+        self._instrument_cache_by_id: dict[str, Instrument] = {}
 
     def get_instruments(
         self,
@@ -389,14 +393,28 @@ class OkxRestClient:
         *,
         uly: str | None = None,
         inst_family: str | None = None,
+        prefer_cached: bool = False,
     ) -> list[Instrument]:
-        params = {"instType": inst_type.upper()}
+        normalized_type = inst_type.upper()
+        normalized_family = (inst_family or "").strip().upper() or None
+        if prefer_cached:
+            cached = self._get_cached_instruments(normalized_type, inst_family=normalized_family)
+            if cached:
+                return cached
+
+        params = {"instType": normalized_type}
         if uly:
             params["uly"] = uly
-        if inst_family:
-            params["instFamily"] = inst_family
+        if normalized_family:
+            params["instFamily"] = normalized_family
 
-        payload = self._request("GET", "/api/v5/public/instruments", params=params)
+        try:
+            payload = self._request("GET", "/api/v5/public/instruments", params=params)
+        except Exception:
+            cached = self._get_cached_instruments(normalized_type, inst_family=normalized_family)
+            if cached:
+                return cached
+            raise
         instruments: list[Instrument] = []
         for item in payload["data"]:
             instruments.append(
@@ -416,6 +434,7 @@ class OkxRestClient:
                 )
             )
         instruments.sort(key=lambda item: item.inst_id)
+        self._cache_instruments(instruments)
         return instruments
 
     def get_swap_instruments(self) -> list[Instrument]:
@@ -427,14 +446,87 @@ class OkxRestClient:
     def get_spot_instruments(self) -> list[Instrument]:
         return self.get_instruments("SPOT")
 
-    def get_instrument(self, inst_id: str) -> Instrument:
+    def get_cached_instruments(self, inst_type: str, *, inst_family: str | None = None) -> list[Instrument]:
+        return self._get_cached_instruments(inst_type, inst_family=inst_family)
+
+    def get_cached_instrument(self, inst_id: str) -> Instrument | None:
+        return self._get_cached_instrument(inst_id)
+
+    def get_instrument(self, inst_id: str, *, prefer_cached: bool = False) -> Instrument:
         normalized = inst_id.strip().upper()
+        if prefer_cached:
+            cached = self._get_cached_instrument(normalized)
+            if cached is not None:
+                return cached
         inst_type = infer_inst_type(normalized)
         inst_family = infer_option_family(normalized) if inst_type == "OPTION" else None
-        for instrument in self.get_instruments(inst_type, inst_family=inst_family):
+        for instrument in self.get_instruments(inst_type, inst_family=inst_family, prefer_cached=prefer_cached):
             if instrument.inst_id == normalized:
                 return instrument
         raise OkxApiError(f"未找到可交易标的：{normalized}")
+
+    def _ensure_instrument_cache_loaded(self) -> None:
+        with self._instrument_cache_lock:
+            if self._instrument_cache_loaded:
+                return
+            self._instrument_cache_loaded = True
+            cache_path = instrument_metadata_cache_file_path()
+            if not cache_path.exists():
+                return
+            try:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            except Exception:
+                return
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                return
+            loaded: dict[str, Instrument] = {}
+            for item in items:
+                instrument = _deserialize_instrument_cache_item(item)
+                if instrument is not None:
+                    loaded[instrument.inst_id] = instrument
+            self._instrument_cache_by_id = loaded
+
+    def _get_cached_instrument(self, inst_id: str) -> Instrument | None:
+        self._ensure_instrument_cache_loaded()
+        return self._instrument_cache_by_id.get(inst_id.strip().upper())
+
+    def _get_cached_instruments(self, inst_type: str, *, inst_family: str | None = None) -> list[Instrument]:
+        self._ensure_instrument_cache_loaded()
+        normalized_type = inst_type.strip().upper()
+        normalized_family = (inst_family or "").strip().upper() or None
+        instruments = [
+            instrument
+            for instrument in self._instrument_cache_by_id.values()
+            if instrument.inst_type == normalized_type
+            and (normalized_family is None or (instrument.inst_family or "").strip().upper() == normalized_family)
+        ]
+        instruments.sort(key=lambda item: item.inst_id)
+        return instruments
+
+    def _cache_instruments(self, instruments: list[Instrument]) -> None:
+        if not instruments:
+            return
+        self._ensure_instrument_cache_loaded()
+        with self._instrument_cache_lock:
+            for instrument in instruments:
+                self._instrument_cache_by_id[instrument.inst_id] = instrument
+            try:
+                payload = {
+                    "version": 1,
+                    "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    "items": [
+                        _serialize_instrument_cache_item(item)
+                        for item in sorted(self._instrument_cache_by_id.values(), key=lambda instrument: instrument.inst_id)
+                    ],
+                }
+                target = instrument_metadata_cache_file_path()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = target.with_suffix(target.suffix + ".tmp")
+                temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                temp_path.replace(target)
+            except Exception:
+                return
 
     def get_candles(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
         payload = self._request(
@@ -2502,6 +2594,52 @@ def infer_option_family(inst_id: str) -> str | None:
         return None
     parts = normalized.split("-")
     return f"{parts[0]}-{parts[1]}"
+
+
+def _serialize_instrument_cache_item(instrument: Instrument) -> dict[str, Any]:
+    return {
+        "inst_id": instrument.inst_id,
+        "inst_type": instrument.inst_type,
+        "tick_size": str(instrument.tick_size),
+        "lot_size": str(instrument.lot_size),
+        "min_size": str(instrument.min_size),
+        "state": instrument.state,
+        "settle_ccy": instrument.settle_ccy,
+        "ct_val": str(instrument.ct_val) if instrument.ct_val is not None else None,
+        "ct_mult": str(instrument.ct_mult) if instrument.ct_mult is not None else None,
+        "ct_val_ccy": instrument.ct_val_ccy,
+        "uly": instrument.uly,
+        "inst_family": instrument.inst_family,
+    }
+
+
+def _deserialize_instrument_cache_item(payload: Any) -> Instrument | None:
+    if not isinstance(payload, dict):
+        return None
+    inst_id = str(payload.get("inst_id") or "").strip().upper()
+    inst_type = str(payload.get("inst_type") or "").strip().upper()
+    if not inst_id or not inst_type:
+        return None
+    try:
+        tick_size = Decimal(str(payload.get("tick_size")))
+        lot_size = Decimal(str(payload.get("lot_size")))
+        min_size = Decimal(str(payload.get("min_size")))
+    except Exception:
+        return None
+    return Instrument(
+        inst_id=inst_id,
+        inst_type=inst_type,
+        tick_size=tick_size,
+        lot_size=lot_size,
+        min_size=min_size,
+        state=str(payload.get("state") or ""),
+        settle_ccy=str(payload.get("settle_ccy") or "").strip().upper() or None,
+        ct_val=_to_decimal(payload.get("ct_val")),
+        ct_mult=_to_decimal(payload.get("ct_mult")),
+        ct_val_ccy=str(payload.get("ct_val_ccy") or "").strip().upper() or None,
+        uly=str(payload.get("uly") or "").strip().upper() or None,
+        inst_family=str(payload.get("inst_family") or "").strip().upper() or None,
+    )
 
 
 def _pick_aggressive_price(ticker: OkxTicker, side: str) -> Decimal | None:

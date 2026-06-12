@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.21`
+当前版本：`v0.6.22`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -29,7 +29,7 @@
 
 ## 近期更新
 
-`v0.6.21` 这一轮版本内容比较集中，重点新增和调整如下：
+`v0.6.22` 这一轮版本内容比较集中，重点新增和调整如下：
 
 - 新增 `EMA55 斜率做空` 策略：
   - 规则：`EMA55` 单根斜率比例小于等于阈值时开空，斜率重新转正时平仓
@@ -65,6 +65,20 @@
   - 打开和刷新时优先更新持仓主视图与当前页签，不再一次性同步所有历史页
   - 下方各标签页改为切换到该页时再刷新
   - 持仓主数据和盈亏折算/合约信息/盘口价格改成分阶段补全，减少主界面阻塞感
+- 回测区新增“纯本地回测”链路：
+  - 新增 `纯本地回测（不补拉）` 开关，只使用本地缓存，不再临时联网补拉 K 线
+  - 新增本地数据状态提示，会显示当前标的/周期的本地缓存根数和覆盖时间范围
+  - 支持先单独同步 `1H / 4H` 等选定周期，不必每次全量同步所有周期
+  - 新增“同步价格精度/下单规则”，离线回测前可先缓存合约元数据
+- 回测前置校验更完整：
+  - 纯本地模式下会检查主回测 K 线、多周期过滤 K 线、日线过滤 K 线、高周期方向过滤 K 线是否缺失或有缺口
+  - 本地缓存不足时直接提示首段缺口或覆盖范围，不再静默回退联网
+- 合约元数据缓存正式落地：
+  - 新增 `instrument_metadata_cache.json`
+  - `get_instrument` / `get_instruments` 支持优先读取本地缓存
+  - 网络拉取成功后会自动回写缓存，网络失败时可回退读本地缓存
+- 持仓展示在缺少合约规格时补了兜底显示：
+  - 对 `OPTION / SWAP / FUTURES`，若拿不到合约规格，先按“张”显示原始合约数量，避免数量口径直接失真
 - 策略接入结构做了 B 方案重构：
   - 新增 `strategy_ui_schema.py`，集中声明策略 UI 默认值、显示隐藏、强制只读/强制行为
   - 新增 `strategy_runtime_registry.py`，集中声明策略 family、运行入口、方向偏好、参考线标题等
@@ -85,6 +99,10 @@
   - 新增 `best_short_line_experiment`，对比空头策略不同均线口径
   - 新增 `best_parameter_bundle_overall`，汇总整组组合包的总体表现
   - 新增 `S140-S160` 策略分析报告脚本
+- 新增一批 BTC 多头复盘脚本：
+  - `btc_long_5_software_results_analysis`
+  - `btc_long_three_config_full_compare`
+  - `r001_r003_local_full_compare`
 - 实盘轮询链路补了三项轻量扩容优化：
   - 默认轮询间隔从 `3s` 调整为 `10s`
   - 新增 `market_data_hub`，同进程内相同 `instId + bar` 的 K 线共享读取
@@ -226,8 +244,9 @@ python main.py
 
 ### 回测与研究
 
-- [okx_quant/backtest.py](/D:/qqokx/okx_quant/backtest.py)：回测核心逻辑，当前已统一支持 `nR 保本`、`首档触发R` 与斜率策略差异化说明
+- [okx_quant/backtest.py](/D:/qqokx/okx_quant/backtest.py)：回测核心逻辑，当前已统一支持 `nR 保本`、`首档触发R`、斜率策略差异化说明与纯本地回测
 - [okx_quant/backtest_ui.py](/D:/qqokx/okx_quant/backtest_ui.py)：回测界面，当前已支持 `EMA55 斜率做空` 的 `首档触发R`、`首档保本特例`、`斜率转正平仓` 等参数联动
+- [okx_quant/candle_store.py](/D:/qqokx/okx_quant/candle_store.py)：本地 K 线存储，当前已支持查询缓存根数与时间覆盖范围
 - [reports/ema55_slope_short_research_report.html](/D:/qqokx/reports/ema55_slope_short_research_report.html)：EMA55 斜率做空研究报告（HTML）
 - [scripts/run_ema55_slope_short_research_report.py](/D:/qqokx/scripts/run_ema55_slope_short_research_report.py)：EMA55 斜率做空研究复跑脚本
 - [okx_quant/btc_market_analyzer.py](/D:/qqokx/okx_quant/btc_market_analyzer.py)：BTC 市场研究分析
@@ -264,6 +283,9 @@ python main.py
 - `scripts/run_best_short_line_experiment.py`：最佳空头组合的均线类型 / 周期对比实验
 - `scripts/run_best_parameter_bundle_overall_report.py`：最佳参数组合包整体表现汇总
 - `scripts/generate_s140_s160_strategy_analysis.py`：`S140-S160` 策略分析报告
+- `scripts/generate_btc_long_5_software_analysis.py`：BTC 多头最近 5 组软件回测结果分析
+- `scripts/run_btc_long_three_config_full_compare.py`：BTC 多头 3 套配置全量对比
+- `scripts/run_r001_r003_local_full_compare_report.py`：`R001-R003` 本地全量重跑对比报告
 
 ## 现货套利快速上手
 
@@ -390,7 +412,7 @@ scripts\release_one_click.bat
   ：服务器升级操作清单，适合按实盘环境灰度启用私有 WS 加速
 - [软件开发指南.md](/D:/qqokx/软件开发指南.md)
   ：开发维护说明，已补充策略 schema / runtime registry、EMA55 斜率做空、回测与 UI 接入约定
-- [版本开发日志_v0.6.21.md](/D:/qqokx/版本开发日志_v0.6.21.md)
+- [版本开发日志_v0.6.22.md](/D:/qqokx/版本开发日志_v0.6.22.md)
   ：本轮版本开发日志，归档 EMA55 策略、研究报告、B 方案结构重构与验证结果
 - [reports/strategy_ui_schema_b_impl.md](/D:/qqokx/reports/strategy_ui_schema_b_impl.md)
   ：B 方案实施说明，记录 schema / registry 这一轮已经解掉的耦合和剩余尾项

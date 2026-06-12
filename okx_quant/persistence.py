@@ -23,6 +23,7 @@ ANALYSIS_REPORT_DIR_NAME = "analysis"
 DERIBIT_REPORT_EXPORT_DIR_NAME = "deribit"
 LIVE_STRATEGY_SESSIONS_DIR_NAME = "live_strategy_sessions"
 DERIBIT_VOLATILITY_CACHE_FILE_NAME = "deribit_volatility_cache.json"
+INSTRUMENT_METADATA_CACHE_FILE_NAME = "instrument_metadata_cache.json"
 STRATEGY_HISTORY_FILE_NAME = "strategy_history.json"
 STRATEGY_TRADE_LEDGER_FILE_NAME = "strategy_trade_ledger.json"
 RECOVERABLE_STRATEGY_SESSIONS_FILE_NAME = "recoverable_strategy_sessions.json"
@@ -104,6 +105,12 @@ def deribit_volatility_cache_file_path(base_dir: Path | None = None) -> Path:
     if base_dir is not None:
         return Path(base_dir) / DERIBIT_VOLATILITY_CACHE_FILE_NAME
     return cache_dir_path() / DERIBIT_VOLATILITY_CACHE_FILE_NAME
+
+
+def instrument_metadata_cache_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / INSTRUMENT_METADATA_CACHE_FILE_NAME
+    return cache_dir_path() / INSTRUMENT_METADATA_CACHE_FILE_NAME
 
 
 def strategy_history_file_path(base_dir: Path | None = None) -> Path:

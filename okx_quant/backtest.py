@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 
+from okx_quant.candle_cache import load_candle_cache, load_candle_cache_range
 from okx_quant.engine import build_protection_plan, determine_order_size
 from okx_quant.daily_filters import (
     aggregate_candles_to_daily_boundary,
@@ -517,6 +518,7 @@ def run_backtest(
     end_ts: int | None = None,
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
+    local_only: bool = False,
 ) -> BacktestResult:
     if candle_limit < 0:
         raise ValueError("回测 K 线数量不能小于 0")
@@ -525,7 +527,6 @@ def run_backtest(
     if start_ts is not None and end_ts is not None and start_ts > end_ts:
         raise ValueError("开始时间不能晚于结束时间")
 
-    instrument = client.get_instrument(config.inst_id)
     preload_count = _required_backtest_preload_candles(config)
     candles = _load_backtest_candles(
         client,
@@ -535,7 +536,9 @@ def run_backtest(
         start_ts=start_ts,
         end_ts=end_ts,
         preload_count=preload_count,
+        local_only=local_only,
     )
+    instrument = _load_backtest_instrument(client, config.inst_id, candles_loaded=bool(candles), local_only=local_only)
     mtf_filter_candles: list[Candle] | None = None
     if _backtest_uses_mtf_filter(config.strategy_id):
         filter_inst_id = config.resolved_mtf_filter_inst_id()
@@ -550,6 +553,7 @@ def run_backtest(
             start_ts=start_ts,
             end_ts=end_ts,
             preload_count=filter_preload,
+            local_only=local_only,
         )
     direction_filter_bias: list[str] | None = None
     if _backtest_uses_daily_filter(config) and candles:
@@ -557,6 +561,7 @@ def run_backtest(
             client,
             config,
             entry_candles=candles,
+            local_only=local_only,
         )
         direction_filter_bias = _build_daily_direction_filter_bias(
             candles,
@@ -582,6 +587,7 @@ def run_backtest(
             start_ts=start_ts,
             end_ts=end_ts,
             preload_count=hi_preload,
+            local_only=local_only,
         )
         cross_higher_tf_bias = _build_cross_higher_tf_bias(
             candles,
@@ -698,6 +704,7 @@ def _load_daily_filter_candles(
     config: StrategyConfig,
     *,
     entry_candles: list[Candle],
+    local_only: bool = False,
 ) -> list[Candle]:
     if not entry_candles:
         return []
@@ -714,6 +721,7 @@ def _load_daily_filter_candles(
             0,
             start_ts=start_ts,
             end_ts=end_ts,
+            local_only=local_only,
         )
     if filter_inst_id == config.inst_id and str(config.bar or "").strip().upper() == "1H":
         hourly_candles = [candle for candle in entry_candles if candle.confirmed]
@@ -725,6 +733,7 @@ def _load_daily_filter_candles(
             0,
             start_ts=start_ts,
             end_ts=end_ts,
+            local_only=local_only,
         )
     aggregated, _ = aggregate_candles_to_daily_boundary(hourly_candles, boundary=boundary)
     return aggregated
@@ -939,6 +948,7 @@ def run_backtest_batch(
     take_ratios: tuple[Decimal, ...] = ATR_BATCH_TAKE_RATIOS,
     maker_fee_rate: Decimal = Decimal("0"),
     taker_fee_rate: Decimal = Decimal("0"),
+    local_only: bool = False,
 ) -> list[tuple[StrategyConfig, BacktestResult]]:
     if _backtest_strategy_family(base_config.strategy_id) == "ema5_ema8":
         raise RuntimeError("4H EMA5/EMA8 金叉死叉策略不参与 ATR 批量矩阵回测，请使用单组回测。")
@@ -959,7 +969,6 @@ def run_backtest_batch(
 
     preload_count = max(_required_backtest_preload_candles(config) for config in batch_configs)
     sample_config = batch_configs[0]
-    instrument = client.get_instrument(sample_config.inst_id)
     candles = _load_backtest_candles(
         client,
         sample_config.inst_id,
@@ -968,6 +977,13 @@ def run_backtest_batch(
         start_ts=start_ts,
         end_ts=end_ts,
         preload_count=preload_count,
+        local_only=local_only,
+    )
+    instrument = _load_backtest_instrument(
+        client,
+        sample_config.inst_id,
+        candles_loaded=bool(candles),
+        local_only=local_only,
     )
     mtf_filter_candles: list[Candle] | None = None
     if _backtest_uses_mtf_filter(sample_config.strategy_id):
@@ -980,6 +996,7 @@ def run_backtest_batch(
             start_ts=start_ts,
             end_ts=end_ts,
             preload_count=max(_required_mtf_filter_preload_candles(config) for config in batch_configs),
+            local_only=local_only,
         )
     daily_filter_bias_by_key: dict[tuple[object, ...], list[str]] = {}
     if candles:
@@ -1001,6 +1018,7 @@ def run_backtest_batch(
                 client,
                 config,
                 entry_candles=candles,
+                local_only=local_only,
             )
             daily_filter_bias_by_key[cache_key] = _build_daily_direction_filter_bias(
                 candles,
@@ -1499,6 +1517,42 @@ def _format_backtest_timestamp(ts: int) -> str:
     return str(ts)
 
 
+def _load_backtest_instrument(
+    client: OkxRestClient,
+    inst_id: str,
+    *,
+    candles_loaded: bool,
+    local_only: bool = False,
+) -> Instrument:
+    if local_only:
+        cached_getter = getattr(client, "get_cached_instrument", None)
+        instrument = cached_getter(inst_id) if callable(cached_getter) else None
+        if instrument is not None:
+            return instrument
+        if candles_loaded:
+            raise RuntimeError(
+                "本地K线已加载，但缺少可用的合约元数据缓存，当前无法纯离线回测。"
+                "请先点“同步价格精度/下单规则”或联网同步一次后重试。"
+            )
+        raise RuntimeError("缺少可用的合约元数据缓存，当前无法纯离线回测。请先同步价格精度/下单规则。")
+
+    get_instrument = getattr(client, "get_instrument")
+    try:
+        try:
+            return get_instrument(inst_id, prefer_cached=True)
+        except TypeError as exc:
+            if "prefer_cached" not in str(exc):
+                raise
+            return get_instrument(inst_id)
+    except Exception as exc:
+        if candles_loaded:
+            raise RuntimeError(
+                "本地K线已加载，但缺少可用的合约元数据缓存，当前无法纯离线回测。"
+                f"请联网同步一次合约信息后重试。原始错误：{exc}"
+            ) from exc
+        raise
+
+
 def _load_backtest_candles(
     client: OkxRestClient,
     inst_id: str,
@@ -1508,7 +1562,32 @@ def _load_backtest_candles(
     start_ts: int | None = None,
     end_ts: int | None = None,
     preload_count: int = 0,
+    local_only: bool = False,
 ) -> list[Candle]:
+    if local_only:
+        used_range_fetcher = start_ts is not None or end_ts is not None
+        if used_range_fetcher:
+            raw_candles = load_candle_cache_range(
+                inst_id,
+                bar,
+                start_ts=0 if start_ts is None else start_ts,
+                end_ts=9999999999999 if end_ts is None else end_ts,
+                limit=None if candle_limit <= 0 else candle_limit,
+                preload_count=max(0, preload_count),
+            )
+        else:
+            raw_candles = load_candle_cache(
+                inst_id,
+                bar,
+                limit=None if candle_limit <= 0 else candle_limit,
+            )
+        candles = [candle for candle in raw_candles if candle.confirmed]
+        if not used_range_fetcher and start_ts is not None:
+            candles = [candle for candle in candles if candle.ts >= start_ts]
+        if not used_range_fetcher and end_ts is not None:
+            candles = [candle for candle in candles if candle.ts <= end_ts]
+        return candles if used_range_fetcher or candle_limit <= 0 else candles[-candle_limit:]
+
     range_fetcher = getattr(client, "get_candles_history_range", None)
     history_fetcher = getattr(client, "get_candles_history", None)
     used_range_fetcher = (start_ts is not None or end_ts is not None) and callable(range_fetcher)
@@ -2534,6 +2613,7 @@ def _run_adaptive_rail_backtest(
                 dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
                 time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                 time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+                next_dynamic_trigger_r=max(int(config.ema55_slope_lock_profit_trigger_r), 2),
                 immediate_entry_fee_rate=taker_fee_rate,
                 immediate_entry_fee_type="taker",
                 adaptive_rail_period=plan_rail_period,
@@ -2774,6 +2854,7 @@ def _run_dynamic_backtest(
                 dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
                 time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                 time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+                next_dynamic_trigger_r=max(int(config.ema55_slope_lock_profit_trigger_r), 2),
                 immediate_entry_fee_rate=taker_fee_rate,
                 immediate_entry_fee_type="taker",
             )
@@ -3507,6 +3588,7 @@ def _try_fill_dynamic_order(
     dynamic_fee_offset_enabled: bool = True,
     time_stop_break_even_enabled: bool = False,
     time_stop_break_even_bars: int = 0,
+    next_dynamic_trigger_r: int = 2,
     immediate_entry_fee_rate: Decimal = Decimal("0"),
     immediate_entry_fee_type: str = "none",
     adaptive_rail_period: int | None = None,
@@ -3556,6 +3638,7 @@ def _try_fill_dynamic_order(
         dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
         time_stop_break_even_enabled=time_stop_break_even_enabled,
         time_stop_break_even_bars=time_stop_break_even_bars,
+        next_dynamic_trigger_r=next_dynamic_trigger_r,
         apply_entry_slippage=False,
         adaptive_rail_period=adaptive_rail_period,
     )

@@ -1,5 +1,8 @@
 import http.client
+import json
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -8,6 +11,70 @@ from okx_quant.okx_client import OkxApiError, OkxOrderStatus, OkxRestClient, _ok
 
 
 class OkxClientOrderRequestTest(TestCase):
+    def test_get_instrument_prefers_local_metadata_cache_when_requested(self) -> None:
+        client = OkxRestClient()
+        payload = {
+            "version": 1,
+            "items": [
+                {
+                    "inst_id": "BTC-USDT-SWAP",
+                    "inst_type": "SWAP",
+                    "tick_size": "0.1",
+                    "lot_size": "0.01",
+                    "min_size": "0.01",
+                    "state": "live",
+                    "settle_ccy": "USDT",
+                    "ct_val": None,
+                    "ct_mult": None,
+                    "ct_val_ccy": None,
+                    "uly": "BTC-USDT",
+                    "inst_family": "BTC-USDT",
+                }
+            ],
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "instrument_metadata_cache.json"
+            cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            with patch("okx_quant.okx_client.instrument_metadata_cache_file_path", return_value=cache_path):
+                client._request = lambda *args, **kwargs: self.fail("should not call remote instruments")  # type: ignore[method-assign]
+                instrument = client.get_instrument("BTC-USDT-SWAP", prefer_cached=True)
+
+        self.assertEqual(instrument.inst_id, "BTC-USDT-SWAP")
+        self.assertEqual(instrument.tick_size, Decimal("0.1"))
+        self.assertEqual(instrument.min_size, Decimal("0.01"))
+
+    def test_get_instruments_fall_back_to_local_metadata_cache_on_network_error(self) -> None:
+        client = OkxRestClient()
+        payload = {
+            "version": 1,
+            "items": [
+                {
+                    "inst_id": "ETH-USDT-SWAP",
+                    "inst_type": "SWAP",
+                    "tick_size": "0.01",
+                    "lot_size": "0.1",
+                    "min_size": "0.1",
+                    "state": "live",
+                    "settle_ccy": "USDT",
+                    "ct_val": None,
+                    "ct_mult": None,
+                    "ct_val_ccy": None,
+                    "uly": "ETH-USDT",
+                    "inst_family": "ETH-USDT",
+                }
+            ],
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "instrument_metadata_cache.json"
+            cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            with patch("okx_quant.okx_client.instrument_metadata_cache_file_path", return_value=cache_path):
+                client._request = lambda *args, **kwargs: (_ for _ in ()).throw(OkxApiError("网络错误：timeout"))  # type: ignore[method-assign]
+                instruments = client.get_instruments("SWAP")
+
+        self.assertEqual([item.inst_id for item in instruments], ["ETH-USDT-SWAP"])
+
     def test_get_positions_prefers_ws_snapshot_when_available(self) -> None:
         client = OkxRestClient()
         client.get_cached_private_positions = lambda credentials, environment: (  # type: ignore[method-assign]

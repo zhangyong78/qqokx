@@ -105,6 +105,14 @@ function Invoke-GitUtf8([string[]]$Arguments) {
     return $stdout
 }
 
+function Get-CurrentGitBranch {
+    $branch = (Invoke-GitUtf8 @('branch', '--show-current')).Trim()
+    if ([string]::IsNullOrWhiteSpace($branch)) {
+        throw (U '\u65e0\u6cd5\u68c0\u6d4b\u5f53\u524d Git \u5206\u652f\u3002')
+    }
+    return $branch
+}
+
 $script:GitExe = Resolve-GitExecutable
 
 function Get-ChangedFiles {
@@ -261,5 +269,8 @@ if ($changedFiles.Count -gt 0) {
 if ($LASTEXITCODE -eq 0) { Write-Host (U '\u6ca1\u6709\u53ef\u63d0\u4ea4\u7684\u6587\u4ef6\u3002'); exit 0 }
 if ([string]::IsNullOrWhiteSpace($CommitMessage)) { $CommitMessage = "release: v$nextVersionText automated one-click release" }
 Invoke-GitCommand @('commit', '-m', $CommitMessage)
-if (-not $SkipPush) { Invoke-GitCommand @('push', 'origin', 'main') }
+if (-not $SkipPush) {
+    $currentBranch = Get-CurrentGitBranch
+    [void](Invoke-GitUtf8 @('push', 'origin', $currentBranch))
+}
 Write-Host "DONE v$nextVersionText"

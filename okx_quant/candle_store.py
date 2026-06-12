@@ -220,6 +220,24 @@ def get_candle_count(inst_id: str, bar: str, *, base_dir: Path | str | None = No
     return int(row[0]) if row else 0
 
 
+def get_candle_time_bounds(
+    inst_id: str,
+    bar: str,
+    *,
+    base_dir: Path | str | None = None,
+) -> tuple[int, int] | None:
+    normalized_inst_id = _normalize_inst_id(inst_id)
+    normalized_bar = _normalize_bar(bar)
+    with _connection(base_dir) as conn:
+        row = conn.execute(
+            "SELECT MIN(ts), MAX(ts) FROM candles WHERE inst_id = ? AND bar = ?",
+            (normalized_inst_id, normalized_bar),
+        ).fetchone()
+    if row is None or row[0] is None or row[1] is None:
+        return None
+    return int(row[0]), int(row[1])
+
+
 def _migration_is_current(
     conn: sqlite3.Connection,
     *,

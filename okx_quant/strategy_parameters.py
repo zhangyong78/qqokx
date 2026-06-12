@@ -177,6 +177,7 @@ STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
             "max_entries_per_trend",
             "dynamic_two_r_break_even",
             "dynamic_fee_offset_enabled",
+            "ema55_slope_lock_profit_trigger_r",
             "time_stop_break_even_enabled",
             "time_stop_break_even_bars",
             "daily_filter_enabled",

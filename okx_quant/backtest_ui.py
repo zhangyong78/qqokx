@@ -21,6 +21,12 @@ from okx_quant.backtest import (
     BacktestResult,
     BacktestTrade,
     MAX_BACKTEST_CANDLES,
+    _backtest_uses_daily_filter,
+    _backtest_uses_mtf_filter,
+    _load_backtest_candles,
+    _load_daily_filter_candles,
+    _required_backtest_preload_candles,
+    _required_mtf_filter_preload_candles,
     build_parameter_batch_configs,
     format_backtest_report,
     format_trade_exit_reason,
@@ -35,6 +41,8 @@ from okx_quant.backtest_export import (
     export_single_backtest_report,
 )
 from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_pool_profile_name
+from okx_quant.candle_continuity import bar_step_ms, find_candle_gaps_half_open_range, find_candle_gaps_in_window
+from okx_quant.candle_store import get_candle_count, get_candle_time_bounds
 from okx_quant.candle_cache_verify import CacheVerifyOutcome, verify_and_repair_cached_candles
 from okx_quant.models import Instrument, StrategyConfig, moving_average_display_label
 from okx_quant.minimum_risk_recommendations import (
@@ -121,6 +129,12 @@ BACKTEST_SYMBOL_OPTIONS = (
     "DOGE-USDT-SWAP",
 )
 BACKTEST_HISTORY_SYNC_BARS = ("5m", "15m", "1H", "4H")
+DEFAULT_HISTORY_SYNC_BAR_FLAGS = {
+    "5m": False,
+    "15m": False,
+    "1H": True,
+    "4H": True,
+}
 DEFAULT_MAKER_FEE_PERCENT = "0.015"
 DEFAULT_TAKER_FEE_PERCENT = "0.036"
 BACKTEST_SIZING_OPTIONS = {
@@ -525,6 +539,25 @@ def _reverse_lookup_label(mapping: dict[str, str], value: str, default: str) -> 
 
 def _format_backtest_candle_limit(candle_limit: int) -> str:
     return "全量" if candle_limit <= 0 else str(candle_limit)
+
+
+def _format_local_cache_range_text(bounds: tuple[int, int] | None) -> str:
+    if bounds is None:
+        return "暂无缓存"
+    start_ts, end_ts = bounds
+    return f"{_format_chart_timestamp(start_ts)} -> {_format_chart_timestamp(end_ts)}"
+
+
+def _format_gap_window(start_ts: int, end_exclusive_ts: int, step_ms: int) -> str:
+    end_ts = max(start_ts, end_exclusive_ts - step_ms)
+    return f"{_format_chart_timestamp(start_ts)} -> {_format_chart_timestamp(end_ts)}"
+
+
+def _first_gap_summary(gaps: list[tuple[int, int, int]], step_ms: int) -> str:
+    if not gaps:
+        return ""
+    gap_start, gap_end_exclusive, missing_count = gaps[0]
+    return f"{_format_gap_window(gap_start, gap_end_exclusive, step_ms)}（缺 {missing_count} 根）"
 
 
 def _build_backtest_symbol_options(current_symbol: str) -> tuple[str, ...]:
@@ -1805,6 +1838,10 @@ class BacktestWindow:
         self.trigger_type_label = StringVar(value=initial_state.trigger_type_label)
         self.environment_label = StringVar(value=initial_state.environment_label)
         self.candle_limit = StringVar(value=initial_state.candle_limit)
+        self.pure_local_backtest = BooleanVar(value=True)
+        self.sync_history_bar_vars = {
+            bar: BooleanVar(value=DEFAULT_HISTORY_SYNC_BAR_FLAGS.get(bar, False)) for bar in BACKTEST_HISTORY_SYNC_BARS
+        }
         self.backtest_profile_id = StringVar(value=initial_state.backtest_profile_id)
         self.backtest_profile_name = StringVar(value=initial_state.backtest_profile_name)
         self.backtest_profile_summary = StringVar(value=initial_state.backtest_profile_summary)
@@ -1813,6 +1850,7 @@ class BacktestWindow:
         self._strategy_parameter_drafts = load_strategy_parameter_drafts()
         self._strategy_parameter_scope = "backtest"
         self._last_strategy_parameter_strategy_id: str | None = None
+        self.local_data_status = StringVar(value="本地数据：等待选择标的与周期。")
         self.history_sync_status = StringVar(
             value="填 0 = 全量；填 10000 = 最新往前 10000 根。可先点“同步历史数据”下载 5 个币种的 5m / 15m / 1H / 4H 全量缓存；点“校验数据”检查连续性并尝试补洞。"
         )
@@ -1859,18 +1897,29 @@ class BacktestWindow:
         self._backtest_hint_instrument_cache: dict[str, Instrument] = {}
         self._backtest_hint_fetching_symbols: set[str] = set()
         self._backtest_hint_after_id: str | None = None
+        self._local_data_status_after_id: str | None = None
 
         self.strategy_name.trace_add("write", self._schedule_backtest_minimum_order_hint_update)
         self.symbol.trace_add("write", self._schedule_backtest_minimum_order_hint_update)
         self.signal_mode_label.trace_add("write", self._schedule_backtest_minimum_order_hint_update)
         self.risk_amount.trace_add("write", self._schedule_backtest_minimum_order_hint_update)
         self.sizing_mode_label.trace_add("write", self._schedule_backtest_minimum_order_hint_update)
+        self.symbol.trace_add("write", self._schedule_local_data_status_update)
+        self.bar_label.trace_add("write", self._schedule_local_data_status_update)
+        self.start_time_text.trace_add("write", self._schedule_local_data_status_update)
+        self.end_time_text.trace_add("write", self._schedule_local_data_status_update)
+        self.candle_limit.trace_add("write", self._schedule_local_data_status_update)
+        self.pure_local_backtest.trace_add("write", self._schedule_local_data_status_update)
 
         self._build_layout()
         self._update_batch_layer_controls("none", [])
         self._apply_selected_strategy_definition()
         self._update_sizing_mode_widgets()
         self._update_backtest_minimum_order_hint()
+        self.history_sync_status.set(
+            "先勾选要同步的周期。默认只同步 1H / 4H；打开“纯本地回测”后只使用本地缓存，缺数据会直接提示。"
+        )
+        self._update_local_data_status()
 
     @staticmethod
     def _widget_exists(widget: object) -> bool:
@@ -1891,6 +1940,12 @@ class BacktestWindow:
             except Exception:
                 pass
             self._chart_redraw_job = None
+        if self._local_data_status_after_id is not None and self._widget_exists(self.window):
+            try:
+                self.window.after_cancel(self._local_data_status_after_id)
+            except Exception:
+                pass
+            self._local_data_status_after_id = None
         if self._widget_exists(self.window):
             for job_map in (self._chart_canvas_redraw_jobs, self._chart_canvas_finalize_jobs):
                 for job in list(job_map.values()):
@@ -2762,15 +2817,33 @@ class BacktestWindow:
         )
         self._candle_limit_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
         self._bind_responsive_wrap(self._candle_limit_hint_label, controls, padding=48, min_wrap=280)
+        ttk.Checkbutton(controls, text="纯本地回测（不补拉）", variable=self.pure_local_backtest).grid(
+            row=row, column=4, columnspan=2, sticky="w", pady=(12, 0)
+        )
+        row += 1
+        self._local_data_status_label = ttk.Label(controls, textvariable=self.local_data_status, justify="left")
+        self._local_data_status_label.grid(row=row, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        self._bind_responsive_wrap(self._local_data_status_label, controls, padding=48, min_wrap=360)
         row += 1
         actions_bar = ttk.Frame(controls)
         actions_bar.grid(row=row, column=0, columnspan=6, sticky="ew", pady=(10, 0))
         actions_bar.columnconfigure(0, weight=1)
         history_btn_frame = ttk.Frame(actions_bar)
         history_btn_frame.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Label(history_btn_frame, text="同步周期").pack(side=LEFT)
+        for bar in BACKTEST_HISTORY_SYNC_BARS:
+            ttk.Checkbutton(history_btn_frame, text=bar, variable=self.sync_history_bar_vars[bar]).pack(
+                side=LEFT, padx=(6, 0)
+            )
         self.sync_history_button = ttk.Button(history_btn_frame, text="同步历史数据", command=self.sync_history_data)
+        self.sync_metadata_button = ttk.Button(
+            history_btn_frame,
+            text="同步价格精度/下单规则",
+            command=self.sync_instrument_metadata,
+        )
         self.verify_cache_button = ttk.Button(history_btn_frame, text="校验数据", command=self.verify_history_cache_data)
-        self.sync_history_button.pack(side=LEFT, padx=(0, 6))
+        self.sync_history_button.pack(side=LEFT, padx=(10, 6))
+        self.sync_metadata_button.pack(side=LEFT, padx=(0, 6))
         self.verify_cache_button.pack(side=LEFT)
         run_btn_frame = ttk.Frame(actions_bar)
         run_btn_frame.grid(row=0, column=1, sticky="e")
@@ -3293,6 +3366,180 @@ class BacktestWindow:
             )
         )
 
+    def _selected_history_sync_bars(self) -> list[str]:
+        return [bar for bar in BACKTEST_HISTORY_SYNC_BARS if self.sync_history_bar_vars[bar].get()]
+
+    def _schedule_local_data_status_update(self, *_: str) -> None:
+        if not self._ui_alive():
+            return
+        if self._local_data_status_after_id is not None:
+            try:
+                self.window.after_cancel(self._local_data_status_after_id)
+            except Exception:
+                pass
+        self._local_data_status_after_id = self.window.after(120, self._update_local_data_status)
+
+    def _update_local_data_status(self) -> None:
+        self._local_data_status_after_id = None
+        inst_id = self.symbol.get().strip().upper()
+        bar = _backtest_bar_value_from_label(self.bar_label.get())
+        if not inst_id:
+            self.local_data_status.set("本地数据：等待选择标的与周期。")
+            return
+        count = get_candle_count(inst_id, bar)
+        bounds = get_candle_time_bounds(inst_id, bar)
+        if count <= 0 or bounds is None:
+            self.local_data_status.set(
+                f"本地数据：{inst_id} {bar} 暂无缓存。可先勾选周期后点“同步历史数据”，需要离线回测时再点“同步价格精度/下单规则”。"
+            )
+            return
+        prefix = "纯本地" if self.pure_local_backtest.get() else "本地优先"
+        self.local_data_status.set(
+            f"{prefix}数据：{inst_id} {bar} 共 {count} 根，覆盖 {_format_local_cache_range_text(bounds)}。"
+        )
+
+    def _validate_local_candle_dataset(
+        self,
+        *,
+        candles: list[object],
+        inst_id: str,
+        bar: str,
+        purpose: str,
+        candle_limit: int,
+        start_ts: int | None,
+        end_ts: int | None,
+    ) -> None:
+        if not candles:
+            raise ValueError(f"{purpose}缺少本地缓存：{inst_id} {bar}。请先同步对应周期数据。")
+        step_ms = bar_step_ms(bar)
+        if start_ts is not None or end_ts is not None:
+            window_start = start_ts if start_ts is not None else candles[0].ts
+            window_end = end_ts if end_ts is not None else candles[-1].ts
+            in_range = [candle for candle in candles if window_start <= candle.ts <= window_end]
+            if not in_range:
+                raise ValueError(
+                    f"{purpose}本地缓存未覆盖请求区间：{inst_id} {bar}，当前仅有 {_format_local_cache_range_text((candles[0].ts, candles[-1].ts))}。"
+                )
+            gaps, _warnings = find_candle_gaps_in_window(
+                in_range,
+                window_start_ms=window_start,
+                window_end_ms_inclusive=window_end,
+                step_ms=step_ms,
+            )
+            if gaps:
+                raise ValueError(
+                    f"{purpose}存在本地缺口：{inst_id} {bar}，首段缺口 {_first_gap_summary(gaps, step_ms)}。"
+                )
+            return
+        if candle_limit > 0 and len(candles) < candle_limit:
+            raise ValueError(
+                f"{purpose}本地缓存不足：{inst_id} {bar} 仅有 {len(candles)} 根，少于请求的 {candle_limit} 根；"
+                f"当前覆盖 {_format_local_cache_range_text((candles[0].ts, candles[-1].ts))}。"
+            )
+        gaps, _warnings = find_candle_gaps_half_open_range(
+            candles,
+            start_ms=candles[0].ts,
+            end_exclusive_ms=candles[-1].ts + step_ms,
+            step_ms=step_ms,
+        )
+        if gaps:
+            raise ValueError(f"{purpose}存在本地缺口：{inst_id} {bar}，首段缺口 {_first_gap_summary(gaps, step_ms)}。")
+
+    def _preflight_pure_local_backtest(
+        self,
+        config: StrategyConfig,
+        candle_limit: int,
+        start_ts: int | None,
+        end_ts: int | None,
+    ) -> None:
+        cached_instrument_getter = getattr(self.client, "get_cached_instrument", None)
+        if callable(cached_instrument_getter) and cached_instrument_getter(config.inst_id) is None:
+            raise ValueError(f"缺少合约元数据缓存：{config.inst_id}。请先点“同步价格精度/下单规则”。")
+
+        preload_count = _required_backtest_preload_candles(config)
+        primary_candles = _load_backtest_candles(
+            self.client,
+            config.inst_id,
+            config.bar,
+            candle_limit,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            preload_count=preload_count,
+            local_only=True,
+        )
+        self._validate_local_candle_dataset(
+            candles=primary_candles,
+            inst_id=config.inst_id,
+            bar=config.bar,
+            purpose="主回测K线",
+            candle_limit=candle_limit,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+
+        if _backtest_uses_mtf_filter(config.strategy_id):
+            filter_limit = min(MAX_BACKTEST_CANDLES, max(800, candle_limit if candle_limit > 0 else len(primary_candles)))
+            filter_candles = _load_backtest_candles(
+                self.client,
+                config.resolved_mtf_filter_inst_id(),
+                config.resolved_mtf_filter_bar(),
+                filter_limit,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                preload_count=_required_mtf_filter_preload_candles(config),
+                local_only=True,
+            )
+            self._validate_local_candle_dataset(
+                candles=filter_candles,
+                inst_id=config.resolved_mtf_filter_inst_id(),
+                bar=config.resolved_mtf_filter_bar(),
+                purpose="多周期过滤K线",
+                candle_limit=filter_limit,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+
+        if (
+            strategy_is_cross_family(config.strategy_id)
+            and int(config.cross_higher_tf_ref_ema_period) > 0
+            and (config.cross_higher_tf_inst_id or "").strip()
+            and (config.cross_higher_tf_bar or "").strip()
+        ):
+            hi_inst_id = (config.cross_higher_tf_inst_id or config.inst_id).strip()
+            hi_bar = (config.cross_higher_tf_bar or "").strip()
+            hi_limit = min(MAX_BACKTEST_CANDLES, max(800, len(primary_candles) // 4 + 400))
+            hi_candles = _load_backtest_candles(
+                self.client,
+                hi_inst_id,
+                hi_bar,
+                hi_limit,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                preload_count=max(0, int(config.cross_higher_tf_ref_ema_period) + 5),
+                local_only=True,
+            )
+            self._validate_local_candle_dataset(
+                candles=hi_candles,
+                inst_id=hi_inst_id,
+                bar=hi_bar,
+                purpose="高周期方向过滤K线",
+                candle_limit=hi_limit,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+
+        if _backtest_uses_daily_filter(config) and primary_candles:
+            daily_candles = _load_daily_filter_candles(
+                self.client,
+                config,
+                entry_candles=primary_candles,
+                local_only=True,
+            )
+            if len(daily_candles) < max(int(config.daily_filter_period), 1):
+                raise ValueError(
+                    f"日线过滤本地缓存不足：{config.resolved_daily_filter_inst_id()} {config.resolved_daily_filter_bar()}。"
+                )
+
     def start_backtest(self) -> None:
         try:
             config = self._build_config()
@@ -3388,28 +3635,44 @@ class BacktestWindow:
         if self._backtest_running or self._history_ui_busy():
             return
         try:
-            config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts = self._build_backtest_request()
+            config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts, local_only = self._build_backtest_request()
+            if local_only:
+                self._preflight_pure_local_backtest(config, candle_limit, start_ts, end_ts)
             raw_batch_count = len(build_parameter_batch_configs(config))
         except Exception as exc:
             messagebox.showerror("回测参数错误", str(exc), parent=self.window)
             return
         if raw_batch_count <= 1:
-            self._prepare_backtest_output("正在单组回测，请稍候...")
+            self._prepare_backtest_output("正在单组回测，请稍候..." if not local_only else "正在纯本地单组回测，请稍候...")
             self._set_backtest_running(True)
             threading.Thread(
                 target=self._run_backtest_worker,
-                args=(config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts),
+                args=(config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts, local_only),
                 daemon=True,
             ).start()
             return
 
-        summary_text = f"正在准备批量回测：原始矩阵 {raw_batch_count} 组，正在排除无效组合，请稍候..."
+        summary_text = (
+            f"正在准备批量回测：原始矩阵 {raw_batch_count} 组，正在排除无效组合，请稍候..."
+            if not local_only
+            else f"正在准备纯本地批量回测：原始矩阵 {raw_batch_count} 组，正在排除无效组合，请稍候..."
+        )
         self._prepare_backtest_output(summary_text)
         self._set_backtest_running(True)
         batch_label = self._next_batch_label()
         threading.Thread(
             target=self._run_batch_backtest_worker,
-            args=(config, candle_limit, batch_label, raw_batch_count, maker_fee_rate, taker_fee_rate, start_ts, end_ts),
+            args=(
+                config,
+                candle_limit,
+                batch_label,
+                raw_batch_count,
+                maker_fee_rate,
+                taker_fee_rate,
+                start_ts,
+                end_ts,
+                local_only,
+            ),
             daemon=True,
         ).start()
 
@@ -3417,20 +3680,24 @@ class BacktestWindow:
         if self._backtest_running or self._history_ui_busy():
             return
         try:
-            config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts = self._build_backtest_request()
+            config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts, local_only = self._build_backtest_request()
+            if local_only:
+                self._preflight_pure_local_backtest(config, candle_limit, start_ts, end_ts)
         except Exception as exc:
             messagebox.showerror("回测参数错误", str(exc), parent=self.window)
             return
 
-        self._prepare_backtest_output("\u6b63\u5728\u5355\u7ec4\u56de\u6d4b\uff0c\u8bf7\u7a0d\u5019...")
+        self._prepare_backtest_output("正在单组回测，请稍候..." if not local_only else "正在纯本地单组回测，请稍候...")
         self._set_backtest_running(True)
         threading.Thread(
             target=self._run_backtest_worker,
-            args=(config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts),
+            args=(config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts, local_only),
             daemon=True,
         ).start()
 
-    def _build_backtest_request(self) -> tuple[StrategyConfig, int, Decimal, Decimal, int | None, int | None]:
+    def _build_backtest_request(
+        self,
+    ) -> tuple[StrategyConfig, int, Decimal, Decimal, int | None, int | None, bool]:
         start_ts = self._parse_optional_datetime(self.start_time_text.get(), "开始时间", end_of_day=False)
         end_ts = self._parse_optional_datetime(self.end_time_text.get(), "结束时间", end_of_day=True)
         if start_ts is not None and end_ts is not None and start_ts > end_ts:
@@ -3443,6 +3710,7 @@ class BacktestWindow:
             self._parse_fee_percent(self.taker_fee_percent.get(), "Taker手续费"),
             start_ts,
             end_ts,
+            bool(self.pure_local_backtest.get()),
         )
 
     def _prepare_backtest_output(self, summary_text: str) -> None:
@@ -3633,15 +3901,21 @@ class BacktestWindow:
             self.batch_backtest_button.configure(state=state)
         if self._widget_exists(getattr(self, "sync_history_button", None)):
             self.sync_history_button.configure(state=state)
+        if self._widget_exists(getattr(self, "sync_metadata_button", None)):
+            self.sync_metadata_button.configure(state=state)
         if self._widget_exists(getattr(self, "verify_cache_button", None)):
             self.verify_cache_button.configure(state=state)
 
     def sync_history_data(self) -> None:
         if self._backtest_running or self._history_ui_busy():
             return
-        tasks = [(symbol, bar) for symbol in BACKTEST_SYMBOL_OPTIONS for bar in BACKTEST_HISTORY_SYNC_BARS]
+        selected_bars = self._selected_history_sync_bars()
+        if not selected_bars:
+            messagebox.showinfo("同步历史数据", "请至少勾选一个要同步的周期。", parent=self.window)
+            return
+        tasks = [(symbol, bar) for symbol in BACKTEST_SYMBOL_OPTIONS for bar in selected_bars]
         self.history_sync_status.set(
-            f"正在同步历史数据（0/{len(tasks)}）：5 个币种 x 4 个周期，全量缓存下载中，请稍候..."
+            f"正在同步历史数据（0/{len(tasks)}）：5 个币种 × {len(selected_bars)} 个周期（{' / '.join(selected_bars)}），全量缓存下载中，请稍候..."
         )
         self._set_history_sync_running(True)
         threading.Thread(
@@ -3653,9 +3927,13 @@ class BacktestWindow:
     def verify_history_cache_data(self) -> None:
         if self._backtest_running or self._history_ui_busy():
             return
-        tasks = [(symbol, bar) for symbol in BACKTEST_SYMBOL_OPTIONS for bar in BACKTEST_HISTORY_SYNC_BARS]
+        selected_bars = self._selected_history_sync_bars()
+        if not selected_bars:
+            messagebox.showinfo("校验数据", "请至少勾选一个要校验的周期。", parent=self.window)
+            return
+        tasks = [(symbol, bar) for symbol in BACKTEST_SYMBOL_OPTIONS for bar in selected_bars]
         self.history_sync_status.set(
-            f"正在校验本地缓存（0/{len(tasks)}）：5 个币种 × 4 周期（5m/15m/1H/4H），检查连续性并尝试补洞…"
+            f"正在校验本地缓存（0/{len(tasks)}）：5 个币种 × {len(selected_bars)} 个周期（{' / '.join(selected_bars)}），检查连续性并尝试补洞…"
         )
         self._set_history_verify_running(True)
         threading.Thread(
@@ -3663,6 +3941,51 @@ class BacktestWindow:
             args=(tasks,),
             daemon=True,
         ).start()
+
+    def sync_instrument_metadata(self) -> None:
+        if self._backtest_running or self._history_ui_busy():
+            return
+        symbols = list(BACKTEST_SYMBOL_OPTIONS)
+        self.history_sync_status.set(
+            f"正在同步价格精度/下单规则（0/{len(symbols)}）：5 个回测币种的价格精度与最小下单单位缓存中，请稍候..."
+        )
+        self._set_history_sync_running(True)
+        threading.Thread(target=self._run_instrument_metadata_sync_worker, args=(symbols,), daemon=True).start()
+
+    def _run_instrument_metadata_sync_worker(self, symbols: list[str]) -> None:
+        results: list[tuple[str, str | None]] = []
+        try:
+            total = len(symbols)
+            for index, symbol in enumerate(symbols, start=1):
+                if self._ui_alive():
+                    progress_text = f"正在同步价格精度/下单规则（{index}/{total}）：{symbol}"
+                    self.window.after(0, lambda text=progress_text: self.history_sync_status.set(text))
+                try:
+                    self.client.get_instrument(symbol)
+                    results.append((symbol, None))
+                except Exception as exc:
+                    results.append((symbol, str(exc)))
+            if self._ui_alive():
+                self.window.after(0, lambda: self._apply_instrument_metadata_sync_results(results))
+        except Exception as exc:
+            if self._ui_alive():
+                self.window.after(0, lambda error=exc: self._show_history_sync_error(error))
+
+    def _apply_instrument_metadata_sync_results(self, results: list[tuple[str, str | None]]) -> None:
+        if not self._ui_alive():
+            return
+        self._set_history_sync_running(False)
+        success = [symbol for symbol, error in results if error is None]
+        failed = [(symbol, error) for symbol, error in results if error is not None]
+        self.history_sync_status.set(f"价格精度/下单规则同步完成：成功 {len(success)} 个，失败 {len(failed)} 个。")
+        self._update_local_data_status()
+        lines = [f"本次共同步 {len(results)} 个回测币种的合约信息：成功 {len(success)} 个，失败 {len(failed)} 个。", ""]
+        lines.extend([f"{symbol} | 成功" for symbol in success])
+        lines.extend([f"{symbol} | 失败：{error}" for symbol, error in failed])
+        if failed:
+            messagebox.showwarning("同步价格精度/下单规则", "\n".join(lines), parent=self.window)
+        else:
+            messagebox.showinfo("同步价格精度/下单规则", "\n".join(lines), parent=self.window)
 
     def _run_history_verify_worker(self, tasks: list[tuple[str, str]]) -> None:
         results: list[CacheVerifyOutcome] = []
@@ -3706,6 +4029,7 @@ class BacktestWindow:
         if not self._ui_alive():
             return
         self._set_history_verify_running(False)
+        self._update_local_data_status()
         ok_n = sum(1 for item in results if item.ok and not item.error)
         bad_n = len(results) - ok_n
         total_fetched = sum(item.range_fetch_calls for item in results)
@@ -3811,6 +4135,7 @@ class BacktestWindow:
         if not self._ui_alive():
             return
         self._set_history_sync_running(False)
+        self._update_local_data_status()
         success = [(symbol, bar, count) for symbol, bar, count, error in results if not error]
         failed = [(symbol, bar, error or "未知错误") for symbol, bar, _, error in results if error]
         total_candles = sum(count for _, _, count in success)
@@ -3850,6 +4175,7 @@ class BacktestWindow:
         taker_fee_rate: Decimal,
         start_ts: int | None,
         end_ts: int | None,
+        local_only: bool,
     ) -> None:
         try:
             results = run_backtest_batch(
@@ -3860,6 +4186,7 @@ class BacktestWindow:
                 end_ts=end_ts,
                 maker_fee_rate=maker_fee_rate,
                 taker_fee_rate=taker_fee_rate,
+                local_only=local_only,
             )
             if self._ui_alive():
                 self.window.after(
@@ -3883,6 +4210,7 @@ class BacktestWindow:
         taker_fee_rate: Decimal,
         start_ts: int | None,
         end_ts: int | None,
+        local_only: bool,
     ) -> None:
         try:
             result = run_backtest(
@@ -3893,6 +4221,7 @@ class BacktestWindow:
                 end_ts=end_ts,
                 maker_fee_rate=maker_fee_rate,
                 taker_fee_rate=taker_fee_rate,
+                local_only=local_only,
             )
             if self._ui_alive():
                 self.window.after(0, lambda: self._apply_backtest_result(result, config, candle_limit))

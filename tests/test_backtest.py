@@ -86,6 +86,7 @@ from okx_quant.backtest_ui import (
 from okx_quant.indicators import atr, ema
 from okx_quant.backtest import BacktestManualPosition, BacktestOpenPosition, BacktestReport, BacktestResult, BacktestTrade
 from okx_quant.models import Candle, Instrument, OrderPlan, SignalDecision, StrategyConfig
+from okx_quant.okx_client import OkxApiError
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
@@ -164,6 +165,79 @@ class BacktestTest(TestCase):
     def test_backtest_default_fee_percents(self) -> None:
         self.assertEqual(DEFAULT_MAKER_FEE_PERCENT, "0.015")
         self.assertEqual(DEFAULT_TAKER_FEE_PERCENT, "0.036")
+
+    def test_run_backtest_relabels_missing_offline_instrument_metadata(self) -> None:
+        candles = [
+            Candle(
+                1711929600000 + (index * 900000),
+                Decimal("100"),
+                Decimal("101"),
+                Decimal("99"),
+                Decimal("100"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(260)
+        ]
+
+        class _OfflineInstrumentClient:
+            def __init__(self, source: list[Candle]) -> None:
+                self._candles = source
+
+            def get_candles_history(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
+                returned = list(self._candles) if limit <= 0 else self._candles[-limit:]
+                self.last_candle_history_stats = {
+                    "cache_hit_count": len(returned),
+                    "latest_fetch_count": 0,
+                    "older_fetch_count": 0,
+                    "requested_count": 0 if limit <= 0 else limit,
+                    "returned_count": len(returned),
+                    "full_history": limit <= 0,
+                }
+                return returned
+
+            def get_instrument(self, inst_id: str) -> Instrument:
+                raise OkxApiError("网络错误：timed out")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            run_backtest(_OfflineInstrumentClient(candles), self._build_config(), candle_limit=220)
+
+        self.assertIn("本地K线已加载", str(ctx.exception))
+        self.assertIn("合约元数据缓存", str(ctx.exception))
+
+    def test_run_backtest_local_only_uses_cached_candles_and_metadata(self) -> None:
+        candles = [
+            Candle(
+                1711929600000 + (index * 900000),
+                Decimal("100"),
+                Decimal("101"),
+                Decimal("99"),
+                Decimal(str(100 + (index % 5))),
+                Decimal("1"),
+                True,
+            )
+            for index in range(260)
+        ]
+        instrument = self._build_instrument()
+
+        class _LocalOnlyClient:
+            def get_cached_instrument(self, inst_id: str) -> Instrument | None:
+                return instrument if inst_id == instrument.inst_id else None
+
+            def get_instrument(self, inst_id: str) -> Instrument:
+                raise AssertionError("should not call remote instrument lookup in local-only mode")
+
+            def get_candles_history(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
+                raise AssertionError("should not call remote candle history in local-only mode")
+
+            def get_candles_history_range(self, **kwargs):  # noqa: ANN003
+                raise AssertionError("should not call remote range history in local-only mode")
+
+        with patch("okx_quant.backtest.load_candle_cache", return_value=candles):
+            result = run_backtest(_LocalOnlyClient(), self._build_config(), candle_limit=220, local_only=True)
+
+        self.assertEqual(result.instrument, instrument)
+        self.assertEqual(len(result.candles), 220)
 
     def test_mtf_filter_bias_uses_latest_closed_filter_candle_by_time(self) -> None:
         entry_candles = [
