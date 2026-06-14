@@ -14,7 +14,7 @@ from okx_quant.backtest_audit import (
 )
 from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_pool_profile_name
 from okx_quant.minimum_risk_recommendations import format_risk_recommendation, recommended_minimum_risk_amount_for_config
-from okx_quant.models import StrategyConfig, moving_average_display_label
+from okx_quant.models import StrategyConfig, describe_dynamic_protection_rules, moving_average_display_label
 from okx_quant.persistence import backtest_report_export_dir_path
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import (
@@ -69,6 +69,30 @@ def _uses_dynamic_break_even_trigger_r(config: StrategyConfig) -> bool:
         config.strategy_id,
         "ema55_slope_lock_profit_trigger_r",
     )
+
+
+def _dynamic_protection_summary_parts(config: StrategyConfig) -> tuple[str, ...]:
+    rules = config.resolved_dynamic_protection_rules()
+    if rules:
+        return describe_dynamic_protection_rules(
+            rules,
+            fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+        )
+    parts: list[str] = []
+    if _uses_dynamic_break_even_trigger_r(config):
+        parts.extend(
+            (
+                f"保本触发R{max(int(config.dynamic_break_even_trigger_r), 1)}",
+                f"移动止盈触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
+                f"首档锁盈R{max(int(config.dynamic_first_lock_r), 0) if int(config.dynamic_first_lock_r) > 0 else '自动'}",
+                f"移动步长R{max(int(config.dynamic_trailing_step_r), 1)}",
+                f"首档触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
+                f"nR保本{config.dynamic_two_r_break_even_label()}",
+            )
+        )
+    else:
+        parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
+    return tuple(parts)
 
 
 def export_single_backtest_report(
@@ -503,11 +527,7 @@ def _build_batch_scope_line(
         )
     if batch_mode == "dynamic_entries":
         config = results[0][0]
-        break_even_text = (
-            f"nR保本 = {config.dynamic_two_r_break_even_label()}；首档触发R = {max(int(config.ema55_slope_lock_profit_trigger_r), 2)}；"
-            if _uses_dynamic_break_even_trigger_r(config)
-            else f"2R保本 = {config.dynamic_two_r_break_even_label()}；"
-        )
+        break_even_text = "；".join(_dynamic_protection_summary_parts(config)) + "；"
         return (
             "参数范围：动态止盈；"
             f"挂单参考线 = {_config_reference_label(results[0][0])}；"
@@ -717,18 +737,13 @@ def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
         parts.insert(2, f"挂单参考线{_config_reference_label(config)}")
         parts.append(f"止盈方式{'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}")
         if config.take_profit_mode == "dynamic":
-            if _uses_dynamic_break_even_trigger_r(config):
-                parts.append(f"首档触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}")
-                parts.append(f"nR保本{config.dynamic_two_r_break_even_label()}")
-            else:
-                parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
+            parts.extend(_dynamic_protection_summary_parts(config))
             parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
         parts.append(f"每波最多开仓次数{_format_max_entries_label(config.max_entries_per_trend)}")
     if config.strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
         parts.append(f"止盈方式{'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}")
         if config.take_profit_mode == "dynamic":
-            parts.append(f"动态止盈首档{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}R")
-            parts.append(f"nR保本{config.dynamic_two_r_break_even_label()}")
+            parts.extend(_dynamic_protection_summary_parts(config))
             parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
     parts.extend(
         [

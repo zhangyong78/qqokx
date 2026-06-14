@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import json
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -11,6 +12,11 @@ from okx_quant.strategy_runtime_registry import (
     strategy_preferred_direction,
 )
 from okx_quant.strategy_catalog import supports_startup_chase_current_signal
+from okx_quant.models import (
+    describe_dynamic_protection_rules,
+    dynamic_protection_rules_to_payload,
+    normalize_dynamic_protection_rules,
+)
 from okx_quant.strategy_parameters import strategy_uses_parameter
 from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
 
@@ -171,7 +177,15 @@ class UiStrategySessionsMixin:
         self.daily_filter_period.set(str(record.config.daily_filter_period))
         self.ema55_slope_exit_enabled.set(bool(record.config.ema55_slope_exit_enabled))
         self.dynamic_two_r_break_even.set(record.config.dynamic_two_r_break_even)
+        self.dynamic_break_even_trigger_r.set(str(max(int(record.config.dynamic_break_even_trigger_r), 1)))
         self.ema55_slope_lock_profit_trigger_r.set(str(max(int(record.config.ema55_slope_lock_profit_trigger_r), 2)))
+        self.dynamic_first_lock_r.set(str(max(int(record.config.dynamic_first_lock_r), 0)))
+        self.dynamic_trailing_step_r.set(str(max(int(record.config.dynamic_trailing_step_r), 1)))
+        self.dynamic_protection_rules_json.set(
+            json.dumps(dynamic_protection_rules_to_payload(record.config.resolved_dynamic_protection_rules()), ensure_ascii=False)
+        )
+        if hasattr(self, "_rebuild_dynamic_protection_rule_editor"):
+            self._rebuild_dynamic_protection_rule_editor()
         self.dynamic_fee_offset_enabled.set(record.config.dynamic_fee_offset_enabled)
         self.time_stop_break_even_enabled.set(record.config.time_stop_break_even_enabled)
         self.time_stop_break_even_bars.set(str(record.config.time_stop_break_even_bars))
@@ -4371,6 +4385,8 @@ class UiStrategySessionsMixin:
             self._dynamic_two_r_break_even_check.grid()
             self._ema55_slope_lock_profit_trigger_r_label.grid()
             self._ema55_slope_lock_profit_trigger_r_entry.grid()
+            self._dynamic_first_lock_r_label.grid()
+            self._dynamic_first_lock_r_entry.grid()
             self._dynamic_fee_offset_check.grid()
             self._dynamic_fee_offset_hint_label.grid()
             self._time_stop_break_even_check.grid()
@@ -4384,6 +4400,8 @@ class UiStrategySessionsMixin:
             self._dynamic_two_r_break_even_check.grid_remove()
             self._ema55_slope_lock_profit_trigger_r_label.grid_remove()
             self._ema55_slope_lock_profit_trigger_r_entry.grid_remove()
+            self._dynamic_first_lock_r_label.grid_remove()
+            self._dynamic_first_lock_r_entry.grid_remove()
             self._dynamic_fee_offset_check.grid_remove()
             self._dynamic_fee_offset_hint_label.grid_remove()
             self._time_stop_break_even_check.grid_remove()
@@ -4614,12 +4632,22 @@ class UiStrategySessionsMixin:
             definition.strategy_id,
             "ema55_slope_lock_profit_trigger_r",
         )
+        uses_first_lock_r = strategy_uses_parameter(
+            definition.strategy_id,
+            "dynamic_first_lock_r",
+        )
         self._dynamic_two_r_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self._ema55_slope_lock_profit_trigger_r_label.configure(
             state="normal" if dynamic_take_profit and uses_dynamic_trigger_r else "disabled"
         )
         self._ema55_slope_lock_profit_trigger_r_entry.configure(
             state="normal" if dynamic_take_profit and uses_dynamic_trigger_r else "disabled"
+        )
+        self._dynamic_first_lock_r_label.configure(
+            state="normal" if dynamic_take_profit and uses_first_lock_r else "disabled"
+        )
+        self._dynamic_first_lock_r_entry.configure(
+            state="normal" if dynamic_take_profit and uses_first_lock_r else "disabled"
         )
         self._dynamic_fee_offset_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self._time_stop_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
@@ -4977,12 +5005,30 @@ class UiStrategySessionsMixin:
             ema55_slope_exit_enabled=bool(self.ema55_slope_exit_enabled.get())
             if strategy_uses_parameter(strategy_id, "ema55_slope_exit_enabled")
             else True,
+            dynamic_break_even_trigger_r=max(
+                self._parse_positive_int(self.dynamic_break_even_trigger_r.get() or "2", "保本触发R"),
+                1,
+            )
+            if strategy_uses_parameter(strategy_id, "dynamic_break_even_trigger_r")
+            else 2,
             ema55_slope_lock_profit_trigger_r=max(
-                self._parse_positive_int(self.ema55_slope_lock_profit_trigger_r.get() or "5", "首档触发R"),
+                self._parse_positive_int(self.ema55_slope_lock_profit_trigger_r.get() or "5", "移动止盈触发R"),
                 2,
             )
             if strategy_uses_parameter(strategy_id, "ema55_slope_lock_profit_trigger_r")
             else 2,
+            dynamic_first_lock_r=max(
+                self._parse_nonnegative_int(self.dynamic_first_lock_r.get() or "0", "首档锁盈R"),
+                0,
+            )
+            if strategy_uses_parameter(strategy_id, "dynamic_first_lock_r")
+            else 0,
+            dynamic_trailing_step_r=max(
+                self._parse_positive_int(self.dynamic_trailing_step_r.get() or "1", "移动步长R"),
+                1,
+            )
+            if strategy_uses_parameter(strategy_id, "dynamic_trailing_step_r")
+            else 1,
             dynamic_two_r_break_even=self.dynamic_two_r_break_even.get()
             if strategy_supports_dynamic_take_profit(strategy_id)
             else False,
@@ -6424,9 +6470,23 @@ class UiStrategySessionsMixin:
             "take_profit_mode",
             "dynamic",
         ) == "dynamic":
+            rules = normalize_dynamic_protection_rules(snapshot.get("dynamic_protection_rules"))
             parameter_rows.extend(
                 [
                     (
+                        "动态保护规则："
+                        + " / ".join(
+                            describe_dynamic_protection_rules(
+                                rules,
+                                fee_offset_enabled=bool(snapshot.get("dynamic_fee_offset_enabled", True)),
+                            )
+                        )
+                    )
+                    if rules
+                    else (
+                        f"保本触发R：{max(int(snapshot.get('dynamic_break_even_trigger_r', 2) or 2), 1)} / "
+                        f"移动止盈触发R：{max(int(snapshot.get('ema55_slope_lock_profit_trigger_r', 2) or 2), 2)} / "
+                        f"移动步长R：{max(int(snapshot.get('dynamic_trailing_step_r', 1) or 1), 1)} / "
                         f"首档触发R：{max(int(snapshot.get('ema55_slope_lock_profit_trigger_r', 2) or 2), 2)} / "
                         f"nR保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}"
                     )

@@ -85,7 +85,15 @@ from okx_quant.backtest_ui import (
 )
 from okx_quant.indicators import atr, ema
 from okx_quant.backtest import BacktestManualPosition, BacktestOpenPosition, BacktestReport, BacktestResult, BacktestTrade
-from okx_quant.models import Candle, Instrument, OrderPlan, SignalDecision, StrategyConfig
+from okx_quant.models import (
+    Candle,
+    DynamicProtectionRule,
+    Instrument,
+    OrderPlan,
+    SignalDecision,
+    StrategyConfig,
+    describe_dynamic_protection_rule_overlap_warnings,
+)
 from okx_quant.okx_client import OkxApiError
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
@@ -95,6 +103,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
     STRATEGY_DYNAMIC_ID,
+    STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_MTF_LONG_ID,
     STRATEGY_EMA5_EMA8_ID,
 )
@@ -545,6 +554,507 @@ class BacktestTest(TestCase):
         stop_price = _dynamic_stop_price(position, 2)
 
         self.assertEqual(stop_price, Decimal("100"))
+
+    def test_dynamic_backtest_can_break_even_at_2r_then_trail_every_2r_from_4r(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price=Decimal("100"),
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("140"),
+            initial_stop_loss=Decimal("90"),
+            initial_take_profit=Decimal("140"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            dynamic_take_profit_enabled=True,
+            dynamic_two_r_break_even=True,
+            dynamic_break_even_trigger_r=2,
+            next_dynamic_trigger_r=4,
+            dynamic_trailing_step_r=2,
+            dynamic_fee_offset_enabled=False,
+        )
+
+        _advance_dynamic_stop(position, Decimal("120"))
+
+        self.assertEqual(position.stop_loss, Decimal("100"))
+        self.assertEqual(position.next_dynamic_trigger_r, 4)
+        self.assertEqual(position.take_profit, Decimal("140"))
+
+        _advance_dynamic_stop(position, Decimal("140"))
+
+        self.assertEqual(position.stop_loss, Decimal("120"))
+        self.assertEqual(position.next_dynamic_trigger_r, 6)
+        self.assertEqual(position.take_profit, Decimal("160"))
+
+        _advance_dynamic_stop(position, Decimal("160"))
+
+        self.assertEqual(position.stop_loss, Decimal("140"))
+        self.assertEqual(position.next_dynamic_trigger_r, 8)
+        self.assertEqual(position.take_profit, Decimal("180"))
+
+    def test_dynamic_backtest_can_override_first_lock_then_resume_scheme_b_trailing(self) -> None:
+        position = _OpenPosition(
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price=Decimal("100"),
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("130"),
+            initial_stop_loss=Decimal("90"),
+            initial_take_profit=Decimal("130"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            dynamic_take_profit_enabled=True,
+            dynamic_two_r_break_even=False,
+            dynamic_trailing_start_r=3,
+            next_dynamic_trigger_r=3,
+            dynamic_first_lock_r=1,
+            dynamic_trailing_step_r=1,
+            dynamic_fee_offset_enabled=False,
+        )
+
+        _advance_dynamic_stop(position, Decimal("130"))
+        self.assertEqual(position.stop_loss, Decimal("110"))
+        self.assertEqual(position.next_dynamic_trigger_r, 4)
+
+        _advance_dynamic_stop(position, Decimal("140"))
+        self.assertEqual(position.stop_loss, Decimal("120"))
+        self.assertEqual(position.next_dynamic_trigger_r, 5)
+
+        _advance_dynamic_stop(position, Decimal("150"))
+        self.assertEqual(position.stop_loss, Decimal("130"))
+        self.assertEqual(position.next_dynamic_trigger_r, 6)
+
+    def test_dynamic_backtest_can_follow_explicit_rule_table_with_plateau_then_trail(self) -> None:
+        rules = (
+            DynamicProtectionRule(trigger_r=3, action="lock_profit", lock_r=1, trail_mode="none"),
+            DynamicProtectionRule(trigger_r=5, action="lock_profit", lock_r=4, trail_mode="step", trail_every_r=1, trail_add_r=1),
+        )
+        position = _create_open_position(
+            instrument=Instrument(
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("0.1"),
+                min_size=Decimal("0.1"),
+                state="live",
+            ),
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("130"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            entry_fee_rate=Decimal("0"),
+            exit_fee_rate=Decimal("0"),
+            entry_fee_type="maker",
+            entry_slippage_rate=Decimal("0"),
+            exit_slippage_rate=Decimal("0"),
+            funding_rate=Decimal("0"),
+            dynamic_take_profit_enabled=True,
+            dynamic_fee_offset_enabled=False,
+            dynamic_protection_rules=rules,
+            next_dynamic_trigger_r=3,
+            apply_entry_slippage=False,
+        )
+
+        _advance_dynamic_stop(position, Decimal("130"))
+        self.assertEqual(position.stop_loss, Decimal("110"))
+
+        _advance_dynamic_stop(position, Decimal("140"))
+        self.assertEqual(position.stop_loss, Decimal("110"))
+
+        _advance_dynamic_stop(position, Decimal("150"))
+        self.assertEqual(position.stop_loss, Decimal("140"))
+
+        _advance_dynamic_stop(position, Decimal("160"))
+        self.assertEqual(position.stop_loss, Decimal("150"))
+
+    def test_dynamic_backtest_prefers_stronger_rule_when_multiple_rules_fire_same_trigger(self) -> None:
+        rules = (
+            DynamicProtectionRule(trigger_r=2, action="break_even"),
+            DynamicProtectionRule(trigger_r=3, action="lock_profit", lock_r=2, trail_mode="step", trail_every_r=1, trail_add_r=1),
+            DynamicProtectionRule(trigger_r=4, action="lock_profit", lock_r=1, trail_mode="step", trail_every_r=1, trail_add_r=1),
+        )
+        position = _create_open_position(
+            instrument=Instrument(
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("0.1"),
+                min_size=Decimal("0.1"),
+                state="live",
+            ),
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("120"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            entry_fee_rate=Decimal("0"),
+            exit_fee_rate=Decimal("0"),
+            entry_fee_type="maker",
+            entry_slippage_rate=Decimal("0"),
+            exit_slippage_rate=Decimal("0"),
+            funding_rate=Decimal("0"),
+            dynamic_take_profit_enabled=True,
+            dynamic_fee_offset_enabled=False,
+            dynamic_protection_rules=rules,
+            next_dynamic_trigger_r=2,
+            apply_entry_slippage=False,
+        )
+
+        _advance_dynamic_stop(position, Decimal("120"))
+        self.assertEqual(position.stop_loss, Decimal("100"))
+        self.assertEqual(position.dynamic_active_lock_r, 0)
+
+        _advance_dynamic_stop(position, Decimal("130"))
+        self.assertEqual(position.stop_loss, Decimal("120"))
+        self.assertEqual(position.dynamic_active_lock_r, 2)
+
+        _advance_dynamic_stop(position, Decimal("140"))
+        self.assertEqual(position.stop_loss, Decimal("130"))
+        self.assertEqual(position.dynamic_active_lock_r, 3)
+
+        _advance_dynamic_stop(position, Decimal("150"))
+        self.assertEqual(position.stop_loss, Decimal("140"))
+        self.assertEqual(position.dynamic_active_lock_r, 4)
+
+    def test_dynamic_backtest_can_switch_to_later_rule_once_it_becomes_stronger(self) -> None:
+        rules = (
+            DynamicProtectionRule(trigger_r=3, action="lock_profit", lock_r=1, trail_mode="step", trail_every_r=1, trail_add_r=1),
+            DynamicProtectionRule(trigger_r=5, action="lock_profit", lock_r=1, trail_mode="step", trail_every_r=1, trail_add_r=3),
+        )
+        position = _create_open_position(
+            instrument=Instrument(
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("0.1"),
+                min_size=Decimal("0.1"),
+                state="live",
+            ),
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("130"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            entry_fee_rate=Decimal("0"),
+            exit_fee_rate=Decimal("0"),
+            entry_fee_type="maker",
+            entry_slippage_rate=Decimal("0"),
+            exit_slippage_rate=Decimal("0"),
+            funding_rate=Decimal("0"),
+            dynamic_take_profit_enabled=True,
+            dynamic_fee_offset_enabled=False,
+            dynamic_protection_rules=rules,
+            next_dynamic_trigger_r=3,
+            apply_entry_slippage=False,
+        )
+
+        _advance_dynamic_stop(position, Decimal("130"))
+        self.assertEqual(position.stop_loss, Decimal("110"))
+        self.assertEqual(position.dynamic_active_lock_r, 1)
+
+        _advance_dynamic_stop(position, Decimal("140"))
+        self.assertEqual(position.stop_loss, Decimal("120"))
+        self.assertEqual(position.dynamic_active_lock_r, 2)
+
+        _advance_dynamic_stop(position, Decimal("150"))
+        self.assertEqual(position.stop_loss, Decimal("130"))
+        self.assertEqual(position.dynamic_active_lock_r, 3)
+
+        _advance_dynamic_stop(position, Decimal("160"))
+        self.assertEqual(position.stop_loss, Decimal("140"))
+        self.assertEqual(position.dynamic_active_lock_r, 4)
+
+        _advance_dynamic_stop(position, Decimal("170"))
+        self.assertEqual(position.stop_loss, Decimal("170"))
+        self.assertEqual(position.dynamic_active_lock_r, 7)
+
+    def test_dynamic_protection_rule_overlap_warnings_flag_weaker_later_rule(self) -> None:
+        warnings = describe_dynamic_protection_rule_overlap_warnings(
+            (
+                DynamicProtectionRule(trigger_r=2, action="break_even"),
+                DynamicProtectionRule(trigger_r=3, action="lock_profit", lock_r=2, trail_mode="step", trail_every_r=1, trail_add_r=1),
+                DynamicProtectionRule(trigger_r=4, action="lock_profit", lock_r=1, trail_mode="step", trail_every_r=1, trail_add_r=1),
+            )
+        )
+
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("4R", warnings[0])
+        self.assertIn("3R", warnings[0])
+        self.assertIn("锁 3R", warnings[0])
+        self.assertIn("锁 1R", warnings[0])
+
+    def test_backtest_param_summary_uses_explicit_dynamic_rule_descriptions(self) -> None:
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("3"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            risk_amount=Decimal("100"),
+            take_profit_mode="dynamic",
+            dynamic_fee_offset_enabled=True,
+            dynamic_protection_rules=(
+                DynamicProtectionRule(trigger_r=2, action="break_even"),
+                DynamicProtectionRule(trigger_r=4, action="lock_profit", lock_r=3, trail_mode="step", trail_every_r=2, trail_add_r=2),
+            ),
+        )
+
+        summary = _build_backtest_param_summary(config)
+
+        self.assertIn("2R -> 保本 + 双向手续费", summary)
+        self.assertIn("4R -> 锁 3R + 双向手续费；之后每 2R 再上移 2R", summary)
+
+    def test_legacy_dynamic_rules_keep_old_r001_break_even_special_case(self) -> None:
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("2"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            risk_amount=Decimal("100"),
+            take_profit_mode="dynamic",
+            dynamic_two_r_break_even=True,
+            dynamic_break_even_trigger_r=2,
+            ema55_slope_lock_profit_trigger_r=2,
+            dynamic_first_lock_r=0,
+            dynamic_trailing_step_r=1,
+        )
+
+        rules = config.resolved_dynamic_protection_rules()
+
+        self.assertEqual([rule.to_payload() for rule in rules], [
+            {
+                "trigger_r": 2,
+                "action": "break_even",
+                "lock_r": None,
+                "trail_mode": "none",
+                "trail_every_r": None,
+                "trail_add_r": None,
+            },
+            {
+                "trigger_r": 3,
+                "action": "lock_profit",
+                "lock_r": 2,
+                "trail_mode": "step",
+                "trail_every_r": 1,
+                "trail_add_r": 1,
+            },
+        ])
+
+    def test_legacy_dynamic_rules_keep_same_trigger_custom_first_lock(self) -> None:
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("2"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            risk_amount=Decimal("100"),
+            take_profit_mode="dynamic",
+            dynamic_two_r_break_even=True,
+            dynamic_break_even_trigger_r=2,
+            ema55_slope_lock_profit_trigger_r=2,
+            dynamic_first_lock_r=1,
+            dynamic_trailing_step_r=1,
+        )
+
+        rules = config.resolved_dynamic_protection_rules()
+
+        self.assertEqual([rule.to_payload() for rule in rules], [
+            {
+                "trigger_r": 2,
+                "action": "lock_profit",
+                "lock_r": 1,
+                "trail_mode": "step",
+                "trail_every_r": 1,
+                "trail_add_r": 1,
+            },
+        ])
+
+    def test_dynamic_rules_merge_legacy_base_with_explicit_overrides(self) -> None:
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("2"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            risk_amount=Decimal("100"),
+            take_profit_mode="dynamic",
+            dynamic_two_r_break_even=True,
+            dynamic_break_even_trigger_r=2,
+            ema55_slope_lock_profit_trigger_r=4,
+            dynamic_first_lock_r=1,
+            dynamic_trailing_step_r=1,
+            dynamic_protection_rules=(
+                DynamicProtectionRule(
+                    trigger_r=5,
+                    action="lock_profit",
+                    lock_r=4,
+                    trail_mode="step",
+                    trail_every_r=1,
+                    trail_add_r=1,
+                ),
+            ),
+        )
+
+        rules = config.resolved_dynamic_protection_rules()
+
+        self.assertEqual([rule.to_payload() for rule in rules], [
+            {
+                "trigger_r": 2,
+                "action": "break_even",
+                "lock_r": None,
+                "trail_mode": "none",
+                "trail_every_r": None,
+                "trail_add_r": None,
+            },
+            {
+                "trigger_r": 4,
+                "action": "lock_profit",
+                "lock_r": 1,
+                "trail_mode": "step",
+                "trail_every_r": 1,
+                "trail_add_r": 1,
+            },
+            {
+                "trigger_r": 5,
+                "action": "lock_profit",
+                "lock_r": 4,
+                "trail_mode": "step",
+                "trail_every_r": 1,
+                "trail_add_r": 1,
+            },
+        ])
+
+    def test_dynamic_rules_merge_legacy_base_with_explicit_overrides_in_backtest(self) -> None:
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("3"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            risk_amount=Decimal("100"),
+            take_profit_mode="dynamic",
+            dynamic_two_r_break_even=True,
+            dynamic_break_even_trigger_r=2,
+            ema55_slope_lock_profit_trigger_r=4,
+            dynamic_first_lock_r=1,
+            dynamic_trailing_step_r=1,
+            dynamic_fee_offset_enabled=False,
+            dynamic_protection_rules=(
+                DynamicProtectionRule(
+                    trigger_r=5,
+                    action="lock_profit",
+                    lock_r=4,
+                    trail_mode="step",
+                    trail_every_r=1,
+                    trail_add_r=1,
+                ),
+            ),
+        )
+        position = _create_open_position(
+            instrument=Instrument(
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("0.1"),
+                min_size=Decimal("0.1"),
+                state="live",
+            ),
+            signal="long",
+            entry_index=0,
+            entry_ts=0,
+            entry_price_raw=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("130"),
+            atr_value=Decimal("10"),
+            size=Decimal("1"),
+            entry_fee_rate=Decimal("0"),
+            exit_fee_rate=Decimal("0"),
+            entry_fee_type="maker",
+            entry_slippage_rate=Decimal("0"),
+            exit_slippage_rate=Decimal("0"),
+            funding_rate=Decimal("0"),
+            dynamic_take_profit_enabled=True,
+            dynamic_fee_offset_enabled=False,
+            dynamic_protection_rules=config.resolved_dynamic_protection_rules(),
+            next_dynamic_trigger_r=2,
+            apply_entry_slippage=False,
+        )
+
+        _advance_dynamic_stop(position, Decimal("120"))
+        self.assertEqual(position.stop_loss, Decimal("100"))
+
+        _advance_dynamic_stop(position, Decimal("140"))
+        self.assertEqual(position.stop_loss, Decimal("110"))
+
+        _advance_dynamic_stop(position, Decimal("150"))
+        self.assertEqual(position.stop_loss, Decimal("140"))
+
+        _advance_dynamic_stop(position, Decimal("160"))
+        self.assertEqual(position.stop_loss, Decimal("150"))
 
     def test_dynamic_backtest_time_stop_break_even_moves_long_stop_after_threshold(self) -> None:
         position = _OpenPosition(
@@ -1935,6 +2445,61 @@ class BacktestTest(TestCase):
         self.assertEqual(len(result), 10000)
         self.assertEqual(client.history_limits, [10000])
 
+    def test_load_backtest_candles_refetches_when_latest_candle_is_unconfirmed(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("100"),
+                Decimal("101"),
+                Decimal("99"),
+                Decimal("100"),
+                Decimal("1"),
+                index != 10001,
+            )
+            for index in range(1, 10002)
+        ]
+        client = DummyBacktestClient(candles, self._build_instrument())
+
+        result = _load_backtest_candles(client, "BTC-USDT-SWAP", "15m", 10000)
+
+        self.assertEqual(len(result), 10000)
+        self.assertEqual(result[0].ts, 1)
+        self.assertEqual(result[-1].ts, 10000)
+        self.assertEqual(client.history_limits, [10000, 10001])
+
+    def test_load_backtest_candles_local_only_refetches_when_latest_candle_is_unconfirmed(self) -> None:
+        candles = [
+            Candle(
+                index,
+                Decimal("100"),
+                Decimal("101"),
+                Decimal("99"),
+                Decimal("100"),
+                Decimal("1"),
+                index != 10001,
+            )
+            for index in range(1, 10002)
+        ]
+        requested_limits: list[int | None] = []
+
+        def _fake_load_candle_cache(inst_id: str, bar: str, *, limit: int | None = None):  # noqa: ANN202
+            requested_limits.append(limit)
+            return list(candles) if limit is None else candles[-limit:]
+
+        with patch("okx_quant.backtest.load_candle_cache", side_effect=_fake_load_candle_cache):
+            result = _load_backtest_candles(
+                DummyBacktestClient(candles, self._build_instrument()),
+                "BTC-USDT-SWAP",
+                "15m",
+                10000,
+                local_only=True,
+            )
+
+        self.assertEqual(len(result), 10000)
+        self.assertEqual(result[0].ts, 1)
+        self.assertEqual(result[-1].ts, 10000)
+        self.assertEqual(requested_limits, [10000, 10001])
+
     def test_load_backtest_candles_zero_limit_returns_full_history(self) -> None:
         candles = [
             Candle(
@@ -2754,20 +3319,23 @@ class BacktestTest(TestCase):
                 trend_ema_period=55,
                 strategy_id=STRATEGY_DYNAMIC_ID,
             ),
+            runtime_id="R001",
+            archive_id="S392",
         )
 
         row = _build_backtest_compare_row(snapshot)
 
         self.assertEqual(row[0], "R001")
-        self.assertEqual(row[1], "03-23 12:30")
-        self.assertIn("EMA 动态委托", row[2])
-        self.assertEqual(row[3], "BTC-USDT-SWAP")
-        self.assertIn("2024-03-23 08:00 -> 2024-03-24 08:00", row[4])
-        self.assertIn("15分钟", row[4])
-        self.assertIn("500根", row[4])
-        self.assertIn("EMA21", row[5])
-        self.assertEqual(row[6], "3")
-        self.assertEqual(row[7], "66.67%")
+        self.assertEqual(row[1], "S392")
+        self.assertEqual(row[2], "03-23 12:30")
+        self.assertIn("EMA 动态委托", row[3])
+        self.assertEqual(row[4], "BTC-USDT-SWAP")
+        self.assertIn("2024-03-23 08:00 -> 2024-03-24 08:00", row[5])
+        self.assertIn("15分钟", row[5])
+        self.assertIn("500根", row[5])
+        self.assertIn("EMA21", row[6])
+        self.assertEqual(row[7], "3")
+        self.assertEqual(row[8], "66.67%")
 
     def test_build_backtest_param_summary_for_btc_slope_short_includes_exit_toggles(self) -> None:
         summary = _build_backtest_param_summary(
@@ -2948,9 +3516,13 @@ class BacktestTest(TestCase):
                 trend_ema_period=89,
                 strategy_id=STRATEGY_EMA_BREAKDOWN_SHORT_ID,
             ),
+            runtime_id="R009",
+            archive_id="S362",
         )
 
         detail = _build_backtest_compare_detail(snapshot)
+        self.assertIn("运行编号：R009", detail)
+        self.assertIn("已归档：S362", detail)
 
         self.assertIn("编号：R009", detail)
         self.assertIn("策略：EMA 跌破做空策略", detail)
@@ -2958,6 +3530,61 @@ class BacktestTest(TestCase):
         self.assertIn("K线周期：1小时", detail)
         self.assertIn("K线根数：800根", detail)
         self.assertIn("方向只做空", detail)
+
+    def test_build_backtest_compare_detail_for_archive_snapshot_shows_source_runtime(self) -> None:
+        report = BacktestReport(
+            total_trades=0,
+            win_trades=0,
+            loss_trades=0,
+            breakeven_trades=0,
+            win_rate=Decimal("0"),
+            total_pnl=Decimal("0"),
+            average_pnl=Decimal("0"),
+            gross_profit=Decimal("0"),
+            gross_loss=Decimal("0"),
+            profit_factor=None,
+            average_win=Decimal("0"),
+            average_loss=Decimal("0"),
+            profit_loss_ratio=None,
+            average_r_multiple=Decimal("0"),
+            max_drawdown=Decimal("0"),
+            take_profit_hits=0,
+            stop_loss_hits=0,
+        )
+        snapshot = _BacktestSnapshot(
+            snapshot_id="S362",
+            created_at=datetime(2026, 3, 23, 8, 0, 0),
+            config=StrategyConfig(
+                inst_id="ETH-USDT-SWAP",
+                bar="1H",
+                ema_period=34,
+                trend_ema_period=89,
+                atr_period=14,
+                atr_stop_multiplier=Decimal("1.5"),
+                atr_take_multiplier=Decimal("3"),
+                order_size=Decimal("0"),
+                trade_mode="cross",
+                signal_mode="short_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+                strategy_id=STRATEGY_EMA_BREAKDOWN_SHORT_ID,
+                risk_amount=Decimal("200"),
+            ),
+            candle_limit=800,
+            candle_count=800,
+            report=report,
+            report_text="示例详情",
+            start_ts=1711065600000,
+            end_ts=1711152000000,
+            runtime_id="R009",
+            archive_id="S362",
+        )
+
+        detail = _build_backtest_compare_detail(snapshot, prefer_archive=True)
+
+        self.assertIn("归档编号：S362", detail)
+        self.assertIn("当前会话编号：R009", detail)
 
     def test_build_backtest_compare_detail_formats_zero_candle_limit_as_full_history(self) -> None:
         report = BacktestReport(
@@ -4060,7 +4687,13 @@ class BacktestTest(TestCase):
                     risk_amount=Decimal("100"),
                 )
 
-                store.add_snapshot(result, config, 500, export_path="D:/qqokx/reports/backtest_exports/demo.txt")
+                store.add_snapshot(
+                    result,
+                    config,
+                    500,
+                    runtime_snapshot_id="R123",
+                    export_path="D:/qqokx/reports/backtest_exports/demo.txt",
+                )
                 reloaded_store = _BacktestSnapshotStore()
                 snapshots = reloaded_store.list_snapshots()
 
@@ -4074,6 +4707,8 @@ class BacktestTest(TestCase):
                 self.assertEqual(snapshots[0].report.max_total_occupied_slots, 4)
                 self.assertEqual(snapshots[0].start_ts, 1710976500000)
                 self.assertEqual(snapshots[0].end_ts, 1711062900000)
+                self.assertIsNone(snapshots[0].runtime_id)
+                self.assertEqual(snapshots[0].archive_id, "S001")
                 self.assertIn("趋势过滤", snapshots[0].report_text)
             finally:
                 backtest_ui_module.backtest_history_file_path = original_path_factory

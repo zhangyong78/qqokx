@@ -9,6 +9,7 @@ from tkinter import BooleanVar, END, StringVar, Text, Toplevel, filedialog
 from tkinter import messagebox, ttk
 from typing import Callable
 
+from okx_quant.models import describe_dynamic_protection_rules, normalize_dynamic_protection_rules
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_LONG_ID,
@@ -608,11 +609,25 @@ def _build_trader_strategy_lines(
         lines.append(f"{_entry_reference_ema_caption(strategy_id)}：{_entry_reference_ema_label(snapshot)}")
     if is_dynamic_strategy_id(strategy_id):
         take_profit_mode = "动态" if _snapshot_text(snapshot, "take_profit_mode", "dynamic") == "dynamic" else "固定"
+        rules = normalize_dynamic_protection_rules(snapshot.get("dynamic_protection_rules"))
         dynamic_break_even_text = (
-            f"首档触发R={max(int(snapshot.get('ema55_slope_lock_profit_trigger_r', 2) or 2), 2)} | "
-            f"nR保本={_bool_label(snapshot.get('dynamic_two_r_break_even', True))}"
-            if strategy_id == STRATEGY_DYNAMIC_LONG_ID
-            else f"2R保本={_bool_label(snapshot.get('dynamic_two_r_break_even', True))}"
+            " | ".join(
+                describe_dynamic_protection_rules(
+                    rules,
+                    fee_offset_enabled=bool(snapshot.get("dynamic_fee_offset_enabled", True)),
+                )
+            )
+            if rules
+            else (
+                f"保本触发R={max(int(snapshot.get('dynamic_break_even_trigger_r', 2) or 2), 1)} | "
+                f"移动止盈触发R={max(int(snapshot.get('ema55_slope_lock_profit_trigger_r', 2) or 2), 2)} | "
+                f"首档锁盈R={max(int(snapshot.get('dynamic_first_lock_r', 0) or 0), 0) or '自动'} | "
+                f"移动步长R={max(int(snapshot.get('dynamic_trailing_step_r', 1) or 1), 1)} | "
+                f"首档触发R={max(int(snapshot.get('ema55_slope_lock_profit_trigger_r', 2) or 2), 2)} | "
+                f"nR保本={_bool_label(snapshot.get('dynamic_two_r_break_even', True))}"
+                if strategy_id == STRATEGY_DYNAMIC_LONG_ID
+                else f"2R保本={_bool_label(snapshot.get('dynamic_two_r_break_even', True))}"
+            )
         )
         lines.append(
             f"止盈模式：{take_profit_mode} | "

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from okx_quant.duration_input import format_duration_cn_compact
 
@@ -23,6 +23,8 @@ MovingAverageType = Literal["ema", "ma"]
 DailyFilterBoundary = Literal["exchange", "bjt_00", "bjt_08"]
 DailyFilterMode = Literal["disabled", "close_vs_ma", "weak_day"]
 DailyFilterScope = Literal["both", "long_only", "short_only"]
+DynamicProtectionAction = Literal["break_even", "lock_profit"]
+DynamicProtectionTrailMode = Literal["none", "step"]
 
 
 def normalize_moving_average_type(value: str | None) -> MovingAverageType:
@@ -37,6 +39,276 @@ def moving_average_display_label(
 ) -> str:
     prefix = "MA" if normalize_moving_average_type(ma_type) == "ma" else "EMA"
     return f"{prefix}({period})" if with_parentheses else f"{prefix}{period}"
+
+
+def normalize_dynamic_protection_action(value: str | None) -> DynamicProtectionAction:
+    return "break_even" if str(value or "").strip().lower() == "break_even" else "lock_profit"
+
+
+def normalize_dynamic_protection_trail_mode(value: str | None) -> DynamicProtectionTrailMode:
+    return "step" if str(value or "").strip().lower() == "step" else "none"
+
+
+@dataclass(frozen=True)
+class DynamicProtectionRule:
+    trigger_r: int
+    action: DynamicProtectionAction
+    lock_r: int | None = None
+    trail_mode: DynamicProtectionTrailMode = "none"
+    trail_every_r: int | None = None
+    trail_add_r: int | None = None
+
+    def resolved_trigger_r(self) -> int:
+        return max(int(self.trigger_r), 1)
+
+    def resolved_action(self) -> DynamicProtectionAction:
+        return normalize_dynamic_protection_action(self.action)
+
+    def resolved_lock_r(self) -> int:
+        if self.resolved_action() == "break_even":
+            return 0
+        return max(int(self.lock_r or 0), 0)
+
+    def resolved_trail_mode(self) -> DynamicProtectionTrailMode:
+        return normalize_dynamic_protection_trail_mode(self.trail_mode)
+
+    def resolved_trail_every_r(self) -> int:
+        return max(int(self.trail_every_r or 0), 1)
+
+    def resolved_trail_add_r(self) -> int:
+        return max(int(self.trail_add_r or 0), 1)
+
+    def trailing_enabled(self) -> bool:
+        return self.resolved_action() == "lock_profit" and self.resolved_trail_mode() == "step"
+
+    def normalized(self) -> "DynamicProtectionRule":
+        return DynamicProtectionRule(
+            trigger_r=self.resolved_trigger_r(),
+            action=self.resolved_action(),
+            lock_r=self.resolved_lock_r() if self.resolved_action() == "lock_profit" else None,
+            trail_mode=self.resolved_trail_mode() if self.resolved_action() == "lock_profit" else "none",
+            trail_every_r=self.resolved_trail_every_r() if self.trailing_enabled() else None,
+            trail_add_r=self.resolved_trail_add_r() if self.trailing_enabled() else None,
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        normalized = self.normalized()
+        return {
+            "trigger_r": normalized.trigger_r,
+            "action": normalized.action,
+            "lock_r": normalized.lock_r,
+            "trail_mode": normalized.trail_mode,
+            "trail_every_r": normalized.trail_every_r,
+            "trail_add_r": normalized.trail_add_r,
+        }
+
+
+def normalize_dynamic_protection_rules(
+    rules: tuple[DynamicProtectionRule, ...] | list[DynamicProtectionRule] | tuple[dict[str, Any], ...] | list[dict[str, Any]] | None,
+) -> tuple[DynamicProtectionRule, ...]:
+    normalized: list[DynamicProtectionRule] = []
+    for item in rules or ():
+        if isinstance(item, DynamicProtectionRule):
+            rule = item.normalized()
+        else:
+            rule = DynamicProtectionRule(
+                trigger_r=max(int(item.get("trigger_r", 0) or 0), 1),
+                action=normalize_dynamic_protection_action(str(item.get("action", "lock_profit"))),
+                lock_r=(None if item.get("lock_r") in (None, "") else max(int(item.get("lock_r", 0) or 0), 0)),
+                trail_mode=normalize_dynamic_protection_trail_mode(str(item.get("trail_mode", "none"))),
+                trail_every_r=(None if item.get("trail_every_r") in (None, "") else max(int(item.get("trail_every_r", 0) or 0), 1)),
+                trail_add_r=(None if item.get("trail_add_r") in (None, "") else max(int(item.get("trail_add_r", 0) or 0), 1)),
+            ).normalized()
+        normalized.append(rule)
+    normalized.sort(key=lambda rule: rule.trigger_r)
+    deduped: list[DynamicProtectionRule] = []
+    seen_triggers: set[int] = set()
+    for rule in normalized:
+        if rule.trigger_r in seen_triggers:
+            continue
+        seen_triggers.add(rule.trigger_r)
+        deduped.append(rule)
+    return tuple(deduped)
+
+
+def dynamic_protection_rules_to_payload(
+    rules: tuple[DynamicProtectionRule, ...] | list[DynamicProtectionRule] | None,
+) -> tuple[dict[str, Any], ...]:
+    return tuple(rule.to_payload() for rule in normalize_dynamic_protection_rules(rules))
+
+
+def dynamic_protection_rule_fires_at(rule: DynamicProtectionRule, trigger_r: int) -> bool:
+    normalized = rule.normalized()
+    current_trigger = max(int(trigger_r), 1)
+    base_trigger = normalized.resolved_trigger_r()
+    if current_trigger < base_trigger:
+        return False
+    if current_trigger == base_trigger:
+        return True
+    if not normalized.trailing_enabled():
+        return False
+    return (current_trigger - base_trigger) % normalized.resolved_trail_every_r() == 0
+
+
+def dynamic_protection_rule_lock_r_at(rule: DynamicProtectionRule, trigger_r: int) -> int:
+    normalized = rule.normalized()
+    current_trigger = max(int(trigger_r), 1)
+    lock_r = 0 if normalized.resolved_action() == "break_even" else normalized.resolved_lock_r()
+    if not normalized.trailing_enabled() or current_trigger <= normalized.resolved_trigger_r():
+        return lock_r
+    step_count = (current_trigger - normalized.resolved_trigger_r()) // normalized.resolved_trail_every_r()
+    return max(lock_r + step_count * normalized.resolved_trail_add_r(), 0)
+
+
+def _dynamic_protection_lock_label(lock_r: int) -> str:
+    return "保本" if max(int(lock_r), 0) <= 0 else f"锁 {max(int(lock_r), 0)}R"
+
+
+def describe_dynamic_protection_rule_overlap_warnings(
+    rules: tuple[DynamicProtectionRule, ...] | list[DynamicProtectionRule] | None,
+) -> tuple[str, ...]:
+    normalized = normalize_dynamic_protection_rules(rules)
+    warnings: list[str] = []
+    for index, rule in enumerate(normalized):
+        trigger_r = rule.resolved_trigger_r()
+        current_lock_r = dynamic_protection_rule_lock_r_at(rule, trigger_r)
+        best_prior_rule: DynamicProtectionRule | None = None
+        best_prior_lock_r: int | None = None
+        for prior_rule in normalized[:index]:
+            if not dynamic_protection_rule_fires_at(prior_rule, trigger_r):
+                continue
+            prior_lock_r = dynamic_protection_rule_lock_r_at(prior_rule, trigger_r)
+            if best_prior_lock_r is None or prior_lock_r > best_prior_lock_r:
+                best_prior_rule = prior_rule
+                best_prior_lock_r = prior_lock_r
+        if best_prior_rule is None or best_prior_lock_r is None:
+            continue
+        if best_prior_lock_r < current_lock_r:
+            continue
+        warnings.append(
+            f"{trigger_r}R 规则在触发点不优于前序 {best_prior_rule.resolved_trigger_r()}R 规则"
+            f"（前序已可{_dynamic_protection_lock_label(best_prior_lock_r)}，本条仅{_dynamic_protection_lock_label(current_lock_r)}）。"
+        )
+    return tuple(warnings)
+
+
+def merge_dynamic_protection_rules(
+    base_rules: tuple[DynamicProtectionRule, ...] | list[DynamicProtectionRule] | None,
+    override_rules: tuple[DynamicProtectionRule, ...] | list[DynamicProtectionRule] | tuple[dict[str, Any], ...] | list[dict[str, Any]] | None,
+) -> tuple[DynamicProtectionRule, ...]:
+    merged_by_trigger: dict[int, DynamicProtectionRule] = {
+        rule.resolved_trigger_r(): rule
+        for rule in normalize_dynamic_protection_rules(base_rules)
+    }
+    for rule in normalize_dynamic_protection_rules(override_rules):
+        merged_by_trigger[rule.resolved_trigger_r()] = rule
+    return tuple(sorted(merged_by_trigger.values(), key=lambda rule: rule.resolved_trigger_r()))
+
+
+def build_legacy_dynamic_protection_rules(
+    *,
+    break_even_enabled: bool,
+    break_even_trigger_r: int,
+    trailing_start_r: int,
+    first_lock_r: int,
+    trailing_step_r: int,
+) -> tuple[DynamicProtectionRule, ...]:
+    rules: list[DynamicProtectionRule] = []
+    break_even_trigger = max(int(break_even_trigger_r), 1)
+    trailing_start = max(int(trailing_start_r), 2)
+    trailing_step = max(int(trailing_step_r), 1)
+    configured_first_lock_r = max(int(first_lock_r), 0)
+    auto_first_lock_r = max(trailing_start - trailing_step, 0)
+    effective_first_lock_r = configured_first_lock_r or auto_first_lock_r
+
+    if not break_even_enabled:
+        rules.append(
+            DynamicProtectionRule(
+                trigger_r=trailing_start,
+                action="lock_profit",
+                lock_r=effective_first_lock_r,
+                trail_mode="step",
+                trail_every_r=trailing_step,
+                trail_add_r=trailing_step,
+            ).normalized()
+        )
+        return normalize_dynamic_protection_rules(rules)
+
+    # Legacy snapshots used one special path when保本触发R与移动止盈触发R相同，
+    # 且首档锁盈R保持自动值：先在该触发点保本，再从下一档开始按 n-stepR 递进。
+    if trailing_start == break_even_trigger and configured_first_lock_r <= 0:
+        rules.append(
+            DynamicProtectionRule(
+                trigger_r=break_even_trigger,
+                action="break_even",
+            ).normalized()
+        )
+        rules.append(
+            DynamicProtectionRule(
+                trigger_r=trailing_start + trailing_step,
+                action="lock_profit",
+                lock_r=effective_first_lock_r + trailing_step,
+                trail_mode="step",
+                trail_every_r=trailing_step,
+                trail_add_r=trailing_step,
+            ).normalized()
+        )
+        return normalize_dynamic_protection_rules(rules)
+
+    # When the first profit-lock starts no later than break-even and already
+    # locks positive R, the lock-profit leg dominates the break-even leg.
+    if trailing_start <= break_even_trigger:
+        rules.append(
+            DynamicProtectionRule(
+                trigger_r=trailing_start,
+                action="lock_profit",
+                lock_r=effective_first_lock_r,
+                trail_mode="step",
+                trail_every_r=trailing_step,
+                trail_add_r=trailing_step,
+            ).normalized()
+        )
+        return normalize_dynamic_protection_rules(rules)
+
+    rules.append(
+        DynamicProtectionRule(
+            trigger_r=break_even_trigger,
+            action="break_even",
+        ).normalized()
+    )
+    rules.append(
+        DynamicProtectionRule(
+            trigger_r=trailing_start,
+            action="lock_profit",
+            lock_r=effective_first_lock_r,
+            trail_mode="step",
+            trail_every_r=trailing_step,
+            trail_add_r=trailing_step,
+        ).normalized()
+    )
+    return normalize_dynamic_protection_rules(rules)
+
+
+def describe_dynamic_protection_rules(
+    rules: tuple[DynamicProtectionRule, ...] | list[DynamicProtectionRule] | None,
+    *,
+    fee_offset_enabled: bool,
+) -> tuple[str, ...]:
+    fee_text = " + 双向手续费" if fee_offset_enabled else ""
+    lines: list[str] = []
+    for rule in normalize_dynamic_protection_rules(rules):
+        trigger_r = rule.resolved_trigger_r()
+        if rule.resolved_action() == "break_even":
+            lines.append(f"{trigger_r}R -> 保本{fee_text}")
+            continue
+        base_lock_r = rule.resolved_lock_r()
+        if rule.trailing_enabled():
+            lines.append(
+                f"{trigger_r}R -> 锁 {base_lock_r}R{fee_text}；之后每 {rule.resolved_trail_every_r()}R 再上移 {rule.resolved_trail_add_r()}R"
+            )
+        else:
+            lines.append(f"{trigger_r}R -> 锁 {base_lock_r}R{fee_text}")
+    return tuple(lines)
 
 
 @dataclass(frozen=True)
@@ -113,10 +385,14 @@ class StrategyConfig:
     entry_reference_ema_period: int = 55
     entry_reference_ema_type: MovingAverageType = "ema"
     dynamic_two_r_break_even: bool = True
+    dynamic_break_even_trigger_r: int = 2
     dynamic_fee_offset_enabled: bool = True
+    dynamic_protection_rules: tuple[DynamicProtectionRule, ...] = ()
     ema55_slope_exit_enabled: bool = True
     ema55_slope_lock_profit_enabled: bool = False
     ema55_slope_lock_profit_trigger_r: int = 5
+    dynamic_first_lock_r: int = 0
+    dynamic_trailing_step_r: int = 1
     ema55_slope_negative_entry_bars: int = 1
     ema55_slope_same_bar_reentry_block: bool = False
     ema55_slope_dynamic_exit_requires_bear_reentry: bool = False
@@ -265,6 +541,30 @@ class StrategyConfig:
 
     def dynamic_two_r_break_even_label(self) -> str:
         return "\u5f00\u542f" if self.dynamic_two_r_break_even else "\u5173\u95ed"
+
+    def resolved_dynamic_break_even_trigger_r(self) -> int:
+        return max(int(self.dynamic_break_even_trigger_r), 1)
+
+    def resolved_dynamic_trailing_start_r(self) -> int:
+        return max(int(self.ema55_slope_lock_profit_trigger_r), 2)
+
+    def resolved_dynamic_first_lock_r(self) -> int:
+        return max(int(self.dynamic_first_lock_r), 0)
+
+    def resolved_dynamic_trailing_step_r(self) -> int:
+        return max(int(self.dynamic_trailing_step_r), 1)
+
+    def resolved_dynamic_protection_rules(self) -> tuple[DynamicProtectionRule, ...]:
+        if self.take_profit_mode != "dynamic":
+            return ()
+        legacy_rules = build_legacy_dynamic_protection_rules(
+            break_even_enabled=bool(self.dynamic_two_r_break_even),
+            break_even_trigger_r=self.resolved_dynamic_break_even_trigger_r(),
+            trailing_start_r=self.resolved_dynamic_trailing_start_r(),
+            first_lock_r=self.resolved_dynamic_first_lock_r(),
+            trailing_step_r=self.resolved_dynamic_trailing_step_r(),
+        )
+        return merge_dynamic_protection_rules(legacy_rules, self.dynamic_protection_rules)
 
     def dynamic_fee_offset_enabled_label(self) -> str:
         return "\u5f00\u542f" if self.dynamic_fee_offset_enabled else "\u5173\u95ed"

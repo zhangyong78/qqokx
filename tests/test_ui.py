@@ -919,6 +919,37 @@ HTTP 502: <!DOCTYPE html>
         self.assertIn("手续费偏移：开启", hint)
         self.assertIn("时间保本：关闭（当前设定 10 根", hint)
 
+    def test_build_dynamic_protection_hint_text_for_enabled_dynamic_mode(self) -> None:
+        hint = _build_dynamic_protection_hint_text(
+            take_profit_mode_label="动态止盈",
+            dynamic_two_r_break_even_enabled=True,
+            dynamic_fee_offset_enabled=True,
+            time_stop_break_even_enabled=False,
+            time_stop_break_even_bars_raw="10",
+        )
+
+        self.assertIn("2R保本：开启", hint)
+        self.assertIn("首档触发R：固定为 2。", hint)
+        self.assertIn("手续费偏移：开启", hint)
+        self.assertIn("时间保本：关闭（当前设定 10 根", hint)
+
+    def test_build_dynamic_protection_hint_text_for_custom_first_lock(self) -> None:
+        hint = _build_dynamic_protection_hint_text(
+            take_profit_mode_label="动态止盈",
+            dynamic_two_r_break_even_enabled=True,
+            break_even_trigger_r_raw="3",
+            trailing_start_r_raw="3",
+            first_lock_r_raw="1",
+            trailing_step_r_raw="1",
+            break_even_trigger_r_configurable=True,
+            dynamic_fee_offset_enabled=True,
+            time_stop_break_even_enabled=False,
+            time_stop_break_even_bars_raw="0",
+        )
+
+        self.assertIn("保本触发R：3；移动止盈触发R：3；首档锁盈R：1；移动步长R：1。", hint)
+        self.assertIn("到 3R 后先锁 1R，到 4R 后上移到 2R", hint)
+
     def test_build_normal_strategy_book_summary_filters_out_trader_history(self) -> None:
         history_records = [
             StrategyHistoryRecord(

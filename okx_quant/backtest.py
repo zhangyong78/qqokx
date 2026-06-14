@@ -15,10 +15,12 @@ from okx_quant.daily_filters import (
 from okx_quant.indicators import atr, ema, linear_regression_slope, moving_average
 from okx_quant.models import (
     Candle,
+    DynamicProtectionRule,
     Instrument,
     OrderPlan,
     SignalDecision,
     StrategyConfig,
+    describe_dynamic_protection_rules,
     moving_average_display_label,
 )
 from okx_quant.okx_client import OkxRestClient
@@ -238,10 +240,14 @@ class BacktestResult:
     funding_rate: Decimal = Decimal("0")
     take_profit_mode: str = "fixed"
     dynamic_two_r_break_even: bool = False
+    dynamic_break_even_trigger_r: int = 2
     dynamic_fee_offset_enabled: bool = True
+    dynamic_protection_rules: tuple[DynamicProtectionRule, ...] = ()
     ema55_slope_exit_enabled: bool = True
     ema55_slope_lock_profit_enabled: bool = False
     ema55_slope_lock_profit_trigger_r: int = 5
+    dynamic_first_lock_r: int = 0
+    dynamic_trailing_step_r: int = 1
     ema55_slope_negative_entry_bars: int = 1
     ema55_slope_same_bar_reentry_block: bool = False
     ema55_slope_dynamic_exit_requires_bear_reentry: bool = False
@@ -348,6 +354,17 @@ class _OpenPosition:
     dynamic_take_profit_enabled: bool = False
     take_profit_enabled: bool = True
     next_dynamic_trigger_r: int = 2
+    dynamic_protection_rules: tuple[DynamicProtectionRule, ...] = ()
+    dynamic_next_rule_index: int = 0
+    dynamic_active_rule_index: int = -1
+    dynamic_next_trailing_trigger_r: int = 0
+    dynamic_active_lock_r: int | None = None
+    dynamic_last_processed_trigger_r: int = 0
+    dynamic_trailing_start_r: int = 2
+    dynamic_break_even_trigger_r: int = 2
+    dynamic_first_lock_r: int = 0
+    dynamic_trailing_step_r: int = 1
+    dynamic_separate_break_even_enabled: bool = True
     dynamic_exit_fee_rate: Decimal = Decimal("0")
     dynamic_two_r_break_even: bool = False
     dynamic_fee_offset_enabled: bool = True
@@ -448,6 +465,16 @@ def _ema55_slope_dynamic_two_r_break_even_enabled(config: StrategyConfig) -> boo
     return bool(config.dynamic_two_r_break_even)
 
 
+def _dynamic_break_even_trigger_r(config: StrategyConfig) -> int:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return _ema55_slope_lock_profit_trigger_r(config)
+    return config.resolved_dynamic_break_even_trigger_r()
+
+
+def _dynamic_separate_break_even_enabled(config: StrategyConfig) -> bool:
+    return not is_btc_ema55_slope_short_strategy(config.strategy_id)
+
+
 def _ema55_slope_dynamic_fee_offset_enabled(config: StrategyConfig) -> bool:
     if is_btc_ema55_slope_short_strategy(config.strategy_id):
         return bool(config.ema55_slope_lock_profit_enabled)
@@ -455,19 +482,43 @@ def _ema55_slope_dynamic_fee_offset_enabled(config: StrategyConfig) -> bool:
 
 
 def _ema55_slope_lock_profit_trigger_r(config: StrategyConfig) -> int:
-    return max(int(config.ema55_slope_lock_profit_trigger_r), 2)
+    return config.resolved_dynamic_trailing_start_r()
+
+
+def _dynamic_trailing_step_r(config: StrategyConfig) -> int:
+    return config.resolved_dynamic_trailing_step_r()
+
+
+def _dynamic_first_lock_r(config: StrategyConfig) -> int:
+    return config.resolved_dynamic_first_lock_r()
+
+
+def _dynamic_protection_rules(config: StrategyConfig) -> tuple[DynamicProtectionRule, ...]:
+    return config.resolved_dynamic_protection_rules()
+
+
+def _first_dynamic_rule_trigger_r(config: StrategyConfig) -> int:
+    rules = _dynamic_protection_rules(config)
+    if rules:
+        return rules[0].resolved_trigger_r()
+    return _ema55_slope_lock_profit_trigger_r(config)
 
 
 def _ema55_slope_entry_triggered(
     config: StrategyConfig,
     *,
     recent_slope_ratios: list[Decimal | None],
+    previous_slope_ratio_before_window: Decimal | None = None,
     threshold: Decimal,
 ) -> bool:
     required_negative_bars = _ema55_slope_negative_entry_bars(config)
     if len(recent_slope_ratios) < required_negative_bars:
         return False
     if any(slope_ratio is None or slope_ratio > threshold for slope_ratio in recent_slope_ratios[-required_negative_bars:]):
+        return False
+    if is_btc_ema55_slope_short_strategy(config.strategy_id) and (
+        previous_slope_ratio_before_window is None or previous_slope_ratio_before_window < 0
+    ):
         return False
     return True
 
@@ -791,6 +842,8 @@ def build_parameter_batch_configs(
             atr_multipliers=atr_multipliers,
         )
     if family == "ema55_slope_short":
+        if int(base_config.ema_period) == 55 and int(base_config.trend_ema_period) == 55:
+            return [base_config]
         return build_btc_slope_short_batch_configs(
             base_config,
             atr_multipliers=atr_multipliers,
@@ -1234,10 +1287,14 @@ def _run_backtest_with_loaded_data(
         funding_rate=config.backtest_funding_rate,
         take_profit_mode=str(config.take_profit_mode),
         dynamic_two_r_break_even=_ema55_slope_dynamic_two_r_break_even_enabled(config),
+        dynamic_break_even_trigger_r=_dynamic_break_even_trigger_r(config),
         dynamic_fee_offset_enabled=_ema55_slope_dynamic_fee_offset_enabled(config),
+        dynamic_protection_rules=_dynamic_protection_rules(config),
         ema55_slope_exit_enabled=bool(config.ema55_slope_exit_enabled),
         ema55_slope_lock_profit_enabled=bool(config.ema55_slope_lock_profit_enabled),
-        ema55_slope_lock_profit_trigger_r=max(int(config.ema55_slope_lock_profit_trigger_r), 2),
+        ema55_slope_lock_profit_trigger_r=_ema55_slope_lock_profit_trigger_r(config),
+        dynamic_first_lock_r=_dynamic_first_lock_r(config),
+        dynamic_trailing_step_r=_dynamic_trailing_step_r(config),
         ema55_slope_negative_entry_bars=max(int(config.ema55_slope_negative_entry_bars), 1),
         ema55_slope_same_bar_reentry_block=bool(config.ema55_slope_same_bar_reentry_block),
         ema55_slope_dynamic_exit_requires_bear_reentry=bool(config.ema55_slope_dynamic_exit_requires_bear_reentry),
@@ -1564,52 +1621,73 @@ def _load_backtest_candles(
     preload_count: int = 0,
     local_only: bool = False,
 ) -> list[Candle]:
+    def _finalize_loaded_candles(raw_candles: list[Candle], *, used_range_fetcher: bool) -> tuple[list[Candle], int]:
+        confirmed = [candle for candle in raw_candles if candle.confirmed]
+        if not used_range_fetcher:
+            if start_ts is not None:
+                confirmed[:] = [candle for candle in confirmed if candle.ts >= start_ts]
+            if end_ts is not None:
+                confirmed[:] = [candle for candle in confirmed if candle.ts <= end_ts]
+            selected = confirmed if candle_limit <= 0 else confirmed[-candle_limit:]
+            return selected, len(selected)
+
+        window_start = 0 if start_ts is None else start_ts
+        window_end = 9999999999999 if end_ts is None else end_ts
+        preload = [candle for candle in confirmed if candle.ts < window_start]
+        if preload_count > 0:
+            preload = preload[-preload_count:]
+        elif start_ts is not None:
+            preload = []
+        in_range = [candle for candle in confirmed if window_start <= candle.ts <= window_end]
+        selected_in_range = in_range if candle_limit <= 0 else in_range[-candle_limit:]
+        return preload + selected_in_range, len(selected_in_range)
+
     if local_only:
         used_range_fetcher = start_ts is not None or end_ts is not None
-        if used_range_fetcher:
-            raw_candles = load_candle_cache_range(
-                inst_id,
-                bar,
-                start_ts=0 if start_ts is None else start_ts,
-                end_ts=9999999999999 if end_ts is None else end_ts,
-                limit=None if candle_limit <= 0 else candle_limit,
-                preload_count=max(0, preload_count),
-            )
-        else:
-            raw_candles = load_candle_cache(
-                inst_id,
-                bar,
-                limit=None if candle_limit <= 0 else candle_limit,
-            )
-        candles = [candle for candle in raw_candles if candle.confirmed]
-        if not used_range_fetcher and start_ts is not None:
-            candles = [candle for candle in candles if candle.ts >= start_ts]
-        if not used_range_fetcher and end_ts is not None:
-            candles = [candle for candle in candles if candle.ts <= end_ts]
-        return candles if used_range_fetcher or candle_limit <= 0 else candles[-candle_limit:]
+        request_limit = None if candle_limit <= 0 else candle_limit
+        while True:
+            if used_range_fetcher:
+                raw_candles = load_candle_cache_range(
+                    inst_id,
+                    bar,
+                    start_ts=0 if start_ts is None else start_ts,
+                    end_ts=9999999999999 if end_ts is None else end_ts,
+                    limit=request_limit,
+                    preload_count=max(0, preload_count),
+                )
+            else:
+                raw_candles = load_candle_cache(
+                    inst_id,
+                    bar,
+                    limit=request_limit,
+                )
+            candles, selected_count = _finalize_loaded_candles(raw_candles, used_range_fetcher=used_range_fetcher)
+            if candle_limit <= 0 or selected_count >= candle_limit or all(candle.confirmed for candle in raw_candles):
+                return candles
+            request_limit = max(int(request_limit or 0) + (candle_limit - selected_count), candle_limit + 1)
 
     range_fetcher = getattr(client, "get_candles_history_range", None)
     history_fetcher = getattr(client, "get_candles_history", None)
     used_range_fetcher = (start_ts is not None or end_ts is not None) and callable(range_fetcher)
-    if used_range_fetcher:
-        raw_candles = range_fetcher(
-            inst_id,
-            bar,
-            start_ts=0 if start_ts is None else start_ts,
-            end_ts=9999999999999 if end_ts is None else end_ts,
-            limit=candle_limit,
-            preload_count=max(0, preload_count),
-        )
-    elif callable(history_fetcher):
-        raw_candles = history_fetcher(inst_id, bar, limit=candle_limit)
-    else:
-        raw_candles = client.get_candles(inst_id, bar, limit=candle_limit)
-    candles = [candle for candle in raw_candles if candle.confirmed]
-    if not used_range_fetcher and start_ts is not None:
-        candles = [candle for candle in candles if candle.ts >= start_ts]
-    if not used_range_fetcher and end_ts is not None:
-        candles = [candle for candle in candles if candle.ts <= end_ts]
-    return candles if used_range_fetcher else candles[-candle_limit:]
+    request_limit = candle_limit
+    while True:
+        if used_range_fetcher:
+            raw_candles = range_fetcher(
+                inst_id,
+                bar,
+                start_ts=0 if start_ts is None else start_ts,
+                end_ts=9999999999999 if end_ts is None else end_ts,
+                limit=request_limit,
+                preload_count=max(0, preload_count),
+            )
+        elif callable(history_fetcher):
+            raw_candles = history_fetcher(inst_id, bar, limit=request_limit)
+        else:
+            raw_candles = client.get_candles(inst_id, bar, limit=request_limit)
+        candles, selected_count = _finalize_loaded_candles(raw_candles, used_range_fetcher=used_range_fetcher)
+        if candle_limit <= 0 or selected_count >= candle_limit or all(candle.confirmed for candle in raw_candles):
+            return candles
+        request_limit = max(request_limit + (candle_limit - selected_count), candle_limit + 1)
 
 
 def _build_cross_higher_tf_bias(
@@ -2088,9 +2166,15 @@ def _run_cross_backtest(
             dynamic_take_profit_enabled=dynamic_take_profit_enabled,
             dynamic_exit_fee_rate=taker_fee_rate,
             dynamic_two_r_break_even=config.dynamic_two_r_break_even,
+            dynamic_break_even_trigger_r=_dynamic_break_even_trigger_r(config),
+            dynamic_first_lock_r=_dynamic_first_lock_r(config),
+            dynamic_trailing_step_r=_dynamic_trailing_step_r(config),
+            dynamic_separate_break_even_enabled=_dynamic_separate_break_even_enabled(config),
             dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+            dynamic_protection_rules=_dynamic_protection_rules(config),
             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
             time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+            next_dynamic_trigger_r=_ema55_slope_lock_profit_trigger_r(config),
         )
         entries_in_current_wave += 1
 
@@ -2153,6 +2237,7 @@ def _run_ema55_slope_short_backtest(
             _ema55_slope_ratio_from_series(ema_values, slope_index)
             for slope_index in range(index - negative_entry_bars + 1, index + 1)
         ]
+        previous_slope_ratio_before_window = _ema55_slope_ratio_from_series(ema_values, index - negative_entry_bars)
         exited_this_bar = False
 
         if open_position is not None:
@@ -2223,6 +2308,7 @@ def _run_ema55_slope_short_backtest(
             or not _ema55_slope_entry_triggered(
                 config,
                 recent_slope_ratios=recent_slope_ratios,
+                previous_slope_ratio_before_window=previous_slope_ratio_before_window,
                 threshold=entry_slope_threshold_ratio,
             )
         ):
@@ -2300,7 +2386,12 @@ def _run_ema55_slope_short_backtest(
             take_profit_enabled=take_profit_enabled,
             dynamic_exit_fee_rate=taker_fee_rate,
             dynamic_two_r_break_even=dynamic_two_r_break_even,
+            dynamic_break_even_trigger_r=_dynamic_break_even_trigger_r(config),
+            dynamic_first_lock_r=_dynamic_first_lock_r(config),
+            dynamic_trailing_step_r=_dynamic_trailing_step_r(config),
+            dynamic_separate_break_even_enabled=_dynamic_separate_break_even_enabled(config),
             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+            dynamic_protection_rules=_dynamic_protection_rules(config),
             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
             time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
             next_dynamic_trigger_r=dynamic_trigger_r,
@@ -2344,7 +2435,7 @@ def _run_body_retest_short_backtest(
     open_position: _OpenPosition | None = None
     dynamic_take_profit_enabled = config.take_profit_mode == "dynamic"
     slope_exit_enabled = bool(config.ema55_slope_exit_enabled)
-    dynamic_trigger_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
+    dynamic_trigger_r = _ema55_slope_lock_profit_trigger_r(config)
     slope_threshold = Decimal(str(config.trend_ema_slope_filter_min_ratio))
     breakdown_mult = Decimal(str(config.body_retest_breakdown_atr_multiplier))
     retest_mult = Decimal(str(config.body_retest_retest_atr_multiplier))
@@ -2462,7 +2553,12 @@ def _run_body_retest_short_backtest(
                         dynamic_take_profit_enabled=dynamic_take_profit_enabled,
                         dynamic_exit_fee_rate=taker_fee_rate,
                         dynamic_two_r_break_even=config.dynamic_two_r_break_even,
+                        dynamic_break_even_trigger_r=_dynamic_break_even_trigger_r(config),
+                        dynamic_first_lock_r=_dynamic_first_lock_r(config),
+                        dynamic_trailing_step_r=_dynamic_trailing_step_r(config),
+                        dynamic_separate_break_even_enabled=_dynamic_separate_break_even_enabled(config),
                         dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                        dynamic_protection_rules=_dynamic_protection_rules(config),
                         time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                         time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
                         next_dynamic_trigger_r=dynamic_trigger_r,
@@ -2610,10 +2706,15 @@ def _run_adaptive_rail_backtest(
                 dynamic_take_profit_enabled=dynamic_take_profit_enabled,
                 dynamic_exit_fee_rate=taker_fee_rate,
                 dynamic_two_r_break_even=config.dynamic_two_r_break_even,
+                dynamic_break_even_trigger_r=_dynamic_break_even_trigger_r(config),
+                dynamic_first_lock_r=_dynamic_first_lock_r(config),
+                dynamic_trailing_step_r=_dynamic_trailing_step_r(config),
+                dynamic_separate_break_even_enabled=_dynamic_separate_break_even_enabled(config),
                 dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                dynamic_protection_rules=_dynamic_protection_rules(config),
                 time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                 time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
-                next_dynamic_trigger_r=max(int(config.ema55_slope_lock_profit_trigger_r), 2),
+                next_dynamic_trigger_r=_ema55_slope_lock_profit_trigger_r(config),
                 immediate_entry_fee_rate=taker_fee_rate,
                 immediate_entry_fee_type="taker",
                 adaptive_rail_period=plan_rail_period,
@@ -2851,10 +2952,15 @@ def _run_dynamic_backtest(
                 dynamic_take_profit_enabled=dynamic_take_profit_enabled,
                 dynamic_exit_fee_rate=taker_fee_rate,
                 dynamic_two_r_break_even=config.dynamic_two_r_break_even,
+                dynamic_break_even_trigger_r=_dynamic_break_even_trigger_r(config),
+                dynamic_first_lock_r=_dynamic_first_lock_r(config),
+                dynamic_trailing_step_r=_dynamic_trailing_step_r(config),
+                dynamic_separate_break_even_enabled=_dynamic_separate_break_even_enabled(config),
                 dynamic_fee_offset_enabled=config.dynamic_fee_offset_enabled,
+                dynamic_protection_rules=_dynamic_protection_rules(config),
                 time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                 time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
-                next_dynamic_trigger_r=max(int(config.ema55_slope_lock_profit_trigger_r), 2),
+                next_dynamic_trigger_r=_ema55_slope_lock_profit_trigger_r(config),
                 immediate_entry_fee_rate=taker_fee_rate,
                 immediate_entry_fee_type="taker",
             )
@@ -3359,7 +3465,12 @@ def _create_open_position(
     take_profit_enabled: bool = True,
     dynamic_exit_fee_rate: Decimal = Decimal("0"),
     dynamic_two_r_break_even: bool = False,
+    dynamic_break_even_trigger_r: int = 2,
+    dynamic_first_lock_r: int = 0,
+    dynamic_trailing_step_r: int = 1,
+    dynamic_separate_break_even_enabled: bool = True,
     dynamic_fee_offset_enabled: bool = True,
+    dynamic_protection_rules: tuple[DynamicProtectionRule, ...] = (),
     time_stop_break_even_enabled: bool = False,
     time_stop_break_even_bars: int = 0,
     next_dynamic_trigger_r: int = 2,
@@ -3408,6 +3519,12 @@ def _create_open_position(
         dynamic_take_profit_enabled=dynamic_take_profit_enabled,
         take_profit_enabled=take_profit_enabled,
         next_dynamic_trigger_r=next_dynamic_trigger_r,
+        dynamic_protection_rules=dynamic_protection_rules,
+        dynamic_trailing_start_r=max(int(next_dynamic_trigger_r), 2),
+        dynamic_break_even_trigger_r=max(int(dynamic_break_even_trigger_r), 1),
+        dynamic_first_lock_r=max(int(dynamic_first_lock_r), 0),
+        dynamic_trailing_step_r=max(int(dynamic_trailing_step_r), 1),
+        dynamic_separate_break_even_enabled=bool(dynamic_separate_break_even_enabled),
         dynamic_exit_fee_rate=dynamic_exit_fee_rate,
         dynamic_two_r_break_even=dynamic_two_r_break_even,
         dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
@@ -3423,7 +3540,14 @@ def _create_open_position(
         funding_rate=funding_rate if instrument.inst_type == "SWAP" else Decimal("0"),
         adaptive_rail_period=adaptive_rail_period,
     )
-    if current_take_profit is None and dynamic_take_profit_enabled:
+    if dynamic_protection_rules:
+        open_position.dynamic_next_rule_index = 0
+        open_position.dynamic_active_rule_index = -1
+        open_position.dynamic_next_trailing_trigger_r = 0
+        open_position.dynamic_active_lock_r = None
+        open_position.dynamic_last_processed_trigger_r = 0
+        _sync_dynamic_next_event(open_position)
+    elif current_take_profit is None and dynamic_take_profit_enabled:
         open_position.take_profit = _dynamic_trigger_price(open_position, next_dynamic_trigger_r)
     return open_position
 
@@ -3585,7 +3709,12 @@ def _try_fill_dynamic_order(
     dynamic_take_profit_enabled: bool = False,
     dynamic_exit_fee_rate: Decimal = Decimal("0"),
     dynamic_two_r_break_even: bool = False,
+    dynamic_break_even_trigger_r: int = 2,
+    dynamic_first_lock_r: int = 0,
+    dynamic_trailing_step_r: int = 1,
+    dynamic_separate_break_even_enabled: bool = True,
     dynamic_fee_offset_enabled: bool = True,
+    dynamic_protection_rules: tuple[DynamicProtectionRule, ...] = (),
     time_stop_break_even_enabled: bool = False,
     time_stop_break_even_bars: int = 0,
     next_dynamic_trigger_r: int = 2,
@@ -3635,7 +3764,12 @@ def _try_fill_dynamic_order(
         dynamic_take_profit_enabled=dynamic_take_profit_enabled,
         dynamic_exit_fee_rate=dynamic_exit_fee_rate,
         dynamic_two_r_break_even=dynamic_two_r_break_even,
+        dynamic_break_even_trigger_r=dynamic_break_even_trigger_r,
+        dynamic_first_lock_r=dynamic_first_lock_r,
+        dynamic_trailing_step_r=dynamic_trailing_step_r,
+        dynamic_separate_break_even_enabled=dynamic_separate_break_even_enabled,
         dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+        dynamic_protection_rules=dynamic_protection_rules,
         time_stop_break_even_enabled=time_stop_break_even_enabled,
         time_stop_break_even_bars=time_stop_break_even_bars,
         next_dynamic_trigger_r=next_dynamic_trigger_r,
@@ -3701,6 +3835,10 @@ def _dynamic_fee_offset(entry_price: Decimal, exit_fee_rate: Decimal, *, enabled
 
 
 def _time_stop_break_even_price(position: _OpenPosition) -> Decimal:
+    return _dynamic_break_even_price(position)
+
+
+def _dynamic_break_even_price(position: _OpenPosition) -> Decimal:
     entry_price = _position_strategy_entry_price(position)
     fee_offset = _dynamic_fee_offset(
         entry_price,
@@ -3712,17 +3850,153 @@ def _time_stop_break_even_price(position: _OpenPosition) -> Decimal:
     return snap_to_increment(raw, position.tick_size, rounding)
 
 
+def _dynamic_rule_base_lock_r(rule: DynamicProtectionRule) -> int:
+    return 0 if rule.resolved_action() == "break_even" else rule.resolved_lock_r()
+
+
+def _dynamic_rule_stop_price_for_lock_r(position: _OpenPosition, lock_r: int) -> Decimal:
+    entry_price = _position_strategy_entry_price(position)
+    locked_offset = position.risk_per_unit * Decimal(str(max(int(lock_r), 0)))
+    fee_offset = _dynamic_fee_offset(
+        entry_price,
+        position.dynamic_exit_fee_rate,
+        enabled=position.dynamic_fee_offset_enabled,
+    )
+    raw = (
+        entry_price + locked_offset + fee_offset
+        if position.signal == "long"
+        else entry_price - locked_offset - fee_offset
+    )
+    rounding = "up" if position.signal == "long" else "down"
+    return snap_to_increment(raw, position.tick_size, rounding)
+
+
+def _dynamic_rule_lock_r(rule: DynamicProtectionRule, trigger_r: int) -> int:
+    lock_r = _dynamic_rule_base_lock_r(rule)
+    if not rule.trailing_enabled():
+        return lock_r
+    if trigger_r <= rule.resolved_trigger_r():
+        return lock_r
+    step_count = max(trigger_r - rule.resolved_trigger_r(), 0) // rule.resolved_trail_every_r()
+    return max(lock_r + step_count * rule.resolved_trail_add_r(), 0)
+
+
+def _dynamic_rule_trigger_price(position: _OpenPosition, rule: DynamicProtectionRule | int) -> Decimal:
+    trigger_r = rule if isinstance(rule, int) else rule.resolved_trigger_r()
+    return _dynamic_trigger_price(position, trigger_r)
+
+
+def _dynamic_rule_fires_at(rule: DynamicProtectionRule, trigger_r: int) -> bool:
+    current_trigger = max(int(trigger_r), 1)
+    base_trigger = rule.resolved_trigger_r()
+    if current_trigger < base_trigger:
+        return False
+    if current_trigger == base_trigger:
+        return True
+    if not rule.trailing_enabled():
+        return False
+    return (current_trigger - base_trigger) % rule.resolved_trail_every_r() == 0
+
+
+def _next_dynamic_rule_event_after(rule: DynamicProtectionRule, trigger_r: int) -> int:
+    current_trigger = max(int(trigger_r), 0)
+    base_trigger = rule.resolved_trigger_r()
+    if current_trigger < base_trigger:
+        return base_trigger
+    if not rule.trailing_enabled():
+        return 0
+    trail_every_r = rule.resolved_trail_every_r()
+    step_count = ((current_trigger - base_trigger) // trail_every_r) + 1
+    return base_trigger + (step_count * trail_every_r)
+
+
+def _dynamic_rules_enabled(position: _OpenPosition) -> bool:
+    return bool(position.dynamic_take_profit_enabled and position.dynamic_protection_rules)
+
+
+def _sync_dynamic_next_event(position: _OpenPosition) -> None:
+    if _dynamic_rules_enabled(position):
+        next_event_r = 0
+        current_trigger = max(int(position.dynamic_last_processed_trigger_r), 0)
+        for rule in position.dynamic_protection_rules:
+            candidate = _next_dynamic_rule_event_after(rule, current_trigger)
+            if candidate <= 0:
+                continue
+            if next_event_r <= 0 or candidate < next_event_r:
+                next_event_r = candidate
+        position.next_dynamic_trigger_r = next_event_r
+        if position.next_dynamic_trigger_r > 0:
+            position.take_profit = _dynamic_trigger_price(position, position.next_dynamic_trigger_r)
+        return
+    next_rule_r: int | None = None
+    if 0 <= position.dynamic_next_rule_index < len(position.dynamic_protection_rules):
+        next_rule_r = position.dynamic_protection_rules[position.dynamic_next_rule_index].resolved_trigger_r()
+    next_trailing_r = position.dynamic_next_trailing_trigger_r if position.dynamic_next_trailing_trigger_r > 0 else None
+    candidates = [value for value in (next_rule_r, next_trailing_r) if value is not None]
+    position.next_dynamic_trigger_r = min(candidates) if candidates else 0
+    if position.next_dynamic_trigger_r > 0:
+        position.take_profit = _dynamic_trigger_price(position, position.next_dynamic_trigger_r)
+
+
+def _dynamic_apply_rule_event(position: _OpenPosition, trigger_r: int) -> bool:
+    best_rule_index = -1
+    best_lock_r: int | None = None
+    best_candidate: Decimal | None = None
+    for rule_index, rule in enumerate(position.dynamic_protection_rules):
+        if not _dynamic_rule_fires_at(rule, trigger_r):
+            continue
+        lock_r = _dynamic_rule_lock_r(rule, trigger_r)
+        candidate = _dynamic_rule_stop_price_for_lock_r(position, lock_r)
+        if best_candidate is None:
+            best_rule_index = rule_index
+            best_lock_r = lock_r
+            best_candidate = candidate
+            continue
+        if position.signal == "long":
+            if candidate > best_candidate or (candidate == best_candidate and lock_r > max(int(best_lock_r or 0), 0)):
+                best_rule_index = rule_index
+                best_lock_r = lock_r
+                best_candidate = candidate
+        else:
+            if candidate < best_candidate or (candidate == best_candidate and lock_r > max(int(best_lock_r or 0), 0)):
+                best_rule_index = rule_index
+                best_lock_r = lock_r
+                best_candidate = candidate
+    position.dynamic_last_processed_trigger_r = max(int(position.dynamic_last_processed_trigger_r), int(trigger_r))
+    if best_candidate is None or best_lock_r is None:
+        return False
+    moved = False
+    if position.signal == "long":
+        if best_candidate > position.stop_loss:
+            position.stop_loss = best_candidate
+            moved = True
+    else:
+        if best_candidate < position.stop_loss:
+            position.stop_loss = best_candidate
+            moved = True
+    if moved or best_candidate == position.stop_loss:
+        position.dynamic_active_rule_index = best_rule_index
+        position.dynamic_active_lock_r = best_lock_r
+    return moved
+
+
 def _dynamic_stop_exit_reason(position: _OpenPosition) -> str:
     if not position.dynamic_take_profit_enabled:
         return "stop_loss"
     if position.stop_loss == position.initial_stop_loss:
         return "stop_loss"
+    if _dynamic_rules_enabled(position):
+        if position.dynamic_active_lock_r is None:
+            return "stop_loss"
+        return "break_even_stop" if position.dynamic_active_lock_r <= 0 else f"locked_{position.dynamic_active_lock_r}r_stop"
     if position.time_stop_break_even_enabled and position.stop_loss == _time_stop_break_even_price(position):
+        return "break_even_stop"
+    if position.dynamic_two_r_break_even and position.stop_loss == _dynamic_break_even_price(position):
         return "break_even_stop"
     for trigger_r in range(2, position.next_dynamic_trigger_r):
         if position.stop_loss != _dynamic_stop_price(position, trigger_r):
             continue
-        locked_r = 0 if (position.dynamic_two_r_break_even and trigger_r == 2) else max(trigger_r - 1, 0)
+        locked_r = _dynamic_locked_r(position, trigger_r)
         return "break_even_stop" if locked_r <= 0 else f"locked_{locked_r}r_stop"
     return "stop_loss"
 
@@ -3741,10 +4015,12 @@ def _apply_time_stop_break_even(position: _OpenPosition, current_price: Decimal,
         if current_price < candidate or candidate <= position.stop_loss:
             return False
         position.stop_loss = candidate
+        position.dynamic_active_lock_r = 0
         return True
     if current_price > candidate or candidate >= position.stop_loss:
         return False
     position.stop_loss = candidate
+    position.dynamic_active_lock_r = 0
     return True
 
 
@@ -3775,10 +4051,15 @@ def _dynamic_trigger_price(position: _OpenPosition, trigger_r: int) -> Decimal:
 
 
 def _dynamic_stop_price(position: _OpenPosition, trigger_r: int) -> Decimal:
+    if _dynamic_rules_enabled(position):
+        for rule in position.dynamic_protection_rules:
+            if rule.resolved_trigger_r() == trigger_r:
+                return _dynamic_rule_stop_price_for_lock_r(position, _dynamic_rule_lock_r(rule, trigger_r))
+        if 0 <= position.dynamic_active_rule_index < len(position.dynamic_protection_rules):
+            active_rule = position.dynamic_protection_rules[position.dynamic_active_rule_index]
+            return _dynamic_rule_stop_price_for_lock_r(position, _dynamic_rule_lock_r(active_rule, trigger_r))
     entry_price = _position_strategy_entry_price(position)
-    lock_multiple = max(trigger_r - 1, 0)
-    if position.dynamic_two_r_break_even and trigger_r == 2:
-        lock_multiple = 0
+    lock_multiple = _dynamic_locked_r(position, trigger_r)
     locked_offset = position.risk_per_unit * Decimal(str(lock_multiple))
     fee_offset = _dynamic_fee_offset(
         entry_price,
@@ -3794,8 +4075,83 @@ def _dynamic_stop_price(position: _OpenPosition, trigger_r: int) -> Decimal:
     return snap_to_increment(raw, position.tick_size, rounding)
 
 
+def _dynamic_break_even_lock_trigger_matches(position: _OpenPosition, trigger_r: int) -> bool:
+    if not position.dynamic_two_r_break_even:
+        return False
+    if position.dynamic_separate_break_even_enabled:
+        return trigger_r == max(int(position.dynamic_break_even_trigger_r), 1)
+    return trigger_r == 2
+
+
+def _dynamic_effective_first_lock_r(position: _OpenPosition) -> int:
+    first_lock_r = max(int(position.dynamic_first_lock_r), 0)
+    if first_lock_r > 0:
+        return first_lock_r
+    trailing_start_r = max(int(position.dynamic_trailing_start_r), 2)
+    trailing_step_r = max(int(position.dynamic_trailing_step_r), 1)
+    return max(trailing_start_r - trailing_step_r, 0)
+
+
+def _dynamic_locked_r(position: _OpenPosition, trigger_r: int) -> int:
+    if _dynamic_break_even_lock_trigger_matches(position, trigger_r):
+        return 0
+    trailing_start_r = max(int(position.dynamic_trailing_start_r), 2)
+    trailing_step_r = max(int(position.dynamic_trailing_step_r), 1)
+    effective_first_lock_r = _dynamic_effective_first_lock_r(position)
+    if trigger_r <= trailing_start_r:
+        return effective_first_lock_r
+    trigger_offset = max(trigger_r - trailing_start_r, 0)
+    step_count = trigger_offset // trailing_step_r
+    return max(effective_first_lock_r + step_count * trailing_step_r, 0)
+
+
+def _apply_dynamic_break_even(position: _OpenPosition, favorable_price: Decimal) -> bool:
+    if _dynamic_rules_enabled(position):
+        return False
+    if (
+        not position.dynamic_take_profit_enabled
+        or not position.dynamic_two_r_break_even
+        or not position.dynamic_separate_break_even_enabled
+    ):
+        return False
+    trigger_r = max(int(position.dynamic_break_even_trigger_r), 1)
+    trigger_price = _dynamic_trigger_price(position, trigger_r)
+    if position.signal == "long":
+        if favorable_price < trigger_price:
+            return False
+        candidate = _dynamic_break_even_price(position)
+        if candidate <= position.stop_loss:
+            return False
+        position.stop_loss = candidate
+        position.dynamic_active_lock_r = 0
+        return True
+    if favorable_price > trigger_price:
+        return False
+    candidate = _dynamic_break_even_price(position)
+    if candidate >= position.stop_loss:
+        return False
+    position.stop_loss = candidate
+    position.dynamic_active_lock_r = 0
+    return True
+
+
 def _advance_dynamic_stop(position: _OpenPosition, favorable_price: Decimal, *, holding_bars: int = 0) -> None:
     _apply_time_stop_break_even(position, favorable_price, holding_bars)
+    if _dynamic_rules_enabled(position):
+        while True:
+            event_r = position.next_dynamic_trigger_r if position.next_dynamic_trigger_r > 0 else None
+            if event_r is None:
+                break
+            trigger_price = _dynamic_trigger_price(position, event_r)
+            if position.signal == "long":
+                if favorable_price < trigger_price:
+                    break
+            elif favorable_price > trigger_price:
+                break
+            _dynamic_apply_rule_event(position, event_r)
+            _sync_dynamic_next_event(position)
+        return
+    _apply_dynamic_break_even(position, favorable_price)
     while position.next_dynamic_trigger_r >= 2:
         trigger_price = _dynamic_trigger_price(position, position.next_dynamic_trigger_r)
         if position.signal == "long":
@@ -3804,14 +4160,14 @@ def _advance_dynamic_stop(position: _OpenPosition, favorable_price: Decimal, *, 
             candidate_stop = _dynamic_stop_price(position, position.next_dynamic_trigger_r)
             if candidate_stop > position.stop_loss:
                 position.stop_loss = candidate_stop
-            position.next_dynamic_trigger_r += 1
+            position.next_dynamic_trigger_r += max(int(position.dynamic_trailing_step_r), 1)
         else:
             if favorable_price > trigger_price:
                 break
             candidate_stop = _dynamic_stop_price(position, position.next_dynamic_trigger_r)
             if candidate_stop < position.stop_loss:
                 position.stop_loss = candidate_stop
-            position.next_dynamic_trigger_r += 1
+            position.next_dynamic_trigger_r += max(int(position.dynamic_trailing_step_r), 1)
     position.take_profit = _dynamic_trigger_price(position, position.next_dynamic_trigger_r)
 
 
@@ -4308,6 +4664,18 @@ def _format_backtest_sizing_mode(value: str) -> str:
 
 
 def _append_backtest_dynamic_take_profit_lines(lines: list[str], result: BacktestResult) -> None:
+    rules = tuple(rule.normalized() for rule in result.dynamic_protection_rules)
+    rule_descriptions = describe_dynamic_protection_rules(
+        rules,
+        fee_offset_enabled=bool(result.dynamic_fee_offset_enabled),
+    )
+    break_even_trigger_r = max(int(result.dynamic_break_even_trigger_r), 1)
+    dynamic_trigger_r = max(int(result.ema55_slope_lock_profit_trigger_r), 2)
+    first_lock_r = max(int(result.dynamic_first_lock_r), 0)
+    trailing_step_r = max(int(result.dynamic_trailing_step_r), 1)
+    auto_first_lock_r = max(dynamic_trigger_r - trailing_step_r, 0)
+    effective_first_lock_r = first_lock_r if first_lock_r > 0 else auto_first_lock_r
+    custom_first_lock_enabled = first_lock_r > 0 and first_lock_r != auto_first_lock_r
     if result.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
         lines.append(
             "平仓条件："
@@ -4317,40 +4685,75 @@ def _append_backtest_dynamic_take_profit_lines(lines: list[str], result: Backtes
         )
         lines.append("止损说明：该策略始终使用 ATR 止损。")
         if result.ema55_slope_lock_profit_enabled:
-            lines.append(
-                f"锁盈说明：nR保本已开启；首档触发R={result.ema55_slope_lock_profit_trigger_r}。"
-                "若首档触发R=2，则 2R 时先把止损上移到保本 - 双向 Taker 手续费；"
-                "此后每多走 1R，止损继续按 n-1R - 双向 Taker 手续费递进。"
-            )
+            if rule_descriptions:
+                lines.append("锁盈规则：" + "；".join(rule_descriptions) + "。")
+            else:
+                lines.append(
+                    f"锁盈说明：保本触发R={break_even_trigger_r}，移动止盈触发R={dynamic_trigger_r}。"
+                    f"价格先到 {break_even_trigger_r}R 时把止损上移到保本 - 双向 Taker 手续费；"
+                    f"到 {dynamic_trigger_r}R 后再按 n-{trailing_step_r}R - 双向 Taker 手续费开始移动止盈；"
+                    f"此后每多走 {trailing_step_r}R，止损继续按 n-{trailing_step_r}R - 双向 Taker 手续费递进。"
+                )
         return
-    dynamic_trigger_r = max(int(result.ema55_slope_lock_profit_trigger_r), 2)
     lines.append(f"斜率转正平仓：{'开启' if result.ema55_slope_exit_enabled else '关闭'}")
     lines.append(f"止盈方式：{'动态止盈' if result.take_profit_mode == 'dynamic' else '固定止盈'}")
     if result.take_profit_mode != "dynamic":
         lines.append("止盈说明：固定止盈为 ATR 倍数止盈。")
         return
-    lines.append(f"首档触发R：{dynamic_trigger_r}")
-    lines.append(f"nR保本：{'开启' if result.dynamic_two_r_break_even else '关闭'}")
+    if rule_descriptions:
+        lines.append("动态保护规则：" + " | ".join(rule_descriptions))
+    else:
+        lines.append(f"保本触发R：{break_even_trigger_r}")
+        lines.append(f"移动止盈触发R：{dynamic_trigger_r}")
+        lines.append(f"首档锁盈R：{first_lock_r if first_lock_r > 0 else '自动'}")
+        lines.append(f"移动步长R：{trailing_step_r}")
+    lines.append(f"保本开关：{'开启' if result.dynamic_two_r_break_even else '关闭'}")
     lines.append(f"手续费偏移开关：{'开启' if result.dynamic_fee_offset_enabled else '关闭'}")
     lines.append(
         "时间保本开关："
         f"{'开启' if result.time_stop_break_even_enabled else '关闭'}"
         f" | 阈值K线：{result.time_stop_break_even_bars if result.time_stop_break_even_bars > 0 else '未启用'}"
     )
-    if result.dynamic_two_r_break_even and dynamic_trigger_r == 2:
-        description = (
-            "止盈说明：动态止盈在 2R 时先上移到开仓价+2倍Taker手续费，3R 起按 n-1R+2倍Taker手续费递推；固定止盈为 ATR 倍数止盈。"
-            if result.dynamic_fee_offset_enabled
-            else "止盈说明：动态止盈在 2R 时先上移到开仓价，3R 起按 n-1R 递推；固定止盈为 ATR 倍数止盈。"
-        )
+    if rule_descriptions:
+        description = "止盈说明：" + "；".join(rule_descriptions) + "；固定止盈为 ATR 倍数止盈。"
+    elif result.dynamic_two_r_break_even:
+        fee_text = "+2倍Taker手续费" if result.dynamic_fee_offset_enabled else ""
+        if custom_first_lock_enabled:
+            next_trigger_r = dynamic_trigger_r + trailing_step_r
+            next_lock_r = effective_first_lock_r + trailing_step_r
+            description = (
+                f"止盈说明：价格先到 {break_even_trigger_r}R 时止损上移到开仓价{fee_text}；"
+                f"到 {dynamic_trigger_r}R 后先锁定 {effective_first_lock_r}R{fee_text}；"
+                f"到 {next_trigger_r}R 后上移到 {next_lock_r}R{fee_text}；"
+                f"此后每多走 {trailing_step_r}R，止损继续再上移 {trailing_step_r}R；固定止盈为 ATR 倍数止盈。"
+            )
+        else:
+            next_trigger_r = dynamic_trigger_r + trailing_step_r
+            next_lock_r = effective_first_lock_r + trailing_step_r
+            description = (
+                f"止盈说明：价格先到 {break_even_trigger_r}R 时止损上移到开仓价{fee_text}；"
+                f"到 {dynamic_trigger_r}R 后才开始移动止盈，先锁定 {effective_first_lock_r}R{fee_text}；"
+                f"到 {next_trigger_r}R 后上移到 {next_lock_r}R{fee_text}；"
+                f"此后每多走 {trailing_step_r}R，止损继续再上移 {trailing_step_r}R；固定止盈为 ATR 倍数止盈。"
+            )
     else:
-        description = (
-            f"止盈说明：动态止盈在 {dynamic_trigger_r}R 时先上移到 {max(dynamic_trigger_r - 1, 0)}R+2倍Taker手续费，"
-            "此后每多走 1R，止损继续按 1R 台阶递进；固定止盈为 ATR 倍数止盈。"
-            if result.dynamic_fee_offset_enabled
-            else f"止盈说明：动态止盈在 {dynamic_trigger_r}R 时先上移到 {max(dynamic_trigger_r - 1, 0)}R，"
-            "此后每多走 1R，止损继续按 1R 台阶递进；固定止盈为 ATR 倍数止盈。"
-        )
+        fee_text = "+2倍Taker手续费" if result.dynamic_fee_offset_enabled else ""
+        if custom_first_lock_enabled:
+            next_trigger_r = dynamic_trigger_r + trailing_step_r
+            next_lock_r = effective_first_lock_r + trailing_step_r
+            description = (
+                f"止盈说明：动态止盈在 {dynamic_trigger_r}R 时先上移到 {effective_first_lock_r}R{fee_text}；"
+                f"到 {next_trigger_r}R 后上移到 {next_lock_r}R{fee_text}；"
+                f"此后每多走 {trailing_step_r}R，止损继续再上移 {trailing_step_r}R；固定止盈为 ATR 倍数止盈。"
+            )
+        else:
+            next_trigger_r = dynamic_trigger_r + trailing_step_r
+            next_lock_r = effective_first_lock_r + trailing_step_r
+            description = (
+                f"止盈说明：动态止盈在 {dynamic_trigger_r}R 时先上移到 {effective_first_lock_r}R{fee_text}；"
+                f"到 {next_trigger_r}R 后上移到 {next_lock_r}R{fee_text}；"
+                f"此后每多走 {trailing_step_r}R，止损继续再上移 {trailing_step_r}R；固定止盈为 ATR 倍数止盈。"
+            )
     lines.append(description)
     if result.time_stop_break_even_enabled and result.time_stop_break_even_bars > 0:
         lines.append(

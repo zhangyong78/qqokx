@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.22`
+当前版本：`v0.6.23`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -29,7 +29,7 @@
 
 ## 近期更新
 
-`v0.6.22` 这一轮版本内容比较集中，重点新增和调整如下：
+`v0.6.23` 这一轮版本内容比较集中，重点新增和调整如下：
 
 - 新增 `EMA55 斜率做空` 策略：
   - 规则：`EMA55` 单根斜率比例小于等于阈值时开空，斜率重新转正时平仓
@@ -70,6 +70,42 @@
   - 新增本地数据状态提示，会显示当前标的/周期的本地缓存根数和覆盖时间范围
   - 支持先单独同步 `1H / 4H` 等选定周期，不必每次全量同步所有周期
   - 新增“同步价格精度/下单规则”，离线回测前可先缓存合约元数据
+- 动态保护参数继续拆细为四段：
+  - `保本触发R`
+  - `移动止盈触发R`
+  - `首档锁盈R`
+  - `移动步长R`
+  - 上述参数已贯通到启动区、会话编辑、回测区、实盘引擎、回测报告和导出说明
+- 动态保护规则继续升级为“规则列表”：
+  - `StrategyConfig` 新增 `dynamic_protection_rules`
+  - 现在不只支持一套固定四段参数，还支持按 `trigger_r + action + lock_r + trail_mode` 配多条规则
+  - 规则支持 `break_even` / `lock_profit` 两类动作
+  - 规则支持 `step` 递进，可配置“每隔几 R 再加几 R”
+  - 旧的四段参数仍然保留，并会自动转换成兼容规则
+- 动态止盈逻辑更细：
+  - 非 BTC 专用斜率做空策略现在支持“先保本，再进入移动止盈”
+  - `首档锁盈R = 0` 时，按“移动止盈触发R - 移动步长R”自动推导
+  - `移动步长R` 不再固定为 `1R`，可按策略独立设置
+- `BTC EMA55 斜率做空` 入场条件更严格：
+  - 连续负斜率开空前，窗口前一根斜率不能已经处于负值延续
+  - 更偏向只在新的转弱段开始时开空，减少连续阴跌中的重复追空
+- 回测数据读取补了一层“确认K线不够就继续补拉”的兜底：
+  - 无论联网回测还是纯本地回测，都会尽量补足目标根数
+  - 避免末尾未确认 K 线被过滤后直接少样本
+- 回测快照与编号口径重新整理：
+  - 当前界面更明确区分 `运行编号` 和 `归档编号`
+  - 比较区、详情区、图表区和已保存快照区都改成统一编号展示
+  - `Rxxx` 更偏当前会话，`Sxxx` 更偏归档快照，减少“同一结果两个编号”的歧义
+- 回测 K 线图主窗继续改版：
+  - 图表大窗标题与说明文案改为更明确的“回测K线图”
+  - 热力图 / 矩阵图的视口和滚动区域同步更稳定
+  - 动态保护参数、快照编号、图表标题之间的联动说明更完整
+- 回测审计导出改成流式写出：
+  - `capital audit` 与 `operation audit` 不再先整表堆内存
+  - 导出时按行迭代写 CSV，适合更大的回测结果
+- BTC 动态委托做多默认模板回调：
+  - BTC 做多默认组合从更激进口径回调为 `EMA21 / EMA55 / 入场 EMA55 / 2R`
+  - 每波最多开仓次数提高到 `3`
 - 回测前置校验更完整：
   - 纯本地模式下会检查主回测 K 线、多周期过滤 K 线、日线过滤 K 线、高周期方向过滤 K 线是否缺失或有缺口
   - 本地缓存不足时直接提示首段缺口或覆盖范围，不再静默回退联网
@@ -79,6 +115,10 @@
   - 网络拉取成功后会自动回写缓存，网络失败时可回退读本地缓存
 - 持仓展示在缺少合约规格时补了兜底显示：
   - 对 `OPTION / SWAP / FUTURES`，若拿不到合约规格，先按“张”显示原始合约数量，避免数量口径直接失真
+- 持仓估值与规格兜底继续增强：
+  - 对常见 `OPTION / SWAP / FUTURES` 增加了合约面值 fallback
+  - 期权优先尝试 `uly` / `instFamily` 两套查询口径
+  - ticker 缺 bid/ask 时，会再补查一次 order book 顶档价格
 - 策略接入结构做了 B 方案重构：
   - 新增 `strategy_ui_schema.py`，集中声明策略 UI 默认值、显示隐藏、强制只读/强制行为
   - 新增 `strategy_runtime_registry.py`，集中声明策略 family、运行入口、方向偏好、参考线标题等
@@ -103,6 +143,17 @@
   - `btc_long_5_software_results_analysis`
   - `btc_long_three_config_full_compare`
   - `r001_r003_local_full_compare`
+- 新增 `btc_dynamic_long_ma50_vs_ema55_matrix`：
+  - 用来对比 BTC 动态委托做多里 `MA50` vs `EMA55` 作为趋势/入场参考线的矩阵结果
+- 最佳参数组合包说明文档扩写：
+  - 新增策略设计思路
+  - 新增动态保护 R 口径说明
+  - 新增完整参数 JSON 展示
+  - 新增文档末尾更新日志
+- 最佳参数组合包说明继续升级：
+  - 新增字段级说明
+  - 新增动态保护规则口径解释
+  - 组合包文档更适合作为长期参数手册回看
 - 实盘轮询链路补了三项轻量扩容优化：
   - 默认轮询间隔从 `3s` 调整为 `10s`
   - 新增 `market_data_hub`，同进程内相同 `instId + bar` 的 K 线共享读取
@@ -244,8 +295,9 @@ python main.py
 
 ### 回测与研究
 
-- [okx_quant/backtest.py](/D:/qqokx/okx_quant/backtest.py)：回测核心逻辑，当前已统一支持 `nR 保本`、`首档触发R`、斜率策略差异化说明与纯本地回测
-- [okx_quant/backtest_ui.py](/D:/qqokx/okx_quant/backtest_ui.py)：回测界面，当前已支持 `EMA55 斜率做空` 的 `首档触发R`、`首档保本特例`、`斜率转正平仓` 等参数联动
+- [okx_quant/backtest.py](/D:/qqokx/okx_quant/backtest.py)：回测核心逻辑，当前已统一支持 `nR 保本`、纯本地回测、四段动态保护，以及可配置的 `dynamic_protection_rules`
+- [okx_quant/backtest_ui.py](/D:/qqokx/okx_quant/backtest_ui.py)：回测界面，当前已支持动态保护规则编辑、运行编号/归档编号区分、以及新的回测 K 线图交互
+- [okx_quant/backtest_audit.py](/D:/qqokx/okx_quant/backtest_audit.py)：回测审计导出，当前已改成流式 CSV 写出
 - [okx_quant/candle_store.py](/D:/qqokx/okx_quant/candle_store.py)：本地 K 线存储，当前已支持查询缓存根数与时间覆盖范围
 - [reports/ema55_slope_short_research_report.html](/D:/qqokx/reports/ema55_slope_short_research_report.html)：EMA55 斜率做空研究报告（HTML）
 - [scripts/run_ema55_slope_short_research_report.py](/D:/qqokx/scripts/run_ema55_slope_short_research_report.py)：EMA55 斜率做空研究复跑脚本
@@ -286,6 +338,7 @@ python main.py
 - `scripts/generate_btc_long_5_software_analysis.py`：BTC 多头最近 5 组软件回测结果分析
 - `scripts/run_btc_long_three_config_full_compare.py`：BTC 多头 3 套配置全量对比
 - `scripts/run_r001_r003_local_full_compare_report.py`：`R001-R003` 本地全量重跑对比报告
+- `scripts/run_btc_dynamic_long_ma50_vs_ema55_matrix.py`：BTC 动态委托做多 `MA50 vs EMA55` 参数矩阵对比
 
 ## 现货套利快速上手
 
@@ -412,7 +465,7 @@ scripts\release_one_click.bat
   ：服务器升级操作清单，适合按实盘环境灰度启用私有 WS 加速
 - [软件开发指南.md](/D:/qqokx/软件开发指南.md)
   ：开发维护说明，已补充策略 schema / runtime registry、EMA55 斜率做空、回测与 UI 接入约定
-- [版本开发日志_v0.6.22.md](/D:/qqokx/版本开发日志_v0.6.22.md)
+- [版本开发日志_v0.6.23.md](/D:/qqokx/版本开发日志_v0.6.23.md)
   ：本轮版本开发日志，归档 EMA55 策略、研究报告、B 方案结构重构与验证结果
 - [reports/strategy_ui_schema_b_impl.md](/D:/qqokx/reports/strategy_ui_schema_b_impl.md)
   ：B 方案实施说明，记录 schema / registry 这一轮已经解掉的耦合和剩余尾项

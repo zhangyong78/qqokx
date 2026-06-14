@@ -1,0 +1,808 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>回测参数区紧凑化方案（待审核）</title>
+  <style>
+    :root {
+      --bg: #f3f1ea;
+      --panel: rgba(251, 250, 247, 0.96);
+      --panel-soft: #f8f4ec;
+      --line: #ddd5c6;
+      --line-strong: #cfc2ae;
+      --text: #2c2a27;
+      --muted: #6d665c;
+      --accent: #8b5a2e;
+      --accent-soft: #ede1d0;
+      --ok: #2e6a48;
+      --ok-soft: #e5f1ea;
+      --warn: #83662b;
+      --warn-soft: #f5ebcf;
+      --shadow: 0 14px 36px rgba(74, 58, 38, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif;
+      background:
+        radial-gradient(circle at top right, #fbf8f1 0, #f3f1ea 44%, #ece7dc 100%);
+    }
+
+    .page {
+      width: min(1720px, calc(100vw - 40px));
+      margin: 20px auto 36px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.3fr 1fr;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    .card,
+    .mock-card,
+    .note-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+    }
+
+    .card {
+      padding: 22px 24px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 30px;
+      padding: 0 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .04em;
+    }
+
+    h1 {
+      margin: 14px 0 10px;
+      font-size: 30px;
+      line-height: 1.14;
+    }
+
+    p {
+      margin: 0;
+      line-height: 1.72;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .decision-list {
+      margin: 14px 0 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: 10px;
+    }
+
+    .decision-list li {
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: var(--panel-soft);
+      border: 1px solid #e7ded0;
+      font-size: 13px;
+      line-height: 1.56;
+    }
+
+    .mock-card {
+      overflow: hidden;
+    }
+
+    .mock-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(255,255,255,.74), rgba(244,239,231,.95));
+    }
+
+    .mock-title {
+      display: grid;
+      gap: 4px;
+    }
+
+    .mock-title strong {
+      font-size: 18px;
+    }
+
+    .mock-title span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .header-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .btn {
+      min-height: 34px;
+      padding: 0 12px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      white-space: nowrap;
+    }
+
+    .btn.primary {
+      color: #fff;
+      border-color: var(--accent);
+      background: var(--accent);
+    }
+
+    .mock-body {
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .summary-strip {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr .95fr;
+      gap: 10px;
+    }
+
+    .summary-box {
+      min-height: 58px;
+      padding: 11px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, #fcfbf8, #f6f1e8);
+      display: grid;
+      gap: 5px;
+    }
+
+    .summary-box strong {
+      font-size: 13px;
+    }
+
+    .summary-box span {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .macro-grid {
+      display: grid;
+      grid-template-columns: 1.2fr 1.2fr .95fr;
+      gap: 12px;
+      align-items: start;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: linear-gradient(180deg, #fcfbf8, #f7f3eb);
+      overflow: hidden;
+    }
+
+    .panel h2 {
+      margin: 0;
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(237, 225, 208, .75);
+      font-size: 13px;
+      letter-spacing: .02em;
+    }
+
+    .panel-body {
+      padding: 12px 14px 14px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .field-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 9px 12px;
+    }
+
+    .field-grid.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .field {
+      display: grid;
+      gap: 4px;
+    }
+
+    .field.full {
+      grid-column: 1 / -1;
+    }
+
+    .field label {
+      font-size: 11px;
+      line-height: 1.22;
+      color: var(--muted);
+    }
+
+    .input,
+    .select {
+      min-height: 34px;
+      padding: 0 10px;
+      border-radius: 9px;
+      border: 1px solid #d7cfbf;
+      background: rgba(255,255,255,.94);
+      display: flex;
+      align-items: center;
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .inline-pair {
+      display: grid;
+      grid-template-columns: 84px 1fr;
+      gap: 8px;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+    }
+
+    .chip {
+      min-height: 30px;
+      padding: 0 10px;
+      border-radius: 999px;
+      border: 1px solid #ded2c1;
+      background: #efe7da;
+      color: #534a40;
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .chip.on {
+      background: var(--ok-soft);
+      border-color: #bdd7c4;
+      color: var(--ok);
+      font-weight: 700;
+    }
+
+    .chip.warn {
+      background: var(--warn-soft);
+      border-color: #e3d6aa;
+      color: var(--warn);
+      font-weight: 700;
+    }
+
+    .micro-note {
+      font-size: 11px;
+      line-height: 1.48;
+      color: var(--muted);
+    }
+
+    .rule-card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fcfbf8;
+      overflow: hidden;
+    }
+
+    .rule-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(237, 225, 208, .65);
+    }
+
+    .rule-head strong {
+      font-size: 13px;
+    }
+
+    .rule-head span {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .rule-grid {
+      display: grid;
+      grid-template-columns: 72px 76px 72px 82px 70px 72px 70px;
+      gap: 8px;
+      align-items: center;
+      padding: 10px 14px 14px;
+      font-size: 12px;
+    }
+
+    .rule-grid.header {
+      padding-bottom: 0;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .cell {
+      min-height: 30px;
+      padding: 0 8px;
+      border-radius: 8px;
+      border: 1px solid #ddd3c2;
+      background: #fff;
+      display: flex;
+      align-items: center;
+    }
+
+    .backtest-band {
+      border: 1px solid var(--line-strong);
+      border-radius: 16px;
+      background: linear-gradient(180deg, #faf7f1, #f3ede2);
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .backtest-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .backtest-head strong {
+      font-size: 14px;
+    }
+
+    .tag-row {
+      display: flex;
+      gap: 7px;
+      flex-wrap: wrap;
+    }
+
+    .band-grid {
+      display: grid;
+      grid-template-columns: 1.1fr 1.1fr .9fr;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .subbox {
+      min-height: 100%;
+      padding: 11px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.66);
+      display: grid;
+      gap: 9px;
+    }
+
+    .subbox strong {
+      font-size: 12px;
+    }
+
+    .action-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .hint-bar {
+      padding: 9px 12px;
+      border-radius: 10px;
+      border: 1px dashed #d5c6af;
+      background: rgba(255,255,255,.48);
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.52;
+    }
+
+    .notes-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .note-card {
+      padding: 14px 16px;
+    }
+
+    .note-card h3 {
+      margin: 0 0 8px;
+      font-size: 14px;
+    }
+
+    .note-card p,
+    .note-card li {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.65;
+    }
+
+    .note-card ul {
+      margin: 0;
+      padding-left: 18px;
+    }
+
+    @media (max-width: 1400px) {
+      .hero,
+      .summary-strip,
+      .macro-grid,
+      .band-grid,
+      .notes-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 1100px) {
+      .field-grid,
+      .field-grid.three {
+        grid-template-columns: 1fr;
+      }
+
+      .rule-grid {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <div class="card">
+        <span class="eyebrow">待审核方案 / 参数区紧凑化</span>
+        <h1>把“策略参数 + 回测参数”收成一屏主操作区</h1>
+        <p>
+          这版不只是压缩“回测参数”，而是把上半区整体重排。核心是按使用频率和修改习惯分层：
+          高频参数留在第一视线，低频开关收进胶囊和短说明，动态保护规则保持独立但更紧凑，
+          尽量减少整块区域的纵向占用，避免一打开就先看到滚动条。
+        </p>
+      </div>
+      <div class="card">
+        <ul class="decision-list">
+          <li><strong>第一层放常改项：</strong> 策略、交易对、K线周期、均线、ATR、止盈、风险资金、时间区间、K线数。</li>
+          <li><strong>第二层放低频项：</strong> 复利、纯本地回测、时间保本、手续费偏移、同步周期等收为短标签或工具条。</li>
+          <li><strong>规则区独立：</strong> 动态保护规则不再拉长主表单，但保持可见，避免藏得太深。</li>
+          <li><strong>说明改短句：</strong> 长提示改成底部提示条，只保留决策需要的信息，不再占一整行解释文。</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="mock-card">
+      <div class="mock-header">
+        <div class="mock-title">
+          <strong>回测参数区紧凑版示意</strong>
+          <span>目标：1920 宽度下尽量不出现顶部滚动条，且保留现有功能口径</span>
+        </div>
+        <div class="header-actions">
+          <button class="btn">导入参数模板</button>
+          <button class="btn">清除模板来源</button>
+          <button class="btn">同步历史数据</button>
+          <button class="btn">校验数据</button>
+          <button class="btn">当前参数单组回测</button>
+          <button class="btn primary">开始回测</button>
+        </div>
+      </div>
+
+      <div class="mock-body">
+        <div class="summary-strip">
+          <div class="summary-box">
+            <strong>第一屏优先看什么</strong>
+            <span>先看到“策略怎么跑、风险怎么定、时间怎么切”，不是先看到大段说明文字和稀疏空白。</span>
+          </div>
+          <div class="summary-box">
+            <strong>哪些保留展开</strong>
+            <span>动态保护规则仍然直接可见，因为它是策略行为的一部分，不建议彻底折叠隐藏。</span>
+          </div>
+          <div class="summary-box">
+            <strong>哪些改成短控件</strong>
+            <span>复利、纯本地、时间保本、手续费偏移、同步周期这类低频项，统一改成紧凑标签行。</span>
+          </div>
+        </div>
+
+        <div class="macro-grid">
+          <section class="panel">
+            <h2>策略与品种</h2>
+            <div class="panel-body">
+              <div class="field-grid">
+                <div class="field full">
+                  <label>策略</label>
+                  <div class="input">EMA 动态委托做多</div>
+                </div>
+                <div class="field">
+                  <label>交易对</label>
+                  <div class="select">ETH-USDT-SWAP</div>
+                </div>
+                <div class="field">
+                  <label>K线周期</label>
+                  <div class="select">1小时</div>
+                </div>
+                <div class="field full">
+                  <label>Profile / 模板来源</label>
+                  <div class="input">当前未加载参数模板；可手填，或通过“导入参数模板”回填</div>
+                </div>
+              </div>
+              <div class="chips">
+                <span class="chip on">模板已对齐字段口径</span>
+                <span class="chip">导入参数模板</span>
+                <span class="chip">清除模板来源</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2>信号与止盈</h2>
+            <div class="panel-body">
+              <div class="field-grid">
+                <div class="field">
+                  <label>快线均线</label>
+                  <div class="inline-pair">
+                    <div class="select">EMA</div>
+                    <div class="input">21</div>
+                  </div>
+                </div>
+                <div class="field">
+                  <label>趋势均线</label>
+                  <div class="inline-pair">
+                    <div class="select">EMA</div>
+                    <div class="input">55</div>
+                  </div>
+                </div>
+                <div class="field">
+                  <label>ATR 周期</label>
+                  <div class="input">10</div>
+                </div>
+                <div class="field">
+                  <label>止损 ATR 倍数</label>
+                  <div class="input">2</div>
+                </div>
+                <div class="field">
+                  <label>信号方向</label>
+                  <div class="select">只做多</div>
+                </div>
+                <div class="field">
+                  <label>挂单参考线</label>
+                  <div class="inline-pair">
+                    <div class="select">EMA</div>
+                    <div class="input">34</div>
+                  </div>
+                </div>
+                <div class="field">
+                  <label>止盈方式</label>
+                  <div class="select">动态止盈</div>
+                </div>
+                <div class="field">
+                  <label>每波最多开仓次数</label>
+                  <div class="input">3</div>
+                </div>
+              </div>
+              <div class="chips">
+                <span class="chip on">启用保本</span>
+                <span class="chip on">移动止盈触发 R = 3</span>
+                <span class="chip">保本触发 R = 2</span>
+                <span class="chip">首档锁盈 R = 1</span>
+                <span class="chip">移动步长 R = 1</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2>低频开关</h2>
+            <div class="panel-body">
+              <div class="chips">
+                <span class="chip on">启用手续费偏移</span>
+                <span class="chip">启用时间保本</span>
+                <span class="chip">EMA55 斜率平仓</span>
+                <span class="chip">N R 锁盈递推</span>
+                <span class="chip">满 N 根收盘平仓</span>
+              </div>
+              <div class="micro-note">
+                这些项目不是每次都改，不再占用大行高，统一收为“状态胶囊 + 少量关键值”的表达方式。
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <section class="rule-card">
+          <div class="rule-head">
+            <div>
+              <strong>动态保护规则</strong>
+              <span>保留直接可见，但缩成一张独立紧凑卡，避免把主表单撑高</span>
+            </div>
+            <div class="tag-row">
+              <span class="chip">新增规则</span>
+              <span class="chip">按当前字段生成</span>
+            </div>
+          </div>
+          <div class="rule-grid header">
+            <div>触发R</div>
+            <div>动作</div>
+            <div>锁到R</div>
+            <div>递进</div>
+            <div>每隔R</div>
+            <div>每次加R</div>
+            <div>操作</div>
+          </div>
+          <div class="rule-grid">
+            <div class="cell">2</div>
+            <div class="cell">保本</div>
+            <div class="cell">-</div>
+            <div class="cell">无</div>
+            <div class="cell">-</div>
+            <div class="cell">-</div>
+            <div class="cell">删除</div>
+            <div class="cell">3</div>
+            <div class="cell">锁盈</div>
+            <div class="cell">1</div>
+            <div class="cell">阶梯</div>
+            <div class="cell">1</div>
+            <div class="cell">1</div>
+            <div class="cell">删除</div>
+          </div>
+        </section>
+
+        <section class="backtest-band">
+          <div class="backtest-head">
+            <strong>回测参数</strong>
+            <div class="tag-row">
+              <span class="chip on">启用手续费偏移</span>
+              <span class="chip">启用复利</span>
+              <span class="chip warn">纯本地回测（不补拉）</span>
+            </div>
+          </div>
+
+          <div class="band-grid">
+            <section class="subbox">
+              <strong>资金与成本</strong>
+              <div class="field-grid">
+                <div class="field">
+                  <label>固定风险金 / 数量</label>
+                  <div class="input">100</div>
+                </div>
+                <div class="field">
+                  <label>初始资金</label>
+                  <div class="input">10000</div>
+                </div>
+                <div class="field">
+                  <label>Maker 手续费(%)</label>
+                  <div class="input">0.015</div>
+                </div>
+                <div class="field">
+                  <label>Taker 手续费(%)</label>
+                  <div class="input">0.036</div>
+                </div>
+                <div class="field">
+                  <label>仓位模式</label>
+                  <div class="select">固定风险金</div>
+                </div>
+                <div class="field">
+                  <label>风险百分比(%)</label>
+                  <div class="input">1</div>
+                </div>
+                <div class="field">
+                  <label>开仓滑点(%)</label>
+                  <div class="input">0</div>
+                </div>
+                <div class="field">
+                  <label>平仓滑点(%)</label>
+                  <div class="input">0</div>
+                </div>
+                <div class="field full">
+                  <label>资金费率 / 8h(%)</label>
+                  <div class="input">0</div>
+                </div>
+              </div>
+              <div class="micro-note">
+                回测参考：BTC-USDT-SWAP 建议 1U，最低 15U。此类提示改成短注，不再单独占整行。
+              </div>
+            </section>
+
+            <section class="subbox">
+              <strong>时间与样本</strong>
+              <div class="field-grid">
+                <div class="field">
+                  <label>开始时间</label>
+                  <div class="input"></div>
+                </div>
+                <div class="field">
+                  <label>结束时间</label>
+                  <div class="input"></div>
+                </div>
+                <div class="field">
+                  <label>回测K线数</label>
+                  <div class="input">10000</div>
+                </div>
+                <div class="field">
+                  <label>时间保本K线数</label>
+                  <div class="input">0</div>
+                </div>
+              </div>
+              <div class="chips">
+                <span class="chip">支持 YYYYMMDD</span>
+                <span class="chip">支持 YYYYMMDD HH:MM</span>
+                <span class="chip">0 = 全量</span>
+                <span class="chip">10000 = 最近 10000 根</span>
+              </div>
+            </section>
+
+            <section class="subbox">
+              <strong>运行与数据</strong>
+              <div class="chips">
+                <span class="chip on">5m</span>
+                <span class="chip">15m</span>
+                <span class="chip on">1H</span>
+                <span class="chip">4H</span>
+              </div>
+              <div class="action-row">
+                <div class="btn">同步历史数据</div>
+                <div class="btn">同步价格精度/下单规则</div>
+                <div class="btn">校验数据</div>
+              </div>
+              <div class="micro-note">
+                “同步周期 + 数据按钮”统一压成工具盒，避免原来单独一大行横向散开。
+              </div>
+            </section>
+          </div>
+
+          <div class="hint-bar">
+            “开始回测”固定运行 SL × 1 / 1.5 / 2，每一行再按 TP = SL × 1 / 2 / 3 生成 9 组批量回测。
+            先勾选要同步的周期再点“同步历史数据”；默认只同步当前主回测周期，缺数据会直接提示。
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section class="notes-grid">
+      <article class="note-card">
+        <h3>这版重点</h3>
+        <ul>
+          <li>“策略参数”和“回测参数”统一放进一屏主操作区，不再上下两块松散堆叠。</li>
+          <li>高频字段采用两列或三列密排，低频状态用胶囊表达，减少空白。</li>
+          <li>规则表保持可见，但从“拖长页面的主因”改成“高度可控的独立卡片”。</li>
+        </ul>
+      </article>
+
+      <article class="note-card">
+        <h3>落地建议</h3>
+        <ul>
+          <li>正式 UI 可保留当前字段和变量，不改业务逻辑，只先调整容器分组和 grid 布局。</li>
+          <li>长提示文统一改成底部提示条或分组脚注，减少每一行字段后面的说明文本。</li>
+          <li>参数区和回测报告区继续保留上下拖动分隔，用户能自行取舍可视高度。</li>
+        </ul>
+      </article>
+
+      <article class="note-card">
+        <h3>待你确认</h3>
+        <ul>
+          <li>是否接受把“低频开关”从复选框改成更紧凑的状态标签表达。</li>
+          <li>是否接受“策略与品种 / 信号与止盈 / 回测参数”这种新的归类顺序。</li>
+          <li>确认后我再把这套结构正式落到 Tk 界面，不只停留在 HTML 审核稿。</li>
+        </ul>
+      </article>
+    </section>
+  </div>
+</body>
+</html>

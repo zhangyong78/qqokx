@@ -15,7 +15,18 @@ from okx_quant.daily_filters import (
 )
 from okx_quant.indicators import atr, ema
 from okx_quant.market_data_hub import MarketDataHub
-from okx_quant.models import Credentials, Instrument, OrderPlan, ProtectionPlan, SignalDecision, StrategyConfig
+from okx_quant.models import (
+    Credentials,
+    DynamicProtectionRule,
+    Instrument,
+    OrderPlan,
+    ProtectionPlan,
+    SignalDecision,
+    StrategyConfig,
+    build_legacy_dynamic_protection_rules,
+    describe_dynamic_protection_rules,
+    normalize_dynamic_protection_rules,
+)
 from okx_quant.notifications import EmailNotifier
 from okx_quant.okx_client import (
     OkxApiError,
@@ -94,7 +105,29 @@ def _live_ema55_slope_dynamic_fee_offset_enabled(config: StrategyConfig) -> bool
 
 
 def _live_ema55_slope_lock_profit_trigger_r(config: StrategyConfig) -> int:
-    return max(int(config.ema55_slope_lock_profit_trigger_r), 2)
+    return config.resolved_dynamic_trailing_start_r()
+
+
+def _live_dynamic_break_even_trigger_r(config: StrategyConfig) -> int:
+    if is_btc_ema55_slope_short_strategy(config.strategy_id):
+        return _live_ema55_slope_lock_profit_trigger_r(config)
+    return config.resolved_dynamic_break_even_trigger_r()
+
+
+def _live_dynamic_separate_break_even_enabled(config: StrategyConfig) -> bool:
+    return not is_btc_ema55_slope_short_strategy(config.strategy_id)
+
+
+def _live_dynamic_trailing_step_r(config: StrategyConfig) -> int:
+    return config.resolved_dynamic_trailing_step_r()
+
+
+def _live_dynamic_first_lock_r(config: StrategyConfig) -> int:
+    return config.resolved_dynamic_first_lock_r()
+
+
+def _live_dynamic_protection_rules(config: StrategyConfig) -> tuple[DynamicProtectionRule, ...]:
+    return config.resolved_dynamic_protection_rules()
 
 
 def _live_dynamic_break_even_uses_trigger_r(config: StrategyConfig) -> bool:
@@ -105,12 +138,27 @@ def _live_dynamic_break_even_uses_trigger_r(config: StrategyConfig) -> bool:
 
 
 def _live_dynamic_break_even_summary(config: StrategyConfig) -> str:
+    rules = _live_dynamic_protection_rules(config)
+    if rules:
+        parts = list(
+            describe_dynamic_protection_rules(
+                rules,
+                fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+            )
+        )
+        parts.append(f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根")
+        return " | ".join(parts)
     if _live_dynamic_break_even_uses_trigger_r(config):
         return (
+            f"保本触发R={_live_dynamic_break_even_trigger_r(config)} | "
+            f"移动止盈触发R={_live_ema55_slope_lock_profit_trigger_r(config)} | "
             f"首档触发R={_live_ema55_slope_lock_profit_trigger_r(config)} | "
+            f"首档锁盈R={_live_dynamic_first_lock_r(config) or '自动'} | "
+            f"移动步长R={_live_dynamic_trailing_step_r(config)} | "
+            f"保本={config.dynamic_two_r_break_even_label()} | "
             f"nR保本={config.dynamic_two_r_break_even_label()}"
         )
-    return f"2R保本={config.dynamic_two_r_break_even_label()}"
+    return f"保本触发R={_live_dynamic_break_even_trigger_r(config)} | 保本={config.dynamic_two_r_break_even_label()}"
 
 
 def _live_ema55_slope_negative_entry_bars(config: StrategyConfig) -> int:
@@ -3213,7 +3261,13 @@ class StrategyEngine:
                     next_trigger_r=next_trigger_r,
                     tick_size=trade_instrument.tick_size,
                     two_r_break_even=dynamic_two_r_break_even,
+                    break_even_trigger_r=_live_dynamic_break_even_trigger_r(config),
+                    trailing_start_r=_live_ema55_slope_lock_profit_trigger_r(config),
+                    first_lock_r=_live_dynamic_first_lock_r(config),
+                    trailing_step_r=_live_dynamic_trailing_step_r(config),
+                    separate_break_even_enabled=_live_dynamic_separate_break_even_enabled(config),
                     dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+                    dynamic_protection_rules=_live_dynamic_protection_rules(config),
                     holding_bars=holding_bars,
                     time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                     time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
@@ -3254,6 +3308,12 @@ class StrategyEngine:
                             two_r_break_even=dynamic_two_r_break_even,
                             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
                             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+                            break_even_trigger_r=_live_dynamic_break_even_trigger_r(config),
+                            trailing_start_r=_live_ema55_slope_lock_profit_trigger_r(config),
+                            first_lock_r=_live_dynamic_first_lock_r(config),
+                            trailing_step_r=_live_dynamic_trailing_step_r(config),
+                            separate_break_even_enabled=_live_dynamic_separate_break_even_enabled(config),
+                            dynamic_protection_rules=_live_dynamic_protection_rules(config),
                         )
                         if dynamic_take_profit_enabled
                         else "止损"
@@ -3328,7 +3388,13 @@ class StrategyEngine:
                     next_trigger_r=next_trigger_r,
                     tick_size=trade_instrument.tick_size,
                     two_r_break_even=dynamic_two_r_break_even,
+                    break_even_trigger_r=_live_dynamic_break_even_trigger_r(config),
+                    trailing_start_r=_live_ema55_slope_lock_profit_trigger_r(config),
+                    first_lock_r=_live_dynamic_first_lock_r(config),
+                    trailing_step_r=_live_dynamic_trailing_step_r(config),
+                    separate_break_even_enabled=_live_dynamic_separate_break_even_enabled(config),
                     dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+                    dynamic_protection_rules=_live_dynamic_protection_rules(config),
                     holding_bars=holding_bars,
                     time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                     time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
@@ -3369,6 +3435,12 @@ class StrategyEngine:
                             two_r_break_even=dynamic_two_r_break_even,
                             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
                             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+                            break_even_trigger_r=_live_dynamic_break_even_trigger_r(config),
+                            trailing_start_r=_live_ema55_slope_lock_profit_trigger_r(config),
+                            first_lock_r=_live_dynamic_first_lock_r(config),
+                            trailing_step_r=_live_dynamic_trailing_step_r(config),
+                            separate_break_even_enabled=_live_dynamic_separate_break_even_enabled(config),
+                            dynamic_protection_rules=_live_dynamic_protection_rules(config),
                         )
                         if dynamic_take_profit_enabled
                         else "止损"
@@ -3829,7 +3901,13 @@ class StrategyEngine:
             next_trigger_r=next_trigger_r,
             tick_size=trade_instrument.tick_size,
             two_r_break_even=_live_ema55_slope_dynamic_two_r_break_even_enabled(config),
+            break_even_trigger_r=_live_dynamic_break_even_trigger_r(config),
+            trailing_start_r=_live_ema55_slope_lock_profit_trigger_r(config),
+            first_lock_r=_live_dynamic_first_lock_r(config),
+            trailing_step_r=_live_dynamic_trailing_step_r(config),
+            separate_break_even_enabled=_live_dynamic_separate_break_even_enabled(config),
             dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
+            dynamic_protection_rules=_live_dynamic_protection_rules(config),
             holding_bars=holding_bars,
             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
             time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
@@ -5080,7 +5158,13 @@ class StrategyEngine:
                     next_trigger_r=next_trigger_r,
                     tick_size=trade_instrument.tick_size,
                     two_r_break_even=_live_ema55_slope_dynamic_two_r_break_even_enabled(config),
+                    break_even_trigger_r=_live_dynamic_break_even_trigger_r(config),
+                    trailing_start_r=_live_ema55_slope_lock_profit_trigger_r(config),
+                    first_lock_r=_live_dynamic_first_lock_r(config),
+                    trailing_step_r=_live_dynamic_trailing_step_r(config),
+                    separate_break_even_enabled=_live_dynamic_separate_break_even_enabled(config),
                     dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
+                    dynamic_protection_rules=_live_dynamic_protection_rules(config),
                     holding_bars=holding_bars,
                     time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                     time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
@@ -5346,6 +5430,12 @@ class StrategyEngine:
             two_r_break_even=_live_ema55_slope_dynamic_two_r_break_even_enabled(config),
             dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
+            break_even_trigger_r=_live_dynamic_break_even_trigger_r(config),
+            trailing_start_r=_live_ema55_slope_lock_profit_trigger_r(config),
+            first_lock_r=_live_dynamic_first_lock_r(config),
+            trailing_step_r=_live_dynamic_trailing_step_r(config),
+            separate_break_even_enabled=_live_dynamic_separate_break_even_enabled(config),
+            dynamic_protection_rules=_live_dynamic_protection_rules(config),
         )
         history_item = self._lookup_recent_position_close_history(
             credentials,
@@ -5573,12 +5663,29 @@ def _dynamic_stop_price_live(
     trigger_r: int,
     tick_size: Decimal,
     two_r_break_even: bool = False,
+    break_even_trigger_r: int = 2,
+    trailing_start_r: int = 2,
+    first_lock_r: int = 0,
+    trailing_step_r: int = 1,
+    separate_break_even_enabled: bool = True,
     taker_fee_rate: Decimal = LIVE_DYNAMIC_TAKER_FEE_RATE,
     dynamic_fee_offset_enabled: bool = True,
 ) -> Decimal:
-    lock_multiple = Decimal(max(trigger_r - 1, 0))
-    if two_r_break_even and trigger_r == 2:
-        lock_multiple = Decimal("0")
+    step_r = max(int(trailing_step_r), 1)
+    trailing_start_multiple = max(int(trailing_start_r), 2)
+    first_lock_multiple = max(int(first_lock_r), 0)
+    if first_lock_multiple <= 0:
+        first_lock_multiple = max(trailing_start_multiple - step_r, 0)
+    lock_multiple = first_lock_multiple
+    if two_r_break_even:
+        break_even_lock_trigger_r = max(int(break_even_trigger_r), 1) if separate_break_even_enabled else 2
+        if trigger_r == break_even_lock_trigger_r:
+            lock_multiple = Decimal("0")
+    elif trigger_r > trailing_start_multiple:
+        trigger_offset = max(int(trigger_r) - trailing_start_multiple, 0)
+        step_count = trigger_offset // step_r
+        lock_multiple = first_lock_multiple + step_count * step_r
+    lock_multiple = Decimal(str(lock_multiple))
     fee_offset = _dynamic_two_taker_fee_offset_live(
         entry_price,
         taker_fee_rate,
@@ -5593,6 +5700,95 @@ def _dynamic_stop_price_live(
     return snap_to_increment(raw, tick_size, rounding)
 
 
+def _dynamic_stop_price_live_for_lock_r(
+    *,
+    direction: Literal["long", "short"],
+    entry_price: Decimal,
+    risk_per_unit: Decimal,
+    lock_r: int,
+    tick_size: Decimal,
+    taker_fee_rate: Decimal = LIVE_DYNAMIC_TAKER_FEE_RATE,
+    dynamic_fee_offset_enabled: bool = True,
+) -> Decimal:
+    lock_multiple = Decimal(str(max(int(lock_r), 0)))
+    fee_offset = _dynamic_two_taker_fee_offset_live(
+        entry_price,
+        taker_fee_rate,
+        enabled=dynamic_fee_offset_enabled,
+    )
+    raw = (
+        entry_price + (risk_per_unit * lock_multiple) + fee_offset
+        if direction == "long"
+        else entry_price - (risk_per_unit * lock_multiple) - fee_offset
+    )
+    rounding = "up" if direction == "long" else "down"
+    return snap_to_increment(raw, tick_size, rounding)
+
+
+def _live_dynamic_rule_base_lock_r(rule: DynamicProtectionRule) -> int:
+    return 0 if rule.resolved_action() == "break_even" else rule.resolved_lock_r()
+
+
+def _live_dynamic_rule_lock_r(rule: DynamicProtectionRule, trigger_r: int) -> int:
+    lock_r = _live_dynamic_rule_base_lock_r(rule)
+    if not rule.trailing_enabled():
+        return lock_r
+    if trigger_r <= rule.resolved_trigger_r():
+        return lock_r
+    step_count = max(trigger_r - rule.resolved_trigger_r(), 0) // rule.resolved_trail_every_r()
+    return max(lock_r + step_count * rule.resolved_trail_add_r(), 0)
+
+
+def _live_resolved_dynamic_rules(
+    *,
+    dynamic_protection_rules: tuple[DynamicProtectionRule, ...] | tuple[dict, ...] | list[DynamicProtectionRule] | list[dict] | None,
+    two_r_break_even: bool,
+    break_even_trigger_r: int,
+    trailing_start_r: int,
+    first_lock_r: int,
+    trailing_step_r: int,
+) -> tuple[DynamicProtectionRule, ...]:
+    normalized = normalize_dynamic_protection_rules(dynamic_protection_rules)
+    if normalized:
+        return normalized
+    return build_legacy_dynamic_protection_rules(
+        break_even_enabled=bool(two_r_break_even),
+        break_even_trigger_r=max(int(break_even_trigger_r), 1),
+        trailing_start_r=max(int(trailing_start_r), 2),
+        first_lock_r=max(int(first_lock_r), 0),
+        trailing_step_r=max(int(trailing_step_r), 1),
+    )
+
+
+def _live_dynamic_next_rule_index(rules: tuple[DynamicProtectionRule, ...], next_trigger_r: int) -> int:
+    for index, rule in enumerate(rules):
+        if rule.resolved_trigger_r() >= next_trigger_r:
+            return index
+    return len(rules)
+
+
+def _live_dynamic_next_event_after_rule(rules: tuple[DynamicProtectionRule, ...], rule_index: int) -> int:
+    rule = rules[rule_index]
+    next_explicit_r = rules[rule_index + 1].resolved_trigger_r() if rule_index + 1 < len(rules) else 0
+    next_trailing_r = rule.resolved_trigger_r() + rule.resolved_trail_every_r() if rule.trailing_enabled() else 0
+    candidates = [value for value in (next_explicit_r, next_trailing_r) if value > 0]
+    return min(candidates) if candidates else 0
+
+
+def _live_dynamic_next_event_after_trailing(
+    rules: tuple[DynamicProtectionRule, ...],
+    *,
+    active_rule_index: int,
+    current_trigger_r: int,
+) -> int:
+    next_rule_index = _live_dynamic_next_rule_index(rules, current_trigger_r + 1)
+    next_explicit_r = rules[next_rule_index].resolved_trigger_r() if next_rule_index < len(rules) else 0
+    active_rule = rules[active_rule_index]
+    next_trailing_r = current_trigger_r + active_rule.resolved_trail_every_r() if active_rule.trailing_enabled() else 0
+    candidates = [value for value in (next_explicit_r, next_trailing_r) if value > 0]
+    return min(candidates) if candidates else 0
+
+
 def _advance_dynamic_stop_live(
     *,
     direction: Literal["long", "short"],
@@ -5603,22 +5799,38 @@ def _advance_dynamic_stop_live(
     next_trigger_r: int,
     tick_size: Decimal,
     two_r_break_even: bool = False,
+    break_even_trigger_r: int = 2,
+    trailing_start_r: int = 2,
+    first_lock_r: int = 0,
+    trailing_step_r: int = 1,
+    separate_break_even_enabled: bool = True,
     taker_fee_rate: Decimal = LIVE_DYNAMIC_TAKER_FEE_RATE,
     dynamic_fee_offset_enabled: bool = True,
+    dynamic_protection_rules: tuple[DynamicProtectionRule, ...] | tuple[dict, ...] | list[DynamicProtectionRule] | list[dict] | None = None,
     holding_bars: int = 0,
     time_stop_break_even_enabled: bool = False,
     time_stop_break_even_bars: int = 0,
 ) -> tuple[Decimal, Decimal, int, bool]:
+    resolved_rules = _live_resolved_dynamic_rules(
+        dynamic_protection_rules=dynamic_protection_rules,
+        two_r_break_even=two_r_break_even,
+        break_even_trigger_r=break_even_trigger_r,
+        trailing_start_r=trailing_start_r,
+        first_lock_r=first_lock_r,
+        trailing_step_r=trailing_step_r,
+    )
     if risk_per_unit <= 0:
-        next_take_profit = _dynamic_trigger_price_live(
-            direction=direction,
-            entry_price=entry_price,
-            risk_per_unit=Decimal("0"),
-            trigger_r=next_trigger_r,
-            tick_size=tick_size,
-            taker_fee_rate=taker_fee_rate,
-            dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
-        )
+        next_take_profit = current_price
+        if next_trigger_r > 0:
+            next_take_profit = _dynamic_trigger_price_live(
+                direction=direction,
+                entry_price=entry_price,
+                risk_per_unit=Decimal("0"),
+                trigger_r=next_trigger_r,
+                tick_size=tick_size,
+                taker_fee_rate=taker_fee_rate,
+                dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+            )
         updated_stop = current_stop_loss
         moved = False
         if time_stop_break_even_enabled and time_stop_break_even_bars > 0 and holding_bars >= time_stop_break_even_bars:
@@ -5656,6 +5868,90 @@ def _advance_dynamic_stop_live(
         elif current_price <= candidate and candidate < updated_stop:
             updated_stop = candidate
             moved = True
+    if resolved_rules:
+        while trigger_r > 0:
+            trigger_price = _dynamic_trigger_price_live(
+                direction=direction,
+                entry_price=entry_price,
+                risk_per_unit=risk_per_unit,
+                trigger_r=trigger_r,
+                tick_size=tick_size,
+                taker_fee_rate=taker_fee_rate,
+                dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+            )
+            reached = current_price >= trigger_price if direction == "long" else current_price <= trigger_price
+            if not reached:
+                return updated_stop, trigger_price, trigger_r, moved
+
+            next_rule_index = _live_dynamic_next_rule_index(resolved_rules, trigger_r)
+            is_explicit_rule_event = (
+                next_rule_index < len(resolved_rules)
+                and resolved_rules[next_rule_index].resolved_trigger_r() == trigger_r
+            )
+            if is_explicit_rule_event:
+                rule = resolved_rules[next_rule_index]
+                lock_r = _live_dynamic_rule_lock_r(rule, trigger_r)
+                candidate = _dynamic_stop_price_live_for_lock_r(
+                    direction=direction,
+                    entry_price=entry_price,
+                    risk_per_unit=risk_per_unit,
+                    lock_r=lock_r,
+                    tick_size=tick_size,
+                    taker_fee_rate=taker_fee_rate,
+                    dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+                )
+                updated_stop = max(updated_stop, candidate) if direction == "long" else min(updated_stop, candidate)
+                trigger_r = _live_dynamic_next_event_after_rule(resolved_rules, next_rule_index)
+            elif next_rule_index > 0:
+                active_rule_index = next_rule_index - 1
+                active_rule = resolved_rules[active_rule_index]
+                lock_r = _live_dynamic_rule_lock_r(active_rule, trigger_r)
+                candidate = _dynamic_stop_price_live_for_lock_r(
+                    direction=direction,
+                    entry_price=entry_price,
+                    risk_per_unit=risk_per_unit,
+                    lock_r=lock_r,
+                    tick_size=tick_size,
+                    taker_fee_rate=taker_fee_rate,
+                    dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+                )
+                updated_stop = max(updated_stop, candidate) if direction == "long" else min(updated_stop, candidate)
+                trigger_r = _live_dynamic_next_event_after_trailing(
+                    resolved_rules,
+                    active_rule_index=active_rule_index,
+                    current_trigger_r=trigger_r,
+                )
+            else:
+                break
+            moved = True
+        return updated_stop, current_price, trigger_r, moved
+    if two_r_break_even and separate_break_even_enabled:
+        be_trigger_r = max(int(break_even_trigger_r), 1)
+        be_trigger_price = _dynamic_trigger_price_live(
+            direction=direction,
+            entry_price=entry_price,
+            risk_per_unit=risk_per_unit,
+            trigger_r=be_trigger_r,
+            tick_size=tick_size,
+            taker_fee_rate=taker_fee_rate,
+            dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+        )
+        be_reached = current_price >= be_trigger_price if direction == "long" else current_price <= be_trigger_price
+        if be_reached:
+            candidate = _time_stop_break_even_price_live(
+                direction=direction,
+                entry_price=entry_price,
+                tick_size=tick_size,
+                taker_fee_rate=taker_fee_rate,
+                dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+            )
+            if direction == "long":
+                if candidate > updated_stop:
+                    updated_stop = candidate
+                    moved = True
+            elif candidate < updated_stop:
+                updated_stop = candidate
+                moved = True
     while True:
         trigger_price = _dynamic_trigger_price_live(
             direction=direction,
@@ -5677,11 +5973,16 @@ def _advance_dynamic_stop_live(
             trigger_r=trigger_r,
             tick_size=tick_size,
             two_r_break_even=two_r_break_even,
+            break_even_trigger_r=break_even_trigger_r,
+            trailing_start_r=trailing_start_r,
+            first_lock_r=first_lock_r,
+            trailing_step_r=trailing_step_r,
+            separate_break_even_enabled=separate_break_even_enabled,
             taker_fee_rate=taker_fee_rate,
             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
         )
         updated_stop = max(updated_stop, candidate) if direction == "long" else min(updated_stop, candidate)
-        trigger_r += 1
+        trigger_r += max(int(trailing_step_r), 1)
         moved = True
 
 
@@ -5719,7 +6020,21 @@ def _classify_live_dynamic_close_reason(
     two_r_break_even: bool,
     dynamic_fee_offset_enabled: bool,
     time_stop_break_even_enabled: bool,
+    break_even_trigger_r: int = 2,
+    trailing_start_r: int = 2,
+    first_lock_r: int = 0,
+    trailing_step_r: int = 1,
+    separate_break_even_enabled: bool = True,
+    dynamic_protection_rules: tuple[DynamicProtectionRule, ...] | tuple[dict, ...] | list[DynamicProtectionRule] | list[dict] | None = None,
 ) -> str:
+    resolved_rules = _live_resolved_dynamic_rules(
+        dynamic_protection_rules=dynamic_protection_rules,
+        two_r_break_even=two_r_break_even,
+        break_even_trigger_r=break_even_trigger_r,
+        trailing_start_r=trailing_start_r,
+        first_lock_r=first_lock_r,
+        trailing_step_r=trailing_step_r,
+    )
     if current_stop_loss == initial_stop_loss:
         return "止损"
     if time_stop_break_even_enabled and current_stop_loss == _time_stop_break_even_price_live(
@@ -5729,6 +6044,54 @@ def _classify_live_dynamic_close_reason(
         dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
     ):
         return "保本"
+    if two_r_break_even and current_stop_loss == _time_stop_break_even_price_live(
+        direction=direction,
+        entry_price=entry_price,
+        tick_size=tick_size,
+        dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+    ):
+        return "保本"
+    if resolved_rules:
+        active_next_trigger_r = next_trigger_r
+        if active_next_trigger_r <= 0:
+            last_rule = resolved_rules[-1]
+            active_next_trigger_r = (
+                last_rule.resolved_trigger_r() + last_rule.resolved_trail_every_r()
+                if last_rule.trailing_enabled()
+                else last_rule.resolved_trigger_r() + 1
+            )
+        next_rule_index = _live_dynamic_next_rule_index(resolved_rules, active_next_trigger_r)
+        for index in range(min(next_rule_index, len(resolved_rules))):
+            rule = resolved_rules[index]
+            lock_r = _live_dynamic_rule_lock_r(rule, rule.resolved_trigger_r())
+            candidate = _dynamic_stop_price_live_for_lock_r(
+                direction=direction,
+                entry_price=entry_price,
+                risk_per_unit=risk_per_unit,
+                lock_r=lock_r,
+                tick_size=tick_size,
+                dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+            )
+            if candidate == current_stop_loss:
+                return "保本" if lock_r <= 0 else f"{lock_r}R"
+        if next_rule_index > 0:
+            active_rule = resolved_rules[next_rule_index - 1]
+            if active_rule.trailing_enabled():
+                trail_trigger_r = active_rule.resolved_trigger_r() + active_rule.resolved_trail_every_r()
+                while trail_trigger_r < active_next_trigger_r:
+                    lock_r = _live_dynamic_rule_lock_r(active_rule, trail_trigger_r)
+                    candidate = _dynamic_stop_price_live_for_lock_r(
+                        direction=direction,
+                        entry_price=entry_price,
+                        risk_per_unit=risk_per_unit,
+                        lock_r=lock_r,
+                        tick_size=tick_size,
+                        dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+                    )
+                    if candidate == current_stop_loss:
+                        return "保本" if lock_r <= 0 else f"{lock_r}R"
+                    trail_trigger_r += active_rule.resolved_trail_every_r()
+        return "保本" if _is_profit_protecting_stop(direction=direction, entry_price=entry_price, stop_loss=current_stop_loss) else "止损"
     for trigger_r in range(2, next_trigger_r):
         candidate = _dynamic_stop_price_live(
             direction=direction,
@@ -5737,14 +6100,32 @@ def _classify_live_dynamic_close_reason(
             trigger_r=trigger_r,
             tick_size=tick_size,
             two_r_break_even=two_r_break_even,
+            break_even_trigger_r=break_even_trigger_r,
+            trailing_start_r=trailing_start_r,
+            first_lock_r=first_lock_r,
+            trailing_step_r=trailing_step_r,
+            separate_break_even_enabled=separate_break_even_enabled,
             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
         )
         if candidate != current_stop_loss:
             continue
-        locked_r = 0 if (two_r_break_even and trigger_r == 2) else max(trigger_r - 1, 0)
+        break_even_lock_trigger_r = max(int(break_even_trigger_r), 1) if separate_break_even_enabled else 2
+        if two_r_break_even and trigger_r == break_even_lock_trigger_r:
+            locked_r = 0
+        else:
+            trailing_start_multiple = max(int(trailing_start_r), 2)
+            trailing_step_multiple = max(int(trailing_step_r), 1)
+            first_lock_multiple = max(int(first_lock_r), 0)
+            if first_lock_multiple <= 0:
+                first_lock_multiple = max(trailing_start_multiple - trailing_step_multiple, 0)
+            if trigger_r <= trailing_start_multiple:
+                locked_r = first_lock_multiple
+            else:
+                trigger_offset = max(int(trigger_r) - trailing_start_multiple, 0)
+                step_count = trigger_offset // trailing_step_multiple
+                locked_r = max(first_lock_multiple + step_count * trailing_step_multiple, 0)
         return "保本" if locked_r <= 0 else f"{locked_r}R"
     return "止损"
-
 
 def _reset_startup_signal_gate(gate_state: StartupSignalGateState) -> None:
     gate_state.blocked_signal = None

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Iterable
 
 from okx_quant.backtest import (
     BacktestResult,
@@ -19,6 +20,63 @@ from okx_quant.strategy_catalog import BACKTEST_STRATEGY_DEFINITIONS, is_dynamic
 STRATEGY_ID_TO_NAME = {item.strategy_id: item.name for item in BACKTEST_STRATEGY_DEFINITIONS}
 FUNDING_INTERVAL_MS = Decimal("28800000")
 ZERO = Decimal("0")
+CAPITAL_AUDIT_FIELDNAMES = [
+    "candle_index",
+    "ts",
+    "datetime",
+    "open",
+    "high",
+    "low",
+    "close",
+    "realized_pnl_change",
+    "realized_pnl_cumulative",
+    "realized_equity",
+    "auto_floating_pnl_report_basis",
+    "manual_floating_pnl_report_basis",
+    "floating_pnl_report_basis",
+    "auto_floating_pnl_liquidation_basis",
+    "manual_floating_pnl_liquidation_basis",
+    "floating_pnl_liquidation_basis",
+    "marked_equity_report_basis",
+    "marked_equity_liquidation_basis",
+    "realized_drawdown",
+    "realized_drawdown_pct",
+    "marked_drawdown_liquidation",
+    "marked_drawdown_liquidation_pct",
+    "auto_positions",
+    "manual_positions",
+    "occupied_slots",
+]
+OPERATION_AUDIT_FIELDNAMES = [
+    "event_seq",
+    "event_hint",
+    "position_id",
+    "group",
+    "action",
+    "ts",
+    "datetime",
+    "candle_index",
+    "direction",
+    "price",
+    "size",
+    "entry_fee",
+    "exit_fee",
+    "total_fee",
+    "funding_cost",
+    "gross_pnl",
+    "pnl",
+    "floating_pnl_report_basis",
+    "floating_pnl_liquidation_basis",
+    "stop_loss",
+    "take_profit",
+    "break_even_price",
+    "realized_pnl_change",
+    "auto_positions_after",
+    "manual_positions_after",
+    "occupied_slots_after",
+    "reason",
+    "note",
+]
 
 
 @dataclass(frozen=True)
@@ -129,10 +187,16 @@ def export_single_backtest_audit_files(
     report_path: Path,
 ) -> dict[str, Path]:
     paths = single_backtest_artifact_paths(report_path)
-    capital_rows = _build_capital_audit_rows(result)
-    operation_rows = _build_operation_rows(result)
-    _write_csv(paths["capital"], capital_rows)
-    _write_csv(paths["operations"], operation_rows)
+    capital_row_count = _write_csv(
+        paths["capital"],
+        _iter_capital_audit_rows(result),
+        fieldnames=CAPITAL_AUDIT_FIELDNAMES,
+    )
+    operation_row_count = _write_csv(
+        paths["operations"],
+        _iter_operation_rows(result),
+        fieldnames=OPERATION_AUDIT_FIELDNAMES,
+    )
     manifest_payload = {
         "schema_version": 1,
         "export_scope": "single",
@@ -144,8 +208,8 @@ def export_single_backtest_audit_files(
             "trade_count": len(result.trades),
             "manual_position_count": len(result.manual_positions),
             "terminal_open_position_count": 1 if result.open_position is not None else 0,
-            "capital_row_count": len(capital_rows),
-            "operation_event_count": len(operation_rows),
+            "capital_row_count": capital_row_count,
+            "operation_event_count": operation_row_count,
             "candle_limit": candle_limit,
         },
         "report_summary": _report_snapshot(result),
@@ -223,7 +287,7 @@ def export_batch_backtest_manifest(
     _write_json(paths["manifest"], payload)
     return paths["manifest"]
 
-def _build_capital_audit_rows(result: BacktestResult) -> list[dict[str, str]]:
+def _iter_capital_audit_rows(result: BacktestResult) -> Iterable[dict[str, str]]:
     exposures = _build_capital_exposures(result)
     realized_changes = [ZERO for _ in result.candles]
     last_index = max(len(result.candles) - 1, 0)
@@ -232,7 +296,6 @@ def _build_capital_audit_rows(result: BacktestResult) -> list[dict[str, str]]:
             continue
         exit_index = max(0, min(trade.exit_index, last_index))
         realized_changes[exit_index] += trade.pnl
-    rows: list[dict[str, str]] = []
     realized_running = ZERO
     marked_peak_liquidation = result.initial_capital
     for index, candle in enumerate(result.candles):
@@ -283,79 +346,72 @@ def _build_capital_audit_rows(result: BacktestResult) -> list[dict[str, str]]:
         )
         realized_drawdown = result.drawdown_curve[index] if index < len(result.drawdown_curve) else ZERO
         realized_drawdown_pct = result.drawdown_pct_curve[index] if index < len(result.drawdown_pct_curve) else ZERO
-        rows.append(
-            {
-                "candle_index": str(index),
-                "ts": str(candle.ts),
-                "datetime": _format_timestamp(candle.ts),
-                "open": str(candle.open),
-                "high": str(candle.high),
-                "low": str(candle.low),
-                "close": str(candle.close),
-                "realized_pnl_change": str(realized_change),
-                "realized_pnl_cumulative": str(realized_running),
-                "realized_equity": str(realized_equity),
-                "auto_floating_pnl_report_basis": str(auto_report),
-                "manual_floating_pnl_report_basis": str(manual_report),
-                "floating_pnl_report_basis": str(floating_report),
-                "auto_floating_pnl_liquidation_basis": str(auto_liquidation),
-                "manual_floating_pnl_liquidation_basis": str(manual_liquidation),
-                "floating_pnl_liquidation_basis": str(floating_liquidation),
-                "marked_equity_report_basis": str(marked_equity_report),
-                "marked_equity_liquidation_basis": str(marked_equity_liquidation),
-                "realized_drawdown": str(realized_drawdown),
-                "realized_drawdown_pct": str(realized_drawdown_pct),
-                "marked_drawdown_liquidation": str(marked_drawdown_liquidation),
-                "marked_drawdown_liquidation_pct": str(marked_drawdown_liquidation_pct),
-                "auto_positions": str(auto_positions),
-                "manual_positions": str(manual_positions),
-                "occupied_slots": str(auto_positions + manual_positions),
-            }
-        )
-    return rows
+        yield {
+            "candle_index": str(index),
+            "ts": str(candle.ts),
+            "datetime": _format_timestamp(candle.ts),
+            "open": str(candle.open),
+            "high": str(candle.high),
+            "low": str(candle.low),
+            "close": str(candle.close),
+            "realized_pnl_change": str(realized_change),
+            "realized_pnl_cumulative": str(realized_running),
+            "realized_equity": str(realized_equity),
+            "auto_floating_pnl_report_basis": str(auto_report),
+            "manual_floating_pnl_report_basis": str(manual_report),
+            "floating_pnl_report_basis": str(floating_report),
+            "auto_floating_pnl_liquidation_basis": str(auto_liquidation),
+            "manual_floating_pnl_liquidation_basis": str(manual_liquidation),
+            "floating_pnl_liquidation_basis": str(floating_liquidation),
+            "marked_equity_report_basis": str(marked_equity_report),
+            "marked_equity_liquidation_basis": str(marked_equity_liquidation),
+            "realized_drawdown": str(realized_drawdown),
+            "realized_drawdown_pct": str(realized_drawdown_pct),
+            "marked_drawdown_liquidation": str(marked_drawdown_liquidation),
+            "marked_drawdown_liquidation_pct": str(marked_drawdown_liquidation_pct),
+            "auto_positions": str(auto_positions),
+            "manual_positions": str(manual_positions),
+            "occupied_slots": str(auto_positions + manual_positions),
+        }
 
 
-def _build_operation_rows(result: BacktestResult) -> list[dict[str, str]]:
+def _iter_operation_rows(result: BacktestResult) -> Iterable[dict[str, str]]:
     events = _build_operation_events(result)
-    rows: list[dict[str, str]] = []
     auto_positions = 0
     manual_positions = 0
     for index, event in enumerate(events, start=1):
         auto_positions += event.auto_delta
         manual_positions += event.manual_delta
-        rows.append(
-            {
-                "event_seq": str(index),
-                "event_hint": event.event_seq_hint,
-                "position_id": event.position_id,
-                "group": event.group,
-                "action": event.action,
-                "ts": str(event.ts),
-                "datetime": _format_timestamp(event.ts),
-                "candle_index": str(event.candle_index),
-                "direction": event.signal,
-                "price": _decimal_text(event.price),
-                "size": _decimal_text(event.size),
-                "entry_fee": _decimal_text(event.entry_fee),
-                "exit_fee": _decimal_text(event.exit_fee),
-                "total_fee": _decimal_text(event.total_fee),
-                "funding_cost": _decimal_text(event.funding_cost),
-                "gross_pnl": _decimal_text(event.gross_pnl),
-                "pnl": _decimal_text(event.pnl),
-                "floating_pnl_report_basis": _decimal_text(event.floating_pnl_report_basis),
-                "floating_pnl_liquidation_basis": _decimal_text(event.floating_pnl_liquidation_basis),
-                "stop_loss": _decimal_text(event.stop_loss),
-                "take_profit": _decimal_text(event.take_profit),
-                "break_even_price": _decimal_text(event.break_even_price),
-                "realized_pnl_change": _decimal_text(event.realized_pnl_change),
-                "auto_positions_after": str(auto_positions),
-                "manual_positions_after": str(manual_positions),
-                "occupied_slots_after": str(auto_positions + manual_positions),
-                "reason": event.reason,
-                "note": event.note,
-            }
-        )
-    return rows
+        yield {
+            "event_seq": str(index),
+            "event_hint": event.event_seq_hint,
+            "position_id": event.position_id,
+            "group": event.group,
+            "action": event.action,
+            "ts": str(event.ts),
+            "datetime": _format_timestamp(event.ts),
+            "candle_index": str(event.candle_index),
+            "direction": event.signal,
+            "price": _decimal_text(event.price),
+            "size": _decimal_text(event.size),
+            "entry_fee": _decimal_text(event.entry_fee),
+            "exit_fee": _decimal_text(event.exit_fee),
+            "total_fee": _decimal_text(event.total_fee),
+            "funding_cost": _decimal_text(event.funding_cost),
+            "gross_pnl": _decimal_text(event.gross_pnl),
+            "pnl": _decimal_text(event.pnl),
+            "floating_pnl_report_basis": _decimal_text(event.floating_pnl_report_basis),
+            "floating_pnl_liquidation_basis": _decimal_text(event.floating_pnl_liquidation_basis),
+            "stop_loss": _decimal_text(event.stop_loss),
+            "take_profit": _decimal_text(event.take_profit),
+            "break_even_price": _decimal_text(event.break_even_price),
+            "realized_pnl_change": _decimal_text(event.realized_pnl_change),
+            "auto_positions_after": str(auto_positions),
+            "manual_positions_after": str(manual_positions),
+            "occupied_slots_after": str(auto_positions + manual_positions),
+            "reason": event.reason,
+            "note": event.note,
+        }
 
 
 def _build_capital_exposures(result: BacktestResult) -> list[_CapitalExposure]:
@@ -775,76 +831,28 @@ def _fee_rate_from_type(result: BacktestResult, fee_type: str) -> Decimal:
     return ZERO
 
 
-def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
+def _write_csv(
+    path: Path,
+    rows: Iterable[dict[str, str]],
+    *,
+    fieldnames: list[str] | tuple[str, ...] | None = None,
+) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(rows[0].keys()) if rows else []
     if not fieldnames:
         if ".capital." in path.name:
-            fieldnames = [
-                "candle_index",
-                "ts",
-                "datetime",
-                "open",
-                "high",
-                "low",
-                "close",
-                "realized_pnl_change",
-                "realized_pnl_cumulative",
-                "realized_equity",
-                "auto_floating_pnl_report_basis",
-                "manual_floating_pnl_report_basis",
-                "floating_pnl_report_basis",
-                "auto_floating_pnl_liquidation_basis",
-                "manual_floating_pnl_liquidation_basis",
-                "floating_pnl_liquidation_basis",
-                "marked_equity_report_basis",
-                "marked_equity_liquidation_basis",
-                "realized_drawdown",
-                "realized_drawdown_pct",
-                "marked_drawdown_liquidation",
-                "marked_drawdown_liquidation_pct",
-                "auto_positions",
-                "manual_positions",
-                "occupied_slots",
-            ]
+            fieldnames = CAPITAL_AUDIT_FIELDNAMES
         else:
-            fieldnames = [
-                "event_seq",
-                "event_hint",
-                "position_id",
-                "group",
-                "action",
-                "ts",
-                "datetime",
-                "candle_index",
-                "direction",
-                "price",
-                "size",
-                "entry_fee",
-                "exit_fee",
-                "total_fee",
-                "funding_cost",
-                "gross_pnl",
-                "pnl",
-                "floating_pnl_report_basis",
-                "floating_pnl_liquidation_basis",
-                "stop_loss",
-                "take_profit",
-                "break_even_price",
-                "realized_pnl_change",
-                "auto_positions_after",
-                "manual_positions_after",
-                "occupied_slots_after",
-                "reason",
-                "note",
-            ]
+            fieldnames = OPERATION_AUDIT_FIELDNAMES
     temp_path = path.with_suffix(path.suffix + ".tmp")
     with temp_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
+        row_count = 0
         for row in rows:
             writer.writerow(row)
+            row_count += 1
     temp_path.replace(path)
+    return row_count
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:

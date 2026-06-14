@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, BooleanVar, Canvas, PanedWindow, StringVar, Text, Toplevel, X, Y
+from tkinter import BOTH, END, LEFT, RIGHT, BooleanVar, Button, Canvas, PanedWindow, StringVar, Text, Toplevel, X, Y
 from tkinter import filedialog, messagebox, ttk
 
 from okx_quant.backtest import (
@@ -44,7 +44,18 @@ from okx_quant.backtest_strategy_pool import is_strategy_pool_config, strategy_p
 from okx_quant.candle_continuity import bar_step_ms, find_candle_gaps_half_open_range, find_candle_gaps_in_window
 from okx_quant.candle_store import get_candle_count, get_candle_time_bounds
 from okx_quant.candle_cache_verify import CacheVerifyOutcome, verify_and_repair_cached_candles
-from okx_quant.models import Instrument, StrategyConfig, moving_average_display_label
+from okx_quant.models import (
+    DynamicProtectionRule,
+    Instrument,
+    StrategyConfig,
+    build_legacy_dynamic_protection_rules,
+    describe_dynamic_protection_rule_overlap_warnings,
+    describe_dynamic_protection_rules,
+    dynamic_protection_rules_to_payload,
+    merge_dynamic_protection_rules,
+    moving_average_display_label,
+    normalize_dynamic_protection_rules,
+)
 from okx_quant.minimum_risk_recommendations import (
     format_risk_recommendation,
     recommended_minimum_risk_amount_for_config,
@@ -137,6 +148,9 @@ DEFAULT_HISTORY_SYNC_BAR_FLAGS = {
 }
 DEFAULT_MAKER_FEE_PERCENT = "0.015"
 DEFAULT_TAKER_FEE_PERCENT = "0.036"
+CHART_ACTION_BUTTON_BG = "#d8f3dc"
+CHART_ACTION_BUTTON_ACTIVE_BG = "#b7e4c7"
+CHART_ACTION_BUTTON_FG = "#1b4332"
 BACKTEST_SIZING_OPTIONS = {
     "固定风险金": "fixed_risk",
     "固定数量": "fixed_size",
@@ -217,6 +231,7 @@ class BacktestLaunchState:
     take_profit_mode_label: str
     max_entries_per_trend: str
     dynamic_two_r_break_even: bool
+    dynamic_break_even_trigger_r: str
     dynamic_fee_offset_enabled: bool
     time_stop_break_even_enabled: bool
     time_stop_break_even_bars: str
@@ -236,6 +251,8 @@ class BacktestLaunchState:
     ema55_slope_exit_enabled: bool = True
     ema55_slope_lock_profit_enabled: bool = True
     ema55_slope_lock_profit_trigger_r: str = "5"
+    dynamic_first_lock_r: str = "0"
+    dynamic_trailing_step_r: str = "1"
     ema55_slope_negative_entry_bars: str = "1"
     maker_fee_percent: str = DEFAULT_MAKER_FEE_PERCENT
     taker_fee_percent: str = DEFAULT_TAKER_FEE_PERCENT
@@ -258,6 +275,25 @@ class BacktestLaunchState:
     backtest_profile_id: str = ""
     backtest_profile_name: str = ""
     backtest_profile_summary: str = ""
+    dynamic_protection_rules_json: str = ""
+
+
+@dataclass
+class _DynamicProtectionRuleEditorRow:
+    frame: ttk.Frame
+    trigger_r: StringVar
+    action: StringVar
+    lock_r: StringVar
+    trail_mode: StringVar
+    trail_every_r: StringVar
+    trail_add_r: StringVar
+    trigger_entry: ttk.Entry
+    action_combo: ttk.Combobox
+    lock_entry: ttk.Entry
+    trail_mode_combo: ttk.Combobox
+    trail_every_entry: ttk.Entry
+    trail_add_entry: ttk.Entry
+    delete_button: ttk.Button
 
 
 @dataclass
@@ -301,6 +337,8 @@ class _BacktestSnapshot:
     maker_fee_rate: Decimal = Decimal("0")
     taker_fee_rate: Decimal = Decimal("0")
     export_path: str | None = None
+    runtime_id: str | None = None
+    archive_id: str | None = None
 
 
 class _BacktestSnapshotStore:
@@ -318,6 +356,7 @@ class _BacktestSnapshotStore:
         config: StrategyConfig,
         candle_limit: int,
         *,
+        runtime_snapshot_id: str | None = None,
         export_path: str | None = None,
     ) -> _BacktestSnapshot:
         self._sequence += 1
@@ -335,6 +374,8 @@ class _BacktestSnapshotStore:
             maker_fee_rate=result.maker_fee_rate,
             taker_fee_rate=result.taker_fee_rate,
             export_path=export_path,
+            runtime_id=runtime_snapshot_id,
+            archive_id=f"S{self._sequence:03d}",
         )
         self._snapshots[snapshot.snapshot_id] = snapshot
         self._order.append(snapshot.snapshot_id)
@@ -433,6 +474,41 @@ def get_backtest_snapshot_store() -> _BacktestSnapshotStore:
     if _BACKTEST_SNAPSHOT_STORE is None:
         _BACKTEST_SNAPSHOT_STORE = _BacktestSnapshotStore()
     return _BACKTEST_SNAPSHOT_STORE
+
+
+def _runtime_snapshot_id(snapshot: _BacktestSnapshot) -> str | None:
+    if snapshot.runtime_id:
+        return snapshot.runtime_id
+    if snapshot.snapshot_id.startswith("R"):
+        return snapshot.snapshot_id
+    return None
+
+
+def _archive_snapshot_id(snapshot: _BacktestSnapshot) -> str | None:
+    if snapshot.archive_id:
+        return snapshot.archive_id
+    if snapshot.snapshot_id.startswith("S"):
+        return snapshot.snapshot_id
+    return None
+
+
+def _build_backtest_identity_parts(snapshot: _BacktestSnapshot, *, prefer_archive: bool) -> list[str]:
+    runtime_id = _runtime_snapshot_id(snapshot)
+    archive_id = _archive_snapshot_id(snapshot)
+    if prefer_archive:
+        parts: list[str] = []
+        if archive_id:
+            parts.append(f"归档编号：{archive_id}")
+        else:
+            parts.append(f"归档编号：{snapshot.snapshot_id}")
+        if runtime_id:
+            parts.append(f"当前会话编号：{runtime_id}")
+        return parts
+
+    parts = [f"运行编号：{runtime_id or snapshot.snapshot_id}"]
+    if archive_id:
+        parts.append(f"已归档：{archive_id}")
+    return parts
 
 
 def _normalize_backtest_bar_label(value: str) -> str:
@@ -630,8 +706,9 @@ def _build_backtest_header_summary(snapshot: _BacktestSnapshot) -> str:
     report = snapshot.report
     start_text, end_text = _backtest_snapshot_range_text(snapshot)
     signal_label = SIGNAL_VALUE_TO_LABEL.get(snapshot.config.signal_mode, snapshot.config.signal_mode)
+    identity_text = " | ".join(_build_backtest_identity_parts(snapshot, prefer_archive=False))
     return (
-        f"编号：{snapshot.snapshot_id} | 时间：{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
+        f"{identity_text} | 时间：{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
         f"策略：{_strategy_display_name(snapshot.config)} | 交易对：{snapshot.config.inst_id} | "
         f"区间：{start_text} -> {end_text} | K线：{_normalize_backtest_bar_label(snapshot.config.bar)} | "
         f"样本：{_build_backtest_candle_scope_text(snapshot)} | 方向：{signal_label} | "
@@ -641,11 +718,33 @@ def _build_backtest_header_summary(snapshot: _BacktestSnapshot) -> str:
     )
 
 
-def _build_backtest_compare_row(snapshot: _BacktestSnapshot) -> tuple[str, ...]:
+def _build_backtest_compare_row(snapshot: _BacktestSnapshot, *, prefer_archive: bool = False) -> tuple[str, ...]:
     report = snapshot.report
     config = snapshot.config
+    if prefer_archive:
+        display_id = _archive_snapshot_id(snapshot) or snapshot.snapshot_id
+        return (
+            display_id,
+            snapshot.created_at.strftime("%m-%d %H:%M"),
+            _strategy_display_name(config),
+            config.inst_id,
+            _build_backtest_period_summary(snapshot),
+            _build_backtest_param_summary(
+                config,
+                maker_fee_rate=snapshot.maker_fee_rate,
+                taker_fee_rate=snapshot.taker_fee_rate,
+            ),
+            str(report.total_trades),
+            f"{format_decimal_fixed(report.win_rate, 2)}%",
+            format_decimal_fixed(report.total_pnl, 4),
+            format_decimal_fixed(report.max_drawdown, 4),
+        )
+
+    runtime_id = _runtime_snapshot_id(snapshot) or snapshot.snapshot_id
+    archive_id = _archive_snapshot_id(snapshot) or "-"
     return (
-        snapshot.snapshot_id,
+        runtime_id,
+        archive_id,
         snapshot.created_at.strftime("%m-%d %H:%M"),
         _strategy_display_name(config),
         config.inst_id,
@@ -662,19 +761,34 @@ def _build_backtest_compare_row(snapshot: _BacktestSnapshot) -> tuple[str, ...]:
     )
 
 
-def _configure_backtest_compare_tree(tree: ttk.Treeview) -> None:
-    columns = (
-        ("id", "编号", 54, "center", False),
-        ("time", "回测时间", 112, "center", False),
-        ("strategy", "策略", 150, "w", False),
-        ("symbol", "交易对", 122, "center", False),
-        ("period", "回测区间 / K线", 320, "w", True),
-        ("params", "参数摘要", 520, "w", True),
-        ("trades", "交易数", 68, "e", False),
-        ("win_rate", "胜率", 80, "e", False),
-        ("pnl", "总盈亏", 100, "e", False),
-        ("drawdown", "最大回撤", 100, "e", False),
-    )
+def _configure_backtest_compare_tree(tree: ttk.Treeview, *, id_heading: str, include_archive_column: bool = False) -> None:
+    if include_archive_column:
+        columns = (
+            ("id", id_heading, 92, "center", False),
+            ("archive_id", "已归档", 92, "center", False),
+            ("time", "回测时间", 112, "center", False),
+            ("strategy", "策略", 150, "w", False),
+            ("symbol", "交易对", 122, "center", False),
+            ("period", "回测区间 / K线", 320, "w", True),
+            ("params", "参数摘要", 520, "w", True),
+            ("trades", "交易数", 68, "e", False),
+            ("win_rate", "胜率", 80, "e", False),
+            ("pnl", "总盈亏", 100, "e", False),
+            ("drawdown", "最大回撤", 100, "e", False),
+        )
+    else:
+        columns = (
+            ("id", id_heading, 132, "center", False),
+            ("time", "回测时间", 112, "center", False),
+            ("strategy", "策略", 150, "w", False),
+            ("symbol", "交易对", 122, "center", False),
+            ("period", "回测区间 / K线", 320, "w", True),
+            ("params", "参数摘要", 520, "w", True),
+            ("trades", "交易数", 68, "e", False),
+            ("win_rate", "胜率", 80, "e", False),
+            ("pnl", "总盈亏", 100, "e", False),
+            ("drawdown", "最大回撤", 100, "e", False),
+        )
     for column_id, heading, width, anchor, stretch in columns:
         tree.heading(column_id, text=heading)
         tree.column(column_id, width=width, anchor=anchor, stretch=stretch)
@@ -683,8 +797,8 @@ def _configure_backtest_compare_tree(tree: ttk.Treeview) -> None:
 def _btc_ema55_slope_exit_summary(config: StrategyConfig) -> str:
     trigger_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
     slope_exit = "开" if config.ema55_slope_exit_enabled else "关"
-    lock_profit = "nR保本开启" if config.ema55_slope_lock_profit_enabled else "nR保本关闭"
-    return f"斜率转正平仓={slope_exit} / 首档触发R={trigger_r} / {lock_profit}"
+    lock_profit = "nR保本开启(含双向手续费)" if config.ema55_slope_lock_profit_enabled else "nR保本关闭"
+    return f"斜率转正平仓={slope_exit} / 首档触发R={trigger_r}R / {lock_profit}"
 
 
 def _btc_ema55_slope_reentry_summary(config: StrategyConfig) -> str:
@@ -712,7 +826,7 @@ def _backtest_exit_mode_label(config: StrategyConfig) -> str:
     if config.strategy_id in {STRATEGY_EMA55_SLOPE_SHORT_ID, STRATEGY_BODY_RETEST_SHORT_ID} and config.take_profit_mode == "dynamic":
         trigger_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
         slope_exit = "开" if config.ema55_slope_exit_enabled else "关"
-        return f"动态止盈 / 斜率转正平仓={slope_exit} / 首档触发R={trigger_r}"
+        return f"动态止盈 / 斜率转正平仓={slope_exit} / 首档触发R={trigger_r}R"
     if config.strategy_id in {STRATEGY_EMA55_SLOPE_SHORT_ID, STRATEGY_BODY_RETEST_SHORT_ID}:
         slope_exit = "开" if config.ema55_slope_exit_enabled else "关"
         return f"固定止盈 / 斜率转正平仓={slope_exit}"
@@ -724,6 +838,49 @@ def _uses_dynamic_break_even_trigger_r(config: StrategyConfig) -> bool:
         config.strategy_id,
         "ema55_slope_lock_profit_trigger_r",
     )
+
+
+def _dynamic_protection_summary_parts(config: StrategyConfig) -> tuple[str, ...]:
+    rules = config.resolved_dynamic_protection_rules()
+    if rules:
+        return describe_dynamic_protection_rules(
+            rules,
+            fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+        )
+    if _uses_dynamic_break_even_trigger_r(config):
+        return (
+            f"保本触发R{max(int(config.dynamic_break_even_trigger_r), 1)}",
+            f"移动止盈触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
+            f"首档锁盈R{max(int(config.dynamic_first_lock_r), 0) if int(config.dynamic_first_lock_r) > 0 else '自动'}",
+            f"移动步长R{max(int(config.dynamic_trailing_step_r), 1)}",
+            f"首档触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
+            f"nR保本{config.dynamic_two_r_break_even_label()}",
+        )
+    return (f"2R保本{config.dynamic_two_r_break_even_label()}",)
+
+
+def _dynamic_protection_metric_parts(config: StrategyConfig) -> tuple[str, ...]:
+    rules = config.resolved_dynamic_protection_rules()
+    if rules:
+        return tuple(
+            "动态保护规则：" + part if index == 0 else part
+            for index, part in enumerate(
+                describe_dynamic_protection_rules(
+                    rules,
+                    fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+                )
+            )
+        )
+    if _uses_dynamic_break_even_trigger_r(config):
+        return (
+            f"保本触发R：{max(int(config.dynamic_break_even_trigger_r), 1)}",
+            f"移动止盈触发R：{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
+            f"首档锁盈R：{max(int(config.dynamic_first_lock_r), 0) if int(config.dynamic_first_lock_r) > 0 else '自动'}",
+            f"移动步长R：{max(int(config.dynamic_trailing_step_r), 1)}",
+            f"首档触发R：{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
+            f"nR保本：{config.dynamic_two_r_break_even_label()}",
+        )
+    return (f"2R保本：{config.dynamic_two_r_break_even_label()}",)
 
 
 def _build_backtest_param_summary(
@@ -764,8 +921,7 @@ def _build_backtest_param_summary(
     if config.strategy_id in {STRATEGY_EMA55_SLOPE_SHORT_ID, STRATEGY_BODY_RETEST_SHORT_ID}:
         extra_parts = [_backtest_exit_mode_label(config)]
         if config.take_profit_mode == "dynamic":
-            extra_parts.append(f"首档触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}")
-            extra_parts.append(f"nR保本{config.dynamic_two_r_break_even_label()}")
+            extra_parts.extend(_dynamic_protection_summary_parts(config))
             extra_parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
             extra_parts.append(
                 f"时间保本{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
@@ -786,11 +942,7 @@ def _build_backtest_param_summary(
     if profile.uses_dynamic_orders or strategy_is_cross_family(config.strategy_id):
         extra_parts = [_backtest_exit_mode_label(config)]
         if config.take_profit_mode == "dynamic":
-            if _uses_dynamic_break_even_trigger_r(config):
-                extra_parts.append(f"首档触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}")
-                extra_parts.append(f"nR保本{config.dynamic_two_r_break_even_label()}")
-            else:
-                extra_parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
+            extra_parts.extend(_dynamic_protection_summary_parts(config))
             extra_parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
             extra_parts.append(
                 f"时间保本{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
@@ -844,12 +996,12 @@ def _backtest_export_detail_lines(export_path: str | None) -> list[str]:
         return [f"报告文件：{export_path}"]
 
 
-def _build_backtest_compare_detail(snapshot: _BacktestSnapshot) -> str:
+def _build_backtest_compare_detail(snapshot: _BacktestSnapshot, *, prefer_archive: bool = False) -> str:
     config = snapshot.config
     strategy_name = _strategy_display_name(config)
     start_text, end_text = _backtest_snapshot_range_text(snapshot)
     lines = [
-        f"编号：{snapshot.snapshot_id}",
+        *_build_backtest_identity_parts(snapshot, prefer_archive=prefer_archive),
         f"回测时间：{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
         f"策略：{strategy_name}",
         f"交易对：{config.inst_id}",
@@ -1325,10 +1477,14 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "take_profit_mode": config.take_profit_mode,
         "max_entries_per_trend": config.max_entries_per_trend,
         "dynamic_two_r_break_even": config.dynamic_two_r_break_even,
+        "dynamic_break_even_trigger_r": int(config.dynamic_break_even_trigger_r),
         "dynamic_fee_offset_enabled": config.dynamic_fee_offset_enabled,
+        "dynamic_protection_rules": list(dynamic_protection_rules_to_payload(config.resolved_dynamic_protection_rules())),
         "ema55_slope_exit_enabled": config.ema55_slope_exit_enabled,
         "ema55_slope_lock_profit_enabled": config.ema55_slope_lock_profit_enabled,
         "ema55_slope_lock_profit_trigger_r": int(config.ema55_slope_lock_profit_trigger_r),
+        "dynamic_first_lock_r": int(config.dynamic_first_lock_r),
+        "dynamic_trailing_step_r": int(config.dynamic_trailing_step_r),
         "ema55_slope_negative_entry_bars": int(config.ema55_slope_negative_entry_bars),
         "trend_ema_slope_filter_enabled": config.trend_ema_slope_filter_enabled,
         "trend_ema_slope_filter_lookback_bars": config.trend_ema_slope_filter_lookback_bars,
@@ -1454,10 +1610,14 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         take_profit_mode=str(payload.get("take_profit_mode", "dynamic")),
         max_entries_per_trend=int(payload.get("max_entries_per_trend", 1)),
         dynamic_two_r_break_even=bool(payload.get("dynamic_two_r_break_even", True)),
+        dynamic_break_even_trigger_r=int(payload.get("dynamic_break_even_trigger_r", 2)),
         dynamic_fee_offset_enabled=bool(payload.get("dynamic_fee_offset_enabled", True)),
+        dynamic_protection_rules=normalize_dynamic_protection_rules(payload.get("dynamic_protection_rules")),
         ema55_slope_exit_enabled=coerce_bool(payload.get("ema55_slope_exit_enabled"), True),
         ema55_slope_lock_profit_enabled=coerce_bool(payload.get("ema55_slope_lock_profit_enabled"), False),
         ema55_slope_lock_profit_trigger_r=int(payload.get("ema55_slope_lock_profit_trigger_r", 5)),
+        dynamic_first_lock_r=int(payload.get("dynamic_first_lock_r", 0)),
+        dynamic_trailing_step_r=int(payload.get("dynamic_trailing_step_r", 1)),
         ema55_slope_negative_entry_bars=int(payload.get("ema55_slope_negative_entry_bars", 1)),
         trend_ema_slope_filter_enabled=coerce_bool(payload.get("trend_ema_slope_filter_enabled"), True),
         trend_ema_slope_filter_lookback_bars=int(payload.get("trend_ema_slope_filter_lookback_bars", 5)),
@@ -1610,6 +1770,7 @@ def _serialize_backtest_snapshot(snapshot: _BacktestSnapshot) -> dict[str, objec
         "config": _serialize_strategy_config(snapshot.config),
         "report": _serialize_backtest_report(snapshot.report),
         "report_text": snapshot.report_text,
+        "archive_id": snapshot.archive_id or "",
     }
 
 
@@ -1637,6 +1798,8 @@ def _deserialize_backtest_snapshot(payload: object) -> _BacktestSnapshot | None:
             maker_fee_rate=Decimal(str(payload.get("maker_fee_rate", "0"))),
             taker_fee_rate=Decimal(str(payload.get("taker_fee_rate", "0"))),
             export_path=str(payload.get("export_path", "")).strip() or None,
+            runtime_id=None,
+            archive_id=str(payload.get("archive_id", "")).strip() or None,
         )
     except Exception:
         return None
@@ -1696,7 +1859,7 @@ class BacktestCompareOverviewWindow:
             show="headings",
             selectmode="browse",
         )
-        _configure_backtest_compare_tree(self.tree)
+        _configure_backtest_compare_tree(self.tree, id_heading="归档编号")
         tree_scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         tree_scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(
@@ -1720,9 +1883,16 @@ class BacktestCompareOverviewWindow:
         previous_selection = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
         for snapshot in snapshots:
-            self.tree.insert("", END, iid=snapshot.snapshot_id, values=_build_backtest_compare_row(snapshot))
+            self.tree.insert(
+                "",
+                END,
+                iid=snapshot.snapshot_id,
+                values=_build_backtest_compare_row(snapshot, prefer_archive=True),
+            )
         if snapshots:
-            self.summary_text.set(f"已保存 {len(snapshots)} 组历史回测结果。关闭程序后仍会保留。")
+            self.summary_text.set(
+                f"已保存 {len(snapshots)} 组历史回测结果。归档编号用于历史保存。"
+            )
         else:
             self.summary_text.set("暂无历史回测记录。新的回测结果会自动保存到总览页。")
 
@@ -1748,7 +1918,7 @@ class BacktestCompareOverviewWindow:
         self.detail_text.delete("1.0", END)
         if snapshot is None:
             return
-        self.detail_text.insert("1.0", _build_backtest_compare_detail(snapshot))
+        self.detail_text.insert("1.0", _build_backtest_compare_detail(snapshot, prefer_archive=True))
 
     def _clear_all(self) -> None:
         if not messagebox.askyesno("清空历史", "确定要清空全部历史回测记录吗？该操作会同步保存到本地文件。", parent=self.window):
@@ -1817,6 +1987,8 @@ class BacktestWindow:
         self.take_profit_mode_label = StringVar(value=initial_state.take_profit_mode_label)
         self.max_entries_per_trend = StringVar(value=initial_state.max_entries_per_trend)
         self.dynamic_two_r_break_even = BooleanVar(value=initial_state.dynamic_two_r_break_even)
+        self.dynamic_break_even_trigger_r = StringVar(value=initial_state.dynamic_break_even_trigger_r)
+        self.dynamic_protection_rules_json = StringVar(value=initial_state.dynamic_protection_rules_json)
         self.dynamic_fee_offset_enabled = BooleanVar(value=initial_state.dynamic_fee_offset_enabled)
         self.time_stop_break_even_enabled = BooleanVar(value=initial_state.time_stop_break_even_enabled)
         self.time_stop_break_even_bars = StringVar(value=initial_state.time_stop_break_even_bars)
@@ -1831,6 +2003,8 @@ class BacktestWindow:
         self.ema55_slope_exit_enabled = BooleanVar(value=initial_state.ema55_slope_exit_enabled)
         self.ema55_slope_lock_profit_enabled = BooleanVar(value=initial_state.ema55_slope_lock_profit_enabled)
         self.ema55_slope_lock_profit_trigger_r = StringVar(value=initial_state.ema55_slope_lock_profit_trigger_r)
+        self.dynamic_first_lock_r = StringVar(value=initial_state.dynamic_first_lock_r)
+        self.dynamic_trailing_step_r = StringVar(value=initial_state.dynamic_trailing_step_r)
         self.ema55_slope_negative_entry_bars = StringVar(value=initial_state.ema55_slope_negative_entry_bars)
         self.signal_mode_label = StringVar(value=initial_state.signal_mode_label)
         self.trade_mode_label = StringVar(value=initial_state.trade_mode_label)
@@ -1847,6 +2021,11 @@ class BacktestWindow:
         self.backtest_profile_summary = StringVar(value=initial_state.backtest_profile_summary)
         self.profile_summary_text = StringVar(value=self._build_profile_summary_text())
         self.minimum_order_hint_text = StringVar(value="回测参考：请先选择标的。")
+        self._dynamic_protection_rule_rows: list[_DynamicProtectionRuleEditorRow] = []
+        self._dynamic_protection_rules_frame: ttk.Frame | None = None
+        self._dynamic_protection_rules_card: ttk.LabelFrame | None = None
+        self._dynamic_protection_add_rule_button: ttk.Button | None = None
+        self._dynamic_protection_restore_button: ttk.Button | None = None
         self._strategy_parameter_drafts = load_strategy_parameter_drafts()
         self._strategy_parameter_scope = "backtest"
         self._last_strategy_parameter_strategy_id: str | None = None
@@ -1866,6 +2045,8 @@ class BacktestWindow:
         self.heatmap_metric = StringVar(value="总盈亏")
         self.batch_entries_layer_label = StringVar(value=_batch_entries_label(BATCH_MAX_ENTRIES_OPTIONS[0]))
         self._latest_result: BacktestResult | None = None
+        self.chart_frame: ttk.LabelFrame | None = None
+        self.chart_canvas: Canvas | None = None
         self._chart_zoom_window: Toplevel | None = None
         self._chart_zoom_canvas: Canvas | None = None
         self._chart_zoom_intro_label: ttk.Label | None = None
@@ -2023,6 +2204,162 @@ class BacktestWindow:
             except Exception:
                 pass
 
+    def _build_legacy_dynamic_protection_rules_from_current_inputs(self) -> tuple[DynamicProtectionRule, ...]:
+        try:
+            break_even_trigger_r = max(int((self.dynamic_break_even_trigger_r.get() or "2").strip()), 1)
+        except ValueError:
+            break_even_trigger_r = 2
+        try:
+            trailing_start_r = max(int((self.ema55_slope_lock_profit_trigger_r.get() or "5").strip()), 2)
+        except ValueError:
+            trailing_start_r = 5
+        try:
+            first_lock_r = max(int((self.dynamic_first_lock_r.get() or "0").strip()), 0)
+        except ValueError:
+            first_lock_r = 0
+        try:
+            trailing_step_r = max(int((self.dynamic_trailing_step_r.get() or "1").strip()), 1)
+        except ValueError:
+            trailing_step_r = 1
+        return build_legacy_dynamic_protection_rules(
+            break_even_enabled=bool(self.dynamic_two_r_break_even.get()),
+            break_even_trigger_r=break_even_trigger_r,
+            trailing_start_r=trailing_start_r,
+            first_lock_r=first_lock_r,
+            trailing_step_r=trailing_step_r,
+        )
+
+    def _current_dynamic_protection_rules(self) -> tuple[DynamicProtectionRule, ...]:
+        raw = self.dynamic_protection_rules_json.get().strip()
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                return ()
+            return merge_dynamic_protection_rules(
+                self._build_legacy_dynamic_protection_rules_from_current_inputs(),
+                payload,
+            )
+        return self._build_legacy_dynamic_protection_rules_from_current_inputs()
+
+    def _sync_dynamic_protection_rules_json_from_editor(self) -> None:
+        rules_payload: list[dict[str, object]] = []
+        for row in self._dynamic_protection_rule_rows:
+            action = "break_even" if row.action.get() == "保本" else "lock_profit"
+            trail_mode = "step" if row.trail_mode.get() == "阶梯" else "none"
+            trigger_raw = row.trigger_r.get().strip()
+            if not trigger_raw:
+                continue
+            try:
+                trigger_r = max(int(trigger_raw), 1)
+            except ValueError:
+                continue
+            rules_payload.append(
+                {
+                    "trigger_r": trigger_r,
+                    "action": action,
+                    "lock_r": None if action == "break_even" else max(int(row.lock_r.get().strip() or "0"), 0),
+                    "trail_mode": "none" if action == "break_even" else trail_mode,
+                    "trail_every_r": None
+                    if action == "break_even" or trail_mode == "none"
+                    else max(int(row.trail_every_r.get().strip() or "1"), 1),
+                    "trail_add_r": None
+                    if action == "break_even" or trail_mode == "none"
+                    else max(int(row.trail_add_r.get().strip() or "1"), 1),
+                }
+            )
+        serialized = json.dumps(dynamic_protection_rules_to_payload(rules_payload), ensure_ascii=False)
+        if self.dynamic_protection_rules_json.get() != serialized:
+            self.dynamic_protection_rules_json.set(serialized)
+
+    def _update_dynamic_protection_rule_row_state(self, row: _DynamicProtectionRuleEditorRow) -> None:
+        action_is_break_even = row.action.get() == "保本"
+        trail_enabled = (not action_is_break_even) and row.trail_mode.get() == "阶梯"
+        row.lock_entry.configure(state="normal" if not action_is_break_even else "disabled")
+        row.trail_mode_combo.configure(state="readonly" if not action_is_break_even else "disabled")
+        row.trail_every_entry.configure(state="normal" if trail_enabled else "disabled")
+        row.trail_add_entry.configure(state="normal" if trail_enabled else "disabled")
+
+    def _remove_dynamic_protection_rule_row(self, row: _DynamicProtectionRuleEditorRow) -> None:
+        if row not in self._dynamic_protection_rule_rows:
+            return
+        self._dynamic_protection_rule_rows.remove(row)
+        row.frame.destroy()
+        self._sync_dynamic_protection_rules_json_from_editor()
+
+    def _append_dynamic_protection_rule_row(self, rule: DynamicProtectionRule | None = None) -> None:
+        if self._dynamic_protection_rules_frame is None:
+            return
+        normalized = rule.normalized() if rule is not None else None
+        row_frame = ttk.Frame(self._dynamic_protection_rules_frame)
+        row_frame.grid(column=0, row=len(self._dynamic_protection_rule_rows) + 1, sticky="ew", pady=(4, 0))
+        for column, width in ((0, 10), (1, 12), (2, 10), (3, 10), (4, 10), (5, 10), (6, 10)):
+            row_frame.columnconfigure(column, minsize=width)
+        trigger_r = StringVar(value=str(normalized.trigger_r if normalized else len(self._dynamic_protection_rule_rows) + 2))
+        action = StringVar(value="保本" if normalized and normalized.action == "break_even" else "锁盈")
+        lock_r = StringVar(value="" if normalized is None or normalized.action == "break_even" else str(normalized.lock_r or 0))
+        trail_mode = StringVar(value="阶梯" if normalized and normalized.trailing_enabled() else "无")
+        trail_every_r = StringVar(
+            value="" if normalized is None or not normalized.trailing_enabled() else str(normalized.trail_every_r or 1)
+        )
+        trail_add_r = StringVar(
+            value="" if normalized is None or not normalized.trailing_enabled() else str(normalized.trail_add_r or 1)
+        )
+        trigger_entry = ttk.Entry(row_frame, textvariable=trigger_r, width=8)
+        trigger_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        action_combo = ttk.Combobox(row_frame, textvariable=action, values=("保本", "锁盈"), state="readonly", width=8)
+        action_combo.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        lock_entry = ttk.Entry(row_frame, textvariable=lock_r, width=8)
+        lock_entry.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+        trail_mode_combo = ttk.Combobox(row_frame, textvariable=trail_mode, values=("无", "阶梯"), state="readonly", width=8)
+        trail_mode_combo.grid(row=0, column=3, sticky="ew", padx=(0, 6))
+        trail_every_entry = ttk.Entry(row_frame, textvariable=trail_every_r, width=8)
+        trail_every_entry.grid(row=0, column=4, sticky="ew", padx=(0, 6))
+        trail_add_entry = ttk.Entry(row_frame, textvariable=trail_add_r, width=8)
+        trail_add_entry.grid(row=0, column=5, sticky="ew", padx=(0, 6))
+        delete_button = ttk.Button(row_frame, text="删除")
+        delete_button.grid(row=0, column=6, sticky="ew")
+        editor_row = _DynamicProtectionRuleEditorRow(
+            frame=row_frame,
+            trigger_r=trigger_r,
+            action=action,
+            lock_r=lock_r,
+            trail_mode=trail_mode,
+            trail_every_r=trail_every_r,
+            trail_add_r=trail_add_r,
+            trigger_entry=trigger_entry,
+            action_combo=action_combo,
+            lock_entry=lock_entry,
+            trail_mode_combo=trail_mode_combo,
+            trail_every_entry=trail_every_entry,
+            trail_add_entry=trail_add_entry,
+            delete_button=delete_button,
+        )
+        delete_button.configure(command=lambda current=editor_row: self._remove_dynamic_protection_rule_row(current))
+        for variable in (trigger_r, action, lock_r, trail_mode, trail_every_r, trail_add_r):
+            variable.trace_add(
+                "write",
+                lambda *_args, current=editor_row: (
+                    self._update_dynamic_protection_rule_row_state(current),
+                    self._sync_dynamic_protection_rules_json_from_editor(),
+                ),
+            )
+        self._dynamic_protection_rule_rows.append(editor_row)
+        self._update_dynamic_protection_rule_row_state(editor_row)
+
+    def _rebuild_dynamic_protection_rule_editor(self) -> None:
+        rules = self._current_dynamic_protection_rules()
+        for row in list(self._dynamic_protection_rule_rows):
+            row.frame.destroy()
+        self._dynamic_protection_rule_rows.clear()
+        if not rules:
+            rules = self._build_legacy_dynamic_protection_rules_from_current_inputs()
+        for rule in rules:
+            self._append_dynamic_protection_rule_row(rule)
+        if not self._dynamic_protection_rule_rows:
+            self._append_dynamic_protection_rule_row()
+        self._sync_dynamic_protection_rules_json_from_editor()
+
     def _build_profile_summary_text(self) -> str:
         name = self.backtest_profile_name.get().strip()
         summary = self.backtest_profile_summary.get().strip()
@@ -2070,6 +2407,8 @@ class BacktestWindow:
             "take_profit_mode": self.take_profit_mode_label,
             "max_entries_per_trend": self.max_entries_per_trend,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
+            "dynamic_break_even_trigger_r": self.dynamic_break_even_trigger_r,
+            "dynamic_protection_rules": self.dynamic_protection_rules_json,
             "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
             "trend_ema_slope_filter_min_ratio": self.trend_ema_slope_filter_min_ratio,
             "atr_percentile_filter_max": self.atr_percentile_filter_max,
@@ -2081,6 +2420,8 @@ class BacktestWindow:
             "ema55_slope_exit_enabled": self.ema55_slope_exit_enabled,
             "ema55_slope_lock_profit_enabled": self.ema55_slope_lock_profit_enabled,
             "ema55_slope_lock_profit_trigger_r": self.ema55_slope_lock_profit_trigger_r,
+            "dynamic_first_lock_r": self.dynamic_first_lock_r,
+            "dynamic_trailing_step_r": self.dynamic_trailing_step_r,
             "ema55_slope_negative_entry_bars": self.ema55_slope_negative_entry_bars,
             "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
             "time_stop_break_even_bars": self.time_stop_break_even_bars,
@@ -2133,6 +2474,7 @@ class BacktestWindow:
             else:
                 variable.set(default_value)
         self._apply_strategy_parameter_fixed_values(strategy_id, definition=definition)
+        self._rebuild_dynamic_protection_rule_editor()
 
     def _apply_strategy_parameter_fixed_values(
         self,
@@ -2226,12 +2568,20 @@ class BacktestWindow:
             inner_h = inner.winfo_reqheight()
         except Exception:
             return
+        viewport_h = 0
+        if viewport is not None and self._widget_exists(viewport):
+            try:
+                viewport_h = int(viewport.winfo_height())
+            except Exception:
+                viewport_h = 0
         try:
             screen_h = max(int(self.window.winfo_screenheight()), 600)
         except Exception:
             screen_h = 800
-        cap = max(280, min(int(screen_h * 0.36), 520))
-        view_h = max(1, min(inner_h + 10, cap))
+        cap = max(360, min(int(screen_h * 0.48), 760))
+        available_h = max(viewport_h - 2, 0)
+        preferred_h = max(cap, available_h) if available_h > 0 else cap
+        view_h = max(1, min(inner_h + 10, preferred_h))
         try:
             canvas.configure(height=view_h)
             bbox = canvas.bbox("all")
@@ -2269,7 +2619,13 @@ class BacktestWindow:
             return
         if total_h <= 1:
             return
-        upper_height = max(240, min(int(total_h * 0.42), total_h - 220))
+        controls = getattr(self, "_controls_frame", None)
+        try:
+            controls_h = int(controls.winfo_reqheight()) if controls is not None and self._widget_exists(controls) else 0
+        except Exception:
+            controls_h = 0
+        desired_upper = controls_h + 24 if controls_h > 0 else int(total_h * 0.46)
+        upper_height = max(300, min(desired_upper, total_h - 260))
         try:
             content_pane.sashpos(0, upper_height)
         except Exception:
@@ -2311,12 +2667,63 @@ class BacktestWindow:
         canvas.bind("<Enter>", _enter)
         canvas.bind("<Leave>", _leave)
 
+    def _sync_matrix_grid_viewport(self, event: object | None = None) -> None:
+        canvas = getattr(self, "matrix_canvas", None)
+        inner = getattr(self, "matrix_grid_frame", None)
+        inner_id = getattr(self, "_matrix_inner_window_id", None)
+        if canvas is None or inner is None or inner_id is None:
+            return
+        if not self._widget_exists(canvas):
+            return
+        try:
+            self.window.update_idletasks()
+            canvas.update_idletasks()
+        except Exception:
+            pass
+        try:
+            inner_w = int(canvas.winfo_width())
+        except Exception:
+            inner_w = 0
+        if event is not None and getattr(event, "widget", None) is canvas:
+            try:
+                inner_w = max(inner_w, int(getattr(event, "width", 0)))
+            except Exception:
+                pass
+        inner_w = max(inner_w - 2, 0)
+        if inner_w > 2:
+            try:
+                canvas.itemconfigure(inner_id, width=inner_w)
+            except Exception:
+                pass
+        try:
+            bbox = canvas.bbox("all")
+            if bbox is None:
+                bbox = (0, 0, max(inner_w, 1), max(int(inner.winfo_reqheight()), 1))
+            canvas.configure(scrollregion=bbox)
+        except Exception:
+            return
+
+    def _sync_heatmap_canvas_scrollregion(self, fallback_width: int = 640, fallback_height: int = 360) -> None:
+        canvas = getattr(self, "heatmap_canvas", None)
+        if canvas is None or not self._widget_exists(canvas):
+            return
+        try:
+            bbox = canvas.bbox("all")
+            if bbox is None:
+                bbox = (0, 0, fallback_width, fallback_height)
+            canvas.configure(scrollregion=bbox)
+        except Exception:
+            return
+
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
-        self.window.rowconfigure(1, weight=1)
+        self.window.rowconfigure(0, weight=1)
 
-        params_viewport = ttk.Frame(self.window)
-        params_viewport.grid(row=0, column=0, sticky="nsew", padx=16, pady=(16, 8))
+        main_pane = self._build_backtest_panedwindow(self.window, orient="vertical")
+        main_pane.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        self._content_pane = main_pane
+
+        params_viewport = ttk.Frame(main_pane)
         params_viewport.columnconfigure(0, weight=1)
         params_viewport.rowconfigure(0, weight=1)
         params_viewport.bind("<Configure>", lambda _e: self._sync_backtest_params_viewport())
@@ -2346,70 +2753,109 @@ class BacktestWindow:
         params_inner.bind("<Configure>", lambda _e: self._sync_backtest_params_viewport())
         params_canvas.bind("<Configure>", self._sync_backtest_params_viewport)
 
-        controls = ttk.LabelFrame(params_inner, text="回测参数", padding=16)
+        controls = ttk.LabelFrame(params_inner, text="回测参数", padding=12)
         controls.grid(row=0, column=0, sticky="ew")
         self._controls_frame = controls
         self._bind_params_canvas_mousewheel()
         self.window.after_idle(self._sync_backtest_params_viewport)
         self.window.after(120, self._sync_backtest_params_viewport)
 
-        for column in range(6):
-            controls.columnconfigure(column, weight=1)
+        controls.columnconfigure(0, weight=1)
+
+        def _configure_pair_columns(frame: ttk.Frame, count: int) -> None:
+            for column in range(count):
+                frame.columnconfigure(column, weight=1 if column % 2 == 1 else 0)
+
+        top_sections = ttk.Frame(controls)
+        top_sections.grid(row=0, column=0, sticky="ew")
+        top_sections.columnconfigure(0, weight=4)
+        top_sections.columnconfigure(1, weight=4)
+        top_sections.columnconfigure(2, weight=3)
+
+        strategy_section = ttk.LabelFrame(top_sections, text="基础参数", padding=(10, 8))
+        strategy_section.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        _configure_pair_columns(strategy_section, 4)
+
+        signal_section = ttk.LabelFrame(top_sections, text="信号与止盈", padding=(10, 8))
+        signal_section.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+        _configure_pair_columns(signal_section, 4)
+
+        advanced_section = ttk.LabelFrame(top_sections, text="扩展条件", padding=(10, 8))
+        advanced_section.grid(row=0, column=2, sticky="nsew")
+        _configure_pair_columns(advanced_section, 4)
+
+        dynamic_section = ttk.LabelFrame(controls, text="动态止盈与退出条件", padding=(10, 8))
+        dynamic_section.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        _configure_pair_columns(dynamic_section, 6)
+
+        backtest_section = ttk.LabelFrame(controls, text="回测参数", padding=(10, 8))
+        backtest_section.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        backtest_section.columnconfigure(0, weight=1)
 
         row = 0
-        ttk.Label(controls, text="策略").grid(row=row, column=0, sticky="w")
+        ttk.Label(strategy_section, text="策略").grid(row=row, column=0, sticky="w")
         strategy_combo = ttk.Combobox(
-            controls,
+            strategy_section,
             textvariable=self.strategy_name,
             values=[item.name for item in BACKTEST_STRATEGY_DEFINITIONS],
             state="readonly",
         )
-        strategy_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12))
+        strategy_combo.grid(row=row, column=1, columnspan=3, sticky="ew")
         strategy_combo.bind("<<ComboboxSelected>>", self._on_strategy_selected)
-        ttk.Label(controls, text="交易对").grid(row=row, column=2, sticky="w")
+
+        row += 1
+        ttk.Label(strategy_section, text="交易对").grid(row=row, column=0, sticky="w", pady=(8, 0))
         self.symbol_combo = ttk.Combobox(
-            controls,
+            strategy_section,
             textvariable=self.symbol,
             values=_build_backtest_symbol_options(self.symbol.get()),
             state="readonly",
         )
-        self.symbol_combo.grid(row=row, column=3, sticky="ew", padx=(0, 12))
+        self.symbol_combo.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
         self.symbol_combo.bind("<<ComboboxSelected>>", self._on_symbol_selected)
-        self.bar_caption = ttk.Label(controls, text="K线周期")
-        self.bar_caption.grid(row=row, column=4, sticky="w")
+        self.bar_caption = ttk.Label(strategy_section, text="K线周期")
+        self.bar_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
         self.bar_combo = ttk.Combobox(
-            controls,
+            strategy_section,
             textvariable=self.bar_label,
             values=list(BACKTEST_BAR_LABEL_TO_VALUE.keys()),
             state="readonly",
         )
-        self.bar_combo.grid(row=row, column=5, sticky="ew")
+        self.bar_combo.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row += 1
-        self.profile_summary_caption = ttk.Label(controls, text="Profile")
-        self.profile_summary_caption.grid(row=row, column=0, sticky="w", pady=(10, 0))
+        self.profile_summary_caption = ttk.Label(strategy_section, text="Profile")
+        self.profile_summary_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
         self.profile_summary_label = ttk.Label(
-            controls,
+            strategy_section,
             textvariable=self.profile_summary_text,
             justify="left",
             foreground="#57606a",
         )
-        self.profile_summary_label.grid(row=row, column=1, columnspan=3, sticky="w", pady=(10, 0))
-        self._bind_responsive_wrap(self.profile_summary_label, controls, padding=180, min_wrap=260)
+        self.profile_summary_label.grid(row=row, column=1, columnspan=3, sticky="ew", pady=(8, 0))
+        self._bind_responsive_wrap(self.profile_summary_label, strategy_section, padding=48, min_wrap=240)
+
+        row += 1
+        profile_button_frame = ttk.Frame(strategy_section)
+        profile_button_frame.grid(row=row, column=1, columnspan=3, sticky="e", pady=(8, 0))
         self.import_profile_button = ttk.Button(
-            controls,
+            profile_button_frame,
             text="导入参数模板",
             command=self.import_backtest_profile_bundle,
         )
-        self.import_profile_button.grid(row=row, column=4, sticky="e", pady=(10, 0), padx=(0, 8))
-        self.clear_profile_button = ttk.Button(controls, text="清除模板来源", command=self.clear_backtest_profile_origin)
-        self.clear_profile_button.grid(row=row, column=5, sticky="ew", pady=(10, 0))
+        self.import_profile_button.pack(side=LEFT, padx=(0, 6))
+        self.clear_profile_button = ttk.Button(
+            profile_button_frame,
+            text="清除模板来源",
+            command=self.clear_backtest_profile_origin,
+        )
+        self.clear_profile_button.pack(side=LEFT)
 
-        row += 1
-        self.ema_period_caption = ttk.Label(controls, text="快线均线")
-        self.ema_period_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self.ema_period_frame = ttk.Frame(controls)
-        self.ema_period_frame.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        row = 0
+        self.ema_period_caption = ttk.Label(signal_section, text="快线均线")
+        self.ema_period_caption.grid(row=row, column=0, sticky="w")
+        self.ema_period_frame = ttk.Frame(signal_section)
+        self.ema_period_frame.grid(row=row, column=1, sticky="ew", padx=(0, 8))
         self.ema_period_frame.columnconfigure(1, weight=1)
         self.ema_type_combo = ttk.Combobox(
             self.ema_period_frame,
@@ -2421,10 +2867,10 @@ class BacktestWindow:
         self.ema_type_combo.grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.ema_period_entry = ttk.Entry(self.ema_period_frame, textvariable=self.ema_period)
         self.ema_period_entry.grid(row=0, column=1, sticky="ew")
-        self.trend_ema_period_caption = ttk.Label(controls, text="趋势均线")
-        self.trend_ema_period_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self.trend_ema_period_frame = ttk.Frame(controls)
-        self.trend_ema_period_frame.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.trend_ema_period_caption = ttk.Label(signal_section, text="趋势均线")
+        self.trend_ema_period_caption.grid(row=row, column=2, sticky="w")
+        self.trend_ema_period_frame = ttk.Frame(signal_section)
+        self.trend_ema_period_frame.grid(row=row, column=3, sticky="ew")
         self.trend_ema_period_frame.columnconfigure(1, weight=1)
         self.trend_ema_type_combo = ttk.Combobox(
             self.trend_ema_period_frame,
@@ -2436,34 +2882,36 @@ class BacktestWindow:
         self.trend_ema_type_combo.grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.trend_ema_period_entry = ttk.Entry(self.trend_ema_period_frame, textvariable=self.trend_ema_period)
         self.trend_ema_period_entry.grid(row=0, column=1, sticky="ew")
-        self.big_ema_caption = ttk.Label(controls, text="大周期均线")
-        self.big_ema_caption.grid(row=row, column=4, sticky="w", pady=(12, 0))
-        self.big_ema_entry = ttk.Entry(controls, textvariable=self.big_ema_period)
-        self.big_ema_entry.grid(row=row, column=5, sticky="ew", pady=(12, 0))
 
         row += 1
-        self.atr_period_caption = ttk.Label(controls, text="ATR 周期")
-        self.atr_period_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self.atr_period_entry = ttk.Entry(controls, textvariable=self.atr_period)
-        self.atr_period_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        self.stop_atr_caption = ttk.Label(controls, text="止损 ATR 倍数")
-        self.stop_atr_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self.stop_atr_entry = ttk.Entry(controls, textvariable=self.stop_atr)
-        self.stop_atr_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
-        self.take_atr_caption = ttk.Label(controls, text="止盈 ATR 倍数")
-        self.take_atr_caption.grid(row=row, column=4, sticky="w", pady=(12, 0))
-        self.take_atr_entry = ttk.Entry(controls, textvariable=self.take_atr)
-        self.take_atr_entry.grid(row=row, column=5, sticky="ew", pady=(12, 0))
+        self.big_ema_caption = ttk.Label(signal_section, text="大周期均线")
+        self.big_ema_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.big_ema_entry = ttk.Entry(signal_section, textvariable=self.big_ema_period)
+        self.big_ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self.atr_period_caption = ttk.Label(signal_section, text="ATR 周期")
+        self.atr_period_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.atr_period_entry = ttk.Entry(signal_section, textvariable=self.atr_period)
+        self.atr_period_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row += 1
-        self.signal_caption = ttk.Label(controls, text="信号方向")
-        self.signal_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self.signal_combo = ttk.Combobox(controls, textvariable=self.signal_mode_label, state="readonly")
-        self.signal_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        self.entry_reference_ema_caption = ttk.Label(controls, text="挂单参考线")
-        self.entry_reference_ema_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self.entry_reference_ema_frame = ttk.Frame(controls)
-        self.entry_reference_ema_frame.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.stop_atr_caption = ttk.Label(signal_section, text="止损 ATR 倍数")
+        self.stop_atr_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.stop_atr_entry = ttk.Entry(signal_section, textvariable=self.stop_atr)
+        self.stop_atr_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self.take_atr_caption = ttk.Label(signal_section, text="止盈 ATR 倍数")
+        self.take_atr_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.take_atr_entry = ttk.Entry(signal_section, textvariable=self.take_atr)
+        self.take_atr_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
+
+        row += 1
+        self.signal_caption = ttk.Label(signal_section, text="信号方向")
+        self.signal_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.signal_combo = ttk.Combobox(signal_section, textvariable=self.signal_mode_label, state="readonly")
+        self.signal_combo.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self.entry_reference_ema_caption = ttk.Label(signal_section, text="挂单参考线")
+        self.entry_reference_ema_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.entry_reference_ema_frame = ttk.Frame(signal_section)
+        self.entry_reference_ema_frame.grid(row=row, column=3, sticky="ew", pady=(8, 0))
         self.entry_reference_ema_frame.columnconfigure(1, weight=1)
         self.entry_reference_ema_type_combo = ttk.Combobox(
             self.entry_reference_ema_frame,
@@ -2480,371 +2928,459 @@ class BacktestWindow:
         self.entry_reference_ema_entry.grid(row=0, column=1, sticky="ew")
 
         row += 1
-        self.slope_threshold_caption = ttk.Label(controls, text="开空斜率阈值(负数)")
-        self.slope_threshold_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self.slope_threshold_entry = ttk.Entry(controls, textvariable=self.trend_ema_slope_filter_min_ratio)
-        self.slope_threshold_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.take_profit_mode_caption = ttk.Label(signal_section, text="止盈方式")
+        self.take_profit_mode_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.take_profit_mode_combo = ttk.Combobox(
+            signal_section,
+            textvariable=self.take_profit_mode_label,
+            values=list(TAKE_PROFIT_MODE_OPTIONS.keys()),
+            state="readonly",
+        )
+        self.take_profit_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self.take_profit_mode_combo.bind("<<ComboboxSelected>>", lambda *_: self._sync_dynamic_take_profit_controls())
+        self.max_entries_caption = ttk.Label(signal_section, text="每波最多开仓次数")
+        self.max_entries_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.max_entries_entry = ttk.Entry(signal_section, textvariable=self.max_entries_per_trend)
+        self.max_entries_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
+
+        row = 0
+        self.slope_threshold_caption = ttk.Label(advanced_section, text="开空斜率阈值(负数)")
+        self.slope_threshold_caption.grid(row=row, column=0, sticky="w")
+        self.slope_threshold_entry = ttk.Entry(advanced_section, textvariable=self.trend_ema_slope_filter_min_ratio)
+        self.slope_threshold_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8))
+        self.atr_percentile_filter_caption = ttk.Label(advanced_section, text="ATR percentile max")
+        self.atr_percentile_filter_caption.grid(row=row, column=2, sticky="w")
+        self.atr_percentile_filter_entry = ttk.Entry(advanced_section, textvariable=self.atr_percentile_filter_max)
+        self.atr_percentile_filter_entry.grid(row=row, column=3, sticky="ew")
+
+        row += 1
         self.slope_threshold_hint = ttk.Label(
-            controls,
+            advanced_section,
             text="填 0 表示只要均线斜率转负就开空；例如填 -0.0005 表示需要更陡的负斜率才开空。",
             foreground="#57606a",
         )
-        self.slope_threshold_hint.grid(row=row, column=2, columnspan=4, sticky="w", pady=(12, 0))
+        self.slope_threshold_hint.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self._bind_responsive_wrap(self.slope_threshold_hint, advanced_section, padding=36, min_wrap=220)
 
         row += 1
         self.ema55_slope_negative_entry_bars_caption = ttk.Label(
-            controls,
+            advanced_section,
             text="连续负斜率根数",
         )
         self.ema55_slope_negative_entry_bars_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
         self.ema55_slope_negative_entry_bars_entry = ttk.Entry(
-            controls,
+            advanced_section,
             textvariable=self.ema55_slope_negative_entry_bars,
         )
-        self.ema55_slope_negative_entry_bars_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.ema55_slope_negative_entry_bars_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+
+        row += 1
         self.ema55_slope_negative_entry_bars_hint = ttk.Label(
-            controls,
+            advanced_section,
             text="仅 BTC EMA55 斜率做空使用；只有当 EMA55 先为非负斜率，再连续 N 根负斜率同时满足阈值时才开空。",
             foreground="#57606a",
         )
-        self.ema55_slope_negative_entry_bars_hint.grid(row=row, column=2, columnspan=4, sticky="w", pady=(8, 0))
+        self.ema55_slope_negative_entry_bars_hint.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self._bind_responsive_wrap(self.ema55_slope_negative_entry_bars_hint, advanced_section, padding=36, min_wrap=220)
 
         row += 1
-        self.mtf_filter_bar_caption = ttk.Label(controls, text="高周期K线")
-        self.mtf_filter_bar_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self.atr_percentile_filter_caption = ttk.Label(controls, text="ATR percentile max")
-        self.atr_percentile_filter_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
-        self.atr_percentile_filter_entry = ttk.Entry(controls, textvariable=self.atr_percentile_filter_max)
-        self.atr_percentile_filter_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
-        self.body_retest_breakdown_caption = ttk.Label(controls, text="Breakdown ATR")
+        self.mtf_filter_bar_caption = ttk.Label(advanced_section, text="高周期K线")
+        self.mtf_filter_bar_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.body_retest_breakdown_caption = ttk.Label(advanced_section, text="Breakdown ATR")
         self.body_retest_breakdown_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
-        self.body_retest_breakdown_entry = ttk.Entry(controls, textvariable=self.body_retest_breakdown_atr_multiplier)
-        self.body_retest_breakdown_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
-        self.body_retest_retest_caption = ttk.Label(controls, text="Retest ATR")
-        self.body_retest_retest_caption.grid(row=row, column=4, sticky="w", pady=(8, 0))
-        self.body_retest_retest_entry = ttk.Entry(controls, textvariable=self.body_retest_retest_atr_multiplier)
-        self.body_retest_retest_entry.grid(row=row, column=5, sticky="ew", pady=(8, 0))
+        self.body_retest_breakdown_entry = ttk.Entry(
+            advanced_section,
+            textvariable=self.body_retest_breakdown_atr_multiplier,
+        )
+        self.body_retest_breakdown_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row += 1
-        self.body_retest_stop_buffer_caption = ttk.Label(controls, text="Stop buffer ATR")
-        self.body_retest_stop_buffer_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.body_retest_retest_caption = ttk.Label(advanced_section, text="Retest ATR")
+        self.body_retest_retest_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.body_retest_retest_entry = ttk.Entry(advanced_section, textvariable=self.body_retest_retest_atr_multiplier)
+        self.body_retest_retest_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self.body_retest_stop_buffer_caption = ttk.Label(advanced_section, text="Stop buffer ATR")
+        self.body_retest_stop_buffer_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
         self.body_retest_stop_buffer_entry = ttk.Entry(
-            controls,
+            advanced_section,
             textvariable=self.body_retest_stop_buffer_atr_multiplier,
         )
-        self.body_retest_stop_buffer_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
-        self.body_retest_body_limit_caption = ttk.Label(controls, text="Body ATR limit")
-        self.body_retest_body_limit_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
-        self.body_retest_body_limit_entry = ttk.Entry(controls, textvariable=self.body_retest_body_atr_limit)
-        self.body_retest_body_limit_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
-        self.body_retest_watch_bars_caption = ttk.Label(controls, text="Watch bars")
-        self.body_retest_watch_bars_caption.grid(row=row, column=4, sticky="w", pady=(8, 0))
-        self.body_retest_watch_bars_entry = ttk.Entry(controls, textvariable=self.body_retest_watch_bars)
-        self.body_retest_watch_bars_entry.grid(row=row, column=5, sticky="ew", pady=(8, 0))
+        self.body_retest_stop_buffer_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row += 1
-        self.mtf_filter_bar_caption_row = ttk.Label(controls, text="Higher TF bar")
-        self.mtf_filter_bar_caption_row.grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self.body_retest_body_limit_caption = ttk.Label(advanced_section, text="Body ATR limit")
+        self.body_retest_body_limit_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.body_retest_body_limit_entry = ttk.Entry(advanced_section, textvariable=self.body_retest_body_atr_limit)
+        self.body_retest_body_limit_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self.body_retest_watch_bars_caption = ttk.Label(advanced_section, text="Watch bars")
+        self.body_retest_watch_bars_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.body_retest_watch_bars_entry = ttk.Entry(advanced_section, textvariable=self.body_retest_watch_bars)
+        self.body_retest_watch_bars_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
+
+        row += 1
+        self.mtf_filter_bar_caption_row = ttk.Label(advanced_section, text="Higher TF bar")
+        self.mtf_filter_bar_caption_row.grid(row=row, column=0, sticky="w", pady=(8, 0))
         self.mtf_filter_bar_combo = ttk.Combobox(
-            controls,
+            advanced_section,
             textvariable=self.mtf_filter_bar,
             values=list(BACKTEST_BAR_LABEL_TO_VALUE.keys()),
             state="readonly",
         )
-        self.mtf_filter_bar_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        self.mtf_filter_fast_ema_caption = ttk.Label(controls, text="高周期快EMA")
-        self.mtf_filter_fast_ema_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self.mtf_filter_fast_ema_entry = ttk.Entry(controls, textvariable=self.mtf_filter_fast_ema_period)
-        self.mtf_filter_fast_ema_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
-        self.mtf_filter_slow_ema_caption = ttk.Label(controls, text="高周期慢EMA")
-        self.mtf_filter_slow_ema_caption.grid(row=row, column=4, sticky="w", pady=(12, 0))
-        self.mtf_filter_slow_ema_entry = ttk.Entry(controls, textvariable=self.mtf_filter_slow_ema_period)
-        self.mtf_filter_slow_ema_entry.grid(row=row, column=5, sticky="ew", pady=(12, 0))
+        self.mtf_filter_bar_combo.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self.mtf_filter_fast_ema_caption = ttk.Label(advanced_section, text="高周期快EMA")
+        self.mtf_filter_fast_ema_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.mtf_filter_fast_ema_entry = ttk.Entry(advanced_section, textvariable=self.mtf_filter_fast_ema_period)
+        self.mtf_filter_fast_ema_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row += 1
-        self.mtf_reversal_mode_caption = ttk.Label(controls, text="高周期反向处理")
-        self.mtf_reversal_mode_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.mtf_filter_slow_ema_caption = ttk.Label(advanced_section, text="高周期慢EMA")
+        self.mtf_filter_slow_ema_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.mtf_filter_slow_ema_entry = ttk.Entry(advanced_section, textvariable=self.mtf_filter_slow_ema_period)
+        self.mtf_filter_slow_ema_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self.mtf_reversal_mode_caption = ttk.Label(advanced_section, text="高周期反向处理")
+        self.mtf_reversal_mode_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
         self.mtf_reversal_mode_combo = ttk.Combobox(
-            controls,
+            advanced_section,
             textvariable=self.mtf_reversal_mode_label,
             values=list(MTF_REVERSAL_MODE_OPTIONS.keys()),
             state="readonly",
         )
-        self.mtf_reversal_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.mtf_reversal_mode_combo.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row += 1
         self.daily_filter_enabled_check = ttk.Checkbutton(
-            controls,
+            advanced_section,
             text="启用日线过滤（仅使用当时已收盘的上一根日线）",
             variable=self.daily_filter_enabled,
             command=self._sync_daily_filter_controls,
         )
-        self.daily_filter_enabled_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.daily_filter_boundary_caption = ttk.Label(controls, text="日线标准")
-        self.daily_filter_boundary_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.daily_filter_enabled_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        row += 1
+        self.daily_filter_boundary_caption = ttk.Label(advanced_section, text="日线标准")
+        self.daily_filter_boundary_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
         self.daily_filter_boundary_combo = ttk.Combobox(
-            controls,
+            advanced_section,
             textvariable=self.daily_filter_boundary_label,
             values=list(DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE.keys()),
             state="readonly",
         )
-        self.daily_filter_boundary_combo.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
-        self.daily_filter_scope_caption = ttk.Label(controls, text="过滤方向")
-        self.daily_filter_scope_caption.grid(row=row, column=4, sticky="w", pady=(8, 0))
+        self.daily_filter_boundary_combo.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self.daily_filter_scope_caption = ttk.Label(advanced_section, text="过滤方向")
+        self.daily_filter_scope_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
         self.daily_filter_scope_combo = ttk.Combobox(
-            controls,
+            advanced_section,
             textvariable=self.daily_filter_scope_label,
             values=list(DAILY_FILTER_SCOPE_LABEL_TO_VALUE.keys()),
             state="readonly",
         )
-        self.daily_filter_scope_combo.grid(row=row, column=5, sticky="ew", pady=(8, 0))
+        self.daily_filter_scope_combo.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row += 1
-        self.daily_filter_mode_caption = ttk.Label(controls, text="过滤规则")
+        self.daily_filter_mode_caption = ttk.Label(advanced_section, text="过滤规则")
         self.daily_filter_mode_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
         self.daily_filter_mode_combo = ttk.Combobox(
-            controls,
+            advanced_section,
             textvariable=self.daily_filter_mode_label,
             values=list(DAILY_FILTER_MODE_LABEL_TO_VALUE.keys()),
             state="readonly",
         )
-        self.daily_filter_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.daily_filter_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
         self.daily_filter_mode_combo.bind("<<ComboboxSelected>>", lambda *_: self._sync_daily_filter_controls())
-        self.daily_filter_ma_caption = ttk.Label(controls, text="均线类型")
+        self.daily_filter_ma_caption = ttk.Label(advanced_section, text="均线类型")
         self.daily_filter_ma_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
         self.daily_filter_ma_combo = ttk.Combobox(
-            controls,
+            advanced_section,
             textvariable=self.daily_filter_ma_type,
             values=MOVING_AVERAGE_TYPE_OPTIONS,
             state="readonly",
             width=6,
         )
-        self.daily_filter_ma_combo.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
-        self.daily_filter_period_caption = ttk.Label(controls, text="均线周期")
-        self.daily_filter_period_caption.grid(row=row, column=4, sticky="w", pady=(8, 0))
-        self.daily_filter_period_entry = ttk.Entry(controls, textvariable=self.daily_filter_period)
-        self.daily_filter_period_entry.grid(row=row, column=5, sticky="ew", pady=(8, 0))
+        self.daily_filter_ma_combo.grid(row=row, column=3, sticky="ew", pady=(8, 0))
+
+        row += 1
+        self.daily_filter_period_caption = ttk.Label(advanced_section, text="均线周期")
+        self.daily_filter_period_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.daily_filter_period_entry = ttk.Entry(advanced_section, textvariable=self.daily_filter_period)
+        self.daily_filter_period_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
 
         row += 1
         self.daily_filter_hint = ttk.Label(
-            controls,
+            advanced_section,
             text="北京时间0点/8点日线会从 1H 已收盘K线重采样；交易所1D 直接使用 OKX 已收盘日线。",
             foreground="#57606a",
         )
-        self.daily_filter_hint.grid(row=row, column=0, columnspan=6, sticky="w", pady=(2, 0))
+        self.daily_filter_hint.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self._bind_responsive_wrap(self.daily_filter_hint, advanced_section, padding=36, min_wrap=220)
 
-        row += 1
-        self.take_profit_mode_caption = ttk.Label(controls, text="止盈方式")
-        self.take_profit_mode_caption.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self.take_profit_mode_combo = ttk.Combobox(
-            controls,
-            textvariable=self.take_profit_mode_label,
-            values=list(TAKE_PROFIT_MODE_OPTIONS.keys()),
-            state="readonly",
-        )
-        self.take_profit_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        self.take_profit_mode_combo.bind("<<ComboboxSelected>>", lambda *_: self._sync_dynamic_take_profit_controls())
-        self.max_entries_caption = ttk.Label(controls, text="每波最多开仓次数")
-        self.max_entries_caption.grid(row=row, column=2, sticky="w", pady=(12, 0))
-        self.max_entries_entry = ttk.Entry(controls, textvariable=self.max_entries_per_trend)
-        self.max_entries_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
-
-        row += 1
+        row = 0
         self.dynamic_two_r_break_even_check = ttk.Checkbutton(
-            controls,
-            text="启用 nR保本特例（首档触发R=2时，先移到保本位）",
+            dynamic_section,
+            text="启用保本（达到保本触发R时先移到保本位）",
             variable=self.dynamic_two_r_break_even,
         )
-        self.dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        self.dynamic_break_even_trigger_r_label = ttk.Label(controls, text="首档触发R")
-        self.dynamic_break_even_trigger_r_label.grid(row=row, column=2, sticky="e", pady=(12, 0))
+        self.dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=2, sticky="w")
+        self.dynamic_break_even_trigger_r_label = ttk.Label(dynamic_section, text="保本触发R")
+        self.dynamic_break_even_trigger_r_label.grid(row=row, column=2, sticky="e")
         self.dynamic_break_even_trigger_r_entry = ttk.Entry(
-            controls,
-            textvariable=self.ema55_slope_lock_profit_trigger_r,
+            dynamic_section,
+            textvariable=self.dynamic_break_even_trigger_r,
         )
-        self.dynamic_break_even_trigger_r_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
-
-        row += 1
+        self.dynamic_break_even_trigger_r_entry.grid(row=row, column=3, sticky="ew", padx=(0, 10))
         self.dynamic_fee_offset_check = ttk.Checkbutton(
-            controls,
+            dynamic_section,
             text="启用手续费偏移（按2倍Taker手续费留缓冲）",
             variable=self.dynamic_fee_offset_enabled,
         )
-        self.dynamic_fee_offset_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.dynamic_fee_offset_check.grid(row=row, column=4, columnspan=2, sticky="w")
+
+        row += 1
+        self.dynamic_trailing_start_r_label = ttk.Label(dynamic_section, text="移动止盈触发R")
+        self.dynamic_trailing_start_r_label.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.dynamic_trailing_start_r_entry = ttk.Entry(
+            dynamic_section,
+            textvariable=self.ema55_slope_lock_profit_trigger_r,
+        )
+        self.dynamic_trailing_start_r_entry.grid(row=row, column=1, sticky="ew", padx=(0, 10), pady=(8, 0))
+        self.dynamic_first_lock_r_label = ttk.Label(dynamic_section, text="首档锁盈R")
+        self.dynamic_first_lock_r_label.grid(row=row, column=2, sticky="e", pady=(8, 0))
+        self.dynamic_first_lock_r_entry = ttk.Entry(
+            dynamic_section,
+            textvariable=self.dynamic_first_lock_r,
+        )
+        self.dynamic_first_lock_r_entry.grid(row=row, column=3, sticky="ew", padx=(0, 10), pady=(8, 0))
+        self.dynamic_trailing_step_r_label = ttk.Label(dynamic_section, text="移动步长R")
+        self.dynamic_trailing_step_r_label.grid(row=row, column=4, sticky="e", pady=(8, 0))
+        self.dynamic_trailing_step_r_entry = ttk.Entry(
+            dynamic_section,
+            textvariable=self.dynamic_trailing_step_r,
+        )
+        self.dynamic_trailing_step_r_entry.grid(row=row, column=5, sticky="ew", pady=(8, 0))
 
         row += 1
         self.dynamic_fee_offset_hint_label = ttk.Label(
-            controls,
+            dynamic_section,
             text="提示：保本位是否叠加手续费偏移，由下方开关决定；大部分组合开启更优，默认建议开启。",
         )
-        self.dynamic_fee_offset_hint_label.grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        self.dynamic_fee_offset_hint_label.grid(row=row, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        self._bind_responsive_wrap(self.dynamic_fee_offset_hint_label, dynamic_section, padding=36, min_wrap=360)
 
         row += 1
         self.time_stop_break_even_check = ttk.Checkbutton(
-            controls,
+            dynamic_section,
             text="启用时间保本（持仓满指定K线且已达到净保本时，上移到保本位）",
             variable=self.time_stop_break_even_enabled,
             command=self._sync_dynamic_take_profit_controls,
         )
         self.time_stop_break_even_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.time_stop_break_even_bars_label = ttk.Label(controls, text="时间保本K线数")
+        self.time_stop_break_even_bars_label = ttk.Label(dynamic_section, text="时间保本K线数")
         self.time_stop_break_even_bars_label.grid(row=row, column=2, sticky="e", pady=(8, 0))
-        self.time_stop_break_even_bars_entry = ttk.Entry(controls, textvariable=self.time_stop_break_even_bars)
-        self.time_stop_break_even_bars_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
-
-        row += 1
-        self.ema55_slope_exit_conditions_caption = ttk.Label(controls, text="平仓条件")
-        self.ema55_slope_exit_conditions_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.time_stop_break_even_bars_entry = ttk.Entry(dynamic_section, textvariable=self.time_stop_break_even_bars)
+        self.time_stop_break_even_bars_entry.grid(row=row, column=3, sticky="ew", padx=(0, 10), pady=(8, 0))
+        self.ema55_slope_exit_conditions_caption = ttk.Label(dynamic_section, text="平仓条件")
+        self.ema55_slope_exit_conditions_caption.grid(row=row, column=4, sticky="e", pady=(8, 0))
         self.ema55_slope_exit_enabled_check = ttk.Checkbutton(
-            controls,
+            dynamic_section,
             text="EMA55 斜率重新转正时，按收盘价平仓",
             variable=self.ema55_slope_exit_enabled,
         )
-        self.ema55_slope_exit_enabled_check.grid(row=row, column=1, columnspan=5, sticky="w", pady=(8, 0))
+        self.ema55_slope_exit_enabled_check.grid(row=row, column=5, sticky="w", pady=(8, 0))
 
         row += 1
         self.ema55_slope_lock_profit_enabled_check = ttk.Checkbutton(
-            controls,
+            dynamic_section,
             text="启用 N R 锁盈利 + 双向手续费",
             variable=self.ema55_slope_lock_profit_enabled,
             command=self._sync_ema55_slope_exit_condition_controls,
         )
         self.ema55_slope_lock_profit_enabled_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.ema55_slope_lock_profit_trigger_r_label = ttk.Label(controls, text="锁盈利触发R")
+        self.ema55_slope_lock_profit_trigger_r_label = ttk.Label(dynamic_section, text="锁盈利触发R")
         self.ema55_slope_lock_profit_trigger_r_label.grid(row=row, column=2, sticky="e", pady=(8, 0))
         self.ema55_slope_lock_profit_trigger_r_entry = ttk.Entry(
-            controls,
+            dynamic_section,
             textvariable=self.ema55_slope_lock_profit_trigger_r,
         )
-        self.ema55_slope_lock_profit_trigger_r_entry.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.ema55_slope_lock_profit_trigger_r_entry.grid(row=row, column=3, sticky="ew", padx=(0, 10), pady=(8, 0))
+        self.hold_close_exit_bars_caption = ttk.Label(dynamic_section, text="满N根K线收盘价平仓")
+        self.hold_close_exit_bars_caption.grid(row=row, column=4, sticky="e", pady=(8, 0))
+        self.hold_close_exit_bars_entry = ttk.Entry(dynamic_section, textvariable=self.hold_close_exit_bars)
+        self.hold_close_exit_bars_entry.grid(row=row, column=5, sticky="ew", pady=(8, 0))
 
         row += 1
         self.ema55_slope_exit_conditions_hint = ttk.Label(
-            controls,
+            dynamic_section,
             text="锁盈利规则：价格先到 N R，再把止损上移到 (N-1)R + 双向 Taker 手续费；后续每新增 1R，继续逐级上移。",
             foreground="#57606a",
         )
-        self.ema55_slope_exit_conditions_hint.grid(row=row, column=0, columnspan=6, sticky="w", pady=(2, 0))
-
-        row += 1
-        self.hold_close_exit_bars_caption = ttk.Label(controls, text="满N根K线收盘价平仓")
-        self.hold_close_exit_bars_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
-        self.hold_close_exit_bars_entry = ttk.Entry(controls, textvariable=self.hold_close_exit_bars)
-        self.hold_close_exit_bars_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(8, 0))
+        self.ema55_slope_exit_conditions_hint.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
         self.hold_close_exit_hint = ttk.Label(
-            controls,
+            dynamic_section,
             text="填0关闭；从开仓K线索引起计满N根已收盘K线后，当根按收盘价平仓。",
             foreground="#57606a",
         )
-        self.hold_close_exit_hint.grid(row=row, column=2, columnspan=4, sticky="w", pady=(8, 0))
+        self.hold_close_exit_hint.grid(row=row, column=4, columnspan=2, sticky="w", pady=(4, 0))
+        self._bind_responsive_wrap(self.ema55_slope_exit_conditions_hint, dynamic_section, padding=36, min_wrap=280)
+        self._bind_responsive_wrap(self.hold_close_exit_hint, dynamic_section, padding=36, min_wrap=220)
 
         row += 1
-        self.size_or_risk_label = ttk.Label(controls, text="固定风险金/数量")
-        self.size_or_risk_label.grid(row=row, column=0, sticky="w", pady=(12, 0))
-        self.size_or_risk_entry = ttk.Entry(controls, textvariable=self.risk_amount)
-        self.size_or_risk_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        ttk.Label(controls, text="Maker手续费(%)").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.maker_fee_percent).grid(
-            row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
+        self._dynamic_protection_rules_card = ttk.LabelFrame(dynamic_section, text="动态保护规则", padding=(10, 8))
+        self._dynamic_protection_rules_card.grid(row=row, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+        self._dynamic_protection_rules_card.columnconfigure(0, weight=1)
+        header_frame = ttk.Frame(self._dynamic_protection_rules_card)
+        header_frame.grid(row=0, column=0, sticky="ew")
+        for column, text in enumerate(("触发R", "动作", "锁到R", "递进", "每隔R", "每次加R", "操作")):
+            ttk.Label(header_frame, text=text).grid(row=0, column=column, sticky="w", padx=(0, 6))
+        self._dynamic_protection_rules_frame = ttk.Frame(self._dynamic_protection_rules_card)
+        self._dynamic_protection_rules_frame.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        footer_frame = ttk.Frame(self._dynamic_protection_rules_card)
+        footer_frame.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self._dynamic_protection_add_rule_button = ttk.Button(
+            footer_frame,
+            text="新增规则",
+            command=lambda: (self._append_dynamic_protection_rule_row(), self._sync_dynamic_protection_rules_json_from_editor()),
         )
-        ttk.Label(controls, text="Taker手续费(%)").grid(row=row, column=4, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.taker_fee_percent).grid(row=row, column=5, sticky="ew", pady=(12, 0))
+        self._dynamic_protection_add_rule_button.grid(row=0, column=0, sticky="w")
+        self._dynamic_protection_restore_button = ttk.Button(
+            footer_frame,
+            text="按当前4字段生成",
+            command=self._rebuild_dynamic_protection_rule_editor,
+        )
+        self._dynamic_protection_restore_button.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self._rebuild_dynamic_protection_rule_editor()
+
+        backtest_boxes = ttk.Frame(backtest_section)
+        backtest_boxes.grid(row=0, column=0, sticky="ew")
+        backtest_boxes.columnconfigure(0, weight=5)
+        backtest_boxes.columnconfigure(1, weight=4)
+        backtest_boxes.columnconfigure(2, weight=4)
+
+        funds_box = ttk.LabelFrame(backtest_boxes, text="资金与成本", padding=(10, 8))
+        funds_box.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        _configure_pair_columns(funds_box, 4)
+
+        sample_box = ttk.LabelFrame(backtest_boxes, text="时间与样本", padding=(10, 8))
+        sample_box.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+        _configure_pair_columns(sample_box, 4)
+
+        data_box = ttk.LabelFrame(backtest_boxes, text="运行与数据", padding=(10, 8))
+        data_box.grid(row=0, column=2, sticky="nsew")
+        data_box.columnconfigure(0, weight=1)
+
+        row = 0
+        self.size_or_risk_label = ttk.Label(funds_box, text="固定风险金/数量")
+        self.size_or_risk_label.grid(row=row, column=0, sticky="w")
+        self.size_or_risk_entry = ttk.Entry(funds_box, textvariable=self.risk_amount)
+        self.size_or_risk_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(funds_box, text="Maker手续费(%)").grid(row=row, column=2, sticky="w")
+        ttk.Entry(funds_box, textvariable=self.maker_fee_percent).grid(row=row, column=3, sticky="ew")
 
         row += 1
-        ttk.Label(controls, text="初始资金").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.initial_capital).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
-        ttk.Label(controls, text="仓位模式").grid(row=row, column=2, sticky="w", pady=(12, 0))
+        ttk.Label(funds_box, text="初始资金").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(funds_box, textvariable=self.initial_capital).grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        ttk.Label(funds_box, text="Taker手续费(%)").grid(row=row, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(funds_box, textvariable=self.taker_fee_percent).grid(row=row, column=3, sticky="ew", pady=(8, 0))
+
+        row += 1
+        ttk.Label(funds_box, text="仓位模式").grid(row=row, column=0, sticky="w", pady=(8, 0))
         self.sizing_mode_combo = ttk.Combobox(
-            controls,
+            funds_box,
             textvariable=self.sizing_mode_label,
             values=list(BACKTEST_SIZING_OPTIONS.keys()),
             state="readonly",
         )
-        self.sizing_mode_combo.grid(row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0))
+        self.sizing_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
         self.sizing_mode_combo.bind("<<ComboboxSelected>>", lambda *_: self._update_sizing_mode_widgets())
-        ttk.Label(controls, text="风险百分比(%)").grid(row=row, column=4, sticky="w", pady=(12, 0))
-        self.risk_percent_entry = ttk.Entry(controls, textvariable=self.risk_percent)
-        self.risk_percent_entry.grid(row=row, column=5, sticky="ew", pady=(12, 0))
+        ttk.Label(funds_box, text="风险百分比(%)").grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.risk_percent_entry = ttk.Entry(funds_box, textvariable=self.risk_percent)
+        self.risk_percent_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row += 1
         self._minimum_order_hint_label = ttk.Label(
-            controls,
+            funds_box,
             textvariable=self.minimum_order_hint_text,
             justify="left",
             foreground="#57606a",
         )
-        self._minimum_order_hint_label.grid(row=row, column=0, columnspan=6, sticky="w", pady=(2, 0))
-        self._bind_responsive_wrap(self._minimum_order_hint_label, controls, padding=48, min_wrap=280)
+        self._minimum_order_hint_label.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self._bind_responsive_wrap(self._minimum_order_hint_label, funds_box, padding=36, min_wrap=260)
 
         row += 1
-        ttk.Label(controls, text="开仓滑点(%)").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.entry_slippage_percent).grid(
-            row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0)
+        ttk.Label(funds_box, text="开仓滑点(%)").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(funds_box, textvariable=self.entry_slippage_percent).grid(
+            row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0)
         )
-        ttk.Label(controls, text="平仓滑点(%)").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.exit_slippage_percent).grid(
-            row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
-        )
-        ttk.Label(controls, text="资金费率/8h(%)").grid(row=row, column=4, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.funding_rate_percent).grid(row=row, column=5, sticky="ew", pady=(12, 0))
-
-        row += 1
-        ttk.Checkbutton(controls, text="启用复利", variable=self.compounding_enabled).grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(12, 0)
+        ttk.Label(funds_box, text="平仓滑点(%)").grid(row=row, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(funds_box, textvariable=self.exit_slippage_percent).grid(
+            row=row, column=3, sticky="ew", pady=(8, 0)
         )
 
         row += 1
-        ttk.Label(controls, text="开始时间").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.start_time_text).grid(
-            row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0)
+        ttk.Label(funds_box, text="资金费率/8h(%)").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(funds_box, textvariable=self.funding_rate_percent).grid(
+            row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0)
         )
-        ttk.Label(controls, text="结束时间").grid(row=row, column=2, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.end_time_text).grid(
-            row=row, column=3, sticky="ew", padx=(0, 12), pady=(12, 0)
+        ttk.Checkbutton(funds_box, text="启用复利", variable=self.compounding_enabled).grid(
+            row=row, column=2, columnspan=2, sticky="w", pady=(8, 0)
         )
+
+        row = 0
+        ttk.Label(sample_box, text="开始时间").grid(row=row, column=0, sticky="w")
+        ttk.Entry(sample_box, textvariable=self.start_time_text).grid(row=row, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(sample_box, text="结束时间").grid(row=row, column=2, sticky="w")
+        ttk.Entry(sample_box, textvariable=self.end_time_text).grid(row=row, column=3, sticky="ew")
+
+        row += 1
+        ttk.Label(sample_box, text="回测K线数").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(sample_box, textvariable=self.candle_limit).grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+
+        row += 1
+        ttk.Label(sample_box, text="时间格式").grid(row=row, column=0, sticky="w", pady=(8, 0))
         ttk.Label(
-            controls,
+            sample_box,
             text="支持 YYYYMMDD 或 YYYYMMDD HH:MM",
-        ).grid(row=row, column=4, columnspan=2, sticky="w", pady=(12, 0))
+            foreground="#57606a",
+        ).grid(row=row, column=1, columnspan=3, sticky="w", pady=(8, 0))
 
         row += 1
-        ttk.Label(controls, text="回测K线数").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        ttk.Entry(controls, textvariable=self.candle_limit).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(12, 0))
         self._candle_limit_hint_label = ttk.Label(
-            controls,
+            sample_box,
             text="填 0 = 全量；填 10000 = 最新往前 10000 根；正数上限 10000。",
             justify="left",
         )
-        self._candle_limit_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=(12, 0))
-        self._bind_responsive_wrap(self._candle_limit_hint_label, controls, padding=48, min_wrap=280)
-        ttk.Checkbutton(controls, text="纯本地回测（不补拉）", variable=self.pure_local_backtest).grid(
-            row=row, column=4, columnspan=2, sticky="w", pady=(12, 0)
+        self._candle_limit_hint_label.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self._bind_responsive_wrap(self._candle_limit_hint_label, sample_box, padding=36, min_wrap=240)
+
+        row = 0
+        ttk.Checkbutton(data_box, text="纯本地回测（不补拉）", variable=self.pure_local_backtest).grid(
+            row=row, column=0, sticky="w"
         )
+
         row += 1
-        self._local_data_status_label = ttk.Label(controls, textvariable=self.local_data_status, justify="left")
-        self._local_data_status_label.grid(row=row, column=0, columnspan=6, sticky="w", pady=(6, 0))
-        self._bind_responsive_wrap(self._local_data_status_label, controls, padding=48, min_wrap=360)
-        row += 1
-        actions_bar = ttk.Frame(controls)
-        actions_bar.grid(row=row, column=0, columnspan=6, sticky="ew", pady=(10, 0))
-        actions_bar.columnconfigure(0, weight=1)
-        history_btn_frame = ttk.Frame(actions_bar)
-        history_btn_frame.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        history_btn_frame = ttk.Frame(data_box)
+        history_btn_frame.grid(row=row, column=0, sticky="w", pady=(8, 0))
         ttk.Label(history_btn_frame, text="同步周期").pack(side=LEFT)
         for bar in BACKTEST_HISTORY_SYNC_BARS:
             ttk.Checkbutton(history_btn_frame, text=bar, variable=self.sync_history_bar_vars[bar]).pack(
                 side=LEFT, padx=(6, 0)
             )
-        self.sync_history_button = ttk.Button(history_btn_frame, text="同步历史数据", command=self.sync_history_data)
+
+        row += 1
+        data_actions = ttk.Frame(data_box)
+        data_actions.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.sync_history_button = ttk.Button(data_actions, text="同步历史数据", command=self.sync_history_data)
+        self.sync_history_button.pack(side=LEFT, padx=(0, 6))
         self.sync_metadata_button = ttk.Button(
-            history_btn_frame,
+            data_actions,
             text="同步价格精度/下单规则",
             command=self.sync_instrument_metadata,
         )
-        self.verify_cache_button = ttk.Button(history_btn_frame, text="校验数据", command=self.verify_history_cache_data)
-        self.sync_history_button.pack(side=LEFT, padx=(10, 6))
         self.sync_metadata_button.pack(side=LEFT, padx=(0, 6))
+        self.verify_cache_button = ttk.Button(data_actions, text="校验数据", command=self.verify_history_cache_data)
         self.verify_cache_button.pack(side=LEFT)
+
+        actions_bar = ttk.Frame(backtest_section)
+        actions_bar.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        actions_bar.columnconfigure(0, weight=1)
         run_btn_frame = ttk.Frame(actions_bar)
         run_btn_frame.grid(row=0, column=1, sticky="e")
         self.single_backtest_button = ttk.Button(
@@ -2853,15 +3389,15 @@ class BacktestWindow:
             command=self.start_single_backtest,
         )
         self.single_backtest_button.pack(side=LEFT, padx=(0, 8))
-        self.batch_backtest_button = ttk.Button(controls, text="开始回测", command=self.start_backtest)
-        self.batch_backtest_button.grid(row=row, column=5, sticky="e", pady=(12, 0))
-        self.batch_backtest_button.grid_remove()
         self.batch_backtest_button = ttk.Button(run_btn_frame, text="开始回测", command=self.start_backtest)
         self.batch_backtest_button.pack(side=LEFT)
 
-        row += 1
-        batch_note = ttk.Frame(controls)
-        batch_note.grid(row=row, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+        self._local_data_status_label = ttk.Label(backtest_section, textvariable=self.local_data_status, justify="left")
+        self._local_data_status_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self._bind_responsive_wrap(self._local_data_status_label, backtest_section, padding=36, min_wrap=420)
+
+        batch_note = ttk.Frame(backtest_section)
+        batch_note.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         batch_note.columnconfigure(0, weight=1)
         self._batch_mode_hint_label = ttk.Label(
             batch_note,
@@ -2869,33 +3405,26 @@ class BacktestWindow:
             justify="left",
         )
         self._batch_mode_hint_label.grid(row=0, column=0, sticky="w")
-        self._bind_responsive_wrap(self._batch_mode_hint_label, batch_note, padding=36, min_wrap=360)
-        self.single_backtest_button = ttk.Button(
-            batch_note,
-            text="\u5f53\u524d\u53c2\u6570\u5355\u7ec4\u56de\u6d4b",
-            command=self.start_single_backtest,
-        )
-        self.single_backtest_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
-        self.single_backtest_button.grid_remove()
+        self._bind_responsive_wrap(self._batch_mode_hint_label, batch_note, padding=36, min_wrap=420)
         self._history_sync_status_label = ttk.Label(
             batch_note,
             textvariable=self.history_sync_status,
             justify="left",
         )
         self._history_sync_status_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self._bind_responsive_wrap(self._history_sync_status_label, batch_note, padding=36, min_wrap=360)
+        self._bind_responsive_wrap(self._history_sync_status_label, batch_note, padding=36, min_wrap=420)
 
-        content_pane = self._build_backtest_panedwindow(self.window, orient="vertical")
-        content_pane.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
-        self._content_pane = content_pane
+        content_frame = ttk.Frame(main_pane)
+        content_frame.columnconfigure(0, weight=1)
+        content_frame.rowconfigure(0, weight=1)
 
-        report_frame = self._build_backtest_panedwindow(content_pane, orient="horizontal")
+        report_frame = self._build_backtest_panedwindow(content_frame, orient="horizontal")
 
         summary_frame = ttk.LabelFrame(report_frame, text="回测报告", padding=12)
         trades_frame = ttk.LabelFrame(report_frame, text="交易明细", padding=12)
         report_frame.add(summary_frame, stretch="always")
         report_frame.add(trades_frame, stretch="always")
-        content_pane.add(report_frame, stretch="always")
+        report_frame.grid(row=0, column=0, sticky="nsew")
 
         summary_frame.columnconfigure(0, weight=1)
         summary_frame.rowconfigure(1, weight=1)
@@ -2905,15 +3434,34 @@ class BacktestWindow:
         self._report_summary_label = ttk.Label(summary_frame, textvariable=self.report_summary, justify="left")
         self._report_summary_label.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         self._bind_responsive_wrap(self._report_summary_label, summary_frame, padding=28, min_wrap=280)
+        self.chart_zoom_button = Button(
+            summary_frame,
+            text="回测K线图",
+            command=self.open_chart_zoom_window,
+            bg=CHART_ACTION_BUTTON_BG,
+            activebackground=CHART_ACTION_BUTTON_ACTIVE_BG,
+            fg=CHART_ACTION_BUTTON_FG,
+            activeforeground=CHART_ACTION_BUTTON_FG,
+            relief="raised",
+            bd=1,
+            cursor="hand2",
+            padx=8,
+            pady=1,
+        )
+        self.chart_zoom_button.grid(row=0, column=1, sticky="e", padx=(8, 0), pady=(0, 10))
 
         report_notebook = ttk.Notebook(summary_frame)
-        report_notebook.grid(row=1, column=0, sticky="nsew")
+        report_notebook.grid(row=1, column=0, columnspan=2, sticky="nsew")
 
         report_tab = ttk.Frame(report_notebook, padding=8)
         report_tab.columnconfigure(0, weight=1)
         report_tab.rowconfigure(0, weight=1)
+        report_scroll_y = ttk.Scrollbar(report_tab, orient="vertical")
         self.report_text = Text(report_tab, height=11, wrap="word", font=("Consolas", 10))
+        self.report_text.configure(yscrollcommand=report_scroll_y.set)
         self.report_text.grid(row=0, column=0, sticky="nsew")
+        report_scroll_y.configure(command=self.report_text.yview)
+        report_scroll_y.grid(row=0, column=1, sticky="ns")
         report_notebook.add(report_tab, text="当前报告")
 
         compare_tab = ttk.Frame(report_notebook, padding=8)
@@ -2935,20 +3483,26 @@ class BacktestWindow:
 
         self.compare_tree = ttk.Treeview(
             compare_tree_frame,
-            columns=("id", "time", "strategy", "symbol", "period", "params", "trades", "win_rate", "pnl", "drawdown"),
+            columns=("id", "archive_id", "time", "strategy", "symbol", "period", "params", "trades", "win_rate", "pnl", "drawdown"),
             show="headings",
             selectmode="browse",
         )
-        _configure_backtest_compare_tree(self.compare_tree)
+        _configure_backtest_compare_tree(self.compare_tree, id_heading="运行编号", include_archive_column=True)
+        compare_tree_yscroll = ttk.Scrollbar(compare_tree_frame, orient="vertical", command=self.compare_tree.yview)
         compare_tree_xscroll = ttk.Scrollbar(compare_tree_frame, orient="horizontal", command=self.compare_tree.xview)
-        self.compare_tree.configure(xscrollcommand=compare_tree_xscroll.set)
+        self.compare_tree.configure(yscrollcommand=compare_tree_yscroll.set, xscrollcommand=compare_tree_xscroll.set)
         self.compare_tree.grid(row=0, column=0, sticky="nsew")
+        compare_tree_yscroll.grid(row=0, column=1, sticky="ns")
         compare_tree_xscroll.grid(row=1, column=0, sticky="ew")
         self.compare_tree.bind("<<TreeviewSelect>>", self._on_compare_tree_selected)
-        self.compare_tree.bind("<Double-Button-1>", lambda *_: self.load_selected_snapshot())
+        self.compare_tree.bind("<Double-Button-1>", lambda *_: self.open_chart_zoom_window())
 
+        compare_detail_scroll_y = ttk.Scrollbar(compare_tab, orient="vertical")
         self.compare_detail_text = Text(compare_tab, height=6, wrap="word", font=("Consolas", 10))
+        self.compare_detail_text.configure(yscrollcommand=compare_detail_scroll_y.set)
         self.compare_detail_text.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        compare_detail_scroll_y.configure(command=self.compare_detail_text.yview)
+        compare_detail_scroll_y.grid(row=2, column=1, sticky="ns", pady=(8, 0))
         report_notebook.add(compare_tab, text="回测对比")
 
         matrix_tab = ttk.Frame(report_notebook, padding=8)
@@ -2979,8 +3533,20 @@ class BacktestWindow:
             wraplength=480,
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(0, 10))
-        self.matrix_grid_frame = ttk.Frame(matrix_tab)
-        self.matrix_grid_frame.grid(row=2, column=0, sticky="nsew")
+        matrix_viewport = ttk.Frame(matrix_tab)
+        matrix_viewport.grid(row=2, column=0, sticky="nsew")
+        matrix_viewport.columnconfigure(0, weight=1)
+        matrix_viewport.rowconfigure(0, weight=1)
+        self.matrix_canvas = Canvas(matrix_viewport, highlightthickness=0, bd=0, background="#f0f0f0")
+        self.matrix_canvas.grid(row=0, column=0, sticky="nsew")
+        matrix_scroll_y = ttk.Scrollbar(matrix_viewport, orient="vertical", command=self.matrix_canvas.yview)
+        self.matrix_canvas.configure(yscrollcommand=matrix_scroll_y.set)
+        matrix_scroll_y.grid(row=0, column=1, sticky="ns")
+        self.matrix_grid_frame = ttk.Frame(self.matrix_canvas)
+        self._matrix_inner_window_id = self.matrix_canvas.create_window((0, 0), window=self.matrix_grid_frame, anchor="nw")
+        self.matrix_grid_frame.bind("<Configure>", lambda _e: self._sync_matrix_grid_viewport())
+        self.matrix_canvas.bind("<Configure>", self._sync_matrix_grid_viewport)
+        self.window.after_idle(self._sync_matrix_grid_viewport)
         report_notebook.add(matrix_tab, text="\u77e9\u9635\u5bf9\u6bd4")
 
         heatmap_tab = ttk.Frame(report_notebook, padding=8)
@@ -3021,8 +3587,12 @@ class BacktestWindow:
             justify="left",
             wraplength=860,
         ).grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        heatmap_scroll_y = ttk.Scrollbar(heatmap_tab, orient="vertical")
         self.heatmap_canvas = Canvas(heatmap_tab, background="#ffffff", highlightthickness=0)
+        self.heatmap_canvas.configure(yscrollcommand=heatmap_scroll_y.set)
         self.heatmap_canvas.grid(row=2, column=0, sticky="nsew")
+        heatmap_scroll_y.configure(command=self.heatmap_canvas.yview)
+        heatmap_scroll_y.grid(row=2, column=1, sticky="ns")
         self.heatmap_canvas.bind("<Configure>", lambda *_: self._show_batch_heatmap(self._current_matrix_batch_label))
         report_notebook.add(heatmap_tab, text="参数热力图")
 
@@ -3035,6 +3605,7 @@ class BacktestWindow:
         monthly_tab = ttk.Frame(stats_notebook, padding=8)
         monthly_tab.columnconfigure(0, weight=1)
         monthly_tab.rowconfigure(0, weight=1)
+        monthly_scroll_y = ttk.Scrollbar(monthly_tab, orient="vertical")
         self.monthly_stats_tree = ttk.Treeview(
             monthly_tab,
             columns=("period", "trades", "win_rate", "pnl", "return_pct", "drawdown", "drawdown_pct", "end_equity"),
@@ -3053,12 +3624,16 @@ class BacktestWindow:
         ):
             self.monthly_stats_tree.heading(column, text=label)
             self.monthly_stats_tree.column(column, width=width, anchor="e" if column != "period" else "center")
+        self.monthly_stats_tree.configure(yscrollcommand=monthly_scroll_y.set)
         self.monthly_stats_tree.grid(row=0, column=0, sticky="nsew")
+        monthly_scroll_y.configure(command=self.monthly_stats_tree.yview)
+        monthly_scroll_y.grid(row=0, column=1, sticky="ns")
         stats_notebook.add(monthly_tab, text="月度统计")
 
         yearly_tab = ttk.Frame(stats_notebook, padding=8)
         yearly_tab.columnconfigure(0, weight=1)
         yearly_tab.rowconfigure(0, weight=1)
+        yearly_scroll_y = ttk.Scrollbar(yearly_tab, orient="vertical")
         self.yearly_stats_tree = ttk.Treeview(
             yearly_tab,
             columns=("period", "trades", "win_rate", "pnl", "return_pct", "drawdown", "drawdown_pct", "end_equity"),
@@ -3077,7 +3652,10 @@ class BacktestWindow:
         ):
             self.yearly_stats_tree.heading(column, text=label)
             self.yearly_stats_tree.column(column, width=width, anchor="e" if column != "period" else "center")
+        self.yearly_stats_tree.configure(yscrollcommand=yearly_scroll_y.set)
         self.yearly_stats_tree.grid(row=0, column=0, sticky="nsew")
+        yearly_scroll_y.configure(command=self.yearly_stats_tree.yview)
+        yearly_scroll_y.grid(row=0, column=1, sticky="ns")
         stats_notebook.add(yearly_tab, text="年度统计")
         report_notebook.add(stats_tab, text="周期统计")
 
@@ -3255,32 +3833,8 @@ class BacktestWindow:
         manual_tree_scroll_x.grid(row=1, column=0, sticky="ew")
 
         trades_notebook.add(trade_tab, text="交易流水")
-
-        self.chart_frame = ttk.LabelFrame(content_pane, text="K线图、资金曲线与止盈止损触发位置 | 暂无选中回测", padding=12)
-        self.chart_frame.columnconfigure(0, weight=1)
-        self.chart_frame.rowconfigure(1, weight=1)
-        content_pane.add(self.chart_frame, stretch="always")
-
-        chart_toolbar = ttk.Frame(self.chart_frame)
-        chart_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        chart_toolbar.columnconfigure(0, weight=1)
-        self._chart_toolbar_hint_label = ttk.Label(
-            chart_toolbar,
-            text="支持滚轮缩放、按住左键拖动平移；上方显示K线与EMA，下方显示资金曲线，可使用“图表大窗”或双击主图放大观察。",
-            justify="left",
-        )
-        self._chart_toolbar_hint_label.grid(row=0, column=0, sticky="ew")
-        self._bind_responsive_wrap(self._chart_toolbar_hint_label, chart_toolbar, padding=32, min_wrap=360)
-        chart_actions = ttk.Frame(chart_toolbar)
-        chart_actions.grid(row=1, column=0, sticky="e", pady=(8, 0))
-        ttk.Button(chart_actions, text="重置视图", command=self.reset_main_chart_view).pack(side=LEFT, padx=(0, 8))
-        ttk.Button(chart_actions, text="图表大窗", command=self.open_chart_zoom_window).pack(side=LEFT)
-
-        self.chart_canvas = Canvas(self.chart_frame, background="#ffffff", highlightthickness=0)
-        self.chart_canvas.grid(row=1, column=0, sticky="nsew")
-        self.chart_canvas.bind("<Double-Button-1>", lambda *_: self.open_chart_zoom_window())
-        self.chart_canvas.bind("<Configure>", lambda _event, target=self.chart_canvas: self._on_chart_canvas_configure(target))
-        self._bind_chart_interactions(self.chart_canvas)
+        main_pane.add(params_viewport, stretch="never")
+        main_pane.add(content_frame, stretch="always")
         self.window.after_idle(self._initialize_backtest_content_pane)
 
     def _update_sizing_mode_widgets(self) -> None:
@@ -3549,7 +4103,7 @@ class BacktestWindow:
             return
 
         self.report_summary.set(
-            f"编号：{snapshot.snapshot_id} | 时间：{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"快照编号：{snapshot.snapshot_id} | 时间：{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
             f"策略：{STRATEGY_ID_TO_NAME.get(snapshot.config.strategy_id, snapshot.config.strategy_id)} | "
             f"交易对：{snapshot.config.inst_id} | K线：{_normalize_backtest_bar_label(snapshot.config.bar)} | "
             f"交易次数：{result.report.total_trades}"
@@ -3587,7 +4141,7 @@ class BacktestWindow:
         self._latest_result = result
         self._reset_chart_views()
         self.report_summary.set(
-            f"编号：{snapshot.snapshot_id} | 时间：{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"快照编号：{snapshot.snapshot_id} | 时间：{snapshot.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
             f"策略：{STRATEGY_ID_TO_NAME.get(snapshot.config.strategy_id, snapshot.config.strategy_id)} | "
             f"交易对：{snapshot.config.inst_id} | K线：{_normalize_backtest_bar_label(snapshot.config.bar)} | "
             f"交易次数：{result.report.total_trades}"
@@ -3721,7 +4275,6 @@ class BacktestWindow:
         )
         self._current_snapshot_id = None
         self._reset_chart_views()
-        self._clear_chart_canvas(self.chart_canvas)
         self._set_chart_title("K线图、资金曲线与止盈止损触发位置 | 正在准备回测")
         if self._chart_zoom_canvas is not None and self._chart_zoom_canvas.winfo_exists():
             self._clear_chart_canvas(self._chart_zoom_canvas)
@@ -3735,7 +4288,7 @@ class BacktestWindow:
         signal_label = SIGNAL_VALUE_TO_LABEL.get(snapshot.config.signal_mode, snapshot.config.signal_mode)
         return (
             "K线图、资金曲线与止盈止损触发位置 | "
-            f"{snapshot.snapshot_id} | "
+            f"运行结果 {_runtime_snapshot_id(snapshot) or snapshot.snapshot_id} | "
             f"{_strategy_display_name(snapshot.config)} | "
             f"{snapshot.config.inst_id} | "
             f"{_normalize_backtest_bar_label(snapshot.config.bar)} | "
@@ -3776,6 +4329,8 @@ class BacktestWindow:
         if manual_position is None:
             messagebox.showinfo("扩展统计", "请先在扩展统计里选中一条记录。", parent=self.window)
             return
+        if self._chart_zoom_window is None or not self._chart_zoom_window.winfo_exists():
+            self.open_chart_zoom_window()
         self._focus_chart_on_manual_position(manual_position)
 
     def _sync_extension_stats_tab(self, result: BacktestResult | None) -> None:
@@ -4355,6 +4910,7 @@ class BacktestWindow:
         daily_filter_period = 5
         dynamic_two_r_break_even = False
         dynamic_fee_offset_enabled = False
+        dynamic_protection_rules: tuple[DynamicProtectionRule, ...] = ()
         trend_ema_slope_filter_min_ratio = Decimal("0")
         atr_percentile_filter_max = Decimal("0")
         body_retest_breakdown_atr_multiplier = Decimal("0.2")
@@ -4503,6 +5059,8 @@ class BacktestWindow:
                 max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
             dynamic_two_r_break_even = bool(self.dynamic_two_r_break_even.get())
             dynamic_fee_offset_enabled = bool(self.dynamic_fee_offset_enabled.get())
+            if take_profit_mode == "dynamic":
+                dynamic_protection_rules = self._current_dynamic_protection_rules()
             time_stop_break_even_enabled = bool(self.time_stop_break_even_enabled.get())
             time_stop_break_even_bars = (
                 self._parse_positive_int(self.time_stop_break_even_bars.get(), "时间保本K线数")
@@ -4516,10 +5074,40 @@ class BacktestWindow:
         if strategy_uses_parameter(definition.strategy_id, "ema55_slope_lock_profit_trigger_r"):
             ema55_slope_lock_profit_trigger_r = self._parse_positive_int(
                 self.ema55_slope_lock_profit_trigger_r.get(),
-                "首档触发R",
+                "移动止盈触发R",
             )
             if ema55_slope_lock_profit_trigger_r < 2:
-                raise ValueError("首档触发R 不能小于 2")
+                raise ValueError("移动止盈触发R 不能小于 2")
+        dynamic_break_even_trigger_r = 2
+        if strategy_uses_parameter(definition.strategy_id, "dynamic_break_even_trigger_r"):
+            dynamic_break_even_trigger_r = self._parse_positive_int(
+                self.dynamic_break_even_trigger_r.get(),
+                "保本触发R",
+            )
+            if dynamic_break_even_trigger_r < 1:
+                raise ValueError("保本触发R 不能小于 1")
+        dynamic_first_lock_r = 0
+        if strategy_uses_parameter(definition.strategy_id, "dynamic_first_lock_r"):
+            dynamic_first_lock_r = self._parse_nonnegative_int(
+                self.dynamic_first_lock_r.get() or "0",
+                "首档锁盈R",
+            )
+        dynamic_trailing_step_r = 1
+        if strategy_uses_parameter(definition.strategy_id, "dynamic_trailing_step_r"):
+            dynamic_trailing_step_r = self._parse_positive_int(
+                self.dynamic_trailing_step_r.get(),
+                "移动步长R",
+            )
+            if dynamic_trailing_step_r < 1:
+                raise ValueError("移动步长R 不能小于 1")
+        if take_profit_mode == "dynamic":
+            overlap_warnings = describe_dynamic_protection_rule_overlap_warnings(dynamic_protection_rules)
+            if overlap_warnings:
+                raise ValueError(
+                    "动态保护规则有冲突：\n"
+                    + "\n".join(overlap_warnings)
+                    + "\n请删除或修改较弱规则后再回测。"
+                )
         if strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
             ema55_slope_lock_profit_enabled = bool(self.ema55_slope_lock_profit_enabled.get())
         entry_slippage_rate = self._parse_nonnegative_decimal(self.entry_slippage_percent.get(), "开仓滑点") / Decimal("100")
@@ -4570,10 +5158,14 @@ class BacktestWindow:
             take_profit_mode=take_profit_mode,
             max_entries_per_trend=max_entries_per_trend,
             dynamic_two_r_break_even=dynamic_two_r_break_even,
+            dynamic_break_even_trigger_r=dynamic_break_even_trigger_r,
             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+            dynamic_protection_rules=dynamic_protection_rules,
             ema55_slope_exit_enabled=ema55_slope_exit_enabled,
             ema55_slope_lock_profit_enabled=ema55_slope_lock_profit_enabled,
             ema55_slope_lock_profit_trigger_r=ema55_slope_lock_profit_trigger_r,
+            dynamic_first_lock_r=dynamic_first_lock_r,
+            dynamic_trailing_step_r=dynamic_trailing_step_r,
             ema55_slope_negative_entry_bars=ema55_slope_negative_entry_bars,
             trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
             atr_percentile_filter_max=atr_percentile_filter_max,
@@ -4749,6 +5341,13 @@ class BacktestWindow:
                 self.dynamic_two_r_break_even_check,
                 self.dynamic_break_even_trigger_r_label,
                 self.dynamic_break_even_trigger_r_entry,
+                self.dynamic_trailing_start_r_label,
+                self.dynamic_trailing_start_r_entry,
+                self.dynamic_first_lock_r_label,
+                self.dynamic_first_lock_r_entry,
+                self.dynamic_trailing_step_r_label,
+                self.dynamic_trailing_step_r_entry,
+                self._dynamic_protection_rules_card,
                 self.dynamic_fee_offset_check,
                 self.dynamic_fee_offset_hint_label,
                 self.time_stop_break_even_check,
@@ -4937,6 +5536,7 @@ class BacktestWindow:
             self.backtest_profile_id.set("")
             self.backtest_profile_name.set("")
             self.backtest_profile_summary.set("")
+        self._rebuild_dynamic_protection_rule_editor()
         self._sync_dynamic_take_profit_controls()
         self._sync_ema55_slope_exit_condition_controls()
         self._sync_daily_filter_controls()
@@ -4954,13 +5554,58 @@ class BacktestWindow:
             definition.strategy_id,
             "ema55_slope_lock_profit_trigger_r",
         )
+        uses_break_even_trigger_r = strategy_uses_parameter(
+            definition.strategy_id,
+            "dynamic_break_even_trigger_r",
+        )
+        uses_trailing_step_r = strategy_uses_parameter(
+            definition.strategy_id,
+            "dynamic_trailing_step_r",
+        )
+        uses_first_lock_r = strategy_uses_parameter(
+            definition.strategy_id,
+            "dynamic_first_lock_r",
+        )
         self.dynamic_two_r_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self.dynamic_break_even_trigger_r_label.configure(
-            state="normal" if dynamic_take_profit and uses_dynamic_trigger_r else "disabled"
+            state="normal" if dynamic_take_profit and uses_break_even_trigger_r else "disabled"
         )
         self.dynamic_break_even_trigger_r_entry.configure(
+            state="normal" if dynamic_take_profit and uses_break_even_trigger_r else "disabled"
+        )
+        self.dynamic_trailing_start_r_label.configure(
             state="normal" if dynamic_take_profit and uses_dynamic_trigger_r else "disabled"
         )
+        self.dynamic_trailing_start_r_entry.configure(
+            state="normal" if dynamic_take_profit and uses_dynamic_trigger_r else "disabled"
+        )
+        self.dynamic_first_lock_r_label.configure(
+            state="normal" if dynamic_take_profit and uses_first_lock_r else "disabled"
+        )
+        self.dynamic_first_lock_r_entry.configure(
+            state="normal" if dynamic_take_profit and uses_first_lock_r else "disabled"
+        )
+        self.dynamic_trailing_step_r_label.configure(
+            state="normal" if dynamic_take_profit and uses_trailing_step_r else "disabled"
+        )
+        self.dynamic_trailing_step_r_entry.configure(
+            state="normal" if dynamic_take_profit and uses_trailing_step_r else "disabled"
+        )
+        if self._dynamic_protection_add_rule_button is not None:
+            self._dynamic_protection_add_rule_button.configure(state="normal" if dynamic_take_profit else "disabled")
+        if self._dynamic_protection_restore_button is not None:
+            self._dynamic_protection_restore_button.configure(state="normal" if dynamic_take_profit else "disabled")
+        for row in self._dynamic_protection_rule_rows:
+            row.trigger_entry.configure(state="normal" if dynamic_take_profit else "disabled")
+            row.action_combo.configure(state="readonly" if dynamic_take_profit else "disabled")
+            row.delete_button.configure(state="normal" if dynamic_take_profit else "disabled")
+            if dynamic_take_profit:
+                self._update_dynamic_protection_rule_row_state(row)
+            else:
+                row.lock_entry.configure(state="disabled")
+                row.trail_mode_combo.configure(state="disabled")
+                row.trail_every_entry.configure(state="disabled")
+                row.trail_add_entry.configure(state="disabled")
         self.dynamic_fee_offset_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self.time_stop_break_even_check.configure(state="normal" if dynamic_take_profit else "disabled")
         self.time_stop_break_even_bars_label.configure(state="normal" if dynamic_take_profit else "disabled")
@@ -5097,6 +5742,10 @@ class BacktestWindow:
         )
         self.max_entries_per_trend.set(str(config.max_entries_per_trend))
         self.dynamic_two_r_break_even.set(bool(config.dynamic_two_r_break_even))
+        self.dynamic_break_even_trigger_r.set(str(max(int(config.dynamic_break_even_trigger_r), 1)))
+        self.dynamic_protection_rules_json.set(
+            json.dumps(dynamic_protection_rules_to_payload(config.resolved_dynamic_protection_rules()), ensure_ascii=False)
+        )
         self.dynamic_fee_offset_enabled.set(bool(config.dynamic_fee_offset_enabled))
         self.time_stop_break_even_enabled.set(bool(config.time_stop_break_even_enabled))
         self.time_stop_break_even_bars.set(str(config.time_stop_break_even_bars))
@@ -5111,6 +5760,8 @@ class BacktestWindow:
         self.ema55_slope_exit_enabled.set(bool(config.ema55_slope_exit_enabled))
         self.ema55_slope_lock_profit_enabled.set(bool(config.ema55_slope_lock_profit_enabled))
         self.ema55_slope_lock_profit_trigger_r.set(str(max(int(config.ema55_slope_lock_profit_trigger_r), 2)))
+        self.dynamic_first_lock_r.set(str(max(int(config.dynamic_first_lock_r), 0)))
+        self.dynamic_trailing_step_r.set(str(max(int(config.dynamic_trailing_step_r), 1)))
         self.ema55_slope_negative_entry_bars.set(str(max(int(config.ema55_slope_negative_entry_bars), 1)))
         self.signal_mode_label.set(SIGNAL_VALUE_TO_LABEL.get(str(config.signal_mode), self.signal_mode_label.get()))
         self.trade_mode_label.set(_reverse_lookup_label(TRADE_MODE_OPTIONS, config.trade_mode, self.trade_mode_label.get()))
@@ -5134,6 +5785,7 @@ class BacktestWindow:
         self.backtest_profile_name.set(profile.profile_name)
         self.backtest_profile_summary.set(config.daily_filter_summary())
         self._apply_strategy_parameter_fixed_values(definition.strategy_id, definition=definition)
+        self._rebuild_dynamic_protection_rule_editor()
         self._refresh_profile_summary_text()
         self._sync_daily_filter_controls()
         self._sync_dynamic_take_profit_controls()
@@ -5150,8 +5802,9 @@ class BacktestWindow:
         export_path: str | None = None,
     ) -> _BacktestSnapshot:
         self._backtest_snapshot_sequence += 1
+        runtime_snapshot_id = f"R{self._backtest_snapshot_sequence:03d}"
         snapshot = _BacktestSnapshot(
-            snapshot_id=f"R{self._backtest_snapshot_sequence:03d}",
+            snapshot_id=runtime_snapshot_id,
             created_at=datetime.now(),
             config=config,
             candle_limit=candle_limit,
@@ -5164,6 +5817,7 @@ class BacktestWindow:
             maker_fee_rate=result.maker_fee_rate,
             taker_fee_rate=result.taker_fee_rate,
             export_path=export_path,
+            runtime_id=runtime_snapshot_id,
         )
         self._backtest_snapshots[snapshot.snapshot_id] = snapshot
         self._backtest_snapshot_order.append(snapshot.snapshot_id)
@@ -5173,7 +5827,17 @@ class BacktestWindow:
         if self._ui_alive() and self._widget_exists(getattr(self, "compare_tree", None)):
             self.compare_tree.insert("", END, iid=snapshot.snapshot_id, values=_build_backtest_compare_row(snapshot))
             self._update_compare_summary()
-        get_backtest_snapshot_store().add_snapshot(result, config, candle_limit, export_path=export_path)
+        archive_snapshot = get_backtest_snapshot_store().add_snapshot(
+            result,
+            config,
+            candle_limit,
+            runtime_snapshot_id=runtime_snapshot_id,
+            export_path=export_path,
+        )
+        snapshot = replace(snapshot, archive_id=_archive_snapshot_id(archive_snapshot))
+        self._backtest_snapshots[snapshot.snapshot_id] = snapshot
+        if self._ui_alive() and self._widget_exists(getattr(self, "compare_tree", None)) and self.compare_tree.exists(snapshot.snapshot_id):
+            self.compare_tree.item(snapshot.snapshot_id, values=_build_backtest_compare_row(snapshot))
         return snapshot
 
     def _update_compare_summary(self) -> None:
@@ -5181,7 +5845,10 @@ class BacktestWindow:
         if count == 0:
             self.compare_summary.set("暂无回测对比记录。")
             return
-        self.compare_summary.set(f"已保留 {count} 组回测结果。单击任一编号即可联动切换主视图，双击或点“加载所选”也可恢复到主视图。")
+        self.compare_summary.set(
+            f"已保存 {count} 组回测结果。单击任一运行编号即可联动切换当前结果，详情里可查看对应归档编号。"
+        )
+        return
 
     def _on_compare_tree_selected(self, *_: object) -> None:
         snapshot = self._selected_compare_snapshot()
@@ -5567,7 +6234,7 @@ class BacktestWindow:
             result_frame.columnconfigure(0, weight=1)
             ttk.Label(
                 result_frame,
-                text=f"编号：{current_snapshot.snapshot_id}",
+                text=" | ".join(_build_backtest_identity_parts(current_snapshot, prefer_archive=False)),
                 anchor="center",
                 justify="center",
             ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -5792,6 +6459,7 @@ class BacktestWindow:
                         command=lambda sid=snapshot.snapshot_id: self._load_snapshot(sid),
                     ).grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
 
+        self._sync_matrix_grid_viewport()
         self._show_batch_heatmap_v2(batch_label)
 
     def _show_batch_heatmap_v2(self, batch_label: str | None) -> None:
@@ -5812,6 +6480,7 @@ class BacktestWindow:
                     fill="#6e7781",
                     font=("Microsoft YaHei UI", 11),
                 )
+                self._sync_heatmap_canvas_scrollregion(width, height)
                 return
 
             self.heatmap_summary.set(
@@ -5825,6 +6494,7 @@ class BacktestWindow:
                 fill="#6e7781",
                 font=("Microsoft YaHei UI", 11),
             )
+            self._sync_heatmap_canvas_scrollregion(width, height)
             return
 
         snapshot_ids = self._batch_snapshot_groups.get(batch_label, [])
@@ -6014,6 +6684,7 @@ class BacktestWindow:
                     if snapshot is not None:
                         canvas.tag_bind(item_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
                         canvas.tag_bind(text_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+            self._sync_heatmap_canvas_scrollregion(width, height)
             return
 
         cell_width = grid_width / max(len(ATR_BATCH_TAKE_RATIOS), 1)
@@ -6068,6 +6739,7 @@ class BacktestWindow:
                 if snapshot is not None:
                     canvas.tag_bind(item_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
                     canvas.tag_bind(text_id, "<Button-1>", lambda _e, sid=snapshot.snapshot_id: self._load_snapshot(sid))
+        self._sync_heatmap_canvas_scrollregion(width, height)
 
     def _selected_compare_snapshot(self) -> _BacktestSnapshot | None:
         selection = self.compare_tree.selection()
@@ -6104,7 +6776,6 @@ class BacktestWindow:
         self._populate_period_stats(self.monthly_stats_tree, [])
         self._populate_period_stats(self.yearly_stats_tree, [])
         self._set_chart_title("K线图、资金曲线与止盈止损触发位置 | 暂无选中回测")
-        self._clear_chart_canvas(self.chart_canvas)
         if self._chart_zoom_canvas is not None and self._chart_zoom_canvas.winfo_exists():
             self._clear_chart_canvas(self._chart_zoom_canvas)
         self._refresh_zoom_chart_header()
@@ -6945,7 +7616,9 @@ class BacktestWindow:
         )
         canvas.tag_lower(background, text_item)
 
-    def _clear_chart_canvas(self, canvas: Canvas) -> None:
+    def _clear_chart_canvas(self, canvas: Canvas | None) -> None:
+        if canvas is None or not self._widget_exists(canvas):
+            return
         canvas.delete("all")
         width = max(canvas.winfo_width(), 960)
         height = max(canvas.winfo_height(), 420)
@@ -7024,7 +7697,8 @@ class BacktestWindow:
         self._chart_redraw_job = None
         if self._latest_result is None:
             return
-        self._draw_chart(self._latest_result, self.chart_canvas)
+        if self._widget_exists(getattr(self, "chart_canvas", None)):
+            self._draw_chart(self._latest_result, self.chart_canvas)
         if self._chart_zoom_canvas is not None and self._chart_zoom_canvas.winfo_exists():
             self._draw_chart(self._latest_result, self._chart_zoom_canvas)
 
@@ -7043,8 +7717,9 @@ class BacktestWindow:
         exit_label = _backtest_exit_mode_label(config)
         exit_metric_label = "平仓" if config.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID else "止盈"
         max_entries_label = "不限(0)" if config.max_entries_per_trend <= 0 else str(config.max_entries_per_trend)
+        identity_text = " | ".join(_build_backtest_identity_parts(snapshot, prefer_archive=False))
         context_line = (
-            f"编号：{snapshot.snapshot_id} | 策略：{strategy_name} | 交易对：{config.inst_id} | "
+            f"{identity_text} | 策略：{strategy_name} | 交易对：{config.inst_id} | "
             f"K线：{_normalize_backtest_bar_label(config.bar)} | 方向：{signal_label}"
         )
         metrics_parts = [
@@ -7056,11 +7731,7 @@ class BacktestWindow:
         if config.uses_daily_filter():
             metrics_parts.append(config.daily_filter_summary())
         if config.strategy_id != STRATEGY_BTC_EMA55_SLOPE_SHORT_ID and config.take_profit_mode == "dynamic":
-            if _uses_dynamic_break_even_trigger_r(config):
-                metrics_parts.append(f"首档触发R：{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}")
-                metrics_parts.append(f"nR保本：{config.dynamic_two_r_break_even_label()}")
-            else:
-                metrics_parts.append(f"2R保本：{config.dynamic_two_r_break_even_label()}")
+            metrics_parts.extend(_dynamic_protection_metric_parts(config))
             metrics_parts.append(f"手续费偏移：{config.dynamic_fee_offset_enabled_label()}")
             metrics_parts.append(
                 f"时间保本：{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
@@ -7084,12 +7755,13 @@ class BacktestWindow:
         if self._chart_zoom_metrics_label is not None and self._widget_exists(self._chart_zoom_metrics_label):
             self._chart_zoom_metrics_label.configure(text=metrics_line)
         if self._chart_zoom_window is not None and self._chart_zoom_window.winfo_exists():
-            if snapshot is None:
-                self._chart_zoom_window.title("回测图表大窗")
-            else:
-                self._chart_zoom_window.title(
-                    f"回测图表大窗 | {snapshot.snapshot_id} | {snapshot.config.inst_id} | {_normalize_backtest_bar_label(snapshot.config.bar)}"
-                )
+            desired_title = (
+                "回测K线图"
+                if snapshot is None
+                else f"回测K线图 | {snapshot.config.inst_id} | {_normalize_backtest_bar_label(snapshot.config.bar)}"
+            )
+            self._chart_zoom_window.title(desired_title)
+            return
 
     def open_chart_zoom_window(self) -> None:
         if self._chart_zoom_window is not None and self._chart_zoom_window.winfo_exists():
@@ -7102,6 +7774,7 @@ class BacktestWindow:
 
         zoom_window = Toplevel(self.window)
         zoom_window.title("\u56de\u6d4b\u56fe\u8868\u5927\u7a97")
+        zoom_window.title("回测K线图")
         apply_adaptive_window_geometry(
             zoom_window,
             width_ratio=0.9,
@@ -7124,7 +7797,7 @@ class BacktestWindow:
         toolbar.columnconfigure(0, weight=1)
         self._chart_zoom_intro_label = ttk.Label(
             toolbar,
-            text="放大图表：适合全面观察 K 线结构、EMA 轨迹、资金曲线和 TP/SL 触发位置，支持滚轮缩放和拖动平移。",
+            text="回测K线图：用于查看 K 线结构、EMA 轨迹、资金曲线、回撤曲线和 TP/SL 触发位置，支持滚轮缩放和拖动平移。",
             justify="left",
         )
         self._chart_zoom_intro_label.grid(row=0, column=0, sticky="w")

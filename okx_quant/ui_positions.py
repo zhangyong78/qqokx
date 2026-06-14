@@ -3752,11 +3752,15 @@ class UiPositionsMixin:
         self.positions_summary_text.set("正在刷新账户持仓...")
         environment = ENV_OPTIONS[self.environment_label.get()]
         profile_name = credentials.profile_name or self._current_credential_profile()
-        threading.Thread(
-            target=self._refresh_positions_worker,
-            args=(credentials, environment, profile_name, generation),
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=self._refresh_positions_worker,
+                args=(credentials, environment, profile_name, generation),
+                daemon=True,
+            ).start()
+        except RuntimeError as exc:
+            self._apply_positions_error(f"系统线程资源不足，无法启动持仓刷新：{exc}")
+            return
 
     def _refresh_positions_worker(
         self,
@@ -3884,11 +3888,19 @@ class UiPositionsMixin:
             return
         self._positions_enrichment_refreshing = True
         self._positions_enrichment_request = None
-        threading.Thread(
-            target=self._refresh_positions_enrichment_worker,
-            args=(list(positions), environment, profile_name, generation),
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=self._refresh_positions_enrichment_worker,
+                args=(list(positions), environment, profile_name, generation),
+                daemon=True,
+            ).start()
+        except RuntimeError:
+            self._positions_enrichment_refreshing = False
+            self._positions_enrichment_request = (generation, list(positions), environment, profile_name)
+            self._enqueue_api_switch_refresh_log_once(
+                f"positions:enrichment:thread-limit:{profile_name}:{environment}",
+                "持仓补全 | 系统线程资源不足，已跳过本轮行情补全。",
+            )
 
     def _refresh_positions_enrichment_worker(
         self,
@@ -3913,6 +3925,14 @@ class UiPositionsMixin:
             position_tickers = _build_position_ticker_map(self.client, positions)
         except Exception as exc:
             warnings.append(f"盘口价格补全失败：{_format_network_error_message(str(exc))}")
+        try:
+            upl_usdt_prices = _augment_upl_usdt_prices_from_positions(
+                upl_usdt_prices,
+                positions,
+                position_tickers,
+            )
+        except Exception as exc:
+            warnings.append(f"持仓折算价兜底失败：{_format_network_error_message(str(exc))}")
         self.root.after(
             0,
             lambda: self._apply_positions_enrichment(
@@ -3943,21 +3963,31 @@ class UiPositionsMixin:
         pending_request = self._positions_enrichment_request
         self._positions_enrichment_request = None
         if generation != getattr(self, "_positions_active_generation", 0):
-            if pending_request is not None:
-                next_generation, next_positions, next_environment, next_profile_name = pending_request
-                self._start_positions_enrichment_refresh(
-                    positions=next_positions,
-                    environment=next_environment,
-                    profile_name=next_profile_name,
-                    generation=next_generation,
-                )
-            return
+            enrichment_ids = {position.inst_id for position in positions if position.inst_id}
+            current_ids = {position.inst_id for position in self._latest_positions if position.inst_id}
+            if not enrichment_ids or not enrichment_ids.issubset(current_ids):
+                if pending_request is not None:
+                    next_generation, next_positions, next_environment, next_profile_name = pending_request
+                    self._start_positions_enrichment_refresh(
+                        positions=next_positions,
+                        environment=next_environment,
+                        profile_name=next_profile_name,
+                        generation=next_generation,
+                    )
+                return
+            positions = list(self._latest_positions)
+            self._enqueue_api_switch_refresh_log_once(
+                f"positions:enrichment:stale-applied:{profile_name}:{environment}",
+                "持仓补全 | 行情补全返回较慢，已应用到当前持仓列表。",
+            )
         if upl_usdt_prices:
             self._upl_usdt_prices = dict(upl_usdt_prices)
         if position_instruments:
             self._position_instruments = dict(position_instruments)
         if position_tickers:
             self._position_tickers = dict(position_tickers)
+            self._latest_positions = _apply_position_ticker_prices(self._latest_positions, self._position_tickers)
+            positions = _apply_position_ticker_prices(positions, self._position_tickers)
         if profile_name:
             snapshot = self._positions_snapshot_by_profile.get(profile_name)
             if snapshot is not None and str(snapshot.effective_environment or "") == str(environment or ""):

@@ -77,11 +77,18 @@ from okx_quant.market_data_hub import MarketDataHub
 from okx_quant.models import (
     Candle,
     Credentials,
+    DynamicProtectionRule,
     EmailNotificationConfig,
     Instrument,
     OrderPlan,
     ProtectionPlan,
     StrategyConfig,
+    build_legacy_dynamic_protection_rules,
+    describe_dynamic_protection_rule_overlap_warnings,
+    describe_dynamic_protection_rules,
+    dynamic_protection_rules_to_payload,
+    merge_dynamic_protection_rules,
+    normalize_dynamic_protection_rules,
 )
 from okx_quant.minimum_risk_recommendations import format_risk_recommendation, recommended_minimum_risk_amount_for_strategy
 from okx_quant.duration_input import (
@@ -1588,6 +1595,11 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             payload.get("dynamic_two_r_break_even"),
             bool(_strategy_config_default("dynamic_two_r_break_even")),
         ),
+        dynamic_break_even_trigger_r=_coerce_snapshot_int(
+            payload.get("dynamic_break_even_trigger_r"),
+            int(_strategy_config_default("dynamic_break_even_trigger_r")),
+            minimum=1,
+        ),
         ema55_slope_exit_enabled=_coerce_snapshot_bool(
             payload.get("ema55_slope_exit_enabled"),
             bool(_strategy_config_default("ema55_slope_exit_enabled")),
@@ -1597,6 +1609,17 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             int(_strategy_config_default("ema55_slope_lock_profit_trigger_r")),
             minimum=2,
         ),
+        dynamic_first_lock_r=_coerce_snapshot_int(
+            payload.get("dynamic_first_lock_r"),
+            int(_strategy_config_default("dynamic_first_lock_r")),
+            minimum=0,
+        ),
+        dynamic_trailing_step_r=_coerce_snapshot_int(
+            payload.get("dynamic_trailing_step_r"),
+            int(_strategy_config_default("dynamic_trailing_step_r")),
+            minimum=1,
+        ),
+        dynamic_protection_rules=normalize_dynamic_protection_rules(payload.get("dynamic_protection_rules")),
         dynamic_fee_offset_enabled=_coerce_snapshot_bool(
             payload.get("dynamic_fee_offset_enabled"),
             bool(_strategy_config_default("dynamic_fee_offset_enabled")),
@@ -3052,6 +3075,24 @@ def _position_history_item_from_cache(record: dict[str, object]) -> OkxPositionH
     )
 
 
+@dataclass
+class _DynamicProtectionRuleEditorRow:
+    frame: ttk.Frame
+    trigger_r: StringVar
+    action: StringVar
+    lock_r: StringVar
+    trail_mode: StringVar
+    trail_every_r: StringVar
+    trail_add_r: StringVar
+    trigger_entry: ttk.Entry
+    action_combo: ttk.Combobox
+    lock_entry: ttk.Entry
+    trail_mode_combo: ttk.Combobox
+    trail_every_entry: ttk.Entry
+    trail_add_entry: ttk.Entry
+    delete_button: ttk.Button
+
+
 class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStrategySessionsMixin):
     def __init__(self) -> None:
         self.root = Tk()
@@ -3358,7 +3399,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.startup_chase_window_seconds = StringVar(value="0")
         self.ema55_slope_exit_enabled = BooleanVar(value=True)
         self.dynamic_two_r_break_even = BooleanVar(value=True)
+        self.dynamic_break_even_trigger_r = StringVar(value="2")
         self.ema55_slope_lock_profit_trigger_r = StringVar(value="5")
+        self.dynamic_first_lock_r = StringVar(value="0")
+        self.dynamic_trailing_step_r = StringVar(value="1")
+        self.dynamic_protection_rules_json = StringVar(value="")
+        self._dynamic_protection_rule_rows: list[_DynamicProtectionRuleEditorRow] = []
+        self._dynamic_protection_rules_frame: ttk.Frame | None = None
         self.dynamic_fee_offset_enabled = BooleanVar(value=True)
         self.time_stop_break_even_enabled = BooleanVar(value=False)
         self.time_stop_break_even_bars = StringVar(value="10")
@@ -3427,7 +3474,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.daily_filter_ma_type.trace_add("write", self._update_trend_parameter_hint)
         self.daily_filter_period.trace_add("write", self._update_trend_parameter_hint)
         self.dynamic_two_r_break_even.trace_add("write", self._update_dynamic_protection_hint)
+        self.dynamic_break_even_trigger_r.trace_add("write", self._update_dynamic_protection_hint)
         self.ema55_slope_lock_profit_trigger_r.trace_add("write", self._update_dynamic_protection_hint)
+        self.dynamic_first_lock_r.trace_add("write", self._update_dynamic_protection_hint)
+        self.dynamic_trailing_step_r.trace_add("write", self._update_dynamic_protection_hint)
+        self.dynamic_protection_rules_json.trace_add("write", self._update_dynamic_protection_hint)
         self.dynamic_fee_offset_enabled.trace_add("write", self._update_dynamic_protection_hint)
         self.time_stop_break_even_enabled.trace_add("write", self._update_dynamic_protection_hint)
         self.time_stop_break_even_bars.trace_add("write", self._update_dynamic_protection_hint)
@@ -3697,7 +3748,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "max_entries_per_trend": self.max_entries_per_trend,
             "ema55_slope_exit_enabled": self.ema55_slope_exit_enabled,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
+            "dynamic_break_even_trigger_r": self.dynamic_break_even_trigger_r,
             "ema55_slope_lock_profit_trigger_r": self.ema55_slope_lock_profit_trigger_r,
+            "dynamic_first_lock_r": self.dynamic_first_lock_r,
+            "dynamic_trailing_step_r": self.dynamic_trailing_step_r,
+            "dynamic_protection_rules": self.dynamic_protection_rules_json,
             "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
             "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
             "time_stop_break_even_bars": self.time_stop_break_even_bars,
@@ -4206,17 +4261,78 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         row += 1
         self._dynamic_two_r_break_even_check = ttk.Checkbutton(
             launch_form,
-            text="启用 nR保本特例（首档触发R=2时，先移到保本位）",
+            text="启用保本（达到保本触发R时先移到保本位）",
             variable=self.dynamic_two_r_break_even,
         )
         self._dynamic_two_r_break_even_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=_lp)
-        self._ema55_slope_lock_profit_trigger_r_label = ttk.Label(launch_form, text="首档触发R")
-        self._ema55_slope_lock_profit_trigger_r_label.grid(row=row, column=2, sticky="e", pady=_lp)
+        self._dynamic_break_even_trigger_r_label = ttk.Label(launch_form, text="保本触发R")
+        self._dynamic_break_even_trigger_r_label.grid(row=row, column=2, sticky="e", pady=_lp)
+        self._dynamic_break_even_trigger_r_entry = ttk.Entry(
+            launch_form,
+            textvariable=self.dynamic_break_even_trigger_r,
+        )
+        self._dynamic_break_even_trigger_r_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        self._ema55_slope_lock_profit_trigger_r_label = ttk.Label(launch_form, text="移动止盈触发R")
+        self._ema55_slope_lock_profit_trigger_r_label.grid(row=row, column=0, sticky="w", pady=_lp)
         self._ema55_slope_lock_profit_trigger_r_entry = ttk.Entry(
             launch_form,
             textvariable=self.ema55_slope_lock_profit_trigger_r,
         )
-        self._ema55_slope_lock_profit_trigger_r_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
+        self._ema55_slope_lock_profit_trigger_r_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._dynamic_first_lock_r_label = ttk.Label(launch_form, text="首档锁盈R")
+        self._dynamic_first_lock_r_label.grid(row=row, column=2, sticky="e", pady=_lp)
+        self._dynamic_first_lock_r_entry = ttk.Entry(
+            launch_form,
+            textvariable=self.dynamic_first_lock_r,
+        )
+        self._dynamic_first_lock_r_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        self._dynamic_trailing_step_r_label = ttk.Label(launch_form, text="移动步长R")
+        self._dynamic_trailing_step_r_label.grid(row=row, column=2, sticky="e", pady=_lp)
+        self._dynamic_trailing_step_r_entry = ttk.Entry(
+            launch_form,
+            textvariable=self.dynamic_trailing_step_r,
+        )
+        self._dynamic_trailing_step_r_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        for widget in (
+            self._dynamic_two_r_break_even_check,
+            self._dynamic_break_even_trigger_r_label,
+            self._dynamic_break_even_trigger_r_entry,
+            self._ema55_slope_lock_profit_trigger_r_label,
+            self._ema55_slope_lock_profit_trigger_r_entry,
+            self._dynamic_first_lock_r_label,
+            self._dynamic_first_lock_r_entry,
+            self._dynamic_trailing_step_r_label,
+            self._dynamic_trailing_step_r_entry,
+        ):
+            widget.grid_remove()
+
+        self._dynamic_protection_rules_card = ttk.LabelFrame(launch_form, text="动态保护规则", padding=(10, 8))
+        self._dynamic_protection_rules_card.grid(row=row - 2, column=0, columnspan=4, sticky="ew", pady=(0, 6))
+        self._dynamic_protection_rules_card.columnconfigure(0, weight=1)
+        header_frame = ttk.Frame(self._dynamic_protection_rules_card)
+        header_frame.grid(row=0, column=0, sticky="ew")
+        for column, text in enumerate(("触发R", "动作", "锁到R", "递进", "每隔R", "每次加R", "操作")):
+            ttk.Label(header_frame, text=text).grid(row=0, column=column, sticky="w", padx=(0, 6))
+        self._dynamic_protection_rules_frame = ttk.Frame(self._dynamic_protection_rules_card)
+        self._dynamic_protection_rules_frame.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        footer_frame = ttk.Frame(self._dynamic_protection_rules_card)
+        footer_frame.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(
+            footer_frame,
+            text="新增规则",
+            command=lambda: (self._append_dynamic_protection_rule_row(), self._sync_dynamic_protection_rules_json_from_editor()),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            footer_frame,
+            text="恢复默认",
+            command=self._rebuild_dynamic_protection_rule_editor,
+        ).grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self._rebuild_dynamic_protection_rule_editor()
 
         row += 1
         self._dynamic_fee_offset_check = ttk.Checkbutton(
@@ -8232,15 +8348,212 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             )
         )
 
-    def _update_dynamic_protection_hint(self, *_: str) -> None:
+    def _build_legacy_dynamic_protection_rules_from_current_inputs(self) -> tuple[DynamicProtectionRule, ...]:
+        try:
+            break_even_trigger_r = max(int((self.dynamic_break_even_trigger_r.get() or "2").strip()), 1)
+        except ValueError:
+            break_even_trigger_r = 2
+        try:
+            trailing_start_r = max(int((self.ema55_slope_lock_profit_trigger_r.get() or "5").strip()), 2)
+        except ValueError:
+            trailing_start_r = 5
+        try:
+            first_lock_r = max(int((self.dynamic_first_lock_r.get() or "0").strip()), 0)
+        except ValueError:
+            first_lock_r = 0
+        try:
+            trailing_step_r = max(int((self.dynamic_trailing_step_r.get() or "1").strip()), 1)
+        except ValueError:
+            trailing_step_r = 1
+        return build_legacy_dynamic_protection_rules(
+            break_even_enabled=bool(self.dynamic_two_r_break_even.get()),
+            break_even_trigger_r=break_even_trigger_r,
+            trailing_start_r=trailing_start_r,
+            first_lock_r=first_lock_r,
+            trailing_step_r=trailing_step_r,
+        )
+
+    def _current_dynamic_protection_rules(self) -> tuple[DynamicProtectionRule, ...]:
+        raw = self.dynamic_protection_rules_json.get().strip()
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                return ()
+            return merge_dynamic_protection_rules(
+                self._build_legacy_dynamic_protection_rules_from_current_inputs(),
+                payload,
+            )
+        return self._build_legacy_dynamic_protection_rules_from_current_inputs()
+
+    def _sync_dynamic_protection_rules_json_from_editor(self) -> None:
+        rules_payload: list[dict[str, object]] = []
+        for row in self._dynamic_protection_rule_rows:
+            action = "break_even" if row.action.get() == "保本" else "lock_profit"
+            trail_mode = "step" if row.trail_mode.get() == "阶梯" else "none"
+            trigger_raw = row.trigger_r.get().strip()
+            if not trigger_raw:
+                continue
+            try:
+                trigger_r = max(int(trigger_raw), 1)
+            except ValueError:
+                continue
+            item: dict[str, object] = {
+                "trigger_r": trigger_r,
+                "action": action,
+                "lock_r": None if action == "break_even" else max(int(row.lock_r.get().strip() or "0"), 0),
+                "trail_mode": "none" if action == "break_even" else trail_mode,
+                "trail_every_r": None if action == "break_even" or trail_mode == "none" else max(int(row.trail_every_r.get().strip() or "1"), 1),
+                "trail_add_r": None if action == "break_even" or trail_mode == "none" else max(int(row.trail_add_r.get().strip() or "1"), 1),
+            }
+            rules_payload.append(item)
+        normalized = dynamic_protection_rules_to_payload(rules_payload)
+        serialized = json.dumps(normalized, ensure_ascii=False)
+        if self.dynamic_protection_rules_json.get() != serialized:
+            self.dynamic_protection_rules_json.set(serialized)
+
+    def _update_dynamic_protection_rule_row_state(self, row: _DynamicProtectionRuleEditorRow) -> None:
+        action_is_break_even = row.action.get() == "保本"
+        trail_enabled = (not action_is_break_even) and row.trail_mode.get() == "阶梯"
+        row.lock_entry.configure(state="normal" if not action_is_break_even else "disabled")
+        row.trail_mode_combo.configure(state="readonly" if not action_is_break_even else "disabled")
+        row.trail_every_entry.configure(state="normal" if trail_enabled else "disabled")
+        row.trail_add_entry.configure(state="normal" if trail_enabled else "disabled")
+
+    def _remove_dynamic_protection_rule_row(self, row: _DynamicProtectionRuleEditorRow) -> None:
+        if row not in self._dynamic_protection_rule_rows:
+            return
+        self._dynamic_protection_rule_rows.remove(row)
+        row.frame.destroy()
+        self._sync_dynamic_protection_rules_json_from_editor()
+
+    def _append_dynamic_protection_rule_row(self, rule: DynamicProtectionRule | None = None) -> None:
+        if self._dynamic_protection_rules_frame is None:
+            return
+        normalized = rule.normalized() if rule is not None else None
+        row_frame = ttk.Frame(self._dynamic_protection_rules_frame)
+        row_frame.grid(column=0, row=len(self._dynamic_protection_rule_rows) + 1, sticky="ew", pady=(4, 0))
+        for column, width in ((0, 10), (1, 12), (2, 10), (3, 10), (4, 10), (5, 10), (6, 10)):
+            row_frame.columnconfigure(column, minsize=width)
+        trigger_r = StringVar(value=str(normalized.trigger_r if normalized else len(self._dynamic_protection_rule_rows) + 2))
+        action = StringVar(value="保本" if normalized and normalized.action == "break_even" else "锁盈")
+        lock_r = StringVar(value="" if normalized is None or normalized.action == "break_even" else str(normalized.lock_r or 0))
+        trail_mode = StringVar(value="阶梯" if normalized and normalized.trailing_enabled() else "无")
+        trail_every_r = StringVar(value="" if normalized is None or not normalized.trailing_enabled() else str(normalized.trail_every_r or 1))
+        trail_add_r = StringVar(value="" if normalized is None or not normalized.trailing_enabled() else str(normalized.trail_add_r or 1))
+        trigger_entry = ttk.Entry(row_frame, textvariable=trigger_r, width=8)
+        trigger_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        action_combo = ttk.Combobox(row_frame, textvariable=action, values=("保本", "锁盈"), state="readonly", width=8)
+        action_combo.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        lock_entry = ttk.Entry(row_frame, textvariable=lock_r, width=8)
+        lock_entry.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+        trail_mode_combo = ttk.Combobox(row_frame, textvariable=trail_mode, values=("无", "阶梯"), state="readonly", width=8)
+        trail_mode_combo.grid(row=0, column=3, sticky="ew", padx=(0, 6))
+        trail_every_entry = ttk.Entry(row_frame, textvariable=trail_every_r, width=8)
+        trail_every_entry.grid(row=0, column=4, sticky="ew", padx=(0, 6))
+        trail_add_entry = ttk.Entry(row_frame, textvariable=trail_add_r, width=8)
+        trail_add_entry.grid(row=0, column=5, sticky="ew", padx=(0, 6))
+        delete_button = ttk.Button(row_frame, text="删除")
+        delete_button.grid(row=0, column=6, sticky="ew")
+        editor_row = _DynamicProtectionRuleEditorRow(
+            frame=row_frame,
+            trigger_r=trigger_r,
+            action=action,
+            lock_r=lock_r,
+            trail_mode=trail_mode,
+            trail_every_r=trail_every_r,
+            trail_add_r=trail_add_r,
+            trigger_entry=trigger_entry,
+            action_combo=action_combo,
+            lock_entry=lock_entry,
+            trail_mode_combo=trail_mode_combo,
+            trail_every_entry=trail_every_entry,
+            trail_add_entry=trail_add_entry,
+            delete_button=delete_button,
+        )
+        delete_button.configure(command=lambda current=editor_row: self._remove_dynamic_protection_rule_row(current))
+        for variable in (trigger_r, action, lock_r, trail_mode, trail_every_r, trail_add_r):
+            variable.trace_add("write", lambda *_args, current=editor_row: (self._update_dynamic_protection_rule_row_state(current), self._sync_dynamic_protection_rules_json_from_editor()))
+        self._dynamic_protection_rule_rows.append(editor_row)
+        self._update_dynamic_protection_rule_row_state(editor_row)
+
+    def _rebuild_dynamic_protection_rule_editor(self) -> None:
+        rules = self._current_dynamic_protection_rules()
+        for row in list(self._dynamic_protection_rule_rows):
+            row.frame.destroy()
+        self._dynamic_protection_rule_rows.clear()
+        if not rules:
+            rules = self._build_legacy_dynamic_protection_rules_from_current_inputs()
+        for rule in rules:
+            self._append_dynamic_protection_rule_row(rule)
+        if not self._dynamic_protection_rule_rows:
+            self._append_dynamic_protection_rule_row()
+        self._sync_dynamic_protection_rules_json_from_editor()
+
+    def _update_dynamic_protection_hint_legacy(self, *_: str) -> None:
         strategy_id = self._strategy_name_to_id.get(self.strategy_name.get(), "")
-        profile = get_strategy_runtime_profile(strategy_id) if strategy_id else None
+        rules = self._current_dynamic_protection_rules()
+        if self.take_profit_mode_label.get() == "鍔ㄦ€佹鐩?" and rules:
+            preview_lines = describe_dynamic_protection_rules(
+                rules,
+                fee_offset_enabled=self.dynamic_fee_offset_enabled.get(),
+            )
+            time_stop_bars = self.time_stop_break_even_bars.get().strip() or "0"
+            time_stop_text = (
+                f"时间保本：开启，持仓满 {time_stop_bars} 根K线且已达到净保本后，再把止损抬到保本位。"
+                if self.time_stop_break_even_enabled.get()
+                else f"时间保本：关闭（当前设定 {time_stop_bars} 根，仅保存参数，不会启用）。"
+            )
+            self.dynamic_protection_hint_text.set("动态保护： " + " / ".join(preview_lines + (time_stop_text,)))
+            return
         self.dynamic_protection_hint_text.set(
             _build_dynamic_protection_hint_text(
                 take_profit_mode_label=self.take_profit_mode_label.get(),
                 dynamic_two_r_break_even_enabled=self.dynamic_two_r_break_even.get(),
-                break_even_trigger_r_raw=self.ema55_slope_lock_profit_trigger_r.get(),
-                break_even_trigger_r_configurable=bool(profile and profile.family == "ema55_slope_short"),
+                break_even_trigger_r_raw=self.dynamic_break_even_trigger_r.get(),
+                trailing_start_r_raw=self.ema55_slope_lock_profit_trigger_r.get(),
+                first_lock_r_raw=self.dynamic_first_lock_r.get(),
+                trailing_step_r_raw=self.dynamic_trailing_step_r.get(),
+                break_even_trigger_r_configurable=bool(
+                    strategy_id and strategy_uses_parameter(strategy_id, "dynamic_break_even_trigger_r")
+                ),
+                dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get(),
+                time_stop_break_even_enabled=self.time_stop_break_even_enabled.get(),
+                time_stop_break_even_bars_raw=self.time_stop_break_even_bars.get(),
+            )
+        )
+
+    def _update_dynamic_protection_hint(self, *_: str) -> None:
+        strategy_id = self._strategy_name_to_id.get(self.strategy_name.get(), "")
+        rules = self._current_dynamic_protection_rules()
+        if self.take_profit_mode_label.get() == "动态止盈" and rules:
+            preview_lines = describe_dynamic_protection_rules(
+                rules,
+                fee_offset_enabled=self.dynamic_fee_offset_enabled.get(),
+            )
+            overlap_warnings = describe_dynamic_protection_rule_overlap_warnings(rules)
+            time_stop_bars = self.time_stop_break_even_bars.get().strip() or "0"
+            time_stop_text = (
+                f"时间保本：开启，持仓满 {time_stop_bars} 根K线且已达到净保本后，再把止损抬到保本位。"
+                if self.time_stop_break_even_enabled.get()
+                else f"时间保本：关闭（当前设定 {time_stop_bars} 根，仅保存参数，不会启用）。"
+            )
+            hint_parts = preview_lines + (time_stop_text,)
+            if overlap_warnings:
+                hint_parts = hint_parts + ("规则提示：" + "；".join(overlap_warnings),)
+            self.dynamic_protection_hint_text.set("动态保护： " + " / ".join(hint_parts))
+            return
+        self.dynamic_protection_hint_text.set(
+            _build_dynamic_protection_hint_text(
+                take_profit_mode_label=self.take_profit_mode_label.get(),
+                dynamic_two_r_break_even_enabled=self.dynamic_two_r_break_even.get(),
+                break_even_trigger_r_raw=self.dynamic_break_even_trigger_r.get(),
+                trailing_start_r_raw=self.ema55_slope_lock_profit_trigger_r.get(),
+                first_lock_r_raw=self.dynamic_first_lock_r.get(),
+                trailing_step_r_raw=self.dynamic_trailing_step_r.get(),
+                break_even_trigger_r_configurable=bool(
+                    strategy_id and strategy_uses_parameter(strategy_id, "dynamic_break_even_trigger_r")
+                ),
                 dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get(),
                 time_stop_break_even_enabled=self.time_stop_break_even_enabled.get(),
                 time_stop_break_even_bars_raw=self.time_stop_break_even_bars.get(),
@@ -8328,12 +8641,38 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 else True
             )
             ema55_slope_lock_profit_trigger_r = (
-                self._parse_nonnegative_int(self.ema55_slope_lock_profit_trigger_r.get(), "首档触发R")
+                self._parse_nonnegative_int(self.ema55_slope_lock_profit_trigger_r.get(), "移动止盈触发R")
                 if strategy_uses_parameter(definition.strategy_id, "ema55_slope_lock_profit_trigger_r")
                 else 2
             )
+            dynamic_break_even_trigger_r = (
+                self._parse_nonnegative_int(self.dynamic_break_even_trigger_r.get(), "保本触发R")
+                if strategy_uses_parameter(definition.strategy_id, "dynamic_break_even_trigger_r")
+                else 2
+            )
+            dynamic_trailing_step_r = (
+                self._parse_nonnegative_int(self.dynamic_trailing_step_r.get(), "移动步长R")
+                if strategy_uses_parameter(definition.strategy_id, "dynamic_trailing_step_r")
+                else 1
+            )
+            dynamic_first_lock_r = (
+                self._parse_nonnegative_int(self.dynamic_first_lock_r.get(), "首档锁盈R")
+                if strategy_uses_parameter(definition.strategy_id, "dynamic_first_lock_r")
+                else 0
+            )
             if ema55_slope_lock_profit_trigger_r < 2:
-                raise ValueError("首档触发R 不能小于 2")
+                raise ValueError("移动止盈触发R 不能小于 2")
+            if dynamic_break_even_trigger_r < 1:
+                raise ValueError("保本触发R 不能小于 1")
+            if dynamic_trailing_step_r < 1:
+                raise ValueError("移动步长R 不能小于 1")
+            dynamic_protection_rules = (
+                self._current_dynamic_protection_rules()
+                if TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "dynamic") == "dynamic"
+                else ()
+            )
+            if TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "dynamic") == "dynamic" and not dynamic_protection_rules:
+                raise ValueError("动态止盈至少需要一条动态保护规则")
             config = StrategyConfig(
                 inst_id=signal_symbol or trade_symbol,
                 bar=self.bar.get().strip(),
@@ -8360,7 +8699,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 take_profit_mode=TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "dynamic"),
                 ema55_slope_exit_enabled=ema55_slope_exit_enabled,
                 dynamic_two_r_break_even=bool(self.dynamic_two_r_break_even.get()),
+                dynamic_break_even_trigger_r=dynamic_break_even_trigger_r,
                 ema55_slope_lock_profit_trigger_r=ema55_slope_lock_profit_trigger_r,
+                dynamic_first_lock_r=dynamic_first_lock_r,
+                dynamic_trailing_step_r=dynamic_trailing_step_r,
+                dynamic_protection_rules=dynamic_protection_rules,
                 dynamic_fee_offset_enabled=bool(self.dynamic_fee_offset_enabled.get()),
                 trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
                 atr_percentile_filter_max=atr_percentile_filter_max,
@@ -12902,11 +13245,14 @@ def _entry_reference_ema_caption(strategy_id: str) -> str:
     return strategy_entry_reference_caption(strategy_id)
 
 
-def _build_dynamic_protection_hint_text(
+def _build_dynamic_protection_hint_text_legacy(
     *,
     take_profit_mode_label: str,
     dynamic_two_r_break_even_enabled: bool,
     break_even_trigger_r_raw: str = "2",
+    trailing_start_r_raw: str = "2",
+    first_lock_r_raw: str = "0",
+    trailing_step_r_raw: str = "1",
     break_even_trigger_r_configurable: bool = False,
     dynamic_fee_offset_enabled: bool,
     time_stop_break_even_enabled: bool,
@@ -12914,32 +13260,39 @@ def _build_dynamic_protection_hint_text(
 ) -> str:
     if take_profit_mode_label != "动态止盈":
         return "动态保护：当前为固定止盈，首档触发R / nR保本 / 手续费偏移 / 时间保本都不生效。"
-    trigger_r_raw = break_even_trigger_r_raw.strip() or "2"
+    trigger_r_raw = trailing_start_r_raw.strip() or "2"
+    break_even_raw = break_even_trigger_r_raw.strip() or "2"
+    trailing_step_raw = trailing_step_r_raw.strip() or "1"
     try:
         trigger_r = max(int(trigger_r_raw), 2)
     except ValueError:
         trigger_r = 2
+    try:
+        break_even_trigger_r = max(int(break_even_raw), 1)
+    except ValueError:
+        break_even_trigger_r = 2
+    try:
+        trailing_step_r = max(int(trailing_step_raw), 1)
+    except ValueError:
+        trailing_step_r = 1
     time_stop_bars = time_stop_break_even_bars_raw.strip() or "0"
-    if break_even_trigger_r_configurable:
-        if dynamic_two_r_break_even_enabled and trigger_r == 2:
-            first_leg_text = "nR保本：开启，首档触发R=2 时先把止损抬到保本位。"
-        elif dynamic_two_r_break_even_enabled:
-            first_leg_text = (
-                f"nR保本：开启，首档触发R={trigger_r}；因此会沿用 BTC 斜率做空逻辑，"
-                f"在 {trigger_r}R 时先抬到 {trigger_r - 1}R 位。"
-            )
-        else:
-            first_leg_text = (
-                f"nR保本：关闭，价格达到首档 {trigger_r}R 后，止损先抬到 {trigger_r - 1}R 位。"
-            )
+    locked_r = max(trigger_r - trailing_step_r, 0)
+    if dynamic_two_r_break_even_enabled:
+        first_leg_text = (
+            f"保本：开启，价格先到 {break_even_trigger_r}R 时抬到保本位；"
+            f"到 {trigger_r}R 后开始移动止盈，先锁 {locked_r}R，之后每 {trailing_step_r}R 推进一次。"
+        )
     else:
         first_leg_text = (
-            "2R保本：开启，浮盈达到 2R 后先把止损抬到保本位。"
-            if dynamic_two_r_break_even_enabled
-            else "2R保本：关闭，浮盈达到 2R 也不会自动抬到保本位。"
+            f"保本：关闭，价格达到 {trigger_r}R 后才开始移动止盈，先锁 {locked_r}R，"
+            f"之后每 {trailing_step_r}R 推进一次。"
         )
     parts = [
-        (f"首档触发R：{trigger_r}。" if break_even_trigger_r_configurable else "首档触发R：固定为 2。"),
+        (
+            f"保本触发R：{break_even_trigger_r}；移动止盈触发R：{trigger_r}；移动步长R：{trailing_step_r}。"
+            if break_even_trigger_r_configurable
+            else "移动止盈触发R：固定为 2。"
+        ),
         first_leg_text,
         (
             "手续费偏移：开启，保本位会额外预留双边手续费缓冲。"
@@ -12952,6 +13305,107 @@ def _build_dynamic_protection_hint_text(
             else f"时间保本：关闭（当前设定 {time_stop_bars} 根，仅保存参数，不会启用）。"
         ),
     ]
+    if not break_even_trigger_r_configurable:
+        parts[0] = "首档触发R：固定为 2。 " + parts[0]
+        first_leg_prefix = "2R保本：开启，" if dynamic_two_r_break_even_enabled else "2R保本：关闭，"
+        parts[1] = first_leg_prefix + parts[1]
+    return "动态保护： " + " ".join(parts)
+
+
+def _build_dynamic_protection_hint_text(
+    *,
+    take_profit_mode_label: str,
+    dynamic_two_r_break_even_enabled: bool,
+    break_even_trigger_r_raw: str = "2",
+    trailing_start_r_raw: str = "2",
+    first_lock_r_raw: str = "0",
+    trailing_step_r_raw: str = "1",
+    break_even_trigger_r_configurable: bool = False,
+    dynamic_fee_offset_enabled: bool,
+    time_stop_break_even_enabled: bool,
+    time_stop_break_even_bars_raw: str,
+) -> str:
+    if take_profit_mode_label != "动态止盈":
+        return "动态保护：当前为固定止盈，保本触发R / 移动止盈触发R / 首档锁盈R / 手续费偏移 / 时间保本都不生效。"
+    trigger_r_raw = trailing_start_r_raw.strip() or "2"
+    break_even_raw = break_even_trigger_r_raw.strip() or "2"
+    first_lock_raw = first_lock_r_raw.strip() or "0"
+    trailing_step_raw = trailing_step_r_raw.strip() or "1"
+    try:
+        trigger_r = max(int(trigger_r_raw), 2)
+    except ValueError:
+        trigger_r = 2
+    try:
+        break_even_trigger_r = max(int(break_even_raw), 1)
+    except ValueError:
+        break_even_trigger_r = 2
+    try:
+        first_lock_r = max(int(first_lock_raw), 0)
+    except ValueError:
+        first_lock_r = 0
+    try:
+        trailing_step_r = max(int(trailing_step_raw), 1)
+    except ValueError:
+        trailing_step_r = 1
+    time_stop_bars = time_stop_break_even_bars_raw.strip() or "0"
+    auto_first_lock_r = max(trigger_r - trailing_step_r, 0)
+    effective_first_lock_r = first_lock_r if first_lock_r > 0 else auto_first_lock_r
+    custom_first_lock_enabled = first_lock_r > 0 and first_lock_r != auto_first_lock_r
+    if dynamic_two_r_break_even_enabled:
+        if custom_first_lock_enabled:
+            next_trigger_r = trigger_r + trailing_step_r
+            next_lock_r = effective_first_lock_r + trailing_step_r
+            first_leg_text = (
+                f"保本：开启，价格先到 {break_even_trigger_r}R 时先移到保本位；"
+                f"到 {trigger_r}R 后先锁 {effective_first_lock_r}R，"
+                f"到 {next_trigger_r}R 后上移到 {next_lock_r}R，之后每 {trailing_step_r}R 再上移 {trailing_step_r}R。"
+            )
+        else:
+            next_trigger_r = trigger_r + trailing_step_r
+            next_lock_r = effective_first_lock_r + trailing_step_r
+            first_leg_text = (
+                f"保本：开启，价格先到 {break_even_trigger_r}R 时先移到保本位；"
+                f"到 {trigger_r}R 后开始移动止盈，先锁 {effective_first_lock_r}R；"
+                f"到 {next_trigger_r}R 后上移到 {next_lock_r}R，之后每 {trailing_step_r}R 再上移 {trailing_step_r}R。"
+            )
+    else:
+        if custom_first_lock_enabled:
+            next_trigger_r = trigger_r + trailing_step_r
+            next_lock_r = effective_first_lock_r + trailing_step_r
+            first_leg_text = (
+                f"保本：关闭，价格到 {trigger_r}R 后才开始移动止盈，先锁 {effective_first_lock_r}R；"
+                f"到 {next_trigger_r}R 后上移到 {next_lock_r}R，之后每 {trailing_step_r}R 再上移 {trailing_step_r}R。"
+            )
+        else:
+            next_trigger_r = trigger_r + trailing_step_r
+            next_lock_r = effective_first_lock_r + trailing_step_r
+            first_leg_text = (
+                f"保本：关闭，价格到 {trigger_r}R 后才开始移动止盈，先锁 {effective_first_lock_r}R；"
+                f"到 {next_trigger_r}R 后上移到 {next_lock_r}R，之后每 {trailing_step_r}R 再上移 {trailing_step_r}R。"
+            )
+    parts = [
+        (
+            f"保本触发R：{break_even_trigger_r}；移动止盈触发R：{trigger_r}；首档锁盈R："
+            f"{first_lock_r if first_lock_r > 0 else '自动'}；移动步长R：{trailing_step_r}。"
+            if break_even_trigger_r_configurable
+            else "首档触发R：固定为 2。"
+        ),
+        first_leg_text,
+        (
+            "手续费偏移：开启，保本位会额外预留双向手续费缓冲。"
+            if dynamic_fee_offset_enabled
+            else "手续费偏移：关闭，保本位不额外预留手续费缓冲。"
+        ),
+        (
+            f"时间保本：开启，持仓满 {time_stop_bars} 根K线且达到净保本后，再把止损抬到保本位。"
+            if time_stop_break_even_enabled
+            else f"时间保本：关闭（当前设定 {time_stop_bars} 根，仅保存参数，不会启用）。"
+        ),
+    ]
+    if not break_even_trigger_r_configurable:
+        parts[0] = "首档触发R：固定为 2。" + parts[0]
+        first_leg_prefix = "2R保本：开启，" if dynamic_two_r_break_even_enabled else "2R保本：关闭，"
+        parts[1] = first_leg_prefix + parts[1]
     return "动态保护： " + " ".join(parts)
 
 
@@ -13585,16 +14039,21 @@ def _position_signed_display_amount(
     sign = Decimal("-1") if direction == "short" else Decimal("1")
     instrument = position_instruments.get(position.inst_id)
 
-    if instrument is not None and instrument.ct_val is not None and instrument.ct_val > 0 and instrument.ct_val_ccy:
-        multiplier = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
-        quote_currency = instrument.ct_val_ccy.upper()
+    contract_value, contract_currency = _position_contract_value_snapshot(position, instrument)
+    if contract_value is not None and contract_value > 0 and contract_currency:
+        multiplier = (
+            instrument.ct_mult
+            if instrument is not None and instrument.ct_mult is not None and instrument.ct_mult > 0
+            else Decimal("1")
+        )
+        quote_currency = contract_currency.upper()
         if quote_currency in {"USD", "USDT", "USDC"} and position.inst_type in {"FUTURES", "SWAP"}:
             reference_price = position.mark_price or position.last_price or position.avg_price
             base_currency = _extract_asset_key(position.inst_id).upper()
             if reference_price is not None and reference_price > 0 and base_currency:
-                amount = (abs(position.position) * instrument.ct_val * multiplier / reference_price) * sign
+                amount = (abs(position.position) * contract_value * multiplier / reference_price) * sign
                 return amount, base_currency
-        amount = abs(position.position) * instrument.ct_val * multiplier * sign
+        amount = abs(position.position) * contract_value * multiplier * sign
         return amount, quote_currency
 
     if position.inst_type in {"OPTION", "SWAP", "FUTURES"}:
@@ -13681,6 +14140,56 @@ def _format_group_option_trade_side(
         f"{_slot_text('买购')} : {_slot_text('卖购')} | "
         f"{_slot_text('买沽')} : {_slot_text('卖沽')}"
     )
+
+
+def _position_contract_value_snapshot(
+    position: OkxPosition,
+    instrument: Instrument | None,
+) -> tuple[Decimal | None, str | None]:
+    if instrument is not None and instrument.ct_val is not None and instrument.ct_val > 0 and instrument.ct_val_ccy:
+        return instrument.ct_val, instrument.ct_val_ccy.upper()
+    return _fallback_position_contract_value(position.inst_id, position.inst_type)
+
+
+def _fallback_position_contract_value(inst_id: str, inst_type: str) -> tuple[Decimal | None, str | None]:
+    normalized_type = str(inst_type or "").strip().upper()
+    asset = _extract_asset_key(inst_id).upper()
+    quote = (_extract_quote_key(inst_id) or "").upper()
+    if not asset:
+        return None, None
+
+    if normalized_type == "OPTION" and quote == "USD":
+        option_contract_values = {
+            "BTC": Decimal("0.01"),
+            "ETH": Decimal("0.1"),
+        }
+        contract_value = option_contract_values.get(asset)
+        if contract_value is not None:
+            return contract_value, asset
+
+    if normalized_type in {"SWAP", "FUTURES"} and quote == "USD":
+        inverse_contract_values = {
+            "BTC": Decimal("100"),
+        }
+        contract_value = inverse_contract_values.get(asset)
+        if contract_value is not None:
+            return contract_value, "USD"
+
+    if normalized_type in {"SWAP", "FUTURES"} and quote in {"USDT", "USDC"}:
+        linear_contract_values = {
+            "BTC": Decimal("0.01"),
+            "ETH": Decimal("0.1"),
+            "BNB": Decimal("0.01"),
+            "OKB": Decimal("0.01"),
+            "SOL": Decimal("1"),
+            "DOGE": Decimal("1000"),
+            "XRP": Decimal("100"),
+        }
+        contract_value = linear_contract_values.get(asset)
+        if contract_value is not None:
+            return contract_value, asset
+
+    return None, None
 
 
 def _format_filtered_option_position_size(
@@ -14046,10 +14555,15 @@ def _position_contract_amount(
     position_instruments: dict[str, Instrument],
 ) -> tuple[Decimal | None, str | None]:
     instrument = position_instruments.get(position.inst_id)
-    if instrument is not None and instrument.ct_val is not None and instrument.ct_val > 0 and instrument.ct_val_ccy:
-        multiplier = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
-        amount = abs(position.position) * instrument.ct_val * multiplier
-        return amount, instrument.ct_val_ccy.upper()
+    contract_value, contract_currency = _position_contract_value_snapshot(position, instrument)
+    if contract_value is not None and contract_value > 0 and contract_currency:
+        multiplier = (
+            instrument.ct_mult
+            if instrument is not None and instrument.ct_mult is not None and instrument.ct_mult > 0
+            else Decimal("1")
+        )
+        amount = abs(position.position) * contract_value * multiplier
+        return amount, contract_currency.upper()
     if position.inst_type == "SPOT":
         return abs(position.position), _extract_asset_key(position.inst_id).upper()
     return None, None
@@ -14211,6 +14725,14 @@ def _position_matches_session_live_pnl(
 
 def _build_upl_usdt_price_map(client: OkxRestClient, positions: list[OkxPosition]) -> dict[str, Decimal]:
     currencies = {_infer_upl_currency(position) for position in positions if position.unrealized_pnl is not None}
+    for position in positions:
+        inferred_currency = _infer_upl_currency(position)
+        if inferred_currency:
+            currencies.add(inferred_currency)
+        if position.inst_type == "OPTION":
+            asset_currency = _extract_asset_key(position.inst_id).upper()
+            if asset_currency:
+                currencies.add(asset_currency)
     return _build_usdt_price_snapshot(client, currencies)
 
 
@@ -14261,12 +14783,27 @@ def _build_position_instrument_map(client: OkxRestClient, positions: list[OkxPos
         }
     )
     for family in option_families:
+        family_needed_ids = {
+            position.inst_id
+            for position in positions
+            if position.inst_type == "OPTION" and infer_option_family(position.inst_id) == family
+        }
         try:
-            for instrument in client.get_option_instruments(inst_family=family):
-                if instrument.inst_id in needed_ids:
-                    result[instrument.inst_id] = instrument
+            family_instruments = client.get_option_instruments(inst_family=family)
         except Exception:
+            family_instruments = []
+        for instrument in family_instruments:
+            if instrument.inst_id in needed_ids:
+                result[instrument.inst_id] = instrument
+        if family_needed_ids.issubset(result.keys()):
             continue
+        try:
+            uly_instruments = client.get_option_instruments(uly=family)
+        except Exception:
+            uly_instruments = []
+        for instrument in uly_instruments:
+            if instrument.inst_id in needed_ids:
+                result[instrument.inst_id] = instrument
 
     swap_ids = {position.inst_id for position in positions if position.inst_type == "SWAP"}
     if swap_ids:
@@ -14312,12 +14849,27 @@ def _build_position_ticker_map(client: OkxRestClient, positions: list[OkxPositio
         }
     )
     for family in option_families:
+        family_needed_ids = {
+            position.inst_id
+            for position in positions
+            if position.inst_type == "OPTION" and infer_option_family(position.inst_id) == family
+        }
         try:
-            for ticker in client.get_tickers("OPTION", inst_family=family):
-                if ticker.inst_id in needed_ids:
-                    result[ticker.inst_id] = ticker
+            uly_tickers = client.get_tickers("OPTION", uly=family)
         except Exception:
+            uly_tickers = []
+        for ticker in uly_tickers:
+            if ticker.inst_id in needed_ids:
+                result[ticker.inst_id] = ticker
+        if family_needed_ids.issubset(result.keys()):
             continue
+        try:
+            family_tickers = client.get_tickers("OPTION", inst_family=family)
+        except Exception:
+            family_tickers = []
+        for ticker in family_tickers:
+            if ticker.inst_id in needed_ids:
+                result[ticker.inst_id] = ticker
 
     for inst_type in ("SWAP", "FUTURES", "SPOT", "MARGIN"):
         type_needed_ids = {
@@ -14333,7 +14885,127 @@ def _build_position_ticker_map(client: OkxRestClient, positions: list[OkxPositio
                     result[ticker.inst_id] = ticker
         except Exception:
             continue
+    missing_ids = needed_ids.difference(result.keys())
+    for inst_id in sorted(missing_ids):
+        try:
+            result[inst_id] = client.get_ticker(inst_id)
+        except Exception:
+            continue
+    for inst_id in sorted(needed_ids):
+        ticker = result.get(inst_id)
+        if ticker is not None and ticker.bid is not None and ticker.ask is not None:
+            continue
+        try:
+            order_book = client.get_order_book(inst_id, depth=1)
+        except Exception:
+            continue
+        bid_price = order_book.bids[0][0] if order_book.bids else None
+        ask_price = order_book.asks[0][0] if order_book.asks else None
+        if bid_price is None and ask_price is None:
+            continue
+        result[inst_id] = _merge_ticker_order_book_quotes(ticker, inst_id, bid_price=bid_price, ask_price=ask_price)
     return result
+
+
+def _merge_ticker_order_book_quotes(
+    ticker: OkxTicker | None,
+    inst_id: str,
+    *,
+    bid_price: Decimal | None,
+    ask_price: Decimal | None,
+) -> OkxTicker:
+    raw = dict(ticker.raw) if ticker is not None and isinstance(ticker.raw, dict) else {}
+    raw["orderBookBidPx"] = str(bid_price) if bid_price is not None else ""
+    raw["orderBookAskPx"] = str(ask_price) if ask_price is not None else ""
+    return OkxTicker(
+        inst_id=ticker.inst_id if ticker is not None else inst_id,
+        last=ticker.last if ticker is not None else None,
+        bid=ticker.bid if ticker is not None and ticker.bid is not None else bid_price,
+        ask=ticker.ask if ticker is not None and ticker.ask is not None else ask_price,
+        mark=ticker.mark if ticker is not None else None,
+        index=ticker.index if ticker is not None else None,
+        raw=raw,
+    )
+
+
+def _augment_upl_usdt_prices_from_positions(
+    prices: dict[str, Decimal],
+    positions: list[OkxPosition],
+    position_tickers: dict[str, OkxTicker],
+) -> dict[str, Decimal]:
+    augmented = dict(prices)
+    augmented.setdefault("USD", Decimal("1"))
+    augmented.setdefault("USDT", Decimal("1"))
+    augmented.setdefault("USDC", Decimal("1"))
+
+    def _set_price(currency: str, value: Decimal | None) -> None:
+        normalized = currency.strip().upper()
+        if not normalized or normalized in augmented:
+            return
+        if value is not None and value > 0:
+            augmented[normalized] = value
+
+    def _ticker_reference_price(ticker: OkxTicker | None, *, allow_mark: bool) -> Decimal | None:
+        if ticker is None:
+            return None
+        candidates = (ticker.index, ticker.last, ticker.mark, ticker.bid, ticker.ask) if allow_mark else (ticker.index, ticker.last)
+        for candidate in candidates:
+            if candidate is not None and candidate > 0:
+                return candidate
+        return None
+
+    for position in positions:
+        asset_currency = _extract_asset_key(position.inst_id).upper()
+        quote_currency = (_extract_quote_key(position.inst_id) or "").upper()
+        ticker = position_tickers.get(position.inst_id)
+        if not asset_currency:
+            continue
+
+        if position.inst_type in {"SWAP", "FUTURES", "SPOT"} and quote_currency in {"USD", "USDT", "USDC"}:
+            position_price = position.mark_price or position.last_price or position.avg_price
+            _set_price(asset_currency, position_price)
+            _set_price(asset_currency, _ticker_reference_price(ticker, allow_mark=True))
+            continue
+
+        if position.inst_type == "OPTION":
+            raw = position.raw if isinstance(position.raw, dict) else {}
+            for key in ("idxPx", "indexPx", "underlyingPx", "ulyPx"):
+                raw_price = _parse_decimal_or_none(raw.get(key))
+                if raw_price is not None and raw_price > 0:
+                    _set_price(asset_currency, raw_price)
+                    break
+            _set_price(asset_currency, _ticker_reference_price(ticker, allow_mark=False))
+
+    return augmented
+
+
+def _apply_position_ticker_prices(
+    positions: list[OkxPosition],
+    position_tickers: dict[str, OkxTicker],
+) -> list[OkxPosition]:
+    enriched: list[OkxPosition] = []
+    for position in positions:
+        ticker = position_tickers.get(position.inst_id)
+        if ticker is None:
+            enriched.append(position)
+            continue
+        mark_price = position.mark_price or ticker.mark
+        last_price = position.last_price or ticker.last
+        if mark_price is None:
+            mark_price = last_price
+        if mark_price == position.mark_price and last_price == position.last_price:
+            enriched.append(position)
+            continue
+        enriched.append(
+            OkxPosition(
+                **{
+                    **position.__dict__,
+                    "mark_price": mark_price,
+                    "last_price": last_price,
+                }
+            )
+        )
+    return enriched
 
 
 def _now_epoch_ms() -> int:

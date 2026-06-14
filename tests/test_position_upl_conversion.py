@@ -2,11 +2,14 @@
 from unittest import TestCase
 
 from okx_quant.models import Credentials, Instrument
-from okx_quant.okx_client import OkxPosition, OkxRestClient, OkxTicker
+from okx_quant.okx_client import OkxOrderBook, OkxPosition, OkxRestClient, OkxTicker
 from okx_quant.ui import (
     POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS,
     _aggregate_position_metrics,
+    _apply_position_ticker_prices,
+    _augment_upl_usdt_prices_from_positions,
     _build_position_instrument_map,
+    _build_position_ticker_map,
     _build_upl_usdt_price_map,
     _build_group_row_values,
     _format_margin_mode,
@@ -101,6 +104,14 @@ class PositionUplConversionTest(TestCase):
         self.assertEqual(prices["BTC"], Decimal("80000"))
         self.assertEqual(prices["USDT"], Decimal("1"))
 
+    def test_build_upl_usdt_price_map_includes_option_underlying_without_upl(self) -> None:
+        position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy=None)
+        position = OkxPosition(**{**position.__dict__, "unrealized_pnl": None})
+
+        prices = _build_upl_usdt_price_map(_StubClient(), [position])
+
+        self.assertEqual(prices["BTC"], Decimal("80000"))
+
     def test_position_unrealized_pnl_usdt_converts_from_margin_currency(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0.0015", margin_ccy="BTC")
         converted = _position_unrealized_pnl_usdt(position, {"BTC": Decimal("80000")})
@@ -146,11 +157,17 @@ class PositionUplConversionTest(TestCase):
         text = _format_position_size(position, {instrument.inst_id: instrument})
         self.assertEqual(text, "-0.2 BTC (short)")
 
-    def test_format_position_size_without_option_contract_specs_uses_contract_unit(self) -> None:
+    def test_format_position_size_without_option_contract_specs_uses_btc_contract_value(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
         position = OkxPosition(**{**position.__dict__, "position": Decimal("25"), "pos_side": "net"})
 
-        self.assertEqual(_format_position_size(position, {}), "25 张 (long)")
+        self.assertEqual(_format_position_size(position, {}), "0.25 BTC (long)")
+
+    def test_format_position_size_without_option_specs_shows_one_btc_for_100_contracts(self) -> None:
+        position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
+        position = OkxPosition(**{**position.__dict__, "position": Decimal("100"), "pos_side": "net"})
+
+        self.assertEqual(_format_position_size(position, {}), "1 BTC (long)")
 
     def test_format_position_size_returns_dash_for_zero_position(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
@@ -248,6 +265,33 @@ class PositionUplConversionTest(TestCase):
             ct_val_ccy="USD",
         )
         self.assertEqual(_format_position_size(position, {instrument.inst_id: instrument}), "-0.4000 BTC (short)")
+
+    def test_format_position_size_converts_coin_margined_btc_swap_without_specs(self) -> None:
+        position = _make_position(inst_id="BTC-USD-SWAP", upl="0", margin_ccy="BTC")
+        position = OkxPosition(
+            **{
+                **position.__dict__,
+                "inst_type": "SWAP",
+                "position": Decimal("200"),
+                "pos_side": "short",
+                "mark_price": Decimal("50000"),
+            }
+        )
+
+        self.assertEqual(_format_position_size(position, {}), "-0.4000 BTC (short)")
+
+    def test_format_position_size_converts_usdt_swap_without_specs(self) -> None:
+        position = _make_position(inst_id="DOGE-USDT-SWAP", upl="0", margin_ccy="USDT")
+        position = OkxPosition(
+            **{
+                **position.__dict__,
+                "inst_type": "SWAP",
+                "position": Decimal("250"),
+                "pos_side": "long",
+            }
+        )
+
+        self.assertEqual(_format_position_size(position, {}), "250000.0000 DOGE (long)")
 
     def test_aggregate_position_metrics_uses_coin_delta_for_usd_futures(self) -> None:
         futures = _make_position(inst_id="BTC-USD-260626", upl="0", margin_ccy="BTC")
@@ -380,6 +424,186 @@ class PositionUplConversionTest(TestCase):
             "16",
         )
 
+    def test_build_position_ticker_map_falls_back_to_single_ticker_lookup(self) -> None:
+        target = OkxTicker(
+            inst_id="BTC-USD-260626-100000-C",
+            last=Decimal("0.0112"),
+            bid=Decimal("0.011"),
+            ask=Decimal("0.0115"),
+            mark=Decimal("0.0113"),
+            index=None,
+            raw={},
+        )
+
+        class _StubTickerClient:
+            @staticmethod
+            def get_tickers(inst_type: str, **kwargs):  # noqa: ANN001
+                raise RuntimeError(f"batch ticker lookup failed: {inst_type}")
+
+            @staticmethod
+            def get_ticker(inst_id: str) -> OkxTicker:
+                self.assertEqual(inst_id, target.inst_id)
+                return target
+
+        position = _make_position(inst_id=target.inst_id, upl="0", margin_ccy="BTC")
+        tickers = _build_position_ticker_map(_StubTickerClient(), [position])
+
+        self.assertEqual(tickers[target.inst_id], target)
+
+    def test_build_position_ticker_map_falls_back_to_inst_family_for_options(self) -> None:
+        target = OkxTicker(
+            inst_id="BTC-USD-260626-100000-C",
+            last=Decimal("0.0112"),
+            bid=Decimal("0.011"),
+            ask=Decimal("0.0115"),
+            mark=Decimal("0.0113"),
+            index=Decimal("63636"),
+            raw={},
+        )
+        calls: list[dict[str, str | None]] = []
+
+        class _StubTickerClient:
+            @staticmethod
+            def get_tickers(inst_type: str, *, uly: str | None = None, inst_family: str | None = None):
+                calls.append({"uly": uly, "inst_family": inst_family})
+                if inst_family == "BTC-USD":
+                    return [target]
+                if uly == "BTC-USD":
+                    return []
+                return []
+
+            @staticmethod
+            def get_ticker(inst_id: str) -> OkxTicker:
+                raise AssertionError(inst_id)
+
+        position = _make_position(inst_id=target.inst_id, upl="0", margin_ccy="BTC")
+        tickers = _build_position_ticker_map(_StubTickerClient(), [position])
+
+        self.assertEqual(tickers[target.inst_id], target)
+        self.assertEqual(
+            calls,
+            [
+                {"uly": "BTC-USD", "inst_family": None},
+                {"uly": None, "inst_family": "BTC-USD"},
+            ],
+        )
+
+    def test_build_position_ticker_map_uses_uly_first_for_options(self) -> None:
+        target = OkxTicker(
+            inst_id="BTC-USD-260626-68000-C",
+            last=Decimal("0.008"),
+            bid=Decimal("0.008"),
+            ask=Decimal("0.0085"),
+            mark=None,
+            index=None,
+            raw={},
+        )
+        calls: list[dict[str, str | None]] = []
+
+        class _StubTickerClient:
+            @staticmethod
+            def get_tickers(inst_type: str, *, uly: str | None = None, inst_family: str | None = None):
+                calls.append({"uly": uly, "inst_family": inst_family})
+                if uly == "BTC-USD":
+                    return [target]
+                raise AssertionError("instFamily should not be queried after uly returns the needed ticker")
+
+            @staticmethod
+            def get_ticker(inst_id: str) -> OkxTicker:
+                raise AssertionError(inst_id)
+
+            @staticmethod
+            def get_order_book(inst_id: str, depth: int = 1) -> OkxOrderBook:
+                raise AssertionError(inst_id)
+
+        position = _make_position(inst_id=target.inst_id, upl="0", margin_ccy="BTC")
+        tickers = _build_position_ticker_map(_StubTickerClient(), [position])
+
+        self.assertEqual(tickers[target.inst_id], target)
+        self.assertEqual(calls, [{"uly": "BTC-USD", "inst_family": None}])
+
+    def test_build_position_ticker_map_fills_bid_ask_from_order_book(self) -> None:
+        ticker_without_quotes = OkxTicker(
+            inst_id="BTC-USD-260626-68000-C",
+            last=Decimal("0.008"),
+            bid=None,
+            ask=None,
+            mark=None,
+            index=None,
+            raw={},
+        )
+
+        class _StubTickerClient:
+            @staticmethod
+            def get_tickers(inst_type: str, **kwargs):  # noqa: ANN001
+                return [ticker_without_quotes]
+
+            @staticmethod
+            def get_ticker(inst_id: str) -> OkxTicker:
+                return ticker_without_quotes
+
+            @staticmethod
+            def get_order_book(inst_id: str, depth: int = 1) -> OkxOrderBook:
+                self.assertEqual(inst_id, ticker_without_quotes.inst_id)
+                self.assertEqual(depth, 1)
+                return OkxOrderBook(
+                    inst_id=inst_id,
+                    bids=((Decimal("0.008"), Decimal("11191")),),
+                    asks=((Decimal("0.0085"), Decimal("211")),),
+                    raw={},
+                )
+
+        position = _make_position(inst_id=ticker_without_quotes.inst_id, upl="0", margin_ccy="BTC")
+        tickers = _build_position_ticker_map(_StubTickerClient(), [position])
+
+        self.assertEqual(tickers[position.inst_id].bid, Decimal("0.008"))
+        self.assertEqual(tickers[position.inst_id].ask, Decimal("0.0085"))
+
+    def test_augment_upl_usdt_prices_uses_btc_usd_futures_mark_as_underlying(self) -> None:
+        option_position = _make_position(inst_id="BTC-USD-260626-65000-C", upl="0", margin_ccy="BTC")
+        option_position = OkxPosition(**{**option_position.__dict__, "mark_price": Decimal("0.1000")})
+        futures_position = _make_position(inst_id="BTC-USD-260626", upl="0", margin_ccy="BTC")
+        futures_position = OkxPosition(
+            **{
+                **futures_position.__dict__,
+                "inst_type": "FUTURES",
+                "mark_price": Decimal("70000"),
+            }
+        )
+
+        prices = _augment_upl_usdt_prices_from_positions({}, [option_position, futures_position], {})
+
+        self.assertEqual(prices["BTC"], Decimal("70000"))
+        self.assertEqual(_position_option_intrinsic_value_usdt(option_position, prices), Decimal("5000.0"))
+        self.assertEqual(_position_option_time_value_usdt(option_position, prices), Decimal("2000.0"))
+
+    def test_apply_position_ticker_prices_fills_missing_mark_and_last(self) -> None:
+        position = _make_position(inst_id="BTC-USD-260626", upl="0", margin_ccy="BTC")
+        position = OkxPosition(
+            **{
+                **position.__dict__,
+                "inst_type": "FUTURES",
+                "position": Decimal("200"),
+                "pos_side": "short",
+                "mark_price": None,
+                "last_price": None,
+            }
+        )
+        ticker = OkxTicker(
+            inst_id=position.inst_id,
+            last=Decimal("63424.5"),
+            bid=Decimal("63424.4"),
+            ask=Decimal("63424.6"),
+            mark=Decimal("63424.3"),
+            index=None,
+            raw={},
+        )
+
+        enriched = _apply_position_ticker_prices([position], {position.inst_id: ticker})[0]
+
+        self.assertEqual(enriched.mark_price, Decimal("63424.3"))
+        self.assertEqual(enriched.last_price, Decimal("63424.5"))
+
     def test_build_position_instrument_map_falls_back_to_single_instrument_lookup(self) -> None:
         target = Instrument(
             inst_id="BTC-USD-260626-100000-C",
@@ -419,6 +643,58 @@ class PositionUplConversionTest(TestCase):
 
         self.assertEqual(instruments[target.inst_id], target)
         self.assertEqual(_format_position_size(position, instruments), "0.01 BTC (long)")
+
+    def test_build_position_instrument_map_falls_back_to_uly_for_options(self) -> None:
+        target = Instrument(
+            inst_id="BTC-USD-260626-100000-C",
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            settle_ccy="BTC",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+            uly="BTC-USD",
+            inst_family="BTC-USD",
+        )
+        calls: list[dict[str, str | None]] = []
+
+        class _StubClient:
+            @staticmethod
+            def get_option_instruments(*, uly: str | None = None, inst_family: str | None = None):
+                calls.append({"uly": uly, "inst_family": inst_family})
+                if inst_family == "BTC-USD":
+                    return []
+                if uly == "BTC-USD":
+                    return [target]
+                return []
+
+            @staticmethod
+            def get_swap_instruments():
+                return []
+
+            @staticmethod
+            def get_instruments(inst_type: str):
+                return []
+
+            @staticmethod
+            def get_instrument(inst_id: str) -> Instrument:
+                raise AssertionError(inst_id)
+
+        position = _make_position(inst_id=target.inst_id, upl="0", margin_ccy="BTC")
+        instruments = _build_position_instrument_map(_StubClient(), [position])
+
+        self.assertEqual(instruments[target.inst_id], target)
+        self.assertEqual(_format_position_size(position, instruments), "0.01 BTC (long)")
+        self.assertEqual(
+            calls,
+            [
+                {"uly": None, "inst_family": "BTC-USD"},
+                {"uly": "BTC-USD", "inst_family": None},
+            ],
+        )
 
     def test_positions_zoom_defaults_show_bid_ask_before_mark(self) -> None:
         columns = POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS["positions"]
