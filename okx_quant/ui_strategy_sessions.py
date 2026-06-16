@@ -4654,10 +4654,14 @@ class UiStrategySessionsMixin:
                 variable.set(_reverse_lookup_label(TAKE_PROFIT_MODE_OPTIONS, str(value), self.take_profit_mode_label.get()))
             elif key == "mtf_reversal_mode":
                 variable.set(_reverse_lookup_label(MTF_REVERSAL_MODE_OPTIONS, str(value), self.mtf_reversal_mode_label.get()))
+            elif key == "dynamic_protection_rules":
+                variable.set(json.dumps(dynamic_protection_rules_to_payload(value), ensure_ascii=False))
             elif key.endswith("_type"):
                 variable.set(str(value).upper())
             else:
                 variable.set(value)
+        if hasattr(self, "_rebuild_dynamic_protection_rule_editor"):
+            self._rebuild_dynamic_protection_rule_editor()
         self._sync_dynamic_take_profit_controls()
         self._sync_daily_filter_controls()
 
@@ -6147,7 +6151,7 @@ class UiStrategySessionsMixin:
             session.symbol,
             bar_label,
             _normalize_strategy_direction_label(
-                session.strategy_id,
+                getattr(session, "strategy_id", getattr(getattr(session, "config", None), "strategy_id", "")),
                 getattr(session, "config", None),
                 fallback=session.direction_label,
             ),

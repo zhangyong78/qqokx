@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
+from okx_quant.backtest_ui import BacktestWindow
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import Instrument, OkxOrderResult, OkxOrderStatus, OkxPosition
 from okx_quant.persistence import build_profile_switch_password_snapshot
@@ -1860,6 +1862,7 @@ class StrategyTemplateImportExportTest(TestCase):
             _on_strategy_selected=MagicMock(),
             _sync_dynamic_take_profit_controls=MagicMock(),
             _ensure_importable_strategy_symbols=MagicMock(),
+            _apply_strategy_parameter_fixed_values=MagicMock(),
             strategy_name=_Var(),
             symbol=_Var(),
             trade_symbol=_Var(),
@@ -1896,10 +1899,18 @@ class StrategyTemplateImportExportTest(TestCase):
             daily_filter_scope_label=_Var(),
             daily_filter_ma_type=_Var(),
             daily_filter_period=_Var(),
+            ema55_slope_exit_enabled=_Var(False),
             dynamic_two_r_break_even=_Var(False),
+            dynamic_break_even_trigger_r=_Var(),
+            ema55_slope_lock_profit_trigger_r=_Var(),
+            dynamic_first_lock_r=_Var(),
+            dynamic_trailing_step_r=_Var(),
+            dynamic_protection_rules_json=_Var(),
             dynamic_fee_offset_enabled=_Var(False),
             time_stop_break_even_enabled=_Var(False),
             time_stop_break_even_bars=_Var(),
+            trend_ema_close_exit_after_trigger_r_enabled=_Var(False),
+            trend_ema_close_exit_after_trigger_r=_Var(),
             run_mode_label=_Var(),
             trade_mode_label=_Var(),
             position_mode_label=_Var(),
@@ -5433,7 +5444,7 @@ class PositionRealizedUsdtColumnTest(TestCase):
             },
         )
 
-        self.assertEqual(values[19], "+0.00100")
+        self.assertEqual(values[19], "+0.00100000")
         self.assertEqual(values[20], "+100")
 
     def test_insert_position_row_includes_realized_usdt_value(self) -> None:
@@ -5472,7 +5483,7 @@ class PositionRealizedUsdtColumnTest(TestCase):
 
         QuantApp._insert_position_row(app, app.position_tree, "", position, "P01")
 
-        self.assertEqual(app.position_tree.rows["P01"]["values"][19], "+0.00100")
+        self.assertEqual(app.position_tree.rows["P01"]["values"][19], "+0.00100000")
         self.assertEqual(app.position_tree.rows["P01"]["values"][20], "+100")
         self.assertEqual(app.position_tree.rows["P01"]["values"][-1], "减仓观察")
 
@@ -6483,9 +6494,9 @@ class CredentialProfileEnvironmentTest(TestCase):
         self.assertEqual(app.credential_profile_password_status_text.get(), "\u5207\u6362\u5bc6\u7801\uff1a\u672a\u8bbe\u7f6e")
         self.assertEqual(
             app._last_saved_credentials,
-            ("moni", "demo-key", "demo-secret", "demo-pass", "demo"),
+            ("moni", "demo-key", "demo-secret", "demo-pass", "demo", "", "", "", "", "", ""),
         )
-        app._enqueue_log.assert_called_once_with("\u5df2\u5207\u6362 API \u914d\u7f6e\uff1amoni")
+        app._enqueue_log.assert_called_once_with("API切换 | 配置=moni")
 
     def test_save_credentials_now_persists_environment_with_profile(self) -> None:
         password_snapshot = build_profile_switch_password_snapshot("desk-pass")
@@ -6512,6 +6523,12 @@ class CredentialProfileEnvironmentTest(TestCase):
                 "secret_key": "live-secret",
                 "passphrase": "live-pass",
                 "environment": "live",
+                "spot_maker_fee_rate": "",
+                "spot_taker_fee_rate": "",
+                "futures_maker_fee_rate": "",
+                "futures_taker_fee_rate": "",
+                "option_maker_fee_rate": "",
+                "option_taker_fee_rate": "",
                 **password_snapshot,
             },
         )
@@ -7238,7 +7255,13 @@ class StrategyParameterDraftRestoreTest(TestCase):
             mtf_reversal_mode_label=_Var(""),
             take_profit_mode_label=_Var(""),
             max_entries_per_trend=_Var(""),
+            ema55_slope_exit_enabled=_Var(False),
             dynamic_two_r_break_even=_Var(False),
+            dynamic_break_even_trigger_r=_Var(""),
+            ema55_slope_lock_profit_trigger_r=_Var(""),
+            dynamic_first_lock_r=_Var(""),
+            dynamic_trailing_step_r=_Var(""),
+            dynamic_protection_rules_json=_Var(""),
             dynamic_fee_offset_enabled=_Var(False),
             daily_filter_enabled=_Var(False),
             daily_filter_boundary_label=_Var(""),
@@ -7255,11 +7278,18 @@ class StrategyParameterDraftRestoreTest(TestCase):
             body_retest_watch_bars=_Var(""),
             time_stop_break_even_enabled=_Var(False),
             time_stop_break_even_bars=_Var(""),
+            trend_ema_close_exit_after_trigger_r_enabled=_Var(False),
+            trend_ema_close_exit_after_trigger_r=_Var(""),
             startup_chase_current_signal=_Var(False),
             startup_chase_window_seconds=_Var(""),
         )
         app._strategy_parameter_scope_drafts = lambda: QuantApp._strategy_parameter_scope_drafts(app)
         app._strategy_parameter_bindings = lambda: QuantApp._strategy_parameter_bindings(app)
+        app._apply_strategy_parameter_fixed_values = lambda strategy_id, definition=None: QuantApp._apply_strategy_parameter_fixed_values(
+            app,
+            strategy_id,
+            definition=definition,
+        )
         return app
 
     def test_restore_strategy_parameter_draft_applies_fixed_ema5_8_values(self) -> None:
@@ -7312,8 +7342,158 @@ class StrategyParameterDraftRestoreTest(TestCase):
         self.assertTrue(app.dynamic_two_r_break_even.get())
         self.assertTrue(app.dynamic_fee_offset_enabled.get())
         self.assertFalse(app.time_stop_break_even_enabled.get())
-        self.assertEqual(app.time_stop_break_even_bars.get(), 10)
+        self.assertEqual(app.time_stop_break_even_bars.get(), 0)
         self.assertEqual(app.trend_ema_slope_filter_min_ratio.get(), "-0.0005")
+
+
+class StrategySymbolDefaultsUiSyncTest(TestCase):
+    def test_apply_symbol_specific_defaults_serializes_dynamic_protection_rules_json(self) -> None:
+        app = SimpleNamespace()
+        app.symbol = _Var("ETH-USDT-SWAP")
+        app.dynamic_break_even_trigger_r = _Var("")
+        app.ema55_slope_lock_profit_trigger_r = _Var("")
+        app.dynamic_first_lock_r = _Var("")
+        app.dynamic_trailing_step_r = _Var("")
+        app.dynamic_protection_rules_json = _Var("")
+        app.max_entries_per_trend = _Var("")
+        app.dynamic_two_r_break_even = _Var(False)
+        app.dynamic_fee_offset_enabled = _Var(False)
+        app._selected_strategy_definition = lambda: SimpleNamespace(
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            default_signal_label="只做多",
+        )
+        app._strategy_parameter_bindings = lambda: {
+            "dynamic_break_even_trigger_r": app.dynamic_break_even_trigger_r,
+            "ema55_slope_lock_profit_trigger_r": app.ema55_slope_lock_profit_trigger_r,
+            "dynamic_first_lock_r": app.dynamic_first_lock_r,
+            "dynamic_trailing_step_r": app.dynamic_trailing_step_r,
+            "dynamic_protection_rules": app.dynamic_protection_rules_json,
+            "max_entries_per_trend": app.max_entries_per_trend,
+            "dynamic_two_r_break_even": app.dynamic_two_r_break_even,
+            "dynamic_fee_offset_enabled": app.dynamic_fee_offset_enabled,
+        }
+        app._rebuild_dynamic_protection_rule_editor = MagicMock()
+        app._sync_dynamic_take_profit_controls = MagicMock()
+        app._sync_daily_filter_controls = MagicMock()
+
+        QuantApp._apply_symbol_specific_defaults_if_needed(app)
+
+        self.assertEqual(1, app.dynamic_break_even_trigger_r.get())
+        self.assertEqual(4, app.ema55_slope_lock_profit_trigger_r.get())
+        self.assertEqual(1, app.dynamic_first_lock_r.get())
+        self.assertEqual(1, app.dynamic_trailing_step_r.get())
+        self.assertEqual(3, app.max_entries_per_trend.get())
+        self.assertTrue(app.dynamic_two_r_break_even.get())
+        self.assertTrue(app.dynamic_fee_offset_enabled.get())
+        self.assertEqual(
+            json.loads(app.dynamic_protection_rules_json.get()),
+            [
+                {
+                    "trigger_r": 1,
+                    "action": "break_even",
+                    "lock_r": None,
+                    "trail_mode": "none",
+                    "trail_every_r": None,
+                    "trail_add_r": None,
+                },
+                {
+                    "trigger_r": 4,
+                    "action": "lock_profit",
+                    "lock_r": 1,
+                    "trail_mode": "step",
+                    "trail_every_r": 1,
+                    "trail_add_r": 1,
+                },
+                {
+                    "trigger_r": 11,
+                    "action": "lock_profit",
+                    "lock_r": 10,
+                    "trail_mode": "step",
+                    "trail_every_r": 1,
+                    "trail_add_r": 1,
+                },
+            ],
+        )
+        app._rebuild_dynamic_protection_rule_editor.assert_called_once()
+
+    def test_backtest_defaults_serialize_dynamic_protection_rules_json(self) -> None:
+        app = SimpleNamespace()
+        app.symbol = _Var("ETH-USDT-SWAP")
+        app.dynamic_break_even_trigger_r = _Var("")
+        app.ema55_slope_lock_profit_trigger_r = _Var("")
+        app.dynamic_first_lock_r = _Var("")
+        app.dynamic_trailing_step_r = _Var("")
+        app.dynamic_protection_rules_json = _Var("")
+        app.max_entries_per_trend = _Var("")
+        app.dynamic_two_r_break_even = _Var(False)
+        app.dynamic_fee_offset_enabled = _Var(False)
+        app.backtest_profile_id = _Var("profile-1")
+        app.backtest_profile_name = _Var("Profile")
+        app.backtest_profile_summary = _Var("Summary")
+        app.take_profit_mode_label = _Var("动态止盈")
+        app.mtf_reversal_mode_label = _Var("收盘价")
+        app._selected_strategy_definition = lambda: SimpleNamespace(
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            default_signal_label="只做多",
+        )
+        app._strategy_parameter_bindings = lambda: {
+            "dynamic_break_even_trigger_r": app.dynamic_break_even_trigger_r,
+            "ema55_slope_lock_profit_trigger_r": app.ema55_slope_lock_profit_trigger_r,
+            "dynamic_first_lock_r": app.dynamic_first_lock_r,
+            "dynamic_trailing_step_r": app.dynamic_trailing_step_r,
+            "dynamic_protection_rules": app.dynamic_protection_rules_json,
+            "max_entries_per_trend": app.max_entries_per_trend,
+            "dynamic_two_r_break_even": app.dynamic_two_r_break_even,
+            "dynamic_fee_offset_enabled": app.dynamic_fee_offset_enabled,
+        }
+        app._rebuild_dynamic_protection_rule_editor = MagicMock()
+        app._sync_dynamic_take_profit_controls = MagicMock()
+        app._sync_ema55_slope_exit_condition_controls = MagicMock()
+        app._sync_daily_filter_controls = MagicMock()
+        app._refresh_profile_summary_text = MagicMock()
+
+        BacktestWindow._apply_symbol_specific_defaults_if_needed(app, clear_profile_origin=True)
+
+        self.assertEqual(1, app.dynamic_break_even_trigger_r.get())
+        self.assertEqual(4, app.ema55_slope_lock_profit_trigger_r.get())
+        self.assertEqual(1, app.dynamic_first_lock_r.get())
+        self.assertEqual(1, app.dynamic_trailing_step_r.get())
+        self.assertEqual(3, app.max_entries_per_trend.get())
+        self.assertTrue(app.dynamic_two_r_break_even.get())
+        self.assertTrue(app.dynamic_fee_offset_enabled.get())
+        self.assertEqual(
+            json.loads(app.dynamic_protection_rules_json.get()),
+            [
+                {
+                    "trigger_r": 1,
+                    "action": "break_even",
+                    "lock_r": None,
+                    "trail_mode": "none",
+                    "trail_every_r": None,
+                    "trail_add_r": None,
+                },
+                {
+                    "trigger_r": 4,
+                    "action": "lock_profit",
+                    "lock_r": 1,
+                    "trail_mode": "step",
+                    "trail_every_r": 1,
+                    "trail_add_r": 1,
+                },
+                {
+                    "trigger_r": 11,
+                    "action": "lock_profit",
+                    "lock_r": 10,
+                    "trail_mode": "step",
+                    "trail_every_r": 1,
+                    "trail_add_r": 1,
+                },
+            ],
+        )
+        self.assertEqual("", app.backtest_profile_id.get())
+        self.assertEqual("", app.backtest_profile_name.get())
+        self.assertEqual("", app.backtest_profile_summary.get())
+        app._rebuild_dynamic_protection_rule_editor.assert_called_once()
 
 
 class StrategyParameterFixedLabelTest(TestCase):

@@ -7611,6 +7611,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._positions_effective_environment = None
         self.environment_label.set(self._environment_label_for_profile(profile_name))
 
+    def _credential_field_text(self, field_name: str) -> str:
+        variable = getattr(self, field_name, None)
+        if hasattr(variable, "get"):
+            return str(variable.get() or "").strip()
+        return ""
+
     def _current_credentials_state(self) -> tuple[str, str, str, str, str, str, str, str, str, str, str]:
         return (
             self._editing_credential_profile(),
@@ -7618,12 +7624,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self.secret_key.get().strip(),
             self.passphrase.get().strip(),
             self._environment_value_from_label(self.environment_label.get()),
-            self.spot_maker_fee_rate.get().strip(),
-            self.spot_taker_fee_rate.get().strip(),
-            self.futures_maker_fee_rate.get().strip(),
-            self.futures_taker_fee_rate.get().strip(),
-            self.option_maker_fee_rate.get().strip(),
-            self.option_taker_fee_rate.get().strip(),
+            QuantApp._credential_field_text(self, "spot_maker_fee_rate"),
+            QuantApp._credential_field_text(self, "spot_taker_fee_rate"),
+            QuantApp._credential_field_text(self, "futures_maker_fee_rate"),
+            QuantApp._credential_field_text(self, "futures_taker_fee_rate"),
+            QuantApp._credential_field_text(self, "option_maker_fee_rate"),
+            QuantApp._credential_field_text(self, "option_taker_fee_rate"),
         )
 
     def _set_credentials_fields(self, snapshot: dict[str, str]) -> None:
@@ -8008,6 +8014,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self._credential_save_job = None
 
         current = self._current_credentials_state()
+        if len(current) == 5:
+            current = (*current, "", "", "", "", "", "")
         if current == self._last_saved_credentials:
             return
         if self._credential_profile_is_locked(current[0]):
@@ -15045,7 +15053,9 @@ def _build_position_ticker_map(client: OkxRestClient, positions: list[OkxPositio
             continue
     for inst_id in sorted(needed_ids):
         ticker = result.get(inst_id)
-        if ticker is not None and ticker.bid is not None and ticker.ask is not None:
+        ticker_bid = getattr(ticker, "bid", None)
+        ticker_ask = getattr(ticker, "ask", None)
+        if ticker is not None and ticker_bid is not None and ticker_ask is not None:
             continue
         try:
             order_book = client.get_order_book(inst_id, depth=1)
@@ -15070,12 +15080,12 @@ def _merge_ticker_order_book_quotes(
     raw["orderBookBidPx"] = str(bid_price) if bid_price is not None else ""
     raw["orderBookAskPx"] = str(ask_price) if ask_price is not None else ""
     return OkxTicker(
-        inst_id=ticker.inst_id if ticker is not None else inst_id,
-        last=ticker.last if ticker is not None else None,
-        bid=ticker.bid if ticker is not None and ticker.bid is not None else bid_price,
-        ask=ticker.ask if ticker is not None and ticker.ask is not None else ask_price,
-        mark=ticker.mark if ticker is not None else None,
-        index=ticker.index if ticker is not None else None,
+        inst_id=getattr(ticker, "inst_id", inst_id) if ticker is not None else inst_id,
+        last=getattr(ticker, "last", None) if ticker is not None else None,
+        bid=getattr(ticker, "bid", None) if ticker is not None and getattr(ticker, "bid", None) is not None else bid_price,
+        ask=getattr(ticker, "ask", None) if ticker is not None and getattr(ticker, "ask", None) is not None else ask_price,
+        mark=getattr(ticker, "mark", None) if ticker is not None else None,
+        index=getattr(ticker, "index", None) if ticker is not None else None,
         raw=raw,
     )
 

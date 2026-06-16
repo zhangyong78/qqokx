@@ -4251,7 +4251,13 @@ class UiPositionsMixin:
         if selected_filter != "全部":
             visible_count = sum(1 for session in active_sessions if QuantApp._session_matches_running_filter(self, session))
             parts.append(f"当前筛选 {selected_filter} {visible_count}条")
-        parts.append(self._running_session_position_cache_summary(active_sessions))
+        position_cache_summary = (
+            self._running_session_position_cache_summary(active_sessions)
+            if hasattr(self, "_running_session_position_cache_summary")
+            else ""
+        )
+        if position_cache_summary:
+            parts.append(position_cache_summary)
         if latest_refresh_at is not None:
             parts.append(f"参考持仓 {latest_refresh_at.strftime('%H:%M:%S')}")
         else:

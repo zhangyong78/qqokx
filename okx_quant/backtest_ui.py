@@ -1014,6 +1014,7 @@ def _build_backtest_compare_detail(snapshot: _BacktestSnapshot, *, prefer_archiv
         f"回测区间：{start_text} -> {end_text}",
         f"K线周期：{_normalize_backtest_bar_label(config.bar)}",
         f"K线根数：{_build_backtest_candle_scope_text(snapshot)}",
+        f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)}",
         f"参数：{_build_backtest_param_summary(config, maker_fee_rate=snapshot.maker_fee_rate, taker_fee_rate=snapshot.taker_fee_rate)}",
     ]
     lines.extend(_backtest_export_detail_lines(snapshot.export_path))
@@ -5659,6 +5660,8 @@ class BacktestWindow:
                 variable.set(TAKE_PROFIT_MODE_VALUE_TO_LABEL.get(str(value), self.take_profit_mode_label.get()))
             elif key == "mtf_reversal_mode":
                 variable.set(MTF_REVERSAL_MODE_VALUE_TO_LABEL.get(str(value), self.mtf_reversal_mode_label.get()))
+            elif key == "dynamic_protection_rules":
+                variable.set(json.dumps(dynamic_protection_rules_to_payload(value), ensure_ascii=False))
             elif key.endswith("_type"):
                 variable.set(str(value).upper())
             else:

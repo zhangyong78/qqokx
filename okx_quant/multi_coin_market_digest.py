@@ -15,6 +15,8 @@ from okx_quant.btc_market_analyzer import (
     btc_market_analysis_payload,
     load_btc_market_email_notifier,
 )
+from okx_quant.analysis_email_validation import build_recent_email_validation_summary, load_latest_email_validation_payload
+from okx_quant.candle_cache import load_candle_cache
 from okx_quant.mini_chart import LINE_COLORS, MiniChartOverlay, render_candles_png_base64
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import (
@@ -114,12 +116,20 @@ def build_multi_coin_market_email_subject(digest: MultiCoinMarketDigest) -> str:
 
 def build_multi_coin_market_email_body(digest: MultiCoinMarketDigest) -> str:
     email_state = load_btc_market_email_state()
+    viewpoints = build_multi_coin_market_viewpoints(digest)
+    validation_summary = _load_recent_validation_summary()
     last_sent_at = _parse_iso_datetime(email_state.get("last_sent_at", ""))
     lines = [
         "简明结论：",
         f"- 做多最强：{_leader_headline(digest.strongest_long)}",
         f"- 做空最弱：{_leader_headline(digest.weakest_short)}",
         f"- 最值得跟踪做单：{digest.best_trade_candidate.label}。{digest.best_trade_candidate.summary}",
+        "",
+        "明确观点：",
+        *[f"- {item['asset']}：{item['stance']}。{item['summary']}" for item in viewpoints],
+        "",
+        "最近复盘：",
+        *_build_recent_validation_text_lines(validation_summary, viewpoints=viewpoints),
         "",
         "分币摘要：",
     ]
@@ -135,6 +145,8 @@ def build_multi_coin_market_email_html(
     overlay_legend_map: dict[str, dict[str, str]] | None = None,
 ) -> str:
     email_state = load_btc_market_email_state()
+    viewpoints = build_multi_coin_market_viewpoints(digest)
+    validation_summary = _load_recent_validation_summary()
     last_sent_at = _parse_iso_datetime(email_state.get("last_sent_at", ""))
     strongest_long_asset = digest.strongest_long.label.upper()
     weakest_short_asset = digest.weakest_short.label.upper()
@@ -153,6 +165,17 @@ def build_multi_coin_market_email_html(
         """
         for label, content in summary_rows
     )
+    viewpoint_html = "".join(
+        f"""
+        <tr>
+            <td style="padding: 6px 0; color: #34495e; font-size: 14px; line-height: 1.7;">
+                - <strong>{escape(str(item['asset']))}</strong>：{escape(str(item['stance']))}。{escape(str(item['summary']))}
+            </td>
+        </tr>
+        """
+        for item in viewpoints
+    )
+    validation_html = _build_recent_validation_html(validation_summary, viewpoints=viewpoints)
     coin_cards_html = "".join(
         _build_coin_card_html(
             analysis,
@@ -189,6 +212,22 @@ def build_multi_coin_market_email_html(
                             <h2 style="margin: 0 0 12px 0; color: #2980b9; font-size: 16px; font-weight: 600;">简明结论</h2>
                             <table width="100%" border="0" cellspacing="0" cellpadding="0">
                                 {summary_html}
+                            </table>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 20px 24px; background-color: #f6fbf8; border-top: 1px solid #d5eadb;">
+                            <h2 style="margin: 0 0 12px 0; color: #1f7a4d; font-size: 16px; font-weight: 600;">明确观点</h2>
+                            <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                                {viewpoint_html}
+                            </table>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 20px 24px; background-color: #fff8ed; border-top: 1px solid #f3dfb2;">
+                            <h2 style="margin: 0 0 12px 0; color: #9a6700; font-size: 16px; font-weight: 600;">最近复盘</h2>
+                            <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                                {validation_html}
                             </table>
                         </td>
                     </tr>
@@ -257,6 +296,383 @@ def send_multi_coin_market_email(
     return True
 
 
+def build_multi_coin_market_viewpoints(digest: MultiCoinMarketDigest) -> list[dict[str, object]]:
+    viewpoints: list[dict[str, object]] = []
+    for analysis in digest.analyses:
+        asset = _asset_name(analysis.symbol)
+        tf4h = _find_timeframe(analysis, "4H")
+        tf1h = _find_timeframe(analysis, "1H")
+        stance = _coin_view_stance(analysis, tf4h, tf1h)
+        summary = _coin_view_summary(analysis, tf4h, tf1h)
+        viewpoints.append(
+            {
+                "symbol": analysis.symbol,
+                "asset": asset,
+                "stance": stance,
+                "summary": summary,
+                "direction": analysis.direction,
+                "score": analysis.score,
+                "confidence": _pct(analysis.confidence),
+            }
+        )
+    return viewpoints
+
+
+def _load_recent_validation_summary() -> dict[str, object] | None:
+    payload = load_latest_email_validation_payload()
+    if not payload:
+        return None
+    return build_recent_email_validation_summary(payload, recent_email_limit=20)
+
+
+def _build_recent_validation_text_lines(
+    summary: dict[str, object] | None,
+    *,
+    viewpoints: list[dict[str, object]] | None = None,
+) -> list[str]:
+    if not summary:
+        return ["- 暂无本地复盘汇总。可先运行 scripts/run_multi_coin_email_validation.py 生成。"]
+    overall = summary.get("overall") if isinstance(summary.get("overall"), dict) else {}
+    actionable = summary.get("actionable") if isinstance(summary.get("actionable"), dict) else {}
+    by_symbol = summary.get("by_symbol") if isinstance(summary.get("by_symbol"), dict) else {}
+    highlights = summary.get("highlights") if isinstance(summary.get("highlights"), dict) else {}
+    email_count = int(summary.get("email_count", 0) or 0)
+    sample_count = int(summary.get("sample_count", 0) or 0)
+    actionable_count = int(summary.get("actionable_sample_count", 0) or 0)
+    generated_at = str(summary.get("generated_at", "") or "").strip()
+    lines = [
+        (
+            f"- 基于最近一次本地复盘汇总，覆盖最近 {email_count} 封已发送邮件，"
+            f"共 {sample_count} 个样本。"
+        ),
+        (
+            f"- 总体命中率：{_summary_hit_rate_text(overall)}"
+            f"（已完成 {overall.get('completed', 0)}，有效 {overall.get('effective', 0)}，"
+            f"部分有效 {overall.get('partial', 0)}，失效 {overall.get('invalid', 0)}，"
+            f"待验证 {overall.get('pending', 0)}）。"
+        ),
+        (
+            f"- 明确观点命中率：{_summary_hit_rate_text(actionable)}"
+            f"（样本 {actionable_count}，24H 平均回报 {_summary_avg_return_text(actionable, 'avg_return_24h_pct')}）。"
+        ),
+        *_build_recent_validation_highlight_lines(highlights),
+    ]
+    for item in _build_recent_validation_action_items(highlights, viewpoints=viewpoints):
+        lines.append(f"- {item['title']}：{item['body']}")
+    lines.append(f"- 最近复盘汇总生成时间：{generated_at or '-'}")
+    if by_symbol:
+        lines.append("- 各币种最近命中率简表：")
+        for symbol, item in by_symbol.items():
+            if not isinstance(item, dict):
+                continue
+            asset = str(symbol).split("-")[0].upper()
+            lines.append(
+                f"- {asset}：命中率 {_summary_hit_rate_text(item)} | "
+                f"已完成 {item.get('completed', 0)} | 待验证 {item.get('pending', 0)} | "
+                f"24H 平均回报 {_summary_avg_return_text(item, 'avg_return_24h_pct')}"
+            )
+    return lines
+
+
+def _build_recent_validation_html(
+    summary: dict[str, object] | None,
+    *,
+    viewpoints: list[dict[str, object]] | None = None,
+) -> str:
+    if not summary:
+        return """
+        <tr>
+            <td style="padding: 6px 0; color: #7c5f10; font-size: 14px; line-height: 1.7;">
+                - 暂无本地复盘汇总。可先运行 <strong>scripts/run_multi_coin_email_validation.py</strong> 生成。
+            </td>
+        </tr>
+        """
+    overall = summary.get("overall") if isinstance(summary.get("overall"), dict) else {}
+    actionable = summary.get("actionable") if isinstance(summary.get("actionable"), dict) else {}
+    by_symbol = summary.get("by_symbol") if isinstance(summary.get("by_symbol"), dict) else {}
+    highlights = summary.get("highlights") if isinstance(summary.get("highlights"), dict) else {}
+    email_count = int(summary.get("email_count", 0) or 0)
+    sample_count = int(summary.get("sample_count", 0) or 0)
+    actionable_count = int(summary.get("actionable_sample_count", 0) or 0)
+    generated_at = str(summary.get("generated_at", "") or "").strip() or "-"
+    rows = [
+        f"基于最近一次本地复盘汇总，覆盖最近 {email_count} 封已发送邮件，共 {sample_count} 个样本。",
+        (
+            f"总体命中率：{_summary_hit_rate_text(overall)}"
+            f"（已完成 {overall.get('completed', 0)}，有效 {overall.get('effective', 0)}，"
+            f"部分有效 {overall.get('partial', 0)}，失效 {overall.get('invalid', 0)}，"
+            f"待验证 {overall.get('pending', 0)}）。"
+        ),
+        (
+            f"明确观点命中率：{_summary_hit_rate_text(actionable)}"
+            f"（样本 {actionable_count}，24H 平均回报 {_summary_avg_return_text(actionable, 'avg_return_24h_pct')}）。"
+        ),
+    ]
+    rows.extend(_build_recent_validation_highlight_lines(highlights))
+    rows.extend(
+        f"{item['title']}：{item['body']}"
+        for item in _build_recent_validation_action_items(highlights, viewpoints=viewpoints)
+    )
+    rows.append(f"最近复盘汇总生成时间：{generated_at}")
+    summary_html = "".join(
+        f"""
+        <tr>
+            <td style="padding: 6px 0; color: #7c5f10; font-size: 14px; line-height: 1.7;">
+                - {escape(row)}
+            </td>
+        </tr>
+        """
+        for row in rows
+    )
+    highlight_cards_html = _build_recent_validation_highlight_cards_html(highlights, viewpoints=viewpoints)
+    if not by_symbol:
+        return highlight_cards_html + summary_html
+    symbol_table = """
+        <tr>
+            <td style="padding: 10px 0 6px 0; color: #7c5f10; font-size: 14px; line-height: 1.7; font-weight: 600;">
+                各币种最近命中率简表
+            </td>
+        </tr>
+        <tr>
+            <td style="padding: 0;">
+                <table width="100%" border="0" cellspacing="0" cellpadding="0" style="border-collapse: collapse; font-size: 12px; color: #7c5f10;">
+                    <tr>
+                        <td style="padding: 6px 8px; border-bottom: 1px solid #ecd7ab; font-weight: 600;">币种</td>
+                        <td style="padding: 6px 8px; border-bottom: 1px solid #ecd7ab; font-weight: 600;">命中率</td>
+                        <td style="padding: 6px 8px; border-bottom: 1px solid #ecd7ab; font-weight: 600;">已完成</td>
+                        <td style="padding: 6px 8px; border-bottom: 1px solid #ecd7ab; font-weight: 600;">待验证</td>
+                        <td style="padding: 6px 8px; border-bottom: 1px solid #ecd7ab; font-weight: 600;">24H均回报</td>
+                    </tr>
+    """
+    for symbol, item in by_symbol.items():
+        if not isinstance(item, dict):
+            continue
+        symbol_table += f"""
+                    <tr>
+                        <td style="padding: 6px 8px; border-bottom: 1px solid #f3e5c5;">{escape(str(symbol).split('-')[0].upper())}</td>
+                        <td style="padding: 6px 8px; border-bottom: 1px solid #f3e5c5;">{escape(_summary_hit_rate_text(item))}</td>
+                        <td style="padding: 6px 8px; border-bottom: 1px solid #f3e5c5;">{escape(str(item.get('completed', 0)))}</td>
+                        <td style="padding: 6px 8px; border-bottom: 1px solid #f3e5c5;">{escape(str(item.get('pending', 0)))}</td>
+                        <td style="padding: 6px 8px; border-bottom: 1px solid #f3e5c5;">{escape(_summary_avg_return_text(item, 'avg_return_24h_pct'))}</td>
+                    </tr>
+        """
+    symbol_table += """
+                </table>
+            </td>
+        </tr>
+    """
+    return highlight_cards_html + summary_html + symbol_table
+
+
+def _build_recent_validation_highlight_lines(highlights: dict[str, object]) -> list[str]:
+    if not highlights:
+        return []
+    lines: list[str] = []
+    best = highlights.get("best_symbol") if isinstance(highlights.get("best_symbol"), dict) else None
+    worst = highlights.get("worst_symbol") if isinstance(highlights.get("worst_symbol"), dict) else None
+    notable_change = str(highlights.get("notable_change", "") or "").strip()
+    if best is not None:
+        best_summary = best.get("summary") if isinstance(best.get("summary"), dict) else {}
+        lines.append(
+            f"- 命中率最高币种：{best.get('asset', '-')}"
+            f"（命中率 {_summary_hit_rate_text(best_summary)}，已完成 {best_summary.get('completed', 0)}）。"
+        )
+    if worst is not None:
+        worst_summary = worst.get("summary") if isinstance(worst.get("summary"), dict) else {}
+        lines.append(
+            f"- 命中率最低币种：{worst.get('asset', '-')}"
+            f"（命中率 {_summary_hit_rate_text(worst_summary)}，已完成 {worst_summary.get('completed', 0)}）。"
+        )
+    if notable_change:
+        lines.append(f"- 最值得关注的变化：{notable_change}")
+    return lines
+
+
+def _build_recent_validation_action_items(
+    highlights: dict[str, object],
+    *,
+    viewpoints: list[dict[str, object]] | None = None,
+) -> list[dict[str, str]]:
+    if not highlights:
+        return []
+    viewpoint_by_asset: dict[str, dict[str, object]] = {}
+    for item in viewpoints or []:
+        if not isinstance(item, dict):
+            continue
+        asset = str(item.get("asset", "") or "").strip().upper()
+        if asset:
+            viewpoint_by_asset[asset] = item
+    items: list[dict[str, str]] = []
+    best = highlights.get("best_symbol") if isinstance(highlights.get("best_symbol"), dict) else None
+    worst = highlights.get("worst_symbol") if isinstance(highlights.get("worst_symbol"), dict) else None
+    if best is not None:
+        best_asset = str(best.get("asset", "") or "").strip().upper()
+        best_summary = best.get("summary") if isinstance(best.get("summary"), dict) else {}
+        best_view = viewpoint_by_asset.get(best_asset)
+        best_stance = _recent_validation_viewpoint_stance(best_view)
+        best_body = f"{best_asset}（最近命中率 {_summary_hit_rate_text(best_summary)}"
+        if best_stance:
+            best_body += f"，当前观点：{best_stance}"
+        best_body += "）"
+        items.append(
+            {
+                "title": "今日优先跟踪",
+                "body": best_body,
+                "accent": "#175cd3",
+                "background": "#eef4ff",
+            }
+        )
+        one_trade_body = f"优先看 {best_asset} 的{_recent_validation_trade_side(best_view)}"
+        if best_stance:
+            one_trade_body += f"（当前观点：{best_stance}）"
+        items.append(
+            {
+                "title": "若只做一笔",
+                "body": one_trade_body,
+                "accent": "#7a5af8",
+                "background": "#f4f3ff",
+            }
+        )
+    if worst is not None:
+        worst_asset = str(worst.get("asset", "") or "").strip().upper()
+        worst_summary = worst.get("summary") if isinstance(worst.get("summary"), dict) else {}
+        worst_view = viewpoint_by_asset.get(worst_asset)
+        worst_stance = _recent_validation_viewpoint_stance(worst_view)
+        worst_body = f"{worst_asset}（最近命中率 {_summary_hit_rate_text(worst_summary)}"
+        if worst_stance:
+            worst_body += f"，当前观点：{worst_stance}"
+        worst_body += "）"
+        items.append(
+            {
+                "title": "今日谨慎对待",
+                "body": worst_body,
+                "accent": "#b42318",
+                "background": "#fff5f4",
+            }
+        )
+    return items
+
+
+def _recent_validation_viewpoint_stance(viewpoint: dict[str, object] | None) -> str:
+    if viewpoint is None:
+        return ""
+    return str(viewpoint.get("stance", "") or "").strip()
+
+
+def _recent_validation_trade_side(viewpoint: dict[str, object] | None) -> str:
+    if viewpoint is None:
+        return "顺势侧"
+    stance = str(viewpoint.get("stance", "") or "").strip()
+    direction = str(viewpoint.get("direction", "") or "").strip().lower()
+    if "做多" in stance or "偏多" in stance or direction == "long":
+        return "多头侧"
+    if "做空" in stance or "偏空" in stance or direction == "short":
+        return "空头侧"
+    return "观望侧"
+
+
+def _build_recent_validation_highlight_cards_html(
+    highlights: dict[str, object],
+    *,
+    viewpoints: list[dict[str, object]] | None = None,
+) -> str:
+    if not highlights:
+        return ""
+    cards: list[str] = []
+    best = highlights.get("best_symbol") if isinstance(highlights.get("best_symbol"), dict) else None
+    worst = highlights.get("worst_symbol") if isinstance(highlights.get("worst_symbol"), dict) else None
+    notable_change = str(highlights.get("notable_change", "") or "").strip()
+    if best is not None:
+        best_summary = best.get("summary") if isinstance(best.get("summary"), dict) else {}
+        cards.append(
+            _recent_validation_card_html(
+                title="命中率最高币种",
+                accent="#1f7a4d",
+                background="#f3fcf6",
+                body=f"{best.get('asset', '-')} | 命中率 {_summary_hit_rate_text(best_summary)} | 已完成 {best_summary.get('completed', 0)}",
+            )
+        )
+    if worst is not None:
+        worst_summary = worst.get("summary") if isinstance(worst.get("summary"), dict) else {}
+        cards.append(
+            _recent_validation_card_html(
+                title="命中率最低币种",
+                accent="#b42318",
+                background="#fff5f4",
+                body=f"{worst.get('asset', '-')} | 命中率 {_summary_hit_rate_text(worst_summary)} | 已完成 {worst_summary.get('completed', 0)}",
+            )
+        )
+    if notable_change:
+        cards.append(
+            _recent_validation_card_html(
+                title="最值得关注的变化",
+                accent="#9a6700",
+                background="#fff9eb",
+                body=notable_change,
+            )
+        )
+    for item in _build_recent_validation_action_items(highlights, viewpoints=viewpoints):
+        cards.append(
+            _recent_validation_card_html(
+                title=item["title"],
+                accent=item["accent"],
+                background=item["background"],
+                body=item["body"],
+            )
+        )
+    if not cards:
+        return ""
+    rows: list[str] = []
+    for index in range(0, len(cards), 2):
+        left = cards[index]
+        right = cards[index + 1] if index + 1 < len(cards) else ""
+        rows.append(
+            f"""
+                    <tr>
+                        <td width="50%" valign="top" style="padding: 0 6px 8px 0;">{left}</td>
+                        <td width="50%" valign="top" style="padding: 0 0 8px 6px;">{right}</td>
+                    </tr>
+            """
+        )
+    return (
+        """
+        <tr>
+            <td style="padding: 4px 0 10px 0;">
+                <table width="100%" border="0" cellspacing="0" cellpadding="0">
+        """
+        + "".join(rows)
+        + """
+                </table>
+            </td>
+        </tr>
+        """
+    )
+
+
+def _recent_validation_card_html(*, title: str, accent: str, background: str, body: str) -> str:
+    return f"""
+    <table width="100%" border="0" cellspacing="0" cellpadding="0" style="border: 1px solid {accent}; border-radius: 8px; background: {background};">
+        <tr>
+            <td style="padding: 10px 12px;">
+                <div style="font-size: 12px; font-weight: 700; color: {accent}; margin-bottom: 6px;">{escape(title)}</div>
+                <div style="font-size: 13px; line-height: 1.6; color: #344054;">{escape(body)}</div>
+            </td>
+        </tr>
+    </table>
+    """
+
+
+def _summary_hit_rate_text(summary: dict[str, object]) -> str:
+    return f"{float(summary.get('hit_rate_pct', 0) or 0):.2f}%"
+
+
+def _summary_avg_return_text(summary: dict[str, object], key: str) -> str:
+    value = summary.get(key)
+    if isinstance(value, (int, float)):
+        return f"{float(value):.4f}%"
+    return "-"
+
+
 def _build_coin_section(analysis: BtcMarketAnalysis, *, last_sent_at: datetime | None) -> list[str]:
     asset = _asset_name(analysis.symbol)
     tf4h = _find_timeframe(analysis, "4H")
@@ -283,6 +699,36 @@ def _coin_tracking_summary(
     if tf4h is not None and tf1h is not None and tf4h.direction == tf1h.direction and tf4h.direction in {"long", "short"}:
         return f"4H/1H 同向偏{_direction_label(tf4h.direction)}，可优先盯它"
     return f"当前以{_direction_label(analysis.direction)}为主，但节奏还要看 1H 变化"
+
+
+def _coin_view_stance(
+    analysis: BtcMarketAnalysis,
+    tf4h: TimeframeAnalysis | None,
+    tf1h: TimeframeAnalysis | None,
+) -> str:
+    if tf4h is not None and tf1h is not None and tf4h.direction == tf1h.direction == "long":
+        return "优先做多"
+    if tf4h is not None and tf1h is not None and tf4h.direction == tf1h.direction == "short":
+        return "优先做空"
+    if analysis.direction == "long" and analysis.score >= 4:
+        return "偏多跟踪"
+    if analysis.direction == "short" and analysis.score <= -4:
+        return "偏空跟踪"
+    return "暂观望"
+
+
+def _coin_view_summary(
+    analysis: BtcMarketAnalysis,
+    tf4h: TimeframeAnalysis | None,
+    tf1h: TimeframeAnalysis | None,
+) -> str:
+    if tf4h is not None and tf1h is not None and tf4h.direction == tf1h.direction and tf4h.direction in {"long", "short"}:
+        return (
+            f"4H 与 1H 同向，综合分数 {analysis.score}，置信度 {_pct(analysis.confidence)}，"
+            f"更适合按 {_direction_label(tf4h.direction)} 方向处理。"
+        )
+    lead_reason = analysis.reason[0] if analysis.reason else "当前缺少足够强的主导信号。"
+    return f"综合分数 {analysis.score}，置信度 {_pct(analysis.confidence)}，核心依据：{lead_reason}"
 
 
 def _collect_recent_events(
@@ -506,6 +952,8 @@ def archive_multi_coin_market_email(
         "archive_html_path": str(html_path),
         "archive_text_path": str(text_path),
         "report_path": str(report_path) if report_path is not None else "",
+        "viewpoints": build_multi_coin_market_viewpoints(digest),
+        "digest_payload": multi_coin_market_digest_payload(digest),
         "archived_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -531,10 +979,12 @@ def build_multi_coin_chart_image_map(
                 timeframe,
             )
             preload_limit = visible_limit + max((item.period for item in symbol_overlays), default=55)
-            try:
-                candles = resolved_client.get_candles_history(analysis.symbol, timeframe, limit=preload_limit)
-            except Exception:
-                continue
+            candles = _load_chart_candles(
+                analysis.symbol,
+                timeframe,
+                limit=preload_limit,
+                client=resolved_client,
+            )
             if not candles:
                 continue
             try:
@@ -550,6 +1000,34 @@ def build_multi_coin_chart_image_map(
         if symbol_images:
             images[analysis.symbol] = symbol_images
     return images
+
+
+def _load_chart_candles(
+    symbol: str,
+    timeframe: str,
+    *,
+    limit: int,
+    client: OkxRestClient,
+) -> list:
+    if timeframe == "1W":
+        try:
+            return client.get_candles(symbol, timeframe, limit=limit)
+        except Exception:
+            return []
+
+    cached: list = []
+    try:
+        cached = load_candle_cache(symbol, timeframe, limit=limit)
+    except Exception:
+        cached = []
+    if len(cached) >= limit:
+        return cached[-limit:]
+
+    try:
+        fetched = client.get_candles_history(symbol, timeframe, limit=limit)
+    except Exception:
+        return cached
+    return fetched or cached
 
 
 def _build_coin_chart_html(

@@ -2,7 +2,12 @@ from decimal import Decimal
 from unittest import TestCase
 
 from okx_quant.backtest import BacktestTrade
-from scripts.build_best_parameter_bundle import _combined_period_report, _combined_period_rows
+from scripts.build_best_parameter_bundle import (
+    _combined_period_report,
+    _combined_period_rows,
+    _direction_period_equity_rows,
+    _monthly_equity_chart_html,
+)
 
 
 def _trade(*, signal: str, entry_ts: int, exit_ts: int, pnl: str) -> BacktestTrade:
@@ -106,3 +111,35 @@ class BestParameterBundlePeriodTablesTest(TestCase):
         self.assertEqual(report.total_trades, 3)
         self.assertEqual(str(report.total_pnl), "80")
         self.assertEqual(str(report.ending_equity), "10080")
+
+    def test_monthly_equity_chart_html_uses_monthly_ending_equity_series(self) -> None:
+        monthly_rows = (
+            ("2025-01", 1, "100.0000", 1, "30.0000", 2, "100.00%", "130.0000", "1.30%", "0.0000", "0.00%", "10130.0000"),
+            ("2025-02", 1, "-50.0000", 0, "0.0000", 1, "0.00%", "-50.0000", "-0.49%", "50.0000", "0.49%", "10080.0000"),
+        )
+        long_trades = (
+            _trade(signal="long", entry_ts=1735686000000, exit_ts=1735689600000, pnl="100"),
+            _trade(signal="long", entry_ts=1738364400000, exit_ts=1738368000000, pnl="-50"),
+        )
+        short_trades = (
+            _trade(signal="short", entry_ts=1735772400000, exit_ts=1735776000000, pnl="30"),
+        )
+        direction_rows = _direction_period_equity_rows(long_trades, short_trades, by="month")
+
+        html = _monthly_equity_chart_html(
+            "ETH 月度多空权益折线图",
+            monthly_rows,
+            direction_rows=direction_rows,
+        )
+
+        self.assertIn('class="chart-card"', html)
+        self.assertIn('class="equity-chart"', html)
+        self.assertIn('chart-legend-swatch-long', html)
+        self.assertIn('chart-legend-swatch-short', html)
+        self.assertIn('chart-legend-swatch-total', html)
+        self.assertIn("2025-01", html)
+        self.assertIn("2025-02", html)
+        self.assertIn("10100.0000", html)
+        self.assertIn("10050.0000", html)
+        self.assertIn("10030.0000", html)
+        self.assertIn("10130.0000", html)

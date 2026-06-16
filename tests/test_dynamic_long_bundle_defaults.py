@@ -30,10 +30,10 @@ class DynamicLongBundleDefaultsTest(TestCase):
         self.assertEqual(str(config.atr_stop_multiplier), "1")
         self.assertEqual(str(config.atr_take_multiplier), "1")
         self.assertEqual(config.dynamic_break_even_trigger_r, 3)
-        self.assertEqual(config.ema55_slope_lock_profit_trigger_r, 7)
+        self.assertEqual(config.ema55_slope_lock_profit_trigger_r, 5)
         self.assertEqual(config.dynamic_first_lock_r, 1)
         self.assertEqual(config.max_entries_per_trend, 2)
-        self.assertEqual(config.resolved_dynamic_protection_rules()[1].trigger_r, 7)
+        self.assertEqual(config.resolved_dynamic_protection_rules()[1].trigger_r, 5)
 
     def test_best_parameter_bundle_syncs_doge_final_long_profile(self) -> None:
         spec = next(item for item in build_specs() if item.profile_id == "dynamic_long_best_doge_v2")
@@ -44,11 +44,12 @@ class DynamicLongBundleDefaultsTest(TestCase):
         self.assertEqual(config.entry_reference_ema_period, 0)
         self.assertEqual(str(config.atr_stop_multiplier), "1")
         self.assertEqual(str(config.atr_take_multiplier), "1")
-        self.assertEqual(config.dynamic_break_even_trigger_r, 3)
+        self.assertEqual(config.dynamic_break_even_trigger_r, 2)
         self.assertEqual(config.ema55_slope_lock_profit_trigger_r, 6)
         self.assertEqual(config.dynamic_first_lock_r, 1)
         self.assertEqual(config.max_entries_per_trend, 2)
         self.assertEqual(config.resolved_dynamic_protection_rules()[1].trigger_r, 6)
+        self.assertEqual(config.resolved_dynamic_protection_rules()[0].trigger_r, 2)
 
     def test_ready_pack_syncs_eth_final_long_profile(self) -> None:
         spec = next(item for item in build_ready_specs("demo") if item.profile_id == "eth-long-ma5-bjt08")
@@ -70,7 +71,7 @@ class DynamicLongBundleDefaultsTest(TestCase):
         self.assertEqual(str(config.atr_stop_multiplier), "1")
         self.assertEqual(str(config.atr_take_multiplier), "1")
         self.assertEqual(config.dynamic_break_even_trigger_r, 3)
-        self.assertEqual(config.ema55_slope_lock_profit_trigger_r, 7)
+        self.assertEqual(config.ema55_slope_lock_profit_trigger_r, 5)
         self.assertEqual(config.dynamic_first_lock_r, 1)
         self.assertEqual(config.max_entries_per_trend, 2)
 
@@ -81,7 +82,8 @@ class DynamicLongBundleDefaultsTest(TestCase):
         self.assertEqual(config.entry_reference_ema_period, 0)
         self.assertEqual(str(config.atr_stop_multiplier), "1")
         self.assertEqual(str(config.atr_take_multiplier), "1")
-        self.assertEqual(config.dynamic_break_even_trigger_r, 3)
+        self.assertEqual(config.dynamic_break_even_trigger_r, 2)
         self.assertEqual(config.ema55_slope_lock_profit_trigger_r, 6)
         self.assertEqual(config.dynamic_first_lock_r, 1)
         self.assertEqual(config.max_entries_per_trend, 2)
+        self.assertEqual(config.resolved_dynamic_protection_rules()[0].trigger_r, 2)

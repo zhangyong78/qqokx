@@ -143,7 +143,7 @@ _DYNAMIC_LONG_4COIN_DEFAULTS: dict[str, dict[str, object]] = {
                 "trail_add_r": None,
             },
             {
-                "trigger_r": 7,
+                "trigger_r": 5,
                 "action": "lock_profit",
                 "lock_r": 1,
                 "trail_mode": "step",
@@ -159,7 +159,7 @@ _DYNAMIC_LONG_4COIN_DEFAULTS: dict[str, dict[str, object]] = {
                 "trail_add_r": 1,
             },
         ),
-        "ema55_slope_lock_profit_trigger_r": 7,
+        "ema55_slope_lock_profit_trigger_r": 5,
         "dynamic_first_lock_r": 1,
         "dynamic_trailing_step_r": 1,
         "time_stop_break_even_enabled": False,
@@ -182,11 +182,11 @@ _DYNAMIC_LONG_4COIN_DEFAULTS: dict[str, dict[str, object]] = {
         "take_profit_mode": "dynamic",
         "max_entries_per_trend": 2,
         "dynamic_two_r_break_even": True,
-        "dynamic_break_even_trigger_r": 3,
+        "dynamic_break_even_trigger_r": 2,
         "dynamic_fee_offset_enabled": True,
         "dynamic_protection_rules": (
             {
-                "trigger_r": 3,
+                "trigger_r": 2,
                 "action": "break_even",
                 "lock_r": None,
                 "trail_mode": "none",

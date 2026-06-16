@@ -111,7 +111,7 @@ class StrategySymbolDefaultsTest(TestCase):
         self.assertEqual(defaults["atr_stop_multiplier"], "1")
         self.assertEqual(defaults["atr_take_multiplier"], "1")
         self.assertEqual(defaults["dynamic_break_even_trigger_r"], 3)
-        self.assertEqual(defaults["ema55_slope_lock_profit_trigger_r"], 7)
+        self.assertEqual(defaults["ema55_slope_lock_profit_trigger_r"], 5)
         self.assertEqual(defaults["dynamic_first_lock_r"], 1)
         self.assertEqual(defaults["max_entries_per_trend"], 2)
         self.assertEqual(
@@ -126,7 +126,7 @@ class StrategySymbolDefaultsTest(TestCase):
                     "trail_add_r": None,
                 },
                 {
-                    "trigger_r": 7,
+                    "trigger_r": 5,
                     "action": "lock_profit",
                     "lock_r": 1,
                     "trail_mode": "step",
@@ -156,7 +156,7 @@ class StrategySymbolDefaultsTest(TestCase):
         self.assertEqual(defaults["entry_reference_ema_period"], 0)
         self.assertEqual(defaults["atr_stop_multiplier"], "1")
         self.assertEqual(defaults["atr_take_multiplier"], "1")
-        self.assertEqual(defaults["dynamic_break_even_trigger_r"], 3)
+        self.assertEqual(defaults["dynamic_break_even_trigger_r"], 2)
         self.assertEqual(defaults["ema55_slope_lock_profit_trigger_r"], 6)
         self.assertEqual(defaults["dynamic_first_lock_r"], 1)
         self.assertEqual(defaults["max_entries_per_trend"], 2)
@@ -164,7 +164,7 @@ class StrategySymbolDefaultsTest(TestCase):
             defaults["dynamic_protection_rules"],
             (
                 {
-                    "trigger_r": 3,
+                    "trigger_r": 2,
                     "action": "break_even",
                     "lock_r": None,
                     "trail_mode": "none",

@@ -318,6 +318,8 @@ def build_backtest_focus_lines(
         (
             f"费用：Maker {_format_percent(result.maker_fee_rate)} | "
             f"Taker {_format_percent(result.taker_fee_rate)} | "
+            f"开滑{_format_percent(result.entry_slippage_rate)} | "
+            f"平滑{_format_percent(result.exit_slippage_rate)} | "
             f"手续费合计 {format_decimal_fixed(report.total_fees, 4)} | "
             f"手续费占净盈亏 {_format_optional_pct(fee_to_net_pct)}"
         ),
@@ -749,6 +751,7 @@ def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
     if config.strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
         if config.take_profit_mode == "dynamic":
             parts.append("动态止盈")
+            parts.append(f"动态止盈首档{config.resolved_dynamic_trailing_start_r()}R")
             parts.extend(_dynamic_protection_summary_parts(config))
             if config.time_stop_break_even_enabled and config.resolved_time_stop_break_even_bars() > 0:
                 parts.append(f"时间保本{config.resolved_time_stop_break_even_bars()}根")

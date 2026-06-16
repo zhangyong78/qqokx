@@ -5,7 +5,7 @@ import html
 import json
 import re
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -33,12 +33,13 @@ PACKAGE_DIR = analysis_report_dir_path() / "packages"
 PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
 JSON_PATH = PACKAGE_DIR / f"{BUNDLE_NAME}.json"
 HTML_PATH = PACKAGE_DIR / HTML_NAME
-REPORTS_DIR = ROOT / "reports"
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-LEGACY_HTML_PATH = REPORTS_DIR / HTML_NAME
+LEGACY_HTML_PATH = ROOT / "reports" / HTML_NAME
 
 STANDARD_REPORT_DIR = ROOT / "reports" / "best_parameter_bundle_1h_standard_100u"
 STANDARD_TRADES_CSV = STANDARD_REPORT_DIR / "trades.csv"
+ANALYSIS_REPORT_DIR = analysis_report_dir_path()
+OVERALL_TRADES_GLOB = "best_parameter_bundle_overall_*.csv"
+CLEANUP_BACKUPS_DIR = ANALYSIS_REPORT_DIR.parents[1] / "cleanup_backups"
 
 BUNDLE_INITIAL_CAPITAL = Decimal("10000")
 
@@ -59,7 +60,7 @@ _LONG_NOTE_MAP: dict[str, str] = {
     "BTC-USDT-SWAP": "BTC 做多默认参数已同步到参数包、UI 与实盘；下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
     "ETH-USDT-SWAP": "ETH 做多默认参数已同步到参数包、UI 与实盘；下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
     "SOL-USDT-SWAP": "SOL 做多默认参数已同步到参数包、UI 与实盘；下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
-    "DOGE-USDT-SWAP": "DOGE 做多默认参数已同步到参数包、UI 与实盘；下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
+    "DOGE-USDT-SWAP": "DOGE 做多本轮已复核 S652 / S653 / S654 / S655，并把主候选从先前误推的 S652 更正为 S653；默认参数已同步到参数包、UI 与实盘。下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
 }
 
 _SHORT_NOTE_MAP: dict[str, str] = {
@@ -68,6 +69,31 @@ _SHORT_NOTE_MAP: dict[str, str] = {
     "SOL-USDT-SWAP": "SOL 做空默认参数已同步到参数包、UI 与实盘；下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
     "DOGE-USDT-SWAP": "DOGE 做空默认参数已同步到参数包、UI 与实盘；Bear-Reentry 复核未带来足够大的综合提升，当前定稿暂不调整。下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
 }
+
+
+_LIVE_CAPITAL_PLAN: tuple[tuple[str, str, Decimal], ...] = (
+    ("BTC", "BTC-USDT-SWAP", Decimal("100")),
+    ("ETH", "ETH-USDT-SWAP", Decimal("50")),
+    ("SOL", "SOL-USDT-SWAP", Decimal("50")),
+    ("DOGE", "DOGE-USDT-SWAP", Decimal("20")),
+)
+_LIVE_TRIAL_COMBO_PLAN: tuple[tuple[str, str, Decimal], ...] = (
+    ("BTC", "BTC-USDT-SWAP", Decimal("30")),
+    ("ETH", "ETH-USDT-SWAP", Decimal("20")),
+    ("SOL", "SOL-USDT-SWAP", Decimal("10")),
+    ("DOGE", "DOGE-USDT-SWAP", Decimal("10")),
+)
+_LIVE_IMPORT_TRIAL_RISK_MAP: dict[tuple[str, str], Decimal] = {
+    ("BTC-USDT-SWAP", "long_only"): Decimal("20"),
+    ("BTC-USDT-SWAP", "short_only"): Decimal("10"),
+    ("ETH-USDT-SWAP", "long_only"): Decimal("12"),
+    ("ETH-USDT-SWAP", "short_only"): Decimal("8"),
+    ("SOL-USDT-SWAP", "long_only"): Decimal("4"),
+    ("SOL-USDT-SWAP", "short_only"): Decimal("6"),
+    ("DOGE-USDT-SWAP", "long_only"): Decimal("4"),
+    ("DOGE-USDT-SWAP", "short_only"): Decimal("6"),
+}
+_LIVE_CAPITAL_STOP_LOSS_COUNT = Decimal("20")
 
 
 @dataclass(frozen=True)
@@ -155,7 +181,11 @@ def _build_config_from_defaults(strategy_id: str, symbol: str, signal_mode: str)
     }
     for key, value in defaults.items():
         kwargs[key] = _coerce_value(key, value)
-    return StrategyConfig(**kwargs)
+    config = StrategyConfig(**kwargs)
+    import_risk = _LIVE_IMPORT_TRIAL_RISK_MAP.get((symbol, signal_mode))
+    if import_risk is not None:
+        config = replace(config, risk_amount=import_risk, order_size=Decimal("0"))
+    return config
 
 
 def _format_rule(rule: dict[str, object], *, fee_offset_enabled: bool) -> str:
@@ -211,6 +241,15 @@ def build_specs() -> tuple[BundleSpec, ...]:
     for symbol in symbols:
         config = _build_config_from_defaults(STRATEGY_DYNAMIC_LONG_ID, symbol, "long_only")
         coin = symbol.replace("-USDT-SWAP", "")
+        note = _LONG_NOTE_MAP[symbol]
+        if symbol == "SOL-USDT-SWAP":
+            note = (
+                "SOL 做多本轮围绕 S656 基线补测 5R / 6R / 7R / 8R 首档锁盈，"
+                "并对每波 1 / 2 / 3 次做样本外与滚动窗口复核；"
+                "最终确认 3R 保本 + 5R 锁 1R + 11R 锁 10R / 每波 2 次优于原 7R 锁 1R，"
+                "已同步到参数包、UI 与实盘。下方统计按固定风险 100U、初始资金 10000U、"
+                "非复利标准口径展示。"
+            )
         specs.append(
             BundleSpec(
                 side="做多",
@@ -221,7 +260,7 @@ def build_specs() -> tuple[BundleSpec, ...]:
                 strategy_label="EMA 动态委托做多",
                 core_label=_build_core_label(config, include_entry_reference=True),
                 protection_label=_build_protection_label(config, include_entries=True, append_exit_rule=False),
-                note=_LONG_NOTE_MAP[symbol],
+                note=note,
                 config=config,
             )
         )
@@ -245,6 +284,79 @@ def build_specs() -> tuple[BundleSpec, ...]:
         )
 
     return tuple(specs)
+
+
+def build_slope_short_config(
+    *,
+    symbol: str,
+    ema_period: int,
+    ema_type: str,
+    trend_ema_period: int,
+    trend_ema_type: str,
+    daily_filter_period: int = 5,
+    daily_filter_boundary: str = "bjt_08",
+    daily_filter_scope: str = "short_only",
+    daily_filter_mode: str = "close_vs_ma",
+    atr_period: int = 14,
+    dynamic_break_even_trigger_r: int = 2,
+    dynamic_first_lock_r: int = 0,
+    dynamic_trailing_step_r: int = 1,
+    dynamic_protection_rules: tuple[dict[str, object], ...] | None = None,
+    ema55_slope_lock_profit_trigger_r: int = 5,
+    ema55_slope_exit_enabled: bool = True,
+    time_stop_break_even_bars: int = 10,
+    environment: str = "live",
+) -> StrategyConfig:
+    import_risk = _LIVE_IMPORT_TRIAL_RISK_MAP.get((symbol, "short_only"), Decimal("10"))
+    return StrategyConfig(
+        inst_id=symbol,
+        bar="1H",
+        ema_period=ema_period,
+        ema_type=ema_type,
+        trend_ema_period=trend_ema_period,
+        trend_ema_type=trend_ema_type,
+        big_ema_period=233,
+        atr_period=atr_period,
+        atr_stop_multiplier=Decimal("2"),
+        atr_take_multiplier=Decimal("4"),
+        order_size=Decimal("0"),
+        trade_mode="cross",
+        signal_mode="short_only",
+        position_mode="net",
+        environment=environment,
+        tp_sl_trigger_type="mark",
+        strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+        risk_amount=import_risk,
+        trade_inst_id=symbol,
+        tp_sl_mode="exchange",
+        entry_side_mode="follow_signal",
+        run_mode="trade",
+        backtest_initial_capital=BUNDLE_INITIAL_CAPITAL,
+        backtest_sizing_mode="fixed_risk",
+        take_profit_mode="dynamic",
+        dynamic_two_r_break_even=True,
+        dynamic_break_even_trigger_r=dynamic_break_even_trigger_r,
+        dynamic_fee_offset_enabled=True,
+        dynamic_protection_rules=tuple(dynamic_protection_rules or ()),
+        ema55_slope_exit_enabled=ema55_slope_exit_enabled,
+        ema55_slope_lock_profit_trigger_r=ema55_slope_lock_profit_trigger_r,
+        dynamic_first_lock_r=dynamic_first_lock_r,
+        dynamic_trailing_step_r=dynamic_trailing_step_r,
+        ema55_slope_same_bar_reentry_block=True,
+        ema55_slope_dynamic_exit_requires_bear_reentry=False,
+        ema55_slope_dynamic_exit_bear_reentry_break_prev_low=False,
+        atr_percentile_filter_max=Decimal("0.5"),
+        trend_ema_slope_filter_min_ratio=Decimal("-0.0005"),
+        time_stop_break_even_enabled=False,
+        time_stop_break_even_bars=time_stop_break_even_bars,
+        daily_filter_enabled=daily_filter_mode != "disabled",
+        daily_filter_bar="1D",
+        daily_filter_boundary=daily_filter_boundary,
+        daily_filter_mode=daily_filter_mode,
+        daily_filter_scope=daily_filter_scope,
+        daily_filter_ma_type="ema",
+        daily_filter_period=daily_filter_period,
+    )
 
 
 def build_bundle(specs: tuple[BundleSpec, ...]) -> StrategyBundle:
@@ -297,9 +409,10 @@ def _note_takeaway_text(note: str) -> str:
 
 def _fmt_note_report_line(report: BacktestReport) -> str:
     pf_text = "-" if report.profit_factor is None else _fmt_fixed(report.profit_factor)
+    win_rate_text = _fmt_fixed(report.win_rate, "0.01") + "%"
     return (
         f"PnL {_fmt_fixed(report.total_pnl)} / DD {_fmt_fixed(report.max_drawdown)} / "
-        f"PF {pf_text} / Trades {report.total_trades}"
+        f"WinRate {win_rate_text} / PF {pf_text} / Trades {report.total_trades}"
     )
 
 
@@ -359,6 +472,88 @@ def _strategy_detail_note_html(spec: BundleSpec, run: BundleRun | None) -> str:
     lines.append(f'<div class="note-meta">{_html_text(_bundle_run_backtest_range_text(run))}</div>')
     lines.append("</div>")
     return "".join(lines)
+
+
+def _live_capital_plan_html() -> str:
+    def _plan_rows(plan: tuple[tuple[str, str, Decimal], ...]) -> tuple[str, Decimal, Decimal]:
+        rows: list[str] = []
+        total_risk = Decimal("0")
+        total_stop_line = Decimal("0")
+        for coin, _symbol, risk_amount in plan:
+            stop_line = risk_amount * _LIVE_CAPITAL_STOP_LOSS_COUNT
+            total_risk += risk_amount
+            total_stop_line += stop_line
+            rows.append(
+                "<tr>"
+                f"<td>{_html_text(coin)}</td>"
+                f"<td>{_html_text(_fmt_decimal(risk_amount) + 'U')}</td>"
+                f"<td>{_html_text(_fmt_decimal(stop_line) + 'U')}</td>"
+                f"<td>{_html_text('单币种多空组合；累计亏满 20 次固定风险即暂停')}</td>"
+                "</tr>"
+            )
+        return "".join(rows), total_risk, total_stop_line
+
+    standard_rows_html, standard_total_risk, standard_total_stop_line = _plan_rows(_LIVE_CAPITAL_PLAN)
+    trial_rows_html, trial_total_risk, trial_total_stop_line = _plan_rows(_LIVE_TRIAL_COMBO_PLAN)
+    import_rows: list[str] = []
+    for coin, symbol, _combo_risk in _LIVE_TRIAL_COMBO_PLAN:
+        long_risk = _LIVE_IMPORT_TRIAL_RISK_MAP[(symbol, "long_only")]
+        short_risk = _LIVE_IMPORT_TRIAL_RISK_MAP[(symbol, "short_only")]
+        import_rows.append(
+            "<tr>"
+            f"<td>{_html_text(coin)}</td>"
+            f"<td>{_html_text(_fmt_decimal(long_risk) + 'U')}</td>"
+            f"<td>{_html_text(_fmt_decimal(short_risk) + 'U')}</td>"
+            f"<td>{_html_text(_fmt_decimal(long_risk + short_risk) + 'U')}</td>"
+            "</tr>"
+        )
+    return (
+        '<div class="live-plan">'
+        f'<h2>{_html_text("实盘资金建议")}</h2>'
+        f'<p>{_html_text("下面资金分配按单一币种的多空组合口径整理。选择依据不是追求收益最大，而是优先兼顾历史稳定性、流动性、连续亏损承受度和你当前先缩规模验证实盘执行的阶段目标。")}</p>'
+        '<ul class="live-plan-list">'
+        f'<li>{_html_text("BTC 历史稳定性和流动性最好，所以放在第一档。")}</li>'
+        f'<li>{_html_text("ETH 整体稳定性次于 BTC，但通常好于 SOL / DOGE，所以放在中档。")}</li>'
+        f'<li>{_html_text("SOL、DOGE 历史上更容易出现低胜率和更长的回撤段，初期不建议和 BTC 同额度。")}</li>'
+        f'<li>{_html_text("试运行档的目标是先验证滑点、止损执行、参数一致性和你的心理承受度，而不是一上来把收益做大。")}</li>'
+        "</ul>"
+        f'<h3>{_html_text("实盘试运行档")}</h3>'
+        f'<p>{_html_text("建议先用这档开始，按组合累计亏满 20 次固定风险即停止；四个币种总测试资金更轻，更适合刚开始联机验证。")}</p>'
+        '<table class="live-plan-table">'
+        "<thead><tr>"
+        f"<th>{_html_text('币种')}</th>"
+        f"<th>{_html_text('组合单次风险')}</th>"
+        f"<th>{_html_text('20 次止损停线')}</th>"
+        f"<th>{_html_text('备注')}</th>"
+        "</tr></thead>"
+        f"<tbody>{trial_rows_html}</tbody>"
+        "</table>"
+        f'<p class="live-plan-summary">{_html_text(f"试运行档合计：单次总风险 {_fmt_decimal(trial_total_risk)}U；四个币种总启动资金 {_fmt_decimal(trial_total_stop_line)}U。")}</p>'
+        f'<h3>{_html_text("参数包导入默认风险金")}</h3>'
+        f'<p>{_html_text("由于最佳参数包是按 8 个独立策略导入，不是按 4 个组合导入，所以默认风险金已按试运行档拆分预填；强的一侧多给，弱的一侧少给，导入后同币种多空合计正好对应试运行档。")}</p>'
+        '<table class="live-plan-table">'
+        "<thead><tr>"
+        f"<th>{_html_text('币种')}</th>"
+        f"<th>{_html_text('做多默认风险金')}</th>"
+        f"<th>{_html_text('做空默认风险金')}</th>"
+        f"<th>{_html_text('同币种合计')}</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(import_rows)}</tbody>"
+        "</table>"
+        f'<h3>{_html_text("实盘标准档")}</h3>'
+        f'<p>{_html_text("当试运行阶段确认执行、滑点和心理承受都稳定后，再放大到标准档。")}</p>'
+        '<table class="live-plan-table">'
+        "<thead><tr>"
+        f"<th>{_html_text('币种')}</th>"
+        f"<th>{_html_text('组合单次风险')}</th>"
+        f"<th>{_html_text('20 次止损停线')}</th>"
+        f"<th>{_html_text('备注')}</th>"
+        "</tr></thead>"
+        f"<tbody>{standard_rows_html}</tbody>"
+        "</table>"
+        f'<p class="live-plan-summary">{_html_text(f"标准档合计：单次总风险 {_fmt_decimal(standard_total_risk)}U；四个币种总启动资金 {_fmt_decimal(standard_total_stop_line)}U。")}</p>'
+        "</div>"
+    )
 
 
 def _combined_period_report(
@@ -477,6 +672,163 @@ def _empty_period_row(label: str) -> tuple[object, ...]:
     return (label, 0, "0.0000", 0, "0.0000", 0, "0.00%", "0.0000", "0.00%", "0.0000", "0.00%", "10000.0000")
 
 
+def _direction_period_equity_rows(
+    long_trades: tuple[BacktestTrade, ...],
+    short_trades: tuple[BacktestTrade, ...],
+    *,
+    by: str,
+) -> tuple[tuple[str, Decimal, Decimal], ...]:
+    if by not in {"year", "month"}:
+        raise ValueError("by must be 'year' or 'month'")
+
+    bucket_keys: list[str] = []
+    bucket_map: dict[str, dict[str, Decimal]] = {}
+    for trade in long_trades:
+        key = _period_key(int(trade.exit_ts), by)
+        if key not in bucket_map:
+            bucket_keys.append(key)
+            bucket_map[key] = {"long": Decimal("0"), "short": Decimal("0")}
+        bucket_map[key]["long"] += trade.pnl
+    for trade in short_trades:
+        key = _period_key(int(trade.exit_ts), by)
+        if key not in bucket_map:
+            bucket_keys.append(key)
+            bucket_map[key] = {"long": Decimal("0"), "short": Decimal("0")}
+        bucket_map[key]["short"] += trade.pnl
+
+    bucket_keys.sort()
+    long_equity = BUNDLE_INITIAL_CAPITAL
+    short_equity = BUNDLE_INITIAL_CAPITAL
+    rows: list[tuple[str, Decimal, Decimal]] = []
+    for key in bucket_keys:
+        payload = bucket_map[key]
+        long_equity += payload["long"]
+        short_equity += payload["short"]
+        rows.append((key, long_equity, short_equity))
+    return tuple(rows)
+
+
+def _monthly_equity_chart_html(
+    title: str,
+    monthly_rows: tuple[tuple[object, ...], ...],
+    *,
+    direction_rows: tuple[tuple[str, Decimal, Decimal], ...] = (),
+) -> str:
+    if not monthly_rows and not direction_rows:
+        return (
+            '<div class="chart-empty">'
+            f"{_html_text(f'{title}：暂无月度数据')}"
+            "</div>"
+        )
+
+    if direction_rows:
+        labels = [row[0] for row in direction_rows]
+        long_equities = [row[1] for row in direction_rows]
+        short_equities = [row[2] for row in direction_rows]
+        total_equities = [_parse_decimal(str(row[11])) for row in monthly_rows] if monthly_rows else [
+            long_equities[index] + short_equities[index] - BUNDLE_INITIAL_CAPITAL for index in range(len(labels))
+        ]
+    else:
+        labels = [str(row[0]) for row in monthly_rows]
+        long_equities = [_parse_decimal(str(row[11])) for row in monthly_rows]
+        short_equities = list(long_equities)
+        total_equities = list(long_equities)
+
+    all_equities = [*long_equities, *short_equities, *total_equities]
+    min_equity = min(all_equities)
+    max_equity = max(all_equities)
+    if min_equity == max_equity:
+        min_equity -= Decimal("1")
+        max_equity += Decimal("1")
+
+    width = 820
+    height = 280
+    pad_left = 56
+    pad_right = 20
+    pad_top = 18
+    pad_bottom = 46
+    plot_width = width - pad_left - pad_right
+    plot_height = height - pad_top - pad_bottom
+    denominator = max_equity - min_equity
+
+    def _x(index: int) -> float:
+        if len(labels) <= 1:
+            return float(pad_left + plot_width / 2)
+        return float(pad_left + (plot_width * index / (len(labels) - 1)))
+
+    def _y(value: Decimal) -> float:
+        normalized = float((value - min_equity) / denominator)
+        return float(pad_top + plot_height - (normalized * plot_height))
+
+    long_points = " ".join(f"{_x(index):.1f},{_y(value):.1f}" for index, value in enumerate(long_equities))
+    short_points = " ".join(f"{_x(index):.1f},{_y(value):.1f}" for index, value in enumerate(short_equities))
+    total_points = " ".join(f"{_x(index):.1f},{_y(value):.1f}" for index, value in enumerate(total_equities))
+
+    ticks: list[str] = []
+    for step in range(5):
+        y = pad_top + plot_height * step / 4
+        value = max_equity - (denominator * Decimal(step) / Decimal("4"))
+        ticks.append(
+            f'<line x1="{pad_left}" y1="{y:.1f}" x2="{pad_left + plot_width}" y2="{y:.1f}" class="chart-grid" />'
+            f'<text x="{pad_left - 8}" y="{y + 4:.1f}" text-anchor="end" class="chart-axis-label">{_html_text(_fmt_fixed(value))}</text>'
+        )
+
+    x_labels: list[str] = []
+    max_labels = 8
+    label_step = max(1, len(labels) // max_labels)
+    for index, label in enumerate(labels):
+        if index % label_step != 0 and index != len(labels) - 1:
+            continue
+        x = _x(index)
+        x_labels.append(
+            f'<text x="{x:.1f}" y="{height - 14}" text-anchor="middle" class="chart-axis-label">{_html_text(label)}</text>'
+        )
+
+    long_dots = "".join(
+        f'<circle cx="{_x(index):.1f}" cy="{_y(value):.1f}" r="3.2" class="chart-dot chart-dot-long">'
+        f'<title>{_html_text(f"{labels[index]} 做多期末权益 {_fmt_fixed(value)}")}</title>'
+        "</circle>"
+        for index, value in enumerate(long_equities)
+    )
+    short_dots = "".join(
+        f'<circle cx="{_x(index):.1f}" cy="{_y(value):.1f}" r="3.2" class="chart-dot chart-dot-short">'
+        f'<title>{_html_text(f"{labels[index]} 做空期末权益 {_fmt_fixed(value)}")}</title>'
+        "</circle>"
+        for index, value in enumerate(short_equities)
+    )
+    total_dots = "".join(
+        f'<circle cx="{_x(index):.1f}" cy="{_y(value):.1f}" r="3.2" class="chart-dot chart-dot-total">'
+        f'<title>{_html_text(f"{labels[index]} 合计期末权益 {_fmt_fixed(value)}")}</title>'
+        "</circle>"
+        for index, value in enumerate(total_equities)
+    )
+
+    long_latest_value = _fmt_fixed(long_equities[-1])
+    short_latest_value = _fmt_fixed(short_equities[-1])
+    total_latest_value = _fmt_fixed(total_equities[-1])
+    return (
+        '<div class="chart-card">'
+        f'<div class="chart-title">{_html_text(title)}</div>'
+        f'<div class="chart-subtitle">{_html_text(f"月度累计权益三线：做多 {long_latest_value} / 做空 {short_latest_value} / 合计 {total_latest_value}")}</div>'
+        '<div class="chart-legend">'
+        f'<span class="chart-legend-item"><span class="chart-legend-swatch chart-legend-swatch-long"></span>{_html_text("做多")}</span>'
+        f'<span class="chart-legend-item"><span class="chart-legend-swatch chart-legend-swatch-short"></span>{_html_text("做空")}</span>'
+        f'<span class="chart-legend-item"><span class="chart-legend-swatch chart-legend-swatch-total"></span>{_html_text("合计")}</span>'
+        "</div>"
+        f'<svg class="equity-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{_html_text(title)}">'
+        + "".join(ticks)
+        + f'<polyline points="{total_points}" fill="none" stroke="#1d4ed8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />'
+        + f'<polyline points="{long_points}" fill="none" stroke="#0f766e" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />'
+        + f'<polyline points="{short_points}" fill="none" stroke="#c2410c" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />'
+        + total_dots
+        + long_dots
+        + short_dots
+        + "".join(x_labels)
+        + "</svg>"
+        "</div>"
+    )
+
+
 def _period_overview_html(
     *,
     title: str,
@@ -522,6 +874,17 @@ def _parse_report_ts(text: str) -> int:
     return int(dt.timestamp() * 1000)
 
 
+def _parse_overall_report_ts(text: str) -> int:
+    normalized = text.strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            dt = datetime.strptime(normalized, fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    raise ValueError(f"unsupported overall report timestamp: {text}")
+
+
 def _placeholder_instrument(symbol: str) -> Instrument:
     return Instrument(
         inst_id=symbol,
@@ -533,31 +896,39 @@ def _placeholder_instrument(symbol: str) -> Instrument:
     )
 
 
+def _report_row_value(row: dict[str, str], *keys: str, default: str = "") -> str:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return default
+
+
 def _trade_from_report_row(row: dict[str, str]) -> BacktestTrade:
-    direction = row.get("方向", "")
+    direction = _report_row_value(row, "方向")
     signal = "long" if direction == "多头" else "short"
-    pnl = _parse_decimal(row.get("盈亏", "0"))
-    r_multiple = _parse_decimal(row.get("R倍数", "0"))
+    pnl = _parse_decimal(_report_row_value(row, "盈亏", default="0"))
+    r_multiple = _parse_decimal(_report_row_value(row, "R倍数", default="0"))
     return BacktestTrade(
         signal=signal,
         entry_index=0,
         exit_index=0,
-        entry_ts=_parse_report_ts(row["开仓时间"]),
-        exit_ts=_parse_report_ts(row["平仓时间"]),
-        entry_price=_parse_decimal(row.get("开仓价", "0")),
-        exit_price=_parse_decimal(row.get("平仓价", "0")),
+        entry_ts=_parse_report_ts(_report_row_value(row, "开仓时间")),
+        exit_ts=_parse_report_ts(_report_row_value(row, "平仓时间")),
+        entry_price=_parse_decimal(_report_row_value(row, "开仓价", default="0")),
+        exit_price=_parse_decimal(_report_row_value(row, "平仓价", default="0")),
         stop_loss=Decimal("0"),
         take_profit=Decimal("0"),
-        size=_parse_decimal(row.get("成交数量", "0")),
+        size=_parse_decimal(_report_row_value(row, "成交数量", default="0")),
         gross_pnl=pnl,
         pnl=pnl,
-        risk_value=_parse_decimal(row.get("风险金额", "0")),
+        risk_value=_parse_decimal(_report_row_value(row, "风险金额", default="0")),
         r_multiple=r_multiple,
-        exit_reason=row.get("平仓原因", "") or "",
+        exit_reason=_report_row_value(row, "平仓原因"),
     )
 
 
-def _load_bundle_runs(specs: tuple[BundleSpec, ...]) -> tuple[BundleRun, ...]:
+def _load_bundle_runs_standard_legacy(specs: tuple[BundleSpec, ...]) -> tuple[BundleRun, ...]:
     if not STANDARD_TRADES_CSV.exists():
         return ()
 
@@ -587,6 +958,109 @@ def _load_bundle_runs(specs: tuple[BundleSpec, ...]) -> tuple[BundleRun, ...]:
     return tuple(runs)
 
 
+def _load_bundle_runs_from_standard_report(specs: tuple[BundleSpec, ...]) -> tuple[BundleRun, ...]:
+    if not STANDARD_TRADES_CSV.exists():
+        return ()
+
+    grouped: dict[tuple[str, str], list[BacktestTrade]] = {}
+    with STANDARD_TRADES_CSV.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            coin = row.get("币种", "").strip()
+            direction = row.get("方向", "").strip()
+            if not coin or direction not in {"多头", "空头"}:
+                continue
+            side = "做多" if direction == "多头" else "做空"
+            grouped.setdefault((coin, side), []).append(_trade_from_report_row(row))
+
+    runs: list[BundleRun] = []
+    for spec in specs:
+        coin = spec.symbol.replace("-USDT-SWAP", "")
+        trades = sorted(grouped.get((coin, spec.side), []), key=lambda item: (item.exit_ts, item.entry_ts, item.signal))
+        report = _build_report(trades, initial_capital=BUNDLE_INITIAL_CAPITAL)
+        result = BacktestResult(
+            candles=[],
+            trades=trades,
+            report=report,
+            instrument=_placeholder_instrument(spec.symbol),
+        )
+        runs.append(BundleRun(spec=spec, result=result, data_source_note=str(STANDARD_TRADES_CSV)))
+    return tuple(runs)
+
+
+def _trade_from_overall_report_row(row: dict[str, str]) -> BacktestTrade:
+    signal = str(row.get("signal", "")).strip().lower()
+    if signal not in {"long", "short"}:
+        side = str(row.get("side", "")).strip()
+        signal = "long" if side == "做多" else "short"
+    pnl = _parse_decimal(row.get("pnl_u", "0"))
+    r_multiple = _parse_decimal(row.get("r_multiple", "0"))
+    return BacktestTrade(
+        signal=signal,
+        entry_index=0,
+        exit_index=0,
+        entry_ts=_parse_overall_report_ts(str(row.get("entry_time", ""))),
+        exit_ts=_parse_overall_report_ts(str(row.get("exit_time", ""))),
+        entry_price=_parse_decimal(row.get("entry_price", "0")),
+        exit_price=_parse_decimal(row.get("exit_price", "0")),
+        stop_loss=Decimal("0"),
+        take_profit=Decimal("0"),
+        size=Decimal("0"),
+        gross_pnl=pnl,
+        pnl=pnl,
+        risk_value=Decimal("100"),
+        r_multiple=r_multiple,
+        exit_reason=str(row.get("exit_reason", "") or ""),
+    )
+
+
+def _latest_overall_trades_csv() -> Path | None:
+    candidates = list(ANALYSIS_REPORT_DIR.glob(OVERALL_TRADES_GLOB))
+    if CLEANUP_BACKUPS_DIR.exists():
+        for backup_dir in CLEANUP_BACKUPS_DIR.glob("cleanup_*"):
+            analysis_root_files = backup_dir / "analysis_root_files"
+            if analysis_root_files.exists():
+                candidates.extend(analysis_root_files.glob(OVERALL_TRADES_GLOB))
+    candidates = sorted(
+        candidates,
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _load_bundle_runs(specs: tuple[BundleSpec, ...]) -> tuple[BundleRun, ...]:
+    overall_csv = _latest_overall_trades_csv()
+    if overall_csv is not None:
+        grouped: dict[tuple[str, str], list[BacktestTrade]] = {}
+        with overall_csv.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                symbol = str(row.get("symbol", "")).strip().upper()
+                side = str(row.get("side", "")).strip()
+                if not symbol or side not in {"做多", "做空"}:
+                    continue
+                grouped.setdefault((symbol, side), []).append(_trade_from_overall_report_row(row))
+
+        runs: list[BundleRun] = []
+        for spec in specs:
+            trades = sorted(
+                grouped.get((spec.symbol, spec.side), []),
+                key=lambda item: (item.exit_ts, item.entry_ts, item.signal),
+            )
+            report = _build_report(trades, initial_capital=BUNDLE_INITIAL_CAPITAL)
+            result = BacktestResult(
+                candles=[],
+                trades=trades,
+                report=report,
+                instrument=_placeholder_instrument(spec.symbol),
+            )
+            runs.append(BundleRun(spec=spec, result=result, data_source_note=str(overall_csv)))
+        return tuple(runs)
+
+    return _load_bundle_runs_from_standard_report(specs)
+
+
 def _coin_order(specs: tuple[BundleSpec, ...]) -> tuple[str, ...]:
     ordered: list[str] = []
     for spec in specs:
@@ -600,7 +1074,7 @@ def _coin_period_tables_html(specs: tuple[BundleSpec, ...], runs: tuple[BundleRu
     if not runs:
         return (
             '<div class="strategy-card">'
-            f'<p>{_html_text(f"未找到标准 100U 组合回测明细：{STANDARD_TRADES_CSV}。先生成标准 100U 组合报告后，再重建本说明即可自动带出年度/月度统计。")}</p>'
+            f'<p>{_html_text(f"未找到可追溯的 overall CSV 或 standard trades CSV：{OVERALL_TRADES_GLOB} / {STANDARD_TRADES_CSV}。请先恢复或重建回测明细，再重建本说明以带出年度/月度统计。")}</p>'
             "</div>"
         )
 
@@ -628,6 +1102,7 @@ def _coin_period_tables_html(specs: tuple[BundleSpec, ...], runs: tuple[BundleRu
         short_trades = tuple(short_run.result.trades) if short_run else ()
         yearly_rows = _combined_period_rows(long_trades, short_trades, by="year")
         monthly_rows = _combined_period_rows(long_trades, short_trades, by="month")
+        direction_monthly_rows = _direction_period_equity_rows(long_trades, short_trades, by="month")
         report = _combined_period_report(long_trades, short_trades)
         cards.append(
             '<div class="strategy-card">'
@@ -639,6 +1114,11 @@ def _coin_period_tables_html(specs: tuple[BundleSpec, ...], runs: tuple[BundleRu
                 long_trades=len(long_trades),
                 short_trades=len(short_trades),
             )
+            + _monthly_equity_chart_html(
+                f"{coin} 月度多空权益折线图",
+                monthly_rows,
+                direction_rows=direction_monthly_rows,
+            )
             + f'<details open><summary>{_html_text("年度统计")}</summary><div class="table-scroll">{_simple_table_html(headers, yearly_rows or (_empty_period_row("无数据"),))}</div></details>'
             + f'<details><summary>{_html_text("月度统计")}</summary><div class="table-scroll">{_simple_table_html(headers, monthly_rows or (_empty_period_row("无数据"),))}</div></details>'
             + "</div>"
@@ -648,7 +1128,14 @@ def _coin_period_tables_html(specs: tuple[BundleSpec, ...], runs: tuple[BundleRu
     short_all = tuple(trade for run in runs if run.spec.side == "做空" for trade in run.result.trades)
     overall_yearly_rows = _combined_period_rows(long_all, short_all, by="year")
     overall_monthly_rows = _combined_period_rows(long_all, short_all, by="month")
+    overall_direction_monthly_rows = _direction_period_equity_rows(long_all, short_all, by="month")
     overall_report = _combined_period_report(long_all, short_all)
+    source_notes = sorted({run.data_source_note for run in runs if run.data_source_note})
+    source_note_text = (
+        "K\u7ebf\u6765\u6e90\uff1a" + "\uff1b".join(source_notes)
+        if source_notes
+        else f"\u672a\u627e\u5230\u53ef\u8ffd\u6eaf\u7684 overall CSV \u6216 standard trades CSV\uff1a{OVERALL_TRADES_GLOB} / {STANDARD_TRADES_CSV}"
+    )
     cards.append(
         '<div class="strategy-card">'
         + _period_overview_html(
@@ -659,10 +1146,15 @@ def _coin_period_tables_html(specs: tuple[BundleSpec, ...], runs: tuple[BundleRu
             long_trades=len(long_all),
             short_trades=len(short_all),
         )
+        + _monthly_equity_chart_html(
+            "全组合月度多空权益折线图",
+            overall_monthly_rows,
+            direction_rows=overall_direction_monthly_rows,
+        )
         + f'<p>{_html_text("口径：固定风险 100U、初始资金 10000U、非复利；多/空列展示各方向交易数与盈亏，合计列按该币或全组合的合并资金曲线统计收益率、回撤与期末权益。")}</p>'
         + f'<details open><summary>{_html_text("年度统计")}</summary><div class="table-scroll">{_simple_table_html(headers, overall_yearly_rows or (_empty_period_row("无数据"),))}</div></details>'
         + f'<details><summary>{_html_text("月度统计")}</summary><div class="table-scroll">{_simple_table_html(headers, overall_monthly_rows or (_empty_period_row("无数据"),))}</div></details>'
-        + f'<p><small>{_html_text(f"K线来源：{STANDARD_TRADES_CSV}；由标准 100U 组合回测成交明细重建。")}</small></p>'
+        + f'<p><small>{_html_text(source_note_text)}</small></p>'
         + "</div>"
     )
     return "".join(cards)
@@ -701,6 +1193,7 @@ def build_html(specs: tuple[BundleSpec, ...]) -> str:
     rows_html = "".join(rows)
     configs_html = "".join(config_cards)
     coin_period_tables = _coin_period_tables_html(specs, runs)
+    live_capital_plan_html = _live_capital_plan_html()
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -843,6 +1336,86 @@ def build_html(specs: tuple[BundleSpec, ...]) -> str:
       font-size: 16px;
       color: #0b5d58;
     }}
+    .chart-card {{
+      margin: 14px 0 10px 0;
+      padding: 14px 14px 10px 14px;
+      border: 1px solid rgba(15, 118, 110, 0.12);
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(246, 251, 249, 0.96), rgba(255, 255, 255, 0.86));
+    }}
+    .chart-title {{
+      font-size: 15px;
+      font-weight: 700;
+      color: #0b5d58;
+    }}
+    .chart-subtitle {{
+      margin-top: 4px;
+      font-size: 12px;
+      color: #6b7280;
+    }}
+    .chart-legend {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 8px;
+      font-size: 12px;
+      color: #475569;
+    }}
+    .chart-legend-item {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }}
+    .chart-legend-swatch {{
+      width: 20px;
+      height: 3px;
+      border-radius: 999px;
+      display: inline-block;
+    }}
+    .chart-legend-swatch-long {{
+      background: #0f766e;
+    }}
+    .chart-legend-swatch-short {{
+      background: #c2410c;
+    }}
+    .chart-legend-swatch-total {{
+      background: #1d4ed8;
+    }}
+    .equity-chart {{
+      width: 100%;
+      height: auto;
+      display: block;
+      margin-top: 10px;
+    }}
+    .chart-grid {{
+      stroke: rgba(15, 118, 110, 0.12);
+      stroke-width: 1;
+    }}
+    .chart-axis-label {{
+      fill: #6b7280;
+      font-size: 11px;
+    }}
+    .chart-dot {{
+      stroke: rgba(255, 255, 255, 0.92);
+      stroke-width: 1.5;
+    }}
+    .chart-dot-long {{
+      fill: #0f766e;
+    }}
+    .chart-dot-short {{
+      fill: #c2410c;
+    }}
+    .chart-dot-total {{
+      fill: #1d4ed8;
+    }}
+    .chart-empty {{
+      margin: 14px 0 10px 0;
+      padding: 12px 14px;
+      border: 1px dashed rgba(15, 118, 110, 0.18);
+      border-radius: 12px;
+      color: #6b7280;
+      background: rgba(246, 251, 249, 0.75);
+    }}
     .strategy-table th:nth-child(1),
     .strategy-table td:nth-child(1) {{ width: 7%; }}
     .strategy-table th:nth-child(2),
@@ -900,6 +1473,21 @@ def build_html(specs: tuple[BundleSpec, ...]) -> str:
       border: 1px dashed rgba(15, 118, 110, 0.18);
       border-radius: 10px;
     }}
+    .live-plan {{
+      margin-top: 16px;
+      border: 1px solid rgba(15, 118, 110, 0.14);
+      border-radius: 16px;
+      padding: 16px 18px;
+      background: linear-gradient(180deg, rgba(246, 251, 249, 0.95), rgba(255, 255, 255, 0.86));
+    }}
+    .live-plan-table {{
+      margin-top: 10px;
+    }}
+    .live-plan-summary {{
+      margin-top: 12px;
+      color: #0b5d58;
+      font-weight: 700;
+    }}
   </style>
 </head>
 <body>
@@ -910,6 +1498,7 @@ def build_html(specs: tuple[BundleSpec, ...]) -> str:
       <div class="chip"><strong>{_html_text("生成时间")}</strong><br>{generated_at}</div>
       <div class="chip"><strong>{_html_text("JSON 路径")}</strong><br>{json_path}</div>
     </div>
+    {live_capital_plan_html}
   </section>
   <section class="panel">
     <h2>{_html_text("参数总览")}</h2>
@@ -942,21 +1531,21 @@ def build_html(specs: tuple[BundleSpec, ...]) -> str:
 """
 
 
-def write_outputs() -> tuple[Path, Path, Path]:
+def write_outputs() -> tuple[Path, Path]:
     specs = build_specs()
     bundle = build_bundle(specs)
     write_strategy_bundle(bundle, JSON_PATH)
     html_text = build_html(specs)
     HTML_PATH.write_text(html_text, encoding="utf-8-sig")
-    LEGACY_HTML_PATH.write_text(html_text, encoding="utf-8-sig")
-    return JSON_PATH, HTML_PATH, LEGACY_HTML_PATH
+    if LEGACY_HTML_PATH.exists():
+        LEGACY_HTML_PATH.unlink()
+    return JSON_PATH, HTML_PATH
 
 
 def main() -> None:
-    json_path, html_path, legacy_html_path = write_outputs()
+    json_path, html_path = write_outputs()
     print(json_path)
     print(html_path)
-    print(legacy_html_path)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,12 @@
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 
 from okx_quant.backtest import BacktestReport, BacktestResult
 from okx_quant.models import Candle, Instrument, StrategyConfig
+from scripts import build_best_parameter_bundle as bundle_module
 from scripts.build_best_parameter_bundle import BundleRun, BundleSpec, _note_takeaway_text, _strategy_detail_note_html
 
 
@@ -24,6 +28,32 @@ def _config() -> StrategyConfig:
 
 
 class BestParameterBundleNotesTest(TestCase):
+    def test_write_outputs_keeps_only_package_html(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            json_path = temp_root / "最佳参数组合包.json"
+            html_path = temp_root / "最佳参数组合包说明.html"
+            legacy_path = temp_root / "reports" / "最佳参数组合包说明.html"
+            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_path.write_text("legacy", encoding="utf-8")
+
+            with (
+                patch.object(bundle_module, "JSON_PATH", json_path),
+                patch.object(bundle_module, "HTML_PATH", html_path),
+                patch.object(bundle_module, "LEGACY_HTML_PATH", legacy_path),
+                patch.object(bundle_module, "build_specs", return_value=[]),
+                patch.object(bundle_module, "build_bundle", return_value=object()),
+                patch.object(bundle_module, "build_html", return_value="<html>only package copy</html>"),
+                patch.object(bundle_module, "write_strategy_bundle") as write_bundle_mock,
+            ):
+                result = bundle_module.write_outputs()
+
+            self.assertEqual(result, (json_path, html_path))
+            self.assertTrue(html_path.exists())
+            self.assertFalse(legacy_path.exists())
+            self.assertEqual(html_path.read_text(encoding="utf-8-sig"), "<html>only package copy</html>")
+            write_bundle_mock.assert_called_once()
+
     def test_strategy_detail_note_html_appends_backtest_range_when_missing(self) -> None:
         spec = BundleSpec(
             side="做空",
@@ -91,6 +121,7 @@ class BestParameterBundleNotesTest(TestCase):
 
         self.assertIn("&#x5B9A;&#x7A3F;&#x7ED3;&#x8BBA;", html)
         self.assertIn("&#x5168;&#x6837;&#x672C;", html)
+        self.assertIn("WinRate 0.00%", html)
         self.assertIn("2022-01-01", html)
         self.assertIn('class="note-meta"', html)
         self.assertIn("2019-12-16 14:00 -&gt; 2024-06-14 19:00", html)

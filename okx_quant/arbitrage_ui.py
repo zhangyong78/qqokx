@@ -192,6 +192,20 @@ def _estimated_one_coin_fee_usdt(
     return reference_price * rate
 
 
+def _estimated_one_coin_taker_fee_usdt(
+    *,
+    instrument: Instrument,
+    reference_price: Decimal | None,
+    fee_profile: ArbitrageFeeProfile | None = None,
+) -> Decimal | None:
+    return _estimated_one_coin_fee_usdt(
+        instrument=instrument,
+        reference_price=reference_price,
+        liquidity="taker",
+        fee_profile=fee_profile,
+    )
+
+
 def _format_fee_amount_usdt_rounded(amount: Decimal | None) -> str:
     if amount is None:
         return "-"

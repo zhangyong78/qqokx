@@ -2650,6 +2650,7 @@ def _run_adaptive_rail_backtest(
     if bool(config.rail_fast_gate_enabled) and int(config.rail_fast_gate_period) > 0:
         ema_periods.add(int(config.rail_fast_gate_period))
     ema_by_period = {period: ema(closes, period) for period in sorted(ema_periods)}
+    trend_ema_values = ema_by_period.get(int(config.trend_ema_period)) or ema(closes, int(config.trend_ema_period))
     ema200_values = ema_by_period.get(200) or ema(closes, 200)
     atr_values = atr(candles, config.atr_period)
     trades: list[BacktestTrade] = []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from unittest import TestCase
 
@@ -8,6 +9,7 @@ from okx_quant.multi_coin_market_digest import (
     archive_multi_coin_market_email,
     build_multi_coin_market_email_body,
     build_multi_coin_market_email_html,
+    build_multi_coin_chart_image_map,
     multi_coin_market_digest_payload,
     analyze_multi_coin_market,
 )
@@ -99,37 +101,88 @@ class MultiCoinMarketDigestTest(TestCase):
         )
 
         payload = multi_coin_market_digest_payload(digest)
-        body = build_multi_coin_market_email_body(digest)
-        html = build_multi_coin_market_email_html(
-            digest,
-            chart_image_map={
-                "BTC-USDT-SWAP": {"1H": "ZmFrZV9pbWFnZQ==", "4H": "ZmFrZV9pbWFnZQ==", "1D": "ZmFrZV9pbWFnZQ==", "1W": "ZmFrZV9pbWFnZQ=="},
-                "ETH-USDT-SWAP": {"1H": "ZmFrZV9pbWFnZQ==", "4H": "ZmFrZV9pbWFnZQ==", "1D": "ZmFrZV9pbWFnZQ==", "1W": "ZmFrZV9pbWFnZQ=="},
-            },
-            overlay_legend_map={
-                "BTC-USDT-SWAP": {
-                    "1H": "叠加：<span>EMA21</span><span>MA50</span><span>EMA55</span>",
-                    "4H": "叠加：<span>EMA21</span><span>EMA55</span>",
-                    "1D": "叠加：<span>EMA21</span><span>EMA55</span>",
-                    "1W": "叠加：<span>EMA21</span><span>EMA55</span>",
+        validation_payload = {
+            "generated_at": "2026-06-16T12:00:00Z",
+            "details": [
+                {
+                    "archive_meta_path": "a.json",
+                    "generated_at": "2026-06-16T08:00:00Z",
+                    "symbol": "BTC-USDT-SWAP",
+                    "stance": "优先做多",
+                    "return_24h_pct": 1.2,
+                    "validation": {"verdict": "effective"},
                 },
-                "ETH-USDT-SWAP": {
-                    "1H": "叠加：<span>MA34</span><span>EMA55</span>",
-                    "4H": "叠加：<span>EMA21</span><span>EMA55</span>",
-                    "1D": "叠加：<span>EMA21</span><span>EMA55</span>",
-                    "1W": "叠加：<span>EMA21</span><span>EMA55</span>",
+                {
+                    "archive_meta_path": "a.json",
+                    "generated_at": "2026-06-16T08:00:00Z",
+                    "symbol": "ETH-USDT-SWAP",
+                    "stance": "优先做空",
+                    "return_24h_pct": -0.5,
+                    "validation": {"verdict": "invalid"},
                 },
-            },
-        )
+                {
+                    "archive_meta_path": "b.json",
+                    "generated_at": "2026-06-16T12:00:00Z",
+                    "symbol": "SOL-USDT-SWAP",
+                    "stance": "暂观望",
+                    "return_24h_pct": 0.3,
+                    "validation": {"verdict": "pending"},
+                },
+            ],
+        }
+        with patch("okx_quant.multi_coin_market_digest.load_latest_email_validation_payload", return_value=validation_payload):
+            body = build_multi_coin_market_email_body(digest)
+            html = build_multi_coin_market_email_html(
+                digest,
+                chart_image_map={
+                    "BTC-USDT-SWAP": {"1H": "ZmFrZV9pbWFnZQ==", "4H": "ZmFrZV9pbWFnZQ==", "1D": "ZmFrZV9pbWFnZQ==", "1W": "ZmFrZV9pbWFnZQ=="},
+                    "ETH-USDT-SWAP": {"1H": "ZmFrZV9pbWFnZQ==", "4H": "ZmFrZV9pbWFnZQ==", "1D": "ZmFrZV9pbWFnZQ==", "1W": "ZmFrZV9pbWFnZQ=="},
+                },
+                overlay_legend_map={
+                    "BTC-USDT-SWAP": {
+                        "1H": "叠加：<span>EMA21</span><span>MA50</span><span>EMA55</span>",
+                        "4H": "叠加：<span>EMA21</span><span>EMA55</span>",
+                        "1D": "叠加：<span>EMA21</span><span>EMA55</span>",
+                        "1W": "叠加：<span>EMA21</span><span>EMA55</span>",
+                    },
+                    "ETH-USDT-SWAP": {
+                        "1H": "叠加：<span>MA34</span><span>EMA55</span>",
+                        "4H": "叠加：<span>EMA21</span><span>EMA55</span>",
+                        "1D": "叠加：<span>EMA21</span><span>EMA55</span>",
+                        "1W": "叠加：<span>EMA21</span><span>EMA55</span>",
+                    },
+                },
+            )
 
         self.assertEqual(payload["leaders"]["strongest_long"]["symbol"], "BTC-USDT-SWAP")
         self.assertEqual(payload["leaders"]["weakest_short"]["symbol"], "ETH-USDT-SWAP")
         self.assertIn(payload["leaders"]["best_trade_candidate"]["symbol"], {"BTC-USDT-SWAP", "ETH-USDT-SWAP"})
         self.assertIn("简明结论：", body)
+        self.assertIn("明确观点：", body)
+        self.assertIn("最近复盘：", body)
+        self.assertIn("覆盖最近 2 封已发送邮件", body)
+        self.assertIn("明确观点命中率", body)
+        self.assertIn("命中率最高币种", body)
+        self.assertIn("命中率最低币种", body)
+        self.assertIn("最值得关注的变化", body)
+        self.assertIn("今日优先跟踪", body)
+        self.assertIn("今日谨慎对待", body)
+        self.assertIn("若只做一笔", body)
+        self.assertIn("各币种最近命中率简表", body)
+        self.assertIn("BTC：命中率", body)
         self.assertIn("做多最强", body)
         self.assertIn("分币摘要：", body)
         self.assertIn("<html", html)
         self.assertIn("生成时间：", html)
+        self.assertIn("明确观点", html)
+        self.assertIn("最近复盘", html)
+        self.assertIn("命中率最高币种", html)
+        self.assertIn("命中率最低币种", html)
+        self.assertIn("最值得关注的变化", html)
+        self.assertIn("今日优先跟踪", html)
+        self.assertIn("今日谨慎对待", html)
+        self.assertIn("若只做一笔", html)
+        self.assertIn("各币种最近命中率简表", html)
         self.assertIn("BTC", html)
         self.assertIn("ETH", html)
         self.assertIn("data:image/png;base64", html)
@@ -154,3 +207,83 @@ class MultiCoinMarketDigestTest(TestCase):
             self.assertEqual(archive_path.parent.name, "email_archives")
             self.assertTrue(archive_path.with_suffix(".txt").exists())
             self.assertTrue(archive_path.with_suffix(".json").exists())
+            metadata = json.loads(archive_path.with_suffix(".json").read_text(encoding="utf-8"))
+            self.assertIn("viewpoints", metadata)
+            self.assertIn("digest_payload", metadata)
+            self.assertEqual(metadata["digest_payload"]["symbols"], list(digest.symbols))
+            self.assertEqual(metadata["viewpoints"][0]["symbol"], "BTC-USDT-SWAP")
+
+    def test_build_chart_image_map_reuses_cached_intraday_data_and_fetches_weekly_directly(self) -> None:
+        from okx_quant.multi_coin_market_digest import MultiCoinMarketDigest, _pick_best_trade_candidate, _pick_strongest_long, _pick_weakest_short
+        from okx_quant.models import Candle
+
+        analysis = _analysis("BTC-USDT-SWAP", "long", 8, "long", "long", ("底分型",), ("锤子线",))
+        digest = MultiCoinMarketDigest(
+            generated_at="2026-05-29T00:00:00Z",
+            symbols=(analysis.symbol,),
+            analyses=(analysis,),
+            strongest_long=_pick_strongest_long((analysis,)),
+            weakest_short=_pick_weakest_short((analysis,)),
+            best_trade_candidate=_pick_best_trade_candidate((analysis,)),
+        )
+
+        def _candles(step_ms: int, count: int = 140) -> list[Candle]:
+            rows: list[Candle] = []
+            for index in range(count):
+                price = Decimal(str(100 + index))
+                rows.append(
+                    Candle(
+                        ts=index * step_ms,
+                        open=price,
+                        high=price + Decimal("1"),
+                        low=price - Decimal("1"),
+                        close=price,
+                        volume=Decimal("1"),
+                        confirmed=True,
+                    )
+                )
+            return rows
+
+        cached_map = {
+            "1H": _candles(3_600_000),
+            "4H": _candles(14_400_000),
+            "1D": _candles(86_400_000),
+        }
+        weekly_candles = _candles(604_800_000)
+
+        class StubChartClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, int]] = []
+
+            def get_candles_history(self, symbol: str, timeframe: str, limit: int = 0):  # noqa: ANN202
+                self.calls.append((symbol, timeframe, limit))
+                raise AssertionError("intraday/daily charts should reuse local cache")
+
+            def get_candles(self, symbol: str, timeframe: str, limit: int = 0):  # noqa: ANN202
+                self.calls.append((symbol, timeframe, limit))
+                if timeframe != "1W":
+                    raise AssertionError(f"unexpected direct fetch timeframe: {timeframe}")
+                return weekly_candles[-limit:]
+
+        client = StubChartClient()
+
+        def _fake_load_candle_cache(symbol: str, timeframe: str, *, limit: int | None = None):  # noqa: ANN202
+            rows = list(cached_map.get(timeframe, []))
+            return rows if limit is None else rows[-limit:]
+
+        with patch("okx_quant.multi_coin_market_digest.load_candle_cache", side_effect=_fake_load_candle_cache):
+            with patch("okx_quant.multi_coin_market_digest.render_candles_png_base64", return_value="fake-chart"):
+                image_map = build_multi_coin_chart_image_map(digest, client=client)
+
+        self.assertEqual(
+            image_map,
+            {
+                "BTC-USDT-SWAP": {
+                    "1H": "fake-chart",
+                    "4H": "fake-chart",
+                    "1D": "fake-chart",
+                    "1W": "fake-chart",
+                }
+            },
+        )
+        self.assertEqual(client.calls, [("BTC-USDT-SWAP", "1W", 127)])

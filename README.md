@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.25`
+当前版本：`v0.6.26`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -29,7 +29,7 @@
 
 ## 近期更新
 
-`v0.6.25` 这一轮版本内容比较集中，重点新增和调整如下：
+`v0.6.26` 这一轮版本内容比较集中，重点新增和调整如下：
 
 - 新增 `EMA55 斜率做空` 策略：
   - 规则：`EMA55` 单根斜率比例小于等于阈值时开空，斜率重新转正时平仓
@@ -166,6 +166,28 @@
   - 新增字段级说明
   - 新增动态保护规则口径解释
   - 组合包文档更适合作为长期参数手册回看
+- 最佳参数组合包导入体验补了一步“逐条风险金可调”：
+  - 导入策略组合弹窗现在会为每条策略显示单独的 `Risk`
+  - 默认带出组合包里原始 `risk_amount`
+  - 导入前可以按策略分别改风险金，不需要整包统一一个数
+  - 自动启动和“只回填首条到启动区”两条导入路径都会优先使用这次输入的风险金
+  - 如果某条策略手动填了风险金，会覆盖原固定数量映射，回到风险金模式
+- 最佳参数组合包这轮还补了“分层实盘试跑风险金”口径：
+  - 组合包内部继续保留统一 `100U` 回测统计口径
+  - 但导入实盘试跑时，已经内置 `BTC 20/10`、`ETH 12/8`、`SOL 4/6`、`DOGE 4/6` 的多空分层风险金映射
+  - 文档说明里也同步加入了“初期为什么不要所有币一把梭同额度”的解释
+- `SOL / DOGE` 动态委托做多模板又做了一轮小定稿：
+  - `SOL` 做多从旧的 `7R 锁 1R` 收回到 `5R 锁 1R`
+  - `DOGE` 做多主候选从先前误推的 `S652` 更正回 `S653`
+  - `DOGE` 做多默认 `保本触发R` 也回到 `2R`
+- 多币种市场早报邮件开始带“观点 + 最近复盘”：
+  - 邮件正文和 HTML 现在除了强弱排序，还会给出每个币的明确观点
+  - 还会附上最近多封邮件的本地回放命中率、最高/最低命中币种、以及“若只做一笔”的提示
+  - 早报图表对 `1H / 4H / 1D` 会优先复用本地 K 线缓存，只对 `1W` 直接拉取
+- 新增一条“邮件观点有效性验证”链路：
+  - 新增 `okx_quant/analysis_email_validation.py`
+  - 支持把历史多币种早报邮件按 `4 / 12 / 24 / 72h` 窗口做回放验证
+  - 会落地 `JSON / CSV / Markdown` 三种验证结果，方便回看“哪些邮件观点真的有效”
 - 五币日线过滤操作包继续做成“配置即文档”：
   - `build_five_coin_daily_filter_operation_pack.py` 现在会根据真实 `StrategyConfig` 自动生成小时摘要、日线摘要和动态保护说明
   - 操作手册和 metadata 不再依赖手写静态文案，降低 bundle 参数变了但手册忘同步的风险
@@ -314,7 +336,9 @@ python main.py
 - [okx_quant/backtest_ui.py](/D:/qqokx/okx_quant/backtest_ui.py)：回测界面，当前已支持动态保护规则编辑、运行编号/归档编号区分、以及新的回测 K 线图交互
 - [okx_quant/backtest_audit.py](/D:/qqokx/okx_quant/backtest_audit.py)：回测审计导出，当前已改成流式 CSV 写出
 - [okx_quant/candle_store.py](/D:/qqokx/okx_quant/candle_store.py)：本地 K 线存储，当前已支持查询缓存根数与时间覆盖范围，以及过期未确认 K 线自动转确认
-- [okx_quant/strategy_symbol_defaults.py](/D:/qqokx/okx_quant/strategy_symbol_defaults.py)：分币种策略默认模板，当前已固化 `v0.6.25` 的多头/空头独立参数
+- [okx_quant/strategy_symbol_defaults.py](/D:/qqokx/okx_quant/strategy_symbol_defaults.py)：分币种策略默认模板，当前已固化 `v0.6.26` 的多头/空头独立参数
+- [okx_quant/multi_coin_market_digest.py](/D:/qqokx/okx_quant/multi_coin_market_digest.py)：多币种市场早报，当前已支持“明确观点 + 最近复盘命中率”邮件内容
+- [okx_quant/analysis_email_validation.py](/D:/qqokx/okx_quant/analysis_email_validation.py)：多币种早报邮件的历史观点回放验证与汇总导出
 - [reports/ema55_slope_short_research_report.html](/D:/qqokx/reports/ema55_slope_short_research_report.html)：EMA55 斜率做空研究报告（HTML）
 - [scripts/run_ema55_slope_short_research_report.py](/D:/qqokx/scripts/run_ema55_slope_short_research_report.py)：EMA55 斜率做空研究复跑脚本
 - [okx_quant/btc_market_analyzer.py](/D:/qqokx/okx_quant/btc_market_analyzer.py)：BTC 市场研究分析
@@ -359,6 +383,10 @@ python main.py
 - `scripts/run_eth_sol_doge_dynamic_long_template_refine.py`：ETH / SOL / DOGE 动态委托做多模板联合打磨
 - `scripts/run_sol_slope_short_refine.py`：SOL 斜率做空模板打磨
 - `scripts/run_doge_slope_short_refine.py`：DOGE 斜率做空模板打磨
+- `scripts/run_multi_coin_email_validation.py`：多币种市场早报邮件历史观点验证
+- `scripts/generate_doge_dynamic_long_s652_s655_review.py`：DOGE 动态做多 `S652-S655` 复核
+- `scripts/run_sol_dynamic_long_lock5_validation.py`：SOL 动态做多 `5R 锁 1R` 验证
+- `scripts/run_sol_dynamic_long_s656_followup.py`：SOL 动态做多 `S656` 跟进实验
 
 ## 现货套利快速上手
 
@@ -485,7 +513,7 @@ scripts\release_one_click.bat
   ：服务器升级操作清单，适合按实盘环境灰度启用私有 WS 加速
 - [软件开发指南.md](/D:/qqokx/软件开发指南.md)
   ：开发维护说明，已补充策略 schema / runtime registry、EMA55 斜率做空、回测与 UI 接入约定
-- [版本开发日志_v0.6.25.md](/D:/qqokx/版本开发日志_v0.6.25.md)
+- [版本开发日志_v0.6.26.md](/D:/qqokx/版本开发日志_v0.6.26.md)
   ：本轮版本开发日志，归档 EMA55 策略、研究报告、B 方案结构重构与验证结果
 - [reports/strategy_ui_schema_b_impl.md](/D:/qqokx/reports/strategy_ui_schema_b_impl.md)
   ：B 方案实施说明，记录 schema / registry 这一轮已经解掉的耦合和剩余尾项

@@ -181,6 +181,9 @@ def _live_dynamic_break_even_summary(config: StrategyConfig) -> str:
                 fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
             )
         )
+        if _live_dynamic_break_even_uses_trigger_r(config):
+            parts.insert(0, f"首档触发R={_live_ema55_slope_lock_profit_trigger_r(config)}")
+            parts.insert(1, f"nR保本={config.dynamic_two_r_break_even_label()}")
         parts.append(f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根")
         return " | ".join(parts)
     if _live_dynamic_break_even_uses_trigger_r(config):

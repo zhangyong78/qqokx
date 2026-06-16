@@ -1,6 +1,6 @@
 ﻿[project]
 name = "okx-quant-mvp"
-version = "0.6.25"
+version = "0.6.26"
 description = "Desktop MVP for OKX EMA signal trading with ATR-based TP/SL"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,3 +16,7 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["okx_quant*", "research*", "stats*", "export*", "utils*"]
 exclude = ["tests*", "tests_artifacts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["btc_ema_short_research", "tests_artifacts", ".git", ".venv", "venv"]

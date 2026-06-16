@@ -345,7 +345,7 @@ def build_ready_specs(environment: str) -> tuple[ReadyStrategySpec, ...]:
                         "trail_add_r": None,
                     },
                     {
-                        "trigger_r": 7,
+                        "trigger_r": 5,
                         "action": "lock_profit",
                         "lock_r": 1,
                         "trail_mode": "step",
@@ -361,7 +361,7 @@ def build_ready_specs(environment: str) -> tuple[ReadyStrategySpec, ...]:
                         "trail_add_r": 1,
                     },
                 ),
-                ema55_slope_lock_profit_trigger_r=7,
+                ema55_slope_lock_profit_trigger_r=5,
             ),
         ),
         ReadyStrategySpec(
@@ -394,7 +394,7 @@ def build_ready_specs(environment: str) -> tuple[ReadyStrategySpec, ...]:
             direction_label="long_only",
             run_mode_label="trade",
             family="dynamic_long",
-            hour_summary="EMA5 / EMA13，挂单参考 EMA5，ATR10 止损 1.5 倍",
+            hour_summary="EMA5 / EMA13，挂单参考 EMA5，ATR10 止损 1 倍",
             daily_summary="北京时间 8 点日线，收盘价在 MA13 上方，只过滤做多",
             notes="动态止盈，2R 保本，手续费偏移开启，每趋势最多 1 次开仓",
             config=build_dynamic_long_config(
@@ -408,12 +408,12 @@ def build_ready_specs(environment: str) -> tuple[ReadyStrategySpec, ...]:
                 daily_period=13,
                 environment=environment,
                 max_entries_per_trend=2,
-                dynamic_break_even_trigger_r=3,
+                dynamic_break_even_trigger_r=2,
                 dynamic_first_lock_r=1,
                 dynamic_trailing_step_r=1,
                 dynamic_protection_rules=(
                     {
-                        "trigger_r": 3,
+                        "trigger_r": 2,
                         "action": "break_even",
                         "lock_r": None,
                         "trail_mode": "none",
