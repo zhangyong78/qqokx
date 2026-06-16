@@ -2,7 +2,7 @@ from decimal import Decimal
 from unittest import TestCase
 
 from okx_quant.backtest import BacktestTrade
-from scripts.build_best_parameter_bundle import _combined_period_rows
+from scripts.build_best_parameter_bundle import _combined_period_report, _combined_period_rows
 
 
 def _trade(*, signal: str, entry_ts: int, exit_ts: int, pnl: str) -> BacktestTrade:
@@ -91,3 +91,18 @@ class BestParameterBundlePeriodTablesTest(TestCase):
                 ),
             ),
         )
+
+    def test_combined_period_report_uses_merged_equity_curve(self) -> None:
+        long_trades = (
+            _trade(signal="long", entry_ts=1735686000000, exit_ts=1735689600000, pnl="100"),
+            _trade(signal="long", entry_ts=1738364400000, exit_ts=1738368000000, pnl="-50"),
+        )
+        short_trades = (
+            _trade(signal="short", entry_ts=1735772400000, exit_ts=1735776000000, pnl="30"),
+        )
+
+        report = _combined_period_report(long_trades, short_trades)
+
+        self.assertEqual(report.total_trades, 3)
+        self.assertEqual(str(report.total_pnl), "80")
+        self.assertEqual(str(report.ending_equity), "10080")

@@ -31,11 +31,30 @@ _DYNAMIC_LONG_4COIN_DEFAULTS: dict[str, dict[str, object]] = {
         "dynamic_break_even_trigger_r": 1,
         "dynamic_fee_offset_enabled": True,
         "dynamic_protection_rules": (
-            '[{"trigger_r": 1, "action": "break_even", "lock_r": null, "trail_mode": "none", '
-            '"trail_every_r": null, "trail_add_r": null}, {"trigger_r": 4, "action": "lock_profit", '
-            '"lock_r": 1, "trail_mode": "step", "trail_every_r": 1, "trail_add_r": 1}, '
-            '{"trigger_r": 11, "action": "lock_profit", "lock_r": 10, "trail_mode": "step", '
-            '"trail_every_r": 1, "trail_add_r": 1}]'
+            {
+                "trigger_r": 1,
+                "action": "break_even",
+                "lock_r": None,
+                "trail_mode": "none",
+                "trail_every_r": None,
+                "trail_add_r": None,
+            },
+            {
+                "trigger_r": 4,
+                "action": "lock_profit",
+                "lock_r": 1,
+                "trail_mode": "step",
+                "trail_every_r": 1,
+                "trail_add_r": 1,
+            },
+            {
+                "trigger_r": 11,
+                "action": "lock_profit",
+                "lock_r": 10,
+                "trail_mode": "step",
+                "trail_every_r": 1,
+                "trail_add_r": 1,
+            },
         ),
         "ema55_slope_lock_profit_trigger_r": 4,
         "dynamic_first_lock_r": 1,

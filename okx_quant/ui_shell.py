@@ -1588,12 +1588,12 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
         max_entries_per_trend=_coerce_snapshot_int(
             payload.get("max_entries_per_trend"),
             int(_strategy_config_default("max_entries_per_trend")),
-            minimum=1,
+            minimum=0,
         ),
         entry_reference_ema_period=_coerce_snapshot_int(
             payload.get("entry_reference_ema_period"),
             int(_strategy_config_default("entry_reference_ema_period")),
-            minimum=1,
+            minimum=0,
         ),
         entry_reference_ema_type=_coerce_snapshot_text(
             payload.get("entry_reference_ema_type"),
@@ -2098,6 +2098,7 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
         self._item_vars: list[BooleanVar] = []
         self._item_api_vars: list[StringVar] = []
         self._item_api_combos: list[ttk.Combobox] = []
+        self._item_risk_vars: list[StringVar] = []
         self._item_chase_vars: list[BooleanVar] = []
         super().__init__(parent, "导入策略组合")
 
@@ -2164,9 +2165,14 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
         item_box.columnconfigure(0, weight=1)
         item_box.columnconfigure(1, weight=0)
         item_box.columnconfigure(2, weight=0)
+        item_box.columnconfigure(3, weight=0)
+        ttk.Label(item_box, text="Strategy").grid(row=0, column=0, sticky="w")
+        ttk.Label(item_box, text="API").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(item_box, text="Risk").grid(row=0, column=2, sticky="w", padx=(12, 0))
         self._item_vars = []
         self._item_api_vars = []
         self._item_api_combos = []
+        self._item_risk_vars = []
         self._item_chase_vars = []
         for index, item in enumerate(self._items, start=1):
             var = BooleanVar(value=True)
@@ -2176,12 +2182,14 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
                 default_api = self._initial_api
             api_var = StringVar(value=default_api)
             self._item_api_vars.append(api_var)
+            risk_var = StringVar(value=self._bundle_item_initial_risk_text(item))
+            self._item_risk_vars.append(risk_var)
             preview_text = self._bundle_item_preview_text(index, item)
             ttk.Checkbutton(
                 item_box,
                 text=preview_text,
                 variable=var,
-            ).grid(row=index - 1, column=0, sticky="w", pady=(0 if index == 1 else 6, 0))
+            ).grid(row=index, column=0, sticky="w", pady=(0 if index == 1 else 6, 0))
             api_combo = ttk.Combobox(
                 item_box,
                 state="disabled",
@@ -2189,8 +2197,15 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
                 values=self._available_profiles,
                 width=16,
             )
-            api_combo.grid(row=index - 1, column=1, sticky="e", padx=(12, 0), pady=(0 if index == 1 else 6, 0))
+            api_combo.grid(row=index, column=1, sticky="e", padx=(12, 0), pady=(0 if index == 1 else 6, 0))
             self._item_api_combos.append(api_combo)
+            ttk.Entry(item_box, textvariable=risk_var, width=10).grid(
+                row=index,
+                column=2,
+                sticky="e",
+                padx=(12, 0),
+                pady=(0 if index == 1 else 6, 0),
+            )
             chase_var = BooleanVar(value=bool(getattr(item.record.config, "startup_chase_current_signal", False)))
             self._item_chase_vars.append(chase_var)
             if supports_startup_chase_current_signal(item.record.strategy_id):
@@ -2198,7 +2213,7 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
                     item_box,
                     text="追当前信号",
                     variable=chase_var,
-                ).grid(row=index - 1, column=2, sticky="e", padx=(12, 0), pady=(0 if index == 1 else 6, 0))
+                ).grid(row=index, column=3, sticky="e", padx=(12, 0), pady=(0 if index == 1 else 6, 0))
         return combo
 
     @staticmethod
@@ -2210,6 +2225,13 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
             f"{index}. {strategy_name} | {record.symbol} | {record.direction_label or '-'} | "
             f"API={record.api_name or '-'} | {daily_summary}"
         )
+
+    @staticmethod
+    def _bundle_item_initial_risk_text(item: StrategyTemplateBundleItem) -> str:
+        risk_amount = getattr(item.record.config, "risk_amount", None)
+        if isinstance(risk_amount, Decimal) and risk_amount > 0:
+            return format_decimal(risk_amount)
+        return ""
 
     def _refresh_api_combo_state(self) -> None:
         if self._api_combo is None:
@@ -2235,6 +2257,20 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
                 if not selected_api:
                     messagebox.showerror("提示", f"请为第 {index + 1} 条策略选择 API。", parent=self)
                     return False
+        for index, variable in enumerate(self._item_vars):
+            if not variable.get():
+                continue
+            risk_text = self._item_risk_vars[index].get().strip()
+            if not risk_text:
+                continue
+            try:
+                risk_amount = Decimal(risk_text)
+            except InvalidOperation:
+                messagebox.showerror("提示", f"Strategy #{index + 1} has an invalid risk amount.", parent=self)
+                return False
+            if risk_amount <= 0:
+                messagebox.showerror("提示", f"Strategy #{index + 1} risk amount must be > 0.", parent=self)
+                return False
         if mode == "current" and not self._current_api_name:
             messagebox.showerror("提示", "当前没有选中 API，不能使用“全部改成当前 API”。", parent=self)
             return False
@@ -2252,6 +2288,11 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
             for index, variable in enumerate(self._item_vars)
             if variable.get() and supports_startup_chase_current_signal(self._items[index].record.strategy_id)
         )
+        per_item_risk_map = ";".join(
+            f"{index}={self._item_risk_vars[index].get().strip()}"
+            for index, variable in enumerate(self._item_vars)
+            if variable.get() and self._item_risk_vars[index].get().strip()
+        )
         self.result_payload = {
             "mode": mode,
             "api_name": api_name,
@@ -2259,6 +2300,7 @@ class StrategyBundleImportDialog(simpledialog.Dialog):
             "selected_indices": ",".join(selected_indices),
             "per_item_api_map": per_item_api_map,
             "per_item_chase_map": per_item_chase_map,
+            "per_item_risk_map": per_item_risk_map,
         }
         return True
 
@@ -13633,6 +13675,69 @@ def _build_strategy_start_confirmation_message(
             return "-（当前模式未使用）"
         return f"{custom_trigger_symbol or '-'}（本地止盈止损按这个标的触发）"
 
+    def _time_stop_break_even_text() -> str:
+        if config.time_stop_break_even_enabled:
+            return (
+                f"开启 / {config.resolved_time_stop_break_even_bars()}根"
+                "（持仓满指定K线且达到净保本时再抬止损）"
+            )
+        return f"关闭 / {config.resolved_time_stop_break_even_bars()}根（当前仅保存参数，不启用）"
+
+    def _trend_ema_exit_text() -> str:
+        trigger_r = config.resolved_trend_ema_close_exit_after_trigger_r()
+        if config.trend_ema_close_exit_after_trigger_r_enabled:
+            return f"开启（达到 {trigger_r}R 后，若收盘跌破趋势EMA则平仓）"
+        return f"关闭（当前触发R 设为 {trigger_r}）"
+
+    def _dynamic_protection_rule_lines(*, include_trend_exit: bool) -> list[str]:
+        if config.take_profit_mode != "dynamic":
+            return []
+        rules = config.resolved_dynamic_protection_rules()
+        if rules:
+            rule_summary = " / ".join(
+                describe_dynamic_protection_rules(
+                    rules,
+                    fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+                )
+            )
+            lines = [f"动态保护规则：{rule_summary}"]
+        else:
+            lines = [
+                _build_dynamic_protection_hint_text(
+                    take_profit_mode_label=take_profit_mode_label,
+                    dynamic_two_r_break_even_enabled=bool(config.dynamic_two_r_break_even),
+                    break_even_trigger_r_raw=str(config.dynamic_break_even_trigger_r),
+                    trailing_start_r_raw=str(config.ema55_slope_lock_profit_trigger_r),
+                    first_lock_r_raw=str(config.dynamic_first_lock_r),
+                    trailing_step_r_raw=str(config.dynamic_trailing_step_r),
+                    break_even_trigger_r_configurable=strategy_uses_parameter(
+                        config.strategy_id,
+                        "dynamic_break_even_trigger_r",
+                    ),
+                    dynamic_fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+                    time_stop_break_even_enabled=bool(config.time_stop_break_even_enabled),
+                    time_stop_break_even_bars_raw=str(config.time_stop_break_even_bars),
+                    trend_ema_close_exit_after_trigger_r_enabled=bool(
+                        config.trend_ema_close_exit_after_trigger_r_enabled
+                    ),
+                    trend_ema_close_exit_after_trigger_r_raw=str(
+                        config.trend_ema_close_exit_after_trigger_r
+                    ),
+                )
+            ]
+        lines.append(
+            "手续费偏移："
+            + (
+                "开启（保本/锁盈位额外预留双边手续费）"
+                if config.dynamic_fee_offset_enabled
+                else "关闭（保本/锁盈位不额外预留手续费）"
+            )
+        )
+        lines.append(f"时间保本：{_time_stop_break_even_text()}")
+        if include_trend_exit:
+            lines.append(f"趋势EMA离场：{_trend_ema_exit_text()}")
+        return lines
+
     stop_atr_text = format_decimal(config.atr_stop_multiplier)
     take_atr_text = format_decimal(config.atr_take_multiplier)
     take_profit_mode_text = (
@@ -13705,22 +13810,7 @@ def _build_strategy_start_confirmation_message(
                 ]
             )
         if config.take_profit_mode == "dynamic":
-            lines.extend(
-                [
-                    (
-                        f"首档触发R：{max(int(config.ema55_slope_lock_profit_trigger_r), 2)} / "
-                        f"nR保本：{config.dynamic_two_r_break_even_label()}（到 nR 后先移到 {max(int(config.ema55_slope_lock_profit_trigger_r), 2) - 1}R，"
-                        "若首档触发R=2则先移到保本）"
-                    )
-                    if strategy_uses_parameter(config.strategy_id, "ema55_slope_lock_profit_trigger_r")
-                    else f"2R保本开关：{config.dynamic_two_r_break_even_label()}（浮盈达到 2R 后止损抬到保本）",
-                    f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}（保本位预留双边手续费）",
-                    (
-                        f"时间保本：{config.time_stop_break_even_enabled_label()} / "
-                        f"{config.resolved_time_stop_break_even_bars()}根（持仓满指定K线且达到净保本时再抬止损）"
-                    ),
-                ]
-            )
+            lines.extend(_dynamic_protection_rule_lines(include_trend_exit=True))
     if profile.family == "ema55_slope_short":
         """
         lines.extend(
@@ -13765,40 +13855,7 @@ def _build_strategy_start_confirmation_message(
             ]
         )
         if config.take_profit_mode == "dynamic":
-            if profile.family == "ema55_slope_short":
-                trigger_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
-                lines.extend(
-                    [
-                        f"首档触发R：{trigger_r}（与 BTC 斜率做空一致，首档保护从这里开始）",
-                        (
-                            "nR保本：开启（仅当首档触发R=2时，2R 先抬到保本位）"
-                            if config.dynamic_two_r_break_even
-                            else "nR保本：关闭（首档触发后直接按已锁定R上移止损）"
-                        ),
-                        f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}（保本位预留双边手续费）",
-                        (
-                            f"时间保本：{config.time_stop_break_even_enabled_label()} / "
-                            f"{config.resolved_time_stop_break_even_bars()}根（持仓满指定K线且达到净保本时再抬止损）"
-                        ),
-                    ]
-                )
-            else:
-                lines.extend(
-                    [
-                        (
-                            f"首档触发R：{max(int(config.ema55_slope_lock_profit_trigger_r), 2)} / "
-                            f"nR保本：{config.dynamic_two_r_break_even_label()}（到 nR 后先移到 {max(int(config.ema55_slope_lock_profit_trigger_r), 2) - 1}R，"
-                            "若首档触发R=2则先移到保本）"
-                        )
-                        if strategy_uses_parameter(config.strategy_id, "ema55_slope_lock_profit_trigger_r")
-                        else f"2R保本开关：{config.dynamic_two_r_break_even_label()}（浮盈达到 2R 后止损抬到保本）",
-                        f"手续费偏移开关：{config.dynamic_fee_offset_enabled_label()}（保本位预留双边手续费）",
-                        (
-                            f"时间保本：{config.time_stop_break_even_enabled_label()} / "
-                            f"{config.resolved_time_stop_break_even_bars()}根（持仓满指定K线且达到净保本时再抬止损）"
-                        ),
-                    ]
-                )
+            lines.extend(_dynamic_protection_rule_lines(include_trend_exit=False))
     lines.extend(
         [
             f"ATR周期：{config.atr_period}（波动计算周期）",

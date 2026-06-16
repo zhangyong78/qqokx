@@ -52,6 +52,7 @@ from okx_quant.backtest_ui import (
     _backtest_bar_value_from_label,
     _BacktestSnapshotStore,
     _build_backtest_param_summary,
+    _dynamic_protection_metric_parts,
     _build_backtest_minimum_order_hint_text,
     _build_backtest_minimum_order_sample_summary,
     _build_backtest_symbol_options,
@@ -3516,9 +3517,79 @@ class BacktestTest(TestCase):
             )
         )
 
-        self.assertIn("首档触发R3", summary)
-        self.assertIn("nR保本开", summary)
-        self.assertIn("动态止盈", summary)
+        self.assertIn("首档触发R=3R", summary)
+        self.assertIn("2R -> 保本 + 双向手续费", summary)
+
+    def test_build_backtest_param_summary_for_dynamic_long_uses_rule_list(self) -> None:
+        summary = _build_backtest_param_summary(
+            StrategyConfig(
+                inst_id="ETH-USDT-SWAP",
+                bar="1H",
+                ema_period=21,
+                trend_ema_period=55,
+                big_ema_period=233,
+                atr_period=10,
+                atr_stop_multiplier=Decimal("1.5"),
+                atr_take_multiplier=Decimal("1.5"),
+                order_size=Decimal("0"),
+                trade_mode="cross",
+                signal_mode="long_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+                strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+                take_profit_mode="dynamic",
+                backtest_sizing_mode="fixed_size",
+                max_entries_per_trend=3,
+                entry_reference_ema_period=55,
+                dynamic_two_r_break_even=True,
+                dynamic_break_even_trigger_r=1,
+                dynamic_fee_offset_enabled=True,
+                dynamic_protection_rules=(
+                    {"trigger_r": 1, "action": "break_even", "lock_r": None, "trail_mode": "none", "trail_every_r": None, "trail_add_r": None},
+                    {"trigger_r": 4, "action": "lock_profit", "lock_r": 1, "trail_mode": "step", "trail_every_r": 1, "trail_add_r": 1},
+                    {"trigger_r": 11, "action": "lock_profit", "lock_r": 10, "trail_mode": "step", "trail_every_r": 1, "trail_add_r": 1},
+                ),
+            )
+        )
+
+        self.assertIn("1R -> 保本 + 双向手续费", summary)
+        self.assertIn("11R -> 锁 10R + 双向手续费；之后每 1R 再上移 1R", summary)
+        self.assertIn("每波3次", summary)
+
+    def test_dynamic_protection_metric_parts_joins_rule_list_for_chart_header(self) -> None:
+        parts = _dynamic_protection_metric_parts(
+            StrategyConfig(
+                inst_id="ETH-USDT-SWAP",
+                bar="1H",
+                ema_period=21,
+                trend_ema_period=55,
+                big_ema_period=233,
+                atr_period=10,
+                atr_stop_multiplier=Decimal("1.5"),
+                atr_take_multiplier=Decimal("1.5"),
+                order_size=Decimal("0"),
+                trade_mode="cross",
+                signal_mode="long_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+                strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+                take_profit_mode="dynamic",
+                dynamic_two_r_break_even=True,
+                dynamic_break_even_trigger_r=1,
+                dynamic_fee_offset_enabled=True,
+                dynamic_protection_rules=(
+                    {"trigger_r": 1, "action": "break_even", "lock_r": None, "trail_mode": "none", "trail_every_r": None, "trail_add_r": None},
+                    {"trigger_r": 4, "action": "lock_profit", "lock_r": 1, "trail_mode": "step", "trail_every_r": 1, "trail_add_r": 1},
+                    {"trigger_r": 11, "action": "lock_profit", "lock_r": 10, "trail_mode": "step", "trail_every_r": 1, "trail_add_r": 1},
+                ),
+            )
+        )
+
+        self.assertEqual(len(parts), 1)
+        self.assertIn("动态保护规则：1R -> 保本 + 双向手续费", parts[0])
+        self.assertIn("11R -> 锁 10R + 双向手续费；之后每 1R 再上移 1R", parts[0])
 
     def test_export_param_summary_for_slope_short_includes_dynamic_trigger_r(self) -> None:
         summary = backtest_export_module._build_param_summary(

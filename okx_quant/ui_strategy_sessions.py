@@ -258,7 +258,7 @@ class UiStrategySessionsMixin:
         if not source:
             return
         try:
-            payload = json.loads(Path(source).read_text(encoding="utf-8"))
+            payload = json.loads(Path(source).read_text(encoding="utf-8-sig"))
             record = _strategy_template_record_from_payload(payload)
             if record is None:
                 raise ValueError("文件缺少有效的策略配置快照。")
@@ -418,7 +418,7 @@ class UiStrategySessionsMixin:
             return
         source_path = Path(source)
         try:
-            payload = json.loads(source_path.read_text(encoding="utf-8"))
+            payload = json.loads(source_path.read_text(encoding="utf-8-sig"))
         except Exception as exc:
             messagebox.showerror("导入失败", f"组合包解析失败：{exc}")
             return
@@ -492,6 +492,23 @@ class UiStrategySessionsMixin:
                 if not sep or not left.strip().isdigit():
                     continue
                 per_item_chase_map[int(left.strip())] = _coerce_snapshot_bool(right.strip(), False)
+        per_item_risk_map_raw = str(selection.get("per_item_risk_map", "") or "").strip()
+        per_item_risk_map: dict[int, Decimal] = {}
+        if per_item_risk_map_raw:
+            for chunk in per_item_risk_map_raw.split(";"):
+                left, sep, right = chunk.partition("=")
+                if not sep or not left.strip().isdigit():
+                    continue
+                risk_text = right.strip()
+                if not risk_text:
+                    continue
+                try:
+                    risk_amount = Decimal(risk_text)
+                except InvalidOperation:
+                    continue
+                if risk_amount <= 0:
+                    continue
+                per_item_risk_map[int(left.strip())] = risk_amount
         if not self._confirm_bundle_import_api_access(
             bundle,
             selection=selection,
@@ -514,6 +531,32 @@ class UiStrategySessionsMixin:
                 {"started": 0, "applied": 0, "skipped": 0, "failed": 0},
             )
             stats[outcome] = stats.get(outcome, 0) + 1
+
+        def _apply_bundle_import_overrides(item: StrategyTemplateBundleItem, *, item_index: int):
+            resolved_config = item.record.config
+            selected_risk_amount = per_item_risk_map.get(item_index)
+            if selected_risk_amount is not None:
+                resolved_config = replace(
+                    resolved_config,
+                    risk_amount=selected_risk_amount,
+                    order_size=Decimal("0"),
+                )
+            has_risk_amount = resolved_config.risk_amount is not None and resolved_config.risk_amount > 0
+            has_fixed_size = resolved_config.order_size is not None and resolved_config.order_size > 0
+            if not has_risk_amount and not has_fixed_size and item.unit_quota > 0:
+                resolved_config = replace(
+                    resolved_config,
+                    risk_amount=None,
+                    order_size=item.unit_quota,
+                )
+            return replace(
+                resolved_config,
+                startup_chase_current_signal=(
+                    per_item_chase_map.get(item_index, resolved_config.startup_chase_current_signal)
+                    if supports_startup_chase_current_signal(item.record.strategy_id)
+                    else False
+                ),
+            )
 
         auto_start_enabled = _coerce_snapshot_bool(selection.get("auto_start"), False)
         if auto_start_enabled:
@@ -539,23 +582,7 @@ class UiStrategySessionsMixin:
                     skipped_summaries.append(f"{item.record.strategy_name or item.record.strategy_id} {item.record.symbol}：目标 API 不可用")
                     _record_api_outcome(selected_api_name or item.record.api_name, "skipped")
                     continue
-                resolved_config = item.record.config
-                has_risk_amount = resolved_config.risk_amount is not None and resolved_config.risk_amount > 0
-                has_fixed_size = resolved_config.order_size is not None and resolved_config.order_size > 0
-                if not has_risk_amount and not has_fixed_size and item.unit_quota > 0:
-                    resolved_config = replace(
-                        resolved_config,
-                        risk_amount=None,
-                        order_size=item.unit_quota,
-                    )
-                resolved_config = replace(
-                    resolved_config,
-                    startup_chase_current_signal=(
-                        per_item_chase_map.get(original_index, resolved_config.startup_chase_current_signal)
-                        if supports_startup_chase_current_signal(item.record.strategy_id)
-                        else False
-                    ),
-                )
+                resolved_config = _apply_bundle_import_overrides(item, item_index=original_index)
                 resolved_record = replace(
                     item.record,
                     api_name=resolved_api_name or item.record.api_name,
@@ -614,23 +641,7 @@ class UiStrategySessionsMixin:
                     skipped_summaries.append(f"{first_item.record.strategy_name or first_item.record.strategy_id} {first_item.record.symbol}：目标 API 不可用")
                     _record_api_outcome(selected_api_name or first_item.record.api_name, "skipped")
                 else:
-                    resolved_config = first_item.record.config
-                    has_risk_amount = resolved_config.risk_amount is not None and resolved_config.risk_amount > 0
-                    has_fixed_size = resolved_config.order_size is not None and resolved_config.order_size > 0
-                    if not has_risk_amount and not has_fixed_size and first_item.unit_quota > 0:
-                        resolved_config = replace(
-                            resolved_config,
-                            risk_amount=None,
-                            order_size=first_item.unit_quota,
-                        )
-                    resolved_config = replace(
-                        resolved_config,
-                        startup_chase_current_signal=(
-                            per_item_chase_map.get(first_index, resolved_config.startup_chase_current_signal)
-                            if supports_startup_chase_current_signal(first_item.record.strategy_id)
-                            else False
-                        ),
-                    )
+                    resolved_config = _apply_bundle_import_overrides(first_item, item_index=first_index)
                     resolved_record = replace(
                         first_item.record,
                         api_name=resolved_api_name or first_item.record.api_name,
@@ -660,6 +671,13 @@ class UiStrategySessionsMixin:
             f"跳过：{len(skipped_summaries)} 条",
             f"失败：{len(start_failed_summaries)} 条",
         ]
+        risk_override_count = sum(
+            1
+            for index, item in enumerate(bundle.items)
+            if item in selected_items and index in per_item_risk_map
+        )
+        if risk_override_count > 0:
+            summary_lines.append(f"风险金覆盖：{risk_override_count} 条")
         if imported_labels:
             summary_lines.append(f"已处理：{', '.join(imported_labels[:5])}{' ...' if len(imported_labels) > 5 else ''}")
         if api_notes:
@@ -683,7 +701,9 @@ class UiStrategySessionsMixin:
                 summary_lines.append(f"- {api_name}：{' / '.join(parts) if parts else '0'}")
         quota_mapped_count = sum(
             1
-            for item in selected_items
+            for index, item in enumerate(bundle.items)
+            if item in selected_items
+            and index not in per_item_risk_map
             if (item.record.config.risk_amount is None or item.record.config.risk_amount <= 0)
             and (item.record.config.order_size is None or item.record.config.order_size <= 0)
             and item.unit_quota > 0
@@ -717,6 +737,8 @@ class UiStrategySessionsMixin:
             f"处理模式：{'自动启动并进入运行中列表' if auto_start_enabled else '仅回填首条到启动区，不进入运行中列表'}",
             f"选择条数：{len(selected_items)} / {len(bundle.items)}",
         ]
+        if risk_override_count > 0:
+            detail_lines.append(f"风险金覆盖：{risk_override_count} 条")
         if imported_labels:
             detail_lines.append("")
             detail_lines.append("已处理条目：")
@@ -6458,8 +6480,57 @@ class UiStrategySessionsMixin:
         tp_sl_mode_label = _launcher_tp_sl_mode_label(self._snapshot_text(snapshot, "tp_sl_mode"))
         max_entries_per_trend = self._snapshot_int(snapshot, "max_entries_per_trend")
         startup_window_seconds = self._snapshot_int(snapshot, "startup_chase_window_seconds") or 0
+        dynamic_take_profit_enabled = strategy_uses_parameter(strategy_id, "take_profit_mode") and self._snapshot_text(
+            snapshot,
+            "take_profit_mode",
+            "dynamic",
+        ) == "dynamic"
 
         lines: list[str] = []
+
+        def _time_stop_break_even_detail_text() -> str:
+            bars = max(self._snapshot_int(snapshot, "time_stop_break_even_bars", 10), 0)
+            if snapshot.get("time_stop_break_even_enabled", False):
+                return f"开启，持仓满 {bars} 根K线且已达到净保本后，再把止损抬到保本位"
+            return f"关闭（当前设定 {bars} 根，仅保存参数，不会启用）"
+
+        def _trend_ema_exit_detail_text() -> str:
+            trigger_r = max(self._snapshot_int(snapshot, "trend_ema_close_exit_after_trigger_r", 5), 1)
+            if snapshot.get("trend_ema_close_exit_after_trigger_r_enabled", False):
+                return f"开启，达到 {trigger_r}R 后，若收盘跌破趋势EMA则平仓"
+            return f"关闭（当前设定 {trigger_r}R，仅保存参数，不会启用）"
+
+        def _dynamic_protection_detail_rows() -> list[str]:
+            rules = normalize_dynamic_protection_rules(snapshot.get("dynamic_protection_rules"))
+            if rules:
+                rule_text = " / ".join(
+                    describe_dynamic_protection_rules(
+                        rules,
+                        fee_offset_enabled=bool(snapshot.get("dynamic_fee_offset_enabled", True)),
+                    )
+                )
+            elif "ema55_slope_lock_profit_trigger_r" in snapshot:
+                rule_text = (
+                    f"{max(int(snapshot.get('dynamic_break_even_trigger_r', 2) or 2), 1)}R -> 保本"
+                    + (" + 双向手续费" if bool(snapshot.get("dynamic_fee_offset_enabled", True)) else "")
+                    + " / "
+                    + f"{max(int(snapshot.get('ema55_slope_lock_profit_trigger_r', 2) or 2), 2)}R -> "
+                    + f"锁 {max(int(snapshot.get('dynamic_first_lock_r', 0) or 0), 0)}R"
+                    + (" + 双向手续费" if bool(snapshot.get("dynamic_fee_offset_enabled", True)) else "")
+                    + f"；之后每 {max(int(snapshot.get('dynamic_trailing_step_r', 1) or 1), 1)}R 再上移 "
+                    + f"{max(int(snapshot.get('dynamic_trailing_step_r', 1) or 1), 1)}R"
+                )
+            else:
+                rule_text = (
+                    f"2R保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}"
+                )
+            rows = [
+                f"动态保护规则：{rule_text}",
+                f"时间保本：{_time_stop_break_even_detail_text()}",
+            ]
+            if strategy_uses_parameter(strategy_id, "trend_ema_close_exit_after_trigger_r_enabled"):
+                rows.append(f"趋势EMA离场：{_trend_ema_exit_detail_text()}")
+            return rows
 
         def add_section(title: str, rows: list[str]) -> None:
             visible_rows = [row for row in rows if row]
@@ -6594,40 +6665,9 @@ class UiStrategySessionsMixin:
             parameter_rows.append(
                 f"追当前信号：{self._bool_label(snapshot.get('startup_chase_current_signal', False))}"
             )
-        if strategy_uses_parameter(strategy_id, "take_profit_mode") and self._snapshot_text(
-            snapshot,
-            "take_profit_mode",
-            "dynamic",
-        ) == "dynamic":
-            rules = normalize_dynamic_protection_rules(snapshot.get("dynamic_protection_rules"))
-            parameter_rows.extend(
-                [
-                    (
-                        "动态保护规则："
-                        + " / ".join(
-                            describe_dynamic_protection_rules(
-                                rules,
-                                fee_offset_enabled=bool(snapshot.get("dynamic_fee_offset_enabled", True)),
-                            )
-                        )
-                    )
-                    if rules
-                    else (
-                        f"保本触发R：{max(int(snapshot.get('dynamic_break_even_trigger_r', 2) or 2), 1)} / "
-                        f"移动止盈触发R：{max(int(snapshot.get('ema55_slope_lock_profit_trigger_r', 2) or 2), 2)} / "
-                        f"移动步长R：{max(int(snapshot.get('dynamic_trailing_step_r', 1) or 1), 1)} / "
-                        f"首档触发R：{max(int(snapshot.get('ema55_slope_lock_profit_trigger_r', 2) or 2), 2)} / "
-                        f"nR保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}"
-                    )
-                    if "ema55_slope_lock_profit_trigger_r" in snapshot
-                    else f"2R保本开关：{self._bool_label(snapshot.get('dynamic_two_r_break_even', True))}",
-                    f"手续费偏移开关：{self._bool_label(snapshot.get('dynamic_fee_offset_enabled', True))}",
-                    "时间保本："
-                    f"{self._bool_label(snapshot.get('time_stop_break_even_enabled', False))} / "
-                    f"{self._snapshot_text(snapshot, 'time_stop_break_even_bars', '10')}根",
-                ]
-            )
-        if strategy_uses_parameter(strategy_id, "trend_ema_close_exit_after_trigger_r_enabled"):
+        if dynamic_take_profit_enabled:
+            parameter_rows.extend(_dynamic_protection_detail_rows())
+        if strategy_uses_parameter(strategy_id, "trend_ema_close_exit_after_trigger_r_enabled") and not dynamic_take_profit_enabled:
             parameter_rows.append(
                 "nR后跌破趋势EMA平仓："
                 + self._bool_label(snapshot.get("trend_ema_close_exit_after_trigger_r_enabled", False))

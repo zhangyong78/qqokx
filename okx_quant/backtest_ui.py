@@ -887,20 +887,12 @@ def _dynamic_protection_summary_parts(config: StrategyConfig) -> tuple[str, ...]
     if bool(config.trend_ema_close_exit_after_trigger_r_enabled):
         extra_parts.append(f"{config.resolved_trend_ema_close_exit_after_trigger_r()}R破趋势EMA平仓")
     if rules:
-        compact_parts: list[str] = []
-        for rule in rules:
-            trigger_r = rule.resolved_trigger_r()
-            if rule.resolved_action() == "break_even":
-                compact_parts.append(f"{trigger_r}R保本")
-                continue
-            lock_r = rule.resolved_lock_r()
-            if rule.trailing_enabled():
-                compact_parts.append(
-                    f"{trigger_r}R锁{lock_r}R后每{rule.resolved_trail_every_r()}R移{rule.resolved_trail_add_r()}R"
-                )
-            else:
-                compact_parts.append(f"{trigger_r}R锁{lock_r}R")
-        return tuple(compact_parts + extra_parts)
+        return tuple(
+            describe_dynamic_protection_rules(
+                rules,
+                fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+            )
+        ) + tuple(extra_parts)
     if _uses_dynamic_break_even_trigger_r(config):
         first_lock_r = max(int(config.dynamic_first_lock_r), 0)
         trailing_start_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
@@ -917,25 +909,23 @@ def _dynamic_protection_summary_parts(config: StrategyConfig) -> tuple[str, ...]
 def _dynamic_protection_metric_parts(config: StrategyConfig) -> tuple[str, ...]:
     rules = config.resolved_dynamic_protection_rules()
     if rules:
-        return tuple(
-            "动态保护规则：" + part if index == 0 else part
-            for index, part in enumerate(
+        parts = [
+            "动态保护规则："
+            + " / ".join(
                 describe_dynamic_protection_rules(
                     rules,
                     fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
                 )
             )
-        )
+        ]
+        if bool(config.trend_ema_close_exit_after_trigger_r_enabled):
+            parts.append(
+                f"趋势EMA离场：达到 {config.resolved_trend_ema_close_exit_after_trigger_r()}R 后，若收盘跌破趋势EMA则平仓"
+            )
+        return tuple(parts)
     if _uses_dynamic_break_even_trigger_r(config):
-        return (
-            f"保本触发R：{max(int(config.dynamic_break_even_trigger_r), 1)}",
-            f"移动止盈触发R：{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
-            f"首档锁盈R：{max(int(config.dynamic_first_lock_r), 0) if int(config.dynamic_first_lock_r) > 0 else '自动'}",
-            f"移动步长R：{max(int(config.dynamic_trailing_step_r), 1)}",
-            f"首档触发R：{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
-            f"nR保本：{config.dynamic_two_r_break_even_label()}",
-        )
-    return (f"2R保本：{config.dynamic_two_r_break_even_label()}",)
+        return ("动态保护规则：" + " / ".join(_dynamic_protection_summary_parts(config)),)
+    return (f"动态保护规则：2R保本：{config.dynamic_two_r_break_even_label()}",)
 
 
 def _build_backtest_param_summary(
@@ -7954,7 +7944,6 @@ class BacktestWindow:
             metrics_parts.append(config.daily_filter_summary())
         if config.strategy_id != STRATEGY_BTC_EMA55_SLOPE_SHORT_ID and config.take_profit_mode == "dynamic":
             metrics_parts.extend(_dynamic_protection_metric_parts(config))
-            metrics_parts.append(f"手续费偏移：{config.dynamic_fee_offset_enabled_label()}")
             metrics_parts.append(
                 f"时间保本：{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
             )

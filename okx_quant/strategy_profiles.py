@@ -224,5 +224,5 @@ def write_strategy_bundle(bundle: StrategyBundle, path: Path) -> Path:
 
 
 def read_strategy_bundle(path: Path) -> StrategyBundle:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
     return StrategyBundle.from_payload(payload)

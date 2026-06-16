@@ -123,3 +123,39 @@ class StrategyProfilesTest(TestCase):
         self.assertEqual(restored_profile.daily_filter.mode, "close_vs_ma")
         self.assertEqual(restored_profile.daily_filter.scope, "long_only")
         self.assertEqual(restored_profile.config_snapshot["daily_filter_period"], 5)
+
+    def test_read_strategy_bundle_accepts_utf8_bom(self) -> None:
+        payload = {
+            "bundle_version": STRATEGY_PROFILE_SCHEMA_VERSION,
+            "bundle_name": "UTF8 BOM Bundle",
+            "profiles": [
+                {
+                    "profile_id": "doge-long",
+                    "profile_name": "DOGE Long",
+                    "strategy_id": "ema_dynamic_order_long",
+                    "symbol": "DOGE-USDT-SWAP",
+                    "api_name": "moni",
+                    "direction_label": "只做多",
+                    "run_mode_label": "交易并下单",
+                    "enabled": True,
+                    "daily_filter": {},
+                    "config_snapshot": {
+                        "inst_id": "DOGE-USDT-SWAP",
+                        "bar": "1H",
+                        "strategy_id": "ema_dynamic_order_long",
+                    },
+                    "tags": [],
+                    "notes": "",
+                    "created_at": "",
+                    "source_report": "",
+                }
+            ],
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "bundle.json"
+            path.write_text(__import__("json").dumps(payload, ensure_ascii=False), encoding="utf-8-sig")
+            restored = read_strategy_bundle(path)
+
+        self.assertEqual(restored.bundle_name, "UTF8 BOM Bundle")
+        self.assertEqual(restored.profiles[0].symbol, "DOGE-USDT-SWAP")

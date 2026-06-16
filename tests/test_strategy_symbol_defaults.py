@@ -21,6 +21,35 @@ class StrategySymbolDefaultsTest(TestCase):
         self.assertEqual(defaults["ema_period"], 21)
         self.assertEqual(defaults["trend_ema_type"], "ema")
         self.assertEqual(defaults["trend_ema_period"], 55)
+        self.assertEqual(
+            defaults["dynamic_protection_rules"],
+            (
+                {
+                    "trigger_r": 1,
+                    "action": "break_even",
+                    "lock_r": None,
+                    "trail_mode": "none",
+                    "trail_every_r": None,
+                    "trail_add_r": None,
+                },
+                {
+                    "trigger_r": 4,
+                    "action": "lock_profit",
+                    "lock_r": 1,
+                    "trail_mode": "step",
+                    "trail_every_r": 1,
+                    "trail_add_r": 1,
+                },
+                {
+                    "trigger_r": 11,
+                    "action": "lock_profit",
+                    "lock_r": 10,
+                    "trail_mode": "step",
+                    "trail_every_r": 1,
+                    "trail_add_r": 1,
+                },
+            ),
+        )
         self.assertNotIn("startup_chase_window_seconds", defaults)
 
     def test_dynamic_long_eth_defaults_follow_final_profile(self) -> None:

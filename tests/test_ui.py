@@ -846,6 +846,73 @@ HTTP 502: <!DOCTYPE html>
         self.assertIn("启动追单窗口：关闭（启动不追老信号，只等新波）", message)
         self.assertIn("追当前信号：开启（导入启动时若当前信号仍有效，本次直接接管）", message)
 
+    def test_build_strategy_start_confirmation_message_shows_dynamic_rule_list(self) -> None:
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("1.5"),
+            atr_take_multiplier=Decimal("1.5"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="live",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            risk_amount=Decimal("10"),
+            tp_sl_mode="exchange",
+            entry_side_mode="follow_signal",
+            run_mode="trade",
+            take_profit_mode="dynamic",
+            max_entries_per_trend=3,
+            entry_reference_ema_period=55,
+            dynamic_two_r_break_even=True,
+            dynamic_break_even_trigger_r=1,
+            dynamic_fee_offset_enabled=True,
+            dynamic_protection_rules=(
+                {"trigger_r": 1, "action": "break_even", "lock_r": None, "trail_mode": "none", "trail_every_r": None, "trail_add_r": None},
+                {"trigger_r": 4, "action": "lock_profit", "lock_r": 1, "trail_mode": "step", "trail_every_r": 1, "trail_add_r": 1},
+                {"trigger_r": 11, "action": "lock_profit", "lock_r": 10, "trail_mode": "step", "trail_every_r": 1, "trail_add_r": 1},
+            ),
+            startup_chase_current_signal=False,
+            startup_chase_window_seconds=0,
+            time_stop_break_even_enabled=False,
+            time_stop_break_even_bars=0,
+            trend_ema_close_exit_after_trigger_r_enabled=False,
+            trend_ema_close_exit_after_trigger_r=5,
+        )
+
+        message = _build_strategy_start_confirmation_message(
+            strategy_name="EMA 动态委托做多",
+            rule_description="当快线高于慢线时，等待回踩后挂单。",
+            strategy_symbol="ETH-USDT-SWAP",
+            config=config,
+            run_mode_label="交易并下单",
+            environment_label="实盘 live",
+            trade_mode_label="全仓 cross",
+            position_mode_label="净持仓 net",
+            signal_mode_label="只做多",
+            entry_side_mode_label="跟随信号",
+            tp_sl_mode_label="OKX 托管（仅同标的永续）",
+            trigger_type_label="标记价格 mark",
+            take_profit_mode_label="动态止盈",
+            risk_value="10",
+            fixed_size="-",
+            custom_trigger_symbol="",
+            instrument=None,
+            api_label="live-api-1",
+        )
+
+        self.assertIn("挂单参考线：EMA55（挂单价格锚点）", message)
+        self.assertIn("每波最多开仓次数：3（同一波最多允许开仓的次数）", message)
+        self.assertIn("动态保护规则：1R -> 保本 + 双向手续费", message)
+        self.assertIn("4R -> 锁 1R + 双向手续费；之后每 1R 再上移 1R", message)
+        self.assertIn("11R -> 锁 10R + 双向手续费；之后每 1R 再上移 1R", message)
+        self.assertIn("趋势EMA离场：关闭（当前触发R 设为 5）", message)
+
     def test_build_launch_parameter_hint_text_for_dynamic_take_profit(self) -> None:
         hint = _build_launch_parameter_hint_text(
             stop_atr_raw="2",
@@ -1858,6 +1925,63 @@ class StrategyTemplateImportExportTest(TestCase):
         app._apply_credentials_profile.assert_not_called()
         app._ensure_importable_strategy_symbols.assert_called_once_with("SOL-USDT-SWAP", "")
 
+    def test_strategy_template_record_preserves_zero_entry_reference_and_unlimited_entries(self) -> None:
+        payload = {
+            "strategy_id": STRATEGY_DYNAMIC_LONG_ID,
+            "strategy_name": "EMA 动态委托做多",
+            "api_name": "moni",
+            "direction_label": "只做多",
+            "run_mode_label": "交易并下单",
+            "symbol": "DOGE-USDT-SWAP",
+            "config_snapshot": {
+                "inst_id": "DOGE-USDT-SWAP",
+                "bar": "1H",
+                "ema_type": "ema",
+                "ema_period": 5,
+                "atr_period": 10,
+                "atr_stop_multiplier": "1",
+                "atr_take_multiplier": "1",
+                "order_size": "0",
+                "trade_mode": "cross",
+                "signal_mode": "long_only",
+                "position_mode": "net",
+                "environment": "demo",
+                "tp_sl_trigger_type": "mark",
+                "trend_ema_type": "ema",
+                "trend_ema_period": 13,
+                "big_ema_period": 233,
+                "strategy_id": STRATEGY_DYNAMIC_LONG_ID,
+                "poll_seconds": 10,
+                "risk_amount": "10",
+                "trade_inst_id": "DOGE-USDT-SWAP",
+                "tp_sl_mode": "exchange",
+                "entry_side_mode": "follow_signal",
+                "run_mode": "trade",
+                "take_profit_mode": "dynamic",
+                "max_entries_per_trend": 0,
+                "entry_reference_ema_period": 0,
+                "dynamic_two_r_break_even": True,
+                "dynamic_break_even_trigger_r": 3,
+                "dynamic_fee_offset_enabled": True,
+                "dynamic_protection_rules": [
+                    {"trigger_r": 3, "action": "break_even"},
+                    {"trigger_r": 6, "action": "lock_profit", "lock_r": 1, "trail_mode": "step", "trail_every_r": 1, "trail_add_r": 1},
+                    {"trigger_r": 11, "action": "lock_profit", "lock_r": 10, "trail_mode": "step", "trail_every_r": 1, "trail_add_r": 1},
+                ],
+                "startup_chase_current_signal": False,
+                "startup_chase_window_seconds": 0,
+                "time_stop_break_even_enabled": False,
+                "time_stop_break_even_bars": 0,
+            },
+        }
+
+        record = _strategy_template_record_from_payload(payload)
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.config.entry_reference_ema_period, 0)
+        self.assertEqual(record.config.max_entries_per_trend, 0)
+
 
     def test_confirm_bundle_import_api_access_skips_prompt_for_unlocked_current_protected_api(self) -> None:
         item = SimpleNamespace(
@@ -2000,6 +2124,234 @@ class StrategyTemplateImportExportTest(TestCase):
 
         app._confirm_bundle_import_api_access.assert_called_once()
         app._apply_strategy_template_record.assert_not_called()
+
+    def test_import_strategy_template_bundle_overrides_first_item_risk_amount_before_apply(self) -> None:
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            trend_ema_period=55,
+            big_ema_period=233,
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10.0,
+            risk_amount=Decimal("100"),
+            trade_inst_id="ETH-USDT-SWAP",
+            tp_sl_mode="local_trade",
+            entry_side_mode="follow_signal",
+            run_mode="trade",
+            take_profit_mode="dynamic",
+            max_entries_per_trend=1,
+            entry_reference_ema_period=55,
+            dynamic_two_r_break_even=True,
+            dynamic_fee_offset_enabled=True,
+            startup_chase_current_signal=False,
+            startup_chase_window_seconds=0,
+            time_stop_break_even_enabled=False,
+            time_stop_break_even_bars=0,
+        )
+        payload = {
+            "strategy_id": STRATEGY_DYNAMIC_LONG_ID,
+            "strategy_name": "Demo Long",
+            "api_name": "moni",
+            "direction_label": "只做多",
+            "run_mode_label": "交易并下单",
+            "symbol": "ETH-USDT-SWAP",
+            "config_snapshot": {
+                "inst_id": "ETH-USDT-SWAP",
+                "bar": "1H",
+                "ema_period": 21,
+                "atr_period": 10,
+                "atr_stop_multiplier": "2",
+                "atr_take_multiplier": "4",
+                "order_size": "1",
+                "trade_mode": "cross",
+                "signal_mode": "long_only",
+                "position_mode": "net",
+                "environment": "demo",
+                "tp_sl_trigger_type": "mark",
+                "trend_ema_period": 55,
+                "big_ema_period": 233,
+                "strategy_id": STRATEGY_DYNAMIC_LONG_ID,
+                "poll_seconds": 10,
+                "risk_amount": "100",
+                "trade_inst_id": "ETH-USDT-SWAP",
+                "tp_sl_mode": "local_trade",
+                "entry_side_mode": "follow_signal",
+                "run_mode": "trade",
+                "take_profit_mode": "dynamic",
+                "max_entries_per_trend": 1,
+                "entry_reference_ema_period": 55,
+                "dynamic_two_r_break_even": True,
+                "dynamic_fee_offset_enabled": True,
+                "startup_chase_current_signal": False,
+                "startup_chase_window_seconds": 0,
+                "time_stop_break_even_enabled": False,
+                "time_stop_break_even_bars": 0,
+            },
+        }
+        record = _strategy_template_record_from_payload(payload)
+        assert record is not None
+        item = SimpleNamespace(record=record, unit_quota=Decimal("0.1"))
+        bundle = SimpleNamespace(package_name="测试组合包", items=(item,), auto_start_on_import=False)
+        dialog = SimpleNamespace(
+            result_payload={
+                "mode": "selected",
+                "api_name": "moni",
+                "auto_start": "0",
+                "selected_indices": "0",
+                "per_item_risk_map": "0=250",
+            }
+        )
+        app = SimpleNamespace(
+            root=object(),
+            _credential_profiles={"moni": {"api_key": "k", "secret_key": "s", "passphrase": "p"}},
+            _current_credential_profile=lambda: "moni",
+            _confirm_bundle_import_api_access=MagicMock(return_value=True),
+            _resolve_bundle_import_api=MagicMock(return_value=("moni", "")),
+            _apply_strategy_template_record=MagicMock(return_value=(SimpleNamespace(name="Demo Long"), "moni", "")),
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            bundle_path = Path(temp_dir) / "bundle.json"
+            bundle_path.write_text("{}", encoding="utf-8")
+            import_globals = QuantApp.import_strategy_template_bundle.__globals__
+            patched_globals = {
+                "filedialog": SimpleNamespace(askopenfilename=lambda **_: str(bundle_path)),
+                "_strategy_template_bundle_from_payload": lambda payload, **_: bundle,
+                "StrategyBundleImportDialog": lambda *args, **kwargs: dialog,
+                "_show_strategy_bundle_import_result_dialog": lambda *args, **kwargs: None,
+            }
+            with patch.dict(import_globals, patched_globals):
+                QuantApp.import_strategy_template_bundle(app)
+
+        applied_record = app._apply_strategy_template_record.call_args.args[0]
+        self.assertEqual(applied_record.config.risk_amount, Decimal("250"))
+        self.assertEqual(applied_record.config.order_size, Decimal("0"))
+
+    def test_import_strategy_template_bundle_overrides_auto_started_item_risk_amount(self) -> None:
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            trend_ema_period=55,
+            big_ema_period=233,
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10.0,
+            risk_amount=Decimal("100"),
+            trade_inst_id="ETH-USDT-SWAP",
+            tp_sl_mode="local_trade",
+            entry_side_mode="follow_signal",
+            run_mode="trade",
+            take_profit_mode="dynamic",
+            max_entries_per_trend=1,
+            entry_reference_ema_period=55,
+            dynamic_two_r_break_even=True,
+            dynamic_fee_offset_enabled=True,
+            startup_chase_current_signal=False,
+            startup_chase_window_seconds=0,
+            time_stop_break_even_enabled=False,
+            time_stop_break_even_bars=0,
+        )
+        payload = {
+            "strategy_id": STRATEGY_DYNAMIC_LONG_ID,
+            "strategy_name": "Demo Long",
+            "api_name": "moni",
+            "direction_label": "只做多",
+            "run_mode_label": "交易并下单",
+            "symbol": "ETH-USDT-SWAP",
+            "config_snapshot": {
+                "inst_id": "ETH-USDT-SWAP",
+                "bar": "1H",
+                "ema_period": 21,
+                "atr_period": 10,
+                "atr_stop_multiplier": "2",
+                "atr_take_multiplier": "4",
+                "order_size": "1",
+                "trade_mode": "cross",
+                "signal_mode": "long_only",
+                "position_mode": "net",
+                "environment": "demo",
+                "tp_sl_trigger_type": "mark",
+                "trend_ema_period": 55,
+                "big_ema_period": 233,
+                "strategy_id": STRATEGY_DYNAMIC_LONG_ID,
+                "poll_seconds": 10,
+                "risk_amount": "100",
+                "trade_inst_id": "ETH-USDT-SWAP",
+                "tp_sl_mode": "local_trade",
+                "entry_side_mode": "follow_signal",
+                "run_mode": "trade",
+                "take_profit_mode": "dynamic",
+                "max_entries_per_trend": 1,
+                "entry_reference_ema_period": 55,
+                "dynamic_two_r_break_even": True,
+                "dynamic_fee_offset_enabled": True,
+                "startup_chase_current_signal": False,
+                "startup_chase_window_seconds": 0,
+                "time_stop_break_even_enabled": False,
+                "time_stop_break_even_bars": 0,
+            },
+        }
+        record = _strategy_template_record_from_payload(payload)
+        assert record is not None
+        item = SimpleNamespace(record=record, unit_quota=Decimal("0.1"))
+        bundle = SimpleNamespace(package_name="测试组合包", items=(item,), auto_start_on_import=True)
+        dialog = SimpleNamespace(
+            result_payload={
+                "mode": "selected",
+                "api_name": "moni",
+                "auto_start": "1",
+                "selected_indices": "0",
+                "per_item_risk_map": "0=320",
+            }
+        )
+        app = SimpleNamespace(
+            root=object(),
+            _credential_profiles={"moni": {"api_key": "k", "secret_key": "s", "passphrase": "p"}},
+            _current_credential_profile=lambda: "moni",
+            _confirm_bundle_import_api_access=MagicMock(return_value=True),
+            _resolve_bundle_import_api=MagicMock(return_value=("moni", "")),
+            _resolve_strategy_template_definition=MagicMock(return_value=SimpleNamespace(name="Demo Long", default_signal_label="只做多")),
+            _credentials_for_profile_or_none=MagicMock(return_value=object()),
+            _build_notifier=MagicMock(return_value=object()),
+            _start_strategy_session=MagicMock(return_value="S01"),
+            _focus_first_running_session=MagicMock(return_value=False),
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            bundle_path = Path(temp_dir) / "bundle.json"
+            bundle_path.write_text("{}", encoding="utf-8")
+            import_globals = QuantApp.import_strategy_template_bundle.__globals__
+            patched_globals = {
+                "filedialog": SimpleNamespace(askopenfilename=lambda **_: str(bundle_path)),
+                "_strategy_template_bundle_from_payload": lambda payload, **_: bundle,
+                "StrategyBundleImportDialog": lambda *args, **kwargs: dialog,
+                "_show_strategy_bundle_import_result_dialog": lambda *args, **kwargs: None,
+            }
+            with patch.dict(import_globals, patched_globals):
+                QuantApp.import_strategy_template_bundle(app)
+
+        started_config = app._start_strategy_session.call_args.kwargs["config"]
+        self.assertEqual(started_config.risk_amount, Decimal("320"))
+        self.assertEqual(started_config.order_size, Decimal("0"))
 
 
 class StrategyDuplicateLaunchGuardTest(TestCase):
@@ -5658,6 +6010,111 @@ class SelectedSessionDetailRefreshTest(TestCase):
         self.assertIn("止盈方式：动态止盈", text)
         self.assertIn("启动追单窗口：关闭（启动不追老信号）", text)
         self.assertIn("实时浮盈亏：+1.25（参考持仓 16:34:17）", text)
+
+    def test_build_strategy_detail_text_shows_dynamic_rule_list_for_eth_long(self) -> None:
+        snapshot = {
+            "environment": "demo",
+            "trade_mode": "cross",
+            "position_mode": "net",
+            "signal_mode": "long_only",
+            "bar": "1H",
+            "ema_type": "ema",
+            "ema_period": 21,
+            "trend_ema_type": "ema",
+            "trend_ema_period": 55,
+            "entry_reference_ema_type": "ema",
+            "entry_reference_ema_period": 55,
+            "take_profit_mode": "dynamic",
+            "max_entries_per_trend": 3,
+            "startup_chase_window_seconds": 0,
+            "dynamic_two_r_break_even": True,
+            "dynamic_fee_offset_enabled": True,
+            "time_stop_break_even_enabled": False,
+            "time_stop_break_even_bars": 10,
+            "trend_ema_close_exit_after_trigger_r_enabled": True,
+            "trend_ema_close_exit_after_trigger_r": 11,
+            "dynamic_protection_rules": [
+                {"trigger_r": 1, "action": "break_even"},
+                {
+                    "trigger_r": 4,
+                    "action": "lock_profit",
+                    "lock_r": 1,
+                    "trail_mode": "step",
+                    "trail_every_r": 1,
+                    "trail_add_r": 1,
+                },
+                {
+                    "trigger_r": 11,
+                    "action": "lock_profit",
+                    "lock_r": 10,
+                    "trail_mode": "step",
+                    "trail_every_r": 1,
+                    "trail_add_r": 1,
+                },
+            ],
+            "atr_period": 10,
+            "atr_stop_multiplier": "2",
+            "atr_take_multiplier": "4",
+            "risk_amount": "20",
+            "order_size": "1",
+            "entry_side_mode": "follow_signal",
+            "tp_sl_mode": "exchange",
+            "tp_sl_trigger_type": "mark",
+            "local_tp_sl_inst_id": "",
+            "poll_seconds": "8",
+        }
+        app = SimpleNamespace(
+            _snapshot_optional_text=lambda payload, key: QuantApp._snapshot_optional_text(payload, key),
+            _snapshot_text=lambda payload, key, default="-": QuantApp._snapshot_text(payload, key, default),
+            _snapshot_int=lambda payload, key, default=0: QuantApp._snapshot_int(payload, key, default),
+            _format_strategy_symbol_display=lambda signal_symbol, trade_symbol: QuantApp._format_strategy_symbol_display(
+                signal_symbol,
+                trade_symbol,
+            ),
+            _entry_reference_ema_caption=lambda strategy_id: QuantApp._entry_reference_ema_caption(strategy_id),
+            _strategy_uses_big_ema=lambda _strategy_id: False,
+            _bool_label=lambda value: QuantApp._bool_label(value),
+            _max_entries_detail_label=lambda value: QuantApp._max_entries_detail_label(value),
+            _startup_chase_window_detail_label=lambda value: QuantApp._startup_chase_window_detail_label(value),
+        )
+
+        text = QuantApp._build_strategy_detail_text(
+            app,
+            session_id="S620",
+            api_name="QQzhangyong",
+            status="运行中",
+            runtime_status="等待信号",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            strategy_name="EMA 动态委托做多",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            started_at=datetime(2026, 6, 16, 9, 0, 0),
+            stopped_at=None,
+            ended_reason="",
+            config_snapshot=snapshot,
+            log_file_path="",
+            last_message="等待信号",
+            trade_count=0,
+            win_count=0,
+            gross_pnl_total=Decimal("0"),
+            fee_total=Decimal("0"),
+            funding_total=Decimal("0"),
+            net_pnl_total=Decimal("0"),
+            last_close_reason="",
+            live_pnl=None,
+            live_pnl_refreshed_at=None,
+            duplicate_warning="",
+            email_status_label="开",
+            global_email_enabled=True,
+        )
+
+        self.assertIn("挂单参考线：EMA55", text)
+        self.assertIn("每波最多开仓次数：3次", text)
+        self.assertIn("动态保护规则：1R -> 保本 + 双向手续费", text)
+        self.assertIn("11R -> 锁 10R + 双向手续费；之后每 1R 再上移 1R", text)
+        self.assertIn("时间保本：关闭（当前设定 10 根，仅保存参数，不会启用）", text)
+        self.assertIn("趋势EMA离场：开启，达到 11R 后，若收盘跌破趋势EMA则平仓", text)
 
 
 class SessionLivePnlSummaryTest(TestCase):
