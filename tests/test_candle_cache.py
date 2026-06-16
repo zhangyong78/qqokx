@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -90,13 +91,32 @@ class CandleCacheTest(TestCase):
 
         self.assertEqual([candle.ts for candle in loaded], [1, 2, 5, 6])
 
+    def test_load_promotes_stale_unconfirmed_candle(self) -> None:
+        stale = Candle(
+            ts=1,
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100"),
+            volume=Decimal("1"),
+            confirmed=False,
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            save_candle_cache("BTC-USDT-SWAP", "1H", [stale], base_dir=temp_dir)
+            loaded = load_candle_cache("BTC-USDT-SWAP", "1H", base_dir=temp_dir)
+
+        self.assertEqual(len(loaded), 1)
+        self.assertTrue(loaded[0].confirmed)
+
     def test_legacy_json_cache_migrates_to_sqlite(self) -> None:
+        current_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         payload = {
             "inst_id": "BTC-USDT-SWAP",
             "bar": "15m",
             "candles": [
                 {
-                    "ts": 1,
+                    "ts": current_ms,
                     "open": "100.123456789",
                     "high": "101.123456789",
                     "low": "99.123456789",

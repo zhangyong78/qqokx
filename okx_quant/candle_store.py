@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterator
 
 from okx_quant.app_paths import cache_dir_path
+from okx_quant.candle_continuity import bar_step_ms
 from okx_quant.models import Candle
 
 
@@ -236,6 +237,38 @@ def get_candle_time_bounds(
     if row is None or row[0] is None or row[1] is None:
         return None
     return int(row[0]), int(row[1])
+
+
+def promote_stale_unconfirmed_candles(
+    inst_id: str,
+    bar: str,
+    *,
+    base_dir: Path | str | None = None,
+    now_ms: int | None = None,
+) -> int:
+    """
+    Promote candles that are still marked unconfirmed even though their full bar has
+    already elapsed.
+
+    This protects local-only backtests from treating historical bars as missing just
+    because an earlier sync left them with confirmed=0.
+    """
+    normalized_inst_id = _normalize_inst_id(inst_id)
+    normalized_bar = _normalize_bar(bar)
+    cutoff_ms = int(
+        (datetime.now(timezone.utc).timestamp() * 1000) if now_ms is None else now_ms
+    ) - bar_step_ms(normalized_bar)
+    with _connection(base_dir) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE candles
+            SET confirmed = 1
+            WHERE inst_id = ? AND bar = ? AND confirmed = 0 AND ts <= ?
+            """,
+            (normalized_inst_id, normalized_bar, cutoff_ms),
+        )
+        conn.commit()
+    return max(int(cursor.rowcount or 0), 0)
 
 
 def _migration_is_current(

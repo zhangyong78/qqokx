@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.23`
+当前版本：`v0.6.24`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -29,7 +29,7 @@
 
 ## 近期更新
 
-`v0.6.23` 这一轮版本内容比较集中，重点新增和调整如下：
+`v0.6.24` 这一轮版本内容比较集中，重点新增和调整如下：
 
 - 新增 `EMA55 斜率做空` 策略：
   - 规则：`EMA55` 单根斜率比例小于等于阈值时开空，斜率重新转正时平仓
@@ -82,10 +82,19 @@
   - 规则支持 `break_even` / `lock_profit` 两类动作
   - 规则支持 `step` 递进，可配置“每隔几 R 再加几 R”
   - 旧的四段参数仍然保留，并会自动转换成兼容规则
+- 动态委托做多补了一条新的趋势离场规则：
+  - 新增 `trend_ema_close_exit_after_trigger_r_enabled` 和 `trend_ema_close_exit_after_trigger_r`
+  - 做多仓位在至少达到指定 `nR` 后，如果后续收盘价跌回趋势 `EMA` 下方，可按收盘价直接离场
+  - 这条规则已贯通到回测结果、参数摘要、回测说明与导出文案
 - 动态止盈逻辑更细：
   - 非 BTC 专用斜率做空策略现在支持“先保本，再进入移动止盈”
   - `首档锁盈R = 0` 时，按“移动止盈触发R - 移动步长R”自动推导
   - `移动步长R` 不再固定为 `1R`，可按策略独立设置
+- 分币种默认模板这一轮继续重定稿：
+  - 动态委托做多默认模板改成更明确的 `BTC / ETH / SOL / DOGE` 四币独立参数集
+  - BTC 做多默认每趋势开仓次数从 `3` 回调到 `1`，并补了第 `11R` 锁 `10R` 的尾段规则
+  - ETH / SOL / DOGE 做多的 `ATR`、挂单参考线、`保本触发R`、`max_entries_per_trend` 和规则列表都已按各自最终模板拆开
+  - ETH / SOL / DOGE 斜率做空默认线型也分别固化为 `MA61`、`MA20`、`MA21`，不再统一沿用旧版 `EMA55`
 - `BTC EMA55 斜率做空` 入场条件更严格：
   - 连续负斜率开空前，窗口前一根斜率不能已经处于负值延续
   - 更偏向只在新的转弱段开始时开空，减少连续阴跌中的重复追空
@@ -109,6 +118,9 @@
 - 回测前置校验更完整：
   - 纯本地模式下会检查主回测 K 线、多周期过滤 K 线、日线过滤 K 线、高周期方向过滤 K 线是否缺失或有缺口
   - 本地缓存不足时直接提示首段缺口或覆盖范围，不再静默回退联网
+- 本地 K 线缓存补了一层“历史未确认自动转确认”：
+  - 读取缓存前会把已经完整走完周期、但仍标记为 `confirmed=0` 的旧 K 线自动转正
+  - 纯本地回测不再因为早期同步留下的“过期未确认 K 线”而误判样本不足
 - 合约元数据缓存正式落地：
   - 新增 `instrument_metadata_cache.json`
   - `get_instrument` / `get_instruments` 支持优先读取本地缓存
@@ -154,6 +166,9 @@
   - 新增字段级说明
   - 新增动态保护规则口径解释
   - 组合包文档更适合作为长期参数手册回看
+- 五币日线过滤操作包继续做成“配置即文档”：
+  - `build_five_coin_daily_filter_operation_pack.py` 现在会根据真实 `StrategyConfig` 自动生成小时摘要、日线摘要和动态保护说明
+  - 操作手册和 metadata 不再依赖手写静态文案，降低 bundle 参数变了但手册忘同步的风险
 - 实盘轮询链路补了三项轻量扩容优化：
   - 默认轮询间隔从 `3s` 调整为 `10s`
   - 新增 `market_data_hub`，同进程内相同 `instId + bar` 的 K 线共享读取
@@ -298,7 +313,8 @@ python main.py
 - [okx_quant/backtest.py](/D:/qqokx/okx_quant/backtest.py)：回测核心逻辑，当前已统一支持 `nR 保本`、纯本地回测、四段动态保护，以及可配置的 `dynamic_protection_rules`
 - [okx_quant/backtest_ui.py](/D:/qqokx/okx_quant/backtest_ui.py)：回测界面，当前已支持动态保护规则编辑、运行编号/归档编号区分、以及新的回测 K 线图交互
 - [okx_quant/backtest_audit.py](/D:/qqokx/okx_quant/backtest_audit.py)：回测审计导出，当前已改成流式 CSV 写出
-- [okx_quant/candle_store.py](/D:/qqokx/okx_quant/candle_store.py)：本地 K 线存储，当前已支持查询缓存根数与时间覆盖范围
+- [okx_quant/candle_store.py](/D:/qqokx/okx_quant/candle_store.py)：本地 K 线存储，当前已支持查询缓存根数与时间覆盖范围，以及过期未确认 K 线自动转确认
+- [okx_quant/strategy_symbol_defaults.py](/D:/qqokx/okx_quant/strategy_symbol_defaults.py)：分币种策略默认模板，当前已固化 `v0.6.24` 的多头/空头独立参数
 - [reports/ema55_slope_short_research_report.html](/D:/qqokx/reports/ema55_slope_short_research_report.html)：EMA55 斜率做空研究报告（HTML）
 - [scripts/run_ema55_slope_short_research_report.py](/D:/qqokx/scripts/run_ema55_slope_short_research_report.py)：EMA55 斜率做空研究复跑脚本
 - [okx_quant/btc_market_analyzer.py](/D:/qqokx/okx_quant/btc_market_analyzer.py)：BTC 市场研究分析
@@ -339,6 +355,10 @@ python main.py
 - `scripts/run_btc_long_three_config_full_compare.py`：BTC 多头 3 套配置全量对比
 - `scripts/run_r001_r003_local_full_compare_report.py`：`R001-R003` 本地全量重跑对比报告
 - `scripts/run_btc_dynamic_long_ma50_vs_ema55_matrix.py`：BTC 动态委托做多 `MA50 vs EMA55` 参数矩阵对比
+- `scripts/run_eth_dynamic_long_template_refine_ema55.py`：ETH 动态委托做多模板打磨
+- `scripts/run_eth_sol_doge_dynamic_long_template_refine.py`：ETH / SOL / DOGE 动态委托做多模板联合打磨
+- `scripts/run_sol_slope_short_refine.py`：SOL 斜率做空模板打磨
+- `scripts/run_doge_slope_short_refine.py`：DOGE 斜率做空模板打磨
 
 ## 现货套利快速上手
 
@@ -465,7 +485,7 @@ scripts\release_one_click.bat
   ：服务器升级操作清单，适合按实盘环境灰度启用私有 WS 加速
 - [软件开发指南.md](/D:/qqokx/软件开发指南.md)
   ：开发维护说明，已补充策略 schema / runtime registry、EMA55 斜率做空、回测与 UI 接入约定
-- [版本开发日志_v0.6.23.md](/D:/qqokx/版本开发日志_v0.6.23.md)
+- [版本开发日志_v0.6.24.md](/D:/qqokx/版本开发日志_v0.6.24.md)
   ：本轮版本开发日志，归档 EMA55 策略、研究报告、B 方案结构重构与验证结果
 - [reports/strategy_ui_schema_b_impl.md](/D:/qqokx/reports/strategy_ui_schema_b_impl.md)
   ：B 方案实施说明，记录 schema / registry 这一轮已经解掉的耦合和剩余尾项

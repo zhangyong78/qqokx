@@ -63,20 +63,110 @@ class StrategyUiSchemaTest(TestCase):
             ),
             14,
         )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_EMA55_SLOPE_SHORT_ID,
+                "dynamic_break_even_trigger_r",
+                "launcher",
+            ),
+            9,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_EMA55_SLOPE_SHORT_ID,
+                "ema55_slope_lock_profit_trigger_r",
+                "launcher",
+            ),
+            9,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_EMA55_SLOPE_SHORT_ID,
+                "time_stop_break_even_bars",
+                "launcher",
+            ),
+            0,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_EMA55_SLOPE_SHORT_ID,
+                "dynamic_trailing_step_r",
+                "launcher",
+            ),
+            1,
+        )
         launcher_defaults = strategy_ui_extra_defaults(STRATEGY_EMA55_SLOPE_SHORT_ID, "launcher")
         self.assertEqual(launcher_defaults["risk_amount"], "10")
         self.assertEqual(launcher_defaults["poll_seconds"], "10")
         self.assertEqual(launcher_defaults["tp_sl_mode"], "local_trade")
         self.assertEqual(launcher_defaults["entry_side_mode"], "follow_signal")
         backtest_defaults = strategy_ui_extra_defaults(STRATEGY_EMA55_SLOPE_SHORT_ID, "backtest")
-        self.assertEqual(backtest_defaults["risk_amount"], "10")
+        self.assertEqual(backtest_defaults["risk_amount"], "100")
+
+    def test_dynamic_long_schema_defaults_follow_btc_template(self) -> None:
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_DYNAMIC_LONG_ID,
+                "entry_reference_ema_period",
+                "launcher",
+            ),
+            55,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_DYNAMIC_LONG_ID,
+                "atr_take_multiplier",
+                "launcher",
+            ),
+            "2",
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_DYNAMIC_LONG_ID,
+                "dynamic_break_even_trigger_r",
+                "launcher",
+            ),
+            1,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_DYNAMIC_LONG_ID,
+                "ema55_slope_lock_profit_trigger_r",
+                "launcher",
+            ),
+            4,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_DYNAMIC_LONG_ID,
+                "dynamic_first_lock_r",
+                "launcher",
+            ),
+            1,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_DYNAMIC_LONG_ID,
+                "time_stop_break_even_bars",
+                "launcher",
+            ),
+            0,
+        )
+        protection_rules = strategy_parameter_default_for_scope(
+            STRATEGY_DYNAMIC_LONG_ID,
+            "dynamic_protection_rules",
+            "launcher",
+        )
+        self.assertEqual(protection_rules[0]["trigger_r"], 1)
+        self.assertEqual(protection_rules[1]["trigger_r"], 4)
+        self.assertEqual(protection_rules[2]["lock_r"], 10)
 
     def test_body_retest_strategy_schema_uses_10u_for_launcher_and_backtest(self) -> None:
         launcher_defaults = strategy_ui_extra_defaults(STRATEGY_BODY_RETEST_SHORT_ID, "launcher")
         backtest_defaults = strategy_ui_extra_defaults(STRATEGY_BODY_RETEST_SHORT_ID, "backtest")
 
         self.assertEqual(launcher_defaults["risk_amount"], "10")
-        self.assertEqual(backtest_defaults["risk_amount"], "10")
+        self.assertEqual(backtest_defaults["risk_amount"], "100")
 
     def test_schema_flags_capture_strategy_runtime_constraints(self) -> None:
         self.assertTrue(strategy_supports_dynamic_take_profit(STRATEGY_EMA55_SLOPE_SHORT_ID))
@@ -104,7 +194,7 @@ class StrategyUiSchemaTest(TestCase):
         self.assertEqual(launcher_defaults["risk_amount"], "10")
         self.assertEqual(
             strategy_parameter_default_for_scope(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "atr_period", "launcher"),
-            10,
+            14,
         )
         visibility = build_strategy_widget_visibility(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "launcher")
         self.assertFalse(visibility.show_dynamic_take_profit)

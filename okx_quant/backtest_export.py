@@ -5,7 +5,13 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
-from okx_quant.backtest import BACKTEST_RESERVED_CANDLES, BacktestResult, format_backtest_report, format_trade_exit_reason
+from okx_quant.backtest import (
+    BACKTEST_RESERVED_CANDLES,
+    BacktestResult,
+    format_backtest_report,
+    format_trade_exit_reason,
+    summarize_trade_exit_reasons,
+)
 from okx_quant.backtest_audit import (
     batch_backtest_artifact_paths,
     export_batch_backtest_manifest,
@@ -67,31 +73,39 @@ def _config_reference_label(config: StrategyConfig) -> str:
 def _uses_dynamic_break_even_trigger_r(config: StrategyConfig) -> bool:
     return config.take_profit_mode == "dynamic" and strategy_uses_parameter(
         config.strategy_id,
-        "ema55_slope_lock_profit_trigger_r",
+        "dynamic_break_even_trigger_r",
     )
 
 
 def _dynamic_protection_summary_parts(config: StrategyConfig) -> tuple[str, ...]:
     rules = config.resolved_dynamic_protection_rules()
-    if rules:
-        return describe_dynamic_protection_rules(
-            rules,
-            fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
-        )
     parts: list[str] = []
-    if _uses_dynamic_break_even_trigger_r(config):
+    if rules:
+        for rule in rules:
+            trigger_r = rule.resolved_trigger_r()
+            if rule.resolved_action() == "break_even":
+                parts.append(f"{trigger_r}R保本")
+                continue
+            lock_r = rule.resolved_lock_r()
+            if rule.trailing_enabled():
+                parts.append(f"{trigger_r}R锁{lock_r}R后每{rule.resolved_trail_every_r()}R移{rule.resolved_trail_add_r()}R")
+            else:
+                parts.append(f"{trigger_r}R锁{lock_r}R")
+    elif _uses_dynamic_break_even_trigger_r(config):
+        first_lock_r = max(int(config.dynamic_first_lock_r), 0)
+        trailing_start_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
+        trailing_step_r = max(int(config.dynamic_trailing_step_r), 1)
+        effective_first_lock_r = first_lock_r if first_lock_r > 0 else max(trailing_start_r - trailing_step_r, 0)
         parts.extend(
             (
-                f"保本触发R{max(int(config.dynamic_break_even_trigger_r), 1)}",
-                f"移动止盈触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
-                f"首档锁盈R{max(int(config.dynamic_first_lock_r), 0) if int(config.dynamic_first_lock_r) > 0 else '自动'}",
-                f"移动步长R{max(int(config.dynamic_trailing_step_r), 1)}",
-                f"首档触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
-                f"nR保本{config.dynamic_two_r_break_even_label()}",
+                f"{max(int(config.dynamic_break_even_trigger_r), 1)}R保本",
+                f"{trailing_start_r}R锁{effective_first_lock_r}R后每{trailing_step_r}R移{trailing_step_r}R",
             )
         )
     else:
         parts.append(f"2R保本{config.dynamic_two_r_break_even_label()}")
+    if bool(config.trend_ema_close_exit_after_trigger_r_enabled):
+        parts.append(f"{config.resolved_trend_ema_close_exit_after_trigger_r()}R破趋势EMA平仓")
     return tuple(parts)
 
 
@@ -707,57 +721,39 @@ def _build_matrix_cell_text(result: BacktestResult) -> str:
 
 
 def _build_exit_reason_summary_text(result: BacktestResult) -> str:
-    counts: dict[str, int] = {}
-    for trade in result.trades:
-        label = format_trade_exit_reason(trade.exit_reason)
-        counts[label] = counts.get(label, 0) + 1
-    if not counts:
+    ordered = summarize_trade_exit_reasons(result.trades)
+    if not ordered:
         return ""
-    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
     return " | ".join(f"{label} {count}" for label, count in ordered)
 
 
 def _build_param_summary(config: StrategyConfig, result: BacktestResult) -> str:
-    if config.backtest_sizing_mode == "risk_percent":
-        sizing_text = f"风险百分比{format_decimal(config.backtest_risk_percent or Decimal('0'))}%"
-    elif config.backtest_sizing_mode == "fixed_size":
-        sizing_text = f"固定数量{format_decimal(config.order_size)}"
-    else:
-        sizing_text = f"固定风险金{format_decimal(config.risk_amount or Decimal('0'))}"
     parts = [
         f"EMA{config.ema_period}",
         f"趋势线{_config_trend_label(config)}",
         f"ATR{config.atr_period}",
         f"SL x{format_decimal(config.atr_stop_multiplier)}",
-        f"TP x{format_decimal(config.atr_take_multiplier)}",
     ]
     if config.backtest_profile_name:
         parts.insert(0, f"候选{config.backtest_profile_name}")
     if is_dynamic_strategy_id(config.strategy_id):
         parts.insert(2, f"挂单参考线{_config_reference_label(config)}")
-        parts.append(f"止盈方式{'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}")
         if config.take_profit_mode == "dynamic":
+            parts.append("动态止盈")
             parts.extend(_dynamic_protection_summary_parts(config))
-            parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
+            if config.time_stop_break_even_enabled and config.resolved_time_stop_break_even_bars() > 0:
+                parts.append(f"时间保本{config.resolved_time_stop_break_even_bars()}根")
+        else:
+            parts.append(f"TP x{format_decimal(config.atr_take_multiplier)}")
         parts.append(f"每波最多开仓次数{_format_max_entries_label(config.max_entries_per_trend)}")
     if config.strategy_id == STRATEGY_EMA55_SLOPE_SHORT_ID:
-        parts.append(f"止盈方式{'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}")
         if config.take_profit_mode == "dynamic":
+            parts.append("动态止盈")
             parts.extend(_dynamic_protection_summary_parts(config))
-            parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
-    parts.extend(
-        [
-            f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)}",
-            f"仓位{sizing_text}",
-            f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)}",
-            "复利" if config.backtest_compounding else "不复利",
-            f"M费{_format_percent(result.maker_fee_rate)}",
-            f"T费{_format_percent(result.taker_fee_rate)}",
-            f"开滑{_format_percent(config.resolved_backtest_entry_slippage_rate())}",
-            f"平滑{_format_percent(config.resolved_backtest_exit_slippage_rate())}",
-            f"资金费{_format_percent(config.backtest_funding_rate)}",
-        ]
-    )
+            if config.time_stop_break_even_enabled and config.resolved_time_stop_break_even_bars() > 0:
+                parts.append(f"时间保本{config.resolved_time_stop_break_even_bars()}根")
+        else:
+            parts.append(f"TP x{format_decimal(config.atr_take_multiplier)}")
     return " / ".join(parts)
 
 

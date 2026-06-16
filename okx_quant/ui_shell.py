@@ -225,8 +225,10 @@ from okx_quant.upgrade_launch import (
 )
 from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_DEFINITIONS,
     STRATEGY_DYNAMIC_ID,
+    STRATEGY_EMA55_SLOPE_SHORT_ID,
     StrategyDefinition,
     get_strategy_definition,
     resolve_dynamic_signal_mode,
@@ -298,6 +300,12 @@ def _bind_mixin_to_shell_globals(mixin_cls):
             rebound.__dict__.update(getattr(value, "__dict__", {}))
             setattr(mixin_cls, name, rebound)
     return mixin_cls
+
+
+def _strategy_fast_line_caption(strategy_id: str) -> str:
+    if strategy_id in {STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, STRATEGY_EMA55_SLOPE_SHORT_ID}:
+        return "信号均线（斜率开平仓）"
+    return "快线均线"
 
 
 def _build_app_restart_command(
@@ -1679,6 +1687,15 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             payload.get("time_stop_break_even_bars"),
             int(_strategy_config_default("time_stop_break_even_bars")),
             minimum=0,
+        ),
+        trend_ema_close_exit_after_trigger_r_enabled=_coerce_snapshot_bool(
+            payload.get("trend_ema_close_exit_after_trigger_r_enabled"),
+            bool(_strategy_config_default("trend_ema_close_exit_after_trigger_r_enabled")),
+        ),
+        trend_ema_close_exit_after_trigger_r=_coerce_snapshot_int(
+            payload.get("trend_ema_close_exit_after_trigger_r"),
+            int(_strategy_config_default("trend_ema_close_exit_after_trigger_r")),
+            minimum=1,
         ),
         trader_virtual_stop_loss=_coerce_snapshot_bool(
             payload.get("trader_virtual_stop_loss"),
@@ -3409,6 +3426,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.dynamic_fee_offset_enabled = BooleanVar(value=True)
         self.time_stop_break_even_enabled = BooleanVar(value=False)
         self.time_stop_break_even_bars = StringVar(value="10")
+        self.trend_ema_close_exit_after_trigger_r_enabled = BooleanVar(value=False)
+        self.trend_ema_close_exit_after_trigger_r = StringVar(value="5")
         self.run_mode_label = StringVar(value="交易并下单")
         self.trade_mode_label = StringVar(value="全仓 cross")
         self.position_mode_label = StringVar(value="净持仓 net")
@@ -3482,7 +3501,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.dynamic_fee_offset_enabled.trace_add("write", self._update_dynamic_protection_hint)
         self.time_stop_break_even_enabled.trace_add("write", self._update_dynamic_protection_hint)
         self.time_stop_break_even_bars.trace_add("write", self._update_dynamic_protection_hint)
+        self.trend_ema_close_exit_after_trigger_r_enabled.trace_add("write", self._update_dynamic_protection_hint)
+        self.trend_ema_close_exit_after_trigger_r.trace_add("write", self._update_dynamic_protection_hint)
         self.time_stop_break_even_enabled.trace_add("write", lambda *_: self._sync_dynamic_take_profit_controls())
+        self.trend_ema_close_exit_after_trigger_r_enabled.trace_add(
+            "write",
+            lambda *_: self._sync_dynamic_take_profit_controls(),
+        )
         self.run_mode_label.trace_add("write", lambda *_: self._sync_entry_side_mode_controls())
         self.run_mode_label.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.tp_sl_mode_label.trace_add("write", lambda *_: self._sync_entry_side_mode_controls())
@@ -3756,6 +3781,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
             "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
             "time_stop_break_even_bars": self.time_stop_break_even_bars,
+            "trend_ema_close_exit_after_trigger_r_enabled": self.trend_ema_close_exit_after_trigger_r_enabled,
+            "trend_ema_close_exit_after_trigger_r": self.trend_ema_close_exit_after_trigger_r,
             "startup_chase_window_seconds": self.startup_chase_window_seconds,
         }
 
@@ -3852,7 +3879,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         label_map = {
             "bar": (self._bar_label, "K线周期"),
             "signal_mode": (self._signal_label, "信号方向"),
-            "ema_period": (self._ema_label, "快线均线"),
+            "ema_period": (self._ema_label, _strategy_fast_line_caption(strategy_id)),
             "trend_ema_period": (self._trend_ema_label, "趋势均线"),
             "big_ema_period": (self._big_ema_label, "大周期均线"),
         }
@@ -4253,7 +4280,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._ema55_slope_exit_conditions_caption.grid(row=row, column=0, sticky="w", pady=_lp)
         self._ema55_slope_exit_enabled_check = ttk.Checkbutton(
             launch_form,
-            text="均线斜率重新转正时，按收盘价平仓",
+            text="信号均线斜率重新转正时，按收盘价平仓",
             variable=self.ema55_slope_exit_enabled,
         )
         self._ema55_slope_exit_enabled_check.grid(row=row, column=1, columnspan=3, sticky="w", pady=_lp)
@@ -4360,6 +4387,30 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._time_stop_break_even_bars_label.grid(row=row, column=2, sticky="e", pady=_lp_tight)
         self._time_stop_break_even_bars_entry = ttk.Entry(launch_form, textvariable=self.time_stop_break_even_bars)
         self._time_stop_break_even_bars_entry.grid(row=row, column=3, sticky="ew", pady=_lp_tight)
+
+        row += 1
+        self._trend_ema_close_exit_after_trigger_r_enabled_check = ttk.Checkbutton(
+            launch_form,
+            text="达到 nR 后，收盘跌破趋势 EMA 平仓",
+            variable=self.trend_ema_close_exit_after_trigger_r_enabled,
+            command=self._sync_dynamic_take_profit_controls,
+        )
+        self._trend_ema_close_exit_after_trigger_r_enabled_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=_lp_tight)
+        self._trend_ema_close_exit_after_trigger_r_label = ttk.Label(launch_form, text="趋势EMA平仓触发R")
+        self._trend_ema_close_exit_after_trigger_r_label.grid(row=row, column=2, sticky="e", pady=_lp_tight)
+        self._trend_ema_close_exit_after_trigger_r_entry = ttk.Entry(
+            launch_form,
+            textvariable=self.trend_ema_close_exit_after_trigger_r,
+        )
+        self._trend_ema_close_exit_after_trigger_r_entry.grid(row=row, column=3, sticky="ew", pady=_lp_tight)
+
+        row += 1
+        self._trend_ema_close_exit_after_trigger_r_hint_label = ttk.Label(
+            launch_form,
+            text="趋势 EMA 随上方趋势均线同步",
+            foreground="#57606a",
+        )
+        self._trend_ema_close_exit_after_trigger_r_hint_label.grid(row=row, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         row += 1
         ttk.Label(
@@ -8520,6 +8571,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get(),
                 time_stop_break_even_enabled=self.time_stop_break_even_enabled.get(),
                 time_stop_break_even_bars_raw=self.time_stop_break_even_bars.get(),
+                trend_ema_close_exit_after_trigger_r_enabled=self.trend_ema_close_exit_after_trigger_r_enabled.get(),
+                trend_ema_close_exit_after_trigger_r_raw=self.trend_ema_close_exit_after_trigger_r.get(),
             )
         )
 
@@ -8539,6 +8592,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 else f"时间保本：关闭（当前设定 {time_stop_bars} 根，仅保存参数，不会启用）。"
             )
             hint_parts = preview_lines + (time_stop_text,)
+            if self.trend_ema_close_exit_after_trigger_r_enabled.get():
+                trend_exit_r = self.trend_ema_close_exit_after_trigger_r.get().strip() or "5"
+                hint_parts = hint_parts + (
+                    f"趋势EMA离场：达到 {trend_exit_r}R 后，若收盘跌破趋势EMA则平仓。",
+                )
             if overlap_warnings:
                 hint_parts = hint_parts + ("规则提示：" + "；".join(overlap_warnings),)
             self.dynamic_protection_hint_text.set("动态保护： " + " / ".join(hint_parts))
@@ -8557,6 +8615,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 dynamic_fee_offset_enabled=self.dynamic_fee_offset_enabled.get(),
                 time_stop_break_even_enabled=self.time_stop_break_even_enabled.get(),
                 time_stop_break_even_bars_raw=self.time_stop_break_even_bars.get(),
+                trend_ema_close_exit_after_trigger_r_enabled=self.trend_ema_close_exit_after_trigger_r_enabled.get(),
+                trend_ema_close_exit_after_trigger_r_raw=self.trend_ema_close_exit_after_trigger_r.get(),
             )
         )
 
@@ -8660,12 +8720,24 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 if strategy_uses_parameter(definition.strategy_id, "dynamic_first_lock_r")
                 else 0
             )
+            trend_ema_close_exit_after_trigger_r_enabled = (
+                bool(self.trend_ema_close_exit_after_trigger_r_enabled.get())
+                if strategy_uses_parameter(definition.strategy_id, "trend_ema_close_exit_after_trigger_r_enabled")
+                else False
+            )
+            trend_ema_close_exit_after_trigger_r = (
+                self._parse_positive_int(self.trend_ema_close_exit_after_trigger_r.get(), "趋势EMA平仓触发R")
+                if strategy_uses_parameter(definition.strategy_id, "trend_ema_close_exit_after_trigger_r")
+                else 5
+            )
             if ema55_slope_lock_profit_trigger_r < 2:
                 raise ValueError("移动止盈触发R 不能小于 2")
             if dynamic_break_even_trigger_r < 1:
                 raise ValueError("保本触发R 不能小于 1")
             if dynamic_trailing_step_r < 1:
                 raise ValueError("移动步长R 不能小于 1")
+            if trend_ema_close_exit_after_trigger_r < 1:
+                raise ValueError("趋势EMA平仓触发R 不能小于 1")
             dynamic_protection_rules = (
                 self._current_dynamic_protection_rules()
                 if TAKE_PROFIT_MODE_OPTIONS.get(self.take_profit_mode_label.get(), "dynamic") == "dynamic"
@@ -8718,6 +8790,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                     if self.time_stop_break_even_enabled.get()
                     else 0
                 ),
+                trend_ema_close_exit_after_trigger_r_enabled=trend_ema_close_exit_after_trigger_r_enabled,
+                trend_ema_close_exit_after_trigger_r=trend_ema_close_exit_after_trigger_r,
                 max_entries_per_trend=max(self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数"), 0),
                 entry_reference_ema_type=self.entry_reference_ema_type.get().strip().lower(),
                 entry_reference_ema_period=max(
@@ -13207,10 +13281,16 @@ def _build_trend_parameter_hint_text(
         if entry_reference_ema_period not in {"", "0"}
         else f"跟随快线({fast_label})"
     )
-    parts = [
-        f"快线均线：{fast_label}，负责捕捉最近节奏。",
-        f"趋势均线：{trend_label}，用来判断当前方向是否仍然有效。",
-    ]
+    if profile.family == "ema55_slope_short":
+        parts = [
+            f"信号均线：{fast_label}，负责斜率开仓与斜率转正平仓。",
+            f"趋势均线：{trend_label}，当前作为同组趋势参数展示，不负责这条斜率平仓信号。",
+        ]
+    else:
+        parts = [
+            f"快线均线：{fast_label}，负责捕捉最近节奏。",
+            f"趋势均线：{trend_label}，用来判断当前方向是否仍然有效。",
+        ]
     if profile.family == "cross_breakdown_short":
         ref = reference_label if entry_reference_ema_period not in {"", "0"} else fast_label
         parts.append(f"突破参考线：{ref}，收盘向下跌破该线触发做空，且需 {fast_label}<{trend_label}。")
@@ -13324,6 +13404,8 @@ def _build_dynamic_protection_hint_text(
     dynamic_fee_offset_enabled: bool,
     time_stop_break_even_enabled: bool,
     time_stop_break_even_bars_raw: str,
+    trend_ema_close_exit_after_trigger_r_enabled: bool = False,
+    trend_ema_close_exit_after_trigger_r_raw: str = "5",
 ) -> str:
     if take_profit_mode_label != "动态止盈":
         return "动态保护：当前为固定止盈，保本触发R / 移动止盈触发R / 首档锁盈R / 手续费偏移 / 时间保本都不生效。"
@@ -13348,6 +13430,11 @@ def _build_dynamic_protection_hint_text(
     except ValueError:
         trailing_step_r = 1
     time_stop_bars = time_stop_break_even_bars_raw.strip() or "0"
+    trend_exit_r_raw = trend_ema_close_exit_after_trigger_r_raw.strip() or "5"
+    try:
+        trend_exit_r = max(int(trend_exit_r_raw), 1)
+    except ValueError:
+        trend_exit_r = 5
     auto_first_lock_r = max(trigger_r - trailing_step_r, 0)
     effective_first_lock_r = first_lock_r if first_lock_r > 0 else auto_first_lock_r
     custom_first_lock_enabled = first_lock_r > 0 and first_lock_r != auto_first_lock_r
@@ -13402,6 +13489,10 @@ def _build_dynamic_protection_hint_text(
             else f"时间保本：关闭（当前设定 {time_stop_bars} 根，仅保存参数，不会启用）。"
         ),
     ]
+    if trend_ema_close_exit_after_trigger_r_enabled:
+        parts.append(f"趋势EMA离场：达到 {trend_exit_r}R 后，若收盘跌破趋势EMA则平仓。")
+    else:
+        parts.append(f"趋势EMA离场：关闭（当前触发R 设为 {trend_exit_r}）。")
     if not break_even_trigger_r_configurable:
         parts[0] = "首档触发R：固定为 2。" + parts[0]
         first_leg_prefix = "2R保本：开启，" if dynamic_two_r_break_even_enabled else "2R保本：关闭，"
@@ -13579,7 +13670,11 @@ def _build_strategy_start_confirmation_message(
         f"自定义触发标的：{_custom_trigger_text()}",
         "",
         "参数说明：",
-        f"快线均线：{config.ema_label()}",
+        (
+            f"信号均线：{config.ema_label()}"
+            if profile.family == "ema55_slope_short"
+            else f"快线均线：{config.ema_label()}"
+        ),
         f"趋势均线：{config.trend_ema_label()}",
     ]
     if config.uses_daily_filter():

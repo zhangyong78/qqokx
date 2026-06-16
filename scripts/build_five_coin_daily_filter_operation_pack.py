@@ -60,10 +60,20 @@ def build_dynamic_long_config(
     ema_period: int,
     trend_period: int,
     atr_stop: str,
+    atr_take: str | None = None,
     entry_reference_period: int,
     daily_ma_type: str,
     daily_period: int,
     environment: str,
+    max_entries_per_trend: int = 1,
+    dynamic_break_even_trigger_r: int = 2,
+    dynamic_first_lock_r: int = 0,
+    dynamic_trailing_step_r: int = 1,
+    dynamic_protection_rules: tuple[dict[str, object], ...] | None = None,
+    ema55_slope_lock_profit_trigger_r: int = 5,
+    time_stop_break_even_bars: int = 0,
+    trend_ema_close_exit_after_trigger_r_enabled: bool = False,
+    trend_ema_close_exit_after_trigger_r: int = 5,
 ) -> StrategyConfig:
     return StrategyConfig(
         inst_id=symbol,
@@ -75,7 +85,11 @@ def build_dynamic_long_config(
         big_ema_period=233,
         atr_period=10,
         atr_stop_multiplier=Decimal(atr_stop),
-        atr_take_multiplier=Decimal(atr_stop) * Decimal("2"),
+        atr_take_multiplier=(
+            Decimal(atr_take)
+            if atr_take is not None
+            else Decimal(atr_stop) * Decimal("2")
+        ),
         order_size=Decimal("0"),
         trade_mode="cross",
         signal_mode="long_only",
@@ -89,9 +103,18 @@ def build_dynamic_long_config(
         entry_reference_ema_period=entry_reference_period,
         entry_reference_ema_type="ema",
         take_profit_mode="dynamic",
-        max_entries_per_trend=1,
+        max_entries_per_trend=max_entries_per_trend,
         dynamic_two_r_break_even=True,
+        dynamic_break_even_trigger_r=dynamic_break_even_trigger_r,
+        dynamic_protection_rules=tuple(dynamic_protection_rules or ()),
         dynamic_fee_offset_enabled=True,
+        ema55_slope_lock_profit_trigger_r=ema55_slope_lock_profit_trigger_r,
+        dynamic_first_lock_r=dynamic_first_lock_r,
+        dynamic_trailing_step_r=dynamic_trailing_step_r,
+        time_stop_break_even_enabled=False,
+        time_stop_break_even_bars=time_stop_break_even_bars,
+        trend_ema_close_exit_after_trigger_r_enabled=trend_ema_close_exit_after_trigger_r_enabled,
+        trend_ema_close_exit_after_trigger_r=trend_ema_close_exit_after_trigger_r,
         daily_filter_enabled=True,
         daily_filter_bar="1D",
         daily_filter_boundary="bjt_08",
@@ -111,6 +134,14 @@ def build_slope_short_config(
     daily_ma_type: str,
     daily_period: int,
     environment: str,
+    atr_period: int = 14,
+    dynamic_break_even_trigger_r: int = 2,
+    dynamic_first_lock_r: int = 0,
+    dynamic_trailing_step_r: int = 1,
+    dynamic_protection_rules: tuple[dict[str, object], ...] | None = None,
+    ema55_slope_lock_profit_trigger_r: int = 5,
+    ema55_slope_exit_enabled: bool = False,
+    time_stop_break_even_bars: int = 10,
 ) -> StrategyConfig:
     return StrategyConfig(
         inst_id=symbol,
@@ -120,7 +151,7 @@ def build_slope_short_config(
         trend_ema_period=period,
         trend_ema_type=ma_type,
         big_ema_period=233,
-        atr_period=14,
+        atr_period=atr_period,
         atr_stop_multiplier=Decimal("2"),
         atr_take_multiplier=Decimal("4"),
         order_size=Decimal("0"),
@@ -135,15 +166,20 @@ def build_slope_short_config(
         backtest_sizing_mode="fixed_risk",
         take_profit_mode="dynamic",
         dynamic_two_r_break_even=True,
+        dynamic_break_even_trigger_r=dynamic_break_even_trigger_r,
         dynamic_fee_offset_enabled=True,
-        ema55_slope_exit_enabled=False,
+        dynamic_protection_rules=tuple(dynamic_protection_rules or ()),
+        ema55_slope_exit_enabled=ema55_slope_exit_enabled,
+        ema55_slope_lock_profit_trigger_r=ema55_slope_lock_profit_trigger_r,
+        dynamic_first_lock_r=dynamic_first_lock_r,
+        dynamic_trailing_step_r=dynamic_trailing_step_r,
         ema55_slope_same_bar_reentry_block=True,
         ema55_slope_dynamic_exit_requires_bear_reentry=False,
         ema55_slope_dynamic_exit_bear_reentry_break_prev_low=False,
         atr_percentile_filter_max=Decimal("0.5"),
         trend_ema_slope_filter_min_ratio=Decimal("-0.0005"),
         time_stop_break_even_enabled=False,
-        time_stop_break_even_bars=10,
+        time_stop_break_even_bars=time_stop_break_even_bars,
         daily_filter_enabled=True,
         daily_filter_bar="1D",
         daily_filter_boundary="bjt_08",
@@ -236,10 +272,42 @@ def build_ready_specs(environment: str) -> tuple[ReadyStrategySpec, ...]:
                 ema_period=21,
                 trend_period=55,
                 atr_stop="1.5",
-                entry_reference_period=34,
+                atr_take="1.5",
+                entry_reference_period=55,
                 daily_ma_type="ma",
                 daily_period=5,
                 environment=environment,
+                max_entries_per_trend=3,
+                dynamic_break_even_trigger_r=1,
+                dynamic_first_lock_r=1,
+                dynamic_trailing_step_r=1,
+                dynamic_protection_rules=(
+                    {
+                        "trigger_r": 1,
+                        "action": "break_even",
+                        "lock_r": None,
+                        "trail_mode": "none",
+                        "trail_every_r": None,
+                        "trail_add_r": None,
+                    },
+                    {
+                        "trigger_r": 4,
+                        "action": "lock_profit",
+                        "lock_r": 1,
+                        "trail_mode": "step",
+                        "trail_every_r": 1,
+                        "trail_add_r": 1,
+                    },
+                    {
+                        "trigger_r": 11,
+                        "action": "lock_profit",
+                        "lock_r": 10,
+                        "trail_mode": "step",
+                        "trail_every_r": 1,
+                        "trail_add_r": 1,
+                    },
+                ),
+                ema55_slope_lock_profit_trigger_r=4,
             ),
         ),
         ReadyStrategySpec(
@@ -258,10 +326,42 @@ def build_ready_specs(environment: str) -> tuple[ReadyStrategySpec, ...]:
                 ema_period=21,
                 trend_period=55,
                 atr_stop="1",
+                atr_take="1",
                 entry_reference_period=13,
                 daily_ma_type="ema",
                 daily_period=5,
                 environment=environment,
+                max_entries_per_trend=2,
+                dynamic_break_even_trigger_r=3,
+                dynamic_first_lock_r=1,
+                dynamic_trailing_step_r=1,
+                dynamic_protection_rules=(
+                    {
+                        "trigger_r": 3,
+                        "action": "break_even",
+                        "lock_r": None,
+                        "trail_mode": "none",
+                        "trail_every_r": None,
+                        "trail_add_r": None,
+                    },
+                    {
+                        "trigger_r": 7,
+                        "action": "lock_profit",
+                        "lock_r": 1,
+                        "trail_mode": "step",
+                        "trail_every_r": 1,
+                        "trail_add_r": 1,
+                    },
+                    {
+                        "trigger_r": 11,
+                        "action": "lock_profit",
+                        "lock_r": 10,
+                        "trail_mode": "step",
+                        "trail_every_r": 1,
+                        "trail_add_r": 1,
+                    },
+                ),
+                ema55_slope_lock_profit_trigger_r=7,
             ),
         ),
         ReadyStrategySpec(
@@ -301,11 +401,43 @@ def build_ready_specs(environment: str) -> tuple[ReadyStrategySpec, ...]:
                 symbol="DOGE-USDT-SWAP",
                 ema_period=5,
                 trend_period=13,
-                atr_stop="1.5",
+                atr_stop="1",
+                atr_take="1",
                 entry_reference_period=0,
                 daily_ma_type="ma",
                 daily_period=13,
                 environment=environment,
+                max_entries_per_trend=2,
+                dynamic_break_even_trigger_r=3,
+                dynamic_first_lock_r=1,
+                dynamic_trailing_step_r=1,
+                dynamic_protection_rules=(
+                    {
+                        "trigger_r": 3,
+                        "action": "break_even",
+                        "lock_r": None,
+                        "trail_mode": "none",
+                        "trail_every_r": None,
+                        "trail_add_r": None,
+                    },
+                    {
+                        "trigger_r": 6,
+                        "action": "lock_profit",
+                        "lock_r": 1,
+                        "trail_mode": "step",
+                        "trail_every_r": 1,
+                        "trail_add_r": 1,
+                    },
+                    {
+                        "trigger_r": 11,
+                        "action": "lock_profit",
+                        "lock_r": 10,
+                        "trail_mode": "step",
+                        "trail_every_r": 1,
+                        "trail_add_r": 1,
+                    },
+                ),
+                ema55_slope_lock_profit_trigger_r=6,
             ),
         ),
         ReadyStrategySpec(
@@ -342,12 +474,36 @@ def build_ready_specs(environment: str) -> tuple[ReadyStrategySpec, ...]:
             notes="动态止盈，2R 保本，关闭斜率转正平仓",
             config=build_slope_short_config(
                 symbol="ETH-USDT-SWAP",
-                ma_type="ema",
-                period=55,
+                ma_type="ma",
+                period=61,
                 daily_mode="close_vs_ma",
                 daily_ma_type="ema",
                 daily_period=55,
                 environment=environment,
+                atr_period=11,
+                dynamic_break_even_trigger_r=3,
+                dynamic_first_lock_r=5,
+                dynamic_protection_rules=(
+                    {
+                        "trigger_r": 3,
+                        "action": "break_even",
+                        "lock_r": None,
+                        "trail_mode": "none",
+                        "trail_every_r": None,
+                        "trail_add_r": None,
+                    },
+                    {
+                        "trigger_r": 6,
+                        "action": "lock_profit",
+                        "lock_r": 5,
+                        "trail_mode": "step",
+                        "trail_every_r": 1,
+                        "trail_add_r": 1,
+                    },
+                ),
+                ema55_slope_lock_profit_trigger_r=6,
+                ema55_slope_exit_enabled=True,
+                time_stop_break_even_bars=0,
             ),
         ),
         ReadyStrategySpec(
@@ -369,6 +525,30 @@ def build_ready_specs(environment: str) -> tuple[ReadyStrategySpec, ...]:
                 daily_ma_type="ema",
                 daily_period=21,
                 environment=environment,
+                atr_period=15,
+                dynamic_break_even_trigger_r=2,
+                dynamic_first_lock_r=5,
+                dynamic_protection_rules=(
+                    {
+                        "trigger_r": 2,
+                        "action": "break_even",
+                        "lock_r": None,
+                        "trail_mode": "none",
+                        "trail_every_r": None,
+                        "trail_add_r": None,
+                    },
+                    {
+                        "trigger_r": 6,
+                        "action": "lock_profit",
+                        "lock_r": 5,
+                        "trail_mode": "step",
+                        "trail_every_r": 1,
+                        "trail_add_r": 1,
+                    },
+                ),
+                ema55_slope_lock_profit_trigger_r=6,
+                ema55_slope_exit_enabled=True,
+                time_stop_break_even_bars=0,
             ),
         ),
         ReadyStrategySpec(
@@ -398,11 +578,34 @@ def build_ready_specs(environment: str) -> tuple[ReadyStrategySpec, ...]:
             config=build_slope_short_config(
                 symbol="DOGE-USDT-SWAP",
                 ma_type="ma",
-                period=55,
+                period=21,
                 daily_mode="close_vs_ma",
                 daily_ma_type="ma",
                 daily_period=20,
                 environment=environment,
+                atr_period=13,
+                dynamic_break_even_trigger_r=2,
+                dynamic_first_lock_r=5,
+                dynamic_protection_rules=(
+                    {
+                        "trigger_r": 2,
+                        "action": "break_even",
+                        "lock_r": None,
+                        "trail_mode": "none",
+                        "trail_every_r": None,
+                        "trail_add_r": None,
+                    },
+                    {
+                        "trigger_r": 6,
+                        "action": "lock_profit",
+                        "lock_r": 5,
+                        "trail_mode": "step",
+                        "trail_every_r": 1,
+                        "trail_add_r": 1,
+                    },
+                ),
+                ema55_slope_lock_profit_trigger_r=6,
+                ema55_slope_exit_enabled=True,
             ),
         ),
     )
@@ -435,6 +638,109 @@ def build_bundle(bundle_name: str, specs: tuple[ReadyStrategySpec, ...]) -> Stra
     )
 
 
+def _ma_label(ma_type: str, period: int) -> str:
+    return f"{ma_type.upper()}{period}"
+
+
+def _render_slope_short_hour_summary(config: StrategyConfig) -> str:
+    return (
+        f"{_ma_label(config.ema_type, config.ema_period)} slope <= {config.trend_ema_slope_filter_min_ratio}, "
+        f"ATR{config.atr_period} SL{config.atr_stop_multiplier}, "
+        f"ATR percentile <= {config.atr_percentile_filter_max}"
+    )
+
+
+def _render_slope_short_daily_summary(config: StrategyConfig) -> str:
+    if not config.daily_filter_enabled or config.daily_filter_mode != "close_vs_ma":
+        return "Daily filter disabled"
+    side_text = "short only" if config.signal_mode == "short_only" else "long only"
+    return (
+        f"BJT 08:00 daily close below {_ma_label(config.daily_filter_ma_type, config.daily_filter_period)}, "
+        f"{side_text}"
+    )
+
+
+def _render_dynamic_long_hour_summary(config: StrategyConfig) -> str:
+    entry_label = (
+        _ma_label(config.entry_reference_ema_type, config.entry_reference_ema_period)
+        if config.entry_reference_ema_period > 0
+        else f"follow {_ma_label(config.ema_type, config.ema_period)}"
+    )
+    return (
+        f"{_ma_label(config.ema_type, config.ema_period)} / {_ma_label(config.trend_ema_type, config.trend_ema_period)}, "
+        f"entry {entry_label}, ATR{config.atr_period} SL{config.atr_stop_multiplier}"
+    )
+
+
+def _render_dynamic_long_daily_summary(config: StrategyConfig) -> str:
+    if not config.daily_filter_enabled or config.daily_filter_mode != "close_vs_ma":
+        return "Daily filter disabled"
+    return (
+        f"BJT 08:00 daily close above {_ma_label(config.daily_filter_ma_type, config.daily_filter_period)}, "
+        "long only"
+    )
+
+
+def _render_dynamic_long_notes(config: StrategyConfig) -> str:
+    rules = list(config.resolved_dynamic_protection_rules())
+    parts: list[str] = []
+    break_even_rule = next((rule for rule in rules if rule.action == "break_even"), None)
+    lock_rules = [rule for rule in rules if rule.action == "lock_profit"]
+    if break_even_rule is not None:
+        parts.append(f"{break_even_rule.trigger_r}R break-even")
+    for rule in lock_rules:
+        lock_text = f"{rule.trigger_r}R lock {rule.lock_r}R"
+        if rule.trail_mode == "step" and rule.trail_every_r and rule.trail_add_r:
+            lock_text += f" then trail by {rule.trail_add_r}R every {rule.trail_every_r}R"
+        parts.append(lock_text)
+    if config.dynamic_fee_offset_enabled:
+        parts.append("fee offset on")
+    parts.append(f"max entries {config.max_entries_per_trend}")
+    return ", ".join(parts)
+
+
+def _render_slope_short_notes(config: StrategyConfig) -> str:
+    rules = list(config.resolved_dynamic_protection_rules())
+    parts: list[str] = []
+    break_even_rule = next((rule for rule in rules if rule.action == "break_even"), None)
+    lock_rule = next((rule for rule in rules if rule.action == "lock_profit"), None)
+    if break_even_rule is not None:
+        parts.append(f"{break_even_rule.trigger_r}R break-even")
+    if lock_rule is not None:
+        lock_text = f"{lock_rule.trigger_r}R lock {lock_rule.lock_r}R"
+        if lock_rule.trail_mode == "step" and lock_rule.trail_every_r and lock_rule.trail_add_r:
+            lock_text += f" then trail by {lock_rule.trail_add_r}R every {lock_rule.trail_every_r}R"
+        parts.append(lock_text)
+    if config.dynamic_fee_offset_enabled:
+        parts.append("fee offset on")
+    parts.append(f"slope-turn exit {'on' if config.ema55_slope_exit_enabled else 'off'}")
+    return ", ".join(parts)
+
+
+def _render_spec_hour_summary(spec: ReadyStrategySpec) -> str:
+    if spec.family == "dynamic_long":
+        return _render_dynamic_long_hour_summary(spec.config)
+    if spec.family == "slope_short":
+        return _render_slope_short_hour_summary(spec.config)
+    return spec.hour_summary
+
+
+def _render_spec_daily_summary(spec: ReadyStrategySpec) -> str:
+    if spec.family == "dynamic_long":
+        return _render_dynamic_long_daily_summary(spec.config)
+    if spec.family == "slope_short":
+        return _render_slope_short_daily_summary(spec.config)
+    return spec.daily_summary
+
+
+def _render_spec_notes(spec: ReadyStrategySpec) -> str:
+    if spec.family == "dynamic_long":
+        return _render_dynamic_long_notes(spec.config)
+    if spec.family == "slope_short":
+        return _render_slope_short_notes(spec.config)
+    return spec.notes
+
+
 def render_rows(specs: tuple[ReadyStrategySpec, ...]) -> str:
     direction_map = {
         "long_only": "只做多",
@@ -452,9 +758,9 @@ def render_rows(specs: tuple[ReadyStrategySpec, ...]) -> str:
             f"<td>{html.escape(spec.symbol)}</td>"
             f"<td>{html.escape(direction_map.get(spec.direction_label, spec.direction_label))}</td>"
             f"<td>{html.escape(family_map.get(spec.family, spec.family))}</td>"
-            f"<td>{html.escape(spec.hour_summary)}</td>"
-            f"<td>{html.escape(spec.daily_summary)}</td>"
-            f"<td>{html.escape(spec.notes)}</td>"
+            f"<td>{html.escape(_render_spec_hour_summary(spec))}</td>"
+            f"<td>{html.escape(_render_spec_daily_summary(spec))}</td>"
+            f"<td>{html.escape(_render_spec_notes(spec))}</td>"
             "</tr>"
         )
     return "\n".join(rows)
@@ -621,9 +927,9 @@ def build_metadata_payload(
                 "strategy_id": spec.strategy_id,
                 "direction_label": spec.direction_label,
                 "family": spec.family,
-                "hour_summary": spec.hour_summary,
-                "daily_summary": spec.daily_summary,
-                "notes": spec.notes,
+                "hour_summary": _render_spec_hour_summary(spec),
+                "daily_summary": _render_spec_daily_summary(spec),
+                "notes": _render_spec_notes(spec),
             }
             for spec in ready_specs
         ],

@@ -13,7 +13,7 @@ from okx_quant.daily_filters import (
     build_daily_close_vs_ma_bias,
     build_daily_weak_day_flags,
 )
-from okx_quant.indicators import atr, ema
+from okx_quant.indicators import atr, ema, moving_average
 from okx_quant.market_data_hub import MarketDataHub
 from okx_quant.models import (
     Credentials,
@@ -128,6 +128,41 @@ def _live_dynamic_first_lock_r(config: StrategyConfig) -> int:
 
 def _live_dynamic_protection_rules(config: StrategyConfig) -> tuple[DynamicProtectionRule, ...]:
     return config.resolved_dynamic_protection_rules()
+
+
+def _live_trend_ema_close_exit_after_trigger_r_enabled(config: StrategyConfig) -> bool:
+    return bool(config.trend_ema_close_exit_after_trigger_r_enabled)
+
+
+def _live_trend_ema_close_exit_trigger_r(config: StrategyConfig) -> int:
+    return config.resolved_trend_ema_close_exit_after_trigger_r()
+
+
+def _live_dynamic_trigger_r_reached(
+    *,
+    direction: Literal["long", "short"],
+    current_price: Decimal,
+    entry_price: Decimal,
+    risk_per_unit: Decimal,
+    next_trigger_r: int,
+    trigger_r: int,
+    tick_size: Decimal,
+    dynamic_fee_offset_enabled: bool,
+) -> bool:
+    resolved_trigger_r = max(int(trigger_r), 1)
+    if next_trigger_r <= 0 or next_trigger_r > resolved_trigger_r:
+        return True
+    trigger_price = _dynamic_trigger_price_live(
+        direction=direction,
+        entry_price=entry_price,
+        risk_per_unit=risk_per_unit,
+        trigger_r=resolved_trigger_r,
+        tick_size=tick_size,
+        dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+    )
+    if direction == "long":
+        return current_price >= trigger_price
+    return current_price <= trigger_price
 
 
 def _live_dynamic_break_even_uses_trigger_r(config: StrategyConfig) -> bool:
@@ -385,6 +420,8 @@ class DynamicStopMonitorStepResult:
     amend_failures: int
     missing_algo_strikes: int = 0
     seed_baseline_abs: Decimal | None = None
+    trend_ema_close_exit_armed: bool = False
+    trend_ema_close_exit_last_candle_ts: int | None = None
 
 
 class OrderSizeTooSmallError(RuntimeError):
@@ -3207,6 +3244,42 @@ class StrategyEngine:
 
         raise RuntimeError("本地止盈止损模式错误")
 
+    def _poll_trend_ema_close_exit_snapshot(
+        self,
+        config: StrategyConfig,
+        *,
+        signal_inst_id: str,
+        direction: Literal["long", "short"],
+        last_checked_candle_ts: int | None,
+    ) -> tuple[bool, int | None, object | None, Decimal | None]:
+        lookback = recommended_indicator_lookback(
+            config.ema_period,
+            config.trend_ema_period,
+            config.atr_period,
+            config.resolved_entry_reference_ema_period(),
+            DEFAULT_DEBUG_ATR_PERIOD,
+        )
+        candles = self._get_candles_with_retry(signal_inst_id, config.bar, limit=lookback)
+        confirmed = [candle for candle in candles if candle.confirmed]
+        if not confirmed:
+            return False, last_checked_candle_ts, None, None
+        newest = confirmed[-1]
+        if newest.ts == last_checked_candle_ts:
+            return False, last_checked_candle_ts, None, None
+        trend_ema_values = moving_average(
+            [candle.close for candle in confirmed],
+            config.trend_ema_period,
+            config.resolved_trend_ema_type(),
+        )
+        trend_ema_value = trend_ema_values[-1] if trend_ema_values else None
+        if trend_ema_value is None:
+            return False, newest.ts, newest, None
+        if direction == "long":
+            exit_ready = newest.close <= trend_ema_value
+        else:
+            exit_ready = newest.close >= trend_ema_value
+        return exit_ready, newest.ts, newest, trend_ema_value
+
     def _monitor_local_exit(
         self,
         credentials: Credentials,
@@ -3223,6 +3296,15 @@ class StrategyEngine:
         current_take_profit = protection.take_profit
         next_trigger_r = _live_ema55_slope_lock_profit_trigger_r(config)
         risk_per_unit = abs(position.entry_price - protection.stop_loss)
+        trend_ema_close_exit_enabled = (
+            protection.direction == "long"
+            and dynamic_take_profit_enabled
+            and _live_trend_ema_close_exit_after_trigger_r_enabled(config)
+        )
+        trend_ema_close_exit_trigger_r = _live_trend_ema_close_exit_trigger_r(config)
+        trend_ema_close_exit_armed = False
+        trend_ema_close_exit_last_candle_ts: int | None = None
+        signal_inst_id = (config.inst_id or trade_instrument.inst_id).strip().upper() or trade_instrument.inst_id
         monitor_parts = [
             f"开始本地止盈止损监控 | 触发标的={protection.trigger_inst_id}",
             f"触发价格类型={protection.trigger_price_type}",
@@ -3293,6 +3375,17 @@ class StrategyEngine:
                     stop_loss=current_stop_loss,
                     take_profit=current_take_profit,
                 )
+            if trend_ema_close_exit_enabled:
+                trend_ema_close_exit_armed = trend_ema_close_exit_armed or _live_dynamic_trigger_r_reached(
+                    direction=protection.direction,
+                    current_price=current_price,
+                    entry_price=position.entry_price,
+                    risk_per_unit=risk_per_unit,
+                    next_trigger_r=next_trigger_r,
+                    trigger_r=trend_ema_close_exit_trigger_r,
+                    tick_size=trade_instrument.tick_size,
+                    dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+                )
             if stop_hit or take_hit:
                 reason = "止盈"
                 if stop_hit:
@@ -3326,6 +3419,24 @@ class StrategyEngine:
                 self._close_position(credentials, config, trade_instrument, position, reason)
                 self.resume_automatic_trade_management()
                 return
+            if trend_ema_close_exit_enabled and trend_ema_close_exit_armed:
+                exit_ready, trend_ema_close_exit_last_candle_ts, exit_candle, trend_ema_value = (
+                    self._poll_trend_ema_close_exit_snapshot(
+                        config,
+                        signal_inst_id=signal_inst_id,
+                        direction=protection.direction,
+                        last_checked_candle_ts=trend_ema_close_exit_last_candle_ts,
+                    )
+                )
+                if exit_ready and exit_candle is not None and trend_ema_value is not None:
+                    trend_label = config.trend_ema_label()
+                    self._logger(
+                        f"{_fmt_ts(exit_candle.ts)} | 达到 {trend_ema_close_exit_trigger_r}R 后收盘跌破 {trend_label} 平仓 | "
+                        f"收盘={format_decimal(exit_candle.close)} | {trend_label}={format_decimal(trend_ema_value)}"
+                    )
+                    self._close_position(credentials, config, trade_instrument, position, f"跌破{trend_label}")
+                    self.resume_automatic_trade_management()
+                    return
             self._stop_event.wait(config.poll_seconds)
 
     def _monitor_ema55_slope_short_local_exit(
@@ -3609,6 +3720,8 @@ class StrategyEngine:
 
         baseline_abs: Decimal | None = None
         missing_algo_strikes = 0
+        trend_ema_close_exit_armed = False
+        trend_ema_close_exit_last_candle_ts: int | None = None
 
         while not self._stop_event.is_set():
             try:
@@ -3626,6 +3739,8 @@ class StrategyEngine:
                     amend_failures=amend_failures,
                     missing_algo_strikes=missing_algo_strikes,
                     baseline_abs_position=baseline_abs,
+                    trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                    trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
                 )
             except Exception as exc:
                 if self._stop_event.is_set():
@@ -3658,6 +3773,8 @@ class StrategyEngine:
                 missing_algo_strikes = should_continue.missing_algo_strikes
                 if should_continue.seed_baseline_abs is not None:
                     baseline_abs = should_continue.seed_baseline_abs
+                trend_ema_close_exit_armed = should_continue.trend_ema_close_exit_armed
+                trend_ema_close_exit_last_candle_ts = should_continue.trend_ema_close_exit_last_candle_ts
                 if not should_continue.keep_monitoring:
                     self.resume_automatic_trade_management()
                     return
@@ -3754,6 +3871,8 @@ class StrategyEngine:
         amend_failures: int,
         missing_algo_strikes: int = 0,
         baseline_abs_position: Decimal | None = None,
+        trend_ema_close_exit_armed: bool = False,
+        trend_ema_close_exit_last_candle_ts: int | None = None,
     ) -> DynamicStopMonitorStepResult:
         algo_ref = (
             f"algoClOrdId={stop_loss_algo_cl_ord_id}"
@@ -3781,6 +3900,8 @@ class StrategyEngine:
                 amend_failures=amend_failures,
                 missing_algo_strikes=0,
                 seed_baseline_abs=None,
+                trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
             )
 
         seed_snap: Decimal | None = None
@@ -3797,6 +3918,8 @@ class StrategyEngine:
                 amend_failures=0,
                 missing_algo_strikes=0,
                 seed_baseline_abs=seed_snap,
+                trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
             )
 
         direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
@@ -3841,6 +3964,8 @@ class StrategyEngine:
                         amend_failures=amend_failures,
                         missing_algo_strikes=0,
                         seed_baseline_abs=seed_snap,
+                        trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                        trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
                     )
             infer_price = Decimal("0")
             if next_missing >= OKX_DYNAMIC_STOP_MISSING_ALGO_PRICE_EXIT_POLLS:
@@ -3884,6 +4009,8 @@ class StrategyEngine:
                     amend_failures=amend_failures,
                     missing_algo_strikes=0,
                     seed_baseline_abs=seed_snap,
+                    trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                    trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
                 )
 
         current_price = self._get_trigger_price_with_retry(
@@ -3912,6 +4039,44 @@ class StrategyEngine:
             time_stop_break_even_enabled=config.time_stop_break_even_enabled,
             time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
         )
+        if direction == "long" and _live_trend_ema_close_exit_after_trigger_r_enabled(config):
+            trend_ema_close_exit_armed = trend_ema_close_exit_armed or _live_dynamic_trigger_r_reached(
+                direction=direction,
+                current_price=current_price,
+                entry_price=position.entry_price,
+                risk_per_unit=risk_per_unit,
+                next_trigger_r=updated_trigger_r,
+                trigger_r=_live_trend_ema_close_exit_trigger_r(config),
+                tick_size=trade_instrument.tick_size,
+                dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
+            )
+            if trend_ema_close_exit_armed:
+                signal_inst_id = (config.inst_id or trade_instrument.inst_id).strip().upper() or trade_instrument.inst_id
+                exit_ready, trend_ema_close_exit_last_candle_ts, exit_candle, trend_ema_value = (
+                    self._poll_trend_ema_close_exit_snapshot(
+                        config,
+                        signal_inst_id=signal_inst_id,
+                        direction=direction,
+                        last_checked_candle_ts=trend_ema_close_exit_last_candle_ts,
+                    )
+                )
+                if exit_ready and exit_candle is not None and trend_ema_value is not None:
+                    trend_label = config.trend_ema_label()
+                    self._logger(
+                        f"{_fmt_ts(exit_candle.ts)} | 达到 {_live_trend_ema_close_exit_trigger_r(config)}R 后收盘跌破 {trend_label} 平仓 | "
+                        f"收盘={format_decimal(exit_candle.close)} | {trend_label}={format_decimal(trend_ema_value)}"
+                    )
+                    self._close_position(credentials, config, trade_instrument, position, f"跌破{trend_label}")
+                    return DynamicStopMonitorStepResult(
+                        keep_monitoring=False,
+                        current_stop_loss=updated_stop_loss,
+                        next_trigger_r=updated_trigger_r,
+                        amend_failures=0,
+                        missing_algo_strikes=next_missing,
+                        seed_baseline_abs=seed_snap,
+                        trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                        trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
+                    )
         should_amend = moved and (
             updated_stop_loss > current_stop_loss if position.side == "buy" else updated_stop_loss < current_stop_loss
         )
@@ -3923,6 +4088,8 @@ class StrategyEngine:
                 amend_failures=0,
                 missing_algo_strikes=next_missing,
                 seed_baseline_abs=seed_snap,
+                trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
             )
 
         fresh_price = self._get_trigger_price_with_retry(
@@ -3955,6 +4122,8 @@ class StrategyEngine:
                 amend_failures=amend_failures,
                 missing_algo_strikes=next_missing,
                 seed_baseline_abs=seed_snap,
+                trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
             )
 
         algo_order = pending_tracked
@@ -3976,6 +4145,8 @@ class StrategyEngine:
                 amend_failures=amend_failures,
                 missing_algo_strikes=next_missing,
                 seed_baseline_abs=seed_snap,
+                trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
             )
 
         amend_cl_ord = (algo_order.algo_client_order_id or stop_loss_algo_cl_ord_id or "").strip() or None
@@ -4014,6 +4185,8 @@ class StrategyEngine:
                     amend_failures=amend_failures,
                     missing_algo_strikes=0,
                     seed_baseline_abs=seed_snap,
+                    trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                    trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
                 )
             latest_price = self._get_trigger_price_with_retry(
                 trade_instrument.inst_id,
@@ -4045,6 +4218,8 @@ class StrategyEngine:
                     amend_failures=amend_failures,
                     missing_algo_strikes=next_missing,
                     seed_baseline_abs=seed_snap,
+                    trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                    trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
                 )
 
             next_amend_failures = amend_failures + 1
@@ -4068,6 +4243,8 @@ class StrategyEngine:
                     amend_failures=next_amend_failures,
                     missing_algo_strikes=next_missing,
                     seed_baseline_abs=seed_snap,
+                    trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                    trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
                 )
             raise RuntimeError(f"OKX 动态止损上移失败：{detail}") from exc
 
@@ -4083,6 +4260,8 @@ class StrategyEngine:
             amend_failures=0,
             missing_algo_strikes=0,
             seed_baseline_abs=seed_snap,
+            trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+            trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
         )
 
     def _monitor_exchange_managed_position_until_closed(
@@ -5118,6 +5297,14 @@ class StrategyEngine:
         next_trigger_r = 2
         risk_per_unit = abs(position.entry_price - initial_stop_loss)
         virtual_loss_logged = False
+        trend_ema_close_exit_enabled = (
+            direction == "long"
+            and dynamic_take_profit_enabled
+            and _live_trend_ema_close_exit_after_trigger_r_enabled(config)
+        )
+        trend_ema_close_exit_armed = False
+        trend_ema_close_exit_last_candle_ts: int | None = None
+        signal_inst_id = (config.inst_id or trade_instrument.inst_id).strip().upper() or trade_instrument.inst_id
         monitor_parts = [
             f"交易员虚拟止损监控启动 | 标的={trade_instrument.inst_id}",
             f"触发价格类型={config.tp_sl_trigger_type}",
@@ -5178,6 +5365,17 @@ class StrategyEngine:
                         f"新保护价={format_decimal(current_stop_loss)} | 下一阶段={next_trigger_r}R | "
                         f"holding_bars={holding_bars}"
                     )
+                if trend_ema_close_exit_enabled:
+                    trend_ema_close_exit_armed = trend_ema_close_exit_armed or _live_dynamic_trigger_r_reached(
+                        direction=direction,
+                        current_price=current_price,
+                        entry_price=position.entry_price,
+                        risk_per_unit=risk_per_unit,
+                        next_trigger_r=next_trigger_r,
+                        trigger_r=_live_trend_ema_close_exit_trigger_r(config),
+                        tick_size=trade_instrument.tick_size,
+                        dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
+                    )
             else:
                 _, take_hit = evaluate_local_exit(
                     direction=direction,
@@ -5191,6 +5389,24 @@ class StrategyEngine:
                         f"止盈={format_decimal(current_take_profit)} | 开始平仓释放额度"
                     )
                     self._close_position(credentials, config, trade_instrument, position, "止盈")
+                    return
+
+            if trend_ema_close_exit_enabled and trend_ema_close_exit_armed:
+                exit_ready, trend_ema_close_exit_last_candle_ts, exit_candle, trend_ema_value = (
+                    self._poll_trend_ema_close_exit_snapshot(
+                        config,
+                        signal_inst_id=signal_inst_id,
+                        direction=direction,
+                        last_checked_candle_ts=trend_ema_close_exit_last_candle_ts,
+                    )
+                )
+                if exit_ready and exit_candle is not None and trend_ema_value is not None:
+                    trend_label = config.trend_ema_label()
+                    self._logger(
+                        f"{_fmt_ts(exit_candle.ts)} | 达到 {_live_trend_ema_close_exit_trigger_r(config)}R 后收盘跌破 {trend_label} 平仓 | "
+                        f"收盘={format_decimal(exit_candle.close)} | {trend_label}={format_decimal(trend_ema_value)}"
+                    )
+                    self._close_position(credentials, config, trade_instrument, position, f"跌破{trend_label}")
                     return
 
             stop_hit = current_price <= current_stop_loss if direction == "long" else current_price >= current_stop_loss

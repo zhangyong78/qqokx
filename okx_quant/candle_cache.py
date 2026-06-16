@@ -7,6 +7,7 @@ from okx_quant.candle_store import (
     get_candles,
     get_candles_before,
     migrate_json_cache_file,
+    promote_stale_unconfirmed_candles,
     upsert_candles,
 )
 from okx_quant.models import Candle
@@ -46,6 +47,7 @@ def load_candle_cache(
     base_dir: Path | None = None,
 ) -> list[Candle]:
     _migrate_legacy_json_if_needed(inst_id, bar, base_dir)
+    promote_stale_unconfirmed_candles(inst_id, bar, base_dir=base_dir)
     return get_candles(inst_id, bar, limit=limit, base_dir=base_dir)
 
 
@@ -60,6 +62,7 @@ def load_candle_cache_range(
     base_dir: Path | None = None,
 ) -> list[Candle]:
     _migrate_legacy_json_if_needed(inst_id, bar, base_dir)
+    promote_stale_unconfirmed_candles(inst_id, bar, base_dir=base_dir)
     selected = get_candles(
         inst_id,
         bar,

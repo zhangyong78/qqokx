@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -189,6 +190,10 @@ class UiStrategySessionsMixin:
         self.dynamic_fee_offset_enabled.set(record.config.dynamic_fee_offset_enabled)
         self.time_stop_break_even_enabled.set(record.config.time_stop_break_even_enabled)
         self.time_stop_break_even_bars.set(str(record.config.time_stop_break_even_bars))
+        self.trend_ema_close_exit_after_trigger_r_enabled.set(
+            bool(record.config.trend_ema_close_exit_after_trigger_r_enabled)
+        )
+        self.trend_ema_close_exit_after_trigger_r.set(str(record.config.resolved_trend_ema_close_exit_after_trigger_r()))
         self.run_mode_label.set(_reverse_lookup_label(RUN_MODE_OPTIONS, record.config.run_mode, record.run_mode_label))
         self.trade_mode_label.set(_reverse_lookup_label(TRADE_MODE_OPTIONS, record.config.trade_mode, "全仓 cross"))
         self.position_mode_label.set(
@@ -4392,6 +4397,16 @@ class UiStrategySessionsMixin:
             self._time_stop_break_even_check.grid()
             self._time_stop_break_even_bars_label.grid()
             self._time_stop_break_even_bars_entry.grid()
+            if strategy_uses_parameter(strategy_id, "trend_ema_close_exit_after_trigger_r_enabled"):
+                self._trend_ema_close_exit_after_trigger_r_enabled_check.grid()
+                self._trend_ema_close_exit_after_trigger_r_label.grid()
+                self._trend_ema_close_exit_after_trigger_r_entry.grid()
+                self._trend_ema_close_exit_after_trigger_r_hint_label.grid()
+            else:
+                self._trend_ema_close_exit_after_trigger_r_enabled_check.grid_remove()
+                self._trend_ema_close_exit_after_trigger_r_label.grid_remove()
+                self._trend_ema_close_exit_after_trigger_r_entry.grid_remove()
+                self._trend_ema_close_exit_after_trigger_r_hint_label.grid_remove()
         else:
             self._take_profit_mode_label.grid_remove()
             self._take_profit_mode_combo.grid_remove()
@@ -4407,6 +4422,10 @@ class UiStrategySessionsMixin:
             self._time_stop_break_even_check.grid_remove()
             self._time_stop_break_even_bars_label.grid_remove()
             self._time_stop_break_even_bars_entry.grid_remove()
+            self._trend_ema_close_exit_after_trigger_r_enabled_check.grid_remove()
+            self._trend_ema_close_exit_after_trigger_r_label.grid_remove()
+            self._trend_ema_close_exit_after_trigger_r_entry.grid_remove()
+            self._trend_ema_close_exit_after_trigger_r_hint_label.grid_remove()
         if visibility.show_startup_chase_window:
             self._startup_chase_window_label.grid()
             self._startup_chase_window_entry.grid()
@@ -4654,6 +4673,17 @@ class UiStrategySessionsMixin:
         self._time_stop_break_even_bars_label.configure(state="normal" if dynamic_take_profit else "disabled")
         self._time_stop_break_even_bars_entry.configure(
             state="normal" if dynamic_take_profit and self.time_stop_break_even_enabled.get() else "disabled"
+        )
+        trend_exit_enabled = (
+            dynamic_take_profit
+            and self.trend_ema_close_exit_after_trigger_r_enabled.get()
+            and strategy_uses_parameter(definition.strategy_id, "trend_ema_close_exit_after_trigger_r")
+        )
+        self._trend_ema_close_exit_after_trigger_r_label.configure(
+            state="normal" if trend_exit_enabled else "disabled"
+        )
+        self._trend_ema_close_exit_after_trigger_r_entry.configure(
+            state="normal" if trend_exit_enabled else "disabled"
         )
 
     def _sync_daily_filter_controls(self) -> None:
@@ -5043,6 +5073,14 @@ class UiStrategySessionsMixin:
                 if strategy_supports_dynamic_take_profit(strategy_id)
                 and self.time_stop_break_even_enabled.get()
                 else 0
+            ),
+            trend_ema_close_exit_after_trigger_r_enabled=self.trend_ema_close_exit_after_trigger_r_enabled.get()
+            if strategy_uses_parameter(strategy_id, "trend_ema_close_exit_after_trigger_r_enabled")
+            else False,
+            trend_ema_close_exit_after_trigger_r=(
+                self._parse_positive_int(self.trend_ema_close_exit_after_trigger_r.get(), "趋势EMA平仓触发R")
+                if strategy_uses_parameter(strategy_id, "trend_ema_close_exit_after_trigger_r")
+                else 5
             ),
         )
         return credentials, config
@@ -5542,7 +5580,7 @@ class UiStrategySessionsMixin:
         trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or session.symbol).strip().upper()
         inst_type = infer_inst_type(trade_inst_id) if trade_inst_id else "SWAP"
         inst_types = (inst_type,)
-        return StrategyTradeReconciliationSnapshot(
+        snapshot = StrategyTradeReconciliationSnapshot(
             effective_environment=environment,
             order_history=self.client.get_order_history(credentials, environment=environment, inst_types=inst_types, limit=400),
             fills=self.client.get_fills_history(credentials, environment=environment, inst_types=inst_types, limit=400),
@@ -5559,6 +5597,11 @@ class UiStrategySessionsMixin:
                 limit=300,
             ),
         )
+        position_instruments = dict(getattr(self, "_position_instruments", {}) or {})
+        if trade_inst_id and trade_inst_id not in position_instruments:
+            position_instruments.update(_safe_build_history_instrument_map(self.client, [trade_inst_id]))
+        snapshot.position_instruments = position_instruments
+        return snapshot
 
     def _load_strategy_trade_reconciliation_snapshot_with_fallback(
         self,
@@ -5587,6 +5630,52 @@ class UiStrategySessionsMixin:
             if value
         )
         return any(marker in text for marker in FUNDING_FEE_BILL_MARKERS)
+
+    @staticmethod
+    def _strategy_trade_direction_sign(session: StrategySession) -> int | None:
+        direction = UiStrategySessionsMixin._trader_wave_lock_signal_from_session(session)
+        if direction == "long":
+            return 1
+        if direction == "short":
+            return -1
+        return None
+
+    def _estimate_strategy_trade_gross_pnl(
+        self,
+        session: StrategySession,
+        snapshot: StrategyTradeReconciliationSnapshot,
+        *,
+        trade_inst_id: str,
+        entry_price: Decimal | None,
+        exit_price: Decimal | None,
+        size: Decimal | None,
+    ) -> Decimal | None:
+        if not trade_inst_id or entry_price is None or exit_price is None or size is None or size <= 0:
+            return None
+        direction_sign = UiStrategySessionsMixin._strategy_trade_direction_sign(session)
+        if direction_sign is None:
+            return None
+        instruments = dict(getattr(snapshot, "position_instruments", {}) or {})
+        if not instruments:
+            instruments = dict(getattr(self, "_position_instruments", {}) or {})
+        base_currency = _extract_asset_key(trade_inst_id).upper()
+        quote_currency = (_extract_quote_key(trade_inst_id) or "").upper()
+        amount, currency = _history_display_amount(
+            inst_id=trade_inst_id,
+            inst_type=infer_inst_type(trade_inst_id) if trade_inst_id else "SWAP",
+            size=size,
+            reference_price=entry_price,
+            instruments=instruments,
+        )
+        if amount is None or amount <= 0:
+            return None
+        if quote_currency not in {"USDT", "USD", "USDC"} or currency != base_currency:
+            return None
+        return (exit_price - entry_price) * amount * direction_sign
+
+    @staticmethod
+    def _strategy_trade_reconciliation_needs_retry(result: StrategyTradeReconciliationResult) -> bool:
+        return result.error_message == "" and result.ledger_record is not None and result.ledger_record.net_pnl is None
 
     def _build_strategy_trade_reconciliation_result(
         self,
@@ -5792,11 +5881,35 @@ class UiStrategySessionsMixin:
             if funding_seen:
                 funding_fee = funding_total
 
+        if (
+            gross_pnl is None
+            and matched_position_history is not None
+            and matched_position_history.realized_pnl is not None
+            and (entry_fee is not None or exit_fee is not None or funding_fee is not None)
+        ):
+            gross_pnl = (
+                matched_position_history.realized_pnl
+                - (entry_fee or Decimal("0"))
+                - (exit_fee or Decimal("0"))
+                - (funding_fee or Decimal("0"))
+            )
+        if gross_pnl is None:
+            gross_pnl = self._estimate_strategy_trade_gross_pnl(
+                session,
+                snapshot,
+                trade_inst_id=trade_inst_id,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                size=size,
+            )
+
         net_pnl = None
         if gross_pnl is not None:
             net_pnl = gross_pnl + (entry_fee or Decimal("0")) + (exit_fee or Decimal("0")) + (funding_fee or Decimal("0"))
         elif matched_position_history is not None and matched_position_history.realized_pnl is not None:
             net_pnl = matched_position_history.realized_pnl
+        if gross_pnl is None and net_pnl is not None and (entry_fee is not None or exit_fee is not None or funding_fee is not None):
+            gross_pnl = net_pnl - (entry_fee or Decimal("0")) - (exit_fee or Decimal("0")) - (funding_fee or Decimal("0"))
 
         ledger_record = StrategyTradeLedgerRecord(
             record_id=self._next_strategy_trade_ledger_record_id(session, trade.round_id, closed_at),
@@ -5873,14 +5986,30 @@ class UiStrategySessionsMixin:
         session = self.sessions.get(session_id)
         if session is None:
             return
-        try:
-            snapshot = self._load_strategy_trade_reconciliation_snapshot_with_fallback(session, credentials)
-            result = self._build_strategy_trade_reconciliation_result(session, trade, snapshot)
-        except Exception as exc:
+        result: StrategyTradeReconciliationResult | None = None
+        for attempt in range(3):
+            try:
+                snapshot = self._load_strategy_trade_reconciliation_snapshot_with_fallback(session, credentials)
+                candidate = self._build_strategy_trade_reconciliation_result(session, trade, snapshot)
+            except Exception as exc:
+                if attempt >= 2:
+                    result = StrategyTradeReconciliationResult(
+                        session_id=session_id,
+                        round_id=trade.round_id,
+                        error_message=_format_network_error_message(str(exc)),
+                    )
+                    break
+                time.sleep(1.2)
+                continue
+            result = candidate
+            if not UiStrategySessionsMixin._strategy_trade_reconciliation_needs_retry(candidate) or attempt >= 2:
+                break
+            time.sleep(1.2)
+        if result is None:
             result = StrategyTradeReconciliationResult(
                 session_id=session_id,
                 round_id=trade.round_id,
-                error_message=_format_network_error_message(str(exc)),
+                error_message="本轮归因失败：未获取到有效结果。",
             )
         self.root.after(0, lambda: self._apply_strategy_trade_reconciliation_result(result))
 
@@ -6497,6 +6626,12 @@ class UiStrategySessionsMixin:
                     f"{self._bool_label(snapshot.get('time_stop_break_even_enabled', False))} / "
                     f"{self._snapshot_text(snapshot, 'time_stop_break_even_bars', '10')}根",
                 ]
+            )
+        if strategy_uses_parameter(strategy_id, "trend_ema_close_exit_after_trigger_r_enabled"):
+            parameter_rows.append(
+                "nR后跌破趋势EMA平仓："
+                + self._bool_label(snapshot.get("trend_ema_close_exit_after_trigger_r_enabled", False))
+                + f" / 触发R：{max(int(snapshot.get('trend_ema_close_exit_after_trigger_r', 5) or 5), 1)}"
             )
         if strategy_uses_parameter(strategy_id, "ema55_slope_exit_enabled"):
             parameter_rows.append(

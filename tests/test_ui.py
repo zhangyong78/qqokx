@@ -4696,6 +4696,122 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertIn("原因=OKX止损触发", result.attribution_summary)
         self.assertIn("累计净盈亏=-3.87", result.cumulative_summary)
 
+    def test_build_strategy_trade_reconciliation_result_estimates_missing_net_pnl_from_prices(self) -> None:
+        session = self._make_session()
+        session.strategy_name = "EMA dynamic"
+        session.symbol = "BTC-USDT-SWAP"
+        session.direction_label = "只做多"
+        session.trade_count = 2
+        session.win_count = 1
+        session.net_pnl_total = Decimal("19.52")
+        session.config = SimpleNamespace(
+            trade_inst_id="BTC-USDT-SWAP",
+            inst_id="BTC-USDT-SWAP",
+            environment="demo",
+            run_mode="trade",
+            tp_sl_mode="exchange",
+            take_profit_mode="dynamic",
+            position_mode="long_short",
+            signal_mode="long_only",
+            strategy_id="ema_dynamic_order_long",
+        )
+        prefix = _session_order_prefixes(session)[0]
+        open_ms = int(datetime(2026, 6, 14, 22, 34, 4).timestamp() * 1000)
+        close_ms = int(datetime(2026, 6, 16, 3, 18, 52).timestamp() * 1000)
+        trade = StrategyTradeRuntimeState(
+            round_id="round-3",
+            signal_bar_at=datetime(2026, 6, 14, 21, 0, 0),
+            opened_logged_at=datetime(2026, 6, 14, 22, 34, 4),
+            entry_order_id="1001",
+            entry_client_order_id=f"{prefix}ent061414000286663",
+            entry_price=Decimal("63992.7"),
+            size=Decimal("4.72"),
+            protective_algo_cl_ord_id=f"{prefix}slg061414000286664",
+            current_stop_price=Decimal("66576.8"),
+            reconciliation_started=True,
+        )
+        snapshot = StrategyTradeReconciliationSnapshot(
+            effective_environment="demo",
+            order_history=[
+                SimpleNamespace(
+                    client_order_id=f"{prefix}ent061414000286663",
+                    algo_client_order_id="",
+                    order_id="1001",
+                    algo_id="",
+                    inst_id="BTC-USDT-SWAP",
+                    side="buy",
+                    pos_side="long",
+                    filled_size=Decimal("4.72"),
+                    actual_size=Decimal("4.72"),
+                    avg_price=Decimal("63992.7"),
+                    actual_price=Decimal("63992.7"),
+                    price=Decimal("63992.7"),
+                    fee=Decimal("-0.45"),
+                    pnl=None,
+                    state="filled",
+                    update_time=open_ms,
+                    created_time=open_ms,
+                ),
+                SimpleNamespace(
+                    client_order_id="",
+                    algo_client_order_id=f"{prefix}slg061414000286664",
+                    order_id="3001",
+                    algo_id="4001",
+                    inst_id="BTC-USDT-SWAP",
+                    side="sell",
+                    pos_side="long",
+                    filled_size=Decimal("4.72"),
+                    actual_size=Decimal("4.72"),
+                    avg_price=Decimal("66576.8"),
+                    actual_price=Decimal("66576.8"),
+                    price=Decimal("66576.8"),
+                    fee=None,
+                    pnl=None,
+                    state="filled",
+                    update_time=close_ms,
+                    created_time=close_ms,
+                ),
+            ],
+            fills=[],
+            position_history=[],
+            account_bills=[],
+        )
+        snapshot.position_instruments = {
+            "BTC-USDT-SWAP": Instrument(
+                inst_id="BTC-USDT-SWAP",
+                inst_type="SWAP",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+                settle_ccy="USDT",
+                ct_val=Decimal("0.01"),
+                ct_mult=Decimal("1"),
+                ct_val_ccy="BTC",
+            )
+        }
+        app = SimpleNamespace(
+            _next_strategy_trade_ledger_record_id=lambda session_, round_id, closed_at: "T03",
+            _is_funding_fee_bill=QuantApp._is_funding_fee_bill,
+            _position_instruments={},
+        )
+        app._estimate_strategy_trade_gross_pnl = lambda current_session, current_snapshot, **kwargs: (
+            QuantApp._estimate_strategy_trade_gross_pnl(
+                app,
+                current_session,
+                current_snapshot,
+                **kwargs,
+            )
+        )
+
+        result = QuantApp._build_strategy_trade_reconciliation_result(app, session, trade, snapshot)
+
+        self.assertEqual(result.ledger_record.record_id, "T03")
+        self.assertEqual(result.ledger_record.gross_pnl, Decimal("121.96952"))
+        self.assertEqual(result.ledger_record.net_pnl, Decimal("121.51952"))
+        self.assertIn("净盈亏=+121.52", result.attribution_summary)
+        self.assertIn("累计净盈亏=+141.04", result.cumulative_summary)
+
     def test_upsert_strategy_trade_ledger_record_dedupes_same_round(self) -> None:
         existing = StrategyTradeLedgerRecord(
             record_id="legacy-1",

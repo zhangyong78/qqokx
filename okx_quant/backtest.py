@@ -86,6 +86,7 @@ EXIT_REASON_LABELS = {
     "signal_profit_exit": "信号失效盈利平仓",
     "break_even_stop": "保本",
     "slope_turn_positive": "斜率转正平仓",
+    "trend_ema_close_exit": "跌破趋势EMA收盘平仓",
 }
 
 
@@ -261,6 +262,8 @@ class BacktestResult:
     ema55_slope_dynamic_exit_bull_bar_reentry_max_r: int = 0
     time_stop_break_even_enabled: bool = False
     time_stop_break_even_bars: int = 0
+    trend_ema_close_exit_after_trigger_r_enabled: bool = False
+    trend_ema_close_exit_after_trigger_r: int = 5
     trend_ema_slope_filter_min_ratio: Decimal = Decimal("0")
     atr_percentile_filter_max: Decimal = Decimal("0")
     body_retest_breakdown_atr_multiplier: Decimal = Decimal("0")
@@ -483,6 +486,10 @@ def _ema55_slope_dynamic_fee_offset_enabled(config: StrategyConfig) -> bool:
 
 def _ema55_slope_lock_profit_trigger_r(config: StrategyConfig) -> int:
     return config.resolved_dynamic_trailing_start_r()
+
+
+def _trend_ema_close_exit_trigger_r(config: StrategyConfig) -> int:
+    return config.resolved_trend_ema_close_exit_after_trigger_r()
 
 
 def _dynamic_trailing_step_r(config: StrategyConfig) -> int:
@@ -1312,6 +1319,8 @@ def _run_backtest_with_loaded_data(
         ema55_slope_dynamic_exit_bull_bar_reentry_max_r=int(config.ema55_slope_dynamic_exit_bull_bar_reentry_max_r),
         time_stop_break_even_enabled=bool(config.time_stop_break_even_enabled),
         time_stop_break_even_bars=int(config.resolved_time_stop_break_even_bars()),
+        trend_ema_close_exit_after_trigger_r_enabled=bool(config.trend_ema_close_exit_after_trigger_r_enabled),
+        trend_ema_close_exit_after_trigger_r=int(config.resolved_trend_ema_close_exit_after_trigger_r()),
         trend_ema_slope_filter_min_ratio=Decimal(str(config.trend_ema_slope_filter_min_ratio)),
         atr_percentile_filter_max=Decimal(str(config.atr_percentile_filter_max)),
         body_retest_breakdown_atr_multiplier=Decimal(str(config.body_retest_breakdown_atr_multiplier)),
@@ -2026,6 +2035,7 @@ def _run_cross_backtest(
     for index in range(trade_start_index, len(candles)):
         candle = candles[index]
         if open_position is not None:
+            trend_ema = trend_ema_values[index] if index < len(trend_ema_values) else None
             closed_trade = _try_close_position(
                 open_position,
                 candle,
@@ -2035,6 +2045,34 @@ def _run_cross_backtest(
             )
             if closed_trade is not None:
                 trades.append(closed_trade)
+                open_position = None
+            elif (
+                bool(config.trend_ema_close_exit_after_trigger_r_enabled)
+                and open_position.signal == "long"
+                and trend_ema is not None
+                and candle.close <= trend_ema
+                and _dynamic_trigger_r_reached(open_position, _trend_ema_close_exit_trigger_r(config))
+            ):
+                exit_price_raw = candle.close
+                exit_price = _apply_slippage_price(
+                    exit_price_raw,
+                    signal=open_position.signal,
+                    tick_size=open_position.tick_size,
+                    slippage_rate=open_position.exit_slippage_rate,
+                    is_entry=False,
+                )
+                trades.append(
+                    _build_closed_trade(
+                        open_position,
+                        candle,
+                        index,
+                        exit_price_raw=exit_price_raw,
+                        exit_price=exit_price,
+                        exit_reason="trend_ema_close_exit",
+                        exit_fee_rate=taker_fee_rate,
+                        exit_fee_type="taker",
+                    )
+                )
                 open_position = None
             elif (
                 int(config.hold_close_exit_bars) > 0
@@ -2631,6 +2669,7 @@ def _run_adaptive_rail_backtest(
         candle = candles[index]
 
         if open_position is not None:
+            trend_ema = trend_ema_values[index] if index < len(trend_ema_values) else None
             closed_trade = _try_close_position(
                 open_position,
                 candle,
@@ -2926,6 +2965,7 @@ def _run_dynamic_backtest(
         candle = candles[index]
 
         if open_position is not None:
+            trend_ema = trend_ema_values[index] if index < len(trend_ema_values) else None
             closed_trade = _try_close_position(
                 open_position,
                 candle,
@@ -2935,6 +2975,34 @@ def _run_dynamic_backtest(
             )
             if closed_trade is not None:
                 trades.append(closed_trade)
+                open_position = None
+            elif (
+                bool(config.trend_ema_close_exit_after_trigger_r_enabled)
+                and open_position.signal == "long"
+                and trend_ema is not None
+                and candle.close <= trend_ema
+                and _dynamic_trigger_r_reached(open_position, _trend_ema_close_exit_trigger_r(config))
+            ):
+                exit_price_raw = candle.close
+                exit_price = _apply_slippage_price(
+                    exit_price_raw,
+                    signal=open_position.signal,
+                    tick_size=open_position.tick_size,
+                    slippage_rate=open_position.exit_slippage_rate,
+                    is_entry=False,
+                )
+                trades.append(
+                    _build_closed_trade(
+                        open_position,
+                        candle,
+                        index,
+                        exit_price_raw=exit_price_raw,
+                        exit_price=exit_price,
+                        exit_reason="trend_ema_close_exit",
+                        exit_fee_rate=taker_fee_rate,
+                        exit_fee_type="taker",
+                    )
+                )
                 open_position = None
 
         if active_plan is not None and open_position is None:
@@ -4005,6 +4073,15 @@ def _holding_bars_for_position(position: _OpenPosition, candle_index: int) -> in
     return max(candle_index - position.entry_index, 0)
 
 
+def _dynamic_trigger_r_reached(position: _OpenPosition, trigger_r: int) -> bool:
+    if not position.dynamic_take_profit_enabled:
+        return False
+    resolved_trigger_r = max(int(trigger_r), 1)
+    if _dynamic_rules_enabled(position):
+        return int(position.dynamic_last_processed_trigger_r) >= resolved_trigger_r
+    return int(position.next_dynamic_trigger_r) > resolved_trigger_r
+
+
 def _apply_time_stop_break_even(position: _OpenPosition, current_price: Decimal, holding_bars: int) -> bool:
     if not position.time_stop_break_even_enabled or position.time_stop_break_even_bars <= 0:
         return False
@@ -4714,6 +4791,11 @@ def _append_backtest_dynamic_take_profit_lines(lines: list[str], result: Backtes
         f"{'开启' if result.time_stop_break_even_enabled else '关闭'}"
         f" | 阈值K线：{result.time_stop_break_even_bars if result.time_stop_break_even_bars > 0 else '未启用'}"
     )
+    lines.append(
+        "nR后跌破趋势EMA收盘平仓："
+        f"{'开启' if result.trend_ema_close_exit_after_trigger_r_enabled else '关闭'}"
+        f" | 触发R：{result.trend_ema_close_exit_after_trigger_r}"
+    )
     if rule_descriptions:
         description = "止盈说明：" + "；".join(rule_descriptions) + "；固定止盈为 ATR 倍数止盈。"
     elif result.dynamic_two_r_break_even:
@@ -4760,6 +4842,12 @@ def _append_backtest_dynamic_take_profit_lines(lines: list[str], result: Backtes
             "时间保本说明：持仓满 "
             f"{result.time_stop_break_even_bars} 根K线后，若价格已达到净保本区间，则把止损合并上移到开仓价±2倍Taker手续费；"
             "该止损只会朝有利方向推进，不会回退。"
+        )
+    if result.trend_ema_close_exit_after_trigger_r_enabled:
+        lines.append(
+            f"趋势离场说明：当价格至少触发过 {result.trend_ema_close_exit_after_trigger_r}R 后，"
+            f"若后续某根 K 线收盘跌破 EMA{result.trend_ema_period}，"
+            "则按该根收盘价离场（含平仓滑点）。"
         )
 
 

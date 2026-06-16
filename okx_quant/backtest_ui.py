@@ -105,6 +105,12 @@ SIGNAL_LABEL_TO_VALUE = {
     "只做多": "long_only",
     "只做空": "short_only",
 }
+def _strategy_fast_line_caption(strategy_id: str) -> str:
+    if strategy_id in {STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, STRATEGY_EMA55_SLOPE_SHORT_ID}:
+        return "信号均线（斜率开平仓）"
+    return "快线均线"
+
+
 POSITION_MODE_OPTIONS = {
     "净持仓 net": "net",
     "双向持仓 long/short": "long_short",
@@ -240,6 +246,8 @@ class BacktestLaunchState:
     position_mode_label: str
     trigger_type_label: str
     environment_label: str
+    trend_ema_close_exit_after_trigger_r_enabled: bool = False
+    trend_ema_close_exit_after_trigger_r: str = "5"
     hold_close_exit_bars: str = "0"
     trend_ema_slope_filter_min_ratio: str = "0"
     atr_percentile_filter_max: str = "0"
@@ -434,15 +442,24 @@ class _BacktestSnapshotStore:
     def _save_to_disk(self) -> None:
         path = backtest_history_file_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "records": [_serialize_backtest_snapshot(self._snapshots[snapshot_id]) for snapshot_id in self._order],
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        # 流式写入避免在 32 位 Python 里为整个历史文件额外构造一份超大 JSON 字符串。
         # 固定名 .tmp 多实例会互踩；replace 在 Windows 上遇杀软/占用易 PermissionError，故用随机临时名 + 短重试。
         temp_path = path.with_name(f"{path.stem}.{uuid.uuid4().hex}.tmp")
         try:
-            temp_path.write_text(body, encoding="utf-8")
+            with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write('{"records":[')
+                for index, snapshot_id in enumerate(self._order):
+                    if index > 0:
+                        handle.write(",")
+                    json.dump(
+                        _serialize_backtest_snapshot(self._snapshots[snapshot_id]),
+                        handle,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                handle.write('],"updated_at":')
+                json.dump(datetime.now().isoformat(timespec="seconds"), handle, ensure_ascii=False)
+                handle.write("}\n")
             last_err: PermissionError | None = None
             for attempt in range(8):
                 try:
@@ -718,6 +735,30 @@ def _build_backtest_header_summary(snapshot: _BacktestSnapshot) -> str:
     )
 
 
+def _backtest_snapshot_matches_keyword(snapshot: _BacktestSnapshot, keyword: str) -> bool:
+    normalized = " ".join(str(keyword or "").strip().lower().split())
+    if not normalized:
+        return True
+    tokens = normalized.split(" ")
+    values = [
+        snapshot.snapshot_id,
+        _runtime_snapshot_id(snapshot) or "",
+        _archive_snapshot_id(snapshot) or "",
+        snapshot.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+        snapshot.config.strategy_id,
+        _strategy_display_name(snapshot.config),
+        snapshot.config.inst_id,
+        *_build_backtest_compare_row(snapshot),
+        *_build_backtest_compare_row(snapshot, prefer_archive=True),
+    ]
+    haystack = " ".join(str(value) for value in values if value).lower()
+    return all(token in haystack for token in tokens)
+
+
+def _filter_backtest_snapshots(snapshots: list[_BacktestSnapshot], keyword: str) -> list[_BacktestSnapshot]:
+    return [snapshot for snapshot in snapshots if _backtest_snapshot_matches_keyword(snapshot, keyword)]
+
+
 def _build_backtest_compare_row(snapshot: _BacktestSnapshot, *, prefer_archive: bool = False) -> tuple[str, ...]:
     report = snapshot.report
     config = snapshot.config
@@ -836,27 +877,41 @@ def _backtest_exit_mode_label(config: StrategyConfig) -> str:
 def _uses_dynamic_break_even_trigger_r(config: StrategyConfig) -> bool:
     return config.take_profit_mode == "dynamic" and strategy_uses_parameter(
         config.strategy_id,
-        "ema55_slope_lock_profit_trigger_r",
+        "dynamic_break_even_trigger_r",
     )
 
 
 def _dynamic_protection_summary_parts(config: StrategyConfig) -> tuple[str, ...]:
     rules = config.resolved_dynamic_protection_rules()
+    extra_parts: list[str] = []
+    if bool(config.trend_ema_close_exit_after_trigger_r_enabled):
+        extra_parts.append(f"{config.resolved_trend_ema_close_exit_after_trigger_r()}R破趋势EMA平仓")
     if rules:
-        return describe_dynamic_protection_rules(
-            rules,
-            fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
-        )
+        compact_parts: list[str] = []
+        for rule in rules:
+            trigger_r = rule.resolved_trigger_r()
+            if rule.resolved_action() == "break_even":
+                compact_parts.append(f"{trigger_r}R保本")
+                continue
+            lock_r = rule.resolved_lock_r()
+            if rule.trailing_enabled():
+                compact_parts.append(
+                    f"{trigger_r}R锁{lock_r}R后每{rule.resolved_trail_every_r()}R移{rule.resolved_trail_add_r()}R"
+                )
+            else:
+                compact_parts.append(f"{trigger_r}R锁{lock_r}R")
+        return tuple(compact_parts + extra_parts)
     if _uses_dynamic_break_even_trigger_r(config):
+        first_lock_r = max(int(config.dynamic_first_lock_r), 0)
+        trailing_start_r = max(int(config.ema55_slope_lock_profit_trigger_r), 2)
+        trailing_step_r = max(int(config.dynamic_trailing_step_r), 1)
+        effective_first_lock_r = first_lock_r if first_lock_r > 0 else max(trailing_start_r - trailing_step_r, 0)
         return (
-            f"保本触发R{max(int(config.dynamic_break_even_trigger_r), 1)}",
-            f"移动止盈触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
-            f"首档锁盈R{max(int(config.dynamic_first_lock_r), 0) if int(config.dynamic_first_lock_r) > 0 else '自动'}",
-            f"移动步长R{max(int(config.dynamic_trailing_step_r), 1)}",
-            f"首档触发R{max(int(config.ema55_slope_lock_profit_trigger_r), 2)}",
+            f"{max(int(config.dynamic_break_even_trigger_r), 1)}R保本",
             f"nR保本{config.dynamic_two_r_break_even_label()}",
-        )
-    return (f"2R保本{config.dynamic_two_r_break_even_label()}",)
+            f"{trailing_start_r}R锁{effective_first_lock_r}R后每{trailing_step_r}R移{trailing_step_r}R",
+        ) + tuple(extra_parts)
+    return (f"2R保本{config.dynamic_two_r_break_even_label()}",) + tuple(extra_parts)
 
 
 def _dynamic_protection_metric_parts(config: StrategyConfig) -> tuple[str, ...]:
@@ -894,98 +949,59 @@ def _build_backtest_param_summary(
     reference_label = config.entry_reference_line_label()
     profile = get_strategy_runtime_profile(config.strategy_id)
 
-    risk_text = "-" if config.risk_amount is None else format_decimal(config.risk_amount)
-    sizing_label = BACKTEST_SIZING_VALUE_TO_LABEL.get(config.backtest_sizing_mode, config.backtest_sizing_mode)
-    if config.backtest_sizing_mode == "risk_percent":
-        sizing_text = f"{sizing_label}{format_decimal(config.backtest_risk_percent or Decimal('0'))}%"
-    elif config.backtest_sizing_mode == "fixed_size":
-        sizing_text = f"{sizing_label}{format_decimal(config.order_size)}"
-    else:
-        sizing_text = f"{sizing_label}{risk_text}"
-
     if config.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
         return (
             f"{fast_label}/{trend_label} / ATR{config.atr_period} / "
             f"SLx{format_decimal(config.atr_stop_multiplier)} / "
             f"开仓连续负斜率{max(int(config.ema55_slope_negative_entry_bars), 1)}根 / "
             f"平仓规则{_btc_ema55_slope_exit_summary(config)} / "
-            f"再入场{_btc_ema55_slope_reentry_summary(config)} / "
-            f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
-            f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
-            f"{'复利' if config.backtest_compounding else '不复利'} / "
-            f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
-            f"{_format_backtest_slippage_summary(config)} / "
-            f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
+            f"再入场{_btc_ema55_slope_reentry_summary(config)}"
         )
 
     if config.strategy_id in {STRATEGY_EMA55_SLOPE_SHORT_ID, STRATEGY_BODY_RETEST_SHORT_ID}:
         extra_parts = [_backtest_exit_mode_label(config)]
         if config.take_profit_mode == "dynamic":
             extra_parts.extend(_dynamic_protection_summary_parts(config))
-            extra_parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
-            extra_parts.append(
-                f"时间保本{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
-            )
+            if config.time_stop_break_even_enabled and config.resolved_time_stop_break_even_bars() > 0:
+                extra_parts.append(f"时间保本{config.resolved_time_stop_break_even_bars()}根")
+        else:
+            extra_parts.append(f"TPx{format_decimal(config.atr_take_multiplier)}")
         extra_text = " / ".join(extra_parts)
         return (
             f"{fast_label}/{trend_label} / ATR{config.atr_period} / "
-            f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
-            f"{extra_text} / "
-            f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
-            f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
-            f"{'复利' if config.backtest_compounding else '不复利'} / "
-            f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
-            f"{_format_backtest_slippage_summary(config)} / "
-            f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
+            f"SLx{format_decimal(config.atr_stop_multiplier)} / {extra_text}"
         )
 
     if profile.uses_dynamic_orders or strategy_is_cross_family(config.strategy_id):
         extra_parts = [_backtest_exit_mode_label(config)]
         if config.take_profit_mode == "dynamic":
             extra_parts.extend(_dynamic_protection_summary_parts(config))
-            extra_parts.append(f"手续费偏移{config.dynamic_fee_offset_enabled_label()}")
-            extra_parts.append(
-                f"时间保本{config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
-            )
-        max_entries_text = "不限" if config.max_entries_per_trend <= 0 else f"每波前{config.max_entries_per_trend}次"
+            if config.time_stop_break_even_enabled and config.resolved_time_stop_break_even_bars() > 0:
+                extra_parts.append(f"时间保本{config.resolved_time_stop_break_even_bars()}根")
+        else:
+            extra_parts.append(f"TPx{format_decimal(config.atr_take_multiplier)}")
+        max_entries_text = "每波不限" if config.max_entries_per_trend <= 0 else f"每波{config.max_entries_per_trend}次"
         extra_parts.append(max_entries_text)
         if strategy_is_cross_family(config.strategy_id) and int(config.hold_close_exit_bars) > 0:
-            extra_parts.append(f"满{int(config.hold_close_exit_bars)}根收盘平仓")
+            extra_parts.append(f"{int(config.hold_close_exit_bars)}根收盘平仓")
         extra_text = " / ".join(extra_parts)
         ref_line_label = strategy_entry_reference_caption(config.strategy_id)
         return (
             f"{fast_label}/{trend_label} / ATR{config.atr_period} / "
             f"{ref_line_label}{reference_label} / "
-            f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
-            f"{extra_text} / "
-            f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
-            f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
-            f"{'复利' if config.backtest_compounding else '不复利'} / "
-            f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
-            f"{_format_backtest_slippage_summary(config)} / "
-            f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
+            f"SLx{format_decimal(config.atr_stop_multiplier)} / {extra_text}"
         )
 
     if profile.family == "ema5_ema8":
         return (
             f"4H固定 / {fast_label}/{trend_label}/EMA{config.big_ema_period} / "
-            f"{trend_label}动态止损 / 方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / "
-            f"仓位{sizing_text} / 本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
-            f"{'复利' if config.backtest_compounding else '不复利'} / "
-            f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
-            f"{_format_backtest_slippage_summary(config)} / "
-            f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
+            f"{trend_label}动态止损 / 方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)}"
         )
 
     return (
         f"{fast_label}/{trend_label}/EMA{config.big_ema_period} / ATR{config.atr_period} / "
         f"SLx{format_decimal(config.atr_stop_multiplier)} / TPx{format_decimal(config.atr_take_multiplier)} / "
-        f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)} / 仓位{sizing_text} / "
-        f"本金{format_decimal_fixed(config.backtest_initial_capital, 2)} / "
-        f"{'复利' if config.backtest_compounding else '不复利'} / "
-        f"M费{_format_fee_rate_percent(maker_fee_rate)} / T费{_format_fee_rate_percent(taker_fee_rate)} / "
-        f"{_format_backtest_slippage_summary(config)} / "
-        f"资金费{_format_fee_rate_percent(config.backtest_funding_rate)}"
+        f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)}"
     )
 def _backtest_export_detail_lines(export_path: str | None) -> list[str]:
     if not export_path:
@@ -1497,6 +1513,8 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "body_retest_watch_bars": int(config.body_retest_watch_bars),
         "time_stop_break_even_enabled": config.time_stop_break_even_enabled,
         "time_stop_break_even_bars": config.resolved_time_stop_break_even_bars(),
+        "trend_ema_close_exit_after_trigger_r_enabled": config.trend_ema_close_exit_after_trigger_r_enabled,
+        "trend_ema_close_exit_after_trigger_r": config.resolved_trend_ema_close_exit_after_trigger_r(),
         "hold_close_exit_bars": int(config.hold_close_exit_bars),
         "mtf_filter_inst_id": config.mtf_filter_inst_id,
         "mtf_filter_bar": config.mtf_filter_bar,
@@ -1632,6 +1650,10 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         body_retest_watch_bars=int(payload.get("body_retest_watch_bars", 6)),
         time_stop_break_even_enabled=bool(payload.get("time_stop_break_even_enabled", False)),
         time_stop_break_even_bars=int(payload.get("time_stop_break_even_bars", 10)),
+        trend_ema_close_exit_after_trigger_r_enabled=bool(
+            payload.get("trend_ema_close_exit_after_trigger_r_enabled", False)
+        ),
+        trend_ema_close_exit_after_trigger_r=str(payload.get("trend_ema_close_exit_after_trigger_r", 5)),
         hold_close_exit_bars=int(payload.get("hold_close_exit_bars", 0)),
         mtf_filter_inst_id=None
         if payload.get("mtf_filter_inst_id") in (None, "")
@@ -1825,6 +1847,7 @@ class BacktestCompareOverviewWindow:
         self._store = get_backtest_snapshot_store()
         self._subscription_token = self._store.subscribe(self._refresh)
         self.summary_text = StringVar(value="正在加载历史回测记录...")
+        self.filter_keyword = StringVar(value="")
 
         self._build_layout()
         self._refresh()
@@ -1847,6 +1870,15 @@ class BacktestCompareOverviewWindow:
         ttk.Label(header, textvariable=self.summary_text, justify="left").grid(row=0, column=0, sticky="w")
         ttk.Button(header, text="刷新", command=self._refresh).grid(row=0, column=1, sticky="e", padx=(8, 8))
         ttk.Button(header, text="清空全部历史", command=self._clear_all).grid(row=0, column=2, sticky="e")
+        filter_bar = ttk.Frame(header)
+        filter_bar.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        filter_bar.columnconfigure(1, weight=1)
+        ttk.Label(filter_bar, text="筛选").grid(row=0, column=0, sticky="w")
+        filter_entry = ttk.Entry(filter_bar, textvariable=self.filter_keyword)
+        filter_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        filter_entry.bind("<Return>", lambda *_: self._refresh())
+        ttk.Button(filter_bar, text="应用筛选", command=self._refresh).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(filter_bar, text="清空筛选", command=self._clear_filter).grid(row=0, column=3)
 
         tree_frame = ttk.Frame(self.window)
         tree_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
@@ -1879,7 +1911,9 @@ class BacktestCompareOverviewWindow:
         self.detail_text.grid(row=0, column=0, sticky="nsew")
 
     def _refresh(self) -> None:
-        snapshots = self._store.list_snapshots()
+        all_snapshots = self._store.list_snapshots()
+        keyword = self.filter_keyword.get()
+        snapshots = _filter_backtest_snapshots(all_snapshots, keyword)
         previous_selection = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
         for snapshot in snapshots:
@@ -1890,9 +1924,12 @@ class BacktestCompareOverviewWindow:
                 values=_build_backtest_compare_row(snapshot, prefer_archive=True),
             )
         if snapshots:
-            self.summary_text.set(
-                f"已保存 {len(snapshots)} 组历史回测结果。归档编号用于历史保存。"
-            )
+            summary = f"已保存 {len(all_snapshots)} 组历史回测结果。归档编号用于历史保存。"
+            if str(keyword).strip():
+                summary = f"{summary} 当前筛选：{len(snapshots)}/{len(all_snapshots)}。"
+            self.summary_text.set(summary)
+        elif all_snapshots and str(keyword).strip():
+            self.summary_text.set(f"已保存 {len(all_snapshots)} 组历史回测结果。当前筛选无结果。")
         else:
             self.summary_text.set("暂无历史回测记录。新的回测结果会自动保存到总览页。")
 
@@ -1906,6 +1943,10 @@ class BacktestCompareOverviewWindow:
             self._show_snapshot_detail(target_selection)
         else:
             self.detail_text.delete("1.0", END)
+
+    def _clear_filter(self) -> None:
+        self.filter_keyword.set("")
+        self._refresh()
 
     def _on_tree_selected(self, *_: object) -> None:
         selection = self.tree.selection()
@@ -1992,6 +2033,12 @@ class BacktestWindow:
         self.dynamic_fee_offset_enabled = BooleanVar(value=initial_state.dynamic_fee_offset_enabled)
         self.time_stop_break_even_enabled = BooleanVar(value=initial_state.time_stop_break_even_enabled)
         self.time_stop_break_even_bars = StringVar(value=initial_state.time_stop_break_even_bars)
+        self.trend_ema_close_exit_after_trigger_r_enabled = BooleanVar(
+            value=initial_state.trend_ema_close_exit_after_trigger_r_enabled
+        )
+        self.trend_ema_close_exit_after_trigger_r = StringVar(
+            value=initial_state.trend_ema_close_exit_after_trigger_r
+        )
         self.hold_close_exit_bars = StringVar(value=initial_state.hold_close_exit_bars)
         self.trend_ema_slope_filter_min_ratio = StringVar(value=initial_state.trend_ema_slope_filter_min_ratio)
         self.atr_percentile_filter_max = StringVar(value=initial_state.atr_percentile_filter_max)
@@ -2038,6 +2085,7 @@ class BacktestWindow:
         self.manual_filter_label = StringVar(value="全部")
         self.manual_sort_label = StringVar(value=MANUAL_DEFAULT_SORT_LABEL)
         self.compare_summary = StringVar(value="暂无回测对比记录。")
+        self.compare_filter_keyword = StringVar(value="")
         self.matrix_summary = StringVar(value="\u6682\u65e0 ATR \u6279\u91cf\u56de\u6d4b\u77e9\u9635\u3002")
         self.heatmap_summary = StringVar(
             value="\u53c2\u6570\u70ed\u529b\u56fe\u4f1a\u5728\u8fd9\u91cc\u663e\u793a\uff0c\u53ef\u5207\u6362\u6307\u6807\u5e76\u5355\u51fb\u5355\u5143\u683c\u8054\u52a8\u56de\u6d4b\u89c6\u56fe\u3002"
@@ -2091,6 +2139,8 @@ class BacktestWindow:
         self.end_time_text.trace_add("write", self._schedule_local_data_status_update)
         self.candle_limit.trace_add("write", self._schedule_local_data_status_update)
         self.pure_local_backtest.trace_add("write", self._schedule_local_data_status_update)
+        self.local_data_status.trace_add("write", self._refresh_backtest_action_summary)
+        self.history_sync_status.trace_add("write", self._refresh_backtest_action_summary)
 
         self._build_layout()
         self._update_batch_layer_controls("none", [])
@@ -2410,6 +2460,8 @@ class BacktestWindow:
             "dynamic_break_even_trigger_r": self.dynamic_break_even_trigger_r,
             "dynamic_protection_rules": self.dynamic_protection_rules_json,
             "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
+            "trend_ema_close_exit_after_trigger_r_enabled": self.trend_ema_close_exit_after_trigger_r_enabled,
+            "trend_ema_close_exit_after_trigger_r": self.trend_ema_close_exit_after_trigger_r,
             "trend_ema_slope_filter_min_ratio": self.trend_ema_slope_filter_min_ratio,
             "atr_percentile_filter_max": self.atr_percentile_filter_max,
             "body_retest_breakdown_atr_multiplier": self.body_retest_breakdown_atr_multiplier,
@@ -2513,7 +2565,7 @@ class BacktestWindow:
         label_map = {
             "bar": (self.bar_caption, "K线周期"),
             "signal_mode": (self.signal_caption, "信号方向"),
-            "ema_period": (self.ema_period_caption, "快线均线"),
+            "ema_period": (self.ema_period_caption, _strategy_fast_line_caption(strategy_id)),
             "trend_ema_period": (self.trend_ema_period_caption, "趋势均线"),
             "big_ema_period": (self.big_ema_caption, "大周期均线"),
         }
@@ -3177,14 +3229,42 @@ class BacktestWindow:
         self.time_stop_break_even_bars_label.grid(row=row, column=2, sticky="e", pady=(8, 0))
         self.time_stop_break_even_bars_entry = ttk.Entry(dynamic_section, textvariable=self.time_stop_break_even_bars)
         self.time_stop_break_even_bars_entry.grid(row=row, column=3, sticky="ew", padx=(0, 10), pady=(8, 0))
+        self.trend_ema_close_exit_after_trigger_r_enabled_check = ttk.Checkbutton(
+            dynamic_section,
+            text="达到 nR 后，收盘跌破趋势 EMA 平仓",
+            variable=self.trend_ema_close_exit_after_trigger_r_enabled,
+            command=self._sync_dynamic_take_profit_controls,
+        )
+        self.trend_ema_close_exit_after_trigger_r_enabled_check.grid(row=row, column=4, sticky="w", pady=(8, 0))
+        self.trend_ema_close_exit_after_trigger_r_label = ttk.Label(dynamic_section, text="趋势EMA平仓触发R")
+        self.trend_ema_close_exit_after_trigger_r_label.grid(row=row, column=5, sticky="e", pady=(8, 0))
+        self.trend_ema_close_exit_after_trigger_r_entry = ttk.Entry(
+            dynamic_section,
+            textvariable=self.trend_ema_close_exit_after_trigger_r,
+        )
+        self.trend_ema_close_exit_after_trigger_r_entry.grid(row=row, column=6, sticky="ew", padx=(0, 10), pady=(8, 0))
         self.ema55_slope_exit_conditions_caption = ttk.Label(dynamic_section, text="平仓条件")
-        self.ema55_slope_exit_conditions_caption.grid(row=row, column=4, sticky="e", pady=(8, 0))
+        self.ema55_slope_exit_conditions_caption.grid(row=row, column=7, sticky="e", pady=(8, 0))
         self.ema55_slope_exit_enabled_check = ttk.Checkbutton(
             dynamic_section,
-            text="EMA55 斜率重新转正时，按收盘价平仓",
+            text="信号均线斜率重新转正时，按收盘价平仓",
             variable=self.ema55_slope_exit_enabled,
         )
-        self.ema55_slope_exit_enabled_check.grid(row=row, column=5, sticky="w", pady=(8, 0))
+        self.ema55_slope_exit_enabled_check.grid(row=row, column=8, sticky="w", pady=(8, 0))
+
+        row += 1
+        self.trend_ema_close_exit_after_trigger_r_hint_label = ttk.Label(
+            dynamic_section,
+            text="趋势 EMA 随上方趋势均线同步",
+            foreground="#57606a",
+        )
+        self.trend_ema_close_exit_after_trigger_r_hint_label.grid(
+            row=row,
+            column=4,
+            columnspan=3,
+            sticky="w",
+            pady=(2, 0),
+        )
 
         row += 1
         self.ema55_slope_lock_profit_enabled_check = ttk.Checkbutton(
@@ -3381,6 +3461,14 @@ class BacktestWindow:
         actions_bar = ttk.Frame(backtest_section)
         actions_bar.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         actions_bar.columnconfigure(0, weight=1)
+        self._backtest_action_summary = StringVar(value="")
+        self._backtest_action_summary_label = ttk.Label(
+            actions_bar,
+            textvariable=self._backtest_action_summary,
+            justify="left",
+            anchor="w",
+        )
+        self._backtest_action_summary_label.grid(row=0, column=0, sticky="ew", padx=(0, 12))
         run_btn_frame = ttk.Frame(actions_bar)
         run_btn_frame.grid(row=0, column=1, sticky="e")
         self.single_backtest_button = ttk.Button(
@@ -3391,28 +3479,7 @@ class BacktestWindow:
         self.single_backtest_button.pack(side=LEFT, padx=(0, 8))
         self.batch_backtest_button = ttk.Button(run_btn_frame, text="开始回测", command=self.start_backtest)
         self.batch_backtest_button.pack(side=LEFT)
-
-        self._local_data_status_label = ttk.Label(backtest_section, textvariable=self.local_data_status, justify="left")
-        self._local_data_status_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self._bind_responsive_wrap(self._local_data_status_label, backtest_section, padding=36, min_wrap=420)
-
-        batch_note = ttk.Frame(backtest_section)
-        batch_note.grid(row=3, column=0, sticky="ew", pady=(6, 0))
-        batch_note.columnconfigure(0, weight=1)
-        self._batch_mode_hint_label = ttk.Label(
-            batch_note,
-            text="\u201c\u5f00\u59cb\u56de\u6d4b\u201d\u4f1a\u56fa\u5b9a\u8fd0\u884c SL x 1/1.5/2\uff0c\u6bcf\u4e00\u884c\u518d\u6309 TP = SL x 1/2/3 \u751f\u6210 9 \u7ec4\u6279\u91cf\u56de\u6d4b\u3002",
-            justify="left",
-        )
-        self._batch_mode_hint_label.grid(row=0, column=0, sticky="w")
-        self._bind_responsive_wrap(self._batch_mode_hint_label, batch_note, padding=36, min_wrap=420)
-        self._history_sync_status_label = ttk.Label(
-            batch_note,
-            textvariable=self.history_sync_status,
-            justify="left",
-        )
-        self._history_sync_status_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self._bind_responsive_wrap(self._history_sync_status_label, batch_note, padding=36, min_wrap=420)
+        self._refresh_backtest_action_summary()
 
         content_frame = ttk.Frame(main_pane)
         content_frame.columnconfigure(0, weight=1)
@@ -3471,10 +3538,16 @@ class BacktestWindow:
 
         compare_toolbar = ttk.Frame(compare_tab)
         compare_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        compare_toolbar.columnconfigure(0, weight=1)
+        compare_toolbar.columnconfigure(2, weight=1)
         ttk.Label(compare_toolbar, textvariable=self.compare_summary, justify="left").grid(row=0, column=0, sticky="w")
-        ttk.Button(compare_toolbar, text="加载所选", command=self.load_selected_snapshot).grid(row=0, column=1, sticky="e", padx=(8, 8))
-        ttk.Button(compare_toolbar, text="清空记录", command=self.clear_backtest_snapshots).grid(row=0, column=2, sticky="e")
+        ttk.Label(compare_toolbar, text="筛选").grid(row=0, column=1, sticky="e", padx=(12, 6))
+        compare_filter_entry = ttk.Entry(compare_toolbar, textvariable=self.compare_filter_keyword, width=30)
+        compare_filter_entry.grid(row=0, column=2, sticky="ew")
+        compare_filter_entry.bind("<Return>", lambda *_: self._render_compare_tree())
+        ttk.Button(compare_toolbar, text="应用筛选", command=self._render_compare_tree).grid(row=0, column=3, sticky="e", padx=(8, 6))
+        ttk.Button(compare_toolbar, text="清空筛选", command=self._clear_compare_filter).grid(row=0, column=4, sticky="e", padx=(0, 8))
+        ttk.Button(compare_toolbar, text="加载所选", command=self.load_selected_snapshot).grid(row=0, column=5, sticky="e", padx=(0, 8))
+        ttk.Button(compare_toolbar, text="清空记录", command=self.clear_backtest_snapshots).grid(row=0, column=6, sticky="e")
 
         compare_tree_frame = ttk.Frame(compare_tab)
         compare_tree_frame.grid(row=1, column=0, sticky="nsew")
@@ -3922,6 +3995,45 @@ class BacktestWindow:
 
     def _selected_history_sync_bars(self) -> list[str]:
         return [bar for bar in BACKTEST_HISTORY_SYNC_BARS if self.sync_history_bar_vars[bar].get()]
+
+    @staticmethod
+    def _compact_status_text(text: str) -> str:
+        return text.strip().replace("\n", " ").rstrip("。")
+
+    def _compact_local_data_status(self) -> str:
+        text = self._compact_status_text(self.local_data_status.get())
+        if text.startswith("本地数据："):
+            text = f"本地：{text.split('：', 1)[1]}"
+        if text.startswith("纯本地数据："):
+            text = f"纯本地：{text.split('：', 1)[1]}"
+        if text.startswith("本地优先数据："):
+            text = f"本地优先：{text.split('：', 1)[1]}"
+        text = text.replace(" 共 ", " ").replace(" 根，覆盖 ", "根，")
+        if "。可先" in text:
+            text = text.split("。", 1)[0]
+        return text
+
+    def _compact_history_sync_status(self) -> str:
+        text = self._compact_status_text(self.history_sync_status.get())
+        if text.startswith("先勾选要同步的周期"):
+            return "同步：勾选周期后同步，纯本地仅用缓存"
+        if text.startswith("正在同步历史数据"):
+            return text.replace("正在同步历史数据", "同步中", 1)
+        if text.startswith("正在校验本地缓存"):
+            return text.replace("正在校验本地缓存", "校验中", 1)
+        if text.startswith("正在同步价格精度/下单规则"):
+            return text.replace("正在同步价格精度/下单规则", "规则同步中", 1)
+        return text
+
+    def _refresh_backtest_action_summary(self, *_: str) -> None:
+        if not hasattr(self, "_backtest_action_summary"):
+            return
+        parts = [
+            self._compact_local_data_status(),
+            "批量：SL×1/1.5/2，TP×1/2/3，共9组",
+            self._compact_history_sync_status(),
+        ]
+        self._backtest_action_summary.set("；".join(part for part in parts if part))
 
     def _schedule_local_data_status_update(self, *_: str) -> None:
         if not self._ui_alive():
@@ -4920,6 +5032,7 @@ class BacktestWindow:
         body_retest_watch_bars = 6
         time_stop_break_even_enabled = False
         time_stop_break_even_bars = 0
+        trend_ema_close_exit_after_trigger_r_enabled = False
         hold_close_exit_bars = 0
         ema55_slope_exit_enabled = True
         ema55_slope_lock_profit_enabled = False
@@ -5067,6 +5180,18 @@ class BacktestWindow:
                 if time_stop_break_even_enabled
                 else 0
             )
+        if strategy_uses_parameter(definition.strategy_id, "trend_ema_close_exit_after_trigger_r_enabled"):
+            trend_ema_close_exit_after_trigger_r_enabled = bool(
+                self.trend_ema_close_exit_after_trigger_r_enabled.get()
+            )
+        trend_ema_close_exit_after_trigger_r = 5
+        if strategy_uses_parameter(definition.strategy_id, "trend_ema_close_exit_after_trigger_r"):
+            trend_ema_close_exit_after_trigger_r = self._parse_positive_int(
+                self.trend_ema_close_exit_after_trigger_r.get(),
+                "趋势EMA平仓触发R",
+            )
+            if trend_ema_close_exit_after_trigger_r < 1:
+                raise ValueError("趋势EMA平仓触发R 不能小于 1")
         if strategy_uses_parameter(definition.strategy_id, "hold_close_exit_bars"):
             hold_close_exit_bars = self._parse_nonnegative_int(self.hold_close_exit_bars.get(), "满N根K线收盘价平仓")
         if strategy_uses_parameter(definition.strategy_id, "ema55_slope_exit_enabled"):
@@ -5176,6 +5301,8 @@ class BacktestWindow:
             body_retest_watch_bars=body_retest_watch_bars,
             time_stop_break_even_enabled=time_stop_break_even_enabled,
             time_stop_break_even_bars=time_stop_break_even_bars,
+            trend_ema_close_exit_after_trigger_r_enabled=trend_ema_close_exit_after_trigger_r_enabled,
+            trend_ema_close_exit_after_trigger_r=trend_ema_close_exit_after_trigger_r,
             hold_close_exit_bars=hold_close_exit_bars,
             mtf_filter_bar=mtf_filter_bar,
             mtf_filter_fast_ema_period=mtf_filter_fast_ema_period,
@@ -5353,6 +5480,10 @@ class BacktestWindow:
                 self.time_stop_break_even_check,
                 self.time_stop_break_even_bars_label,
                 self.time_stop_break_even_bars_entry,
+                self.trend_ema_close_exit_after_trigger_r_enabled_check,
+                self.trend_ema_close_exit_after_trigger_r_label,
+                self.trend_ema_close_exit_after_trigger_r_entry,
+                self.trend_ema_close_exit_after_trigger_r_hint_label,
             )
             for widget in dynamic_widgets:
                 if visibility.show_dynamic_take_profit:
@@ -5386,6 +5517,16 @@ class BacktestWindow:
                     widget.grid()
                 else:
                     widget.grid_remove()
+            if strategy_uses_parameter(strategy_id, "trend_ema_close_exit_after_trigger_r_enabled"):
+                self.trend_ema_close_exit_after_trigger_r_enabled_check.grid()
+                self.trend_ema_close_exit_after_trigger_r_label.grid()
+                self.trend_ema_close_exit_after_trigger_r_entry.grid()
+                self.trend_ema_close_exit_after_trigger_r_hint_label.grid()
+            else:
+                self.trend_ema_close_exit_after_trigger_r_enabled_check.grid_remove()
+                self.trend_ema_close_exit_after_trigger_r_label.grid_remove()
+                self.trend_ema_close_exit_after_trigger_r_entry.grid_remove()
+                self.trend_ema_close_exit_after_trigger_r_hint_label.grid_remove()
             btc_slope_exit_widgets = (
                 self.ema55_slope_lock_profit_enabled_check,
                 self.ema55_slope_lock_profit_trigger_r_label,
@@ -5612,6 +5753,25 @@ class BacktestWindow:
         self.time_stop_break_even_bars_entry.configure(
             state="normal" if dynamic_take_profit and self.time_stop_break_even_enabled.get() else "disabled"
         )
+        self.trend_ema_close_exit_after_trigger_r_enabled_check.configure(
+            state=(
+                "normal"
+                if dynamic_take_profit
+                and strategy_uses_parameter(definition.strategy_id, "trend_ema_close_exit_after_trigger_r_enabled")
+                else "disabled"
+            )
+        )
+        trend_ema_close_exit_enabled = (
+            dynamic_take_profit
+            and self.trend_ema_close_exit_after_trigger_r_enabled.get()
+            and strategy_uses_parameter(definition.strategy_id, "trend_ema_close_exit_after_trigger_r")
+        )
+        self.trend_ema_close_exit_after_trigger_r_label.configure(
+            state="normal" if trend_ema_close_exit_enabled else "disabled"
+        )
+        self.trend_ema_close_exit_after_trigger_r_entry.configure(
+            state="normal" if trend_ema_close_exit_enabled else "disabled"
+        )
 
     def _sync_ema55_slope_exit_condition_controls(self) -> None:
         if not hasattr(self, "ema55_slope_lock_profit_trigger_r_entry"):
@@ -5749,6 +5909,10 @@ class BacktestWindow:
         self.dynamic_fee_offset_enabled.set(bool(config.dynamic_fee_offset_enabled))
         self.time_stop_break_even_enabled.set(bool(config.time_stop_break_even_enabled))
         self.time_stop_break_even_bars.set(str(config.time_stop_break_even_bars))
+        self.trend_ema_close_exit_after_trigger_r_enabled.set(
+            bool(config.trend_ema_close_exit_after_trigger_r_enabled)
+        )
+        self.trend_ema_close_exit_after_trigger_r.set(str(config.resolved_trend_ema_close_exit_after_trigger_r()))
         self.hold_close_exit_bars.set(str(config.hold_close_exit_bars))
         self.trend_ema_slope_filter_min_ratio.set(format_decimal(config.trend_ema_slope_filter_min_ratio))
         self.atr_percentile_filter_max.set(format_decimal(config.atr_percentile_filter_max))
@@ -5825,8 +5989,7 @@ class BacktestWindow:
             self._batch_snapshot_groups.setdefault(batch_label, []).append(snapshot.snapshot_id)
             self._snapshot_batch_labels[snapshot.snapshot_id] = batch_label
         if self._ui_alive() and self._widget_exists(getattr(self, "compare_tree", None)):
-            self.compare_tree.insert("", END, iid=snapshot.snapshot_id, values=_build_backtest_compare_row(snapshot))
-            self._update_compare_summary()
+            self._render_compare_tree(target_snapshot_id=snapshot.snapshot_id)
         archive_snapshot = get_backtest_snapshot_store().add_snapshot(
             result,
             config,
@@ -5836,19 +5999,60 @@ class BacktestWindow:
         )
         snapshot = replace(snapshot, archive_id=_archive_snapshot_id(archive_snapshot))
         self._backtest_snapshots[snapshot.snapshot_id] = snapshot
-        if self._ui_alive() and self._widget_exists(getattr(self, "compare_tree", None)) and self.compare_tree.exists(snapshot.snapshot_id):
-            self.compare_tree.item(snapshot.snapshot_id, values=_build_backtest_compare_row(snapshot))
+        if self._ui_alive() and self._widget_exists(getattr(self, "compare_tree", None)):
+            self._render_compare_tree(target_snapshot_id=snapshot.snapshot_id)
         return snapshot
 
     def _update_compare_summary(self) -> None:
-        count = len(self._backtest_snapshot_order)
-        if count == 0:
+        total_count = len(self._backtest_snapshot_order)
+        if total_count == 0:
             self.compare_summary.set("暂无回测对比记录。")
             return
-        self.compare_summary.set(
-            f"已保存 {count} 组回测结果。单击任一运行编号即可联动切换当前结果，详情里可查看对应归档编号。"
-        )
+        visible_count = len(self.compare_tree.get_children()) if self._widget_exists(getattr(self, "compare_tree", None)) else total_count
+        summary = f"已保存 {total_count} 组回测结果。单击任一运行编号即可联动切换当前结果，详情里可查看对应归档编号。"
+        if str(self.compare_filter_keyword.get()).strip():
+            summary = f"{summary} 当前筛选：{visible_count}/{total_count}。"
+        self.compare_summary.set(summary)
         return
+
+    def _ordered_compare_snapshots(self) -> list[_BacktestSnapshot]:
+        return [self._backtest_snapshots[snapshot_id] for snapshot_id in self._backtest_snapshot_order if snapshot_id in self._backtest_snapshots]
+
+    def _filtered_compare_snapshots(self) -> list[_BacktestSnapshot]:
+        return _filter_backtest_snapshots(self._ordered_compare_snapshots(), self.compare_filter_keyword.get())
+
+    def _render_compare_tree(self, target_snapshot_id: str | None = None) -> None:
+        if not self._widget_exists(getattr(self, "compare_tree", None)):
+            return
+        previous_selection = self.compare_tree.selection()
+        snapshots = self._filtered_compare_snapshots()
+        visible_ids = {snapshot.snapshot_id for snapshot in snapshots}
+        self.compare_tree.delete(*self.compare_tree.get_children())
+        for snapshot in snapshots:
+            self.compare_tree.insert("", END, iid=snapshot.snapshot_id, values=_build_backtest_compare_row(snapshot))
+        self._update_compare_summary()
+        selected_id = None
+        if target_snapshot_id and target_snapshot_id in visible_ids:
+            selected_id = target_snapshot_id
+        elif previous_selection and previous_selection[0] in visible_ids:
+            selected_id = previous_selection[0]
+        elif self._current_snapshot_id and self._current_snapshot_id in visible_ids:
+            selected_id = self._current_snapshot_id
+        elif snapshots:
+            selected_id = snapshots[-1].snapshot_id
+        if selected_id is not None:
+            self.compare_tree.selection_set(selected_id)
+            self.compare_tree.focus(selected_id)
+            self.compare_tree.see(selected_id)
+            self._update_compare_detail(self._backtest_snapshots[selected_id])
+            self._show_batch_matrix_for_snapshot(selected_id)
+            return
+        self.compare_detail_text.delete("1.0", END)
+        self._show_batch_matrix(None)
+
+    def _clear_compare_filter(self) -> None:
+        self.compare_filter_keyword.set("")
+        self._render_compare_tree()
 
     def _on_compare_tree_selected(self, *_: object) -> None:
         snapshot = self._selected_compare_snapshot()
@@ -7289,13 +7493,31 @@ class BacktestWindow:
             canvas.create_line(entry_x, take_y, exit_x, take_y, fill="#1a7f37", dash=(4, 2))
             canvas.create_oval(entry_x - 4, entry_y - 4, entry_x + 4, entry_y + 4, fill=trade_color, outline="")
             canvas.create_oval(exit_x - 5, exit_y - 5, exit_x + 5, exit_y + 5, fill=exit_color, outline="")
-            canvas.create_text(
-                exit_x + 8,
+            exit_label = _format_backtest_trade_exit_label(trade)
+            label_anchor = "e" if exit_x > width - right - 52 else "w"
+            label_x = exit_x - 8 if label_anchor == "e" else exit_x + 8
+            label_id = canvas.create_text(
+                label_x,
                 exit_y,
-                text=_format_backtest_trade_exit_label(trade),
-                anchor="w",
-                fill=exit_color,
+                text=exit_label,
+                anchor=label_anchor,
+                fill="#ffffff",
+                font=("Microsoft YaHei UI", 10, "bold"),
             )
+            label_bbox = canvas.bbox(label_id)
+            if label_bbox is not None:
+                pad_x = 4
+                pad_y = 2
+                badge_id = canvas.create_rectangle(
+                    label_bbox[0] - pad_x,
+                    label_bbox[1] - pad_y,
+                    label_bbox[2] + pad_x,
+                    label_bbox[3] + pad_y,
+                    fill=exit_color,
+                    outline="#ffffff",
+                    width=1,
+                )
+                canvas.tag_lower(badge_id, label_id)
 
         if result.open_position is not None and result.candles:
             open_position = result.open_position

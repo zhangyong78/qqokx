@@ -417,6 +417,8 @@ class StrategyConfig:
     startup_chase_window_seconds: int = 0
     time_stop_break_even_enabled: bool = False
     time_stop_break_even_bars: int = 10
+    trend_ema_close_exit_after_trigger_r_enabled: bool = False
+    trend_ema_close_exit_after_trigger_r: int = 5
     hold_close_exit_bars: int = 0
     trader_virtual_stop_loss: bool = False
     backtest_profile_id: str = ""
@@ -589,6 +591,9 @@ class StrategyConfig:
 
     def time_stop_break_even_enabled_label(self) -> str:
         return "\u5f00\u542f" if self.time_stop_break_even_enabled else "\u5173\u95ed"
+
+    def resolved_trend_ema_close_exit_after_trigger_r(self) -> int:
+        return max(int(self.trend_ema_close_exit_after_trigger_r), 1)
 
 
 

@@ -57,8 +57,10 @@ from okx_quant.backtest_ui import (
     _build_backtest_symbol_options,
     _build_backtest_compare_detail,
     _build_backtest_compare_row,
+    _backtest_snapshot_matches_keyword,
     _build_open_position_summary,
     _filter_manual_positions,
+    _filter_backtest_snapshots,
     _has_extension_stats,
     _build_manual_pool_summary,
     _build_manual_position_row,
@@ -3336,6 +3338,122 @@ class BacktestTest(TestCase):
         self.assertIn("EMA21", row[6])
         self.assertEqual(row[7], "3")
         self.assertEqual(row[8], "66.67%")
+
+    def test_backtest_snapshot_matches_keyword_supports_multiple_fields(self) -> None:
+        report = BacktestReport(
+            total_trades=3,
+            win_trades=2,
+            loss_trades=1,
+            breakeven_trades=0,
+            win_rate=Decimal("66.67"),
+            total_pnl=Decimal("123.4567"),
+            average_pnl=Decimal("41.1522"),
+            gross_profit=Decimal("200"),
+            gross_loss=Decimal("76.5433"),
+            profit_factor=Decimal("2.61"),
+            average_win=Decimal("100"),
+            average_loss=Decimal("76.5433"),
+            profit_loss_ratio=Decimal("1.31"),
+            average_r_multiple=Decimal("0.9"),
+            max_drawdown=Decimal("55.4321"),
+            take_profit_hits=2,
+            stop_loss_hits=1,
+        )
+        snapshot = _BacktestSnapshot(
+            snapshot_id="R001",
+            created_at=datetime(2026, 3, 23, 12, 30, 45),
+            config=StrategyConfig(
+                inst_id="BTC-USDT-SWAP",
+                bar="15m",
+                ema_period=21,
+                trend_ema_period=55,
+                atr_period=14,
+                atr_stop_multiplier=Decimal("2"),
+                atr_take_multiplier=Decimal("4"),
+                order_size=Decimal("0"),
+                trade_mode="cross",
+                signal_mode="long_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+                strategy_id=STRATEGY_DYNAMIC_ID,
+                risk_amount=Decimal("100"),
+            ),
+            candle_limit=500,
+            candle_count=500,
+            report=report,
+            report_text="示例详情",
+            start_ts=1711152000000,
+            end_ts=1711238400000,
+            archive_id="S392",
+        )
+
+        self.assertTrue(_backtest_snapshot_matches_keyword(snapshot, "BTC-USDT-SWAP"))
+        self.assertTrue(_backtest_snapshot_matches_keyword(snapshot, "S392"))
+        self.assertTrue(_backtest_snapshot_matches_keyword(snapshot, "R001 BTC-USDT"))
+        self.assertTrue(_backtest_snapshot_matches_keyword(snapshot, "ema21"))
+        self.assertFalse(_backtest_snapshot_matches_keyword(snapshot, "ETH short_only"))
+
+    def test_filter_backtest_snapshots_returns_only_matching_items(self) -> None:
+        report = BacktestReport(
+            total_trades=1,
+            win_trades=1,
+            loss_trades=0,
+            breakeven_trades=0,
+            win_rate=Decimal("100"),
+            total_pnl=Decimal("10"),
+            average_pnl=Decimal("10"),
+            gross_profit=Decimal("10"),
+            gross_loss=Decimal("0"),
+            profit_factor=Decimal("10"),
+            average_win=Decimal("10"),
+            average_loss=Decimal("0"),
+            profit_loss_ratio=None,
+            average_r_multiple=Decimal("1"),
+            max_drawdown=Decimal("1"),
+            take_profit_hits=1,
+            stop_loss_hits=0,
+        )
+        first = _BacktestSnapshot(
+            snapshot_id="R001",
+            created_at=datetime(2026, 3, 23, 12, 30, 45),
+            config=StrategyConfig(
+                inst_id="BTC-USDT-SWAP",
+                bar="15m",
+                ema_period=21,
+                trend_ema_period=55,
+                atr_period=14,
+                atr_stop_multiplier=Decimal("2"),
+                atr_take_multiplier=Decimal("4"),
+                order_size=Decimal("0"),
+                trade_mode="cross",
+                signal_mode="long_only",
+                position_mode="net",
+                environment="demo",
+                tp_sl_trigger_type="mark",
+                strategy_id=STRATEGY_DYNAMIC_ID,
+                risk_amount=Decimal("100"),
+            ),
+            candle_limit=500,
+            candle_count=500,
+            report=report,
+            report_text="示例详情",
+            archive_id="S392",
+        )
+        second = _BacktestSnapshot(
+            snapshot_id="R002",
+            created_at=datetime(2026, 3, 24, 12, 30, 45),
+            config=replace(first.config, inst_id="ETH-USDT-SWAP"),
+            candle_limit=500,
+            candle_count=500,
+            report=report,
+            report_text="示例详情",
+            archive_id="S393",
+        )
+
+        filtered = _filter_backtest_snapshots([first, second], "ETH S393")
+
+        self.assertEqual([snapshot.snapshot_id for snapshot in filtered], ["R002"])
 
     def test_build_backtest_param_summary_for_btc_slope_short_includes_exit_toggles(self) -> None:
         summary = _build_backtest_param_summary(
