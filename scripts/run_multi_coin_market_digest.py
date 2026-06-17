@@ -13,7 +13,10 @@ from okx_quant.market_analysis import MarketAnalysisConfig
 from okx_quant.multi_coin_market_digest import (
     DEFAULT_DIGEST_SYMBOLS,
     analyze_multi_coin_market,
+    archive_pending_multi_coin_market_email,
     multi_coin_market_digest_json,
+    prepare_multi_coin_market_email,
+    release_pending_multi_coin_market_emails,
     save_multi_coin_market_digest,
     send_multi_coin_market_email,
 )
@@ -43,6 +46,22 @@ def main() -> None:
         help="How bullish/bearish probability streaks are defined.",
     )
     parser.add_argument("--send-email", action="store_true", help="Send the combined digest email.")
+    parser.add_argument(
+        "--delivery-mode",
+        choices=("immediate", "archive_only", "release_pending_and_send"),
+        default="immediate",
+        help="Email delivery mode. immediate=send now, archive_only=archive and defer, release_pending_and_send=send pending first then send current.",
+    )
+    parser.add_argument(
+        "--scheduled-release-slot",
+        default="08:00",
+        help="Target release slot for deferred emails, default 08:00.",
+    )
+    parser.add_argument(
+        "--analysis-slot",
+        default="",
+        help="Optional analysis slot label like 00:00/04:00/08:00 to store in archive metadata.",
+    )
     parser.add_argument("--print-json", action="store_true", help="Print the JSON payload to stdout after saving the report.")
     args = parser.parse_args()
 
@@ -61,8 +80,26 @@ def main() -> None:
         print(multi_coin_market_digest_json(digest))
 
     if args.send_email:
-        delivered = send_multi_coin_market_email(digest, report_path=output_path)
-        print("email_sent" if delivered else "email_not_sent")
+        if args.delivery_mode == "archive_only":
+            archive_path = archive_pending_multi_coin_market_email(
+                digest,
+                report_path=output_path,
+                scheduled_release_slot=args.scheduled_release_slot,
+                analysis_slot=args.analysis_slot,
+            )
+            print(archive_path)
+            print("email_deferred")
+        elif args.delivery_mode == "release_pending_and_send":
+            released = release_pending_multi_coin_market_emails(
+                scheduled_release_slot=args.scheduled_release_slot,
+                update_email_state=False,
+            )
+            delivered = send_multi_coin_market_email(digest, report_path=output_path)
+            print(f"pending_released={released}")
+            print("email_sent" if delivered else "email_not_sent")
+        else:
+            delivered = send_multi_coin_market_email(digest, report_path=output_path)
+            print("email_sent" if delivered else "email_not_sent")
 
 
 if __name__ == "__main__":

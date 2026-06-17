@@ -1054,6 +1054,21 @@ class StrategyEngine:
                 self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前无法生成挂单 | {exc}")
                 self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                 continue
+            if startup_gate_message:
+                should_skip_by_stop, stop_crossed_message = self._should_skip_startup_takeover_when_stop_crossed(
+                    startup_gate,
+                    config,
+                    signal=decision.signal,
+                    candle_ts=decision.candle_ts,
+                    trigger_inst_id=plan.inst_id,
+                    stop_loss=plan.stop_loss,
+                )
+                if should_skip_by_stop:
+                    idle_signal_candle_ts = newest_ts
+                    if stop_crossed_message:
+                        self._logger(stop_crossed_message)
+                    self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                    continue
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 准备挂单 | 方向={plan.signal.upper()} | "
                 f"第{current_wave_index}波 | 本波第{entries_in_current_wave + 1}次委托 | "
@@ -1061,27 +1076,12 @@ class StrategyEngine:
                 f"止损={format_decimal(plan.stop_loss)} | "
                 f"{'动态止盈=初始不挂止盈' if dynamic_stop_only else f'止盈={format_decimal(plan.take_profit)}'}"
             )
-            cl_ord_id = self._next_client_order_id(role="entry")
-            stop_loss_algo_cl_ord_id = (
-                self._next_client_order_id(role="slg")
-                if dynamic_stop_only and not trader_virtual_stop_loss_enabled
-                else None
-            )
-            result = self._submit_order_with_recovery(
+            cl_ord_id, result, stop_loss_algo_cl_ord_id = self._submit_dynamic_limit_entry_order(
                 credentials,
                 config,
-                inst_id=plan.inst_id,
-                cl_ord_id=cl_ord_id,
-                label="动态限价挂单",
-                submit_fn=lambda: self._client.place_limit_order(
-                    credentials,
-                    config,
-                    plan,
-                    cl_ord_id=cl_ord_id,
-                    include_take_profit=not dynamic_stop_only,
-                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
-                    include_attached_protection=not trader_virtual_stop_loss_enabled,
-                ),
+                plan=plan,
+                dynamic_stop_only=dynamic_stop_only,
+                trader_virtual_stop_loss_enabled=trader_virtual_stop_loss_enabled,
             )
             if not result.ord_id:
                 raise RuntimeError("OKX 未返回挂单 ordId，无法继续监控该委托")
@@ -1350,25 +1350,12 @@ class StrategyEngine:
                     signal_candle_high=decision.signal_candle_high,
                     signal_candle_low=decision.signal_candle_low,
                 )
-                cl_ord_id = self._next_client_order_id(role="entry")
-                stop_loss_algo_cl_ord_id = (
-                    self._next_client_order_id(role="slg") if dynamic_stop_only and not config.trader_virtual_stop_loss else None
-                )
-                result = self._submit_order_with_recovery(
+                cl_ord_id, result, stop_loss_algo_cl_ord_id = self._submit_dynamic_limit_entry_order(
                     credentials,
                     config,
-                    inst_id=plan.inst_id,
-                    cl_ord_id=cl_ord_id,
-                    label="动态限价挂单",
-                    submit_fn=lambda: self._client.place_limit_order(
-                        credentials,
-                        config,
-                        plan,
-                        cl_ord_id=cl_ord_id,
-                        include_take_profit=not dynamic_stop_only,
-                        stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
-                        include_attached_protection=not config.trader_virtual_stop_loss,
-                    ),
+                    plan=plan,
+                    dynamic_stop_only=dynamic_stop_only,
+                    trader_virtual_stop_loss_enabled=bool(config.trader_virtual_stop_loss),
                 )
                 if not result.ord_id:
                     raise RuntimeError("OKX 未返回挂单 ordId，无法继续监控该委托")
@@ -1561,6 +1548,20 @@ class StrategyEngine:
                 self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前无法生成挂单 | {exc}")
                 self._stop_event.wait(config.poll_seconds)
                 continue
+            if startup_gate_message:
+                should_skip_by_stop, stop_crossed_message = self._should_skip_startup_takeover_when_stop_crossed(
+                    startup_gate,
+                    config,
+                    signal=decision.signal,
+                    candle_ts=decision.candle_ts,
+                    trigger_inst_id=plan.inst_id,
+                    stop_loss=plan.stop_loss,
+                )
+                if should_skip_by_stop:
+                    if stop_crossed_message:
+                        self._logger(stop_crossed_message)
+                    self._stop_event.wait(config.poll_seconds)
+                    continue
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 准备市价单 | 方向={plan.signal.upper()} | "
                 f"参考入场价={format_decimal(plan.entry_reference)} | 数量={_format_size_with_contract_equivalent(instrument, plan.size)} | "
@@ -4757,6 +4758,13 @@ class StrategyEngine:
         normalized_detail = str(detail or "").strip() or "-"
         normalized_code = str(code or "").strip()
         code_text = f" | code={normalized_code}" if normalized_code else ""
+        if normalized_code == "50101" or "current environment" in normalized_detail:
+            return (
+                f"OKX {label}失败 | 标的={inst_id} | clOrdId={cl_ord_id} | "
+                f"原始返回={normalized_detail}{code_text} | "
+                "直接原因：API Key 与当前交易环境不匹配。"
+                "请检查所选 API 配置保存的是 demo 还是 live，并确保与策略 environment 一致。"
+            )
         if "操作全部失败" in normalized_detail:
             return (
                 f"OKX {label}被交易所拒绝 | 标的={inst_id} | clOrdId={cl_ord_id} | "
@@ -4787,6 +4795,143 @@ class StrategyEngine:
             cl_ord_id=cl_ord_id,
             label=label,
             submit_fn=submit_fn,
+        )
+
+    @staticmethod
+    def _is_retryable_dynamic_limit_stop_attach_failure(detail: str) -> bool:
+        normalized = str(detail or "").strip()
+        if not normalized or "51051" not in normalized:
+            return False
+        lowered = normalized.lower()
+        return "止损价格应低于开仓价格" in normalized or "stop loss price should be lower than" in lowered
+
+    def _submit_dynamic_limit_entry_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        plan: OrderPlan,
+        dynamic_stop_only: bool,
+        trader_virtual_stop_loss_enabled: bool,
+    ) -> tuple[str, OkxOrderResult, str | None]:
+        cl_ord_id = self._next_client_order_id(role="entry")
+        stop_loss_algo_cl_ord_id = (
+            self._next_client_order_id(role="slg")
+            if dynamic_stop_only and not trader_virtual_stop_loss_enabled
+            else None
+        )
+
+        def _submit_limit_order(*, stop_loss_client_id: str | None, include_attached_protection: bool) -> OkxOrderResult:
+            return self._submit_order_with_recovery(
+                credentials,
+                config,
+                inst_id=plan.inst_id,
+                cl_ord_id=cl_ord_id,
+                label="动态限价挂单",
+                submit_fn=lambda: self._client.place_limit_order(
+                    credentials,
+                    config,
+                    plan,
+                    cl_ord_id=cl_ord_id,
+                    include_take_profit=not dynamic_stop_only,
+                    stop_loss_algo_cl_ord_id=stop_loss_client_id,
+                    include_attached_protection=include_attached_protection,
+                ),
+            )
+
+        try:
+            result = _submit_limit_order(
+                stop_loss_client_id=stop_loss_algo_cl_ord_id,
+                include_attached_protection=not trader_virtual_stop_loss_enabled,
+            )
+            return cl_ord_id, result, stop_loss_algo_cl_ord_id
+        except RuntimeError as exc:
+            detail = str(exc).strip()
+            if not (
+                dynamic_stop_only
+                and not trader_virtual_stop_loss_enabled
+                and self._is_retryable_dynamic_limit_stop_attach_failure(detail)
+            ):
+                raise
+
+        self._logger(
+            " | ".join(
+                [
+                    "OKX 附带止损拒绝了动态限价主单，改为先挂裸限价单",
+                    f"标的={plan.inst_id}",
+                    f"clOrdId={cl_ord_id}",
+                    "后续将在成交后补挂独立 OKX 止损算法单",
+                ]
+            )
+        )
+        result = _submit_limit_order(
+            stop_loss_client_id=None,
+            include_attached_protection=False,
+        )
+        return cl_ord_id, result, None
+
+    def _submit_post_fill_exchange_stop_loss(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        stop_loss: Decimal,
+    ) -> tuple[str | None, str | None]:
+        stop_loss_algo_cl_ord_id = self._next_client_order_id(role="slg")
+        try:
+            result = self._submit_order_with_recovery(
+                credentials,
+                config,
+                inst_id=trade_instrument.inst_id,
+                cl_ord_id=stop_loss_algo_cl_ord_id,
+                label="初始OKX止损算法单",
+                submit_fn=lambda: self._client.place_stop_loss_algo_order(
+                    credentials,
+                    config,
+                    inst_id=trade_instrument.inst_id,
+                    side=position.close_side,
+                    size=position.size,
+                    pos_side=position.pos_side,
+                    stop_loss_trigger_price=stop_loss,
+                    algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                ),
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"开仓已成交，但补挂 OKX 初始止损失败 | 标的={trade_instrument.inst_id} | {exc}"
+            ) from exc
+        algo_id = (result.ord_id or "").strip() or None
+        algo_cl_ord_id = (result.cl_ord_id or stop_loss_algo_cl_ord_id or "").strip() or None
+        return algo_id, algo_cl_ord_id
+
+    def _should_skip_startup_takeover_when_stop_crossed(
+        self,
+        gate_state: StartupSignalGateState,
+        config: StrategyConfig,
+        *,
+        signal: Literal["long", "short"],
+        candle_ts: int,
+        trigger_inst_id: str,
+        stop_loss: Decimal,
+    ) -> tuple[bool, str | None]:
+        current_price = self._get_trigger_price_with_retry(
+            trigger_inst_id,
+            config.tp_sl_trigger_type,
+            environment=config.environment,
+        )
+        stop_crossed = current_price <= stop_loss if signal == "long" else current_price >= stop_loss
+        if not stop_crossed:
+            return False, None
+
+        gate_state.blocked_signal = signal
+        relation_text = "低于等于" if signal == "long" else "高于等于"
+        return (
+            True,
+            f"{_fmt_ts(candle_ts)} | 启动追当前波段已放弃接管 | 方向={signal.upper()} | "
+            f"触发价类型={config.tp_sl_trigger_type} | 当前价={format_decimal(current_price)} | "
+            f"止损={format_decimal(stop_loss)} | 当前价已{relation_text}止损，等待当前波失效后再接管",
         )
 
     def _does_pending_algo_stop_loss_match(
@@ -5261,8 +5406,21 @@ class StrategyEngine:
             price_delta_multiplier=price_delta_multiplier,
         )
         if dynamic_stop_only:
+            stop_loss_algo_id = active_order.stop_loss_algo_id
+            stop_loss_algo_cl_ord_id = active_order.stop_loss_algo_cl_ord_id
+            created_after_fill = False
+            if not (stop_loss_algo_id or "").strip() and not (stop_loss_algo_cl_ord_id or "").strip():
+                stop_loss_algo_id, stop_loss_algo_cl_ord_id = self._submit_post_fill_exchange_stop_loss(
+                    credentials,
+                    config,
+                    trade_instrument=trade_instrument,
+                    position=position,
+                    stop_loss=active_order.stop_loss,
+                )
+                created_after_fill = True
             self._logger(
-                f"初始 OKX 止损已提交 | algoClOrdId={active_order.stop_loss_algo_cl_ord_id or '-'} | "
+                f"{'初始 OKX 止损已补挂' if created_after_fill else '初始 OKX 止损已提交'} | "
+                f"algoClOrdId={stop_loss_algo_cl_ord_id or '-'} | algoId={stop_loss_algo_id or '-'} | "
                 f"止损={format_decimal(active_order.stop_loss)} | 启动动态上移监控"
             )
             self._monitor_exchange_dynamic_stop(
@@ -5271,8 +5429,8 @@ class StrategyEngine:
                 trade_instrument=trade_instrument,
                 position=position,
                 initial_stop_loss=active_order.stop_loss,
-                stop_loss_algo_cl_ord_id=active_order.stop_loss_algo_cl_ord_id,
-                stop_loss_algo_id=active_order.stop_loss_algo_id,
+                stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                stop_loss_algo_id=stop_loss_algo_id,
             )
         else:
             self._logger("止盈止损已附加到 OKX 主单，开始监控持仓是否结束。")

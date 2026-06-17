@@ -66,6 +66,8 @@ def load_email_analysis_records(
         metadata = _load_json_dict(meta_path)
         if not metadata:
             continue
+        if not _archive_metadata_is_delivered(metadata):
+            continue
         digest_payload = _resolve_digest_payload(metadata, meta_path=meta_path)
         if not digest_payload:
             continue
@@ -106,6 +108,30 @@ def load_email_analysis_records(
             )
     records.sort(key=lambda item: (item.generated_at, item.symbol))
     return records
+
+
+def refresh_email_validation_report(
+    *,
+    base_dir: Path | str | None = None,
+    archive_dir: Path | None = None,
+    out_dir: Path | None = None,
+    symbols: Iterable[str] | None = None,
+    archive_limit: int = 60,
+    windows_hours: tuple[int, ...] = (4, 12, 24, 72),
+    client: OkxRestClient | None = None,
+) -> dict[str, object] | None:
+    records = load_email_analysis_records(
+        base_dir=base_dir,
+        archive_dir=archive_dir,
+        symbols=symbols,
+        limit=archive_limit,
+    )
+    if not records:
+        return None
+    results = validate_email_analysis_records(records, client=client, windows_hours=windows_hours)
+    payload = build_email_validation_report_payload(results, windows_hours=windows_hours)
+    save_email_validation_report(payload, base_dir=base_dir, out_dir=out_dir)
+    return payload
 
 
 def validate_email_analysis_records(
@@ -249,6 +275,13 @@ def build_recent_email_validation_summary(
     }
     summary["highlights"] = _build_recent_summary_highlights(summary)
     return summary
+
+
+def _archive_metadata_is_delivered(metadata: dict[str, object]) -> bool:
+    delivery_status = str(metadata.get("delivery_status", "") or "").strip().lower()
+    if not delivery_status:
+        return True
+    return delivery_status in {"sent", "released"}
 
 
 def _build_recent_summary_highlights(summary: dict[str, object]) -> dict[str, object]:

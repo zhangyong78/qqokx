@@ -1408,6 +1408,8 @@ def _serialize_strategy_config_snapshot(config: StrategyConfig) -> dict[str, obj
         value = getattr(config, item.name)
         if isinstance(value, Decimal):
             snapshot[item.name] = format(value, "f")
+        elif item.name == "dynamic_protection_rules":
+            snapshot[item.name] = dynamic_protection_rules_to_payload(value)
         else:
             snapshot[item.name] = value
     return snapshot
@@ -3213,6 +3215,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._protection_window: Toplevel | None = None
         self._protection_replay_window: ProtectionReplayWindow | None = None
         self._positions_refreshing = False
+        self._selected_position_manual_flatten_running = False
         self._positions_history_refreshing = False
         self._positions_zoom_takeover_status_text = StringVar(
             value="动态止盈接管：当前无运行中任务；请在大窗底部「动态止盈接管」选项卡查看列表与说明。"
@@ -7598,9 +7601,16 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
     def _environment_value_from_label(self, label: str | None) -> str:
         return ENV_OPTIONS[self._normalized_environment_label(label)]
 
-    def _environment_label_for_profile(self, profile_name: str) -> str:
+    def _credential_profile_environment_value(self, profile_name: str, *, fallback: str = "") -> str:
         snapshot = self._credential_profiles.get(profile_name, {})
         environment = str(snapshot.get("environment", "")).strip().lower()
+        if environment in {"demo", "live"}:
+            return environment
+        fallback_value = str(fallback or "").strip().lower()
+        return fallback_value if fallback_value in {"demo", "live"} else ""
+
+    def _environment_label_for_profile(self, profile_name: str) -> str:
+        environment = self._credential_profile_environment_value(profile_name)
         if environment == "live":
             return "实盘 live"
         if environment == "demo":
@@ -9586,7 +9596,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                         session.ended_reason = ""
                 running_count += 1
             elif session.stop_cleanup_in_progress:
-                session.status = "停止中"
+                session.status = "已停止"
+                session.runtime_status = "已停止"
+                if session.stopped_at is None:
+                    session.stopped_at = datetime.now()
             elif session.status == "恢复中":
                 session.status = "待恢复"
                 session.runtime_status = "待恢复"
@@ -13570,7 +13583,16 @@ def _build_strategy_start_confirmation_message(
     custom_trigger_symbol: str,
     instrument: Instrument | None = None,
     api_label: str = "",
+    api_environment_label: str = "",
 ) -> str:
+    def _environment_value_from_label(label: str) -> str:
+        normalized = str(label or "").strip().lower()
+        if normalized.endswith("live") or normalized == "live":
+            return "live"
+        if normalized.endswith("demo") or normalized == "demo":
+            return "demo"
+        return ""
+
     def _signal_mode_text(label: str) -> str:
         description = {
             "双向": "多空信号都接收",
@@ -13762,14 +13784,24 @@ def _build_strategy_start_confirmation_message(
     profile = get_strategy_runtime_profile(config.strategy_id)
     visibility = build_strategy_widget_visibility(config.strategy_id, "launcher")
     api_text = (api_label or "").strip() or "-"
+    api_environment_text = (api_environment_label or "").strip() or "-"
+    strategy_environment_text = (environment_label or "").strip() or "-"
+    api_environment_value = _environment_value_from_label(api_environment_text)
+    strategy_environment_value = _environment_value_from_label(strategy_environment_text)
+    if api_environment_value and strategy_environment_value:
+        environment_status = "一致" if api_environment_value == strategy_environment_value else "不一致（将阻止启动）"
+    else:
+        environment_status = "未校验"
 
     lines = [
         f"策略：{strategy_name}",
         "",
         "基础信息：",
         f"运行模式：{run_mode_label}",
-        f"交易环境：{environment_label}",
         f"API：{api_text}",
+        f"API环境：{api_environment_text}",
+        f"策略环境：{strategy_environment_text}",
+        f"环境状态：{environment_status}",
         f"交易模式：{trade_mode_label}",
         f"持仓模式：{position_mode_label}",
         f"交易标的：{strategy_symbol}",
@@ -16880,7 +16912,10 @@ def _refresh_status_with_recovery_support(self: QuantApp) -> None:
                     session.ended_reason = ""
             running_count += 1
         elif session.stop_cleanup_in_progress:
-            session.status = "停止中"
+            session.status = "已停止"
+            session.runtime_status = "已停止"
+            if session.stopped_at is None:
+                session.stopped_at = datetime.now()
         elif session.status == "恢复中":
             session.status = "待恢复"
             session.runtime_status = "待恢复"

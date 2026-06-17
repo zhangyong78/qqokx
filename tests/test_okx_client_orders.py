@@ -434,6 +434,101 @@ class OkxClientOrderRequestTest(TestCase):
             },
         )
 
+    def test_place_stop_loss_algo_order_posts_conditional_reduce_only_order(self) -> None:
+        client = OkxRestClient()
+        captured: dict[str, object] = {}
+
+        def _stub_request(method: str, path: str, params=None, body=None, **kwargs):
+            if path == "/api/v5/public/instruments":
+                return {
+                    "data": [
+                        {
+                            "instId": "BTC-USD-SWAP",
+                            "instType": "SWAP",
+                            "tickSz": "0.1",
+                            "lotSz": "0.1",
+                            "minSz": "0.1",
+                            "state": "live",
+                            "settleCcy": "BTC",
+                            "ctVal": "100",
+                            "ctMult": "1",
+                            "ctValCcy": "USD",
+                            "uly": "BTC-USD",
+                            "instFamily": "BTC-USD",
+                        }
+                    ]
+                }
+            if path == "/api/v5/account/config":
+                return {"data": [{"posMode": "long_short_mode"}]}
+            captured["method"] = method
+            captured["path"] = path
+            captured["body"] = body
+            captured["simulated"] = kwargs.get("simulated")
+            return {
+                "data": [
+                    {
+                        "algoId": "algo-1",
+                        "algoClOrdId": "slg-1",
+                        "sCode": "0",
+                        "sMsg": "",
+                    }
+                ]
+            }
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        config = StrategyConfig(
+            inst_id="BTC-USD-SWAP",
+            trade_inst_id="BTC-USD-SWAP",
+            local_tp_sl_inst_id="BTC-USD-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            tp_sl_mode="exchange",
+            take_profit_mode="dynamic",
+            risk_amount=Decimal("10"),
+        )
+
+        result = client.place_stop_loss_algo_order(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            config,
+            inst_id="BTC-USD-SWAP",
+            side="sell",
+            size=Decimal("0.1"),
+            pos_side="long",
+            stop_loss_trigger_price=Decimal("71000"),
+            algo_cl_ord_id="slg-1",
+        )
+
+        self.assertEqual(result.ord_id, "algo-1")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["path"], "/api/v5/trade/order-algo")
+        self.assertTrue(captured["simulated"])
+        self.assertEqual(
+            captured["body"],
+            {
+                "instId": "BTC-USD-SWAP",
+                "tdMode": "cross",
+                "side": "sell",
+                "ordType": "conditional",
+                "sz": "0.1",
+                "slTriggerPx": "71000",
+                "slOrdPx": "-1",
+                "slTriggerPxType": "last",
+                "reduceOnly": True,
+                "cxlOnClosePos": True,
+                "posSide": "long",
+                "algoClOrdId": "slg-1",
+            },
+        )
+
     def test_place_market_order_can_attach_stop_without_take_profit(self) -> None:
         client = OkxRestClient()
         captured: dict[str, object] = {}

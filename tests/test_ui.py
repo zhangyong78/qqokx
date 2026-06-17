@@ -85,6 +85,7 @@ from okx_quant.ui import (
     _refresh_indicator_badge_text,
     _refresh_health_is_stale,
     _resolve_import_api_profile,
+    _serialize_strategy_config_snapshot,
     _session_order_prefixes,
     _strategy_template_record_from_payload,
     _trade_order_belongs_to_session,
@@ -95,6 +96,63 @@ from okx_quant.ui import (
 
 
 class UiHelpersTest(TestCase):
+    def test_serialize_strategy_config_snapshot_converts_dynamic_protection_rules(self) -> None:
+        config = StrategyConfig(
+            inst_id="SOL-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("1"),
+            atr_take_multiplier=Decimal("1"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("4"),
+            dynamic_protection_rules=(
+                {
+                    "trigger_r": 5,
+                    "action": "lock_profit",
+                    "lock_r": 1,
+                    "trail_mode": "step",
+                    "trail_every_r": 1,
+                    "trail_add_r": 1,
+                },
+                {
+                    "trigger_r": 3,
+                    "action": "break_even",
+                },
+            ),
+        )
+
+        snapshot = _serialize_strategy_config_snapshot(config)
+
+        self.assertEqual(snapshot["risk_amount"], "4")
+        self.assertEqual(
+            snapshot["dynamic_protection_rules"],
+            (
+                {
+                    "trigger_r": 3,
+                    "action": "break_even",
+                    "lock_r": None,
+                    "trail_mode": "none",
+                    "trail_every_r": None,
+                    "trail_add_r": None,
+                },
+                {
+                    "trigger_r": 5,
+                    "action": "lock_profit",
+                    "lock_r": 1,
+                    "trail_mode": "step",
+                    "trail_every_r": 1,
+                    "trail_add_r": 1,
+                },
+            ),
+        )
+        json.dumps(snapshot)
+
     def test_ui_split_keeps_parse_positive_int_bound_to_app(self) -> None:
         descriptor = QuantApp.__dict__["_parse_positive_int"]
 
@@ -293,6 +351,37 @@ class UiHelpersTest(TestCase):
         app.refresh_positions.assert_called_once_with()
         app._positions_zoom_active_tab_label.assert_called_once_with()
         app._refresh_positions_zoom_tab_by_label.assert_called_once_with("历史成交")
+
+    def test_open_positions_zoom_window_reuses_window_before_active_tab_refresh(self) -> None:
+        events: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+        def record(name: str):
+            return lambda *args, **kwargs: events.append((name, args, kwargs))
+
+        zoom_window = SimpleNamespace(
+            winfo_exists=lambda: True,
+            focus_force=record("focus_force"),
+        )
+        app = SimpleNamespace(
+            _positions_zoom_window=zoom_window,
+            _schedule_positions_zoom_sync=record("schedule_sync"),
+            _load_local_history_cache=record("load_local_history_cache"),
+            _refresh_positions_zoom_primary_views=record("refresh_primary_views"),
+            _schedule_positions_zoom_active_tab_refresh=record("schedule_active_tab_refresh"),
+        )
+
+        QuantApp.open_positions_zoom_window(app)
+
+        self.assertEqual(
+            events,
+            [
+                ("focus_force", (), {}),
+                ("schedule_sync", (), {}),
+                ("load_local_history_cache", (), {}),
+                ("refresh_primary_views", (), {"refresh_active_tab": False}),
+                ("schedule_active_tab_refresh", (), {}),
+            ],
+        )
 
     def test_build_position_ticker_map_uses_bulk_ticker_queries(self) -> None:
         option = OkxPosition(
@@ -834,10 +923,14 @@ HTTP 502: <!DOCTYPE html>
             custom_trigger_symbol="",
             instrument=instrument,
             api_label="demo-api-1",
+            api_environment_label="模拟盘 demo",
         )
 
         self.assertIn("基础信息：", message)
         self.assertIn("API：demo-api-1", message)
+        self.assertIn("API环境：模拟盘 demo", message)
+        self.assertIn("策略环境：模拟盘 demo", message)
+        self.assertIn("环境状态：一致", message)
         self.assertIn("信号方向：只做多（只接收多头信号）", message)
         self.assertIn("下单方向模式：跟随信号（多头买入，空头卖出）", message)
         self.assertIn("止损 ATR 倍数：2（止损距离 = 2 × ATR）", message)
@@ -906,8 +999,12 @@ HTTP 502: <!DOCTYPE html>
             custom_trigger_symbol="",
             instrument=None,
             api_label="live-api-1",
+            api_environment_label="模拟盘 demo",
         )
 
+        self.assertIn("API环境：模拟盘 demo", message)
+        self.assertIn("策略环境：实盘 live", message)
+        self.assertIn("环境状态：不一致（将阻止启动）", message)
         self.assertIn("挂单参考线：EMA55（挂单价格锚点）", message)
         self.assertIn("每波最多开仓次数：3（同一波最多允许开仓的次数）", message)
         self.assertIn("动态保护规则：1R -> 保本 + 双向手续费", message)
@@ -1856,7 +1953,7 @@ class StrategyTemplateImportExportTest(TestCase):
         assert record is not None
         app = SimpleNamespace(
             _strategy_name_to_id={"EMA 动态委托做空": STRATEGY_DYNAMIC_SHORT_ID},
-            _credential_profiles={"local": {"api_key": "k", "secret_key": "s", "passphrase": "p", "environment": "demo"}},
+            _credential_profiles={"local": {"api_key": "k", "secret_key": "s", "passphrase": "p", "environment": "live"}},
             _current_credential_profile=lambda: "local",
             _apply_credentials_profile=MagicMock(),
             _on_strategy_selected=MagicMock(),
@@ -1921,6 +2018,14 @@ class StrategyTemplateImportExportTest(TestCase):
         )
         app._resolve_strategy_template_definition = lambda item: QuantApp._resolve_strategy_template_definition(app, item)
         app._format_optional_positive_entry_decimal = lambda value: QuantApp._format_optional_positive_entry_decimal(value)
+        app._credential_profile_environment_value = (
+            lambda profile_name, fallback="": QuantApp._credential_profile_environment_value(
+                app,
+                profile_name,
+                fallback=fallback,
+            )
+        )
+        app._environment_label_for_profile = lambda profile_name: QuantApp._environment_label_for_profile(app, profile_name)
 
         definition, resolved_api_name, api_note = QuantApp._apply_strategy_template_record(app, record)
 
@@ -1932,7 +2037,7 @@ class StrategyTemplateImportExportTest(TestCase):
         self.assertEqual(app.risk_amount.get(), "10")
         self.assertTrue(app.startup_chase_current_signal.get())
         self.assertEqual(app.tp_sl_mode_label.get(), "OKX 托管（仅同标的永续）")
-        self.assertEqual(app.environment_label.get(), "模拟盘 demo")
+        self.assertEqual(app.environment_label.get(), "实盘 live")
         app._apply_credentials_profile.assert_not_called()
         app._ensure_importable_strategy_symbols.assert_called_once_with("SOL-USDT-SWAP", "")
 
@@ -2224,11 +2329,21 @@ class StrategyTemplateImportExportTest(TestCase):
         )
         app = SimpleNamespace(
             root=object(),
-            _credential_profiles={"moni": {"api_key": "k", "secret_key": "s", "passphrase": "p"}},
+            _credential_profiles={"moni": {"api_key": "k", "secret_key": "s", "passphrase": "p", "environment": "demo"}},
             _current_credential_profile=lambda: "moni",
             _confirm_bundle_import_api_access=MagicMock(return_value=True),
             _resolve_bundle_import_api=MagicMock(return_value=("moni", "")),
             _apply_strategy_template_record=MagicMock(return_value=(SimpleNamespace(name="Demo Long"), "moni", "")),
+        )
+        app._credential_profile_environment_value = (
+            lambda profile_name, fallback="": QuantApp._credential_profile_environment_value(
+                app,
+                profile_name,
+                fallback=fallback,
+            )
+        )
+        app._config_with_api_environment = (
+            lambda config, api_name: QuantApp._config_with_api_environment(app, config, api_name)
         )
 
         with TemporaryDirectory() as temp_dir:
@@ -2336,7 +2451,7 @@ class StrategyTemplateImportExportTest(TestCase):
         )
         app = SimpleNamespace(
             root=object(),
-            _credential_profiles={"moni": {"api_key": "k", "secret_key": "s", "passphrase": "p"}},
+            _credential_profiles={"moni": {"api_key": "k", "secret_key": "s", "passphrase": "p", "environment": "live"}},
             _current_credential_profile=lambda: "moni",
             _confirm_bundle_import_api_access=MagicMock(return_value=True),
             _resolve_bundle_import_api=MagicMock(return_value=("moni", "")),
@@ -2345,6 +2460,16 @@ class StrategyTemplateImportExportTest(TestCase):
             _build_notifier=MagicMock(return_value=object()),
             _start_strategy_session=MagicMock(return_value="S01"),
             _focus_first_running_session=MagicMock(return_value=False),
+        )
+        app._credential_profile_environment_value = (
+            lambda profile_name, fallback="": QuantApp._credential_profile_environment_value(
+                app,
+                profile_name,
+                fallback=fallback,
+            )
+        )
+        app._config_with_api_environment = (
+            lambda config, api_name: QuantApp._config_with_api_environment(app, config, api_name)
         )
 
         with TemporaryDirectory() as temp_dir:
@@ -2363,6 +2488,7 @@ class StrategyTemplateImportExportTest(TestCase):
         started_config = app._start_strategy_session.call_args.kwargs["config"]
         self.assertEqual(started_config.risk_amount, Decimal("320"))
         self.assertEqual(started_config.order_size, Decimal("0"))
+        self.assertEqual(started_config.environment, "live")
 
 
 class StrategyDuplicateLaunchGuardTest(TestCase):
@@ -4869,7 +4995,9 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(client.orders[0]["price"], Decimal("2299.20"))
         self.assertEqual(client.orders[0]["size"], Decimal("0.2"))
 
-    def test_flatten_selected_position_best_quote_submits_and_refreshes(self) -> None:
+
+
+    def test_flatten_selected_position_best_quote_starts_async_submit(self) -> None:
         position = OkxPosition(
             inst_id="ETH-USDT-SWAP",
             inst_type="SWAP",
@@ -4895,7 +5023,16 @@ class StrategyTradeTrackingTest(TestCase):
             theta=None,
             raw={},
         )
-        client = SimpleNamespace(get_instrument=lambda inst_id: Instrument(inst_id=inst_id, inst_type="SWAP", tick_size=Decimal("0.01"), lot_size=Decimal("0.1"), min_size=Decimal("0.1"), state="live"))
+        client = SimpleNamespace(
+            get_instrument=lambda inst_id: Instrument(
+                inst_id=inst_id,
+                inst_type="SWAP",
+                tick_size=Decimal("0.01"),
+                lot_size=Decimal("0.1"),
+                min_size=Decimal("0.1"),
+                state="live",
+            )
+        )
 
         app = SimpleNamespace(
             _selected_position_item=lambda: position,
@@ -4910,20 +5047,10 @@ class StrategyTradeTrackingTest(TestCase):
             environment_label=_Var("???"),
             _selected_position_close_size=lambda selected: QuantApp._selected_position_close_size(app, selected),
             _build_selected_position_manual_flatten_config=lambda selected: QuantApp._build_selected_position_manual_flatten_config(app, selected),
-            _submit_selected_position_manual_flatten=lambda selected, flatten_mode: (
-                OkxOrderResult(
-                    ord_id="ord-position-2",
-                    cl_ord_id="cl-position-2",
-                    s_code="0",
-                    s_msg="accepted",
-                    raw={},
-                ),
-                Decimal("2299.10"),
-                "best_quote",
-            ),
+            _start_selected_position_manual_flatten=MagicMock(),
             _enqueue_log=MagicMock(),
             refresh_positions=MagicMock(),
-            refresh_order_views=MagicMock(),
+            refresh_pending_orders=MagicMock(),
         )
 
         with patch("okx_quant.ui.messagebox.askyesnocancel", return_value=False) as askyesnocancel, patch(
@@ -4932,15 +5059,92 @@ class StrategyTradeTrackingTest(TestCase):
             QuantApp.flatten_selected_position(app)
 
         askyesnocancel.assert_called_once()
+        showinfo.assert_not_called()
+        app._start_selected_position_manual_flatten.assert_called_once()
+        _, start_kwargs = app._start_selected_position_manual_flatten.call_args
+        self.assertTrue(start_kwargs["direction_label"])
+        self.assertIn("BUY", start_kwargs["close_side_label"])
+        self.assertEqual(start_kwargs["submit_size_text"], "0.1")
+        self.assertEqual(start_kwargs["parent"], "parent-window")
+        app.refresh_positions.assert_not_called()
+        app.refresh_pending_orders.assert_not_called()
+
+    def test_finish_selected_position_manual_flatten_success_schedules_light_refresh(self) -> None:
+        position = OkxPosition(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="net",
+            mgn_mode="cross",
+            position=Decimal("-0.1"),
+            avail_position=Decimal("-0.1"),
+            avg_price=Decimal("2300"),
+            mark_price=None,
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy="USDT",
+            last_price=None,
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+        root = _AfterRoot()
+        app = SimpleNamespace(
+            root=root,
+            _positions_context_profile_name=None,
+            _current_credential_profile=lambda: "test-profile",
+            _normalize_position_manual_flatten_mode=QuantApp._normalize_position_manual_flatten_mode,
+            _position_manual_flatten_mode_label=QuantApp._position_manual_flatten_mode_label,
+            _schedule_selected_position_manual_flatten_follow_up_refresh=lambda flatten_mode: QuantApp._schedule_selected_position_manual_flatten_follow_up_refresh(
+                app
+                ,
+                flatten_mode,
+            ),
+            _selected_position_manual_flatten_after=lambda delay_ms, callback: QuantApp._selected_position_manual_flatten_after(
+                app,
+                delay_ms,
+                callback,
+            ),
+            _enqueue_log=MagicMock(),
+            refresh_positions=MagicMock(),
+            refresh_pending_orders=MagicMock(),
+            _selected_position_manual_flatten_running=True,
+        )
+
+        with patch("okx_quant.ui.messagebox.showinfo") as showinfo:
+            QuantApp._finish_selected_position_manual_flatten_success(
+                app,
+                position=position,
+                result=OkxOrderResult(
+                    ord_id="ord-position-2",
+                    cl_ord_id="cl-position-2",
+                    s_code="0",
+                    s_msg="accepted",
+                    raw={},
+                ),
+                price=Decimal("2299.10"),
+                normalized_flatten_mode="best_quote",
+                direction_label="绌哄ご",
+                close_side_label="BUY 涔板叆骞充粨",
+                submit_size_text="0.1",
+                parent="parent-window",
+            )
+
         showinfo.assert_called_once()
-        show_args, show_kwargs = showinfo.call_args
-        self.assertEqual(show_args[0], "平仓已提交")
-        self.assertIn("方式：挂买一/卖一平仓", show_args[1])
-        self.assertIn("挂单价：2299.1", show_args[1])
-        self.assertEqual(show_kwargs["parent"], "parent-window")
+        self.assertFalse(app._selected_position_manual_flatten_running)
         app._enqueue_log.assert_called_once()
+        self.assertEqual([delay for delay, _ in root.calls], [450, 1800])
+        for _, callback in root.calls:
+            callback()
         app.refresh_positions.assert_called_once()
-        app.refresh_order_views.assert_called_once()
+        app.refresh_pending_orders.assert_called_once()
 
     def test_build_strategy_trade_reconciliation_result_attributes_stop_loss_and_net_pnl(self) -> None:
         session = self._make_session()
@@ -5880,6 +6084,57 @@ class SelectedSessionDetailRefreshTest(TestCase):
         )
         self.assertEqual(app._selected_session_detail_session_id, "S01")
 
+    def test_refresh_selected_session_details_skips_rewrite_when_text_unchanged(self) -> None:
+        session = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            status="running",
+            runtime_status="等待信号",
+            strategy_id="ema",
+            strategy_name="EMA 动态委托做多",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            started_at=datetime(2026, 4, 26, 8, 0, 0),
+            stopped_at=None,
+            ended_reason="",
+            config=object(),
+            log_file_path="",
+            last_message="最新日志",
+            trade_count=1,
+            win_count=1,
+            gross_pnl_total=Decimal("1"),
+            fee_total=Decimal("0.1"),
+            funding_total=Decimal("0"),
+            net_pnl_total=Decimal("0.9"),
+            last_close_reason="",
+        )
+        app = SimpleNamespace(
+            _selected_session=lambda: session,
+            selected_session_text=_Var("detail"),
+            _selected_session_detail=SimpleNamespace(),
+            _selected_session_detail_session_id="S01",
+            _session_live_pnl_snapshot=lambda _session: (None, None),
+            _session_position_cache_note=lambda _session: "",
+            _build_strategy_detail_text=MagicMock(return_value="detail"),
+            _set_readonly_text=MagicMock(),
+            notify_enabled=_Var(True),
+        )
+
+        with patch("okx_quant.ui._serialize_strategy_config_snapshot", return_value={}), patch.object(
+            QuantApp,
+            "_build_duplicate_launch_conflict_warning",
+            return_value="",
+        ), patch.object(
+            QuantApp,
+            "_duplicate_launch_conflicts_for",
+            return_value=[],
+        ):
+            QuantApp._refresh_selected_session_details(app)
+
+        app._set_readonly_text.assert_not_called()
+        self.assertEqual(app._selected_session_detail_session_id, "S01")
+
     def test_refresh_selected_session_details_resets_scroll_for_new_session(self) -> None:
         session = SimpleNamespace(
             session_id="S02",
@@ -5934,6 +6189,28 @@ class SelectedSessionDetailRefreshTest(TestCase):
             preserve_scroll=False,
         )
         self.assertEqual(app._selected_session_detail_session_id, "S02")
+
+    def test_schedule_selected_session_details_refresh_coalesces_rapid_selection(self) -> None:
+        root = _AfterRoot()
+        app = SimpleNamespace(
+            root=root,
+            _selected_session_detail_refresh_job="old-job",
+            _selected_session_detail_refresh_token=0,
+            _refresh_selected_session_details=MagicMock(),
+        )
+
+        QuantApp._schedule_selected_session_details_refresh(app, delay_ms=45)
+        first_callback = root.calls[0][1]
+        QuantApp._schedule_selected_session_details_refresh(app, delay_ms=45)
+        second_callback = root.calls[1][1]
+
+        self.assertEqual(root.canceled, ["old-job", "job-1"])
+
+        first_callback()
+        app._refresh_selected_session_details.assert_not_called()
+
+        second_callback()
+        app._refresh_selected_session_details.assert_called_once_with()
 
     def test_build_strategy_detail_text_groups_running_parameters_and_shows_max_entries(self) -> None:
         snapshot = {
@@ -6476,6 +6753,13 @@ class CredentialProfileEnvironmentTest(TestCase):
         app._normalized_environment_label = lambda label, fallback=None: QuantApp._normalized_environment_label(
             app, label, fallback=fallback
         )
+        app._credential_profile_environment_value = (
+            lambda profile_name, fallback="": QuantApp._credential_profile_environment_value(
+                app,
+                profile_name,
+                fallback=fallback,
+            )
+        )
         app._environment_label_for_profile = lambda profile_name: QuantApp._environment_label_for_profile(app, profile_name)
         app._apply_profile_environment = lambda profile_name: QuantApp._apply_profile_environment(app, profile_name)
         app._credential_profile_requires_switch_password = lambda profile_name: QuantApp._credential_profile_requires_switch_password(
@@ -6497,6 +6781,69 @@ class CredentialProfileEnvironmentTest(TestCase):
             ("moni", "demo-key", "demo-secret", "demo-pass", "demo", "", "", "", "", "", ""),
         )
         app._enqueue_log.assert_called_once_with("API切换 | 配置=moni")
+
+    def test_validate_strategy_session_environment_blocks_trade_launch_on_profile_mismatch(self) -> None:
+        app = SimpleNamespace(
+            _credential_profiles={"moni": {"environment": "demo"}},
+        )
+        app._credential_profile_environment_value = (
+            lambda profile_name, fallback="": QuantApp._credential_profile_environment_value(
+                app,
+                profile_name,
+                fallback=fallback,
+            )
+        )
+        config = StrategyConfig(
+            inst_id="DOGE-USDT-SWAP",
+            bar="15m",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="live",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            run_mode="trade",
+        )
+
+        with self.assertRaisesRegex(ValueError, "API 配置 moni 当前保存的是 模拟盘 demo"):
+            QuantApp._validate_strategy_session_environment(app, api_name="moni", config=config)
+
+    def test_validate_strategy_session_environment_allows_signal_only_mismatch(self) -> None:
+        app = SimpleNamespace(
+            _credential_profiles={"moni": {"environment": "demo"}},
+        )
+        app._credential_profile_environment_value = (
+            lambda profile_name, fallback="": QuantApp._credential_profile_environment_value(
+                app,
+                profile_name,
+                fallback=fallback,
+            )
+        )
+        config = StrategyConfig(
+            inst_id="DOGE-USDT-SWAP",
+            bar="15m",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="live",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            run_mode="signal_only",
+        )
+
+        QuantApp._validate_strategy_session_environment(app, api_name="moni", config=config)
 
     def test_save_credentials_now_persists_environment_with_profile(self) -> None:
         password_snapshot = build_profile_switch_password_snapshot("desk-pass")
@@ -6821,6 +7168,13 @@ class CredentialProfileEnvironmentTest(TestCase):
         app._normalized_environment_label = lambda label, fallback=None: QuantApp._normalized_environment_label(
             app, label, fallback=fallback
         )
+        app._credential_profile_environment_value = (
+            lambda profile_name, fallback="": QuantApp._credential_profile_environment_value(
+                app,
+                profile_name,
+                fallback=fallback,
+            )
+        )
         app._environment_label_for_profile = lambda profile_name: QuantApp._environment_label_for_profile(app, profile_name)
         app._apply_profile_environment = lambda profile_name: QuantApp._apply_profile_environment(app, profile_name)
         app._credential_profile_requires_switch_password = lambda profile_name: QuantApp._credential_profile_requires_switch_password(
@@ -6912,6 +7266,13 @@ class CredentialProfileEnvironmentTest(TestCase):
         )
         app._normalized_environment_label = lambda label, fallback=None: QuantApp._normalized_environment_label(
             app, label, fallback=fallback
+        )
+        app._credential_profile_environment_value = (
+            lambda profile_name, fallback="": QuantApp._credential_profile_environment_value(
+                app,
+                profile_name,
+                fallback=fallback,
+            )
         )
         app._environment_label_for_profile = lambda profile_name: QuantApp._environment_label_for_profile(app, profile_name)
         app._apply_profile_environment = lambda profile_name: QuantApp._apply_profile_environment(app, profile_name)
@@ -7038,6 +7399,119 @@ class StrategyStopCleanupTest(TestCase):
             environment_note=environment_note,
         )
 
+    def test_mark_strategy_session_stopped_pending_audit_keeps_audit_flag(self) -> None:
+        session = self._make_session()
+        session.status = "运行中"
+        session.runtime_status = "持仓监控中"
+        session.stop_cleanup_in_progress = False
+        app = SimpleNamespace(
+            _remove_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _selected_session=lambda: session,
+            _refresh_selected_session_details=MagicMock(),
+            root=SimpleNamespace(after=lambda delay_ms, callback: callback()),
+        )
+
+        QuantApp._mark_strategy_session_stopped_pending_audit(
+            app,
+            session,
+            ended_reason="用户手动停止",
+            show_dialog=True,
+        )
+
+        self.assertEqual(session.status, "已停止")
+        self.assertEqual(session.runtime_status, "已停止")
+        self.assertTrue(session.stop_cleanup_in_progress)
+        self.assertEqual(session.ended_reason, "用户手动停止")
+        app._remove_recoverable_strategy_session.assert_called_once_with(session.session_id)
+        app._upsert_session_row.assert_called_once_with(session)
+        app._refresh_selected_session_details.assert_called_once_with()
+
+    def test_session_can_be_cleared_requires_audit_finished(self) -> None:
+        session = self._make_session()
+        session.status = "已停止"
+        session.engine = SimpleNamespace(is_running=False)
+        session.stop_cleanup_in_progress = True
+        self.assertFalse(QuantApp._session_can_be_cleared(session))
+        session.stop_cleanup_in_progress = False
+        self.assertTrue(QuantApp._session_can_be_cleared(session))
+
+    def test_refresh_status_keeps_background_stop_audit_displayed_stopped(self) -> None:
+        session = self._make_session()
+        session.status = "\u505c\u6b62\u4e2d"
+        session.runtime_status = "\u505c\u6b62\u4e2d"
+        session.engine = SimpleNamespace(is_running=False)
+        session.stop_cleanup_in_progress = True
+
+        app = SimpleNamespace(
+            sessions={session.session_id: session},
+            _refresh_session_live_pnl_cache=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            status_text=_Var(),
+            _refresh_trader_desk_runtime=MagicMock(),
+            _refresh_running_session_summary=MagicMock(),
+            _update_settings_summary=MagicMock(),
+            _refresh_selected_session_details=MagicMock(),
+            _refresh_strategy_book_window=MagicMock(),
+            _refresh_status=MagicMock(),
+            root=SimpleNamespace(after=MagicMock()),
+        )
+
+        QuantApp._refresh_status(app)
+
+        self.assertEqual(session.status, "\u5df2\u505c\u6b62")
+        self.assertEqual(session.runtime_status, "\u5df2\u505c\u6b62")
+        self.assertTrue(session.stop_cleanup_in_progress)
+        self.assertIsNotNone(session.stopped_at)
+        self.assertEqual(app.status_text.get(), "\u8fd0\u884c\u4e2d\u7b56\u7565\uff1a0")
+        app._upsert_session_row.assert_called_once_with(session)
+        app._sync_strategy_history_from_session.assert_called_once_with(session)
+        app.root.after.assert_called_once_with(500, app._refresh_status)
+
+    def test_request_stop_strategy_session_stops_immediately_before_background_audit(self) -> None:
+        session = self._make_session()
+        session.status = "运行中"
+        session.stop_cleanup_in_progress = False
+        session.engine = SimpleNamespace(is_running=True, stop=MagicMock())
+        session.config.run_mode = "trade"
+        credentials = SimpleNamespace(profile_name=session.api_name)
+
+        app = SimpleNamespace(
+            sessions={session.session_id: session},
+            _credentials_for_profile_or_none=lambda profile_name: credentials,
+            _remove_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _selected_session=lambda: session,
+            _refresh_selected_session_details=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _stop_session_cleanup_worker=MagicMock(),
+            _log_session_message=MagicMock(),
+            root=SimpleNamespace(after=lambda delay_ms, callback: callback()),
+        )
+
+        with patch(
+            "okx_quant.ui.threading.Thread",
+            return_value=SimpleNamespace(start=MagicMock()),
+        ) as thread_cls:
+            started = QuantApp._request_stop_strategy_session(
+                app,
+                session.session_id,
+                ended_reason="用户手动停止",
+                source_label="用户手动停止",
+                show_dialog=True,
+            )
+
+        self.assertTrue(started)
+        self.assertEqual(session.status, "已停止")
+        self.assertEqual(session.runtime_status, "已停止")
+        self.assertTrue(session.stop_cleanup_in_progress)
+        session.engine.stop.assert_called_once_with()
+        app._upsert_session_row.assert_called_once_with(session)
+        app._refresh_selected_session_details.assert_called_once_with()
+        app._sync_strategy_history_from_session.assert_not_called()
+        thread_cls.assert_called_once()
+
     def test_perform_stop_session_cleanup_collects_successful_cancel(self) -> None:
         session = self._make_session()
         entry_order = self._make_order(session, role="ent")
@@ -7063,6 +7537,80 @@ class StrategyStopCleanupTest(TestCase):
         self.assertFalse(result.remaining_pending_summaries)
         self.assertFalse(result.needs_manual_review)
         self.assertEqual(result.final_reason, "\u7528\u6237\u624b\u52a8\u505c\u6b62")
+
+    def test_perform_stop_session_cleanup_uses_light_follow_up_checks(self) -> None:
+        session = self._make_session()
+        session.engine = SimpleNamespace(is_running=True, wait_stopped=MagicMock(return_value=True))
+        entry_order = self._make_order(session, role="ent")
+        initial_snapshot = self._make_snapshot(pending_orders=[entry_order])
+        final_snapshot = self._make_snapshot()
+        pending_checks: list[str] = []
+        credentials = SimpleNamespace()
+
+        app = SimpleNamespace(
+            _load_strategy_stop_cleanup_snapshot_with_fallback=lambda session_, credentials_: initial_snapshot,
+            _load_strategy_stop_cleanup_snapshot=MagicMock(return_value=final_snapshot),
+            _load_strategy_stop_cleanup_pending_orders=lambda session_, credentials, *, environment: pending_checks.append(environment) or [],
+            _cancel_pending_order_request=lambda credentials, *, environment, item: SimpleNamespace(s_code="0", s_msg=""),
+        )
+
+        with patch("okx_quant.ui.threading.Event", return_value=_FastEvent()):
+            result = QuantApp._perform_stop_session_cleanup(app, session, credentials)
+
+        self.assertFalse(result.needs_manual_review)
+        self.assertEqual(pending_checks, ["demo"])
+        session.engine.wait_stopped.assert_called_once_with(timeout=1.0)
+        app._load_strategy_stop_cleanup_snapshot.assert_called_once_with(session, credentials, "demo")
+
+    def test_load_strategy_stop_cleanup_snapshot_limits_requests_to_trade_inst_type(self) -> None:
+        session = self._make_session()
+        session.config.tp_sl_mode = "local_trade"
+        session.config.trader_virtual_stop_loss = False
+        session.config.trade_inst_id = "ETH-USDT-SWAP"
+        credentials = SimpleNamespace()
+        client = SimpleNamespace(
+            get_pending_orders=MagicMock(return_value=[]),
+            get_order_history=MagicMock(return_value=[]),
+            get_positions=MagicMock(return_value=[]),
+        )
+        app = SimpleNamespace(client=client)
+
+        QuantApp._load_strategy_stop_cleanup_snapshot(app, session, credentials, "demo")
+
+        client.get_pending_orders.assert_called_once_with(
+            credentials,
+            environment="demo",
+            inst_types=("SWAP",),
+            limit=60,
+            include_algo=False,
+        )
+        client.get_order_history.assert_called_once_with(
+            credentials,
+            environment="demo",
+            inst_types=("SWAP",),
+            limit=80,
+            include_algo=False,
+        )
+        client.get_positions.assert_called_once_with(credentials, environment="demo", inst_type="SWAP")
+
+    def test_load_strategy_stop_cleanup_pending_orders_keeps_algo_scan_for_exchange_tp_sl(self) -> None:
+        session = self._make_session()
+        session.config.tp_sl_mode = "exchange"
+        session.config.trader_virtual_stop_loss = False
+        session.config.trade_inst_id = "DOGE-USDT-SWAP"
+        credentials = SimpleNamespace()
+        client = SimpleNamespace(get_pending_orders=MagicMock(return_value=[]))
+        app = SimpleNamespace(client=client)
+
+        QuantApp._load_strategy_stop_cleanup_pending_orders(app, session, credentials, environment="demo")
+
+        client.get_pending_orders.assert_called_once_with(
+            credentials,
+            environment="demo",
+            inst_types=("SWAP",),
+            limit=60,
+            include_algo=True,
+        )
 
     def test_perform_stop_session_cleanup_flags_failed_cancel_for_manual_review(self) -> None:
         session = self._make_session()

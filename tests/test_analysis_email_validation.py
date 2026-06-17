@@ -12,6 +12,7 @@ from okx_quant.analysis_email_validation import (
     build_email_validation_report_payload,
     load_latest_email_validation_payload,
     load_email_analysis_records,
+    refresh_email_validation_report,
     save_email_validation_report,
     validate_email_analysis_records,
 )
@@ -76,6 +77,7 @@ class AnalysisEmailValidationTest(TestCase):
         btc_meta = {
             "subject": "[QQOKX] test 1",
             "generated_at": "2026-06-16T12:00:00Z",
+            "delivery_status": "sent",
             "viewpoints": [
                 {
                     "symbol": "BTC-USDT-SWAP",
@@ -101,10 +103,25 @@ class AnalysisEmailValidationTest(TestCase):
         eth_meta = {
             "subject": "[QQOKX] test 2",
             "generated_at": "2026-06-16T13:00:00Z",
+            "delivery_status": "released",
             "report_path": str(eth_report_path),
         }
         (archive_dir / "multi_coin_market_digest_email_20260616T130000Z.json").write_text(
             json.dumps(eth_meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        pending_meta = {
+            "subject": "[QQOKX] test 3",
+            "generated_at": "2026-06-16T14:00:00Z",
+            "delivery_status": "pending_morning_release",
+            "digest_payload": {
+                "generated_at": "2026-06-16T14:00:00Z",
+                "symbols": ["SOL-USDT-SWAP"],
+                "analyses": [_analysis_payload("SOL-USDT-SWAP", "long", 5, "0.60", 3_000, "300")],
+            },
+        }
+        (archive_dir / "multi_coin_market_digest_email_20260616T140000Z.json").write_text(
+            json.dumps(pending_meta, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -206,3 +223,52 @@ class AnalysisEmailValidationTest(TestCase):
         self.assertEqual(highlights["worst_symbol"]["symbol"], "ETH-USDT-SWAP")
         self.assertTrue(str(highlights["notable_change"]).strip())
         self.assertIn("BTC", str(highlights["notable_change"]) + str(summary))
+
+    def test_refresh_email_validation_report_builds_latest_payload(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        analysis_dir = temp_dir / "reports" / "analysis"
+        archive_dir = analysis_dir / "email_archives"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        digest_payload = {
+            "generated_at": "2026-06-16T12:00:00Z",
+            "symbols": ["BTC-USDT-SWAP"],
+            "analyses": [_analysis_payload("BTC-USDT-SWAP", "long", 8, "0.80", 1_000, "100")],
+        }
+        meta = {
+            "subject": "[QQOKX] test refresh",
+            "generated_at": "2026-06-16T12:00:00Z",
+            "delivery_status": "sent",
+            "digest_payload": digest_payload,
+        }
+        (archive_dir / "multi_coin_market_digest_email_20260616T120000Z.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        class StubClient:
+            def get_candles_history_range(self, symbol, timeframe, *, start_ts, end_ts, limit, preload_count):  # noqa: ANN202
+                return [
+                    Candle(
+                        ts=1_000 + (index + 1) * 3_600_000,
+                        open=Decimal("100"),
+                        high=Decimal("102") + Decimal(index),
+                        low=Decimal("99"),
+                        close=Decimal("101.2") + Decimal(index),
+                        volume=Decimal("1"),
+                        confirmed=True,
+                    )
+                    for index in range(24)
+                ]
+
+        refreshed = refresh_email_validation_report(
+            base_dir=temp_dir,
+            archive_limit=20,
+            windows_hours=(4, 12, 24),
+            client=StubClient(),
+        )
+        self.assertIsNotNone(refreshed)
+        latest_payload = load_latest_email_validation_payload(base_dir=temp_dir)
+        self.assertIsNotNone(latest_payload)
+        assert latest_payload is not None
+        self.assertEqual(latest_payload["overall"]["samples"], 1)

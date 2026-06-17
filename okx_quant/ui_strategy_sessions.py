@@ -101,6 +101,8 @@ class UiStrategySessionsMixin:
             if not self._ensure_credential_profile_access(resolved_api_name, prompt=True):
                 raise ValueError(f"API 配置 {resolved_api_name} 未完成密码验证。")
             self._apply_credentials_profile(resolved_api_name, log_change=False)
+        target_api_name = resolved_api_name or self._current_credential_profile()
+        target_environment_label = self._environment_label_for_profile(target_api_name)
 
         self.strategy_name.set(definition.name)
         self._on_strategy_selected()
@@ -206,7 +208,7 @@ class UiStrategySessionsMixin:
         self.entry_side_mode_label.set(
             _reverse_lookup_label(ENTRY_SIDE_MODE_OPTIONS, record.config.entry_side_mode, "跟随信号")
         )
-        self.environment_label.set(_reverse_lookup_label(ENV_OPTIONS, record.config.environment, "模拟盘 demo"))
+        self.environment_label.set(target_environment_label)
         if strategy_forces_local_trade(definition.strategy_id):
             self.trade_symbol.set(launch_symbol)
             self.local_tp_sl_symbol.set(launch_symbol)
@@ -582,7 +584,10 @@ class UiStrategySessionsMixin:
                     skipped_summaries.append(f"{item.record.strategy_name or item.record.strategy_id} {item.record.symbol}：目标 API 不可用")
                     _record_api_outcome(selected_api_name or item.record.api_name, "skipped")
                     continue
-                resolved_config = _apply_bundle_import_overrides(item, item_index=original_index)
+                resolved_config = self._config_with_api_environment(
+                    _apply_bundle_import_overrides(item, item_index=original_index),
+                    resolved_api_name or item.record.api_name,
+                )
                 resolved_record = replace(
                     item.record,
                     api_name=resolved_api_name or item.record.api_name,
@@ -641,7 +646,10 @@ class UiStrategySessionsMixin:
                     skipped_summaries.append(f"{first_item.record.strategy_name or first_item.record.strategy_id} {first_item.record.symbol}：目标 API 不可用")
                     _record_api_outcome(selected_api_name or first_item.record.api_name, "skipped")
                 else:
-                    resolved_config = _apply_bundle_import_overrides(first_item, item_index=first_index)
+                    resolved_config = self._config_with_api_environment(
+                        _apply_bundle_import_overrides(first_item, item_index=first_index),
+                        resolved_api_name or first_item.record.api_name,
+                    )
                     resolved_record = replace(
                         first_item.record,
                         api_name=resolved_api_name or first_item.record.api_name,
@@ -3558,7 +3566,7 @@ class UiStrategySessionsMixin:
         credentials = self._credentials_for_profile_or_none(target_api_name)
         if credentials is None:
             raise ValueError(f"未找到 API 配置：{target_api_name}")
-        config = record.config
+        config = self._config_with_api_environment(record.config, target_api_name)
         if config.run_mode == "signal_only" and not supports_signal_only(definition.strategy_id):
             raise ValueError(f"{definition.name} 当前不支持只发信号邮件模式。")
         if ask_confirm and not self._confirm_start(definition, config):
@@ -3598,6 +3606,7 @@ class UiStrategySessionsMixin:
         trader_id: str = "",
         trader_slot_id: str = "",
     ) -> str:
+        self._validate_strategy_session_environment(api_name=api_name, config=config)
         if not allow_duplicate_launch:
             duplicate_session = self._find_duplicate_strategy_session(api_name=api_name, config=config)
             if duplicate_session is not None:
@@ -3921,21 +3930,17 @@ class UiStrategySessionsMixin:
             return True
 
         credentials = self._credentials_for_profile_or_none(session.api_name)
-        session.status = "停止中"
-        session.stop_cleanup_in_progress = True
-        session.stop_result_show_dialog = show_dialog
-        session.ended_reason = ended_reason
         session.engine.stop()
-        self._upsert_session_row(session)
-        self._refresh_selected_session_details()
-        self._sync_strategy_history_from_session(session)
-        self._log_session_message(session, f"{source_label}，正在检查本策略委托与持仓。")
+        QuantApp._mark_strategy_session_stopped_pending_audit(
+            self,
+            session,
+            ended_reason=ended_reason,
+            show_dialog=show_dialog,
+        )
+        self._log_session_message(session, f"{source_label}，策略线程已停止，后台继续检查本策略委托与持仓。")
         if credentials is None:
             session.stop_cleanup_in_progress = False
-            session.status = "已停止"
-            session.stopped_at = datetime.now()
             session.ended_reason = f"{ended_reason}（未找到对应API凭证，未执行撤单检查）"
-            self._remove_recoverable_strategy_session(session.session_id)
             self._upsert_session_row(session)
             self._refresh_selected_session_details()
             self._sync_strategy_history_from_session(session)
@@ -3991,14 +3996,65 @@ class UiStrategySessionsMixin:
         credentials: Credentials,
         environment: str,
     ) -> StrategyStopCleanupSnapshot:
-        pending_orders = self.client.get_pending_orders(credentials, environment=environment, limit=200)
-        order_history = self.client.get_order_history(credentials, environment=environment, limit=200)
-        positions = self.client.get_positions(credentials, environment=environment)
+        inst_types = QuantApp._strategy_stop_cleanup_inst_types(session)
+        include_pending_algo = QuantApp._strategy_stop_cleanup_needs_algo_scan(session)
+        pending_orders = self.client.get_pending_orders(
+            credentials,
+            environment=environment,
+            inst_types=inst_types,
+            limit=60,
+            include_algo=include_pending_algo,
+        )
+        order_history = self.client.get_order_history(
+            credentials,
+            environment=environment,
+            inst_types=inst_types,
+            limit=80,
+            include_algo=False,
+        )
+        inst_type = inst_types[0] if inst_types else None
+        positions = self.client.get_positions(credentials, environment=environment, inst_type=inst_type)
         return StrategyStopCleanupSnapshot(
             effective_environment=environment,
             pending_orders=pending_orders,
             order_history=order_history,
             positions=positions,
+        )
+
+    @staticmethod
+    def _strategy_stop_cleanup_inst_types(session: StrategySession) -> tuple[str, ...]:
+        trade_inst_id = str(
+            getattr(getattr(session, "config", None), "trade_inst_id", "")
+            or getattr(getattr(session, "config", None), "inst_id", "")
+            or getattr(session, "symbol", "")
+            or ""
+        ).strip().upper()
+        inst_type = infer_inst_type(trade_inst_id) if trade_inst_id else ""
+        return (inst_type,) if inst_type else ("SWAP",)
+
+    @staticmethod
+    def _strategy_stop_cleanup_needs_algo_scan(session: StrategySession) -> bool:
+        config = getattr(session, "config", None)
+        tp_sl_mode = str(getattr(config, "tp_sl_mode", "") or "").strip().lower()
+        if tp_sl_mode != "exchange":
+            return False
+        if bool(getattr(config, "trader_virtual_stop_loss", False)):
+            return False
+        return True
+
+    def _load_strategy_stop_cleanup_pending_orders(
+        self,
+        session: StrategySession,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> list[OkxTradeOrderItem]:
+        return self.client.get_pending_orders(
+            credentials,
+            environment=environment,
+            inst_types=QuantApp._strategy_stop_cleanup_inst_types(session),
+            limit=60,
+            include_algo=QuantApp._strategy_stop_cleanup_needs_algo_scan(session),
         )
 
     def _load_strategy_stop_cleanup_snapshot_with_fallback(
@@ -4043,24 +4099,37 @@ class UiStrategySessionsMixin:
                     f"{_trade_order_cancel_summary(item)} | 原因={_format_network_error_message(str(exc))}"
                 )
 
-        final_snapshot = initial_snapshot
-        wait_rounds = 3 if cancelable_pending else 1
-        for attempt in range(wait_rounds):
-            if attempt > 0:
-                threading.Event().wait(0.6)
-            final_snapshot = self._load_strategy_stop_cleanup_snapshot(session, credentials, effective_environment)
-            remaining_cancelable = [
-                item
-                for item in final_snapshot.pending_orders
-                if _trade_order_session_role(item, session) in {"ent", "exi"}
-            ]
-            if not remaining_cancelable:
-                break
+        pending_loader = getattr(self, "_load_strategy_stop_cleanup_pending_orders", None)
+        if not callable(pending_loader):
+            pending_loader = lambda session_, credentials_, *, environment: self._load_strategy_stop_cleanup_snapshot(  # noqa: E731
+                session_,
+                credentials_,
+                environment,
+            ).pending_orders
+        remaining_cancelable = list(cancelable_pending)
+        if cancelable_pending:
+            for wait_seconds in (0.25, 0.45):
+                threading.Event().wait(wait_seconds)
+                pending_orders = pending_loader(session, credentials, environment=effective_environment)
+                remaining_cancelable = [
+                    item for item in pending_orders if _trade_order_session_role(item, session) in {"ent", "exi"}
+                ]
+                if not remaining_cancelable:
+                    break
 
-        for _ in range(20):
-            if not session.engine.is_running:
-                break
-            threading.Event().wait(0.25)
+        wait_stopped = getattr(session.engine, "wait_stopped", None)
+        if callable(wait_stopped):
+            try:
+                wait_stopped(timeout=1.0)
+            except Exception:
+                pass
+        else:
+            for _ in range(6):
+                if not session.engine.is_running:
+                    break
+                threading.Event().wait(0.15)
+
+        final_snapshot = self._load_strategy_stop_cleanup_snapshot(session, credentials, effective_environment)
 
         remaining_cancelable = [
             item
@@ -4115,6 +4184,37 @@ class UiStrategySessionsMixin:
             needs_manual_review=needs_manual_review,
             final_reason=final_reason,
         )
+
+    def _refresh_strategy_session_stop_requested_ui(self, session: StrategySession) -> None:
+        self._upsert_session_row(session)
+        try:
+            selected_session = self._selected_session()
+        except Exception:
+            selected_session = None
+        if selected_session is None or selected_session.session_id != session.session_id:
+            return
+        root = getattr(self, "root", None)
+        if root is not None and hasattr(root, "after"):
+            root.after(0, self._refresh_selected_session_details)
+            return
+        self._refresh_selected_session_details()
+
+    def _mark_strategy_session_stopped_pending_audit(
+        self,
+        session: StrategySession,
+        *,
+        ended_reason: str,
+        show_dialog: bool,
+    ) -> None:
+        session.status = "已停止"
+        session.runtime_status = "已停止"
+        session.stop_cleanup_in_progress = True
+        session.stop_result_show_dialog = show_dialog
+        session.ended_reason = ended_reason
+        if session.stopped_at is None:
+            session.stopped_at = datetime.now()
+        self._remove_recoverable_strategy_session(session.session_id)
+        QuantApp._refresh_strategy_session_stop_requested_ui(self, session)
 
     def _stop_session_cleanup_worker(self, session_id: str, credentials: Credentials) -> None:
         session = self.sessions.get(session_id)
@@ -4232,7 +4332,11 @@ class UiStrategySessionsMixin:
 
     @staticmethod
     def _session_can_be_cleared(session: StrategySession) -> bool:
-        return session.status == "已停止" and not session.engine.is_running
+        return (
+            session.status == "已停止"
+            and not session.engine.is_running
+            and not getattr(session, "stop_cleanup_in_progress", False)
+        )
 
     @staticmethod
     def _next_session_selection_after_clear(
@@ -4748,6 +4852,29 @@ class UiStrategySessionsMixin:
         strategy_id = self._strategy_name_to_id[self.strategy_name.get()]
         return get_strategy_definition(strategy_id)
 
+    def _config_with_api_environment(self, config: StrategyConfig, api_name: str) -> StrategyConfig:
+        profile_environment = self._credential_profile_environment_value(api_name, fallback=str(config.environment or ""))
+        if not profile_environment or profile_environment == str(config.environment or "").strip().lower():
+            return config
+        return replace(config, environment=profile_environment)
+
+    def _validate_strategy_session_environment(self, *, api_name: str, config: StrategyConfig) -> None:
+        if str(config.run_mode or "").strip().lower() == "signal_only":
+            return
+        strategy_environment = str(config.environment or "").strip().lower()
+        if strategy_environment not in {"demo", "live"}:
+            return
+        profile_environment = self._credential_profile_environment_value(api_name)
+        if not profile_environment or profile_environment == strategy_environment:
+            return
+        profile_label = "实盘 live" if profile_environment == "live" else "模拟盘 demo"
+        strategy_label = "实盘 live" if strategy_environment == "live" else "模拟盘 demo"
+        raise ValueError(
+            f"启动被拦截：API 配置 {api_name} 当前保存的是 {profile_label}，"
+            f"但策略准备在 {strategy_label} 环境下单。"
+            f"请切换到匹配环境的 API，或把策略环境改成 {profile_label} 后再启动。"
+        )
+
     def _confirm_start(self, definition: StrategyDefinition, config: StrategyConfig) -> bool:
         strategy_symbol = self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
         risk_value = self.risk_amount.get().strip() or "-"
@@ -4774,6 +4901,7 @@ class UiStrategySessionsMixin:
             custom_trigger_symbol=self.local_tp_sl_symbol.get().strip().upper(),
             instrument=instrument,
             api_label=self._current_credential_profile(),
+            api_environment_label=self._environment_label_for_profile(self._current_credential_profile()),
         )
         return messagebox.askokcancel(f"确认启动 {definition.name}", message)
 
@@ -6172,8 +6300,30 @@ class UiStrategySessionsMixin:
             return None
         return self.sessions.get(selected[0])
 
+    def _schedule_selected_session_details_refresh(self, delay_ms: int = 45) -> None:
+        root = getattr(self, "root", None)
+        if root is None or not hasattr(root, "after"):
+            self._refresh_selected_session_details()
+            return
+        previous_job = getattr(self, "_selected_session_detail_refresh_job", None)
+        if previous_job is not None and hasattr(root, "after_cancel"):
+            try:
+                root.after_cancel(previous_job)
+            except Exception:
+                pass
+        token = int(getattr(self, "_selected_session_detail_refresh_token", 0) or 0) + 1
+        self._selected_session_detail_refresh_token = token
+
+        def _run(expected_token: int = token) -> None:
+            self._selected_session_detail_refresh_job = None
+            if int(getattr(self, "_selected_session_detail_refresh_token", 0) or 0) != expected_token:
+                return
+            self._refresh_selected_session_details()
+
+        self._selected_session_detail_refresh_job = root.after(delay_ms, _run)
+
     def _on_session_selected(self, *_: object) -> None:
-        self._refresh_selected_session_details()
+        self._schedule_selected_session_details_refresh()
 
     @staticmethod
     def _session_tree_double_click_hint(column_id: str) -> str:
@@ -6306,6 +6456,8 @@ class UiStrategySessionsMixin:
         return None
 
     def _refresh_selected_session_details(self) -> None:
+        self._selected_session_detail_refresh_job = None
+        self._selected_session_detail_refresh_token = int(getattr(self, "_selected_session_detail_refresh_token", 0) or 0) + 1
         session = self._selected_session()
         if session is None:
             self.selected_session_text.set(self._default_selected_session_text())
@@ -6319,38 +6471,41 @@ class UiStrategySessionsMixin:
             session,
             QuantApp._duplicate_launch_conflicts_for(self, session),
         )
-        self.selected_session_text.set(
-            self._build_strategy_detail_text(
-                session_id=session.session_id,
-                api_name=session.api_name,
-                status=session.status,
-                runtime_status=session.runtime_status,
-                strategy_id=session.strategy_id,
-                strategy_name=session.strategy_name,
-                symbol=session.symbol,
-                direction_label=session.direction_label,
-                run_mode_label=session.run_mode_label,
-                started_at=session.started_at,
-                stopped_at=session.stopped_at,
-                ended_reason=session.ended_reason,
-                config_snapshot=_serialize_strategy_config_snapshot(session.config),
-                log_file_path=session.log_file_path,
-                last_message=session.last_message,
-                trade_count=session.trade_count,
-                win_count=session.win_count,
-                gross_pnl_total=session.gross_pnl_total,
-                fee_total=session.fee_total,
-                funding_total=session.funding_total,
-                net_pnl_total=session.net_pnl_total,
-                last_close_reason=session.last_close_reason,
-                live_pnl=live_pnl,
-                live_pnl_refreshed_at=live_pnl_refreshed_at,
-                position_cache_note=self._session_position_cache_note(session),
-                duplicate_warning=duplicate_warning,
-                email_status_label=QuantApp._session_email_status_label(self, session),
-                global_email_enabled=self.notify_enabled.get(),
-            )
+        detail_text = self._build_strategy_detail_text(
+            session_id=session.session_id,
+            api_name=session.api_name,
+            status=session.status,
+            runtime_status=session.runtime_status,
+            strategy_id=session.strategy_id,
+            strategy_name=session.strategy_name,
+            symbol=session.symbol,
+            direction_label=session.direction_label,
+            run_mode_label=session.run_mode_label,
+            started_at=session.started_at,
+            stopped_at=session.stopped_at,
+            ended_reason=session.ended_reason,
+            config_snapshot=_serialize_strategy_config_snapshot(session.config),
+            log_file_path=session.log_file_path,
+            last_message=session.last_message,
+            trade_count=session.trade_count,
+            win_count=session.win_count,
+            gross_pnl_total=session.gross_pnl_total,
+            fee_total=session.fee_total,
+            funding_total=session.funding_total,
+            net_pnl_total=session.net_pnl_total,
+            last_close_reason=session.last_close_reason,
+            live_pnl=live_pnl,
+            live_pnl_refreshed_at=live_pnl_refreshed_at,
+            position_cache_note=self._session_position_cache_note(session),
+            duplicate_warning=duplicate_warning,
+            email_status_label=QuantApp._session_email_status_label(self, session),
+            global_email_enabled=self.notify_enabled.get(),
         )
+        current_text = self.selected_session_text.get() if hasattr(self.selected_session_text, "get") else ""
+        if preserve_scroll and current_text == detail_text:
+            self._selected_session_detail_session_id = session.session_id
+            return
+        self.selected_session_text.set(detail_text)
         self._set_readonly_text(
             self._selected_session_detail,
             self.selected_session_text.get(),
@@ -8162,21 +8317,17 @@ class UiStrategySessionsMixin:
             return True
 
         credentials = self._credentials_for_profile_or_none(session.api_name)
-        session.status = "停止中"
-        session.stop_cleanup_in_progress = True
-        session.stop_result_show_dialog = show_dialog
-        session.ended_reason = ended_reason
         session.engine.stop()
-        self._upsert_session_row(session)
-        self._refresh_selected_session_details()
-        self._sync_strategy_history_from_session(session)
-        self._log_session_message(session, f"{source_label}，正在检查本策略委托与持仓。")
+        QuantApp._mark_strategy_session_stopped_pending_audit(
+            self,
+            session,
+            ended_reason=ended_reason,
+            show_dialog=show_dialog,
+        )
+        self._log_session_message(session, f"{source_label}，策略线程已停止，后台继续检查本策略委托与持仓。")
         if credentials is None:
             session.stop_cleanup_in_progress = False
-            session.status = "已停止"
-            session.stopped_at = datetime.now()
             session.ended_reason = f"{ended_reason}（未找到对应API凭证，未执行撤单检查）"
-            self._remove_recoverable_strategy_session(session.session_id)
             self._upsert_session_row(session)
             self._refresh_selected_session_details()
             self._sync_strategy_history_from_session(session)

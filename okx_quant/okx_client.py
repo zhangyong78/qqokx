@@ -124,8 +124,28 @@ def _okx_order_reject_hint_by_code(*, s_code: str, sub_code: str, item: dict[str
 
 def _okx_trade_order_request_log_fragment(order: dict[str, Any]) -> str:
     """下单 POST body 摘要，便于对照 OKX 拒单原因（控制长度）。"""
-    keys = ("instId", "tdMode", "side", "ordType", "px", "sz", "posSide", "ccy", "clOrdId", "reduceOnly")
+    keys = (
+        "instId",
+        "tdMode",
+        "side",
+        "ordType",
+        "px",
+        "sz",
+        "posSide",
+        "ccy",
+        "clOrdId",
+        "algoClOrdId",
+        "reduceOnly",
+        "cxlOnClosePos",
+    )
     frag: dict[str, Any] = {k: order[k] for k in keys if k in order and order[k] is not None}
+    top_level_algo_fields = {
+        k: order.get(k)
+        for k in ("tpTriggerPx", "slTriggerPx", "tpTriggerPxType", "slTriggerPxType", "tpOrdPx", "slOrdPx")
+        if order.get(k) not in (None, "")
+    }
+    if top_level_algo_fields:
+        frag["algo_tp_sl"] = top_level_algo_fields
     aa = order.get("attachAlgoOrds")
     if isinstance(aa, list) and aa:
         frag["attachAlgoOrds_n"] = len(aa)
@@ -1732,6 +1752,7 @@ class OkxRestClient:
         environment: str,
         inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION", "SPOT"),
         limit: int = 100,
+        include_algo: bool = True,
     ) -> list[OkxTradeOrderItem]:
         items: list[OkxTradeOrderItem] = []
         normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
@@ -1748,14 +1769,15 @@ class OkxRestClient:
             )
             for item in payload.get("data", []):
                 items.append(self._parse_trade_order_item(item, default_inst_type=inst_type, source_kind="normal"))
-        items.extend(
-            self._fetch_algo_orders(
-                credentials=credentials,
-                environment=environment,
-                limit=limit,
-                history=False,
+        if include_algo:
+            items.extend(
+                self._fetch_algo_orders(
+                    credentials=credentials,
+                    environment=environment,
+                    limit=limit,
+                    history=False,
+                )
             )
-        )
         items.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
         return items[:limit]
 
@@ -1766,6 +1788,7 @@ class OkxRestClient:
         environment: str,
         inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION", "SPOT"),
         limit: int = 100,
+        include_algo: bool = True,
     ) -> list[OkxTradeOrderItem]:
         items: list[OkxTradeOrderItem] = []
         normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
@@ -1782,14 +1805,15 @@ class OkxRestClient:
             )
             for item in payload.get("data", []):
                 items.append(self._parse_trade_order_item(item, default_inst_type=inst_type, source_kind="normal"))
-        items.extend(
-            self._fetch_algo_orders(
-                credentials=credentials,
-                environment=environment,
-                limit=limit,
-                history=True,
+        if include_algo:
+            items.extend(
+                self._fetch_algo_orders(
+                    credentials=credentials,
+                    environment=environment,
+                    limit=limit,
+                    history=True,
+                )
             )
-        )
         items.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
         return items[:limit]
 
@@ -2153,6 +2177,73 @@ class OkxRestClient:
             return self._parse_algo_order_result(
                 payload,
                 empty_message="OKX 返回了空的触发价算法单结果",
+                fallback_algo_cl_ord_id=algo_cl_ord_id,
+            )
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
+
+    def place_stop_loss_algo_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        pos_side: str | None,
+        stop_loss_trigger_price: Decimal,
+        algo_cl_ord_id: str | None = None,
+    ) -> OkxOrderResult:
+        instrument = self.get_instrument(inst_id)
+        if instrument.inst_type == "OPTION":
+            raise OkxApiError("OKX 期权不支持这里的独立止损算法单，请改走本地止损流程")
+
+        stop_loss_txt = _format_okx_px_for_increment(stop_loss_trigger_price, instrument.tick_size)
+        order: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": config.trade_mode,
+            "side": side,
+            "ordType": "conditional",
+            "sz": _format_exchange_contract_sz(instrument, size),
+            "slTriggerPx": stop_loss_txt,
+            "slOrdPx": "-1",
+            "slTriggerPxType": config.tp_sl_trigger_type,
+            "reduceOnly": True,
+            "cxlOnClosePos": True,
+        }
+        normalized_plan_pos = (pos_side or "").strip().lower()
+        acct = self._get_account_config_cached(credentials, config)
+        acct_mode = (acct.position_mode or "").strip().lower() if acct is not None else ""
+        if acct_mode == "net_mode":
+            resolved_pos_side = None
+        elif normalized_plan_pos in {"long", "short"}:
+            resolved_pos_side = normalized_plan_pos
+        else:
+            resolved_pos_side = self._derivative_order_pos_side(
+                credentials,
+                config,
+                instrument,
+                side,
+                plan_pos_side=pos_side,
+            )
+        if resolved_pos_side:
+            order["posSide"] = resolved_pos_side
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
+        if algo_cl_ord_id:
+            order["algoClOrdId"] = algo_cl_ord_id
+
+        try:
+            payload = self._request(
+                "POST",
+                "/api/v5/trade/order-algo",
+                body=order,
+                auth=True,
+                credentials=credentials,
+                simulated=config.environment == "demo",
+            )
+            return self._parse_algo_order_result(
+                payload,
+                empty_message="OKX 未返回独立止损算法单结果",
                 fallback_algo_cl_ord_id=algo_cl_ord_id,
             )
         except OkxApiError as exc:

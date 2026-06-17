@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest import TestCase
 
@@ -12,6 +13,8 @@ from okx_quant.multi_coin_market_digest import (
     build_multi_coin_chart_image_map,
     multi_coin_market_digest_payload,
     analyze_multi_coin_market,
+    release_due_pending_multi_coin_market_emails,
+    release_pending_multi_coin_market_emails,
 )
 import tempfile
 from pathlib import Path
@@ -168,6 +171,10 @@ class MultiCoinMarketDigestTest(TestCase):
         self.assertIn("今日优先跟踪", body)
         self.assertIn("今日谨慎对待", body)
         self.assertIn("若只做一笔", body)
+        self.assertIn("当前观点：", body)
+        self.assertIn("理由：", body)
+        self.assertIn("失效条件：", body)
+        self.assertIn("前提：", body)
         self.assertIn("各币种最近命中率简表", body)
         self.assertIn("BTC：命中率", body)
         self.assertIn("做多最强", body)
@@ -182,6 +189,12 @@ class MultiCoinMarketDigestTest(TestCase):
         self.assertIn("今日优先跟踪", html)
         self.assertIn("今日谨慎对待", html)
         self.assertIn("若只做一笔", html)
+        self.assertIn("当前观点：", html)
+        self.assertIn("理由：", html)
+        self.assertIn("失效条件：", html)
+        self.assertIn("观察条件：", html)
+        self.assertIn("border-left: 4px solid", html)
+        self.assertIn("border-radius: 999px", html)
         self.assertIn("各币种最近命中率简表", html)
         self.assertIn("BTC", html)
         self.assertIn("ETH", html)
@@ -210,8 +223,169 @@ class MultiCoinMarketDigestTest(TestCase):
             metadata = json.loads(archive_path.with_suffix(".json").read_text(encoding="utf-8"))
             self.assertIn("viewpoints", metadata)
             self.assertIn("digest_payload", metadata)
+            self.assertEqual(metadata["delivery_status"], "sent")
             self.assertEqual(metadata["digest_payload"]["symbols"], list(digest.symbols))
             self.assertEqual(metadata["viewpoints"][0]["symbol"], "BTC-USDT-SWAP")
+
+    def test_release_pending_multi_coin_market_emails_sends_archived_midnight_and_4am_messages(self) -> None:
+        class StubNotifier:
+            enabled = True
+
+            def __init__(self) -> None:
+                self.sent: list[tuple[str, str, str]] = []
+
+            def _send(self, subject: str, body: str, *, html_body: str) -> None:
+                self.sent.append((subject, body, html_body))
+
+        notifier = StubNotifier()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_root = Path(temp_dir) / "analysis"
+            digest = None
+            analyses = (
+                _analysis("BTC-USDT-SWAP", "long", 8, "long", "long"),
+                _analysis("ETH-USDT-SWAP", "short", -7, "short", "short"),
+            )
+            from okx_quant.multi_coin_market_digest import MultiCoinMarketDigest, _pick_best_trade_candidate, _pick_strongest_long, _pick_weakest_short
+
+            digest = MultiCoinMarketDigest(
+                generated_at="2026-06-17T00:00:00Z",
+                symbols=tuple(item.symbol for item in analyses),
+                analyses=analyses,
+                strongest_long=_pick_strongest_long(analyses),
+                weakest_short=_pick_weakest_short(analyses),
+                best_trade_candidate=_pick_best_trade_candidate(analyses),
+            )
+
+            with patch("okx_quant.multi_coin_market_digest.analysis_report_dir_path", return_value=archive_root):
+                first_path = archive_multi_coin_market_email(
+                    digest,
+                    subject="[QQOKX] 00",
+                    body="midnight-body",
+                    html_body="<html>midnight</html>",
+                    report_path=None,
+                    delivery_status="pending_morning_release",
+                    scheduled_release_slot="08:00",
+                    analysis_slot="00:00",
+                )
+                second_digest = MultiCoinMarketDigest(
+                    generated_at="2026-06-17T04:00:00Z",
+                    symbols=tuple(item.symbol for item in analyses),
+                    analyses=analyses,
+                    strongest_long=_pick_strongest_long(analyses),
+                    weakest_short=_pick_weakest_short(analyses),
+                    best_trade_candidate=_pick_best_trade_candidate(analyses),
+                )
+                second_path = archive_multi_coin_market_email(
+                    second_digest,
+                    subject="[QQOKX] 04",
+                    body="four-body",
+                    html_body="<html>four</html>",
+                    report_path=None,
+                    delivery_status="pending_morning_release",
+                    scheduled_release_slot="08:00",
+                    analysis_slot="04:00",
+                )
+                with patch("okx_quant.multi_coin_market_digest.load_btc_market_email_notifier", return_value=notifier):
+                    released = release_pending_multi_coin_market_emails(scheduled_release_slot="08:00")
+
+            self.assertEqual(released, 2)
+            self.assertEqual(
+                notifier.sent,
+                [
+                    ("[QQOKX] 00", "midnight-body", "<html>midnight</html>"),
+                    ("[QQOKX] 04", "four-body", "<html>four</html>"),
+                ],
+            )
+            first_meta = json.loads(first_path.with_suffix(".json").read_text(encoding="utf-8"))
+            second_meta = json.loads(second_path.with_suffix(".json").read_text(encoding="utf-8"))
+            self.assertEqual(first_meta["delivery_status"], "released")
+            self.assertEqual(first_meta["released_by_slot"], "08:00")
+            self.assertTrue(first_meta["released_at"])
+            self.assertEqual(second_meta["delivery_status"], "released")
+            self.assertEqual(second_meta["released_by_slot"], "08:00")
+            self.assertTrue(second_meta["released_at"])
+
+    def test_release_due_pending_multi_coin_market_emails_respects_release_slot_and_catches_up_next_day(self) -> None:
+        class StubNotifier:
+            enabled = True
+
+            def __init__(self) -> None:
+                self.sent: list[tuple[str, str, str]] = []
+
+            def _send(self, subject: str, body: str, *, html_body: str) -> None:
+                self.sent.append((subject, body, html_body))
+
+        notifier = StubNotifier()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_root = Path(temp_dir) / "analysis"
+            analyses = (_analysis("BTC-USDT-SWAP", "long", 8, "long", "long"),)
+            from okx_quant.multi_coin_market_digest import MultiCoinMarketDigest, _pick_best_trade_candidate, _pick_strongest_long, _pick_weakest_short
+
+            digest = MultiCoinMarketDigest(
+                generated_at="2026-06-17T00:00:00Z",
+                symbols=tuple(item.symbol for item in analyses),
+                analyses=analyses,
+                strongest_long=_pick_strongest_long(analyses),
+                weakest_short=_pick_weakest_short(analyses),
+                best_trade_candidate=_pick_best_trade_candidate(analyses),
+            )
+
+            with patch("okx_quant.multi_coin_market_digest.analysis_report_dir_path", return_value=archive_root):
+                same_day_path = archive_multi_coin_market_email(
+                    digest,
+                    subject="[QQOKX] same-day",
+                    body="same-day-body",
+                    html_body="<html>same-day</html>",
+                    report_path=None,
+                    delivery_status="pending_morning_release",
+                    scheduled_release_slot="08:00",
+                    analysis_slot="04:00",
+                )
+                next_day_digest = MultiCoinMarketDigest(
+                    generated_at="2026-06-16T04:00:00Z",
+                    symbols=tuple(item.symbol for item in analyses),
+                    analyses=analyses,
+                    strongest_long=_pick_strongest_long(analyses),
+                    weakest_short=_pick_weakest_short(analyses),
+                    best_trade_candidate=_pick_best_trade_candidate(analyses),
+                )
+                next_day_path = archive_multi_coin_market_email(
+                    next_day_digest,
+                    subject="[QQOKX] overdue",
+                    body="overdue-body",
+                    html_body="<html>overdue</html>",
+                    report_path=None,
+                    delivery_status="pending_morning_release",
+                    scheduled_release_slot="08:00",
+                    analysis_slot="04:00",
+                )
+                with patch("okx_quant.multi_coin_market_digest.load_btc_market_email_notifier", return_value=notifier):
+                    before_slot = release_due_pending_multi_coin_market_emails(
+                        scheduled_release_slot="08:00",
+                        now=datetime(2026, 6, 17, 7, 0, tzinfo=timezone(timedelta(hours=8))),
+                        update_email_state=False,
+                    )
+                    catch_up_next_day = release_due_pending_multi_coin_market_emails(
+                        scheduled_release_slot="08:00",
+                        now=datetime(2026, 6, 18, 1, 0, tzinfo=timezone(timedelta(hours=8))),
+                        update_email_state=False,
+                    )
+
+            self.assertEqual(before_slot, 1)
+            self.assertEqual(catch_up_next_day, 1)
+            self.assertEqual(
+                notifier.sent,
+                [
+                    ("[QQOKX] overdue", "overdue-body", "<html>overdue</html>"),
+                    ("[QQOKX] same-day", "same-day-body", "<html>same-day</html>"),
+                ],
+            )
+            same_day_meta = json.loads(same_day_path.with_suffix(".json").read_text(encoding="utf-8"))
+            next_day_meta = json.loads(next_day_path.with_suffix(".json").read_text(encoding="utf-8"))
+            self.assertEqual(same_day_meta["delivery_status"], "released")
+            self.assertEqual(next_day_meta["delivery_status"], "released")
 
     def test_build_chart_image_map_reuses_cached_intraday_data_and_fetches_weekly_directly(self) -> None:
         from okx_quant.multi_coin_market_digest import MultiCoinMarketDigest, _pick_best_trade_candidate, _pick_strongest_long, _pick_weakest_short

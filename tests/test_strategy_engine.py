@@ -26,7 +26,7 @@ from okx_quant.engine import (
     validate_entry_side_mode_support,
 )
 from okx_quant.engine_strategy_router import EngineStrategyRouter
-from okx_quant.models import Candle, Credentials, Instrument, SignalDecision, StrategyConfig
+from okx_quant.models import Candle, Credentials, Instrument, OrderPlan, SignalDecision, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxTradeOrderItem
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategy_catalog import (
@@ -47,6 +47,18 @@ class _HistoryClient:
 
 
 class StrategyEngineTest(TestCase):
+    def test_build_okx_write_failure_message_explains_environment_mismatch(self) -> None:
+        message = StrategyEngine._build_okx_write_failure_message(
+            label="开仓报单",
+            inst_id="DOGE-USDT-SWAP",
+            cl_ord_id="abc123",
+            detail='HTTP 401: {"msg":"APIKey does not match current environment.","code":"50101"}',
+            code="50101",
+        )
+
+        self.assertIn("API Key 与当前交易环境不匹配", message)
+        self.assertIn("demo 还是 live", message)
+
     def test_log_strategy_start_uses_actual_moving_average_labels(self) -> None:
         messages: list[str] = []
         engine = StrategyEngine(object(), messages.append)
@@ -1002,6 +1014,52 @@ class StrategyEngineTest(TestCase):
         self.assertIn("启动追当前信号，本次接管当前波段", message or "")
         self.assertIsNone(gate.blocked_signal)
 
+    def test_startup_takeover_skips_when_current_price_has_crossed_stop(self) -> None:
+        messages: list[str] = []
+        gate = StartupSignalGateState(
+            started_at_ms=180_000,
+            chase_window_seconds=0,
+            chase_current_signal=True,
+        )
+        engine = StrategyEngine(
+            object(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托多头",
+            session_id="S-startup-stop",
+        )
+        engine._get_trigger_price_with_retry = lambda *args, **kwargs: Decimal("2279")  # type: ignore[assignment]
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+        )
+
+        should_skip, message = engine._should_skip_startup_takeover_when_stop_crossed(
+            gate,
+            config,
+            signal="long",
+            candle_ts=60_000,
+            trigger_inst_id="ETH-USDT-SWAP",
+            stop_loss=Decimal("2280"),
+        )
+
+        self.assertTrue(should_skip)
+        self.assertEqual(gate.blocked_signal, "long")
+        self.assertIn("当前价已低于等于止损", message or "")
+
     def test_cross_exchange_strategy_skips_old_signal_when_startup_window_disabled(self) -> None:
         messages: list[str] = []
         submit_calls = {"count": 0}
@@ -1103,6 +1161,7 @@ class StrategyEngineTest(TestCase):
         engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
         engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
         engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._get_trigger_price_with_retry = lambda *args, **kwargs: Decimal("2305")  # type: ignore[assignment]
 
         def _fake_submit(*_args, **_kwargs) -> OkxOrderResult:  # noqa: ANN001
             submit_calls["count"] += 1
@@ -1178,6 +1237,87 @@ class StrategyEngineTest(TestCase):
 
         self.assertEqual(submit_calls["count"], 1)
         self.assertTrue(any("启动追单窗口内接管当前波段" in message for message in messages))
+
+    def test_cross_exchange_strategy_skips_startup_takeover_when_current_price_crosses_stop(self) -> None:
+        messages: list[str] = []
+        submit_calls = {"count": 0}
+        candles = self._make_candles([str(2000 + index) for index in range(260)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, _timeout: float) -> bool:
+                self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            object(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 突破做多策略",
+            session_id="S-startup-stop-cross",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._get_trigger_price_with_retry = lambda *args, **kwargs: Decimal("2279")  # type: ignore[assignment]
+        engine._submit_order_with_recovery = lambda *_args, **_kwargs: submit_calls.__setitem__("count", submit_calls["count"] + 1)  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_EMA_BREAKOUT_LONG_ID,
+            poll_seconds=10,
+            risk_amount=Decimal("10"),
+            startup_chase_current_signal=True,
+            startup_chase_window_seconds=0,
+            take_profit_mode="fixed",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
+            return SignalDecision(
+                signal="long",
+                reason="突破成立",
+                candle_ts=60_000,
+                entry_reference=Decimal("2300"),
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2310"),
+                signal_candle_high=Decimal("2315"),
+                signal_candle_low=Decimal("2295"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=180.0), patch(
+            "okx_quant.engine.EmaAtrStrategy.evaluate",
+            new=_fake_evaluate,
+        ):
+            engine._run_cross_exchange_strategy(None, config, instrument)  # type: ignore[arg-type]
+
+        self.assertEqual(submit_calls["count"], 0)
+        self.assertTrue(any("当前价已低于等于止损" in message for message in messages))
 
     def test_ema55_slope_signal_only_accepts_old_signal_when_chase_current_signal_enabled(self) -> None:
         messages: list[str] = []
@@ -1256,6 +1396,85 @@ class StrategyEngineTest(TestCase):
 
         self.assertEqual(notify_calls["count"], 1)
         self.assertTrue(any("启动追当前信号，本次接管当前波段" in message for message in messages))
+
+    def test_dynamic_exchange_strategy_skips_startup_takeover_when_current_price_crosses_stop(self) -> None:
+        messages: list[str] = []
+        submit_calls = {"count": 0}
+        candles = self._make_candles([str(2000 + index) for index in range(80)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, _timeout: float) -> bool:
+                self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            object(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托多头",
+            session_id="S-dyn-startup-stop",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._get_trigger_price_with_retry = lambda *args, **kwargs: Decimal("2279")  # type: ignore[assignment]
+        engine._submit_dynamic_limit_entry_order = lambda *_args, **_kwargs: submit_calls.__setitem__("count", submit_calls["count"] + 1)  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            risk_amount=Decimal("10"),
+            startup_chase_current_signal=True,
+            startup_chase_window_seconds=0,
+            take_profit_mode="dynamic",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
+            return SignalDecision(
+                signal="long",
+                reason="趋势成立",
+                candle_ts=60_000,
+                entry_reference=Decimal("2300"),
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2310"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=180.0), patch(
+            "okx_quant.engine.EmaDynamicOrderStrategy.evaluate",
+            new=_fake_evaluate,
+        ):
+            engine._run_dynamic_exchange_strategy(None, config, instrument)  # type: ignore[arg-type]
+
+        self.assertEqual(submit_calls["count"], 0)
+        self.assertTrue(any("当前价已低于等于止损" in message for message in messages))
 
     def test_dynamic_exchange_strategy_continues_after_round_trip_and_respects_wave_limit(self) -> None:
         messages: list[str] = []
@@ -1757,6 +1976,213 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(captured_monitor["take_profit"], Decimal("2340"))
         self.assertTrue(captured_monitor["dynamic_take_profit_enabled"])
         self.assertTrue(any("交易员虚拟止损只记触发" in message for message in messages))
+
+    def test_dynamic_limit_entry_retries_without_attached_stop_after_51051_reject(self) -> None:
+        messages: list[str] = []
+        place_limit_calls: list[dict[str, object]] = []
+        next_ids = iter(("entry-1", "slg-1"))
+
+        class _StubClient:
+            @staticmethod
+            def place_limit_order(
+                credentials,
+                config,
+                plan,
+                *,
+                cl_ord_id=None,
+                include_take_profit=True,
+                stop_loss_algo_cl_ord_id=None,
+                include_attached_protection=True,
+            ):  # noqa: ANN001
+                place_limit_calls.append(
+                    {
+                        "cl_ord_id": cl_ord_id,
+                        "include_take_profit": include_take_profit,
+                        "stop_loss_algo_cl_ord_id": stop_loss_algo_cl_ord_id,
+                        "include_attached_protection": include_attached_protection,
+                    }
+                )
+                if include_attached_protection:
+                    raise OkxApiError("操作全部失败 | 止损价格应低于开仓价格 | sCode=51051", code="1")
+                return OkxOrderResult(
+                    ord_id="ord-limit-1",
+                    cl_ord_id=cl_ord_id,
+                    s_code="0",
+                    s_msg="accepted",
+                    raw={},
+                )
+
+        engine = StrategyEngine(
+            _StubClient(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托多头",
+            session_id="S01",
+        )
+        engine._next_client_order_id = lambda *, role: next(next_ids)  # type: ignore[assignment]
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            take_profit_mode="dynamic",
+        )
+        plan = OrderPlan(
+            inst_id="ETH-USDT-SWAP",
+            side="buy",
+            pos_side="long",
+            size=Decimal("0.01"),
+            take_profit=Decimal("2340"),
+            stop_loss=Decimal("2280"),
+            entry_reference=Decimal("2300"),
+            atr_value=Decimal("10"),
+            signal="long",
+            candle_ts=1,
+            tp_sl_inst_id="ETH-USDT-SWAP",
+            tp_sl_mode="exchange",
+        )
+
+        cl_ord_id, result, stop_loss_algo_cl_ord_id = engine._submit_dynamic_limit_entry_order(
+            None,  # type: ignore[arg-type]
+            config,
+            plan=plan,
+            dynamic_stop_only=True,
+            trader_virtual_stop_loss_enabled=False,
+        )
+
+        self.assertEqual(cl_ord_id, "entry-1")
+        self.assertEqual(result.ord_id, "ord-limit-1")
+        self.assertIsNone(stop_loss_algo_cl_ord_id)
+        self.assertEqual(len(place_limit_calls), 2)
+        self.assertTrue(place_limit_calls[0]["include_attached_protection"])
+        self.assertEqual(place_limit_calls[0]["stop_loss_algo_cl_ord_id"], "slg-1")
+        self.assertFalse(place_limit_calls[1]["include_attached_protection"])
+        self.assertIsNone(place_limit_calls[1]["stop_loss_algo_cl_ord_id"])
+        self.assertTrue(any("改为先挂裸限价单" in message for message in messages))
+
+    def test_manage_filled_dynamic_entry_submits_stop_loss_algo_after_plain_limit_fill(self) -> None:
+        messages: list[str] = []
+        captured_algo: dict[str, object] = {}
+        captured_monitor: dict[str, object] = {}
+
+        class _StubClient:
+            @staticmethod
+            def place_stop_loss_algo_order(
+                credentials,
+                config,
+                *,
+                inst_id: str,
+                side: str,
+                size: Decimal,
+                pos_side: str | None,
+                stop_loss_trigger_price: Decimal,
+                algo_cl_ord_id: str | None = None,
+            ) -> OkxOrderResult:
+                captured_algo["inst_id"] = inst_id
+                captured_algo["side"] = side
+                captured_algo["size"] = size
+                captured_algo["pos_side"] = pos_side
+                captured_algo["stop_loss_trigger_price"] = stop_loss_trigger_price
+                captured_algo["algo_cl_ord_id"] = algo_cl_ord_id
+                return OkxOrderResult(
+                    ord_id="algo-1",
+                    cl_ord_id=algo_cl_ord_id,
+                    s_code="0",
+                    s_msg="accepted",
+                    raw={},
+                )
+
+        engine = StrategyEngine(
+            _StubClient(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托多头",
+            session_id="S01",
+        )
+        engine._next_client_order_id = lambda *, role: "slg-after-fill"  # type: ignore[assignment]
+        engine._notify_trade_fill = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._monitor_exchange_dynamic_stop = lambda *args, **kwargs: captured_monitor.update(kwargs)  # type: ignore[assignment]
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            take_profit_mode="dynamic",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        active_order = ManagedEntryOrder(
+            ord_id="ord-limit-1",
+            cl_ord_id="entry-1",
+            candle_ts=1,
+            entry_reference=Decimal("2300"),
+            stop_loss=Decimal("2280"),
+            take_profit=Decimal("2340"),
+            stop_loss_algo_cl_ord_id=None,
+            size=Decimal("0.01"),
+            side="buy",
+            signal="long",
+            stop_loss_algo_id=None,
+        )
+        status = OkxOrderStatus(
+            ord_id="ord-limit-1",
+            state="filled",
+            side="buy",
+            ord_type="limit",
+            price=Decimal("2300"),
+            avg_price=Decimal("2299"),
+            size=Decimal("0.01"),
+            filled_size=Decimal("0.01"),
+            raw={},
+        )
+
+        engine._manage_filled_dynamic_entry(
+            None,  # type: ignore[arg-type]
+            config,
+            trade_instrument=instrument,
+            active_order=active_order,
+            status=status,
+            newest_ts=1,
+            dynamic_stop_only=True,
+        )
+
+        self.assertEqual(captured_algo["inst_id"], "ETH-USDT-SWAP")
+        self.assertEqual(captured_algo["side"], "sell")
+        self.assertEqual(captured_algo["size"], Decimal("0.01"))
+        self.assertEqual(captured_algo["pos_side"], "long")
+        self.assertEqual(captured_algo["stop_loss_trigger_price"], Decimal("2280"))
+        self.assertEqual(captured_algo["algo_cl_ord_id"], "slg-after-fill")
+        self.assertEqual(captured_monitor["stop_loss_algo_id"], "algo-1")
+        self.assertEqual(captured_monitor["stop_loss_algo_cl_ord_id"], "slg-after-fill")
+        self.assertTrue(any("初始 OKX 止损已补挂" in message for message in messages))
 
     def test_dynamic_exchange_strategy_logs_no_signal_only_once_per_candle(self) -> None:
         messages: list[str] = []

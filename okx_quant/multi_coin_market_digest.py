@@ -15,7 +15,11 @@ from okx_quant.btc_market_analyzer import (
     btc_market_analysis_payload,
     load_btc_market_email_notifier,
 )
-from okx_quant.analysis_email_validation import build_recent_email_validation_summary, load_latest_email_validation_payload
+from okx_quant.analysis_email_validation import (
+    build_recent_email_validation_summary,
+    load_latest_email_validation_payload,
+    refresh_email_validation_report,
+)
 from okx_quant.candle_cache import load_candle_cache
 from okx_quant.mini_chart import LINE_COLORS, MiniChartOverlay, render_candles_png_base64
 from okx_quant.okx_client import OkxRestClient
@@ -34,6 +38,7 @@ DEFAULT_DIGEST_SYMBOLS: tuple[str, ...] = (
     "SOL-USDT-SWAP",
     "DOGE-USDT-SWAP",
 )
+DEFAULT_DEFERRED_RELEASE_SLOT = "08:00"
 
 
 @dataclass(frozen=True)
@@ -115,9 +120,17 @@ def build_multi_coin_market_email_subject(digest: MultiCoinMarketDigest) -> str:
 
 
 def build_multi_coin_market_email_body(digest: MultiCoinMarketDigest) -> str:
+    return _build_multi_coin_market_email_body(digest, validation_summary=None)
+
+
+def _build_multi_coin_market_email_body(
+    digest: MultiCoinMarketDigest,
+    *,
+    validation_summary: dict[str, object] | None,
+) -> str:
     email_state = load_btc_market_email_state()
     viewpoints = build_multi_coin_market_viewpoints(digest)
-    validation_summary = _load_recent_validation_summary()
+    resolved_validation_summary = validation_summary if validation_summary is not None else _load_recent_validation_summary()
     last_sent_at = _parse_iso_datetime(email_state.get("last_sent_at", ""))
     lines = [
         "简明结论：",
@@ -129,7 +142,7 @@ def build_multi_coin_market_email_body(digest: MultiCoinMarketDigest) -> str:
         *[f"- {item['asset']}：{item['stance']}。{item['summary']}" for item in viewpoints],
         "",
         "最近复盘：",
-        *_build_recent_validation_text_lines(validation_summary, viewpoints=viewpoints),
+        *_build_recent_validation_text_lines(resolved_validation_summary, viewpoints=viewpoints),
         "",
         "分币摘要：",
     ]
@@ -144,9 +157,24 @@ def build_multi_coin_market_email_html(
     chart_image_map: dict[str, dict[str, str]] | None = None,
     overlay_legend_map: dict[str, dict[str, str]] | None = None,
 ) -> str:
+    return _build_multi_coin_market_email_html(
+        digest,
+        chart_image_map=chart_image_map,
+        overlay_legend_map=overlay_legend_map,
+        validation_summary=None,
+    )
+
+
+def _build_multi_coin_market_email_html(
+    digest: MultiCoinMarketDigest,
+    *,
+    chart_image_map: dict[str, dict[str, str]] | None = None,
+    overlay_legend_map: dict[str, dict[str, str]] | None = None,
+    validation_summary: dict[str, object] | None,
+) -> str:
     email_state = load_btc_market_email_state()
     viewpoints = build_multi_coin_market_viewpoints(digest)
-    validation_summary = _load_recent_validation_summary()
+    resolved_validation_summary = validation_summary if validation_summary is not None else _load_recent_validation_summary()
     last_sent_at = _parse_iso_datetime(email_state.get("last_sent_at", ""))
     strongest_long_asset = digest.strongest_long.label.upper()
     weakest_short_asset = digest.weakest_short.label.upper()
@@ -175,7 +203,7 @@ def build_multi_coin_market_email_html(
         """
         for item in viewpoints
     )
-    validation_html = _build_recent_validation_html(validation_summary, viewpoints=viewpoints)
+    validation_html = _build_recent_validation_html(resolved_validation_summary, viewpoints=viewpoints)
     coin_cards_html = "".join(
         _build_coin_card_html(
             analysis,
@@ -258,8 +286,37 @@ def send_multi_coin_market_email(
     notifier = load_btc_market_email_notifier()
     if notifier is None or not notifier.enabled:
         return False
+    release_due_pending_multi_coin_market_emails(
+        scheduled_release_slot=DEFAULT_DEFERRED_RELEASE_SLOT,
+        update_email_state=False,
+    )
+    prepared = prepare_multi_coin_market_email(digest, report_path=report_path)
+    _deliver_email_message(
+        notifier,
+        subject=prepared["subject"],
+        body=prepared["body"],
+        html_body=prepared["html_body"],
+    )
+    archive_path = Path(str(prepared["archive_path"]))
+    save_btc_market_email_state(
+        last_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        last_subject=str(prepared["subject"]),
+        last_report_path=str(archive_path if archive_path is not None else report_path) if (archive_path is not None or report_path is not None) else "",
+    )
+    return True
+
+
+def prepare_multi_coin_market_email(
+    digest: MultiCoinMarketDigest,
+    *,
+    report_path: Path | None = None,
+    delivery_status: str = "sent",
+    scheduled_release_slot: str = "",
+    analysis_slot: str = "",
+) -> dict[str, object]:
+    validation_summary = _load_recent_validation_summary()
     subject = build_multi_coin_market_email_subject(digest)
-    body = build_multi_coin_market_email_body(digest)
+    body = _build_multi_coin_market_email_body(digest, validation_summary=validation_summary)
     overlay_map = build_multi_coin_overlay_map(digest)
     chart_image_map = build_multi_coin_chart_image_map(digest, overlay_map=overlay_map)
     overlay_legend_map = {
@@ -271,10 +328,11 @@ def send_multi_coin_market_email(
         }
         for symbol, overlays in overlay_map.items()
     }
-    html_body = build_multi_coin_market_email_html(
+    html_body = _build_multi_coin_market_email_html(
         digest,
         chart_image_map=chart_image_map,
         overlay_legend_map=overlay_legend_map,
+        validation_summary=validation_summary,
     )
     archive_path = archive_multi_coin_market_email(
         digest,
@@ -282,18 +340,110 @@ def send_multi_coin_market_email(
         body=body,
         html_body=html_body,
         report_path=report_path,
+        delivery_status=delivery_status,
+        scheduled_release_slot=scheduled_release_slot,
+        analysis_slot=analysis_slot,
     )
+    return {
+        "subject": subject,
+        "body": body,
+        "html_body": html_body,
+        "archive_path": archive_path,
+    }
+
+
+def archive_pending_multi_coin_market_email(
+    digest: MultiCoinMarketDigest,
+    *,
+    report_path: Path | None = None,
+    scheduled_release_slot: str = DEFAULT_DEFERRED_RELEASE_SLOT,
+    analysis_slot: str = "",
+) -> Path:
+    prepared = prepare_multi_coin_market_email(
+        digest,
+        report_path=report_path,
+        delivery_status="pending_morning_release",
+        scheduled_release_slot=scheduled_release_slot,
+        analysis_slot=analysis_slot,
+    )
+    return Path(str(prepared["archive_path"]))
+
+
+def release_pending_multi_coin_market_emails(
+    *,
+    scheduled_release_slot: str = DEFAULT_DEFERRED_RELEASE_SLOT,
+    update_email_state: bool = True,
+) -> int:
+    return _release_pending_email_archive_meta_paths(
+        _iter_pending_email_archive_meta_paths(scheduled_release_slot=scheduled_release_slot),
+        scheduled_release_slot=scheduled_release_slot,
+        update_email_state=update_email_state,
+    )
+
+
+def release_due_pending_multi_coin_market_emails(
+    *,
+    scheduled_release_slot: str = DEFAULT_DEFERRED_RELEASE_SLOT,
+    update_email_state: bool = True,
+    now: datetime | None = None,
+) -> int:
+    return _release_pending_email_archive_meta_paths(
+        _iter_due_pending_email_archive_meta_paths(
+            scheduled_release_slot=scheduled_release_slot,
+            now=now,
+        ),
+        scheduled_release_slot=scheduled_release_slot,
+        update_email_state=update_email_state,
+    )
+
+
+def _release_pending_email_archive_meta_paths(
+    meta_paths: list[Path],
+    *,
+    scheduled_release_slot: str,
+    update_email_state: bool,
+) -> int:
+    notifier = load_btc_market_email_notifier()
+    if notifier is None or not notifier.enabled:
+        return 0
+    released_count = 0
+    last_archive_path = ""
+    last_subject = ""
+    for meta_path in meta_paths:
+        metadata = _load_archive_metadata(meta_path)
+        if not metadata:
+            continue
+        subject = str(metadata.get("subject", "") or "").strip()
+        html_path = Path(str(metadata.get("archive_html_path", "") or "").strip())
+        text_path = Path(str(metadata.get("archive_text_path", "") or "").strip())
+        if not subject or not html_path.exists() or not text_path.exists():
+            continue
+        body = text_path.read_text(encoding="utf-8")
+        html_body = html_path.read_text(encoding="utf-8")
+        _deliver_email_message(notifier, subject=subject, body=body, html_body=html_body)
+        released_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        metadata["delivery_status"] = "released"
+        metadata["released_at"] = released_at
+        metadata["released_by_slot"] = scheduled_release_slot
+        meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        released_count += 1
+        last_archive_path = str(html_path)
+        last_subject = subject
+    if released_count > 0 and update_email_state:
+        save_btc_market_email_state(
+            last_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            last_subject=last_subject,
+            last_report_path=last_archive_path,
+        )
+    return released_count
+
+
+def _deliver_email_message(notifier, *, subject: str, body: str, html_body: str) -> None:
     sender = getattr(notifier, "_send", None)
     if callable(sender):
         sender(subject, body, html_body=html_body)
     else:
         notifier.notify_async(subject, body, html_body=html_body)
-    save_btc_market_email_state(
-        last_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        last_subject=subject,
-        last_report_path=str(archive_path if archive_path is not None else report_path) if (archive_path is not None or report_path is not None) else "",
-    )
-    return True
 
 
 def build_multi_coin_market_viewpoints(digest: MultiCoinMarketDigest) -> list[dict[str, object]]:
@@ -313,16 +463,29 @@ def build_multi_coin_market_viewpoints(digest: MultiCoinMarketDigest) -> list[di
                 "direction": analysis.direction,
                 "score": analysis.score,
                 "confidence": _pct(analysis.confidence),
+                "focus_reason": _coin_view_focus_reason(analysis, tf4h, tf1h),
+                "invalidation": _coin_view_invalidation(analysis, tf4h, tf1h),
             }
         )
     return viewpoints
 
 
 def _load_recent_validation_summary() -> dict[str, object] | None:
+    _refresh_recent_validation_summary_if_needed()
     payload = load_latest_email_validation_payload()
     if not payload:
         return None
     return build_recent_email_validation_summary(payload, recent_email_limit=20)
+
+
+def _refresh_recent_validation_summary_if_needed() -> None:
+    payload = load_latest_email_validation_payload()
+    if payload is not None:
+        return
+    try:
+        refresh_email_validation_report(archive_limit=60)
+    except Exception:
+        return
 
 
 def _build_recent_validation_text_lines(
@@ -358,7 +521,11 @@ def _build_recent_validation_text_lines(
         *_build_recent_validation_highlight_lines(highlights),
     ]
     for item in _build_recent_validation_action_items(highlights, viewpoints=viewpoints):
-        lines.append(f"- {item['title']}：{item['body']}")
+        lines.append(f"- {item['title']}：{item['headline']}")
+        for detail_line in item.get("detail_lines", []):
+            text = str(detail_line or "").strip()
+            if text:
+                lines.append(f"  {text}")
     lines.append(f"- 最近复盘汇总生成时间：{generated_at or '-'}")
     if by_symbol:
         lines.append("- 各币种最近命中率简表：")
@@ -409,10 +576,12 @@ def _build_recent_validation_html(
         ),
     ]
     rows.extend(_build_recent_validation_highlight_lines(highlights))
-    rows.extend(
-        f"{item['title']}：{item['body']}"
-        for item in _build_recent_validation_action_items(highlights, viewpoints=viewpoints)
-    )
+    for item in _build_recent_validation_action_items(highlights, viewpoints=viewpoints):
+        rows.append(f"{item['title']}：{item['headline']}")
+        for detail_line in item.get("detail_lines", []):
+            text = str(detail_line or "").strip()
+            if text:
+                rows.append(text)
     rows.append(f"最近复盘汇总生成时间：{generated_at}")
     summary_html = "".join(
         f"""
@@ -492,7 +661,7 @@ def _build_recent_validation_action_items(
     highlights: dict[str, object],
     *,
     viewpoints: list[dict[str, object]] | None = None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, object]]:
     if not highlights:
         return []
     viewpoint_by_asset: dict[str, dict[str, object]] = {}
@@ -502,7 +671,7 @@ def _build_recent_validation_action_items(
         asset = str(item.get("asset", "") or "").strip().upper()
         if asset:
             viewpoint_by_asset[asset] = item
-    items: list[dict[str, str]] = []
+    items: list[dict[str, object]] = []
     best = highlights.get("best_symbol") if isinstance(highlights.get("best_symbol"), dict) else None
     worst = highlights.get("worst_symbol") if isinstance(highlights.get("worst_symbol"), dict) else None
     if best is not None:
@@ -510,25 +679,36 @@ def _build_recent_validation_action_items(
         best_summary = best.get("summary") if isinstance(best.get("summary"), dict) else {}
         best_view = viewpoint_by_asset.get(best_asset)
         best_stance = _recent_validation_viewpoint_stance(best_view)
-        best_body = f"{best_asset}（最近命中率 {_summary_hit_rate_text(best_summary)}"
+        best_reason = _recent_validation_focus_reason(best_view)
+        best_invalidation = _recent_validation_invalidation(best_view)
+        best_headline = best_asset
         if best_stance:
-            best_body += f"，当前观点：{best_stance}"
-        best_body += "）"
+            best_headline += f" | 当前观点：{best_stance}"
+        detail_lines = [f"命中率：{_summary_hit_rate_text(best_summary)}"]
+        if best_reason:
+            detail_lines.append(f"理由：{best_reason}")
+        if best_invalidation:
+            detail_lines.append(f"失效条件：{best_invalidation}")
         items.append(
             {
                 "title": "今日优先跟踪",
-                "body": best_body,
+                "headline": best_headline,
+                "detail_lines": detail_lines,
                 "accent": "#175cd3",
                 "background": "#eef4ff",
             }
         )
-        one_trade_body = f"优先看 {best_asset} 的{_recent_validation_trade_side(best_view)}"
-        if best_stance:
-            one_trade_body += f"（当前观点：{best_stance}）"
+        one_trade_headline = f"优先看 {best_asset} 的{_recent_validation_trade_side(best_view)}"
+        one_trade_detail_lines: list[str] = []
+        if best_reason:
+            one_trade_detail_lines.append(f"前提：{best_reason}")
+        if best_invalidation:
+            one_trade_detail_lines.append(f"若{best_invalidation}，先不做")
         items.append(
             {
                 "title": "若只做一笔",
-                "body": one_trade_body,
+                "headline": one_trade_headline,
+                "detail_lines": one_trade_detail_lines,
                 "accent": "#7a5af8",
                 "background": "#f4f3ff",
             }
@@ -538,14 +718,21 @@ def _build_recent_validation_action_items(
         worst_summary = worst.get("summary") if isinstance(worst.get("summary"), dict) else {}
         worst_view = viewpoint_by_asset.get(worst_asset)
         worst_stance = _recent_validation_viewpoint_stance(worst_view)
-        worst_body = f"{worst_asset}（最近命中率 {_summary_hit_rate_text(worst_summary)}"
+        worst_invalidation = _recent_validation_invalidation(worst_view)
+        worst_headline = worst_asset
         if worst_stance:
-            worst_body += f"，当前观点：{worst_stance}"
-        worst_body += "）"
+            worst_headline += f" | 当前观点：{worst_stance}"
+        worst_detail_lines = [
+            f"最近命中率：{_summary_hit_rate_text(worst_summary)}",
+            "处理：先等信号重新收敛再碰",
+        ]
+        if worst_invalidation:
+            worst_detail_lines.append(f"观察条件：{worst_invalidation}")
         items.append(
             {
                 "title": "今日谨慎对待",
-                "body": worst_body,
+                "headline": worst_headline,
+                "detail_lines": worst_detail_lines,
                 "accent": "#b42318",
                 "background": "#fff5f4",
             }
@@ -557,6 +744,18 @@ def _recent_validation_viewpoint_stance(viewpoint: dict[str, object] | None) -> 
     if viewpoint is None:
         return ""
     return str(viewpoint.get("stance", "") or "").strip()
+
+
+def _recent_validation_focus_reason(viewpoint: dict[str, object] | None) -> str:
+    if viewpoint is None:
+        return ""
+    return str(viewpoint.get("focus_reason", "") or "").strip()
+
+
+def _recent_validation_invalidation(viewpoint: dict[str, object] | None) -> str:
+    if viewpoint is None:
+        return ""
+    return str(viewpoint.get("invalidation", "") or "").strip()
 
 
 def _recent_validation_trade_side(viewpoint: dict[str, object] | None) -> str:
@@ -617,7 +816,8 @@ def _build_recent_validation_highlight_cards_html(
                 title=item["title"],
                 accent=item["accent"],
                 background=item["background"],
-                body=item["body"],
+                body=item["headline"],
+                detail_lines=tuple(str(line or "").strip() for line in item.get("detail_lines", [])),
             )
         )
     if not cards:
@@ -649,17 +849,53 @@ def _build_recent_validation_highlight_cards_html(
     )
 
 
-def _recent_validation_card_html(*, title: str, accent: str, background: str, body: str) -> str:
+def _recent_validation_card_html(
+    *,
+    title: str,
+    accent: str,
+    background: str,
+    body: str,
+    detail_lines: tuple[str, ...] = (),
+) -> str:
+    filtered_lines = tuple(line for line in detail_lines if str(line or "").strip())
+    detail_html = "".join(_recent_validation_detail_line_html(line=line, accent=accent) for line in filtered_lines)
     return f"""
-    <table width="100%" border="0" cellspacing="0" cellpadding="0" style="border: 1px solid {accent}; border-radius: 8px; background: {background};">
+    <table width="100%" border="0" cellspacing="0" cellpadding="0" style="border: 1px solid {accent}; border-left: 4px solid {accent}; border-radius: 12px; background: {background}; box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);">
         <tr>
-            <td style="padding: 10px 12px;">
-                <div style="font-size: 12px; font-weight: 700; color: {accent}; margin-bottom: 6px;">{escape(title)}</div>
-                <div style="font-size: 13px; line-height: 1.6; color: #344054;">{escape(body)}</div>
+            <td style="padding: 12px 14px;">
+                <div style="margin-bottom: 8px;">
+                    <span style="display: inline-block; padding: 3px 8px; border-radius: 999px; background: #ffffff; color: {accent}; font-size: 11px; font-weight: 700; letter-spacing: 0.2px;">{escape(title)}</span>
+                </div>
+                <div style="font-size: 15px; line-height: 1.5; color: #101828; font-weight: 700;">{escape(body)}</div>
+                {detail_html}
             </td>
         </tr>
     </table>
     """
+
+
+def _recent_validation_detail_line_html(*, line: str, accent: str) -> str:
+    label, content = _split_recent_validation_detail_line(line)
+    if label and content:
+        return (
+            f'<div style="margin-top: 8px; padding: 7px 9px; background: #ffffff; border-radius: 8px; border: 1px solid #e6eaf0;">'
+            f'<span style="font-size: 12px; font-weight: 700; color: {accent};">{escape(label)}：</span>'
+            f'<span style="font-size: 12px; line-height: 1.6; color: #475467;">{escape(content)}</span>'
+            f"</div>"
+        )
+    return (
+        f'<div style="margin-top: 8px; padding: 7px 9px; background: #ffffff; border-radius: 8px; border: 1px solid #e6eaf0; font-size: 12px; line-height: 1.6; color: #475467;">'
+        f"{escape(line)}"
+        f"</div>"
+    )
+
+
+def _split_recent_validation_detail_line(line: str) -> tuple[str, str]:
+    text = str(line or "").strip()
+    if not text or "：" not in text:
+        return "", text
+    label, content = text.split("：", 1)
+    return label.strip(), content.strip()
 
 
 def _summary_hit_rate_text(summary: dict[str, object]) -> str:
@@ -729,6 +965,39 @@ def _coin_view_summary(
         )
     lead_reason = analysis.reason[0] if analysis.reason else "当前缺少足够强的主导信号。"
     return f"综合分数 {analysis.score}，置信度 {_pct(analysis.confidence)}，核心依据：{lead_reason}"
+
+
+def _coin_view_focus_reason(
+    analysis: BtcMarketAnalysis,
+    tf4h: TimeframeAnalysis | None,
+    tf1h: TimeframeAnalysis | None,
+) -> str:
+    if tf4h is not None and tf1h is not None and tf4h.direction == tf1h.direction == "long":
+        return "4H 与 1H 同向偏多，顺势一致性最好"
+    if tf4h is not None and tf1h is not None and tf4h.direction == tf1h.direction == "short":
+        return "4H 与 1H 同向偏空，顺势压制最清晰"
+    if analysis.direction == "long" and analysis.score >= 4:
+        return "综合分数仍偏强，但需要 1H 继续确认"
+    if analysis.direction == "short" and analysis.score <= -4:
+        return "综合分数仍偏弱，但需要 1H 继续确认"
+    lead_reason = analysis.reason[0] if analysis.reason else ""
+    return lead_reason
+
+
+def _coin_view_invalidation(
+    analysis: BtcMarketAnalysis,
+    tf4h: TimeframeAnalysis | None,
+    tf1h: TimeframeAnalysis | None,
+) -> str:
+    if tf4h is not None and tf1h is not None and tf4h.direction == tf1h.direction == "long":
+        return "1H 与 4H 不再同向偏多"
+    if tf4h is not None and tf1h is not None and tf4h.direction == tf1h.direction == "short":
+        return "1H 与 4H 不再同向偏空"
+    if analysis.direction == "long" and analysis.score >= 4:
+        return "综合分数回落到 3 分以下，或 1H 明显转弱"
+    if analysis.direction == "short" and analysis.score <= -4:
+        return "综合分数回到 -3 分以上，或 1H 明显转强"
+    return "1H 与 4H 分歧继续扩大"
 
 
 def _collect_recent_events(
@@ -935,10 +1204,13 @@ def archive_multi_coin_market_email(
     body: str,
     html_body: str,
     report_path: Path | None,
+    delivery_status: str = "sent",
+    scheduled_release_slot: str = "",
+    analysis_slot: str = "",
 ) -> Path:
     archive_dir = analysis_report_dir_path() / "email_archives"
     archive_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     base_name = f"multi_coin_market_digest_email_{stamp}"
     html_path = archive_dir / f"{base_name}.html"
     text_path = archive_dir / f"{base_name}.txt"
@@ -954,10 +1226,88 @@ def archive_multi_coin_market_email(
         "report_path": str(report_path) if report_path is not None else "",
         "viewpoints": build_multi_coin_market_viewpoints(digest),
         "digest_payload": multi_coin_market_digest_payload(digest),
+        "delivery_status": str(delivery_status or "").strip() or "sent",
+        "scheduled_release_slot": str(scheduled_release_slot or "").strip(),
+        "analysis_slot": str(analysis_slot or "").strip(),
         "archived_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return html_path
+
+
+def _iter_pending_email_archive_meta_paths(*, scheduled_release_slot: str) -> list[Path]:
+    archive_dir = analysis_report_dir_path() / "email_archives"
+    if not archive_dir.exists():
+        return []
+    rows: list[tuple[str, Path]] = []
+    for meta_path in sorted(archive_dir.glob("multi_coin_market_digest_email_*.json")):
+        metadata = _load_archive_metadata(meta_path)
+        if not metadata:
+            continue
+        if str(metadata.get("delivery_status", "") or "").strip() != "pending_morning_release":
+            continue
+        if str(metadata.get("scheduled_release_slot", "") or "").strip() != scheduled_release_slot:
+            continue
+        generated_at = str(metadata.get("generated_at", "") or "").strip()
+        rows.append((generated_at, meta_path))
+    rows.sort(key=lambda item: item[0])
+    return [item[1] for item in rows]
+
+
+def _iter_due_pending_email_archive_meta_paths(
+    *,
+    scheduled_release_slot: str,
+    now: datetime | None = None,
+) -> list[Path]:
+    now_bjt = _as_beijing_time(now or datetime.now(timezone.utc))
+    release_minutes = _slot_minutes(scheduled_release_slot)
+    rows: list[Path] = []
+    for meta_path in _iter_pending_email_archive_meta_paths(scheduled_release_slot=scheduled_release_slot):
+        metadata = _load_archive_metadata(meta_path)
+        if not metadata:
+            continue
+        pending_at = _pending_release_anchor_datetime(metadata)
+        if pending_at is None:
+            rows.append(meta_path)
+            continue
+        pending_bjt = _as_beijing_time(pending_at)
+        if pending_bjt.date() < now_bjt.date():
+            rows.append(meta_path)
+            continue
+        if pending_bjt.date() == now_bjt.date() and now_bjt.hour * 60 + now_bjt.minute >= release_minutes:
+            rows.append(meta_path)
+    return rows
+
+
+def _load_archive_metadata(meta_path: Path) -> dict[str, object]:
+    if not meta_path.exists():
+        return {}
+    try:
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _pending_release_anchor_datetime(metadata: dict[str, object]) -> datetime | None:
+    for key in ("generated_at", "archived_at"):
+        parsed = _parse_iso_datetime(metadata.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _slot_minutes(slot_text: str) -> int:
+    raw = str(slot_text or "").strip()
+    try:
+        hour_text, minute_text = raw.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except Exception:
+        return 8 * 60
+    hour = max(0, min(hour, 23))
+    minute = max(0, min(minute, 59))
+    return hour * 60 + minute
 
 
 def build_multi_coin_chart_image_map(
@@ -1314,5 +1664,11 @@ def _format_generated_at_display(raw_value: str) -> str:
     parsed = _parse_iso_datetime(raw_value)
     if parsed is None:
         return raw_value
-    china_time = parsed.astimezone(timezone(timedelta(hours=8)))
+    china_time = _as_beijing_time(parsed)
     return china_time.strftime("%Y-%m-%d %H:%M UTC+8")
+
+
+def _as_beijing_time(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone(timedelta(hours=8)))

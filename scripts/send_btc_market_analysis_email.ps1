@@ -1,5 +1,12 @@
 $ErrorActionPreference = "Stop"
 
+param(
+    [ValidateSet("immediate", "archive_only", "release_pending_and_send")]
+    [string]$DeliveryMode = "immediate",
+    [string]$ScheduledReleaseSlot = "08:00",
+    [string]$AnalysisSlot = ""
+)
+
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $projectRoot
 
@@ -10,7 +17,12 @@ if (-not (Test-Path $python)) {
     throw "Python executable not found: $python"
 }
 
-$output = & $python $scriptPath --send-email 2>&1
+$args = @($scriptPath, "--send-email", "--delivery-mode", $DeliveryMode, "--scheduled-release-slot", $ScheduledReleaseSlot)
+if ($AnalysisSlot) {
+    $args += @("--analysis-slot", $AnalysisSlot)
+}
+
+$output = & $python @args 2>&1
 $exitCode = $LASTEXITCODE
 $output | ForEach-Object { Write-Output $_ }
 
@@ -18,6 +30,10 @@ if ($exitCode -ne 0) {
     throw "BTC analysis command failed with exit code $exitCode"
 }
 
-if (-not ($output -contains "email_sent")) {
+if ($DeliveryMode -eq "archive_only") {
+    if (-not ($output -contains "email_deferred")) {
+        throw "Multi-coin digest finished but did not report email_deferred"
+    }
+} elseif (-not ($output -contains "email_sent")) {
     throw "Multi-coin digest finished but did not report email_sent"
 }
