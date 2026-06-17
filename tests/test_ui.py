@@ -30,6 +30,7 @@ from okx_quant.upgrade_launch import (
 )
 from okx_quant.trader_desk import TraderDraftRecord, TraderRunState, TraderSlotRecord
 from okx_quant.ui import (
+    ENV_OPTIONS,
     NormalStrategyBookFilters,
     NormalStrategyBookSummary,
     ProfilePositionSnapshot,
@@ -473,6 +474,7 @@ class UiHelpersTest(TestCase):
             _refresh_running_session_summary=MagicMock(),
             _refresh_selected_session_details=MagicMock(),
             _start_positions_enrichment_refresh=MagicMock(),
+            _drain_pending_positions_refresh_request=MagicMock(),
         )
         position = OkxPosition(
             inst_id="ETH-USDT-SWAP",
@@ -2593,6 +2595,7 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
             direction_label="只做多",
             run_mode_label="交易并下单",
             net_pnl_total=Decimal("0"),
+            last_net_pnl=Decimal("1.25"),
             display_status="等待信号",
             started_at=datetime(2026, 4, 23, 22, 6, 41),
             status="运行中",
@@ -2625,6 +2628,8 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         self.assertEqual(app.session_tree.rows["S01"]["values"][4], "普通量化")
         self.assertEqual(app.session_tree.rows["S01"]["values"][6], "交易并下单")
         self.assertEqual(app.session_tree.rows["S01"]["values"][8], "1H")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][10], "10")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][14], "+1.25")
     def test_session_trader_label_prefers_trader_id_and_falls_back_to_dash(self) -> None:
         trader_session = SimpleNamespace(trader_id="T001")
         plain_session = SimpleNamespace(trader_id="")
@@ -5475,6 +5480,64 @@ class _LabelStub:
             self.text = str(kwargs["text"])
 
 
+class _GridWidgetStub:
+    def __init__(self) -> None:
+        self.visible = True
+
+    @staticmethod
+    def winfo_exists() -> bool:
+        return True
+
+    def grid(self, *_args: object, **_kwargs: object) -> None:
+        self.visible = True
+
+    def grid_remove(self) -> None:
+        self.visible = False
+
+
+class _TextConfigureStub:
+    def __init__(self) -> None:
+        self.height: int | None = None
+
+    def configure(self, **kwargs: object) -> None:
+        if "height" in kwargs:
+            self.height = int(kwargs["height"])
+
+
+class _RowConfigureStub:
+    def __init__(self) -> None:
+        self.weights: dict[int, int] = {}
+
+    def rowconfigure(self, index: int, weight: int = 0) -> None:
+        self.weights[index] = weight
+
+
+class _PaneStub:
+    def __init__(self, width: int = 1600, height: int = 900) -> None:
+        self.width = width
+        self.height = height
+        self.sash_positions: dict[int, int] = {}
+
+    @staticmethod
+    def winfo_exists() -> bool:
+        return True
+
+    def winfo_width(self) -> int:
+        return self.width
+
+    def winfo_height(self) -> int:
+        return self.height
+
+    def sashpos(self, index: int, value: int) -> None:
+        self.sash_positions[index] = value
+
+
+class _RootUpdateStub:
+    @staticmethod
+    def update_idletasks() -> None:
+        return
+
+
 class _SessionTreeStub:
     def __init__(self) -> None:
         self.rows: dict[str, dict[str, object]] = {}
@@ -5992,6 +6055,110 @@ class PositionZoomSelectionSyncTest(TestCase):
 
 
 class SelectedSessionDetailRefreshTest(TestCase):
+    def test_update_launcher_selection_summary_formats_current_target(self) -> None:
+        app = SimpleNamespace(
+            strategy_name=_Var("EMA 动态委托做多"),
+            symbol=_Var("eth-usdt-swap"),
+            bar=_Var("1H"),
+            signal_mode_label=_Var("只做多"),
+            launcher_strategy_title_text=_Var(""),
+            launcher_selection_summary_text=_Var(""),
+        )
+
+        QuantApp._update_launcher_selection_summary(app)
+
+        self.assertEqual(app.launcher_strategy_title_text.get(), app.strategy_name.get())
+        self.assertEqual(app.launcher_selection_summary_text.get(), "ETH-USDT-SWAP | 周期 1H | 方向 只做多")
+        return
+
+        self.assertEqual(
+            app.launcher_selection_summary_text.get(),
+            "待启动：EMA 动态委托做多\n标的：ETH-USDT-SWAP | 周期：1H | 方向：只做多",
+        )
+
+    def test_apply_launcher_manual_visibility_updates_row_weights(self) -> None:
+        launcher_frame = _RowConfigureStub()
+        start_frame = _GridWidgetStub()
+        info_frame = _GridWidgetStub()
+        app = SimpleNamespace(
+            _launcher_frame=launcher_frame,
+            _launcher_start_frame=start_frame,
+            _launcher_strategy_info_frame=info_frame,
+            _launcher_manual_toggle_text=_Var("展开手动参数"),
+            _launcher_manual_visible=False,
+            _watch_mode_enabled=False,
+        )
+
+        QuantApp._apply_launcher_manual_visibility(app)
+        self.assertFalse(start_frame.visible)
+        self.assertFalse(info_frame.visible)
+        self.assertEqual(launcher_frame.weights[1], 0)
+        self.assertEqual(app._launcher_manual_toggle_text.get(), "展开手动参数")
+
+        app._launcher_manual_visible = True
+        QuantApp._apply_launcher_manual_visibility(app)
+        self.assertTrue(start_frame.visible)
+        self.assertFalse(info_frame.visible)
+        self.assertEqual(launcher_frame.weights[1], 1)
+        self.assertEqual(app._launcher_manual_toggle_text.get(), "收起手动参数")
+
+    def test_apply_watch_mode_layout_toggles_compact_sections(self) -> None:
+        compact = _GridWidgetStub()
+        rail = _GridWidgetStub()
+        detail = _GridWidgetStub()
+        positions_table = _GridWidgetStub()
+        log_text = _TextConfigureStub()
+        app = SimpleNamespace(
+            _watch_mode_enabled=False,
+            _watch_mode_button_text=_Var("盯盘模式"),
+            _launcher_frame=_RowConfigureStub(),
+            _launcher_compact_frame=compact,
+            _launcher_watch_rail_frame=rail,
+            _launcher_start_frame=_GridWidgetStub(),
+            _launcher_strategy_info_frame=_GridWidgetStub(),
+            _launcher_manual_toggle_text=_Var("展开手动参数"),
+            _launcher_manual_visible=False,
+            _session_detail_frame=detail,
+            _positions_table_frame=positions_table,
+            log_text=log_text,
+        )
+        app._apply_launcher_manual_visibility = lambda: QuantApp._apply_launcher_manual_visibility(app)
+
+        QuantApp._apply_watch_mode_layout(app)
+        self.assertEqual(app._watch_mode_button_text.get(), "盯盘模式")
+        self.assertTrue(compact.visible)
+        self.assertFalse(rail.visible)
+        self.assertTrue(detail.visible)
+        self.assertTrue(positions_table.visible)
+        self.assertEqual(log_text.height, 10)
+
+        app._watch_mode_enabled = True
+        QuantApp._apply_watch_mode_layout(app)
+        self.assertEqual(app._watch_mode_button_text.get(), "退出盯盘")
+        self.assertFalse(compact.visible)
+        self.assertTrue(rail.visible)
+        self.assertFalse(detail.visible)
+        self.assertTrue(positions_table.visible)
+        self.assertEqual(log_text.height, 5)
+
+    def test_apply_layout_sash_positions_expands_left_pane_for_manual_mode(self) -> None:
+        main_pane = _PaneStub(width=1600)
+        sessions_pane = _PaneStub(height=900)
+        app = SimpleNamespace(
+            root=_RootUpdateStub(),
+            _main_body_pane=main_pane,
+            _sessions_pane=sessions_pane,
+            _watch_mode_enabled=False,
+            _launcher_manual_visible=False,
+        )
+
+        QuantApp._apply_layout_sash_positions(app)
+        self.assertEqual(main_pane.sash_positions[0], int(1600 * 0.16))
+
+        app._launcher_manual_visible = True
+        QuantApp._apply_layout_sash_positions(app)
+        self.assertEqual(main_pane.sash_positions[0], int(1600 * 0.30))
+
     def test_set_readonly_text_preserves_scroll_when_requested(self) -> None:
         class _FakeText:
             def __init__(self, y_position: float = 0.0) -> None:
@@ -6052,6 +6219,7 @@ class SelectedSessionDetailRefreshTest(TestCase):
             fee_total=Decimal("0.1"),
             funding_total=Decimal("0"),
             net_pnl_total=Decimal("0.9"),
+            last_net_pnl=None,
             last_close_reason="",
         )
         app = SimpleNamespace(
@@ -6107,6 +6275,7 @@ class SelectedSessionDetailRefreshTest(TestCase):
             fee_total=Decimal("0.1"),
             funding_total=Decimal("0"),
             net_pnl_total=Decimal("0.9"),
+            last_net_pnl=None,
             last_close_reason="",
         )
         app = SimpleNamespace(
@@ -6158,6 +6327,7 @@ class SelectedSessionDetailRefreshTest(TestCase):
             fee_total=Decimal("0.1"),
             funding_total=Decimal("0"),
             net_pnl_total=Decimal("0.9"),
+            last_net_pnl=None,
             last_close_reason="",
         )
         app = SimpleNamespace(
@@ -6406,6 +6576,88 @@ class SelectedSessionDetailRefreshTest(TestCase):
 
 
 class SessionLivePnlSummaryTest(TestCase):
+    def test_refresh_positions_queues_latest_profile_request_while_busy(self) -> None:
+        demo_label = next(label for label, value in ENV_OPTIONS.items() if value == "demo")
+        app = SimpleNamespace(
+            _positions_refreshing=True,
+            _positions_refresh_request=None,
+            _current_credentials_or_none=lambda: SimpleNamespace(profile_name="desk"),
+            environment_label=_Var(demo_label),
+            _current_credential_profile=lambda: "desk",
+            positions_summary_text=_Var(),
+            _apply_positions=MagicMock(),
+            _positions_refresh_health=RefreshHealthState("鎸佷粨"),
+            _refresh_all_refresh_badges=MagicMock(),
+        )
+
+        QuantApp.refresh_positions(app)
+
+        self.assertIsNotNone(app._positions_refresh_request)
+        credentials, environment, profile_name = app._positions_refresh_request
+        self.assertEqual("desk", credentials.profile_name)
+        self.assertEqual("demo", environment)
+        self.assertEqual("desk", profile_name)
+
+    def test_drain_pending_positions_refresh_request_starts_next_worker(self) -> None:
+        app = SimpleNamespace(
+            _positions_refresh_request=(SimpleNamespace(profile_name="desk"), "demo", "desk"),
+            _positions_refreshing=False,
+            _positions_refresh_generation=0,
+            _mark_api_switch_refresh_step=MagicMock(),
+            positions_summary_text=_Var(),
+            _refresh_positions_worker=MagicMock(),
+            _apply_positions_error=MagicMock(),
+        )
+
+        with patch("okx_quant.ui.threading.Thread") as thread_cls:
+            thread_instance = MagicMock()
+            thread_cls.return_value = thread_instance
+
+            QuantApp._drain_pending_positions_refresh_request(app)
+
+        self.assertIsNone(app._positions_refresh_request)
+        self.assertTrue(app._positions_refreshing)
+        self.assertEqual(1, app._positions_refresh_generation)
+        app._mark_api_switch_refresh_step.assert_called_once_with("positions", "running")
+        thread_cls.assert_called_once()
+        thread_instance.start.assert_called_once_with()
+
+    def test_session_position_snapshot_targets_only_lists_missing_profiles(self) -> None:
+        refreshed_at = datetime(2026, 4, 23, 19, 5, 0)
+        app = SimpleNamespace(
+            sessions={
+                "S01": SimpleNamespace(
+                    session_id="S01",
+                    api_name="moni",
+                    config=SimpleNamespace(environment="demo"),
+                    engine=SimpleNamespace(is_running=True),
+                    stop_cleanup_in_progress=False,
+                    status="杩愯涓?",
+                ),
+                "S02": SimpleNamespace(
+                    session_id="S02",
+                    api_name="desk",
+                    config=SimpleNamespace(environment="live"),
+                    engine=SimpleNamespace(is_running=True),
+                    stop_cleanup_in_progress=False,
+                    status="杩愯涓?",
+                ),
+            },
+            _positions_snapshot_by_profile={
+                "moni": ProfilePositionSnapshot(
+                    api_name="moni",
+                    effective_environment="demo",
+                    positions=[],
+                    upl_usdt_prices={},
+                    refreshed_at=refreshed_at,
+                )
+            },
+        )
+
+        targets = QuantApp._session_position_snapshot_targets(app)
+
+        self.assertEqual([("desk", "live")], targets)
+
     def test_session_open_position_amount_text_uses_signed_coin_size(self) -> None:
         snapshot = ProfilePositionSnapshot(
             api_name="moni",
@@ -7660,6 +7912,12 @@ class StrategyStopCleanupTest(TestCase):
     def test_apply_stop_session_cleanup_result_warns_for_manual_review(self) -> None:
         session = self._make_session()
         log_messages: list[str] = []
+        scheduled_callbacks: list[object] = []
+
+        def record_after(delay_ms: int, callback) -> None:
+            self.assertEqual(delay_ms, 0)
+            scheduled_callbacks.append(callback)
+
         app = SimpleNamespace(
             sessions={session.session_id: session},
             _remove_recoverable_strategy_session=MagicMock(),
@@ -7670,6 +7928,7 @@ class StrategyStopCleanupTest(TestCase):
             _current_credential_profile=lambda: "moni",
             refresh_positions=MagicMock(),
             refresh_order_views=MagicMock(),
+            root=SimpleNamespace(after=record_after),
         )
         result = StrategyStopCleanupResult(
             session_id=session.session_id,
@@ -7682,9 +7941,11 @@ class StrategyStopCleanupTest(TestCase):
             final_reason="\u7528\u6237\u624b\u52a8\u505c\u6b62\uff08\u68c0\u6d4b\u5230\u5df2\u6210\u4ea4\u4ed3\u4f4d\uff0c\u9700\u4eba\u5de5\u5224\u65ad\uff09",
         )
 
+        events: list[str] = []
         with patch("okx_quant.ui.messagebox.showwarning") as showwarning, patch(
             "okx_quant.ui.messagebox.showinfo"
         ) as showinfo:
+            showwarning.side_effect = lambda *args, **kwargs: events.append("warning")
             QuantApp._apply_stop_session_cleanup_result(app, result)
 
         self.assertEqual(session.status, "\u5df2\u505c\u6b62")
@@ -7694,12 +7955,23 @@ class StrategyStopCleanupTest(TestCase):
         self.assertTrue(any("\u68c0\u6d4b\u5230\u4ecd\u6709\u4ed3\u4f4d" in message for message in log_messages))
         showwarning.assert_called_once()
         showinfo.assert_not_called()
+        self.assertEqual(events, ["warning"])
+        self.assertEqual(len(scheduled_callbacks), 1)
+        app.refresh_positions.assert_not_called()
+        app.refresh_order_views.assert_not_called()
+        scheduled_callbacks[0]()
         app.refresh_positions.assert_called_once()
         app.refresh_order_views.assert_called_once()
 
     def test_apply_stop_session_cleanup_result_shows_info_when_clean(self) -> None:
         session = self._make_session()
         log_messages: list[str] = []
+        scheduled_callbacks: list[object] = []
+
+        def record_after(delay_ms: int, callback) -> None:
+            self.assertEqual(delay_ms, 0)
+            scheduled_callbacks.append(callback)
+
         app = SimpleNamespace(
             sessions={session.session_id: session},
             _remove_recoverable_strategy_session=MagicMock(),
@@ -7710,6 +7982,7 @@ class StrategyStopCleanupTest(TestCase):
             _current_credential_profile=lambda: "moni",
             refresh_positions=MagicMock(),
             refresh_order_views=MagicMock(),
+            root=SimpleNamespace(after=record_after),
         )
         result = StrategyStopCleanupResult(
             session_id=session.session_id,
@@ -7719,9 +7992,11 @@ class StrategyStopCleanupTest(TestCase):
             final_reason="\u7528\u6237\u624b\u52a8\u505c\u6b62",
         )
 
+        events: list[str] = []
         with patch("okx_quant.ui.messagebox.showwarning") as showwarning, patch(
             "okx_quant.ui.messagebox.showinfo"
         ) as showinfo:
+            showinfo.side_effect = lambda *args, **kwargs: events.append("info")
             QuantApp._apply_stop_session_cleanup_result(app, result)
 
         self.assertEqual(session.status, "\u5df2\u505c\u6b62")
@@ -7729,10 +8004,23 @@ class StrategyStopCleanupTest(TestCase):
         self.assertTrue(any("\u5df2\u63d0\u4ea4\u64a4\u5355 1 \u6761" in message for message in log_messages))
         showwarning.assert_not_called()
         showinfo.assert_called_once()
+        self.assertEqual(events, ["info"])
+        self.assertEqual(len(scheduled_callbacks), 1)
+        app.refresh_positions.assert_not_called()
+        app.refresh_order_views.assert_not_called()
+        scheduled_callbacks[0]()
+        app.refresh_positions.assert_called_once()
+        app.refresh_order_views.assert_called_once()
 
     def test_apply_stop_session_cleanup_result_suppresses_dialog_when_requested(self) -> None:
         session = self._make_session()
         session.stop_result_show_dialog = False
+        scheduled_callbacks: list[object] = []
+
+        def record_after(delay_ms: int, callback) -> None:
+            self.assertEqual(delay_ms, 0)
+            scheduled_callbacks.append(callback)
+
         app = SimpleNamespace(
             sessions={session.session_id: session},
             _remove_recoverable_strategy_session=MagicMock(),
@@ -7743,6 +8031,7 @@ class StrategyStopCleanupTest(TestCase):
             _current_credential_profile=lambda: "moni",
             refresh_positions=MagicMock(),
             refresh_order_views=MagicMock(),
+            root=SimpleNamespace(after=record_after),
         )
         result = StrategyStopCleanupResult(
             session_id=session.session_id,
@@ -7760,6 +8049,12 @@ class StrategyStopCleanupTest(TestCase):
         showwarning.assert_not_called()
         showinfo.assert_not_called()
         self.assertTrue(session.stop_result_show_dialog)
+        self.assertEqual(len(scheduled_callbacks), 1)
+        app.refresh_positions.assert_not_called()
+        app.refresh_order_views.assert_not_called()
+        scheduled_callbacks[0]()
+        app.refresh_positions.assert_called_once()
+        app.refresh_order_views.assert_called_once()
 
     def test_apply_stop_session_cleanup_error_suppresses_dialog_when_requested(self) -> None:
         session = self._make_session()

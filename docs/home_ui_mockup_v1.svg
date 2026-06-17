@@ -1,0 +1,258 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2048" height="1152" viewBox="0 0 2048 1152">
+  <defs>
+    <style>
+      .bg { fill: #f4f5f7; }
+      .panel { fill: #ffffff; stroke: #d7dce2; stroke-width: 1; }
+      .panel-soft { fill: #fbfcfd; stroke: #d7dce2; stroke-width: 1; }
+      .line { stroke: #d7dce2; stroke-width: 1; }
+      .muted { fill: #667085; font-size: 18px; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; }
+      .text { fill: #1f2937; font-size: 19px; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; }
+      .small { fill: #475467; font-size: 16px; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; }
+      .title { fill: #101828; font-size: 30px; font-weight: 700; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; }
+      .section { fill: #101828; font-size: 21px; font-weight: 700; font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif; }
+      .hcell { fill: #f2f4f7; stroke: #d7dce2; stroke-width: 1; }
+      .cell { fill: #ffffff; stroke: #e5e8ec; stroke-width: 1; }
+      .btn { fill: #eef2f6; stroke: #cbd3dc; stroke-width: 1; }
+      .btn-danger { fill: #fff1f0; stroke: #f5aaa5; stroke-width: 1; }
+      .btn-primary { fill: #e8f2ff; stroke: #9cc8ff; stroke-width: 1; }
+      .tab { fill: #ffffff; stroke: #cbd3dc; stroke-width: 1; }
+      .tab-active { fill: #e8f2ff; stroke: #6aa7f8; stroke-width: 1.5; }
+      .badge-live { fill: #fff2e5; stroke: #ffb36b; stroke-width: 1; }
+      .badge-demo { fill: #e8f6ef; stroke: #7acb9a; stroke-width: 1; }
+      .badge-ok { fill: #e8f6ef; stroke: #71c391; stroke-width: 1; }
+      .badge-warn { fill: #fff7e6; stroke: #e3b85c; stroke-width: 1; }
+      .green { fill: #067647; font-weight: 700; }
+      .orange { fill: #b54708; font-weight: 700; }
+      .blue { fill: #175cd3; font-weight: 700; }
+      .red { fill: #b42318; font-weight: 700; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="2048" height="1152"/>
+
+  <!-- Top menu and title -->
+  <rect fill="#ffffff" x="0" y="0" width="2048" height="42"/>
+  <text class="small" x="12" y="27">设置</text>
+  <text class="small" x="58" y="27">工具</text>
+  <text class="small" x="104" y="27">系统</text>
+
+  <rect class="bg" x="0" y="42" width="2048" height="72"/>
+  <text class="title" x="22" y="88">OKX 多策略工作台</text>
+  <text class="muted" x="1830" y="82">运行中策略：</text>
+  <text class="title" x="1948" y="82">8</text>
+
+  <!-- Global status bar -->
+  <rect class="panel" x="18" y="118" width="2012" height="66" rx="6"/>
+  <text class="section" x="38" y="158">全局状态</text>
+  <text class="small" x="168" y="158">API</text>
+  <rect class="panel-soft" x="208" y="134" width="116" height="32" rx="4"/>
+  <text class="text" x="232" y="157">moni</text>
+
+  <rect class="badge-live" x="350" y="132" width="132" height="36" rx="18"/>
+  <text class="orange" x="378" y="156" style="font-size:17px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">实盘 live</text>
+
+  <rect class="badge-ok" x="500" y="132" width="122" height="36" rx="18"/>
+  <text class="green" x="525" y="156" style="font-size:17px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">环境一致</text>
+
+  <rect class="panel-soft" x="646" y="132" width="138" height="36" rx="4"/>
+  <text class="small" x="668" y="156">全仓 cross</text>
+  <rect class="panel-soft" x="800" y="132" width="138" height="36" rx="4"/>
+  <text class="small" x="822" y="156">净持仓 net</text>
+  <rect class="badge-ok" x="956" y="132" width="116" height="36" rx="18"/>
+  <text class="green" x="984" y="156" style="font-size:17px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">邮件 开</text>
+  <rect class="badge-warn" x="1090" y="132" width="152" height="36" rx="18"/>
+  <text class="orange" x="1115" y="156" style="font-size:17px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">WS 回退 REST</text>
+  <text class="muted" x="1270" y="156">最近刷新：15:07:51</text>
+  <rect class="btn-primary" x="1882" y="132" width="124" height="36" rx="4"/>
+  <text class="blue" x="1912" y="156" style="font-size:17px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">刷新</text>
+
+  <!-- Left launch panel -->
+  <rect class="panel" x="18" y="198" width="500" height="778" rx="6"/>
+  <text class="section" x="38" y="234">策略启动</text>
+  <text class="small" x="420" y="234">高级参数折叠</text>
+
+  <text class="small" x="38" y="278">选择策略</text>
+  <rect class="panel-soft" x="132" y="252" width="350" height="36" rx="4"/>
+  <text class="text" x="146" y="276">EMA 动态委托做多</text>
+  <text class="small" x="38" y="324">交易标的</text>
+  <rect class="panel-soft" x="132" y="298" width="168" height="36" rx="4"/>
+  <text class="text" x="146" y="322">BTC-USDT-SWAP</text>
+  <text class="small" x="318" y="324">周期</text>
+  <rect class="panel-soft" x="366" y="298" width="116" height="36" rx="4"/>
+  <text class="text" x="382" y="322">1H</text>
+
+  <text class="small" x="38" y="370">信号方向</text>
+  <rect class="panel-soft" x="132" y="344" width="168" height="36" rx="4"/>
+  <text class="text" x="146" y="368">只做多</text>
+  <text class="small" x="318" y="370">运行模式</text>
+  <rect class="panel-soft" x="396" y="344" width="86" height="36" rx="4"/>
+  <text class="text" x="412" y="368">下单</text>
+
+  <line class="line" x1="38" y1="408" x2="482" y2="408"/>
+  <text class="section" x="38" y="446">仓位与风险</text>
+  <text class="small" x="38" y="488">风险金</text>
+  <rect class="panel-soft" x="132" y="462" width="130" height="36" rx="4"/>
+  <text class="text" x="148" y="486">4</text>
+  <text class="small" x="288" y="488">每波最多开仓</text>
+  <rect class="panel-soft" x="420" y="462" width="62" height="36" rx="4"/>
+  <text class="text" x="444" y="486">2</text>
+
+  <text class="small" x="38" y="536">止盈方式</text>
+  <rect class="panel-soft" x="132" y="510" width="168" height="36" rx="4"/>
+  <text class="text" x="146" y="534">动态止盈</text>
+  <text class="small" x="318" y="536">追当前信号</text>
+  <rect class="badge-warn" x="420" y="510" width="62" height="36" rx="18"/>
+  <text class="orange" x="439" y="534" style="font-size:17px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">关</text>
+
+  <line class="line" x1="38" y1="576" x2="482" y2="576"/>
+  <text class="section" x="38" y="614">动态保护规则</text>
+  <rect class="hcell" x="38" y="638" width="80" height="34"/><text class="small" x="58" y="661">触发R</text>
+  <rect class="hcell" x="118" y="638" width="120" height="34"/><text class="small" x="154" y="661">动作</text>
+  <rect class="hcell" x="238" y="638" width="80" height="34"/><text class="small" x="258" y="661">锁到R</text>
+  <rect class="hcell" x="318" y="638" width="164" height="34"/><text class="small" x="354" y="661">递进</text>
+  <rect class="cell" x="38" y="672" width="80" height="36"/><text class="text" x="70" y="696">1</text>
+  <rect class="cell" x="118" y="672" width="120" height="36"/><text class="text" x="150" y="696">保本</text>
+  <rect class="cell" x="238" y="672" width="80" height="36"/><text class="muted" x="266" y="696">-</text>
+  <rect class="cell" x="318" y="672" width="164" height="36"/><text class="muted" x="354" y="696">无</text>
+  <rect class="cell" x="38" y="708" width="80" height="36"/><text class="text" x="70" y="732">4</text>
+  <rect class="cell" x="118" y="708" width="120" height="36"/><text class="text" x="150" y="732">锁盈</text>
+  <rect class="cell" x="238" y="708" width="80" height="36"/><text class="text" x="270" y="732">1</text>
+  <rect class="cell" x="318" y="708" width="164" height="36"/><text class="text" x="346" y="732">每1R +1R</text>
+  <rect class="cell" x="38" y="744" width="80" height="36"/><text class="text" x="66" y="768">11</text>
+  <rect class="cell" x="118" y="744" width="120" height="36"/><text class="text" x="150" y="768">锁盈</text>
+  <rect class="cell" x="238" y="744" width="80" height="36"/><text class="text" x="266" y="768">10</text>
+  <rect class="cell" x="318" y="744" width="164" height="36"/><text class="text" x="346" y="768">每1R +1R</text>
+
+  <rect class="panel-soft" x="38" y="808" width="444" height="74" rx="4"/>
+  <text class="small" x="58" y="838">实盘安全检查：API 环境一致、启动追老信号越损会跳过。</text>
+  <text class="small" x="58" y="866">当前组合包参数可直接复用，不再区分模拟/实盘包。</text>
+
+  <rect class="btn-primary" x="38" y="906" width="134" height="42" rx="4"/>
+  <text class="blue" x="84" y="934" style="font-size:18px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">启动</text>
+  <rect class="btn" x="188" y="906" width="134" height="42" rx="4"/>
+  <text class="text" x="222" y="934">加载 OKX</text>
+  <rect class="btn" x="338" y="906" width="144" height="42" rx="4"/>
+  <text class="text" x="368" y="934">导出调试</text>
+
+  <!-- Main running panel -->
+  <rect class="panel" x="536" y="198" width="1494" height="378" rx="6"/>
+  <text class="section" x="558" y="234">运行中策略</text>
+  <text class="muted" x="688" y="234">合计 8 个 | 实时浮盈亏：- | 净盈亏：0.00 | 持仓 0/8</text>
+  <text class="small" x="1810" y="234">筛选</text>
+  <rect class="panel-soft" x="1860" y="208" width="144" height="36" rx="4"/>
+  <text class="text" x="1882" y="232">普通量化</text>
+
+  <!-- Table -->
+  <rect class="hcell" x="558" y="258" width="80" height="36"/><text class="small" x="576" y="282">会话</text>
+  <rect class="hcell" x="638" y="258" width="90" height="36"/><text class="small" x="666" y="282">API</text>
+  <rect class="hcell" x="728" y="258" width="152" height="36"/><text class="small" x="770" y="282">策略</text>
+  <rect class="hcell" x="880" y="258" width="190" height="36"/><text class="small" x="934" y="282">标的</text>
+  <rect class="hcell" x="1070" y="258" width="70" height="36"/><text class="small" x="1094" y="282">周期</text>
+  <rect class="hcell" x="1140" y="258" width="88" height="36"/><text class="small" x="1164" y="282">方向</text>
+  <rect class="hcell" x="1228" y="258" width="120" height="36"/><text class="small" x="1260" y="282">开仓数</text>
+  <rect class="hcell" x="1348" y="258" width="130" height="36"/><text class="small" x="1384" y="282">浮盈亏</text>
+  <rect class="hcell" x="1478" y="258" width="130" height="36"/><text class="small" x="1514" y="282">净盈亏</text>
+  <rect class="hcell" x="1608" y="258" width="150" height="36"/><text class="small" x="1652" y="282">状态</text>
+  <rect class="hcell" x="1758" y="258" width="246" height="36"/><text class="small" x="1842" y="282">启动时间</text>
+
+  <g>
+    <rect class="cell" x="558" y="294" width="80" height="36"/><text class="text" x="582" y="318">S242</text>
+    <rect class="cell" x="638" y="294" width="90" height="36"/><text class="text" x="666" y="318">moni</text>
+    <rect class="cell" x="728" y="294" width="152" height="36"/><text class="small" x="752" y="318">EMA 动态多</text>
+    <rect class="cell" x="880" y="294" width="190" height="36"/><text class="text" x="906" y="318">BTC-USDT-SWAP</text>
+    <rect class="cell" x="1070" y="294" width="70" height="36"/><text class="text" x="1094" y="318">1H</text>
+    <rect class="cell" x="1140" y="294" width="88" height="36"/><text class="green" x="1164" y="318" style="font-size:18px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">只做多</text>
+    <rect class="cell" x="1228" y="294" width="120" height="36"/><text class="text" x="1280" y="318">-</text>
+    <rect class="cell" x="1348" y="294" width="130" height="36"/><text class="text" x="1402" y="318">-</text>
+    <rect class="cell" x="1478" y="294" width="130" height="36"/><text class="text" x="1530" y="318">0.00</text>
+    <rect class="cell" x="1608" y="294" width="150" height="36"/><text class="orange" x="1650" y="318" style="font-size:18px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">等待信号</text>
+    <rect class="cell" x="1758" y="294" width="246" height="36"/><text class="text" x="1840" y="318">14:58:53</text>
+  </g>
+  <g>
+    <rect class="cell" x="558" y="330" width="80" height="36"/><text class="text" x="582" y="354">S246</text>
+    <rect class="cell" x="638" y="330" width="90" height="36"/><text class="text" x="666" y="354">moni</text>
+    <rect class="cell" x="728" y="330" width="152" height="36"/><text class="small" x="752" y="354">均线斜率空</text>
+    <rect class="cell" x="880" y="330" width="190" height="36"/><text class="text" x="906" y="354">BTC-USDT-SWAP</text>
+    <rect class="cell" x="1070" y="330" width="70" height="36"/><text class="text" x="1094" y="354">1H</text>
+    <rect class="cell" x="1140" y="330" width="88" height="36"/><text class="red" x="1164" y="354" style="font-size:18px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">只做空</text>
+    <rect class="cell" x="1228" y="330" width="120" height="36"/><text class="text" x="1280" y="354">-</text>
+    <rect class="cell" x="1348" y="330" width="130" height="36"/><text class="text" x="1402" y="354">-</text>
+    <rect class="cell" x="1478" y="330" width="130" height="36"/><text class="text" x="1530" y="354">0.00</text>
+    <rect class="cell" x="1608" y="330" width="150" height="36"/><text class="orange" x="1650" y="354" style="font-size:18px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">等待信号</text>
+    <rect class="cell" x="1758" y="330" width="246" height="36"/><text class="text" x="1840" y="354">14:59:25</text>
+  </g>
+  <g opacity="0.96">
+    <rect class="cell" x="558" y="366" width="80" height="36"/><text class="text" x="582" y="390">S249</text>
+    <rect class="cell" x="638" y="366" width="90" height="36"/><text class="text" x="666" y="390">moni</text>
+    <rect class="cell" x="728" y="366" width="152" height="36"/><text class="small" x="752" y="390">均线斜率空</text>
+    <rect class="cell" x="880" y="366" width="190" height="36"/><text class="text" x="906" y="390">DOGE-USDT-SWAP</text>
+    <rect class="cell" x="1070" y="366" width="70" height="36"/><text class="text" x="1094" y="390">1H</text>
+    <rect class="cell" x="1140" y="366" width="88" height="36"/><text class="red" x="1164" y="390" style="font-size:18px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">只做空</text>
+    <rect class="cell" x="1228" y="366" width="120" height="36"/><text class="text" x="1280" y="390">-</text>
+    <rect class="cell" x="1348" y="366" width="130" height="36"/><text class="text" x="1402" y="390">-</text>
+    <rect class="cell" x="1478" y="366" width="130" height="36"/><text class="text" x="1530" y="390">0.00</text>
+    <rect class="cell" x="1608" y="366" width="150" height="36"/><text class="orange" x="1650" y="390" style="font-size:18px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">等待信号</text>
+    <rect class="cell" x="1758" y="366" width="246" height="36"/><text class="text" x="1840" y="390">15:00:13</text>
+  </g>
+
+  <!-- Grouped toolbar -->
+  <text class="small" x="558" y="444">策略操作</text>
+  <rect class="btn-danger" x="638" y="420" width="104" height="36" rx="4"/><text class="red" x="672" y="444" style="font-size:17px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">停止</text>
+  <rect class="btn" x="754" y="420" width="104" height="36" rx="4"/><text class="text" x="774" y="444">提前平仓</text>
+  <rect class="btn" x="870" y="420" width="104" height="36" rx="4"/><text class="text" x="890" y="444">修改止损</text>
+  <rect class="btn" x="986" y="420" width="104" height="36" rx="4"/><text class="text" x="1006" y="444">恢复自动</text>
+
+  <text class="small" x="1126" y="444">查看</text>
+  <rect class="btn" x="1178" y="420" width="104" height="36" rx="4"/><text class="text" x="1198" y="444">实时K线</text>
+  <rect class="btn" x="1294" y="420" width="104" height="36" rx="4"/><text class="text" x="1314" y="444">历史策略</text>
+  <rect class="btn" x="1410" y="420" width="104" height="36" rx="4"/><text class="text" x="1430" y="444">策略总账</text>
+
+  <text class="small" x="1550" y="444">导入导出</text>
+  <rect class="btn" x="1640" y="420" width="104" height="36" rx="4"/><text class="text" x="1660" y="444">导出参数</text>
+  <rect class="btn" x="1756" y="420" width="104" height="36" rx="4"/><text class="text" x="1776" y="444">导入参数</text>
+  <rect class="btn" x="1872" y="420" width="132" height="36" rx="4"/><text class="text" x="1896" y="444">导入组合包</text>
+
+  <rect class="panel-soft" x="558" y="480" width="1446" height="74" rx="4"/>
+  <text class="text" x="580" y="510">选中策略：S242 | EMA 动态委托做多 | BTC-USDT-SWAP | 1H | 只做多</text>
+  <text class="small" x="580" y="540">当前状态：等待信号；启动追当前信号关闭；动态保护：1R 保本、4R 锁 1R、11R 锁 10R；手续费偏移开启。</text>
+
+  <!-- Detail tabs and account/log areas -->
+  <rect class="panel" x="536" y="592" width="1494" height="384" rx="6"/>
+  <rect class="tab-active" x="558" y="616" width="132" height="40" rx="4"/>
+  <text class="blue" x="586" y="642" style="font-size:18px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">策略详情</text>
+  <rect class="tab" x="696" y="616" width="132" height="40" rx="4"/>
+  <text class="text" x="724" y="642">账户持仓</text>
+  <rect class="tab" x="834" y="616" width="132" height="40" rx="4"/>
+  <text class="text" x="862" y="642">运行日志</text>
+  <rect class="tab" x="972" y="616" width="132" height="40" rx="4"/>
+  <text class="text" x="1000" y="642">异常提醒</text>
+
+  <rect class="panel-soft" x="558" y="674" width="710" height="276" rx="4"/>
+  <text class="section" x="582" y="710">规则摘要</text>
+  <text class="text" x="582" y="748">趋势：上一根收盘价站上 EMA21，且 EMA21 位于 EMA55 上方。</text>
+  <text class="text" x="582" y="786">挂单：按上一根 EMA13 作为限价委托参考线。</text>
+  <text class="text" x="582" y="824">止损：初始挂 OKX 托管止损，动态止盈由本地逐步上移。</text>
+  <text class="text" x="582" y="862">保护：启动接管时，若当前价已越过止损，则放弃接管。</text>
+  <text class="text" x="582" y="900">风控：风险金 4U，每波最多 2 次委托。</text>
+
+  <rect class="panel-soft" x="1290" y="674" width="714" height="276" rx="4"/>
+  <text class="section" x="1314" y="710">账户快照</text>
+  <text class="small" x="1314" y="752">持仓笔数</text><text class="title" x="1448" y="756">0</text>
+  <text class="small" x="1580" y="752">实时浮盈亏</text><text class="title" x="1720" y="756">-</text>
+  <text class="small" x="1314" y="810">净盈亏</text><text class="title" x="1448" y="814">0.00</text>
+  <text class="small" x="1580" y="810">已实现盈亏</text><text class="title" x="1720" y="814">-</text>
+  <line class="line" x1="1314" y1="844" x2="1980" y2="844"/>
+  <text class="small" x="1314" y="884">账户持仓表在此 tab 展开；主页默认只显示摘要，减少首屏拥挤。</text>
+  <rect class="btn" x="1314" y="910" width="116" height="36" rx="4"/><text class="text" x="1348" y="934">刷新</text>
+  <rect class="btn" x="1444" y="910" width="136" height="36" rx="4"/><text class="text" x="1474" y="934">持仓大图</text>
+
+  <!-- Bottom log drawer -->
+  <rect class="panel" x="18" y="994" width="2012" height="138" rx="6"/>
+  <text class="section" x="38" y="1030">运行日志</text>
+  <rect class="badge-ok" x="154" y="1008" width="92" height="34" rx="17"/>
+  <text class="green" x="180" y="1031" style="font-size:16px;font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;">正常</text>
+  <rect class="btn" x="1848" y="1008" width="72" height="34" rx="4"/><text class="small" x="1872" y="1031">清空</text>
+  <rect class="btn" x="1930" y="1008" width="72" height="34" rx="4"/><text class="small" x="1954" y="1031">折叠</text>
+  <text class="small" x="38" y="1068">[06-17 15:01:10] [moni] [S242 EMA 动态委托做多 BTC-USDT-SWAP] 当前无法生成挂单，收盘价仍在 EMA55 下方，等待下一次多头信号。</text>
+  <text class="small" x="38" y="1098">[06-17 15:00:25] [moni] [S246 均线斜率做空 BTC-USDT-SWAP] 斜率比例未达到阈值，等待信号。</text>
+</svg>

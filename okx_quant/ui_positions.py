@@ -3754,9 +3754,6 @@ class UiPositionsMixin:
         return None
 
     def refresh_positions(self) -> None:
-        if self._positions_refreshing:
-            return
-
         credentials = self._current_credentials_or_none()
         if credentials is None:
             self._apply_positions([], "未配置 API 凭证，无法读取持仓。")
@@ -3764,13 +3761,38 @@ class UiPositionsMixin:
             self._refresh_all_refresh_badges()
             return
 
+        environment = ENV_OPTIONS[self.environment_label.get()]
+        profile_name = credentials.profile_name or self._current_credential_profile()
+        if self._positions_refreshing:
+            self._positions_refresh_request = (credentials, environment, profile_name)
+            self.positions_summary_text.set(f"持仓仍在刷新，已排队切换到 {profile_name}/{environment}。")
+            return
         self._positions_refreshing = True
         generation = int(getattr(self, "_positions_refresh_generation", 0)) + 1
         self._positions_refresh_generation = generation
         self._mark_api_switch_refresh_step("positions", "running")
         self.positions_summary_text.set("正在刷新账户持仓...")
-        environment = ENV_OPTIONS[self.environment_label.get()]
-        profile_name = credentials.profile_name or self._current_credential_profile()
+        try:
+            threading.Thread(
+                target=self._refresh_positions_worker,
+                args=(credentials, environment, profile_name, generation),
+                daemon=True,
+            ).start()
+        except RuntimeError as exc:
+            self._apply_positions_error(f"系统线程资源不足，无法启动持仓刷新：{exc}")
+            return
+
+    def _drain_pending_positions_refresh_request(self) -> None:
+        pending = getattr(self, "_positions_refresh_request", None)
+        self._positions_refresh_request = None
+        if pending is None:
+            return
+        credentials, environment, profile_name = pending
+        self._positions_refreshing = True
+        generation = int(getattr(self, "_positions_refresh_generation", 0)) + 1
+        self._positions_refresh_generation = generation
+        self._mark_api_switch_refresh_step("positions", "running")
+        self.positions_summary_text.set("正在刷新账户持仓...")
         try:
             threading.Thread(
                 target=self._refresh_positions_worker,
@@ -3893,6 +3915,7 @@ class UiPositionsMixin:
             profile_name=profile_name,
             generation=self._positions_active_generation,
         )
+        self._drain_pending_positions_refresh_request()
 
     def _start_positions_enrichment_refresh(
         self,
@@ -4050,6 +4073,142 @@ class UiPositionsMixin:
         if expected_environment and effective_environment and expected_environment != effective_environment:
             return None
         return snapshot
+
+    def _session_position_snapshot_targets(self) -> list[tuple[str, str]]:
+        targets: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for session in self.sessions.values():
+            if not QuantApp._session_counts_toward_running_summary(session):
+                continue
+            profile_name = str(getattr(session, "api_name", "") or "").strip()
+            environment = str(getattr(getattr(session, "config", None), "environment", "") or "").strip().lower()
+            if not profile_name or not environment:
+                continue
+            snapshot = self._positions_snapshot_by_profile.get(profile_name)
+            snapshot_environment = str(getattr(snapshot, "effective_environment", "") or "").strip().lower()
+            if snapshot is not None and snapshot_environment == environment:
+                continue
+            key = (profile_name, environment)
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append(key)
+        return targets
+
+    def _schedule_session_position_snapshot_sync(self) -> None:
+        targets = self._session_position_snapshot_targets()
+        if not targets:
+            return
+        if getattr(self, "_session_positions_snapshot_refreshing", False):
+            self._session_positions_snapshot_refresh_requested = True
+            return
+        self._session_positions_snapshot_refreshing = True
+        self._session_positions_snapshot_refresh_requested = False
+        try:
+            threading.Thread(
+                target=self._refresh_session_position_snapshots_worker,
+                args=(targets,),
+                daemon=True,
+            ).start()
+        except RuntimeError:
+            self._session_positions_snapshot_refreshing = False
+            self._session_positions_snapshot_refresh_requested = True
+
+    def _refresh_session_position_snapshots_worker(self, targets: list[tuple[str, str]]) -> None:
+        results: list[tuple[str, str, list[OkxPosition], str, dict[str, Decimal], dict[str, Instrument]]] = []
+        warnings: list[str] = []
+        for profile_name, environment in targets:
+            credentials = self._credentials_for_profile_or_none(profile_name)
+            if credentials is None:
+                continue
+            effective_environment = environment
+            try:
+                positions = self.client.get_positions(credentials, environment=environment)
+                ws_cache_note = self._format_private_ws_cache_note(credentials, environment)
+            except Exception as exc:
+                message = str(exc)
+                if "50101" in message and "current environment" in message:
+                    alternate = "live" if environment == "demo" else "demo"
+                    try:
+                        positions = self.client.get_positions(credentials, environment=alternate)
+                        ws_cache_note = self._format_private_ws_cache_note(credentials, alternate)
+                        effective_environment = alternate
+                    except Exception as alternate_exc:
+                        warnings.append(
+                            f"{profile_name}/{environment} session positions sync failed: {_format_network_error_message(str(alternate_exc))}"
+                        )
+                        continue
+                else:
+                    warnings.append(
+                        f"{profile_name}/{environment} session positions sync failed: {_format_network_error_message(message)}"
+                    )
+                    continue
+            upl_usdt_prices: dict[str, Decimal] = {}
+            position_instruments: dict[str, Instrument] = {}
+            position_tickers: dict[str, OkxTicker] = {}
+            try:
+                upl_usdt_prices = _build_upl_usdt_price_map(self.client, positions)
+            except Exception:
+                upl_usdt_prices = {}
+            try:
+                position_instruments = _build_position_instrument_map(self.client, positions)
+            except Exception:
+                position_instruments = {}
+            try:
+                position_tickers = _build_position_ticker_map(self.client, positions)
+            except Exception:
+                position_tickers = {}
+            try:
+                upl_usdt_prices = _augment_upl_usdt_prices_from_positions(
+                    upl_usdt_prices,
+                    positions,
+                    position_tickers,
+                )
+            except Exception:
+                pass
+            if position_tickers:
+                positions = _apply_position_ticker_prices(positions, position_tickers)
+            results.append(
+                (
+                    profile_name,
+                    effective_environment,
+                    list(positions),
+                    ws_cache_note,
+                    dict(upl_usdt_prices),
+                    dict(position_instruments),
+                )
+            )
+        self.root.after(0, lambda: self._apply_session_position_snapshot_sync(results, warnings))
+
+    def _apply_session_position_snapshot_sync(
+        self,
+        results: list[tuple[str, str, list[OkxPosition], str, dict[str, Decimal], dict[str, Instrument]]],
+        warnings: list[str],
+    ) -> None:
+        self._session_positions_snapshot_refreshing = False
+        refreshed_any = False
+        for profile_name, environment, positions, ws_cache_note, upl_usdt_prices, position_instruments in results:
+            self._positions_snapshot_by_profile[profile_name] = ProfilePositionSnapshot(
+                api_name=profile_name,
+                effective_environment=environment,
+                positions=list(positions),
+                upl_usdt_prices=dict(upl_usdt_prices),
+                refreshed_at=datetime.now(),
+                position_instruments=dict(position_instruments),
+                ws_cache_note=ws_cache_note,
+            )
+            refreshed_any = True
+        if refreshed_any:
+            self._refresh_session_live_pnl_cache()
+            for session in self.sessions.values():
+                self._upsert_session_row(session)
+            self._refresh_running_session_summary()
+            self._refresh_selected_session_details()
+        for message in warnings:
+            self._enqueue_log(f"多账户持仓补抓 | {message}")
+        if self._session_positions_snapshot_refresh_requested:
+            self._session_positions_snapshot_refresh_requested = False
+            self._schedule_session_position_snapshot_sync()
 
     def _session_position_cache_note(self, session: StrategySession) -> str:
         snapshot = self._positions_snapshot_for_session(session)
@@ -4282,6 +4441,8 @@ class UiPositionsMixin:
         else:
             parts.append("实时浮盈待持仓刷新")
         self.session_summary_text.set(" | ".join(parts))
+        if hasattr(self, "_schedule_session_position_snapshot_sync"):
+            self._schedule_session_position_snapshot_sync()
 
     def _refresh_running_session_tree(self) -> None:
         tree = self.session_tree
@@ -4975,6 +5136,7 @@ class UiPositionsMixin:
             self._sync_positions_zoom_window()
             self._refresh_positions_zoom_detail()
             self._log_api_switch_refresh_event("positions", "失败", f"继续显示缓存 | {friendly_message}", dedupe_key=f"positions:error:{friendly_message}")
+            self._drain_pending_positions_refresh_request()
             return
         self._latest_positions = []
         self._positions_context_note = None
@@ -5002,6 +5164,7 @@ class UiPositionsMixin:
         self._refresh_positions_zoom_detail()
         summary = f"持仓读取失败：{friendly_message}{suffix}"
         self.positions_summary_text.set(summary)
+        self._drain_pending_positions_refresh_request()
         self._log_api_switch_refresh_event("positions", "失败", friendly_message, dedupe_key=f"positions:error:{friendly_message}")
 
     @staticmethod

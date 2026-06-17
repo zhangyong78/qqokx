@@ -3904,7 +3904,7 @@ class UiStrategySessionsMixin:
         session.runtime_status = "持仓监控中"
         self._upsert_session_row(session)
         self._refresh_selected_session_details()
-        self._log_session_message(session, "当前轮已恢复自动管理，动态止损继续接管。")
+        self._log_session_message(session, "当前轮已恢复自动止盈管理，动态止盈/止损继续接管。")
 
     def _request_stop_strategy_session(
         self,
@@ -4235,6 +4235,7 @@ class UiStrategySessionsMixin:
         if session is None:
             return
         show_dialog = bool(getattr(session, "stop_result_show_dialog", True))
+        should_refresh_active_profile = session.api_name.strip() == self._current_credential_profile()
         session.stop_result_show_dialog = True
         session.stop_cleanup_in_progress = False
         session.status = "已停止"
@@ -4266,10 +4267,6 @@ class UiStrategySessionsMixin:
             self._log_session_message(session, f"停止清理 | 检测到保护委托 | {summary}")
         self._log_session_message(session, f"停止流程结束 | 结论={result.final_reason}")
 
-        if session.api_name.strip() == self._current_credential_profile():
-            self.refresh_positions()
-            self.refresh_order_views()
-
         if result.needs_manual_review:
             details: list[str] = ["策略已停止，但检测到需要人工接管的情况。"]
             if result.cancel_failed_summaries or result.remaining_pending_summaries:
@@ -4292,6 +4289,8 @@ class UiStrategySessionsMixin:
             details.append("请人工检查“当前委托 / 账户持仓 / OKX 托管止损”，再决定是否保留、撤单或平仓。")
             if show_dialog:
                 messagebox.showwarning("停止提醒", "\n".join(details))
+            if should_refresh_active_profile:
+                QuantApp._schedule_stop_cleanup_follow_up_refresh(self)
             return
 
         if show_dialog:
@@ -4303,6 +4302,8 @@ class UiStrategySessionsMixin:
                     "未发现残留仓位或需人工接管的问题。"
                 ),
             )
+        if should_refresh_active_profile:
+            QuantApp._schedule_stop_cleanup_follow_up_refresh(self)
 
     def _apply_stop_session_cleanup_error(self, session_id: str, message: str) -> None:
         session = self.sessions.get(session_id)
@@ -4329,6 +4330,13 @@ class UiStrategySessionsMixin:
                 f"原因：{friendly_message}\n\n"
                 "请人工检查：\n- 当前委托是否仍有残留\n- 是否已经成交并留下仓位\n- OKX 托管止损是否仍在",
             )
+
+    def _schedule_stop_cleanup_follow_up_refresh(self) -> None:
+        self.root.after(0, lambda: QuantApp._run_stop_cleanup_follow_up_refresh(self))
+
+    def _run_stop_cleanup_follow_up_refresh(self) -> None:
+        self.refresh_positions()
+        self.refresh_order_views()
 
     @staticmethod
     def _session_can_be_cleared(session: StrategySession) -> bool:
@@ -5418,6 +5426,12 @@ class UiStrategySessionsMixin:
             f"{api_status} | {mail_status} | {self.environment_label.get()} | {self.trade_mode_label.get()} | "
             f"{self.position_mode_label.get()}"
         )
+        if hasattr(self, "launcher_status_summary_text"):
+            self.launcher_status_summary_text.set(f"API：{api_status} | 通知：{mail_status}")
+        if hasattr(self, "launcher_mode_summary_text"):
+            self.launcher_mode_summary_text.set(
+                f"{self.environment_label.get()} | {self.trade_mode_label.get()} | {self.position_mode_label.get()}"
+            )
 
     def _append_logged_message(
         self,
@@ -6263,6 +6277,9 @@ class UiStrategySessionsMixin:
             return
         live_pnl, _ = self._session_live_pnl_snapshot(session)
         open_qty_text = self._session_open_position_amount_text(session)
+        risk_amount_text = UiStrategySessionsMixin._format_optional_positive_entry_decimal(
+            getattr(getattr(session, "config", None), "risk_amount", None)
+        ) or "-"
         source_type = QuantApp._session_category_label(session)
         trader_label = QuantApp._session_trader_label(self, session)
         email_label = QuantApp._session_email_status_label(self, session)
@@ -6283,9 +6300,11 @@ class UiStrategySessionsMixin:
                 getattr(session, "config", None),
                 fallback=session.direction_label,
             ),
+            risk_amount_text,
             open_qty_text,
             _format_optional_usdt_precise(live_pnl, places=2),
             _format_optional_usdt_precise(session.net_pnl_total, places=2),
+            _format_optional_usdt_precise(session.last_net_pnl, places=2),
             session.display_status,
             session.started_at.strftime("%H:%M:%S"),
         )
@@ -6493,6 +6512,7 @@ class UiStrategySessionsMixin:
             fee_total=session.fee_total,
             funding_total=session.funding_total,
             net_pnl_total=session.net_pnl_total,
+            last_net_pnl=session.last_net_pnl,
             last_close_reason=session.last_close_reason,
             live_pnl=live_pnl,
             live_pnl_refreshed_at=live_pnl_refreshed_at,
@@ -6577,6 +6597,7 @@ class UiStrategySessionsMixin:
         fee_total: Decimal = Decimal("0"),
         funding_total: Decimal = Decimal("0"),
         net_pnl_total: Decimal = Decimal("0"),
+        last_net_pnl: Decimal | None = None,
         last_close_reason: str = "",
         live_pnl: Decimal | None = None,
         live_pnl_refreshed_at: datetime | None = None,
@@ -6742,6 +6763,7 @@ class UiStrategySessionsMixin:
                 f"手续费：{_format_optional_usdt_precise(fee_total, places=2)}",
                 f"资金费：{_format_optional_usdt_precise(funding_total, places=2)}",
                 f"净盈亏：{_format_optional_usdt_precise(net_pnl_total, places=2)}",
+                f"上次盈亏：{_format_optional_usdt_precise(last_net_pnl, places=2)}",
                 f"最近结论：{last_close_reason}" if last_close_reason else "",
             ]
         )
@@ -8372,6 +8394,7 @@ class UiStrategySessionsMixin:
             fee_total=_parse_decimal_snapshot(payload.get("fee_total")),
             funding_total=_parse_decimal_snapshot(payload.get("funding_total")),
             net_pnl_total=_parse_decimal_snapshot(payload.get("net_pnl_total")),
+            last_net_pnl=_parse_decimal_snapshot(payload.get("last_net_pnl"), default=None),
             last_close_reason=str(payload.get("last_close_reason", "")).strip(),
         )
 
@@ -8399,6 +8422,7 @@ class UiStrategySessionsMixin:
             "fee_total": format(record.fee_total, "f"),
             "funding_total": format(record.funding_total, "f"),
             "net_pnl_total": format(record.net_pnl_total, "f"),
+            "last_net_pnl": format(record.last_net_pnl, "f") if record.last_net_pnl is not None else "",
             "last_close_reason": record.last_close_reason,
         }
 
@@ -8606,6 +8630,7 @@ class UiStrategySessionsMixin:
         )
         target.funding_total = sum(((item.funding_fee or Decimal("0")) for item in records), Decimal("0"))
         target.net_pnl_total = sum(((item.net_pnl or Decimal("0")) for item in records), Decimal("0"))
+        target.last_net_pnl = records[0].net_pnl if records else None
         target.last_close_reason = records[0].close_reason if records else ""
 
     def _rebuild_history_financials_from_trade_ledger(self) -> None:
@@ -8625,6 +8650,7 @@ class UiStrategySessionsMixin:
                 record.fee_total,
                 record.funding_total,
                 record.net_pnl_total,
+                record.last_net_pnl,
                 record.last_close_reason,
             )
             self._apply_financial_totals(record, matched)
@@ -8635,6 +8661,7 @@ class UiStrategySessionsMixin:
                 record.fee_total,
                 record.funding_total,
                 record.net_pnl_total,
+                record.last_net_pnl,
                 record.last_close_reason,
             )
             if current != previous:
@@ -8739,6 +8766,7 @@ class UiStrategySessionsMixin:
             fee_total=session.fee_total,
             funding_total=session.funding_total,
             net_pnl_total=session.net_pnl_total,
+            last_net_pnl=session.last_net_pnl,
             last_close_reason=session.last_close_reason,
         )
 
@@ -8788,6 +8816,7 @@ class UiStrategySessionsMixin:
             ("fee_total", session.fee_total),
             ("funding_total", session.funding_total),
             ("net_pnl_total", session.net_pnl_total),
+            ("last_net_pnl", session.last_net_pnl),
             ("last_close_reason", session.last_close_reason),
         ):
             if getattr(record, attr) != desired:

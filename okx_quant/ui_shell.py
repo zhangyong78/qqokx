@@ -1077,6 +1077,7 @@ class StrategySession:
     fee_total: Decimal = Decimal("0")
     funding_total: Decimal = Decimal("0")
     net_pnl_total: Decimal = Decimal("0")
+    last_net_pnl: Decimal | None = None
     last_close_reason: str = ""
     trader_id: str = ""
     trader_slot_id: str = ""
@@ -1289,6 +1290,7 @@ class StrategyHistoryRecord:
     fee_total: Decimal = Decimal("0")
     funding_total: Decimal = Decimal("0")
     net_pnl_total: Decimal = Decimal("0")
+    last_net_pnl: Decimal | None = None
     last_close_reason: str = ""
 
 
@@ -3167,6 +3169,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         offset_y = max((screen_height - default_height) // 2 - 12, 20)
         self.root.geometry(f"{default_width}x{default_height}+{offset_x}+{offset_y}")
         self.root.minsize(1420, 900)
+        self._configure_compact_ui_style()
 
         self.client = OkxRestClient()
         self.market_data_hub = MarketDataHub(self.client, logger=self._enqueue_log)
@@ -3257,8 +3260,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._account_info_refresh_health = RefreshHealthState("账户信息")
         self._positions_refresh_generation = 0
         self._positions_active_generation = 0
+        self._positions_refresh_request: tuple[Credentials, str, str] | None = None
         self._positions_enrichment_refreshing = False
         self._positions_enrichment_request: tuple[int, list[OkxPosition], str, str] | None = None
+        self._session_positions_snapshot_refreshing = False
+        self._session_positions_snapshot_refresh_requested = False
         self._upl_usdt_prices: dict[str, Decimal] = {}
         self._position_history_usdt_prices: dict[str, Decimal] = {}
         self._order_history_usdt_prices: dict[str, Decimal] = {}
@@ -3373,7 +3379,17 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._positions_zoom_position_history_apply_contract_button: ttk.Button | None = None
         self._positions_zoom_position_history_apply_expiry_prefix_button: ttk.Button | None = None
         self._main_body_pane: ttk.Panedwindow | None = None
+        self._launcher_frame: ttk.Frame | None = None
+        self._launcher_compact_frame: ttk.LabelFrame | None = None
+        self._launcher_watch_rail_frame: ttk.Frame | None = None
+        self._launcher_start_frame: ttk.LabelFrame | None = None
+        self._launcher_strategy_info_frame: ttk.LabelFrame | None = None
+        self._sessions_frame: ttk.Frame | None = None
         self._sessions_pane: ttk.Panedwindow | None = None
+        self._session_detail_frame: ttk.LabelFrame | None = None
+        self._positions_frame: ttk.LabelFrame | None = None
+        self._positions_table_frame: ttk.Frame | None = None
+        self._log_frame: ttk.LabelFrame | None = None
         self._protection_sessions_tree: ttk.Treeview | None = None
         self._protection_detail_text: Text | None = None
         self._protection_form_title_text = StringVar(value="请选择一个期权持仓后，再设置保护。")
@@ -3484,9 +3500,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.trade_symbol.trace_add("write", self._on_fixed_order_size_symbol_changed)
         self.trade_symbol.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.symbol.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.symbol.trace_add("write", self._update_launcher_selection_summary)
         self.strategy_name.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.strategy_name.trace_add("write", self._update_launcher_selection_summary)
         self.bar.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.bar.trace_add("write", self._update_launcher_selection_summary)
         self.signal_mode_label.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.signal_mode_label.trace_add("write", self._update_launcher_selection_summary)
         self.ema_type.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.ema_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.trend_ema_type.trace_add("write", self._schedule_minimum_order_risk_hint_update)
@@ -3616,6 +3636,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.protection_poll_seconds = StringVar(value="2")
 
         self.status_text = StringVar(value="运行中策略：0")
+        self._watch_mode_button_text = StringVar(value="退出盯盘")
+        self._launcher_manual_toggle_text = StringVar(value="展开手动参数")
         self.session_summary_text = StringVar(value="多策略合计：当前没有运行中的策略。")
         self.session_quick_actions_text = StringVar(
             value="快捷操作：会话=双击日志 | 交易员=双击打开管理台 | 邮件=双击切换 | 标的=双击K线"
@@ -3623,6 +3645,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.global_email_toggle_text = StringVar(value="发邮件：开")
         self.settings_summary_text = StringVar()
         self.strategy_summary_text = StringVar()
+        self.launcher_status_summary_text = StringVar(value="")
+        self.launcher_mode_summary_text = StringVar(value="")
+        self.launcher_strategy_title_text = StringVar(value="未选择策略")
+        self.launcher_selection_summary_text = StringVar(value="未选择标的 | - | -")
         self.strategy_rule_text = StringVar()
         self.strategy_hint_text = StringVar()
         self.selected_session_text = StringVar(value=self._default_selected_session_text())
@@ -3656,6 +3682,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.position_long_call_text = StringVar(value="-")
         self.position_long_put_text = StringVar(value="-")
         self.position_detail_text = StringVar(value=self._default_position_detail_text())
+        self._watch_mode_enabled = True
+        self._launcher_manual_visible = False
         self.account_info_summary_text = StringVar(value="尚未读取账户信息。")
         self._account_info_api_switch_badge_text = StringVar(value="")
         self._account_info_refresh_badge_text = StringVar(value="未读")
@@ -3751,12 +3779,63 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._bind_auto_save()
         self._apply_selected_strategy_definition()
         self._update_settings_summary()
+        self._update_launcher_selection_summary()
         self.root.after_idle(self._apply_initial_pane_layout)
         self.root.after(250, self._drain_log_queue)
         self.root.after(500, self._refresh_status)
         self.root.after(900, self._attempt_auto_restore_recoverable_sessions)
         self.root.after(1200, self._refresh_positions_periodic)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _configure_compact_ui_style(self) -> None:
+        def _shrink_named_font(name: str, *, minimum: int = 8) -> None:
+            try:
+                named_font = tkfont.nametofont(name)
+            except Exception:
+                return
+            try:
+                current_size = int(named_font.cget("size"))
+            except Exception:
+                return
+            if current_size <= 0:
+                return
+            named_font.configure(size=max(current_size - 1, minimum))
+
+        for font_name in (
+            "TkDefaultFont",
+            "TkTextFont",
+            "TkMenuFont",
+            "TkHeadingFont",
+            "TkCaptionFont",
+            "TkSmallCaptionFont",
+            "TkTooltipFont",
+            "TkIconFont",
+            "TkFixedFont",
+        ):
+            _shrink_named_font(font_name)
+
+        style = ttk.Style(self.root)
+        default_font = tkfont.nametofont("TkDefaultFont")
+        heading_font = tkfont.nametofont("TkHeadingFont")
+        text_font = tkfont.nametofont("TkTextFont")
+        style.configure(".", font=default_font)
+        style.configure("TButton", padding=(6, 2))
+        style.configure("TCombobox", padding=(4, 1))
+        style.configure("TEntry", padding=(4, 1))
+        style.configure("TLabelframe.Label", font=heading_font)
+        style.configure("Treeview", font=text_font, rowheight=22)
+        style.configure("Treeview.Heading", font=heading_font)
+        style.configure("Vertical.TScrollbar", arrowsize=12)
+        style.configure("Horizontal.TScrollbar", arrowsize=12)
+        self.root.option_add("*Font", default_font)
+        self.root.option_add("*Text.Font", text_font)
+        self.root.option_add("*Text.spacing1", 0)
+        self.root.option_add("*Text.spacing2", 1)
+        self.root.option_add("*Text.spacing3", 0)
+        self.root.option_add("*Menu.Font", default_font)
+        self.root.option_add("*Listbox.Font", text_font)
+        self.root.option_add("*TCombobox*Listbox.font", default_font)
+        self.root.option_add("*tearOff", False)
 
     @staticmethod
     def _strategy_uses_big_ema(strategy_id: str) -> bool:
@@ -4176,10 +4255,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=4)
+        self.root.rowconfigure(1, weight=6)
         self.root.rowconfigure(2, weight=1)
 
-        header = ttk.Frame(self.root, padding=(16, 16, 16, 8))
+        header = ttk.Frame(self.root, padding=(12, 12, 12, 6))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         header.columnconfigure(1, weight=1)
@@ -4187,12 +4266,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         ttk.Label(
             header,
             text="OKX 多策略工作台",
-            font=("Microsoft YaHei UI", 20, "bold"),
+            font=("Microsoft YaHei UI", 17, "bold"),
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
             textvariable=self.status_text,
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=("Microsoft YaHei UI", 10, "bold"),
         ).grid(row=0, column=1, sticky="e")
         summary_row = ttk.Frame(header)
         summary_row.grid(row=1, column=1, sticky="e", pady=(6, 0))
@@ -4217,27 +4296,126 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 10))
         self._main_body_pane = body
 
-        launcher_frame = ttk.Frame(body, padding=12)
-        sessions_frame = ttk.Frame(body, padding=12)
-        body.add(launcher_frame, weight=2)
-        body.add(sessions_frame, weight=3)
+        launcher_frame = ttk.Frame(body, padding=10)
+        sessions_frame = ttk.Frame(body, padding=10)
+        body.add(launcher_frame, weight=1)
+        body.add(sessions_frame, weight=5)
+        self._launcher_frame = launcher_frame
+        self._sessions_frame = sessions_frame
 
         launcher_frame.columnconfigure(0, weight=1)
-        launcher_frame.rowconfigure(0, weight=1)
-        launcher_frame.rowconfigure(1, weight=0)
+        launcher_frame.rowconfigure(0, weight=0)
+        launcher_frame.rowconfigure(1, weight=1)
+        launcher_frame.rowconfigure(2, weight=0)
         sessions_frame.columnconfigure(0, weight=1)
         sessions_frame.rowconfigure(0, weight=1)
+
+        launcher_compact_frame = ttk.LabelFrame(launcher_frame, text="启动概览", padding=10)
+        launcher_compact_frame.grid(row=0, column=0, sticky="ew")
+        launcher_compact_frame.columnconfigure(0, weight=1)
+        self._launcher_compact_frame = launcher_compact_frame
+
+        launcher_summary = ttk.Frame(launcher_compact_frame)
+        launcher_summary.grid(row=0, column=0, sticky="ew")
+        launcher_summary.columnconfigure(0, weight=1)
+        launcher_summary.columnconfigure(1, weight=1)
+        ttk.Label(
+            launcher_summary,
+            text="当前账户",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(launcher_summary, text="当前 API").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(launcher_summary, textvariable=self.api_profile_name, font=("Microsoft YaHei UI", 11, "bold")).grid(
+            row=1, column=1, sticky="w", padx=(8, 0), pady=(10, 0)
+        )
+        ttk.Label(launcher_summary, text="环境").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(launcher_summary, textvariable=self.environment_label, font=("Microsoft YaHei UI", 9, "bold")).grid(
+            row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0)
+        )
+        ttk.Label(
+            launcher_summary,
+            textvariable=self.launcher_status_summary_text,
+            foreground="#374151",
+            wraplength=248,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(
+            launcher_summary,
+            textvariable=self.launcher_mode_summary_text,
+            foreground="#6b7280",
+            wraplength=248,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        ttk.Separator(launcher_compact_frame, orient="horizontal").grid(row=1, column=0, sticky="ew", pady=(10, 8))
+
+        launcher_target = ttk.Frame(launcher_compact_frame)
+        launcher_target.grid(row=2, column=0, sticky="ew")
+        launcher_target.columnconfigure(0, weight=1)
+        ttk.Label(launcher_target, text="待启动策略", font=("Microsoft YaHei UI", 10, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            launcher_target,
+            textvariable=self.launcher_strategy_title_text,
+            font=("Microsoft YaHei UI", 11, "bold"),
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(
+            launcher_target,
+            textvariable=self.launcher_selection_summary_text,
+            justify="left",
+            wraplength=248,
+            foreground="#374151",
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+        action_row = ttk.Frame(launcher_compact_frame)
+        action_row.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        action_row.columnconfigure(0, weight=1)
+        action_row.columnconfigure(1, weight=1)
+        ttk.Button(
+            action_row,
+            textvariable=self._launcher_manual_toggle_text,
+            command=self.toggle_launcher_manual_controls,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(action_row, textvariable=self._watch_mode_button_text, command=self.toggle_watch_mode).grid(
+            row=0, column=1, sticky="ew", padx=(4, 0)
+        )
+
+        ttk.Separator(launcher_compact_frame, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=(10, 8))
+
+        launcher_checklist = ttk.Frame(launcher_compact_frame)
+        launcher_checklist.grid(row=5, column=0, sticky="ew")
+        launcher_checklist.columnconfigure(0, weight=1)
+        ttk.Label(launcher_checklist, text="启动前确认", font=("Microsoft YaHei UI", 10, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            launcher_checklist,
+            text="API 环境一致 · 组合包切换跟随 API · 越损接管会自动跳过",
+            justify="left",
+            wraplength=248,
+            foreground="#6b7280",
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        launcher_watch_rail = ttk.Frame(launcher_frame, padding=(0, 12, 0, 12))
+        launcher_watch_rail.grid(row=0, column=0, sticky="nsw")
+        launcher_watch_rail.columnconfigure(0, weight=1)
+        ttk.Label(launcher_watch_rail, text="左栏", font=("Microsoft YaHei UI", 11, "bold")).grid(row=0, column=0, sticky="n")
+        ttk.Button(launcher_watch_rail, text=">", command=self.toggle_watch_mode).grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        launcher_watch_rail.grid_remove()
+        self._launcher_watch_rail_frame = launcher_watch_rail
 
         _lp = (6, 0)
         _lp_tight = (4, 0)
         _ix = (0, 10)
         _hint_wrap = 520
 
-        start_frame = ttk.LabelFrame(launcher_frame, text="策略启动", padding=8)
-        start_frame.grid(row=0, column=0, sticky="nsew")
+        start_frame = ttk.LabelFrame(launcher_frame, text="策略启动", padding=6)
+        start_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         start_frame.columnconfigure(0, weight=1)
         start_frame.rowconfigure(0, weight=1)
         start_frame.rowconfigure(1, weight=0)
+        self._launcher_start_frame = start_frame
 
         scroll_host = ttk.Frame(start_frame)
         scroll_host.grid(row=0, column=0, sticky="nsew")
@@ -4779,11 +4957,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        strategy_info = ttk.LabelFrame(launcher_frame, text="策略说明", padding=12)
-        strategy_info.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        strategy_info = ttk.LabelFrame(launcher_frame, text="策略说明", padding=10)
+        strategy_info.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         strategy_info.columnconfigure(0, weight=1)
+        self._launcher_strategy_info_frame = strategy_info
 
-        ttk.Label(strategy_info, text="策略简介", font=("Microsoft YaHei UI", 11, "bold")).grid(
+        ttk.Label(strategy_info, text="策略简介", font=("Microsoft YaHei UI", 10, "bold")).grid(
             row=0, column=0, sticky="w"
         )
         ttk.Label(
@@ -4793,7 +4972,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(6, 12))
 
-        ttk.Label(strategy_info, text="规则说明", font=("Microsoft YaHei UI", 11, "bold")).grid(
+        ttk.Label(strategy_info, text="规则说明", font=("Microsoft YaHei UI", 10, "bold")).grid(
             row=2, column=0, sticky="w"
         )
         ttk.Label(
@@ -4803,7 +4982,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             justify="left",
         ).grid(row=3, column=0, sticky="w", pady=(6, 12))
 
-        ttk.Label(strategy_info, text="参数提示", font=("Microsoft YaHei UI", 11, "bold")).grid(
+        ttk.Label(strategy_info, text="参数提示", font=("Microsoft YaHei UI", 10, "bold")).grid(
             row=4, column=0, sticky="w"
         )
         ttk.Label(
@@ -4812,6 +4991,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             wraplength=820,
             justify="left",
         ).grid(row=5, column=0, sticky="w", pady=(6, 0))
+        start_frame.grid_remove()
+        strategy_info.grid_remove()
 
         sessions_pane = ttk.Panedwindow(sessions_frame, orient="vertical")
         sessions_pane.grid(row=0, column=0, sticky="nsew")
@@ -4819,14 +5000,15 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         session_top_frame = ttk.Frame(sessions_pane)
         session_top_frame.columnconfigure(0, weight=1)
-        session_top_frame.rowconfigure(0, weight=4)
+        session_top_frame.rowconfigure(0, weight=8)
         session_top_frame.rowconfigure(1, weight=1)
-        sessions_pane.add(session_top_frame, weight=2)
+        sessions_pane.add(session_top_frame, weight=5)
 
-        running_frame = ttk.LabelFrame(session_top_frame, text="运行中策略", padding=12)
+        running_frame = ttk.LabelFrame(session_top_frame, text="运行中策略", padding=10)
         running_frame.grid(row=0, column=0, sticky="nsew")
         running_frame.columnconfigure(0, weight=1)
         running_frame.rowconfigure(1, weight=1)
+        self._running_frame = running_frame
 
         running_header = ttk.Frame(running_frame)
         running_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
@@ -4866,9 +5048,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 "symbol",
                 "bar",
                 "direction",
+                "risk_amount",
                 "open_qty",
                 "live_pnl",
                 "pnl",
+                "last_pnl",
                 "status",
                 "started",
             ),
@@ -4885,9 +5069,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("symbol", text="标的(双击K线)")
         self.session_tree.heading("bar", text="周期")
         self.session_tree.heading("direction", text="方向")
+        self.session_tree.heading("risk_amount", text="风险金")
         self.session_tree.heading("open_qty", text="开仓数量")
         self.session_tree.heading("live_pnl", text="实时浮盈亏")
         self.session_tree.heading("pnl", text="净盈亏")
+        self.session_tree.heading("last_pnl", text="上次盈亏")
         self.session_tree.heading("status", text="状态")
         self.session_tree.heading("started", text="启动时间")
         self.session_tree.column("session", width=56, anchor="center")
@@ -4900,9 +5086,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.column("symbol", width=156, anchor="w")
         self.session_tree.column("bar", width=68, anchor="center")
         self.session_tree.column("direction", width=82, anchor="center")
+        self.session_tree.column("risk_amount", width=88, anchor="e")
         self.session_tree.column("open_qty", width=112, anchor="e")
         self.session_tree.column("live_pnl", width=112, anchor="e")
         self.session_tree.column("pnl", width=104, anchor="e")
+        self.session_tree.column("last_pnl", width=104, anchor="e")
         self.session_tree.column("status", width=108, anchor="center")
         self.session_tree.column("started", width=96, anchor="center")
         self.session_tree.grid(row=1, column=0, sticky="nsew")
@@ -4917,83 +5105,65 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.configure(yscrollcommand=tree_scroll.set)
 
         control_row = ttk.Frame(running_frame)
-        control_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Button(control_row, text="\u505c\u6b62\u9009\u4e2d\u7b56\u7565", command=self.stop_selected_session).grid(row=0, column=0)
-        ttk.Button(control_row, text="提前平仓", command=self.manual_flatten_selected_session).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(control_row, text="修改止损", command=self.manual_adjust_selected_session_stop_loss).grid(
-            row=0, column=2, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="恢复自动", command=self.resume_selected_session_auto_management).grid(
-            row=0, column=3, padx=(8, 0)
-        )
-        ttk.Button(control_row, textvariable=self.global_email_toggle_text, command=self.toggle_global_email_notifications).grid(
-            row=0, column=4, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="\u5f00\u542f\u90ae\u4ef6", command=self.enable_selected_session_email_notifications).grid(
-            row=0,
-            column=5,
-            padx=(8, 0),
-        )
-        ttk.Button(control_row, text="\u5173\u95ed\u90ae\u4ef6", command=self.disable_selected_session_email_notifications).grid(
-            row=0,
-            column=6,
-            padx=(8, 0),
-        )
-        ttk.Button(control_row, text="\u5b9e\u65f6K\u7ebf\u56fe", command=self.open_selected_strategy_live_chart).grid(
-            row=0, column=7, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="BTC行情分析", command=self.open_btc_market_analysis_window).grid(
-            row=0, column=8, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="\u4fe1\u53f7\u89c2\u5bdf\u53f0", command=self.open_signal_monitor_window).grid(
-            row=0, column=9, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="\u4ea4\u6613\u5458\u7ba1\u7406\u53f0", command=self.open_trader_desk_window).grid(
-            row=0, column=10, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="\u6e05\u7a7a\u5df2\u505c\u6b62", command=self.clear_stopped_sessions).grid(
-            row=0, column=11, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="\u5386\u53f2\u7b56\u7565", command=self.open_strategy_history_window).grid(
-            row=0, column=12, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="\u7b56\u7565\u603b\u8d26\u672c", command=self.open_strategy_book_window).grid(
-            row=0, column=13, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="\u5bfc\u51fa\u9009\u4e2d\u53c2\u6570", command=self.export_selected_session_template).grid(
-            row=0, column=14, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="\u5bfc\u5165\u7b56\u7565\u53c2\u6570", command=self.import_strategy_template).grid(
-            row=0, column=15, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="导入策略组合", command=self.import_strategy_template_bundle).grid(
-            row=0, column=16, padx=(8, 0)
-        )
-        ttk.Button(control_row, text="恢复选中策略", command=self.recover_selected_session).grid(
-            row=0, column=17, padx=(8, 0)
+        control_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        session_group = ttk.LabelFrame(control_row, text="会话控制", padding=(8, 6))
+        session_group.grid(row=0, column=0, sticky="w")
+        ttk.Button(session_group, text="停止选中策略", command=self.stop_selected_session).grid(row=0, column=0)
+        ttk.Button(session_group, text="恢复选中策略", command=self.recover_selected_session).grid(
+            row=0, column=1, padx=(8, 0)
         )
 
-        detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=16)
+        trade_group = ttk.LabelFrame(control_row, text="持仓处理", padding=(8, 6))
+        trade_group.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ttk.Button(trade_group, text="提前平仓", command=self.manual_flatten_selected_session).grid(row=0, column=0)
+        ttk.Button(trade_group, text="修改止损", command=self.manual_adjust_selected_session_stop_loss).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+        ttk.Button(trade_group, text="恢复自动止盈", command=self.resume_selected_session_auto_management).grid(
+            row=0, column=2, padx=(8, 0)
+        )
+
+        book_group = ttk.LabelFrame(control_row, text="历史账本", padding=(8, 6))
+        book_group.grid(row=0, column=2, sticky="w", padx=(10, 0))
+        ttk.Button(book_group, text="历史策略", command=self.open_strategy_history_window).grid(row=0, column=0)
+        ttk.Button(book_group, text="策略总账本", command=self.open_strategy_book_window).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+        ttk.Button(book_group, text="导入最佳参数组合包", command=self.import_strategy_template_bundle).grid(
+            row=0, column=2, padx=(8, 0)
+        )
+
+        utility_group = ttk.LabelFrame(control_row, text="清理与模式", padding=(8, 6))
+        utility_group.grid(row=0, column=3, sticky="w", padx=(10, 0))
+        ttk.Button(utility_group, text="清空已停止", command=self.clear_stopped_sessions).grid(row=0, column=0)
+        ttk.Button(utility_group, textvariable=self._watch_mode_button_text, command=self.toggle_watch_mode).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+
+        detail_frame = ttk.LabelFrame(session_top_frame, text="选中策略详情", padding=12)
         detail_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         detail_frame.columnconfigure(0, weight=1)
         detail_frame.rowconfigure(0, weight=1)
+        self._session_detail_frame = detail_frame
         self._selected_session_detail = Text(
             detail_frame,
-            height=9,
+            height=5,
             wrap="word",
-            font=("Microsoft YaHei UI", 10),
+            font=("Microsoft YaHei UI", 9),
             relief="flat",
         )
+        self._selected_session_detail.configure(spacing1=0, spacing2=1, spacing3=0)
         self._selected_session_detail.grid(row=0, column=0, sticky="nsew")
         detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self._selected_session_detail.yview)
         detail_scroll.grid(row=0, column=1, sticky="ns")
         self._selected_session_detail.configure(yscrollcommand=detail_scroll.set)
         self._set_readonly_text(self._selected_session_detail, self.selected_session_text.get())
 
-        positions_frame = ttk.LabelFrame(sessions_pane, text="账户持仓（仿 OKX 客户端风格）", padding=(6, 5))
+        positions_frame = ttk.LabelFrame(sessions_pane, text="账户持仓", padding=(5, 4))
         positions_frame.columnconfigure(0, weight=1)
         positions_frame.rowconfigure(2, weight=1)
-        sessions_pane.add(positions_frame, weight=7)
+        sessions_pane.add(positions_frame, weight=4)
+        self._positions_frame = positions_frame
 
         header_row = ttk.Frame(positions_frame)
         header_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
@@ -5023,7 +5193,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._positions_api_switch_badge_label = Label(
             header_row,
             textvariable=self._positions_api_switch_badge_text,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=("Microsoft YaHei UI", 8, "bold"),
             padx=10,
             pady=2,
             bd=0,
@@ -5035,7 +5205,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._positions_summary_label = Label(
             header_row,
             textvariable=self.positions_summary_text,
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
             anchor="w",
             justify="left",
             fg="#111827",
@@ -5065,6 +5235,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         position_table.grid(row=2, column=0, sticky="nsew")
         position_table.columnconfigure(0, weight=1)
         position_table.rowconfigure(0, weight=1)
+        self._positions_table_frame = position_table
 
         self.position_tree = ttk.Treeview(
             position_table,
@@ -5215,12 +5386,14 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._main_positions_pane = None
         self._main_position_detail_frame = None
 
-        log_frame = ttk.LabelFrame(self.root, text="运行日志", padding=12)
+        log_frame = ttk.LabelFrame(self.root, text="运行日志", padding=10)
         log_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
+        self._log_frame = log_frame
 
-        self.log_text = Text(log_frame, height=18, wrap="word", font=("Consolas", 10))
+        self.log_text = Text(log_frame, height=18, wrap="word", font=("Consolas", 9))
+        self.log_text.configure(spacing1=0, spacing2=1, spacing3=0)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -5270,20 +5443,107 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             messagebox.showerror("打开日志目录", str(exc), parent=self.root)
 
     def _apply_initial_pane_layout(self) -> None:
+        self._apply_layout_sash_positions()
+
+    def _update_launcher_selection_summary(self, *_args: object) -> None:
+        strategy_name = str(self.strategy_name.get() or "").strip() or "未选择策略"
+        symbol = str(self.symbol.get() or "").strip().upper() or "未选择标的"
+        bar = str(self.bar.get() or "").strip() or "-"
+        direction = str(self.signal_mode_label.get() or "").strip() or "-"
+        self.launcher_strategy_title_text.set(strategy_name)
+        self.launcher_selection_summary_text.set(f"{symbol} | 周期 {bar} | 方向 {direction}")
+
+    def _apply_initial_detail_visibility(self) -> None:
+        self._apply_launcher_manual_visibility()
+        self._apply_watch_mode_layout()
+
+    def toggle_launcher_manual_controls(self) -> None:
+        self._launcher_manual_visible = not self._launcher_manual_visible
+        self._apply_launcher_manual_visibility()
+        self._apply_layout_sash_positions()
+
+    def toggle_watch_mode(self) -> None:
+        self._watch_mode_enabled = not self._watch_mode_enabled
+        self._apply_watch_mode_layout()
+        self._apply_layout_sash_positions()
+
+    def _apply_launcher_manual_visibility(self) -> None:
+        launcher_frame = self._launcher_frame
+        start_frame = self._launcher_start_frame
+        info_frame = self._launcher_strategy_info_frame
+        if start_frame is None or info_frame is None:
+            return
+        if self._watch_mode_enabled:
+            start_frame.grid_remove()
+            info_frame.grid_remove()
+            if launcher_frame is not None:
+                launcher_frame.rowconfigure(1, weight=0)
+                launcher_frame.rowconfigure(2, weight=0)
+            self._launcher_manual_toggle_text.set("展开手动参数")
+            return
+        if self._launcher_manual_visible:
+            start_frame.grid()
+            info_frame.grid_remove()
+            if launcher_frame is not None:
+                launcher_frame.rowconfigure(1, weight=1)
+                launcher_frame.rowconfigure(2, weight=0)
+            self._launcher_manual_toggle_text.set("收起手动参数")
+        else:
+            start_frame.grid_remove()
+            info_frame.grid_remove()
+            if launcher_frame is not None:
+                launcher_frame.rowconfigure(1, weight=0)
+                launcher_frame.rowconfigure(2, weight=0)
+            self._launcher_manual_toggle_text.set("展开手动参数")
+
+    def _apply_watch_mode_layout(self) -> None:
+        self._watch_mode_button_text.set("退出盯盘" if self._watch_mode_enabled else "盯盘模式")
+        if self._launcher_compact_frame is not None:
+            if self._watch_mode_enabled:
+                self._launcher_compact_frame.grid_remove()
+            else:
+                self._launcher_compact_frame.grid()
+        if self._launcher_watch_rail_frame is not None:
+            if self._watch_mode_enabled:
+                self._launcher_watch_rail_frame.grid()
+            else:
+                self._launcher_watch_rail_frame.grid_remove()
+        self._apply_launcher_manual_visibility()
+        if self._session_detail_frame is not None:
+            if self._watch_mode_enabled:
+                self._session_detail_frame.grid_remove()
+            else:
+                self._session_detail_frame.grid()
+        if self._positions_table_frame is not None:
+            self._positions_table_frame.grid()
+        if getattr(self, "log_text", None) is not None:
+            try:
+                self.log_text.configure(height=5 if self._watch_mode_enabled else 10)
+            except TclError:
+                pass
+
+    def _apply_layout_sash_positions(self) -> None:
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
         try:
             if self._main_body_pane is not None and self._main_body_pane.winfo_exists():
                 total_width = self._main_body_pane.winfo_width()
                 if total_width > 1200:
-                    self._main_body_pane.sashpos(0, int(total_width * Decimal("0.39")))
+                    if self._watch_mode_enabled:
+                        self._main_body_pane.sashpos(0, 84)
+                    elif self._launcher_manual_visible:
+                        self._main_body_pane.sashpos(0, int(total_width * Decimal("0.30")))
+                    else:
+                        self._main_body_pane.sashpos(0, int(total_width * Decimal("0.16")))
             if self._sessions_pane is not None and self._sessions_pane.winfo_exists():
                 total_height = self._sessions_pane.winfo_height()
                 if total_height > 600:
-                    self._sessions_pane.sashpos(0, int(total_height * Decimal("0.15")))
+                    ratio = Decimal("0.78") if self._watch_mode_enabled else Decimal("0.60")
+                    self._sessions_pane.sashpos(0, int(total_height * ratio))
         except Exception:
             return
-
-    def _apply_initial_detail_visibility(self) -> None:
-        return
 
     def toggle_main_position_detail(self) -> None:
         if self._main_positions_pane is None or self._main_position_detail_frame is None:
