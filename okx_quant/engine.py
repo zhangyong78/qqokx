@@ -909,7 +909,10 @@ class StrategyEngine:
                         dynamic_stop_only=dynamic_stop_only,
                     )
                     active_order = None
-                    idle_signal_candle_ts = None
+                    # After a round-trip closes on the current confirmed candle,
+                    # do not immediately re-place another entry from the same
+                    # candle's reference price. Wait for the next confirmed bar.
+                    idle_signal_candle_ts = newest_ts
                     if self._stop_event.is_set():
                         return
                     self._logger("本轮持仓已结束，继续监控下一次信号。")
@@ -964,7 +967,7 @@ class StrategyEngine:
                         dynamic_stop_only=dynamic_stop_only,
                     )
                     active_order = None
-                    idle_signal_candle_ts = None
+                    idle_signal_candle_ts = newest_ts
                     if self._stop_event.is_set():
                         return
                     self._logger("本轮持仓已结束，继续监控下一次信号。")
@@ -1054,21 +1057,20 @@ class StrategyEngine:
                 self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前无法生成挂单 | {exc}")
                 self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                 continue
-            if startup_gate_message:
-                should_skip_by_stop, stop_crossed_message = self._should_skip_startup_takeover_when_stop_crossed(
-                    startup_gate,
-                    config,
-                    signal=decision.signal,
-                    candle_ts=decision.candle_ts,
-                    trigger_inst_id=plan.inst_id,
-                    stop_loss=plan.stop_loss,
-                )
-                if should_skip_by_stop:
-                    idle_signal_candle_ts = newest_ts
-                    if stop_crossed_message:
-                        self._logger(stop_crossed_message)
-                    self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
-                    continue
+            should_skip_by_stop, stop_crossed_message = self._should_skip_dynamic_entry_when_stop_crossed(
+                config,
+                signal=decision.signal,
+                candle_ts=decision.candle_ts,
+                trigger_inst_id=plan.inst_id,
+                stop_loss=plan.stop_loss,
+                gate_state=startup_gate if startup_gate_message else None,
+            )
+            if should_skip_by_stop:
+                idle_signal_candle_ts = newest_ts
+                if stop_crossed_message:
+                    self._logger(stop_crossed_message)
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
             self._logger(
                 f"{_fmt_ts(plan.candle_ts)} | 准备挂单 | 方向={plan.signal.upper()} | "
                 f"第{current_wave_index}波 | 本波第{entries_in_current_wave + 1}次委托 | "
@@ -2447,6 +2449,7 @@ class StrategyEngine:
             active_trigger = None
             self._monitor_local_exit_v2(credentials, config, trade_instrument, position, protection)
             if not self._stop_event.is_set():
+                idle_signal_candle_ts = newest_ts
                 self._logger("本轮持仓已结束，继续监控下一次信号。")
 
     def _run_dynamic_signal_only_v2(
@@ -4930,6 +4933,43 @@ class StrategyEngine:
         return (
             True,
             f"{_fmt_ts(candle_ts)} | 启动追当前波段已放弃接管 | 方向={signal.upper()} | "
+            f"触发价类型={config.tp_sl_trigger_type} | 当前价={format_decimal(current_price)} | "
+            f"止损={format_decimal(stop_loss)} | 当前价已{relation_text}止损，等待当前波失效后再接管",
+        )
+
+    def _should_skip_dynamic_entry_when_stop_crossed(
+        self,
+        config: StrategyConfig,
+        *,
+        signal: Literal["long", "short"],
+        candle_ts: int,
+        trigger_inst_id: str,
+        stop_loss: Decimal,
+        gate_state: StartupSignalGateState | None = None,
+    ) -> tuple[bool, str | None]:
+        if gate_state is not None:
+            return self._should_skip_startup_takeover_when_stop_crossed(
+                gate_state,
+                config,
+                signal=signal,
+                candle_ts=candle_ts,
+                trigger_inst_id=trigger_inst_id,
+                stop_loss=stop_loss,
+            )
+
+        current_price = self._get_trigger_price_with_retry(
+            trigger_inst_id,
+            config.tp_sl_trigger_type,
+            environment=config.environment,
+        )
+        stop_crossed = current_price <= stop_loss if signal == "long" else current_price >= stop_loss
+        if not stop_crossed:
+            return False, None
+
+        relation_text = "低于等于" if signal == "long" else "高于等于"
+        return (
+            True,
+            f"{_fmt_ts(candle_ts)} | 当前动态挂单已跳过 | 方向={signal.upper()} | "
             f"触发价类型={config.tp_sl_trigger_type} | 当前价={format_decimal(current_price)} | "
             f"止损={format_decimal(stop_loss)} | 当前价已{relation_text}止损，等待当前波失效后再接管",
         )

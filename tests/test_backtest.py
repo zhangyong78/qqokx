@@ -14,6 +14,7 @@ from okx_quant.backtest import (
     BATCH_MAX_ENTRIES_OPTIONS,
     _OpenPosition,
     _create_open_position,
+    _build_closed_trade,
     _build_drawdown_curves,
     _build_equity_curve,
     _combine_direction_filter_bias,
@@ -28,6 +29,7 @@ from okx_quant.backtest import (
     _position_initial_risk_value,
     _backtest_trade_start_index,
     _format_backtest_timestamp,
+    _run_dynamic_backtest,
     _should_require_bearish_reentry_after_dynamic_exit,
     _try_close_position,
     _try_close_position_same_candle_after_fill,
@@ -1204,6 +1206,61 @@ class BacktestTest(TestCase):
         self.assertEqual(position.risk_per_unit, Decimal("10"))
         self.assertEqual(_dynamic_trigger_price(position, 2), Decimal("120.1"))
 
+    def test_dynamic_closed_trade_preserves_wave_entry_sequence(self) -> None:
+        plan = OrderPlan(
+            inst_id="BTC-USDT-SWAP",
+            side="buy",
+            pos_side=None,
+            size=Decimal("1"),
+            take_profit=Decimal("140"),
+            stop_loss=Decimal("90"),
+            entry_reference=Decimal("100"),
+            atr_value=Decimal("10"),
+            signal="long",
+            candle_ts=1,
+        )
+        entry_candle = Candle(
+            1,
+            Decimal("101"),
+            Decimal("102"),
+            Decimal("99"),
+            Decimal("100"),
+            Decimal("1"),
+            True,
+        )
+        exit_candle = Candle(
+            2,
+            Decimal("110"),
+            Decimal("111"),
+            Decimal("109"),
+            Decimal("110"),
+            Decimal("1"),
+            True,
+        )
+
+        position = _try_fill_dynamic_order(
+            self._build_instrument(),
+            plan,
+            entry_candle,
+            0,
+            entry_sequence=7,
+            wave_entry_sequence=2,
+            dynamic_take_profit_enabled=True,
+        )
+
+        self.assertIsNotNone(position)
+        assert position is not None
+        trade = _build_closed_trade(
+            position,
+            exit_candle,
+            1,
+            exit_price_raw=Decimal("110"),
+            exit_price=Decimal("110"),
+            exit_reason="take_profit",
+        )
+        self.assertEqual(trade.entry_sequence, 7)
+        self.assertEqual(trade.wave_entry_sequence, 2)
+
     def test_dynamic_limit_fill_at_open_uses_open_price_and_taker_fee_for_long(self) -> None:
         plan = OrderPlan(
             inst_id="BTC-USDT-SWAP",
@@ -2008,6 +2065,141 @@ class BacktestTest(TestCase):
         self.assertEqual(trade.signal, "long")
         self.assertEqual(trade.entry_price, Decimal("61566.6"))
         self.assertEqual(trade.entry_fee_type, "taker")
+
+    def test_run_dynamic_backtest_waits_next_candle_after_same_candle_close_before_new_plan(self) -> None:
+        candles = [
+            Candle(
+                1711929600000 + (index * 3600000),
+                Decimal("100"),
+                Decimal("101"),
+                Decimal("99"),
+                Decimal("100"),
+                Decimal("1"),
+                True,
+            )
+            for index in range(204)
+        ]
+        instrument = self._build_instrument()
+        config = replace(
+            self._build_config(),
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            signal_mode="long_only",
+            max_entries_per_trend=2,
+        )
+        plan_candle_ts: list[int] = []
+        closed_once = False
+
+        def fake_decision(  # noqa: ANN202
+            candles: list[Candle],
+            index: int,
+            ema_values: list[Decimal | None],
+            entry_reference_ema_values: list[Decimal | None],
+            trend_ema_values: list[Decimal | None],
+            atr_values: list[Decimal | None],
+            config: StrategyConfig,
+        ) -> SignalDecision:
+            return SignalDecision(
+                signal="long",
+                reason="mock_signal",
+                candle_ts=candles[index].ts,
+                entry_reference=Decimal("100"),
+                atr_value=Decimal("1"),
+                ema_value=Decimal("100"),
+            )
+
+        def fake_build_plan(**kwargs) -> OrderPlan:  # noqa: ANN003, ANN202
+            plan_candle_ts.append(kwargs["candle_ts"])
+            return OrderPlan(
+                inst_id=instrument.inst_id,
+                side="buy",
+                pos_side="long",
+                size=Decimal("1"),
+                take_profit=Decimal("104"),
+                stop_loss=Decimal("98"),
+                entry_reference=kwargs["entry_reference"],
+                atr_value=kwargs["atr_value"],
+                signal=kwargs["signal"],
+                candle_ts=kwargs["candle_ts"],
+            )
+
+        def fake_fill(  # noqa: ANN202
+            instrument: Instrument,
+            order_plan: OrderPlan,
+            candle: Candle,
+            index: int,
+            **kwargs,
+        ) -> _OpenPosition:
+            return _create_open_position(
+                instrument=instrument,
+                signal=order_plan.signal,
+                entry_index=index,
+                entry_ts=candle.ts,
+                entry_price_raw=order_plan.entry_reference,
+                stop_loss=order_plan.stop_loss,
+                take_profit=order_plan.take_profit,
+                atr_value=order_plan.atr_value,
+                size=order_plan.size,
+                entry_fee_rate=Decimal("0"),
+                exit_fee_rate=Decimal("0"),
+                entry_fee_type="maker",
+                entry_slippage_rate=Decimal("0"),
+                exit_slippage_rate=Decimal("0"),
+                funding_rate=Decimal("0"),
+                entry_sequence=kwargs["entry_sequence"],
+            )
+
+        def fake_same_candle_close(  # noqa: ANN202
+            position: _OpenPosition,
+            candle: Candle,
+            candle_index: int,
+            *,
+            exit_fee_rate: Decimal = Decimal("0"),
+            exit_fee_type: str = "none",
+        ) -> BacktestTrade | None:
+            nonlocal closed_once
+            if closed_once:
+                return None
+            closed_once = True
+            return BacktestTrade(
+                signal=position.signal,
+                entry_index=position.entry_index,
+                exit_index=candle_index,
+                entry_ts=position.entry_ts,
+                exit_ts=candle.ts,
+                entry_price=position.entry_price,
+                exit_price=position.stop_loss,
+                stop_loss=position.stop_loss,
+                take_profit=position.take_profit,
+                size=position.size,
+                gross_pnl=Decimal("-2"),
+                pnl=Decimal("-2"),
+                risk_value=Decimal("2"),
+                r_multiple=Decimal("-1"),
+                exit_reason="stop_loss",
+                atr_value=position.atr_value,
+                entry_sequence=position.entry_sequence,
+            )
+
+        with (
+            patch("okx_quant.backtest._evaluate_dynamic_signal_precomputed", side_effect=fake_decision),
+            patch("okx_quant.backtest._build_backtest_order_plan", side_effect=fake_build_plan),
+            patch("okx_quant.backtest._try_fill_dynamic_order", side_effect=fake_fill),
+            patch("okx_quant.backtest._try_close_position", return_value=None),
+            patch(
+                "okx_quant.backtest._try_close_position_same_candle_after_fill",
+                side_effect=fake_same_candle_close,
+            ),
+        ):
+            trades, _ = _run_dynamic_backtest(candles, instrument, config)
+
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(
+            plan_candle_ts,
+            [
+                candles[BACKTEST_RESERVED_CANDLES].ts,
+                candles[BACKTEST_RESERVED_CANDLES + 2].ts,
+            ],
+        )
 
     def test_cross_backtest_generates_trade_and_report(self) -> None:
         warmup_candles = [

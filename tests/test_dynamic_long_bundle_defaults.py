@@ -1,7 +1,9 @@
+from dataclasses import asdict
 from unittest import TestCase
 
 from scripts.build_best_parameter_bundle import build_specs
 from scripts.build_five_coin_daily_filter_operation_pack import build_ready_specs
+from scripts.run_best_parameter_bundle_1h_standard_portfolio import deserialize_strategy_config
 
 
 class DynamicLongBundleDefaultsTest(TestCase):
@@ -19,6 +21,15 @@ class DynamicLongBundleDefaultsTest(TestCase):
         self.assertEqual(config.dynamic_first_lock_r, 1)
         self.assertEqual(config.max_entries_per_trend, 3)
         self.assertEqual(config.resolved_dynamic_protection_rules()[2].lock_r, 10)
+
+    def test_standard_report_deserialize_preserves_dynamic_protection_rules(self) -> None:
+        spec = next(item for item in build_specs() if item.profile_id == "dynamic_long_best_btc_v2")
+        restored = deserialize_strategy_config(asdict(spec.config))
+        rules = restored.resolved_dynamic_protection_rules()
+
+        self.assertEqual([rule.trigger_r for rule in rules], [1, 4, 11])
+        self.assertEqual(rules[1].lock_r, 1)
+        self.assertEqual(rules[2].lock_r, 10)
 
     def test_best_parameter_bundle_syncs_sol_final_long_profile(self) -> None:
         spec = next(item for item in build_specs() if item.profile_id == "dynamic_long_best_sol_v2")

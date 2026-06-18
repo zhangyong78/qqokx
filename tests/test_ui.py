@@ -3239,6 +3239,55 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(session.active_trade.pending_stop_price, Decimal("2320.66"))
         self.assertEqual(session.active_trade.size, Decimal("0.1"))
 
+    def test_track_session_trade_runtime_clears_unsubmitted_trade_after_stop_reason(self) -> None:
+        session = self._make_session()
+        app = self._make_app_for_tracking()
+
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "2026-04-23 08:00:00 | 准备挂单 | 方向=LONG | 开仓价=2358.42 | 数量=0.1 | 止损=2320.66",
+        )
+        self.assertIsNotNone(session.active_trade)
+
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "策略停止，原因：OKX 动态限价挂单被交易所拒绝 | 标的=ETH-USDT-SWAP | clOrdId=s01emaent042300000897343",
+        )
+
+        self.assertIsNone(session.active_trade)
+
+    def test_track_session_trade_runtime_clears_local_trade_after_terminal_message(self) -> None:
+        session = self._make_session()
+        session.config.tp_sl_mode = "local_trade"
+        app = self._make_app_for_tracking()
+
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "2026-04-23 08:00:00 | 准备本地下单 | 信号方向=SHORT | 实际下单方向=SELL | 下单标的=ETH-USDT-SWAP | 预估入场价=2358.42 | 数量=0.1张（折合0.1 ETH）",
+        )
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "本地下单成交 | ordId=1001 | 标的=ETH-USDT-SWAP | 方向=SELL | 成交均价=2358.42 | 成交数量=0.1张（折合0.1 ETH）",
+        )
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "开始本地止盈止损监控 | 触发标的=ETH-USDT-SWAP | 触发价格类型=mark | 止损=2368.42 | 止盈=2338.42",
+        )
+        self.assertIsNotNone(session.active_trade)
+
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "本次本地止盈止损流程已结束。",
+        )
+
+        self.assertIsNone(session.active_trade)
+
     def test_track_session_trade_runtime_starts_reconciliation_when_dynamic_stop_monitor_ends_without_position(self) -> None:
         session = self._make_session()
         app = self._make_app_for_tracking()
@@ -3292,6 +3341,20 @@ class StrategyTradeTrackingTest(TestCase):
         session.last_message = (
             "监控的止损算法单已不在挂单列表，且持仓张数已减少 7.77（基准 14.17 → 当前 6.4），"
             "推断该止损已触发，结束 OKX 动态止损监控。"
+        )
+
+        self.assertFalse(QuantApp._session_should_transition_to_recoverable(session))
+
+    def test_session_should_not_transition_to_recoverable_after_pre_submit_failure(self) -> None:
+        session = self._make_session()
+        session.last_message = "策略停止，原因：OKX 动态限价挂单被交易所拒绝"
+        session.active_trade = StrategyTradeRuntimeState(
+            round_id="S01-1",
+            pending_entry_reference=Decimal("2358.42"),
+            pending_stop_price=Decimal("2320.66"),
+            size=Decimal("0.1"),
+            pending_side="buy",
+            pending_signal="long",
         )
 
         self.assertFalse(QuantApp._session_should_transition_to_recoverable(session))
@@ -6154,10 +6217,12 @@ class SelectedSessionDetailRefreshTest(TestCase):
 
         QuantApp._apply_layout_sash_positions(app)
         self.assertEqual(main_pane.sash_positions[0], int(1600 * 0.16))
+        self.assertEqual(sessions_pane.sash_positions[0], int(900 * 0.67))
 
         app._launcher_manual_visible = True
         QuantApp._apply_layout_sash_positions(app)
         self.assertEqual(main_pane.sash_positions[0], int(1600 * 0.30))
+        self.assertEqual(sessions_pane.sash_positions[0], int(900 * 0.67))
 
     def test_set_readonly_text_preserves_scroll_when_requested(self) -> None:
         class _FakeText:

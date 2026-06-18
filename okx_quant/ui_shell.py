@@ -4261,27 +4261,22 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         header = ttk.Frame(self.root, padding=(12, 12, 12, 6))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        header.columnconfigure(1, weight=1)
+        header.columnconfigure(1, weight=0)
 
         ttk.Label(
             header,
             text="OKX 多策略工作台",
-            font=("Microsoft YaHei UI", 17, "bold"),
+            font=("Microsoft YaHei UI", 12, "bold"),
         ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            header,
-            textvariable=self.status_text,
-            font=("Microsoft YaHei UI", 10, "bold"),
-        ).grid(row=0, column=1, sticky="e")
         summary_row = ttk.Frame(header)
-        summary_row.grid(row=1, column=1, sticky="e", pady=(6, 0))
+        summary_row.grid(row=0, column=1, sticky="e")
         ttk.Label(summary_row, text="API").grid(row=0, column=0, sticky="e")
         self._header_credential_profile_combo = ttk.Combobox(
             summary_row,
             textvariable=self.api_profile_name,
             values=self._credential_profile_names(),
             state="readonly",
-            width=10,
+            width=8,
         )
         self._header_credential_profile_combo.grid(row=0, column=1, sticky="e", padx=(4, 8))
         self._header_credential_profile_combo.bind("<<ComboboxSelected>>", self._on_api_profile_selected)
@@ -4289,8 +4284,14 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             summary_row,
             textvariable=self.settings_summary_text,
             justify="right",
-            wraplength=540,
+            wraplength=460,
+            font=("Microsoft YaHei UI", 8),
         ).grid(row=0, column=2, sticky="e")
+        ttk.Label(
+            summary_row,
+            textvariable=self.status_text,
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).grid(row=0, column=3, sticky="e", padx=(12, 0))
 
         body = ttk.Panedwindow(self.root, orient="horizontal")
         body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 10))
@@ -5000,9 +5001,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         session_top_frame = ttk.Frame(sessions_pane)
         session_top_frame.columnconfigure(0, weight=1)
-        session_top_frame.rowconfigure(0, weight=8)
+        session_top_frame.rowconfigure(0, weight=6)
         session_top_frame.rowconfigure(1, weight=1)
-        sessions_pane.add(session_top_frame, weight=5)
+        sessions_pane.add(session_top_frame, weight=2)
 
         running_frame = ttk.LabelFrame(session_top_frame, text="运行中策略", padding=10)
         running_frame.grid(row=0, column=0, sticky="nsew")
@@ -5162,7 +5163,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         positions_frame = ttk.LabelFrame(sessions_pane, text="账户持仓", padding=(5, 4))
         positions_frame.columnconfigure(0, weight=1)
         positions_frame.rowconfigure(2, weight=1)
-        sessions_pane.add(positions_frame, weight=4)
+        sessions_pane.add(positions_frame, weight=1)
         self._positions_frame = positions_frame
 
         header_row = ttk.Frame(positions_frame)
@@ -5325,7 +5326,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.position_tree.column("avg", width=108, anchor="e")
         self.position_tree.column("avg_usdt", width=54, anchor="e")
         self.position_tree.column("open_value_usdt", width=96, anchor="e")
-        self.position_tree.column("pos", width=110, anchor="e")
+        self.position_tree.column("pos", width=170, anchor="e")
         self.position_tree.column("option_side", width=170, anchor="center")
         self.position_tree.column("upl", width=210, anchor="e")
         self.position_tree.column("upl_usdt", width=105, anchor="e")
@@ -5540,8 +5541,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             if self._sessions_pane is not None and self._sessions_pane.winfo_exists():
                 total_height = self._sessions_pane.winfo_height()
                 if total_height > 600:
-                    ratio = Decimal("0.78") if self._watch_mode_enabled else Decimal("0.60")
-                    self._sessions_pane.sashpos(0, int(total_height * ratio))
+                    self._sessions_pane.sashpos(0, int(total_height * Decimal("0.67")))
         except Exception:
             return
 

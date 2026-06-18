@@ -113,6 +113,7 @@ class BacktestTrade:
     exit_reason: str
     atr_value: Decimal = Decimal("0")
     entry_sequence: int = 0
+    wave_entry_sequence: int = 0
     entry_fee: Decimal = Decimal("0")
     exit_fee: Decimal = Decimal("0")
     total_fee: Decimal = Decimal("0")
@@ -354,6 +355,7 @@ class _OpenPosition:
     risk_per_unit: Decimal = Decimal("0")
     tick_size: Decimal = Decimal("0.1")
     entry_sequence: int = 0
+    wave_entry_sequence: int = 0
     dynamic_take_profit_enabled: bool = False
     take_profit_enabled: bool = True
     next_dynamic_trigger_r: int = 2
@@ -2743,6 +2745,7 @@ def _run_adaptive_rail_backtest(
                 exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
                 funding_rate=config.backtest_funding_rate,
                 entry_sequence=entry_sequence + 1,
+                wave_entry_sequence=entries_on_current_rail + 1,
                 dynamic_take_profit_enabled=dynamic_take_profit_enabled,
                 dynamic_exit_fee_rate=taker_fee_rate,
                 dynamic_two_r_break_even=config.dynamic_two_r_break_even,
@@ -2964,6 +2967,7 @@ def _run_dynamic_backtest(
 
     for index in range(trade_start_index, len(candles)):
         candle = candles[index]
+        closed_round_this_candle = False
 
         if open_position is not None:
             trend_ema = trend_ema_values[index] if index < len(trend_ema_values) else None
@@ -2977,6 +2981,7 @@ def _run_dynamic_backtest(
             if closed_trade is not None:
                 trades.append(closed_trade)
                 open_position = None
+                closed_round_this_candle = True
             elif (
                 bool(config.trend_ema_close_exit_after_trigger_r_enabled)
                 and open_position.signal == "long"
@@ -3005,6 +3010,7 @@ def _run_dynamic_backtest(
                     )
                 )
                 open_position = None
+                closed_round_this_candle = True
 
         if active_plan is not None and open_position is None:
             filled_position = _try_fill_dynamic_order(
@@ -3018,6 +3024,7 @@ def _run_dynamic_backtest(
                 exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
                 funding_rate=config.backtest_funding_rate,
                 entry_sequence=entry_sequence + 1,
+                wave_entry_sequence=entries_in_current_wave + 1,
                 dynamic_take_profit_enabled=dynamic_take_profit_enabled,
                 dynamic_exit_fee_rate=taker_fee_rate,
                 dynamic_two_r_break_even=config.dynamic_two_r_break_even,
@@ -3046,10 +3053,11 @@ def _run_dynamic_backtest(
                 )
                 if closed_trade is not None:
                     trades.append(closed_trade)
+                    closed_round_this_candle = True
                 else:
                     open_position = filled_position
 
-        if open_position is not None or index >= len(candles) - 1:
+        if open_position is not None or closed_round_this_candle or index >= len(candles) - 1:
             continue
 
         decision = _evaluate_dynamic_signal_precomputed(
@@ -3530,6 +3538,7 @@ def _create_open_position(
     exit_slippage_rate: Decimal,
     funding_rate: Decimal,
     entry_sequence: int = 0,
+    wave_entry_sequence: int = 0,
     dynamic_take_profit_enabled: bool = False,
     take_profit_enabled: bool = True,
     dynamic_exit_fee_rate: Decimal = Decimal("0"),
@@ -3585,6 +3594,7 @@ def _create_open_position(
         risk_per_unit=risk_per_unit,
         tick_size=instrument.tick_size,
         entry_sequence=entry_sequence,
+        wave_entry_sequence=wave_entry_sequence,
         dynamic_take_profit_enabled=dynamic_take_profit_enabled,
         take_profit_enabled=take_profit_enabled,
         next_dynamic_trigger_r=next_dynamic_trigger_r,
@@ -3775,6 +3785,7 @@ def _try_fill_dynamic_order(
     exit_slippage_rate: Decimal = Decimal("0"),
     funding_rate: Decimal = Decimal("0"),
     entry_sequence: int = 0,
+    wave_entry_sequence: int = 0,
     dynamic_take_profit_enabled: bool = False,
     dynamic_exit_fee_rate: Decimal = Decimal("0"),
     dynamic_two_r_break_even: bool = False,
@@ -3830,6 +3841,7 @@ def _try_fill_dynamic_order(
         exit_slippage_rate=exit_slippage_rate,
         funding_rate=funding_rate,
         entry_sequence=entry_sequence,
+        wave_entry_sequence=wave_entry_sequence,
         dynamic_take_profit_enabled=dynamic_take_profit_enabled,
         dynamic_exit_fee_rate=dynamic_exit_fee_rate,
         dynamic_two_r_break_even=dynamic_two_r_break_even,
@@ -4314,6 +4326,7 @@ def _build_closed_trade(
         exit_reason=exit_reason,
         atr_value=position.atr_value,
         entry_sequence=position.entry_sequence,
+        wave_entry_sequence=position.wave_entry_sequence,
         entry_fee=entry_fee,
         exit_fee=exit_fee,
         total_fee=total_fee,

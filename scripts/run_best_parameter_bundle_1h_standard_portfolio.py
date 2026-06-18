@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
 
 from okx_quant.backtest import BacktestTrade, _run_backtest_with_loaded_data, format_trade_exit_reason
 from okx_quant.candle_cache import load_candle_cache
-from okx_quant.models import StrategyConfig
+from okx_quant.models import StrategyConfig, normalize_dynamic_protection_rules
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import analysis_report_dir_path
 from okx_quant.strategy_profiles import read_strategy_bundle
@@ -93,6 +93,7 @@ class CandidateTrade:
     data_end_ts: int
     candle_count: int
     fee_model: str
+    wave_entry_sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,7 @@ class ExecutedTrade:
     fee_model: str
     capital_before_entry: Decimal
     capital_after_exit: Decimal
+    wave_entry_sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -346,6 +348,7 @@ def build_candidate_trades(
                     data_end_ts=candles[-1].ts,
                     candle_count=len(candles),
                     fee_model=fee_model,
+                    wave_entry_sequence=int(trade.wave_entry_sequence),
                 )
             )
     assumptions = {
@@ -431,7 +434,12 @@ def deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         take_profit_mode=str(payload.get("take_profit_mode", "dynamic")),
         max_entries_per_trend=int(payload.get("max_entries_per_trend", 1)),
         dynamic_two_r_break_even=bool(payload.get("dynamic_two_r_break_even", True)),
+        dynamic_break_even_trigger_r=int(payload.get("dynamic_break_even_trigger_r", 2)),
         dynamic_fee_offset_enabled=bool(payload.get("dynamic_fee_offset_enabled", True)),
+        dynamic_protection_rules=normalize_dynamic_protection_rules(payload.get("dynamic_protection_rules")),
+        ema55_slope_lock_profit_trigger_r=int(payload.get("ema55_slope_lock_profit_trigger_r", 5)),
+        dynamic_first_lock_r=int(payload.get("dynamic_first_lock_r", 0)),
+        dynamic_trailing_step_r=int(payload.get("dynamic_trailing_step_r", 1)),
         trend_ema_slope_filter_enabled=coerce_bool(payload.get("trend_ema_slope_filter_enabled"), True),
         ema55_slope_exit_enabled=coerce_bool(payload.get("ema55_slope_exit_enabled"), True),
         ema55_slope_same_bar_reentry_block=coerce_bool(payload.get("ema55_slope_same_bar_reentry_block"), False),
@@ -581,6 +589,7 @@ def simulate_portfolio(
                 fee_model=position["fee_model"],
                 capital_before_entry=position["capital_before_entry"],
                 capital_after_exit=equity,
+                wave_entry_sequence=int(position.get("wave_entry_sequence", 0)),
             )
             executed.append(trade)
             open_positions.remove(position)
@@ -698,6 +707,7 @@ def simulate_portfolio(
                 "exit_reason_label": candidate.exit_reason_label,
                 "fee_model": candidate.fee_model,
                 "capital_before_entry": equity,
+                "wave_entry_sequence": candidate.wave_entry_sequence,
             }
         )
 
@@ -744,6 +754,7 @@ def build_executed_trade_frame(executed_trades: list[ExecutedTrade]) -> pd.DataF
                 "strategy_name": trade.strategy_name,
                 "strategy_id": trade.strategy_id,
                 "side": trade.side,
+                "wave_entry_sequence": int(trade.wave_entry_sequence),
                 "entry_ts": trade.entry_ts,
                 "entry_time_bjt": entry_dt.strftime("%Y-%m-%d %H:%M:%S"),
                 "entry_price": float(trade.entry_price),
@@ -778,6 +789,7 @@ def build_executed_trade_frame(executed_trades: list[ExecutedTrade]) -> pd.DataF
                 "strategy_name",
                 "strategy_id",
                 "side",
+                "wave_entry_sequence",
                 "entry_ts",
                 "entry_time_bjt",
                 "entry_price",
@@ -809,13 +821,14 @@ def build_executed_trade_frame(executed_trades: list[ExecutedTrade]) -> pd.DataF
 def build_trades_export(executed_df: pd.DataFrame) -> pd.DataFrame:
     if executed_df.empty:
         return pd.DataFrame(
-            columns=["编号", "币种", "策略", "方向", "开仓时间", "开仓价", "平仓时间", "平仓价", "盈亏", "收益率", "R倍数", "平仓原因"]
+            columns=["编号", "币种", "策略", "方向", "本波第几次", "开仓时间", "开仓价", "平仓时间", "平仓价", "盈亏", "收益率", "R倍数", "平仓原因"]
         )
     out = executed_df.copy()
     out["编号"] = out["trade_no"]
     out["币种"] = out["coin"]
     out["策略"] = out["strategy_name"]
     out["方向"] = out["side"]
+    out["本波第几次"] = out["wave_entry_sequence"].fillna(0).astype(int)
     out["开仓时间"] = out["entry_time_bjt"]
     out["开仓价"] = out["entry_price"].map(lambda value: round(float(value), 8))
     out["平仓时间"] = out["exit_time_bjt"]
@@ -838,6 +851,7 @@ def build_trades_export(executed_df: pd.DataFrame) -> pd.DataFrame:
             "币种",
             "策略",
             "方向",
+            "本波第几次",
             "开仓时间",
             "开仓价",
             "平仓时间",

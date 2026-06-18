@@ -8148,7 +8148,34 @@ class UiStrategySessionsMixin:
             return False
         if not QuantApp._strategy_session_supports_position_recovery(session.config):
             return False
+        if not QuantApp._session_trade_has_recoverable_state(trade):
+            return False
         last_message = str(getattr(session, "last_message", "") or "").strip()
+        if QuantApp._session_message_marks_trade_terminal(last_message):
+            return False
+        return True
+
+    @staticmethod
+    def _session_trade_has_recoverable_state(trade: StrategyTradeRuntimeState | None) -> bool:
+        if trade is None or trade.reconciliation_started:
+            return False
+        if trade.opened_logged_at is not None:
+            return True
+        return any(
+            str(value or "").strip()
+            for value in (
+                trade.entry_order_id,
+                trade.entry_client_order_id,
+                trade.protective_algo_id,
+                trade.protective_algo_cl_ord_id,
+            )
+        )
+
+    @staticmethod
+    def _session_message_marks_trade_terminal(message: str) -> bool:
+        text = str(message or "").strip()
+        if not text:
+            return False
         terminal_markers = (
             "未检测到策略持仓，OKX 动态止损监控结束。",
             "未检测到策略持仓，交易员虚拟止损监控结束。",
@@ -8156,10 +8183,9 @@ class UiStrategySessionsMixin:
             "未再检测到策略持仓，视为本轮 OKX 托管持仓已结束。",
             "推断该止损已触发，结束 OKX 动态止损监控。",
             "本轮持仓已结束，继续监控下一次信号。",
+            "本次本地止盈止损流程已结束。",
         )
-        if any(marker in last_message for marker in terminal_markers):
-            return False
-        return True
+        return any(marker in text for marker in terminal_markers)
 
     def _track_session_trade_runtime_with_observed_at(
         self,
@@ -8191,11 +8217,48 @@ class UiStrategySessionsMixin:
                     trade.pending_signal = direction_norm
                     trade.pending_side = "buy" if direction_norm == "long" else "sell"
             return
+        if "准备本地下单" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            entry_reference = _extract_log_field_decimal(message, "预估入场价")
+            if entry_reference is not None:
+                trade.pending_entry_reference = entry_reference
+            size = _extract_log_field_decimal(message, "数量")
+            if size is not None:
+                trade.size = size
+            signal_direction = _extract_log_field(message, "信号方向")
+            if signal_direction:
+                direction_norm = signal_direction.strip().lower()
+                if direction_norm in {"long", "short"}:
+                    trade.pending_signal = direction_norm
+            actual_side = _extract_log_field(message, "实际下单方向")
+            if actual_side:
+                side_norm = actual_side.strip().lower()
+                if side_norm in {"buy", "sell"}:
+                    trade.pending_side = side_norm
+                    if not trade.pending_signal:
+                        trade.pending_signal = "long" if side_norm == "buy" else "short"
+            return
         if "挂单已提交到 OKX" in message:
             trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
             entry_order_id = _extract_log_field(message, "ordId")
             if entry_order_id:
                 trade.entry_order_id = entry_order_id
+            return
+        if "本地下单成交" in message:
+            trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
+            trade.opened_logged_at = observed_at
+            entry_order_id = _extract_log_field(message, "ordId")
+            if entry_order_id:
+                trade.entry_order_id = entry_order_id
+            entry_price = _extract_log_field_decimal(message, "成交均价")
+            if entry_price is not None:
+                trade.entry_price = entry_price
+            size = _extract_log_field_decimal(message, "成交数量")
+            if size is not None:
+                trade.size = size
+            if trade.pending_entry_reference is None and entry_price is not None:
+                trade.pending_entry_reference = entry_price
+            QuantApp._trader_desk_sync_open_trade_state(self, session)
             return
         if "委托追踪" in message:
             trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)
@@ -8258,6 +8321,16 @@ class UiStrategySessionsMixin:
                     trade.initial_stop_price = stop_price
                 trade.current_stop_price = stop_price
             return
+        if "开始本地止盈止损监控" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            stop_price = _extract_log_field_decimal(message, "止损")
+            if stop_price is not None:
+                if trade.initial_stop_price is None:
+                    trade.initial_stop_price = stop_price
+                trade.current_stop_price = stop_price
+            return
         if "OKX 动态止损已上移" in message:
             trade = session.active_trade
             if trade is None:
@@ -8265,6 +8338,12 @@ class UiStrategySessionsMixin:
             new_stop = _extract_log_field_decimal(message, "新止损") or _extract_log_field_decimal(message, "止损")
             if new_stop is not None:
                 trade.current_stop_price = new_stop
+            return
+        if "策略停止，原因：" in message:
+            trade = session.active_trade
+            if trade is not None and not QuantApp._session_trade_has_recoverable_state(trade):
+                self._clear_session_manual_management_state(session)
+                session.active_trade = None
             return
         if "本轮持仓已结束，继续监控下一次信号。" in message:
             trade = session.active_trade
@@ -8276,6 +8355,11 @@ class UiStrategySessionsMixin:
                 return
             trade.reconciliation_started = True
             self._start_session_trade_reconciliation(session, trade)
+            return
+        if "本次本地止盈止损流程已结束。" in message:
+            if session.active_trade is not None:
+                self._clear_session_manual_management_state(session)
+                session.active_trade = None
             return
         if (
             "未检测到策略持仓，OKX 动态止损监控结束。" in message

@@ -1476,6 +1476,84 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(submit_calls["count"], 0)
         self.assertTrue(any("当前价已低于等于止损" in message for message in messages))
 
+    def test_dynamic_exchange_strategy_skips_fresh_order_when_current_price_crosses_stop(self) -> None:
+        messages: list[str] = []
+        submit_calls = {"count": 0}
+        candles = self._make_candles([str(2000 + index) for index in range(80)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, _timeout: float) -> bool:
+                self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            object(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托做多",
+            session_id="S-dyn-stop-cross",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._get_trigger_price_with_retry = lambda *args, **kwargs: Decimal("2279")  # type: ignore[assignment]
+        engine._submit_dynamic_limit_entry_order = lambda *_args, **_kwargs: submit_calls.__setitem__("count", submit_calls["count"] + 1)  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            risk_amount=Decimal("10"),
+            take_profit_mode="dynamic",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
+            return SignalDecision(
+                signal="long",
+                reason="趋势成立",
+                candle_ts=_candles[-1].ts,
+                entry_reference=Decimal("2300"),
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2310"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=0.0), patch(
+            "okx_quant.engine.EmaDynamicOrderStrategy.evaluate",
+            new=_fake_evaluate,
+        ):
+            engine._run_dynamic_exchange_strategy(None, config, instrument)  # type: ignore[arg-type]
+
+        self.assertEqual(submit_calls["count"], 0)
+        self.assertTrue(any("当前动态挂单已跳过" in message for message in messages))
+        self.assertTrue(any("当前价已低于等于止损" in message for message in messages))
+
     def test_dynamic_exchange_strategy_continues_after_round_trip_and_respects_wave_limit(self) -> None:
         messages: list[str] = []
         waits: list[float] = []
@@ -1512,6 +1590,7 @@ class StrategyEngineTest(TestCase):
         engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
         engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
         engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._get_trigger_price_with_retry = lambda *args, **kwargs: Decimal("2305")  # type: ignore[assignment]
         engine._monitor_exchange_managed_position_until_closed = lambda *args, **kwargs: None  # type: ignore[assignment]
 
         def _fake_submit(*_args, **_kwargs) -> OkxOrderResult:  # noqa: ANN001
@@ -1585,7 +1664,118 @@ class StrategyEngineTest(TestCase):
 
         self.assertEqual(submit_calls["count"], 1)
         self.assertTrue(any("本轮持仓已结束，继续监控下一次信号" in message for message in messages))
-        self.assertTrue(any("第1波趋势开仓次数已达上限" in message for message in messages))
+        self.assertFalse(any("第1波趋势开仓次数已达上限" in message for message in messages))
+
+    def test_dynamic_exchange_strategy_waits_next_candle_before_second_entry_in_same_wave(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+        submit_calls = {"count": 0}
+        evaluate_calls = 0
+        candles = self._make_candles([str(2000 + index) for index in range(80)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+                self._wait_calls = 0
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, timeout: float) -> bool:
+                waits.append(timeout)
+                self._wait_calls += 1
+                if self._wait_calls >= 2:
+                    self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._get_trigger_price_with_retry = lambda *args, **kwargs: Decimal("2305")  # type: ignore[assignment]
+        engine._monitor_exchange_managed_position_until_closed = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+        def _fake_submit(*_args, **_kwargs) -> OkxOrderResult:  # noqa: ANN001
+            submit_calls["count"] += 1
+            return OkxOrderResult(
+                ord_id="ord-live-1",
+                cl_ord_id="cl-live-1",
+                s_code="0",
+                s_msg="accepted",
+                raw={},
+            )
+
+        engine._submit_order_with_recovery = _fake_submit  # type: ignore[assignment]
+        engine._get_order_with_retry = lambda *args, **kwargs: OkxOrderStatus(  # type: ignore[assignment]
+            ord_id="ord-live-1",
+            state="filled",
+            side="buy",
+            ord_type="limit",
+            price=Decimal("2300"),
+            avg_price=Decimal("2299"),
+            size=Decimal("0.01"),
+            filled_size=Decimal("0.01"),
+            raw={},
+        )
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            risk_amount=Decimal("10"),
+            max_entries_per_trend=2,
+            take_profit_mode="fixed",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
+            nonlocal evaluate_calls
+            evaluate_calls += 1
+            return SignalDecision(
+                signal="long",
+                reason="趋势成立",
+                candle_ts=_candles[-1].ts,
+                entry_reference=Decimal("2300"),
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2310"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=0.0), patch(
+            "okx_quant.engine.EmaDynamicOrderStrategy.evaluate",
+            new=_fake_evaluate,
+        ):
+            engine._run_dynamic_exchange_strategy(None, config, instrument)  # type: ignore[arg-type]
+
+        self.assertEqual(submit_calls["count"], 1)
+        self.assertEqual(evaluate_calls, 1)
+        self.assertEqual(waits, [10, 60.0])
+        self.assertFalse(any("第1波趋势开仓次数已达上限" in message for message in messages))
 
     def test_dynamic_exchange_strategy_transfers_to_position_monitor_when_cancel_lookup_finds_fill(self) -> None:
         messages: list[str] = []
@@ -1636,6 +1826,7 @@ class StrategyEngineTest(TestCase):
 
         candle_batches = iter([first_candles, second_candles])
         engine._get_candles_with_retry = lambda *args, **kwargs: next(candle_batches)  # type: ignore[assignment]
+        engine._get_trigger_price_with_retry = lambda *args, **kwargs: Decimal("2305")  # type: ignore[assignment]
         engine._get_order_with_retry = lambda *args, **kwargs: OkxOrderStatus(  # type: ignore[assignment]
             ord_id="ord-live-2",
             state="live",
@@ -2297,6 +2488,7 @@ class StrategyEngineTest(TestCase):
         engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
         engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
         engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._get_trigger_price_with_retry = lambda *args, **kwargs: Decimal("2305")  # type: ignore[assignment]
         engine._monitor_exchange_managed_position_until_closed = lambda *args, **kwargs: None  # type: ignore[assignment]
 
         def _fake_submit(*_args, **_kwargs) -> OkxOrderResult:  # noqa: ANN001
@@ -2542,6 +2734,115 @@ class StrategyEngineTest(TestCase):
 
         self.assertEqual(evaluate_calls, 1)
         self.assertEqual(sum("当前无法生成动态开仓价" in message for message in messages), 1)
+        self.assertEqual(waits, [60.0, 60.0])
+
+    def test_dynamic_local_strategy_v2_waits_next_candle_before_second_entry_in_same_wave(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+        evaluate_calls = 0
+        open_calls = {"count": 0}
+        candles = self._make_candles([str(2000 + index) for index in range(80)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+                self._wait_calls = 0
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, timeout: float) -> bool:
+                waits.append(timeout)
+                self._wait_calls += 1
+                if self._wait_calls >= 2:
+                    self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S01",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_local_mode_summary = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._get_trigger_price_with_retry = lambda *args, **kwargs: Decimal("2299")  # type: ignore[assignment]
+        engine._build_local_protection_plan = lambda *args, **kwargs: object()  # type: ignore[assignment]
+        engine._monitor_local_exit_v2 = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+        def _fake_open_local_position(*_args, **_kwargs) -> FilledPosition:  # noqa: ANN001
+            open_calls["count"] += 1
+            return FilledPosition(
+                ord_id="ord-local-1",
+                cl_ord_id="cl-local-1",
+                inst_id="ETH-USDT-SWAP",
+                side="buy",
+                close_side="sell",
+                pos_side="long",
+                size=Decimal("0.01"),
+                entry_price=Decimal("2300"),
+                entry_ts=1_000,
+            )
+
+        engine._open_local_position = _fake_open_local_position  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            risk_amount=Decimal("10"),
+            max_entries_per_trend=2,
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        def _fake_evaluate(_strategy, _candles, _config, **_kw):  # noqa: ANN001
+            nonlocal evaluate_calls
+            evaluate_calls += 1
+            return SignalDecision(
+                signal="long",
+                reason="趋势成立",
+                candle_ts=_candles[-1].ts,
+                entry_reference=Decimal("2300"),
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2310"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=0.0), patch(
+            "okx_quant.engine.EmaDynamicOrderStrategy.evaluate",
+            new=_fake_evaluate,
+        ):
+            engine._run_dynamic_local_strategy_v2(
+                None,  # type: ignore[arg-type]
+                config,
+                instrument,
+                instrument,
+            )
+
+        self.assertEqual(open_calls["count"], 1)
+        self.assertEqual(evaluate_calls, 1)
         self.assertEqual(waits, [60.0, 60.0])
 
     def test_okx_read_retry_recovers_from_transient_error(self) -> None:
