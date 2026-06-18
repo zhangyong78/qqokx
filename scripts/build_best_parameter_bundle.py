@@ -231,6 +231,11 @@ def _build_protection_label(config: StrategyConfig, *, include_entries: bool, ap
     if include_entries:
         entries_text = "不限" if config.max_entries_per_trend <= 0 else str(config.max_entries_per_trend)
         parts.append(f"每波 {entries_text} 次")
+    if include_entries and config.uses_reentry_confirmation():
+        parts.append(
+            f"再开仓确认：第{config.resolved_reentry_confirmation_min_sequence()}次起收盘站上"
+            f"{config.reentry_confirmation_line_label()}"
+        )
     return " / ".join(parts)
 
 

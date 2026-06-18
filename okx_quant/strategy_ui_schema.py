@@ -29,6 +29,7 @@ class StrategyWidgetVisibility:
     show_big_ema: bool
     show_dynamic_take_profit: bool
     show_entry_reference: bool
+    show_reentry_confirmation: bool
     show_hold_close_exit: bool
     show_max_entries: bool
     show_mtf_controls: bool
@@ -68,6 +69,10 @@ STRATEGY_UI_SCHEMAS: dict[str, StrategyUiSchema] = {
                 "atr_take_multiplier": "2",
                 "entry_reference_ema_type": "ema",
                 "entry_reference_ema_period": 55,
+                "reentry_confirmation_enabled": False,
+                "reentry_confirmation_min_sequence": 0,
+                "reentry_confirmation_ma_type": "ema",
+                "reentry_confirmation_ma_period": 21,
                 "take_profit_mode": "dynamic",
                 "max_entries_per_trend": 1,
                 "dynamic_two_r_break_even": True,
@@ -119,6 +124,10 @@ STRATEGY_UI_SCHEMAS: dict[str, StrategyUiSchema] = {
                 "atr_take_multiplier": "2",
                 "entry_reference_ema_type": "ema",
                 "entry_reference_ema_period": 55,
+                "reentry_confirmation_enabled": False,
+                "reentry_confirmation_min_sequence": 0,
+                "reentry_confirmation_ma_type": "ema",
+                "reentry_confirmation_ma_period": 21,
                 "take_profit_mode": "dynamic",
                 "max_entries_per_trend": 1,
                 "dynamic_two_r_break_even": True,
@@ -484,6 +493,7 @@ def build_strategy_widget_visibility(strategy_id: str, scope: PageScope) -> Stra
         show_big_ema=strategy_uses_parameter(strategy_id, "big_ema_period"),
         show_dynamic_take_profit=strategy_supports_dynamic_take_profit(strategy_id),
         show_entry_reference=strategy_uses_parameter(strategy_id, "entry_reference_ema_period"),
+        show_reentry_confirmation=strategy_uses_parameter(strategy_id, "reentry_confirmation_enabled"),
         show_hold_close_exit=scope == _SCOPE_BACKTEST and strategy_uses_parameter(strategy_id, "hold_close_exit_bars"),
         show_max_entries=strategy_uses_parameter(strategy_id, "max_entries_per_trend"),
         show_mtf_controls=is_dynamic_mtf_strategy_id(strategy_id),

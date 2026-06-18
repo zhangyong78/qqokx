@@ -74,6 +74,10 @@ def build_dynamic_long_config(
     time_stop_break_even_bars: int = 0,
     trend_ema_close_exit_after_trigger_r_enabled: bool = False,
     trend_ema_close_exit_after_trigger_r: int = 5,
+    reentry_confirmation_enabled: bool = False,
+    reentry_confirmation_min_sequence: int = 0,
+    reentry_confirmation_ma_type: str = "ema",
+    reentry_confirmation_ma_period: int = 21,
 ) -> StrategyConfig:
     return StrategyConfig(
         inst_id=symbol,
@@ -102,6 +106,10 @@ def build_dynamic_long_config(
         backtest_sizing_mode="fixed_risk",
         entry_reference_ema_period=entry_reference_period,
         entry_reference_ema_type="ema",
+        reentry_confirmation_enabled=reentry_confirmation_enabled,
+        reentry_confirmation_min_sequence=reentry_confirmation_min_sequence,
+        reentry_confirmation_ma_type=reentry_confirmation_ma_type,
+        reentry_confirmation_ma_period=reentry_confirmation_ma_period,
         take_profit_mode="dynamic",
         max_entries_per_trend=max_entries_per_trend,
         dynamic_two_r_break_even=True,
@@ -308,6 +316,10 @@ def build_ready_specs(environment: str) -> tuple[ReadyStrategySpec, ...]:
                     },
                 ),
                 ema55_slope_lock_profit_trigger_r=4,
+                reentry_confirmation_enabled=True,
+                reentry_confirmation_min_sequence=3,
+                reentry_confirmation_ma_type="ema",
+                reentry_confirmation_ma_period=21,
             ),
         ),
         ReadyStrategySpec(

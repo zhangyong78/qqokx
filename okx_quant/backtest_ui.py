@@ -236,6 +236,10 @@ class BacktestLaunchState:
     risk_amount: str
     take_profit_mode_label: str
     max_entries_per_trend: str
+    reentry_confirmation_enabled: bool
+    reentry_confirmation_min_sequence: str
+    reentry_confirmation_ma_type: str
+    reentry_confirmation_ma_period: str
     dynamic_two_r_break_even: bool
     dynamic_break_even_trigger_r: str
     dynamic_fee_offset_enabled: bool
@@ -1483,6 +1487,10 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "run_mode": config.run_mode,
         "take_profit_mode": config.take_profit_mode,
         "max_entries_per_trend": config.max_entries_per_trend,
+        "reentry_confirmation_enabled": config.reentry_confirmation_enabled,
+        "reentry_confirmation_min_sequence": config.resolved_reentry_confirmation_min_sequence(),
+        "reentry_confirmation_ma_type": config.resolved_reentry_confirmation_ma_type(),
+        "reentry_confirmation_ma_period": config.resolved_reentry_confirmation_ma_period(),
         "dynamic_two_r_break_even": config.dynamic_two_r_break_even,
         "dynamic_break_even_trigger_r": int(config.dynamic_break_even_trigger_r),
         "dynamic_fee_offset_enabled": config.dynamic_fee_offset_enabled,
@@ -1618,6 +1626,10 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         run_mode=str(payload.get("run_mode", "trade")),
         take_profit_mode=str(payload.get("take_profit_mode", "dynamic")),
         max_entries_per_trend=int(payload.get("max_entries_per_trend", 1)),
+        reentry_confirmation_enabled=coerce_bool(payload.get("reentry_confirmation_enabled"), False),
+        reentry_confirmation_min_sequence=int(payload.get("reentry_confirmation_min_sequence", 0)),
+        reentry_confirmation_ma_type=str(payload.get("reentry_confirmation_ma_type", "ema")),
+        reentry_confirmation_ma_period=int(payload.get("reentry_confirmation_ma_period", 21)),
         dynamic_two_r_break_even=bool(payload.get("dynamic_two_r_break_even", True)),
         dynamic_break_even_trigger_r=int(payload.get("dynamic_break_even_trigger_r", 2)),
         dynamic_fee_offset_enabled=bool(payload.get("dynamic_fee_offset_enabled", True)),
@@ -2018,6 +2030,10 @@ class BacktestWindow:
         self.end_time_text = StringVar(value=initial_state.end_time_text)
         self.take_profit_mode_label = StringVar(value=initial_state.take_profit_mode_label)
         self.max_entries_per_trend = StringVar(value=initial_state.max_entries_per_trend)
+        self.reentry_confirmation_enabled = BooleanVar(value=initial_state.reentry_confirmation_enabled)
+        self.reentry_confirmation_min_sequence = StringVar(value=initial_state.reentry_confirmation_min_sequence)
+        self.reentry_confirmation_ma_type = StringVar(value=(initial_state.reentry_confirmation_ma_type or "EMA").upper())
+        self.reentry_confirmation_ma_period = StringVar(value=initial_state.reentry_confirmation_ma_period)
         self.dynamic_two_r_break_even = BooleanVar(value=initial_state.dynamic_two_r_break_even)
         self.dynamic_break_even_trigger_r = StringVar(value=initial_state.dynamic_break_even_trigger_r)
         self.dynamic_protection_rules_json = StringVar(value=initial_state.dynamic_protection_rules_json)
@@ -2447,6 +2463,10 @@ class BacktestWindow:
             "daily_filter_period": self.daily_filter_period,
             "take_profit_mode": self.take_profit_mode_label,
             "max_entries_per_trend": self.max_entries_per_trend,
+            "reentry_confirmation_enabled": self.reentry_confirmation_enabled,
+            "reentry_confirmation_min_sequence": self.reentry_confirmation_min_sequence,
+            "reentry_confirmation_ma_type": self.reentry_confirmation_ma_type,
+            "reentry_confirmation_ma_period": self.reentry_confirmation_ma_period,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
             "dynamic_break_even_trigger_r": self.dynamic_break_even_trigger_r,
             "dynamic_protection_rules": self.dynamic_protection_rules_json,
@@ -2985,6 +3005,49 @@ class BacktestWindow:
         self.max_entries_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
         self.max_entries_entry = ttk.Entry(signal_section, textvariable=self.max_entries_per_trend)
         self.max_entries_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
+
+        row += 1
+        self.reentry_confirmation_check = ttk.Checkbutton(
+            signal_section,
+            text="再开仓确认",
+            variable=self.reentry_confirmation_enabled,
+            command=self._sync_dynamic_take_profit_controls,
+        )
+        self.reentry_confirmation_check.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.reentry_confirmation_min_sequence_caption = ttk.Label(signal_section, text="从第")
+        self.reentry_confirmation_min_sequence_caption.grid(row=row, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.reentry_confirmation_min_sequence_entry = ttk.Entry(
+            signal_section,
+            textvariable=self.reentry_confirmation_min_sequence,
+            width=6,
+        )
+        self.reentry_confirmation_min_sequence_entry.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.reentry_confirmation_ma_frame = ttk.Frame(signal_section)
+        self.reentry_confirmation_ma_frame.grid(row=row, column=3, sticky="ew", pady=(8, 0))
+        self.reentry_confirmation_rule_prefix = ttk.Label(
+            self.reentry_confirmation_ma_frame,
+            text="次起，确认K收盘站上",
+        )
+        self.reentry_confirmation_rule_prefix.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.reentry_confirmation_ma_type_combo = ttk.Combobox(
+            self.reentry_confirmation_ma_frame,
+            textvariable=self.reentry_confirmation_ma_type,
+            values=MOVING_AVERAGE_TYPE_OPTIONS,
+            state="readonly",
+            width=6,
+        )
+        self.reentry_confirmation_ma_type_combo.grid(row=0, column=1, sticky="w", padx=(0, 6))
+        self.reentry_confirmation_ma_period_entry = ttk.Entry(
+            self.reentry_confirmation_ma_frame,
+            textvariable=self.reentry_confirmation_ma_period,
+            width=6,
+        )
+        self.reentry_confirmation_ma_period_entry.grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.reentry_confirmation_rule_suffix = ttk.Label(
+            self.reentry_confirmation_ma_frame,
+            text="后才允许再次挂单",
+        )
+        self.reentry_confirmation_rule_suffix.grid(row=0, column=3, sticky="w")
 
         row = 0
         self.slope_threshold_caption = ttk.Label(advanced_section, text="开空斜率阈值(负数)")
@@ -5011,6 +5074,10 @@ class BacktestWindow:
         daily_filter_scope = "both"
         daily_filter_ma_type = "ema"
         daily_filter_period = 5
+        reentry_confirmation_enabled = False
+        reentry_confirmation_min_sequence = 0
+        reentry_confirmation_ma_type = "ema"
+        reentry_confirmation_ma_period = 21
         dynamic_two_r_break_even = False
         dynamic_fee_offset_enabled = False
         dynamic_protection_rules: tuple[DynamicProtectionRule, ...] = ()
@@ -5157,6 +5224,30 @@ class BacktestWindow:
                         self._parse_positive_int(self.daily_filter_period.get(), "日线均线周期"),
                     )
                 )
+        if strategy_uses_parameter(definition.strategy_id, "reentry_confirmation_enabled"):
+            reentry_confirmation_enabled = bool(self.reentry_confirmation_enabled.get())
+            reentry_confirmation_ma_type = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "reentry_confirmation_ma_type",
+                    self.reentry_confirmation_ma_type.get().strip().lower(),
+                )
+            )
+            reentry_confirmation_ma_period = int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "reentry_confirmation_ma_period",
+                    self._parse_positive_int(self.reentry_confirmation_ma_period.get(), "再开仓确认均线周期"),
+                )
+            )
+            if reentry_confirmation_enabled:
+                reentry_confirmation_min_sequence = int(
+                    self._resolve_strategy_parameter_value(
+                        strategy_id,
+                        "reentry_confirmation_min_sequence",
+                        self._parse_positive_int(self.reentry_confirmation_min_sequence.get(), "再开仓确认起始次数"),
+                    )
+                )
         if dynamic_tp_strategy:
             take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
             if strategy_uses_parameter(definition.strategy_id, "max_entries_per_trend"):
@@ -5260,6 +5351,10 @@ class BacktestWindow:
             ),
             entry_reference_ema_type=entry_reference_ema_type,
             entry_reference_ema_period=entry_reference_ema_period,
+            reentry_confirmation_enabled=reentry_confirmation_enabled,
+            reentry_confirmation_min_sequence=reentry_confirmation_min_sequence,
+            reentry_confirmation_ma_type=reentry_confirmation_ma_type,
+            reentry_confirmation_ma_period=reentry_confirmation_ma_period,
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
             atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
@@ -5538,6 +5633,17 @@ class BacktestWindow:
                     widget.grid_remove()
             if not visibility.show_max_entries:
                 self.max_entries_caption.configure(text="每波最多开仓次数")
+            reentry_widgets = (
+                self.reentry_confirmation_check,
+                self.reentry_confirmation_min_sequence_caption,
+                self.reentry_confirmation_min_sequence_entry,
+                self.reentry_confirmation_ma_frame,
+            )
+            for widget in reentry_widgets:
+                if visibility.show_reentry_confirmation:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
             hold_close_widgets = (
                 self.hold_close_exit_bars_caption,
                 self.hold_close_exit_bars_entry,
@@ -5629,6 +5735,13 @@ class BacktestWindow:
             self._apply_strategy_parameter_fixed_labels(strategy_id)
         if visibility.show_entry_reference and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
+        if visibility.show_reentry_confirmation:
+            if not self.reentry_confirmation_min_sequence.get().strip():
+                self.reentry_confirmation_min_sequence.set("0")
+            if not self.reentry_confirmation_ma_type.get().strip():
+                self.reentry_confirmation_ma_type.set("EMA")
+            if not self.reentry_confirmation_ma_period.get().strip():
+                self.reentry_confirmation_ma_period.set("21")
         self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
         self._sync_ema55_slope_exit_condition_controls()
@@ -5765,6 +5878,28 @@ class BacktestWindow:
         self.trend_ema_close_exit_after_trigger_r_entry.configure(
             state="normal" if trend_ema_close_exit_enabled else "disabled"
         )
+        reentry_supported = strategy_uses_parameter(definition.strategy_id, "reentry_confirmation_enabled")
+        reentry_enabled = reentry_supported and bool(self.reentry_confirmation_enabled.get())
+        if hasattr(self, "reentry_confirmation_check"):
+            self.reentry_confirmation_check.configure(state="normal" if reentry_supported else "disabled")
+            self.reentry_confirmation_min_sequence_caption.configure(
+                state="normal" if reentry_enabled else "disabled"
+            )
+            self.reentry_confirmation_min_sequence_entry.configure(
+                state="normal" if reentry_enabled else "disabled"
+            )
+            self.reentry_confirmation_ma_type_combo.configure(
+                state="readonly" if reentry_enabled else "disabled"
+            )
+            self.reentry_confirmation_ma_period_entry.configure(
+                state="normal" if reentry_enabled else "disabled"
+            )
+            self.reentry_confirmation_rule_prefix.configure(
+                state="normal" if reentry_enabled else "disabled"
+            )
+            self.reentry_confirmation_rule_suffix.configure(
+                state="normal" if reentry_enabled else "disabled"
+            )
 
     def _sync_ema55_slope_exit_condition_controls(self) -> None:
         if not hasattr(self, "ema55_slope_lock_profit_trigger_r_entry"):
@@ -5871,6 +6006,10 @@ class BacktestWindow:
         self.big_ema_period.set(str(config.big_ema_period))
         self.entry_reference_ema_type.set(str(config.resolved_entry_reference_ema_type()).upper())
         self.entry_reference_ema_period.set(str(config.entry_reference_ema_period))
+        self.reentry_confirmation_enabled.set(bool(config.reentry_confirmation_enabled))
+        self.reentry_confirmation_min_sequence.set(str(config.reentry_confirmation_min_sequence))
+        self.reentry_confirmation_ma_type.set(str(config.resolved_reentry_confirmation_ma_type()).upper())
+        self.reentry_confirmation_ma_period.set(str(config.reentry_confirmation_ma_period))
         self.mtf_filter_bar.set(_normalize_backtest_bar_label(config.resolved_mtf_filter_bar()))
         self.mtf_filter_fast_ema_period.set(str(config.mtf_filter_fast_ema_period))
         self.mtf_filter_slow_ema_period.set(str(config.mtf_filter_slow_ema_period))

@@ -1595,6 +1595,24 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             int(_strategy_config_default("max_entries_per_trend")),
             minimum=0,
         ),
+        reentry_confirmation_enabled=_coerce_snapshot_bool(
+            payload.get("reentry_confirmation_enabled"),
+            bool(_strategy_config_default("reentry_confirmation_enabled")),
+        ),
+        reentry_confirmation_min_sequence=_coerce_snapshot_int(
+            payload.get("reentry_confirmation_min_sequence"),
+            int(_strategy_config_default("reentry_confirmation_min_sequence")),
+            minimum=0,
+        ),
+        reentry_confirmation_ma_type=_coerce_snapshot_text(
+            payload.get("reentry_confirmation_ma_type"),
+            str(_strategy_config_default("reentry_confirmation_ma_type")),
+        ),
+        reentry_confirmation_ma_period=_coerce_snapshot_int(
+            payload.get("reentry_confirmation_ma_period"),
+            int(_strategy_config_default("reentry_confirmation_ma_period")),
+            minimum=1,
+        ),
         entry_reference_ema_period=_coerce_snapshot_int(
             payload.get("entry_reference_ema_period"),
             int(_strategy_config_default("entry_reference_ema_period")),
@@ -3474,6 +3492,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.signal_mode_label = StringVar(value=STRATEGY_DEFINITIONS[0].default_signal_label)
         self.take_profit_mode_label = StringVar(value="动态止盈")
         self.max_entries_per_trend = StringVar(value="1")
+        self.reentry_confirmation_enabled = BooleanVar(value=False)
+        self.reentry_confirmation_min_sequence = StringVar(value="0")
+        self.reentry_confirmation_ma_type = StringVar(value="EMA")
+        self.reentry_confirmation_ma_period = StringVar(value="21")
         self.startup_chase_current_signal = BooleanVar(value=False)
         self.startup_chase_window_seconds = StringVar(value="0")
         self.ema55_slope_exit_enabled = BooleanVar(value=True)
@@ -3541,6 +3563,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.take_profit_mode_label.trace_add("write", self._update_launch_parameter_hint)
         self.take_profit_mode_label.trace_add("write", self._update_dynamic_protection_hint)
         self.max_entries_per_trend.trace_add("write", self._update_launch_parameter_hint)
+        self.reentry_confirmation_enabled.trace_add("write", self._update_launch_parameter_hint)
+        self.reentry_confirmation_min_sequence.trace_add("write", self._update_launch_parameter_hint)
+        self.reentry_confirmation_ma_type.trace_add("write", self._update_launch_parameter_hint)
+        self.reentry_confirmation_ma_period.trace_add("write", self._update_launch_parameter_hint)
+        self.reentry_confirmation_enabled.trace_add("write", lambda *_: self._sync_dynamic_take_profit_controls())
         self.startup_chase_window_seconds.trace_add("write", self._update_launch_parameter_hint)
         self.ema_type.trace_add("write", self._update_trend_parameter_hint)
         self.ema_period.trace_add("write", self._update_trend_parameter_hint)
@@ -3896,6 +3923,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "body_retest_watch_bars": self.body_retest_watch_bars,
             "take_profit_mode": self.take_profit_mode_label,
             "max_entries_per_trend": self.max_entries_per_trend,
+            "reentry_confirmation_enabled": getattr(self, "reentry_confirmation_enabled", None),
+            "reentry_confirmation_min_sequence": getattr(self, "reentry_confirmation_min_sequence", None),
+            "reentry_confirmation_ma_type": getattr(self, "reentry_confirmation_ma_type", None),
+            "reentry_confirmation_ma_period": getattr(self, "reentry_confirmation_ma_period", None),
             "ema55_slope_exit_enabled": self.ema55_slope_exit_enabled,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
             "dynamic_break_even_trigger_r": self.dynamic_break_even_trigger_r,
@@ -4488,6 +4519,49 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._max_entries_per_trend_label.grid(row=row, column=2, sticky="w", pady=_lp)
         self._max_entries_per_trend_entry = ttk.Entry(launch_form, textvariable=self.max_entries_per_trend)
         self._max_entries_per_trend_entry.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        self._reentry_confirmation_enabled_check = ttk.Checkbutton(
+            launch_form,
+            text="再开仓确认",
+            variable=self.reentry_confirmation_enabled,
+            command=self._sync_dynamic_take_profit_controls,
+        )
+        self._reentry_confirmation_enabled_check.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._reentry_confirmation_min_sequence_label = ttk.Label(launch_form, text="从第")
+        self._reentry_confirmation_min_sequence_label.grid(row=row, column=1, sticky="w", padx=_ix, pady=_lp)
+        self._reentry_confirmation_min_sequence_entry = ttk.Entry(
+            launch_form,
+            textvariable=self.reentry_confirmation_min_sequence,
+            width=6,
+        )
+        self._reentry_confirmation_min_sequence_entry.grid(row=row, column=2, sticky="w", pady=_lp)
+        self._reentry_confirmation_ma_frame = ttk.Frame(launch_form)
+        self._reentry_confirmation_ma_frame.grid(row=row, column=3, sticky="ew", pady=_lp)
+        self._reentry_confirmation_rule_prefix = ttk.Label(
+            self._reentry_confirmation_ma_frame,
+            text="次起，确认K收盘站上",
+        )
+        self._reentry_confirmation_rule_prefix.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self._reentry_confirmation_ma_type_combo = ttk.Combobox(
+            self._reentry_confirmation_ma_frame,
+            textvariable=self.reentry_confirmation_ma_type,
+            values=MOVING_AVERAGE_TYPE_OPTIONS,
+            state="readonly",
+            width=6,
+        )
+        self._reentry_confirmation_ma_type_combo.grid(row=0, column=1, sticky="w", padx=(0, 6))
+        self._reentry_confirmation_ma_period_entry = ttk.Entry(
+            self._reentry_confirmation_ma_frame,
+            textvariable=self.reentry_confirmation_ma_period,
+            width=6,
+        )
+        self._reentry_confirmation_ma_period_entry.grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self._reentry_confirmation_rule_suffix = ttk.Label(
+            self._reentry_confirmation_ma_frame,
+            text="后才允许再次挂单",
+        )
+        self._reentry_confirmation_rule_suffix.grid(row=0, column=3, sticky="w")
 
         row += 1
         self._startup_chase_window_label = ttk.Label(launch_form, text="启动追单窗口")
@@ -9051,6 +9125,26 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 if strategy_uses_parameter(definition.strategy_id, "trend_ema_close_exit_after_trigger_r")
                 else 5
             )
+            reentry_confirmation_enabled = (
+                bool(self.reentry_confirmation_enabled.get())
+                if strategy_uses_parameter(definition.strategy_id, "reentry_confirmation_enabled")
+                else False
+            )
+            reentry_confirmation_min_sequence = (
+                self._parse_positive_int(self.reentry_confirmation_min_sequence.get(), "再开仓确认起始次数")
+                if reentry_confirmation_enabled
+                else 0
+            )
+            reentry_confirmation_ma_type = (
+                self.reentry_confirmation_ma_type.get().strip().lower()
+                if strategy_uses_parameter(definition.strategy_id, "reentry_confirmation_ma_type")
+                else "ema"
+            )
+            reentry_confirmation_ma_period = (
+                self._parse_positive_int(self.reentry_confirmation_ma_period.get(), "再开仓确认均线周期")
+                if strategy_uses_parameter(definition.strategy_id, "reentry_confirmation_ma_period")
+                else 21
+            )
             if ema55_slope_lock_profit_trigger_r < 2:
                 raise ValueError("移动止盈触发R 不能小于 2")
             if dynamic_break_even_trigger_r < 1:
@@ -9122,6 +9216,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                     ),
                     0,
                 ),
+                reentry_confirmation_enabled=reentry_confirmation_enabled,
+                reentry_confirmation_min_sequence=reentry_confirmation_min_sequence,
+                reentry_confirmation_ma_type=reentry_confirmation_ma_type,
+                reentry_confirmation_ma_period=reentry_confirmation_ma_period,
             )
         except Exception as exc:
             self.minimum_order_risk_hint_text.set(

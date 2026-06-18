@@ -24,6 +24,7 @@ from okx_quant.backtest import (
     _advance_dynamic_stop,
     _dynamic_stop_price,
     _dynamic_trigger_price,
+    _reentry_confirmation_blocks_entry,
     _load_backtest_candles,
     _process_dynamic_position_segment,
     _position_initial_risk_value,
@@ -173,6 +174,69 @@ class DummyBacktestClient:
             "full_history": fetch_full_history,
         }
         return returned
+
+
+class ReentryConfirmationBacktestTest(TestCase):
+    def _candle(self, close: str) -> Candle:
+        value = Decimal(close)
+        return Candle(
+            ts=1,
+            open=value,
+            high=value,
+            low=value,
+            close=value,
+            volume=Decimal("1"),
+            confirmed=True,
+        )
+
+    def test_reentry_confirmation_blocks_only_configured_sequence(self) -> None:
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("1.5"),
+            atr_take_multiplier=Decimal("1.5"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            reentry_confirmation_enabled=True,
+            reentry_confirmation_min_sequence=3,
+            reentry_confirmation_ma_type="ema",
+            reentry_confirmation_ma_period=21,
+        )
+
+        self.assertFalse(
+            _reentry_confirmation_blocks_entry(
+                config=config,
+                signal="long",
+                wave_entry_sequence=2,
+                candle=self._candle("100"),
+                confirmation_value=Decimal("101"),
+            )
+        )
+        self.assertTrue(
+            _reentry_confirmation_blocks_entry(
+                config=config,
+                signal="long",
+                wave_entry_sequence=3,
+                candle=self._candle("100"),
+                confirmation_value=Decimal("101"),
+            )
+        )
+        self.assertFalse(
+            _reentry_confirmation_blocks_entry(
+                config=config,
+                signal="long",
+                wave_entry_sequence=3,
+                candle=self._candle("102"),
+                confirmation_value=Decimal("101"),
+            )
+        )
 
 
 class BacktestTest(TestCase):

@@ -139,6 +139,11 @@ class UiStrategySessionsMixin:
             _reverse_lookup_label(TAKE_PROFIT_MODE_OPTIONS, record.config.take_profit_mode, "动态止盈")
         )
         self.max_entries_per_trend.set(str(record.config.max_entries_per_trend))
+        if hasattr(self, "reentry_confirmation_enabled"):
+            self.reentry_confirmation_enabled.set(bool(record.config.reentry_confirmation_enabled))
+            self.reentry_confirmation_min_sequence.set(str(record.config.reentry_confirmation_min_sequence))
+            self.reentry_confirmation_ma_type.set(str(record.config.resolved_reentry_confirmation_ma_type()).upper())
+            self.reentry_confirmation_ma_period.set(str(record.config.reentry_confirmation_ma_period))
         self.trend_ema_slope_filter_min_ratio.set(_format_entry_decimal(record.config.trend_ema_slope_filter_min_ratio))
         self.atr_percentile_filter_max.set(_format_entry_decimal(record.config.atr_percentile_filter_max))
         self.body_retest_breakdown_atr_multiplier.set(
@@ -4499,6 +4504,18 @@ class UiStrategySessionsMixin:
             max_entries_per_trend = extra_defaults.get("max_entries_per_trend")
             if max_entries_per_trend is not None:
                 self.max_entries_per_trend.set(str(max_entries_per_trend))
+            reentry_confirmation_enabled = extra_defaults.get("reentry_confirmation_enabled")
+            if reentry_confirmation_enabled is not None:
+                self.reentry_confirmation_enabled.set(bool(reentry_confirmation_enabled))
+            reentry_confirmation_min_sequence = extra_defaults.get("reentry_confirmation_min_sequence")
+            if reentry_confirmation_min_sequence is not None:
+                self.reentry_confirmation_min_sequence.set(str(reentry_confirmation_min_sequence))
+            reentry_confirmation_ma_type = extra_defaults.get("reentry_confirmation_ma_type")
+            if reentry_confirmation_ma_type is not None:
+                self.reentry_confirmation_ma_type.set(str(reentry_confirmation_ma_type).upper())
+            reentry_confirmation_ma_period = extra_defaults.get("reentry_confirmation_ma_period")
+            if reentry_confirmation_ma_period is not None:
+                self.reentry_confirmation_ma_period.set(str(reentry_confirmation_ma_period))
             tp_sl_mode = extra_defaults.get("tp_sl_mode")
             if tp_sl_mode is not None:
                 self.tp_sl_mode_label.set(_launcher_tp_sl_mode_label(str(tp_sl_mode)))
@@ -4560,6 +4577,17 @@ class UiStrategySessionsMixin:
             self._trend_ema_close_exit_after_trigger_r_label.grid_remove()
             self._trend_ema_close_exit_after_trigger_r_entry.grid_remove()
             self._trend_ema_close_exit_after_trigger_r_hint_label.grid_remove()
+        reentry_widgets = (
+            self._reentry_confirmation_enabled_check,
+            self._reentry_confirmation_min_sequence_label,
+            self._reentry_confirmation_min_sequence_entry,
+            self._reentry_confirmation_ma_frame,
+        )
+        for widget in reentry_widgets:
+            if visibility.show_reentry_confirmation:
+                widget.grid()
+            else:
+                widget.grid_remove()
         if visibility.show_startup_chase_window:
             self._startup_chase_window_label.grid()
             self._startup_chase_window_entry.grid()
@@ -4726,6 +4754,13 @@ class UiStrategySessionsMixin:
                 self._tp_sl_mode_combo.configure(values=LAUNCHER_TP_SL_MODE_LABELS, state="readonly")
         if visibility.show_entry_reference and not self.entry_reference_ema_period.get().strip():
             self.entry_reference_ema_period.set("55")
+        if visibility.show_reentry_confirmation:
+            if not self.reentry_confirmation_min_sequence.get().strip():
+                self.reentry_confirmation_min_sequence.set("0")
+            if not self.reentry_confirmation_ma_type.get().strip():
+                self.reentry_confirmation_ma_type.set("EMA")
+            if not self.reentry_confirmation_ma_period.get().strip():
+                self.reentry_confirmation_ma_period.set("21")
         if not supports_startup_chase_current_signal(strategy_id):
             self.startup_chase_current_signal.set(False)
         if visibility.show_startup_chase_window and not self.startup_chase_window_seconds.get().strip():
@@ -4823,6 +4858,30 @@ class UiStrategySessionsMixin:
         self._trend_ema_close_exit_after_trigger_r_entry.configure(
             state="normal" if trend_exit_enabled else "disabled"
         )
+        reentry_supported = strategy_uses_parameter(definition.strategy_id, "reentry_confirmation_enabled")
+        reentry_enabled = reentry_supported and bool(self.reentry_confirmation_enabled.get())
+        if hasattr(self, "_reentry_confirmation_enabled_check"):
+            self._reentry_confirmation_enabled_check.configure(state="normal" if reentry_supported else "disabled")
+            self._reentry_confirmation_min_sequence_label.configure(
+                state="normal" if reentry_enabled else "disabled"
+            )
+            self._reentry_confirmation_min_sequence_entry.configure(
+                state="normal" if reentry_enabled else "disabled"
+            )
+            self._reentry_confirmation_ma_type_combo.configure(
+                state="readonly" if reentry_enabled else "disabled"
+            )
+            self._reentry_confirmation_ma_period_entry.configure(
+                state="normal" if reentry_enabled else "disabled"
+            )
+            if hasattr(self, "_reentry_confirmation_rule_prefix"):
+                self._reentry_confirmation_rule_prefix.configure(
+                    state="normal" if reentry_enabled else "disabled"
+                )
+            if hasattr(self, "_reentry_confirmation_rule_suffix"):
+                self._reentry_confirmation_rule_suffix.configure(
+                    state="normal" if reentry_enabled else "disabled"
+                )
 
     def _sync_daily_filter_controls(self) -> None:
         if not hasattr(self, "_daily_filter_enabled_check"):
@@ -4948,6 +5007,10 @@ class UiStrategySessionsMixin:
         daily_filter_scope = "both"
         daily_filter_ma_type = "ema"
         daily_filter_period = 5
+        reentry_confirmation_enabled = False
+        reentry_confirmation_min_sequence = 0
+        reentry_confirmation_ma_type = "ema"
+        reentry_confirmation_ma_period = 21
         if strategy_uses_parameter(strategy_id, "entry_reference_ema_period"):
             entry_reference_ema_period = self._parse_nonnegative_int(
                 self.entry_reference_ema_period.get(),
@@ -5017,6 +5080,30 @@ class UiStrategySessionsMixin:
                         strategy_id,
                         "daily_filter_period",
                         self._parse_positive_int(self.daily_filter_period.get(), "日线均线周期"),
+                    )
+                )
+        if strategy_uses_parameter(strategy_id, "reentry_confirmation_enabled"):
+            reentry_confirmation_enabled = bool(self.reentry_confirmation_enabled.get())
+            reentry_confirmation_ma_type = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "reentry_confirmation_ma_type",
+                    self.reentry_confirmation_ma_type.get().strip().lower(),
+                )
+            )
+            reentry_confirmation_ma_period = int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "reentry_confirmation_ma_period",
+                    self._parse_positive_int(self.reentry_confirmation_ma_period.get(), "再开仓确认均线周期"),
+                )
+            )
+            if reentry_confirmation_enabled:
+                reentry_confirmation_min_sequence = int(
+                    self._resolve_strategy_parameter_value(
+                        strategy_id,
+                        "reentry_confirmation_min_sequence",
+                        self._parse_positive_int(self.reentry_confirmation_min_sequence.get(), "再开仓确认起始次数"),
                     )
                 )
         if strategy_uses_startup_chase_window(strategy_id):
@@ -5157,6 +5244,10 @@ class UiStrategySessionsMixin:
                 )
             ),
             entry_reference_ema_period=entry_reference_ema_period,
+            reentry_confirmation_enabled=reentry_confirmation_enabled,
+            reentry_confirmation_min_sequence=reentry_confirmation_min_sequence,
+            reentry_confirmation_ma_type=reentry_confirmation_ma_type,
+            reentry_confirmation_ma_period=reentry_confirmation_ma_period,
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
             atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
@@ -6838,6 +6929,17 @@ class UiStrategySessionsMixin:
             parameter_rows.append(
                 f"每波最多开仓次数：{self._max_entries_detail_label(max_entries_per_trend)}"
             )
+        if strategy_uses_parameter(strategy_id, "reentry_confirmation_enabled"):
+            reentry_enabled = bool(snapshot.get("reentry_confirmation_enabled", False))
+            if reentry_enabled:
+                reentry_ma_type = (self._snapshot_text(snapshot, "reentry_confirmation_ma_type", "ema") or "ema").upper()
+                reentry_ma_period = self._snapshot_int(snapshot, "reentry_confirmation_ma_period", 21)
+                reentry_min_sequence = self._snapshot_int(snapshot, "reentry_confirmation_min_sequence", 0)
+                parameter_rows.append(
+                    f"再开仓确认：本波第 {reentry_min_sequence} 次及以后，上一根已收K收盘价需站上 {reentry_ma_type}{reentry_ma_period}"
+                )
+            else:
+                parameter_rows.append("再开仓确认：关闭")
         if strategy_uses_parameter(strategy_id, "startup_chase_window_seconds"):
             parameter_rows.append(
                 f"启动追单窗口：{self._startup_chase_window_detail_label(startup_window_seconds)}"
@@ -7968,6 +8070,10 @@ class UiStrategySessionsMixin:
             entry_ts=int((trade.opened_logged_at or session.started_at).timestamp() * 1000),
         )
         tp_sl_mode = str(session.config.tp_sl_mode or "").strip().lower()
+        trade_management_mode = str(getattr(trade, "management_mode", "") or "").strip().lower()
+        if tp_sl_mode != "local_trade":
+            if trade_management_mode == "local_trade" or strategy_forces_local_trade(session.config.strategy_id):
+                tp_sl_mode = "local_trade"
         take_profit_mode = str(session.config.take_profit_mode or "").strip().lower()
         fallback_to_managed_monitor = False
         if tp_sl_mode == "local_trade":
@@ -8363,6 +8469,7 @@ class UiStrategySessionsMixin:
             trade = session.active_trade
             if trade is None:
                 return
+            trade.management_mode = "trader_virtual_stop"
             stop_price = _extract_log_field_decimal(message, "策略止损")
             if stop_price is not None:
                 if trade.initial_stop_price is None:
@@ -8389,6 +8496,7 @@ class UiStrategySessionsMixin:
             trade = session.active_trade
             if trade is None:
                 return
+            trade.management_mode = "exchange_dynamic"
             algo_cl_ord_id = _extract_log_field(message, "algoClOrdId")
             if algo_cl_ord_id:
                 trade.protective_algo_cl_ord_id = algo_cl_ord_id
@@ -8405,6 +8513,7 @@ class UiStrategySessionsMixin:
             trade = session.active_trade
             if trade is None:
                 return
+            trade.management_mode = "local_trade"
             stop_price = _extract_log_field_decimal(message, "止损")
             if stop_price is not None:
                 if trade.initial_stop_price is None:

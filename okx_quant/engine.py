@@ -807,6 +807,7 @@ class StrategyEngine:
             config.trend_ema_period,
             config.atr_period,
             entry_reference_ema_period,
+            config.resolved_reentry_confirmation_ma_period() if config.uses_reentry_confirmation() else 0,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = None
@@ -845,6 +846,8 @@ class StrategyEngine:
             f"每波最多开仓次数={config.max_entries_per_trend or 0}",
             f"启动追单窗口={config.startup_chase_window_label()}",
         ]
+        if config.uses_reentry_confirmation():
+            mode_parts.append(config.reentry_confirmation_summary())
         self._append_dynamic_mtf_mode_parts(config, mode_parts)
         self._append_daily_filter_mode_parts(config, mode_parts)
         self._logger(" | ".join(mode_parts))
@@ -880,6 +883,7 @@ class StrategyEngine:
                 config.trend_ema_period,
                 config.atr_period,
                 entry_reference_ema_period,
+                config.resolved_reentry_confirmation_ma_period() if config.uses_reentry_confirmation() else 0,
             )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
@@ -1039,6 +1043,18 @@ class StrategyEngine:
                 )
                 self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                 continue
+            next_wave_entry_sequence = entries_in_current_wave + 1
+            reentry_block_reason = _dynamic_reentry_confirmation_block_reason(
+                config,
+                confirmed,
+                signal=decision.signal,
+                wave_entry_sequence=next_wave_entry_sequence,
+            )
+            if reentry_block_reason:
+                idle_signal_candle_ts = newest_ts
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | {reentry_block_reason}")
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
 
             try:
                 plan = build_order_plan(
@@ -1168,6 +1184,7 @@ class StrategyEngine:
             config.trend_ema_period,
             config.atr_period,
             entry_reference_ema_period,
+            config.resolved_reentry_confirmation_ma_period() if config.uses_reentry_confirmation() else 0,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = active_order.candle_ts
@@ -1284,6 +1301,7 @@ class StrategyEngine:
                 config.trend_ema_period,
                 config.atr_period,
                 entry_reference_ema_period,
+                config.resolved_reentry_confirmation_ma_period() if config.uses_reentry_confirmation() else 0,
             )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，保留现有挂单继续等待更多数据...")
@@ -2044,6 +2062,7 @@ class StrategyEngine:
             config.trend_ema_period,
             config.atr_period,
             entry_reference_ema_period,
+            config.resolved_reentry_confirmation_ma_period() if config.uses_reentry_confirmation() else 0,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = None
@@ -2072,6 +2091,7 @@ class StrategyEngine:
                 config.trend_ema_period,
                 config.atr_period,
                 entry_reference_ema_period,
+                config.resolved_reentry_confirmation_ma_period() if config.uses_reentry_confirmation() else 0,
             )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
@@ -2171,6 +2191,7 @@ class StrategyEngine:
             config.trend_ema_period,
             config.atr_period,
             entry_reference_ema_period,
+            config.resolved_reentry_confirmation_ma_period() if config.uses_reentry_confirmation() else 0,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = None
@@ -2200,6 +2221,7 @@ class StrategyEngine:
                 config.trend_ema_period,
                 config.atr_period,
                 entry_reference_ema_period,
+                config.resolved_reentry_confirmation_ma_period() if config.uses_reentry_confirmation() else 0,
             )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
@@ -2273,6 +2295,7 @@ class StrategyEngine:
             config.trend_ema_period,
             config.atr_period,
             entry_reference_ema_period,
+            config.resolved_reentry_confirmation_ma_period() if config.uses_reentry_confirmation() else 0,
             DEFAULT_DEBUG_ATR_PERIOD,
         )
         last_candle_ts: int | None = None
@@ -2299,6 +2322,8 @@ class StrategyEngine:
             f"挂单参考={_dynamic_entry_reference_ema_text(config)}",
             f"启动追单窗口={config.startup_chase_window_label()}",
         ]
+        if config.uses_reentry_confirmation():
+            mode_parts.append(config.reentry_confirmation_summary())
         self._append_dynamic_mtf_mode_parts(config, mode_parts)
         self._append_daily_filter_mode_parts(config, mode_parts)
         if config.take_profit_mode == "dynamic":
@@ -2319,7 +2344,13 @@ class StrategyEngine:
         while not self._stop_event.is_set():
             candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period, entry_reference_ema_period)
+            minimum = max(
+                config.ema_period,
+                config.trend_ema_period,
+                config.atr_period,
+                entry_reference_ema_period,
+                config.resolved_reentry_confirmation_ma_period() if config.uses_reentry_confirmation() else 0,
+            )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -2378,6 +2409,19 @@ class StrategyEngine:
                         f"{_fmt_ts(decision.candle_ts)} | 第{current_wave_index}波趋势开仓次数已达上限 | 方向={decision.signal.upper()} | "
                         f"上限={config.max_entries_per_trend}"
                     )
+                    self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                    continue
+                next_wave_entry_sequence = entries_in_current_wave + 1
+                reentry_block_reason = _dynamic_reentry_confirmation_block_reason(
+                    config,
+                    confirmed,
+                    signal=decision.signal,
+                    wave_entry_sequence=next_wave_entry_sequence,
+                )
+                if reentry_block_reason:
+                    active_trigger = None
+                    idle_signal_candle_ts = newest_ts
+                    self._logger(f"{_fmt_ts(decision.candle_ts)} | {reentry_block_reason}")
                     self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
                     continue
 
@@ -2509,7 +2553,13 @@ class StrategyEngine:
         while not self._stop_event.is_set():
             candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
-            minimum = max(config.ema_period, config.trend_ema_period, config.atr_period, entry_reference_ema_period)
+            minimum = max(
+                config.ema_period,
+                config.trend_ema_period,
+                config.atr_period,
+                entry_reference_ema_period,
+                config.resolved_reentry_confirmation_ma_period() if config.uses_reentry_confirmation() else 0,
+            )
             if len(confirmed) < minimum:
                 self._logger("已收盘 K 线数量不足，继续等待更多数据...")
                 self._stop_event.wait(config.poll_seconds)
@@ -2563,6 +2613,17 @@ class StrategyEngine:
                     f"{_fmt_ts(decision.candle_ts)} | 第{current_wave_index}波趋势信号次数已达上限 | 方向={decision.signal.upper()} | "
                     f"上限={config.max_entries_per_trend}"
                 )
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            next_wave_entry_sequence = entries_in_current_wave + 1
+            reentry_block_reason = _dynamic_reentry_confirmation_block_reason(
+                config,
+                confirmed,
+                signal=decision.signal,
+                wave_entry_sequence=next_wave_entry_sequence,
+            )
+            if reentry_block_reason:
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | {reentry_block_reason}")
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
@@ -6868,6 +6929,39 @@ def recommended_indicator_lookback(*periods: int) -> int:
 
 def _dynamic_entry_reference_ema_text(config: StrategyConfig) -> str:
     return config.entry_reference_line_label()
+
+
+def _dynamic_reentry_confirmation_block_reason(
+    config: StrategyConfig,
+    confirmed: list[Candle],
+    *,
+    signal: str,
+    wave_entry_sequence: int,
+) -> str | None:
+    if not config.uses_reentry_confirmation():
+        return None
+    if wave_entry_sequence < config.resolved_reentry_confirmation_min_sequence():
+        return None
+    period = config.resolved_reentry_confirmation_ma_period()
+    if len(confirmed) < period:
+        return f"再开仓确认需要至少 {period} 根已收K线"
+    closes = [candle.close for candle in confirmed]
+    values = moving_average(closes, period, config.resolved_reentry_confirmation_ma_type())
+    confirmation_value = values[-1] if values else None
+    if confirmation_value is None:
+        return f"再开仓确认 {config.reentry_confirmation_line_label()} 尚未准备好"
+    close = confirmed[-1].close
+    if signal == "long" and close <= confirmation_value:
+        return (
+            f"本波第{wave_entry_sequence}次开仓未通过再开仓确认："
+            f"上一根已收K收盘={format_decimal(close)} <= {config.reentry_confirmation_line_label()}={format_decimal(confirmation_value)}"
+        )
+    if signal == "short" and close >= confirmation_value:
+        return (
+            f"本波第{wave_entry_sequence}次开仓未通过再开仓确认："
+            f"上一根已收K收盘={format_decimal(close)} >= {config.reentry_confirmation_line_label()}={format_decimal(confirmation_value)}"
+        )
+    return None
 
 
 def _decimal_places_for_tick_size(tick_size: Decimal) -> int:

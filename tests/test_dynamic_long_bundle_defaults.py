@@ -21,6 +21,10 @@ class DynamicLongBundleDefaultsTest(TestCase):
         self.assertEqual(config.dynamic_first_lock_r, 1)
         self.assertEqual(config.max_entries_per_trend, 3)
         self.assertEqual(config.resolved_dynamic_protection_rules()[2].lock_r, 10)
+        self.assertTrue(config.reentry_confirmation_enabled)
+        self.assertEqual(config.reentry_confirmation_min_sequence, 3)
+        self.assertEqual(config.resolved_reentry_confirmation_ma_type(), "ema")
+        self.assertEqual(config.reentry_confirmation_ma_period, 21)
 
     def test_standard_report_deserialize_preserves_dynamic_protection_rules(self) -> None:
         spec = next(item for item in build_specs() if item.profile_id == "dynamic_long_best_btc_v2")
@@ -45,6 +49,7 @@ class DynamicLongBundleDefaultsTest(TestCase):
         self.assertEqual(config.dynamic_first_lock_r, 1)
         self.assertEqual(config.max_entries_per_trend, 2)
         self.assertEqual(config.resolved_dynamic_protection_rules()[1].trigger_r, 5)
+        self.assertFalse(config.reentry_confirmation_enabled)
 
     def test_best_parameter_bundle_syncs_doge_final_long_profile(self) -> None:
         spec = next(item for item in build_specs() if item.profile_id == "dynamic_long_best_doge_v2")
@@ -61,6 +66,7 @@ class DynamicLongBundleDefaultsTest(TestCase):
         self.assertEqual(config.max_entries_per_trend, 2)
         self.assertEqual(config.resolved_dynamic_protection_rules()[1].trigger_r, 6)
         self.assertEqual(config.resolved_dynamic_protection_rules()[0].trigger_r, 2)
+        self.assertFalse(config.reentry_confirmation_enabled)
 
     def test_ready_pack_syncs_eth_final_long_profile(self) -> None:
         spec = next(item for item in build_ready_specs("demo") if item.profile_id == "eth-long-ma5-bjt08")
@@ -73,6 +79,10 @@ class DynamicLongBundleDefaultsTest(TestCase):
         self.assertEqual(config.ema55_slope_lock_profit_trigger_r, 4)
         self.assertEqual(config.dynamic_first_lock_r, 1)
         self.assertEqual(config.max_entries_per_trend, 3)
+        self.assertTrue(config.reentry_confirmation_enabled)
+        self.assertEqual(config.reentry_confirmation_min_sequence, 3)
+        self.assertEqual(config.resolved_reentry_confirmation_ma_type(), "ema")
+        self.assertEqual(config.reentry_confirmation_ma_period, 21)
 
     def test_ready_pack_syncs_sol_final_long_profile(self) -> None:
         spec = next(item for item in build_ready_specs("demo") if item.profile_id == "sol-long-ema5-bjt08")
@@ -85,6 +95,7 @@ class DynamicLongBundleDefaultsTest(TestCase):
         self.assertEqual(config.ema55_slope_lock_profit_trigger_r, 5)
         self.assertEqual(config.dynamic_first_lock_r, 1)
         self.assertEqual(config.max_entries_per_trend, 2)
+        self.assertFalse(config.reentry_confirmation_enabled)
 
     def test_ready_pack_syncs_doge_final_long_profile(self) -> None:
         spec = next(item for item in build_ready_specs("demo") if item.profile_id == "doge-long-ma13-bjt08")
@@ -98,3 +109,4 @@ class DynamicLongBundleDefaultsTest(TestCase):
         self.assertEqual(config.dynamic_first_lock_r, 1)
         self.assertEqual(config.max_entries_per_trend, 2)
         self.assertEqual(config.resolved_dynamic_protection_rules()[0].trigger_r, 2)
+        self.assertFalse(config.reentry_confirmation_enabled)

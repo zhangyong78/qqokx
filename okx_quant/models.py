@@ -384,6 +384,10 @@ class StrategyConfig:
     max_entries_per_trend: int = 1
     entry_reference_ema_period: int = 55
     entry_reference_ema_type: MovingAverageType = "ema"
+    reentry_confirmation_enabled: bool = False
+    reentry_confirmation_min_sequence: int = 0
+    reentry_confirmation_ma_period: int = 21
+    reentry_confirmation_ma_type: MovingAverageType = "ema"
     dynamic_two_r_break_even: bool = True
     dynamic_break_even_trigger_r: int = 2
     dynamic_fee_offset_enabled: bool = True
@@ -540,6 +544,32 @@ class StrategyConfig:
         if self.entry_reference_ema_period > 0:
             return f"EMA{resolved_period}"
         return f"跟随快线(EMA{resolved_period})"
+
+    def uses_reentry_confirmation(self) -> bool:
+        return bool(self.reentry_confirmation_enabled and self.reentry_confirmation_min_sequence > 0)
+
+    def resolved_reentry_confirmation_min_sequence(self) -> int:
+        return max(int(self.reentry_confirmation_min_sequence), 0)
+
+    def resolved_reentry_confirmation_ma_period(self) -> int:
+        return max(int(self.reentry_confirmation_ma_period), 1)
+
+    def resolved_reentry_confirmation_ma_type(self) -> MovingAverageType:
+        return normalize_moving_average_type(self.reentry_confirmation_ma_type)
+
+    def reentry_confirmation_line_label(self) -> str:
+        return moving_average_display_label(
+            self.resolved_reentry_confirmation_ma_type(),
+            self.resolved_reentry_confirmation_ma_period(),
+        )
+
+    def reentry_confirmation_summary(self) -> str:
+        if not self.uses_reentry_confirmation():
+            return "再开仓确认：关闭"
+        return (
+            f"再开仓确认：本波第 {self.resolved_reentry_confirmation_min_sequence()} 次及以后，"
+            f"上一根已收K收盘价需站上 {self.reentry_confirmation_line_label()}"
+        )
 
     def dynamic_two_r_break_even_label(self) -> str:
         return "\u5f00\u542f" if self.dynamic_two_r_break_even else "\u5173\u95ed"

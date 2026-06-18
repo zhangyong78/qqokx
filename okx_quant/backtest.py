@@ -1804,6 +1804,27 @@ def _direction_filter_allows_signal(bias: str, signal: str | None) -> bool:
     return signal in _direction_filter_bias_allowed_signals(bias)
 
 
+def _reentry_confirmation_blocks_entry(
+    *,
+    config: StrategyConfig,
+    signal: str,
+    wave_entry_sequence: int,
+    candle: Candle,
+    confirmation_value: Decimal | None,
+) -> bool:
+    if not config.uses_reentry_confirmation():
+        return False
+    if wave_entry_sequence < config.resolved_reentry_confirmation_min_sequence():
+        return False
+    if confirmation_value is None:
+        return True
+    if signal == "long":
+        return candle.close <= confirmation_value
+    if signal == "short":
+        return candle.close >= confirmation_value
+    return False
+
+
 def _required_mtf_filter_preload_candles(config: StrategyConfig) -> int:
     return max(
         int(config.mtf_filter_fast_ema_period),
@@ -1840,6 +1861,8 @@ def _required_backtest_preload_candles(config: StrategyConfig) -> int:
             config.atr_period,
             config.resolved_entry_reference_ema_period(),
         )
+    if config.uses_reentry_confirmation():
+        minimum = max(minimum, config.resolved_reentry_confirmation_ma_period() + 2)
     return _backtest_trade_start_index(minimum)
 
 
@@ -2649,10 +2672,23 @@ def _run_adaptive_rail_backtest(
     candidate_periods = adaptive_rail_candidate_periods(config)
     ema_periods = {period for period in candidate_periods if period > 0}
     ema_periods.add(int(config.trend_ema_period))
+    if config.uses_reentry_confirmation():
+        ema_periods.add(config.resolved_reentry_confirmation_ma_period())
     if bool(config.rail_fast_gate_enabled) and int(config.rail_fast_gate_period) > 0:
         ema_periods.add(int(config.rail_fast_gate_period))
     ema_by_period = {period: ema(closes, period) for period in sorted(ema_periods)}
     trend_ema_values = ema_by_period.get(int(config.trend_ema_period)) or ema(closes, int(config.trend_ema_period))
+    reentry_confirmation_values = (
+        ema_by_period.get(config.resolved_reentry_confirmation_ma_period())
+        if config.uses_reentry_confirmation() and config.resolved_reentry_confirmation_ma_type() == "ema"
+        else moving_average(
+            closes,
+            config.resolved_reentry_confirmation_ma_period(),
+            config.resolved_reentry_confirmation_ma_type(),
+        )
+        if config.uses_reentry_confirmation()
+        else []
+    )
     ema200_values = ema_by_period.get(200) or ema(closes, 200)
     atr_values = atr(candles, config.atr_period)
     trades: list[BacktestTrade] = []
@@ -2806,6 +2842,20 @@ def _run_adaptive_rail_backtest(
             continue
         if config.max_entries_per_trend > 0 and entries_on_current_rail >= config.max_entries_per_trend:
             continue
+        next_wave_entry_sequence = entries_on_current_rail + 1
+        reentry_confirmation_value = (
+            reentry_confirmation_values[index]
+            if index < len(reentry_confirmation_values)
+            else None
+        )
+        if _reentry_confirmation_blocks_entry(
+            config=config,
+            signal=decision.signal,
+            wave_entry_sequence=next_wave_entry_sequence,
+            candle=candles[index],
+            confirmation_value=reentry_confirmation_value,
+        ):
+            continue
 
         resolved_config = _resolve_backtest_config(config, trades)
         try:
@@ -2954,6 +3004,15 @@ def _run_dynamic_backtest(
         else moving_average(closes, entry_reference_ema_period, config.resolved_entry_reference_ema_type())
     )
     trend_ema_values = moving_average(closes, config.trend_ema_period, config.resolved_trend_ema_type())
+    reentry_confirmation_values = (
+        moving_average(
+            closes,
+            config.resolved_reentry_confirmation_ma_period(),
+            config.resolved_reentry_confirmation_ma_type(),
+        )
+        if config.uses_reentry_confirmation()
+        else []
+    )
     atr_values = atr(candles, config.atr_period)
     trades: list[BacktestTrade] = []
     open_position: _OpenPosition | None = None
@@ -3084,6 +3143,20 @@ def _run_dynamic_backtest(
             current_wave_signal = decision.signal
             entries_in_current_wave = 0
         if config.max_entries_per_trend > 0 and entries_in_current_wave >= config.max_entries_per_trend:
+            continue
+        next_wave_entry_sequence = entries_in_current_wave + 1
+        reentry_confirmation_value = (
+            reentry_confirmation_values[index]
+            if index < len(reentry_confirmation_values)
+            else None
+        )
+        if _reentry_confirmation_blocks_entry(
+            config=config,
+            signal=decision.signal,
+            wave_entry_sequence=next_wave_entry_sequence,
+            candle=candles[index],
+            confirmation_value=reentry_confirmation_value,
+        ):
             continue
 
         resolved_config = _resolve_backtest_config(config, trades)
