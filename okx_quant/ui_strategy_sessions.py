@@ -6972,7 +6972,7 @@ class UiStrategySessionsMixin:
     def _strategy_session_supports_position_recovery(config: StrategyConfig) -> bool:
         return (
             str(getattr(config, "run_mode", "") or "").strip().lower() == "trade"
-            and str(getattr(config, "tp_sl_mode", "") or "").strip().lower() == "exchange"
+            and str(getattr(config, "tp_sl_mode", "") or "").strip().lower() in {"exchange", "local_trade"}
         )
 
     def _session_can_auto_migrate_on_close(self, session: StrategySession) -> bool:
@@ -7967,9 +7967,86 @@ class UiStrategySessionsMixin:
             entry_price=entry_price,
             entry_ts=int((trade.opened_logged_at or session.started_at).timestamp() * 1000),
         )
+        tp_sl_mode = str(session.config.tp_sl_mode or "").strip().lower()
         take_profit_mode = str(session.config.take_profit_mode or "").strip().lower()
         fallback_to_managed_monitor = False
-        if take_profit_mode == "dynamic":
+        if tp_sl_mode == "local_trade":
+            stop_price = trade.current_stop_price or trade.initial_stop_price or trade.pending_stop_price
+            if stop_price is None or stop_price <= 0:
+                reason = "恢复接管结束：本地止盈止损缺少可恢复止损价。"
+                session.status = "待恢复"
+                session.runtime_status = "待恢复"
+                session.ended_reason = reason
+                self._upsert_session_row(session)
+                self._sync_strategy_history_from_session(session)
+                self._log_session_message(session, reason)
+                if not auto:
+                    self._enqueue_log(f"{session.log_prefix} {reason}")
+                return False
+            if trade.initial_stop_price is None:
+                trade.initial_stop_price = stop_price
+            trade.current_stop_price = stop_price
+            risk_per_unit = abs(entry_price - stop_price)
+            atr_stop_multiplier = Decimal(str(getattr(session.config, "atr_stop_multiplier", Decimal("1")) or "1"))
+            atr_take_multiplier = Decimal(str(getattr(session.config, "atr_take_multiplier", Decimal("4")) or "4"))
+            atr_value = risk_per_unit / atr_stop_multiplier if atr_stop_multiplier > 0 else risk_per_unit
+            take_profit = trade.pending_take_profit
+            if take_profit is None:
+                take_offset = atr_value * atr_take_multiplier
+                take_profit = entry_price + take_offset if direction == "long" else entry_price - take_offset
+                trade.pending_take_profit = take_profit
+            protection = ProtectionPlan(
+                trigger_inst_id=trade_inst_id,
+                trigger_price_type=session.config.tp_sl_trigger_type,
+                take_profit=take_profit,
+                stop_loss=stop_price,
+                entry_reference=entry_price,
+                atr_value=atr_value,
+                direction=direction,
+                candle_ts=int((trade.signal_bar_at or trade.opened_logged_at or session.started_at).timestamp() * 1000),
+            )
+            start_message = (
+                "检测到现有 OKX 仓位，开始恢复本地止盈止损监控"
+                f" | 标的={trade_inst_id}"
+                f" | 方向={direction.upper()}"
+                f" | 数量={format_decimal(size)}"
+                f" | 当前止损={format_decimal(stop_price)}"
+                f" | 止盈={format_decimal(take_profit)}"
+            )
+
+            def _monitor() -> None:
+                if is_ema55_slope_short_strategy(session.config.strategy_id):
+                    signal_inst_id = (session.config.inst_id or trade_inst_id).strip().upper() or trade_inst_id
+                    signal_instrument = (
+                        trade_instrument
+                        if signal_inst_id == trade_instrument.inst_id
+                        else session.engine._get_instrument_with_retry(signal_inst_id)
+                    )
+                    lookback = recommended_indicator_lookback(
+                        session.config.ema_period,
+                        session.config.trend_ema_period,
+                        session.config.atr_period,
+                        session.config.resolved_entry_reference_ema_period(),
+                        DEFAULT_DEBUG_ATR_PERIOD,
+                    )
+                    session.engine._monitor_ema55_slope_short_local_exit(
+                        credentials,
+                        session.config,
+                        signal_instrument=signal_instrument,
+                        trade_instrument=trade_instrument,
+                        position=position,
+                        protection=protection,
+                        lookback=lookback,
+                    )
+                    return
+                session.engine._monitor_local_exit_v2(
+                    credentials,
+                    session.config,
+                    trade_instrument,
+                    position,
+                    protection,
+                )
+        elif take_profit_mode == "dynamic":
             if auto_restore_probe is not None and auto_restore_probe.get("protective_order_checked"):
                 protective_order = auto_restore_probe.get("protective_order")
             else:
@@ -8320,6 +8397,9 @@ class UiStrategySessionsMixin:
                 if trade.initial_stop_price is None:
                     trade.initial_stop_price = stop_price
                 trade.current_stop_price = stop_price
+            take_profit = _extract_log_field_decimal(message, "止盈")
+            if take_profit is not None:
+                trade.pending_take_profit = take_profit
             return
         if "开始本地止盈止损监控" in message:
             trade = session.active_trade
@@ -8330,6 +8410,9 @@ class UiStrategySessionsMixin:
                 if trade.initial_stop_price is None:
                     trade.initial_stop_price = stop_price
                 trade.current_stop_price = stop_price
+            take_profit = _extract_log_field_decimal(message, "止盈")
+            if take_profit is not None:
+                trade.pending_take_profit = take_profit
             return
         if "OKX 动态止损已上移" in message:
             trade = session.active_trade

@@ -3603,6 +3603,137 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(session.ended_reason, "恢复为托管持仓监控")
         start_custom.assert_called_once()
 
+    def test_recover_session_restores_local_trade_monitor_for_slope_short_position(self) -> None:
+        session = self._make_session()
+        session.strategy_id = STRATEGY_EMA55_SLOPE_SHORT_ID
+        session.symbol = "SOL-USDT-SWAP"
+        session.config = StrategyConfig(
+            inst_id="SOL-USDT-SWAP",
+            trade_inst_id="SOL-USDT-SWAP",
+            bar="1H",
+            ema_type="ma",
+            ema_period=20,
+            trend_ema_period=20,
+            big_ema_period=0,
+            entry_reference_ema_period=55,
+            atr_period=15,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            risk_amount=Decimal("4"),
+            tp_sl_mode="local_trade",
+            take_profit_mode="dynamic",
+        )
+        local_monitor = MagicMock()
+        managed_monitor = MagicMock()
+        dynamic_monitor = MagicMock()
+
+        class _StopEvent:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def is_set(self) -> bool:
+                return self.stopped
+
+            def set(self) -> None:
+                self.stopped = True
+
+        stop_event = _StopEvent()
+        session.engine = SimpleNamespace(
+            is_running=False,
+            start_custom=lambda func, **_kwargs: func(),
+            _stop_event=stop_event,
+            _get_instrument_with_retry=lambda _inst_id: Instrument(
+                inst_id="SOL-USDT-SWAP",
+                inst_type="SWAP",
+                tick_size=Decimal("0.01"),
+                lot_size=Decimal("0.01"),
+                min_size=Decimal("0.01"),
+                state="live",
+            ),
+            _monitor_ema55_slope_short_local_exit=local_monitor,
+            _monitor_exchange_dynamic_stop=dynamic_monitor,
+            _monitor_exchange_managed_position_until_closed=managed_monitor,
+            _monitor_local_exit_v2=MagicMock(),
+            _run=MagicMock(),
+            _logger=MagicMock(),
+            _notify_error=MagicMock(),
+        )
+        session.active_trade = StrategyTradeRuntimeState(
+            round_id="S14-1",
+            opened_logged_at=datetime(2026, 6, 18, 4, 0, 11),
+            entry_order_id="3664949666738397184",
+            entry_client_order_id="s14stgent061720001136601",
+            entry_price=Decimal("71.56"),
+            size=Decimal("3.09"),
+            pending_signal="short",
+            pending_side="sell",
+            initial_stop_price=Decimal("73.5"),
+            current_stop_price=Decimal("73.5"),
+            pending_take_profit=Decimal("67.68"),
+        )
+        position = OkxPosition(
+            inst_id="SOL-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="short",
+            mgn_mode="cross",
+            position=Decimal("3.09"),
+            avail_position=Decimal("3.09"),
+            avg_price=Decimal("71.56"),
+            mark_price=Decimal("72"),
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy=None,
+            last_price=Decimal("72"),
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+        app = SimpleNamespace(
+            root=SimpleNamespace(after=lambda _delay, callback: callback()),
+            sessions={"S01": session},
+            _recoverable_strategy_sessions={},
+            _credentials_for_profile_or_none=lambda _api_name: SimpleNamespace(profile_name="moni"),
+            _restore_session_trade_runtime_from_log=lambda session_: session_.active_trade,
+            _find_recovery_claim_conflict=lambda session_id, trade: None,
+            _load_recoverable_live_positions=lambda *_args, **_kwargs: [position],
+            _select_recoverable_live_position=lambda *_args, **_kwargs: position,
+            _recoverable_position_direction=lambda position_: QuantApp._recoverable_position_direction(position_),
+            _find_recoverable_protective_order=MagicMock(side_effect=AssertionError("local_trade should not look for algo order")),
+            _build_recoverable_strategy_session_record=lambda session_: SimpleNamespace(session_id=session_.session_id, api_name=session_.api_name),
+            _upsert_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _remove_recoverable_strategy_session=MagicMock(),
+            _log_session_message=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+
+        result = QuantApp._recover_session(app, "S01", auto=False)
+
+        self.assertTrue(result)
+        local_monitor.assert_called_once()
+        dynamic_monitor.assert_not_called()
+        managed_monitor.assert_not_called()
+        session.engine._logger.assert_any_call(
+            "检测到现有 OKX 仓位，开始恢复本地止盈止损监控"
+            " | 标的=SOL-USDT-SWAP | 方向=SHORT | 数量=3.09 | 当前止损=73.5 | 止盈=67.68"
+        )
+
     def test_recover_session_starts_pending_order_takeover_when_order_is_still_live(self) -> None:
         session = self._make_session()
         start_custom = MagicMock()

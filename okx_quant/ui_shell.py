@@ -231,6 +231,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA55_SLOPE_SHORT_ID,
     StrategyDefinition,
     get_strategy_definition,
+    is_ema55_slope_short_strategy,
     resolve_dynamic_signal_mode,
     supports_startup_chase_current_signal,
     supports_trader_desk,
