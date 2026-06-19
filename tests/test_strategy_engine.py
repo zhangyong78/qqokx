@@ -138,6 +138,106 @@ class StrategyEngineTest(TestCase):
         self.assertIn("日线过滤", messages[0])
         self.assertIn("北京时间8点", messages[0])
 
+    def test_ema55_slope_short_local_strategy_continues_after_round_trip(self) -> None:
+        messages: list[str] = []
+        waits: list[float] = []
+        monitor_calls: list[bool] = []
+        candles = self._make_candles([str(100 + index) for index in range(80)])
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+                self._wait_calls = 0
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, timeout: float) -> bool:
+                waits.append(timeout)
+                self._wait_calls += 1
+                if self._wait_calls >= 1:
+                    self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            _HistoryClient(),
+            messages.append,
+            strategy_name="均线斜率做空",
+            session_id="S-slope-loop",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_local_mode_summary = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_candles_with_retry = lambda *args, **kwargs: candles  # type: ignore[assignment]
+        engine._clear_ema55_slope_same_bar_reentry_block_if_advanced = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_ema55_slope_same_bar_reentry_block_ts = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._apply_live_daily_filter_to_decision = lambda _candles, _config, decision: decision  # type: ignore[assignment]
+        engine._build_local_protection_plan = lambda *args, **kwargs: object()  # type: ignore[assignment]
+        engine._open_local_position = lambda *args, **kwargs: FilledPosition(  # type: ignore[assignment]
+            ord_id="ord-1",
+            cl_ord_id="cl-1",
+            inst_id="DOGE-USDT-SWAP",
+            side="sell",
+            close_side="buy",
+            pos_side=None,
+            size=Decimal("4"),
+            entry_price=Decimal("0.08504"),
+            entry_ts=0,
+        )
+        engine._monitor_ema55_slope_short_local_exit = (  # type: ignore[assignment]
+            lambda *args, **kwargs: monitor_calls.append(True)
+        )
+
+        config = StrategyConfig(
+            inst_id="DOGE-USDT-SWAP",
+            trade_inst_id="DOGE-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=13,
+            atr_stop_multiplier=Decimal("1"),
+            atr_take_multiplier=Decimal("2"),
+            order_size=Decimal("4"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+            poll_seconds=10,
+        )
+        instrument = Instrument(
+            inst_id="DOGE-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.00001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+
+        def _fake_evaluate(_candles, _config, **_kw):  # noqa: ANN001
+            return SignalDecision(
+                signal="short",
+                reason="MA21 斜率达到阈值",
+                candle_ts=_candles[-1].ts,
+                entry_reference=Decimal("0.08504"),
+                atr_value=Decimal("0.001"),
+                ema_value=Decimal("0.085"),
+                signal_candle_high=Decimal("0.086"),
+                signal_candle_low=Decimal("0.084"),
+            )
+
+        with patch("okx_quant.engine.time.time", return_value=0.0), patch(
+            "okx_quant.engine.evaluate_ema55_slope_short_signal",
+            new=_fake_evaluate,
+        ):
+            engine._run_ema55_slope_short_local_strategy(None, config, instrument, instrument)  # type: ignore[arg-type]
+
+        self.assertEqual(monitor_calls, [True])
+        self.assertTrue(any("本轮持仓已结束，继续监控下一次信号。" in message for message in messages))
+        self.assertEqual(waits, [10])
+
     def test_get_okx_read_retry_config_env_overrides(self) -> None:
         with patch.dict(
             os.environ,
@@ -2021,6 +2121,96 @@ class StrategyEngineTest(TestCase):
         self.assertTrue(any("2310.5" in message for message in tracked_messages))
         self.assertEqual(waits, [10])
 
+    def test_resume_dynamic_exchange_pending_order_loop_hands_off_partial_fill(self) -> None:
+        messages: list[str] = []
+        handled: dict[str, object] = {}
+        resume_calls: list[bool] = []
+
+        class _StopStub:
+            def is_set(self) -> bool:
+                return False
+
+            def wait(self, _timeout: float) -> bool:
+                return False
+
+        engine = StrategyEngine(
+            _HistoryClient(),
+            messages.append,
+            strategy_name="EMA 鍔ㄦ€佸鎵樺仛澶?",
+            session_id="S-partial-resume",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._get_order_with_retry = lambda *args, **kwargs: OkxOrderStatus(  # type: ignore[assignment]
+            ord_id="ord-partial",
+            state="partially_filled",
+            side="buy",
+            ord_type="limit",
+            price=Decimal("2300"),
+            avg_price=Decimal("2299"),
+            size=Decimal("0.02"),
+            filled_size=Decimal("0.01"),
+            raw={},
+        )
+        engine._handle_partial_dynamic_entry = lambda *args, **kwargs: handled.update(  # type: ignore[assignment]
+            {
+                "status": kwargs["status"],
+                "dynamic_stop_only": kwargs["dynamic_stop_only"],
+            }
+        ) or True
+        engine.resume_automatic_trade_management = lambda: resume_calls.append(True)  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            take_profit_mode="dynamic",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        active_order = ManagedEntryOrder(
+            ord_id="ord-partial",
+            cl_ord_id="cl-partial",
+            candle_ts=60_000,
+            entry_reference=Decimal("2300"),
+            stop_loss=Decimal("2280"),
+            take_profit=Decimal("2340"),
+            stop_loss_algo_cl_ord_id=None,
+            size=Decimal("0.02"),
+            side="buy",
+            signal="long",
+        )
+
+        engine._resume_dynamic_exchange_pending_order_loop(
+            None,  # type: ignore[arg-type]
+            config,
+            instrument,
+            active_order=active_order,
+        )
+
+        self.assertIsInstance(handled.get("status"), OkxOrderStatus)
+        self.assertEqual(handled["status"].state, "partially_filled")
+        self.assertTrue(handled["dynamic_stop_only"])
+        self.assertEqual(resume_calls, [True])
+
     def test_dynamic_exchange_strategy_trader_virtual_mode_skips_exchange_stop_and_uses_virtual_monitor(self) -> None:
         messages: list[str] = []
         submit_calls = {"count": 0}
@@ -2374,6 +2564,102 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(captured_monitor["stop_loss_algo_id"], "algo-1")
         self.assertEqual(captured_monitor["stop_loss_algo_cl_ord_id"], "slg-after-fill")
         self.assertTrue(any("初始 OKX 止损已补挂" in message for message in messages))
+
+    def test_handle_partial_dynamic_entry_cancels_remaining_and_manages_partial_position(self) -> None:
+        messages: list[str] = []
+        notifications: list[dict[str, object]] = []
+        captured_monitor: dict[str, object] = {}
+
+        engine = StrategyEngine(
+            _HistoryClient(),
+            messages.append,
+            strategy_name="EMA 鍔ㄦ€佸鎵樺仛澶?",
+            session_id="S-partial-manage",
+        )
+        engine._notify_trade_fill = lambda *args, **kwargs: notifications.append(kwargs)  # type: ignore[assignment]
+        engine._cancel_active_order = lambda *args, **kwargs: CancelActiveOrderResult(  # type: ignore[assignment]
+            "canceled",
+            OkxOrderStatus(
+                ord_id="ord-partial",
+                state="canceled",
+                side="buy",
+                ord_type="limit",
+                price=Decimal("2300"),
+                avg_price=Decimal("2299"),
+                size=Decimal("0.02"),
+                filled_size=Decimal("0.01"),
+                raw={},
+            ),
+        )
+        engine._find_pending_entry_order = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._monitor_exchange_managed_position_until_closed = lambda *args, **kwargs: captured_monitor.update(kwargs)  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            take_profit_mode="fixed",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        active_order = ManagedEntryOrder(
+            ord_id="ord-partial",
+            cl_ord_id="cl-partial",
+            candle_ts=60_000,
+            entry_reference=Decimal("2300"),
+            stop_loss=Decimal("2280"),
+            take_profit=Decimal("2340"),
+            stop_loss_algo_cl_ord_id=None,
+            size=Decimal("0.02"),
+            side="buy",
+            signal="long",
+        )
+        status = OkxOrderStatus(
+            ord_id="ord-partial",
+            state="partially_filled",
+            side="buy",
+            ord_type="limit",
+            price=Decimal("2300"),
+            avg_price=Decimal("2299"),
+            size=Decimal("0.02"),
+            filled_size=Decimal("0.01"),
+            raw={},
+        )
+
+        managed = engine._handle_partial_dynamic_entry(
+            None,  # type: ignore[arg-type]
+            config,
+            trade_instrument=instrument,
+            active_order=active_order,
+            status=status,
+            newest_ts=60_000,
+            dynamic_stop_only=False,
+        )
+
+        self.assertTrue(managed)
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(captured_monitor["position"].size, Decimal("0.01"))
+        self.assertEqual(captured_monitor["position"].entry_price, Decimal("2299"))
+        self.assertTrue(any("ord-partial" in message for message in messages))
 
     def test_dynamic_exchange_strategy_logs_no_signal_only_once_per_candle(self) -> None:
         messages: list[str] = []

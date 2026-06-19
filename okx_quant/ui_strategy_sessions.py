@@ -7511,8 +7511,7 @@ class UiStrategySessionsMixin:
             )
             self.sessions[record.session_id] = session
             self._update_session_counter_from_session_id(record.session_id)
-            self._upsert_session_row(session)
-            self._sync_strategy_history_from_session(session)
+            self._refresh_session_financials_from_trade_ledger(session)
 
     def _attempt_auto_restore_recoverable_sessions(self) -> None:
         session_ids = list(self._recoverable_strategy_sessions.keys())

@@ -3,6 +3,11 @@ $ErrorActionPreference = "Stop"
 $runnerPath = Join-Path $PSScriptRoot "send_btc_market_analysis_email.ps1"
 $powershellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 $taskPrefix = "QQOKX BTC Analysis Email"
+$taskSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -MultipleInstances IgnoreNew
 $taskConfigs = @(
     @{ Time = "00:00"; DeliveryMode = "archive_only"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "00:00" },
     @{ Time = "04:00"; DeliveryMode = "archive_only"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "04:00" },
@@ -23,5 +28,6 @@ foreach ($config in $taskConfigs) {
         "-AnalysisSlot `"$($config.AnalysisSlot)`""
     )
     schtasks /Create /TN $taskName /SC DAILY /ST $time /TR $taskCommand /F | Out-Null
+    Set-ScheduledTask -TaskName $taskName -Settings $taskSettings | Out-Null
     Write-Output "registered $taskName at $time [$($config.DeliveryMode)]"
 }

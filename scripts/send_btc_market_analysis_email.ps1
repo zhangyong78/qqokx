@@ -1,11 +1,11 @@
-$ErrorActionPreference = "Stop"
-
 param(
     [ValidateSet("immediate", "archive_only", "release_pending_and_send")]
     [string]$DeliveryMode = "immediate",
     [string]$ScheduledReleaseSlot = "08:00",
     [string]$AnalysisSlot = ""
 )
+
+$ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $projectRoot

@@ -5777,6 +5777,94 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(target.net_pnl_total, Decimal("0"))
         self.assertEqual(target.last_close_reason, "")
 
+    def test_hydrate_recoverable_strategy_sessions_restores_session_financials_from_trade_ledger(self) -> None:
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            trade_inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("1"),
+            atr_take_multiplier=Decimal("2"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("4"),
+            run_mode="trade",
+            tp_sl_mode="exchange",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+        )
+        record = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            strategy_name="EMA dynamic",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            started_at=datetime(2026, 6, 20, 15, 0, 26),
+            history_record_id="H01",
+            log_file_path=None,
+            recovery_root_dir=Path("D:/qqokx/recovery/S01"),
+            config_snapshot=_serialize_strategy_config_snapshot(config),
+            updated_at=datetime(2026, 6, 20, 15, 10, 0),
+        )
+        ledger_record = StrategyTradeLedgerRecord(
+            record_id="T01",
+            history_record_id="H01",
+            session_id="S01",
+            api_name="moni",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            strategy_name="EMA dynamic",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            environment="demo",
+            closed_at=datetime(2026, 6, 20, 15, 8, 0),
+            round_id="round-1",
+            net_pnl=Decimal("12.34"),
+            gross_pnl=Decimal("12.50"),
+            entry_fee=Decimal("-0.08"),
+            exit_fee=Decimal("-0.08"),
+            funding_fee=Decimal("0"),
+            close_reason="止盈",
+        )
+        app = SimpleNamespace(
+            _recoverable_strategy_sessions={"S01": record},
+            sessions={},
+            _strategy_trade_ledger_records=[ledger_record],
+            _build_notifier=lambda *_args, **_kwargs: object(),
+            _build_session_notifier=lambda *_args, **_kwargs: object(),
+            _format_strategy_symbol_display=lambda signal_symbol, trade_symbol: trade_symbol or signal_symbol,
+            _create_session_engine=lambda **_kwargs: SimpleNamespace(),
+            _strategy_session_supports_recovery=lambda _config: True,
+            _update_session_counter_from_session_id=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _refresh_selected_session_details=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+        )
+        app._apply_financial_totals = lambda target, records: QuantApp._apply_financial_totals(app, target, records)
+        app._refresh_session_financials_from_trade_ledger = (
+            lambda session: QuantApp._refresh_session_financials_from_trade_ledger(app, session)
+        )
+
+        with patch("okx_quant.ui.get_strategy_definition", return_value=SimpleNamespace(name="EMA dynamic", default_signal_label="只做多")):
+            QuantApp._hydrate_recoverable_strategy_sessions(app)
+
+        session = app.sessions["S01"]
+        self.assertEqual(session.history_record_id, "H01")
+        self.assertEqual(session.trade_count, 1)
+        self.assertEqual(session.win_count, 1)
+        self.assertEqual(session.gross_pnl_total, Decimal("12.50"))
+        self.assertEqual(session.net_pnl_total, Decimal("12.34"))
+        self.assertEqual(session.last_net_pnl, Decimal("12.34"))
+        self.assertEqual(session.last_close_reason, "止盈")
+        app._upsert_session_row.assert_called_once_with(session)
+        app._sync_strategy_history_from_session.assert_called_once_with(session)
+
 
 class _FastEvent:
     def wait(self, timeout: float | None = None) -> bool:

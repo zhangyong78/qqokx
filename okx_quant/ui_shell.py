@@ -42,6 +42,7 @@ from okx_quant.btc_research_workbench_ui import BtcResearchWorkbenchWindow
 from okx_quant.deribit_client import DeribitRestClient
 from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
+from okx_quant.email_schedule_manager_ui import EmailScheduleManagerWindow
 from okx_quant.daily_filters import daily_boundary_anchor_offset_ms
 from okx_quant.engine import (
     DEFAULT_DEBUG_ATR_PERIOD,
@@ -3225,6 +3226,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._journal_window: JournalWindow | None = None
         self._signal_monitor_window: SignalMonitorWindow | None = None
         self._trader_desk_window: TraderDeskWindow | None = None
+        self._email_schedule_manager_window: EmailScheduleManagerWindow | None = None
         self._line_trading_desk_window: LineTradingDeskWindowState | None = None
         self._smart_order_window: SmartOrderWindow | None = None
         self._arbitrage_window: ArbitrageWindow | None = None
@@ -4056,6 +4058,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         tools_menu.add_command(label="打开回测窗口", command=self.open_backtest_window)
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
         tools_menu.add_command(label="打开BTC行情分析", command=self.open_btc_market_analysis_window)
+        tools_menu.add_command(label="打开邮件任务管理器", command=self.open_email_schedule_manager_window)
         tools_menu.add_command(label="打开BTC研究工作台", command=self.open_btc_research_workbench_window)
         tools_menu.add_command(label="打开信号复盘实验室", command=self.open_signal_replay_mock_window)
         tools_menu.add_command(label="打开行情日记", command=self.open_journal_window)
@@ -7727,6 +7730,17 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self.root,
             logger=self._enqueue_log,
         )
+
+    def open_email_schedule_manager_window(self) -> None:
+        if self._email_schedule_manager_window is not None and self._email_schedule_manager_window.window.winfo_exists():
+            self._email_schedule_manager_window.show()
+            return
+
+        self._email_schedule_manager_window = EmailScheduleManagerWindow(
+            self.root,
+            on_close=lambda: setattr(self, "_email_schedule_manager_window", None),
+        )
+        self._email_schedule_manager_window.show()
 
     def open_signal_replay_mock_window(self) -> None:
         if self._signal_replay_mock_window is not None and self._signal_replay_mock_window.window.winfo_exists():
@@ -13292,6 +13306,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self._signal_replay_mock_window.destroy()
         if self._journal_window is not None and self._journal_window.window.winfo_exists():
             self._journal_window.destroy()
+        if (
+            self._email_schedule_manager_window is not None
+            and self._email_schedule_manager_window.window.winfo_exists()
+        ):
+            self._email_schedule_manager_window.destroy()
         if self._signal_monitor_window is not None and self._signal_monitor_window.window.winfo_exists():
             self._signal_monitor_window.destroy()
         if self._trader_desk_window is not None and self._trader_desk_window.window.winfo_exists():
