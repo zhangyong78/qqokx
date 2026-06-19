@@ -232,7 +232,8 @@ class EmailScheduleManagerWindow:
         try:
             bundle = collect_email_schedule_snapshot()
         except Exception as exc:
-            self.window.after(0, lambda: self._finish_refresh_error(str(exc)))
+            error_text = str(exc)
+            self.window.after(0, lambda error_text=error_text: self._finish_refresh_error(error_text))
             return
         self.window.after(0, lambda: self._finish_refresh_success(bundle))
 

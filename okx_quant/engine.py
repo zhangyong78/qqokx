@@ -941,25 +941,6 @@ class StrategyEngine:
                         return
                     self._logger("本轮持仓已结束，继续监控下一次信号。")
                     continue
-                if state == "partially_filled":
-                    filled_price = status.avg_price or status.price or active_order.entry_reference
-                    filled_size = status.filled_size or active_order.size
-                    self._logger(
-                        f"{_fmt_ts(newest_ts)} | 挂单部分成交 | ordId={status.ord_id} | "
-                        "为避免重复撤单重挂，策略已停止，请手动检查剩余委托。"
-                    )
-                    self._notify_trade_fill(
-                        config,
-                        title="开仓委托部分成交",
-                        symbol=config.inst_id,
-                        side=active_order.side,
-                        size=filled_size,
-                        size_text=_format_notify_size_with_unit(instrument, filled_size),
-                        price=filled_price,
-                        tick_size=instrument.tick_size,
-                        reason="EMA 动态委托出现部分成交，策略停止等待人工处理",
-                    )
-                    return
                 if state not in {"live"}:
                     self._logger(
                         f"{_fmt_ts(newest_ts)} | 检测到挂单状态已变更为 {status.state}，准备重新同步挂单。"
@@ -1019,14 +1000,6 @@ class StrategyEngine:
                         return
                     self._logger("本轮持仓已结束，继续监控下一次信号。")
                     continue
-                if cancel_result.action == "partially_filled":
-                    status = cancel_result.status
-                    if status is None:
-                        raise RuntimeError(f"旧挂单部分成交回查缺少订单状态，ordId={active_order.ord_id}")
-                    self._log_partial_dynamic_fill_and_stop(
-                        active_order, status, newest_ts, config, trade_instrument=instrument
-                    )
-                    return
                 active_order = None
 
             if active_order is None and idle_signal_candle_ts == newest_ts:
@@ -1297,17 +1270,26 @@ class StrategyEngine:
                         entry_ts=int(time.time() * 1000),
                         price_delta_multiplier=_instrument_price_delta_multiplier(instrument),
                     )
-                    self._logger(
-                        "恢复中的挂单已成交，但未找到可接管的 OKX 止损算法单，恢复为托管持仓监控"
-                        f" | ordId={status.ord_id or active_order.ord_id}"
-                    )
-                    self._monitor_exchange_managed_position_until_closed(
+                    stop_loss_algo_id, stop_loss_algo_cl_ord_id, created_after_fill = self._ensure_exchange_stop_loss_algo(
                         credentials,
                         config,
                         trade_instrument=instrument,
                         position=position,
+                        stop_loss=active_order.stop_loss,
+                        stop_loss_algo_id=active_order.stop_loss_algo_id,
+                        stop_loss_algo_cl_ord_id=active_order.stop_loss_algo_cl_ord_id,
                     )
-                    return
+                    if created_after_fill:
+                        self._logger(
+                            "恢复中的挂单已成交，未找到可接管的 OKX 止损算法单，已补挂新的初始止损"
+                            f" | ordId={status.ord_id or active_order.ord_id} | "
+                            f"algoClOrdId={stop_loss_algo_cl_ord_id or '-'} | algoId={stop_loss_algo_id or '-'}"
+                        )
+                    active_order = replace(
+                        active_order,
+                        stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                        stop_loss_algo_id=stop_loss_algo_id,
+                    )
                 self._manage_filled_dynamic_entry(
                     credentials,
                     config,
@@ -1340,15 +1322,6 @@ class StrategyEngine:
                     return
                 self._stop_event.wait(config.poll_seconds)
                 continue
-            if state == "partially_filled":
-                self._log_partial_dynamic_fill_and_stop(
-                    active_order,
-                    status,
-                    newest_ts,
-                    config,
-                    trade_instrument=instrument,
-                )
-                return
             if state != "live":
                 self._logger(
                     f"{_fmt_ts(newest_ts)} | 恢复接管的挂单状态已变更为 {status.state}，结束本次挂单恢复。"
@@ -1414,19 +1387,6 @@ class StrategyEngine:
                         return
                     self._stop_event.wait(config.poll_seconds)
                     continue
-                if cancel_result.action == "partially_filled":
-                    status = cancel_result.status
-                    if status is None:
-                        raise RuntimeError(f"旧挂单部分成交回查缺少订单状态，ordId={active_order.ord_id}")
-                    self._log_partial_dynamic_fill_and_stop(
-                        active_order,
-                        status,
-                        newest_candle_ts,
-                        config,
-                        trade_instrument=instrument,
-                    )
-                    return
-
                 decision = self._evaluate_dynamic_signal_decision(
                     confirmed,
                     config,
@@ -5053,6 +5013,31 @@ class StrategyEngine:
         algo_cl_ord_id = (result.cl_ord_id or stop_loss_algo_cl_ord_id or "").strip() or None
         return algo_id, algo_cl_ord_id
 
+    def _ensure_exchange_stop_loss_algo(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        stop_loss: Decimal,
+        stop_loss_algo_id: str | None,
+        stop_loss_algo_cl_ord_id: str | None,
+    ) -> tuple[str | None, str | None, bool]:
+        algo_id = (stop_loss_algo_id or "").strip() or None
+        algo_cl_ord_id = (stop_loss_algo_cl_ord_id or "").strip() or None
+        created_after_fill = False
+        if algo_id is None and algo_cl_ord_id is None:
+            algo_id, algo_cl_ord_id = self._submit_post_fill_exchange_stop_loss(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                position=position,
+                stop_loss=stop_loss,
+            )
+            created_after_fill = True
+        return algo_id, algo_cl_ord_id, created_after_fill
+
     def _should_skip_startup_takeover_when_stop_crossed(
         self,
         gate_state: StartupSignalGateState,
@@ -5590,18 +5575,15 @@ class StrategyEngine:
             price_delta_multiplier=price_delta_multiplier,
         )
         if dynamic_stop_only:
-            stop_loss_algo_id = active_order.stop_loss_algo_id
-            stop_loss_algo_cl_ord_id = active_order.stop_loss_algo_cl_ord_id
-            created_after_fill = False
-            if not (stop_loss_algo_id or "").strip() and not (stop_loss_algo_cl_ord_id or "").strip():
-                stop_loss_algo_id, stop_loss_algo_cl_ord_id = self._submit_post_fill_exchange_stop_loss(
-                    credentials,
-                    config,
-                    trade_instrument=trade_instrument,
-                    position=position,
-                    stop_loss=active_order.stop_loss,
-                )
-                created_after_fill = True
+            stop_loss_algo_id, stop_loss_algo_cl_ord_id, created_after_fill = self._ensure_exchange_stop_loss_algo(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                position=position,
+                stop_loss=active_order.stop_loss,
+                stop_loss_algo_id=active_order.stop_loss_algo_id,
+                stop_loss_algo_cl_ord_id=active_order.stop_loss_algo_cl_ord_id,
+            )
             self._logger(
                 f"{'初始 OKX 止损已补挂' if created_after_fill else '初始 OKX 止损已提交'} | "
                 f"algoClOrdId={stop_loss_algo_cl_ord_id or '-'} | algoId={stop_loss_algo_id or '-'} | "
@@ -5896,18 +5878,15 @@ class StrategyEngine:
             )
             return True
         if dynamic_stop_only:
-            stop_loss_algo_id = active_order.stop_loss_algo_id
-            stop_loss_algo_cl_ord_id = active_order.stop_loss_algo_cl_ord_id
-            created_after_fill = False
-            if not (stop_loss_algo_id or "").strip() and not (stop_loss_algo_cl_ord_id or "").strip():
-                stop_loss_algo_id, stop_loss_algo_cl_ord_id = self._submit_post_fill_exchange_stop_loss(
-                    credentials,
-                    config,
-                    trade_instrument=trade_instrument,
-                    position=position,
-                    stop_loss=active_order.stop_loss,
-                )
-                created_after_fill = True
+            stop_loss_algo_id, stop_loss_algo_cl_ord_id, created_after_fill = self._ensure_exchange_stop_loss_algo(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                position=position,
+                stop_loss=active_order.stop_loss,
+                stop_loss_algo_id=active_order.stop_loss_algo_id,
+                stop_loss_algo_cl_ord_id=active_order.stop_loss_algo_cl_ord_id,
+            )
             stop_loss_label = "初始 OKX 止损已补挂" if created_after_fill else "初始 OKX 止损已提交"
             self._logger(
                 f"{stop_loss_label} | algoClOrdId={stop_loss_algo_cl_ord_id or '-'} | "
@@ -5932,34 +5911,6 @@ class StrategyEngine:
             position=position,
         )
         return True
-
-    def _log_partial_dynamic_fill_and_stop(
-        self,
-        active_order: ManagedEntryOrder,
-        status: OkxOrderStatus,
-        newest_ts: int,
-        config: StrategyConfig,
-        *,
-        trade_instrument: Instrument,
-    ) -> None:
-        filled_price = status.avg_price or status.price or active_order.entry_reference
-        filled_size = status.filled_size or status.size or active_order.size
-        ord_id = status.ord_id or active_order.ord_id
-        self._logger(
-            f"{_fmt_ts(newest_ts)} | 挂单部分成交 | ordId={ord_id} | "
-            "为避免重复撤单重挂，策略已停止，请手动检查剩余委托。"
-        )
-        self._notify_trade_fill(
-            config,
-            title="开仓委托部分成交",
-            symbol=config.inst_id,
-            side=active_order.side,
-            size=filled_size,
-            size_text=_format_notify_size_with_unit(trade_instrument, filled_size),
-            price=filled_price,
-            tick_size=trade_instrument.tick_size,
-            reason="EMA 动态委托出现部分成交，策略停止等待人工处理",
-        )
 
     def _log_strategy_start(
         self,

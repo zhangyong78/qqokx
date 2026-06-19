@@ -2211,6 +2211,133 @@ class StrategyEngineTest(TestCase):
         self.assertTrue(handled["dynamic_stop_only"])
         self.assertEqual(resume_calls, [True])
 
+    def test_resume_dynamic_exchange_pending_order_loop_recreates_missing_dynamic_stop_algo(self) -> None:
+        messages: list[str] = []
+        resume_calls: list[bool] = []
+        submit_calls: list[dict[str, object]] = []
+        managed: dict[str, object] = {}
+
+        class _StopStub:
+            def is_set(self) -> bool:
+                return False
+
+            def wait(self, _timeout: float) -> bool:
+                return False
+
+        class _StubClient:
+            @staticmethod
+            def place_stop_loss_algo_order(
+                credentials,
+                config,
+                *,
+                inst_id: str,
+                side: str,
+                size: Decimal,
+                pos_side: str | None,
+                stop_loss_trigger_price: Decimal,
+                algo_cl_ord_id: str | None = None,
+            ) -> OkxOrderResult:
+                submit_calls.append(
+                    {
+                        "inst_id": inst_id,
+                        "side": side,
+                        "size": size,
+                        "pos_side": pos_side,
+                        "stop_loss_trigger_price": stop_loss_trigger_price,
+                        "algo_cl_ord_id": algo_cl_ord_id,
+                    }
+                )
+                return OkxOrderResult(
+                    ord_id="algo-restored",
+                    cl_ord_id=algo_cl_ord_id,
+                    s_code="0",
+                    s_msg="accepted",
+                    raw={},
+                )
+
+        engine = StrategyEngine(
+            _StubClient(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托多头",
+            session_id="S-resume-stop-restore",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._next_client_order_id = lambda *, role: "slg-restored"  # type: ignore[assignment]
+        engine._get_order_with_retry = lambda *args, **kwargs: OkxOrderStatus(  # type: ignore[assignment]
+            ord_id="ord-filled",
+            state="filled",
+            side="buy",
+            ord_type="limit",
+            price=Decimal("2300"),
+            avg_price=Decimal("2299"),
+            size=Decimal("0.02"),
+            filled_size=Decimal("0.02"),
+            raw={},
+        )
+        engine._find_latest_pending_stop_algo_order = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._manage_filled_dynamic_entry = lambda *args, **kwargs: managed.update(kwargs)  # type: ignore[assignment]
+        engine.resume_automatic_trade_management = lambda: resume_calls.append(True)  # type: ignore[assignment]
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            take_profit_mode="dynamic",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        active_order = ManagedEntryOrder(
+            ord_id="ord-filled",
+            cl_ord_id="cl-filled",
+            candle_ts=60_000,
+            entry_reference=Decimal("2300"),
+            stop_loss=Decimal("2280"),
+            take_profit=Decimal("2340"),
+            stop_loss_algo_cl_ord_id=None,
+            size=Decimal("0.02"),
+            side="buy",
+            signal="long",
+            stop_loss_algo_id=None,
+        )
+
+        engine._resume_dynamic_exchange_pending_order_loop(
+            None,  # type: ignore[arg-type]
+            config,
+            instrument,
+            active_order=active_order,
+        )
+
+        self.assertEqual(len(submit_calls), 1)
+        self.assertEqual(submit_calls[0]["inst_id"], "ETH-USDT-SWAP")
+        self.assertEqual(submit_calls[0]["side"], "sell")
+        self.assertEqual(submit_calls[0]["size"], Decimal("0.02"))
+        self.assertEqual(submit_calls[0]["pos_side"], "long")
+        self.assertEqual(submit_calls[0]["stop_loss_trigger_price"], Decimal("2280"))
+        self.assertEqual(submit_calls[0]["algo_cl_ord_id"], "slg-restored")
+        self.assertEqual(managed["active_order"].stop_loss_algo_id, "algo-restored")
+        self.assertEqual(managed["active_order"].stop_loss_algo_cl_ord_id, "slg-restored")
+        self.assertTrue(any("已补挂新的初始止损" in message for message in messages))
+        self.assertEqual(resume_calls, [True])
+
     def test_dynamic_exchange_strategy_trader_virtual_mode_skips_exchange_stop_and_uses_virtual_monitor(self) -> None:
         messages: list[str] = []
         submit_calls = {"count": 0}

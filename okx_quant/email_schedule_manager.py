@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import locale
 import re
 import subprocess
 from dataclasses import dataclass
@@ -319,7 +320,7 @@ def open_path(path: Path) -> None:
 
 def _run_powershell_json(command: str) -> Any:
     output = _run_powershell_text(command)
-    text = output.strip()
+    text = output.lstrip("\ufeff").strip()
     if not text:
         return []
     return json.loads(text)
@@ -339,13 +340,36 @@ def _run_powershell_text(command: str) -> str:
             encoded,
         ],
         capture_output=True,
-        text=True,
-        encoding="utf-8",
+        text=False,
     )
     if process.returncode != 0:
-        error_text = (process.stderr or process.stdout or "").strip()
+        error_text = _decode_process_output(process.stderr or process.stdout).strip()
         raise RuntimeError(error_text or f"PowerShell exited with code {process.returncode}")
-    return process.stdout
+    return _decode_process_output(process.stdout)
+
+
+def _decode_process_output(raw: bytes | None) -> str:
+    data = raw or b""
+    if not data:
+        return ""
+    encodings = [
+        "utf-8",
+        locale.getpreferredencoding(False),
+        "gbk",
+        "cp936",
+        "mbcs",
+    ]
+    tried: set[str] = set()
+    for encoding in encodings:
+        normalized = str(encoding or "").strip()
+        if not normalized or normalized in tried:
+            continue
+        tried.add(normalized)
+        try:
+            return data.decode(normalized)
+        except Exception:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def _coerce_rows(payload: Any) -> list[dict[str, Any]]:
