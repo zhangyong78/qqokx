@@ -949,13 +949,32 @@ class ArbitrageWindow:
         self._schedule_market_panel_refresh(initial_delay_ms=200)
 
     def show(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         self._sync_api_profile_controls()
         self.window.deiconify()
         self.window.lift()
         self.window.focus_force()
 
+    @staticmethod
+    def _widget_exists(widget: object) -> bool:
+        try:
+            return widget is not None and bool(widget.winfo_exists())
+        except Exception:
+            return False
+
+    def _safe_after(self, callback: Callable[[], object], delay_ms: int = 0) -> str | None:
+        if self._destroying or not self._widget_exists(self.window):
+            return None
+        try:
+            return self.window.after(delay_ms, callback)
+        except Exception:
+            return None
+
     def destroy(self) -> None:
         self._destroying = True
+        self._market_panel_refresh_token += 1
+        self._chart_load_token += 1
         try:
             self.manager.stop_auto_open()
             self.manager.stop_auto_close()
@@ -981,7 +1000,7 @@ class ArbitrageWindow:
             except Exception:
                 pass
             self._market_panel_job = None
-        if self.window.winfo_exists():
+        if self._widget_exists(self.window):
             self.window.destroy()
 
     def _on_close(self) -> None:
@@ -2300,7 +2319,7 @@ class ArbitrageWindow:
             self._schedule_market_panel_refresh()
 
         try:
-            self.window.after(0, _apply)
+            self._safe_after(_apply)
         except Exception:
             self._market_panel_refresh_busy = False
 
@@ -2364,7 +2383,7 @@ class ArbitrageWindow:
             self.status_text.set(message)
 
         try:
-            self.window.after(0, _write)
+            self._safe_after(_write)
         except Exception:
             pass
         self._logger(message)
@@ -2376,7 +2395,7 @@ class ArbitrageWindow:
             self.pair_close_status_text.set(message)
 
         try:
-            self.window.after(0, _apply)
+            self._safe_after(_apply)
         except Exception:
             pass
 
@@ -2387,7 +2406,7 @@ class ArbitrageWindow:
             self.roll_status_text.set(message)
 
         try:
-            self.window.after(0, _apply)
+            self._safe_after(_apply)
         except Exception:
             pass
 
@@ -2754,7 +2773,7 @@ class ArbitrageWindow:
                 self._maybe_alert(self._scan_display_rows)
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 self._scan_busy = False
 
@@ -3206,7 +3225,7 @@ class ArbitrageWindow:
                 self._schedule_market_panel_refresh(initial_delay_ms=50)
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 pass
 
@@ -3312,7 +3331,7 @@ class ArbitrageWindow:
                 self._refresh_roll_preview()
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 pass
 
@@ -3537,7 +3556,7 @@ class ArbitrageWindow:
                     messagebox.showerror("移仓失败", result.message, parent=self.window)
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 pass
 
@@ -3596,7 +3615,7 @@ class ArbitrageWindow:
                 self._schedule_market_panel_refresh(initial_delay_ms=50)
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 pass
 
@@ -4478,7 +4497,7 @@ class ArbitrageWindow:
                     messagebox.showerror("配对平仓失败", message, parent=self.window)
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 pass
 
@@ -4587,7 +4606,7 @@ class ArbitrageWindow:
                     messagebox.showerror("自动配对平仓失败", message, parent=self.window)
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 pass
 
@@ -4697,7 +4716,7 @@ class ArbitrageWindow:
                     messagebox.showerror("自动移仓失败", message, parent=self.window)
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 pass
 
@@ -5033,7 +5052,7 @@ class ArbitrageWindow:
                     messagebox.showerror("开仓失败", result.message, parent=self.window)
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 pass
 
@@ -5118,7 +5137,7 @@ class ArbitrageWindow:
                     messagebox.showerror("移仓失败", result.message, parent=self.window)
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 pass
 
@@ -5269,7 +5288,7 @@ class ArbitrageWindow:
                     messagebox.showerror("移仓失败", result.message, parent=self.window)
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 pass
 
@@ -5403,7 +5422,7 @@ class ArbitrageWindow:
                     messagebox.showerror("平仓失败", result.message, parent=self.window)
 
             try:
-                self.window.after(0, _apply)
+                self._safe_after(_apply)
             except Exception:
                 pass
 
@@ -5488,12 +5507,11 @@ class ArbitrageWindow:
             except Exception as exc:
                 if self._destroying:
                     return
-                self.window.after(0, lambda e=str(exc): self._apply_arbitrage_chart_error(token, e))
+                self._safe_after(lambda e=str(exc): self._apply_arbitrage_chart_error(token, e))
                 return
             if self._destroying:
                 return
-            self.window.after(
-                0,
+            self._safe_after(
                 lambda: self._apply_arbitrage_charts(
                     token,
                     spot_inst_id,
@@ -5502,7 +5520,7 @@ class ArbitrageWindow:
                     spot_candles,
                     derivative_candles,
                     spread_candles,
-                ),
+                )
             )
 
         threading.Thread(target=_worker, name="arbitrage-charts", daemon=True).start()
@@ -5517,7 +5535,7 @@ class ArbitrageWindow:
         derivative_candles: list[Candle],
         spread_candles: list[Candle],
     ) -> None:
-        if token != self._chart_load_token:
+        if token != self._chart_load_token or self._destroying or not self._widget_exists(self.window):
             return
         spot_visible = [item for item in spot_candles if item.confirmed] or list(spot_candles)
         derivative_visible = [item for item in derivative_candles if item.confirmed] or list(derivative_candles)
@@ -5570,7 +5588,7 @@ class ArbitrageWindow:
         self._append_log(f"已加载套利图表：{spot_inst_id} / {derivative_inst_id} | {bar}")
 
     def _apply_arbitrage_chart_error(self, token: int, message: str) -> None:
-        if token != self._chart_load_token:
+        if token != self._chart_load_token or self._destroying or not self._widget_exists(self.window):
             return
         self.chart_status_text.set(f"套利图表加载失败：{message}")
         self.spot_chart_status_text.set("现货图加载失败")
@@ -5578,6 +5596,8 @@ class ArbitrageWindow:
         self.spread_chart_status_text.set("价差图加载失败")
 
     def _render_arbitrage_chart_canvases(self) -> None:
+        if self._destroying or not self._widget_exists(self.window):
+            return
         if getattr(self, "spot_chart_canvas", None) is not None and self._spot_chart_snapshot is not None:
             render_strategy_live_chart(self.spot_chart_canvas, self._spot_chart_snapshot)
         if getattr(self, "derivative_chart_canvas", None) is not None and self._derivative_chart_snapshot is not None:
@@ -5589,7 +5609,7 @@ class ArbitrageWindow:
         if self._destroying:
             return
         try:
-            self.window.after(0, self._render_arbitrage_chart_canvases)
+            self._safe_after(self._render_arbitrage_chart_canvases)
         except Exception:
             pass
 

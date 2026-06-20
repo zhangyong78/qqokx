@@ -2169,6 +2169,14 @@ class BacktestWindow:
     def _ui_alive(self) -> bool:
         return (not self._closed) and self._widget_exists(self.window)
 
+    def _safe_after(self, callback: Callable[[], object], delay_ms: int = 0) -> str | None:
+        if not self._ui_alive():
+            return None
+        try:
+            return self.window.after(delay_ms, callback)
+        except Exception:
+            return None
+
     def _close(self) -> None:
         self._save_strategy_parameter_draft()
         self._closed = True
@@ -4027,7 +4035,7 @@ class BacktestWindow:
                 self._update_backtest_minimum_order_hint()
 
             if self._ui_alive():
-                self.window.after(0, apply)
+                self._safe_after(apply)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -4290,9 +4298,9 @@ class BacktestWindow:
     def _run_backtest_worker(self, config: StrategyConfig, candle_limit: int) -> None:
         try:
             result = run_backtest(self.client, config, candle_limit=candle_limit)
-            self.window.after(0, lambda: self._apply_backtest_result(result, config, candle_limit))
+            self._safe_after(lambda: self._apply_backtest_result(result, config, candle_limit))
         except Exception as exc:
-            self.window.after(0, lambda error=exc: self._show_backtest_error(error))
+            self._safe_after(lambda error=exc: self._show_backtest_error(error))
 
     def _apply_backtest_result(self, result: BacktestResult, config: StrategyConfig, candle_limit: int) -> None:
         snapshot = self._append_backtest_snapshot(result, config, candle_limit)
@@ -4680,17 +4688,17 @@ class BacktestWindow:
             for index, symbol in enumerate(symbols, start=1):
                 if self._ui_alive():
                     progress_text = f"正在同步价格精度/下单规则（{index}/{total}）：{symbol}"
-                    self.window.after(0, lambda text=progress_text: self.history_sync_status.set(text))
+                    self._safe_after(lambda text=progress_text: self.history_sync_status.set(text))
                 try:
                     self.client.get_instrument(symbol)
                     results.append((symbol, None))
                 except Exception as exc:
                     results.append((symbol, str(exc)))
             if self._ui_alive():
-                self.window.after(0, lambda: self._apply_instrument_metadata_sync_results(results))
+                self._safe_after(lambda: self._apply_instrument_metadata_sync_results(results))
         except Exception as exc:
             if self._ui_alive():
-                self.window.after(0, lambda error=exc: self._show_history_sync_error(error))
+                self._safe_after(lambda error=exc: self._show_history_sync_error(error))
 
     def _apply_instrument_metadata_sync_results(self, results: list[tuple[str, str | None]]) -> None:
         if not self._ui_alive():
@@ -4718,7 +4726,7 @@ class BacktestWindow:
                         f"正在校验本地缓存（{index}/{total}）："
                         f"{symbol} | {_normalize_backtest_bar_label(bar)}"
                     )
-                    self.window.after(0, lambda text=progress_text: self.history_sync_status.set(text))
+                    self._safe_after(lambda text=progress_text: self.history_sync_status.set(text))
                 try:
                     outcome = verify_and_repair_cached_candles(self.client, symbol, bar)
                     results.append(outcome)
@@ -4741,10 +4749,10 @@ class BacktestWindow:
                         )
                     )
             if self._ui_alive():
-                self.window.after(0, lambda: self._apply_history_verify_results(results))
+                self._safe_after(lambda: self._apply_history_verify_results(results))
         except Exception as exc:
             if self._ui_alive():
-                self.window.after(0, lambda error=exc: self._show_history_verify_error(error))
+                self._safe_after(lambda error=exc: self._show_history_verify_error(error))
 
     def _apply_history_verify_results(self, results: list[CacheVerifyOutcome]) -> None:
         if not self._ui_alive():
@@ -4815,7 +4823,7 @@ class BacktestWindow:
                         f"正在同步历史数据（{index}/{total}）："
                         f"{symbol} | {_normalize_backtest_bar_label(bar)} | 全量历史"
                     )
-                    self.window.after(0, lambda text=progress_text: self.history_sync_status.set(text))
+                    self._safe_after(lambda text=progress_text: self.history_sync_status.set(text))
                 try:
                     progress_state = {"last_page": 0}
 
@@ -4840,17 +4848,17 @@ class BacktestWindow:
                             f"{_normalize_backtest_bar_label(bar)} | 第 {page_count} 页 | "
                             f"已累计 {total_count} 根 | 最早到 {range_text}"
                         )
-                        self.window.after(0, lambda text=progress_text: self.history_sync_status.set(text))
+                        self._safe_after(lambda text=progress_text: self.history_sync_status.set(text))
 
                     candles = self.client.get_candles_history(symbol, bar, limit=0, progress_callback=on_progress)
                     results.append((symbol, bar, len(candles), None))
                 except Exception as exc:
                     results.append((symbol, bar, 0, str(exc)))
             if self._ui_alive():
-                self.window.after(0, lambda: self._apply_history_sync_results(results))
+                self._safe_after(lambda: self._apply_history_sync_results(results))
         except Exception as exc:
             if self._ui_alive():
-                self.window.after(0, lambda error=exc: self._show_history_sync_error(error))
+                self._safe_after(lambda error=exc: self._show_history_sync_error(error))
 
     def _apply_history_sync_results(self, results: list[tuple[str, str, int, str | None]]) -> None:
         if not self._ui_alive():
@@ -4910,18 +4918,17 @@ class BacktestWindow:
                 local_only=local_only,
             )
             if self._ui_alive():
-                self.window.after(
-                    0,
+                self._safe_after(
                     lambda: self._apply_batch_backtest_results(
                         results,
                         candle_limit,
                         batch_label,
                         raw_batch_count=raw_batch_count,
-                    ),
+                    )
                 )
         except Exception as exc:
             if self._ui_alive():
-                self.window.after(0, lambda error=exc: self._show_backtest_error(error))
+                self._safe_after(lambda error=exc: self._show_backtest_error(error))
 
     def _run_backtest_worker(
         self,
@@ -4945,10 +4952,10 @@ class BacktestWindow:
                 local_only=local_only,
             )
             if self._ui_alive():
-                self.window.after(0, lambda: self._apply_backtest_result(result, config, candle_limit))
+                self._safe_after(lambda: self._apply_backtest_result(result, config, candle_limit))
         except Exception as exc:
             if self._ui_alive():
-                self.window.after(0, lambda error=exc: self._show_backtest_error(error))
+                self._safe_after(lambda error=exc: self._show_backtest_error(error))
 
     def _apply_backtest_result(self, result: BacktestResult, config: StrategyConfig, candle_limit: int) -> None:
         if not self._ui_alive():

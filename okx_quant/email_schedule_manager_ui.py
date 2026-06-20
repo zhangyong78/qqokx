@@ -82,7 +82,7 @@ class EmailScheduleManagerWindow:
         self.refresh_now()
 
     def destroy(self) -> None:
-        if not self.window.winfo_exists():
+        if not self._widget_exists(self.window):
             return
         self.window.destroy()
         if self._on_close_callback is not None:
@@ -222,6 +222,8 @@ class EmailScheduleManagerWindow:
         ttk.Label(bottom, textvariable=self.archive_detail_text, wraplength=1180, justify="left").pack(anchor="w")
 
     def refresh_now(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         if self._refresh_inflight:
             return
         self._refresh_inflight = True
@@ -233,11 +235,14 @@ class EmailScheduleManagerWindow:
             bundle = collect_email_schedule_snapshot()
         except Exception as exc:
             error_text = str(exc)
-            self.window.after(0, lambda error_text=error_text: self._finish_refresh_error(error_text))
+            self._safe_after(lambda error_text=error_text: self._finish_refresh_error(error_text))
             return
-        self.window.after(0, lambda: self._finish_refresh_success(bundle))
+        self._safe_after(lambda bundle=bundle: self._finish_refresh_success(bundle))
 
     def _finish_refresh_success(self, bundle: EmailScheduleSnapshotBundle) -> None:
+        if not self._widget_exists(self.window):
+            self._refresh_inflight = False
+            return
         self._refresh_inflight = False
         self._render_tasks(bundle.tasks)
         self._render_events(bundle.events)
@@ -247,10 +252,15 @@ class EmailScheduleManagerWindow:
         )
 
     def _finish_refresh_error(self, error_text: str) -> None:
+        if not self._widget_exists(self.window):
+            self._refresh_inflight = False
+            return
         self._refresh_inflight = False
         self.status_text.set(f"刷新失败：{error_text}")
 
     def _render_tasks(self, tasks: list[EmailScheduledTaskSnapshot]) -> None:
+        if not self._widget_exists(self.task_tree):
+            return
         selected = self._selected_item_key(self.task_tree)
         self.task_tree.delete(*self.task_tree.get_children())
         self._task_rows.clear()
@@ -278,6 +288,8 @@ class EmailScheduleManagerWindow:
         self._restore_selection(self.task_tree, self._task_rows, selected, self._on_task_select)
 
     def _render_events(self, events: list[EmailScheduledTaskEvent]) -> None:
+        if not self._widget_exists(self.history_tree):
+            return
         selected = self._selected_item_key(self.history_tree)
         self.history_tree.delete(*self.history_tree.get_children())
         self._event_rows.clear()
@@ -299,6 +311,8 @@ class EmailScheduleManagerWindow:
         self._restore_selection(self.history_tree, self._event_rows, selected, self._on_event_select)
 
     def _render_archives(self, archives: list[EmailArchiveRecord]) -> None:
+        if not self._widget_exists(self.archive_tree):
+            return
         selected = self._selected_item_key(self.archive_tree)
         self.archive_tree.delete(*self.archive_tree.get_children())
         self._archive_rows.clear()
@@ -321,6 +335,8 @@ class EmailScheduleManagerWindow:
         self._restore_selection(self.archive_tree, self._archive_rows, selected, self._on_archive_select)
 
     def _restore_selection(self, tree: ttk.Treeview, rows: dict[str, object], selected_key: str, callback: Callable[[], None]) -> None:
+        if not self._widget_exists(tree):
+            return
         if not rows:
             callback()
             return
@@ -338,6 +354,8 @@ class EmailScheduleManagerWindow:
         callback()
 
     def _selected_item_key(self, tree: ttk.Treeview) -> str:
+        if not self._widget_exists(tree):
+            return ""
         selected = tree.selection()
         if not selected:
             return ""
@@ -348,6 +366,8 @@ class EmailScheduleManagerWindow:
         return str(getattr(row, "task_name", None) or getattr(row, "meta_path", None) or getattr(row, "time_created", None) or "")
 
     def _on_task_select(self, *_args: object) -> None:
+        if not self._widget_exists(self.task_tree):
+            return
         selected = self.task_tree.selection()
         if not selected:
             self.task_detail_text.set("选中一条任务后，这里会显示完整执行命令和运行设置。")
@@ -364,6 +384,8 @@ class EmailScheduleManagerWindow:
         )
 
     def _on_event_select(self, *_args: object) -> None:
+        if not self._widget_exists(self.history_tree):
+            return
         selected = self.history_tree.selection()
         if not selected:
             self._set_text(self.history_detail, "")
@@ -381,6 +403,8 @@ class EmailScheduleManagerWindow:
         self._set_text(self.history_detail, header + (event.message or ""))
 
     def _on_archive_select(self, *_args: object) -> None:
+        if not self._widget_exists(self.archive_tree):
+            return
         selected = self.archive_tree.selection()
         if not selected:
             self.archive_detail_text.set("选中一条归档后，这里会显示主题、文件路径和投递信息。")
@@ -396,6 +420,8 @@ class EmailScheduleManagerWindow:
         )
 
     def run_selected_task(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         selected = self.task_tree.selection()
         if not selected:
             messagebox.showinfo("提示", "请先选中一条任务。", parent=self.window)
@@ -409,11 +435,12 @@ class EmailScheduleManagerWindow:
             try:
                 start_email_schedule_task(task.task_name)
             except Exception as exc:
-                self.window.after(0, lambda: messagebox.showerror("运行失败", str(exc), parent=self.window))
-                self.window.after(0, lambda: self.status_text.set(f"触发失败：{task.task_name}"))
+                error_text = str(exc)
+                self._safe_after(lambda error_text=error_text: messagebox.showerror("运行失败", error_text, parent=self.window))
+                self._safe_after(lambda: self.status_text.set(f"触发失败：{task.task_name}"))
                 return
-            self.window.after(0, lambda: self.status_text.set(f"已触发任务：{task.task_name}"))
-            self.window.after(2500, self.refresh_now)
+            self._safe_after(lambda: self.status_text.set(f"已触发任务：{task.task_name}"))
+            self._safe_after(self.refresh_now, delay_ms=2500)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -457,15 +484,38 @@ class EmailScheduleManagerWindow:
             messagebox.showerror("打开失败", str(exc), parent=self.window)
 
     def _set_text(self, widget: tk.Text, value: str) -> None:
+        if not self._widget_exists(widget):
+            return
         widget.configure(state="normal")
         widget.delete("1.0", "end")
         widget.insert("1.0", value)
         widget.configure(state="disabled")
 
     def _auto_refresh(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         self.refresh_now()
-        if self.window.winfo_exists():
-            self.window.after(30_000, self._auto_refresh)
+        self.window.after(30_000, self._auto_refresh)
+
+    def _safe_after(self, callback: Callable[[], None], *, delay_ms: int = 0) -> None:
+        if not self._widget_exists(self.window):
+            return
+        try:
+            self.window.after(delay_ms, callback)
+        except Exception:
+            return
+
+    @staticmethod
+    def _widget_exists(widget: object) -> bool:
+        if widget is None:
+            return False
+        winfo_exists = getattr(widget, "winfo_exists", None)
+        if not callable(winfo_exists):
+            return False
+        try:
+            return bool(winfo_exists())
+        except Exception:
+            return False
 
 
 def _enable_windows_dpi_awareness() -> None:

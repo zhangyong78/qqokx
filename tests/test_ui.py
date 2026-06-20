@@ -3258,7 +3258,7 @@ class StrategyTradeTrackingTest(TestCase):
 
         self.assertIsNone(session.active_trade)
 
-    def test_track_session_trade_runtime_clears_local_trade_after_terminal_message(self) -> None:
+    def test_track_session_trade_runtime_starts_reconciliation_after_local_terminal_message(self) -> None:
         session = self._make_session()
         session.config.tp_sl_mode = "local_trade"
         app = self._make_app_for_tracking()
@@ -3287,7 +3287,10 @@ class StrategyTradeTrackingTest(TestCase):
             "本次本地止盈止损流程已结束。",
         )
 
-        self.assertIsNone(session.active_trade)
+        self.assertIsNotNone(session.active_trade)
+        assert session.active_trade is not None
+        self.assertTrue(session.active_trade.reconciliation_started)
+        app._start_session_trade_reconciliation.assert_called_once()
 
     def test_track_session_trade_runtime_starts_reconciliation_when_dynamic_stop_monitor_ends_without_position(self) -> None:
         session = self._make_session()

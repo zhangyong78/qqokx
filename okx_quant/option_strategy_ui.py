@@ -133,7 +133,7 @@ class OptionStrategyCalculatorWindow:
             max_width=1880,
             max_height=1260,
         )
-        self.window.protocol("WM_DELETE_WINDOW", self.window.withdraw)
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.status_text = StringVar(value="正在加载期权系列...")
         self.strategy_name = StringVar()
@@ -213,6 +213,7 @@ class OptionStrategyCalculatorWindow:
         self._kline_view_states: dict[str, KlineChartViewState] = {}
         self._kline_drag_states: dict[str, tuple[float, int, int]] = {}
         self._did_initial_chain_refresh = False
+        self._closed = False
         self._chain_request_id = 0
         self._chart_request_id = 0
         self._position_import_request_id = 0
@@ -236,7 +237,7 @@ class OptionStrategyCalculatorWindow:
         self._seed_family_options()
 
     def show(self) -> None:
-        if not self.window.winfo_exists():
+        if not self._ui_alive():
             return
         self.window.deiconify()
         self.window.lift()
@@ -244,6 +245,49 @@ class OptionStrategyCalculatorWindow:
         if not self._did_initial_chain_refresh and self.option_family.get().strip():
             self._did_initial_chain_refresh = True
             self.window.after(120, self.refresh_chain)
+
+    @staticmethod
+    def _widget_exists(widget: object) -> bool:
+        try:
+            return widget is not None and bool(widget.winfo_exists())
+        except Exception:
+            return False
+
+    def _ui_alive(self) -> bool:
+        return (not self._closed) and self._widget_exists(self.window)
+
+    def _safe_after(self, callback: Callable[[], object], delay_ms: int = 0) -> str | None:
+        if not self._ui_alive():
+            return None
+        try:
+            return self.window.after(delay_ms, callback)
+        except Exception:
+            return None
+
+    def _on_close(self) -> None:
+        if self._widget_exists(self.window):
+            self.window.withdraw()
+
+    def destroy(self) -> None:
+        self._closed = True
+        self._chain_request_id += 1
+        self._chart_request_id += 1
+        self._position_import_request_id += 1
+        self._overlay_chart_request_id += 1
+        self._overlay_refresh_inflight = False
+        if self._big_chart_redraw_after_id is not None and self._widget_exists(self._big_chart_window):
+            try:
+                self._big_chart_window.after_cancel(self._big_chart_redraw_after_id)
+            except Exception:
+                pass
+            self._big_chart_redraw_after_id = None
+        if self._widget_exists(self._big_chart_window):
+            try:
+                self._big_chart_window.destroy()
+            except Exception:
+                pass
+        if self._widget_exists(self.window):
+            self.window.destroy()
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
@@ -720,8 +764,7 @@ class OptionStrategyCalculatorWindow:
                 quotes.append(_build_option_quote(instrument, ticker))
             chain_rows = build_option_chain_rows(quotes)
             underlying_price = next((item.index_price for item in quotes if item.index_price is not None), None)
-            self.window.after(
-                0,
+            self._safe_after(
                 lambda: self._apply_chain_snapshot(
                     request_id=request_id,
                     family=family,
@@ -732,10 +775,10 @@ class OptionStrategyCalculatorWindow:
                     tickers_by_inst_id=tickers_by_inst_id,
                     family_instruments=family_instruments,
                     underlying_price=underlying_price,
-                ),
+                )
             )
         except Exception as exc:  # noqa: BLE001
-            self.window.after(0, lambda error=exc: self._show_chain_error(request_id, error))
+            self._safe_after(lambda error=exc: self._show_chain_error(request_id, error))
 
     def _apply_chain_snapshot(
         self,
@@ -750,7 +793,7 @@ class OptionStrategyCalculatorWindow:
         family_instruments: list[Instrument],
         underlying_price: Decimal | None,
     ) -> None:
-        if request_id != self._chain_request_id or not self.window.winfo_exists():
+        if request_id != self._chain_request_id or not self._ui_alive():
             return
         self._chain_rows = chain_rows
         self._current_underlying_price = underlying_price
@@ -775,7 +818,7 @@ class OptionStrategyCalculatorWindow:
         self._refresh_strategy_summary()
 
     def _show_chain_error(self, request_id: int, exc: Exception) -> None:
-        if request_id != self._chain_request_id:
+        if request_id != self._chain_request_id or not self._ui_alive():
             return
         self.status_text.set("期权链加载失败")
         messagebox.showerror("期权链加载失败", str(exc), parent=self.window)
@@ -870,8 +913,7 @@ class OptionStrategyCalculatorWindow:
                     )
                 )
 
-            self.window.after(
-                0,
+            self._safe_after(
                 lambda: self._apply_imported_positions(
                     request_id=request_id,
                     family=family,
@@ -881,10 +923,10 @@ class OptionStrategyCalculatorWindow:
                     imported=imports,
                     family_instruments=family_instruments,
                     tickers_by_inst_id=tickers_by_inst_id,
-                ),
+                )
             )
         except Exception as exc:  # noqa: BLE001
-            self.window.after(0, lambda error=exc: self._show_import_positions_error(request_id, error))
+            self._safe_after(lambda error=exc: self._show_import_positions_error(request_id, error))
 
     def _apply_imported_positions(
         self,
@@ -898,7 +940,7 @@ class OptionStrategyCalculatorWindow:
         family_instruments: list[Instrument],
         tickers_by_inst_id: dict[str, OkxTicker],
     ) -> None:
-        if request_id != self._position_import_request_id or not self.window.winfo_exists():
+        if request_id != self._position_import_request_id or not self._ui_alive():
             return
 
         old_default_formula = build_default_formula(self._legs) if self._legs else ""
@@ -949,7 +991,7 @@ class OptionStrategyCalculatorWindow:
         self.status_text.set(f"已导入 {scope_text} 持仓：{context} | {imported_count} 条策略腿")
 
     def _show_import_positions_error(self, request_id: int, exc: Exception) -> None:
-        if request_id != self._position_import_request_id:
+        if request_id != self._position_import_request_id or not self._ui_alive():
             return
         self.status_text.set("导入持仓失败")
         messagebox.showerror("导入持仓失败", str(exc), parent=self.window)
@@ -1292,14 +1334,16 @@ class OptionStrategyCalculatorWindow:
                 ticker = self.client.get_ticker(leg.inst_id)
                 quote = _build_option_quote(instrument, ticker)
                 refreshed.append((leg.inst_id, instrument, quote))
-            self.window.after(0, lambda: self._apply_refreshed_leg_quotes(refreshed))
+            self._safe_after(lambda: self._apply_refreshed_leg_quotes(refreshed))
         except Exception as exc:  # noqa: BLE001
-            self.window.after(0, lambda msg=str(exc): messagebox.showerror("刷新腿报价失败", msg, parent=self.window))
+            self._safe_after(lambda msg=str(exc): messagebox.showerror("刷新腿报价失败", msg, parent=self.window))
 
     def _apply_refreshed_leg_quotes(
         self,
         refreshed: list[tuple[str, Instrument, OptionQuote]],
     ) -> None:
+        if not self._ui_alive():
+            return
         for inst_id, instrument, quote in refreshed:
             self._instrument_map[inst_id] = instrument
             self._quotes_by_inst_id[inst_id] = quote
@@ -1886,8 +1930,7 @@ class OptionStrategyCalculatorWindow:
                 allowed_names=set(latest_values.keys()),
             )
             combo_last = evaluate_linear_formula(formula, latest_values, allowed_names=set(latest_values.keys()))
-            self.window.after(
-                0,
+            self._safe_after(
                 lambda: self._apply_chart_snapshot(
                     request_id=request_id,
                     combo_candles=combo_candles,
@@ -1903,10 +1946,10 @@ class OptionStrategyCalculatorWindow:
                     resolved_legs=resolved_legs,
                     implied_volatility_by_alias=normalized_implied_volatility_by_alias,
                     payoff_loaded_at=payoff_loaded_at,
-                ),
+                )
             )
         except Exception as exc:  # noqa: BLE001
-            self.window.after(0, lambda error=exc: self._show_chart_error(request_id, error))
+            self._safe_after(lambda error=exc: self._show_chart_error(request_id, error))
 
     def _load_combo_chart_worker(self, request_id: int, candle_limit: int, formula: str) -> None:
         try:
@@ -1959,8 +2002,7 @@ class OptionStrategyCalculatorWindow:
                 bar=self.bar.get().strip(),
                 limit=candle_limit,
             )
-            self.window.after(
-                0,
+            self._safe_after(
                 lambda: self._apply_combo_chart_snapshot(
                     request_id=request_id,
                     combo_candles=combo_candles,
@@ -1972,10 +2014,10 @@ class OptionStrategyCalculatorWindow:
                     spot_usdt_candles=spot_usdt_candles,
                     formula=formula,
                     current_underlying_price=current_underlying_price,
-                ),
+                )
             )
         except Exception as exc:  # noqa: BLE001
-            self.window.after(0, lambda error=exc: self._show_chart_error(request_id, error))
+            self._safe_after(lambda error=exc: self._show_chart_error(request_id, error))
 
     def _overlay_context_signature(self) -> str:
         active = [leg for leg in self._legs if leg.enabled]
@@ -2114,8 +2156,7 @@ class OptionStrategyCalculatorWindow:
                     f"请确认已在「Deribit 波动率指数」窗口拉取过 {currency} 的小时线缓存，或尝试切换叠加周期。"
                 )
 
-            self.window.after(
-                0,
+            self._safe_after(
                 lambda: self._apply_overlay_chart_snapshot(
                     request_id=request_id,
                     triples=triples,
@@ -2124,10 +2165,10 @@ class OptionStrategyCalculatorWindow:
                     vol_currency=currency,
                     resolution_label=resolution_label,
                     resolution_note=resolution_note,
-                ),
+                )
             )
         except Exception as exc:  # noqa: BLE001
-            self.window.after(0, lambda error=exc: self._apply_overlay_chart_error(request_id, error))
+            self._safe_after(lambda error=exc: self._apply_overlay_chart_error(request_id, error))
 
     def _apply_overlay_chart_snapshot(
         self,
@@ -2141,7 +2182,7 @@ class OptionStrategyCalculatorWindow:
         resolution_note: str,
     ) -> None:
         self._overlay_refresh_inflight = False
-        if request_id != self._overlay_chart_request_id or not self.window.winfo_exists():
+        if request_id != self._overlay_chart_request_id or not self._ui_alive():
             return
         self._overlay_refresh_failed_sig = ""
         self._overlay_chain_rows = list(triples)
@@ -2159,7 +2200,7 @@ class OptionStrategyCalculatorWindow:
 
     def _apply_overlay_chart_error(self, request_id: int, exc: Exception) -> None:
         self._overlay_refresh_inflight = False
-        if request_id != self._overlay_chart_request_id or not self.window.winfo_exists():
+        if request_id != self._overlay_chart_request_id or not self._ui_alive():
             return
         self._overlay_chain_rows = []
         self._overlay_refresh_failed_sig = self._overlay_context_signature()
@@ -2236,7 +2277,7 @@ class OptionStrategyCalculatorWindow:
         implied_volatility_by_alias: dict[str, Decimal],
         payoff_loaded_at: datetime,
     ) -> None:
-        if request_id != self._chart_request_id or not self.window.winfo_exists():
+        if request_id != self._chart_request_id or not self._ui_alive():
             return
         self._latest_combo_candles = combo_candles
         self._latest_combo_requested_limit = requested_limit
@@ -2286,7 +2327,7 @@ class OptionStrategyCalculatorWindow:
         formula: str,
         current_underlying_price: Decimal | None,
     ) -> None:
-        if request_id != self._chart_request_id or not self.window.winfo_exists():
+        if request_id != self._chart_request_id or not self._ui_alive():
             return
         self._latest_combo_candles = combo_candles
         self._latest_combo_requested_limit = requested_limit
@@ -2530,7 +2571,7 @@ class OptionStrategyCalculatorWindow:
         return spot_ticker.last or spot_ticker.bid or spot_ticker.ask
 
     def _show_chart_error(self, request_id: int, exc: Exception) -> None:
-        if request_id != self._chart_request_id:
+        if request_id != self._chart_request_id or not self._ui_alive():
             return
         self.status_text.set("图表生成失败")
         messagebox.showerror("图表生成失败", str(exc), parent=self.window)

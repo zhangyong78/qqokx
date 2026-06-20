@@ -8548,9 +8548,15 @@ class UiStrategySessionsMixin:
             self._start_session_trade_reconciliation(session, trade)
             return
         if "本次本地止盈止损流程已结束。" in message:
-            if session.active_trade is not None:
+            trade = session.active_trade
+            if trade is None or trade.reconciliation_started:
+                return
+            if not allow_reconciliation:
                 self._clear_session_manual_management_state(session)
                 session.active_trade = None
+                return
+            trade.reconciliation_started = True
+            self._start_session_trade_reconciliation(session, trade)
             return
         if (
             "未检测到策略持仓，OKX 动态止损监控结束。" in message

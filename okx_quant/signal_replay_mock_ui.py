@@ -143,11 +143,15 @@ class SignalReplayMockWindow:
         self._schedule_auto_refresh()
 
     def show(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         self.window.deiconify()
         self.window.lift()
         self.window.focus_force()
 
     def destroy(self) -> None:
+        self._load_token += 1
+        self._is_loading = False
         if self._redraw_job is not None:
             try:
                 self.window.after_cancel(self._redraw_job)
@@ -160,8 +164,28 @@ class SignalReplayMockWindow:
             except Exception:
                 pass
             self._auto_refresh_job = None
-        if self.window.winfo_exists():
+        if self._widget_exists(self.window):
             self.window.destroy()
+
+    @staticmethod
+    def _widget_exists(widget: object) -> bool:
+        if widget is None:
+            return False
+        winfo_exists = getattr(widget, "winfo_exists", None)
+        if not callable(winfo_exists):
+            return False
+        try:
+            return bool(winfo_exists())
+        except Exception:
+            return False
+
+    def _safe_after(self, callback, *, delay_ms: int = 0) -> None:
+        if not self._widget_exists(self.window):
+            return
+        try:
+            self.window.after(delay_ms, callback)
+        except Exception:
+            return
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
@@ -453,17 +477,14 @@ class SignalReplayMockWindow:
             try:
                 candles = self._client.get_candles_history(symbol, "1H", limit=limit)
             except Exception as exc:
-                self.window.after(0, lambda error=exc: self._apply_load_error_v2(token, error))
+                self._safe_after(lambda token=token, error=exc: self._apply_load_error_v2(token, error))
                 return
-            self.window.after(
-                0,
-                lambda result=candles, last_ts=previous_latest_ts, should_email=trigger_email: self._apply_loaded_candles_v2(
+            self._safe_after(lambda result=candles, last_ts=previous_latest_ts, should_email=trigger_email: self._apply_loaded_candles_v2(
                     token,
                     result,
                     previous_latest_ts=last_ts,
                     trigger_email=should_email,
-                ),
-            )
+                ))
 
         threading.Thread(target=worker, daemon=True, name="signal-replay-load").start()
 
@@ -488,9 +509,9 @@ class SignalReplayMockWindow:
             try:
                 candles = self._client.get_candles_history(symbol, "1H", limit=limit)
             except Exception as exc:
-                self.window.after(0, lambda error=exc: self._apply_load_error(token, error))
+                self._safe_after(lambda token=token, error=exc: self._apply_load_error(token, error))
                 return
-            self.window.after(0, lambda result=candles: self._apply_loaded_candles(token, result))
+            self._safe_after(lambda token=token, result=candles: self._apply_loaded_candles(token, result))
 
         threading.Thread(target=worker, daemon=True, name="signal-replay-load").start()
 
@@ -502,6 +523,8 @@ class SignalReplayMockWindow:
         previous_latest_ts: int | None,
         trigger_email: bool,
     ) -> None:
+        if not self._widget_exists(self.window):
+            return
         if token != self._load_token:
             return
         self._is_loading = False
@@ -522,6 +545,8 @@ class SignalReplayMockWindow:
         self._logger(f"[信号复盘实验室] 已加载 {self.symbol.get().strip().upper()} 1H K线 {count} 根")
 
     def _apply_load_error_v2(self, token: int, exc: Exception) -> None:
+        if not self._widget_exists(self.window):
+            return
         if token != self._load_token:
             return
         self._is_loading = False
@@ -536,6 +561,8 @@ class SignalReplayMockWindow:
         previous_latest_ts: int | None = None,
         trigger_email: bool = False,
     ) -> None:
+        if not self._widget_exists(self.window):
+            return
         if token != self._load_token:
             return
         self._is_loading = False
@@ -554,6 +581,8 @@ class SignalReplayMockWindow:
         self._logger(f"[信号复盘实验室] 已加载 {self.symbol.get().strip().upper()} 1H K线 {count} 根")
 
     def _apply_load_error(self, token: int, exc: Exception) -> None:
+        if not self._widget_exists(self.window):
+            return
         if token != self._load_token:
             return
         self.status_text.set(f"加载失败：{exc}")
@@ -714,6 +743,8 @@ class SignalReplayMockWindow:
             )
 
     def _schedule_redraw(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         if self._redraw_job is not None:
             try:
                 self.window.after_cancel(self._redraw_job)
@@ -722,6 +753,8 @@ class SignalReplayMockWindow:
         self._redraw_job = self.window.after(16, self._redraw_all)
 
     def _redraw_all(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         self._redraw_job = None
         self._draw_main_chart()
         self._draw_macd_chart()
@@ -1021,6 +1054,8 @@ class SignalReplayMockWindow:
         )
 
     def _schedule_auto_refresh(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         if self._auto_refresh_job is not None:
             try:
                 self.window.after_cancel(self._auto_refresh_job)
@@ -1032,6 +1067,8 @@ class SignalReplayMockWindow:
         self._auto_refresh_job = self.window.after(_AUTO_REFRESH_MS, self._run_auto_refresh)
 
     def _run_auto_refresh(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         self._auto_refresh_job = None
         if not self.window.winfo_exists():
             return

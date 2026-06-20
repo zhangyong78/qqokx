@@ -215,15 +215,41 @@ class BtcMarketAnalysisWindow:
         self.window.protocol("WM_DELETE_WINDOW", self.destroy)
 
     def show(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         self.window.deiconify()
         self.window.lift()
         self.window.focus_force()
 
     def destroy(self) -> None:
+        self._request_token += 1
+        self._loading = False
+        if not self._widget_exists(self.window):
+            return
         try:
             self.window.destroy()
         except Exception:
             pass
+
+    @staticmethod
+    def _widget_exists(widget: object) -> bool:
+        if widget is None:
+            return False
+        winfo_exists = getattr(widget, "winfo_exists", None)
+        if not callable(winfo_exists):
+            return False
+        try:
+            return bool(winfo_exists())
+        except Exception:
+            return False
+
+    def _safe_after(self, callback, *, delay_ms: int = 0) -> None:
+        if not self._widget_exists(self.window):
+            return
+        try:
+            self.window.after(delay_ms, callback)
+        except Exception:
+            return
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
@@ -383,8 +409,7 @@ class BtcMarketAnalysisWindow:
                 email_sent = False
                 if should_send_email:
                     email_sent = send_btc_market_analysis_email(analysis)
-                self.window.after(
-                    0,
+                self._safe_after(
                     lambda: self._on_analysis_success(
                         request_token,
                         analysis=analysis,
@@ -393,7 +418,7 @@ class BtcMarketAnalysisWindow:
                     ),
                 )
             except Exception as exc:
-                self.window.after(0, lambda token=request_token, err=exc: self._on_analysis_error(token, err))
+                self._safe_after(lambda token=request_token, err=exc: self._on_analysis_error(token, err))
 
         threading.Thread(target=_worker, daemon=True, name="btc-market-analysis").start()
 
@@ -406,9 +431,9 @@ class BtcMarketAnalysisWindow:
         def _worker() -> None:
             try:
                 delivered = send_btc_market_analysis_email(self._analysis)
-                self.window.after(0, lambda: self._on_email_finished(delivered))
+                self._safe_after(lambda delivered=delivered: self._on_email_finished(delivered))
             except Exception as exc:
-                self.window.after(0, lambda err=exc: self._on_email_error(err))
+                self._safe_after(lambda err=exc: self._on_email_error(err))
 
         threading.Thread(target=_worker, daemon=True, name="btc-market-email").start()
 
@@ -420,6 +445,8 @@ class BtcMarketAnalysisWindow:
         report_path: Path,
         email_sent: bool,
     ) -> None:
+        if not self._widget_exists(self.window):
+            return
         if request_token != self._request_token:
             return
         self._loading = False
@@ -442,6 +469,8 @@ class BtcMarketAnalysisWindow:
         self._log(f"BTC 行情分析完成 | {analysis.symbol} | 方向={analysis.direction} | 评分={analysis.score} | 报告={report_path}")
 
     def _on_analysis_error(self, request_token: int, exc: Exception) -> None:
+        if not self._widget_exists(self.window):
+            return
         if request_token != self._request_token:
             return
         self._loading = False
@@ -450,25 +479,31 @@ class BtcMarketAnalysisWindow:
         messagebox.showerror("分析失败", f"生成行情分析时出错：\n{exc}", parent=self.window)
 
     def _on_email_finished(self, delivered: bool) -> None:
+        if not self._widget_exists(self.window):
+            return
         self.status_text.set("邮件已发送。" if delivered else "当前邮件配置不可用，未发送。")
         if delivered:
             self._log("BTC 行情分析邮件已发送")
 
     def _on_email_error(self, exc: Exception) -> None:
+        if not self._widget_exists(self.window):
+            return
         self.status_text.set(f"邮件发送失败：{exc}")
         self._log(f"BTC 行情分析邮件发送失败 | {exc}")
         messagebox.showerror("发送失败", f"发送行情分析邮件时出错：\n{exc}", parent=self.window)
 
     def _render_analysis(self, analysis: BtcMarketAnalysis, report_path: Path) -> None:
+        if not self._widget_exists(self.window):
+            return
         overview = build_market_analysis_overview_text(analysis, latest_report_path=report_path)
         display_payload = build_market_analysis_display_payload(analysis, latest_report_path=report_path)
-        if self._overview_text is not None:
+        if self._widget_exists(self._overview_text):
             self._overview_text.delete("1.0", END)
             self._overview_text.insert("1.0", overview)
-        if self._json_text is not None:
+        if self._widget_exists(self._json_text):
             self._json_text.delete("1.0", END)
             self._json_text.insert("1.0", json.dumps(display_payload, ensure_ascii=False, indent=2))
-        if self._timeframe_tree is not None:
+        if self._widget_exists(self._timeframe_tree):
             self._timeframe_tree.delete(*self._timeframe_tree.get_children())
             for item in analysis.timeframes:
                 self._timeframe_tree.insert(
@@ -482,7 +517,7 @@ class BtcMarketAnalysisWindow:
                         _term_label(item.trend_context, _TREND_CONTEXT_TERMS),
                     ),
                 )
-        if self._signal_tree is not None:
+        if self._widget_exists(self._signal_tree):
             self._signal_tree.delete(*self._signal_tree.get_children())
             for item in analysis.signals:
                 self._signal_tree.insert(

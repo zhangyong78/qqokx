@@ -227,13 +227,39 @@ class BtcResearchWorkbenchWindow:
             self.window.after(120, self._load_chart_candles)
 
     def show(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         self.window.deiconify()
         self.window.lift()
         self.window.focus_force()
 
     def destroy(self) -> None:
-        if self.window.winfo_exists():
+        self._chart_load_token += 1
+        self._volatility_load_token += 1
+        self._chart_render_token += 1
+        self._replay_request_token += 1
+        if self._widget_exists(self.window):
             self.window.destroy()
+
+    @staticmethod
+    def _widget_exists(widget: object) -> bool:
+        if widget is None:
+            return False
+        winfo_exists = getattr(widget, "winfo_exists", None)
+        if not callable(winfo_exists):
+            return False
+        try:
+            return bool(winfo_exists())
+        except Exception:
+            return False
+
+    def _safe_after(self, callback, *, delay_ms: int = 0) -> None:
+        if not self._widget_exists(self.window):
+            return
+        try:
+            self.window.after(delay_ms, callback)
+        except Exception:
+            return
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
@@ -713,13 +739,15 @@ class BtcResearchWorkbenchWindow:
             try:
                 candles = self._client.get_candles_history("BTC-USDT-SWAP", bar, limit=520)
             except Exception as exc:
-                self.window.after(0, lambda e=str(exc): self._apply_chart_error(token, e))
+                self._safe_after(lambda e=str(exc): self._apply_chart_error(token, e))
                 return
-            self.window.after(0, lambda: self._apply_chart_candles(token, bar, candles))
+            self._safe_after(lambda token=token, bar=bar, candles=candles: self._apply_chart_candles(token, bar, candles))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_chart_candles(self, token: int, timeframe: str, candles: list[Candle]) -> None:
+        if not self._widget_exists(self.window):
+            return
         if token != self._chart_load_token:
             return
         confirmed_only = [candle for candle in candles if candle.confirmed]
@@ -734,6 +762,8 @@ class BtcResearchWorkbenchWindow:
         self._logger(f"[BTC研究工作台] 价格K线加载完成 | BTC-USDT-SWAP {timeframe} {len(self._candles)}")
 
     def _apply_chart_error(self, token: int, message: str) -> None:
+        if not self._widget_exists(self.window):
+            return
         if token != self._chart_load_token:
             return
         self.chart_status_text.set(f"K线加载失败：{message}")
@@ -752,11 +782,13 @@ class BtcResearchWorkbenchWindow:
                 volatility = self._load_deribit_volatility_live(bar, requested_limit=requested_limit)
             if not volatility and self._candles:
                 volatility = _build_realized_volatility_from_reference(self._candles, bar=bar, lookback=20)
-            self.window.after(0, lambda: self._apply_volatility_series(token, volatility))
+            self._safe_after(lambda token=token, volatility=volatility: self._apply_volatility_series(token, volatility))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_volatility_series(self, token: int, candles: list[Candle]) -> None:
+        if not self._widget_exists(self.window):
+            return
         if token != self._volatility_load_token:
             return
         self._volatility_candles = candles
@@ -785,6 +817,8 @@ class BtcResearchWorkbenchWindow:
         self._schedule_chart_redraw()
 
     def _reload_historical_markers(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         timeframe = self._effective_chart_bar()
         self._historical_markers = _load_historical_analysis_markers("BTC-USDT-SWAP", timeframe)
         self._update_signal_text()
@@ -792,6 +826,8 @@ class BtcResearchWorkbenchWindow:
         self._schedule_chart_redraw()
 
     def _refresh_replay_statistics(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         timeframe = self._effective_chart_bar()
         summary, rows = _load_replay_statistics("BTC-USDT-SWAP", timeframe)
         self.replay_stats_summary_text.set(summary)
@@ -843,9 +879,15 @@ class BtcResearchWorkbenchWindow:
                     config=config,
                 )
                 report_path = save_btc_market_analysis(analysis)
-                self.window.after(0, lambda: self._on_replay_completed(request_token, analysis, report_path))
+                self._safe_after(
+                    lambda request_token=request_token, analysis=analysis, report_path=report_path: self._on_replay_completed(
+                        request_token,
+                        analysis,
+                        report_path,
+                    )
+                )
             except Exception as exc:
-                self.window.after(0, lambda error=exc: self._on_replay_failed(request_token, error))
+                self._safe_after(lambda request_token=request_token, error=exc: self._on_replay_failed(request_token, error))
 
         threading.Thread(target=worker, daemon=True, name="btc-research-replay").start()
 
@@ -853,6 +895,8 @@ class BtcResearchWorkbenchWindow:
         self._replay_from_current_chart_point()
 
     def _on_replay_completed(self, request_token: int, analysis: Any, report_path: Path) -> None:
+        if not self._widget_exists(self.window):
+            return
         if request_token != self._replay_request_token:
             return
         self.status_text.set(
@@ -863,6 +907,8 @@ class BtcResearchWorkbenchWindow:
         self._logger(f"[BTC研究工作台] 复盘完成 | 报告={report_path}")
 
     def _on_replay_failed(self, request_token: int, exc: Exception) -> None:
+        if not self._widget_exists(self.window):
+            return
         if request_token != self._replay_request_token:
             return
         self.status_text.set(f"复盘失败：{exc}")
@@ -882,6 +928,8 @@ class BtcResearchWorkbenchWindow:
         return self._last_selected_chart_candle
 
     def _update_signal_text(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         if len(self._candles) < 2:
             self._replace_text(self.signal_text, "价格K线样本不足。")
             return
@@ -904,9 +952,11 @@ class BtcResearchWorkbenchWindow:
         self._replace_text(self.signal_text, "\n".join(lines))
 
     def _schedule_chart_redraw(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         token = self._chart_render_token + 1
         self._chart_render_token = token
-        self.window.after(16, lambda: self._run_scheduled_redraw(token))
+        self._safe_after(lambda token=token: self._run_scheduled_redraw(token), delay_ms=16)
 
     def _run_scheduled_redraw(self, token: int) -> None:
         if token != self._chart_render_token or not self.window.winfo_exists():
@@ -1812,6 +1862,8 @@ class BtcResearchWorkbenchWindow:
         return [_candle_from_deribit(item) for item in merged]
 
     def _replace_text(self, widget: Text, content: str) -> None:
+        if not self._widget_exists(widget):
+            return
         widget.delete("1.0", END)
         widget.insert("1.0", content)
 

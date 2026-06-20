@@ -103,7 +103,7 @@ class OptionRollSuggestionWindow:
             max_width=1680,
             max_height=1080,
         )
-        self.window.protocol("WM_DELETE_WINDOW", self.window.withdraw)
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.preference_label = StringVar(value="优先净收权利金")
         self.strike_scope_label = StringVar(value="更虚值优先")
@@ -115,6 +115,7 @@ class OptionRollSuggestionWindow:
         self._current_instrument: Instrument = instrument
         self._current_quote: OptionQuote = quote
         self._api_name = api_name
+        self._closed = False
         self._request_id = 0
         self._suggestions: list[OptionRollSuggestion] = []
         self._candidate_instruments: dict[str, Instrument] = {}
@@ -130,9 +131,39 @@ class OptionRollSuggestionWindow:
         self.load_position(position=position, instrument=instrument, quote=quote, api_name=api_name, auto_scan=True)
 
     def show(self) -> None:
+        if not self._ui_alive():
+            return
         self.window.deiconify()
         self.window.lift()
         self.window.focus_force()
+
+    @staticmethod
+    def _widget_exists(widget: object) -> bool:
+        try:
+            return widget is not None and bool(widget.winfo_exists())
+        except Exception:
+            return False
+
+    def _ui_alive(self) -> bool:
+        return (not self._closed) and self._widget_exists(self.window)
+
+    def _safe_after(self, callback: Callable[[], object], delay_ms: int = 0) -> str | None:
+        if not self._ui_alive():
+            return None
+        try:
+            return self.window.after(delay_ms, callback)
+        except Exception:
+            return None
+
+    def _on_close(self) -> None:
+        if self._widget_exists(self.window):
+            self.window.withdraw()
+
+    def destroy(self) -> None:
+        self._closed = True
+        self._request_id += 1
+        if self._widget_exists(self.window):
+            self.window.destroy()
 
     def load_position(
         self,
@@ -433,14 +464,13 @@ class OptionRollSuggestionWindow:
                 preferred_strike_levels=STRIKE_LEVEL_PRIORITY_OPTIONS[self.strike_level_priority_label.get()],
                 max_results=int(self.max_results_label.get()),
             )
-            self.window.after(
-                0,
+            self._safe_after(
                 lambda result=suggestions, req=request_id, insts=instrument_map, quotes=quote_map: self._apply_scan_results(
                     req, result, insts, quotes
-                ),
+                )
             )
         except Exception as exc:
-            self.window.after(0, lambda error=exc, req=request_id: self._apply_scan_error(req, error))
+            self._safe_after(lambda error=exc, req=request_id: self._apply_scan_error(req, error))
 
     def _apply_scan_results(
         self,
@@ -449,7 +479,7 @@ class OptionRollSuggestionWindow:
         instruments: dict[str, Instrument],
         quotes: dict[str, OptionQuote],
     ) -> None:
-        if request_id != self._request_id:
+        if request_id != self._request_id or not self._ui_alive():
             return
         if self._scan_button is not None:
             self._scan_button.configure(state="normal")
@@ -465,7 +495,7 @@ class OptionRollSuggestionWindow:
             self._set_detail("未找到符合条件的候选合约。建议放宽行权价方向、档位优先或稍后重试。")
 
     def _apply_scan_error(self, request_id: int, error: Exception) -> None:
-        if request_id != self._request_id:
+        if request_id != self._request_id or not self._ui_alive():
             return
         if self._scan_button is not None:
             self._scan_button.configure(state="normal")
@@ -474,7 +504,7 @@ class OptionRollSuggestionWindow:
         self._log(f"[展期建议] 扫描失败 | {self._current_position.inst_id} | {error}")
 
     def _render_results(self) -> None:
-        if self._result_tree is None:
+        if self._result_tree is None or not self._widget_exists(self._result_tree):
             return
         self._result_tree.delete(*self._result_tree.get_children())
         for index, suggestion in enumerate(self._suggestions):
@@ -563,7 +593,7 @@ class OptionRollSuggestionWindow:
             return None
 
     def _set_detail(self, text: str) -> None:
-        if self._detail_text is None:
+        if self._detail_text is None or not self._widget_exists(self._detail_text):
             return
         self._detail_text.configure(state="normal")
         self._detail_text.delete("1.0", END)

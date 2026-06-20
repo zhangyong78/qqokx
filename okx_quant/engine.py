@@ -3745,11 +3745,19 @@ class StrategyEngine:
                 estimated_entry=self._estimate_trade_entry_price_with_retry(trade_instrument, position.close_side),
             )
             remaining -= filled.size
+            trade_pnl = StrategyEngine._trade_fill_pnl_text_for_close(
+                position,
+                fill_size=filled.size,
+                fill_price=filled.entry_price,
+                trade_instrument=trade_instrument,
+            )
+            pnl_segment = f" | 本笔盈亏={trade_pnl}" if trade_pnl else ""
             self._logger(
                 f"本地{reason}平仓已成交 | ordId={filled.ord_id} | 标的={trade_instrument.inst_id} | "
                 f"方向={position.close_side.upper()} | "
                 f"成交均价={_format_notify_price_by_tick_size(filled.entry_price, trade_instrument.tick_size)} | "
                 f"成交数量={_format_size_with_contract_equivalent(trade_instrument, filled.size)} | 剩余={_format_size_with_contract_equivalent(trade_instrument, max(remaining, Decimal('0')))}"
+                f"{pnl_segment}"
             )
             self._notify_trade_close(
                 config,
@@ -3762,11 +3770,7 @@ class StrategyEngine:
                 tick_size=trade_instrument.tick_size,
                 trigger_reason=reason,
                 detail=f"本地{reason}触发后平仓成交",
-                trade_pnl=StrategyEngine._trade_fill_pnl_text_for_close(
-                    position,
-                    fill_size=filled.size,
-                    fill_price=filled.entry_price,
-                ),
+                trade_pnl=trade_pnl,
             )
 
         if remaining > 0:
@@ -6128,18 +6132,40 @@ class StrategyEngine:
         )
 
     @staticmethod
-    def _trade_fill_pnl_text_for_close(position: FilledPosition, *, fill_size: Decimal, fill_price: Decimal) -> str:
+    def _trade_fill_pnl_text_for_close(
+        position: FilledPosition,
+        *,
+        fill_size: Decimal,
+        fill_price: Decimal,
+        trade_instrument: Instrument | None = None,
+    ) -> str:
         matched_size = min(abs(fill_size), abs(position.size))
         if matched_size <= 0:
             return ""
-        price_delta_multiplier = (
-            position.price_delta_multiplier if position.price_delta_multiplier > 0 else Decimal("1")
+        price_delta_multiplier = StrategyEngine._resolve_trade_fill_price_delta_multiplier(
+            position,
+            trade_instrument=trade_instrument,
         )
         if position.side == "buy":
             pnl = (fill_price - position.entry_price) * matched_size * price_delta_multiplier
         else:
             pnl = (position.entry_price - fill_price) * matched_size * price_delta_multiplier
         return format_decimal(pnl)
+
+    @staticmethod
+    def _resolve_trade_fill_price_delta_multiplier(
+        position: FilledPosition,
+        trade_instrument: Instrument | None = None,
+    ) -> Decimal:
+        if trade_instrument is not None:
+            instrument_multiplier = _instrument_price_delta_multiplier(trade_instrument)
+            if trade_instrument.inst_type not in {"SWAP", "FUTURES", "OPTION"}:
+                return instrument_multiplier if instrument_multiplier > 0 else Decimal("1")
+            if trade_instrument.ct_val is not None and trade_instrument.ct_val > 0 and instrument_multiplier > 0:
+                return instrument_multiplier
+        if position.price_delta_multiplier > 0:
+            return position.price_delta_multiplier
+        return Decimal("1")
 
     def _notify_error(self, config: StrategyConfig | None, message: str) -> None:
         if self._notifier is None:

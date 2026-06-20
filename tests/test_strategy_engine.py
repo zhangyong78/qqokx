@@ -726,6 +726,41 @@ class StrategyEngineTest(TestCase):
 
         self.assertEqual(trade_pnl, "-15.32852")
 
+    def test_trade_fill_pnl_text_for_close_prefers_trade_instrument_multiplier_when_position_cache_is_wrong(self) -> None:
+        position = FilledPosition(
+            ord_id="ord-1",
+            cl_ord_id="cl-1",
+            inst_id="BTC-USDT-SWAP",
+            side="sell",
+            close_side="buy",
+            pos_side="short",
+            size=Decimal("0.83"),
+            entry_price=Decimal("64192.3"),
+            entry_ts=0,
+            price_delta_multiplier=Decimal("1"),
+        )
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+            settle_ccy="USDT",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+        )
+
+        trade_pnl = StrategyEngine._trade_fill_pnl_text_for_close(
+            position,
+            fill_size=Decimal("0.83"),
+            fill_price=Decimal("63523.3"),
+            trade_instrument=instrument,
+        )
+
+        self.assertEqual(trade_pnl, "5.5527")
+
     def test_long_signal_is_detected(self) -> None:
         candles = [
             Candle(1, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),

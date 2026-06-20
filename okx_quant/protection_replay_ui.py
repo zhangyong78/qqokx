@@ -61,8 +61,35 @@ class ProtectionReplayWindow:
         self._latest_points: list[ProtectionReplayPoint] = []
         self._latest_result: ProtectionReplayResult | None = None
         self._latest_trigger_label = protection.trigger_label or protection.trigger_inst_id
+        self._replay_token = 0
 
         self._build_layout()
+        self.window.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    @staticmethod
+    def _widget_exists(widget: object) -> bool:
+        if widget is None:
+            return False
+        winfo_exists = getattr(widget, "winfo_exists", None)
+        if not callable(winfo_exists):
+            return False
+        try:
+            return bool(winfo_exists())
+        except Exception:
+            return False
+
+    def _safe_after(self, callback, *, delay_ms: int = 0) -> None:
+        if not self._widget_exists(self.window):
+            return
+        try:
+            self.window.after(delay_ms, callback)
+        except Exception:
+            return
+
+    def destroy(self) -> None:
+        self._replay_token += 1
+        if self._widget_exists(self.window):
+            self.window.destroy()
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
@@ -164,6 +191,8 @@ class ProtectionReplayWindow:
         self.chart_canvas.grid(row=0, column=0, sticky="nsew")
 
     def start_replay(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         try:
             candle_limit = self._parse_positive_int(self.candle_limit.get(), "回放K线数")
         except Exception as exc:
@@ -174,14 +203,16 @@ class ProtectionReplayWindow:
         self.report_text.delete("1.0", END)
         self.event_tree.delete(*self.event_tree.get_children())
         self.chart_canvas.delete("all")
+        self._replay_token += 1
+        replay_token = self._replay_token
 
         threading.Thread(
             target=self._run_replay_worker,
-            args=(self.bar.get().strip(), candle_limit),
+            args=(replay_token, self.bar.get().strip(), candle_limit),
             daemon=True,
         ).start()
 
-    def _run_replay_worker(self, bar: str, candle_limit: int) -> None:
+    def _run_replay_worker(self, replay_token: int, bar: str, candle_limit: int) -> None:
         try:
             points = self._load_replay_points(bar=bar, candle_limit=candle_limit)
             instrument = self.client.get_instrument(self.protection.option_inst_id)
@@ -193,9 +224,9 @@ class ProtectionReplayWindow:
                 min_size=instrument.min_size,
                 points=points,
             )
-            self.window.after(0, lambda: self._apply_replay_result(points, result))
+            self._safe_after(lambda replay_token=replay_token, points=points, result=result: self._apply_replay_result(replay_token, points, result))
         except Exception as exc:
-            self.window.after(0, lambda err=exc: self._show_replay_error(err))
+            self._safe_after(lambda replay_token=replay_token, err=exc: self._show_replay_error(replay_token, err))
 
     def _load_replay_points(self, *, bar: str, candle_limit: int) -> list[ProtectionReplayPoint]:
         option_mark_candles = self.client.get_mark_price_candles(self.protection.option_inst_id, bar, limit=candle_limit)
@@ -222,7 +253,9 @@ class ProtectionReplayWindow:
             raise RuntimeError("没有拿到可用于回放的已收盘 K 线数据。")
         return points
 
-    def _apply_replay_result(self, points: list[ProtectionReplayPoint], result: ProtectionReplayResult) -> None:
+    def _apply_replay_result(self, replay_token: int, points: list[ProtectionReplayPoint], result: ProtectionReplayResult) -> None:
+        if not self._widget_exists(self.window) or replay_token != self._replay_token:
+            return
         self._latest_points = points
         self._latest_result = result
         self.summary_text.set(
@@ -250,7 +283,9 @@ class ProtectionReplayWindow:
 
         self._draw_chart(points, result)
 
-    def _show_replay_error(self, exc: Exception) -> None:
+    def _show_replay_error(self, replay_token: int, exc: Exception) -> None:
+        if not self._widget_exists(self.window) or replay_token != self._replay_token:
+            return
         self.summary_text.set("回放失败")
         messagebox.showerror("回放失败", str(exc), parent=self.window)
 

@@ -156,11 +156,33 @@ class DeribitVolatilityWindow:
         self.window.after(50, self._bootstrap_initial_load)
 
     def show(self) -> None:
+        if not self._widget_exists(self.window):
+            return
         self.window.deiconify()
         self.window.lift()
         self.window.focus_force()
         self._schedule_auto_refresh()
         self._refresh_for_current_selection(use_cache=True, force_network=True)
+
+    @staticmethod
+    def _widget_exists(widget: object) -> bool:
+        if widget is None:
+            return False
+        winfo_exists = getattr(widget, "winfo_exists", None)
+        if not callable(winfo_exists):
+            return False
+        try:
+            return bool(winfo_exists())
+        except Exception:
+            return False
+
+    def _safe_after(self, callback, *, delay_ms: int = 0) -> None:
+        if not self._widget_exists(self.window):
+            return
+        try:
+            self.window.after(delay_ms, callback)
+        except Exception:
+            return
 
     def _build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
@@ -403,16 +425,13 @@ class DeribitVolatilityWindow:
                 spot_hourly=spot_hourly,
                 fetched_at=fetched_at,
             )
-            self.window.after(
-                0,
-                lambda data=snapshot, token=request_token: self._apply_snapshot(
+            self._safe_after(lambda data=snapshot, token=request_token: self._apply_snapshot(
                     data,
                     request_token=token,
                     from_cache=False,
-                ),
-            )
+                ))
         except Exception as exc:
-            self.window.after(0, lambda error=exc, token=request_token: self._show_fetch_error(error, token))
+            self._safe_after(lambda error=exc, token=request_token: self._show_fetch_error(error, token))
 
     def _apply_snapshot(
         self,
@@ -421,6 +440,8 @@ class DeribitVolatilityWindow:
         request_token: int | None,
         from_cache: bool,
     ) -> None:
+        if not self._widget_exists(self.window):
+            return
         if request_token is not None and request_token != self._request_token:
             return
         selection_matches = self._snapshot_matches_current_selection(snapshot)
@@ -431,14 +452,11 @@ class DeribitVolatilityWindow:
                 force_network = self._pending_force_network
                 self._pending_refresh_after_load = False
                 self._pending_force_network = False
-                self.window.after(
-                    10,
-                    lambda force=force_network: self._refresh_for_current_selection(
+                self._safe_after(lambda force=force_network: self._refresh_for_current_selection(
                         use_cache=True,
                         force_network=force,
                         supersede_if_loading=False,
-                    ),
-                )
+                    ), delay_ms=10)
             return
         previous_snapshot = self._latest_snapshot
         previous_last_ts = _snapshot_last_ts(previous_snapshot) if previous_snapshot is not None else None
@@ -535,6 +553,8 @@ class DeribitVolatilityWindow:
         return ""
 
     def _show_fetch_error(self, exc: Exception, request_token: int) -> None:
+        if not self._widget_exists(self.window):
+            return
         if request_token != self._request_token:
             return
         self._loading = False
@@ -551,14 +571,11 @@ class DeribitVolatilityWindow:
             force_network = self._pending_force_network
             self._pending_refresh_after_load = False
             self._pending_force_network = False
-            self.window.after(
-                10,
-                lambda force=force_network: self._refresh_for_current_selection(
+            self._safe_after(lambda force=force_network: self._refresh_for_current_selection(
                     use_cache=True,
                     force_network=force,
                     supersede_if_loading=False,
-                ),
-            )
+                ), delay_ms=10)
         return
         self.status_text.set("Deribit 波动率指数历史K线获取失败。")
         messagebox.showerror("获取失败", str(exc), parent=self.window)
@@ -613,24 +630,28 @@ class DeribitVolatilityWindow:
 
     def _on_close(self) -> None:
         self._cancel_auto_refresh()
+        self._request_token += 1
+        self._loading = False
+        if not self._widget_exists(self.window):
+            return
         self.window.withdraw()
 
     def _schedule_auto_refresh(self) -> None:
         self._cancel_auto_refresh()
-        if not self.window.winfo_exists() or self.window.state() == "withdrawn":
+        if not self._widget_exists(self.window) or self.window.state() == "withdrawn":
             return
         resolution = DERIBIT_RESOLUTION_OPTIONS.get(self.resolution_label.get(), DERIBIT_BASE_HOURLY_RESOLUTION)
         delay_ms = _next_refresh_delay_ms(self._latest_snapshot, resolution)
         self._auto_refresh_job = self.window.after(delay_ms, self._auto_refresh)
 
     def _cancel_auto_refresh(self) -> None:
-        if self._auto_refresh_job is not None and self.window.winfo_exists():
+        if self._auto_refresh_job is not None and self._widget_exists(self.window):
             self.window.after_cancel(self._auto_refresh_job)
         self._auto_refresh_job = None
 
     def _auto_refresh(self) -> None:
         self._auto_refresh_job = None
-        if not self.window.winfo_exists() or self.window.state() == "withdrawn":
+        if not self._widget_exists(self.window) or self.window.state() == "withdrawn":
             return
         self._refresh_for_current_selection(use_cache=True, force_network=True, supersede_if_loading=False)
 
