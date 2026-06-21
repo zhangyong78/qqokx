@@ -3155,6 +3155,8 @@ def _position_history_item_from_cache(record: dict[str, object]) -> OkxPositionH
         raw=record.get("raw") if isinstance(record.get("raw"), dict) else {},
         fee=_parse_decimal_or_none(record.get("fee")) or _parse_decimal_or_none(record.get("fillFee")),
         fee_currency=str(record.get("fee_currency") or record.get("feeCcy") or record.get("ccy") or "") or None,
+        funding_fee=_parse_decimal_or_none(record.get("funding_fee"))
+        or _parse_decimal_or_none((record.get("raw") or {}).get("fundingFee") if isinstance(record.get("raw"), dict) else None),
     )
 
 
@@ -4054,7 +4056,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         tools_menu = Menu(menu_bar, tearoff=False)
         tools_menu.add_command(label="打开无限下单", command=self.open_smart_order_window)
-        tools_menu.add_command(label="打开现货套利", command=self.open_arbitrage_window)
+        tools_menu.add_command(label="打开现货套利工作台", command=self.open_arbitrage_window)
+        tools_menu.add_command(label="打开现货套利极速版", command=self.open_arbitrage_fast_window)
         tools_menu.add_command(label="打开回测窗口", command=self.open_backtest_window)
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
         tools_menu.add_command(label="打开BTC行情分析", command=self.open_btc_market_analysis_window)
@@ -5152,7 +5155,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("open_qty", text="开仓数量")
         self.session_tree.heading("live_pnl", text="实时浮盈亏")
         self.session_tree.heading("pnl", text="净盈亏")
-        self.session_tree.heading("last_pnl", text="上次盈亏")
+        self.session_tree.heading("last_pnl", text="上次净盈亏")
         self.session_tree.heading("status", text="状态")
         self.session_tree.heading("started", text="启动时间")
         self.session_tree.column("session", width=56, anchor="center")

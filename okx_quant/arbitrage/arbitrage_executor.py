@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -19,12 +20,15 @@ from okx_quant.arbitrage.models import ArbitrageLedgerEntry, ArbitrageTradeRunti
 from okx_quant.arbitrage.position_ledger import find_ledger_entry, load_open_ledger_entries, upsert_ledger_entry
 from okx_quant.arbitrage.size_converter import preview_arbitrage_size
 from okx_quant.models import StrategyConfig
-from okx_quant.okx_client import OkxApiError, OkxRestClient
+from okx_quant.okx_client import OkxApiError, OkxOrderBook, OkxRestClient, OkxTicker
 from okx_quant.pricing import format_decimal, snap_to_increment
 
 Logger = Callable[[str], None]
 FillWaitSeconds = 90.0
 PollSeconds = 1.0
+EXECUTOR_MARKET_CACHE_TTL_SECONDS = 0.25
+PRIVATE_WS_WAIT_SLICE_SECONDS = 10.0
+PRIVATE_WS_STALE_REST_FALLBACK_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -272,6 +276,137 @@ def _wait_order_fill_with_private_ws(
     raise OkxApiError(f"{label} 等待成交超时。")
 
 
+def _private_ws_connected(client: OkxRestClient, credentials, *, environment: str) -> bool:
+    get_debug_status = getattr(client, "get_private_ws_debug_status", None)
+    if not callable(get_debug_status):
+        return callable(getattr(client, "wait_private_order_update", None))
+    try:
+        status = get_debug_status(credentials, environment=environment)
+    except Exception:  # noqa: BLE001
+        return callable(getattr(client, "wait_private_order_update", None))
+    return bool(status.get("enabled")) and bool(status.get("available")) and bool(status.get("connected"))
+
+
+def _get_cached_private_order_status(
+    client: OkxRestClient,
+    *,
+    credentials,
+    environment: str,
+    inst_id: str,
+    ord_id: str | None = None,
+    cl_ord_id: str | None = None,
+):
+    get_cached_status = getattr(client, "get_cached_private_order_status", None)
+    if not callable(get_cached_status):
+        return None
+    try:
+        return get_cached_status(
+            credentials,
+            environment=environment,
+            inst_id=inst_id,
+            ord_id=ord_id,
+            cl_ord_id=cl_ord_id,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _wait_order_fill_with_private_ws(
+    client: OkxRestClient,
+    *,
+    credentials,
+    config: StrategyConfig,
+    inst_id: str,
+    ord_id: str,
+    expected_size: Decimal,
+    logger: Logger,
+    label: str,
+) -> tuple[Decimal, Decimal | None]:
+    deadline = time.time() + FillWaitSeconds
+    last_filled = Decimal("0")
+    avg_price: Decimal | None = None
+    ws_version = 0
+    private_ws_connected = _private_ws_connected(client, credentials, environment=config.environment)
+    rest_fallback_at = time.time()
+    cached_status = _get_cached_private_order_status(
+        client,
+        credentials=credentials,
+        environment=config.environment,
+        inst_id=inst_id,
+        ord_id=ord_id,
+    )
+    if cached_status is not None:
+        ws_version, status = cached_status
+        filled = status.filled_size or Decimal("0")
+        avg_price = status.avg_price
+        last_filled = filled
+        state = (status.state or "").lower()
+        if state == "filled" or filled >= expected_size:
+            return filled, avg_price
+        if state in {"canceled", "cancelled"}:
+            if filled > 0:
+                return filled, avg_price
+            raise OkxApiError(f"{label} 订单已撤销，未成交。")
+    while time.time() < deadline:
+        remaining = max(0.0, deadline - time.time())
+        status = None
+        wait_private_update = getattr(client, "wait_private_order_update", None)
+        if private_ws_connected and callable(wait_private_update):
+            timeout_seconds = min(remaining, PRIVATE_WS_WAIT_SLICE_SECONDS)
+            if timeout_seconds > 0:
+                try:
+                    ws_payload = wait_private_update(
+                        credentials,
+                        environment=config.environment,
+                        inst_id=inst_id,
+                        ord_id=ord_id,
+                        after_version=ws_version,
+                        timeout=timeout_seconds,
+                    )
+                except Exception:  # noqa: BLE001
+                    ws_payload = None
+                if ws_payload is not None:
+                    ws_version, status = ws_payload
+        if status is None:
+            if not private_ws_connected or time.time() >= rest_fallback_at:
+                status = client.get_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
+                rest_fallback_at = time.time() + PRIVATE_WS_STALE_REST_FALLBACK_SECONDS
+            else:
+                cached_status = _get_cached_private_order_status(
+                    client,
+                    credentials=credentials,
+                    environment=config.environment,
+                    inst_id=inst_id,
+                    ord_id=ord_id,
+                )
+                if cached_status is not None:
+                    ws_version, status = cached_status
+        if status is None:
+            if private_ws_connected:
+                continue
+            time.sleep(PollSeconds)
+            continue
+        filled = status.filled_size or Decimal("0")
+        avg_price = status.avg_price
+        state = (status.state or "").lower()
+        if filled > last_filled:
+            logger(f"{label} 成交进度 {format_decimal(filled)} / {format_decimal(expected_size)}")
+            last_filled = filled
+        if state == "filled" or filled >= expected_size:
+            return filled, avg_price
+        if state in {"canceled", "cancelled"}:
+            if filled > 0:
+                return filled, avg_price
+            raise OkxApiError(f"{label} 订单已撤销，未成交。")
+        if private_ws_connected and ws_version > 0:
+            continue
+        time.sleep(PollSeconds)
+    if last_filled > 0:
+        logger(f"{label} 等待超时，已部分成交 {format_decimal(last_filled)}。")
+        return last_filled, avg_price
+    raise OkxApiError(f"{label} 等待成交超时。")
+
+
 _wait_order_fill = _wait_order_fill_with_private_ws
 
 
@@ -279,6 +414,106 @@ class ArbitrageExecutor:
     def __init__(self, client: OkxRestClient, *, logger: Logger | None = None) -> None:
         self._client = client
         self._logger = logger or (lambda _message: None)
+        self._cache_lock = threading.Lock()
+        self._instrument_cache: dict[str, object] = {}
+        self._ticker_cache: dict[tuple[str, str], tuple[float, OkxTicker]] = {}
+        self._order_book_cache: dict[tuple[str, str, int], tuple[float, OkxOrderBook]] = {}
+
+    def _cached_instrument(self, inst_id: str):
+        with self._cache_lock:
+            cached = self._instrument_cache.get(inst_id)
+        if cached is not None:
+            return cached
+        instrument = self._client.get_instrument(inst_id)
+        with self._cache_lock:
+            self._instrument_cache[inst_id] = instrument
+        return instrument
+
+    def _ticker_cache_key(self, inst_id: str, *, environment: str) -> tuple[str, str]:
+        return environment.strip().lower() or "demo", inst_id.strip().upper()
+
+    def _order_book_cache_key(self, inst_id: str, *, environment: str, depth: int) -> tuple[str, str, int]:
+        return environment.strip().lower() or "demo", inst_id.strip().upper(), max(1, int(depth))
+
+    def _read_ttl_cache(self, cache: dict, key):
+        now = time.monotonic()
+        with self._cache_lock:
+            payload = cache.get(key)
+            if payload is None:
+                return None
+            cached_at, value = payload
+            if now - cached_at <= EXECUTOR_MARKET_CACHE_TTL_SECONDS:
+                return value
+            cache.pop(key, None)
+        return None
+
+    def _write_ttl_cache(self, cache: dict, key, value) -> None:
+        with self._cache_lock:
+            cache[key] = (time.monotonic(), value)
+
+    def _prime_market_context(self, inst_ids: tuple[str, ...] | list[str], *, environment: str, depth: int = 5) -> None:
+        for inst_id in inst_ids:
+            if not inst_id:
+                continue
+            try:
+                self._cached_instrument(inst_id)
+            except Exception:
+                pass
+            try:
+                self._preferred_ticker(inst_id, environment=environment)
+            except Exception:
+                pass
+            try:
+                self._preferred_order_book(inst_id, environment=environment, depth=depth)
+            except Exception:
+                pass
+
+    def prewarm_market_context(self, inst_ids: tuple[str, ...] | list[str], *, environment: str, depth: int = 5) -> None:
+        self._prime_market_context(inst_ids, environment=environment, depth=depth)
+
+    def _preferred_ticker(self, inst_id: str, *, environment: str) -> OkxTicker:
+        cached = self._read_ttl_cache(self._ticker_cache, self._ticker_cache_key(inst_id, environment=environment))
+        if cached is not None:
+            return cached
+        try:
+            self._client.ensure_public_ws_market_watch(inst_id, environment=environment)
+        except Exception:
+            pass
+        try:
+            payload = self._client.get_cached_public_ticker(inst_id, environment=environment)
+        except Exception:
+            payload = None
+        if payload is not None:
+            _, ticker = payload
+            self._write_ttl_cache(self._ticker_cache, self._ticker_cache_key(inst_id, environment=environment), ticker)
+            return ticker
+        ticker = self._client.get_ticker(inst_id)
+        self._write_ttl_cache(self._ticker_cache, self._ticker_cache_key(inst_id, environment=environment), ticker)
+        return ticker
+
+    def _preferred_order_book(self, inst_id: str, *, environment: str, depth: int = 5) -> OkxOrderBook | None:
+        cache_key = self._order_book_cache_key(inst_id, environment=environment, depth=depth)
+        cached = self._read_ttl_cache(self._order_book_cache, cache_key)
+        if cached is not None:
+            return cached
+        try:
+            self._client.ensure_public_ws_market_watch(inst_id, environment=environment)
+        except Exception:
+            pass
+        try:
+            payload = self._client.get_cached_public_order_book(inst_id, environment=environment)
+        except Exception:
+            payload = None
+        if payload is not None:
+            _, order_book = payload
+            self._write_ttl_cache(self._order_book_cache, cache_key, order_book)
+            return order_book
+        try:
+            order_book = self._client.get_order_book(inst_id, depth=depth)
+            self._write_ttl_cache(self._order_book_cache, cache_key, order_book)
+            return order_book
+        except Exception:
+            return None
 
     def _blend_avg_price(
         self,
@@ -296,13 +531,17 @@ class ArbitrageExecutor:
             return current_avg
         return ((current_avg * current_size) + (new_avg * new_size)) / total_size
 
-    def _resolve_passive_price(self, instrument, *, side: str) -> Decimal:
-        order_book = None
-        try:
-            order_book = self._client.get_order_book(instrument.inst_id, depth=5)
-        except Exception:
-            order_book = None
-        ticker = self._client.get_ticker(instrument.inst_id)
+    def _resolve_passive_price(
+        self,
+        instrument,
+        *,
+        side: str,
+        environment: str,
+        ticker: OkxTicker | None = None,
+        order_book: OkxOrderBook | None = None,
+    ) -> Decimal:
+        order_book = order_book or self._preferred_order_book(instrument.inst_id, environment=environment, depth=5)
+        ticker = ticker or self._preferred_ticker(instrument.inst_id, environment=environment)
         normalized_side = side.strip().lower()
         if normalized_side == "buy":
             raw = order_book.bids[0][0] if order_book is not None and order_book.bids else ticker.bid
@@ -368,6 +607,74 @@ class ArbitrageExecutor:
             time.sleep(PollSeconds)
         return last_filled, avg_price, filled_completely
 
+    def _wait_two_maker_orders_until(
+        self,
+        *,
+        credentials,
+        current_config: StrategyConfig,
+        target_config: StrategyConfig,
+        current_inst_id: str,
+        target_inst_id: str,
+        current_ord_id: str,
+        target_ord_id: str,
+        timeout_seconds: float,
+        current_label: str,
+        target_label: str,
+    ) -> tuple[Decimal, Decimal | None, Decimal, Decimal | None, bool]:
+        deadline = time.time() + timeout_seconds
+        current_filled = Decimal("0")
+        target_filled = Decimal("0")
+        current_avg: Decimal | None = None
+        target_avg: Decimal | None = None
+        while time.time() < deadline:
+            current_status = self._client.get_order(
+                credentials,
+                current_config,
+                inst_id=current_inst_id,
+                ord_id=current_ord_id,
+            )
+            target_status = self._client.get_order(
+                credentials,
+                target_config,
+                inst_id=target_inst_id,
+                ord_id=target_ord_id,
+            )
+            next_current_filled = current_status.filled_size or Decimal("0")
+            next_target_filled = target_status.filled_size or Decimal("0")
+            current_avg = current_status.avg_price
+            target_avg = target_status.avg_price
+            if next_current_filled > current_filled:
+                self._logger(
+                    f"{current_label} 成交进度 {format_decimal(next_current_filled)}"
+                )
+                current_filled = next_current_filled
+            if next_target_filled > target_filled:
+                self._logger(
+                    f"{target_label} 成交进度 {format_decimal(next_target_filled)}"
+                )
+                target_filled = next_target_filled
+            if current_filled > 0 or target_filled > 0:
+                return current_filled, current_avg, target_filled, target_avg, True
+            current_state = (current_status.state or "").lower()
+            target_state = (target_status.state or "").lower()
+            if current_state in {"filled", "canceled", "cancelled"} and target_state in {"filled", "canceled", "cancelled"}:
+                break
+            time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.2))
+        return current_filled, current_avg, target_filled, target_avg, (current_filled > 0 or target_filled > 0)
+
+    def _cancel_order_safely(
+        self,
+        *,
+        credentials,
+        config: StrategyConfig,
+        inst_id: str,
+        ord_id: str,
+    ) -> None:
+        try:
+            self._client.cancel_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
+        except Exception:
+            pass
+
     def _execute_taker_leg(
         self,
         *,
@@ -422,7 +729,10 @@ class ArbitrageExecutor:
         deriv_avg: Decimal | None = None
         residual_spot_qty = Decimal("0")
         remaining_derivative_qty = preview.swap_contracts
-        reference_price = self._client.get_ticker(request.derivative_inst_id).last or self._client.get_ticker(request.spot_inst_id).last
+        reference_price = (
+            self._preferred_ticker(request.derivative_inst_id, environment=runtime.environment).last
+            or self._preferred_ticker(request.spot_inst_id, environment=runtime.environment).last
+        )
 
         for attempt in range(max(0, request.chase_limit) + 1):
             if remaining_derivative_qty < deriv_inst.min_size:
@@ -462,7 +772,11 @@ class ArbitrageExecutor:
                 size=maker_size,
                 ord_type="post_only",
                 pos_side=maker_pos_side,
-                price=self._resolve_passive_price(maker_instrument, side=maker_side),
+                price=self._resolve_passive_price(
+                    maker_instrument,
+                    side=maker_side,
+                    environment=runtime.environment,
+                ),
                 reduce_only=maker_reduce_only,
                 cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
             )
@@ -611,7 +925,11 @@ class ArbitrageExecutor:
                 size=maker_size,
                 ord_type="post_only",
                 pos_side=maker_pos_side,
-                price=self._resolve_passive_price(maker_instrument, side=maker_side),
+                price=self._resolve_passive_price(
+                    maker_instrument,
+                    side=maker_side,
+                    environment=runtime.environment,
+                ),
                 reduce_only=maker_reduce_only,
                 cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
             )
@@ -708,9 +1026,10 @@ class ArbitrageExecutor:
         runtime: ArbitrageTradeRuntime,
     ) -> ArbitrageOpenResult:
         credentials = runtime.credentials
-        spot_inst = self._client.get_instrument(request.spot_inst_id)
-        deriv_inst = self._client.get_instrument(request.derivative_inst_id)
-        spot_ticker = self._client.get_ticker(request.spot_inst_id)
+        self._prime_market_context((request.spot_inst_id, request.derivative_inst_id), environment=runtime.environment)
+        spot_inst = self._cached_instrument(request.spot_inst_id)
+        deriv_inst = self._cached_instrument(request.derivative_inst_id)
+        spot_ticker = self._preferred_ticker(request.spot_inst_id, environment=runtime.environment)
         spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask)
         if spot_mid is None:
             return ArbitrageOpenResult(success=False, message=f"无法获取 {request.spot_inst_id} 报价。")
@@ -795,7 +1114,12 @@ class ArbitrageExecutor:
             )
 
         spot_price = self._resolve_spot_buy_price(request, spot_inst, spot_ticker)
-        deriv_price = self._resolve_derivative_sell_price(request, deriv_inst, request.derivative_inst_id)
+        deriv_price = self._resolve_derivative_sell_price(
+            request,
+            deriv_inst,
+            request.derivative_inst_id,
+            environment=runtime.environment,
+        )
 
         self._logger(
             "套利开仓："
@@ -985,10 +1309,11 @@ class ArbitrageExecutor:
         runtime: ArbitrageTradeRuntime,
     ) -> Decimal | None:
         credentials = runtime.credentials
-        spot_inst = self._client.get_instrument(entry.spot_inst_id)
-        deriv_inst = self._client.get_instrument(entry.derivative_inst_id)
-        deriv_ticker = self._client.get_ticker(entry.derivative_inst_id)
-        spot_ticker = self._client.get_ticker(entry.spot_inst_id)
+        self._prime_market_context((entry.spot_inst_id, entry.derivative_inst_id), environment=runtime.environment)
+        spot_inst = self._cached_instrument(entry.spot_inst_id)
+        deriv_inst = self._cached_instrument(entry.derivative_inst_id)
+        deriv_ticker = self._preferred_ticker(entry.derivative_inst_id, environment=runtime.environment)
+        spot_ticker = self._preferred_ticker(entry.spot_inst_id, environment=runtime.environment)
         planned_derivative_qty = self._resolve_close_derivative_qty(entry, request, deriv_inst)
         planned_batches = _split_derivative_batches(
             planned_derivative_qty,
@@ -1229,9 +1554,13 @@ class ArbitrageExecutor:
         if entry.derivative_inst_id == request.target_derivative_inst_id:
             return ArbitrageRollResult(success=False, message="目标交割合约不能与当前合约相同。")
         try:
-            current_inst = self._client.get_instrument(entry.derivative_inst_id)
-            target_inst = self._client.get_instrument(request.target_derivative_inst_id)
-            spot_inst = self._client.get_instrument(entry.spot_inst_id)
+            self._prime_market_context(
+                (entry.derivative_inst_id, request.target_derivative_inst_id, entry.spot_inst_id),
+                environment=runtime.environment,
+            )
+            current_inst = self._cached_instrument(entry.derivative_inst_id)
+            target_inst = self._cached_instrument(request.target_derivative_inst_id)
+            spot_inst = self._cached_instrument(entry.spot_inst_id)
             roll_derivative_qty = self._resolve_roll_derivative_qty(entry, request, current_inst)
             planned_batches = _split_derivative_batches(
                 roll_derivative_qty,
@@ -1443,9 +1772,13 @@ class ArbitrageExecutor:
         if entry.derivative_inst_id == request.target_derivative_inst_id:
             return ArbitrageRollResult(success=False, message="目标交割合约不能与当前合约相同。")
         try:
-            current_inst = self._client.get_instrument(entry.derivative_inst_id)
-            target_inst = self._client.get_instrument(request.target_derivative_inst_id)
-            spot_inst = self._client.get_instrument(entry.spot_inst_id)
+            self._prime_market_context(
+                (entry.derivative_inst_id, request.target_derivative_inst_id, entry.spot_inst_id),
+                environment=runtime.environment,
+            )
+            current_inst = self._cached_instrument(entry.derivative_inst_id)
+            target_inst = self._cached_instrument(request.target_derivative_inst_id)
+            spot_inst = self._cached_instrument(entry.spot_inst_id)
             roll_derivative_qty = self._resolve_roll_derivative_qty(entry, request, current_inst)
             planned_batches = _split_derivative_batches(
                 roll_derivative_qty,
@@ -1645,6 +1978,150 @@ class ArbitrageExecutor:
         current_config = _build_strategy_config(entry.derivative_inst_id, runtime)
         target_config = _build_strategy_config(request.target_derivative_inst_id, runtime)
         derivative_pos_side = "short" if runtime.position_mode == "long_short" else None
+        if request.execution_mode == "both_maker_first_taker":
+            total_current_filled = Decimal("0")
+            total_target_filled = Decimal("0")
+            current_avg: Decimal | None = None
+            target_avg: Decimal | None = None
+            remaining_qty = planned_derivative_qty
+            for attempt in range(max(0, request.chase_limit) + 1):
+                if remaining_qty < current_inst.min_size or remaining_qty < target_inst.min_size:
+                    break
+                current_order = self._client.place_simple_order(
+                    credentials,
+                    current_config,
+                    inst_id=entry.derivative_inst_id,
+                    side="buy",
+                    size=remaining_qty,
+                    ord_type="post_only",
+                    pos_side=derivative_pos_side,
+                    price=self._resolve_passive_price(
+                        current_inst,
+                        side="buy",
+                        environment=runtime.environment,
+                    ),
+                    reduce_only=True,
+                    cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                )
+                target_order = self._client.place_simple_order(
+                    credentials,
+                    target_config,
+                    inst_id=request.target_derivative_inst_id,
+                    side="sell",
+                    size=remaining_qty,
+                    ord_type="post_only",
+                    pos_side=derivative_pos_side,
+                    price=self._resolve_passive_price(
+                        target_inst,
+                        side="sell",
+                        environment=runtime.environment,
+                    ),
+                    reduce_only=False,
+                    cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                )
+                (
+                    current_maker_filled,
+                    current_maker_avg,
+                    target_maker_filled,
+                    target_maker_avg,
+                    any_maker_filled,
+                ) = self._wait_two_maker_orders_until(
+                    credentials=credentials,
+                    current_config=current_config,
+                    target_config=target_config,
+                    current_inst_id=entry.derivative_inst_id,
+                    target_inst_id=request.target_derivative_inst_id,
+                    current_ord_id=current_order.ord_id,
+                    target_ord_id=target_order.ord_id,
+                    timeout_seconds=request.maker_wait_seconds,
+                    current_label=f"移仓旧合约双边挂单腿 第 {attempt + 1} 次",
+                    target_label=f"移仓目标合约双边挂单腿 第 {attempt + 1} 次",
+                )
+                self._cancel_order_safely(
+                    credentials=credentials,
+                    config=current_config,
+                    inst_id=entry.derivative_inst_id,
+                    ord_id=current_order.ord_id,
+                )
+                self._cancel_order_safely(
+                    credentials=credentials,
+                    config=target_config,
+                    inst_id=request.target_derivative_inst_id,
+                    ord_id=target_order.ord_id,
+                )
+                if not any_maker_filled:
+                    if attempt >= request.chase_limit:
+                        raise OkxApiError("双边挂单腿均未成交，已达到最大追单次数。")
+                    continue
+
+                current_batch_filled = current_maker_filled
+                target_batch_filled = target_maker_filled
+                batch_current_avg = current_maker_avg
+                batch_target_avg = target_maker_avg
+                if current_batch_filled > target_batch_filled:
+                    hedge_qty = current_batch_filled - target_batch_filled
+                    target_taker_filled, target_taker_avg = self._execute_taker_leg(
+                        credentials=credentials,
+                        config=target_config,
+                        inst_id=request.target_derivative_inst_id,
+                        side="sell",
+                        size=hedge_qty,
+                        label="移仓目标合约市价补齐腿",
+                        pos_side=derivative_pos_side,
+                    )
+                    batch_target_avg = self._blend_avg_price(
+                        batch_target_avg,
+                        target_batch_filled,
+                        target_taker_avg,
+                        target_taker_filled,
+                    )
+                    target_batch_filled += target_taker_filled
+                elif target_batch_filled > current_batch_filled:
+                    hedge_qty = target_batch_filled - current_batch_filled
+                    current_taker_filled, current_taker_avg = self._execute_taker_leg(
+                        credentials=credentials,
+                        config=current_config,
+                        inst_id=entry.derivative_inst_id,
+                        side="buy",
+                        size=hedge_qty,
+                        label="移仓旧合约市价补齐腿",
+                        pos_side=derivative_pos_side,
+                        reduce_only=True,
+                    )
+                    batch_current_avg = self._blend_avg_price(
+                        batch_current_avg,
+                        current_batch_filled,
+                        current_taker_avg,
+                        current_taker_filled,
+                    )
+                    current_batch_filled += current_taker_filled
+
+                if current_batch_filled <= 0 or target_batch_filled <= 0:
+                    if attempt >= request.chase_limit:
+                        raise OkxApiError("双边挂单已有成交但未形成有效双腿移仓成交。")
+                    continue
+                current_avg = self._blend_avg_price(
+                    current_avg,
+                    total_current_filled,
+                    batch_current_avg,
+                    current_batch_filled,
+                )
+                target_avg = self._blend_avg_price(
+                    target_avg,
+                    total_target_filled,
+                    batch_target_avg,
+                    target_batch_filled,
+                )
+                total_current_filled += current_batch_filled
+                total_target_filled += target_batch_filled
+                balanced_filled = min(total_current_filled, total_target_filled)
+                remaining_qty = max(planned_derivative_qty - balanced_filled, Decimal("0"))
+                if remaining_qty < current_inst.min_size or remaining_qty < target_inst.min_size:
+                    break
+            if total_current_filled <= 0 or total_target_filled <= 0:
+                raise OkxApiError("当前未形成有效的交割合约双边挂单移仓成交。")
+            return total_current_filled, current_avg, total_target_filled, target_avg
+
         if request.execution_mode == "old_maker_new_taker":
             total_current_filled = Decimal("0")
             total_target_filled = Decimal("0")
@@ -1662,7 +2139,11 @@ class ArbitrageExecutor:
                     size=remaining_qty,
                     ord_type="post_only",
                     pos_side=derivative_pos_side,
-                    price=self._resolve_roll_current_buy_price(request, current_inst),
+                    price=self._resolve_passive_price(
+                        current_inst,
+                        side="buy",
+                        environment=runtime.environment,
+                    ),
                     reduce_only=True,
                     cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
                 )
@@ -1719,7 +2200,11 @@ class ArbitrageExecutor:
                     size=remaining_qty,
                     ord_type="post_only",
                     pos_side=derivative_pos_side,
-                    price=self._resolve_roll_target_sell_price(request, target_inst),
+                    price=self._resolve_passive_price(
+                        target_inst,
+                        side="sell",
+                        environment=runtime.environment,
+                    ),
                     reduce_only=False,
                     cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
                 )
@@ -1760,10 +2245,20 @@ class ArbitrageExecutor:
                 raise OkxApiError("当前未形成有效的交割合约移仓成交。")
             return total_current_filled, current_avg, total_target_filled, target_avg
 
-        current_ticker = self._client.get_ticker(entry.derivative_inst_id)
-        target_ticker = self._client.get_ticker(request.target_derivative_inst_id)
-        current_buy_price = self._resolve_roll_current_buy_price(request, current_inst, ticker=current_ticker)
-        target_sell_price = self._resolve_roll_target_sell_price(request, target_inst, ticker=target_ticker)
+        current_ticker = self._preferred_ticker(entry.derivative_inst_id, environment=runtime.environment)
+        target_ticker = self._preferred_ticker(request.target_derivative_inst_id, environment=runtime.environment)
+        current_buy_price = self._resolve_roll_current_buy_price(
+            request,
+            current_inst,
+            ticker=current_ticker,
+            environment=runtime.environment,
+        )
+        target_sell_price = self._resolve_roll_target_sell_price(
+            request,
+            target_inst,
+            ticker=target_ticker,
+            environment=runtime.environment,
+        )
         current_ord_type = "limit" if request.use_limit_orders else "market"
         target_ord_type = "limit" if request.use_limit_orders else "market"
         current_result = self._client.place_simple_order(
@@ -1843,15 +2338,113 @@ class ArbitrageExecutor:
         raw = ask * (Decimal("1") + request.max_slippage)
         return snap_to_increment(raw, instrument.tick_size, "up")
 
-    def _resolve_derivative_sell_price(self, request: ArbitrageOpenRequest, instrument, inst_id: str) -> Decimal:
+    def _resolve_derivative_sell_price(
+        self,
+        request: ArbitrageOpenRequest,
+        instrument,
+        inst_id: str,
+        *,
+        environment: str,
+        ticker: OkxTicker | None = None,
+    ) -> Decimal:
         if request.derivative_limit_price is not None and request.derivative_limit_price > 0:
             return snap_to_increment(request.derivative_limit_price, instrument.tick_size, "down")
-        ticker = self._client.get_ticker(inst_id)
+        ticker = ticker or self._preferred_ticker(inst_id, environment=environment)
         bid = ticker.bid
         if bid is None or bid <= 0:
             raise OkxApiError(f"{inst_id} 缺少买一价。")
         raw = bid * (Decimal("1") - request.max_slippage)
         return snap_to_increment(raw, instrument.tick_size, "down")
+
+    def _wait_order_fill_until(
+        self,
+        *,
+        credentials,
+        config: StrategyConfig,
+        inst_id: str,
+        ord_id: str,
+        expected_size: Decimal,
+        timeout_seconds: float,
+        label: str,
+    ) -> tuple[Decimal, Decimal | None, bool]:
+        deadline = time.time() + timeout_seconds
+        last_filled = Decimal("0")
+        avg_price: Decimal | None = None
+        filled_completely = False
+        ws_version = 0
+        private_ws_connected = _private_ws_connected(self._client, credentials, environment=config.environment)
+        rest_fallback_at = time.time()
+        cached_status = _get_cached_private_order_status(
+            self._client,
+            credentials=credentials,
+            environment=config.environment,
+            inst_id=inst_id,
+            ord_id=ord_id,
+        )
+        if cached_status is not None:
+            ws_version, status = cached_status
+            filled = status.filled_size or Decimal("0")
+            avg_price = status.avg_price
+            last_filled = filled
+            state = (status.state or "").lower()
+            if state == "filled" or filled >= expected_size:
+                return filled, avg_price, True
+            if state in {"canceled", "cancelled"}:
+                return filled, avg_price, False
+        while time.time() < deadline:
+            remaining = max(0.0, deadline - time.time())
+            status = None
+            wait_private_update = getattr(self._client, "wait_private_order_update", None)
+            if private_ws_connected and callable(wait_private_update):
+                timeout = min(remaining, PRIVATE_WS_WAIT_SLICE_SECONDS)
+                if timeout > 0:
+                    try:
+                        ws_payload = wait_private_update(
+                            credentials,
+                            environment=config.environment,
+                            inst_id=inst_id,
+                            ord_id=ord_id,
+                            after_version=ws_version,
+                            timeout=timeout,
+                        )
+                    except Exception:  # noqa: BLE001
+                        ws_payload = None
+                    if ws_payload is not None:
+                        ws_version, status = ws_payload
+            if status is None:
+                if not private_ws_connected or time.time() >= rest_fallback_at:
+                    status = self._client.get_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
+                    rest_fallback_at = time.time() + PRIVATE_WS_STALE_REST_FALLBACK_SECONDS
+                else:
+                    cached_status = _get_cached_private_order_status(
+                        self._client,
+                        credentials=credentials,
+                        environment=config.environment,
+                        inst_id=inst_id,
+                        ord_id=ord_id,
+                    )
+                    if cached_status is not None:
+                        ws_version, status = cached_status
+            if status is None:
+                if private_ws_connected:
+                    continue
+                time.sleep(PollSeconds)
+                continue
+            filled = status.filled_size or Decimal("0")
+            avg_price = status.avg_price
+            state = (status.state or "").lower()
+            if filled > last_filled:
+                self._logger(f"{label} 成交进度 {format_decimal(filled)} / {format_decimal(expected_size)}")
+                last_filled = filled
+            if state == "filled" or filled >= expected_size:
+                filled_completely = True
+                break
+            if state in {"canceled", "cancelled"}:
+                break
+            if private_ws_connected and ws_version > 0:
+                continue
+            time.sleep(PollSeconds)
+        return last_filled, avg_price, filled_completely
 
     def _resolve_derivative_buy_price(self, request: ArbitrageCloseRequest, instrument, ticker) -> Decimal:
         if request.derivative_limit_price is not None and request.derivative_limit_price > 0:
@@ -1871,20 +2464,34 @@ class ArbitrageExecutor:
         raw = bid * (Decimal("1") - request.max_slippage)
         return snap_to_increment(raw, instrument.tick_size, "down")
 
-    def _resolve_roll_current_buy_price(self, request: ArbitrageRollRequest, instrument, ticker=None) -> Decimal:
+    def _resolve_roll_current_buy_price(
+        self,
+        request: ArbitrageRollRequest,
+        instrument,
+        ticker: OkxTicker | None = None,
+        *,
+        environment: str,
+    ) -> Decimal:
         if request.current_derivative_limit_price is not None and request.current_derivative_limit_price > 0:
             return snap_to_increment(request.current_derivative_limit_price, instrument.tick_size, "up")
-        ticker = ticker or self._client.get_ticker(instrument.inst_id)
+        ticker = ticker or self._preferred_ticker(instrument.inst_id, environment=environment)
         ask = ticker.ask
         if ask is None or ask <= 0:
             raise OkxApiError(f"{instrument.inst_id} 缺少卖一价。")
         raw = ask * (Decimal("1") + request.max_slippage)
         return snap_to_increment(raw, instrument.tick_size, "up")
 
-    def _resolve_roll_target_sell_price(self, request: ArbitrageRollRequest, instrument, ticker=None) -> Decimal:
+    def _resolve_roll_target_sell_price(
+        self,
+        request: ArbitrageRollRequest,
+        instrument,
+        ticker: OkxTicker | None = None,
+        *,
+        environment: str,
+    ) -> Decimal:
         if request.target_derivative_limit_price is not None and request.target_derivative_limit_price > 0:
             return snap_to_increment(request.target_derivative_limit_price, instrument.tick_size, "down")
-        ticker = ticker or self._client.get_ticker(instrument.inst_id)
+        ticker = ticker or self._preferred_ticker(instrument.inst_id, environment=environment)
         bid = ticker.bid
         if bid is None or bid <= 0:
             raise OkxApiError(f"{instrument.inst_id} 缺少买一价。")

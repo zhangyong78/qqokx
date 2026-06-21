@@ -16,6 +16,7 @@ from okx_quant.arbitrage.arbitrage_executor import (
     ArbitrageRollRequest,
 )
 from okx_quant.arbitrage_ui import (
+    ArbitrageWindow,
     _actionable_spread_abs,
     _arbitrage_fee_profile_from_snapshot,
     _build_spread_candles,
@@ -1784,6 +1785,162 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertEqual(client.orders[0]["inst_id"], "BTC-USDT-SWAP")
         self.assertEqual(client.orders[1]["inst_id"], "BTC-USDT-260926")
         upsert_mock.assert_not_called()
+
+    def test_roll_supports_both_maker_first_fill_then_market_hedge(self) -> None:
+        client = _FakeArbitrageTradeClient()
+        executor = ArbitrageExecutor(client)
+        entry = ArbitrageLedgerEntry(
+            entry_id="entry-open",
+            base_ccy="BTC",
+            pair_kind="spot_quarter",
+            spot_inst_id="BTC-USDT",
+            derivative_inst_id="BTC-USDT-SWAP",
+            spot_qty=Decimal("0.0200"),
+            derivative_qty=Decimal("2"),
+            open_spot_price=Decimal("100"),
+            open_derivative_price=Decimal("101"),
+            close_spot_price=None,
+            close_derivative_price=None,
+            basis_at_open_pct=Decimal("1"),
+            fee_total=Decimal("0"),
+            funding_total=Decimal("0"),
+            realized_pnl=None,
+            close_mode="open",
+            opened_at="2026-06-01T00:00:00Z",
+            closed_at=None,
+            notes="test",
+        )
+        request = ArbitrageRollRequest(
+            entry_id="entry-open",
+            target_derivative_inst_id="BTC-USDT-260926",
+            max_slippage=Decimal("0.0015"),
+            use_limit_orders=False,
+            roll_derivative_qty=Decimal("1"),
+            execution_mode="both_maker_first_taker",
+            maker_wait_seconds=0.1,
+            chase_limit=0,
+        )
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        with (
+            patch("okx_quant.arbitrage.arbitrage_executor.find_ledger_entry", return_value=entry),
+            patch("okx_quant.arbitrage.arbitrage_executor.upsert_ledger_entry"),
+            patch.object(
+                executor,
+                "_wait_two_maker_orders_until",
+                return_value=(Decimal("1"), Decimal("100"), Decimal("0"), None, True),
+            ),
+            patch(
+                "okx_quant.arbitrage.arbitrage_executor._wait_order_fill",
+                return_value=(Decimal("1"), Decimal("102")),
+            ),
+        ):
+            result = executor.roll_cash_and_carry(request, runtime=runtime)
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(client.orders), 3)
+        self.assertEqual(client.orders[0]["inst_id"], "BTC-USDT-SWAP")
+        self.assertEqual(client.orders[0]["ord_type"], "post_only")
+        self.assertEqual(client.orders[0]["side"], "buy")
+        self.assertEqual(client.orders[1]["inst_id"], "BTC-USDT-260926")
+        self.assertEqual(client.orders[1]["ord_type"], "post_only")
+        self.assertEqual(client.orders[1]["side"], "sell")
+        self.assertEqual(client.orders[2]["inst_id"], "BTC-USDT-260926")
+        self.assertEqual(client.orders[2]["ord_type"], "market")
+        self.assertEqual(client.orders[2]["side"], "sell")
+        self.assertEqual(client.cancels, [("BTC-USDT-SWAP", "ord-1"), ("BTC-USDT-260926", "ord-2")])
+
+    def test_roll_ui_builds_request_from_delivery_position_without_spot_match(self) -> None:
+        class _Value:
+            def __init__(self, value: str | bool) -> None:
+                self._value = value
+
+            def get(self):
+                return self._value
+
+        class _Manager:
+            def get_instrument(self, inst_id: str) -> Instrument:
+                if inst_id == "BTC-USDT":
+                    return Instrument(
+                        inst_id="BTC-USDT",
+                        inst_type="SPOT",
+                        tick_size=Decimal("0.01"),
+                        lot_size=Decimal("0.0001"),
+                        min_size=Decimal("0.0001"),
+                        state="live",
+                    )
+                raise AssertionError(f"unexpected instrument lookup: {inst_id}")
+
+        current_future = OkxPosition(
+            inst_id="BTC-USD-260626",
+            inst_type="FUTURES",
+            pos_side="short",
+            mgn_mode="cross",
+            position=Decimal("-890"),
+            avail_position=Decimal("890"),
+            avg_price=Decimal("64000"),
+            mark_price=Decimal("64000"),
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy=None,
+            last_price=Decimal("64000"),
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+        current_instrument = Instrument(
+            inst_id="BTC-USD-260626",
+            inst_type="FUTURES",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("0.01"),
+            ct_val_ccy="BTC",
+        )
+        window = object.__new__(ArbitrageWindow)
+        window._roll_entry_label = _Value("current")
+        window._roll_position_by_key = {"current": current_future}
+        window._roll_instruments = {"BTC-USD-260626": current_instrument}
+        window._roll_reference_prices = {}
+        window._roll_spot_by_base = {}
+        window._roll_source_entry_id = None
+        window._ledger_entry_by_id = {}
+        window.manager = _Manager()
+        window.roll_target_derivative_inst_id = _Value("BTC-USD-260925")
+        window.max_slippage_percent = _Value("0.15")
+        window.use_limit_orders = _Value(False)
+        window.roll_current_limit_price = _Value("")
+        window.roll_target_limit_price = _Value("")
+        window.roll_batch_count = _Value("10")
+        window.roll_batch_qty = _Value("1")
+        window.roll_execution_mode_label = _Value("dual_taker")
+        window.roll_maker_wait_seconds = _Value("6")
+        window.roll_chase_limit = _Value("3")
+
+        entry = window._selected_roll_entry()
+        assert entry is not None
+        request = window._build_roll_request(entry=entry, roll_derivative_qty=Decimal("100"))
+
+        self.assertIsNone(request.entry_id)
+        self.assertEqual(request.spot_inst_id, "BTC-USDT")
+        self.assertEqual(request.current_derivative_inst_id, "BTC-USD-260626")
+        self.assertEqual(request.target_derivative_inst_id, "BTC-USD-260925")
+        self.assertEqual(request.roll_derivative_qty, Decimal("100"))
+        self.assertEqual(request.current_derivative_qty, Decimal("890"))
+        self.assertGreater(request.spot_qty or Decimal("0"), Decimal("0"))
 
 
 if __name__ == "__main__":

@@ -124,6 +124,25 @@ class OkxPublicWsConnection:
                 return None
             return record.version, dict(record.payload)
 
+    def wait_for_market_update(
+        self,
+        inst_ids: tuple[str, ...] | list[str],
+        *,
+        after_version: int = 0,
+        timeout: float = 1.0,
+    ) -> int | None:
+        normalized = tuple(sorted({inst_id.strip().upper() for inst_id in inst_ids if inst_id and inst_id.strip()}))
+        deadline = time.monotonic() + max(timeout, 0.0)
+        with self._lock:
+            while not self._stop_event.is_set():
+                if self._has_relevant_update(normalized, after_version=after_version):
+                    return self._version
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._lock.wait(timeout=remaining)
+        return None
+
     def _run_forever(self) -> None:
         try:
             asyncio.run(self._run_forever_async())
@@ -256,3 +275,17 @@ class OkxPublicWsConnection:
                 return
             self._last_error_logged = message
         self._logger(message)
+
+    def _has_relevant_update(self, inst_ids: tuple[str, ...], *, after_version: int) -> bool:
+        if self._version <= after_version:
+            return False
+        if not inst_ids:
+            return True
+        for inst_id in inst_ids:
+            ticker = self._ticker_by_inst_id.get(inst_id)
+            if ticker is not None and ticker.version > after_version:
+                return True
+            order_book = self._order_book_by_inst_id.get(inst_id)
+            if order_book is not None and order_book.version > after_version:
+                return True
+        return False

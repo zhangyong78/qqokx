@@ -3751,7 +3751,23 @@ class StrategyEngine:
                 fill_price=filled.entry_price,
                 trade_instrument=trade_instrument,
             )
-            pnl_segment = f" | 本笔盈亏={trade_pnl}" if trade_pnl else ""
+            closed_position = replace(position, size=filled.size)
+            history_item = self._lookup_recent_position_close_history(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                position=closed_position,
+            )
+            close_trade_pnl = self._position_history_total_net_pnl_text(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                position=closed_position,
+                history_item=history_item,
+            )
+            if close_trade_pnl:
+                trade_pnl = close_trade_pnl
+            pnl_segment = f" | 本笔净盈亏={trade_pnl}" if trade_pnl else ""
             self._logger(
                 f"本地{reason}平仓已成交 | ordId={filled.ord_id} | 标的={trade_instrument.inst_id} | "
                 f"方向={position.close_side.upper()} | "
@@ -4428,6 +4444,18 @@ class StrategyEngine:
                     tick_size=trade_instrument.tick_size,
                     trigger_reason="OKX托管平仓（原因待确认）",
                     detail="OKX 托管止盈止损持仓已结束；当前监控链路无法区分具体由止盈还是止损触发，请以 OKX 成交明细为准。",
+                    trade_pnl=self._position_history_total_net_pnl_text(
+                        credentials,
+                        config,
+                        trade_instrument=trade_instrument,
+                        position=position,
+                        history_item=self._lookup_recent_position_close_history(
+                            credentials,
+                            config,
+                            trade_instrument=trade_instrument,
+                            position=position,
+                        ),
+                    ),
                 )
                 return
 
@@ -4639,10 +4667,137 @@ class StrategyEngine:
         value = item.realized_pnl if item.realized_pnl is not None else item.pnl
         if value is None:
             return ""
+        return StrategyEngine._signed_pnl_text(value)
+
+    @staticmethod
+    def _signed_pnl_text(value: Decimal | None) -> str:
+        if value is None:
+            return ""
         text = format_decimal(value)
         if value > 0:
             return f"+{text}"
         return text
+
+    def _lookup_entry_fee_for_position(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        max_attempts: int = 3,
+        delay_seconds: float = 1.0,
+    ) -> Decimal | None:
+        if not position.ord_id and not (position.cl_ord_id or "").strip():
+            return None
+
+        inst_types = (trade_instrument.inst_type,)
+        entry_window_ms = max(position.entry_ts - 2 * 60 * 1000, 0)
+        normalized_cl_ord_id = (position.cl_ord_id or "").strip()
+        for attempt in range(max_attempts):
+            fills = self._call_okx_read_with_retry(
+                f"读取开仓成交手续费 {trade_instrument.inst_id}",
+                lambda: self._client.get_fills_history(
+                    credentials,
+                    environment=config.environment,
+                    inst_types=inst_types,
+                    limit=100,
+                ),
+            )
+            fill_fee_total = Decimal("0")
+            fill_fee_seen = False
+            for item in fills:
+                if item.inst_id != trade_instrument.inst_id:
+                    continue
+                if (item.fill_time or 0) < entry_window_ms:
+                    continue
+                same_order = bool(position.ord_id and (item.order_id or "").strip() == position.ord_id)
+                same_client_order = bool(
+                    normalized_cl_ord_id and str(item.raw.get("clOrdId") or "").strip() == normalized_cl_ord_id
+                )
+                if not same_order and not same_client_order:
+                    continue
+                if item.fill_fee is None:
+                    continue
+                fill_fee_total += item.fill_fee
+                fill_fee_seen = True
+            if fill_fee_seen:
+                return fill_fee_total
+
+            orders = self._call_okx_read_with_retry(
+                f"读取开仓委托手续费 {trade_instrument.inst_id}",
+                lambda: self._client.get_order_history(
+                    credentials,
+                    environment=config.environment,
+                    inst_types=inst_types,
+                    limit=100,
+                ),
+            )
+            for item in orders:
+                if item.inst_id != trade_instrument.inst_id:
+                    continue
+                if (item.update_time or item.created_time or 0) < entry_window_ms:
+                    continue
+                same_order = bool(position.ord_id and (item.order_id or "").strip() == position.ord_id)
+                same_client_order = bool(
+                    normalized_cl_ord_id and (item.client_order_id or "").strip() == normalized_cl_ord_id
+                )
+                if not same_order and not same_client_order:
+                    continue
+                if item.fee is not None:
+                    return item.fee
+            if attempt + 1 < max_attempts:
+                self._stop_event.wait(delay_seconds)
+        return None
+
+    def _position_history_total_net_pnl_text(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        history_item: OkxPositionHistoryItem | None,
+    ) -> str:
+        if history_item is None:
+            return ""
+        try:
+            entry_fee = self._lookup_entry_fee_for_position(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                position=position,
+            )
+        except Exception:
+            entry_fee = None
+        gross_pnl = history_item.pnl
+        funding_fee = history_item.funding_fee
+        close_fee = history_item.fee
+        if history_item.realized_pnl is not None:
+            value = history_item.realized_pnl + (entry_fee or Decimal("0"))
+        elif gross_pnl is not None:
+            value = (
+                gross_pnl
+                + (entry_fee or Decimal("0"))
+                + (close_fee or Decimal("0"))
+                + (funding_fee or Decimal("0"))
+            )
+        else:
+            return ""
+        detail_parts: list[str] = []
+        if gross_pnl is not None:
+            detail_parts.append(f"毛盈亏 {self._signed_pnl_text(gross_pnl)}")
+        if entry_fee is not None or close_fee is not None:
+            total_fee = (entry_fee or Decimal("0")) + (close_fee or Decimal("0"))
+            detail_parts.append(f"手续费 {self._signed_pnl_text(total_fee)}")
+        if funding_fee is not None:
+            detail_parts.append(f"资金费 {self._signed_pnl_text(funding_fee)}")
+        if entry_fee is None:
+            detail_parts.append("开仓手续费待补齐")
+        net_text = self._signed_pnl_text(value)
+        if not detail_parts:
+            return net_text
+        return f"{net_text}（{' | '.join(detail_parts)}）"
 
     def _call_okx_read_with_retry(self, label: str, fn: Callable[[], T]) -> T:
         return self._retry_policy.call_okx_read_with_retry(label, fn)
@@ -6127,7 +6282,13 @@ class StrategyEngine:
             tick_size=trade_instrument.tick_size,
             trigger_reason=trigger_reason,
             detail=detail,
-            trade_pnl=self._position_history_close_pnl_text(history_item),
+            trade_pnl=self._position_history_total_net_pnl_text(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                position=position,
+                history_item=history_item,
+            ),
             price_label="触发止损价",
         )
 

@@ -12,7 +12,9 @@ from okx_quant.arbitrage.models import ArbitrageTradeRuntime
 from okx_quant.okx_client import OkxRestClient
 
 Logger = Callable[[str], None]
+SessionUpdateCallback = Callable[[object | None], None]
 MonitorPollSeconds = 2.0
+PublicWsWaitSliceSeconds = 0.5
 
 
 @dataclass
@@ -35,16 +37,30 @@ class ArbitrageAutoOpenService:
         *,
         executor: ArbitrageExecutor | None = None,
         logger: Logger | None = None,
+        status_callback: SessionUpdateCallback | None = None,
     ) -> None:
         self._client = client
         self._executor = executor or ArbitrageExecutor(client, logger=logger)
         self._logger = logger or (lambda _message: None)
+        self._status_callback = status_callback or (lambda _session: None)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._session: ArbitrageAutoOpenSession | None = None
 
-    def _get_live_ticker(self, inst_id: str, *, environment: str):
+    def set_status_callback(self, callback: SessionUpdateCallback | None) -> None:
+        self._status_callback = callback or (lambda _session: None)
+
+    def _notify_session_update(self, session: ArbitrageAutoOpenSession | None = None) -> None:
+        callback = self._status_callback
+        if session is None:
+            session = self.session
+        try:
+            callback(session)
+        except Exception:
+            pass
+
+    def _get_live_ticker_with_version(self, inst_id: str, *, environment: str):
         ensure_watch = getattr(self._client, "ensure_public_ws_market_watch", None)
         if callable(ensure_watch):
             try:
@@ -58,9 +74,37 @@ class ArbitrageAutoOpenService:
             except Exception:
                 payload = None
             if payload is not None:
-                _, ticker = payload
-                return ticker
-        return self._client.get_ticker(inst_id)
+                version, ticker = payload
+                return version, ticker
+        return None, self._client.get_ticker(inst_id)
+
+    def _wait_public_market_update_or_sleep(
+        self,
+        *,
+        inst_ids: tuple[str, ...],
+        environment: str,
+        after_version: int | None,
+    ) -> None:
+        deadline = time.monotonic() + MonitorPollSeconds
+        if after_version is not None and after_version > 0:
+            while not self._stop_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                wait_seconds = min(remaining, PublicWsWaitSliceSeconds)
+                try:
+                    version = self._client.wait_public_market_update(
+                        inst_ids,
+                        environment=environment,
+                        after_version=after_version,
+                        timeout=wait_seconds,
+                    )
+                except Exception:
+                    version = None
+                if version is not None:
+                    return
+            return
+        self._stop_event.wait(MonitorPollSeconds)
 
     @property
     def is_running(self) -> bool:
@@ -80,12 +124,15 @@ class ArbitrageAutoOpenService:
             self._session = ArbitrageAutoOpenSession(request=request, runtime=runtime)
             self._thread = threading.Thread(target=self._run, name="arbitrage-auto-open", daemon=True)
             self._thread.start()
+            session = self._session
+        self._notify_session_update(session)
 
     def stop(self) -> None:
         self._stop_event.set()
         with self._lock:
             if self._session is not None and not self._session.triggered:
                 self._session.status = "已停止"
+                self._notify_session_update(self._session)
             thread = self._thread
         if thread is not None:
             thread.join(timeout=MonitorPollSeconds + 1.0)
@@ -97,8 +144,10 @@ class ArbitrageAutoOpenService:
             if session is None:
                 return
             try:
-                if self._should_trigger(session):
+                should_trigger, market_version = self._refresh_quote(session)
+                if should_trigger:
                     session.status = "条件满足，正在开仓…"
+                    self._notify_session_update(session)
                     spread_text = (
                         f"价差率 {session.last_spread_pct:.4f}% | 绝对价差 {session.last_spread_abs:.6f}"
                         if session.last_spread_pct is not None and session.last_spread_abs is not None
@@ -113,25 +162,40 @@ class ArbitrageAutoOpenService:
                     session.result = result
                     session.status = "已完成" if result.success else f"失败：{result.message}"
                     self._logger(session.status)
+                    self._notify_session_update(session)
                     return
-                self._refresh_quote(session)
             except Exception as exc:
                 session.status = f"异常：{exc}"
                 self._logger(f"自动开仓监控异常：{exc}")
+                self._notify_session_update(session)
                 return
-            time.sleep(MonitorPollSeconds)
+            self._wait_public_market_update_or_sleep(
+                inst_ids=(session.request.spot_inst_id, session.request.derivative_inst_id),
+                environment=session.runtime.environment,
+                after_version=market_version,
+            )
         session = self.session
         if session is not None and not session.triggered:
             session.status = "已停止"
+            self._notify_session_update(session)
 
-    def _refresh_quote(self, session: ArbitrageAutoOpenSession) -> None:
-        spot_ticker = self._get_live_ticker(session.request.spot_inst_id, environment=session.runtime.environment)
-        deriv_ticker = self._get_live_ticker(session.request.derivative_inst_id, environment=session.runtime.environment)
+    def _refresh_quote(self, session: ArbitrageAutoOpenSession) -> tuple[bool, int | None]:
+        runtime = getattr(session, "runtime", None)
+        environment = getattr(runtime, "environment", "demo")
+        spot_version, spot_ticker = self._get_live_ticker_with_version(
+            session.request.spot_inst_id,
+            environment=environment,
+        )
+        deriv_version, deriv_ticker = self._get_live_ticker_with_version(
+            session.request.derivative_inst_id,
+            environment=environment,
+        )
         spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask)
         deriv_mid = mid_price(deriv_ticker.bid, deriv_ticker.ask)
         if spot_mid is None or deriv_mid is None or spot_mid <= 0:
             session.status = "等待有效报价…"
-            return
+            self._notify_session_update(session)
+            return False, None
         spread_abs = deriv_mid - spot_mid
         spread_pct = (deriv_mid - spot_mid) / spot_mid * Decimal("100")
         session.last_spot_mid = spot_mid
@@ -139,32 +203,19 @@ class ArbitrageAutoOpenService:
         session.last_spread_pct = spread_pct
         session.last_spread_abs = spread_abs
         session.status = f"监控中 | 价差率 {spread_pct:.4f}% | 绝对价差 {spread_abs:.6f}"
-
-    def _should_trigger(self, session: ArbitrageAutoOpenSession) -> bool:
+        self._notify_session_update(session)
         request = session.request
-        runtime = getattr(session, "runtime", None)
-        environment = getattr(runtime, "environment", "demo")
-        spot_ticker = self._get_live_ticker(request.spot_inst_id, environment=environment)
-        deriv_ticker = self._get_live_ticker(request.derivative_inst_id, environment=environment)
-        spot_mid = mid_price(spot_ticker.bid, spot_ticker.ask)
-        deriv_mid = mid_price(deriv_ticker.bid, deriv_ticker.ask)
-        if spot_mid is None or deriv_mid is None or spot_mid <= 0:
-            return False
-        spread_abs = deriv_mid - spot_mid
-        spread_pct = (deriv_mid - spot_mid) / spot_mid * Decimal("100")
-        session.last_spot_mid = spot_mid
-        session.last_deriv_mid = deriv_mid
-        session.last_spread_pct = spread_pct
-        session.last_spread_abs = spread_abs
+        versions = [version for version in (spot_version, deriv_version) if version is not None]
+        market_version = max(versions) if versions else None
 
         if request.trigger_mode == "spread":
             if request.open_spread_pct_max is None:
-                return False
-            return spread_pct <= request.open_spread_pct_max
+                return False, market_version
+            return spread_pct <= request.open_spread_pct_max, market_version
         if request.trigger_mode == "spread_abs":
             if request.open_spread_abs_max is None:
-                return False
-            return spread_abs >= request.open_spread_abs_max
+                return False, market_version
+            return spread_abs >= request.open_spread_abs_max, market_version
 
         spot_ok = True
         deriv_ok = True
@@ -174,4 +225,8 @@ class ArbitrageAutoOpenService:
         if request.derivative_limit_price is not None and request.derivative_limit_price > 0:
             bid = deriv_ticker.bid
             deriv_ok = bid is not None and bid > 0 and bid >= request.derivative_limit_price
-        return spot_ok and deriv_ok
+        return spot_ok and deriv_ok, market_version
+
+    def _should_trigger(self, session: ArbitrageAutoOpenSession) -> bool:
+        should_trigger, _market_version = self._refresh_quote(session)
+        return should_trigger

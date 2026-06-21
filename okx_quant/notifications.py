@@ -264,7 +264,7 @@ class EmailNotifier:
                 f"成交方向：{self._trade_side_label(side)}",
                 f"成交数量：{size}",
                 f"成交价格：{price}",
-                *([f"本笔盈亏：{trade_pnl}"] if trade_pnl.strip() else []),
+                *([f"本笔净盈亏：{trade_pnl}"] if trade_pnl.strip() else []),
                 f"说明：{reason}",
             ]
         )
@@ -318,7 +318,7 @@ class EmailNotifier:
         if exit_price.strip():
             lines.append(f"{price_label}：{exit_price}")
         if trade_pnl.strip():
-            lines.append(f"本笔盈亏：{trade_pnl}")
+            lines.append(f"本笔净盈亏：{trade_pnl}")
         lines.append(f"说明：{detail}")
         self.notify_async(subject, "\n".join(lines))
 

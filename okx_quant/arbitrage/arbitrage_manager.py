@@ -115,6 +115,15 @@ class ArbitrageManager:
     def roll_now(self, request: ArbitrageRollRequest, *, runtime: ArbitrageTradeRuntime) -> ArbitrageRollResult:
         return self._executor.roll_cash_and_carry(request, runtime=runtime)
 
+    def prewarm_market_context(
+        self,
+        inst_ids: tuple[str, ...] | list[str],
+        *,
+        environment: str,
+        depth: int = 5,
+    ) -> None:
+        self._executor.prewarm_market_context(inst_ids, environment=environment, depth=depth)
+
     def start_auto_open(self, request: ArbitrageOpenRequest, *, runtime: ArbitrageTradeRuntime) -> None:
         self._auto_open.start(request, runtime)
 

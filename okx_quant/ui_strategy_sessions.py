@@ -5934,7 +5934,12 @@ class UiStrategySessionsMixin:
 
     @staticmethod
     def _strategy_trade_reconciliation_needs_retry(result: StrategyTradeReconciliationResult) -> bool:
-        return result.error_message == "" and result.ledger_record is not None and result.ledger_record.net_pnl is None
+        if result.error_message != "" or result.ledger_record is None:
+            return False
+        record = result.ledger_record
+        if record.net_pnl is None or record.gross_pnl is None:
+            return True
+        return record.exit_fee is None
 
     def _build_strategy_trade_reconciliation_result(
         self,
@@ -6100,6 +6105,8 @@ class UiStrategySessionsMixin:
         exit_fee = _sum_fill_fee(close_fills)
         if exit_fee is None and close_order is not None:
             exit_fee = close_order.fee
+        if exit_fee is None and matched_position_history is not None:
+            exit_fee = getattr(matched_position_history, "fee", None)
         gross_pnl = _sum_fill_pnl(close_fills)
         if gross_pnl is None and close_order is not None:
             gross_pnl = close_order.pnl
@@ -6139,16 +6146,17 @@ class UiStrategySessionsMixin:
                 funding_seen = True
             if funding_seen:
                 funding_fee = funding_total
+        if funding_fee is None and matched_position_history is not None:
+            funding_fee = getattr(matched_position_history, "funding_fee", None)
 
         if (
             gross_pnl is None
             and matched_position_history is not None
             and matched_position_history.realized_pnl is not None
-            and (entry_fee is not None or exit_fee is not None or funding_fee is not None)
+            and (exit_fee is not None or funding_fee is not None)
         ):
             gross_pnl = (
                 matched_position_history.realized_pnl
-                - (entry_fee or Decimal("0"))
                 - (exit_fee or Decimal("0"))
                 - (funding_fee or Decimal("0"))
             )
@@ -6163,10 +6171,10 @@ class UiStrategySessionsMixin:
             )
 
         net_pnl = None
-        if gross_pnl is not None:
+        if matched_position_history is not None and matched_position_history.realized_pnl is not None:
+            net_pnl = matched_position_history.realized_pnl + (entry_fee or Decimal("0"))
+        elif gross_pnl is not None:
             net_pnl = gross_pnl + (entry_fee or Decimal("0")) + (exit_fee or Decimal("0")) + (funding_fee or Decimal("0"))
-        elif matched_position_history is not None and matched_position_history.realized_pnl is not None:
-            net_pnl = matched_position_history.realized_pnl
         if gross_pnl is None and net_pnl is not None and (entry_fee is not None or exit_fee is not None or funding_fee is not None):
             gross_pnl = net_pnl - (entry_fee or Decimal("0")) - (exit_fee or Decimal("0")) - (funding_fee or Decimal("0"))
 
@@ -6854,7 +6862,7 @@ class UiStrategySessionsMixin:
                 f"手续费：{_format_optional_usdt_precise(fee_total, places=2)}",
                 f"资金费：{_format_optional_usdt_precise(funding_total, places=2)}",
                 f"净盈亏：{_format_optional_usdt_precise(net_pnl_total, places=2)}",
-                f"上次盈亏：{_format_optional_usdt_precise(last_net_pnl, places=2)}",
+                f"上次净盈亏：{_format_optional_usdt_precise(last_net_pnl, places=2)}",
                 f"最近结论：{last_close_reason}" if last_close_reason else "",
             ]
         )

@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from tkinter import messagebox
+
+from okx_quant.app_paths import data_root
 
 
 class UiBacktestEntryMixin:
+    @staticmethod
+    def _arbitrage_fast_project_root() -> Path:
+        return Path(__file__).resolve().parent.parent
+
     def open_backtest_window(self) -> None:
         if self._backtest_window is not None and self._backtest_window.window.winfo_exists():
             self._backtest_window.window.focus_force()
@@ -109,6 +118,27 @@ class UiBacktestEntryMixin:
             runtime_config_provider=self._build_arbitrage_trade_runtime_or_none,
             logger=self._enqueue_log,
         )
+
+    def open_arbitrage_fast_window(self) -> None:
+        command = self._build_arbitrage_fast_command()
+        try:
+            subprocess.Popen(command, cwd=str(self._arbitrage_fast_project_root()))
+            self._enqueue_log("已启动现货套利极速版独立进程。")
+        except Exception as exc:
+            messagebox.showerror("启动失败", f"无法启动现货套利极速版：{exc}", parent=self.root)
+
+    def _build_arbitrage_fast_command(self) -> list[str]:
+        shared_data_root = str(data_root())
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--app", "arbitrage-fast", "--data-dir", shared_data_root]
+        return [
+            sys.executable,
+            str(self._arbitrage_fast_project_root() / "main.py"),
+            "--app",
+            "arbitrage-fast",
+            "--data-dir",
+            shared_data_root,
+        ]
 
     def open_backtest_compare_window(self) -> None:
         if self._backtest_compare_window is not None and self._backtest_compare_window.window.winfo_exists():

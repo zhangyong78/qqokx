@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 from okx_quant.engine import StrategyEngine, _classify_live_dynamic_close_reason
 from okx_quant.models import Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
-from okx_quant.okx_client import OkxPositionHistoryItem
+from okx_quant.okx_client import OkxFillHistoryItem, OkxPositionHistoryItem
 from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_LONG_ID, STRATEGY_EMA5_EMA8_ID
 
 
@@ -181,7 +181,7 @@ class EmailNotifierTest(TestCase):
         )
 
         _, body = notifier.notify_async.call_args.args
-        self.assertIn("本笔盈亏：+50", body)
+        self.assertIn("本笔净盈亏：+50", body)
 
     def test_send_trade_close_includes_trigger_reason_and_prices(self) -> None:
         notifier = self._make_notifier()
@@ -207,7 +207,7 @@ class EmailNotifierTest(TestCase):
         self.assertIn("触发原因：3R", body)
         self.assertIn("开仓价格：2500", body)
         self.assertIn("平仓价格：2550", body)
-        self.assertIn("本笔盈亏：+50", body)
+        self.assertIn("本笔净盈亏：+50", body)
 
     def test_login_uses_sender_email_when_username_blank(self) -> None:
         notifier = EmailNotifier(
@@ -578,8 +578,81 @@ class StrategyEngineNotificationTest(TestCase):
             detail="OKX 动态止损平仓",
         )
 
-        self.assertEqual(notifier.send_trade_close.call_args.kwargs["trade_pnl"], "+48.5")
+        self.assertEqual(
+            notifier.send_trade_close.call_args.kwargs["trade_pnl"],
+            "+48.5（毛盈亏 +47.5 | 手续费 -1 | 开仓手续费待补齐）",
+        )
         client.get_positions_history.assert_called_once()
+
+    def test_exchange_dynamic_stop_close_notification_includes_entry_fee_when_history_is_available(self) -> None:
+        client = MagicMock()
+        client.get_positions_history.return_value = [
+            OkxPositionHistoryItem(
+                update_time=None,
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                mgn_mode="cross",
+                pos_side="long",
+                direction="net",
+                open_avg_price=Decimal("2500"),
+                close_avg_price=Decimal("2550"),
+                close_size=Decimal("1"),
+                pnl=Decimal("50"),
+                realized_pnl=Decimal("48.5"),
+                settle_pnl=Decimal("0"),
+                raw={},
+                fee=Decimal("-1"),
+                fee_currency="USDT",
+                funding_fee=Decimal("-0.5"),
+            )
+        ]
+        client.get_fills_history.return_value = [
+            OkxFillHistoryItem(
+                fill_time=1_700_000_000_000,
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                side="buy",
+                pos_side="long",
+                fill_price=Decimal("2500"),
+                fill_size=Decimal("1"),
+                fill_fee=Decimal("-0.8"),
+                fee_currency="USDT",
+                pnl=None,
+                order_id="entry-1",
+                trade_id="t1",
+                exec_type="T",
+                raw={"clOrdId": "entry-cl-1"},
+            )
+        ]
+        notifier = MagicMock()
+        engine = StrategyEngine(client, lambda message: None, notifier=notifier, strategy_name="EMA 动态委托")
+
+        engine._notify_exchange_dynamic_stop_close(
+            self._make_credentials(),
+            _make_strategy_config(),
+            trade_instrument=self._make_trade_instrument(),
+            position=SimpleNamespace(
+                inst_id="ETH-USDT-SWAP",
+                ord_id="entry-1",
+                cl_ord_id="entry-cl-1",
+                side="buy",
+                close_side="sell",
+                pos_side="long",
+                size=Decimal("1"),
+                entry_price=Decimal("2500"),
+                entry_ts=1_700_000_000_000,
+            ),
+            initial_stop_loss=Decimal("2400"),
+            current_stop_loss=Decimal("2550"),
+            risk_per_unit=Decimal("100"),
+            next_trigger_r=3,
+            detail="OKX 动态止损平仓",
+        )
+
+        self.assertEqual(
+            notifier.send_trade_close.call_args.kwargs["trade_pnl"],
+            "+47.7（毛盈亏 +50 | 手续费 -1.8 | 资金费 -0.5）",
+        )
 
     def test_exchange_dynamic_stop_close_notification_skips_unmatched_history_pnl(self) -> None:
         client = MagicMock()

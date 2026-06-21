@@ -283,6 +283,7 @@ class OkxPositionHistoryItem:
     raw: dict[str, Any]
     fee: Decimal | None = None
     fee_currency: str | None = None
+    funding_fee: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -984,6 +985,19 @@ class OkxRestClient:
         status["reason"] = ""
         return status
 
+    def wait_public_market_update(
+        self,
+        inst_ids: tuple[str, ...] | list[str],
+        *,
+        environment: str,
+        after_version: int = 0,
+        timeout: float = 1.0,
+    ) -> int | None:
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return None
+        return connection.wait_for_market_update(inst_ids, after_version=after_version, timeout=timeout)
+
     def _build_ticker_from_public_item(self, *, inst_id: str, item: dict[str, Any]) -> OkxTicker:
         return OkxTicker(
             inst_id=inst_id,
@@ -1124,17 +1138,19 @@ class OkxRestClient:
         *,
         environment: str,
         inst_type: str | None = None,
+        prefer_cache: bool = True,
     ) -> list[OkxPosition]:
-        cached_positions = self.get_cached_private_positions(
-            credentials,
-            environment=environment,
-        )
-        if cached_positions is not None:
-            _, positions = cached_positions
-            if inst_type:
-                inst_type_upper = inst_type.upper()
-                return [item for item in positions if item.inst_type.upper() == inst_type_upper]
-            return positions
+        if prefer_cache:
+            cached_positions = self.get_cached_private_positions(
+                credentials,
+                environment=environment,
+            )
+            if cached_positions is not None:
+                _, positions = cached_positions
+                if inst_type:
+                    inst_type_upper = inst_type.upper()
+                    return [item for item in positions if item.inst_type.upper() == inst_type_upper]
+                return positions
         params: dict[str, str] | None = None
         if inst_type:
             params = {"instType": inst_type.upper()}
@@ -1187,14 +1203,16 @@ class OkxRestClient:
         credentials: Credentials,
         *,
         environment: str,
+        prefer_cache: bool = True,
     ) -> OkxAccountOverview:
-        cached_overview = self.get_cached_private_account_overview(
-            credentials,
-            environment=environment,
-        )
-        if cached_overview is not None:
-            _, overview = cached_overview
-            return overview
+        if prefer_cache:
+            cached_overview = self.get_cached_private_account_overview(
+                credentials,
+                environment=environment,
+            )
+            if cached_overview is not None:
+                _, overview = cached_overview
+                return overview
         payload = self._request(
             "GET",
             "/api/v5/account/balance",
@@ -1740,6 +1758,7 @@ class OkxRestClient:
                         raw=item,
                         fee=_first_decimal(item.get("fee"), item.get("fillFee")),
                         fee_currency=(str(item.get("feeCcy") or item.get("ccy") or "").strip() or None),
+                        funding_fee=_to_decimal(item.get("fundingFee")),
                     )
                 )
         items.sort(key=lambda item: item.update_time or 0, reverse=True)

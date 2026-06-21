@@ -5710,6 +5710,103 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertIn("净盈亏=+121.52", result.attribution_summary)
         self.assertIn("累计净盈亏=+141.04", result.cumulative_summary)
 
+    def test_build_strategy_trade_reconciliation_result_falls_back_to_position_history_fee_and_funding(self) -> None:
+        session = self._make_session()
+        prefix = _session_order_prefixes(session)[0]
+        open_ms = int(datetime(2026, 6, 21, 10, 0, 0).timestamp() * 1000)
+        close_ms = int(datetime(2026, 6, 21, 13, 0, 0).timestamp() * 1000)
+        trade = StrategyTradeRuntimeState(
+            round_id="round-fallback",
+            signal_bar_at=datetime(2026, 6, 21, 9, 0, 0),
+            opened_logged_at=datetime(2026, 6, 21, 10, 0, 0),
+            entry_order_id="1001",
+            entry_client_order_id=f"{prefix}ent062110000000001",
+            entry_price=Decimal("1754.83"),
+            size=Decimal("2.2"),
+            protective_algo_cl_ord_id=f"{prefix}slg062110000000002",
+            current_stop_price=Decimal("1732.84"),
+            reconciliation_started=True,
+        )
+        snapshot = StrategyTradeReconciliationSnapshot(
+            effective_environment="demo",
+            order_history=[
+                SimpleNamespace(
+                    client_order_id=f"{prefix}ent062110000000001",
+                    algo_client_order_id="",
+                    order_id="1001",
+                    algo_id="",
+                    inst_id="ETH-USDT-SWAP",
+                    side="sell",
+                    pos_side="net",
+                    filled_size=Decimal("2.2"),
+                    actual_size=Decimal("2.2"),
+                    avg_price=Decimal("1754.83"),
+                    actual_price=Decimal("1754.83"),
+                    price=Decimal("1754.83"),
+                    fee=Decimal("-0.14"),
+                    pnl=None,
+                    state="filled",
+                    update_time=open_ms,
+                    created_time=open_ms,
+                ),
+                SimpleNamespace(
+                    client_order_id="",
+                    algo_client_order_id=f"{prefix}slg062110000000002",
+                    order_id="2001",
+                    algo_id="3001",
+                    inst_id="ETH-USDT-SWAP",
+                    side="buy",
+                    pos_side="net",
+                    filled_size=Decimal("2.2"),
+                    actual_size=Decimal("2.2"),
+                    avg_price=Decimal("1732.84"),
+                    actual_price=Decimal("1732.84"),
+                    price=Decimal("1732.84"),
+                    fee=None,
+                    pnl=None,
+                    state="filled",
+                    update_time=close_ms,
+                    created_time=close_ms,
+                ),
+            ],
+            fills=[
+                SimpleNamespace(
+                    inst_id="ETH-USDT-SWAP",
+                    order_id="1001",
+                    fill_time=open_ms,
+                    fill_price=Decimal("1754.83"),
+                    fill_size=Decimal("2.2"),
+                    fill_fee=Decimal("-0.14"),
+                    pnl=None,
+                ),
+            ],
+            position_history=[
+                SimpleNamespace(
+                    inst_id="ETH-USDT-SWAP",
+                    update_time=close_ms,
+                    close_avg_price=Decimal("1732.84"),
+                    pnl=Decimal("4.84"),
+                    realized_pnl=Decimal("4.85"),
+                    fee=Decimal("-0.01"),
+                    funding_fee=Decimal("0.02"),
+                )
+            ],
+            account_bills=[],
+        )
+        app = SimpleNamespace(
+            _next_strategy_trade_ledger_record_id=lambda session_, round_id, closed_at: "T04",
+            _is_funding_fee_bill=QuantApp._is_funding_fee_bill,
+        )
+
+        result = QuantApp._build_strategy_trade_reconciliation_result(app, session, trade, snapshot)
+
+        self.assertEqual(result.ledger_record.exit_fee, Decimal("-0.01"))
+        self.assertEqual(result.ledger_record.funding_fee, Decimal("0.02"))
+        self.assertEqual(result.ledger_record.gross_pnl, Decimal("4.84"))
+        self.assertEqual(result.ledger_record.net_pnl, Decimal("4.71"))
+        self.assertIn("平仓手续费=-0.01", result.attribution_summary)
+        self.assertIn("净盈亏=+4.71", result.attribution_summary)
+
     def test_upsert_strategy_trade_ledger_record_dedupes_same_round(self) -> None:
         existing = StrategyTradeLedgerRecord(
             record_id="legacy-1",
@@ -6867,6 +6964,7 @@ class SelectedSessionDetailRefreshTest(TestCase):
             fee_total=Decimal("0.4"),
             funding_total=Decimal("0"),
             net_pnl_total=Decimal("2.2"),
+            last_net_pnl=Decimal("0.8"),
             last_close_reason="",
             live_pnl=Decimal("1.25"),
             live_pnl_refreshed_at=datetime(2026, 5, 26, 16, 34, 17),
@@ -6884,6 +6982,7 @@ class SelectedSessionDetailRefreshTest(TestCase):
         self.assertIn("止盈方式：动态止盈", text)
         self.assertIn("启动追单窗口：关闭（启动不追老信号）", text)
         self.assertIn("实时浮盈亏：+1.25（参考持仓 16:34:17）", text)
+        self.assertIn("上次净盈亏：+0.80", text)
 
     def test_build_strategy_detail_text_shows_dynamic_rule_list_for_eth_long(self) -> None:
         snapshot = {
