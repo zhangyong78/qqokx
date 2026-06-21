@@ -5786,7 +5786,7 @@ class StrategyTradeTrackingTest(TestCase):
                     update_time=close_ms,
                     close_avg_price=Decimal("1732.84"),
                     pnl=Decimal("4.84"),
-                    realized_pnl=Decimal("4.85"),
+                    realized_pnl=Decimal("4.71"),
                     fee=Decimal("-0.01"),
                     funding_fee=Decimal("0.02"),
                 )

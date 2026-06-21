@@ -130,6 +130,24 @@ class OkxPrivateWsConnection:
                 return None
             return record.version, dict(record.payload)
 
+    def get_latest_orders(self, *, limit: int = 50) -> tuple[int, tuple[dict[str, Any], ...]] | None:
+        with self._lock:
+            records_by_key: dict[tuple[str, str], OkxPrivateWsRecord] = {}
+            for record in self._order_by_ord_id.values():
+                ord_id = str(record.payload.get("ordId") or "").strip()
+                cl_ord_id = str(record.payload.get("clOrdId") or "").strip()
+                records_by_key[(ord_id, cl_ord_id)] = record
+            for record in self._order_by_cl_ord_id.values():
+                ord_id = str(record.payload.get("ordId") or "").strip()
+                cl_ord_id = str(record.payload.get("clOrdId") or "").strip()
+                records_by_key[(ord_id, cl_ord_id)] = record
+            if not records_by_key:
+                return None
+            records = sorted(records_by_key.values(), key=lambda item: item.received_at, reverse=True)
+            capped = records[: max(1, limit)]
+            version = max(item.version for item in capped)
+            return version, tuple(dict(item.payload) for item in capped)
+
     def wait_for_order_update(
         self,
         *,

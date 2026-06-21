@@ -1713,6 +1713,7 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
             max_slippage=Decimal("0.0015"),
             use_limit_orders=False,
             roll_derivative_qty=Decimal("1"),
+            current_position_side="short",
         )
         runtime = ArbitrageTradeRuntime(
             credentials=Credentials("k", "s", "p"),
@@ -1760,6 +1761,7 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
             current_derivative_inst_id="BTC-USDT-SWAP",
             spot_qty=Decimal("0.0100"),
             current_derivative_qty=Decimal("1"),
+            current_position_side="short",
         )
         runtime = ArbitrageTradeRuntime(
             credentials=Credentials("k", "s", "p"),
@@ -1819,6 +1821,7 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
             execution_mode="both_maker_first_taker",
             maker_wait_seconds=0.1,
             chase_limit=0,
+            current_position_side="short",
         )
         runtime = ArbitrageTradeRuntime(
             credentials=Credentials("k", "s", "p"),
@@ -1853,6 +1856,112 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertEqual(client.orders[2]["ord_type"], "market")
         self.assertEqual(client.orders[2]["side"], "sell")
         self.assertEqual(client.cancels, [("BTC-USDT-SWAP", "ord-1"), ("BTC-USDT-260926", "ord-2")])
+
+    def test_roll_short_position_in_long_short_mode_uses_buy_close_and_sell_open(self) -> None:
+        client = _FakeArbitrageTradeClient()
+        executor = ArbitrageExecutor(client)
+        request = ArbitrageRollRequest(
+            entry_id=None,
+            target_derivative_inst_id="BTC-USDT-260926",
+            max_slippage=Decimal("0.0015"),
+            use_limit_orders=False,
+            roll_derivative_qty=Decimal("1"),
+            base_ccy="BTC",
+            spot_inst_id="BTC-USDT",
+            current_derivative_inst_id="BTC-USDT-SWAP",
+            spot_qty=Decimal("0.0100"),
+            current_derivative_qty=Decimal("1"),
+            current_position_side="short",
+        )
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="long_short",
+        )
+        with patch(
+            "okx_quant.arbitrage.arbitrage_executor._wait_order_fill",
+            side_effect=[
+                (Decimal("1"), Decimal("100")),
+                (Decimal("1"), Decimal("102")),
+            ],
+        ):
+            result = executor.roll_cash_and_carry(request, runtime=runtime)
+
+        self.assertTrue(result.success)
+        self.assertEqual(client.orders[0]["side"], "buy")
+        self.assertEqual(client.orders[0]["pos_side"], "short")
+        self.assertTrue(client.orders[0]["reduce_only"])
+        self.assertEqual(client.orders[1]["side"], "sell")
+        self.assertEqual(client.orders[1]["pos_side"], "short")
+        self.assertFalse(client.orders[1]["reduce_only"])
+
+    def test_roll_long_position_in_long_short_mode_uses_sell_close_and_buy_open(self) -> None:
+        client = _FakeArbitrageTradeClient()
+        executor = ArbitrageExecutor(client)
+        request = ArbitrageRollRequest(
+            entry_id=None,
+            target_derivative_inst_id="BTC-USDT-260926",
+            max_slippage=Decimal("0.0015"),
+            use_limit_orders=False,
+            roll_derivative_qty=Decimal("1"),
+            base_ccy="BTC",
+            spot_inst_id="BTC-USDT",
+            current_derivative_inst_id="BTC-USDT-SWAP",
+            spot_qty=Decimal("0.0100"),
+            current_derivative_qty=Decimal("1"),
+            current_position_side="long",
+        )
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="long_short",
+        )
+        with patch(
+            "okx_quant.arbitrage.arbitrage_executor._wait_order_fill",
+            side_effect=[
+                (Decimal("1"), Decimal("100")),
+                (Decimal("1"), Decimal("102")),
+            ],
+        ):
+            result = executor.roll_cash_and_carry(request, runtime=runtime)
+
+        self.assertTrue(result.success)
+        self.assertEqual(client.orders[0]["side"], "sell")
+        self.assertEqual(client.orders[0]["pos_side"], "long")
+        self.assertTrue(client.orders[0]["reduce_only"])
+        self.assertEqual(client.orders[1]["side"], "buy")
+        self.assertEqual(client.orders[1]["pos_side"], "long")
+        self.assertFalse(client.orders[1]["reduce_only"])
+
+    def test_roll_blocks_submit_when_current_position_side_missing(self) -> None:
+        client = _FakeArbitrageTradeClient()
+        executor = ArbitrageExecutor(client)
+        request = ArbitrageRollRequest(
+            entry_id=None,
+            target_derivative_inst_id="BTC-USDT-260926",
+            max_slippage=Decimal("0.0015"),
+            use_limit_orders=False,
+            roll_derivative_qty=Decimal("1"),
+            base_ccy="BTC",
+            spot_inst_id="BTC-USDT",
+            current_derivative_inst_id="BTC-USDT-SWAP",
+            spot_qty=Decimal("0.0100"),
+            current_derivative_qty=Decimal("1"),
+        )
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="long_short",
+        )
+
+        result = executor.roll_cash_and_carry(request, runtime=runtime)
+
+        self.assertFalse(result.success)
+        self.assertIn("缺少当前持仓方向", result.message)
+        self.assertEqual(client.orders, [])
 
     def test_roll_ui_builds_request_from_delivery_position_without_spot_match(self) -> None:
         class _Value:
@@ -1940,6 +2049,7 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertEqual(request.target_derivative_inst_id, "BTC-USD-260925")
         self.assertEqual(request.roll_derivative_qty, Decimal("100"))
         self.assertEqual(request.current_derivative_qty, Decimal("890"))
+        self.assertEqual(request.current_position_side, "short")
         self.assertGreater(request.spot_qty or Decimal("0"), Decimal("0"))
 
 

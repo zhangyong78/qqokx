@@ -86,6 +86,7 @@ class ArbitrageRollRequest:
     current_derivative_inst_id: str | None = None
     spot_qty: Decimal | None = None
     current_derivative_qty: Decimal | None = None
+    current_position_side: str | None = None
 
 
 @dataclass
@@ -181,6 +182,16 @@ def _build_strategy_config(inst_id: str, runtime: ArbitrageTradeRuntime) -> Stra
         tp_sl_trigger_type="last",
         strategy_id="arbitrage_runtime",
     )
+
+
+def _roll_direction_fields(request: ArbitrageRollRequest, runtime: ArbitrageTradeRuntime) -> tuple[str, str, str | None]:
+    side = str(request.current_position_side or "").strip().lower()
+    if side not in {"long", "short"}:
+        raise OkxApiError("移仓缺少当前持仓方向，已阻止下单。请先刷新并确认当前交割合约是多还是空。")
+    close_side = "buy" if side == "short" else "sell"
+    open_side = "sell" if side == "short" else "buy"
+    pos_side = side if runtime.position_mode == "long_short" else None
+    return close_side, open_side, pos_side
 
 
 def _wait_order_fill(
@@ -1977,7 +1988,12 @@ class ArbitrageExecutor:
         credentials = runtime.credentials
         current_config = _build_strategy_config(entry.derivative_inst_id, runtime)
         target_config = _build_strategy_config(request.target_derivative_inst_id, runtime)
-        derivative_pos_side = "short" if runtime.position_mode == "long_short" else None
+        current_close_side, target_open_side, derivative_pos_side = _roll_direction_fields(request, runtime)
+        self._logger(
+            "移仓批次参数："
+            f"旧合约 side={current_close_side} posSide={derivative_pos_side or 'net'} reduceOnly=true | "
+            f"目标合约 side={target_open_side} posSide={derivative_pos_side or 'net'} reduceOnly=false"
+        )
         if request.execution_mode == "both_maker_first_taker":
             total_current_filled = Decimal("0")
             total_target_filled = Decimal("0")
@@ -1991,13 +2007,13 @@ class ArbitrageExecutor:
                     credentials,
                     current_config,
                     inst_id=entry.derivative_inst_id,
-                    side="buy",
+                    side=current_close_side,
                     size=remaining_qty,
                     ord_type="post_only",
                     pos_side=derivative_pos_side,
                     price=self._resolve_passive_price(
                         current_inst,
-                        side="buy",
+                        side=current_close_side,
                         environment=runtime.environment,
                     ),
                     reduce_only=True,
@@ -2007,13 +2023,13 @@ class ArbitrageExecutor:
                     credentials,
                     target_config,
                     inst_id=request.target_derivative_inst_id,
-                    side="sell",
+                    side=target_open_side,
                     size=remaining_qty,
                     ord_type="post_only",
                     pos_side=derivative_pos_side,
                     price=self._resolve_passive_price(
                         target_inst,
-                        side="sell",
+                        side=target_open_side,
                         environment=runtime.environment,
                     ),
                     reduce_only=False,
@@ -2064,7 +2080,7 @@ class ArbitrageExecutor:
                         credentials=credentials,
                         config=target_config,
                         inst_id=request.target_derivative_inst_id,
-                        side="sell",
+                        side=target_open_side,
                         size=hedge_qty,
                         label="移仓目标合约市价补齐腿",
                         pos_side=derivative_pos_side,
@@ -2082,7 +2098,7 @@ class ArbitrageExecutor:
                         credentials=credentials,
                         config=current_config,
                         inst_id=entry.derivative_inst_id,
-                        side="buy",
+                        side=current_close_side,
                         size=hedge_qty,
                         label="移仓旧合约市价补齐腿",
                         pos_side=derivative_pos_side,
@@ -2135,13 +2151,13 @@ class ArbitrageExecutor:
                     credentials,
                     current_config,
                     inst_id=entry.derivative_inst_id,
-                    side="buy",
+                    side=current_close_side,
                     size=remaining_qty,
                     ord_type="post_only",
                     pos_side=derivative_pos_side,
                     price=self._resolve_passive_price(
                         current_inst,
-                        side="buy",
+                        side=current_close_side,
                         environment=runtime.environment,
                     ),
                     reduce_only=True,
@@ -2169,7 +2185,7 @@ class ArbitrageExecutor:
                     credentials=credentials,
                     config=target_config,
                     inst_id=request.target_derivative_inst_id,
-                    side="sell",
+                    side=target_open_side,
                     size=current_filled,
                     label="移仓目标合约吃单腿",
                     pos_side=derivative_pos_side,
@@ -2196,13 +2212,13 @@ class ArbitrageExecutor:
                     credentials,
                     target_config,
                     inst_id=request.target_derivative_inst_id,
-                    side="sell",
+                    side=target_open_side,
                     size=remaining_qty,
                     ord_type="post_only",
                     pos_side=derivative_pos_side,
                     price=self._resolve_passive_price(
                         target_inst,
-                        side="sell",
+                        side=target_open_side,
                         environment=runtime.environment,
                     ),
                     reduce_only=False,
@@ -2230,7 +2246,7 @@ class ArbitrageExecutor:
                     credentials=credentials,
                     config=current_config,
                     inst_id=entry.derivative_inst_id,
-                    side="buy",
+                    side=current_close_side,
                     size=target_filled,
                     label="移仓旧合约吃单腿",
                     pos_side=derivative_pos_side,
@@ -2247,17 +2263,21 @@ class ArbitrageExecutor:
 
         current_ticker = self._preferred_ticker(entry.derivative_inst_id, environment=runtime.environment)
         target_ticker = self._preferred_ticker(request.target_derivative_inst_id, environment=runtime.environment)
-        current_buy_price = self._resolve_roll_current_buy_price(
+        current_order_price = self._resolve_roll_order_price(
             request,
             current_inst,
+            side=current_close_side,
             ticker=current_ticker,
             environment=runtime.environment,
+            is_current_leg=True,
         )
-        target_sell_price = self._resolve_roll_target_sell_price(
+        target_order_price = self._resolve_roll_order_price(
             request,
             target_inst,
+            side=target_open_side,
             ticker=target_ticker,
             environment=runtime.environment,
+            is_current_leg=False,
         )
         current_ord_type = "limit" if request.use_limit_orders else "market"
         target_ord_type = "limit" if request.use_limit_orders else "market"
@@ -2265,10 +2285,10 @@ class ArbitrageExecutor:
             credentials,
             current_config,
             inst_id=entry.derivative_inst_id,
-            side="buy",
+            side=current_close_side,
             size=planned_derivative_qty,
             ord_type=current_ord_type,
-            price=current_buy_price if current_ord_type == "limit" else None,
+            price=current_order_price if current_ord_type == "limit" else None,
             reduce_only=True,
             pos_side=derivative_pos_side,
             cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
@@ -2289,10 +2309,10 @@ class ArbitrageExecutor:
             credentials,
             target_config,
             inst_id=request.target_derivative_inst_id,
-            side="sell",
+            side=target_open_side,
             size=current_filled,
             ord_type=target_ord_type,
-            price=target_sell_price if target_ord_type == "limit" else None,
+            price=target_order_price if target_ord_type == "limit" else None,
             reduce_only=False,
             pos_side=derivative_pos_side,
             cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
@@ -2464,34 +2484,31 @@ class ArbitrageExecutor:
         raw = bid * (Decimal("1") - request.max_slippage)
         return snap_to_increment(raw, instrument.tick_size, "down")
 
-    def _resolve_roll_current_buy_price(
+    def _resolve_roll_order_price(
         self,
         request: ArbitrageRollRequest,
         instrument,
-        ticker: OkxTicker | None = None,
         *,
-        environment: str,
-    ) -> Decimal:
-        if request.current_derivative_limit_price is not None and request.current_derivative_limit_price > 0:
-            return snap_to_increment(request.current_derivative_limit_price, instrument.tick_size, "up")
-        ticker = ticker or self._preferred_ticker(instrument.inst_id, environment=environment)
-        ask = ticker.ask
-        if ask is None or ask <= 0:
-            raise OkxApiError(f"{instrument.inst_id} 缺少卖一价。")
-        raw = ask * (Decimal("1") + request.max_slippage)
-        return snap_to_increment(raw, instrument.tick_size, "up")
-
-    def _resolve_roll_target_sell_price(
-        self,
-        request: ArbitrageRollRequest,
-        instrument,
+        side: str,
         ticker: OkxTicker | None = None,
-        *,
         environment: str,
+        is_current_leg: bool,
     ) -> Decimal:
-        if request.target_derivative_limit_price is not None and request.target_derivative_limit_price > 0:
-            return snap_to_increment(request.target_derivative_limit_price, instrument.tick_size, "down")
+        manual_price = (
+            request.current_derivative_limit_price
+            if is_current_leg
+            else request.target_derivative_limit_price
+        )
+        if manual_price is not None and manual_price > 0:
+            snap_mode = "up" if side == "buy" else "down"
+            return snap_to_increment(manual_price, instrument.tick_size, snap_mode)
         ticker = ticker or self._preferred_ticker(instrument.inst_id, environment=environment)
+        if side == "buy":
+            ask = ticker.ask
+            if ask is None or ask <= 0:
+                raise OkxApiError(f"{instrument.inst_id} 缺少卖一价。")
+            raw = ask * (Decimal("1") + request.max_slippage)
+            return snap_to_increment(raw, instrument.tick_size, "up")
         bid = ticker.bid
         if bid is None or bid <= 0:
             raise OkxApiError(f"{instrument.inst_id} 缺少买一价。")

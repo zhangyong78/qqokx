@@ -6153,10 +6153,11 @@ class UiStrategySessionsMixin:
             gross_pnl is None
             and matched_position_history is not None
             and matched_position_history.realized_pnl is not None
-            and (exit_fee is not None or funding_fee is not None)
+            and (entry_fee is not None or exit_fee is not None or funding_fee is not None)
         ):
             gross_pnl = (
                 matched_position_history.realized_pnl
+                - (entry_fee or Decimal("0"))
                 - (exit_fee or Decimal("0"))
                 - (funding_fee or Decimal("0"))
             )
@@ -6172,7 +6173,7 @@ class UiStrategySessionsMixin:
 
         net_pnl = None
         if matched_position_history is not None and matched_position_history.realized_pnl is not None:
-            net_pnl = matched_position_history.realized_pnl + (entry_fee or Decimal("0"))
+            net_pnl = matched_position_history.realized_pnl
         elif gross_pnl is not None:
             net_pnl = gross_pnl + (entry_fee or Decimal("0")) + (exit_fee or Decimal("0")) + (funding_fee or Decimal("0"))
         if gross_pnl is None and net_pnl is not None and (entry_fee is not None or exit_fee is not None or funding_fee is not None):

@@ -3958,6 +3958,7 @@ class ArbitrageWindow:
             current_derivative_inst_id=derivative_position.inst_id,
             spot_qty=entry.spot_qty,
             current_derivative_qty=entry.derivative_qty,
+            current_position_side=_pair_position_direction(derivative_position),
         )
 
     def _submit_roll(self) -> None:
@@ -5553,6 +5554,7 @@ class ArbitrageWindow:
         )
 
     def _build_roll_request(self, *, entry_id: str, roll_derivative_qty: Decimal) -> ArbitrageRollRequest:
+        derivative_position = self._selected_roll_position()
         return ArbitrageRollRequest(
             entry_id=entry_id,
             target_derivative_inst_id=self.roll_target_derivative_inst_id.get().strip().upper(),
@@ -5566,6 +5568,11 @@ class ArbitrageWindow:
             execution_mode=self._current_roll_execution_mode(),
             maker_wait_seconds=self._parse_roll_maker_wait_seconds(),
             chase_limit=self._parse_roll_chase_limit(),
+            current_position_side=(
+                _pair_position_direction(derivative_position)
+                if derivative_position is not None
+                else None
+            ),
         )
 
     def _submit_roll(self) -> None:
@@ -5716,6 +5723,7 @@ class ArbitrageWindow:
             current_derivative_inst_id=derivative_position.inst_id,
             spot_qty=entry.spot_qty,
             current_derivative_qty=entry.derivative_qty,
+            current_position_side=_pair_position_direction(derivative_position),
         )
 
     def _submit_roll(self) -> None:
@@ -5908,6 +5916,7 @@ class ArbitrageWindow:
         threading.Thread(target=_worker, name="roll-preview-refresh", daemon=True).start()
 
     def _build_roll_request(self, *, entry, roll_derivative_qty: Decimal) -> ArbitrageRollRequest:
+        derivative_position = self._selected_roll_position()
         return ArbitrageRollRequest(
             entry_id=(entry.entry_id or None),
             target_derivative_inst_id=self.roll_target_derivative_inst_id.get().strip().upper(),
@@ -5926,6 +5935,11 @@ class ArbitrageWindow:
             current_derivative_inst_id=entry.derivative_inst_id,
             spot_qty=entry.spot_qty,
             current_derivative_qty=entry.derivative_qty,
+            current_position_side=(
+                _pair_position_direction(derivative_position)
+                if derivative_position is not None
+                else None
+            ),
         )
 
     def _start_auto_close(self, *, entry_id: str | None = None) -> None:

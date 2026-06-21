@@ -30,3 +30,14 @@ class MarketPairSnapshot:
     updated_at: str
     status: str
 
+
+@dataclass(frozen=True)
+class ArbitrageOpportunityView:
+    key: str
+    title: str
+    left_inst_id: str
+    right_inst_id: str
+    left_kind: str
+    right_kind: str
+    template: str
+    description: str = ""

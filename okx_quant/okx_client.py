@@ -1327,6 +1327,30 @@ class OkxRestClient:
         version, item = payload
         return version, _build_okx_order_status_from_ws_item(item, fallback_ord_id=ord_id, fallback_inst_id=inst_id)
 
+    def get_cached_private_order_statuses(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        limit: int = 50,
+    ) -> tuple[int, list[OkxOrderStatus]] | None:
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_orders(limit=limit)
+        if payload is None:
+            return None
+        version, items = payload
+        statuses = [
+            _build_okx_order_status_from_ws_item(
+                item,
+                fallback_ord_id=str(item.get("ordId") or ""),
+                fallback_inst_id=str(item.get("instId") or ""),
+            )
+            for item in items
+        ]
+        return version, statuses
+
     def get_cached_private_positions(
         self,
         credentials: Credentials,

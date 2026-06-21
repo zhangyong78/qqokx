@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.36`
+当前版本：`v0.6.37`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -29,7 +29,7 @@
 
 ## 近期更新
 
-`v0.6.36` 这一轮版本内容比较集中，重点新增和调整如下：
+`v0.6.37` 这一轮版本内容比较集中，重点新增和调整如下：
 
 - API 环境与策略环境的一致性防呆补齐：
   - 启动确认弹窗现在会同时显示 `API环境`、`策略环境` 和 `环境状态`
@@ -108,6 +108,11 @@
   - 主工作台工具菜单也新增了“打开现货套利极速版”，不再只能在原工作台里共用同一个主进程窗口
   - 极速版当前聚焦“交割移仓”场景，默认弱化全市场自动扫描，把界面和刷新资源更集中给当前套利腿与目标合约盘口
   - `ArbitrageWindow(fast_mode=True)` 已切到更轻的界面布局和交互路径，方向上更接近临战交易终端，而不是泛扫描工具页
+- 交割移仓这轮又往前走了一步，新增 `roll_terminal_qt/` 原型：
+  - 这是独立于 Tk 工作台之外的一套 Qt 专业移仓终端，目标是进一步摆脱 Tk 版在盘口刷新、线程阻塞、切换合约时的卡顿感
+  - 当前已拆出 `market/account/order/execution/instrument/opportunity` 多个 service 线程，UI 只负责展示与下发参数，不再自己背太多后台逻辑
+  - 终端会自动读取现有 API profile，支持带切换密码的 profile 解锁后再启动私有持仓/订单线程
+  - 已接入手动移仓参数、执行方式、自动移仓阈值与执行状态表，方向上更像“专业移仓终端”而不是工作台里的附属页
 - 回测区新增“纯本地回测”链路：
   - 新增 `纯本地回测（不补拉）` 开关，只使用本地缓存，不再临时联网补拉 K 线
   - 新增本地数据状态提示，会显示当前标的/周期的本地缓存根数和覆盖时间范围
@@ -379,7 +384,7 @@ python main.py
 - [okx_quant/backtest_ui.py](/D:/qqokx/okx_quant/backtest_ui.py)：回测界面，当前已支持动态保护规则编辑、运行编号/归档编号区分、以及新的回测 K 线图交互
 - [okx_quant/backtest_audit.py](/D:/qqokx/okx_quant/backtest_audit.py)：回测审计导出，当前已改成流式 CSV 写出
 - [okx_quant/candle_store.py](/D:/qqokx/okx_quant/candle_store.py)：本地 K 线存储，当前已支持查询缓存根数与时间覆盖范围，以及过期未确认 K 线自动转确认
-- [okx_quant/strategy_symbol_defaults.py](/D:/qqokx/okx_quant/strategy_symbol_defaults.py)：分币种策略默认模板，当前已固化 `v0.6.36` 的多头/空头独立参数
+- [okx_quant/strategy_symbol_defaults.py](/D:/qqokx/okx_quant/strategy_symbol_defaults.py)：分币种策略默认模板，当前已固化 `v0.6.37` 的多头/空头独立参数
 - [okx_quant/multi_coin_market_digest.py](/D:/qqokx/okx_quant/multi_coin_market_digest.py)：多币种市场早报，当前已支持“明确观点 + 最近复盘命中率”邮件内容
 - [okx_quant/analysis_email_validation.py](/D:/qqokx/okx_quant/analysis_email_validation.py)：多币种早报邮件的历史观点回放验证与汇总导出
 - [reports/ema55_slope_short_research_report.html](/D:/qqokx/reports/ema55_slope_short_research_report.html)：EMA55 斜率做空研究报告（HTML）
@@ -556,7 +561,7 @@ scripts\release_one_click.bat
   ：服务器升级操作清单，适合按实盘环境灰度启用私有 WS 加速
 - [软件开发指南.md](/D:/qqokx/软件开发指南.md)
   ：开发维护说明，已补充策略 schema / runtime registry、EMA55 斜率做空、回测与 UI 接入约定
-- [版本开发日志_v0.6.36.md](/D:/qqokx/版本开发日志_v0.6.36.md)
+- [版本开发日志_v0.6.37.md](/D:/qqokx/版本开发日志_v0.6.37.md)
   ：本轮版本开发日志，归档 EMA55 策略、研究报告、B 方案结构重构与验证结果
 - [reports/strategy_ui_schema_b_impl.md](/D:/qqokx/reports/strategy_ui_schema_b_impl.md)
   ：B 方案实施说明，记录 schema / registry 这一轮已经解掉的耦合和剩余尾项

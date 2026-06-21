@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from decimal import Decimal
+
+from PySide6.QtCore import QThread, Signal
+
+from okx_quant.arbitrage.models import ArbitrageTradeRuntime
+from okx_quant.okx_client import OkxOrderStatus, OkxRestClient
+
+
+@dataclass(frozen=True)
+class OrderStatusView:
+    inst_id: str
+    ord_id: str
+    side: str
+    ord_type: str
+    state: str
+    price: Decimal | None
+    avg_price: Decimal | None
+    size: Decimal | None
+    filled_size: Decimal | None
+
+
+class OrderFeedThread(QThread):
+    orders_ready = Signal(object)
+    status_changed = Signal(str)
+
+    def __init__(self, runtime: ArbitrageTradeRuntime | None) -> None:
+        super().__init__()
+        self._runtime = runtime
+        self._client = OkxRestClient()
+        self._running = True
+        self._watched_inst_ids: set[str] = set()
+
+    def set_watched_inst_ids(self, inst_ids: set[str]) -> None:
+        self._watched_inst_ids = {item.strip().upper() for item in inst_ids if item and item.strip()}
+
+    def stop(self) -> None:
+        self._running = False
+
+    def run(self) -> None:
+        while self._running:
+            if self._runtime is None:
+                self.status_changed.emit("订单WS不可用")
+                time.sleep(1.0)
+                continue
+            try:
+                payload = self._client.get_cached_private_order_statuses(
+                    self._runtime.credentials,
+                    environment=self._runtime.environment,
+                    limit=80,
+                )
+                if payload is None:
+                    self.status_changed.emit("等待订单WS...")
+                    time.sleep(0.5)
+                    continue
+                version, statuses = payload
+                views = [self._to_view(item) for item in statuses if self._is_relevant(item)]
+                self.orders_ready.emit(views)
+                self.status_changed.emit(f"订单WS v{version} | 相关 {len(views)}")
+                time.sleep(0.35)
+            except Exception as exc:  # noqa: BLE001
+                self.status_changed.emit(f"订单WS异常：{exc}")
+                time.sleep(1.0)
+
+    def _is_relevant(self, status: OkxOrderStatus) -> bool:
+        if not self._watched_inst_ids:
+            return True
+        inst_id = str(status.raw.get("instId") or "").strip().upper()
+        return inst_id in self._watched_inst_ids
+
+    def _to_view(self, status: OkxOrderStatus) -> OrderStatusView:
+        return OrderStatusView(
+            inst_id=str(status.raw.get("instId") or ""),
+            ord_id=status.ord_id,
+            side=str(status.side or ""),
+            ord_type=str(status.ord_type or ""),
+            state=status.state,
+            price=status.price,
+            avg_price=status.avg_price,
+            size=status.size,
+            filled_size=status.filled_size,
+        )
+
