@@ -7,6 +7,9 @@ QWidget {
     font-size: 11px;
     background: #eef3f8;
 }
+QLabel {
+    background: transparent;
+}
 QFrame#Header,
 QFrame#Panel,
 QFrame#Guide,
@@ -17,8 +20,8 @@ QFrame#StatCard {
 }
 QLabel#Title {
     color: #0f172a;
-    font-size: 20px;
-    font-weight: 700;
+    font-size: 18px;
+    font-weight: 600;
 }
 QLabel#Subtitle,
 QLabel#GuideText,
@@ -30,28 +33,28 @@ QLabel#StatTitle {
 }
 QLabel#Metric {
     color: #0f172a;
-    font-size: 14px;
-    font-weight: 700;
+    font-size: 13px;
+    font-weight: 600;
 }
 QLabel#SectionTitle,
 QLabel#GuideTitle {
     color: #0f172a;
-    font-size: 13px;
-    font-weight: 700;
+    font-size: 12px;
+    font-weight: 600;
 }
 QLabel#Badge {
     color: #334155;
     background: #f8fafc;
     border: 1px solid #d7e0ea;
-    border-radius: 10px;
-    padding: 6px 10px;
+    border-radius: 8px;
+    padding: 4px 8px;
 }
 QComboBox,
 QLineEdit {
-    min-height: 30px;
+    min-height: 28px;
     border: 1px solid #cbd5e1;
-    border-radius: 8px;
-    padding: 3px 8px;
+    border-radius: 7px;
+    padding: 2px 8px;
     background: #ffffff;
     color: #111827;
     selection-background-color: #dbeafe;
@@ -68,13 +71,13 @@ QComboBox:focus {
     border: 1px solid #3b82f6;
 }
 QPushButton {
-    min-height: 32px;
+    min-height: 30px;
     border: 1px solid #cbd5e1;
-    border-radius: 8px;
-    padding: 4px 12px;
+    border-radius: 7px;
+    padding: 3px 10px;
     background: #ffffff;
     color: #1f2937;
-    font-weight: 600;
+    font-weight: 500;
 }
 QPushButton:hover {
     background: #f8fafc;
@@ -132,7 +135,7 @@ QTableWidget#OrderBookTable {
     font-size: 9px;
 }
 QListWidget::item {
-    padding: 7px 8px;
+    padding: 6px 8px;
     border-bottom: 1px solid #eef2f7;
 }
 QListWidget::item:selected {
@@ -144,8 +147,8 @@ QHeaderView::section {
     color: #64748b;
     border: none;
     border-bottom: 1px solid #d7e0ea;
-    padding: 3px 5px;
-    font-weight: 600;
+    padding: 2px 5px;
+    font-weight: 500;
 }
 QInputDialog,
 QMessageBox {

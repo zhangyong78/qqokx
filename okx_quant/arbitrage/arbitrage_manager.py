@@ -106,14 +106,38 @@ class ArbitrageManager:
             swap_instrument=swap_inst,
         )
 
-    def open_now(self, request: ArbitrageOpenRequest, *, runtime: ArbitrageTradeRuntime) -> ArbitrageOpenResult:
-        return self._executor.open_cash_and_carry(request, runtime=runtime)
+    def open_now(
+        self,
+        request: ArbitrageOpenRequest,
+        *,
+        runtime: ArbitrageTradeRuntime,
+        should_stop_after_batch: Callable[[], bool] | None = None,
+        wait_before_next_batch: Callable[[], bool] | None = None,
+    ) -> ArbitrageOpenResult:
+        return self._executor.open_cash_and_carry(
+            request,
+            runtime=runtime,
+            should_stop_after_batch=should_stop_after_batch,
+            wait_before_next_batch=wait_before_next_batch,
+        )
 
     def close_now(self, request: ArbitrageCloseRequest, *, runtime: ArbitrageTradeRuntime) -> ArbitrageCloseResult:
         return self._executor.close_cash_and_carry(request, runtime=runtime)
 
-    def roll_now(self, request: ArbitrageRollRequest, *, runtime: ArbitrageTradeRuntime) -> ArbitrageRollResult:
-        return self._executor.roll_cash_and_carry(request, runtime=runtime)
+    def roll_now(
+        self,
+        request: ArbitrageRollRequest,
+        *,
+        runtime: ArbitrageTradeRuntime,
+        should_stop_after_batch: Callable[[], bool] | None = None,
+        wait_before_next_batch: Callable[[], bool] | None = None,
+    ) -> ArbitrageRollResult:
+        return self._executor.roll_cash_and_carry(
+            request,
+            runtime=runtime,
+            should_stop_after_batch=should_stop_after_batch,
+            wait_before_next_batch=wait_before_next_batch,
+        )
 
     def prewarm_market_context(
         self,

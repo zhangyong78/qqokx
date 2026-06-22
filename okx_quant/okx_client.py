@@ -2424,6 +2424,7 @@ class OkxRestClient:
         inst_id: str,
         ord_id: str | None = None,
         cl_ord_id: str | None = None,
+        request_timeout: float | None = None,
     ) -> OkxOrderStatus:
         if not ord_id and not cl_ord_id:
             raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个")
@@ -2439,6 +2440,7 @@ class OkxRestClient:
             auth=True,
             credentials=credentials,
             simulated=config.environment == "demo",
+            timeout_seconds=request_timeout,
         )
         if not payload["data"]:
             order_key = ord_id or cl_ord_id or ""
@@ -2465,6 +2467,7 @@ class OkxRestClient:
         inst_id: str,
         ord_id: str | None = None,
         cl_ord_id: str | None = None,
+        request_timeout: float | None = None,
     ) -> OkxOrderResult:
         return self.cancel_order_by_id(
             credentials,
@@ -2472,6 +2475,7 @@ class OkxRestClient:
             inst_id=inst_id,
             ord_id=ord_id,
             cl_ord_id=cl_ord_id,
+            request_timeout=request_timeout,
         )
 
     def cancel_order_by_id(
@@ -2482,6 +2486,7 @@ class OkxRestClient:
         inst_id: str,
         ord_id: str | None = None,
         cl_ord_id: str | None = None,
+        request_timeout: float | None = None,
     ) -> OkxOrderResult:
         if not ord_id and not cl_ord_id:
             raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个")
@@ -2497,6 +2502,7 @@ class OkxRestClient:
             auth=True,
             credentials=credentials,
             simulated=environment == "demo",
+            timeout_seconds=request_timeout,
         )
         return self._parse_order_result(
             payload,
@@ -2634,6 +2640,7 @@ class OkxRestClient:
         auth: bool = False,
         credentials: Credentials | None = None,
         simulated: bool = False,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         if params:
             query_string = parse.urlencode(params)
@@ -2667,7 +2674,7 @@ class OkxRestClient:
         req = request.Request(url, data=data or None, headers=headers, method=method.upper())
 
         try:
-            with request.urlopen(req, timeout=20) as response:
+            with request.urlopen(req, timeout=max(float(timeout_seconds or 20), 0.1)) as response:
                 content = response.read().decode("utf-8")
                 payload = json.loads(content)
         except error.HTTPError as exc:

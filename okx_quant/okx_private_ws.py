@@ -5,6 +5,7 @@ import json
 import time
 import threading
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from okx_quant.models import Credentials
@@ -16,6 +17,23 @@ except Exception:  # noqa: BLE001
 
 
 Logger = Callable[[str], None]
+
+
+def _position_snapshot_key(item: dict[str, Any]) -> tuple[str, str, str] | None:
+    inst_id = str(item.get("instId") or "").strip().upper()
+    if not inst_id:
+        return None
+    pos_side = str(item.get("posSide") or "").strip().lower() or "net"
+    mgn_mode = str(item.get("mgnMode") or "").strip().lower()
+    return inst_id, pos_side, mgn_mode
+
+
+def _ws_position_has_nonzero_size(item: dict[str, Any]) -> bool:
+    try:
+        position = Decimal(str(item.get("pos") or "0").strip() or "0")
+    except (InvalidOperation, ValueError):
+        return False
+    return position != 0
 
 
 def _ws_timestamp_seconds() -> str:
@@ -348,10 +366,35 @@ class OkxPrivateWsConnection:
 
     def _store_positions(self, items: list[dict[str, Any]]) -> None:
         with self._lock:
+            merged_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+            if self._positions_snapshot is not None:
+                existing_items = self._positions_snapshot.payload.get("data", ())
+                for existing in existing_items:
+                    if not isinstance(existing, dict):
+                        continue
+                    key = _position_snapshot_key(existing)
+                    if key is None:
+                        continue
+                    merged_by_key[key] = dict(existing)
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                key = _position_snapshot_key(item)
+                if key is None:
+                    continue
+                if _ws_position_has_nonzero_size(item):
+                    merged_by_key[key] = dict(item)
+                else:
+                    merged_by_key.pop(key, None)
             self._version += 1
             self._positions_snapshot = OkxPrivateWsRecord(
                 version=self._version,
-                payload={"data": [dict(item) for item in items if isinstance(item, dict)]},
+                payload={
+                    "data": [
+                        merged_by_key[key]
+                        for key in sorted(merged_by_key, key=lambda item: (item[0], item[1], item[2]))
+                    ]
+                },
                 received_at=time.time(),
             )
             self._lock.notify_all()

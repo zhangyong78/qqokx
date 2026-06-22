@@ -67,6 +67,7 @@ _PAIR_CLOSE_EXECUTION_MODE_OPTIONS = {
     "双腿吃单": "dual_taker",
     "现货挂单/合约吃单": "spot_maker_derivative_taker",
     "合约挂单/现货吃单": "derivative_maker_spot_taker",
+    "双方挂单/先成后市价": "both_maker_first_taker",
 }
 _ARBITRAGE_EXECUTION_MODE_OPTIONS = _PAIR_CLOSE_EXECUTION_MODE_OPTIONS
 _ROLL_EXECUTION_MODE_OPTIONS = {
@@ -887,22 +888,22 @@ class ArbitrageWindow:
         self.pair_close_batch_qty = StringVar(value=str(settings.get("pair_close_batch_qty", "")))
         self.open_batch_count = StringVar(value=str(settings.get("open_batch_count", "1")))
         self.open_batch_qty = StringVar(value=str(settings.get("open_batch_qty", "")))
-        self.open_execution_mode_label = StringVar(value=str(settings.get("open_execution_mode_label", "双腿吃单")))
+        self.open_execution_mode_label = StringVar(value=str(settings.get("open_execution_mode_label", "双方挂单/先成后市价")))
         self.open_maker_wait_seconds = StringVar(value=str(settings.get("open_maker_wait_seconds", "6")))
         self.open_chase_limit = StringVar(value=str(settings.get("open_chase_limit", "3")))
         self.close_batch_count = StringVar(value=str(settings.get("close_batch_count", "1")))
         self.close_batch_qty = StringVar(value=str(settings.get("close_batch_qty", "")))
-        self.close_execution_mode_label = StringVar(value=str(settings.get("close_execution_mode_label", "双腿吃单")))
+        self.close_execution_mode_label = StringVar(value=str(settings.get("close_execution_mode_label", "双方挂单/先成后市价")))
         self.close_maker_wait_seconds = StringVar(value=str(settings.get("close_maker_wait_seconds", "6")))
         self.close_chase_limit = StringVar(value=str(settings.get("close_chase_limit", "3")))
         self.roll_batch_count = StringVar(value=str(settings.get("roll_batch_count", "1")))
         self.roll_batch_qty = StringVar(value=str(settings.get("roll_batch_qty", "")))
-        self.roll_execution_mode_label = StringVar(value=str(settings.get("roll_execution_mode_label", "双腿吃单")))
+        self.roll_execution_mode_label = StringVar(value=str(settings.get("roll_execution_mode_label", "双方挂单/先成后市价")))
         self.roll_maker_wait_seconds = StringVar(value=str(settings.get("roll_maker_wait_seconds", "6")))
         self.roll_chase_limit = StringVar(value=str(settings.get("roll_chase_limit", "3")))
         self.roll_auto_spread_abs_min = StringVar(value=str(settings.get("roll_auto_spread_abs_min", "")))
         self.pair_close_execution_mode_label = StringVar(
-            value=str(settings.get("pair_close_execution_mode_label", "双腿吃单"))
+            value=str(settings.get("pair_close_execution_mode_label", "双方挂单/先成后市价"))
         )
         self.pair_close_maker_wait_seconds = StringVar(value=str(settings.get("pair_close_maker_wait_seconds", "6")))
         self.pair_close_chase_limit = StringVar(value=str(settings.get("pair_close_chase_limit", "3")))

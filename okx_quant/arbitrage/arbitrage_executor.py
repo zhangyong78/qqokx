@@ -20,7 +20,7 @@ from okx_quant.arbitrage.models import ArbitrageLedgerEntry, ArbitrageTradeRunti
 from okx_quant.arbitrage.position_ledger import find_ledger_entry, load_open_ledger_entries, upsert_ledger_entry
 from okx_quant.arbitrage.size_converter import preview_arbitrage_size
 from okx_quant.models import StrategyConfig
-from okx_quant.okx_client import OkxApiError, OkxOrderBook, OkxRestClient, OkxTicker
+from okx_quant.okx_client import OkxApiError, OkxOrderBook, OkxOrderResult, OkxOrderStatus, OkxRestClient, OkxTicker
 from okx_quant.pricing import format_decimal, snap_to_increment
 
 Logger = Callable[[str], None]
@@ -29,6 +29,46 @@ PollSeconds = 1.0
 EXECUTOR_MARKET_CACHE_TTL_SECONDS = 0.25
 PRIVATE_WS_WAIT_SLICE_SECONDS = 10.0
 PRIVATE_WS_STALE_REST_FALLBACK_SECONDS = 5.0
+ORDER_STATUS_REQUEST_TIMEOUT_SECONDS = 2.5
+ORDER_CANCEL_REQUEST_TIMEOUT_SECONDS = 2.5
+POST_CANCEL_SETTLE_SECONDS = 5.0
+POST_CANCEL_RECOVERY_SECONDS = 8.0
+
+
+def _post_cancel_settle_seconds_for_mode(execution_mode: str) -> float:
+    normalized = str(execution_mode or "").strip().lower()
+    if normalized == "both_maker_first_taker":
+        return 5.0
+    if normalized in {
+        "old_maker_new_taker",
+        "new_maker_old_taker",
+        "spot_maker_derivative_taker",
+        "derivative_maker_spot_taker",
+    }:
+        return 2.0
+    return 1.2
+
+
+def _post_cancel_recovery_seconds_for_mode(execution_mode: str) -> float:
+    normalized = str(execution_mode or "").strip().lower()
+    if normalized == "both_maker_first_taker":
+        return 8.0
+    if normalized in {
+        "old_maker_new_taker",
+        "new_maker_old_taker",
+        "spot_maker_derivative_taker",
+        "derivative_maker_spot_taker",
+    }:
+        return 3.0
+    return 0.0
+
+
+class PostCancelStatusUnknownError(OkxApiError):
+    """Raised when post-cancel status cannot be confirmed due to transient query uncertainty."""
+
+
+class PostCancelNonTerminalError(OkxApiError):
+    """Raised when post-cancel status is confirmed but still non-terminal."""
 
 
 @dataclass(frozen=True)
@@ -212,7 +252,13 @@ def _wait_order_fill(
     last_filled = Decimal("0")
     avg_price: Decimal | None = None
     while time.time() < deadline:
-        status = client.get_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
+        status = client.get_order(
+            credentials,
+            config,
+            inst_id=inst_id,
+            ord_id=ord_id,
+            request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
+        )
         filled = status.filled_size or Decimal("0")
         avg_price = status.avg_price
         state = (status.state or "").lower()
@@ -268,7 +314,13 @@ def _wait_order_fill_with_private_ws(
                 if ws_payload is not None:
                     ws_version, status = ws_payload
         if status is None:
-            status = client.get_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
+            status = client.get_order(
+                credentials,
+                config,
+                inst_id=inst_id,
+                ord_id=ord_id,
+                request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
+            )
         filled = status.filled_size or Decimal("0")
         avg_price = status.avg_price
         state = (status.state or "").lower()
@@ -383,7 +435,13 @@ def _wait_order_fill_with_private_ws(
                     ws_version, status = ws_payload
         if status is None:
             if not private_ws_connected or time.time() >= rest_fallback_at:
-                status = client.get_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
+                status = client.get_order(
+                    credentials,
+                    config,
+                    inst_id=inst_id,
+                    ord_id=ord_id,
+                    request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
+                )
                 rest_fallback_at = time.time() + PRIVATE_WS_STALE_REST_FALLBACK_SECONDS
             else:
                 cached_status = _get_cached_private_order_status(
@@ -604,7 +662,15 @@ class ArbitrageExecutor:
                     if ws_payload is not None:
                         ws_version, status = ws_payload
             if status is None:
-                status = self._client.get_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
+                status = self._get_order_status_once(
+                    credentials=credentials,
+                    config=config,
+                    inst_id=inst_id,
+                    ord_id=ord_id,
+                )
+            if status is None:
+                time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.2))
+                continue
             filled = status.filled_size or Decimal("0")
             avg_price = status.avg_price
             state = (status.state or "").lower()
@@ -640,19 +706,86 @@ class ArbitrageExecutor:
         target_filled = Decimal("0")
         current_avg: Decimal | None = None
         target_avg: Decimal | None = None
+        current_ws_version = 0
+        target_ws_version = 0
+        private_ws_connected = _private_ws_connected(self._client, credentials, environment=current_config.environment)
+        rest_fallback_at = time.time()
         while time.time() < deadline:
-            current_status = self._client.get_order(
-                credentials,
-                current_config,
-                inst_id=current_inst_id,
-                ord_id=current_ord_id,
-            )
-            target_status = self._client.get_order(
-                credentials,
-                target_config,
-                inst_id=target_inst_id,
-                ord_id=target_ord_id,
-            )
+            current_status = None
+            target_status = None
+            wait_private_update = getattr(self._client, "wait_private_order_update", None)
+            if private_ws_connected and callable(wait_private_update):
+                timeout = min(max(deadline - time.time(), 0.0), 0.8)
+                if timeout > 0:
+                    try:
+                        current_ws_payload = wait_private_update(
+                            credentials,
+                            environment=current_config.environment,
+                            inst_id=current_inst_id,
+                            ord_id=current_ord_id,
+                            after_version=current_ws_version,
+                            timeout=timeout,
+                        )
+                    except Exception:  # noqa: BLE001
+                        current_ws_payload = None
+                    if current_ws_payload is not None:
+                        current_ws_version, current_status = current_ws_payload
+                    try:
+                        target_ws_payload = wait_private_update(
+                            credentials,
+                            environment=target_config.environment,
+                            inst_id=target_inst_id,
+                            ord_id=target_ord_id,
+                            after_version=target_ws_version,
+                            timeout=timeout,
+                        )
+                    except Exception:  # noqa: BLE001
+                        target_ws_payload = None
+                    if target_ws_payload is not None:
+                        target_ws_version, target_status = target_ws_payload
+            if current_status is None or target_status is None:
+                if not private_ws_connected or time.time() >= rest_fallback_at:
+                    if current_status is None:
+                        current_status = self._get_order_status_once(
+                            credentials=credentials,
+                            config=current_config,
+                            inst_id=current_inst_id,
+                            ord_id=current_ord_id,
+                        )
+                    if target_status is None:
+                        target_status = self._get_order_status_once(
+                            credentials=credentials,
+                            config=target_config,
+                            inst_id=target_inst_id,
+                            ord_id=target_ord_id,
+                        )
+                    rest_fallback_at = time.time() + PRIVATE_WS_STALE_REST_FALLBACK_SECONDS
+                else:
+                    if current_status is None:
+                        cached_current = _get_cached_private_order_status(
+                            self._client,
+                            credentials=credentials,
+                            environment=current_config.environment,
+                            inst_id=current_inst_id,
+                            ord_id=current_ord_id,
+                        )
+                        if cached_current is not None:
+                            current_ws_version, current_status = cached_current
+                    if target_status is None:
+                        cached_target = _get_cached_private_order_status(
+                            self._client,
+                            credentials=credentials,
+                            environment=target_config.environment,
+                            inst_id=target_inst_id,
+                            ord_id=target_ord_id,
+                        )
+                        if cached_target is not None:
+                            target_ws_version, target_status = cached_target
+            if current_status is None or target_status is None:
+                if private_ws_connected:
+                    continue
+                time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.2))
+                continue
             next_current_filled = current_status.filled_size or Decimal("0")
             next_target_filled = target_status.filled_size or Decimal("0")
             current_avg = current_status.avg_price
@@ -683,11 +816,398 @@ class ArbitrageExecutor:
         config: StrategyConfig,
         inst_id: str,
         ord_id: str,
+        label: str | None = None,
     ) -> None:
         try:
-            self._client.cancel_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
-        except Exception:
-            pass
+            self._client.cancel_order(
+                credentials,
+                config,
+                inst_id=inst_id,
+                ord_id=ord_id,
+                request_timeout=ORDER_CANCEL_REQUEST_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            if label:
+                self._logger(f"{label} 撤单请求异常：{exc}；继续核对订单最终状态。")
+
+    @staticmethod
+    def _is_timeout_error_message(message: str) -> bool:
+        lowered = str(message or "").lower()
+        return "timed out" in lowered or "timeout" in lowered or "超时" in str(message or "")
+
+    @staticmethod
+    def _is_retryable_order_query_error_message(message: str) -> bool:
+        lowered = str(message or "").lower()
+        markers = (
+            "network error",
+            "timeout",
+            "timed out",
+            "handshake",
+            "ssl",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "temporarily unavailable",
+            "temporary failure",
+            "read timed out",
+            "connect timeout",
+            "proxy error",
+            "bad gateway",
+            "service unavailable",
+            "gateway timeout",
+            "eof occurred",
+            "remote end closed connection without response",
+            "remotedisconnected",
+            "网络错误",
+            "超时",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _is_missing_order_status_message(message: str) -> bool:
+        lowered = str(message or "").lower()
+        return (
+            "未返回订单状态" in str(message or "")
+            or "order not found" in lowered
+            or "does not exist" in lowered
+            or "not exist" in lowered
+        )
+
+    def _get_order_status_once(
+        self,
+        *,
+        credentials,
+        config: StrategyConfig,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+    ) -> OkxOrderStatus | None:
+        try:
+            return self._client.get_order(
+                credentials,
+                config,
+                inst_id=inst_id,
+                ord_id=ord_id,
+                cl_ord_id=cl_ord_id,
+                request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
+            )
+        except OkxApiError as exc:
+            message = str(exc)
+            if self._is_missing_order_status_message(message):
+                return None
+            if self._is_retryable_order_query_error_message(message):
+                return None
+            raise
+
+    def _wait_order_status_by_ref(
+        self,
+        *,
+        credentials,
+        config: StrategyConfig,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+        timeout_seconds: float = 8.0,
+    ) -> OkxOrderStatus | None:
+        deadline = time.time() + max(0.0, timeout_seconds)
+        ws_version = 0
+        private_ws_connected = _private_ws_connected(self._client, credentials, environment=config.environment)
+        rest_fallback_at = time.time()
+        cached_status = _get_cached_private_order_status(
+            self._client,
+            credentials=credentials,
+            environment=config.environment,
+            inst_id=inst_id,
+            ord_id=ord_id,
+            cl_ord_id=cl_ord_id,
+        )
+        if cached_status is not None:
+            ws_version, status = cached_status
+            return status
+        while time.time() < deadline:
+            status = None
+            wait_private_update = getattr(self._client, "wait_private_order_update", None)
+            if private_ws_connected and callable(wait_private_update):
+                timeout = min(max(deadline - time.time(), 0.0), 1.5)
+                if timeout > 0:
+                    try:
+                        ws_payload = wait_private_update(
+                            credentials,
+                            environment=config.environment,
+                            inst_id=inst_id,
+                            ord_id=ord_id,
+                            cl_ord_id=cl_ord_id,
+                            after_version=ws_version,
+                            timeout=timeout,
+                        )
+                    except Exception:  # noqa: BLE001
+                        ws_payload = None
+                    if ws_payload is not None:
+                        ws_version, status = ws_payload
+            if status is None:
+                if not private_ws_connected or time.time() >= rest_fallback_at:
+                    try:
+                        status = self._get_order_status_once(
+                            credentials=credentials,
+                            config=config,
+                            inst_id=inst_id,
+                            ord_id=ord_id,
+                            cl_ord_id=cl_ord_id,
+                        )
+                    except OkxApiError as exc:
+                        if "未返回订单状态" not in str(exc):
+                            raise
+                    rest_fallback_at = time.time() + PRIVATE_WS_STALE_REST_FALLBACK_SECONDS
+                else:
+                    cached_status = _get_cached_private_order_status(
+                        self._client,
+                        credentials=credentials,
+                        environment=config.environment,
+                        inst_id=inst_id,
+                        ord_id=ord_id,
+                        cl_ord_id=cl_ord_id,
+                    )
+                    if cached_status is not None:
+                        ws_version, status = cached_status
+            if status is not None:
+                return status
+            if private_ws_connected:
+                continue
+            time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.2))
+        return None
+
+    def _place_simple_order_with_recovery(
+        self,
+        credentials,
+        config: StrategyConfig,
+        *,
+        label: str,
+        **kwargs,
+    ) -> OkxOrderResult:
+        cl_ord_id = str(kwargs.get("cl_ord_id") or "").strip() or None
+        inst_id = str(kwargs.get("inst_id") or "").strip().upper()
+        try:
+            return self._client.place_simple_order(
+                credentials,
+                config,
+                **kwargs,
+            )
+        except OkxApiError as exc:
+            if not cl_ord_id or not inst_id or not self._is_timeout_error_message(str(exc)):
+                raise
+            self._logger(f"{label} 下单请求超时，正在按 clOrdId={cl_ord_id} 回查 OKX 是否已受理。")
+            status = self._wait_order_status_by_ref(
+                credentials=credentials,
+                config=config,
+                inst_id=inst_id,
+                cl_ord_id=cl_ord_id,
+                timeout_seconds=8.0,
+            )
+            if status is None:
+                raise OkxApiError(
+                    f"{exc} | 已按 clOrdId={cl_ord_id} 回查 8 秒，未发现 OKX 已受理该订单。"
+                ) from exc
+            self._logger(
+                f"{label} 超时回查成功：OKX 已记录订单 {status.ord_id or '-'}，"
+                f"状态 {status.state or '-'}。"
+            )
+            return OkxOrderResult(
+                ord_id=status.ord_id,
+                cl_ord_id=cl_ord_id,
+                s_code="0",
+                s_msg="recovered_after_timeout",
+                raw=status.raw,
+            )
+
+    def _wait_order_terminal_after_cancel(
+        self,
+        *,
+        credentials,
+        config: StrategyConfig,
+        inst_id: str,
+        ord_id: str,
+        known_filled: Decimal,
+        known_avg: Decimal | None,
+        label: str,
+        settle_seconds: float = 3.0,
+    ) -> tuple[Decimal, Decimal | None, str]:
+        deadline = time.time() + max(0.0, settle_seconds)
+        latest_filled = known_filled
+        latest_avg = known_avg
+        last_state = ""
+        while True:
+            remaining = max(deadline - time.time(), 0.0)
+            status = self._wait_order_status_by_ref(
+                credentials=credentials,
+                config=config,
+                inst_id=inst_id,
+                ord_id=ord_id,
+                timeout_seconds=min(remaining, 0.8),
+            )
+            if status is None:
+                if time.time() >= deadline:
+                    error_cls = PostCancelNonTerminalError if last_state and last_state != "unknown" else PostCancelStatusUnknownError
+                    raise error_cls(
+                        f"{label} 撤单后订单仍未进入终态（最近状态：{last_state or 'unknown'}）。"
+                        "为避免残留挂单继续成交导致数量错配，已中止后续批次。"
+                    )
+                time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.15))
+                continue
+            next_filled = status.filled_size or Decimal("0")
+            if next_filled > latest_filled:
+                self._logger(
+                    f"{label} 撤单确认期间追加成交 {format_decimal(next_filled - latest_filled)}，"
+                    f"累计 {format_decimal(next_filled)}。"
+                )
+                latest_filled = next_filled
+                latest_avg = status.avg_price
+            elif latest_avg is None and status.avg_price is not None:
+                latest_avg = status.avg_price
+            last_state = (status.state or "").lower()
+            if last_state in {"filled", "canceled", "cancelled"}:
+                return latest_filled, latest_avg, last_state
+            if time.time() >= deadline:
+                raise PostCancelNonTerminalError(
+                    f"{label} 撤单后订单仍未进入终态（当前状态：{status.state or 'unknown'}）。"
+                    "为避免残留挂单继续成交导致数量错配，已中止后续批次。"
+                )
+            time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.15))
+
+    def _wait_order_terminal_after_cancel_with_recovery(
+        self,
+        *,
+        credentials,
+        config: StrategyConfig,
+        inst_id: str,
+        ord_id: str,
+        known_filled: Decimal,
+        known_avg: Decimal | None,
+        label: str,
+        settle_seconds: float = POST_CANCEL_SETTLE_SECONDS,
+        recovery_seconds: float = POST_CANCEL_RECOVERY_SECONDS,
+    ) -> tuple[Decimal, Decimal | None, str]:
+        try:
+            return self._wait_order_terminal_after_cancel(
+                credentials=credentials,
+                config=config,
+                inst_id=inst_id,
+                ord_id=ord_id,
+                known_filled=known_filled,
+                known_avg=known_avg,
+                label=label,
+                settle_seconds=settle_seconds,
+            )
+        except PostCancelNonTerminalError as exc:
+            self._logger(
+                f"{label} 撤单确认结论：状态已明确但仍非终态（例如 live/partially_filled），"
+                "不进入恢复核对，直接按真实残单风险处理。"
+            )
+            raise
+        except PostCancelStatusUnknownError as exc:
+            if recovery_seconds <= 0:
+                raise
+            self._logger(
+                f"{label} 撤单确认结论：状态未知，进入恢复核对 {recovery_seconds} 秒。原因：{exc}"
+            )
+            latest_filled = known_filled
+            latest_avg = known_avg
+            last_state = ""
+            deadline = time.time() + max(0.0, recovery_seconds)
+            while time.time() < deadline:
+                self._cancel_order_safely(
+                    credentials=credentials,
+                    config=config,
+                    inst_id=inst_id,
+                    ord_id=ord_id,
+                    label=label,
+                )
+                status = self._wait_order_status_by_ref(
+                    credentials=credentials,
+                    config=config,
+                    inst_id=inst_id,
+                    ord_id=ord_id,
+                    timeout_seconds=min(max(deadline - time.time(), 0.0), 1.2),
+                )
+                if status is None:
+                    time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.25))
+                    continue
+                next_filled = status.filled_size or Decimal("0")
+                if next_filled > latest_filled:
+                    self._logger(
+                        f"{label} 恢复核对期间追加确认成交 {format_decimal(next_filled - latest_filled)}，"
+                        f"累计 {format_decimal(next_filled)}。"
+                    )
+                    latest_filled = next_filled
+                    latest_avg = status.avg_price
+                elif latest_avg is None and status.avg_price is not None:
+                    latest_avg = status.avg_price
+                last_state = (status.state or "").lower()
+                if last_state in {"filled", "canceled", "cancelled"}:
+                    self._logger(
+                        f"{label} 恢复核对成功：最终状态 {status.state or '-'}，"
+                        f"累计成交 {format_decimal(latest_filled)}。"
+                    )
+                    return latest_filled, latest_avg, last_state
+                time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.25))
+            raise OkxApiError(
+                f"{label} 撤单后恢复核对 {recovery_seconds} 秒仍未进入终态（最近状态：{last_state or 'unknown'}）。"
+                "为避免残留挂单继续成交导致数量错配，已中止后续批次。"
+            ) from exc
+
+    def _cancel_dual_maker_orders_and_capture_fills(
+        self,
+        *,
+        credentials,
+        current_config: StrategyConfig,
+        target_config: StrategyConfig,
+        current_inst_id: str,
+        target_inst_id: str,
+        current_ord_id: str,
+        target_ord_id: str,
+        current_filled: Decimal,
+        current_avg: Decimal | None,
+        target_filled: Decimal,
+        target_avg: Decimal | None,
+        settle_seconds: float = POST_CANCEL_SETTLE_SECONDS,
+        recovery_seconds: float = POST_CANCEL_RECOVERY_SECONDS,
+    ) -> tuple[Decimal, Decimal | None, Decimal, Decimal | None]:
+        self._cancel_order_safely(
+            credentials=credentials,
+            config=current_config,
+            inst_id=current_inst_id,
+            ord_id=current_ord_id,
+            label="移仓旧合约挂单腿",
+        )
+        self._cancel_order_safely(
+            credentials=credentials,
+            config=target_config,
+            inst_id=target_inst_id,
+            ord_id=target_ord_id,
+            label="移仓目标合约挂单腿",
+        )
+        latest_current_filled, latest_current_avg, _ = self._wait_order_terminal_after_cancel_with_recovery(
+            credentials=credentials,
+            config=current_config,
+            inst_id=current_inst_id,
+            ord_id=current_ord_id,
+            known_filled=current_filled,
+            known_avg=current_avg,
+            label="移仓旧合约挂单腿",
+            settle_seconds=settle_seconds,
+            recovery_seconds=recovery_seconds,
+        )
+        latest_target_filled, latest_target_avg, _ = self._wait_order_terminal_after_cancel_with_recovery(
+            credentials=credentials,
+            config=target_config,
+            inst_id=target_inst_id,
+            ord_id=target_ord_id,
+            known_filled=target_filled,
+            known_avg=target_avg,
+            label="移仓目标合约挂单腿",
+            settle_seconds=settle_seconds,
+            recovery_seconds=recovery_seconds,
+        )
+        return latest_current_filled, latest_current_avg, latest_target_filled, latest_target_avg
 
     def _execute_taker_leg(
         self,
@@ -701,9 +1221,10 @@ class ArbitrageExecutor:
         pos_side: str | None = None,
         reduce_only: bool = False,
     ) -> tuple[Decimal, Decimal | None]:
-        result = self._client.place_simple_order(
+        result = self._place_simple_order_with_recovery(
             credentials,
             config,
+            label=label,
             inst_id=inst_id,
             side=side,
             size=size,
@@ -764,6 +1285,362 @@ class ArbitrageExecutor:
         if target_filled <= 0:
             raise OkxApiError("自动补齐失败：目标合约腿未成交。")
         return current_filled, current_avg, target_filled, target_avg
+
+    def _complete_roll_batch_gaps(
+        self,
+        *,
+        credentials,
+        current_config: StrategyConfig,
+        target_config: StrategyConfig,
+        current_inst_id: str,
+        target_inst_id: str,
+        current_close_side: str,
+        target_open_side: str,
+        planned_qty: Decimal,
+        current_filled: Decimal,
+        current_avg: Decimal | None,
+        target_filled: Decimal,
+        target_avg: Decimal | None,
+        derivative_pos_side: str | None,
+        reason: str,
+    ) -> tuple[Decimal, Decimal | None, Decimal, Decimal | None]:
+        current_total = current_filled
+        current_avg_total = current_avg
+        target_total = target_filled
+        target_avg_total = target_avg
+
+        current_gap = max(planned_qty - current_total, Decimal("0"))
+        target_gap = max(planned_qty - target_total, Decimal("0"))
+        paired_gap = min(current_gap, target_gap)
+
+        if paired_gap > 0:
+            (
+                pair_current_filled,
+                pair_current_avg,
+                pair_target_filled,
+                pair_target_avg,
+            ) = self._execute_roll_completion_taker_pair(
+                credentials=credentials,
+                current_config=current_config,
+                target_config=target_config,
+                current_inst_id=current_inst_id,
+                target_inst_id=target_inst_id,
+                current_close_side=current_close_side,
+                target_open_side=target_open_side,
+                remaining_qty=paired_gap,
+                derivative_pos_side=derivative_pos_side,
+                reason=reason,
+            )
+            current_avg_total = self._blend_avg_price(
+                current_avg_total,
+                current_total,
+                pair_current_avg,
+                pair_current_filled,
+            )
+            target_avg_total = self._blend_avg_price(
+                target_avg_total,
+                target_total,
+                pair_target_avg,
+                pair_target_filled,
+            )
+            current_total += pair_current_filled
+            target_total += pair_target_filled
+
+        current_gap = max(planned_qty - current_total, Decimal("0"))
+        if current_gap > 0:
+            self._logger(
+                f"{reason}，旧合约腿还差 {format_decimal(current_gap)} 张，继续补齐。"
+            )
+            extra_current_filled, extra_current_avg = self._execute_taker_leg(
+                credentials=credentials,
+                config=current_config,
+                inst_id=current_inst_id,
+                side=current_close_side,
+                size=current_gap,
+                label="自动移仓旧合约补齐腿",
+                pos_side=derivative_pos_side,
+                reduce_only=True,
+            )
+            if extra_current_filled <= 0:
+                raise OkxApiError("自动补齐失败：旧合约腿未成交。")
+            current_avg_total = self._blend_avg_price(
+                current_avg_total,
+                current_total,
+                extra_current_avg,
+                extra_current_filled,
+            )
+            current_total += extra_current_filled
+
+        target_gap = max(planned_qty - target_total, Decimal("0"))
+        if target_gap > 0:
+            self._logger(
+                f"{reason}，目标合约腿还差 {format_decimal(target_gap)} 张，继续补齐。"
+            )
+            extra_target_filled, extra_target_avg = self._execute_taker_leg(
+                credentials=credentials,
+                config=target_config,
+                inst_id=target_inst_id,
+                side=target_open_side,
+                size=target_gap,
+                label="自动移仓目标合约补齐腿",
+                pos_side=derivative_pos_side,
+            )
+            if extra_target_filled <= 0:
+                raise OkxApiError("自动补齐失败：目标合约腿未成交。")
+            target_avg_total = self._blend_avg_price(
+                target_avg_total,
+                target_total,
+                extra_target_avg,
+                extra_target_filled,
+            )
+            target_total += extra_target_filled
+
+        final_current_gap = max(planned_qty - current_total, Decimal("0"))
+        final_target_gap = max(planned_qty - target_total, Decimal("0"))
+        if final_current_gap > 0 or final_target_gap > 0:
+            raise OkxApiError(
+                "自动补齐后仍有未完成张数："
+                f"旧合约剩余 {format_decimal(final_current_gap)} 张，"
+                f"目标合约剩余 {format_decimal(final_target_gap)} 张。"
+            )
+
+        return current_total, current_avg_total, target_total, target_avg_total
+
+    def _execute_spot_derivative_both_maker(
+        self,
+        *,
+        credentials,
+        runtime: ArbitrageTradeRuntime,
+        spot_inst,
+        deriv_inst,
+        spot_config: StrategyConfig,
+        deriv_config: StrategyConfig,
+        spot_inst_id: str,
+        deriv_inst_id: str,
+        planned_derivative_qty: Decimal,
+        spot_side: str,
+        deriv_side: str,
+        deriv_pos_side: str | None,
+        deriv_reduce_only: bool,
+        maker_wait_seconds: float,
+        chase_limit: int,
+        spot_maker_label_prefix: str,
+        deriv_maker_label_prefix: str,
+        spot_taker_label: str,
+        deriv_taker_label: str,
+    ) -> tuple[Decimal, Decimal | None, Decimal, Decimal | None]:
+        total_spot_filled = Decimal("0")
+        total_derivative_filled = Decimal("0")
+        spot_avg: Decimal | None = None
+        deriv_avg: Decimal | None = None
+        residual_spot_qty = Decimal("0")
+        remaining_derivative_qty = planned_derivative_qty
+        post_cancel_settle_seconds = _post_cancel_settle_seconds_for_mode("both_maker_first_taker")
+        post_cancel_recovery_seconds = _post_cancel_recovery_seconds_for_mode("both_maker_first_taker")
+
+        for attempt in range(max(0, chase_limit) + 1):
+            if remaining_derivative_qty < deriv_inst.min_size:
+                break
+            planned_spot_qty = snap_to_increment(
+                spot_base_from_derivative_fill(
+                    derivative_filled_contracts=remaining_derivative_qty,
+                    derivative_instrument=deriv_inst,
+                ),
+                spot_inst.lot_size,
+                "down",
+            )
+            if planned_spot_qty <= 0:
+                raise OkxApiError("双方挂单当前批次换算后的现货数量为 0。")
+            self._logger(
+                f"专业双腿双方挂单：第 {attempt + 1}/{max(0, chase_limit) + 1} 次尝试，"
+                f"本次计划 现货 {format_decimal(planned_spot_qty)} / 合约 {format_decimal(remaining_derivative_qty)}，"
+                f"挂单等待 {maker_wait_seconds} 秒。"
+            )
+            spot_order = self._place_simple_order_with_recovery(
+                credentials,
+                spot_config,
+                label=f"{spot_maker_label_prefix} 第 {attempt + 1} 次",
+                inst_id=spot_inst_id,
+                side=spot_side,
+                size=planned_spot_qty,
+                ord_type="post_only",
+                price=self._resolve_passive_price(
+                    spot_inst,
+                    side=spot_side,
+                    environment=runtime.environment,
+                ),
+                reduce_only=False,
+                cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+            )
+            deriv_order = self._place_simple_order_with_recovery(
+                credentials,
+                deriv_config,
+                label=f"{deriv_maker_label_prefix} 第 {attempt + 1} 次",
+                inst_id=deriv_inst_id,
+                side=deriv_side,
+                size=remaining_derivative_qty,
+                ord_type="post_only",
+                pos_side=deriv_pos_side,
+                price=self._resolve_passive_price(
+                    deriv_inst,
+                    side=deriv_side,
+                    environment=runtime.environment,
+                ),
+                reduce_only=deriv_reduce_only,
+                cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+            )
+            (
+                spot_maker_filled,
+                spot_maker_avg,
+                deriv_maker_filled,
+                deriv_maker_avg,
+                any_maker_filled,
+            ) = self._wait_two_maker_orders_until(
+                credentials=credentials,
+                current_config=spot_config,
+                target_config=deriv_config,
+                current_inst_id=spot_inst_id,
+                target_inst_id=deriv_inst_id,
+                current_ord_id=spot_order.ord_id,
+                target_ord_id=deriv_order.ord_id,
+                timeout_seconds=maker_wait_seconds,
+                current_label=f"{spot_maker_label_prefix} 第 {attempt + 1} 次",
+                target_label=f"{deriv_maker_label_prefix} 第 {attempt + 1} 次",
+            )
+            (
+                spot_batch_filled,
+                batch_spot_avg,
+                deriv_batch_filled,
+                batch_deriv_avg,
+            ) = self._cancel_dual_maker_orders_and_capture_fills(
+                credentials=credentials,
+                current_config=spot_config,
+                target_config=deriv_config,
+                current_inst_id=spot_inst_id,
+                target_inst_id=deriv_inst_id,
+                current_ord_id=spot_order.ord_id,
+                target_ord_id=deriv_order.ord_id,
+                current_filled=spot_maker_filled,
+                current_avg=spot_maker_avg,
+                target_filled=deriv_maker_filled,
+                target_avg=deriv_maker_avg,
+                settle_seconds=post_cancel_settle_seconds,
+                recovery_seconds=post_cancel_recovery_seconds,
+            )
+            if not any_maker_filled and spot_batch_filled <= 0 and deriv_batch_filled <= 0:
+                if attempt >= chase_limit:
+                    raise OkxApiError("双方挂单双腿均未成交，已达到最大追单次数。")
+                continue
+            if spot_batch_filled != spot_maker_filled or deriv_batch_filled != deriv_maker_filled:
+                self._logger("专业双腿双方挂单在撤单确认期间出现晚到成交，已按最新成交差额继续补齐。")
+
+            residual_before = residual_spot_qty
+            batch_spot_committed = Decimal("0")
+            batch_derivative_total = deriv_batch_filled
+
+            if deriv_batch_filled > 0:
+                required_spot_qty = snap_to_increment(
+                    spot_base_from_derivative_fill(
+                        derivative_filled_contracts=deriv_batch_filled,
+                        derivative_instrument=deriv_inst,
+                    ),
+                    spot_inst.lot_size,
+                    "down",
+                )
+                available_spot_qty = residual_before + spot_batch_filled
+                if available_spot_qty < required_spot_qty:
+                    missing_spot_qty = required_spot_qty - available_spot_qty
+                    spot_taker_filled, spot_taker_avg = self._execute_taker_leg(
+                        credentials=credentials,
+                        config=spot_config,
+                        inst_id=spot_inst_id,
+                        side=spot_side,
+                        size=missing_spot_qty,
+                        label=spot_taker_label,
+                    )
+                    batch_spot_avg = self._blend_avg_price(
+                        batch_spot_avg,
+                        spot_batch_filled,
+                        spot_taker_avg,
+                        spot_taker_filled,
+                    )
+                    spot_batch_filled += spot_taker_filled
+                    available_spot_qty += spot_taker_filled
+                if available_spot_qty < required_spot_qty:
+                    raise OkxApiError("双方挂单后现货腿补齐失败，无法覆盖已成交的合约张数。")
+                batch_spot_committed += required_spot_qty
+                residual_spot_qty = max(available_spot_qty - required_spot_qty, Decimal("0"))
+            else:
+                residual_spot_qty += spot_batch_filled
+
+            extra_derivative_qty = derivative_contracts_from_spot_base(
+                spot_base_qty=residual_spot_qty,
+                derivative_instrument=deriv_inst,
+            )
+            if extra_derivative_qty > 0:
+                deriv_taker_filled, deriv_taker_avg = self._execute_taker_leg(
+                    credentials=credentials,
+                    config=deriv_config,
+                    inst_id=deriv_inst_id,
+                    side=deriv_side,
+                    size=extra_derivative_qty,
+                    label=deriv_taker_label,
+                    pos_side=deriv_pos_side,
+                    reduce_only=deriv_reduce_only,
+                )
+                used_spot_qty = snap_to_increment(
+                    spot_base_from_derivative_fill(
+                        derivative_filled_contracts=deriv_taker_filled,
+                        derivative_instrument=deriv_inst,
+                    ),
+                    spot_inst.lot_size,
+                    "down",
+                )
+                residual_spot_qty = max(residual_spot_qty - used_spot_qty, Decimal("0"))
+                batch_spot_committed += used_spot_qty
+                batch_deriv_avg = self._blend_avg_price(
+                    batch_deriv_avg,
+                    deriv_batch_filled,
+                    deriv_taker_avg,
+                    deriv_taker_filled,
+                )
+                batch_derivative_total += deriv_taker_filled
+
+            if batch_spot_committed <= 0 or batch_derivative_total <= 0:
+                if attempt >= chase_limit:
+                    raise OkxApiError("双方挂单已有成交，但未形成有效的双腿开平仓配对。")
+                continue
+
+            spot_avg = self._blend_avg_price(
+                spot_avg,
+                total_spot_filled,
+                batch_spot_avg,
+                batch_spot_committed,
+            )
+            deriv_avg = self._blend_avg_price(
+                deriv_avg,
+                total_derivative_filled,
+                batch_deriv_avg,
+                batch_derivative_total,
+            )
+            total_spot_filled += batch_spot_committed
+            total_derivative_filled += batch_derivative_total
+            remaining_derivative_qty = max(planned_derivative_qty - total_derivative_filled, Decimal("0"))
+            if remaining_derivative_qty < deriv_inst.min_size:
+                break
+
+        if total_spot_filled <= 0 or total_derivative_filled <= 0:
+            raise OkxApiError("当前未形成有效的专业双腿双方挂单成交。")
+        if total_derivative_filled < planned_derivative_qty:
+            raise OkxApiError(
+                f"专业双腿双方挂单未完成：计划 {format_decimal(planned_derivative_qty)} 张，"
+                f"实际合约 {format_decimal(total_derivative_filled)} 张。"
+            )
+        if residual_spot_qty >= spot_inst.lot_size:
+            self._logger(
+                f"专业双腿双方挂单结束时仍有未完全对冲的现货残量：{format_decimal(residual_spot_qty)}。"
+            )
+        return total_spot_filled, spot_avg, total_derivative_filled, deriv_avg
 
     def _open_maker_taker(
         self,
@@ -1080,6 +1957,8 @@ class ArbitrageExecutor:
         request: ArbitrageOpenRequest,
         *,
         runtime: ArbitrageTradeRuntime,
+        should_stop_after_batch: Callable[[], bool] | None = None,
+        wait_before_next_batch: Callable[[], bool] | None = None,
     ) -> ArbitrageOpenResult:
         credentials = runtime.credentials
         self._prime_market_context((request.spot_inst_id, request.derivative_inst_id), environment=runtime.environment)
@@ -1123,7 +2002,12 @@ class ArbitrageExecutor:
                     batch_count=1,
                     batch_contract_qty=None,
                 )
-                batch_result = self.open_cash_and_carry(batch_request, runtime=runtime)
+                batch_result = self.open_cash_and_carry(
+                    batch_request,
+                    runtime=runtime,
+                    should_stop_after_batch=should_stop_after_batch,
+                    wait_before_next_batch=wait_before_next_batch,
+                )
                 batch_messages.append(f"第 {index}/{len(planned_batches)} 批：{batch_result.message}")
                 if batch_result.spot_filled_qty > 0:
                     spot_avg = self._blend_avg_price(
@@ -1148,6 +2032,32 @@ class ArbitrageExecutor:
                         success=False,
                         message=(
                             f"分批开仓中断：已完成 {index - 1}/{len(planned_batches)} 批。\n"
+                            + "\n".join(batch_messages)
+                        ),
+                        spot_filled_qty=total_spot_filled,
+                        derivative_filled_qty=total_derivative_filled,
+                        spot_avg_price=spot_avg,
+                        derivative_avg_price=deriv_avg,
+                        ledger_entry_id=ledger_entry_ids[0] if len(ledger_entry_ids) == 1 else None,
+                    )
+                if index < len(planned_batches) and callable(should_stop_after_batch) and should_stop_after_batch():
+                    return ArbitrageOpenResult(
+                        success=True,
+                        message=(
+                            f"已按停止请求在第 {index}/{len(planned_batches)} 批完成后停止。\n"
+                            + "\n".join(batch_messages)
+                        ),
+                        spot_filled_qty=total_spot_filled,
+                        derivative_filled_qty=total_derivative_filled,
+                        spot_avg_price=spot_avg,
+                        derivative_avg_price=deriv_avg,
+                        ledger_entry_id=ledger_entry_ids[0] if len(ledger_entry_ids) == 1 else None,
+                    )
+                if index < len(planned_batches) and callable(wait_before_next_batch) and not wait_before_next_batch():
+                    return ArbitrageOpenResult(
+                        success=True,
+                        message=(
+                            f"已按停止请求在第 {index}/{len(planned_batches)} 批完成后停止。\n"
                             + "\n".join(batch_messages)
                         ),
                         spot_filled_qty=total_spot_filled,
@@ -1184,7 +2094,40 @@ class ArbitrageExecutor:
         )
 
         try:
-            if request.execution_mode in {"spot_maker_derivative_taker", "derivative_maker_spot_taker"}:
+            if request.execution_mode == "both_maker_first_taker":
+                spot_config = _build_strategy_config(request.spot_inst_id, runtime)
+                deriv_config = _build_strategy_config(request.derivative_inst_id, runtime)
+                derivative_pos_side = "short" if runtime.position_mode == "long_short" else None
+                spot_filled, spot_avg, deriv_filled, deriv_avg = self._execute_spot_derivative_both_maker(
+                    credentials=credentials,
+                    runtime=runtime,
+                    spot_inst=spot_inst,
+                    deriv_inst=deriv_inst,
+                    spot_config=spot_config,
+                    deriv_config=deriv_config,
+                    spot_inst_id=request.spot_inst_id,
+                    deriv_inst_id=request.derivative_inst_id,
+                    planned_derivative_qty=preview.swap_contracts,
+                    spot_side="buy",
+                    deriv_side="sell",
+                    deriv_pos_side=derivative_pos_side,
+                    deriv_reduce_only=False,
+                    maker_wait_seconds=request.maker_wait_seconds,
+                    chase_limit=request.chase_limit,
+                    spot_maker_label_prefix="专业套利现货挂单腿",
+                    deriv_maker_label_prefix="专业套利合约挂单腿",
+                    spot_taker_label="专业套利现货市价补齐腿",
+                    deriv_taker_label="专业套利合约市价补齐腿",
+                )
+                spot_reconciled = reconcile_fill(planned_size=preview.spot_base_qty, filled_size=spot_filled, avg_price=spot_avg)
+                deriv_reconciled = reconcile_fill(
+                    planned_size=preview.swap_contracts,
+                    filled_size=deriv_filled,
+                    avg_price=deriv_avg,
+                )
+                self._logger(format_reconcile_message("现货成交校验", spot_reconciled))
+                self._logger(format_reconcile_message("合约成交校验", deriv_reconciled))
+            elif request.execution_mode in {"spot_maker_derivative_taker", "derivative_maker_spot_taker"}:
                 spot_filled, spot_avg, deriv_filled, deriv_avg = self._open_maker_taker(
                     request,
                     runtime=runtime,
@@ -1411,7 +2354,50 @@ class ArbitrageExecutor:
             f"合约买入 {format_decimal(planned_derivative_qty)} 张 @ {format_decimal(deriv_price)}，"
             f"现货卖出 {format_decimal(planned_spot_qty)} @ {format_decimal(spot_price)}"
         )
-        if request.execution_mode in {"spot_maker_derivative_taker", "derivative_maker_spot_taker"}:
+        if request.execution_mode == "both_maker_first_taker":
+            deriv_config = _build_strategy_config(entry.derivative_inst_id, runtime)
+            spot_config = _build_strategy_config(entry.spot_inst_id, runtime)
+            derivative_pos_side = "short" if runtime.position_mode == "long_short" else "short"
+            spot_filled, spot_avg, deriv_filled, deriv_avg = self._execute_spot_derivative_both_maker(
+                credentials=credentials,
+                runtime=runtime,
+                spot_inst=spot_inst,
+                deriv_inst=deriv_inst,
+                spot_config=spot_config,
+                deriv_config=deriv_config,
+                spot_inst_id=entry.spot_inst_id,
+                deriv_inst_id=entry.derivative_inst_id,
+                planned_derivative_qty=planned_derivative_qty,
+                spot_side="sell",
+                deriv_side="buy",
+                deriv_pos_side=derivative_pos_side,
+                deriv_reduce_only=True,
+                maker_wait_seconds=request.maker_wait_seconds,
+                chase_limit=request.chase_limit,
+                spot_maker_label_prefix="套利平仓现货挂单腿",
+                deriv_maker_label_prefix="套利平仓合约挂单腿",
+                spot_taker_label="套利平仓现货市价补齐腿",
+                deriv_taker_label="套利平仓合约市价补齐腿",
+            )
+            deriv_reconciled = reconcile_fill(
+                planned_size=planned_derivative_qty,
+                filled_size=deriv_filled,
+                avg_price=deriv_avg,
+            )
+            self._logger(format_reconcile_message("平仓合约校验", deriv_reconciled))
+            spot_qty = snap_to_increment(
+                spot_base_from_derivative_fill(
+                    derivative_filled_contracts=deriv_reconciled.filled_size,
+                    derivative_instrument=deriv_inst,
+                ),
+                spot_inst.lot_size,
+                "down",
+            )
+            if spot_qty <= 0:
+                raise OkxApiError("合约平仓后换算现货数量为 0。")
+            spot_reconciled = reconcile_fill(planned_size=spot_qty, filled_size=spot_filled, avg_price=spot_avg)
+            self._logger(format_reconcile_message("平仓现货校验", spot_reconciled))
+        elif request.execution_mode in {"spot_maker_derivative_taker", "derivative_maker_spot_taker"}:
             deriv_filled, deriv_avg, spot_filled, spot_avg = self._close_maker_taker(
                 entry,
                 request,
@@ -1603,6 +2589,8 @@ class ArbitrageExecutor:
         request: ArbitrageRollRequest,
         *,
         runtime: ArbitrageTradeRuntime,
+        should_stop_after_batch: Callable[[], bool] | None = None,
+        wait_before_next_batch: Callable[[], bool] | None = None,
     ) -> ArbitrageRollResult:
         entry = find_ledger_entry(request.entry_id)
         if entry is None or entry.close_mode != "open":
@@ -1633,6 +2621,7 @@ class ArbitrageExecutor:
         total_target_filled = Decimal("0")
         current_avg: Decimal | None = None
         target_avg: Decimal | None = None
+        stopped_after_batch = False
         try:
             for index, batch_qty in enumerate(planned_batches, start=1):
                 self._logger(f"交割合约移仓：第 {index}/{len(planned_batches)} 批，目标 {format_decimal(batch_qty)} 张")
@@ -1654,7 +2643,35 @@ class ArbitrageExecutor:
                 target_avg = self._blend_avg_price(target_avg, total_target_filled, batch_target_avg, batch_target_filled)
                 total_current_filled += batch_current_filled
                 total_target_filled += batch_target_filled
+                if index < len(planned_batches) and callable(should_stop_after_batch) and should_stop_after_batch():
+                    self._logger(f"已按停止请求在第 {index}/{len(planned_batches)} 批完成后停止后续批次。")
+                    break
         except OkxApiError as exc:
+            if total_current_filled > 0 and total_current_filled == total_target_filled:
+                ledger_suffix = "未更新本地套利账本（来源为当前现有持仓）。"
+                if tracked_by_ledger:
+                    self._persist_roll_progress_if_tracked(
+                        entry=entry,
+                        request=request,
+                        current_inst=current_inst,
+                        spot_inst=spot_inst,
+                        total_current_filled=total_current_filled,
+                        total_target_filled=total_target_filled,
+                        target_avg=target_avg,
+                    )
+                    ledger_suffix = "已按已完成部分更新本地套利账本。"
+                return ArbitrageRollResult(
+                    success=False,
+                    message=(
+                        f"移仓部分完成后中断：已成对移仓 {format_decimal(total_current_filled)} 张。"
+                        f"原因：{exc} {ledger_suffix}"
+                    ),
+                    rolled_derivative_qty=total_current_filled,
+                    target_derivative_filled_qty=total_target_filled,
+                    current_derivative_avg_price=current_avg,
+                    target_derivative_avg_price=target_avg,
+                    entry_id=entry.entry_id or None,
+                )
             return ArbitrageRollResult(
                 success=False,
                 message=(
@@ -1678,97 +2695,31 @@ class ArbitrageExecutor:
                 entry_id=entry.entry_id,
             )
 
-        rolled_spot_qty = (
-            entry.spot_qty
-            if total_current_filled >= entry.derivative_qty
-            else snap_to_increment(
-                entry.spot_qty * total_current_filled / max(entry.derivative_qty, Decimal("1e-18")),
-                spot_inst.lot_size,
-                "down",
-            )
+        self._persist_roll_progress_if_tracked(
+            entry=entry,
+            request=request,
+            current_inst=current_inst,
+            spot_inst=spot_inst,
+            total_current_filled=total_current_filled,
+            total_target_filled=total_target_filled,
+            target_avg=target_avg,
         )
-        if rolled_spot_qty <= 0:
-            rolled_spot_qty = entry.spot_qty
-        remaining_derivative_qty = snap_to_increment(
-            max(entry.derivative_qty - total_current_filled, Decimal("0")),
-            current_inst.lot_size,
-            "down",
-        )
-        remaining_spot_qty = snap_to_increment(
-            max(entry.spot_qty - rolled_spot_qty, Decimal("0")),
-            spot_inst.lot_size,
-            "down",
-        )
-        moved_note = f"移仓：{entry.derivative_inst_id} -> {request.target_derivative_inst_id}"
 
-        if remaining_derivative_qty > 0 and remaining_spot_qty > 0:
-            updated_current = ArbitrageLedgerEntry(
+        if stopped_after_batch:
+            message = (
+                f"已按停止请求在当前批次完成后停止：回补 {entry.derivative_inst_id} {format_decimal(total_current_filled)} 张，"
+                f"开出 {request.target_derivative_inst_id} {format_decimal(total_target_filled)} 张。"
+            )
+            self._logger(message)
+            return ArbitrageRollResult(
+                success=True,
+                message=message,
+                rolled_derivative_qty=total_current_filled,
+                target_derivative_filled_qty=total_target_filled,
+                current_derivative_avg_price=current_avg,
+                target_derivative_avg_price=target_avg,
                 entry_id=entry.entry_id,
-                base_ccy=entry.base_ccy,
-                pair_kind=entry.pair_kind,
-                spot_inst_id=entry.spot_inst_id,
-                derivative_inst_id=entry.derivative_inst_id,
-                spot_qty=remaining_spot_qty,
-                derivative_qty=remaining_derivative_qty,
-                open_spot_price=entry.open_spot_price,
-                open_derivative_price=entry.open_derivative_price,
-                close_spot_price=None,
-                close_derivative_price=None,
-                basis_at_open_pct=entry.basis_at_open_pct,
-                fee_total=entry.fee_total,
-                funding_total=entry.funding_total,
-                realized_pnl=None,
-                close_mode="open",
-                opened_at=entry.opened_at,
-                closed_at=None,
-                notes=entry.notes,
             )
-            upsert_ledger_entry(updated_current)
-            new_entry = ArbitrageLedgerEntry(
-                entry_id=uuid.uuid4().hex,
-                base_ccy=entry.base_ccy,
-                pair_kind=entry.pair_kind,
-                spot_inst_id=entry.spot_inst_id,
-                derivative_inst_id=request.target_derivative_inst_id,
-                spot_qty=rolled_spot_qty,
-                derivative_qty=total_target_filled,
-                open_spot_price=entry.open_spot_price,
-                open_derivative_price=target_avg,
-                close_spot_price=None,
-                close_derivative_price=None,
-                basis_at_open_pct=entry.basis_at_open_pct,
-                fee_total=Decimal("0"),
-                funding_total=Decimal("0"),
-                realized_pnl=None,
-                close_mode="open",
-                opened_at=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-                closed_at=None,
-                notes=(entry.notes + " | " + moved_note) if entry.notes else moved_note,
-            )
-            upsert_ledger_entry(new_entry)
-        else:
-            updated_entry = ArbitrageLedgerEntry(
-                entry_id=entry.entry_id,
-                base_ccy=entry.base_ccy,
-                pair_kind=entry.pair_kind,
-                spot_inst_id=entry.spot_inst_id,
-                derivative_inst_id=request.target_derivative_inst_id,
-                spot_qty=entry.spot_qty,
-                derivative_qty=total_target_filled,
-                open_spot_price=entry.open_spot_price,
-                open_derivative_price=target_avg,
-                close_spot_price=None,
-                close_derivative_price=None,
-                basis_at_open_pct=entry.basis_at_open_pct,
-                fee_total=entry.fee_total,
-                funding_total=entry.funding_total,
-                realized_pnl=None,
-                close_mode="open",
-                opened_at=entry.opened_at,
-                closed_at=None,
-                notes=(entry.notes + " | " + moved_note) if entry.notes else moved_note,
-            )
-            upsert_ledger_entry(updated_entry)
 
         message = (
             f"移仓完成：回补 {entry.derivative_inst_id} {format_decimal(total_current_filled)} 张，"
@@ -1790,6 +2741,8 @@ class ArbitrageExecutor:
         request: ArbitrageRollRequest,
         *,
         runtime: ArbitrageTradeRuntime,
+        should_stop_after_batch: Callable[[], bool] | None = None,
+        wait_before_next_batch: Callable[[], bool] | None = None,
     ) -> ArbitrageRollResult:
         tracked_by_ledger = bool(request.entry_id)
         if request.entry_id:
@@ -1851,6 +2804,7 @@ class ArbitrageExecutor:
         total_target_filled = Decimal("0")
         current_avg: Decimal | None = None
         target_avg: Decimal | None = None
+        stopped_after_batch = False
         try:
             for index, batch_qty in enumerate(planned_batches, start=1):
                 self._logger(f"交割合约移仓：第 {index}/{len(planned_batches)} 批，目标 {format_decimal(batch_qty)} 张")
@@ -1872,7 +2826,39 @@ class ArbitrageExecutor:
                 target_avg = self._blend_avg_price(target_avg, total_target_filled, batch_target_avg, batch_target_filled)
                 total_current_filled += batch_current_filled
                 total_target_filled += batch_target_filled
+                if index < len(planned_batches) and callable(should_stop_after_batch) and should_stop_after_batch():
+                    self._logger(f"已按停止请求在第 {index}/{len(planned_batches)} 批完成后停止后续批次。")
+                    stopped_after_batch = True
+                    break
+                if index < len(planned_batches) and callable(wait_before_next_batch) and not wait_before_next_batch():
+                    stopped_after_batch = True
+                    break
         except OkxApiError as exc:
+            if total_current_filled > 0 and total_current_filled == total_target_filled:
+                ledger_suffix = "未更新本地套利账本（来源为当前现有持仓）。"
+                if tracked_by_ledger:
+                    self._persist_roll_progress_if_tracked(
+                        entry=entry,
+                        request=request,
+                        current_inst=current_inst,
+                        spot_inst=spot_inst,
+                        total_current_filled=total_current_filled,
+                        total_target_filled=total_target_filled,
+                        target_avg=target_avg,
+                    )
+                    ledger_suffix = "已按已完成部分更新本地套利账本。"
+                return ArbitrageRollResult(
+                    success=False,
+                    message=(
+                        f"移仓部分完成后中断：已成对移仓 {format_decimal(total_current_filled)} 张。"
+                        f"原因：{exc} {ledger_suffix}"
+                    ),
+                    rolled_derivative_qty=total_current_filled,
+                    target_derivative_filled_qty=total_target_filled,
+                    current_derivative_avg_price=current_avg,
+                    target_derivative_avg_price=target_avg,
+                    entry_id=entry.entry_id or None,
+                )
             return ArbitrageRollResult(
                 success=False,
                 message=(
@@ -1886,6 +2872,31 @@ class ArbitrageExecutor:
                 entry_id=entry.entry_id or None,
             )
         except Exception as exc:
+            if total_current_filled > 0 and total_current_filled == total_target_filled:
+                ledger_suffix = "未更新本地套利账本（来源为当前现有持仓）。"
+                if tracked_by_ledger:
+                    self._persist_roll_progress_if_tracked(
+                        entry=entry,
+                        request=request,
+                        current_inst=current_inst,
+                        spot_inst=spot_inst,
+                        total_current_filled=total_current_filled,
+                        total_target_filled=total_target_filled,
+                        target_avg=target_avg,
+                    )
+                    ledger_suffix = "已按已完成部分更新本地套利账本。"
+                return ArbitrageRollResult(
+                    success=False,
+                    message=(
+                        f"移仓部分完成后中断：已成对移仓 {format_decimal(total_current_filled)} 张。"
+                        f"原因：{exc} {ledger_suffix}"
+                    ),
+                    rolled_derivative_qty=total_current_filled,
+                    target_derivative_filled_qty=total_target_filled,
+                    current_derivative_avg_price=current_avg,
+                    target_derivative_avg_price=target_avg,
+                    entry_id=entry.entry_id or None,
+                )
             return ArbitrageRollResult(
                 success=False,
                 message=f"移仓异常：{exc}",
@@ -1894,6 +2905,23 @@ class ArbitrageExecutor:
                 current_derivative_avg_price=current_avg,
                 target_derivative_avg_price=target_avg,
                 entry_id=entry.entry_id or None,
+            )
+
+        if stopped_after_batch and not tracked_by_ledger:
+            message = (
+                f"已按停止请求在当前批次完成后停止：回补 {entry.derivative_inst_id} {format_decimal(total_current_filled)} 张，"
+                f"开出 {request.target_derivative_inst_id} {format_decimal(total_target_filled)} 张。"
+                "未更新本地套利账本（来源为当前现有持仓）。"
+            )
+            self._logger(message)
+            return ArbitrageRollResult(
+                success=True,
+                message=message,
+                rolled_derivative_qty=total_current_filled,
+                target_derivative_filled_qty=total_target_filled,
+                current_derivative_avg_price=current_avg,
+                target_derivative_avg_price=target_avg,
+                entry_id=None,
             )
 
         if not tracked_by_ledger:
@@ -1913,6 +2941,58 @@ class ArbitrageExecutor:
                 entry_id=None,
             )
 
+        self._persist_roll_progress_if_tracked(
+            entry=entry,
+            request=request,
+            current_inst=current_inst,
+            spot_inst=spot_inst,
+            total_current_filled=total_current_filled,
+            total_target_filled=total_target_filled,
+            target_avg=target_avg,
+        )
+
+        if stopped_after_batch:
+            message = (
+                f"已按停止请求在当前批次完成后停止：回补 {entry.derivative_inst_id} {format_decimal(total_current_filled)} 张，"
+                f"开出 {request.target_derivative_inst_id} {format_decimal(total_target_filled)} 张。"
+            )
+            self._logger(message)
+            return ArbitrageRollResult(
+                success=True,
+                message=message,
+                rolled_derivative_qty=total_current_filled,
+                target_derivative_filled_qty=total_target_filled,
+                current_derivative_avg_price=current_avg,
+                target_derivative_avg_price=target_avg,
+                entry_id=entry.entry_id,
+            )
+
+        message = (
+            f"移仓完成：回补 {entry.derivative_inst_id} {format_decimal(total_current_filled)} 张，"
+            f"开出 {request.target_derivative_inst_id} {format_decimal(total_target_filled)} 张。"
+        )
+        self._logger(message)
+        return ArbitrageRollResult(
+            success=True,
+            message=message,
+            rolled_derivative_qty=total_current_filled,
+            target_derivative_filled_qty=total_target_filled,
+            current_derivative_avg_price=current_avg,
+            target_derivative_avg_price=target_avg,
+            entry_id=entry.entry_id,
+        )
+
+    def _persist_roll_progress_if_tracked(
+        self,
+        *,
+        entry: ArbitrageLedgerEntry,
+        request: ArbitrageRollRequest,
+        current_inst,
+        spot_inst,
+        total_current_filled: Decimal,
+        total_target_filled: Decimal,
+        target_avg: Decimal | None,
+    ) -> None:
         rolled_spot_qty = (
             entry.spot_qty
             if total_current_filled >= entry.derivative_qty
@@ -1981,44 +3061,30 @@ class ArbitrageExecutor:
                 notes=(entry.notes + " | " + moved_note) if entry.notes else moved_note,
             )
             upsert_ledger_entry(new_entry)
-        else:
-            updated_entry = ArbitrageLedgerEntry(
-                entry_id=entry.entry_id,
-                base_ccy=entry.base_ccy,
-                pair_kind=entry.pair_kind,
-                spot_inst_id=entry.spot_inst_id,
-                derivative_inst_id=request.target_derivative_inst_id,
-                spot_qty=entry.spot_qty,
-                derivative_qty=total_target_filled,
-                open_spot_price=entry.open_spot_price,
-                open_derivative_price=target_avg,
-                close_spot_price=None,
-                close_derivative_price=None,
-                basis_at_open_pct=entry.basis_at_open_pct,
-                fee_total=entry.fee_total,
-                funding_total=entry.funding_total,
-                realized_pnl=None,
-                close_mode="open",
-                opened_at=entry.opened_at,
-                closed_at=None,
-                notes=(entry.notes + " | " + moved_note) if entry.notes else moved_note,
-            )
-            upsert_ledger_entry(updated_entry)
+            return
 
-        message = (
-            f"移仓完成：回补 {entry.derivative_inst_id} {format_decimal(total_current_filled)} 张，"
-            f"开出 {request.target_derivative_inst_id} {format_decimal(total_target_filled)} 张。"
-        )
-        self._logger(message)
-        return ArbitrageRollResult(
-            success=True,
-            message=message,
-            rolled_derivative_qty=total_current_filled,
-            target_derivative_filled_qty=total_target_filled,
-            current_derivative_avg_price=current_avg,
-            target_derivative_avg_price=target_avg,
+        updated_entry = ArbitrageLedgerEntry(
             entry_id=entry.entry_id,
+            base_ccy=entry.base_ccy,
+            pair_kind=entry.pair_kind,
+            spot_inst_id=entry.spot_inst_id,
+            derivative_inst_id=request.target_derivative_inst_id,
+            spot_qty=entry.spot_qty,
+            derivative_qty=total_target_filled,
+            open_spot_price=entry.open_spot_price,
+            open_derivative_price=target_avg,
+            close_spot_price=None,
+            close_derivative_price=None,
+            basis_at_open_pct=entry.basis_at_open_pct,
+            fee_total=entry.fee_total,
+            funding_total=entry.funding_total,
+            realized_pnl=None,
+            close_mode="open",
+            opened_at=entry.opened_at,
+            closed_at=None,
+            notes=(entry.notes + " | " + moved_note) if entry.notes else moved_note,
         )
+        upsert_ledger_entry(updated_entry)
 
     def _roll_single_batch(
         self,
@@ -2045,12 +3111,19 @@ class ArbitrageExecutor:
             current_avg: Decimal | None = None
             target_avg: Decimal | None = None
             remaining_qty = planned_derivative_qty
+            post_cancel_settle_seconds = _post_cancel_settle_seconds_for_mode(request.execution_mode)
+            post_cancel_recovery_seconds = _post_cancel_recovery_seconds_for_mode(request.execution_mode)
             for attempt in range(max(0, request.chase_limit) + 1):
                 if remaining_qty < current_inst.min_size or remaining_qty < target_inst.min_size:
                     break
-                current_order = self._client.place_simple_order(
+                self._logger(
+                    f"移仓双边挂单：第 {attempt + 1}/{max(0, request.chase_limit) + 1} 次尝试，"
+                    f"本次计划 {format_decimal(remaining_qty)} 张，挂单等待 {request.maker_wait_seconds} 秒。"
+                )
+                current_order = self._place_simple_order_with_recovery(
                     credentials,
                     current_config,
+                    label=f"移仓旧合约挂单腿 第 {attempt + 1} 次",
                     inst_id=entry.derivative_inst_id,
                     side=current_close_side,
                     size=remaining_qty,
@@ -2064,9 +3137,10 @@ class ArbitrageExecutor:
                     reduce_only=True,
                     cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
                 )
-                target_order = self._client.place_simple_order(
+                target_order = self._place_simple_order_with_recovery(
                     credentials,
                     target_config,
+                    label=f"移仓目标合约挂单腿 第 {attempt + 1} 次",
                     inst_id=request.target_derivative_inst_id,
                     side=target_open_side,
                     size=remaining_qty,
@@ -2098,64 +3172,83 @@ class ArbitrageExecutor:
                     current_label=f"移仓旧合约双边挂单腿 第 {attempt + 1} 次",
                     target_label=f"移仓目标合约双边挂单腿 第 {attempt + 1} 次",
                 )
-                self._cancel_order_safely(
-                    credentials=credentials,
-                    config=current_config,
-                    inst_id=entry.derivative_inst_id,
-                    ord_id=current_order.ord_id,
-                )
-                self._cancel_order_safely(
-                    credentials=credentials,
-                    config=target_config,
-                    inst_id=request.target_derivative_inst_id,
-                    ord_id=target_order.ord_id,
-                )
                 if not any_maker_filled:
-                    if attempt >= request.chase_limit:
-                        if request.force_execution_completion:
-                            (
-                                fallback_current_filled,
-                                fallback_current_avg,
-                                fallback_target_filled,
-                                fallback_target_avg,
-                            ) = self._execute_roll_completion_taker_pair(
-                                credentials=credentials,
-                                current_config=current_config,
-                                target_config=target_config,
-                                current_inst_id=entry.derivative_inst_id,
-                                target_inst_id=request.target_derivative_inst_id,
-                                current_close_side=current_close_side,
-                                target_open_side=target_open_side,
-                                remaining_qty=remaining_qty,
-                                derivative_pos_side=derivative_pos_side,
-                                reason="双边挂单腿均未成交，已达到最大追单次数",
-                            )
-                            current_avg = self._blend_avg_price(
-                                current_avg,
-                                total_current_filled,
-                                fallback_current_avg,
-                                fallback_current_filled,
-                            )
-                            target_avg = self._blend_avg_price(
-                                target_avg,
-                                total_target_filled,
-                                fallback_target_avg,
-                                fallback_target_filled,
-                            )
-                            total_current_filled += fallback_current_filled
-                            total_target_filled += fallback_target_filled
-                            balanced_filled = min(total_current_filled, total_target_filled)
-                            remaining_qty = max(planned_derivative_qty - balanced_filled, Decimal("0"))
-                            if remaining_qty < current_inst.min_size or remaining_qty < target_inst.min_size:
-                                break
-                            continue
-                        raise OkxApiError("双边挂单腿均未成交，已达到最大追单次数。")
-                    continue
-
-                current_batch_filled = current_maker_filled
-                target_batch_filled = target_maker_filled
-                batch_current_avg = current_maker_avg
-                batch_target_avg = target_maker_avg
+                    (
+                        current_batch_filled,
+                        batch_current_avg,
+                        target_batch_filled,
+                        batch_target_avg,
+                    ) = self._cancel_dual_maker_orders_and_capture_fills(
+                        credentials=credentials,
+                        current_config=current_config,
+                        target_config=target_config,
+                        current_inst_id=entry.derivative_inst_id,
+                        target_inst_id=request.target_derivative_inst_id,
+                        current_ord_id=current_order.ord_id,
+                        target_ord_id=target_order.ord_id,
+                        current_filled=current_maker_filled,
+                        current_avg=current_maker_avg,
+                        target_filled=target_maker_filled,
+                        target_avg=target_maker_avg,
+                        settle_seconds=post_cancel_settle_seconds,
+                        recovery_seconds=post_cancel_recovery_seconds,
+                    )
+                    if current_batch_filled <= 0 and target_batch_filled <= 0:
+                        if attempt >= request.chase_limit:
+                            if request.force_execution_completion:
+                                (
+                                    total_current_filled,
+                                    current_avg,
+                                    total_target_filled,
+                                    target_avg,
+                                ) = self._complete_roll_batch_gaps(
+                                    credentials=credentials,
+                                    current_config=current_config,
+                                    target_config=target_config,
+                                    current_inst_id=entry.derivative_inst_id,
+                                    target_inst_id=request.target_derivative_inst_id,
+                                    current_close_side=current_close_side,
+                                    target_open_side=target_open_side,
+                                    planned_qty=planned_derivative_qty,
+                                    current_filled=total_current_filled,
+                                    current_avg=current_avg,
+                                    target_filled=total_target_filled,
+                                    target_avg=target_avg,
+                                    derivative_pos_side=derivative_pos_side,
+                                    reason="双边挂单腿均未成交，自动补齐剩余批次",
+                                )
+                                balanced_filled = min(total_current_filled, total_target_filled)
+                                remaining_qty = max(planned_derivative_qty - balanced_filled, Decimal("0"))
+                                if remaining_qty < current_inst.min_size or remaining_qty < target_inst.min_size:
+                                    break
+                                continue
+                            raise OkxApiError("双边挂单腿均未成交，已达到最大追单次数。")
+                        self._logger("双边挂单本轮确认零成交：撤单后无残留成交，准备按最新盘口进入下一轮重挂。")
+                        continue
+                    self._logger("双边挂单在撤单确认期间出现晚到成交，已按最新成交差额继续补齐。")
+                else:
+                    (
+                        current_batch_filled,
+                        batch_current_avg,
+                        target_batch_filled,
+                        batch_target_avg,
+                    ) = self._cancel_dual_maker_orders_and_capture_fills(
+                        credentials=credentials,
+                        current_config=current_config,
+                        target_config=target_config,
+                        current_inst_id=entry.derivative_inst_id,
+                        target_inst_id=request.target_derivative_inst_id,
+                        current_ord_id=current_order.ord_id,
+                        target_ord_id=target_order.ord_id,
+                        current_filled=current_maker_filled,
+                        current_avg=current_maker_avg,
+                        target_filled=target_maker_filled,
+                        target_avg=target_maker_avg,
+                        settle_seconds=post_cancel_settle_seconds,
+                        recovery_seconds=post_cancel_recovery_seconds,
+                    )
+                if current_batch_filled != current_maker_filled or target_batch_filled != target_maker_filled:
+                    self._logger("双边挂单出现单腿先成，已撤单并按最新成交差额立即补齐。")
                 if current_batch_filled > target_batch_filled:
                     hedge_qty = current_batch_filled - target_batch_filled
                     target_taker_filled, target_taker_avg = self._execute_taker_leg(
@@ -2198,11 +3291,11 @@ class ArbitrageExecutor:
                     if attempt >= request.chase_limit:
                         if request.force_execution_completion:
                             (
-                                fallback_current_filled,
-                                fallback_current_avg,
-                                fallback_target_filled,
-                                fallback_target_avg,
-                            ) = self._execute_roll_completion_taker_pair(
+                                total_current_filled,
+                                current_avg,
+                                total_target_filled,
+                                target_avg,
+                            ) = self._complete_roll_batch_gaps(
                                 credentials=credentials,
                                 current_config=current_config,
                                 target_config=target_config,
@@ -2210,31 +3303,46 @@ class ArbitrageExecutor:
                                 target_inst_id=request.target_derivative_inst_id,
                                 current_close_side=current_close_side,
                                 target_open_side=target_open_side,
-                                remaining_qty=remaining_qty,
+                                planned_qty=planned_derivative_qty,
+                                current_filled=total_current_filled,
+                                current_avg=current_avg,
+                                target_filled=total_target_filled,
+                                target_avg=target_avg,
                                 derivative_pos_side=derivative_pos_side,
-                                reason="双边挂单已有成交但未形成有效双腿移仓成交",
+                                reason="双边挂单已有成交但未形成有效双腿，自动补齐剩余批次",
                             )
-                            current_avg = self._blend_avg_price(
-                                current_avg,
-                                total_current_filled,
-                                fallback_current_avg,
-                                fallback_current_filled,
-                            )
-                            target_avg = self._blend_avg_price(
-                                target_avg,
-                                total_target_filled,
-                                fallback_target_avg,
-                                fallback_target_filled,
-                            )
-                            total_current_filled += fallback_current_filled
-                            total_target_filled += fallback_target_filled
                             balanced_filled = min(total_current_filled, total_target_filled)
                             remaining_qty = max(planned_derivative_qty - balanced_filled, Decimal("0"))
                             if remaining_qty < current_inst.min_size or remaining_qty < target_inst.min_size:
                                 break
                             continue
                         raise OkxApiError("双边挂单已有成交但未形成有效双腿移仓成交。")
+                    self._logger("旧合约挂单腿本轮确认零成交：撤单后无残留成交，准备按最新盘口进入下一轮重挂。")
                     continue
+                if request.force_execution_completion and (
+                    current_batch_filled < remaining_qty or target_batch_filled < remaining_qty
+                ):
+                    (
+                        current_batch_filled,
+                        batch_current_avg,
+                        target_batch_filled,
+                        batch_target_avg,
+                    ) = self._complete_roll_batch_gaps(
+                        credentials=credentials,
+                        current_config=current_config,
+                        target_config=target_config,
+                        current_inst_id=entry.derivative_inst_id,
+                        target_inst_id=request.target_derivative_inst_id,
+                        current_close_side=current_close_side,
+                        target_open_side=target_open_side,
+                        planned_qty=remaining_qty,
+                        current_filled=current_batch_filled,
+                        current_avg=batch_current_avg,
+                        target_filled=target_batch_filled,
+                        target_avg=batch_target_avg,
+                        derivative_pos_side=derivative_pos_side,
+                        reason="双边挂单批次只部分成交，自动补齐到本批目标张数",
+                    )
                 current_avg = self._blend_avg_price(
                     current_avg,
                     total_current_filled,
@@ -2255,6 +3363,28 @@ class ArbitrageExecutor:
                     break
             if total_current_filled <= 0 or total_target_filled <= 0:
                 raise OkxApiError("当前未形成有效的交割合约双边挂单移仓成交。")
+            if total_current_filled < planned_derivative_qty or total_target_filled < planned_derivative_qty:
+                if request.force_execution_completion:
+                    return self._complete_roll_batch_gaps(
+                        credentials=credentials,
+                        current_config=current_config,
+                        target_config=target_config,
+                        current_inst_id=entry.derivative_inst_id,
+                        target_inst_id=request.target_derivative_inst_id,
+                        current_close_side=current_close_side,
+                        target_open_side=target_open_side,
+                        planned_qty=planned_derivative_qty,
+                        current_filled=total_current_filled,
+                        current_avg=current_avg,
+                        target_filled=total_target_filled,
+                        target_avg=target_avg,
+                        derivative_pos_side=derivative_pos_side,
+                        reason="双边挂单批次结束时仍有未完成张数",
+                    )
+                raise OkxApiError(
+                    f"双边挂单批次未完成：计划 {format_decimal(planned_derivative_qty)} 张，"
+                    f"实际旧合约 {format_decimal(total_current_filled)} / 目标合约 {format_decimal(total_target_filled)}。"
+                )
             return total_current_filled, current_avg, total_target_filled, target_avg
 
         if request.execution_mode == "old_maker_new_taker":
@@ -2263,12 +3393,19 @@ class ArbitrageExecutor:
             current_avg: Decimal | None = None
             target_avg: Decimal | None = None
             remaining_qty = planned_derivative_qty
+            post_cancel_settle_seconds = _post_cancel_settle_seconds_for_mode(request.execution_mode)
+            post_cancel_recovery_seconds = _post_cancel_recovery_seconds_for_mode(request.execution_mode)
             for attempt in range(max(0, request.chase_limit) + 1):
                 if remaining_qty < current_inst.min_size:
                     break
-                current_order = self._client.place_simple_order(
+                self._logger(
+                    f"移仓旧合约挂单：第 {attempt + 1}/{max(0, request.chase_limit) + 1} 次尝试，"
+                    f"本次计划 {format_decimal(remaining_qty)} 张，挂单等待 {request.maker_wait_seconds} 秒。"
+                )
+                current_order = self._place_simple_order_with_recovery(
                     credentials,
                     current_config,
+                    label=f"移仓旧合约挂单腿 第 {attempt + 1} 次",
                     inst_id=entry.derivative_inst_id,
                     side=current_close_side,
                     size=remaining_qty,
@@ -2292,19 +3429,33 @@ class ArbitrageExecutor:
                     label=f"移仓旧合约挂单腿 第 {attempt + 1} 次",
                 )
                 if not current_done:
-                    try:
-                        self._client.cancel_order(credentials, current_config, inst_id=entry.derivative_inst_id, ord_id=current_order.ord_id)
-                    except Exception:
-                        pass
+                    self._cancel_order_safely(
+                        credentials=credentials,
+                        config=current_config,
+                        inst_id=entry.derivative_inst_id,
+                        ord_id=current_order.ord_id,
+                        label=f"移仓旧合约挂单腿 第 {attempt + 1} 次",
+                    )
+                    current_filled, current_avg_once, _ = self._wait_order_terminal_after_cancel_with_recovery(
+                        credentials=credentials,
+                        config=current_config,
+                        inst_id=entry.derivative_inst_id,
+                        ord_id=current_order.ord_id,
+                        known_filled=current_filled,
+                        known_avg=current_avg_once,
+                        settle_seconds=post_cancel_settle_seconds,
+                        recovery_seconds=post_cancel_recovery_seconds,
+                        label=f"移仓旧合约挂单腿 第 {attempt + 1} 次",
+                    )
                 if current_filled <= 0:
                     if attempt >= request.chase_limit:
                         if request.force_execution_completion:
                             (
-                                fallback_current_filled,
-                                fallback_current_avg,
-                                fallback_target_filled,
-                                fallback_target_avg,
-                            ) = self._execute_roll_completion_taker_pair(
+                                total_current_filled,
+                                current_avg,
+                                total_target_filled,
+                                target_avg,
+                            ) = self._complete_roll_batch_gaps(
                                 credentials=credentials,
                                 current_config=current_config,
                                 target_config=target_config,
@@ -2312,29 +3463,20 @@ class ArbitrageExecutor:
                                 target_inst_id=request.target_derivative_inst_id,
                                 current_close_side=current_close_side,
                                 target_open_side=target_open_side,
-                                remaining_qty=remaining_qty,
+                                planned_qty=planned_derivative_qty,
+                                current_filled=total_current_filled,
+                                current_avg=current_avg,
+                                target_filled=total_target_filled,
+                                target_avg=target_avg,
                                 derivative_pos_side=derivative_pos_side,
-                                reason="旧合约挂单腿未成交，已达到最大追单次数",
+                                reason="旧合约挂单腿未成交，自动补齐剩余批次",
                             )
-                            current_avg = self._blend_avg_price(
-                                current_avg,
-                                total_current_filled,
-                                fallback_current_avg,
-                                fallback_current_filled,
-                            )
-                            target_avg = self._blend_avg_price(
-                                target_avg,
-                                total_target_filled,
-                                fallback_target_avg,
-                                fallback_target_filled,
-                            )
-                            total_current_filled += fallback_current_filled
-                            total_target_filled += fallback_target_filled
                             remaining_qty = max(planned_derivative_qty - min(total_current_filled, total_target_filled), Decimal("0"))
                             if remaining_qty < current_inst.min_size:
                                 break
                             continue
                         raise OkxApiError("旧合约挂单腿未成交，已达到最大追单次数。")
+                    self._logger("目标合约挂单腿本轮确认零成交：撤单后无残留成交，准备按最新盘口进入下一轮重挂。")
                     continue
                 target_filled_once, target_avg_once = self._execute_taker_leg(
                     credentials=credentials,
@@ -2345,6 +3487,28 @@ class ArbitrageExecutor:
                     label="移仓目标合约吃单腿",
                     pos_side=derivative_pos_side,
                 )
+                if request.force_execution_completion and target_filled_once < current_filled:
+                    (
+                        current_filled,
+                        current_avg_once,
+                        target_filled_once,
+                        target_avg_once,
+                    ) = self._complete_roll_batch_gaps(
+                        credentials=credentials,
+                        current_config=current_config,
+                        target_config=target_config,
+                        current_inst_id=entry.derivative_inst_id,
+                        target_inst_id=request.target_derivative_inst_id,
+                        current_close_side=current_close_side,
+                        target_open_side=target_open_side,
+                        planned_qty=current_filled,
+                        current_filled=current_filled,
+                        current_avg=current_avg_once,
+                        target_filled=target_filled_once,
+                        target_avg=target_avg_once,
+                        derivative_pos_side=derivative_pos_side,
+                        reason="旧合约挂单后，目标合约吃单腿未完全成交",
+                    )
                 current_avg = self._blend_avg_price(current_avg, total_current_filled, current_avg_once, current_filled)
                 target_avg = self._blend_avg_price(target_avg, total_target_filled, target_avg_once, target_filled_once)
                 total_current_filled += current_filled
@@ -2352,6 +3516,28 @@ class ArbitrageExecutor:
                 remaining_qty = max(planned_derivative_qty - total_current_filled, Decimal("0"))
             if total_current_filled <= 0 or total_target_filled <= 0:
                 raise OkxApiError("当前未形成有效的交割合约移仓成交。")
+            if total_current_filled < planned_derivative_qty or total_target_filled < planned_derivative_qty:
+                if request.force_execution_completion:
+                    return self._complete_roll_batch_gaps(
+                        credentials=credentials,
+                        current_config=current_config,
+                        target_config=target_config,
+                        current_inst_id=entry.derivative_inst_id,
+                        target_inst_id=request.target_derivative_inst_id,
+                        current_close_side=current_close_side,
+                        target_open_side=target_open_side,
+                        planned_qty=planned_derivative_qty,
+                        current_filled=total_current_filled,
+                        current_avg=current_avg,
+                        target_filled=total_target_filled,
+                        target_avg=target_avg,
+                        derivative_pos_side=derivative_pos_side,
+                        reason="旧合约挂单批次结束时仍有未完成张数",
+                    )
+                raise OkxApiError(
+                    f"旧合约挂单批次未完成：计划 {format_decimal(planned_derivative_qty)} 张，"
+                    f"实际旧合约 {format_decimal(total_current_filled)} / 目标合约 {format_decimal(total_target_filled)}。"
+                )
             return total_current_filled, current_avg, total_target_filled, target_avg
 
         if request.execution_mode == "new_maker_old_taker":
@@ -2360,12 +3546,19 @@ class ArbitrageExecutor:
             current_avg: Decimal | None = None
             target_avg: Decimal | None = None
             remaining_qty = planned_derivative_qty
+            post_cancel_settle_seconds = _post_cancel_settle_seconds_for_mode(request.execution_mode)
+            post_cancel_recovery_seconds = _post_cancel_recovery_seconds_for_mode(request.execution_mode)
             for attempt in range(max(0, request.chase_limit) + 1):
                 if remaining_qty < target_inst.min_size:
                     break
-                target_order = self._client.place_simple_order(
+                self._logger(
+                    f"移仓目标合约挂单：第 {attempt + 1}/{max(0, request.chase_limit) + 1} 次尝试，"
+                    f"本次计划 {format_decimal(remaining_qty)} 张，挂单等待 {request.maker_wait_seconds} 秒。"
+                )
+                target_order = self._place_simple_order_with_recovery(
                     credentials,
                     target_config,
+                    label=f"移仓目标合约挂单腿 第 {attempt + 1} 次",
                     inst_id=request.target_derivative_inst_id,
                     side=target_open_side,
                     size=remaining_qty,
@@ -2389,19 +3582,33 @@ class ArbitrageExecutor:
                     label=f"移仓目标合约挂单腿 第 {attempt + 1} 次",
                 )
                 if not target_done:
-                    try:
-                        self._client.cancel_order(credentials, target_config, inst_id=request.target_derivative_inst_id, ord_id=target_order.ord_id)
-                    except Exception:
-                        pass
+                    self._cancel_order_safely(
+                        credentials=credentials,
+                        config=target_config,
+                        inst_id=request.target_derivative_inst_id,
+                        ord_id=target_order.ord_id,
+                        label=f"移仓目标合约挂单腿 第 {attempt + 1} 次",
+                    )
+                    target_filled, target_avg_once, _ = self._wait_order_terminal_after_cancel_with_recovery(
+                        credentials=credentials,
+                        config=target_config,
+                        inst_id=request.target_derivative_inst_id,
+                        ord_id=target_order.ord_id,
+                        known_filled=target_filled,
+                        known_avg=target_avg_once,
+                        settle_seconds=post_cancel_settle_seconds,
+                        recovery_seconds=post_cancel_recovery_seconds,
+                        label=f"移仓目标合约挂单腿 第 {attempt + 1} 次",
+                    )
                 if target_filled <= 0:
                     if attempt >= request.chase_limit:
                         if request.force_execution_completion:
                             (
-                                fallback_current_filled,
-                                fallback_current_avg,
-                                fallback_target_filled,
-                                fallback_target_avg,
-                            ) = self._execute_roll_completion_taker_pair(
+                                total_current_filled,
+                                current_avg,
+                                total_target_filled,
+                                target_avg,
+                            ) = self._complete_roll_batch_gaps(
                                 credentials=credentials,
                                 current_config=current_config,
                                 target_config=target_config,
@@ -2409,24 +3616,14 @@ class ArbitrageExecutor:
                                 target_inst_id=request.target_derivative_inst_id,
                                 current_close_side=current_close_side,
                                 target_open_side=target_open_side,
-                                remaining_qty=remaining_qty,
+                                planned_qty=planned_derivative_qty,
+                                current_filled=total_current_filled,
+                                current_avg=current_avg,
+                                target_filled=total_target_filled,
+                                target_avg=target_avg,
                                 derivative_pos_side=derivative_pos_side,
-                                reason="目标合约挂单腿未成交，已达到最大追单次数",
+                                reason="目标合约挂单腿未成交，自动补齐剩余批次",
                             )
-                            current_avg = self._blend_avg_price(
-                                current_avg,
-                                total_current_filled,
-                                fallback_current_avg,
-                                fallback_current_filled,
-                            )
-                            target_avg = self._blend_avg_price(
-                                target_avg,
-                                total_target_filled,
-                                fallback_target_avg,
-                                fallback_target_filled,
-                            )
-                            total_current_filled += fallback_current_filled
-                            total_target_filled += fallback_target_filled
                             remaining_qty = max(planned_derivative_qty - min(total_current_filled, total_target_filled), Decimal("0"))
                             if remaining_qty < target_inst.min_size:
                                 break
@@ -2443,6 +3640,28 @@ class ArbitrageExecutor:
                     pos_side=derivative_pos_side,
                     reduce_only=True,
                 )
+                if request.force_execution_completion and current_filled_once < target_filled:
+                    (
+                        current_filled_once,
+                        current_avg_once,
+                        target_filled,
+                        target_avg_once,
+                    ) = self._complete_roll_batch_gaps(
+                        credentials=credentials,
+                        current_config=current_config,
+                        target_config=target_config,
+                        current_inst_id=entry.derivative_inst_id,
+                        target_inst_id=request.target_derivative_inst_id,
+                        current_close_side=current_close_side,
+                        target_open_side=target_open_side,
+                        planned_qty=target_filled,
+                        current_filled=current_filled_once,
+                        current_avg=current_avg_once,
+                        target_filled=target_filled,
+                        target_avg=target_avg_once,
+                        derivative_pos_side=derivative_pos_side,
+                        reason="目标合约挂单后，旧合约吃单腿未完全成交",
+                    )
                 current_avg = self._blend_avg_price(current_avg, total_current_filled, current_avg_once, current_filled_once)
                 target_avg = self._blend_avg_price(target_avg, total_target_filled, target_avg_once, target_filled)
                 total_current_filled += current_filled_once
@@ -2450,6 +3669,28 @@ class ArbitrageExecutor:
                 remaining_qty = max(planned_derivative_qty - total_target_filled, Decimal("0"))
             if total_current_filled <= 0 or total_target_filled <= 0:
                 raise OkxApiError("当前未形成有效的交割合约移仓成交。")
+            if total_current_filled < planned_derivative_qty or total_target_filled < planned_derivative_qty:
+                if request.force_execution_completion:
+                    return self._complete_roll_batch_gaps(
+                        credentials=credentials,
+                        current_config=current_config,
+                        target_config=target_config,
+                        current_inst_id=entry.derivative_inst_id,
+                        target_inst_id=request.target_derivative_inst_id,
+                        current_close_side=current_close_side,
+                        target_open_side=target_open_side,
+                        planned_qty=planned_derivative_qty,
+                        current_filled=total_current_filled,
+                        current_avg=current_avg,
+                        target_filled=total_target_filled,
+                        target_avg=target_avg,
+                        derivative_pos_side=derivative_pos_side,
+                        reason="目标合约挂单批次结束时仍有未完成张数",
+                    )
+                raise OkxApiError(
+                    f"目标合约挂单批次未完成：计划 {format_decimal(planned_derivative_qty)} 张，"
+                    f"实际旧合约 {format_decimal(total_current_filled)} / 目标合约 {format_decimal(total_target_filled)}。"
+                )
             return total_current_filled, current_avg, total_target_filled, target_avg
 
         current_ticker = self._preferred_ticker(entry.derivative_inst_id, environment=runtime.environment)
@@ -2472,9 +3713,10 @@ class ArbitrageExecutor:
         )
         current_ord_type = "limit" if request.use_limit_orders else "market"
         target_ord_type = "limit" if request.use_limit_orders else "market"
-        current_result = self._client.place_simple_order(
+        current_result = self._place_simple_order_with_recovery(
             credentials,
             current_config,
+            label="移仓旧合约腿",
             inst_id=entry.derivative_inst_id,
             side=current_close_side,
             size=planned_derivative_qty,
@@ -2496,9 +3738,10 @@ class ArbitrageExecutor:
         )
         if current_filled <= 0:
             raise OkxApiError("旧合约腿未成交。")
-        target_result = self._client.place_simple_order(
+        target_result = self._place_simple_order_with_recovery(
             credentials,
             target_config,
+            label="移仓目标合约腿",
             inst_id=request.target_derivative_inst_id,
             side=target_open_side,
             size=current_filled,
@@ -2624,7 +3867,13 @@ class ArbitrageExecutor:
                         ws_version, status = ws_payload
             if status is None:
                 if not private_ws_connected or time.time() >= rest_fallback_at:
-                    status = self._client.get_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
+                    status = self._client.get_order(
+                        credentials,
+                        config,
+                        inst_id=inst_id,
+                        ord_id=ord_id,
+                        request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
+                    )
                     rest_fallback_at = time.time() + PRIVATE_WS_STALE_REST_FALLBACK_SECONDS
                 else:
                     cached_status = _get_cached_private_order_status(
