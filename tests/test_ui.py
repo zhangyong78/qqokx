@@ -3280,6 +3280,15 @@ class StrategyTradeTrackingTest(TestCase):
         )
         self.assertIsNotNone(session.active_trade)
         self.assertEqual(session.active_trade.management_mode, "local_trade")
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "本地止损平仓已成交 | ordId=2001 | 标的=ETH-USDT-SWAP | 方向=BUY | 成交均价=2368.42 | 成交数量=0.1张（折合0.1 ETH） | 剩余=0张（折合0 ETH）",
+        )
+        self.assertEqual(session.active_trade.exit_order_id, "2001")
+        self.assertEqual(session.active_trade.exit_price, Decimal("2368.42"))
+        self.assertEqual(session.active_trade.exit_size, Decimal("0.1"))
+        self.assertEqual(session.active_trade.close_reason_hint, "本地止损触发")
 
         QuantApp._track_session_trade_runtime(
             app,
@@ -5593,6 +5602,151 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(result.ledger_record.net_pnl, Decimal("-3.87"))
         self.assertIn("原因=OKX止损触发", result.attribution_summary)
         self.assertIn("累计净盈亏=-3.87", result.cumulative_summary)
+
+    def test_build_strategy_trade_reconciliation_result_prefers_local_close_match_for_same_symbol_history(self) -> None:
+        session = self._make_session()
+        session.strategy_id = "ema55_slope_short"
+        session.strategy_name = "均线斜率做空"
+        session.symbol = "DOGE-USDT-SWAP"
+        session.direction_label = "只做空"
+        session.config = SimpleNamespace(
+            trade_inst_id="DOGE-USDT-SWAP",
+            inst_id="DOGE-USDT-SWAP",
+            environment="demo",
+            run_mode="trade",
+            tp_sl_mode="local_trade",
+            take_profit_mode="dynamic",
+            position_mode="long_short",
+            signal_mode="short_only",
+            strategy_id="ema55_slope_short",
+        )
+        trade = StrategyTradeRuntimeState(
+            round_id="round-s21",
+            signal_bar_at=datetime(2026, 6, 22, 8, 0, 0),
+            opened_logged_at=datetime(2026, 6, 22, 8, 0, 19),
+            closed_logged_at=datetime(2026, 6, 22, 9, 2, 12),
+            entry_order_id="366-entry",
+            exit_order_id="366-exit",
+            entry_price=Decimal("0.08219"),
+            exit_price=Decimal("0.08320"),
+            size=Decimal("6.06"),
+            exit_size=Decimal("6.06"),
+            close_reason_hint="本地止损触发",
+            current_stop_price=Decimal("0.08318"),
+            reconciliation_started=True,
+        )
+        open_ms = int(datetime(2026, 6, 22, 8, 0, 19).timestamp() * 1000)
+        close_ms = int(datetime(2026, 6, 22, 9, 2, 12).timestamp() * 1000)
+        later_ms = int(datetime(2026, 6, 22, 9, 8, 0).timestamp() * 1000)
+        snapshot = StrategyTradeReconciliationSnapshot(
+            effective_environment="demo",
+            order_history=[
+                SimpleNamespace(
+                    client_order_id="",
+                    algo_client_order_id="",
+                    order_id="366-entry",
+                    algo_id="",
+                    inst_id="DOGE-USDT-SWAP",
+                    side="sell",
+                    pos_side="short",
+                    filled_size=Decimal("6.06"),
+                    actual_size=Decimal("6.06"),
+                    avg_price=Decimal("0.08219"),
+                    actual_price=Decimal("0.08219"),
+                    price=Decimal("0.08219"),
+                    fee=Decimal("-0.09"),
+                    pnl=None,
+                    state="filled",
+                    update_time=open_ms,
+                    created_time=open_ms,
+                ),
+                SimpleNamespace(
+                    client_order_id="",
+                    algo_client_order_id="",
+                    order_id="366-exit",
+                    algo_id="",
+                    inst_id="DOGE-USDT-SWAP",
+                    side="buy",
+                    pos_side="short",
+                    filled_size=Decimal("6.06"),
+                    actual_size=Decimal("6.06"),
+                    avg_price=Decimal("0.08320"),
+                    actual_price=Decimal("0.08320"),
+                    price=Decimal("0.08320"),
+                    fee=Decimal("-0.36"),
+                    pnl=Decimal("-4.3215"),
+                    state="filled",
+                    update_time=close_ms,
+                    created_time=close_ms,
+                ),
+            ],
+            fills=[
+                SimpleNamespace(
+                    inst_id="DOGE-USDT-SWAP",
+                    order_id="366-entry",
+                    fill_time=open_ms,
+                    fill_price=Decimal("0.08219"),
+                    fill_size=Decimal("6.06"),
+                    fill_fee=Decimal("-0.09"),
+                    pnl=None,
+                ),
+                SimpleNamespace(
+                    inst_id="DOGE-USDT-SWAP",
+                    order_id="366-exit",
+                    fill_time=close_ms,
+                    fill_price=Decimal("0.08320"),
+                    fill_size=Decimal("6.06"),
+                    fill_fee=Decimal("-0.36"),
+                    pnl=Decimal("-4.3215"),
+                ),
+            ],
+            position_history=[
+                SimpleNamespace(
+                    inst_id="DOGE-USDT-SWAP",
+                    pos_side="short",
+                    close_size=Decimal("6.06"),
+                    open_avg_price=Decimal("0.08219"),
+                    close_avg_price=Decimal("0.08320"),
+                    update_time=close_ms,
+                    pnl=Decimal("-4.3215"),
+                    realized_pnl=Decimal("-4.8625768769212535"),
+                    fee=Decimal("-0.36"),
+                    funding_fee=Decimal("-0.0901668329212535"),
+                ),
+                SimpleNamespace(
+                    inst_id="DOGE-USDT-SWAP",
+                    pos_side="short",
+                    close_size=Decimal("6.06"),
+                    open_avg_price=Decimal("0.08100"),
+                    close_avg_price=Decimal("0.08450"),
+                    update_time=later_ms,
+                    pnl=Decimal("-6.12"),
+                    realized_pnl=Decimal("-6.48"),
+                    fee=Decimal("-0.36"),
+                    funding_fee=Decimal("0"),
+                ),
+            ],
+            account_bills=[],
+        )
+        app = SimpleNamespace(
+            _next_strategy_trade_ledger_record_id=lambda session_, round_id, closed_at: "TS21",
+            _is_funding_fee_bill=QuantApp._is_funding_fee_bill,
+            _position_instruments={},
+            _match_strategy_trade_position_history=lambda items, **kwargs: QuantApp._match_strategy_trade_position_history(
+                items,
+                **kwargs,
+            ),
+        )
+
+        result = QuantApp._build_strategy_trade_reconciliation_result(app, session, trade, snapshot)
+
+        self.assertEqual(result.ledger_record.close_reason, "本地止损触发")
+        self.assertEqual(result.ledger_record.exit_order_id, "366-exit")
+        self.assertEqual(result.ledger_record.gross_pnl, Decimal("-4.3215"))
+        self.assertEqual(result.ledger_record.net_pnl, Decimal("-4.8625768769212535"))
+        self.assertEqual(result.ledger_record.funding_fee, Decimal("-0.0901668329212535"))
+        self.assertIn("原因=本地止损触发", result.attribution_summary)
+        self.assertIn("净盈亏=-4.86", result.attribution_summary)
 
     def test_build_strategy_trade_reconciliation_result_estimates_missing_net_pnl_from_prices(self) -> None:
         session = self._make_session()

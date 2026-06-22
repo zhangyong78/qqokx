@@ -41,3 +41,4 @@ class ArbitrageOpportunityView:
     right_kind: str
     template: str
     description: str = ""
+    is_custom: bool = False

@@ -81,6 +81,7 @@ class ArbitrageRollRequest:
     execution_mode: str = "dual_taker"
     maker_wait_seconds: float = 6.0
     chase_limit: int = 3
+    force_execution_completion: bool = False
     base_ccy: str | None = None
     spot_inst_id: str | None = None
     current_derivative_inst_id: str | None = None
@@ -190,7 +191,9 @@ def _roll_direction_fields(request: ArbitrageRollRequest, runtime: ArbitrageTrad
         raise OkxApiError("移仓缺少当前持仓方向，已阻止下单。请先刷新并确认当前交割合约是多还是空。")
     close_side = "buy" if side == "short" else "sell"
     open_side = "sell" if side == "short" else "buy"
-    pos_side = side if runtime.position_mode == "long_short" else None
+    # 不再依赖本地 runtime.position_mode；始终沿用当前持仓方向。
+    # 若真实账户是 net_mode，okx_client.place_simple_order() 会依据 /account/config 自动去掉 posSide。
+    pos_side = side
     return close_side, open_side, pos_side
 
 
@@ -719,6 +722,48 @@ class ArbitrageExecutor:
             logger=self._logger,
             label=label,
         )
+
+    def _execute_roll_completion_taker_pair(
+        self,
+        *,
+        credentials,
+        current_config: StrategyConfig,
+        target_config: StrategyConfig,
+        current_inst_id: str,
+        target_inst_id: str,
+        current_close_side: str,
+        target_open_side: str,
+        remaining_qty: Decimal,
+        derivative_pos_side: str | None,
+        reason: str,
+    ) -> tuple[Decimal, Decimal | None, Decimal, Decimal | None]:
+        self._logger(
+            f"{reason}，自动改为吃单补齐剩余 {format_decimal(remaining_qty)} 张。"
+        )
+        current_filled, current_avg = self._execute_taker_leg(
+            credentials=credentials,
+            config=current_config,
+            inst_id=current_inst_id,
+            side=current_close_side,
+            size=remaining_qty,
+            label="自动移仓旧合约补齐腿",
+            pos_side=derivative_pos_side,
+            reduce_only=True,
+        )
+        if current_filled <= 0:
+            raise OkxApiError("自动补齐失败：旧合约腿未成交。")
+        target_filled, target_avg = self._execute_taker_leg(
+            credentials=credentials,
+            config=target_config,
+            inst_id=target_inst_id,
+            side=target_open_side,
+            size=current_filled,
+            label="自动移仓目标合约补齐腿",
+            pos_side=derivative_pos_side,
+        )
+        if target_filled <= 0:
+            raise OkxApiError("自动补齐失败：目标合约腿未成交。")
+        return current_filled, current_avg, target_filled, target_avg
 
     def _open_maker_taker(
         self,
@@ -2067,6 +2112,43 @@ class ArbitrageExecutor:
                 )
                 if not any_maker_filled:
                     if attempt >= request.chase_limit:
+                        if request.force_execution_completion:
+                            (
+                                fallback_current_filled,
+                                fallback_current_avg,
+                                fallback_target_filled,
+                                fallback_target_avg,
+                            ) = self._execute_roll_completion_taker_pair(
+                                credentials=credentials,
+                                current_config=current_config,
+                                target_config=target_config,
+                                current_inst_id=entry.derivative_inst_id,
+                                target_inst_id=request.target_derivative_inst_id,
+                                current_close_side=current_close_side,
+                                target_open_side=target_open_side,
+                                remaining_qty=remaining_qty,
+                                derivative_pos_side=derivative_pos_side,
+                                reason="双边挂单腿均未成交，已达到最大追单次数",
+                            )
+                            current_avg = self._blend_avg_price(
+                                current_avg,
+                                total_current_filled,
+                                fallback_current_avg,
+                                fallback_current_filled,
+                            )
+                            target_avg = self._blend_avg_price(
+                                target_avg,
+                                total_target_filled,
+                                fallback_target_avg,
+                                fallback_target_filled,
+                            )
+                            total_current_filled += fallback_current_filled
+                            total_target_filled += fallback_target_filled
+                            balanced_filled = min(total_current_filled, total_target_filled)
+                            remaining_qty = max(planned_derivative_qty - balanced_filled, Decimal("0"))
+                            if remaining_qty < current_inst.min_size or remaining_qty < target_inst.min_size:
+                                break
+                            continue
                         raise OkxApiError("双边挂单腿均未成交，已达到最大追单次数。")
                     continue
 
@@ -2114,6 +2196,43 @@ class ArbitrageExecutor:
 
                 if current_batch_filled <= 0 or target_batch_filled <= 0:
                     if attempt >= request.chase_limit:
+                        if request.force_execution_completion:
+                            (
+                                fallback_current_filled,
+                                fallback_current_avg,
+                                fallback_target_filled,
+                                fallback_target_avg,
+                            ) = self._execute_roll_completion_taker_pair(
+                                credentials=credentials,
+                                current_config=current_config,
+                                target_config=target_config,
+                                current_inst_id=entry.derivative_inst_id,
+                                target_inst_id=request.target_derivative_inst_id,
+                                current_close_side=current_close_side,
+                                target_open_side=target_open_side,
+                                remaining_qty=remaining_qty,
+                                derivative_pos_side=derivative_pos_side,
+                                reason="双边挂单已有成交但未形成有效双腿移仓成交",
+                            )
+                            current_avg = self._blend_avg_price(
+                                current_avg,
+                                total_current_filled,
+                                fallback_current_avg,
+                                fallback_current_filled,
+                            )
+                            target_avg = self._blend_avg_price(
+                                target_avg,
+                                total_target_filled,
+                                fallback_target_avg,
+                                fallback_target_filled,
+                            )
+                            total_current_filled += fallback_current_filled
+                            total_target_filled += fallback_target_filled
+                            balanced_filled = min(total_current_filled, total_target_filled)
+                            remaining_qty = max(planned_derivative_qty - balanced_filled, Decimal("0"))
+                            if remaining_qty < current_inst.min_size or remaining_qty < target_inst.min_size:
+                                break
+                            continue
                         raise OkxApiError("双边挂单已有成交但未形成有效双腿移仓成交。")
                     continue
                 current_avg = self._blend_avg_price(
@@ -2179,6 +2298,42 @@ class ArbitrageExecutor:
                         pass
                 if current_filled <= 0:
                     if attempt >= request.chase_limit:
+                        if request.force_execution_completion:
+                            (
+                                fallback_current_filled,
+                                fallback_current_avg,
+                                fallback_target_filled,
+                                fallback_target_avg,
+                            ) = self._execute_roll_completion_taker_pair(
+                                credentials=credentials,
+                                current_config=current_config,
+                                target_config=target_config,
+                                current_inst_id=entry.derivative_inst_id,
+                                target_inst_id=request.target_derivative_inst_id,
+                                current_close_side=current_close_side,
+                                target_open_side=target_open_side,
+                                remaining_qty=remaining_qty,
+                                derivative_pos_side=derivative_pos_side,
+                                reason="旧合约挂单腿未成交，已达到最大追单次数",
+                            )
+                            current_avg = self._blend_avg_price(
+                                current_avg,
+                                total_current_filled,
+                                fallback_current_avg,
+                                fallback_current_filled,
+                            )
+                            target_avg = self._blend_avg_price(
+                                target_avg,
+                                total_target_filled,
+                                fallback_target_avg,
+                                fallback_target_filled,
+                            )
+                            total_current_filled += fallback_current_filled
+                            total_target_filled += fallback_target_filled
+                            remaining_qty = max(planned_derivative_qty - min(total_current_filled, total_target_filled), Decimal("0"))
+                            if remaining_qty < current_inst.min_size:
+                                break
+                            continue
                         raise OkxApiError("旧合约挂单腿未成交，已达到最大追单次数。")
                     continue
                 target_filled_once, target_avg_once = self._execute_taker_leg(
@@ -2240,6 +2395,42 @@ class ArbitrageExecutor:
                         pass
                 if target_filled <= 0:
                     if attempt >= request.chase_limit:
+                        if request.force_execution_completion:
+                            (
+                                fallback_current_filled,
+                                fallback_current_avg,
+                                fallback_target_filled,
+                                fallback_target_avg,
+                            ) = self._execute_roll_completion_taker_pair(
+                                credentials=credentials,
+                                current_config=current_config,
+                                target_config=target_config,
+                                current_inst_id=entry.derivative_inst_id,
+                                target_inst_id=request.target_derivative_inst_id,
+                                current_close_side=current_close_side,
+                                target_open_side=target_open_side,
+                                remaining_qty=remaining_qty,
+                                derivative_pos_side=derivative_pos_side,
+                                reason="目标合约挂单腿未成交，已达到最大追单次数",
+                            )
+                            current_avg = self._blend_avg_price(
+                                current_avg,
+                                total_current_filled,
+                                fallback_current_avg,
+                                fallback_current_filled,
+                            )
+                            target_avg = self._blend_avg_price(
+                                target_avg,
+                                total_target_filled,
+                                fallback_target_avg,
+                                fallback_target_filled,
+                            )
+                            total_current_filled += fallback_current_filled
+                            total_target_filled += fallback_target_filled
+                            remaining_qty = max(planned_derivative_qty - min(total_current_filled, total_target_filled), Decimal("0"))
+                            if remaining_qty < target_inst.min_size:
+                                break
+                            continue
                         raise OkxApiError("目标合约挂单腿未成交，已达到最大追单次数。")
                     continue
                 current_filled_once, current_avg_once = self._execute_taker_leg(

@@ -974,10 +974,14 @@ class StrategyTradeRuntimeState:
     round_id: str
     signal_bar_at: datetime | None = None
     opened_logged_at: datetime | None = None
+    closed_logged_at: datetime | None = None
     entry_order_id: str = ""
     entry_client_order_id: str = ""
+    exit_order_id: str = ""
     entry_price: Decimal | None = None
+    exit_price: Decimal | None = None
     size: Decimal | None = None
+    exit_size: Decimal | None = None
     pending_entry_reference: Decimal | None = None
     pending_stop_price: Decimal | None = None
     pending_take_profit: Decimal | None = None
@@ -991,6 +995,7 @@ class StrategyTradeRuntimeState:
     manual_reason: str = ""
     manual_override_stop_price: Decimal | None = None
     manual_override_at: datetime | None = None
+    close_reason_hint: str = ""
     reconciliation_started: bool = False
 
 

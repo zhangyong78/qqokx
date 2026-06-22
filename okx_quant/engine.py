@@ -4670,10 +4670,10 @@ class StrategyEngine:
         return StrategyEngine._signed_pnl_text(value)
 
     @staticmethod
-    def _signed_pnl_text(value: Decimal | None) -> str:
+    def _signed_pnl_text(value: Decimal | None, *, places: int | None = None) -> str:
         if value is None:
             return ""
-        text = format_decimal(value)
+        text = format_decimal_fixed(value, places) if places is not None else format_decimal(value)
         if value > 0:
             return f"+{text}"
         return text
@@ -4774,7 +4774,7 @@ class StrategyEngine:
         funding_fee = history_item.funding_fee
         close_fee = history_item.fee
         if history_item.realized_pnl is not None:
-            value = history_item.realized_pnl + (entry_fee or Decimal("0"))
+            value = history_item.realized_pnl
         elif gross_pnl is not None:
             value = (
                 gross_pnl
@@ -4786,15 +4786,15 @@ class StrategyEngine:
             return ""
         detail_parts: list[str] = []
         if gross_pnl is not None:
-            detail_parts.append(f"毛盈亏 {self._signed_pnl_text(gross_pnl)}")
+            detail_parts.append(f"毛盈亏 {self._signed_pnl_text(gross_pnl, places=2)}")
         if entry_fee is not None or close_fee is not None:
             total_fee = (entry_fee or Decimal("0")) + (close_fee or Decimal("0"))
-            detail_parts.append(f"手续费 {self._signed_pnl_text(total_fee)}")
+            detail_parts.append(f"手续费 {self._signed_pnl_text(total_fee, places=2)}")
         if funding_fee is not None:
-            detail_parts.append(f"资金费 {self._signed_pnl_text(funding_fee)}")
+            detail_parts.append(f"资金费 {self._signed_pnl_text(funding_fee, places=2)}")
         if entry_fee is None:
             detail_parts.append("开仓手续费待补齐")
-        net_text = self._signed_pnl_text(value)
+        net_text = self._signed_pnl_text(value, places=2)
         if not detail_parts:
             return net_text
         return f"{net_text}（{' | '.join(detail_parts)}）"

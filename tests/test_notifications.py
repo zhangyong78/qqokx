@@ -580,7 +580,7 @@ class StrategyEngineNotificationTest(TestCase):
 
         self.assertEqual(
             notifier.send_trade_close.call_args.kwargs["trade_pnl"],
-            "+48.5（毛盈亏 +47.5 | 手续费 -1 | 开仓手续费待补齐）",
+            "+48.50（毛盈亏 +47.50 | 手续费 -1.00 | 开仓手续费待补齐）",
         )
         client.get_positions_history.assert_called_once()
 
@@ -598,7 +598,7 @@ class StrategyEngineNotificationTest(TestCase):
                 close_avg_price=Decimal("2550"),
                 close_size=Decimal("1"),
                 pnl=Decimal("50"),
-                realized_pnl=Decimal("48.5"),
+                realized_pnl=Decimal("47.7"),
                 settle_pnl=Decimal("0"),
                 raw={},
                 fee=Decimal("-1"),
@@ -651,7 +651,7 @@ class StrategyEngineNotificationTest(TestCase):
 
         self.assertEqual(
             notifier.send_trade_close.call_args.kwargs["trade_pnl"],
-            "+47.7（毛盈亏 +50 | 手续费 -1.8 | 资金费 -0.5）",
+            "+47.70（毛盈亏 +50.00 | 手续费 -1.80 | 资金费 -0.50）",
         )
 
     def test_exchange_dynamic_stop_close_notification_skips_unmatched_history_pnl(self) -> None:

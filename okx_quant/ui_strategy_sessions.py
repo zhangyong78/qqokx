@@ -5899,6 +5899,132 @@ class UiStrategySessionsMixin:
             return -1
         return None
 
+    @staticmethod
+    def _strategy_trade_expected_pos_side(session: StrategySession) -> str:
+        position_mode = str(getattr(getattr(session, "config", None), "position_mode", "") or "").strip().lower()
+        if position_mode != "long_short":
+            return ""
+        direction = UiStrategySessionsMixin._trader_wave_lock_signal_from_session(session)
+        if direction in {"long", "short"}:
+            return direction
+        return ""
+
+    @staticmethod
+    def _strategy_trade_local_close_reason_hint(message: str) -> str:
+        text = str(message or "").strip()
+        if not text:
+            return ""
+        if "本地斜率转正平仓已成交" in text:
+            return "斜率转正平仓"
+        if "本地止损平仓已成交" in text:
+            return "本地止损触发"
+        if "本地止盈平仓已成交" in text:
+            return "本地止盈触发"
+        if "平仓已成交" in text:
+            return "本地主动平仓"
+        return ""
+
+    @staticmethod
+    def _match_strategy_trade_position_history(
+        items: list[OkxPositionHistoryItem],
+        *,
+        inst_id: str,
+        pos_side: str,
+        entry_price: Decimal | None,
+        exit_price: Decimal | None,
+        size: Decimal | None,
+        open_ms: int,
+        close_ms: int,
+    ) -> OkxPositionHistoryItem | None:
+        normalized_inst_id = str(inst_id or "").strip().upper()
+        expected_pos_side = str(pos_side or "").strip().lower()
+        expected_size = abs(size) if size is not None else Decimal("0")
+        expected_entry = entry_price if entry_price is not None and entry_price > 0 else None
+        expected_exit = exit_price if exit_price is not None and exit_price > 0 else None
+        best_item: OkxPositionHistoryItem | None = None
+        best_score = -1
+        best_time_gap: int | None = None
+        for item in items:
+            item_inst_id = str(getattr(item, "inst_id", "") or "").strip().upper()
+            if normalized_inst_id and item_inst_id != normalized_inst_id:
+                continue
+            update_time = getattr(item, "update_time", None) or 0
+            if open_ms > 0 and update_time and update_time < open_ms:
+                continue
+
+            score = 100
+            item_pos_side = str(getattr(item, "pos_side", "") or "").strip().lower()
+            if expected_pos_side and item_pos_side:
+                if item_pos_side != expected_pos_side:
+                    continue
+                score += 40
+
+            close_size_value = getattr(item, "close_size", None)
+            if close_size_value is not None and expected_size > 0:
+                close_size = abs(close_size_value)
+                diff_ratio = abs(close_size - expected_size) / expected_size
+                if diff_ratio <= Decimal("0.02"):
+                    score += 45
+                elif diff_ratio <= Decimal("0.10"):
+                    score += 25
+                elif close_size < expected_size * Decimal("0.5"):
+                    continue
+
+            open_avg_price = getattr(item, "open_avg_price", None)
+            if open_avg_price is not None and expected_entry is not None:
+                diff_ratio = abs(open_avg_price - expected_entry) / expected_entry
+                if diff_ratio <= Decimal("0.002"):
+                    score += 35
+                elif diff_ratio <= Decimal("0.02"):
+                    score += 20
+                elif diff_ratio > Decimal("0.08"):
+                    score -= 20
+
+            close_avg_price = getattr(item, "close_avg_price", None)
+            if close_avg_price is not None and expected_exit is not None:
+                diff_ratio = abs(close_avg_price - expected_exit) / expected_exit
+                if diff_ratio <= Decimal("0.002"):
+                    score += 35
+                elif diff_ratio <= Decimal("0.02"):
+                    score += 20
+                elif diff_ratio > Decimal("0.08"):
+                    score -= 20
+
+            if update_time > 0:
+                time_gap = abs(update_time - close_ms) if close_ms > 0 else 0
+                if close_ms > 0:
+                    if time_gap <= 2 * 60 * 1000:
+                        score += 25
+                    elif time_gap <= 15 * 60 * 1000:
+                        score += 15
+                    elif time_gap <= 2 * 60 * 60 * 1000:
+                        score += 5
+                    else:
+                        score -= 10
+                else:
+                    time_gap = 0
+            else:
+                time_gap = None
+
+            if getattr(item, "realized_pnl", None) is not None or getattr(item, "pnl", None) is not None:
+                score += 5
+
+            if score > best_score:
+                best_item = item
+                best_score = score
+                best_time_gap = time_gap
+                continue
+            if score == best_score and score >= 100:
+                current_gap = time_gap if time_gap is not None else 1 << 30
+                chosen_gap = best_time_gap if best_time_gap is not None else 1 << 30
+                if current_gap < chosen_gap:
+                    best_item = item
+                    best_time_gap = time_gap
+                elif current_gap == chosen_gap and update_time > (best_item.update_time or 0):
+                    best_item = item
+                    best_time_gap = time_gap
+        return best_item if best_score >= 100 else None
+
     def _estimate_strategy_trade_gross_pnl(
         self,
         session: StrategySession,
@@ -5950,6 +6076,7 @@ class UiStrategySessionsMixin:
         trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or session.symbol).strip().upper()
         open_anchor = trade.opened_logged_at or datetime.now()
         open_ms = int((open_anchor - timedelta(minutes=2)).timestamp() * 1000)
+        close_ms_hint = int(trade.closed_logged_at.timestamp() * 1000) if trade.closed_logged_at is not None else 0
 
         session_orders = [
             item
@@ -6004,6 +6131,14 @@ class UiStrategySessionsMixin:
 
         exit_orders = [item for item in recent_orders if _trade_order_session_role(item, session) == "exi"]
         exit_orders.sort(key=_trade_order_event_time, reverse=True)
+        direct_exit_order = next(
+            (
+                item
+                for item in recent_orders
+                if trade.exit_order_id and (item.order_id or "").strip() == trade.exit_order_id
+            ),
+            None,
+        )
         filled_exit_order = next(
             (
                 item
@@ -6032,6 +6167,8 @@ class UiStrategySessionsMixin:
         close_order_ids = {
             value
             for value in (
+                trade.exit_order_id,
+                direct_exit_order.order_id if direct_exit_order is not None else "",
                 filled_exit_order.order_id if filled_exit_order is not None else "",
                 protective_order.order_id if protective_order is not None else "",
             )
@@ -6046,8 +6183,55 @@ class UiStrategySessionsMixin:
             if (not trade_inst_id or item.inst_id.strip().upper() == trade_inst_id)
             and (item.update_time or 0) >= open_ms
         ]
-        relevant_position_history.sort(key=lambda item: item.update_time or 0, reverse=True)
-        matched_position_history = relevant_position_history[0] if relevant_position_history else None
+        effective_entry_price = (
+            _weighted_average_fill_price(entry_fills)
+            or trade.entry_price
+            or (entry_order.avg_price if entry_order is not None else None)
+            or (entry_order.actual_price if entry_order is not None else None)
+            or (entry_order.price if entry_order is not None else None)
+        )
+        effective_size = (
+            trade.exit_size
+            or _sum_fill_size(close_fills)
+            or _sum_fill_size(entry_fills)
+            or trade.size
+            or (entry_order.filled_size if entry_order is not None else None)
+            or (entry_order.actual_size if entry_order is not None else None)
+            or (entry_order.size if entry_order is not None else None)
+        )
+        effective_close_ms = max(
+            [item.fill_time or 0 for item in close_fills]
+            + [
+                close_ms_hint,
+                _trade_order_event_time(direct_exit_order) if direct_exit_order is not None else 0,
+                _trade_order_event_time(filled_exit_order) if filled_exit_order is not None else 0,
+                _trade_order_event_time(protective_order) if protective_order is not None else 0,
+            ]
+        )
+        effective_exit_price = (
+            _weighted_average_fill_price(close_fills)
+            or (direct_exit_order.actual_price if direct_exit_order is not None else None)
+            or (direct_exit_order.avg_price if direct_exit_order is not None else None)
+            or (direct_exit_order.price if direct_exit_order is not None else None)
+            or trade.exit_price
+            or (filled_exit_order.actual_price if filled_exit_order is not None else None)
+            or (filled_exit_order.avg_price if filled_exit_order is not None else None)
+            or (filled_exit_order.price if filled_exit_order is not None else None)
+            or (protective_order.actual_price if protective_order is not None else None)
+            or (protective_order.avg_price if protective_order is not None else None)
+            or (protective_order.price if protective_order is not None else None)
+            or trade.current_stop_price
+        )
+        matched_position_history = UiStrategySessionsMixin._match_strategy_trade_position_history(
+            relevant_position_history,
+            inst_id=trade_inst_id,
+            pos_side=UiStrategySessionsMixin._strategy_trade_expected_pos_side(session),
+            entry_price=effective_entry_price,
+            exit_price=effective_exit_price,
+            size=effective_size,
+            open_ms=open_ms,
+            close_ms=effective_close_ms,
+        )
 
         close_reason = "持仓已关闭（原因待确认）"
         reason_confidence = "low"
@@ -6062,11 +6246,19 @@ class UiStrategySessionsMixin:
                     protective_order.order_id is not None
                     and any((item.order_id or "") == protective_order.order_id for item in close_fills)
                 )
-            )
+        )
         if protective_executed:
             close_reason = "OKX止损触发"
             reason_confidence = "high"
             close_order = protective_order
+        elif trade.close_reason_hint:
+            close_reason = trade.close_reason_hint
+            reason_confidence = "high" if trade.exit_order_id or trade.exit_price is not None else "medium"
+            close_order = direct_exit_order or filled_exit_order
+        elif direct_exit_order is not None:
+            close_reason = "策略主动平仓"
+            reason_confidence = "high"
+            close_order = direct_exit_order
         elif filled_exit_order is not None:
             close_reason = "策略主动平仓"
             reason_confidence = "high"
@@ -6078,24 +6270,17 @@ class UiStrategySessionsMixin:
             reason_confidence = "medium"
 
         entry_price = (
-            _weighted_average_fill_price(entry_fills)
-            or trade.entry_price
-            or (entry_order.avg_price if entry_order is not None else None)
-            or (entry_order.actual_price if entry_order is not None else None)
-            or (entry_order.price if entry_order is not None else None)
+            effective_entry_price
         )
         size = (
-            _sum_fill_size(entry_fills)
-            or trade.size
-            or (entry_order.filled_size if entry_order is not None else None)
-            or (entry_order.actual_size if entry_order is not None else None)
-            or (entry_order.size if entry_order is not None else None)
+            effective_size
         )
         exit_price = (
             _weighted_average_fill_price(close_fills)
             or (close_order.actual_price if close_order is not None else None)
             or (close_order.avg_price if close_order is not None else None)
             or (close_order.price if close_order is not None else None)
+            or trade.exit_price
             or (matched_position_history.close_avg_price if matched_position_history is not None else None)
             or trade.current_stop_price
         )
@@ -6116,6 +6301,7 @@ class UiStrategySessionsMixin:
         close_time_ms = max(
             [item.fill_time or 0 for item in close_fills]
             + [
+                close_ms_hint,
                 _trade_order_event_time(close_order) if close_order is not None else 0,
                 matched_position_history.update_time if matched_position_history is not None else 0,
             ]
@@ -6196,7 +6382,10 @@ class UiStrategySessionsMixin:
             round_id=trade.round_id,
             entry_order_id=trade.entry_order_id or (entry_order.order_id if entry_order is not None else ""),
             entry_client_order_id=trade.entry_client_order_id,
-            exit_order_id=close_order.order_id if close_order is not None and close_order.order_id is not None else "",
+            exit_order_id=(
+                trade.exit_order_id
+                or (close_order.order_id if close_order is not None and close_order.order_id is not None else "")
+            ),
             protective_algo_id=protective_order.algo_id if protective_order is not None and protective_order.algo_id is not None else "",
             protective_algo_cl_ord_id=trade.protective_algo_cl_ord_id or (
                 protective_order.algo_client_order_id if protective_order is not None else ""
@@ -7231,14 +7420,19 @@ class UiStrategySessionsMixin:
             round_id=trade.round_id,
             signal_bar_at=trade.signal_bar_at,
             opened_logged_at=trade.opened_logged_at,
+            closed_logged_at=trade.closed_logged_at,
             entry_order_id=trade.entry_order_id,
             entry_client_order_id=trade.entry_client_order_id,
+            exit_order_id=trade.exit_order_id,
             entry_price=trade.entry_price,
+            exit_price=trade.exit_price,
             size=trade.size,
+            exit_size=trade.exit_size,
             protective_algo_id=trade.protective_algo_id,
             protective_algo_cl_ord_id=trade.protective_algo_cl_ord_id,
             initial_stop_price=trade.initial_stop_price,
             current_stop_price=trade.current_stop_price,
+            close_reason_hint=trade.close_reason_hint,
             reconciliation_started=True,
         )
         threading.Thread(
@@ -8530,6 +8724,23 @@ class UiStrategySessionsMixin:
             take_profit = _extract_log_field_decimal(message, "止盈")
             if take_profit is not None:
                 trade.pending_take_profit = take_profit
+            return
+        local_close_reason_hint = QuantApp._strategy_trade_local_close_reason_hint(message)
+        if local_close_reason_hint:
+            trade = session.active_trade
+            if trade is None:
+                return
+            trade.closed_logged_at = observed_at
+            trade.close_reason_hint = local_close_reason_hint
+            exit_order_id = _extract_log_field(message, "ordId")
+            if exit_order_id:
+                trade.exit_order_id = exit_order_id
+            exit_price = _extract_log_field_decimal(message, "成交均价")
+            if exit_price is not None:
+                trade.exit_price = exit_price
+            exit_size = _extract_log_field_decimal(message, "成交数量")
+            if exit_size is not None:
+                trade.exit_size = exit_size
             return
         if "OKX 动态止损已上移" in message:
             trade = session.active_trade

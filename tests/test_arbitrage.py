@@ -1857,6 +1857,78 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertEqual(client.orders[2]["side"], "sell")
         self.assertEqual(client.cancels, [("BTC-USDT-SWAP", "ord-1"), ("BTC-USDT-260926", "ord-2")])
 
+    def test_roll_auto_force_completion_falls_back_to_dual_taker_when_both_makers_miss(self) -> None:
+        client = _FakeArbitrageTradeClient()
+        executor = ArbitrageExecutor(client)
+        entry = ArbitrageLedgerEntry(
+            entry_id="entry-open",
+            base_ccy="BTC",
+            pair_kind="spot_quarter",
+            spot_inst_id="BTC-USDT",
+            derivative_inst_id="BTC-USDT-SWAP",
+            spot_qty=Decimal("0.0200"),
+            derivative_qty=Decimal("2"),
+            open_spot_price=Decimal("100"),
+            open_derivative_price=Decimal("101"),
+            close_spot_price=None,
+            close_derivative_price=None,
+            basis_at_open_pct=Decimal("1"),
+            fee_total=Decimal("0"),
+            funding_total=Decimal("0"),
+            realized_pnl=None,
+            close_mode="open",
+            opened_at="2026-06-01T00:00:00Z",
+            closed_at=None,
+            notes="test",
+        )
+        request = ArbitrageRollRequest(
+            entry_id="entry-open",
+            target_derivative_inst_id="BTC-USDT-260926",
+            max_slippage=Decimal("0.0015"),
+            use_limit_orders=False,
+            roll_derivative_qty=Decimal("1"),
+            execution_mode="both_maker_first_taker",
+            maker_wait_seconds=0.1,
+            chase_limit=0,
+            force_execution_completion=True,
+            current_position_side="short",
+        )
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        with (
+            patch("okx_quant.arbitrage.arbitrage_executor.find_ledger_entry", return_value=entry),
+            patch("okx_quant.arbitrage.arbitrage_executor.upsert_ledger_entry"),
+            patch.object(
+                executor,
+                "_wait_two_maker_orders_until",
+                return_value=(Decimal("0"), None, Decimal("0"), None, False),
+            ),
+            patch(
+                "okx_quant.arbitrage.arbitrage_executor._wait_order_fill",
+                side_effect=[
+                    (Decimal("1"), Decimal("100")),
+                    (Decimal("1"), Decimal("102")),
+                ],
+            ),
+        ):
+            result = executor.roll_cash_and_carry(request, runtime=runtime)
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(client.orders), 4)
+        self.assertEqual(client.orders[0]["ord_type"], "post_only")
+        self.assertEqual(client.orders[1]["ord_type"], "post_only")
+        self.assertEqual(client.orders[2]["inst_id"], "BTC-USDT-SWAP")
+        self.assertEqual(client.orders[2]["ord_type"], "market")
+        self.assertEqual(client.orders[2]["side"], "buy")
+        self.assertEqual(client.orders[3]["inst_id"], "BTC-USDT-260926")
+        self.assertEqual(client.orders[3]["ord_type"], "market")
+        self.assertEqual(client.orders[3]["side"], "sell")
+        self.assertEqual(client.cancels, [("BTC-USDT-SWAP", "ord-1"), ("BTC-USDT-260926", "ord-2")])
+
     def test_roll_short_position_in_long_short_mode_uses_buy_close_and_sell_open(self) -> None:
         client = _FakeArbitrageTradeClient()
         executor = ArbitrageExecutor(client)
@@ -1962,6 +2034,45 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("缺少当前持仓方向", result.message)
         self.assertEqual(client.orders, [])
+
+    def test_roll_short_position_keeps_short_pos_side_even_when_runtime_declares_net(self) -> None:
+        client = _FakeArbitrageTradeClient()
+        executor = ArbitrageExecutor(client)
+        request = ArbitrageRollRequest(
+            entry_id=None,
+            target_derivative_inst_id="BTC-USDT-260926",
+            max_slippage=Decimal("0.0015"),
+            use_limit_orders=False,
+            roll_derivative_qty=Decimal("1"),
+            base_ccy="BTC",
+            spot_inst_id="BTC-USDT",
+            current_derivative_inst_id="BTC-USDT-SWAP",
+            spot_qty=Decimal("0.0100"),
+            current_derivative_qty=Decimal("1"),
+            current_position_side="short",
+        )
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        with patch(
+            "okx_quant.arbitrage.arbitrage_executor._wait_order_fill",
+            side_effect=[
+                (Decimal("1"), Decimal("100")),
+                (Decimal("1"), Decimal("102")),
+            ],
+        ):
+            result = executor.roll_cash_and_carry(request, runtime=runtime)
+
+        self.assertTrue(result.success)
+        self.assertEqual(client.orders[0]["side"], "buy")
+        self.assertEqual(client.orders[0]["pos_side"], "short")
+        self.assertTrue(client.orders[0]["reduce_only"])
+        self.assertEqual(client.orders[1]["side"], "sell")
+        self.assertEqual(client.orders[1]["pos_side"], "short")
+        self.assertFalse(client.orders[1]["reduce_only"])
 
     def test_roll_ui_builds_request_from_delivery_position_without_spot_match(self) -> None:
         class _Value:
