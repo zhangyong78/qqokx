@@ -244,7 +244,7 @@ class EmailNotifier:
         if not self._kind_enabled("trade_fill"):
             return
         subject = self._subject_with_context(
-            f"[QQOKX] 成交通知 | {title} | {symbol}",
+            f"[QQOKX] 成交通知 | {strategy_name} | {title} | {symbol}",
             api_name=api_name,
             session_id=session_id,
             trader_id=trader_id,

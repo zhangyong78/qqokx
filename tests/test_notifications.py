@@ -63,6 +63,9 @@ class EmailNotifierTest(TestCase):
         )
 
         subject, body = notifier.notify_async.call_args.args
+        self.assertIn("EMA 动态委托", subject)
+        self.assertIn("开仓成交", subject)
+        self.assertIn("ETH-USDT-SWAP", subject)
         self.assertIn("API=moni", subject)
         self.assertIn("会话=S08", subject)
         self.assertIn("交易员=T001", subject)
