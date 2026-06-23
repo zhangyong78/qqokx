@@ -4375,7 +4375,230 @@ class UiPositionsMixin:
         selected_filter = QuantApp._current_running_session_filter_label(self)
         if selected_filter == "全部":
             return True
-        return QuantApp._session_category_label(session) == selected_filter
+        if selected_filter != "鍏ㄩ儴" and QuantApp._session_category_label(session) != selected_filter:
+            return False
+        api_filter = QuantApp._current_running_session_api_filter_label(self)
+        if api_filter != STRATEGY_BOOK_FILTER_ALL_API:
+            session_api_name = str(getattr(session, "api_name", "") or "-").strip() or "-"
+            if session_api_name != api_filter:
+                return False
+        return True
+
+    def _running_session_api_filter_options(self) -> tuple[str, ...]:
+        all_label = STRATEGY_BOOK_FILTER_ALL_API
+        values = sorted(
+            {
+                str(getattr(session, "api_name", "") or "-").strip() or "-"
+                for session in self.sessions.values()
+            }
+        )
+        current = str(getattr(getattr(self, "running_session_api_filter", None), "get", lambda: all_label)() or "").strip()
+        if current and current != all_label and current not in values:
+            values.append(current)
+            values.sort()
+        return (all_label, *values)
+
+    def _current_running_session_api_filter_label(self) -> str:
+        all_label = STRATEGY_BOOK_FILTER_ALL_API
+        options = QuantApp._running_session_api_filter_options(self)
+        selected_filter: object = getattr(self, "running_session_api_filter", all_label)
+        if hasattr(selected_filter, "get"):
+            label = str(selected_filter.get() or "").strip()
+        else:
+            label = str(selected_filter or "").strip()
+        if label in options:
+            return label
+        return all_label
+
+    def _refresh_running_session_filter_controls(self) -> None:
+        combo = getattr(self, "_running_session_api_filter_combo", None)
+        variable = getattr(self, "running_session_api_filter", None)
+        options = QuantApp._running_session_api_filter_options(self)
+        current = QuantApp._current_running_session_api_filter_label(self)
+        if hasattr(variable, "set"):
+            variable.set(current)
+        if combo is not None and _widget_exists(combo):
+            combo.configure(values=options)
+
+    def _session_matches_running_filter(self, session: StrategySession) -> bool:
+        selected_filter = QuantApp._current_running_session_filter_label(self)
+        if selected_filter != RUNNING_SESSION_FILTER_OPTIONS[0]:
+            if QuantApp._session_category_label(session) != selected_filter:
+                return False
+        api_filter = QuantApp._current_running_session_api_filter_label(self)
+        if api_filter != STRATEGY_BOOK_FILTER_ALL_API:
+            session_api_name = str(getattr(session, "api_name", "") or "-").strip() or "-"
+            if session_api_name != api_filter:
+                return False
+        return True
+
+    def _refresh_running_session_tree_headings(self) -> None:
+        tree = getattr(self, "session_tree", None)
+        if tree is None or not _widget_exists(tree):
+            return
+        headings = {
+            "session": "会话(双击日志)",
+            "trader": "交易员(双击打开)",
+            "email": "邮件(双击切换)",
+            "api": "API",
+            "source_type": "来源类型",
+            "strategy": "策略",
+            "mode": "模式",
+            "symbol": "标的(双击K线)",
+            "bar": "周期",
+            "direction": "方向",
+            "risk_amount": "风险金",
+            "open_qty": "开仓数量",
+            "live_pnl": "实时浮盈亏",
+            "pnl": "净盈亏",
+            "last_pnl": "上次净盈亏",
+            "status": "状态",
+            "started": "启动时间",
+        }
+        active_column = str(getattr(self, "_running_session_sort_column", "started") or "started")
+        descending = bool(getattr(self, "_running_session_sort_descending", True))
+        for column_id, label in headings.items():
+            text = label
+            if column_id == active_column:
+                text = f"{label} {'▼' if descending else '▲'}"
+            tree.heading(
+                column_id,
+                text=text,
+                command=lambda value=column_id: self._on_running_session_sort_requested(value),
+            )
+
+    def _on_running_session_sort_requested(self, column_id: str) -> None:
+        normalized = str(column_id or "").strip()
+        if not normalized:
+            return
+        if getattr(self, "_running_session_sort_column", "started") == normalized:
+            self._running_session_sort_descending = not bool(getattr(self, "_running_session_sort_descending", True))
+        else:
+            self._running_session_sort_column = normalized
+            self._running_session_sort_descending = normalized not in {
+                "session",
+                "trader",
+                "email",
+                "api",
+                "source_type",
+                "strategy",
+                "mode",
+                "symbol",
+                "bar",
+                "direction",
+                "status",
+            }
+        self._refresh_running_session_tree_headings()
+        self._refresh_running_session_tree()
+
+    def _session_open_position_sort_value(self, session: StrategySession) -> Decimal:
+        snapshot = self._positions_snapshot_for_session(session)
+        if snapshot is None:
+            return Decimal("0")
+        total = Decimal("0")
+        instruments = dict(getattr(snapshot, "position_instruments", {}) or {})
+        if not instruments:
+            instruments = dict(getattr(self, "_position_instruments", {}) or {})
+        for position in snapshot.positions:
+            if (
+                position.position == 0
+                or not _position_matches_session_live_pnl(
+                    position,
+                    trade_inst_id=_session_trade_inst_id(session),
+                    expected_sides=_session_expected_position_sides(session),
+                )
+            ):
+                continue
+            amount, _currency = _position_signed_display_amount(position, instruments)
+            if amount is None:
+                continue
+            total += abs(amount)
+        return total
+
+    def _running_session_sort_key(self, session: StrategySession, column_id: str) -> object:
+        normalized = str(column_id or "").strip()
+        if normalized == "session":
+            return session.session_id or ""
+        if normalized == "trader":
+            return QuantApp._session_trader_label(self, session)
+        if normalized == "email":
+            return QuantApp._session_email_status_label(self, session)
+        if normalized == "api":
+            return session.api_name or ""
+        if normalized == "source_type":
+            return QuantApp._session_category_label(session)
+        if normalized == "strategy":
+            return session.strategy_name or ""
+        if normalized == "mode":
+            return session.run_mode_label or ""
+        if normalized == "symbol":
+            return session.symbol or ""
+        if normalized == "bar":
+            return str(getattr(getattr(session, "config", None), "bar", "") or "")
+        if normalized == "direction":
+            return _normalize_strategy_direction_label(
+                getattr(session, "strategy_id", getattr(getattr(session, "config", None), "strategy_id", "")),
+                getattr(session, "config", None),
+                fallback=session.direction_label,
+            )
+        if normalized == "risk_amount":
+            return getattr(getattr(session, "config", None), "risk_amount", None) or Decimal("0")
+        if normalized == "open_qty":
+            return self._session_open_position_sort_value(session)
+        if normalized == "live_pnl":
+            live_pnl, _refreshed_at = self._session_live_pnl_snapshot(session)
+            return live_pnl or Decimal("0")
+        if normalized == "pnl":
+            return session.net_pnl_total or Decimal("0")
+        if normalized == "last_pnl":
+            return session.last_net_pnl or Decimal("0")
+        if normalized == "status":
+            return session.display_status or ""
+        if normalized == "started":
+            return session.started_at or datetime.min
+        return session.session_id or ""
+
+    def _sorted_visible_running_sessions(self) -> list[StrategySession]:
+        ordered = [
+            session
+            for session in self.sessions.values()
+            if QuantApp._session_matches_running_filter(self, session)
+        ]
+        ordered.sort(
+            key=lambda session: (
+                self._running_session_sort_key(session, getattr(self, "_running_session_sort_column", "started")),
+                session.session_id,
+            ),
+            reverse=bool(getattr(self, "_running_session_sort_descending", True)),
+        )
+        return ordered
+
+    def _apply_running_session_tree_sort_order(self, *, selected_before: str | None = None) -> None:
+        tree = getattr(self, "session_tree", None)
+        if tree is None or not _widget_exists(tree):
+            return
+        if selected_before is None:
+            current_selection = tree.selection()
+            selected_before = current_selection[0] if current_selection else None
+        ordered_sessions = self._sorted_visible_running_sessions()
+        visible_ids = {session.session_id for session in ordered_sessions}
+        for item_id in tuple(tree.get_children()):
+            if item_id not in visible_ids and tree.exists(item_id):
+                tree.delete(item_id)
+        if hasattr(tree, "move"):
+            for index, session in enumerate(ordered_sessions):
+                if tree.exists(session.session_id):
+                    tree.move(session.session_id, "", index)
+        remaining = tuple(tree.get_children())
+        next_selection = None
+        if selected_before and tree.exists(selected_before):
+            next_selection = selected_before
+        elif remaining:
+            next_selection = remaining[0]
+        if next_selection is not None:
+            tree.selection_set(next_selection)
+            tree.focus(next_selection)
+            tree.see(next_selection)
 
     @staticmethod
     def _build_duplicate_launch_conflict_warning(
@@ -4392,6 +4615,7 @@ class UiPositionsMixin:
         )
 
     def _refresh_running_session_summary(self) -> None:
+        self._refresh_running_session_filter_controls()
         self._refresh_session_live_pnl_cache()
         active_sessions = [
             session for session in self.sessions.values() if self._session_counts_toward_running_summary(session)
@@ -4446,20 +4670,71 @@ class UiPositionsMixin:
 
     def _refresh_running_session_tree(self) -> None:
         tree = self.session_tree
+        QuantApp._refresh_running_session_filter_controls(self)
         selected_before = tree.selection()[0] if tree.selection() else None
         for session in self.sessions.values():
-            self._upsert_session_row(session)
+            self._upsert_session_row(session, reorder=False)
+        self._apply_running_session_tree_sort_order(selected_before=selected_before)
 
-        remaining = tuple(tree.get_children())
-        next_selection = None
-        if selected_before and tree.exists(selected_before):
-            next_selection = selected_before
-        elif remaining:
-            next_selection = remaining[0]
-        if next_selection is not None:
-            tree.selection_set(next_selection)
-            tree.focus(next_selection)
-            tree.see(next_selection)
+    def _refresh_running_session_summary(self) -> None:
+        QuantApp._refresh_running_session_filter_controls(self)
+        self._refresh_session_live_pnl_cache()
+        active_sessions = [
+            session for session in self.sessions.values() if self._session_counts_toward_running_summary(session)
+        ]
+        if not active_sessions:
+            self.session_summary_text.set("多策略合计：当前没有运行中的策略。")
+            return
+
+        net_total = Decimal("0")
+        live_total = Decimal("0")
+        live_covered = 0
+        latest_refresh_at: datetime | None = None
+        for session in active_sessions:
+            net_total += session.net_pnl_total or Decimal("0")
+            live_pnl, refreshed_at = self._session_live_pnl_snapshot(session)
+            if refreshed_at is not None and (latest_refresh_at is None or refreshed_at > latest_refresh_at):
+                latest_refresh_at = refreshed_at
+            if live_pnl is None:
+                continue
+            live_total += live_pnl
+            live_covered += 1
+
+        parts = [
+            f"多策略合计：{len(active_sessions)} 个策略",
+            f"实时浮盈亏={_format_optional_usdt_precise(live_total, places=2) if live_covered else '-'}",
+            f"净盈亏={_format_optional_usdt_precise(net_total, places=2)}",
+        ]
+        duplicate_groups = QuantApp._active_duplicate_strategy_groups(self)
+        if duplicate_groups:
+            duplicate_sessions = sum(len(items) for items in duplicate_groups.values())
+            parts.append(f"重复风险 {len(duplicate_groups)}组/{duplicate_sessions}条")
+        if live_covered < len(active_sessions):
+            parts.append(f"浮盈覆盖 {live_covered}/{len(active_sessions)}")
+        selected_filter = QuantApp._current_running_session_filter_label(self)
+        selected_api_filter = QuantApp._current_running_session_api_filter_label(self)
+        if selected_filter != RUNNING_SESSION_FILTER_OPTIONS[0] or selected_api_filter != STRATEGY_BOOK_FILTER_ALL_API:
+            visible_count = sum(1 for session in active_sessions if QuantApp._session_matches_running_filter(self, session))
+            filter_parts: list[str] = []
+            if selected_filter != RUNNING_SESSION_FILTER_OPTIONS[0]:
+                filter_parts.append(selected_filter)
+            if selected_api_filter != STRATEGY_BOOK_FILTER_ALL_API:
+                filter_parts.append(f"API {selected_api_filter}")
+            parts.append(f"当前筛选 {' | '.join(filter_parts)} {visible_count}条")
+        position_cache_summary = (
+            self._running_session_position_cache_summary(active_sessions)
+            if hasattr(self, "_running_session_position_cache_summary")
+            else ""
+        )
+        if position_cache_summary:
+            parts.append(position_cache_summary)
+        if latest_refresh_at is not None:
+            parts.append(f"参考持仓 {latest_refresh_at.strftime('%H:%M:%S')}")
+        else:
+            parts.append("实时浮盈待持仓刷新")
+        self.session_summary_text.set(" | ".join(parts))
+        if hasattr(self, "_schedule_session_position_snapshot_sync"):
+            self._schedule_session_position_snapshot_sync()
 
     def _on_running_session_filter_changed(self, *_: object) -> None:
         self._refresh_running_session_summary()

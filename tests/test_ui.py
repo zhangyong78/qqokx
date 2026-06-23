@@ -2734,6 +2734,36 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         self.assertEqual(result, "break")
         self.assertEqual(opened, ["S01"])
 
+    def test_session_tree_double_click_opens_trade_detail_on_pnl_columns(self) -> None:
+        session = SimpleNamespace(session_id="S01", email_notifications_enabled=True)
+        tree = _SessionTreeStub()
+        tree.rows["S01"] = {"values": (), "tags": (), "text": ""}
+        opened: list[tuple[str, bool]] = []
+        app = SimpleNamespace(
+            session_tree=tree,
+            sessions={"S01": session},
+            _open_session_trade_detail_window=lambda target_session, latest_only=False: opened.append(
+                (target_session.session_id, latest_only)
+            ),
+        )
+
+        tree.identify_column = lambda _x: "#14"
+        tree.identify_row = lambda _y: "S01"
+        result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=56, y=12))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(opened, [("S01", False)])
+
+        tree.identify_column = lambda _x: "#15"
+        result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=64, y=12))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(opened, [("S01", False), ("S01", True)])
+
+    def test_session_tree_double_click_hint_includes_trade_detail_columns(self) -> None:
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#14"), "双击查看这条会话的净盈亏明细")
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#15"), "双击查看最近一笔净盈亏明细")
+
     def test_session_tree_double_click_opens_session_log_on_session_column(self) -> None:
         session = SimpleNamespace(session_id="S01", email_notifications_enabled=True, trader_id="")
         tree = _SessionTreeStub()
@@ -6255,6 +6285,18 @@ class _SessionTreeStub:
         if self.seen == iid:
             self.seen = None
 
+    def move(self, iid: str, _parent: str, index: int) -> None:
+        if iid not in self.rows:
+            return
+        items = list(self.rows.items())
+        current_index = next((offset for offset, (row_id, _row) in enumerate(items) if row_id == iid), None)
+        if current_index is None:
+            return
+        row = items.pop(current_index)
+        safe_index = max(0, min(int(index), len(items)))
+        items.insert(safe_index, row)
+        self.rows = dict(items)
+
     def get_children(self) -> tuple[str, ...]:
         return tuple(self.rows.keys())
 
@@ -7602,6 +7644,169 @@ class RunningSessionFilterTest(TestCase):
         QuantApp._upsert_session_row(app, session)
 
         self.assertFalse(app.session_tree.exists("S01"))
+
+    def test_running_session_api_filter_options_include_active_api_names(self) -> None:
+        app = SimpleNamespace(
+            sessions={
+                "S01": SimpleNamespace(api_name="moni"),
+                "S02": SimpleNamespace(api_name="QQzhangyong"),
+                "S03": SimpleNamespace(api_name=""),
+            },
+            running_session_api_filter=_Var("全部API"),
+        )
+
+        options = QuantApp._running_session_api_filter_options(app)
+
+        self.assertEqual(options[0], "全部API")
+        self.assertIn("moni", options)
+        self.assertIn("QQzhangyong", options)
+        self.assertIn("-", options)
+
+    def test_session_matches_running_filter_combines_source_and_api(self) -> None:
+        session = SimpleNamespace(
+            api_name="moni",
+            trader_id="",
+            config=SimpleNamespace(run_mode="trade"),
+        )
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            running_session_filter=_Var("普通量化"),
+            running_session_api_filter=_Var("moni"),
+        )
+        app._running_session_api_filter_options = lambda: QuantApp._running_session_api_filter_options(app)
+
+        self.assertTrue(QuantApp._session_matches_running_filter(app, session))
+
+        app.running_session_api_filter.set("QQzhangyong")
+        self.assertFalse(QuantApp._session_matches_running_filter(app, session))
+
+    def test_refresh_running_session_tree_headings_marks_active_sort_column(self) -> None:
+        tree = _SessionTreeStub()
+        app = SimpleNamespace(
+            session_tree=tree,
+            _running_session_sort_column="strategy",
+            _running_session_sort_descending=False,
+            _on_running_session_sort_requested=lambda _column_id: None,
+        )
+
+        QuantApp._refresh_running_session_tree_headings(app)
+
+        self.assertEqual(tree.headings["strategy"]["text"], "策略 ▲")
+        self.assertIn("command", tree.headings["strategy"])
+
+    def test_running_session_sort_request_defaults_text_columns_to_ascending(self) -> None:
+        app = SimpleNamespace(
+            _running_session_sort_column="started",
+            _running_session_sort_descending=True,
+            _refresh_running_session_tree_headings=MagicMock(),
+            _refresh_running_session_tree=MagicMock(),
+        )
+
+        QuantApp._on_running_session_sort_requested(app, "strategy")
+
+        self.assertEqual(app._running_session_sort_column, "strategy")
+        self.assertFalse(app._running_session_sort_descending)
+        app._refresh_running_session_tree_headings.assert_called_once_with()
+        app._refresh_running_session_tree.assert_called_once_with()
+
+    def test_refresh_running_session_tree_reorders_rows_by_strategy_name(self) -> None:
+        config_a = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("10"),
+            strategy_id="ema_dynamic_long",
+        )
+        config_b = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            risk_amount=Decimal("10"),
+            strategy_id="ema_dynamic_short",
+        )
+        session_a = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            trader_id="",
+            strategy_name="AAA",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            net_pnl_total=Decimal("0"),
+            last_net_pnl=Decimal("0"),
+            display_status="等待信号",
+            started_at=datetime(2026, 4, 24, 11, 45, 26),
+            status="运行中",
+            engine=SimpleNamespace(is_running=True),
+            config=config_a,
+            email_notifications_enabled=True,
+        )
+        session_b = SimpleNamespace(
+            session_id="S02",
+            api_name="moni",
+            trader_id="",
+            strategy_name="BBB",
+            symbol="BTC-USDT-SWAP",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+            net_pnl_total=Decimal("0"),
+            last_net_pnl=Decimal("0"),
+            display_status="等待信号",
+            started_at=datetime(2026, 4, 24, 11, 46, 26),
+            status="运行中",
+            engine=SimpleNamespace(is_running=True),
+            config=config_b,
+            email_notifications_enabled=True,
+        )
+        tree = _SessionTreeStub()
+        app = SimpleNamespace(
+            session_tree=tree,
+            sessions={"S02": session_b, "S01": session_a},
+            running_session_filter=_Var("全部"),
+            notify_enabled=_Var(True),
+            _running_session_sort_column="strategy",
+            _running_session_sort_descending=False,
+            _session_live_pnl_snapshot=lambda _session: (None, None),
+            _session_open_position_amount_text=lambda _session: "-",
+            _trader_desk_draft_by_id=lambda _trader_id: None,
+            _refresh_running_session_tree_headings=lambda: None,
+        )
+        app._upsert_session_row = lambda session, reorder=True: QuantApp._upsert_session_row(app, session, reorder=reorder)
+        app._apply_running_session_tree_sort_order = (
+            lambda selected_before=None: QuantApp._apply_running_session_tree_sort_order(
+                app,
+                selected_before=selected_before,
+            )
+        )
+        app._sorted_visible_running_sessions = lambda: QuantApp._sorted_visible_running_sessions(app)
+        app._running_session_sort_key = lambda session, column_id: QuantApp._running_session_sort_key(
+            app,
+            session,
+            column_id,
+        )
+
+        QuantApp._refresh_running_session_tree(app)
+
+        self.assertEqual(tree.get_children(), ("S01", "S02"))
+        self.assertEqual(tree.focused, "S01")
 
 
 class _AfterRoot:

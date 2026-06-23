@@ -310,14 +310,21 @@ class RollExecutionThread(QThread):
             lines.append(
                 f"平均价差(目标-当前)：{fmt_decimal(avg_spread, 2)} | {fmt_decimal(spread_pct, 2)}%"
             )
+        executed_contract_qty = self._resolve_executed_roll_contract_qty(result)
+        history_limit = self._estimate_roll_fee_history_limit(executed_contract_qty=executed_contract_qty)
+        fee_pending = self._should_defer_fee_summary_for_result(result)
         fee_line, fee_total_usdt = self._build_fee_summary_line(
             client=client,
             request=request,
+            result=result,
             started_at_ms=started_at_ms,
+            pending_only=fee_pending,
+            history_limit=history_limit,
         )
         if fee_line:
             lines.append(fee_line)
-            executed_contract_qty = self._resolve_executed_roll_contract_qty(result)
+            if fee_pending:
+                return lines
             fee_per_coin_usdt = self._compute_fee_per_coin_usdt(
                 total_fee_usdt=fee_total_usdt,
                 current_avg_price=current_avg_price,
@@ -345,12 +352,22 @@ class RollExecutionThread(QThread):
         *,
         client: OkxRestClient,
         request: ArbitrageRollRequest,
+        result,
         started_at_ms: int,
+        pending_only: bool = False,
+        history_limit: int = 200,
     ) -> tuple[str | None, Decimal | None]:
+        explicit_order_ids = {
+            str(order_id).strip()
+            for order_id in getattr(result, "order_ids", ()) or ()
+            if str(order_id).strip()
+        }
         matched_orders = self._load_recent_roll_orders(
             client=client,
             request=request,
             started_at_ms=started_at_ms,
+            explicit_order_ids=explicit_order_ids,
+            history_limit=history_limit,
         )
         matched_order_ids_by_leg: dict[str, set[str]] = {"current": set(), "target": set()}
         for item in matched_orders:
@@ -367,19 +384,51 @@ class RollExecutionThread(QThread):
             client=client,
             request=request,
             started_at_ms=started_at_ms,
+            explicit_order_ids=explicit_order_ids,
             matched_order_ids_by_leg=matched_order_ids_by_leg,
+            history_limit=max(history_limit * 2, history_limit),
         )
         fee_totals = self._sum_fill_fees(matched_fills)
         if fee_totals:
             fee_usdt_totals = self._estimate_fill_fee_usdt_totals(matched_fills)
             total_fee_usdt = self._sum_fee_usdt_total(fee_totals, fee_usdt_totals)
+            if pending_only:
+                return (
+                    f"本次双腿手续费：当前仍有未终态委托，以下仅为已确认部分 {self._format_fee_totals(fee_totals, fee_usdt_totals)}；"
+                    "最终手续费待订单终态后再确认。",
+                    None,
+                )
             return f"\u672c\u6b21\u53cc\u817f\u5408\u8ba1\u624b\u7eed\u8d39\uff1a{self._format_fee_totals(fee_totals, fee_usdt_totals)}", total_fee_usdt
         fee_totals = self._sum_order_fees(matched_orders)
         if fee_totals:
             fee_usdt_totals = self._estimate_order_fee_usdt_totals(matched_orders)
             total_fee_usdt = self._sum_fee_usdt_total(fee_totals, fee_usdt_totals)
+            if pending_only:
+                return (
+                    f"本次双腿手续费：当前仍有未终态委托，以下仅为已确认部分 {self._format_fee_totals(fee_totals, fee_usdt_totals)}；"
+                    "最终手续费待订单终态后再确认。",
+                    None,
+                )
             return f"\u672c\u6b21\u53cc\u817f\u5408\u8ba1\u624b\u7eed\u8d39\uff1a{self._format_fee_totals(fee_totals, fee_usdt_totals)}", total_fee_usdt
+        if pending_only:
+            return "本次双腿手续费：当前仍有未终态委托，手续费待订单终态后再确认。", None
         return "\u672c\u6b21\u53cc\u817f\u5408\u8ba1\u624b\u7eed\u8d39\uff1a\u6682\u672a\u4ece OKX \u56de\u62a5\u4e2d\u53d6\u5230\uff0c\u8bf7\u7a0d\u540e\u770b\u8ba2\u5355\u5386\u53f2\u3002", None
+
+    @staticmethod
+    def _should_defer_fee_summary_for_result(result) -> bool:  # noqa: ANN001
+        message = str(getattr(result, "message", "") or "")
+        if not message:
+            return False
+        return any(
+            keyword in message
+            for keyword in (
+                "未进入终态",
+                "当前状态：live",
+                "最近状态：live",
+                "仍有未终态委托",
+                "恢复核对",
+            )
+        )
 
     def _load_recent_roll_orders(
         self,
@@ -387,6 +436,8 @@ class RollExecutionThread(QThread):
         client: OkxRestClient,
         request: ArbitrageRollRequest,
         started_at_ms: int,
+        explicit_order_ids: set[str] | None = None,
+        history_limit: int = 200,
     ) -> list[OkxTradeOrderItem]:
         current_side = roll_direction_from_position(self._plan.current).current_order_side.lower()
         target_side = roll_direction_from_position(self._plan.current).target_order_side.lower()
@@ -398,13 +449,18 @@ class RollExecutionThread(QThread):
                     self._runtime.credentials,
                     environment=self._runtime.environment,
                     inst_types=("FUTURES",),
-                    limit=80,
+                    limit=max(100, history_limit),
                     include_algo=False,
                 )
             except Exception:  # noqa: BLE001
                 history = []
             matched = []
             for item in history:
+                order_id = str(item.order_id or "").strip()
+                if explicit_order_ids:
+                    if order_id in explicit_order_ids:
+                        matched.append(item)
+                    continue
                 event_time = item.update_time or item.created_time or 0
                 if event_time and event_time < window_start:
                     continue
@@ -432,7 +488,9 @@ class RollExecutionThread(QThread):
         client: OkxRestClient,
         request: ArbitrageRollRequest,
         started_at_ms: int,
+        explicit_order_ids: set[str] | None,
         matched_order_ids_by_leg: dict[str, set[str]],
+        history_limit: int = 400,
     ) -> list[OkxFillHistoryItem]:
         window_start = started_at_ms - 15000
         matched: list[OkxFillHistoryItem] = []
@@ -442,13 +500,18 @@ class RollExecutionThread(QThread):
                     self._runtime.credentials,
                     environment=self._runtime.environment,
                     inst_types=("FUTURES",),
-                    limit=160,
+                    limit=max(200, history_limit),
                 )
             except Exception:  # noqa: BLE001
                 fills = []
             candidates_by_leg: dict[str, list[OkxFillHistoryItem]] = {"current": [], "target": []}
             exact_matches_by_leg: dict[str, list[OkxFillHistoryItem]] = {"current": [], "target": []}
             for item in fills:
+                order_id = str(item.order_id or "").strip()
+                if explicit_order_ids:
+                    if order_id in explicit_order_ids:
+                        matched.append(item)
+                    continue
                 fill_time = item.fill_time or 0
                 if fill_time and fill_time < window_start:
                     continue
@@ -460,10 +523,14 @@ class RollExecutionThread(QThread):
                 if leg is None:
                     continue
                 candidates_by_leg[leg].append(item)
-                order_id = str(item.order_id or "").strip()
                 leg_order_ids = matched_order_ids_by_leg.get(leg, set())
                 if order_id and order_id in leg_order_ids:
                     exact_matches_by_leg[leg].append(item)
+            if explicit_order_ids:
+                if matched or attempt == 3:
+                    return matched
+                time.sleep(0.6)
+                continue
             matched = []
             for leg in ("current", "target"):
                 leg_order_ids = matched_order_ids_by_leg.get(leg, set())
@@ -687,6 +754,16 @@ class RollExecutionThread(QThread):
         if len(candidates) == 2:
             return min(candidates)
         return candidates[0]
+
+    def _estimate_roll_fee_history_limit(self, *, executed_contract_qty: Decimal | None) -> int:
+        qty = executed_contract_qty if executed_contract_qty is not None and executed_contract_qty > 0 else self._plan.qty
+        qty_count = int(qty)
+        if qty != Decimal(qty_count):
+            qty_count += 1
+        qty_count = max(qty_count, 1)
+        chase_attempts = max(int(self._plan.chase_limit), 0) + 1
+        estimated = qty_count * max(chase_attempts * 2, 4)
+        return min(max(estimated, 200), 1200)
 
     @staticmethod
     def _format_fee_totals(

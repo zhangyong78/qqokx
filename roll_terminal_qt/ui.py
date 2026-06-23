@@ -2576,6 +2576,49 @@ class RollTerminalWindow(QMainWindow):
         self._execution_table.resizeRowToContents(row)
         self._execution_table.scrollToBottom()
 
+    def _update_active_execution_row_status_from_log(self, text: str) -> None:
+        status_text = self._execution_status_from_log_text(text)
+        if not status_text:
+            return
+        for row in range(self._execution_table.rowCount() - 1, -1, -1):
+            phase_item = self._execution_table.item(row, 0)
+            if phase_item is None:
+                continue
+            phase_text = phase_item.text().strip()
+            if phase_text not in {"执行中", "提交", "鎵ц涓?", "鎻愪氦"}:
+                continue
+            status_item = self._execution_table.item(row, 4)
+            if status_item is None:
+                status_item = QTableWidgetItem(status_text)
+                self._execution_table.setItem(row, 4, status_item)
+            else:
+                status_item.setText(status_text)
+            status_item.setToolTip(text)
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            self._execution_table.resizeRowToContents(row)
+            break
+
+    @staticmethod
+    def _execution_status_from_log_text(text: str) -> str:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return ""
+        if "撤单确认结论：状态未知" in cleaned:
+            return "状态未知 -> 恢复核对中"
+        if "恢复核对成功" in cleaned:
+            return "恢复核对成功 -> 继续执行"
+        if "恢复核对期间追加确认成交" in cleaned:
+            return "恢复核对中 -> 发现晚到成交"
+        if "状态已明确但仍非终态" in cleaned:
+            return "状态明确 live -> 不进恢复，按风险处理"
+        if "本轮确认零成交" in cleaned and "下一轮重挂" in cleaned:
+            return "撤单确认完成 -> 准备下一轮重挂"
+        if "单腿先成" in cleaned and "立即补齐" in cleaned:
+            return "单腿先成 -> 正在市价补齐"
+        if "晚到成交" in cleaned and "继续补齐" in cleaned:
+            return "撤单后晚到成交 -> 正在补齐"
+        return ""
+
     @Slot(object)
     def _apply_order_updates(self, orders: list[OrderStatusView]) -> None:
         self._order_table.setRowCount(0)
@@ -2610,6 +2653,10 @@ class RollTerminalWindow(QMainWindow):
         raw_text = str(text or "").strip()
         if not raw_text:
             return
+        for line in raw_text.splitlines():
+            cleaned_line = line.strip()
+            if cleaned_line:
+                self._update_active_execution_row_status_from_log(cleaned_line)
         formatted_lines: list[str] = []
         for index, line in enumerate(raw_text.splitlines()):
             cleaned = line.rstrip()

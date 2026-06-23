@@ -33,6 +33,7 @@ ORDER_STATUS_REQUEST_TIMEOUT_SECONDS = 2.5
 ORDER_CANCEL_REQUEST_TIMEOUT_SECONDS = 2.5
 POST_CANCEL_SETTLE_SECONDS = 5.0
 POST_CANCEL_RECOVERY_SECONDS = 8.0
+POST_CANCEL_NONTERMINAL_RECOVERY_SECONDS = 12.0
 
 
 def _post_cancel_settle_seconds_for_mode(execution_mode: str) -> float:
@@ -60,6 +61,20 @@ def _post_cancel_recovery_seconds_for_mode(execution_mode: str) -> float:
         "derivative_maker_spot_taker",
     }:
         return 3.0
+    return 0.0
+
+
+def _post_cancel_nonterminal_recovery_seconds_for_mode(execution_mode: str) -> float:
+    normalized = str(execution_mode or "").strip().lower()
+    if normalized == "both_maker_first_taker":
+        return 12.0
+    if normalized in {
+        "old_maker_new_taker",
+        "new_maker_old_taker",
+        "spot_maker_derivative_taker",
+        "derivative_maker_spot_taker",
+    }:
+        return 4.0
     return 0.0
 
 
@@ -159,6 +174,7 @@ class ArbitrageRollResult:
     current_derivative_avg_price: Decimal | None = None
     target_derivative_avg_price: Decimal | None = None
     entry_id: str | None = None
+    order_ids: tuple[str, ...] = ()
 
 
 def _split_derivative_batches(
@@ -490,6 +506,14 @@ class ArbitrageExecutor:
         self._instrument_cache: dict[str, object] = {}
         self._ticker_cache: dict[tuple[str, str], tuple[float, OkxTicker]] = {}
         self._order_book_cache: dict[tuple[str, str, int], tuple[float, OkxOrderBook]] = {}
+        self._active_roll_order_ids: set[str] | None = None
+
+    def _track_active_roll_order_id(self, order_id: str | None) -> None:
+        active_roll_order_ids = self._active_roll_order_ids
+        normalized_order_id = str(order_id or "").strip()
+        if active_roll_order_ids is None or not normalized_order_id:
+            return
+        active_roll_order_ids.add(normalized_order_id)
 
     def _cached_instrument(self, inst_id: str):
         with self._cache_lock:
@@ -987,11 +1011,13 @@ class ArbitrageExecutor:
         cl_ord_id = str(kwargs.get("cl_ord_id") or "").strip() or None
         inst_id = str(kwargs.get("inst_id") or "").strip().upper()
         try:
-            return self._client.place_simple_order(
+            result = self._client.place_simple_order(
                 credentials,
                 config,
                 **kwargs,
             )
+            self._track_active_roll_order_id(result.ord_id)
+            return result
         except OkxApiError as exc:
             if not cl_ord_id or not inst_id or not self._is_timeout_error_message(str(exc)):
                 raise
@@ -1011,13 +1037,15 @@ class ArbitrageExecutor:
                 f"{label} 超时回查成功：OKX 已记录订单 {status.ord_id or '-'}，"
                 f"状态 {status.state or '-'}。"
             )
-            return OkxOrderResult(
+            result = OkxOrderResult(
                 ord_id=status.ord_id,
                 cl_ord_id=cl_ord_id,
                 s_code="0",
                 s_msg="recovered_after_timeout",
                 raw=status.raw,
             )
+            self._track_active_roll_order_id(result.ord_id)
+            return result
 
     def _wait_order_terminal_after_cancel(
         self,
@@ -1071,8 +1099,6 @@ class ArbitrageExecutor:
                     f"{label} 撤单后订单仍未进入终态（当前状态：{status.state or 'unknown'}）。"
                     "为避免残留挂单继续成交导致数量错配，已中止后续批次。"
                 )
-            time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.15))
-
     def _wait_order_terminal_after_cancel_with_recovery(
         self,
         *,
@@ -1085,6 +1111,7 @@ class ArbitrageExecutor:
         label: str,
         settle_seconds: float = POST_CANCEL_SETTLE_SECONDS,
         recovery_seconds: float = POST_CANCEL_RECOVERY_SECONDS,
+        nonterminal_recovery_seconds: float = 0.0,
     ) -> tuple[Decimal, Decimal | None, str]:
         try:
             return self._wait_order_terminal_after_cancel(
@@ -1098,16 +1125,65 @@ class ArbitrageExecutor:
                 settle_seconds=settle_seconds,
             )
         except PostCancelNonTerminalError as exc:
+            if nonterminal_recovery_seconds <= 0:
+                self._logger(
+                    f"{label} ???????????????????? live/partially_filled??"
+                    "??????????????????????"
+                )
+                raise
             self._logger(
-                f"{label} 撤单确认结论：状态已明确但仍非终态（例如 live/partially_filled），"
-                "不进入恢复核对，直接按真实残单风险处理。"
+                f"{label} ?????????????????????????? {nonterminal_recovery_seconds} ??"
+                f" ???{exc}"
             )
-            raise
+            latest_filled = known_filled
+            latest_avg = known_avg
+            last_state = ""
+            deadline = time.time() + max(0.0, nonterminal_recovery_seconds)
+            while time.time() < deadline:
+                self._cancel_order_safely(
+                    credentials=credentials,
+                    config=config,
+                    inst_id=inst_id,
+                    ord_id=ord_id,
+                    label=label,
+                )
+                status = self._wait_order_status_by_ref(
+                    credentials=credentials,
+                    config=config,
+                    inst_id=inst_id,
+                    ord_id=ord_id,
+                    timeout_seconds=min(max(deadline - time.time(), 0.0), 1.2),
+                )
+                if status is None:
+                    time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.25))
+                    continue
+                next_filled = status.filled_size or Decimal("0")
+                if next_filled > latest_filled:
+                    self._logger(
+                        f"{label} ?????????????? {format_decimal(next_filled - latest_filled)}?"
+                        f"?? {format_decimal(next_filled)}?"
+                    )
+                    latest_filled = next_filled
+                    latest_avg = status.avg_price
+                elif latest_avg is None and status.avg_price is not None:
+                    latest_avg = status.avg_price
+                last_state = (status.state or "").lower()
+                if last_state in {"filled", "canceled", "cancelled"}:
+                    self._logger(
+                        f"{label} ????????????? {status.state or '-'}?"
+                        f"???? {format_decimal(latest_filled)}?"
+                    )
+                    return latest_filled, latest_avg, last_state
+                time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.25))
+            raise OkxApiError(
+                f"{label} ????????? {nonterminal_recovery_seconds} ?????????????{last_state or 'unknown'}??"
+                "??????????????????????????"
+            ) from exc
         except PostCancelStatusUnknownError as exc:
             if recovery_seconds <= 0:
                 raise
             self._logger(
-                f"{label} 撤单确认结论：状态未知，进入恢复核对 {recovery_seconds} 秒。原因：{exc}"
+                f"{label} ?????????????????? {recovery_seconds} ?????{exc}"
             )
             latest_filled = known_filled
             latest_avg = known_avg
@@ -1134,8 +1210,8 @@ class ArbitrageExecutor:
                 next_filled = status.filled_size or Decimal("0")
                 if next_filled > latest_filled:
                     self._logger(
-                        f"{label} 恢复核对期间追加确认成交 {format_decimal(next_filled - latest_filled)}，"
-                        f"累计 {format_decimal(next_filled)}。"
+                        f"{label} ???????????? {format_decimal(next_filled - latest_filled)}?"
+                        f"?? {format_decimal(next_filled)}?"
                     )
                     latest_filled = next_filled
                     latest_avg = status.avg_price
@@ -1144,14 +1220,14 @@ class ArbitrageExecutor:
                 last_state = (status.state or "").lower()
                 if last_state in {"filled", "canceled", "cancelled"}:
                     self._logger(
-                        f"{label} 恢复核对成功：最终状态 {status.state or '-'}，"
-                        f"累计成交 {format_decimal(latest_filled)}。"
+                        f"{label} ??????????? {status.state or '-'}?"
+                        f"???? {format_decimal(latest_filled)}?"
                     )
                     return latest_filled, latest_avg, last_state
                 time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.25))
             raise OkxApiError(
-                f"{label} 撤单后恢复核对 {recovery_seconds} 秒仍未进入终态（最近状态：{last_state or 'unknown'}）。"
-                "为避免残留挂单继续成交导致数量错配，已中止后续批次。"
+                f"{label} ??????? {recovery_seconds} ?????????????{last_state or 'unknown'}??"
+                "??????????????????????????"
             ) from exc
 
     def _cancel_dual_maker_orders_and_capture_fills(
@@ -1170,6 +1246,7 @@ class ArbitrageExecutor:
         target_avg: Decimal | None,
         settle_seconds: float = POST_CANCEL_SETTLE_SECONDS,
         recovery_seconds: float = POST_CANCEL_RECOVERY_SECONDS,
+        nonterminal_recovery_seconds: float = POST_CANCEL_NONTERMINAL_RECOVERY_SECONDS,
     ) -> tuple[Decimal, Decimal | None, Decimal, Decimal | None]:
         self._cancel_order_safely(
             credentials=credentials,
@@ -1194,6 +1271,7 @@ class ArbitrageExecutor:
             known_avg=current_avg,
             label="移仓旧合约挂单腿",
             settle_seconds=settle_seconds,
+            nonterminal_recovery_seconds=nonterminal_recovery_seconds,
             recovery_seconds=recovery_seconds,
         )
         latest_target_filled, latest_target_avg, _ = self._wait_order_terminal_after_cancel_with_recovery(
@@ -1204,6 +1282,7 @@ class ArbitrageExecutor:
             known_filled=target_filled,
             known_avg=target_avg,
             label="移仓目标合约挂单腿",
+            nonterminal_recovery_seconds=nonterminal_recovery_seconds,
             settle_seconds=settle_seconds,
             recovery_seconds=recovery_seconds,
         )
@@ -1437,6 +1516,7 @@ class ArbitrageExecutor:
         remaining_derivative_qty = planned_derivative_qty
         post_cancel_settle_seconds = _post_cancel_settle_seconds_for_mode("both_maker_first_taker")
         post_cancel_recovery_seconds = _post_cancel_recovery_seconds_for_mode("both_maker_first_taker")
+        post_cancel_nonterminal_recovery_seconds = _post_cancel_nonterminal_recovery_seconds_for_mode("both_maker_first_taker")
 
         for attempt in range(max(0, chase_limit) + 1):
             if remaining_derivative_qty < deriv_inst.min_size:
@@ -1526,6 +1606,7 @@ class ArbitrageExecutor:
                 target_avg=deriv_maker_avg,
                 settle_seconds=post_cancel_settle_seconds,
                 recovery_seconds=post_cancel_recovery_seconds,
+                nonterminal_recovery_seconds=post_cancel_nonterminal_recovery_seconds,
             )
             if not any_maker_filled and spot_batch_filled <= 0 and deriv_batch_filled <= 0:
                 if attempt >= chase_limit:
@@ -2617,6 +2698,14 @@ class ArbitrageExecutor:
         except Exception as exc:
             return ArbitrageRollResult(success=False, message=f"移仓参数异常：{exc}")
 
+        roll_order_ids: set[str] = set()
+        previous_active_roll_order_ids = self._active_roll_order_ids
+        self._active_roll_order_ids = roll_order_ids
+
+        def _tracked_roll_result(**kwargs) -> ArbitrageRollResult:  # noqa: ANN003
+            self._active_roll_order_ids = previous_active_roll_order_ids
+            return ArbitrageRollResult(order_ids=tuple(sorted(roll_order_ids)), **kwargs)
+
         total_current_filled = Decimal("0")
         total_target_filled = Decimal("0")
         current_avg: Decimal | None = None
@@ -2660,7 +2749,7 @@ class ArbitrageExecutor:
                         target_avg=target_avg,
                     )
                     ledger_suffix = "已按已完成部分更新本地套利账本。"
-                return ArbitrageRollResult(
+                return _tracked_roll_result(
                     success=False,
                     message=(
                         f"移仓部分完成后中断：已成对移仓 {format_decimal(total_current_filled)} 张。"
@@ -2672,7 +2761,7 @@ class ArbitrageExecutor:
                     target_derivative_avg_price=target_avg,
                     entry_id=entry.entry_id or None,
                 )
-            return ArbitrageRollResult(
+            return _tracked_roll_result(
                 success=False,
                 message=(
                     f"移仓中断：已完成当前合约回补 {format_decimal(total_current_filled)} 张，"
@@ -2745,6 +2834,14 @@ class ArbitrageExecutor:
         wait_before_next_batch: Callable[[], bool] | None = None,
     ) -> ArbitrageRollResult:
         tracked_by_ledger = bool(request.entry_id)
+        roll_order_ids: set[str] = set()
+        previous_active_roll_order_ids = self._active_roll_order_ids
+        self._active_roll_order_ids = roll_order_ids
+
+        def _tracked_roll_result(**kwargs) -> ArbitrageRollResult:  # noqa: ANN003
+            self._active_roll_order_ids = previous_active_roll_order_ids
+            return ArbitrageRollResult(order_ids=tuple(sorted(roll_order_ids)), **kwargs)
+
         if request.entry_id:
             entry = find_ledger_entry(request.entry_id)
             if entry is None or entry.close_mode != "open":
@@ -2847,7 +2944,7 @@ class ArbitrageExecutor:
                         target_avg=target_avg,
                     )
                     ledger_suffix = "已按已完成部分更新本地套利账本。"
-                return ArbitrageRollResult(
+                return _tracked_roll_result(
                     success=False,
                     message=(
                         f"移仓部分完成后中断：已成对移仓 {format_decimal(total_current_filled)} 张。"
@@ -2859,7 +2956,7 @@ class ArbitrageExecutor:
                     target_derivative_avg_price=target_avg,
                     entry_id=entry.entry_id or None,
                 )
-            return ArbitrageRollResult(
+            return _tracked_roll_result(
                 success=False,
                 message=(
                     f"移仓中断：已完成当前合约回补 {format_decimal(total_current_filled)} 张，"
@@ -2885,7 +2982,7 @@ class ArbitrageExecutor:
                         target_avg=target_avg,
                     )
                     ledger_suffix = "已按已完成部分更新本地套利账本。"
-                return ArbitrageRollResult(
+                return _tracked_roll_result(
                     success=False,
                     message=(
                         f"移仓部分完成后中断：已成对移仓 {format_decimal(total_current_filled)} 张。"
@@ -2907,6 +3004,9 @@ class ArbitrageExecutor:
                 entry_id=entry.entry_id or None,
             )
 
+        tracked_order_ids = tuple(sorted(roll_order_ids))
+        self._active_roll_order_ids = previous_active_roll_order_ids
+
         if stopped_after_batch and not tracked_by_ledger:
             message = (
                 f"已按停止请求在当前批次完成后停止：回补 {entry.derivative_inst_id} {format_decimal(total_current_filled)} 张，"
@@ -2922,6 +3022,7 @@ class ArbitrageExecutor:
                 current_derivative_avg_price=current_avg,
                 target_derivative_avg_price=target_avg,
                 entry_id=None,
+                order_ids=tracked_order_ids,
             )
 
         if not tracked_by_ledger:
@@ -2939,6 +3040,7 @@ class ArbitrageExecutor:
                 current_derivative_avg_price=current_avg,
                 target_derivative_avg_price=target_avg,
                 entry_id=None,
+                order_ids=tracked_order_ids,
             )
 
         self._persist_roll_progress_if_tracked(
@@ -2965,6 +3067,7 @@ class ArbitrageExecutor:
                 current_derivative_avg_price=current_avg,
                 target_derivative_avg_price=target_avg,
                 entry_id=entry.entry_id,
+                order_ids=tracked_order_ids,
             )
 
         message = (
@@ -2980,6 +3083,7 @@ class ArbitrageExecutor:
             current_derivative_avg_price=current_avg,
             target_derivative_avg_price=target_avg,
             entry_id=entry.entry_id,
+            order_ids=tracked_order_ids,
         )
 
     def _persist_roll_progress_if_tracked(
@@ -3113,6 +3217,7 @@ class ArbitrageExecutor:
             remaining_qty = planned_derivative_qty
             post_cancel_settle_seconds = _post_cancel_settle_seconds_for_mode(request.execution_mode)
             post_cancel_recovery_seconds = _post_cancel_recovery_seconds_for_mode(request.execution_mode)
+            post_cancel_nonterminal_recovery_seconds = _post_cancel_nonterminal_recovery_seconds_for_mode(request.execution_mode)
             for attempt in range(max(0, request.chase_limit) + 1):
                 if remaining_qty < current_inst.min_size or remaining_qty < target_inst.min_size:
                     break
@@ -3192,6 +3297,7 @@ class ArbitrageExecutor:
                         target_avg=target_maker_avg,
                         settle_seconds=post_cancel_settle_seconds,
                         recovery_seconds=post_cancel_recovery_seconds,
+                        nonterminal_recovery_seconds=post_cancel_nonterminal_recovery_seconds,
                     )
                     if current_batch_filled <= 0 and target_batch_filled <= 0:
                         if attempt >= request.chase_limit:
@@ -3246,6 +3352,7 @@ class ArbitrageExecutor:
                         target_avg=target_maker_avg,
                         settle_seconds=post_cancel_settle_seconds,
                         recovery_seconds=post_cancel_recovery_seconds,
+                        nonterminal_recovery_seconds=post_cancel_nonterminal_recovery_seconds,
                     )
                 if current_batch_filled != current_maker_filled or target_batch_filled != target_maker_filled:
                     self._logger("双边挂单出现单腿先成，已撤单并按最新成交差额立即补齐。")
@@ -3395,6 +3502,7 @@ class ArbitrageExecutor:
             remaining_qty = planned_derivative_qty
             post_cancel_settle_seconds = _post_cancel_settle_seconds_for_mode(request.execution_mode)
             post_cancel_recovery_seconds = _post_cancel_recovery_seconds_for_mode(request.execution_mode)
+            post_cancel_nonterminal_recovery_seconds = _post_cancel_nonterminal_recovery_seconds_for_mode(request.execution_mode)
             for attempt in range(max(0, request.chase_limit) + 1):
                 if remaining_qty < current_inst.min_size:
                     break
@@ -3445,6 +3553,7 @@ class ArbitrageExecutor:
                         known_avg=current_avg_once,
                         settle_seconds=post_cancel_settle_seconds,
                         recovery_seconds=post_cancel_recovery_seconds,
+                        nonterminal_recovery_seconds=post_cancel_nonterminal_recovery_seconds,
                         label=f"移仓旧合约挂单腿 第 {attempt + 1} 次",
                     )
                 if current_filled <= 0:
@@ -3548,6 +3657,7 @@ class ArbitrageExecutor:
             remaining_qty = planned_derivative_qty
             post_cancel_settle_seconds = _post_cancel_settle_seconds_for_mode(request.execution_mode)
             post_cancel_recovery_seconds = _post_cancel_recovery_seconds_for_mode(request.execution_mode)
+            post_cancel_nonterminal_recovery_seconds = _post_cancel_nonterminal_recovery_seconds_for_mode(request.execution_mode)
             for attempt in range(max(0, request.chase_limit) + 1):
                 if remaining_qty < target_inst.min_size:
                     break
@@ -3598,6 +3708,7 @@ class ArbitrageExecutor:
                         known_avg=target_avg_once,
                         settle_seconds=post_cancel_settle_seconds,
                         recovery_seconds=post_cancel_recovery_seconds,
+                        nonterminal_recovery_seconds=post_cancel_nonterminal_recovery_seconds,
                         label=f"移仓目标合约挂单腿 第 {attempt + 1} 次",
                     )
                 if target_filled <= 0:

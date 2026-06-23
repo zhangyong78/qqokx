@@ -57,9 +57,47 @@ class RollTerminalExecutionServiceTests(unittest.TestCase):
                 target_derivative_inst_id="BTC-USD-260925",
             ),
             started_at_ms=100_500,
+            explicit_order_ids=None,
             matched_order_ids_by_leg={"current": {"old-leg-order"}, "target": set()},
         )
         self.assertEqual([item.order_id for item in matched], ["old-leg-order", "target-leg-order"])
+
+    def test_load_recent_roll_fills_prefers_exact_order_ids_even_if_fill_time_is_old(self) -> None:
+        class FakeClient:
+            def get_fills_history(self, *args, **kwargs):  # noqa: ANN002, ANN003
+                return [
+                    OkxFillHistoryItem(
+                        fill_time=1,
+                        inst_id="BTC-USD-260626",
+                        inst_type="FUTURES",
+                        side="buy",
+                        pos_side="short",
+                        fill_price=Decimal("64000"),
+                        fill_size=Decimal("1"),
+                        fill_fee=Decimal("-0.0000013"),
+                        fee_currency="BTC",
+                        pnl=None,
+                        order_id="tracked-order",
+                        trade_id="trade-1",
+                        exec_type=None,
+                        raw={},
+                    )
+                ]
+
+        thread = RollExecutionThread.__new__(RollExecutionThread)
+        thread._runtime = SimpleNamespace(credentials=object(), environment="paper")
+        thread._plan = SimpleNamespace(current=SimpleNamespace(side="\u7a7a"))
+        matched = thread._load_recent_roll_fills(
+            client=FakeClient(),
+            request=SimpleNamespace(
+                current_derivative_inst_id="BTC-USD-260626",
+                target_derivative_inst_id="BTC-USD-260925",
+            ),
+            started_at_ms=100_500,
+            explicit_order_ids={"tracked-order"},
+            matched_order_ids_by_leg={"current": set(), "target": set()},
+        )
+        self.assertEqual([item.order_id for item in matched], ["tracked-order"])
 
     def test_estimate_fill_fee_usdt_totals_from_coin_margin_fill_price(self) -> None:
         totals = RollExecutionThread._estimate_fill_fee_usdt_totals(
@@ -210,6 +248,31 @@ class RollTerminalExecutionServiceTests(unittest.TestCase):
             avg_spread=Decimal("577.3"),
         )
         self.assertEqual(text, "\u6263\u53cc\u817f\u624b\u7eed\u8d39\u540e\u51c0\u4ef7\u5dee\uff1a558.0253 USDT/BTC")
+
+    def test_should_defer_fee_summary_for_nonterminal_result(self) -> None:
+        self.assertTrue(
+            RollExecutionThread._should_defer_fee_summary_for_result(
+                SimpleNamespace(message="移仓部分完成后中断：原因：目标合约挂单腿 撤单后订单仍未进入终态（当前状态：live）。")
+            )
+        )
+        self.assertFalse(
+            RollExecutionThread._should_defer_fee_summary_for_result(
+                SimpleNamespace(message="已按停止请求在当前批次完成后停止：回补 BTC-USD-260626 31.5 张，开出 BTC-USD-260925 31.5 张。")
+            )
+        )
+        self.assertFalse(
+            RollExecutionThread._should_defer_fee_summary_for_result(
+                SimpleNamespace(message="移仓完成：回补 10 张，开出 10 张。")
+            )
+        )
+
+    def test_estimate_roll_fee_history_limit_scales_with_completed_qty(self) -> None:
+        thread = RollExecutionThread.__new__(RollExecutionThread)
+        thread._plan = SimpleNamespace(qty=Decimal("100"), chase_limit=3)
+        self.assertEqual(
+            thread._estimate_roll_fee_history_limit(executed_contract_qty=Decimal("100")),
+            800,
+        )
 
 
 if __name__ == "__main__":

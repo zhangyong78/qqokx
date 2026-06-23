@@ -364,10 +364,14 @@ class UiStrategySessionsMixin:
         if not normalized_ids:
             return False
         running_filter = getattr(self, "running_session_filter", None)
+        running_api_filter = getattr(self, "running_session_api_filter", None)
         if hasattr(running_filter, "set"):
             try:
                 running_filter.set("交易员策略")
+                if hasattr(running_api_filter, "set"):
+                    running_api_filter.set(STRATEGY_BOOK_FILTER_ALL_API)
                 self._refresh_running_session_summary()
+                self._refresh_running_session_tree()
             except Exception:
                 pass
         candidates = [
@@ -394,10 +398,14 @@ class UiStrategySessionsMixin:
         if not normalized_ids:
             return False
         running_filter = getattr(self, "running_session_filter", None)
+        running_api_filter = getattr(self, "running_session_api_filter", None)
         if hasattr(running_filter, "set"):
             try:
                 running_filter.set(filter_label)
+                if hasattr(running_api_filter, "set"):
+                    running_api_filter.set(STRATEGY_BOOK_FILTER_ALL_API)
                 self._refresh_running_session_summary()
+                self._refresh_running_session_tree()
             except Exception:
                 pass
         candidates = [session for session in self.sessions.values() if session.session_id in normalized_ids]
@@ -6559,10 +6567,12 @@ class UiStrategySessionsMixin:
         self._save_trader_desk_snapshot()
         self._ensure_trader_watcher(trader_id)
 
-    def _upsert_session_row(self, session: StrategySession) -> None:
+    def _upsert_session_row(self, session: StrategySession, *, reorder: bool = True) -> None:
         if not QuantApp._session_matches_running_filter(self, session):
             if self.session_tree.exists(session.session_id):
                 self.session_tree.delete(session.session_id)
+            if reorder and hasattr(self, "_apply_running_session_tree_sort_order"):
+                self._apply_running_session_tree_sort_order()
             return
         live_pnl, _ = self._session_live_pnl_snapshot(session)
         open_qty_text = self._session_open_position_amount_text(session)
@@ -6601,6 +6611,8 @@ class UiStrategySessionsMixin:
             self.session_tree.item(session.session_id, values=values, tags=tags)
         else:
             self.session_tree.insert("", END, iid=session.session_id, values=values, tags=tags)
+        if reorder and hasattr(self, "_apply_running_session_tree_sort_order"):
+            self._apply_running_session_tree_sort_order()
 
     def _selected_session(self) -> StrategySession | None:
         selected = self.session_tree.selection()
@@ -6640,7 +6652,228 @@ class UiStrategySessionsMixin:
             "#2": "双击打开并定位对应交易员",
             "#3": "双击切换当前会话发邮件开关",
             "#8": "双击打开这条策略的实时K线图",
+            "#14": "双击查看这条会话的净盈亏明细",
+            "#15": "双击查看最近一笔净盈亏明细",
         }.get(str(column_id or "").strip(), "")
+
+    @staticmethod
+    def _session_trade_detail_reason_text(record: StrategyTradeLedgerRecord) -> str:
+        reason = str(record.close_reason or "").strip()
+        note = str(record.summary_note or "").strip()
+        if reason and note and note != reason:
+            return f"{reason} | {note}"
+        return reason or note or "-"
+
+    def _session_trade_detail_records(
+        self,
+        session: StrategySession,
+        *,
+        latest_only: bool = False,
+    ) -> list[StrategyTradeLedgerRecord]:
+        records = list(self._strategy_live_chart_ledger_records(session))
+        if not latest_only or not records:
+            return records
+        latest_record = max(records, key=lambda item: (item.closed_at or datetime.min, item.record_id))
+        return [latest_record]
+
+    def _populate_session_trade_detail_tree(
+        self,
+        tree: ttk.Treeview,
+        records: list[StrategyTradeLedgerRecord],
+    ) -> None:
+        tree.delete(*tree.get_children())
+        for index, record in enumerate(records, start=1):
+            fee_total = (record.entry_fee or Decimal("0")) + (record.exit_fee or Decimal("0"))
+            net_pnl = record.net_pnl or Decimal("0")
+            if net_pnl > 0:
+                row_tag = "trade_profit"
+            elif net_pnl < 0:
+                row_tag = "trade_loss"
+            else:
+                row_tag = "trade_flat"
+            tree.insert(
+                "",
+                END,
+                iid=record.record_id,
+                values=(
+                    index,
+                    record.direction_label or "-",
+                    _format_history_datetime(record.opened_at),
+                    _format_optional_decimal(record.entry_price),
+                    _format_optional_decimal(record.size),
+                    _format_history_datetime(record.closed_at),
+                    _format_optional_decimal(record.exit_price),
+                    _format_optional_usdt_precise(fee_total, places=2),
+                    _format_optional_usdt_precise(record.funding_fee or Decimal("0"), places=2),
+                    _format_optional_usdt_precise(record.gross_pnl or Decimal("0"), places=2),
+                    _format_optional_usdt_precise(net_pnl, places=2),
+                    self._session_trade_detail_reason_text(record),
+                ),
+                tags=(row_tag,),
+            )
+
+    def _build_session_trade_detail_header_text(
+        self,
+        session: StrategySession,
+        records: list[StrategyTradeLedgerRecord],
+        *,
+        latest_only: bool = False,
+    ) -> str:
+        bar_text = str(getattr(getattr(session, "config", None), "bar", "") or "").strip() or "-"
+        if not records:
+            empty_label = "最近一笔" if latest_only else "当前"
+            return (
+                f"会话 {session.session_id} | {session.symbol} | {bar_text} | {session.direction_label or '-'} | "
+                f"{empty_label}还没有已平仓账本记录"
+            )
+        win_count = sum(1 for item in records if (item.net_pnl or Decimal("0")) > 0)
+        loss_count = sum(1 for item in records if (item.net_pnl or Decimal("0")) < 0)
+        flat_count = sum(1 for item in records if (item.net_pnl or Decimal("0")) == 0)
+        net_total = sum(((item.net_pnl or Decimal("0")) for item in records), Decimal("0"))
+        status_parts = [f"盈利 {win_count}", f"亏损 {loss_count}"]
+        if flat_count:
+            status_parts.append(f"保本 {flat_count}")
+        range_part = f"最近一笔 {len(records)} 单" if latest_only else f"累计平仓 {len(records)} 单"
+        header_text = (
+            f"会话 {session.session_id} | {session.symbol} | {bar_text} | {session.direction_label or '-'} | "
+            f"{range_part} | {' | '.join(status_parts)} | 净盈亏 {_format_optional_usdt_precise(net_total, places=2)}"
+        )
+        return header_text
+
+    def _close_session_trade_detail_window(self) -> None:
+        window = getattr(self, "_session_trade_detail_window", None)
+        if window is not None and _widget_exists(window):
+            window.destroy()
+        self._session_trade_detail_window = None
+        self._session_trade_detail_tree = None
+        self._session_trade_detail_context_label = None
+        self._session_trade_detail_summary_label = None
+
+    def _open_session_trade_detail_window(self, session: StrategySession, *, latest_only: bool = False) -> None:
+        records = self._session_trade_detail_records(session, latest_only=latest_only)
+        if not records:
+            messagebox.showinfo(
+                "净盈亏明细",
+                "当前会话还没有已平仓账本记录，等产生净盈亏后这里会显示明细。",
+                parent=self.root,
+            )
+            return
+
+        window = getattr(self, "_session_trade_detail_window", None)
+        tree = getattr(self, "_session_trade_detail_tree", None)
+        context_label = getattr(self, "_session_trade_detail_context_label", None)
+        summary_label = getattr(self, "_session_trade_detail_summary_label", None)
+        if window is None or not _widget_exists(window) or tree is None or not _widget_exists(tree):
+            window = Toplevel(self.root)
+            apply_window_icon(window)
+            apply_adaptive_window_geometry(
+                window,
+                width_ratio=0.84,
+                height_ratio=0.66,
+                min_width=1160,
+                min_height=460,
+                max_width=1780,
+                max_height=980,
+            )
+            container = ttk.Frame(window, padding=(8, 6))
+            container.pack(fill="both", expand=True)
+            container.columnconfigure(0, weight=1)
+            container.rowconfigure(1, weight=1)
+
+            header = ttk.Frame(container)
+            header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+            header.columnconfigure(0, weight=1)
+            context_label = ttk.Label(header, justify="left")
+            context_label.grid(row=0, column=0, sticky="w")
+            summary_label = ttk.Label(header, justify="left")
+            summary_label.grid(row=1, column=0, sticky="w")
+            ttk.Button(header, text="关闭", command=self._close_session_trade_detail_window).grid(
+                row=0,
+                column=1,
+                rowspan=2,
+                sticky="e",
+            )
+
+            table_frame = ttk.Frame(container)
+            table_frame.grid(row=1, column=0, sticky="nsew")
+            table_frame.columnconfigure(0, weight=1)
+            table_frame.rowconfigure(0, weight=1)
+
+            tree = ttk.Treeview(
+                table_frame,
+                columns=(
+                    "seq",
+                    "direction",
+                    "opened",
+                    "entry",
+                    "size",
+                    "closed",
+                    "exit",
+                    "fee",
+                    "funding",
+                    "gross",
+                    "net",
+                    "reason",
+                ),
+                show="headings",
+                selectmode="browse",
+            )
+            headings = {
+                "seq": "序号",
+                "direction": "方向",
+                "opened": "进场时间",
+                "entry": "进场价格",
+                "size": "开仓数量",
+                "closed": "出场时间",
+                "exit": "出场价格",
+                "fee": "手续费",
+                "funding": "资金费",
+                "gross": "毛盈亏",
+                "net": "净盈亏",
+                "reason": "原因",
+            }
+            for column_id, text in headings.items():
+                tree.heading(column_id, text=text)
+            tree.column("seq", width=60, anchor="center")
+            tree.column("direction", width=72, anchor="center")
+            tree.column("opened", width=150, anchor="center")
+            tree.column("entry", width=102, anchor="e")
+            tree.column("size", width=102, anchor="e")
+            tree.column("closed", width=150, anchor="center")
+            tree.column("exit", width=102, anchor="e")
+            tree.column("fee", width=90, anchor="e")
+            tree.column("funding", width=90, anchor="e")
+            tree.column("gross", width=96, anchor="e")
+            tree.column("net", width=96, anchor="e")
+            tree.column("reason", width=220, anchor="center")
+            tree.tag_configure("trade_profit", foreground="#1a7f37")
+            tree.tag_configure("trade_loss", foreground="#d1242f")
+            tree.tag_configure("trade_flat", foreground="#9a6700")
+            tree.grid(row=0, column=0, sticky="nsew")
+
+            scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+            scroll_x = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+            tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+            scroll_y.grid(row=0, column=1, sticky="ns")
+            scroll_x.grid(row=1, column=0, sticky="ew")
+
+            window.protocol("WM_DELETE_WINDOW", self._close_session_trade_detail_window)
+            self._session_trade_detail_window = window
+            self._session_trade_detail_tree = tree
+            self._session_trade_detail_context_label = context_label
+            self._session_trade_detail_summary_label = summary_label
+
+        header_text = self._build_session_trade_detail_header_text(session, records, latest_only=latest_only)
+        title_prefix = "最近一笔净盈亏明细" if latest_only else "净盈亏明细"
+        window.title(f"{title_prefix} | {session.session_id} | {session.symbol}")
+        if context_label is not None and _widget_exists(context_label):
+            context_label.configure(text=header_text)
+        if summary_label is not None and _widget_exists(summary_label):
+            summary_label.configure(text="")
+        self._populate_session_trade_detail_tree(tree, records)
+        window.deiconify()
+        window.lift()
+        window.focus_force()
 
     def _session_open_position_amount_text(self, session: StrategySession) -> str:
         snapshot = self._positions_snapshot_for_session(session)
@@ -6760,6 +6993,12 @@ class UiStrategySessionsMixin:
             return "break"
         if column_id == "#8":
             self.open_strategy_live_chart_window(session.session_id)
+            return "break"
+        if column_id == "#14":
+            self._open_session_trade_detail_window(session, latest_only=False)
+            return "break"
+        if column_id == "#15":
+            self._open_session_trade_detail_window(session, latest_only=True)
             return "break"
         return None
 

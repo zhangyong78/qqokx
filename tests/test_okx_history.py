@@ -338,6 +338,76 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(items[0].exec_type, "exercise")
         self.assertEqual(items[0].fill_price, Decimal("0.025"))
 
+    def test_get_order_history_pages_when_limit_exceeds_one_page(self) -> None:
+        client = OkxRestClient()
+        seen_after: list[str | None] = []
+        first_page = [
+            {
+                "ordId": str(1000 - index),
+                "instId": "BTC-USD-260626",
+                "instType": "FUTURES",
+                "side": "buy",
+                "posSide": "short",
+                "tdMode": "cross",
+                "ordType": "limit",
+                "state": "filled",
+                "px": "65000",
+                "sz": "1",
+                "accFillSz": "1",
+                "avgPx": "65001",
+                "fee": "-0.000001",
+                "feeCcy": "BTC",
+                "uTime": str(1710000000300 - index),
+                "cTime": str(1710000000200 - index),
+            }
+            for index in range(100)
+        ]
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            self.assertEqual(method, "GET")
+            self.assertEqual(path, "/api/v5/trade/orders-history")
+            after = (params or {}).get("after")
+            seen_after.append(after)
+            if after is None:
+                return {"data": first_page}
+            self.assertEqual(after, "901")
+            return {
+                "data": [
+                    {
+                        "ordId": "900",
+                        "instId": "BTC-USD-260626",
+                        "instType": "FUTURES",
+                        "side": "buy",
+                        "posSide": "short",
+                        "tdMode": "cross",
+                        "ordType": "limit",
+                        "state": "filled",
+                        "px": "65010",
+                        "sz": "1",
+                        "accFillSz": "1",
+                        "avgPx": "65011",
+                        "fee": "-0.000001",
+                        "feeCcy": "BTC",
+                        "uTime": "1710000000100",
+                        "cTime": "1710000000000",
+                    }
+                ]
+            }
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        items = client.get_order_history(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            environment="live",
+            inst_types=("FUTURES",),
+            limit=101,
+            include_algo=False,
+        )
+
+        self.assertEqual(seen_after, [None, "901"])
+        self.assertEqual(len(items), 101)
+        self.assertEqual(items[0].order_id, "1000")
+        self.assertEqual(items[-1].order_id, "900")
+
     def test_filter_fill_history_items_supports_type_side_and_keyword(self) -> None:
         items = [
             OkxFillHistoryItem(

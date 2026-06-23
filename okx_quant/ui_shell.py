@@ -3758,6 +3758,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._strategy_history_mode_combo: ttk.Combobox | None = None
         self._strategy_history_pnl_combo: ttk.Combobox | None = None
         self._strategy_history_status_combo: ttk.Combobox | None = None
+        self.running_session_api_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_API)
+        self._running_session_sort_column = "started"
+        self._running_session_sort_descending = True
         self._strategy_history_sort_column = "started"
         self._strategy_history_sort_descending = True
         self._auto_channel_preview_window: Toplevel | None = None
@@ -5121,6 +5124,16 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         )
         running_session_filter_combo.grid(row=0, column=2, sticky="e")
         running_session_filter_combo.bind("<<ComboboxSelected>>", self._on_running_session_filter_changed)
+        ttk.Label(running_header, text="API").grid(row=0, column=3, sticky="e", padx=(12, 6))
+        self._running_session_api_filter_combo = ttk.Combobox(
+            running_header,
+            textvariable=self.running_session_api_filter,
+            values=(STRATEGY_BOOK_FILTER_ALL_API,),
+            state="readonly",
+            width=14,
+        )
+        self._running_session_api_filter_combo.grid(row=0, column=4, sticky="e")
+        self._running_session_api_filter_combo.bind("<<ComboboxSelected>>", self._on_running_session_filter_changed)
 
         self.session_tree = ttk.Treeview(
             running_frame,
@@ -5163,6 +5176,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("last_pnl", text="上次净盈亏")
         self.session_tree.heading("status", text="状态")
         self.session_tree.heading("started", text="启动时间")
+        self._refresh_running_session_tree_headings()
         self.session_tree.column("session", width=56, anchor="center")
         self.session_tree.column("trader", width=72, anchor="center")
         self.session_tree.column("email", width=56, anchor="center")

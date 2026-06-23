@@ -1655,6 +1655,34 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertEqual(result.ord_id, "ord-recovered")
         self.assertEqual(result.cl_ord_id, "arb-test-timeout")
 
+    def test_place_simple_order_with_recovery_tracks_active_roll_order_id(self) -> None:
+        client = _FakeArbitrageTradeClient()
+        executor = ArbitrageExecutor(client)
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        config = arbitrage_executor_module._build_strategy_config("BTC-USDT-SWAP", runtime)  # noqa: SLF001
+        executor._active_roll_order_ids = set()
+
+        result = executor._place_simple_order_with_recovery(
+            credentials=runtime.credentials,
+            config=config,
+            label="test",
+            inst_id="BTC-USDT-SWAP",
+            side="buy",
+            size=Decimal("1"),
+            ord_type="market",
+            pos_side="short",
+            reduce_only=True,
+            cl_ord_id="arb-track-order",
+        )
+
+        self.assertEqual(result.ord_id, "ord-1")
+        self.assertEqual(executor._active_roll_order_ids, {"ord-1"})
+
     def test_partial_close_updates_open_entry_and_creates_closed_record(self) -> None:
         client = _FakeArbitrageTradeClient()
         executor = ArbitrageExecutor(client)
@@ -2470,6 +2498,60 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertEqual(result.target_derivative_filled_qty, Decimal("1"))
         self.assertEqual(batch_mock.call_count, 1)
 
+    def test_roll_cash_and_carry_result_includes_tracked_order_ids(self) -> None:
+        client = _FakeArbitrageTradeClient()
+        executor = ArbitrageExecutor(client)
+        entry = ArbitrageLedgerEntry(
+            entry_id="entry-open",
+            base_ccy="BTC",
+            pair_kind="spot_quarter",
+            spot_inst_id="BTC-USDT",
+            derivative_inst_id="BTC-USDT-SWAP",
+            spot_qty=Decimal("0.0200"),
+            derivative_qty=Decimal("1"),
+            open_spot_price=Decimal("100"),
+            open_derivative_price=Decimal("101"),
+            close_spot_price=None,
+            close_derivative_price=None,
+            basis_at_open_pct=Decimal("1"),
+            fee_total=Decimal("0"),
+            funding_total=Decimal("0"),
+            realized_pnl=None,
+            close_mode="open",
+            opened_at="2026-06-01T00:00:00Z",
+            closed_at=None,
+            notes="test",
+        )
+        request = ArbitrageRollRequest(
+            entry_id="entry-open",
+            target_derivative_inst_id="BTC-USDT-260926",
+            max_slippage=Decimal("0.0015"),
+            use_limit_orders=False,
+            roll_derivative_qty=Decimal("1"),
+            current_position_side="short",
+        )
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+
+        def fake_roll_single_batch(*args, **kwargs):  # noqa: ANN002, ANN003
+            executor._track_active_roll_order_id("ord-b")
+            executor._track_active_roll_order_id("ord-a")
+            return (Decimal("1"), Decimal("64332.64"), Decimal("1"), Decimal("64910.55"))
+
+        with (
+            patch("okx_quant.arbitrage.arbitrage_executor.find_ledger_entry", return_value=entry),
+            patch("okx_quant.arbitrage.arbitrage_executor.upsert_ledger_entry"),
+            patch.object(executor, "_roll_single_batch", side_effect=fake_roll_single_batch),
+        ):
+            result = executor.roll_cash_and_carry(request, runtime=runtime)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.order_ids, ("ord-a", "ord-b"))
+
     def test_roll_dual_maker_late_fill_after_cancel_is_hedged_before_next_batch(self) -> None:
         client = _FakeArbitrageTradeClient()
         executor = ArbitrageExecutor(client)
@@ -2690,6 +2772,58 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
                 recovery_seconds=0.6,
             )
         self.assertLess(time.time() - started, 0.4)
+
+    def test_wait_order_terminal_after_cancel_with_recovery_can_recover_confirmed_live_order(self) -> None:
+        client = _FakeArbitrageTradeClient()
+        executor = ArbitrageExecutor(client)
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        config = arbitrage_executor_module._build_strategy_config("BTC-USDT-SWAP", runtime)  # noqa: SLF001
+        client.order_statuses[("BTC-USDT-SWAP", "ord-1")] = [
+            OkxOrderStatus(
+                ord_id="ord-1",
+                state="live",
+                side="buy",
+                ord_type="limit",
+                price=Decimal("100"),
+                avg_price=None,
+                size=Decimal("1"),
+                filled_size=Decimal("0"),
+                raw={},
+            ),
+            OkxOrderStatus(
+                ord_id="ord-1",
+                state="canceled",
+                side="buy",
+                ord_type="limit",
+                price=Decimal("100"),
+                avg_price=None,
+                size=Decimal("1"),
+                filled_size=Decimal("0"),
+                raw={},
+            ),
+        ]
+
+        filled, avg_price, state = executor._wait_order_terminal_after_cancel_with_recovery(
+            credentials=runtime.credentials,
+            config=config,
+            inst_id="BTC-USDT-SWAP",
+            ord_id="ord-1",
+            known_filled=Decimal("0"),
+            known_avg=None,
+            label="测试挂单腿",
+            settle_seconds=0.05,
+            recovery_seconds=0.0,
+            nonterminal_recovery_seconds=0.6,
+        )
+
+        self.assertEqual(filled, Decimal("0"))
+        self.assertIsNone(avg_price)
+        self.assertEqual(state, "canceled")
 
     def test_wait_two_maker_orders_until_does_not_hang_on_status_query_timeout(self) -> None:
         class _TimedOutStatusClient(_FakeArbitrageTradeClient):
