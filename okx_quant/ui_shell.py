@@ -3165,6 +3165,141 @@ def _position_history_item_from_cache(record: dict[str, object]) -> OkxPositionH
     )
 
 
+def _position_history_lifecycle_key(item: OkxPositionHistoryItem) -> str:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    inst_id = item.inst_id.strip().upper()
+    pos_id = str(raw.get("posId") or "").strip()
+    created_time = _record_coalesce_int(raw, "cTime")
+    side = str(item.pos_side or item.direction or "").strip().lower()
+    margin_mode = str(item.mgn_mode or "").strip().lower()
+    if pos_id and created_time is not None:
+        return "|".join((inst_id, pos_id, str(created_time)))
+    if created_time is not None:
+        return "|".join((inst_id, str(created_time), side, margin_mode))
+    update_time = _normalize_okx_timestamp_ms(item.update_time) or 0
+    close_size = str(item.close_size) if item.close_size is not None else ""
+    close_avg_price = str(item.close_avg_price) if item.close_avg_price is not None else ""
+    return "|".join((inst_id, str(update_time), side, margin_mode, close_size, close_avg_price))
+
+
+def _position_history_snapshot_close_total(item: OkxPositionHistoryItem) -> Decimal | None:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    return (
+        _parse_decimal_or_none(raw.get("closeTotalPos"))
+        or _parse_decimal_or_none(raw.get("closePos"))
+        or _parse_decimal_or_none(raw.get("closeSz"))
+        or item.close_size
+    )
+
+
+def _position_history_snapshot_open_total(item: OkxPositionHistoryItem) -> Decimal | None:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    return _parse_decimal_or_none(raw.get("openMaxPos"))
+
+
+def _decorate_position_history_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    decorated_records = [dict(record) for record in records if isinstance(record, dict)]
+    parsed_items: list[tuple[int, OkxPositionHistoryItem]] = []
+    for index, record in enumerate(decorated_records):
+        item = _position_history_item_from_cache(record)
+        if item is not None:
+            parsed_items.append((index, item))
+    groups: dict[str, list[tuple[int, OkxPositionHistoryItem]]] = {}
+    for index, item in parsed_items:
+        groups.setdefault(_position_history_lifecycle_key(item), []).append((index, item))
+    for lifecycle_key, entries in groups.items():
+        entries.sort(key=lambda pair: _normalize_okx_timestamp_ms(pair[1].update_time) or 0)
+        previous_close_total: Decimal | None = None
+        group_count = len(entries)
+        for seq, (record_index, item) in enumerate(entries, start=1):
+            record = decorated_records[record_index]
+            raw = dict(record.get("raw")) if isinstance(record.get("raw"), dict) else {}
+            close_total = _position_history_snapshot_close_total(item)
+            open_total = _position_history_snapshot_open_total(item)
+            has_later_snapshot = seq < group_count
+            is_partial_close = False
+            if open_total is not None and close_total is not None and close_total < open_total:
+                is_partial_close = True
+            elif has_later_snapshot:
+                is_partial_close = True
+            incremental_close_total: Decimal | None = None
+            if close_total is not None:
+                incremental_close_total = close_total
+                if previous_close_total is not None:
+                    delta = close_total - previous_close_total
+                    if delta >= 0:
+                        incremental_close_total = delta
+            meta = {
+                "lifecycleKey": lifecycle_key,
+                "snapshotSeq": seq,
+                "snapshotCount": group_count,
+                "isLatestSnapshot": seq == group_count,
+                "isPartialClose": is_partial_close,
+                "prevCloseTotal": str(previous_close_total) if previous_close_total is not None else "",
+                "incrementalCloseTotal": str(incremental_close_total) if incremental_close_total is not None else "",
+                "openTotal": str(open_total) if open_total is not None else "",
+                "closeTotal": str(close_total) if close_total is not None else "",
+            }
+            raw["qqokxHistoryMeta"] = meta
+            record["raw"] = raw
+            record["qqokx_history_meta"] = meta
+            decorated_records[record_index] = record
+            if close_total is not None:
+                previous_close_total = close_total
+    return decorated_records
+
+
+def _collapse_position_history_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    decorated_records = _decorate_position_history_records(records)
+    latest_by_lifecycle: dict[str, tuple[int, dict[str, object]]] = {}
+    for index, record in enumerate(decorated_records):
+        item = _position_history_item_from_cache(record)
+        if item is None:
+            continue
+        lifecycle_key = _position_history_lifecycle_key(item)
+        existing = latest_by_lifecycle.get(lifecycle_key)
+        current_time = _normalize_okx_timestamp_ms(item.update_time) or 0
+        if existing is None:
+            latest_by_lifecycle[lifecycle_key] = (current_time, record)
+            continue
+        existing_time = existing[0]
+        if current_time >= existing_time:
+            latest_by_lifecycle[lifecycle_key] = (current_time, record)
+    collapsed_records = [record for _, record in latest_by_lifecycle.values()]
+    collapsed_records.sort(
+        key=lambda record: _record_coalesce_int(record, "update_time", "uTime", "ts") or 0,
+        reverse=True,
+    )
+    return collapsed_records
+
+
+def _position_history_snapshot_meta(item: OkxPositionHistoryItem) -> dict[str, object]:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    meta = raw.get("qqokxHistoryMeta")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _position_history_is_partial_close(item: OkxPositionHistoryItem) -> bool:
+    meta = _position_history_snapshot_meta(item)
+    return bool(meta.get("isPartialClose"))
+
+
+def _position_history_incremental_close_total(item: OkxPositionHistoryItem) -> Decimal | None:
+    meta = _position_history_snapshot_meta(item)
+    return _parse_decimal_or_none(meta.get("incrementalCloseTotal"))
+
+
+def _position_history_auto_summary(item: OkxPositionHistoryItem) -> str:
+    if not _position_history_is_partial_close(item):
+        return ""
+    return "部分平仓"
+
+
+def _position_history_note_summary_text(item: OkxPositionHistoryItem, note: str) -> str:
+    parts = [part for part in (_position_history_auto_summary(item), _format_position_note_summary(note)) if part and part != "-"]
+    return " | ".join(parts) if parts else "-"
+
+
 @dataclass
 class _DynamicProtectionRuleEditorRow:
     frame: ttk.Frame
@@ -16338,6 +16473,7 @@ def _filter_position_history_items(
                     item.mgn_mode,
                     item.pos_side,
                     item.direction,
+                    _position_history_auto_summary(item),
                     note_texts_by_index.get(index, "") if note_texts_by_index else "",
                 )
                 if part
@@ -17211,16 +17347,31 @@ def _build_position_history_detail_text(
     note: str = "",
 ) -> str:
     note_line = _format_position_note_detail(note)
+    status_text = _position_history_auto_summary(item) or "完整平仓/最终快照"
+    incremental_close_total = _position_history_incremental_close_total(item)
+    incremental_close_line = ""
+    if incremental_close_total is not None:
+        incremental_item = OkxPositionHistoryItem(
+            **{
+                **item.__dict__,
+                "close_size": incremental_close_total,
+            }
+        )
+        incremental_close_line = (
+            f"本次增量平仓：{_format_position_history_size(incremental_item, instruments)}\n"
+        )
     return (
         f"更新时间：{_format_okx_ms_timestamp(item.update_time)}\n"
         f"合约：{item.inst_id or '-'}\n"
         f"类型：{item.inst_type or '-'}\n"
         f"{note_line}"
+        f"状态：{status_text}\n"
         f"保证金模式：{_format_margin_mode(item.mgn_mode or '')}\n"
         f"方向：{_format_history_side(None, item.pos_side or item.direction)}\n"
         f"开仓均价：{_format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type)}\n"
         f"平仓均价：{_format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type)}\n"
         f"平仓数量：{_format_position_history_size(item, instruments)}\n"
+        f"{incremental_close_line}"
         f"手续费：{_format_position_history_fee_cell(item, upl_usdt_prices)}\n"
         f"盈亏：{_format_position_history_pnl(item.pnl, item, usdt_prices=upl_usdt_prices)}\n"
         f"已实现盈亏：{_format_position_history_pnl(item.realized_pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"

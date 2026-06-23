@@ -6676,9 +6676,55 @@ class UiStrategySessionsMixin:
         latest_record = max(records, key=lambda item: (item.closed_at or datetime.min, item.record_id))
         return [latest_record]
 
+    def _session_trade_detail_instruments(self, session: StrategySession) -> dict[str, Instrument]:
+        snapshot = self._positions_snapshot_for_session(session)
+        instruments = dict(getattr(snapshot, "position_instruments", {}) or {})
+        if not instruments:
+            instruments = dict(getattr(self, "_position_instruments", {}) or {})
+        return instruments
+
+    def _session_trade_detail_size_text(
+        self,
+        session: StrategySession,
+        record: StrategyTradeLedgerRecord,
+    ) -> str:
+        if record.size is None:
+            return "-"
+        inst_id = _session_trade_inst_id(session) or str(record.symbol or "").strip().upper()
+        if not inst_id:
+            return _format_optional_decimal(record.size)
+        instruments = self._session_trade_detail_instruments(session)
+        instrument = instruments.get(inst_id)
+        if instrument is None:
+            try:
+                instrument = self.client.get_instrument(inst_id)
+            except Exception:
+                instrument = None
+            else:
+                instruments[inst_id] = instrument
+                cached = dict(getattr(self, "_position_instruments", {}) or {})
+                cached[inst_id] = instrument
+                self._position_instruments = cached
+        amount, currency = _history_display_amount(
+            inst_id=inst_id,
+            inst_type=infer_inst_type(inst_id),
+            size=record.size,
+            reference_price=record.entry_price or record.exit_price,
+            instruments=instruments,
+        )
+        if amount is None:
+            return _format_optional_decimal(record.size)
+        normalized_direction = str(record.direction_label or "").strip()
+        if "空" in normalized_direction:
+            amount = -abs(amount)
+        else:
+            amount = abs(amount)
+        return _format_history_size_amount(amount, currency)
+
     def _populate_session_trade_detail_tree(
         self,
         tree: ttk.Treeview,
+        session: StrategySession,
         records: list[StrategyTradeLedgerRecord],
     ) -> None:
         tree.delete(*tree.get_children())
@@ -6700,7 +6746,7 @@ class UiStrategySessionsMixin:
                     record.direction_label or "-",
                     _format_history_datetime(record.opened_at),
                     _format_optional_decimal(record.entry_price),
-                    _format_optional_decimal(record.size),
+                    self._session_trade_detail_size_text(session, record),
                     _format_history_datetime(record.closed_at),
                     _format_optional_decimal(record.exit_price),
                     _format_optional_usdt_precise(fee_total, places=2),
@@ -6870,7 +6916,7 @@ class UiStrategySessionsMixin:
             context_label.configure(text=header_text)
         if summary_label is not None and _widget_exists(summary_label):
             summary_label.configure(text="")
-        self._populate_session_trade_detail_tree(tree, records)
+        self._populate_session_trade_detail_tree(tree, session, records)
         window.deiconify()
         window.lift()
         window.focus_force()

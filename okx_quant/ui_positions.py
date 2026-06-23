@@ -138,7 +138,7 @@ class UiPositionsMixin:
         return _normalize_position_note_text(record.get("note", "")) if isinstance(record, dict) else ""
 
     def _position_history_note_summary(self, item: OkxPositionHistoryItem) -> str:
-        return _format_position_note_summary(self._position_history_note_text(item))
+        return _position_history_note_summary_text(item, self._position_history_note_text(item))
 
     def _current_position_note_text_map(self) -> dict[str, str]:
         return {
@@ -2279,9 +2279,13 @@ class UiPositionsMixin:
         position_records = load_history_cache_records("positions", profile_name, environment)
         self._latest_order_history = [item for record in order_records if (item := _order_item_from_cache(record)) is not None]
         self._latest_fill_history = [item for record in fill_records if (item := _fill_item_from_cache(record)) is not None]
+        collapsed_position_records = _collapse_position_history_records(position_records)
+        if collapsed_position_records != position_records:
+            save_history_cache_records("positions", profile_name, environment, collapsed_position_records)
         self._latest_position_history = [
-            item for record in position_records if (item := _position_history_item_from_cache(record)) is not None
+            item for record in collapsed_position_records if (item := _position_history_item_from_cache(record)) is not None
         ]
+        self._latest_position_history.sort(key=lambda item: item.update_time or 0, reverse=True)
         self._order_history_usdt_prices = {}
         self._fill_history_usdt_prices = {}
         self._position_history_usdt_prices = {}
@@ -3456,8 +3460,9 @@ class UiPositionsMixin:
             remote_records=[_serialize_history_item(item) for item in position_history],
             dedup_fields=("update_time", "inst_id", "pos_side", "direction", "close_size", "close_avg_price"),
         )
-        save_history_cache_records("positions", active_profile, active_environment, merged_records)
-        parsed_items = [item for record in merged_records if (item := _position_history_item_from_cache(record)) is not None]
+        collapsed_records = _collapse_position_history_records(merged_records)
+        save_history_cache_records("positions", active_profile, active_environment, collapsed_records)
+        parsed_items = [item for record in collapsed_records if (item := _position_history_item_from_cache(record)) is not None]
         parsed_items.sort(key=lambda item: item.update_time or 0, reverse=True)
         self._latest_position_history = parsed_items[: self._position_history_fetch_limit]
         extra_ccys: set[str] = set()
@@ -3632,7 +3637,7 @@ class UiPositionsMixin:
                         with_sign=True,
                         usdt_prices=self._position_history_usdt_prices,
                     ),
-                    self._position_history_note_summary(item),
+                    _position_history_note_summary_text(item, self._position_history_note_text(item)),
                 ),
                 tags=tuple(tag for tag in (_pnl_tag(item.pnl),) if tag),
             )

@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 from okx_quant.backtest_ui import BacktestWindow
 from okx_quant.models import StrategyConfig
-from okx_quant.okx_client import Instrument, OkxOrderResult, OkxOrderStatus, OkxPosition
+from okx_quant.okx_client import Instrument, OkxOrderResult, OkxOrderStatus, OkxPosition, OkxPositionHistoryItem
 from okx_quant.persistence import build_profile_switch_password_snapshot
 from okx_quant.persistence import load_notification_snapshot, save_notification_snapshot
 from okx_quant.strategy_catalog import (
@@ -75,7 +75,12 @@ from okx_quant.ui import (
     _mark_refresh_health_success,
     _merge_history_cache_records,
     _order_item_from_cache,
+    _decorate_position_history_records,
+    _collapse_position_history_records,
     _position_history_item_from_cache,
+    _position_history_incremental_close_total,
+    _position_history_is_partial_close,
+    _position_history_note_summary_text,
     _format_trade_order_coin_size,
     _position_history_note_key,
     _position_note_current_key,
@@ -97,6 +102,148 @@ from okx_quant.ui import (
 
 
 class UiHelpersTest(TestCase):
+    def test_decorate_position_history_records_marks_partial_close_and_increment(self) -> None:
+        first_partial = OkxPositionHistoryItem(
+            update_time=1775023544581,
+            inst_id="BTC-USD-260626",
+            inst_type="FUTURES",
+            mgn_mode="cross",
+            pos_side="net",
+            direction="short",
+            open_avg_price=Decimal("71544.81"),
+            close_avg_price=Decimal("68913.21"),
+            close_size=Decimal("1424"),
+            pnl=Decimal("0.0760062583848"),
+            realized_pnl=Decimal("0.9662040588328357"),
+            settle_pnl=Decimal("0"),
+            raw={"posId": "3153500435885170688", "cTime": "1766484036639", "uTime": "1775023544581"},
+        )
+        latest_partial = OkxPositionHistoryItem(
+            update_time=1782195915590,
+            inst_id="BTC-USD-260626",
+            inst_type="FUTURES",
+            mgn_mode="cross",
+            pos_side="net",
+            direction="short",
+            open_avg_price=Decimal("68491.42"),
+            close_avg_price=Decimal("67217.79"),
+            close_size=Decimal("2759"),
+            pnl=Decimal("0.07632582993809"),
+            realized_pnl=Decimal("1.0310427751331068"),
+            settle_pnl=Decimal("0"),
+            raw={"posId": "3153500435885170688", "cTime": "1766484036639", "uTime": "1782195915590"},
+        )
+        independent_cycle = OkxPositionHistoryItem(
+            update_time=1780646422967,
+            inst_id="BTC-USD-260605",
+            inst_type="FUTURES",
+            mgn_mode="cross",
+            pos_side="net",
+            direction="short",
+            open_avg_price=Decimal("62766.00"),
+            close_avg_price=Decimal("62703.94"),
+            close_size=Decimal("197.4"),
+            pnl=Decimal("0.00031125496059"),
+            realized_pnl=Decimal("0.0002325984646705"),
+            settle_pnl=Decimal("0"),
+            raw={"posId": "3628698346731446272", "cTime": "1780646366221", "uTime": "1780646422967"},
+        )
+
+        decorated = _decorate_position_history_records(
+            [
+                {"inst_id": first_partial.inst_id, "inst_type": first_partial.inst_type, "mgn_mode": first_partial.mgn_mode, "pos_side": first_partial.pos_side, "direction": first_partial.direction, "open_avg_price": str(first_partial.open_avg_price), "close_avg_price": str(first_partial.close_avg_price), "close_size": str(first_partial.close_size), "pnl": str(first_partial.pnl), "realized_pnl": str(first_partial.realized_pnl), "settle_pnl": str(first_partial.settle_pnl), "update_time": first_partial.update_time, "raw": dict(first_partial.raw)},
+                {"inst_id": independent_cycle.inst_id, "inst_type": independent_cycle.inst_type, "mgn_mode": independent_cycle.mgn_mode, "pos_side": independent_cycle.pos_side, "direction": independent_cycle.direction, "open_avg_price": str(independent_cycle.open_avg_price), "close_avg_price": str(independent_cycle.close_avg_price), "close_size": str(independent_cycle.close_size), "pnl": str(independent_cycle.pnl), "realized_pnl": str(independent_cycle.realized_pnl), "settle_pnl": str(independent_cycle.settle_pnl), "update_time": independent_cycle.update_time, "raw": dict(independent_cycle.raw)},
+                {"inst_id": latest_partial.inst_id, "inst_type": latest_partial.inst_type, "mgn_mode": latest_partial.mgn_mode, "pos_side": latest_partial.pos_side, "direction": latest_partial.direction, "open_avg_price": str(latest_partial.open_avg_price), "close_avg_price": str(latest_partial.close_avg_price), "close_size": str(latest_partial.close_size), "pnl": str(latest_partial.pnl), "realized_pnl": str(latest_partial.realized_pnl), "settle_pnl": str(latest_partial.settle_pnl), "update_time": latest_partial.update_time, "raw": dict(latest_partial.raw)},
+            ]
+        )
+        decorated_items = [_position_history_item_from_cache(record) for record in decorated]
+        decorated_items = [item for item in decorated_items if item is not None]
+
+        self.assertEqual(len(decorated_items), 3)
+        self.assertTrue(_position_history_is_partial_close(decorated_items[0]))
+        self.assertEqual(_position_history_incremental_close_total(decorated_items[0]), Decimal("1424"))
+        self.assertFalse(_position_history_is_partial_close(decorated_items[1]))
+        self.assertFalse(_position_history_is_partial_close(decorated_items[2]))
+        self.assertEqual(_position_history_incremental_close_total(decorated_items[2]), Decimal("1335"))
+        self.assertEqual(_position_history_note_summary_text(decorated_items[0], ""), "部分平仓")
+
+    def test_collapse_position_history_records_keeps_only_latest_snapshot_per_lifecycle(self) -> None:
+        records = [
+            {
+                "inst_id": "BTC-USD-260626",
+                "inst_type": "FUTURES",
+                "mgn_mode": "cross",
+                "pos_side": "net",
+                "direction": "short",
+                "open_avg_price": "71544.81",
+                "close_avg_price": "68913.21",
+                "close_size": "1424",
+                "pnl": "0.0760062583848",
+                "realized_pnl": "0.9662040588328357",
+                "settle_pnl": "0",
+                "update_time": 1775023544581,
+                "raw": {
+                    "posId": "3153500435885170688",
+                    "cTime": "1766484036639",
+                    "uTime": "1775023544581",
+                    "closeTotalPos": "1424",
+                    "openMaxPos": "2670",
+                },
+            },
+            {
+                "inst_id": "BTC-USD-260626",
+                "inst_type": "FUTURES",
+                "mgn_mode": "cross",
+                "pos_side": "net",
+                "direction": "short",
+                "open_avg_price": "71812.33",
+                "close_avg_price": "69512.06",
+                "close_size": "1647",
+                "pnl": "0.07589504125071",
+                "realized_pnl": "0.8077364316888233",
+                "settle_pnl": "0",
+                "update_time": 1780117969243,
+                "raw": {
+                    "posId": "3153500435885170688",
+                    "cTime": "1766484036639",
+                    "uTime": "1780117969243",
+                    "closeTotalPos": "1647",
+                    "openMaxPos": "2670",
+                },
+            },
+            {
+                "inst_id": "BTC-USD-260605",
+                "inst_type": "FUTURES",
+                "mgn_mode": "cross",
+                "pos_side": "net",
+                "direction": "short",
+                "open_avg_price": "62766.00",
+                "close_avg_price": "62703.94",
+                "close_size": "197.4",
+                "pnl": "0.00031125496059",
+                "realized_pnl": "0.0002325984646705",
+                "settle_pnl": "0",
+                "update_time": 1780646422967,
+                "raw": {
+                    "posId": "3628698346731446272",
+                    "cTime": "1780646366221",
+                    "uTime": "1780646422967",
+                    "closeTotalPos": "197.4",
+                    "openMaxPos": "197.4",
+                },
+            },
+        ]
+
+        collapsed = _collapse_position_history_records(records)
+        collapsed_items = [_position_history_item_from_cache(record) for record in collapsed]
+        collapsed_items = [item for item in collapsed_items if item is not None]
+
+        self.assertEqual(len(collapsed_items), 2)
+        self.assertEqual(collapsed_items[0].inst_id, "BTC-USD-260605")
+        self.assertEqual(collapsed_items[1].inst_id, "BTC-USD-260626")
+        self.assertTrue(_position_history_is_partial_close(collapsed_items[1]))
+        self.assertEqual(_position_history_incremental_close_total(collapsed_items[1]), Decimal("223"))
+
     def test_serialize_strategy_config_snapshot_converts_dynamic_protection_rules(self) -> None:
         config = StrategyConfig(
             inst_id="SOL-USDT-SWAP",
