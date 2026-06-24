@@ -1535,6 +1535,35 @@ class OkxRestClient:
             return "long" if trade_side == "buy" else "short"
         return None
 
+    def _reduce_only_order_pos_side(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        instrument: Instrument,
+        trade_side: str,
+        *,
+        plan_pos_side: str | None,
+    ) -> str | None:
+        normalized_plan_pos = (plan_pos_side or "").strip().lower()
+        acct = self._get_account_config_cached(credentials, config)
+        acct_mode = (acct.position_mode or "").strip().lower() if acct is not None else ""
+        if acct_mode == "net_mode":
+            return None
+        if normalized_plan_pos in {"long", "short"}:
+            return normalized_plan_pos
+        expects_long_short = instrument.inst_type in {"SWAP", "FUTURES"} and (
+            acct_mode == "long_short_mode" or config.position_mode == "long_short"
+        )
+        if expects_long_short:
+            raise OkxApiError("双向持仓模式下，reduceOnly 平仓单必须显式传入 posSide；已拦截以避免误开反向仓位。")
+        return self._derivative_order_pos_side(
+            credentials,
+            config,
+            instrument,
+            trade_side,
+            plan_pos_side=plan_pos_side,
+        )
+
     def _maybe_isolated_margin_ccy(self, order: dict[str, Any], *, instrument: Instrument, config: StrategyConfig) -> None:
         if config.trade_mode != "isolated" or instrument.inst_type not in {"SWAP", "FUTURES"}:
             return
@@ -2267,21 +2296,13 @@ class OkxRestClient:
             "reduceOnly": True,
             "cxlOnClosePos": True,
         }
-        normalized_plan_pos = (pos_side or "").strip().lower()
-        acct = self._get_account_config_cached(credentials, config)
-        acct_mode = (acct.position_mode or "").strip().lower() if acct is not None else ""
-        if acct_mode == "net_mode":
-            resolved_pos_side = None
-        elif normalized_plan_pos in {"long", "short"}:
-            resolved_pos_side = normalized_plan_pos
-        else:
-            resolved_pos_side = self._derivative_order_pos_side(
-                credentials,
-                config,
-                instrument,
-                side,
-                plan_pos_side=pos_side,
-            )
+        resolved_pos_side = self._reduce_only_order_pos_side(
+            credentials,
+            config,
+            instrument,
+            side,
+            plan_pos_side=pos_side,
+        )
         if resolved_pos_side:
             order["posSide"] = resolved_pos_side
         self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
@@ -2339,21 +2360,13 @@ class OkxRestClient:
                 if inst.inst_type == "SPOT":
                     order["tdMode"] = "cash"
                 if reduce_only:
-                    normalized_plan_pos = (pos_side or "").strip().lower()
-                    acct = self._get_account_config_cached(credentials, config)
-                    acct_mode = (acct.position_mode or "").strip().lower() if acct is not None else ""
-                    if acct_mode == "net_mode":
-                        resolved_pos = None
-                    elif normalized_plan_pos in {"long", "short"}:
-                        resolved_pos = normalized_plan_pos
-                    else:
-                        resolved_pos = self._derivative_order_pos_side(
-                            credentials,
-                            config,
-                            inst,
-                            side,
-                            plan_pos_side=pos_side,
-                        )
+                    resolved_pos = self._reduce_only_order_pos_side(
+                        credentials,
+                        config,
+                        inst,
+                        side,
+                        plan_pos_side=pos_side,
+                    )
                 else:
                     resolved_pos = self._derivative_order_pos_side(
                         credentials,

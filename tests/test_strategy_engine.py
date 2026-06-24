@@ -27,7 +27,7 @@ from okx_quant.engine import (
 )
 from okx_quant.engine_strategy_router import EngineStrategyRouter
 from okx_quant.models import Candle, Credentials, Instrument, OrderPlan, SignalDecision, StrategyConfig
-from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxTradeOrderItem
+from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxPosition, OkxTradeOrderItem
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategy_catalog import (
     STRATEGY_EMA_BREAKOUT_LONG_ID,
@@ -237,6 +237,310 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(monitor_calls, [True])
         self.assertTrue(any("本轮持仓已结束，继续监控下一次信号。" in message for message in messages))
         self.assertEqual(waits, [10])
+
+    def test_wait_for_order_fill_recovers_long_short_pos_side_from_account_mode(self) -> None:
+        class _Client:
+            @staticmethod
+            def _get_account_config_cached(credentials, config):  # noqa: ANN001,ARG004
+                return type("Cfg", (), {"position_mode": "long_short_mode"})()
+
+        engine = StrategyEngine(_Client(), lambda _message: None)
+        engine._get_order_with_retry = lambda *args, **kwargs: OkxOrderStatus(  # type: ignore[assignment]
+            ord_id="ord-short-1",
+            state="filled",
+            side="sell",
+            ord_type="market",
+            price=Decimal("71.84"),
+            avg_price=Decimal("71.84"),
+            size=Decimal("4.05"),
+            filled_size=Decimal("4.05"),
+            raw={},
+        )
+        instrument = Instrument(
+            inst_id="SOL-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        config = StrategyConfig(
+            inst_id="SOL-USDT-SWAP",
+            trade_inst_id="SOL-USDT-SWAP",
+            bar="1H",
+            ema_period=20,
+            trend_ema_period=55,
+            atr_period=15,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+        )
+
+        filled = engine._wait_for_order_fill(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            config,
+            trade_instrument=instrument,
+            side="sell",
+            pos_side=None,
+            result=OkxOrderResult(
+                ord_id="ord-short-1",
+                cl_ord_id="cl-short-1",
+                s_code="0",
+                s_msg="accepted",
+                raw={},
+            ),
+            estimated_entry=Decimal("71.84"),
+        )
+
+        self.assertEqual(filled.pos_side, "short")
+        self.assertEqual(filled.close_side, "buy")
+
+    def test_find_managed_position_recovers_expected_side_from_account_mode(self) -> None:
+        class _Client:
+            @staticmethod
+            def _get_account_config_cached(credentials, config):  # noqa: ANN001,ARG004
+                return type("Cfg", (), {"position_mode": "long_short_mode"})()
+
+        engine = StrategyEngine(_Client(), lambda _message: None)
+        engine._get_positions_with_retry = lambda *args, **kwargs: [  # type: ignore[assignment]
+            OkxPosition(
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                pos_side="long",
+                mgn_mode="cross",
+                position=Decimal("0.02"),
+                avail_position=Decimal("0.02"),
+                avg_price=Decimal("2300"),
+                mark_price=Decimal("2301"),
+                unrealized_pnl=None,
+                unrealized_pnl_ratio=None,
+                liquidation_price=None,
+                leverage=None,
+                margin_ccy=None,
+                last_price=None,
+                realized_pnl=None,
+                margin_ratio=None,
+                initial_margin=None,
+                maintenance_margin=None,
+                delta=None,
+                gamma=None,
+                vega=None,
+                theta=None,
+                raw={},
+            )
+        ]
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            trade_inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+        )
+        position = FilledPosition(
+            ord_id="ord-1",
+            cl_ord_id="cl-1",
+            inst_id="ETH-USDT-SWAP",
+            side="buy",
+            close_side="sell",
+            pos_side=None,
+            size=Decimal("0.02"),
+            entry_price=Decimal("2300"),
+            entry_ts=0,
+        )
+
+        matched = engine._find_managed_position(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            config,
+            instrument,
+            position,
+        )
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched.pos_side, "long")
+
+    def test_find_managed_position_rejects_mismatched_pos_side_takeover(self) -> None:
+        class _Client:
+            @staticmethod
+            def _get_account_config_cached(credentials, config):  # noqa: ANN001,ARG004
+                return type("Cfg", (), {"position_mode": "long_short_mode"})()
+
+        engine = StrategyEngine(_Client(), lambda _message: None)
+        engine._get_positions_with_retry = lambda *args, **kwargs: [  # type: ignore[assignment]
+            OkxPosition(
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                pos_side="short",
+                mgn_mode="cross",
+                position=Decimal("0.02"),
+                avail_position=Decimal("0.02"),
+                avg_price=Decimal("2300"),
+                mark_price=Decimal("2301"),
+                unrealized_pnl=None,
+                unrealized_pnl_ratio=None,
+                liquidation_price=None,
+                leverage=None,
+                margin_ccy=None,
+                last_price=None,
+                realized_pnl=None,
+                margin_ratio=None,
+                initial_margin=None,
+                maintenance_margin=None,
+                delta=None,
+                gamma=None,
+                vega=None,
+                theta=None,
+                raw={},
+            )
+        ]
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            trade_inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+        )
+        position = FilledPosition(
+            ord_id="ord-1",
+            cl_ord_id="cl-1",
+            inst_id="ETH-USDT-SWAP",
+            side="buy",
+            close_side="sell",
+            pos_side=None,
+            size=Decimal("0.02"),
+            entry_price=Decimal("2300"),
+            entry_ts=0,
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            engine._find_managed_position(
+                Credentials(api_key="", secret_key="", passphrase=""),
+                config,
+                instrument,
+                position,
+            )
+
+        self.assertIn("拒绝接管现有持仓", str(ctx.exception))
+        self.assertIn("预期posSide=long", str(ctx.exception))
+
+    def test_close_position_resolves_exit_pos_side_from_account_mode(self) -> None:
+        captured_exit: dict[str, object] = {}
+
+        class _Client:
+            @staticmethod
+            def _get_account_config_cached(credentials, config):  # noqa: ANN001,ARG004
+                return type("Cfg", (), {"position_mode": "long_short_mode"})()
+
+        engine = StrategyEngine(_Client(), lambda _message: None)
+        engine._place_exit_order = lambda credentials, config, **kwargs: captured_exit.update(kwargs) or OkxOrderResult(  # type: ignore[assignment]
+            ord_id="ord-exit-1",
+            cl_ord_id="cl-exit-1",
+            s_code="0",
+            s_msg="accepted",
+            raw={},
+        )
+        engine._wait_for_order_fill = lambda *args, **kwargs: FilledPosition(  # type: ignore[assignment]
+            ord_id="ord-exit-1",
+            cl_ord_id="cl-exit-1",
+            inst_id="SOL-USDT-SWAP",
+            side="buy",
+            close_side="sell",
+            pos_side="short",
+            size=Decimal("4.05"),
+            entry_price=Decimal("69.56"),
+            entry_ts=0,
+        )
+        engine._lookup_recent_position_close_history = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._position_history_total_net_pnl_text = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._notify_trade_close = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._estimate_trade_entry_price_with_retry = lambda *args, **kwargs: Decimal("69.56")  # type: ignore[assignment]
+        instrument = Instrument(
+            inst_id="SOL-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+        config = StrategyConfig(
+            inst_id="SOL-USDT-SWAP",
+            trade_inst_id="SOL-USDT-SWAP",
+            bar="1H",
+            ema_period=20,
+            trend_ema_period=55,
+            atr_period=15,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+        )
+        position = FilledPosition(
+            ord_id="ord-entry-1",
+            cl_ord_id="cl-entry-1",
+            inst_id="SOL-USDT-SWAP",
+            side="sell",
+            close_side="buy",
+            pos_side=None,
+            size=Decimal("4.05"),
+            entry_price=Decimal("71.84"),
+            entry_ts=0,
+        )
+
+        engine._close_position(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            config,
+            instrument,
+            position,
+            "斜率转正",
+        )
+
+        self.assertEqual(captured_exit["pos_side"], "short")
 
     def test_get_okx_read_retry_config_env_overrides(self) -> None:
         with patch.dict(

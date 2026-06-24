@@ -1258,13 +1258,20 @@ class StrategyEngine:
                 ):
                     filled_price = status.avg_price or status.price or active_order.entry_reference
                     filled_size = status.filled_size or status.size or active_order.size
+                    recovered_pos_side = self._resolve_filled_position_pos_side(
+                        credentials,
+                        config,
+                        trade_instrument=instrument,
+                        side=active_order.side,
+                        pos_side=resolve_open_pos_side(config, active_order.side),
+                    )
                     position = FilledPosition(
                         ord_id=status.ord_id or active_order.ord_id,
                         cl_ord_id=active_order.cl_ord_id,
                         inst_id=instrument.inst_id,
                         side=active_order.side,
                         close_side="sell" if active_order.side == "buy" else "buy",
-                        pos_side=resolve_open_pos_side(config, active_order.side),
+                        pos_side=recovered_pos_side,
                         size=filled_size,
                         entry_price=filled_price,
                         entry_ts=int(time.time() * 1000),
@@ -3715,6 +3722,13 @@ class StrategyEngine:
     ) -> None:
         remaining = position.size
         lot = trade_instrument.lot_size
+        effective_pos_side = self._resolve_filled_position_pos_side(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            side=position.side,
+            pos_side=position.pos_side,
+        )
         for _ in range(3):
             if remaining <= 0:
                 break
@@ -3733,14 +3747,14 @@ class StrategyEngine:
                 trade_instrument=trade_instrument,
                 side=position.close_side,
                 size=size,
-                pos_side=position.pos_side,
+                pos_side=effective_pos_side,
             )
             filled = self._wait_for_order_fill(
                 credentials,
                 config,
                 trade_instrument=trade_instrument,
                 side=position.close_side,
-                pos_side=position.pos_side,
+                pos_side=effective_pos_side,
                 result=result,
                 estimated_entry=self._estimate_trade_entry_price_with_retry(trade_instrument, position.close_side),
             )
@@ -4558,15 +4572,52 @@ class StrategyEngine:
             config,
             inst_type=trade_instrument.inst_type,
         )
-        for item in positions:
-            if item.inst_id != trade_instrument.inst_id:
-                continue
-            item_pos_side = (item.pos_side or "").strip().lower()
-            expected_pos_side = (position.pos_side or "").strip().lower()
-            if expected_pos_side:
-                if item_pos_side != expected_pos_side:
-                    continue
-            elif config.position_mode == "net":
+        candidates = [
+            item
+            for item in positions
+            if item.inst_id == trade_instrument.inst_id
+            and (item.avail_position if item.avail_position not in {None, Decimal("0")} else item.position) != 0
+        ]
+        if not candidates:
+            return None
+
+        expected_pos_side = (
+            self._resolve_filled_position_pos_side(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+                side=position.side,
+                pos_side=position.pos_side,
+            )
+            or ""
+        ).strip().lower()
+        if expected_pos_side:
+            directional = [
+                item
+                for item in candidates
+                if str(item.pos_side or "").strip().lower() == expected_pos_side
+            ]
+            if directional:
+                directional.sort(
+                    key=lambda item: abs(
+                        item.avail_position if item.avail_position not in {None, Decimal("0")} else item.position
+                    ),
+                    reverse=True,
+                )
+                return directional[0]
+            actual_sides = ", ".join(
+                f"{(str(item.pos_side or '').strip().lower() or 'net')}:{format_decimal(abs(item.position))}"
+                for item in candidates
+            )
+            raise RuntimeError(
+                "拒绝接管现有持仓：交易所持仓侧与策略预期不一致"
+                f" | 标的={trade_instrument.inst_id}"
+                f" | 预期posSide={expected_pos_side}"
+                f" | 实际={actual_sides or '-'}"
+            )
+
+        for item in candidates:
+            if config.position_mode == "net":
                 if position.side == "buy" and item.position < 0:
                     continue
                 if position.side == "sell" and item.position > 0:
@@ -5452,6 +5503,13 @@ class StrategyEngine:
 
         latest_state = ""
         price_delta_multiplier = _instrument_price_delta_multiplier(trade_instrument)
+        effective_pos_side = self._resolve_filled_position_pos_side(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            side=side,
+            pos_side=pos_side,
+        )
         for _ in range(12):
             status = self._get_order_with_retry(
                 credentials,
@@ -5468,7 +5526,7 @@ class StrategyEngine:
                     inst_id=trade_instrument.inst_id,
                     side=side,
                     close_side="sell" if side == "buy" else "buy",
-                    pos_side=pos_side,
+                    pos_side=effective_pos_side,
                     size=filled_size if filled_size > 0 else status.size or Decimal("0"),
                     entry_price=status.avg_price or status.price or estimated_entry,
                     entry_ts=int(time.time() * 1000),
@@ -5481,7 +5539,7 @@ class StrategyEngine:
                     inst_id=trade_instrument.inst_id,
                     side=side,
                     close_side="sell" if side == "buy" else "buy",
-                    pos_side=pos_side,
+                    pos_side=effective_pos_side,
                     size=filled_size,
                     entry_price=status.avg_price or status.price or estimated_entry,
                     entry_ts=int(time.time() * 1000),
@@ -5492,6 +5550,34 @@ class StrategyEngine:
             self._stop_event.wait(max(config.poll_seconds / 2, 0.5))
 
         raise RuntimeError(f"订单未成交，ordId={result.ord_id}，状态={latest_state or 'unknown'}")
+
+    def _resolve_filled_position_pos_side(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        side: Literal["buy", "sell"],
+        pos_side: Literal["long", "short"] | None,
+    ) -> Literal["long", "short"] | None:
+        if pos_side in {"long", "short"}:
+            return pos_side
+        if trade_instrument.inst_type not in {"SWAP", "FUTURES"}:
+            return pos_side
+        if config.position_mode == "long_short":
+            return "long" if side == "buy" else "short"
+        get_account_config_cached = getattr(self._client, "_get_account_config_cached", None)
+        if callable(get_account_config_cached):
+            try:
+                acct = get_account_config_cached(credentials, config)
+            except Exception:
+                acct = None
+            acct_mode = (getattr(acct, "position_mode", "") or "").strip().lower()
+            if acct_mode == "long_short_mode":
+                return "long" if side == "buy" else "short"
+            if acct_mode == "net_mode":
+                return None
+        return pos_side
 
     def _next_client_order_id(self, *, role: str) -> str:
         return self._order_service.next_client_order_id(role=role)
@@ -5661,6 +5747,13 @@ class StrategyEngine:
         filled_size = status.filled_size or status.size or active_order.size
         ord_id = status.ord_id or active_order.ord_id
         price_delta_multiplier = _instrument_price_delta_multiplier(trade_instrument)
+        recovered_pos_side = self._resolve_filled_position_pos_side(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            side=active_order.side,
+            pos_side=resolve_open_pos_side(config, active_order.side),
+        )
         if config.trader_virtual_stop_loss:
             self._logger(
                 f"{_fmt_ts(newest_ts)} | 挂单已成交 | ordId={ord_id} | "
@@ -5684,7 +5777,7 @@ class StrategyEngine:
                 inst_id=trade_instrument.inst_id,
                 side=active_order.side,
                 close_side="sell" if active_order.side == "buy" else "buy",
-                pos_side=resolve_open_pos_side(config, active_order.side),
+                pos_side=recovered_pos_side,
                 size=filled_size,
                 entry_price=filled_price,
                 entry_ts=int(time.time() * 1000),
@@ -5727,7 +5820,7 @@ class StrategyEngine:
             inst_id=trade_instrument.inst_id,
             side=active_order.side,
             close_side="sell" if active_order.side == "buy" else "buy",
-            pos_side=resolve_open_pos_side(config, active_order.side),
+            pos_side=recovered_pos_side,
             size=filled_size,
             entry_price=filled_price,
             entry_ts=int(time.time() * 1000),
@@ -5988,13 +6081,20 @@ class StrategyEngine:
 
         filled_price = latest_status.avg_price or latest_status.price or active_order.entry_reference
         filled_size = latest_status.filled_size or latest_status.size or active_order.size
+        recovered_pos_side = self._resolve_filled_position_pos_side(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            side=active_order.side,
+            pos_side=resolve_open_pos_side(config, active_order.side),
+        )
         position = FilledPosition(
             ord_id=latest_status.ord_id or ord_id,
             cl_ord_id=active_order.cl_ord_id,
             inst_id=trade_instrument.inst_id,
             side=active_order.side,
             close_side="sell" if active_order.side == "buy" else "buy",
-            pos_side=resolve_open_pos_side(config, active_order.side),
+            pos_side=recovered_pos_side,
             size=filled_size,
             entry_price=filled_price,
             entry_ts=int(time.time() * 1000),

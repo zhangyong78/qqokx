@@ -8545,13 +8545,15 @@ class UiStrategySessionsMixin:
                 self._enqueue_log(f"{session.log_prefix} 缺少有效开仓价，恢复接管已跳过。")
             return False
         size = abs(live_position.avail_position if live_position.avail_position not in {None, Decimal('0')} else live_position.position)
+        live_pos_side = str(live_position.pos_side or "").strip().lower()
+        recovered_pos_side = live_pos_side if live_pos_side in {"long", "short"} else None
         position = FilledPosition(
             ord_id=trade.entry_order_id or f"recovered-{session.session_id}",
             cl_ord_id=trade.entry_client_order_id or None,
             inst_id=trade_inst_id,
             side="buy" if direction == "long" else "sell",
             close_side="sell" if direction == "long" else "buy",
-            pos_side=direction if session.config.position_mode == "long_short" else None,
+            pos_side=recovered_pos_side,
             size=size,
             entry_price=entry_price,
             entry_ts=int((trade.opened_logged_at or session.started_at).timestamp() * 1000),
