@@ -3813,6 +3813,8 @@ class StrategyEngine:
                 config,
                 trade_instrument=trade_instrument,
                 position=closed_position,
+                exit_price=filled.entry_price,
+                close_ms=filled.entry_ts,
             )
             close_trade_pnl = self._position_history_total_net_pnl_text(
                 credentials,
@@ -4510,6 +4512,7 @@ class StrategyEngine:
                             config,
                             trade_instrument=trade_instrument,
                             position=position,
+                            close_ms=int(time.time() * 1000),
                         ),
                     ),
                 )
@@ -4674,6 +4677,8 @@ class StrategyEngine:
         *,
         trade_instrument: Instrument,
         position: FilledPosition,
+        exit_price: Decimal | None = None,
+        close_ms: int = 0,
         max_attempts: int = 3,
         delay_seconds: float = 1.0,
     ) -> OkxPositionHistoryItem | None:
@@ -4687,6 +4692,8 @@ class StrategyEngine:
             matched = self._match_recent_position_close_history(
                 items,
                 position=position,
+                exit_price=exit_price,
+                close_ms=close_ms,
             )
             if matched is not None:
                 return matched
@@ -4699,13 +4706,17 @@ class StrategyEngine:
         items: list[OkxPositionHistoryItem],
         *,
         position: FilledPosition,
+        exit_price: Decimal | None = None,
+        close_ms: int = 0,
     ) -> OkxPositionHistoryItem | None:
         expected_pos_side = (position.pos_side or "").strip().lower()
         expected_size = abs(position.size)
         expected_entry = position.entry_price if position.entry_price > 0 else None
+        expected_exit = exit_price if exit_price is not None and exit_price > 0 else None
         now_ms = int(time.time() * 1000)
         best_item: OkxPositionHistoryItem | None = None
         best_score = -1
+        best_time_gap: int | None = None
         for item in items:
             if item.inst_id != position.inst_id:
                 continue
@@ -4736,14 +4747,42 @@ class StrategyEngine:
                 elif diff_ratio > Decimal("0.08"):
                     score -= 20
 
-            if item.update_time is not None:
-                age_ms = max(0, now_ms - item.update_time)
-                if age_ms <= 5 * 60 * 1000:
+            if item.close_avg_price is not None and expected_exit is not None:
+                diff_ratio = abs(item.close_avg_price - expected_exit) / expected_exit
+                if diff_ratio <= Decimal("0.002"):
+                    score += 35
+                elif diff_ratio <= Decimal("0.02"):
                     score += 20
-                elif age_ms <= 60 * 60 * 1000:
-                    score += 10
-                elif age_ms > 3 * 24 * 60 * 60 * 1000:
-                    score -= 30
+                elif diff_ratio > Decimal("0.08"):
+                    score -= 20
+
+            update_time = item.update_time
+            if close_ms > 0:
+                if update_time is None:
+                    continue
+                if update_time + 10 * 60 * 1000 < close_ms:
+                    continue
+                if update_time - close_ms > 2 * 60 * 60 * 1000:
+                    continue
+                time_gap = abs(update_time - close_ms)
+                if time_gap <= 2 * 60 * 1000:
+                    score += 25
+                elif time_gap <= 15 * 60 * 1000:
+                    score += 15
+                elif time_gap <= 2 * 60 * 60 * 1000:
+                    score += 5
+                else:
+                    score -= 10
+            else:
+                time_gap = None
+                if update_time is not None:
+                    age_ms = max(0, now_ms - update_time)
+                    if age_ms <= 5 * 60 * 1000:
+                        score += 20
+                    elif age_ms <= 60 * 60 * 1000:
+                        score += 10
+                    elif age_ms > 3 * 24 * 60 * 60 * 1000:
+                        score -= 30
 
             if item.realized_pnl is not None or item.pnl is not None:
                 score += 5
@@ -4751,6 +4790,17 @@ class StrategyEngine:
             if score > best_score:
                 best_item = item
                 best_score = score
+                best_time_gap = time_gap
+                continue
+            if score == best_score and score >= 100 and close_ms > 0:
+                current_gap = time_gap if time_gap is not None else 1 << 30
+                chosen_gap = best_time_gap if best_time_gap is not None else 1 << 30
+                if current_gap < chosen_gap:
+                    best_item = item
+                    best_time_gap = time_gap
+                elif current_gap == chosen_gap and (update_time or 0) > (best_item.update_time or 0):
+                    best_item = item
+                    best_time_gap = time_gap
         return best_item if best_score >= 100 else None
 
     @staticmethod
@@ -6412,6 +6462,8 @@ class StrategyEngine:
             config,
             trade_instrument=trade_instrument,
             position=position,
+            exit_price=current_stop_loss,
+            close_ms=int(time.time() * 1000),
         )
         self._notify_trade_close(
             config,

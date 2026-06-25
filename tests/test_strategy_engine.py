@@ -27,7 +27,14 @@ from okx_quant.engine import (
 )
 from okx_quant.engine_strategy_router import EngineStrategyRouter
 from okx_quant.models import Candle, Credentials, Instrument, OrderPlan, SignalDecision, StrategyConfig
-from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxPosition, OkxTradeOrderItem
+from okx_quant.okx_client import (
+    OkxApiError,
+    OkxOrderResult,
+    OkxOrderStatus,
+    OkxPosition,
+    OkxPositionHistoryItem,
+    OkxTradeOrderItem,
+)
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategy_catalog import (
     STRATEGY_EMA_BREAKOUT_LONG_ID,
@@ -541,6 +548,160 @@ class StrategyEngineTest(TestCase):
         )
 
         self.assertEqual(captured_exit["pos_side"], "short")
+
+    def test_match_recent_position_close_history_prefers_fresh_close_match(self) -> None:
+        close_ms = 1_780_000_000_000
+        position = FilledPosition(
+            ord_id="ord-entry-1",
+            cl_ord_id="cl-entry-1",
+            inst_id="DOGE-USDT-SWAP",
+            side="sell",
+            close_side="buy",
+            pos_side="short",
+            size=Decimal("4.19"),
+            entry_price=Decimal("0.07669"),
+            entry_ts=close_ms - 23 * 60 * 60 * 1000,
+        )
+        stale_item = OkxPositionHistoryItem(
+            update_time=close_ms - 21 * 60 * 60 * 1000,
+            inst_id="DOGE-USDT-SWAP",
+            inst_type="SWAP",
+            mgn_mode="cross",
+            pos_side="short",
+            direction="net",
+            open_avg_price=Decimal("0.07669"),
+            close_avg_price=Decimal("0.07346"),
+            close_size=Decimal("4.19"),
+            pnl=Decimal("13.54"),
+            realized_pnl=Decimal("13.32"),
+            settle_pnl=Decimal("0"),
+            raw={},
+            fee=Decimal("-0.37"),
+            funding_fee=Decimal("0.04"),
+        )
+        fresh_item = OkxPositionHistoryItem(
+            update_time=close_ms + 30_000,
+            inst_id="DOGE-USDT-SWAP",
+            inst_type="SWAP",
+            mgn_mode="cross",
+            pos_side="short",
+            direction="net",
+            open_avg_price=Decimal("0.07669"),
+            close_avg_price=Decimal("0.07609"),
+            close_size=Decimal("4.19"),
+            pnl=Decimal("2.51"),
+            realized_pnl=Decimal("2.28"),
+            settle_pnl=Decimal("0"),
+            raw={},
+            fee=Decimal("-0.25"),
+            funding_fee=Decimal("0.02"),
+        )
+
+        matched = StrategyEngine._match_recent_position_close_history(
+            [stale_item, fresh_item],
+            position=position,
+            exit_price=Decimal("0.07609"),
+            close_ms=close_ms,
+        )
+
+        self.assertIs(matched, fresh_item)
+
+    def test_close_position_ignores_stale_history_pnl_when_recent_close_history_is_missing(self) -> None:
+        captured_close: dict[str, object] = {}
+        close_ms = 1_780_000_000_000
+        stale_item = OkxPositionHistoryItem(
+            update_time=close_ms - 21 * 60 * 60 * 1000,
+            inst_id="DOGE-USDT-SWAP",
+            inst_type="SWAP",
+            mgn_mode="cross",
+            pos_side="short",
+            direction="net",
+            open_avg_price=Decimal("0.07669"),
+            close_avg_price=Decimal("0.07346"),
+            close_size=Decimal("4.19"),
+            pnl=Decimal("13.54"),
+            realized_pnl=Decimal("13.32"),
+            settle_pnl=Decimal("0"),
+            raw={},
+            fee=Decimal("-0.37"),
+            funding_fee=Decimal("0.04"),
+        )
+
+        engine = StrategyEngine(object(), lambda _message: None)
+        engine._place_exit_order = lambda credentials, config, **kwargs: OkxOrderResult(  # type: ignore[assignment]
+            ord_id="ord-exit-1",
+            cl_ord_id="cl-exit-1",
+            s_code="0",
+            s_msg="accepted",
+            raw={},
+        )
+        engine._wait_for_order_fill = lambda *args, **kwargs: FilledPosition(  # type: ignore[assignment]
+            ord_id="ord-exit-1",
+            cl_ord_id="cl-exit-1",
+            inst_id="DOGE-USDT-SWAP",
+            side="buy",
+            close_side="sell",
+            pos_side="short",
+            size=Decimal("4.19"),
+            entry_price=Decimal("0.07609"),
+            entry_ts=close_ms,
+            price_delta_multiplier=Decimal("1000"),
+        )
+        engine._get_positions_history_with_retry = lambda *args, **kwargs: [stale_item]  # type: ignore[assignment]
+        engine._notify_trade_close = lambda *args, **kwargs: captured_close.update(kwargs)  # type: ignore[assignment]
+        engine._estimate_trade_entry_price_with_retry = lambda *args, **kwargs: Decimal("0.07609")  # type: ignore[assignment]
+
+        instrument = Instrument(
+            inst_id="DOGE-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.00001"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+            settle_ccy="USDT",
+            ct_val=Decimal("1000"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="DOGE",
+        )
+        config = StrategyConfig(
+            inst_id="DOGE-USDT-SWAP",
+            trade_inst_id="DOGE-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            atr_period=13,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="short_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_EMA55_SLOPE_SHORT_ID,
+        )
+        position = FilledPosition(
+            ord_id="ord-entry-1",
+            cl_ord_id="cl-entry-1",
+            inst_id="DOGE-USDT-SWAP",
+            side="sell",
+            close_side="buy",
+            pos_side="short",
+            size=Decimal("4.19"),
+            entry_price=Decimal("0.07669"),
+            entry_ts=close_ms - 23 * 60 * 60 * 1000,
+            price_delta_multiplier=Decimal("1000"),
+        )
+
+        engine._close_position(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            config,
+            instrument,
+            position,
+            "斜率转正",
+        )
+
+        self.assertEqual(captured_close["trade_pnl"], "2.514")
 
     def test_get_okx_read_retry_config_env_overrides(self) -> None:
         with patch.dict(
