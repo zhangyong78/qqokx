@@ -3907,6 +3907,9 @@ class UiPositionsMixin:
                 environment=effective_environment,
                 positions=positions,
             )
+        refresh_home_account_snapshot = getattr(self, "_refresh_home_account_snapshot_if_needed", None)
+        if callable(refresh_home_account_snapshot):
+            refresh_home_account_snapshot()
         self._render_positions_view()
         self._refresh_session_live_pnl_cache()
         for session in self.sessions.values():

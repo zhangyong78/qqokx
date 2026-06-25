@@ -3464,6 +3464,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._account_info_refreshing = False
         self._latest_account_overview: OkxAccountOverview | None = None
         self._latest_account_config: OkxAccountConfig | None = None
+        self._account_info_last_refresh_at: datetime | None = None
+        self._latest_account_info_profile_name = ""
+        self._latest_account_info_environment = ""
         self._positions_zoom_column_window: Toplevel | None = None
         self._positions_zoom_credential_profile_combo: ttk.Combobox | None = None
         self._positions_zoom_detail_frame: ttk.LabelFrame | None = None
@@ -5455,17 +5458,16 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         overview_row = ttk.Frame(positions_frame)
         overview_row.grid(row=1, column=0, sticky="ew", pady=(0, 4))
-        for column in range(9):
+        for column in range(8):
             overview_row.columnconfigure(column, weight=1)
-        self._build_metric_card(overview_row, 0, "持仓笔数", self.position_total_text, compact=True)
-        self._build_metric_card(overview_row, 1, "浮动盈亏(USDT)", self.position_upl_text, compact=True)
-        self._build_metric_card(overview_row, 2, "已实现盈亏", self.position_realized_text, compact=True)
-        self._build_metric_card(overview_row, 3, "初始保证金(IMR)", self.position_margin_text, compact=True)
-        self._build_metric_card(overview_row, 4, "Delta 合计", self.position_delta_text, compact=True)
-        self._build_metric_card(overview_row, 5, "买购数量", self.position_long_call_text, compact=True)
-        self._build_metric_card(overview_row, 6, "卖购数量", self.position_short_call_text, compact=True)
-        self._build_metric_card(overview_row, 7, "买沽数量", self.position_long_put_text, compact=True)
-        self._build_metric_card(overview_row, 8, "卖沽数量", self.position_short_put_text, compact=True)
+        self._build_metric_card(overview_row, 0, "总权益", self.account_total_equity_text, compact=True)
+        self._build_metric_card(overview_row, 1, "调整后权益", self.account_adjusted_equity_text, compact=True)
+        self._build_metric_card(overview_row, 2, "可用权益", self.account_available_equity_text, compact=True)
+        self._build_metric_card(overview_row, 3, "未实现盈亏", self.account_upl_text, compact=True)
+        self._build_metric_card(overview_row, 4, "持仓笔数", self.position_total_text, compact=True)
+        self._build_metric_card(overview_row, 5, "浮动盈亏(USDT)", self.position_upl_text, compact=True)
+        self._build_metric_card(overview_row, 6, "已实现盈亏", self.position_realized_text, compact=True)
+        self._build_metric_card(overview_row, 7, "初始保证金(IMR)", self.position_margin_text, compact=True)
 
         position_table = ttk.Frame(positions_frame)
         position_table.grid(row=2, column=0, sticky="nsew")
@@ -5920,6 +5922,21 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.refresh_account_info()
         self.refresh_order_views()
 
+    def _refresh_home_account_snapshot_if_needed(self, *, force: bool = False, max_age_seconds: int = 30) -> None:
+        credentials = self._current_credentials_or_none()
+        if credentials is None:
+            return
+        active_profile = (credentials.profile_name or self._current_credential_profile()).strip()
+        active_environment = self._positions_effective_environment or ENV_OPTIONS[self.environment_label.get()]
+        profile_mismatch = active_profile != self._latest_account_info_profile_name
+        environment_mismatch = active_environment != self._latest_account_info_environment
+        stale = True
+        if self._account_info_last_refresh_at is not None:
+            stale = (datetime.now() - self._account_info_last_refresh_at).total_seconds() >= max_age_seconds
+        should_refresh = force or self._latest_account_overview is None or profile_mismatch or environment_mismatch or stale
+        if should_refresh:
+            self.refresh_account_info()
+
     def open_account_info_window(self) -> None:
         if self._account_info_window is not None and self._account_info_window.winfo_exists():
             self._account_info_window.focus_force()
@@ -6117,6 +6134,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self._set_readonly_text(self._account_info_detail_panel, self._default_account_info_detail_text())
             if self._account_info_tree is not None:
                 self._account_info_tree.delete(*self._account_info_tree.get_children())
+            self._account_info_last_refresh_at = None
+            self._latest_account_info_profile_name = ""
+            self._latest_account_info_environment = ""
             self._refresh_all_refresh_badges()
             return
         self._account_info_refreshing = True
@@ -6164,6 +6184,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._mark_api_switch_refresh_step("account_info", "done")
         self._latest_account_overview = overview
         self._latest_account_config = config
+        self._account_info_last_refresh_at = datetime.now()
+        self._latest_account_info_profile_name = self._current_credential_profile().strip()
+        self._latest_account_info_environment = effective_environment
         _mark_refresh_health_success(self._account_info_refresh_health)
         self._refresh_all_refresh_badges()
         environment_label = "实盘 live" if effective_environment == "live" else "模拟盘 demo"
