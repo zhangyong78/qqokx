@@ -2772,11 +2772,12 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         self.assertEqual(app.session_tree.rows["S01"]["values"][0], "S01")
         self.assertEqual(app.session_tree.rows["S01"]["values"][1], "-")
         self.assertEqual(app.session_tree.rows["S01"]["values"][2], "开")
-        self.assertEqual(app.session_tree.rows["S01"]["values"][4], "普通量化")
-        self.assertEqual(app.session_tree.rows["S01"]["values"][6], "交易并下单")
-        self.assertEqual(app.session_tree.rows["S01"]["values"][8], "1H")
-        self.assertEqual(app.session_tree.rows["S01"]["values"][10], "10")
-        self.assertEqual(app.session_tree.rows["S01"]["values"][14], "+1.25")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][4], "-")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][5], "普通量化")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][7], "交易并下单")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][9], "1H")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][11], "10")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][15], "+1.25")
     def test_session_trader_label_prefers_trader_id_and_falls_back_to_dash(self) -> None:
         trader_session = SimpleNamespace(trader_id="T001")
         plain_session = SimpleNamespace(trader_id="")
@@ -2874,9 +2875,27 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
             open_strategy_live_chart_window=lambda session_id: opened.append(session_id),
         )
 
-        tree.identify_column = lambda _x: "#8"
+        tree.identify_column = lambda _x: "#9"
         tree.identify_row = lambda _y: "S01"
         result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=48, y=12))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(opened, ["S01"])
+
+    def test_session_tree_double_click_opens_account_equity_curve_on_equity_column(self) -> None:
+        session = SimpleNamespace(session_id="S01", email_notifications_enabled=True)
+        tree = _SessionTreeStub()
+        tree.rows["S01"] = {"values": (), "tags": (), "text": ""}
+        opened: list[str] = []
+        app = SimpleNamespace(
+            session_tree=tree,
+            sessions={"S01": session},
+            open_account_equity_curve_window_for_session=lambda target_session: opened.append(target_session.session_id),
+        )
+
+        tree.identify_column = lambda _x: "#5"
+        tree.identify_row = lambda _y: "S01"
+        result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=40, y=12))
 
         self.assertEqual(result, "break")
         self.assertEqual(opened, ["S01"])
@@ -2894,22 +2913,22 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
             ),
         )
 
-        tree.identify_column = lambda _x: "#14"
+        tree.identify_column = lambda _x: "#15"
         tree.identify_row = lambda _y: "S01"
         result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=56, y=12))
 
         self.assertEqual(result, "break")
         self.assertEqual(opened, [("S01", False)])
 
-        tree.identify_column = lambda _x: "#15"
+        tree.identify_column = lambda _x: "#16"
         result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=64, y=12))
 
         self.assertEqual(result, "break")
         self.assertEqual(opened, [("S01", False), ("S01", True)])
 
     def test_session_tree_double_click_hint_includes_trade_detail_columns(self) -> None:
-        self.assertEqual(QuantApp._session_tree_double_click_hint("#14"), "双击查看这条会话的净盈亏明细")
-        self.assertEqual(QuantApp._session_tree_double_click_hint("#15"), "双击查看最近一笔净盈亏明细")
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#15"), "双击查看这条会话的净盈亏明细")
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#16"), "双击查看最近一笔净盈亏明细")
 
     def test_session_tree_double_click_opens_session_log_on_session_column(self) -> None:
         session = SimpleNamespace(session_id="S01", email_notifications_enabled=True, trader_id="")
@@ -2967,8 +2986,14 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         self.assertEqual(QuantApp._session_tree_double_click_hint("#1"), "双击打开这条会话的独立日志")
         self.assertEqual(QuantApp._session_tree_double_click_hint("#2"), "双击打开并定位对应交易员")
         self.assertEqual(QuantApp._session_tree_double_click_hint("#3"), "双击切换当前会话发邮件开关")
-        self.assertEqual(QuantApp._session_tree_double_click_hint("#8"), "双击打开这条策略的实时K线图")
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#5"), "双击查看该 API 的账户权益曲线")
+        self.assertEqual(QuantApp._session_tree_double_click_hint("#9"), "双击打开这条策略的实时K线图")
         self.assertEqual(QuantApp._session_tree_double_click_hint("#4"), "")
+
+    def test_session_tree_column_key_resolves_inserted_account_equity_column(self) -> None:
+        tree = _SessionTreeStub()
+        self.assertEqual(QuantApp._session_tree_column_key(tree, "#5"), "account_equity")
+        self.assertEqual(QuantApp._session_tree_column_key(tree, "#9"), "symbol")
 
     def test_strategy_history_tree_double_click_hint_maps_supported_columns(self) -> None:
         self.assertEqual(QuantApp._strategy_history_tree_double_click_hint("#1"), "双击打开这条历史策略的独立日志")
@@ -6387,6 +6412,26 @@ class _SessionTreeStub:
         self.focused: str | None = None
         self.seen: str | None = None
         self.headings: dict[str, dict[str, object]] = {}
+        self.columns = (
+            "session",
+            "trader",
+            "email",
+            "api",
+            "account_equity",
+            "source_type",
+            "strategy",
+            "mode",
+            "symbol",
+            "bar",
+            "direction",
+            "risk_amount",
+            "open_qty",
+            "live_pnl",
+            "pnl",
+            "last_pnl",
+            "status",
+            "started",
+        )
 
     @staticmethod
     def winfo_exists() -> bool:
@@ -6463,6 +6508,11 @@ class _SessionTreeStub:
 
     def heading(self, column: str, **kwargs: object) -> None:
         self.headings[column] = kwargs
+
+    def cget(self, key: str):
+        if key == "columns":
+            return self.columns
+        raise KeyError(key)
 
 
 class TraderWaveLockTest(TestCase):

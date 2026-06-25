@@ -48,6 +48,7 @@ HISTORY_CACHE_DIR_NAME = "history"
 HISTORY_ORDER_FILE_NAME = "order_history.json"
 HISTORY_FILLS_FILE_NAME = "fills_history.json"
 HISTORY_POSITIONS_FILE_NAME = "position_history.json"
+ACCOUNT_EQUITY_CURVE_FILE_NAME = "account_equity_curve.json"
 POSITION_HISTORY_VIEW_PREFS_FILE_NAME = "position_history_view_prefs.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 PROFILE_ENVIRONMENTS = {"demo", "live"}
@@ -537,6 +538,55 @@ def history_cache_file_path(
     if not file_name:
         raise ValueError(f"Unsupported history cache kind: {history_kind}")
     return history_cache_dir_path(profile_name, environment, base_dir=base_dir) / file_name
+
+
+def account_equity_curve_file_path(
+    profile_name: str,
+    environment: str,
+    *,
+    base_dir: Path | None = None,
+) -> Path:
+    return history_cache_dir_path(profile_name, environment, base_dir=base_dir) / ACCOUNT_EQUITY_CURVE_FILE_NAME
+
+
+def load_account_equity_curve_records(
+    profile_name: str,
+    environment: str,
+    *,
+    base_dir: Path | None = None,
+) -> list[dict[str, object]]:
+    target = account_equity_curve_file_path(profile_name, environment, base_dir=base_dir)
+    if not target.exists():
+        return []
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        return []
+    return [item for item in records if isinstance(item, dict)]
+
+
+def save_account_equity_curve_records(
+    profile_name: str,
+    environment: str,
+    records: list[dict[str, object]],
+    *,
+    base_dir: Path | None = None,
+) -> Path:
+    target = account_equity_curve_file_path(profile_name, environment, base_dir=base_dir)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    normalized_records = [item for item in records if isinstance(item, dict)]
+    payload = {
+        "version": 1,
+        "records": normalized_records,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
 
 
 def load_history_cache_records(

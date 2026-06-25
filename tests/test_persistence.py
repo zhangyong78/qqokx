@@ -4,10 +4,12 @@ from unittest import TestCase
 from uuid import uuid4
 
 from okx_quant.persistence import (
+    account_equity_curve_file_path,
     btc_research_workbench_state_file_path,
     credentials_file_path,
     history_cache_dir_path,
     history_cache_file_path,
+    load_account_equity_curve_records,
     load_btc_research_workbench_state,
     load_history_cache_records,
     load_position_history_view_prefs,
@@ -18,6 +20,7 @@ from okx_quant.persistence import (
     load_strategy_history_snapshot,
     load_strategy_trade_ledger_snapshot,
     option_strategies_file_path,
+    save_account_equity_curve_records,
     save_btc_research_workbench_state,
     save_credentials_snapshot,
     save_history_cache_records,
@@ -425,3 +428,27 @@ class PersistenceTest(TestCase):
         loaded = load_position_history_view_prefs(path=target)
         self.assertEqual(loaded["local_range_start"], "2025-01-01")
         self.assertEqual(loaded["local_range_end"], "2025-12-31")
+
+    def test_save_and_load_account_equity_curve_records(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        target = account_equity_curve_file_path("api9", "live", base_dir=temp_dir)
+        save_account_equity_curve_records(
+            "api9",
+            "live",
+            [
+                {
+                    "time": "2026-06-25T01:00:00Z",
+                    "total_equity": "3029.31",
+                    "adjusted_equity": "3029.31",
+                    "available_equity": "2648.02",
+                    "upl": "22.08",
+                }
+            ],
+            base_dir=temp_dir,
+        )
+
+        records = load_account_equity_curve_records("api9", "live", base_dir=temp_dir)
+
+        self.assertTrue(target.exists())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["total_equity"], "3029.31")

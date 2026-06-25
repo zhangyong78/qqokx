@@ -12,7 +12,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 import uuid
 from dataclasses import MISSING, asdict, dataclass, field, fields as dataclass_fields, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from types import FunctionType
@@ -122,6 +122,7 @@ from okx_quant.persistence import (
     credential_profile_has_switch_password,
     credentials_file_path,
     DEFAULT_CREDENTIAL_PROFILE_NAME,
+    load_account_equity_curve_records,
     load_history_cache_records,
     load_position_history_view_prefs,
     load_recoverable_strategy_sessions_snapshot,
@@ -134,6 +135,7 @@ from okx_quant.persistence import (
     load_strategy_trade_ledger_snapshot,
     save_recoverable_strategy_sessions_snapshot,
     save_credentials_profiles_snapshot,
+    save_account_equity_curve_records,
     save_notification_snapshot,
     save_history_cache_records,
     save_position_history_view_prefs,
@@ -967,6 +969,26 @@ class ProfilePositionSnapshot:
     refreshed_at: datetime
     position_instruments: dict[str, Instrument] = field(default_factory=dict)
     ws_cache_note: str = ""
+
+
+@dataclass
+class AccountOverviewCacheEntry:
+    profile_name: str
+    environment: str
+    overview: OkxAccountOverview
+    config: OkxAccountConfig | None = None
+    refreshed_at: datetime | None = None
+    source: str = "rest"
+
+
+@dataclass
+class AccountEquityCurveWindowState:
+    profile_name: str
+    environment: str
+    window: Toplevel
+    canvas: Canvas
+    summary_text: StringVar
+    range_var: StringVar
 
 
 @dataclass
@@ -3467,6 +3489,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._account_info_last_refresh_at: datetime | None = None
         self._latest_account_info_profile_name = ""
         self._latest_account_info_environment = ""
+        self._account_overview_cache_by_key: dict[tuple[str, str], AccountOverviewCacheEntry] = {}
+        self._account_overview_refreshing_keys: set[tuple[str, str]] = set()
+        self._account_overview_last_error_by_key: dict[tuple[str, str], str] = {}
+        self._account_equity_curve_records_by_key: dict[tuple[str, str], list[dict[str, object]]] = {}
+        self._account_equity_curve_windows: dict[tuple[str, str], AccountEquityCurveWindowState] = {}
+        self._running_session_account_equity_last_scan_at: datetime | None = None
         self._positions_zoom_column_window: Toplevel | None = None
         self._positions_zoom_credential_profile_combo: ttk.Combobox | None = None
         self._positions_zoom_detail_frame: ttk.LabelFrame | None = None
@@ -5280,6 +5308,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 "trader",
                 "email",
                 "api",
+                "account_equity",
                 "source_type",
                 "strategy",
                 "mode",
@@ -5301,6 +5330,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("trader", text="交易员(双击打开)")
         self.session_tree.heading("email", text="邮件(双击切换)")
         self.session_tree.heading("api", text="API")
+        self.session_tree.heading("account_equity", text="账户总权益")
         self.session_tree.heading("source_type", text="来源类型")
         self.session_tree.heading("strategy", text="策略")
         self.session_tree.heading("mode", text="模式")
@@ -5319,6 +5349,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.column("trader", width=72, anchor="center")
         self.session_tree.column("email", width=56, anchor="center")
         self.session_tree.column("api", width=80, anchor="center")
+        self.session_tree.column("account_equity", width=112, anchor="e")
         self.session_tree.column("source_type", width=98, anchor="center")
         self.session_tree.column("strategy", width=120, anchor="w")
         self.session_tree.column("mode", width=96, anchor="center")
@@ -5937,6 +5968,478 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         if should_refresh:
             self.refresh_account_info()
 
+    @staticmethod
+    def _account_overview_cache_key(profile_name: str, environment: str) -> tuple[str, str]:
+        normalized_profile = str(profile_name or "").strip() or DEFAULT_CREDENTIAL_PROFILE_NAME
+        normalized_environment = str(environment or "").strip().lower()
+        if normalized_environment not in {"demo", "live"}:
+            normalized_environment = "demo"
+        return normalized_profile, normalized_environment
+
+    def _session_account_overview_key(self, session: StrategySession) -> tuple[str, str]:
+        profile_name = str(getattr(session, "api_name", "") or "").strip() or self._current_credential_profile().strip()
+        fallback_environment = str(getattr(getattr(session, "config", None), "environment", "") or "").strip().lower()
+        environment = self._credential_profile_environment_value(profile_name, fallback=fallback_environment)
+        return self._account_overview_cache_key(profile_name, environment or fallback_environment or "demo")
+
+    def _running_session_account_overview_keys(self) -> tuple[tuple[str, str], ...]:
+        keys: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for session in self.sessions.values():
+            if not self._session_counts_toward_running_summary(session):
+                continue
+            key = self._session_account_overview_key(session)
+            if key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+        return tuple(keys)
+
+    def _account_overview_cache_entry_for_session(self, session: StrategySession) -> AccountOverviewCacheEntry | None:
+        return self._account_overview_cache_by_key.get(self._session_account_overview_key(session))
+
+    def _session_account_total_equity_text(self, session: StrategySession) -> str:
+        entry = self._account_overview_cache_entry_for_session(session)
+        if entry is None:
+            return "-"
+        return _format_optional_usdt_precise(entry.overview.total_equity, places=2, with_sign=False)
+
+    def _load_account_equity_curve_records_cached(self, profile_name: str, environment: str) -> list[dict[str, object]]:
+        key = self._account_overview_cache_key(profile_name, environment)
+        cached = self._account_equity_curve_records_by_key.get(key)
+        if cached is None:
+            cached = list(load_account_equity_curve_records(key[0], key[1]))
+            self._account_equity_curve_records_by_key[key] = cached
+        return cached
+
+    @staticmethod
+    def _account_equity_curve_recorded_at(record: dict[str, object]) -> datetime | None:
+        text = str(record.get("time", "") or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _maybe_record_account_equity_curve_sample(
+        self,
+        profile_name: str,
+        environment: str,
+        overview: OkxAccountOverview,
+        *,
+        sampled_at: datetime | None = None,
+        min_interval_seconds: int = 3600,
+    ) -> bool:
+        key = self._account_overview_cache_key(profile_name, environment)
+        records = list(self._load_account_equity_curve_records_cached(key[0], key[1]))
+        sample_time = sampled_at or datetime.now(timezone.utc)
+        if sample_time.tzinfo is None:
+            sample_time = sample_time.replace(tzinfo=timezone.utc)
+        else:
+            sample_time = sample_time.astimezone(timezone.utc)
+        if records:
+            latest_at = self._account_equity_curve_recorded_at(records[-1])
+            if latest_at is not None and (sample_time - latest_at).total_seconds() < min_interval_seconds:
+                return False
+        records.append(
+            {
+                "time": sample_time.isoformat(timespec="seconds").replace("+00:00", "Z"),
+                "total_equity": str(overview.total_equity) if overview.total_equity is not None else None,
+                "adjusted_equity": str(overview.adjusted_equity) if overview.adjusted_equity is not None else None,
+                "available_equity": str(overview.available_equity) if overview.available_equity is not None else None,
+                "upl": str(overview.unrealized_pnl) if overview.unrealized_pnl is not None else None,
+            }
+        )
+        self._account_equity_curve_records_by_key[key] = records
+        save_account_equity_curve_records(key[0], key[1], records)
+        return True
+
+    def _store_account_overview_cache_entry(
+        self,
+        profile_name: str,
+        environment: str,
+        overview: OkxAccountOverview,
+        *,
+        config: OkxAccountConfig | None = None,
+        refreshed_at: datetime | None = None,
+        source: str = "rest",
+    ) -> None:
+        key = self._account_overview_cache_key(profile_name, environment)
+        existing = self._account_overview_cache_by_key.get(key)
+        self._account_overview_cache_by_key[key] = AccountOverviewCacheEntry(
+            profile_name=key[0],
+            environment=key[1],
+            overview=overview,
+            config=config if config is not None else (existing.config if existing is not None else None),
+            refreshed_at=refreshed_at or datetime.now(),
+            source=source,
+        )
+        self._account_overview_last_error_by_key.pop(key, None)
+        self._maybe_record_account_equity_curve_sample(key[0], key[1], overview, sampled_at=refreshed_at)
+        matched_session = False
+        for session in self.sessions.values():
+            if self._session_account_overview_key(session) != key:
+                continue
+            matched_session = True
+            self._upsert_session_row(session, reorder=False)
+        sort_column = str(getattr(self, "_running_session_sort_column", "") or "")
+        if matched_session and sort_column == "account_equity":
+            self._refresh_running_session_tree()
+        elif matched_session and hasattr(self, "_apply_running_session_tree_sort_order"):
+            self._apply_running_session_tree_sort_order()
+        window_state = self._account_equity_curve_windows.get(key)
+        if window_state is not None and _widget_exists(window_state.window):
+            self._refresh_account_equity_curve_window(key)
+
+    def _apply_session_account_overview_cache_entry(
+        self,
+        profile_name: str,
+        environment: str,
+        overview: OkxAccountOverview,
+        *,
+        source: str,
+    ) -> None:
+        key = self._account_overview_cache_key(profile_name, environment)
+        self._account_overview_refreshing_keys.discard(key)
+        self._store_account_overview_cache_entry(
+            key[0],
+            key[1],
+            overview,
+            refreshed_at=datetime.now(),
+            source=source,
+        )
+
+    def _apply_session_account_overview_cache_error(self, profile_name: str, environment: str, message: str) -> None:
+        key = self._account_overview_cache_key(profile_name, environment)
+        self._account_overview_refreshing_keys.discard(key)
+        self._account_overview_last_error_by_key[key] = _format_network_error_message(message)
+        window_state = self._account_equity_curve_windows.get(key)
+        if window_state is not None and _widget_exists(window_state.window):
+            self._refresh_account_equity_curve_window(key)
+
+    def _refresh_session_account_overview_worker(
+        self,
+        credentials: Credentials,
+        profile_name: str,
+        environment: str,
+    ) -> None:
+        source = "rest"
+        try:
+            cached_overview = self.client.get_cached_private_account_overview(credentials, environment=environment)
+            if cached_overview is not None:
+                _version, overview = cached_overview
+                source = "ws"
+            else:
+                overview = self.client.get_account_overview(
+                    credentials,
+                    environment=environment,
+                    prefer_cache=False,
+                )
+        except Exception as exc:
+            message = str(exc)
+            if "50101" in message and "current environment" in message:
+                alternate = "live" if environment == "demo" else "demo"
+                try:
+                    cached_overview = self.client.get_cached_private_account_overview(credentials, environment=alternate)
+                    if cached_overview is not None:
+                        _version, overview = cached_overview
+                        source = "ws"
+                    else:
+                        overview = self.client.get_account_overview(
+                            credentials,
+                            environment=alternate,
+                            prefer_cache=False,
+                        )
+                except Exception:
+                    self.root.after(
+                        0,
+                        lambda target_profile=profile_name, target_environment=environment, error_text=message: self._apply_session_account_overview_cache_error(
+                            target_profile,
+                            target_environment,
+                            error_text,
+                        ),
+                    )
+                    return
+                self.root.after(
+                    0,
+                    lambda target_profile=profile_name, target_environment=environment, target_overview=overview, target_source=source: self._apply_session_account_overview_cache_entry(
+                        target_profile,
+                        target_environment,
+                        target_overview,
+                        source=target_source,
+                    ),
+                )
+                return
+            self.root.after(
+                0,
+                lambda target_profile=profile_name, target_environment=environment, error_text=message: self._apply_session_account_overview_cache_error(
+                    target_profile,
+                    target_environment,
+                    error_text,
+                ),
+            )
+            return
+        self.root.after(
+            0,
+            lambda target_profile=profile_name, target_environment=environment, target_overview=overview, target_source=source: self._apply_session_account_overview_cache_entry(
+                target_profile,
+                target_environment,
+                target_overview,
+                source=target_source,
+            ),
+        )
+
+    def _refresh_running_session_account_equities_if_needed(
+        self,
+        *,
+        force: bool = False,
+        target_keys: tuple[tuple[str, str], ...] | None = None,
+        max_age_seconds: int = 30,
+        min_scan_interval_seconds: int = 5,
+    ) -> None:
+        now = datetime.now()
+        if not force and self._running_session_account_equity_last_scan_at is not None:
+            since = (now - self._running_session_account_equity_last_scan_at).total_seconds()
+            if since < min_scan_interval_seconds:
+                return
+        self._running_session_account_equity_last_scan_at = now
+        keys = target_keys if target_keys is not None else self._running_session_account_overview_keys()
+        for key in keys:
+            if key in self._account_overview_refreshing_keys:
+                continue
+            cache_entry = self._account_overview_cache_by_key.get(key)
+            if not force and cache_entry is not None and cache_entry.refreshed_at is not None:
+                age = (now - cache_entry.refreshed_at).total_seconds()
+                if age < max_age_seconds:
+                    continue
+            credentials = self._credentials_for_profile_or_none(key[0])
+            if credentials is None:
+                continue
+            self._account_overview_refreshing_keys.add(key)
+            threading.Thread(
+                target=self._refresh_session_account_overview_worker,
+                args=(credentials, key[0], key[1]),
+                daemon=True,
+            ).start()
+
+    def open_account_equity_curve_window_for_session(self, session: StrategySession) -> None:
+        key = self._session_account_overview_key(session)
+        self.open_account_equity_curve_window(key[0], key[1])
+
+    def open_account_equity_curve_window(self, profile_name: str, environment: str) -> None:
+        key = self._account_overview_cache_key(profile_name, environment)
+        existing = self._account_equity_curve_windows.get(key)
+        if existing is not None and _widget_exists(existing.window):
+            existing.window.focus_force()
+            self._refresh_account_equity_curve_window(key)
+            self._refresh_running_session_account_equities_if_needed(force=True, target_keys=(key,))
+            return
+
+        window = Toplevel(self.root)
+        window.title(f"账户权益曲线 - {key[0]} - {'实盘 live' if key[1] == 'live' else '模拟盘 demo'}")
+        apply_adaptive_window_geometry(
+            window,
+            width_ratio=0.64,
+            height_ratio=0.56,
+            min_width=920,
+            min_height=520,
+            max_width=1440,
+            max_height=920,
+        )
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(container)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.columnconfigure(0, weight=1)
+        summary_text = StringVar(value="正在获取账户权益...")
+        ttk.Label(header, textvariable=summary_text, anchor="w", justify="left").grid(row=0, column=0, sticky="w")
+        tools = ttk.Frame(header)
+        tools.grid(row=0, column=1, sticky="e")
+        range_var = StringVar(value="24h")
+        for index, (label, value) in enumerate((("24H", "24h"), ("7D", "7d"), ("30D", "30d"), ("全部", "all"))):
+            ttk.Radiobutton(
+                tools,
+                text=label,
+                value=value,
+                variable=range_var,
+                command=lambda target_key=key: self._render_account_equity_curve_window(target_key),
+            ).grid(row=0, column=index, padx=(0, 6) if index < 3 else (0, 0))
+        ttk.Button(
+            tools,
+            text="刷新",
+            command=lambda target_key=key: self._refresh_running_session_account_equities_if_needed(
+                force=True,
+                target_keys=(target_key,),
+            ),
+        ).grid(row=0, column=4, padx=(8, 6))
+        ttk.Button(tools, text="关闭", command=lambda target_key=key: self._close_account_equity_curve_window(target_key)).grid(
+            row=0,
+            column=5,
+        )
+
+        canvas = Canvas(container, background="#ffffff", highlightthickness=0, width=980, height=460)
+        canvas.grid(row=1, column=0, sticky="nsew")
+        state = AccountEquityCurveWindowState(
+            profile_name=key[0],
+            environment=key[1],
+            window=window,
+            canvas=canvas,
+            summary_text=summary_text,
+            range_var=range_var,
+        )
+        self._account_equity_curve_windows[key] = state
+        window.protocol("WM_DELETE_WINDOW", lambda target_key=key: self._close_account_equity_curve_window(target_key))
+        canvas.bind("<Configure>", lambda *_args, target_key=key: self._render_account_equity_curve_window(target_key))
+        self._refresh_account_equity_curve_window(key)
+        self._refresh_running_session_account_equities_if_needed(force=True, target_keys=(key,))
+
+    def _close_account_equity_curve_window(self, key: tuple[str, str]) -> None:
+        state = self._account_equity_curve_windows.pop(key, None)
+        if state is not None and _widget_exists(state.window):
+            state.window.destroy()
+
+    def _refresh_account_equity_curve_window(self, key: tuple[str, str]) -> None:
+        state = self._account_equity_curve_windows.get(key)
+        if state is None or not _widget_exists(state.window):
+            return
+        cache_entry = self._account_overview_cache_by_key.get(key)
+        if cache_entry is not None:
+            self._maybe_record_account_equity_curve_sample(
+                key[0],
+                key[1],
+                cache_entry.overview,
+                sampled_at=cache_entry.refreshed_at,
+            )
+        self._render_account_equity_curve_window(key)
+
+    def _render_account_equity_curve_window(self, key: tuple[str, str]) -> None:
+        state = self._account_equity_curve_windows.get(key)
+        if state is None or not _widget_exists(state.canvas):
+            return
+        cache_entry = self._account_overview_cache_by_key.get(key)
+        error_text = self._account_overview_last_error_by_key.get(key, "")
+        if cache_entry is not None:
+            refreshed_text = cache_entry.refreshed_at.strftime("%m-%d %H:%M:%S") if cache_entry.refreshed_at else "-"
+            source_label = "WS缓存" if cache_entry.source == "ws" else "REST"
+            state.summary_text.set(
+                " | ".join(
+                    (
+                        f"总权益 {_format_optional_usdt_precise(cache_entry.overview.total_equity, places=2, with_sign=False)}",
+                        f"调整后 {_format_optional_usdt_precise(cache_entry.overview.adjusted_equity, places=2, with_sign=False)}",
+                        f"可用 {_format_optional_usdt_precise(cache_entry.overview.available_equity, places=2, with_sign=False)}",
+                        f"未实现 {_format_optional_usdt_precise(cache_entry.overview.unrealized_pnl, places=2)}",
+                        f"最近刷新 {refreshed_text}",
+                        f"来源 {source_label}",
+                    )
+                )
+            )
+        elif error_text:
+            state.summary_text.set(f"账户权益读取失败：{error_text}")
+        else:
+            state.summary_text.set("正在获取账户权益...")
+
+        all_records = list(self._load_account_equity_curve_records_cached(key[0], key[1]))
+        now_utc = datetime.now(timezone.utc)
+        range_value = str(state.range_var.get() or "24h").strip().lower()
+        range_windows = {
+            "24h": timedelta(hours=24),
+            "7d": timedelta(days=7),
+            "30d": timedelta(days=30),
+        }
+        cutoff = now_utc - range_windows[range_value] if range_value in range_windows else None
+        points: list[tuple[datetime, Decimal]] = []
+        for record in all_records:
+            recorded_at = self._account_equity_curve_recorded_at(record)
+            if recorded_at is None:
+                continue
+            if cutoff is not None and recorded_at < cutoff:
+                continue
+            raw_value = record.get("total_equity")
+            if raw_value in {None, ""}:
+                continue
+            try:
+                equity_value = Decimal(str(raw_value))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            points.append((recorded_at, equity_value))
+
+        canvas = state.canvas
+        canvas.delete("all")
+        width = max(int(canvas.winfo_width() or 0), int(float(canvas.cget("width") or 0) or 980))
+        height = max(int(canvas.winfo_height() or 0), int(float(canvas.cget("height") or 0) or 460))
+        if width <= 40 or height <= 40:
+            return
+        if not points:
+            empty_text = "当前区间暂无权益采样点。"
+            if not all_records:
+                empty_text = "还没有账户权益采样点，等待刷新后会自动开始记录。"
+            canvas.create_text(width / 2, height / 2, text=empty_text, fill="#6b7280", font=("Microsoft YaHei UI", 12))
+            return
+
+        left = 72
+        top = 28
+        right = max(left + 120, width - 24)
+        bottom = max(top + 120, height - 52)
+        min_value = min(value for _, value in points)
+        max_value = max(value for _, value in points)
+        if min_value == max_value:
+            padding = max(abs(float(max_value)) * 0.02, 1.0)
+            min_plot = float(min_value) - padding
+            max_plot = float(max_value) + padding
+        else:
+            value_span = float(max_value - min_value)
+            padding = max(value_span * 0.08, 1.0)
+            min_plot = float(min_value) - padding
+            max_plot = float(max_value) + padding
+        start_time = points[0][0]
+        end_time = points[-1][0]
+        span_seconds = max((end_time - start_time).total_seconds(), 1.0)
+
+        def _x(recorded_at: datetime) -> float:
+            if len(points) == 1:
+                return (left + right) / 2
+            return left + ((recorded_at - start_time).total_seconds() / span_seconds) * (right - left)
+
+        def _y(value: Decimal) -> float:
+            ratio = 0.5 if max_plot == min_plot else (float(value) - min_plot) / (max_plot - min_plot)
+            return bottom - ratio * (bottom - top)
+
+        canvas.create_rectangle(left, top, right, bottom, outline="#d1d5db", width=1)
+        for step in range(1, 4):
+            y = top + ((bottom - top) * step / 4.0)
+            canvas.create_line(left, y, right, y, fill="#eef2f7")
+
+        line_points: list[float] = []
+        for recorded_at, value in points:
+            line_points.extend((_x(recorded_at), _y(value)))
+        if len(line_points) >= 4:
+            canvas.create_line(*line_points, fill="#2563eb", width=2, smooth=False)
+        for recorded_at, value in (points[0], points[-1]) if len(points) > 1 else (points[0],):
+            x = _x(recorded_at)
+            y = _y(value)
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#2563eb", outline="")
+
+        canvas.create_text(left, top - 10, text=_format_optional_usdt_precise(Decimal(str(max_plot)), places=2, with_sign=False), anchor="w", fill="#374151", font=("Microsoft YaHei UI", 9))
+        canvas.create_text(left, bottom + 10, text=_format_optional_usdt_precise(Decimal(str(min_plot)), places=2, with_sign=False), anchor="w", fill="#374151", font=("Microsoft YaHei UI", 9))
+        canvas.create_text(left, bottom + 28, text=start_time.astimezone().strftime("%m-%d %H:%M"), anchor="w", fill="#6b7280", font=("Microsoft YaHei UI", 9))
+        canvas.create_text(right, bottom + 28, text=end_time.astimezone().strftime("%m-%d %H:%M"), anchor="e", fill="#6b7280", font=("Microsoft YaHei UI", 9))
+        latest_value = points[-1][1]
+        canvas.create_text(
+            right,
+            top - 10,
+            text=f"{len(points)} 点 | 最新 {_format_optional_usdt_precise(latest_value, places=2, with_sign=False)}",
+            anchor="e",
+            fill="#2563eb",
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+
     def open_account_info_window(self) -> None:
         if self._account_info_window is not None and self._account_info_window.winfo_exists():
             self._account_info_window.focus_force()
@@ -6150,15 +6653,26 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         ).start()
 
     def _refresh_account_info_worker(self, credentials: Credentials, environment: str) -> None:
+        source = "rest"
         try:
-            overview = self.client.get_account_overview(credentials, environment=environment)
+            cached_overview = self.client.get_cached_private_account_overview(credentials, environment=environment)
+            if cached_overview is not None:
+                _version, overview = cached_overview
+                source = "ws"
+            else:
+                overview = self.client.get_account_overview(credentials, environment=environment, prefer_cache=False)
             config = self.client.get_account_config(credentials, environment=environment)
         except Exception as exc:
             message = str(exc)
             if "50101" in message and "current environment" in message:
                 alternate = "live" if environment == "demo" else "demo"
                 try:
-                    overview = self.client.get_account_overview(credentials, environment=alternate)
+                    cached_overview = self.client.get_cached_private_account_overview(credentials, environment=alternate)
+                    if cached_overview is not None:
+                        _version, overview = cached_overview
+                        source = "ws"
+                    else:
+                        overview = self.client.get_account_overview(credentials, environment=alternate, prefer_cache=False)
                     config = self.client.get_account_config(credentials, environment=alternate)
                 except Exception:
                     self.root.after(0, lambda: self._apply_account_info_error(message))
@@ -6167,11 +6681,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                     f"当前 API Key 与 {alternate} 环境匹配，已自动按 "
                     f"{'实盘' if alternate == 'live' else '模拟盘'} 读取账户信息。"
                 )
-                self.root.after(0, lambda: self._apply_account_info(overview, config, summary, alternate))
+                self.root.after(0, lambda: self._apply_account_info(overview, config, summary, alternate, source=source))
                 return
             self.root.after(0, lambda: self._apply_account_info_error(message))
             return
-        self.root.after(0, lambda: self._apply_account_info(overview, config, None, environment))
+        self.root.after(0, lambda: self._apply_account_info(overview, config, None, environment, source=source))
 
     def _apply_account_info(
         self,
@@ -6179,6 +6693,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         config: OkxAccountConfig,
         summary_note: str | None,
         effective_environment: str,
+        *,
+        source: str = "rest",
     ) -> None:
         self._account_info_refreshing = False
         self._mark_api_switch_refresh_step("account_info", "done")
@@ -6205,6 +6721,14 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.account_upl_text.set(_format_optional_usdt_precise(overview.unrealized_pnl, places=2))
         self.account_imr_text.set(_format_optional_usdt_precise(overview.initial_margin, places=2, with_sign=False))
         self.account_mmr_text.set(_format_optional_usdt_precise(overview.maintenance_margin, places=2, with_sign=False))
+        self._store_account_overview_cache_entry(
+            self._latest_account_info_profile_name,
+            effective_environment,
+            overview,
+            config=config,
+            refreshed_at=self._account_info_last_refresh_at,
+            source=source,
+        )
         self._set_readonly_text(
             self._account_info_config_panel,
             _build_account_config_detail_text(

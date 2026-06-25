@@ -6582,6 +6582,8 @@ class UiStrategySessionsMixin:
         source_type = QuantApp._session_category_label(session)
         trader_label = QuantApp._session_trader_label(self, session)
         email_label = QuantApp._session_email_status_label(self, session)
+        account_equity_text_provider = getattr(self, "_session_account_total_equity_text", None)
+        account_equity_text = account_equity_text_provider(session) if callable(account_equity_text_provider) else "-"
         bar_label = str(getattr(getattr(session, "config", None), "bar", "") or "").strip() or "-"
         tags = ("duplicate_conflict",) if QuantApp._session_has_duplicate_launch_conflict(self, session) else ()
         values = (
@@ -6589,6 +6591,7 @@ class UiStrategySessionsMixin:
             trader_label,
             email_label,
             session.api_name or "-",
+            account_equity_text,
             source_type,
             session.strategy_name,
             session.run_mode_label,
@@ -6646,14 +6649,65 @@ class UiStrategySessionsMixin:
         self._schedule_selected_session_details_refresh()
 
     @staticmethod
+    def _session_tree_column_key(tree: ttk.Treeview | object, column_id: str) -> str:
+        raw = str(column_id or "").strip()
+        if not raw.startswith("#"):
+            return raw
+        columns: tuple[str, ...] = ()
+        try:
+            resolved = tree.cget("columns") if hasattr(tree, "cget") else getattr(tree, "columns", ())
+        except Exception:
+            resolved = ()
+        if isinstance(resolved, str):
+            columns = tuple(part for part in resolved.split() if str(part).strip())
+        elif isinstance(resolved, (tuple, list)):
+            columns = tuple(str(part) for part in resolved if str(part).strip())
+        if not columns:
+            columns = (
+                "session",
+                "trader",
+                "email",
+                "api",
+                "account_equity",
+                "source_type",
+                "strategy",
+                "mode",
+                "symbol",
+                "bar",
+                "direction",
+                "risk_amount",
+                "open_qty",
+                "live_pnl",
+                "pnl",
+                "last_pnl",
+                "status",
+                "started",
+            )
+        try:
+            index = int(raw[1:]) - 1
+        except ValueError:
+            return raw
+        if 0 <= index < len(columns):
+            return columns[index]
+        return raw
+
+    @staticmethod
     def _session_tree_double_click_hint(column_id: str) -> str:
         return {
             "#1": "双击打开这条会话的独立日志",
             "#2": "双击打开并定位对应交易员",
             "#3": "双击切换当前会话发邮件开关",
-            "#8": "双击打开这条策略的实时K线图",
-            "#14": "双击查看这条会话的净盈亏明细",
-            "#15": "双击查看最近一笔净盈亏明细",
+            "#5": "双击查看该 API 的账户权益曲线",
+            "#9": "双击打开这条策略的实时K线图",
+            "#15": "双击查看这条会话的净盈亏明细",
+            "#16": "双击查看最近一笔净盈亏明细",
+            "session": "双击打开这条会话的独立日志",
+            "trader": "双击打开并定位对应交易员",
+            "email": "双击切换当前会话发邮件开关",
+            "account_equity": "双击查看该 API 的账户权益曲线",
+            "symbol": "双击打开这条策略的实时K线图",
+            "pnl": "双击查看这条会话的净盈亏明细",
+            "last_pnl": "双击查看最近一笔净盈亏明细",
         }.get(str(column_id or "").strip(), "")
 
     @staticmethod
@@ -7003,7 +7057,9 @@ class UiStrategySessionsMixin:
         if region != "heading":
             self._hide_session_tree_hover_tip()
             return
-        tip_text = QuantApp._session_tree_double_click_hint(column_id)
+        tip_text = QuantApp._session_tree_double_click_hint(
+            QuantApp._session_tree_column_key(tree, column_id)
+        ) or QuantApp._session_tree_double_click_hint(column_id)
         if not tip_text:
             self._hide_session_tree_hover_tip()
             return
@@ -7025,25 +7081,29 @@ class UiStrategySessionsMixin:
         session = self.sessions.get(row_id)
         if session is None:
             return None
-        if column_id == "#1":
+        column_key = QuantApp._session_tree_column_key(tree, column_id)
+        if column_key == "session":
             self.open_strategy_session_log(session.session_id)
             return "break"
-        if column_id == "#2":
+        if column_key == "trader":
             trader_id = str(getattr(session, "trader_id", "") or "").strip()
             if trader_id:
                 self.open_trader_desk_window_for_trader(trader_id)
                 return "break"
             return None
-        if column_id == "#3":
+        if column_key == "email":
             self._set_selected_session_email_notifications(not bool(getattr(session, "email_notifications_enabled", True)))
             return "break"
-        if column_id == "#8":
+        if column_key == "account_equity":
+            self.open_account_equity_curve_window_for_session(session)
+            return "break"
+        if column_key == "symbol":
             self.open_strategy_live_chart_window(session.session_id)
             return "break"
-        if column_id == "#14":
+        if column_key == "pnl":
             self._open_session_trade_detail_window(session, latest_only=False)
             return "break"
-        if column_id == "#15":
+        if column_key == "last_pnl":
             self._open_session_trade_detail_window(session, latest_only=True)
             return "break"
         return None

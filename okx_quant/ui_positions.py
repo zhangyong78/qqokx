@@ -4449,6 +4449,7 @@ class UiPositionsMixin:
             "trader": "交易员(双击打开)",
             "email": "邮件(双击切换)",
             "api": "API",
+            "account_equity": "账户总权益",
             "source_type": "来源类型",
             "strategy": "策略",
             "mode": "模式",
@@ -4533,6 +4534,11 @@ class UiPositionsMixin:
             return QuantApp._session_email_status_label(self, session)
         if normalized == "api":
             return session.api_name or ""
+        if normalized == "account_equity":
+            cache_entry = self._account_overview_cache_entry_for_session(session)
+            if cache_entry is None or cache_entry.overview.total_equity is None:
+                return Decimal("0")
+            return cache_entry.overview.total_equity
         if normalized == "source_type":
             return QuantApp._session_category_label(session)
         if normalized == "strategy":
@@ -4687,6 +4693,9 @@ class UiPositionsMixin:
     def _refresh_running_session_summary(self) -> None:
         QuantApp._refresh_running_session_filter_controls(self)
         self._refresh_session_live_pnl_cache()
+        refresh_account_equities = getattr(self, "_refresh_running_session_account_equities_if_needed", None)
+        if callable(refresh_account_equities):
+            refresh_account_equities()
         active_sessions = [
             session for session in self.sessions.values() if self._session_counts_toward_running_summary(session)
         ]
