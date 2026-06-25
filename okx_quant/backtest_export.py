@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+import html
+import json
 import re
 from datetime import datetime
 from decimal import Decimal
@@ -25,6 +28,8 @@ from okx_quant.persistence import backtest_report_export_dir_path
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.strategy_catalog import (
     BACKTEST_STRATEGY_DEFINITIONS,
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
     is_dynamic_strategy_id,
 )
@@ -33,6 +38,10 @@ from okx_quant.strategy_runtime_registry import get_strategy_runtime_profile
 
 
 STRATEGY_ID_TO_NAME = {item.strategy_id: item.name for item in BACKTEST_STRATEGY_DEFINITIONS}
+BTC_EMA15_MA50_PULLBACK_STRATEGY_IDS = {
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
+}
 BAR_VALUE_TO_LABEL = {
     "5m": "5分钟",
     "15m": "15分钟",
@@ -147,6 +156,12 @@ def export_single_backtest_report(
         exported_at=exported_at,
         report_path=target,
     )
+    if config.strategy_id in BTC_EMA15_MA50_PULLBACK_STRATEGY_IDS:
+        export_btc_ema15_ma50_pullback_research_bundle(
+            [(config, result)],
+            exported_at=exported_at,
+            base_dir=base_dir,
+        )
     return target
 
 
@@ -227,6 +242,12 @@ def export_batch_backtest_report(
         exported_at=exported_at,
         results=detail_records,
     )
+    if first_config.strategy_id in BTC_EMA15_MA50_PULLBACK_STRATEGY_IDS:
+        export_btc_ema15_ma50_pullback_research_bundle(
+            sorted_results,
+            exported_at=exported_at,
+            base_dir=base_dir,
+        )
     return target
 
 
@@ -800,3 +821,616 @@ def _sanitize_filename_part(text: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", text.strip())
     cleaned = re.sub(r"_+", "_", cleaned).strip("._")
     return cleaned or "report"
+
+
+def btc_ema15_ma50_pullback_report_dir(
+    base_dir: Path | None = None,
+    *,
+    strategy_id: str = STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+) -> Path:
+    root = Path(base_dir) if base_dir is not None else Path("reports")
+    return root / _btc_ema15_ma50_pullback_study_slug(strategy_id) / "latest"
+
+
+def _btc_ema15_ma50_pullback_study_slug(strategy_id: str) -> str:
+    if strategy_id == STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID:
+        return "btc_ema15_ma50_short"
+    return "btc_ema15_ma50_long"
+
+
+def _btc_ema15_ma50_pullback_direction(strategy_id: str) -> str:
+    return "short" if strategy_id == STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID else "long"
+
+
+def _btc_ema15_ma50_pullback_title(strategy_id: str) -> str:
+    return "BTC EMA15/MA50 回踩做空" if strategy_id == STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID else "BTC EMA15/MA50 回踩做多"
+
+
+def _btc_ema15_ma50_pullback_report_dir_for_strategy(strategy_id: str, base_dir: Path | None = None) -> Path:
+    root = Path(base_dir) if base_dir is not None else Path("reports")
+    return root / _btc_ema15_ma50_pullback_study_slug(strategy_id) / "latest"
+
+
+def export_btc_ema15_ma50_pullback_research_bundle(
+    results: list[tuple[StrategyConfig, BacktestResult]],
+    *,
+    exported_at: datetime | None = None,
+    base_dir: Path | None = None,
+) -> Path:
+    if not results:
+        raise ValueError("BTC EMA15/MA50 回踩研究结果为空，无法导出。")
+    exported_at = exported_at or datetime.now()
+    strategy_id = results[0][0].strategy_id
+    output_dir = _btc_ema15_ma50_pullback_report_dir_for_strategy(strategy_id, base_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ordered = sorted(results, key=lambda item: _btc_ema15_ma50_rank_sort_key(item[0], item[1]), reverse=True)
+    best_config, best_result = ordered[0]
+    comparison_rows = [
+        _btc_ema15_ma50_comparison_row(index, config, result)
+        for index, (config, result) in enumerate(ordered, start=1)
+    ]
+    summary_row = _btc_ema15_ma50_summary_row(best_config, best_result, exported_at=exported_at)
+    trades_rows = _btc_ema15_ma50_trade_rows(best_config, best_result)
+
+    _write_csv_rows(output_dir / "summary.csv", list(summary_row.keys()), [summary_row])
+    _write_csv_rows(output_dir / "strategy_comparison.csv", list(comparison_rows[0].keys()), comparison_rows)
+    _write_csv_rows(output_dir / "trades.csv", list(trades_rows[0].keys()) if trades_rows else _btc_ema15_trade_csv_headers(), trades_rows)
+    _write_csv_rows(
+        output_dir / "equity_curve.csv",
+        ["ts", "time", "equity", "net_value", "drawdown", "drawdown_pct"],
+        _btc_ema15_ma50_equity_rows(best_result),
+    )
+    _write_csv_rows(
+        output_dir / "monthly_returns.csv",
+        ["period", "trades", "win_rate", "total_pnl", "return_pct", "start_equity", "end_equity", "max_drawdown", "max_drawdown_pct"],
+        _btc_ema15_ma50_period_rows(best_result.monthly_stats),
+    )
+    _write_csv_rows(
+        output_dir / "yearly_returns.csv",
+        ["period", "trades", "win_rate", "total_pnl", "return_pct", "start_equity", "end_equity", "max_drawdown", "max_drawdown_pct"],
+        _btc_ema15_ma50_period_rows(best_result.yearly_stats),
+    )
+    trade_chart_dir = output_dir / "trade_charts"
+    trade_chart_dir.mkdir(parents=True, exist_ok=True)
+    trade_chart_links = _btc_ema15_ma50_write_trade_charts(trade_chart_dir, best_config, best_result)
+    report_html = _btc_ema15_ma50_build_report_html(
+        ordered,
+        best_config,
+        best_result,
+        comparison_rows,
+        trades_rows,
+        trade_chart_links,
+        exported_at=exported_at,
+    )
+    (output_dir / "report.html").write_text(report_html, encoding="utf-8")
+    return output_dir
+
+
+def _write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: _csv_value(row.get(key)) for key in fieldnames})
+
+
+def _csv_value(value: object) -> object:
+    if isinstance(value, Decimal):
+        return format_decimal(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    return value
+
+
+def _btc_ema15_ma50_rank_sort_key(config: StrategyConfig, result: BacktestResult) -> tuple[Decimal, Decimal, Decimal]:
+    return (
+        result.report.total_pnl,
+        sum((trade.r_multiple for trade in result.trades), Decimal("0")),
+        -result.report.max_drawdown,
+    )
+
+
+def _btc_ema15_ma50_summary_row(
+    config: StrategyConfig,
+    result: BacktestResult,
+    *,
+    exported_at: datetime,
+) -> dict[str, object]:
+    return {
+        "exported_at": exported_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "strategy_id": config.strategy_id,
+        "strategy_name": STRATEGY_ID_TO_NAME.get(config.strategy_id, config.strategy_id),
+        "symbol": config.inst_id,
+        "timeframe": config.bar,
+        "atr_period": config.atr_period,
+        "atr_stop_multiplier": config.atr_stop_multiplier,
+        "cross_window_bars": config.cross_window_bars,
+        "max_pullback_index": config.max_pullback_index,
+        "daily_filter": _btc_ema15_ma50_daily_filter_text(config),
+        "exit_mode": config.exit_mode,
+        "rr": config.rr,
+        "break_even_trigger_r": config.dynamic_break_even_trigger_r,
+        "trailing_start_r": config.ema55_slope_lock_profit_trigger_r,
+        "first_lock_r": config.dynamic_first_lock_r,
+        "trailing_step_r": config.dynamic_trailing_step_r,
+        "trades": result.report.total_trades,
+        "win_rate": result.report.win_rate,
+        "profit_factor": result.report.profit_factor,
+        "total_r": sum((trade.r_multiple for trade in result.trades), Decimal("0")),
+        "net_profit": result.report.total_pnl,
+        "max_drawdown": result.report.max_drawdown,
+        "max_drawdown_pct": result.report.max_drawdown_pct,
+        "avg_r": result.report.average_r_multiple,
+        "median_r": _btc_ema15_ma50_median_r(result),
+        "max_consecutive_losses": _btc_ema15_ma50_max_consecutive_losses(result),
+    }
+
+
+def _btc_ema15_ma50_comparison_row(rank: int, config: StrategyConfig, result: BacktestResult) -> dict[str, object]:
+    return {
+        "rank": rank,
+        "symbol": config.inst_id,
+        "timeframe": config.bar,
+        "atr_period": config.atr_period,
+        "atr_stop_multiplier": config.atr_stop_multiplier,
+        "cross_window_bars": config.cross_window_bars,
+        "max_pullback_index": config.max_pullback_index,
+        "daily_filter": _btc_ema15_ma50_daily_filter_text(config),
+        "exit_mode": config.exit_mode,
+        "rr": config.rr,
+        "break_even_trigger_r": config.dynamic_break_even_trigger_r,
+        "trailing_start_r": config.ema55_slope_lock_profit_trigger_r,
+        "first_lock_r": config.dynamic_first_lock_r,
+        "trailing_step_r": config.dynamic_trailing_step_r,
+        "trades": result.report.total_trades,
+        "win_rate": result.report.win_rate,
+        "profit_factor": result.report.profit_factor,
+        "total_r": sum((trade.r_multiple for trade in result.trades), Decimal("0")),
+        "net_profit": result.report.total_pnl,
+        "max_drawdown": result.report.max_drawdown,
+        "max_drawdown_pct": result.report.max_drawdown_pct,
+        "avg_r": result.report.average_r_multiple,
+        "median_r": _btc_ema15_ma50_median_r(result),
+        "max_consecutive_losses": _btc_ema15_ma50_max_consecutive_losses(result),
+        "maker_fee_rate": result.maker_fee_rate,
+        "taker_fee_rate": result.taker_fee_rate,
+        "entry_slippage_rate": result.entry_slippage_rate,
+        "exit_slippage_rate": result.exit_slippage_rate,
+    }
+
+
+def _btc_ema15_trade_csv_headers() -> list[str]:
+    return [
+        "trade_id",
+        "symbol",
+        "timeframe",
+        "direction",
+        "cross_time",
+        "entry_time",
+        "exit_time",
+        "entry_price",
+        "exit_price",
+        "ema15_at_entry",
+        "ma50_at_entry",
+        "atr_at_entry",
+        "stop_price",
+        "qty",
+        "gross_pnl",
+        "fee",
+        "slippage",
+        "net_pnl",
+        "r_multiple",
+        "exit_reason",
+        "bars_after_cross",
+        "pullback_index",
+        "pullback_depth_pct",
+        "ema15_slope_5",
+        "ema15_slope_10",
+        "ma50_slope_10",
+        "daily_filter_pass",
+        "max_r_before_exit",
+        "max_drawdown_r",
+        "holding_bars",
+    ]
+
+
+def _btc_ema15_ma50_trade_rows(config: StrategyConfig, result: BacktestResult) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    direction = _btc_ema15_ma50_pullback_direction(config.strategy_id)
+    for index, trade in enumerate(result.trades, start=1):
+        metadata = trade.metadata or {}
+        rows.append(
+            {
+                "trade_id": f"T{index:04d}",
+                "symbol": config.inst_id,
+                "timeframe": config.bar,
+                "direction": direction,
+                "cross_time": _format_timestamp(int(metadata.get("cross_ts", trade.entry_ts))),
+                "entry_time": _format_timestamp(trade.entry_ts),
+                "exit_time": _format_timestamp(trade.exit_ts),
+                "entry_price": trade.entry_price,
+                "exit_price": trade.exit_price,
+                "ema15_at_entry": metadata.get("ema15_at_entry", ""),
+                "ma50_at_entry": metadata.get("ma50_at_entry", ""),
+                "atr_at_entry": metadata.get("atr_at_entry", trade.atr_value),
+                "stop_price": metadata.get("stop_price", trade.stop_loss),
+                "qty": trade.size,
+                "gross_pnl": trade.gross_pnl,
+                "fee": trade.total_fee,
+                "slippage": trade.slippage_cost,
+                "net_pnl": trade.pnl,
+                "r_multiple": trade.r_multiple,
+                "exit_reason": format_trade_exit_reason(trade.exit_reason),
+                "bars_after_cross": metadata.get("bars_after_cross", ""),
+                "pullback_index": metadata.get("pullback_index", ""),
+                "pullback_depth_pct": metadata.get("pullback_depth_pct", ""),
+                "ema15_slope_5": metadata.get("ema15_slope_5", ""),
+                "ema15_slope_10": metadata.get("ema15_slope_10", ""),
+                "ma50_slope_10": metadata.get("ma50_slope_10", ""),
+                "daily_filter_pass": bool(metadata.get("daily_filter_pass", False)),
+                "max_r_before_exit": metadata.get("max_r_before_exit", ""),
+                "max_drawdown_r": metadata.get("max_drawdown_r", ""),
+                "holding_bars": max(trade.exit_index - trade.entry_index, 0),
+            }
+        )
+    return rows
+
+
+def _btc_ema15_ma50_equity_rows(result: BacktestResult) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for index, candle in enumerate(result.candles):
+        rows.append(
+            {
+                "ts": candle.ts,
+                "time": _format_timestamp(candle.ts),
+                "equity": result.equity_curve[index] if index < len(result.equity_curve) else Decimal("0"),
+                "net_value": result.net_value_curve[index] if index < len(result.net_value_curve) else Decimal("0"),
+                "drawdown": result.drawdown_curve[index] if index < len(result.drawdown_curve) else Decimal("0"),
+                "drawdown_pct": result.drawdown_pct_curve[index] if index < len(result.drawdown_pct_curve) else Decimal("0"),
+            }
+        )
+    return rows
+
+
+def _btc_ema15_ma50_period_rows(stats: list[object]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for item in stats:
+        rows.append(
+            {
+                "period": item.period_label,
+                "trades": item.trades,
+                "win_rate": item.win_rate,
+                "total_pnl": item.total_pnl,
+                "return_pct": item.return_pct,
+                "start_equity": item.start_equity,
+                "end_equity": item.end_equity,
+                "max_drawdown": item.max_drawdown,
+                "max_drawdown_pct": item.max_drawdown_pct,
+            }
+        )
+    return rows
+
+
+def _btc_ema15_ma50_median_r(result: BacktestResult) -> Decimal:
+    values = sorted(trade.r_multiple for trade in result.trades)
+    if not values:
+        return Decimal("0")
+    middle = len(values) // 2
+    if len(values) % 2 == 1:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) / Decimal("2")
+
+
+def _btc_ema15_ma50_max_consecutive_losses(result: BacktestResult) -> int:
+    streak = 0
+    best = 0
+    for trade in result.trades:
+        if trade.pnl < 0:
+            streak += 1
+            best = max(best, streak)
+        else:
+            streak = 0
+    return best
+
+
+def _btc_ema15_ma50_daily_filter_text(config: StrategyConfig) -> str:
+    if not config.uses_daily_filter():
+        return "disabled"
+    return f"{config.daily_filter_mode}/{config.daily_filter_scope}/{config.daily_filter_period}"
+
+
+def _btc_ema15_ma50_write_trade_charts(
+    output_dir: Path,
+    config: StrategyConfig,
+    result: BacktestResult,
+) -> dict[str, str]:
+    links: dict[str, str] = {}
+    for index, trade in enumerate(result.trades, start=1):
+        trade_id = f"T{index:04d}"
+        file_name = f"{trade_id}.html"
+        (output_dir / file_name).write_text(
+            _btc_ema15_ma50_build_trade_chart_html(config, result, trade, trade_id),
+            encoding="utf-8",
+        )
+        links[trade_id] = f"trade_charts/{file_name}"
+    return links
+
+
+def _btc_ema15_ma50_build_trade_chart_html(
+    config: StrategyConfig,
+    result: BacktestResult,
+    trade,
+    trade_id: str,
+) -> str:
+    metadata = trade.metadata or {}
+    strategy_title = _btc_ema15_ma50_pullback_title(config.strategy_id)
+    direction = _btc_ema15_ma50_pullback_direction(config.strategy_id)
+    cross_label = "CrossDown" if direction == "short" else "CrossUp"
+    cross_index = int(metadata.get("cross_index", max(trade.entry_index - 1, 0)))
+    start_index = max(min(cross_index, trade.entry_index) - 12, 0)
+    end_index = min(trade.exit_index + 12, len(result.candles) - 1)
+    window = result.candles[start_index : end_index + 1]
+    x_values = [_format_timestamp(item.ts) for item in window]
+    candle_payload = {
+        "x": x_values,
+        "open": [float(item.open) for item in window],
+        "high": [float(item.high) for item in window],
+        "low": [float(item.low) for item in window],
+        "close": [float(item.close) for item in window],
+    }
+    ema_trace = [
+        None if value is None else float(value)
+        for value in result.ema_values[start_index : end_index + 1]
+    ]
+    ma_trace = [
+        None if value is None else float(value)
+        for value in result.trend_ema_values[start_index : end_index + 1]
+    ]
+    stop_history = []
+    for item in metadata.get("stop_history", []):
+        ts = int(item.get("ts", trade.entry_ts))
+        if result.candles[start_index].ts <= ts <= result.candles[end_index].ts:
+            stop_history.append(
+                {
+                    "x": _format_timestamp(ts),
+                    "y": float(Decimal(str(item.get("price", trade.stop_loss)))),
+                }
+            )
+    if not stop_history:
+        stop_history = [
+            {"x": _format_timestamp(trade.entry_ts), "y": float(trade.stop_loss)},
+            {"x": _format_timestamp(trade.exit_ts), "y": float(trade.stop_loss)},
+        ]
+    chart_payload = {
+        "candles": candle_payload,
+        "ema": {"x": x_values, "y": ema_trace},
+        "ma": {"x": x_values, "y": ma_trace},
+        "cross": {
+            "x": [_format_timestamp(int(metadata.get("cross_ts", trade.entry_ts)))],
+            "y": [float(metadata.get("ema15_at_entry", trade.entry_price))],
+        },
+        "entry": {"x": [_format_timestamp(trade.entry_ts)], "y": [float(trade.entry_price)]},
+        "exit": {"x": [_format_timestamp(trade.exit_ts)], "y": [float(trade.exit_price)]},
+        "initial_stop": {
+            "x": [_format_timestamp(trade.entry_ts), _format_timestamp(trade.exit_ts)],
+            "y": [float(trade.stop_loss), float(trade.stop_loss)],
+        },
+        "stop_history": {
+            "x": [item["x"] for item in stop_history],
+            "y": [item["y"] for item in stop_history],
+        },
+        "max_favorable": {
+            "x": [_format_timestamp(int(metadata.get("max_favorable_ts", trade.exit_ts)))],
+            "y": [float(Decimal(str(metadata.get("max_favorable_price", trade.exit_price))))],
+        },
+        "max_adverse": {
+            "x": [_format_timestamp(int(metadata.get("max_adverse_ts", trade.entry_ts)))],
+            "y": [float(Decimal(str(metadata.get("max_adverse_price", trade.entry_price))))],
+        },
+    }
+    summary = (
+        f"交易ID：{trade_id} | {cross_label}：{_format_timestamp(int(metadata.get('cross_ts', trade.entry_ts)))} | "
+        f"入场：{_format_timestamp(trade.entry_ts)} @ {format_decimal_fixed(trade.entry_price, 4)} | "
+        f"离场：{_format_timestamp(trade.exit_ts)} @ {format_decimal_fixed(trade.exit_price, 4)} | "
+        f"原因：{format_trade_exit_reason(trade.exit_reason)} | R={format_decimal_fixed(trade.r_multiple, 4)}"
+    )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{html.escape(trade_id)} 交易图</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body {{ font-family: "Microsoft YaHei", sans-serif; margin: 24px; background: #f7f5ef; color: #1f2933; }}
+    h1 {{ margin-bottom: 8px; }}
+    .summary {{ margin-bottom: 16px; }}
+    #chart {{ width: 100%; height: 760px; }}
+  </style>
+</head>
+<body>
+  <h1>{html.escape(strategy_title)} | {html.escape(trade_id)}</h1>
+  <div class="summary">{html.escape(summary)}</div>
+  <div id="chart"></div>
+  <script>
+    const payload = {json.dumps(chart_payload, ensure_ascii=False)};
+    const traces = [
+      {{
+        x: payload.candles.x,
+        open: payload.candles.open,
+        high: payload.candles.high,
+        low: payload.candles.low,
+        close: payload.candles.close,
+        type: "candlestick",
+        name: "4H K线"
+      }},
+      {{ x: payload.ema.x, y: payload.ema.y, type: "scatter", mode: "lines", name: "EMA15", line: {{ color: "#e76f51", width: 2 }} }},
+      {{ x: payload.ma.x, y: payload.ma.y, type: "scatter", mode: "lines", name: "MA50", line: {{ color: "#264653", width: 2 }} }},
+      {{ x: payload.cross.x, y: payload.cross.y, type: "scatter", mode: "markers", name: "{cross_label}", marker: {{ color: "#2a9d8f", size: 12, symbol: "diamond" }} }},
+      {{ x: payload.entry.x, y: payload.entry.y, type: "scatter", mode: "markers+text", text: ["Entry"], textposition: "top center", name: "Entry", marker: {{ color: "#1d4ed8", size: 12 }} }},
+      {{ x: payload.exit.x, y: payload.exit.y, type: "scatter", mode: "markers+text", text: ["Exit"], textposition: "top center", name: "Exit", marker: {{ color: "#b91c1c", size: 12 }} }},
+      {{ x: payload.initial_stop.x, y: payload.initial_stop.y, type: "scatter", mode: "lines", name: "初始止损", line: {{ color: "#ef4444", dash: "dot" }} }},
+      {{ x: payload.stop_history.x, y: payload.stop_history.y, type: "scatter", mode: "lines+markers", name: "动态止损轨迹", line: {{ color: "#8b5cf6", width: 2 }} }},
+      {{ x: payload.max_favorable.x, y: payload.max_favorable.y, type: "scatter", mode: "markers+text", text: ["最高浮盈"], textposition: "top right", name: "最高浮盈", marker: {{ color: "#15803d", size: 11 }} }},
+      {{ x: payload.max_adverse.x, y: payload.max_adverse.y, type: "scatter", mode: "markers+text", text: ["最大浮亏"], textposition: "bottom right", name: "最大浮亏", marker: {{ color: "#dc2626", size: 11 }} }}
+    ];
+    Plotly.newPlot("chart", traces, {{
+      title: "{html.escape(trade_id)} | {html.escape(format_trade_exit_reason(trade.exit_reason))} | R={format_decimal_fixed(trade.r_multiple, 4)}",
+      xaxis: {{ rangeslider: {{ visible: false }} }},
+      yaxis: {{ title: "价格" }},
+      legend: {{ orientation: "h" }},
+      margin: {{ l: 60, r: 20, t: 60, b: 40 }},
+      paper_bgcolor: "#f7f5ef",
+      plot_bgcolor: "#fffdf8"
+    }}, {{ responsive: true }});
+  </script>
+</body>
+</html>
+"""
+
+
+def _btc_ema15_ma50_build_report_html(
+    ordered: list[tuple[StrategyConfig, BacktestResult]],
+    best_config: StrategyConfig,
+    best_result: BacktestResult,
+    comparison_rows: list[dict[str, object]],
+    trades_rows: list[dict[str, object]],
+    trade_chart_links: dict[str, str],
+    *,
+    exported_at: datetime,
+) -> str:
+    strategy_title = _btc_ema15_ma50_pullback_title(best_config.strategy_id)
+    direction = _btc_ema15_ma50_pullback_direction(best_config.strategy_id)
+    slug = _btc_ema15_ma50_pullback_study_slug(best_config.strategy_id)
+    description = (
+        "本研究模块固定品种为 BTC-USDT-SWAP、周期为 4H、方向只做空。先要求 EMA15 从上向下穿越 MA50，再在限定窗口内等待 high 回抽 EMA15 且 close 收回 EMA15 下方，信号在收盘确认后统一于下一根K线开盘成交。止损使用 ATR 倍数，离场可选择固定RR、动态保护，以及 EMA15 收盘重新站回上方后的下一根开盘离场。"
+        if direction == "short"
+        else "本研究模块固定品种为 BTC-USDT-SWAP、周期为 4H、方向只做多。先要求 EMA15 从下向上穿越 MA50，再在限定窗口内等待 low 回踩 EMA15 且 close 收回 EMA15 上方，信号在收盘确认后统一于下一根K线开盘成交。止损使用 ATR 倍数，离场可选择固定RR、动态保护，以及 EMA15 收盘跌破后的下一根开盘离场。"
+    )
+    top_rows = comparison_rows[:20]
+    best_total_r = sum((trade.r_multiple for trade in best_result.trades), Decimal("0"))
+    equity_payload = {
+        "x": [_format_timestamp(candle.ts) for candle in best_result.candles],
+        "net": [float(value) for value in best_result.net_value_curve],
+        "drawdown": [float(value) for value in best_result.drawdown_curve],
+    }
+    comparison_table = "".join(
+        "<tr>"
+        f"<td>{row['rank']}</td>"
+        f"<td>{html.escape(str(row['atr_period']))}</td>"
+        f"<td>{html.escape(str(row['atr_stop_multiplier']))}</td>"
+        f"<td>{html.escape(str(row['cross_window_bars']))}</td>"
+        f"<td>{html.escape(str(row['max_pullback_index']))}</td>"
+        f"<td>{html.escape(str(row['daily_filter']))}</td>"
+        f"<td>{html.escape(str(row['exit_mode']))}</td>"
+        f"<td>{html.escape(str(row['rr']))}</td>"
+        f"<td>{html.escape(str(row['net_profit']))}</td>"
+        f"<td>{html.escape(str(row['total_r']))}</td>"
+        f"<td>{html.escape(str(row['profit_factor']))}</td>"
+        f"<td>{html.escape(str(row['max_drawdown']))}</td>"
+        "</tr>"
+        for row in top_rows
+    )
+    trades_table = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(row['trade_id']))}</td>"
+        f"<td>{html.escape(str(row['entry_time']))}</td>"
+        f"<td>{html.escape(str(row['exit_time']))}</td>"
+        f"<td>{html.escape(str(row['entry_price']))}</td>"
+        f"<td>{html.escape(str(row['exit_price']))}</td>"
+        f"<td>{html.escape(str(row['net_pnl']))}</td>"
+        f"<td>{html.escape(str(row['r_multiple']))}</td>"
+        f"<td>{html.escape(str(row['exit_reason']))}</td>"
+        f"<td><a href=\"{html.escape(trade_chart_links.get(str(row['trade_id']), ''))}\">查看图表</a></td>"
+        "</tr>"
+        for row in trades_rows
+    )
+    monthly_table = "".join(
+        "<tr>"
+        f"<td>{html.escape(item.period_label)}</td>"
+        f"<td>{item.trades}</td>"
+        f"<td>{format_decimal_fixed(item.return_pct, 2)}%</td>"
+        f"<td>{format_decimal_fixed(item.total_pnl, 4)}</td>"
+        "</tr>"
+        for item in best_result.monthly_stats
+    )
+    yearly_table = "".join(
+        "<tr>"
+        f"<td>{html.escape(item.period_label)}</td>"
+        f"<td>{item.trades}</td>"
+        f"<td>{format_decimal_fixed(item.return_pct, 2)}%</td>"
+        f"<td>{format_decimal_fixed(item.total_pnl, 4)}</td>"
+        "</tr>"
+        for item in best_result.yearly_stats
+    )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{html.escape(strategy_title)}研究报告</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body {{ font-family: "Microsoft YaHei", sans-serif; margin: 24px; background: #f4efe6; color: #1f2933; }}
+    h1, h2 {{ color: #8f3f2b; }}
+    .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 16px 0 24px; }}
+    .card {{ background: #fffdf8; border: 1px solid #eadfcd; border-radius: 12px; padding: 14px; }}
+    table {{ width: 100%; border-collapse: collapse; margin: 12px 0 24px; background: #fffdf8; }}
+    th, td {{ border: 1px solid #eadfcd; padding: 8px 10px; text-align: left; font-size: 14px; }}
+    th {{ background: #f7e8d0; }}
+    .muted {{ color: #52606d; }}
+    #equityChart {{ width: 100%; height: 460px; }}
+  </style>
+</head>
+<body>
+  <h1>{html.escape(strategy_title)}研究报告</h1>
+  <div class="muted">导出时间：{exported_at.strftime("%Y-%m-%d %H:%M:%S")} | 输出目录：reports/{slug}/latest/</div>
+  <h2>策略说明</h2>
+  <p>{html.escape(description)}</p>
+  <div class="cards">
+    <div class="card"><strong>参数排名第1</strong><br>ATR={best_config.atr_period} / stop={format_decimal(best_config.atr_stop_multiplier)} / window={best_config.cross_window_bars}</div>
+    <div class="card"><strong>胜率</strong><br>{format_decimal_fixed(best_result.report.win_rate, 2)}%</div>
+    <div class="card"><strong>Profit Factor</strong><br>{_format_optional_ratio(best_result.report.profit_factor)}</div>
+    <div class="card"><strong>总R</strong><br>{format_decimal_fixed(best_total_r, 4)}</div>
+    <div class="card"><strong>净利润</strong><br>{format_decimal_fixed(best_result.report.total_pnl, 4)}</div>
+    <div class="card"><strong>最大回撤</strong><br>{format_decimal_fixed(best_result.report.max_drawdown, 4)}</div>
+    <div class="card"><strong>连续亏损</strong><br>{_btc_ema15_ma50_max_consecutive_losses(best_result)}</div>
+    <div class="card"><strong>平均R / 中位数R</strong><br>{format_decimal_fixed(best_result.report.average_r_multiple, 4)} / {format_decimal_fixed(_btc_ema15_ma50_median_r(best_result), 4)}</div>
+  </div>
+  <h2>参数组合排名</h2>
+  <table>
+    <thead>
+      <tr><th>排名</th><th>ATR周期</th><th>ATR止损倍数</th><th>Cross窗口</th><th>最大回踩序号</th><th>日线过滤</th><th>Exit模式</th><th>RR</th><th>净利润</th><th>总R</th><th>PF</th><th>最大回撤</th></tr>
+    </thead>
+    <tbody>{comparison_table}</tbody>
+  </table>
+  <h2>资金曲线与回撤曲线</h2>
+  <div id="equityChart"></div>
+  <h2>月度收益</h2>
+  <table><thead><tr><th>月份</th><th>交易数</th><th>收益率</th><th>净利润</th></tr></thead><tbody>{monthly_table}</tbody></table>
+  <h2>年度收益</h2>
+  <table><thead><tr><th>年份</th><th>交易数</th><th>收益率</th><th>净利润</th></tr></thead><tbody>{yearly_table}</tbody></table>
+  <h2>每笔交易列表</h2>
+  <table>
+    <thead><tr><th>ID</th><th>入场时间</th><th>离场时间</th><th>入场价</th><th>离场价</th><th>净利润</th><th>R</th><th>离场原因</th><th>K线图</th></tr></thead>
+    <tbody>{trades_table}</tbody>
+  </table>
+  <script>
+    const payload = {json.dumps(equity_payload, ensure_ascii=False)};
+    Plotly.newPlot("equityChart", [
+      {{ x: payload.x, y: payload.net, type: "scatter", mode: "lines", name: "资金曲线", line: {{ color: "#8f3f2b", width: 2 }} }},
+      {{ x: payload.x, y: payload.drawdown, type: "scatter", mode: "lines", name: "回撤曲线", yaxis: "y2", line: {{ color: "#1d3557", width: 2 }} }}
+    ], {{
+      margin: {{ l: 50, r: 50, t: 30, b: 40 }},
+      paper_bgcolor: "#f4efe6",
+      plot_bgcolor: "#fffdf8",
+      xaxis: {{ title: "时间" }},
+      yaxis: {{ title: "资金曲线" }},
+      yaxis2: {{ title: "回撤", overlaying: "y", side: "right" }},
+      legend: {{ orientation: "h" }}
+    }}, {{ responsive: true }});
+  </script>
+</body>
+</html>
+"""

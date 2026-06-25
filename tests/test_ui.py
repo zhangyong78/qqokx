@@ -3574,6 +3574,26 @@ class StrategyTradeTrackingTest(TestCase):
 
         self.assertFalse(QuantApp._session_should_transition_to_recoverable(session))
 
+    def test_session_should_not_transition_to_recoverable_after_rejected_position_takeover(self) -> None:
+        session = self._make_session()
+        session.last_message = (
+            "策略停止，原因：拒绝接管现有持仓：交易所持仓侧与策略预期不一致"
+            " | 标的=DOGE-USDT-SWAP | 预期posSide=long | 实际=short:4.19"
+        )
+        session.active_trade = StrategyTradeRuntimeState(
+            round_id="S34-1",
+            opened_logged_at=datetime(2026, 6, 25, 16, 59, 56),
+            entry_order_id="3686693011492790272",
+            entry_client_order_id="s34emaent062508001352207",
+            entry_price=Decimal("0.07697"),
+            size=Decimal("5.4"),
+            protective_algo_cl_ord_id="s34emaslg062508001352208",
+            initial_stop_price=Decimal("0.07623"),
+            current_stop_price=Decimal("0.07623"),
+        )
+
+        self.assertFalse(QuantApp._session_should_transition_to_recoverable(session))
+
     def test_restore_session_trade_runtime_from_log_recovers_initial_stop_and_latest_stop(self) -> None:
         session = self._make_session()
         app = self._make_app_for_tracking()

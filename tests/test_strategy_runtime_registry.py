@@ -2,6 +2,8 @@ from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_LONG_ID,
@@ -64,6 +66,14 @@ class StrategyRuntimeRegistryTest(TestCase):
         self.assertEqual(adaptive_rail_profile.family, "adaptive_ema_rail")
         self.assertFalse(adaptive_rail_profile.supports_exchange_trade)
 
+        pullback_long_profile = get_strategy_runtime_profile(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID)
+        self.assertEqual(pullback_long_profile.family, "ema15_ma50_pullback_long")
+        self.assertFalse(pullback_long_profile.supports_exchange_trade)
+
+        pullback_short_profile = get_strategy_runtime_profile(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID)
+        self.assertEqual(pullback_short_profile.family, "ema15_ma50_pullback_short")
+        self.assertFalse(pullback_short_profile.supports_exchange_trade)
+
     def test_entry_reference_captions_follow_runtime_family(self) -> None:
         self.assertEqual(strategy_entry_reference_caption(STRATEGY_DYNAMIC_LONG_ID), "挂单参考线")
         self.assertEqual(strategy_entry_reference_caption(STRATEGY_EMA_BREAKOUT_LONG_ID), "突破参考线")
@@ -95,6 +105,8 @@ class StrategyRuntimeRegistryTest(TestCase):
         self.assertEqual(strategy_preferred_direction(STRATEGY_DYNAMIC_MTF_LONG_ID, "both"), "long")
         self.assertEqual(strategy_preferred_direction(STRATEGY_DYNAMIC_MTF_SHORT_ID, "both"), "short")
         self.assertEqual(strategy_preferred_direction(STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID, "both"), "long")
+        self.assertEqual(strategy_preferred_direction(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "both"), "long")
+        self.assertEqual(strategy_preferred_direction(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "both"), "short")
         self.assertIsNone(strategy_preferred_direction(STRATEGY_EMA5_EMA8_ID, "both"))
 
     def test_cross_helpers_and_signal_extrema_flags_follow_runtime_profile(self) -> None:

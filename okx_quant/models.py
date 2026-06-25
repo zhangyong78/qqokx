@@ -417,6 +417,10 @@ class StrategyConfig:
     body_retest_stop_buffer_atr_multiplier: Decimal = Decimal("0.3")
     body_retest_body_atr_limit: Decimal = Decimal("1.0")
     body_retest_watch_bars: int = 6
+    cross_window_bars: int = 10
+    max_pullback_index: int = 1
+    exit_mode: str = "fixed_rr"
+    rr: Decimal = Decimal("2")
     startup_chase_current_signal: bool = False
     startup_chase_window_seconds: int = 0
     time_stop_break_even_enabled: bool = False
@@ -624,6 +628,15 @@ class StrategyConfig:
 
     def resolved_trend_ema_close_exit_after_trigger_r(self) -> int:
         return max(int(self.trend_ema_close_exit_after_trigger_r), 1)
+
+    def resolved_cross_window_bars(self) -> int:
+        return max(int(self.cross_window_bars), 1)
+
+    def resolved_max_pullback_index(self) -> int:
+        return max(int(self.max_pullback_index), 1)
+
+    def resolved_fixed_rr(self) -> Decimal:
+        return max(Decimal(str(self.rr)), Decimal("0.1"))
 
 
 

@@ -1,6 +1,8 @@
 from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_CROSS_ID,
@@ -111,3 +113,17 @@ class StrategyParametersTest(TestCase):
         self.assertEqual(strategy_fixed_value(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "signal_mode"), "short_only")
         self.assertFalse(strategy_is_parameter_editable(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "ema_type", "launcher"))
         self.assertFalse(strategy_is_parameter_editable(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "ema_period", "launcher"))
+
+    def test_btc_ema15_ma50_pullback_profiles_share_same_research_parameter_set(self) -> None:
+        keys_long = set(iter_strategy_parameter_keys(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID))
+        keys_short = set(iter_strategy_parameter_keys(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID))
+
+        self.assertEqual(keys_long, keys_short)
+        self.assertIn("cross_window_bars", keys_long)
+        self.assertIn("max_pullback_index", keys_long)
+        self.assertIn("exit_mode", keys_long)
+        self.assertIn("dynamic_protection_rules", keys_long)
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "signal_mode"), "long_only")
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "signal_mode"), "short_only")
+        self.assertFalse(strategy_is_parameter_editable(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "bar", "backtest"))
+        self.assertFalse(strategy_is_parameter_editable(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "bar", "backtest"))

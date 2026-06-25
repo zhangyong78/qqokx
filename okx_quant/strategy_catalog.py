@@ -16,6 +16,8 @@ STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID = "adaptive_ema_rail_long"
 STRATEGY_EMA55_SLOPE_SHORT_ID = "ema55_slope_short"
 STRATEGY_BTC_EMA55_SLOPE_SHORT_ID = "btc_ema55_slope_short"
 STRATEGY_BODY_RETEST_SHORT_ID = "body_retest_short"
+STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID = "btc_ema15_ma50_pullback_long"
+STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID = "btc_ema15_ma50_pullback_short"
 
 
 def is_ema_atr_breakout_strategy(strategy_id: str) -> bool:
@@ -41,6 +43,14 @@ def is_btc_ema55_slope_short_strategy(strategy_id: str) -> bool:
 
 def is_body_retest_short_strategy(strategy_id: str) -> bool:
     return strategy_id == STRATEGY_BODY_RETEST_SHORT_ID
+
+
+def is_btc_ema15_ma50_pullback_long_strategy(strategy_id: str) -> bool:
+    return strategy_id == STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID
+
+
+def is_btc_ema15_ma50_pullback_short_strategy(strategy_id: str) -> bool:
+    return strategy_id == STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID
 
 
 def is_dynamic_mtf_strategy_id(strategy_id: str) -> bool:
@@ -305,6 +315,46 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
         supports_batch_observe=True,
     ),
     StrategyDefinition(
+        strategy_id=STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+        name="BTC EMA15/MA50 回踩做多",
+        summary="BTC 4H 专用研究策略：EMA15 上穿 MA50 后，等待限定窗口内首次或前几次回踩 EMA15 的收盘确认，下一根开盘做多。",
+        rule_description=(
+            "流程：固定 BTC-USDT-SWAP 4H；先要求 EMA15 从下向上穿越 MA50，随后进入限定观察窗口。"
+            "若窗口内出现 low 触及 EMA15 且 close 重新收回 EMA15 上方，则在该根 K 线收盘确认，下一根 K 线开盘做多。"
+            "持仓后可选择固定 RR、nR 动态保护，以及 EMA15 收盘跌破后的下一根开盘离场。"
+        ),
+        parameter_hint=(
+            "核心研究参数：ATR 周期、ATR 止损倍数、Cross 后观察窗口、允许交易的第几次回踩、"
+            "固定 RR、动态保护触发 R、日线过滤，以及是否叠加 EMA15 收破离场。"
+        ),
+        default_signal_label="只做多",
+        allowed_signal_labels=("只做多",),
+        supports_trade=False,
+        supports_signal_only=False,
+        supports_backtest=True,
+        supports_batch_observe=False,
+    ),
+    StrategyDefinition(
+        strategy_id=STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
+        name="BTC EMA15/MA50 回踩做空",
+        summary="BTC 4H 专用研究策略：EMA15 下穿 MA50 后，等待限定窗口内首次或前几次回抽 EMA15 的收盘确认，下一根开盘做空。",
+        rule_description=(
+            "流程：固定 BTC-USDT-SWAP 4H；先要求 EMA15 从上向下穿越 MA50，随后进入限定观察窗口。"
+            "若窗口内出现 high 触及 EMA15 且 close 重新收回 EMA15 下方，则在该根 K 线收盘确认，下一根 K 线开盘做空。"
+            "持仓后可选择固定 RR、nR 动态保护，以及 EMA15 收盘重新站回上方后的下一根开盘离场。"
+        ),
+        parameter_hint=(
+            "核心研究参数：ATR 周期、ATR 止损倍数、Cross 后观察窗口、允许交易的第几次回抽、"
+            "固定 RR、动态保护触发 R、日线过滤，以及是否叠加 EMA15 收回离场。"
+        ),
+        default_signal_label="只做空",
+        allowed_signal_labels=("只做空",),
+        supports_trade=False,
+        supports_signal_only=False,
+        supports_backtest=True,
+        supports_batch_observe=False,
+    ),
+    StrategyDefinition(
         strategy_id=STRATEGY_DYNAMIC_ID,
         name="EMA 动态委托",
         summary="通用 EMA 动态委托策略入口，通常由做多/做空两个方向版本承接。",
@@ -341,6 +391,8 @@ _STRATEGY_IDS_HIDDEN_FROM_LAUNCHER: frozenset[str] = frozenset(
         STRATEGY_DYNAMIC_ID,
         STRATEGY_CROSS_ID,
         STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+        STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+        STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     }
 )
 _STRATEGY_IDS_HIDDEN_FROM_BACKTEST: frozenset[str] = frozenset({STRATEGY_DYNAMIC_ID, STRATEGY_CROSS_ID})
@@ -409,5 +461,9 @@ def resolve_dynamic_signal_mode(strategy_id: str, signal_mode: str) -> str:
     if strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
         return "short_only"
     if strategy_id == STRATEGY_BODY_RETEST_SHORT_ID:
+        return "short_only"
+    if strategy_id == STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID:
+        return "long_only"
+    if strategy_id == STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID:
         return "short_only"
     return signal_mode

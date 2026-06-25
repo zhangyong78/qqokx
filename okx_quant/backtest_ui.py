@@ -68,6 +68,8 @@ from okx_quant.strategy_profiles import StrategyProfile, read_strategy_bundle
 from okx_quant.strategy_catalog import (
     ALL_STRATEGY_DEFINITIONS,
     BACKTEST_STRATEGY_DEFINITIONS,
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_ID,
@@ -167,6 +169,13 @@ TAKE_PROFIT_MODE_OPTIONS = {
     "固定止盈": "fixed",
     "动态止盈": "dynamic",
 }
+BTC_EMA15_MA50_EXIT_MODE_OPTIONS = {
+    "固定RR": "fixed_rr",
+    "固定RR+EMA15离场": "fixed_rr_or_ema15_close",
+    "动态保护": "dynamic",
+    "动态保护+EMA15离场": "dynamic_or_ema15_close",
+    "仅EMA15离场": "ema15_close",
+}
 MTF_REVERSAL_MODE_OPTIONS = {
     "只过滤新开仓": "block_new_entries",
 }
@@ -176,6 +185,9 @@ DEFAULT_BACKTEST_CHART_VISIBLE_CANDLES = 900
 BACKTEST_CHART_FAST_RENDER_CANDLES = 800
 BACKTEST_CHART_FULL_RENDER_CANDLES = 2200
 TAKE_PROFIT_MODE_VALUE_TO_LABEL = {value: label for label, value in TAKE_PROFIT_MODE_OPTIONS.items()}
+BTC_EMA15_MA50_EXIT_MODE_VALUE_TO_LABEL = {
+    value: label for label, value in BTC_EMA15_MA50_EXIT_MODE_OPTIONS.items()
+}
 MOVING_AVERAGE_TYPE_OPTIONS = ("EMA", "MA")
 DAILY_FILTER_BOUNDARY_LABEL_TO_VALUE = {
     "交易所1D": "exchange",
@@ -260,6 +272,10 @@ class BacktestLaunchState:
     body_retest_stop_buffer_atr_multiplier: str = "0.3"
     body_retest_body_atr_limit: str = "1.0"
     body_retest_watch_bars: str = "6"
+    cross_window_bars: str = "10"
+    max_pullback_index: str = "1"
+    exit_mode_label: str = "动态保护+EMA15离场"
+    rr: str = "2"
     ema55_slope_exit_enabled: bool = True
     ema55_slope_lock_profit_enabled: bool = True
     ema55_slope_lock_profit_trigger_r: str = "5"
@@ -866,6 +882,14 @@ def _btc_ema55_slope_reentry_summary(config: StrategyConfig) -> str:
 
 
 def _backtest_exit_mode_label(config: StrategyConfig) -> str:
+    if config.strategy_id in {
+        STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+        STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
+    }:
+        exit_label = BTC_EMA15_MA50_EXIT_MODE_VALUE_TO_LABEL.get(str(config.exit_mode), str(config.exit_mode))
+        if str(config.exit_mode).startswith("fixed_rr"):
+            return f"{exit_label} / RR={format_decimal(config.rr)}"
+        return exit_label
     if config.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
         return _btc_ema55_slope_exit_summary(config)
     if config.strategy_id in {STRATEGY_EMA55_SLOPE_SHORT_ID, STRATEGY_BODY_RETEST_SHORT_ID} and config.take_profit_mode == "dynamic":
@@ -1510,6 +1534,10 @@ def _serialize_strategy_config(config: StrategyConfig) -> dict[str, object]:
         "body_retest_stop_buffer_atr_multiplier": str(config.body_retest_stop_buffer_atr_multiplier),
         "body_retest_body_atr_limit": str(config.body_retest_body_atr_limit),
         "body_retest_watch_bars": int(config.body_retest_watch_bars),
+        "cross_window_bars": int(config.cross_window_bars),
+        "max_pullback_index": int(config.max_pullback_index),
+        "exit_mode": str(config.exit_mode),
+        "rr": str(config.rr),
         "time_stop_break_even_enabled": config.time_stop_break_even_enabled,
         "time_stop_break_even_bars": config.resolved_time_stop_break_even_bars(),
         "trend_ema_close_exit_after_trigger_r_enabled": config.trend_ema_close_exit_after_trigger_r_enabled,
@@ -1651,6 +1679,10 @@ def _deserialize_strategy_config(payload: dict[str, object]) -> StrategyConfig:
         ),
         body_retest_body_atr_limit=Decimal(str(payload.get("body_retest_body_atr_limit", "1.0"))),
         body_retest_watch_bars=int(payload.get("body_retest_watch_bars", 6)),
+        cross_window_bars=int(payload.get("cross_window_bars", 10)),
+        max_pullback_index=int(payload.get("max_pullback_index", 1)),
+        exit_mode=str(payload.get("exit_mode", "fixed_rr")),
+        rr=Decimal(str(payload.get("rr", "2"))),
         time_stop_break_even_enabled=bool(payload.get("time_stop_break_even_enabled", False)),
         time_stop_break_even_bars=int(payload.get("time_stop_break_even_bars", 10)),
         trend_ema_close_exit_after_trigger_r_enabled=bool(
@@ -2054,6 +2086,10 @@ class BacktestWindow:
         self.body_retest_stop_buffer_atr_multiplier = StringVar(value=initial_state.body_retest_stop_buffer_atr_multiplier)
         self.body_retest_body_atr_limit = StringVar(value=initial_state.body_retest_body_atr_limit)
         self.body_retest_watch_bars = StringVar(value=initial_state.body_retest_watch_bars)
+        self.cross_window_bars = StringVar(value=initial_state.cross_window_bars)
+        self.max_pullback_index = StringVar(value=initial_state.max_pullback_index)
+        self.exit_mode_label = StringVar(value=initial_state.exit_mode_label)
+        self.rr = StringVar(value=initial_state.rr)
         self.ema55_slope_exit_enabled = BooleanVar(value=initial_state.ema55_slope_exit_enabled)
         self.ema55_slope_lock_profit_enabled = BooleanVar(value=initial_state.ema55_slope_lock_profit_enabled)
         self.ema55_slope_lock_profit_trigger_r = StringVar(value=initial_state.ema55_slope_lock_profit_trigger_r)
@@ -2488,6 +2524,10 @@ class BacktestWindow:
             "body_retest_stop_buffer_atr_multiplier": self.body_retest_stop_buffer_atr_multiplier,
             "body_retest_body_atr_limit": self.body_retest_body_atr_limit,
             "body_retest_watch_bars": self.body_retest_watch_bars,
+            "cross_window_bars": self.cross_window_bars,
+            "max_pullback_index": self.max_pullback_index,
+            "exit_mode": self.exit_mode_label,
+            "rr": self.rr,
             "ema55_slope_exit_enabled": self.ema55_slope_exit_enabled,
             "ema55_slope_lock_profit_enabled": self.ema55_slope_lock_profit_enabled,
             "ema55_slope_lock_profit_trigger_r": self.ema55_slope_lock_profit_trigger_r,
@@ -2536,6 +2576,8 @@ class BacktestWindow:
                 variable.set(_normalize_backtest_bar_label(str(default_value)))
             elif key == "signal_mode":
                 variable.set(SIGNAL_VALUE_TO_LABEL.get(str(default_value), definition.default_signal_label))
+            elif key == "exit_mode":
+                variable.set(BTC_EMA15_MA50_EXIT_MODE_VALUE_TO_LABEL.get(str(default_value), self.exit_mode_label.get()))
             elif key == "take_profit_mode":
                 variable.set(TAKE_PROFIT_MODE_VALUE_TO_LABEL.get(str(default_value), self.take_profit_mode_label.get()))
             elif key == "mtf_reversal_mode":
@@ -2565,6 +2607,8 @@ class BacktestWindow:
                     variable.set(_normalize_backtest_bar_label(str(fixed_value)))
                 elif key == "signal_mode":
                     variable.set(SIGNAL_VALUE_TO_LABEL.get(str(fixed_value), resolved_definition.default_signal_label))
+                elif key == "exit_mode":
+                    variable.set(BTC_EMA15_MA50_EXIT_MODE_VALUE_TO_LABEL.get(str(fixed_value), self.exit_mode_label.get()))
                 elif key == "mtf_reversal_mode":
                     variable.set(MTF_REVERSAL_MODE_VALUE_TO_LABEL.get(str(fixed_value), self.mtf_reversal_mode_label.get()))
                 elif key.endswith("_type"):
@@ -3056,6 +3100,32 @@ class BacktestWindow:
             text="后才允许再次挂单",
         )
         self.reentry_confirmation_rule_suffix.grid(row=0, column=3, sticky="w")
+
+        row += 1
+        self.btc_pullback_exit_mode_caption = ttk.Label(signal_section, text="研究离场模式")
+        self.btc_pullback_exit_mode_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.btc_pullback_exit_mode_combo = ttk.Combobox(
+            signal_section,
+            textvariable=self.exit_mode_label,
+            values=list(BTC_EMA15_MA50_EXIT_MODE_OPTIONS.keys()),
+            state="readonly",
+        )
+        self.btc_pullback_exit_mode_combo.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self.btc_pullback_exit_mode_combo.bind("<<ComboboxSelected>>", lambda *_: self._sync_btc_pullback_exit_mode_controls())
+        self.btc_pullback_rr_caption = ttk.Label(signal_section, text="固定RR")
+        self.btc_pullback_rr_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.btc_pullback_rr_entry = ttk.Entry(signal_section, textvariable=self.rr)
+        self.btc_pullback_rr_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
+
+        row += 1
+        self.btc_pullback_cross_window_caption = ttk.Label(signal_section, text="Cross观察窗口")
+        self.btc_pullback_cross_window_caption.grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.btc_pullback_cross_window_entry = ttk.Entry(signal_section, textvariable=self.cross_window_bars)
+        self.btc_pullback_cross_window_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self.btc_pullback_max_index_caption = ttk.Label(signal_section, text="最大回踩序号")
+        self.btc_pullback_max_index_caption.grid(row=row, column=2, sticky="w", pady=(8, 0))
+        self.btc_pullback_max_index_entry = ttk.Entry(signal_section, textvariable=self.max_pullback_index)
+        self.btc_pullback_max_index_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row = 0
         self.slope_threshold_caption = ttk.Label(advanced_section, text="开空斜率阈值(负数)")
@@ -5095,6 +5165,10 @@ class BacktestWindow:
         body_retest_stop_buffer_atr_multiplier = Decimal("0.3")
         body_retest_body_atr_limit = Decimal("1.0")
         body_retest_watch_bars = 6
+        cross_window_bars = 10
+        max_pullback_index = 1
+        exit_mode = "fixed_rr"
+        rr = Decimal("2")
         time_stop_break_even_enabled = False
         time_stop_break_even_bars = 0
         trend_ema_close_exit_after_trigger_r_enabled = False
@@ -5160,6 +5234,40 @@ class BacktestWindow:
             body_retest_watch_bars = self._parse_positive_int(
                 self.body_retest_watch_bars.get(),
                 "Watch bars",
+            )
+        if strategy_uses_parameter(definition.strategy_id, "cross_window_bars"):
+            cross_window_bars = int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "cross_window_bars",
+                    self._parse_positive_int(self.cross_window_bars.get(), "Cross观察窗口K线数"),
+                )
+            )
+        if strategy_uses_parameter(definition.strategy_id, "max_pullback_index"):
+            max_pullback_index = int(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "max_pullback_index",
+                    self._parse_positive_int(self.max_pullback_index.get(), "最大回踩序号"),
+                )
+            )
+        if strategy_uses_parameter(definition.strategy_id, "exit_mode"):
+            exit_mode = str(
+                self._resolve_strategy_parameter_value(
+                    strategy_id,
+                    "exit_mode",
+                    BTC_EMA15_MA50_EXIT_MODE_OPTIONS.get(self.exit_mode_label.get(), "fixed_rr"),
+                )
+            )
+        if strategy_uses_parameter(definition.strategy_id, "rr"):
+            rr = Decimal(
+                str(
+                    self._resolve_strategy_parameter_value(
+                        strategy_id,
+                        "rr",
+                        self._parse_positive_decimal(self.rr.get(), "固定RR"),
+                    )
+                )
             )
         if strategy_uses_parameter(definition.strategy_id, "mtf_filter_bar"):
             mtf_filter_bar = str(
@@ -5257,6 +5365,15 @@ class BacktestWindow:
                 )
         if dynamic_tp_strategy:
             take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
+            if strategy_id in {
+                STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+                STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
+            }:
+                take_profit_mode = (
+                    "dynamic"
+                    if exit_mode in {"dynamic", "dynamic_or_ema15_close"}
+                    else "fixed"
+                )
             if strategy_uses_parameter(definition.strategy_id, "max_entries_per_trend"):
                 max_entries_per_trend = self._parse_nonnegative_int(self.max_entries_per_trend.get(), "每波最多开仓次数")
             dynamic_two_r_break_even = bool(self.dynamic_two_r_break_even.get())
@@ -5392,6 +5509,10 @@ class BacktestWindow:
             body_retest_stop_buffer_atr_multiplier=body_retest_stop_buffer_atr_multiplier,
             body_retest_body_atr_limit=body_retest_body_atr_limit,
             body_retest_watch_bars=body_retest_watch_bars,
+            cross_window_bars=cross_window_bars,
+            max_pullback_index=max_pullback_index,
+            exit_mode=exit_mode,
+            rr=rr,
             time_stop_break_even_enabled=time_stop_break_even_enabled,
             time_stop_break_even_bars=time_stop_break_even_bars,
             trend_ema_close_exit_after_trigger_r_enabled=trend_ema_close_exit_after_trigger_r_enabled,
@@ -5555,6 +5676,25 @@ class BacktestWindow:
                     widget.grid()
                 else:
                     widget.grid_remove()
+            btc_pullback_widgets = (
+                self.btc_pullback_exit_mode_caption,
+                self.btc_pullback_exit_mode_combo,
+                self.btc_pullback_rr_caption,
+                self.btc_pullback_rr_entry,
+                self.btc_pullback_cross_window_caption,
+                self.btc_pullback_cross_window_entry,
+                self.btc_pullback_max_index_caption,
+                self.btc_pullback_max_index_entry,
+            )
+            show_btc_pullback_widgets = strategy_id in {
+                STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+                STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
+            }
+            for widget in btc_pullback_widgets:
+                if show_btc_pullback_widgets:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
             dynamic_widgets = (
                 self.take_profit_mode_caption,
                 self.take_profit_mode_combo,
@@ -5579,7 +5719,10 @@ class BacktestWindow:
                 self.trend_ema_close_exit_after_trigger_r_hint_label,
             )
             for widget in dynamic_widgets:
-                if visibility.show_dynamic_take_profit:
+                if visibility.show_dynamic_take_profit and strategy_id not in {
+                    STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+                    STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
+                }:
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -5736,6 +5879,22 @@ class BacktestWindow:
                 ),
             )
             self._set_field_state(
+                self.btc_pullback_cross_window_entry,
+                editable=strategy_is_parameter_editable(strategy_id, "cross_window_bars", "backtest"),
+            )
+            self._set_field_state(
+                self.btc_pullback_max_index_entry,
+                editable=strategy_is_parameter_editable(strategy_id, "max_pullback_index", "backtest"),
+            )
+            self._set_field_state(
+                self.btc_pullback_exit_mode_combo,
+                editable=strategy_is_parameter_editable(strategy_id, "exit_mode", "backtest"),
+            )
+            self._set_field_state(
+                self.btc_pullback_rr_entry,
+                editable=strategy_is_parameter_editable(strategy_id, "rr", "backtest"),
+            )
+            self._set_field_state(
                 self.hold_close_exit_bars_entry,
                 editable=strategy_is_parameter_editable(strategy_id, "hold_close_exit_bars", "backtest"),
             )
@@ -5751,6 +5910,7 @@ class BacktestWindow:
                 self.reentry_confirmation_ma_period.set("21")
         self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
+        self._sync_btc_pullback_exit_mode_controls()
         self._sync_ema55_slope_exit_condition_controls()
         self._sync_daily_filter_controls()
         self._refresh_profile_summary_text()
@@ -5908,6 +6068,19 @@ class BacktestWindow:
                 state="normal" if reentry_enabled else "disabled"
             )
 
+    def _sync_btc_pullback_exit_mode_controls(self) -> None:
+        if not hasattr(self, "btc_pullback_rr_entry"):
+            return
+        definition = self._selected_strategy_definition()
+        show_controls = definition.strategy_id in {
+            STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+            STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
+        }
+        exit_mode = BTC_EMA15_MA50_EXIT_MODE_OPTIONS.get(self.exit_mode_label.get(), "fixed_rr")
+        rr_enabled = show_controls and exit_mode.startswith("fixed_rr")
+        self.btc_pullback_rr_caption.configure(state="normal" if rr_enabled else "disabled")
+        self.btc_pullback_rr_entry.configure(state="normal" if rr_enabled else "disabled")
+
     def _sync_ema55_slope_exit_condition_controls(self) -> None:
         if not hasattr(self, "ema55_slope_lock_profit_trigger_r_entry"):
             return
@@ -6060,6 +6233,12 @@ class BacktestWindow:
         self.body_retest_stop_buffer_atr_multiplier.set(format_decimal(config.body_retest_stop_buffer_atr_multiplier))
         self.body_retest_body_atr_limit.set(format_decimal(config.body_retest_body_atr_limit))
         self.body_retest_watch_bars.set(str(config.body_retest_watch_bars))
+        self.cross_window_bars.set(str(max(int(config.cross_window_bars), 1)))
+        self.max_pullback_index.set(str(max(int(config.max_pullback_index), 1)))
+        self.exit_mode_label.set(
+            BTC_EMA15_MA50_EXIT_MODE_VALUE_TO_LABEL.get(str(config.exit_mode), self.exit_mode_label.get())
+        )
+        self.rr.set(format_decimal(config.rr))
         self.ema55_slope_exit_enabled.set(bool(config.ema55_slope_exit_enabled))
         self.ema55_slope_lock_profit_enabled.set(bool(config.ema55_slope_lock_profit_enabled))
         self.ema55_slope_lock_profit_trigger_r.set(str(max(int(config.ema55_slope_lock_profit_trigger_r), 2)))
@@ -6092,6 +6271,7 @@ class BacktestWindow:
         self._refresh_profile_summary_text()
         self._sync_daily_filter_controls()
         self._sync_dynamic_take_profit_controls()
+        self._sync_btc_pullback_exit_mode_controls()
         self._sync_ema55_slope_exit_condition_controls()
         self._update_sizing_mode_widgets()
 

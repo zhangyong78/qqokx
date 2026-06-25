@@ -8908,6 +8908,14 @@ class UiStrategySessionsMixin:
         text = str(message or "").strip()
         if not text:
             return False
+        if text.startswith("策略停止，原因："):
+            reason = text.partition("：")[2].strip()
+            unrecoverable_stop_markers = (
+                "拒绝接管现有持仓",
+                "交易所持仓侧与策略预期不一致",
+            )
+            if any(marker in reason for marker in unrecoverable_stop_markers):
+                return True
         terminal_markers = (
             "未检测到策略持仓，OKX 动态止损监控结束。",
             "未检测到策略持仓，交易员虚拟止损监控结束。",

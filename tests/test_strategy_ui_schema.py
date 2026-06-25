@@ -1,6 +1,8 @@
 from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_LONG_ID,
@@ -199,3 +201,29 @@ class StrategyUiSchemaTest(TestCase):
         visibility = build_strategy_widget_visibility(STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, "launcher")
         self.assertFalse(visibility.show_dynamic_take_profit)
         self.assertTrue(visibility.show_slope_threshold)
+
+    def test_btc_ema15_ma50_pullback_schema_exposes_research_defaults_for_both_directions(self) -> None:
+        self.assertTrue(strategy_supports_dynamic_take_profit(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID))
+        self.assertTrue(strategy_supports_dynamic_take_profit(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID))
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "bar", "backtest"),
+            "4H",
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "bar", "backtest"),
+            "4H",
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "cross_window_bars", "backtest"),
+            10,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "cross_window_bars", "backtest"),
+            10,
+        )
+        visibility_long = build_strategy_widget_visibility(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "backtest")
+        visibility_short = build_strategy_widget_visibility(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "backtest")
+        self.assertTrue(visibility_long.show_dynamic_take_profit)
+        self.assertTrue(visibility_short.show_dynamic_take_profit)
+        self.assertTrue(visibility_long.show_daily_filter_controls)
+        self.assertTrue(visibility_short.show_daily_filter_controls)

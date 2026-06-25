@@ -4,6 +4,7 @@ import bisect
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from okx_quant.candle_cache import load_candle_cache, load_candle_cache_range
 from okx_quant.engine import build_protection_plan, determine_order_size
@@ -37,6 +38,18 @@ from okx_quant.strategies.body_retest_short import (
     build_body_retest_short_protection_plan,
     rolling_body_retest_percentile,
 )
+from okx_quant.strategies.btc_ema15_ma50_pullback_long import (
+    PullbackCandidate as LongPullbackCandidate,
+    btc_ema15_ma50_pullback_long_bias_allows_long,
+    btc_ema15_ma50_pullback_long_minimum_candles,
+    scan_btc_ema15_ma50_pullback_long_candidates,
+)
+from okx_quant.strategies.btc_ema15_ma50_pullback_short import (
+    PullbackCandidate as ShortPullbackCandidate,
+    btc_ema15_ma50_pullback_short_bias_allows_short,
+    btc_ema15_ma50_pullback_short_minimum_candles,
+    scan_btc_ema15_ma50_pullback_short_candidates,
+)
 from okx_quant.strategies.adaptive_ema_rail import (
     ADAPTIVE_RAIL_STATE_CONFIRMED,
     ADAPTIVE_RAIL_STATE_BROKEN,
@@ -53,10 +66,14 @@ from okx_quant.strategy_runtime_registry import (
 )
 from okx_quant.strategy_ui_schema import build_strategy_widget_visibility
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
+    STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
     is_adaptive_ema_rail_strategy,
+    is_btc_ema15_ma50_pullback_long_strategy,
+    is_btc_ema15_ma50_pullback_short_strategy,
     is_btc_ema55_slope_short_strategy,
     resolve_dynamic_signal_mode,
 )
@@ -87,6 +104,7 @@ EXIT_REASON_LABELS = {
     "break_even_stop": "保本",
     "slope_turn_positive": "斜率转正平仓",
     "trend_ema_close_exit": "跌破趋势EMA收盘平仓",
+    "ema15_close_exit": "EMA15收破离场",
 }
 
 
@@ -122,6 +140,7 @@ class BacktestTrade:
     slippage_cost: Decimal = Decimal("0")
     funding_cost: Decimal = Decimal("0")
     adaptive_rail_period: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -220,6 +239,7 @@ class BacktestResult:
     entry_reference_ema_type: str = "ema"
     big_ema_period: int = 233
     atr_period: int = 10
+    atr_stop_multiplier: Decimal = Decimal("0")
     strategy_id: str = STRATEGY_DYNAMIC_ID
     bar: str = ""
     mtf_filter_bar: str = ""
@@ -272,6 +292,10 @@ class BacktestResult:
     body_retest_stop_buffer_atr_multiplier: Decimal = Decimal("0")
     body_retest_body_atr_limit: Decimal = Decimal("0")
     body_retest_watch_bars: int = 0
+    cross_window_bars: int = 0
+    max_pullback_index: int = 1
+    exit_mode: str = "fixed_rr"
+    rr: Decimal = Decimal("0")
     hold_close_exit_bars: int = 0
     max_entries_per_trend: int = 1
     sizing_mode: str = "fixed_risk"
@@ -384,6 +408,7 @@ class _OpenPosition:
     slippage_rate: Decimal = Decimal("0")
     funding_rate: Decimal = Decimal("0")
     adaptive_rail_period: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -857,6 +882,116 @@ def build_parameter_batch_configs(
             base_config,
             atr_multipliers=atr_multipliers,
         )
+    if family == "ema15_ma50_pullback_long":
+        configs: list[StrategyConfig] = []
+        atr_periods = (10, 14)
+        cross_windows = (8, 10, 15, 20)
+        pullback_indices = (1, 2, 3)
+        exit_modes = (
+            "fixed_rr",
+            "fixed_rr_or_ema15_close",
+            "dynamic",
+            "dynamic_or_ema15_close",
+        )
+        rr_values = (
+            Decimal("1"),
+            Decimal("1.5"),
+            Decimal("2"),
+            Decimal("3"),
+        )
+        daily_filter_variants = (
+            {
+                "daily_filter_enabled": False,
+                "daily_filter_mode": "disabled",
+                "daily_filter_scope": "both",
+            },
+            {
+                "daily_filter_enabled": True,
+                "daily_filter_mode": "close_vs_ma",
+                "daily_filter_scope": "long_only",
+            },
+        )
+        for atr_period_value in atr_periods:
+            for stop_multiplier in (Decimal("0.8"), Decimal("1.0"), Decimal("1.2"), Decimal("1.5"), Decimal("2.0")):
+                for cross_window in cross_windows:
+                    for pullback_index in pullback_indices:
+                        for filter_variant in daily_filter_variants:
+                            for exit_mode in exit_modes:
+                                rr_candidates = (
+                                    rr_values if exit_mode.startswith("fixed_rr") else (base_config.resolved_fixed_rr(),)
+                                )
+                                take_profit_mode = "fixed" if exit_mode.startswith("fixed_rr") else "dynamic"
+                                for rr_value in rr_candidates:
+                                    configs.append(
+                                        replace(
+                                            base_config,
+                                            atr_period=atr_period_value,
+                                            atr_stop_multiplier=stop_multiplier,
+                                            cross_window_bars=cross_window,
+                                            max_pullback_index=pullback_index,
+                                            exit_mode=exit_mode,
+                                            rr=rr_value,
+                                            take_profit_mode=take_profit_mode,
+                                            daily_filter_enabled=bool(filter_variant["daily_filter_enabled"]),
+                                            daily_filter_mode=str(filter_variant["daily_filter_mode"]),
+                                            daily_filter_scope=str(filter_variant["daily_filter_scope"]),
+                                        )
+                                    )
+        return configs
+    if family == "ema15_ma50_pullback_short":
+        configs: list[StrategyConfig] = []
+        atr_periods = (10, 14)
+        cross_windows = (8, 10, 15, 20)
+        pullback_indices = (1, 2, 3)
+        exit_modes = (
+            "fixed_rr",
+            "fixed_rr_or_ema15_close",
+            "dynamic",
+            "dynamic_or_ema15_close",
+        )
+        rr_values = (
+            Decimal("1"),
+            Decimal("1.5"),
+            Decimal("2"),
+            Decimal("3"),
+        )
+        daily_filter_variants = (
+            {
+                "daily_filter_enabled": False,
+                "daily_filter_mode": "disabled",
+                "daily_filter_scope": "both",
+            },
+            {
+                "daily_filter_enabled": True,
+                "daily_filter_mode": "close_vs_ma",
+                "daily_filter_scope": "short_only",
+            },
+        )
+        for atr_period_value in atr_periods:
+            for stop_multiplier in (Decimal("0.8"), Decimal("1.0"), Decimal("1.2"), Decimal("1.5"), Decimal("2.0")):
+                for cross_window in cross_windows:
+                    for pullback_index in pullback_indices:
+                        for filter_variant in daily_filter_variants:
+                            for exit_mode in exit_modes:
+                                rr_candidates = rr_values if exit_mode.startswith("fixed_rr") else (base_config.resolved_fixed_rr(),)
+                                take_profit_mode = "fixed" if exit_mode.startswith("fixed_rr") else "dynamic"
+                                for rr_value in rr_candidates:
+                                    configs.append(
+                                        replace(
+                                            base_config,
+                                            atr_period=atr_period_value,
+                                            atr_stop_multiplier=stop_multiplier,
+                                            cross_window_bars=cross_window,
+                                            max_pullback_index=pullback_index,
+                                            exit_mode=exit_mode,
+                                            rr=rr_value,
+                                            take_profit_mode=take_profit_mode,
+                                            daily_filter_enabled=bool(filter_variant["daily_filter_enabled"]),
+                                            daily_filter_mode=str(filter_variant["daily_filter_mode"]),
+                                            daily_filter_scope=str(filter_variant["daily_filter_scope"]),
+                                        )
+                                    )
+        return configs
     if family == "body_retest_short":
         return [base_config]
     if family not in {"dynamic_order", "adaptive_ema_rail"}:
@@ -1190,6 +1325,24 @@ def _run_backtest_with_loaded_data(
             taker_fee_rate=taker_fee_rate,
             direction_filter_bias=direction_filter_bias,
         )
+    elif family == "ema15_ma50_pullback_long":
+        trades, terminal_open_position = _run_btc_ema15_ma50_pullback_long_backtest(
+            candles,
+            instrument,
+            config,
+            maker_fee_rate=maker_fee_rate,
+            taker_fee_rate=taker_fee_rate,
+            direction_filter_bias=direction_filter_bias,
+        )
+    elif family == "ema15_ma50_pullback_short":
+        trades, terminal_open_position = _run_btc_ema15_ma50_pullback_short_backtest(
+            candles,
+            instrument,
+            config,
+            maker_fee_rate=maker_fee_rate,
+            taker_fee_rate=taker_fee_rate,
+            direction_filter_bias=direction_filter_bias,
+        )
     elif strategy_is_cross_family(config.strategy_id):
         trades, terminal_open_position = _run_cross_backtest(
             candles,
@@ -1270,6 +1423,7 @@ def _run_backtest_with_loaded_data(
         entry_reference_ema_type=config.resolved_entry_reference_ema_type(),
         big_ema_period=config.big_ema_period,
         atr_period=config.atr_period,
+        atr_stop_multiplier=Decimal(str(config.atr_stop_multiplier)),
         strategy_id=config.strategy_id,
         bar=config.bar,
         mtf_filter_bar=config.resolved_mtf_filter_bar() if _backtest_uses_mtf_filter(config.strategy_id) else "",
@@ -1294,7 +1448,24 @@ def _run_backtest_with_loaded_data(
         exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
         slippage_rate=config.resolved_backtest_exit_slippage_rate(),
         funding_rate=config.backtest_funding_rate,
-        take_profit_mode=str(config.take_profit_mode),
+        take_profit_mode=(
+            "dynamic"
+            if (
+                (
+                    is_btc_ema15_ma50_pullback_long_strategy(config.strategy_id)
+                    or is_btc_ema15_ma50_pullback_short_strategy(config.strategy_id)
+                )
+                and _btc_ema15_ma50_uses_dynamic_exit(config)
+            )
+            else (
+                "fixed"
+                if (
+                    is_btc_ema15_ma50_pullback_long_strategy(config.strategy_id)
+                    or is_btc_ema15_ma50_pullback_short_strategy(config.strategy_id)
+                )
+                else str(config.take_profit_mode)
+            )
+        ),
         dynamic_two_r_break_even=_ema55_slope_dynamic_two_r_break_even_enabled(config),
         dynamic_break_even_trigger_r=_dynamic_break_even_trigger_r(config),
         dynamic_fee_offset_enabled=_ema55_slope_dynamic_fee_offset_enabled(config),
@@ -1330,6 +1501,10 @@ def _run_backtest_with_loaded_data(
         body_retest_stop_buffer_atr_multiplier=Decimal(str(config.body_retest_stop_buffer_atr_multiplier)),
         body_retest_body_atr_limit=Decimal(str(config.body_retest_body_atr_limit)),
         body_retest_watch_bars=int(config.body_retest_watch_bars),
+        cross_window_bars=int(config.cross_window_bars),
+        max_pullback_index=int(config.max_pullback_index),
+        exit_mode=str(config.exit_mode),
+        rr=Decimal(str(config.rr)),
         hold_close_exit_bars=int(config.hold_close_exit_bars),
         max_entries_per_trend=int(config.max_entries_per_trend),
         sizing_mode=config.backtest_sizing_mode,
@@ -1844,6 +2019,10 @@ def _required_backtest_preload_candles(config: StrategyConfig) -> int:
         )
     elif family == "ema55_slope_short":
         minimum = max(config.ema_period, 2) + 1
+    elif family == "ema15_ma50_pullback_long":
+        minimum = btc_ema15_ma50_pullback_long_minimum_candles(config) + 1
+    elif family == "ema15_ma50_pullback_short":
+        minimum = btc_ema15_ma50_pullback_short_minimum_candles(config) + 1
     elif family == "body_retest_short":
         minimum = body_retest_short_minimum_candles(config)
     elif family == "adaptive_ema_rail":
@@ -2650,6 +2829,501 @@ def _run_body_retest_short_backtest(
         invalid_protection_count=invalid_protection_count,
         valid_entry_plan_count=valid_entry_plan_count,
     )
+    return trades, _build_terminal_open_position(open_position, candles)
+
+
+def _btc_ema15_ma50_pullback_exit_mode(config: StrategyConfig) -> str:
+    raw = str(config.exit_mode or "").strip().lower()
+    if raw in {
+        "fixed_rr",
+        "fixed_rr_or_ema15_close",
+        "dynamic",
+        "dynamic_or_ema15_close",
+        "ema15_close",
+    }:
+        return raw
+    return "dynamic_or_ema15_close" if str(config.take_profit_mode or "") == "dynamic" else "fixed_rr"
+
+
+def _btc_ema15_ma50_uses_dynamic_exit(config: StrategyConfig) -> bool:
+    return _btc_ema15_ma50_pullback_exit_mode(config) in {"dynamic", "dynamic_or_ema15_close"}
+
+
+def _btc_ema15_ma50_uses_fixed_rr_exit(config: StrategyConfig) -> bool:
+    return _btc_ema15_ma50_pullback_exit_mode(config) in {"fixed_rr", "fixed_rr_or_ema15_close"}
+
+
+def _btc_ema15_ma50_uses_ema15_close_exit(config: StrategyConfig) -> bool:
+    return _btc_ema15_ma50_pullback_exit_mode(config) in {
+        "fixed_rr_or_ema15_close",
+        "dynamic_or_ema15_close",
+        "ema15_close",
+    }
+
+
+def _btc_ema15_ma50_trade_metadata(
+    candidate: LongPullbackCandidate | ShortPullbackCandidate,
+) -> dict[str, Any]:
+    return {
+        "cross_ts": candidate.cross_ts,
+        "cross_index": candidate.cross_index,
+        "signal_ts": candidate.signal_ts,
+        "signal_index": candidate.signal_index,
+        "bars_after_cross": candidate.bars_after_cross,
+        "pullback_index": candidate.pullback_index,
+        "pullback_depth_pct": candidate.pullback_depth_pct,
+        "ema15_slope_5": candidate.ema15_slope_5,
+        "ema15_slope_10": candidate.ema15_slope_10,
+        "ma50_slope_10": candidate.ma50_slope_10,
+        "daily_filter_pass": candidate.daily_filter_pass,
+        "max_r_before_exit": Decimal("0"),
+        "max_drawdown_r": Decimal("0"),
+        "max_favorable_price": None,
+        "max_favorable_ts": None,
+        "max_adverse_price": None,
+        "max_adverse_ts": None,
+        "stop_history": [],
+    }
+
+
+def _btc_ema15_ma50_record_stop_history(
+    position: _OpenPosition,
+    *,
+    candle_ts: int,
+    label: str | None = None,
+) -> None:
+    history = position.metadata.setdefault("stop_history", [])
+    current_stop = Decimal(position.stop_loss)
+    if history:
+        last_item = history[-1]
+        if Decimal(str(last_item.get("price", current_stop))) == current_stop:
+            return
+    history.append(
+        {
+            "ts": candle_ts,
+            "price": current_stop,
+            "label": label or "stop",
+        }
+    )
+
+
+def _btc_ema15_ma50_track_excursions(position: _OpenPosition, candle: Candle) -> None:
+    risk_per_unit = abs(position.risk_per_unit)
+    if risk_per_unit <= 0:
+        return
+    entry_reference = _position_strategy_entry_price(position)
+    metadata = position.metadata
+    if position.signal == "long":
+        max_r = max((candle.high - entry_reference) / risk_per_unit, Decimal("0"))
+        max_dd = max((entry_reference - candle.low) / risk_per_unit, Decimal("0"))
+        if max_r >= Decimal(str(metadata.get("max_r_before_exit", Decimal("0")))):
+            metadata["max_r_before_exit"] = max_r
+            metadata["max_favorable_price"] = candle.high
+            metadata["max_favorable_ts"] = candle.ts
+        if max_dd >= Decimal(str(metadata.get("max_drawdown_r", Decimal("0")))):
+            metadata["max_drawdown_r"] = max_dd
+            metadata["max_adverse_price"] = candle.low
+            metadata["max_adverse_ts"] = candle.ts
+        return
+    max_r = max((entry_reference - candle.low) / risk_per_unit, Decimal("0"))
+    max_dd = max((candle.high - entry_reference) / risk_per_unit, Decimal("0"))
+    if max_r >= Decimal(str(metadata.get("max_r_before_exit", Decimal("0")))):
+        metadata["max_r_before_exit"] = max_r
+        metadata["max_favorable_price"] = candle.low
+        metadata["max_favorable_ts"] = candle.ts
+    if max_dd >= Decimal(str(metadata.get("max_drawdown_r", Decimal("0")))):
+        metadata["max_drawdown_r"] = max_dd
+        metadata["max_adverse_price"] = candle.high
+        metadata["max_adverse_ts"] = candle.ts
+
+
+def _btc_ema15_ma50_close_at_open(
+    position: _OpenPosition,
+    candle: Candle,
+    candle_index: int,
+    *,
+    exit_reason: str,
+    exit_fee_rate: Decimal,
+    exit_fee_type: str,
+) -> BacktestTrade:
+    exit_price_raw = snap_to_increment(candle.open, position.tick_size, "nearest")
+    exit_price = _apply_slippage_price(
+        exit_price_raw,
+        signal=position.signal,
+        tick_size=position.tick_size,
+        slippage_rate=position.exit_slippage_rate,
+        is_entry=False,
+    )
+    return _build_closed_trade(
+        position,
+        candle,
+        candle_index,
+        exit_price_raw=exit_price_raw,
+        exit_price=exit_price,
+        exit_reason=exit_reason,
+        exit_fee_rate=exit_fee_rate,
+        exit_fee_type=exit_fee_type,
+    )
+
+
+def _run_btc_ema15_ma50_pullback_long_backtest(
+    candles: list[Candle],
+    instrument: Instrument,
+    config: StrategyConfig,
+    *,
+    maker_fee_rate: Decimal = Decimal("0"),
+    taker_fee_rate: Decimal = Decimal("0"),
+    direction_filter_bias: list[str] | None = None,
+) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
+    if not is_btc_ema15_ma50_pullback_long_strategy(config.strategy_id):
+        raise RuntimeError("BTC EMA15/MA50 回踩做多回测配置不匹配。")
+    minimum = btc_ema15_ma50_pullback_long_minimum_candles(config)
+    if len(candles) < minimum + 1:
+        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum + 1} 根。")
+    trade_start_index = _backtest_trade_start_index(minimum)
+    if len(candles) <= trade_start_index:
+        return [], None
+
+    closes = [candle.close for candle in candles]
+    ema15_values = moving_average(closes, int(config.ema_period), config.resolved_ema_type())
+    ma50_values = moving_average(closes, int(config.trend_ema_period), config.resolved_trend_ema_type())
+    candidates = scan_btc_ema15_ma50_pullback_long_candidates(
+        candles,
+        config,
+        direction_filter_bias=direction_filter_bias,
+    )
+    candidates_by_signal_index = {candidate.signal_index: candidate for candidate in candidates}
+    trades: list[BacktestTrade] = []
+    open_position: _OpenPosition | None = None
+    pending_close_reason: str | None = None
+    entry_sequence = 0
+    rr_value = config.resolved_fixed_rr()
+    dynamic_take_profit_enabled = _btc_ema15_ma50_uses_dynamic_exit(config)
+
+    for index in range(trade_start_index, len(candles)):
+        candle = candles[index]
+        closed_round_this_candle = False
+
+        if open_position is not None and pending_close_reason is not None:
+            _btc_ema15_ma50_track_excursions(open_position, candle)
+            trades.append(
+                _btc_ema15_ma50_close_at_open(
+                    open_position,
+                    candle,
+                    index,
+                    exit_reason=pending_close_reason,
+                    exit_fee_rate=taker_fee_rate,
+                    exit_fee_type="taker",
+                )
+            )
+            open_position = None
+            pending_close_reason = None
+            closed_round_this_candle = True
+
+        if open_position is not None:
+            _btc_ema15_ma50_track_excursions(open_position, candle)
+            previous_stop = open_position.stop_loss
+            closed_trade = _try_close_position(
+                open_position,
+                candle,
+                index,
+                exit_fee_rate=taker_fee_rate,
+                exit_fee_type="taker",
+            )
+            if closed_trade is not None:
+                trades.append(closed_trade)
+                open_position = None
+                pending_close_reason = None
+                closed_round_this_candle = True
+            else:
+                if open_position.stop_loss != previous_stop:
+                    _btc_ema15_ma50_record_stop_history(open_position, candle_ts=candle.ts)
+                ema15_value = ema15_values[index] if index < len(ema15_values) else None
+                if (
+                    open_position is not None
+                    and _btc_ema15_ma50_uses_ema15_close_exit(config)
+                    and ema15_value is not None
+                    and candle.close < ema15_value
+                ):
+                    pending_close_reason = "ema15_close_exit"
+
+        if open_position is not None or closed_round_this_candle or index == 0:
+            continue
+
+        candidate = candidates_by_signal_index.get(index - 1)
+        if candidate is None:
+            continue
+        if candidate.pullback_index > config.resolved_max_pullback_index():
+            continue
+        if not candidate.daily_filter_pass:
+            continue
+
+        entry_candle = candle
+        entry_price_raw = snap_to_increment(entry_candle.open, instrument.tick_size, "nearest")
+        stop_distance = candidate.atr_at_signal * Decimal(str(config.atr_stop_multiplier))
+        stop_price = snap_to_increment(entry_price_raw - stop_distance, instrument.tick_size, "down")
+        if stop_price >= entry_price_raw:
+            continue
+        take_profit = entry_price_raw
+        take_profit_enabled = False
+        if _btc_ema15_ma50_uses_fixed_rr_exit(config):
+            risk_distance = entry_price_raw - stop_price
+            take_profit = snap_to_increment(entry_price_raw + (risk_distance * rr_value), instrument.tick_size, "up")
+            take_profit_enabled = True
+
+        resolved_config = replace(
+            _resolve_backtest_config(config, trades),
+            take_profit_mode="dynamic" if dynamic_take_profit_enabled else "fixed",
+        )
+        size = _determine_backtest_order_size(
+            instrument=instrument,
+            config=resolved_config,
+            entry_price=entry_price_raw,
+            stop_loss=stop_price,
+            risk_price_compatible=bool(resolved_config.risk_amount is not None and resolved_config.risk_amount > 0),
+        )
+        entry_sequence += 1
+        metadata = _btc_ema15_ma50_trade_metadata(candidate)
+        metadata.update(
+            {
+                "entry_signal_index": candidate.signal_index,
+                "entry_index": index,
+                "ema15_at_entry": candidate.ema15_at_signal,
+                "ma50_at_entry": candidate.ma50_at_signal,
+                "atr_at_entry": candidate.atr_at_signal,
+                "stop_price": stop_price,
+            }
+        )
+        filled_position = _create_open_position(
+            instrument=instrument,
+            signal="long",
+            entry_index=index,
+            entry_ts=entry_candle.ts,
+            entry_price_raw=entry_price_raw,
+            stop_loss=stop_price,
+            take_profit=take_profit,
+            atr_value=candidate.atr_at_signal,
+            size=size,
+            entry_fee_rate=maker_fee_rate,
+            exit_fee_rate=taker_fee_rate,
+            entry_fee_type="maker",
+            entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
+            exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
+            funding_rate=config.backtest_funding_rate,
+            entry_sequence=entry_sequence,
+            wave_entry_sequence=candidate.pullback_index,
+            dynamic_take_profit_enabled=dynamic_take_profit_enabled,
+            take_profit_enabled=take_profit_enabled,
+            dynamic_exit_fee_rate=taker_fee_rate,
+            dynamic_two_r_break_even=bool(config.dynamic_two_r_break_even),
+            dynamic_break_even_trigger_r=_dynamic_break_even_trigger_r(config),
+            dynamic_first_lock_r=_dynamic_first_lock_r(config),
+            dynamic_trailing_step_r=_dynamic_trailing_step_r(config),
+            dynamic_separate_break_even_enabled=_dynamic_separate_break_even_enabled(config),
+            dynamic_fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+            dynamic_protection_rules=_dynamic_protection_rules(resolved_config),
+            time_stop_break_even_enabled=bool(config.time_stop_break_even_enabled),
+            time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+            next_dynamic_trigger_r=_first_dynamic_rule_trigger_r(resolved_config),
+            apply_entry_slippage=True,
+            metadata=metadata,
+        )
+        _btc_ema15_ma50_record_stop_history(filled_position, candle_ts=entry_candle.ts, label="initial_stop")
+        _btc_ema15_ma50_track_excursions(filled_position, candle)
+        closed_trade = _try_close_position_same_candle_after_fill(
+            filled_position,
+            candle,
+            index,
+            exit_fee_rate=taker_fee_rate,
+            exit_fee_type="taker",
+        )
+        if closed_trade is not None:
+            trades.append(closed_trade)
+            pending_close_reason = None
+            continue
+        open_position = filled_position
+        pending_close_reason = None
+
+    return trades, _build_terminal_open_position(open_position, candles)
+
+
+def _run_btc_ema15_ma50_pullback_short_backtest(
+    candles: list[Candle],
+    instrument: Instrument,
+    config: StrategyConfig,
+    *,
+    maker_fee_rate: Decimal = Decimal("0"),
+    taker_fee_rate: Decimal = Decimal("0"),
+    direction_filter_bias: list[str] | None = None,
+) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
+    if not is_btc_ema15_ma50_pullback_short_strategy(config.strategy_id):
+        raise RuntimeError("BTC EMA15/MA50 回踩做空回测配置不匹配。")
+    minimum = btc_ema15_ma50_pullback_short_minimum_candles(config)
+    if len(candles) < minimum + 1:
+        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum + 1} 根。")
+    trade_start_index = _backtest_trade_start_index(minimum)
+    if len(candles) <= trade_start_index:
+        return [], None
+
+    closes = [candle.close for candle in candles]
+    ema15_values = moving_average(closes, int(config.ema_period), config.resolved_ema_type())
+    candidates = scan_btc_ema15_ma50_pullback_short_candidates(
+        candles,
+        config,
+        direction_filter_bias=direction_filter_bias,
+    )
+    candidates_by_signal_index = {candidate.signal_index: candidate for candidate in candidates}
+    trades: list[BacktestTrade] = []
+    open_position: _OpenPosition | None = None
+    pending_close_reason: str | None = None
+    entry_sequence = 0
+    rr_value = config.resolved_fixed_rr()
+    dynamic_take_profit_enabled = _btc_ema15_ma50_uses_dynamic_exit(config)
+
+    for index in range(trade_start_index, len(candles)):
+        candle = candles[index]
+        closed_round_this_candle = False
+
+        if open_position is not None and pending_close_reason is not None:
+            _btc_ema15_ma50_track_excursions(open_position, candle)
+            trades.append(
+                _btc_ema15_ma50_close_at_open(
+                    open_position,
+                    candle,
+                    index,
+                    exit_reason=pending_close_reason,
+                    exit_fee_rate=taker_fee_rate,
+                    exit_fee_type="taker",
+                )
+            )
+            open_position = None
+            pending_close_reason = None
+            closed_round_this_candle = True
+
+        if open_position is not None:
+            _btc_ema15_ma50_track_excursions(open_position, candle)
+            previous_stop = open_position.stop_loss
+            closed_trade = _try_close_position(
+                open_position,
+                candle,
+                index,
+                exit_fee_rate=taker_fee_rate,
+                exit_fee_type="taker",
+            )
+            if closed_trade is not None:
+                trades.append(closed_trade)
+                open_position = None
+                pending_close_reason = None
+                closed_round_this_candle = True
+            else:
+                if open_position.stop_loss != previous_stop:
+                    _btc_ema15_ma50_record_stop_history(open_position, candle_ts=candle.ts)
+                ema15_value = ema15_values[index] if index < len(ema15_values) else None
+                if (
+                    open_position is not None
+                    and _btc_ema15_ma50_uses_ema15_close_exit(config)
+                    and ema15_value is not None
+                    and candle.close > ema15_value
+                ):
+                    pending_close_reason = "ema15_close_exit"
+
+        if open_position is not None or closed_round_this_candle or index == 0:
+            continue
+
+        candidate = candidates_by_signal_index.get(index - 1)
+        if candidate is None:
+            continue
+        if candidate.pullback_index > config.resolved_max_pullback_index():
+            continue
+        if not candidate.daily_filter_pass:
+            continue
+
+        entry_candle = candle
+        entry_price_raw = snap_to_increment(entry_candle.open, instrument.tick_size, "nearest")
+        stop_distance = candidate.atr_at_signal * Decimal(str(config.atr_stop_multiplier))
+        stop_price = snap_to_increment(entry_price_raw + stop_distance, instrument.tick_size, "up")
+        if stop_price <= entry_price_raw:
+            continue
+        take_profit = entry_price_raw
+        take_profit_enabled = False
+        if _btc_ema15_ma50_uses_fixed_rr_exit(config):
+            risk_distance = stop_price - entry_price_raw
+            take_profit = snap_to_increment(entry_price_raw - (risk_distance * rr_value), instrument.tick_size, "down")
+            take_profit_enabled = True
+
+        resolved_config = replace(
+            _resolve_backtest_config(config, trades),
+            take_profit_mode="dynamic" if dynamic_take_profit_enabled else "fixed",
+        )
+        size = _determine_backtest_order_size(
+            instrument=instrument,
+            config=resolved_config,
+            entry_price=entry_price_raw,
+            stop_loss=stop_price,
+            risk_price_compatible=bool(resolved_config.risk_amount is not None and resolved_config.risk_amount > 0),
+        )
+        entry_sequence += 1
+        metadata = _btc_ema15_ma50_trade_metadata(candidate)
+        metadata.update(
+            {
+                "entry_signal_index": candidate.signal_index,
+                "entry_index": index,
+                "ema15_at_entry": candidate.ema15_at_signal,
+                "ma50_at_entry": candidate.ma50_at_signal,
+                "atr_at_entry": candidate.atr_at_signal,
+                "stop_price": stop_price,
+            }
+        )
+        filled_position = _create_open_position(
+            instrument=instrument,
+            signal="short",
+            entry_index=index,
+            entry_ts=entry_candle.ts,
+            entry_price_raw=entry_price_raw,
+            stop_loss=stop_price,
+            take_profit=take_profit,
+            atr_value=candidate.atr_at_signal,
+            size=size,
+            entry_fee_rate=maker_fee_rate,
+            exit_fee_rate=taker_fee_rate,
+            entry_fee_type="maker",
+            entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
+            exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
+            funding_rate=config.backtest_funding_rate,
+            entry_sequence=entry_sequence,
+            wave_entry_sequence=candidate.pullback_index,
+            dynamic_take_profit_enabled=dynamic_take_profit_enabled,
+            take_profit_enabled=take_profit_enabled,
+            dynamic_exit_fee_rate=taker_fee_rate,
+            dynamic_two_r_break_even=bool(config.dynamic_two_r_break_even),
+            dynamic_break_even_trigger_r=_dynamic_break_even_trigger_r(config),
+            dynamic_first_lock_r=_dynamic_first_lock_r(config),
+            dynamic_trailing_step_r=_dynamic_trailing_step_r(config),
+            dynamic_separate_break_even_enabled=_dynamic_separate_break_even_enabled(config),
+            dynamic_fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+            dynamic_protection_rules=_dynamic_protection_rules(resolved_config),
+            time_stop_break_even_enabled=bool(config.time_stop_break_even_enabled),
+            time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
+            next_dynamic_trigger_r=_first_dynamic_rule_trigger_r(resolved_config),
+            apply_entry_slippage=True,
+            metadata=metadata,
+        )
+        _btc_ema15_ma50_record_stop_history(filled_position, candle_ts=entry_candle.ts, label="initial_stop")
+        _btc_ema15_ma50_track_excursions(filled_position, candle)
+        closed_trade = _try_close_position_same_candle_after_fill(
+            filled_position,
+            candle,
+            index,
+            exit_fee_rate=taker_fee_rate,
+            exit_fee_type="taker",
+        )
+        if closed_trade is not None:
+            trades.append(closed_trade)
+            pending_close_reason = None
+            continue
+        open_position = filled_position
+        pending_close_reason = None
+
     return trades, _build_terminal_open_position(open_position, candles)
 
 
@@ -3630,6 +4304,7 @@ def _create_open_position(
     entry_path_price: Decimal | None = None,
     apply_entry_slippage: bool = True,
     adaptive_rail_period: int | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> _OpenPosition:
     strategy_entry_price = entry_price_raw
     if filled_entry_price is not None:
@@ -3691,6 +4366,7 @@ def _create_open_position(
         slippage_rate=exit_slippage_rate,
         funding_rate=funding_rate if instrument.inst_type == "SWAP" else Decimal("0"),
         adaptive_rail_period=adaptive_rail_period,
+        metadata=dict(metadata or {}),
     )
     if dynamic_protection_rules:
         open_position.dynamic_next_rule_index = 0
@@ -4368,6 +5044,7 @@ def _build_closed_trade(
     exit_fee_rate: Decimal = Decimal("0"),
     exit_fee_type: str = "none",
 ) -> BacktestTrade:
+    metadata = dict(position.metadata or {})
     if position.signal == "long":
         gross_pnl = (exit_price - position.entry_price) * position.size
     else:
@@ -4408,6 +5085,7 @@ def _build_closed_trade(
         slippage_cost=slippage_cost,
         funding_cost=funding_cost,
         adaptive_rail_period=position.adaptive_rail_period,
+        metadata=metadata,
     )
 
 
@@ -4441,12 +5119,19 @@ def _try_close_position_same_candle_after_fill(
                     holding_bars=holding_bars,
                 )
             else:
-                touched_exit = _first_touched_exit_on_segment(
-                    entry_price,
-                    segment_end,
-                    stop_loss=position.stop_loss,
-                    take_profit=position.take_profit,
-                )
+                if position.take_profit_enabled:
+                    touched_exit = _first_touched_exit_on_segment(
+                        entry_price,
+                        segment_end,
+                        stop_loss=position.stop_loss,
+                        take_profit=position.take_profit,
+                    )
+                else:
+                    touched_exit = (
+                        (position.stop_loss, "stop_loss")
+                        if _segment_contains_price(entry_price, segment_end, position.stop_loss)
+                        else None
+                    )
             if touched_exit is not None:
                 exit_price_raw, exit_reason = touched_exit
                 exit_price = _apply_slippage_price(
@@ -4476,12 +5161,19 @@ def _try_close_position_same_candle_after_fill(
                     holding_bars=holding_bars,
                 )
             else:
-                touched_exit = _first_touched_exit_on_segment(
-                    segment_start,
-                    segment_end,
-                    stop_loss=position.stop_loss,
-                    take_profit=position.take_profit,
-                )
+                if position.take_profit_enabled:
+                    touched_exit = _first_touched_exit_on_segment(
+                        segment_start,
+                        segment_end,
+                        stop_loss=position.stop_loss,
+                        take_profit=position.take_profit,
+                    )
+                else:
+                    touched_exit = (
+                        (position.stop_loss, "stop_loss")
+                        if _segment_contains_price(segment_start, segment_end, position.stop_loss)
+                        else None
+                    )
             if touched_exit is not None:
                 exit_price_raw, exit_reason = touched_exit
                 exit_price = _apply_slippage_price(
@@ -5109,6 +5801,44 @@ def _append_backtest_strategy_notes(
             f"ATR分位上限={format_decimal_fixed(result.atr_percentile_filter_max, 2)}"
         )
         _append_backtest_dynamic_take_profit_lines(lines, result)
+        lines.append("方向说明：本策略只做空，不做多。")
+        return
+    if family == "ema15_ma50_pullback_long":
+        lines.append(
+            f"交易逻辑：固定 4H {fast_label}/{trend_label}；当 {fast_label} 从下向上穿越 {trend_label} 后，进入 {result.cross_window_bars} 根K线观察窗口，仅在 low 回踩 {fast_label} 且 close 重新收回其上方时确认做多信号。"
+        )
+        lines.append(
+            f"成交规则：信号K线只负责收盘确认，统一在下一根K线开盘成交；每轮 CrossUp 默认最多交易第 {result.max_pullback_index} 次有效回踩。"
+        )
+        lines.append(
+            "止损止盈："
+            f"ATR周期={result.atr_period} | ATR止损倍数={format_decimal_fixed(result.atr_stop_multiplier, 2)} | "
+            f"exit_mode={result.exit_mode} | 固定RR={format_decimal_fixed(result.rr, 2)}"
+        )
+        if result.exit_mode in {"dynamic", "dynamic_or_ema15_close"}:
+            _append_backtest_dynamic_take_profit_lines(lines, result)
+        if result.exit_mode in {"fixed_rr_or_ema15_close", "dynamic_or_ema15_close", "ema15_close"}:
+            lines.append(f"EMA15离场：若收盘价跌破 {fast_label}，则按下一根K线开盘价离场。")
+        lines.append("费用口径：开仓按 Maker，平仓按 Taker，并计入项目现有滑点配置。")
+        lines.append("方向说明：本策略只做多，不做空。")
+        return
+    if family == "ema15_ma50_pullback_short":
+        lines.append(
+            f"交易逻辑：固定 4H {fast_label}/{trend_label}；当 {fast_label} 从上向下穿越 {trend_label} 后，进入 {result.cross_window_bars} 根K线观察窗口，仅在 high 回抽 {fast_label} 且 close 重新收回其下方时确认做空信号。"
+        )
+        lines.append(
+            f"成交规则：信号K线只负责收盘确认，统一在下一根K线开盘成交；每轮 CrossDown 默认最多交易第 {result.max_pullback_index} 次有效回抽。"
+        )
+        lines.append(
+            "止损止盈："
+            f"ATR周期={result.atr_period} | ATR止损倍数={format_decimal_fixed(result.atr_stop_multiplier, 2)} | "
+            f"exit_mode={result.exit_mode} | 固定RR={format_decimal_fixed(result.rr, 2)}"
+        )
+        if result.exit_mode in {"dynamic", "dynamic_or_ema15_close"}:
+            _append_backtest_dynamic_take_profit_lines(lines, result)
+        if result.exit_mode in {"fixed_rr_or_ema15_close", "dynamic_or_ema15_close", "ema15_close"}:
+            lines.append(f"EMA15离场：若收盘价重新站回 {fast_label} 上方，则按下一根K线开盘价离场。")
+        lines.append("费用口径：开仓按 Maker，平仓按 Taker，并计入项目现有滑点配置。")
         lines.append("方向说明：本策略只做空，不做多。")
         return
     if family in {"cross_breakout_long", "cross_breakdown_short", "cross_legacy"}:
