@@ -941,6 +941,10 @@ def build_parameter_batch_configs(
     if family == "ema15_ma50_pullback_short":
         configs: list[StrategyConfig] = []
         atr_periods = (10, 14)
+        trend_variants = (
+            ("ema", 50),
+            ("ema", 55),
+        )
         cross_windows = (8, 10, 15, 20)
         pullback_indices = (1, 2, 3)
         exit_modes = (
@@ -968,29 +972,32 @@ def build_parameter_batch_configs(
             },
         )
         for atr_period_value in atr_periods:
-            for stop_multiplier in (Decimal("0.8"), Decimal("1.0"), Decimal("1.2"), Decimal("1.5"), Decimal("2.0")):
-                for cross_window in cross_windows:
-                    for pullback_index in pullback_indices:
-                        for filter_variant in daily_filter_variants:
-                            for exit_mode in exit_modes:
-                                rr_candidates = rr_values if exit_mode.startswith("fixed_rr") else (base_config.resolved_fixed_rr(),)
-                                take_profit_mode = "fixed" if exit_mode.startswith("fixed_rr") else "dynamic"
-                                for rr_value in rr_candidates:
-                                    configs.append(
-                                        replace(
-                                            base_config,
-                                            atr_period=atr_period_value,
-                                            atr_stop_multiplier=stop_multiplier,
-                                            cross_window_bars=cross_window,
-                                            max_pullback_index=pullback_index,
-                                            exit_mode=exit_mode,
-                                            rr=rr_value,
-                                            take_profit_mode=take_profit_mode,
-                                            daily_filter_enabled=bool(filter_variant["daily_filter_enabled"]),
-                                            daily_filter_mode=str(filter_variant["daily_filter_mode"]),
-                                            daily_filter_scope=str(filter_variant["daily_filter_scope"]),
+            for trend_ema_type, trend_ema_period in trend_variants:
+                for stop_multiplier in (Decimal("0.8"), Decimal("1.0"), Decimal("1.2"), Decimal("1.5"), Decimal("2.0")):
+                    for cross_window in cross_windows:
+                        for pullback_index in pullback_indices:
+                            for filter_variant in daily_filter_variants:
+                                for exit_mode in exit_modes:
+                                    rr_candidates = rr_values if exit_mode.startswith("fixed_rr") else (base_config.resolved_fixed_rr(),)
+                                    take_profit_mode = "fixed" if exit_mode.startswith("fixed_rr") else "dynamic"
+                                    for rr_value in rr_candidates:
+                                        configs.append(
+                                            replace(
+                                                base_config,
+                                                atr_period=atr_period_value,
+                                                trend_ema_type=trend_ema_type,
+                                                trend_ema_period=trend_ema_period,
+                                                atr_stop_multiplier=stop_multiplier,
+                                                cross_window_bars=cross_window,
+                                                max_pullback_index=pullback_index,
+                                                exit_mode=exit_mode,
+                                                rr=rr_value,
+                                                take_profit_mode=take_profit_mode,
+                                                daily_filter_enabled=bool(filter_variant["daily_filter_enabled"]),
+                                                daily_filter_mode=str(filter_variant["daily_filter_mode"]),
+                                                daily_filter_scope=str(filter_variant["daily_filter_scope"]),
+                                            )
                                         )
-                                    )
         return configs
     if family == "body_retest_short":
         return [base_config]

@@ -843,7 +843,7 @@ def _btc_ema15_ma50_pullback_direction(strategy_id: str) -> str:
 
 
 def _btc_ema15_ma50_pullback_title(strategy_id: str) -> str:
-    return "BTC EMA15/MA50 回踩做空" if strategy_id == STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID else "BTC EMA15/MA50 回踩做多"
+    return "BTC 快线/趋势均线 回踩做空" if strategy_id == STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID else "BTC 快线/趋势均线 回踩做多"
 
 
 def _btc_ema15_ma50_pullback_report_dir_for_strategy(strategy_id: str, base_dir: Path | None = None) -> Path:
@@ -945,6 +945,10 @@ def _btc_ema15_ma50_summary_row(
         "strategy_name": STRATEGY_ID_TO_NAME.get(config.strategy_id, config.strategy_id),
         "symbol": config.inst_id,
         "timeframe": config.bar,
+        "ema_type": config.resolved_ema_type(),
+        "ema_period": config.ema_period,
+        "trend_ema_type": config.resolved_trend_ema_type(),
+        "trend_ema_period": config.trend_ema_period,
         "atr_period": config.atr_period,
         "atr_stop_multiplier": config.atr_stop_multiplier,
         "cross_window_bars": config.cross_window_bars,
@@ -974,6 +978,10 @@ def _btc_ema15_ma50_comparison_row(rank: int, config: StrategyConfig, result: Ba
         "rank": rank,
         "symbol": config.inst_id,
         "timeframe": config.bar,
+        "ema_type": config.resolved_ema_type(),
+        "ema_period": config.ema_period,
+        "trend_ema_type": config.resolved_trend_ema_type(),
+        "trend_ema_period": config.trend_ema_period,
         "atr_period": config.atr_period,
         "atr_stop_multiplier": config.atr_stop_multiplier,
         "cross_window_bars": config.cross_window_bars,
@@ -1304,10 +1312,12 @@ def _btc_ema15_ma50_build_report_html(
     strategy_title = _btc_ema15_ma50_pullback_title(best_config.strategy_id)
     direction = _btc_ema15_ma50_pullback_direction(best_config.strategy_id)
     slug = _btc_ema15_ma50_pullback_study_slug(best_config.strategy_id)
+    fast_label = _config_fast_label(best_config)
+    trend_label = _config_trend_label(best_config)
     description = (
-        "本研究模块固定品种为 BTC-USDT-SWAP、周期为 4H、方向只做空。先要求 EMA15 从上向下穿越 MA50，再在限定窗口内等待 high 回抽 EMA15 且 close 收回 EMA15 下方，信号在收盘确认后统一于下一根K线开盘成交。止损使用 ATR 倍数，离场可选择固定RR、动态保护，以及 EMA15 收盘重新站回上方后的下一根开盘离场。"
+        f"本研究模块固定品种为 BTC-USDT-SWAP、周期为 4H、方向只做空。先要求 {fast_label} 从上向下穿越 {trend_label}，再在限定窗口内等待 high 回抽 {fast_label} 且 close 收回 {fast_label} 下方，信号在收盘确认后统一于下一根K线开盘成交。止损使用 ATR 倍数，离场可选择固定RR、动态保护，以及 {fast_label} 收盘重新站回上方后的下一根开盘离场。"
         if direction == "short"
-        else "本研究模块固定品种为 BTC-USDT-SWAP、周期为 4H、方向只做多。先要求 EMA15 从下向上穿越 MA50，再在限定窗口内等待 low 回踩 EMA15 且 close 收回 EMA15 上方，信号在收盘确认后统一于下一根K线开盘成交。止损使用 ATR 倍数，离场可选择固定RR、动态保护，以及 EMA15 收盘跌破后的下一根开盘离场。"
+        else f"本研究模块固定品种为 BTC-USDT-SWAP、周期为 4H、方向只做多。先要求 {fast_label} 从下向上穿越 {trend_label}，再在限定窗口内等待 low 回踩 {fast_label} 且 close 收回 {fast_label} 上方，信号在收盘确认后统一于下一根K线开盘成交。止损使用 ATR 倍数，离场可选择固定RR、动态保护，以及 {fast_label} 收盘跌破后的下一根开盘离场。"
     )
     top_rows = comparison_rows[:20]
     best_total_r = sum((trade.r_multiple for trade in best_result.trades), Decimal("0"))

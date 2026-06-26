@@ -504,10 +504,6 @@ STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
         fixed_values={
             "bar": "4H",
             "signal_mode": "long_only",
-            "ema_type": "ema",
-            "ema_period": 15,
-            "trend_ema_type": "ma",
-            "trend_ema_period": 50,
         },
     ),
     STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID: StrategyParameterProfile(
@@ -544,10 +540,6 @@ STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
         fixed_values={
             "bar": "4H",
             "signal_mode": "short_only",
-            "ema_type": "ema",
-            "ema_period": 15,
-            "trend_ema_type": "ma",
-            "trend_ema_period": 50,
         },
     ),
     STRATEGY_BODY_RETEST_SHORT_ID: StrategyParameterProfile(

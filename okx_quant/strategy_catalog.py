@@ -316,16 +316,16 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     ),
     StrategyDefinition(
         strategy_id=STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
-        name="BTC EMA15/MA50 回踩做多",
-        summary="BTC 4H 专用研究策略：EMA15 上穿 MA50 后，等待限定窗口内首次或前几次回踩 EMA15 的收盘确认，下一根开盘做多。",
+        name="BTC 快线/趋势均线 回踩做多",
+        summary="BTC 4H 专用研究策略：快线从下向上穿越趋势均线后，等待限定窗口内首次或前几次回踩快线的收盘确认，下一根开盘做多；默认快线为 EMA15、趋势线为 MA50，均可实验调整。",
         rule_description=(
-            "流程：固定 BTC-USDT-SWAP 4H；先要求 EMA15 从下向上穿越 MA50，随后进入限定观察窗口。"
-            "若窗口内出现 low 触及 EMA15 且 close 重新收回 EMA15 上方，则在该根 K 线收盘确认，下一根 K 线开盘做多。"
-            "持仓后可选择固定 RR、nR 动态保护，以及 EMA15 收盘跌破后的下一根开盘离场。"
+            "流程：固定 BTC-USDT-SWAP 4H；先要求快线从下向上穿越趋势均线，随后进入限定观察窗口。"
+            "若窗口内出现 low 触及快线且 close 重新收回快线上方，则在该根 K 线收盘确认，下一根 K 线开盘做多。"
+            "持仓后可选择固定 RR、nR 动态保护，以及快线收盘跌破后的下一根开盘离场。"
         ),
         parameter_hint=(
-            "核心研究参数：ATR 周期、ATR 止损倍数、Cross 后观察窗口、允许交易的第几次回踩、"
-            "固定 RR、动态保护触发 R、日线过滤，以及是否叠加 EMA15 收破离场。"
+            "核心研究参数：快线类型/周期、趋势均线类型/周期、ATR 周期、ATR 止损倍数、Cross 后观察窗口、允许交易的第几次回踩、"
+            "固定 RR、动态保护触发 R、日线过滤，以及是否叠加快线收破离场。"
         ),
         default_signal_label="只做多",
         allowed_signal_labels=("只做多",),
@@ -336,16 +336,16 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
     ),
     StrategyDefinition(
         strategy_id=STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
-        name="BTC EMA15/MA50 回踩做空",
-        summary="BTC 4H 专用研究策略：EMA15 下穿 MA50 后，等待限定窗口内首次或前几次回抽 EMA15 的收盘确认，下一根开盘做空。",
+        name="BTC 快线/趋势均线 回踩做空",
+        summary="BTC 4H 专用研究策略：快线从上向下穿越趋势均线后，等待限定窗口内首次或前几次回抽快线的收盘确认，下一根开盘做空；默认快线为 EMA15、趋势线为 EMA55，均可实验调整。",
         rule_description=(
-            "流程：固定 BTC-USDT-SWAP 4H；先要求 EMA15 从上向下穿越 MA50，随后进入限定观察窗口。"
-            "若窗口内出现 high 触及 EMA15 且 close 重新收回 EMA15 下方，则在该根 K 线收盘确认，下一根 K 线开盘做空。"
-            "持仓后可选择固定 RR、nR 动态保护，以及 EMA15 收盘重新站回上方后的下一根开盘离场。"
+            "流程：固定 BTC-USDT-SWAP 4H；先要求快线从上向下穿越趋势均线，随后进入限定观察窗口。"
+            "若窗口内出现 high 触及快线且 close 重新收回快线下方，则在该根 K 线收盘确认，下一根 K 线开盘做空。"
+            "持仓后可选择固定 RR、nR 动态保护，以及快线收盘重新站回上方后的下一根开盘离场。"
         ),
         parameter_hint=(
-            "核心研究参数：ATR 周期、ATR 止损倍数、Cross 后观察窗口、允许交易的第几次回抽、"
-            "固定 RR、动态保护触发 R、日线过滤，以及是否叠加 EMA15 收回离场。"
+            "核心研究参数：快线类型/周期、趋势均线类型/周期、ATR 周期、ATR 止损倍数、Cross 后观察窗口、允许交易的第几次回抽、"
+            "固定 RR、动态保护触发 R、日线过滤，以及是否叠加快线收回离场。"
         ),
         default_signal_label="只做空",
         allowed_signal_labels=("只做空",),

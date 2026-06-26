@@ -23,6 +23,7 @@ from okx_quant.ui import (
     _build_position_history_detail_text,
     _build_position_history_usdt_price_map,
     _filter_position_history_items,
+    _format_position_history_trade_side,
     _format_fill_history_pnl,
     _format_position_history_filter_stats,
     _format_position_history_pnl,
@@ -1021,6 +1022,70 @@ class OkxHistoryParsingTest(TestCase):
             self._option_instruments(),
         )
         self.assertIn("平仓数量：0.2 BTC", detail)
+
+    def test_format_position_history_trade_side_inferrs_delivery_short_from_net_mode(self) -> None:
+        text = _format_position_history_trade_side(
+            OkxPositionHistoryItem(
+                update_time=1710000000200,
+                inst_id="BTC-USD-260626",
+                inst_type="FUTURES",
+                mgn_mode="cross",
+                pos_side="net",
+                direction="net",
+                open_avg_price=Decimal("70000"),
+                close_avg_price=Decimal("69000"),
+                close_size=Decimal("200"),
+                pnl=Decimal("0.12"),
+                realized_pnl=Decimal("0.08"),
+                settle_pnl=Decimal("0.01"),
+                raw={"ccy": "BTC"},
+                fee=Decimal("-0.0001"),
+            )
+        )
+        self.assertEqual(text, "卖出开仓（推断）")
+
+    def test_format_position_history_trade_side_inferrs_option_buy_from_net_mode(self) -> None:
+        text = _format_position_history_trade_side(
+            OkxPositionHistoryItem(
+                update_time=1710000000200,
+                inst_id="BTC-USD-260626-100000-C",
+                inst_type="OPTION",
+                mgn_mode="isolated",
+                pos_side="net",
+                direction="net",
+                open_avg_price=Decimal("0.02"),
+                close_avg_price=Decimal("0.03"),
+                close_size=Decimal("10"),
+                pnl=Decimal("0.001"),
+                realized_pnl=Decimal("0.0005"),
+                settle_pnl=Decimal("0"),
+                raw={},
+                fee=Decimal("-0.0002"),
+            )
+        )
+        self.assertEqual(text, "买入开仓（推断）")
+
+    def test_position_history_detail_includes_trade_side_line(self) -> None:
+        detail = _build_position_history_detail_text(
+            OkxPositionHistoryItem(
+                update_time=1710000000200,
+                inst_id="BTC-USDT-SWAP",
+                inst_type="SWAP",
+                mgn_mode="cross",
+                pos_side="net",
+                direction="net",
+                open_avg_price=Decimal("70000"),
+                close_avg_price=Decimal("70500"),
+                close_size=Decimal("3"),
+                pnl=Decimal("12.3"),
+                realized_pnl=Decimal("8.5"),
+                settle_pnl=Decimal("0"),
+                raw={},
+            ),
+            {"USDT": Decimal("1")},
+            {},
+        )
+        self.assertIn("交易方向：买入开仓（推断）", detail)
 
     def test_position_history_size_keeps_asset_unit_when_instrument_metadata_missing(self) -> None:
         text = _format_position_history_size(

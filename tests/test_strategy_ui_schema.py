@@ -218,8 +218,40 @@ class StrategyUiSchemaTest(TestCase):
             10,
         )
         self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "ema_type", "backtest"),
+            "ema",
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "ema_period", "backtest"),
+            15,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "trend_ema_type", "backtest"),
+            "ma",
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "trend_ema_period", "backtest"),
+            50,
+        )
+        self.assertEqual(
             strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "cross_window_bars", "backtest"),
             10,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "ema_type", "backtest"),
+            "ema",
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "ema_period", "backtest"),
+            15,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "trend_ema_type", "backtest"),
+            "ema",
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "trend_ema_period", "backtest"),
+            55,
         )
         visibility_long = build_strategy_widget_visibility(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "backtest")
         visibility_short = build_strategy_widget_visibility(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "backtest")

@@ -1148,6 +1148,7 @@ class UiPositionsMixin:
             "inst_id",
             "mgn_mode",
             "side",
+            "trade_side",
             "open_avg",
             "close_avg",
             "close_size",
@@ -1194,6 +1195,9 @@ class UiPositionsMixin:
                 if column_id in {"open_avg", "close_avg", "close_size", "fee", "pnl", "realized"}
                 else "center",
             )
+        tree.heading("side", text="持仓模式")
+        tree.heading("trade_side", text="交易方向")
+        tree.column("trade_side", width=116, anchor="center")
         tree.column("inst_id", anchor="w")
         tree.column("note", anchor="w")
         tree.grid(row=0, column=0, sticky="nsew")
@@ -3626,6 +3630,7 @@ class UiPositionsMixin:
                     item.inst_id or "-",
                     _format_margin_mode(item.mgn_mode or ""),
                     _format_history_side(None, item.pos_side or item.direction),
+                    _format_position_history_trade_side(item),
                     _format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type),
                     _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
                     _format_position_history_size(item, self._position_history_instruments),

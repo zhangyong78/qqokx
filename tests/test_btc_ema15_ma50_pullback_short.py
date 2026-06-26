@@ -54,8 +54,8 @@ def _config() -> StrategyConfig:
         bar="4H",
         ema_type="ema",
         ema_period=15,
-        trend_ema_type="ma",
-        trend_ema_period=50,
+        trend_ema_type="ema",
+        trend_ema_period=55,
         atr_period=14,
         atr_stop_multiplier=Decimal("1"),
         atr_take_multiplier=Decimal("1"),
@@ -89,6 +89,8 @@ class BtcEma15Ma50PullbackShortTest(TestCase):
         configs = build_parameter_batch_configs(_config())
 
         self.assertTrue(configs)
+        self.assertEqual({item.resolved_trend_ema_type() for item in configs}, {"ema"})
+        self.assertEqual({item.trend_ema_period for item in configs}, {50, 55})
         self.assertEqual({item.atr_period for item in configs}, {10, 14})
         self.assertEqual({item.cross_window_bars for item in configs}, {8, 10, 15, 20})
         self.assertEqual({item.max_pullback_index for item in configs}, {1, 2, 3})
@@ -336,20 +338,27 @@ class BtcEma15Ma50PullbackShortTest(TestCase):
             research_dir = Path(temp_dir) / "btc_ema15_ma50_short" / "latest"
             report_html = (research_dir / "report.html").read_text(encoding="utf-8")
             trades_csv = (research_dir / "trades.csv").read_text(encoding="utf-8-sig")
+            comparison_csv = (research_dir / "strategy_comparison.csv").read_text(encoding="utf-8-sig")
             self.assertTrue((research_dir / "summary.csv").exists())
             self.assertTrue((research_dir / "strategy_comparison.csv").exists())
             self.assertTrue((research_dir / "equity_curve.csv").exists())
             self.assertTrue((research_dir / "monthly_returns.csv").exists())
             self.assertTrue((research_dir / "yearly_returns.csv").exists())
             self.assertTrue((research_dir / "trade_charts" / "T0001.html").exists())
-            self.assertIn("BTC EMA15/MA50", report_html)
+            self.assertIn("EMA15", report_html)
             self.assertIn("trade_id", trades_csv)
             self.assertIn("pullback_index", trades_csv)
+            self.assertIn("ema_period", comparison_csv)
+            self.assertIn("trend_ema_period", comparison_csv)
 
     def test_backtest_ui_strategy_config_roundtrip_preserves_research_fields(self) -> None:
         payload = backtest_ui_module._serialize_strategy_config(
             replace(
                 _config(),
+                ema_type="ma",
+                ema_period=12,
+                trend_ema_type="ma",
+                trend_ema_period=50,
                 cross_window_bars=15,
                 max_pullback_index=3,
                 exit_mode="dynamic_or_ema15_close",
@@ -359,6 +368,10 @@ class BtcEma15Ma50PullbackShortTest(TestCase):
 
         restored = backtest_ui_module._deserialize_strategy_config(payload)
 
+        self.assertEqual(restored.resolved_ema_type(), "ma")
+        self.assertEqual(restored.ema_period, 12)
+        self.assertEqual(restored.resolved_trend_ema_type(), "ma")
+        self.assertEqual(restored.trend_ema_period, 50)
         self.assertEqual(restored.cross_window_bars, 15)
         self.assertEqual(restored.max_pullback_index, 3)
         self.assertEqual(restored.exit_mode, "dynamic_or_ema15_close")

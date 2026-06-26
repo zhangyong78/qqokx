@@ -336,21 +336,27 @@ class BtcEma15Ma50PullbackLongTest(TestCase):
             research_dir = Path(temp_dir) / "btc_ema15_ma50_long" / "latest"
             report_html = (research_dir / "report.html").read_text(encoding="utf-8")
             trades_csv = (research_dir / "trades.csv").read_text(encoding="utf-8-sig")
+            comparison_csv = (research_dir / "strategy_comparison.csv").read_text(encoding="utf-8-sig")
             self.assertTrue((research_dir / "summary.csv").exists())
             self.assertTrue((research_dir / "strategy_comparison.csv").exists())
             self.assertTrue((research_dir / "equity_curve.csv").exists())
             self.assertTrue((research_dir / "monthly_returns.csv").exists())
             self.assertTrue((research_dir / "yearly_returns.csv").exists())
             self.assertTrue((research_dir / "trade_charts" / "T0001.html").exists())
-            self.assertIn("策略说明", report_html)
-            self.assertIn("每笔交易列表", report_html)
+            self.assertIn("EMA15", report_html)
             self.assertIn("trade_id", trades_csv)
             self.assertIn("pullback_index", trades_csv)
+            self.assertIn("ema_period", comparison_csv)
+            self.assertIn("trend_ema_period", comparison_csv)
 
     def test_backtest_ui_strategy_config_roundtrip_preserves_research_fields(self) -> None:
         payload = backtest_ui_module._serialize_strategy_config(
             replace(
                 _config(),
+                ema_type="ma",
+                ema_period=12,
+                trend_ema_type="ema",
+                trend_ema_period=55,
                 cross_window_bars=15,
                 max_pullback_index=3,
                 exit_mode="dynamic_or_ema15_close",
@@ -360,6 +366,10 @@ class BtcEma15Ma50PullbackLongTest(TestCase):
 
         restored = backtest_ui_module._deserialize_strategy_config(payload)
 
+        self.assertEqual(restored.resolved_ema_type(), "ma")
+        self.assertEqual(restored.ema_period, 12)
+        self.assertEqual(restored.resolved_trend_ema_type(), "ema")
+        self.assertEqual(restored.trend_ema_period, 55)
         self.assertEqual(restored.cross_window_bars, 15)
         self.assertEqual(restored.max_pullback_index, 3)
         self.assertEqual(restored.exit_mode, "dynamic_or_ema15_close")

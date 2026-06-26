@@ -601,6 +601,7 @@ POSITIONS_ZOOM_DEFAULT_VISIBLE_COLUMNS = {
         "inst_id",
         "mgn_mode",
         "side",
+        "trade_side",
         "open_avg",
         "close_avg",
         "close_size",
@@ -16914,6 +16915,64 @@ def _format_history_side(side: str | None, pos_side: str | None) -> str:
     return " / ".join(parts) if parts else (side or pos_side or "-")
 
 
+def _decimal_sign(value: Decimal | None) -> int:
+    if value is None:
+        return 0
+    if value > 0:
+        return 1
+    if value < 0:
+        return -1
+    return 0
+
+
+def _normalize_position_history_trade_side(value: str | None) -> str | None:
+    token = str(value or "").strip().lower()
+    if token in {"buy", "long"}:
+        return "buy"
+    if token in {"sell", "short"}:
+        return "sell"
+    return None
+
+
+def _infer_position_history_trade_side(item: OkxPositionHistoryItem) -> tuple[str | None, bool]:
+    explicit_side = _normalize_position_history_trade_side(item.pos_side) or _normalize_position_history_trade_side(item.direction)
+    if explicit_side is not None:
+        return explicit_side, False
+    if item.open_avg_price is None or item.close_avg_price is None:
+        return None, False
+    price_delta = item.close_avg_price - item.open_avg_price
+    price_sign = _decimal_sign(price_delta)
+    if price_sign == 0:
+        return None, False
+    pnl_source: Decimal | None = None
+    for candidate in (item.realized_pnl, item.pnl, item.settle_pnl):
+        if _decimal_sign(candidate) != 0:
+            pnl_source = candidate
+            break
+    if pnl_source is None:
+        return None, False
+    effective_pnl = pnl_source
+    if item.fee is not None:
+        effective_pnl -= item.fee
+    if item.funding_fee is not None:
+        effective_pnl -= item.funding_fee
+    pnl_sign = _decimal_sign(effective_pnl)
+    if pnl_sign == 0:
+        pnl_sign = _decimal_sign(pnl_source)
+    if pnl_sign == 0:
+        return None, False
+    return ("buy", True) if price_sign == pnl_sign else ("sell", True)
+
+
+def _format_position_history_trade_side(item: OkxPositionHistoryItem) -> str:
+    side, inferred = _infer_position_history_trade_side(item)
+    if side == "buy":
+        return "买入开仓（推断）" if inferred else "买入开仓"
+    if side == "sell":
+        return "卖出开仓（推断）" if inferred else "卖出开仓"
+    return "无法判断"
+
+
 def _desk_tree_final_iids_from_bases(base_iids: list[str]) -> list[str]:
     """与 `_line_trading_desk_sync_tree_rows` 一致：重复 base iid 时追加 __2、__3…"""
     iid_seen: dict[str, int] = {}
@@ -17915,6 +17974,43 @@ def _build_position_history_detail_text(
         f"状态：{status_text}\n"
         f"保证金模式：{_format_margin_mode(item.mgn_mode or '')}\n"
         f"方向：{_format_history_side(None, item.pos_side or item.direction)}\n"
+        f"开仓均价：{_format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type)}\n"
+        f"平仓均价：{_format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type)}\n"
+        f"平仓数量：{_format_position_history_size(item, instruments)}\n"
+        f"{incremental_close_line}"
+        f"手续费：{_format_position_history_fee_cell(item, upl_usdt_prices)}\n"
+        f"盈亏：{_format_position_history_pnl(item.pnl, item, usdt_prices=upl_usdt_prices)}\n"
+        f"已实现盈亏：{_format_position_history_pnl(item.realized_pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"
+        f"结算盈亏：{_format_optional_decimal(item.settle_pnl)}"
+    )
+
+def _build_position_history_detail_text(
+    item: OkxPositionHistoryItem,
+    upl_usdt_prices: dict[str, Decimal],
+    instruments: dict[str, Instrument],
+    note: str = "",
+) -> str:
+    note_line = _format_position_note_detail(note)
+    status_text = _position_history_auto_summary(item) or "完整平仓/最终快照"
+    incremental_close_total = _position_history_incremental_close_total(item)
+    incremental_close_line = ""
+    if incremental_close_total is not None:
+        incremental_item = OkxPositionHistoryItem(
+            **{
+                **item.__dict__,
+                "close_size": incremental_close_total,
+            }
+        )
+        incremental_close_line = f"本次增量平仓：{_format_position_history_size(incremental_item, instruments)}\n"
+    return (
+        f"更新时间：{_format_okx_ms_timestamp(item.update_time)}\n"
+        f"合约：{item.inst_id or '-'}\n"
+        f"类型：{item.inst_type or '-'}\n"
+        f"{note_line}"
+        f"状态：{status_text}\n"
+        f"保证金模式：{_format_margin_mode(item.mgn_mode or '')}\n"
+        f"持仓模式：{_format_history_side(None, item.pos_side or item.direction)}\n"
+        f"交易方向：{_format_position_history_trade_side(item)}\n"
         f"开仓均价：{_format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type)}\n"
         f"平仓均价：{_format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type)}\n"
         f"平仓数量：{_format_position_history_size(item, instruments)}\n"
