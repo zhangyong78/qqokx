@@ -3,15 +3,24 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 from typing import Callable
 
 from PySide6.QtCore import QThread, Signal
 
 from okx_quant.arbitrage.basis_calculator import mid_price
-from okx_quant.arbitrage.arbitrage_executor import ArbitrageOpenRequest, ArbitrageRollRequest
+from okx_quant.arbitrage.arbitrage_executor import (
+    ArbitrageCloseRequest,
+    ArbitrageOpenRequest,
+    ArbitrageRollRequest,
+    _build_strategy_config,
+    _wait_order_fill,
+)
 from okx_quant.arbitrage.arbitrage_manager import ArbitrageManager
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
-from okx_quant.okx_client import OkxFillHistoryItem, OkxRestClient, OkxTradeOrderItem
+from okx_quant.arbitrage.position_ledger import find_ledger_entry, load_open_ledger_entries
+from okx_quant.okx_client import OkxApiError, OkxFillHistoryItem, OkxRestClient, OkxTradeOrderItem
+from okx_quant.pricing import snap_to_increment
 
 from roll_terminal_qt.account_service import FuturesPositionView
 from roll_terminal_qt.formatting import fmt_decimal
@@ -62,6 +71,33 @@ class ProfessionalOpenExecutionPlan:
     right_inst_id: str
     spot_inst_id: str
     derivative_inst_id: str
+    size_value: Decimal
+    size_unit: str
+    execution_label: str
+    execution_mode_value: str = ""
+    max_slippage: Decimal = Decimal("0.0015")
+    use_limit_orders: bool = False
+    spot_limit_price: Decimal | None = None
+    derivative_limit_price: Decimal | None = None
+    batch_count: int = 1
+    batch_contract_qty: Decimal | None = None
+    maker_wait_seconds: float = 6.0
+    chase_limit: int = 3
+
+    @property
+    def execution_mode(self) -> str:
+        if self.execution_mode_value:
+            return self.execution_mode_value
+        return OPEN_EXECUTION_MODE_BY_LABEL.get(self.execution_label, "dual_taker")
+
+
+@dataclass(frozen=True)
+class ProfessionalCloseExecutionPlan:
+    left_inst_id: str
+    right_inst_id: str
+    spot_inst_id: str
+    derivative_inst_id: str
+    entry_ids: tuple[str, ...]
     qty_contracts: Decimal
     execution_label: str
     execution_mode_value: str = ""
@@ -73,6 +109,7 @@ class ProfessionalOpenExecutionPlan:
     batch_contract_qty: Decimal | None = None
     maker_wait_seconds: float = 6.0
     chase_limit: int = 3
+    close_profit_spot: bool = False
 
     @property
     def execution_mode(self) -> str:
@@ -864,9 +901,14 @@ class ProfessionalOpenExecutionThread(QThread):
                 message="双腿开仓请求已构造，准备提交",
             )
         )
+        size_suffix = {
+            "coin": "币",
+            "usdt": "U",
+            "contracts": "张",
+        }.get(self._plan.size_unit, self._plan.size_unit)
         self.log.emit(
             f"提交双腿开仓：{self._plan.left_inst_id} <-> {self._plan.right_inst_id} "
-            f"| 合约张数 {self._plan.qty_contracts} | {self._plan.execution_label}"
+            f"| 输入数量 {fmt_decimal(self._plan.size_value)} {size_suffix} | {self._plan.execution_label}"
         )
         self.status.emit(
             ExecutionStatus(
@@ -920,8 +962,8 @@ class ProfessionalOpenExecutionThread(QThread):
             base_ccy=base_ccy,
             spot_inst_id=self._plan.spot_inst_id,
             derivative_inst_id=self._plan.derivative_inst_id,
-            size=self._plan.qty_contracts,
-            size_unit="contracts",
+            size=self._plan.size_value,
+            size_unit=self._plan.size_unit,  # type: ignore[arg-type]
             trigger_mode="spread_abs",
             open_spread_pct_max=None,
             open_spread_abs_max=None,
@@ -951,6 +993,271 @@ class ProfessionalOpenExecutionThread(QThread):
             spread_pct = (spread_abs / spot_avg) * Decimal("100")
             lines.append(f"开仓价差(衍生品-现货)：{fmt_decimal(spread_abs, 2)} | {fmt_decimal(spread_pct, 2)}%")
         result.message = f"{result.message}\n" + "\n".join(lines)
+
+
+class ProfessionalCloseExecutionThread(QThread):
+    log = Signal(str)
+    status = Signal(object)
+    finished_with_result = Signal(object)
+
+    def __init__(
+        self,
+        *,
+        runtime: ArbitrageTradeRuntime,
+        plan: ProfessionalCloseExecutionPlan,
+    ) -> None:
+        super().__init__()
+        self._runtime = runtime
+        self._plan = plan
+        self._stop_after_batch_requested = False
+
+    @property
+    def supports_stop_after_batch(self) -> bool:
+        return True
+
+    @property
+    def stop_after_batch_requested(self) -> bool:
+        return self._stop_after_batch_requested
+
+    def request_stop_after_batch(self) -> bool:
+        already_requested = self._stop_after_batch_requested
+        self._stop_after_batch_requested = True
+        return not already_requested
+
+    def _base_ccy(self) -> str:
+        return str(self._plan.spot_inst_id or "").strip().upper().split("-", 1)[0]
+
+    def _is_coin_settled_derivative(self, client: OkxRestClient) -> bool:
+        base_ccy = self._base_ccy()
+        instrument = client.get_instrument(self._plan.derivative_inst_id, prefer_cached=True)
+        settle_ccy = str(instrument.settle_ccy or "").strip().upper()
+        return bool(base_ccy) and settle_ccy == base_ccy
+
+    def _load_available_base_qty(self, client: OkxRestClient, *, base_ccy: str) -> Decimal:
+        overview = client.get_account_overview(
+            self._runtime.credentials,
+            environment=self._runtime.environment,
+            prefer_cache=False,
+        )
+        for asset in getattr(overview, "details", ()):
+            ccy = str(getattr(asset, "ccy", "") or "").strip().upper()
+            if ccy != base_ccy:
+                continue
+            available = getattr(asset, "available_balance", None)
+            equity = getattr(asset, "equity", None)
+            closeable = available if available not in {None, Decimal("0")} else equity
+            if closeable is None or closeable <= 0:
+                return Decimal("0")
+            return closeable
+        return Decimal("0")
+
+    @staticmethod
+    def _load_reserved_spot_qty(*, base_ccy: str) -> Decimal:
+        return sum(
+            (
+                entry.spot_qty
+                for entry in load_open_ledger_entries()
+                if str(entry.base_ccy or "").strip().upper() == base_ccy and entry.close_mode == "open"
+            ),
+            start=Decimal("0"),
+        )
+
+    @staticmethod
+    def _compute_profit_spot_sell_qty(
+        *,
+        available_base_qty: Decimal,
+        reserved_spot_qty: Decimal,
+        lot_size: Decimal,
+    ) -> Decimal:
+        releasable_qty = max((available_base_qty or Decimal("0")) - (reserved_spot_qty or Decimal("0")), Decimal("0"))
+        increment = lot_size if lot_size is not None and lot_size > 0 else Decimal("0.00000001")
+        snapped_qty = snap_to_increment(releasable_qty, increment, "down")
+        return max(snapped_qty, Decimal("0"))
+
+    def _close_profit_spot_balance(self, client: OkxRestClient) -> Decimal:
+        base_ccy = self._base_ccy()
+        if not base_ccy:
+            return Decimal("0")
+        if not self._is_coin_settled_derivative(client):
+            self.log.emit(
+                f"利润币清算已跳过：{self._plan.derivative_inst_id} 不是 {base_ccy} 币结算合约，本次平仓不会额外卖出现货利润币。"
+            )
+            return Decimal("0")
+        spot_instrument = client.get_instrument(self._plan.spot_inst_id, prefer_cached=True)
+        available_base_qty = self._load_available_base_qty(client, base_ccy=base_ccy)
+        reserved_spot_qty = self._load_reserved_spot_qty(base_ccy=base_ccy)
+        sell_qty = self._compute_profit_spot_sell_qty(
+            available_base_qty=available_base_qty,
+            reserved_spot_qty=reserved_spot_qty,
+            lot_size=spot_instrument.lot_size,
+        )
+        self.log.emit(
+            f"利润币清算测算：当前可用 {base_ccy} {fmt_decimal(available_base_qty)} - "
+            f"账本仍占用 {fmt_decimal(reserved_spot_qty)} = 可额外卖出 {fmt_decimal(sell_qty)} {base_ccy}"
+        )
+        if sell_qty <= 0:
+            return Decimal("0")
+        config = _build_strategy_config(self._plan.spot_inst_id, self._runtime)
+        order_result = client.place_simple_order(
+            self._runtime.credentials,
+            config,
+            inst_id=self._plan.spot_inst_id,
+            side="sell",
+            size=sell_qty,
+            ord_type="market",
+            pos_side=None,
+            reduce_only=False,
+        )
+        if not order_result.ord_id:
+            raise OkxApiError("利润币现货卖出下单成功，但未返回订单号，无法确认成交。")
+        filled_qty, avg_price = _wait_order_fill(
+            client,
+            credentials=self._runtime.credentials,
+            config=config,
+            inst_id=self._plan.spot_inst_id,
+            ord_id=order_result.ord_id,
+            expected_size=sell_qty,
+            logger=self.log.emit,
+            label="利润币现货卖出",
+        )
+        if filled_qty <= 0:
+            raise OkxApiError("利润币现货卖出未成交，请手动检查账户剩余币数量。")
+        avg_text = f" @ {fmt_decimal(avg_price)}" if avg_price is not None and avg_price > 0 else ""
+        self.log.emit(f"利润币现货卖出完成：{fmt_decimal(filled_qty)} {base_ccy}{avg_text}")
+        return filled_qty
+
+    def run(self) -> None:
+        client = OkxRestClient()
+        manager = ArbitrageManager(client, logger=self.log.emit)
+        open_entries = {
+            item.entry_id: item
+            for item in load_open_ledger_entries()
+            if item.entry_id in set(self._plan.entry_ids)
+        }
+        remaining_qty = self._plan.qty_contracts
+        total_pnl = Decimal("0")
+        total_derivative_qty = Decimal("0")
+        profit_spot_sold_qty = Decimal("0")
+        closed_ids: list[str] = []
+        errors: list[str] = []
+        total_entries = len(self._plan.entry_ids)
+
+        self.status.emit(
+            ExecutionStatus(
+                phase="提交",
+                current_inst_id=self._plan.derivative_inst_id,
+                target_inst_id=self._plan.spot_inst_id,
+                current_filled=Decimal("0"),
+                target_filled=Decimal("0"),
+                message="双腿平仓请求已构造，准备提交",
+            )
+        )
+        self.log.emit(
+            f"提交套利平仓：{self._plan.left_inst_id} <-> {self._plan.right_inst_id}"
+            f" | 合约张数 {self._plan.qty_contracts} | {self._plan.execution_label}"
+        )
+
+        for index, entry_id in enumerate(self._plan.entry_ids, start=1):
+            if self._stop_after_batch_requested:
+                self.log.emit("已收到停止请求：当前已完成批次后停止后续平仓。")
+                break
+            if remaining_qty <= 0:
+                break
+            entry = find_ledger_entry(entry_id) or open_entries.get(entry_id)
+            if entry is None or entry.close_mode != "open":
+                errors.append(f"{entry_id}: 未找到可继续处理的 open 持仓")
+                continue
+            close_qty = min(remaining_qty, entry.derivative_qty)
+            if close_qty <= 0:
+                continue
+            self.status.emit(
+                ExecutionStatus(
+                    phase="执行中",
+                    current_inst_id=self._plan.derivative_inst_id,
+                    target_inst_id=self._plan.spot_inst_id,
+                    current_filled=total_derivative_qty,
+                    target_filled=total_derivative_qty,
+                    message=f"正在处理第 {index}/{total_entries} 笔套利持仓，目标 {fmt_decimal(close_qty)} 张",
+                )
+            )
+            result = manager.close_now(
+                ArbitrageCloseRequest(
+                    entry_id=entry_id,
+                    max_slippage=self._plan.max_slippage,
+                    use_limit_orders=self._plan.use_limit_orders,
+                    spot_limit_price=self._plan.spot_limit_price,
+                    derivative_limit_price=self._plan.derivative_limit_price,
+                    close_derivative_qty=close_qty,
+                    batch_count=self._plan.batch_count,
+                    batch_contract_qty=self._plan.batch_contract_qty,
+                    execution_mode=self._plan.execution_mode,
+                    maker_wait_seconds=self._plan.maker_wait_seconds,
+                    chase_limit=self._plan.chase_limit,
+                ),
+                runtime=self._runtime,
+            )
+            if not result.success:
+                errors.append(f"{entry.base_ccy}: {result.message}")
+                continue
+            total_derivative_qty += close_qty
+            remaining_qty = max(remaining_qty - close_qty, Decimal("0"))
+            total_pnl += result.total_pnl or Decimal("0")
+            closed_ids.extend(result.entry_ids or (entry_id,))
+
+        success = total_derivative_qty > 0
+        profit_spot_error: str | None = None
+        if success and self._plan.close_profit_spot:
+            try:
+                self.status.emit(
+                    ExecutionStatus(
+                        phase="执行中",
+                        current_inst_id=self._plan.derivative_inst_id,
+                        target_inst_id=self._plan.spot_inst_id,
+                        current_filled=total_derivative_qty,
+                        target_filled=total_derivative_qty,
+                        message="主平仓已完成，正在检查是否需要额外卖出币本位利润币",
+                    )
+                )
+                profit_spot_sold_qty = self._close_profit_spot_balance(client)
+            except Exception as exc:  # noqa: BLE001
+                profit_spot_error = str(exc)
+                self.log.emit(f"利润币清算失败：{exc}")
+        if success:
+            message = f"已平仓 {len(closed_ids)} 笔，合约 {fmt_decimal(total_derivative_qty)} 张"
+            if total_pnl != 0:
+                message += f"，合计盈亏约 {fmt_decimal(total_pnl)} USDT"
+            if profit_spot_sold_qty > 0:
+                message += f"，额外卖出利润币 {fmt_decimal(profit_spot_sold_qty)} {self._base_ccy()}"
+            if remaining_qty > 0:
+                message += f"，仍有 {fmt_decimal(remaining_qty)} 张未处理"
+            if errors:
+                message += f"，{len(errors)} 笔失败"
+            if profit_spot_error:
+                message += f"，利润币清算失败：{profit_spot_error}"
+        else:
+            message = "；".join(errors) or "套利平仓失败。"
+
+        result = SimpleNamespace(
+            success=success,
+            message=message,
+            closed_count=len(closed_ids),
+            entry_ids=tuple(closed_ids),
+            total_pnl=total_pnl if success else None,
+            executed_derivative_qty=total_derivative_qty,
+            profit_spot_sold_qty=profit_spot_sold_qty,
+        )
+        self.status.emit(
+            ExecutionStatus(
+                phase="完成" if success else "失败",
+                current_inst_id=self._plan.derivative_inst_id,
+                target_inst_id=self._plan.spot_inst_id,
+                current_filled=total_derivative_qty,
+                target_filled=total_derivative_qty,
+                message=message,
+                success=success,
+            )
+        )
+        self.finished_with_result.emit(result)
 
 
 def parse_roll_qty(text: str, *, max_qty: Decimal) -> Decimal:

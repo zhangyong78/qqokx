@@ -44,24 +44,54 @@ def reconcile_fill(
     )
 
 
+def _derivative_base_per_contract(
+    *,
+    derivative_instrument: Instrument,
+    reference_price: Decimal | None = None,
+) -> Decimal:
+    ct_val = derivative_instrument.ct_val or Decimal("1")
+    if ct_val <= 0:
+        return Decimal("0")
+    multiplier = (
+        derivative_instrument.ct_mult
+        if derivative_instrument.ct_mult is not None and derivative_instrument.ct_mult > 0
+        else Decimal("1")
+    )
+    contract_value = ct_val * multiplier
+    payout_ccy = str(derivative_instrument.ct_val_ccy or "").strip().upper()
+    if payout_ccy in {"USD", "USDT", "USDC"}:
+        if reference_price is None or reference_price <= 0:
+            return contract_value
+        return contract_value / reference_price
+    return contract_value
+
+
 def spot_base_from_derivative_fill(
     *,
     derivative_filled_contracts: Decimal,
     derivative_instrument: Instrument,
+    reference_price: Decimal | None = None,
 ) -> Decimal:
-    ct_val = derivative_instrument.ct_val or Decimal("1")
-    return max(derivative_filled_contracts, Decimal("0")) * ct_val
+    base_per_contract = _derivative_base_per_contract(
+        derivative_instrument=derivative_instrument,
+        reference_price=reference_price,
+    )
+    return max(derivative_filled_contracts, Decimal("0")) * base_per_contract
 
 
 def derivative_contracts_from_spot_base(
     *,
     spot_base_qty: Decimal,
     derivative_instrument: Instrument,
+    reference_price: Decimal | None = None,
 ) -> Decimal:
-    ct_val = derivative_instrument.ct_val or Decimal("1")
-    if ct_val <= 0:
+    base_per_contract = _derivative_base_per_contract(
+        derivative_instrument=derivative_instrument,
+        reference_price=reference_price,
+    )
+    if base_per_contract <= 0:
         return Decimal("0")
-    raw = max(spot_base_qty, Decimal("0")) / ct_val
+    raw = max(spot_base_qty, Decimal("0")) / base_per_contract
     return snap_to_increment(raw, derivative_instrument.lot_size, "down")
 
 

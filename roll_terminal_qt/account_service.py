@@ -15,6 +15,7 @@ from okx_quant.okx_client import OkxPosition, OkxRestClient
 class FuturesPositionView:
     position_key: str
     inst_id: str
+    inst_type: str
     side: str
     available: Decimal
     contracts: Decimal
@@ -64,15 +65,23 @@ class AccountFeedThread(QThread):
         )
         if cached_payload is not None:
             _, cached_positions = cached_payload
-            futures = [item for item in cached_positions if item.inst_type.upper() == "FUTURES"]
-            if futures:
-                return [self._to_view(item) for item in futures]
-        rest_positions = self._client.get_positions(
-            self._runtime.credentials,
-            environment=self._runtime.environment,
-            inst_type="FUTURES",
-            prefer_cache=False,
-        )
+            derivatives = [item for item in cached_positions if item.inst_type.upper() in {"FUTURES", "SWAP"}]
+            if derivatives:
+                return [self._to_view(item) for item in derivatives]
+        rest_positions = [
+            *self._client.get_positions(
+                self._runtime.credentials,
+                environment=self._runtime.environment,
+                inst_type="FUTURES",
+                prefer_cache=False,
+            ),
+            *self._client.get_positions(
+                self._runtime.credentials,
+                environment=self._runtime.environment,
+                inst_type="SWAP",
+                prefer_cache=False,
+            ),
+        ]
         return [self._to_view(item) for item in rest_positions]
 
     def _build_status_text(self, position_count: int) -> str:
@@ -87,7 +96,7 @@ class AccountFeedThread(QThread):
         connected = "在线" if status.get("connected") else "未就绪"
         positions_version = int(status.get("positions_version") or 0)
         order_version = int(status.get("version") or 0)
-        return f"交割持仓 {position_count} 条 | 私有WS {connected} | 持仓v{positions_version} 订单v{order_version}"
+        return f"衍生品持仓 {position_count} 条 | 私有WS {connected} | 持仓v{positions_version} 订单v{order_version}"
 
     def _to_view(self, position: OkxPosition) -> FuturesPositionView:
         api_available = abs(position.avail_position or position.position)
@@ -136,6 +145,7 @@ class AccountFeedThread(QThread):
         return FuturesPositionView(
             position_key=_position_key(position.inst_id, side),
             inst_id=position.inst_id,
+            inst_type=str(position.inst_type or "").strip().upper() or "FUTURES",
             side=side,
             available=contracts,
             contracts=api_contracts,

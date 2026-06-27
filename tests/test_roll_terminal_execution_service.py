@@ -4,11 +4,120 @@ import unittest
 from decimal import Decimal
 from types import SimpleNamespace
 
+from okx_quant.arbitrage.fill_reconciler import derivative_contracts_from_spot_base, spot_base_from_derivative_fill
+from okx_quant.arbitrage.size_converter import preview_arbitrage_size
+from okx_quant.models import Instrument
 from okx_quant.okx_client import OkxFillHistoryItem, OkxTradeOrderItem
-from roll_terminal_qt.execution_service import RollExecutionThread
+from roll_terminal_qt.execution_service import ProfessionalCloseExecutionThread, RollExecutionThread
 
 
 class RollTerminalExecutionServiceTests(unittest.TestCase):
+    @staticmethod
+    def _inverse_btc_future() -> Instrument:
+        return Instrument(
+            inst_id="BTC-USD-260925",
+            inst_type="FUTURES",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            settle_ccy="BTC",
+            ct_val=Decimal("100"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="USD",
+        )
+
+    def test_compute_profit_spot_sell_qty_keeps_reserved_spot_and_snaps_down(self) -> None:
+        qty = ProfessionalCloseExecutionThread._compute_profit_spot_sell_qty(
+            available_base_qty=Decimal("1.33333333"),
+            reserved_spot_qty=Decimal("1"),
+            lot_size=Decimal("0.0001"),
+        )
+        self.assertEqual(qty, Decimal("0.3333"))
+
+    def test_compute_profit_spot_sell_qty_never_returns_negative(self) -> None:
+        qty = ProfessionalCloseExecutionThread._compute_profit_spot_sell_qty(
+            available_base_qty=Decimal("0.4"),
+            reserved_spot_qty=Decimal("0.5"),
+            lot_size=Decimal("0.0001"),
+        )
+        self.assertEqual(qty, Decimal("0"))
+
+    def test_inverse_contract_close_qty_uses_current_price(self) -> None:
+        qty = spot_base_from_derivative_fill(
+            derivative_filled_contracts=Decimal("800"),
+            derivative_instrument=self._inverse_btc_future(),
+            reference_price=Decimal("40000"),
+        )
+        self.assertEqual(qty, Decimal("2"))
+
+    def test_inverse_contracts_from_spot_base_uses_current_price(self) -> None:
+        qty = derivative_contracts_from_spot_base(
+            spot_base_qty=Decimal("2"),
+            derivative_instrument=self._inverse_btc_future(),
+            reference_price=Decimal("40000"),
+        )
+        self.assertEqual(qty, Decimal("800"))
+
+    def test_preview_arbitrage_size_converts_inverse_contracts_to_spot_base(self) -> None:
+        spot_instrument = Instrument(
+            inst_id="BTC-USDT",
+            inst_type="SPOT",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.00000001"),
+            min_size=Decimal("0.00000001"),
+            state="live",
+        )
+        preview = preview_arbitrage_size(
+            size=Decimal("800"),
+            unit="contracts",
+            spot_mid=Decimal("80000"),
+            spot_instrument=spot_instrument,
+            swap_instrument=self._inverse_btc_future(),
+        )
+        self.assertEqual(preview.spot_base_qty, Decimal("1"))
+        self.assertEqual(preview.swap_contracts, Decimal("800"))
+
+    def test_preview_arbitrage_size_supports_open_by_coin(self) -> None:
+        spot_instrument = Instrument(
+            inst_id="BTC-USDT",
+            inst_type="SPOT",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.00000001"),
+            min_size=Decimal("0.00000001"),
+            state="live",
+        )
+        preview = preview_arbitrage_size(
+            size=Decimal("1"),
+            unit="coin",
+            spot_mid=Decimal("80000"),
+            spot_instrument=spot_instrument,
+            swap_instrument=self._inverse_btc_future(),
+        )
+        self.assertEqual(preview.spot_base_qty, Decimal("1"))
+        self.assertEqual(preview.swap_contracts, Decimal("800"))
+        self.assertEqual(preview.notional_usdt, Decimal("80000"))
+
+    def test_preview_arbitrage_size_supports_open_by_usdt(self) -> None:
+        spot_instrument = Instrument(
+            inst_id="BTC-USDT",
+            inst_type="SPOT",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.00000001"),
+            min_size=Decimal("0.00000001"),
+            state="live",
+        )
+        preview = preview_arbitrage_size(
+            size=Decimal("100000"),
+            unit="usdt",
+            spot_mid=Decimal("80000"),
+            spot_instrument=spot_instrument,
+            swap_instrument=self._inverse_btc_future(),
+        )
+        self.assertEqual(preview.spot_base_qty, Decimal("1.25"))
+        self.assertEqual(preview.swap_contracts, Decimal("1000"))
+        self.assertEqual(preview.notional_usdt, Decimal("100000.00"))
+
     def test_load_recent_roll_fills_keeps_other_leg_when_only_one_leg_has_order_history(self) -> None:
         class FakeClient:
             def get_fills_history(self, *args, **kwargs):  # noqa: ANN002, ANN003

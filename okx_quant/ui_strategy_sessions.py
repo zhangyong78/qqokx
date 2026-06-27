@@ -1859,6 +1859,9 @@ class UiStrategySessionsMixin:
             open_anchor = latest_ledger.opened_at
         if open_anchor is None:
             return tuple(markers)
+        close_anchor = None
+        if trade is None and latest_ledger is not None and latest_ledger.closed_at is not None:
+            close_anchor = latest_ledger.closed_at
 
         inst_type = infer_inst_type(trade_inst_id)
         inst_types = (inst_type,) if inst_type else ("SWAP", "FUTURES", "OPTION", "SPOT")
@@ -1873,11 +1876,13 @@ class UiStrategySessionsMixin:
             return tuple(markers)
 
         lower_ms = int((open_anchor - timedelta(minutes=2)).timestamp() * 1000)
+        upper_ms = int((close_anchor + timedelta(minutes=2)).timestamp() * 1000) if close_anchor is not None else None
         relevant_fills = [
             item
             for item in fills
             if item.fill_time is not None
             and item.fill_time >= lower_ms
+            and (upper_ms is None or item.fill_time <= upper_ms)
             and item.inst_id.strip().upper() == trade_inst_id.strip().upper()
         ]
         if not relevant_fills:
@@ -1897,11 +1902,25 @@ class UiStrategySessionsMixin:
             for value in (latest_ledger.exit_order_id if latest_ledger is not None else "",)
             if str(value).strip()
         }
+        has_session_prefix_fill = any(
+            _strategy_live_chart_fill_session_role(item, session) is not None for item in relevant_fills
+        )
+        if has_session_prefix_fill:
+            session_owned_fills = [
+                item
+                for item in relevant_fills
+                if str(item.order_id or "").strip() in entry_order_ids
+                or str(item.order_id or "").strip() in close_order_ids
+                or _strategy_live_chart_fill_belongs_to_session(item, session)
+            ]
+            if session_owned_fills:
+                relevant_fills = session_owned_fills
 
         open_side = ""
         for fill in relevant_fills:
             order_id = str(fill.order_id or "").strip()
-            if order_id and order_id in entry_order_ids and fill.side:
+            fill_role = _strategy_live_chart_fill_session_role(fill, session)
+            if ((order_id and order_id in entry_order_ids) or fill_role == "ent") and fill.side:
                 open_side = str(fill.side).strip().lower()
                 break
         if not open_side:
@@ -1916,6 +1935,7 @@ class UiStrategySessionsMixin:
             if fill_time is None or not side:
                 continue
             order_id = str(fill.order_id or "").strip()
+            fill_role = _strategy_live_chart_fill_session_role(fill, session)
             dedupe_key = order_id or f"{fill_time}:{side}"
             if dedupe_key in seen_events:
                 continue
@@ -1936,7 +1956,7 @@ class UiStrategySessionsMixin:
                     )
                 )
                 continue
-            if order_id and order_id in close_order_ids:
+            if (order_id and order_id in close_order_ids) or fill_role in {"exi", "slg"}:
                 if close_marker_exists:
                     continue
                 markers.append(

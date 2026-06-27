@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -1938,6 +1938,138 @@ HTTP 502: <!DOCTYPE html>
         markers = QuantApp._strategy_live_chart_event_time_markers(app, session, "SOL-USDT-SWAP")
 
         self.assertEqual([marker.key for marker in markers], ["open:L01", "close:L01", "add:ent002", "reduce:red001"])
+
+    def test_strategy_live_chart_event_time_markers_ignore_unrelated_fills_after_closed_round(self) -> None:
+        opened_at = datetime(2026, 4, 28, 9, 0)
+        closed_at = datetime(2026, 4, 28, 10, 15)
+        app = QuantApp.__new__(QuantApp)
+        app._strategy_trade_ledger_records = [
+            StrategyTradeLedgerRecord(
+                record_id="L01",
+                history_record_id="H01",
+                session_id="S01",
+                api_name="moni",
+                strategy_id="ema_dynamic_order",
+                strategy_name="EMA dynamic",
+                symbol="SOL-USDT-SWAP",
+                direction_label="LONG_ONLY",
+                run_mode_label="TRADE",
+                environment="demo",
+                opened_at=opened_at,
+                closed_at=closed_at,
+                entry_order_id="ent001",
+                exit_order_id="exi001",
+            )
+        ]
+        app._credentials_for_profile_or_none = lambda profile_name: SimpleNamespace(profile_name=profile_name)
+        app.client = SimpleNamespace(
+            get_fills_history=lambda credentials, **kwargs: [
+                SimpleNamespace(
+                    fill_time=int(opened_at.timestamp() * 1000),
+                    inst_id="SOL-USDT-SWAP",
+                    side="buy",
+                    order_id="ent001",
+                    trade_id="t1",
+                ),
+                SimpleNamespace(
+                    fill_time=int(closed_at.timestamp() * 1000),
+                    inst_id="SOL-USDT-SWAP",
+                    side="sell",
+                    order_id="exi001",
+                    trade_id="t2",
+                ),
+                SimpleNamespace(
+                    fill_time=int((closed_at + timedelta(hours=23)).timestamp() * 1000),
+                    inst_id="SOL-USDT-SWAP",
+                    side="sell",
+                    order_id="external001",
+                    trade_id="t3",
+                ),
+            ]
+        )
+        session = SimpleNamespace(
+            session_id="S01",
+            history_record_id="H01",
+            api_name="moni",
+            active_trade=None,
+            config=SimpleNamespace(environment="demo"),
+        )
+
+        markers = QuantApp._strategy_live_chart_event_time_markers(app, session, "SOL-USDT-SWAP")
+
+        self.assertEqual([marker.key for marker in markers], ["open:L01", "close:L01"])
+
+    def test_strategy_live_chart_event_time_markers_ignore_other_session_fills_same_inst(self) -> None:
+        opened_at = datetime(2026, 4, 28, 9, 0)
+        closed_at = datetime(2026, 4, 28, 10, 15)
+        app = QuantApp.__new__(QuantApp)
+        app._strategy_trade_ledger_records = [
+            StrategyTradeLedgerRecord(
+                record_id="L01",
+                history_record_id="H01",
+                session_id="S01",
+                api_name="moni",
+                strategy_id="ema_dynamic_order",
+                strategy_name="EMA dynamic",
+                symbol="SOL-USDT-SWAP",
+                direction_label="LONG_ONLY",
+                run_mode_label="TRADE",
+                environment="demo",
+                opened_at=opened_at,
+                closed_at=closed_at,
+                entry_order_id="ent001",
+                exit_order_id="exi001",
+            )
+        ]
+        app._credentials_for_profile_or_none = lambda profile_name: SimpleNamespace(profile_name=profile_name)
+        session = SimpleNamespace(
+            session_id="S01",
+            history_record_id="H01",
+            api_name="moni",
+            strategy_id="ema_dynamic_order",
+            strategy_name="EMA dynamic",
+            active_trade=None,
+            config=SimpleNamespace(environment="demo"),
+        )
+        other_session = SimpleNamespace(
+            session_id="S02",
+            strategy_id="ema_dynamic_order",
+            strategy_name="EMA dynamic",
+        )
+        own_prefix = _session_order_prefixes(session)[0]
+        other_prefix = _session_order_prefixes(other_session)[0]
+        app.client = SimpleNamespace(
+            get_fills_history=lambda credentials, **kwargs: [
+                SimpleNamespace(
+                    fill_time=int(opened_at.timestamp() * 1000),
+                    inst_id="SOL-USDT-SWAP",
+                    side="buy",
+                    order_id="ent001",
+                    trade_id="t1",
+                    raw={"clOrdId": f"{own_prefix}ent042809000000001"},
+                ),
+                SimpleNamespace(
+                    fill_time=int((opened_at + timedelta(minutes=45)).timestamp() * 1000),
+                    inst_id="SOL-USDT-SWAP",
+                    side="sell",
+                    order_id="other001",
+                    trade_id="t2",
+                    raw={"clOrdId": f"{other_prefix}exi042809450000001"},
+                ),
+                SimpleNamespace(
+                    fill_time=int(closed_at.timestamp() * 1000),
+                    inst_id="SOL-USDT-SWAP",
+                    side="sell",
+                    order_id="exi001",
+                    trade_id="t3",
+                    raw={"clOrdId": f"{own_prefix}exi042810150000001"},
+                ),
+            ]
+        )
+
+        markers = QuantApp._strategy_live_chart_event_time_markers(app, session, "SOL-USDT-SWAP")
+
+        self.assertEqual([marker.key for marker in markers], ["open:L01", "close:L01"])
 
     def test_session_can_be_cleared_only_when_stopped_and_not_running(self) -> None:
         stopped = SimpleNamespace(status="\u5df2\u505c\u6b62", engine=SimpleNamespace(is_running=False))

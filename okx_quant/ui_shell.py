@@ -4230,9 +4230,6 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         menu_bar.add_cascade(label="设置", menu=settings_menu)
 
         tools_menu = Menu(menu_bar, tearoff=False)
-        tools_menu.add_command(label="打开无限下单", command=self.open_smart_order_window)
-        tools_menu.add_command(label="打开现货套利工作台", command=self.open_arbitrage_window)
-        tools_menu.add_command(label="打开现货套利极速版", command=self.open_arbitrage_fast_window)
         tools_menu.add_command(label="打开回测窗口", command=self.open_backtest_window)
         tools_menu.add_command(label="打开回测对比总览", command=self.open_backtest_compare_window)
         tools_menu.add_command(label="打开BTC行情分析", command=self.open_btc_market_analysis_window)
@@ -4240,15 +4237,24 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         tools_menu.add_command(label="打开BTC研究工作台", command=self.open_btc_research_workbench_window)
         tools_menu.add_command(label="打开信号复盘实验室", command=self.open_signal_replay_mock_window)
         tools_menu.add_command(label="打开行情日记", command=self.open_journal_window)
-        tools_menu.add_command(label="打开划线交易台", command=self.open_line_trading_desk_window)
         tools_menu.add_command(label="打开信号观察台", command=self.open_signal_monitor_window)
-        tools_menu.add_command(label="打开自动通道预览", command=self.open_auto_channel_preview_window)
         tools_menu.add_command(label="打开交易员管理台", command=self.open_trader_desk_window)
-        tools_menu.add_command(label="打开波动率监控", command=self.open_deribit_volatility_monitor_window)
-        tools_menu.add_command(label="打开Deribit波动率指数", command=self.open_deribit_volatility_window)
-        tools_menu.add_command(label="打开期权策略计算器", command=self.open_option_strategy_window)
-        tools_menu.add_command(label="打开运行日志目录", command=self._open_run_logs_directory)
         menu_bar.add_cascade(label="工具", menu=tools_menu)
+
+        history_menu = Menu(menu_bar, tearoff=False)
+        history_menu.add_command(label="打开无限下单", command=self.open_smart_order_window)
+        history_menu.add_command(label="打开现货套利工作台", command=self.open_arbitrage_window)
+        history_menu.add_command(label="打开现货套利极速版", command=self.open_arbitrage_fast_window)
+        history_menu.add_command(label="打开划线交易台", command=self.open_line_trading_desk_window)
+        history_menu.add_command(label="打开自动通道预览", command=self.open_auto_channel_preview_window)
+        menu_bar.add_cascade(label="QT", menu=history_menu)
+
+        volatility_menu = Menu(menu_bar, tearoff=False)
+        volatility_menu.add_command(label="打开波动率监控", command=self.open_deribit_volatility_monitor_window)
+        volatility_menu.add_command(label="打开Deribit波动率指数", command=self.open_deribit_volatility_window)
+        volatility_menu.add_command(label="打开期权策略计算器", command=self.open_option_strategy_window)
+        volatility_menu.add_command(label="打开运行日志目录", command=self._open_run_logs_directory)
+        menu_bar.add_cascade(label="波动率", menu=volatility_menu)
 
         system_menu = Menu(menu_bar, tearoff=False)
         system_menu.add_command(label=f"版本信息 (v{APP_VERSION})", command=self.show_version_info)
@@ -17337,9 +17343,34 @@ def _trade_order_program_owner_label(item: OkxTradeOrderItem) -> str | None:
 
 
 def _session_order_prefixes(session: StrategySession) -> tuple[str, ...]:
-    session_token = "".join(ch for ch in session.session_id.lower() if ch.isascii() and ch.isalnum())[:4] or "sess"
-    strategy_token = "".join(ch for ch in session.strategy_name.lower() if ch.isascii() and ch.isalnum())[:4] or "stg"
+    session_id = str(getattr(session, "session_id", "") or "")
+    strategy_name = str(getattr(session, "strategy_name", "") or getattr(session, "strategy_id", "") or "")
+    session_token = "".join(ch for ch in session_id.lower() if ch.isascii() and ch.isalnum())[:4] or "sess"
+    strategy_token = "".join(ch for ch in strategy_name.lower() if ch.isascii() and ch.isalnum())[:4] or "stg"
     return (f"{session_token}{strategy_token}",)
+
+
+def _strategy_live_chart_fill_session_role(item: OkxFillHistoryItem, session: StrategySession) -> str | None:
+    raw_value = getattr(item, "raw", None)
+    raw = raw_value if isinstance(raw_value, dict) else {}
+    prefixes = _session_order_prefixes(session)
+    candidates = [
+        str(raw.get("clOrdId") or "").strip().lower(),
+        str(raw.get("algoClOrdId") or "").strip().lower(),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        for prefix in prefixes:
+            if candidate.startswith(prefix):
+                role = candidate[len(prefix): len(prefix) + 3]
+                if role in {"ent", "exi", "slg"}:
+                    return role
+    return None
+
+
+def _strategy_live_chart_fill_belongs_to_session(item: OkxFillHistoryItem, session: StrategySession) -> bool:
+    return _strategy_live_chart_fill_session_role(item, session) is not None
 
 
 def _trade_order_session_role(item: OkxTradeOrderItem, session: StrategySession) -> str | None:

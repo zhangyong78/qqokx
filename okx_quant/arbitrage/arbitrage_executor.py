@@ -241,6 +241,12 @@ def _build_strategy_config(inst_id: str, runtime: ArbitrageTradeRuntime) -> Stra
     )
 
 
+def _market_reference_price(ticker: OkxTicker | None) -> Decimal | None:
+    if ticker is None:
+        return None
+    return mid_price(ticker.bid, ticker.ask) or ticker.last or ticker.mark or ticker.bid or ticker.ask
+
+
 def _roll_direction_fields(request: ArbitrageRollRequest, runtime: ArbitrageTradeRuntime) -> tuple[str, str, str | None]:
     side = str(request.current_position_side or "").strip().lower()
     if side not in {"long", "short"}:
@@ -1521,10 +1527,14 @@ class ArbitrageExecutor:
         for attempt in range(max(0, chase_limit) + 1):
             if remaining_derivative_qty < deriv_inst.min_size:
                 break
+            spot_reference_price = _market_reference_price(
+                self._preferred_ticker(spot_inst_id, environment=runtime.environment)
+            )
             planned_spot_qty = snap_to_increment(
                 spot_base_from_derivative_fill(
                     derivative_filled_contracts=remaining_derivative_qty,
                     derivative_instrument=deriv_inst,
+                    reference_price=spot_reference_price,
                 ),
                 spot_inst.lot_size,
                 "down",
@@ -1624,6 +1634,7 @@ class ArbitrageExecutor:
                     spot_base_from_derivative_fill(
                         derivative_filled_contracts=deriv_batch_filled,
                         derivative_instrument=deriv_inst,
+                        reference_price=spot_reference_price,
                     ),
                     spot_inst.lot_size,
                     "down",
@@ -1657,6 +1668,7 @@ class ArbitrageExecutor:
             extra_derivative_qty = derivative_contracts_from_spot_base(
                 spot_base_qty=residual_spot_qty,
                 derivative_instrument=deriv_inst,
+                reference_price=spot_reference_price,
             )
             if extra_derivative_qty > 0:
                 deriv_taker_filled, deriv_taker_avg = self._execute_taker_leg(
@@ -1673,6 +1685,7 @@ class ArbitrageExecutor:
                     spot_base_from_derivative_fill(
                         derivative_filled_contracts=deriv_taker_filled,
                         derivative_instrument=deriv_inst,
+                        reference_price=spot_reference_price,
                     ),
                     spot_inst.lot_size,
                     "down",
@@ -1751,6 +1764,9 @@ class ArbitrageExecutor:
         for attempt in range(max(0, request.chase_limit) + 1):
             if remaining_derivative_qty < deriv_inst.min_size:
                 break
+            spot_reference_price = _market_reference_price(
+                self._preferred_ticker(request.spot_inst_id, environment=runtime.environment)
+            )
             if maker_leg == "derivative":
                 maker_inst_id = request.derivative_inst_id
                 maker_config = deriv_config
@@ -1770,6 +1786,7 @@ class ArbitrageExecutor:
                     spot_base_from_derivative_fill(
                         derivative_filled_contracts=remaining_derivative_qty,
                         derivative_instrument=deriv_inst,
+                        reference_price=spot_reference_price,
                     ),
                     spot_inst.lot_size,
                     "down",
@@ -1817,6 +1834,7 @@ class ArbitrageExecutor:
                     spot_base_from_derivative_fill(
                         derivative_filled_contracts=maker_filled,
                         derivative_instrument=deriv_inst,
+                        reference_price=spot_reference_price,
                     ),
                     spot_inst.lot_size,
                     "down",
@@ -1844,6 +1862,7 @@ class ArbitrageExecutor:
                 hedge_derivative_qty = derivative_contracts_from_spot_base(
                     spot_base_qty=residual_spot_qty,
                     derivative_instrument=deriv_inst,
+                    reference_price=spot_reference_price,
                 )
                 if hedge_derivative_qty <= 0:
                     if attempt >= request.chase_limit:
@@ -1862,6 +1881,7 @@ class ArbitrageExecutor:
                     spot_base_from_derivative_fill(
                         derivative_filled_contracts=deriv_filled_once,
                         derivative_instrument=deriv_inst,
+                        reference_price=spot_reference_price,
                     ),
                     spot_inst.lot_size,
                     "down",
@@ -1904,6 +1924,9 @@ class ArbitrageExecutor:
         for attempt in range(max(0, request.chase_limit) + 1):
             if remaining_derivative_qty < deriv_inst.min_size:
                 break
+            spot_reference_price = _market_reference_price(
+                self._preferred_ticker(entry.spot_inst_id, environment=runtime.environment)
+            )
             if maker_leg == "derivative":
                 maker_inst_id = entry.derivative_inst_id
                 maker_config = deriv_config
@@ -1923,6 +1946,7 @@ class ArbitrageExecutor:
                     spot_base_from_derivative_fill(
                         derivative_filled_contracts=remaining_derivative_qty,
                         derivative_instrument=deriv_inst,
+                        reference_price=spot_reference_price,
                     ),
                     spot_inst.lot_size,
                     "down",
@@ -1970,6 +1994,7 @@ class ArbitrageExecutor:
                     spot_base_from_derivative_fill(
                         derivative_filled_contracts=maker_filled,
                         derivative_instrument=deriv_inst,
+                        reference_price=spot_reference_price,
                     ),
                     spot_inst.lot_size,
                     "down",
@@ -1997,6 +2022,7 @@ class ArbitrageExecutor:
                 hedge_derivative_qty = derivative_contracts_from_spot_base(
                     spot_base_qty=residual_spot_qty,
                     derivative_instrument=deriv_inst,
+                    reference_price=spot_reference_price,
                 )
                 if hedge_derivative_qty <= 0:
                     if attempt >= request.chase_limit:
@@ -2016,6 +2042,7 @@ class ArbitrageExecutor:
                     spot_base_from_derivative_fill(
                         derivative_filled_contracts=deriv_filled_once,
                         derivative_instrument=deriv_inst,
+                        reference_price=spot_reference_price,
                     ),
                     spot_inst.lot_size,
                     "down",
@@ -2258,6 +2285,7 @@ class ArbitrageExecutor:
                 adjusted_contracts = derivative_contracts_from_spot_base(
                     spot_base_qty=spot_reconciled.filled_size,
                     derivative_instrument=deriv_inst,
+                    reference_price=spot_avg or _market_reference_price(spot_ticker) or spot_price,
                 )
                 deriv_result = self._client.place_simple_order(
                     credentials,
@@ -2422,6 +2450,7 @@ class ArbitrageExecutor:
             spot_base_from_derivative_fill(
                 derivative_filled_contracts=planned_derivative_qty,
                 derivative_instrument=deriv_inst,
+                reference_price=_market_reference_price(spot_ticker),
             ),
             spot_inst.lot_size,
             "down",
@@ -2470,6 +2499,7 @@ class ArbitrageExecutor:
                 spot_base_from_derivative_fill(
                     derivative_filled_contracts=deriv_reconciled.filled_size,
                     derivative_instrument=deriv_inst,
+                    reference_price=spot_avg or _market_reference_price(spot_ticker) or spot_price,
                 ),
                 spot_inst.lot_size,
                 "down",
@@ -2497,6 +2527,7 @@ class ArbitrageExecutor:
                 spot_base_from_derivative_fill(
                     derivative_filled_contracts=deriv_reconciled.filled_size,
                     derivative_instrument=deriv_inst,
+                    reference_price=spot_avg or _market_reference_price(spot_ticker) or spot_price,
                 ),
                 spot_inst.lot_size,
                 "down",
@@ -2543,6 +2574,7 @@ class ArbitrageExecutor:
                 spot_base_from_derivative_fill(
                     derivative_filled_contracts=deriv_reconciled.filled_size,
                     derivative_instrument=deriv_inst,
+                    reference_price=spot_avg or _market_reference_price(spot_ticker) or spot_price,
                 ),
                 spot_inst.lot_size,
                 "down",
