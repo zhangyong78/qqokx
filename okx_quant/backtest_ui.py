@@ -265,6 +265,7 @@ class BacktestLaunchState:
     trend_ema_close_exit_after_trigger_r_enabled: bool = False
     trend_ema_close_exit_after_trigger_r: str = "5"
     hold_close_exit_bars: str = "0"
+    trend_ema_slope_filter_enabled: bool = True
     trend_ema_slope_filter_min_ratio: str = "0"
     atr_percentile_filter_max: str = "0"
     body_retest_breakdown_atr_multiplier: str = "0.2"
@@ -2079,6 +2080,7 @@ class BacktestWindow:
             value=initial_state.trend_ema_close_exit_after_trigger_r
         )
         self.hold_close_exit_bars = StringVar(value=initial_state.hold_close_exit_bars)
+        self.trend_ema_slope_filter_enabled = BooleanVar(value=initial_state.trend_ema_slope_filter_enabled)
         self.trend_ema_slope_filter_min_ratio = StringVar(value=initial_state.trend_ema_slope_filter_min_ratio)
         self.atr_percentile_filter_max = StringVar(value=initial_state.atr_percentile_filter_max)
         self.body_retest_breakdown_atr_multiplier = StringVar(value=initial_state.body_retest_breakdown_atr_multiplier)
@@ -2517,6 +2519,7 @@ class BacktestWindow:
             "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
             "trend_ema_close_exit_after_trigger_r_enabled": self.trend_ema_close_exit_after_trigger_r_enabled,
             "trend_ema_close_exit_after_trigger_r": self.trend_ema_close_exit_after_trigger_r,
+            "trend_ema_slope_filter_enabled": self.trend_ema_slope_filter_enabled,
             "trend_ema_slope_filter_min_ratio": self.trend_ema_slope_filter_min_ratio,
             "atr_percentile_filter_max": self.atr_percentile_filter_max,
             "body_retest_breakdown_atr_multiplier": self.body_retest_breakdown_atr_multiplier,
@@ -3128,7 +3131,16 @@ class BacktestWindow:
         self.btc_pullback_max_index_entry.grid(row=row, column=3, sticky="ew", pady=(8, 0))
 
         row = 0
-        self.slope_threshold_caption = ttk.Label(advanced_section, text="开空斜率阈值(负数)")
+        self.trend_slope_filter_enabled_check = ttk.Checkbutton(
+            advanced_section,
+            text="启用趋势线斜率过滤",
+            variable=self.trend_ema_slope_filter_enabled,
+            command=self._sync_trend_slope_filter_controls,
+        )
+        self.trend_slope_filter_enabled_check.grid(row=row, column=0, columnspan=4, sticky="w")
+
+        row += 1
+        self.slope_threshold_caption = ttk.Label(advanced_section, text="趋势线斜率阈值")
         self.slope_threshold_caption.grid(row=row, column=0, sticky="w")
         self.slope_threshold_entry = ttk.Entry(advanced_section, textvariable=self.trend_ema_slope_filter_min_ratio)
         self.slope_threshold_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8))
@@ -3140,7 +3152,7 @@ class BacktestWindow:
         row += 1
         self.slope_threshold_hint = ttk.Label(
             advanced_section,
-            text="填 0 表示只要均线斜率转负就开空；例如填 -0.0005 表示需要更陡的负斜率才开空。",
+            text="按最近 5 根趋势线回归斜率 / 当前趋势线值得出；填 0 表示斜率一转负就拦截，填 -0.0005 表示允许轻微下拐。",
             foreground="#57606a",
         )
         self.slope_threshold_hint.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -5158,6 +5170,7 @@ class BacktestWindow:
         dynamic_two_r_break_even = False
         dynamic_fee_offset_enabled = False
         dynamic_protection_rules: tuple[DynamicProtectionRule, ...] = ()
+        trend_ema_slope_filter_enabled = True
         trend_ema_slope_filter_min_ratio = Decimal("0")
         atr_percentile_filter_max = Decimal("0")
         body_retest_breakdown_atr_multiplier = Decimal("0.2")
@@ -5193,13 +5206,15 @@ class BacktestWindow:
                 self.entry_reference_ema_period.get(),
                 strategy_entry_reference_period_caption(definition.strategy_id),
             )
+        if strategy_uses_parameter(definition.strategy_id, "trend_ema_slope_filter_enabled"):
+            trend_ema_slope_filter_enabled = bool(self.trend_ema_slope_filter_enabled.get())
         if strategy_uses_parameter(definition.strategy_id, "trend_ema_slope_filter_min_ratio"):
             trend_ema_slope_filter_min_ratio = self._parse_decimal(
                 self.trend_ema_slope_filter_min_ratio.get(),
-                "开空斜率阈值",
+                "趋势线斜率阈值",
             )
             if trend_ema_slope_filter_min_ratio > 0:
-                raise ValueError("开空斜率阈值必须小于或等于 0")
+                raise ValueError("趋势线斜率阈值必须小于或等于 0")
         if strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
             ema55_slope_negative_entry_bars = self._parse_positive_int(
                 self.ema55_slope_negative_entry_bars.get(),
@@ -5495,6 +5510,7 @@ class BacktestWindow:
             dynamic_two_r_break_even=dynamic_two_r_break_even,
             dynamic_break_even_trigger_r=dynamic_break_even_trigger_r,
             dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+            trend_ema_slope_filter_enabled=trend_ema_slope_filter_enabled,
             dynamic_protection_rules=dynamic_protection_rules,
             ema55_slope_exit_enabled=ema55_slope_exit_enabled,
             ema55_slope_lock_profit_enabled=ema55_slope_lock_profit_enabled,
@@ -5589,6 +5605,13 @@ class BacktestWindow:
             )
             for widget in entry_reference_widgets:
                 if visibility.show_entry_reference:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            show_slope_filter_toggle = strategy_uses_parameter(strategy_id, "trend_ema_slope_filter_enabled")
+            slope_filter_toggle_widgets = (self.trend_slope_filter_enabled_check,)
+            for widget in slope_filter_toggle_widgets:
+                if show_slope_filter_toggle:
                     widget.grid()
                 else:
                     widget.grid_remove()
@@ -5830,6 +5853,14 @@ class BacktestWindow:
                 self.entry_reference_ema_type_combo,
                 editable=strategy_is_parameter_editable(strategy_id, "entry_reference_ema_type", "backtest"),
             )
+            if hasattr(self, "trend_slope_filter_enabled_check"):
+                self.trend_slope_filter_enabled_check.configure(
+                    state=(
+                        "normal"
+                        if strategy_is_parameter_editable(strategy_id, "trend_ema_slope_filter_enabled", "backtest")
+                        else "disabled"
+                    )
+                )
             self._set_field_state(
                 self.slope_threshold_entry,
                 editable=strategy_is_parameter_editable(strategy_id, "trend_ema_slope_filter_min_ratio", "backtest"),
@@ -5913,6 +5944,7 @@ class BacktestWindow:
         self._sync_btc_pullback_exit_mode_controls()
         self._sync_ema55_slope_exit_condition_controls()
         self._sync_daily_filter_controls()
+        self._sync_trend_slope_filter_controls()
         self._refresh_profile_summary_text()
         self._update_sizing_mode_widgets()
         if self._latest_result is None:
@@ -5954,6 +5986,8 @@ class BacktestWindow:
         self._sync_dynamic_take_profit_controls()
         self._sync_ema55_slope_exit_condition_controls()
         self._sync_daily_filter_controls()
+        if hasattr(self, "_sync_trend_slope_filter_controls"):
+            self._sync_trend_slope_filter_controls()
         self._refresh_profile_summary_text()
 
     def _sync_dynamic_take_profit_controls(self) -> None:
@@ -6106,6 +6140,18 @@ class BacktestWindow:
         self._set_field_state(self.daily_filter_ma_combo, editable=ma_active)
         self._set_field_state(self.daily_filter_period_entry, editable=ma_active)
 
+    def _sync_trend_slope_filter_controls(self) -> None:
+        if not hasattr(self, "slope_threshold_entry"):
+            return
+        definition = self._selected_strategy_definition()
+        enabled_supported = strategy_uses_parameter(definition.strategy_id, "trend_ema_slope_filter_enabled")
+        threshold_supported = strategy_uses_parameter(definition.strategy_id, "trend_ema_slope_filter_min_ratio")
+        filter_enabled = (not enabled_supported) or bool(self.trend_ema_slope_filter_enabled.get())
+        editable = threshold_supported and filter_enabled
+        self.slope_threshold_caption.configure(state="normal" if editable else "disabled")
+        self._set_field_state(self.slope_threshold_entry, editable=editable)
+        self.slope_threshold_hint.configure(state="normal" if filter_enabled and threshold_supported else "disabled")
+
     def clear_backtest_profile_origin(self) -> None:
         self.backtest_profile_id.set("")
         self.backtest_profile_name.set("")
@@ -6226,6 +6272,7 @@ class BacktestWindow:
         )
         self.trend_ema_close_exit_after_trigger_r.set(str(config.resolved_trend_ema_close_exit_after_trigger_r()))
         self.hold_close_exit_bars.set(str(config.hold_close_exit_bars))
+        self.trend_ema_slope_filter_enabled.set(bool(config.trend_ema_slope_filter_enabled))
         self.trend_ema_slope_filter_min_ratio.set(format_decimal(config.trend_ema_slope_filter_min_ratio))
         self.atr_percentile_filter_max.set(format_decimal(config.atr_percentile_filter_max))
         self.body_retest_breakdown_atr_multiplier.set(format_decimal(config.body_retest_breakdown_atr_multiplier))

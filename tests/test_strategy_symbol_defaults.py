@@ -51,6 +51,7 @@ class StrategySymbolDefaultsTest(TestCase):
             ),
         )
         self.assertNotIn("startup_chase_window_seconds", defaults)
+        self.assertFalse(defaults["trend_ema_slope_filter_enabled"])
 
     def test_dynamic_long_eth_defaults_follow_final_profile(self) -> None:
         defaults = get_strategy_symbol_parameter_defaults(
@@ -68,6 +69,7 @@ class StrategySymbolDefaultsTest(TestCase):
         self.assertEqual(defaults["ema55_slope_lock_profit_trigger_r"], 4)
         self.assertEqual(defaults["dynamic_first_lock_r"], 1)
         self.assertEqual(defaults["max_entries_per_trend"], 3)
+        self.assertTrue(defaults["trend_ema_slope_filter_enabled"])
         self.assertEqual(
             defaults["dynamic_protection_rules"],
             (
@@ -114,6 +116,7 @@ class StrategySymbolDefaultsTest(TestCase):
         self.assertEqual(defaults["ema55_slope_lock_profit_trigger_r"], 5)
         self.assertEqual(defaults["dynamic_first_lock_r"], 1)
         self.assertEqual(defaults["max_entries_per_trend"], 2)
+        self.assertFalse(defaults["trend_ema_slope_filter_enabled"])
         self.assertEqual(
             defaults["dynamic_protection_rules"],
             (
@@ -160,6 +163,7 @@ class StrategySymbolDefaultsTest(TestCase):
         self.assertEqual(defaults["ema55_slope_lock_profit_trigger_r"], 6)
         self.assertEqual(defaults["dynamic_first_lock_r"], 1)
         self.assertEqual(defaults["max_entries_per_trend"], 2)
+        self.assertTrue(defaults["trend_ema_slope_filter_enabled"])
         self.assertEqual(
             defaults["dynamic_protection_rules"],
             (

@@ -1664,10 +1664,19 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             payload.get("ema55_slope_exit_enabled"),
             bool(_strategy_config_default("ema55_slope_exit_enabled")),
         ),
+        ema55_slope_lock_profit_enabled=_coerce_snapshot_bool(
+            payload.get("ema55_slope_lock_profit_enabled"),
+            bool(_strategy_config_default("ema55_slope_lock_profit_enabled")),
+        ),
         ema55_slope_lock_profit_trigger_r=_coerce_snapshot_int(
             payload.get("ema55_slope_lock_profit_trigger_r"),
             int(_strategy_config_default("ema55_slope_lock_profit_trigger_r")),
             minimum=2,
+        ),
+        ema55_slope_negative_entry_bars=_coerce_snapshot_int(
+            payload.get("ema55_slope_negative_entry_bars"),
+            int(_strategy_config_default("ema55_slope_negative_entry_bars")),
+            minimum=1,
         ),
         dynamic_first_lock_r=_coerce_snapshot_int(
             payload.get("dynamic_first_lock_r"),
@@ -3645,6 +3654,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.daily_filter_scope_label = StringVar(value=DAILY_FILTER_SCOPE_VALUE_TO_LABEL["both"])
         self.daily_filter_ma_type = StringVar(value="EMA")
         self.daily_filter_period = StringVar(value="5")
+        self.trend_ema_slope_filter_enabled = BooleanVar(value=True)
         self.trend_ema_slope_filter_min_ratio = StringVar(value="0")
         self.atr_percentile_filter_max = StringVar(value="0")
         self.body_retest_breakdown_atr_multiplier = StringVar(value="0.2")
@@ -3675,9 +3685,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.startup_chase_current_signal = BooleanVar(value=False)
         self.startup_chase_window_seconds = StringVar(value="0")
         self.ema55_slope_exit_enabled = BooleanVar(value=True)
+        self.ema55_slope_lock_profit_enabled = BooleanVar(value=False)
         self.dynamic_two_r_break_even = BooleanVar(value=True)
         self.dynamic_break_even_trigger_r = StringVar(value="2")
         self.ema55_slope_lock_profit_trigger_r = StringVar(value="5")
+        self.ema55_slope_negative_entry_bars = StringVar(value="1")
         self.dynamic_first_lock_r = StringVar(value="0")
         self.dynamic_trailing_step_r = StringVar(value="1")
         self.dynamic_protection_rules_json = StringVar(value="")
@@ -3722,6 +3734,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.daily_filter_scope_label.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.daily_filter_ma_type.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.daily_filter_period.trace_add("write", self._schedule_minimum_order_risk_hint_update)
+        self.trend_ema_slope_filter_enabled.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.trend_ema_slope_filter_min_ratio.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.atr_percentile_filter_max.trace_add("write", self._schedule_minimum_order_risk_hint_update)
         self.body_retest_breakdown_atr_multiplier.trace_add("write", self._schedule_minimum_order_risk_hint_update)
@@ -3761,6 +3774,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.daily_filter_scope_label.trace_add("write", self._update_trend_parameter_hint)
         self.daily_filter_ma_type.trace_add("write", self._update_trend_parameter_hint)
         self.daily_filter_period.trace_add("write", self._update_trend_parameter_hint)
+        self.trend_ema_slope_filter_enabled.trace_add("write", self._update_trend_parameter_hint)
+        self.trend_ema_slope_filter_enabled.trace_add("write", lambda *_: self._sync_trend_slope_filter_controls())
+        self.trend_ema_slope_filter_min_ratio.trace_add("write", self._update_trend_parameter_hint)
+        self.ema55_slope_lock_profit_enabled.trace_add(
+            "write",
+            lambda *_: self._sync_btc_ema55_slope_short_controls(),
+        )
         self.dynamic_two_r_break_even.trace_add("write", self._update_dynamic_protection_hint)
         self.dynamic_break_even_trigger_r.trace_add("write", self._update_dynamic_protection_hint)
         self.ema55_slope_lock_profit_trigger_r.trace_add("write", self._update_dynamic_protection_hint)
@@ -4093,6 +4113,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "daily_filter_scope": self.daily_filter_scope_label,
             "daily_filter_ma_type": self.daily_filter_ma_type,
             "daily_filter_period": self.daily_filter_period,
+            "trend_ema_slope_filter_enabled": self.trend_ema_slope_filter_enabled,
             "trend_ema_slope_filter_min_ratio": self.trend_ema_slope_filter_min_ratio,
             "atr_percentile_filter_max": self.atr_percentile_filter_max,
             "body_retest_breakdown_atr_multiplier": self.body_retest_breakdown_atr_multiplier,
@@ -4107,11 +4128,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "reentry_confirmation_ma_type": getattr(self, "reentry_confirmation_ma_type", None),
             "reentry_confirmation_ma_period": getattr(self, "reentry_confirmation_ma_period", None),
             "ema55_slope_exit_enabled": self.ema55_slope_exit_enabled,
+            "ema55_slope_lock_profit_enabled": self.ema55_slope_lock_profit_enabled,
             "dynamic_two_r_break_even": self.dynamic_two_r_break_even,
             "dynamic_break_even_trigger_r": self.dynamic_break_even_trigger_r,
             "ema55_slope_lock_profit_trigger_r": self.ema55_slope_lock_profit_trigger_r,
             "dynamic_first_lock_r": self.dynamic_first_lock_r,
             "dynamic_trailing_step_r": self.dynamic_trailing_step_r,
+            "ema55_slope_negative_entry_bars": self.ema55_slope_negative_entry_bars,
             "dynamic_protection_rules": self.dynamic_protection_rules_json,
             "dynamic_fee_offset_enabled": self.dynamic_fee_offset_enabled,
             "time_stop_break_even_enabled": self.time_stop_break_even_enabled,
@@ -4256,9 +4279,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         volatility_menu.add_command(label="打开运行日志目录", command=self._open_run_logs_directory)
         menu_bar.add_cascade(label="波动率", menu=volatility_menu)
 
+        run_logs_menu_label = volatility_menu.entrycget(3, "label")
+        volatility_menu.delete(3)
+
         system_menu = Menu(menu_bar, tearoff=False)
         system_menu.add_command(label=f"版本信息 (v{APP_VERSION})", command=self.show_version_info)
         system_menu.add_command(label="程序升级", command=self.upgrade_program)
+        system_menu.add_command(label=run_logs_menu_label, command=self._open_run_logs_directory)
         system_menu.add_separator()
         system_menu.add_command(label="退出", command=self._on_close)
         menu_bar.add_cascade(label="系统", menu=system_menu)
@@ -4772,6 +4799,30 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._ema55_slope_exit_enabled_check.grid(row=row, column=1, columnspan=3, sticky="w", pady=_lp)
 
         row += 1
+        self._ema55_slope_negative_entry_bars_label = ttk.Label(launch_form, text="连续负斜率根数")
+        self._ema55_slope_negative_entry_bars_label.grid(row=row, column=0, sticky="w", pady=_lp)
+        self._ema55_slope_negative_entry_bars_entry = ttk.Entry(
+            launch_form,
+            textvariable=self.ema55_slope_negative_entry_bars,
+        )
+        self._ema55_slope_negative_entry_bars_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        self._ema55_slope_negative_entry_bars_hint_label = ttk.Label(
+            launch_form,
+            text="BTC 斜率做空专用。1=当前 K 线斜率转负即可开空；2/3=要求连续负斜率确认。",
+            foreground="#57606a",
+        )
+        self._ema55_slope_negative_entry_bars_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=_lp)
+
+        row += 1
+        self._ema55_slope_lock_profit_enabled_check = ttk.Checkbutton(
+            launch_form,
+            text="启用 N R 锁盈利 + 双向手续费",
+            variable=self.ema55_slope_lock_profit_enabled,
+            command=self._sync_btc_ema55_slope_short_controls,
+        )
+        self._ema55_slope_lock_profit_enabled_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=_lp)
+
+        row += 1
         self._dynamic_two_r_break_even_check = ttk.Checkbutton(
             launch_form,
             text="启用保本（达到保本触发R时先移到保本位）",
@@ -4815,6 +4866,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self._dynamic_two_r_break_even_check,
             self._dynamic_break_even_trigger_r_label,
             self._dynamic_break_even_trigger_r_entry,
+            self._ema55_slope_negative_entry_bars_label,
+            self._ema55_slope_negative_entry_bars_entry,
+            self._ema55_slope_negative_entry_bars_hint_label,
+            self._ema55_slope_lock_profit_enabled_check,
             self._ema55_slope_lock_profit_trigger_r_label,
             self._ema55_slope_lock_profit_trigger_r_entry,
             self._dynamic_first_lock_r_label,
@@ -4977,13 +5032,22 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._entry_reference_ema_entry.grid(row=0, column=1, sticky="ew")
 
         row += 1
-        self._slope_threshold_label = ttk.Label(launch_form, text="开空斜率阈值")
+        self._trend_slope_filter_enabled_check = ttk.Checkbutton(
+            launch_form,
+            text="启用趋势线斜率过滤",
+            variable=self.trend_ema_slope_filter_enabled,
+            command=self._sync_trend_slope_filter_controls,
+        )
+        self._trend_slope_filter_enabled_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=_lp)
+
+        row += 1
+        self._slope_threshold_label = ttk.Label(launch_form, text="趋势线斜率阈值")
         self._slope_threshold_label.grid(row=row, column=0, sticky="w", pady=_lp)
         self._slope_threshold_entry = ttk.Entry(launch_form, textvariable=self.trend_ema_slope_filter_min_ratio)
         self._slope_threshold_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
         self._slope_threshold_hint_label = ttk.Label(
             launch_form,
-            text="按单根均线斜率 / 当前均线值计算；填负数，越小越严格，例如 -0.0005。",
+            text="按最近 5 根趋势线回归斜率 / 当前趋势线值得出；填 0 表示斜率一转负就拦截，填 -0.0005 表示允许轻微下拐。",
         )
         self._slope_threshold_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", pady=_lp)
 
@@ -9800,9 +9864,14 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 "should_estimate": False,
             }
         try:
+            trend_ema_slope_filter_enabled = (
+                bool(self.trend_ema_slope_filter_enabled.get())
+                if strategy_uses_parameter(definition.strategy_id, "trend_ema_slope_filter_enabled")
+                else True
+            )
             trend_ema_slope_filter_min_ratio = Decimal(str(self.trend_ema_slope_filter_min_ratio.get()).strip() or "0")
             if trend_ema_slope_filter_min_ratio > 0:
-                raise ValueError("开空斜率阈值必须小于或等于 0")
+                raise ValueError("趋势线斜率阈值必须小于或等于 0")
             atr_percentile_filter_max = Decimal(str(self.atr_percentile_filter_max.get()).strip() or "0")
             body_retest_breakdown_atr_multiplier = Decimal(
                 str(self.body_retest_breakdown_atr_multiplier.get()).strip() or "0.2"
@@ -9917,6 +9986,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 dynamic_trailing_step_r=dynamic_trailing_step_r,
                 dynamic_protection_rules=dynamic_protection_rules,
                 dynamic_fee_offset_enabled=bool(self.dynamic_fee_offset_enabled.get()),
+                trend_ema_slope_filter_enabled=trend_ema_slope_filter_enabled,
                 trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
                 atr_percentile_filter_max=atr_percentile_filter_max,
                 body_retest_breakdown_atr_multiplier=body_retest_breakdown_atr_multiplier,

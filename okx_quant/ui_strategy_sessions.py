@@ -144,6 +144,7 @@ class UiStrategySessionsMixin:
             self.reentry_confirmation_min_sequence.set(str(record.config.reentry_confirmation_min_sequence))
             self.reentry_confirmation_ma_type.set(str(record.config.resolved_reentry_confirmation_ma_type()).upper())
             self.reentry_confirmation_ma_period.set(str(record.config.reentry_confirmation_ma_period))
+        self.trend_ema_slope_filter_enabled.set(bool(record.config.trend_ema_slope_filter_enabled))
         self.trend_ema_slope_filter_min_ratio.set(_format_entry_decimal(record.config.trend_ema_slope_filter_min_ratio))
         self.atr_percentile_filter_max.set(_format_entry_decimal(record.config.atr_percentile_filter_max))
         self.body_retest_breakdown_atr_multiplier.set(
@@ -184,9 +185,11 @@ class UiStrategySessionsMixin:
         self.daily_filter_ma_type.set(str(record.config.daily_filter_ma_type).upper())
         self.daily_filter_period.set(str(record.config.daily_filter_period))
         self.ema55_slope_exit_enabled.set(bool(record.config.ema55_slope_exit_enabled))
+        self.ema55_slope_lock_profit_enabled.set(bool(record.config.ema55_slope_lock_profit_enabled))
         self.dynamic_two_r_break_even.set(record.config.dynamic_two_r_break_even)
         self.dynamic_break_even_trigger_r.set(str(max(int(record.config.dynamic_break_even_trigger_r), 1)))
         self.ema55_slope_lock_profit_trigger_r.set(str(max(int(record.config.ema55_slope_lock_profit_trigger_r), 2)))
+        self.ema55_slope_negative_entry_bars.set(str(max(int(record.config.ema55_slope_negative_entry_bars), 1)))
         self.dynamic_first_lock_r.set(str(max(int(record.config.dynamic_first_lock_r), 0)))
         self.dynamic_trailing_step_r.set(str(max(int(record.config.dynamic_trailing_step_r), 1)))
         self.dynamic_protection_rules_json.set(
@@ -222,6 +225,8 @@ class UiStrategySessionsMixin:
             self.entry_side_mode_label.set("跟随信号")
         self._apply_strategy_parameter_fixed_values(definition.strategy_id, definition=definition)
         self._sync_dynamic_take_profit_controls()
+        if hasattr(self, "_sync_btc_ema55_slope_short_controls"):
+            self._sync_btc_ema55_slope_short_controls()
         QuantApp._sync_daily_filter_controls(self)
         QuantApp._sync_entry_side_mode_controls(self)
         return definition, resolved_api_name, api_note
@@ -4561,14 +4566,23 @@ class UiStrategySessionsMixin:
                 widget.grid()
             else:
                 widget.grid_remove()
+        show_btc_slope_short_widgets = strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID
+        for widget in (
+            self._ema55_slope_negative_entry_bars_label,
+            self._ema55_slope_negative_entry_bars_entry,
+            self._ema55_slope_negative_entry_bars_hint_label,
+            self._ema55_slope_lock_profit_enabled_check,
+        ):
+            if show_btc_slope_short_widgets:
+                widget.grid()
+            else:
+                widget.grid_remove()
         if visibility.show_dynamic_take_profit:
             self._take_profit_mode_label.grid()
             self._take_profit_mode_combo.grid()
             self._max_entries_per_trend_label.grid()
             self._max_entries_per_trend_entry.grid()
             self._dynamic_two_r_break_even_check.grid()
-            self._ema55_slope_lock_profit_trigger_r_label.grid()
-            self._ema55_slope_lock_profit_trigger_r_entry.grid()
             self._dynamic_first_lock_r_label.grid()
             self._dynamic_first_lock_r_entry.grid()
             self._dynamic_fee_offset_check.grid()
@@ -4605,6 +4619,15 @@ class UiStrategySessionsMixin:
             self._trend_ema_close_exit_after_trigger_r_label.grid_remove()
             self._trend_ema_close_exit_after_trigger_r_entry.grid_remove()
             self._trend_ema_close_exit_after_trigger_r_hint_label.grid_remove()
+        show_lock_profit_trigger_widgets = visibility.show_dynamic_take_profit or show_btc_slope_short_widgets
+        for widget in (
+            self._ema55_slope_lock_profit_trigger_r_label,
+            self._ema55_slope_lock_profit_trigger_r_entry,
+        ):
+            if show_lock_profit_trigger_widgets:
+                widget.grid()
+            else:
+                widget.grid_remove()
         reentry_widgets = (
             self._reentry_confirmation_enabled_check,
             self._reentry_confirmation_min_sequence_label,
@@ -4631,6 +4654,13 @@ class UiStrategySessionsMixin:
         else:
             self._entry_reference_ema_label.grid_remove()
             self._entry_reference_ema_entry.grid_remove()
+        show_slope_filter_toggle = strategy_uses_parameter(strategy_id, "trend_ema_slope_filter_enabled")
+        slope_filter_widgets = (self._trend_slope_filter_enabled_check,)
+        for widget in slope_filter_widgets:
+            if show_slope_filter_toggle:
+                widget.grid()
+            else:
+                widget.grid_remove()
         slope_widgets = (
             self._slope_threshold_label,
             self._slope_threshold_entry,
@@ -4722,6 +4752,14 @@ class UiStrategySessionsMixin:
         self._daily_filter_enabled_check.configure(
             state="normal" if strategy_is_parameter_editable(strategy_id, "daily_filter_enabled", "launcher") else "disabled"
         )
+        if hasattr(self, "_trend_slope_filter_enabled_check"):
+            self._trend_slope_filter_enabled_check.configure(
+                state=(
+                    "normal"
+                    if strategy_is_parameter_editable(strategy_id, "trend_ema_slope_filter_enabled", "launcher")
+                    else "disabled"
+                )
+            )
         self._set_field_state(
             self._slope_threshold_entry,
             editable=strategy_is_parameter_editable(strategy_id, "trend_ema_slope_filter_min_ratio", "launcher"),
@@ -4729,6 +4767,17 @@ class UiStrategySessionsMixin:
         self._set_field_state(
             self._atr_percentile_filter_entry,
             editable=strategy_is_parameter_editable(strategy_id, "atr_percentile_filter_max", "launcher"),
+        )
+        self._ema55_slope_lock_profit_enabled_check.configure(
+            state=(
+                "normal"
+                if strategy_is_parameter_editable(strategy_id, "ema55_slope_lock_profit_enabled", "launcher")
+                else "disabled"
+            )
+        )
+        self._set_field_state(
+            self._ema55_slope_negative_entry_bars_entry,
+            editable=strategy_is_parameter_editable(strategy_id, "ema55_slope_negative_entry_bars", "launcher"),
         )
         self._set_field_state(
             self._body_retest_breakdown_entry,
@@ -4795,6 +4844,7 @@ class UiStrategySessionsMixin:
             self.startup_chase_window_seconds.set("0")
         self._last_strategy_parameter_strategy_id = strategy_id
         self._sync_dynamic_take_profit_controls()
+        self._sync_btc_ema55_slope_short_controls()
         self._sync_daily_filter_controls()
         QuantApp._sync_entry_side_mode_controls(self)
         self.strategy_summary_text.set(definition.summary)
@@ -4838,7 +4888,11 @@ class UiStrategySessionsMixin:
         if hasattr(self, "_rebuild_dynamic_protection_rule_editor"):
             self._rebuild_dynamic_protection_rule_editor()
         self._sync_dynamic_take_profit_controls()
+        if hasattr(self, "_sync_btc_ema55_slope_short_controls"):
+            self._sync_btc_ema55_slope_short_controls()
         self._sync_daily_filter_controls()
+        if hasattr(self, "_sync_trend_slope_filter_controls"):
+            self._sync_trend_slope_filter_controls()
 
     def _sync_dynamic_take_profit_controls(self) -> None:
         if not hasattr(self, "_dynamic_two_r_break_even_check"):
@@ -4911,6 +4965,16 @@ class UiStrategySessionsMixin:
                     state="normal" if reentry_enabled else "disabled"
                 )
 
+    def _sync_btc_ema55_slope_short_controls(self) -> None:
+        if not hasattr(self, "_ema55_slope_lock_profit_enabled_check"):
+            return
+        definition = self._selected_strategy_definition()
+        if definition.strategy_id != STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
+            return
+        enabled = bool(self.ema55_slope_lock_profit_enabled.get())
+        self._ema55_slope_lock_profit_trigger_r_label.configure(state="normal" if enabled else "disabled")
+        self._set_field_state(self._ema55_slope_lock_profit_trigger_r_entry, editable=enabled)
+
     def _sync_daily_filter_controls(self) -> None:
         if not hasattr(self, "_daily_filter_enabled_check"):
             return
@@ -4923,6 +4987,18 @@ class UiStrategySessionsMixin:
         self._set_field_state(self._daily_filter_mode_combo, editable=enabled)
         self._set_field_state(self._daily_filter_ma_combo, editable=ma_active)
         self._set_field_state(self._daily_filter_period_entry, editable=ma_active)
+
+    def _sync_trend_slope_filter_controls(self) -> None:
+        if not hasattr(self, "_slope_threshold_entry"):
+            return
+        definition = self._selected_strategy_definition()
+        enabled_supported = strategy_uses_parameter(definition.strategy_id, "trend_ema_slope_filter_enabled")
+        threshold_supported = strategy_uses_parameter(definition.strategy_id, "trend_ema_slope_filter_min_ratio")
+        filter_enabled = (not enabled_supported) or bool(self.trend_ema_slope_filter_enabled.get())
+        editable = threshold_supported and filter_enabled
+        self._slope_threshold_label.configure(state="normal" if editable else "disabled")
+        self._set_field_state(self._slope_threshold_entry, editable=editable)
+        self._slope_threshold_hint_label.configure(state="normal" if filter_enabled and threshold_supported else "disabled")
 
     def _sync_entry_side_mode_controls(self) -> None:
         if not hasattr(self, "_entry_side_mode_combo"):
@@ -5144,14 +5220,25 @@ class UiStrategySessionsMixin:
             if supports_startup_chase_current_signal(strategy_id)
             else False
         )
+        trend_ema_slope_filter_enabled = True
+        if strategy_uses_parameter(strategy_id, "trend_ema_slope_filter_enabled"):
+            trend_ema_slope_filter_enabled = bool(self.trend_ema_slope_filter_enabled.get())
         trend_ema_slope_filter_min_ratio = Decimal("0")
         if strategy_uses_parameter(strategy_id, "trend_ema_slope_filter_min_ratio"):
             try:
                 trend_ema_slope_filter_min_ratio = Decimal(self.trend_ema_slope_filter_min_ratio.get().strip() or "0")
             except InvalidOperation as exc:
-                raise ValueError("开空斜率阈值不是有效数字") from exc
+                raise ValueError("趋势线斜率阈值不是有效数字") from exc
             if trend_ema_slope_filter_min_ratio > 0:
-                raise ValueError("开空斜率阈值必须小于或等于 0")
+                raise ValueError("趋势线斜率阈值必须小于或等于 0")
+        ema55_slope_lock_profit_enabled = False
+        ema55_slope_negative_entry_bars = 1
+        if strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
+            ema55_slope_lock_profit_enabled = bool(self.ema55_slope_lock_profit_enabled.get())
+            ema55_slope_negative_entry_bars = self._parse_positive_int(
+                self.ema55_slope_negative_entry_bars.get() or "1",
+                "连续负斜率根数",
+            )
         atr_percentile_filter_max = Decimal("0")
         body_retest_breakdown_atr_multiplier = Decimal("0.2")
         body_retest_retest_atr_multiplier = Decimal("0.3")
@@ -5295,6 +5382,7 @@ class UiStrategySessionsMixin:
             run_mode=run_mode,
             take_profit_mode=TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()],
             max_entries_per_trend=max_entries_per_trend,
+            trend_ema_slope_filter_enabled=trend_ema_slope_filter_enabled,
             trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,
             atr_percentile_filter_max=atr_percentile_filter_max,
             body_retest_breakdown_atr_multiplier=body_retest_breakdown_atr_multiplier,
@@ -5316,6 +5404,7 @@ class UiStrategySessionsMixin:
             ema55_slope_exit_enabled=bool(self.ema55_slope_exit_enabled.get())
             if strategy_uses_parameter(strategy_id, "ema55_slope_exit_enabled")
             else True,
+            ema55_slope_lock_profit_enabled=ema55_slope_lock_profit_enabled,
             dynamic_break_even_trigger_r=max(
                 self._parse_positive_int(self.dynamic_break_even_trigger_r.get() or "2", "保本触发R"),
                 1,
@@ -5328,6 +5417,7 @@ class UiStrategySessionsMixin:
             )
             if strategy_uses_parameter(strategy_id, "ema55_slope_lock_profit_trigger_r")
             else 2,
+            ema55_slope_negative_entry_bars=ema55_slope_negative_entry_bars,
             dynamic_first_lock_r=max(
                 self._parse_nonnegative_int(self.dynamic_first_lock_r.get() or "0", "首档锁盈R"),
                 0,

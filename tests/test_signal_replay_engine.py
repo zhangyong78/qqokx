@@ -100,6 +100,17 @@ class SignalReplayEngineTest(unittest.TestCase):
             self.assertIsNotNone(near_pct)
             self.assertLessEqual(near_pct, Decimal("0.4"))
 
+    def test_builds_display_ema_stack_and_trend_state(self) -> None:
+        candles = [_candle(index, Decimal("100") + Decimal(index)) for index in range(120)]
+        dataset = build_signal_replay_dataset(candles)
+
+        self.assertEqual(len(dataset.ema_display_fast), len(candles))
+        self.assertEqual(len(dataset.ema_display_mid), len(candles))
+        self.assertEqual(len(dataset.ema_display_slow), len(candles))
+        self.assertEqual(len(dataset.trend_state), len(candles))
+        self.assertEqual(dataset.trend_state[-1], "bull")
+        self.assertIn(dataset.trend_state[0], {"bull", "bear", "mixed"})
+
     def test_detects_pattern_signals_with_large_move_gate(self) -> None:
         candles = [_custom_candle(index, "100", "100.3", "99.8", "100.1") for index in range(30)]
         candles.extend(

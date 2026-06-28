@@ -15,6 +15,7 @@ from okx_quant.okx_client import Instrument, OkxOrderResult, OkxOrderStatus, Okx
 from okx_quant.persistence import build_profile_switch_password_snapshot
 from okx_quant.persistence import load_notification_snapshot, save_notification_snapshot
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_MTF_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
@@ -2262,6 +2263,7 @@ class StrategyTemplateImportExportTest(TestCase):
             signal_mode_label=_Var(),
             take_profit_mode_label=_Var(),
             max_entries_per_trend=_Var(),
+            trend_ema_slope_filter_enabled=_Var(False),
             trend_ema_slope_filter_min_ratio=_Var(),
             atr_percentile_filter_max=_Var(),
             body_retest_breakdown_atr_multiplier=_Var(),
@@ -2278,9 +2280,11 @@ class StrategyTemplateImportExportTest(TestCase):
             daily_filter_ma_type=_Var(),
             daily_filter_period=_Var(),
             ema55_slope_exit_enabled=_Var(False),
+            ema55_slope_lock_profit_enabled=_Var(False),
             dynamic_two_r_break_even=_Var(False),
             dynamic_break_even_trigger_r=_Var(),
             ema55_slope_lock_profit_trigger_r=_Var(),
+            ema55_slope_negative_entry_bars=_Var(),
             dynamic_first_lock_r=_Var(),
             dynamic_trailing_step_r=_Var(),
             dynamic_protection_rules_json=_Var(),
@@ -9322,9 +9326,11 @@ class StrategyParameterDraftRestoreTest(TestCase):
             take_profit_mode_label=_Var(""),
             max_entries_per_trend=_Var(""),
             ema55_slope_exit_enabled=_Var(False),
+            ema55_slope_lock_profit_enabled=_Var(False),
             dynamic_two_r_break_even=_Var(False),
             dynamic_break_even_trigger_r=_Var(""),
             ema55_slope_lock_profit_trigger_r=_Var(""),
+            ema55_slope_negative_entry_bars=_Var(""),
             dynamic_first_lock_r=_Var(""),
             dynamic_trailing_step_r=_Var(""),
             dynamic_protection_rules_json=_Var(""),
@@ -9335,6 +9341,7 @@ class StrategyParameterDraftRestoreTest(TestCase):
             daily_filter_scope_label=_Var(""),
             daily_filter_ma_type=_Var(""),
             daily_filter_period=_Var(""),
+            trend_ema_slope_filter_enabled=_Var(False),
             trend_ema_slope_filter_min_ratio=_Var(""),
             atr_percentile_filter_max=_Var(""),
             body_retest_breakdown_atr_multiplier=_Var(""),
@@ -9396,6 +9403,14 @@ class StrategyParameterDraftRestoreTest(TestCase):
         self.assertEqual(app.mtf_filter_slow_ema_period.get(), 55)
         self.assertEqual(app.mtf_reversal_mode_label.get(), "只过滤新开仓")
 
+    def test_restore_strategy_parameter_draft_exposes_dynamic_long_slope_filter_defaults(self) -> None:
+        app = self._make_parameter_stub()
+
+        QuantApp._restore_strategy_parameter_draft(app, STRATEGY_DYNAMIC_LONG_ID)
+
+        self.assertTrue(app.trend_ema_slope_filter_enabled.get())
+        self.assertEqual(app.trend_ema_slope_filter_min_ratio.get(), "0")
+
     def test_restore_strategy_parameter_draft_uses_slope_strategy_schema_defaults(self) -> None:
         app = self._make_parameter_stub()
 
@@ -9409,6 +9424,18 @@ class StrategyParameterDraftRestoreTest(TestCase):
         self.assertTrue(app.dynamic_fee_offset_enabled.get())
         self.assertFalse(app.time_stop_break_even_enabled.get())
         self.assertEqual(app.time_stop_break_even_bars.get(), 0)
+        self.assertEqual(app.trend_ema_slope_filter_min_ratio.get(), "-0.0005")
+
+    def test_restore_strategy_parameter_draft_exposes_btc_slope_short_defaults(self) -> None:
+        app = self._make_parameter_stub()
+
+        QuantApp._restore_strategy_parameter_draft(app, STRATEGY_BTC_EMA55_SLOPE_SHORT_ID)
+
+        self.assertEqual(app.bar.get(), "1H")
+        self.assertTrue(app.ema55_slope_exit_enabled.get())
+        self.assertTrue(app.ema55_slope_lock_profit_enabled.get())
+        self.assertEqual(app.ema55_slope_lock_profit_trigger_r.get(), 5)
+        self.assertEqual(app.ema55_slope_negative_entry_bars.get(), 1)
         self.assertEqual(app.trend_ema_slope_filter_min_ratio.get(), "-0.0005")
 
 

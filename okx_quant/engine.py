@@ -4654,6 +4654,12 @@ class StrategyEngine:
                 f"{(str(item.pos_side or '').strip().lower() or 'net')}:{format_decimal(abs(item.position))}"
                 for item in candidates
             )
+            if self._uses_long_short_position_mode(
+                credentials,
+                config,
+                trade_instrument=trade_instrument,
+            ):
+                return None
             raise RuntimeError(
                 "拒绝接管现有持仓：交易所持仓侧与策略预期不一致"
                 f" | 标的={trade_instrument.inst_id}"
@@ -4669,6 +4675,27 @@ class StrategyEngine:
                     continue
             return item
         return None
+
+    def _uses_long_short_position_mode(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+    ) -> bool:
+        if trade_instrument.inst_type not in {"SWAP", "FUTURES"}:
+            return False
+        if config.position_mode == "long_short":
+            return True
+        get_account_config_cached = getattr(self._client, "_get_account_config_cached", None)
+        if not callable(get_account_config_cached):
+            return False
+        try:
+            acct = get_account_config_cached(credentials, config)
+        except Exception:
+            return False
+        acct_mode = (getattr(acct, "position_mode", "") or "").strip().lower()
+        return acct_mode == "long_short_mode"
 
     def _lookup_recent_position_close_history(
         self,

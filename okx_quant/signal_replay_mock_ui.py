@@ -128,7 +128,7 @@ class SignalReplayMockWindow:
         self.false_break_reclaim_position = StringVar(value="0.6")
 
         self.status_text = StringVar(value="等待加载 1H K线。")
-        self.summary_text = StringVar(value="BTC / 1H / EMA21-55 / MACD / 乖离率 / 成交量")
+        self.summary_text = StringVar(value="BTC / 1H / EMA50-60-70 / MACD / 乖离率 / 成交量")
         self.signal_set_text = StringVar(value="趋势过滤 + 回踩确认 + MACD 共振 + 量能放大")
         self.stats_text = StringVar(value="-")
         self.selected_signal_text = StringVar(value="尚未选择信号。")
@@ -334,7 +334,7 @@ class SignalReplayMockWindow:
             info,
             text=(
                 "目的：验证某根 1H K线在当下是否值得作为开仓机会。\n\n"
-                "趋势层：EMA21 / EMA55 位置和斜率\n"
+                "趋势层：EMA50 / EMA60 / EMA70 排列与状态\n"
                 "触发层：回踩站回、反抽失败、MACD 金叉死叉\n"
                 "过滤层：乖离率、均线附近、量能、ATR 波动"
             ),
@@ -351,11 +351,13 @@ class SignalReplayMockWindow:
         for idx, (label, color) in enumerate(
             (
                 ("K线：价格", "#d8dee9"),
-                ("橙线：EMA21", "#f59e0b"),
-                ("蓝线：EMA55", "#38bdf8"),
+                ("橙线：EMA50", "#f59e0b"),
+                ("蓝线：EMA60", "#38bdf8"),
+                ("紫线：EMA70", "#a78bfa"),
+                ("顶部色带：多头 / 空头 / 无序", "#334155"),
                 ("绿三角：开多候选", "#22c55e"),
                 ("红三角：开空候选", "#ef4444"),
-                ("紫线：乖离率", "#c084fc"),
+                ("粉线：乖离率", "#c084fc"),
             )
         ):
             row = ttk.Frame(legend)
@@ -536,7 +538,7 @@ class SignalReplayMockWindow:
         latest_ts = self._dataset.candles[-1].ts if self._dataset.candles else None
         self.reset_view()
         count = len(self._dataset.candles)
-        self.summary_text.set(f"{self.symbol.get().strip().upper()} / 1H / K线 {count} / 信号 {len(self._dataset.signals)}")
+        self.summary_text.set(f"{self.symbol.get().strip().upper()} / 1H / EMA50-60-70 / K线 {count} / 信号 {len(self._dataset.signals)}")
         self.status_text.set(f"已加载 {count} 根 1H K线，生成 {len(self._dataset.signals)} 个候选信号。")
         self._refresh_side_panels()
         self._schedule_redraw()
@@ -574,7 +576,7 @@ class SignalReplayMockWindow:
         latest_ts = self._dataset.candles[-1].ts if self._dataset.candles else None
         self.reset_view()
         count = len(self._dataset.candles)
-        self.summary_text.set(f"{self.symbol.get().strip().upper()} / 1H / K线 {count} / 信号 {len(self._dataset.signals)}")
+        self.summary_text.set(f"{self.symbol.get().strip().upper()} / 1H / EMA50-60-70 / K线 {count} / 信号 {len(self._dataset.signals)}")
         self.status_text.set(f"已加载 {count} 根 1H K线，生成 {len(self._dataset.signals)} 个候选信号。")
         self._refresh_side_panels()
         self._schedule_redraw()
@@ -597,7 +599,7 @@ class SignalReplayMockWindow:
             messagebox.showerror("参数错误", f"重新计算信号失败：\n{exc}", parent=self.window)
             return
         self.status_text.set(f"已按当前条件刷新，候选信号 {len(self._dataset.signals)} 个。")
-        self.summary_text.set(f"{self.symbol.get().strip().upper()} / 1H / K线 {len(self._dataset.candles)} / 信号 {len(self._dataset.signals)}")
+        self.summary_text.set(f"{self.symbol.get().strip().upper()} / 1H / EMA50-60-70 / K线 {len(self._dataset.candles)} / 信号 {len(self._dataset.signals)}")
         self._refresh_side_panels()
         self._schedule_redraw()
 
@@ -774,11 +776,13 @@ class SignalReplayMockWindow:
         start, end = self._visible_range()
         visible = dataset.candles[start:end]
         values = [float(item.high) for item in visible] + [float(item.low) for item in visible]
-        values.extend(float(item) for item in dataset.ema_fast[start:end])
-        values.extend(float(item) for item in dataset.ema_slow[start:end])
+        values.extend(float(item) for item in dataset.ema_display_fast[start:end])
+        values.extend(float(item) for item in dataset.ema_display_mid[start:end])
+        values.extend(float(item) for item in dataset.ema_display_slow[start:end])
         geometry = self._build_geometry(canvas, values, start, end, top=22, bottom_pad=30)
         self._main_geometry = geometry
         self._draw_grid(canvas, width, height, geometry, rows=5, cols=8, label_values=True)
+        self._draw_trend_state_band(canvas, geometry, start, end)
 
         for index in range(start, end):
             candle = dataset.candles[index]
@@ -792,11 +796,20 @@ class SignalReplayMockWindow:
             half = max(min(geometry.slot * 0.32, 7), 2)
             canvas.create_rectangle(x - half, min(y_open, y_close), x + half, max(y_open, y_close), fill=color, outline=color)
 
-        self._draw_series(canvas, geometry, dataset.ema_fast, start, end, "#f59e0b", width=2)
-        self._draw_series(canvas, geometry, dataset.ema_slow, start, end, "#38bdf8", width=2)
+        self._draw_series(canvas, geometry, dataset.ema_display_fast, start, end, "#f59e0b", width=2)
+        self._draw_series(canvas, geometry, dataset.ema_display_mid, start, end, "#38bdf8", width=2)
+        self._draw_series(canvas, geometry, dataset.ema_display_slow, start, end, "#a78bfa", width=2)
         self._draw_signal_markers(canvas, geometry, start, end)
         self._draw_crosshair(canvas, geometry)
-        canvas.create_text(14, 10, text="价格 / EMA21 / EMA55", anchor="nw", fill="#e2e8f0", font=("Microsoft YaHei UI", 10, "bold"))
+        current_trend = _trend_state_label(dataset.trend_state[end - 1]) if end > start else "无序"
+        canvas.create_text(
+            14,
+            10,
+            text=f"价格 / EMA50 / EMA60 / EMA70 / {current_trend}",
+            anchor="nw",
+            fill="#e2e8f0",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
 
     def _draw_macd_chart(self) -> None:
         dataset = self._dataset
@@ -900,6 +913,32 @@ class SignalReplayMockWindow:
             return
         x = self._x_for_index(geometry, index)
         canvas.create_line(x, geometry.top, x, geometry.bottom, fill="#f8fafc", dash=(3, 4))
+
+    def _draw_trend_state_band(self, canvas: Canvas, geometry: _ChartGeometry, start: int, end: int) -> None:
+        dataset = self._dataset
+        if dataset is None:
+            return
+        band_top = 4
+        band_bottom = 16
+        for index in range(start, end):
+            x0 = geometry.left + (index - geometry.start) * geometry.slot
+            x1 = x0 + geometry.slot + 1
+            canvas.create_rectangle(
+                x0,
+                band_top,
+                x1,
+                band_bottom,
+                outline="",
+                fill=_trend_state_color(dataset.trend_state[index]),
+            )
+        canvas.create_text(
+            geometry.right - 4,
+            band_top + 1,
+            text="多头 / 空头 / 无序",
+            anchor="ne",
+            fill="#cbd5e1",
+            font=("Microsoft YaHei UI", 9),
+        )
 
     def _draw_series(self, canvas: Canvas, geometry: _ChartGeometry, values: tuple[Decimal, ...], start: int, end: int, color: str, *, width: int) -> None:
         points: list[float] = []
@@ -1043,12 +1082,14 @@ class SignalReplayMockWindow:
             return
         candle = dataset.candles[self._selected_index]
         signal = self._signal_at_index(self._selected_index)
+        trend_text = _trend_state_label(dataset.trend_state[self._selected_index])
         if signal is None:
-            self.selected_signal_text.set(f"{_format_ts(candle.ts)}\nC {candle.close}\n当前 K线不是候选信号。")
+            self.selected_signal_text.set(f"{_format_ts(candle.ts)}\nC {candle.close}\n趋势：{trend_text}\n当前 K线不是候选信号。")
             return
         self.selected_signal_text.set(
             f"{_format_ts(signal.ts)}\n"
             f"{_direction_label(signal.direction)} | {signal.score}分\n"
+            f"趋势：{trend_text}\n"
             f"{signal.pattern_name} | {signal.candle_count}根K线\n"
             f"24H {_fmt_optional_signed(signal.validation.return_24h_pct)}"
         )
@@ -1164,6 +1205,22 @@ def _fmt_optional_signed(value: Decimal | None) -> str:
     if value is None:
         return "-"
     return f"{_fmt_signed(value, 2)}%"
+
+
+def _trend_state_label(state: str) -> str:
+    if state == "bull":
+        return "多头"
+    if state == "bear":
+        return "空头"
+    return "无序"
+
+
+def _trend_state_color(state: str) -> str:
+    if state == "bull":
+        return "#166534"
+    if state == "bear":
+        return "#991b1b"
+    return "#475569"
 
 
 def _signal_dedupe_key(symbol: str, bar: str, signal: SignalReplayPoint) -> str:

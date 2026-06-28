@@ -15,6 +15,9 @@ ONE_HOUR_MS = 3_600_000
 class SignalReplayConfig:
     ema_fast_period: int = 21
     ema_slow_period: int = 55
+    display_ema_fast_period: int = 50
+    display_ema_mid_period: int = 60
+    display_ema_slow_period: int = 70
     volume_ma_period: int = 20
     atr_period: int = 14
     macd_fast_period: int = 12
@@ -108,6 +111,10 @@ class SignalReplayDataset:
     candles: tuple[Candle, ...]
     ema_fast: tuple[Decimal, ...]
     ema_slow: tuple[Decimal, ...]
+    ema_display_fast: tuple[Decimal, ...]
+    ema_display_mid: tuple[Decimal, ...]
+    ema_display_slow: tuple[Decimal, ...]
+    trend_state: tuple[str, ...]
     macd_line: tuple[Decimal, ...]
     macd_signal: tuple[Decimal, ...]
     macd_histogram: tuple[Decimal, ...]
@@ -134,10 +141,14 @@ def build_signal_replay_dataset(
     volumes = [item.volume for item in ordered]
     bodies = [_body(item) for item in ordered]
     if not ordered:
-        return SignalReplayDataset((), (), (), (), (), (), (), (), (), (), (), (), (), _build_summary(()))
+        return SignalReplayDataset((), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), _build_summary(()))
 
     ema_fast = ema(closes, config.ema_fast_period)
     ema_slow = ema(closes, config.ema_slow_period)
+    ema_display_fast = ema(closes, config.display_ema_fast_period)
+    ema_display_mid = ema(closes, config.display_ema_mid_period)
+    ema_display_slow = ema(closes, config.display_ema_slow_period)
+    trend_state = _build_trend_state(ema_display_fast, ema_display_mid, ema_display_slow)
     macd_line, macd_signal, macd_histogram = macd(
         closes,
         fast_period=config.macd_fast_period,
@@ -184,6 +195,10 @@ def build_signal_replay_dataset(
         candles=tuple(ordered),
         ema_fast=tuple(ema_fast),
         ema_slow=tuple(ema_slow),
+        ema_display_fast=tuple(ema_display_fast),
+        ema_display_mid=tuple(ema_display_mid),
+        ema_display_slow=tuple(ema_display_slow),
+        trend_state=trend_state,
         macd_line=tuple(macd_line),
         macd_signal=tuple(macd_signal),
         macd_histogram=tuple(macd_histogram),
@@ -196,6 +211,22 @@ def build_signal_replay_dataset(
         signals=signals,
         summary=_build_summary(signals),
     )
+
+
+def _build_trend_state(
+    ema_display_fast: list[Decimal],
+    ema_display_mid: list[Decimal],
+    ema_display_slow: list[Decimal],
+) -> tuple[str, ...]:
+    states: list[str] = []
+    for fast, mid, slow in zip(ema_display_fast, ema_display_mid, ema_display_slow):
+        if fast > mid > slow:
+            states.append("bull")
+        elif fast < mid < slow:
+            states.append("bear")
+        else:
+            states.append("mixed")
+    return tuple(states)
 
 
 def _iter_signals(

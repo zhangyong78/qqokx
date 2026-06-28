@@ -67,6 +67,8 @@ class StrategyParametersTest(TestCase):
     def test_strategy_parameter_keys_stay_strategy_specific(self) -> None:
         self.assertIn("entry_reference_ema_period", iter_strategy_parameter_keys(STRATEGY_EMA_BREAKOUT_LONG_ID))
         self.assertIn("entry_reference_ema_period", iter_strategy_parameter_keys(STRATEGY_DYNAMIC_LONG_ID))
+        self.assertIn("trend_ema_slope_filter_enabled", iter_strategy_parameter_keys(STRATEGY_DYNAMIC_LONG_ID))
+        self.assertIn("trend_ema_slope_filter_min_ratio", iter_strategy_parameter_keys(STRATEGY_DYNAMIC_LONG_ID))
         self.assertNotIn("hold_close_exit_bars", iter_strategy_parameter_keys(STRATEGY_DYNAMIC_LONG_ID))
         self.assertIn("hold_close_exit_bars", iter_strategy_parameter_keys(STRATEGY_EMA_BREAKOUT_LONG_ID))
 

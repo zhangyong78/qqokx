@@ -37,6 +37,7 @@ LEGACY_HTML_PATH = ROOT / "reports" / HTML_NAME
 
 STANDARD_REPORT_DIR = ROOT / "reports" / "best_parameter_bundle_1h_standard_100u"
 STANDARD_TRADES_CSV = STANDARD_REPORT_DIR / "trades.csv"
+SLOPE_FILTER_COMPARE_CSV = ROOT / "reports" / "dynamic_long_slope_filter_compare" / "compare.csv"
 ANALYSIS_REPORT_DIR = analysis_report_dir_path()
 OVERALL_TRADES_GLOB = "best_parameter_bundle_overall_*.csv"
 CLEANUP_BACKUPS_DIR = ANALYSIS_REPORT_DIR.parents[1] / "cleanup_backups"
@@ -57,10 +58,10 @@ _DECIMAL_FIELDS = {
 }
 
 _LONG_NOTE_MAP: dict[str, str] = {
-    "BTC-USDT-SWAP": "BTC 做多默认参数已同步到参数包、UI 与实盘；下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
-    "ETH-USDT-SWAP": "ETH 做多默认参数已同步到参数包、UI 与实盘；下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
-    "SOL-USDT-SWAP": "SOL 做多默认参数已同步到参数包、UI 与实盘；下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
-    "DOGE-USDT-SWAP": "DOGE 做多本轮已复核 S652 / S653 / S654 / S655，并把主候选从先前误推的 S652 更正为 S653；默认参数已同步到参数包、UI 与实盘。下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
+    "BTC-USDT-SWAP": "BTC 做多默认参数已同步到参数包、UI 与实盘。本轮补做趋势线斜率过滤开/关对比后，关闭过滤总收益略高但最大回撤同步放大，因此最佳参数包当前默认关闭，并继续观察回撤扩张是否可接受。下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
+    "ETH-USDT-SWAP": "ETH 做多默认参数已同步到参数包、UI 与实盘。本轮补做趋势线斜率过滤开/关对比后，开启过滤的收益与回撤都略优于关闭方案，因此最佳参数包当前保留开启。下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
+    "SOL-USDT-SWAP": "SOL 做多默认参数已同步到参数包、UI 与实盘。本轮补做趋势线斜率过滤开/关对比后，关闭过滤同时带来更高收益和更低回撤，因此最佳参数包当前默认关闭。下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
+    "DOGE-USDT-SWAP": "DOGE 做多本轮已复核 S652 / S653 / S654 / S655，并把主候选从先前误推的 S652 更正为 S653；同时补做趋势线斜率过滤开/关对比，结果显示开启过滤的收益与回撤都优于关闭方案，因此最佳参数包当前保留开启。下方统计按固定风险 100U、初始资金 10000U、非复利标准口径展示。",
 }
 
 _SHORT_NOTE_MAP: dict[str, str] = {
@@ -252,7 +253,8 @@ def build_specs() -> tuple[BundleSpec, ...]:
                 "SOL 做多本轮围绕 S656 基线补测 5R / 6R / 7R / 8R 首档锁盈，"
                 "并对每波 1 / 2 / 3 次做样本外与滚动窗口复核；"
                 "最终确认 3R 保本 + 5R 锁 1R + 11R 锁 10R / 每波 2 次优于原 7R 锁 1R，"
-                "已同步到参数包、UI 与实盘。下方统计按固定风险 100U、初始资金 10000U、"
+                "同时补做趋势线斜率过滤开/关对比，关闭过滤后总收益更高且最大回撤更低，"
+                "因此最佳参数包当前默认关闭该过滤。已同步到参数包、UI 与实盘。下方统计按固定风险 100U、初始资金 10000U、"
                 "非复利标准口径展示。"
             )
         specs.append(
@@ -412,6 +414,18 @@ def _note_takeaway_text(note: str) -> str:
     return takeaway
 
 
+def _note_primary_text(note: str) -> str:
+    cleaned = _strip_backtest_range_clause(note)
+    parts = [part.strip(" 。；;") for part in re.split(r"[；。]", cleaned) if part.strip(" 。；;")]
+    filtered = [part for part in parts if not part.startswith("下方统计按固定风险")]
+    if not filtered:
+        return cleaned
+    primary = "；".join(filtered)
+    if primary and primary[-1] not in "。！？":
+        primary += "。"
+    return primary
+
+
 def _fmt_note_report_line(report: BacktestReport) -> str:
     pf_text = "-" if report.profit_factor is None else _fmt_fixed(report.profit_factor)
     win_rate_text = _fmt_fixed(report.win_rate, "0.01") + "%"
@@ -457,7 +471,7 @@ def _strategy_detail_note_html(spec: BundleSpec, run: BundleRun | None) -> str:
         '<div class="note-stack">',
         (
             f'<div class="note-block note-block-primary"><strong class="note-tag">{_html_text("定稿结论")}</strong>'
-            f'<span class="note-copy">{_html_text(f"{run.coin}{spec.side}当前默认采用 {spec.core_label}；保护口径为 {spec.protection_label}。")}</span></div>'
+            f'<span class="note-copy">{_html_text(_note_primary_text(spec.note))}</span></div>'
         ),
         (
             f'<div class="note-block note-block-stats"><strong class="note-tag">{_html_text("全样本")}</strong>'
@@ -469,11 +483,14 @@ def _strategy_detail_note_html(spec: BundleSpec, run: BundleRun | None) -> str:
         ),
     ]
     takeaway = _note_takeaway_text(spec.note)
-    if takeaway:
-        lines.append(
-            f'<div class="note-block note-block-research"><strong class="note-tag">{_html_text("研究备注")}</strong>'
-            f'<span class="note-copy">{_html_text(takeaway)}</span></div>'
-        )
+    technical_summary = f"当前默认采用 {spec.core_label}；保护口径为 {spec.protection_label}。"
+    research_copy = takeaway or technical_summary
+    if takeaway and takeaway != technical_summary:
+        research_copy = technical_summary
+    lines.append(
+        f'<div class="note-block note-block-research"><strong class="note-tag">{_html_text("研究备注")}</strong>'
+        f'<span class="note-copy">{_html_text(research_copy)}</span></div>'
+    )
     lines.append(f'<div class="note-meta">{_html_text(_bundle_run_backtest_range_text(run))}</div>')
     lines.append("</div>")
     return "".join(lines)
@@ -1035,6 +1052,10 @@ def _latest_overall_trades_csv() -> Path | None:
 
 
 def _load_bundle_runs(specs: tuple[BundleSpec, ...]) -> tuple[BundleRun, ...]:
+    standard_runs = _load_bundle_runs_from_standard_report(specs)
+    if standard_runs:
+        return standard_runs
+
     overall_csv = _latest_overall_trades_csv()
     if overall_csv is not None:
         grouped: dict[tuple[str, str], list[BacktestTrade]] = {}
@@ -1165,6 +1186,79 @@ def _coin_period_tables_html(specs: tuple[BundleSpec, ...], runs: tuple[BundleRu
     return "".join(cards)
 
 
+def _slope_filter_compare_section_html(specs: tuple[BundleSpec, ...]) -> str:
+    if not SLOPE_FILTER_COMPARE_CSV.exists():
+        return ""
+
+    grouped: dict[str, dict[bool, dict[str, str]]] = {}
+    with SLOPE_FILTER_COMPARE_CSV.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            symbol = str(row.get("symbol", "")).strip().upper()
+            enabled_text = str(row.get("slope_filter_enabled", "")).strip().lower()
+            if not symbol or enabled_text not in {"true", "false"}:
+                continue
+            grouped.setdefault(symbol, {})[enabled_text == "true"] = row
+
+    default_map = {
+        spec.symbol: bool(spec.config.trend_ema_slope_filter_enabled)
+        for spec in specs
+        if spec.strategy_id == STRATEGY_DYNAMIC_LONG_ID
+    }
+    cards: list[str] = []
+    for symbol in ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "DOGE-USDT-SWAP"):
+        pair = grouped.get(symbol)
+        if not pair or True not in pair or False not in pair:
+            continue
+        enabled_row = pair[True]
+        disabled_row = pair[False]
+        coin = symbol.replace("-USDT-SWAP", "")
+        default_enabled = default_map.get(symbol, True)
+        stance_text = "当前结论：保留开启" if default_enabled else "当前结论：默认关闭"
+        pnl_delta = Decimal(str(disabled_row.get("total_pnl", "0"))) - Decimal(str(enabled_row.get("total_pnl", "0")))
+        dd_delta = Decimal(str(disabled_row.get("max_drawdown_pct", "0"))) - Decimal(
+            str(enabled_row.get("max_drawdown_pct", "0"))
+        )
+        range_text = (
+            f"回测区间：{enabled_row.get('start_local', '')} -> {enabled_row.get('end_local', '')} | "
+            f"样本 {enabled_row.get('candles', '0')} 根 1H K 线"
+        )
+        enabled_text = (
+            f"PnL {_fmt_fixed(enabled_row.get('total_pnl', '0'))} / "
+            f"DD {_fmt_fixed(enabled_row.get('max_drawdown_pct', '0'), '0.01')}% / "
+            f"Trades {enabled_row.get('trades', '0')}"
+        )
+        disabled_text = (
+            f"PnL {_fmt_fixed(disabled_row.get('total_pnl', '0'))} / "
+            f"DD {_fmt_fixed(disabled_row.get('max_drawdown_pct', '0'), '0.01')}% / "
+            f"Trades {disabled_row.get('trades', '0')}"
+        )
+        delta_text = f"PnL {_fmt_fixed(pnl_delta)} / DD {_fmt_fixed(dd_delta, '0.01')}%"
+        cards.append(
+            '<div class="compare-card">'
+            f'<div class="compare-card-head"><h3>{_html_text(coin + " 斜率过滤开 / 关结论")}</h3>'
+            f'<span class="compare-badge">{_html_text(stance_text)}</span></div>'
+            f'<p class="compare-range">{_html_text(range_text)}</p>'
+            '<div class="compare-metrics">'
+            f'<div class="compare-metric"><span class="metric-label">{_html_text("开启")}</span><strong class="metric-value">{_html_text(enabled_text)}</strong></div>'
+            f'<div class="compare-metric"><span class="metric-label">{_html_text("关闭")}</span><strong class="metric-value">{_html_text(disabled_text)}</strong></div>'
+            f'<div class="compare-metric"><span class="metric-label">{_html_text("关闭 - 开启")}</span><strong class="metric-value">{_html_text(delta_text)}</strong></div>'
+            "</div>"
+            "</div>"
+        )
+
+    if not cards:
+        return ""
+
+    return (
+        '<section class="panel">'
+        f'<h2>{_html_text("斜率过滤开 / 关结论")}</h2>'
+        f'<p>{_html_text("下面单独汇总 BTC / ETH / SOL / DOGE 动态做多策略的趋势线斜率过滤开关对比，口径为最佳参数时间段、1H 全缓存、固定风险 100U、初始资金 10000U、非复利。")}</p>'
+        f'<div class="compare-grid">{"".join(cards)}</div>'
+        "</section>"
+    )
+
+
 def build_html(specs: tuple[BundleSpec, ...]) -> str:
     runs = _load_bundle_runs(specs)
     run_map = {run.spec.profile_id: run for run in runs}
@@ -1199,6 +1293,7 @@ def build_html(specs: tuple[BundleSpec, ...]) -> str:
     configs_html = "".join(config_cards)
     coin_period_tables = _coin_period_tables_html(specs, runs)
     live_capital_plan_html = _live_capital_plan_html()
+    slope_filter_compare_html = _slope_filter_compare_section_html(specs)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1340,6 +1435,54 @@ def build_html(specs: tuple[BundleSpec, ...]) -> str:
       display: block;
       font-size: 16px;
       color: #0b5d58;
+    }}
+    .compare-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 14px;
+    }}
+    .compare-card {{
+      border: 1px solid rgba(15, 118, 110, 0.14);
+      border-radius: 16px;
+      background: rgba(246, 251, 249, 0.96);
+      padding: 16px;
+    }}
+    .compare-card-head {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+    }}
+    .compare-card-head h3 {{
+      margin: 0;
+      font-size: 18px;
+    }}
+    .compare-badge {{
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(15, 118, 110, 0.1);
+      color: #0b5d58;
+      font-weight: 700;
+      font-size: 12px;
+      white-space: nowrap;
+    }}
+    .compare-range {{
+      color: #5b6470;
+      font-size: 13px;
+      margin-bottom: 10px;
+    }}
+    .compare-metrics {{
+      display: grid;
+      gap: 8px;
+    }}
+    .compare-metric {{
+      border: 1px solid rgba(15, 118, 110, 0.12);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.84);
+      padding: 10px 12px;
     }}
     .chart-card {{
       margin: 14px 0 10px 0;
@@ -1505,6 +1648,7 @@ def build_html(specs: tuple[BundleSpec, ...]) -> str:
     </div>
     {live_capital_plan_html}
   </section>
+  {slope_filter_compare_html}
   <section class="panel">
     <h2>{_html_text("参数总览")}</h2>
     <table class="strategy-table">
