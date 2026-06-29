@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from okx_quant.arbitrage.launch_support import build_runtime_for_profile
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
-from okx_quant.arbitrage_ui import _build_runtime_for_profile
 from okx_quant.persistence import load_credentials_profiles_snapshot
 
 
@@ -16,7 +16,7 @@ def load_runtime(profile_name: str | None = None) -> ArbitrageTradeRuntime | Non
     profile = profiles.get(selected)
     if not isinstance(profile, dict):
         return None
-    return _build_runtime_for_profile(selected, profile_snapshot=profile, fallback_runtime=None)
+    return build_runtime_for_profile(selected, profile_snapshot=profile, fallback_runtime=None)
 
 
 def profile_names() -> list[str]:
@@ -25,4 +25,3 @@ def profile_names() -> list[str]:
     if not isinstance(profiles, dict):
         return []
     return [str(name) for name in profiles.keys() if str(name).strip()]
-

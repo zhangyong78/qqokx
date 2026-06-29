@@ -1,2 +1,1 @@
-"""Standalone Qt roll terminal prototype."""
-
+"""Qt terminal shell with modular launch surfaces."""

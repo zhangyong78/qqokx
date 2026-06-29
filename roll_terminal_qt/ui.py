@@ -183,6 +183,7 @@ class RollTerminalWindow(QMainWindow):
         self._execution_thread: QThread | None = None
         self._active_execution_label = "移仓"
         self._positions: list[FuturesPositionView] = []
+        self._spot_balance_lookup: dict[str, str] = {}
         self._latest_snapshot: MarketPairSnapshot | None = None
         self._profile_snapshots: dict[str, dict[str, str]] = {}
         self._unlocked_profiles: set[str] = set()
@@ -478,15 +479,19 @@ class RollTerminalWindow(QMainWindow):
         self._position_action.setObjectName("Hint")
         self._position_action.setWordWrap(True)
         self._positions_breakdown = QLabel("持仓合计：等待持仓...")
+        self._position_spot = QLabel("对应现货：等待账户余额...")
+        self._position_spot.setObjectName("Subtle")
+        self._position_spot.setWordWrap(True)
         self._positions_breakdown.setObjectName("Subtle")
         self._positions_breakdown.setWordWrap(True)
         position_focus_layout.addWidget(position_focus_title)
         position_focus_layout.addWidget(self._position_summary)
         position_focus_layout.addWidget(self._position_action)
+        position_focus_layout.addWidget(self._position_spot)
         position_focus_layout.addWidget(self._positions_breakdown)
         positions_layout.addWidget(position_focus)
-        self._positions_table = QTableWidget(0, 4)
-        self._positions_table.setHorizontalHeaderLabels(["合约", "方向", "可平(张)", "折合"])
+        self._positions_table = QTableWidget(0, 5)
+        self._positions_table.setHorizontalHeaderLabels(["合约", "方向", "可平(张)", "折合", "对应现货"])
         self._positions_table.verticalHeader().setVisible(False)
         self._positions_table.verticalHeader().setDefaultSectionSize(28)
         self._positions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -496,7 +501,8 @@ class RollTerminalWindow(QMainWindow):
         positions_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         positions_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         positions_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        positions_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        positions_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        positions_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self._positions_table.setMinimumHeight(220)
         self._positions_table.setMaximumHeight(340)
         self._positions_table.cellClicked.connect(self._on_position_row_clicked)
@@ -1170,6 +1176,10 @@ class RollTerminalWindow(QMainWindow):
                 return leg.ask
         return None
 
+    def _preview_cached_instrument(self, inst_id: str):
+        client = OkxRestClient()
+        return client.get_cached_instrument(inst_id)
+
     def _preview_open_size(
         self,
         *,
@@ -1182,9 +1192,10 @@ class RollTerminalWindow(QMainWindow):
         if spot_mid is None or spot_mid <= 0:
             return None
         try:
-            client = OkxRestClient()
-            spot_inst = client.get_instrument(spot_inst_id, prefer_cached=True)
-            derivative_inst = client.get_instrument(derivative_inst_id, prefer_cached=True)
+            spot_inst = self._preview_cached_instrument(spot_inst_id)
+            derivative_inst = self._preview_cached_instrument(derivative_inst_id)
+            if spot_inst is None or derivative_inst is None:
+                return None
             preview = preview_arbitrage_size(
                 size=size_value,
                 unit=size_unit,
@@ -1265,8 +1276,9 @@ class RollTerminalWindow(QMainWindow):
     def _open_estimated_batch_text(self, total_contracts: Decimal, derivative_inst_id: str) -> str:
         batch_mode = self._selected_batch_mode()
         try:
-            client = OkxRestClient()
-            derivative_inst = client.get_instrument(derivative_inst_id, prefer_cached=True)
+            derivative_inst = self._preview_cached_instrument(derivative_inst_id)
+            if derivative_inst is None:
+                return "预计拆单：等待本地合约元数据缓存就绪后自动刷新。"
             lot_size = derivative_inst.lot_size if derivative_inst.lot_size is not None else Decimal("1")
         except Exception:
             lot_size = Decimal("1")
@@ -1813,6 +1825,7 @@ class RollTerminalWindow(QMainWindow):
             self._position_action.setText(
                 f"操作方向：{roll_direction_from_position(position).summary_text}"
             )
+            self._position_spot.setText(self._position_spot_text(position))
             self._highlight_position_row(position.position_key)
         self._sync_execute_button()
 
@@ -1855,6 +1868,50 @@ class RollTerminalWindow(QMainWindow):
         if short_total > 0:
             return f"持仓合计：空 {fmt_decimal(short_total)} 张"
         return f"持仓合计：多 {fmt_decimal(long_total)} 张"
+
+    def _refresh_spot_balance_lookup(self) -> None:
+        self._spot_balance_lookup = {}
+        if self._runtime is None:
+            return
+        try:
+            cached_payload = OkxRestClient().get_cached_private_account_overview(
+                self._runtime.credentials,
+                environment=self._runtime.environment,
+            )
+        except Exception:
+            return
+        if cached_payload is None:
+            return
+        _, overview = cached_payload
+        details = getattr(overview, "details", ()) or ()
+        lookup: dict[str, str] = {}
+        for asset in details:
+            ccy = str(getattr(asset, "ccy", "") or "").strip().upper()
+            if not ccy or ccy in {"USDT", "USDC", "USD"}:
+                continue
+            available = getattr(asset, "available_balance", None)
+            equity = getattr(asset, "equity", None)
+            cash_balance = getattr(asset, "cash_balance", None)
+            total = equity if equity is not None else cash_balance
+            qty = available if available is not None and available > 0 else total
+            if qty is None or qty <= 0:
+                continue
+            text = f"{ccy}-USDT | 可用 {fmt_decimal(qty)} {ccy}"
+            if total is not None and total > 0 and total != qty:
+                text += f" | 余额 {fmt_decimal(total)} {ccy}"
+            lookup[ccy] = text
+        self._spot_balance_lookup = lookup
+
+    def _position_spot_text(self, position: FuturesPositionView | None) -> str:
+        if position is None:
+            return "对应现货：等待持仓..."
+        base_ccy = position.inst_id.split("-")[0].strip().upper() or "BTC"
+        if not self._spot_balance_lookup:
+            return f"对应现货：{base_ccy}-USDT 等待账户余额..."
+        spot_text = self._spot_balance_lookup.get(base_ccy)
+        if spot_text:
+            return f"对应现货：{spot_text}"
+        return f"对应现货：{base_ccy}-USDT 未读取到可用持仓"
 
     @Slot()
     def _switch_pair(self) -> None:
@@ -2048,11 +2105,13 @@ class RollTerminalWindow(QMainWindow):
         self._stop_runtime_threads()
         self._runtime = runtime
         self._positions = []
+        self._spot_balance_lookup = {}
         self._current.blockSignals(True)
         self._current.clear()
         self._current.addItem("正在读取衍生品持仓...", "")
         self._current.blockSignals(False)
         self._position_summary.setText("正在读取衍生品持仓...")
+        self._position_spot.setText("对应现货：正在读取账户余额...")
         self._positions_breakdown.setText("持仓合计：正在读取衍生品持仓...")
         self._source.setText("等待盘口切换...")
         self._order_table.setRowCount(0)
@@ -2101,6 +2160,7 @@ class RollTerminalWindow(QMainWindow):
             self._current.addItem("未读取到衍生品持仓", "")
             selected_position_key = ""
         self._positions_table.setRowCount(0)
+        self._refresh_spot_balance_lookup()
         for position in positions:
             row = self._positions_table.rowCount()
             self._positions_table.insertRow(row)
@@ -2110,11 +2170,13 @@ class RollTerminalWindow(QMainWindow):
                 if position.notional_base is not None
                 else "-"
             )
+            spot_text = self._spot_balance_lookup.get(base_ccy, f"{base_ccy}-USDT")
             values = [
                 position.inst_id,
                 "空" if str(position.side).lower() == "short" else "多",
                 fmt_decimal(position.available),
                 exposure_text,
+                spot_text,
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -2132,9 +2194,11 @@ class RollTerminalWindow(QMainWindow):
             self._position_action.setText(
                 f"操作方向：{roll_direction_from_position(selected_position).summary_text}"
             )
+            self._position_spot.setText(self._position_spot_text(selected_position))
         else:
             self._position_summary.setText("未读取到衍生品持仓")
             self._position_action.setText("操作方向：等待持仓...")
+            self._position_spot.setText("对应现货：等待账户余额...")
         self._highlight_position_row(selected_position_key)
         if selected_position is not None:
             self._refresh_target_candidates()
@@ -2506,7 +2570,6 @@ class RollTerminalWindow(QMainWindow):
             batch_contract_qty=batch_contract_qty,
             maker_wait_seconds=maker_wait_seconds,
             chase_limit=chase_limit,
-            close_profit_spot=self._close_profit_spot.isChecked(),
         )
 
     def _build_professional_close_plan(self) -> ProfessionalCloseExecutionPlan | None:
@@ -3319,6 +3382,7 @@ class RollTerminalWindow(QMainWindow):
         if not self._positions:
             self._position_summary.setText(text)
             self._position_action.setText("操作方向：等待持仓...")
+            self._position_spot.setText("对应现货：等待账户余额...")
 
 
 def run() -> int:

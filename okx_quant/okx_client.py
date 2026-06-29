@@ -113,9 +113,28 @@ def _okx_order_reject_hint_by_code(*, s_code: str, sub_code: str, item: dict[str
         if "clOrdId" in msg:
             return "clOrdId 不符合规则。请只用英文/数字/短横线，长度控制在 32 字符以内。"
         return "请求参数不合法。请检查 posSide、sz、px、tdMode 是否与账户设置一致。"
+    if code == "51004":
+        limit_match = re.search(r"持仓上限\s*([0-9]+(?:\.[0-9]+)?)\s*张", msg)
+        order_match = re.search(r"当前下单张数[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*张", msg)
+        held_match = re.search(r"当前合约多空持有仓位[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*张", msg)
+        pending_match = re.search(r"当前合约多空挂单张数[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*张", msg)
+        occupied_match = re.search(r"其他合约占用额度[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*张", msg)
+        if limit_match and held_match:
+            limit_qty = Decimal(limit_match.group(1))
+            held_qty = Decimal(held_match.group(1))
+            pending_qty = Decimal(pending_match.group(1)) if pending_match else Decimal("0")
+            occupied_qty = Decimal(occupied_match.group(1)) if occupied_match else Decimal("0")
+            requested_qty = Decimal(order_match.group(1)) if order_match else None
+            remaining_qty = max(limit_qty - held_qty - pending_qty - occupied_qty, Decimal("0"))
+            hint = f"该币种当前最多还能再开 {format_decimal(remaining_qty)} 张。"
+            if requested_qty is not None:
+                hint += f" 本次请求 {format_decimal(requested_qty)} 张，已超过交易所上限 {format_decimal(limit_qty)} 张。"
+            hint += " 请减小开仓张数，或换子账户执行。"
+            return hint
+        return "该币种/账户当前可开张数已触达交易所上限。请减小开仓张数，或换子账户执行。"
     if code == "51121" or sub == "51121":
         return "下单数量超出该合约或账户当前可下范围。请减小张数后重试。"
-    if code == "51131" or sub == "51131":
+    if code in {"51006", "51131"} or sub == "51131":
         return "下单价格超出交易所允许范围。请贴近盘口价格后重试。"
     if code == "50011":
         return "请求过于频繁。请稍等 1-2 秒再重试。"
@@ -218,6 +237,24 @@ class OkxOrderBook:
     inst_id: str
     bids: tuple[tuple[Decimal, Decimal], ...]
     asks: tuple[tuple[Decimal, Decimal], ...]
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxPriceLimit:
+    inst_id: str
+    buy_limit: Decimal | None
+    sell_limit: Decimal | None
+    ts: int | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxMaxOrderSize:
+    inst_id: str
+    ccy: str | None
+    max_buy: Decimal | None
+    max_sell: Decimal | None
     raw: dict[str, Any]
 
 
@@ -472,6 +509,16 @@ class OkxRestClient:
 
     def get_cached_instrument(self, inst_id: str) -> Instrument | None:
         return self._get_cached_instrument(inst_id)
+
+    def _spot_td_mode_for_account(self, credentials: Credentials, config: StrategyConfig) -> str:
+        try:
+            account_config = self.get_account_config(credentials, environment=config.environment)
+        except Exception:
+            return "cash"
+        account_level = str(getattr(account_config, "account_level", "") or "").strip()
+        if account_level in {"3", "4"}:
+            return "cross"
+        return "cash"
 
     def get_instrument(self, inst_id: str, *, prefer_cached: bool = False) -> Instrument:
         normalized = inst_id.strip().upper()
@@ -918,6 +965,59 @@ class OkxRestClient:
             raise OkxApiError(f"OKX 未返回盘口：{inst_id}")
         first = payload["data"][0]
         return self._build_order_book_from_public_item(inst_id=inst_id, item=first)
+
+    def get_price_limit(self, inst_id: str) -> OkxPriceLimit | None:
+        payload = self._request("GET", "/api/v5/public/price-limit", params={"instId": inst_id})
+        if not payload["data"]:
+            return None
+        first = payload["data"][0]
+        return OkxPriceLimit(
+            inst_id=first.get("instId", inst_id),
+            buy_limit=_first_decimal(first.get("buyLmt"), first.get("buyLimit")),
+            sell_limit=_first_decimal(first.get("sellLmt"), first.get("sellLimit")),
+            ts=_to_int(first.get("ts")),
+            raw=first,
+        )
+
+    def get_max_order_size(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        td_mode: str,
+        ccy: str | None = None,
+        px: Decimal | None = None,
+        leverage: Decimal | None = None,
+    ) -> OkxMaxOrderSize | None:
+        params = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+        }
+        if ccy:
+            params["ccy"] = ccy
+        if px is not None and px > 0:
+            params["px"] = format_decimal(px)
+        if leverage is not None and leverage > 0:
+            params["lever"] = format_decimal(leverage)
+        payload = self._request(
+            "GET",
+            "/api/v5/account/max-size",
+            params=params,
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        if not payload["data"]:
+            return None
+        first = payload["data"][0]
+        return OkxMaxOrderSize(
+            inst_id=first.get("instId", inst_id),
+            ccy=first.get("ccy"),
+            max_buy=_first_decimal(first.get("maxBuy"), first.get("maxBuySz")),
+            max_sell=_first_decimal(first.get("maxSell"), first.get("maxSellSz")),
+            raw=first,
+        )
 
     def ensure_public_ws_market_watch(self, inst_id: str, *, environment: str) -> None:
         connection = self._public_ws_connection_for(environment=environment)
@@ -2358,7 +2458,9 @@ class OkxRestClient:
             if inst is not None:
                 order["sz"] = _format_exchange_contract_sz(inst, size)
                 if inst.inst_type == "SPOT":
-                    order["tdMode"] = "cash"
+                    order["tdMode"] = self._spot_td_mode_for_account(credentials, config)
+                    if str(ord_type or "").strip().lower() == "post_only":
+                        order["ordType"] = "limit"
                 if reduce_only:
                     resolved_pos = self._reduce_only_order_pos_side(
                         credentials,
@@ -2404,6 +2506,31 @@ class OkxRestClient:
                 fallback_cl_ord_id=cl_ord_id,
             )
         except OkxApiError as exc:
+            if (
+                exc.code == "51000"
+                and inst is not None
+                and inst.inst_type == "SPOT"
+                and str(order.get("ordType") or "").strip().lower() == "post_only"
+                and order.get("px") not in {None, ""}
+            ):
+                retry_order = dict(order)
+                retry_order["ordType"] = "limit"
+                try:
+                    payload = self._request(
+                        "POST",
+                        "/api/v5/trade/order",
+                        body=retry_order,
+                        auth=True,
+                        credentials=credentials,
+                        simulated=config.environment == "demo",
+                    )
+                    return self._parse_order_result(
+                        payload,
+                        empty_message="OKX 返回了空的下单结果",
+                        fallback_cl_ord_id=cl_ord_id,
+                    )
+                except OkxApiError as retry_exc:
+                    _raise_order_error_with_request(retry_exc, retry_order)
             _raise_order_error_with_request(exc, order)
 
     def place_aggressive_limit_order(

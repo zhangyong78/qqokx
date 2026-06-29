@@ -5,6 +5,8 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from okx_quant.models import Instrument
+from roll_terminal_qt.account_service import FuturesPositionView
+from roll_terminal_qt.execution_service import ProfessionalOpenExecutionPlan
 from roll_terminal_qt.ui import RollTerminalWindow
 
 
@@ -29,6 +31,18 @@ class _Label:
 
     def setText(self, value: str) -> None:
         self.value = value
+
+
+class _ComboValue:
+    def __init__(self, *, text: str = "", data: str = "") -> None:
+        self._text = text
+        self._data = data
+
+    def currentText(self) -> str:
+        return self._text
+
+    def currentData(self):
+        return self._data
 
 
 class RollTerminalUiTests(unittest.TestCase):
@@ -142,6 +156,84 @@ class RollTerminalUiTests(unittest.TestCase):
         window._update_open_estimate_preview()
 
         self.assertIn("默认值：按币数 1，按金额(U) 10000，按合约张数 100。", window._open_estimate_text.value)
+
+    def test_build_professional_open_plan_does_not_pass_close_only_field(self) -> None:
+        window = self._build_window()
+        window._selected_opportunity = type(
+            "_Item",
+            (),
+            {
+                "left_inst_id": "BTC-USDT",
+                "right_inst_id": "BTC-USD-260925",
+            },
+        )()
+        window._selected_professional_open_legs = lambda: ("BTC-USDT", "BTC-USD-260925")
+        window._open_qty_unit_value = lambda: "coin"
+        window._selected_batch_mode = lambda: "count"
+        window._qty = _TextField("1")
+        window._max_slippage = _TextField("0.15")
+        window._batch_count = _TextField("10")
+        window._batch_qty = _TextField("")
+        window._maker_wait = _TextField("6")
+        window._chase_limit = _TextField("3")
+        window._current_limit_price = _TextField("")
+        window._target_limit_price = _TextField("")
+        window._mode = _ComboValue(text="双方挂单/先成交后市价", data="both_maker_first_taker")
+        window._use_limit_orders = type("_Check", (), {"isChecked": lambda self: False})()
+
+        plan = window._build_professional_open_plan()
+
+        self.assertIsInstance(plan, ProfessionalOpenExecutionPlan)
+        self.assertEqual(plan.size_value, Decimal("1"))
+        self.assertEqual(plan.size_unit, "coin")
+
+    def test_position_spot_text_prefers_cached_matching_spot_balance(self) -> None:
+        window = self._build_window()
+        window._spot_balance_lookup = {"BTC": "BTC-USDT | 可用 0.52 BTC | 余额 0.73 BTC"}
+        position = FuturesPositionView(
+            position_key="BTC-USD-260925|short",
+            inst_id="BTC-USD-260925",
+            inst_type="FUTURES",
+            side="short",
+            available=Decimal("17.6"),
+            contracts=Decimal("17.6"),
+            api_available=Decimal("17.6"),
+            api_contracts=Decimal("17.6"),
+            lot_size=Decimal("1"),
+            notional_base=Decimal("0.02946736"),
+            contract_value=Decimal("100"),
+            contract_value_ccy="USD",
+            notional_value=Decimal("1760"),
+            label="demo",
+        )
+
+        text = window._position_spot_text(position)
+
+        self.assertEqual(text, "对应现货：BTC-USDT | 可用 0.52 BTC | 余额 0.73 BTC")
+
+    def test_position_spot_text_falls_back_to_waiting_when_cache_missing(self) -> None:
+        window = self._build_window()
+        window._spot_balance_lookup = {}
+        position = FuturesPositionView(
+            position_key="BTC-USD-260925|short",
+            inst_id="BTC-USD-260925",
+            inst_type="FUTURES",
+            side="short",
+            available=Decimal("17.6"),
+            contracts=Decimal("17.6"),
+            api_available=Decimal("17.6"),
+            api_contracts=Decimal("17.6"),
+            lot_size=Decimal("1"),
+            notional_base=Decimal("0.02946736"),
+            contract_value=Decimal("100"),
+            contract_value_ccy="USD",
+            notional_value=Decimal("1760"),
+            label="demo",
+        )
+
+        text = window._position_spot_text(position)
+
+        self.assertEqual(text, "对应现货：BTC-USDT 等待账户余额...")
 
 
 if __name__ == "__main__":

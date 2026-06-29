@@ -20,7 +20,16 @@ from okx_quant.arbitrage.models import ArbitrageLedgerEntry, ArbitrageTradeRunti
 from okx_quant.arbitrage.position_ledger import find_ledger_entry, load_open_ledger_entries, upsert_ledger_entry
 from okx_quant.arbitrage.size_converter import preview_arbitrage_size
 from okx_quant.models import StrategyConfig
-from okx_quant.okx_client import OkxApiError, OkxOrderBook, OkxOrderResult, OkxOrderStatus, OkxRestClient, OkxTicker
+from okx_quant.okx_client import (
+    OkxApiError,
+    OkxMaxOrderSize,
+    OkxOrderBook,
+    OkxOrderResult,
+    OkxOrderStatus,
+    OkxPriceLimit,
+    OkxRestClient,
+    OkxTicker,
+)
 from okx_quant.pricing import format_decimal, snap_to_increment
 
 Logger = Callable[[str], None]
@@ -512,6 +521,8 @@ class ArbitrageExecutor:
         self._instrument_cache: dict[str, object] = {}
         self._ticker_cache: dict[tuple[str, str], tuple[float, OkxTicker]] = {}
         self._order_book_cache: dict[tuple[str, str, int], tuple[float, OkxOrderBook]] = {}
+        self._price_limit_cache: dict[tuple[str, str], tuple[float, OkxPriceLimit | None]] = {}
+        self._max_order_size_cache: dict[tuple[str, str, str], tuple[float, OkxMaxOrderSize | None]] = {}
         self._active_roll_order_ids: set[str] | None = None
 
     def _track_active_roll_order_id(self, order_id: str | None) -> None:
@@ -536,6 +547,16 @@ class ArbitrageExecutor:
 
     def _order_book_cache_key(self, inst_id: str, *, environment: str, depth: int) -> tuple[str, str, int]:
         return environment.strip().lower() or "demo", inst_id.strip().upper(), max(1, int(depth))
+
+    def _price_limit_cache_key(self, inst_id: str, *, environment: str) -> tuple[str, str]:
+        return environment.strip().lower() or "demo", inst_id.strip().upper()
+
+    def _max_order_size_cache_key(self, inst_id: str, *, environment: str, td_mode: str) -> tuple[str, str, str]:
+        return (
+            environment.strip().lower() or "demo",
+            inst_id.strip().upper(),
+            td_mode.strip().lower() or "cross",
+        )
 
     def _read_ttl_cache(self, cache: dict, key):
         now = time.monotonic()
@@ -617,6 +638,109 @@ class ArbitrageExecutor:
         except Exception:
             return None
 
+    def _preferred_price_limit(self, inst_id: str, *, environment: str) -> OkxPriceLimit | None:
+        cache_key = self._price_limit_cache_key(inst_id, environment=environment)
+        cached = self._read_ttl_cache(self._price_limit_cache, cache_key)
+        if cached is not None:
+            return cached
+        getter = getattr(self._client, "get_price_limit", None)
+        if not callable(getter):
+            return None
+        try:
+            price_limit = getter(inst_id)
+        except Exception:
+            return None
+        self._write_ttl_cache(self._price_limit_cache, cache_key, price_limit)
+        return price_limit
+
+    def _preferred_max_order_size(
+        self,
+        *,
+        credentials,
+        environment: str,
+        inst_id: str,
+        td_mode: str,
+    ) -> OkxMaxOrderSize | None:
+        cache_key = self._max_order_size_cache_key(inst_id, environment=environment, td_mode=td_mode)
+        cached = self._read_ttl_cache(self._max_order_size_cache, cache_key)
+        if cached is not None:
+            return cached
+        getter = getattr(self._client, "get_max_order_size", None)
+        if not callable(getter):
+            return None
+        try:
+            max_size = getter(
+                credentials,
+                environment=environment,
+                inst_id=inst_id,
+                td_mode=td_mode,
+            )
+        except Exception:
+            return None
+        self._write_ttl_cache(self._max_order_size_cache, cache_key, max_size)
+        return max_size
+
+    def _precheck_open_order_capacity(
+        self,
+        *,
+        credentials,
+        config: StrategyConfig,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        reduce_only: bool,
+    ) -> None:
+        if reduce_only or size <= 0:
+            return
+        try:
+            instrument = self._client.get_instrument(inst_id)
+        except Exception:
+            return
+        if str(getattr(instrument, "inst_type", "") or "").strip().upper() not in {"FUTURES", "SWAP"}:
+            return
+        max_size = self._preferred_max_order_size(
+            credentials=credentials,
+            environment=config.environment,
+            inst_id=inst_id,
+            td_mode=config.trade_mode,
+        )
+        if max_size is None:
+            return
+        normalized_side = side.strip().lower()
+        allowed = max_size.max_buy if normalized_side == "buy" else max_size.max_sell
+        if allowed is None or allowed <= 0:
+            raise OkxApiError(
+                f"{inst_id} 当前该方向可开额度为 0 张，无法继续开仓。"
+            )
+        if size > allowed:
+            raise OkxApiError(
+                f"{inst_id} 当前该方向最多还能开 {format_decimal(allowed)} 张，"
+                f"本次请求 {format_decimal(size)} 张。请减小开仓张数后重试。",
+                code="51004",
+            )
+
+    def _clamp_passive_price_to_band(
+        self,
+        *,
+        instrument,
+        side: str,
+        environment: str,
+        candidate: Decimal,
+    ) -> Decimal:
+        price_limit = self._preferred_price_limit(instrument.inst_id, environment=environment)
+        if price_limit is None:
+            return candidate
+        normalized_side = side.strip().lower()
+        if normalized_side == "buy":
+            buy_limit = price_limit.buy_limit
+            if buy_limit is None or buy_limit <= 0:
+                return candidate
+            return snap_to_increment(min(candidate, buy_limit), instrument.tick_size, "down")
+        sell_limit = price_limit.sell_limit
+        if sell_limit is None or sell_limit <= 0:
+            return candidate
+        return snap_to_increment(max(candidate, sell_limit), instrument.tick_size, "up")
+
     def _blend_avg_price(
         self,
         current_avg: Decimal | None,
@@ -649,11 +773,23 @@ class ArbitrageExecutor:
             raw = order_book.bids[0][0] if order_book is not None and order_book.bids else ticker.bid
             if raw is None or raw <= 0:
                 raise OkxApiError(f"{instrument.inst_id} 缺少买一价，无法挂被动买单。")
-            return snap_to_increment(raw, instrument.tick_size, "down")
+            candidate = snap_to_increment(raw, instrument.tick_size, "down")
+            return self._clamp_passive_price_to_band(
+                instrument=instrument,
+                side=normalized_side,
+                environment=environment,
+                candidate=candidate,
+            )
         raw = order_book.asks[0][0] if order_book is not None and order_book.asks else ticker.ask
         if raw is None or raw <= 0:
             raise OkxApiError(f"{instrument.inst_id} 缺少卖一价，无法挂被动卖单。")
-        return snap_to_increment(raw, instrument.tick_size, "up")
+        candidate = snap_to_increment(raw, instrument.tick_size, "up")
+        return self._clamp_passive_price_to_band(
+            instrument=instrument,
+            side=normalized_side,
+            environment=environment,
+            candidate=candidate,
+        )
 
     def _wait_order_fill_until(
         self,
@@ -1016,6 +1152,19 @@ class ArbitrageExecutor:
     ) -> OkxOrderResult:
         cl_ord_id = str(kwargs.get("cl_ord_id") or "").strip() or None
         inst_id = str(kwargs.get("inst_id") or "").strip().upper()
+        side = str(kwargs.get("side") or "").strip().lower()
+        reduce_only = bool(kwargs.get("reduce_only", False))
+        raw_size = kwargs.get("size")
+        size = raw_size if isinstance(raw_size, Decimal) else Decimal(str(raw_size or "0"))
+        if inst_id and side and size > 0:
+            self._precheck_open_order_capacity(
+                credentials=credentials,
+                config=config,
+                inst_id=inst_id,
+                side=side,
+                size=size,
+                reduce_only=reduce_only,
+            )
         try:
             result = self._client.place_simple_order(
                 credentials,
@@ -1025,6 +1174,26 @@ class ArbitrageExecutor:
             self._track_active_roll_order_id(result.ord_id)
             return result
         except OkxApiError as exc:
+            retried_result = self._retry_spot_post_only_as_limit(
+                credentials=credentials,
+                config=config,
+                label=label,
+                exc=exc,
+                kwargs=kwargs,
+            )
+            if retried_result is not None:
+                self._track_active_roll_order_id(retried_result.ord_id)
+                return retried_result
+            retried_result = self._retry_post_only_with_price_band(
+                credentials=credentials,
+                config=config,
+                label=label,
+                exc=exc,
+                kwargs=kwargs,
+            )
+            if retried_result is not None:
+                self._track_active_roll_order_id(retried_result.ord_id)
+                return retried_result
             if not cl_ord_id or not inst_id or not self._is_timeout_error_message(str(exc)):
                 raise
             self._logger(f"{label} 下单请求超时，正在按 clOrdId={cl_ord_id} 回查 OKX 是否已受理。")
@@ -1052,6 +1221,84 @@ class ArbitrageExecutor:
             )
             self._track_active_roll_order_id(result.ord_id)
             return result
+
+    def _retry_spot_post_only_as_limit(
+        self,
+        *,
+        credentials,
+        config: StrategyConfig,
+        label: str,
+        exc: OkxApiError,
+        kwargs: dict[str, object],
+    ) -> OkxOrderResult | None:
+        inst_id = str(kwargs.get("inst_id") or "").strip().upper()
+        ord_type = str(kwargs.get("ord_type") or "").strip().lower()
+        price = kwargs.get("price")
+        if exc.code != "51000" or ord_type != "post_only" or not inst_id or price is None:
+            return None
+        try:
+            instrument = self._client.get_instrument(inst_id)
+        except Exception:
+            return None
+        if str(getattr(instrument, "inst_type", "") or "").strip().upper() != "SPOT":
+            return None
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["ord_type"] = "limit"
+        self._logger(
+            f"{label} post_only 被 OKX 拒绝（51000），现货腿自动降级为同价 limit 重试："
+            f"{inst_id} @ {format_decimal(price if isinstance(price, Decimal) else Decimal(str(price)))}"
+        )
+        return self._client.place_simple_order(
+            credentials,
+            config,
+            **retry_kwargs,
+        )
+
+    def _retry_post_only_with_price_band(
+        self,
+        *,
+        credentials,
+        config: StrategyConfig,
+        label: str,
+        exc: OkxApiError,
+        kwargs: dict[str, object],
+    ) -> OkxOrderResult | None:
+        inst_id = str(kwargs.get("inst_id") or "").strip().upper()
+        ord_type = str(kwargs.get("ord_type") or "").strip().lower()
+        side = str(kwargs.get("side") or "").strip().lower()
+        price = kwargs.get("price")
+        if exc.code != "51006" or ord_type != "post_only" or not inst_id or price is None:
+            return None
+        try:
+            instrument = self._client.get_instrument(inst_id)
+        except Exception:
+            return None
+        try:
+            price_limit = self._preferred_price_limit(inst_id, environment=config.environment)
+        except Exception:
+            price_limit = None
+        if price_limit is None:
+            return None
+        current_price = price if isinstance(price, Decimal) else Decimal(str(price))
+        adjusted_price = self._clamp_passive_price_to_band(
+            instrument=instrument,
+            side=side,
+            environment=config.environment,
+            candidate=current_price,
+        )
+        if adjusted_price == current_price:
+            return None
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["price"] = adjusted_price
+        self._logger(
+            f"{label} post_only 触发 OKX 限价带（51006），自动按价带边界重试："
+            f"{inst_id} {side} {format_decimal(current_price)} -> {format_decimal(adjusted_price)}"
+        )
+        return self._client.place_simple_order(
+            credentials,
+            config,
+            **retry_kwargs,
+        )
 
     def _wait_order_terminal_after_cancel(
         self,

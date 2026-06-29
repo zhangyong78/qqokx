@@ -53,7 +53,17 @@ from okx_quant.arbitrage.order_book_analyzer import estimated_slippage_pct, vwap
 from okx_quant.arbitrage.size_converter import preview_arbitrage_size
 from okx_quant.models import Credentials, Instrument
 from okx_quant.models import Candle
-from okx_quant.okx_client import OkxAccountAssetItem, OkxAccountOverview, OkxApiError, OkxOrderBook, OkxOrderStatus, OkxPosition, OkxTicker, infer_inst_type
+from okx_quant.okx_client import (
+    OkxAccountAssetItem,
+    OkxAccountOverview,
+    OkxApiError,
+    OkxOrderBook,
+    OkxOrderStatus,
+    OkxPosition,
+    OkxPriceLimit,
+    OkxTicker,
+    infer_inst_type,
+)
 
 
 class ArbitrageCalculatorTest(unittest.TestCase):
@@ -1515,6 +1525,150 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertEqual(client.orders[1]["inst_id"], "BTC-USDT-SWAP")
         self.assertEqual(client.orders[1]["ord_type"], "post_only")
         self.assertEqual(client.orders[1]["side"], "sell")
+
+    def test_spot_post_only_51000_retries_as_limit(self) -> None:
+        class _SpotPostOnlyRejectClient(_FakeArbitrageTradeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.attempts: list[dict[str, object]] = []
+
+            def place_simple_order(self, credentials, config, **kwargs):  # noqa: ANN001
+                self.attempts.append(dict(kwargs))
+                if (
+                    kwargs.get("inst_id") == "BTC-USDT"
+                    and kwargs.get("ord_type") == "post_only"
+                    and len(self.attempts) == 1
+                ):
+                    raise OkxApiError("请求参数不合法", code="51000")
+                self.orders.append(kwargs)
+                return SimpleNamespace(ord_id=f"ord-{len(self.orders)}")
+
+        client = _SpotPostOnlyRejectClient()
+        executor = ArbitrageExecutor(client)
+        result = executor._place_simple_order_with_recovery(
+            Credentials("k", "s", "p"),
+            SimpleNamespace(trade_mode="cash", environment="demo"),
+            label="现货挂单腿",
+            inst_id="BTC-USDT",
+            side="buy",
+            size=Decimal("0.01"),
+            ord_type="post_only",
+            price=Decimal("100"),
+            reduce_only=False,
+            cl_ord_id="arb-test-1",
+        )
+
+        self.assertEqual(result.ord_id, "ord-1")
+        self.assertEqual(len(client.attempts), 2)
+        self.assertEqual(client.attempts[0]["ord_type"], "post_only")
+        self.assertEqual(client.attempts[1]["ord_type"], "limit")
+        self.assertEqual(client.orders[0]["ord_type"], "limit")
+
+    def test_resolve_passive_sell_price_clamps_to_okx_sell_limit(self) -> None:
+        class _PriceBandClient(_FakeArbitrageTradeClient):
+            def get_price_limit(self, inst_id: str) -> OkxPriceLimit | None:
+                return OkxPriceLimit(
+                    inst_id=inst_id,
+                    buy_limit=Decimal("60326.23"),
+                    sell_limit=Decimal("59126.97"),
+                    ts=1710000000000,
+                    raw={},
+                )
+
+        client = _PriceBandClient()
+        executor = ArbitrageExecutor(client)
+        instrument = client.get_instrument("BTC-USDT-260926")
+        price = executor._resolve_passive_price(
+            instrument,
+            side="sell",
+            environment="demo",
+            ticker=OkxTicker("BTC-USDT-260926", Decimal("59080"), Decimal("59070"), Decimal("59071.8"), None, None, raw={}),
+            order_book=OkxOrderBook(
+                "BTC-USDT-260926",
+                bids=((Decimal("59070"), Decimal("2")),),
+                asks=((Decimal("59071.8"), Decimal("3")),),
+                raw={},
+            ),
+        )
+
+        self.assertEqual(price, Decimal("59127.0"))
+
+    def test_post_only_51006_retries_with_price_band_boundary(self) -> None:
+        class _PostOnlyPriceBandRejectClient(_FakeArbitrageTradeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.attempts: list[dict[str, object]] = []
+
+            def get_price_limit(self, inst_id: str) -> OkxPriceLimit | None:
+                return OkxPriceLimit(
+                    inst_id=inst_id,
+                    buy_limit=Decimal("60326.23"),
+                    sell_limit=Decimal("59126.97"),
+                    ts=1710000000000,
+                    raw={},
+                )
+
+            def place_simple_order(self, credentials, config, **kwargs):  # noqa: ANN001
+                self.attempts.append(dict(kwargs))
+                if len(self.attempts) == 1:
+                    raise OkxApiError("价格不在限价范围内", code="51006")
+                self.orders.append(kwargs)
+                return SimpleNamespace(ord_id="ord-band-1")
+
+        client = _PostOnlyPriceBandRejectClient()
+        executor = ArbitrageExecutor(client)
+        result = executor._place_simple_order_with_recovery(
+            Credentials("k", "s", "p"),
+            SimpleNamespace(trade_mode="cross", environment="demo"),
+            label="衍生品挂单腿",
+            inst_id="BTC-USDT-260926",
+            side="sell",
+            size=Decimal("1"),
+            ord_type="post_only",
+            pos_side="short",
+            price=Decimal("59071.8"),
+            reduce_only=False,
+            cl_ord_id="arb-band-1",
+        )
+
+        self.assertEqual(result.ord_id, "ord-band-1")
+        self.assertEqual(len(client.attempts), 2)
+        self.assertEqual(client.attempts[0]["price"], Decimal("59071.8"))
+        self.assertEqual(client.attempts[1]["price"], Decimal("59127.0"))
+        self.assertEqual(client.attempts[1]["ord_type"], "post_only")
+
+    def test_precheck_open_capacity_blocks_derivative_order_before_submit(self) -> None:
+        class _CapacityLimitedClient(_FakeArbitrageTradeClient):
+            def get_max_order_size(self, credentials, *, environment: str, inst_id: str, td_mode: str):  # noqa: ANN001
+                return SimpleNamespace(
+                    inst_id=inst_id,
+                    ccy="BTC",
+                    max_buy=Decimal("20"),
+                    max_sell=Decimal("8.2"),
+                    raw={},
+                )
+
+        client = _CapacityLimitedClient()
+        executor = ArbitrageExecutor(client)
+
+        with self.assertRaises(OkxApiError) as ctx:
+            executor._place_simple_order_with_recovery(
+                Credentials("k", "s", "p"),
+                SimpleNamespace(trade_mode="cross", environment="demo"),
+                label="衍生品挂单腿",
+                inst_id="BTC-USDT-260926",
+                side="sell",
+                size=Decimal("11.8"),
+                ord_type="post_only",
+                pos_side="short",
+                price=Decimal("59727.1"),
+                reduce_only=False,
+                cl_ord_id="arb-cap-1",
+            )
+
+        self.assertIn("最多还能开 8.2 张", str(ctx.exception))
+        self.assertIn("本次请求 11.8 张", str(ctx.exception))
+        self.assertEqual(client.orders, [])
 
     def test_open_supports_batch_execution_by_count(self) -> None:
         client = _FakeArbitrageTradeClient()

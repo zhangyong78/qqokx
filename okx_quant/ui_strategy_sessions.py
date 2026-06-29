@@ -945,67 +945,8 @@ class UiStrategySessionsMixin:
         canvas = Canvas(chart_frame, background="#ffffff", highlightthickness=0, width=1120, height=620)
         canvas.grid(row=0, column=0, sticky="nsew")
 
-        tools_frame = ttk.Frame(container)
-        tools_frame.grid(row=2, column=0, sticky="ew", pady=(8, 4))
-        tools_frame.columnconfigure(11, weight=1)
-
-        ttk.Label(tools_frame, text="画线工具").grid(row=0, column=0, sticky="w")
-        ttk.Button(tools_frame, text="趋势线", command=lambda target_session_id=session_id: self._set_live_chart_tool(target_session_id, "line")).grid(row=0, column=1, padx=(6, 2))
-        ttk.Button(tools_frame, text="水平线", command=lambda target_session_id=session_id: self._set_live_chart_tool(target_session_id, "horizontal")).grid(row=0, column=2, padx=2)
-        ttk.Button(tools_frame, text="止损线", command=lambda target_session_id=session_id: self._set_live_chart_tool(target_session_id, "stop")).grid(row=0, column=3, padx=2)
-        ttk.Button(tools_frame, text="清空线", command=lambda target_session_id=session_id: self._clear_live_chart_annotations(target_session_id)).grid(row=0, column=4, padx=(2, 10))
-
-        ttk.Label(tools_frame, text="价格基准").grid(row=0, column=5, sticky="e")
-        trade_price_basis = StringVar(value="最新价格")
-        ttk.Combobox(
-            tools_frame,
-            width=9,
-            state="readonly",
-            values=("最新价格", "最新K线", "上一根K线"),
-            textvariable=trade_price_basis,
-        ).grid(row=0, column=6, padx=(4, 8))
-        ttk.Label(tools_frame, text="止损基准").grid(row=0, column=7, sticky="e")
-        trade_stop_basis = StringVar(value="上一根ATR")
-        ttk.Combobox(
-            tools_frame,
-            width=11,
-            state="readonly",
-            values=("上一根ATR", "前三根高低", "止损线"),
-            textvariable=trade_stop_basis,
-        ).grid(row=0, column=8, padx=(4, 8))
-        trade_order_mode = StringVar(value="限价挂单")
-        ttk.Combobox(
-            tools_frame,
-            width=9,
-            state="readonly",
-            values=("限价挂单", "对手价"),
-            textvariable=trade_order_mode,
-        ).grid(row=0, column=9, padx=(0, 8))
-        ttk.Button(tools_frame, text="开多", command=lambda target_session_id=session_id: self._submit_live_chart_trade(target_session_id, "long")).grid(row=0, column=10, padx=(0, 4))
-        ttk.Button(tools_frame, text="开空", command=lambda target_session_id=session_id: self._submit_live_chart_trade(target_session_id, "short")).grid(row=0, column=11, sticky="w")
-
-        trade_config_frame = ttk.Frame(container)
-        trade_config_frame.grid(row=3, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(trade_config_frame, text="定量").grid(row=0, column=0, sticky="w")
-        trade_risk_mode = StringVar(value="以损定量")
-        ttk.Combobox(
-            trade_config_frame,
-            width=9,
-            state="readonly",
-            values=("以损定量", "固定张数"),
-            textvariable=trade_risk_mode,
-        ).grid(row=0, column=1, padx=(4, 8))
-        ttk.Label(trade_config_frame, text="风险金").grid(row=0, column=2, sticky="e")
-        trade_risk_amount = StringVar(value=format_decimal(session.config.risk_amount or Decimal("20")))
-        ttk.Entry(trade_config_frame, width=10, textvariable=trade_risk_amount).grid(row=0, column=3, padx=(4, 8))
-        ttk.Label(trade_config_frame, text="固定张数").grid(row=0, column=4, sticky="e")
-        trade_fixed_size = StringVar(value=format_decimal(session.config.order_size or Decimal("1")))
-        ttk.Entry(trade_config_frame, width=10, textvariable=trade_fixed_size).grid(row=0, column=5, padx=(4, 8))
-        trade_status_text = StringVar(value="划线交易待命。")
-        ttk.Label(trade_config_frame, textvariable=trade_status_text).grid(row=0, column=6, sticky="w")
-
         footer = ttk.Frame(container)
-        footer.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        footer.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         footer.columnconfigure(0, weight=1)
         ttk.Label(footer, textvariable=footer_text, justify="left", wraplength=980).grid(row=0, column=0, sticky="w")
         action_row = ttk.Frame(footer)
@@ -1030,13 +971,6 @@ class UiStrategySessionsMixin:
             headline_text=headline_text,
             status_text=status_text,
             footer_text=footer_text,
-            trade_price_basis=trade_price_basis,
-            trade_stop_basis=trade_stop_basis,
-            trade_order_mode=trade_order_mode,
-            trade_risk_mode=trade_risk_mode,
-            trade_risk_amount=trade_risk_amount,
-            trade_fixed_size=trade_fixed_size,
-            trade_status_text=trade_status_text,
         )
         self._strategy_live_chart_windows[session_id] = state
         window.protocol("WM_DELETE_WINDOW", lambda target_session_id=session_id: self._close_strategy_live_chart_window(target_session_id))
