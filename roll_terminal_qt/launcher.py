@@ -19,7 +19,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from okx_quant.app_paths import config_dir_path, data_root, logs_dir_path, state_dir_path
+from roll_terminal_qt.auto_channel_window import AutoChannelWindow
+from roll_terminal_qt.line_trading_window import LineTradingQtWindow
 from roll_terminal_qt.module_overview import ModuleOverview, build_module_overview, launcher_module_specs
+from roll_terminal_qt.smart_order_window import SmartOrderQtWindow
 from roll_terminal_qt.style import APP_STYLE
 from roll_terminal_qt.ui import RollTerminalWindow
 
@@ -198,6 +202,33 @@ class LauncherWindow(QMainWindow):
         hero_layout.addWidget(intro)
         root_layout.addWidget(hero)
 
+        shared_panel = QFrame()
+        shared_panel.setObjectName("Guide")
+        shared_layout = QGridLayout(shared_panel)
+        shared_layout.setContentsMargins(18, 18, 18, 18)
+        shared_layout.setHorizontalSpacing(18)
+        shared_layout.setVerticalSpacing(8)
+        shared_title = QLabel("共享配置与数据")
+        shared_title.setObjectName("GuideTitle")
+        shared_layout.addWidget(shared_title, 0, 0, 1, 2)
+        for row, (label, value) in enumerate(
+            (
+                ("数据根目录", str(data_root())),
+                ("配置目录", str(config_dir_path())),
+                ("状态目录", str(state_dir_path())),
+                ("日志目录", str(logs_dir_path())),
+            ),
+            start=1,
+        ):
+            key_label = QLabel(label)
+            key_label.setObjectName("GuideText")
+            value_label = QLabel(value)
+            value_label.setObjectName("GuideText")
+            value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            shared_layout.addWidget(key_label, row, 0)
+            shared_layout.addWidget(value_label, row, 1)
+        root_layout.addWidget(shared_panel)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         content = QWidget()
@@ -232,6 +263,12 @@ def create_module_window(module_key: str) -> QWidget:
     normalized = module_key.strip().lower()
     if normalized == "roll":
         return RollTerminalWindow()
+    if normalized == "smart-order":
+        return SmartOrderQtWindow()
+    if normalized == "line-trading":
+        return LineTradingQtWindow()
+    if normalized == "auto-channel":
+        return AutoChannelWindow()
     for spec in launcher_module_specs():
         if spec.key == normalized:
             return ModuleOverviewWindow(module_key=spec.key, title=spec.title, subtitle=spec.subtitle)
@@ -266,4 +303,3 @@ def run(argv: Iterable[str] | None = None) -> int:
     window = create_root_window(args.module)
     window.show()
     return app.exec()
-

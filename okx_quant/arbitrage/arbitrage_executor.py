@@ -129,6 +129,10 @@ class ArbitrageCloseRequest:
     execution_mode: str = "dual_taker"
     maker_wait_seconds: float = 6.0
     chase_limit: int = 3
+    base_ccy: str | None = None
+    spot_inst_id: str | None = None
+    derivative_inst_id: str | None = None
+    current_derivative_qty: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -769,21 +773,50 @@ class ArbitrageExecutor:
         order_book = order_book or self._preferred_order_book(instrument.inst_id, environment=environment, depth=5)
         ticker = ticker or self._preferred_ticker(instrument.inst_id, environment=environment)
         normalized_side = side.strip().lower()
+        tick_size = instrument.tick_size
+        best_bid = order_book.bids[0][0] if order_book is not None and order_book.bids else ticker.bid
+        best_ask = order_book.asks[0][0] if order_book is not None and order_book.asks else ticker.ask
         if normalized_side == "buy":
-            raw = order_book.bids[0][0] if order_book is not None and order_book.bids else ticker.bid
+            raw = best_bid
             if raw is None or raw <= 0:
-                raise OkxApiError(f"{instrument.inst_id} 缺少买一价，无法挂被动买单。")
-            candidate = snap_to_increment(raw, instrument.tick_size, "down")
+                last = ticker.last
+                fallback_ask = best_ask
+                if last is not None and last > 0:
+                    raw = last
+                elif fallback_ask is not None and fallback_ask > tick_size:
+                    raw = fallback_ask - tick_size
+                else:
+                    raise OkxApiError(f"{instrument.inst_id} 缺少买一价，无法挂被动买单。")
+                if fallback_ask is not None and fallback_ask > 0:
+                    raw = min(raw, fallback_ask - tick_size)
+                if raw <= 0:
+                    raise OkxApiError(f"{instrument.inst_id} 缺少有效挂单价，无法挂被动买单。")
+                self._logger(
+                    f"{instrument.inst_id} 缺少买一价，挂被动买单改用兜底价格 {format_decimal(raw)}。"
+                )
+            candidate = snap_to_increment(raw, tick_size, "down")
             return self._clamp_passive_price_to_band(
                 instrument=instrument,
                 side=normalized_side,
                 environment=environment,
                 candidate=candidate,
             )
-        raw = order_book.asks[0][0] if order_book is not None and order_book.asks else ticker.ask
+        raw = best_ask
         if raw is None or raw <= 0:
-            raise OkxApiError(f"{instrument.inst_id} 缺少卖一价，无法挂被动卖单。")
-        candidate = snap_to_increment(raw, instrument.tick_size, "up")
+            last = ticker.last
+            fallback_bid = best_bid
+            if last is not None and last > 0:
+                raw = last
+            elif fallback_bid is not None and fallback_bid > 0:
+                raw = fallback_bid + tick_size
+            else:
+                raise OkxApiError(f"{instrument.inst_id} 缺少卖一价，无法挂被动卖单。")
+            if fallback_bid is not None and fallback_bid > 0:
+                raw = max(raw, fallback_bid + tick_size)
+            self._logger(
+                f"{instrument.inst_id} 缺少卖一价，挂被动卖单改用兜底价格 {format_decimal(raw)}。"
+            )
+        candidate = snap_to_increment(raw, tick_size, "up")
         return self._clamp_passive_price_to_band(
             instrument=instrument,
             side=normalized_side,
@@ -2350,6 +2383,7 @@ class ArbitrageExecutor:
             ledger_entry_ids: list[str] = []
             batch_messages: list[str] = []
             for index, batch_qty in enumerate(planned_batches, start=1):
+                self._logger(f"分批开仓：第 {index}/{len(planned_batches)} 批，目标 {format_decimal(batch_qty)} 张")
                 batch_request = replace(
                     request,
                     size=batch_qty,
@@ -2396,6 +2430,7 @@ class ArbitrageExecutor:
                         ledger_entry_id=ledger_entry_ids[0] if len(ledger_entry_ids) == 1 else None,
                     )
                 if index < len(planned_batches) and callable(should_stop_after_batch) and should_stop_after_batch():
+                    self._logger(f"已按停止请求在第 {index}/{len(planned_batches)} 批完成后停止后续批次。")
                     return ArbitrageOpenResult(
                         success=True,
                         message=(
@@ -2409,6 +2444,7 @@ class ArbitrageExecutor:
                         ledger_entry_id=ledger_entry_ids[0] if len(ledger_entry_ids) == 1 else None,
                     )
                 if index < len(planned_batches) and callable(wait_before_next_batch) and not wait_before_next_batch():
+                    self._logger(f"分批开仓在第 {index}/{len(planned_batches)} 批完成后暂停后续批次。")
                     return ArbitrageOpenResult(
                         success=True,
                         message=(
@@ -2615,43 +2651,83 @@ class ArbitrageExecutor:
         request: ArbitrageCloseRequest,
         *,
         runtime: ArbitrageTradeRuntime,
+        should_stop_after_batch: Callable[[], bool] | None = None,
+        wait_before_next_batch: Callable[[], bool] | None = None,
     ) -> ArbitrageCloseResult:
-        if request.close_derivative_qty is not None and not request.entry_id:
-            return ArbitrageCloseResult(
-                success=False,
-                message="指定平仓数量时，请先选择一条具体的套利持仓。",
-                closed_count=0,
-            )
-        targets = load_open_ledger_entries()
-        if request.entry_id:
-            targets = [item for item in targets if item.entry_id == request.entry_id]
-        if not targets:
-            return ArbitrageCloseResult(success=False, message="没有可平仓的套利持仓。", closed_count=0)
+        tracked_by_ledger = bool(request.entry_id)
+        if tracked_by_ledger:
+            targets = load_open_ledger_entries()
+            if request.entry_id:
+                targets = [item for item in targets if item.entry_id == request.entry_id]
+            if not targets:
+                return ArbitrageCloseResult(success=False, message="没有可平仓的套利持仓。", closed_count=0)
+        else:
+            if not request.derivative_inst_id:
+                return ArbitrageCloseResult(success=False, message="缺少衍生品持仓合约，无法执行套利平仓。", closed_count=0)
+            if not request.spot_inst_id:
+                return ArbitrageCloseResult(success=False, message="缺少配对现货合约，无法执行套利平仓。", closed_count=0)
+            current_derivative_qty = request.current_derivative_qty or request.close_derivative_qty
+            if current_derivative_qty is None or current_derivative_qty <= 0:
+                return ArbitrageCloseResult(success=False, message="缺少有效的衍生品可平数量。", closed_count=0)
+            targets = [
+                ArbitrageLedgerEntry(
+                    entry_id="",
+                    base_ccy=(request.base_ccy or request.derivative_inst_id.split("-")[0]).strip().upper(),
+                    pair_kind="spot_future",
+                    spot_inst_id=request.spot_inst_id,
+                    derivative_inst_id=request.derivative_inst_id,
+                    spot_qty=Decimal("0"),
+                    derivative_qty=max(current_derivative_qty, Decimal("0")),
+                    open_spot_price=None,
+                    open_derivative_price=None,
+                    close_spot_price=None,
+                    close_derivative_price=None,
+                    basis_at_open_pct=None,
+                    fee_total=Decimal("0"),
+                    funding_total=Decimal("0"),
+                    realized_pnl=None,
+                    close_mode="open",
+                    opened_at=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    closed_at=None,
+                    notes="live_close_source",
+                )
+            ]
 
         closed_ids: list[str] = []
+        completed_targets = 0
         total_pnl = Decimal("0")
         errors: list[str] = []
         for entry in targets:
             try:
-                pnl = self._close_single_entry(entry, request, runtime=runtime)
-                closed_ids.append(entry.entry_id)
+                pnl = self._close_single_entry(
+                    entry,
+                    request,
+                    runtime=runtime,
+                    should_stop_after_batch=should_stop_after_batch,
+                    wait_before_next_batch=wait_before_next_batch,
+                )
+                completed_targets += 1
+                if entry.entry_id:
+                    closed_ids.append(entry.entry_id)
                 if pnl is not None:
                     total_pnl += pnl
             except Exception as exc:
                 errors.append(f"{entry.base_ccy}: {exc}")
                 self._logger(f"平仓失败 {entry.base_ccy}：{exc}")
 
-        if not closed_ids:
+        if completed_targets <= 0:
             return ArbitrageCloseResult(success=False, message="；".join(errors) or "平仓失败。", closed_count=0)
-        message = f"已平仓 {len(closed_ids)} 笔"
+        message = f"已平仓 {len(closed_ids)} 笔" if tracked_by_ledger else "已按实时持仓平仓"
         if errors:
             message += f"，{len(errors)} 笔失败"
-        if closed_ids:
+        if closed_ids or not tracked_by_ledger:
             message += f"，合计盈亏约 {format_decimal(total_pnl)} USDT"
+        if not tracked_by_ledger:
+            message += "，已补记本地平仓归档"
         return ArbitrageCloseResult(
             success=True,
             message=message,
-            closed_count=len(closed_ids),
+            closed_count=len(closed_ids) if tracked_by_ledger else completed_targets,
             entry_ids=tuple(closed_ids),
             total_pnl=total_pnl,
         )
@@ -2662,6 +2738,8 @@ class ArbitrageExecutor:
         request: ArbitrageCloseRequest,
         *,
         runtime: ArbitrageTradeRuntime,
+        should_stop_after_batch: Callable[[], bool] | None = None,
+        wait_before_next_batch: Callable[[], bool] | None = None,
     ) -> Decimal | None:
         credentials = runtime.credentials
         self._prime_market_context((entry.spot_inst_id, entry.derivative_inst_id), environment=runtime.environment)
@@ -2669,6 +2747,7 @@ class ArbitrageExecutor:
         deriv_inst = self._cached_instrument(entry.derivative_inst_id)
         deriv_ticker = self._preferred_ticker(entry.derivative_inst_id, environment=runtime.environment)
         spot_ticker = self._preferred_ticker(entry.spot_inst_id, environment=runtime.environment)
+        tracked_by_ledger = bool(entry.entry_id)
         planned_derivative_qty = self._resolve_close_derivative_qty(entry, request, deriv_inst)
         planned_batches = _split_derivative_batches(
             planned_derivative_qty,
@@ -2679,9 +2758,11 @@ class ArbitrageExecutor:
         if len(planned_batches) > 1:
             total_pnl = Decimal("0")
             for index, batch_qty in enumerate(planned_batches, start=1):
-                current_entry = find_ledger_entry(entry.entry_id)
-                if current_entry is None or current_entry.close_mode != "open":
-                    raise OkxApiError(f"分批平仓第 {index} 批前未找到可继续处理的 open 持仓。")
+                current_entry = entry
+                if tracked_by_ledger:
+                    current_entry = find_ledger_entry(entry.entry_id)
+                    if current_entry is None or current_entry.close_mode != "open":
+                        raise OkxApiError(f"分批平仓第 {index} 批前未找到可继续处理的 open 持仓。")
                 batch_request = replace(
                     request,
                     close_derivative_qty=batch_qty,
@@ -2689,9 +2770,21 @@ class ArbitrageExecutor:
                     batch_contract_qty=None,
                 )
                 self._logger(f"分批平仓：第 {index}/{len(planned_batches)} 批，目标 {format_decimal(batch_qty)} 张")
-                batch_pnl = self._close_single_entry(current_entry, batch_request, runtime=runtime)
+                batch_pnl = self._close_single_entry(
+                    current_entry,
+                    batch_request,
+                    runtime=runtime,
+                    should_stop_after_batch=None,
+                    wait_before_next_batch=None,
+                )
                 if batch_pnl is not None:
                     total_pnl += batch_pnl
+                if index < len(planned_batches) and callable(should_stop_after_batch) and should_stop_after_batch():
+                    self._logger(f"已按停止请求在第 {index}/{len(planned_batches)} 批完成后停止后续批次。")
+                    break
+                if index < len(planned_batches) and callable(wait_before_next_batch) and not wait_before_next_batch():
+                    self._logger(f"分批平仓在第 {index}/{len(planned_batches)} 批完成后暂停后续批次。")
+                    break
             return total_pnl
         planned_spot_qty = snap_to_increment(
             spot_base_from_derivative_fill(
@@ -2711,6 +2804,7 @@ class ArbitrageExecutor:
             f"合约买入 {format_decimal(planned_derivative_qty)} 张 @ {format_decimal(deriv_price)}，"
             f"现货卖出 {format_decimal(planned_spot_qty)} @ {format_decimal(spot_price)}"
         )
+        spot_avg: Decimal | None = None
         if request.execution_mode == "both_maker_first_taker":
             deriv_config = _build_strategy_config(entry.derivative_inst_id, runtime)
             spot_config = _build_strategy_config(entry.spot_inst_id, runtime)
@@ -2861,6 +2955,42 @@ class ArbitrageExecutor:
             derivative_instrument=deriv_inst,
             derivative_qty=deriv_reconciled.filled_size,
         )
+        if not tracked_by_ledger:
+            closed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            remaining_derivative_qty = snap_to_increment(
+                max(entry.derivative_qty - deriv_reconciled.filled_size, Decimal("0")),
+                deriv_inst.lot_size,
+                "down",
+            )
+            close_mode = "partial" if remaining_derivative_qty > 0 else "full"
+            archive_note = "实时持仓平仓归档"
+            archived_entry = ArbitrageLedgerEntry(
+                entry_id=uuid.uuid4().hex,
+                base_ccy=entry.base_ccy,
+                pair_kind=entry.pair_kind,
+                spot_inst_id=entry.spot_inst_id,
+                derivative_inst_id=entry.derivative_inst_id,
+                spot_qty=spot_reconciled.filled_size,
+                derivative_qty=deriv_reconciled.filled_size,
+                open_spot_price=entry.open_spot_price,
+                open_derivative_price=entry.open_derivative_price,
+                close_spot_price=spot_avg,
+                close_derivative_price=deriv_avg,
+                basis_at_open_pct=entry.basis_at_open_pct,
+                fee_total=Decimal("0"),
+                funding_total=Decimal("0"),
+                realized_pnl=pnl,
+                close_mode=close_mode,
+                opened_at=entry.opened_at,
+                closed_at=closed_at,
+                notes=archive_note,
+            )
+            upsert_ledger_entry(archived_entry)
+            self._logger(
+                f"{entry.base_ccy} 平仓完成：合约 {format_decimal(deriv_reconciled.filled_size)} 张，"
+                f"现货 {format_decimal(spot_reconciled.filled_size)}。来源为实时持仓，已补记本地平仓归档。"
+            )
+            return pnl
         closed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         remaining_derivative_qty = snap_to_increment(
             max(entry.derivative_qty - deriv_reconciled.filled_size, Decimal("0")),

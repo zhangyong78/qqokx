@@ -31,6 +31,7 @@ class FuturesPositionView:
 
 class AccountFeedThread(QThread):
     positions_ready = Signal(object)
+    spot_balances_ready = Signal(object)
     status_changed = Signal(str)
 
     def __init__(self, runtime: ArbitrageTradeRuntime | None) -> None:
@@ -50,7 +51,9 @@ class AccountFeedThread(QThread):
                 continue
             try:
                 positions = self._load_futures_positions()
+                spot_balances = self._load_spot_balance_lookup()
                 self.positions_ready.emit(positions)
+                self.spot_balances_ready.emit(spot_balances)
                 self.status_changed.emit(self._build_status_text(len(positions)))
                 time.sleep(2.5)
             except Exception as exc:  # noqa: BLE001
@@ -83,6 +86,43 @@ class AccountFeedThread(QThread):
             ),
         ]
         return [self._to_view(item) for item in rest_positions]
+
+    def _load_spot_balance_lookup(self) -> dict[str, str]:
+        assert self._runtime is not None
+        overview = None
+        cached_payload = self._client.get_cached_private_account_overview(
+            self._runtime.credentials,
+            environment=self._runtime.environment,
+        )
+        if cached_payload is not None:
+            _, overview = cached_payload
+        if overview is None:
+            try:
+                overview = self._client.get_account_overview(
+                    self._runtime.credentials,
+                    environment=self._runtime.environment,
+                    prefer_cache=False,
+                )
+            except Exception:
+                return {}
+        details = getattr(overview, "details", ()) or ()
+        lookup: dict[str, str] = {}
+        for asset in details:
+            ccy = str(getattr(asset, "ccy", "") or "").strip().upper()
+            if not ccy or ccy in {"USDT", "USDC", "USD"}:
+                continue
+            available = getattr(asset, "available_balance", None)
+            equity = getattr(asset, "equity", None)
+            cash_balance = getattr(asset, "cash_balance", None)
+            total = equity if equity is not None else cash_balance
+            qty = available if available is not None and available > 0 else total
+            if qty is None or qty <= 0:
+                continue
+            text = f"{ccy}-USDT | 可用 {_fmt(qty)} {ccy}"
+            if total is not None and total > 0 and total != qty:
+                text += f" | 余额 {_fmt(total)} {ccy}"
+            lookup[ccy] = text
+        return lookup
 
     def _build_status_text(self, position_count: int) -> str:
         assert self._runtime is not None

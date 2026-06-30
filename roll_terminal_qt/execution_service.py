@@ -14,6 +14,7 @@ from okx_quant.arbitrage.arbitrage_executor import (
     ArbitrageOpenRequest,
     ArbitrageRollRequest,
     _build_strategy_config,
+    _split_derivative_batches,
     _wait_order_fill,
 )
 from okx_quant.arbitrage.arbitrage_manager import ArbitrageManager
@@ -54,6 +55,7 @@ class RollExecutionPlan:
     target_limit_price: Decimal | None = None
     batch_count: int = 1
     batch_contract_qty: Decimal | None = None
+    derivative_lot_size: Decimal = Decimal("1")
     maker_wait_seconds: float = 6.0
     chase_limit: int = 3
     force_completion: bool = False
@@ -81,6 +83,7 @@ class ProfessionalOpenExecutionPlan:
     derivative_limit_price: Decimal | None = None
     batch_count: int = 1
     batch_contract_qty: Decimal | None = None
+    derivative_lot_size: Decimal = Decimal("1")
     maker_wait_seconds: float = 6.0
     chase_limit: int = 3
 
@@ -107,9 +110,11 @@ class ProfessionalCloseExecutionPlan:
     derivative_limit_price: Decimal | None = None
     batch_count: int = 1
     batch_contract_qty: Decimal | None = None
+    derivative_lot_size: Decimal = Decimal("1")
     maker_wait_seconds: float = 6.0
     chase_limit: int = 3
     close_profit_spot: bool = False
+    position_available_contracts: Decimal = Decimal("0")
 
     @property
     def execution_mode(self) -> str:
@@ -170,8 +175,13 @@ def _wait_for_auto_spread_resume(
     threshold: Decimal,
     should_stop: Callable[[], bool],
     logger: Callable[[str], None],
+    trigger_when: str = "gte",
     wait_seconds: float = 0.8,
 ) -> bool:
+    if trigger_when not in {"gte", "lte"}:
+        raise ValueError(f"Unsupported auto trigger comparator: {trigger_when}")
+    resume_operator = "<=" if trigger_when == "lte" else ">="
+    wait_operator = ">" if trigger_when == "lte" else "<"
     waiting_logged = False
     while True:
         if should_stop():
@@ -190,16 +200,19 @@ def _wait_for_auto_spread_resume(
                 waiting_logged = True
             time.sleep(wait_seconds)
             continue
-        if spread_abs is not None and spread_abs >= threshold:
+        condition_met = spread_abs is not None and (
+            spread_abs <= threshold if trigger_when == "lte" else spread_abs >= threshold
+        )
+        if condition_met:
             if waiting_logged:
                 logger(
-                    f"自动交易条件恢复：当前价差 {fmt_decimal(spread_abs)} >= {fmt_decimal(threshold)}，继续下一批。"
+                    f"自动交易条件恢复：当前价差 {fmt_decimal(spread_abs)} {resume_operator} {fmt_decimal(threshold)}，继续下一批。"
                 )
             return True
         if not waiting_logged:
             spread_text = fmt_decimal(spread_abs) if spread_abs is not None else "-"
             logger(
-                f"自动交易等待下一批：当前价差 {spread_text} < {fmt_decimal(threshold)}，"
+                f"自动交易等待下一批：当前价差 {spread_text} {wait_operator} {fmt_decimal(threshold)}，"
                 "暂停后续批次，等待重新满足后继续。"
             )
             waiting_logged = True
@@ -1005,11 +1018,13 @@ class ProfessionalCloseExecutionThread(QThread):
         *,
         runtime: ArbitrageTradeRuntime,
         plan: ProfessionalCloseExecutionPlan,
+        auto_pause_threshold: Decimal | None = None,
     ) -> None:
         super().__init__()
         self._runtime = runtime
         self._plan = plan
         self._stop_after_batch_requested = False
+        self._auto_pause_threshold = auto_pause_threshold
 
     @property
     def supports_stop_after_batch(self) -> bool:
@@ -1026,6 +1041,29 @@ class ProfessionalCloseExecutionThread(QThread):
 
     def _base_ccy(self) -> str:
         return str(self._plan.spot_inst_id or "").strip().upper().split("-", 1)[0]
+
+    def _planned_batch_summary(self, client: OkxRestClient, qty_contracts: Decimal) -> str:
+        try:
+            batches = self._planned_batches(client, qty_contracts)
+        except Exception:
+            return ""
+        if len(batches) <= 1:
+            return "预计 1 批"
+        batch_text = " + ".join(fmt_decimal(item) for item in batches[:4])
+        if len(batches) > 4:
+            batch_text += " + ..."
+        return f"预计 {len(batches)} 批（{batch_text}）"
+
+    def _planned_batches(self, client: OkxRestClient, qty_contracts: Decimal) -> list[Decimal]:
+        instrument = client.get_instrument(self._plan.derivative_inst_id, prefer_cached=True)
+        return list(
+            _split_derivative_batches(
+                qty_contracts,
+                instrument=instrument,
+                batch_count=self._plan.batch_count,
+                batch_contract_qty=self._plan.batch_contract_qty,
+            )
+        )
 
     def _is_coin_settled_derivative(self, client: OkxRestClient) -> bool:
         base_ccy = self._base_ccy()
@@ -1129,10 +1167,11 @@ class ProfessionalCloseExecutionThread(QThread):
     def run(self) -> None:
         client = OkxRestClient()
         manager = ArbitrageManager(client, logger=self.log.emit)
+        plan_entry_ids = tuple(entry_id for entry_id in self._plan.entry_ids if str(entry_id).strip())
         open_entries = {
             item.entry_id: item
             for item in load_open_ledger_entries()
-            if item.entry_id in set(self._plan.entry_ids)
+            if item.entry_id in set(plan_entry_ids)
         }
         remaining_qty = self._plan.qty_contracts
         total_pnl = Decimal("0")
@@ -1140,7 +1179,7 @@ class ProfessionalCloseExecutionThread(QThread):
         profit_spot_sold_qty = Decimal("0")
         closed_ids: list[str] = []
         errors: list[str] = []
-        total_entries = len(self._plan.entry_ids)
+        total_entries = len(plan_entry_ids)
 
         self.status.emit(
             ExecutionStatus(
@@ -1157,56 +1196,119 @@ class ProfessionalCloseExecutionThread(QThread):
             f" | 合约张数 {self._plan.qty_contracts} | {self._plan.execution_label}"
         )
 
-        for index, entry_id in enumerate(self._plan.entry_ids, start=1):
-            if self._stop_after_batch_requested:
-                self.log.emit("已收到停止请求：当前已完成批次后停止后续平仓。")
-                break
-            if remaining_qty <= 0:
-                break
-            entry = find_ledger_entry(entry_id) or open_entries.get(entry_id)
-            if entry is None or entry.close_mode != "open":
-                errors.append(f"{entry_id}: 未找到可继续处理的 open 持仓")
-                continue
-            close_qty = min(remaining_qty, entry.derivative_qty)
-            if close_qty <= 0:
-                continue
-            self.status.emit(
-                ExecutionStatus(
-                    phase="执行中",
-                    current_inst_id=self._plan.derivative_inst_id,
-                    target_inst_id=self._plan.spot_inst_id,
-                    current_filled=total_derivative_qty,
-                    target_filled=total_derivative_qty,
-                    message=f"正在处理第 {index}/{total_entries} 笔套利持仓，目标 {fmt_decimal(close_qty)} 张",
+        if plan_entry_ids:
+            for index, entry_id in enumerate(plan_entry_ids, start=1):
+                if self._stop_after_batch_requested:
+                    self.log.emit("已收到停止请求：当前已完成批次后停止后续平仓。")
+                    break
+                if remaining_qty <= 0:
+                    break
+                entry = find_ledger_entry(entry_id) or open_entries.get(entry_id)
+                if entry is None or entry.close_mode != "open":
+                    errors.append(f"{entry_id}: 未找到可继续处理的 open 持仓")
+                    continue
+                close_qty = min(remaining_qty, entry.derivative_qty)
+                if close_qty <= 0:
+                    continue
+                self.status.emit(
+                    ExecutionStatus(
+                        phase="执行中",
+                        current_inst_id=self._plan.derivative_inst_id,
+                        target_inst_id=self._plan.spot_inst_id,
+                        current_filled=total_derivative_qty,
+                        target_filled=total_derivative_qty,
+                        message=(
+                            f"正在处理第 {index}/{total_entries} 笔套利持仓，目标 {fmt_decimal(close_qty)} 张"
+                            + (f" | {self._planned_batch_summary(client, close_qty)}" if close_qty > 0 else "")
+                        ),
+                    )
                 )
+                result = manager.close_now(
+                    ArbitrageCloseRequest(
+                        entry_id=entry_id,
+                        max_slippage=self._plan.max_slippage,
+                        use_limit_orders=self._plan.use_limit_orders,
+                        spot_limit_price=self._plan.spot_limit_price,
+                        derivative_limit_price=self._plan.derivative_limit_price,
+                        close_derivative_qty=close_qty,
+                        batch_count=self._plan.batch_count,
+                        batch_contract_qty=self._plan.batch_contract_qty,
+                        execution_mode=self._plan.execution_mode,
+                        maker_wait_seconds=self._plan.maker_wait_seconds,
+                        chase_limit=self._plan.chase_limit,
+                    ),
+                    runtime=self._runtime,
+                    should_stop_after_batch=lambda: self._stop_after_batch_requested,
+                    wait_before_next_batch=self._build_auto_wait_before_next_batch(client),
+                )
+                if not result.success:
+                    errors.append(f"{entry.base_ccy}: {result.message}")
+                    continue
+                total_derivative_qty += close_qty
+                remaining_qty = max(remaining_qty - close_qty, Decimal("0"))
+                total_pnl += result.total_pnl or Decimal("0")
+                closed_ids.extend(result.entry_ids or (entry_id,))
+        else:
+            planned_batches = self._planned_batches(client, self._plan.qty_contracts)
+            remaining_position_qty = (
+                self._plan.position_available_contracts
+                if self._plan.position_available_contracts > 0
+                else self._plan.qty_contracts
             )
-            result = manager.close_now(
-                ArbitrageCloseRequest(
-                    entry_id=entry_id,
-                    max_slippage=self._plan.max_slippage,
-                    use_limit_orders=self._plan.use_limit_orders,
-                    spot_limit_price=self._plan.spot_limit_price,
-                    derivative_limit_price=self._plan.derivative_limit_price,
-                    close_derivative_qty=close_qty,
-                    batch_count=self._plan.batch_count,
-                    batch_contract_qty=self._plan.batch_contract_qty,
-                    execution_mode=self._plan.execution_mode,
-                    maker_wait_seconds=self._plan.maker_wait_seconds,
-                    chase_limit=self._plan.chase_limit,
-                ),
-                runtime=self._runtime,
-            )
-            if not result.success:
-                errors.append(f"{entry.base_ccy}: {result.message}")
-                continue
-            total_derivative_qty += close_qty
-            remaining_qty = max(remaining_qty - close_qty, Decimal("0"))
-            total_pnl += result.total_pnl or Decimal("0")
-            closed_ids.extend(result.entry_ids or (entry_id,))
+            for index, batch_qty in enumerate(planned_batches, start=1):
+                if self._stop_after_batch_requested:
+                    self.log.emit("已收到停止请求：当前已完成批次后停止后续平仓。")
+                    break
+                if batch_qty <= 0 or remaining_position_qty <= 0:
+                    continue
+                effective_qty = min(batch_qty, remaining_position_qty)
+                self.status.emit(
+                    ExecutionStatus(
+                        phase="执行中",
+                        current_inst_id=self._plan.derivative_inst_id,
+                        target_inst_id=self._plan.spot_inst_id,
+                        current_filled=total_derivative_qty,
+                        target_filled=total_derivative_qty,
+                        message=f"正在处理第 {index}/{len(planned_batches)} 批实时持仓，目标 {fmt_decimal(effective_qty)} 张",
+                    )
+                )
+                result = manager.close_now(
+                    ArbitrageCloseRequest(
+                        entry_id=None,
+                        max_slippage=self._plan.max_slippage,
+                        use_limit_orders=self._plan.use_limit_orders,
+                        spot_limit_price=self._plan.spot_limit_price,
+                        derivative_limit_price=self._plan.derivative_limit_price,
+                        close_derivative_qty=effective_qty,
+                        batch_count=1,
+                        batch_contract_qty=None,
+                        execution_mode=self._plan.execution_mode,
+                        maker_wait_seconds=self._plan.maker_wait_seconds,
+                        chase_limit=self._plan.chase_limit,
+                        base_ccy=self._base_ccy(),
+                        spot_inst_id=self._plan.spot_inst_id,
+                        derivative_inst_id=self._plan.derivative_inst_id,
+                        current_derivative_qty=remaining_position_qty,
+                    ),
+                    runtime=self._runtime,
+                    should_stop_after_batch=lambda: self._stop_after_batch_requested,
+                    wait_before_next_batch=None,
+                )
+                if not result.success:
+                    errors.append(f"{self._base_ccy()}: {result.message}")
+                    break
+                total_derivative_qty += effective_qty
+                remaining_qty = max(remaining_qty - effective_qty, Decimal("0"))
+                remaining_position_qty = max(remaining_position_qty - effective_qty, Decimal("0"))
+                total_pnl += result.total_pnl or Decimal("0")
+                if index < len(planned_batches):
+                    wait_callback = self._build_auto_wait_before_next_batch(client)
+                    if callable(wait_callback) and not wait_callback():
+                        break
 
         success = total_derivative_qty > 0
         profit_spot_error: str | None = None
-        if success and self._plan.close_profit_spot:
+        if success and self._plan.close_profit_spot and plan_entry_ids:
             try:
                 self.status.emit(
                     ExecutionStatus(
@@ -1223,7 +1325,10 @@ class ProfessionalCloseExecutionThread(QThread):
                 profit_spot_error = str(exc)
                 self.log.emit(f"利润币清算失败：{exc}")
         if success:
-            message = f"已平仓 {len(closed_ids)} 笔，合约 {fmt_decimal(total_derivative_qty)} 张"
+            if plan_entry_ids:
+                message = f"已平仓 {len(closed_ids)} 笔，合约 {fmt_decimal(total_derivative_qty)} 张"
+            else:
+                message = f"已按实时持仓平仓，合约 {fmt_decimal(total_derivative_qty)} 张"
             if total_pnl != 0:
                 message += f"，合计盈亏约 {fmt_decimal(total_pnl)} USDT"
             if profit_spot_sold_qty > 0:
@@ -1234,6 +1339,8 @@ class ProfessionalCloseExecutionThread(QThread):
                 message += f"，{len(errors)} 笔失败"
             if profit_spot_error:
                 message += f"，利润币清算失败：{profit_spot_error}"
+            if not plan_entry_ids:
+                message += "。本次来源为实时持仓，未更新本地套利账本。"
         else:
             message = "；".join(errors) or "套利平仓失败。"
 
@@ -1258,6 +1365,23 @@ class ProfessionalCloseExecutionThread(QThread):
             )
         )
         self.finished_with_result.emit(result)
+
+    def _build_auto_wait_before_next_batch(self, client: OkxRestClient) -> Callable[[], bool] | None:
+        threshold = self._auto_pause_threshold
+        left_inst_id = str(self._plan.derivative_inst_id or "").strip().upper()
+        right_inst_id = str(self._plan.spot_inst_id or "").strip().upper()
+        if threshold is None or not left_inst_id or not right_inst_id:
+            return None
+        return lambda: _wait_for_auto_spread_resume(
+            client=client,
+            environment=self._runtime.environment,
+            left_inst_id=left_inst_id,
+            right_inst_id=right_inst_id,
+            threshold=threshold,
+            should_stop=lambda: self._stop_after_batch_requested,
+            logger=self.log.emit,
+            trigger_when="lte",
+        )
 
 
 def parse_roll_qty(text: str, *, max_qty: Decimal) -> Decimal:

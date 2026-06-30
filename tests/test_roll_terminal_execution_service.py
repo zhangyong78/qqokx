@@ -3,12 +3,13 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from okx_quant.arbitrage.fill_reconciler import derivative_contracts_from_spot_base, spot_base_from_derivative_fill
 from okx_quant.arbitrage.size_converter import preview_arbitrage_size
 from okx_quant.models import Instrument
 from okx_quant.okx_client import OkxFillHistoryItem, OkxTradeOrderItem
-from roll_terminal_qt.execution_service import ProfessionalCloseExecutionThread, RollExecutionThread
+from roll_terminal_qt.execution_service import ProfessionalCloseExecutionPlan, ProfessionalCloseExecutionThread, RollExecutionThread
 
 
 class RollTerminalExecutionServiceTests(unittest.TestCase):
@@ -42,6 +43,49 @@ class RollTerminalExecutionServiceTests(unittest.TestCase):
             lot_size=Decimal("0.0001"),
         )
         self.assertEqual(qty, Decimal("0"))
+
+    def test_close_thread_builds_auto_wait_callback_when_threshold_present(self) -> None:
+        thread = ProfessionalCloseExecutionThread(
+            runtime=SimpleNamespace(environment="demo"),
+            plan=ProfessionalCloseExecutionPlan(
+                left_inst_id="BTC-USD-260925",
+                right_inst_id="BTC-USDT",
+                spot_inst_id="BTC-USDT",
+                derivative_inst_id="BTC-USD-260925",
+                entry_ids=("e1",),
+                qty_contracts=Decimal("10"),
+                execution_label="双腿吃单",
+            ),
+            auto_pause_threshold=Decimal("450"),
+        )
+        thread.log = SimpleNamespace(emit=lambda _msg: None)  # type: ignore[assignment]
+
+        callback = thread._build_auto_wait_before_next_batch(SimpleNamespace())
+
+        self.assertTrue(callable(callback))
+
+    def test_close_thread_auto_wait_callback_uses_lte_trigger(self) -> None:
+        thread = ProfessionalCloseExecutionThread(
+            runtime=SimpleNamespace(environment="demo"),
+            plan=ProfessionalCloseExecutionPlan(
+                left_inst_id="BTC-USD-260925",
+                right_inst_id="BTC-USDT",
+                spot_inst_id="BTC-USDT",
+                derivative_inst_id="BTC-USD-260925",
+                entry_ids=("e1",),
+                qty_contracts=Decimal("10"),
+                execution_label="双腿吃单",
+            ),
+            auto_pause_threshold=Decimal("450"),
+        )
+        thread.log = SimpleNamespace(emit=lambda _msg: None)  # type: ignore[assignment]
+        callback = thread._build_auto_wait_before_next_batch(SimpleNamespace())
+
+        with patch("roll_terminal_qt.execution_service._wait_for_auto_spread_resume", return_value=True) as mocked:
+            assert callback is not None
+            self.assertTrue(callback())
+
+        self.assertEqual(mocked.call_args.kwargs["trigger_when"], "lte")
 
     def test_inverse_contract_close_qty_uses_current_price(self) -> None:
         qty = spot_base_from_derivative_fill(

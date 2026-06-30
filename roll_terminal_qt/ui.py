@@ -60,6 +60,7 @@ from roll_terminal_qt.opportunity_service import (
     remove_custom_opportunity,
 )
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
+from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots, profile_requires_password
 from roll_terminal_qt.runtime import load_runtime, profile_names
 from roll_terminal_qt.spread_chart_window import SpreadChartWindow
 from roll_terminal_qt.style import APP_STYLE
@@ -68,11 +69,6 @@ from okx_quant.arbitrage.position_ledger import load_open_ledger_entries
 from okx_quant.app_paths import logs_dir_path
 from okx_quant.log_utils import append_preformatted_log_line, ensure_log_timestamp
 from okx_quant.okx_client import OkxRestClient
-from okx_quant.persistence import (
-    credential_profile_has_switch_password,
-    load_credentials_profiles_snapshot,
-    verify_profile_switch_password,
-)
 
 
 ROLL_EXECUTION_OPTIONS = (
@@ -205,6 +201,7 @@ class RollTerminalWindow(QMainWindow):
         self._feed.snapshot_ready.connect(self._apply_snapshot)
         self._feed.status_changed.connect(self._set_status)
         self._account_feed.positions_ready.connect(self._apply_positions)
+        self._account_feed.spot_balances_ready.connect(self._apply_spot_balances)
         self._account_feed.status_changed.connect(self._set_account_status)
         self._order_feed.orders_ready.connect(self._apply_order_updates)
         self._order_feed.status_changed.connect(self._set_order_status)
@@ -572,6 +569,7 @@ class RollTerminalWindow(QMainWindow):
         self._current_limit_price.setPlaceholderText("可不填")
         self._target_limit_price.setPlaceholderText("可不填")
         self._auto_threshold.setPlaceholderText("例如 450")
+        self._auto_threshold.textChanged.connect(lambda _text: self._refresh_auto_live_text(self._latest_snapshot))
         self._current.setToolTip("当前模式下的主腿选择。移仓模式选择当前交割持仓，平仓模式选择衍生品空头持仓。")
         self._target.setToolTip("当前模式下的目标腿。移仓模式为目标交割合约，平仓模式会自动带出现货腿。")
         self._qty.setToolTip("按 OKX 页面显示的张数填写。你输入 1，就是按 OKX 的 1 张执行。")
@@ -643,6 +641,9 @@ class RollTerminalWindow(QMainWindow):
         )
         self._auto_help.setObjectName("Hint")
         self._auto_help.setWordWrap(True)
+        self._auto_live = QLabel("实时监控值：当前价差 - | 目标阈值 - | 状态：未启动")
+        self._auto_live.setObjectName("Subtle")
+        self._auto_live.setWordWrap(True)
         self._limit_order_help = QLabel(
             "按限价挂单说明：不勾时更偏向尽快成交；勾选后会尽量按限价单执行，价格更可控，但可能成交更慢。"
             "如果你希望自动换月在达到阈值后按指定价格执行，通常应勾选；如果你更在意达到阈值后尽快完成换月，通常可不勾。"
@@ -772,9 +773,10 @@ class RollTerminalWindow(QMainWindow):
         controls_layout.addWidget(self._auto_threshold_label, 22, 0)
         controls_layout.addWidget(self._auto_threshold, 23, 0)
         controls_layout.addWidget(self._auto_help, 24, 0, 1, 4)
-        controls_layout.addWidget(self._auto_hint, 25, 0, 1, 4)
-        controls_layout.addWidget(self._start_auto_button, 26, 0, 1, 2)
-        controls_layout.addWidget(self._stop_auto_button, 26, 2, 1, 2)
+        controls_layout.addWidget(self._auto_live, 25, 0, 1, 4)
+        controls_layout.addWidget(self._auto_hint, 26, 0, 1, 4)
+        controls_layout.addWidget(self._start_auto_button, 27, 0, 1, 2)
+        controls_layout.addWidget(self._stop_auto_button, 27, 2, 1, 2)
         right_column.addWidget(controls)
         right_column.addStretch(1)
 
@@ -989,7 +991,82 @@ class RollTerminalWindow(QMainWindow):
     def _current_auto_condition_text(self, threshold: Decimal) -> str:
         left_leg = self._current.currentText().strip() or self._current_inst_id() or "当前腿"
         right_leg = self._target.currentText().strip() or "目标腿"
-        return f"{right_leg} 中间价 - {left_leg} 中间价 >= {fmt_decimal(threshold)}"
+        operator = "<=" if self._is_close_mode() else ">="
+        return f"{right_leg} 中间价 - {left_leg} 中间价 {operator} {fmt_decimal(threshold)}"
+
+    def _auto_trigger_met(self, current_spread: Decimal, threshold: Decimal) -> bool:
+        if self._is_close_mode():
+            return current_spread <= threshold
+        return current_spread >= threshold
+
+    def _auto_trigger_operator_text(self) -> str:
+        return "<=" if self._is_close_mode() else ">="
+
+    def _auto_monitor_state_text(self) -> str:
+        execution_running = self._execution_thread is not None and self._execution_thread.isRunning()
+        stop_after_batch_requested = bool(
+            execution_running and getattr(self._execution_thread, "_stop_after_batch_requested", False)
+        )
+        if execution_running:
+            return "执行中（本批后停止）" if stop_after_batch_requested else "执行中"
+        if self._auto_enabled:
+            return "已触发" if self._auto_triggered else "监控中"
+        if self._auto_monitor_supported():
+            return "未启动"
+        return "当前组合暂不支持"
+
+    def _build_auto_live_text(self, snapshot: MarketPairSnapshot | None = None) -> str:
+        operator = self._auto_trigger_operator_text()
+        threshold_text = "-"
+        threshold_value = self._auto_threshold_value
+        if threshold_value is not None:
+            threshold_text = fmt_decimal(threshold_value)
+        elif hasattr(self, "_auto_threshold"):
+            raw_threshold = self._auto_threshold.text().strip()
+            if raw_threshold:
+                threshold_text = raw_threshold
+        current_spread = self._current_auto_spread_from_snapshot(snapshot) if snapshot is not None else None
+        current_text = fmt_decimal(current_spread) if current_spread is not None else "-"
+        state_text = self._auto_monitor_state_text()
+        if current_spread is not None and threshold_value is not None:
+            matched = "已满足" if self._auto_trigger_met(current_spread, threshold_value) else "未满足"
+            state_text = f"{state_text}（{matched}）"
+        return f"实时监控值：当前价差 {current_text} | 目标阈值 {operator} {threshold_text} | 状态：{state_text}"
+
+    def _refresh_auto_live_text(self, snapshot: MarketPairSnapshot | None = None) -> None:
+        if hasattr(self, "_auto_live"):
+            self._auto_live.setText(self._build_auto_live_text(snapshot))
+
+    @staticmethod
+    def _auto_leg_mid(leg: LegMarket) -> Decimal | None:
+        if leg.bid is not None and leg.ask is not None and leg.bid > 0 and leg.ask > 0:
+            return (leg.bid + leg.ask) / Decimal("2")
+        if leg.last is not None and leg.last > 0:
+            return leg.last
+        if leg.bid is not None and leg.bid > 0:
+            return leg.bid
+        if leg.ask is not None and leg.ask > 0:
+            return leg.ask
+        return None
+
+    def _current_auto_spread_from_snapshot(self, snapshot: MarketPairSnapshot) -> Decimal | None:
+        left_inst_id = self._current.currentText().strip().upper() or self._current_inst_id()
+        right_inst_id = self._target.currentText().strip().upper()
+        if not left_inst_id or not right_inst_id:
+            return snapshot.spread_abs
+        leg_map = {
+            snapshot.current.inst_id.strip().upper(): snapshot.current,
+            snapshot.target.inst_id.strip().upper(): snapshot.target,
+        }
+        left_leg = leg_map.get(left_inst_id)
+        right_leg = leg_map.get(right_inst_id)
+        if left_leg is None or right_leg is None:
+            return snapshot.spread_abs
+        left_mid = self._auto_leg_mid(left_leg)
+        right_mid = self._auto_leg_mid(right_leg)
+        if left_mid is None or right_mid is None:
+            return None
+        return right_mid - left_mid
 
     def _build_auto_execution_context(self, *, threshold: Decimal, for_trigger: bool) -> dict[str, object] | None:
         assert self._runtime is not None
@@ -1020,7 +1097,32 @@ class RollTerminalWindow(QMainWindow):
                 "invalid_log": "自动交易触发失败：移仓参数无效。",
             }
         if self._is_close_mode():
-            return None
+            plan = self._build_professional_close_plan()
+            if plan is None:
+                return None
+            return {
+                "thread": ProfessionalCloseExecutionThread(runtime=self._runtime, plan=plan, auto_pause_threshold=threshold),
+                "task_label": "套利平仓",
+                "confirm_title": "确认启动自动交易监控",
+                "confirm_body": (
+                    f"当“{condition_text}”时，将自动提交真实双腿平仓订单。\n"
+                    f"左腿：{plan.left_inst_id}\n"
+                    f"右腿：{plan.right_inst_id}\n"
+                    f"合约腿：{plan.derivative_inst_id}（买入平空）\n"
+                    f"现货腿：{plan.spot_inst_id}（卖出）\n"
+                    f"数量：{fmt_decimal(plan.qty_contracts)} 张（按衍生品合约张数；现货数量按当前价格自动折算）\n"
+                    f"执行方式：{plan.execution_label}\n"
+                    f"拆单预览：{self._batch_preview_text_for_plan(plan)}\n"
+                    f"利润币附加卖出：{'是' if plan.close_profit_spot else '否'}\n\n"
+                    "启动后首次达到阈值会自动触发一次，不再二次确认。"
+                    "若存在剩余批次，程序会在每批之间重新检查价差；价差回落时暂停等待，重新满足后继续。"
+                ),
+                "monitor_hint": f"自动交易监控中：{condition_text} 时触发；触发后若后续批次前价差回落，会等待重新满足后继续。",
+                "start_log": f"自动交易监控已启动：{condition_text} 时触发；触发后若后续批次前价差回落，会等待重新满足后继续。",
+                "triggered_hint": "自动交易已触发：开始按当前参数执行套利平仓；若后续批次前价差回落，会等待重新满足后继续。",
+                "trigger_start_message": "自动交易已触发，开始执行套利平仓...",
+                "invalid_log": "自动交易触发失败：套利平仓参数无效或当前组合暂不支持真实执行。",
+            }
         plan = self._build_professional_open_plan()
         if plan is None:
             return None
@@ -1056,16 +1158,18 @@ class RollTerminalWindow(QMainWindow):
             return
         if self._execution_thread is not None and self._execution_thread.isRunning():
             return
-        if self._auto_threshold_value is None or snapshot.spread_abs is None:
+        current_spread = self._current_auto_spread_from_snapshot(snapshot)
+        if self._auto_threshold_value is None or current_spread is None:
             return
-        if snapshot.spread_abs < self._auto_threshold_value:
+        if not self._auto_trigger_met(current_spread, self._auto_threshold_value):
             return
         context = self._build_auto_execution_context(threshold=self._auto_threshold_value, for_trigger=True)
         self._auto_triggered = True
         self._update_auto_controls_v2()
         self._auto_hint.setText("自动交易已触发：开始按当前参数执行；若后续批次前价差回落，会等待重新满足后继续。")
+        operator = "<=" if self._is_close_mode() else ">="
         self._append_log(
-            f"自动交易已触发：当前价差 {fmt_decimal(snapshot.spread_abs)} >= {fmt_decimal(self._auto_threshold_value)}"
+            f"自动交易已触发：当前价差 {fmt_decimal(current_spread)} {operator} {fmt_decimal(self._auto_threshold_value)}"
         )
         if context is None:
             self._auto_enabled = False
@@ -1179,6 +1283,18 @@ class RollTerminalWindow(QMainWindow):
     def _preview_cached_instrument(self, inst_id: str):
         client = OkxRestClient()
         return client.get_cached_instrument(inst_id)
+
+    def _preview_instrument_lot_size(self, inst_id: str, *, fallback: Decimal = Decimal("1")) -> Decimal:
+        try:
+            instrument = self._preview_cached_instrument(inst_id)
+        except Exception:
+            instrument = None
+        if instrument is None:
+            return fallback
+        lot_size = getattr(instrument, "lot_size", None)
+        if lot_size is None or lot_size <= 0:
+            return fallback
+        return lot_size
 
     def _preview_open_size(
         self,
@@ -1341,8 +1457,6 @@ class RollTerminalWindow(QMainWindow):
             and entry.close_mode == "open"
         ]
         entries.sort(key=lambda entry: entry.opened_at)
-        if not entries:
-            return None
         return spot_inst_id, derivative_inst_id, position, entries
 
     def _selected_supports_professional_close(self) -> bool:
@@ -1354,7 +1468,7 @@ class RollTerminalWindow(QMainWindow):
         if self._is_roll_template_active():
             return self._selected_position() is not None and bool(self._target.currentText().strip())
         if self._is_close_mode():
-            return False
+            return self._selected_supports_professional_close()
         return self._selected_supports_professional_open()
 
     def _apply_execution_mode_options(self, options: tuple[tuple[str, str], ...]) -> None:
@@ -1547,8 +1661,12 @@ class RollTerminalWindow(QMainWindow):
             self._open_qty_unit_label.setVisible(False)
             self._open_qty_unit.setVisible(False)
             close_context = self._selected_professional_close_context()
+            close_entries = close_context[3] if close_context is not None else []
+            close_tracked_by_ledger = bool(close_entries)
             self._close_profit_spot.setVisible(True)
-            self._close_profit_spot.setEnabled(close_context is not None)
+            self._close_profit_spot.setEnabled(close_tracked_by_ledger)
+            if not close_tracked_by_ledger:
+                self._close_profit_spot.setChecked(False)
             self._current_label_widget.setText("衍生品持仓")
             self._target_label_widget.setText("现货腿")
             self._mode_label_widget.setText("双腿方式")
@@ -1556,19 +1674,23 @@ class RollTerminalWindow(QMainWindow):
             self._current_limit_price_label.setText("合约买入限价")
             self._target_limit_price_label.setText("现货卖出限价")
             self._auto_title.setText("自动交易监控")
-            self._auto_threshold_label.setText("触发价差>=")
-            self._start_auto_button.setText("套利平仓暂不开启自动")
-            self._stop_auto_button.setText("当前模式无需停止")
-            self._auto_intro.setText("套利平仓模式：数量按合约张数填写，现货卖出数量按当前价格自动折算；自动平仓监控后续再单独接入。")
-            self._auto_help.setText("当前套利平仓模式先支持手动执行，避免在双向持仓账户里误把平仓腿开成新仓。")
-            self._auto_hint.setText("套利平仓模式：数量按合约张数填写，现货卖出数量会按当前价格自动折算。")
+            self._auto_threshold_label.setText("触发价差<=")
+            self._start_auto_button.setText("启动自动交易监控")
+            self._stop_auto_button.setText("停止自动交易监控")
+            self._auto_intro.setText("套利平仓模式：数量按合约张数填写，现货卖出数量按当前价格自动折算；启动监控后首次收敛到阈值以内时自动开始。")
+            self._auto_help.setText(
+                "自动交易说明：当前套利平仓会监控“现货中间价 - 合约中间价”。"
+                "首次小于等于阈值后，会按当前页面参数自动执行；若存在剩余批次，程序会在每批之间继续按价差判断。"
+            )
+            if not self._auto_enabled:
+                self._auto_hint.setText("自动交易监控：填写阈值后启动；首次小于等于阈值后开始执行，剩余批次会按价差等待并继续。")
             self._guide_text.setText(
                 "1. 输入单位：数量按合约张数填写，现货卖出数量按当前价格自动折算。\n"
                 "2. 方向语义：合约腿买入平空，现货腿卖出；当前版本只接通这一种套利平仓方向。\n"
                 "3. 左侧先选专业套利对，再在“衍生品持仓”里选中对应空头持仓，且不能超过当前持仓与账本可平数量。\n"
                 "4. 若勾选“平仓后额外卖出利润币”，程序会在主平仓后按账户可释放现货净额追加卖出币本位利润币。\n"
                 "5. 若选择挂单模式，挂单腿会优先排队，另一腿再按配置吃单或跟进。\n"
-                "6. 若同一套利对在账本里有多笔 open 记录，程序会按开仓时间顺序逐笔消化。"
+                "6. 自动交易监控会在当前平仓组合下按“现货中间价 - 合约中间价 <= 阈值”触发；若同一套利对在账本里有多笔 open 记录，程序会按开仓时间顺序逐笔消化。"
             )
             if item is not None:
                 if professional_legs is not None:
@@ -1583,15 +1705,20 @@ class RollTerminalWindow(QMainWindow):
             self._apply_execution_mode_options(PROFESSIONAL_OPEN_OPTIONS)
             self._execution_table.setHorizontalHeaderLabels(["阶段", "合约腿", "现货腿", "成交", "状态"])
             if close_context is not None:
-                self._manual_hint.setText(
-                    "点击“执行平仓”后，会按输入张数提交合约买入平空 + 现货卖出的真实双腿订单；现货数量按当前价格自动折算。若勾选利润币选项，主平仓后还会补一笔现货卖出。"
-                )
-                self._execution_scope_hint.setText("当前真实执行能力：已接通套利平仓，支持按合约张数平仓并自动折算现货卖出数量。")
+                if close_tracked_by_ledger:
+                    self._manual_hint.setText(
+                        "点击“执行平仓”后，会按输入张数提交合约买入平空 + 现货卖出的真实双腿订单；现货数量按当前价格自动折算。若勾选利润币选项，主平仓后还会补一笔现货卖出。"
+                    )
+                    self._execution_scope_hint.setText("当前真实执行能力：已接通套利平仓，支持按合约张数平仓并自动折算现货卖出数量。")
+                else:
+                    self._manual_hint.setText(
+                        "当前将按实时持仓直接执行套利平仓：提交合约买入平空 + 现货卖出。由于本地没有匹配到套利账本 open 记录，本次只按实际持仓执行，不额外卖出利润币，也不会回写本地开平仓盈亏账本。"
+                    )
+                    self._execution_scope_hint.setText("当前真实执行能力：已检测到匹配的衍生品空头持仓，可按实时持仓执行套利平仓；本次不依赖本地套利账本 open 记录。")
                 self._execute_button.setText("执行平仓")
             elif professional_legs is not None:
-                self._close_profit_spot.setChecked(False)
-                self._manual_hint.setText("当前套利对已支持平仓语义，但还没有匹配到可平的空头持仓或账本 open 记录。")
-                self._execution_scope_hint.setText("当前真实执行能力：套利平仓要求同时存在衍生品空头持仓和对应的套利账本 open 记录。")
+                self._manual_hint.setText("当前套利对已支持平仓语义，但还没有匹配到可平的衍生品空头持仓。")
+                self._execution_scope_hint.setText("当前真实执行能力：套利平仓至少需要先选中一条匹配的衍生品空头持仓。")
                 self._execute_button.setText("当前组合暂无可平仓持仓")
             else:
                 self._close_profit_spot.setChecked(False)
@@ -1869,39 +1996,6 @@ class RollTerminalWindow(QMainWindow):
             return f"持仓合计：空 {fmt_decimal(short_total)} 张"
         return f"持仓合计：多 {fmt_decimal(long_total)} 张"
 
-    def _refresh_spot_balance_lookup(self) -> None:
-        self._spot_balance_lookup = {}
-        if self._runtime is None:
-            return
-        try:
-            cached_payload = OkxRestClient().get_cached_private_account_overview(
-                self._runtime.credentials,
-                environment=self._runtime.environment,
-            )
-        except Exception:
-            return
-        if cached_payload is None:
-            return
-        _, overview = cached_payload
-        details = getattr(overview, "details", ()) or ()
-        lookup: dict[str, str] = {}
-        for asset in details:
-            ccy = str(getattr(asset, "ccy", "") or "").strip().upper()
-            if not ccy or ccy in {"USDT", "USDC", "USD"}:
-                continue
-            available = getattr(asset, "available_balance", None)
-            equity = getattr(asset, "equity", None)
-            cash_balance = getattr(asset, "cash_balance", None)
-            total = equity if equity is not None else cash_balance
-            qty = available if available is not None and available > 0 else total
-            if qty is None or qty <= 0:
-                continue
-            text = f"{ccy}-USDT | 可用 {fmt_decimal(qty)} {ccy}"
-            if total is not None and total > 0 and total != qty:
-                text += f" | 余额 {fmt_decimal(total)} {ccy}"
-            lookup[ccy] = text
-        self._spot_balance_lookup = lookup
-
     def _position_spot_text(self, position: FuturesPositionView | None) -> str:
         if position is None:
             return "对应现货：等待持仓..."
@@ -1912,6 +2006,19 @@ class RollTerminalWindow(QMainWindow):
         if spot_text:
             return f"对应现货：{spot_text}"
         return f"对应现货：{base_ccy}-USDT 未读取到可用持仓"
+
+    @Slot(object)
+    def _apply_spot_balances(self, lookup: dict[str, str]) -> None:
+        self._spot_balance_lookup = dict(lookup or {})
+        selected_position = self._selected_position()
+        self._position_spot.setText(self._position_spot_text(selected_position))
+        for row in range(self._positions_table.rowCount()):
+            inst_item = self._positions_table.item(row, 0)
+            spot_item = self._positions_table.item(row, 4)
+            if inst_item is None or spot_item is None:
+                continue
+            base_ccy = str(inst_item.text() or "").strip().upper().split("-", 1)[0] or "BTC"
+            spot_item.setText(self._spot_balance_lookup.get(base_ccy, f"{base_ccy}-USDT"))
 
     @Slot()
     def _switch_pair(self) -> None:
@@ -1972,6 +2079,7 @@ class RollTerminalWindow(QMainWindow):
         )
         self._source.setText(snapshot.status)
         self._status.setText("在线")
+        self._refresh_auto_live_text(snapshot)
         self._maybe_trigger_auto_execution(snapshot)
         self._update_open_estimate_preview()
 
@@ -2010,19 +2118,14 @@ class RollTerminalWindow(QMainWindow):
         self._status.setText(text)
 
     def _refresh_profile_snapshots(self) -> None:
-        snapshot = load_credentials_profiles_snapshot()
-        profiles = snapshot.get("profiles", {}) if isinstance(snapshot, dict) else {}
-        self._profile_snapshots = {
-            str(name).strip(): dict(profile)
-            for name, profile in profiles.items()
-            if str(name).strip() and isinstance(profile, dict)
-        } if isinstance(profiles, dict) else {}
+        self._profile_snapshots, _selected_profile = load_profile_snapshots()
         self._unlocked_profiles.intersection_update(set(self._profile_snapshots))
 
     def _profile_requires_password(self, profile_name: str) -> bool:
-        return credential_profile_has_switch_password(self._profile_snapshots.get(profile_name.strip(), {}))
+        return profile_requires_password(profile_name, self._profile_snapshots)
 
     def _ensure_profile_unlocked(self, profile_name: str) -> bool:
+        return ensure_profile_unlocked(self, profile_name, self._profile_snapshots, self._unlocked_profiles)
         target = profile_name.strip()
         if not target:
             return False
@@ -2124,6 +2227,7 @@ class RollTerminalWindow(QMainWindow):
         self._feed.snapshot_ready.connect(self._apply_snapshot)
         self._feed.status_changed.connect(self._set_status)
         self._account_feed.positions_ready.connect(self._apply_positions)
+        self._account_feed.spot_balances_ready.connect(self._apply_spot_balances)
         self._account_feed.status_changed.connect(self._set_account_status)
         self._order_feed.orders_ready.connect(self._apply_order_updates)
         self._order_feed.status_changed.connect(self._set_order_status)
@@ -2160,7 +2264,6 @@ class RollTerminalWindow(QMainWindow):
             self._current.addItem("未读取到衍生品持仓", "")
             selected_position_key = ""
         self._positions_table.setRowCount(0)
-        self._refresh_spot_balance_lookup()
         for position in positions:
             row = self._positions_table.rowCount()
             self._positions_table.insertRow(row)
@@ -2568,6 +2671,7 @@ class RollTerminalWindow(QMainWindow):
             derivative_limit_price=derivative_limit_price,
             batch_count=batch_count,
             batch_contract_qty=batch_contract_qty,
+            derivative_lot_size=self._preview_instrument_lot_size(derivative_inst_id),
             maker_wait_seconds=maker_wait_seconds,
             chase_limit=chase_limit,
         )
@@ -2579,13 +2683,16 @@ class RollTerminalWindow(QMainWindow):
             return None
         close_context = self._selected_professional_close_context()
         if close_context is None:
-            QMessageBox.warning(self, "暂不支持", "当前缺少可配对的空头持仓或套利账本 open 记录。")
+            QMessageBox.warning(self, "暂不支持", "当前缺少可配对的空头持仓。")
             return None
         spot_inst_id, derivative_inst_id, position, entries = close_context
-        max_qty = min(
-            position.available,
-            sum((entry.derivative_qty for entry in entries), start=Decimal("0")),
-        )
+        tracked_by_ledger = bool(entries)
+        max_qty = position.available
+        if tracked_by_ledger:
+            max_qty = min(
+                position.available,
+                sum((entry.derivative_qty for entry in entries), start=Decimal("0")),
+            )
         try:
             qty_contracts = parse_roll_qty(self._qty.text(), max_qty=max_qty)
             max_slippage = parse_slippage_percent(self._max_slippage.text())
@@ -2620,8 +2727,11 @@ class RollTerminalWindow(QMainWindow):
             derivative_limit_price=derivative_limit_price,
             batch_count=batch_count,
             batch_contract_qty=batch_contract_qty,
+            derivative_lot_size=position.lot_size,
             maker_wait_seconds=maker_wait_seconds,
             chase_limit=chase_limit,
+            close_profit_spot=tracked_by_ledger and self._close_profit_spot.isChecked(),
+            position_available_contracts=position.available,
         )
 
     def _select_position_by_inst_id(self, inst_id: str) -> None:
@@ -2797,12 +2907,14 @@ class RollTerminalWindow(QMainWindow):
             if self._is_close_mode():
                 close_context = self._selected_professional_close_context()
                 if close_context is None:
-                    return "拆单规则：当前套利平仓暂未匹配到可平的空头持仓或账本 open 记录。"
+                    return "拆单规则：当前套利平仓暂未匹配到可平的空头持仓。"
                 _spot_inst_id, _derivative_inst_id, position, entries = close_context
-                max_qty = min(
-                    position.available,
-                    sum((entry.derivative_qty for entry in entries), start=Decimal("0")),
-                )
+                max_qty = position.available
+                if entries:
+                    max_qty = min(
+                        position.available,
+                        sum((entry.derivative_qty for entry in entries), start=Decimal("0")),
+                    )
                 try:
                     qty = parse_roll_qty(self._qty.text(), max_qty=max_qty)
                     if batch_mode == "size":
@@ -2847,11 +2959,16 @@ class RollTerminalWindow(QMainWindow):
                     f"拆单规则：当前开仓输入按{self._open_qty_value_suffix()}计，"
                     f"提交时会按当前价格换算为合约张数；{rule_text}仍按合约张数生效。"
                 )
+            professional_legs = self._selected_professional_open_legs()
+            derivative_lot_size = self._preview_instrument_lot_size(
+                professional_legs[1] if professional_legs is not None else "",
+                fallback=Decimal("1"),
+            )
             return self._batch_preview_text(
                 qty=qty,
                 batch_count=batch_count,
                 batch_contract_qty=batch_contract_qty,
-                lot_size=Decimal("1"),
+                lot_size=derivative_lot_size,
             )
         position = self._selected_position()
         if position is None:
@@ -2875,7 +2992,10 @@ class RollTerminalWindow(QMainWindow):
             lot_size=position.lot_size,
         )
 
-    def _batch_preview_text_for_plan(self, plan: RollExecutionPlan | ProfessionalOpenExecutionPlan) -> str:
+    def _batch_preview_text_for_plan(
+        self,
+        plan: RollExecutionPlan | ProfessionalOpenExecutionPlan | ProfessionalCloseExecutionPlan,
+    ) -> str:
         if isinstance(plan, ProfessionalOpenExecutionPlan) and plan.size_unit != "contracts":
             input_suffix = self._open_plan_qty_suffix(plan)
             batch_rule = (
@@ -2887,8 +3007,15 @@ class RollTerminalWindow(QMainWindow):
                 f"拆单预览：当前输入 {fmt_decimal(plan.size_value)} {input_suffix}，"
                 f"提交时会按当前价格换算成合约张数后执行；{batch_rule}仍按合约张数生效。"
             )
-        qty = plan.qty if isinstance(plan, RollExecutionPlan) else plan.size_value
-        lot_size = plan.current.lot_size if isinstance(plan, RollExecutionPlan) else Decimal("1")
+        if isinstance(plan, RollExecutionPlan):
+            qty = plan.qty
+            lot_size = plan.current.lot_size
+        elif isinstance(plan, ProfessionalCloseExecutionPlan):
+            qty = plan.qty_contracts
+            lot_size = plan.derivative_lot_size
+        else:
+            qty = plan.size_value
+            lot_size = plan.derivative_lot_size
         return self._batch_preview_text(
             qty=qty,
             batch_count=plan.batch_count,
@@ -2936,13 +3063,17 @@ class RollTerminalWindow(QMainWindow):
             return []
         if batch_contract_qty is not None:
             normalized_batch = self._snap_down(batch_contract_qty, lot_size)
-            if normalized_batch <= 0:
+            if normalized_batch < lot_size:
                 return []
             batches: list[Decimal] = []
             remaining = normalized_total
             while remaining > 0:
                 current = self._snap_down(min(normalized_batch, remaining), lot_size)
-                if current <= 0:
+                if current < lot_size:
+                    if not batches:
+                        return []
+                    batches[-1] += remaining
+                    remaining = Decimal("0")
                     break
                 batches.append(current)
                 remaining -= current
@@ -2950,15 +3081,16 @@ class RollTerminalWindow(QMainWindow):
         if batch_count <= 1:
             return [normalized_total]
         base_batch = self._snap_down(normalized_total / Decimal(batch_count), lot_size)
-        if base_batch <= 0:
-            return [normalized_total]
+        if base_batch < lot_size:
+            return []
         batches = []
         remaining = normalized_total
-        while len(batches) < batch_count - 1 and remaining - base_batch > 0:
+        while len(batches) < batch_count - 1 and remaining - base_batch >= lot_size:
             batches.append(base_batch)
             remaining -= base_batch
-        if remaining > 0:
-            batches.append(remaining)
+        if remaining < lot_size:
+            return []
+        batches.append(remaining)
         return batches
 
     @staticmethod
@@ -3223,6 +3355,40 @@ class RollTerminalWindow(QMainWindow):
         self._execution_table.resizeRowToContents(row)
         self._execution_table.scrollToBottom()
 
+    @staticmethod
+    def _parse_batch_execution_log(text: str) -> tuple[str, str] | None:
+        cleaned = str(text or "").strip()
+        match = re.match(r"^分批(开仓|平仓|移仓)：第\s*(\d+)/(\d+)\s*批，(.+)$", cleaned)
+        if not match:
+            return None
+        _task, batch_index, batch_total, batch_message = match.groups()
+        return f"批次 {batch_index}/{batch_total}", batch_message.strip()
+
+    def _append_batch_execution_row_from_log(self, text: str) -> None:
+        parsed = self._parse_batch_execution_log(text)
+        if parsed is None:
+            return
+        phase_text, status_text = parsed
+        current_inst_id, target_inst_id = self._latest_execution_pair()
+        row = self._execution_table.rowCount()
+        self._execution_table.insertRow(row)
+        values = [
+            phase_text,
+            current_inst_id,
+            target_inst_id,
+            "-",
+            status_text,
+        ]
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(str(value))
+            item.setToolTip(str(text))
+            if column == 4:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            item.setForeground(QColor("#2457d6"))
+            self._execution_table.setItem(row, column, item)
+        self._execution_table.resizeRowToContents(row)
+        self._execution_table.scrollToBottom()
+
     def _update_active_execution_row_status_from_log(self, text: str) -> None:
         status_text = self._execution_status_from_log_text(text)
         if not status_text:
@@ -3250,6 +3416,12 @@ class RollTerminalWindow(QMainWindow):
         cleaned = str(text or "").strip()
         if not cleaned:
             return ""
+        if cleaned.startswith("分批开仓：第 ") or cleaned.startswith("分批平仓：第 ") or cleaned.startswith("分批移仓：第 "):
+            return cleaned
+        if cleaned.startswith("分批开仓在第 ") or cleaned.startswith("分批平仓在第 "):
+            return cleaned
+        if cleaned.startswith("已按停止请求在第 "):
+            return cleaned
         if "撤单确认结论：状态未知" in cleaned:
             return "状态未知 -> 恢复核对中"
         if "恢复核对成功" in cleaned:
@@ -3303,6 +3475,7 @@ class RollTerminalWindow(QMainWindow):
         for line in raw_text.splitlines():
             cleaned_line = line.strip()
             if cleaned_line:
+                self._append_batch_execution_row_from_log(cleaned_line)
                 self._update_active_execution_row_status_from_log(cleaned_line)
         formatted_lines: list[str] = []
         for index, line in enumerate(raw_text.splitlines()):
@@ -3372,6 +3545,7 @@ class RollTerminalWindow(QMainWindow):
                 self._stop_auto_button.setText("本批后停止" if not stop_after_batch_requested else "已登记停止")
             else:
                 self._stop_auto_button.setText("停止自动交易监控")
+        self._refresh_auto_live_text(self._latest_snapshot)
 
     def _update_auto_controls(self) -> None:
         self._update_auto_controls_v2()

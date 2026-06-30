@@ -38,26 +38,26 @@ def launcher_module_specs() -> tuple[LauncherModuleSpec, ...]:
         LauncherModuleSpec(
             key="roll",
             title="专业套利终端",
-            subtitle="Qt 全量接入模块，负责套利开平仓、交割移仓与监控。",
-            status="已接入",
+            subtitle="主壳负责统一入口、共享配置和核心套利流程。",
+            status="Qt 主模块",
         ),
         LauncherModuleSpec(
             key="smart-order",
             title="无限下单",
-            subtitle="先完成 Qt 主壳入口和共享状态归拢，再逐步迁移交互与执行面板。",
-            status="迁移底座",
+            subtitle="纯 Qt 版直接接入共享任务、收藏、仓位限制和实时状态。",
+            status="Qt 原生",
         ),
         LauncherModuleSpec(
             key="line-trading",
             title="划线交易台",
-            subtitle="先集中管理入口与注解状态，再把图表、画线和下单链路搬到 Qt。",
-            status="迁移底座",
+            subtitle="纯 Qt 版统一管理共享射线注解和 RR 区块。",
+            status="Qt 原生",
         ),
         LauncherModuleSpec(
             key="auto-channel",
             title="自动通道",
-            subtitle="复用现有分析内核，先以 Qt 模块页承接预览与后续扩展。",
-            status="迁移底座",
+            subtitle="纯 Qt 版统一做样例、市场行情和历史快照结构分析。",
+            status="Qt 原生",
         ),
     )
 
@@ -65,20 +65,18 @@ def launcher_module_specs() -> tuple[LauncherModuleSpec, ...]:
 def build_roll_module_overview() -> ModuleOverview:
     snapshot = load_credentials_profiles_snapshot()
     profiles = snapshot.get("profiles", {}) if isinstance(snapshot, dict) else {}
-    profile_count = len(profiles) if isinstance(profiles, dict) else 0
     selected_profile = str(snapshot.get("selected_profile", "") or "").strip() if isinstance(snapshot, dict) else ""
     return ModuleOverview(
         status="已接入",
-        phase="Qt 全量模块",
+        phase="Qt 主壳",
         summary_lines=(
             f"共享数据根目录：{data_root()}",
-            f"可用 API Profile：{profile_count} 个" + (f" | 当前：{selected_profile}" if selected_profile else ""),
+            f"可用 API Profile：{len(profiles) if isinstance(profiles, dict) else 0} 个"
+            + (f" | 当前：{selected_profile}" if selected_profile else ""),
             f"日志目录：{logs_dir_path()}",
         ),
         data_paths=(logs_dir_path(), state_dir_path()),
-        next_steps=(
-            "继续把套利运行态与模块管理页打通，支持从主壳直接查看模块心跳和日志。",
-        ),
+        next_steps=("继续把主壳上的运行态监控、日志聚合和模块跳转做得更顺手。",),
     )
 
 
@@ -89,17 +87,15 @@ def build_smart_order_module_overview() -> ModuleOverview:
     favorite_items = favorites.get("favorites", []) if isinstance(favorites, dict) else []
     locked_inst_id = str(snapshot.get("locked_inst_id", "") or "").strip() if isinstance(snapshot, dict) else ""
     return ModuleOverview(
-        status="迁移底座",
-        phase="Qt 入口已建立",
+        status="Qt 原生",
+        phase="任务与下单一体化",
         summary_lines=(
             f"任务数：{len(tasks) if isinstance(tasks, list) else 0}",
             f"收藏标的：{len(favorite_items) if isinstance(favorite_items, list) else 0}",
             f"当前锁定标的：{locked_inst_id or '-'}",
         ),
         data_paths=(smart_order_tasks_file_path(), smart_order_favorites_file_path()),
-        next_steps=(
-            "下一步优先迁移任务列表、参数面板和运行状态条，再接入实盘执行线程。",
-        ),
+        next_steps=("继续细化盘口交互和任务恢复体验。",),
     )
 
 
@@ -116,33 +112,29 @@ def build_line_trading_module_overview() -> ModuleOverview:
         if isinstance(rr, list):
             total_rr += len(rr)
     return ModuleOverview(
-        status="迁移底座",
-        phase="Qt 入口已建立",
+        status="Qt 原生",
+        phase="共享注解管理",
         summary_lines=(
             f"已保存会话：{session_count}",
             f"画线条目：{total_lines}",
             f"盈亏比区域：{total_rr}",
         ),
         data_paths=(line_trading_desk_annotations_file_path(),),
-        next_steps=(
-            "下一步优先迁移实时图表画布、画线交互和开仓参数卡。",
-        ),
+        next_steps=("继续把图形编辑和下单联动往 Qt 画布里迁。",),
     )
 
 
 def build_auto_channel_module_overview() -> ModuleOverview:
     snapshot = build_auto_channel_preview_snapshot()
     return ModuleOverview(
-        status="迁移底座",
-        phase="Qt 入口已建立",
+        status="Qt 原生",
+        phase="结构分析",
         summary_lines=(
             f"样例 K 线：{len(snapshot.candles)}",
             f"通道覆盖层：{len(snapshot.band_overlays)} | 箱体覆盖层：{len(snapshot.box_overlays)}",
             f"分析摘要：{snapshot.note or '-'}",
         ),
-        next_steps=(
-            "下一步优先接入真实行情快照、参数调节面板和结果确认流。",
-        ),
+        next_steps=("继续强化结构快照的对比、标注和结果确认链路。",),
     )
 
 
@@ -157,4 +149,3 @@ def build_module_overview(module_key: str) -> ModuleOverview:
     if normalized == "auto-channel":
         return build_auto_channel_module_overview()
     raise KeyError(f"unknown module: {module_key}")
-

@@ -121,8 +121,20 @@ class ArbitrageManager:
             wait_before_next_batch=wait_before_next_batch,
         )
 
-    def close_now(self, request: ArbitrageCloseRequest, *, runtime: ArbitrageTradeRuntime) -> ArbitrageCloseResult:
-        return self._executor.close_cash_and_carry(request, runtime=runtime)
+    def close_now(
+        self,
+        request: ArbitrageCloseRequest,
+        *,
+        runtime: ArbitrageTradeRuntime,
+        should_stop_after_batch: Callable[[], bool] | None = None,
+        wait_before_next_batch: Callable[[], bool] | None = None,
+    ) -> ArbitrageCloseResult:
+        return self._executor.close_cash_and_carry(
+            request,
+            runtime=runtime,
+            should_stop_after_batch=should_stop_after_batch,
+            wait_before_next_batch=wait_before_next_batch,
+        )
 
     def roll_now(
         self,
