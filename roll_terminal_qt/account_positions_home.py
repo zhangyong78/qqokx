@@ -38,6 +38,7 @@ POSITION_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("全部类型", ""),
     ("交割合约 FUTURES", "FUTURES"),
     ("永续 SWAP", "SWAP"),
+    ("期权 OPTION", "OPTION"),
 )
 
 
@@ -48,7 +49,18 @@ def _base_ccy(inst_id: str) -> str:
 def _table_text(value: Decimal | None, places: int | None = None) -> str:
     if value is None:
         return "-"
-    return fmt_decimal(value, places)
+    if places is not None:
+        return fmt_decimal(value, places)
+    magnitude = abs(value)
+    if magnitude >= Decimal("1000"):
+        return fmt_decimal(value, 2)
+    if magnitude >= Decimal("1"):
+        return fmt_decimal(value, 4)
+    if magnitude >= Decimal("0.01"):
+        return fmt_decimal(value, 6)
+    if magnitude >= Decimal("0.0001"):
+        return fmt_decimal(value, 8)
+    return fmt_decimal(value, 12)
 
 
 def _spot_text_for_position(position: FuturesPositionView, spot_lookup: dict[str, str]) -> str:
@@ -67,6 +79,17 @@ def _position_inst_type_matches(position: FuturesPositionView, inst_type: str) -
     if not inst_type:
         return True
     return position.inst_type.strip().upper() == inst_type
+
+
+def _option_kind_text(inst_id: str, inst_type: str) -> str:
+    if inst_type.strip().upper() != "OPTION":
+        return "-"
+    last_segment = (inst_id or "").strip().upper().split("-")[-1]
+    if last_segment == "C":
+        return "看涨(C)"
+    if last_segment == "P":
+        return "看跌(P)"
+    return "期权"
 
 
 class AccountOverviewDialog(QDialog):
@@ -281,9 +304,9 @@ class AccountPositionsHomeWidget(QWidget):
         title_row.addWidget(self._positions_hint)
         layout.addLayout(title_row)
 
-        self._positions_table = QTableWidget(0, 10)
+        self._positions_table = QTableWidget(0, 11)
         self._positions_table.setHorizontalHeaderLabels(
-            ["合约", "类型", "方向", "可平(张)", "持仓(张)", "1张面值", "名义金额", "折合币数", "对应现货", "模式"]
+            ["合约", "类型", "期权类型", "方向", "可平(张)", "持仓(张)", "1张面值", "名义金额", "折合币数", "对应现货", "模式"]
         )
         self._positions_table.verticalHeader().setVisible(False)
         self._positions_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -300,8 +323,9 @@ class AccountPositionsHomeWidget(QWidget):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(10, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self._positions_table, 1)
         return panel
 
@@ -567,8 +591,8 @@ class AccountPositionsHomeWidget(QWidget):
             if _base_ccy(item.inst_id) in self._spot_balance_lookup
         }
         self._position_count_metric.setText(str(len(self._visible_positions)))
-        self._contract_metric.setText(f"{fmt_decimal(total_contracts)} 张")
-        self._base_metric.setText(f"{fmt_decimal(total_base)} 币")
+        self._contract_metric.setText(f"{_table_text(total_contracts)} 张")
+        self._base_metric.setText(f"{_table_text(total_base)} 币")
         self._spot_metric.setText(str(len(visible_assets)))
 
     def _render_positions_table(self) -> None:
@@ -579,6 +603,7 @@ class AccountPositionsHomeWidget(QWidget):
             values = [
                 position.inst_id,
                 position.inst_type,
+                _option_kind_text(position.inst_id, position.inst_type),
                 "空" if position.side == "short" else "多",
                 _table_text(position.available),
                 _table_text(position.contracts),
@@ -602,13 +627,13 @@ class AccountPositionsHomeWidget(QWidget):
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if column in {3, 4, 5, 6, 7}:
+                if column in {4, 5, 6, 7, 8}:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 else:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                if column == 2:
+                if column == 3:
                     item.setForeground(QColor("#c83b55" if position.side == "short" else "#1a7f46"))
-                if column == 8:
+                if column == 9:
                     item.setForeground(QColor("#4f46e5"))
                 item.setData(Qt.ItemDataRole.UserRole, position.position_key)
                 self._positions_table.setItem(row, column, item)
@@ -719,26 +744,27 @@ class AccountPositionsHomeWidget(QWidget):
         lines = [
             f"合约：{position.inst_id}",
             f"类型：{position.inst_type}",
+            f"期权类型：{_option_kind_text(position.inst_id, position.inst_type)}",
             f"方向：{'空' if position.side == 'short' else '多'}",
-            f"可平张数：{fmt_decimal(position.available)}",
-            f"持仓张数：{fmt_decimal(position.contracts)}",
-            f"API 原始可平：{fmt_decimal(position.api_available)}",
-            f"API 原始持仓：{fmt_decimal(position.api_contracts)}",
+            f"可平张数：{_table_text(position.available)}",
+            f"持仓张数：{_table_text(position.contracts)}",
+            f"API 原始可平：{_table_text(position.api_available)}",
+            f"API 原始持仓：{_table_text(position.api_contracts)}",
             f"每张面值："
             + (
-                f"{fmt_decimal(position.contract_value)} {position.contract_value_ccy}"
+                f"{_table_text(position.contract_value)} {position.contract_value_ccy}"
                 if position.contract_value is not None and position.contract_value_ccy
                 else "-"
             ),
             f"名义金额："
             + (
-                f"{fmt_decimal(position.notional_value)} {position.contract_value_ccy}"
+                f"{_table_text(position.notional_value)} {position.contract_value_ccy}"
                 if position.notional_value is not None and position.contract_value_ccy
                 else "-"
             ),
             f"折合币数："
             + (
-                f"{fmt_decimal(position.notional_base)} {_base_ccy(position.inst_id)}"
+                f"{_table_text(position.notional_base)} {_base_ccy(position.inst_id)}"
                 if position.notional_base is not None
                 else "-"
             ),
@@ -773,11 +799,12 @@ class AccountPositionsHomeWidget(QWidget):
         total_base = sum((item.notional_base or Decimal("0") for item in self._visible_positions), Decimal("0"))
         futures_count = sum(1 for item in self._visible_positions if item.inst_type == "FUTURES")
         swap_count = sum(1 for item in self._visible_positions if item.inst_type == "SWAP")
+        option_count = sum(1 for item in self._visible_positions if item.inst_type == "OPTION")
         lines = [
             f"当前 API：{self._last_profile_name or '-'}",
-            f"可见持仓：{len(self._visible_positions)} 条 | 交割 {futures_count} | 永续 {swap_count}",
-            f"可平张数合计：{fmt_decimal(total_contracts)} 张",
-            f"折合币数合计：{fmt_decimal(total_base)}",
+            f"可见持仓：{len(self._visible_positions)} 条 | 交割 {futures_count} | 永续 {swap_count} | 期权 {option_count}",
+            f"可平张数合计：{_table_text(total_contracts)} 张",
+            f"折合币数合计：{_table_text(total_base)}",
             f"当前委托：{len(self._visible_orders)} 条",
             "",
             "对应现货余额：",

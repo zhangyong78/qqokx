@@ -3890,10 +3890,19 @@ class StrategyEngine:
             raise RuntimeError("动态止盈模式缺少 OKX 止损委托标识（algoId 或 algoClOrdId），无法继续动态上移。")
 
         current_stop_loss = initial_stop_loss
-        next_trigger_r = 2
+        next_trigger_r = _live_dynamic_initial_trigger_r(config)
         amend_failures = 0
         consecutive_read_failures = 0
         risk_per_unit = abs(position.entry_price - initial_stop_loss)
+        direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
+        next_trigger_price_text = _dynamic_next_trigger_price_text(
+            direction=direction,
+            entry_price=position.entry_price,
+            risk_per_unit=risk_per_unit,
+            next_trigger_r=next_trigger_r,
+            tick_size=trade_instrument.tick_size,
+            dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
+        )
         ref_parts: list[str] = []
         if algo_cl_norm:
             ref_parts.append(f"algoClOrdId={algo_cl_norm}")
@@ -3913,6 +3922,8 @@ class StrategyEngine:
             f"触发价格类型={config.tp_sl_trigger_type}",
             f"初始止损={format_decimal(initial_stop_loss)}",
             _live_dynamic_break_even_summary(config),
+            f"下一次上移阶段={next_trigger_r}R",
+            f"下一次上移触发价={next_trigger_price_text}",
             f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
             f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根",
         ]
@@ -4452,6 +4463,7 @@ class StrategyEngine:
         self._logger(
             f"OKX 动态止损已上移 | 当前价={format_decimal(fresh_price)} | "
             f"新止损={format_decimal(updated_stop_loss)} | 下一阶段={updated_trigger_r}R | "
+            f"下一次上移触发价={_dynamic_next_trigger_price_text(direction=direction, entry_price=position.entry_price, risk_per_unit=risk_per_unit, next_trigger_r=updated_trigger_r, tick_size=trade_instrument.tick_size, dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config))} | "
             f"{algo_ref} | holding_bars={holding_bars}"
         )
         return DynamicStopMonitorStepResult(
@@ -6005,8 +6017,16 @@ class StrategyEngine:
         direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
         current_stop_loss = initial_stop_loss
         current_take_profit = take_profit
-        next_trigger_r = 2
+        next_trigger_r = _live_dynamic_initial_trigger_r(config)
         risk_per_unit = abs(position.entry_price - initial_stop_loss)
+        next_trigger_price_text = _dynamic_next_trigger_price_text(
+            direction=direction,
+            entry_price=position.entry_price,
+            risk_per_unit=risk_per_unit,
+            next_trigger_r=next_trigger_r,
+            tick_size=trade_instrument.tick_size,
+            dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
+        )
         virtual_loss_logged = False
         trend_ema_close_exit_enabled = (
             direction == "long"
@@ -6026,6 +6046,8 @@ class StrategyEngine:
                 [
                     "止盈方式=动态",
                     _live_dynamic_break_even_summary(config),
+                    f"下一次上移阶段={next_trigger_r}R",
+                    f"下一次上移触发价={next_trigger_price_text}",
                     f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
                     f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根",
                 ]
@@ -6074,6 +6096,7 @@ class StrategyEngine:
                     self._logger(
                         f"交易员动态止盈保护价已上移 | 当前价={format_decimal(current_price)} | "
                         f"新保护价={format_decimal(current_stop_loss)} | 下一阶段={next_trigger_r}R | "
+                        f"下一次上移触发价={_dynamic_next_trigger_price_text(direction=direction, entry_price=position.entry_price, risk_per_unit=risk_per_unit, next_trigger_r=next_trigger_r, tick_size=trade_instrument.tick_size, dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config))} | "
                         f"holding_bars={holding_bars}"
                     )
                 if trend_ema_close_exit_enabled:
@@ -6745,6 +6768,31 @@ def _dynamic_trigger_price_live(
     return snap_to_increment(raw, tick_size, rounding)
 
 
+def _dynamic_next_trigger_price_text(
+    *,
+    direction: Literal["long", "short"],
+    entry_price: Decimal,
+    risk_per_unit: Decimal,
+    next_trigger_r: int,
+    tick_size: Decimal,
+    taker_fee_rate: Decimal = LIVE_DYNAMIC_TAKER_FEE_RATE,
+    dynamic_fee_offset_enabled: bool = True,
+) -> str:
+    if next_trigger_r <= 0:
+        return "-"
+    return format_decimal(
+        _dynamic_trigger_price_live(
+            direction=direction,
+            entry_price=entry_price,
+            risk_per_unit=risk_per_unit,
+            trigger_r=next_trigger_r,
+            tick_size=tick_size,
+            taker_fee_rate=taker_fee_rate,
+            dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
+        )
+    )
+
+
 def _dynamic_stop_price_live(
     *,
     direction: Literal["long", "short"],
@@ -6848,6 +6896,26 @@ def _live_resolved_dynamic_rules(
         first_lock_r=max(int(first_lock_r), 0),
         trailing_step_r=max(int(trailing_step_r), 1),
     )
+
+
+def _live_dynamic_initial_trigger_r(
+    config: StrategyConfig,
+    *,
+    fallback: int = 2,
+) -> int:
+    resolved_rules = _live_resolved_dynamic_rules(
+        dynamic_protection_rules=_live_dynamic_protection_rules(config),
+        two_r_break_even=_live_ema55_slope_dynamic_two_r_break_even_enabled(config),
+        break_even_trigger_r=_live_dynamic_break_even_trigger_r(config),
+        trailing_start_r=_live_ema55_slope_lock_profit_trigger_r(config),
+        first_lock_r=_live_dynamic_first_lock_r(config),
+        trailing_step_r=_live_dynamic_trailing_step_r(config),
+    )
+    if resolved_rules:
+        return max(int(resolved_rules[0].resolved_trigger_r()), 1)
+    if _live_ema55_slope_dynamic_two_r_break_even_enabled(config):
+        return max(_live_dynamic_break_even_trigger_r(config), 1)
+    return max(int(fallback), 1)
 
 
 def _live_dynamic_next_rule_index(rules: tuple[DynamicProtectionRule, ...], next_trigger_r: int) -> int:

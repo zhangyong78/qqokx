@@ -50,7 +50,7 @@ class AccountFeedThread(QThread):
                 time.sleep(2)
                 continue
             try:
-                positions = self._load_futures_positions()
+                positions = self._load_positions()
                 spot_balances = self._load_spot_balance_lookup()
                 self.positions_ready.emit(positions)
                 self.spot_balances_ready.emit(spot_balances)
@@ -60,7 +60,7 @@ class AccountFeedThread(QThread):
                 self.status_changed.emit(f"持仓读取异常：{exc}")
                 time.sleep(2.5)
 
-    def _load_futures_positions(self) -> list[FuturesPositionView]:
+    def _load_positions(self) -> list[FuturesPositionView]:
         assert self._runtime is not None
         cached_payload = self._client.get_cached_private_positions(
             self._runtime.credentials,
@@ -68,7 +68,7 @@ class AccountFeedThread(QThread):
         )
         if cached_payload is not None:
             _, cached_positions = cached_payload
-            derivatives = [item for item in cached_positions if item.inst_type.upper() in {"FUTURES", "SWAP"}]
+            derivatives = [item for item in cached_positions if item.inst_type.upper() in {"FUTURES", "SWAP", "OPTION"}]
             if derivatives:
                 return [self._to_view(item) for item in derivatives]
         rest_positions = [
@@ -82,6 +82,12 @@ class AccountFeedThread(QThread):
                 self._runtime.credentials,
                 environment=self._runtime.environment,
                 inst_type="SWAP",
+                prefer_cache=False,
+            ),
+            *self._client.get_positions(
+                self._runtime.credentials,
+                environment=self._runtime.environment,
+                inst_type="OPTION",
                 prefer_cache=False,
             ),
         ]
@@ -178,14 +184,15 @@ class AccountFeedThread(QThread):
         base_text = "-" if base_qty is None else _fmt(base_qty)
         contract_text = _contract_text(contract_value, contract_value_ccy)
         notional_text = _notional_text(notional_value, contract_value_ccy)
+        inst_type_text = str(position.inst_type or "").strip().upper() or "FUTURES"
         label = (
             f"{position.inst_id} | {side_text} | 可平 {_fmt(contracts)} 张 | {contract_text} | {notional_text} | "
-            f"折合 {base_text} {base_ccy} | FUTURES | {position.mgn_mode}/{pos_side or 'net'}"
+            f"折合 {base_text} {base_ccy} | {inst_type_text} | {position.mgn_mode}/{pos_side or 'net'}"
         )
         return FuturesPositionView(
             position_key=_position_key(position.inst_id, side),
             inst_id=position.inst_id,
-            inst_type=str(position.inst_type or "").strip().upper() or "FUTURES",
+            inst_type=inst_type_text,
             side=side,
             available=contracts,
             contracts=api_contracts,
@@ -282,7 +289,17 @@ def _round_base(value: Decimal) -> Decimal:
 
 
 def _fmt(value: Decimal) -> str:
-    text = format(value, "f")
+    magnitude = abs(value)
+    if magnitude >= Decimal("1000"):
+        text = format(value.quantize(Decimal("0.01")), "f")
+    elif magnitude >= Decimal("1"):
+        text = format(value.quantize(Decimal("0.0001")), "f")
+    elif magnitude >= Decimal("0.01"):
+        text = format(value.quantize(Decimal("0.000001")), "f")
+    elif magnitude >= Decimal("0.0001"):
+        text = format(value.quantize(Decimal("0.00000001")), "f")
+    else:
+        text = format(value.quantize(Decimal("0.000000000001")), "f")
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text or "0"
