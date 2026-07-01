@@ -36,6 +36,192 @@ class UiStrategySessionsMixin:
         return value.strftime("%m-%d %H:%M:%S")
 
     @staticmethod
+    def _running_session_all_columns() -> tuple[str, ...]:
+        return (
+            "session",
+            "trader",
+            "email",
+            "api",
+            "account_equity",
+            "source_type",
+            "strategy",
+            "mode",
+            "symbol",
+            "bar",
+            "direction",
+            "risk_amount",
+            "open_qty",
+            "entry_price",
+            "stop_price",
+            "take_profit",
+            "live_pnl",
+            "pnl",
+            "last_pnl",
+            "status",
+            "started",
+        )
+
+    @staticmethod
+    def _running_session_default_display_columns() -> tuple[str, ...]:
+        return (
+            "session",
+            "api",
+            "account_equity",
+            "strategy",
+            "mode",
+            "symbol",
+            "bar",
+            "direction",
+            "risk_amount",
+            "open_qty",
+            "entry_price",
+            "stop_price",
+            "take_profit",
+            "live_pnl",
+            "pnl",
+            "last_pnl",
+            "status",
+            "started",
+        )
+
+    @staticmethod
+    def _running_session_column_heading_text(column_id: str) -> str:
+        return {
+            "session": "会话(双击日志)",
+            "trader": "交易员(双击打开)",
+            "email": "邮件(双击切换)",
+            "api": "API",
+            "account_equity": "账户总权益",
+            "source_type": "来源类型",
+            "strategy": "策略",
+            "mode": "模式",
+            "symbol": "标的(双击K线)",
+            "bar": "周期",
+            "direction": "方向",
+            "risk_amount": "风险金",
+            "open_qty": "开仓数量",
+            "entry_price": "开仓价",
+            "stop_price": "止损价",
+            "take_profit": "止盈价",
+            "live_pnl": "实时浮盈亏",
+            "pnl": "净盈亏",
+            "last_pnl": "上次净盈亏",
+            "status": "状态",
+            "started": "启动时间",
+        }.get(str(column_id or "").strip(), str(column_id or "").strip())
+
+    @staticmethod
+    def _normalize_running_session_display_columns(columns: object) -> tuple[str, ...]:
+        allowed = UiStrategySessionsMixin._running_session_all_columns()
+        if isinstance(columns, str):
+            raw_items = [part for part in columns.split() if str(part).strip()]
+        elif isinstance(columns, (tuple, list)):
+            raw_items = [str(part).strip() for part in columns if str(part).strip()]
+        else:
+            raw_items = []
+        normalized: list[str] = []
+        for column_id in raw_items:
+            if column_id in allowed and column_id not in normalized:
+                normalized.append(column_id)
+        if not normalized:
+            return UiStrategySessionsMixin._running_session_default_display_columns()
+        return tuple(normalized)
+
+    def _apply_running_session_display_columns(self) -> None:
+        columns = self._normalize_running_session_display_columns(
+            getattr(self, "_running_session_display_columns", ())
+        )
+        self._running_session_display_columns = columns
+        tree = getattr(self, "session_tree", None)
+        if tree is not None:
+            try:
+                tree.configure(displaycolumns=columns)
+            except Exception:
+                pass
+        column_vars = getattr(self, "_running_session_column_vars", None)
+        if isinstance(column_vars, dict):
+            for column_id, variable in column_vars.items():
+                try:
+                    variable.set(column_id in columns)
+                except Exception:
+                    pass
+
+    def _toggle_running_session_column(self, column_id: str) -> None:
+        allowed = self._running_session_all_columns()
+        normalized_id = str(column_id or "").strip()
+        if normalized_id not in allowed:
+            return
+        column_vars = getattr(self, "_running_session_column_vars", None)
+        visible = True
+        if isinstance(column_vars, dict) and normalized_id in column_vars:
+            try:
+                visible = bool(column_vars[normalized_id].get())
+            except Exception:
+                visible = True
+        current = list(
+            self._normalize_running_session_display_columns(getattr(self, "_running_session_display_columns", ()))
+        )
+        if visible:
+            if normalized_id not in current:
+                insert_after = [item for item in allowed if item == normalized_id or item in current]
+                target_index = len(insert_after) - 1
+                if target_index < 0:
+                    current.append(normalized_id)
+                else:
+                    current.insert(target_index, normalized_id)
+        else:
+            current = [item for item in current if item != normalized_id]
+        normalized = self._normalize_running_session_display_columns(tuple(current))
+        self._running_session_display_columns = normalized
+        self._apply_running_session_display_columns()
+        self._on_notification_settings_changed()
+        refresh = getattr(self, "_refresh_running_session_tree", None)
+        if callable(refresh):
+            refresh()
+
+    def _show_running_session_column_menu(self) -> None:
+        menu = getattr(self, "_running_session_column_menu", None)
+        button = getattr(self, "_running_session_columns_button", None)
+        if menu is None or button is None:
+            return
+        try:
+            menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _session_runtime_entry_price_text(session: StrategySession) -> str:
+        trade = getattr(session, "active_trade", None)
+        if trade is None:
+            return "-"
+        value = trade.entry_price
+        if value is None:
+            value = trade.pending_entry_reference
+        return _format_optional_decimal(value)
+
+    @staticmethod
+    def _session_runtime_stop_price_text(session: StrategySession) -> str:
+        trade = getattr(session, "active_trade", None)
+        if trade is None:
+            return "-"
+        value = trade.current_stop_price
+        if value is None:
+            value = trade.initial_stop_price
+        if value is None:
+            value = trade.pending_stop_price
+        return _format_optional_decimal(value)
+
+    @staticmethod
+    def _session_runtime_take_profit_text(session: StrategySession) -> str:
+        trade = getattr(session, "active_trade", None)
+        if trade is None:
+            return "-"
+        return _format_optional_decimal(trade.pending_take_profit)
+
+    @staticmethod
     def _session_recovery_reason_text(session: StrategySession) -> str:
         status = str(getattr(session, "status", "") or "").strip()
         if status not in {"待恢复", "恢复中"}:
@@ -6862,6 +7048,9 @@ class UiStrategySessionsMixin:
             ),
             risk_amount_text,
             open_qty_text,
+            self._session_runtime_entry_price_text(session),
+            self._session_runtime_stop_price_text(session),
+            self._session_runtime_take_profit_text(session),
             _format_optional_usdt_precise(live_pnl, places=2),
             _format_optional_usdt_precise(session.net_pnl_total, places=2),
             _format_optional_usdt_precise(session.last_net_pnl, places=2),
@@ -6921,26 +7110,7 @@ class UiStrategySessionsMixin:
         elif isinstance(resolved, (tuple, list)):
             columns = tuple(str(part) for part in resolved if str(part).strip())
         if not columns:
-            columns = (
-                "session",
-                "trader",
-                "email",
-                "api",
-                "account_equity",
-                "source_type",
-                "strategy",
-                "mode",
-                "symbol",
-                "bar",
-                "direction",
-                "risk_amount",
-                "open_qty",
-                "live_pnl",
-                "pnl",
-                "last_pnl",
-                "status",
-                "started",
-            )
+            columns = UiStrategySessionsMixin._running_session_all_columns()
         try:
             index = int(raw[1:]) - 1
         except ValueError:

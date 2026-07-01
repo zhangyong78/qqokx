@@ -1043,12 +1043,16 @@ def load_notification_snapshot(path: Path | None = None) -> dict[str, object]:
             "notify_errors": True,
             "upgrade_launch_mode": "",
             "upgrade_custom_launch_path": "",
+            "running_session_display_columns": [],
         }
 
     payload = json.loads(target.read_text(encoding="utf-8"))
     raw_overrides = payload.get("api_sender_email_overrides", {})
     if not isinstance(raw_overrides, dict):
         raw_overrides = {}
+    raw_running_session_display_columns = payload.get("running_session_display_columns", [])
+    if not isinstance(raw_running_session_display_columns, list):
+        raw_running_session_display_columns = []
     return {
         "environment_label": str(payload.get("environment_label", "模拟盘 demo")),
         "trade_mode_label": str(payload.get("trade_mode_label", "全仓 cross")),
@@ -1072,6 +1076,9 @@ def load_notification_snapshot(path: Path | None = None) -> dict[str, object]:
         "notify_errors": bool(payload.get("notify_errors", True)),
         "upgrade_launch_mode": str(payload.get("upgrade_launch_mode", "")),
         "upgrade_custom_launch_path": str(payload.get("upgrade_custom_launch_path", "")),
+        "running_session_display_columns": [
+            str(item).strip() for item in raw_running_session_display_columns if str(item).strip()
+        ],
     }
 
 
@@ -1095,6 +1102,7 @@ def save_notification_snapshot(
     notify_errors: bool,
     upgrade_launch_mode: str = "",
     upgrade_custom_launch_path: str = "",
+    running_session_display_columns: list[str] | tuple[str, ...] | None = None,
     path: Path | None = None,
 ) -> Path:
     target = path or settings_file_path()
@@ -1122,6 +1130,11 @@ def save_notification_snapshot(
         "notify_errors": notify_errors,
         "upgrade_launch_mode": upgrade_launch_mode.strip(),
         "upgrade_custom_launch_path": upgrade_custom_launch_path.strip(),
+        "running_session_display_columns": [
+            str(item).strip()
+            for item in (running_session_display_columns or [])
+            if str(item).strip()
+        ],
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     temp_path = target.with_suffix(target.suffix + ".tmp")

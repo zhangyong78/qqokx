@@ -3958,6 +3958,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._strategy_history_pnl_combo: ttk.Combobox | None = None
         self._strategy_history_status_combo: ttk.Combobox | None = None
         self.running_session_api_filter = StringVar(value=STRATEGY_BOOK_FILTER_ALL_API)
+        self._running_session_display_columns = UiStrategySessionsMixin._running_session_default_display_columns()
+        self._running_session_column_vars: dict[str, BooleanVar] = {}
+        self._running_session_column_menu: Menu | None = None
+        self._running_session_columns_button: ttk.Button | None = None
         self._running_session_sort_column = "started"
         self._running_session_sort_descending = True
         self._strategy_history_sort_column = "started"
@@ -5383,6 +5387,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         )
         self._running_session_api_filter_combo.grid(row=0, column=4, sticky="e")
         self._running_session_api_filter_combo.bind("<<ComboboxSelected>>", self._on_running_session_filter_changed)
+        self._running_session_columns_button = ttk.Button(running_header, text="列设置")
+        self._running_session_columns_button.grid(row=0, column=5, sticky="e", padx=(12, 0))
 
         self.session_tree = ttk.Treeview(
             running_frame,
@@ -5400,6 +5406,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 "direction",
                 "risk_amount",
                 "open_qty",
+                "entry_price",
+                "stop_price",
+                "take_profit",
                 "live_pnl",
                 "pnl",
                 "last_pnl",
@@ -5422,6 +5431,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("direction", text="方向")
         self.session_tree.heading("risk_amount", text="风险金")
         self.session_tree.heading("open_qty", text="开仓数量")
+        self.session_tree.heading("entry_price", text="开仓价")
+        self.session_tree.heading("stop_price", text="止损价")
+        self.session_tree.heading("take_profit", text="止盈价")
         self.session_tree.heading("live_pnl", text="实时浮盈亏")
         self.session_tree.heading("pnl", text="净盈亏")
         self.session_tree.heading("last_pnl", text="上次净盈亏")
@@ -5441,17 +5453,36 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.column("direction", width=82, anchor="center")
         self.session_tree.column("risk_amount", width=88, anchor="e")
         self.session_tree.column("open_qty", width=112, anchor="e")
+        self.session_tree.column("entry_price", width=92, anchor="e")
+        self.session_tree.column("stop_price", width=92, anchor="e")
+        self.session_tree.column("take_profit", width=92, anchor="e")
         self.session_tree.column("live_pnl", width=112, anchor="e")
         self.session_tree.column("pnl", width=104, anchor="e")
         self.session_tree.column("last_pnl", width=104, anchor="e")
         self.session_tree.column("status", width=168, anchor="center")
         self.session_tree.column("started", width=136, anchor="center")
+        self.session_tree.configure(
+            displaycolumns=UiStrategySessionsMixin._normalize_running_session_display_columns(
+                self._running_session_display_columns
+            )
+        )
         self.session_tree.grid(row=1, column=0, sticky="nsew")
         self.session_tree.bind("<<TreeviewSelect>>", self._on_session_selected)
         self.session_tree.bind("<Double-1>", self._on_session_tree_double_click)
         self.session_tree.bind("<Motion>", self._on_session_tree_hover)
         self.session_tree.bind("<Leave>", self._on_session_tree_hover_leave)
         self.session_tree.tag_configure("duplicate_conflict", background="#fff4e5", foreground="#a85a00")
+        self._running_session_column_menu = Menu(self.root, tearoff=0)
+        for column_id in UiStrategySessionsMixin._running_session_all_columns():
+            variable = BooleanVar(value=column_id in self._running_session_display_columns)
+            self._running_session_column_vars[column_id] = variable
+            self._running_session_column_menu.add_checkbutton(
+                label=UiStrategySessionsMixin._running_session_column_heading_text(column_id),
+                variable=variable,
+                command=lambda current=column_id: self._toggle_running_session_column(current),
+            )
+        self._running_session_columns_button.configure(command=self._show_running_session_column_menu)
+        self._apply_running_session_display_columns()
 
         tree_scroll = ttk.Scrollbar(running_frame, orient="vertical", command=self.session_tree.yview)
         tree_scroll.grid(row=1, column=1, sticky="ns")
@@ -8990,6 +9021,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._upgrade_custom_launch_path_setting = UpgradeLaunchManager.normalize_custom_launch_path(
             snapshot.get("upgrade_custom_launch_path", "")
         )
+        self._running_session_display_columns = UiStrategySessionsMixin._normalize_running_session_display_columns(
+            snapshot.get("running_session_display_columns", ())
+        )
         self._sync_current_api_sender_email_override(self._current_credential_profile())
         self._refresh_global_email_toggle_text()
         self._default_environment_label = self._normalized_environment_label(str(snapshot["environment_label"]))
@@ -9513,6 +9547,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 notify_errors=self.notify_errors.get(),
                 upgrade_launch_mode=self._upgrade_launch_mode_setting,
                 upgrade_custom_launch_path=self._upgrade_custom_launch_path_setting,
+                running_session_display_columns=list(
+                    UiStrategySessionsMixin._normalize_running_session_display_columns(
+                        getattr(self, "_running_session_display_columns", ())
+                    )
+                ),
             )
         except Exception as exc:
             if not silent:
@@ -10562,6 +10601,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self.notify_errors.get(),
             self._upgrade_launch_mode_setting,
             self._upgrade_custom_launch_path_setting,
+            tuple(
+                UiStrategySessionsMixin._normalize_running_session_display_columns(
+                    getattr(self, "_running_session_display_columns", ())
+                )
+            ),
         )
 
     def _enqueue_log(self, message: str) -> None:

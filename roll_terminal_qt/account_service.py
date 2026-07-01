@@ -9,6 +9,7 @@ from PySide6.QtCore import QThread, Signal
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
 from okx_quant.models import Instrument
 from okx_quant.okx_client import OkxPosition, OkxRestClient
+from okx_quant.ui_shell import _build_position_instrument_map, _build_position_ticker_map, _build_upl_usdt_price_map
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class FuturesPositionView:
 
 class AccountFeedThread(QThread):
     positions_ready = Signal(object)
+    payload_ready = Signal(object)
     spot_balances_ready = Signal(object)
     status_changed = Signal(str)
 
@@ -50,7 +52,9 @@ class AccountFeedThread(QThread):
                 time.sleep(2)
                 continue
             try:
-                positions = self._load_positions()
+                raw_positions = self._load_raw_positions()
+                positions = [self._to_view(item) for item in raw_positions]
+                self.payload_ready.emit(self._build_payload(raw_positions))
                 spot_balances = self._load_spot_balance_lookup()
                 self.positions_ready.emit(positions)
                 self.spot_balances_ready.emit(spot_balances)
@@ -60,7 +64,7 @@ class AccountFeedThread(QThread):
                 self.status_changed.emit(f"持仓读取异常：{exc}")
                 time.sleep(2.5)
 
-    def _load_positions(self) -> list[FuturesPositionView]:
+    def _load_raw_positions(self) -> list[OkxPosition]:
         assert self._runtime is not None
         cached_payload = self._client.get_cached_private_positions(
             self._runtime.credentials,
@@ -70,7 +74,7 @@ class AccountFeedThread(QThread):
             _, cached_positions = cached_payload
             derivatives = [item for item in cached_positions if item.inst_type.upper() in {"FUTURES", "SWAP", "OPTION"}]
             if derivatives:
-                return [self._to_view(item) for item in derivatives]
+                return derivatives
         rest_positions = [
             *self._client.get_positions(
                 self._runtime.credentials,
@@ -91,7 +95,27 @@ class AccountFeedThread(QThread):
                 prefer_cache=False,
             ),
         ]
-        return [self._to_view(item) for item in rest_positions]
+        return rest_positions
+
+    def _build_payload(self, positions: list[OkxPosition]) -> dict[str, object]:
+        try:
+            upl_usdt_prices = _build_upl_usdt_price_map(self._client, positions)
+        except Exception:
+            upl_usdt_prices = {}
+        try:
+            position_instruments = _build_position_instrument_map(self._client, positions)
+        except Exception:
+            position_instruments = {}
+        try:
+            position_tickers = _build_position_ticker_map(self._client, positions)
+        except Exception:
+            position_tickers = {}
+        return {
+            "positions": positions,
+            "upl_usdt_prices": upl_usdt_prices,
+            "position_instruments": position_instruments,
+            "position_tickers": position_tickers,
+        }
 
     def _load_spot_balance_lookup(self) -> dict[str, str]:
         assert self._runtime is not None
