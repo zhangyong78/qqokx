@@ -271,6 +271,8 @@ class UiStrategySessionsMixin:
             summary = "缺少开仓价"
         elif "无法判断当前持仓方向" in summary:
             summary = "方向判断失败"
+        elif "拒绝接管现有持仓" in summary:
+            summary = "拒绝误接管"
         summary = summary.strip(" |，；。")
         if len(summary) > max_length:
             summary = f"{summary[:max_length]}..."
@@ -8546,15 +8548,19 @@ class UiStrategySessionsMixin:
 
     def _probe_recoverable_session_for_auto_restore(self, session_id: str) -> dict[str, object]:
         session = self.sessions.get(session_id)
-        if session is None or session.engine.is_running or not session.recovery_supported:
-            return {"ready": False}
+        if session is None:
+            return {"ready": False, "reason": "会话不存在"}
+        if session.engine.is_running:
+            return {"ready": False, "reason": "会话已在运行中"}
+        if not session.recovery_supported:
+            return {"ready": False, "reason": "当前模式不支持恢复接管"}
         record = self._recoverable_strategy_sessions.get(session_id)
         credentials = self._credentials_for_profile_or_none(session.api_name or (record.api_name if record is not None else ""))
         if credentials is None:
-            return {"ready": False}
+            return {"ready": False, "reason": "未找到对应的 API 凭证"}
         trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or session.symbol).strip().upper()
         if not trade_inst_id:
-            return {"ready": False}
+            return {"ready": False, "reason": "缺少交易标的"}
         try:
             inst_type = infer_inst_type(trade_inst_id)
             positions = self._load_recoverable_live_positions(credentials, session.config, inst_type=inst_type)
@@ -8571,42 +8577,41 @@ class UiStrategySessionsMixin:
                 "trade": trade,
                 "supports_position_recovery": supports_position_recovery,
             }
-            if live_position is None:
-                pending_signal = str(trade.pending_signal or "").strip().lower() if trade is not None else ""
-                pending_side = str(trade.pending_side or "").strip().lower() if trade is not None else ""
-                can_recover_pending_entry = (
-                    trade is not None
-                    and trade.opened_logged_at is None
-                    and bool((trade.entry_order_id or "").strip() or (trade.entry_client_order_id or "").strip())
-                    and trade.pending_entry_reference is not None
-                    and trade.pending_stop_price is not None
-                    and trade.size is not None
-                    and pending_signal in {"long", "short"}
-                    and pending_side in {"buy", "sell"}
+            can_recover_pending_entry = (
+                supports_position_recovery
+                and UiStrategySessionsMixin._session_trade_can_recover_pending_entry(trade)
+            )
+            if can_recover_pending_entry:
+                pending_status = session.engine._get_order_with_retry(
+                    credentials,
+                    session.config,
+                    inst_id=trade_inst_id,
+                    ord_id=(trade.entry_order_id or "").strip() or None,
+                    cl_ord_id=(trade.entry_client_order_id or "").strip() or None,
                 )
-                if can_recover_pending_entry and supports_position_recovery:
-                    pending_status = session.engine._get_order_with_retry(
+                probe["pending_status_checked"] = True
+                probe["pending_status"] = pending_status
+                pending_state = str(getattr(pending_status, "state", "") or "").strip().lower()
+                if pending_state == "filled":
+                    positions = self._load_recoverable_live_positions(
                         credentials,
                         session.config,
-                        inst_id=trade_inst_id,
-                        ord_id=(trade.entry_order_id or "").strip() or None,
-                        cl_ord_id=(trade.entry_client_order_id or "").strip() or None,
+                        inst_type=inst_type,
                     )
-                    probe["pending_status_checked"] = True
-                    probe["pending_status"] = pending_status
-                    pending_state = str(pending_status.state or "").strip().lower()
-                    if pending_state == "filled":
-                        positions = self._load_recoverable_live_positions(
-                            credentials,
-                            session.config,
-                            inst_type=inst_type,
-                        )
-                        live_position = self._select_recoverable_live_position(session, positions)
-                        probe["positions"] = positions
-                        probe["live_position"] = live_position
-                    elif pending_state == "live":
-                        probe["trade_instrument_checked"] = True
-                        probe["trade_instrument"] = session.engine._get_instrument_with_retry(trade_inst_id)
+                    live_position = self._select_recoverable_live_position(session, positions)
+                    probe["positions"] = positions
+                    probe["live_position"] = live_position
+                elif pending_state == "live":
+                    probe["prefer_pending_recovery"] = True
+                    probe["trade_instrument_checked"] = True
+                    probe["trade_instrument"] = session.engine._get_instrument_with_retry(trade_inst_id)
+                    return probe
+                elif live_position is not None:
+                    return {
+                        "ready": False,
+                        "reason": UiStrategySessionsMixin._reject_unmatched_live_position_reason(pending_state),
+                    }
+            if live_position is None:
                 return probe
             if supports_position_recovery:
                 direction = self._recoverable_position_direction(live_position)
@@ -8623,8 +8628,8 @@ class UiStrategySessionsMixin:
                         direction=direction,
                     )
             return probe
-        except Exception:
-            return {"ready": False}
+        except Exception as exc:
+            return {"ready": False, "reason": f"自动恢复探测失败：{exc}"}
 
     def _apply_auto_restore_probe_result(self, session_id: str, probe_result: dict[str, object]) -> None:
         try:
@@ -8635,6 +8640,20 @@ class UiStrategySessionsMixin:
                     self._auto_restore_probe_cache = cache
                 cache[session_id] = probe_result
                 self._recover_session(session_id, auto=True)
+            else:
+                reason = str(probe_result.get("reason") or "").strip()
+                session = self.sessions.get(session_id)
+                if session is not None and reason:
+                    session.ended_reason = reason
+                    if session.status not in {"待恢复", "恢复中"}:
+                        session.status = "待恢复"
+                    if session.runtime_status not in {"待恢复", "恢复中"}:
+                        session.runtime_status = "待恢复"
+                    if session.stopped_at is None:
+                        session.stopped_at = datetime.now()
+                    self._upsert_session_row(session)
+                    self._sync_strategy_history_from_session(session)
+                    self._log_session_message(session, reason)
         finally:
             pending = getattr(self, "_auto_restore_batch_pending", None)
             if not isinstance(pending, set):
@@ -8689,6 +8708,42 @@ class UiStrategySessionsMixin:
         if symbol:
             return f"{session_id}({symbol})"
         return session_id
+
+    @staticmethod
+    def _session_trade_can_recover_pending_entry(trade: StrategyTradeRuntimeState | None) -> bool:
+        if trade is None or trade.opened_logged_at is not None:
+            return False
+        pending_signal = str(trade.pending_signal or "").strip().lower()
+        pending_side = str(trade.pending_side or "").strip().lower()
+        return (
+            bool((trade.entry_order_id or "").strip() or (trade.entry_client_order_id or "").strip())
+            and trade.pending_entry_reference is not None
+            and trade.pending_stop_price is not None
+            and trade.size is not None
+            and pending_signal in {"long", "short"}
+            and pending_side in {"buy", "sell"}
+        )
+
+    @staticmethod
+    def _pending_order_state_label(pending_state: str) -> str:
+        normalized = str(pending_state or "").strip().lower()
+        mapping = {
+            "live": "未成交",
+            "filled": "已成交",
+            "partially_filled": "部分成交",
+            "partially-filled": "部分成交",
+            "canceled": "已撤单",
+            "cancelled": "已撤单",
+        }
+        return mapping.get(normalized, normalized or "未知")
+
+    @staticmethod
+    def _reject_unmatched_live_position_reason(pending_state: str) -> str:
+        state_label = UiStrategySessionsMixin._pending_order_state_label(pending_state)
+        return (
+            "拒绝接管现有持仓：检测到同标的同方向仓位，"
+            f"但当前会话暂无开仓成交记录，且本会话挂单状态为{state_label}。"
+        )
 
     def _restart_recoverable_signal_monitoring(self, session: StrategySession, credentials: Credentials) -> bool:
         def _mark_recovery_back_to_running(status_note: str) -> None:
@@ -8835,139 +8890,150 @@ class UiStrategySessionsMixin:
             self._sync_strategy_history_from_session(session)
             self._log_session_message(session, conflict_reason)
             return False
-        if live_position is None:
-            pending_signal = str(trade.pending_signal or "").strip().lower() if trade is not None else ""
-            pending_side = str(trade.pending_side or "").strip().lower() if trade is not None else ""
-            can_recover_pending_entry = (
-                trade is not None
-                and trade.opened_logged_at is None
-                and bool((trade.entry_order_id or "").strip() or (trade.entry_client_order_id or "").strip())
-                and trade.pending_entry_reference is not None
-                and trade.pending_stop_price is not None
-                and trade.size is not None
-                and pending_signal in {"long", "short"}
-                and pending_side in {"buy", "sell"}
-            )
-            if can_recover_pending_entry and supports_position_recovery:
-                if auto_restore_probe is not None and auto_restore_probe.get("pending_status_checked"):
-                    pending_status = auto_restore_probe.get("pending_status")
-                else:
+        pending_signal = str(trade.pending_signal or "").strip().lower() if trade is not None else ""
+        pending_side = str(trade.pending_side or "").strip().lower() if trade is not None else ""
+        can_recover_pending_entry = (
+            supports_position_recovery
+            and UiStrategySessionsMixin._session_trade_can_recover_pending_entry(trade)
+        )
+        pending_status = (
+            auto_restore_probe.get("pending_status")
+            if auto_restore_probe is not None and auto_restore_probe.get("pending_status_checked")
+            else None
+        )
+        pending_state = str(getattr(pending_status, "state", "") or "").strip().lower()
+        if can_recover_pending_entry:
+            if pending_status is None:
+                try:
+                    pending_status = session.engine._get_order_with_retry(
+                        credentials,
+                        session.config,
+                        inst_id=trade_inst_id,
+                        ord_id=(trade.entry_order_id or "").strip() or None,
+                        cl_ord_id=(trade.entry_client_order_id or "").strip() or None,
+                    )
+                except Exception as exc:
+                    if not auto:
+                        self._enqueue_log(f"{session.log_prefix} 回查未成交挂单失败，暂时无法恢复接管：{exc}")
+                    return False
+            if pending_status is None:
+                return False
+            pending_state = str(getattr(pending_status, "state", "") or "").strip().lower()
+            if pending_state == "filled" and live_position is None:
+                try:
+                    positions = self._load_recoverable_live_positions(credentials, session.config, inst_type=inst_type)
+                    live_position = self._select_recoverable_live_position(session, positions)
+                except Exception:
+                    live_position = None
+            if pending_state == "live":
+                trade_instrument = (
+                    auto_restore_probe.get("trade_instrument")
+                    if auto_restore_probe is not None and auto_restore_probe.get("trade_instrument_checked")
+                    else None
+                )
+                if trade_instrument is None:
                     try:
-                        pending_status = session.engine._get_order_with_retry(
-                            credentials,
-                            session.config,
-                            inst_id=trade_inst_id,
-                            ord_id=(trade.entry_order_id or "").strip() or None,
-                            cl_ord_id=(trade.entry_client_order_id or "").strip() or None,
-                        )
+                        trade_instrument = session.engine._get_instrument_with_retry(trade_inst_id)
                     except Exception as exc:
                         if not auto:
-                            self._enqueue_log(f"{session.log_prefix} 回查未成交挂单失败，暂时无法恢复接管：{exc}")
+                            self._enqueue_log(f"{session.log_prefix} 读取交易标的信息失败，无法恢复挂单接管：{exc}")
                         return False
-                if pending_status is None:
-                    return False
-                pending_state = str(pending_status.state or "").strip().lower()
-                if pending_state == "filled" and live_position is None:
-                    try:
-                        positions = self._load_recoverable_live_positions(credentials, session.config, inst_type=inst_type)
-                        live_position = self._select_recoverable_live_position(session, positions)
-                    except Exception:
-                        live_position = None
-                if pending_state == "live":
-                    trade_instrument = (
-                        auto_restore_probe.get("trade_instrument")
-                        if auto_restore_probe is not None and auto_restore_probe.get("trade_instrument_checked")
-                        else None
+
+                def _monitor_pending() -> None:
+                    session.engine._logger(
+                        "检测到现有 OKX 未成交挂单，开始恢复动态挂单接管"
+                        f" | 标的={trade_inst_id}"
+                        f" | ordId={trade.entry_order_id or '-'}"
+                        f" | clOrdId={trade.entry_client_order_id or '-'}"
+                        f" | 方向={pending_signal.upper()}"
+                        f" | 数量={format_decimal(trade.size)}"
+                        f" | 挂单价={format_decimal(trade.pending_entry_reference)}"
                     )
-                    if trade_instrument is None:
-                        try:
-                            trade_instrument = session.engine._get_instrument_with_retry(trade_inst_id)
-                        except Exception as exc:
-                            if not auto:
-                                self._enqueue_log(f"{session.log_prefix} 读取交易标的信息失败，无法恢复挂单接管：{exc}")
-                            return False
+                    session.engine.resume_dynamic_exchange_pending_order(
+                        credentials,
+                        session.config,
+                        trade_instrument,
+                        ord_id=(pending_status.ord_id or trade.entry_order_id or "").strip(),
+                        cl_ord_id=(trade.entry_client_order_id or "").strip() or None,
+                        candle_ts=int((trade.signal_bar_at or session.started_at).timestamp() * 1000),
+                        entry_reference=trade.pending_entry_reference,
+                        stop_loss=trade.pending_stop_price,
+                        take_profit=trade.pending_take_profit or trade.pending_entry_reference,
+                        size=trade.size,
+                        side=pending_side,
+                        signal=pending_signal,
+                        stop_loss_algo_cl_ord_id=(trade.protective_algo_cl_ord_id or "").strip() or None,
+                        stop_loss_algo_id=(trade.protective_algo_id or "").strip() or None,
+                    )
 
-                    def _monitor_pending() -> None:
-                        session.engine._logger(
-                            "检测到现有 OKX 未成交挂单，开始恢复动态挂单接管"
-                            f" | 标的={trade_inst_id}"
-                            f" | ordId={trade.entry_order_id or '-'}"
-                            f" | clOrdId={trade.entry_client_order_id or '-'}"
-                            f" | 方向={pending_signal.upper()}"
-                            f" | 数量={format_decimal(trade.size)}"
-                            f" | 挂单价={format_decimal(trade.pending_entry_reference)}"
-                        )
-                        session.engine.resume_dynamic_exchange_pending_order(
-                            credentials,
-                            session.config,
-                            trade_instrument,
-                            ord_id=(pending_status.ord_id or trade.entry_order_id or "").strip(),
-                            cl_ord_id=(trade.entry_client_order_id or "").strip() or None,
-                            candle_ts=int((trade.signal_bar_at or session.started_at).timestamp() * 1000),
-                            entry_reference=trade.pending_entry_reference,
-                            stop_loss=trade.pending_stop_price,
-                            take_profit=trade.pending_take_profit or trade.pending_entry_reference,
-                            size=trade.size,
-                            side=pending_side,
-                            signal=pending_signal,
-                            stop_loss_algo_cl_ord_id=(trade.protective_algo_cl_ord_id or "").strip() or None,
-                            stop_loss_algo_id=(trade.protective_algo_id or "").strip() or None,
-                        )
-
-                    def _mark_recovery_back_to_running(status_note: str) -> None:
-                        session.status = "运行中"
-                        session.runtime_status = "等待信号"
-                        session.stopped_at = None
-                        session.ended_reason = ""
-                        self._remove_recoverable_strategy_session(session.session_id)
-                        self._upsert_session_row(session)
-                        self._sync_strategy_history_from_session(session)
-                        self._log_session_message(session, status_note)
-
-                    def _run_pending_recovery() -> None:
-                        continue_main_loop = False
-                        try:
-                            _monitor_pending()
-                            if not session.engine._stop_event.is_set():
-                                continue_main_loop = True
-                                self.root.after(
-                                    0,
-                                    lambda: _mark_recovery_back_to_running(
-                                        "恢复挂单接管已完成，已切回主策略循环，继续监控下一次信号。"
-                                    ),
-                                )
-                                session.engine._run(credentials, session.config)
-                        except Exception as exc:
-                            session.engine._notify_error(session.config, str(exc))
-                            session.engine._logger(f"策略停止，原因：{exc}")
-                        finally:
-                            if not continue_main_loop or session.engine._stop_event.is_set():
-                                session.engine._stop_event.set()
-
-                    session.active_trade = trade
-                    session.status = "恢复中"
-                    session.runtime_status = "恢复中"
+                def _mark_recovery_back_to_running(status_note: str) -> None:
+                    session.status = "运行中"
+                    session.runtime_status = "等待信号"
                     session.stopped_at = None
-                    session.ended_reason = "恢复中"
-                    self._upsert_recoverable_strategy_session(session)
+                    session.ended_reason = ""
+                    self._remove_recoverable_strategy_session(session.session_id)
                     self._upsert_session_row(session)
                     self._sync_strategy_history_from_session(session)
+                    self._log_session_message(session, status_note)
+
+                def _run_pending_recovery() -> None:
+                    continue_main_loop = False
                     try:
-                        session.engine.start_custom(
-                            _run_pending_recovery,
-                            thread_name=f"okx-{session.config.strategy_id}-recover-pending",
-                        )
+                        _monitor_pending()
+                        if not session.engine._stop_event.is_set():
+                            continue_main_loop = True
+                            self.root.after(
+                                0,
+                                lambda: _mark_recovery_back_to_running(
+                                    "恢复挂单接管已完成，已切回主策略循环，继续监控下一次信号。"
+                                ),
+                            )
+                            session.engine._run(credentials, session.config)
                     except Exception as exc:
-                        session.status = "待恢复"
-                        session.runtime_status = "待恢复"
-                        session.stopped_at = datetime.now()
-                        session.ended_reason = "恢复启动失败"
-                        self._upsert_session_row(session)
-                        self._sync_strategy_history_from_session(session)
-                        if not auto:
-                            self._enqueue_log(f"{session.log_prefix} 恢复挂单接管启动失败：{exc}")
-                        return False
-                    return True
+                        session.engine._notify_error(session.config, str(exc))
+                        session.engine._logger(f"策略停止，原因：{exc}")
+                    finally:
+                        if not continue_main_loop or session.engine._stop_event.is_set():
+                            session.engine._stop_event.set()
+
+                session.active_trade = trade
+                session.status = "恢复中"
+                session.runtime_status = "恢复中"
+                session.stopped_at = None
+                session.ended_reason = "恢复中"
+                self._upsert_recoverable_strategy_session(session)
+                self._upsert_session_row(session)
+                self._sync_strategy_history_from_session(session)
+                try:
+                    session.engine.start_custom(
+                        _run_pending_recovery,
+                        thread_name=f"okx-{session.config.strategy_id}-recover-pending",
+                    )
+                except Exception as exc:
+                    session.status = "待恢复"
+                    session.runtime_status = "待恢复"
+                    session.stopped_at = datetime.now()
+                    session.ended_reason = "恢复启动失败"
+                    self._upsert_session_row(session)
+                    self._sync_strategy_history_from_session(session)
+                    if not auto:
+                        self._enqueue_log(f"{session.log_prefix} 恢复挂单接管启动失败：{exc}")
+                    return False
+                return True
+            if live_position is not None and pending_state != "filled":
+                reason = UiStrategySessionsMixin._reject_unmatched_live_position_reason(pending_state)
+                session.status = "已停止"
+                session.runtime_status = "已停止"
+                session.stopped_at = datetime.now()
+                session.ended_reason = reason
+                self._remove_recoverable_strategy_session(session.session_id)
+                self._upsert_session_row(session)
+                self._sync_strategy_history_from_session(session)
+                self._log_session_message(session, reason)
+                if not auto:
+                    self._enqueue_log(f"{session.log_prefix} {reason}")
+                return False
+        if live_position is None:
             if trade is None:
                 if not auto:
                     self._enqueue_log(f"{session.log_prefix} 未检测到现有仓位或挂单，恢复为信号监听。")
@@ -8993,6 +9059,19 @@ class UiStrategySessionsMixin:
             self._upsert_session_row(session)
             self._sync_strategy_history_from_session(session)
             self._log_session_message(session, "恢复接管结束：当前未检测到可接管仓位。")
+            return False
+        if trade is not None and trade.opened_logged_at is None and pending_state != "filled":
+            reason = UiStrategySessionsMixin._reject_unmatched_live_position_reason(pending_state)
+            session.status = "已停止"
+            session.runtime_status = "已停止"
+            session.stopped_at = datetime.now()
+            session.ended_reason = reason
+            self._remove_recoverable_strategy_session(session.session_id)
+            self._upsert_session_row(session)
+            self._sync_strategy_history_from_session(session)
+            self._log_session_message(session, reason)
+            if not auto:
+                self._enqueue_log(f"{session.log_prefix} {reason}")
             return False
         if not supports_position_recovery:
             reason = "恢复接管结束：该模式仅支持空闲等待信号自动重启，不支持持仓中的自动接管。"
