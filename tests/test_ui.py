@@ -3131,6 +3131,38 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         self.assertEqual(QuantApp._session_tree_column_key(tree, "#5"), "account_equity")
         self.assertEqual(QuantApp._session_tree_column_key(tree, "#9"), "symbol")
 
+    def test_session_tree_column_key_prefers_displaycolumns_when_hidden_columns_exist(self) -> None:
+        tree = _SessionTreeStub()
+        tree.displaycolumns = (
+            "session",
+            "api",
+            "account_equity",
+            "strategy",
+        )
+
+        self.assertEqual(QuantApp._session_tree_column_key(tree, "#1"), "session")
+        self.assertEqual(QuantApp._session_tree_column_key(tree, "#2"), "api")
+        self.assertEqual(QuantApp._session_tree_column_key(tree, "#3"), "account_equity")
+
+    def test_session_tree_double_click_opens_account_equity_when_email_column_is_hidden(self) -> None:
+        session = SimpleNamespace(session_id="S01", email_notifications_enabled=True)
+        tree = _SessionTreeStub()
+        tree.displaycolumns = ("session", "api", "account_equity", "strategy")
+        tree.rows["S01"] = {"values": (), "tags": (), "text": ""}
+        opened: list[str] = []
+        app = SimpleNamespace(
+            session_tree=tree,
+            sessions={"S01": session},
+            open_account_equity_curve_window_for_session=lambda target_session: opened.append(target_session.session_id),
+        )
+
+        tree.identify_column = lambda _x: "#3"
+        tree.identify_row = lambda _y: "S01"
+        result = QuantApp._on_session_tree_double_click(app, SimpleNamespace(x=40, y=12))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(opened, ["S01"])
+
     def test_strategy_history_tree_double_click_hint_maps_supported_columns(self) -> None:
         self.assertEqual(QuantApp._strategy_history_tree_double_click_hint("#1"), "双击打开这条历史策略的独立日志")
         self.assertEqual(QuantApp._strategy_history_tree_double_click_hint("#4"), "双击打开对应会话的实时K线图（若仍存在）")
@@ -3896,7 +3928,7 @@ class StrategyTradeTrackingTest(TestCase):
 
         self.assertTrue(result)
         self.assertEqual(session.status, "恢复中")
-        self.assertEqual(session.runtime_status, "恢复中")
+        self.assertEqual(session.runtime_status, "恢复持仓接管中")
         start_custom.assert_called_once()
 
     def test_recover_session_falls_back_to_managed_monitor_without_log_snapshot_or_protective_order(self) -> None:
@@ -4301,7 +4333,7 @@ class StrategyTradeTrackingTest(TestCase):
 
         self.assertTrue(result)
         self.assertEqual(session.status, "恢复中")
-        self.assertEqual(session.runtime_status, "恢复中")
+        self.assertEqual(session.runtime_status, "恢复挂单接管中")
         start_custom.assert_called_once()
 
     def test_recover_session_prefers_pending_order_takeover_over_existing_account_position(self) -> None:
@@ -4400,7 +4432,7 @@ class StrategyTradeTrackingTest(TestCase):
 
         self.assertTrue(result)
         self.assertEqual(session.status, "恢复中")
-        self.assertEqual(session.runtime_status, "恢复中")
+        self.assertEqual(session.runtime_status, "恢复挂单接管中")
         start_custom.assert_called_once()
         session.engine._monitor_exchange_dynamic_stop.assert_not_called()
         session.engine._monitor_exchange_managed_position_until_closed.assert_not_called()
@@ -4540,7 +4572,8 @@ class StrategyTradeTrackingTest(TestCase):
         result = QuantApp._recover_session(app, "S01", auto=False)
 
         self.assertTrue(result)
-        self.assertEqual(session.status, session.runtime_status)
+        self.assertEqual(session.status, "恢复中")
+        self.assertEqual(session.runtime_status, "恢复信号监听中")
         start_custom.assert_called_once()
 
     def test_recover_session_restarts_idle_trade_even_with_local_tp_sl_mode(self) -> None:
@@ -4588,7 +4621,8 @@ class StrategyTradeTrackingTest(TestCase):
         result = QuantApp._recover_session(app, "S01", auto=False)
 
         self.assertTrue(result)
-        self.assertEqual(session.status, session.runtime_status)
+        self.assertEqual(session.status, "恢复中")
+        self.assertEqual(session.runtime_status, "恢复信号监听中")
         start_custom.assert_called_once()
 
     def test_session_can_auto_migrate_on_close_only_allows_active_trade_for_exchange_mode(self) -> None:
@@ -4810,6 +4844,7 @@ class StrategyTradeTrackingTest(TestCase):
 
         self.assertTrue(result)
         self.assertEqual(session.status, "恢复中")
+        self.assertEqual(session.runtime_status, "恢复托管持仓中")
         self.assertEqual(session.ended_reason, "恢复为托管持仓监控")
         self.assertEqual(app._auto_restore_probe_cache, {})
         start_custom.assert_called_once()
@@ -4912,6 +4947,22 @@ class StrategyTradeTrackingTest(TestCase):
         selected = QuantApp._select_recoverable_live_position(app, session, [short_position])
 
         self.assertIsNone(selected)
+
+    def test_session_runtime_heartbeat_expected_ignores_entry_monitoring_phase(self) -> None:
+        session = self._make_session()
+        session.active_trade = StrategyTradeRuntimeState(round_id="S01-1")
+        session.runtime_status = "开仓监控中"
+        session.last_runtime_heartbeat_label = ""
+
+        self.assertFalse(QuantApp._session_runtime_heartbeat_expected(session))
+
+    def test_session_runtime_heartbeat_expected_accepts_position_monitoring_phase(self) -> None:
+        session = self._make_session()
+        session.active_trade = StrategyTradeRuntimeState(round_id="S01-1")
+        session.runtime_status = "持仓监控中"
+        session.last_runtime_heartbeat_label = ""
+
+        self.assertTrue(QuantApp._session_runtime_heartbeat_expected(session))
 
     def test_handle_stopped_watcher_pauses_trader_on_unexpected_stop(self) -> None:
         draft = TraderDraftRecord(
@@ -6812,6 +6863,7 @@ class _SessionTreeStub:
             "status",
             "started",
         )
+        self.displaycolumns: tuple[str, ...] | str = "#all"
 
     @staticmethod
     def winfo_exists() -> bool:
@@ -6892,6 +6944,8 @@ class _SessionTreeStub:
     def cget(self, key: str):
         if key == "columns":
             return self.columns
+        if key == "displaycolumns":
+            return self.displaycolumns
         raise KeyError(key)
 
 

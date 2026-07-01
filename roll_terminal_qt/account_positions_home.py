@@ -263,6 +263,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._upl_usdt_prices: dict[str, Decimal] = {}
         self._position_row_payloads: dict[str, dict[str, object]] = {}
         self._visible_column_ids: set[str] = set(DEFAULT_VISIBLE_COLUMNS)
+        self._expanded_row_keys: set[str] = set()
 
         self._current_notes: dict[str, dict[str, object]] = {}
         self._history_notes: dict[str, dict[str, object]] = {}
@@ -424,6 +425,9 @@ class AccountPositionsHomeWidget(QWidget):
         self._positions_hint.setObjectName("Subtle")
         title_row.addWidget(title)
         title_row.addStretch(1)
+        expand_all_button = QPushButton("展开全部")
+        expand_all_button.clicked.connect(self._expand_all_positions)
+        title_row.addWidget(expand_all_button)
         title_row.addWidget(self._positions_hint)
         panel_layout.addLayout(title_row)
 
@@ -434,6 +438,8 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._position_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._position_tree.itemSelectionChanged.connect(self._on_position_selected)
+        self._position_tree.itemExpanded.connect(self._on_tree_item_expanded)
+        self._position_tree.itemCollapsed.connect(self._on_tree_item_collapsed)
         self._position_tree.setRootIsDecorated(True)
         self._position_tree.setUniformRowHeights(True)
         header = self._position_tree.header()
@@ -703,8 +709,8 @@ class AccountPositionsHomeWidget(QWidget):
                 payload_metrics=asset_metrics,
             )
             asset_item.setFont(0, bold_font)
-            asset_item.setExpanded(True)
             self._position_tree.addTopLevelItem(asset_item)
+            asset_item.setExpanded(asset_id in self._expanded_row_keys)
 
             for bucket_label, bucket_positions in buckets.items():
                 if bucket_label == "__DIRECT__":
@@ -726,8 +732,8 @@ class AccountPositionsHomeWidget(QWidget):
                     payload_metrics=bucket_metrics,
                 )
                 bucket_item.setFont(0, bold_font)
-                bucket_item.setExpanded(True)
                 asset_item.addChild(bucket_item)
+                bucket_item.setExpanded(bucket_id in self._expanded_row_keys)
                 for position in bucket_positions:
                     bucket_item.addChild(self._build_position_item(position))
 
@@ -847,6 +853,29 @@ class AccountPositionsHomeWidget(QWidget):
         for index in range(self._position_tree.topLevelItemCount()):
             _walk(self._position_tree.topLevelItem(index))
         return items
+
+    def _expand_all_positions(self) -> None:
+        for item in self._iter_tree_items():
+            row_key = item.data(0, Qt.ItemDataRole.UserRole)
+            payload = self._position_row_payloads.get(row_key) if isinstance(row_key, str) else None
+            if not isinstance(payload, dict) or payload.get("kind") != "group":
+                continue
+            self._expanded_row_keys.add(row_key)
+            item.setExpanded(True)
+
+    def _on_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
+        row_key = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(row_key, str):
+            return
+        payload = self._position_row_payloads.get(row_key)
+        if isinstance(payload, dict) and payload.get("kind") == "group":
+            self._expanded_row_keys.add(row_key)
+
+    def _on_tree_item_collapsed(self, item: QTreeWidgetItem) -> None:
+        row_key = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(row_key, str):
+            return
+        self._expanded_row_keys.discard(row_key)
 
     def _update_summary_text(self) -> None:
         total_count = len(self._raw_positions)
@@ -1028,4 +1057,3 @@ class AccountPositionsHomeWidget(QWidget):
         self._visible_orders = [
             item for item in self._orders if not visible_inst_ids or item.inst_id.strip().upper() in visible_inst_ids
         ]
-

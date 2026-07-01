@@ -347,7 +347,10 @@ class UiStrategySessionsMixin:
         if session.active_trade is None:
             return False
         status_text = str(session.runtime_status or "").strip()
-        return any(token in status_text for token in ("监控", "接管"))
+        if any(token in status_text for token in ("持仓监控", "托管持仓", "人工接管")):
+            return True
+        heartbeat_label = str(getattr(session, "last_runtime_heartbeat_label", "") or "").strip()
+        return heartbeat_label in {"OKX动态止损", "本地止盈止损", "OKX托管持仓", "交易员虚拟止损"}
 
     @staticmethod
     def _session_runtime_heartbeat_timeout_seconds(session: StrategySession) -> float:
@@ -7104,13 +7107,26 @@ class UiStrategySessionsMixin:
             return raw
         columns: tuple[str, ...] = ()
         try:
+            display_resolved = tree.cget("displaycolumns") if hasattr(tree, "cget") else getattr(tree, "displaycolumns", ())
+        except Exception:
+            display_resolved = ()
+        if isinstance(display_resolved, str):
+            normalized_display = display_resolved.strip()
+            if normalized_display and normalized_display != "#all":
+                columns = tuple(part for part in normalized_display.split() if str(part).strip())
+        elif isinstance(display_resolved, (tuple, list)):
+            display_parts = tuple(str(part) for part in display_resolved if str(part).strip())
+            if display_parts and display_parts != ("#all",):
+                columns = display_parts
+        try:
             resolved = tree.cget("columns") if hasattr(tree, "cget") else getattr(tree, "columns", ())
         except Exception:
             resolved = ()
-        if isinstance(resolved, str):
-            columns = tuple(part for part in resolved.split() if str(part).strip())
-        elif isinstance(resolved, (tuple, list)):
-            columns = tuple(str(part) for part in resolved if str(part).strip())
+        if not columns:
+            if isinstance(resolved, str):
+                columns = tuple(part for part in resolved.split() if str(part).strip())
+            elif isinstance(resolved, (tuple, list)):
+                columns = tuple(str(part) for part in resolved if str(part).strip())
         if not columns:
             columns = UiStrategySessionsMixin._running_session_all_columns()
         try:
@@ -8745,6 +8761,17 @@ class UiStrategySessionsMixin:
             f"但当前会话暂无开仓成交记录，且本会话挂单状态为{state_label}。"
         )
 
+    @staticmethod
+    def _recovery_runtime_status_label(mode: str) -> str:
+        normalized = str(mode or "").strip().lower()
+        mapping = {
+            "signal": "恢复信号监听中",
+            "pending": "恢复挂单接管中",
+            "position": "恢复持仓接管中",
+            "managed_position": "恢复托管持仓中",
+        }
+        return mapping.get(normalized, "恢复中")
+
     def _restart_recoverable_signal_monitoring(self, session: StrategySession, credentials: Credentials) -> bool:
         def _mark_recovery_back_to_running(status_note: str) -> None:
             session.status = "运行中"
@@ -8776,7 +8803,7 @@ class UiStrategySessionsMixin:
 
         session.active_trade = None
         session.status = "恢复中"
-        session.runtime_status = "恢复中"
+        session.runtime_status = UiStrategySessionsMixin._recovery_runtime_status_label("signal")
         session.stopped_at = None
         session.ended_reason = "恢复中"
         self._upsert_recoverable_strategy_session(session)
@@ -8998,7 +9025,7 @@ class UiStrategySessionsMixin:
 
                 session.active_trade = trade
                 session.status = "恢复中"
-                session.runtime_status = "恢复中"
+                session.runtime_status = UiStrategySessionsMixin._recovery_runtime_status_label("pending")
                 session.stopped_at = None
                 session.ended_reason = "恢复中"
                 self._upsert_recoverable_strategy_session(session)
@@ -9329,7 +9356,9 @@ class UiStrategySessionsMixin:
 
         session.active_trade = trade
         session.status = "恢复中"
-        session.runtime_status = "恢复中"
+        session.runtime_status = UiStrategySessionsMixin._recovery_runtime_status_label(
+            "managed_position" if fallback_to_managed_monitor else "position"
+        )
         session.stopped_at = None
         session.ended_reason = "恢复为托管持仓监控" if fallback_to_managed_monitor else "恢复中"
         self._upsert_recoverable_strategy_session(session)
