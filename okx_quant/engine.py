@@ -236,6 +236,7 @@ def _take_profit_mode_description_for_signal_email(config: StrategyConfig) -> st
 DEFAULT_DEBUG_ATR_PERIOD = 10
 LIVE_DYNAMIC_MAKER_FEE_RATE = Decimal("0.00015")
 LIVE_DYNAMIC_TAKER_FEE_RATE = Decimal("0.00036")
+_RUNTIME_HEARTBEAT_PREFIX = "__qqokx_runtime_heartbeat__|"
 
 
 def _qqokx_env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
@@ -488,6 +489,14 @@ class StrategyEngine:
     @property
     def is_running(self) -> bool:
         return self._session_runner.is_running
+
+    @staticmethod
+    def _runtime_heartbeat_message(label: str) -> str:
+        normalized = str(label or "").strip() or "持仓监控"
+        return f"{_RUNTIME_HEARTBEAT_PREFIX}{normalized}"
+
+    def _emit_runtime_heartbeat(self, label: str) -> None:
+        self._logger(self._runtime_heartbeat_message(label))
 
     def start(self, credentials: Credentials, config: StrategyConfig) -> None:
         self._session_runner.start(credentials, config)
@@ -3485,6 +3494,7 @@ class StrategyEngine:
                 protection.trigger_price_type,
                 environment=config.environment,
             )
+            self._emit_runtime_heartbeat("本地止盈止损")
             manual_control = self.get_manual_trade_control()
             manual_mode = manual_control.management_mode == "manual"
             if manual_mode and manual_control.stop_loss is not None:
@@ -3641,6 +3651,7 @@ class StrategyEngine:
                 protection.trigger_price_type,
                 environment=config.environment,
             )
+            self._emit_runtime_heartbeat("本地止盈止损")
             manual_control = self.get_manual_trade_control()
             manual_mode = manual_control.management_mode == "manual"
             if manual_mode and manual_control.stop_loss is not None:
@@ -3956,6 +3967,7 @@ class StrategyEngine:
                 ) from exc
             else:
                 consecutive_read_failures = 0
+                self._emit_runtime_heartbeat("OKX动态止损")
                 current_stop_loss = should_continue.current_stop_loss
                 next_trigger_r = should_continue.next_trigger_r
                 amend_failures = should_continue.amend_failures
@@ -4519,6 +4531,7 @@ class StrategyEngine:
                 return
 
             saw_live_position = True
+            self._emit_runtime_heartbeat("OKX托管持仓")
             self._stop_event.wait(config.poll_seconds)
 
         self._logger("策略已停止，保留当前 OKX 托管止盈止损。")

@@ -1098,6 +1098,11 @@ class StrategySession:
     stop_cleanup_in_progress: bool = False
     runtime_status: str = "启动中"
     last_message: str = ""
+    last_message_at: datetime | None = None
+    last_runtime_heartbeat_at: datetime | None = None
+    last_runtime_heartbeat_label: str = ""
+    runtime_alert: str = ""
+    runtime_heartbeat_timeout_logged_at: datetime | None = None
     recovery_root_dir: Path | None = None
     recovery_supported: bool = False
     active_trade: StrategyTradeRuntimeState | None = None
@@ -1121,6 +1126,8 @@ class StrategySession:
 
     @property
     def display_status(self) -> str:
+        if self.status == "运行中" and self.runtime_alert:
+            return self.runtime_alert
         if self.status == "运行中" and self.runtime_status:
             return self.runtime_status
         return self.status
@@ -5433,7 +5440,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.column("pnl", width=104, anchor="e")
         self.session_tree.column("last_pnl", width=104, anchor="e")
         self.session_tree.column("status", width=108, anchor="center")
-        self.session_tree.column("started", width=96, anchor="center")
+        self.session_tree.column("started", width=136, anchor="center")
         self.session_tree.grid(row=1, column=0, sticky="nsew")
         self.session_tree.bind("<<TreeviewSelect>>", self._on_session_selected)
         self.session_tree.bind("<Double-1>", self._on_session_tree_double_click)
@@ -10768,6 +10775,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 session.ended_reason = self._session_stop_reason_text(session)
                 self._remove_recoverable_strategy_session(session.session_id)
                 self._trader_desk_handle_stopped_session(session)
+            self._update_session_runtime_heartbeat_state(session)
             self._upsert_session_row(session)
             self._sync_strategy_history_from_session(session)
 
@@ -18233,6 +18241,7 @@ def _refresh_status_with_recovery_support(self: QuantApp) -> None:
                 session.ended_reason = self._session_stop_reason_text(session)
                 self._remove_recoverable_strategy_session(session.session_id)
                 self._trader_desk_handle_stopped_session(session)
+        self._update_session_runtime_heartbeat_state(session)
         self._upsert_session_row(session)
         self._sync_strategy_history_from_session(session)
 

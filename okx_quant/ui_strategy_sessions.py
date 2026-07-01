@@ -21,11 +21,143 @@ from okx_quant.models import (
 from okx_quant.strategy_parameters import strategy_uses_parameter
 from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
 
+_SESSION_RUNTIME_HEARTBEAT_PREFIX = "__qqokx_runtime_heartbeat__|"
+_SESSION_RUNTIME_HEARTBEAT_TIMEOUT_POLLS = 6
+_SESSION_RUNTIME_HEARTBEAT_TIMEOUT_MIN_SECONDS = 180.0
+
 
 class UiStrategySessionsMixin:
     @staticmethod
     def _entry_reference_ema_caption(strategy_id: str) -> str:
         return strategy_entry_reference_period_caption(strategy_id)
+
+    @staticmethod
+    def _format_session_started_at(value: datetime) -> str:
+        return value.strftime("%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _runtime_heartbeat_control_message(label: str) -> str:
+        normalized = str(label or "").strip() or "持仓监控"
+        return f"{_SESSION_RUNTIME_HEARTBEAT_PREFIX}{normalized}"
+
+    @staticmethod
+    def _parse_runtime_heartbeat_control_message(message: str) -> str | None:
+        text = str(message or "").strip()
+        if not text.startswith(_SESSION_RUNTIME_HEARTBEAT_PREFIX):
+            return None
+        label = text[len(_SESSION_RUNTIME_HEARTBEAT_PREFIX) :].strip()
+        return label or "持仓监控"
+
+    @staticmethod
+    def _runtime_heartbeat_label_from_message(message: str) -> str | None:
+        text = str(message or "").strip()
+        if not text:
+            return None
+        if "OKX 动态止损" in text or "恢复动态止损接管" in text:
+            return "OKX动态止损"
+        if "本地止盈止损监控" in text or "恢复本地止盈止损监控" in text:
+            return "本地止盈止损"
+        if "OKX 托管持仓" in text or "恢复为托管持仓监控" in text:
+            return "OKX托管持仓"
+        if "交易员虚拟止损监控" in text:
+            return "交易员虚拟止损"
+        return None
+
+    @staticmethod
+    def _runtime_heartbeat_age_text(total_seconds: float) -> str:
+        seconds = max(int(total_seconds), 0)
+        days, seconds = divmod(seconds, 86400)
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        parts: list[str] = []
+        if days > 0:
+            parts.append(f"{days}天")
+        if hours > 0:
+            parts.append(f"{hours}小时")
+        if minutes > 0 and days == 0:
+            parts.append(f"{minutes}分")
+        if not parts:
+            parts.append(f"{seconds}秒")
+        return "".join(parts[:2])
+
+    def _touch_session_runtime_heartbeat(
+        self,
+        session: StrategySession,
+        label: str,
+        *,
+        observed_at: datetime | None = None,
+    ) -> None:
+        session.last_runtime_heartbeat_at = observed_at or datetime.now()
+        session.last_runtime_heartbeat_label = str(label or "").strip() or session.last_runtime_heartbeat_label or "持仓监控"
+        session.runtime_alert = ""
+        session.runtime_heartbeat_timeout_logged_at = None
+
+    @staticmethod
+    def _clear_session_runtime_heartbeat(session: StrategySession) -> None:
+        session.last_runtime_heartbeat_at = None
+        session.last_runtime_heartbeat_label = ""
+        session.runtime_alert = ""
+        session.runtime_heartbeat_timeout_logged_at = None
+
+    @staticmethod
+    def _session_runtime_heartbeat_expected(session: StrategySession) -> bool:
+        if session.active_trade is None:
+            return False
+        status_text = str(session.runtime_status or "").strip()
+        return any(token in status_text for token in ("监控", "接管"))
+
+    @staticmethod
+    def _session_runtime_heartbeat_timeout_seconds(session: StrategySession) -> float:
+        poll_seconds = max(float(getattr(session.config, "poll_seconds", 30.0) or 30.0), 1.0)
+        return max(
+            poll_seconds * _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_POLLS,
+            _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_MIN_SECONDS,
+        )
+
+    def _session_runtime_heartbeat_note(self, session: StrategySession, *, now: datetime | None = None) -> str:
+        heartbeat_at = getattr(session, "last_runtime_heartbeat_at", None)
+        label = str(getattr(session, "last_runtime_heartbeat_label", "") or "").strip() or "持仓监控"
+        if heartbeat_at is None:
+            return "最后心跳：尚未收到"
+        checked_at = now or datetime.now()
+        age_text = self._runtime_heartbeat_age_text((checked_at - heartbeat_at).total_seconds())
+        suffix = "（已超时）" if getattr(session, "runtime_alert", "") else f"（距今 {age_text}）"
+        return f"最后心跳：{label} | {_format_history_datetime(heartbeat_at)}{suffix}"
+
+    def _update_session_runtime_heartbeat_state(self, session: StrategySession) -> None:
+        session.runtime_alert = ""
+        if not self._session_runtime_heartbeat_expected(session):
+            self._clear_session_runtime_heartbeat(session)
+            return
+        now = datetime.now()
+        timeout_seconds = self._session_runtime_heartbeat_timeout_seconds(session)
+        heartbeat_at = getattr(session, "last_runtime_heartbeat_at", None)
+        reference_at = heartbeat_at or session.started_at
+        stale_seconds = (now - reference_at).total_seconds()
+        if stale_seconds < timeout_seconds:
+            session.runtime_heartbeat_timeout_logged_at = None
+            return
+        session.runtime_alert = "监控心跳超时"
+        if session.runtime_heartbeat_timeout_logged_at is not None:
+            return
+        session.runtime_heartbeat_timeout_logged_at = now
+        label = str(getattr(session, "last_runtime_heartbeat_label", "") or "").strip() or "持仓监控"
+        if heartbeat_at is None:
+            heartbeat_text = "尚未收到"
+        else:
+            heartbeat_text = _format_history_datetime(heartbeat_at)
+        self._log_session_message(
+            session,
+            " | ".join(
+                [
+                    "监控心跳超时",
+                    f"类型={label}",
+                    f"最后心跳={heartbeat_text}",
+                    f"超时={self._runtime_heartbeat_age_text(stale_seconds)}",
+                    "请核对 OKX 持仓、止损委托与策略监控状态。",
+                ]
+            ),
+        )
 
     @staticmethod
     def _format_strategy_symbol_display(signal_symbol: str, trade_symbol: str | None) -> str:
@@ -833,7 +965,7 @@ class UiStrategySessionsMixin:
             f"API：{session.api_name or '-'}\n"
             f"会话：{session.session_id}\n"
             f"状态：{session.display_status}\n"
-            f"启动时间：{session.started_at.strftime('%H:%M:%S')}\n"
+            f"启动时间：{self._format_session_started_at(session.started_at)}\n"
             f"标的：{session.symbol or '-'}\n\n"
             f"{guidance}"
         )
@@ -2243,6 +2375,8 @@ class UiStrategySessionsMixin:
             parts.append(f"\u6b62\u635f {format_decimal(stop_price)}")
         if session.config.uses_daily_filter():
             parts.append(session.config.daily_filter_summary())
+        if self._session_runtime_heartbeat_expected(session) or session.last_runtime_heartbeat_at is not None:
+            parts.append(self._session_runtime_heartbeat_note(session))
         last_message = (session.last_message or "").strip()
         if last_message:
             if len(last_message) > 72:
@@ -2457,10 +2591,13 @@ class UiStrategySessionsMixin:
             "session_id": session.session_id,
             "runtime_status": session.display_status or session.status,
             "last_message": session.last_message,
+            "last_message_at": session.last_message_at,
             "started_at": session.started_at,
             "ended_reason": session.ended_reason,
             "is_running": bool(session.engine.is_running or session.stop_cleanup_in_progress),
             "log_file_path": str(session.log_file_path) if session.log_file_path is not None else "",
+            "last_runtime_heartbeat_at": session.last_runtime_heartbeat_at,
+            "last_runtime_heartbeat_label": session.last_runtime_heartbeat_label,
         }
 
     def _trader_runtime_snapshot_for_ui(self, trader_id: str) -> dict[str, object] | None:
@@ -5615,6 +5752,8 @@ class UiStrategySessionsMixin:
 
         def _logger(message: str) -> None:
             self._record_session_runtime_message(session_id, message)
+            if self._parse_runtime_heartbeat_control_message(message) is not None:
+                return
             self._append_logged_message(
                 f"{prefix} {message}",
                 extra_log_path=log_file_path,
@@ -5679,10 +5818,24 @@ class UiStrategySessionsMixin:
         text = str(message or "").strip()
         if not text:
             return
+        observed_at = datetime.now()
+        heartbeat_label = self._parse_runtime_heartbeat_control_message(text)
+        if heartbeat_label is not None:
+            self._touch_session_runtime_heartbeat(session, heartbeat_label, observed_at=observed_at)
+            pending_updates = getattr(self, "_pending_runtime_session_updates", None)
+            if not isinstance(pending_updates, set):
+                pending_updates = set()
+                self._pending_runtime_session_updates = pending_updates
+            pending_updates.add(session_id)
+            return
         session.last_message = text
+        session.last_message_at = observed_at
         inferred = _infer_session_runtime_status(text, session.runtime_status)
         if inferred:
             session.runtime_status = inferred
+        visible_heartbeat_label = self._runtime_heartbeat_label_from_message(text)
+        if visible_heartbeat_label is not None:
+            self._touch_session_runtime_heartbeat(session, visible_heartbeat_label, observed_at=observed_at)
         self._track_session_trade_runtime(session, text)
         pending_updates = getattr(self, "_pending_runtime_session_updates", None)
         if not isinstance(pending_updates, set):
@@ -6652,7 +6805,7 @@ class UiStrategySessionsMixin:
             _format_optional_usdt_precise(session.net_pnl_total, places=2),
             _format_optional_usdt_precise(session.last_net_pnl, places=2),
             session.display_status,
-            session.started_at.strftime("%H:%M:%S"),
+            self._format_session_started_at(session.started_at),
         )
         if self.session_tree.exists(session.session_id):
             self.session_tree.item(session.session_id, values=values, tags=tags)
@@ -7184,6 +7337,10 @@ class UiStrategySessionsMixin:
             config_snapshot=_serialize_strategy_config_snapshot(session.config),
             log_file_path=session.log_file_path,
             last_message=session.last_message,
+            last_message_at=session.last_message_at,
+            heartbeat_note=self._session_runtime_heartbeat_note(session)
+            if self._session_runtime_heartbeat_expected(session) or session.last_runtime_heartbeat_at is not None
+            else "",
             trade_count=session.trade_count,
             win_count=session.win_count,
             gross_pnl_total=session.gross_pnl_total,
@@ -7269,6 +7426,8 @@ class UiStrategySessionsMixin:
         updated_at: datetime | None = None,
         runtime_status: str | None = None,
         last_message: str = "",
+        last_message_at: datetime | None = None,
+        heartbeat_note: str = "",
         trade_count: int = 0,
         win_count: int = 0,
         gross_pnl_total: Decimal = Decimal("0"),
@@ -7419,6 +7578,8 @@ class UiStrategySessionsMixin:
                 f"停止时间：{_format_history_datetime(stopped_at)}" if stopped_at is not None else "",
                 f"最近更新：{_format_history_datetime(updated_at)}" if updated_at is not None else "",
                 f"独立日志：{_coerce_log_file_path(log_file_path) or '-'}",
+                heartbeat_note,
+                f"最近日志时间：{_format_history_datetime(last_message_at)}" if last_message_at is not None else "",
                 f"最近日志：{last_message}" if last_message else "",
                 f"结束原因：{ended_reason}" if ended_reason else "",
                 duplicate_warning,
