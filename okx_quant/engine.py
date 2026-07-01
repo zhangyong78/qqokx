@@ -7326,12 +7326,13 @@ def _should_skip_startup_signal(
         return (
             True,
             f"{_fmt_ts(candle_ts)} | 启动追单窗口已过期，当前不追单 | 方向={signal.upper()} | "
-            f"信号年龄={signal_age_seconds}秒 | 窗口={window_seconds}秒 | 等待当前波失效后再接管",
+            f"信号年龄={signal_age_seconds}秒 | 窗口={window_seconds}秒 | "
+            "这是重启前已确认的老信号，按设置跳过本波，等待下一波新信号",
         )
     return (
         True,
-        f"{_fmt_ts(candle_ts)} | 启动默认不追老信号 | 方向={signal.upper()} | 当前波已在启动前确认 | "
-        "等待当前波失效后再接管",
+        f"{_fmt_ts(candle_ts)} | 启动默认不追老信号 | 方向={signal.upper()} | "
+        "这是重启前已确认的老信号，按设置跳过本波，等待下一波新信号",
     )
 
 
