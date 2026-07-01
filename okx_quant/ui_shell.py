@@ -273,7 +273,12 @@ from okx_quant.window_layout import (
 from okx_quant.ui_backtest_entry import UiBacktestEntryMixin
 from okx_quant.ui_positions import UiPositionsMixin
 from okx_quant.ui_protection import UiProtectionMixin
-from okx_quant.ui_strategy_sessions import UiStrategySessionsMixin
+from okx_quant.ui_strategy_sessions import (
+    UiStrategySessionsMixin,
+    _SESSION_RUNTIME_HEARTBEAT_PREFIX,
+    _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_MIN_SECONDS,
+    _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_POLLS,
+)
 
 
 def _bind_mixin_to_shell_globals(mixin_cls):
@@ -5439,7 +5444,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.column("live_pnl", width=112, anchor="e")
         self.session_tree.column("pnl", width=104, anchor="e")
         self.session_tree.column("last_pnl", width=104, anchor="e")
-        self.session_tree.column("status", width=108, anchor="center")
+        self.session_tree.column("status", width=168, anchor="center")
         self.session_tree.column("started", width=136, anchor="center")
         self.session_tree.grid(row=1, column=0, sticky="nsew")
         self.session_tree.bind("<<TreeviewSelect>>", self._on_session_selected)

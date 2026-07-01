@@ -36,6 +36,61 @@ class UiStrategySessionsMixin:
         return value.strftime("%m-%d %H:%M:%S")
 
     @staticmethod
+    def _session_recovery_reason_text(session: StrategySession) -> str:
+        status = str(getattr(session, "status", "") or "").strip()
+        if status not in {"待恢复", "恢复中"}:
+            return ""
+        last_message = str(getattr(session, "last_message", "") or "").strip()
+        if last_message.startswith("策略停止，原因："):
+            detail = last_message.partition("：")[2].strip()
+            if detail and detail not in {"恢复中", "恢复启动失败"}:
+                return detail
+        ended_reason = str(getattr(session, "ended_reason", "") or "").strip()
+        if not ended_reason or ended_reason == "恢复中":
+            return ""
+        if ended_reason == "应用关闭后待恢复接管":
+            return "等待恢复接管"
+        if ended_reason == "恢复启动失败":
+            return "恢复线程启动失败"
+        return ended_reason
+
+    @staticmethod
+    def _session_recovery_reason_summary(session: StrategySession, *, max_length: int = 12) -> str:
+        text = UiStrategySessionsMixin._session_recovery_reason_text(session)
+        if not text:
+            return ""
+        summary = text
+        replacements = (
+            ("恢复接管结束：", ""),
+            ("当前", ""),
+            ("。", ""),
+        )
+        for source, target in replacements:
+            summary = summary.replace(source, target)
+        if "is not defined" in summary or "NameError" in summary:
+            summary = "代码异常"
+        elif "未检测到可接管仓位" in summary:
+            summary = "无可接管仓位"
+        elif "恢复线程启动失败" in summary:
+            summary = "启动失败"
+        elif "等待恢复接管" in summary:
+            summary = "等待恢复"
+        elif "恢复为托管持仓监控" in summary or "托管持仓监控" in summary:
+            summary = "托管监控"
+        elif "读取当前持仓失败" in summary:
+            summary = "持仓读取失败"
+        elif "未找到该会话对应的 API 凭证" in summary:
+            summary = "缺少API凭证"
+        elif "缺少有效开仓价" in summary:
+            summary = "缺少开仓价"
+        elif "无法判断当前持仓方向" in summary:
+            summary = "方向判断失败"
+        summary = summary.strip(" |，；。")
+        if len(summary) > max_length:
+            summary = f"{summary[:max_length]}..."
+        return summary
+
+    @staticmethod
     def _runtime_heartbeat_control_message(label: str) -> str:
         normalized = str(label or "").strip() or "持仓监控"
         return f"{_SESSION_RUNTIME_HEARTBEAT_PREFIX}{normalized}"
@@ -6783,6 +6838,12 @@ class UiStrategySessionsMixin:
         account_equity_text = account_equity_text_provider(session) if callable(account_equity_text_provider) else "-"
         bar_label = str(getattr(getattr(session, "config", None), "bar", "") or "").strip() or "-"
         tags = ("duplicate_conflict",) if QuantApp._session_has_duplicate_launch_conflict(self, session) else ()
+        recovery_summary = self._session_recovery_reason_summary(session)
+        status_text = (
+            f"{session.status}:{recovery_summary}"
+            if session.status in {"待恢复", "恢复中"} and recovery_summary
+            else session.display_status
+        )
         values = (
             session.session_id,
             trader_label,
@@ -6804,7 +6865,7 @@ class UiStrategySessionsMixin:
             _format_optional_usdt_precise(live_pnl, places=2),
             _format_optional_usdt_precise(session.net_pnl_total, places=2),
             _format_optional_usdt_precise(session.last_net_pnl, places=2),
-            session.display_status,
+            status_text,
             self._format_session_started_at(session.started_at),
         )
         if self.session_tree.exists(session.session_id):
@@ -7338,6 +7399,7 @@ class UiStrategySessionsMixin:
             log_file_path=session.log_file_path,
             last_message=session.last_message,
             last_message_at=session.last_message_at,
+            recovery_note=self._session_recovery_reason_text(session),
             heartbeat_note=self._session_runtime_heartbeat_note(session)
             if self._session_runtime_heartbeat_expected(session) or session.last_runtime_heartbeat_at is not None
             else "",
@@ -7427,6 +7489,7 @@ class UiStrategySessionsMixin:
         runtime_status: str | None = None,
         last_message: str = "",
         last_message_at: datetime | None = None,
+        recovery_note: str = "",
         heartbeat_note: str = "",
         trade_count: int = 0,
         win_count: int = 0,
@@ -7578,10 +7641,12 @@ class UiStrategySessionsMixin:
                 f"停止时间：{_format_history_datetime(stopped_at)}" if stopped_at is not None else "",
                 f"最近更新：{_format_history_datetime(updated_at)}" if updated_at is not None else "",
                 f"独立日志：{_coerce_log_file_path(log_file_path) or '-'}",
+                f"待恢复原因：{recovery_note}" if recovery_note and status == "待恢复" else "",
+                f"恢复说明：{recovery_note}" if recovery_note and status == "恢复中" else "",
                 heartbeat_note,
                 f"最近日志时间：{_format_history_datetime(last_message_at)}" if last_message_at is not None else "",
                 f"最近日志：{last_message}" if last_message else "",
-                f"结束原因：{ended_reason}" if ended_reason else "",
+                f"结束原因：{ended_reason}" if ended_reason and not (recovery_note and status in {"待恢复", "恢复中"}) else "",
                 duplicate_warning,
             ]
         )

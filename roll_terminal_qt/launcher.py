@@ -5,21 +5,25 @@ import sys
 from typing import Iterable
 
 from PySide6.QtCore import Qt, Slot
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
-    QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from okx_quant.app_paths import config_dir_path, data_root, logs_dir_path, state_dir_path
+from roll_terminal_qt.account_positions_home import AccountPositionsHomeWidget
 from roll_terminal_qt.auto_channel_window import AutoChannelWindow
 from roll_terminal_qt.line_trading_window import LineTradingQtWindow
 from roll_terminal_qt.module_overview import ModuleOverview, build_module_overview, launcher_module_specs
@@ -34,6 +38,54 @@ def module_choices() -> tuple[str, ...]:
 
 def _standalone_command(module_key: str) -> str:
     return f"python run_roll_terminal_qt.py --module {module_key}"
+
+
+class SharedDataDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("共享配置与数据")
+        self.resize(780, 360)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("共享配置与数据")
+        title.setObjectName("SectionTitle")
+        subtitle = QLabel("主壳统一展示共享目录，模块继续复用同一套配置、状态和日志目录。")
+        subtitle.setObjectName("Subtle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        panel = QFrame()
+        panel.setObjectName("Guide")
+        grid = QGridLayout(panel)
+        grid.setContentsMargins(16, 16, 16, 16)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+        for row, (label, value) in enumerate(
+            (
+                ("数据根目录", str(data_root())),
+                ("配置目录", str(config_dir_path())),
+                ("状态目录", str(state_dir_path())),
+                ("日志目录", str(logs_dir_path())),
+            )
+        ):
+            key_label = QLabel(label)
+            key_label.setObjectName("GuideText")
+            value_label = QLabel(value)
+            value_label.setObjectName("GuideText")
+            value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            grid.addWidget(key_label, row, 0)
+            grid.addWidget(value_label, row, 1)
+        layout.addWidget(panel)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
+        layout.addWidget(buttons)
 
 
 class ModuleOverviewWindow(QMainWindow):
@@ -51,13 +103,13 @@ class ModuleOverviewWindow(QMainWindow):
         layout.setSpacing(16)
 
         title_row = QHBoxLayout()
-        title = QLabel(title)
-        title.setObjectName("SectionTitle")
+        title_label = QLabel(title)
+        title_label.setObjectName("SectionTitle")
         subtitle_label = QLabel(subtitle)
         subtitle_label.setObjectName("Subtle")
         subtitle_label.setWordWrap(True)
         header = QVBoxLayout()
-        header.addWidget(title)
+        header.addWidget(title_label)
         header.addWidget(subtitle_label)
         header_widget = QWidget()
         header_widget.setLayout(header)
@@ -164,7 +216,7 @@ class ModuleCard(QFrame):
     def refresh_summary(self) -> None:
         overview = build_module_overview(self._module_key)
         summary = [f"阶段：{overview.phase}"]
-        summary.extend(f"• {line}" for line in overview.summary_lines[:3])
+        summary.extend(f"- {line}" for line in overview.summary_lines[:3])
         summary.append(f"独立启动：{_standalone_command(self._module_key)}")
         self._summary_label.setText("\n".join(summary))
 
@@ -177,83 +229,63 @@ class LauncherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self._child_windows: list[QWidget] = []
+        self._shared_data_dialog: SharedDataDialog | None = None
+        self._home_widget = AccountPositionsHomeWidget(self)
         self.setWindowTitle("Qt 专业终端主壳")
-        self.resize(1280, 860)
+        self.resize(1680, 980)
+        self.setCentralWidget(self._home_widget)
+        self._build_menu()
 
-        root = QWidget()
-        root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(20, 20, 20, 20)
-        root_layout.setSpacing(16)
+    def closeEvent(self, event) -> None:  # noqa: ANN001
+        self._home_widget.shutdown()
+        super().closeEvent(event)
 
-        hero = QFrame()
-        hero.setObjectName("Panel")
-        hero_layout = QVBoxLayout(hero)
-        hero_layout.setContentsMargins(24, 24, 24, 24)
-        hero_layout.setSpacing(8)
-        title = QLabel("Qt 专业终端主壳")
-        title.setObjectName("SectionTitle")
-        intro = QLabel(
-            "一个首页管理多个独立模块。当前先把入口、共享状态和专业套利终端接稳，"
-            "再把无限下单、划线交易台、自动通道逐步迁到 Qt。"
+    def _build_menu(self) -> None:
+        menu_bar = self.menuBar()
+
+        data_menu = menu_bar.addMenu("共享配置与数据")
+        shared_action = QAction("查看共享路径", self)
+        shared_action.triggered.connect(self._show_shared_data_dialog)
+        data_menu.addAction(shared_action)
+
+        module_menu = menu_bar.addMenu("功能模块")
+        for spec in launcher_module_specs():
+            action = QAction(spec.title, self)
+            action.triggered.connect(lambda _checked=False, key=spec.key: self.open_module_window(key))
+            module_menu.addAction(action)
+
+        home_menu = menu_bar.addMenu("主页")
+        refresh_action = QAction("刷新账户持仓", self)
+        refresh_action.triggered.connect(self._home_widget.refresh_view)
+        home_menu.addAction(refresh_action)
+
+        summary_action = QAction("查看主页说明", self)
+        summary_action.triggered.connect(self._show_home_summary_hint)
+        home_menu.addAction(summary_action)
+
+    @Slot()
+    def _show_shared_data_dialog(self) -> None:
+        if self._shared_data_dialog is None:
+            self._shared_data_dialog = SharedDataDialog(self)
+        self._shared_data_dialog.show()
+        self._shared_data_dialog.raise_()
+        self._shared_data_dialog.activateWindow()
+
+    @Slot()
+    def _show_home_summary_hint(self) -> None:
+        QMessageBox.information(
+            self,
+            "账户持仓主页",
+            "首页已经切换为账户持仓大窗方向。共享路径和功能模块入口已收进上方菜单。",
         )
-        intro.setObjectName("Subtle")
-        intro.setWordWrap(True)
-        hero_layout.addWidget(title)
-        hero_layout.addWidget(intro)
-        root_layout.addWidget(hero)
-
-        shared_panel = QFrame()
-        shared_panel.setObjectName("Guide")
-        shared_layout = QGridLayout(shared_panel)
-        shared_layout.setContentsMargins(18, 18, 18, 18)
-        shared_layout.setHorizontalSpacing(18)
-        shared_layout.setVerticalSpacing(8)
-        shared_title = QLabel("共享配置与数据")
-        shared_title.setObjectName("GuideTitle")
-        shared_layout.addWidget(shared_title, 0, 0, 1, 2)
-        for row, (label, value) in enumerate(
-            (
-                ("数据根目录", str(data_root())),
-                ("配置目录", str(config_dir_path())),
-                ("状态目录", str(state_dir_path())),
-                ("日志目录", str(logs_dir_path())),
-            ),
-            start=1,
-        ):
-            key_label = QLabel(label)
-            key_label.setObjectName("GuideText")
-            value_label = QLabel(value)
-            value_label.setObjectName("GuideText")
-            value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            shared_layout.addWidget(key_label, row, 0)
-            shared_layout.addWidget(value_label, row, 1)
-        root_layout.addWidget(shared_panel)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        content = QWidget()
-        grid = QGridLayout(content)
-        grid.setContentsMargins(4, 4, 4, 4)
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(14)
-        for index, spec in enumerate(launcher_module_specs()):
-            card = ModuleCard(
-                module_key=spec.key,
-                title=spec.title,
-                subtitle=spec.subtitle,
-                status=spec.status,
-                open_callback=self.open_module_window,
-            )
-            grid.addWidget(card, index // 2, index % 2)
-        scroll.setWidget(content)
-        root_layout.addWidget(scroll, 1)
-        self.setCentralWidget(root)
 
     @Slot(str)
     def open_module_window(self, module_key: str) -> None:
         window = create_module_window(module_key)
         self._child_windows.append(window)
-        window.destroyed.connect(lambda *_args, target=window: self._child_windows.remove(target) if target in self._child_windows else None)
+        window.destroyed.connect(
+            lambda *_args, target=window: self._child_windows.remove(target) if target in self._child_windows else None
+        )
         window.show()
         window.raise_()
         window.activateWindow()
