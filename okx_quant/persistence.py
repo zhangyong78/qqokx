@@ -495,13 +495,31 @@ def account_positions_home_view_prefs_file_path(*, base_dir: Path | None = None)
 def load_account_positions_home_view_prefs(path: Path | None = None) -> dict[str, object]:
     target = path or account_positions_home_view_prefs_file_path()
     if not target.exists():
-        return {"visible_columns": [], "tree_column_widths": {}}
+        return {
+            "visible_columns": [],
+            "tree_column_widths": {},
+            "position_kline_bar": "1H",
+            "position_kline_window_width": 1280,
+            "position_kline_window_height": 760,
+        }
     try:
         payload = json.loads(target.read_text(encoding="utf-8"))
     except Exception:
-        return {"visible_columns": [], "tree_column_widths": {}}
+        return {
+            "visible_columns": [],
+            "tree_column_widths": {},
+            "position_kline_bar": "1H",
+            "position_kline_window_width": 1280,
+            "position_kline_window_height": 760,
+        }
     if not isinstance(payload, dict):
-        return {"visible_columns": [], "tree_column_widths": {}}
+        return {
+            "visible_columns": [],
+            "tree_column_widths": {},
+            "position_kline_bar": "1H",
+            "position_kline_window_width": 1280,
+            "position_kline_window_height": 760,
+        }
     raw_visible_columns = payload.get("visible_columns")
     raw_tree_column_widths = payload.get("tree_column_widths")
     visible_columns = (
@@ -521,9 +539,21 @@ def load_account_positions_home_view_prefs(path: Path | None = None) -> dict[str
                 continue
             if normalized_value > 0:
                 tree_column_widths[normalized_key] = normalized_value
+    raw_position_kline_bar = str(payload.get("position_kline_bar") or "").strip()
+    try:
+        position_kline_window_width = int(str(payload.get("position_kline_window_width", 1280)).strip())
+    except Exception:
+        position_kline_window_width = 1280
+    try:
+        position_kline_window_height = int(str(payload.get("position_kline_window_height", 760)).strip())
+    except Exception:
+        position_kline_window_height = 760
     return {
         "visible_columns": visible_columns,
         "tree_column_widths": tree_column_widths,
+        "position_kline_bar": raw_position_kline_bar or "1H",
+        "position_kline_window_width": position_kline_window_width if position_kline_window_width > 0 else 1280,
+        "position_kline_window_height": position_kline_window_height if position_kline_window_height > 0 else 760,
     }
 
 
@@ -531,6 +561,9 @@ def save_account_positions_home_view_prefs(
     *,
     visible_columns: list[str],
     tree_column_widths: dict[str, int],
+    position_kline_bar: str = "1H",
+    position_kline_window_width: int = 1280,
+    position_kline_window_height: int = 760,
     path: Path | None = None,
 ) -> Path:
     target = path or account_positions_home_view_prefs_file_path()
@@ -551,6 +584,9 @@ def save_account_positions_home_view_prefs(
         "version": 1,
         "visible_columns": normalized_visible_columns,
         "tree_column_widths": normalized_tree_column_widths,
+        "position_kline_bar": str(position_kline_bar or "1H").strip() or "1H",
+        "position_kline_window_width": max(int(position_kline_window_width), 320),
+        "position_kline_window_height": max(int(position_kline_window_height), 240),
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
     temp_path = target.with_suffix(target.suffix + ".tmp")

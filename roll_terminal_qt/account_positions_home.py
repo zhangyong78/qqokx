@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 from decimal import Decimal
 from tkinter import Tk
 from typing import Callable
 
-from PySide6.QtCore import QTimer, Qt, Slot
+from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -35,12 +37,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from okx_quant.models import StrategyConfig
+from okx_quant.models import Candle, Credentials, Instrument, StrategyConfig
 from okx_quant.option_roll import is_short_option_position
 from okx_quant.option_roll_ui import OptionRollSuggestionWindow
 from okx_quant.option_strategy_ui import OptionStrategyCalculatorWindow, _build_option_quote
 from okx_quant.okx_client import (
     OkxFillHistoryItem,
+    OkxOrderResult,
     OkxPosition,
     OkxPositionHistoryItem,
     OkxRestClient,
@@ -61,6 +64,7 @@ from okx_quant.position_protection import (
     infer_default_spot_inst_id,
     normalize_spot_inst_id,
 )
+from okx_quant.pricing import format_decimal, snap_to_increment
 from okx_quant.ui_shell import (
     _aggregate_position_metrics,
     _asset_group_row_id,
@@ -137,6 +141,7 @@ from okx_quant.ui_shell import (
 )
 from roll_terminal_qt.account_service import AccountFeedThread
 from roll_terminal_qt.history_service import FillHistoryFeedThread, OrderHistoryFeedThread, PositionHistoryFeedThread
+from roll_terminal_qt.option_strategy_window import CandlestickChartView
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots, profile_requires_password
 from roll_terminal_qt.runtime import load_runtime, profile_names
@@ -210,6 +215,101 @@ DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
     "note",
 )
 
+# Qt 持仓首页默认按当前人工校准后的列集和列宽启动；后续用户拖拽列宽/列设置仍会写入本地偏好覆盖这里。
+DEFAULT_VISIBLE_COLUMNS = (
+    "ask_price",
+    "ask_usdt",
+    "avg",
+    "avg_usdt",
+    "bid_price",
+    "bid_usdt",
+    "delta",
+    "gamma",
+    "intrinsic_usdt",
+    "intrinsic_value",
+    "mark",
+    "mark_usdt",
+    "market_value",
+    "mgn_ratio",
+    "note",
+    "open_value_usdt",
+    "option_side",
+    "pos",
+    "realized",
+    "theta",
+    "theta_usdt",
+    "time_value",
+    "time_value_usdt",
+    "upl",
+    "upl_usdt",
+    "vega",
+)
+
+DEFAULT_TREE_LABEL_WIDTH = 221
+DEFAULT_TREE_COLUMN_WIDTHS: dict[str, int] = {
+    "time_value": 69,
+    "time_value_usdt": 72,
+    "intrinsic_value": 63,
+    "intrinsic_usdt": 66,
+    "bid_price": 66,
+    "bid_usdt": 71,
+    "ask_price": 64,
+    "ask_usdt": 69,
+    "mark": 56,
+    "mark_usdt": 63,
+    "avg": 66,
+    "avg_usdt": 72,
+    "open_value_usdt": 102,
+    "pos": 154,
+    "option_side": 170,
+    "upl": 164,
+    "upl_usdt": 72,
+    "realized": 102,
+    "market_value": 149,
+    "mgn_ratio": 55,
+    "delta": 84,
+    "gamma": 69,
+    "vega": 70,
+    "theta": 71,
+    "theta_usdt": 75,
+    "note": 457,
+}
+
+
+def _format_account_level_text(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    mapping = {
+        "1": "简单交易",
+        "2": "单币种保证金",
+        "3": "跨币种保证金",
+        "4": "组合保证金",
+    }
+    return mapping.get(text, text)
+
+
+def _format_account_position_mode_text(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return "-"
+    if text == "net":
+        return "净持仓 net"
+    if text in {"long_short", "long/short", "long_short_mode"}:
+        return "双向持仓 long/short"
+    return text
+
+
+def _format_greeks_type_text(value: str | None) -> str:
+    text = str(value or "").strip().upper()
+    return text or "-"
+
+
+def _format_bool_text(value: bool | None) -> str:
+    if value is None:
+        return "-"
+    return "是" if value else "否"
+
 ORDER_SOURCE_FILTER_OPTIONS: tuple[tuple[str, str], ...] = (
     ("全部来源", ""),
     ("普通委托", "normal"),
@@ -257,6 +357,14 @@ def _history_expiry_filter_matches(inst_id: str, expiry_filter: str) -> bool:
     return False
 
 
+POSITION_KLINE_BAR_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("15分钟", "15m"),
+    ("1小时", "1H"),
+    ("4小时", "4H"),
+    ("1天", "1D"),
+)
+
+
 class NoteEditorDialog(QDialog):
     def __init__(self, *, title: str, prompt: str, initial_value: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -293,7 +401,7 @@ class AccountOverviewDialog(QDialog):
     def __init__(self, *, summary_text: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("账户信息")
-        self.resize(760, 520)
+        self.resize(920, 680)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -311,6 +419,191 @@ class AccountOverviewDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
         layout.addWidget(buttons)
+
+
+class InstrumentKlineLoadThread(QThread):
+    loaded = Signal(str, str, str, str, object)
+    failed = Signal(str, str, str, str)
+
+    def __init__(self, *, inst_id: str, inst_type: str, bar: str, limit: int = 240) -> None:
+        super().__init__()
+        self._inst_id = inst_id.strip().upper()
+        self._inst_type = inst_type.strip().upper()
+        self._bar = bar.strip()
+        self._limit = max(60, limit)
+
+    def run(self) -> None:
+        source = "mark" if self._inst_type == "OPTION" else "trade"
+        try:
+            client = OkxRestClient()
+            if source == "mark":
+                candles = client.get_mark_price_candles(self._inst_id, self._bar, limit=self._limit)
+            else:
+                candles = client.get_candles_history(self._inst_id, self._bar, limit=self._limit)
+            if not candles:
+                raise ValueError("当前周期没有可用 K 线数据。")
+            self.loaded.emit(self._inst_id, self._inst_type, self._bar, source, candles)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(self._inst_id, self._inst_type, self._bar, str(exc))
+
+
+class InstrumentKlineDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        initial_bar: str = "1H",
+        initial_width: int = 1280,
+        initial_height: int = 760,
+        prefs_changed: Callable[[str, int, int], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
+        self.setWindowTitle("合约 K 线图")
+        self.resize(max(int(initial_width), 480), max(int(initial_height), 320))
+
+        self._inst_id = ""
+        self._inst_type = ""
+        self._current_bar = initial_bar if initial_bar in {bar for _text, bar in POSITION_KLINE_BAR_OPTIONS} else "1H"
+        self._load_thread: InstrumentKlineLoadThread | None = None
+        self._bar_buttons: dict[str, QPushButton] = {}
+        self._prefs_changed = prefs_changed
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self._title_label = QLabel("等待选择持仓")
+        self._title_label.setObjectName("SectionTitle")
+        self._status_label = QLabel("点击持仓后自动加载对应 K 线。")
+        self._status_label.setObjectName("Subtle")
+        header.addWidget(self._title_label, 1)
+        header.addWidget(self._status_label, 2)
+        layout.addLayout(header)
+
+        bar_row = QHBoxLayout()
+        bar_row.setSpacing(8)
+        bar_row.addWidget(QLabel("周期"))
+        for text, bar in POSITION_KLINE_BAR_OPTIONS:
+            button = QPushButton(text)
+            button.setCheckable(True)
+            button.clicked.connect(lambda _checked=False, target_bar=bar: self._select_bar(target_bar))
+            self._bar_buttons[bar] = button
+            bar_row.addWidget(button)
+        bar_row.addStretch(1)
+        layout.addLayout(bar_row)
+
+        self._chart = CandlestickChartView()
+        self._chart.show_message("请点击一条持仓加载 K 线")
+        layout.addWidget(self._chart, 1)
+        self._sync_bar_buttons()
+
+    def show_instrument(self, *, inst_id: str, inst_type: str) -> None:
+        self._inst_id = inst_id.strip().upper()
+        self._inst_type = inst_type.strip().upper()
+        self._update_title()
+        self._load_current_bar()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001
+        if self._load_thread is not None and self._load_thread.isRunning():
+            self._load_thread.requestInterruption()
+            self._load_thread.wait(1500)
+        self._emit_prefs_changed()
+        super().closeEvent(event)
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        self._emit_prefs_changed()
+
+    def _select_bar(self, bar: str) -> None:
+        self._current_bar = bar
+        self._sync_bar_buttons()
+        self._emit_prefs_changed()
+        self._load_current_bar()
+
+    def _sync_bar_buttons(self) -> None:
+        for bar, button in self._bar_buttons.items():
+            checked = bar == self._current_bar
+            button.blockSignals(True)
+            button.setChecked(checked)
+            button.blockSignals(False)
+            button.setObjectName("Primary" if checked else "")
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+    def _update_title(self) -> None:
+        if not self._inst_id:
+            self._title_label.setText("等待选择持仓")
+            return
+        source_label = "标记价格K线" if self._inst_type == "OPTION" else "成交价格K线"
+        self._title_label.setText(f"{self._inst_id} | {source_label}")
+
+    @Slot()
+    def _load_current_bar(self) -> None:
+        if not self._inst_id:
+            return
+        if self._load_thread is not None and self._load_thread.isRunning():
+            return
+        source_label = "标记价格" if self._inst_type == "OPTION" else "成交价格"
+        self._status_label.setText(f"正在加载 {self._inst_id} {self._current_bar} {source_label} K 线...")
+        self._load_thread = InstrumentKlineLoadThread(
+            inst_id=self._inst_id,
+            inst_type=self._inst_type,
+            bar=self._current_bar,
+        )
+        self._load_thread.loaded.connect(self._apply_loaded_candles)
+        self._load_thread.failed.connect(self._apply_load_error)
+        self._load_thread.finished.connect(self._clear_finished_thread)
+        self._load_thread.start()
+
+    @Slot(str, str, str, str, object)
+    def _apply_loaded_candles(
+        self,
+        inst_id: str,
+        inst_type: str,
+        bar: str,
+        source: str,
+        candles: object,
+    ) -> None:
+        if inst_id != self._inst_id or inst_type != self._inst_type or bar != self._current_bar:
+            return
+        if not isinstance(candles, list):
+            return
+        source_label = "标记价格" if source == "mark" else "成交价格"
+        self._chart.set_candles(title=f"{inst_id} {source_label}K线 | {bar}", candles=candles)
+        latest = candles[-1] if candles else None
+        latest_text = ""
+        latest_time_text = ""
+        if isinstance(latest, Candle):
+            latest_text = f" | 最新 {latest.close}"
+            latest_time_text = f" | 时间 {datetime.fromtimestamp(latest.ts / 1000).strftime('%Y-%m-%d %H:%M:%S')}"
+        self._status_label.setText(f"{inst_id} | {bar} | {source_label} K 线已加载{latest_text}{latest_time_text}")
+
+    @Slot(str, str, str, str)
+    def _apply_load_error(self, inst_id: str, inst_type: str, bar: str, message: str) -> None:
+        if inst_id != self._inst_id or inst_type != self._inst_type or bar != self._current_bar:
+            return
+        self._chart.show_message(f"{inst_id} K 线加载失败")
+        self._status_label.setText(f"K 线加载失败：{message}")
+
+    @Slot()
+    def _clear_finished_thread(self) -> None:
+        if self._load_thread is not None:
+            self._load_thread.deleteLater()
+            self._load_thread = None
+
+    def _emit_prefs_changed(self) -> None:
+        if self._prefs_changed is None:
+            return
+        try:
+            self._prefs_changed(self._current_bar, self.width(), self.height())
+        except Exception:
+            return
 
 
 class ColumnSettingsDialog(QDialog):
@@ -960,14 +1253,19 @@ class AccountPositionsHomeWidget(QWidget):
         self._visible_column_ids: set[str] = set(DEFAULT_VISIBLE_COLUMNS)
         self._tree_column_width_overrides: dict[str, int] = {}
         self._expanded_row_keys: set[str] = set()
+        self._position_kline_last_bar = "1H"
+        self._position_kline_window_width = 1280
+        self._position_kline_window_height = 760
         self._fill_history_fetch_limit = 100
         self._position_history_fetch_limit = 300
         self._position_history_last_sync_text = "-"
         self._position_history_filter_resetting = False
+        self._selected_position_manual_flatten_running = False
         self._shared_client = OkxRestClient()
         self._protection_manager = PositionProtectionManager(self._shared_client, lambda _message: None)
         self._protection_dialog: PositionProtectionDialog | None = None
         self._legacy_option_tools = LegacyOptionToolsHost(parent=self, runtime_provider=lambda: self._runtime)
+        self._instrument_kline_dialog: InstrumentKlineDialog | None = None
 
         self._current_notes: dict[str, dict[str, object]] = {}
         self._history_notes: dict[str, dict[str, object]] = {}
@@ -1358,7 +1656,7 @@ class AccountPositionsHomeWidget(QWidget):
             ("账户信息", self._show_account_overview, ""),
             ("展开持仓详情", self._toggle_detail_panel, "_detail_toggle_button"),
             ("折叠历史区域", self._toggle_history_panel, "_history_toggle_button"),
-            ("平仓选中", self._show_not_ready_action, ""),
+            ("平仓选中", self.flatten_selected_position, ""),
             ("编辑备注", self.edit_selected_position_note, ""),
             ("从选中持仓接管", self._show_not_ready_action, ""),
             ("停止接管", self._show_not_ready_action, ""),
@@ -1460,15 +1758,20 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._position_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._position_tree.itemSelectionChanged.connect(self._on_position_selected)
+        self._position_tree.itemDoubleClicked.connect(self._on_position_tree_clicked)
         self._position_tree.itemExpanded.connect(self._on_tree_item_expanded)
         self._position_tree.itemCollapsed.connect(self._on_tree_item_collapsed)
         self._position_tree.setRootIsDecorated(True)
         self._position_tree.setUniformRowHeights(True)
         header = self._position_tree.header()
         header.setStretchLastSection(False)
-        self._position_tree.setColumnWidth(0, 240)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        header_item = self._position_tree.headerItem()
+        for index in range(self._position_tree.columnCount()):
+            header_item.setTextAlignment(index, int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+        self._position_tree.setColumnWidth(0, DEFAULT_TREE_LABEL_WIDTH)
         for index, (_column_id, _heading, width, _alignment) in enumerate(POSITION_COLUMNS, start=1):
-            self._position_tree.setColumnWidth(index, width)
+            self._position_tree.setColumnWidth(index, DEFAULT_TREE_COLUMN_WIDTHS.get(_column_id, width))
         self._apply_tree_column_width_overrides()
         self._apply_column_visibility()
         header.sectionResized.connect(self._schedule_positions_view_prefs_save)
@@ -1739,6 +2042,297 @@ class AccountPositionsHomeWidget(QWidget):
             return None
         return position
 
+    def _position_action_parent(self) -> QWidget:
+        return self
+
+    @staticmethod
+    def _normalize_position_manual_flatten_mode(flatten_mode: str) -> str:
+        normalized = str(flatten_mode or "").strip().lower()
+        return "best_quote" if normalized == "best_quote" else "market"
+
+    @staticmethod
+    def _position_manual_flatten_mode_label(flatten_mode: str) -> str:
+        return "挂买一/卖一平仓" if AccountPositionsHomeWidget._normalize_position_manual_flatten_mode(flatten_mode) == "best_quote" else "市价平仓"
+
+    def _build_selected_position_manual_flatten_config(self, position: OkxPosition) -> StrategyConfig:
+        runtime = self._runtime
+        environment = getattr(runtime, "environment", "live") if runtime is not None else "live"
+        runtime_trade_mode = getattr(runtime, "trade_mode", "cross") if runtime is not None else "cross"
+        normalized_mgn_mode = str(position.mgn_mode or "").strip().lower()
+        trade_mode = normalized_mgn_mode if normalized_mgn_mode in {"cross", "isolated"} else runtime_trade_mode
+        position_mode = "long_short" if position.pos_side and position.pos_side.lower() != "net" else "net"
+        direction = derive_position_direction(position)
+        return StrategyConfig(
+            inst_id=position.inst_id,
+            bar="1m",
+            ema_period=1,
+            atr_period=1,
+            atr_stop_multiplier=Decimal("1"),
+            atr_take_multiplier=Decimal("1"),
+            order_size=abs(position.position),
+            trade_mode=trade_mode,
+            signal_mode="long_only" if direction == "long" else "short_only",
+            position_mode=position_mode,
+            environment=environment,
+            tp_sl_trigger_type="last",
+            strategy_id="manual_position_flatten",
+            poll_seconds=10.0,
+            risk_amount=None,
+            trade_inst_id=position.inst_id,
+            tp_sl_mode="local_trade",
+            local_tp_sl_inst_id=position.inst_id,
+            entry_side_mode="follow_signal",
+            run_mode="trade",
+        )
+
+    def _selected_position_close_size(self, position: OkxPosition) -> Decimal:
+        base = position.avail_position
+        if base is None or base == 0:
+            base = position.position
+        return abs(base)
+
+    def _selected_position_flatten_instrument(self, position: OkxPosition) -> Instrument:
+        inst_id = str(position.inst_id or "").strip().upper()
+        cached = self._position_instruments.get(inst_id)
+        if isinstance(cached, Instrument):
+            return cached
+        get_cached_instrument = getattr(self._shared_client, "get_cached_instrument", None)
+        if callable(get_cached_instrument):
+            try:
+                cached = get_cached_instrument(inst_id)
+            except Exception:
+                cached = None
+            if isinstance(cached, Instrument):
+                return cached
+        try:
+            return self._shared_client.get_instrument(inst_id, prefer_cached=True)
+        except TypeError:
+            return self._shared_client.get_instrument(inst_id)
+
+    def _resolve_best_quote_flatten_price(self, instrument: Instrument, *, side: str) -> Decimal:
+        order_book = None
+        try:
+            order_book = self._shared_client.get_order_book(instrument.inst_id, depth=5)
+        except Exception:
+            order_book = None
+        ticker = self._shared_client.get_ticker(instrument.inst_id)
+        if side == "buy":
+            raw_price = order_book.bids[0][0] if order_book is not None and order_book.bids else ticker.bid
+            if raw_price is None or raw_price <= 0:
+                raise ValueError(f"{instrument.inst_id} 当前缺少买一价，无法按买一挂平空单。")
+            return snap_to_increment(raw_price, instrument.tick_size, "down")
+        raw_price = order_book.asks[0][0] if order_book is not None and order_book.asks else ticker.ask
+        if raw_price is None or raw_price <= 0:
+            raise ValueError(f"{instrument.inst_id} 当前缺少卖一价，无法按卖一挂平多单。")
+        return snap_to_increment(raw_price, instrument.tick_size, "up")
+
+    def _prepare_selected_position_manual_flatten(
+        self,
+        position: OkxPosition,
+        flatten_mode: str,
+        *,
+        close_size: Decimal | None = None,
+    ) -> tuple[Credentials, StrategyConfig, Instrument, Decimal, str, str | None, str, str]:
+        runtime = self._runtime
+        if runtime is None:
+            raise ValueError("当前没有可用的 API 运行时，无法执行平仓。")
+        credentials = runtime.credentials
+        config = self._build_selected_position_manual_flatten_config(position)
+        instrument = self._selected_position_flatten_instrument(position)
+        max_close = snap_to_increment(self._selected_position_close_size(position), instrument.lot_size, "down")
+        if max_close < instrument.min_size:
+            raise ValueError("当前选中持仓的可平数量不足最小下单量，无法直接平仓。")
+        if close_size is not None:
+            if close_size <= 0:
+                raise ValueError("平仓数量必须大于 0。")
+            requested = snap_to_increment(close_size, instrument.lot_size, "down")
+            if requested <= 0:
+                raise ValueError("平仓数量按最小变动单位向下取整后为 0，请增大数量。")
+            if requested > max_close:
+                raise ValueError(f"平仓数量不能超过当前可平数量 {format_decimal(max_close)}。")
+            closeable_size = requested
+        else:
+            closeable_size = max_close
+        direction = derive_position_direction(position)
+        close_side = "sell" if direction == "long" else "buy"
+        pos_side = None
+        if config.position_mode == "long_short":
+            normalized_pos_side = str(position.pos_side or "").strip().lower()
+            pos_side = normalized_pos_side if normalized_pos_side in {"long", "short"} else direction
+        normalized_mode = self._normalize_position_manual_flatten_mode(flatten_mode)
+        return credentials, config, instrument, closeable_size, close_side, pos_side, direction, normalized_mode
+
+    def _submit_selected_position_manual_flatten(
+        self,
+        position: OkxPosition,
+        flatten_mode: str,
+        *,
+        close_size: Decimal | None = None,
+    ) -> tuple[OkxOrderResult, Decimal | None, str]:
+        credentials, config, instrument, closeable_size, close_side, pos_side, _direction, normalized_mode = (
+            self._prepare_selected_position_manual_flatten(position, flatten_mode, close_size=close_size)
+        )
+        if normalized_mode == "best_quote":
+            price = self._resolve_best_quote_flatten_price(instrument, side=close_side)
+            result = self._shared_client.place_simple_order(
+                credentials,
+                config,
+                inst_id=position.inst_id,
+                side=close_side,
+                size=closeable_size,
+                ord_type="limit",
+                pos_side=pos_side,
+                price=price,
+                reduce_only=True,
+            )
+            return result, price, normalized_mode
+        result = self._shared_client.place_simple_order(
+            credentials,
+            config,
+            inst_id=position.inst_id,
+            side=close_side,
+            size=closeable_size,
+            ord_type="market",
+            pos_side=pos_side,
+            reduce_only=True,
+        )
+        return result, None, normalized_mode
+
+    def _schedule_selected_position_manual_flatten_follow_up_refresh(self, flatten_mode: str) -> None:
+        normalized_mode = self._normalize_position_manual_flatten_mode(flatten_mode)
+        if normalized_mode == "best_quote":
+            QTimer.singleShot(450, self.refresh_view)
+            QTimer.singleShot(1800, self.refresh_view)
+            return
+        QTimer.singleShot(650, self.refresh_view)
+
+    def _finish_selected_position_manual_flatten_error(self, exc: Exception) -> None:
+        self._selected_position_manual_flatten_running = False
+        self._status_badge.setText("正常")
+        QMessageBox.critical(self, "平仓失败", str(exc))
+
+    def _finish_selected_position_manual_flatten_success(
+        self,
+        *,
+        position: OkxPosition,
+        result: OkxOrderResult,
+        price: Decimal | None,
+        normalized_flatten_mode: str,
+        direction_label: str,
+        close_side_label: str,
+        submit_size_text: str,
+    ) -> None:
+        self._selected_position_manual_flatten_running = False
+        self._status_badge.setText("正常")
+        mode_label = self._position_manual_flatten_mode_label(normalized_flatten_mode)
+        order_id = (result.ord_id or "-").strip() or "-"
+        client_order_id = (result.cl_ord_id or "-").strip() or "-"
+        message = (
+            "已提交选中持仓平仓。\n\n"
+            f"合约：{position.inst_id}\n"
+            f"方向：{direction_label}\n"
+            f"平仓数量：{submit_size_text}\n"
+            f"下单方向：{close_side_label}\n"
+            f"方式：{mode_label}\n"
+            f"订单ID：{order_id}\n"
+            f"客户端单号：{client_order_id}"
+        )
+        if normalized_flatten_mode == "best_quote" and price is not None:
+            message = f"{message}\n挂单价：{format_decimal(price)}"
+        QMessageBox.information(self, "平仓已提交", message)
+        self._schedule_selected_position_manual_flatten_follow_up_refresh(normalized_flatten_mode)
+
+    def flatten_selected_position(self) -> None:
+        if not self._ensure_runtime_ready(force_unlock=True):
+            return
+        if self._selected_position_manual_flatten_running:
+            QMessageBox.information(self, "平仓", "当前已有一笔选中持仓平仓在提交中，请稍候。")
+            return
+        position = self._selected_position()
+        if position is None:
+            QMessageBox.information(self, "平仓", "请先在当前持仓里选中一条具体持仓。")
+            return
+        try:
+            (
+                _credentials,
+                _config,
+                _instrument,
+                preview_close_size,
+                preview_close_side,
+                _pos_side,
+                preview_direction,
+                _normalized_mode,
+            ) = self._prepare_selected_position_manual_flatten(position, "market")
+        except Exception as exc:
+            QMessageBox.critical(self, "平仓失败", str(exc))
+            return
+
+        direction_label = "多头" if preview_direction == "long" else "空头"
+        close_side_label = "SELL 卖出平仓" if preview_close_side == "sell" else "BUY 买入平仓"
+        hold_size_text = format_decimal(abs(position.position))
+        closeable_size_text = format_decimal(self._selected_position_close_size(position))
+        submit_size_text = format_decimal(preview_close_size)
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("平仓选中")
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setText(
+            "\n".join(
+                [
+                    "请选择这次对选中持仓的平仓方式。",
+                    "",
+                    f"合约：{position.inst_id}",
+                    f"方向：{direction_label}",
+                    f"当前持仓：{hold_size_text}",
+                    f"当前可平：{closeable_size_text}",
+                    f"本次将报单平仓数量：{submit_size_text}",
+                    f"实际报单方向：{close_side_label}",
+                    "",
+                    "说明：",
+                    "1. 市价平仓会立刻按市场可成交价格报单。",
+                    "2. 挂买一/卖一平仓会先挂单，未成交前持仓不会消失。",
+                    "3. 平多按卖一挂单，平空按买一挂单。",
+                ]
+            )
+        )
+        market_button = dialog.addButton("市价平仓", QMessageBox.ButtonRole.AcceptRole)
+        best_quote_button = dialog.addButton("挂买一/卖一", QMessageBox.ButtonRole.ActionRole)
+        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked not in {market_button, best_quote_button}:
+            return
+        flatten_mode = "market" if clicked is market_button else "best_quote"
+
+        self._selected_position_manual_flatten_running = True
+        self._status_badge.setText("平仓提交中...")
+
+        def _worker() -> None:
+            try:
+                result, price, normalized_mode = self._submit_selected_position_manual_flatten(position, flatten_mode)
+            except Exception as exc:
+                QTimer.singleShot(0, lambda exc=exc: self._finish_selected_position_manual_flatten_error(exc))
+                return
+            QTimer.singleShot(
+                0,
+                lambda result=result, price=price, normalized_mode=normalized_mode: self._finish_selected_position_manual_flatten_success(
+                    position=position,
+                    result=result,
+                    price=price,
+                    normalized_flatten_mode=normalized_mode,
+                    direction_label=direction_label,
+                    close_side_label=close_side_label,
+                    submit_size_text=submit_size_text,
+                ),
+            )
+
+        try:
+            threading.Thread(target=_worker, name="qt-selected-position-flatten", daemon=True).start()
+        except RuntimeError as exc:
+            self._selected_position_manual_flatten_running = False
+            self._status_badge.setText("正常")
+            QMessageBox.critical(self, "平仓失败", f"系统线程资源不足，无法提交平仓：{exc}")
+
     def _position_history_note_text(self, item: OkxPositionHistoryItem) -> str:
         key = _position_history_note_key(self._last_profile_name, self._note_environment(), item)
         record = self._history_notes.get(key)
@@ -1913,6 +2507,21 @@ class AccountPositionsHomeWidget(QWidget):
                 for key, value in raw_tree_column_widths.items()
                 if str(key).strip() and str(value).strip().isdigit() and int(value) > 0
             }
+        raw_position_kline_bar = str(snapshot.get("position_kline_bar") or "").strip()
+        if raw_position_kline_bar in {bar for _text, bar in POSITION_KLINE_BAR_OPTIONS}:
+            self._position_kline_last_bar = raw_position_kline_bar
+        try:
+            loaded_width = int(str(snapshot.get("position_kline_window_width", self._position_kline_window_width)).strip())
+            if loaded_width > 0:
+                self._position_kline_window_width = loaded_width
+        except Exception:
+            pass
+        try:
+            loaded_height = int(str(snapshot.get("position_kline_window_height", self._position_kline_window_height)).strip())
+            if loaded_height > 0:
+                self._position_kline_window_height = loaded_height
+        except Exception:
+            pass
 
     def _apply_tree_column_width_overrides(self) -> None:
         if not hasattr(self, "_position_tree"):
@@ -1947,6 +2556,9 @@ class AccountPositionsHomeWidget(QWidget):
             save_account_positions_home_view_prefs(
                 visible_columns=sorted(self._visible_column_ids),
                 tree_column_widths=self._collect_tree_column_widths(),
+                position_kline_bar=self._position_kline_last_bar,
+                position_kline_window_width=self._position_kline_window_width,
+                position_kline_window_height=self._position_kline_window_height,
             )
         except Exception:
             return
@@ -2379,15 +2991,123 @@ class AccountPositionsHomeWidget(QWidget):
         self._detail_text.setPlainText("点击任一行查看持仓详情。")
 
     def _show_account_overview(self) -> None:
-        lines = [
-            f"当前 API：{self._last_profile_name or '-'}",
-            f"持仓总数：{len(self._raw_positions)}",
-            f"当前显示：{len(self._visible_positions)}",
-            f"当前委托：{len(self._visible_orders)}",
-            f"当前筛选：{self._keyword_edit.text().strip() or '-'}",
-        ]
-        dialog = AccountOverviewDialog(summary_text="\n".join(lines), parent=self)
+        dialog = AccountOverviewDialog(summary_text=self._build_account_overview_summary_text(), parent=self)
         dialog.exec()
+
+    def _build_account_overview_summary_text(self) -> str:
+        raw_positions = list(self._raw_positions)
+        visible_positions = list(self._visible_positions)
+        position_metrics = _aggregate_position_metrics(raw_positions, self._upl_usdt_prices, self._position_instruments)
+        visible_metrics = _aggregate_position_metrics(visible_positions, self._upl_usdt_prices, self._position_instruments)
+        type_counts = Counter(str(item.inst_type or "-").upper() or "-" for item in raw_positions)
+        visible_type_counts = Counter(str(item.inst_type or "-").upper() or "-" for item in visible_positions)
+        option_long = sum(1 for item in raw_positions if str(item.inst_type or "").upper() == "OPTION" and derive_position_direction(item) == "long")
+        option_short = sum(1 for item in raw_positions if str(item.inst_type or "").upper() == "OPTION" and derive_position_direction(item) == "short")
+        keyword = self._keyword_edit.text().strip()
+        type_filter = self._type_combo.currentText().strip() or "全部类型"
+        runtime = self._runtime
+        environment = getattr(runtime, "environment", "") if runtime is not None else ""
+        environment_label = "实盘 live" if str(environment).lower() == "live" else ("模拟 demo" if str(environment).lower() == "demo" else "-")
+
+        lines = [
+            "账户基础",
+            f"当前 API：{self._last_profile_name or '-'}",
+            f"环境：{environment_label}",
+            f"持仓总数：{len(raw_positions)}",
+            f"当前显示：{len(visible_positions)}",
+            f"当前委托：{len(self._visible_orders)}",
+            f"当前筛选：类型={type_filter} | 关键字={keyword or '-'}",
+            "",
+            "持仓结构",
+            "全部持仓类型分布："
+            + (" | ".join(f"{inst_type} {count}" for inst_type, count in sorted(type_counts.items())) if type_counts else "-"),
+            "当前显示类型分布："
+            + (" | ".join(f"{inst_type} {count}" for inst_type, count in sorted(visible_type_counts.items())) if visible_type_counts else "-"),
+            f"期权方向：多头 {option_long} | 空头 {option_short}",
+            "",
+            "持仓汇总（全部）",
+            f"浮盈亏：{_format_optional_decimal_fixed(position_metrics.get('upl') if isinstance(position_metrics.get('upl'), Decimal) else None, places=5, with_sign=True)}",
+            f"浮盈≈USDT：{_format_optional_usdt(position_metrics.get('upl_usdt') if isinstance(position_metrics.get('upl_usdt'), Decimal) else None)}",
+            f"已实现盈亏：{_format_optional_decimal_fixed(position_metrics.get('realized') if isinstance(position_metrics.get('realized'), Decimal) else None, places=5, with_sign=True)}",
+            f"已实现≈USDT：{_format_optional_usdt(position_metrics.get('realized_usdt') if isinstance(position_metrics.get('realized_usdt'), Decimal) else None)}",
+            f"开仓价值≈USDT：{_format_optional_approx_usdt(position_metrics.get('open_value_usdt') if isinstance(position_metrics.get('open_value_usdt'), Decimal) else None)}",
+            f"市值≈USDT：{_format_optional_approx_usdt(position_metrics.get('market_value_usdt') if isinstance(position_metrics.get('market_value_usdt'), Decimal) else None)}",
+            f"Delta(PA)：{_format_optional_decimal_fixed(position_metrics.get('delta') if isinstance(position_metrics.get('delta'), Decimal) else None, places=5)}",
+            f"Gamma(PA)：{_format_optional_decimal_fixed(position_metrics.get('gamma') if isinstance(position_metrics.get('gamma'), Decimal) else None, places=5)}",
+            f"Vega(PA)：{_format_optional_decimal_fixed(position_metrics.get('vega') if isinstance(position_metrics.get('vega'), Decimal) else None, places=5)}",
+            f"Theta(PA)：{_format_optional_decimal_fixed(position_metrics.get('theta') if isinstance(position_metrics.get('theta'), Decimal) else None, places=5)}",
+            f"Theta≈USDT：{_format_optional_usdt_precise(position_metrics.get('theta_usdt') if isinstance(position_metrics.get('theta_usdt'), Decimal) else None, places=2)}",
+            f"初始保证金(IMR)：{_format_optional_integer(position_metrics.get('imr') if isinstance(position_metrics.get('imr'), Decimal) else None)}",
+            f"维持保证金(MMR)：{_format_optional_integer(position_metrics.get('mmr') if isinstance(position_metrics.get('mmr'), Decimal) else None)}",
+            "",
+            "持仓汇总（当前显示）",
+            f"浮盈亏：{_format_optional_decimal_fixed(visible_metrics.get('upl') if isinstance(visible_metrics.get('upl'), Decimal) else None, places=5, with_sign=True)}",
+            f"浮盈≈USDT：{_format_optional_usdt(visible_metrics.get('upl_usdt') if isinstance(visible_metrics.get('upl_usdt'), Decimal) else None)}",
+            f"已实现≈USDT：{_format_optional_usdt(visible_metrics.get('realized_usdt') if isinstance(visible_metrics.get('realized_usdt'), Decimal) else None)}",
+            f"市值≈USDT：{_format_optional_approx_usdt(visible_metrics.get('market_value_usdt') if isinstance(visible_metrics.get('market_value_usdt'), Decimal) else None)}",
+        ]
+
+        if runtime is not None:
+            try:
+                overview = self._shared_client.get_account_overview(
+                    runtime.credentials,
+                    environment=runtime.environment,
+                    prefer_cache=True,
+                )
+                config = self._shared_client.get_account_config(
+                    runtime.credentials,
+                    environment=runtime.environment,
+                )
+            except Exception as exc:
+                lines.extend(
+                    [
+                        "",
+                        "账户资产",
+                        f"读取失败：{exc}",
+                    ]
+                )
+                return "\n".join(lines)
+
+            lines.extend(
+                [
+                    "",
+                    "账户资产",
+                    f"账户模式：{_format_account_level_text(getattr(config, 'account_level', None))}",
+                    f"持仓模式：{_format_account_position_mode_text(getattr(config, 'position_mode', None))}",
+                    f"Greeks 类型：{_format_greeks_type_text(getattr(config, 'greeks_type', None))}",
+                    f"自动借币：{_format_bool_text(getattr(config, 'auto_loan', None))}",
+                    f"总权益：{_format_optional_usdt_precise(getattr(overview, 'total_equity', None), places=2, with_sign=False)}",
+                    f"调整后权益：{_format_optional_usdt_precise(getattr(overview, 'adjusted_equity', None), places=2, with_sign=False)}",
+                    f"可用权益：{_format_optional_usdt_precise(getattr(overview, 'available_equity', None), places=2, with_sign=False)}",
+                    f"未实现盈亏：{_format_optional_usdt_precise(getattr(overview, 'unrealized_pnl', None), places=2)}",
+                    f"初始保证金(IMR)：{_format_optional_usdt_precise(getattr(overview, 'initial_margin', None), places=2, with_sign=False)}",
+                    f"维持保证金(MMR)：{_format_optional_usdt_precise(getattr(overview, 'maintenance_margin', None), places=2, with_sign=False)}",
+                    f"订单冻结：{_format_optional_usdt_precise(getattr(overview, 'order_frozen', None), places=2, with_sign=False)}",
+                    f"总名义价值(USD)：{_format_optional_usdt_precise(getattr(overview, 'notional_usd', None), places=2, with_sign=False)}",
+                ]
+            )
+
+            assets = [
+                asset
+                for asset in getattr(overview, "details", ())
+                if (asset.equity_usd is not None and asset.equity_usd != 0)
+                or (asset.equity is not None and asset.equity != 0)
+                or (asset.available_balance is not None and asset.available_balance != 0)
+            ]
+            if assets:
+                lines.extend(["", f"资产明细 Top {min(len(assets), 12)}"])
+                for index, asset in enumerate(assets[:12], start=1):
+                    lines.append(
+                        f"{index:02d}. {asset.ccy or '-'}"
+                        f" | 权益={_format_optional_decimal(asset.equity)}"
+                        f" | 可用={_format_optional_decimal(asset.available_balance)}"
+                        f" | 可用权益={_format_optional_decimal(asset.available_equity)}"
+                        f" | 折合USD={_format_optional_usdt_precise(asset.equity_usd, places=2, with_sign=False)}"
+                        f" | 未实现={_format_optional_decimal(asset.unrealized_pnl, with_sign=True)}"
+                        f" | 负债={_format_optional_decimal(asset.liability)}"
+                    )
+
+        return "\n".join(lines)
 
     def _toggle_detail_panel(self) -> None:
         visible = not self._detail_panel.isHidden()
@@ -2434,6 +3154,44 @@ class AccountPositionsHomeWidget(QWidget):
     def _on_position_selected(self) -> None:
         self._update_filter_shortcuts()
         self._refresh_detail()
+
+    def _position_for_tree_item(self, item: QTreeWidgetItem | None) -> OkxPosition | None:
+        if item is None:
+            return None
+        row_key = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(row_key, str):
+            return None
+        payload = self._position_row_payloads.get(row_key)
+        if not isinstance(payload, dict) or payload.get("kind") != "position":
+            return None
+        position = payload.get("item")
+        return position if isinstance(position, OkxPosition) else None
+
+    @Slot(QTreeWidgetItem, int)
+    def _on_position_tree_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        if column != 0:
+            return
+        position = self._position_for_tree_item(item)
+        if position is None:
+            return
+        self._open_position_kline(position)
+
+    def _open_position_kline(self, position: OkxPosition) -> None:
+        if self._instrument_kline_dialog is None:
+            self._instrument_kline_dialog = InstrumentKlineDialog(
+                initial_bar=self._position_kline_last_bar,
+                initial_width=self._position_kline_window_width,
+                initial_height=self._position_kline_window_height,
+                prefs_changed=self._on_position_kline_prefs_changed,
+                parent=self,
+            )
+        self._instrument_kline_dialog.show_instrument(inst_id=position.inst_id, inst_type=position.inst_type)
+
+    def _on_position_kline_prefs_changed(self, bar: str, width: int, height: int) -> None:
+        self._position_kline_last_bar = bar if bar in {item_bar for _text, item_bar in POSITION_KLINE_BAR_OPTIONS} else "1H"
+        self._position_kline_window_width = max(int(width), 320)
+        self._position_kline_window_height = max(int(height), 240)
+        self._schedule_positions_view_prefs_save()
 
     @Slot(str)
     def _set_account_status(self, text: str) -> None:

@@ -6,8 +6,11 @@ from pathlib import Path
 from okx_quant.app_paths import data_root, logs_dir_path, state_dir_path
 from okx_quant.auto_channel_preview import build_auto_channel_preview_snapshot
 from okx_quant.persistence import (
+    deribit_report_export_dir_path,
+    deribit_volatility_cache_file_path,
     line_trading_desk_annotations_file_path,
     load_credentials_profiles_snapshot,
+    load_option_strategies_snapshot,
     load_line_trading_desk_annotations_entries,
     load_smart_order_favorites_snapshot,
     load_smart_order_tasks_snapshot,
@@ -57,6 +60,18 @@ def launcher_module_specs() -> tuple[LauncherModuleSpec, ...]:
             key="auto-channel",
             title="自动通道",
             subtitle="纯 Qt 版统一做样例、市场行情和历史快照结构分析。",
+            status="Qt 原生",
+        ),
+        LauncherModuleSpec(
+            key="deribit-volatility",
+            title="Deribit 波动率指数",
+            subtitle="纯 Qt 版复刻 Deribit 波动率指数窗口，支持联动 K 线、缓存和 CSV 导出。",
+            status="Qt 原生",
+        ),
+        LauncherModuleSpec(
+            key="option-strategy",
+            title="期权策略计算器",
+            subtitle="纯 Qt 版复刻期权策略计算器，支持期权链、策略腿、盈亏图、组合 K 线与持仓导入。",
             status="Qt 原生",
         ),
     )
@@ -138,6 +153,39 @@ def build_auto_channel_module_overview() -> ModuleOverview:
     )
 
 
+def build_deribit_volatility_module_overview() -> ModuleOverview:
+    cache_path = deribit_volatility_cache_file_path()
+    export_dir = deribit_report_export_dir_path()
+    cache_exists = cache_path.exists()
+    cache_size = cache_path.stat().st_size if cache_exists else 0
+    return ModuleOverview(
+        status="Qt 原生",
+        phase="波动率指数与现货联动",
+        summary_lines=(
+            f"缓存文件：{cache_path.name} | {'已存在' if cache_exists else '未生成'}",
+            f"缓存大小：{cache_size} bytes",
+            "支持币种、周期、日线对齐、均价 K 线、导出 CSV 与自动刷新。",
+        ),
+        data_paths=(cache_path, export_dir),
+        next_steps=("继续对齐旧版窗口的交互细节，保证 1:1 使用体验。",),
+    )
+
+
+def build_option_strategy_module_overview() -> ModuleOverview:
+    snapshot = load_option_strategies_snapshot()
+    strategies = snapshot.get("strategies", []) if isinstance(snapshot, dict) else []
+    return ModuleOverview(
+        status="Qt 原生",
+        phase="策略腿建模与盈亏分析",
+        summary_lines=(
+            f"已保存策略：{len(strategies) if isinstance(strategies, list) else 0}",
+            "支持期权链刷新、导入持仓、保存/加载策略、到期盈亏图与组合 K 线。",
+            "图表大窗已接入波动率 K 线与三图叠加对比。",
+        ),
+        next_steps=("继续打磨列宽、细节文案和旧版交互，向 1:1 再靠近。",),
+    )
+
+
 def build_module_overview(module_key: str) -> ModuleOverview:
     normalized = module_key.strip().lower()
     if normalized == "roll":
@@ -148,4 +196,8 @@ def build_module_overview(module_key: str) -> ModuleOverview:
         return build_line_trading_module_overview()
     if normalized == "auto-channel":
         return build_auto_channel_module_overview()
+    if normalized == "deribit-volatility":
+        return build_deribit_volatility_module_overview()
+    if normalized == "option-strategy":
+        return build_option_strategy_module_overview()
     raise KeyError(f"unknown module: {module_key}")

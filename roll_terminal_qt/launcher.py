@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from typing import Iterable
 
-from PySide6.QtCore import Qt, Slot
-from PySide6.QtGui import QAction
+from PySide6.QtCore import Qt, QUrl, Slot
+from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -22,18 +23,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from okx_quant.app_meta import APP_VERSION, build_version_info_text
 from okx_quant.app_paths import config_dir_path, data_root, logs_dir_path, state_dir_path
 from roll_terminal_qt.account_positions_home import AccountPositionsHomeWidget
+from roll_terminal_qt.app_icon import apply_qt_application_identity, apply_qt_window_icon
 from roll_terminal_qt.auto_channel_window import AutoChannelWindow
+from roll_terminal_qt.deribit_volatility_window import DeribitVolatilityQtWindow
 from roll_terminal_qt.line_trading_window import LineTradingQtWindow
 from roll_terminal_qt.module_overview import ModuleOverview, build_module_overview, launcher_module_specs
+from roll_terminal_qt.option_strategy_window import OptionStrategyQtWindow
+from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
 from roll_terminal_qt.smart_order_window import SmartOrderQtWindow
 from roll_terminal_qt.style import APP_STYLE
 from roll_terminal_qt.ui import RollTerminalWindow
 
 
 def module_choices() -> tuple[str, ...]:
-    return ("home",) + tuple(spec.key for spec in launcher_module_specs())
+    return ("home", "kline-analysis") + tuple(spec.key for spec in launcher_module_specs())
 
 
 def _standalone_command(module_key: str) -> str:
@@ -43,16 +49,17 @@ def _standalone_command(module_key: str) -> str:
 class SharedDataDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("共享配置与数据")
+        apply_qt_window_icon(self)
+        self.setWindowTitle("数据中心")
         self.resize(780, 360)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
 
-        title = QLabel("共享配置与数据")
+        title = QLabel("数据中心")
         title.setObjectName("SectionTitle")
-        subtitle = QLabel("主壳统一展示共享目录，模块继续复用同一套配置、状态和日志目录。")
+        subtitle = QLabel("这里集中展示程序共用的数据目录、配置目录、状态目录和日志目录。")
         subtitle.setObjectName("Subtle")
         subtitle.setWordWrap(True)
         layout.addWidget(title)
@@ -91,6 +98,7 @@ class SharedDataDialog(QDialog):
 class ModuleOverviewWindow(QMainWindow):
     def __init__(self, *, module_key: str, title: str, subtitle: str) -> None:
         super().__init__()
+        apply_qt_window_icon(self)
         self._module_key = module_key
         self._title_text = title
         self._subtitle_text = subtitle
@@ -172,6 +180,7 @@ class ModuleOverviewWindow(QMainWindow):
 class ModuleCard(QFrame):
     def __init__(self, *, module_key: str, title: str, subtitle: str, status: str, open_callback) -> None:
         super().__init__()
+        apply_qt_window_icon(self)
         self._module_key = module_key
         self._open_callback = open_callback
         self.setObjectName("Panel")
@@ -243,25 +252,41 @@ class LauncherWindow(QMainWindow):
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
 
-        data_menu = menu_bar.addMenu("共享配置与数据")
-        shared_action = QAction("查看共享路径", self)
+        data_menu = menu_bar.addMenu("设置")
+        shared_action = QAction("查看目录与路径", self)
         shared_action.triggered.connect(self._show_shared_data_dialog)
         data_menu.addAction(shared_action)
 
-        module_menu = menu_bar.addMenu("功能模块")
+        module_menu = menu_bar.addMenu("模块导航")
         for spec in launcher_module_specs():
             action = QAction(spec.title, self)
             action.triggered.connect(lambda _checked=False, key=spec.key: self.open_module_window(key))
             module_menu.addAction(action)
+        module_menu.addSeparator()
+        chart_action = QAction("专业K线分析", self)
+        chart_action.triggered.connect(lambda _checked=False: self.open_module_window("kline-analysis"))
+        module_menu.addAction(chart_action)
 
-        home_menu = menu_bar.addMenu("主页")
-        refresh_action = QAction("刷新账户持仓", self)
+        home_menu = menu_bar.addMenu("系统")
+        refresh_action = QAction("刷新当前页面", self)
         refresh_action.triggered.connect(self._home_widget.refresh_view)
         home_menu.addAction(refresh_action)
 
-        summary_action = QAction("查看主页说明", self)
+        summary_action = QAction("查看工作台说明", self)
         summary_action.triggered.connect(self._show_home_summary_hint)
         home_menu.addAction(summary_action)
+
+        logs_dir_action = QAction("打开日志目录", self)
+        logs_dir_action.triggered.connect(self._open_roll_terminal_logs_directory)
+        home_menu.addAction(logs_dir_action)
+
+        today_log_action = QAction("打开今日日志", self)
+        today_log_action.triggered.connect(self._open_today_console_log)
+        home_menu.addAction(today_log_action)
+
+        version_action = QAction(f"版本信息 (v{APP_VERSION})", self)
+        version_action.triggered.connect(self._show_version_info)
+        home_menu.addAction(version_action)
 
     @Slot()
     def _show_shared_data_dialog(self) -> None:
@@ -275,9 +300,36 @@ class LauncherWindow(QMainWindow):
     def _show_home_summary_hint(self) -> None:
         QMessageBox.information(
             self,
-            "账户持仓主页",
-            "首页已经切换为账户持仓大窗方向。共享路径和功能模块入口已收进上方菜单。",
+            "账户持仓工作台",
+            "当前主页面已经切换为账户持仓工作台，数据目录和模块入口都已收进上方菜单。",
         )
+
+    @Slot()
+    def _show_version_info(self) -> None:
+        QMessageBox.information(self, "版本信息", build_version_info_text())
+
+    def _open_local_path(self, target_path, *, title: str) -> None:  # noqa: ANN001
+        try:
+            if getattr(target_path, "suffix", ""):
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                if not target_path.exists():
+                    target_path.touch()
+            else:
+                target_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, title, f"无法创建目标路径：{exc}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(target_path))):
+            QMessageBox.warning(self, title, f"系统未能打开：\n{target_path}")
+
+    @Slot()
+    def _open_roll_terminal_logs_directory(self) -> None:
+        self._open_local_path(logs_dir_path() / "roll_terminal_qt", title="打开日志目录")
+
+    @Slot()
+    def _open_today_console_log(self) -> None:
+        today_log = logs_dir_path() / "roll_terminal_qt" / f"console_{datetime.now().strftime('%Y-%m-%d')}.log"
+        self._open_local_path(today_log, title="打开今日日志")
 
     @Slot(str)
     def open_module_window(self, module_key: str) -> None:
@@ -294,16 +346,38 @@ class LauncherWindow(QMainWindow):
 def create_module_window(module_key: str) -> QWidget:
     normalized = module_key.strip().lower()
     if normalized == "roll":
-        return RollTerminalWindow()
+        window = RollTerminalWindow()
+        apply_qt_window_icon(window)
+        return window
+    if normalized == "kline-analysis":
+        window = KlineAnalysisWindow()
+        apply_qt_window_icon(window)
+        return window
     if normalized == "smart-order":
-        return SmartOrderQtWindow()
+        window = SmartOrderQtWindow()
+        apply_qt_window_icon(window)
+        return window
     if normalized == "line-trading":
-        return LineTradingQtWindow()
+        window = LineTradingQtWindow()
+        apply_qt_window_icon(window)
+        return window
     if normalized == "auto-channel":
-        return AutoChannelWindow()
+        window = AutoChannelWindow()
+        apply_qt_window_icon(window)
+        return window
+    if normalized == "deribit-volatility":
+        window = DeribitVolatilityQtWindow()
+        apply_qt_window_icon(window)
+        return window
+    if normalized == "option-strategy":
+        window = OptionStrategyQtWindow()
+        apply_qt_window_icon(window)
+        return window
     for spec in launcher_module_specs():
         if spec.key == normalized:
-            return ModuleOverviewWindow(module_key=spec.key, title=spec.title, subtitle=spec.subtitle)
+            window = ModuleOverviewWindow(module_key=spec.key, title=spec.title, subtitle=spec.subtitle)
+            apply_qt_window_icon(window)
+            return window
     raise KeyError(f"unknown module: {module_key}")
 
 
@@ -331,7 +405,9 @@ def run(argv: Iterable[str] | None = None) -> int:
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv[:1])
+    apply_qt_application_identity(app)
     app.setStyleSheet(APP_STYLE)
     window = create_root_window(args.module)
+    apply_qt_window_icon(window)
     window.show()
     return app.exec()
