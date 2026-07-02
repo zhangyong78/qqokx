@@ -170,7 +170,7 @@ class RollTerminalWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("专业套利终端")
         self.resize(1680, 980)
-        self._runtime = load_runtime("2211") or load_runtime()
+        self._runtime = load_runtime("159") or load_runtime()
         environment = self._runtime.environment if self._runtime is not None else "live"
         self._feed = MarketFeedThread(environment=environment)
         self._account_feed = AccountFeedThread(self._runtime)

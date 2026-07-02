@@ -38,7 +38,7 @@ def launcher_module_specs() -> tuple[LauncherModuleSpec, ...]:
         LauncherModuleSpec(
             key="roll",
             title="专业套利终端",
-            subtitle="主壳负责统一入口、共享配置和核心套利流程。",
+            subtitle="主壳负责统一入口、共享配置和核心交易流程。",
             status="Qt 主模块",
         ),
         LauncherModuleSpec(

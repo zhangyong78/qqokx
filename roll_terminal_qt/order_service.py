@@ -13,14 +13,22 @@ from okx_quant.okx_client import OkxOrderStatus, OkxRestClient
 @dataclass(frozen=True)
 class OrderStatusView:
     inst_id: str
+    inst_type: str
     ord_id: str
     side: str
+    pos_side: str
+    td_mode: str
     ord_type: str
     state: str
     price: Decimal | None
     avg_price: Decimal | None
     size: Decimal | None
     filled_size: Decimal | None
+    created_time: int | None
+    update_time: int | None
+    client_order_id: str
+    reduce_only: bool | None
+    raw: dict[str, object]
 
 
 class OrderFeedThread(QThread):
@@ -72,15 +80,48 @@ class OrderFeedThread(QThread):
         return inst_id in self._watched_inst_ids
 
     def _to_view(self, status: OkxOrderStatus) -> OrderStatusView:
+        raw = status.raw if isinstance(status.raw, dict) else {}
         return OrderStatusView(
-            inst_id=str(status.raw.get("instId") or ""),
+            inst_id=str(raw.get("instId") or ""),
+            inst_type=str(raw.get("instType") or ""),
             ord_id=status.ord_id,
             side=str(status.side or ""),
+            pos_side=str(raw.get("posSide") or ""),
+            td_mode=str(raw.get("tdMode") or ""),
             ord_type=str(status.ord_type or ""),
             state=status.state,
             price=status.price,
             avg_price=status.avg_price,
             size=status.size,
             filled_size=status.filled_size,
+            created_time=_parse_int_like(raw.get("cTime")),
+            update_time=_parse_int_like(raw.get("uTime")),
+            client_order_id=str(raw.get("clOrdId") or ""),
+            reduce_only=_parse_optional_bool(raw.get("reduceOnly")),
+            raw=dict(raw),
         )
 
+
+def _parse_int_like(value: object) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except Exception:
+        return None
+
+
+def _parse_optional_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None

@@ -50,6 +50,7 @@ HISTORY_FILLS_FILE_NAME = "fills_history.json"
 HISTORY_POSITIONS_FILE_NAME = "position_history.json"
 ACCOUNT_EQUITY_CURVE_FILE_NAME = "account_equity_curve.json"
 POSITION_HISTORY_VIEW_PREFS_FILE_NAME = "position_history_view_prefs.json"
+ACCOUNT_POSITIONS_HOME_VIEW_PREFS_FILE_NAME = "account_positions_home_view_prefs.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 PROFILE_ENVIRONMENTS = {"demo", "live"}
 _CREDENTIAL_CIPHER_PREFIX = "dpapi:"
@@ -484,6 +485,78 @@ def history_cache_dir_path(
 def position_history_view_prefs_file_path(*, base_dir: Path | None = None) -> Path:
     root = Path(base_dir) if base_dir is not None else state_dir_path()
     return root / POSITION_HISTORY_VIEW_PREFS_FILE_NAME
+
+
+def account_positions_home_view_prefs_file_path(*, base_dir: Path | None = None) -> Path:
+    root = Path(base_dir) if base_dir is not None else state_dir_path()
+    return root / ACCOUNT_POSITIONS_HOME_VIEW_PREFS_FILE_NAME
+
+
+def load_account_positions_home_view_prefs(path: Path | None = None) -> dict[str, object]:
+    target = path or account_positions_home_view_prefs_file_path()
+    if not target.exists():
+        return {"visible_columns": [], "tree_column_widths": {}}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"visible_columns": [], "tree_column_widths": {}}
+    if not isinstance(payload, dict):
+        return {"visible_columns": [], "tree_column_widths": {}}
+    raw_visible_columns = payload.get("visible_columns")
+    raw_tree_column_widths = payload.get("tree_column_widths")
+    visible_columns = (
+        [str(item).strip() for item in raw_visible_columns if str(item).strip()]
+        if isinstance(raw_visible_columns, list)
+        else []
+    )
+    tree_column_widths: dict[str, int] = {}
+    if isinstance(raw_tree_column_widths, dict):
+        for key, value in raw_tree_column_widths.items():
+            normalized_key = str(key).strip()
+            if not normalized_key:
+                continue
+            try:
+                normalized_value = int(str(value).strip())
+            except Exception:
+                continue
+            if normalized_value > 0:
+                tree_column_widths[normalized_key] = normalized_value
+    return {
+        "visible_columns": visible_columns,
+        "tree_column_widths": tree_column_widths,
+    }
+
+
+def save_account_positions_home_view_prefs(
+    *,
+    visible_columns: list[str],
+    tree_column_widths: dict[str, int],
+    path: Path | None = None,
+) -> Path:
+    target = path or account_positions_home_view_prefs_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    normalized_visible_columns = [str(item).strip() for item in visible_columns if str(item).strip()]
+    normalized_tree_column_widths: dict[str, int] = {}
+    for key, value in tree_column_widths.items():
+        normalized_key = str(key).strip()
+        if not normalized_key:
+            continue
+        try:
+            normalized_value = int(str(value).strip())
+        except Exception:
+            continue
+        if normalized_value > 0:
+            normalized_tree_column_widths[normalized_key] = normalized_value
+    payload = {
+        "version": 1,
+        "visible_columns": normalized_visible_columns,
+        "tree_column_widths": normalized_tree_column_widths,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
 
 
 def load_position_history_view_prefs(path: Path | None = None) -> dict[str, str]:

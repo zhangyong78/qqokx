@@ -231,7 +231,7 @@ class LauncherWindow(QMainWindow):
         self._child_windows: list[QWidget] = []
         self._shared_data_dialog: SharedDataDialog | None = None
         self._home_widget = AccountPositionsHomeWidget(self)
-        self.setWindowTitle("Qt 专业终端主壳")
+        self.setWindowTitle("量化交易控制台")
         self.resize(1680, 980)
         self.setCentralWidget(self._home_widget)
         self._build_menu()
