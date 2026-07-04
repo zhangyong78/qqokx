@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 import json
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 import traceback
 
-from PySide6.QtCharts import QCandlestickSeries, QCandlestickSet, QChart, QChartView, QDateTimeAxis, QValueAxis
+from PySide6.QtCharts import QCandlestickSeries, QCandlestickSet, QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
 from PySide6.QtCore import QDateTime, QMargins, QPointF, QRectF, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -64,6 +65,10 @@ from okx_quant.persistence import deribit_report_export_dir_path, deribit_volati
 
 _DERIBIT_SHARED_CLIENT: DeribitRestClient | None = None
 _OKX_SHARED_CLIENT: OkxRestClient | None = None
+_EMA15_OVERLAY_COLOR = "#ff4d6d"
+_MA50_OVERLAY_COLOR = "#58c66d"
+_EMA15_OVERLAY_WIDTH = 2
+_MA50_OVERLAY_WIDTH = 3
 
 
 def _shared_deribit_client() -> DeribitRestClient:
@@ -87,6 +92,74 @@ def _decimal_places_for_candles(candles: list[DeribitVolatilityCandle | Candle])
             current = max(0, -value.normalize().as_tuple().exponent)
             places = max(places, min(current, 6))
     return places
+
+
+@dataclass(frozen=True)
+class ChartLineOverlay:
+    label: str
+    values: list[Decimal | None]
+    color: str
+    width: int
+
+
+def _build_moving_average_series(closes: list[Decimal]) -> tuple[list[Decimal], list[Decimal | None]]:
+    if not closes:
+        return [], []
+    ema_period = 15
+    ma_period = 50
+    ema_multiplier = Decimal("2") / Decimal(ema_period + 1)
+    ema15_values: list[Decimal] = []
+    ma50_values: list[Decimal | None] = []
+    ema_value: Decimal | None = None
+    rolling_sum = Decimal("0")
+
+    for index, close in enumerate(closes):
+        if ema_value is None:
+            ema_value = close
+        else:
+            ema_value = ((close - ema_value) * ema_multiplier) + ema_value
+        ema15_values.append(ema_value)
+
+        rolling_sum += close
+        if index >= ma_period:
+            rolling_sum -= closes[index - ma_period]
+        if index + 1 < ma_period:
+            ma50_values.append(None)
+        else:
+            ma50_values.append(rolling_sum / Decimal(ma_period))
+    return ema15_values, ma50_values
+
+
+def _build_moving_average_overlays(
+    candles: list[DeribitVolatilityCandle | Candle],
+    *,
+    start_index: int,
+    end_index: int,
+) -> list[ChartLineOverlay]:
+    closes = [candle.close for candle in candles]
+    ema15_values, ma50_values = _build_moving_average_series(closes)
+    return [
+        ChartLineOverlay(
+            label="EMA15",
+            values=ema15_values[start_index:end_index],
+            color=_EMA15_OVERLAY_COLOR,
+            width=_EMA15_OVERLAY_WIDTH,
+        ),
+        ChartLineOverlay(
+            label="MA50",
+            values=ma50_values[start_index:end_index],
+            color=_MA50_OVERLAY_COLOR,
+            width=_MA50_OVERLAY_WIDTH,
+        ),
+    ]
+
+
+def _attach_series_to_axes_once(series, axis_x, axis_y) -> None:  # noqa: ANN001
+    attached_axes = set(series.attachedAxes())
+    if axis_x not in attached_axes:
+        series.attachAxis(axis_x)
+    if axis_y not in attached_axes:
+        series.attachAxis(axis_y)
 
 
 class _DeribitFetchThread(QThread):
@@ -200,6 +273,7 @@ class LinkedCandlestickChartView(QChartView):
         self._value_suffix = "%"
         self._empty_message = "暂无可用K线数据。"
         self._candles: list[DeribitVolatilityCandle | Candle] = []
+        self._line_overlays: list[ChartLineOverlay] = []
         self._hover_pos: QPointF | None = None
         self._value_min = 0.0
         self._value_max = 1.0
@@ -216,10 +290,12 @@ class LinkedCandlestickChartView(QChartView):
         title: str,
         candles: list[DeribitVolatilityCandle | Candle],
         empty_message: str,
+        line_overlays: list[ChartLineOverlay] | None = None,
     ) -> None:
         self._title = title
         self._empty_message = empty_message
         self._candles = list(candles)
+        self._line_overlays = list(line_overlays or [])
         self._hover_pos = None
         self._linked_hover_index = None
         self._linked_hover_y_ratio = None
@@ -531,12 +607,22 @@ class LinkedCandlestickChartView(QChartView):
 
         self.chart().addSeries(up_series)
         self.chart().addSeries(down_series)
+        for overlay in self._line_overlays:
+            line_series = QLineSeries()
+            line_series.setName(overlay.label)
+            line_pen = QPen(QColor(overlay.color))
+            line_pen.setWidth(overlay.width)
+            line_pen.setCosmetic(True)
+            line_series.setPen(line_pen)
+            for candle, value in zip(candles, overlay.values):
+                if value is None:
+                    continue
+                line_series.append(float(candle.ts), float(value))
+            self.chart().addSeries(line_series)
         self.chart().addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
         self.chart().addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
-        up_series.attachAxis(axis_x)
-        up_series.attachAxis(axis_y)
-        down_series.attachAxis(axis_x)
-        down_series.attachAxis(axis_y)
+        for series in self.chart().series():
+            _attach_series_to_axes_once(series, axis_x, axis_y)
 
     def _nearest_candle_index(self, x: float, plot: QRectF) -> int:
         if not self._candles:
@@ -654,6 +740,8 @@ class DeribitVolatilityQtWindow(QMainWindow):
         self._day_align_combo = QComboBox()
         self._candle_limit_edit = QLineEdit("300")
         self._average_kline_check = QCheckBox("平均K线")
+        self._moving_average_check = QCheckBox("EMA15 / MA50")
+        self._moving_average_check.setChecked(True)
         self._status_label = QLabel("打开页面后自动加载历史K线，并每小时同步一次。")
         self._summary_label = QLabel("暂无数据。")
         self._spot_chart_title = QLabel("同币种现货K线")
@@ -693,9 +781,9 @@ class DeribitVolatilityQtWindow(QMainWindow):
         controls = QFrame()
         controls.setObjectName("Panel")
         controls_layout = QGridLayout(controls)
-        controls_layout.setContentsMargins(14, 14, 14, 14)
+        controls_layout.setContentsMargins(12, 10, 12, 10)
         controls_layout.setHorizontalSpacing(10)
-        controls_layout.setVerticalSpacing(10)
+        controls_layout.setVerticalSpacing(6)
         for item in DERIBIT_CURRENCY_OPTIONS:
             self._currency_combo.addItem(item, item)
         for label, value in DERIBIT_RESOLUTION_OPTIONS.items():
@@ -714,6 +802,9 @@ class DeribitVolatilityQtWindow(QMainWindow):
         export_button.clicked.connect(self.export_csv)
         reset_button = QPushButton("重置视图")
         reset_button.clicked.connect(self.reset_chart_view)
+        for button in (refresh_button, export_button, reset_button):
+            button.setMinimumHeight(24)
+            button.setMaximumHeight(24)
 
         controls_layout.addWidget(QLabel("币种"), 0, 0)
         controls_layout.addWidget(self._currency_combo, 0, 1)
@@ -724,7 +815,8 @@ class DeribitVolatilityQtWindow(QMainWindow):
         controls_layout.addWidget(QLabel("K线数量"), 0, 6)
         controls_layout.addWidget(self._candle_limit_edit, 0, 7)
         controls_layout.addWidget(self._average_kline_check, 0, 8)
-        controls_layout.addWidget(reset_button, 0, 9)
+        controls_layout.addWidget(self._moving_average_check, 0, 9)
+        controls_layout.addWidget(reset_button, 0, 10)
         controls_layout.addWidget(self._status_label, 1, 0, 1, 7)
         controls_layout.addWidget(refresh_button, 1, 8)
         controls_layout.addWidget(export_button, 1, 9)
@@ -759,6 +851,7 @@ class DeribitVolatilityQtWindow(QMainWindow):
         self._resolution_combo.currentIndexChanged.connect(self._on_selection_changed)
         self._day_align_combo.currentIndexChanged.connect(self._on_selection_changed)
         self._average_kline_check.stateChanged.connect(self._on_chart_style_changed)
+        self._moving_average_check.stateChanged.connect(self._on_chart_style_changed)
         self._candle_limit_edit.editingFinished.connect(self._on_limit_changed)
         self._volatility_chart.zoom_requested.connect(self._on_chart_zoom_requested)
         self._spot_chart.zoom_requested.connect(self._on_chart_zoom_requested)
@@ -1023,16 +1116,23 @@ class DeribitVolatilityQtWindow(QMainWindow):
         end_index = min(total, start_index + visible_count)
         visible_vol = vol_candles[start_index:end_index]
         visible_spot = spot_candles[start_index:end_index]
+        vol_line_overlays: list[ChartLineOverlay] = []
+        spot_line_overlays: list[ChartLineOverlay] = []
+        if self._moving_average_check.isChecked():
+            vol_line_overlays = _build_moving_average_overlays(vol_candles, start_index=start_index, end_index=end_index)
+            spot_line_overlays = _build_moving_average_overlays(spot_candles, start_index=start_index, end_index=end_index)
         resolution_label = self._resolution_combo.currentText()
         self._volatility_chart.set_chart_payload(
             title=f"{snapshot.currency} Deribit 波动率指数K线 | {resolution_label}",
             candles=visible_vol,
             empty_message="暂无可显示的波动率K线。",
+            line_overlays=vol_line_overlays,
         )
         self._spot_chart.set_chart_payload(
             title=f"{snapshot.spot_inst_id} 现货K线 | {resolution_label}",
             candles=visible_spot,
             empty_message="暂无可显示的现货K线。",
+            line_overlays=spot_line_overlays,
         )
         self._clear_chart_hover()
 

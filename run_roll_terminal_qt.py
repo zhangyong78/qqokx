@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import faulthandler
 import io
+import os
 import sys
 import threading
 import traceback
@@ -107,9 +108,37 @@ def _install_runtime_logging() -> Path:
     return log_path
 
 
+def _configure_qt_webengine_runtime() -> None:
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").strip()
+    extra_flags = (
+        "--disable-direct-composition",
+        "--disable-gpu",
+        "--disable-gpu-compositing",
+        "--disable-gpu-rasterization",
+    )
+    merged_flags = [flag for flag in flags.split() if flag]
+    for flag in extra_flags:
+        if flag not in merged_flags:
+            merged_flags.append(flag)
+    if merged_flags:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(merged_flags)
+    os.environ.setdefault("QT_OPENGL", "software")
+    os.environ.setdefault("QT_QUICK_BACKEND", "software")
+    os.environ.setdefault("QTWEBENGINE_DISABLE_GPU", "1")
+    print(
+        "[QQOKX] QtWebEngine fallback:"
+        f" QT_OPENGL={os.environ.get('QT_OPENGL')}"
+        f" QT_QUICK_BACKEND={os.environ.get('QT_QUICK_BACKEND')}"
+        f" QTWEBENGINE_DISABLE_GPU={os.environ.get('QTWEBENGINE_DISABLE_GPU')}"
+        f" QTWEBENGINE_CHROMIUM_FLAGS={os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS')}",
+        file=sys.stderr,
+    )
+
+
 def main() -> int:
     _set_console_title()
     _install_runtime_logging()
+    _configure_qt_webengine_runtime()
     from roll_terminal_qt.launcher import run
 
     return run()

@@ -3487,5 +3487,69 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertGreater(request.spot_qty or Decimal("0"), Decimal("0"))
 
 
+class ArbitrageWindowLedgerReloadTest(unittest.TestCase):
+    def test_reload_ledger_inserts_entries_with_root_parent_and_entry_iid(self) -> None:
+        class _LedgerTree:
+            def __init__(self) -> None:
+                self.rows: list[dict[str, object]] = []
+
+            def get_children(self):
+                return ("stale",)
+
+            def delete(self, *item_ids) -> None:  # noqa: ANN002
+                self.deleted = item_ids
+
+            def insert(self, parent, index, *args, **kwargs):  # noqa: ANN001,ANN002,ANN003
+                if parent != "":
+                    raise AssertionError(f"unexpected parent: {parent}")
+                self.rows.append(
+                    {
+                        "parent": parent,
+                        "index": index,
+                        "args": args,
+                        "kwargs": kwargs,
+                    }
+                )
+
+        class _Manager:
+            def load_ledger(self):
+                return [
+                    ArbitrageLedgerEntry(
+                        entry_id="entry-1",
+                        base_ccy="BTC",
+                        pair_kind="spot_swap",
+                        spot_inst_id="BTC-USDT",
+                        derivative_inst_id="BTC-USDT-SWAP",
+                        spot_qty=Decimal("0.01"),
+                        derivative_qty=Decimal("1"),
+                        open_spot_price=Decimal("100000"),
+                        open_derivative_price=Decimal("100100"),
+                        close_spot_price=None,
+                        close_derivative_price=None,
+                        basis_at_open_pct=Decimal("0.001"),
+                        fee_total=Decimal("1.25"),
+                        funding_total=Decimal("0"),
+                        realized_pnl=None,
+                        close_mode="open",
+                        opened_at="2026-07-05 12:00:00",
+                        closed_at=None,
+                    )
+                ]
+
+        window = object.__new__(ArbitrageWindow)
+        window.ledger_tree = _LedgerTree()
+        window.manager = _Manager()
+        window._refresh_close_entry_options = lambda: None
+        window._refresh_roll_entry_options = lambda: None
+
+        window._reload_ledger()
+
+        self.assertEqual(len(window.ledger_tree.rows), 1)
+        inserted = window.ledger_tree.rows[0]
+        self.assertEqual(inserted["parent"], "")
+        self.assertEqual(inserted["kwargs"]["iid"], "entry-1")
+        self.assertIn("entry-1", window._ledger_entry_by_id)
+
+
 if __name__ == "__main__":
     unittest.main()

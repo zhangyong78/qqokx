@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import Counter
 import json
@@ -10,11 +10,10 @@ from decimal import Decimal
 from tkinter import Tk
 from typing import Callable
 
-from PySide6.QtCore import QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -56,7 +55,6 @@ from okx_quant.persistence import (
     load_position_notes_snapshot,
     save_account_positions_home_view_prefs,
     save_position_notes_snapshot,
-    verify_profile_switch_password,
 )
 from okx_quant.position_protection import (
     OptionProtectionConfig,
@@ -99,7 +97,6 @@ from okx_quant.ui_shell import (
     _format_mark_price,
     _format_position_mark_price_usdt,
     _format_option_trade_side_display,
-    _format_network_error_message,
     _format_okx_ms_timestamp,
     _group_positions_for_tree,
     _format_history_side,
@@ -109,8 +106,6 @@ from okx_quant.ui_shell import (
     _format_trade_order_size,
     _format_trade_order_state,
     _format_trade_order_fee_cell,
-    _trade_order_cancel_reference,
-    _trade_order_program_owner_label,
     _build_trade_order_detail_text,
     _build_fill_history_detail_text,
     _build_history_position_note_record,
@@ -130,7 +125,6 @@ from okx_quant.ui_shell import (
     _position_history_note_summary_text,
     _position_delta_value,
     _position_note_current_key,
-    _position_contract_value_snapshot,
     _position_realized_pnl_usdt,
     _position_signed_open_value_approx_usdt,
     _position_theta_usdt,
@@ -155,135 +149,45 @@ from roll_terminal_qt.runtime import load_runtime, profile_names
 
 
 POSITION_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("全部类型", ""),
-    ("交割合约 FUTURES", "FUTURES"),
-    ("永续 SWAP", "SWAP"),
-    ("期权 OPTION", "OPTION"),
+    ("鍏ㄩ儴绫诲瀷", ""),
+    ("浜ゅ壊鍚堢害 FUTURES", "FUTURES"),
+    ("姘哥画 SWAP", "SWAP"),
+    ("鏈熸潈 OPTION", "OPTION"),
 )
 
-def _current_order_view_source_kind(order: OrderStatusView) -> str:
-    raw = order.raw if isinstance(order.raw, dict) else {}
-    return str(raw.get("_source_kind") or "").strip().lower() or "normal"
-
-
-def _current_order_view_source_label(order: OrderStatusView) -> str:
-    raw = order.raw if isinstance(order.raw, dict) else {}
-    feed_source = str(raw.get("_feed_source") or "").strip().lower()
-    source_kind = _current_order_view_source_kind(order)
-    if feed_source == "rest_pending" and source_kind == "algo":
-        return "REST 算法"
-    if feed_source == "rest_pending":
-        return "REST pending"
-    if source_kind == "algo":
-        return "WS 当前算法"
-    return "WS 当前"
-
-
-def _current_order_view_to_trade_order_item(order: OrderStatusView) -> OkxTradeOrderItem:
-    raw = dict(order.raw) if isinstance(order.raw, dict) else {}
-    algo_id = str(raw.get("algoId") or "").strip() or None
-    algo_cl_ord_id = str(raw.get("algoClOrdId") or "").strip() or None
-    return OkxTradeOrderItem(
-        source_kind=_current_order_view_source_kind(order),
-        source_label=_current_order_view_source_label(order),
-        created_time=order.created_time,
-        update_time=order.update_time,
-        inst_id=order.inst_id,
-        inst_type=order.inst_type,
-        side=order.side or None,
-        pos_side=order.pos_side or None,
-        td_mode=order.td_mode or None,
-        ord_type=order.ord_type or None,
-        state=order.state or None,
-        price=order.price,
-        size=order.size,
-        filled_size=order.filled_size,
-        avg_price=order.avg_price,
-        order_id=order.ord_id or None,
-        algo_id=algo_id,
-        client_order_id=order.client_order_id or None,
-        algo_client_order_id=algo_cl_ord_id or (order.client_order_id or None),
-        pnl=None,
-        fee=None,
-        fee_currency=None,
-        reduce_only=order.reduce_only,
-        trigger_price=None,
-        trigger_price_type=None,
-        order_price=None,
-        actual_price=None,
-        actual_size=None,
-        actual_side=None,
-        take_profit_trigger_price=None,
-        take_profit_order_price=None,
-        take_profit_trigger_price_type=None,
-        stop_loss_trigger_price=None,
-        stop_loss_order_price=None,
-        stop_loss_trigger_price_type=None,
-        raw=raw,
-    )
-
-
-def _current_order_view_cancel_reference(order: OrderStatusView) -> str:
-    return _trade_order_cancel_reference(_current_order_view_to_trade_order_item(order))
-
-
-def _current_order_view_program_owner_label(order: OrderStatusView) -> str | None:
-    return _trade_order_program_owner_label(_current_order_view_to_trade_order_item(order))
-
-
-def _current_order_view_owner_display_label(order: OrderStatusView) -> str:
-    return _current_order_view_program_owner_label(order) or "未识别来源"
-
-
-def _current_order_cancel_result_failed(result: OkxOrderResult) -> bool:
-    return str(result.s_code or "").strip() not in {"", "0"}
-
-
-def _current_order_cancel_result_error_message(order: OrderStatusView, result: OkxOrderResult) -> str:
-    cancel_id = _current_order_view_cancel_reference(order) or "-"
-    s_code = str(result.s_code or "").strip() or "-"
-    s_msg = str(result.s_msg or "").strip() or "accepted"
-    return (
-        f"{_current_order_view_source_label(order)} 撤单失败。\n\n"
-        f"合约：{order.inst_id or '-'}\n"
-        f"标识：{cancel_id}\n"
-        f"返回：sCode={s_code} | sMsg={s_msg}"
-    )
-
-
 POSITION_COLUMNS: tuple[tuple[str, str, int, Qt.AlignmentFlag], ...] = (
-    ("inst_type", "类型", 72, Qt.AlignmentFlag.AlignCenter),
-    ("mgn_mode", "保证金模式", 92, Qt.AlignmentFlag.AlignCenter),
-    ("time_value", "时间价值", 88, Qt.AlignmentFlag.AlignRight),
-    ("time_value_usdt", "时间≈USDT", 72, Qt.AlignmentFlag.AlignRight),
-    ("intrinsic_value", "内在价值", 88, Qt.AlignmentFlag.AlignRight),
-    ("intrinsic_usdt", "内在≈USDT", 72, Qt.AlignmentFlag.AlignRight),
-    ("bid_price", "买一价", 78, Qt.AlignmentFlag.AlignRight),
-    ("bid_usdt", "买一≈USDT", 78, Qt.AlignmentFlag.AlignRight),
-    ("ask_price", "卖一价", 78, Qt.AlignmentFlag.AlignRight),
-    ("ask_usdt", "卖一≈USDT", 78, Qt.AlignmentFlag.AlignRight),
-    ("mark", "标记价", 84, Qt.AlignmentFlag.AlignRight),
-    ("mark_usdt", "标记≈USDT", 72, Qt.AlignmentFlag.AlignRight),
-    ("avg", "开仓价", 84, Qt.AlignmentFlag.AlignRight),
-    ("avg_usdt", "开仓≈USDT", 72, Qt.AlignmentFlag.AlignRight),
-    ("open_value_usdt", "开仓价值≈USDT", 116, Qt.AlignmentFlag.AlignRight),
-    ("pos", "持仓量", 170, Qt.AlignmentFlag.AlignRight),
-    ("option_side", "买购:卖购 | 买沽:卖沽", 170, Qt.AlignmentFlag.AlignCenter),
-    ("upl", "浮盈亏", 168, Qt.AlignmentFlag.AlignRight),
-    ("upl_usdt", "浮盈≈USDT", 108, Qt.AlignmentFlag.AlignRight),
-    ("realized", "已实现盈亏", 118, Qt.AlignmentFlag.AlignRight),
-    ("realized_usdt", "已实现≈USDT", 108, Qt.AlignmentFlag.AlignRight),
-    ("market_value", "市值", 160, Qt.AlignmentFlag.AlignRight),
-    ("liq", "强平价", 92, Qt.AlignmentFlag.AlignRight),
-    ("mgn_ratio", "保证金率", 88, Qt.AlignmentFlag.AlignRight),
-    ("imr", "初始保证金", 100, Qt.AlignmentFlag.AlignRight),
-    ("mmr", "维持保证金", 100, Qt.AlignmentFlag.AlignRight),
+    ("inst_type", "绫诲瀷", 72, Qt.AlignmentFlag.AlignCenter),
+    ("mgn_mode", "淇濊瘉閲戞ā寮?, 92, Qt.AlignmentFlag.AlignCenter),
+    ("time_value", "鏃堕棿浠峰€?, 88, Qt.AlignmentFlag.AlignRight),
+    ("time_value_usdt", "鏃堕棿鈮圲SDT", 72, Qt.AlignmentFlag.AlignRight),
+    ("intrinsic_value", "鍐呭湪浠峰€?, 88, Qt.AlignmentFlag.AlignRight),
+    ("intrinsic_usdt", "鍐呭湪鈮圲SDT", 72, Qt.AlignmentFlag.AlignRight),
+    ("bid_price", "涔颁竴浠?, 78, Qt.AlignmentFlag.AlignRight),
+    ("bid_usdt", "涔颁竴鈮圲SDT", 78, Qt.AlignmentFlag.AlignRight),
+    ("ask_price", "鍗栦竴浠?, 78, Qt.AlignmentFlag.AlignRight),
+    ("ask_usdt", "鍗栦竴鈮圲SDT", 78, Qt.AlignmentFlag.AlignRight),
+    ("mark", "鏍囪浠?, 84, Qt.AlignmentFlag.AlignRight),
+    ("mark_usdt", "鏍囪鈮圲SDT", 72, Qt.AlignmentFlag.AlignRight),
+    ("avg", "寮€浠撲环", 84, Qt.AlignmentFlag.AlignRight),
+    ("avg_usdt", "寮€浠撯増USDT", 72, Qt.AlignmentFlag.AlignRight),
+    ("open_value_usdt", "寮€浠撲环鍊尖増USDT", 116, Qt.AlignmentFlag.AlignRight),
+    ("pos", "鎸佷粨閲?, 170, Qt.AlignmentFlag.AlignRight),
+    ("option_side", "涔拌喘:鍗栬喘 | 涔版步:鍗栨步", 170, Qt.AlignmentFlag.AlignCenter),
+    ("upl", "娴泩浜?, 168, Qt.AlignmentFlag.AlignRight),
+    ("upl_usdt", "娴泩鈮圲SDT", 108, Qt.AlignmentFlag.AlignRight),
+    ("realized", "宸插疄鐜扮泩浜?, 118, Qt.AlignmentFlag.AlignRight),
+    ("realized_usdt", "宸插疄鐜扳増USDT", 108, Qt.AlignmentFlag.AlignRight),
+    ("market_value", "甯傚€?, 160, Qt.AlignmentFlag.AlignRight),
+    ("liq", "寮哄钩浠?, 92, Qt.AlignmentFlag.AlignRight),
+    ("mgn_ratio", "淇濊瘉閲戠巼", 88, Qt.AlignmentFlag.AlignRight),
+    ("imr", "鍒濆淇濊瘉閲?, 100, Qt.AlignmentFlag.AlignRight),
+    ("mmr", "缁存寔淇濊瘉閲?, 100, Qt.AlignmentFlag.AlignRight),
     ("delta", "Delta(PA)", 82, Qt.AlignmentFlag.AlignRight),
     ("gamma", "Gamma(PA)", 82, Qt.AlignmentFlag.AlignRight),
     ("vega", "Vega(PA)", 82, Qt.AlignmentFlag.AlignRight),
     ("theta", "Theta(PA)", 108, Qt.AlignmentFlag.AlignRight),
-    ("theta_usdt", "Theta≈USDT", 108, Qt.AlignmentFlag.AlignRight),
-    ("note", "备注", 200, Qt.AlignmentFlag.AlignLeft),
+    ("theta_usdt", "Theta鈮圲SDT", 108, Qt.AlignmentFlag.AlignRight),
+    ("note", "澶囨敞", 200, Qt.AlignmentFlag.AlignLeft),
 )
 
 DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
@@ -312,8 +216,7 @@ DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
     "note",
 )
 
-# Qt 账户持仓页默认可见列，作为软件生成的默认设置。
-DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
+# Qt 鎸佷粨棣栭〉榛樿鎸夊綋鍓嶄汉宸ユ牎鍑嗗悗鐨勫垪闆嗗拰鍒楀鍚姩锛涘悗缁敤鎴锋嫋鎷藉垪瀹?鍒楄缃粛浼氬啓鍏ユ湰鍦板亸濂借鐩栬繖閲屻€?DEFAULT_VISIBLE_COLUMNS = (
     "ask_price",
     "ask_usdt",
     "avg",
@@ -378,10 +281,10 @@ def _format_account_level_text(value: str | None) -> str:
     if not text:
         return "-"
     mapping = {
-        "1": "简单交易",
-        "2": "单币种保证金",
-        "3": "跨币种保证金",
-        "4": "组合保证金",
+        "1": "绠€鍗曚氦鏄?,
+        "2": "鍗曞竵绉嶄繚璇侀噾",
+        "3": "璺ㄥ竵绉嶄繚璇侀噾",
+        "4": "缁勫悎淇濊瘉閲?,
     }
     return mapping.get(text, text)
 
@@ -391,9 +294,9 @@ def _format_account_position_mode_text(value: str | None) -> str:
     if not text:
         return "-"
     if text == "net":
-        return "净持仓 net"
+        return "鍑€鎸佷粨 net"
     if text in {"long_short", "long/short", "long_short_mode"}:
-        return "双向持仓 long/short"
+        return "鍙屽悜鎸佷粨 long/short"
     return text
 
 
@@ -405,37 +308,37 @@ def _format_greeks_type_text(value: str | None) -> str:
 def _format_bool_text(value: bool | None) -> str:
     if value is None:
         return "-"
-    return "是" if value else "否"
+    return "鏄? if value else "鍚?
 
 ORDER_SOURCE_FILTER_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("全部来源", ""),
-    ("普通委托", "normal"),
-    ("算法委托", "algo"),
-    ("WS 当前", "ws"),
+    ("鍏ㄩ儴鏉ユ簮", ""),
+    ("鏅€氬鎵?, "normal"),
+    ("绠楁硶濮旀墭", "algo"),
+    ("WS 褰撳墠", "ws"),
 )
 
 ORDER_STATE_FILTER_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("全部状态", ""),
-    ("等待成交", "live"),
-    ("部分成交", "partially_filled"),
-    ("已成交", "filled"),
-    ("已撤单", "canceled"),
-    ("失败", "order_failed"),
+    ("鍏ㄩ儴鐘舵€?, ""),
+    ("绛夊緟涓?, "live"),
+    ("閮ㄥ垎鎴愪氦", "partially_filled"),
+    ("宸叉垚浜?, "filled"),
+    ("宸叉挙鍗?, "canceled"),
+    ("澶辫触", "order_failed"),
 )
 
 HISTORY_FILL_SIDE_FILTER_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("全部方向", ""),
-    ("买入", "buy"),
-    ("卖出", "sell"),
-    ("多头", "long"),
-    ("空头", "short"),
+    ("鍏ㄩ儴鏂瑰悜", ""),
+    ("涔板叆", "buy"),
+    ("鍗栧嚭", "sell"),
+    ("澶氬ご", "long"),
+    ("绌哄ご", "short"),
 )
 
 HISTORY_MARGIN_MODE_FILTER_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("全部模式", ""),
-    ("全仓", "cross"),
-    ("逐仓", "isolated"),
-    ("现金", "cash"),
+    ("鍏ㄩ儴妯″紡", ""),
+    ("鍏ㄤ粨", "cross"),
+    ("閫愪粨", "isolated"),
+    ("鐜伴噾", "cash"),
 )
 
 
@@ -455,10 +358,10 @@ def _history_expiry_filter_matches(inst_id: str, expiry_filter: str) -> bool:
 
 
 POSITION_KLINE_BAR_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("15分钟", "15m"),
-    ("1小时", "1H"),
-    ("4小时", "4H"),
-    ("1天", "1D"),
+    ("15鍒嗛挓", "15m"),
+    ("1灏忔椂", "1H"),
+    ("4灏忔椂", "4H"),
+    ("1澶?, "1D"),
 )
 
 
@@ -482,8 +385,8 @@ class NoteEditorDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("淇濆瓨")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("鍙栨秷")
         layout.addWidget(buttons)
 
     @property
@@ -495,65 +398,17 @@ class NoteEditorDialog(QDialog):
         self.accept()
 
 
-class QuantityInputDialog(QDialog):
-    def __init__(
-        self,
-        *,
-        title: str,
-        prompt: str,
-        initial_value: str,
-        unit_text: str,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        apply_qt_window_icon(self)
-        self._result_text: str | None = None
-        self.setWindowTitle(title)
-        self.resize(420, 140)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-
-        prompt_label = QLabel(prompt)
-        prompt_label.setWordWrap(True)
-        layout.addWidget(prompt_label)
-
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        self._edit = QLineEdit(initial_value)
-        self._edit.selectAll()
-        row.addWidget(self._edit, 1)
-        unit_label = QLabel(unit_text)
-        unit_label.setObjectName("Subtle")
-        row.addWidget(unit_label)
-        layout.addLayout(row)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self._accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    @property
-    def result_text(self) -> str | None:
-        return self._result_text
-
-    def _accept(self) -> None:
-        self._result_text = self._edit.text().strip()
-        self.accept()
-
-
 class AccountOverviewDialog(QDialog):
     def __init__(self, *, summary_text: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         apply_qt_window_icon(self)
-        self.setWindowTitle("账户信息")
+        self.setWindowTitle("璐︽埛淇℃伅")
         self.resize(920, 680)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
-        title = QLabel("账户持仓概览")
+        title = QLabel("璐︽埛鎸佷粨姒傝")
         title.setObjectName("SectionTitle")
         layout.addWidget(title)
 
@@ -564,7 +419,7 @@ class AccountOverviewDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
-        buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("鍏抽棴")
         layout.addWidget(buttons)
 
 
@@ -588,7 +443,7 @@ class InstrumentKlineLoadThread(QThread):
             else:
                 candles = client.get_candles_history(self._inst_id, self._bar, limit=self._limit)
             if not candles:
-                raise ValueError("当前周期没有可用 K 线数据。")
+                raise ValueError("褰撳墠鍛ㄦ湡娌℃湁鍙敤 K 绾挎暟鎹€?)
             self.loaded.emit(self._inst_id, self._inst_type, self._bar, source, candles)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(self._inst_id, self._inst_type, self._bar, str(exc))
@@ -606,7 +461,7 @@ class InstrumentKlineDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         apply_qt_window_icon(self)
-        self.setWindowTitle("合约 K 线图")
+        self.setWindowTitle("鍚堢害 K 绾垮浘")
         self.resize(max(int(initial_width), 480), max(int(initial_height), 320))
 
         self._inst_id = ""
@@ -622,9 +477,9 @@ class InstrumentKlineDialog(QDialog):
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        self._title_label = QLabel("等待选择持仓")
+        self._title_label = QLabel("绛夊緟閫夋嫨鎸佷粨")
         self._title_label.setObjectName("SectionTitle")
-        self._status_label = QLabel("点击持仓后自动加载对应 K 线。")
+        self._status_label = QLabel("鐐瑰嚮鎸佷粨鍚庤嚜鍔ㄥ姞杞藉搴?K 绾裤€?)
         self._status_label.setObjectName("Subtle")
         header.addWidget(self._title_label, 1)
         header.addWidget(self._status_label, 2)
@@ -632,7 +487,7 @@ class InstrumentKlineDialog(QDialog):
 
         bar_row = QHBoxLayout()
         bar_row.setSpacing(8)
-        bar_row.addWidget(QLabel("周期"))
+        bar_row.addWidget(QLabel("鍛ㄦ湡"))
         for text, bar in POSITION_KLINE_BAR_OPTIONS:
             button = QPushButton(text)
             button.setCheckable(True)
@@ -643,7 +498,7 @@ class InstrumentKlineDialog(QDialog):
         layout.addLayout(bar_row)
 
         self._chart = CandlestickChartView()
-        self._chart.show_message("请点击一条持仓加载 K 线")
+        self._chart.show_message("璇风偣鍑讳竴鏉℃寔浠撳姞杞?K 绾?)
         layout.addWidget(self._chart, 1)
         self._sync_bar_buttons()
 
@@ -685,9 +540,9 @@ class InstrumentKlineDialog(QDialog):
 
     def _update_title(self) -> None:
         if not self._inst_id:
-            self._title_label.setText("等待选择持仓")
+            self._title_label.setText("绛夊緟閫夋嫨鎸佷粨")
             return
-        source_label = "标记价格K线" if self._inst_type == "OPTION" else "成交价格K线"
+        source_label = "鏍囪浠锋牸K绾? if self._inst_type == "OPTION" else "鎴愪氦浠锋牸K绾?
         self._title_label.setText(f"{self._inst_id} | {source_label}")
 
     @Slot()
@@ -696,8 +551,8 @@ class InstrumentKlineDialog(QDialog):
             return
         if self._load_thread is not None and self._load_thread.isRunning():
             return
-        source_label = "标记价格" if self._inst_type == "OPTION" else "成交价格"
-        self._status_label.setText(f"正在加载 {self._inst_id} {self._current_bar} {source_label} K 线...")
+        source_label = "鏍囪浠锋牸" if self._inst_type == "OPTION" else "鎴愪氦浠锋牸"
+        self._status_label.setText(f"姝ｅ湪鍔犺浇 {self._inst_id} {self._current_bar} {source_label} K 绾?..")
         self._load_thread = InstrumentKlineLoadThread(
             inst_id=self._inst_id,
             inst_type=self._inst_type,
@@ -721,22 +576,22 @@ class InstrumentKlineDialog(QDialog):
             return
         if not isinstance(candles, list):
             return
-        source_label = "标记价格" if source == "mark" else "成交价格"
-        self._chart.set_candles(title=f"{inst_id} {source_label}K线 | {bar}", candles=candles)
+        source_label = "鏍囪浠锋牸" if source == "mark" else "鎴愪氦浠锋牸"
+        self._chart.set_candles(title=f"{inst_id} {source_label}K绾?| {bar}", candles=candles)
         latest = candles[-1] if candles else None
         latest_text = ""
         latest_time_text = ""
         if isinstance(latest, Candle):
-            latest_text = f" | 最新价 {latest.close}"
-            latest_time_text = f" | 时间 {datetime.fromtimestamp(latest.ts / 1000).strftime('%Y-%m-%d %H:%M:%S')}"
-        self._status_label.setText(f"{inst_id} | {bar} | {source_label} K 线已加载{latest_text}{latest_time_text}")
+            latest_text = f" | 鏈€鏂?{latest.close}"
+            latest_time_text = f" | 鏃堕棿 {datetime.fromtimestamp(latest.ts / 1000).strftime('%Y-%m-%d %H:%M:%S')}"
+        self._status_label.setText(f"{inst_id} | {bar} | {source_label} K 绾垮凡鍔犺浇{latest_text}{latest_time_text}")
 
     @Slot(str, str, str, str)
     def _apply_load_error(self, inst_id: str, inst_type: str, bar: str, message: str) -> None:
         if inst_id != self._inst_id or inst_type != self._inst_type or bar != self._current_bar:
             return
-        self._chart.show_message(f"{inst_id} K 线加载失败")
-        self._status_label.setText(f"K 线加载失败：{message}")
+        self._chart.show_message(f"{inst_id} K 绾垮姞杞藉け璐?)
+        self._status_label.setText(f"K 绾垮姞杞藉け璐ワ細{message}")
 
     @Slot()
     def _clear_finished_thread(self) -> None:
@@ -764,13 +619,13 @@ class ColumnSettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         apply_qt_window_icon(self)
-        self.setWindowTitle("持仓大窗列设置")
+        self.setWindowTitle("鎸佷粨澶х獥鍒楄缃?)
         self.resize(560, 520)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
-        tip = QLabel("可按区域勾选显示/隐藏列。`合约 / 分组` 为结构列，当前固定显示。")
+        tip = QLabel("鍙寜鍖哄煙鍕鹃€夋樉绀?闅愯棌鍒椼€俙鍚堢害 / 鍒嗙粍` 涓虹粨鏋勫垪锛屽綋鍓嶅浐瀹氭樉绀恒€?)
         tip.setObjectName("Subtle")
         tip.setWordWrap(True)
         layout.addWidget(tip)
@@ -789,7 +644,7 @@ class ColumnSettingsDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
-        buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("鍏抽棴")
         layout.addWidget(buttons)
 
 
@@ -842,7 +697,7 @@ class LegacyOptionToolsHost:
     ) -> None:
         root = self._ensure_root()
         if root is None:
-            raise RuntimeError("Tk 桥接窗口初始化失败。")
+            raise RuntimeError("Tk 妗ユ帴绐楀彛鍒濆鍖栧け璐ャ€?)
         quote = _build_option_quote(instrument, ticker)
 
         def _send_to_strategy(payload: object) -> None:
@@ -922,9 +777,8 @@ class PositionProtectionDialog(QDialog):
         self._form_position_key = ""
         self._session_ids: list[str] = []
         self._last_fixed_price_memory = {"tp": "", "sl": ""}
-        self._last_abnormal_protection_alert: dict[str, str] = {}
 
-        self.setWindowTitle("设置期权保护")
+        self.setWindowTitle("璁剧疆鏈熸潈淇濇姢")
         self.resize(1080, 760)
 
         self._build_ui()
@@ -947,10 +801,10 @@ class PositionProtectionDialog(QDialog):
         top_layout.setContentsMargins(12, 12, 12, 12)
         top_layout.setSpacing(10)
 
-        self._title_label = QLabel("请先在当前持仓里选中一条期权仓位。")
+        self._title_label = QLabel("璇峰厛鍦ㄥ綋鍓嶆寔浠撻噷閫変腑涓€鏉℃湡鏉冧粨浣嶃€?)
         self._title_label.setObjectName("SectionTitle")
         self._title_label.setWordWrap(True)
-        self._logic_hint = QLabel("保护逻辑会跟随上方选中的期权仓位。")
+        self._logic_hint = QLabel("淇濇姢閫昏緫浼氳窡闅忎笂鏂归€変腑鐨勬湡鏉冧粨浣嶃€?)
         self._logic_hint.setObjectName("Subtle")
         self._logic_hint.setWordWrap(True)
         top_layout.addWidget(self._title_label)
@@ -981,38 +835,38 @@ class PositionProtectionDialog(QDialog):
         self._sl_slippage_edit = QLineEdit("0")
         self._poll_seconds_edit = QLineEdit("2")
 
-        form.addWidget(QLabel("触发条件"), 0, 0)
+        form.addWidget(QLabel("瑙﹀彂鏉′欢"), 0, 0)
         form.addWidget(self._trigger_combo, 0, 1)
-        form.addWidget(QLabel("现货标的"), 0, 2)
+        form.addWidget(QLabel("鐜拌揣鏍囩殑"), 0, 2)
         form.addWidget(self._spot_symbol_edit, 0, 3)
-        form.addWidget(QLabel("止盈触发价"), 1, 0)
+        form.addWidget(QLabel("姝㈢泩瑙﹀彂浠?), 1, 0)
         form.addWidget(self._tp_trigger_edit, 1, 1)
-        form.addWidget(QLabel("止损触发价"), 1, 2)
+        form.addWidget(QLabel("姝㈡崯瑙﹀彂浠?), 1, 2)
         form.addWidget(self._sl_trigger_edit, 1, 3)
-        form.addWidget(QLabel("止盈报单方式"), 2, 0)
+        form.addWidget(QLabel("姝㈢泩鎶ュ崟鏂瑰紡"), 2, 0)
         form.addWidget(self._tp_mode_combo, 2, 1)
-        form.addWidget(QLabel("止盈报单价格"), 2, 2)
+        form.addWidget(QLabel("姝㈢泩鎶ュ崟浠锋牸"), 2, 2)
         form.addWidget(self._tp_price_edit, 2, 3)
-        form.addWidget(QLabel("止盈滑点"), 3, 0)
+        form.addWidget(QLabel("姝㈢泩婊戠偣"), 3, 0)
         form.addWidget(self._tp_slippage_edit, 3, 1)
-        form.addWidget(QLabel("轮询秒数"), 3, 2)
+        form.addWidget(QLabel("杞绉掓暟"), 3, 2)
         form.addWidget(self._poll_seconds_edit, 3, 3)
-        form.addWidget(QLabel("止损报单方式"), 4, 0)
+        form.addWidget(QLabel("姝㈡崯鎶ュ崟鏂瑰紡"), 4, 0)
         form.addWidget(self._sl_mode_combo, 4, 1)
-        form.addWidget(QLabel("止损报单价格"), 4, 2)
+        form.addWidget(QLabel("姝㈡崯鎶ュ崟浠锋牸"), 4, 2)
         form.addWidget(self._sl_price_edit, 4, 3)
-        form.addWidget(QLabel("止损滑点"), 5, 0)
+        form.addWidget(QLabel("姝㈡崯婊戠偣"), 5, 0)
         form.addWidget(self._sl_slippage_edit, 5, 1)
         top_layout.addLayout(form)
 
         action_row = QHBoxLayout()
-        start_button = QPushButton("启动保护")
+        start_button = QPushButton("鍚姩淇濇姢")
         start_button.clicked.connect(self._start_selected_position_protection)
-        stop_button = QPushButton("停止选中任务")
+        stop_button = QPushButton("鍋滄閫変腑浠诲姟")
         stop_button.clicked.connect(self._stop_selected_position_protection)
-        clear_button = QPushButton("清除已结束")
+        clear_button = QPushButton("娓呴櫎宸茬粨鏉?)
         clear_button.clicked.connect(self._clear_finished_position_protections)
-        close_button = QPushButton("关闭")
+        close_button = QPushButton("鍏抽棴")
         close_button.clicked.connect(self.close)
         action_row.addWidget(start_button)
         action_row.addWidget(stop_button)
@@ -1029,11 +883,11 @@ class PositionProtectionDialog(QDialog):
         sessions_layout = QVBoxLayout(sessions_panel)
         sessions_layout.setContentsMargins(10, 10, 10, 10)
         sessions_layout.setSpacing(8)
-        self._session_status_label = QLabel("当前没有运行中的期权保护任务。")
+        self._session_status_label = QLabel("褰撳墠娌℃湁杩愯涓殑鏈熸潈淇濇姢浠诲姟銆?)
         self._session_status_label.setObjectName("Subtle")
         sessions_layout.addWidget(self._session_status_label)
         self._sessions_table = QTableWidget(0, 6)
-        self._sessions_table.setHorizontalHeaderLabels(("API", "期权合约", "触发条件", "方向", "状态", "启动时间"))
+        self._sessions_table.setHorizontalHeaderLabels(("API", "鏈熸潈鍚堢害", "瑙﹀彂鏉′欢", "鏂瑰悜", "鐘舵€?, "鍚姩鏃堕棿"))
         self._sessions_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._sessions_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._sessions_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1054,7 +908,7 @@ class PositionProtectionDialog(QDialog):
         detail_layout = QVBoxLayout(detail_panel)
         detail_layout.setContentsMargins(10, 10, 10, 10)
         detail_layout.setSpacing(8)
-        detail_title = QLabel("任务详情")
+        detail_title = QLabel("浠诲姟璇︽儏")
         detail_title.setObjectName("SectionTitle")
         self._detail_text = QTextEdit()
         self._detail_text.setReadOnly(True)
@@ -1083,8 +937,8 @@ class PositionProtectionDialog(QDialog):
     def _refresh_from_selection(self, *, force: bool) -> None:
         position = self._selected_option_provider()
         if position is None and self._selected_position is None:
-            self._title_label.setText("请先在当前持仓里选中一条期权仓位。")
-            self._logic_hint.setText("保护逻辑会跟随上方选中的期权仓位。")
+            self._title_label.setText("璇峰厛鍦ㄥ綋鍓嶆寔浠撻噷閫変腑涓€鏉℃湡鏉冧粨浣嶃€?)
+            self._logic_hint.setText("淇濇姢閫昏緫浼氳窡闅忎笂鏂归€変腑鐨勬湡鏉冧粨浣嶃€?)
             return
         if position is None:
             position = self._selected_position
@@ -1094,7 +948,7 @@ class PositionProtectionDialog(QDialog):
         position_key = _position_tree_row_id(position)
         direction = derive_position_direction(position)
         self._title_label.setText(
-            f"当前选中：{position.inst_id} | 方向={direction.upper()} | 持仓={_format_optional_decimal(position.position)} | 开仓均价={_format_optional_decimal(position.avg_price)}"
+            f"褰撳墠閫変腑锛歿position.inst_id} | 鏂瑰悜={direction.upper()} | 鎸佷粨閲?{_format_optional_decimal(position.position)} | 寮€浠撳潎浠?{_format_optional_decimal(position.avg_price)}"
         )
         if force or position_key != self._form_position_key:
             self._form_position_key = position_key
@@ -1117,7 +971,7 @@ class PositionProtectionDialog(QDialog):
         trigger_source = PROTECTION_TRIGGER_SOURCE_OPTIONS.get(self._trigger_combo.currentText(), "option_mark")
         self._spot_symbol_edit.setEnabled(trigger_source == "spot_last")
         if position is None:
-            self._logic_hint.setText("保护逻辑会跟随上方选中的期权仓位。")
+            self._logic_hint.setText("淇濇姢閫昏緫浼氳窡闅忎笂鏂归€変腑鐨勬湡鏉冧粨浣嶃€?)
             return
         if trigger_source == "option_mark":
             trigger_inst_id = position.inst_id
@@ -1157,10 +1011,10 @@ class PositionProtectionDialog(QDialog):
         runtime = self._runtime_provider()
         position = self._current_position()
         if runtime is None:
-            QMessageBox.warning(self, "启动失败", "当前没有可用的 API 运行时。")
+            QMessageBox.warning(self, "鍚姩澶辫触", "褰撳墠娌℃湁鍙敤鐨?API 杩愯鏃躲€?)
             return
         if position is None or position.inst_type != "OPTION":
-            QMessageBox.information(self, "提示", "请先在当前持仓中选中一条期权仓位。")
+            QMessageBox.information(self, "鎻愮ず", "璇峰厛鍦ㄥ綋鍓嶆寔浠撲腑閫変腑涓€鏉℃湡鏉冧粨浣嶃€?)
             return
         try:
             protection = self._build_selected_position_protection(position)
@@ -1169,45 +1023,45 @@ class PositionProtectionDialog(QDialog):
             self._manager.start(runtime.credentials, config, protection)
             self._refresh_sessions()
         except Exception as exc:
-            QMessageBox.critical(self, "启动保护失败", str(exc))
+            QMessageBox.critical(self, "鍚姩淇濇姢澶辫触", str(exc))
 
     def _stop_selected_position_protection(self) -> None:
         session_id = self._selected_session_id()
         if not session_id:
-            QMessageBox.information(self, "提示", "请先在下方任务列表里选中一条保护任务。")
+            QMessageBox.information(self, "鎻愮ず", "璇峰厛鍦ㄤ笅鏂逛换鍔″垪琛ㄩ噷閫変腑涓€鏉′繚鎶や换鍔°€?)
             return
         try:
             self._manager.stop(session_id)
             self._refresh_sessions()
         except Exception as exc:
-            QMessageBox.critical(self, "停止失败", str(exc))
+            QMessageBox.critical(self, "鍋滄澶辫触", str(exc))
 
     def _clear_finished_position_protections(self) -> None:
         cleared = self._manager.clear_finished()
         self._refresh_sessions()
         if cleared <= 0:
-            QMessageBox.information(self, "提示", "当前没有可清理的已结束任务。")
+            QMessageBox.information(self, "鎻愮ず", "褰撳墠娌℃湁鍙竻鐞嗙殑宸茬粨鏉熶换鍔°€?)
 
     def _build_selected_position_protection(self, position: OkxPosition) -> OptionProtectionConfig:
         trigger_source = PROTECTION_TRIGGER_SOURCE_OPTIONS[self._trigger_combo.currentText()]
         if trigger_source == "option_mark":
             trigger_inst_id = position.inst_id
             trigger_price_type = "mark"
-            trigger_label = f"{position.inst_id} 标记价"
+            trigger_label = f"{position.inst_id} 鏍囪浠?
         else:
             trigger_inst_id = normalize_spot_inst_id(self._spot_symbol_edit.text())
             if not trigger_inst_id:
-                raise ValueError("现货触发模式下，请填写现货标的，例如 BTC-USDT。")
+                raise ValueError("鐜拌揣瑙﹀彂妯″紡涓嬶紝璇峰～鍐欑幇璐ф爣鐨勶紝渚嬪 BTC-USDT銆?)
             trigger_instrument = self._client.get_instrument(trigger_inst_id)
             if str(trigger_instrument.inst_type or "").upper() != "SPOT":
-                raise ValueError("现货触发模式下，标的必须是现货交易对，例如 BTC-USDT。")
+                raise ValueError("鐜拌揣瑙﹀彂妯″紡涓嬶紝鏍囩殑蹇呴』鏄幇璐т氦鏄撳锛屼緥濡?BTC-USDT銆?)
             trigger_price_type = "last"
-            trigger_label = f"{trigger_inst_id} 最新价"
+            trigger_label = f"{trigger_inst_id} 鏈€鏂颁环"
 
-        take_profit_trigger = self._parse_optional_positive_decimal(self._tp_trigger_edit.text(), "止盈触发价")
-        stop_loss_trigger = self._parse_optional_positive_decimal(self._sl_trigger_edit.text(), "止损触发价")
+        take_profit_trigger = self._parse_optional_positive_decimal(self._tp_trigger_edit.text(), "姝㈢泩瑙﹀彂浠?)
+        stop_loss_trigger = self._parse_optional_positive_decimal(self._sl_trigger_edit.text(), "姝㈡崯瑙﹀彂浠?)
         if take_profit_trigger is None and stop_loss_trigger is None:
-            raise ValueError("止盈触发价和止损触发价至少要填写一个。")
+            raise ValueError("姝㈢泩瑙﹀彂浠峰拰姝㈡崯瑙﹀彂浠疯嚦灏戣濉啓涓€涓€?)
 
         direction = derive_position_direction(position)
         _validate_protection_price_relationship(
@@ -1221,8 +1075,8 @@ class PositionProtectionDialog(QDialog):
 
         take_profit_order_mode = PROTECTION_ORDER_MODE_OPTIONS[self._tp_mode_combo.currentText()]
         stop_loss_order_mode = PROTECTION_ORDER_MODE_OPTIONS[self._sl_mode_combo.currentText()]
-        take_profit_order_price = self._parse_positive_decimal(self._tp_price_edit.text(), "止盈报单价格") if take_profit_order_mode == "fixed_price" else None
-        stop_loss_order_price = self._parse_positive_decimal(self._sl_price_edit.text(), "止损报单价格") if stop_loss_order_mode == "fixed_price" else None
+        take_profit_order_price = self._parse_positive_decimal(self._tp_price_edit.text(), "姝㈢泩鎶ュ崟浠锋牸") if take_profit_order_mode == "fixed_price" else None
+        stop_loss_order_price = self._parse_positive_decimal(self._sl_price_edit.text(), "姝㈡崯鎶ュ崟浠锋牸") if stop_loss_order_mode == "fixed_price" else None
         return OptionProtectionConfig(
             option_inst_id=position.inst_id,
             trigger_inst_id=trigger_inst_id,
@@ -1233,11 +1087,11 @@ class PositionProtectionDialog(QDialog):
             stop_loss_trigger=stop_loss_trigger,
             take_profit_order_mode=take_profit_order_mode,
             take_profit_order_price=take_profit_order_price,
-            take_profit_slippage=self._parse_nonnegative_decimal(self._tp_slippage_edit.text(), "止盈滑点"),
+            take_profit_slippage=self._parse_nonnegative_decimal(self._tp_slippage_edit.text(), "姝㈢泩婊戠偣"),
             stop_loss_order_mode=stop_loss_order_mode,
             stop_loss_order_price=stop_loss_order_price,
-            stop_loss_slippage=self._parse_nonnegative_decimal(self._sl_slippage_edit.text(), "止损滑点"),
-            poll_seconds=float(self._parse_positive_decimal(self._poll_seconds_edit.text(), "轮询秒数")),
+            stop_loss_slippage=self._parse_nonnegative_decimal(self._sl_slippage_edit.text(), "姝㈡崯婊戠偣"),
+            poll_seconds=float(self._parse_positive_decimal(self._poll_seconds_edit.text(), "杞绉掓暟")),
             trigger_label=trigger_label,
         )
 
@@ -1276,7 +1130,7 @@ class PositionProtectionDialog(QDialog):
     def _refresh_sessions(self) -> None:
         sessions = self._manager.list_sessions()
         selected_before = self._selected_session_id()
-        self._session_status_label.setText(f"当前保护任务：{len(sessions)}" if sessions else "当前没有运行中的期权保护任务。")
+        self._session_status_label.setText(f"褰撳墠淇濇姢浠诲姟锛歿len(sessions)}" if sessions else "褰撳墠娌℃湁杩愯涓殑鏈熸潈淇濇姢浠诲姟銆?)
         self._sessions_table.setRowCount(len(sessions))
         self._session_ids = [item.session_id for item in sessions]
         for row, item in enumerate(sessions):
@@ -1301,7 +1155,7 @@ class PositionProtectionDialog(QDialog):
         if target_row >= 0:
             self._sessions_table.selectRow(target_row)
         else:
-            self._detail_text.setPlainText("请选择一条保护任务查看详情。")
+            self._detail_text.setPlainText("璇烽€夋嫨涓€鏉′繚鎶や换鍔℃煡鐪嬭鎯呫€?)
         self._refresh_selected_session_detail()
 
     def _refresh_selected_session_detail(self) -> None:
@@ -1309,79 +1163,32 @@ class PositionProtectionDialog(QDialog):
         sessions = {item.session_id: item for item in self._manager.list_sessions()}
         session = sessions.get(session_id)
         if session is None:
-            self._detail_text.setPlainText("请选择一条保护任务查看详情。")
-            return
-
-        status = str(session.status)
-        last_message = (session.last_message or "").strip()
-        detail_lines = [
-            f"任务：{session.session_id}",
-            f"API配置：{session.api_name or '-'}",
-            f"期权合约：{session.option_inst_id}",
-            f"触发条件：{session.trigger_label}",
-            f"触发标的：{session.trigger_inst_id}",
-            f"触发价格类型：{_format_protection_trigger_price_type(session.trigger_price_type)}",
-            f"方向：{session.direction}",
-            f"持仓方向：{session.pos_side or '-'}",
-            f"止盈触发：{_format_optional_decimal(session.take_profit_trigger)}",
-            f"止盈报单方式：{_format_protection_order_mode_label(session.take_profit_order_mode)}",
-            f"止盈报单价格：{_format_protection_order_price_detail(session.take_profit_order_mode, session.take_profit_order_price)}",
-            f"止盈滑点：{_format_optional_decimal(session.take_profit_slippage)}",
-            f"止损触发：{_format_optional_decimal(session.stop_loss_trigger)}",
-            f"止损报单方式：{_format_protection_order_mode_label(session.stop_loss_order_mode)}",
-            f"止损报单价格：{_format_protection_order_price_detail(session.stop_loss_order_mode, session.stop_loss_order_price)}",
-            f"止损滑点：{_format_optional_decimal(session.stop_loss_slippage)}",
-            f"轮询秒数：{session.poll_seconds:g}",
-            f"状态：{status}",
-            f"启动时间：{session.started_at.strftime('%Y-%m-%d %H:%M:%S')}",
-        ]
-        if last_message:
-            if status == "异常":
-                detail_lines.extend(["", f"异常原因：{last_message}"])
-                previous_message = self._last_abnormal_protection_alert.get(session.session_id, "")
-                if previous_message != last_message:
-                    QMessageBox.warning(
-                        self,
-                        "期权保护异常",
-                        f"保护任务 {session.session_id} 进入异常状态，请关注。\n\n{last_message}",
-                    )
-                    self._last_abnormal_protection_alert[session.session_id] = last_message
-            else:
-                detail_lines.extend(["", f"最新状态：{last_message}"])
-                self._last_abnormal_protection_alert.pop(session.session_id, None)
-        self._detail_text.setPlainText("\n".join(detail_lines))
-
-    def _refresh_selected_session_detail_legacy(self) -> None:
-        session_id = self._selected_session_id()
-        sessions = {item.session_id: item for item in self._manager.list_sessions()}
-        session = sessions.get(session_id)
-        if session is None:
-            self._detail_text.setPlainText("请选择一条保护任务查看详情。")
+            self._detail_text.setPlainText("璇烽€夋嫨涓€鏉′繚鎶や换鍔℃煡鐪嬭鎯呫€?)
             return
         self._detail_text.setPlainText(
             "\n".join(
                 [
-                    f"任务：{session.session_id}",
-                    f"API配置：{session.api_name or '-'}",
-                    f"期权合约：{session.option_inst_id}",
-                    f"触发条件：{session.trigger_label}",
-                    f"触发标的：{session.trigger_inst_id}",
-                    f"触发价格类型：{_format_protection_trigger_price_type(session.trigger_price_type)}",
-                    f"方向：{session.direction}",
-                    f"持仓方向：{session.pos_side or '-'}",
-                    f"止盈触发：{_format_optional_decimal(session.take_profit_trigger)}",
-                    f"止盈报单方式：{_format_protection_order_mode_label(session.take_profit_order_mode)}",
-                    f"止盈报单价格：{_format_protection_order_price_detail(session.take_profit_order_mode, session.take_profit_order_price)}",
-                    f"止盈滑点：{_format_optional_decimal(session.take_profit_slippage)}",
-                    f"止损触发：{_format_optional_decimal(session.stop_loss_trigger)}",
-                    f"止损报单方式：{_format_protection_order_mode_label(session.stop_loss_order_mode)}",
-                    f"止损报单价格：{_format_protection_order_price_detail(session.stop_loss_order_mode, session.stop_loss_order_price)}",
-                    f"止损滑点：{_format_optional_decimal(session.stop_loss_slippage)}",
-                    f"轮询秒数：{session.poll_seconds:g}",
-                    f"状态：{session.status}",
-                    f"启动时间：{session.started_at.strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"浠诲姟锛歿session.session_id}",
+                    f"API閰嶇疆锛歿session.api_name or '-'}",
+                    f"鏈熸潈鍚堢害锛歿session.option_inst_id}",
+                    f"瑙﹀彂鏉′欢锛歿session.trigger_label}",
+                    f"瑙﹀彂鏍囩殑锛歿session.trigger_inst_id}",
+                    f"瑙﹀彂浠锋牸绫诲瀷锛歿_format_protection_trigger_price_type(session.trigger_price_type)}",
+                    f"鏂瑰悜锛歿session.direction}",
+                    f"鎸佷粨鏂瑰悜锛歿session.pos_side or '-'}",
+                    f"姝㈢泩瑙﹀彂锛歿_format_optional_decimal(session.take_profit_trigger)}",
+                    f"姝㈢泩鎶ュ崟鏂瑰紡锛歿_format_protection_order_mode_label(session.take_profit_order_mode)}",
+                    f"姝㈢泩鎶ュ崟浠锋牸锛歿_format_protection_order_price_detail(session.take_profit_order_mode, session.take_profit_order_price)}",
+                    f"姝㈢泩婊戠偣锛歿_format_optional_decimal(session.take_profit_slippage)}",
+                    f"姝㈡崯瑙﹀彂锛歿_format_optional_decimal(session.stop_loss_trigger)}",
+                    f"姝㈡崯鎶ュ崟鏂瑰紡锛歿_format_protection_order_mode_label(session.stop_loss_order_mode)}",
+                    f"姝㈡崯鎶ュ崟浠锋牸锛歿_format_protection_order_price_detail(session.stop_loss_order_mode, session.stop_loss_order_price)}",
+                    f"姝㈡崯婊戠偣锛歿_format_optional_decimal(session.stop_loss_slippage)}",
+                    f"杞绉掓暟锛歿session.poll_seconds:g}",
+                    f"鐘舵€侊細{session.status}",
+                    f"鍚姩鏃堕棿锛歿session.started_at.strftime('%Y-%m-%d %H:%M:%S')}",
                     "",
-                    f"最新状态：{session.last_message}",
+                    f"鏈€鏂扮姸鎬侊細{session.last_message}",
                 ]
             )
         )
@@ -1390,9 +1197,9 @@ class PositionProtectionDialog(QDialog):
         try:
             value = Decimal(raw.strip())
         except Exception as exc:
-            raise ValueError(f"{field_name} 不是有效数字") from exc
+            raise ValueError(f"{field_name} 涓嶆槸鏈夋晥鏁板瓧") from exc
         if value <= 0:
-            raise ValueError(f"{field_name} 必须大于 0")
+            raise ValueError(f"{field_name} 蹇呴』澶т簬 0")
         return value
 
     def _parse_optional_positive_decimal(self, raw: str, field_name: str) -> Decimal | None:
@@ -1408,16 +1215,13 @@ class PositionProtectionDialog(QDialog):
         try:
             value = Decimal(cleaned)
         except Exception as exc:
-            raise ValueError(f"{field_name} 不是有效数字") from exc
+            raise ValueError(f"{field_name} 涓嶆槸鏈夋晥鏁板瓧") from exc
         if value < 0:
-            raise ValueError(f"{field_name} 不能小于 0")
+            raise ValueError(f"{field_name} 涓嶈兘灏忎簬 0")
         return value
 
 
 class AccountPositionsHomeWidget(QWidget):
-    _ui_callback = Signal(object)
-    _selected_position_manual_flatten_callback = Signal(object)
-
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._runtime = load_runtime("159") or load_runtime()
@@ -1426,14 +1230,11 @@ class AccountPositionsHomeWidget(QWidget):
         self._last_profile_name = self._runtime.credential_profile_name if self._runtime is not None else ""
         self._profile_switch_guard = False
         self._profile_change_serial = 0
-        self._profile_change_ready = False
-        self._profile_unlock_dialog: QDialog | None = None
         self._account_feed: AccountFeedThread | None = None
         self._order_feed: OrderFeedThread | None = None
         self._order_history_feed: OrderHistoryFeedThread | None = None
         self._fill_history_feed: FillHistoryFeedThread | None = None
         self._position_history_feed: PositionHistoryFeedThread | None = None
-        self._retired_threads: list[QThread] = []
 
         self._raw_positions: list[OkxPosition] = []
         self._visible_positions: list[OkxPosition] = []
@@ -1464,15 +1265,12 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_fetch_limit = 300
         self._position_history_last_sync_text = "-"
         self._position_history_filter_resetting = False
-        self._current_order_canceling = False
         self._selected_position_manual_flatten_running = False
         self._shared_client = OkxRestClient()
         self._protection_manager = PositionProtectionManager(self._shared_client, lambda _message: None)
         self._protection_dialog: PositionProtectionDialog | None = None
         self._legacy_option_tools = LegacyOptionToolsHost(parent=self, runtime_provider=lambda: self._runtime)
         self._instrument_kline_dialog: InstrumentKlineDialog | None = None
-        self._ui_callback.connect(self._run_ui_callback)
-        self._selected_position_manual_flatten_callback.connect(self._run_selected_position_manual_flatten_callback)
 
         self._current_notes: dict[str, dict[str, object]] = {}
         self._history_notes: dict[str, dict[str, object]] = {}
@@ -1494,84 +1292,43 @@ class AccountPositionsHomeWidget(QWidget):
             self._last_profile_name and profile_requires_password(self._last_profile_name, self._profile_snapshots)
         )
         if locked_on_start:
-            self._account_status.setText(f"API {self._last_profile_name} 未解锁")
-            self._order_status.setText("订单 WS 等待 API 解锁")
-            self._summary_label.setText("当前 API 配置已加切换密码，请先解锁后再加载账户持仓。")
+            self._account_status.setText(f"API {self._last_profile_name} 鏈В閿?)
+            self._order_status.setText("璁㈠崟 WS 绛夊緟 API 瑙ｉ攣")
+            self._summary_label.setText("褰撳墠 API 閰嶇疆宸插姞鍒囨崲瀵嗙爜锛岃鍏堣В閿佸悗鍐嶅姞杞借处鎴锋寔浠撱€?)
         else:
             if self._last_profile_name:
                 self._unlocked_profiles.add(self._last_profile_name)
             self._start_private_threads()
-        self._profile_change_ready = True
-
-    def _retire_thread(self, thread: QThread) -> None:
-        try:
-            thread.disconnect()
-        except Exception:
-            pass
-        if thread in self._retired_threads:
-            return
-        self._retired_threads.append(thread)
-
-        def _cleanup() -> None:
-            if thread in self._retired_threads:
-                self._retired_threads.remove(thread)
-            thread.deleteLater()
-
-        thread.finished.connect(_cleanup)
-
-    def _flush_retired_threads(self, *, wait_ms: int = 2500, terminate_wait_ms: int = 1000) -> None:
-        pending = list(self._retired_threads)
-        for thread in pending:
-            try:
-                if thread.isRunning():
-                    thread.wait(wait_ms)
-                if thread.isRunning():
-                    thread.terminate()
-                    thread.wait(terminate_wait_ms)
-            except Exception:
-                pass
-            try:
-                if thread in self._retired_threads:
-                    self._retired_threads.remove(thread)
-            except Exception:
-                pass
-            try:
-                thread.deleteLater()
-            except Exception:
-                pass
 
     def _stop_position_history_thread(self) -> None:
         thread = self._position_history_feed
         if thread is None:
             return
         thread.stop()
-        self._position_history_feed = None
         if thread.isRunning() and not thread.wait(1600):
-            self._retire_thread(thread)
-            return
-        thread.deleteLater()
+            thread.terminate()
+            thread.wait(1600)
+        self._position_history_feed = None
 
     def _stop_order_history_thread(self) -> None:
         thread = self._order_history_feed
         if thread is None:
             return
         thread.stop()
-        self._order_history_feed = None
         if thread.isRunning() and not thread.wait(1600):
-            self._retire_thread(thread)
-            return
-        thread.deleteLater()
+            thread.terminate()
+            thread.wait(1600)
+        self._order_history_feed = None
 
     def _stop_fill_history_thread(self) -> None:
         thread = self._fill_history_feed
         if thread is None:
             return
         thread.stop()
-        self._fill_history_feed = None
         if thread.isRunning() and not thread.wait(1600):
-            self._retire_thread(thread)
-            return
-        thread.deleteLater()
+            thread.terminate()
+            thread.wait(1600)
+        self._fill_history_feed = None
 
     def _start_order_history_refresh(self, *, force_restart: bool = False) -> None:
         if self._runtime is None:
@@ -1585,7 +1342,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._order_history_feed.status_changed.connect(self._set_order_history_status)
         self._order_history_feed.finished.connect(self._clear_order_history_thread)
         if hasattr(self, "_order_history_summary_label"):
-            self._order_history_summary_label.setText("正在同步历史委托...")
+            self._order_history_summary_label.setText("姝ｅ湪鍚屾鍘嗗彶濮旀墭...")
         self._order_history_feed.start()
 
     def _start_fill_history_refresh(self, *, force_restart: bool = False) -> None:
@@ -1600,7 +1357,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._fill_history_feed.status_changed.connect(self._set_fill_history_status)
         self._fill_history_feed.finished.connect(self._clear_fill_history_thread)
         if hasattr(self, "_fill_history_summary_label"):
-            self._fill_history_summary_label.setText("正在同步历史成交...")
+            self._fill_history_summary_label.setText("姝ｅ湪鍚屾鍘嗗彶鎴愪氦...")
         self._fill_history_feed.start()
 
     def _start_position_history_refresh(self, *, force_restart: bool = False) -> None:
@@ -1614,7 +1371,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_feed.data_ready.connect(self._apply_position_history_payload)
         self._position_history_feed.status_changed.connect(self._set_position_history_status)
         self._position_history_feed.finished.connect(self._clear_position_history_thread)
-        self._position_history_summary_label.setText("正在同步历史仓位...")
+        self._position_history_summary_label.setText("姝ｅ湪鍚屾鍘嗗彶浠撲綅...")
         self._position_history_feed.start()
 
     @Slot()
@@ -1683,9 +1440,9 @@ class AccountPositionsHomeWidget(QWidget):
             self._last_profile_name and profile_requires_password(self._last_profile_name, self._profile_snapshots)
         )
         if locked_on_start:
-            self._account_status.setText(f"API {self._last_profile_name} 未解锁")
-            self._order_status.setText("委托 WS 等待 API 解锁")
-            self._summary_label.setText("当前 API 配置已加切换密码，请先解锁后再加载账户持仓。")
+            self._account_status.setText(f"API {self._last_profile_name} 鏈В閿?)
+            self._order_status.setText("濮旀墭 WS 绛夊緟 API 瑙ｉ攣")
+            self._summary_label.setText("褰撳墠 API 閰嶇疆宸插姞鍒囨崲瀵嗙爜锛岃鍏堣В閿佸悗鍐嶅姞杞借处鎴锋寔浠撱€?)
         else:
             if self._last_profile_name:
                 self._unlocked_profiles.add(self._last_profile_name)
@@ -1701,18 +1458,17 @@ class AccountPositionsHomeWidget(QWidget):
         if self._protection_dialog is not None:
             self._protection_dialog.close()
         self._legacy_option_tools.shutdown()
-        self._flush_retired_threads()
 
     def refresh_view(self) -> None:
         if not self._ensure_runtime_ready(force_unlock=True):
             return
-        self._status_badge.setText("正在刷新...")
+        self._status_badge.setText("姝ｅ湪鍒锋柊...")
         self._start_private_threads(force_restart=True)
 
     def refresh_view(self) -> None:
         if not self._ensure_runtime_ready(force_unlock=True):
             return
-        self._status_badge.setText("正在刷新...")
+        self._status_badge.setText("姝ｅ湪鍒锋柊...")
         self._start_private_threads(force_restart=True)
 
     @Slot(object)
@@ -1741,8 +1497,8 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_summary_label.setText(
             "\n".join(
                 (
-                    f"历史仓位: {len(self._position_history_items)} 条 | 最近同步: {self._position_history_last_sync_text} | 当前显示: {len(filtered)}/{len(self._position_history_items)}",
-                    f"筛选统计: {stats_text}",
+                    f"鍘嗗彶浠撲綅: {len(self._position_history_items)} 鏉?| 鏈€杩戝悓姝? {self._position_history_last_sync_text} | 褰撳墠鏄剧ず: {len(filtered)}/{len(self._position_history_items)}",
+                    f"绛涢€夌粺璁? {stats_text}",
                 )
             )
         )
@@ -1750,8 +1506,8 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_summary_label.setText(
             "\n".join(
                 (
-                    f"历史仓位: {len(self._position_history_items)} 条 | 最近同步: {self._position_history_last_sync_text} | 当前显示: {len(filtered)}/{len(self._position_history_items)}",
-                    f"筛选统计: {stats_text}",
+                    f"鍘嗗彶浠撲綅: {len(self._position_history_items)} 鏉?| 鏈€杩戝悓姝? {self._position_history_last_sync_text} | 褰撳墠鏄剧ず: {len(filtered)}/{len(self._position_history_items)}",
+                    f"绛涢€夌粺璁? {stats_text}",
                 )
             )
         )
@@ -1895,13 +1651,13 @@ class AccountPositionsHomeWidget(QWidget):
 
         top = QHBoxLayout()
         top.setSpacing(6)
-        self._status_badge = QLabel("正常")
+        self._status_badge = QLabel("姝ｅ父")
         self._status_badge.setObjectName("Badge")
-        self._account_status = QLabel("持仓读取中...")
+        self._account_status = QLabel("鎸佷粨璇诲彇涓?..")
         self._account_status.setObjectName("Subtle")
-        self._order_status = QLabel("订单WS等待中...")
+        self._order_status = QLabel("璁㈠崟WS绛夊緟涓?..")
         self._order_status.setObjectName("Subtle")
-        self._summary_label = QLabel("当前没有持仓")
+        self._summary_label = QLabel("褰撳墠娌℃湁鎸佷粨")
         self._summary_label.setObjectName("Subtle")
         self._summary_label.setWordWrap(False)
         top.addWidget(self._status_badge)
@@ -1909,7 +1665,7 @@ class AccountPositionsHomeWidget(QWidget):
         top.addWidget(self._order_status)
         top.addWidget(self._summary_label, 1)
         top.addStretch(1)
-        top.addWidget(QLabel("API配置"))
+        top.addWidget(QLabel("API閰嶇疆"))
         self._profile_combo = QComboBox()
         self._profile_combo.currentIndexChanged.connect(self._on_profile_changed)
         self._profile_combo.setMinimumWidth(120)
@@ -1922,17 +1678,17 @@ class AccountPositionsHomeWidget(QWidget):
         actions.setContentsMargins(5, 4, 5, 4)
         actions.setSpacing(4)
         for text, handler, button_attr in (
-            ("刷新", self.refresh_view, ""),
-            ("账户信息", self._show_account_overview, ""),
-            ("展开持仓详情", self._toggle_detail_panel, "_detail_toggle_button"),
-            ("折叠历史区域", self._toggle_history_panel, "_history_toggle_button"),
-            ("平仓选中", self.flatten_selected_position, ""),
-            ("编辑备注", self.edit_selected_position_note, ""),
-            ("从选中持仓接管", self._show_not_ready_action, ""),
-            ("停止接管", self._show_not_ready_action, ""),
-            ("设置期权保护", self._open_position_protection_dialog, ""),
-            ("展期建议", self._open_option_roll_window, ""),
-            ("列设置", self.open_positions_column_window, ""),
+            ("鍒锋柊", self.refresh_view, ""),
+            ("璐︽埛淇℃伅", self._show_account_overview, ""),
+            ("灞曞紑鎸佷粨璇︽儏", self._toggle_detail_panel, "_detail_toggle_button"),
+            ("鎶樺彔鍘嗗彶鍖哄煙", self._toggle_history_panel, "_history_toggle_button"),
+            ("骞充粨閫変腑", self.flatten_selected_position, ""),
+            ("缂栬緫澶囨敞", self.edit_selected_position_note, ""),
+            ("浠庨€変腑鎸佷粨鎺ョ", self._show_not_ready_action, ""),
+            ("鍋滄鎺ョ", self._show_not_ready_action, ""),
+            ("璁剧疆鏈熸潈淇濇姢", self._open_position_protection_dialog, ""),
+            ("灞曟湡寤鸿", self._open_option_roll_window, ""),
+            ("鍒楄缃?, self.open_positions_column_window, ""),
         ):
             button = QPushButton(text)
             button.clicked.connect(handler)
@@ -1957,27 +1713,27 @@ class AccountPositionsHomeWidget(QWidget):
         self._type_combo.currentIndexChanged.connect(self._apply_filters)
 
         self._keyword_edit = QLineEdit()
-        self._keyword_edit.setPlaceholderText("搜索合约 / 币种 / 到期日 / 模式")
+        self._keyword_edit.setPlaceholderText("鎼滅储鍚堢害 / 甯佺 / 澶囨敞 / 妯″紡")
         self._keyword_edit.textChanged.connect(self._apply_filters)
 
-        self._filter_hint = QLabel("选中期权后，可一键带入合约或到期前缀。")
+        self._filter_hint = QLabel("閫変腑鏈熸潈鍚庯紝鍙竴閿甫鍏ュ悎绾︽垨鍒版湡鍓嶇紑銆?)
         self._filter_hint.setObjectName("Subtle")
 
-        self._apply_contract_button = QPushButton("带入合约")
+        self._apply_contract_button = QPushButton("甯﹀叆鍚堢害")
         self._apply_contract_button.clicked.connect(self.apply_selected_option_to_position_search)
         self._apply_contract_button.setEnabled(False)
-        self._apply_expiry_button = QPushButton("带入到期前缀")
+        self._apply_expiry_button = QPushButton("甯﹀叆鍒版湡鍓嶇紑")
         self._apply_expiry_button.clicked.connect(self.apply_selected_option_expiry_prefix_to_position_search)
         self._apply_expiry_button.setEnabled(False)
 
-        apply_button = QPushButton("应用筛选")
+        apply_button = QPushButton("搴旂敤绛涢€?)
         apply_button.clicked.connect(self._apply_filters)
-        clear_button = QPushButton("清空筛选")
+        clear_button = QPushButton("娓呯┖绛涢€?)
         clear_button.clicked.connect(self._clear_filters)
 
-        layout.addWidget(QLabel("类型"), 0, 0)
+        layout.addWidget(QLabel("绫诲瀷"), 0, 0)
         layout.addWidget(self._type_combo, 0, 1)
-        layout.addWidget(QLabel("搜索"), 0, 2)
+        layout.addWidget(QLabel("鎼滅储"), 0, 2)
         layout.addWidget(self._keyword_edit, 0, 3, 1, 4)
         layout.addWidget(self._apply_contract_button, 0, 7)
         layout.addWidget(self._apply_expiry_button, 0, 8)
@@ -2009,13 +1765,13 @@ class AccountPositionsHomeWidget(QWidget):
         panel_layout.setSpacing(5)
 
         title_row = QHBoxLayout()
-        title = QLabel("当前持仓")
+        title = QLabel("褰撳墠鎸佷粨")
         title.setObjectName("SectionTitle")
-        self._positions_hint = QLabel("当前显示 0 条持仓 | 点击任一行查看详情。")
+        self._positions_hint = QLabel("褰撳墠鏄剧ず 0 鏉℃寔浠?| 鐐瑰嚮浠讳竴琛屾煡鐪嬭鎯呫€?)
         self._positions_hint.setObjectName("Subtle")
         title_row.addWidget(title)
         title_row.addStretch(1)
-        self._expand_toggle_button = QPushButton("展开全部")
+        self._expand_toggle_button = QPushButton("灞曞紑鍏ㄩ儴")
         self._expand_toggle_button.clicked.connect(self._toggle_all_positions)
         title_row.addWidget(self._expand_toggle_button)
         title_row.addWidget(self._positions_hint)
@@ -2023,7 +1779,7 @@ class AccountPositionsHomeWidget(QWidget):
 
         self._position_tree = QTreeWidget()
         self._position_tree.setColumnCount(1 + len(POSITION_COLUMNS))
-        self._position_tree.setHeaderLabels(["合约 / 分组", *[item[1] for item in POSITION_COLUMNS]])
+        self._position_tree.setHeaderLabels(["鍚堢害 / 鍒嗙粍", *[item[1] for item in POSITION_COLUMNS]])
         self._position_tree.setAlternatingRowColors(True)
         self._position_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._position_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -2053,7 +1809,7 @@ class AccountPositionsHomeWidget(QWidget):
         detail_layout = QVBoxLayout(self._detail_panel)
         detail_layout.setContentsMargins(12, 12, 12, 12)
         detail_layout.setSpacing(8)
-        detail_title = QLabel("持仓详情")
+        detail_title = QLabel("鎸佷粨璇︽儏")
         detail_title.setObjectName("SectionTitle")
         self._detail_text = QTextEdit()
         self._detail_text.setReadOnly(True)
@@ -2071,11 +1827,11 @@ class AccountPositionsHomeWidget(QWidget):
         layout.setSpacing(8)
 
         self._tabs = QTabWidget()
-        self._tabs.addTab(self._build_current_orders_tab(), "当前委托")
-        self._tabs.addTab(self._build_placeholder_tab("动态止盈接管", "动态止盈接管区块预留，后续按旧页面完整迁移。"), "动态止盈接管")
-        self._tabs.addTab(self._build_placeholder_tab("历史委托", "历史委托区块预留，后续补齐筛选和同步逻辑。"), "历史委托")
-        self._tabs.addTab(self._build_placeholder_tab("历史成交", "历史成交区块预留，后续补齐筛选和同步逻辑。"), "历史成交")
-        self._tabs.addTab(self._build_position_history_tab(), "历史仓位")
+        self._tabs.addTab(self._build_current_orders_tab(), "褰撳墠濮旀墭")
+        self._tabs.addTab(self._build_placeholder_tab("鍔ㄦ€佹鐩堟帴绠?, "鍔ㄦ€佹鐩堟帴绠″尯鍧楅鐣欙紝鍚庣画鎸夋棫椤甸潰瀹屾暣杩佺Щ銆?), "鍔ㄦ€佹鐩堟帴绠?)
+        self._tabs.addTab(self._build_placeholder_tab("鍘嗗彶濮旀墭", "鍘嗗彶濮旀墭鍖哄潡棰勭暀锛屽悗缁ˉ榻愮瓫閫夊拰鍚屾閫昏緫銆?), "鍘嗗彶濮旀墭")
+        self._tabs.addTab(self._build_placeholder_tab("鍘嗗彶鎴愪氦", "鍘嗗彶鎴愪氦鍖哄潡棰勭暀锛屽悗缁ˉ榻愮瓫閫夊拰鍚屾閫昏緫銆?), "鍘嗗彶鎴愪氦")
+        self._tabs.addTab(self._build_position_history_tab(), "鍘嗗彶浠撲綅")
         layout.addWidget(self._tabs, 1)
         return self._history_panel
 
@@ -2085,14 +1841,14 @@ class AccountPositionsHomeWidget(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
-        self._orders_summary_label = QLabel("当前委托尚未读取。")
+        self._orders_summary_label = QLabel("褰撳墠濮旀墭灏氭湭璇诲彇銆?)
         self._orders_summary_label.setObjectName("Subtle")
         self._orders_summary_label.setWordWrap(True)
         layout.addWidget(self._orders_summary_label)
 
         self._orders_table = QTableWidget(0, 11)
         self._orders_table.setHorizontalHeaderLabels(
-            ("时间", "合约", "类型", "状态", "方向", "委托类型", "委托价", "委托量", "已成交", "交易模式", "clOrdId")
+            ("鏃堕棿", "鍚堢害", "绫诲瀷", "鐘舵€?, "鏂瑰悜", "濮旀墭绫诲瀷", "濮旀墭浠?, "濮旀墭閲?, "宸叉垚浜?, "浜ゆ槗妯″紡", "clOrdId")
         )
         self._orders_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._orders_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -2114,11 +1870,11 @@ class AccountPositionsHomeWidget(QWidget):
         self._orders_table.itemSelectionChanged.connect(self._refresh_current_order_detail)
         layout.addWidget(self._orders_table, 1)
 
-        detail_title = QLabel("委托详情")
+        detail_title = QLabel("濮旀墭璇︽儏")
         detail_title.setObjectName("SectionTitle")
         self._orders_detail = QTextEdit()
         self._orders_detail.setReadOnly(True)
-        self._orders_detail.setPlainText("这里会显示选中当前委托的详情。")
+        self._orders_detail.setPlainText("杩欓噷浼氭樉绀洪€変腑褰撳墠濮旀墭鐨勮鎯呫€?)
         layout.addWidget(detail_title)
         layout.addWidget(self._orders_detail, 1)
         return tab
@@ -2144,18 +1900,18 @@ class AccountPositionsHomeWidget(QWidget):
         layout.setSpacing(8)
 
         head = QHBoxLayout()
-        self._position_history_summary_label = QLabel("历史仓位尚未读取。")
+        self._position_history_summary_label = QLabel("鍘嗗彶浠撲綅灏氭湭璇诲彇銆?)
         self._position_history_summary_label.setObjectName("Subtle")
         self._position_history_summary_label.setWordWrap(True)
         head.addWidget(self._position_history_summary_label, 1)
-        refresh_button = QPushButton("同步历史仓位")
+        refresh_button = QPushButton("鍚屾鍘嗗彶浠撲綅")
         refresh_button.clicked.connect(self._refresh_position_history)
         head.addWidget(refresh_button)
         layout.addLayout(head)
 
         self._position_history_table = QTableWidget(0, 12)
         self._position_history_table.setHorizontalHeaderLabels(
-            ("时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "平仓数量", "手续费", "盈亏", "备注")
+            ("鏃堕棿", "绫诲瀷", "鍚堢害", "淇濊瘉閲戞ā寮?, "鎸佷粨妯″紡", "浜ゆ槗鏂瑰悜", "寮€浠撳潎浠?, "骞充粨鍧囦环", "骞充粨鏁伴噺", "鎵嬬画璐?, "鐩堜簭", "澶囨敞")
         )
         self._position_history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._position_history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -2178,11 +1934,11 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_table.itemSelectionChanged.connect(self._refresh_position_history_detail)
         layout.addWidget(self._position_history_table, 1)
 
-        detail_title = QLabel("历史仓位详情")
+        detail_title = QLabel("鍘嗗彶浠撲綅璇︽儏")
         detail_title.setObjectName("SectionTitle")
         self._position_history_detail = QTextEdit()
         self._position_history_detail.setReadOnly(True)
-        self._position_history_detail.setPlainText("这里会显示选中历史仓位的详情。")
+        self._position_history_detail.setPlainText("杩欓噷浼氭樉绀洪€変腑鍘嗗彶浠撲綅鐨勮鎯呫€?)
         layout.addWidget(detail_title)
         layout.addWidget(self._position_history_detail, 1)
         return tab
@@ -2193,28 +1949,27 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _populate_profile_combo(self) -> None:
         self._profile_switch_guard = True
-        with QSignalBlocker(self._profile_combo):
-            self._profile_combo.clear()
-            names = profile_names()
-            if names:
-                self._profile_combo.addItems(names)
-                target = self._last_profile_name or names[0]
-                index = self._profile_combo.findText(target)
-                self._profile_combo.setCurrentIndex(index if index >= 0 else 0)
-            else:
-                self._profile_combo.addItem("未配置")
+        self._profile_combo.clear()
+        names = profile_names()
+        if names:
+            self._profile_combo.addItems(names)
+            target = self._last_profile_name or names[0]
+            index = self._profile_combo.findText(target)
+            self._profile_combo.setCurrentIndex(index if index >= 0 else 0)
+        else:
+            self._profile_combo.addItem("鏈厤缃?)
         self._profile_switch_guard = False
 
     def _ensure_runtime_ready(self, *, force_unlock: bool) -> bool:
         profile_name = self._current_profile_name()
         if not profile_name:
-            QMessageBox.warning(self, "无法刷新", "当前未配置可用的 API Profile。")
+            QMessageBox.warning(self, "鏃犳硶鍒锋柊", "褰撳墠鏈厤缃彲鐢ㄧ殑 API Profile銆?)
             return False
         if force_unlock and not ensure_profile_unlocked(self, profile_name, self._profile_snapshots, self._unlocked_profiles):
             return False
         runtime = load_runtime(profile_name)
         if runtime is None:
-            QMessageBox.warning(self, "无法刷新", f"API 配置 {profile_name} 不可用，请检查凭证。")
+            QMessageBox.warning(self, "鏃犳硶鍒锋柊", f"API 閰嶇疆 {profile_name} 涓嶅彲鐢紝璇锋鏌ュ嚟璇併€?)
             return False
         self._runtime = runtime
         self._last_profile_name = profile_name
@@ -2222,7 +1977,7 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _current_profile_name(self) -> str:
         text = self._profile_combo.currentText().strip()
-        return "" if text == "未配置" else text
+        return "" if text == "鏈厤缃? else text
 
     def _stop_private_threads(self) -> None:
         for thread in (self._account_feed, self._order_feed):
@@ -2230,9 +1985,8 @@ class AccountPositionsHomeWidget(QWidget):
                 continue
             thread.stop()
             if thread.isRunning() and not thread.wait(1600):
-                self._retire_thread(thread)
-                continue
-            thread.deleteLater()
+                thread.terminate()
+                thread.wait(1600)
         self._account_feed = None
         self._order_feed = None
 
@@ -2243,6 +1997,7 @@ class AccountPositionsHomeWidget(QWidget):
             self._stop_private_threads()
         elif self._account_feed is not None and self._account_feed.isRunning():
             return
+
         self._account_feed = AccountFeedThread(self._runtime)
         self._order_feed = OrderFeedThread(self._runtime)
         self._account_feed.positions_ready.connect(self._apply_positions_summary)
@@ -2322,18 +2077,8 @@ class AccountPositionsHomeWidget(QWidget):
         return "best_quote" if normalized == "best_quote" else "market"
 
     @staticmethod
-    def _parse_positive_decimal(raw: str, field_name: str) -> Decimal:
-        try:
-            value = Decimal(str(raw).strip())
-        except Exception as exc:
-            raise ValueError(f"{field_name} 不是有效数字") from exc
-        if value <= 0:
-            raise ValueError(f"{field_name} 必须大于 0")
-        return value
-
-    @staticmethod
     def _position_manual_flatten_mode_label(flatten_mode: str) -> str:
-        return "挂买一/卖一平仓" if AccountPositionsHomeWidget._normalize_position_manual_flatten_mode(flatten_mode) == "best_quote" else "市价平仓"
+        return "鎸備拱涓€/鍗栦竴骞充粨" if AccountPositionsHomeWidget._normalize_position_manual_flatten_mode(flatten_mode) == "best_quote" else "甯備环骞充粨"
 
     def _build_selected_position_manual_flatten_config(self, position: OkxPosition) -> StrategyConfig:
         runtime = self._runtime
@@ -2372,99 +2117,6 @@ class AccountPositionsHomeWidget(QWidget):
             base = position.position
         return abs(base)
 
-    @staticmethod
-    def _position_asset_symbol(position: OkxPosition) -> str:
-        parts = str(position.inst_id or "").strip().upper().split("-")
-        return parts[0] if parts and parts[0] else "币"
-
-    @staticmethod
-    def _position_contract_multiplier(instrument: Instrument | None) -> Decimal:
-        if instrument is not None and instrument.ct_mult is not None and instrument.ct_mult > 0:
-            return instrument.ct_mult
-        return Decimal("1")
-
-    @staticmethod
-    def _selected_position_contract_size_to_display_amount(
-        position: OkxPosition,
-        instrument: Instrument | None,
-        contract_size: Decimal,
-    ) -> tuple[Decimal, str]:
-        size = abs(contract_size)
-        if position.inst_type == "SPOT":
-            return size, AccountPositionsHomeWidget._position_asset_symbol(position)
-        contract_value, contract_currency = _position_contract_value_snapshot(position, instrument)
-        if contract_value is not None and contract_value > 0 and contract_currency:
-            multiplier = AccountPositionsHomeWidget._position_contract_multiplier(instrument)
-            quote_currency = contract_currency.upper()
-            if quote_currency in {"USD", "USDT", "USDC"} and position.inst_type in {"FUTURES", "SWAP"}:
-                reference_price = position.mark_price or position.last_price or position.avg_price
-                if reference_price is not None and reference_price > 0:
-                    return (size * contract_value * multiplier / reference_price), AccountPositionsHomeWidget._position_asset_symbol(position)
-            return size * contract_value * multiplier, quote_currency
-        return size, "张"
-
-    def _selected_position_close_display_amount(
-        self,
-        position: OkxPosition,
-        instrument: Instrument | None,
-    ) -> tuple[Decimal, str]:
-        contract_size = position.avail_position
-        if contract_size is None or contract_size == 0:
-            contract_size = position.position
-        return AccountPositionsHomeWidget._selected_position_contract_size_to_display_amount(
-            position,
-            instrument,
-            abs(contract_size),
-        )
-
-    @staticmethod
-    def _format_amount_with_unit(amount: Decimal, unit: str) -> str:
-        return f"{format_decimal(amount)} {unit}".strip()
-
-    @staticmethod
-    def _selected_position_order_size_text(
-        position: OkxPosition,
-        instrument: Instrument | None,
-        order_size: Decimal,
-    ) -> str:
-        if position.inst_type == "SPOT":
-            return AccountPositionsHomeWidget._format_amount_with_unit(
-                abs(order_size),
-                AccountPositionsHomeWidget._position_asset_symbol(position),
-            )
-        return f"{format_decimal(abs(order_size))} 张"
-
-    @staticmethod
-    def _convert_selected_position_close_coin_to_order_size(
-        position: OkxPosition,
-        instrument: Instrument,
-        close_amount: Decimal,
-    ) -> Decimal:
-        if close_amount <= 0:
-            raise ValueError("平仓币数必须大于 0。")
-        if position.inst_type == "SPOT":
-            return snap_to_increment(close_amount, instrument.lot_size, "down")
-
-        contract_value, contract_currency = _position_contract_value_snapshot(position, instrument)
-        if contract_value is None or contract_value <= 0 or not contract_currency:
-            raise ValueError("当前合约缺少币数换算所需的合约面值信息，暂时无法按币数平仓。")
-
-        multiplier = AccountPositionsHomeWidget._position_contract_multiplier(instrument)
-        denominator = contract_value * multiplier
-        if denominator <= 0:
-            raise ValueError("当前合约缺少有效合约面值，暂时无法按币数平仓。")
-
-        quote_currency = contract_currency.upper()
-        if quote_currency in {"USD", "USDT", "USDC"} and position.inst_type in {"FUTURES", "SWAP"}:
-            reference_price = position.mark_price or position.last_price or position.avg_price
-            if reference_price is None or reference_price <= 0:
-                raise ValueError("当前合约缺少有效参考价格，无法把币数换算成下单张数。")
-            raw_size = close_amount * reference_price / denominator
-        else:
-            raw_size = close_amount / denominator
-
-        return snap_to_increment(raw_size, instrument.lot_size, "down")
-
     def _selected_position_flatten_instrument(self, position: OkxPosition) -> Instrument:
         inst_id = str(position.inst_id or "").strip().upper()
         cached = self._position_instruments.get(inst_id)
@@ -2493,32 +2145,12 @@ class AccountPositionsHomeWidget(QWidget):
         if side == "buy":
             raw_price = order_book.bids[0][0] if order_book is not None and order_book.bids else ticker.bid
             if raw_price is None or raw_price <= 0:
-                raise ValueError(f"{instrument.inst_id} 当前缺少买一价，无法按买一挂平空单。")
+                raise ValueError(f"{instrument.inst_id} 褰撳墠缂哄皯涔颁竴浠凤紝鏃犳硶鎸変拱涓€鎸傚钩绌哄崟銆?)
             return snap_to_increment(raw_price, instrument.tick_size, "down")
         raw_price = order_book.asks[0][0] if order_book is not None and order_book.asks else ticker.ask
         if raw_price is None or raw_price <= 0:
-            raise ValueError(f"{instrument.inst_id} 当前缺少卖一价，无法按卖一挂平多单。")
+            raise ValueError(f"{instrument.inst_id} 褰撳墠缂哄皯鍗栦竴浠凤紝鏃犳硶鎸夊崠涓€鎸傚钩澶氬崟銆?)
         return snap_to_increment(raw_price, instrument.tick_size, "up")
-
-    @staticmethod
-    def _derive_total_equity_btc(
-        total_equity: Decimal | None,
-        details: tuple[object, ...] | None,
-    ) -> Decimal | None:
-        if total_equity is None or not isinstance(details, tuple):
-            return None
-        for asset in details:
-            if str(getattr(asset, "ccy", "") or "").strip().upper() != "BTC":
-                continue
-            equity = getattr(asset, "equity", None)
-            equity_usd = getattr(asset, "equity_usd", None)
-            if not isinstance(equity, Decimal) or not isinstance(equity_usd, Decimal) or equity == 0:
-                return None
-            btc_price = abs(equity_usd) / abs(equity)
-            if btc_price <= 0:
-                return None
-            return total_equity / btc_price
-        return None
 
     def _prepare_selected_position_manual_flatten(
         self,
@@ -2529,22 +2161,21 @@ class AccountPositionsHomeWidget(QWidget):
     ) -> tuple[Credentials, StrategyConfig, Instrument, Decimal, str, str | None, str, str]:
         runtime = self._runtime
         if runtime is None:
-            raise ValueError("当前没有可用的 API 运行时，无法执行平仓。")
+            raise ValueError("褰撳墠娌℃湁鍙敤鐨?API 杩愯鏃讹紝鏃犳硶鎵ц骞充粨銆?)
         credentials = runtime.credentials
         config = self._build_selected_position_manual_flatten_config(position)
         instrument = self._selected_position_flatten_instrument(position)
         max_close = snap_to_increment(self._selected_position_close_size(position), instrument.lot_size, "down")
         if max_close < instrument.min_size:
-            raise ValueError("当前选中持仓的可平数量不足最小下单量，无法直接平仓。")
+            raise ValueError("褰撳墠閫変腑鎸佷粨鐨勫彲骞虫暟閲忎笉瓒虫渶灏忎笅鍗曢噺锛屾棤娉曠洿鎺ュ钩浠撱€?)
         if close_size is not None:
-            max_close_amount, max_close_unit = self._selected_position_close_display_amount(position, instrument)
-            requested = self._convert_selected_position_close_coin_to_order_size(position, instrument, close_size)
+            if close_size <= 0:
+                raise ValueError("骞充粨鏁伴噺蹇呴』澶т簬 0銆?)
+            requested = snap_to_increment(close_size, instrument.lot_size, "down")
             if requested <= 0:
-                raise ValueError("输入币数按合约最小变动单位换算后为 0，请增大数量。")
+                raise ValueError("骞充粨鏁伴噺鎸夋渶灏忓彉鍔ㄥ崟浣嶅悜涓嬪彇鏁村悗涓?0锛岃澧炲ぇ鏁伴噺銆?)
             if requested > max_close:
-                raise ValueError(
-                    f"平仓币数不能超过当前可平数量 {self._format_amount_with_unit(max_close_amount, max_close_unit)}。"
-                )
+                raise ValueError(f"骞充粨鏁伴噺涓嶈兘瓒呰繃褰撳墠鍙钩鏁伴噺 {format_decimal(max_close)}銆?)
             closeable_size = requested
         else:
             closeable_size = max_close
@@ -2567,16 +2198,6 @@ class AccountPositionsHomeWidget(QWidget):
         credentials, config, instrument, closeable_size, close_side, pos_side, _direction, normalized_mode = (
             self._prepare_selected_position_manual_flatten(position, flatten_mode, close_size=close_size)
         )
-        if normalized_mode == "market" and instrument.inst_type == "OPTION":
-            result = self._shared_client.place_aggressive_limit_order(
-                credentials,
-                config,
-                instrument,
-                side=close_side,
-                size=closeable_size,
-                pos_side=None,
-            )
-            return result, None, normalized_mode
         if normalized_mode == "best_quote":
             price = self._resolve_best_quote_flatten_price(instrument, side=close_side)
             result = self._shared_client.place_simple_order(
@@ -2611,76 +2232,10 @@ class AccountPositionsHomeWidget(QWidget):
             return
         QTimer.singleShot(650, self.refresh_view)
 
-    def _selected_position_manual_flatten_after(self, delay_ms: int, callback) -> None:
-        if delay_ms <= 0:
-            self._selected_position_manual_flatten_callback.emit(callback)
-            return
-        QTimer.singleShot(delay_ms, callback)
-
-    @Slot(object)
-    def _run_selected_position_manual_flatten_callback(self, callback: object) -> None:
-        if callable(callback):
-            callback()
-
-    @Slot(object)
-    def _run_ui_callback(self, callback: object) -> None:
-        if not callable(callback):
-            return
-        try:
-            callback()
-        except Exception as exc:  # noqa: BLE001
-            self._current_order_canceling = False
-            QMessageBox.critical(self, "操作失败", str(exc))
-
     def _finish_selected_position_manual_flatten_error(self, exc: Exception) -> None:
         self._selected_position_manual_flatten_running = False
-        self._status_badge.setText("失败")
-        self._summary_label.setText(f"平仓失败：{exc}")
-        QMessageBox.critical(self, "平仓失败", str(exc))
-
-    def _selected_position_manual_flatten_result_failed(self, result: OkxOrderResult) -> bool:
-        return str(result.s_code or "").strip() not in {"", "0"}
-
-    def _selected_position_manual_flatten_result_error_message(
-        self,
-        *,
-        position: OkxPosition,
-        result: OkxOrderResult,
-        close_side_label: str,
-        submit_size_text: str,
-    ) -> str:
-        profile_name = (self._last_profile_name or self._current_profile_name() or "-").strip() or "-"
-        s_code = str(result.s_code or "").strip() or "-"
-        s_msg = str(result.s_msg or "").strip() or "accepted"
-        order_id = (result.ord_id or "-").strip() or "-"
-        client_order_id = (result.cl_ord_id or "-").strip() or "-"
-        reason = self._selected_position_manual_flatten_result_reason_text(s_code=s_code, s_msg=s_msg)
-        return (
-            "当前下单被交易所拒绝。\n\n"
-            f"API配置：{profile_name}\n"
-            f"合约：{position.inst_id}\n"
-            f"平仓数量：{submit_size_text}\n"
-            f"下单方向：{close_side_label}\n"
-            f"订单ID：{order_id}\n"
-            f"客户端单号：{client_order_id}\n"
-            f"返回：sCode={s_code} | sMsg={s_msg}\n"
-            f"原因解释：{reason}"
-        )
-
-    def _selected_position_manual_flatten_result_reason_text(self, *, s_code: str, s_msg: str) -> str:
-        code = (s_code or "").strip()
-        lowered = (s_msg or "").strip().lower()
-        if code == "50120" or "doesn't have permission to use this function" in lowered:
-            return (
-                "这个 API Key 没有交易权限，当前更像只有查询权限。"
-                "常见原因是：创建 API 时没有勾选交易权限，或该 Key 被设成只读。"
-                "请到 OKX 的 API 管理里检查是否开启 Trade/交易权限。"
-            )
-        if "read-only" in lowered or "read only" in lowered:
-            return "这个 API Key 是只读权限，不能下单。请改成带交易权限的 API Key。"
-        if code == "401" or "http 401" in lowered:
-            return "交易接口返回 401，当前凭证未通过授权校验。请检查 API 权限、密钥是否有效，以及当前环境是否匹配。"
-        return "交易接口已拒绝本次下单。请检查 API 权限、账户模式和下单参数是否与当前账户设置一致。"
+        self._status_badge.setText("姝ｅ父")
+        QMessageBox.critical(self, "骞充粨澶辫触", str(exc))
 
     def _finish_selected_position_manual_flatten_success(
         self,
@@ -2692,39 +2247,36 @@ class AccountPositionsHomeWidget(QWidget):
         direction_label: str,
         close_side_label: str,
         submit_size_text: str,
-        order_size_text: str | None = None,
     ) -> None:
         self._selected_position_manual_flatten_running = False
-        self._status_badge.setText("正常")
+        self._status_badge.setText("姝ｅ父")
         mode_label = self._position_manual_flatten_mode_label(normalized_flatten_mode)
         order_id = (result.ord_id or "-").strip() or "-"
         client_order_id = (result.cl_ord_id or "-").strip() or "-"
         message = (
-            "已提交选中持仓平仓。\n\n"
-            f"合约：{position.inst_id}\n"
-            f"方向：{direction_label}\n"
-            f"平仓币数：{submit_size_text}\n"
-            f"下单方向：{close_side_label}\n"
-            f"方式：{mode_label}\n"
-            f"订单ID：{order_id}\n"
-            f"客户端单号：{client_order_id}"
+            "宸叉彁浜ら€変腑鎸佷粨骞充粨銆俓n\n"
+            f"鍚堢害锛歿position.inst_id}\n"
+            f"鏂瑰悜锛歿direction_label}\n"
+            f"骞充粨鏁伴噺锛歿submit_size_text}\n"
+            f"涓嬪崟鏂瑰悜锛歿close_side_label}\n"
+            f"鏂瑰紡锛歿mode_label}\n"
+            f"璁㈠崟ID锛歿order_id}\n"
+            f"瀹㈡埛绔崟鍙凤細{client_order_id}"
         )
-        if order_size_text:
-            message = f"{message}\n实际下单量：{order_size_text}"
         if normalized_flatten_mode == "best_quote" and price is not None:
-            message = f"{message}\n挂单价：{format_decimal(price)}"
-        QMessageBox.information(self, "平仓已提交", message)
+            message = f"{message}\n鎸傚崟浠凤細{format_decimal(price)}"
+        QMessageBox.information(self, "骞充粨宸叉彁浜?, message)
         self._schedule_selected_position_manual_flatten_follow_up_refresh(normalized_flatten_mode)
 
     def flatten_selected_position(self) -> None:
         if not self._ensure_runtime_ready(force_unlock=True):
             return
         if self._selected_position_manual_flatten_running:
-            QMessageBox.information(self, "平仓", "当前已有一笔选中持仓平仓在提交中，请稍候。")
+            QMessageBox.information(self, "骞充粨", "褰撳墠宸叉湁涓€绗旈€変腑鎸佷粨骞充粨鍦ㄦ彁浜や腑锛岃绋嶅€欍€?)
             return
         position = self._selected_position()
         if position is None:
-            QMessageBox.information(self, "平仓", "请先在当前持仓里选中一条具体持仓。")
+            QMessageBox.information(self, "骞充粨", "璇峰厛鍦ㄥ綋鍓嶆寔浠撻噷閫変腑涓€鏉″叿浣撴寔浠撱€?)
             return
         try:
             (
@@ -2738,92 +2290,39 @@ class AccountPositionsHomeWidget(QWidget):
                 _normalized_mode,
             ) = self._prepare_selected_position_manual_flatten(position, "market")
         except Exception as exc:
-            QMessageBox.critical(self, "平仓失败", str(exc))
+            QMessageBox.critical(self, "骞充粨澶辫触", str(exc))
             return
 
-        direction_label = "多头" if preview_direction == "long" else "空头"
-        close_side_label = "SELL 卖出平仓" if preview_close_side == "sell" else "BUY 买入平仓"
-        instrument = self._selected_position_flatten_instrument(position)
-        hold_amount_text = self._format_amount_with_unit(
-            *self._selected_position_contract_size_to_display_amount(
-                position,
-                instrument,
-                abs(position.position),
-            )
-        )
-        closeable_amount, closeable_unit = self._selected_position_close_display_amount(position, instrument)
-        closeable_amount_text = self._format_amount_with_unit(closeable_amount, closeable_unit)
-        submit_amount_text = self._format_amount_with_unit(
-            *self._selected_position_contract_size_to_display_amount(
-                position,
-                instrument,
-                preview_close_size,
-            )
-        )
-        order_size_text = self._selected_position_order_size_text(position, instrument, preview_close_size)
-        size_dialog = QuantityInputDialog(
-            title="平仓币数",
-            prompt=f"输入本次平仓币数（默认可平全部，单位：{closeable_unit}）",
-            initial_value=format_decimal(closeable_amount),
-            unit_text=closeable_unit,
-            parent=self,
-        )
-        if size_dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        requested_close_size = size_dialog.result_text or ""
-        try:
-            requested_close_size = self._parse_positive_decimal(requested_close_size, "平仓币数")
-            (
-                _credentials,
-                _config,
-                _instrument,
-                preview_close_size,
-                preview_close_side,
-                _pos_side,
-                preview_direction,
-                _normalized_mode,
-            ) = self._prepare_selected_position_manual_flatten(
-                position,
-                "market",
-                close_size=requested_close_size,
-            )
-            submit_amount_text = self._format_amount_with_unit(
-                *self._selected_position_contract_size_to_display_amount(
-                    position,
-                    instrument,
-                    preview_close_size,
-                )
-            )
-            order_size_text = self._selected_position_order_size_text(position, instrument, preview_close_size)
-        except Exception as exc:
-            QMessageBox.critical(self, "平仓失败", str(exc))
-            return
+        direction_label = "澶氬ご" if preview_direction == "long" else "绌哄ご"
+        close_side_label = "SELL 鍗栧嚭骞充粨" if preview_close_side == "sell" else "BUY 涔板叆骞充粨"
+        hold_size_text = format_decimal(abs(position.position))
+        closeable_size_text = format_decimal(self._selected_position_close_size(position))
+        submit_size_text = format_decimal(preview_close_size)
 
         dialog = QMessageBox(self)
-        dialog.setWindowTitle("平仓选中")
+        dialog.setWindowTitle("骞充粨閫変腑")
         dialog.setIcon(QMessageBox.Icon.Question)
         dialog.setText(
             "\n".join(
                 [
-                    "请选择这次对选中持仓的平仓方式。",
+                    "璇烽€夋嫨杩欐瀵归€変腑鎸佷粨鐨勫钩浠撴柟寮忋€?,
                     "",
-                    f"合约：{position.inst_id}",
-                    f"方向：{direction_label}",
-                    f"当前持仓：{hold_amount_text}",
-                    f"当前可平：{closeable_amount_text}",
-                    f"本次将报单平仓币数：{submit_amount_text}",
-                    f"换算下单量：{order_size_text}",
-                    f"实际报单方向：{close_side_label}",
+                    f"鍚堢害锛歿position.inst_id}",
+                    f"鏂瑰悜锛歿direction_label}",
+                    f"褰撳墠鎸佷粨锛歿hold_size_text}",
+                    f"褰撳墠鍙钩锛歿closeable_size_text}",
+                    f"鏈灏嗘姤鍗曞钩浠撴暟閲忥細{submit_size_text}",
+                    f"瀹為檯鎶ュ崟鏂瑰悜锛歿close_side_label}",
                     "",
-                    "说明：",
-                    "1. 市价平仓会立刻按市场可成交价格报单。",
-                    "2. 挂买一/卖一平仓会先挂单，未成交前持仓不会消失。",
-                    "3. 平多按卖一挂单，平空按买一挂单。",
+                    "璇存槑锛?,
+                    "1. 甯備环骞充粨浼氱珛鍒绘寜甯傚満鍙垚浜や环鏍兼姤鍗曘€?,
+                    "2. 鎸備拱涓€/鍗栦竴骞充粨浼氬厛鎸傚崟锛屾湭鎴愪氦鍓嶆寔浠撲笉浼氭秷澶便€?,
+                    "3. 骞冲鎸夊崠涓€鎸傚崟锛屽钩绌烘寜涔颁竴鎸傚崟銆?,
                 ]
             )
         )
-        market_button = dialog.addButton("市价平仓", QMessageBox.ButtonRole.AcceptRole)
-        best_quote_button = dialog.addButton("挂买一/卖一", QMessageBox.ButtonRole.ActionRole)
+        market_button = dialog.addButton("甯備环骞充粨", QMessageBox.ButtonRole.AcceptRole)
+        best_quote_button = dialog.addButton("鎸備拱涓€/鍗栦竴", QMessageBox.ButtonRole.ActionRole)
         dialog.addButton(QMessageBox.StandardButton.Cancel)
         dialog.exec()
         clicked = dialog.clickedButton()
@@ -2832,34 +2331,15 @@ class AccountPositionsHomeWidget(QWidget):
         flatten_mode = "market" if clicked is market_button else "best_quote"
 
         self._selected_position_manual_flatten_running = True
-        self._status_badge.setText("平仓提交中...")
+        self._status_badge.setText("骞充粨鎻愪氦涓?..")
 
         def _worker() -> None:
             try:
-                result, price, normalized_mode = self._submit_selected_position_manual_flatten(
-                    position,
-                    flatten_mode,
-                    close_size=requested_close_size,
-                )
+                result, price, normalized_mode = self._submit_selected_position_manual_flatten(position, flatten_mode)
             except Exception as exc:
-                self._selected_position_manual_flatten_after(
-                    0,
-                    lambda exc=exc: self._finish_selected_position_manual_flatten_error(exc),
-                )
+                QTimer.singleShot(0, lambda exc=exc: self._finish_selected_position_manual_flatten_error(exc))
                 return
-            if self._selected_position_manual_flatten_result_failed(result):
-                error_message = self._selected_position_manual_flatten_result_error_message(
-                    position=position,
-                    result=result,
-                    close_side_label=close_side_label,
-                    submit_size_text=submit_amount_text,
-                )
-                self._selected_position_manual_flatten_after(
-                    0,
-                    lambda message=error_message: self._finish_selected_position_manual_flatten_error(RuntimeError(message)),
-                )
-                return
-            self._selected_position_manual_flatten_after(
+            QTimer.singleShot(
                 0,
                 lambda result=result, price=price, normalized_mode=normalized_mode: self._finish_selected_position_manual_flatten_success(
                     position=position,
@@ -2868,8 +2348,7 @@ class AccountPositionsHomeWidget(QWidget):
                     normalized_flatten_mode=normalized_mode,
                     direction_label=direction_label,
                     close_side_label=close_side_label,
-                    submit_size_text=submit_amount_text,
-                    order_size_text=order_size_text,
+                    submit_size_text=submit_size_text,
                 ),
             )
 
@@ -2877,8 +2356,8 @@ class AccountPositionsHomeWidget(QWidget):
             threading.Thread(target=_worker, name="qt-selected-position-flatten", daemon=True).start()
         except RuntimeError as exc:
             self._selected_position_manual_flatten_running = False
-            self._status_badge.setText("正常")
-            QMessageBox.critical(self, "平仓失败", f"系统线程资源不足，无法提交平仓：{exc}")
+            self._status_badge.setText("姝ｅ父")
+            QMessageBox.critical(self, "骞充粨澶辫触", f"绯荤粺绾跨▼璧勬簮涓嶈冻锛屾棤娉曟彁浜ゅ钩浠擄細{exc}")
 
     def _position_history_note_text(self, item: OkxPositionHistoryItem) -> str:
         key = _position_history_note_key(self._last_profile_name, self._note_environment(), item)
@@ -2914,7 +2393,7 @@ class AccountPositionsHomeWidget(QWidget):
                 if column not in {2, 11}:
                     cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
                 self._position_history_table.setItem(row, column, cell)
-        self._position_history_summary_label.setText(f"历史仓位：{len(self._position_history_items)} 条")
+        self._position_history_summary_label.setText(f"鍘嗗彶浠撲綅锛歿len(self._position_history_items)} 鏉?)
         target_row = -1
         if selected_key is not None:
             for index, item in enumerate(self._position_history_items):
@@ -2927,13 +2406,13 @@ class AccountPositionsHomeWidget(QWidget):
         if target_row >= 0:
             self._position_history_table.selectRow(target_row)
         else:
-            self._position_history_detail.setPlainText("这里会显示选中历史仓位的详情。")
+            self._position_history_detail.setPlainText("杩欓噷浼氭樉绀洪€変腑鍘嗗彶浠撲綅鐨勮鎯呫€?)
         self._refresh_position_history_detail()
 
     def _open_position_protection_dialog(self) -> None:
         position = self._selected_option_for_shortcut()
         if position is None:
-            QMessageBox.information(self, "设置期权保护", "请先在当前持仓里选中一条期权仓位。")
+            QMessageBox.information(self, "璁剧疆鏈熸潈淇濇姢", "璇峰厛鍦ㄥ綋鍓嶆寔浠撻噷閫変腑涓€鏉℃湡鏉冧粨浣嶃€?)
             return
         if self._protection_dialog is None:
             self._protection_dialog = PositionProtectionDialog(
@@ -2941,10 +2420,8 @@ class AccountPositionsHomeWidget(QWidget):
                 client=self._shared_client,
                 runtime_provider=lambda: self._runtime,
                 selected_option_provider=self._selected_option_for_shortcut,
-                parent=None,
+                parent=self,
             )
-            self._protection_dialog.setWindowFlag(Qt.WindowType.Window, True)
-            self._protection_dialog.destroyed.connect(lambda *_args: setattr(self, "_protection_dialog", None))
         self._protection_dialog._refresh_from_selection(force=True)
         self._protection_dialog.show()
         self._protection_dialog.raise_()
@@ -2953,24 +2430,24 @@ class AccountPositionsHomeWidget(QWidget):
     def _open_option_roll_window(self) -> None:
         position = self._selected_option_for_shortcut()
         if position is None:
-            QMessageBox.information(self, "展期建议", "请先在当前持仓中选中一条期权持仓。")
+            QMessageBox.information(self, "灞曟湡寤鸿", "璇峰厛鍦ㄥ綋鍓嶆寔浠撲腑閫変腑涓€鏉℃湡鏉冩寔浠撱€?)
             return
         if not is_short_option_position(position):
-            QMessageBox.information(self, "展期建议", "展期建议第一版只支持期权卖出方向持仓。")
+            QMessageBox.information(self, "灞曟湡寤鸿", "灞曟湡寤鸿绗竴鐗堝彧鏀寔鏈熸潈鍗栧嚭鏂瑰悜鎸佷粨銆?)
             return
         instrument = self._position_instruments.get(position.inst_id)
         if instrument is None:
             try:
                 instrument = self._shared_client.get_instrument(position.inst_id)
             except Exception as exc:
-                QMessageBox.critical(self, "展期建议", f"读取合约信息失败：{exc}")
+                QMessageBox.critical(self, "灞曟湡寤鸿", f"璇诲彇鍚堢害淇℃伅澶辫触锛歿exc}")
                 return
         ticker = self._position_tickers.get(position.inst_id)
         if ticker is None:
             try:
                 ticker = self._shared_client.get_ticker(position.inst_id)
             except Exception as exc:
-                QMessageBox.critical(self, "展期建议", f"读取行情失败：{exc}")
+                QMessageBox.critical(self, "灞曟湡寤鸿", f"璇诲彇琛屾儏澶辫触锛歿exc}")
                 return
         try:
             self._legacy_option_tools.open_option_roll(
@@ -2980,16 +2457,16 @@ class AccountPositionsHomeWidget(QWidget):
                 api_name=self._last_profile_name or "",
             )
         except Exception as exc:
-            QMessageBox.critical(self, "展期建议", f"打开展期建议失败：{exc}")
+            QMessageBox.critical(self, "灞曟湡寤鸿", f"鎵撳紑灞曟湡寤鸿澶辫触锛歿exc}")
 
     def edit_selected_position_note(self) -> None:
         position = self._selected_position()
         if position is None:
-            QMessageBox.information(self, "备注", "请先在当前持仓里选中一条具体持仓。")
+            QMessageBox.information(self, "澶囨敞", "璇峰厛鍦ㄥ綋鍓嶆寔浠撻噷閫変腑涓€鏉″叿浣撴寔浠撱€?)
             return
         dialog = NoteEditorDialog(
-            title="编辑持仓备注",
-            prompt=f"为 {position.inst_id} 填写备注。留空后保存会清空当前持仓备注。",
+            title="缂栬緫鎸佷粨澶囨敞",
+            prompt=f"涓?{position.inst_id} 濉啓澶囨敞銆傜暀绌哄悗淇濆瓨浼氭竻绌哄綋鍓嶆寔浠撳娉ㄣ€?,
             initial_value=self._current_note_text(position),
             parent=self,
         )
@@ -3143,8 +2620,8 @@ class AccountPositionsHomeWidget(QWidget):
             asset_metrics = _aggregate_position_metrics(asset_positions, self._upl_usdt_prices, self._position_instruments)
             asset_item = self._make_tree_item(
                 row_key=asset_id,
-                label=f"{asset_label} 风险单元",
-                values=_build_group_row_values("组合", asset_metrics),
+                label=f"{asset_label} 椋庨櫓鍗曞厓",
+                values=_build_group_row_values("缁勫悎", asset_metrics),
                 kind="group",
                 payload_item=asset_positions,
                 payload_metrics=asset_metrics,
@@ -3167,7 +2644,7 @@ class AccountPositionsHomeWidget(QWidget):
                 bucket_item = self._make_tree_item(
                     row_key=bucket_id,
                     label=bucket_label,
-                    values=_build_group_row_values("分组", bucket_metrics),
+                    values=_build_group_row_values("鍒嗙粍", bucket_metrics),
                     kind="group",
                     payload_item=bucket_positions,
                     payload_metrics=bucket_metrics,
@@ -3178,7 +2655,7 @@ class AccountPositionsHomeWidget(QWidget):
                 for position in bucket_positions:
                     bucket_item.addChild(self._build_position_item(position))
 
-        self._positions_hint.setText(f"当前显示 {len(self._visible_positions)} 条持仓 | 点击任一行查看详情。")
+        self._positions_hint.setText(f"褰撳墠鏄剧ず {len(self._visible_positions)} 鏉℃寔浠?| 鐐瑰嚮浠讳竴琛屾煡鐪嬭鎯呫€?)
         self._update_summary_text()
         self._restore_tree_selection(selected_key)
         self._update_filter_shortcuts()
@@ -3317,7 +2794,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _update_expand_toggle_button(self) -> None:
         if not hasattr(self, "_expand_toggle_button"):
             return
-        self._expand_toggle_button.setText("折叠全部" if self._all_group_rows_expanded() else "展开全部")
+        self._expand_toggle_button.setText("鎶樺彔鍏ㄩ儴" if self._all_group_rows_expanded() else "灞曞紑鍏ㄩ儴")
 
     def _toggle_all_positions(self) -> None:
         if self._all_group_rows_expanded():
@@ -3363,20 +2840,20 @@ class AccountPositionsHomeWidget(QWidget):
         total_count = len(self._raw_positions)
         visible_count = len(self._visible_positions)
         parts = [
-            f"API配置：{self._last_profile_name or '-'}",
+            f"API閰嶇疆锛歿self._last_profile_name or '-'}",
             self._account_status.text(),
         ]
         if total_count:
-            text = f"当前仓位（{total_count}）"
+            text = f"褰撳墠浠撲綅锛坽total_count}锛?
             if visible_count != total_count:
-                text += f"，当前显示 {visible_count}"
+                text += f"锛屽綋鍓嶆樉绀?{visible_count}"
             parts.append(text)
         else:
-            parts.append("当前没有持仓")
+            parts.append("褰撳墠娌℃湁鎸佷粨")
         keyword = self._keyword_edit.text().strip().upper()
         type_label = self._type_combo.currentText().strip()
-        if keyword or type_label != "全部类型":
-            parts.append(f"筛选：{type_label if type_label != '全部类型' else ''} {'| ' + keyword if keyword else ''}".strip())
+        if keyword or type_label != "鍏ㄩ儴绫诲瀷":
+            parts.append(f"绛涢€夛細{type_label if type_label != '鍏ㄩ儴绫诲瀷' else ''} {'| ' + keyword if keyword else ''}".strip())
         self._summary_label.setText(" | ".join(part for part in parts if part))
 
     def _update_filter_shortcuts(self) -> None:
@@ -3386,15 +2863,15 @@ class AccountPositionsHomeWidget(QWidget):
         self._apply_contract_button.setEnabled(enabled)
         self._apply_expiry_button.setEnabled(enabled)
         if not enabled:
-            self._filter_hint.setText("选中期权后，可一键带入合约或到期前缀。")
+            self._filter_hint.setText("閫変腑鏈熸潈鍚庯紝鍙竴閿甫鍏ュ悎绾︽垨鍒版湡鍓嶇紑銆?)
             return
-        self._filter_hint.setText(f"已选期权：{contract} | 快捷筛选：合约={contract} | 到期前缀={expiry_prefix}")
+        self._filter_hint.setText(f"宸查€夋湡鏉冿細{contract} | 蹇嵎绛涢€夛細鍚堢害={contract} | 鍒版湡鍓嶇紑={expiry_prefix}")
 
     def apply_selected_option_to_position_search(self) -> None:
         position = self._selected_option_for_shortcut()
         contract, _expiry_prefix = _option_search_shortcuts(position.inst_id if position else "")
         if not contract:
-            QMessageBox.information(self, "快捷筛选", "请先在当前持仓里选中一条期权合约。")
+            QMessageBox.information(self, "蹇嵎绛涢€?, "璇峰厛鍦ㄥ綋鍓嶆寔浠撻噷閫変腑涓€鏉℃湡鏉冨悎绾︺€?)
             return
         self._keyword_edit.setText(contract)
 
@@ -3402,7 +2879,7 @@ class AccountPositionsHomeWidget(QWidget):
         position = self._selected_option_for_shortcut()
         _contract, expiry_prefix = _option_search_shortcuts(position.inst_id if position else "")
         if not expiry_prefix:
-            QMessageBox.information(self, "快捷筛选", "请先在当前持仓里选中一条期权合约。")
+            QMessageBox.information(self, "蹇嵎绛涢€?, "璇峰厛鍦ㄥ綋鍓嶆寔浠撻噷閫変腑涓€鏉℃湡鏉冨悎绾︺€?)
             return
         self._keyword_edit.setText(expiry_prefix)
 
@@ -3423,7 +2900,7 @@ class AccountPositionsHomeWidget(QWidget):
         if 0 <= current_row < len(self._visible_orders):
             selected_ord_id = self._visible_orders[current_row].ord_id
         self._orders_summary_label.setText(
-            f"当前委托：{len(self._visible_orders)} 条 | 仅显示当前持仓相关合约。"
+            f"褰撳墠濮旀墭锛歿len(self._visible_orders)} 鏉?| 浠呮樉绀哄綋鍓嶆寔浠撶浉鍏冲悎绾︺€?
         )
         self._orders_table.setRowCount(len(self._visible_orders))
         for row, order in enumerate(self._visible_orders):
@@ -3456,7 +2933,87 @@ class AccountPositionsHomeWidget(QWidget):
         if target_row >= 0:
             self._orders_table.selectRow(target_row)
         else:
-            self._orders_detail.setPlainText("这里会显示选中当前委托的详情。")
+            self._orders_detail.setPlainText("杩欓噷浼氭樉绀洪€変腑褰撳墠濮旀墭鐨勮鎯呫€?)
+        self._refresh_current_order_detail()
+
+    def _refresh_current_orders_table(self) -> None:
+        if not hasattr(self, "_orders_table"):
+            return
+        filtered = self._filtered_current_orders()
+        selected_ord_id = ""
+        row = self._orders_table.currentRow()
+        if 0 <= row < len(filtered):
+            selected_ord_id = filtered[row].ord_id
+        self._orders_summary_label.setText(f"褰撳墠濮旀墭锛歿len(filtered)} 鏉?| 浠呮樉绀哄綋鍓嶆寔浠撶浉鍏冲悎绾︺€?)
+        self._orders_table.setRowCount(len(filtered))
+        for row, order in enumerate(filtered):
+            feed_source = str(order.raw.get("_feed_source") or "").strip().lower()
+            source_kind = str(order.raw.get("_source_kind") or "").strip().lower()
+            if feed_source == "rest_pending" and source_kind == "algo":
+                source_label = "REST 绠楁硶"
+            elif feed_source == "rest_pending":
+                source_label = "REST pending"
+            else:
+                source_label = "WS 褰撳墠"
+            values = (
+                _format_okx_ms_timestamp(order.update_time or order.created_time),
+                source_label,
+                order.inst_type or "-",
+                order.inst_id or "-",
+                _format_trade_order_state(order.state),
+                _format_history_side(order.side or "-", order.pos_side or ""),
+                order.ord_type or "-",
+                _format_trade_order_price(order.price, order.inst_id, order.inst_type or ""),
+                _format_trade_order_size(order.size),
+                _format_trade_order_size(order.filled_size),
+                "-",
+                "-",
+                order.ord_id or "-",
+                order.client_order_id or "-",
+            )
+            self._set_table_row(self._orders_table, row, values, left_align={3, 13})
+        self._current_order_rows = filtered
+        self._restore_table_selection(self._orders_table, filtered, selected_ord_id, lambda item: item.ord_id or "")
+        self._refresh_current_order_detail()
+
+    def _refresh_current_orders_table(self) -> None:
+        if not hasattr(self, "_orders_table"):
+            return
+        filtered = self._filtered_current_orders()
+        selected_ord_id = ""
+        row = self._orders_table.currentRow()
+        if 0 <= row < len(filtered):
+            selected_ord_id = filtered[row].ord_id
+        self._orders_summary_label.setText(f"褰撳墠濮旀墭锛歿len(filtered)} 鏉?| 浠呮樉绀哄綋鍓嶆寔浠撶浉鍏冲悎绾︺€?)
+        self._orders_table.setRowCount(len(filtered))
+        for row, order in enumerate(filtered):
+            feed_source = str(order.raw.get("_feed_source") or "").strip().lower()
+            source_kind = str(order.raw.get("_source_kind") or "").strip().lower()
+            if feed_source == "rest_pending" and source_kind == "algo":
+                source_label = "REST 绠楁硶"
+            elif feed_source == "rest_pending":
+                source_label = "REST pending"
+            else:
+                source_label = "WS 褰撳墠"
+            values = (
+                _format_okx_ms_timestamp(order.update_time or order.created_time),
+                source_label,
+                order.inst_type or "-",
+                order.inst_id or "-",
+                _format_trade_order_state(order.state),
+                _format_history_side(order.side or "-", order.pos_side or ""),
+                order.ord_type or "-",
+                _format_trade_order_price(order.price, order.inst_id, order.inst_type or ""),
+                _format_trade_order_size(order.size),
+                _format_trade_order_size(order.filled_size),
+                "-",
+                "-",
+                order.ord_id or "-",
+                order.client_order_id or "-",
+            )
+            self._set_table_row(self._orders_table, row, values, left_align={3, 13})
+        self._current_order_rows = filtered
+        self._restore_table_selection(self._orders_table, filtered, selected_ord_id, lambda item: item.ord_id or "")
         self._refresh_current_order_detail()
 
     def _refresh_current_order_detail(self) -> None:
@@ -3464,27 +3021,27 @@ class AccountPositionsHomeWidget(QWidget):
             return
         row = self._orders_table.currentRow()
         if row < 0 or row >= len(self._visible_orders):
-            self._orders_detail.setPlainText("这里会显示选中当前委托的详情。")
+            self._orders_detail.setPlainText("杩欓噷浼氭樉绀洪€変腑褰撳墠濮旀墭鐨勮鎯呫€?)
             return
         order = self._visible_orders[row]
         lines = [
-            f"合约：{order.inst_id or '-'}",
-            f"类型：{order.inst_type or '-'}",
-            f"状态：{_format_trade_order_state(order.state)}",
-            f"方向：{_format_history_side(order.side or '-', order.pos_side or '')}",
-            f"交易模式：{order.td_mode or '-'}",
-            f"委托类型：{order.ord_type or '-'}",
-            f"委托价：{_format_trade_order_price(order.price, order.inst_id, order.inst_type or '')}",
-            f"委托量：{_format_trade_order_size(order.size)}",
-            f"已成交：{_format_trade_order_size(order.filled_size)}",
-            f"成交均价：{_format_trade_order_price(order.avg_price, order.inst_id, order.inst_type or '')}",
-            f"更新时间：{_format_okx_ms_timestamp(order.update_time)}",
-            f"创建时间：{_format_okx_ms_timestamp(order.created_time)}",
-            f"reduceOnly：{'是' if order.reduce_only is True else '否' if order.reduce_only is False else '-'}",
-            f"ordId：{order.ord_id or '-'}",
-            f"clOrdId：{order.client_order_id or '-'}",
+            f"鍚堢害锛歿order.inst_id or '-'}",
+            f"绫诲瀷锛歿order.inst_type or '-'}",
+            f"鐘舵€侊細{_format_trade_order_state(order.state)}",
+            f"鏂瑰悜锛歿_format_history_side(order.side or '-', order.pos_side or '')}",
+            f"浜ゆ槗妯″紡锛歿order.td_mode or '-'}",
+            f"濮旀墭绫诲瀷锛歿order.ord_type or '-'}",
+            f"濮旀墭浠凤細{_format_trade_order_price(order.price, order.inst_id, order.inst_type or '')}",
+            f"濮旀墭閲忥細{_format_trade_order_size(order.size)}",
+            f"宸叉垚浜わ細{_format_trade_order_size(order.filled_size)}",
+            f"鎴愪氦鍧囦环锛歿_format_trade_order_price(order.avg_price, order.inst_id, order.inst_type or '')}",
+            f"鏇存柊鏃堕棿锛歿_format_okx_ms_timestamp(order.update_time)}",
+            f"鍒涘缓鏃堕棿锛歿_format_okx_ms_timestamp(order.created_time)}",
+            f"reduceOnly锛歿'鏄? if order.reduce_only is True else '鍚? if order.reduce_only is False else '-'}",
+            f"ordId锛歿order.ord_id or '-'}",
+            f"clOrdId锛歿order.client_order_id or '-'}",
             "",
-            "原始 WS 数据",
+            "鍘熷 WS 鍥炴姤锛?,
             json.dumps(order.raw, ensure_ascii=False, indent=2, sort_keys=True),
         ]
         self._orders_detail.setPlainText("\n".join(lines))
@@ -3494,7 +3051,7 @@ class AccountPositionsHomeWidget(QWidget):
             return
         row = self._position_history_table.currentRow()
         if row < 0 or row >= len(self._position_history_items):
-            self._position_history_detail.setPlainText("这里会显示选中历史仓位的详情。")
+            self._position_history_detail.setPlainText("杩欓噷浼氭樉绀洪€変腑鍘嗗彶浠撲綅鐨勮鎯呫€?)
             return
         item = self._position_history_items[row]
         self._position_history_detail.setPlainText(
@@ -3509,7 +3066,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _refresh_detail(self) -> None:
         payload = self._selected_payload()
         if payload is None:
-            self._detail_text.setPlainText("点击任一行查看持仓详情。")
+            self._detail_text.setPlainText("鐐瑰嚮浠讳竴琛屾煡鐪嬫寔浠撹鎯呫€?)
             return
         if payload.get("kind") == "position":
             position = payload.get("item")
@@ -3537,7 +3094,7 @@ class AccountPositionsHomeWidget(QWidget):
                 )
             )
             return
-        self._detail_text.setPlainText("点击任一行查看持仓详情。")
+        self._detail_text.setPlainText("鐐瑰嚮浠讳竴琛屾煡鐪嬫寔浠撹鎯呫€?)
 
     def _show_account_overview(self) -> None:
         dialog = AccountOverviewDialog(summary_text=self._build_account_overview_summary_text(), parent=self)
@@ -3553,47 +3110,47 @@ class AccountPositionsHomeWidget(QWidget):
         option_long = sum(1 for item in raw_positions if str(item.inst_type or "").upper() == "OPTION" and derive_position_direction(item) == "long")
         option_short = sum(1 for item in raw_positions if str(item.inst_type or "").upper() == "OPTION" and derive_position_direction(item) == "short")
         keyword = self._keyword_edit.text().strip()
-        type_filter = self._type_combo.currentText().strip() or "全部类型"
+        type_filter = self._type_combo.currentText().strip() or "鍏ㄩ儴绫诲瀷"
         runtime = self._runtime
         environment = getattr(runtime, "environment", "") if runtime is not None else ""
-        environment_label = "实盘 live" if str(environment).lower() == "live" else ("模拟 demo" if str(environment).lower() == "demo" else "-")
+        environment_label = "瀹炵洏 live" if str(environment).lower() == "live" else ("妯℃嫙 demo" if str(environment).lower() == "demo" else "-")
 
         lines = [
-            "账户基础",
-            f"当前 API：{self._last_profile_name or '-'}",
-            f"环境：{environment_label}",
-            f"持仓总数：{len(raw_positions)}",
-            f"当前显示：{len(visible_positions)}",
-            f"当前委托：{len(self._visible_orders)}",
-            f"当前筛选：类型={type_filter} | 关键字={keyword or '-'}",
+            "璐︽埛鍩虹",
+            f"褰撳墠 API锛歿self._last_profile_name or '-'}",
+            f"鐜锛歿environment_label}",
+            f"鎸佷粨鎬绘暟锛歿len(raw_positions)}",
+            f"褰撳墠鏄剧ず锛歿len(visible_positions)}",
+            f"褰撳墠濮旀墭锛歿len(self._visible_orders)}",
+            f"褰撳墠绛涢€夛細绫诲瀷={type_filter} | 鍏抽敭瀛?{keyword or '-'}",
             "",
-            "持仓结构",
-            "全部持仓类型分布："
+            "鎸佷粨缁撴瀯",
+            "鍏ㄩ儴鎸佷粨绫诲瀷鍒嗗竷锛?
             + (" | ".join(f"{inst_type} {count}" for inst_type, count in sorted(type_counts.items())) if type_counts else "-"),
-            "当前显示类型分布："
+            "褰撳墠鏄剧ず绫诲瀷鍒嗗竷锛?
             + (" | ".join(f"{inst_type} {count}" for inst_type, count in sorted(visible_type_counts.items())) if visible_type_counts else "-"),
-            f"期权方向：多头 {option_long} | 空头 {option_short}",
+            f"鏈熸潈鏂瑰悜锛氬澶?{option_long} | 绌哄ご {option_short}",
             "",
-            "持仓汇总（全部）",
-            f"浮盈亏：{_format_optional_decimal_fixed(position_metrics.get('upl') if isinstance(position_metrics.get('upl'), Decimal) else None, places=5, with_sign=True)}",
-            f"浮盈≈USDT：{_format_optional_usdt(position_metrics.get('upl_usdt') if isinstance(position_metrics.get('upl_usdt'), Decimal) else None)}",
-            f"已实现盈亏：{_format_optional_decimal_fixed(position_metrics.get('realized') if isinstance(position_metrics.get('realized'), Decimal) else None, places=5, with_sign=True)}",
-            f"已实现≈USDT：{_format_optional_usdt(position_metrics.get('realized_usdt') if isinstance(position_metrics.get('realized_usdt'), Decimal) else None)}",
-            f"开仓价值≈USDT：{_format_optional_approx_usdt(position_metrics.get('open_value_usdt') if isinstance(position_metrics.get('open_value_usdt'), Decimal) else None)}",
-            f"市值≈USDT：{_format_optional_approx_usdt(position_metrics.get('market_value_usdt') if isinstance(position_metrics.get('market_value_usdt'), Decimal) else None)}",
-            f"Delta(PA)：{_format_optional_decimal_fixed(position_metrics.get('delta') if isinstance(position_metrics.get('delta'), Decimal) else None, places=5)}",
-            f"Gamma(PA)：{_format_optional_decimal_fixed(position_metrics.get('gamma') if isinstance(position_metrics.get('gamma'), Decimal) else None, places=5)}",
-            f"Vega(PA)：{_format_optional_decimal_fixed(position_metrics.get('vega') if isinstance(position_metrics.get('vega'), Decimal) else None, places=5)}",
-            f"Theta(PA)：{_format_optional_decimal_fixed(position_metrics.get('theta') if isinstance(position_metrics.get('theta'), Decimal) else None, places=5)}",
-            f"Theta≈USDT：{_format_optional_usdt_precise(position_metrics.get('theta_usdt') if isinstance(position_metrics.get('theta_usdt'), Decimal) else None, places=2)}",
-            f"初始保证金(IMR)：{_format_optional_integer(position_metrics.get('imr') if isinstance(position_metrics.get('imr'), Decimal) else None)}",
-            f"维持保证金(MMR)：{_format_optional_integer(position_metrics.get('mmr') if isinstance(position_metrics.get('mmr'), Decimal) else None)}",
+            "鎸佷粨姹囨€伙紙鍏ㄩ儴锛?,
+            f"娴泩浜忥細{_format_optional_decimal_fixed(position_metrics.get('upl') if isinstance(position_metrics.get('upl'), Decimal) else None, places=5, with_sign=True)}",
+            f"娴泩鈮圲SDT锛歿_format_optional_usdt(position_metrics.get('upl_usdt') if isinstance(position_metrics.get('upl_usdt'), Decimal) else None)}",
+            f"宸插疄鐜扮泩浜忥細{_format_optional_decimal_fixed(position_metrics.get('realized') if isinstance(position_metrics.get('realized'), Decimal) else None, places=5, with_sign=True)}",
+            f"宸插疄鐜扳増USDT锛歿_format_optional_usdt(position_metrics.get('realized_usdt') if isinstance(position_metrics.get('realized_usdt'), Decimal) else None)}",
+            f"寮€浠撲环鍊尖増USDT锛歿_format_optional_approx_usdt(position_metrics.get('open_value_usdt') if isinstance(position_metrics.get('open_value_usdt'), Decimal) else None)}",
+            f"甯傚€尖増USDT锛歿_format_optional_approx_usdt(position_metrics.get('market_value_usdt') if isinstance(position_metrics.get('market_value_usdt'), Decimal) else None)}",
+            f"Delta(PA)锛歿_format_optional_decimal_fixed(position_metrics.get('delta') if isinstance(position_metrics.get('delta'), Decimal) else None, places=5)}",
+            f"Gamma(PA)锛歿_format_optional_decimal_fixed(position_metrics.get('gamma') if isinstance(position_metrics.get('gamma'), Decimal) else None, places=5)}",
+            f"Vega(PA)锛歿_format_optional_decimal_fixed(position_metrics.get('vega') if isinstance(position_metrics.get('vega'), Decimal) else None, places=5)}",
+            f"Theta(PA)锛歿_format_optional_decimal_fixed(position_metrics.get('theta') if isinstance(position_metrics.get('theta'), Decimal) else None, places=5)}",
+            f"Theta鈮圲SDT锛歿_format_optional_usdt_precise(position_metrics.get('theta_usdt') if isinstance(position_metrics.get('theta_usdt'), Decimal) else None, places=2)}",
+            f"鍒濆淇濊瘉閲?IMR)锛歿_format_optional_integer(position_metrics.get('imr') if isinstance(position_metrics.get('imr'), Decimal) else None)}",
+            f"缁存寔淇濊瘉閲?MMR)锛歿_format_optional_integer(position_metrics.get('mmr') if isinstance(position_metrics.get('mmr'), Decimal) else None)}",
             "",
-            "持仓汇总（当前显示）",
-            f"浮盈亏：{_format_optional_decimal_fixed(visible_metrics.get('upl') if isinstance(visible_metrics.get('upl'), Decimal) else None, places=5, with_sign=True)}",
-            f"浮盈≈USDT：{_format_optional_usdt(visible_metrics.get('upl_usdt') if isinstance(visible_metrics.get('upl_usdt'), Decimal) else None)}",
-            f"已实现≈USDT：{_format_optional_usdt(visible_metrics.get('realized_usdt') if isinstance(visible_metrics.get('realized_usdt'), Decimal) else None)}",
-            f"市值≈USDT：{_format_optional_approx_usdt(visible_metrics.get('market_value_usdt') if isinstance(visible_metrics.get('market_value_usdt'), Decimal) else None)}",
+            "鎸佷粨姹囨€伙紙褰撳墠鏄剧ず锛?,
+            f"娴泩浜忥細{_format_optional_decimal_fixed(visible_metrics.get('upl') if isinstance(visible_metrics.get('upl'), Decimal) else None, places=5, with_sign=True)}",
+            f"娴泩鈮圲SDT锛歿_format_optional_usdt(visible_metrics.get('upl_usdt') if isinstance(visible_metrics.get('upl_usdt'), Decimal) else None)}",
+            f"宸插疄鐜扳増USDT锛歿_format_optional_usdt(visible_metrics.get('realized_usdt') if isinstance(visible_metrics.get('realized_usdt'), Decimal) else None)}",
+            f"甯傚€尖増USDT锛歿_format_optional_approx_usdt(visible_metrics.get('market_value_usdt') if isinstance(visible_metrics.get('market_value_usdt'), Decimal) else None)}",
         ]
 
         if runtime is not None:
@@ -3611,8 +3168,8 @@ class AccountPositionsHomeWidget(QWidget):
                 lines.extend(
                     [
                         "",
-                        "账户资产",
-                        f"读取失败：{exc}",
+                        "璐︽埛璧勪骇",
+                        f"璇诲彇澶辫触锛歿exc}",
                     ]
                 )
                 return "\n".join(lines)
@@ -3620,20 +3177,19 @@ class AccountPositionsHomeWidget(QWidget):
             lines.extend(
                 [
                     "",
-                    "账户资产",
-                    f"账户模式：{_format_account_level_text(getattr(config, 'account_level', None))}",
-                    f"持仓模式：{_format_account_position_mode_text(getattr(config, 'position_mode', None))}",
-                    f"Greeks 类型：{_format_greeks_type_text(getattr(config, 'greeks_type', None))}",
-                    f"自动借币：{_format_bool_text(getattr(config, 'auto_loan', None))}",
-                    f"总权益：{_format_optional_usdt_precise(getattr(overview, 'total_equity', None), places=2, with_sign=False)}",
-                    f"总权益（约BTC）：{_format_optional_decimal(AccountPositionsHomeWidget._derive_total_equity_btc(getattr(overview, 'total_equity', None), getattr(overview, 'details', ()) ))} BTC",
-                    f"调整后权益：{_format_optional_usdt_precise(getattr(overview, 'adjusted_equity', None), places=2, with_sign=False)}",
-                    f"可用权益：{_format_optional_usdt_precise(getattr(overview, 'available_equity', None), places=2, with_sign=False)}",
-                    f"未实现盈亏：{_format_optional_usdt_precise(getattr(overview, 'unrealized_pnl', None), places=2)}",
-                    f"初始保证金(IMR)：{_format_optional_usdt_precise(getattr(overview, 'initial_margin', None), places=2, with_sign=False)}",
-                    f"维持保证金(MMR)：{_format_optional_usdt_precise(getattr(overview, 'maintenance_margin', None), places=2, with_sign=False)}",
-                    f"订单冻结：{_format_optional_usdt_precise(getattr(overview, 'order_frozen', None), places=2, with_sign=False)}",
-                    f"总名义价值(USD)：{_format_optional_usdt_precise(getattr(overview, 'notional_usd', None), places=2, with_sign=False)}",
+                    "璐︽埛璧勪骇",
+                    f"璐︽埛妯″紡锛歿_format_account_level_text(getattr(config, 'account_level', None))}",
+                    f"鎸佷粨妯″紡锛歿_format_account_position_mode_text(getattr(config, 'position_mode', None))}",
+                    f"Greeks 绫诲瀷锛歿_format_greeks_type_text(getattr(config, 'greeks_type', None))}",
+                    f"鑷姩鍊熷竵锛歿_format_bool_text(getattr(config, 'auto_loan', None))}",
+                    f"鎬绘潈鐩婏細{_format_optional_usdt_precise(getattr(overview, 'total_equity', None), places=2, with_sign=False)}",
+                    f"璋冩暣鍚庢潈鐩婏細{_format_optional_usdt_precise(getattr(overview, 'adjusted_equity', None), places=2, with_sign=False)}",
+                    f"鍙敤鏉冪泭锛歿_format_optional_usdt_precise(getattr(overview, 'available_equity', None), places=2, with_sign=False)}",
+                    f"鏈疄鐜扮泩浜忥細{_format_optional_usdt_precise(getattr(overview, 'unrealized_pnl', None), places=2)}",
+                    f"鍒濆淇濊瘉閲?IMR)锛歿_format_optional_usdt_precise(getattr(overview, 'initial_margin', None), places=2, with_sign=False)}",
+                    f"缁存寔淇濊瘉閲?MMR)锛歿_format_optional_usdt_precise(getattr(overview, 'maintenance_margin', None), places=2, with_sign=False)}",
+                    f"璁㈠崟鍐荤粨锛歿_format_optional_usdt_precise(getattr(overview, 'order_frozen', None), places=2, with_sign=False)}",
+                    f"鎬诲悕涔変环鍊?USD)锛歿_format_optional_usdt_precise(getattr(overview, 'notional_usd', None), places=2, with_sign=False)}",
                 ]
             )
 
@@ -3645,16 +3201,16 @@ class AccountPositionsHomeWidget(QWidget):
                 or (asset.available_balance is not None and asset.available_balance != 0)
             ]
             if assets:
-                lines.extend(["", f"资产明细 Top {min(len(assets), 12)}"])
+                lines.extend(["", f"璧勪骇鏄庣粏 Top {min(len(assets), 12)}"])
                 for index, asset in enumerate(assets[:12], start=1):
                     lines.append(
                         f"{index:02d}. {asset.ccy or '-'}"
-                        f" | 权益={_format_optional_decimal(asset.equity)}"
-                        f" | 可用={_format_optional_decimal(asset.available_balance)}"
-                        f" | 可用权益={_format_optional_decimal(asset.available_equity)}"
-                        f" | 折合USD={_format_optional_usdt_precise(asset.equity_usd, places=2, with_sign=False)}"
-                        f" | 未实现={_format_optional_decimal(asset.unrealized_pnl, with_sign=True)}"
-                        f" | 负债={_format_optional_decimal(asset.liability)}"
+                        f" | 鏉冪泭={_format_optional_decimal(asset.equity)}"
+                        f" | 鍙敤={_format_optional_decimal(asset.available_balance)}"
+                        f" | 鍙敤鏉冪泭={_format_optional_decimal(asset.available_equity)}"
+                        f" | 鎶樺悎USD={_format_optional_usdt_precise(asset.equity_usd, places=2, with_sign=False)}"
+                        f" | 鏈疄鐜?{_format_optional_decimal(asset.unrealized_pnl, with_sign=True)}"
+                        f" | 璐熷€?{_format_optional_decimal(asset.liability)}"
                     )
 
         return "\n".join(lines)
@@ -3671,39 +3227,39 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _update_panel_toggle_buttons(self) -> None:
         if hasattr(self, "_detail_toggle_button") and hasattr(self, "_detail_panel"):
-            self._detail_toggle_button.setText("折叠持仓详情" if not self._detail_panel.isHidden() else "展开持仓详情")
+            self._detail_toggle_button.setText("鎶樺彔鎸佷粨璇︽儏" if not self._detail_panel.isHidden() else "灞曞紑鎸佷粨璇︽儏")
         if hasattr(self, "_history_toggle_button") and hasattr(self, "_history_panel"):
-            self._history_toggle_button.setText("折叠历史区域" if not self._history_panel.isHidden() else "展开历史区域")
+            self._history_toggle_button.setText("鎶樺彔鍘嗗彶鍖哄煙" if not self._history_panel.isHidden() else "灞曞紑鍘嗗彶鍖哄煙")
 
     def _show_not_ready_action(self) -> None:
-        sender = self.sender()
-        if isinstance(sender, QPushButton):
-            text = sender.text().strip()
-            if text == "撤单选中":
-                self._cancel_selected_current_order()
-                return
-        QMessageBox.information(self, "迁移", "这个入口已经预留到主页上，下一步会按旧页面逻辑继续接入。")
+        QMessageBox.information(self, "杩佺Щ涓?, "杩欎釜鍏ュ彛宸茬粡棰勭暀鍒颁富椤典笂锛屼笅涓€姝ヤ細鎸夋棫椤甸潰閫昏緫缁х画鎺ュ叆銆?)
 
     def _apply_filters(self, *_args: object) -> None:
-        self._render_positions_tree()
+            QMessageBox.warning(self, "切换失败", f"API 配置 {target} 不可用，请检查凭证。")
 
     def _on_profile_changed(self, *_args: object) -> None:
-        if self._profile_switch_guard or not self._profile_change_ready:
+        if self._profile_switch_guard:
             return
         target = self._current_profile_name()
         if not target or target == self._last_profile_name:
             return
         self._profile_change_serial += 1
         serial = self._profile_change_serial
-        QTimer.singleShot(0, lambda target=target, serial=serial: self._dispatch_profile_change(target, serial))
-
-    def _dispatch_profile_change(self, target: str, serial: int) -> None:
-        if serial != self._profile_change_serial:
+        QTimer.singleShot(0, lambda target=target, serial=serial: self._apply_profile_change(target, serial))
+        return
+        if not ensure_profile_unlocked(self, target, self._profile_snapshots, self._unlocked_profiles):
+            self._profile_switch_guard = True
+            previous_index = self._profile_combo.findText(self._last_profile_name)
+            self._profile_combo.setCurrentIndex(previous_index if previous_index >= 0 else 0)
+            self._profile_switch_guard = False
             return
-        if QApplication.activePopupWidget() is not None:
-            QTimer.singleShot(0, lambda target=target, serial=serial: self._dispatch_profile_change(target, serial))
+        runtime = load_runtime(target)
+        if runtime is None:
+            QMessageBox.warning(self, "鍒囨崲澶辫触", f"API 閰嶇疆 {target} 涓嶅彲鐢紝璇锋鏌ュ嚟璇併€?)
             return
-        self._apply_profile_change(target, serial)
+        self._runtime = runtime
+        self._last_profile_name = target
+        self._start_private_threads(force_restart=True)
 
     def _apply_profile_change(self, target: str, serial: int) -> None:
         if serial != self._profile_change_serial:
@@ -3713,82 +3269,22 @@ class AccountPositionsHomeWidget(QWidget):
         current = self._current_profile_name()
         if not target or current != target or target == self._last_profile_name:
             return
-        if profile_requires_password(target, self._profile_snapshots) and target not in self._unlocked_profiles:
-            self._prompt_profile_unlock(target, serial)
+        if not ensure_profile_unlocked(self, target, self._profile_snapshots, self._unlocked_profiles):
+            self._restore_previous_profile_selection()
             return
         runtime = load_runtime(target)
         if runtime is None:
-            QMessageBox.warning(self, "切换失败", f"API 配置 {target} 不可用，请检查凭证。")
+            QMessageBox.warning(self, "閸掑洦宕叉径杈Е", f"API 闁板秶鐤?{target} 娑撳秴褰查悽顭掔礉鐠囬攱顥呴弻銉ュ殶鐠囦降鈧?)
             self._restore_previous_profile_selection()
             return
         self._runtime = runtime
         self._last_profile_name = target
         self._start_private_threads(force_restart=True)
 
-    def _prompt_profile_unlock(self, target: str, serial: int) -> None:
-        if serial != self._profile_change_serial:
-            return
-        existing = self._profile_unlock_dialog
-        if existing is not None:
-            existing.close()
-            existing.deleteLater()
-            self._profile_unlock_dialog = None
-
-        dialog = QDialog(self)
-        dialog.setModal(True)
-        dialog.setWindowTitle("输入 API 切换密码")
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-
-        prompt = QLabel(f"API 配置 {target} 已设置切换密码，请输入密码后继续。", dialog)
-        prompt.setWordWrap(True)
-        layout.addWidget(prompt)
-
-        password_edit = QLineEdit(dialog)
-        password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        password_edit.setPlaceholderText("切换密码")
-        layout.addWidget(password_edit)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
-            parent=dialog,
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        def _finish(result_code: int) -> None:
-            if self._profile_unlock_dialog is dialog:
-                self._profile_unlock_dialog = None
-            password = password_edit.text()
-            dialog.deleteLater()
-            if serial != self._profile_change_serial:
-                return
-            if self._current_profile_name() != target:
-                return
-            if result_code != int(QDialog.DialogCode.Accepted):
-                self._restore_previous_profile_selection()
-                return
-            if verify_profile_switch_password(self._profile_snapshots.get(target, {}), password):
-                self._unlocked_profiles.add(target)
-                QTimer.singleShot(0, lambda target=target, serial=serial: self._apply_profile_change(target, serial))
-                return
-            QMessageBox.warning(self, "密码错误", f"API 配置 {target} 的切换密码不正确。")
-            self._restore_previous_profile_selection()
-
-        dialog.finished.connect(_finish)
-        self._profile_unlock_dialog = dialog
-        QTimer.singleShot(0, password_edit.setFocus)
-        dialog.open()
-
     def _restore_previous_profile_selection(self) -> None:
         self._profile_switch_guard = True
-        with QSignalBlocker(self._profile_combo):
-            previous_index = self._profile_combo.findText(self._last_profile_name)
-            self._profile_combo.setCurrentIndex(previous_index if previous_index >= 0 else 0)
+        previous_index = self._profile_combo.findText(self._last_profile_name)
+        self._profile_combo.setCurrentIndex(previous_index if previous_index >= 0 else 0)
         self._profile_switch_guard = False
 
     def _on_position_selected(self) -> None:
@@ -3849,7 +3345,7 @@ class AccountPositionsHomeWidget(QWidget):
 
     @Slot(object)
     def _apply_positions_summary(self, _positions: object) -> None:
-        self._status_badge.setText("正常")
+        self._status_badge.setText("姝ｅ父")
 
     @Slot(object)
     def _apply_positions_payload(self, payload: object) -> None:
@@ -3903,14 +3399,11 @@ class AccountPositionsHomeWidget(QWidget):
         layout.setSpacing(8)
 
         self._tabs = QTabWidget()
-        self._tabs.addTab(self._build_current_orders_tab_v2(), "当前委托")
-        self._tabs.addTab(
-            self._build_placeholder_tab("动态止盈接管", "动态止盈接管页保留在这里，后续继续按旧版完整迁移。"),
-            "动态止盈接管",
-        )
-        self._tabs.addTab(self._build_order_history_tab(), "历史委托")
-        self._tabs.addTab(self._build_fill_history_tab(), "历史成交")
-        self._tabs.addTab(self._build_position_history_tab_v2(), "历史仓位")
+        self._tabs.addTab(self._build_current_orders_tab_v2(), "褰撳墠濮旀墭")
+        self._tabs.addTab(self._build_placeholder_tab("鍔ㄦ€佹鐩堟帴绠?, "鍔ㄦ€佹鐩堟帴绠￠〉淇濈暀鍦ㄨ繖閲岋紝鍚庣画缁х画鎸夋棫鐗堝畬鏁磋縼绉汇€?), "鍔ㄦ€佹鐩堟帴绠?)
+        self._tabs.addTab(self._build_order_history_tab(), "鍘嗗彶濮旀墭")
+        self._tabs.addTab(self._build_fill_history_tab(), "鍘嗗彶鎴愪氦")
+        self._tabs.addTab(self._build_position_history_tab_v2(), "鍘嗗彶浠撲綅")
         layout.addWidget(self._tabs, 1)
         return self._history_panel
 
@@ -3921,15 +3414,15 @@ class AccountPositionsHomeWidget(QWidget):
         layout.setSpacing(8)
 
         top = QHBoxLayout()
-        self._orders_summary_label = QLabel("当前委托尚未读取。")
+        self._orders_summary_label = QLabel("褰撳墠濮旀墭灏氭湭璇诲彇銆?)
         self._orders_summary_label.setObjectName("Subtle")
         self._orders_summary_label.setWordWrap(True)
         top.addWidget(self._orders_summary_label, 1)
         for text, handler in (
-            ("刷新", self.refresh_view),
-            ("从选中条件单接管动态止盈", self._show_not_ready_action),
-            ("撤单选中", self._show_not_ready_action),
-            ("批量撤当前筛选", self._show_not_ready_action),
+            ("鍒锋柊", self.refresh_view),
+            ("浠庨€変腑鏉′欢鍗曟帴绠″姩鎬佹鐩?, self._show_not_ready_action),
+            ("鎾ゅ崟閫変腑", self._show_not_ready_action),
+            ("鎵归噺鎾ゅ綋鍓嶇瓫閫?, self._show_not_ready_action),
         ):
             button = QPushButton(text)
             button.clicked.connect(handler)
@@ -3963,28 +3456,28 @@ class AccountPositionsHomeWidget(QWidget):
                 widget.currentIndexChanged.connect(self._refresh_current_orders_table)
             else:
                 widget.textChanged.connect(self._refresh_current_orders_table)
-        apply_button = QPushButton("应用筛选")
+        apply_button = QPushButton("搴旂敤绛涢€?)
         apply_button.clicked.connect(self._refresh_current_orders_table)
-        clear_button = QPushButton("清空筛选")
+        clear_button = QPushButton("娓呯┖绛涢€?)
         clear_button.clicked.connect(self._clear_pending_order_filters)
-        filter_row.addWidget(QLabel("类型"), 0, 0)
+        filter_row.addWidget(QLabel("绫诲瀷"), 0, 0)
         filter_row.addWidget(self._pending_type_combo, 0, 1)
-        filter_row.addWidget(QLabel("来源"), 0, 2)
+        filter_row.addWidget(QLabel("鏉ユ簮"), 0, 2)
         filter_row.addWidget(self._pending_source_combo, 0, 3)
-        filter_row.addWidget(QLabel("状态"), 0, 4)
+        filter_row.addWidget(QLabel("鐘舵€?), 0, 4)
         filter_row.addWidget(self._pending_state_combo, 0, 5)
-        filter_row.addWidget(QLabel("标的"), 0, 6)
+        filter_row.addWidget(QLabel("鏍囩殑"), 0, 6)
         filter_row.addWidget(self._pending_asset_edit, 0, 7)
-        filter_row.addWidget(QLabel("到期前缀"), 0, 8)
+        filter_row.addWidget(QLabel("鍒版湡鍓嶇紑"), 0, 8)
         filter_row.addWidget(self._pending_expiry_edit, 0, 9)
-        filter_row.addWidget(QLabel("搜索"), 0, 10)
+        filter_row.addWidget(QLabel("鎼滅储"), 0, 10)
         filter_row.addWidget(self._pending_keyword_edit, 0, 11)
         filter_row.addWidget(apply_button, 0, 12)
         filter_row.addWidget(clear_button, 0, 13)
         layout.addLayout(filter_row)
 
         self._orders_table = self._build_history_table(
-            ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量", "已成交", "手续费", "TP/SL", "订单ID", "clOrdId"),
+            ("鏃堕棿", "鏉ユ簮", "绫诲瀷", "鍚堢害", "鐘舵€?, "鏂瑰悜", "濮旀墭绫诲瀷", "濮旀墭浠?, "濮旀墭閲?, "宸叉垚浜?, "鎵嬬画璐?, "TP/SL", "璁㈠崟ID", "clOrdId"),
             stretch_columns={3, 11, 13},
         )
         layout.addWidget(self._orders_table, 1)
@@ -3997,10 +3490,10 @@ class AccountPositionsHomeWidget(QWidget):
         layout.setSpacing(8)
 
         top = QHBoxLayout()
-        self._order_history_summary_label = QLabel("历史委托尚未读取。")
+        self._order_history_summary_label = QLabel("鍘嗗彶濮旀墭灏氭湭璇诲彇銆?)
         self._order_history_summary_label.setObjectName("Subtle")
         top.addWidget(self._order_history_summary_label, 1)
-        sync_button = QPushButton("同步")
+        sync_button = QPushButton("鍚屾")
         sync_button.clicked.connect(self._refresh_order_history)
         top.addWidget(sync_button)
         layout.addLayout(top)
@@ -4032,28 +3525,28 @@ class AccountPositionsHomeWidget(QWidget):
                 widget.currentIndexChanged.connect(self._refresh_order_history_table)
             else:
                 widget.textChanged.connect(self._refresh_order_history_table)
-        order_apply = QPushButton("应用筛选")
+        order_apply = QPushButton("搴旂敤绛涢€?)
         order_apply.clicked.connect(self._refresh_order_history_table)
-        order_clear = QPushButton("清空筛选")
+        order_clear = QPushButton("娓呯┖绛涢€?)
         order_clear.clicked.connect(self._clear_order_history_filters)
-        filter_row.addWidget(QLabel("类型"), 0, 0)
+        filter_row.addWidget(QLabel("绫诲瀷"), 0, 0)
         filter_row.addWidget(self._order_history_type_combo, 0, 1)
-        filter_row.addWidget(QLabel("来源"), 0, 2)
+        filter_row.addWidget(QLabel("鏉ユ簮"), 0, 2)
         filter_row.addWidget(self._order_history_source_combo, 0, 3)
-        filter_row.addWidget(QLabel("状态"), 0, 4)
+        filter_row.addWidget(QLabel("鐘舵€?), 0, 4)
         filter_row.addWidget(self._order_history_state_combo, 0, 5)
-        filter_row.addWidget(QLabel("标的"), 0, 6)
+        filter_row.addWidget(QLabel("鏍囩殑"), 0, 6)
         filter_row.addWidget(self._order_history_asset_edit, 0, 7)
-        filter_row.addWidget(QLabel("到期前缀"), 0, 8)
+        filter_row.addWidget(QLabel("鍒版湡鍓嶇紑"), 0, 8)
         filter_row.addWidget(self._order_history_expiry_edit, 0, 9)
-        filter_row.addWidget(QLabel("搜索"), 0, 10)
+        filter_row.addWidget(QLabel("鎼滅储"), 0, 10)
         filter_row.addWidget(self._order_history_keyword_edit, 0, 11)
         filter_row.addWidget(order_apply, 0, 12)
         filter_row.addWidget(order_clear, 0, 13)
         layout.addLayout(filter_row)
 
         self._order_history_table = self._build_history_table(
-            ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量", "已成交", "手续费", "TP/SL", "订单ID", "clOrdId"),
+            ("鏃堕棿", "鏉ユ簮", "绫诲瀷", "鍚堢害", "鐘舵€?, "鏂瑰悜", "濮旀墭绫诲瀷", "濮旀墭浠?, "濮旀墭閲?, "宸叉垚浜?, "鎵嬬画璐?, "TP/SL", "璁㈠崟ID", "clOrdId"),
             stretch_columns={3, 11, 13},
         )
         layout.addWidget(self._order_history_table, 1)
@@ -4066,10 +3559,10 @@ class AccountPositionsHomeWidget(QWidget):
         layout.setSpacing(8)
 
         top = QHBoxLayout()
-        self._fill_history_summary_label = QLabel("历史成交尚未读取。")
+        self._fill_history_summary_label = QLabel("鍘嗗彶鎴愪氦灏氭湭璇诲彇銆?)
         self._fill_history_summary_label.setObjectName("Subtle")
         top.addWidget(self._fill_history_summary_label, 1)
-        more_button = QPushButton("增加100条")
+        more_button = QPushButton("澧炲姞100鏉?)
         more_button.clicked.connect(self._expand_fill_history_limit)
         top.addWidget(more_button)
         layout.addLayout(top)
@@ -4097,23 +3590,23 @@ class AccountPositionsHomeWidget(QWidget):
                 widget.currentIndexChanged.connect(self._refresh_fill_history_table)
             else:
                 widget.textChanged.connect(self._refresh_fill_history_table)
-        fill_apply = QPushButton("应用筛选")
+        fill_apply = QPushButton("搴旂敤绛涢€?)
         fill_apply.clicked.connect(self._refresh_fill_history_table)
-        fill_clear = QPushButton("清空筛选")
+        fill_clear = QPushButton("娓呯┖绛涢€?)
         fill_clear.clicked.connect(self._clear_fill_history_filters)
-        fill_contract = QPushButton("带入合约")
+        fill_contract = QPushButton("甯﹀叆鍚堢害")
         fill_contract.clicked.connect(self.apply_selected_option_to_fill_history_search)
-        fill_expiry = QPushButton("带入到期前缀")
+        fill_expiry = QPushButton("甯﹀叆鍒版湡鍓嶇紑")
         fill_expiry.clicked.connect(self.apply_selected_option_expiry_prefix_to_fill_history_search)
-        filter_row.addWidget(QLabel("类型"), 0, 0)
+        filter_row.addWidget(QLabel("绫诲瀷"), 0, 0)
         filter_row.addWidget(self._fill_history_type_combo, 0, 1)
-        filter_row.addWidget(QLabel("方向"), 0, 2)
+        filter_row.addWidget(QLabel("鏂瑰悜"), 0, 2)
         filter_row.addWidget(self._fill_history_side_combo, 0, 3)
-        filter_row.addWidget(QLabel("标的"), 0, 4)
+        filter_row.addWidget(QLabel("鏍囩殑"), 0, 4)
         filter_row.addWidget(self._fill_history_asset_edit, 0, 5)
-        filter_row.addWidget(QLabel("到期前缀"), 0, 6)
+        filter_row.addWidget(QLabel("鍒版湡鍓嶇紑"), 0, 6)
         filter_row.addWidget(self._fill_history_expiry_edit, 0, 7)
-        filter_row.addWidget(QLabel("搜索"), 0, 8)
+        filter_row.addWidget(QLabel("鎼滅储"), 0, 8)
         filter_row.addWidget(self._fill_history_keyword_edit, 0, 9)
         filter_row.addWidget(fill_contract, 0, 10)
         filter_row.addWidget(fill_expiry, 0, 11)
@@ -4122,7 +3615,7 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addLayout(filter_row)
 
         self._fill_history_table = self._build_history_table(
-            ("时间", "类型", "合约", "方向", "成交价", "成交量", "手续费", "已实现盈亏", "成交类型"),
+            ("鏃堕棿", "绫诲瀷", "鍚堢害", "鏂瑰悜", "鎴愪氦浠?, "鎴愪氦閲?, "鎵嬬画璐?, "宸插疄鐜扮泩浜?, "鎴愪氦绫诲瀷"),
             stretch_columns={2},
         )
         layout.addWidget(self._fill_history_table, 1)
@@ -4135,14 +3628,14 @@ class AccountPositionsHomeWidget(QWidget):
         layout.setSpacing(8)
 
         top = QHBoxLayout()
-        self._position_history_summary_label = QLabel("历史仓位尚未读取。")
+        self._position_history_summary_label = QLabel("鍘嗗彶浠撲綅灏氭湭璇诲彇銆?)
         self._position_history_summary_label.setObjectName("Subtle")
         self._position_history_summary_label.setWordWrap(True)
         top.addWidget(self._position_history_summary_label, 1)
-        more_button = QPushButton("增加100条")
+        more_button = QPushButton("澧炲姞100鏉?)
         more_button.clicked.connect(self._expand_position_history_limit)
         top.addWidget(more_button)
-        edit_button = QPushButton("编辑备注")
+        edit_button = QPushButton("缂栬緫澶囨敞")
         edit_button.clicked.connect(self.edit_selected_position_history_note)
         top.addWidget(edit_button)
         layout.addLayout(top)
@@ -4180,37 +3673,37 @@ class AccountPositionsHomeWidget(QWidget):
                 widget.textChanged.connect(self._schedule_position_history_render)
         self._position_history_range_start_edit.editingFinished.connect(self._schedule_position_history_render)
         self._position_history_range_end_edit.editingFinished.connect(self._schedule_position_history_render)
-        pos_apply = QPushButton("应用筛选")
+        pos_apply = QPushButton("搴旂敤绛涢€?)
         pos_apply.clicked.connect(self._force_position_history_render)
-        pos_clear = QPushButton("清空筛选")
+        pos_clear = QPushButton("娓呯┖绛涢€?)
         pos_clear.clicked.connect(self._clear_position_history_filters)
-        pos_contract = QPushButton("带入合约")
+        pos_contract = QPushButton("甯﹀叆鍚堢害")
         pos_contract.clicked.connect(self.apply_selected_option_to_position_history_search)
-        pos_expiry = QPushButton("带入到期前缀")
+        pos_expiry = QPushButton("甯﹀叆鍒版湡鍓嶇紑")
         pos_expiry.clicked.connect(self.apply_selected_option_expiry_prefix_to_position_history_search)
-        filter_row.addWidget(QLabel("类型"), 0, 0)
+        filter_row.addWidget(QLabel("绫诲瀷"), 0, 0)
         filter_row.addWidget(self._position_history_type_combo, 0, 1)
-        filter_row.addWidget(QLabel("保证金模式"), 0, 2)
+        filter_row.addWidget(QLabel("淇濊瘉閲戞ā寮?), 0, 2)
         filter_row.addWidget(self._position_history_margin_combo, 0, 3)
-        filter_row.addWidget(QLabel("标的"), 0, 4)
+        filter_row.addWidget(QLabel("鏍囩殑"), 0, 4)
         filter_row.addWidget(self._position_history_asset_edit, 0, 5)
-        filter_row.addWidget(QLabel("到期前缀"), 0, 6)
+        filter_row.addWidget(QLabel("鍒版湡鍓嶇紑"), 0, 6)
         filter_row.addWidget(self._position_history_expiry_edit, 0, 7)
-        filter_row.addWidget(QLabel("搜索"), 0, 8)
+        filter_row.addWidget(QLabel("鎼滅储"), 0, 8)
         filter_row.addWidget(self._position_history_keyword_edit, 0, 9)
         filter_row.addWidget(pos_contract, 0, 10)
         filter_row.addWidget(pos_expiry, 0, 11)
         filter_row.addWidget(pos_apply, 0, 12)
         filter_row.addWidget(pos_clear, 0, 13)
-        filter_row.addWidget(QLabel("本地开始"), 1, 0)
+        filter_row.addWidget(QLabel("鏈湴寮€濮?), 1, 0)
         filter_row.addWidget(self._position_history_range_start_edit, 1, 1)
-        filter_row.addWidget(QLabel("本地结束"), 1, 2)
+        filter_row.addWidget(QLabel("鏈湴缁撴潫"), 1, 2)
         filter_row.addWidget(self._position_history_range_end_edit, 1, 3)
-        filter_row.addWidget(QLabel("YYYYMMDD 或 YYYY-MM-DD，留空则不过滤"), 1, 4, 1, 10)
+        filter_row.addWidget(QLabel("YYYYMMDD 鎴?YYYY-MM-DD锛岀暀绌哄垯涓嶈繃婊?), 1, 4, 1, 10)
         layout.addLayout(filter_row)
 
         self._position_history_table = self._build_history_table(
-            ("时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "平仓数量", "手续费", "盈亏", "备注"),
+            ("鏃堕棿", "绫诲瀷", "鍚堢害", "淇濊瘉閲戞ā寮?, "鎸佷粨妯″紡", "浜ゆ槗鏂瑰悜", "寮€浠撳潎浠?, "骞充粨鍧囦环", "骞充粨鏁伴噺", "鎵嬬画璐?, "鐩堜簭", "澶囨敞"),
             stretch_columns={2, 11},
         )
         layout.addWidget(self._position_history_table, 1)
@@ -4292,7 +3785,7 @@ class AccountPositionsHomeWidget(QWidget):
         inst_id = self._selected_option_inst_id_for_fill_history_shortcut()
         contract, _expiry_prefix = _option_search_shortcuts(inst_id)
         if not contract:
-            QMessageBox.information(self, "带入合约", "请先在历史成交里选中一条期权记录，或在当前持仓里选中一条期权持仓。")
+            QMessageBox.information(self, "甯﹀叆鍚堢害", "璇峰厛鍦ㄥ巻鍙叉垚浜ら噷閫変腑涓€鏉℃湡鏉冭褰曪紝鎴栧湪褰撳墠鎸佷粨閲岄€変腑涓€鏉℃湡鏉冩寔浠撱€?)
             return
         self._fill_history_keyword_edit.setText(contract)
         self._refresh_fill_history_table()
@@ -4301,7 +3794,7 @@ class AccountPositionsHomeWidget(QWidget):
         inst_id = self._selected_option_inst_id_for_fill_history_shortcut()
         _contract, expiry_prefix = _option_search_shortcuts(inst_id)
         if not expiry_prefix:
-            QMessageBox.information(self, "带入到期前缀", "请先在历史成交里选中一条期权记录，或在当前持仓里选中一条期权持仓。")
+            QMessageBox.information(self, "甯﹀叆鍒版湡鍓嶇紑", "璇峰厛鍦ㄥ巻鍙叉垚浜ら噷閫変腑涓€鏉℃湡鏉冭褰曪紝鎴栧湪褰撳墠鎸佷粨閲岄€変腑涓€鏉℃湡鏉冩寔浠撱€?)
             return
         self._fill_history_expiry_edit.setText(expiry_prefix)
         self._refresh_fill_history_table()
@@ -4310,7 +3803,7 @@ class AccountPositionsHomeWidget(QWidget):
         inst_id = self._selected_option_inst_id_for_position_history_shortcut()
         contract, _expiry_prefix = _option_search_shortcuts(inst_id)
         if not contract:
-            QMessageBox.information(self, "带入合约", "请先在历史仓位里选中一条期权记录，或在当前持仓里选中一条期权持仓。")
+            QMessageBox.information(self, "甯﹀叆鍚堢害", "璇峰厛鍦ㄥ巻鍙蹭粨浣嶉噷閫変腑涓€鏉℃湡鏉冭褰曪紝鎴栧湪褰撳墠鎸佷粨閲岄€変腑涓€鏉℃湡鏉冩寔浠撱€?)
             return
         self._position_history_keyword_edit.setText(contract)
         self._force_position_history_render()
@@ -4319,7 +3812,7 @@ class AccountPositionsHomeWidget(QWidget):
         inst_id = self._selected_option_inst_id_for_position_history_shortcut()
         _contract, expiry_prefix = _option_search_shortcuts(inst_id)
         if not expiry_prefix:
-            QMessageBox.information(self, "带入到期前缀", "请先在历史仓位里选中一条期权记录，或在当前持仓里选中一条期权持仓。")
+            QMessageBox.information(self, "甯﹀叆鍒版湡鍓嶇紑", "璇峰厛鍦ㄥ巻鍙蹭粨浣嶉噷閫変腑涓€鏉℃湡鏉冭褰曪紝鎴栧湪褰撳墠鎸佷粨閲岄€変腑涓€鏉℃湡鏉冩寔浠撱€?)
             return
         self._position_history_expiry_edit.setText(expiry_prefix)
         self._force_position_history_render()
@@ -4397,17 +3890,10 @@ class AccountPositionsHomeWidget(QWidget):
         row = self._orders_table.currentRow()
         if 0 <= row < len(filtered):
             selected_ord_id = filtered[row].ord_id
-        self._orders_summary_label.setText(f"当前委托：{len(filtered)} 条 | 仅显示当前持仓相关合约。")
+        self._orders_summary_label.setText(f"褰撳墠濮旀墭锛歿len(filtered)} 鏉?| 浠呮樉绀哄綋鍓嶆寔浠撶浉鍏冲悎绾︺€?)
         self._orders_table.setRowCount(len(filtered))
         for row, order in enumerate(filtered):
-            feed_source = str(order.raw.get("_feed_source") or "").strip().lower()
-            source_kind = str(order.raw.get("_source_kind") or "").strip().lower()
-            if feed_source == "rest_pending" and source_kind == "algo":
-                source_label = "REST 算法"
-            elif feed_source == "rest_pending":
-                source_label = "REST pending"
-            else:
-                source_label = "WS 当前"
+            source_label = "REST pending" if str(order.raw.get("_feed_source") or "") == "rest_pending" else "WS 褰撳墠"
             values = (
                 _format_okx_ms_timestamp(order.update_time or order.created_time),
                 source_label,
@@ -4436,231 +3922,26 @@ class AccountPositionsHomeWidget(QWidget):
         row = self._orders_table.currentRow() if hasattr(self, "_orders_table") else -1
         if row < 0 or row >= len(items):
             if hasattr(self, "_orders_detail"):
-                self._orders_detail.setPlainText("这里会显示选中当前委托的详情。")
+                self._orders_detail.setPlainText("杩欓噷浼氭樉绀洪€変腑褰撳墠濮旀墭鐨勮鎯呫€?)
             return
         order = items[row]
         lines = [
-            f"时间：{_format_okx_ms_timestamp(order.update_time or order.created_time)}",
-            f"合约：{order.inst_id or '-'}",
-            f"类型：{order.inst_type or '-'}",
-            f"状态：{_format_trade_order_state(order.state)}",
-            f"方向：{_format_history_side(order.side or '-', order.pos_side or '')}",
-            f"委托类型：{order.ord_type or '-'}",
-            f"委托价：{_format_trade_order_price(order.price, order.inst_id, order.inst_type or '')}",
-            f"委托量：{_format_trade_order_size(order.size)}",
-            f"已成交：{_format_trade_order_size(order.filled_size)}",
-            f"交易模式：{order.td_mode or '-'}",
-            f"订单ID：{order.ord_id or '-'}",
-            f"clOrdId：{order.client_order_id or '-'}",
+            f"鏃堕棿锛歿_format_okx_ms_timestamp(order.update_time or order.created_time)}",
+            f"鍚堢害锛歿order.inst_id or '-'}",
+            f"绫诲瀷锛歿order.inst_type or '-'}",
+            f"鐘舵€侊細{_format_trade_order_state(order.state)}",
+            f"鏂瑰悜锛歿_format_history_side(order.side or '-', order.pos_side or '')}",
+            f"濮旀墭绫诲瀷锛歿order.ord_type or '-'}",
+            f"濮旀墭浠凤細{_format_trade_order_price(order.price, order.inst_id, order.inst_type or '')}",
+            f"濮旀墭閲忥細{_format_trade_order_size(order.size)}",
+            f"宸叉垚浜わ細{_format_trade_order_size(order.filled_size)}",
+            f"浜ゆ槗妯″紡锛歿order.td_mode or '-'}",
+            f"璁㈠崟ID锛歿order.ord_id or '-'}",
+            f"clOrdId锛歿order.client_order_id or '-'}",
             "",
             json.dumps(order.raw, ensure_ascii=False, indent=2, sort_keys=True),
         ]
         self._orders_detail.setPlainText("\n".join(lines))
-
-    def _selected_current_order(self) -> OrderStatusView | None:
-        if not hasattr(self, "_orders_table"):
-            return None
-        filtered = getattr(self, "_current_order_rows", None)
-        if not isinstance(filtered, list):
-            filtered = self._filtered_current_orders()
-        row = self._orders_table.currentRow()
-        if row < 0 or row >= len(filtered):
-            return None
-        item = filtered[row]
-        return item if isinstance(item, OrderStatusView) else None
-
-    def _cancel_selected_current_order(self) -> None:
-        if self._current_order_canceling:
-            QMessageBox.information(self, "撤单", "当前已有一笔撤单请求在处理中，请稍等。")
-            return
-        if not self._ensure_runtime_ready(force_unlock=True):
-            return
-        order = self._selected_current_order()
-        if order is None:
-            QMessageBox.information(self, "撤单", "请先在当前委托里选中一条要撤销的委托。")
-            return
-        owner_label = _current_order_view_owner_display_label(order)
-        cancel_id = _current_order_view_cancel_reference(order)
-        if not cancel_id:
-            QMessageBox.information(self, "撤单", "这条委托缺少可用订单 ID，暂时无法撤单。")
-            return
-        source_notice = ""
-        if owner_label == "未识别来源":
-            source_notice = "\n\n提示：这条委托没有匹配到本程序 clOrdId 规则，将按交易所订单标识直接发起撤单。"
-        confirm_message = (
-            f"确认撤销这条{_current_order_view_source_label(order)}吗？\n\n"
-            f"程序来源：{owner_label}\n"
-            f"合约：{order.inst_id or '-'}\n"
-            f"方向：{_format_history_side(order.side or '-', order.pos_side or '')}\n"
-            f"状态：{_format_trade_order_state(order.state)}\n"
-            f"标识：{cancel_id}"
-            f"{source_notice}"
-        )
-        if not QMessageBox.question(
-            self,
-            "撤单确认",
-            confirm_message,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) == QMessageBox.StandardButton.Yes:
-            return
-        runtime = self._runtime
-        if runtime is None:
-            QMessageBox.warning(self, "撤单", "当前没有 API 凭证，无法发起撤单。")
-            return
-        self._current_order_canceling = True
-        self._orders_summary_label.setText(
-            f"正在撤单：{_current_order_view_source_label(order)} | {order.inst_id or '-'} | {cancel_id}"
-        )
-        threading.Thread(
-            target=self._cancel_selected_current_order_worker,
-            args=(runtime.credentials, self._note_environment(), order, owner_label),
-            daemon=True,
-        ).start()
-
-    def _cancel_selected_current_order_worker(
-        self,
-        credentials: Credentials,
-        environment: str,
-        order: OrderStatusView,
-        owner_label: str,
-    ) -> None:
-        try:
-            result = self._cancel_selected_current_order_request(credentials, environment=environment, order=order)
-            if _current_order_cancel_result_failed(result):
-                self._ui_callback.emit(
-                    lambda order=order, owner_label=owner_label, message=_current_order_cancel_result_error_message(order, result), environment=environment: self._apply_current_order_cancel_error(
-                        order,
-                        owner_label,
-                        message,
-                        environment,
-                    )
-                )
-                return
-            note = ""
-            effective_environment = environment
-        except Exception as exc:  # noqa: BLE001
-            message = str(exc)
-            if "50101" in message and "current environment" in message:
-                alternate = "live" if environment == "demo" else "demo"
-                try:
-                    result = self._cancel_selected_current_order_request(credentials, environment=alternate, order=order)
-                    if _current_order_cancel_result_failed(result):
-                        self._ui_callback.emit(
-                            lambda order=order, owner_label=owner_label, message=_current_order_cancel_result_error_message(order, result), environment=alternate: self._apply_current_order_cancel_error(
-                                order,
-                                owner_label,
-                                message,
-                                environment,
-                            )
-                        )
-                        return
-                    note = f"撤单自动切换到{'实盘' if alternate == 'live' else '模拟'}环境执行。"
-                    effective_environment = alternate
-                except Exception as retry_exc:  # noqa: BLE001
-                    self._ui_callback.emit(
-                        lambda order=order, owner_label=owner_label, message=str(retry_exc), environment=environment: self._apply_current_order_cancel_error(
-                            order,
-                            owner_label,
-                            message,
-                            environment,
-                        )
-                    )
-                    return
-            else:
-                self._ui_callback.emit(
-                    lambda order=order, owner_label=owner_label, message=message, environment=environment: self._apply_current_order_cancel_error(
-                        order,
-                        owner_label,
-                        message,
-                        environment,
-                    )
-                )
-                return
-        self._ui_callback.emit(
-            lambda order=order, result=result, owner_label=owner_label, note=note, effective_environment=effective_environment: self._apply_current_order_cancel_result(
-                order,
-                result,
-                owner_label,
-                note,
-                effective_environment,
-            )
-        )
-
-    def _cancel_selected_current_order_request(
-        self,
-        credentials: Credentials,
-        *,
-        environment: str,
-        order: OrderStatusView,
-    ) -> OkxOrderResult:
-        item = _current_order_view_to_trade_order_item(order)
-        if item.source_kind == "algo":
-            return self._shared_client.cancel_algo_order(
-                credentials,
-                environment=environment,
-                inst_id=item.inst_id,
-                algo_id=item.algo_id or None,
-                algo_cl_ord_id=item.algo_client_order_id or item.client_order_id or None,
-            )
-        return self._shared_client.cancel_order_by_id(
-            credentials,
-            environment=environment,
-            inst_id=item.inst_id,
-            ord_id=item.order_id or None,
-            cl_ord_id=item.client_order_id or None,
-        )
-
-    def _apply_current_order_cancel_result(
-        self,
-        order: OrderStatusView,
-        result: OkxOrderResult,
-        owner_label: str,
-        note: str,
-        effective_environment: str,
-    ) -> None:
-        self._current_order_canceling = False
-        cancel_id = _current_order_view_cancel_reference(order) or result.ord_id or result.cl_ord_id or "-"
-        summary = f"撤单请求已提交：{order.inst_id or '-'} | {cancel_id}"
-        if note:
-            summary = f"{summary} | {note}"
-        self._orders_summary_label.setText(summary)
-        QMessageBox.information(
-            self,
-            "撤单结果",
-            (
-                "撤单请求已提交。\n\n"
-                f"程序来源：{owner_label}\n"
-                f"来源：{_current_order_view_source_label(order)}\n"
-                f"合约：{order.inst_id or '-'}\n"
-                f"标识：{cancel_id}\n"
-                f"返回：sCode={result.s_code} | sMsg={result.s_msg or 'accepted'}"
-            ),
-        )
-        self.refresh_view()
-        self._refresh_order_history()
-
-    def _apply_current_order_cancel_error(
-        self,
-        order: OrderStatusView,
-        owner_label: str,
-        message: str,
-        environment: str,
-    ) -> None:
-        self._current_order_canceling = False
-        friendly_message = _format_network_error_message(message)
-        self._orders_summary_label.setText(f"撤单失败：{friendly_message}")
-        QMessageBox.warning(
-            self,
-            "撤单失败",
-            (
-                f"{_current_order_view_source_label(order)} 撤单失败。\n\n"
-                f"程序来源：{owner_label}\n"
-                f"环境：{'实盘 live' if environment == 'live' else '模拟 demo'}\n"
-                f"合约：{order.inst_id or '-'}\n"
-                f"原因：{friendly_message}"
-            ),
-        )
 
     def _filtered_order_history_items(self) -> list[OkxTradeOrderItem]:
         inst_type = str(self._order_history_type_combo.currentData() or "").strip().upper()
@@ -4709,7 +3990,7 @@ class AccountPositionsHomeWidget(QWidget):
         if 0 <= row < len(filtered):
             selected_key = filtered[row].order_id or filtered[row].client_order_id or ""
         self._visible_order_history_items = filtered
-        self._order_history_summary_label.setText(f"历史委托：当前显示 {len(filtered)}/{len(self._order_history_items)}")
+        self._order_history_summary_label.setText(f"鍘嗗彶濮旀墭锛氬綋鍓嶆樉绀?{len(filtered)}/{len(self._order_history_items)}")
         self._order_history_table.setRowCount(len(filtered))
         for row, item in enumerate(filtered):
             values = (
@@ -4743,7 +4024,7 @@ class AccountPositionsHomeWidget(QWidget):
         row = self._order_history_table.currentRow() if hasattr(self, "_order_history_table") else -1
         if row < 0 or row >= len(self._visible_order_history_items):
             if hasattr(self, "_order_history_detail"):
-                self._order_history_detail.setPlainText("这里会显示选中历史委托的详情。")
+                self._order_history_detail.setPlainText("杩欓噷浼氭樉绀洪€変腑鍘嗗彶濮旀墭鐨勮鎯呫€?)
             return
         item = self._visible_order_history_items[row]
         text = _build_trade_order_detail_text(item)
@@ -4786,7 +4067,7 @@ class AccountPositionsHomeWidget(QWidget):
         if 0 <= row < len(filtered):
             selected_key = filtered[row].trade_id or filtered[row].order_id or ""
         self._visible_fill_history_items = filtered
-        self._fill_history_summary_label.setText(f"历史成交：当前显示 {len(filtered)}/{len(self._fill_history_items)}")
+        self._fill_history_summary_label.setText(f"鍘嗗彶鎴愪氦锛氬綋鍓嶆樉绀?{len(filtered)}/{len(self._fill_history_items)}")
         self._fill_history_table.setRowCount(len(filtered))
         for row, item in enumerate(filtered):
             values = (
@@ -4815,7 +4096,7 @@ class AccountPositionsHomeWidget(QWidget):
         row = self._fill_history_table.currentRow() if hasattr(self, "_fill_history_table") else -1
         if row < 0 or row >= len(self._visible_fill_history_items):
             if hasattr(self, "_fill_history_detail"):
-                self._fill_history_detail.setPlainText("这里会显示选中历史成交的详情。")
+                self._fill_history_detail.setPlainText("杩欓噷浼氭樉绀洪€変腑鍘嗗彶鎴愪氦鐨勮鎯呫€?)
             return
         item = self._visible_fill_history_items[row]
         text = _build_fill_history_detail_text(item, self._fill_history_instruments)
@@ -4879,8 +4160,8 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_summary_label.setText(
             "\n".join(
                 (
-                    f"历史仓位：{len(self._position_history_items)} 条 | 最近同步：{self._position_history_last_sync_text} | 当前显示：{len(filtered)}/{len(self._position_history_items)}",
-                    f"筛选统计：{stats_text}",
+                    f"鍘嗗彶浠撲綅锛歿len(self._position_history_items)} 鏉?| 鏈€杩戝悓姝ワ細{self._position_history_last_sync_text} | 褰撳墠鏄剧ず锛歿len(filtered)}/{len(self._position_history_items)}",
+                    f"绛涢€夌粺璁★細{stats_text}",
                 )
             )
         )
@@ -4914,7 +4195,7 @@ class AccountPositionsHomeWidget(QWidget):
         row = self._position_history_table.currentRow() if hasattr(self, "_position_history_table") else -1
         if row < 0 or row >= len(self._visible_position_history_items):
             if hasattr(self, "_position_history_detail"):
-                self._position_history_detail.setPlainText("这里会显示选中历史仓位的详情。")
+                self._position_history_detail.setPlainText("杩欓噷浼氭樉绀洪€変腑鍘嗗彶浠撲綅鐨勮鎯呫€?)
             return
         item = self._visible_position_history_items[row]
         self._position_history_detail.setPlainText(
@@ -4935,11 +4216,11 @@ class AccountPositionsHomeWidget(QWidget):
     def edit_selected_position_history_note(self) -> None:
         item = self._selected_position_history_item()
         if item is None:
-            QMessageBox.information(self, "编辑备注", "请先选择一条历史仓位。")
+            QMessageBox.information(self, "缂栬緫澶囨敞", "璇峰厛閫夋嫨涓€鏉″巻鍙蹭粨浣嶃€?)
             return
         dialog = NoteEditorDialog(
-            title="编辑历史仓位备注",
-            prompt=f"为 {item.inst_id} 填写备注。留空后保存会清空历史仓位备注。",
+            title="缂栬緫鍘嗗彶浠撲綅澶囨敞",
+            prompt=f"涓?{item.inst_id} 濉啓澶囨敞銆?,
             initial_value=self._position_history_note_text(item),
             parent=self,
         )
@@ -5078,7 +4359,7 @@ class AccountPositionsHomeWidget(QWidget):
         return "20260101"
 
     def _default_position_history_end_text(self) -> str:
-        return datetime.now().strftime("%Y%m%d")
+        return (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
 
     @Slot()
     def _schedule_position_history_render(self) -> None:
@@ -5098,10 +4379,5 @@ class AccountPositionsHomeWidget(QWidget):
     def refresh_view(self) -> None:
         if not self._ensure_runtime_ready(force_unlock=True):
             return
-        self._status_badge.setText("正在刷新...")
+        self._status_badge.setText("姝ｅ湪鍒锋柊...")
         self._start_private_threads(force_restart=True)
-
-
-
-
-

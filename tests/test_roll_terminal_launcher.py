@@ -18,7 +18,16 @@ class RollTerminalLauncherTests(unittest.TestCase):
     def test_module_choices_include_home_and_all_modules(self) -> None:
         self.assertEqual(
             module_choices(),
-            ("home", "roll", "smart-order", "line-trading", "auto-channel"),
+            (
+                "home",
+                "roll",
+                "kline-analysis",
+                "smart-order",
+                "line-trading",
+                "auto-channel",
+                "deribit-volatility",
+                "option-strategy",
+            ),
         )
 
     def test_roll_module_overview_uses_shared_data_root_summary(self) -> None:

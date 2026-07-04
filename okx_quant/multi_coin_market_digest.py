@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 from html import escape
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Iterable
 
@@ -13,6 +15,7 @@ from okx_quant.btc_market_analyzer import (
     TimeframeAnalysis,
     analyze_btc_market_from_client,
     btc_market_analysis_payload,
+    build_pattern_focus_events,
     load_btc_market_email_notifier,
 )
 from okx_quant.analysis_email_validation import (
@@ -21,8 +24,11 @@ from okx_quant.analysis_email_validation import (
     refresh_email_validation_report,
 )
 from okx_quant.candle_cache import load_candle_cache
+from okx_quant.indicators import moving_average
 from okx_quant.mini_chart import LINE_COLORS, MiniChartOverlay, render_candles_png_base64
 from okx_quant.okx_client import OkxRestClient
+from okx_quant.deribit_client import DeribitRestClient, DeribitVolatilityCandle
+from okx_quant.models import Candle
 from okx_quant.persistence import (
     analysis_report_dir_path,
     load_btc_market_email_state,
@@ -39,6 +45,8 @@ DEFAULT_DIGEST_SYMBOLS: tuple[str, ...] = (
     "DOGE-USDT-SWAP",
 )
 DEFAULT_DEFERRED_RELEASE_SLOT = "08:00"
+BTC_EMA15_MA50_TIMEFRAMES: tuple[str, ...] = ("1H", "4H", "1D", "1W")
+BTC_VOLATILITY_EMA15_MA50_TIMEFRAMES: tuple[str, ...] = ("1H", "4H", "1D", "1W")
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,49 @@ class DigestLeader:
 
 
 @dataclass(frozen=True)
+class BtcEma15Ma50TimeframeAnalysis:
+    timeframe: str
+    candle_ts: int | None
+    last_close: Decimal | None
+    ema15: Decimal | None
+    ma50: Decimal | None
+    direction: str
+    structure: str
+    summary: str
+
+
+@dataclass(frozen=True)
+class BtcEma15Ma50Supplement:
+    symbol: str
+    generated_at: str
+    direction: str
+    summary: str
+    timeframes: tuple[BtcEma15Ma50TimeframeAnalysis, ...]
+
+
+@dataclass(frozen=True)
+class BtcVolatilityTimeframeAnalysis:
+    timeframe: str
+    candle_ts: int | None
+    last_close: Decimal | None
+    ema15: Decimal | None
+    ma50: Decimal | None
+    direction: str
+    structure: str
+    source: str
+    summary: str
+
+
+@dataclass(frozen=True)
+class BtcVolatilitySupplement:
+    symbol: str
+    generated_at: str
+    direction: str
+    summary: str
+    timeframes: tuple[BtcVolatilityTimeframeAnalysis, ...]
+
+
+@dataclass(frozen=True)
 class MultiCoinMarketDigest:
     generated_at: str
     symbols: tuple[str, ...]
@@ -58,6 +109,8 @@ class MultiCoinMarketDigest:
     strongest_long: DigestLeader
     weakest_short: DigestLeader
     best_trade_candidate: DigestLeader
+    btc_ema15_ma50: BtcEma15Ma50Supplement | None = None
+    btc_volatility_ema15_ma50: BtcVolatilitySupplement | None = None
 
 
 def analyze_multi_coin_market(
@@ -71,6 +124,17 @@ def analyze_multi_coin_market(
         for symbol in tuple(symbols)
     )
     generated_at = analyses[0].generated_at if analyses else datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    btc_analysis = next((item for item in analyses if item.symbol.strip().upper() == "BTC-USDT-SWAP"), None)
+    btc_ema15_ma50 = (
+        _build_btc_ema15_ma50_supplement(client, symbol=btc_analysis.symbol, generated_at=generated_at)
+        if btc_analysis is not None
+        else None
+    )
+    btc_volatility_ema15_ma50 = (
+        _build_btc_volatility_ema15_ma50_supplement(client, symbol=btc_analysis.symbol, generated_at=generated_at)
+        if btc_analysis is not None
+        else None
+    )
     return MultiCoinMarketDigest(
         generated_at=generated_at,
         symbols=tuple(item.symbol for item in analyses),
@@ -78,11 +142,13 @@ def analyze_multi_coin_market(
         strongest_long=_pick_strongest_long(analyses),
         weakest_short=_pick_weakest_short(analyses),
         best_trade_candidate=_pick_best_trade_candidate(analyses),
+        btc_ema15_ma50=btc_ema15_ma50,
+        btc_volatility_ema15_ma50=btc_volatility_ema15_ma50,
     )
 
 
 def multi_coin_market_digest_payload(digest: MultiCoinMarketDigest) -> dict[str, object]:
-    return {
+    payload = {
         "generated_at": digest.generated_at,
         "symbols": list(digest.symbols),
         "leaders": {
@@ -92,6 +158,11 @@ def multi_coin_market_digest_payload(digest: MultiCoinMarketDigest) -> dict[str,
         },
         "analyses": [btc_market_analysis_payload(item) for item in digest.analyses],
     }
+    if digest.btc_ema15_ma50 is not None:
+        payload["btc_ema15_ma50"] = _btc_ema15_ma50_payload(digest.btc_ema15_ma50)
+    if digest.btc_volatility_ema15_ma50 is not None:
+        payload["btc_volatility_ema15_ma50"] = _btc_volatility_ema15_ma50_payload(digest.btc_volatility_ema15_ma50)
+    return payload
 
 
 def multi_coin_market_digest_json(digest: MultiCoinMarketDigest) -> str:
@@ -148,6 +219,16 @@ def _build_multi_coin_market_email_body(
     ]
     for analysis in digest.analyses:
         lines.extend(_build_coin_section(analysis, last_sent_at=last_sent_at))
+        if (
+            digest.btc_ema15_ma50 is not None
+            and analysis.symbol.strip().upper() == digest.btc_ema15_ma50.symbol.strip().upper()
+        ):
+            lines.extend(_build_btc_ema15_ma50_text_section(digest.btc_ema15_ma50))
+        if (
+            digest.btc_volatility_ema15_ma50 is not None
+            and analysis.symbol.strip().upper() == digest.btc_volatility_ema15_ma50.symbol.strip().upper()
+        ):
+            lines.extend(_build_btc_volatility_text_section(digest.btc_volatility_ema15_ma50))
     return "\n".join(lines)
 
 
@@ -156,11 +237,19 @@ def build_multi_coin_market_email_html(
     *,
     chart_image_map: dict[str, dict[str, str]] | None = None,
     overlay_legend_map: dict[str, dict[str, str]] | None = None,
+    btc_ema15_ma50_chart_image_map: dict[str, dict[str, str]] | None = None,
+    btc_ema15_ma50_overlay_legend_map: dict[str, dict[str, str]] | None = None,
+    btc_volatility_chart_image_map: dict[str, dict[str, str]] | None = None,
+    btc_volatility_overlay_legend_map: dict[str, dict[str, str]] | None = None,
 ) -> str:
     return _build_multi_coin_market_email_html(
         digest,
         chart_image_map=chart_image_map,
         overlay_legend_map=overlay_legend_map,
+        btc_ema15_ma50_chart_image_map=btc_ema15_ma50_chart_image_map,
+        btc_ema15_ma50_overlay_legend_map=btc_ema15_ma50_overlay_legend_map,
+        btc_volatility_chart_image_map=btc_volatility_chart_image_map,
+        btc_volatility_overlay_legend_map=btc_volatility_overlay_legend_map,
         validation_summary=None,
     )
 
@@ -170,6 +259,10 @@ def _build_multi_coin_market_email_html(
     *,
     chart_image_map: dict[str, dict[str, str]] | None = None,
     overlay_legend_map: dict[str, dict[str, str]] | None = None,
+    btc_ema15_ma50_chart_image_map: dict[str, dict[str, str]] | None = None,
+    btc_ema15_ma50_overlay_legend_map: dict[str, dict[str, str]] | None = None,
+    btc_volatility_chart_image_map: dict[str, dict[str, str]] | None = None,
+    btc_volatility_overlay_legend_map: dict[str, dict[str, str]] | None = None,
     validation_summary: dict[str, object] | None,
 ) -> str:
     email_state = load_btc_market_email_state()
@@ -212,6 +305,12 @@ def _build_multi_coin_market_email_html(
             weakest_short_asset=weakest_short_asset,
             chart_image_map=chart_image_map or {},
             overlay_legend_map=overlay_legend_map or {},
+            btc_ema15_ma50=digest.btc_ema15_ma50,
+            btc_ema15_ma50_chart_image_map=btc_ema15_ma50_chart_image_map or {},
+            btc_ema15_ma50_overlay_legend_map=btc_ema15_ma50_overlay_legend_map or {},
+            btc_volatility_ema15_ma50=digest.btc_volatility_ema15_ma50,
+            btc_volatility_chart_image_map=btc_volatility_chart_image_map or {},
+            btc_volatility_overlay_legend_map=btc_volatility_overlay_legend_map or {},
         )
         for analysis in digest.analyses
     )
@@ -319,6 +418,45 @@ def prepare_multi_coin_market_email(
     body = _build_multi_coin_market_email_body(digest, validation_summary=validation_summary)
     overlay_map = build_multi_coin_overlay_map(digest)
     chart_image_map = build_multi_coin_chart_image_map(digest, overlay_map=overlay_map)
+    btc_ema15_ma50_chart_image_map: dict[str, dict[str, str]] = {}
+    btc_ema15_ma50_overlay_legend_map: dict[str, dict[str, str]] = {}
+    btc_volatility_chart_image_map: dict[str, dict[str, str]] = {}
+    btc_volatility_overlay_legend_map: dict[str, dict[str, str]] = {}
+    if digest.btc_ema15_ma50 is not None:
+        btc_symbol = digest.btc_ema15_ma50.symbol
+        btc_ema15_ma50_overlays = _build_btc_ema15_ma50_overlay_map(btc_symbol)
+        btc_ema15_ma50_chart_image_map = build_multi_coin_chart_image_map(
+            digest,
+            overlay_map=btc_ema15_ma50_overlays,
+            symbols=(btc_symbol,),
+        )
+        btc_ema15_ma50_overlay_legend_map = {
+            btc_symbol: {
+                timeframe: build_overlay_legend_html(overlays)
+                for timeframe, overlays in btc_ema15_ma50_overlays[btc_symbol].items()
+            }
+        }
+    if digest.btc_volatility_ema15_ma50 is not None:
+        btc_symbol = digest.btc_volatility_ema15_ma50.symbol
+        btc_volatility_overlays = _build_btc_ema15_ma50_overlay_map(btc_symbol)
+        volatility_series_by_timeframe, _ = _collect_btc_volatility_candle_series(
+            btc_symbol,
+            client=OkxRestClient(),
+            timeframes=BTC_VOLATILITY_EMA15_MA50_TIMEFRAMES,
+            limit=127,
+        )
+        btc_volatility_chart_image_map = _build_chart_image_map_from_candle_series(
+            btc_symbol,
+            candles_by_timeframe=volatility_series_by_timeframe,
+            overlays_by_timeframe=btc_volatility_overlays[btc_symbol],
+            visible_limit=72,
+        )
+        btc_volatility_overlay_legend_map = {
+            btc_symbol: {
+                timeframe: build_overlay_legend_html(overlays)
+                for timeframe, overlays in btc_volatility_overlays[btc_symbol].items()
+            }
+        }
     overlay_legend_map = {
         symbol: {
             "1H": build_overlay_legend_html(overlays.get("1H", default_symbol_overlays())),
@@ -332,6 +470,10 @@ def prepare_multi_coin_market_email(
         digest,
         chart_image_map=chart_image_map,
         overlay_legend_map=overlay_legend_map,
+        btc_ema15_ma50_chart_image_map=btc_ema15_ma50_chart_image_map,
+        btc_ema15_ma50_overlay_legend_map=btc_ema15_ma50_overlay_legend_map,
+        btc_volatility_chart_image_map=btc_volatility_chart_image_map,
+        btc_volatility_overlay_legend_map=btc_volatility_overlay_legend_map,
         validation_summary=validation_summary,
     )
     archive_path = archive_multi_coin_market_email(
@@ -927,6 +1069,20 @@ def _build_coin_section(analysis: BtcMarketAnalysis, *, last_sent_at: datetime |
     return lines
 
 
+def _build_btc_ema15_ma50_text_section(supplement: BtcEma15Ma50Supplement) -> list[str]:
+    lines = [f"  EMA15/MA50 鍥涘懆鏈熻ˉ鍏咃細{supplement.summary}"]
+    for item in supplement.timeframes:
+        lines.append(f"    {item.timeframe}锛歿{item.summary}")
+    return lines
+
+
+def _build_btc_volatility_text_section(supplement: BtcVolatilitySupplement) -> list[str]:
+    lines = [f"  波动率 EMA15/MA50 补充：{supplement.summary}"]
+    for item in supplement.timeframes:
+        lines.append(f"    {item.timeframe}：{item.summary}")
+    return lines
+
+
 def _coin_tracking_summary(
     analysis: BtcMarketAnalysis,
     tf4h: TimeframeAnalysis | None,
@@ -1131,6 +1287,12 @@ def _build_coin_card_html(
     weakest_short_asset: str,
     chart_image_map: dict[str, dict[str, str]],
     overlay_legend_map: dict[str, dict[str, str]],
+    btc_ema15_ma50: BtcEma15Ma50Supplement | None,
+    btc_ema15_ma50_chart_image_map: dict[str, dict[str, str]],
+    btc_ema15_ma50_overlay_legend_map: dict[str, dict[str, str]],
+    btc_volatility_ema15_ma50: BtcVolatilitySupplement | None,
+    btc_volatility_chart_image_map: dict[str, dict[str, str]],
+    btc_volatility_overlay_legend_map: dict[str, dict[str, str]],
 ) -> str:
     asset = _asset_name(analysis.symbol)
     tf4h = _find_timeframe(analysis, "4H")
@@ -1149,6 +1311,26 @@ def _build_coin_card_html(
         chart_image_map=chart_image_map,
         overlay_legends=overlay_legend_map.get(analysis.symbol, {}),
     )
+    btc_extra_html = ""
+    if (
+        btc_ema15_ma50 is not None
+        and analysis.symbol.strip().upper() == btc_ema15_ma50.symbol.strip().upper()
+    ):
+        btc_extra_html = _build_btc_ema15_ma50_html_block(
+            btc_ema15_ma50,
+            chart_image_map=btc_ema15_ma50_chart_image_map,
+            overlay_legends=btc_ema15_ma50_overlay_legend_map.get(analysis.symbol, {}),
+        )
+    btc_volatility_extra_html = ""
+    if (
+        btc_volatility_ema15_ma50 is not None
+        and analysis.symbol.strip().upper() == btc_volatility_ema15_ma50.symbol.strip().upper()
+    ):
+        btc_volatility_extra_html = _build_btc_volatility_html_block(
+            btc_volatility_ema15_ma50,
+            chart_image_map=btc_volatility_chart_image_map,
+            overlay_legends=btc_volatility_overlay_legend_map.get(analysis.symbol, {}),
+        )
     return f"""
     <table width="100%" border="0" cellspacing="0" cellpadding="0" style="border: 1px solid {border_color}; border-radius: 6px; margin-bottom: 16px;">
         <tr>
@@ -1178,6 +1360,8 @@ def _build_coin_card_html(
                         <td style="padding: 4px 0;"><strong>关注新形态：</strong>{escape(recent_events_text)}</td>
                     </tr>
                 </table>
+                {btc_extra_html}
+                {btc_volatility_extra_html}
             </td>
         </tr>
     </table>
@@ -1315,13 +1499,17 @@ def build_multi_coin_chart_image_map(
     *,
     client: OkxRestClient | None = None,
     overlay_map: dict[str, dict[str, tuple[MiniChartOverlay, ...]]] | None = None,
+    symbols: Iterable[str] | None = None,
     timeframes: tuple[str, ...] = ("1H", "4H", "1D", "1W"),
     visible_limit: int = 72,
 ) -> dict[str, dict[str, str]]:
     resolved_client = client or OkxRestClient()
     resolved_overlay_map = overlay_map or {}
+    symbol_filter = {str(item).strip().upper() for item in (symbols or ()) if str(item).strip()}
     images: dict[str, dict[str, str]] = {}
     for analysis in digest.analyses:
+        if symbol_filter and analysis.symbol.strip().upper() not in symbol_filter:
+            continue
         symbol_images: dict[str, str] = {}
         for timeframe in timeframes:
             symbol_overlays = _resolve_chart_overlays_for_timeframe(
@@ -1350,6 +1538,30 @@ def build_multi_coin_chart_image_map(
         if symbol_images:
             images[analysis.symbol] = symbol_images
     return images
+
+
+def _build_chart_image_map_from_candle_series(
+    symbol: str,
+    *,
+    candles_by_timeframe: dict[str, list],
+    overlays_by_timeframe: dict[str, tuple[MiniChartOverlay, ...]],
+    visible_limit: int,
+) -> dict[str, dict[str, str]]:
+    symbol_images: dict[str, str] = {}
+    for timeframe, candles in candles_by_timeframe.items():
+        if not candles:
+            continue
+        try:
+            symbol_images[timeframe] = render_candles_png_base64(
+                candles,
+                width=320,
+                height=160,
+                max_candles=visible_limit,
+                overlays=overlays_by_timeframe.get(timeframe, ()),
+            )
+        except Exception:
+            continue
+    return {symbol: symbol_images} if symbol_images else {}
 
 
 def _load_chart_candles(
@@ -1386,6 +1598,62 @@ def _build_coin_chart_html(
     symbol: str,
     chart_image_map: dict[str, dict[str, str]],
     overlay_legends: dict[str, str],
+    headline: str | None = None,
+) -> str:
+    symbol_images = chart_image_map.get(symbol, {})
+    encoded_1h = symbol_images.get("1H", "").strip()
+    encoded_4h = symbol_images.get("4H", "").strip()
+    encoded_1d = symbol_images.get("1D", "").strip()
+    encoded_1w = symbol_images.get("1W", "").strip()
+    if not encoded_1h and not encoded_4h and not encoded_1d and not encoded_1w:
+        return """
+        <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-bottom: 12px;">
+            <tr>
+                <td style="padding: 10px 12px; border: 1px dashed #d8e1ea; border-radius: 6px; background-color: #fbfcfe; font-size: 12px; color: #7f8c8d; text-align: center;">
+                    缩略 K 线暂不可用
+                </td>
+            </tr>
+        </table>
+        """
+    image_1h_html = _build_single_chart_cell(asset=asset, timeframe="1H", encoded=encoded_1h)
+    image_4h_html = _build_single_chart_cell(asset=asset, timeframe="4H", encoded=encoded_4h)
+    image_1d_html = _build_single_chart_cell(asset=asset, timeframe="1D", encoded=encoded_1d)
+    image_1w_html = _build_single_chart_cell(asset=asset, timeframe="1W", encoded=encoded_1w)
+    overlay_1h = overlay_legends.get("1H", build_overlay_legend_html(default_symbol_overlays()))
+    overlay_4h = overlay_legends.get("4H", build_overlay_legend_html(default_4h_overlays()))
+    overlay_1d = overlay_legends.get("1D", build_overlay_legend_html(default_4h_overlays()))
+    overlay_1w = overlay_legends.get("1W", build_overlay_legend_html(default_4h_overlays()))
+    title = headline or f"{asset} 鏈€杩?72 鏍?1H / 4H / 1D / 1W K 绾?"
+    return f"""
+    <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-bottom: 12px;">
+        <tr>
+            <td style="font-size: 12px; color: #7f8c8d; padding: 0 0 6px 0;">{escape(asset)} 最近 72 根 1H / 4H / 1D / 1W K 线</td>
+        </tr>
+        <tr>
+            <td>
+                <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                    <tr>
+                        <td width="50%" valign="top" style="padding: 0 6px 0 0;">{image_1h_html.replace('__OVERLAY_LEGEND__', overlay_1h)}</td>
+                        <td width="50%" valign="top" style="padding: 0 0 0 6px;">{image_4h_html.replace('__OVERLAY_LEGEND__', overlay_4h)}</td>
+                    </tr>
+                    <tr>
+                        <td width="50%" valign="top" style="padding: 12px 6px 0 0;">{image_1d_html.replace('__OVERLAY_LEGEND__', overlay_1d)}</td>
+                        <td width="50%" valign="top" style="padding: 12px 0 0 6px;">{image_1w_html.replace('__OVERLAY_LEGEND__', overlay_1w)}</td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+    """
+
+
+def _build_coin_chart_html_with_headline(
+    *,
+    asset: str,
+    symbol: str,
+    chart_image_map: dict[str, dict[str, str]],
+    overlay_legends: dict[str, str],
+    headline: str,
 ) -> str:
     symbol_images = chart_image_map.get(symbol, {})
     encoded_1h = symbol_images.get("1H", "").strip()
@@ -1413,7 +1681,7 @@ def _build_coin_chart_html(
     return f"""
     <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-bottom: 12px;">
         <tr>
-            <td style="font-size: 12px; color: #7f8c8d; padding: 0 0 6px 0;">{escape(asset)} 最近 72 根 1H / 4H / 1D / 1W K 线</td>
+            <td style="font-size: 12px; color: #7f8c8d; padding: 0 0 6px 0;">{escape(headline)}</td>
         </tr>
         <tr>
             <td>
@@ -1431,6 +1699,794 @@ def _build_coin_chart_html(
         </tr>
     </table>
     """
+
+
+def _build_btc_ema15_ma50_html_block(
+    supplement: BtcEma15Ma50Supplement,
+    *,
+    chart_image_map: dict[str, dict[str, str]],
+    overlay_legends: dict[str, str],
+) -> str:
+    chart_html = _build_coin_chart_html_with_headline(
+        asset="BTC",
+        symbol=supplement.symbol,
+        chart_image_map=chart_image_map,
+        overlay_legends=overlay_legends,
+        headline="BTC EMA15 + MA50 最近 72 根 1H / 4H / 1D / 1W K 线",
+    )
+    rows_html = "".join(
+        f"""
+        <tr>
+            <td style="padding: 4px 0;"><strong>{escape(item.timeframe)}：</strong>{escape(item.summary)}</td>
+        </tr>
+        """
+        for item in supplement.timeframes
+    )
+    return f"""
+    <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-top: 16px; border-top: 1px dashed #d7deea;">
+        <tr>
+            <td style="padding: 14px 0 10px 0; font-size: 14px; font-weight: 700; color: #175cd3;">BTC EMA15 + MA50 补充分析</td>
+        </tr>
+        <tr>
+            <td style="padding: 0 0 10px 0; font-size: 13px; line-height: 1.7; color: #34495e;">
+                <strong>结论：</strong>{escape(supplement.summary)}
+            </td>
+        </tr>
+        <tr>
+            <td>{chart_html}</td>
+        </tr>
+        <tr>
+            <td>
+                <table width="100%" border="0" cellspacing="0" cellpadding="0" style="font-size: 13px; color: #34495e; line-height: 1.7;">
+                    {rows_html}
+                </table>
+            </td>
+        </tr>
+    </table>
+    """
+
+
+def _build_btc_volatility_html_block(
+    supplement: BtcVolatilitySupplement,
+    *,
+    chart_image_map: dict[str, dict[str, str]],
+    overlay_legends: dict[str, str],
+) -> str:
+    chart_html = _build_coin_chart_html_with_headline(
+        asset="BTC波动率",
+        symbol=supplement.symbol,
+        chart_image_map=chart_image_map,
+        overlay_legends=overlay_legends,
+        headline="BTC 波动率 EMA15 + MA50 最近 72 根 1H / 4H / 1D / 1W K 线",
+    )
+    rows_html = "".join(
+        f"""
+        <tr>
+            <td style="padding: 4px 0;"><strong>{escape(item.timeframe)}：</strong>{escape(item.summary)}</td>
+        </tr>
+        """
+        for item in supplement.timeframes
+    )
+    return f"""
+    <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-top: 16px; border-top: 1px dashed #d7deea;">
+        <tr>
+            <td style="padding: 14px 0 10px 0; font-size: 14px; font-weight: 700; color: #175cd3;">BTC 波动率 EMA15 + MA50 补充分析</td>
+        </tr>
+        <tr>
+            <td style="padding: 0 0 10px 0; font-size: 13px; line-height: 1.7; color: #34495e;">
+                <strong>结论：</strong>{escape(supplement.summary)}
+            </td>
+        </tr>
+        <tr>
+            <td>{chart_html}</td>
+        </tr>
+        <tr>
+            <td>
+                <table width="100%" border="0" cellspacing="0" cellpadding="0" style="font-size: 13px; color: #34495e; line-height: 1.7;">
+                    {rows_html}
+                </table>
+            </td>
+        </tr>
+    </table>
+    """
+
+
+def _build_btc_ema15_ma50_supplement(
+    client: OkxRestClient,
+    *,
+    symbol: str,
+    generated_at: str,
+) -> BtcEma15Ma50Supplement | None:
+    timeframes: list[BtcEma15Ma50TimeframeAnalysis] = []
+    for timeframe in BTC_EMA15_MA50_TIMEFRAMES:
+        candles = _load_chart_candles(symbol, timeframe, limit=120, client=client)
+        item = _build_btc_ema15_ma50_timeframe_analysis(timeframe, candles)
+        if item is not None:
+            timeframes.append(item)
+    if not timeframes:
+        return None
+    direction, summary = _build_btc_ema15_ma50_overall_summary(tuple(timeframes))
+    return BtcEma15Ma50Supplement(
+        symbol=symbol,
+        generated_at=generated_at,
+        direction=direction,
+        summary=summary,
+        timeframes=tuple(timeframes),
+    )
+
+
+def _build_btc_volatility_ema15_ma50_supplement(
+    client: OkxRestClient,
+    *,
+    symbol: str,
+    generated_at: str,
+) -> BtcVolatilitySupplement | None:
+    volatility_series_by_timeframe, source_by_timeframe = _collect_btc_volatility_candle_series(
+        symbol,
+        client=client,
+        timeframes=BTC_VOLATILITY_EMA15_MA50_TIMEFRAMES,
+        limit=120,
+    )
+    timeframes: list[BtcVolatilityTimeframeAnalysis] = []
+    for timeframe in BTC_VOLATILITY_EMA15_MA50_TIMEFRAMES:
+        candles = volatility_series_by_timeframe.get(timeframe, [])
+        source = source_by_timeframe.get(timeframe, "")
+        item = _build_btc_volatility_timeframe_analysis(timeframe, candles, source=source)
+        if item is not None:
+            timeframes.append(item)
+    if not timeframes:
+        return None
+    direction, summary = _build_btc_volatility_overall_summary(tuple(timeframes))
+    return BtcVolatilitySupplement(
+        symbol=symbol,
+        generated_at=generated_at,
+        direction=direction,
+        summary=summary,
+        timeframes=tuple(timeframes),
+    )
+
+
+def _collect_btc_volatility_candle_series(
+    symbol: str,
+    *,
+    client: OkxRestClient,
+    timeframes: tuple[str, ...],
+    limit: int,
+) -> tuple[dict[str, list], dict[str, str]]:
+    deribit_client = DeribitRestClient()
+    series_by_timeframe: dict[str, list] = {}
+    source_by_timeframe: dict[str, str] = {}
+    for timeframe in timeframes:
+        price_candles = _load_chart_candles(symbol, timeframe, limit=limit, client=client)
+        candles, source = _load_btc_volatility_timeframe_candles(
+            symbol,
+            timeframe,
+            price_candles=price_candles,
+            limit=limit,
+            deribit_client=deribit_client,
+        )
+        if candles:
+            series_by_timeframe[timeframe] = candles
+            source_by_timeframe[timeframe] = source
+    return series_by_timeframe, source_by_timeframe
+
+
+def _load_btc_volatility_timeframe_candles(
+    symbol: str,
+    timeframe: str,
+    *,
+    price_candles: list,
+    limit: int,
+    deribit_client: DeribitRestClient | None = None,
+) -> tuple[list, str]:
+    deribit_candles = _load_deribit_volatility_timeframe_candles(
+        symbol,
+        timeframe,
+        limit=limit,
+        deribit_client=deribit_client,
+    )
+    if deribit_candles:
+        return deribit_candles, "Deribit 波动率指数"
+    realized = _build_realized_volatility_from_reference_for_digest(price_candles, bar=timeframe, lookback=20)
+    if realized:
+        return realized[-limit:], "程序历史波动率"
+    return [], ""
+
+
+def _load_deribit_volatility_timeframe_candles(
+    symbol: str,
+    timeframe: str,
+    *,
+    limit: int,
+    deribit_client: DeribitRestClient | None = None,
+) -> list:
+    client = deribit_client or DeribitRestClient()
+    end_dt = datetime.now(timezone.utc)
+    lookback_days = {"1H": 30, "4H": 90, "1D": 240, "1W": 840}.get(timeframe, 30)
+    start_dt = end_dt - timedelta(days=lookback_days)
+    hourly_records = min(20_000, max(limit * {"1H": 1, "4H": 8, "1D": 28, "1W": 168}.get(timeframe, 1), 500))
+    try:
+        hourly = client.get_volatility_index_candles(
+            symbol.strip().upper().split("-", 1)[0] or "BTC",
+            "3600",
+            start_ts=int(start_dt.timestamp() * 1000),
+            end_ts=int(end_dt.timestamp() * 1000),
+            max_records=hourly_records,
+        )
+    except Exception:
+        return []
+    if not hourly:
+        return []
+    merged = _aggregate_deribit_volatility_candles_for_digest(
+        hourly,
+        {"1H": 3_600_000, "4H": 14_400_000, "1D": 86_400_000, "1W": 604_800_000}.get(timeframe, 3_600_000),
+    )
+    if limit > 0:
+        merged = merged[-limit:]
+    return [_candle_from_deribit_for_digest(item) for item in merged]
+
+
+def _aggregate_deribit_volatility_candles_for_digest(
+    candles: list[DeribitVolatilityCandle],
+    resolution_ms: int,
+) -> list[DeribitVolatilityCandle]:
+    if not candles:
+        return []
+    buckets: dict[int, list[DeribitVolatilityCandle]] = {}
+    for candle in sorted(candles, key=lambda item: item.ts):
+        key = _deribit_volatility_bucket_start_ms_for_digest(int(candle.ts), resolution_ms)
+        buckets.setdefault(key, []).append(candle)
+    aggregated: list[DeribitVolatilityCandle] = []
+    for key in sorted(buckets):
+        group = buckets[key]
+        aggregated.append(
+            DeribitVolatilityCandle(
+                ts=key,
+                open=group[0].open,
+                high=max(item.high for item in group),
+                low=min(item.low for item in group),
+                close=group[-1].close,
+            )
+        )
+    return aggregated
+
+
+def _deribit_volatility_bucket_start_ms_for_digest(ts_ms: int, resolution_ms: int) -> int:
+    if resolution_ms not in (3_600_000, 14_400_000, 86_400_000, 604_800_000):
+        return (ts_ms // resolution_ms) * resolution_ms
+    dt_utc = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+    local = dt_utc.astimezone(timezone(timedelta(hours=8)))
+    if resolution_ms == 3_600_000:
+        floored = local.replace(minute=0, second=0, microsecond=0)
+    elif resolution_ms == 14_400_000:
+        floored = local.replace(minute=0, second=0, microsecond=0)
+        floored = floored.replace(hour=(floored.hour // 4) * 4)
+    elif resolution_ms == 86_400_000:
+        floored = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start_of_day = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        floored = start_of_day - timedelta(days=start_of_day.weekday())
+    return int(floored.astimezone(timezone.utc).timestamp() * 1000)
+
+
+def _candle_from_deribit_for_digest(item: DeribitVolatilityCandle) -> Candle:
+    return Candle(
+        ts=item.ts,
+        open=item.open,
+        high=item.high,
+        low=item.low,
+        close=item.close,
+        volume=Decimal("0"),
+        confirmed=True,
+    )
+
+
+def _annualization_factor_for_digest_bar(bar: str) -> float:
+    periods_per_year = {
+        "1H": 365 * 24,
+        "4H": 365 * 6,
+        "1D": 365,
+        "1W": 52,
+    }.get(bar.strip())
+    return math.sqrt(periods_per_year) if periods_per_year else 0.0
+
+
+def _build_realized_volatility_from_reference_for_digest(reference_candles: list, *, bar: str, lookback: int) -> list[Candle]:
+    confirmed = [item for item in reference_candles if getattr(item, "confirmed", False)]
+    if len(confirmed) < lookback + 1:
+        return []
+    annualization = _annualization_factor_for_digest_bar(bar)
+    if annualization <= 0:
+        return []
+    output: list[Candle] = []
+    previous_close_vol: float | None = None
+    for index in range(lookback, len(confirmed)):
+        closes = [float(item.close) for item in confirmed[index - lookback : index + 1]]
+        if any(value <= 0 for value in closes):
+            continue
+        returns = [math.log(closes[offset] / closes[offset - 1]) for offset in range(1, len(closes))]
+        if not returns:
+            continue
+        mean_return = sum(returns) / len(returns)
+        variance = sum((item - mean_return) ** 2 for item in returns) / len(returns)
+        close_vol = math.sqrt(max(variance, 0.0)) * annualization * 100.0
+        open_vol = previous_close_vol if previous_close_vol is not None else close_vol
+        candle = confirmed[index]
+        output.append(
+            Candle(
+                ts=candle.ts,
+                open=Decimal(str(open_vol)),
+                high=Decimal(str(max(open_vol, close_vol))),
+                low=Decimal(str(min(open_vol, close_vol))),
+                close=Decimal(str(close_vol)),
+                volume=Decimal("0"),
+                confirmed=True,
+            )
+        )
+        previous_close_vol = close_vol
+    return output
+
+
+def _build_btc_volatility_timeframe_analysis(
+    timeframe: str,
+    candles: list,
+    *,
+    source: str,
+) -> BtcVolatilityTimeframeAnalysis | None:
+    if not candles:
+        return None
+    closes = [item.close for item in candles]
+    ema15_values = moving_average(closes, 15, "ema")
+    ma50_values = moving_average(closes, 50, "ma")
+    if not ema15_values or not ma50_values:
+        return None
+    latest_close = closes[-1]
+    latest_ema15 = ema15_values[-1]
+    latest_ma50 = ma50_values[-1]
+    if latest_ema15 is None or latest_ma50 is None:
+        return None
+    structure = _btc_ema15_ma50_structure(latest_close, latest_ema15, latest_ma50)
+    shape_summary = _btc_ema15_ma50_shape_summary(
+        timeframe,
+        close=latest_close,
+        ema15=latest_ema15,
+        ma50=latest_ma50,
+        ema15_values=ema15_values,
+        ma50_values=ma50_values,
+    )
+    kline_pattern_summary = _btc_ema15_ma50_kline_pattern_summary(timeframe, candles)
+    return BtcVolatilityTimeframeAnalysis(
+        timeframe=timeframe,
+        candle_ts=int(candles[-1].ts),
+        last_close=latest_close,
+        ema15=latest_ema15,
+        ma50=latest_ma50,
+        direction=_btc_ema15_ma50_direction(latest_close, latest_ema15, latest_ma50),
+        structure=structure,
+        source=source,
+        summary=_btc_volatility_timeframe_summary(
+            timeframe,
+            latest_close,
+            latest_ema15,
+            latest_ma50,
+            source_label=source,
+            structure=structure,
+            shape_summary=shape_summary,
+            kline_pattern_summary=kline_pattern_summary,
+        ),
+    )
+
+
+def _btc_volatility_timeframe_summary(
+    timeframe: str,
+    close: Decimal,
+    ema15: Decimal,
+    ma50: Decimal,
+    *,
+    source_label: str,
+    structure: str,
+    shape_summary: str,
+    kline_pattern_summary: str,
+) -> str:
+    trade_conclusion = _btc_volatility_trade_conclusion(
+        timeframe,
+        close=close,
+        ema15=ema15,
+        ma50=ma50,
+        source_label=source_label,
+        structure=structure,
+        shape_summary=shape_summary,
+        kline_pattern_summary=kline_pattern_summary,
+    )
+    if trade_conclusion:
+        return (
+            f"{trade_conclusion} | vol close {_fmt_decimal(close)} / EMA15 {_fmt_decimal(ema15)} / MA50 {_fmt_decimal(ma50)}"
+            f" | 距 EMA15 {_safe_pct_distance(close, ema15)} | 距 MA50 {_safe_pct_distance(close, ma50)}"
+        )
+    source_prefix = f"{timeframe} [{source_label}] " if source_label else f"{timeframe} "
+    return (
+        f"{source_prefix}{structure} | vol close {_fmt_decimal(close)} / EMA15 {_fmt_decimal(ema15)} / MA50 {_fmt_decimal(ma50)}"
+        f" | 距 EMA15 {_safe_pct_distance(close, ema15)} | 距 MA50 {_safe_pct_distance(close, ma50)} | 先看波动率收敛"
+    )
+
+
+def _btc_volatility_trade_conclusion(
+    timeframe: str,
+    *,
+    close: Decimal,
+    ema15: Decimal,
+    ma50: Decimal,
+    source_label: str,
+    structure: str,
+    shape_summary: str,
+    kline_pattern_summary: str,
+) -> str:
+    if timeframe not in {"4H", "1D"}:
+        return ""
+    prefix = f"{timeframe} [{source_label}] " if source_label else f"{timeframe} "
+    below_both_averages = close < ema15 and close < ma50
+    if structure in {"多头排列", "多头回踩"}:
+        if below_both_averages:
+            return f"{prefix}波动率高位回落后仍在降温，虽然中期均线还没完全转空，但短线风险释放更明显；操作上先别按波动扩张处理，等波动率重新站回 EMA15 再决定是否收紧仓位。"
+        structure_text = "EMA15 维持在 MA50 上方" if "拉开 MA50" in shape_summary or "多头发散" in shape_summary else "均线仍偏向扩张"
+        kline_text = (
+            "波动放大后仍有承接"
+            if "长下影" in kline_pattern_summary or "下探后被拉回" in kline_pattern_summary or "试底" in kline_pattern_summary
+            else "波动扩张还在延续"
+        )
+        return f"{prefix}波动率继续抬升，{structure_text}，{kline_text}；操作上降低追价意愿，控制仓位，优先等波动率回落后再跟随。"
+    if structure == "空头反抽" or "收敛" in shape_summary:
+        kline_text = (
+            "日线波动回拉但仍在收敛观察区"
+            if "大阳线" in kline_pattern_summary or "买盘发力明显" in kline_pattern_summary
+            else "波动率反抽但还没重新进入扩张"
+        )
+        return f"{prefix}波动率从高位回落后出现反抽，{kline_text}；操作上先看波动率是否重新上拐，再决定是否收紧仓位。"
+    if structure == "空头排列":
+        structure_text = "EMA15 压在 MA50 下方" if "空头发散" in shape_summary or "远离 MA50" in shape_summary else "波动回落仍占主导"
+        return f"{prefix}波动率持续回落，{structure_text}，短线风险释放为主；操作上可按原趋势节奏跟踪，但仍防止波动率二次抬头。"
+    return f"{prefix}波动率方向未完全明确，均线与K线信号仍在拉扯；操作上先控制频率，等波动率重新选方向。"
+
+
+def _build_btc_ema15_ma50_timeframe_analysis(
+    timeframe: str,
+    candles: list,
+) -> BtcEma15Ma50TimeframeAnalysis | None:
+    if not candles:
+        return None
+    closes = [item.close for item in candles]
+    ema15_values = moving_average(closes, 15, "ema")
+    ma50_values = moving_average(closes, 50, "ma")
+    if not ema15_values or not ma50_values:
+        return None
+    latest_close = closes[-1]
+    latest_ema15 = ema15_values[-1]
+    latest_ma50 = ma50_values[-1]
+    if latest_ema15 is None or latest_ma50 is None:
+        return None
+    direction = _btc_ema15_ma50_direction(latest_close, latest_ema15, latest_ma50)
+    structure = _btc_ema15_ma50_structure(latest_close, latest_ema15, latest_ma50)
+    shape_summary = _btc_ema15_ma50_shape_summary(
+        timeframe,
+        close=latest_close,
+        ema15=latest_ema15,
+        ma50=latest_ma50,
+        ema15_values=ema15_values,
+        ma50_values=ma50_values,
+    )
+    kline_pattern_summary = _btc_ema15_ma50_kline_pattern_summary(timeframe, candles)
+    return BtcEma15Ma50TimeframeAnalysis(
+        timeframe=timeframe,
+        candle_ts=int(candles[-1].ts),
+        last_close=latest_close,
+        ema15=latest_ema15,
+        ma50=latest_ma50,
+        direction=direction,
+        structure=structure,
+        summary=_btc_ema15_ma50_timeframe_summary(
+            timeframe,
+            latest_close,
+            latest_ema15,
+            latest_ma50,
+            direction=direction,
+            structure=structure,
+            shape_summary=shape_summary,
+            kline_pattern_summary=kline_pattern_summary,
+        ),
+    )
+
+
+def _btc_ema15_ma50_direction(close: Decimal, ema15: Decimal, ma50: Decimal) -> str:
+    if close > ema15 > ma50:
+        return "long"
+    if close < ema15 < ma50:
+        return "short"
+    return "neutral"
+
+
+def _btc_ema15_ma50_structure(close: Decimal, ema15: Decimal, ma50: Decimal) -> str:
+    if ema15 > ma50 and close >= ema15:
+        return "多头排列"
+    if ema15 < ma50 and close <= ema15:
+        return "空头排列"
+    if ema15 > ma50 and close < ema15:
+        return "多头回踩"
+    if ema15 < ma50 and close > ema15:
+        return "空头反抽"
+    if close >= ma50:
+        return "围绕 MA50 偏强震荡"
+    return "围绕 MA50 偏弱震荡"
+
+
+def _btc_ema15_ma50_timeframe_summary(
+    timeframe: str,
+    close: Decimal,
+    ema15: Decimal,
+    ma50: Decimal,
+    *,
+    direction: str,
+    structure: str,
+    shape_summary: str,
+    kline_pattern_summary: str,
+) -> str:
+    trade_conclusion = _btc_ema15_ma50_trade_conclusion(
+        timeframe,
+        direction=direction,
+        structure=structure,
+        shape_summary=shape_summary,
+        kline_pattern_summary=kline_pattern_summary,
+    )
+    action_text = "顺势为主" if direction == "long" else "优先等反抽做空" if direction == "short" else "先等方向收敛"
+    if trade_conclusion:
+        return (
+            f"{trade_conclusion} | close {_fmt_decimal(close)} / EMA15 {_fmt_decimal(ema15)} / MA50 {_fmt_decimal(ma50)}"
+            f" | 距 EMA15 {_safe_pct_distance(close, ema15)} | 距 MA50 {_safe_pct_distance(close, ma50)}"
+        )
+    shape_text = f" | 形态{shape_summary}" if timeframe in {"4H", "1D"} and shape_summary else ""
+    kline_text = f" | {kline_pattern_summary}" if timeframe in {"4H", "1D"} and kline_pattern_summary else ""
+    return (
+        f"{timeframe} {structure}{shape_text}{kline_text} | close {_fmt_decimal(close)} / EMA15 {_fmt_decimal(ema15)} / MA50 {_fmt_decimal(ma50)}"
+        f" | 距 EMA15 {_safe_pct_distance(close, ema15)} | 距 MA50 {_safe_pct_distance(close, ma50)} | {action_text}"
+    )
+
+
+def _btc_ema15_ma50_trade_conclusion(
+    timeframe: str,
+    *,
+    direction: str,
+    structure: str,
+    shape_summary: str,
+    kline_pattern_summary: str,
+) -> str:
+    if timeframe not in {"4H", "1D"}:
+        return ""
+    if direction == "long" or structure in {"多头排列", "多头回踩"}:
+        trend_text = f"{timeframe} 多头主导"
+        structure_text = (
+            "EMA15 持续拉开 MA50"
+            if "拉开 MA50" in shape_summary or "多头发散" in shape_summary
+            else "EMA15 仍压在 MA50 上方"
+        )
+        kline_text = (
+            "回踩承接仍在"
+            if "下探后被拉回" in kline_pattern_summary or "长下影" in kline_pattern_summary or "试底" in kline_pattern_summary
+            else "K线配合仍偏强"
+        )
+        return f"{trend_text}，{structure_text}，{kline_text}，短线继续偏多；操作上优先等回踩 EMA15 再跟随，不追高。"
+    if structure == "空头反抽" or (direction == "neutral" and "收敛" in shape_summary):
+        trend_text = f"{timeframe} 空头结构出现反抽修复"
+        kline_text = (
+            "日线买盘回拉但仍以收敛观察为主"
+            if "买盘发力明显" in kline_pattern_summary or "大阳线" in kline_pattern_summary
+            else "反抽修复仍未改写空头结构"
+        )
+        return f"{trend_text}，{kline_text}；操作上先等 EMA15 与 MA50 进一步收敛后再决定是否跟进。"
+    if direction == "short" or structure == "空头排列":
+        trend_text = f"{timeframe} 空头主导"
+        structure_text = (
+            "EMA15 继续压在 MA50 下方"
+            if "远离 MA50" in shape_summary or "空头发散" in shape_summary
+            else "均线压制仍在"
+        )
+        kline_text = (
+            "上方抛压没有明显松动"
+            if "上影" in kline_pattern_summary or "冲高回落" in kline_pattern_summary
+            else "K线配合仍偏弱"
+        )
+        return f"{trend_text}，{structure_text}，{kline_text}；操作上优先等反抽 EMA15 再处理空单，不低位追空。"
+    return f"{timeframe} 方向仍在收敛，均线与K线信号暂未完全同向；操作上先观察，等结构进一步明确后再跟进。"
+
+
+def _btc_ema15_ma50_kline_pattern_summary(timeframe: str, candles: list) -> str:
+    if timeframe not in {"4H", "1D"}:
+        return ""
+    events = build_pattern_focus_events(candles, timeframe=timeframe, limit=1)
+    if not events:
+        return ""
+    primary = events[0]
+    return f"K线形态{primary.label}：{primary.summary}"
+
+
+def _btc_ema15_ma50_shape_summary(
+    timeframe: str,
+    *,
+    close: Decimal,
+    ema15: Decimal,
+    ma50: Decimal,
+    ema15_values: list[Decimal | None],
+    ma50_values: list[Decimal | None],
+) -> str:
+    if timeframe not in {"4H", "1D"}:
+        return ""
+    ema15_slope_3 = _series_change_ratio(ema15_values, 3)
+    ema15_slope_5 = _series_change_ratio(ema15_values, 5)
+    ma50_slope_5 = _series_change_ratio(ma50_values, 5)
+    spread_now = _relative_spread_ratio(ema15, ma50)
+    spread_prev = _relative_spread_ratio(
+        _last_valid_series_value(ema15_values, offset=3),
+        _last_valid_series_value(ma50_values, offset=3),
+    )
+    gap_expanding = spread_now is not None and spread_prev is not None and abs(spread_now) > abs(spread_prev)
+    gap_contracting = spread_now is not None and spread_prev is not None and abs(spread_now) < abs(spread_prev)
+    near_ema15 = _abs_pct_distance_ratio(close, ema15) <= Decimal("0.015")
+
+    if ema15 > ma50:
+        if ema15_slope_3 > 0 and ma50_slope_5 > 0 and gap_expanding:
+            return "EMA15 上拐并继续拉开 MA50，多头发散，趋势延续。"
+        if near_ema15 and gap_contracting:
+            return "价格回到 EMA15 附近，两线开始收口，更像多头回踩确认。"
+        if ema15_slope_3 <= 0 and ema15_slope_5 <= 0:
+            return "EMA15 走平转弱，虽然仍在 MA50 上方，但多头推进减速。"
+        return "EMA15 仍压在 MA50 上方，但两线扩张一般，偏强整理。"
+
+    if ema15 < ma50:
+        if ema15_slope_3 < 0 and ma50_slope_5 < 0 and gap_expanding:
+            return "EMA15 下压并继续远离 MA50，空头发散，弱势延续。"
+        if close > ema15 and gap_contracting:
+            return "价格重新站回 EMA15 上方，EMA15 向 MA50 收敛，当前更像空头反抽后的收口观察。"
+        if ema15_slope_3 > 0 and ema15_slope_5 > 0:
+            return "EMA15 已上拐靠近 MA50，空头压制减弱，正在酝酿反抽或阶段性筑底。"
+        return "EMA15 仍在 MA50 下方，但没有继续明显发散，暂时以反抽整理看待。"
+
+    return "EMA15 与 MA50 明显贴近收口，处在临近变盘的均线挤压状态。"
+
+
+def _series_change_ratio(values: list[Decimal | None], lookback: int) -> Decimal:
+    current = _last_valid_series_value(values, offset=0)
+    previous = _last_valid_series_value(values, offset=lookback)
+    if current is None or previous is None or previous == 0:
+        return Decimal("0")
+    return (current - previous) / previous
+
+
+def _last_valid_series_value(values: list[Decimal | None], *, offset: int) -> Decimal | None:
+    index = len(values) - 1 - max(offset, 0)
+    while index >= 0:
+        value = values[index]
+        if value is not None:
+            return value
+        index -= 1
+    return None
+
+
+def _relative_spread_ratio(left: Decimal | None, right: Decimal | None) -> Decimal | None:
+    if left is None or right is None or right == 0:
+        return None
+    return (left - right) / right
+
+
+def _abs_pct_distance_ratio(left: Decimal, right: Decimal) -> Decimal:
+    if right == 0:
+        return Decimal("999")
+    return abs((left - right) / right)
+
+
+def _build_btc_ema15_ma50_overall_summary(
+    timeframes: tuple[BtcEma15Ma50TimeframeAnalysis, ...],
+) -> tuple[str, str]:
+    direction_counts = {"long": 0, "short": 0, "neutral": 0}
+    for item in timeframes:
+        direction_counts[item.direction] = direction_counts.get(item.direction, 0) + 1
+    if direction_counts["long"] >= 3 and direction_counts["short"] == 0:
+        return "long", "4 个周期里多数保持多头结构，BTC 额外观察口径偏多，优先等回踩 EMA15 后再跟随。"
+    if direction_counts["short"] >= 3 and direction_counts["long"] == 0:
+        return "short", "4 个周期里多数保持空头结构，BTC 额外观察口径偏空，优先等反抽 EMA15 后再处理空头。"
+    if direction_counts["long"] > direction_counts["short"]:
+        return "long", "短中周期偏多，但并非全周期一致，BTC 额外观察口径以偏多跟踪为主，避免直接追价。"
+    if direction_counts["short"] > direction_counts["long"]:
+        return "short", "短中周期偏空，但并非全周期一致，BTC 额外观察口径以偏空跟踪为主，避免在低位追空。"
+    return "neutral", "EMA15 与 MA50 在 4 个周期里分歧较大，BTC 额外观察口径先看收敛，等待 1H/4H 重新同向。"
+
+
+def _build_btc_volatility_overall_summary(
+    timeframes: tuple[BtcVolatilityTimeframeAnalysis, ...],
+) -> tuple[str, str]:
+    direction_counts = {"long": 0, "short": 0, "neutral": 0}
+    sources = sorted({item.source for item in timeframes if item.source})
+    source_text = " / ".join(sources) if sources else "当前可用波动率序列"
+    for item in timeframes:
+        direction_counts[item.direction] = direction_counts.get(item.direction, 0) + 1
+    if direction_counts["long"] >= 3 and direction_counts["short"] == 0:
+        return "long", f"{source_text}多数周期仍在扩张，短线先把风险控制放在交易节奏前面，避免追价追单。"
+    if direction_counts["short"] >= 3 and direction_counts["long"] == 0:
+        return "short", f"{source_text}多数周期持续回落，风险释放为主，但仍要防止波动率二次抬头。"
+    if direction_counts["long"] > direction_counts["short"]:
+        return "long", f"{source_text}短中周期仍偏扩张，但不是全周期一致，操作上以控仓和等回落为主。"
+    if direction_counts["short"] > direction_counts["long"]:
+        return "short", f"{source_text}短中周期偏回落，市场风险在释放，但暂时不建议因为波动率回落就放松纪律。"
+    return "neutral", f"{source_text}当前仍在收敛与反抽之间切换，先观察 4H/1D 是否重新同向。"
+
+
+def _btc_ema15_ma50_payload(supplement: BtcEma15Ma50Supplement) -> dict[str, object]:
+    return {
+        "symbol": supplement.symbol,
+        "generated_at": supplement.generated_at,
+        "direction": supplement.direction,
+        "summary": supplement.summary,
+        "timeframes": [
+            {
+                "timeframe": item.timeframe,
+                "candle_ts": item.candle_ts,
+                "last_close": str(item.last_close) if item.last_close is not None else None,
+                "ema15": str(item.ema15) if item.ema15 is not None else None,
+                "ma50": str(item.ma50) if item.ma50 is not None else None,
+                "direction": item.direction,
+                "structure": item.structure,
+                "summary": item.summary,
+            }
+            for item in supplement.timeframes
+        ],
+    }
+
+
+def _btc_volatility_ema15_ma50_payload(supplement: BtcVolatilitySupplement) -> dict[str, object]:
+    return {
+        "symbol": supplement.symbol,
+        "generated_at": supplement.generated_at,
+        "direction": supplement.direction,
+        "summary": supplement.summary,
+        "timeframes": [
+            {
+                "timeframe": item.timeframe,
+                "candle_ts": item.candle_ts,
+                "last_close": str(item.last_close) if item.last_close is not None else None,
+                "ema15": str(item.ema15) if item.ema15 is not None else None,
+                "ma50": str(item.ma50) if item.ma50 is not None else None,
+                "direction": item.direction,
+                "structure": item.structure,
+                "source": item.source,
+                "summary": item.summary,
+            }
+            for item in supplement.timeframes
+        ],
+    }
+
+
+def _build_btc_ema15_ma50_overlay_map(symbol: str) -> dict[str, dict[str, tuple[MiniChartOverlay, ...]]]:
+    overlays = (
+        MiniChartOverlay(period=15, ma_type="ema"),
+        MiniChartOverlay(period=50, ma_type="ma"),
+    )
+    return {
+        symbol: {
+            "1H": overlays,
+            "4H": overlays,
+            "1D": overlays,
+            "1W": overlays,
+        }
+    }
+
+
+def _safe_pct_distance(left: Decimal, right: Decimal) -> str:
+    if right == 0:
+        return "-"
+    return f"{((left - right) / right) * Decimal('100'):.2f}%"
+
+
+def _fmt_decimal(value: Decimal | None) -> str:
+    if value is None:
+        return "-"
+    return format(value.quantize(Decimal("0.01")), "f")
 
 
 def _build_single_chart_cell(*, asset: str, timeframe: str, encoded: str) -> str:

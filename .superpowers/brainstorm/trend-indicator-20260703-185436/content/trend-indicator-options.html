@@ -1,0 +1,77 @@
+﻿<h2>日线趋势指标显示方案</h2>
+<p class="subtitle">目标已固定：主图底部一条独立趋势带，先做 5 态。现在只比较视觉承载方式。</p>
+
+<div class="cards">
+  <div class="card" data-choice="bars" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">A. 柱状状态条</div>
+        <div class="mockup-body" style="padding:16px;background:#0b1220;">
+          <div style="height:120px;border-radius:10px;background:linear-gradient(180deg,#0f172a,#0b1220);position:relative;overflow:hidden;border:1px solid #1f2937;">
+            <div style="position:absolute;left:0;right:0;top:12px;height:64px;background:linear-gradient(90deg,transparent 0%,transparent 5%,#334155 5%,#334155 6%,transparent 6%,transparent 12%,#334155 12%,#334155 13%,transparent 13%,transparent 19%,#334155 19%,#334155 20%,transparent 20%);opacity:.45"></div>
+            <div style="position:absolute;left:10px;right:10px;bottom:12px;height:22px;display:flex;gap:2px;align-items:flex-end;">
+              <div style="flex:1;height:20px;background:#166534"></div>
+              <div style="flex:1;height:20px;background:#22c55e"></div>
+              <div style="flex:1;height:20px;background:#86efac"></div>
+              <div style="flex:1;height:20px;background:#fda4af"></div>
+              <div style="flex:1;height:20px;background:#be123c"></div>
+              <div style="flex:1;height:20px;background:#166534"></div>
+              <div style="flex:1;height:20px;background:#22c55e"></div>
+              <div style="flex:1;height:20px;background:#86efac"></div>
+              <div style="flex:1;height:20px;background:#fda4af"></div>
+              <div style="flex:1;height:20px;background:#be123c"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>柱状</h3>
+      <p>离散、规则感强，适合强调状态切换，但会更像副指标，不够贴近趋势连续性。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="band" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">B. 连续色带</div>
+        <div class="mockup-body" style="padding:16px;background:#0b1220;">
+          <div style="height:120px;border-radius:10px;background:linear-gradient(180deg,#0f172a,#0b1220);position:relative;overflow:hidden;border:1px solid #1f2937;">
+            <div style="position:absolute;left:0;right:0;top:12px;height:64px;background:linear-gradient(90deg,transparent 0%,transparent 5%,#334155 5%,#334155 6%,transparent 6%,transparent 12%,#334155 12%,#334155 13%,transparent 13%,transparent 19%,#334155 19%,#334155 20%,transparent 20%);opacity:.45"></div>
+            <div style="position:absolute;left:10px;right:10px;bottom:18px;height:12px;border-radius:999px;background:linear-gradient(90deg,#166534 0%,#22c55e 20%,#86efac 40%,#fda4af 60%,#be123c 82%,#166534 100%);box-shadow:0 0 0 1px rgba(255,255,255,.06) inset;"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>带状</h3>
+      <p>最贴近“趋势状态层”，连续、安静、占用高度小。适合未来继续叠加更多判断逻辑。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="band-labeled" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">C. 带状 + 5 态标签</div>
+        <div class="mockup-body" style="padding:16px;background:#0b1220;">
+          <div style="height:120px;border-radius:10px;background:linear-gradient(180deg,#0f172a,#0b1220);position:relative;overflow:hidden;border:1px solid #1f2937;">
+            <div style="position:absolute;left:0;right:0;top:12px;height:64px;background:linear-gradient(90deg,transparent 0%,transparent 5%,#334155 5%,#334155 6%,transparent 6%,transparent 12%,#334155 12%,#334155 13%,transparent 13%,transparent 19%,#334155 19%,#334155 20%,transparent 20%);opacity:.45"></div>
+            <div style="position:absolute;left:10px;right:10px;bottom:14px;height:14px;border-radius:999px;background:linear-gradient(90deg,#166534 0%,#22c55e 20%,#86efac 40%,#fda4af 60%,#be123c 82%,#166534 100%);"></div>
+            <div style="position:absolute;left:12px;right:12px;bottom:34px;display:flex;justify-content:space-between;font-size:10px;color:#cbd5e1;letter-spacing:.04em;">
+              <span>强多</span><span>弱多</span><span>中性</span><span>弱空</span><span>强空</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>带状 + 标签</h3>
+      <p>保留色带的连续性，同时把 5 态语义直接讲清楚。最适合作为后续规则扩展的正式版本。</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="label">我的建议</div>
+  <p>优先选 <strong>C. 带状 + 5 态标签</strong>。它比柱状更像“趋势层”，比纯色带更容易承载你后面继续加的逻辑。</p>
+</div>

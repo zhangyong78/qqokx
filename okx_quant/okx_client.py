@@ -47,6 +47,36 @@ MAX_PUBLIC_CANDLE_LIMIT = 300
 FULL_HISTORY_CHECKPOINT_PAGE_INTERVAL = 25
 
 
+def _candle_bar_ms(bar: str) -> int:
+    normalized = str(bar or "").strip().upper()
+    if len(normalized) < 2:
+        return 0
+    unit = normalized[-1]
+    try:
+        value = int(normalized[:-1])
+    except ValueError:
+        return 0
+    if value <= 0:
+        return 0
+    if unit == "M":
+        return value * 60_000
+    if unit == "H":
+        return value * 60 * 60_000
+    if unit == "D":
+        return value * 24 * 60 * 60_000
+    return 0
+
+
+def _candles_have_internal_gaps(candles: list[Candle], bar: str) -> bool:
+    expected_gap = _candle_bar_ms(bar)
+    if expected_gap <= 0 or len(candles) < 2:
+        return False
+    for left, right in zip(candles, candles[1:]):
+        if int(right.ts) - int(left.ts) != expected_gap:
+            return True
+    return False
+
+
 class OkxApiError(RuntimeError):
     def __init__(self, message: str, *, code: str | None = None, status: int | None = None) -> None:
         super().__init__(message)
@@ -615,6 +645,8 @@ class OkxRestClient:
         fetch_full_history = limit <= 0
         requested_limit = 0 if fetch_full_history else max(1, limit)
         cached = load_candle_cache(inst_id, bar, limit=None if fetch_full_history else requested_limit)
+        cached_window = list(cached) if fetch_full_history else cached[-requested_limit:]
+        cache_window_has_gaps = _candles_have_internal_gaps(cached_window, bar)
         cached_ts = {candle.ts for candle in cached}
         latest_added_ts: set[int] = set()
         older_added_ts: set[int] = set()
@@ -644,7 +676,8 @@ class OkxRestClient:
         latest_batch_ts = {candle.ts for candle in latest_batch}
         latest_added_ts = latest_batch_ts - cached_ts
 
-        collected = merge_candles(cached, latest_batch)
+        seed_candles = cached if not cache_window_has_gaps else []
+        collected = merge_candles(seed_candles, latest_batch)
         after = str(collected[0].ts) if collected else None
         page_count = 1 if latest_batch else 0
         if fetch_full_history and collected:
@@ -695,7 +728,7 @@ class OkxRestClient:
         save_candle_cache(
             inst_id,
             bar,
-            collected,
+            merge_candles(cached, collected),
             max_records=max(DEFAULT_CANDLE_CACHE_CAPACITY, requested_limit, len(collected)),
         )
         returned = list(collected) if fetch_full_history else collected[-requested_limit:]

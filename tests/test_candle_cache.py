@@ -44,6 +44,10 @@ def _build_okx_row(ts: int, close: str) -> list[str]:
     ]
 
 
+def _ts15(index: int) -> int:
+    return index * 900_000
+
+
 class DummyHistoryClient(OkxRestClient):
     def __init__(self, pages: dict[str, list[list[str]]]) -> None:
         self.pages = pages
@@ -150,8 +154,8 @@ class CandleCacheTest(TestCase):
         self.assertEqual(merged[1].close, Decimal("202"))
 
     def test_history_fetch_uses_cache_and_only_refreshes_latest_page_when_cache_is_enough(self) -> None:
-        cached = [_build_candle(index, str(100 + index)) for index in range(1, 1001)]
-        latest_page = [_build_okx_row(index, str(200 + index)) for index in range(701, 1001)]
+        cached = [_build_candle(_ts15(index), str(100 + index)) for index in range(1, 1001)]
+        latest_page = [_build_okx_row(_ts15(index), str(200 + index)) for index in range(701, 1001)]
         saved_snapshots: list[list[Candle]] = []
         client = DummyHistoryClient({"__LATEST__": latest_page})
 
@@ -170,7 +174,7 @@ class CandleCacheTest(TestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertNotIn("after", client.calls[0])
         self.assertEqual(len(candles), 800)
-        self.assertEqual(candles[-1].ts, 1000)
+        self.assertEqual(candles[-1].ts, _ts15(1000))
         self.assertTrue(saved_snapshots)
         self.assertEqual(client.last_candle_history_stats["cache_hit_count"], 800)
         self.assertEqual(client.last_candle_history_stats["latest_fetch_count"], 0)
@@ -178,10 +182,10 @@ class CandleCacheTest(TestCase):
 
     def test_history_fetch_zero_limit_downloads_full_history(self) -> None:
         pages = {
-            "__LATEST__": [_build_okx_row(index, str(100 + index)) for index in range(701, 1001)],
-            "701": [_build_okx_row(index, str(100 + index)) for index in range(401, 701)],
-            "401": [_build_okx_row(index, str(100 + index)) for index in range(101, 401)],
-            "101": [_build_okx_row(index, str(100 + index)) for index in range(1, 101)],
+            "__LATEST__": [_build_okx_row(_ts15(index), str(100 + index)) for index in range(701, 1001)],
+            str(_ts15(701)): [_build_okx_row(_ts15(index), str(100 + index)) for index in range(401, 701)],
+            str(_ts15(401)): [_build_okx_row(_ts15(index), str(100 + index)) for index in range(101, 401)],
+            str(_ts15(101)): [_build_okx_row(_ts15(index), str(100 + index)) for index in range(1, 101)],
         }
         saved_snapshots: list[tuple[list[Candle], int | None]] = []
         client = DummyHistoryClient(pages)
@@ -199,10 +203,13 @@ class CandleCacheTest(TestCase):
             okx_client_module.save_candle_cache = original_save
 
         self.assertEqual(len(client.calls), 4)
-        self.assertEqual([call.get("after") for call in client.calls], [None, "701", "401", "101"])
+        self.assertEqual(
+            [call.get("after") for call in client.calls],
+            [None, str(_ts15(701)), str(_ts15(401)), str(_ts15(101))],
+        )
         self.assertEqual(len(candles), 1000)
-        self.assertEqual(candles[0].ts, 1)
-        self.assertEqual(candles[-1].ts, 1000)
+        self.assertEqual(candles[0].ts, _ts15(1))
+        self.assertEqual(candles[-1].ts, _ts15(1000))
         self.assertTrue(saved_snapshots)
         self.assertEqual(len(saved_snapshots[-1][0]), 1000)
         self.assertEqual(saved_snapshots[-1][1], 12000)
@@ -214,10 +221,10 @@ class CandleCacheTest(TestCase):
 
     def test_history_fetch_zero_limit_reports_progress_and_saves_checkpoints(self) -> None:
         pages = {
-            "__LATEST__": [_build_okx_row(index, str(100 + index)) for index in range(701, 1001)],
-            "701": [_build_okx_row(index, str(100 + index)) for index in range(401, 701)],
-            "401": [_build_okx_row(index, str(100 + index)) for index in range(101, 401)],
-            "101": [_build_okx_row(index, str(100 + index)) for index in range(1, 101)],
+            "__LATEST__": [_build_okx_row(_ts15(index), str(100 + index)) for index in range(701, 1001)],
+            str(_ts15(701)): [_build_okx_row(_ts15(index), str(100 + index)) for index in range(401, 701)],
+            str(_ts15(401)): [_build_okx_row(_ts15(index), str(100 + index)) for index in range(101, 401)],
+            str(_ts15(101)): [_build_okx_row(_ts15(index), str(100 + index)) for index in range(1, 101)],
         }
         saved_snapshots: list[tuple[list[Candle], int | None]] = []
         progress_records: list[dict[str, object]] = []
@@ -246,11 +253,41 @@ class CandleCacheTest(TestCase):
         self.assertEqual(len(candles), 1000)
         self.assertEqual([record["page_count"] for record in progress_records], [1, 2, 3, 4])
         self.assertEqual(progress_records[-1]["total_count"], 1000)
-        self.assertEqual(progress_records[-1]["oldest_ts"], 1)
-        self.assertEqual(progress_records[-1]["newest_ts"], 1000)
+        self.assertEqual(progress_records[-1]["oldest_ts"], _ts15(1))
+        self.assertEqual(progress_records[-1]["newest_ts"], _ts15(1000))
         self.assertGreaterEqual(len(saved_snapshots), 3)
         self.assertEqual(saved_snapshots[0][1], 12000)
         self.assertEqual(saved_snapshots[-1][1], 12000)
+
+    def test_history_fetch_repairs_internal_cache_gaps_by_refetching_from_latest_page(self) -> None:
+        cached = [_build_candle(_ts15(index), str(100 + index)) for index in range(1, 1001) if index not in range(549, 649)]
+        pages = {
+            "__LATEST__": [_build_okx_row(_ts15(index), str(200 + index)) for index in range(701, 1001)],
+            str(_ts15(701)): [_build_okx_row(_ts15(index), str(200 + index)) for index in range(401, 701)],
+            str(_ts15(401)): [_build_okx_row(_ts15(index), str(200 + index)) for index in range(201, 401)],
+        }
+        saved_snapshots: list[list[Candle]] = []
+        client = DummyHistoryClient(pages)
+
+        original_load = okx_client_module.load_candle_cache
+        original_save = okx_client_module.save_candle_cache
+        okx_client_module.load_candle_cache = lambda inst_id, bar, **kwargs: list(cached)
+        okx_client_module.save_candle_cache = (
+            lambda inst_id, bar, candles, max_records=None: saved_snapshots.append(list(candles))
+        )
+        try:
+            candles = client.get_candles_history("BTC-USDT-SWAP", "15m", limit=800)
+        finally:
+            okx_client_module.load_candle_cache = original_load
+            okx_client_module.save_candle_cache = original_save
+
+        self.assertEqual([call.get("after") for call in client.calls], [None, str(_ts15(701)), str(_ts15(401))])
+        self.assertEqual(len(candles), 800)
+        self.assertEqual(candles[0].ts, _ts15(201))
+        self.assertEqual(candles[-1].ts, _ts15(1000))
+        self.assertTrue(saved_snapshots)
+        for left, right in zip(candles, candles[1:]):
+            self.assertEqual(right.ts - left.ts, 900_000)
 
     def test_history_range_merges_local_cache_into_returned_series(self) -> None:
         """区间拉取返回值应合并本地缓存，避免仅 API 子集导致回测缺根。"""

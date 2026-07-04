@@ -11,6 +11,7 @@ from okx_quant.btc_market_analyzer import (
     analyze_btc_market_at_time,
     analyze_btc_market_from_candle_map,
     btc_market_analysis_payload,
+    build_pattern_focus_events,
     build_btc_market_analysis_email_body,
     save_btc_market_analysis,
 )
@@ -78,6 +79,20 @@ class BtcMarketAnalyzerTest(TestCase):
         self.assertEqual(payload["resonance"]["direction"], "long")
         self.assertEqual(payload["mode"], "realtime")
         self.assertIn("focus_events", payload["timeframes"][0])
+
+    def test_build_pattern_focus_events_supports_daily_timeframe(self) -> None:
+        candles = [
+            Candle(ts=1000, open=Decimal("102"), high=Decimal("103"), low=Decimal("100"), close=Decimal("101"), volume=Decimal("1"), confirmed=True),
+            Candle(ts=2000, open=Decimal("101"), high=Decimal("101.5"), low=Decimal("98.5"), close=Decimal("99.5"), volume=Decimal("1"), confirmed=True),
+            Candle(ts=3000, open=Decimal("99.5"), high=Decimal("100"), low=Decimal("96.5"), close=Decimal("97"), volume=Decimal("1"), confirmed=True),
+            Candle(ts=4000, open=Decimal("97.0"), high=Decimal("97.9"), low=Decimal("92.5"), close=Decimal("97.7"), volume=Decimal("1"), confirmed=True),
+        ]
+
+        events = build_pattern_focus_events(candles, timeframe="1D")
+
+        self.assertGreaterEqual(len(events), 1)
+        self.assertEqual(events[0].timeframe, "1D")
+        self.assertTrue(any(item.label in {"锤子线", "长下影"} for item in events))
 
     def test_save_and_email_body_are_ready_for_delivery(self) -> None:
         candles = _bullish_trend_candles()

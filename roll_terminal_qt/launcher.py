@@ -5,7 +5,7 @@ import sys
 from datetime import datetime
 from typing import Iterable
 
-from PySide6.QtCore import Qt, QUrl, Slot
+from PySide6.QtCore import QCoreApplication, Qt, QUrl, Slot
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -39,7 +39,7 @@ from roll_terminal_qt.ui import RollTerminalWindow
 
 
 def module_choices() -> tuple[str, ...]:
-    return ("home", "kline-analysis") + tuple(spec.key for spec in launcher_module_specs())
+    return ("home",) + tuple(spec.key for spec in launcher_module_specs())
 
 
 def _standalone_command(module_key: str) -> str:
@@ -251,23 +251,33 @@ class LauncherWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
-
-        data_menu = menu_bar.addMenu("设置")
+        option_menu_keys = {"deribit-volatility", "option-strategy"}
         shared_action = QAction("查看目录与路径", self)
         shared_action.triggered.connect(self._show_shared_data_dialog)
-        data_menu.addAction(shared_action)
 
         module_menu = menu_bar.addMenu("模块导航")
         for spec in launcher_module_specs():
+            if spec.key == "kline-analysis" or spec.key in option_menu_keys:
+                continue
             action = QAction(spec.title, self)
             action.triggered.connect(lambda _checked=False, key=spec.key: self.open_module_window(key))
             module_menu.addAction(action)
-        module_menu.addSeparator()
-        chart_action = QAction("专业K线分析", self)
-        chart_action.triggered.connect(lambda _checked=False: self.open_module_window("kline-analysis"))
-        module_menu.addAction(chart_action)
 
+        option_menu = menu_bar.addMenu("期权")
+        for spec in launcher_module_specs():
+            if spec.key not in option_menu_keys:
+                continue
+            action = QAction(spec.title, self)
+            action.triggered.connect(lambda _checked=False, key=spec.key: self.open_module_window(key))
+            option_menu.addAction(action)
+
+        kline_menu = menu_bar.addMenu("K线分析")
+        open_kline_action = QAction("打开 K 线分析", self)
+        open_kline_action.triggered.connect(lambda: self.open_module_window("kline-analysis"))
+        kline_menu.addAction(open_kline_action)
         home_menu = menu_bar.addMenu("系统")
+        home_menu.addAction(shared_action)
+
         refresh_action = QAction("刷新当前页面", self)
         refresh_action.triggered.connect(self._home_widget.refresh_view)
         home_menu.addAction(refresh_action)
@@ -404,6 +414,7 @@ def run(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     app = QApplication.instance()
     if app is None:
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL)
         app = QApplication(sys.argv[:1])
     apply_qt_application_identity(app)
     app.setStyleSheet(APP_STYLE)

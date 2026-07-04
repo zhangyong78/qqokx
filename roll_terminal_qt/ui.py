@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -63,6 +64,11 @@ from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots, profile_requires_password
 from roll_terminal_qt.runtime import load_runtime, profile_names
 from roll_terminal_qt.spread_chart_window import SpreadChartWindow
+from roll_terminal_qt.spot_arbitrage_tools import (
+    SpotArbitrageChartWidget,
+    SpotArbitrageScanWidget,
+    scan_opportunity_to_view,
+)
 from roll_terminal_qt.style import APP_STYLE
 from okx_quant.arbitrage.size_converter import preview_arbitrage_size
 from okx_quant.arbitrage.position_ledger import load_open_ledger_entries
@@ -192,6 +198,9 @@ class RollTerminalWindow(QMainWindow):
         self._limit_order_preference = False
         self._book_pair_locked = False
         self._spread_chart_window: SpreadChartWindow | None = None
+        self._terminal_tabs: QTabWidget | None = None
+        self._spot_arbitrage_scan_widget: SpotArbitrageScanWidget | None = None
+        self._spot_arbitrage_chart_widget: SpotArbitrageChartWidget | None = None
         self._execution_history_records: list[dict[str, object]] = []
         self._all_opportunities = load_all_opportunities()
         self._filtered_opportunities = list(self._all_opportunities)
@@ -227,6 +236,10 @@ class RollTerminalWindow(QMainWindow):
             if not self._target_thread.wait(800):
                 self._target_thread.terminate()
                 self._target_thread.wait(800)
+        if self._spot_arbitrage_scan_widget is not None:
+            self._spot_arbitrage_scan_widget.close_running_thread()
+        if self._spot_arbitrage_chart_widget is not None:
+            self._spot_arbitrage_chart_widget.close_running_thread()
         super().closeEvent(event)
 
     def _stop_runtime_threads(self) -> None:
@@ -856,7 +869,17 @@ class RollTerminalWindow(QMainWindow):
         content_layout.addWidget(sidebar, 3)
         content_layout.addLayout(left_column, 7)
         content_layout.addLayout(right_column, 4)
-        main.addWidget(content, 1)
+
+        self._spot_arbitrage_scan_widget = SpotArbitrageScanWidget()
+        self._spot_arbitrage_chart_widget = SpotArbitrageChartWidget()
+        self._spot_arbitrage_scan_widget.opportunity_selected.connect(self._apply_scanned_arbitrage_opportunity)
+        self._spot_arbitrage_scan_widget.chart_requested.connect(self._open_scanned_arbitrage_chart)
+
+        self._terminal_tabs = QTabWidget()
+        self._terminal_tabs.addTab(content, "交易终端")
+        self._terminal_tabs.addTab(self._spot_arbitrage_scan_widget, "机会扫描")
+        self._terminal_tabs.addTab(self._spot_arbitrage_chart_widget, "套利图表")
+        main.addWidget(self._terminal_tabs, 1)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -987,6 +1010,35 @@ class RollTerminalWindow(QMainWindow):
         self._spread_chart_window.show()
         self._spread_chart_window.raise_()
         self._spread_chart_window.activateWindow()
+
+    @Slot(object)
+    def _apply_scanned_arbitrage_opportunity(self, opportunity: object) -> None:
+        view = scan_opportunity_to_view(opportunity)
+        self._all_opportunities = [view, *[item for item in self._all_opportunities if item.key != view.key]]
+        open_index = self._terminal_mode.findData("open")
+        if open_index >= 0 and self._terminal_mode.currentIndex() != open_index:
+            self._terminal_mode.setCurrentIndex(open_index)
+        self._selected_opportunity = view
+        self._opportunity_search.clear()
+        self._apply_opportunity_filter("")
+        selected_index = next(
+            (idx for idx, item in enumerate(self._filtered_opportunities) if item.key == view.key),
+            -1,
+        )
+        if selected_index >= 0:
+            self._opportunity_list.setCurrentRow(selected_index)
+            self._on_opportunity_selected(selected_index)
+        if self._terminal_tabs is not None:
+            self._terminal_tabs.setCurrentIndex(0)
+        self._set_status(f"已带入扫描机会：{view.left_inst_id} / {view.right_inst_id}")
+
+    @Slot(object)
+    def _open_scanned_arbitrage_chart(self, opportunity: object) -> None:
+        if self._spot_arbitrage_chart_widget is None:
+            return
+        self._spot_arbitrage_chart_widget.load_from_opportunity(opportunity)
+        if self._terminal_tabs is not None:
+            self._terminal_tabs.setCurrentWidget(self._spot_arbitrage_chart_widget)
 
     def _current_auto_condition_text(self, threshold: Decimal) -> str:
         left_leg = self._current.currentText().strip() or self._current_inst_id() or "当前腿"

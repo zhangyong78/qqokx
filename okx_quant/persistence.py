@@ -41,6 +41,7 @@ STRATEGY_PARAMETER_DRAFTS_FILE_NAME = "strategy_parameter_drafts.json"
 STRATEGY_PROFILE_LIBRARY_FILE_NAME = "strategy_profile_library.json"
 STRATEGY_BUNDLE_EXPORT_DIR_NAME = "strategy_bundles"
 LINE_TRADING_DESK_ANNOTATIONS_FILE_NAME = "line_trading_desk_annotations.json"
+KLINE_ANALYSIS_WORKSPACE_FILE_NAME = "kline_analysis_workspace.json"
 JOURNAL_ENTRIES_FILE_NAME = "journal_entries.json"
 BTC_RESEARCH_WORKBENCH_STATE_FILE_NAME = "btc_research_workbench_state.json"
 BTC_MARKET_EMAIL_STATE_FILE_NAME = "btc_market_email_state.json"
@@ -249,6 +250,12 @@ def line_trading_desk_annotations_file_path(base_dir: Path | None = None) -> Pat
     return state_dir_path() / LINE_TRADING_DESK_ANNOTATIONS_FILE_NAME
 
 
+def kline_analysis_workspace_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / KLINE_ANALYSIS_WORKSPACE_FILE_NAME
+    return state_dir_path() / KLINE_ANALYSIS_WORKSPACE_FILE_NAME
+
+
 def journal_entries_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / JOURNAL_ENTRIES_FILE_NAME if base_dir is not None else state_dir_path() / JOURNAL_ENTRIES_FILE_NAME
 
@@ -295,6 +302,42 @@ def load_line_trading_desk_annotations_entries(path: Path | None = None) -> dict
 def save_line_trading_desk_annotations_entries(entries: dict[str, dict[str, object]], path: Path | None = None) -> Path:
     """整文件写入；entries 为 api|标的|周期 → {lines, rr}。"""
     target = path or line_trading_desk_annotations_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "entries": dict(entries),
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
+
+
+def load_kline_analysis_workspace_entries(path: Path | None = None) -> dict[str, dict[str, object]]:
+    target = path or kline_analysis_workspace_file_path()
+    if not target.exists():
+        return {}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    raw = payload.get("entries")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, object]] = {}
+    for k, v in raw.items():
+        key = str(k).strip()
+        if not key or not isinstance(v, dict):
+            continue
+        out[key] = dict(v)
+    return out
+
+
+def save_kline_analysis_workspace_entries(entries: dict[str, dict[str, object]], path: Path | None = None) -> Path:
+    target = path or kline_analysis_workspace_file_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": 1,

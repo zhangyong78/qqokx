@@ -529,6 +529,15 @@ def _build_current_snapshot_section(analysis: BtcMarketAnalysis) -> list[str]:
 def _build_focus_events(candles: list[Candle], *, timeframe: str) -> tuple[PatternFocusEvent, ...]:
     if timeframe not in FOCUS_EMAIL_TIMEFRAMES:
         return ()
+    return build_pattern_focus_events(candles, timeframe=timeframe)
+
+
+def build_pattern_focus_events(
+    candles: list[Candle],
+    *,
+    timeframe: str,
+    limit: int = 12,
+) -> tuple[PatternFocusEvent, ...]:
     events = [
         *_replay_focus_events(candles, timeframe=timeframe),
         *_single_candle_focus_events(candles, timeframe=timeframe),
@@ -540,7 +549,7 @@ def _build_focus_events(candles: list[Candle], *, timeframe: str) -> tuple[Patte
         if current is None or event.score > current.score:
             unique[key] = event
     ordered = sorted(unique.values(), key=lambda item: (item.ts, item.score, item.candle_count, item.label), reverse=True)
-    return tuple(ordered[:12])
+    return tuple(ordered[: max(limit, 0)])
 
 
 def _replay_focus_events(candles: list[Candle], *, timeframe: str) -> list[PatternFocusEvent]:

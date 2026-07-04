@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from roll_terminal_qt.app_icon import apply_qt_window_icon
 from okx_quant.models import Candle, Credentials, Instrument
 from okx_quant.okx_client import OkxPosition, OkxRestClient, OkxTicker
 from okx_quant.option_strategy import (
@@ -1499,7 +1500,7 @@ class CandlestickChartView(QChartView):
 class OptionStrategyBigChartDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
+        apply_qt_window_icon(self)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
         self.setWindowTitle("期权策略图表大窗")

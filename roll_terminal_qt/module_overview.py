@@ -8,8 +8,10 @@ from okx_quant.auto_channel_preview import build_auto_channel_preview_snapshot
 from okx_quant.persistence import (
     deribit_report_export_dir_path,
     deribit_volatility_cache_file_path,
+    kline_analysis_workspace_file_path,
     line_trading_desk_annotations_file_path,
     load_credentials_profiles_snapshot,
+    load_kline_analysis_workspace_entries,
     load_option_strategies_snapshot,
     load_line_trading_desk_annotations_entries,
     load_smart_order_favorites_snapshot,
@@ -44,6 +46,13 @@ def launcher_module_specs() -> tuple[LauncherModuleSpec, ...]:
             subtitle="主壳负责统一入口、共享配置和核心交易流程。",
             status="Qt 主模块",
         ),
+        LauncherModuleSpec(
+            key="kline-analysis",
+            title="K线分析",
+            subtitle="本地图表工作台，支持原生备用渲染、持久化预警线和面向监控的信号规则。",
+            status="Qt 原生",
+        ),
+
         LauncherModuleSpec(
             key="smart-order",
             title="无限下单",
@@ -186,10 +195,37 @@ def build_option_strategy_module_overview() -> ModuleOverview:
     )
 
 
+
+def build_kline_analysis_module_overview() -> ModuleOverview:
+    entries = load_kline_analysis_workspace_entries()
+    session_count = len(entries)
+    total_lines = 0
+    total_events = 0
+    for entry in entries.values():
+        lines = entry.get("lines")
+        events = entry.get("events")
+        if isinstance(lines, list):
+            total_lines += len(lines)
+        if isinstance(events, list):
+            total_events += len(events)
+    return ModuleOverview(
+        status="Qt Ready",
+        phase="K-line Analysis Workstation",
+        summary_lines=(
+            f"Workspace sessions: {session_count}",
+            f"Saved alert lines: {total_lines} | Recent events: {total_events}",
+            "Native Qt fallback keeps charting available when WebEngine rendering is unstable.",
+        ),
+        data_paths=(kline_analysis_workspace_file_path(),),
+        next_steps=("Next step: extend shape alerts and trade-action confirmation on top of the local alert engine.",),
+    )
+
 def build_module_overview(module_key: str) -> ModuleOverview:
     normalized = module_key.strip().lower()
     if normalized == "roll":
         return build_roll_module_overview()
+    if normalized == "kline-analysis":
+        return build_kline_analysis_module_overview()
     if normalized == "smart-order":
         return build_smart_order_module_overview()
     if normalized == "line-trading":

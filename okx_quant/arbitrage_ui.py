@@ -6217,8 +6217,9 @@ class ArbitrageWindow:
         for item in entries:
             if ledger_tree is not None:
                 ledger_tree.insert(
-                    item.entry_id,
+                    "",
                     END,
+                    iid=item.entry_id,
                     values=(
                         item.base_ccy,
                         item.pair_kind,

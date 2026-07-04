@@ -6,6 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from PySide6.QtGui import QGuiApplication, QIcon
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QWidget
 
 
@@ -33,3 +34,9 @@ def apply_qt_window_icon(window: QWidget) -> None:
     icon_path = qt_app_icon_path()
     if icon_path.exists():
         window.setWindowIcon(qt_app_icon())
+    if window.isWindow():
+        try:
+            window.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
+            window.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
+        except Exception:
+            pass

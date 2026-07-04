@@ -6,11 +6,15 @@ from decimal import Decimal
 from unittest import TestCase
 
 from okx_quant.btc_market_analyzer import BtcMarketAnalysis, PatternFocusEvent, ResonanceAnalysis, TimeframeAnalysis
+from okx_quant.models import Candle
 from okx_quant.multi_coin_market_digest import (
     archive_multi_coin_market_email,
     build_multi_coin_market_email_body,
     build_multi_coin_market_email_html,
     build_multi_coin_chart_image_map,
+    _btc_ema15_ma50_timeframe_summary,
+    _btc_volatility_timeframe_summary,
+    _load_btc_volatility_timeframe_candles,
     multi_coin_market_digest_payload,
     analyze_multi_coin_market,
     release_due_pending_multi_coin_market_emails,
@@ -73,7 +77,101 @@ def _analysis(symbol: str, direction: str, score: int, tf4h_dir: str, tf1h_dir: 
     )
 
 
+def _price_candle(index: int, close_price: str) -> Candle:
+    close_value = Decimal(close_price)
+    open_value = close_value - Decimal("0.5")
+    return Candle(
+        ts=1_700_000_000_000 + (index * 86_400_000),
+        open=open_value,
+        high=close_value + Decimal("1"),
+        low=open_value - Decimal("1"),
+        close=close_value,
+        volume=Decimal("1"),
+        confirmed=True,
+    )
+
+
 class MultiCoinMarketDigestTest(TestCase):
+    def test_btc_volatility_timeframe_summary_uses_risk_language(self) -> None:
+        summary = _btc_volatility_timeframe_summary(
+            "4H",
+            Decimal("68.20"),
+            Decimal("62.10"),
+            Decimal("58.40"),
+            source_label="Deribit 波动率指数",
+            structure="多头排列",
+            shape_summary="EMA15 上拐并继续拉开 MA50，多头发散，趋势延续。",
+            kline_pattern_summary="K线形态长下影：下去后被拉回来了，下方承接明显。",
+        )
+
+        self.assertIn("4H [Deribit 波动率指数] 波动率继续抬升", summary)
+        self.assertIn("操作上降低追价意愿", summary)
+
+    def test_btc_volatility_timeframe_summary_treats_close_below_both_emas_as_cooling_not_expansion(self) -> None:
+        summary = _btc_volatility_timeframe_summary(
+            "1D",
+            Decimal("38.95"),
+            Decimal("41.87"),
+            Decimal("41.20"),
+            source_label="Deribit 波动率指数",
+            structure="多头回踩",
+            shape_summary="EMA15 仍压在 MA50 上方，但两线扩张一般，偏强整理。",
+            kline_pattern_summary="K线形态大阳线：单根阳线很强，买盘发力明显。",
+        )
+
+        self.assertNotIn("波动率继续抬升", summary)
+        self.assertIn("波动率高位回落后仍在降温", summary)
+
+    def test_load_btc_volatility_timeframe_candles_falls_back_to_realized(self) -> None:
+        price_candles = [_price_candle(index, str(60000 + index * 300)) for index in range(40)]
+        with patch("okx_quant.multi_coin_market_digest._load_deribit_volatility_timeframe_candles", return_value=[]):
+            candles, source = _load_btc_volatility_timeframe_candles(
+                "BTC-USDT-SWAP",
+                "1D",
+                price_candles=price_candles,
+                limit=24,
+            )
+
+        self.assertEqual(source, "程序历史波动率")
+        self.assertGreater(len(candles), 0)
+
+    def test_btc_ema15_ma50_timeframe_summary_only_adds_shape_for_4h_and_1d(self) -> None:
+        four_hour_summary = _btc_ema15_ma50_timeframe_summary(
+            "4H",
+            Decimal("62480.10"),
+            Decimal("61728.43"),
+            Decimal("60380.91"),
+            direction="long",
+            structure="多头排列",
+            shape_summary="EMA15 上拐并继续拉开 MA50，多头发散，趋势延续。",
+            kline_pattern_summary="K线形态锤子线：下探后被拉回，像是在试底。",
+        )
+        one_day_summary = _btc_ema15_ma50_timeframe_summary(
+            "1D",
+            Decimal("62480.10"),
+            Decimal("61728.43"),
+            Decimal("67085.36"),
+            direction="neutral",
+            structure="空头反抽",
+            shape_summary="价格重新站回 EMA15 上方，EMA15 向 MA50 收敛，当前更像空头反抽后的收口观察。",
+            kline_pattern_summary="K线形态大阳线：单根阳线很强，买盘发力明显。",
+        )
+        one_hour_summary = _btc_ema15_ma50_timeframe_summary(
+            "1H",
+            Decimal("62477.40"),
+            Decimal("62447.33"),
+            Decimal("61907.51"),
+            direction="long",
+            structure="多头排列",
+            shape_summary="EMA15 上拐并继续拉开 MA50，多头发散，趋势延续。",
+            kline_pattern_summary="K线形态锤子线：下探后被拉回，像是在试底。",
+        )
+
+        self.assertIn("4H 多头主导，EMA15 持续拉开 MA50，回踩承接仍在，短线继续偏多；操作上优先等回踩 EMA15 再跟随，不追高。", four_hour_summary)
+        self.assertIn("1D 空头结构出现反抽修复，日线买盘回拉但仍以收敛观察为主；操作上先等 EMA15 与 MA50 进一步收敛后再决定是否跟进。", one_day_summary)
+        self.assertNotIn("形态", one_hour_summary)
+        self.assertNotIn("K线形态", one_hour_summary)
+
     def test_analyze_multi_coin_market_ranks_leaders(self) -> None:
         analyses = (
             _analysis("BTC-USDT-SWAP", "long", 8, "long", "long", ("底分型",), ("锤子线",)),

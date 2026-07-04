@@ -3963,9 +3963,14 @@ def _format_axis_value(value: Decimal) -> str:
     return format_decimal_fixed(value, 6)
 
 
-def _format_compact_number(value: Decimal | None) -> str:
+def _format_compact_number(value: Decimal | int | float | None) -> str:
     if value is None:
         return "-"
+    if not isinstance(value, Decimal):
+        try:
+            value = Decimal(str(value))
+        except Exception:
+            return "-"
     magnitude = abs(value)
     if magnitude >= 1000:
         return format_decimal_fixed(value, 2)
