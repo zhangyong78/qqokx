@@ -5,6 +5,38 @@ from okx_quant.models import Credentials, Instrument
 from okx_quant.okx_client import infer_inst_type
 from okx_quant.persistence import DEFAULT_CREDENTIAL_PROFILE_NAME
 
+_TRADE_MODE = {"cross", "isolated"}
+_POSITION_MODE = {"net", "long_short"}
+
+
+def _normalize_trade_mode(value: object, *, fallback: str = "cross") -> str:
+    text = str(value or "").strip().lower()
+    normalized_fallback = str(fallback or "").strip().lower()
+    if normalized_fallback not in _TRADE_MODE:
+        normalized_fallback = ""
+    if text in {"cross", "isolated", "cash"}:
+        return "cross" if text == "cash" else text
+    if "cross" in text or "全仓" in str(value or ""):
+        return "cross"
+    if "isolated" in text or "逐仓" in str(value or ""):
+        return "isolated"
+    return normalized_fallback
+
+
+def _normalize_position_mode(value: object, *, fallback: str = "net") -> str:
+    text = str(value or "").strip().lower()
+    lowered = str(value or "")
+    normalized_fallback = str(fallback or "").strip().lower()
+    if normalized_fallback not in _POSITION_MODE:
+        normalized_fallback = ""
+    if text in {"net", "long_short"}:
+        return text
+    if "net" in text or "净持仓" in lowered:
+        return "net"
+    if "long_short" in text or "long/short" in text or "long short" in text or "long-short" in text or "双向" in lowered:
+        return "long_short"
+    return normalized_fallback
+
 
 def future_family_key(inst_id: str) -> str | None:
     normalized = inst_id.strip().upper()
@@ -66,6 +98,8 @@ def build_runtime_for_profile(
     *,
     profile_snapshot: dict[str, str] | None,
     fallback_runtime: ArbitrageTradeRuntime | None,
+    trade_mode: str | None = None,
+    position_mode: str | None = None,
 ) -> ArbitrageTradeRuntime | None:
     target_profile = profile_name.strip() or (
         fallback_runtime.credential_profile_name.strip() if fallback_runtime is not None else DEFAULT_CREDENTIAL_PROFILE_NAME
@@ -95,6 +129,21 @@ def build_runtime_for_profile(
         )
     fallback_environment = fallback_runtime.environment if fallback_runtime is not None else "demo"
     environment = credential_profile_environment(snapshot, fallback=fallback_environment)
+    resolved_trade_mode = (
+        _normalize_trade_mode(trade_mode, fallback="")
+        or _normalize_trade_mode(snapshot.get("trade_mode"), fallback="")
+        or _normalize_trade_mode(snapshot.get("trade_mode_label"), fallback="")
+        or _normalize_trade_mode(snapshot.get("mgn_mode"), fallback="")
+    )
+    resolved_position_mode = (
+        _normalize_position_mode(position_mode, fallback="")
+        or _normalize_position_mode(snapshot.get("position_mode"), fallback="")
+        or _normalize_position_mode(snapshot.get("position_mode_label"), fallback="")
+    )
+    if not resolved_trade_mode:
+        resolved_trade_mode = fallback_runtime.trade_mode if fallback_runtime is not None else "cross"
+    if not resolved_position_mode:
+        resolved_position_mode = fallback_runtime.position_mode if fallback_runtime is not None else "net"
     return ArbitrageTradeRuntime(
         credentials=Credentials(
             api_key,
@@ -103,7 +152,7 @@ def build_runtime_for_profile(
             profile_name=target_profile,
         ),
         environment=environment,
-        trade_mode=fallback_runtime.trade_mode if fallback_runtime is not None else "cross",
-        position_mode=fallback_runtime.position_mode if fallback_runtime is not None else "net",
+        trade_mode=resolved_trade_mode,
+        position_mode=resolved_position_mode,
         credential_profile_name=target_profile,
     )

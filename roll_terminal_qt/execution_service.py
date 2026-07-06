@@ -1167,7 +1167,7 @@ class ProfessionalCloseExecutionThread(QThread):
     def run(self) -> None:
         client = OkxRestClient()
         manager = ArbitrageManager(client, logger=self.log.emit)
-        plan_entry_ids = tuple(entry_id for entry_id in self._plan.entry_ids if str(entry_id).strip())
+        plan_entry_ids = tuple(dict.fromkeys(entry_id for entry_id in self._plan.entry_ids if str(entry_id).strip()))
         open_entries = {
             item.entry_id: item
             for item in load_open_ledger_entries()
@@ -1177,6 +1177,7 @@ class ProfessionalCloseExecutionThread(QThread):
         total_pnl = Decimal("0")
         total_derivative_qty = Decimal("0")
         profit_spot_sold_qty = Decimal("0")
+        processed_entry_ids: set[str] = set()
         closed_ids: list[str] = []
         errors: list[str] = []
         total_entries = len(plan_entry_ids)
@@ -1198,6 +1199,9 @@ class ProfessionalCloseExecutionThread(QThread):
 
         if plan_entry_ids:
             for index, entry_id in enumerate(plan_entry_ids, start=1):
+                if entry_id in processed_entry_ids:
+                    self.log.emit(f"重复平仓编号已跳过: {entry_id}")
+                    continue
                 if self._stop_after_batch_requested:
                     self.log.emit("已收到停止请求：当前已完成批次后停止后续平仓。")
                     break
@@ -1244,6 +1248,7 @@ class ProfessionalCloseExecutionThread(QThread):
                 if not result.success:
                     errors.append(f"{entry.base_ccy}: {result.message}")
                     continue
+                processed_entry_ids.add(entry_id)
                 total_derivative_qty += close_qty
                 remaining_qty = max(remaining_qty - close_qty, Decimal("0"))
                 total_pnl += result.total_pnl or Decimal("0")

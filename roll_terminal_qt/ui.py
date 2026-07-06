@@ -2819,7 +2819,9 @@ class RollTerminalWindow(QMainWindow):
             right_inst_id=item.right_inst_id,
             spot_inst_id=spot_inst_id,
             derivative_inst_id=derivative_inst_id,
-            entry_ids=tuple(entry.entry_id for entry in entries),
+            entry_ids=tuple(
+                dict.fromkeys(str(entry.entry_id).strip() for entry in entries if str(entry.entry_id).strip())
+            ),
             qty_contracts=qty_contracts,
             execution_label=self._mode.currentText().strip(),
             execution_mode_value=str(self._mode.currentData() or ""),
