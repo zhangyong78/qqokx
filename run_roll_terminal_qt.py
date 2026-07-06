@@ -135,10 +135,33 @@ def _configure_qt_webengine_runtime() -> None:
     )
 
 
+def _ensure_qt_dependency() -> bool:
+    try:
+        __import__("PySide6")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "[QQOKX] 未检测到 Qt 运行时依赖 PySide6。请先安装后再启动：",
+            file=sys.stderr,
+        )
+        print(
+            "[QQOKX] 安装命令：python -m pip install -r roll_terminal_qt_requirements.txt",
+            file=sys.stderr,
+        )
+        print(
+            "[QQOKX] 若使用 py 启动，请执行：py -3 -m pip install -r roll_terminal_qt_requirements.txt",
+            file=sys.stderr,
+        )
+        print(f"[QQOKX] 原始错误：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
+
+
 def main() -> int:
     _set_console_title()
     _install_runtime_logging()
     _configure_qt_webengine_runtime()
+    if not _ensure_qt_dependency():
+        return 1
     from roll_terminal_qt.launcher import run
 
     return run()
