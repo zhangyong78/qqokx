@@ -1,10 +1,8 @@
-from __future__ import annotations
-
+﻿from pathlib import Path
 import argparse
 import shutil
 import sys
 from datetime import datetime
-from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -50,15 +48,34 @@ def build_package(version: str) -> tuple[Path, Path]:
         "main.py",
         "pyproject.toml",
         "requirements.txt",
+        "roll_terminal_qt_requirements.txt",
         "README.md",
+        "发版协作约定.md",
         "软件开发指南.md",
         "线程工作流模板.md",
-        "发版协作约定.md",
     ):
         shutil.copy2(project_root / file_name, stage_dir / file_name)
+
+    for file_name in (
+        "run_roll_terminal_qt.py",
+        "run_roll_terminal_qt.pyw",
+        "start_roll_terminal_qt.bat",
+        "start_roll_terminal_qt_silent.vbs",
+        "roll_terminal_qt_README.md",
+    ):
+        source = project_root / file_name
+        if source.exists():
+            shutil.copy2(source, stage_dir / file_name)
+
     shutil.copytree(
         project_root / "okx_quant",
         stage_dir / "okx_quant",
+        dirs_exist_ok=True,
+        ignore=package_ignore,
+    )
+    shutil.copytree(
+        project_root / "roll_terminal_qt",
+        stage_dir / "roll_terminal_qt",
         dirs_exist_ok=True,
         ignore=package_ignore,
     )
@@ -76,6 +93,28 @@ def build_package(version: str) -> tuple[Path, Path]:
             "where python >nul 2>&1\r\n"
             "if %errorlevel%==0 (\r\n"
             "    python main.py\r\n"
+            "    goto :end\r\n"
+            ")\r\n"
+            "echo Python 3.11+ not found in PATH.\r\n"
+            "echo Install Python and enable Add Python to PATH, then run again.\r\n"
+            ":end\r\n"
+            "pause\r\n"
+        ),
+        encoding="utf-8",
+    )
+    write_text(
+        stage_dir / "RUN_QT.bat",
+        (
+            "@echo off\r\n"
+            "cd /d %~dp0\r\n"
+            "where py >nul 2>&1\r\n"
+            "if %errorlevel%==0 (\r\n"
+            "    py -3 run_roll_terminal_qt.pyw %*\r\n"
+            "    goto :end\r\n"
+            ")\r\n"
+            "where python >nul 2>&1\r\n"
+            "if %errorlevel%==0 (\r\n"
+            "    python run_roll_terminal_qt.pyw %*\r\n"
             "    goto :end\r\n"
             ")\r\n"
             "echo Python 3.11+ not found in PATH.\r\n"
@@ -116,18 +155,26 @@ def build_package(version: str) -> tuple[Path, Path]:
             f"QQOKX server package v{APP_VERSION}\n\n"
             "1. Runtime\n"
             "- Python 3.11+\n"
-            "- Windows server: run RUN.bat or `python main.py`\n"
+            "- Windows: run RUN.bat for the workbench, RUN_QT.bat for Roll Terminal QT\n"
             "- Linux server: this GUI app requires a desktop environment\n"
             "- Linux Tk install example: sudo apt-get install -y python3-tk\n"
             "- Optional custom data dir: `python main.py --data-dir D:\\qqokx_data`\n"
             "- Optional environment override: `QQOKX_DATA_DIR=D:\\qqokx_data`\n\n"
             "2. Included\n"
             "- main.py\n"
+            "- run_roll_terminal_qt.py\n"
+            "- start_roll_terminal_qt.bat\n"
+            "- start_roll_terminal_qt_silent.vbs\n"
+            "- requirements.txt\n"
+            "- roll_terminal_qt_requirements.txt\n"
+            "- roll_terminal_qt_README.md\n"
+            "- 发版协作约定.md\n"
             "- 软件开发指南.md\n"
             "- 线程工作流模板.md\n"
-            "- 发版协作约定.md\n"
             "- okx_quant/\n"
+            "- roll_terminal_qt/\n"
             "- RUN.bat\n"
+            "- RUN_QT.bat\n"
             "- RUN.ps1\n"
             "- start.sh\n\n"
             "3. Runtime data layout\n"
@@ -136,7 +183,8 @@ def build_package(version: str) -> tuple[Path, Path]:
             "- First launch will bootstrap legacy `.okx_quant_*`, `logs/`, and `reports/` into the shared data dir\n\n"
             "4. Not included\n"
             "- Shared runtime data directory `../qqokx_data/`\n"
-            "- tests/\n\n"
+            "- tests/\n"
+            "- 临时数据目录\n\n"
             "5. Upgrade notes\n"
             "- Preferred: keep the same sibling `qqokx_data/` and replace only the code package\n"
             "- Or copy the whole `qqokx_data/` directory to the new machine / new version\n"
