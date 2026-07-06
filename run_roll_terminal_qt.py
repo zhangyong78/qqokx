@@ -51,7 +51,7 @@ class _TeeTextStream(io.TextIOBase):
 
 def _set_console_title() -> None:
     try:
-        ctypes.windll.kernel32.SetConsoleTitleW("量化交易控制台")
+        ctypes.windll.kernel32.SetConsoleTitleW("量化合约终端")
     except Exception:
         pass
 
@@ -64,7 +64,7 @@ def _console_log_path() -> Path:
 
 def _write_runtime_banner(log_path: Path) -> None:
     with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动量化交易控制台\n")
+        handle.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动量化合约终端\n")
 
 
 def _install_runtime_logging() -> Path:
@@ -88,7 +88,7 @@ def _install_runtime_logging() -> Path:
             except Exception:
                 pass
             return
-        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 未捕获异常：", file=sys.stderr)
+        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 崩溃线程：", file=sys.stderr)
         traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stderr)
 
     sys.excepthook = _log_uncaught_exception
@@ -97,7 +97,7 @@ def _install_runtime_logging() -> Path:
 
         def _threading_excepthook(args: threading.ExceptHookArgs) -> None:
             print(
-                f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 线程未捕获异常：{args.thread.name if args.thread else 'unknown'}",
+                f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 工作线程崩溃：{args.thread.name if args.thread else 'unknown'}",
                 file=sys.stderr,
             )
             traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback, file=sys.stderr)
@@ -136,23 +136,17 @@ def _configure_qt_webengine_runtime() -> None:
 
 
 def _ensure_qt_dependency() -> bool:
+    if sys.maxsize <= 2 ** 32:
+        print("[QQOKX] 当前是32位 Python，建议改用 64 位 Python 3.11+ 后启动。", file=sys.stderr)
+
     try:
         __import__("PySide6")
         return True
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"[QQOKX] 当前启动解释器：{sys.executable}", file=sys.stderr)
-        print(
-            "[QQOKX] 未检测到 Qt 运行时依赖 PySide6。请先安装后再启动：",
-            file=sys.stderr,
-        )
-        print(
-            f"[QQOKX] 安装命令：{sys.executable} -m pip install -r roll_terminal_qt_requirements.txt",
-            file=sys.stderr,
-        )
-        print(
-            "[QQOKX] 当前目录要求：在与程序同一目录执行上述命令，或先切到同目录再执行。",
-            file=sys.stderr,
-        )
+        print("[QQOKX] 未检测到 Qt 运行时依赖 PySide6。请先安装后再启动：", file=sys.stderr)
+        print(f"[QQOKX] 安装命令：{sys.executable} -m pip install -r roll_terminal_qt_requirements.txt", file=sys.stderr)
+        print("[QQOKX] 当前目录要求：在与程序同一目录执行上述命令，或先切到同目录再执行。", file=sys.stderr)
         print(f"[QQOKX] 原始错误：{type(exc).__name__}: {exc}", file=sys.stderr)
         return False
 
