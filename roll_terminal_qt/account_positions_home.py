@@ -41,7 +41,8 @@ from PySide6.QtWidgets import (
 
 from roll_terminal_qt.app_icon import apply_qt_window_icon
 from okx_quant.log_utils import append_log_line
-from okx_quant.models import Candle, Credentials, Instrument, StrategyConfig
+from okx_quant.models import Candle, Credentials, EmailNotificationConfig, Instrument, StrategyConfig
+from okx_quant.notifications import EmailNotifier
 from okx_quant.option_roll import is_short_option_position
 from okx_quant.option_roll_ui import OptionRollSuggestionWindow
 from okx_quant.option_strategy_ui import OptionStrategyCalculatorWindow, _build_option_quote
@@ -55,6 +56,7 @@ from okx_quant.okx_client import (
 )
 from okx_quant.persistence import (
     load_account_positions_home_view_prefs,
+    load_notification_snapshot,
     load_position_notes_snapshot,
     save_account_positions_home_view_prefs,
     save_position_notes_snapshot,
@@ -165,6 +167,39 @@ def _debug_log(message: str) -> None:
         stream.flush()
     except Exception:
         return
+
+
+def _build_optional_protection_notifier(profile_name: str | None) -> EmailNotifier | None:
+    snapshot = load_notification_snapshot()
+    if not bool(snapshot.get("enabled", False)):
+        return None
+    recipients = tuple(
+        item.strip()
+        for item in re.split(r"[,\n;]+", str(snapshot.get("recipient_emails", "")))
+        if item.strip()
+    )
+    normalized_profile = (profile_name or "").strip()
+    sender_overrides = dict(snapshot.get("api_sender_email_overrides", {}))
+    sender_email = str(sender_overrides.get(normalized_profile, "")).strip() or str(snapshot.get("sender_email", "")).strip()
+    notification_config = EmailNotificationConfig(
+        enabled=bool(snapshot.get("enabled", False)),
+        smtp_host=str(snapshot.get("smtp_host", "")).strip(),
+        smtp_port=int(snapshot.get("smtp_port", 465) or 465),
+        smtp_username=str(snapshot.get("smtp_username", "")).strip(),
+        smtp_password=str(snapshot.get("smtp_password", "")),
+        sender_email=sender_email,
+        recipient_emails=recipients,
+        use_ssl=bool(snapshot.get("use_ssl", True)),
+        notify_trade_fills=bool(snapshot.get("notify_trade_fills", True)),
+        notify_signals=bool(snapshot.get("notify_signals", True)),
+        notify_errors=bool(snapshot.get("notify_errors", True)),
+    )
+    if not notification_config.enabled:
+        return None
+    return EmailNotifier(
+        notification_config,
+        logger=lambda message: append_log_line(f"[邮件 持仓保护] {message}"),
+    )
 
 
 POSITION_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -572,6 +607,9 @@ class AccountOverviewDialog(QDialog):
 
         detail = QTextEdit()
         detail.setReadOnly(True)
+        detail_font = QFont("Consolas")
+        detail_font.setPointSize(10)
+        detail.setFont(detail_font)
         detail.setPlainText(summary_text)
         layout.addWidget(detail, 1)
 
@@ -923,6 +961,7 @@ class PositionProtectionDialog(QDialog):
         client: OkxRestClient,
         runtime_provider: Callable[[], object | None],
         selected_option_provider: Callable[[], OkxPosition | None],
+        notifier_provider: Callable[[], EmailNotifier | None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -931,6 +970,7 @@ class PositionProtectionDialog(QDialog):
         self._client = client
         self._runtime_provider = runtime_provider
         self._selected_option_provider = selected_option_provider
+        self._notifier_provider = notifier_provider
         self._selected_position: OkxPosition | None = None
         self._form_position_key = ""
         self._session_ids: list[str] = []
@@ -1045,19 +1085,28 @@ class PositionProtectionDialog(QDialog):
         self._session_status_label = QLabel("当前没有运行中的期权保护任务。")
         self._session_status_label.setObjectName("Subtle")
         sessions_layout.addWidget(self._session_status_label)
-        self._sessions_table = QTableWidget(0, 6)
-        self._sessions_table.setHorizontalHeaderLabels(("API", "期权合约", "触发条件", "方向", "状态", "启动时间"))
+        session_headers = (
+            "API",
+            "期权合约",
+            "触发条件",
+            "触发标的",
+            "价格类型",
+            "方向",
+            "持仓方向",
+            "止盈触发",
+            "止损触发",
+            "报单方式",
+            "轮询",
+            "状态",
+            "启动时间",
+        )
+        self._sessions_table = QTableWidget(0, len(session_headers))
+        self._sessions_table.setHorizontalHeaderLabels(session_headers)
         self._sessions_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._sessions_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._sessions_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._sessions_table.verticalHeader().setVisible(False)
-        self._sessions_table.horizontalHeader().setStretchLastSection(False)
-        self._sessions_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self._sessions_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._sessions_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self._sessions_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self._sessions_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self._sessions_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self._configure_sessions_table_columns(len(session_headers))
         self._sessions_table.itemSelectionChanged.connect(self._refresh_selected_session_detail)
         sessions_layout.addWidget(self._sessions_table, 1)
         bottom_split.addWidget(sessions_panel)
@@ -1076,6 +1125,25 @@ class PositionProtectionDialog(QDialog):
         bottom_split.addWidget(detail_panel)
         bottom_split.setSizes([340, 240])
         layout.addWidget(bottom_split, 1)
+
+    def _configure_sessions_table_columns(self, column_count: int) -> None:
+        header = self._sessions_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for column in range(column_count):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        for column in (1, 2, 3, 9, 12):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+        default_widths = {
+            0: 120,
+            1: 210,
+            2: 170,
+            3: 120,
+            9: 230,
+            12: 96,
+        }
+        for column, width in default_widths.items():
+            self._sessions_table.setColumnWidth(column, width)
+        self._sessions_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._refresh_timer.stop()
@@ -1178,6 +1246,7 @@ class PositionProtectionDialog(QDialog):
         try:
             protection = self._build_selected_position_protection(position)
             _validate_protection_live_price_availability(self._client, protection, position)
+            self._manager.set_notifier(self._notifier_provider() if self._notifier_provider is not None else None)
             config = self._build_strategy_config(runtime=runtime, position=position, protection=protection)
             self._manager.start(runtime.credentials, config, protection)
             self._refresh_sessions()
@@ -1293,18 +1362,30 @@ class PositionProtectionDialog(QDialog):
         self._sessions_table.setRowCount(len(sessions))
         self._session_ids = [item.session_id for item in sessions]
         for row, item in enumerate(sessions):
+            order_mode_summary = (
+                "止盈/止损: "
+                f"{_format_protection_order_mode_label(item.take_profit_order_mode)}/"
+                f"{_format_protection_order_mode_label(item.stop_loss_order_mode)}"
+            )
             values = (
                 item.api_name or "-",
                 item.option_inst_id,
                 item.trigger_label,
+                item.trigger_inst_id,
+                _format_protection_trigger_price_type(item.trigger_price_type),
                 item.direction,
+                item.pos_side or "-",
+                _format_optional_decimal(item.take_profit_trigger),
+                _format_optional_decimal(item.stop_loss_trigger),
+                order_mode_summary,
+                f"{item.poll_seconds:g}s",
                 item.status,
                 item.started_at.strftime("%H:%M:%S"),
             )
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(str(value))
-                if column in {0, 3, 4, 5}:
-                    cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                if column in {0, 4, 5, 6, 7, 8, 10, 11, 12}:
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                 self._sessions_table.setItem(row, column, cell)
         target_row = -1
         if selected_before and selected_before in self._session_ids:
@@ -3240,6 +3321,9 @@ class AccountPositionsHomeWidget(QWidget):
                 client=self._shared_client,
                 runtime_provider=lambda: self._runtime,
                 selected_option_provider=self._selected_option_for_shortcut,
+                notifier_provider=lambda: _build_optional_protection_notifier(
+                    self._last_profile_name or self._current_profile_name() or None
+                ),
                 parent=None,
             )
             self._protection_dialog.setWindowFlag(Qt.WindowType.Window, True)
@@ -3845,6 +3929,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _build_account_overview_summary_text(self) -> str:
         raw_positions = list(self._raw_positions)
         visible_positions = list(self._visible_positions)
+        format_btc_amount = lambda value: _format_optional_decimal_fixed(value, places=8) if isinstance(value, Decimal) else "-"
         position_metrics = _aggregate_position_metrics(raw_positions, self._upl_usdt_prices, self._position_instruments)
         visible_metrics = _aggregate_position_metrics(visible_positions, self._upl_usdt_prices, self._position_instruments)
         type_counts = Counter(str(item.inst_type or "-").upper() or "-" for item in raw_positions)
@@ -3925,7 +4010,7 @@ class AccountPositionsHomeWidget(QWidget):
                     f"Greeks 类型：{_format_greeks_type_text(getattr(config, 'greeks_type', None))}",
                     f"自动借币：{_format_bool_text(getattr(config, 'auto_loan', None))}",
                     f"总权益：{_format_optional_usdt_precise(getattr(overview, 'total_equity', None), places=2, with_sign=False)}",
-                    f"总权益（约BTC）：{_format_optional_decimal(AccountPositionsHomeWidget._derive_total_equity_btc(getattr(overview, 'total_equity', None), getattr(overview, 'details', ()) ))} BTC",
+                    f"总权益（约BTC）：{format_btc_amount(AccountPositionsHomeWidget._derive_total_equity_btc(getattr(overview, 'total_equity', None), getattr(overview, 'details', ()) ))} BTC",
                     f"调整后权益：{_format_optional_usdt_precise(getattr(overview, 'adjusted_equity', None), places=2, with_sign=False)}",
                     f"可用权益：{_format_optional_usdt_precise(getattr(overview, 'available_equity', None), places=2, with_sign=False)}",
                     f"未实现盈亏：{_format_optional_usdt_precise(getattr(overview, 'unrealized_pnl', None), places=2)}",
@@ -3948,12 +4033,12 @@ class AccountPositionsHomeWidget(QWidget):
                 for index, asset in enumerate(assets[:12], start=1):
                     lines.append(
                         f"{index:02d}. {asset.ccy or '-'}"
-                        f" | 权益={_format_optional_decimal(asset.equity)}"
-                        f" | 可用={_format_optional_decimal(asset.available_balance)}"
-                        f" | 可用权益={_format_optional_decimal(asset.available_equity)}"
+                        f" | 权益={format_btc_amount(asset.equity)}"
+                        f" | 可用={format_btc_amount(asset.available_balance)}"
+                        f" | 可用权益={format_btc_amount(asset.available_equity)}"
                         f" | 折合USD={_format_optional_usdt_precise(asset.equity_usd, places=2, with_sign=False)}"
-                        f" | 未实现={_format_optional_decimal(asset.unrealized_pnl, with_sign=True)}"
-                        f" | 负债={_format_optional_decimal(asset.liability)}"
+                        f" | 未实现={_format_optional_decimal_fixed(asset.unrealized_pnl, places=6, with_sign=True) if isinstance(asset.unrealized_pnl, Decimal) else '-'}"
+                        f" | 负债={format_btc_amount(asset.liability)}"
                     )
 
         return "\n".join(lines)
@@ -4248,7 +4333,7 @@ class AccountPositionsHomeWidget(QWidget):
         for text, handler in (
             ("刷新", self.refresh_view),
             ("从选中条件单接管动态止盈", self._show_not_ready_action),
-            ("撤单选中", self._show_not_ready_action),
+            ("撤单选中", self._cancel_selected_current_order),
             ("批量撤当前筛选", self._show_not_ready_action),
         ):
             button = QPushButton(text)

@@ -53,6 +53,8 @@ from roll_terminal_qt.kline_analysis_window import (
     _SMA50_LINE_WIDTH,
     _apply_drag_to_line_rule,
     _build_display_times_ms,
+    _compute_axis_y_padding,
+    _compute_hover_overlay_layout,
     _default_chart_stack_splitter_sizes,
     _default_kline_splitter_sizes,
     _display_x_for_candle_time,
@@ -1885,6 +1887,50 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         self.assertEqual(end_x, float(display_times[-1]) + _native_right_padding_ms(900_000))
         self.assertLess(start_x, end_x)
         self.assertGreater(end_x - display_times[-1], 0.0)
+
+    def test_hover_overlay_layout_moves_tooltip_above_volume_reserved_band(self) -> None:
+        layout = _compute_hover_overlay_layout(
+            viewport_top=0.0,
+            viewport_bottom=500.0,
+            bounds_top=20.0,
+            bounds_bottom=420.0,
+            anchor_y=210.0,
+            price_height=24.0,
+            tooltip_height=150.0,
+            volume_reserved_height=72.0,
+        )
+        self.assertLess(layout["tooltip_y"] + 150.0, 420.0 - 72.0)
+        self.assertEqual(layout["tooltip_side"], "above")
+
+    def test_hover_overlay_layout_clamps_price_badge_above_volume_reserved_band(self) -> None:
+        layout = _compute_hover_overlay_layout(
+            viewport_top=0.0,
+            viewport_bottom=500.0,
+            bounds_top=20.0,
+            bounds_bottom=420.0,
+            anchor_y=360.0,
+            price_height=30.0,
+            tooltip_height=90.0,
+            volume_reserved_height=72.0,
+        )
+        self.assertLessEqual(layout["price_y"] + 30.0, 420.0 - 72.0)
+
+    def test_axis_y_padding_reserves_more_space_below_for_volume_overlay(self) -> None:
+        top_padding, bottom_padding = _compute_axis_y_padding(100.0, 200.0)
+        self.assertGreater(bottom_padding, top_padding)
+
+    def test_axis_y_padding_keeps_min_price_above_volume_reserved_band(self) -> None:
+        min_price = 100.0
+        max_price = 200.0
+        plot_height = 1000.0
+        volume_reserved_ratio = 0.18
+        top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price)
+        axis_min = min_price - bottom_padding
+        axis_max = max_price + top_padding
+        span = axis_max - axis_min
+        min_price_y = ((axis_max - min_price) / span) * plot_height
+        volume_band_top = plot_height * (1.0 - volume_reserved_ratio)
+        self.assertLess(min_price_y, volume_band_top)
 
     def test_resolve_candle_time_from_x_value_supports_future_blank_area(self) -> None:
         candles = [

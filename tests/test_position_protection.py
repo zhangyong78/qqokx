@@ -3,6 +3,7 @@ from datetime import timedelta
 from threading import Event
 from time import sleep
 from unittest import TestCase
+from unittest.mock import patch
 
 import okx_quant.position_protection as protection_module
 from okx_quant.models import Credentials, Instrument, StrategyConfig
@@ -366,6 +367,134 @@ class _SimulatedProtectionClient:
             self.current_position = min(Decimal("0"), self.current_position + fill)
 
 
+class _StaleFilledPositionClient(_SimulatedProtectionClient):
+    def __init__(self, *args, stale_reads_after_flat: int = 2, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._stale_reads_after_flat = stale_reads_after_flat
+
+    def get_positions(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_type: str | None = None,
+    ) -> list[OkxPosition]:
+        if self.current_position == 0 and self._stale_reads_after_flat > 0:
+            self._stale_reads_after_flat -= 1
+            return [
+                OkxPosition(
+                    inst_id=self._position_template.inst_id,
+                    inst_type=self._position_template.inst_type,
+                    pos_side=self._position_template.pos_side,
+                    mgn_mode=self._position_template.mgn_mode,
+                    position=self._position_template.position,
+                    avail_position=abs(self._position_template.position),
+                    avg_price=self._position_template.avg_price,
+                    mark_price=self._position_template.mark_price,
+                    unrealized_pnl=self._position_template.unrealized_pnl,
+                    unrealized_pnl_ratio=self._position_template.unrealized_pnl_ratio,
+                    liquidation_price=self._position_template.liquidation_price,
+                    leverage=self._position_template.leverage,
+                    margin_ccy=self._position_template.margin_ccy,
+                    last_price=self._position_template.last_price,
+                    realized_pnl=self._position_template.realized_pnl,
+                    margin_ratio=self._position_template.margin_ratio,
+                    initial_margin=self._position_template.initial_margin,
+                    maintenance_margin=self._position_template.maintenance_margin,
+                    delta=self._position_template.delta,
+                    gamma=self._position_template.gamma,
+                    vega=self._position_template.vega,
+                    theta=self._position_template.theta,
+                    raw=self._position_template.raw,
+                )
+            ]
+        return super().get_positions(credentials, environment=environment, inst_type=inst_type)
+
+
+class _SequencedOrderFillClient(_SimulatedProtectionClient):
+    def __init__(self, *args, order_status_sequences: list[list[dict[str, object]]], **kwargs) -> None:
+        super().__init__(*args, order_results=[], **kwargs)
+        self._order_status_sequences = [list(sequence) for sequence in order_status_sequences]
+
+    def place_simple_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        ord_type: str,
+        pos_side: str | None = None,
+        price: Decimal | None = None,
+        cl_ord_id: str | None = None,
+    ) -> OkxOrderResult:
+        assert credentials.api_key
+        assert config.environment == "live"
+        ord_id = f"O{len(self.orders) + 1}"
+        self.orders.append(
+            {
+                "inst_id": inst_id,
+                "side": side,
+                "size": size,
+                "ord_type": ord_type,
+                "pos_side": pos_side,
+                "price": price,
+                "cl_ord_id": cl_ord_id,
+            }
+        )
+        sequence = self._order_status_sequences.pop(0)
+        lookup_entry = {
+            "statuses": sequence,
+            "status_index": -1,
+            "applied_filled_size": Decimal("0"),
+            "cl_ord_id": cl_ord_id,
+        }
+        self._order_lookup[ord_id] = lookup_entry
+        if cl_ord_id:
+            self._order_lookup[f"cl:{cl_ord_id}"] = lookup_entry
+        submit_exc = self._submit_exceptions.pop(0) if self._submit_exceptions else None
+        if submit_exc is not None:
+            raise submit_exc
+        return OkxOrderResult(ord_id=ord_id, cl_ord_id=cl_ord_id, s_code="0", s_msg="", raw={})
+
+    def get_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+    ) -> OkxOrderStatus:
+        assert credentials.secret_key
+        assert config.trade_mode == "cross"
+        key = ord_id or f"cl:{cl_ord_id}"
+        order_entry = self._order_lookup[key]
+        statuses = order_entry["statuses"]
+        status_index = min(int(order_entry["status_index"]) + 1, len(statuses) - 1)
+        order_entry["status_index"] = status_index
+        status = statuses[status_index]
+        cumulative_filled = status.get("filled_size")
+        if isinstance(cumulative_filled, Decimal):
+            applied_filled = order_entry["applied_filled_size"]
+            delta = cumulative_filled - applied_filled
+            if delta > 0:
+                self._apply_fill(delta)
+                order_entry["applied_filled_size"] = cumulative_filled
+        return OkxOrderStatus(
+            ord_id=ord_id or "from-cl-ord-id",
+            state=str(status["state"]),
+            side=None,
+            ord_type="ioc",
+            price=status.get("price"),
+            avg_price=status.get("avg_price"),
+            size=status.get("size"),
+            filled_size=status.get("filled_size"),
+            raw={},
+        )
+
+
 class _OrderStatusClient:
     def __init__(self, *statuses: OkxOrderStatus) -> None:
         self._statuses = list(statuses)
@@ -548,6 +677,71 @@ class PositionProtectionTest(TestCase):
             stop_loss=Decimal("50000"),
         )
 
+    def test_live_price_validation_blocks_immediate_short_put_spot_take_profit_below_current(self) -> None:
+        protection = OptionProtectionConfig(
+            option_inst_id="BTC-USD-20260626-60000-P",
+            trigger_inst_id="BTC-USDT",
+            trigger_price_type="last",
+            direction="short",
+            pos_side="short",
+            take_profit_trigger=Decimal("62000"),
+            stop_loss_trigger=None,
+            take_profit_order_mode="fixed_price",
+            take_profit_order_price=Decimal("0.0100"),
+            take_profit_slippage=Decimal("0"),
+            stop_loss_order_mode="fixed_price",
+            stop_loss_order_price=Decimal("0.0200"),
+            stop_loss_slippage=Decimal("0"),
+            poll_seconds=2,
+            trigger_label="BTC-USDT 最新价",
+        )
+        client = _PriceGuardClient(
+            spot_price=Decimal("62800"),
+            option_mark_price=Decimal("0.0105"),
+            option_bid=Decimal("0.0100"),
+            option_ask=Decimal("0.0110"),
+            option_last=Decimal("0.0105"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "62000.*62800.*止损触发"):
+            _validate_protection_live_price_availability(
+                client,
+                protection,
+                _make_option_position(inst_id=protection.option_inst_id, position="-1", pos_side="short"),
+            )
+
+    def test_live_price_validation_allows_short_put_spot_stop_loss_below_current(self) -> None:
+        protection = OptionProtectionConfig(
+            option_inst_id="BTC-USD-20260626-60000-P",
+            trigger_inst_id="BTC-USDT",
+            trigger_price_type="last",
+            direction="short",
+            pos_side="short",
+            take_profit_trigger=None,
+            stop_loss_trigger=Decimal("62000"),
+            take_profit_order_mode="fixed_price",
+            take_profit_order_price=Decimal("0.0100"),
+            take_profit_slippage=Decimal("0"),
+            stop_loss_order_mode="fixed_price",
+            stop_loss_order_price=Decimal("0.0200"),
+            stop_loss_slippage=Decimal("0"),
+            poll_seconds=2,
+            trigger_label="BTC-USDT 最新价",
+        )
+        client = _PriceGuardClient(
+            spot_price=Decimal("62800"),
+            option_mark_price=Decimal("0.0105"),
+            option_bid=Decimal("0.0100"),
+            option_ask=Decimal("0.0110"),
+            option_last=Decimal("0.0105"),
+        )
+
+        _validate_protection_live_price_availability(
+            client,
+            protection,
+            _make_option_position(inst_id=protection.option_inst_id, position="-1", pos_side="short"),
+        )
+
     def test_live_price_validation_blocks_missing_mark_trigger(self) -> None:
         protection = OptionProtectionConfig(
             option_inst_id="BTC-USD-20260626-100000-C",
@@ -623,7 +817,7 @@ class PositionProtectionTest(TestCase):
             option_ask=Decimal("0.0300"),
             option_last=Decimal("0.0280"),
         )
-        with self.assertRaisesRegex(ValueError, "价格保护已拦截"):
+        with self.assertRaisesRegex(ValueError, "已满足止损触发"):
             _validate_protection_live_price_availability(
                 client,
                 protection,
@@ -771,7 +965,7 @@ class PositionProtectionTest(TestCase):
             Decimal("0.0001"),
         )
 
-    def test_wait_order_fill_returns_partial_fill_immediately(self) -> None:
+    def test_wait_order_fill_waits_for_terminal_fill_after_partial_update(self) -> None:
         client = _OrderStatusClient(
             OkxOrderStatus(
                 ord_id="1",
@@ -780,8 +974,19 @@ class PositionProtectionTest(TestCase):
                 ord_type="ioc",
                 price=Decimal("0.0149"),
                 avg_price=Decimal("0.0150"),
-                size=Decimal("3"),
+                size=Decimal("20"),
                 filled_size=Decimal("1"),
+                raw={},
+            ),
+            OkxOrderStatus(
+                ord_id="1",
+                state="filled",
+                side="sell",
+                ord_type="ioc",
+                price=Decimal("0.0149"),
+                avg_price=Decimal("0.0151"),
+                size=Decimal("20"),
+                filled_size=Decimal("20"),
                 raw={},
             )
         )
@@ -795,9 +1000,9 @@ class PositionProtectionTest(TestCase):
             wait_seconds=0.001,
             stop_event=Event(),
         )
-        self.assertEqual(filled_size, Decimal("1"))
-        self.assertEqual(filled_price, Decimal("0.0150"))
-        self.assertEqual(client.calls, 1)
+        self.assertEqual(filled_size, Decimal("20"))
+        self.assertEqual(filled_price, Decimal("0.0151"))
+        self.assertEqual(client.calls, 2)
 
     def test_wait_order_fill_raises_when_order_is_canceled(self) -> None:
         client = _OrderStatusClient(
@@ -977,7 +1182,7 @@ class PositionProtectionTest(TestCase):
             },
             order_results=[
                 {
-                    "state": "partially_filled",
+                    "state": "canceled",
                     "filled_size": Decimal("1"),
                     "avg_price": Decimal("0.0153"),
                     "price": Decimal("0.0153"),
@@ -1326,6 +1531,198 @@ class PositionProtectionTest(TestCase):
         self.assertTrue(any("网络重试" in subject for subject, _ in notifier.messages))
         self.assertEqual(len([subject for subject, _ in notifier.messages if "持仓保护触发" in subject]), 1)
 
+    def test_manager_rechecks_active_close_order_after_fill_wait_timeout_without_second_order(self) -> None:
+        option_inst_id = "BTC-USD-20260327-57000-P"
+        spot_inst_id = "BTC-USDT"
+        client = _SimulatedProtectionClient(
+            initial_position=_make_option_position(inst_id=option_inst_id, position="2", pos_side="long"),
+            trigger_prices={
+                (spot_inst_id, "last"): [Decimal("62900")],
+                (option_inst_id, "mark"): [Decimal("0.0100")],
+            },
+            order_results=[
+                {
+                    "state": "filled",
+                    "filled_size": Decimal("2"),
+                    "avg_price": Decimal("0.0100"),
+                    "price": Decimal("0.0100"),
+                    "size": Decimal("2"),
+                }
+            ],
+        )
+        notifier = _NotifierStub()
+        manager = PositionProtectionManager(
+            client,
+            lambda _message: None,
+            notifier=notifier,
+            transient_alert_interval_seconds=999,
+            transient_status_interval_seconds=0,
+        )
+
+        with patch.object(
+            protection_module,
+            "wait_order_fill",
+            side_effect=protection_module.ProtectionCloseRetryError("等待平仓单状态确认超时"),
+        ):
+            session_id = manager.start(
+                _make_credentials(),
+                _make_strategy_config(),
+                OptionProtectionConfig(
+                    option_inst_id=option_inst_id,
+                    trigger_inst_id=spot_inst_id,
+                    trigger_price_type="last",
+                    direction="long",
+                    pos_side="long",
+                    take_profit_trigger=None,
+                    stop_loss_trigger=Decimal("62900"),
+                    take_profit_order_mode="mark_with_slippage",
+                    take_profit_order_price=None,
+                    take_profit_slippage=Decimal("0"),
+                    stop_loss_order_mode="mark_with_slippage",
+                    stop_loss_order_price=None,
+                    stop_loss_slippage=Decimal("0"),
+                    poll_seconds=0.01,
+                    trigger_label=f"{spot_inst_id} last",
+                ),
+            )
+
+            worker = manager._workers[session_id]
+            assert worker.thread is not None
+            worker.thread.join(timeout=2)
+
+        self.assertFalse(worker.thread.is_alive())
+        self.assertEqual(worker.status, "已完成")
+        self.assertEqual(client.current_position, Decimal("0"))
+        self.assertEqual(len(client.orders), 1)
+
+    def test_manager_stops_reordering_after_full_fill_when_position_query_is_stale(self) -> None:
+        option_inst_id = "BTC-USD-20260327-70000-P"
+        spot_inst_id = "BTC-USDT"
+        client = _StaleFilledPositionClient(
+            initial_position=_make_option_position(inst_id=option_inst_id, position="-2", pos_side="short"),
+            trigger_prices={
+                (spot_inst_id, "last"): [Decimal("62000")],
+                (option_inst_id, "mark"): [Decimal("0.0150")],
+            },
+            order_results=[
+                {
+                    "state": "filled",
+                    "filled_size": Decimal("2"),
+                    "avg_price": Decimal("0.0150"),
+                    "price": Decimal("0.0150"),
+                    "size": Decimal("2"),
+                }
+            ],
+            stale_reads_after_flat=3,
+        )
+        notifier = _NotifierStub()
+        manager = PositionProtectionManager(
+            client,
+            lambda _message: None,
+            notifier=notifier,
+            transient_alert_interval_seconds=999,
+            transient_status_interval_seconds=0,
+        )
+
+        session_id = manager.start(
+            _make_credentials(),
+            _make_strategy_config(),
+            OptionProtectionConfig(
+                option_inst_id=option_inst_id,
+                trigger_inst_id=spot_inst_id,
+                trigger_price_type="last",
+                direction="short",
+                pos_side="short",
+                take_profit_trigger=None,
+                stop_loss_trigger=Decimal("62000"),
+                take_profit_order_mode="fixed_price",
+                take_profit_order_price=Decimal("0.0120"),
+                take_profit_slippage=Decimal("0"),
+                stop_loss_order_mode="fixed_price",
+                stop_loss_order_price=Decimal("0.0150"),
+                stop_loss_slippage=Decimal("0"),
+                poll_seconds=0.01,
+                trigger_label=f"{spot_inst_id} last",
+            ),
+        )
+
+        worker = manager._workers[session_id]
+        assert worker.thread is not None
+        worker.thread.join(timeout=2)
+
+        self.assertFalse(worker.thread.is_alive())
+        self.assertEqual(worker.status, "已完成")
+        self.assertEqual(client.current_position, Decimal("0"))
+        self.assertEqual(len(client.orders), 1)
+
+    def test_fill_email_uses_final_filled_contract_quantity(self) -> None:
+        option_inst_id = "BTC-USD-20260327-57000-P"
+        client = _SequencedOrderFillClient(
+            initial_position=_make_option_position(inst_id=option_inst_id, position="20", pos_side="long"),
+            trigger_prices={
+                (option_inst_id, "mark"): [Decimal("0.0100")],
+            },
+            order_status_sequences=[
+                [
+                    {
+                        "state": "partially_filled",
+                        "filled_size": Decimal("1"),
+                        "avg_price": Decimal("0.01"),
+                        "price": Decimal("0.01"),
+                        "size": Decimal("20"),
+                    },
+                    {
+                        "state": "filled",
+                        "filled_size": Decimal("20"),
+                        "avg_price": Decimal("0.01"),
+                        "price": Decimal("0.01"),
+                        "size": Decimal("20"),
+                    },
+                ]
+            ],
+        )
+        notifier = _NotifierStub()
+        manager = PositionProtectionManager(
+            client,
+            lambda _message: None,
+            notifier=notifier,
+            transient_alert_interval_seconds=999,
+            transient_status_interval_seconds=0,
+        )
+
+        session_id = manager.start(
+            _make_credentials(),
+            _make_strategy_config(),
+            OptionProtectionConfig(
+                option_inst_id=option_inst_id,
+                trigger_inst_id=option_inst_id,
+                trigger_price_type="mark",
+                direction="long",
+                pos_side="long",
+                take_profit_trigger=Decimal("0.0090"),
+                stop_loss_trigger=None,
+                take_profit_order_mode="fixed_price",
+                take_profit_order_price=Decimal("0.01"),
+                take_profit_slippage=Decimal("0"),
+                stop_loss_order_mode="fixed_price",
+                stop_loss_order_price=Decimal("0.0095"),
+                stop_loss_slippage=Decimal("0"),
+                poll_seconds=0.01,
+                trigger_label=f"{option_inst_id} mark",
+            ),
+        )
+
+        worker = manager._workers[session_id]
+        assert worker.thread is not None
+        worker.thread.join(timeout=2)
+
+        self.assertFalse(worker.thread.is_alive())
+        fill_messages = [body for subject, body in notifier.messages if "持仓保护成交" in subject]
+        self.assertEqual(len(fill_messages), 1)
+        self.assertIn("成交数量：20", fill_messages[0])
+        self.assertIn("剩余仓位：0", fill_messages[0])
+        self.assertNotIn("成交数量：1", fill_messages[0])
+
     def test_manager_blocks_unreasonable_mark_price_before_placing_close_order(self) -> None:
         option_inst_id = "BTC-USD-20260331-66500-P"
         spot_inst_id = "BTC-USDT"
@@ -1540,7 +1937,7 @@ class PositionProtectionTest(TestCase):
             },
             order_results=[
                 {
-                    "state": "partially_filled",
+                    "state": "canceled",
                     "filled_size": Decimal("1"),
                     "avg_price": Decimal("0.0152"),
                     "price": Decimal("0.0152"),
@@ -1683,4 +2080,3 @@ class PositionProtectionTest(TestCase):
         self.assertFalse(worker.thread.is_alive())
         self.assertEqual(manager.clear_finished(), 1)
         self.assertEqual(len(manager._workers), 0)
-

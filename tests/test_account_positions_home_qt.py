@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest import TestCase
@@ -7,11 +8,13 @@ from unittest.mock import MagicMock, patch
 
 from roll_terminal_qt.account_positions_home import (
     AccountPositionsHomeWidget,
+    PositionProtectionDialog,
     _current_order_view_cancel_reference,
     _current_order_view_program_owner_label,
     _current_order_view_to_trade_order_item,
 )
 from okx_quant.okx_client import Instrument, OkxOrderResult
+from okx_quant.position_protection import ProtectionSessionSnapshot
 from roll_terminal_qt.order_service import OrderStatusView
 
 
@@ -57,7 +60,149 @@ class _ProfileComboStub:
         self.enabled = enabled
 
 
+class _ProtectionSessionTableStub:
+    def __init__(self) -> None:
+        self.row_count = 0
+        self.items: dict[tuple[int, int], object] = {}
+        self.selected_row = -1
+
+    def currentRow(self) -> int:
+        return self.selected_row
+
+    def setRowCount(self, count: int) -> None:
+        self.row_count = count
+
+    def setItem(self, row: int, column: int, item: object) -> None:
+        self.items[(row, column)] = item
+
+    def selectRow(self, row: int) -> None:
+        self.selected_row = row
+
+
+class _HeaderStub:
+    def __init__(self) -> None:
+        self.stretch_last_section = True
+        self.resize_modes: dict[int, object] = {}
+
+    def setStretchLastSection(self, enabled: bool) -> None:
+        self.stretch_last_section = enabled
+
+    def setSectionResizeMode(self, column: int, mode: object) -> None:
+        self.resize_modes[column] = mode
+
+
+class _ColumnConfigTableStub:
+    def __init__(self) -> None:
+        self._header = _HeaderStub()
+        self.column_widths: dict[int, int] = {}
+        self.scrollbar_policy = None
+
+    def horizontalHeader(self) -> _HeaderStub:
+        return self._header
+
+    def setColumnWidth(self, column: int, width: int) -> None:
+        self.column_widths[column] = width
+
+    def setHorizontalScrollBarPolicy(self, policy: object) -> None:
+        self.scrollbar_policy = policy
+
+
 class AccountPositionsHomeQtHelpersTest(TestCase):
+    @patch("roll_terminal_qt.account_positions_home._validate_protection_live_price_availability")
+    def test_start_selected_position_protection_sets_runtime_notifier(self, validate_live_price: MagicMock) -> None:
+        notifier = object()
+        protection = SimpleNamespace(name="protection")
+        runtime = SimpleNamespace(credentials=SimpleNamespace(name="credentials"))
+        position = SimpleNamespace(inst_type="OPTION")
+        manager = SimpleNamespace(set_notifier=MagicMock(), start=MagicMock())
+        refresh_sessions = MagicMock()
+        dialog = SimpleNamespace(
+            _runtime_provider=lambda: runtime,
+            _current_position=lambda: position,
+            _build_selected_position_protection=lambda current: protection,
+            _client=SimpleNamespace(),
+            _notifier_provider=lambda: notifier,
+            _build_strategy_config=lambda **kwargs: "strategy-config",
+            _manager=manager,
+            _refresh_sessions=refresh_sessions,
+        )
+
+        PositionProtectionDialog._start_selected_position_protection(dialog)
+
+        manager.set_notifier.assert_called_once_with(notifier)
+        manager.start.assert_called_once_with(runtime.credentials, "strategy-config", protection)
+        refresh_sessions.assert_called_once_with()
+        validate_live_price.assert_called_once_with(dialog._client, protection, position)
+
+    def test_refresh_sessions_table_shows_protection_configuration_columns(self) -> None:
+        table = _ProtectionSessionTableStub()
+        session = ProtectionSessionSnapshot(
+            session_id="P01",
+            api_name="QQzhangyong",
+            option_inst_id="BTC-USD-260717-57000-P",
+            trigger_inst_id="BTC-USDT",
+            trigger_label="BTC-USDT 最新价",
+            trigger_price_type="last",
+            direction="long",
+            pos_side=None,
+            take_profit_trigger=None,
+            take_profit_order_mode="mark_with_slippage",
+            take_profit_order_price=None,
+            take_profit_slippage=Decimal("0"),
+            stop_loss_trigger=Decimal("62900"),
+            stop_loss_order_mode="mark_with_slippage",
+            stop_loss_order_price=None,
+            stop_loss_slippage=Decimal("0"),
+            poll_seconds=2,
+            status="运行中",
+            started_at=datetime(2026, 7, 6, 18, 29, 1),
+            last_message="监控中",
+        )
+        dialog = SimpleNamespace(
+            _manager=SimpleNamespace(list_sessions=lambda: [session]),
+            _session_status_label=SimpleNamespace(setText=MagicMock()),
+            _sessions_table=table,
+            _session_ids=[],
+            _selected_session_id=lambda: "",
+            _detail_text=SimpleNamespace(setPlainText=MagicMock()),
+            _refresh_selected_session_detail=MagicMock(),
+        )
+
+        PositionProtectionDialog._refresh_sessions(dialog)
+
+        values = [table.items.get((0, column), SimpleNamespace(text=lambda: "")).text() for column in range(13)]
+        self.assertEqual(
+            values,
+            [
+                "QQzhangyong",
+                "BTC-USD-260717-57000-P",
+                "BTC-USDT 最新价",
+                "BTC-USDT",
+                "最新价",
+                "long",
+                "-",
+                "-",
+                "62900",
+                "止盈/止损: 标记价格加减滑点/标记价格加减滑点",
+                "2s",
+                "运行中",
+                "18:29:01",
+            ],
+        )
+
+    def test_configure_sessions_table_columns_applies_default_widths_for_long_fields(self) -> None:
+        table = _ColumnConfigTableStub()
+
+        PositionProtectionDialog._configure_sessions_table_columns(SimpleNamespace(_sessions_table=table), 13)
+
+        self.assertFalse(table.horizontalHeader().stretch_last_section)
+        self.assertEqual(table.column_widths[0], 120)
+        self.assertEqual(table.column_widths[1], 210)
+        self.assertEqual(table.column_widths[2], 170)
+        self.assertEqual(table.column_widths[3], 120)
+        self.assertEqual(table.column_widths[9], 230)
+        self.assertEqual(table.column_widths[12], 96)
+
     def test_parse_positive_decimal_returns_decimal_without_widget_context(self) -> None:
         value = AccountPositionsHomeWidget._parse_positive_decimal("1.25", "平仓币数")
 

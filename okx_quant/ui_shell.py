@@ -155,6 +155,7 @@ from okx_quant.position_protection import (
     build_close_order_price_from_mark,
     describe_protection_price_logic,
     derive_position_direction,
+    evaluate_protection_trigger,
     infer_protection_profit_on_rise,
     infer_default_spot_inst_id,
     normalize_spot_inst_id,
@@ -16922,6 +16923,47 @@ def _validate_protection_live_price_availability(
                 f"{protection.option_inst_id} 当前拿不到标记价格，不能用“期权标记价格”触发。"
                 "请改用“现货最新价”，或者等 OKX 返回 markPx 后再启动。"
             ) from exc
+
+    try:
+        current_trigger_price = client.get_trigger_price(protection.trigger_inst_id, protection.trigger_price_type)
+    except OkxApiError:
+        current_trigger_price = None
+    if current_trigger_price is not None:
+        stop_hit, take_hit = evaluate_protection_trigger(
+            direction=protection.direction,
+            current_price=current_trigger_price,
+            stop_loss=protection.stop_loss_trigger,
+            take_profit=protection.take_profit_trigger,
+            option_inst_id=protection.option_inst_id,
+            uses_underlying_trigger=(
+                protection.trigger_inst_id.strip().upper() != protection.option_inst_id.strip().upper()
+                or protection.trigger_price_type != "mark"
+            ),
+        )
+        if stop_hit or take_hit:
+            trigger_kind = "止损触发" if stop_hit else "止盈触发"
+            trigger_value = protection.stop_loss_trigger if stop_hit else protection.take_profit_trigger
+            if trigger_value is None:
+                guidance = "请调整触发价后再启动。"
+            elif trigger_value < current_trigger_price:
+                guidance = (
+                    f"{format_decimal(trigger_value)} 低于当前价 {format_decimal(current_trigger_price)}，"
+                    "属于下跌触发；如果你想等跌破后再触发，请填写在止损触发。"
+                )
+            elif trigger_value > current_trigger_price:
+                guidance = (
+                    f"{format_decimal(trigger_value)} 高于当前价 {format_decimal(current_trigger_price)}，"
+                    "属于上涨触发；如果你想等涨破后再触发，请填写在止盈触发。"
+                )
+            else:
+                guidance = (
+                    f"{format_decimal(trigger_value)} 与当前价 {format_decimal(current_trigger_price)} 相等，"
+                    "保护任务会在启动后立刻触发，请调整触发价。"
+                )
+            raise ValueError(
+                f"{protection.trigger_label or protection.trigger_inst_id} 当前价 {format_decimal(current_trigger_price)} "
+                f"已满足{trigger_kind}。为避免启动后立刻触发，本次已阻止启动。{guidance}"
+            )
 
     requires_mark_for_order = (
         protection.take_profit_order_mode == "mark_with_slippage"

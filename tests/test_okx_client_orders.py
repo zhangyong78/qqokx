@@ -7,10 +7,121 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from okx_quant.models import Credentials, OrderPlan, StrategyConfig
-from okx_quant.okx_client import OkxApiError, OkxOrderStatus, OkxRestClient, _okx_trade_order_request_log_fragment
+from okx_quant.okx_client import OkxApiError, OkxOrderStatus, OkxRestClient, OkxTicker, _okx_trade_order_request_log_fragment
 
 
 class OkxClientOrderRequestTest(TestCase):
+    @staticmethod
+    def _strategy_config(inst_id: str) -> StrategyConfig:
+        return StrategyConfig(
+            inst_id=inst_id,
+            trade_inst_id=inst_id,
+            local_tp_sl_inst_id=inst_id,
+            bar="1H",
+            ema_period=21,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            tp_sl_mode="exchange",
+            take_profit_mode="dynamic",
+            risk_amount=Decimal("10"),
+        )
+
+    @staticmethod
+    def _ticker(inst_id: str, price: str) -> OkxTicker:
+        value = Decimal(price)
+        return OkxTicker(inst_id=inst_id, last=value, bid=value, ask=value, mark=value, index=value, raw={})
+
+    def test_place_simple_order_blocks_btc_exposure_above_one_before_request(self) -> None:
+        client = OkxRestClient()
+
+        def _stub_request(method: str, path: str, params=None, body=None, **kwargs):
+            if path == "/api/v5/public/instruments":
+                return {
+                    "data": [
+                        {
+                            "instId": "BTC-USDT-SWAP",
+                            "instType": "SWAP",
+                            "tickSz": "0.1",
+                            "lotSz": "1",
+                            "minSz": "1",
+                            "state": "live",
+                            "settleCcy": "USDT",
+                            "ctVal": "0.01",
+                            "ctMult": "1",
+                            "ctValCcy": "BTC",
+                            "uly": "BTC-USDT",
+                            "instFamily": "BTC-USDT",
+                        }
+                    ]
+                }
+            if path == "/api/v5/account/config":
+                return {"data": [{"posMode": "net_mode"}]}
+            self.fail(f"should block before sending order request: {method} {path}")
+
+        client._request = _stub_request  # type: ignore[method-assign]
+
+        with self.assertRaises(OkxApiError) as ctx:
+            client.place_simple_order(
+                Credentials(api_key="", secret_key="", passphrase=""),
+                self._strategy_config("BTC-USDT-SWAP"),
+                inst_id="BTC-USDT-SWAP",
+                side="buy",
+                size=Decimal("101"),
+                ord_type="market",
+            )
+
+        self.assertIn("BTC", str(ctx.exception))
+        self.assertIn("1", str(ctx.exception))
+
+    def test_place_simple_order_blocks_non_btc_notional_above_5000_before_request(self) -> None:
+        client = OkxRestClient()
+        client.get_ticker = lambda inst_id: self._ticker(inst_id, "2300")  # type: ignore[method-assign]
+
+        def _stub_request(method: str, path: str, params=None, body=None, **kwargs):
+            if path == "/api/v5/public/instruments":
+                return {
+                    "data": [
+                        {
+                            "instId": "ETH-USDT-SWAP",
+                            "instType": "SWAP",
+                            "tickSz": "0.01",
+                            "lotSz": "1",
+                            "minSz": "1",
+                            "state": "live",
+                            "settleCcy": "USDT",
+                            "ctVal": "0.1",
+                            "ctMult": "1",
+                            "ctValCcy": "ETH",
+                            "uly": "ETH-USDT",
+                            "instFamily": "ETH-USDT",
+                        }
+                    ]
+                }
+            if path == "/api/v5/account/config":
+                return {"data": [{"posMode": "net_mode"}]}
+            self.fail(f"should block before sending order request: {method} {path}")
+
+        client._request = _stub_request  # type: ignore[method-assign]
+
+        with self.assertRaises(OkxApiError) as ctx:
+            client.place_simple_order(
+                Credentials(api_key="", secret_key="", passphrase=""),
+                self._strategy_config("ETH-USDT-SWAP"),
+                inst_id="ETH-USDT-SWAP",
+                side="buy",
+                size=Decimal("22"),
+                ord_type="market",
+            )
+
+        self.assertIn("5000", str(ctx.exception))
+
     def test_get_instrument_prefers_local_metadata_cache_when_requested(self) -> None:
         client = OkxRestClient()
         payload = {
@@ -1134,6 +1245,7 @@ class OkxClientOrderRequestTest(TestCase):
 
     def test_place_simple_reduce_only_keeps_short_pos_side_when_account_is_long_short(self) -> None:
         client = OkxRestClient()
+        client.get_ticker = lambda inst_id: self._ticker(inst_id, "80000")  # type: ignore[method-assign]
         captured: dict[str, object] = {}
 
         def _stub_request(method: str, path: str, params=None, body=None, **kwargs):

@@ -220,6 +220,9 @@ class _ProtectionWorker:
     active_close_submitted_at: datetime | None = None
     last_trigger_price: Decimal | None = None
     last_monitor_heartbeat_at: datetime | None = None
+    close_target_size: Decimal | None = None
+    close_filled_size: Decimal = Decimal("0")
+    close_recorded_order_keys: set[str] = field(default_factory=set)
 
 
 class PositionProtectionManager:
@@ -1305,19 +1308,28 @@ def wait_order_fill(
         raise RuntimeError("OKX 未返回 ordId，无法确认保护平仓结果。")
 
     latest_state = ""
+    last_filled_size = Decimal("0")
+    last_resolved_price = estimated_price
     for _ in range(12):
         status = client.get_order(credentials, config, inst_id=inst_id, ord_id=ord_id)
-        latest_state = status.state.lower()
+        latest_state = (status.state or "").lower()
         filled_size = status.filled_size or Decimal("0")
+        resolved_price = status.avg_price or status.price or estimated_price
+        if filled_size > last_filled_size:
+            last_filled_size = filled_size
+            last_resolved_price = resolved_price
         if latest_state == "filled":
-            return filled_size if filled_size > 0 else status.size or Decimal("0"), status.avg_price or status.price or estimated_price
-        if latest_state == "partially_filled" and filled_size > 0:
-            return filled_size, status.avg_price or status.price or estimated_price
-        if latest_state in {"canceled", "order_failed"}:
+            return filled_size if filled_size > 0 else status.size or Decimal("0"), resolved_price
+        if latest_state in {"canceled", "order_failed", "mmp_canceled"}:
+            if filled_size > 0:
+                return filled_size, resolved_price
             break
         stop_event.wait(wait_seconds)
 
-    raise RuntimeError(f"保护平仓订单未成交，ordId={ord_id}，状态={latest_state or 'unknown'}")
+    partial_suffix = ""
+    if last_filled_size > 0:
+        partial_suffix = f"，期间部分成交={format_decimal(last_filled_size)}"
+    raise RuntimeError(f"保护平仓订单未成交，ordId={ord_id}，状态={latest_state or 'unknown'}{partial_suffix}")
 
 
 def _fmt_optional(value: Decimal | None) -> str:
@@ -1582,6 +1594,8 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
         return
 
     remaining = abs(remaining_position.position)
+    if worker.close_target_size is None:
+        worker.close_target_size = remaining
     close_side = derive_close_side(worker.protection.direction)
     pos_side = worker.protection.pos_side
 
@@ -1608,6 +1622,14 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
                 remaining = Decimal("0")
                 break
             remaining = abs(latest.position)
+            if _pp_is_close_fill_saturated(worker):
+                self._logger(
+                    f"{_protection_worker_prefix_clean(worker)} 已确认成交数量达到原始保护仓位 "
+                    f"{format_decimal(worker.close_target_size or Decimal('0'))}，"
+                    f"但持仓查询仍显示剩余 {format_decimal(remaining)}，停止自动补单，等待持仓回写。"
+                )
+                remaining = Decimal("0")
+                break
             if state == "progressed":
                 continue
             raise ProtectionCloseRetryError(f"{reason}平仓单未成交，准备重新挂单。")
@@ -1670,7 +1692,6 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
                 stop_event=worker.stop_event,
             )
         except ProtectionCloseRetryError:
-            self._clear_active_close_order(worker)
             raise
 
         latest = self._find_matching_position(worker)
@@ -1689,6 +1710,7 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
             remaining=remaining,
             order_price=order_price,
             ticker=option_ticker,
+            order_key=result.ord_id or worker.active_close_cl_ord_id or cl_ord_id,
         )
         self._clear_active_close_order(worker)
         latest = self._find_matching_position(worker)
@@ -1696,6 +1718,14 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
             remaining = Decimal("0")
             break
         remaining = abs(latest.position)
+        if _pp_is_close_fill_saturated(worker):
+            self._logger(
+                f"{_protection_worker_prefix_clean(worker)} 已确认成交数量达到原始保护仓位 "
+                f"{format_decimal(worker.close_target_size or Decimal('0'))}，"
+                f"但持仓查询仍显示剩余 {format_decimal(remaining)}，停止自动补单，等待持仓回写。"
+            )
+            remaining = Decimal("0")
+            break
 
     if remaining > 0:
         raise RuntimeError(f"{worker.protection.option_inst_id} 保护平仓后仍有剩余仓位 {format_decimal(remaining)}")
@@ -1731,24 +1761,37 @@ def _pp_reconcile_active_close_order(
 
     state = (status.state or "").lower()
     filled_size = status.filled_size or Decimal("0")
-    if filled_size > 0:
+    if state == "filled":
         latest = self._find_matching_position(worker)
         remaining = Decimal("0") if latest is None else abs(latest.position)
         self._record_close_fill(
             worker,
             reason=reason,
             close_side=close_side,
-            filled_size=filled_size,
+            filled_size=filled_size if filled_size > 0 else expected_remaining,
             filled_price=status.avg_price or status.price or Decimal("0"),
             remaining=remaining,
             order_price=status.price,
             ticker=self._safe_get_ticker(worker.protection.option_inst_id),
+            order_key=status.ord_id or worker.active_close_cl_ord_id,
         )
-
-    if state in {"filled", "partially_filled"}:
         self._clear_active_close_order(worker)
         return "progressed"
     if state in {"canceled", "mmp_canceled", "order_failed"}:
+        if filled_size > 0:
+            latest = self._find_matching_position(worker)
+            remaining = Decimal("0") if latest is None else abs(latest.position)
+            self._record_close_fill(
+                worker,
+                reason=reason,
+                close_side=close_side,
+                filled_size=filled_size,
+                filled_price=status.avg_price or status.price or Decimal("0"),
+                remaining=remaining,
+                order_price=status.price,
+                ticker=self._safe_get_ticker(worker.protection.option_inst_id),
+                order_key=status.ord_id or worker.active_close_cl_ord_id,
+            )
         self._clear_active_close_order(worker)
         return "progressed" if filled_size > 0 else "retry"
     return "waiting"
@@ -2105,6 +2148,8 @@ def _wait_order_fill_with_private_ws(
 
     latest_state = ""
     ws_version = 0
+    last_filled_size = Decimal("0")
+    last_resolved_price = estimated_price
     for _ in range(12):
         status = None
         wait_private_update = getattr(client, "wait_private_order_update", None)
@@ -2127,10 +2172,11 @@ def _wait_order_fill_with_private_ws(
         latest_state = (status.state or "").lower()
         filled_size = status.filled_size or Decimal("0")
         resolved_price = status.avg_price or status.price or estimated_price
+        if filled_size > last_filled_size:
+            last_filled_size = filled_size
+            last_resolved_price = resolved_price
         if latest_state == "filled":
             return filled_size if filled_size > 0 else status.size or Decimal("0"), resolved_price
-        if latest_state == "partially_filled" and filled_size > 0:
-            return filled_size, resolved_price
         if latest_state in {"canceled", "order_failed", "mmp_canceled"}:
             if filled_size > 0:
                 return filled_size, resolved_price
@@ -2141,10 +2187,35 @@ def _wait_order_fill_with_private_ws(
             continue
         stop_event.wait(wait_seconds)
 
-    raise ProtectionCloseRetryError(f"保护平仓订单未成交，ordId={ord_id}，状态={latest_state or 'unknown'}")
+    partial_suffix = ""
+    if last_filled_size > 0:
+        partial_suffix = f"，期间部分成交={format_decimal(last_filled_size)}"
+    raise ProtectionCloseRetryError(
+        f"保护平仓订单未成交，ordId={ord_id}，状态={latest_state or 'unknown'}{partial_suffix}"
+    )
 
 
 wait_order_fill = _wait_order_fill_with_private_ws
+
+
+def _pp_register_close_fill(worker: _ProtectionWorker, *, order_key: str | None, filled_size: Decimal) -> bool:
+    if filled_size <= 0:
+        return False
+    normalized_key = (order_key or "").strip()
+    if normalized_key:
+        if normalized_key in worker.close_recorded_order_keys:
+            return False
+        worker.close_recorded_order_keys.add(normalized_key)
+    worker.close_filled_size += filled_size
+    return True
+
+
+def _pp_is_close_fill_saturated(worker: _ProtectionWorker) -> bool:
+    return (
+        worker.close_target_size is not None
+        and worker.close_target_size > 0
+        and worker.close_filled_size >= worker.close_target_size
+    )
 
 
 def _pp_wait_for_write_reconcile(worker: _ProtectionWorker, attempt: int) -> None:
@@ -2520,6 +2591,8 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
         return
 
     remaining = abs(remaining_position.position)
+    if worker.close_target_size is None:
+        worker.close_target_size = remaining
     close_side = derive_close_side(worker.protection.direction)
     pos_side = worker.protection.pos_side
 
@@ -2546,6 +2619,14 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
                 remaining = Decimal("0")
                 break
             remaining = abs(latest.position)
+            if _pp_is_close_fill_saturated(worker):
+                self._logger(
+                    f"{_protection_worker_prefix_clean(worker)} 已确认成交数量达到原始保护仓位 "
+                    f"{format_decimal(worker.close_target_size or Decimal('0'))}，"
+                    f"但持仓查询仍显示剩余 {format_decimal(remaining)}，停止自动补单，等待持仓回写。"
+                )
+                remaining = Decimal("0")
+                break
             if state == "progressed":
                 continue
             raise ProtectionCloseRetryError(f"{reason}平仓单未成交，准备重新挂单。")
@@ -2608,7 +2689,6 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
                 stop_event=worker.stop_event,
             )
         except ProtectionCloseRetryError:
-            self._clear_active_close_order(worker)
             raise
 
         latest = self._find_matching_position(worker)
@@ -2627,6 +2707,7 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
             remaining=remaining,
             order_price=order_price,
             ticker=option_ticker,
+            order_key=result.ord_id or worker.active_close_cl_ord_id or cl_ord_id,
         )
         self._clear_active_close_order(worker)
         latest = self._find_matching_position(worker)
@@ -2634,6 +2715,14 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
             remaining = Decimal("0")
             break
         remaining = abs(latest.position)
+        if _pp_is_close_fill_saturated(worker):
+            self._logger(
+                f"{_protection_worker_prefix_clean(worker)} 已确认成交数量达到原始保护仓位 "
+                f"{format_decimal(worker.close_target_size or Decimal('0'))}，"
+                f"但持仓查询仍显示剩余 {format_decimal(remaining)}，停止自动补单，等待持仓回写。"
+            )
+            remaining = Decimal("0")
+            break
 
     if remaining > 0:
         raise RuntimeError(f"{worker.protection.option_inst_id} 保护平仓后仍有剩余仓位 {format_decimal(remaining)}")
@@ -2650,7 +2739,10 @@ def _pp_record_close_fill(
     remaining: Decimal,
     order_price: Decimal | None = None,
     ticker: OkxTicker | None = None,
+    order_key: str | None = None,
 ) -> None:
+    if not _pp_register_close_fill(worker, order_key=order_key, filled_size=filled_size):
+        return
     self._logger(
         f"{_protection_worker_prefix_clean(worker)} {reason}平仓成交 | {worker.protection.option_inst_id} | "
         f"方向={close_side.upper()} | 成交价={format_decimal(filled_price)} | 成交量={format_decimal(filled_size)} | "

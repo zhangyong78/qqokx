@@ -45,6 +45,9 @@ OPTION_ID_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+-\d{6}-[0-9]+-[CP]$")
 FUTURES_ID_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+-\d{6}$")
 MAX_PUBLIC_CANDLE_LIMIT = 300
 FULL_HISTORY_CHECKPOINT_PAGE_INTERVAL = 25
+MAX_BTC_ORDER_EXPOSURE = Decimal("1")
+MAX_NON_BTC_ORDER_NOTIONAL_USD = Decimal("5000")
+USD_LIKE_CURRENCIES = {"USD", "USDT", "USDC"}
 
 
 def _candle_bar_ms(bar: str) -> int:
@@ -549,6 +552,56 @@ class OkxRestClient:
         if account_level in {"3", "4"}:
             return "cross"
         return "cash"
+
+    def _enforce_order_size_safety_limit(
+        self,
+        *,
+        instrument: Instrument | None,
+        size: Decimal,
+        reference_price: Decimal | None = None,
+        inst_id: str | None = None,
+    ) -> None:
+        normalized_inst_id = (
+            instrument.inst_id if instrument is not None else inst_id or ""
+        ).strip().upper()
+        base_ccy = _instrument_base_currency(instrument, normalized_inst_id)
+        abs_size = abs(size)
+        if abs_size <= 0:
+            return
+
+        price = reference_price if reference_price is not None and reference_price > 0 else None
+        if base_ccy == "BTC":
+            exposure = _estimate_base_exposure(instrument, abs_size, price)
+            if exposure is None and _instrument_needs_reference_price_for_base_exposure(instrument):
+                price = self._order_size_safety_reference_price(normalized_inst_id)
+                exposure = _estimate_base_exposure(instrument, abs_size, price)
+            if exposure is None:
+                raise OkxApiError(f"{normalized_inst_id} BTC报单暴露无法确认，已拦截。")
+            if exposure > MAX_BTC_ORDER_EXPOSURE:
+                raise OkxApiError(
+                    f"{normalized_inst_id} BTC报单暴露 {format_decimal(exposure)} BTC "
+                    f"超过绝对限制 {format_decimal(MAX_BTC_ORDER_EXPOSURE)} BTC，已拦截。"
+                )
+            return
+
+        notional = _estimate_notional_usd(instrument, abs_size, price)
+        if notional is None and _instrument_needs_reference_price_for_notional(instrument):
+            price = self._order_size_safety_reference_price(normalized_inst_id)
+            notional = _estimate_notional_usd(instrument, abs_size, price)
+        if notional is None:
+            raise OkxApiError(f"{normalized_inst_id} 报单名义价值无法确认，已拦截。")
+        if notional > MAX_NON_BTC_ORDER_NOTIONAL_USD:
+            raise OkxApiError(
+                f"{normalized_inst_id} 报单名义价值 {format_decimal(notional)} USD "
+                f"超过绝对限制 {format_decimal(MAX_NON_BTC_ORDER_NOTIONAL_USD)} USD，已拦截。"
+            )
+
+    def _order_size_safety_reference_price(self, inst_id: str) -> Decimal:
+        ticker = self.get_ticker(inst_id)
+        price = _ticker_reference_price(ticker)
+        if price is None or price <= 0:
+            raise OkxApiError(f"{inst_id} 缺少可用价格，无法确认报单绝对限制，已拦截。")
+        return price
 
     def get_instrument(self, inst_id: str, *, prefer_cached: bool = False) -> Instrument:
         normalized = inst_id.strip().upper()
@@ -2199,6 +2252,12 @@ class OkxRestClient:
         if instrument.inst_type == "OPTION":
             raise OkxApiError("OKX 期权不支持这里的市价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
 
+        self._enforce_order_size_safety_limit(
+            instrument=instrument,
+            size=plan.size,
+            reference_price=plan.entry_reference,
+        )
+
         order: dict[str, Any] = {
             "instId": plan.inst_id,
             "tdMode": config.trade_mode,
@@ -2268,6 +2327,7 @@ class OkxRestClient:
             entry_px = snap_to_increment(entry_px, tick, "nearest")
         px_txt = format_decimal(entry_px)
         tick_opt = tick if tick is not None and tick > 0 else None
+        self._enforce_order_size_safety_limit(instrument=instrument, size=plan.size, reference_price=entry_px)
         order: dict[str, Any] = {
             "instId": plan.inst_id,
             "tdMode": config.trade_mode,
@@ -2350,6 +2410,7 @@ class OkxRestClient:
             raise OkxApiError(f"不支持的订单方向：{plan.side}")
 
         tick_opt = tick
+        self._enforce_order_size_safety_limit(instrument=instrument, size=plan.size, reference_price=entry)
         order: dict[str, Any] = {
             "instId": plan.inst_id,
             "tdMode": config.trade_mode,
@@ -2417,6 +2478,19 @@ class OkxRestClient:
             raise OkxApiError("OKX 期权不支持这里的独立止损算法单，请改走本地止损流程")
 
         stop_loss_txt = _format_okx_px_for_increment(stop_loss_trigger_price, instrument.tick_size)
+        resolved_pos_side = self._reduce_only_order_pos_side(
+            credentials,
+            config,
+            instrument,
+            side,
+            plan_pos_side=pos_side,
+        )
+        self._enforce_order_size_safety_limit(
+            instrument=instrument,
+            size=size,
+            reference_price=stop_loss_trigger_price,
+        )
+
         order: dict[str, Any] = {
             "instId": inst_id,
             "tdMode": config.trade_mode,
@@ -2429,13 +2503,6 @@ class OkxRestClient:
             "reduceOnly": True,
             "cxlOnClosePos": True,
         }
-        resolved_pos_side = self._reduce_only_order_pos_side(
-            credentials,
-            config,
-            instrument,
-            side,
-            plan_pos_side=pos_side,
-        )
         if resolved_pos_side:
             order["posSide"] = resolved_pos_side
         self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
@@ -2473,54 +2540,61 @@ class OkxRestClient:
         cl_ord_id: str | None = None,
         reduce_only: bool = False,
     ) -> OkxOrderResult:
-        sz_txt = format_decimal(size)
+        normalized_inst_id = inst_id.strip().upper()
+        inst: Instrument | None = None
+        try:
+            inst = self.get_instrument(normalized_inst_id)
+        except Exception:
+            inst = None
+        sz_txt = _format_exchange_contract_sz(inst, size) if inst is not None else format_decimal(size)
         order: dict[str, Any] = {
-            "instId": inst_id,
+            "instId": normalized_inst_id,
             "tdMode": config.trade_mode,
             "side": side,
             "ordType": ord_type,
             "sz": sz_txt,
         }
         resolved_pos = pos_side
-        inst: Instrument | None = None
-        if infer_inst_type(inst_id) != "OPTION":
-            try:
-                inst = self.get_instrument(inst_id)
-            except OkxApiError:
-                inst = None
-            if inst is not None:
-                order["sz"] = _format_exchange_contract_sz(inst, size)
-                if inst.inst_type == "SPOT":
-                    order["tdMode"] = self._spot_td_mode_for_account(credentials, config)
-                    if str(ord_type or "").strip().lower() == "post_only":
-                        order["ordType"] = "limit"
-                if reduce_only:
-                    resolved_pos = self._reduce_only_order_pos_side(
-                        credentials,
-                        config,
-                        inst,
-                        side,
-                        plan_pos_side=pos_side,
-                    )
-                else:
-                    resolved_pos = self._derivative_order_pos_side(
-                        credentials,
-                        config,
-                        inst,
-                        side,
-                        plan_pos_side=pos_side,
-                    )
-                self._maybe_isolated_margin_ccy(order, instrument=inst, config=config)
-        if resolved_pos:
-            order["posSide"] = resolved_pos
+        if inst is not None and inst.inst_type == "SPOT":
+            order["tdMode"] = self._spot_td_mode_for_account(credentials, config)
+            if str(ord_type or "").strip().lower() == "post_only":
+                order["ordType"] = "limit"
         if reduce_only:
             order["reduceOnly"] = True
+        reference_price = price
         if price is not None:
             if inst is not None and inst.tick_size is not None and inst.tick_size > 0:
                 px_snapped = snap_to_increment(price, inst.tick_size, "nearest")
                 order["px"] = format_decimal(px_snapped)
+                reference_price = px_snapped
             else:
                 order["px"] = format_decimal(price)
+        if inst is not None and reduce_only:
+            resolved_pos = self._reduce_only_order_pos_side(
+                credentials,
+                config,
+                inst,
+                side,
+                plan_pos_side=pos_side,
+            )
+        self._enforce_order_size_safety_limit(
+            instrument=inst,
+            inst_id=normalized_inst_id,
+            size=size,
+            reference_price=reference_price,
+        )
+        if inst is not None:
+            if not reduce_only:
+                resolved_pos = self._derivative_order_pos_side(
+                    credentials,
+                    config,
+                    inst,
+                    side,
+                    plan_pos_side=pos_side,
+                )
+            self._maybe_isolated_margin_ccy(order, instrument=inst, config=config)
+        if resolved_pos:
+            order["posSide"] = resolved_pos
         if cl_ord_id:
             order["clOrdId"] = cl_ord_id
 
@@ -3027,6 +3101,97 @@ def _format_exchange_contract_sz(instrument: Instrument, size: Decimal) -> str:
             )
         return format_decimal_by_increment(snapped, lot)
     return format_decimal(size)
+
+
+def _instrument_base_currency(instrument: Instrument | None, inst_id: str) -> str:
+    for value in (
+        instrument.uly if instrument is not None else None,
+        instrument.inst_family if instrument is not None else None,
+        instrument.inst_id if instrument is not None else None,
+        inst_id,
+    ):
+        normalized = str(value or "").strip().upper()
+        if normalized:
+            return normalized.split("-", 1)[0]
+    return ""
+
+
+def _contract_value(instrument: Instrument | None) -> Decimal | None:
+    if instrument is None or instrument.ct_val is None or instrument.ct_val <= 0:
+        return None
+    multiplier = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
+    return instrument.ct_val * multiplier
+
+
+def _estimate_base_exposure(
+    instrument: Instrument | None,
+    size: Decimal,
+    reference_price: Decimal | None,
+) -> Decimal | None:
+    if instrument is None:
+        return size
+    base_ccy = _instrument_base_currency(instrument, instrument.inst_id)
+    ct_val_ccy = str(instrument.ct_val_ccy or "").strip().upper()
+    if instrument.inst_type == "SPOT":
+        return size
+    contract_value = _contract_value(instrument)
+    if contract_value is None:
+        return None
+    if ct_val_ccy == base_ccy:
+        return size * contract_value
+    if ct_val_ccy in USD_LIKE_CURRENCIES and reference_price is not None and reference_price > 0:
+        return (size * contract_value) / reference_price
+    return None
+
+
+def _estimate_notional_usd(
+    instrument: Instrument | None,
+    size: Decimal,
+    reference_price: Decimal | None,
+) -> Decimal | None:
+    if instrument is None:
+        return None
+    base_ccy = _instrument_base_currency(instrument, instrument.inst_id)
+    ct_val_ccy = str(instrument.ct_val_ccy or "").strip().upper()
+    if instrument.inst_type == "SPOT":
+        if reference_price is None or reference_price <= 0:
+            return None
+        return size * reference_price
+    contract_value = _contract_value(instrument)
+    if contract_value is None:
+        return None
+    if ct_val_ccy in USD_LIKE_CURRENCIES:
+        return size * contract_value
+    if ct_val_ccy == base_ccy and reference_price is not None and reference_price > 0:
+        return size * contract_value * reference_price
+    return None
+
+
+def _instrument_needs_reference_price_for_base_exposure(instrument: Instrument | None) -> bool:
+    if instrument is None:
+        return False
+    ct_val_ccy = str(instrument.ct_val_ccy or "").strip().upper()
+    return instrument.inst_type == "SPOT" or ct_val_ccy in USD_LIKE_CURRENCIES
+
+
+def _instrument_needs_reference_price_for_notional(instrument: Instrument | None) -> bool:
+    if instrument is None:
+        return False
+    base_ccy = _instrument_base_currency(instrument, instrument.inst_id)
+    ct_val_ccy = str(instrument.ct_val_ccy or "").strip().upper()
+    return instrument.inst_type == "SPOT" or ct_val_ccy == base_ccy
+
+
+def _ticker_reference_price(ticker: OkxTicker) -> Decimal | None:
+    for value in (ticker.last, ticker.mark, ticker.index):
+        if value is not None and value > 0:
+            return value
+    if ticker.bid is not None and ticker.ask is not None and ticker.bid > 0 and ticker.ask > 0:
+        return (ticker.bid + ticker.ask) / Decimal("2")
+    for value in (ticker.bid, ticker.ask):
+        if value is not None and value > 0:
+            return value
+    return None
 
 
 def _format_okx_px_for_increment(value: Decimal, tick_size: Decimal | None) -> str:

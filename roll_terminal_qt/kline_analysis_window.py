@@ -486,6 +486,80 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(value, upper))
 
 
+def _compute_hover_overlay_layout(
+    *,
+    viewport_top: float,
+    viewport_bottom: float,
+    bounds_top: float,
+    bounds_bottom: float,
+    anchor_y: float,
+    price_height: float,
+    tooltip_height: float,
+    volume_reserved_height: float,
+) -> dict[str, float | str]:
+    top_padding = 4.0
+    inner_padding = 8.0
+    tooltip_gap = 18.0
+
+    safe_bottom = float(bounds_bottom) - max(float(volume_reserved_height), 0.0)
+    safe_bottom = min(safe_bottom, float(viewport_bottom) - top_padding)
+    if safe_bottom - float(bounds_top) < max(float(price_height), float(tooltip_height)) + inner_padding:
+        safe_bottom = min(float(bounds_bottom), float(viewport_bottom) - top_padding)
+
+    price_bottom_limit = max(float(bounds_top) + float(price_height), safe_bottom)
+    price_y = _clamp(
+        float(anchor_y) - (float(price_height) / 2.0),
+        float(viewport_top) + top_padding,
+        price_bottom_limit - float(price_height),
+    )
+
+    visible_mid_y = (float(bounds_top) + safe_bottom) / 2.0
+    prefer_above = float(anchor_y) >= visible_mid_y
+    above_y = float(anchor_y) - float(tooltip_height) - tooltip_gap
+    below_y = float(anchor_y) + tooltip_gap
+    min_tooltip_y = float(bounds_top) + inner_padding
+    max_tooltip_y = safe_bottom - float(tooltip_height) - inner_padding
+    can_fit_above = above_y >= min_tooltip_y
+    can_fit_below = below_y <= max_tooltip_y
+
+    if prefer_above and can_fit_above:
+        tooltip_y = above_y
+        tooltip_side = "above"
+    elif (not prefer_above) and can_fit_below:
+        tooltip_y = below_y
+        tooltip_side = "below"
+    elif can_fit_above:
+        tooltip_y = above_y
+        tooltip_side = "above"
+    elif can_fit_below:
+        tooltip_y = below_y
+        tooltip_side = "below"
+    else:
+        tooltip_side = "above" if prefer_above else "below"
+        if max_tooltip_y < min_tooltip_y:
+            tooltip_y = min_tooltip_y
+        else:
+            fallback_y = above_y if tooltip_side == "above" else below_y
+            tooltip_y = _clamp(fallback_y, min_tooltip_y, max_tooltip_y)
+
+    return {
+        "price_y": price_y,
+        "tooltip_y": tooltip_y,
+        "tooltip_side": tooltip_side,
+        "safe_bottom": safe_bottom,
+    }
+
+
+def _compute_axis_y_padding(min_price: float, max_price: float) -> tuple[float, float]:
+    price_span = max(float(max_price) - float(min_price), 0.0)
+    baseline = max(price_span, abs(float(max_price)) * 0.002, 1.0)
+    top_padding = max(price_span * 0.08, abs(float(max_price)) * 0.002, 1.0)
+    reserved_ratio = min(0.42, max(_VOLUME_OVERLAY_HEIGHT_RATIO + 0.03, 0.12))
+    visible_ratio = max(0.18, 1.0 - reserved_ratio)
+    bottom_padding = max((price_span + top_padding) * (reserved_ratio / visible_ratio), baseline * 0.12)
+    return top_padding, bottom_padding
+
+
 def _full_native_x_range(total_bars: int) -> tuple[float, float]:
     if total_bars <= 1:
         return 0.0, 1.0
@@ -1838,14 +1912,48 @@ if QChartView is not None:
 
             volume_band_height = max(42.0, float(plot_area.height()) * _VOLUME_OVERLAY_HEIGHT_RATIO)
             volume_text_y = float(plot_area.bottom()) - volume_band_height + 16.0
+            text_metrics = painter.fontMetrics()
+            min_volume_text_gap = float(text_metrics.height()) + 6.0
+            if self._candles and self._axis_y is not None:
+                left_index, right_index = self._visible_index_range()
+                visible = self._candles[left_index : right_index + 1] if right_index >= left_index else []
+                if not visible:
+                    visible = list(self._candles)
+                try:
+                    min_visible = min(float(item["low"]) for item in visible)
+                    min_label_y = self._y_for_value(min_visible, plot_area)
+                    collision_floor = min_label_y - min_volume_text_gap
+                    volume_text_y = _clamp(volume_text_y, 0.0, collision_floor)
+                except Exception:
+                    pass
+            volume_band_top = float(plot_area.bottom()) - volume_band_height
+            min_text_y = volume_band_top + 4.0
+            max_text_y = float(plot_area.bottom()) - 4.0
+            volume_text_y = _clamp(volume_text_y, min_text_y, max_text_y)
+            volume_segments = [
+                ("Volume ", QColor(_CHART_AXIS_TEXT_COLOR)),
+                (_format_compact_number(float(candle.get("volume", 0.0) or 0.0)), delta_color),
+            ]
+            volume_text_width = sum(float(text_metrics.horizontalAdvance(text)) for text, _ in volume_segments)
+            volume_text_height = float(text_metrics.height())
+            text_padding = 5.0
+            volume_label_rect = QRectF(
+                base_x - 2.0,
+                volume_text_y - volume_text_height - 1.0,
+                volume_text_width + 4.0,
+                volume_text_height + 2.0,
+            ).adjusted(-text_padding, 0.0, text_padding, 1.0)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor(_CHART_AXIS_TEXT_COLOR), 1))
+            painter.setBrush(QColor(11, 15, 20, 190))
+            painter.drawRoundedRect(volume_label_rect, 4.0, 4.0)
+            painter.restore()
             self._draw_colored_segments(
                 painter,
                 base_x,
                 volume_text_y,
-                [
-                    ("Volume ", QColor(_CHART_AXIS_TEXT_COLOR)),
-                    (_format_compact_number(float(candle.get("volume", 0.0) or 0.0)), delta_color),
-                ],
+                volume_segments,
             )
 
         def _draw_colored_segments(
@@ -1969,11 +2077,8 @@ if QChartView is not None:
                 highs.extend(float(value) for value in visible_values)
             min_price = min(lows) if lows else self._full_y_min
             max_price = max(highs) if highs else self._full_y_max
-            if min_price == max_price:
-                padding = max(abs(min_price) * 0.02, 1.0)
-            else:
-                padding = max((max_price - min_price) * 0.08, abs(max_price) * 0.002, 1.0)
-            axis_y.setRange(min_price - padding, max_price + padding)
+            top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price)
+            axis_y.setRange(min_price - bottom_padding, max_price + top_padding)
 
         def _visible_index_range(self) -> tuple[int, int]:
             if not self._candles:
@@ -2410,17 +2515,22 @@ if QChartView is not None:
             self._price_badge.setText(price_text)
             self._price_badge.adjustSize()
             price_size = self._price_badge.sizeHint()
+            volume_reserved_height = max(42.0, float(bounds.height()) * _VOLUME_OVERLAY_HEIGHT_RATIO)
+            overlay_layout = _compute_hover_overlay_layout(
+                viewport_top=float(viewport.top()),
+                viewport_bottom=float(viewport.bottom()),
+                bounds_top=float(mapped_bounds.top()),
+                bounds_bottom=float(mapped_bounds.bottom()),
+                anchor_y=float(mapped_anchor.y()),
+                price_height=float(price_size.height()),
+                tooltip_height=0.0,
+                volume_reserved_height=volume_reserved_height,
+            )
             price_x = min(
                 float(viewport.right()) - float(price_size.width()) - 4.0,
                 float(mapped_bounds.right()) + 8.0,
             )
-            price_y = max(
-                float(viewport.top()) + 4.0,
-                min(
-                    float(mapped_anchor.y()) - (float(price_size.height()) / 2.0),
-                    float(viewport.bottom()) - float(price_size.height()) - 4.0,
-                ),
-            )
+            price_y = float(overlay_layout["price_y"])
             self._price_badge.move(int(round(price_x)), int(round(price_y)))
             self._price_badge.raise_()
             self._price_badge.show()
@@ -2455,25 +2565,27 @@ if QChartView is not None:
             self._tooltip_badge.setText("\n".join(tooltip_lines))
             self._tooltip_badge.adjustSize()
             tooltip_size = self._tooltip_badge.sizeHint()
+            overlay_layout = _compute_hover_overlay_layout(
+                viewport_top=float(viewport.top()),
+                viewport_bottom=float(viewport.bottom()),
+                bounds_top=float(mapped_bounds.top()),
+                bounds_bottom=float(mapped_bounds.bottom()),
+                anchor_y=float(mapped_anchor.y()),
+                price_height=float(price_size.height()),
+                tooltip_height=float(tooltip_size.height()),
+                volume_reserved_height=volume_reserved_height,
+            )
             place_right = float(mapped_anchor.x()) <= float(mapped_bounds.center().x())
-            place_above = float(mapped_anchor.y()) > float(mapped_bounds.center().y())
+            place_above = str(overlay_layout["tooltip_side"]) == "above"
             tooltip_x = (
                 float(mapped_anchor.x()) + 18.0
                 if place_right
                 else float(mapped_anchor.x()) - float(tooltip_size.width()) - 18.0
             )
-            tooltip_y = (
-                float(mapped_anchor.y()) - float(tooltip_size.height()) - 18.0
-                if place_above
-                else float(mapped_anchor.y()) + 18.0
-            )
+            tooltip_y = float(overlay_layout["tooltip_y"])
             tooltip_x = max(
                 float(mapped_bounds.left()) + 8.0,
                 min(tooltip_x, float(mapped_bounds.right()) - float(tooltip_size.width()) - 8.0),
-            )
-            tooltip_y = max(
-                float(mapped_bounds.top()) + 8.0,
-                min(tooltip_y, float(mapped_bounds.bottom()) - float(tooltip_size.height()) - 8.0),
             )
             self._tooltip_badge.move(int(round(tooltip_x)), int(round(tooltip_y)))
             self._tooltip_badge.raise_()
@@ -2981,6 +3093,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._chart_view_range_mode = "recent"
         self._secondary_layout_cycle_btn: QPushButton | None = None
         self._secondary_chart_kind_btn: QPushButton | None = None
+        self._secondary_sync_period_btn: QPushButton | None = None
         self._secondary_layout_mode_value = "vertical"
         self._secondary_chart_kind_mode = "kline"
         self._initial_load_requested = False
@@ -3011,6 +3124,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._refresh_chart_view_range_button()
         self._refresh_secondary_layout_button()
         self._refresh_secondary_chart_kind_button()
+        self._refresh_secondary_sync_period_button()
         self._reload_workspace_view()
         self._build_refresh_timer()
         self._deferred_chart_render_timer = QTimer(self)
@@ -3179,6 +3293,12 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_chart_kind_btn.setEnabled(False)
         self._secondary_chart_kind_btn.clicked.connect(self._on_secondary_chart_kind_cycle_clicked)
         action_row.addWidget(self._secondary_chart_kind_btn)
+
+        self._secondary_sync_period_btn = QPushButton("")
+        self._secondary_sync_period_btn.setEnabled(False)
+        self._secondary_sync_period_btn.setToolTip("副图为K线时：主图1D、副图4H并切换到最近视图")
+        self._secondary_sync_period_btn.clicked.connect(self._on_secondary_sync_period_clicked)
+        action_row.addWidget(self._secondary_sync_period_btn)
 
         action_row.addSpacing(12)
         action_row.addWidget(QLabel("数量"))
@@ -3408,6 +3528,18 @@ class KlineAnalysisWindow(QMainWindow):
             _next_secondary_chart_kind_button_text(self._secondary_chart_kind())
         )
 
+    def _refresh_secondary_sync_period_button(self) -> None:
+        if self._secondary_sync_period_btn is None:
+            return
+        if self._secondary_chart_kind() == "volatility":
+            self._secondary_sync_period_btn.setText("同周期")
+            self._secondary_sync_period_btn.setToolTip(
+                "副图为波动率时：主图和副图同步切换周期（1H/4H/1D）"
+            )
+            return
+        self._secondary_sync_period_btn.setText("1D+4H")
+        self._secondary_sync_period_btn.setToolTip("副图为K线时：主图设为1D、副图设为4H，并切换到最近视图")
+
     def _secondary_display_symbol(self) -> str:
         if self._secondary_chart_kind() == "volatility":
             return "BTC DVOL"
@@ -3469,10 +3601,13 @@ class KlineAnalysisWindow(QMainWindow):
             self._secondary_layout_cycle_btn.setEnabled(enabled)
         if self._secondary_chart_kind_btn is not None:
             self._secondary_chart_kind_btn.setEnabled(enabled)
+        if self._secondary_sync_period_btn is not None:
+            self._secondary_sync_period_btn.setEnabled(enabled)
         self._secondary_average_kline_check.setEnabled(True)
         self._secondary_average_kline_check.setVisible(True)
         self._refresh_secondary_layout_button()
         self._refresh_secondary_chart_kind_button()
+        self._refresh_secondary_sync_period_button()
 
     def _refresh_chart_mode_cycle_button(self) -> None:
         if self._chart_mode_cycle_btn is None:
@@ -3509,6 +3644,35 @@ class KlineAnalysisWindow(QMainWindow):
                 self._secondary_period_combo.blockSignals(False)
         if self._secondary_chart_check.isChecked():
             self._load_data()
+
+    @Slot()
+    def _on_secondary_sync_period_clicked(self) -> None:
+        if not self._secondary_chart_check.isChecked():
+            return
+        if self._secondary_chart_kind() == "volatility":
+            sequence = ("1H", "4H", "1D")
+            current = self._period_combo.currentText().strip().upper()
+            if current not in sequence:
+                current = self._secondary_period_combo.currentText().strip().upper()
+                if current not in sequence:
+                    current = sequence[0]
+            primary_next = sequence[(sequence.index(current) + 1) % len(sequence)]
+            secondary_next = primary_next
+        else:
+            primary_next = "1D"
+            secondary_next = "4H"
+
+        self._period_combo.blockSignals(True)
+        self._secondary_period_combo.blockSignals(True)
+        self._period_combo.setCurrentText(primary_next)
+        self._secondary_period_combo.setCurrentText(secondary_next)
+        self._period_combo.blockSignals(False)
+        self._secondary_period_combo.blockSignals(False)
+        self._sync_primary_period_buttons()
+        self._set_chart_view_range_mode("recent")
+        self._apply_chart_view_range()
+        self._refresh_timer.setInterval(self._auto_refresh_interval_ms(primary_next))
+        self._load_data()
 
     def _apply_secondary_chart_layout(self) -> None:
         splitter = self._chart_stack_splitter
@@ -4490,9 +4654,8 @@ class KlineAnalysisWindow(QMainWindow):
         axis_x.setGridLineVisible(False)
 
         axis_y = QValueAxis()
-        price_span = max_price - min_price
-        padding = max(price_span * 0.08, max_price * 0.002 if max_price else 1.0, 1.0)
-        axis_y.setRange(min_price - padding, max_price + padding)
+        top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price)
+        axis_y.setRange(min_price - bottom_padding, max_price + top_padding)
         axis_y.setLabelFormat("%.2f")
         axis_y.setTickCount(8)
         axis_y.setLabelsColor(QColor(_CHART_AXIS_TEXT_COLOR))
