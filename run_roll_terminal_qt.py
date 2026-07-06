@@ -140,16 +140,17 @@ def _ensure_qt_dependency() -> bool:
         __import__("PySide6")
         return True
     except Exception as exc:  # noqa: BLE001
+        print(f"[QQOKX] 当前启动解释器：{sys.executable}", file=sys.stderr)
         print(
             "[QQOKX] 未检测到 Qt 运行时依赖 PySide6。请先安装后再启动：",
             file=sys.stderr,
         )
         print(
-            "[QQOKX] 安装命令：python -m pip install -r roll_terminal_qt_requirements.txt",
+            f"[QQOKX] 安装命令：{sys.executable} -m pip install -r roll_terminal_qt_requirements.txt",
             file=sys.stderr,
         )
         print(
-            "[QQOKX] 若使用 py 启动，请执行：py -3 -m pip install -r roll_terminal_qt_requirements.txt",
+            "[QQOKX] 当前目录要求：在与程序同一目录执行上述命令，或先切到同目录再执行。",
             file=sys.stderr,
         )
         print(f"[QQOKX] 原始错误：{type(exc).__name__}: {exc}", file=sys.stderr)
