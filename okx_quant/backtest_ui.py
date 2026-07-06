@@ -68,6 +68,7 @@ from okx_quant.strategy_profiles import StrategyProfile, read_strategy_bundle
 from okx_quant.strategy_catalog import (
     ALL_STRATEGY_DEFINITIONS,
     BACKTEST_STRATEGY_DEFINITIONS,
+    STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
@@ -884,6 +885,7 @@ def _btc_ema55_slope_reentry_summary(config: StrategyConfig) -> str:
 
 def _backtest_exit_mode_label(config: StrategyConfig) -> str:
     if config.strategy_id in {
+        STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
         STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
         STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     }:
@@ -5381,6 +5383,7 @@ class BacktestWindow:
         if dynamic_tp_strategy:
             take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
             if strategy_id in {
+                STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
                 STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
                 STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
             }:
@@ -5571,6 +5574,9 @@ class BacktestWindow:
     def _apply_selected_strategy_definition(self) -> None:
         definition = self._selected_strategy_definition()
         strategy_id = definition.strategy_id
+        if strategy_id == STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID:
+            if self.symbol.get().strip().upper() != "BTC-USDT-SWAP":
+                self.symbol.set("BTC-USDT-SWAP")
         has_saved_draft = strategy_id in self._strategy_parameter_scope_drafts()
         previous_strategy_id = self._last_strategy_parameter_strategy_id
         if previous_strategy_id and previous_strategy_id != strategy_id:
@@ -5710,6 +5716,7 @@ class BacktestWindow:
                 self.btc_pullback_max_index_entry,
             )
             show_btc_pullback_widgets = strategy_id in {
+                STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
                 STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
                 STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
             }
@@ -6107,6 +6114,7 @@ class BacktestWindow:
             return
         definition = self._selected_strategy_definition()
         show_controls = definition.strategy_id in {
+            STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
             STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
             STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
         }

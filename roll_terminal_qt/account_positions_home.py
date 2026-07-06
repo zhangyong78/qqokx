@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 import json
 import re
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from roll_terminal_qt.app_icon import apply_qt_window_icon
+from okx_quant.log_utils import append_log_line
 from okx_quant.models import Candle, Credentials, Instrument, StrategyConfig
 from okx_quant.option_roll import is_short_option_position
 from okx_quant.option_roll_ui import OptionRollSuggestionWindow
@@ -152,6 +154,17 @@ from roll_terminal_qt.option_strategy_window import CandlestickChartView
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots, profile_requires_password
 from roll_terminal_qt.runtime import load_runtime, profile_names
+
+
+def _debug_log(message: str) -> None:
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return
+    try:
+        stream.write(f"{message}\n")
+        stream.flush()
+    except Exception:
+        return
 
 
 POSITION_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -1427,6 +1440,14 @@ class AccountPositionsHomeWidget(QWidget):
         self._profile_switch_guard = False
         self._profile_change_serial = 0
         self._profile_change_ready = False
+        self._private_thread_generation = 0
+        self._profile_switch_in_progress = False
+        self._profile_switch_requested_target = ""
+        self._profile_switch_requested_runtime = None
+        self._profile_switch_requested_serial = 0
+        self._profile_switch_deadline_monotonic = 0.0
+        self._profile_switch_force_terminate_sent = False
+        self._profile_switch_poll_timer: QTimer | None = None
         self._profile_unlock_dialog: QDialog | None = None
         self._account_feed: AccountFeedThread | None = None
         self._order_feed: OrderFeedThread | None = None
@@ -1434,6 +1455,11 @@ class AccountPositionsHomeWidget(QWidget):
         self._fill_history_feed: FillHistoryFeedThread | None = None
         self._position_history_feed: PositionHistoryFeedThread | None = None
         self._retired_threads: list[QThread] = []
+        self._shutdown_in_progress = False
+        self._shutdown_finish_callbacks: list[Callable[[], None]] = []
+        self._shutdown_deadline_monotonic = 0.0
+        self._shutdown_force_terminate_sent = False
+        self._shutdown_poll_timer: QTimer | None = None
 
         self._raw_positions: list[OkxPosition] = []
         self._visible_positions: list[OkxPosition] = []
@@ -1540,35 +1566,163 @@ class AccountPositionsHomeWidget(QWidget):
             except Exception:
                 pass
 
-    def _stop_position_history_thread(self) -> None:
+    def _set_profile_switch_in_progress(self, in_progress: bool) -> None:
+        self._profile_switch_in_progress = in_progress
+        if hasattr(self, "_profile_combo"):
+            try:
+                self._profile_combo.setEnabled(not in_progress)
+            except Exception:
+                pass
+
+    def _clear_profile_switch_request(self) -> None:
+        timer = self._profile_switch_poll_timer
+        if timer is not None and timer.isActive():
+            timer.stop()
+        self._profile_switch_requested_target = ""
+        self._profile_switch_requested_runtime = None
+        self._profile_switch_requested_serial = 0
+        self._profile_switch_deadline_monotonic = 0.0
+        self._profile_switch_force_terminate_sent = False
+        self._set_profile_switch_in_progress(False)
+
+    def _ensure_profile_switch_poll_timer(self) -> QTimer:
+        timer = self._profile_switch_poll_timer
+        if timer is not None:
+            return timer
+        timer = QTimer(self)
+        timer.setInterval(100)
+        timer.timeout.connect(self._poll_profile_switch_completion)
+        self._profile_switch_poll_timer = timer
+        return timer
+
+    def _begin_profile_switch_restart(self, target: str, runtime: object, serial: int) -> None:
+        if serial != self._profile_change_serial:
+            self._clear_profile_switch_request()
+            return
+        self._profile_switch_requested_target = target
+        self._profile_switch_requested_runtime = runtime
+        self._profile_switch_requested_serial = serial
+        self._profile_switch_deadline_monotonic = time.monotonic() + 3.0
+        self._profile_switch_force_terminate_sent = False
+        self._stop_private_threads(wait_ms=0)
+        self._stop_order_history_thread(wait_ms=0)
+        self._stop_fill_history_thread(wait_ms=0)
+        self._stop_position_history_thread(wait_ms=0)
+        self._poll_profile_switch_completion()
+
+    def _poll_profile_switch_completion(self) -> None:
+        running_threads: list[QThread] = []
+        for thread in list(self._retired_threads):
+            try:
+                if thread.isRunning():
+                    running_threads.append(thread)
+                    continue
+            except Exception:
+                pass
+            try:
+                if thread in self._retired_threads:
+                    self._retired_threads.remove(thread)
+            except Exception:
+                pass
+            try:
+                thread.deleteLater()
+            except Exception:
+                pass
+        if running_threads:
+            deadline = self._profile_switch_deadline_monotonic
+            if (not self._profile_switch_force_terminate_sent) and deadline and time.monotonic() >= deadline:
+                self._profile_switch_force_terminate_sent = True
+                for thread in running_threads:
+                    try:
+                        thread.terminate()
+                    except Exception:
+                        pass
+            timer = self._ensure_profile_switch_poll_timer()
+            if not timer.isActive():
+                timer.start()
+            return
+        timer = self._profile_switch_poll_timer
+        if timer is not None and timer.isActive():
+            timer.stop()
+        if self._profile_switch_requested_serial != self._profile_change_serial:
+            self._clear_profile_switch_request()
+            current = self._current_profile_name()
+            if current and current != self._last_profile_name:
+                QTimer.singleShot(
+                    0,
+                    lambda current=current, serial=self._profile_change_serial: self._dispatch_profile_change(current, serial),
+                )
+            return
+        target = self._profile_switch_requested_target
+        runtime = self._profile_switch_requested_runtime
+        if not target or runtime is None:
+            self._clear_profile_switch_request()
+            return
+        self._runtime = runtime
+        self._last_profile_name = target
+        self._unlocked_profiles.add(target)
+        self._start_private_threads()
+        self._clear_profile_switch_request()
+
+    def _stop_position_history_thread(self, *, wait_ms: int = 1600) -> None:
         thread = self._position_history_feed
         if thread is None:
             return
+        try:
+            thread.disconnect()
+        except Exception:
+            pass
         thread.stop()
         self._position_history_feed = None
-        if thread.isRunning() and not thread.wait(1600):
+        if wait_ms <= 0:
+            if thread.isRunning():
+                self._retire_thread(thread)
+                return
+            thread.deleteLater()
+            return
+        if thread.isRunning() and not thread.wait(wait_ms):
             self._retire_thread(thread)
             return
         thread.deleteLater()
 
-    def _stop_order_history_thread(self) -> None:
+    def _stop_order_history_thread(self, *, wait_ms: int = 1600) -> None:
         thread = self._order_history_feed
         if thread is None:
             return
+        try:
+            thread.disconnect()
+        except Exception:
+            pass
         thread.stop()
         self._order_history_feed = None
-        if thread.isRunning() and not thread.wait(1600):
+        if wait_ms <= 0:
+            if thread.isRunning():
+                self._retire_thread(thread)
+                return
+            thread.deleteLater()
+            return
+        if thread.isRunning() and not thread.wait(wait_ms):
             self._retire_thread(thread)
             return
         thread.deleteLater()
 
-    def _stop_fill_history_thread(self) -> None:
+    def _stop_fill_history_thread(self, *, wait_ms: int = 1600) -> None:
         thread = self._fill_history_feed
         if thread is None:
             return
+        try:
+            thread.disconnect()
+        except Exception:
+            pass
         thread.stop()
         self._fill_history_feed = None
-        if thread.isRunning() and not thread.wait(1600):
+        if wait_ms <= 0:
+            if thread.isRunning():
+                self._retire_thread(thread)
+                return
+            thread.deleteLater()
+            return
+        if thread.isRunning() and not thread.wait(wait_ms):
             self._retire_thread(thread)
             return
         thread.deleteLater()
@@ -1580,9 +1734,18 @@ class AccountPositionsHomeWidget(QWidget):
             self._stop_order_history_thread()
         elif self._order_history_feed is not None and self._order_history_feed.isRunning():
             return
+        generation = self._private_thread_generation
         self._order_history_feed = OrderHistoryFeedThread(self._runtime, limit=200)
-        self._order_history_feed.data_ready.connect(self._apply_order_history_payload)
-        self._order_history_feed.status_changed.connect(self._set_order_history_status)
+        self._order_history_feed.data_ready.connect(
+            lambda payload, generation=generation: self._apply_order_history_payload(payload)
+            if generation == self._private_thread_generation
+            else None
+        )
+        self._order_history_feed.status_changed.connect(
+            lambda text, generation=generation: self._set_order_history_status(text)
+            if generation == self._private_thread_generation
+            else None
+        )
         self._order_history_feed.finished.connect(self._clear_order_history_thread)
         if hasattr(self, "_order_history_summary_label"):
             self._order_history_summary_label.setText("正在同步历史委托...")
@@ -1595,9 +1758,18 @@ class AccountPositionsHomeWidget(QWidget):
             self._stop_fill_history_thread()
         elif self._fill_history_feed is not None and self._fill_history_feed.isRunning():
             return
+        generation = self._private_thread_generation
         self._fill_history_feed = FillHistoryFeedThread(self._runtime, limit=self._fill_history_fetch_limit)
-        self._fill_history_feed.data_ready.connect(self._apply_fill_history_payload)
-        self._fill_history_feed.status_changed.connect(self._set_fill_history_status)
+        self._fill_history_feed.data_ready.connect(
+            lambda payload, generation=generation: self._apply_fill_history_payload(payload)
+            if generation == self._private_thread_generation
+            else None
+        )
+        self._fill_history_feed.status_changed.connect(
+            lambda text, generation=generation: self._set_fill_history_status(text)
+            if generation == self._private_thread_generation
+            else None
+        )
         self._fill_history_feed.finished.connect(self._clear_fill_history_thread)
         if hasattr(self, "_fill_history_summary_label"):
             self._fill_history_summary_label.setText("正在同步历史成交...")
@@ -1610,9 +1782,18 @@ class AccountPositionsHomeWidget(QWidget):
             self._stop_position_history_thread()
         elif self._position_history_feed is not None and self._position_history_feed.isRunning():
             return
+        generation = self._private_thread_generation
         self._position_history_feed = PositionHistoryFeedThread(self._runtime, limit=self._position_history_fetch_limit)
-        self._position_history_feed.data_ready.connect(self._apply_position_history_payload)
-        self._position_history_feed.status_changed.connect(self._set_position_history_status)
+        self._position_history_feed.data_ready.connect(
+            lambda payload, generation=generation: self._apply_position_history_payload(payload)
+            if generation == self._private_thread_generation
+            else None
+        )
+        self._position_history_feed.status_changed.connect(
+            lambda text, generation=generation: self._set_position_history_status(text)
+            if generation == self._private_thread_generation
+            else None
+        )
         self._position_history_feed.finished.connect(self._clear_position_history_thread)
         self._position_history_summary_label.setText("正在同步历史仓位...")
         self._position_history_feed.start()
@@ -1702,6 +1883,76 @@ class AccountPositionsHomeWidget(QWidget):
             self._protection_dialog.close()
         self._legacy_option_tools.shutdown()
         self._flush_retired_threads()
+
+    def begin_shutdown(self, finished: Callable[[], None] | None = None) -> None:
+        if finished is not None:
+            self._shutdown_finish_callbacks.append(finished)
+        if self._shutdown_in_progress:
+            return
+        self._shutdown_in_progress = True
+        self._shutdown_deadline_monotonic = time.monotonic() + 3.0
+        self._shutdown_force_terminate_sent = False
+        self._save_positions_view_prefs_now()
+        self._stop_private_threads(wait_ms=0)
+        self._stop_order_history_thread(wait_ms=0)
+        self._stop_fill_history_thread(wait_ms=0)
+        self._stop_position_history_thread(wait_ms=0)
+        self._protection_manager.stop_all()
+        if self._protection_dialog is not None:
+            self._protection_dialog.close()
+        self._legacy_option_tools.shutdown()
+        if self._shutdown_poll_timer is None:
+            self._shutdown_poll_timer = QTimer(self)
+            self._shutdown_poll_timer.setInterval(100)
+            self._shutdown_poll_timer.timeout.connect(self._poll_shutdown_completion)
+        self._poll_shutdown_completion()
+
+    def _poll_shutdown_completion(self) -> None:
+        pending = list(self._retired_threads)
+        running_threads: list[QThread] = []
+        for thread in pending:
+            try:
+                if thread.isRunning():
+                    running_threads.append(thread)
+                    continue
+            except Exception:
+                pass
+            try:
+                if thread in self._retired_threads:
+                    self._retired_threads.remove(thread)
+            except Exception:
+                pass
+            try:
+                thread.deleteLater()
+            except Exception:
+                pass
+        if not running_threads:
+            if self._shutdown_poll_timer is not None:
+                self._shutdown_poll_timer.stop()
+            self._finish_shutdown_callbacks()
+            return
+        if (not self._shutdown_force_terminate_sent) and time.monotonic() >= self._shutdown_deadline_monotonic:
+            self._shutdown_force_terminate_sent = True
+            self._shutdown_deadline_monotonic = time.monotonic() + 1.0
+            for thread in running_threads:
+                try:
+                    thread.terminate()
+                except Exception:
+                    pass
+        if self._shutdown_poll_timer is not None and not self._shutdown_poll_timer.isActive():
+            self._shutdown_poll_timer.start()
+
+    def _finish_shutdown_callbacks(self) -> None:
+        callbacks = list(self._shutdown_finish_callbacks)
+        self._shutdown_finish_callbacks.clear()
+        self._shutdown_in_progress = False
+        self._shutdown_force_terminate_sent = False
+        self._shutdown_deadline_monotonic = 0.0
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
 
     def refresh_view(self) -> None:
         if not self._ensure_runtime_ready(force_unlock=True):
@@ -2224,12 +2475,23 @@ class AccountPositionsHomeWidget(QWidget):
         text = self._profile_combo.currentText().strip()
         return "" if text == "未配置" else text
 
-    def _stop_private_threads(self) -> None:
+    def _stop_private_threads(self, *, wait_ms: int = 1600) -> None:
+        self._private_thread_generation += 1
         for thread in (self._account_feed, self._order_feed):
             if thread is None:
                 continue
+            try:
+                thread.disconnect()
+            except Exception:
+                pass
             thread.stop()
-            if thread.isRunning() and not thread.wait(1600):
+            if wait_ms <= 0:
+                if thread.isRunning():
+                    self._retire_thread(thread)
+                    continue
+                thread.deleteLater()
+                continue
+            if thread.isRunning() and not thread.wait(wait_ms):
                 self._retire_thread(thread)
                 continue
             thread.deleteLater()
@@ -2632,10 +2894,21 @@ class AccountPositionsHomeWidget(QWidget):
             self._current_order_canceling = False
             QMessageBox.critical(self, "操作失败", str(exc))
 
+    def _log_selected_position_manual_flatten(self, message: str) -> None:
+        profile_name = (self._last_profile_name or self._current_profile_name() or "-").strip() or "-"
+        environment = (self._note_environment() or "-").strip() or "-"
+        line = f"[manual_flatten] [{profile_name}/{environment}] {message}"
+        try:
+            append_log_line(line)
+        except Exception:
+            pass
+        _debug_log(line)
+
     def _finish_selected_position_manual_flatten_error(self, exc: Exception) -> None:
         self._selected_position_manual_flatten_running = False
         self._status_badge.setText("失败")
         self._summary_label.setText(f"平仓失败：{exc}")
+        self._log_selected_position_manual_flatten(f"失败 | {exc}")
         QMessageBox.critical(self, "平仓失败", str(exc))
 
     def _selected_position_manual_flatten_result_failed(self, result: OkxOrderResult) -> bool:
@@ -2699,6 +2972,11 @@ class AccountPositionsHomeWidget(QWidget):
         mode_label = self._position_manual_flatten_mode_label(normalized_flatten_mode)
         order_id = (result.ord_id or "-").strip() or "-"
         client_order_id = (result.cl_ord_id or "-").strip() or "-"
+        self._log_selected_position_manual_flatten(
+            f"提交成功 | instId={position.inst_id} | mode={normalized_flatten_mode} | side={close_side_label} | "
+            f"submit={submit_size_text} | orderSize={order_size_text or '-'} | ordId={order_id} | clOrdId={client_order_id} | "
+            f"sCode={result.s_code or '-'} | sMsg={result.s_msg or '-'}"
+        )
         message = (
             "已提交选中持仓平仓。\n\n"
             f"合约：{position.inst_id}\n"
@@ -2830,18 +3108,36 @@ class AccountPositionsHomeWidget(QWidget):
         if clicked not in {market_button, best_quote_button}:
             return
         flatten_mode = "market" if clicked is market_button else "best_quote"
+        self._log_selected_position_manual_flatten(
+            f"用户确认平仓 | instId={position.inst_id} | direction={direction_label} | closeSide={close_side_label} | "
+            f"mode={flatten_mode} | submit={submit_amount_text} | orderSize={order_size_text}"
+        )
 
         self._selected_position_manual_flatten_running = True
         self._status_badge.setText("平仓提交中...")
 
         def _worker() -> None:
             try:
+                self._log_selected_position_manual_flatten(
+                    f"线程开始 | instId={position.inst_id} | mode={flatten_mode} | closeSizeInput={requested_close_size} | "
+                    f"submit={submit_amount_text} | orderSize={order_size_text}"
+                )
                 result, price, normalized_mode = self._submit_selected_position_manual_flatten(
                     position,
                     flatten_mode,
                     close_size=requested_close_size,
                 )
+                self._log_selected_position_manual_flatten(
+                    f"交易所返回 | instId={position.inst_id} | mode={normalized_mode} | ordId={result.ord_id or '-'} | "
+                    f"clOrdId={result.cl_ord_id or '-'} | sCode={result.s_code or '-'} | sMsg={result.s_msg or '-'} | "
+                    f"price={format_decimal(price) if price is not None else '-'}"
+                )
             except Exception as exc:
+                import traceback
+
+                self._log_selected_position_manual_flatten(
+                    f"线程异常 | instId={position.inst_id} | mode={flatten_mode} | error={exc}\n{traceback.format_exc()}"
+                )
                 self._selected_position_manual_flatten_after(
                     0,
                     lambda exc=exc: self._finish_selected_position_manual_flatten_error(exc),
@@ -2853,6 +3149,9 @@ class AccountPositionsHomeWidget(QWidget):
                     result=result,
                     close_side_label=close_side_label,
                     submit_size_text=submit_amount_text,
+                )
+                self._log_selected_position_manual_flatten(
+                    f"交易所拒单 | instId={position.inst_id} | mode={normalized_mode} | detail={error_message}"
                 )
                 self._selected_position_manual_flatten_after(
                     0,
@@ -3677,24 +3976,38 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _show_not_ready_action(self) -> None:
         sender = self.sender()
+        text = "-"
         if isinstance(sender, QPushButton):
-            text = sender.text().strip()
-            if text == "撤单选中":
-                self._cancel_selected_current_order()
-                return
+            text = sender.text().strip() or "-"
+        route = "placeholder"
+        if text == "????":
+            route = "cancel_selected_current_order"
+        try:
+            append_log_line(f"[qt_positions] click_entry | action={text} | route={route}")
+        except Exception:
+            pass
+        if isinstance(sender, QPushButton) and text == "????":
+            self._cancel_selected_current_order()
+            return
         QMessageBox.information(self, "迁移", "这个入口已经预留到主页上，下一步会按旧页面逻辑继续接入。")
 
     def _apply_filters(self, *_args: object) -> None:
         self._render_positions_tree()
 
     def _on_profile_changed(self, *_args: object) -> None:
-        if self._profile_switch_guard or not self._profile_change_ready:
+        if (
+            self._profile_switch_guard
+            or not self._profile_change_ready
+            or getattr(self, "_profile_switch_in_progress", False)
+        ):
             return
         target = self._current_profile_name()
         if not target or target == self._last_profile_name:
             return
         self._profile_change_serial += 1
         serial = self._profile_change_serial
+        self._set_profile_switch_in_progress(True)
+        _debug_log(f"[profile_switch] request | target={target} | serial={serial}")
         QTimer.singleShot(0, lambda target=target, serial=serial: self._dispatch_profile_change(target, serial))
 
     def _dispatch_profile_change(self, target: str, serial: int) -> None:
@@ -3707,11 +4020,14 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _apply_profile_change(self, target: str, serial: int) -> None:
         if serial != self._profile_change_serial:
+            self._clear_profile_switch_request()
             return
         if self._profile_switch_guard:
+            self._clear_profile_switch_request()
             return
         current = self._current_profile_name()
         if not target or current != target or target == self._last_profile_name:
+            self._clear_profile_switch_request()
             return
         if profile_requires_password(target, self._profile_snapshots) and target not in self._unlocked_profiles:
             self._prompt_profile_unlock(target, serial)
@@ -3720,10 +4036,10 @@ class AccountPositionsHomeWidget(QWidget):
         if runtime is None:
             QMessageBox.warning(self, "切换失败", f"API 配置 {target} 不可用，请检查凭证。")
             self._restore_previous_profile_selection()
+            self._clear_profile_switch_request()
             return
-        self._runtime = runtime
-        self._last_profile_name = target
-        self._start_private_threads(force_restart=True)
+        _debug_log(f"[profile_switch] apply | target={target} | serial={serial}")
+        self._begin_profile_switch_restart(target, runtime, serial)
 
     def _prompt_profile_unlock(self, target: str, serial: int) -> None:
         if serial != self._profile_change_serial:
@@ -3766,11 +4082,14 @@ class AccountPositionsHomeWidget(QWidget):
             password = password_edit.text()
             dialog.deleteLater()
             if serial != self._profile_change_serial:
+                self._clear_profile_switch_request()
                 return
             if self._current_profile_name() != target:
+                self._clear_profile_switch_request()
                 return
             if result_code != int(QDialog.DialogCode.Accepted):
                 self._restore_previous_profile_selection()
+                self._clear_profile_switch_request()
                 return
             if verify_profile_switch_password(self._profile_snapshots.get(target, {}), password):
                 self._unlocked_profiles.add(target)
@@ -3778,6 +4097,7 @@ class AccountPositionsHomeWidget(QWidget):
                 return
             QMessageBox.warning(self, "密码错误", f"API 配置 {target} 的切换密码不正确。")
             self._restore_previous_profile_selection()
+            self._clear_profile_switch_request()
 
         dialog.finished.connect(_finish)
         self._profile_unlock_dialog = dialog
@@ -4240,13 +4560,37 @@ class AccountPositionsHomeWidget(QWidget):
             self._stop_private_threads()
         elif self._account_feed is not None and self._account_feed.isRunning():
             return
+        self._private_thread_generation += 1
+        generation = self._private_thread_generation
+        profile_name = self._last_profile_name or "-"
+        _debug_log(f"[profile_switch] start_private_threads | profile={profile_name} | generation={generation}")
         self._account_feed = AccountFeedThread(self._runtime)
         self._order_feed = OrderFeedThread(self._runtime)
-        self._account_feed.positions_ready.connect(self._apply_positions_summary)
-        self._account_feed.payload_ready.connect(self._apply_positions_payload)
-        self._account_feed.status_changed.connect(self._set_account_status)
-        self._order_feed.orders_ready.connect(self._apply_orders)
-        self._order_feed.status_changed.connect(self._set_order_status)
+        self._account_feed.positions_ready.connect(
+            lambda payload, generation=generation: self._apply_positions_summary(payload)
+            if generation == self._private_thread_generation
+            else None
+        )
+        self._account_feed.payload_ready.connect(
+            lambda payload, generation=generation: self._apply_positions_payload(payload)
+            if generation == self._private_thread_generation
+            else None
+        )
+        self._account_feed.status_changed.connect(
+            lambda text, generation=generation: self._set_account_status(text)
+            if generation == self._private_thread_generation
+            else None
+        )
+        self._order_feed.orders_ready.connect(
+            lambda orders, generation=generation: self._apply_orders(orders)
+            if generation == self._private_thread_generation
+            else None
+        )
+        self._order_feed.status_changed.connect(
+            lambda text, generation=generation: self._set_order_status(text)
+            if generation == self._private_thread_generation
+            else None
+        )
         self._account_feed.start()
         self._order_feed.start()
         self._start_order_history_refresh(force_restart=force_restart)

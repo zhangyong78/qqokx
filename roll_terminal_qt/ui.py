@@ -191,6 +191,7 @@ class RollTerminalWindow(QMainWindow):
         self._unlocked_profiles: set[str] = set()
         self._last_profile_name = self._runtime.credential_profile_name if self._runtime is not None else ""
         self._private_threads_started = False
+        self._runtime_thread_generation = 0
         self._auto_enabled = False
         self._auto_triggered = False
         self._auto_threshold_value: Decimal | None = None
@@ -207,13 +208,7 @@ class RollTerminalWindow(QMainWindow):
         self._selected_opportunity: ArbitrageOpportunityView | None = None
         self._refresh_profile_snapshots()
         startup_locked = bool(self._last_profile_name and self._profile_requires_password(self._last_profile_name))
-        self._feed.snapshot_ready.connect(self._apply_snapshot)
-        self._feed.status_changed.connect(self._set_status)
-        self._account_feed.positions_ready.connect(self._apply_positions)
-        self._account_feed.spot_balances_ready.connect(self._apply_spot_balances)
-        self._account_feed.status_changed.connect(self._set_account_status)
-        self._order_feed.orders_ready.connect(self._apply_order_updates)
-        self._order_feed.status_changed.connect(self._set_order_status)
+        self._connect_runtime_thread_signals(self._runtime_thread_generation)
         self._build_ui()
         self._load_execution_history()
         self._feed.start()
@@ -243,7 +238,12 @@ class RollTerminalWindow(QMainWindow):
         super().closeEvent(event)
 
     def _stop_runtime_threads(self) -> None:
+        self._runtime_thread_generation = getattr(self, "_runtime_thread_generation", 0) + 1
         for thread in (self._feed, self._account_feed, self._order_feed):
+            try:
+                thread.disconnect()
+            except Exception:
+                pass
             if not thread.isRunning():
                 continue
             thread.stop()
@@ -251,6 +251,62 @@ class RollTerminalWindow(QMainWindow):
                 thread.terminate()
                 thread.wait(1500)
         self._private_threads_started = False
+
+    def _run_runtime_thread_callback(self, generation: int, callback, *args: object) -> None:
+        if generation != getattr(self, "_runtime_thread_generation", 0):
+            return
+        callback(*args)
+
+    def _connect_runtime_thread_signals(self, generation: int) -> None:
+        self._feed.snapshot_ready.connect(
+            lambda snapshot, generation=generation: self._run_runtime_thread_callback(
+                generation,
+                self._apply_snapshot,
+                snapshot,
+            )
+        )
+        self._feed.status_changed.connect(
+            lambda text, generation=generation: self._run_runtime_thread_callback(
+                generation,
+                self._set_status,
+                text,
+            )
+        )
+        self._account_feed.positions_ready.connect(
+            lambda positions, generation=generation: self._run_runtime_thread_callback(
+                generation,
+                self._apply_positions,
+                positions,
+            )
+        )
+        self._account_feed.spot_balances_ready.connect(
+            lambda balances, generation=generation: self._run_runtime_thread_callback(
+                generation,
+                self._apply_spot_balances,
+                balances,
+            )
+        )
+        self._account_feed.status_changed.connect(
+            lambda text, generation=generation: self._run_runtime_thread_callback(
+                generation,
+                self._set_account_status,
+                text,
+            )
+        )
+        self._order_feed.orders_ready.connect(
+            lambda orders, generation=generation: self._run_runtime_thread_callback(
+                generation,
+                self._apply_order_updates,
+                orders,
+            )
+        )
+        self._order_feed.status_changed.connect(
+            lambda text, generation=generation: self._run_runtime_thread_callback(
+                generation,
+                self._set_order_status,
+                text,
+            )
+        )
 
     def _start_private_threads(self) -> None:
         if self._private_threads_started:
@@ -2276,13 +2332,7 @@ class RollTerminalWindow(QMainWindow):
         self._feed = MarketFeedThread(environment=runtime.environment)
         self._account_feed = AccountFeedThread(runtime)
         self._order_feed = OrderFeedThread(runtime)
-        self._feed.snapshot_ready.connect(self._apply_snapshot)
-        self._feed.status_changed.connect(self._set_status)
-        self._account_feed.positions_ready.connect(self._apply_positions)
-        self._account_feed.spot_balances_ready.connect(self._apply_spot_balances)
-        self._account_feed.status_changed.connect(self._set_account_status)
-        self._order_feed.orders_ready.connect(self._apply_order_updates)
-        self._order_feed.status_changed.connect(self._set_order_status)
+        self._connect_runtime_thread_signals(self._runtime_thread_generation)
         self._feed.start()
         self._start_private_threads()
         self._last_profile_name = profile_name

@@ -5,7 +5,7 @@ import sys
 from datetime import datetime
 from typing import Iterable
 
-from PySide6.QtCore import QCoreApplication, Qt, QUrl, Slot
+from PySide6.QtCore import QCoreApplication, QTimer, Qt, QUrl, Slot
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from okx_quant.app_meta import APP_VERSION, build_version_info_text
 from okx_quant.app_paths import config_dir_path, data_root, logs_dir_path, state_dir_path
+from okx_quant.log_utils import append_log_line
 from roll_terminal_qt.account_positions_home import AccountPositionsHomeWidget
 from roll_terminal_qt.app_icon import apply_qt_application_identity, apply_qt_window_icon
 from roll_terminal_qt.auto_channel_window import AutoChannelWindow
@@ -43,7 +44,7 @@ def module_choices() -> tuple[str, ...]:
 
 
 def _standalone_command(module_key: str) -> str:
-    return f"python run_roll_terminal_qt.py --module {module_key}"
+    return f"pythonw run_roll_terminal_qt.pyw --module {module_key}"
 
 
 class SharedDataDialog(QDialog):
@@ -239,6 +240,8 @@ class LauncherWindow(QMainWindow):
         super().__init__()
         self._child_windows: list[QWidget] = []
         self._shared_data_dialog: SharedDataDialog | None = None
+        self._shutdown_in_progress = False
+        self._shutdown_started_at: datetime | None = None
         self._home_widget = AccountPositionsHomeWidget(self)
         self.setWindowTitle("量化交易控制台")
         self.resize(1680, 980)
@@ -246,8 +249,45 @@ class LauncherWindow(QMainWindow):
         self._build_menu()
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
-        self._home_widget.shutdown()
-        super().closeEvent(event)
+        if self._shutdown_in_progress:
+            event.ignore()
+            return
+        self._shutdown_in_progress = True
+        event.ignore()
+        self.setEnabled(False)
+        if "[closing]" not in self.windowTitle():
+            self.setWindowTitle(f"{self.windowTitle()} [closing]")
+        self.repaint()
+        QTimer.singleShot(0, self._begin_shutdown)
+
+    def _begin_shutdown(self) -> None:
+        started_at = datetime.now()
+        self._shutdown_started_at = started_at
+        print(f"[launcher] shutdown_begin | ts={started_at.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+        try:
+            append_log_line(f"[launcher] shutdown_begin | ts={started_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        except Exception:
+            pass
+        self._home_widget.begin_shutdown(self._finish_shutdown)
+
+    def _finish_shutdown(self) -> None:
+        finished_at = datetime.now()
+        started_at = self._shutdown_started_at or finished_at
+        elapsed = (finished_at - started_at).total_seconds()
+        print(
+            f"[launcher] shutdown_end | ts={finished_at.strftime('%Y-%m-%d %H:%M:%S')} | elapsed={elapsed:.3f}s",
+            flush=True,
+        )
+        try:
+            append_log_line(
+                f"[launcher] shutdown_end | ts={finished_at.strftime('%Y-%m-%d %H:%M:%S')} | elapsed={elapsed:.3f}s"
+            )
+        except Exception:
+            pass
+        self.deleteLater()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
@@ -343,12 +383,15 @@ class LauncherWindow(QMainWindow):
 
     @Slot(str)
     def open_module_window(self, module_key: str) -> None:
+        print(f"[launcher] open_module_window begin | module={module_key}", flush=True)
         window = create_module_window(module_key)
+        print(f"[launcher] open_module_window created | module={module_key} | type={type(window).__name__}", flush=True)
         self._child_windows.append(window)
         window.destroyed.connect(
             lambda *_args, target=window: self._child_windows.remove(target) if target in self._child_windows else None
         )
         window.show()
+        print(f"[launcher] open_module_window shown | module={module_key}", flush=True)
         window.raise_()
         window.activateWindow()
 

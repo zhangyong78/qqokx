@@ -58,6 +58,7 @@ from okx_quant.strategies.body_retest_short import (
     evaluate_body_retest_short_signal,
 )
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_BODY_RETEST_SHORT_ID,
@@ -3054,6 +3055,26 @@ class StrategyEngine:
     ) -> None:
         raise RuntimeError(
             f"{STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID} 当前仅开放研究/回测，不支持本地交易模式。"
+        )
+
+    def _run_btc_daily_4h_long_short_signal_only(
+        self,
+        config: StrategyConfig,
+        instrument: Instrument,
+    ) -> None:
+        raise RuntimeError(
+            f"{STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID} 当前仅开放研究/回测，不支持信号监控模式。"
+        )
+
+    def _run_btc_daily_4h_long_short_local_strategy(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        signal_instrument: Instrument,
+        trade_instrument: Instrument,
+    ) -> None:
+        raise RuntimeError(
+            f"{STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID} 当前仅开放研究/回测，不支持本地交易模式。"
         )
 
     def _run_ema5_ema8_signal_only(

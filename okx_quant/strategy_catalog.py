@@ -18,6 +18,7 @@ STRATEGY_BTC_EMA55_SLOPE_SHORT_ID = "btc_ema55_slope_short"
 STRATEGY_BODY_RETEST_SHORT_ID = "body_retest_short"
 STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID = "btc_ema15_ma50_pullback_long"
 STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID = "btc_ema15_ma50_pullback_short"
+STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID = "btc_daily_4h_long_short"
 
 
 def is_ema_atr_breakout_strategy(strategy_id: str) -> bool:
@@ -51,6 +52,10 @@ def is_btc_ema15_ma50_pullback_long_strategy(strategy_id: str) -> bool:
 
 def is_btc_ema15_ma50_pullback_short_strategy(strategy_id: str) -> bool:
     return strategy_id == STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID
+
+
+def is_btc_daily_4h_long_short_strategy(strategy_id: str) -> bool:
+    return strategy_id == STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID
 
 
 def is_dynamic_mtf_strategy_id(strategy_id: str) -> bool:
@@ -355,6 +360,24 @@ ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
         supports_batch_observe=False,
     ),
     StrategyDefinition(
+        strategy_id=STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
+        name="BTC日线+4小时多空策略",
+        summary="BTC 4H 双向回踩研究策略：4H 用 EMA15/MA50 找穿越回踩，方向固定跟随日线 close vs MA50。",
+        rule_description=(
+            "流程：固定 BTC-USDT-SWAP 4H；4H 先识别 EMA15 与 MA50 的方向穿越，再等回踩/反抽 EMA15 的收盘确认，下一根 K 线开盘成交；"
+            "日线方向固定使用 close vs MA50，多头日只做多，空头日只做空；持仓后可按动态保护或 EMA15 收盘反向在下一根开盘离场。"
+        ),
+        parameter_hint=(
+            "本版固定 4H EMA15/MA50 + 日线 MA50 过滤，只保留 ATR 止损、Cross 观察窗口、最大回踩序号与动态止盈参数，便于直接回测。"
+        ),
+        default_signal_label="双向",
+        allowed_signal_labels=("双向", "只做多", "只做空"),
+        supports_trade=False,
+        supports_signal_only=False,
+        supports_backtest=True,
+        supports_batch_observe=False,
+    ),
+    StrategyDefinition(
         strategy_id=STRATEGY_DYNAMIC_ID,
         name="EMA 动态委托",
         summary="通用 EMA 动态委托策略入口，通常由做多/做空两个方向版本承接。",
@@ -393,6 +416,7 @@ _STRATEGY_IDS_HIDDEN_FROM_LAUNCHER: frozenset[str] = frozenset(
         STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
         STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
         STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
+        STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
     }
 )
 _STRATEGY_IDS_HIDDEN_FROM_BACKTEST: frozenset[str] = frozenset({STRATEGY_DYNAMIC_ID, STRATEGY_CROSS_ID})

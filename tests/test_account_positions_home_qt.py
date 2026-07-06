@@ -15,7 +15,54 @@ from okx_quant.okx_client import Instrument, OkxOrderResult
 from roll_terminal_qt.order_service import OrderStatusView
 
 
+class _ThreadRetireStub:
+    def __init__(self, *, running: bool) -> None:
+        self._running = running
+        self.deleted = False
+        self.terminated = False
+
+    def isRunning(self) -> bool:
+        return self._running
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def deleteLater(self) -> None:
+        self.deleted = True
+
+
+class _TimerStub:
+    def __init__(self, *, active: bool = False) -> None:
+        self._active = active
+        self.started = False
+        self.stopped = False
+
+    def isActive(self) -> bool:
+        return self._active
+
+    def start(self) -> None:
+        self.started = True
+        self._active = True
+
+    def stop(self) -> None:
+        self.stopped = True
+        self._active = False
+
+
+class _ProfileComboStub:
+    def __init__(self) -> None:
+        self.enabled = True
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+
 class AccountPositionsHomeQtHelpersTest(TestCase):
+    def test_parse_positive_decimal_returns_decimal_without_widget_context(self) -> None:
+        value = AccountPositionsHomeWidget._parse_positive_decimal("1.25", "平仓币数")
+
+        self.assertEqual(value, Decimal("1.25"))
+
     def test_selected_position_close_display_amount_uses_coin_for_linear_swap(self) -> None:
         position = SimpleNamespace(
             inst_id="BTC-USDT-SWAP",
@@ -185,9 +232,11 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         app = SimpleNamespace(
             _profile_switch_guard=False,
             _profile_change_ready=False,
+            _profile_switch_in_progress=False,
             _last_profile_name="159",
             _profile_change_serial=0,
             _current_profile_name=lambda: "2211",
+            _set_profile_switch_in_progress=lambda value: None,
         )
 
         with patch("roll_terminal_qt.account_positions_home.QTimer.singleShot") as single_shot:
@@ -200,9 +249,11 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         app = SimpleNamespace(
             _profile_switch_guard=False,
             _profile_change_ready=True,
+            _profile_switch_in_progress=False,
             _last_profile_name="159",
             _profile_change_serial=0,
             _current_profile_name=lambda: "2211",
+            _set_profile_switch_in_progress=lambda value: None,
         )
 
         with patch("roll_terminal_qt.account_positions_home.QTimer.singleShot") as single_shot:
@@ -210,6 +261,33 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
 
         self.assertEqual(app._profile_change_serial, 1)
         self.assertEqual(single_shot.call_count, 1)
+
+    def test_on_profile_changed_tolerates_broken_stdout(self) -> None:
+        class _BrokenStdout:
+            def write(self, _message: str) -> None:
+                raise RuntimeError("stdout unavailable")
+
+            def flush(self) -> None:
+                raise RuntimeError("stdout unavailable")
+
+        app = SimpleNamespace(
+            _profile_switch_guard=False,
+            _profile_change_ready=True,
+            _profile_switch_in_progress=False,
+            _last_profile_name="159",
+            _profile_change_serial=0,
+            _current_profile_name=lambda: "2211",
+            _set_profile_switch_in_progress=lambda value: None,
+        )
+
+        with (
+            patch("roll_terminal_qt.account_positions_home.sys.stdout", _BrokenStdout()),
+            patch("roll_terminal_qt.account_positions_home.QTimer.singleShot") as single_shot,
+        ):
+            AccountPositionsHomeWidget._on_profile_changed(app)
+
+        self.assertEqual(app._profile_change_serial, 1)
+        single_shot.assert_called_once()
 
     def test_apply_profile_change_locked_profile_uses_async_unlock_flow(self) -> None:
         app = SimpleNamespace(
@@ -235,6 +313,28 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         app._prompt_profile_unlock.assert_called_once_with("2211", 1)
         load_runtime.assert_not_called()
 
+    def test_apply_profile_change_starts_async_restart_flow_for_valid_runtime(self) -> None:
+        runtime = SimpleNamespace(name="runtime-2211")
+        app = SimpleNamespace(
+            _profile_change_serial=1,
+            _profile_switch_guard=False,
+            _current_profile_name=lambda: "2211",
+            _last_profile_name="159",
+            _profile_snapshots={},
+            _unlocked_profiles=set(),
+            _begin_profile_switch_restart=MagicMock(),
+            _clear_profile_switch_request=MagicMock(),
+        )
+
+        with (
+            patch("roll_terminal_qt.account_positions_home.profile_requires_password", return_value=False),
+            patch("roll_terminal_qt.account_positions_home.load_runtime", return_value=runtime),
+        ):
+            AccountPositionsHomeWidget._apply_profile_change(app, "2211", 1)
+
+        app._begin_profile_switch_restart.assert_called_once_with("2211", runtime, 1)
+        app._clear_profile_switch_request.assert_not_called()
+
     def test_dispatch_profile_change_waits_for_profile_combo_popup_to_close(self) -> None:
         app = SimpleNamespace(
             _profile_change_serial=2,
@@ -249,6 +349,67 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
 
         app._apply_profile_change.assert_not_called()
         single_shot.assert_called_once()
+
+    def test_poll_profile_switch_completion_waits_for_running_retired_threads(self) -> None:
+        retired = _ThreadRetireStub(running=True)
+        timer = _TimerStub(active=False)
+        app = SimpleNamespace(
+            _retired_threads=[retired],
+            _profile_switch_deadline_monotonic=10**9,
+            _profile_switch_force_terminate_sent=False,
+            _profile_switch_poll_timer=timer,
+            _ensure_profile_switch_poll_timer=lambda: timer,
+            _profile_change_serial=3,
+            _profile_switch_requested_serial=3,
+            _profile_switch_requested_target="2211",
+            _profile_switch_requested_runtime=SimpleNamespace(name="runtime-2211"),
+            _last_profile_name="159",
+            _start_private_threads=MagicMock(),
+            _clear_profile_switch_request=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._poll_profile_switch_completion(app)
+
+        app._start_private_threads.assert_not_called()
+        app._clear_profile_switch_request.assert_not_called()
+        self.assertTrue(timer.started)
+        self.assertFalse(retired.deleted)
+
+    def test_poll_profile_switch_completion_applies_runtime_after_retired_threads_finish(self) -> None:
+        retired = _ThreadRetireStub(running=False)
+        timer = _TimerStub(active=True)
+        combo = _ProfileComboStub()
+        runtime = SimpleNamespace(name="runtime-2211")
+        app = SimpleNamespace(
+            _retired_threads=[retired],
+            _profile_switch_deadline_monotonic=10**9,
+            _profile_switch_force_terminate_sent=False,
+            _profile_switch_poll_timer=timer,
+            _profile_change_serial=4,
+            _profile_switch_requested_serial=4,
+            _profile_switch_requested_target="2211",
+            _profile_switch_requested_runtime=runtime,
+            _last_profile_name="159",
+            _runtime=None,
+            _unlocked_profiles=set(),
+            _profile_combo=combo,
+            _profile_switch_in_progress=True,
+            _set_profile_switch_in_progress=lambda value: AccountPositionsHomeWidget._set_profile_switch_in_progress(app, value),
+            _clear_profile_switch_request=lambda: AccountPositionsHomeWidget._clear_profile_switch_request(app),
+            _start_private_threads=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._poll_profile_switch_completion(app)
+
+        self.assertIs(app._runtime, runtime)
+        self.assertEqual(app._last_profile_name, "2211")
+        self.assertIn("2211", app._unlocked_profiles)
+        app._start_private_threads.assert_called_once_with()
+        self.assertTrue(retired.deleted)
+        self.assertEqual(app._profile_switch_requested_target, "")
+        self.assertFalse(app._profile_switch_in_progress)
+        self.assertTrue(combo.enabled)
+        self.assertTrue(timer.stopped)
 
     def test_selected_position_manual_flatten_result_failed_uses_s_code(self) -> None:
         ok_result = OkxOrderResult(ord_id="1", cl_ord_id="a", s_code="0", s_msg="", raw={})

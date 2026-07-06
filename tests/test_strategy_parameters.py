@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
@@ -77,6 +78,13 @@ class StrategyParametersTest(TestCase):
         self.assertEqual(get_strategy_definition(STRATEGY_DYNAMIC_SHORT_ID).default_signal_mode, "short_only")
         self.assertEqual(get_strategy_definition(STRATEGY_EMA5_EMA8_ID).default_signal_mode, "both")
         self.assertEqual(get_strategy_definition(STRATEGY_BODY_RETEST_SHORT_ID).default_signal_mode, "short_only")
+        self.assertEqual(get_strategy_definition(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID).default_signal_mode, "both")
+
+    def test_btc_daily_4h_long_short_definition_uses_real_signal_labels(self) -> None:
+        definition = get_strategy_definition(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID)
+
+        self.assertEqual(definition.default_signal_label, "双向")
+        self.assertEqual(definition.allowed_signal_labels, ("双向", "只做多", "只做空"))
 
     def test_ema55_slope_short_strategy_keeps_signal_fixed_but_allows_coin_specific_ma_params(self) -> None:
         keys = set(iter_strategy_parameter_keys(STRATEGY_EMA55_SLOPE_SHORT_ID))
@@ -145,3 +153,24 @@ class StrategyParametersTest(TestCase):
         self.assertTrue(strategy_is_parameter_editable(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "ema_period", "backtest"))
         self.assertTrue(strategy_is_parameter_editable(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "trend_ema_type", "backtest"))
         self.assertTrue(strategy_is_parameter_editable(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "trend_ema_period", "backtest"))
+
+    def test_btc_daily_4h_long_short_profile_fixes_daily_filter_and_trend_defaults(self) -> None:
+        keys = set(iter_strategy_parameter_keys(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID))
+
+        self.assertIn("signal_mode", keys)
+        self.assertIn("cross_window_bars", keys)
+        self.assertIn("max_pullback_index", keys)
+        self.assertIn("exit_mode", keys)
+        self.assertIn("dynamic_protection_rules", keys)
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "bar"), "4H")
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "ema_type"), "ema")
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "ema_period"), 15)
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "trend_ema_type"), "ma")
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "trend_ema_period"), 50)
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "daily_filter_enabled"), True)
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "daily_filter_mode"), "close_vs_ma")
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "daily_filter_ma_type"), "ma")
+        self.assertEqual(strategy_fixed_value(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "daily_filter_period"), 50)
+        self.assertTrue(strategy_is_parameter_editable(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "signal_mode", "backtest"))
+        self.assertFalse(strategy_is_parameter_editable(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "bar", "backtest"))
+        self.assertFalse(strategy_is_parameter_editable(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "daily_filter_period", "backtest"))

@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
+    STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
@@ -259,3 +260,51 @@ class StrategyUiSchemaTest(TestCase):
         self.assertTrue(visibility_short.show_dynamic_take_profit)
         self.assertTrue(visibility_long.show_daily_filter_controls)
         self.assertTrue(visibility_short.show_daily_filter_controls)
+
+    def test_btc_daily_4h_long_short_schema_uses_fixed_daily_filter_and_dynamic_defaults(self) -> None:
+        self.assertTrue(strategy_supports_dynamic_take_profit(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID))
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "bar", "backtest"),
+            "4H",
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "ema_type", "backtest"),
+            "ema",
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "ema_period", "backtest"),
+            15,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "trend_ema_type", "backtest"),
+            "ma",
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "trend_ema_period", "backtest"),
+            50,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
+                "dynamic_break_even_trigger_r",
+                "backtest",
+            ),
+            2,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(
+                STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
+                "ema55_slope_lock_profit_trigger_r",
+                "backtest",
+            ),
+            3,
+        )
+        self.assertEqual(
+            strategy_parameter_default_for_scope(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "daily_filter_period", "backtest"),
+            50,
+        )
+        backtest_defaults = strategy_ui_extra_defaults(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "backtest")
+        self.assertEqual(backtest_defaults["risk_amount"], "100")
+        visibility = build_strategy_widget_visibility(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "backtest")
+        self.assertTrue(visibility.show_dynamic_take_profit)
+        self.assertTrue(visibility.show_daily_filter_controls)

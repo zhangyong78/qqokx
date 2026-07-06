@@ -5,6 +5,7 @@ from typing import Literal
 
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+    STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
@@ -31,6 +32,7 @@ StrategyRuntimeFamily = Literal[
     "body_retest_short",
     "ema15_ma50_pullback_long",
     "ema15_ma50_pullback_short",
+    "ema15_ma50_pullback_dual",
     "ema5_ema8",
 ]
 
@@ -112,6 +114,11 @@ _BTC_EMA15_MA50_PULLBACK_SHORT_PROFILE = StrategyRuntimeProfile(
     signal_only_handler="_run_btc_ema15_ma50_pullback_short_signal_only",
     local_trade_handler="_run_btc_ema15_ma50_pullback_short_local_strategy",
 )
+_BTC_DAILY_4H_LONG_SHORT_PROFILE = StrategyRuntimeProfile(
+    family="ema15_ma50_pullback_dual",
+    signal_only_handler="_run_btc_daily_4h_long_short_signal_only",
+    local_trade_handler="_run_btc_daily_4h_long_short_local_strategy",
+)
 _EMA5_EMA8_PROFILE = StrategyRuntimeProfile(
     family="ema5_ema8",
     signal_only_handler="_run_ema5_ema8_signal_only",
@@ -143,6 +150,8 @@ def get_strategy_runtime_profile(strategy_id: str) -> StrategyRuntimeProfile:
         return _BTC_EMA15_MA50_PULLBACK_LONG_PROFILE
     if strategy_id == STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID:
         return _BTC_EMA15_MA50_PULLBACK_SHORT_PROFILE
+    if strategy_id == STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID:
+        return _BTC_DAILY_4H_LONG_SHORT_PROFILE
     if strategy_id == STRATEGY_EMA5_EMA8_ID:
         return _EMA5_EMA8_PROFILE
     if strategy_id == STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID:

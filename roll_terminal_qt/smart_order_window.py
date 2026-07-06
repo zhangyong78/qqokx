@@ -89,6 +89,67 @@ POSITION_MODE_OPTIONS: tuple[tuple[str, Literal["net", "long_short"]], ...] = (
 GRID_CYCLE_OPTIONS: tuple[str, ...] = ("连续", "1", "3", "5", "10")
 REFRESH_INTERVAL_MS = 1500
 DEFAULT_TASK_HINT = "这里会显示任务运行状态、活动委托和恢复信息。"
+SMART_ORDER_COMPACT_ROOT_MARGINS = (10, 10, 10, 10)
+SMART_ORDER_COMPACT_SPLITTER_SIZES = (560, 1000)
+SMART_ORDER_TASK_DETAIL_HEIGHT = 76
+SMART_ORDER_LOG_MIN_HEIGHT = 128
+
+SMART_ORDER_LOCAL_STYLE = """
+QMainWindow {
+    background: #eef3f8;
+}
+QFrame#Panel,
+QFrame#Guide {
+    border-radius: 10px;
+}
+QLabel#SmartTitle {
+    color: #0f172a;
+    font-size: 15px;
+    font-weight: 700;
+}
+QLabel#SmartSection {
+    color: #0f172a;
+    font-size: 12px;
+    font-weight: 700;
+}
+QLabel#SmartHint {
+    color: #64748b;
+    font-size: 10px;
+}
+QPushButton {
+    min-height: 24px;
+    padding: 2px 9px;
+}
+QComboBox,
+QLineEdit {
+    min-height: 24px;
+}
+QTabBar::tab {
+    min-height: 24px;
+    padding: 4px 12px;
+}
+QHeaderView::section {
+    min-height: 22px;
+    padding: 3px 6px;
+    background: #f8fafc;
+    border: 0;
+    border-bottom: 1px solid #dbe4ee;
+}
+QTableWidget {
+    gridline-color: #e5edf5;
+    alternate-background-color: #f8fafc;
+    selection-background-color: #dbeafe;
+    selection-color: #0f172a;
+}
+QTextEdit#TaskDetail,
+QTextEdit#SmartLog {
+    background: #fbfdff;
+    border: 1px solid #dbe4ee;
+    border-radius: 8px;
+    font-family: Consolas, "Microsoft YaHei UI";
+    font-size: 10px;
+}
+"""
 
 
 _SHARED_CLIENT: OkxRestClient | None = None
@@ -142,12 +203,13 @@ class SmartOrderQtWindow(QMainWindow):
 
         self.setWindowTitle("无限下单 - Qt")
         self.resize(1560, 960)
+        self.setStyleSheet(SMART_ORDER_LOCAL_STYLE)
 
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(14)
+        layout.setContentsMargins(*SMART_ORDER_COMPACT_ROOT_MARGINS)
+        layout.setSpacing(8)
 
         layout.addWidget(self._build_header())
         layout.addWidget(self._build_runtime_panel())
@@ -156,7 +218,9 @@ class SmartOrderQtWindow(QMainWindow):
         content = QSplitter(Qt.Orientation.Horizontal)
         content.addWidget(self._build_left_panel())
         content.addWidget(self._build_right_panel())
-        content.setSizes([620, 920])
+        content.setChildrenCollapsible(False)
+        content.setHandleWidth(5)
+        content.setSizes(list(SMART_ORDER_COMPACT_SPLITTER_SIZES))
         layout.addWidget(content, 1)
 
         self._timer = QTimer(self)
@@ -181,39 +245,42 @@ class SmartOrderQtWindow(QMainWindow):
     def _build_header(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("Panel")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(8)
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(10)
 
         title = QLabel("无限下单")
-        title.setObjectName("SectionTitle")
+        title.setObjectName("SmartTitle")
         subtitle = QLabel(
-            "纯 Qt 版本直接接入共享任务、收藏、仓位限制和运行状态。"
-            "这里不再依赖旧窗口，后续任务和数据都从同一套共享文件继续。"
+            "纯 Qt 版本直接接入共享任务、收藏、仓位限制和运行状态；后续任务和数据继续沿用共享文件。"
         )
-        subtitle.setObjectName("Subtle")
+        subtitle.setObjectName("SmartHint")
         subtitle.setWordWrap(True)
         layout.addWidget(title)
-        layout.addWidget(subtitle)
+        layout.addWidget(subtitle, 1)
         return panel
 
     def _build_runtime_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("Guide")
         layout = QGridLayout(panel)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setHorizontalSpacing(12)
-        layout.setVerticalSpacing(10)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
 
         self._profile_combo = QComboBox()
+        self._profile_combo.setMinimumWidth(140)
         self._profile_combo.currentIndexChanged.connect(self._on_profile_changed)
         self._environment_combo = QComboBox()
+        self._environment_combo.setMinimumWidth(120)
         for label, value in ENVIRONMENT_OPTIONS:
             self._environment_combo.addItem(label, value)
         self._trade_mode_combo = QComboBox()
+        self._trade_mode_combo.setMinimumWidth(120)
         for label, value in TRADE_MODE_OPTIONS:
             self._trade_mode_combo.addItem(label, value)
         self._position_mode_combo = QComboBox()
+        self._position_mode_combo.setMinimumWidth(120)
         for label, value in POSITION_MODE_OPTIONS:
             self._position_mode_combo.addItem(label, value)
 
@@ -223,10 +290,10 @@ class SmartOrderQtWindow(QMainWindow):
         unlock_button.clicked.connect(self._unlock_contract_if_idle)
 
         self._runtime_summary = QLabel("")
-        self._runtime_summary.setObjectName("GuideText")
+        self._runtime_summary.setObjectName("SmartHint")
         self._runtime_summary.setWordWrap(True)
         self._status = QLabel("")
-        self._status.setObjectName("Subtle")
+        self._status.setObjectName("SmartHint")
         self._status.setWordWrap(True)
 
         layout.addWidget(QLabel("API Profile"), 0, 0)
@@ -239,22 +306,22 @@ class SmartOrderQtWindow(QMainWindow):
         layout.addWidget(self._position_mode_combo, 0, 7)
         layout.addWidget(refresh_button, 0, 8)
         layout.addWidget(unlock_button, 0, 9)
-        layout.addWidget(self._runtime_summary, 1, 0, 1, 6)
-        layout.addWidget(self._status, 1, 6, 1, 4)
+        layout.addWidget(self._runtime_summary, 1, 0, 1, 5)
+        layout.addWidget(self._status, 1, 5, 1, 5)
         return panel
 
     def _build_metrics_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("Panel")
         layout = QHBoxLayout(panel)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(18)
+        layout.setContentsMargins(12, 7, 12, 7)
+        layout.setSpacing(12)
         self._task_metric = QLabel("")
         self._favorite_metric = QLabel("")
         self._locked_metric = QLabel("")
         self._position_metric = QLabel("")
         for label in (self._task_metric, self._favorite_metric, self._locked_metric, self._position_metric):
-            label.setObjectName("GuideText")
+            label.setObjectName("SmartHint")
             layout.addWidget(label, 1)
         return panel
 
@@ -262,10 +329,11 @@ class SmartOrderQtWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
         layout.addWidget(self._build_instrument_panel())
 
         tabs = QTabWidget()
+        tabs.setDocumentMode(True)
         tabs.addTab(self._build_manual_tab(), "手动下单")
         tabs.addTab(self._build_condition_tab(), "条件单")
         tabs.addTab(self._build_tp_sl_tab(), "止盈止损")
@@ -278,16 +346,18 @@ class SmartOrderQtWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
         ladder_panel = QFrame()
         ladder_panel.setObjectName("Panel")
         ladder_layout = QVBoxLayout(ladder_panel)
-        ladder_layout.setContentsMargins(14, 14, 14, 14)
-        ladder_layout.setSpacing(10)
+        ladder_layout.setContentsMargins(12, 9, 12, 10)
+        ladder_layout.setSpacing(6)
 
         ladder_toolbar = QHBoxLayout()
-        ladder_toolbar.addWidget(QLabel("盘口梯子"))
+        ladder_title = QLabel("盘口梯子")
+        ladder_title.setObjectName("SmartSection")
+        ladder_toolbar.addWidget(ladder_title)
         ladder_toolbar.addStretch(1)
         ladder_toolbar.addWidget(QLabel("价格分组"))
         self._ladder_filter_combo = QComboBox()
@@ -298,6 +368,7 @@ class SmartOrderQtWindow(QMainWindow):
         self._ladder_table = QTableWidget(0, 4)
         self._ladder_table.setHorizontalHeaderLabels(["买量", "价格", "卖量", "活动映射"])
         self._ladder_table.verticalHeader().setVisible(False)
+        self._ladder_table.verticalHeader().setDefaultSectionSize(24)
         self._ladder_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._ladder_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._ladder_table.setAlternatingRowColors(True)
@@ -309,16 +380,18 @@ class SmartOrderQtWindow(QMainWindow):
         ladder_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self._ladder_table.cellClicked.connect(self._on_ladder_cell_clicked)
         ladder_layout.addWidget(self._ladder_table, 1)
-        layout.addWidget(ladder_panel, 3)
+        layout.addWidget(ladder_panel, 5)
 
         task_panel = QFrame()
         task_panel.setObjectName("Panel")
         task_layout = QVBoxLayout(task_panel)
-        task_layout.setContentsMargins(14, 14, 14, 14)
-        task_layout.setSpacing(10)
+        task_layout.setContentsMargins(12, 9, 12, 10)
+        task_layout.setSpacing(6)
 
         task_toolbar = QHBoxLayout()
-        task_toolbar.addWidget(QLabel("任务"))
+        task_title = QLabel("任务")
+        task_title.setObjectName("SmartSection")
+        task_toolbar.addWidget(task_title)
         task_toolbar.addStretch(1)
         restart_button = QPushButton("重启")
         restart_button.clicked.connect(self._restart_selected_task)
@@ -337,46 +410,53 @@ class SmartOrderQtWindow(QMainWindow):
             ["ID", "类型", "状态", "方向", "数量", "活动价", "循环", "说明"]
         )
         self._task_table.verticalHeader().setVisible(False)
+        self._task_table.verticalHeader().setDefaultSectionSize(24)
         self._task_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._task_table.itemSelectionChanged.connect(self._sync_task_detail)
         task_layout.addWidget(self._task_table, 1)
 
         self._task_detail = QTextEdit()
+        self._task_detail.setObjectName("TaskDetail")
         self._task_detail.setReadOnly(True)
-        self._task_detail.setMinimumHeight(120)
+        self._task_detail.setMinimumHeight(SMART_ORDER_TASK_DETAIL_HEIGHT)
+        self._task_detail.setMaximumHeight(116)
         task_layout.addWidget(self._task_detail)
-        layout.addWidget(task_panel, 3)
+        layout.addWidget(task_panel, 2)
 
         log_panel = QFrame()
         log_panel.setObjectName("Panel")
         log_layout = QVBoxLayout(log_panel)
-        log_layout.setContentsMargins(14, 14, 14, 14)
-        log_layout.setSpacing(10)
-        log_layout.addWidget(QLabel("日志"))
+        log_layout.setContentsMargins(12, 9, 12, 10)
+        log_layout.setSpacing(6)
+        log_title = QLabel("日志")
+        log_title.setObjectName("SmartSection")
+        log_layout.addWidget(log_title)
         self._log_text = QTextEdit()
+        self._log_text.setObjectName("SmartLog")
         self._log_text.setReadOnly(True)
-        self._log_text.setMinimumHeight(180)
+        self._log_text.setMinimumHeight(SMART_ORDER_LOG_MIN_HEIGHT)
         log_layout.addWidget(self._log_text, 1)
-        layout.addWidget(log_panel, 2)
+        layout.addWidget(log_panel, 1)
         return panel
 
     def _build_instrument_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("Panel")
         layout = QGridLayout(panel)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setHorizontalSpacing(12)
-        layout.setVerticalSpacing(10)
+        layout.setContentsMargins(12, 9, 12, 10)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(6)
 
         self._inst_type_combo = QComboBox()
         for label, value in INSTRUMENT_TYPE_OPTIONS:
             self._inst_type_combo.addItem(label, value)
         self._inst_type_combo.currentIndexChanged.connect(self._refresh_favorite_options)
         self._inst_id_edit = QLineEdit()
+        self._inst_id_edit.setMinimumWidth(260)
         self._favorite_combo = QComboBox()
         self._favorite_combo.currentIndexChanged.connect(self._on_favorite_selected)
         self._instrument_summary = QLabel("请先选择合约。")
-        self._instrument_summary.setObjectName("Subtle")
+        self._instrument_summary.setObjectName("SmartHint")
         self._instrument_summary.setWordWrap(True)
 
         load_button = QPushButton("加载合约")
@@ -401,8 +481,8 @@ class SmartOrderQtWindow(QMainWindow):
     def _build_manual_tab(self) -> QWidget:
         panel = QWidget()
         layout = QFormLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(6)
 
         self._manual_side_combo = QComboBox()
         self._manual_side_combo.addItem("买入 buy", "buy")
@@ -426,8 +506,8 @@ class SmartOrderQtWindow(QMainWindow):
     def _build_condition_tab(self) -> QWidget:
         panel = QWidget()
         layout = QFormLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(6)
 
         self._condition_side_combo = QComboBox()
         self._condition_side_combo.addItem("买入 buy", "buy")
@@ -466,8 +546,8 @@ class SmartOrderQtWindow(QMainWindow):
     def _build_tp_sl_tab(self) -> QWidget:
         panel = QWidget()
         layout = QFormLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(6)
 
         self._tp_sl_side_combo = QComboBox()
         self._tp_sl_side_combo.addItem("多仓 long", "long")
@@ -494,8 +574,8 @@ class SmartOrderQtWindow(QMainWindow):
     def _build_grid_tab(self) -> QWidget:
         panel = QWidget()
         layout = QFormLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(6)
 
         self._grid_enabled = QCheckBox("开启盘口点击建网格")
         self._grid_size_edit = QLineEdit("0.01")
@@ -521,8 +601,8 @@ class SmartOrderQtWindow(QMainWindow):
     def _build_position_limit_tab(self) -> QWidget:
         panel = QWidget()
         layout = QFormLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(6)
 
         self._position_limit_enabled = QCheckBox("启用总仓位限制")
         self._position_long_limit_edit = QLineEdit()

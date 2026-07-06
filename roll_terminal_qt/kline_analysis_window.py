@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QSpinBox,
     QTableWidget,
@@ -44,7 +46,8 @@ from PySide6.QtWidgets import (
 )
 
 from okx_quant.candle_cache import load_candle_cache
-from okx_quant.deribit_client import DeribitRestClient
+from okx_quant.deribit_client import DeribitRestClient, DeribitVolatilityCandle
+from okx_quant.models import Candle
 from okx_quant.deribit_volatility_ui import (
     DERIBIT_BASE_HOURLY_RESOLUTION,
     DERIBIT_FULL_HISTORY_START_TS,
@@ -54,12 +57,16 @@ from okx_quant.deribit_volatility_ui import (
     _hourly_history_limit,
     _merge_deribit_candles,
     _merge_price_candles,
+    _to_average_price_candles,
     _to_average_volatility_candles,
 )
 from okx_quant.okx_client import OkxRestClient
-from okx_quant.persistence import load_kline_analysis_workspace_entries, save_kline_analysis_workspace_entries
+from okx_quant.persistence import (
+    deribit_volatility_cache_file_path,
+    load_kline_analysis_workspace_entries,
+    save_kline_analysis_workspace_entries,
+)
 from okx_quant.signal_replay_engine import SignalReplayConfig, build_signal_replay_dataset
-from roll_terminal_qt.deribit_volatility_window import _load_cached_hourly_series, _save_cached_hourly_series
 from roll_terminal_qt.kline_alerts import (
     build_workspace_key,
     evaluate_workspace_alerts,
@@ -74,6 +81,7 @@ _NATIVE_BOOTSTRAP_RENDER_BARS = 360
 _NATIVE_BOOTSTRAP_RENDER_DELAY_MS = 90
 _AUTO_REFRESH_DEFAULT_ENABLED = True
 _NATIVE_RIGHT_PADDING_BARS = 24
+_RECENT_VIEW_BARS = 240
 _KLINE_SPLITTER_LEFT_RATIO = 0.11
 _VOLUME_OVERLAY_HEIGHT_RATIO = 0.18
 _EMA15_LINE_WIDTH = 2
@@ -81,6 +89,8 @@ _SMA50_LINE_WIDTH = 3
 _SECONDARY_CHART_TOP_RATIO = 0.31
 _SECONDARY_CHART_SIDE_RATIO = 0.56
 _SECONDARY_CHART_SPLITTER_HANDLE_WIDTH = 10
+_HEADER_SYMBOL_INPUT_MIN_WIDTH = 220
+_HEADER_SYMBOL_INPUT_MAX_WIDTH = 360
 _BOX_HISTORY_SCAN_LIMIT = 240
 _BOX_HISTORY_MAX_SEGMENTS = 8
 _BOX_HISTORY_OUTLINE_COLOR = "#f97316"
@@ -101,6 +111,8 @@ _CHART_CROSSHAIR_COLOR = "#6b7280"
 _REPLAY_SIGNAL_NEAR_MA_MAX_PCT = 0.006
 _REPLAY_SIGNAL_LONG_COLOR = "#38bdf8"
 _REPLAY_SIGNAL_SHORT_COLOR = "#f97316"
+_PRIMARY_PERIOD_BUTTON_WIDTH = 48
+_PRIMARY_PERIOD_BUTTON_HEIGHT = 28
 _SOURCE_STATUS_LABELS = {
     "local_cache": "本地缓存",
     "local_cache_partial": "本地缓存不足",
@@ -127,6 +139,115 @@ _REPLAY_SIGNAL_LABELS = {
     "top_fractal": "顶分型",
     "bottom_fractal": "底分型",
 }
+
+
+def _debug_log(message: str) -> None:
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return
+    try:
+        stream.write(f"{message}\n")
+        stream.flush()
+    except Exception:
+        return
+
+
+def _load_deribit_volatility_cache_payload() -> dict[str, Any]:
+    path = deribit_volatility_cache_file_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_deribit_volatility_cache_payload(payload: dict[str, Any]) -> None:
+    path = deribit_volatility_cache_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+
+def _deribit_hourly_cache_key(currency: str) -> str:
+    return f"{currency}|hourly_base"
+
+
+def _load_cached_deribit_hourly_series(currency: str) -> tuple[str, list[DeribitVolatilityCandle], list[Candle], datetime] | None:
+    item = _load_deribit_volatility_cache_payload().get(_deribit_hourly_cache_key(currency))
+    if not isinstance(item, dict):
+        return None
+    try:
+        volatility_candles = [
+            DeribitVolatilityCandle(
+                ts=int(candle["ts"]),
+                open=Decimal(str(candle["open"])),
+                high=Decimal(str(candle["high"])),
+                low=Decimal(str(candle["low"])),
+                close=Decimal(str(candle["close"])),
+            )
+            for candle in item.get("volatility_hourly", [])
+        ]
+        spot_candles = [
+            Candle(
+                ts=int(candle["ts"]),
+                open=Decimal(str(candle["open"])),
+                high=Decimal(str(candle["high"])),
+                low=Decimal(str(candle["low"])),
+                close=Decimal(str(candle["close"])),
+                volume=Decimal(str(candle.get("volume", "0"))),
+                confirmed=bool(candle.get("confirmed", True)),
+            )
+            for candle in item.get("spot_hourly", [])
+        ]
+        if not volatility_candles or not spot_candles:
+            return None
+        return (
+            str(item.get("spot_inst_id", OKX_SPOT_SYMBOLS[currency])),
+            volatility_candles,
+            [candle for candle in spot_candles if candle.confirmed],
+            datetime.fromisoformat(str(item["fetched_at"])),
+        )
+    except Exception:
+        return None
+
+
+def _save_cached_deribit_hourly_series(
+    currency: str,
+    *,
+    spot_inst_id: str,
+    volatility_candles: list[DeribitVolatilityCandle],
+    spot_candles: list[Candle],
+    fetched_at: datetime,
+) -> None:
+    payload = _load_deribit_volatility_cache_payload()
+    payload[_deribit_hourly_cache_key(currency)] = {
+        "spot_inst_id": spot_inst_id,
+        "fetched_at": fetched_at.isoformat(),
+        "volatility_hourly": [
+            {
+                "ts": candle.ts,
+                "open": str(candle.open),
+                "high": str(candle.high),
+                "low": str(candle.low),
+                "close": str(candle.close),
+            }
+            for candle in volatility_candles
+        ],
+        "spot_hourly": [
+            {
+                "ts": candle.ts,
+                "open": str(candle.open),
+                "high": str(candle.high),
+                "low": str(candle.low),
+                "close": str(candle.close),
+                "volume": str(candle.volume),
+                "confirmed": candle.confirmed,
+            }
+            for candle in spot_candles
+        ],
+    }
+    _save_deribit_volatility_cache_payload(payload)
 _DAILY_TREND_NEUTRAL_BIAS = 0.008
 _DAILY_TREND_STRONG_BIAS = 0.015
 _DAILY_TREND_STRONG_SLOPE = 0.006
@@ -371,7 +492,7 @@ def _full_native_x_range(total_bars: int) -> tuple[float, float]:
     return 0.0, float(total_bars - 1)
 
 
-def _default_native_visible_range(total_bars: int, *, target_visible_bars: int = 240) -> tuple[float, float]:
+def _default_native_visible_range(total_bars: int, *, target_visible_bars: int = _RECENT_VIEW_BARS) -> tuple[float, float]:
     full_min, full_max = _full_native_x_range(total_bars)
     if total_bars <= 1:
         return full_min, full_max
@@ -388,7 +509,7 @@ def _default_native_x_range_with_right_padding(
     display_times_ms: list[int],
     *,
     display_step_ms: int,
-    target_visible_bars: int = 240,
+    target_visible_bars: int = _RECENT_VIEW_BARS,
     right_padding_bars: int = _NATIVE_RIGHT_PADDING_BARS,
 ) -> tuple[float, float]:
     if not display_times_ms:
@@ -432,6 +553,16 @@ def _default_chart_stack_splitter_sizes(
     top_height = min(top_height, max_top)
     bottom_height = max(minimum_bottom, safe_total - top_height)
     return top_height, bottom_height
+
+
+def _next_secondary_layout_button_text(layout_mode: str) -> str:
+    normalized = str(layout_mode or "").strip().lower()
+    return "左右分屏" if normalized == "vertical" else "上下分屏"
+
+
+def _next_secondary_chart_kind_button_text(chart_kind: str) -> str:
+    normalized = str(chart_kind or "").strip().lower()
+    return "BTC波动率" if normalized == "kline" else "副图K线"
 
 
 def _default_chart_stack_horizontal_sizes(
@@ -1360,6 +1491,19 @@ if QChartView is not None:
             if self._axis_x is None:
                 return
             start_x, end_x = self._default_x_range()
+            self._apply_x_range(start_x, end_x, emit_signal=True)
+            self._fit_y_axis_to_visible_range()
+            self._hover_pos = None
+            self._hide_hover_overlays()
+            self.viewport().update()
+
+        def set_recent_view_range(self) -> None:
+            self.reset_view()
+
+        def set_full_view_range(self) -> None:
+            if self._axis_x is None:
+                return
+            start_x, end_x = self._full_x_min, self._full_x_max
             self._apply_x_range(start_x, end_x, emit_signal=True)
             self._fit_y_axis_to_visible_range()
             self._hover_pos = None
@@ -2402,6 +2546,7 @@ class KlineDataLoader(QThread):
         period: str,
         limit: int = 1200,
         local_only: bool = False,
+        average_kline: bool = False,
         workspace_entry: dict[str, object] | None = None,
         enable_alerts: bool = True,
     ) -> None:
@@ -2411,6 +2556,7 @@ class KlineDataLoader(QThread):
         self._period = period.strip()
         self._limit = max(50, limit)
         self._local_only = local_only
+        self._average_kline = bool(average_kline)
         self._workspace_entry = normalize_workspace_entry(workspace_entry)
         self._enable_alerts = enable_alerts
 
@@ -2426,6 +2572,8 @@ class KlineDataLoader(QThread):
     ) -> KlineChartPayload:
         if self._limit > 0 and len(candles) > self._limit:
             candles = candles[-self._limit:]
+        if self._average_kline:
+            candles = _to_average_price_candles(candles)
         if not candles:
             raise ValueError(f"没有K线数据：{self._symbol} {self._period}")
 
@@ -2443,6 +2591,7 @@ class KlineDataLoader(QThread):
             local_stale=local_stale,
         )
         stats["cache_synced"] = has_network_fallback
+        stats["average_kline"] = self._average_kline
 
         chart_candles = [
             {
@@ -2697,7 +2846,7 @@ class SecondaryVolatilityDataLoader(QThread):
 
     def _build_payload(self) -> KlineChartPayload:
         resolution = self._target_resolution()
-        cached_hourly = _load_cached_hourly_series("BTC")
+        cached_hourly = _load_cached_deribit_hourly_series("BTC")
         cached_volatility: list[Any] = []
         cached_spot: list[Any] = []
         spot_inst_id = OKX_SPOT_SYMBOLS["BTC"]
@@ -2769,7 +2918,7 @@ class SecondaryVolatilityDataLoader(QThread):
             spot_hourly = list(fetched_spot)
             remote_added_count = len(hourly_candles)
 
-        _save_cached_hourly_series(
+        _save_cached_deribit_hourly_series(
             "BTC",
             spot_inst_id=spot_inst_id,
             volatility_candles=hourly_candles,
@@ -2790,6 +2939,7 @@ class SecondaryVolatilityDataLoader(QThread):
 class KlineAnalysisWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        _debug_log("[kline] __init__ begin")
         self.setWindowTitle("K线分析")
         self.resize(1680, 980)
 
@@ -2826,6 +2976,13 @@ class KlineAnalysisWindow(QMainWindow):
         self._chart_stack_splitter = None
         self._primary_period_buttons: dict[str, QPushButton] = {}
         self._active_chart_target = "primary"
+        self._chart_mode_cycle_btn: QPushButton | None = None
+        self._chart_range_mode_btn: QPushButton | None = None
+        self._chart_view_range_mode = "recent"
+        self._secondary_layout_cycle_btn: QPushButton | None = None
+        self._secondary_chart_kind_btn: QPushButton | None = None
+        self._secondary_layout_mode_value = "vertical"
+        self._secondary_chart_kind_mode = "kline"
         self._initial_load_requested = False
         self._splitter_default_applied = False
         self._native_chart_bootstrap_complete = False
@@ -2850,14 +3007,20 @@ class KlineAnalysisWindow(QMainWindow):
         self._build_header(main_layout)
         self._build_body(main_layout)
         self._sync_primary_period_buttons()
+        self._refresh_chart_mode_cycle_button()
+        self._refresh_chart_view_range_button()
+        self._refresh_secondary_layout_button()
+        self._refresh_secondary_chart_kind_button()
         self._reload_workspace_view()
         self._build_refresh_timer()
         self._deferred_chart_render_timer = QTimer(self)
         self._deferred_chart_render_timer.setSingleShot(True)
         self._deferred_chart_render_timer.timeout.connect(self._render_deferred_full_chart)
+        _debug_log("[kline] __init__ ready")
 
     def showEvent(self, event) -> None:  # noqa: ANN001
         super().showEvent(event)
+        _debug_log("[kline] showEvent")
         self._apply_default_splitter_sizes()
         if self._initial_load_requested:
             return
@@ -2884,9 +3047,11 @@ class KlineAnalysisWindow(QMainWindow):
         top_row.addSpacing(12)
         top_row.addWidget(QLabel("交易对"))
         self._symbol_input = QLineEdit("BTC-USDT-SWAP")
-        self._symbol_input.setMinimumWidth(220)
+        self._symbol_input.setMinimumWidth(_HEADER_SYMBOL_INPUT_MIN_WIDTH)
+        self._symbol_input.setMaximumWidth(_HEADER_SYMBOL_INPUT_MAX_WIDTH)
+        self._symbol_input.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self._symbol_input.editingFinished.connect(self._on_symbol_confirmed)
-        top_row.addWidget(self._symbol_input, 2)
+        top_row.addWidget(self._symbol_input, 0)
 
         self._period_combo = QComboBox()
         self._period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
@@ -2902,6 +3067,9 @@ class KlineAnalysisWindow(QMainWindow):
         for label, period_value in _PRIMARY_PERIOD_OPTIONS:
             button = QPushButton(label)
             button.setCheckable(True)
+            button.setMinimumWidth(_PRIMARY_PERIOD_BUTTON_WIDTH)
+            button.setFixedHeight(_PRIMARY_PERIOD_BUTTON_HEIGHT)
+            button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             button.clicked.connect(lambda _checked=False, value=period_value: self._on_period_button_clicked(value))
             self._primary_period_buttons[period_value] = button
             period_toolbar_layout.addWidget(button)
@@ -2913,45 +3081,75 @@ class KlineAnalysisWindow(QMainWindow):
         top_row.addWidget(self._toggle_left_panel_btn, 0)
 
         top_row.addSpacing(10)
-        top_row.addWidget(QLabel("均线"))
+        ma_group = QFrame()
+        ma_group.setObjectName("ToolbarGroup")
+        ma_group.setStyleSheet(
+            """
+            QFrame#ToolbarGroup {
+                background: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-radius: 7px;
+            }
+            """
+        )
+        ma_group_layout = QHBoxLayout(ma_group)
+        ma_group_layout.setContentsMargins(10, 3, 10, 3)
+        ma_group_layout.setSpacing(8)
+        ma_group_layout.addWidget(QLabel("均线"))
         self._ema9 = QCheckBox("EMA 15")
         self._ema9.setChecked(True)
         self._ema9.setToolTip("显示或隐藏 EMA 15 均线。")
         self._ema9.toggled.connect(self._sync_chart_options)
-        top_row.addWidget(self._ema9)
+        ma_group_layout.addWidget(self._ema9)
 
         self._ema21 = QCheckBox("SMA 50")
         self._ema21.setChecked(True)
         self._ema21.setToolTip("显示或隐藏 SMA 50 均线。")
         self._ema21.toggled.connect(self._sync_chart_options)
-        top_row.addWidget(self._ema21)
+        ma_group_layout.addWidget(self._ema21)
+        top_row.addWidget(ma_group, 0)
 
         shape_signal_tooltip = (
             "形态说明：1H/4H/1D 仅显示均线附近的形态信号。\n"
             "1H 只参考 SMA50；4H/1D 参考 EMA15 或 MA50。\n"
             "规则为形态K线加前2根K线中，至少有1根触碰或穿越对应均线。"
         )
+        shape_group = QFrame()
+        shape_group.setObjectName("ToolbarGroup")
+        shape_group.setStyleSheet(
+            """
+            QFrame#ToolbarGroup {
+                background: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-radius: 7px;
+            }
+            """
+        )
+        shape_group_layout = QHBoxLayout(shape_group)
+        shape_group_layout.setContentsMargins(10, 3, 10, 3)
+        shape_group_layout.setSpacing(8)
         shape_label = QLabel("形态")
         shape_label.setToolTip(shape_signal_tooltip)
-        top_row.addWidget(shape_label)
+        shape_group_layout.addWidget(shape_label)
 
         self._show_1h_shape_signal_check = QCheckBox("1H")
         self._show_1h_shape_signal_check.setChecked(True)
         self._show_1h_shape_signal_check.setToolTip(shape_signal_tooltip)
         self._show_1h_shape_signal_check.toggled.connect(self._sync_chart_options)
-        top_row.addWidget(self._show_1h_shape_signal_check)
+        shape_group_layout.addWidget(self._show_1h_shape_signal_check)
 
         self._show_4h_shape_signal_check = QCheckBox("4H")
         self._show_4h_shape_signal_check.setChecked(True)
         self._show_4h_shape_signal_check.setToolTip(shape_signal_tooltip)
         self._show_4h_shape_signal_check.toggled.connect(self._sync_chart_options)
-        top_row.addWidget(self._show_4h_shape_signal_check)
+        shape_group_layout.addWidget(self._show_4h_shape_signal_check)
 
         self._show_1d_shape_signal_check = QCheckBox("1D")
         self._show_1d_shape_signal_check.setChecked(True)
         self._show_1d_shape_signal_check.setToolTip(shape_signal_tooltip)
         self._show_1d_shape_signal_check.toggled.connect(self._sync_chart_options)
-        top_row.addWidget(self._show_1d_shape_signal_check)
+        shape_group_layout.addWidget(self._show_1d_shape_signal_check)
+        top_row.addWidget(shape_group, 0)
 
         self._status = QLabel("就绪")
         self._status.setObjectName("Subtle")
@@ -2972,19 +3170,15 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_period_combo.hide()
         self._secondary_period_combo.currentTextChanged.connect(self._on_secondary_period_changed)
 
-        self._secondary_layout_combo = QComboBox()
-        self._secondary_layout_combo.addItem("上下分屏", "vertical")
-        self._secondary_layout_combo.addItem("左右分屏", "horizontal")
-        self._secondary_layout_combo.setEnabled(False)
-        self._secondary_layout_combo.currentIndexChanged.connect(self._on_secondary_layout_changed)
-        action_row.addWidget(self._secondary_layout_combo)
+        self._secondary_layout_cycle_btn = QPushButton("")
+        self._secondary_layout_cycle_btn.setEnabled(False)
+        self._secondary_layout_cycle_btn.clicked.connect(self._on_secondary_layout_cycle_clicked)
+        action_row.addWidget(self._secondary_layout_cycle_btn)
 
-        self._secondary_chart_kind_combo = QComboBox()
-        self._secondary_chart_kind_combo.addItem("副图K线", "kline")
-        self._secondary_chart_kind_combo.addItem("BTC波动率", "volatility")
-        self._secondary_chart_kind_combo.setEnabled(False)
-        self._secondary_chart_kind_combo.currentIndexChanged.connect(self._on_secondary_chart_kind_changed)
-        action_row.addWidget(self._secondary_chart_kind_combo)
+        self._secondary_chart_kind_btn = QPushButton("")
+        self._secondary_chart_kind_btn.setEnabled(False)
+        self._secondary_chart_kind_btn.clicked.connect(self._on_secondary_chart_kind_cycle_clicked)
+        action_row.addWidget(self._secondary_chart_kind_btn)
 
         action_row.addSpacing(12)
         action_row.addWidget(QLabel("数量"))
@@ -3001,7 +3195,7 @@ class KlineAnalysisWindow(QMainWindow):
         action_row.addWidget(self._prefer_local_checkbox)
 
         self._secondary_average_kline_check = QCheckBox("平均K线")
-        self._secondary_average_kline_check.setEnabled(False)
+        self._secondary_average_kline_check.setToolTip("开启后，主图和副图都使用平均K线算法显示K线。")
         self._secondary_average_kline_check.toggled.connect(self._load_data)
         action_row.addWidget(self._secondary_average_kline_check)
         action_row.addStretch(1)
@@ -3017,9 +3211,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._auto_refresh_btn.toggled.connect(self._toggle_auto_refresh)
         action_row.addWidget(self._auto_refresh_btn)
 
-        reset_btn = QPushButton("重置视图")
-        reset_btn.clicked.connect(self._reset_chart_view)
-        action_row.addWidget(reset_btn)
+        self._chart_range_mode_btn = QPushButton("全量视图")
+        self._chart_range_mode_btn.clicked.connect(self._toggle_chart_view_range_mode)
+        action_row.addWidget(self._chart_range_mode_btn)
         header_layout.addLayout(action_row)
 
         parent_layout.addWidget(header)
@@ -3193,18 +3387,26 @@ class KlineAnalysisWindow(QMainWindow):
         self._splitter_default_applied = True
 
     def _secondary_chart_kind(self) -> str:
-        combo = getattr(self, "_secondary_chart_kind_combo", None)
-        if combo is None:
-            return "kline"
-        value = str(combo.currentData() or "kline").strip().lower()
+        value = str(self._secondary_chart_kind_mode or "kline").strip().lower()
         return value if value in {"kline", "volatility"} else "kline"
 
     def _secondary_layout_mode(self) -> str:
-        combo = getattr(self, "_secondary_layout_combo", None)
-        if combo is None:
-            return "vertical"
-        value = str(combo.currentData() or "vertical").strip().lower()
+        value = str(self._secondary_layout_mode_value or "vertical").strip().lower()
         return value if value in {"vertical", "horizontal"} else "vertical"
+
+    def _refresh_secondary_layout_button(self) -> None:
+        if self._secondary_layout_cycle_btn is None:
+            return
+        self._secondary_layout_cycle_btn.setText(
+            _next_secondary_layout_button_text(self._secondary_layout_mode())
+        )
+
+    def _refresh_secondary_chart_kind_button(self) -> None:
+        if self._secondary_chart_kind_btn is None:
+            return
+        self._secondary_chart_kind_btn.setText(
+            _next_secondary_chart_kind_button_text(self._secondary_chart_kind())
+        )
 
     def _secondary_display_symbol(self) -> str:
         if self._secondary_chart_kind() == "volatility":
@@ -3262,11 +3464,51 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _update_secondary_controls_state(self) -> None:
         enabled = bool(self._secondary_chart_check.isChecked())
-        is_volatility = self._secondary_chart_kind() == "volatility"
         self._secondary_period_combo.setEnabled(enabled)
-        self._secondary_layout_combo.setEnabled(enabled)
-        self._secondary_chart_kind_combo.setEnabled(enabled)
-        self._secondary_average_kline_check.setEnabled(enabled and is_volatility)
+        if self._secondary_layout_cycle_btn is not None:
+            self._secondary_layout_cycle_btn.setEnabled(enabled)
+        if self._secondary_chart_kind_btn is not None:
+            self._secondary_chart_kind_btn.setEnabled(enabled)
+        self._secondary_average_kline_check.setEnabled(True)
+        self._secondary_average_kline_check.setVisible(True)
+        self._refresh_secondary_layout_button()
+        self._refresh_secondary_chart_kind_button()
+
+    def _refresh_chart_mode_cycle_button(self) -> None:
+        if self._chart_mode_cycle_btn is None:
+            return
+        self._chart_mode_cycle_btn.setText("涓婁笅鍒嗗睆" if not self._secondary_chart_check.isChecked() else "缈婚噷K绾?")
+
+    @Slot()
+    def _on_chart_mode_cycle_clicked(self) -> None:
+        next_enabled = not self._secondary_chart_check.isChecked()
+        if next_enabled:
+            self._secondary_layout_mode_value = "vertical"
+            self._refresh_secondary_layout_button()
+        self._secondary_chart_check.setChecked(next_enabled)
+
+    @Slot()
+    def _on_secondary_layout_cycle_clicked(self) -> None:
+        self._secondary_layout_mode_value = (
+            "horizontal" if self._secondary_layout_mode() == "vertical" else "vertical"
+        )
+        self._refresh_secondary_layout_button()
+        self._apply_secondary_chart_layout()
+
+    @Slot()
+    def _on_secondary_chart_kind_cycle_clicked(self) -> None:
+        self._secondary_chart_kind_mode = (
+            "volatility" if self._secondary_chart_kind() == "kline" else "kline"
+        )
+        self._refresh_secondary_chart_kind_button()
+        if self._secondary_chart_kind() == "volatility":
+            current_period = self._secondary_period_combo.currentText().strip().upper()
+            if current_period not in {"1H", "4H", "1D"}:
+                self._secondary_period_combo.blockSignals(True)
+                self._secondary_period_combo.setCurrentText("1H")
+                self._secondary_period_combo.blockSignals(False)
+        if self._secondary_chart_check.isChecked():
+            self._load_data()
 
     def _apply_secondary_chart_layout(self) -> None:
         splitter = self._chart_stack_splitter
@@ -3294,6 +3536,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_chart_frame.setVisible(enabled)
         self._update_secondary_controls_state()
         self._apply_secondary_chart_layout()
+        self._refresh_chart_mode_cycle_button()
 
     def _active_period_value(self) -> str:
         if self._active_chart_target == "secondary" and self._secondary_chart_check.isChecked():
@@ -3409,6 +3652,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._period_combo.currentText().strip().upper(),
             max(50, self._limit_spin.value()),
             bool(self._prefer_local_checkbox.isChecked()),
+            bool(self._secondary_average_kline_check.isChecked()),
         )
 
     def _current_secondary_request_key(self, *, symbol: str | None = None) -> tuple[Any, ...] | None:
@@ -3432,6 +3676,7 @@ class KlineAnalysisWindow(QMainWindow):
             secondary_period,
             requested_limit,
             bool(self._prefer_local_checkbox.isChecked()),
+            bool(self._secondary_average_kline_check.isChecked()),
         )
 
     def _schedule_pending_reload_if_ready(self) -> None:
@@ -3444,6 +3689,7 @@ class KlineAnalysisWindow(QMainWindow):
     def _load_data(self) -> None:
         symbol = self._symbol_input.text().strip().upper()
         period = self._period_combo.currentText()
+        _debug_log(f"[kline] _load_data begin | symbol={symbol or '-'} | period={period or '-'}")
         if not symbol:
             self._set_status("请输入交易对")
             return
@@ -3473,6 +3719,7 @@ class KlineAnalysisWindow(QMainWindow):
             period=period,
             limit=requested_limit,
             local_only=self._prefer_local_checkbox.isChecked(),
+            average_kline=bool(self._secondary_average_kline_check.isChecked()),
             workspace_entry=workspace_entry,
         )
         self._loader.loaded.connect(self._on_data_loaded)
@@ -3521,6 +3768,7 @@ class KlineAnalysisWindow(QMainWindow):
             period=secondary_period,
             limit=requested_limit,
             local_only=self._prefer_local_checkbox.isChecked(),
+            average_kline=bool(self._secondary_average_kline_check.isChecked()),
             workspace_entry={},
             enable_alerts=False,
         )
@@ -3566,6 +3814,7 @@ class KlineAnalysisWindow(QMainWindow):
         else:
             self._refresh_chart_selection_visuals()
             self._sync_primary_period_buttons()
+        self._refresh_chart_mode_cycle_button()
         if enabled:
             self._load_data()
         else:
@@ -3580,23 +3829,11 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _on_secondary_layout_changed(self) -> None:
-        self._apply_secondary_chart_layout()
+        self._on_secondary_layout_cycle_clicked()
 
     @Slot()
     def _on_secondary_chart_kind_changed(self) -> None:
-        if self._secondary_chart_kind() == "volatility":
-            current_period = self._secondary_period_combo.currentText().strip().upper()
-            if current_period not in {"1H", "4H", "1D"}:
-                self._secondary_period_combo.blockSignals(True)
-                self._secondary_period_combo.setCurrentText("1H")
-                self._secondary_period_combo.blockSignals(False)
-        else:
-            self._secondary_chart_status_text = ""
-            if self._primary_chart_status_text:
-                self._set_status(f"主图：{self._primary_chart_status_text}")
-        self._update_secondary_controls_state()
-        if self._secondary_chart_check.isChecked():
-            self._load_data()
+        self._on_secondary_chart_kind_cycle_clicked()
 
     @Slot(str)
     def _on_secondary_period_changed(self, _value: str) -> None:
@@ -3750,25 +3987,43 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _reset_chart_view(self) -> None:
-        if self._use_native_chart:
-            if self._deferred_chart_payload is not None:
-                if self._deferred_chart_render_timer.isActive():
-                    self._deferred_chart_render_timer.stop()
-                payload = self._deferred_chart_payload
-                self._deferred_chart_payload = None
-                self._deferred_chart_request_id = 0
-                self._render_to_native_chart(payload)
-                self._native_chart_bootstrap_complete = True
-            if isinstance(self._native_chart_view, InteractiveKlineChartView):
-                self._native_chart_view.reset_view()
-            elif self._pending_payload is not None:
-                self._render_to_native_chart(self._pending_payload)
-            if isinstance(self._secondary_native_chart_view, InteractiveKlineChartView):
-                self._sync_secondary_chart_range_from_primary()
-            elif self._secondary_pending_payload is not None:
-                self._render_secondary_chart(self._secondary_pending_payload)
+        self._apply_chart_view_range()
+
+    def _chart_view_range_is_full(self) -> bool:
+        return self._chart_view_range_mode == "full"
+
+    def _set_chart_view_range_mode(self, mode: str) -> None:
+        normalized = str(mode).strip().lower()
+        self._chart_view_range_mode = "full" if normalized == "full" else "recent"
+        self._refresh_chart_view_range_button()
+
+    def _refresh_chart_view_range_button(self) -> None:
+        if self._chart_range_mode_btn is None:
             return
-        self._run_js("window.resetChartView();")
+        self._chart_range_mode_btn.setText("最近视图" if self._chart_view_range_is_full() else "全量视图")
+        self._chart_range_mode_btn.setToolTip("切换图表显示范围（近期视图/全量视图）")
+
+    @Slot()
+    def _toggle_chart_view_range_mode(self) -> None:
+        self._set_chart_view_range_mode("full" if self._chart_view_range_mode == "recent" else "recent")
+        self._apply_chart_view_range()
+
+    def _apply_chart_view_range(self) -> None:
+        if self._use_native_chart:
+            if isinstance(self._native_chart_view, InteractiveKlineChartView):
+                if self._chart_view_range_is_full():
+                    self._native_chart_view.set_full_view_range()
+                else:
+                    self._native_chart_view.set_recent_view_range()
+            if (
+                self._secondary_chart_check.isChecked()
+                and isinstance(self._secondary_native_chart_view, InteractiveKlineChartView)
+            ):
+                self._sync_secondary_chart_range_from_primary()
+            return
+        self._run_js(
+            f"if (typeof window.applyChartViewMode === 'function') {{ window.applyChartViewMode({json.dumps(self._chart_view_range_mode)}); }}"
+        )
 
     @Slot()
     def _sync_chart_options(self) -> None:
@@ -4828,7 +5083,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._set_status(f"{self._status.text()} | 最新K线：{dt}")
 
     def _chart_html(self) -> str:
-        return """
+        html = """
             <!doctype html>
             <html lang="en">
             <head>
@@ -4895,6 +5150,8 @@ class KlineAnalysisWindow(QMainWindow):
                 let volumeSeries = null;
                 let trendByTime = {};
                 let signalByTime = {};
+                let currentCandles = [];
+                const chartRecentVisibleBars = __RECENT_VIEW_BARS__;
 
                 function toTooltipText(time, payload, trendPayload) {
                   if (!time || !payload) {
@@ -5070,6 +5327,33 @@ class KlineAnalysisWindow(QMainWindow):
                   trendSeries.setData(trendPoints);
                 }
 
+                function _resolveRecentRange(candles) {
+                  if (!Array.isArray(candles) || candles.length === 0) return null;
+                  const safeBars = Number(chartRecentVisibleBars);
+                  const visibleBars = Number.isFinite(safeBars) ? Math.max(1, Math.floor(safeBars)) : __RECENT_VIEW_BARS__;
+                  const span = Math.min(visibleBars, candles.length);
+                  const to = Number(candles[candles.length - 1]?.time);
+                  const from = Number(candles[Math.max(0, candles.length - span)]?.time);
+                  if (!Number.isFinite(to) || !Number.isFinite(from)) return null;
+                  return { from, to };
+                }
+
+                function applyChartViewMode(mode) {
+                  if (!chart || !candlestickSeries) return;
+                  const normalized = String(mode || window.__chartViewMode || "recent").trim().toLowerCase();
+                  window.__chartViewMode = normalized === "full" ? "full" : "recent";
+                  if (window.__chartViewMode === "full") {
+                    chart.timeScale().fitContent();
+                    return;
+                  }
+                  const range = _resolveRecentRange(currentCandles);
+                  if (!range) {
+                    chart.timeScale().fitContent();
+                    return;
+                  }
+                  chart.timeScale().setVisibleRange({ from: range.from, to: range.to });
+                }
+
                 function applyChartData(payload) {
                   try {
                     ensureChart();
@@ -5079,6 +5363,7 @@ class KlineAnalysisWindow(QMainWindow):
                     const safePayload = payload || {};
                     window.__chartPeriod = safePayload.period || '';
                     const candles = Array.isArray(safePayload.candles) ? safePayload.candles : [];
+                    currentCandles = candles;
                     candlestickSeries.setData(candles);
                     const signalMarkers = Array.isArray(safePayload.signals)
                       ? safePayload.signals.map((item) => ({
@@ -5125,7 +5410,7 @@ class KlineAnalysisWindow(QMainWindow):
                       safePayload.show?.ema21,
                       { color: '#58c66d', lineWidth: 3, title: 'SMA 50', priceLineVisible: false, lastValueVisible: false }
                     );
-                    chart.timeScale().fitContent();
+                    applyChartViewMode(window.__chartViewMode || 'recent');
                   } catch (error) {
                     if (window.console && window.console.error) {
                       window.console.error('[applyChartData]', error);
@@ -5172,7 +5457,8 @@ class KlineAnalysisWindow(QMainWindow):
                     fallback.style.display = 'flex';
                   }
                 }
-              </script>
+            </script>
             </body>
             </html>
-        """
+            """
+        return html.replace("__RECENT_VIEW_BARS__", str(_RECENT_VIEW_BARS))

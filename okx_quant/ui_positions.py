@@ -6039,6 +6039,11 @@ class UiPositionsMixin:
             f"开仓均价={format_decimal(entry)} | 数量={size_text} | R价差={format_decimal(r_spread)} | "
             f"止损触发={format_decimal(sl_px)} | algoId={algo_id or '-'} | algoClOrdId={algo_cl or '-'}"
         )
+        self._enqueue_log(
+            f"{log_prefix} 接管参数 | ordId={filled.ord_id} | openSide={open_side} | closeSide={close_side} | "
+            f"posSide={pos_side or '-'} | sz={format_decimal(sz)} | 模板={record.strategy_name} | "
+            f"triggerType={config.tp_sl_trigger_type} | bar={config.bar}"
+        )
 
     def open_takeover_from_selected_conditional_order(self) -> None:
         """从「当前委托」选中的条件/触发类算法止损单出发，反查持仓、核对数量后启动交易所动态止盈接管。"""
@@ -6075,6 +6080,13 @@ class UiPositionsMixin:
             return
         algo_id = (item.algo_id or "").strip() or None
         algo_cl = (item.algo_client_order_id or "").strip() or None
+        profile_name = (self._positions_context_profile_name or self._current_credential_profile()).strip() or "-"
+        self._enqueue_log(
+            f"[{profile_name}] [条件单接管] 用户点击接管 | instId={getattr(item, 'inst_id', '') or '-'} | "
+            f"ordType={getattr(item, 'ord_type', '') or '-'} | sourceKind={getattr(item, 'source_kind', '') or '-'} | "
+            f"algoId={algo_id or '-'} | algoClOrdId={algo_cl or '-'} | triggerPx={format_decimal(sl_px)} | "
+            f"size={format_decimal(getattr(item, 'size', None) or Decimal('0'))}"
+        )
         if not algo_id and not algo_cl:
             messagebox.showerror(
                 "从条件单接管动态止盈",
@@ -6100,6 +6112,10 @@ class UiPositionsMixin:
             )
             return
         position, entry = found
+        self._enqueue_log(
+            f"[{profile_name}] [条件单接管] 已匹配持仓 | instId={position.inst_id} | posSide={position.pos_side or '-'} | "
+            f"direction={derive_position_direction(position)} | entry={format_decimal(entry)} | triggerPx={format_decimal(sl_px)}"
+        )
 
         inst_kind = infer_inst_type(position.inst_id)
         if inst_kind not in {"SWAP", "FUTURES"}:
@@ -6115,6 +6131,10 @@ class UiPositionsMixin:
         except Exception as exc:
             messagebox.showerror("从条件单接管动态止盈", f"读取主界面策略模板失败：{exc}", parent=parent)
             return
+        self._enqueue_log(
+            f"[{profile_name or '-'}] [条件单接管] 模板确认 | template={record.strategy_name} | instId={position.inst_id} | "
+            f"triggerType={getattr(record, 'tp_sl_trigger_type', '-') or '-'} | bar={getattr(record, 'bar', '-') or '-'}"
+        )
         env_label = self._environment_label_for_profile(profile_name or self._current_credential_profile())
         desk_env = ENV_OPTIONS[self._normalized_environment_label(env_label)]
         position_mode = (
@@ -6186,6 +6206,10 @@ class UiPositionsMixin:
             messagebox.showinfo("接管动态止盈", "当前仅支持永续或交割合约持仓。", parent=parent)
             return
         profile_name = (self._positions_context_profile_name or self._current_credential_profile()).strip()
+        self._enqueue_log(
+            f"[{profile_name or '-'}] [position_takeover_entry] click | "
+            f"instId={getattr(position, 'inst_id', '') or '-'} | posSide={getattr(position, 'pos_side', '') or '-'}"
+        )
         credentials = self._credentials_for_profile_or_none(profile_name)
         if credentials is None:
             messagebox.showerror("接管动态止盈", "当前 API 未配置有效凭证。", parent=parent)

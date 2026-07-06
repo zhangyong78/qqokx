@@ -2,6 +2,7 @@ from unittest import TestCase
 
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
+    STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
     STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
@@ -74,6 +75,10 @@ class StrategyRuntimeRegistryTest(TestCase):
         self.assertEqual(pullback_short_profile.family, "ema15_ma50_pullback_short")
         self.assertFalse(pullback_short_profile.supports_exchange_trade)
 
+        dual_pullback_profile = get_strategy_runtime_profile(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID)
+        self.assertEqual(dual_pullback_profile.family, "ema15_ma50_pullback_dual")
+        self.assertFalse(dual_pullback_profile.supports_exchange_trade)
+
     def test_entry_reference_captions_follow_runtime_family(self) -> None:
         self.assertEqual(strategy_entry_reference_caption(STRATEGY_DYNAMIC_LONG_ID), "挂单参考线")
         self.assertEqual(strategy_entry_reference_caption(STRATEGY_EMA_BREAKOUT_LONG_ID), "突破参考线")
@@ -107,6 +112,9 @@ class StrategyRuntimeRegistryTest(TestCase):
         self.assertEqual(strategy_preferred_direction(STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID, "both"), "long")
         self.assertEqual(strategy_preferred_direction(STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID, "both"), "long")
         self.assertEqual(strategy_preferred_direction(STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID, "both"), "short")
+        self.assertIsNone(strategy_preferred_direction(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "both"))
+        self.assertEqual(strategy_preferred_direction(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "long_only"), "long")
+        self.assertEqual(strategy_preferred_direction(STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID, "short_only"), "short")
         self.assertIsNone(strategy_preferred_direction(STRATEGY_EMA5_EMA8_ID, "both"))
 
     def test_cross_helpers_and_signal_extrema_flags_follow_runtime_profile(self) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from okx_quant.models import Instrument
 from roll_terminal_qt.account_service import FuturesPositionView
@@ -100,9 +100,65 @@ class _TableStub:
         return self._rows[row][column]
 
 
+class _RuntimeThreadStub:
+    def __init__(self, *, running: bool = True) -> None:
+        self._running = running
+        self.disconnected = False
+        self.stopped = False
+        self.waits: list[int] = []
+        self.terminated = False
+
+    def disconnect(self) -> None:
+        self.disconnected = True
+
+    def isRunning(self) -> bool:
+        return self._running
+
+    def stop(self) -> None:
+        self.stopped = True
+        self._running = False
+
+    def wait(self, wait_ms: int) -> bool:
+        self.waits.append(wait_ms)
+        return True
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self._running = False
+
+
 class RollTerminalUiTests(unittest.TestCase):
     def _build_window(self) -> RollTerminalWindow:
         return RollTerminalWindow.__new__(RollTerminalWindow)
+
+    def test_runtime_thread_callback_ignores_stale_generation(self) -> None:
+        window = self._build_window()
+        window._runtime_thread_generation = 2
+        callback = MagicMock()
+
+        window._run_runtime_thread_callback(1, callback, "old")
+        window._run_runtime_thread_callback(2, callback, "new")
+
+        callback.assert_called_once_with("new")
+
+    def test_stop_runtime_threads_invalidates_and_disconnects_runtime_threads(self) -> None:
+        window = self._build_window()
+        window._runtime_thread_generation = 0
+        window._private_threads_started = True
+        window._feed = _RuntimeThreadStub()
+        window._account_feed = _RuntimeThreadStub()
+        window._order_feed = _RuntimeThreadStub()
+
+        window._stop_runtime_threads()
+
+        self.assertEqual(window._runtime_thread_generation, 1)
+        self.assertFalse(window._private_threads_started)
+        self.assertTrue(window._feed.disconnected)
+        self.assertTrue(window._account_feed.disconnected)
+        self.assertTrue(window._order_feed.disconnected)
+        self.assertTrue(window._feed.stopped)
+        self.assertTrue(window._account_feed.stopped)
+        self.assertTrue(window._order_feed.stopped)
 
     def test_default_open_qty_text_uses_requested_defaults(self) -> None:
         window = self._build_window()
