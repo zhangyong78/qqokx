@@ -957,33 +957,32 @@ class CandlestickChartView(QChartView):
         self._hide_hover_overlays()
 
     def show_message(self, message: str) -> None:
+        self._clear_chart_context()
         chart = self.chart()
         chart.removeAllSeries()
         for axis in chart.axes():
             chart.removeAxis(axis)
         chart.setTitle(message)
-        self._candles = []
-        self._hover_pos = None
         self._chart_title = message
+
+    def _clear_chart_context(self) -> None:
         self._axis_x = None
         self._axis_y = None
+        self._candles = []
+        self._hover_pos = None
         self._pan_anchor_x = None
         self._linked_hover_index = None
         self._linked_hover_y_ratio = None
         self._hide_hover_overlays()
+        self.viewport().update()
 
     def set_candles(self, *, title: str, candles: list[Candle], hide_wicks: bool = False) -> None:
         if not candles:
             self.show_message(title)
             return
-        self._candles = list(candles)
-        self._hover_pos = None
-        self._pan_anchor_x = None
-        self._linked_hover_index = None
-        self._linked_hover_y_ratio = None
-        self._hide_hover_overlays()
         self._hide_wicks = hide_wicks
         self._chart_title = title
+        self._clear_chart_context()
         chart = self.chart()
         chart.removeAllSeries()
         for axis in chart.axes():
@@ -1046,6 +1045,7 @@ class CandlestickChartView(QChartView):
         down_series.attachAxis(axis_y)
         self._axis_x = axis_x
         self._axis_y = axis_y
+        self._candles = list(candles)
         self._full_x_min_ms = float(candles[0].ts)
         self._full_x_max_ms = float(candles[-1].ts)
         self._full_y_min = float(min_price)

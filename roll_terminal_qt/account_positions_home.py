@@ -6,6 +6,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta
 from decimal import Decimal
 from tkinter import Tk
@@ -69,6 +70,7 @@ from okx_quant.position_protection import (
     derive_position_direction,
     describe_protection_price_logic,
     infer_default_spot_inst_id,
+    infer_protection_profit_on_rise,
     normalize_spot_inst_id,
 )
 from okx_quant.pricing import format_decimal, snap_to_increment
@@ -981,12 +983,11 @@ class PositionProtectionDialog(QDialog):
         self.resize(1080, 760)
 
         self._build_ui()
-        self._refresh_from_selection(force=True)
-        self._refresh_sessions()
+        self._safe_refresh_from_selection(force=True, context="init")
+        self._safe_refresh_sessions(context="init")
 
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.timeout.connect(self._refresh_sessions)
-        self._refresh_timer.timeout.connect(lambda: self._refresh_from_selection(force=False))
+        self._refresh_timer.timeout.connect(self._on_refresh_timer_timeout)
         self._refresh_timer.start(1200)
 
     def _build_ui(self) -> None:
@@ -1016,7 +1017,7 @@ class PositionProtectionDialog(QDialog):
         self._trigger_combo = QComboBox()
         for label in PROTECTION_TRIGGER_SOURCE_OPTIONS:
             self._trigger_combo.addItem(label)
-        self._trigger_combo.currentIndexChanged.connect(self._on_trigger_source_changed)
+        self._trigger_combo.currentIndexChanged.connect(self._safe_handle_trigger_source_changed)
 
         self._spot_symbol_edit = QLineEdit()
         self._tp_trigger_edit = QLineEdit()
@@ -1026,8 +1027,8 @@ class PositionProtectionDialog(QDialog):
         for label in PROTECTION_ORDER_MODE_OPTIONS:
             self._tp_mode_combo.addItem(label)
             self._sl_mode_combo.addItem(label)
-        self._tp_mode_combo.currentIndexChanged.connect(self._refresh_order_mode_widgets)
-        self._sl_mode_combo.currentIndexChanged.connect(self._refresh_order_mode_widgets)
+        self._tp_mode_combo.currentIndexChanged.connect(self._safe_handle_order_mode_changed)
+        self._sl_mode_combo.currentIndexChanged.connect(self._safe_handle_order_mode_changed)
         self._tp_price_edit = QLineEdit()
         self._sl_price_edit = QLineEdit()
         self._tp_slippage_edit = QLineEdit("0")
@@ -1107,7 +1108,7 @@ class PositionProtectionDialog(QDialog):
         self._sessions_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._sessions_table.verticalHeader().setVisible(False)
         self._configure_sessions_table_columns(len(session_headers))
-        self._sessions_table.itemSelectionChanged.connect(self._refresh_selected_session_detail)
+        self._sessions_table.itemSelectionChanged.connect(self._safe_handle_selected_session_detail_changed)
         sessions_layout.addWidget(self._sessions_table, 1)
         bottom_split.addWidget(sessions_panel)
 
@@ -1145,6 +1146,67 @@ class PositionProtectionDialog(QDialog):
             self._sessions_table.setColumnWidth(column, width)
         self._sessions_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
+    def _report_refresh_exception(self, context: str, exc: Exception) -> None:
+        message = f"期权保护窗口刷新异常（{context}）：{exc}"
+        append_log_line(f"[期权保护窗口] {message}")
+        trace_text = traceback.format_exc().strip()
+        if trace_text:
+            for line in trace_text.splitlines():
+                append_log_line(f"[期权保护窗口] {line}")
+        if hasattr(self, "_session_status_label"):
+            self._session_status_label.setText("期权保护窗口刷新异常，请重新打开后重试。")
+        if hasattr(self, "_detail_text"):
+            self._detail_text.setPlainText(message)
+
+    def _safe_refresh_sessions(self, *, context: str) -> bool:
+        try:
+            self._refresh_sessions()
+            return True
+        except Exception as exc:
+            self._report_refresh_exception(context, exc)
+            return False
+
+    def _safe_refresh_from_selection(self, *, force: bool, context: str) -> bool:
+        try:
+            self._refresh_from_selection(force=force)
+            return True
+        except Exception as exc:
+            self._report_refresh_exception(context, exc)
+            return False
+
+    def _safe_refresh_selected_session_detail(self, *, context: str) -> bool:
+        try:
+            self._refresh_selected_session_detail()
+            return True
+        except Exception as exc:
+            self._report_refresh_exception(context, exc)
+            return False
+
+    @Slot()
+    def _safe_handle_selected_session_detail_changed(self) -> None:
+        self._safe_refresh_selected_session_detail(context="selection")
+
+    @Slot()
+    def _safe_handle_trigger_source_changed(self) -> None:
+        try:
+            self._on_trigger_source_changed()
+            if PROTECTION_TRIGGER_SOURCE_OPTIONS.get(self._trigger_combo.currentText(), "option_mark") == "spot_last":
+                self._maybe_autofill_spot_trigger_prices()
+        except Exception as exc:
+            self._report_refresh_exception("trigger_source", exc)
+
+    @Slot()
+    def _safe_handle_order_mode_changed(self) -> None:
+        try:
+            self._refresh_order_mode_widgets()
+        except Exception as exc:
+            self._report_refresh_exception("order_mode", exc)
+
+    @Slot()
+    def _on_refresh_timer_timeout(self) -> None:
+        self._safe_refresh_sessions(context="timer")
+        self._safe_refresh_from_selection(force=False, context="timer")
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._refresh_timer.stop()
         super().closeEvent(event)
@@ -1155,20 +1217,22 @@ class PositionProtectionDialog(QDialog):
         super().showEvent(event)
 
     def _current_position(self) -> OkxPosition | None:
-        current = self._selected_option_provider()
+        try:
+            current = self._selected_option_provider()
+        except Exception as exc:
+            self._report_refresh_exception("selected_option_provider", exc)
+            current = None
         if current is not None:
             self._selected_position = current
             return current
         return self._selected_position
 
     def _refresh_from_selection(self, *, force: bool) -> None:
-        position = self._selected_option_provider()
+        position = self._current_position()
         if position is None and self._selected_position is None:
             self._title_label.setText("请先在当前持仓里选中一条期权仓位。")
             self._logic_hint.setText("保护逻辑会跟随上方选中的期权仓位。")
             return
-        if position is None:
-            position = self._selected_position
         if position is None:
             return
         self._selected_position = position
@@ -1215,6 +1279,32 @@ class PositionProtectionDialog(QDialog):
             )
         )
 
+    def _maybe_autofill_spot_trigger_prices(self) -> None:
+        tp_blank = not self._tp_trigger_edit.text().strip()
+        sl_blank = not self._sl_trigger_edit.text().strip()
+        if not tp_blank and not sl_blank:
+            return
+        position = self._current_position()
+        if position is None:
+            return
+        trigger_inst_id = normalize_spot_inst_id(self._spot_symbol_edit.text()) or infer_default_spot_inst_id(position.inst_id)
+        if not trigger_inst_id:
+            return
+        current_price = self._client.get_trigger_price(trigger_inst_id, "last")
+        offset = Decimal("200")
+        profit_on_rise = infer_protection_profit_on_rise(
+            option_inst_id=position.inst_id,
+            direction=derive_position_direction(position),
+            trigger_inst_id=trigger_inst_id,
+            trigger_price_type="last",
+        )
+        take_profit_price = current_price + offset if profit_on_rise else current_price - offset
+        stop_loss_price = current_price - offset if profit_on_rise else current_price + offset
+        if tp_blank:
+            self._tp_trigger_edit.setText(format_decimal(take_profit_price))
+        if sl_blank:
+            self._sl_trigger_edit.setText(format_decimal(stop_loss_price))
+
     def _refresh_order_mode_widgets(self) -> None:
         self._sync_order_mode_widgets(mode_label=self._tp_mode_combo.currentText(), price_edit=self._tp_price_edit, slippage_edit=self._tp_slippage_edit, key="tp")
         self._sync_order_mode_widgets(mode_label=self._sl_mode_combo.currentText(), price_edit=self._sl_price_edit, slippage_edit=self._sl_slippage_edit, key="sl")
@@ -1249,7 +1339,7 @@ class PositionProtectionDialog(QDialog):
             self._manager.set_notifier(self._notifier_provider() if self._notifier_provider is not None else None)
             config = self._build_strategy_config(runtime=runtime, position=position, protection=protection)
             self._manager.start(runtime.credentials, config, protection)
-            self._refresh_sessions()
+            self._safe_refresh_sessions(context="start")
         except Exception as exc:
             QMessageBox.critical(self, "启动保护失败", str(exc))
 
@@ -1266,7 +1356,7 @@ class PositionProtectionDialog(QDialog):
 
     def _clear_finished_position_protections(self) -> None:
         cleared = self._manager.clear_finished()
-        self._refresh_sessions()
+        self._safe_refresh_sessions(context="clear_finished")
         if cleared <= 0:
             QMessageBox.information(self, "提示", "当前没有可清理的已结束任务。")
 
@@ -1434,10 +1524,8 @@ class PositionProtectionDialog(QDialog):
                 detail_lines.extend(["", f"异常原因：{last_message}"])
                 previous_message = self._last_abnormal_protection_alert.get(session.session_id, "")
                 if previous_message != last_message:
-                    QMessageBox.warning(
-                        self,
-                        "期权保护异常",
-                        f"保护任务 {session.session_id} 进入异常状态，请关注。\n\n{last_message}",
+                    append_log_line(
+                        f"[期权保护窗口] 保护任务 {session.session_id} 进入异常状态，请关注。{last_message}"
                     )
                     self._last_abnormal_protection_alert[session.session_id] = last_message
             else:
@@ -3328,7 +3416,7 @@ class AccountPositionsHomeWidget(QWidget):
             )
             self._protection_dialog.setWindowFlag(Qt.WindowType.Window, True)
             self._protection_dialog.destroyed.connect(lambda *_args: setattr(self, "_protection_dialog", None))
-        self._protection_dialog._refresh_from_selection(force=True)
+        self._protection_dialog._safe_refresh_from_selection(force=True, context="open_dialog")
         self._protection_dialog.show()
         self._protection_dialog.raise_()
         self._protection_dialog.activateWindow()

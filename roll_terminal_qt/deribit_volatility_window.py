@@ -294,13 +294,17 @@ class LinkedCandlestickChartView(QChartView):
     ) -> None:
         self._title = title
         self._empty_message = empty_message
-        self._candles = list(candles)
         self._line_overlays = list(line_overlays or [])
+        self._clear_interaction_context()
+        self._render_chart(candles)
+
+    def _clear_interaction_context(self) -> None:
+        self._candles = []
         self._hover_pos = None
         self._linked_hover_index = None
         self._linked_hover_y_ratio = None
         self._hide_hover_overlays()
-        self._render_chart(candles)
+        self.viewport().update()
 
     def reset_view(self) -> None:
         self.reset_requested.emit()
@@ -623,6 +627,8 @@ class LinkedCandlestickChartView(QChartView):
         self.chart().addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
         for series in self.chart().series():
             _attach_series_to_axes_once(series, axis_x, axis_y)
+        self._candles = list(candles)
+        self.viewport().update()
 
     def _nearest_candle_index(self, x: float, plot: QRectF) -> int:
         if not self._candles:

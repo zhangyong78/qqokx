@@ -1647,6 +1647,26 @@ if QChartView is not None:
             self._hide_hover_overlays()
             self.viewport().update()
 
+        def clear_chart_context(self) -> None:
+            self._axis_x = None
+            self._axis_y = None
+            self._candles = []
+            self._overlay_values = []
+            self._trend_indicators = []
+            self._display_times_ms = []
+            self._indicator_series = []
+            self._chart_note_lines = []
+            self._workspace_lines = []
+            self._signal_markers = []
+            self._box_overlays = []
+            self._hover_pos = None
+            self._press_pos = None
+            self._pan_anchor_x = None
+            self._dragging = False
+            self._external_hover_time = None
+            self._hide_hover_overlays()
+            self.viewport().update()
+
         def reset_view(self) -> None:
             if self._axis_x is None:
                 return
@@ -4651,6 +4671,7 @@ class KlineAnalysisWindow(QMainWindow):
         restore_state = None
         if isinstance(chart_view, InteractiveKlineChartView):
             restore_state = chart_view.capture_view_state()
+            chart_view.clear_chart_context()
 
         chart.removeAllSeries()
         for axis in list(chart.axes()):

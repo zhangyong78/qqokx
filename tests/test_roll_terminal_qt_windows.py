@@ -14,6 +14,7 @@ from unittest.mock import patch
 from PySide6.QtCharts import QChart, QLineSeries, QValueAxis
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox, QPushButton, QSizePolicy
+from okx_quant.models import Candle
 from okx_quant.persistence import (
     build_profile_switch_password_snapshot,
     load_kline_analysis_workspace_entries,
@@ -23,6 +24,7 @@ from tests.qt_test_case import QtWidgetTestCase
 from roll_terminal_qt.auto_channel_window import _safe_text as auto_safe_text
 from roll_terminal_qt.deribit_volatility_window import (
     DeribitVolatilityQtWindow,
+    LinkedCandlestickChartView,
     _attach_series_to_axes_once,
     _build_moving_average_series,
 )
@@ -37,6 +39,7 @@ from roll_terminal_qt.line_trading_window import (
 from roll_terminal_qt.line_trading_core import LineAnnotation, RiskRewardAnnotation
 from roll_terminal_qt.profile_access import profile_requires_password
 from roll_terminal_qt.smart_order_window import _safe_text as smart_safe_text
+from roll_terminal_qt.option_strategy_window import CandlestickChartView
 from roll_terminal_qt.smart_order_window import (
     SMART_ORDER_COMPACT_ROOT_MARGINS,
     SMART_ORDER_COMPACT_SPLITTER_SIZES,
@@ -1758,6 +1761,166 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 self.assertTrue(secondary_key[-1])
             finally:
                 self.__class__.dispose_widget(window)
+
+    def test_kline_native_render_clears_old_view_context_before_chart_rebuild(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window._prefer_native_chart_backend", return_value=True),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                chart = window._native_chart
+                chart_view = window._native_chart_view
+                self.assertIsNotNone(chart)
+                self.assertIsNotNone(chart_view)
+
+                chart_view._axis_x = object()
+                chart_view._axis_y = object()
+                chart_view._candles = [{"time": 1, "open": 100.0, "high": 110.0, "low": 90.0, "close": 105.0, "volume": 1.0}]
+                chart_view.capture_view_state = lambda: None
+
+                payload = KlineChartPayload(
+                    candles=[
+                        {"time": 1, "open": 100.0, "high": 110.0, "low": 90.0, "close": 105.0, "volume": 1.0},
+                        {"time": 2, "open": 105.0, "high": 112.0, "low": 101.0, "close": 108.0, "volume": 2.0},
+                    ],
+                    ema_9=[],
+                    ema_21=[],
+                    ema_55=[],
+                    trend_indicator=[],
+                    signal_markers=[],
+                    box_overlays=[],
+                    raw_candles=[],
+                    stats={},
+                    alert_snapshot=None,
+                )
+
+                original_remove_all_series = chart.removeAllSeries
+
+                def remove_all_series_guard() -> None:
+                    self.assertIsNone(chart_view._axis_x)
+                    self.assertIsNone(chart_view._axis_y)
+                    self.assertEqual(chart_view._candles, [])
+                    original_remove_all_series()
+
+                with patch.object(chart, "removeAllSeries", side_effect=remove_all_series_guard):
+                    window._render_native_chart_target(
+                        chart=chart,
+                        chart_view=chart_view,
+                        payload=payload,
+                        period="1D",
+                        title_suffix="主图",
+                        include_workspace_lines=False,
+                        is_secondary=False,
+                    )
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_deribit_linked_chart_clears_state_before_chart_rebuild(self) -> None:
+        view = LinkedCandlestickChartView(percent_axis=False)
+        try:
+            view._candles = [
+                Candle(
+                    ts=1,
+                    open=Decimal("100"),
+                    high=Decimal("110"),
+                    low=Decimal("90"),
+                    close=Decimal("105"),
+                    volume=Decimal("1"),
+                    confirmed=True,
+                )
+            ]
+            view._hover_pos = object()
+            view._linked_hover_index = 0
+            view._linked_hover_y_ratio = 0.5
+            original_remove_all_series = view.chart().removeAllSeries
+
+            def remove_all_series_guard() -> None:
+                self.assertEqual(view._candles, [])
+                self.assertIsNone(view._hover_pos)
+                self.assertIsNone(view._linked_hover_index)
+                self.assertIsNone(view._linked_hover_y_ratio)
+                original_remove_all_series()
+
+            candles = [
+                Candle(
+                    ts=1_700_000_000_000,
+                    open=Decimal("100"),
+                    high=Decimal("110"),
+                    low=Decimal("90"),
+                    close=Decimal("105"),
+                    volume=Decimal("1"),
+                    confirmed=True,
+                ),
+                Candle(
+                    ts=1_700_003_600_000,
+                    open=Decimal("105"),
+                    high=Decimal("112"),
+                    low=Decimal("101"),
+                    close=Decimal("108"),
+                    volume=Decimal("2"),
+                    confirmed=True,
+                ),
+            ]
+            with patch.object(view.chart(), "removeAllSeries", side_effect=remove_all_series_guard):
+                view.set_chart_payload(title="test", candles=candles, empty_message="empty")
+        finally:
+            self.__class__.dispose_widget(view)
+
+    def test_option_candlestick_chart_clears_state_before_chart_rebuild(self) -> None:
+        view = CandlestickChartView()
+        try:
+            view._axis_x = object()
+            view._axis_y = object()
+            view._candles = [
+                Candle(
+                    ts=1,
+                    open=Decimal("100"),
+                    high=Decimal("110"),
+                    low=Decimal("90"),
+                    close=Decimal("105"),
+                    volume=Decimal("1"),
+                    confirmed=True,
+                )
+            ]
+            view._hover_pos = object()
+            view._linked_hover_index = 0
+            view._linked_hover_y_ratio = 0.5
+            original_remove_all_series = view.chart().removeAllSeries
+
+            def remove_all_series_guard() -> None:
+                self.assertIsNone(view._axis_x)
+                self.assertIsNone(view._axis_y)
+                self.assertEqual(view._candles, [])
+                self.assertIsNone(view._hover_pos)
+                self.assertIsNone(view._linked_hover_index)
+                self.assertIsNone(view._linked_hover_y_ratio)
+                original_remove_all_series()
+
+            candles = [
+                Candle(
+                    ts=1_700_000_000_000,
+                    open=Decimal("100"),
+                    high=Decimal("110"),
+                    low=Decimal("90"),
+                    close=Decimal("105"),
+                    volume=Decimal("1"),
+                    confirmed=True,
+                ),
+                Candle(
+                    ts=1_700_003_600_000,
+                    open=Decimal("105"),
+                    high=Decimal("112"),
+                    low=Decimal("101"),
+                    close=Decimal("108"),
+                    volume=Decimal("2"),
+                    confirmed=True,
+                ),
+            ]
+            with patch.object(view.chart(), "removeAllSeries", side_effect=remove_all_series_guard):
+                view.set_candles(title="test", candles=candles)
+        finally:
+            self.__class__.dispose_widget(view)
 
     def test_deribit_overlay_moving_average_series_keeps_length_and_ma50_warmup(self) -> None:
         closes = [Decimal(str(value)) for value in range(1, 61)]

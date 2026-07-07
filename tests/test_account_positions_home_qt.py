@@ -115,7 +115,6 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         runtime = SimpleNamespace(credentials=SimpleNamespace(name="credentials"))
         position = SimpleNamespace(inst_type="OPTION")
         manager = SimpleNamespace(set_notifier=MagicMock(), start=MagicMock())
-        refresh_sessions = MagicMock()
         dialog = SimpleNamespace(
             _runtime_provider=lambda: runtime,
             _current_position=lambda: position,
@@ -124,14 +123,14 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
             _notifier_provider=lambda: notifier,
             _build_strategy_config=lambda **kwargs: "strategy-config",
             _manager=manager,
-            _refresh_sessions=refresh_sessions,
+            _safe_refresh_sessions=MagicMock(),
         )
 
         PositionProtectionDialog._start_selected_position_protection(dialog)
 
         manager.set_notifier.assert_called_once_with(notifier)
         manager.start.assert_called_once_with(runtime.credentials, "strategy-config", protection)
-        refresh_sessions.assert_called_once_with()
+        dialog._safe_refresh_sessions.assert_called_once_with(context="start")
         validate_live_price.assert_called_once_with(dialog._client, protection, position)
 
     def test_refresh_sessions_table_shows_protection_configuration_columns(self) -> None:
@@ -189,6 +188,189 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
                 "18:29:01",
             ],
         )
+
+    def test_protection_dialog_safe_refresh_sessions_reports_exception_without_raising(self) -> None:
+        reporter = MagicMock()
+        dialog = SimpleNamespace(
+            _refresh_sessions=MagicMock(side_effect=RuntimeError("boom")),
+            _report_refresh_exception=reporter,
+        )
+
+        result = PositionProtectionDialog._safe_refresh_sessions(dialog, context="timer")
+
+        self.assertFalse(result)
+        reporter.assert_called_once()
+
+    def test_protection_dialog_safe_refresh_sessions_calls_refresh_once_on_success(self) -> None:
+        refresh = MagicMock()
+        reporter = MagicMock()
+        dialog = SimpleNamespace(
+            _refresh_sessions=refresh,
+            _report_refresh_exception=reporter,
+        )
+
+        result = PositionProtectionDialog._safe_refresh_sessions(dialog, context="timer")
+
+        self.assertTrue(result)
+        refresh.assert_called_once_with()
+        reporter.assert_not_called()
+
+    def test_protection_dialog_timer_refresh_continues_after_session_refresh_failure(self) -> None:
+        dialog = SimpleNamespace(
+            _safe_refresh_sessions=MagicMock(return_value=False),
+            _safe_refresh_from_selection=MagicMock(return_value=True),
+        )
+
+        PositionProtectionDialog._on_refresh_timer_timeout(dialog)
+
+        dialog._safe_refresh_sessions.assert_called_once_with(context="timer")
+        dialog._safe_refresh_from_selection.assert_called_once_with(force=False, context="timer")
+
+    def test_protection_dialog_safe_refresh_selected_session_detail_reports_exception_without_raising(self) -> None:
+        reporter = MagicMock()
+        dialog = SimpleNamespace(
+            _refresh_selected_session_detail=MagicMock(side_effect=RuntimeError("detail boom")),
+            _report_refresh_exception=reporter,
+        )
+
+        result = PositionProtectionDialog._safe_refresh_selected_session_detail(dialog, context="selection")
+
+        self.assertFalse(result)
+        reporter.assert_called_once()
+
+    def test_protection_dialog_safe_trigger_source_change_reports_exception_without_raising(self) -> None:
+        reporter = MagicMock()
+        dialog = SimpleNamespace(
+            _on_trigger_source_changed=MagicMock(side_effect=RuntimeError("trigger boom")),
+            _report_refresh_exception=reporter,
+        )
+
+        result = PositionProtectionDialog._safe_handle_trigger_source_changed(dialog)
+
+        self.assertFalse(result)
+        reporter.assert_called_once()
+
+    def test_protection_dialog_current_position_returns_cached_selection_when_provider_raises(self) -> None:
+        cached = object()
+        reporter = MagicMock()
+        dialog = SimpleNamespace(
+            _selected_option_provider=MagicMock(side_effect=RuntimeError("provider boom")),
+            _selected_position=cached,
+            _report_refresh_exception=reporter,
+        )
+
+        result = PositionProtectionDialog._current_position(dialog)
+
+        self.assertIs(result, cached)
+        reporter.assert_called_once()
+
+    def test_protection_dialog_autofills_spot_trigger_prices_by_option_direction_rules(self) -> None:
+        cases = (
+            ("BTC-USD-260717-60000-C", "long", "63050", "62650"),
+            ("BTC-USD-260717-60000-C", "short", "62650", "63050"),
+            ("BTC-USD-260717-60000-P", "long", "62650", "63050"),
+            ("BTC-USD-260717-60000-P", "short", "63050", "62650"),
+        )
+        for inst_id, pos_side, expected_tp, expected_sl in cases:
+            with self.subTest(inst_id=inst_id, pos_side=pos_side):
+                tp_edit = SimpleNamespace(text=lambda: "", setText=MagicMock())
+                sl_edit = SimpleNamespace(text=lambda: "", setText=MagicMock())
+                dialog = SimpleNamespace(
+                    _client=SimpleNamespace(get_trigger_price=MagicMock(return_value=Decimal("62850"))),
+                    _spot_symbol_edit=SimpleNamespace(text=lambda: "BTC-USDT"),
+                    _tp_trigger_edit=tp_edit,
+                    _sl_trigger_edit=sl_edit,
+                    _current_position=lambda inst_id=inst_id, pos_side=pos_side: SimpleNamespace(
+                        inst_id=inst_id,
+                        pos_side=pos_side,
+                        position=Decimal("1"),
+                    ),
+                )
+
+                PositionProtectionDialog._maybe_autofill_spot_trigger_prices(dialog)
+
+                dialog._client.get_trigger_price.assert_called_once_with("BTC-USDT", "last")
+                tp_edit.setText.assert_called_once_with(expected_tp)
+                sl_edit.setText.assert_called_once_with(expected_sl)
+
+    def test_protection_dialog_autofill_does_not_override_existing_spot_trigger_prices(self) -> None:
+        tp_edit = SimpleNamespace(text=lambda: "63000", setText=MagicMock())
+        sl_edit = SimpleNamespace(text=lambda: "62000", setText=MagicMock())
+        dialog = SimpleNamespace(
+            _client=SimpleNamespace(get_trigger_price=MagicMock(return_value=Decimal("62850"))),
+            _spot_symbol_edit=SimpleNamespace(text=lambda: "BTC-USDT"),
+            _tp_trigger_edit=tp_edit,
+            _sl_trigger_edit=sl_edit,
+            _current_position=lambda: SimpleNamespace(inst_id="BTC-USD-260717-57000-P"),
+        )
+
+        PositionProtectionDialog._maybe_autofill_spot_trigger_prices(dialog)
+
+        dialog._client.get_trigger_price.assert_not_called()
+        tp_edit.setText.assert_not_called()
+        sl_edit.setText.assert_not_called()
+
+    def test_protection_dialog_autofill_updates_only_blank_spot_trigger_price(self) -> None:
+        tp_edit = SimpleNamespace(text=lambda: "63000", setText=MagicMock())
+        sl_edit = SimpleNamespace(text=lambda: "", setText=MagicMock())
+        dialog = SimpleNamespace(
+            _client=SimpleNamespace(get_trigger_price=MagicMock(return_value=Decimal("62850"))),
+            _spot_symbol_edit=SimpleNamespace(text=lambda: "BTC-USDT"),
+            _tp_trigger_edit=tp_edit,
+            _sl_trigger_edit=sl_edit,
+            _current_position=lambda: SimpleNamespace(
+                inst_id="BTC-USD-260717-60000-C",
+                pos_side="short",
+                position=Decimal("1"),
+            ),
+        )
+
+        PositionProtectionDialog._maybe_autofill_spot_trigger_prices(dialog)
+
+        dialog._client.get_trigger_price.assert_called_once_with("BTC-USDT", "last")
+        tp_edit.setText.assert_not_called()
+        sl_edit.setText.assert_called_once_with("63050")
+
+    @patch("roll_terminal_qt.account_positions_home.QMessageBox.warning")
+    def test_protection_dialog_refresh_detail_does_not_open_modal_for_abnormal_session(
+        self,
+        warning: MagicMock,
+    ) -> None:
+        session = ProtectionSessionSnapshot(
+            session_id="P01",
+            api_name="QQzhangyong",
+            option_inst_id="BTC-USD-260717-57000-P",
+            trigger_inst_id="BTC-USDT",
+            trigger_label="BTC-USDT 最新价",
+            trigger_price_type="last",
+            direction="long",
+            pos_side=None,
+            take_profit_trigger=None,
+            take_profit_order_mode="mark_with_slippage",
+            take_profit_order_price=None,
+            take_profit_slippage=Decimal("0"),
+            stop_loss_trigger=Decimal("62900"),
+            stop_loss_order_mode="mark_with_slippage",
+            stop_loss_order_price=None,
+            stop_loss_slippage=Decimal("0"),
+            poll_seconds=2,
+            status="异常",
+            started_at=datetime(2026, 7, 6, 18, 29, 1),
+            last_message="保护任务异常：boom",
+        )
+        detail_text = SimpleNamespace(setPlainText=MagicMock())
+        dialog = SimpleNamespace(
+            _manager=SimpleNamespace(list_sessions=lambda: [session]),
+            _selected_session_id=lambda: "P01",
+            _detail_text=detail_text,
+            _last_abnormal_protection_alert={},
+        )
+
+        PositionProtectionDialog._refresh_selected_session_detail(dialog)
+
+        warning.assert_not_called()
+        self.assertEqual(dialog._last_abnormal_protection_alert, {"P01": "保护任务异常：boom"})
+        detail_text.setPlainText.assert_called_once()
 
     def test_configure_sessions_table_columns_applies_default_widths_for_long_fields(self) -> None:
         table = _ColumnConfigTableStub()
