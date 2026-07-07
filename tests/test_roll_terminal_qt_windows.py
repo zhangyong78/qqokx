@@ -44,6 +44,7 @@ from roll_terminal_qt.smart_order_window import (
     SMART_ORDER_TASK_DETAIL_HEIGHT,
 )
 from roll_terminal_qt.kline_analysis_window import (
+    KlineChartPayload,
     KlineAnalysisWindow,
     _AUTO_REFRESH_DEFAULT_ENABLED,
     _DEFAULT_DUAL_PRIMARY_PERIOD,
@@ -69,6 +70,7 @@ from roll_terminal_qt.kline_analysis_window import (
     _default_native_visible_range,
     _native_right_padding_ms,
     _ordered_trend_endpoints,
+    _reverse_kline_chart_payload,
     _resolve_interaction_cursor_mode,
     _resolve_candle_time_from_x_value,
     _to_sma,
@@ -1704,6 +1706,58 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             _to_sma(closes, 3),
             [1.0, 1.5, 2.0, 3.0, 4.0],
         )
+
+    def test_reverse_kline_chart_payload_mirrors_price_series_around_first_close(self) -> None:
+        payload = KlineChartPayload(
+            candles=[
+                {"time": 1, "open": 100.0, "high": 110.0, "low": 90.0, "close": 105.0, "volume": 1.0},
+                {"time": 2, "open": 109.0, "high": 112.0, "low": 101.0, "close": 106.0, "volume": 2.0},
+            ],
+            ema_9=[{"time": 1, "value": 105.0}, {"time": 2, "value": 107.0}],
+            ema_21=[{"time": 1, "value": 104.0}, {"time": 2, "value": 106.0}],
+            ema_55=[{"time": 1, "value": 103.0}, {"time": 2, "value": 105.0}],
+            trend_indicator=[{"time": 1, "value": 0.5}],
+            signal_markers=[{"time": 1, "direction": "long"}],
+            box_overlays=[{"start_index": 0, "end_index": 1, "upper": 112.0, "lower": 90.0}],
+            raw_candles=[],
+            stats={},
+            alert_snapshot=None,
+        )
+
+        reversed_payload = _reverse_kline_chart_payload(payload)
+
+        self.assertEqual(reversed_payload.candles[0]["open"], 105.0)
+        self.assertEqual(reversed_payload.candles[0]["close"], 110.0)
+        self.assertEqual(reversed_payload.candles[0]["high"], 120.0)
+        self.assertEqual(reversed_payload.candles[0]["low"], 100.0)
+        self.assertGreater(reversed_payload.candles[0]["close"], reversed_payload.candles[0]["open"])
+        self.assertLess(reversed_payload.candles[1]["close"], reversed_payload.candles[1]["open"])
+        self.assertEqual(reversed_payload.candles[1]["open"], 104.0)
+        self.assertEqual(reversed_payload.candles[1]["close"], 101.0)
+        self.assertEqual(reversed_payload.ema_9[1]["value"], 103.0)
+        self.assertEqual(reversed_payload.box_overlays[0]["upper"], 120.0)
+        self.assertEqual(reversed_payload.box_overlays[0]["lower"], 98.0)
+        self.assertTrue(reversed_payload.stats["reverse_kline"])
+        self.assertEqual(reversed_payload.stats["reverse_anchor_price"], 105.0)
+
+    def test_request_keys_include_reverse_kline_state(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._symbol_input.setText("BTC-USDT-SWAP")
+                window._use_native_chart = True
+                window._reverse_kline_check.setChecked(True)
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_kind_mode = "kline"
+                primary_key = window._current_primary_request_key()
+                secondary_key = window._current_secondary_request_key(symbol="BTC-USDT-SWAP")
+
+                self.assertTrue(primary_key[-1])
+                self.assertTrue(secondary_key[-1])
+            finally:
+                self.__class__.dispose_widget(window)
 
     def test_deribit_overlay_moving_average_series_keeps_length_and_ma50_warmup(self) -> None:
         closes = [Decimal(str(value)) for value in range(1, 61)]

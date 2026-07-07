@@ -130,7 +130,7 @@ class ArbitrageAutoCloseService:
         entry_id: str | None = None,
     ) -> None:
         with self._lock:
-            if self.is_running:
+            if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("已有自动平仓任务在运行，请先停止。")
             self._stop_event.clear()
             self._session = ArbitrageAutoCloseSession(

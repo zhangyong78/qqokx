@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from decimal import Decimal
 import time
@@ -132,6 +133,100 @@ class ArbitrageCalculatorTest(unittest.TestCase):
         )
         self.assertEqual(preview.spot_base_qty, Decimal("0.0200"))
         self.assertEqual(preview.swap_contracts, Decimal("2"))
+
+    def test_load_live_pair_close_plan_bypasses_cache_and_clamps_to_live_max_qty(self) -> None:
+        calls: list[tuple[str, bool]] = []
+
+        derivative_position = OkxPosition(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="short",
+            mgn_mode="cross",
+            position=Decimal("4"),
+            avail_position=Decimal("4"),
+            avg_price=None,
+            mark_price=Decimal("63200"),
+            unrealized_pnl=None,
+            unrealized_pnl_ratio=None,
+            liquidation_price=None,
+            leverage=None,
+            margin_ccy="USDT",
+            last_price=None,
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+        spot_instrument = Instrument(
+            inst_id="BTC-USDT",
+            inst_type="SPOT",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.0001"),
+            min_size=Decimal("0.0001"),
+            state="live",
+        )
+        derivative_instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+        )
+
+        class _Client:
+            def get_positions(self, credentials, *, environment: str, prefer_cache: bool = True):
+                calls.append(("positions", prefer_cache))
+                return [derivative_position]
+
+            def get_account_overview(self, credentials, *, environment: str, prefer_cache: bool = True):
+                calls.append(("overview", prefer_cache))
+                return SimpleNamespace(
+                    details=[
+                        SimpleNamespace(
+                            ccy="BTC",
+                            available_balance=Decimal("0.0399"),
+                            equity=Decimal("0.0399"),
+                        )
+                    ]
+                )
+
+            def get_instrument(self, inst_id: str):
+                if inst_id == "BTC-USDT":
+                    return spot_instrument
+                if inst_id == "BTC-USDT-SWAP":
+                    return derivative_instrument
+                raise AssertionError(inst_id)
+
+        window = ArbitrageWindow.__new__(ArbitrageWindow)
+        window.client = _Client()
+        window._pair_close_reference_price = lambda position, instrument: Decimal("63200")  # type: ignore[attr-defined]
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+
+        plan = window._load_live_pair_close_plan(
+            runtime,
+            spot_inst_id="BTC-USDT",
+            derivative_inst_id="BTC-USDT-SWAP",
+            spot_direction="long",
+            derivative_direction="short",
+            target_derivative_qty=Decimal("4"),
+        )
+
+        self.assertEqual(calls, [("positions", False), ("overview", False)])
+        self.assertEqual(plan.derivative_qty, Decimal("3.99"))
 
 
 class _FakeTickerClient:
@@ -344,6 +439,46 @@ class ArbitrageAutoOpenMoreTest(unittest.TestCase):
         )
         session = type("S", (), {"request": request, "runtime": runtime})()
         self.assertTrue(service._should_trigger(session))  # noqa: SLF001
+
+    def test_start_returns_without_deadlocking_when_idle(self) -> None:
+        client = _FakeTickerClient(
+            OkxTicker("BTC-USDT", Decimal("100"), Decimal("99"), Decimal("101"), None, None, raw={}),
+            OkxTicker("BTC-USDT-SWAP", Decimal("100.6"), Decimal("100.5"), Decimal("100.7"), None, None, raw={}),
+        )
+        service = ArbitrageAutoOpenService(client)
+        request = ArbitrageOpenRequest(
+            base_ccy="BTC",
+            spot_inst_id="BTC-USDT",
+            derivative_inst_id="BTC-USDT-SWAP",
+            size=Decimal("1000"),
+            size_unit="usdt",
+            trigger_mode="spread_abs",
+            open_spread_pct_max=None,
+            open_spread_abs_max=Decimal("0.50"),
+            spot_limit_price=None,
+            derivative_limit_price=None,
+            use_limit_orders=False,
+            max_slippage=Decimal("0.0015"),
+        )
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        finished = threading.Event()
+        errors: list[Exception] = []
+
+        with patch.object(service, "_run", return_value=None):
+            worker = threading.Thread(
+                target=lambda: _invoke_auto_open_start(service, request, runtime, finished, errors),
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(finished.wait(0.5))
+            service.stop()
+
+        self.assertEqual(errors, [])
 
 
 class _FakeScannerClient:
@@ -561,6 +696,70 @@ class ArbitrageAutoCloseTest(unittest.TestCase):
             spread_pct, spread_abs = service._refresh_spread(session)  # noqa: SLF001
         self.assertIsNotNone(spread_pct)
         self.assertEqual(spread_abs, Decimal("0.4"))
+
+    def test_start_returns_without_deadlocking_when_idle(self) -> None:
+        client = _FakeTickerClient(
+            OkxTicker("BTC-USDT", Decimal("100"), Decimal("99"), Decimal("101"), None, None, raw={}),
+            OkxTicker("BTC-USDT-SWAP", Decimal("100.4"), Decimal("100.3"), Decimal("100.5"), None, None, raw={}),
+        )
+        service = ArbitrageAutoCloseService(client)
+        finished = threading.Event()
+        errors: list[Exception] = []
+
+        with patch.object(service, "_run", return_value=None):
+            worker = threading.Thread(
+                target=lambda: _invoke_auto_close_start(service, finished, errors),
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(finished.wait(0.5))
+            service.stop()
+
+        self.assertEqual(errors, [])
+
+
+def _invoke_auto_open_start(
+    service: ArbitrageAutoOpenService,
+    request: ArbitrageOpenRequest,
+    runtime: ArbitrageTradeRuntime,
+    finished: threading.Event,
+    errors: list[Exception],
+) -> None:
+    try:
+        service.start(request, runtime)
+    except Exception as exc:  # pragma: no cover - test helper
+        errors.append(exc)
+    finally:
+        finished.set()
+
+
+def _invoke_auto_close_start(
+    service: ArbitrageAutoCloseService,
+    finished: threading.Event,
+    errors: list[Exception],
+) -> None:
+    try:
+        service.start(
+            request=ArbitrageCloseRequest(
+                entry_id="entry-1",
+                max_slippage=Decimal("0.0015"),
+                use_limit_orders=False,
+            ),
+            runtime=ArbitrageTradeRuntime(
+                credentials=Credentials("k", "s", "p"),
+                environment="demo",
+                trade_mode="cross",
+                position_mode="net",
+            ),
+            close_trigger_mode="spread_abs",
+            close_spread_pct_min=None,
+            close_spread_abs_min=Decimal("0.5"),
+            entry_id="entry-1",
+        )
+    except Exception as exc:  # pragma: no cover - test helper
+        errors.append(exc)
+    finally:
+        finished.set()
 
 
 class ArbitrageScannerFilterTest(unittest.TestCase):
@@ -2212,6 +2411,120 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertEqual(client.orders[1]["inst_id"], "BTC-USDT-SWAP")
         self.assertEqual(client.orders[1]["ord_type"], "post_only")
         self.assertEqual(client.orders[1]["side"], "buy")
+        self.assertIsNone(client.orders[1].get("pos_side"))
+
+    def test_close_net_mode_uses_reduce_only_without_pos_side(self) -> None:
+        client = _FakeArbitrageTradeClient()
+        executor = ArbitrageExecutor(client)
+        entry = ArbitrageLedgerEntry(
+            entry_id="entry-open",
+            base_ccy="BTC",
+            pair_kind="spot_swap",
+            spot_inst_id="BTC-USDT",
+            derivative_inst_id="BTC-USDT-SWAP",
+            spot_qty=Decimal("0.0200"),
+            derivative_qty=Decimal("2"),
+            open_spot_price=Decimal("100"),
+            open_derivative_price=Decimal("101"),
+            close_spot_price=None,
+            close_derivative_price=None,
+            basis_at_open_pct=Decimal("1"),
+            fee_total=Decimal("0"),
+            funding_total=Decimal("0"),
+            realized_pnl=None,
+            close_mode="open",
+            opened_at="2026-06-01T00:00:00Z",
+            closed_at=None,
+            notes="测试标注",
+        )
+        request = ArbitrageCloseRequest(
+            entry_id="entry-open",
+            max_slippage=Decimal("0.0015"),
+            use_limit_orders=False,
+            close_derivative_qty=Decimal("1"),
+        )
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        upserts: list[ArbitrageLedgerEntry] = []
+        with (
+            patch("okx_quant.arbitrage.arbitrage_executor.load_open_ledger_entries", return_value=[entry]),
+            patch("okx_quant.arbitrage.arbitrage_executor.upsert_ledger_entry", side_effect=upserts.append),
+            patch(
+                "okx_quant.arbitrage.arbitrage_executor._wait_order_fill",
+                side_effect=[
+                    (Decimal("1"), Decimal("100")),
+                    (Decimal("0.0100"), Decimal("101")),
+                ],
+            ),
+        ):
+            result = executor.close_cash_and_carry(request, runtime=runtime)
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(client.orders), 2)
+        self.assertIsNone(client.orders[0].get("pos_side"))
+        self.assertNotIn("pos_side", client.orders[1])
+
+    def test_close_uses_short_pos_side_when_account_is_long_short_even_if_runtime_declares_net(self) -> None:
+        class _LongShortAccountClient(_FakeArbitrageTradeClient):
+            def get_account_config(self, credentials, *, environment: str):  # noqa: ANN001
+                return SimpleNamespace(position_mode="long_short_mode")
+
+        client = _LongShortAccountClient()
+        executor = ArbitrageExecutor(client)
+        entry = ArbitrageLedgerEntry(
+            entry_id="entry-open",
+            base_ccy="BTC",
+            pair_kind="spot_swap",
+            spot_inst_id="BTC-USDT",
+            derivative_inst_id="BTC-USDT-SWAP",
+            spot_qty=Decimal("0.0200"),
+            derivative_qty=Decimal("2"),
+            open_spot_price=Decimal("100"),
+            open_derivative_price=Decimal("101"),
+            close_spot_price=None,
+            close_derivative_price=None,
+            basis_at_open_pct=Decimal("1"),
+            fee_total=Decimal("0"),
+            funding_total=Decimal("0"),
+            realized_pnl=None,
+            close_mode="open",
+            opened_at="2026-06-01T00:00:00Z",
+            closed_at=None,
+            notes="测试双向账户",
+        )
+        request = ArbitrageCloseRequest(
+            entry_id="entry-open",
+            max_slippage=Decimal("0.0015"),
+            use_limit_orders=False,
+            close_derivative_qty=Decimal("1"),
+        )
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        with (
+            patch("okx_quant.arbitrage.arbitrage_executor.load_open_ledger_entries", return_value=[entry]),
+            patch("okx_quant.arbitrage.arbitrage_executor.upsert_ledger_entry"),
+            patch(
+                "okx_quant.arbitrage.arbitrage_executor._wait_order_fill",
+                side_effect=[
+                    (Decimal("1"), Decimal("100")),
+                    (Decimal("0.0100"), Decimal("101")),
+                ],
+            ),
+        ):
+            result = executor.close_cash_and_carry(request, runtime=runtime)
+
+        self.assertTrue(result.success)
+        self.assertEqual(client.orders[0]["inst_id"], "BTC-USDT-SWAP")
+        self.assertEqual(client.orders[0]["side"], "buy")
+        self.assertEqual(client.orders[0].get("pos_side"), "short")
 
     def test_close_supports_batch_execution_by_count(self) -> None:
         client = _FakeArbitrageTradeClient()

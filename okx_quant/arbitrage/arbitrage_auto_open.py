@@ -118,7 +118,7 @@ class ArbitrageAutoOpenService:
 
     def start(self, request: ArbitrageOpenRequest, runtime: ArbitrageTradeRuntime) -> None:
         with self._lock:
-            if self.is_running:
+            if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("已有自动开仓任务在运行，请先停止。")
             self._stop_event.clear()
             self._session = ArbitrageAutoOpenSession(request=request, runtime=runtime)

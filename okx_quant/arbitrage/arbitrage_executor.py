@@ -272,6 +272,19 @@ def _roll_direction_fields(request: ArbitrageRollRequest, runtime: ArbitrageTrad
     return close_side, open_side, pos_side
 
 
+def _resolve_close_reduce_only_pos_side(client: OkxRestClient, runtime: ArbitrageTradeRuntime) -> str | None:
+    try:
+        account_config = client.get_account_config(runtime.credentials, environment=runtime.environment)
+    except Exception:
+        account_config = None
+    account_mode = str(getattr(account_config, "position_mode", "") or "").strip().lower()
+    if account_mode == "long_short_mode":
+        return "short"
+    if account_mode == "net_mode":
+        return None
+    return "short" if runtime.position_mode == "long_short" else None
+
+
 def _wait_order_fill(
     client: OkxRestClient,
     *,
@@ -2192,7 +2205,7 @@ class ArbitrageExecutor:
         credentials = runtime.credentials
         spot_config = _build_strategy_config(entry.spot_inst_id, runtime)
         deriv_config = _build_strategy_config(entry.derivative_inst_id, runtime)
-        derivative_pos_side = "short" if runtime.position_mode == "long_short" else "short"
+        derivative_pos_side = _resolve_close_reduce_only_pos_side(self._client, runtime)
         maker_leg = "spot" if request.execution_mode == "spot_maker_derivative_taker" else "derivative"
         total_spot_filled = Decimal("0")
         total_derivative_filled = Decimal("0")
@@ -2808,7 +2821,7 @@ class ArbitrageExecutor:
         if request.execution_mode == "both_maker_first_taker":
             deriv_config = _build_strategy_config(entry.derivative_inst_id, runtime)
             spot_config = _build_strategy_config(entry.spot_inst_id, runtime)
-            derivative_pos_side = "short" if runtime.position_mode == "long_short" else "short"
+            derivative_pos_side = _resolve_close_reduce_only_pos_side(self._client, runtime)
             spot_filled, spot_avg, deriv_filled, deriv_avg = self._execute_spot_derivative_both_maker(
                 credentials=credentials,
                 runtime=runtime,
@@ -2891,7 +2904,7 @@ class ArbitrageExecutor:
                 ord_type=deriv_ord_type,
                 price=deriv_price if deriv_ord_type == "limit" else None,
                 reduce_only=True,
-                pos_side="short",
+                pos_side=_resolve_close_reduce_only_pos_side(self._client, runtime),
                 cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
             )
             deriv_filled, deriv_avg = _wait_order_fill(

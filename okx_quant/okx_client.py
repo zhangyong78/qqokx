@@ -183,6 +183,7 @@ def _okx_trade_order_request_log_fragment(order: dict[str, Any]) -> str:
         "ordType",
         "px",
         "sz",
+        "tgtCcy",
         "posSide",
         "ccy",
         "clOrdId",
@@ -1767,7 +1768,10 @@ class OkxRestClient:
     ) -> list[OkxFillHistoryItem]:
         items: list[OkxFillHistoryItem] = []
         normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
-        per_type_target = max(1, math.ceil(limit / max(len(normalized_types), 1)))
+        # Fills are often concentrated in a single instType (for example OPTION).
+        # If we split a small global limit evenly across 4 types, active types get
+        # truncated too aggressively and recent fills disappear from the UI.
+        per_type_target = max(min(limit, 100), math.ceil(limit / max(len(normalized_types), 1)))
         for inst_type in normalized_types:
             collected_for_type = 0
             after: str | None = None
@@ -2559,6 +2563,9 @@ class OkxRestClient:
             order["tdMode"] = self._spot_td_mode_for_account(credentials, config)
             if str(ord_type or "").strip().lower() == "post_only":
                 order["ordType"] = "limit"
+            elif str(ord_type or "").strip().lower() == "market" and str(side or "").strip().lower() == "buy":
+                # For SPOT market buys we submit base-asset quantity; tell OKX that sz is base_ccy.
+                order["tgtCcy"] = "base_ccy"
         if reduce_only:
             order["reduceOnly"] = True
         reference_price = price

@@ -4324,9 +4324,19 @@ class ArbitrageWindow:
         derivative_direction: str,
         target_derivative_qty: Decimal,
     ) -> PairCloseLivePlan:
-        positions = list(self.client.get_positions(runtime.credentials, environment=runtime.environment))
+        positions = list(
+            self.client.get_positions(
+                runtime.credentials,
+                environment=runtime.environment,
+                prefer_cache=False,
+            )
+        )
         try:
-            overview = self.client.get_account_overview(runtime.credentials, environment=runtime.environment)
+            overview = self.client.get_account_overview(
+                runtime.credentials,
+                environment=runtime.environment,
+                prefer_cache=False,
+            )
             positions.extend(_build_spot_positions_from_account(overview, self.client))
         except Exception:
             pass

@@ -1370,6 +1370,92 @@ def _slice_chart_payload_tail(payload: KlineChartPayload, count: int) -> KlineCh
     )
 
 
+def _reverse_kline_price(value: float, anchor_price: float) -> float:
+    return float(anchor_price) * 2.0 - float(value)
+
+
+def _reverse_kline_anchor_price(payload: KlineChartPayload) -> float:
+    if payload.candles:
+        first_close = payload.candles[0].get("close")
+        if isinstance(first_close, (int, float)):
+            return float(first_close)
+    return 0.0
+
+
+def _reverse_kline_chart_payload(payload: KlineChartPayload) -> KlineChartPayload:
+    if not payload.candles:
+        return payload
+    anchor_price = _reverse_kline_anchor_price(payload)
+
+    reversed_candles: list[dict[str, Any]] = []
+    for item in payload.candles:
+        if not isinstance(item, dict):
+            continue
+        original_open = float(item.get("open", 0.0) or 0.0)
+        original_close = float(item.get("close", 0.0) or 0.0)
+        reversed_open = _reverse_kline_price(original_open, anchor_price)
+        reversed_close = _reverse_kline_price(original_close, anchor_price)
+        if original_close >= original_open:
+            display_open = min(reversed_open, reversed_close)
+            display_close = max(reversed_open, reversed_close)
+        else:
+            display_open = max(reversed_open, reversed_close)
+            display_close = min(reversed_open, reversed_close)
+        reversed_candles.append(
+            {
+                **item,
+                "open": display_open,
+                "high": _reverse_kline_price(float(item.get("low", 0.0) or 0.0), anchor_price),
+                "low": _reverse_kline_price(float(item.get("high", 0.0) or 0.0), anchor_price),
+                "close": display_close,
+            }
+        )
+
+    def _reverse_line(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        reversed_points: list[dict[str, Any]] = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            reversed_points.append(
+                {
+                    **point,
+                    "value": _reverse_kline_price(float(point.get("value", 0.0) or 0.0), anchor_price),
+                }
+            )
+        return reversed_points
+
+    reversed_boxes: list[dict[str, Any]] = []
+    for item in payload.box_overlays:
+        if not isinstance(item, dict):
+            continue
+        upper = float(item.get("upper", 0.0) or 0.0)
+        lower = float(item.get("lower", 0.0) or 0.0)
+        reversed_boxes.append(
+            {
+                **item,
+                "upper": _reverse_kline_price(lower, anchor_price),
+                "lower": _reverse_kline_price(upper, anchor_price),
+            }
+        )
+
+    reversed_stats = dict(payload.stats)
+    reversed_stats["reverse_kline"] = True
+    reversed_stats["reverse_anchor_price"] = anchor_price
+
+    return KlineChartPayload(
+        candles=reversed_candles,
+        ema_9=_reverse_line(payload.ema_9),
+        ema_21=_reverse_line(payload.ema_21),
+        ema_55=_reverse_line(payload.ema_55),
+        trend_indicator=[dict(item) for item in payload.trend_indicator if isinstance(item, dict)],
+        signal_markers=[dict(item) for item in payload.signal_markers if isinstance(item, dict)],
+        box_overlays=reversed_boxes,
+        raw_candles=list(payload.raw_candles),
+        stats=reversed_stats,
+        alert_snapshot=payload.alert_snapshot,
+    )
+
+
 if QChartView is not None:
     class InteractiveKlineChartView(QChartView):
         chartPointClicked = Signal(float, float)
@@ -3318,6 +3404,11 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_average_kline_check.setToolTip("开启后，主图和副图都使用平均K线算法显示K线。")
         self._secondary_average_kline_check.toggled.connect(self._load_data)
         action_row.addWidget(self._secondary_average_kline_check)
+
+        self._reverse_kline_check = QCheckBox("K线反转")
+        self._reverse_kline_check.setToolTip("开启后，将当前主图及副图K线按价格镜像反转显示；波动率副图不参与反转。")
+        self._reverse_kline_check.toggled.connect(self._load_data)
+        action_row.addWidget(self._reverse_kline_check)
         action_row.addStretch(1)
 
         load_btn = QPushButton("加载")
@@ -3817,6 +3908,7 @@ class KlineAnalysisWindow(QMainWindow):
             max(50, self._limit_spin.value()),
             bool(self._prefer_local_checkbox.isChecked()),
             bool(self._secondary_average_kline_check.isChecked()),
+            bool(self._reverse_kline_check.isChecked()),
         )
 
     def _current_secondary_request_key(self, *, symbol: str | None = None) -> tuple[Any, ...] | None:
@@ -3832,6 +3924,7 @@ class KlineAnalysisWindow(QMainWindow):
                 secondary_period,
                 requested_limit,
                 bool(self._secondary_average_kline_check.isChecked()),
+                False,
             )
         return (
             "secondary",
@@ -3841,6 +3934,7 @@ class KlineAnalysisWindow(QMainWindow):
             requested_limit,
             bool(self._prefer_local_checkbox.isChecked()),
             bool(self._secondary_average_kline_check.isChecked()),
+            bool(self._reverse_kline_check.isChecked()),
         )
 
     def _schedule_pending_reload_if_ready(self) -> None:
@@ -4203,24 +4297,47 @@ class KlineAnalysisWindow(QMainWindow):
         ):
             self._render_secondary_chart(self._secondary_pending_payload)
 
+    def _reverse_kline_enabled_for_chart(self, *, is_secondary: bool) -> bool:
+        if not bool(self._reverse_kline_check.isChecked()):
+            return False
+        if not is_secondary:
+            return True
+        return self._secondary_chart_kind() == "kline"
+
+    def _display_payload_for_chart(self, payload: KlineChartPayload, *, is_secondary: bool) -> KlineChartPayload:
+        if not self._reverse_kline_enabled_for_chart(is_secondary=is_secondary):
+            return payload
+        return _reverse_kline_chart_payload(payload)
+
+    def _display_price_from_logical(self, payload: KlineChartPayload, value: float, *, is_secondary: bool) -> float:
+        if not self._reverse_kline_enabled_for_chart(is_secondary=is_secondary):
+            return float(value)
+        return _reverse_kline_price(float(value), _reverse_kline_anchor_price(payload))
+
+    def _logical_price_from_display(self, payload: KlineChartPayload, value: float, *, is_secondary: bool) -> float:
+        if not self._reverse_kline_enabled_for_chart(is_secondary=is_secondary):
+            return float(value)
+        return _reverse_kline_price(float(value), _reverse_kline_anchor_price(payload))
+
     def _render_to_chart(self, payload: KlineChartPayload) -> None:
         if self._use_native_chart:
             self._render_to_native_chart(payload)
             return
+        display_payload = self._display_payload_for_chart(payload, is_secondary=False)
         period = self._period_combo.currentText().strip()
         signal_markers = self._filter_replay_signal_markers_for_chart(
-            payload.signal_markers,
+            display_payload.signal_markers,
             period=period,
             is_secondary=False,
         )
-        trend_payload = payload.trend_indicator if _supports_trend_indicator(period) else []
+        trend_payload = display_payload.trend_indicator if _supports_trend_indicator(period) else []
         if not isinstance(trend_payload, list):
             trend_payload = []
         payload_map: dict[str, Any] = {
-            "candles": payload.candles,
+            "candles": display_payload.candles,
             "ema": {
-                "ema9": payload.ema_9,
-                "ema21": payload.ema_21,
+                "ema9": display_payload.ema_9,
+                "ema21": display_payload.ema_21,
             },
             "show": {
                 "ema9": self._ema9.isChecked(),
@@ -4229,7 +4346,7 @@ class KlineAnalysisWindow(QMainWindow):
             "period": period,
             "trend": trend_payload,
             "signals": signal_markers,
-            "boxes": self._visible_box_overlays(payload),
+            "boxes": self._visible_box_overlays(display_payload),
         }
         try:
             self._run_js(f"window.applyChartData({json.dumps(payload_map)});")
@@ -4475,14 +4592,16 @@ class KlineAnalysisWindow(QMainWindow):
             or QValueAxis is None
         ):
             return
+        display_payload = self._display_payload_for_chart(payload, is_secondary=False)
         self._render_native_chart_target(
             chart=self._native_chart,
             chart_view=self._native_chart_view,
-            payload=payload,
+            payload=display_payload,
             period=self._period_combo.currentText().strip(),
             title_suffix="主图",
             include_workspace_lines=True,
             is_secondary=False,
+            source_payload=payload,
         )
 
     def _render_secondary_chart(self, payload: KlineChartPayload) -> None:
@@ -4496,10 +4615,11 @@ class KlineAnalysisWindow(QMainWindow):
             or QValueAxis is None
         ):
             return
+        display_payload = self._display_payload_for_chart(payload, is_secondary=True)
         self._render_native_chart_target(
             chart=self._secondary_native_chart,
             chart_view=self._secondary_native_chart_view,
-            payload=payload,
+            payload=display_payload,
             period=self._secondary_period_combo.currentText().strip(),
             title_suffix="副图",
             include_workspace_lines=False,
@@ -4507,9 +4627,10 @@ class KlineAnalysisWindow(QMainWindow):
             display_symbol=self._secondary_display_symbol(),
             venue_label=self._secondary_chart_venue_label(),
             chart_note_lines=self._secondary_chart_note_lines(
-                payload,
+                display_payload,
                 period=self._secondary_period_combo.currentText().strip(),
             ),
+            source_payload=payload,
         )
 
     def _render_native_chart_target(
@@ -4522,6 +4643,7 @@ class KlineAnalysisWindow(QMainWindow):
         title_suffix: str,
         include_workspace_lines: bool,
         is_secondary: bool,
+        source_payload: KlineChartPayload | None = None,
         display_symbol: str | None = None,
         venue_label: str = "OKX",
         chart_note_lines: list[str] | None = None,
@@ -4535,6 +4657,7 @@ class KlineAnalysisWindow(QMainWindow):
             chart.removeAxis(axis)
 
         candles = payload.candles
+        logical_payload = source_payload or payload
         if not candles:
             chart.setTitle(f"{title_suffix}暂无K线数据")
             return
@@ -4624,7 +4747,11 @@ class KlineAnalysisWindow(QMainWindow):
                 series.setPen(pen)
                 line_values: list[float] = []
                 for candle_index, candle in enumerate(candles):
-                    projected_value = float(line_value_at(item, int(candle["time"])))
+                    projected_value = self._display_price_from_logical(
+                        logical_payload,
+                        float(line_value_at(item, int(candle["time"]))),
+                        is_secondary=is_secondary,
+                    )
                     series.append(float(display_times_ms[candle_index]), projected_value)
                     line_values.append(projected_value)
                     min_price = min(min_price, projected_value)
@@ -4637,13 +4764,34 @@ class KlineAnalysisWindow(QMainWindow):
                         candle_time=future_line_time,
                         display_step_ms=display_step_ms,
                     )
-                    future_value = float(line_value_at(item, future_line_time))
+                    future_value = self._display_price_from_logical(
+                        logical_payload,
+                        float(line_value_at(item, future_line_time)),
+                        is_secondary=is_secondary,
+                    )
                     series.append(future_display_x, future_value)
                     line_values.append(future_value)
                     min_price = min(min_price, future_value)
                     max_price = max(max_price, future_value)
                 chart.addSeries(series)
                 overlay_values.append(line_values)
+            if self._reverse_kline_enabled_for_chart(is_secondary=is_secondary):
+                workspace_lines = [
+                    dict(
+                        item,
+                        price_a=self._display_price_from_logical(
+                            logical_payload,
+                            float(item.get("price_a", 0.0) or 0.0),
+                            is_secondary=is_secondary,
+                        ),
+                        price_b=self._display_price_from_logical(
+                            logical_payload,
+                            float(item.get("price_b", 0.0) or 0.0),
+                            is_secondary=is_secondary,
+                        ),
+                    )
+                    for item in workspace_lines
+                ]
 
         axis_x = QDateTimeAxis()
         axis_x.setFormat("MM-dd" if _bar_to_ms(period) >= 86_400_000 else "MM-dd HH:mm")
@@ -4999,7 +5147,7 @@ class KlineAnalysisWindow(QMainWindow):
             x_value=x_value,
             display_step_ms=display_step_ms,
         )
-        return candle_time, float(y_value)
+        return candle_time, self._logical_price_from_display(self._pending_payload, float(y_value), is_secondary=False)
 
     def _line_hit_test(self, *, candle_time: int, price: float) -> dict[str, object] | None:
         entry = self._workspace_entry()
@@ -5083,24 +5231,34 @@ class KlineAnalysisWindow(QMainWindow):
     def _update_draw_preview(self, *, candle_time: int, price: float) -> None:
         if not isinstance(self._native_chart_view, InteractiveKlineChartView):
             return
+        display_price = (
+            self._display_price_from_logical(self._pending_payload, price, is_secondary=False)
+            if self._pending_payload is not None
+            else float(price)
+        )
         if self._draw_tool == "horizontal":
             self._native_chart_view.set_preview_line(
                 {
                     "kind": "horizontal",
                     "time_a": candle_time,
-                    "price_a": price,
+                    "price_a": display_price,
                     "time_b": candle_time,
-                    "price_b": price,
+                    "price_b": display_price,
                 }
             )
             return
         if self._draw_tool == "trend" and self._pending_line_start is not None:
             start_time, start_price = self._pending_line_start
+            display_start_price = (
+                self._display_price_from_logical(self._pending_payload, start_price, is_secondary=False)
+                if self._pending_payload is not None
+                else float(start_price)
+            )
             line_time_a, line_price_a, line_time_b, line_price_b = _ordered_trend_endpoints(
                 start_time,
-                start_price,
+                display_start_price,
                 candle_time,
-                price,
+                display_price,
             )
             self._native_chart_view.set_preview_line(
                 {

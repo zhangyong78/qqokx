@@ -1243,6 +1243,72 @@ class OkxClientOrderRequestTest(TestCase):
         self.assertEqual(requests[0]["ordType"], "limit")
         self.assertEqual(requests[0]["tdMode"], "cross")
 
+    def test_place_simple_spot_market_buy_uses_base_ccy_size_semantics(self) -> None:
+        client = OkxRestClient()
+        requests: list[dict[str, object]] = []
+
+        def _stub_request(method: str, path: str, params=None, body=None, **kwargs):
+            if path == "/api/v5/public/instruments":
+                return {
+                    "data": [
+                        {
+                            "instId": "BTC-USDT",
+                            "instType": "SPOT",
+                            "tickSz": "0.1",
+                            "lotSz": "0.00000001",
+                            "minSz": "0.00000001",
+                            "state": "live",
+                            "settleCcy": "",
+                            "ctVal": None,
+                            "ctMult": None,
+                            "ctValCcy": None,
+                            "uly": "",
+                            "instFamily": "",
+                        }
+                    ]
+                }
+            if path == "/api/v5/account/config":
+                return {"data": [{"acctLv": "4", "posMode": "net_mode"}]}
+            assert isinstance(body, dict)
+            requests.append(dict(body))
+            return {"data": [{"ordId": "o4", "sCode": "0", "sMsg": ""}]}
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        config = StrategyConfig(
+            inst_id="BTC-USDT",
+            trade_inst_id="BTC-USDT",
+            local_tp_sl_inst_id="BTC-USDT",
+            bar="1H",
+            ema_period=21,
+            atr_period=14,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            tp_sl_mode="exchange",
+            take_profit_mode="dynamic",
+            risk_amount=Decimal("10"),
+        )
+
+        result = client.place_simple_order(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            config,
+            inst_id="BTC-USDT",
+            side="buy",
+            size=Decimal("0.02"),
+            ord_type="market",
+            cl_ord_id="test-spot-market-buy",
+        )
+
+        self.assertEqual(result.ord_id, "o4")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["tdMode"], "cross")
+        self.assertEqual(requests[0]["tgtCcy"], "base_ccy")
+
     def test_place_simple_reduce_only_keeps_short_pos_side_when_account_is_long_short(self) -> None:
         client = OkxRestClient()
         client.get_ticker = lambda inst_id: self._ticker(inst_id, "80000")  # type: ignore[method-assign]

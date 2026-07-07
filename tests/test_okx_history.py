@@ -339,6 +339,51 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(items[0].exec_type, "exercise")
         self.assertEqual(items[0].fill_price, Decimal("0.025"))
 
+    def test_get_fills_history_does_not_cap_active_inst_type_to_quarter_of_limit(self) -> None:
+        client = OkxRestClient()
+
+        option_page = [
+            {
+                "billId": str(1000 - index),
+                "instId": "BTC-USD-260717-60000-P",
+                "instType": "OPTION",
+                "side": "sell",
+                "posSide": "short",
+                "fillPx": "0.015",
+                "fillSz": "1",
+                "fillFee": "-0.0001",
+                "fillFeeCcy": "BTC",
+                "fillPnl": "0",
+                "ordId": str(2000 - index),
+                "tradeId": str(3000 - index),
+                "execType": "T",
+                "fillTime": str(1710000001000 - index),
+            }
+            for index in range(100)
+        ]
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            self.assertIn(path, {"/api/v5/trade/fills-history", "/api/v5/account/bills"})
+            if path == "/api/v5/account/bills":
+                return {"data": []}
+            inst_type = params["instType"]
+            if inst_type == "OPTION":
+                self.assertEqual(params["limit"], "100")
+                return {"data": option_page}
+            return {"data": []}
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        items = client.get_fills_history(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            environment="live",
+            limit=100,
+        )
+
+        self.assertEqual(len(items), 100)
+        self.assertTrue(all(item.inst_type == "OPTION" for item in items))
+        self.assertEqual(items[0].trade_id, "3000")
+        self.assertEqual(items[-1].trade_id, "2901")
+
     def test_get_order_history_pages_when_limit_exceeds_one_page(self) -> None:
         client = OkxRestClient()
         seen_after: list[str | None] = []

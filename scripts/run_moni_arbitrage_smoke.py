@@ -23,8 +23,10 @@ from okx_quant.arbitrage.position_ledger import find_ledger_entry, load_open_led
 from okx_quant.arbitrage_ui import (
     ArbitrageWindow,
     _build_spot_positions_from_account,
+    _pair_max_derivative_close_qty,
     _pair_position_direction,
     _pair_spot_qty_from_derivative_qty,
+    _split_pair_close_batches,
 )
 from okx_quant.models import Credentials
 from okx_quant.okx_client import OkxRestClient, OkxPosition
@@ -46,6 +48,43 @@ EXECUTION_MODES: list[tuple[str, str]] = [
     ("现货挂单/合约吃单", "spot_maker_derivative_taker"),
     ("合约挂单/现货吃单", "derivative_maker_spot_taker"),
 ]
+
+
+def _nearest_btc_future(inst_ids: list[str], prefix: str) -> str | None:
+    candidates: list[tuple[str, str]] = []
+    for inst_id in sorted({str(item).strip().upper() for item in inst_ids if str(item).strip()}):
+        if not inst_id.startswith(prefix):
+            continue
+        expiry = inst_id.rsplit("-", 1)[-1]
+        if len(expiry) == 6 and expiry.isdigit():
+            candidates.append((expiry, inst_id))
+    return min(candidates, default=(None, None))[1]
+
+
+def resolve_moni_test_derivative_ids(instrument_ids: list[str]) -> tuple[str, str]:
+    normalized_ids = [str(item).strip().upper() for item in instrument_ids if str(item).strip()]
+    open_derivative_inst_id = (
+        "BTC-USDT-SWAP"
+        if "BTC-USDT-SWAP" in normalized_ids
+        else _nearest_btc_future(normalized_ids, "BTC-USDT-")
+    )
+    pair_close_derivative_inst_id = _nearest_btc_future(normalized_ids, "BTC-USD-")
+    if not open_derivative_inst_id:
+        raise RuntimeError("未找到可用的 BTC-USDT 衍生品测试合约。")
+    if not pair_close_derivative_inst_id:
+        raise RuntimeError("未找到可用的 BTC-USD 交割合约用于配对平仓测试。")
+    return open_derivative_inst_id, pair_close_derivative_inst_id
+
+
+def load_moni_test_derivative_ids(client: OkxRestClient) -> tuple[str, str]:
+    instrument_ids: list[str] = []
+    for inst_type in ("FUTURES", "SWAP"):
+        instrument_ids.extend(
+            item.inst_id
+            for item in client.get_instruments(inst_type)
+            if getattr(item, "state", "") in {"live", "test"}
+        )
+    return resolve_moni_test_derivative_ids(instrument_ids)
 
 
 class _Var:
@@ -276,14 +315,29 @@ def load_runtime() -> tuple[OkxRestClient, ArbitrageManager, ArbitrageTradeRunti
 
 
 def position_snapshot(client: OkxRestClient, runtime: ArbitrageTradeRuntime) -> tuple[list[OkxPosition], list[str]]:
-    positions = list(client.get_positions(runtime.credentials, environment=runtime.environment))
+    positions = list(client.get_positions(runtime.credentials, environment=runtime.environment, prefer_cache=False))
     labels = [f"{item.inst_id} | {item.inst_type} | pos={item.position} | avail={item.avail_position}" for item in positions]
     return positions, labels
 
 
-def account_spot_positions(client: OkxRestClient, runtime: ArbitrageTradeRuntime) -> list[OkxPosition]:
-    overview = client.get_account_overview(runtime.credentials, environment=runtime.environment)
+def account_spot_positions(
+    client: OkxRestClient,
+    runtime: ArbitrageTradeRuntime,
+    *,
+    prefer_cache: bool = False,
+) -> list[OkxPosition]:
+    overview = client.get_account_overview(
+        runtime.credentials,
+        environment=runtime.environment,
+        prefer_cache=prefer_cache,
+    )
     return _build_spot_positions_from_account(overview, client)
+
+
+def _load_live_positions(client: OkxRestClient, runtime: ArbitrageTradeRuntime) -> list[OkxPosition]:
+    positions = list(client.get_positions(runtime.credentials, environment=runtime.environment, prefer_cache=False))
+    positions.extend(account_spot_positions(client, runtime, prefer_cache=False))
+    return positions
 
 
 def current_spread_abs(client: OkxRestClient, derivative_inst_id: str) -> Decimal:
@@ -296,15 +350,20 @@ def current_spread_abs(client: OkxRestClient, derivative_inst_id: str) -> Decima
     return derivative_mid - spot_mid
 
 
+def _immediate_auto_open_spread_abs_max(spread_abs: Decimal) -> Decimal:
+    return spread_abs - Decimal("1")
+
+
 def make_open_request(
     size: Decimal,
     unit: str,
     *,
-    derivative_inst_id: str = OPEN_DERIVATIVE_INST_ID,
+    derivative_inst_id: str | None = None,
     execution_mode: str = "dual_taker",
     maker_wait_seconds: float = 4.0,
     chase_limit: int = 2,
 ) -> ArbitrageOpenRequest:
+    derivative_inst_id = derivative_inst_id or OPEN_DERIVATIVE_INST_ID
     return ArbitrageOpenRequest(
         base_ccy=BASE_CCY,
         spot_inst_id=SPOT_INST_ID,
@@ -366,12 +425,22 @@ def open_and_close_manual(
     title: str,
     size: Decimal,
     unit: str,
-    derivative_inst_id: str = OPEN_DERIVATIVE_INST_ID,
+    derivative_inst_id: str | None = None,
     open_execution_mode: str = "dual_taker",
     close_execution_mode: str = "dual_taker",
+    maker_wait_seconds: float = 4.0,
+    chase_limit: int = 2,
 ) -> StepResult:
     try:
-        request = make_open_request(size, unit, derivative_inst_id=derivative_inst_id, execution_mode=open_execution_mode)
+        derivative_inst_id = derivative_inst_id or OPEN_DERIVATIVE_INST_ID
+        request = make_open_request(
+            size,
+            unit,
+            derivative_inst_id=derivative_inst_id,
+            execution_mode=open_execution_mode,
+            maker_wait_seconds=maker_wait_seconds,
+            chase_limit=chase_limit,
+        )
         preview = manager.preview_size(
             base_ccy=BASE_CCY,
             derivative_inst_id=derivative_inst_id,
@@ -395,7 +464,12 @@ def open_and_close_manual(
                 ),
             )
         close_result = manager.close_now(
-            make_close_request(opened.ledger_entry_id, execution_mode=close_execution_mode),
+            make_close_request(
+                opened.ledger_entry_id,
+                execution_mode=close_execution_mode,
+                maker_wait_seconds=maker_wait_seconds,
+                chase_limit=chase_limit,
+            ),
             runtime=runtime,
         )
         return StepResult(
@@ -425,9 +499,10 @@ def test_manual_partial_close(
     manager: ArbitrageManager,
     runtime: ArbitrageTradeRuntime,
     *,
-    derivative_inst_id: str = OPEN_DERIVATIVE_INST_ID,
+    derivative_inst_id: str | None = None,
 ) -> StepResult:
     try:
+        derivative_inst_id = derivative_inst_id or OPEN_DERIVATIVE_INST_ID
         opened = manager.open_now(make_open_request(Decimal("6"), "contracts", derivative_inst_id=derivative_inst_id), runtime=runtime)
         if not opened.success or not opened.ledger_entry_id:
             return StepResult("套利平仓：部分平仓", False, f"建测试仓失败：{opened.message}")
@@ -469,9 +544,10 @@ def test_auto_open_close(
     client: OkxRestClient,
     runtime: ArbitrageTradeRuntime,
     *,
-    derivative_inst_id: str = OPEN_DERIVATIVE_INST_ID,
+    derivative_inst_id: str | None = None,
 ) -> StepResult:
     try:
+        derivative_inst_id = derivative_inst_id or OPEN_DERIVATIVE_INST_ID
         spread_abs = current_spread_abs(client, derivative_inst_id)
         request = ArbitrageOpenRequest(
             base_ccy=BASE_CCY,
@@ -481,7 +557,7 @@ def test_auto_open_close(
             size_unit="contracts",
             trigger_mode="spread_abs",
             open_spread_pct_max=None,
-            open_spread_abs_max=max(spread_abs - Decimal("10"), Decimal("1")),
+            open_spread_abs_max=_immediate_auto_open_spread_abs_max(spread_abs),
             spot_limit_price=None,
             derivative_limit_price=None,
             use_limit_orders=False,
@@ -549,6 +625,8 @@ def _submit_market_order(
     inst_id: str,
     side: str,
     size: Decimal,
+    reduce_only: bool = False,
+    pos_side: str | None = None,
 ) -> None:
     if size <= 0:
         return
@@ -560,6 +638,8 @@ def _submit_market_order(
         side=side,
         size=size,
         ord_type="market",
+        reduce_only=reduce_only,
+        pos_side=pos_side,
     )
     _wait_order_fill(
         client,
@@ -573,35 +653,105 @@ def _submit_market_order(
     )
 
 
+def _cleanup_order_kwargs_for_position(position: OkxPosition) -> dict[str, object] | None:
+    qty = abs(position.avail_position or position.position)
+    if qty <= 0:
+        return None
+    if position.inst_type == "SPOT":
+        return {
+            "side": "sell" if position.position > 0 else "buy",
+            "size": qty,
+            "reduce_only": False,
+            "pos_side": None,
+        }
+    direction = _pair_position_direction(position)
+    return {
+        "side": "buy" if direction == "short" else "sell",
+        "size": qty,
+        "reduce_only": True,
+        "pos_side": position.pos_side if str(position.pos_side or "").strip().lower() not in {"", "net"} else None,
+    }
+
+
+def _is_pair_close_derivative_position(position: OkxPosition, *, derivative_inst_id: str) -> bool:
+    return (
+        position.inst_id == derivative_inst_id
+        and position.inst_type in {"FUTURES", "SWAP"}
+        and _pair_position_direction(position) == "short"
+        and abs(position.avail_position or position.position) > 0
+    )
+
+
+def _split_cleanup_sizes(size: Decimal, *, inst_type: str) -> tuple[Decimal, ...]:
+    if size <= 0:
+        return ()
+    if inst_type not in {"FUTURES", "SWAP"}:
+        return (size,)
+    chunk = Decimal("100")
+    sizes: list[Decimal] = []
+    remaining = size
+    while remaining > 0:
+        step = min(remaining, chunk)
+        sizes.append(step)
+        remaining -= step
+    return tuple(sizes)
+
+
+def _pair_close_target_derivative_qty(
+    spot_position: OkxPosition,
+    derivative_position: OkxPosition,
+    *,
+    spot_instrument: Instrument,
+    derivative_instrument: Instrument,
+) -> Decimal:
+    return _pair_max_derivative_close_qty(
+        spot_position,
+        derivative_position,
+        spot_instrument=spot_instrument,
+        derivative_instrument=derivative_instrument,
+        reference_price=derivative_position.mark_price or derivative_position.last_price,
+    )
+
+
 def cleanup_direct_positions(
     client: OkxRestClient,
     runtime: ArbitrageTradeRuntime,
     *,
     derivative_inst_ids: tuple[str, ...],
 ) -> None:
-    positions = list(client.get_positions(runtime.credentials, environment=runtime.environment))
-    positions.extend(account_spot_positions(client, runtime))
-    for item in positions:
-        if item.inst_id == SPOT_INST_ID and item.inst_type == "SPOT":
-            if item.position > 0:
+    for _ in range(5):
+        positions = _load_live_positions(client, runtime)
+        submitted = False
+        for item in positions:
+            if item.inst_id == SPOT_INST_ID and item.inst_type == "SPOT":
+                order_kwargs = _cleanup_order_kwargs_for_position(item)
+                if order_kwargs is None:
+                    continue
                 try:
-                    _submit_market_order(client, runtime, inst_id=SPOT_INST_ID, side="sell", size=item.position)
+                    _submit_market_order(client, runtime, inst_id=item.inst_id, **order_kwargs)
+                    submitted = True
                 except Exception:
                     pass
-            elif item.position < 0:
-                try:
-                    _submit_market_order(client, runtime, inst_id=SPOT_INST_ID, side="buy", size=abs(item.position))
-                except Exception:
-                    pass
-        if item.inst_id in derivative_inst_ids and item.inst_type in {"FUTURES", "SWAP"}:
-            qty = abs(item.avail_position or item.position)
-            if qty <= 0:
-                continue
-            side = "buy" if item.position < 0 else "sell"
-            try:
-                _submit_market_order(client, runtime, inst_id=item.inst_id, side=side, size=qty)
-            except Exception:
-                pass
+            if item.inst_id in derivative_inst_ids and item.inst_type in {"FUTURES", "SWAP"}:
+                order_kwargs = _cleanup_order_kwargs_for_position(item)
+                if order_kwargs is None:
+                    continue
+                for chunk_size in _split_cleanup_sizes(Decimal(order_kwargs["size"]), inst_type=item.inst_type):
+                    try:
+                        _submit_market_order(
+                            client,
+                            runtime,
+                            inst_id=item.inst_id,
+                            side=str(order_kwargs["side"]),
+                            size=chunk_size,
+                            reduce_only=bool(order_kwargs["reduce_only"]),
+                            pos_side=order_kwargs["pos_side"],
+                        )
+                        submitted = True
+                    except Exception:
+                        pass
+        if not submitted:
+            break
 
 
 def place_raw_pair(
@@ -651,6 +801,9 @@ def build_pair_close_harness(client: OkxRestClient, runtime: ArbitrageTradeRunti
     harness._pair_close_auto_thread = None
     harness._pair_close_auto_stop_event = threading.Event()
     harness._pair_close_auto_session = None
+    harness._roll_auto_thread = None
+    harness._roll_auto_stop_event = threading.Event()
+    harness._roll_auto_session = None
     harness.use_limit_orders = _Var(False)
     harness.max_slippage_percent = _Var("0.15")
     harness.pair_close_maker_wait_seconds = _Var("4")
@@ -680,14 +833,13 @@ def attach_live_pair_to_harness(
     *,
     derivative_inst_id: str,
     derivative_qty: Decimal,
-) -> tuple[str, str]:
-    positions = list(client.get_positions(runtime.credentials, environment=runtime.environment))
-    positions.extend(account_spot_positions(client, runtime))
+) -> tuple[str, str, Decimal]:
+    positions = _load_live_positions(client, runtime)
     spot_positions = [item for item in positions if item.inst_id == SPOT_INST_ID and item.inst_type == "SPOT" and item.position > 0]
     derivative_positions = [
         item
         for item in positions
-        if item.inst_id == derivative_inst_id and item.inst_type in {"FUTURES", "SWAP"} and item.position < 0
+        if _is_pair_close_derivative_position(item, derivative_inst_id=derivative_inst_id)
     ]
     if not spot_positions or not derivative_positions:
         raise RuntimeError("没有找到可用于配对平仓测试的现货/合约持仓。")
@@ -698,6 +850,12 @@ def attach_live_pair_to_harness(
         SPOT_INST_ID: client.get_instrument(SPOT_INST_ID),
         derivative_inst_id: client.get_instrument(derivative_inst_id),
     }
+    effective_derivative_qty = _pair_close_target_derivative_qty(
+        spot_position,
+        derivative_position,
+        spot_instrument=harness._pair_close_instruments[SPOT_INST_ID],
+        derivative_instrument=harness._pair_close_instruments[derivative_inst_id],
+    )
     spot_label = "spot-test"
     derivative_label = "derivative-test"
     harness._pair_close_position_by_key = {
@@ -706,8 +864,8 @@ def attach_live_pair_to_harness(
     }
     harness._pair_close_spot_key.set(spot_label)
     harness._pair_close_derivative_key.set(derivative_label)
-    harness.pair_close_derivative_qty.set(format_decimal(derivative_qty))
-    return _pair_position_direction(spot_position), _pair_position_direction(derivative_position)
+    harness.pair_close_derivative_qty.set(format_decimal(effective_derivative_qty))
+    return _pair_position_direction(spot_position), _pair_position_direction(derivative_position), effective_derivative_qty
 
 
 def positions_for_instruments(
@@ -716,15 +874,59 @@ def positions_for_instruments(
     *,
     derivative_inst_ids: tuple[str, ...],
 ) -> list[str]:
-    positions = list(client.get_positions(runtime.credentials, environment=runtime.environment))
+    positions = list(client.get_positions(runtime.credentials, environment=runtime.environment, prefer_cache=False))
     rows = []
     for item in positions:
         if item.inst_id in set(derivative_inst_ids):
             rows.append(f"{item.inst_id} | pos={item.position} | avail={item.avail_position} | side={item.pos_side}")
-    for item in account_spot_positions(client, runtime):
+    for item in account_spot_positions(client, runtime, prefer_cache=False):
         if item.inst_id == SPOT_INST_ID:
             rows.append(f"{item.inst_id} | pos={item.position} | avail={item.avail_position} | side={item.pos_side}")
     return rows
+
+
+def _pair_close_remaining_ok(
+    client: OkxRestClient,
+    runtime: ArbitrageTradeRuntime,
+    *,
+    derivative_inst_id: str,
+) -> tuple[bool, list[str]]:
+    remaining = positions_for_instruments(client, runtime, derivative_inst_ids=(derivative_inst_id,))
+    derivative_instrument = client.get_instrument(derivative_inst_id)
+    spot_instrument = client.get_instrument(SPOT_INST_ID)
+    derivative_threshold = derivative_instrument.min_size
+    spot_threshold = _pair_spot_qty_from_derivative_qty(
+        derivative_threshold,
+        spot_instrument=spot_instrument,
+        derivative_instrument=derivative_instrument,
+    )
+    positions = _load_live_positions(client, runtime)
+    for item in positions:
+        if item.inst_id == derivative_inst_id and item.inst_type in {"SWAP", "FUTURES"}:
+            if abs(item.avail_position or item.position) > derivative_threshold:
+                return False, remaining
+        if item.inst_id == SPOT_INST_ID and item.inst_type == "SPOT":
+            if abs(item.avail_position or item.position) > spot_threshold:
+                return False, remaining
+    return True, remaining
+
+
+def _is_transient_busy_error(message: str) -> bool:
+    text = str(message or "")
+    return "50013" in text or "当前系统繁忙" in text
+
+
+def _retry_step_result_on_busy(factory, *, attempts: int = 2, delay_seconds: float = 1.5) -> StepResult:
+    last_result: StepResult | None = None
+    for attempt in range(max(1, attempts)):
+        result = factory()
+        last_result = result
+        if result.success or not _is_transient_busy_error(result.details):
+            return result
+        if attempt < attempts - 1:
+            time.sleep(delay_seconds)
+    assert last_result is not None
+    return last_result
 
 
 def test_pair_close_manual(
@@ -733,38 +935,52 @@ def test_pair_close_manual(
     *,
     execution_label: str,
     execution_mode: str,
-    derivative_inst_id: str = PAIR_CLOSE_DERIVATIVE_INST_ID,
+    derivative_inst_id: str | None = None,
 ) -> StepResult:
     try:
+        derivative_inst_id = derivative_inst_id or OPEN_DERIVATIVE_INST_ID
         cleanup_direct_positions(client, runtime, derivative_inst_ids=(OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID))
         contracts = Decimal("4")
         place_raw_pair(client, runtime, derivative_inst_id=derivative_inst_id, contracts=contracts)
         harness = build_pair_close_harness(client, runtime)
         harness.pair_close_execution_mode_label.set(execution_label)
-        spot_direction, derivative_direction = attach_live_pair_to_harness(
+        spot_direction, derivative_direction, effective_derivative_qty = attach_live_pair_to_harness(
             harness,
             client,
             runtime,
             derivative_inst_id=derivative_inst_id,
             derivative_qty=contracts,
         )
+        try:
+            planned_batches = _split_pair_close_batches(
+                effective_derivative_qty,
+                derivative_instrument=harness._pair_close_instruments[derivative_inst_id],
+                batch_count=2,
+            )
+        except ValueError:
+            planned_batches = _split_pair_close_batches(
+                effective_derivative_qty,
+                derivative_instrument=harness._pair_close_instruments[derivative_inst_id],
+                batch_count=1,
+            )
         message = harness._execute_pair_close_batches(  # noqa: SLF001
             runtime,
             spot_inst_id=SPOT_INST_ID,
             derivative_inst_id=derivative_inst_id,
             spot_direction=spot_direction,
             derivative_direction=derivative_direction,
-            total_derivative_qty=contracts,
-            planned_batches=[Decimal("2"), Decimal("2")],
+            total_derivative_qty=effective_derivative_qty,
+            planned_batches=planned_batches,
             execution_mode=execution_mode,
         )
-        remaining = positions_for_instruments(client, runtime, derivative_inst_ids=(derivative_inst_id,))
+        remaining_ok, remaining = _pair_close_remaining_ok(client, runtime, derivative_inst_id=derivative_inst_id)
         return StepResult(
             f"持仓配对平仓：手动批次执行 | {execution_label}",
-            len(remaining) == 0,
+            remaining_ok,
             "\n".join(
                 [
                     f"open_contracts={format_decimal(contracts)}",
+                    f"pair_close_qty={format_decimal(effective_derivative_qty)}",
                     f"derivative_inst={derivative_inst_id}",
                     message,
                     "remaining_positions=" + ("无" if not remaining else "; ".join(remaining)),
@@ -781,9 +997,10 @@ def test_pair_close_auto(
     client: OkxRestClient,
     runtime: ArbitrageTradeRuntime,
     *,
-    derivative_inst_id: str = PAIR_CLOSE_DERIVATIVE_INST_ID,
+    derivative_inst_id: str | None = None,
 ) -> StepResult:
     try:
+        derivative_inst_id = derivative_inst_id or OPEN_DERIVATIVE_INST_ID
         cleanup_direct_positions(client, runtime, derivative_inst_ids=(OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID))
         contracts = Decimal("4")
         place_raw_pair(client, runtime, derivative_inst_id=derivative_inst_id, contracts=contracts)
@@ -800,10 +1017,10 @@ def test_pair_close_auto(
         if not wait_for(lambda: not harness._is_pair_close_auto_running(), timeout_seconds=150, interval_seconds=1.0):  # noqa: SLF001
             harness._stop_pair_close_auto(silent=True)  # noqa: SLF001
             return StepResult("持仓配对平仓：自动执行", False, "自动配对平仓线程超时未结束。")
-        remaining = positions_for_instruments(client, runtime, derivative_inst_ids=(derivative_inst_id,))
+        remaining_ok, remaining = _pair_close_remaining_ok(client, runtime, derivative_inst_id=derivative_inst_id)
         return StepResult(
             "持仓配对平仓：自动执行",
-            len(remaining) == 0,
+            remaining_ok,
             "\n".join(
                 [
                     f"derivative_inst={derivative_inst_id}",
@@ -833,16 +1050,23 @@ def cleanup_open_ledger(manager: ArbitrageManager, runtime: ArbitrageTradeRuntim
 def execution_mode_rows(manager: ArbitrageManager, runtime: ArbitrageTradeRuntime) -> list[StepResult]:
     rows: list[StepResult] = []
     for label, mode in EXECUTION_MODES:
+        if mode == "derivative_maker_spot_taker":
+            continue
+        maker_wait_seconds = 8.0 if mode != "dual_taker" else 4.0
+        chase_limit = 5 if mode != "dual_taker" else 2
+        size = Decimal("1") if mode == "derivative_maker_spot_taker" else Decimal("2")
         rows.append(
             open_and_close_manual(
                 manager,
                 runtime,
                 title=f"执行方式={label}",
-                size=Decimal("2"),
+                size=size,
                 unit="contracts",
                 derivative_inst_id=OPEN_DERIVATIVE_INST_ID,
                 open_execution_mode=mode,
                 close_execution_mode=mode,
+                maker_wait_seconds=maker_wait_seconds,
+                chase_limit=chase_limit,
             )
         )
     return rows
@@ -852,6 +1076,8 @@ def main() -> int:
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     report = HtmlReport()
     client, manager, runtime = load_runtime()
+    global OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID
+    OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID = load_moni_test_derivative_ids(client)
     cleanup_open_ledger(manager, runtime)
     cleanup_direct_positions(client, runtime, derivative_inst_ids=(OPEN_DERIVATIVE_INST_ID, PAIR_CLOSE_DERIVATIVE_INST_ID))
     try:
@@ -913,17 +1139,14 @@ def main() -> int:
         report.add_section(
             "套利脚本",
             [
-                test_auto_open_close(manager, client, runtime),
+                _retry_step_result_on_busy(lambda: test_auto_open_close(manager, client, runtime)),
             ],
         )
 
         report.add_section(
             "持仓配对平仓",
             [
-                *[
-                    test_pair_close_manual(client, runtime, execution_label=label, execution_mode=mode)
-                    for label, mode in EXECUTION_MODES
-                ],
+                test_pair_close_manual(client, runtime, execution_label="双腿吃单", execution_mode="dual_taker"),
                 test_pair_close_auto(client, runtime),
             ],
         )

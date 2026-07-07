@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from okx_quant.arbitrage.launch_support import build_runtime_for_profile
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
-from okx_quant.persistence import load_credentials_profiles_snapshot, load_notification_snapshot
+from okx_quant.persistence import load_credentials_profiles_snapshot
 
 
 def load_runtime(profile_name: str | None = None) -> ArbitrageTradeRuntime | None:
-    notification_snapshot = load_notification_snapshot()
     snapshot = load_credentials_profiles_snapshot()
     profiles = snapshot.get("profiles", {}) if isinstance(snapshot, dict) else {}
     if not isinstance(profiles, dict) or not profiles:
@@ -21,8 +20,6 @@ def load_runtime(profile_name: str | None = None) -> ArbitrageTradeRuntime | Non
         selected,
         profile_snapshot=profile,
         fallback_runtime=None,
-        trade_mode=notification_snapshot.get("trade_mode_label"),
-        position_mode=notification_snapshot.get("position_mode_label"),
     )
 
 
