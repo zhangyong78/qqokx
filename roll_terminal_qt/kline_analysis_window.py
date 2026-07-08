@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import math
@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from okx_quant.candle_cache import load_candle_cache
+from okx_quant.analysis.box_detector import BoxDetectionConfig, detect_boxes
 from okx_quant.deribit_client import DeribitRestClient, DeribitVolatilityCandle
 from okx_quant.models import Candle
 from okx_quant.deribit_volatility_ui import (
@@ -67,6 +68,7 @@ from okx_quant.persistence import (
     save_kline_analysis_workspace_entries,
 )
 from okx_quant.signal_replay_engine import SignalReplayConfig, build_signal_replay_dataset
+from roll_terminal_qt.kline_box_rules import AUTO_BOX_MAX_CANDIDATES, is_auto_box_candidate_valid
 from roll_terminal_qt.kline_alerts import (
     build_workspace_key,
     evaluate_workspace_alerts,
@@ -1028,10 +1030,21 @@ def _build_box_history_overlays(candles: list[Any]) -> list[dict[str, Any]]:
         is_active = index == len(selected) - 1
         upper = float(box["upper"])
         lower = float(box["lower"])
+        history_end_index = _extend_history_box_end_index(
+            start_index=int(box["start_index"]),
+            end_index=int(box["end_index"]),
+            upper=upper,
+            lower=lower,
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            atr_values=atr_values,
+        )
         overlays.append(
             {
                 "start_index": int(box["start_index"]) + scan_offset,
-                "end_index": int(box["end_index"]) + scan_offset,
+                "end_index": history_end_index + scan_offset,
                 "upper": upper,
                 "lower": lower,
                 "mode": "history",
@@ -1048,80 +1061,64 @@ def _build_box_history_overlays(candles: list[Any]) -> list[dict[str, Any]]:
     return overlays
 
 
-def _build_box_realtime_overlay(candles: list[Any]) -> list[dict[str, Any]]:
-    if len(candles) < 48:
+def _build_box_current_overlay(candles: list[Any]) -> list[dict[str, Any]]:
+    if len(candles) < 24:
         return []
     scan_candles = list(candles[-_BOX_HISTORY_SCAN_LIMIT:])
     scan_offset = len(candles) - len(scan_candles)
-    opens = [_to_float(item.open) for item in scan_candles]
-    highs = [_to_float(item.high) for item in scan_candles]
-    lows = [_to_float(item.low) for item in scan_candles]
-    closes = [_to_float(item.close) for item in scan_candles]
-    ema15 = _to_ema(closes, 15)
-    ma50 = _to_sma(closes, 50)
-    atr_values = _simple_atr_values(highs=highs, lows=lows, closes=closes, period=14)
-
-    min_box_bars = 12
-    max_box_bars = 54
-    trend_lookback = 22
-    if len(scan_candles) <= trend_lookback + min_box_bars:
+    boxes = detect_boxes(scan_candles, BoxDetectionConfig(max_candidates=AUTO_BOX_MAX_CANDIDATES))
+    box = next((item for item in boxes if is_auto_box_candidate_valid(item, scan_candles)), None)
+    if box is None:
         return []
+    upper = float(box.upper)
+    lower = float(box.lower)
+    return [
+        {
+            "start_index": int(box.start_index) + scan_offset,
+            "end_index": int(box.end_index) + scan_offset,
+            "upper": upper,
+            "lower": lower,
+            "mode": "current",
+            "label": f"自动箱体 {lower:.2f}-{upper:.2f}",
+            "touches": int(box.upper_touches + box.lower_touches),
+            "violations": int(box.violations),
+            "trend": "",
+            "score": float(box.score),
+            "active": True,
+            "outline": _BOX_ACTIVE_OUTLINE_COLOR,
+            "fill": _BOX_ACTIVE_FILL_COLOR,
+        }
+    ]
 
-    candidates: list[dict[str, Any]] = []
-    for end_index in range(trend_lookback + min_box_bars, len(scan_candles)):
-        for box_len in range(min_box_bars, min(max_box_bars, end_index - trend_lookback) + 1):
-            start_index = end_index - box_len + 1
-            candidate = _score_manual_style_box_window(
-                start_index=start_index,
-                end_index=end_index,
-                opens=opens,
-                highs=highs,
-                lows=lows,
-                closes=closes,
-                ema15=ema15,
-                ma50=ma50,
-                atr_values=atr_values,
-                trend_lookback=trend_lookback,
-            )
-            if candidate is not None:
-                candidates.append(candidate)
-    if not candidates:
-        return []
 
-    selected: list[dict[str, Any]] = []
-    for candidate in sorted(candidates, key=lambda item: float(item.get("score", 0.0)), reverse=True):
-        if any(_box_window_overlap_ratio(candidate, item) > 0.45 for item in selected):
-            continue
-        selected.append(candidate)
-        if len(selected) >= _BOX_HISTORY_MAX_SEGMENTS:
+def _extend_history_box_end_index(
+    *,
+    start_index: int,
+    end_index: int,
+    upper: float,
+    lower: float,
+    opens: list[float],
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    atr_values: list[float],
+) -> int:
+    if end_index >= len(closes) - 1:
+        return end_index
+    width = max(upper - lower, 0.0)
+    price = max(abs(closes[end_index]), 1.0)
+    atr = max(_mean([value for value in atr_values[start_index : end_index + 1] if value > 0]), price * 0.001)
+    boundary_tolerance = max(width * 0.12, atr * 0.35)
+    extended_end = end_index
+    for index in range(end_index + 1, len(closes)):
+        body_high = max(opens[index], closes[index])
+        body_low = min(opens[index], closes[index])
+        if body_high > upper + boundary_tolerance or body_low < lower - boundary_tolerance:
             break
-    if not selected:
-        return []
+        extended_end = index
+    return extended_end
 
-    selected.sort(key=lambda item: int(item.get("start_index", 0)))
-    overlays: list[dict[str, Any]] = []
-    for index, box in enumerate(selected):
-        is_active = index == len(selected) - 1
-        upper = float(box["upper"])
-        lower = float(box["lower"])
-        overlays.append(
-            {
-                "start_index": int(box["start_index"]) + scan_offset,
-                "end_index": int(box["end_index"]) + scan_offset,
-                "upper": upper,
-                "lower": lower,
-                "mode": "realtime",
-                "label": f"实盘箱体 {lower:.2f}-{upper:.2f}",
-                "touches": int(box["touches"]),
-                "violations": int(box["violations"]),
-                "trend": str(box.get("trend", "")),
-                "score": float(box.get("score", 0.0)),
-                "active": is_active,
-                "outline": _BOX_ACTIVE_OUTLINE_COLOR if is_active else _BOX_LIVE_OUTLINE_COLOR,
-                "fill": _BOX_ACTIVE_FILL_COLOR if is_active else _BOX_LIVE_FILL_COLOR,
-            }
-        )
-    return overlays
+
 def _score_manual_style_box_window(
     *,
     start_index: int,
@@ -2390,7 +2387,7 @@ if QChartView is not None:
                 mode = str(overlay.get("mode", "history") or "").strip().lower()
                 trend_text = f" | {_BOX_TREND_LABELS.get(trend, trend)}" if trend else ""
                 lines.append(
-                    f"{'实盘' if mode == 'realtime' else '历史'}箱体 {lower:.2f}-{upper:.2f} | 触点 {touches}{trend_text}"
+                    f"{'自动' if mode == 'current' else '历史'}箱体 {lower:.2f}-{upper:.2f} | 触点 {touches}{trend_text}"
                 )
             return tuple(lines)
 
@@ -2853,7 +2850,7 @@ class KlineDataLoader(QThread):
             sma50_values=sma50_values,
         )
         box_overlays = list(_build_box_history_overlays(list(candles)))
-        box_overlays.extend(_build_box_realtime_overlay(list(candles)))
+        box_overlays.extend(_build_box_current_overlay(list(candles)))
 
         alert_snapshot = None
         if include_alerts:
@@ -3494,7 +3491,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._box_breakout_alert_check.toggled.connect(self._sync_chart_options)
         control_layout.addWidget(self._box_breakout_alert_check)
 
-        self._live_box_check = QCheckBox("实盘箱体")
+        self._live_box_check = QCheckBox("历史箱体")
         self._live_box_check.setChecked(False)
         self._live_box_check.toggled.connect(self._save_workspace_settings)
         self._live_box_check.toggled.connect(self._sync_chart_options)
@@ -3643,10 +3640,8 @@ class KlineAnalysisWindow(QMainWindow):
         if self._secondary_sync_period_btn is None:
             return
         if self._secondary_chart_kind() == "volatility":
-            self._secondary_sync_period_btn.setText("同周期")
-            self._secondary_sync_period_btn.setToolTip(
-                "副图为波动率时：主图和副图同步切换周期（1H/4H/1D）"
-            )
+            self._secondary_sync_period_btn.setText("同周期切换")
+            self._secondary_sync_period_btn.setToolTip("副图为波动率时：主图和副图同步切换周期（1H/4H/1D）")
             return
         self._secondary_sync_period_btn.setText("1D+4H")
         self._secondary_sync_period_btn.setToolTip("副图为K线时：主图设为1D、副图设为4H，并切换到最近视图")
@@ -3743,11 +3738,22 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _on_secondary_chart_kind_cycle_clicked(self) -> None:
-        self._secondary_chart_kind_mode = (
-            "volatility" if self._secondary_chart_kind() == "kline" else "kline"
-        )
+        previous_kind = self._secondary_chart_kind()
+        self._secondary_chart_kind_mode = ("volatility" if previous_kind == "kline" else "kline")
         self._refresh_secondary_chart_kind_button()
-        if self._secondary_chart_kind() == "volatility":
+        self._refresh_secondary_sync_period_button()
+        if previous_kind == "kline" and self._secondary_chart_kind() == "volatility":
+            self._period_combo.blockSignals(True)
+            self._secondary_period_combo.blockSignals(True)
+            self._period_combo.setCurrentText("1H")
+            self._secondary_period_combo.setCurrentText("1H")
+            self._period_combo.blockSignals(False)
+            self._secondary_period_combo.blockSignals(False)
+            self._sync_primary_period_buttons()
+            self._set_chart_view_range_mode("recent")
+            self._apply_chart_view_range()
+            self._refresh_timer.setInterval(self._auto_refresh_interval_ms("1H"))
+        elif self._secondary_chart_kind() == "volatility":
             current_period = self._secondary_period_combo.currentText().strip().upper()
             if current_period not in {"1H", "4H", "1D"}:
                 self._secondary_period_combo.blockSignals(True)
@@ -4432,19 +4438,19 @@ class KlineAnalysisWindow(QMainWindow):
         return filtered
 
     def _visible_box_overlays(self, payload: KlineChartPayload) -> list[dict[str, Any]]:
-        show_history = self._box_breakout_alert_check.isChecked()
-        show_realtime = getattr(self, "_live_box_check", None)
-        show_realtime = bool(show_realtime.isChecked()) if show_realtime is not None else False
-        if not show_history and not show_realtime:
+        show_current = self._box_breakout_alert_check.isChecked()
+        show_history = getattr(self, "_live_box_check", None)
+        show_history = bool(show_history.isChecked()) if show_history is not None else False
+        if not show_current and not show_history:
             return []
         visible: list[dict[str, Any]] = []
         for item in payload.box_overlays:
             if not isinstance(item, dict):
                 continue
             mode = str(item.get("mode", "history")).strip().lower()
-            if mode == "realtime" and not show_realtime:
+            if mode == "history" and not show_history:
                 continue
-            if mode != "realtime" and not show_history:
+            if mode != "history" and not show_current:
                 continue
             visible.append(dict(item))
         return visible
@@ -4900,9 +4906,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._box_breakout_alert_check.blockSignals(False)
         self._live_box_check.blockSignals(False)
         self._backend_hint.setText(
-            "当前采用Qt绘图。支持：K线 | 成交量 | 形态显示 | 画线功能 | 实盘箱体 | 历史仓位"
+            "当前采用Qt绘图。支持：K线 | 成交量 | 形态显示 | 画线功能 | 历史箱体 | 历史仓位"
             if self._use_native_chart
-            else "当前采用Web版绘图。支持：K线 | 成交量 | 形态显示 | 画线功能 | 实盘箱体 | 历史仓位"
+            else "当前采用Web版绘图。支持：K线 | 成交量 | 形态显示 | 画线功能 | 历史箱体 | 历史仓位"
         )
         self._populate_line_table()
         self._refresh_event_log()
@@ -5804,3 +5810,4 @@ class KlineAnalysisWindow(QMainWindow):
             </html>
             """
         return html.replace("__RECENT_VIEW_BARS__", str(_RECENT_VIEW_BARS))
+

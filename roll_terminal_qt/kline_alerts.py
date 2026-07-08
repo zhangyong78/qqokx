@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from okx_quant.analysis import TrendlineDetectionConfig, detect_trendlines
 from okx_quant.analysis.box_detector import BoxDetectionConfig, detect_boxes
+from roll_terminal_qt.kline_box_rules import AUTO_BOX_MAX_CANDIDATES, is_auto_box_candidate_valid
 
 
 _LINE_KINDS = {"horizontal", "trend"}
@@ -203,15 +204,15 @@ def _evaluate_box_breakout_alert(raw_candles: list[Any], rule: dict[str, object]
     reference = _tail_candles(raw_candles[:-1], limit=_STRUCTURE_SCAN_BAR_LIMIT)
     if len(reference) < 24:
         return None
-    boxes = detect_boxes(reference, BoxDetectionConfig(max_candidates=1))
-    if not boxes:
+    boxes = detect_boxes(reference, BoxDetectionConfig(max_candidates=AUTO_BOX_MAX_CANDIDATES))
+    box = next((item for item in boxes if is_auto_box_candidate_valid(item, reference)), None)
+    if box is None:
         return None
     previous = raw_candles[-2]
     current = raw_candles[-1]
     candle_time = _safe_int(getattr(current, "ts", 0)) // 1000
     if candle_time <= _safe_int(rule.get("last_event_candle_time")):
         return None
-    box = boxes[0]
     upper = float(box.upper)
     lower = float(box.lower)
     prev_close = _safe_float(getattr(previous, "close", 0.0))

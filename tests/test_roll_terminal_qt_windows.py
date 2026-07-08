@@ -56,6 +56,9 @@ from roll_terminal_qt.kline_analysis_window import (
     _EMA15_LINE_WIDTH,
     _SMA50_LINE_WIDTH,
     _apply_drag_to_line_rule,
+    _build_box_history_overlays,
+    _build_box_current_overlay,
+    _extend_history_box_end_index,
     _build_display_times_ms,
     _compute_axis_y_padding,
     _compute_hover_overlay_layout,
@@ -1276,7 +1279,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     self.assertIsNone(action_mock.call_args)
                     self.assertTrue(error_mock.called)
                     error_message = str(error_mock.call_args.args[1] if len(error_mock.call_args.args) > 1 else "")
-                    self.assertIn("不能超过当前可平仓", error_message)
+                    self.assertIn("不能超过当前可平仓位", error_message)
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -1482,7 +1485,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
                     self.assertIsNone(action_mock.call_args)
                     self.assertTrue(error_mock.called)
-                    self.assertIn("不能超过当前可平仓", str(error_mock.call_args.args[1] if len(error_mock.call_args.args) > 1 else ""))
+                    self.assertIn("不能超过当前可平仓位", str(error_mock.call_args.args[1] if len(error_mock.call_args.args) > 1 else ""))
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -1743,6 +1746,156 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         self.assertTrue(reversed_payload.stats["reverse_kline"])
         self.assertEqual(reversed_payload.stats["reverse_anchor_price"], 105.0)
 
+    def test_build_box_current_overlay_returns_current_effective_box(self) -> None:
+        candles = [SimpleNamespace(open=100.0, high=101.0, low=99.0, close=100.0) for _ in range(60)]
+        with patch(
+            "roll_terminal_qt.kline_analysis_window.detect_boxes",
+            return_value=[
+                SimpleNamespace(
+                    start_index=8,
+                    end_index=59,
+                    upper=Decimal("103"),
+                    lower=Decimal("97"),
+                    upper_touches=2,
+                    lower_touches=3,
+                    violations=0,
+                    score=Decimal("91"),
+                )
+            ],
+        ):
+            overlays = _build_box_current_overlay(candles)
+
+        self.assertEqual(len(overlays), 1)
+        self.assertEqual(overlays[0]["mode"], "current")
+        self.assertEqual(overlays[0]["start_index"], 8)
+        self.assertEqual(overlays[0]["end_index"], 59)
+        self.assertEqual(overlays[0]["touches"], 5)
+
+    def test_build_box_current_overlay_rejects_too_long_box(self) -> None:
+        candles = [SimpleNamespace(open=100.0, high=101.0, low=99.0, close=100.0) for _ in range(80)]
+        with patch(
+            "roll_terminal_qt.kline_analysis_window.detect_boxes",
+            return_value=[
+                SimpleNamespace(
+                    start_index=0,
+                    end_index=79,
+                    upper=Decimal("103"),
+                    lower=Decimal("97"),
+                    upper_touches=4,
+                    lower_touches=4,
+                    violations=0,
+                    score=Decimal("120"),
+                )
+            ],
+        ):
+            self.assertEqual(_build_box_current_overlay(candles), [])
+
+    def test_build_box_current_overlay_rejects_too_wide_box(self) -> None:
+        candles = [SimpleNamespace(open=100.0, high=101.0, low=99.0, close=100.0) for _ in range(60)]
+        with patch(
+            "roll_terminal_qt.kline_analysis_window.detect_boxes",
+            return_value=[
+                SimpleNamespace(
+                    start_index=12,
+                    end_index=59,
+                    upper=Decimal("110"),
+                    lower=Decimal("90"),
+                    upper_touches=4,
+                    lower_touches=4,
+                    violations=0,
+                    score=Decimal("95"),
+                )
+            ],
+        ):
+            self.assertEqual(_build_box_current_overlay(candles), [])
+
+    def test_extend_history_box_end_index_advances_until_breakout_bar(self) -> None:
+        highs = [101.0, 101.0, 101.2, 101.3, 101.1, 101.0]
+        lows = [99.0, 99.2, 99.1, 99.0, 99.3, 98.2]
+        opens = [100.0, 100.2, 100.1, 100.4, 100.3, 99.0]
+        closes = [100.1, 100.1, 100.5, 100.6, 100.4, 98.4]
+        atr_values = [0.8, 0.8, 0.8, 0.8, 0.8, 0.8]
+
+        end_index = _extend_history_box_end_index(
+            start_index=0,
+            end_index=2,
+            upper=101.4,
+            lower=98.9,
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            atr_values=atr_values,
+        )
+
+        self.assertEqual(end_index, 4)
+
+    def test_build_box_history_overlays_extends_box_until_breakout_bar(self) -> None:
+        candles = []
+        for index in range(60):
+            close = 100.2
+            low = 99.2
+            if index == 39:
+                close = 97.9
+                low = 97.7
+            candles.append(SimpleNamespace(open=100.0, high=101.0, low=low, close=close))
+
+        def fake_score_manual_style_box_window(**kwargs):
+            if kwargs["start_index"] == 25 and kwargs["end_index"] == 36:
+                return {
+                    "start_index": 25,
+                    "end_index": 36,
+                    "upper": 101.4,
+                    "lower": 98.9,
+                    "touches": 4,
+                    "violations": 0,
+                    "trend": "up",
+                    "score": 95.0,
+                }
+            return None
+
+        with patch(
+            "roll_terminal_qt.kline_analysis_window._score_manual_style_box_window",
+            side_effect=fake_score_manual_style_box_window,
+        ):
+            overlays = _build_box_history_overlays(candles)
+
+        matching = next(item for item in overlays if item["start_index"] == 25)
+        self.assertEqual(matching["end_index"], 38)
+
+    def test_visible_box_overlays_separates_current_and_history_modes(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                payload = KlineChartPayload(
+                    candles=[],
+                    ema_9=[],
+                    ema_21=[],
+                    ema_55=[],
+                    trend_indicator=[],
+                    signal_markers=[],
+                    box_overlays=[
+                        {"mode": "history", "start_index": 1, "end_index": 4, "upper": 10.0, "lower": 8.0},
+                        {"mode": "current", "start_index": 5, "end_index": 9, "upper": 11.0, "lower": 9.0},
+                    ],
+                    raw_candles=[],
+                    stats={},
+                    alert_snapshot=None,
+                )
+
+                window._box_breakout_alert_check.setChecked(True)
+                window._live_box_check.setChecked(False)
+                current_only = window._visible_box_overlays(payload)
+
+                window._box_breakout_alert_check.setChecked(False)
+                window._live_box_check.setChecked(True)
+                history_only = window._visible_box_overlays(payload)
+            finally:
+                self.__class__.dispose_widget(window)
+
+        self.assertEqual([item["mode"] for item in current_only], ["current"])
+        self.assertEqual([item["mode"] for item in history_only], ["history"])
+
     def test_request_keys_include_reverse_kline_state(self) -> None:
         with (
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
@@ -1759,6 +1912,46 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
                 self.assertTrue(primary_key[-1])
                 self.assertTrue(secondary_key[-1])
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_secondary_sync_period_button_shows_same_period_switch_for_volatility(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_kind_mode = "volatility"
+                window._refresh_secondary_chart_kind_button()
+                window._refresh_secondary_sync_period_button()
+                self.assertEqual(window._secondary_chart_kind_btn.text(), "副图K线")
+                self.assertEqual(window._secondary_sync_period_btn.text(), "同周期切换")
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_switching_secondary_chart_to_volatility_resets_both_periods_to_1h_and_recent_view(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._secondary_chart_check.setChecked(True)
+                window._period_combo.setCurrentText("1D")
+                window._secondary_period_combo.setCurrentText("4H")
+                window._set_chart_view_range_mode("full")
+
+                with (
+                    patch.object(window, "_apply_chart_view_range") as apply_range,
+                    patch.object(window, "_load_data") as load_data,
+                ):
+                    window._on_secondary_chart_kind_cycle_clicked()
+
+                self.assertEqual(window._secondary_chart_kind(), "volatility")
+                self.assertEqual(window._period_combo.currentText(), "1H")
+                self.assertEqual(window._secondary_period_combo.currentText(), "1H")
+                self.assertEqual(window._secondary_sync_period_btn.text(), "同周期切换")
+                self.assertEqual(window._chart_view_range_mode, "recent")
+                apply_range.assert_called_once()
+                load_data.assert_called_once()
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -2213,3 +2406,4 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

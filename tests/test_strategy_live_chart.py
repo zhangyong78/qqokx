@@ -16,6 +16,7 @@ from okx_quant.strategy_live_chart import (
     StrategyLiveChartTimeMarker,
     _ChartBounds,
     _layout_marker_label_positions,
+    _layout_time_marker_line_segments,
     _layout_time_marker_label_positions,
     append_candles_to_snapshot,
     build_auto_channel_live_chart_snapshot,
@@ -457,3 +458,65 @@ class StrategyLiveChartHelpersTest(TestCase):
 
         self.assertEqual(len(placements), 2)
         self.assertEqual({placement[4] for placement in placements}, {34.0})
+
+    def test_anchored_time_marker_lines_stop_before_candle_extremes(self) -> None:
+        bounds = _ChartBounds(left=76.0, top=40.0, right=476.0, bottom=540.0)
+        candles = tuple(
+            Candle(
+                ts=1714330800000 + index * 3_600_000,
+                open=Decimal("100"),
+                high=Decimal("110"),
+                low=Decimal("90"),
+                close=Decimal("101"),
+                volume=Decimal("1"),
+                confirmed=True,
+            )
+            for index in range(3)
+        )
+        snapshot = StrategyLiveChartSnapshot(session_id="S01", candles=candles)
+        markers = (
+            StrategyLiveChartTimeMarker(
+                key="open",
+                label="open",
+                at=datetime.fromtimestamp(candles[1].ts / 1000),
+                color="#6f42c1",
+                vertical_anchor="above",
+            ),
+            StrategyLiveChartTimeMarker(
+                key="close",
+                label="close",
+                at=datetime.fromtimestamp(candles[1].ts / 1000),
+                color="#cf222e",
+                vertical_anchor="below",
+            ),
+        )
+        placements = _layout_time_marker_label_positions(markers, snapshot, bounds, candle_step=80.0)
+
+        segments = _layout_time_marker_line_segments(
+            placements,
+            snapshot,
+            bounds,
+            candle_step=80.0,
+            lower=Decimal("80"),
+            upper=Decimal("120"),
+        )
+
+        self.assertEqual(len(segments), 2)
+        above = next(segment for segment in segments if segment[0].key == "open")
+        below = next(segment for segment in segments if segment[0].key == "close")
+        layout = StrategyLiveChartLayout(
+            800,
+            600,
+            76.0,
+            40.0,
+            476.0,
+            540.0,
+            Decimal("80"),
+            Decimal("120"),
+            80.0,
+            3,
+        )
+        candle_high_y = layout_price_to_y(layout, Decimal("110"))
+        candle_low_y = layout_price_to_y(layout, Decimal("90"))
+        self.assertLess(max(above[2], above[3]), candle_high_y)
+        self.assertGreater(min(below[2], below[3]), candle_low_y)

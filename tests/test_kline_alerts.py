@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from roll_terminal_qt.kline_alerts import (
     build_workspace_key,
@@ -109,6 +112,118 @@ class KlineAlertTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["kind"], "line_alert")
         self.assertTrue(updated["lines"][0]["triggered"])
+
+    def test_evaluate_workspace_alerts_emits_box_breakout_from_current_effective_box(self) -> None:
+        workspace = normalize_workspace_entry({"alerts": {"box_breakout": {"enabled": True}}})
+        raw_candles = [
+            SimpleNamespace(
+                ts=index * 1000,
+                open=Decimal("9.20"),
+                high=Decimal("9.40"),
+                low=Decimal("9.00"),
+                close=Decimal("9.20"),
+                confirmed=True,
+            )
+            for index in range(23)
+        ]
+        raw_candles.append(
+            SimpleNamespace(
+                ts=23_000,
+                open=Decimal("9.30"),
+                high=Decimal("9.80"),
+                low=Decimal("9.10"),
+                close=Decimal("9.60"),
+                confirmed=True,
+            )
+        )
+        raw_candles.append(
+            SimpleNamespace(
+                ts=24_000,
+                open=Decimal("9.70"),
+                high=Decimal("10.80"),
+                low=Decimal("9.50"),
+                close=Decimal("10.60"),
+                confirmed=True,
+            )
+        )
+
+        with patch(
+            "roll_terminal_qt.kline_alerts.detect_boxes",
+            return_value=[
+                SimpleNamespace(
+                    start_index=4,
+                    end_index=23,
+                    upper=Decimal("10.00"),
+                    lower=Decimal("9.30"),
+                    upper_touches=2,
+                    lower_touches=2,
+                    violations=0,
+                    score=Decimal("88"),
+                )
+            ],
+        ):
+            updated, events, _summary = evaluate_workspace_alerts(
+                workspace_entry=workspace,
+                candles=[],
+                ema_fast=[],
+                ma_slow=[],
+                raw_candles=raw_candles,
+            )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "box_breakout")
+        self.assertEqual(events[0]["direction"], "cross_above")
+        self.assertEqual(updated["alerts"]["box_breakout"]["last_event_candle_time"], 24)
+
+    def test_evaluate_workspace_alerts_ignores_too_wide_box_breakout(self) -> None:
+        workspace = normalize_workspace_entry({"alerts": {"box_breakout": {"enabled": True}}})
+        raw_candles = [
+            SimpleNamespace(
+                ts=index * 1000,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                confirmed=True,
+            )
+            for index in range(24)
+        ]
+        raw_candles.append(
+            SimpleNamespace(
+                ts=24_000,
+                open=Decimal("100"),
+                high=Decimal("112"),
+                low=Decimal("99"),
+                close=Decimal("112"),
+                confirmed=True,
+            )
+        )
+
+        with patch(
+            "roll_terminal_qt.kline_alerts.detect_boxes",
+            return_value=[
+                SimpleNamespace(
+                    start_index=4,
+                    end_index=23,
+                    upper=Decimal("110"),
+                    lower=Decimal("90"),
+                    upper_touches=3,
+                    lower_touches=3,
+                    violations=0,
+                    score=Decimal("90"),
+                )
+            ],
+        ):
+            updated, events, _summary = evaluate_workspace_alerts(
+                workspace_entry=workspace,
+                candles=[],
+                ema_fast=[],
+                ma_slow=[],
+                raw_candles=raw_candles,
+            )
+
+        self.assertEqual(events, [])
+        self.assertEqual(updated["alerts"]["box_breakout"]["last_event_candle_time"], 0)
 
 
 if __name__ == "__main__":

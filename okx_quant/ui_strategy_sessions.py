@@ -12,7 +12,7 @@ from okx_quant.strategy_runtime_registry import (
     strategy_entry_reference_period_caption,
     strategy_preferred_direction,
 )
-from okx_quant.strategy_catalog import supports_startup_chase_current_signal
+from okx_quant.strategy_catalog import is_ema55_slope_short_strategy, supports_startup_chase_current_signal
 from okx_quant.models import (
     describe_dynamic_protection_rules,
     dynamic_protection_rules_to_payload,
@@ -2132,6 +2132,15 @@ class UiStrategySessionsMixin:
             return None, None
         return latest_ledger.entry_price, latest_ledger.opened_at
 
+    @staticmethod
+    def _strategy_live_chart_event_anchors(direction_label: str) -> tuple[str, str]:
+        normalized = str(direction_label or "").strip().lower()
+        if any(token in normalized for token in ("short", "sell", "空")):
+            return "above", "below"
+        if any(token in normalized for token in ("long", "buy", "多")):
+            return "below", "above"
+        return "", ""
+
     def _strategy_live_chart_event_time_markers(
         self,
         session: StrategySession,
@@ -2142,6 +2151,7 @@ class UiStrategySessionsMixin:
         ledger_records = self._strategy_live_chart_ledger_records(session)
         latest_ledger = self._latest_strategy_trade_ledger_record(session)
         for ledger in ledger_records:
+            open_anchor, close_anchor = self._strategy_live_chart_event_anchors(ledger.direction_label)
             if ledger.opened_at is not None:
                 markers.append(
                     StrategyLiveChartTimeMarker(
@@ -2151,6 +2161,7 @@ class UiStrategySessionsMixin:
                         color="#6f42c1",
                         dash=(4, 3),
                         width=2,
+                        vertical_anchor=open_anchor,
                     )
                 )
             if ledger.opened_at and ledger.closed_at and ledger.closed_at >= ledger.opened_at:
@@ -2162,8 +2173,27 @@ class UiStrategySessionsMixin:
                         color="#cf222e",
                         dash=(6, 3),
                         width=2,
+                        vertical_anchor=close_anchor,
                     )
                 )
+
+        has_open_marker = any(marker.key == "entry_time" or marker.key.startswith("open:") for marker in markers)
+        if trade is not None and trade.opened_logged_at is not None and not has_open_marker:
+            direction_label = str(getattr(session, "direction_label", "") or "")
+            if latest_ledger is not None and not direction_label:
+                direction_label = latest_ledger.direction_label
+            open_anchor, _close_anchor = self._strategy_live_chart_event_anchors(direction_label)
+            markers.append(
+                StrategyLiveChartTimeMarker(
+                    key="entry_time",
+                    label=f"开仓 {trade.opened_logged_at.strftime('%m-%d %H:%M')}",
+                    at=trade.opened_logged_at,
+                    color="#6f42c1",
+                    dash=(4, 3),
+                    width=2,
+                    vertical_anchor=open_anchor,
+                )
+            )
 
         credentials = self._credentials_for_profile_or_none(session.api_name)
         if credentials is None:
@@ -2242,6 +2272,11 @@ class UiStrategySessionsMixin:
                 break
         if not open_side:
             open_side = str(relevant_fills[0].side or "").strip().lower()
+        fill_open_anchor, fill_close_anchor = ("", "")
+        if open_side == "sell":
+            fill_open_anchor, fill_close_anchor = "above", "below"
+        elif open_side == "buy":
+            fill_open_anchor, fill_close_anchor = "below", "above"
 
         seen_events: set[str] = set()
         same_side_seen = 0
@@ -2270,6 +2305,7 @@ class UiStrategySessionsMixin:
                         at=event_at,
                         color="#1d4ed8",
                         dash=(2, 2),
+                        vertical_anchor=fill_open_anchor,
                     )
                 )
                 continue
@@ -2284,6 +2320,7 @@ class UiStrategySessionsMixin:
                         color="#cf222e",
                         dash=(6, 3),
                         width=2,
+                        vertical_anchor=fill_close_anchor,
                     )
                 )
                 close_marker_exists = True
@@ -2295,6 +2332,7 @@ class UiStrategySessionsMixin:
                     at=event_at,
                     color="#d97706",
                     dash=(3, 3),
+                    vertical_anchor=fill_close_anchor,
                 )
             )
         return tuple(markers)
@@ -8773,6 +8811,18 @@ class UiStrategySessionsMixin:
         return mapping.get(normalized, "恢复中")
 
     def _restart_recoverable_signal_monitoring(self, session: StrategySession, credentials: Credentials) -> bool:
+        previous_trade = session.active_trade
+        if (
+            previous_trade is not None
+            and previous_trade.signal_bar_at is not None
+            and is_ema55_slope_short_strategy(session.config.strategy_id)
+        ):
+            session.engine._mark_ema55_slope_same_bar_reentry_block(
+                credentials,
+                session.config,
+                candle_ts=int(previous_trade.signal_bar_at.timestamp() * 1000),
+            )
+
         def _mark_recovery_back_to_running(status_note: str) -> None:
             session.status = "运行中"
             session.runtime_status = "等待信号"

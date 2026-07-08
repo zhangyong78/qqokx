@@ -1940,6 +1940,56 @@ HTTP 502: <!DOCTYPE html>
 
         self.assertEqual([marker.key for marker in markers], ["open:L01", "close:L01", "add:ent002", "reduce:red001"])
 
+    def test_strategy_live_chart_event_time_markers_anchor_by_trade_direction(self) -> None:
+        opened_at = datetime(2026, 4, 28, 9, 0)
+        closed_at = datetime(2026, 4, 28, 10, 15)
+        app = QuantApp.__new__(QuantApp)
+        app._strategy_trade_ledger_records = [
+            StrategyTradeLedgerRecord(
+                record_id="short",
+                history_record_id="H01",
+                session_id="S01",
+                api_name="moni",
+                strategy_id="ema55_slope_short",
+                strategy_name="EMA55 slope short",
+                symbol="SOL-USDT-SWAP",
+                direction_label="SHORT_ONLY",
+                run_mode_label="TRADE",
+                environment="demo",
+                opened_at=opened_at,
+                closed_at=closed_at,
+            ),
+            StrategyTradeLedgerRecord(
+                record_id="long",
+                history_record_id="H02",
+                session_id="S02",
+                api_name="moni",
+                strategy_id="ema_dynamic_order",
+                strategy_name="EMA dynamic",
+                symbol="ETH-USDT-SWAP",
+                direction_label="LONG_ONLY",
+                run_mode_label="TRADE",
+                environment="demo",
+                opened_at=opened_at,
+                closed_at=closed_at,
+            ),
+        ]
+        app._credentials_for_profile_or_none = lambda profile_name: None
+
+        short_markers = QuantApp._strategy_live_chart_event_time_markers(
+            app,
+            SimpleNamespace(session_id="S01", history_record_id="H01", api_name="moni", active_trade=None),
+            "SOL-USDT-SWAP",
+        )
+        long_markers = QuantApp._strategy_live_chart_event_time_markers(
+            app,
+            SimpleNamespace(session_id="S02", history_record_id="H02", api_name="moni", active_trade=None),
+            "ETH-USDT-SWAP",
+        )
+
+        self.assertEqual([(marker.key, marker.vertical_anchor) for marker in short_markers], [("open:short", "above"), ("close:short", "below")])
+        self.assertEqual([(marker.key, marker.vertical_anchor) for marker in long_markers], [("open:long", "below"), ("close:long", "above")])
+
     def test_strategy_live_chart_event_time_markers_ignore_unrelated_fills_after_closed_round(self) -> None:
         opened_at = datetime(2026, 4, 28, 9, 0)
         closed_at = datetime(2026, 4, 28, 10, 15)
@@ -4623,6 +4673,48 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertTrue(result)
         self.assertEqual(session.status, "恢复中")
         self.assertEqual(session.runtime_status, "恢复信号监听中")
+        start_custom.assert_called_once()
+
+    def test_restart_recoverable_signal_monitoring_reapplies_slope_same_bar_block(self) -> None:
+        session = self._make_session()
+        session.strategy_id = STRATEGY_EMA55_SLOPE_SHORT_ID
+        session.config.strategy_id = STRATEGY_EMA55_SLOPE_SHORT_ID
+        session.active_trade = StrategyTradeRuntimeState(
+            round_id="S01-1",
+            signal_bar_at=datetime(2026, 7, 6, 22, 0, 0),
+            opened_logged_at=datetime(2026, 7, 6, 21, 0, 20),
+            closed_logged_at=datetime(2026, 7, 6, 23, 44, 28),
+        )
+        session.log_prefix = "[S01]"
+        start_custom = MagicMock()
+        mark_same_bar_block = MagicMock()
+        session.engine = SimpleNamespace(
+            is_running=False,
+            start_custom=start_custom,
+            _run=MagicMock(),
+            _logger=MagicMock(),
+            _notify_error=MagicMock(),
+            _mark_ema55_slope_same_bar_reentry_block=mark_same_bar_block,
+            _stop_event=SimpleNamespace(is_set=lambda: False, set=lambda: None),
+        )
+        credentials = SimpleNamespace(profile_name="moni")
+        app = SimpleNamespace(
+            _remove_recoverable_strategy_session=MagicMock(),
+            _upsert_recoverable_strategy_session=MagicMock(),
+            _upsert_session_row=MagicMock(),
+            _sync_strategy_history_from_session=MagicMock(),
+            _log_session_message=MagicMock(),
+            root=SimpleNamespace(after=lambda _delay, callback: callback()),
+        )
+
+        result = QuantApp._restart_recoverable_signal_monitoring(app, session, credentials)
+
+        self.assertTrue(result)
+        mark_same_bar_block.assert_called_once_with(
+            credentials,
+            session.config,
+            candle_ts=int(datetime(2026, 7, 6, 22, 0, 0).timestamp() * 1000),
+        )
         start_custom.assert_called_once()
 
     def test_session_can_auto_migrate_on_close_only_allows_active_trade_for_exchange_mode(self) -> None:

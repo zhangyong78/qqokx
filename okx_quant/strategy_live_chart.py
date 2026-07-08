@@ -87,6 +87,7 @@ class StrategyLiveChartTimeMarker:
     color: str
     dash: tuple[int, ...] = ()
     width: int = 1
+    vertical_anchor: str = ""
 
 
 @dataclass(frozen=True)
@@ -729,11 +730,19 @@ def render_strategy_live_chart(
             font=("Microsoft YaHei UI", 9),
         )
 
-    for time_marker, x, x1, x2, y1, y2 in _layout_time_marker_label_positions(
+    time_marker_layouts = _layout_time_marker_label_positions(
         snapshot.time_markers,
         snapshot,
         bounds,
         candle_step,
+    )
+    for time_marker, x, y1, y2 in _layout_time_marker_line_segments(
+        time_marker_layouts,
+        snapshot,
+        bounds,
+        candle_step=candle_step,
+        lower=lower,
+        upper=upper,
     ):
         line_kwargs = {
             "fill": time_marker.color,
@@ -741,7 +750,8 @@ def render_strategy_live_chart(
         }
         if time_marker.dash:
             line_kwargs["dash"] = time_marker.dash
-        canvas.create_line(x, bounds.top, x, bounds.bottom, **line_kwargs)
+        canvas.create_line(x, y1, x, y2, **line_kwargs)
+    for time_marker, _x, x1, x2, y1, y2 in time_marker_layouts:
         canvas.create_rectangle(x1, y1, x2, y2, outline=time_marker.color, fill=_PRICE_LABEL_BG)
         canvas.create_text(
             x1 + 6,
@@ -1103,43 +1113,55 @@ def _layout_time_marker_label_positions(
 ) -> list[tuple[StrategyLiveChartTimeMarker, float, float, float, float, float]]:
     if not time_markers:
         return []
-    placements: list[dict[str, object]] = []
-    base_y1 = max(
+    top_placements: list[dict[str, object]] = []
+    bottom_placements: list[dict[str, object]] = []
+    top_base_y1 = max(
         _LEGEND_BASELINE_Y + _LEGEND_LABEL_HALF_HEIGHT + 8.0,
         bounds.top - 6.0,
     )
+    bottom_base_y1 = min(bounds.bottom + 6.0, max(bounds.top, bounds.bottom - 18.0))
     for marker in time_markers:
         label_text = marker.label
         text_width = max(len(label_text) * 7 + 14, 88)
         x = _time_marker_x(marker.at, snapshot, bounds, candle_step)
         max_left = max(bounds.left, bounds.right - text_width)
         x1 = min(max(bounds.left, x - text_width / 2), max_left)
-        placements.append(
-            {
-                "marker": marker,
-                "x": x,
-                "x1": x1,
-                "x2": x1 + text_width,
-            }
-        )
-    placements.sort(key=lambda item: (float(item["x1"]), float(item["x"])))
+        item = {
+            "marker": marker,
+            "x": x,
+            "x1": x1,
+            "x2": x1 + text_width,
+        }
+        if str(marker.vertical_anchor or "").strip().lower() == "below":
+            bottom_placements.append(item)
+        else:
+            top_placements.append(item)
 
-    row_right_edges: list[float] = []
-    for item in placements:
-        x1 = float(item["x1"])
-        x2 = float(item["x2"])
-        assigned_row = None
-        for row_index, row_right in enumerate(row_right_edges):
-            if x1 >= row_right + _TIME_MARKER_LABEL_MIN_GAP:
-                assigned_row = row_index
-                row_right_edges[row_index] = x2
-                break
-        if assigned_row is None:
-            assigned_row = len(row_right_edges)
-            row_right_edges.append(x2)
-        y1 = base_y1 + assigned_row * _TIME_MARKER_LABEL_ROW_HEIGHT
-        item["y1"] = y1
-        item["y2"] = y1 + 18.0
+    def _assign_rows(items: list[dict[str, object]], *, base_y1: float, direction: int) -> None:
+        items.sort(key=lambda item: (float(item["x1"]), float(item["x"])))
+        row_right_edges: list[float] = []
+        for item in items:
+            x1 = float(item["x1"])
+            x2 = float(item["x2"])
+            assigned_row = None
+            for row_index, row_right in enumerate(row_right_edges):
+                if x1 >= row_right + _TIME_MARKER_LABEL_MIN_GAP:
+                    assigned_row = row_index
+                    row_right_edges[row_index] = x2
+                    break
+            if assigned_row is None:
+                assigned_row = len(row_right_edges)
+                row_right_edges.append(x2)
+            y1 = base_y1 + direction * assigned_row * _TIME_MARKER_LABEL_ROW_HEIGHT
+            item["y1"] = y1
+            item["y2"] = y1 + 18.0
+
+    _assign_rows(top_placements, base_y1=top_base_y1, direction=1)
+    _assign_rows(bottom_placements, base_y1=bottom_base_y1, direction=-1)
+    placements = sorted(
+        (*top_placements, *bottom_placements),
+        key=lambda item: (float(item["x1"]), float(item["x"]), str(item["marker"].key)),
+    )
 
     return [
         (
@@ -1152,6 +1174,53 @@ def _layout_time_marker_label_positions(
         )
         for item in placements
     ]
+
+
+def _nearest_time_marker_candle_index(
+    marker: StrategyLiveChartTimeMarker,
+    snapshot: StrategyLiveChartSnapshot,
+) -> int | None:
+    if not snapshot.candles:
+        return None
+    target_ms = marker.at.timestamp() * 1000
+    return min(
+        range(len(snapshot.candles)),
+        key=lambda index: abs(snapshot.candles[index].ts - target_ms),
+    )
+
+
+def _layout_time_marker_line_segments(
+    placements: list[tuple[StrategyLiveChartTimeMarker, float, float, float, float, float]],
+    snapshot: StrategyLiveChartSnapshot,
+    bounds: _ChartBounds,
+    *,
+    candle_step: float,
+    lower: Decimal,
+    upper: Decimal,
+    candle_gap: float = 4.0,
+) -> list[tuple[StrategyLiveChartTimeMarker, float, float, float]]:
+    segments: list[tuple[StrategyLiveChartTimeMarker, float, float, float]] = []
+    for marker, x, _x1, _x2, label_y1, label_y2 in placements:
+        vertical_anchor = str(marker.vertical_anchor or "").strip().lower()
+        if vertical_anchor not in {"above", "below"}:
+            segments.append((marker, x, bounds.top, bounds.bottom))
+            continue
+        candle_index = _nearest_time_marker_candle_index(marker, snapshot)
+        if candle_index is None:
+            segments.append((marker, x, bounds.top, bounds.bottom))
+            continue
+        candle = snapshot.candles[candle_index]
+        if vertical_anchor == "above":
+            stop_y = _price_to_y(candle.high, lower, upper, bounds) - candle_gap
+            y1 = min(label_y2, stop_y - 1.0)
+            y2 = max(bounds.top, stop_y)
+            segments.append((marker, x, y1, y2))
+            continue
+        stop_y = _price_to_y(candle.low, lower, upper, bounds) + candle_gap
+        y1 = min(bounds.bottom, stop_y)
+        y2 = max(label_y1, stop_y + 1.0)
+        segments.append((marker, x, y1, y2))
+    return segments
 
 
 def _time_marker_x(
