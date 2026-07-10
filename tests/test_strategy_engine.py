@@ -743,6 +743,144 @@ class StrategyEngineTest(TestCase):
             previous_close = close
         return candles
 
+    def _run_dynamic_exchange_reentry_probe(
+        self,
+        *,
+        candle_counts: list[int],
+        stop_after_waits: int,
+        max_entries_per_trend: int = 3,
+        rejected_candle_ts: set[int] | None = None,
+        no_signal_candle_ts: set[int] | None = None,
+    ) -> tuple[list[int], list[int], int, list[float], list[str]]:
+        messages: list[str] = []
+        waits: list[float] = []
+        attempted_candles: list[int] = []
+        accepted_candles: list[int] = []
+        evaluate_calls = 0
+        candle_read_index = 0
+        rejected = rejected_candle_ts or set()
+        no_signal = no_signal_candle_ts or set()
+
+        class _StopStub:
+            def __init__(self) -> None:
+                self._stopped = False
+
+            def is_set(self) -> bool:
+                return self._stopped
+
+            def wait(self, timeout: float) -> bool:
+                waits.append(timeout)
+                if len(waits) >= stop_after_waits:
+                    self._stopped = True
+                return self._stopped
+
+        engine = StrategyEngine(
+            None,  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托-多头",
+            session_id="S-reentry-probe",
+        )
+        engine._stop_event = _StopStub()  # type: ignore[assignment]
+        engine._log_strategy_start = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._log_hourly_debug = lambda *args, **kwargs: None  # type: ignore[assignment]
+        engine._get_trigger_price_with_retry = lambda *args, **kwargs: Decimal("2305")  # type: ignore[assignment]
+        engine._manage_filled_dynamic_entry = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+        def _candles(*_args, **_kwargs):  # noqa: ANN001
+            nonlocal candle_read_index
+            index = min(candle_read_index, len(candle_counts) - 1)
+            candle_read_index += 1
+            return self._make_candles([str(2000 + item) for item in range(candle_counts[index])])
+
+        def _decision(confirmed, *_args, **_kwargs):  # noqa: ANN001
+            nonlocal evaluate_calls
+            evaluate_calls += 1
+            if confirmed[-1].ts in no_signal:
+                return SignalDecision(
+                    signal=None,
+                    reason="趋势失效",
+                    candle_ts=confirmed[-1].ts,
+                    entry_reference=None,
+                    atr_value=Decimal("10"),
+                    ema_value=Decimal("2290"),
+                )
+            return SignalDecision(
+                signal="long",
+                reason="趋势成立",
+                candle_ts=confirmed[-1].ts,
+                entry_reference=Decimal("2300"),
+                atr_value=Decimal("10"),
+                ema_value=Decimal("2310"),
+            )
+
+        def _submit(*_args, plan: OrderPlan, **_kwargs):  # noqa: ANN001
+            attempted_candles.append(plan.candle_ts)
+            if plan.candle_ts in rejected:
+                return None
+            accepted_candles.append(plan.candle_ts)
+            suffix = len(accepted_candles)
+            return (
+                f"cl-{suffix}",
+                OkxOrderResult(
+                    ord_id=f"ord-{suffix}",
+                    cl_ord_id=f"cl-{suffix}",
+                    s_code="0",
+                    s_msg="accepted",
+                    raw={},
+                ),
+                f"slg-{suffix}",
+            )
+
+        engine._get_candles_with_retry = _candles  # type: ignore[assignment]
+        engine._evaluate_dynamic_signal_decision = _decision  # type: ignore[assignment]
+        engine._submit_dynamic_limit_entry_order = _submit  # type: ignore[assignment]
+        engine._get_order_with_retry = lambda *args, **kwargs: OkxOrderStatus(  # type: ignore[assignment]
+            ord_id="ord-filled",
+            state="filled",
+            side="buy",
+            ord_type="limit",
+            price=Decimal("2300"),
+            avg_price=Decimal("2299"),
+            size=Decimal("0.01"),
+            filled_size=Decimal("0.01"),
+            raw={},
+        )
+
+        config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1m",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.01"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="last",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            risk_amount=Decimal("10"),
+            max_entries_per_trend=max_entries_per_trend,
+            take_profit_mode="dynamic",
+        )
+        instrument = Instrument(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+        )
+
+        with patch("okx_quant.engine.time.time", return_value=0.0):
+            engine._run_dynamic_exchange_strategy(None, config, instrument)  # type: ignore[arg-type]
+
+        return attempted_candles, accepted_candles, evaluate_calls, waits, messages
+
     def test_dynamic_mtf_live_decision_loads_filter_candles_and_blocks_mismatch(self) -> None:
         requested: list[tuple[str, str, int]] = []
         filter_candles = self._make_candles(["110", "106", "103", "101", "100"])
@@ -2376,6 +2514,70 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(evaluate_calls, 1)
         self.assertEqual(waits, [10, 60.0])
         self.assertFalse(any("第1波趋势开仓次数已达上限" in message for message in messages))
+
+    def test_dynamic_exchange_strategy_skips_candles_confirmed_while_position_was_open(self) -> None:
+        attempted, accepted, evaluate_calls, waits, _messages = self._run_dynamic_exchange_reentry_probe(
+            candle_counts=[80, 80, 82, 82],
+            stop_after_waits=2,
+        )
+
+        self.assertEqual(attempted, [80])
+        self.assertEqual(accepted, [80])
+        self.assertEqual(evaluate_calls, 1)
+        self.assertEqual(waits, [10, 60.0])
+
+    def test_dynamic_exchange_strategy_reenters_on_first_candle_confirmed_after_close(self) -> None:
+        attempted, accepted, evaluate_calls, waits, messages = self._run_dynamic_exchange_reentry_probe(
+            candle_counts=[80, 80, 82, 82, 83],
+            stop_after_waits=3,
+        )
+
+        self.assertEqual(attempted, [80, 83])
+        self.assertEqual(accepted, [80, 83])
+        self.assertEqual(evaluate_calls, 2)
+        self.assertEqual(waits, [10, 60.0, 10])
+        self.assertTrue(any("本波第2次委托" in message for message in messages))
+
+    def test_dynamic_exchange_strategy_allows_third_entry_after_another_post_close_candle(self) -> None:
+        attempted, accepted, evaluate_calls, waits, messages = self._run_dynamic_exchange_reentry_probe(
+            candle_counts=[80, 80, 82, 82, 83, 83, 84, 84, 85],
+            stop_after_waits=5,
+            max_entries_per_trend=3,
+        )
+
+        self.assertEqual(attempted, [80, 83, 85])
+        self.assertEqual(accepted, [80, 83, 85])
+        self.assertEqual(evaluate_calls, 3)
+        self.assertEqual(waits, [10, 60.0, 10, 60.0, 10])
+        self.assertTrue(any("本波第3次委托" in message for message in messages))
+
+    def test_dynamic_exchange_strategy_stops_reentry_at_configured_wave_limit(self) -> None:
+        attempted, accepted, evaluate_calls, waits, messages = self._run_dynamic_exchange_reentry_probe(
+            candle_counts=[80, 80, 82, 82, 83, 83, 84, 84, 85],
+            stop_after_waits=5,
+            max_entries_per_trend=2,
+        )
+
+        self.assertEqual(attempted, [80, 83])
+        self.assertEqual(accepted, [80, 83])
+        self.assertEqual(evaluate_calls, 3)
+        self.assertEqual(waits, [10, 60.0, 10, 60.0, 60.0])
+        self.assertTrue(any("开仓次数已达上限" in message for message in messages))
+
+    def test_dynamic_exchange_strategy_resets_wave_after_trend_invalidates(self) -> None:
+        attempted, accepted, evaluate_calls, waits, messages = self._run_dynamic_exchange_reentry_probe(
+            candle_counts=[80, 80, 82, 82, 83, 84],
+            stop_after_waits=4,
+            max_entries_per_trend=3,
+            no_signal_candle_ts={83},
+        )
+
+        self.assertEqual(attempted, [80, 84])
+        self.assertEqual(accepted, [80, 84])
+        self.assertEqual(evaluate_calls, 3)
+        self.assertEqual(waits, [10, 60.0, 60.0, 10])
+        self.assertTrue(any("第2波趋势开始" in message for message in messages))
+        self.assertTrue(any("第2波 | 本波第1次委托" in message for message in messages))
 
     def test_dynamic_exchange_strategy_transfers_to_position_monitor_when_cancel_lookup_finds_fill(self) -> None:
         messages: list[str] = []

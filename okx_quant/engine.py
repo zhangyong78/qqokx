@@ -799,6 +799,17 @@ class StrategyEngine:
             return
         mode_parts.append(config.daily_filter_summary())
 
+    def _refresh_dynamic_entry_candle_baseline(
+        self,
+        config: StrategyConfig,
+        *,
+        lookback: int,
+        fallback_ts: int,
+    ) -> int:
+        candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
+        confirmed = [candle for candle in candles if candle.confirmed]
+        return confirmed[-1].ts if confirmed else fallback_ts
+
     def _run_dynamic_exchange_strategy(
         self,
         credentials: Credentials,
@@ -928,7 +939,12 @@ class StrategyEngine:
                     # After a round-trip closes on the current confirmed candle,
                     # do not immediately re-place another entry from the same
                     # candle's reference price. Wait for the next confirmed bar.
-                    idle_signal_candle_ts = newest_ts
+                    idle_signal_candle_ts = self._refresh_dynamic_entry_candle_baseline(
+                        config,
+                        lookback=lookback,
+                        fallback_ts=newest_ts,
+                    )
+                    last_candle_ts = idle_signal_candle_ts
                     if self._stop_event.is_set():
                         return
                     self._logger("本轮持仓已结束，继续监控下一次信号。")
@@ -948,7 +964,12 @@ class StrategyEngine:
                         continue
                     entries_in_current_wave += 1
                     active_order = None
-                    idle_signal_candle_ts = newest_ts
+                    idle_signal_candle_ts = self._refresh_dynamic_entry_candle_baseline(
+                        config,
+                        lookback=lookback,
+                        fallback_ts=newest_ts,
+                    )
+                    last_candle_ts = idle_signal_candle_ts
                     if self._stop_event.is_set():
                         return
                     self._logger("本轮持仓已结束，继续监控下一次信号。")
@@ -984,7 +1005,12 @@ class StrategyEngine:
                         dynamic_stop_only=dynamic_stop_only,
                     )
                     active_order = None
-                    idle_signal_candle_ts = newest_ts
+                    idle_signal_candle_ts = self._refresh_dynamic_entry_candle_baseline(
+                        config,
+                        lookback=lookback,
+                        fallback_ts=newest_ts,
+                    )
+                    last_candle_ts = idle_signal_candle_ts
                     if self._stop_event.is_set():
                         return
                     self._logger("本轮持仓已结束，继续监控下一次信号。")
@@ -1007,7 +1033,12 @@ class StrategyEngine:
                         continue
                     entries_in_current_wave += 1
                     active_order = None
-                    idle_signal_candle_ts = newest_ts
+                    idle_signal_candle_ts = self._refresh_dynamic_entry_candle_baseline(
+                        config,
+                        lookback=lookback,
+                        fallback_ts=newest_ts,
+                    )
+                    last_candle_ts = idle_signal_candle_ts
                     if self._stop_event.is_set():
                         return
                     self._logger("本轮持仓已结束，继续监控下一次信号。")
