@@ -839,8 +839,8 @@ def _rr_condition_status_text(entry: RRTradeLedgerEntry | None) -> str:
 
     return " | ".join(
         (
-            _link_text("止损", entry.stop_loss_order),
-            _link_text("止盈", entry.take_profit_order),
+            _link_text("止损", getattr(entry, "stop_loss_order", None)),
+            _link_text("止盈", getattr(entry, "take_profit_order", None)),
         )
     )
 
@@ -5549,10 +5549,6 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _refresh_api_profiles(self) -> None:
         self._profile_snapshots, selected_profile = load_profile_snapshots()
-        names = list(self._profile_snapshots)
-        if not names:
-            names = [str(item).strip() for item in profile_names() if str(item).strip()]
-        self._unlocked_profiles.intersection_update(set(names))
         self._suppress_api_profile_change = True
         try:
             runtime = self._runtime if self._runtime is not None else load_runtime("moni") or load_runtime()
@@ -5563,6 +5559,17 @@ class KlineAnalysisWindow(QMainWindow):
                 if not runtime_profile:
                     credentials = getattr(runtime, "credentials", None)
                     runtime_profile = str(getattr(credentials, "profile_name", "") or "").strip()
+            names: list[str] = []
+            for candidate in (
+                *list(self._profile_snapshots),
+                *(str(item).strip() for item in profile_names()),
+                selected_profile,
+                runtime_profile,
+            ):
+                normalized = str(candidate or "").strip()
+                if normalized and normalized not in names:
+                    names.append(normalized)
+            self._unlocked_profiles.intersection_update(set(names))
             if runtime_profile:
                 self._unlocked_profiles.add(runtime_profile)
             self._api_profile_combo.clear()
