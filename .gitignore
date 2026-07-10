@@ -23,6 +23,7 @@ debug_*.txt
 dist/
 build/
 *.egg-info/
+.worktrees/
 reports/任务.txt
 reports/backtest_exports/batch_*.txt
 reports/backtest_exports/single_*.txt
