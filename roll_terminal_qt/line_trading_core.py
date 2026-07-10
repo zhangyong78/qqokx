@@ -157,20 +157,31 @@ def nearest_rr_hit(
     return None if nearest is None else nearest[1]
 
 
-def drag_rr_annotation(annotation: RiskRewardAnnotation, handle: str, new_price: Decimal) -> RiskRewardAnnotation:
+def drag_rr_annotation(
+    annotation: RiskRewardAnnotation,
+    handle: str,
+    new_price: Decimal,
+    *,
+    bar_delta: float = 0.0,
+) -> RiskRewardAnnotation:
     minimum_gap = Decimal("0.000001")
     side = annotation.side.strip().lower()
     price_entry = annotation.price_entry
     price_stop = annotation.price_stop
     price_tp = annotation.price_tp
     r_multiple = annotation.r_multiple
+    bar_entry = annotation.bar_entry
+    bar_stop = annotation.bar_stop
 
     if side == "long":
-        if handle == "rr_entry":
+        if handle in {"rr_entry", "rr_move"}:
             delta = new_price - price_entry
             price_entry += delta
             price_stop += delta
             price_tp += delta
+            if handle == "rr_move":
+                bar_entry += float(bar_delta)
+                bar_stop += float(bar_delta)
         elif handle == "rr_stop":
             price_stop = min(new_price, price_entry - minimum_gap)
             risk = price_entry - price_stop
@@ -182,11 +193,14 @@ def drag_rr_annotation(annotation: RiskRewardAnnotation, handle: str, new_price:
             if risk > 0:
                 r_multiple = (price_tp - price_entry) / risk
     elif side == "short":
-        if handle == "rr_entry":
+        if handle in {"rr_entry", "rr_move"}:
             delta = new_price - price_entry
             price_entry += delta
             price_stop += delta
             price_tp += delta
+            if handle == "rr_move":
+                bar_entry += float(bar_delta)
+                bar_stop += float(bar_delta)
         elif handle == "rr_stop":
             price_stop = max(new_price, price_entry + minimum_gap)
             risk = price_stop - price_entry
@@ -203,8 +217,8 @@ def drag_rr_annotation(annotation: RiskRewardAnnotation, handle: str, new_price:
     return RiskRewardAnnotation(
         rr_id=annotation.rr_id,
         side=annotation.side,
-        bar_entry=annotation.bar_entry,
-        bar_stop=annotation.bar_stop,
+        bar_entry=bar_entry,
+        bar_stop=bar_stop,
         price_entry=price_entry,
         price_stop=price_stop,
         price_tp=price_tp,

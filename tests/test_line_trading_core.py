@@ -238,6 +238,47 @@ class LineTradingCoreTests(unittest.TestCase):
         self.assertEqual(updated.price_tp, Decimal("115"))
         self.assertEqual(updated.r_multiple, Decimal("3"))
 
+    def test_drag_rr_annotation_moves_entire_box_in_time_and_price(self) -> None:
+        annotation = RiskRewardAnnotation(
+            rr_id="rr-1",
+            side="long",
+            bar_entry=10.0,
+            bar_stop=12.0,
+            price_entry=Decimal("100"),
+            price_stop=Decimal("95"),
+            price_tp=Decimal("110"),
+            r_multiple=Decimal("2"),
+        )
+
+        updated = drag_rr_annotation(annotation, "rr_move", Decimal("103"), bar_delta=4.0)
+
+        self.assertEqual(updated.bar_entry, 14.0)
+        self.assertEqual(updated.bar_stop, 16.0)
+        self.assertEqual(updated.price_entry, Decimal("103"))
+        self.assertEqual(updated.price_stop, Decimal("98"))
+        self.assertEqual(updated.price_tp, Decimal("113"))
+        self.assertEqual(updated.r_multiple, Decimal("2"))
+
+    def test_drag_rr_short_annotation_moves_entire_box_in_time_and_price(self) -> None:
+        annotation = RiskRewardAnnotation(
+            rr_id="rr-short",
+            side="short",
+            bar_entry=20.0,
+            bar_stop=21.0,
+            price_entry=Decimal("100"),
+            price_stop=Decimal("105"),
+            price_tp=Decimal("90"),
+            r_multiple=Decimal("2"),
+        )
+
+        updated = drag_rr_annotation(annotation, "rr_move", Decimal("97"), bar_delta=3.0)
+
+        self.assertEqual((updated.bar_entry, updated.bar_stop), (23.0, 24.0))
+        self.assertEqual(updated.price_entry, Decimal("97"))
+        self.assertEqual(updated.price_stop, Decimal("102"))
+        self.assertEqual(updated.price_tp, Decimal("87"))
+        self.assertEqual(updated.r_multiple, Decimal("2"))
+
     def test_drag_line_annotation_updates_horizontal_prices_together(self) -> None:
         annotation = LineAnnotation(
             kind="horizontal",

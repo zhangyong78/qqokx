@@ -113,6 +113,79 @@ class KlineAlertTests(unittest.TestCase):
         self.assertEqual(events[0]["kind"], "line_alert")
         self.assertTrue(updated["lines"][0]["triggered"])
 
+    def test_line_trade_event_preserves_explicit_trade_configuration(self) -> None:
+        line = make_line_rule(
+            kind="horizontal",
+            label="Long breakout",
+            trigger="cross_above",
+            action="long",
+            time_a=100,
+            price_a=10.0,
+            time_b=100,
+            price_b=10.0,
+            trade_enabled=True,
+            risk_amount=125.0,
+            stop_loss_price=9.0,
+            direct_take_profit_r=2.5,
+            management_mode="trail_after_2r",
+            entry_execution_mode="chase_best_quote",
+            fee_offset_enabled=True,
+        )
+        workspace = normalize_workspace_entry({"lines": [line]})
+        candles = [
+            {"time": 100, "open": 9.0, "high": 9.5, "low": 8.8, "close": 9.5},
+            {"time": 200, "open": 9.6, "high": 10.5, "low": 9.4, "close": 10.4},
+        ]
+
+        updated, events, _summary = evaluate_workspace_alerts(
+            workspace_entry=workspace,
+            candles=candles,
+            ema_fast=[],
+            ma_slow=[],
+            raw_candles=[],
+        )
+
+        self.assertEqual(events[0]["line_id"], line["id"])
+        self.assertEqual(events[0]["trade_action"], "long")
+        self.assertTrue(events[0]["trade_enabled"])
+        saved_line = updated["lines"][0]
+        self.assertTrue(saved_line["trade_enabled"])
+        self.assertEqual(saved_line["risk_amount"], 125.0)
+        self.assertEqual(saved_line["stop_loss_price"], 9.0)
+        self.assertEqual(saved_line["management_mode"], "trail_after_2r")
+        self.assertEqual(saved_line["entry_execution_mode"], "chase_best_quote")
+
+    def test_evaluate_workspace_alerts_preserves_rr_items(self) -> None:
+        workspace = normalize_workspace_entry(
+            {
+                "rr": [
+                    {
+                        "rr_id": "rr-1",
+                        "side": "long",
+                        "bar_entry": 12.0,
+                        "bar_stop": 12.0,
+                        "price_entry": "60000",
+                        "price_stop": "59000",
+                        "price_tp": "62000",
+                        "r_multiple": "2",
+                        "locked": False,
+                    }
+                ]
+            }
+        )
+
+        updated, events, _summary = evaluate_workspace_alerts(
+            workspace_entry=workspace,
+            candles=[],
+            ema_fast=[],
+            ma_slow=[],
+            raw_candles=[],
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(len(updated["rr"]), 1)
+        self.assertEqual(updated["rr"][0]["rr_id"], "rr-1")
+
     def test_evaluate_workspace_alerts_emits_box_breakout_from_current_effective_box(self) -> None:
         workspace = normalize_workspace_entry({"alerts": {"box_breakout": {"enabled": True}}})
         raw_candles = [

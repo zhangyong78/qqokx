@@ -12,6 +12,8 @@ from roll_terminal_qt.kline_box_rules import AUTO_BOX_MAX_CANDIDATES, is_auto_bo
 _LINE_KINDS = {"horizontal", "trend"}
 _LINE_TRIGGERS = {"cross_above", "cross_below", "touch"}
 _LINE_ACTIONS = {"notify", "long", "short"}
+_LINE_TRADE_MANAGEMENT_MODES = {"fixed_tp", "trail_after_1r", "trail_after_2r", "trail_after_3r"}
+_LINE_TRADE_ENTRY_MODES = {"limit", "market", "chase_best_quote"}
 _EVENT_LIMIT = 120
 _STRUCTURE_SCAN_BAR_LIMIT = 180
 
@@ -27,6 +29,7 @@ def normalize_workspace_entry(payload: dict[str, object] | None) -> dict[str, ob
     box_breakout = alerts.get("box_breakout") if isinstance(alerts, dict) and isinstance(alerts.get("box_breakout"), dict) else {}
     return {
         "lines": [_normalize_line_rule(item) for item in _safe_list(raw.get("lines"))],
+        "rr": [dict(item) for item in _safe_list(raw.get("rr")) if isinstance(item, dict)],
         "alerts": {
             "ma_cross": {
                 "enabled": _safe_bool(ma_cross.get("enabled"), default=True),
@@ -52,6 +55,7 @@ def evaluate_workspace_alerts(
     entry = normalize_workspace_entry(workspace_entry)
     alerts = dict(entry.get("alerts", {}))
     lines = [_normalize_line_rule(item) for item in _safe_list(entry.get("lines"))]
+    rr_items = [dict(item) for item in _safe_list(entry.get("rr")) if isinstance(item, dict)]
     events = _normalize_events(_safe_list(entry.get("events")))
 
     new_events: list[dict[str, object]] = []
@@ -84,6 +88,7 @@ def evaluate_workspace_alerts(
     structure = build_structure_summary(raw_candles)
     return {
         "lines": updated_lines,
+        "rr": rr_items,
         "alerts": alerts,
         "events": merged_events,
     }, new_events, structure
@@ -124,6 +129,13 @@ def make_line_rule(
     price_b: float,
     enabled: bool = True,
     color: str = "#1d4ed8",
+    trade_enabled: bool = False,
+    risk_amount: float = 100.0,
+    stop_loss_price: float = 0.0,
+    direct_take_profit_r: float = 2.0,
+    management_mode: str = "fixed_tp",
+    entry_execution_mode: str = "limit",
+    fee_offset_enabled: bool = False,
 ) -> dict[str, object]:
     return _normalize_line_rule(
         {
@@ -138,6 +150,13 @@ def make_line_rule(
             "price_b": price_b,
             "enabled": enabled,
             "color": color,
+            "trade_enabled": trade_enabled,
+            "risk_amount": risk_amount,
+            "stop_loss_price": stop_loss_price,
+            "direct_take_profit_r": direct_take_profit_r,
+            "management_mode": management_mode,
+            "entry_execution_mode": entry_execution_mode,
+            "fee_offset_enabled": fee_offset_enabled,
         }
     )
 
@@ -244,12 +263,12 @@ def _evaluate_line_alert(candles: list[dict[str, Any]], line: dict[str, object])
     trigger = str(line.get("trigger", "cross_above") or "cross_above").strip().lower()
     label = str(line.get("label", "线条预警") or "线条预警").strip()
     if trigger == "cross_above" and prev_close <= prev_line and curr_close > curr_line:
-        return _build_event("line_alert", trigger, label, candle_time, f"{label} 向上突破")
+        return _build_line_event(line, trigger, label, candle_time, f"{label} 向上突破")
     if trigger == "cross_below" and prev_close >= prev_line and curr_close < curr_line:
-        return _build_event("line_alert", trigger, label, candle_time, f"{label} 向下跌破")
+        return _build_line_event(line, trigger, label, candle_time, f"{label} 向下跌破")
     tolerance = max(abs(curr_line) * 0.0005, 0.00000001)
     if trigger == "touch" and curr_low <= curr_line + tolerance and curr_high >= curr_line - tolerance:
-        return _build_event("line_alert", trigger, label, candle_time, f"{label} 已触发触碰")
+        return _build_line_event(line, trigger, label, candle_time, f"{label} 已触发触碰")
     return None
 
 
@@ -273,10 +292,35 @@ def _normalize_line_rule(item: object) -> dict[str, object]:
         "time_b": time_b,
         "price_b": price_b,
         "enabled": _safe_bool(raw.get("enabled"), default=True),
+        "trade_enabled": _safe_bool(raw.get("trade_enabled"), default=False),
+        "risk_amount": _safe_float(raw.get("risk_amount"), default=100.0),
+        "stop_loss_price": _safe_float(raw.get("stop_loss_price")),
+        "direct_take_profit_r": _safe_float(raw.get("direct_take_profit_r"), default=2.0),
+        "management_mode": _safe_choice(raw.get("management_mode"), _LINE_TRADE_MANAGEMENT_MODES, default="fixed_tp"),
+        "entry_execution_mode": _safe_choice(raw.get("entry_execution_mode"), _LINE_TRADE_ENTRY_MODES, default="limit"),
+        "fee_offset_enabled": _safe_bool(raw.get("fee_offset_enabled"), default=False),
         "triggered": _safe_bool(raw.get("triggered"), default=False),
         "last_event_candle_time": _safe_int(raw.get("last_event_candle_time")),
         "color": _safe_text(raw.get("color")) or "#1d4ed8",
     }
+
+
+def _build_line_event(
+    line: dict[str, object],
+    direction: str,
+    label: str,
+    candle_time: int,
+    message: str,
+) -> dict[str, object]:
+    event = _build_event("line_alert", direction, label, candle_time, message)
+    event.update(
+        {
+            "line_id": _safe_text(line.get("id")),
+            "trade_action": _safe_choice(line.get("action"), _LINE_ACTIONS, default="notify"),
+            "trade_enabled": _safe_bool(line.get("trade_enabled"), default=False),
+        }
+    )
+    return event
 
 
 def _normalize_events(items: list[object]) -> list[dict[str, object]]:
