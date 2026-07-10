@@ -6217,7 +6217,7 @@ class UiStrategySessionsMixin:
             if stop_price is not None:
                 trade.current_stop_price = stop_price
             return
-        if "初始 OKX 止损已提交" in message:
+        if "初始 OKX 止损已提交" in message or "初始 OKX 止损已补挂" in message:
             trade = session.active_trade
             if trade is None:
                 return
@@ -8203,7 +8203,7 @@ class UiStrategySessionsMixin:
             if stop_price is not None:
                 trade.current_stop_price = stop_price
             return
-        if "初始 OKX 止损已提交" in message:
+        if "初始 OKX 止损已提交" in message or "初始 OKX 止损已补挂" in message:
             trade = session.active_trade
             if trade is None:
                 return
@@ -9647,7 +9647,7 @@ class UiStrategySessionsMixin:
             if stop_price is not None:
                 trade.current_stop_price = stop_price
             return
-        if "初始 OKX 止损已提交" in message:
+        if "初始 OKX 止损已提交" in message or "初始 OKX 止损已补挂" in message:
             trade = session.active_trade
             if trade is None:
                 return

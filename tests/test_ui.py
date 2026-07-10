@@ -3641,6 +3641,30 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(session.active_trade.current_stop_price, Decimal("2320.66"))
         app._start_session_trade_reconciliation.assert_called_once()
 
+    def test_track_session_trade_runtime_captures_backfilled_exchange_stop(self) -> None:
+        session = self._make_session()
+        app = self._make_app_for_tracking()
+
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "2026-07-07 20:00:00 | 挂单已成交 | ordId=2001 | 开仓价=80.65 | 数量=5.88",
+        )
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "初始 OKX 止损已补挂 | algoClOrdId=s211emaslg070713373471228 | "
+            "algoId=3722161598581456896 | 止损=80.65 | 启动动态上移监控",
+        )
+
+        self.assertIsNotNone(session.active_trade)
+        self.assertEqual(
+            session.active_trade.protective_algo_cl_ord_id,
+            "s211emaslg070713373471228",
+        )
+        self.assertEqual(session.active_trade.initial_stop_price, Decimal("80.65"))
+        self.assertEqual(session.active_trade.current_stop_price, Decimal("80.65"))
+
     def test_track_session_trade_runtime_captures_pending_entry_snapshot(self) -> None:
         session = self._make_session()
         app = self._make_app_for_tracking()
