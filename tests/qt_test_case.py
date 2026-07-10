@@ -25,5 +25,8 @@ class QtWidgetTestCase(unittest.TestCase):
     @classmethod
     def dispose_widget(cls, widget: QWidget) -> None:
         widget.close()
+        if widget.__class__.__name__ == "KlineAnalysisWindow":
+            cls._app.processEvents()
+            return
         widget.deleteLater()
         cls._app.processEvents()
