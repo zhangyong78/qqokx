@@ -1153,13 +1153,19 @@ class StrategyEngine:
                 f"止损={format_decimal(plan.stop_loss)} | "
                 f"{'动态止盈=初始不挂止盈' if dynamic_stop_only else f'止盈={format_decimal(plan.take_profit)}'}"
             )
-            cl_ord_id, result, stop_loss_algo_cl_ord_id = self._submit_dynamic_limit_entry_order(
+            submission = self._submit_dynamic_limit_entry_order(
                 credentials,
                 config,
                 plan=plan,
                 dynamic_stop_only=dynamic_stop_only,
                 trader_virtual_stop_loss_enabled=trader_virtual_stop_loss_enabled,
             )
+            if submission is None:
+                idle_signal_candle_ts = newest_ts
+                last_candle_ts = newest_ts
+                self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                continue
+            cl_ord_id, result, stop_loss_algo_cl_ord_id = submission
             if not result.ord_id:
                 raise RuntimeError("OKX 未返回挂单 ordId，无法继续监控该委托")
             active_order = ManagedEntryOrder(
@@ -1462,13 +1468,19 @@ class StrategyEngine:
                     signal_candle_high=decision.signal_candle_high,
                     signal_candle_low=decision.signal_candle_low,
                 )
-                cl_ord_id, result, stop_loss_algo_cl_ord_id = self._submit_dynamic_limit_entry_order(
+                submission = self._submit_dynamic_limit_entry_order(
                     credentials,
                     config,
                     plan=plan,
                     dynamic_stop_only=dynamic_stop_only,
                     trader_virtual_stop_loss_enabled=bool(config.trader_virtual_stop_loss),
                 )
+                if submission is None:
+                    idle_signal_candle_ts = newest_candle_ts
+                    last_candle_ts = newest_candle_ts
+                    self._stop_event.wait(_idle_signal_wait_seconds(config.bar, config.poll_seconds))
+                    continue
+                cl_ord_id, result, stop_loss_algo_cl_ord_id = submission
                 if not result.ord_id:
                     raise RuntimeError("OKX 未返回挂单 ordId，无法继续监控该委托")
                 active_order = ManagedEntryOrder(
@@ -5326,7 +5338,7 @@ class StrategyEngine:
         plan: OrderPlan,
         dynamic_stop_only: bool,
         trader_virtual_stop_loss_enabled: bool,
-    ) -> tuple[str, OkxOrderResult, str | None]:
+    ) -> tuple[str, OkxOrderResult, str | None] | None:
         cl_ord_id = self._next_client_order_id(role="entry")
         stop_loss_algo_cl_ord_id = (
             self._next_client_order_id(role="slg")
@@ -5370,18 +5382,17 @@ class StrategyEngine:
         self._logger(
             " | ".join(
                 [
-                    "OKX 附带止损拒绝了动态限价主单，改为先挂裸限价单",
+                    f"{_fmt_ts(plan.candle_ts)} | OKX 附带止损被拒，本次开仓已放弃",
                     f"标的={plan.inst_id}",
+                    f"方向={plan.signal.upper()}",
+                    f"计划开仓价={format_decimal(plan.entry_reference)}",
+                    f"止损={format_decimal(plan.stop_loss)}",
                     f"clOrdId={cl_ord_id}",
-                    "后续将在成交后补挂独立 OKX 止损算法单",
+                    detail,
                 ]
             )
         )
-        result = _submit_limit_order(
-            stop_loss_client_id=None,
-            include_attached_protection=False,
-        )
-        return cl_ord_id, result, None
+        return None
 
     def _submit_post_fill_exchange_stop_loss(
         self,

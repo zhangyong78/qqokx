@@ -2579,6 +2579,18 @@ class StrategyEngineTest(TestCase):
         self.assertTrue(any("第2波趋势开始" in message for message in messages))
         self.assertTrue(any("第2波 | 本波第1次委托" in message for message in messages))
 
+    def test_dynamic_exchange_strategy_waits_next_candle_after_protected_entry_is_rejected(self) -> None:
+        attempted, accepted, evaluate_calls, waits, _messages = self._run_dynamic_exchange_reentry_probe(
+            candle_counts=[80, 80, 81],
+            stop_after_waits=3,
+            rejected_candle_ts={80},
+        )
+
+        self.assertEqual(attempted, [80, 81])
+        self.assertEqual(accepted, [81])
+        self.assertEqual(evaluate_calls, 2)
+        self.assertEqual(waits, [60.0, 60.0, 10])
+
     def test_dynamic_exchange_strategy_transfers_to_position_monitor_when_cancel_lookup_finds_fill(self) -> None:
         messages: list[str] = []
         submit_calls = {"count": 0}
@@ -3187,7 +3199,7 @@ class StrategyEngineTest(TestCase):
         self.assertTrue(captured_monitor["dynamic_take_profit_enabled"])
         self.assertTrue(any("交易员虚拟止损只记触发" in message for message in messages))
 
-    def test_dynamic_limit_entry_retries_without_attached_stop_after_51051_reject(self) -> None:
+    def test_dynamic_limit_entry_abandons_order_after_51051_reject(self) -> None:
         messages: list[str] = []
         place_limit_calls: list[dict[str, object]] = []
         next_ids = iter(("entry-1", "slg-1"))
@@ -3263,7 +3275,7 @@ class StrategyEngineTest(TestCase):
             tp_sl_mode="exchange",
         )
 
-        cl_ord_id, result, stop_loss_algo_cl_ord_id = engine._submit_dynamic_limit_entry_order(
+        result = engine._submit_dynamic_limit_entry_order(
             None,  # type: ignore[arg-type]
             config,
             plan=plan,
@@ -3271,15 +3283,11 @@ class StrategyEngineTest(TestCase):
             trader_virtual_stop_loss_enabled=False,
         )
 
-        self.assertEqual(cl_ord_id, "entry-1")
-        self.assertEqual(result.ord_id, "ord-limit-1")
-        self.assertIsNone(stop_loss_algo_cl_ord_id)
-        self.assertEqual(len(place_limit_calls), 2)
+        self.assertIsNone(result)
+        self.assertEqual(len(place_limit_calls), 1)
         self.assertTrue(place_limit_calls[0]["include_attached_protection"])
         self.assertEqual(place_limit_calls[0]["stop_loss_algo_cl_ord_id"], "slg-1")
-        self.assertFalse(place_limit_calls[1]["include_attached_protection"])
-        self.assertIsNone(place_limit_calls[1]["stop_loss_algo_cl_ord_id"])
-        self.assertTrue(any("改为先挂裸限价单" in message for message in messages))
+        self.assertTrue(any("附带止损被拒" in message and "本次开仓已放弃" in message for message in messages))
 
     def test_manage_filled_dynamic_entry_submits_stop_loss_algo_after_plain_limit_fill(self) -> None:
         messages: list[str] = []
