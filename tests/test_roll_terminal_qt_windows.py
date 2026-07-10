@@ -4994,6 +4994,40 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             msg=f"returncode={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
 
+    def test_kline_window_unittest_process_exits_zero(self) -> None:
+        script = textwrap.dedent(
+            """
+            import os
+            import sys
+            import unittest
+
+            os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+            import tests.test_roll_terminal_qt_windows as target_module
+
+            suite = unittest.defaultTestLoader.loadTestsFromName(
+                "RollTerminalQtWindowHelperTests.test_kline_symbol_input_uses_bounded_header_width",
+                target_module,
+            )
+            result = unittest.TextTestRunner(verbosity=2).run(suite)
+            sys.exit(0 if result.wasSuccessful() else 1)
+            """
+        )
+        env = dict(os.environ)
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"returncode={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
     def test_native_chart_backend_preferred_when_gpu_disabled(self) -> None:
         with patch.dict(os.environ, {"QTWEBENGINE_DISABLE_GPU": "1"}, clear=False):
             self.assertTrue(_prefer_native_chart_backend())
@@ -5227,4 +5261,3 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

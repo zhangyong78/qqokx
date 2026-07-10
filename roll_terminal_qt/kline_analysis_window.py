@@ -99,6 +99,7 @@ from roll_terminal_qt.kline_alerts import (
     make_line_rule,
     normalize_workspace_entry,
 )
+from roll_terminal_qt.kline_account_drawer import KlineAccountDrawer
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
 from roll_terminal_qt.runtime import load_runtime, profile_names
 
@@ -857,8 +858,8 @@ def _rr_condition_status_text(entry: RRTradeLedgerEntry | None) -> str:
 
     return " | ".join(
         (
-            _link_text("止损", entry.stop_loss_order),
-            _link_text("止盈", entry.take_profit_order),
+            _link_text("止损", getattr(entry, "stop_loss_order", None)),
+            _link_text("止盈", getattr(entry, "take_profit_order", None)),
         )
     )
 
@@ -4549,8 +4550,12 @@ class KlineAnalysisWindow(QMainWindow):
         self._deferred_chart_payload: KlineChartPayload | None = None
         self._deferred_chart_request_id = 0
         self._body_splitter: QSplitter | None = None
+        self._chart_account_splitter: QSplitter | None = None
         self._control_panel: QFrame | None = None
         self._control_scroll: QScrollArea | None = None
+        self._account_drawer: KlineAccountDrawer | None = None
+        self._orders_drawer_button: QPushButton | None = None
+        self._positions_drawer_button: QPushButton | None = None
         self._left_panel_hidden = False
         self._secondary_volatility_loader: SecondaryVolatilityDataLoader | None = None
         self._syncing_chart_range = False
@@ -4818,6 +4823,15 @@ class KlineAnalysisWindow(QMainWindow):
         self._reverse_kline_check.setToolTip("开启后，将当前主图及副图K线按价格镜像反转显示；波动率副图不参与反转。")
         self._reverse_kline_check.toggled.connect(self._load_data)
         action_row.addWidget(self._reverse_kline_check)
+
+        self._orders_drawer_button = QPushButton("委托")
+        self._orders_drawer_button.clicked.connect(lambda: self._show_account_drawer("orders"))
+        action_row.addWidget(self._orders_drawer_button)
+
+        self._positions_drawer_button = QPushButton("持仓")
+        self._positions_drawer_button.clicked.connect(lambda: self._show_account_drawer("positions"))
+        action_row.addWidget(self._positions_drawer_button)
+
         action_row.addStretch(1)
 
         load_btn = QPushButton("加载")
@@ -5100,18 +5114,34 @@ class KlineAnalysisWindow(QMainWindow):
         chart_layout.setContentsMargins(8, 8, 8, 8)
         chart_layout.setSpacing(0)
 
+        chart_frame = QFrame()
+        chart_frame_layout = QVBoxLayout(chart_frame)
+        chart_frame_layout.setContentsMargins(0, 0, 0, 0)
+        chart_frame_layout.setSpacing(0)
+
         if self._use_native_chart:
-            self._create_native_chart(chart_layout)
+            self._create_native_chart(chart_frame_layout)
         elif QWebEngineView is None:
             fallback = QLabel("当前环境未检测到QWebEngine")
             fallback.setObjectName("Subtle")
             fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            chart_layout.addWidget(fallback, 1)
+            chart_frame_layout.addWidget(fallback, 1)
         else:
             self._web = QWebEngineView()
             self._web.setHtml(self._chart_html())
             self._web.loadFinished.connect(self._on_chart_ready)
-            chart_layout.addWidget(self._web, 1)
+            chart_frame_layout.addWidget(self._web, 1)
+
+        self._chart_account_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._chart_account_splitter.setChildrenCollapsible(False)
+        self._chart_account_splitter.addWidget(chart_frame)
+        self._account_drawer = KlineAccountDrawer()
+        self._account_drawer.collapseRequested.connect(self._collapse_account_drawer)
+        self._chart_account_splitter.addWidget(self._account_drawer)
+        self._account_drawer.hide()
+        self._chart_account_splitter.setStretchFactor(0, 5)
+        self._chart_account_splitter.setStretchFactor(1, 2)
+        chart_layout.addWidget(self._chart_account_splitter, 1)
 
         splitter.addWidget(control_scroll)
         splitter.addWidget(chart_host)
@@ -5487,6 +5517,11 @@ class KlineAnalysisWindow(QMainWindow):
         monitor = getattr(self, "_rr_monitor_timer", None)
         if monitor is not None:
             monitor.stop()
+        if self._account_drawer is not None and not self._account_drawer.shutdown():
+            self._set_status("账户抽屉请求仍在完成中，窗口将在请求结束后关闭。")
+            event.ignore()
+            QTimer.singleShot(250, self.close)
+            return
         thread = self._rr_execution_thread
         if thread is not None and thread.isRunning() and not thread.wait(1500):
             self._set_status("RR 请求仍在完成中，窗口将在请求结束后关闭。")
@@ -5533,10 +5568,6 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _refresh_api_profiles(self) -> None:
         self._profile_snapshots, selected_profile = load_profile_snapshots()
-        names = list(self._profile_snapshots)
-        if not names:
-            names = [str(item).strip() for item in profile_names() if str(item).strip()]
-        self._unlocked_profiles.intersection_update(set(names))
         self._suppress_api_profile_change = True
         try:
             runtime = self._runtime if self._runtime is not None else load_runtime("moni") or load_runtime()
@@ -5547,6 +5578,17 @@ class KlineAnalysisWindow(QMainWindow):
                 if not runtime_profile:
                     credentials = getattr(runtime, "credentials", None)
                     runtime_profile = str(getattr(credentials, "profile_name", "") or "").strip()
+            names: list[str] = []
+            for candidate in (
+                *list(self._profile_snapshots),
+                *(str(item).strip() for item in profile_names()),
+                selected_profile,
+                runtime_profile,
+            ):
+                normalized = str(candidate or "").strip()
+                if normalized and normalized not in names:
+                    names.append(normalized)
+            self._unlocked_profiles.intersection_update(set(names))
             if runtime_profile:
                 self._unlocked_profiles.add(runtime_profile)
             self._api_profile_combo.clear()
@@ -5618,6 +5660,18 @@ class KlineAnalysisWindow(QMainWindow):
         if hasattr(self, "_account_context"):
             self._account_context.setText(f"账户 {profile_name} | {environment}")
         self._refresh_rr_trade_hint()
+        self._sync_account_drawer_context()
+
+    def _sync_account_drawer_context(self, *, refresh_if_visible: bool = True) -> None:
+        if self._account_drawer is None:
+            return
+        self._account_drawer.set_context(
+            runtime=self._runtime,
+            profile_name=self._active_profile_name(),
+            environment=self._active_environment(),
+            symbol=self._symbol_input.text().strip().upper(),
+            refresh_if_visible=refresh_if_visible,
+        )
 
     def _instrument_for_symbol(self, symbol: str | None = None) -> object | None:
         normalized = (symbol or self._symbol_input.text()).strip().upper()
@@ -5893,7 +5947,32 @@ class KlineAnalysisWindow(QMainWindow):
     def _on_symbol_confirmed(self) -> None:
         self._reload_workspace_view()
         self._refresh_rr_trade_hint()
+        self._sync_account_drawer_context()
         self._load_data()
+
+    def _show_account_drawer(self, tab_name: str) -> None:
+        if self._account_drawer is None or self._chart_account_splitter is None:
+            return
+        target_tab = "orders" if tab_name == "orders" else "positions"
+        current_tab = "orders" if self._account_drawer._tabs.currentIndex() == 0 else "positions"
+        if not self._account_drawer.isHidden() and current_tab == target_tab:
+            self._collapse_account_drawer()
+            return
+        self._account_drawer.show()
+        self._account_drawer.show_tab(target_tab)
+        self._sync_account_drawer_context(refresh_if_visible=False)
+        total_height = max(self._chart_account_splitter.size().height(), 1)
+        drawer_height = max(int(total_height * 0.28), 180)
+        chart_height = max(total_height - drawer_height, 240)
+        self._chart_account_splitter.setSizes([chart_height, drawer_height])
+        self._account_drawer.refresh_data()
+
+    def _collapse_account_drawer(self) -> None:
+        if self._account_drawer is None or self._chart_account_splitter is None:
+            return
+        total_height = max(self._chart_account_splitter.size().height(), 1)
+        self._account_drawer.hide()
+        self._chart_account_splitter.setSizes([total_height, 0])
 
     @Slot(str)
     def _on_period_changed(self, _value: str) -> None:
@@ -7634,7 +7713,8 @@ class KlineAnalysisWindow(QMainWindow):
     def _legacy_rr_plan_matches_item(self, entry: RRTradeLedgerEntry, item: dict[str, object]) -> bool:
         plan = entry.plan
         side = str(item.get("side", "") or "").strip().lower()
-        if side and str(plan.direction or "").strip().lower() != side:
+        plan_direction = str(getattr(plan, "direction", "") or "").strip().lower()
+        if side and plan_direction and plan_direction != side:
             return False
         for item_key, plan_key in (
             ("price_entry", "entry_price"),
@@ -7643,7 +7723,9 @@ class KlineAnalysisWindow(QMainWindow):
         ):
             item_price = _parse_rr_optional_decimal(item.get(item_key))
             plan_price = _parse_rr_optional_decimal(getattr(plan, plan_key, None))
-            if item_price is None or plan_price is None or item_price != plan_price:
+            if item_price is None or plan_price is None:
+                continue
+            if item_price != plan_price:
                 return False
         return True
 
@@ -9184,4 +9266,3 @@ class KlineAnalysisWindow(QMainWindow):
             </html>
             """
         return html.replace("__RECENT_VIEW_BARS__", str(_RECENT_VIEW_BARS))
-
