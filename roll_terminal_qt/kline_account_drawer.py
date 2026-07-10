@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QPushButton,
     QTabWidget,
     QTableWidget,
@@ -89,6 +90,40 @@ class AccountDrawerLoadThread(QThread):
         )
 
 
+class AccountDrawerCancelThread(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, *, runtime: object, order: object, client: OkxRestClient | None = None) -> None:
+        super().__init__()
+        self._runtime = runtime
+        self._order = order
+        self._client = client or OkxRestClient()
+
+    def run(self) -> None:
+        try:
+            if order_source_kind(self._order) == "algo":
+                result = self._client.cancel_algo_order(
+                    self._runtime.credentials,
+                    environment=self._runtime.environment,
+                    inst_id=self._order.inst_id,
+                    algo_id=getattr(self._order, "algo_id", None) or None,
+                    algo_cl_ord_id=getattr(self._order, "algo_client_order_id", None) or None,
+                )
+            else:
+                result = self._client.cancel_order_by_id(
+                    self._runtime.credentials,
+                    environment=self._runtime.environment,
+                    inst_id=self._order.inst_id,
+                    ord_id=getattr(self._order, "order_id", None) or None,
+                    cl_ord_id=getattr(self._order, "client_order_id", None) or None,
+                )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
 class KlineAccountDrawer(QWidget):
     collapseRequested = Signal()
 
@@ -99,9 +134,11 @@ class KlineAccountDrawer(QWidget):
         self._environment = ""
         self._symbol = ""
         self._request_generation = 0
+        self._refresh_pending = False
         self._snapshot = AccountDrawerSnapshot()
+        self._visible_orders: list[object] = []
         self._load_thread: AccountDrawerLoadThread | None = None
-        self._cancel_thread: QThread | None = None
+        self._cancel_thread: AccountDrawerCancelThread | None = None
         self._cancel_in_flight = False
         self._build_ui()
 
@@ -149,6 +186,7 @@ class KlineAccountDrawer(QWidget):
                 "标识",
             ]
         )
+        self._orders_table.itemSelectionChanged.connect(self._sync_cancel_button_state)
         orders_tab = QWidget()
         orders_layout = QVBoxLayout(orders_tab)
         orders_layout.setContentsMargins(0, 0, 0, 0)
@@ -158,6 +196,7 @@ class KlineAccountDrawer(QWidget):
         orders_toolbar = QHBoxLayout()
         self._cancel_button = QPushButton("撤单")
         self._cancel_button.setEnabled(False)
+        self._cancel_button.clicked.connect(self._cancel_selected_order)
         orders_toolbar.addStretch(1)
         orders_toolbar.addWidget(self._cancel_button, 0)
         orders_layout.addLayout(orders_toolbar)
@@ -215,20 +254,16 @@ class KlineAccountDrawer(QWidget):
         if self._runtime is None:
             self._status_label.setText("未连接账户")
             return
-        if self._load_thread is not None and self._load_thread.isRunning():
-            return
         self._request_generation += 1
-        self._status_label.setText("加载中...")
-        self._load_thread = AccountDrawerLoadThread(
-            request_generation=self._request_generation,
-            runtime=self._runtime,
-        )
-        self._load_thread.completed.connect(self._apply_snapshot)
-        self._load_thread.failed.connect(self._apply_load_error)
-        self._load_thread.finished.connect(self._clear_load_thread)
-        self._load_thread.start()
+        if self._load_thread is not None and self._load_thread.isRunning():
+            self._refresh_pending = True
+            self._status_label.setText("加载中...")
+            return
+        self._start_load(self._request_generation)
 
     def shutdown(self, wait_ms: int = 1500) -> bool:
+        if self._cancel_thread is not None and self._cancel_thread.isRunning():
+            return self._cancel_thread.wait(wait_ms)
         if self._load_thread is not None and self._load_thread.isRunning():
             return self._load_thread.wait(wait_ms)
         return True
@@ -238,6 +273,9 @@ class KlineAccountDrawer(QWidget):
         self._load_thread = None
         if thread is not None:
             thread.deleteLater()
+        if self._refresh_pending and self._runtime is not None:
+            self._refresh_pending = False
+            self._start_load(self._request_generation)
 
     def _apply_snapshot(self, generation: int, snapshot: AccountDrawerSnapshot) -> None:
         if generation != self._request_generation:
@@ -257,8 +295,10 @@ class KlineAccountDrawer(QWidget):
         filtered_positions = filter_account_items(self._snapshot.positions, scope=scope, symbol=self._symbol)
         self._populate_orders_table(filtered_orders)
         self._populate_positions_table(filtered_positions)
+        self._sync_cancel_button_state()
 
     def _populate_orders_table(self, orders: list[object]) -> None:
+        self._visible_orders = list(orders)
         self._orders_table.setRowCount(len(orders))
         for row, order in enumerate(orders):
             values = [
@@ -298,3 +338,78 @@ class KlineAccountDrawer(QWidget):
         if value is None:
             return ""
         return str(value)
+
+    def _start_load(self, generation: int) -> None:
+        self._status_label.setText("加载中...")
+        self._load_thread = AccountDrawerLoadThread(
+            request_generation=generation,
+            runtime=self._runtime,
+        )
+        self._load_thread.completed.connect(self._apply_snapshot)
+        self._load_thread.failed.connect(self._apply_load_error)
+        self._load_thread.finished.connect(self._clear_load_thread)
+        self._load_thread.start()
+
+    def _selected_order(self) -> object | None:
+        row = self._orders_table.currentRow()
+        if row < 0 or row >= len(self._visible_orders):
+            return None
+        return self._visible_orders[row]
+
+    def _sync_cancel_button_state(self) -> None:
+        enabled = (
+            not self._cancel_in_flight
+            and self._runtime is not None
+            and self._selected_order() is not None
+            and bool(order_cancel_reference(self._selected_order()))
+        )
+        self._cancel_button.setEnabled(enabled)
+
+    def _cancel_selected_order(self) -> None:
+        if self._runtime is None or self._cancel_in_flight:
+            return
+        order = self._selected_order()
+        if order is None:
+            return
+        reference = order_cancel_reference(order)
+        if not reference:
+            self._status_label.setText("缺少可撤销订单标识")
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认撤单",
+            (
+                f"确认撤销 {getattr(order, 'inst_id', '')} "
+                f"{getattr(order, 'side', '') or getattr(order, 'pos_side', '')} "
+                f"{getattr(order, 'ord_type', '')} {reference} ?"
+            ).strip(),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._cancel_in_flight = True
+        self._cancel_button.setEnabled(False)
+        self._status_label.setText("撤单中...")
+        self._cancel_thread = AccountDrawerCancelThread(runtime=self._runtime, order=order)
+        self._cancel_thread.completed.connect(self._handle_cancel_completed)
+        self._cancel_thread.failed.connect(self._handle_cancel_failed)
+        self._cancel_thread.finished.connect(self._clear_cancel_thread)
+        self._cancel_thread.start()
+
+    def _handle_cancel_completed(self, _result: object) -> None:
+        self._cancel_in_flight = False
+        self._status_label.setText("撤单成功")
+        self._sync_cancel_button_state()
+        self.refresh_data()
+
+    def _handle_cancel_failed(self, message: str) -> None:
+        self._cancel_in_flight = False
+        self._status_label.setText(f"撤单失败: {message}")
+        self._sync_cancel_button_state()
+
+    def _clear_cancel_thread(self) -> None:
+        thread = self._cancel_thread
+        self._cancel_thread = None
+        if thread is not None:
+            thread.deleteLater()
