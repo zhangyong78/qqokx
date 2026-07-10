@@ -2127,13 +2127,15 @@ class AccountPositionsHomeWidget(QWidget):
         if not self._ensure_runtime_ready(force_unlock=True):
             return
         self._status_badge.setText("正在刷新...")
-        self._start_private_threads(force_restart=True)
+        # Refresh must not tear down live private feeds; rapid clicks otherwise
+        # create overlapping WebSocket and account worker shutdowns.
+        self._start_private_threads(force_restart=False)
 
     def refresh_view(self) -> None:
         if not self._ensure_runtime_ready(force_unlock=True):
             return
         self._status_badge.setText("正在刷新...")
-        self._start_private_threads(force_restart=True)
+        self._start_private_threads(force_restart=False)
 
     @Slot(object)
     def _apply_position_history_payload(self, payload: object) -> None:
@@ -5616,7 +5618,7 @@ class AccountPositionsHomeWidget(QWidget):
         if not self._ensure_runtime_ready(force_unlock=True):
             return
         self._status_badge.setText("正在刷新...")
-        self._start_private_threads(force_restart=True)
+        self._start_private_threads(force_restart=False)
 
 
 

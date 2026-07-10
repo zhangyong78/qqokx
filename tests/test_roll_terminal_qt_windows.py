@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import textwrap
 import unittest
@@ -12,11 +13,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PySide6.QtCharts import QChart, QLineSeries, QValueAxis
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtWidgets import QDoubleSpinBox, QLabel, QMessageBox, QPushButton, QSizePolicy, QTabWidget
+from PySide6.QtCore import QPointF, QThread, Qt
+from PySide6.QtWidgets import QDoubleSpinBox, QLabel, QMessageBox, QPushButton, QSizePolicy, QTabWidget, QWidget
 from okx_quant.models import Candle
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
-from okx_quant.kline_rr_trade import RRTradeLedgerEntry, build_rr_trade_plan
+from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradeOrderLink, build_rr_trade_plan
 from okx_quant.persistence import (
     build_profile_switch_password_snapshot,
     load_kline_analysis_workspace_entries,
@@ -91,9 +92,46 @@ from roll_terminal_qt.kline_analysis_window import (
     _bar_to_ms,
     _is_local_cache_stale,
 )
+import roll_terminal_qt.kline_analysis_window as kline_analysis_module
+from roll_terminal_qt.launcher import LauncherWindow
 
 
 class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
+
+    def test_launcher_waits_for_open_child_windows_before_home_shutdown(self) -> None:
+        class ShutdownHome(QWidget):
+            def __init__(self, parent=None) -> None:  # noqa: ANN001
+                super().__init__(parent)
+                self.shutdown_calls = 0
+
+            def begin_shutdown(self, _finished) -> None:  # noqa: ANN001
+                self.shutdown_calls += 1
+
+            def refresh_view(self) -> None:
+                return
+
+        class BlockingChild(QWidget):
+            def closeEvent(self, event) -> None:  # noqa: ANN001
+                event.ignore()
+
+        with patch("roll_terminal_qt.launcher.AccountPositionsHomeWidget", ShutdownHome):
+            launcher = LauncherWindow()
+        child = BlockingChild()
+        try:
+            child.show()
+            launcher._child_windows.append(child)
+
+            launcher._begin_shutdown()
+
+            self.assertEqual(launcher._home_widget.shutdown_calls, 0)
+            child.hide()
+            launcher._wait_for_child_windows_shutdown()
+            self.assertEqual(launcher._home_widget.shutdown_calls, 1)
+        finally:
+            child.deleteLater()
+            launcher.hide()
+            launcher.deleteLater()
+            self._app.processEvents()
 
     def test_split_annotation_key_supports_standard_triplet(self) -> None:
         self.assertEqual(
@@ -2018,6 +2056,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         with (
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
             patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot", return_value={"entries": []}),
         ):
             window = KlineAnalysisWindow()
             try:
@@ -2070,6 +2109,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         with (
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
             patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot", return_value={"entries": []}),
         ):
             window = KlineAnalysisWindow()
             try:
@@ -2087,7 +2127,243 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
                 self.assertEqual(plan.entry_execution_mode, "chase_best_quote")
                 self.assertEqual(plan.environment, "demo")
+                trade_ref = window._workspace_entry()["rr"][0]["trade_ref"]
+                self.assertTrue(trade_ref)
+                self.assertTrue(plan.plan_id.endswith(trade_ref))
                 self.assertEqual(window._rr_trade_ledger_snapshot.get("entries", []), [])
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_save_rr_trade_ledger_entry_binds_exact_refs_to_selected_rr(self) -> None:
+        instrument = SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            settle_ccy="USDT",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+            uly="BTC-USDT",
+            inst_family="BTC-USDT",
+        )
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot", return_value={"entries": []}),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._rr_entry_edit.setText("60000")
+                window._rr_stop_edit.setText("59000")
+                window._rr_r_edit.setValue(2.0)
+                window._rr_bar_edit.setText("12")
+                window._save_rr_item()
+                trade_ref = str(window._workspace_entry()["rr"][0]["trade_ref"])
+                plan = build_rr_trade_plan(
+                    plan_id=f"moni:BTC-USDT-SWAP:{trade_ref}",
+                    profile_name="moni",
+                    environment="demo",
+                    instrument=instrument,
+                    direction="long",
+                    entry_execution_mode="limit",
+                    management_mode="fixed_tp",
+                    trigger_price_type="last",
+                    risk_amount=Decimal("100"),
+                    entry_price=Decimal("60000"),
+                    stop_loss_price=Decimal("59000"),
+                    direct_take_profit_r=Decimal("2"),
+                    round_trip_fee_rate=Decimal("0"),
+                )
+                entry = RRTradeLedgerEntry(
+                    entry_id=plan.plan_id,
+                    status="entry_working",
+                    plan=plan,
+                    entry_order=RRTradeOrderLink(
+                        role="entry",
+                        channel="order",
+                        order_id="ord-1",
+                        client_id="cl-1",
+                        state="live",
+                        size=Decimal("3"),
+                        price=Decimal("60000"),
+                    ),
+                    stop_loss_order=RRTradeOrderLink(
+                        role="stop_loss",
+                        channel="algo",
+                        algo_id="algo-sl-1",
+                        client_id="algo-cl-sl-1",
+                        state="pending",
+                        trigger_price=Decimal("59000"),
+                    ),
+                    take_profit_order=RRTradeOrderLink(
+                        role="take_profit",
+                        channel="algo",
+                        algo_id="algo-tp-1",
+                        client_id="algo-cl-tp-1",
+                        state="pending",
+                        trigger_price=Decimal("62000"),
+                    ),
+                )
+
+                window._save_rr_trade_ledger_entry(entry)
+
+                binding = window._workspace_entry()["rr"][0].get("trade_binding", {})
+                self.assertEqual(binding["plan_id"], plan.plan_id)
+                self.assertEqual(binding["entry_order_id"], "ord-1")
+                self.assertEqual(binding["entry_client_id"], "cl-1")
+                self.assertEqual(binding["stop_loss_algo_id"], "algo-sl-1")
+                self.assertEqual(binding["take_profit_algo_id"], "algo-tp-1")
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_cancel_rr_trade_uses_bound_ledger_entry_instead_of_rebuilding_plan(self) -> None:
+        instrument = SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            settle_ccy="USDT",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+            uly="BTC-USDT",
+            inst_family="BTC-USDT",
+        )
+        rr_payload = {
+            "rr_id": "rr-1",
+            "trade_ref": "trade-ref-1",
+            "side": "long",
+            "bar_entry": 12.0,
+            "bar_stop": 12.0,
+            "price_entry": "62295.3",
+            "price_stop": "60893.7",
+            "price_tp": "63416.6",
+            "r_multiple": "0.8",
+            "management_mode": "fixed_tp",
+            "locked": False,
+            "trade_binding": {"plan_id": "moni:BTC-USDT-SWAP:trade-ref-1"},
+        }
+        plan = build_rr_trade_plan(
+            plan_id="moni:BTC-USDT-SWAP:trade-ref-1",
+            profile_name="moni",
+            environment="demo",
+            instrument=instrument,
+            direction="long",
+            entry_execution_mode="limit",
+            management_mode="fixed_tp",
+            trigger_price_type="last",
+            risk_amount=Decimal("100"),
+            entry_price=Decimal("60000"),
+            stop_loss_price=Decimal("59000"),
+            direct_take_profit_r=Decimal("2"),
+            round_trip_fee_rate=Decimal("0"),
+        )
+        ledger = RRTradeLedgerEntry(
+            entry_id=plan.plan_id,
+            status="entry_working",
+            plan=plan,
+            entry_order=RRTradeOrderLink(role="entry", channel="order", order_id="ord-1", client_id="cl-1", state="live"),
+        )
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch(
+                "roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries",
+                return_value={f"BTC-USDT-SWAP|{_DEFAULT_SINGLE_CHART_PERIOD}": {"rr": [rr_payload]}},
+            ),
+            patch(
+                "roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot",
+                return_value={"entries": [ledger.to_dict()]},
+            ),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._runtime = SimpleNamespace(credentials=object())
+                window._rr_table.setCurrentCell(0, 0)
+                with (
+                    patch.object(window, "_build_selected_rr_trade_plan", side_effect=AssertionError("cancel should not rebuild plan")),
+                    patch.object(window, "_start_rr_execution_action") as start_execution,
+                ):
+                    window._cancel_selected_rr_trade()
+
+                self.assertEqual(start_execution.call_count, 1)
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_remove_rr_item_cancels_bound_entry_before_deleting(self) -> None:
+        instrument = SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            settle_ccy="USDT",
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+            uly="BTC-USDT",
+            inst_family="BTC-USDT",
+        )
+        rr_payload = {
+            "rr_id": "rr-1",
+            "trade_ref": "trade-ref-1",
+            "side": "long",
+            "bar_entry": 12.0,
+            "bar_stop": 12.0,
+            "price_entry": "62295.3",
+            "price_stop": "60893.7",
+            "price_tp": "63416.6",
+            "r_multiple": "0.8",
+            "management_mode": "fixed_tp",
+            "locked": False,
+            "trade_binding": {"plan_id": "moni:BTC-USDT-SWAP:trade-ref-1"},
+        }
+        plan = build_rr_trade_plan(
+            plan_id="moni:BTC-USDT-SWAP:trade-ref-1",
+            profile_name="moni",
+            environment="demo",
+            instrument=instrument,
+            direction="long",
+            entry_execution_mode="limit",
+            management_mode="fixed_tp",
+            trigger_price_type="last",
+            risk_amount=Decimal("100"),
+            entry_price=Decimal("60000"),
+            stop_loss_price=Decimal("59000"),
+            direct_take_profit_r=Decimal("2"),
+            round_trip_fee_rate=Decimal("0"),
+        )
+        ledger = RRTradeLedgerEntry(
+            entry_id=plan.plan_id,
+            status="entry_working",
+            plan=plan,
+            entry_order=RRTradeOrderLink(role="entry", channel="order", order_id="ord-1", client_id="cl-1", state="live"),
+        )
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch(
+                "roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries",
+                return_value={f"BTC-USDT-SWAP|{_DEFAULT_SINGLE_CHART_PERIOD}": {"rr": [rr_payload]}},
+            ),
+            patch(
+                "roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot",
+                return_value={"entries": [ledger.to_dict()]},
+            ),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._runtime = SimpleNamespace(credentials=object())
+                window._rr_table.setCurrentCell(0, 0)
+                with patch.object(window, "_start_rr_execution_action") as start_execution:
+                    window._remove_rr_item()
+
+                self.assertEqual(start_execution.call_count, 1)
+                self.assertEqual(len(window._workspace_entry()["rr"]), 1)
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -2294,6 +2570,38 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_kline_rr_execution_success_callback_runs_on_gui_thread(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                entry = RRTradeLedgerEntry(
+                    entry_id="thread-callback-entry",
+                    status="entry_working",
+                    plan=SimpleNamespace(plan_id="thread-callback-plan"),
+                )
+                callback_threads: list[QThread] = []
+                with patch.object(window, "_find_rr_trade_ledger_entry", return_value=entry):
+                    window._start_rr_execution_action(
+                        action=lambda: entry,
+                        on_success=lambda _entry: callback_threads.append(QThread.currentThread()),
+                    )
+                    deadline = time.monotonic() + 3.0
+                    while not callback_threads and time.monotonic() < deadline:
+                        self._app.processEvents()
+                        time.sleep(0.01)
+
+                self.assertEqual(callback_threads, [self._app.thread()])
+                deadline = time.monotonic() + 3.0
+                while window._rr_execution_thread is not None and time.monotonic() < deadline:
+                    self._app.processEvents()
+                    time.sleep(0.01)
+                self.assertIsNone(window._rr_execution_thread)
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_kline_cancel_rr_keeps_workspace_payload_unchanged(self) -> None:
         rr_payload = {
             "rr_id": "rr-1", "side": "long", "bar_entry": 1195.0, "bar_stop": 1195.0,
@@ -2307,12 +2615,11 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             window = KlineAnalysisWindow()
             try:
                 before = dict(window._workspace_entry()["rr"][0])
-                plan = SimpleNamespace(plan_id="moni:BTC-USDT-SWAP:rr-1", inst_id="BTC-USDT-SWAP")
                 ledger = SimpleNamespace()
                 window._runtime = SimpleNamespace(credentials=object())
+                window._rr_table.setCurrentCell(0, 0)
                 with (
-                    patch.object(window, "_build_selected_rr_trade_plan", return_value=plan),
-                    patch.object(window, "_find_rr_trade_ledger_entry", return_value=ledger),
+                    patch.object(window, "_rr_ledger_entry_for_item", return_value=ledger),
                     patch.object(window, "_start_rr_execution_action") as start_execution,
                 ):
                     window._cancel_selected_rr_trade()
@@ -2719,7 +3026,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
-    def test_kline_rr_table_click_opens_rr_card_dialog(self) -> None:
+    def test_kline_rr_table_click_selects_and_double_click_opens_rr_card_dialog(self) -> None:
         rr_payload = {
             "rr_id": "rr-1",
             "side": "long",
@@ -2742,6 +3049,8 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             try:
                 with patch.object(window, "_open_rr_card_for_selected") as open_card:
                     window._rr_table.cellClicked.emit(0, 0)
+                    open_card.assert_not_called()
+                    window._rr_table.cellDoubleClicked.emit(0, 0)
                 open_card.assert_called_once()
                 self.assertEqual(window._selected_rr_index, 0)
             finally:
@@ -3122,6 +3431,49 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 self.assertEqual(window._draw_tool, "none")
                 self.assertIsNone(window._pending_rr_start)
                 self.assertGreaterEqual(render_to_chart.call_count, 1)
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_chart_new_rr_uses_a_fresh_id_when_another_rr_is_selected(self) -> None:
+        chart_payload = KlineChartPayload(
+            candles=[
+                {"time": 1, "open": 102.0, "high": 108.0, "low": 99.0, "close": 105.0, "volume": 10.0},
+                {"time": 2, "open": 105.0, "high": 112.0, "low": 100.0, "close": 110.0, "volume": 8.0},
+            ],
+            ema_9=[], ema_21=[], ema_55=[], trend_indicator=[], signal_markers=[], box_overlays=[], raw_candles=[], stats={}, alert_snapshot=None,
+        )
+        existing_rr = {
+            "rr_id": "rr-1", "side": "long", "bar_entry": 0.0, "bar_stop": 0.0,
+            "price_entry": "105", "price_stop": "100", "price_tp": "115", "r_multiple": "2", "locked": False,
+        }
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch(
+                "roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries",
+                return_value={f"BTC-USDT-SWAP|{_DEFAULT_SINGLE_CHART_PERIOD}": {"rr": [existing_rr]}},
+            ),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._pending_payload = chart_payload
+                window._selected_rr_index = 0
+                window._rr_r_edit.setText("2")
+
+                self.assertTrue(
+                    window._append_rr_rule_from_chart(
+                        side="long",
+                        entry_candle_time=2,
+                        entry_price=110.0,
+                        stop_candle_time=2,
+                        stop_price=105.0,
+                    )
+                )
+
+                self.assertEqual(
+                    [item["rr_id"] for item in window._workspace_entry()["rr"]],
+                    ["rr-1", "rr-2"],
+                )
+                self.assertTrue(window._workspace_entry()["rr"][1]["trade_ref"])
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -3698,6 +4050,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 window._pending_payload = chart_payload
                 with patch.object(window, "_rr_ledger_entry_for_item", return_value=SimpleNamespace(status="cancelled")):
                     self.assertEqual(window._rr_hit_test(candle_time=2, price=108.0), {"index": 0, "drag_mode": "rr_move"})
+                    self.assertEqual(window._rr_hit_test(candle_time=2, price=105.0), {"index": 0, "drag_mode": "rr_move"})
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -3709,6 +4062,32 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         self.assertTrue(_rr_ledger_blocks_editing(SimpleNamespace(status="entry_partially_filled")))
         self.assertTrue(_rr_ledger_blocks_editing(SimpleNamespace(status="protected")))
         self.assertTrue(_rr_ledger_blocks_editing(SimpleNamespace(status="protected_cancelled_remainder")))
+
+    def test_kline_rr_legacy_ledger_link_rejects_same_id_with_different_prices(self) -> None:
+        item = {
+            "rr_id": "rr-1", "side": "long",
+            "price_entry": "63185.17000697939", "price_stop": "61030.30564832505", "price_tp": "67494.9",
+        }
+        stale_entry = SimpleNamespace(
+            plan=SimpleNamespace(
+                plan_id="moni:BTC-USDT-SWAP:rr-1",
+                direction="long",
+                entry_price=Decimal("62821.696303743282"),
+                stop_loss_price=Decimal("59963.824282203116"),
+                take_profit_price=Decimal("66822.7"),
+            ),
+            status="entry_working",
+        )
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                with patch.object(window, "_matching_rr_trade_ledger_entries", return_value=[stale_entry]):
+                    self.assertIsNone(window._rr_ledger_entry_for_item(item))
+            finally:
+                self.__class__.dispose_widget(window)
 
     def test_kline_rr_move_drag_translates_time_and_prices_from_press_anchor(self) -> None:
         rr_payload = {
@@ -3787,6 +4166,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 with (
                     patch.object(window, "_resolve_primary_chart_click", side_effect=[(1, 95.0), (1, 90.0), (1, 90.0)]),
                     patch.object(window, "_current_chart_pointer_scene_pos", side_effect=[QPointF(10.0, 10.0), QPointF(26.0, 10.0)]),
+                    patch.object(window, "_rr_ledger_entry_for_item", return_value=None),
                     patch.object(window, "_save_workspace_snapshot"),
                     patch.object(window, "_render_to_chart"),
                 ):
@@ -3854,6 +4234,45 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 self.assertEqual(saved["price_tp"], "115")
                 self.assertIsNone(window._rr_drag_state)
                 save_snapshot.assert_not_called()
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_chart_first_click_on_unselected_rr_only_selects_it(self) -> None:
+        first_rr = {
+            "rr_id": "rr-1", "side": "long", "bar_entry": 0.0, "bar_stop": 0.0,
+            "price_entry": "105", "price_stop": "100", "price_tp": "115", "r_multiple": "2", "locked": False,
+        }
+        second_rr = {
+            "rr_id": "rr-2", "side": "short", "bar_entry": 1.0, "bar_stop": 1.0,
+            "price_entry": "110", "price_stop": "115", "price_tp": "100", "r_multiple": "2", "locked": False,
+        }
+        chart_payload = KlineChartPayload(
+            candles=[
+                {"time": 1, "open": 102.0, "high": 108.0, "low": 99.0, "close": 105.0, "volume": 10.0},
+                {"time": 2, "open": 105.0, "high": 116.0, "low": 100.0, "close": 110.0, "volume": 8.0},
+            ],
+            ema_9=[], ema_21=[], ema_55=[], trend_indicator=[], signal_markers=[], box_overlays=[], raw_candles=[], stats={}, alert_snapshot=None,
+        )
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch(
+                "roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries",
+                return_value={f"BTC-USDT-SWAP|{_DEFAULT_SINGLE_CHART_PERIOD}": {"rr": [first_rr, second_rr]}},
+            ),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._pending_payload = chart_payload
+                window._populate_rr_table(selected_index=0)
+                with (
+                    patch.object(window, "_resolve_primary_chart_click", return_value=(2, 110.0)),
+                    patch.object(window, "_rr_hit_test", return_value={"index": 1, "drag_mode": "rr_move"}),
+                    patch.object(window, "_render_to_chart"),
+                ):
+                    window._on_chart_pointer_pressed(0.0, 0.0)
+
+                self.assertEqual(window._selected_rr_index, 1)
+                self.assertIsNone(window._rr_drag_state)
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -4706,6 +5125,17 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             volume_reserved_height=72.0,
         )
         self.assertLessEqual(layout["price_y"] + 30.0, 420.0 - 72.0)
+
+    def test_hover_tooltip_prefers_right_padding_after_last_candle(self) -> None:
+        self.assertTrue(hasattr(kline_analysis_module, "_compute_hover_tooltip_x"))
+        tooltip_x = kline_analysis_module._compute_hover_tooltip_x(
+            bounds_left=0.0,
+            bounds_right=900.0,
+            anchor_x=380.0,
+            data_right_x=640.0,
+            tooltip_width=180.0,
+        )
+        self.assertEqual(tooltip_x, 652.0)
 
     def test_axis_y_padding_reserves_more_space_below_for_volume_overlay(self) -> None:
         top_padding, bottom_padding = _compute_axis_y_padding(100.0, 200.0)

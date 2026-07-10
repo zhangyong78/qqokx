@@ -241,6 +241,7 @@ class LauncherWindow(QMainWindow):
         self._child_windows: list[QWidget] = []
         self._shared_data_dialog: SharedDataDialog | None = None
         self._shutdown_in_progress = False
+        self._home_shutdown_started = False
         self._shutdown_started_at: datetime | None = None
         self._home_widget = AccountPositionsHomeWidget(self)
         self.setWindowTitle("量化交易控制台")
@@ -268,6 +269,31 @@ class LauncherWindow(QMainWindow):
             append_log_line(f"[launcher] shutdown_begin | ts={started_at.strftime('%Y-%m-%d %H:%M:%S')}")
         except Exception:
             pass
+        self._request_child_windows_close()
+        self._wait_for_child_windows_shutdown()
+
+    def _request_child_windows_close(self) -> None:
+        for window in list(self._child_windows):
+            try:
+                if window.isVisible():
+                    window.close()
+            except RuntimeError:
+                continue
+
+    def _wait_for_child_windows_shutdown(self) -> None:
+        pending_windows: list[QWidget] = []
+        for window in list(self._child_windows):
+            try:
+                if window.isVisible():
+                    pending_windows.append(window)
+            except RuntimeError:
+                continue
+        if pending_windows:
+            QTimer.singleShot(150, self._wait_for_child_windows_shutdown)
+            return
+        if self._home_shutdown_started:
+            return
+        self._home_shutdown_started = True
         self._home_widget.begin_shutdown(self._finish_shutdown)
 
     def _finish_shutdown(self) -> None:

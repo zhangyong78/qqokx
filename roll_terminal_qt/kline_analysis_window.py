@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Callable
+from uuid import uuid4
 
 from PySide6.QtCore import QDateTime, QMargins, QObject, QPointF, QRectF, QTimer, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QColor, QPainter, QPen
@@ -580,6 +581,24 @@ def _compute_hover_overlay_layout(
         "tooltip_side": tooltip_side,
         "safe_bottom": safe_bottom,
     }
+
+
+def _compute_hover_tooltip_x(
+    *,
+    bounds_left: float,
+    bounds_right: float,
+    anchor_x: float,
+    data_right_x: float,
+    tooltip_width: float,
+) -> float:
+    edge_padding = 8.0
+    data_gap = 12.0
+    safe_left = float(bounds_left) + edge_padding
+    safe_right = max(safe_left, float(bounds_right) - float(tooltip_width) - edge_padding)
+    right_padding_x = float(data_right_x) + data_gap
+    if safe_left <= right_padding_x <= safe_right:
+        return right_padding_x
+    return safe_right if float(anchor_x) <= (float(bounds_left) + float(bounds_right)) / 2.0 else safe_left
 
 
 def _compute_axis_y_padding(min_price: float, max_price: float) -> tuple[float, float]:
@@ -3981,18 +4000,17 @@ if QChartView is not None:
                 tooltip_height=float(tooltip_size.height()),
                 volume_reserved_height=volume_reserved_height,
             )
-            place_right = float(mapped_anchor.x()) <= float(mapped_bounds.center().x())
-            place_above = str(overlay_layout["tooltip_side"]) == "above"
-            tooltip_x = (
-                float(mapped_anchor.x()) + 18.0
-                if place_right
-                else float(mapped_anchor.x()) - float(tooltip_size.width()) - 18.0
+            data_right_x = float(mapped_bounds.left())
+            if self._candles:
+                data_right_x = float(viewport_geom.left()) + self._x_for_index(len(self._candles) - 1, bounds)
+            tooltip_x = _compute_hover_tooltip_x(
+                bounds_left=float(mapped_bounds.left()),
+                bounds_right=float(mapped_bounds.right()),
+                anchor_x=float(mapped_anchor.x()),
+                data_right_x=data_right_x,
+                tooltip_width=float(tooltip_size.width()),
             )
             tooltip_y = float(overlay_layout["tooltip_y"])
-            tooltip_x = max(
-                float(mapped_bounds.left()) + 8.0,
-                min(tooltip_x, float(mapped_bounds.right()) - float(tooltip_size.width()) - 8.0),
-            )
             self._tooltip_badge.move(int(round(tooltip_x)), int(round(tooltip_y)))
             self._tooltip_badge.raise_()
             self._tooltip_badge.show()
@@ -4986,6 +5004,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._rr_table.itemSelectionChanged.connect(self._on_rr_selected)
         self._rr_table.cellClicked.connect(self._on_rr_table_cell_clicked)
+        self._rr_table.cellDoubleClicked.connect(self._on_rr_table_cell_double_clicked)
         self._rr_table.setWordWrap(False)
         self._rr_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         rr_header = self._rr_table.horizontalHeader()
@@ -6927,6 +6946,12 @@ class KlineAnalysisWindow(QMainWindow):
         if row < 0:
             return
         self._populate_rr_table(selected_index=row)
+
+    @Slot(int, int)
+    def _on_rr_table_cell_double_clicked(self, row: int, _column: int) -> None:
+        if row < 0:
+            return
+        self._populate_rr_table(selected_index=row)
         self._open_rr_card_for_selected()
 
     def _refresh_event_log(self) -> None:
@@ -7140,6 +7165,7 @@ class KlineAnalysisWindow(QMainWindow):
         if not profile_name or not environment:
             raise RuntimeError("当前 API 账户或环境无效。")
         rr_id = str(payload.get("rr_id", "") or "").strip()
+        trade_ref = str(payload.get("trade_ref", "") or "").strip()
         if not rr_id:
             raise RuntimeError("RR 缺少标识，请先保存该 RR。")
         risk_amount = _parse_rr_optional_decimal(payload.get("risk_amount")) or Decimal("100")
@@ -7151,7 +7177,7 @@ class KlineAnalysisWindow(QMainWindow):
         if _rr_fee_offset_enabled(payload.get("fee_offset_enabled", False)):
             round_trip_fee_rate = _dynamic_two_taker_fee_offset_live(entry_price, enabled=True) / entry_price
         plan = build_rr_trade_plan(
-            plan_id=f"{profile_name}:{str(getattr(instrument, 'inst_id', '') or '')}:{rr_id}",
+            plan_id=f"{profile_name}:{str(getattr(instrument, 'inst_id', '') or '')}:{trade_ref or rr_id}",
             profile_name=profile_name,
             environment=environment,
             instrument=instrument,
@@ -7264,6 +7290,72 @@ class KlineAnalysisWindow(QMainWindow):
                 return item
         return None
 
+    def _rr_trade_binding_plan_id(self, item: dict[str, object] | None) -> str:
+        if not isinstance(item, dict):
+            return ""
+        binding = item.get("trade_binding")
+        if not isinstance(binding, dict):
+            return ""
+        return str(binding.get("plan_id", "") or "").strip()
+
+    def _find_rr_item_index_for_entry(self, entry: RRTradeLedgerEntry) -> int:
+        plan_id = str(entry.plan.plan_id or "").strip()
+        entry_trade_ref = plan_id.rsplit(":", 1)[-1] if ":" in plan_id else plan_id
+        records = self._workspace_entry().get("rr", [])
+        if not isinstance(records, list):
+            return -1
+        for index, item in enumerate(records):
+            if not isinstance(item, dict):
+                continue
+            if self._rr_trade_binding_plan_id(item) == plan_id:
+                return index
+        for index, item in enumerate(records):
+            if not isinstance(item, dict):
+                continue
+            trade_ref = str(item.get("trade_ref", "") or "").strip()
+            if trade_ref and trade_ref == entry_trade_ref:
+                return index
+        for index, item in enumerate(records):
+            if not isinstance(item, dict):
+                continue
+            trade_ref = str(item.get("trade_ref", "") or "").strip()
+            if trade_ref:
+                continue
+            rr_id = str(item.get("rr_id", "") or "").strip()
+            if rr_id and plan_id.endswith(f":{rr_id}") and self._legacy_rr_plan_matches_item(entry, item):
+                return index
+        return -1
+
+    def _bind_rr_trade_entry(self, entry: RRTradeLedgerEntry) -> None:
+        index = self._find_rr_item_index_for_entry(entry)
+        records = self._workspace_entry().get("rr", [])
+        if index < 0 or not isinstance(records, list) or index >= len(records):
+            return
+        existing = records[index]
+        if not isinstance(existing, dict):
+            return
+        plan_id = str(entry.plan.plan_id or "").strip()
+        trade_ref = str(existing.get("trade_ref", "") or "").strip()
+        if not trade_ref and ":" in plan_id:
+            trade_ref = plan_id.rsplit(":", 1)[-1]
+        binding_payload = {
+            "plan_id": plan_id,
+            "status": str(entry.status or "").strip(),
+            "entry_order_id": str(getattr(entry.entry_order, "order_id", "") or "").strip(),
+            "entry_client_id": str(getattr(entry.entry_order, "client_id", "") or "").strip(),
+            "stop_loss_algo_id": str(getattr(entry.stop_loss_order, "algo_id", "") or "").strip(),
+            "stop_loss_client_id": str(getattr(entry.stop_loss_order, "client_id", "") or "").strip(),
+            "take_profit_algo_id": str(getattr(entry.take_profit_order, "algo_id", "") or "").strip(),
+            "take_profit_client_id": str(getattr(entry.take_profit_order, "client_id", "") or "").strip(),
+        }
+        updated = dict(existing)
+        updated["trade_ref"] = trade_ref
+        updated["trade_binding"] = binding_payload
+        if updated == existing:
+            return
+        records[index] = updated
+        self._save_workspace_snapshot()
+
     def _save_rr_trade_ledger_entry(self, entry: RRTradeLedgerEntry) -> None:
         snapshot = self._rr_trade_ledger_snapshot if isinstance(self._rr_trade_ledger_snapshot, dict) else {}
         records = list(snapshot.get("entries", [])) if isinstance(snapshot.get("entries"), list) else []
@@ -7285,6 +7377,7 @@ class KlineAnalysisWindow(QMainWindow):
             normalized_records.append(entry.to_dict())
         self._rr_trade_ledger_snapshot = {"entries": normalized_records}
         save_kline_rr_trade_ledger_snapshot(normalized_records)
+        self._bind_rr_trade_entry(entry)
         self._refresh_rr_trade_hint()
         records = self._workspace_entry().get("rr", [])
         if isinstance(records, list) and 0 <= self._selected_rr_index < len(records):
@@ -7438,8 +7531,7 @@ class KlineAnalysisWindow(QMainWindow):
     @Slot()
     def _cancel_selected_rr_trade(self) -> None:
         try:
-            plan = self._build_selected_rr_trade_plan()
-            entry = self._find_rr_trade_ledger_entry(plan.plan_id)
+            entry = self._rr_ledger_entry_for_item(self._selected_rr_payload())
             if entry is None:
                 raise RuntimeError("当前 RR 没有可取消的交易记录。")
             runtime = self._runtime
@@ -7448,21 +7540,50 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_status(f"无法取消 RR 交易：{exc}")
             return
 
-        def _submit_cancel(*, confirmed_for_filled: bool) -> None:
-            self._start_rr_execution_action(
-                action=lambda: self._rr_trade_execution_service.cancel(
-                    client=OkxRestClient(),
-                    credentials=runtime.credentials,
-                    config=_build_strategy_config(plan.inst_id, runtime),
-                    entry=entry,
-                    confirmed_for_filled=confirmed_for_filled,
-                ),
-                on_success=lambda updated: self._handle_rr_cancel_result(updated, plan=plan, runtime=runtime),
-            )
+        self._submit_rr_trade_cancel(
+            entry=entry,
+            runtime=runtime,
+            confirmed_for_filled=False,
+            delete_after_cancel=False,
+        )
 
-        _submit_cancel(confirmed_for_filled=False)
+    def _submit_rr_trade_cancel(
+        self,
+        *,
+        entry: RRTradeLedgerEntry,
+        runtime,
+        confirmed_for_filled: bool,
+        delete_after_cancel: bool,
+    ) -> None:
+        self._start_rr_execution_action(
+            action=lambda: self._rr_trade_execution_service.cancel(
+                client=OkxRestClient(),
+                credentials=runtime.credentials,
+                config=_build_strategy_config(entry.plan.inst_id, runtime),
+                entry=entry,
+                confirmed_for_filled=confirmed_for_filled,
+            ),
+            on_success=lambda updated: self._handle_rr_cancel_result(
+                updated,
+                runtime=runtime,
+                delete_after_cancel=delete_after_cancel,
+            ),
+        )
 
-    def _handle_rr_cancel_result(self, entry: RRTradeLedgerEntry, *, plan, runtime) -> None:
+    def _delete_rr_item_at_index(self, index: int) -> None:
+        entry = self._workspace_entry()
+        rr_items = entry.get("rr")
+        if not isinstance(rr_items, list) or index < 0 or index >= len(rr_items):
+            return
+        del rr_items[index]
+        next_index = min(index, len(rr_items) - 1)
+        self._selected_rr_index = next_index
+        self._save_workspace_snapshot()
+        self._populate_rr_table(selected_index=next_index)
+        if self._pending_payload is not None:
+            self._render_to_chart(self._pending_payload)
+
+    def _handle_rr_cancel_result(self, entry: RRTradeLedgerEntry, *, runtime, delete_after_cancel: bool) -> None:
         if entry.status == "cancel_confirmation_required":
             confirmed = QMessageBox.question(
                 self,
@@ -7472,30 +7593,59 @@ class KlineAnalysisWindow(QMainWindow):
                 QMessageBox.StandardButton.No,
             )
             if confirmed == QMessageBox.StandardButton.Yes:
-                self._start_rr_execution_action(
-                    action=lambda: self._rr_trade_execution_service.cancel(
-                        client=OkxRestClient(),
-                        credentials=runtime.credentials,
-                        config=_build_strategy_config(plan.inst_id, runtime),
-                        entry=entry,
-                        confirmed_for_filled=True,
-                    ),
-                    on_success=lambda updated: self._set_status(f"RR 取消结果：{updated.status}"),
+                self._submit_rr_trade_cancel(
+                    entry=entry,
+                    runtime=runtime,
+                    confirmed_for_filled=True,
+                    delete_after_cancel=delete_after_cancel,
                 )
                 return
             self._set_status("已取消撤单确认，原订单保持不变。")
             return
+        if delete_after_cancel:
+            if entry.status == "cancelled":
+                index = self._find_rr_item_index_for_entry(entry)
+                if index >= 0:
+                    self._delete_rr_item_at_index(index)
+                self._set_status("RR 挂单已撤销，图形已删除。")
+                return
+            self._set_status(f"RR 取消结果：{entry.status}，已有成交或保护单，保留图形。")
+            return
         self._set_status(f"RR 取消结果：{entry.status}")
 
     def _rr_ledger_entry_for_item(self, item: dict[str, object]) -> RRTradeLedgerEntry | None:
+        bound_plan_id = self._rr_trade_binding_plan_id(item)
+        if bound_plan_id:
+            bound_entry = self._find_rr_trade_ledger_entry(bound_plan_id)
+            if bound_entry is not None:
+                return bound_entry
         rr_id = str(item.get("rr_id", "") or "").strip()
-        if not rr_id:
+        trade_ref = str(item.get("trade_ref", "") or "").strip()
+        if not rr_id and not trade_ref:
             return None
-        suffix = f":{rr_id}"
+        suffix = f":{trade_ref or rr_id}"
         for entry in self._matching_rr_trade_ledger_entries():
-            if str(entry.plan.plan_id or "").endswith(suffix):
+            if not str(entry.plan.plan_id or "").endswith(suffix):
+                continue
+            if trade_ref or self._legacy_rr_plan_matches_item(entry, item):
                 return entry
         return None
+
+    def _legacy_rr_plan_matches_item(self, entry: RRTradeLedgerEntry, item: dict[str, object]) -> bool:
+        plan = entry.plan
+        side = str(item.get("side", "") or "").strip().lower()
+        if side and str(plan.direction or "").strip().lower() != side:
+            return False
+        for item_key, plan_key in (
+            ("price_entry", "entry_price"),
+            ("price_stop", "stop_loss_price"),
+            ("price_tp", "take_profit_price"),
+        ):
+            item_price = _parse_rr_optional_decimal(item.get(item_key))
+            plan_price = _parse_rr_optional_decimal(getattr(plan, plan_key, None))
+            if item_price is None or plan_price is None or item_price != plan_price:
+                return False
+        return True
 
     def _refresh_rr_tracking_summary(self, item: dict[str, object] | None) -> None:
         if not hasattr(self, "_rr_tracking_summary"):
@@ -7672,8 +7822,13 @@ class KlineAnalysisWindow(QMainWindow):
             if rr_hit is None:
                 return
             index = int(rr_hit["index"])
+            was_selected = self._selected_rr_index == index
             self._clear_line_selection_for_rr_focus()
             self._populate_rr_table(selected_index=index)
+            if not was_selected:
+                if self._pending_payload is not None:
+                    self._render_to_chart(self._pending_payload)
+                return
             rr_drag_state: dict[str, object] = {
                 "index": index,
                 "drag_mode": str(rr_hit["drag_mode"]),
@@ -8236,7 +8391,8 @@ class KlineAnalysisWindow(QMainWindow):
             r_multiple = self._parse_rr_decimal(self._rr_r_edit.text(), "R 倍数")
             payload = self._normalized_rr_payload(
                 {
-                "rr_id": self._existing_rr_id(),
+                "rr_id": self._next_rr_id(),
+                "trade_ref": uuid4().hex,
                 "side": side,
                 "bar_entry": self._bar_index_for_candle_time(normalized_entry_time),
                 "bar_stop": self._bar_index_for_candle_time(normalized_stop_time),
@@ -8347,7 +8503,7 @@ class KlineAnalysisWindow(QMainWindow):
             )
             if candle_time < rr_start_time:
                 continue
-            for drag_mode, target_price in (("rr_entry", entry_price), ("rr_stop", stop_price), ("rr_tp", take_profit)):
+            for drag_mode, target_price in (("rr_move", entry_price), ("rr_stop", stop_price), ("rr_tp", take_profit)):
                 distance = abs(target_price - float(price))
                 if distance <= tolerance and distance < best_distance:
                     best_distance = distance
@@ -8441,6 +8597,22 @@ class KlineAnalysisWindow(QMainWindow):
         count = len(raw_rr) + 1 if isinstance(raw_rr, list) else 1
         return f"rr-{count}"
 
+    def _next_rr_id(self, entry: dict[str, object] | None = None) -> str:
+        entry = entry if isinstance(entry, dict) else self._workspace_entry()
+        raw_rr = entry.get("rr", [])
+        records = list(raw_rr) if isinstance(raw_rr, list) else []
+        existing_ids = {
+            str(item.get("rr_id", "") or "").strip()
+            for item in records
+            if isinstance(item, dict)
+        }
+        sequence = max(1, len(records) + 1)
+        candidate = f"rr-{sequence}"
+        while candidate in existing_ids:
+            sequence += 1
+            candidate = f"rr-{sequence}"
+        return candidate
+
     def _parse_rr_decimal(self, text: str, field_name: str) -> Decimal:
         value = Decimal(str(text or "").strip())
         if value <= 0:
@@ -8525,6 +8697,7 @@ class KlineAnalysisWindow(QMainWindow):
             payload = {
                 **existing_payload,
                 "rr_id": self._existing_rr_id(entry),
+                "trade_ref": str(existing_payload.get("trade_ref", "") or uuid4().hex),
                 "side": side,
                 "management_mode": str(self._rr_management_mode_combo.currentData() or "fixed_tp"),
                 "bar_entry": bar_entry,
@@ -8561,18 +8734,41 @@ class KlineAnalysisWindow(QMainWindow):
     def _remove_rr_item(self) -> None:
         if self._selected_rr_index < 0:
             return
-        entry = self._workspace_entry()
-        rr_items = entry.get("rr")
-        if not isinstance(rr_items, list) or self._selected_rr_index >= len(rr_items):
+        try:
+            payload = self._selected_rr_payload()
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"删除 RR 失败：{exc}")
             return
-        deleted_index = self._selected_rr_index
-        del rr_items[deleted_index]
-        next_index = min(deleted_index, len(rr_items) - 1)
-        self._selected_rr_index = next_index
-        self._save_workspace_snapshot()
-        self._populate_rr_table(selected_index=next_index)
-        if self._pending_payload is not None:
-            self._render_to_chart(self._pending_payload)
+        ledger_entry = self._rr_ledger_entry_for_item(payload)
+        if ledger_entry is not None:
+            active_statuses = {
+                "entry_working",
+                "entry_partially_filled",
+                "cancel_confirmation_required",
+            }
+            protected_statuses = {
+                "protected",
+                "protected_break_even",
+                "protected_trailing",
+                "protected_cancelled_remainder",
+            }
+            status = str(ledger_entry.status or "").strip().lower()
+            if status in protected_statuses:
+                self._set_status("该 RR 已有关联仓位或保护单，不能直接删除。请先处理持仓。")
+                return
+            if status in active_statuses:
+                runtime = self._runtime
+                if runtime is None:
+                    self._set_status("当前 RR 有挂单，但 API 不可用，无法先撤单再删除。")
+                    return
+                self._submit_rr_trade_cancel(
+                    entry=ledger_entry,
+                    runtime=runtime,
+                    confirmed_for_filled=False,
+                    delete_after_cancel=True,
+                )
+                return
+        self._delete_rr_item_at_index(self._selected_rr_index)
         self._set_status("RR 区块已删除。")
 
     def _apply_alert_snapshot(self, snapshot: KlineAlertSnapshot | None) -> None:
