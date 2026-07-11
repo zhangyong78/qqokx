@@ -31,6 +31,153 @@ class OrderStatusView:
     raw: dict[str, object]
 
 
+def _parse_int_like(value: object) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except Exception:
+        return None
+
+
+def _parse_optional_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def _order_view_source_kind(order: OrderStatusView) -> str:
+    raw = order.raw if isinstance(order.raw, dict) else {}
+    return str(raw.get("_source_kind") or "").strip().lower() or "normal"
+
+
+def _order_view_source_label(order: OrderStatusView) -> str:
+    raw = order.raw if isinstance(order.raw, dict) else {}
+    feed_source = str(raw.get("_feed_source") or "").strip().lower()
+    source_kind = _order_view_source_kind(order)
+    if feed_source == "rest_pending" and source_kind == "algo":
+        return "REST 算法"
+    if feed_source == "rest_pending":
+        return "REST 普通"
+    if feed_source == "ws" and source_kind == "algo":
+        return "WS 算法"
+    if feed_source == "ws":
+        return "WS 当前"
+    if source_kind == "algo":
+        return "算法委托"
+    return "普通委托"
+
+
+def _order_view_raw_decimal(raw: dict[str, object], *keys: str) -> Decimal | None:
+    for key in keys:
+        value = raw.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            return Decimal(text)
+        except Exception:
+            continue
+    return None
+
+
+def _order_view_extract_tp_sl_fields(raw: dict[str, object]) -> dict[str, Decimal | str | None]:
+    take_profit_trigger_price = _order_view_raw_decimal(raw, "tpTriggerPx", "takeProfitTriggerPrice")
+    take_profit_order_price = _order_view_raw_decimal(raw, "tpOrdPx", "takeProfitOrdPx")
+    take_profit_trigger_price_type = raw.get("tpTriggerPxType") or raw.get("takeProfitTriggerPxType")
+    stop_loss_trigger_price = _order_view_raw_decimal(raw, "slTriggerPx", "stopLossTriggerPrice")
+    stop_loss_order_price = _order_view_raw_decimal(raw, "slOrdPx", "stopLossOrdPx")
+    stop_loss_trigger_price_type = raw.get("slTriggerPxType") or raw.get("stopLossTriggerPxType")
+    attach_algo_orders = raw.get("attachAlgoOrds")
+    if isinstance(attach_algo_orders, list):
+        for item in attach_algo_orders:
+            if not isinstance(item, dict):
+                continue
+            if take_profit_trigger_price is None:
+                take_profit_trigger_price = _order_view_raw_decimal(item, "tpTriggerPx", "takeProfitTriggerPrice")
+            if take_profit_order_price is None:
+                take_profit_order_price = _order_view_raw_decimal(item, "tpOrdPx", "takeProfitOrdPx")
+            if take_profit_trigger_price_type is None:
+                take_profit_trigger_price_type = item.get("tpTriggerPxType") or item.get("takeProfitTriggerPxType")
+            if stop_loss_trigger_price is None:
+                stop_loss_trigger_price = _order_view_raw_decimal(item, "slTriggerPx", "stopLossTriggerPrice")
+            if stop_loss_order_price is None:
+                stop_loss_order_price = _order_view_raw_decimal(item, "slOrdPx", "stopLossOrdPx")
+            if stop_loss_trigger_price_type is None:
+                stop_loss_trigger_price_type = item.get("slTriggerPxType") or item.get("stopLossTriggerPxType")
+    return {
+        "take_profit_trigger_price": take_profit_trigger_price,
+        "take_profit_order_price": take_profit_order_price,
+        "take_profit_trigger_price_type": (
+            str(take_profit_trigger_price_type).strip() if take_profit_trigger_price_type is not None else None
+        ),
+        "stop_loss_trigger_price": stop_loss_trigger_price,
+        "stop_loss_order_price": stop_loss_order_price,
+        "stop_loss_trigger_price_type": (
+            str(stop_loss_trigger_price_type).strip() if stop_loss_trigger_price_type is not None else None
+        ),
+    }
+
+
+def order_view_to_trade_order_item(order: OrderStatusView) -> OkxTradeOrderItem:
+    raw = dict(order.raw) if isinstance(order.raw, dict) else {}
+    algo_id = str(raw.get("algoId") or "").strip() or None
+    algo_cl_ord_id = str(raw.get("algoClOrdId") or "").strip() or None
+    tp_sl = _order_view_extract_tp_sl_fields(raw)
+    return OkxTradeOrderItem(
+        source_kind=_order_view_source_kind(order),
+        source_label=_order_view_source_label(order),
+        created_time=order.created_time,
+        update_time=order.update_time,
+        inst_id=order.inst_id,
+        inst_type=order.inst_type,
+        side=order.side or None,
+        pos_side=order.pos_side or None,
+        td_mode=order.td_mode or None,
+        ord_type=order.ord_type or None,
+        state=order.state or None,
+        price=order.price,
+        size=order.size,
+        filled_size=order.filled_size,
+        avg_price=order.avg_price,
+        order_id=order.ord_id or None,
+        algo_id=algo_id,
+        client_order_id=order.client_order_id or None,
+        algo_client_order_id=algo_cl_ord_id or (order.client_order_id or None),
+        pnl=_order_view_raw_decimal(raw, "pnl"),
+        fee=_order_view_raw_decimal(raw, "fee", "actualFee", "fillFee"),
+        fee_currency=(
+            str(raw.get("feeCcy") or raw.get("actualFeeCcy") or raw.get("fillFeeCcy") or "").strip() or None
+        ),
+        reduce_only=order.reduce_only,
+        trigger_price=_order_view_raw_decimal(raw, "triggerPx", "triggerPrice"),
+        trigger_price_type=(str(raw.get("triggerPxType") or raw.get("triggerPriceType") or "").strip() or None),
+        order_price=_order_view_raw_decimal(raw, "orderPx") or order.price,
+        actual_price=_order_view_raw_decimal(raw, "actualPx", "avgPx", "fillPx") or order.avg_price,
+        actual_size=_order_view_raw_decimal(raw, "actualSz", "accFillSz", "fillSz") or order.filled_size,
+        actual_side=(str(raw.get("actualSide") or "").strip() or order.side or None),
+        take_profit_trigger_price=tp_sl["take_profit_trigger_price"],
+        take_profit_order_price=tp_sl["take_profit_order_price"],
+        take_profit_trigger_price_type=tp_sl["take_profit_trigger_price_type"],
+        stop_loss_trigger_price=tp_sl["stop_loss_trigger_price"],
+        stop_loss_order_price=tp_sl["stop_loss_order_price"],
+        stop_loss_trigger_price_type=tp_sl["stop_loss_trigger_price_type"],
+        raw=raw,
+    )
+
+
 class OrderFeedThread(QThread):
     orders_ready = Signal(object)
     status_changed = Signal(str)
@@ -55,27 +202,13 @@ class OrderFeedThread(QThread):
                 time.sleep(1.0)
                 continue
             try:
-                payload = self._client.get_cached_private_order_statuses(
-                    self._runtime.credentials,
-                    environment=self._runtime.environment,
+                status_text, views = load_current_order_views(
+                    self._runtime,
+                    client=self._client,
                     limit=80,
                 )
-                ws_version = 0
-                ws_statuses: list[OkxOrderStatus] = []
-                if payload is not None:
-                    ws_version, ws_statuses = payload
-                pending_orders = self._client.get_pending_orders(
-                    self._runtime.credentials,
-                    environment=self._runtime.environment,
-                    limit=80,
-                    include_algo=True,
-                )
-                views = self._merge_order_views(ws_statuses, pending_orders)
                 self.orders_ready.emit(views)
-                if payload is None:
-                    self.status_changed.emit(f"订单REST pending | 相关 {len(views)}")
-                else:
-                    self.status_changed.emit(f"订单WS v{ws_version} + REST | 相关 {len(views)}")
+                self.status_changed.emit(status_text)
                 time.sleep(0.35)
             except Exception as exc:  # noqa: BLE001
                 self.status_changed.emit(f"订单WS异常：{exc}")
@@ -191,26 +324,32 @@ class OrderFeedThread(QThread):
         return None
 
 
-def _parse_int_like(value: object) -> int | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return int(text)
-    except Exception:
-        return None
-
-
-def _parse_optional_bool(value: object) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    text = str(value or "").strip().lower()
-    if not text:
-        return None
-    if text in {"true", "1", "yes"}:
-        return True
-    if text in {"false", "0", "no"}:
-        return False
-    return None
+def load_current_order_views(
+    runtime: ArbitrageTradeRuntime | None,
+    *,
+    client: OkxRestClient | None = None,
+    limit: int = 80,
+) -> tuple[str, list[OrderStatusView]]:
+    if runtime is None:
+        raise RuntimeError("订单WS不可用")
+    rest_client = client or OkxRestClient()
+    payload = rest_client.get_cached_private_order_statuses(
+        runtime.credentials,
+        environment=runtime.environment,
+        limit=limit,
+    )
+    ws_version = 0
+    ws_statuses: list[OkxOrderStatus] = []
+    if payload is not None:
+        ws_version, ws_statuses = payload
+    pending_orders = rest_client.get_pending_orders(
+        runtime.credentials,
+        environment=runtime.environment,
+        limit=limit,
+        include_algo=True,
+    )
+    feed = OrderFeedThread(runtime)
+    views = feed._merge_order_views(ws_statuses, pending_orders)
+    if payload is None:
+        return (f"订单REST pending | 相关 {len(views)}", views)
+    return (f"订单WS v{ws_version} + REST | 相关 {len(views)}", views)

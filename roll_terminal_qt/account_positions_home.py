@@ -115,6 +115,7 @@ from okx_quant.ui_shell import (
     _format_trade_order_size,
     _format_trade_order_state,
     _format_trade_order_fee_cell,
+    _format_trade_order_tp_sl,
     _trade_order_cancel_reference,
     _trade_order_program_owner_label,
     _build_trade_order_detail_text,
@@ -157,6 +158,7 @@ from roll_terminal_qt.history_service import FillHistoryFeedThread, OrderHistory
 from roll_terminal_qt.option_strategy_window import CandlestickChartView
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots, profile_requires_password
+from roll_terminal_qt.shared_order_store import SharedOrderSnapshot, get_shared_order_store
 from roll_terminal_qt.runtime import load_runtime, profile_names
 
 
@@ -229,10 +231,79 @@ def _current_order_view_source_label(order: OrderStatusView) -> str:
     return "WS 当前"
 
 
+_CURRENT_ORDER_TERMINAL_STATES = frozenset(
+    {
+        "canceled",
+        "filled",
+        "order_failed",
+        "failed",
+        "mmp_canceled",
+    }
+)
+
+
+def _current_order_state_is_terminal(state: str | None) -> bool:
+    return str(state or "").strip().lower() in _CURRENT_ORDER_TERMINAL_STATES
+
+
+def _current_order_raw_decimal(raw: dict[str, object], *keys: str) -> Decimal | None:
+    for key in keys:
+        value = raw.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            return Decimal(text)
+        except Exception:
+            continue
+    return None
+
+
+def _current_order_extract_tp_sl_fields(raw: dict[str, object]) -> dict[str, Decimal | str | None]:
+    take_profit_trigger_price = _current_order_raw_decimal(raw, "tpTriggerPx", "takeProfitTriggerPrice")
+    take_profit_order_price = _current_order_raw_decimal(raw, "tpOrdPx", "takeProfitOrdPx")
+    take_profit_trigger_price_type = raw.get("tpTriggerPxType") or raw.get("takeProfitTriggerPxType")
+    stop_loss_trigger_price = _current_order_raw_decimal(raw, "slTriggerPx", "stopLossTriggerPrice")
+    stop_loss_order_price = _current_order_raw_decimal(raw, "slOrdPx", "stopLossOrdPx")
+    stop_loss_trigger_price_type = raw.get("slTriggerPxType") or raw.get("stopLossTriggerPxType")
+    attach_algo_orders = raw.get("attachAlgoOrds")
+    if isinstance(attach_algo_orders, list):
+        for item in attach_algo_orders:
+            if not isinstance(item, dict):
+                continue
+            if take_profit_trigger_price is None:
+                take_profit_trigger_price = _current_order_raw_decimal(item, "tpTriggerPx", "takeProfitTriggerPrice")
+            if take_profit_order_price is None:
+                take_profit_order_price = _current_order_raw_decimal(item, "tpOrdPx", "takeProfitOrdPx")
+            if take_profit_trigger_price_type is None:
+                take_profit_trigger_price_type = item.get("tpTriggerPxType") or item.get("takeProfitTriggerPxType")
+            if stop_loss_trigger_price is None:
+                stop_loss_trigger_price = _current_order_raw_decimal(item, "slTriggerPx", "stopLossTriggerPrice")
+            if stop_loss_order_price is None:
+                stop_loss_order_price = _current_order_raw_decimal(item, "slOrdPx", "stopLossOrdPx")
+            if stop_loss_trigger_price_type is None:
+                stop_loss_trigger_price_type = item.get("slTriggerPxType") or item.get("stopLossTriggerPxType")
+    return {
+        "take_profit_trigger_price": take_profit_trigger_price,
+        "take_profit_order_price": take_profit_order_price,
+        "take_profit_trigger_price_type": (
+            str(take_profit_trigger_price_type).strip() if take_profit_trigger_price_type is not None else None
+        ),
+        "stop_loss_trigger_price": stop_loss_trigger_price,
+        "stop_loss_order_price": stop_loss_order_price,
+        "stop_loss_trigger_price_type": (
+            str(stop_loss_trigger_price_type).strip() if stop_loss_trigger_price_type is not None else None
+        ),
+    }
+
+
 def _current_order_view_to_trade_order_item(order: OrderStatusView) -> OkxTradeOrderItem:
     raw = dict(order.raw) if isinstance(order.raw, dict) else {}
     algo_id = str(raw.get("algoId") or "").strip() or None
     algo_cl_ord_id = str(raw.get("algoClOrdId") or "").strip() or None
+    tp_sl = _current_order_extract_tp_sl_fields(raw)
     return OkxTradeOrderItem(
         source_kind=_current_order_view_source_kind(order),
         source_label=_current_order_view_source_label(order),
@@ -253,22 +324,24 @@ def _current_order_view_to_trade_order_item(order: OrderStatusView) -> OkxTradeO
         algo_id=algo_id,
         client_order_id=order.client_order_id or None,
         algo_client_order_id=algo_cl_ord_id or (order.client_order_id or None),
-        pnl=None,
-        fee=None,
-        fee_currency=None,
+        pnl=_current_order_raw_decimal(raw, "pnl"),
+        fee=_current_order_raw_decimal(raw, "fee", "actualFee", "fillFee"),
+        fee_currency=(
+            str(raw.get("feeCcy") or raw.get("actualFeeCcy") or raw.get("fillFeeCcy") or "").strip() or None
+        ),
         reduce_only=order.reduce_only,
-        trigger_price=None,
-        trigger_price_type=None,
-        order_price=None,
-        actual_price=None,
-        actual_size=None,
-        actual_side=None,
-        take_profit_trigger_price=None,
-        take_profit_order_price=None,
-        take_profit_trigger_price_type=None,
-        stop_loss_trigger_price=None,
-        stop_loss_order_price=None,
-        stop_loss_trigger_price_type=None,
+        trigger_price=_current_order_raw_decimal(raw, "triggerPx", "triggerPrice"),
+        trigger_price_type=(str(raw.get("triggerPxType") or raw.get("triggerPriceType") or "").strip() or None),
+        order_price=_current_order_raw_decimal(raw, "orderPx") or order.price,
+        actual_price=_current_order_raw_decimal(raw, "actualPx", "avgPx", "fillPx") or order.avg_price,
+        actual_size=_current_order_raw_decimal(raw, "actualSz", "accFillSz", "fillSz") or order.filled_size,
+        actual_side=(str(raw.get("actualSide") or "").strip() or order.side or None),
+        take_profit_trigger_price=tp_sl["take_profit_trigger_price"],
+        take_profit_order_price=tp_sl["take_profit_order_price"],
+        take_profit_trigger_price_type=tp_sl["take_profit_trigger_price_type"],
+        stop_loss_trigger_price=tp_sl["stop_loss_trigger_price"],
+        stop_loss_order_price=tp_sl["stop_loss_order_price"],
+        stop_loss_trigger_price_type=tp_sl["stop_loss_trigger_price_type"],
         raw=raw,
     )
 
@@ -2150,6 +2223,10 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_last_sync_text = time.strftime("%H:%M:%S")
         self._render_position_history_table()
 
+    def _restart_live_feeds_for_manual_refresh(self) -> None:
+        self._stop_private_threads(wait_ms=0)
+        self._start_private_threads(force_restart=False, start_history=False)
+
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
             return
@@ -3656,10 +3733,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._restore_tree_selection(selected_key)
         self._update_filter_shortcuts()
         self._sync_order_watchlist()
-        visible_inst_ids = {item.inst_id.strip().upper() for item in self._visible_positions}
-        self._visible_orders = [
-            item for item in self._orders if not visible_inst_ids or item.inst_id.strip().upper() in visible_inst_ids
-        ]
+        self._visible_orders = list(self._orders)
         self._refresh_current_orders_table()
         self._refresh_detail()
         self._update_expand_toggle_button()
@@ -3886,7 +3960,11 @@ class AccountPositionsHomeWidget(QWidget):
     def _sync_order_watchlist(self) -> None:
         if self._order_feed is None:
             return
-        self._order_feed.set_watched_inst_ids({item.inst_id for item in self._visible_positions})
+        # Current orders must include pending conditional/algo orders even when
+        # they are not on the same contract set as the currently visible
+        # positions (for example hedge or trigger orders on BTC-USDT-SWAP while
+        # the position tree is filtered to option contracts).
+        self._order_feed.set_watched_inst_ids(set())
 
     def _refresh_current_orders_table(self) -> None:
         if not hasattr(self, "_orders_table"):
@@ -3895,9 +3973,7 @@ class AccountPositionsHomeWidget(QWidget):
         current_row = self._orders_table.currentRow()
         if 0 <= current_row < len(self._visible_orders):
             selected_ord_id = self._visible_orders[current_row].ord_id
-        self._orders_summary_label.setText(
-            f"当前委托：{len(self._visible_orders)} 条 | 仅显示当前持仓相关合约。"
-        )
+        self._orders_summary_label.setText(f"当前委托：{len(self._visible_orders)} 条")
         self._orders_table.setRowCount(len(self._visible_orders))
         for row, order in enumerate(self._visible_orders):
             values = (
@@ -4371,10 +4447,7 @@ class AccountPositionsHomeWidget(QWidget):
     @Slot(object)
     def _apply_orders(self, orders: object) -> None:
         self._orders = list(orders) if isinstance(orders, list) else []
-        visible_inst_ids = {item.inst_id for item in self._visible_positions}
-        self._visible_orders = [
-            item for item in self._orders if not visible_inst_ids or item.inst_id.strip().upper() in visible_inst_ids
-        ]
+        self._visible_orders = list(self._orders)
         self._refresh_current_orders_table()
 
     @Slot(object)
@@ -4728,7 +4801,7 @@ class AccountPositionsHomeWidget(QWidget):
             )
         return table
 
-    def _start_private_threads(self, *, force_restart: bool = False) -> None:
+    def _start_private_threads(self, *, force_restart: bool = False, start_history: bool = True) -> None:
         if self._runtime is None:
             return
         if force_restart:
@@ -4768,9 +4841,10 @@ class AccountPositionsHomeWidget(QWidget):
         )
         self._account_feed.start()
         self._order_feed.start()
-        self._start_order_history_refresh(force_restart=force_restart)
-        self._start_fill_history_refresh(force_restart=force_restart)
-        self._start_position_history_refresh(force_restart=force_restart)
+        if start_history:
+            self._start_order_history_refresh(force_restart=force_restart)
+            self._start_fill_history_refresh(force_restart=force_restart)
+            self._start_position_history_refresh(force_restart=force_restart)
 
     def _clear_pending_order_filters(self) -> None:
         self._pending_type_combo.setCurrentIndex(0)
@@ -4887,6 +4961,8 @@ class AccountPositionsHomeWidget(QWidget):
                 continue
             if state_filter and (item.state or "").strip().lower() != state_filter:
                 continue
+            if not state_filter and _current_order_state_is_terminal(item.state):
+                continue
             inst_id = (item.inst_id or "").strip().upper()
             if asset_filter and not inst_id.startswith(asset_filter + "-"):
                 continue
@@ -4900,7 +4976,10 @@ class AccountPositionsHomeWidget(QWidget):
                         (item.side or ""),
                         (item.pos_side or ""),
                         (item.ord_type or ""),
+                        (item.ord_id or ""),
                         (item.client_order_id or ""),
+                        str(item.raw.get("algoId") or ""),
+                        str(item.raw.get("algoClOrdId") or ""),
                     )
                 ).upper()
                 if keyword not in haystack:
@@ -4916,9 +4995,10 @@ class AccountPositionsHomeWidget(QWidget):
         row = self._orders_table.currentRow()
         if 0 <= row < len(filtered):
             selected_ord_id = filtered[row].ord_id
-        self._orders_summary_label.setText(f"当前委托：{len(filtered)} 条 | 仅显示当前持仓相关合约。")
+        self._orders_summary_label.setText(f"当前委托：{len(filtered)} 条")
         self._orders_table.setRowCount(len(filtered))
         for row, order in enumerate(filtered):
+            item = _current_order_view_to_trade_order_item(order)
             feed_source = str(order.raw.get("_feed_source") or "").strip().lower()
             source_kind = str(order.raw.get("_source_kind") or "").strip().lower()
             if feed_source == "rest_pending" and source_kind == "algo":
@@ -4938,10 +5018,10 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_trade_order_price(order.price, order.inst_id, order.inst_type or ""),
                 _format_trade_order_size(order.size),
                 _format_trade_order_size(order.filled_size),
-                "-",
-                "-",
-                order.ord_id or "-",
-                order.client_order_id or "-",
+                _format_trade_order_fee_cell(item),
+                _format_trade_order_tp_sl(item),
+                item.order_id or item.algo_id or "-",
+                item.client_order_id or item.algo_client_order_id or "-",
             )
             self._set_table_row(self._orders_table, row, values, left_align={3, 13})
         self._current_order_rows = filtered
@@ -4958,6 +5038,7 @@ class AccountPositionsHomeWidget(QWidget):
                 self._orders_detail.setPlainText("这里会显示选中当前委托的详情。")
             return
         order = items[row]
+        item = _current_order_view_to_trade_order_item(order)
         lines = [
             f"时间：{_format_okx_ms_timestamp(order.update_time or order.created_time)}",
             f"合约：{order.inst_id or '-'}",
@@ -4974,7 +5055,9 @@ class AccountPositionsHomeWidget(QWidget):
             "",
             json.dumps(order.raw, ensure_ascii=False, indent=2, sort_keys=True),
         ]
-        self._orders_detail.setPlainText("\n".join(lines))
+        self._orders_detail.setPlainText(
+            f"{_build_trade_order_detail_text(item)}\n\n{json.dumps(order.raw, ensure_ascii=False, indent=2, sort_keys=True)}"
+        )
 
     def _selected_current_order(self) -> OrderStatusView | None:
         if not hasattr(self, "_orders_table"):
@@ -5243,7 +5326,7 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_trade_order_size(item.size),
                 _format_trade_order_size(item.filled_size),
                 _format_trade_order_fee_cell(item, self._order_history_usdt_prices),
-                "-",
+                _format_trade_order_tp_sl(item),
                 item.order_id or item.algo_id or "-",
                 item.client_order_id or item.algo_client_order_id or "-",
             )
@@ -5494,10 +5577,7 @@ class AccountPositionsHomeWidget(QWidget):
     @Slot(object)
     def _apply_orders(self, orders: object) -> None:
         self._orders = list(orders) if isinstance(orders, list) else []
-        visible_inst_ids = {item.inst_id.strip().upper() for item in self._visible_positions}
-        self._visible_orders = [
-            item for item in self._orders if not visible_inst_ids or item.inst_id.strip().upper() in visible_inst_ids
-        ]
+        self._visible_orders = list(self._orders)
         self._refresh_current_orders_table()
 
     @Slot(object)
@@ -5618,7 +5698,76 @@ class AccountPositionsHomeWidget(QWidget):
         if not self._ensure_runtime_ready(force_unlock=True):
             return
         self._status_badge.setText("正在刷新...")
-        self._start_private_threads(force_restart=False)
+        self._restart_live_feeds_for_manual_refresh()
+
+
+_ACCOUNT_POSITIONS_HOME_ORIGINAL_INIT = AccountPositionsHomeWidget.__init__
+_ACCOUNT_POSITIONS_HOME_ORIGINAL_APPLY_ORDERS = AccountPositionsHomeWidget._apply_orders
+_ACCOUNT_POSITIONS_HOME_ORIGINAL_APPLY_ORDER_HISTORY_PAYLOAD = AccountPositionsHomeWidget._apply_order_history_payload
+
+
+def _account_positions_home_shared_init(self: AccountPositionsHomeWidget, parent: QWidget | None = None) -> None:
+    _ACCOUNT_POSITIONS_HOME_ORIGINAL_INIT(self, parent)
+    self._shared_order_store = get_shared_order_store()
+    self._shared_order_store.snapshot_changed.connect(self._apply_shared_order_snapshot)
+
+
+def _account_positions_home_apply_orders(self: AccountPositionsHomeWidget, orders: object) -> None:
+    _ACCOUNT_POSITIONS_HOME_ORIGINAL_APPLY_ORDERS(self, orders)
+    shared_order_store = getattr(self, "_shared_order_store", None)
+    runtime = getattr(self, "_runtime", None)
+    profile_name = str(getattr(self, "_last_profile_name", "") or "").strip()
+    environment = str(getattr(runtime, "environment", "") or "").strip()
+    if runtime is None or not profile_name or shared_order_store is None:
+        return
+    shared_order_store.publish_current_orders(
+        profile_name=profile_name,
+        environment=environment,
+        orders=list(self._orders),
+    )
+
+
+def _account_positions_home_apply_order_history_payload(self: AccountPositionsHomeWidget, payload: object) -> None:
+    _ACCOUNT_POSITIONS_HOME_ORIGINAL_APPLY_ORDER_HISTORY_PAYLOAD(self, payload)
+    shared_order_store = getattr(self, "_shared_order_store", None)
+    runtime = getattr(self, "_runtime", None)
+    profile_name = str(getattr(self, "_last_profile_name", "") or "").strip()
+    environment = str(getattr(runtime, "environment", "") or "").strip()
+    if runtime is None or not profile_name or shared_order_store is None:
+        return
+    shared_order_store.publish_history_orders(
+        profile_name=profile_name,
+        environment=environment,
+        orders=list(self._order_history_items),
+        usdt_prices=dict(self._order_history_usdt_prices),
+    )
+
+
+def _account_positions_home_apply_shared_order_snapshot(
+    self: AccountPositionsHomeWidget,
+    profile_name: str,
+    environment: str,
+    snapshot: object,
+) -> None:
+    runtime = getattr(self, "_runtime", None)
+    current_profile_name = str(getattr(self, "_last_profile_name", "") or "").strip()
+    current_environment = str(getattr(runtime, "environment", "") or "").strip()
+    if profile_name != current_profile_name or environment != current_environment:
+        return
+    if not isinstance(snapshot, SharedOrderSnapshot):
+        return
+    self._orders = list(snapshot.current_order_views)
+    self._visible_orders = list(self._orders)
+    self._order_history_items = list(snapshot.history_orders)
+    self._order_history_usdt_prices = dict(snapshot.history_order_usdt_prices)
+    self._refresh_current_orders_table()
+    self._refresh_order_history_table()
+
+
+AccountPositionsHomeWidget.__init__ = _account_positions_home_shared_init
+AccountPositionsHomeWidget._apply_orders = _account_positions_home_apply_orders
+AccountPositionsHomeWidget._apply_order_history_payload = _account_positions_home_apply_order_history_payload
+AccountPositionsHomeWidget._apply_shared_order_snapshot = _account_positions_home_apply_shared_order_snapshot
 
 
 

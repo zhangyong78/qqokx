@@ -18,6 +18,7 @@ from roll_terminal_qt.kline_account_drawer import (
     order_source_kind,
 )
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
+from roll_terminal_qt.shared_order_store import SharedOrderSnapshot
 from tests.qt_test_case import QtWidgetTestCase
 
 
@@ -64,6 +65,7 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
             self.assertEqual(drawer._scope_combo.currentData(), "symbol")
             self.assertEqual(drawer._tabs.tabText(0), "当前委托")
             self.assertEqual(drawer._tabs.tabText(1), "当前持仓")
+            self.assertEqual(drawer._tabs.tabText(2), "历史委托")
             self.assertEqual(
                 drawer._positions_table.editTriggers(),
                 QAbstractItemView.EditTrigger.NoEditTriggers,
@@ -137,13 +139,223 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
         finally:
             self.dispose_widget(drawer)
 
+    @patch("roll_terminal_qt.kline_account_drawer.get_shared_order_store")
+    def test_refresh_data_requests_shared_order_store_refresh(self, get_shared_order_store: Mock) -> None:
+        shared_order_store = Mock()
+        get_shared_order_store.return_value = shared_order_store
+        drawer = KlineAccountDrawer()
+        try:
+            drawer._runtime = SimpleNamespace(credentials=object(), environment="demo")
+            drawer._profile_name = "moni"
+
+            with patch.object(drawer, "_start_load") as start_load:
+                drawer.refresh_data()
+
+            shared_order_store.request_refresh.assert_called_once_with(
+                runtime=drawer._runtime,
+                profile_name="moni",
+            )
+            start_load.assert_called_once_with(1)
+        finally:
+            self.dispose_widget(drawer)
+
+    def test_orders_table_shows_algo_tp_sl_and_client_identifiers(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            algo_order = SimpleNamespace(
+                inst_id="BTC-USDT-SWAP",
+                source_kind="algo",
+                source_label="算法委托",
+                side="sell",
+                pos_side="long",
+                ord_type="oco",
+                trigger_price=None,
+                order_price=None,
+                price=None,
+                size=Decimal("2.6"),
+                filled_size=Decimal("0"),
+                state="live",
+                update_time=1783692698837,
+                created_time=1783692698837,
+                algo_id="3730927321386143744",
+                client_order_id="rrsto77e9a3508b0457d3688e9631",
+                algo_client_order_id="rrsto77e9a3508b0457d3688e9631",
+                take_profit_trigger_price=Decimal("65000"),
+                take_profit_order_price=Decimal("64950"),
+                stop_loss_trigger_price=Decimal("59000"),
+                stop_loss_order_price=Decimal("58950"),
+                inst_type="SWAP",
+            )
+            drawer._symbol = "BTC-USDT-SWAP"
+            drawer._snapshot = AccountDrawerSnapshot(orders=(algo_order,))
+            drawer._refresh_tables()
+
+            headers = [
+                drawer._orders_table.horizontalHeaderItem(index).text()
+                for index in range(drawer._orders_table.columnCount())
+            ]
+            self.assertIn("TP/SL", headers)
+            self.assertIn("clOrdId", headers)
+            tp_sl_col = headers.index("TP/SL")
+            order_id_col = headers.index("订单ID")
+            cl_ord_col = headers.index("clOrdId")
+            direction_col = headers.index("方向")
+
+            self.assertIn("TP 65000", drawer._orders_table.item(0, tp_sl_col).text())
+            self.assertIn("SL 59000", drawer._orders_table.item(0, tp_sl_col).text())
+            self.assertEqual(drawer._orders_table.item(0, order_id_col).text(), "3730927321386143744")
+            self.assertEqual(drawer._orders_table.item(0, cl_ord_col).text(), "rrsto77e9a3508b0457d3688e9631")
+            self.assertEqual(drawer._orders_table.item(0, direction_col).text(), "卖出")
+        finally:
+            self.dispose_widget(drawer)
+
+    def test_positions_table_shows_chinese_direction_labels(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            position = SimpleNamespace(
+                inst_id="BTC-USDT-SWAP",
+                pos_side="long",
+                position=Decimal("1"),
+                avail_position=Decimal("1"),
+                avg_price=Decimal("100"),
+                mark_price=Decimal("101"),
+                unrealized_pnl=Decimal("1"),
+                mgn_mode="cross",
+                raw={},
+            )
+            drawer._symbol = "BTC-USDT-SWAP"
+            drawer._snapshot = AccountDrawerSnapshot(positions=(position,))
+            drawer._refresh_tables()
+
+            self.assertEqual(drawer._positions_table.item(0, 1).text(), "买入")
+        finally:
+            self.dispose_widget(drawer)
+
+    def test_history_orders_tab_shows_canceled_orders(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            history_order = SimpleNamespace(
+                inst_id="BTC-USDT-SWAP",
+                source_kind="normal",
+                source_label="普通委托",
+                side="sell",
+                pos_side="long",
+                ord_type="limit",
+                trigger_price=None,
+                order_price=None,
+                price=Decimal("64616.1"),
+                size=Decimal("9.87"),
+                filled_size=Decimal("0"),
+                state="canceled",
+                update_time=1783764489406,
+                created_time=1783764489406,
+                order_id="3733336213178388480",
+                client_order_id="rrentf22d15aec205d83537734ffe",
+                algo_id="",
+                algo_client_order_id="",
+                take_profit_trigger_price=Decimal("62084.2"),
+                take_profit_order_price=Decimal("-1"),
+                stop_loss_trigger_price=Decimal("65628.9"),
+                stop_loss_order_price=Decimal("-1"),
+                inst_type="SWAP",
+            )
+            drawer._symbol = "BTC-USDT-SWAP"
+            drawer._snapshot = AccountDrawerSnapshot(order_history=(history_order,))
+            drawer._refresh_tables()
+
+            headers = [
+                drawer._history_orders_table.horizontalHeaderItem(index).text()
+                for index in range(drawer._history_orders_table.columnCount())
+            ]
+            state_col = headers.index("状态")
+            tp_sl_col = headers.index("TP/SL")
+
+            self.assertEqual(drawer._history_orders_table.rowCount(), 1)
+            self.assertEqual(drawer._history_orders_table.item(0, state_col).text(), "canceled")
+            self.assertIn("TP 62084.2", drawer._history_orders_table.item(0, tp_sl_col).text())
+            self.assertIn("SL 65628.9", drawer._history_orders_table.item(0, tp_sl_col).text())
+        finally:
+            self.dispose_widget(drawer)
+
+    def test_drawer_applies_shared_order_snapshot_for_matching_context(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            current_order = SimpleNamespace(
+                inst_id="BTC-USDT-SWAP",
+                source_kind="normal",
+                source_label="普通委托",
+                side="sell",
+                pos_side="long",
+                ord_type="limit",
+                trigger_price=None,
+                order_price=None,
+                price=Decimal("64616.1"),
+                size=Decimal("9.87"),
+                filled_size=Decimal("0"),
+                state="live",
+                update_time=1783764489406,
+                created_time=1783764489406,
+                order_id="3733336213178388480",
+                client_order_id="rrentf22d15aec205d83537734ffe",
+                algo_id="",
+                algo_client_order_id="",
+                take_profit_trigger_price=Decimal("62084.2"),
+                take_profit_order_price=Decimal("-1"),
+                stop_loss_trigger_price=Decimal("65628.9"),
+                stop_loss_order_price=Decimal("-1"),
+                inst_type="SWAP",
+            )
+            history_order = SimpleNamespace(
+                inst_id="BTC-USDT-SWAP",
+                source_kind="algo",
+                source_label="算法委托",
+                side="buy",
+                pos_side="short",
+                ord_type="oco",
+                trigger_price=None,
+                order_price=None,
+                price=None,
+                size=Decimal("2.6"),
+                filled_size=Decimal("0"),
+                state="canceled",
+                update_time=1783764489407,
+                created_time=1783764489407,
+                order_id="",
+                client_order_id="algo-client-1",
+                algo_id="algo-1",
+                algo_client_order_id="algo-client-1",
+                take_profit_trigger_price=Decimal("65000"),
+                take_profit_order_price=Decimal("64950"),
+                stop_loss_trigger_price=Decimal("59000"),
+                stop_loss_order_price=Decimal("58950"),
+                inst_type="SWAP",
+            )
+            drawer._profile_name = "moni"
+            drawer._environment = "demo"
+            drawer._symbol = "BTC-USDT-SWAP"
+
+            drawer._apply_shared_order_snapshot(
+                "moni",
+                "demo",
+                SharedOrderSnapshot(
+                    current_order_items=(current_order,),
+                    history_orders=(history_order,),
+                ),
+            )
+
+            self.assertEqual(drawer._orders_table.rowCount(), 1)
+            self.assertEqual(drawer._history_orders_table.rowCount(), 1)
+            self.assertEqual(drawer._orders_table.item(0, 0).text(), "BTC-USDT-SWAP")
+            self.assertEqual(drawer._history_orders_table.item(0, 0).text(), "BTC-USDT-SWAP")
+        finally:
+            self.dispose_widget(drawer)
+
 
 class KlineAccountDrawerThreadTests(TestCase):
-    def test_load_thread_reads_positions_and_all_pending_order_kinds(self) -> None:
+    def test_load_thread_reads_positions_only(self) -> None:
         runtime = SimpleNamespace(credentials=object(), environment="demo")
         client = Mock()
         client.get_positions.return_value = [SimpleNamespace(inst_id="BTC-USDT-SWAP")]
-        client.get_pending_orders.return_value = [SimpleNamespace(inst_id="BTC-USDT-SWAP")]
         thread = AccountDrawerLoadThread(request_generation=3, runtime=runtime, client=client)
         completed: list[tuple[int, AccountDrawerSnapshot]] = []
 
@@ -151,12 +363,12 @@ class KlineAccountDrawerThreadTests(TestCase):
         thread.run()
 
         self.assertEqual(completed[0][0], 3)
-        client.get_pending_orders.assert_called_once_with(
+        client.get_positions.assert_called_once_with(
             runtime.credentials,
             environment="demo",
-            limit=100,
-            include_algo=True,
         )
+        client.get_pending_orders.assert_not_called()
+        client.get_order_history.assert_not_called()
 
     def test_cancel_thread_routes_normal_and_algo_orders(self) -> None:
         runtime = SimpleNamespace(credentials=object(), environment="demo")

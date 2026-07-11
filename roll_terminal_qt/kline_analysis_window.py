@@ -878,6 +878,28 @@ def _rr_ledger_blocks_editing(entry: object | None) -> bool:
     }
 
 
+def _rr_order_link_looks_local_placeholder(link: object | None) -> bool:
+    if link is None:
+        return False
+    order_id = str(getattr(link, "order_id", "") or "").strip()
+    client_id = str(getattr(link, "client_id", "") or "").strip()
+    algo_id = str(getattr(link, "algo_id", "") or "").strip()
+    if order_id and not order_id.isdigit():
+        return True
+    if algo_id and not algo_id.isdigit():
+        return True
+    return client_id in {"cl-1", "algo-cl-sl-1", "algo-cl-tp-1"}
+
+
+def _rr_entry_looks_local_placeholder(entry: object | None) -> bool:
+    if entry is None:
+        return False
+    return any(
+        _rr_order_link_looks_local_placeholder(getattr(entry, attr, None))
+        for attr in ("entry_order", "stop_loss_order", "take_profit_order")
+    )
+
+
 def _rr_plan_position_text(plan: RRTradePlan) -> str:
     contracts_text = f"{format_decimal(plan.sizing.contract_size)}张"
     base_size = plan.sizing.base_size
@@ -4569,6 +4591,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_trade_execution_service = RRTradeExecutionService()
         self._rr_execution_thread: QThread | None = None
         self._rr_execution_in_flight = False
+        self._pending_rr_execution_requests: list[dict[str, object]] = []
         self._line_trade_execution_queue: list[RRTradePlan] = []
         self._suppress_api_profile_change = False
         self._profile_snapshots: dict[str, dict[str, str]] = {}
@@ -6984,8 +7007,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_table.setRowCount(len(records))
         for row, item in enumerate(records):
             record = item if isinstance(item, dict) else {}
+            side = str(record.get("side", "") or "").strip().lower()
             values = (
-                str(record.get("side", "") or ""),
+                "空头" if side == "short" else "多头",
                 _format_rr_table_price(record.get("price_entry", ""), price_increment),
                 _format_rr_table_price(record.get("price_stop", ""), price_increment),
                 _format_rr_table_price(record.get("price_tp", ""), price_increment),
@@ -7464,16 +7488,53 @@ class KlineAnalysisWindow(QMainWindow):
             if isinstance(selected, dict):
                 self._refresh_rr_tracking_summary(selected)
 
+    def _drop_rr_trade_ledger_entry(self, plan_id: str) -> bool:
+        target_plan_id = str(plan_id or "").strip()
+        if not target_plan_id:
+            return False
+        snapshot = self._rr_trade_ledger_snapshot if isinstance(self._rr_trade_ledger_snapshot, dict) else {}
+        records = list(snapshot.get("entries", [])) if isinstance(snapshot.get("entries"), list) else []
+        normalized_records: list[dict[str, object]] = []
+        removed = False
+        for raw in records:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                existing = RRTradeLedgerEntry.from_dict(raw)
+            except Exception:
+                continue
+            if str(existing.plan.plan_id or "").strip() == target_plan_id:
+                removed = True
+                continue
+            normalized_records.append(raw)
+        if not removed:
+            return False
+        self._rr_trade_ledger_snapshot = {"entries": normalized_records}
+        save_kline_rr_trade_ledger_snapshot(normalized_records)
+        return True
+
     def _start_rr_execution_action(
         self,
         *,
         action: Callable[[], RRTradeLedgerEntry],
         on_success: Callable[[RRTradeLedgerEntry], None],
         on_failure: Callable[[str], None] | None = None,
-    ) -> None:
+        queue_if_busy: bool = False,
+        queued_status_text: str | None = None,
+    ) -> bool:
         if self._rr_execution_in_flight:
+            if queue_if_busy:
+                self._pending_rr_execution_requests.append(
+                    {
+                        "action": action,
+                        "on_success": on_success,
+                        "on_failure": on_failure,
+                    }
+                )
+                self._set_status(queued_status_text or "当前 RR 请求已排队，等待前一个任务完成后自动执行。")
+                return False
             self._set_status("RR 交易请求正在执行，请等待当前请求完成。")
-            return
+            return False
         self._rr_execution_in_flight = True
         thread = RRTradeExecutionThread(action, self)
         self._rr_execution_thread = thread
@@ -7497,11 +7558,31 @@ class KlineAnalysisWindow(QMainWindow):
             if self._rr_execution_thread is thread:
                 self._rr_execution_thread = None
             thread.deleteLater()
+            self._start_next_pending_rr_execution_request()
 
         thread.completed.connect(_completed)
         thread.failed.connect(_failed)
         thread.finished.connect(_finished)
         thread.start()
+        return True
+
+    def _start_next_pending_rr_execution_request(self) -> None:
+        if self._rr_execution_in_flight:
+            return
+        if not self._pending_rr_execution_requests:
+            return
+        request = self._pending_rr_execution_requests.pop(0)
+        action = request.get("action")
+        on_success = request.get("on_success")
+        on_failure = request.get("on_failure")
+        if not callable(action) or not callable(on_success):
+            self._start_next_pending_rr_execution_request()
+            return
+        self._start_rr_execution_action(
+            action=action,
+            on_success=on_success,
+            on_failure=on_failure if callable(on_failure) else None,
+        )
 
     def _enqueue_line_trade_events(self, events: list[dict[str, object]]) -> None:
         plans = self._build_armed_line_trade_plans(events)
@@ -7605,12 +7686,17 @@ class KlineAnalysisWindow(QMainWindow):
                 plan=plan,
             ),
             on_success=lambda entry: self._set_status(f"RR 交易已启用：{entry.status}"),
+            queue_if_busy=True,
+            queued_status_text="当前正在同步已报 RR，新的启用请求已排队，稍后自动提交。",
         )
 
     @Slot()
     def _cancel_selected_rr_trade(self) -> None:
         try:
-            entry = self._rr_ledger_entry_for_item(self._selected_rr_payload())
+            payload = self._selected_rr_payload()
+            if self._purge_placeholder_rr_entry(payload, delete_item=False):
+                return
+            entry = self._rr_ledger_entry_for_item(payload)
             if entry is None:
                 raise RuntimeError("当前 RR 没有可取消的交易记录。")
             runtime = self._runtime
@@ -7647,6 +7733,8 @@ class KlineAnalysisWindow(QMainWindow):
                 runtime=runtime,
                 delete_after_cancel=delete_after_cancel,
             ),
+            queue_if_busy=True,
+            queued_status_text="当前正在同步 RR 状态，撤单请求已排队，稍后自动执行。",
         )
 
     def _delete_rr_item_at_index(self, index: int) -> None:
@@ -7661,6 +7749,33 @@ class KlineAnalysisWindow(QMainWindow):
         self._populate_rr_table(selected_index=next_index)
         if self._pending_payload is not None:
             self._render_to_chart(self._pending_payload)
+
+    def _purge_placeholder_rr_entry(self, payload: dict[str, object], *, delete_item: bool) -> bool:
+        ledger_entry = self._rr_ledger_entry_for_item(payload)
+        if not _rr_entry_looks_local_placeholder(ledger_entry):
+            return False
+        plan_id = ""
+        if isinstance(ledger_entry, RRTradeLedgerEntry):
+            plan_id = str(ledger_entry.plan.plan_id or "").strip()
+        if not plan_id:
+            binding = payload.get("trade_binding")
+            if isinstance(binding, dict):
+                plan_id = str(binding.get("plan_id", "") or "").strip()
+        if plan_id:
+            self._drop_rr_trade_ledger_entry(plan_id)
+        if delete_item:
+            self._delete_rr_item_at_index(self._selected_rr_index)
+            self._set_status("已清理本地测试 RR 记录。")
+            return True
+        refreshed = self._workspace_entry().get("rr", [])
+        if isinstance(refreshed, list) and 0 <= self._selected_rr_index < len(refreshed):
+            item = refreshed[self._selected_rr_index]
+            if isinstance(item, dict):
+                item.pop("trade_binding", None)
+                self._save_workspace_snapshot()
+                self._refresh_rr_tracking_summary(item)
+        self._set_status("已清理本地测试 RR 绑定，可继续正常操作。")
+        return True
 
     def _handle_rr_cancel_result(self, entry: RRTradeLedgerEntry, *, runtime, delete_after_cancel: bool) -> None:
         if entry.status == "cancel_confirmation_required":
@@ -8820,6 +8935,8 @@ class KlineAnalysisWindow(QMainWindow):
             payload = self._selected_rr_payload()
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"删除 RR 失败：{exc}")
+            return
+        if self._purge_placeholder_rr_entry(payload, delete_item=True):
             return
         ledger_entry = self._rr_ledger_entry_for_item(payload)
         if ledger_entry is not None:

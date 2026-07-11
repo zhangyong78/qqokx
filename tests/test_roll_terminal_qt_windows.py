@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import textwrap
@@ -43,6 +44,7 @@ from roll_terminal_qt.line_trading_core import LineAnnotation, RiskRewardAnnotat
 from roll_terminal_qt.profile_access import profile_requires_password
 from roll_terminal_qt.smart_order_window import _safe_text as smart_safe_text
 from roll_terminal_qt.option_strategy_window import CandlestickChartView
+from roll_terminal_qt.kline_account_drawer import AccountDrawerLoadThread
 from roll_terminal_qt.smart_order_window import (
     SMART_ORDER_COMPACT_ROOT_MARGINS,
     SMART_ORDER_COMPACT_SPLITTER_SIZES,
@@ -97,6 +99,46 @@ from roll_terminal_qt.launcher import LauncherWindow
 
 
 class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
+
+    def test_kline_account_drawer_load_thread_fetches_positions_and_orders_in_parallel(self) -> None:
+        barrier = threading.Barrier(2)
+
+        class FakeClient:
+            def get_positions(self, credentials, *, environment):  # noqa: ANN001
+                self._touch(credentials, environment)
+                barrier.wait(timeout=0.5)
+                time.sleep(0.02)
+                return ["position-1"]
+
+            def get_pending_orders(self, credentials, *, environment, limit, include_algo):  # noqa: ANN001
+                self._touch(credentials, environment, limit, include_algo)
+                barrier.wait(timeout=0.5)
+                time.sleep(0.02)
+                return ["order-1"]
+
+            @staticmethod
+            def _touch(*_args, **_kwargs) -> None:
+                return
+
+        runtime = SimpleNamespace(credentials=object(), environment="demo")
+        thread = AccountDrawerLoadThread(
+            request_generation=7,
+            runtime=runtime,
+            client=FakeClient(),
+        )
+        completed: list[tuple[int, object]] = []
+        failed: list[tuple[int, str]] = []
+        thread.completed.connect(lambda generation, snapshot: completed.append((generation, snapshot)))
+        thread.failed.connect(lambda generation, message: failed.append((generation, message)))
+
+        thread.run()
+
+        self.assertEqual(failed, [])
+        self.assertEqual(len(completed), 1)
+        generation, snapshot = completed[0]
+        self.assertEqual(generation, 7)
+        self.assertEqual(tuple(snapshot.positions), ("position-1",))
+        self.assertEqual(tuple(snapshot.orders), ("order-1",))
 
     def test_launcher_waits_for_open_child_windows_before_home_shutdown(self) -> None:
         class ShutdownHome(QWidget):
@@ -1978,7 +2020,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             window = KlineAnalysisWindow()
             try:
                 self.assertEqual(window._rr_table.rowCount(), 1)
-                self.assertEqual(window._rr_table.item(0, 0).text(), "long")
+                self.assertEqual(window._rr_table.item(0, 0).text(), "多头")
                 self.assertEqual(window._rr_table.item(0, 1).text(), "60000.0")
                 self.assertEqual(window._rr_table.item(0, 3).text(), "62000.0")
             finally:
@@ -2057,6 +2099,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
             patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
             patch("roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot", return_value={"entries": []}),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_analysis_workspace_entries", return_value=None),
         ):
             window = KlineAnalysisWindow()
             try:
@@ -2110,6 +2153,8 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
             patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
             patch("roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot", return_value={"entries": []}),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_analysis_workspace_entries", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_rr_trade_ledger_snapshot", return_value=None),
         ):
             window = KlineAnalysisWindow()
             try:
@@ -2267,7 +2312,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             entry_id=plan.plan_id,
             status="entry_working",
             plan=plan,
-            entry_order=RRTradeOrderLink(role="entry", channel="order", order_id="ord-1", client_id="cl-1", state="live"),
+            entry_order=RRTradeOrderLink(role="entry", channel="order", order_id="3732030867860197376", client_id="rrent-real-1", state="live"),
         )
         with (
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
@@ -2279,6 +2324,8 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 "roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot",
                 return_value={"entries": [ledger.to_dict()]},
             ),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_analysis_workspace_entries", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_rr_trade_ledger_snapshot", return_value=None),
         ):
             window = KlineAnalysisWindow()
             try:
@@ -2342,6 +2389,86 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             entry_id=plan.plan_id,
             status="entry_working",
             plan=plan,
+            entry_order=RRTradeOrderLink(
+                role="entry",
+                channel="order",
+                order_id="3732030867860197376",
+                client_id="rrent-real-1",
+                state="live",
+            ),
+        )
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch(
+                "roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries",
+                return_value={f"BTC-USDT-SWAP|{_DEFAULT_SINGLE_CHART_PERIOD}": {"rr": [rr_payload]}},
+            ),
+            patch(
+                "roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot",
+                return_value={"entries": [ledger.to_dict()]},
+            ),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_analysis_workspace_entries", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_rr_trade_ledger_snapshot", return_value=None),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._runtime = SimpleNamespace(credentials=object())
+                window._rr_table.setCurrentCell(0, 0)
+                with patch.object(window, "_start_rr_execution_action") as start_execution:
+                    window._remove_rr_item()
+
+                self.assertEqual(start_execution.call_count, 1)
+                self.assertEqual(len(window._workspace_entry()["rr"]), 1)
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_remove_rr_item_purges_local_placeholder_rr_without_api_cancel(self) -> None:
+        rr_payload = {
+            "rr_id": "rr-1",
+            "trade_ref": "trade-ref-1",
+            "side": "long",
+            "bar_entry": 12.0,
+            "bar_stop": 12.0,
+            "price_entry": "60000",
+            "price_stop": "59000",
+            "price_tp": "62000",
+            "r_multiple": "2",
+            "management_mode": "fixed_tp",
+            "locked": False,
+            "trade_binding": {"plan_id": "moni:BTC-USDT-SWAP:trade-ref-1"},
+        }
+        plan = build_rr_trade_plan(
+            plan_id="moni:BTC-USDT-SWAP:trade-ref-1",
+            profile_name="moni",
+            environment="demo",
+            instrument=SimpleNamespace(
+                inst_id="BTC-USDT-SWAP",
+                inst_type="SWAP",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+                settle_ccy="USDT",
+                ct_val=Decimal("0.01"),
+                ct_mult=Decimal("1"),
+                ct_val_ccy="BTC",
+                uly="BTC-USDT",
+                inst_family="BTC-USDT",
+            ),
+            direction="long",
+            entry_execution_mode="limit",
+            management_mode="fixed_tp",
+            trigger_price_type="last",
+            risk_amount=Decimal("100"),
+            entry_price=Decimal("60000"),
+            stop_loss_price=Decimal("59000"),
+            direct_take_profit_r=Decimal("2"),
+            round_trip_fee_rate=Decimal("0"),
+        )
+        ledger = RRTradeLedgerEntry(
+            entry_id=plan.plan_id,
+            status="entry_working",
+            plan=plan,
             entry_order=RRTradeOrderLink(role="entry", channel="order", order_id="ord-1", client_id="cl-1", state="live"),
         )
         with (
@@ -2354,16 +2481,64 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 "roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot",
                 return_value={"entries": [ledger.to_dict()]},
             ),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_analysis_workspace_entries", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_rr_trade_ledger_snapshot", return_value=None),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._rr_table.setCurrentCell(0, 0)
+                with patch.object(window, "_start_rr_execution_action") as start_execution:
+                    window._remove_rr_item()
+
+                self.assertEqual(start_execution.call_count, 0)
+                self.assertEqual(window._workspace_entry()["rr"], [])
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_enable_rr_trade_queues_when_execution_channel_busy(self) -> None:
+        plan = SimpleNamespace(
+            plan_id="moni:BTC-USDT-SWAP:trade-ref-2",
+            inst_id="BTC-USDT-SWAP",
+            direction="long",
+            entry_execution_mode="limit",
+            stop_loss_price=Decimal("62924.4"),
+            take_profit_price=Decimal("64757.9"),
+        )
+        rr_payload = {
+            "rr_id": "rr-2",
+            "trade_ref": "trade-ref-2",
+            "side": "long",
+            "bar_entry": 1200.0,
+            "bar_stop": 1201.0,
+            "price_entry": "63535.6",
+            "price_stop": "62924.4",
+            "price_tp": "64757.9",
+            "r_multiple": "2",
+            "management_mode": "fixed_tp",
+            "locked": False,
+        }
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch(
+                "roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries",
+                return_value={f"BTC-USDT-SWAP|{_DEFAULT_SINGLE_CHART_PERIOD}": {"rr": [rr_payload]}},
+            ),
         ):
             window = KlineAnalysisWindow()
             try:
                 window._runtime = SimpleNamespace(credentials=object())
                 window._rr_table.setCurrentCell(0, 0)
-                with patch.object(window, "_start_rr_execution_action") as start_execution:
-                    window._remove_rr_item()
+                window._rr_execution_in_flight = True
+                with (
+                    patch.object(window, "_build_selected_rr_trade_plan", return_value=plan),
+                    patch.object(window, "_find_rr_trade_ledger_entry", return_value=None),
+                    patch("roll_terminal_qt.kline_analysis_window._rr_plan_position_text", return_value="0.16 BTC (16.36张)"),
+                    patch("roll_terminal_qt.kline_analysis_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes),
+                ):
+                    window._enable_selected_rr_trade()
 
-                self.assertEqual(start_execution.call_count, 1)
-                self.assertEqual(len(window._workspace_entry()["rr"]), 1)
+                self.assertEqual(len(window._pending_rr_execution_requests), 1)
+                self.assertIn("已排队", window._status.text())
             finally:
                 self.__class__.dispose_widget(window)
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable
 
 from PySide6.QtCore import QThread, Qt, Signal
@@ -21,12 +21,14 @@ from PySide6.QtWidgets import (
 
 from okx_quant.okx_client import OkxPosition, OkxTradeOrderItem
 from okx_quant.okx_client import OkxRestClient
+from roll_terminal_qt.shared_order_store import SharedOrderSnapshot, get_shared_order_store
 
 
 @dataclass(frozen=True)
 class AccountDrawerSnapshot:
     positions: tuple[OkxPosition, ...] = ()
     orders: tuple[OkxTradeOrderItem, ...] = ()
+    order_history: tuple[OkxTradeOrderItem, ...] = ()
 
 
 def filter_account_items(items: Iterable[object], *, scope: str, symbol: str) -> list[object]:
@@ -59,6 +61,63 @@ def order_cancel_reference(order: object) -> str:
     return ""
 
 
+def order_display_direction(item: object) -> str:
+    side = str(getattr(item, "side", "") or "").strip().lower()
+    if side == "buy":
+        return "买入"
+    if side == "sell":
+        return "卖出"
+    pos_side = str(getattr(item, "pos_side", "") or "").strip().lower()
+    if pos_side == "long":
+        return "买入"
+    if pos_side == "short":
+        return "卖出"
+    return side or pos_side
+
+
+def order_display_price(item: object) -> str:
+    trigger_price = getattr(item, "trigger_price", None)
+    order_price = getattr(item, "order_price", None)
+    price = getattr(item, "price", None)
+    if trigger_price is not None:
+        trigger_text = str(trigger_price)
+        if order_price is None or order_price == trigger_price:
+            return f"触发 {trigger_text}"
+        return f"触发 {trigger_text}=>{order_price}"
+    if order_price is not None and price is not None and order_price != price:
+        return f"{price}=>{order_price}"
+    return str(price or order_price or "-")
+
+
+def order_display_tp_sl(item: object) -> str:
+    def _segment(label: str, trigger_price: object, order_price: object) -> str | None:
+        if trigger_price is None:
+            return None
+        if order_price is None or order_price == trigger_price:
+            return f"{label} {trigger_price}"
+        return f"{label} {trigger_price}=>{order_price}"
+
+    parts = [
+        segment
+        for segment in (
+            _segment("TP", getattr(item, "take_profit_trigger_price", None), getattr(item, "take_profit_order_price", None)),
+            _segment("SL", getattr(item, "stop_loss_trigger_price", None), getattr(item, "stop_loss_order_price", None)),
+        )
+        if segment
+    ]
+    if parts:
+        return " / ".join(parts)
+    return "-"
+
+
+def order_display_ids(item: object) -> tuple[str, str]:
+    order_id = str(getattr(item, "order_id", "") or getattr(item, "algo_id", "") or "-")
+    client_order_id = str(
+        getattr(item, "client_order_id", "") or getattr(item, "algo_client_order_id", "") or "-"
+    )
+    return order_id, client_order_id
+
+
 class AccountDrawerLoadThread(QThread):
     completed = Signal(int, object)
     failed = Signal(int, str)
@@ -67,26 +126,21 @@ class AccountDrawerLoadThread(QThread):
         super().__init__()
         self._request_generation = request_generation
         self._runtime = runtime
-        self._client = client or OkxRestClient()
+        self._client = client
 
     def run(self) -> None:
         try:
-            positions = self._client.get_positions(
+            positions_client = self._client or OkxRestClient()
+            positions = positions_client.get_positions(
                 self._runtime.credentials,
                 environment=self._runtime.environment,
-            )
-            orders = self._client.get_pending_orders(
-                self._runtime.credentials,
-                environment=self._runtime.environment,
-                limit=100,
-                include_algo=True,
             )
         except Exception as exc:
             self.failed.emit(self._request_generation, str(exc))
             return
         self.completed.emit(
             self._request_generation,
-            AccountDrawerSnapshot(tuple(positions), tuple(orders)),
+            AccountDrawerSnapshot(positions=tuple(positions)),
         )
 
 
@@ -140,6 +194,9 @@ class KlineAccountDrawer(QWidget):
         self._load_thread: AccountDrawerLoadThread | None = None
         self._cancel_thread: AccountDrawerCancelThread | None = None
         self._cancel_in_flight = False
+        self._shared_order_store = get_shared_order_store()
+        self._shared_order_store.snapshot_changed.connect(self._apply_shared_order_snapshot)
+        self._shared_order_store.refresh_failed.connect(self._apply_shared_order_refresh_error)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -183,7 +240,9 @@ class KlineAccountDrawer(QWidget):
                 "已成交",
                 "状态",
                 "更新时间",
-                "标识",
+                "TP/SL",
+                "订单ID",
+                "clOrdId",
             ]
         )
         self._orders_table.itemSelectionChanged.connect(self._sync_cancel_button_state)
@@ -210,6 +269,28 @@ class KlineAccountDrawer(QWidget):
         positions_layout.setContentsMargins(0, 0, 0, 0)
         positions_layout.addWidget(self._positions_table, 1)
         self._tabs.addTab(positions_tab, "当前持仓")
+
+        self._history_orders_table = self._create_table(
+            [
+                "合约",
+                "来源",
+                "方向",
+                "类型",
+                "价格/触发价",
+                "数量",
+                "已成交",
+                "状态",
+                "更新时间",
+                "TP/SL",
+                "订单ID",
+                "clOrdId",
+            ]
+        )
+        history_orders_tab = QWidget()
+        history_orders_layout = QVBoxLayout(history_orders_tab)
+        history_orders_layout.setContentsMargins(0, 0, 0, 0)
+        history_orders_layout.addWidget(self._history_orders_table, 1)
+        self._tabs.addTab(history_orders_tab, "历史委托")
 
     def _create_table(self, headers: list[str]) -> QTableWidget:
         table = QTableWidget(0, len(headers), self)
@@ -246,6 +327,7 @@ class KlineAccountDrawer(QWidget):
         self._environment = environment
         self._symbol = normalized_symbol
         if changed:
+            self._load_shared_order_snapshot()
             self._refresh_tables()
         if changed and refresh_if_visible and self.isVisible():
             self.refresh_data()
@@ -254,6 +336,7 @@ class KlineAccountDrawer(QWidget):
         if self._runtime is None:
             self._status_label.setText("未连接账户")
             return
+        self._shared_order_store.request_refresh(runtime=self._runtime, profile_name=self._profile_name)
         self._request_generation += 1
         if self._load_thread is not None and self._load_thread.isRunning():
             self._refresh_pending = True
@@ -293,8 +376,10 @@ class KlineAccountDrawer(QWidget):
         scope = str(self._scope_combo.currentData() or "symbol")
         filtered_orders = filter_account_items(self._snapshot.orders, scope=scope, symbol=self._symbol)
         filtered_positions = filter_account_items(self._snapshot.positions, scope=scope, symbol=self._symbol)
+        filtered_order_history = filter_account_items(self._snapshot.order_history, scope=scope, symbol=self._symbol)
         self._populate_orders_table(filtered_orders)
         self._populate_positions_table(filtered_positions)
+        self._populate_history_orders_table(filtered_order_history)
         self._sync_cancel_button_state()
 
     def _populate_orders_table(self, orders: list[object]) -> None:
@@ -304,24 +389,27 @@ class KlineAccountDrawer(QWidget):
             values = [
                 getattr(order, "inst_id", ""),
                 getattr(order, "source_label", "") or order_source_kind(order),
-                getattr(order, "side", "") or getattr(order, "pos_side", ""),
+                order_display_direction(order),
                 getattr(order, "ord_type", ""),
-                getattr(order, "trigger_price", None) or getattr(order, "price", None) or "",
+                order_display_price(order),
                 getattr(order, "size", ""),
                 getattr(order, "filled_size", ""),
                 getattr(order, "state", ""),
                 getattr(order, "update_time", None) or getattr(order, "created_time", None) or "",
-                order_cancel_reference(order),
+                order_display_tp_sl(order),
+                order_display_ids(order)[0],
+                order_display_ids(order)[1],
             ]
             for column, value in enumerate(values):
-                self._orders_table.setItem(row, column, QTableWidgetItem(self._format_value(value)))
+                item = QTableWidgetItem(self._format_value(value))
+                self._orders_table.setItem(row, column, item)
 
     def _populate_positions_table(self, positions: list[object]) -> None:
         self._positions_table.setRowCount(len(positions))
         for row, position in enumerate(positions):
             values = [
                 getattr(position, "inst_id", ""),
-                getattr(position, "pos_side", ""),
+                order_display_direction(position),
                 getattr(position, "position", ""),
                 getattr(position, "avail_position", ""),
                 getattr(position, "avg_price", ""),
@@ -332,6 +420,27 @@ class KlineAccountDrawer(QWidget):
             ]
             for column, value in enumerate(values):
                 self._positions_table.setItem(row, column, QTableWidgetItem(self._format_value(value)))
+
+    def _populate_history_orders_table(self, orders: list[object]) -> None:
+        self._history_orders_table.setRowCount(len(orders))
+        for row, order in enumerate(orders):
+            values = [
+                getattr(order, "inst_id", ""),
+                getattr(order, "source_label", "") or order_source_kind(order),
+                order_display_direction(order),
+                getattr(order, "ord_type", ""),
+                order_display_price(order),
+                getattr(order, "size", ""),
+                getattr(order, "filled_size", ""),
+                getattr(order, "state", ""),
+                getattr(order, "update_time", None) or getattr(order, "created_time", None) or "",
+                order_display_tp_sl(order),
+                order_display_ids(order)[0],
+                order_display_ids(order)[1],
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(self._format_value(value))
+                self._history_orders_table.setItem(row, column, item)
 
     @staticmethod
     def _format_value(value: object) -> str:
@@ -413,3 +522,101 @@ class KlineAccountDrawer(QWidget):
         self._cancel_thread = None
         if thread is not None:
             thread.deleteLater()
+
+
+def _shared_set_context(
+    self: KlineAccountDrawer,
+    *,
+    runtime: object | None,
+    profile_name: str,
+    environment: str,
+    symbol: str,
+    refresh_if_visible: bool = True,
+) -> None:
+    normalized_symbol = symbol.strip().upper()
+    changed = (
+        runtime is not self._runtime
+        or profile_name != self._profile_name
+        or environment != self._environment
+        or normalized_symbol != self._symbol
+    )
+    self._runtime = runtime
+    self._profile_name = profile_name
+    self._environment = environment
+    self._symbol = normalized_symbol
+    if changed:
+        self._load_shared_order_snapshot()
+        self._refresh_tables()
+    if changed and refresh_if_visible and self.isVisible():
+        self.refresh_data()
+
+
+def _shared_refresh_data(self: KlineAccountDrawer) -> None:
+    if self._runtime is None:
+        self._status_label.setText("未连接账户")
+        return
+    self._shared_order_store.request_refresh(runtime=self._runtime, profile_name=self._profile_name)
+    self._request_generation += 1
+    if self._load_thread is not None and self._load_thread.isRunning():
+        self._refresh_pending = True
+        self._status_label.setText("加载中...")
+        return
+    self._start_load(self._request_generation)
+
+
+def _shared_apply_snapshot(self: KlineAccountDrawer, generation: int, snapshot: AccountDrawerSnapshot) -> None:
+    if generation != self._request_generation:
+        return
+    self._snapshot = replace(self._snapshot, positions=tuple(snapshot.positions))
+    self._status_label.setText(f"委托 {len(self._snapshot.orders)} | 持仓 {len(self._snapshot.positions)}")
+    self._refresh_tables()
+
+
+def _shared_load_shared_order_snapshot(self: KlineAccountDrawer) -> None:
+    snapshot = self._shared_order_store.snapshot_for(
+        profile_name=self._profile_name,
+        environment=self._environment,
+    )
+    self._snapshot = replace(
+        self._snapshot,
+        orders=tuple(snapshot.current_order_items),
+        order_history=tuple(snapshot.history_orders),
+    )
+
+
+def _shared_apply_shared_order_snapshot(
+    self: KlineAccountDrawer,
+    profile_name: str,
+    environment: str,
+    snapshot: object,
+) -> None:
+    if profile_name != self._profile_name or environment != self._environment:
+        return
+    if not isinstance(snapshot, SharedOrderSnapshot):
+        return
+    self._snapshot = replace(
+        self._snapshot,
+        orders=tuple(snapshot.current_order_items),
+        order_history=tuple(snapshot.history_orders),
+    )
+    self._status_label.setText(f"委托 {len(self._snapshot.orders)} | 持仓 {len(self._snapshot.positions)}")
+    self._refresh_tables()
+
+
+def _shared_apply_shared_order_refresh_error(
+    self: KlineAccountDrawer,
+    profile_name: str,
+    environment: str,
+    message: str,
+) -> None:
+    if profile_name != self._profile_name or environment != self._environment:
+        return
+    self._status_label.setText(f"委托刷新失败: {message}")
+
+
+KlineAccountDrawer.set_context = _shared_set_context
+KlineAccountDrawer.refresh_data = _shared_refresh_data
+KlineAccountDrawer._apply_snapshot = _shared_apply_snapshot
+KlineAccountDrawer._load_shared_order_snapshot = _shared_load_shared_order_snapshot
+KlineAccountDrawer._apply_shared_order_snapshot = _shared_apply_shared_order_snapshot
+KlineAccountDrawer._apply_shared_order_refresh_error = _shared_apply_shared_order_refresh_error

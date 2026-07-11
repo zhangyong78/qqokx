@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
@@ -7,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from roll_terminal_qt import account_positions_home as account_positions_home_module
 from roll_terminal_qt.account_positions_home import (
     AccountPositionsHomeWidget,
+    _current_order_state_is_terminal,
     _current_order_view_cancel_reference,
     _current_order_cancel_result_error_message,
     _current_order_cancel_result_failed,
@@ -50,6 +52,65 @@ class AccountPositionsHomeQtCurrentOrderHelpersTest(TestCase):
         self.assertEqual(item.algo_id, "987654321")
         self.assertEqual(item.algo_client_order_id, "abcdexi123456789012345")
         self.assertEqual(item.client_order_id, "abcdexi123456789012345")
+
+    def test_current_order_view_to_trade_order_item_preserves_trigger_and_tp_sl_fields(self) -> None:
+        order = OrderStatusView(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            ord_id="algo-123",
+            side="sell",
+            pos_side="long",
+            td_mode="cross",
+            ord_type="oco",
+            state="effective",
+            price=Decimal("65000"),
+            avg_price=None,
+            size=Decimal("2.6"),
+            filled_size=Decimal("0"),
+            created_time=1,
+            update_time=2,
+            client_order_id="algo-client-123",
+            reduce_only=True,
+            raw={
+                "_source_kind": "algo",
+                "algoId": "algo-123",
+                "algoClOrdId": "algo-client-123",
+                "triggerPx": "64999.5",
+                "triggerPxType": "mark",
+                "orderPx": "64998",
+                "actualPx": "64997.5",
+                "actualSz": "1.2",
+                "actualSide": "sell",
+                "tpTriggerPx": "63754",
+                "tpOrdPx": "-1",
+                "tpTriggerPxType": "mark",
+                "slTriggerPx": "64921.4",
+                "slOrdPx": "-1",
+                "slTriggerPxType": "mark",
+            },
+        )
+
+        item = _current_order_view_to_trade_order_item(order)
+
+        self.assertEqual(item.trigger_price, Decimal("64999.5"))
+        self.assertEqual(item.trigger_price_type, "mark")
+        self.assertEqual(item.order_price, Decimal("64998"))
+        self.assertEqual(item.actual_price, Decimal("64997.5"))
+        self.assertEqual(item.actual_size, Decimal("1.2"))
+        self.assertEqual(item.actual_side, "sell")
+        self.assertEqual(item.take_profit_trigger_price, Decimal("63754"))
+        self.assertEqual(item.take_profit_order_price, Decimal("-1"))
+        self.assertEqual(item.take_profit_trigger_price_type, "mark")
+        self.assertEqual(item.stop_loss_trigger_price, Decimal("64921.4"))
+        self.assertEqual(item.stop_loss_order_price, Decimal("-1"))
+        self.assertEqual(item.stop_loss_trigger_price_type, "mark")
+
+    def test_current_order_state_is_terminal_matches_current_tab_expectation(self) -> None:
+        self.assertTrue(_current_order_state_is_terminal("canceled"))
+        self.assertTrue(_current_order_state_is_terminal("filled"))
+        self.assertTrue(_current_order_state_is_terminal("order_failed"))
+        self.assertFalse(_current_order_state_is_terminal("live"))
+        self.assertFalse(_current_order_state_is_terminal("effective"))
 
     def test_current_order_view_cancel_reference_prefers_algo_id_for_algo_orders(self) -> None:
         order = OrderStatusView(

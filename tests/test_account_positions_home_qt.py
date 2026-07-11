@@ -16,6 +16,7 @@ from roll_terminal_qt.account_positions_home import (
 from okx_quant.okx_client import Instrument, OkxOrderResult
 from okx_quant.position_protection import ProtectionSessionSnapshot
 from roll_terminal_qt.order_service import OrderStatusView
+from roll_terminal_qt.shared_order_store import SharedOrderSnapshot
 
 
 class _ThreadRetireStub:
@@ -108,6 +109,175 @@ class _ColumnConfigTableStub:
 
 
 class AccountPositionsHomeQtHelpersTest(TestCase):
+    def test_sync_order_watchlist_clears_symbol_restriction_for_current_orders(self) -> None:
+        order_feed = MagicMock()
+        app = SimpleNamespace(
+            _order_feed=order_feed,
+            _visible_positions=[SimpleNamespace(inst_id="BTC-USD-260731-60000-P")],
+        )
+
+        AccountPositionsHomeWidget._sync_order_watchlist(app)
+
+        order_feed.set_watched_inst_ids.assert_called_once_with(set())
+
+    def test_apply_orders_keeps_pending_order_visible_even_without_matching_position(self) -> None:
+        order = OrderStatusView(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            ord_id="algo-1",
+            side="sell",
+            pos_side="long",
+            td_mode="cross",
+            ord_type="conditional",
+            state="effective",
+            price=None,
+            avg_price=None,
+            size=Decimal("1"),
+            filled_size=Decimal("0"),
+            created_time=1,
+            update_time=2,
+            client_order_id="algo-client-1",
+            reduce_only=None,
+            raw={"_source_kind": "algo", "algoId": "algo-1"},
+        )
+        app = SimpleNamespace(
+            _visible_positions=[SimpleNamespace(inst_id="BTC-USD-260731-60000-P")],
+            _refresh_current_orders_table=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._apply_orders(app, [order])
+
+        self.assertEqual(app._orders, [order])
+        self.assertEqual(app._visible_orders, [order])
+        app._refresh_current_orders_table.assert_called_once_with()
+
+    def test_apply_orders_publishes_current_orders_to_shared_store(self) -> None:
+        order = OrderStatusView(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            ord_id="algo-1",
+            side="sell",
+            pos_side="long",
+            td_mode="cross",
+            ord_type="conditional",
+            state="effective",
+            price=None,
+            avg_price=None,
+            size=Decimal("1"),
+            filled_size=Decimal("0"),
+            created_time=1,
+            update_time=2,
+            client_order_id="algo-client-1",
+            reduce_only=None,
+            raw={"_source_kind": "algo", "algoId": "algo-1"},
+        )
+        shared_order_store = MagicMock()
+        app = SimpleNamespace(
+            _visible_positions=[],
+            _refresh_current_orders_table=MagicMock(),
+            _shared_order_store=shared_order_store,
+            _last_profile_name="moni",
+            _runtime=SimpleNamespace(environment="demo"),
+        )
+
+        AccountPositionsHomeWidget._apply_orders(app, [order])
+
+        shared_order_store.publish_current_orders.assert_called_once_with(
+            profile_name="moni",
+            environment="demo",
+            orders=[order],
+        )
+
+    def test_refresh_current_orders_table_summary_no_longer_mentions_current_position_contract_scope(self) -> None:
+        orders_summary_label = SimpleNamespace(setText=MagicMock())
+        orders_table = SimpleNamespace(
+            currentRow=lambda: -1,
+            setRowCount=MagicMock(),
+        )
+        app = SimpleNamespace(
+            _orders_table=orders_table,
+            _filtered_current_orders=lambda: [],
+            _orders_summary_label=orders_summary_label,
+            _restore_table_selection=MagicMock(),
+            _refresh_current_order_detail=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._refresh_current_orders_table(app)
+
+        orders_summary_label.setText.assert_called_once_with("当前委托：0 条")
+
+    def test_apply_order_history_payload_publishes_history_orders_to_shared_store(self) -> None:
+        history_order = SimpleNamespace(inst_id="BTC-USDT-SWAP")
+        shared_order_store = MagicMock()
+        app = SimpleNamespace(
+            _shared_order_store=shared_order_store,
+            _last_profile_name="moni",
+            _runtime=SimpleNamespace(environment="demo"),
+            _refresh_order_history_table=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._apply_order_history_payload(
+            app,
+            {
+                "items": [history_order],
+                "usdt_prices": {"USDT": Decimal("1")},
+            },
+        )
+
+        shared_order_store.publish_history_orders.assert_called_once_with(
+            profile_name="moni",
+            environment="demo",
+            orders=[history_order],
+            usdt_prices={"USDT": Decimal("1")},
+        )
+        app._refresh_order_history_table.assert_called_once_with()
+
+    def test_apply_shared_order_snapshot_updates_matching_profile_environment(self) -> None:
+        current_order = OrderStatusView(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            ord_id="algo-1",
+            side="sell",
+            pos_side="long",
+            td_mode="cross",
+            ord_type="conditional",
+            state="effective",
+            price=None,
+            avg_price=None,
+            size=Decimal("1"),
+            filled_size=Decimal("0"),
+            created_time=1,
+            update_time=2,
+            client_order_id="algo-client-1",
+            reduce_only=None,
+            raw={"_source_kind": "algo", "algoId": "algo-1"},
+        )
+        history_order = SimpleNamespace(inst_id="BTC-USDT-SWAP")
+        app = SimpleNamespace(
+            _last_profile_name="moni",
+            _runtime=SimpleNamespace(environment="demo"),
+            _refresh_current_orders_table=MagicMock(),
+            _refresh_order_history_table=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._apply_shared_order_snapshot(
+            app,
+            "moni",
+            "demo",
+            SharedOrderSnapshot(
+                current_order_views=(current_order,),
+                history_orders=(history_order,),
+                history_order_usdt_prices={"USDT": Decimal("1")},
+            ),
+        )
+
+        self.assertEqual(app._orders, [current_order])
+        self.assertEqual(app._visible_orders, [current_order])
+        self.assertEqual(app._order_history_items, [history_order])
+        self.assertEqual(app._order_history_usdt_prices, {"USDT": Decimal("1")})
+        app._refresh_current_orders_table.assert_called_once_with()
+        app._refresh_order_history_table.assert_called_once_with()
+
     @patch("roll_terminal_qt.account_positions_home._validate_protection_live_price_availability")
     def test_start_selected_position_protection_sets_runtime_notifier(self, validate_live_price: MagicMock) -> None:
         notifier = object()
@@ -737,6 +907,29 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         self.assertFalse(app._profile_switch_in_progress)
         self.assertTrue(combo.enabled)
         self.assertTrue(timer.stopped)
+
+    def test_restart_live_feeds_for_manual_refresh_restarts_private_threads_without_waiting(self) -> None:
+        app = SimpleNamespace(
+            _stop_private_threads=MagicMock(),
+            _start_private_threads=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._restart_live_feeds_for_manual_refresh(app)
+
+        app._stop_private_threads.assert_called_once_with(wait_ms=0)
+        app._start_private_threads.assert_called_once_with(force_restart=False, start_history=False)
+
+    def test_refresh_view_uses_lightweight_manual_refresh_path(self) -> None:
+        app = SimpleNamespace(
+            _ensure_runtime_ready=lambda force_unlock=False: True,
+            _status_badge=SimpleNamespace(setText=MagicMock()),
+            _restart_live_feeds_for_manual_refresh=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget.refresh_view(app)
+
+        app._status_badge.setText.assert_called_once()
+        app._restart_live_feeds_for_manual_refresh.assert_called_once_with()
 
     def test_selected_position_manual_flatten_result_failed_uses_s_code(self) -> None:
         ok_result = OkxOrderResult(ord_id="1", cl_ord_id="a", s_code="0", s_msg="", raw={})
