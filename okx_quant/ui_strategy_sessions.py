@@ -1211,7 +1211,7 @@ class UiStrategySessionsMixin:
             f"API：{session.api_name or '-'}\n"
             f"会话：{session.session_id}\n"
             f"状态：{session.display_status}\n"
-            f"启动时间：{self._format_session_started_at(session.started_at)}\n"
+            f"启动时间：{UiStrategySessionsMixin._format_session_started_at(session.started_at)}\n"
             f"标的：{session.symbol or '-'}\n\n"
             f"{guidance}"
         )
@@ -6086,7 +6086,55 @@ class UiStrategySessionsMixin:
             run_mode_label=run_mode_label,
             trader_id=trader_id,
             api_name=api_name,
+            trade_settlement_waiter=lambda stop_event: self._wait_for_session_trade_settlement(
+                session_id,
+                stop_event,
+            ),
         )
+
+    def _wait_for_session_trade_settlement(self, session_id: str, stop_event: threading.Event) -> bool:
+        session = self.sessions.get(session_id)
+        if session is None or session.active_trade is None:
+            return True
+        trade = session.active_trade
+        key = (session_id, trade.round_id)
+        events = getattr(self, "_session_trade_settlement_events", None)
+        if not isinstance(events, dict):
+            events = {}
+            self._session_trade_settlement_events = events
+        results = getattr(self, "_session_trade_settlement_results", None)
+        if not isinstance(results, dict):
+            results = {}
+            self._session_trade_settlement_results = results
+        event = threading.Event()
+        events[key] = event
+        results.pop(key, None)
+        if not trade.reconciliation_started:
+            trade.reconciliation_started = True
+            self._start_session_trade_reconciliation(session, trade)
+        try:
+            while not stop_event.is_set():
+                if event.wait(0.2):
+                    return bool(results.pop(key, False))
+            return False
+        finally:
+            if events.get(key) is event:
+                events.pop(key, None)
+
+    def _publish_session_trade_settlement_result(self, session_id: str, round_id: str, *, success: bool) -> None:
+        key = (session_id, round_id)
+        events = getattr(self, "_session_trade_settlement_events", None)
+        if not isinstance(events, dict):
+            return
+        event = events.get(key)
+        if event is None:
+            return
+        results = getattr(self, "_session_trade_settlement_results", None)
+        if not isinstance(results, dict):
+            results = {}
+            self._session_trade_settlement_results = results
+        results[key] = success
+        event.set()
 
     def _next_session_id(self) -> str:
         while True:
@@ -6296,8 +6344,8 @@ class UiStrategySessionsMixin:
                 "检测到仓位已关闭，但未找到该会话对应的 API 凭证，无法自动归因与结算。",
             )
             if session.active_trade is not None and session.active_trade.round_id == trade.round_id:
-                self._clear_session_manual_management_state(session)
-                session.active_trade = None
+                session.active_trade.reconciliation_started = False
+            self._publish_session_trade_settlement_result(session.session_id, trade.round_id, success=False)
             return
         self._log_session_message(
             session,
@@ -6905,7 +6953,7 @@ class UiStrategySessionsMixin:
             else "-"
         )
         attribution_summary = (
-            "历史交易结算完成"
+            "本轮结束"
             f" | roundId={trade.round_id or '-'}"
             f" | 原开仓ordId={trade.entry_order_id or '-'}"
             f" | clOrdId={trade.entry_client_order_id or '-'}"
@@ -6970,15 +7018,20 @@ class UiStrategySessionsMixin:
         session = self.sessions.get(result.session_id)
         if session is None:
             return
-        if session.active_trade is not None and session.active_trade.round_id == result.round_id:
-            self._clear_session_manual_management_state(session)
-            session.active_trade = None
+        matching_trade = session.active_trade is not None and session.active_trade.round_id == result.round_id
         if result.environment_note:
             self._log_session_message(session, result.environment_note)
         if result.error_message:
+            if matching_trade and session.active_trade is not None:
+                session.active_trade.reconciliation_started = False
             self._log_session_message(session, f"历史交易结算失败：{result.error_message}")
+            self._publish_session_trade_settlement_result(result.session_id, result.round_id, success=False)
             return
         if result.ledger_record is None:
+            if matching_trade and session.active_trade is not None:
+                session.active_trade.reconciliation_started = False
+            self._log_session_message(session, "历史交易结算失败：未生成有效账本记录。")
+            self._publish_session_trade_settlement_result(result.session_id, result.round_id, success=False)
             return
         self._upsert_strategy_trade_ledger_record(result.ledger_record)
         self._refresh_session_financials_from_trade_ledger(session)
@@ -6986,7 +7039,13 @@ class UiStrategySessionsMixin:
         self._refresh_running_session_summary()
         self._log_session_message(session, result.attribution_summary)
         self._log_session_message(session, result.cumulative_summary)
-        self._apply_trader_desk_reconciliation(session, result.ledger_record)
+        try:
+            self._apply_trader_desk_reconciliation(session, result.ledger_record)
+        finally:
+            if matching_trade:
+                self._clear_session_manual_management_state(session)
+                session.active_trade = None
+            self._publish_session_trade_settlement_result(result.session_id, result.round_id, success=True)
 
     def _apply_trader_desk_reconciliation(
         self,
@@ -8260,8 +8319,8 @@ class UiStrategySessionsMixin:
                 "检测到仓位已关闭，但未找到该会话对应的 API 凭证，无法自动归因与结算。",
             )
             if session.active_trade is not None and session.active_trade.round_id == trade.round_id:
-                self._clear_session_manual_management_state(session)
-                session.active_trade = None
+                session.active_trade.reconciliation_started = False
+            self._publish_session_trade_settlement_result(session.session_id, trade.round_id, success=False)
             return
         self._log_session_message(
             session,

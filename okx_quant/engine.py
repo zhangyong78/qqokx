@@ -363,6 +363,7 @@ class HourlyDebugSnapshot:
     atr_period: int
     lookback_used: int
     confirmed_count: int
+    ma_type: str = "ema"
 
 
 @dataclass(frozen=True)
@@ -465,6 +466,7 @@ class StrategyEngine:
         run_mode_label: str = "",
         trader_id: str = "",
         api_name: str = "",
+        trade_settlement_waiter: Callable[[threading.Event], bool] | None = None,
     ) -> None:
         self._client = client
         self._logger = logger
@@ -476,6 +478,7 @@ class StrategyEngine:
         self._run_mode_label = run_mode_label.strip()
         self._trader_id = trader_id.strip()
         self._api_name = api_name.strip()
+        self._trade_settlement_waiter = trade_settlement_waiter
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -507,6 +510,25 @@ class StrategyEngine:
 
     def stop(self) -> None:
         self._session_runner.stop()
+
+    def _wait_for_trade_settlement(self) -> bool:
+        waiter = self._trade_settlement_waiter
+        if waiter is None:
+            return True
+        while not self._stop_event.is_set():
+            try:
+                settled = waiter(self._stop_event)
+            except Exception as exc:
+                settled = False
+                self._logger(f"本轮结算协调异常，开仓门禁保持关闭 | {exc}")
+            if settled:
+                self._logger("本轮结算完成，开仓门禁已释放。")
+                return True
+            if self._stop_event.is_set():
+                break
+            self._logger("本轮结算尚未完成，开仓门禁保持关闭，5秒后重试。")
+            self._stop_event.wait(5)
+        return False
 
     def wait_stopped(self, timeout: float | None = None) -> bool:
         return self._session_runner.wait_stopped(timeout=timeout)
@@ -563,11 +585,12 @@ class StrategyEngine:
         *,
         candle_ts: int | None,
     ) -> None:
-        if candle_ts is None:
+        if not config.ema55_slope_same_bar_reentry_block or candle_ts is None:
             return
         key = self._ema55_slope_same_bar_reentry_key(credentials, config)
         with self._lock:
             self._ema55_slope_same_bar_reentry_block_ts[key] = candle_ts
+        self._logger(f"已记录同K线禁重开门禁 | K线时间={_fmt_ts(candle_ts)}")
 
     def _clear_ema55_slope_same_bar_reentry_block_if_advanced(
         self,
@@ -788,8 +811,9 @@ class StrategyEngine:
             "仓位关闭已确认"
             f" | 原开仓ordId={active_order.ord_id or '-'}"
             f" | clOrdId={active_order.cl_ord_id or '-'}"
-            " | 开仓门禁已释放 | 结算归因中 | 开始评估下一次委托"
+            " | 开仓门禁保持关闭 | 开始结算归因"
         )
+        self._wait_for_trade_settlement()
 
     def _append_dynamic_mtf_mode_parts(self, config: StrategyConfig, mode_parts: list[str]) -> None:
         if not strategy_uses_mtf_filter(config.strategy_id):
@@ -1944,6 +1968,7 @@ class StrategyEngine:
                     f"首档触发R={_live_ema55_slope_lock_profit_trigger_r(config)}",
                     f"nR保本={config.dynamic_two_r_break_even_label()}",
                     f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
+                    f"同K线禁重开={'开启' if config.ema55_slope_same_bar_reentry_block else '关闭'}",
                     (
                         f"时间保本={config.time_stop_break_even_enabled_label()}/"
                         f"{config.resolved_time_stop_break_even_bars()}根"
@@ -1956,6 +1981,7 @@ class StrategyEngine:
             config.ema_period,
             current_bar=config.bar,
             trend_ema_period=config.trend_ema_period,
+            ma_type=config.ema_type,
         )
 
         while not self._stop_event.is_set():
@@ -2053,6 +2079,9 @@ class StrategyEngine:
                 lookback=lookback,
             )
             if not self._stop_event.is_set():
+                self._logger("仓位关闭已确认 | 开仓门禁保持关闭 | 开始结算归因")
+                if not self._wait_for_trade_settlement():
+                    return
                 self._logger("本轮持仓已结束，继续监控下一次信号。")
 
     def _run_body_retest_short_local_strategy(
@@ -2607,6 +2636,9 @@ class StrategyEngine:
             self._monitor_local_exit_v2(credentials, config, trade_instrument, position, protection)
             if not self._stop_event.is_set():
                 idle_signal_candle_ts = newest_ts
+                self._logger("仓位关闭已确认 | 开仓门禁保持关闭 | 开始结算归因")
+                if not self._wait_for_trade_settlement():
+                    return
                 self._logger("本轮持仓已结束，继续监控下一次信号。")
 
     def _run_dynamic_signal_only_v2(
@@ -3908,13 +3940,11 @@ class StrategyEngine:
             )
             if close_trade_pnl:
                 trade_pnl = close_trade_pnl
-            pnl_segment = f" | 本笔净盈亏={trade_pnl}" if trade_pnl else ""
             self._logger(
                 f"本地{reason}平仓已成交 | ordId={filled.ord_id} | 标的={trade_instrument.inst_id} | "
                 f"方向={position.close_side.upper()} | "
                 f"成交均价={_format_notify_price_by_tick_size(filled.entry_price, trade_instrument.tick_size)} | "
                 f"成交数量={_format_size_with_contract_equivalent(trade_instrument, filled.size)} | 剩余={_format_size_with_contract_equivalent(trade_instrument, max(remaining, Decimal('0')))}"
-                f"{pnl_segment}"
             )
             self._notify_trade_close(
                 config,
@@ -5171,6 +5201,7 @@ class StrategyEngine:
         trend_ema_period: int = 0,
         big_ema_period: int = 0,
         entry_reference_ema_period: int = 0,
+        ma_type: str = "ema",
     ) -> HourlyDebugSnapshot:
         return self._call_okx_read_with_retry(
             f"读取1小时调试值 {inst_id}",
@@ -5181,6 +5212,7 @@ class StrategyEngine:
                 trend_ema_period=trend_ema_period,
                 big_ema_period=big_ema_period,
                 entry_reference_ema_period=entry_reference_ema_period,
+                ma_type=ma_type,
             ),
         )
 
@@ -6440,6 +6472,7 @@ class StrategyEngine:
         trend_ema_period: int = 0,
         big_ema_period: int = 0,
         entry_reference_ema_period: int = 0,
+        ma_type: str = "ema",
     ) -> None:
         normalized_bar = str(current_bar or "").strip()
         if normalized_bar and normalized_bar.upper() != "1H":
@@ -6451,6 +6484,7 @@ class StrategyEngine:
                 trend_ema_period=trend_ema_period,
                 big_ema_period=big_ema_period,
                 entry_reference_ema_period=entry_reference_ema_period,
+                ma_type=ma_type,
             )
             self._logger(format_hourly_debug(inst_id, hourly_snapshot, trading_bar=current_bar))
         except Exception as exc:
@@ -7737,6 +7771,7 @@ def fetch_hourly_ema_debug(
     trend_ema_period: int = 0,
     big_ema_period: int = 0,
     entry_reference_ema_period: int = 0,
+    ma_type: str = "ema",
 ) -> HourlyDebugSnapshot:
     lookback = recommended_indicator_lookback(
         ema_period,
@@ -7749,10 +7784,11 @@ def fetch_hourly_ema_debug(
     confirmed = [candle for candle in candles if candle.confirmed]
     minimum = max(ema_period, atr_period, trend_ema_period, big_ema_period, entry_reference_ema_period)
     if len(confirmed) < minimum:
-        raise RuntimeError(f"已收盘 1 小时 K 线不足，无法计算 EMA{ema_period} / ATR{atr_period}")
+        line_label = f"{str(ma_type or 'ema').strip().upper()}{ema_period}"
+        raise RuntimeError(f"已收盘 1 小时 K 线不足，无法计算 {line_label} / ATR{atr_period}")
 
     closes = [candle.close for candle in confirmed]
-    ema_values = ema(closes, ema_period)
+    ema_values = moving_average(closes, ema_period, ma_type)
     atr_values = atr(confirmed, atr_period)
     last_closed_candle = confirmed[-1]
     last_closed_ema = ema_values[-1]
@@ -7769,6 +7805,7 @@ def fetch_hourly_ema_debug(
         atr_period=atr_period,
         lookback_used=lookback,
         confirmed_count=len(confirmed),
+        ma_type=str(ma_type or "ema").strip().lower(),
     )
 
 
@@ -7786,7 +7823,7 @@ def format_hourly_debug(
     return (
         f"{prefix} | {inst_id} | K线时间={_fmt_ts(snapshot.candle_ts)} | "
         f"上一根收盘价={format_decimal_fixed(snapshot.candle_close, 2)} | "
-        f"上一根EMA{snapshot.ema_period}={format_decimal_fixed(snapshot.ema_value, 2)} | "
+        f"上一根{snapshot.ma_type.upper()}{snapshot.ema_period}={format_decimal_fixed(snapshot.ema_value, 2)} | "
         f"上一根ATR{snapshot.atr_period}={format_decimal_fixed(snapshot.atr_value, 2)} | "
         f"回看K线数={snapshot.lookback_used} | 已收盘根数={snapshot.confirmed_count}"
     )

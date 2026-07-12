@@ -4277,6 +4277,7 @@ class KlineDataLoader(QThread):
         average_kline: bool = False,
         workspace_entry: dict[str, object] | None = None,
         enable_alerts: bool = True,
+        enable_shape_signals: bool = False,
     ) -> None:
         super().__init__()
         self._request_id = request_id
@@ -4287,6 +4288,7 @@ class KlineDataLoader(QThread):
         self._average_kline = bool(average_kline)
         self._workspace_entry = normalize_workspace_entry(workspace_entry)
         self._enable_alerts = enable_alerts
+        self._enable_shape_signals = bool(enable_shape_signals)
 
     def _build_payload(
         self,
@@ -4356,16 +4358,24 @@ class KlineDataLoader(QThread):
             closes=closes,
             sma50=sma50_values,
         )
-        signal_markers = _build_replay_signal_markers(
-            candles=list(candles),
-            period=self._period,
-            ema15_values=ema9_values,
-            sma50_values=sma50_values,
-        )
-        box_overlays = list(_build_box_history_overlays(list(candles)))
-        box_overlays.extend(_build_box_current_overlay(list(candles)))
         visuals = self._workspace_entry.get("visuals", {})
-        show_auto_channel = bool(visuals.get("auto_channel_visible", False)) if isinstance(visuals, dict) else False
+        visuals = visuals if isinstance(visuals, dict) else {}
+        signal_markers = (
+            _build_replay_signal_markers(
+                candles=list(candles),
+                period=self._period,
+                ema15_values=ema9_values,
+                sma50_values=sma50_values,
+            )
+            if self._enable_shape_signals
+            else []
+        )
+        box_overlays: list[dict[str, Any]] = []
+        if bool(visuals.get("history_box_visible", False)):
+            box_overlays.extend(_build_box_history_overlays(list(candles)))
+        if bool(visuals.get("auto_box_visible", False)):
+            box_overlays.extend(_build_box_current_overlay(list(candles)))
+        show_auto_channel = bool(visuals.get("auto_channel_visible", False))
         channel_settings = self._workspace_entry.get("auto_channel", {})
         channel_settings = channel_settings if isinstance(channel_settings, dict) else {}
         channel_config = ChannelDetectionConfig(
@@ -4871,7 +4881,20 @@ class KlineAnalysisWindow(QMainWindow):
         if hasattr(self, "_shape_settings_button"):
             self._shape_settings_button.setText("形态：开" if self.pattern_signals_enabled() else "形态：关")
 
+    @Slot(bool)
+    def _on_shape_signal_visibility_changed(self, _enabled: bool) -> None:
+        self._load_data()
+
     def begin_shutdown(self, callback: Callable[[], None] | None = None) -> None:
+        callbacks = getattr(self, "_shutdown_callbacks", None)
+        if callbacks is None:
+            callbacks = []
+            self._shutdown_callbacks = callbacks
+        if callback is not None:
+            callbacks.append(callback)
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
+        self._shutdown_requested = True
         self._refresh_timer.stop()
         self._rr_monitor_timer.stop()
         if self._realtime_candle_unsubscribe is not None:
@@ -4880,7 +4903,30 @@ class KlineAnalysisWindow(QMainWindow):
             except Exception:
                 pass
             self._realtime_candle_unsubscribe = None
-        if callback is not None:
+        for loader in (
+            getattr(self, "_loader", None),
+            getattr(self, "_secondary_loader", None),
+            getattr(self, "_secondary_volatility_loader", None),
+        ):
+            if loader is not None and loader.isRunning():
+                loader.requestInterruption()
+        KlineAnalysisWindow._poll_shutdown_loaders(self)
+
+    def _poll_shutdown_loaders(self) -> None:
+        active = any(
+            loader is not None and loader.isRunning()
+            for loader in (
+                getattr(self, "_loader", None),
+                getattr(self, "_secondary_loader", None),
+                getattr(self, "_secondary_volatility_loader", None),
+            )
+        )
+        if active:
+            QTimer.singleShot(50, lambda: KlineAnalysisWindow._poll_shutdown_loaders(self))
+            return
+        callbacks = list(getattr(self, "_shutdown_callbacks", []))
+        self._shutdown_callbacks = []
+        for callback in callbacks:
             callback()
 
     def local_task_summary(self) -> dict[str, int]:
@@ -5047,18 +5093,21 @@ class KlineAnalysisWindow(QMainWindow):
         self._show_1h_shape_signal_check.setChecked(False)
         self._show_1h_shape_signal_check.setToolTip(shape_signal_tooltip)
         self._show_1h_shape_signal_check.toggled.connect(self._sync_chart_options)
+        self._show_1h_shape_signal_check.toggled.connect(self._on_shape_signal_visibility_changed)
         shape_group_layout.addWidget(self._show_1h_shape_signal_check)
 
         self._show_4h_shape_signal_check = QCheckBox("4H")
         self._show_4h_shape_signal_check.setChecked(False)
         self._show_4h_shape_signal_check.setToolTip(shape_signal_tooltip)
         self._show_4h_shape_signal_check.toggled.connect(self._sync_chart_options)
+        self._show_4h_shape_signal_check.toggled.connect(self._on_shape_signal_visibility_changed)
         shape_group_layout.addWidget(self._show_4h_shape_signal_check)
 
         self._show_1d_shape_signal_check = QCheckBox("1D")
         self._show_1d_shape_signal_check.setChecked(False)
         self._show_1d_shape_signal_check.setToolTip(shape_signal_tooltip)
         self._show_1d_shape_signal_check.toggled.connect(self._sync_chart_options)
+        self._show_1d_shape_signal_check.toggled.connect(self._on_shape_signal_visibility_changed)
         shape_group_layout.addWidget(self._show_1d_shape_signal_check)
 
         self._shape_signal_size_metric_btn = QPushButton("")
@@ -5250,14 +5299,12 @@ class KlineAnalysisWindow(QMainWindow):
         control_layout.addWidget(QLabel("自动通道"))
         self._auto_box_check = QCheckBox("显示自动箱体")
         self._auto_box_check.setChecked(False)
-        self._auto_box_check.toggled.connect(self._save_workspace_settings)
-        self._auto_box_check.toggled.connect(self._sync_chart_options)
+        self._auto_box_check.toggled.connect(self._on_auto_box_visibility_changed)
         control_layout.addWidget(self._auto_box_check)
 
         self._history_box_check = QCheckBox("显示历史箱体")
         self._history_box_check.setChecked(False)
-        self._history_box_check.toggled.connect(self._save_workspace_settings)
-        self._history_box_check.toggled.connect(self._sync_chart_options)
+        self._history_box_check.toggled.connect(self._on_auto_box_visibility_changed)
         control_layout.addWidget(self._history_box_check)
         self._live_box_check = self._history_box_check
 
@@ -6186,6 +6233,9 @@ class KlineAnalysisWindow(QMainWindow):
             bool(self._prefer_local_checkbox.isChecked()),
             bool(self._secondary_average_kline_check.isChecked()),
             bool(getattr(self, "_auto_channel_check", None) and self._auto_channel_check.isChecked()),
+            bool(getattr(self, "_auto_box_check", None) and self._auto_box_check.isChecked()),
+            bool(getattr(self, "_history_box_check", None) and self._history_box_check.isChecked()),
+            self.pattern_signals_enabled(),
             bool(self._reverse_kline_check.isChecked()),
         )
 
@@ -6293,6 +6343,7 @@ class KlineAnalysisWindow(QMainWindow):
             local_only=self._prefer_local_checkbox.isChecked(),
             average_kline=bool(self._secondary_average_kline_check.isChecked()),
             workspace_entry=workspace_entry,
+            enable_shape_signals=self.pattern_signals_enabled(),
         )
         self._loader.loaded.connect(self._on_data_loaded)
         self._loader.failed.connect(self._on_data_failed)
@@ -6344,6 +6395,7 @@ class KlineAnalysisWindow(QMainWindow):
             average_kline=bool(self._secondary_average_kline_check.isChecked()),
             workspace_entry={},
             enable_alerts=False,
+            enable_shape_signals=False,
         )
         self._secondary_loader.loaded.connect(self._on_secondary_data_loaded)
         self._secondary_loader.failed.connect(self._on_secondary_data_failed)
@@ -7488,6 +7540,12 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(bool)
     def _on_auto_channel_visibility_changed(self, _enabled: bool) -> None:
+        self._save_workspace_settings()
+        self._sync_chart_options()
+        self._load_data()
+
+    @Slot(bool)
+    def _on_auto_box_visibility_changed(self, _enabled: bool) -> None:
         self._save_workspace_settings()
         self._sync_chart_options()
         self._load_data()

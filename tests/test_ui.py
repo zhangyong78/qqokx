@@ -1681,9 +1681,16 @@ HTTP 502: <!DOCTYPE html>
         )
 
     def test_record_session_runtime_message_marks_session_for_ui_refresh(self) -> None:
-        session = SimpleNamespace(session_id="S01", runtime_status="启动中", last_message="")
+        session = SimpleNamespace(
+            session_id="S01",
+            runtime_status="启动中",
+            last_message="",
+            last_message_at=None,
+        )
         app = SimpleNamespace(
             sessions={"S01": session},
+            _parse_runtime_heartbeat_control_message=lambda _text: None,
+            _runtime_heartbeat_label_from_message=lambda _text: None,
             _track_session_trade_runtime=MagicMock(),
         )
 
@@ -1692,6 +1699,27 @@ HTTP 502: <!DOCTYPE html>
         self.assertEqual(session.runtime_status, "等待信号")
         self.assertEqual(session.last_message, "当前无开空信号 | EMA55 斜率未转空")
         self.assertEqual(app._pending_runtime_session_updates, {"S01"})
+
+    def test_wait_for_session_trade_settlement_releases_after_reconciliation_result(self) -> None:
+        trade = SimpleNamespace(round_id="S01-1", reconciliation_started=False)
+        session = SimpleNamespace(session_id="S01", active_trade=trade)
+        app = SimpleNamespace(sessions={"S01": session})
+
+        def _start_reconciliation(_session, _trade) -> None:  # noqa: ANN001
+            QuantApp._publish_session_trade_settlement_result(
+                app,
+                "S01",
+                "S01-1",
+                success=True,
+            )
+
+        app._start_session_trade_reconciliation = _start_reconciliation
+        stop_event = SimpleNamespace(is_set=lambda: False)
+
+        settled = QuantApp._wait_for_session_trade_settlement(app, "S01", stop_event)
+
+        self.assertTrue(settled)
+        self.assertTrue(trade.reconciliation_started)
 
     def test_drain_pending_runtime_session_updates_refreshes_rows_and_selected_details(self) -> None:
         session = SimpleNamespace(session_id="S01")
@@ -2954,6 +2982,11 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
             session_tree=_SessionTreeStub(),
             _session_live_pnl_snapshot=lambda _session: (None, None),
             _session_open_position_amount_text=lambda _session: "-",
+            _session_recovery_reason_summary=lambda _session: "",
+            _session_runtime_entry_price_text=lambda _session: "-",
+            _session_runtime_stop_price_text=lambda _session: "-",
+            _session_runtime_take_profit_text=lambda _session: "-",
+            _format_session_started_at=lambda value: QuantApp._format_session_started_at(value),
             sessions={"S01": session, "S02": peer},
             notify_enabled=_Var(True),
         )
@@ -2970,7 +3003,7 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         self.assertEqual(app.session_tree.rows["S01"]["values"][7], "交易并下单")
         self.assertEqual(app.session_tree.rows["S01"]["values"][9], "1H")
         self.assertEqual(app.session_tree.rows["S01"]["values"][11], "10")
-        self.assertEqual(app.session_tree.rows["S01"]["values"][15], "+1.25")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][18], "+1.25")
     def test_session_trader_label_prefers_trader_id_and_falls_back_to_dash(self) -> None:
         trader_session = SimpleNamespace(trader_id="T001")
         plain_session = SimpleNamespace(trader_id="")
@@ -6377,11 +6410,11 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(result.ledger_record.close_reason, "OKX止损触发")
         self.assertEqual(result.ledger_record.gross_pnl, Decimal("-3.78"))
         self.assertEqual(result.ledger_record.net_pnl, Decimal("-3.87"))
-        self.assertIn("历史交易结算完成", result.attribution_summary)
+        self.assertIn("本轮结束", result.attribution_summary)
         self.assertIn("roundId=round-1", result.attribution_summary)
         self.assertIn("原开仓ordId=1001", result.attribution_summary)
         self.assertIn("clOrdId=s01emaent042300000897343", result.attribution_summary)
-        self.assertNotIn("本轮结束 |", result.attribution_summary)
+        self.assertIn("本轮结束 |", result.attribution_summary)
         self.assertIn("原因=OKX止损触发", result.attribution_summary)
         self.assertIn("累计净盈亏=-3.87", result.cumulative_summary)
 
@@ -7266,6 +7299,7 @@ class PositionNotesLifecycleTest(TestCase):
             mgn_mode=mgn_mode,
             close_size=close_size,
             close_avg_price=close_avg_price,
+            raw={},
         )
 
     def test_reconcile_current_position_note_records_marks_missing_after_successful_refresh(self) -> None:
@@ -7702,6 +7736,8 @@ class SelectedSessionDetailRefreshTest(TestCase):
             config=object(),
             log_file_path="",
             last_message="最新日志",
+            last_message_at=None,
+            last_runtime_heartbeat_at=None,
             trade_count=1,
             win_count=1,
             gross_pnl_total=Decimal("1"),
@@ -7718,6 +7754,9 @@ class SelectedSessionDetailRefreshTest(TestCase):
             _selected_session_detail_session_id="S01",
             _session_live_pnl_snapshot=lambda _session: (None, None),
             _session_position_cache_note=lambda _session: "",
+            _session_recovery_reason_text=lambda _session: "",
+            _session_runtime_heartbeat_expected=lambda _session: False,
+            _session_runtime_heartbeat_note=lambda _session: "",
             _build_strategy_detail_text=MagicMock(return_value="detail"),
             _set_readonly_text=MagicMock(),
             notify_enabled=_Var(True),
@@ -7758,6 +7797,8 @@ class SelectedSessionDetailRefreshTest(TestCase):
             config=object(),
             log_file_path="",
             last_message="最新日志",
+            last_message_at=None,
+            last_runtime_heartbeat_at=None,
             trade_count=1,
             win_count=1,
             gross_pnl_total=Decimal("1"),
@@ -7774,6 +7815,9 @@ class SelectedSessionDetailRefreshTest(TestCase):
             _selected_session_detail_session_id="S01",
             _session_live_pnl_snapshot=lambda _session: (None, None),
             _session_position_cache_note=lambda _session: "",
+            _session_recovery_reason_text=lambda _session: "",
+            _session_runtime_heartbeat_expected=lambda _session: False,
+            _session_runtime_heartbeat_note=lambda _session: "",
             _build_strategy_detail_text=MagicMock(return_value="detail"),
             _set_readonly_text=MagicMock(),
             notify_enabled=_Var(True),
@@ -7810,6 +7854,8 @@ class SelectedSessionDetailRefreshTest(TestCase):
             config=object(),
             log_file_path="",
             last_message="最新日志",
+            last_message_at=None,
+            last_runtime_heartbeat_at=None,
             trade_count=1,
             win_count=1,
             gross_pnl_total=Decimal("1"),
@@ -7826,6 +7872,9 @@ class SelectedSessionDetailRefreshTest(TestCase):
             _selected_session_detail_session_id="S01",
             _session_live_pnl_snapshot=lambda _session: (None, None),
             _session_position_cache_note=lambda _session: "",
+            _session_recovery_reason_text=lambda _session: "",
+            _session_runtime_heartbeat_expected=lambda _session: False,
+            _session_runtime_heartbeat_note=lambda _session: "",
             _build_strategy_detail_text=MagicMock(return_value="detail"),
             _set_readonly_text=MagicMock(),
             notify_enabled=_Var(True),
@@ -8566,6 +8615,11 @@ class RunningSessionFilterTest(TestCase):
             _running_session_sort_descending=False,
             _session_live_pnl_snapshot=lambda _session: (None, None),
             _session_open_position_amount_text=lambda _session: "-",
+            _session_recovery_reason_summary=lambda _session: "",
+            _session_runtime_entry_price_text=lambda _session: "-",
+            _session_runtime_stop_price_text=lambda _session: "-",
+            _session_runtime_take_profit_text=lambda _session: "-",
+            _format_session_started_at=lambda value: QuantApp._format_session_started_at(value),
             _trader_desk_draft_by_id=lambda _trader_id: None,
             _refresh_running_session_tree_headings=lambda: None,
         )
@@ -9351,6 +9405,7 @@ class StrategyStopCleanupTest(TestCase):
 
         app = SimpleNamespace(
             sessions={session.session_id: session},
+            _update_session_runtime_heartbeat_state=MagicMock(),
             _refresh_session_live_pnl_cache=MagicMock(),
             _upsert_session_row=MagicMock(),
             _sync_strategy_history_from_session=MagicMock(),

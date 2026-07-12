@@ -57,6 +57,7 @@ from roll_terminal_qt.kline_analysis_window import (
     KlineAlertSnapshot,
     KlineChartPayload,
     KlineAnalysisWindow,
+    KlineDataLoader,
     RRCardDialog,
     _AUTO_REFRESH_DEFAULT_ENABLED,
     _DEFAULT_DUAL_PRIMARY_PERIOD,
@@ -106,6 +107,60 @@ from roll_terminal_qt.workspace_shell import LocalTaskCount
 
 
 class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
+
+    def test_disabled_kline_research_layers_are_not_computed_in_loader(self) -> None:
+        candles = [
+            Candle(index * 3_600_000, Decimal("100"), Decimal("102"), Decimal("98"), Decimal("100"), Decimal("1"), False)
+            for index in range(60)
+        ]
+        loader = KlineDataLoader(
+            request_id=1,
+            symbol="BTC-USDT-SWAP",
+            period="4H",
+            limit=1200,
+            workspace_entry={},
+        )
+
+        with (
+            patch("roll_terminal_qt.kline_analysis_window._build_box_history_overlays") as history_boxes,
+            patch("roll_terminal_qt.kline_analysis_window._build_box_current_overlay") as current_box,
+            patch("roll_terminal_qt.kline_analysis_window._build_replay_signal_markers") as shape_signals,
+        ):
+            loader._build_payload(
+                candles=candles,
+                local_count=len(candles),
+                remote_added_count=0,
+                has_network_fallback=False,
+                local_stale=False,
+                include_alerts=False,
+            )
+
+        history_boxes.assert_not_called()
+        current_box.assert_not_called()
+        shape_signals.assert_not_called()
+
+    def test_kline_shutdown_requests_loader_interruption_without_waiting(self) -> None:
+        loader = MagicMock()
+        loader.isRunning.return_value = True
+        app = SimpleNamespace(
+            _refresh_timer=MagicMock(),
+            _rr_monitor_timer=MagicMock(),
+            _realtime_candle_unsubscribe=None,
+            _loader=loader,
+            _secondary_loader=None,
+            _secondary_volatility_loader=None,
+            _deferred_chart_render_timer=MagicMock(),
+            _layout_refresh_timer=MagicMock(),
+        )
+        finished: list[bool] = []
+
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot") as schedule:
+            KlineAnalysisWindow.begin_shutdown(app, lambda: finished.append(True))
+
+        loader.requestInterruption.assert_called_once()
+        loader.wait.assert_not_called()
+        self.assertEqual(finished, [])
+        schedule.assert_called_once()
 
     def test_current_channel_overlay_reuses_research_snapshot_band(self) -> None:
         class Line:
@@ -795,6 +850,110 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             launcher.hide()
             launcher.deleteLater()
             self._app.processEvents()
+
+    def test_launcher_waits_for_every_workspace_page_shutdown_callback(self) -> None:
+        class Home(QWidget):
+            def __init__(self, parent=None) -> None:  # noqa: ANN001
+                super().__init__(parent)
+                self.callback = None
+
+            def begin_shutdown(self, callback) -> None:  # noqa: ANN001
+                self.callback = callback
+
+            def refresh_view(self) -> None:
+                return
+
+        class Kline(QWidget):
+            def __init__(self, *, embedded: bool = False) -> None:
+                super().__init__()
+                self.callback = None
+
+            def begin_shutdown(self, callback=None) -> None:  # noqa: ANN001
+                self.callback = callback
+
+        class Roll(QWidget):
+            def __init__(self) -> None:
+                super().__init__()
+                self.callback = None
+
+            def begin_shutdown(self, callback=None) -> None:  # noqa: ANN001
+                self.callback = callback
+
+        with (
+            patch("roll_terminal_qt.launcher.AccountPositionsHomeWidget", Home),
+            patch("roll_terminal_qt.launcher.KlineAnalysisWindow", Kline),
+            patch("roll_terminal_qt.launcher.RollTerminalWindow", Roll),
+        ):
+            launcher = LauncherWindow()
+            try:
+                launcher.show_page("account")
+                launcher.show_page("roll")
+                launcher._finish_shutdown = MagicMock()
+                launcher._wait_for_child_windows_shutdown()
+
+                kline = launcher._pages["kline"]
+                home = launcher._pages["account"]
+                roll = launcher._pages["roll"]
+                self.assertTrue(callable(kline.callback))
+                self.assertTrue(callable(home.callback))
+                self.assertTrue(callable(roll.callback))
+                kline.callback()
+                home.callback()
+                launcher._finish_shutdown.assert_not_called()
+                roll.callback()
+                launcher._finish_shutdown.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(launcher)
+
+    def test_roll_shutdown_requests_thread_stop_without_blocking_wait(self) -> None:
+        feed = MagicMock()
+        account = MagicMock()
+        order = MagicMock()
+        for thread in (feed, account, order):
+            thread.isRunning.return_value = True
+        app = SimpleNamespace(
+            _shutdown_callbacks=[],
+            _shutdown_requested=False,
+            _runtime_thread_generation=0,
+            _feed=feed,
+            _account_feed=account,
+            _order_feed=order,
+            _target_thread=None,
+            _execution_thread=None,
+        )
+        finished: list[bool] = []
+
+        with patch("roll_terminal_qt.ui.QTimer.singleShot") as schedule:
+            RollTerminalWindow.begin_shutdown(app, lambda: finished.append(True))
+
+        for thread in (feed, account, order):
+            thread.stop.assert_called_once()
+            thread.wait.assert_not_called()
+        self.assertEqual(finished, [])
+        schedule.assert_called_once()
+
+    def test_roll_history_refresh_batches_rows_without_per_row_resize(self) -> None:
+        table = MagicMock()
+        app = SimpleNamespace(
+            _execution_history_records=[
+                {
+                    "timestamp": "2026-07-12 19:00:00", "profile": "moni", "task": "移仓",
+                    "current_inst_id": "BTC-USD-260626", "target_inst_id": "BTC-USD-260925",
+                    "qty": "1", "status": "完成", "avg_spread_line": "价差：1",
+                    "fee_line": "", "net_spread_line": "净价差：1", "message": "", "success": True,
+                },
+            ],
+            _history_table=table,
+            _refresh_execution_history_summary=MagicMock(),
+            _history_metric_value=RollTerminalWindow._history_metric_value,
+            _extract_history_fee_usdt=RollTerminalWindow._extract_history_fee_usdt,
+            _history_fee_display=lambda text: RollTerminalWindow._history_fee_display(app, text),
+        )
+
+        RollTerminalWindow._refresh_execution_history_view(app)
+
+        table.setRowCount.assert_any_call(1)
+        table.resizeRowToContents.assert_not_called()
 
     def test_split_annotation_key_supports_standard_triplet(self) -> None:
         self.assertEqual(
@@ -2819,6 +2978,8 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
             patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
             patch("roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot", return_value={"entries": []}),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_analysis_workspace_entries"),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_rr_trade_ledger_snapshot"),
         ):
             window = KlineAnalysisWindow()
             try:

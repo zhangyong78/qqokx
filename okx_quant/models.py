@@ -398,7 +398,7 @@ class StrategyConfig:
     dynamic_first_lock_r: int = 0
     dynamic_trailing_step_r: int = 1
     ema55_slope_negative_entry_bars: int = 1
-    ema55_slope_same_bar_reentry_block: bool = False
+    ema55_slope_same_bar_reentry_block: bool = True
     ema55_slope_dynamic_exit_requires_bear_reentry: bool = False
     ema55_slope_dynamic_exit_bear_reentry_break_prev_low: bool = False
     ema55_slope_dynamic_exit_requires_ema_reclaim: bool = False

@@ -252,6 +252,7 @@ class LauncherWindow(QMainWindow):
         self._shared_data_dialog: SharedDataDialog | None = None
         self._shutdown_in_progress = False
         self._home_shutdown_started = False
+        self._shutdown_pending_page_keys: set[str] = set()
         self._shutdown_started_at: datetime | None = None
         self._home_widget: AccountPositionsHomeWidget | None = None
         self._pages: dict[str, QWidget] = {}
@@ -522,16 +523,26 @@ class LauncherWindow(QMainWindow):
         if self._home_shutdown_started:
             return
         self._home_shutdown_started = True
+        self._shutdown_pending_page_keys = set(self._pages)
+        if not self._shutdown_pending_page_keys:
+            self._finish_shutdown()
+            return
         for page_key, page in self._pages.items():
-            if page_key == "account":
-                continue
             begin_shutdown = getattr(page, "begin_shutdown", None)
             if callable(begin_shutdown):
-                begin_shutdown()
-        if self._home_widget is not None:
-            self._home_widget.begin_shutdown(self._finish_shutdown)
-        else:
-            self._finish_shutdown()
+                try:
+                    begin_shutdown(lambda key=page_key: self._on_workspace_page_shutdown_finished(key))
+                except TypeError:
+                    begin_shutdown()
+                    self._on_workspace_page_shutdown_finished(page_key)
+                continue
+            self._on_workspace_page_shutdown_finished(page_key)
+
+    def _on_workspace_page_shutdown_finished(self, page_key: str) -> None:
+        self._shutdown_pending_page_keys.discard(page_key)
+        if not self._home_shutdown_started or self._shutdown_pending_page_keys:
+            return
+        self._finish_shutdown()
 
     def _finish_shutdown(self) -> None:
         finished_at = datetime.now()

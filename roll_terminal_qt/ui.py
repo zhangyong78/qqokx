@@ -274,6 +274,51 @@ class RollTerminalWindow(QMainWindow):
                 counts.append(LocalTaskCount(profile_name, arbitrage=1))
         return merge_local_task_counts(counts)
 
+    def begin_shutdown(self, callback=None) -> None:  # noqa: ANN001
+        callbacks = getattr(self, "_shutdown_callbacks", None)
+        if callbacks is None:
+            callbacks = []
+            self._shutdown_callbacks = callbacks
+        if callback is not None:
+            callbacks.append(callback)
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
+        self._shutdown_requested = True
+        self._shutdown_deadline_monotonic = time.monotonic() + 3.0
+        self._runtime_thread_generation = getattr(self, "_runtime_thread_generation", 0) + 1
+        for thread in (self._feed, self._account_feed, self._order_feed, self._target_thread):
+            if thread is None or not thread.isRunning():
+                continue
+            try:
+                thread.stop()
+            except AttributeError:
+                try:
+                    thread.requestInterruption()
+                except Exception:
+                    pass
+        RollTerminalWindow._poll_shutdown_threads(self)
+
+    def _poll_shutdown_threads(self) -> None:
+        threads = [
+            thread
+            for thread in (self._feed, self._account_feed, self._order_feed, self._target_thread, self._execution_thread)
+            if thread is not None and thread.isRunning()
+        ]
+        if threads:
+            if time.monotonic() >= float(getattr(self, "_shutdown_deadline_monotonic", 0.0)):
+                for thread in threads:
+                    try:
+                        thread.terminate()
+                    except Exception:
+                        pass
+            QTimer.singleShot(50, lambda: RollTerminalWindow._poll_shutdown_threads(self))
+            return
+        self._private_threads_started = False
+        callbacks = list(getattr(self, "_shutdown_callbacks", []))
+        self._shutdown_callbacks = []
+        for callback in callbacks:
+            callback()
+
     def closeEvent(self, event) -> None:  # noqa: ANN001
         if self._execution_thread is not None and self._execution_thread.isRunning():
             QMessageBox.warning(self, "执行中", f"{self._active_execution_label}执行中，请等待完成后再关闭窗口")
@@ -3377,10 +3422,10 @@ class RollTerminalWindow(QMainWindow):
 
     def _refresh_execution_history_view(self) -> None:
         self._refresh_execution_history_summary()
-        self._history_table.setRowCount(0)
-        for record in reversed(self._execution_history_records[-200:]):
-            row = self._history_table.rowCount()
-            self._history_table.insertRow(row)
+        records = list(reversed(self._execution_history_records[-200:]))
+        self._history_table.setUpdatesEnabled(False)
+        self._history_table.setRowCount(len(records))
+        for row, record in enumerate(records):
             values = [
                 str(record.get("timestamp", "")),
                 str(record.get("profile", "")),
@@ -3403,7 +3448,8 @@ class RollTerminalWindow(QMainWindow):
                 else:
                     item.setForeground(QColor("#c83b55"))
                 self._history_table.setItem(row, column, item)
-            self._history_table.resizeRowToContents(row)
+        self._history_table.setUpdatesEnabled(True)
+        self._history_table.viewport().update()
 
     def _refresh_execution_history_summary(self) -> None:
         if not self._execution_history_records:

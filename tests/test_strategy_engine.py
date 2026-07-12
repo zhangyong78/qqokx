@@ -145,6 +145,29 @@ class StrategyEngineTest(TestCase):
         self.assertIn("日线过滤", messages[0])
         self.assertIn("北京时间8点", messages[0])
 
+    def test_ema55_slope_same_bar_reentry_block_defaults_enabled(self) -> None:
+        field = StrategyConfig.__dataclass_fields__["ema55_slope_same_bar_reentry_block"]
+
+        self.assertTrue(field.default)
+
+    def test_trade_settlement_waiter_releases_gate_only_after_completion(self) -> None:
+        messages: list[str] = []
+        calls: list[object] = []
+
+        def _waiter(stop_event) -> bool:  # noqa: ANN001
+            calls.append(stop_event)
+            return True
+
+        engine = StrategyEngine(
+            _HistoryClient(),
+            messages.append,
+            trade_settlement_waiter=_waiter,
+        )
+
+        self.assertTrue(engine._wait_for_trade_settlement())
+        self.assertEqual(calls, [engine._stop_event])
+        self.assertEqual(messages, ["本轮结算完成，开仓门禁已释放。"])
+
     def test_ema55_slope_short_local_strategy_continues_after_round_trip(self) -> None:
         messages: list[str] = []
         waits: list[float] = []
@@ -389,7 +412,7 @@ class StrategyEngineTest(TestCase):
         self.assertIsNotNone(matched)
         self.assertEqual(matched.pos_side, "long")
 
-    def test_find_managed_position_rejects_mismatched_pos_side_takeover(self) -> None:
+    def test_find_managed_position_ignores_opposite_side_in_long_short_mode(self) -> None:
         class _Client:
             @staticmethod
             def _get_account_config_cached(credentials, config):  # noqa: ANN001,ARG004
@@ -460,16 +483,14 @@ class StrategyEngineTest(TestCase):
             entry_ts=0,
         )
 
-        with self.assertRaises(RuntimeError) as ctx:
-            engine._find_managed_position(
-                Credentials(api_key="", secret_key="", passphrase=""),
-                config,
-                instrument,
-                position,
-            )
+        matched = engine._find_managed_position(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            config,
+            instrument,
+            position,
+        )
 
-        self.assertIn("拒绝接管现有持仓", str(ctx.exception))
-        self.assertIn("预期posSide=long", str(ctx.exception))
+        self.assertIsNone(matched)
 
     def test_close_position_resolves_exit_pos_side_from_account_mode(self) -> None:
         captured_exit: dict[str, object] = {}
@@ -3084,6 +3105,9 @@ class StrategyEngineTest(TestCase):
                 return self._stopped
 
         class _StubClient:
+            def get_trigger_price(self, *args, **kwargs):  # noqa: ANN002,ANN003
+                return Decimal("2300")
+
             def place_limit_order(
                 self,
                 credentials,
