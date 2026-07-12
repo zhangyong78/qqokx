@@ -2401,7 +2401,7 @@ class StrategyEngineTest(TestCase):
             engine._run_dynamic_exchange_strategy(None, config, instrument)  # type: ignore[arg-type]
 
         self.assertEqual(submit_calls["count"], 1)
-        self.assertTrue(any("本轮持仓已结束，继续监控下一次信号" in message for message in messages))
+        self.assertTrue(any("仓位关闭已确认" in message for message in messages))
         self.assertFalse(any("第1波趋势开仓次数已达上限" in message for message in messages))
 
     def test_dynamic_exchange_strategy_waits_next_candle_before_second_entry_in_same_wave(self) -> None:

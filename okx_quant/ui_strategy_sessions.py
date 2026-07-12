@@ -6236,7 +6236,10 @@ class UiStrategySessionsMixin:
             if new_stop is not None:
                 trade.current_stop_price = new_stop
             return
-        if "本轮持仓已结束，继续监控下一次信号" in message:
+        if (
+            "本轮持仓已结束，继续监控下一次信号" in message
+            or "仓位关闭已确认" in message
+        ):
             trade = session.active_trade
             if trade is None or trade.reconciliation_started:
                 return
@@ -6902,7 +6905,11 @@ class UiStrategySessionsMixin:
             else "-"
         )
         attribution_summary = (
-            f"本轮结束 | 原因={close_reason} | 开仓均价={_format_optional_decimal(entry_price)} | "
+            "历史交易结算完成"
+            f" | roundId={trade.round_id or '-'}"
+            f" | 原开仓ordId={trade.entry_order_id or '-'}"
+            f" | clOrdId={trade.entry_client_order_id or '-'}"
+            f" | 原因={close_reason} | 开仓均价={_format_optional_decimal(entry_price)} | "
             f"平仓均价={_format_optional_decimal(exit_price)} | 数量={_format_optional_decimal(size)} | "
             f"开仓手续费={_format_optional_usdt_precise(entry_fee, places=2)} | "
             f"平仓手续费={_format_optional_usdt_precise(exit_fee, places=2)} | "
@@ -6969,7 +6976,7 @@ class UiStrategySessionsMixin:
         if result.environment_note:
             self._log_session_message(session, result.environment_note)
         if result.error_message:
-            self._log_session_message(session, f"本轮结束归因失败：{result.error_message}")
+            self._log_session_message(session, f"历史交易结算失败：{result.error_message}")
             return
         if result.ledger_record is None:
             return
@@ -8224,7 +8231,10 @@ class UiStrategySessionsMixin:
             if new_stop is not None:
                 trade.current_stop_price = new_stop
             return
-        if "本轮持仓已结束，继续监控下一次信号。" in message:
+        if (
+            "本轮持仓已结束，继续监控下一次信号。" in message
+            or "仓位关闭已确认" in message
+        ):
             trade = session.active_trade
             if trade is None or trade.reconciliation_started:
                 return
@@ -9521,6 +9531,7 @@ class UiStrategySessionsMixin:
             "未再检测到策略持仓，视为本轮 OKX 托管持仓已结束。",
             "推断该止损已触发，结束 OKX 动态止损监控。",
             "本轮持仓已结束，继续监控下一次信号。",
+            "仓位关闭已确认",
             "本次本地止盈止损流程已结束。",
         )
         return any(marker in text for marker in terminal_markers)
@@ -9709,7 +9720,10 @@ class UiStrategySessionsMixin:
                 self._clear_session_manual_management_state(session)
                 session.active_trade = None
             return
-        if "本轮持仓已结束，继续监控下一次信号。" in message:
+        if (
+            "本轮持仓已结束，继续监控下一次信号。" in message
+            or "仓位关闭已确认" in message
+        ):
             trade = session.active_trade
             if trade is None or trade.reconciliation_started:
                 return
