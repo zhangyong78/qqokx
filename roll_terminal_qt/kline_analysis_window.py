@@ -5,14 +5,14 @@ import math
 import os
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Callable
 from uuid import uuid4
 
 from PySide6.QtCore import QDateTime, QMargins, QObject, QPointF, QRectF, QTimer, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QAction, QColor, QPainter, QPen
 try:
     from PySide6.QtCharts import QCandlestickSeries, QCandlestickSet, QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
 except Exception:  # pragma: no cover - fallback for environments without QtCharts
@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -52,12 +53,16 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from okx_quant.candle_cache import load_candle_cache
+from okx_quant.analysis import ChannelDetectionConfig
 from okx_quant.analysis.box_detector import BoxDetectionConfig, detect_boxes
+from okx_quant.strategy_live_chart import build_auto_channel_live_chart_snapshot
 from okx_quant.deribit_client import DeribitRestClient, DeribitVolatilityCandle
 from okx_quant.models import Candle
+from okx_quant.okx_candle_ws import CandleStreamKey
 from okx_quant.deribit_volatility_ui import (
     DERIBIT_BASE_HOURLY_RESOLUTION,
     DERIBIT_FULL_HISTORY_START_TS,
@@ -92,6 +97,7 @@ from roll_terminal_qt.line_trading_core import (
     rr_annotation_to_payload,
 )
 from roll_terminal_qt.kline_box_rules import AUTO_BOX_MAX_CANDIDATES, is_auto_box_candidate_valid
+from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.kline_alerts import (
     build_workspace_key,
     evaluate_workspace_alerts,
@@ -102,6 +108,7 @@ from roll_terminal_qt.kline_alerts import (
 from roll_terminal_qt.kline_account_drawer import KlineAccountDrawer
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
 from roll_terminal_qt.runtime import load_runtime, profile_names
+from roll_terminal_qt.workspace_shell import LocalTaskCount, merge_local_task_counts
 
 
 _INITIAL_WINDOW_LOAD_DELAY_MS = 80
@@ -2232,6 +2239,47 @@ def _build_box_current_overlay(candles: list[Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _build_channel_current_overlays(
+    candles: list[Any],
+    *,
+    config: ChannelDetectionConfig | None = None,
+) -> list[dict[str, Any]]:
+    """Reuse the research module's channel detector as a K-line chart layer."""
+    if len(candles) < 12:
+        return []
+    snapshot = build_auto_channel_live_chart_snapshot(
+        session_id="kline-auto-channel",
+        candles=list(candles),
+        channel_config=config,
+        max_channels=1,
+        max_boxes=0,
+        max_trendlines=0,
+        max_triangles=0,
+        show_pivots=False,
+    )
+    overlays: list[dict[str, Any]] = []
+    for item in snapshot.band_overlays:
+        start_index = int(item.start_index)
+        end_index = int(item.end_index)
+        if start_index < 0 or end_index < start_index:
+            continue
+        overlays.append(
+            {
+                "mode": "current",
+                "start_index": start_index,
+                "end_index": end_index,
+                "upper_start": float(item.upper_line.value_at(start_index)),
+                "upper_end": float(item.upper_line.value_at(end_index)),
+                "lower_start": float(item.lower_line.value_at(start_index)),
+                "lower_end": float(item.lower_line.value_at(end_index)),
+                "label": str(item.label or "自动通道"),
+                "outline": str(item.outline or "#2563eb"),
+                "fill": str(item.fill or "#dbeafe"),
+            }
+        )
+    return overlays
+
+
 def _extend_history_box_end_index(
     *,
     start_index: int,
@@ -2468,6 +2516,7 @@ class KlineChartPayload:
     box_overlays: list[dict[str, Any]]
     raw_candles: list[Any]
     stats: dict[str, Any]
+    channel_overlays: list[dict[str, Any]] = field(default_factory=list)
     alert_snapshot: KlineAlertSnapshot | None = None
 
 
@@ -2478,10 +2527,80 @@ class KlineAlertSnapshot:
     structure: dict[str, object]
 
 
+def _merge_realtime_candle_payload(payload: KlineChartPayload, candle: Candle) -> KlineChartPayload:
+    """Replace an open bar or append a new bar without loading history again."""
+    raw_candles = list(payload.raw_candles)
+    replacement_index = next((index for index, item in enumerate(raw_candles) if item.ts == candle.ts), None)
+    if replacement_index is None:
+        raw_candles.append(candle)
+        raw_candles.sort(key=lambda item: item.ts)
+    else:
+        raw_candles[replacement_index] = candle
+    limit = max(1, len(payload.raw_candles))
+    raw_candles = raw_candles[-limit:]
+    chart_candles = [
+        {
+            "time": _to_ms_seconds(item.ts),
+            "open": _to_float(item.open),
+            "high": _to_float(item.high),
+            "low": _to_float(item.low),
+            "close": _to_float(item.close),
+            "volume": _to_float(item.volume),
+        }
+        for item in raw_candles
+    ]
+    closes = [_to_float(item.close) for item in raw_candles]
+    times = [item["time"] for item in chart_candles]
+    ema15_values = _to_ema(closes, 15)
+    sma50_values = _to_sma(closes, 50)
+    ema55_values = _to_ema(closes, 55)
+    stats = dict(payload.stats)
+    stats.update({"returned": len(raw_candles), "end_ms": _to_ms_seconds(raw_candles[-1].ts)})
+    return KlineChartPayload(
+        candles=chart_candles,
+        ema_9=[{"time": times[index], "value": value} for index, value in enumerate(ema15_values)],
+        ema_21=[{"time": times[index], "value": value} for index, value in enumerate(sma50_values)],
+        ema_55=[{"time": times[index], "value": value} for index, value in enumerate(ema55_values)],
+        trend_indicator=payload.trend_indicator,
+        signal_markers=payload.signal_markers,
+        box_overlays=payload.box_overlays,
+        raw_candles=raw_candles,
+        stats=stats,
+        channel_overlays=payload.channel_overlays,
+        alert_snapshot=payload.alert_snapshot,
+    )
+
+
 def _slice_chart_payload_tail(payload: KlineChartPayload, count: int) -> KlineChartPayload:
     if count <= 0 or len(payload.candles) <= count:
         return payload
     offset = len(payload.candles) - count
+
+    def _slice_channel_overlay(item: dict[str, Any]) -> dict[str, Any] | None:
+        start_index = int(item.get("start_index", -1))
+        end_index = int(item.get("end_index", -1))
+        if start_index < 0 or end_index < start_index or end_index < offset:
+            return None
+        clipped_start = max(start_index, offset)
+        clipped_end = min(end_index, len(payload.candles) - 1)
+        if clipped_end < clipped_start:
+            return None
+        span = max(1, end_index - start_index)
+        result = dict(item, start_index=clipped_start - offset, end_index=clipped_end - offset)
+        for prefix in ("upper", "lower"):
+            start_price = float(item.get(f"{prefix}_start", 0.0) or 0.0)
+            end_price = float(item.get(f"{prefix}_end", 0.0) or 0.0)
+            result[f"{prefix}_start"] = start_price + (end_price - start_price) * ((clipped_start - start_index) / span)
+            result[f"{prefix}_end"] = start_price + (end_price - start_price) * ((clipped_end - start_index) / span)
+        return result
+
+    channel_overlays = [
+        sliced
+        for item in payload.channel_overlays
+        if isinstance(item, dict)
+        for sliced in [_slice_channel_overlay(item)]
+        if sliced is not None
+    ]
     return KlineChartPayload(
         candles=payload.candles[-count:],
         ema_9=payload.ema_9[-count:],
@@ -2504,6 +2623,7 @@ def _slice_chart_payload_tail(payload: KlineChartPayload, count: int) -> KlineCh
         ],
         raw_candles=payload.raw_candles[-count:],
         stats=payload.stats,
+        channel_overlays=channel_overlays,
         alert_snapshot=payload.alert_snapshot,
     )
 
@@ -2576,6 +2696,20 @@ def _reverse_kline_chart_payload(payload: KlineChartPayload) -> KlineChartPayloa
             }
         )
 
+    reversed_channels: list[dict[str, Any]] = []
+    for item in payload.channel_overlays:
+        if not isinstance(item, dict):
+            continue
+        reversed_channels.append(
+            {
+                **item,
+                "upper_start": _reverse_kline_price(float(item.get("lower_start", 0.0) or 0.0), anchor_price),
+                "upper_end": _reverse_kline_price(float(item.get("lower_end", 0.0) or 0.0), anchor_price),
+                "lower_start": _reverse_kline_price(float(item.get("upper_start", 0.0) or 0.0), anchor_price),
+                "lower_end": _reverse_kline_price(float(item.get("upper_end", 0.0) or 0.0), anchor_price),
+            }
+        )
+
     reversed_stats = dict(payload.stats)
     reversed_stats["reverse_kline"] = True
     reversed_stats["reverse_anchor_price"] = anchor_price
@@ -2590,6 +2724,7 @@ def _reverse_kline_chart_payload(payload: KlineChartPayload) -> KlineChartPayloa
         box_overlays=reversed_boxes,
         raw_candles=list(payload.raw_candles),
         stats=reversed_stats,
+        channel_overlays=reversed_channels,
         alert_snapshot=payload.alert_snapshot,
     )
 
@@ -2628,6 +2763,7 @@ if QChartView is not None:
             self._workspace_rr_items: list[dict[str, object]] = []
             self._signal_markers: list[dict[str, Any]] = []
             self._box_overlays: list[dict[str, Any]] = []
+            self._channel_overlays: list[dict[str, Any]] = []
             self._selected_workspace_line_index = -1
             self._selected_workspace_rr_index = -1
             self._hovered_workspace_line_index = -1
@@ -2751,6 +2887,7 @@ if QChartView is not None:
             trend_indicators: list[dict[str, Any]] | None = None,
             signal_markers: list[dict[str, Any]] | None = None,
             box_overlays: list[dict[str, Any]] | None = None,
+            channel_overlays: list[dict[str, Any]] | None = None,
             selected_workspace_line_index: int = -1,
             selected_workspace_rr_index: int = -1,
             hovered_workspace_line_index: int = -1,
@@ -2772,6 +2909,7 @@ if QChartView is not None:
             self._workspace_rr_items = [dict(item) for item in (workspace_rr_items or []) if isinstance(item, dict)]
             self._signal_markers = [dict(item) for item in (signal_markers or []) if isinstance(item, dict)]
             self._box_overlays = [dict(item) for item in (box_overlays or []) if isinstance(item, dict)]
+            self._channel_overlays = [dict(item) for item in (channel_overlays or []) if isinstance(item, dict)]
             self._selected_workspace_line_index = int(selected_workspace_line_index)
             self._selected_workspace_rr_index = int(selected_workspace_rr_index)
             self._hovered_workspace_line_index = int(hovered_workspace_line_index)
@@ -2811,6 +2949,7 @@ if QChartView is not None:
             self._workspace_rr_items = []
             self._signal_markers = []
             self._box_overlays = []
+            self._channel_overlays = []
             self._selected_workspace_rr_index = -1
             self._preview_rr_item = None
             self._hover_pos = None
@@ -2985,6 +3124,7 @@ if QChartView is not None:
                 painter = QPainter(self.viewport())
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                 self._draw_volume_overlay(painter, plot_area)
+                self._draw_channel_overlays(painter, plot_area)
                 self._draw_box_overlays(painter, plot_area)
                 self._draw_workspace_rr_items(painter, plot_area)
                 self._draw_preview_rr_item(painter, plot_area)
@@ -3507,6 +3647,35 @@ if QChartView is not None:
                     text_y = y_pos + 4.0 if stack_down else y_pos - 6.0
                     painter.setPen(color)
                     painter.drawText(QPointF(text_x, text_y), label)
+
+        def _draw_channel_overlays(self, painter: QPainter, plot_area: QRectF) -> None:
+            if not self._channel_overlays or not self._candles:
+                return
+            left_index, right_index = self._visible_index_range()
+            for overlay in self._channel_overlays:
+                start_index = int(overlay.get("start_index", -1))
+                end_index = int(overlay.get("end_index", -1))
+                if start_index < 0 or end_index < start_index or end_index < left_index or start_index > right_index:
+                    continue
+                span = max(1, end_index - start_index)
+
+                def _price_at(prefix: str, index: int) -> float:
+                    start = float(overlay.get(f"{prefix}_start", 0.0) or 0.0)
+                    end = float(overlay.get(f"{prefix}_end", 0.0) or 0.0)
+                    return start + (end - start) * ((index - start_index) / span)
+
+                visible_start = max(left_index, start_index)
+                visible_end = min(right_index, end_index)
+                outline = QColor(str(overlay.get("outline", "#2563eb")))
+                outline.setAlpha(230)
+                pen = QPen(outline, 2)
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                for prefix in ("upper", "lower"):
+                    painter.drawLine(
+                        QPointF(self._x_for_index(visible_start, plot_area), self._y_for_value(_price_at(prefix, visible_start), plot_area)),
+                        QPointF(self._x_for_index(visible_end, plot_area), self._y_for_value(_price_at(prefix, visible_end), plot_area)),
+                    )
 
         def _draw_box_overlays(self, painter: QPainter, plot_area: QRectF) -> None:
             if not self._box_overlays or not self._candles:
@@ -4195,6 +4364,16 @@ class KlineDataLoader(QThread):
         )
         box_overlays = list(_build_box_history_overlays(list(candles)))
         box_overlays.extend(_build_box_current_overlay(list(candles)))
+        visuals = self._workspace_entry.get("visuals", {})
+        show_auto_channel = bool(visuals.get("auto_channel_visible", False)) if isinstance(visuals, dict) else False
+        channel_settings = self._workspace_entry.get("auto_channel", {})
+        channel_settings = channel_settings if isinstance(channel_settings, dict) else {}
+        channel_config = ChannelDetectionConfig(
+            min_anchor_distance=max(1, int(channel_settings.get("anchor_distance", 8) or 8)),
+            min_channel_bars=max(2, int(channel_settings.get("min_bars", 18) or 18)),
+            max_violations=max(0, int(channel_settings.get("max_violations", 8) or 8)),
+        )
+        channel_overlays = _build_channel_current_overlays(list(candles), config=channel_config) if show_auto_channel else []
 
         alert_snapshot = None
         if include_alerts:
@@ -4221,6 +4400,7 @@ class KlineDataLoader(QThread):
             box_overlays=box_overlays,
             raw_candles=list(candles),
             stats=stats,
+            channel_overlays=channel_overlays,
             alert_snapshot=alert_snapshot,
         )
 
@@ -4512,11 +4692,17 @@ class RRTradeExecutionThread(QThread):
 
 
 class KlineAnalysisWindow(QMainWindow):
-    def __init__(self) -> None:
+    _realtime_candle_received = Signal(object)
+
+    def __init__(self, *, embedded: bool = False) -> None:
         super().__init__()
         _debug_log("[kline] __init__ begin")
-        self.setWindowTitle("K线分析")
-        self.resize(1680, 980)
+        self._embedded = bool(embedded)
+        if self._embedded:
+            self.setWindowFlags(Qt.WindowType.Widget)
+        else:
+            self.setWindowTitle("K线分析")
+            self.resize(1680, 980)
 
         self._request_id = 0
         self._active_request_id = 0
@@ -4573,6 +4759,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._deferred_chart_request_id = 0
         self._body_splitter: QSplitter | None = None
         self._chart_account_splitter: QSplitter | None = None
+        self._chart_host: QWidget | None = None
         self._control_panel: QFrame | None = None
         self._control_scroll: QScrollArea | None = None
         self._account_drawer: KlineAccountDrawer | None = None
@@ -4586,11 +4773,15 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_chart_status_text = ""
         self._runtime = load_runtime("moni") or load_runtime()
         self._market_client = OkxRestClient()
+        self._realtime_candle_key: CandleStreamKey | None = None
+        self._realtime_candle_unsubscribe: Callable[[], None] | None = None
+        self._realtime_candle_received.connect(self._apply_realtime_candle)
         self._instrument_cache: dict[str, object | None] = {}
         self._rr_trade_ledger_snapshot = load_kline_rr_trade_ledger_snapshot()
         self._rr_trade_execution_service = RRTradeExecutionService()
         self._rr_execution_thread: QThread | None = None
         self._rr_execution_in_flight = False
+        self._rr_monitor_cursor = 0
         self._pending_rr_execution_requests: list[dict[str, object]] = []
         self._line_trade_execution_queue: list[RRTradePlan] = []
         self._suppress_api_profile_change = False
@@ -4641,6 +4832,95 @@ class KlineAnalysisWindow(QMainWindow):
         self._set_status("窗口已就绪，正在加载首屏图表...")
         QTimer.singleShot(_INITIAL_WINDOW_LOAD_DELAY_MS, self._load_data)
 
+    def set_page_active(self, active: bool) -> None:
+        if not active:
+            self._refresh_timer.stop()
+            return
+        if self._auto_refresh_btn.isChecked():
+            self._refresh_timer.start()
+        if self._pending_payload is not None and self._page_ready:
+            self._render_loaded_payload(self._pending_payload)
+
+    def workspace_profile_name(self) -> str:
+        return self._active_profile_name()
+
+    def apply_workspace_profile(self, profile_name: str) -> None:
+        target = profile_name.strip()
+        if not target or target == self._last_profile_name:
+            return
+        runtime = load_runtime(target)
+        if runtime is None:
+            return
+        self._runtime = runtime
+        self._last_profile_name = target
+        self._sync_account_context()
+        self._sync_account_drawer_context()
+        self._load_data()
+
+    def pattern_signals_enabled(self) -> bool:
+        return any(
+            checkbox.isChecked()
+            for checkbox in (
+                self._show_1h_shape_signal_check,
+                self._show_4h_shape_signal_check,
+                self._show_1d_shape_signal_check,
+            )
+        )
+
+    def _refresh_compact_shape_button(self, *_args: object) -> None:
+        if hasattr(self, "_shape_settings_button"):
+            self._shape_settings_button.setText("形态：开" if self.pattern_signals_enabled() else "形态：关")
+
+    def begin_shutdown(self, callback: Callable[[], None] | None = None) -> None:
+        self._refresh_timer.stop()
+        self._rr_monitor_timer.stop()
+        if self._realtime_candle_unsubscribe is not None:
+            try:
+                self._realtime_candle_unsubscribe()
+            except Exception:
+                pass
+            self._realtime_candle_unsubscribe = None
+        if callback is not None:
+            callback()
+
+    def local_task_summary(self) -> dict[str, int]:
+        counts = self.local_task_counts()
+        return {
+            "rr": sum(item.rr for item in counts),
+            "line_conditions": sum(item.line_conditions for item in counts),
+            "arbitrage": 0,
+        }
+
+    def local_task_counts(self) -> tuple[LocalTaskCount, ...]:
+        counts: list[LocalTaskCount] = []
+        for entry in self._monitorable_rr_trade_ledger_entries():
+            profile_name = str(entry.plan.profile_name or "").strip()
+            if profile_name:
+                counts.append(LocalTaskCount(profile_name, rr=1))
+        fallback_profile = self._active_profile_name()
+        for workspace_entry in self._workspace_entries.values():
+            if not isinstance(workspace_entry, dict):
+                continue
+            lines = workspace_entry.get("lines", [])
+            if not isinstance(lines, list):
+                continue
+            for line in lines:
+                if not isinstance(line, dict):
+                    continue
+                if not bool(line.get("enabled", True)) or not _rr_fee_offset_enabled(line.get("trade_enabled", False)):
+                    continue
+                profile_name = str(line.get("trade_profile_name", "") or "").strip() or fallback_profile
+                if profile_name:
+                    counts.append(LocalTaskCount(profile_name, line_conditions=1))
+        return merge_local_task_counts(counts)
+
+    def connection_snapshot(self) -> dict[str, object]:
+        return {
+            "public_online": self._realtime_candle_unsubscribe is not None or self._pending_payload is not None,
+            "private_online": False,
+            "private_status": "",
+        }
+
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
         self._schedule_chart_layout_refresh(80)
@@ -4669,11 +4949,15 @@ class KlineAnalysisWindow(QMainWindow):
         top_row.addWidget(self._symbol_input, 0)
 
         top_row.addSpacing(8)
-        top_row.addWidget(QLabel("API"))
+        self._api_profile_label = QLabel("API")
+        top_row.addWidget(self._api_profile_label)
         self._api_profile_combo = QComboBox()
         self._api_profile_combo.setMinimumWidth(110)
         self._api_profile_combo.currentIndexChanged.connect(lambda _index: self._on_api_profile_changed())
         top_row.addWidget(self._api_profile_combo, 0)
+        if self._embedded:
+            self._api_profile_label.hide()
+            self._api_profile_combo.hide()
 
         self._account_context = QLabel("")
         self._account_context.setObjectName("Subtle")
@@ -4741,6 +5025,7 @@ class KlineAnalysisWindow(QMainWindow):
             "勾选碰均线后，核心K还需触碰对应均线；1H 只参考 SMA50，4H/1D 参考 EMA15 或 MA50。"
         )
         shape_group = QFrame()
+        self._shape_signal_group = shape_group
         shape_group.setObjectName("ToolbarGroup")
         shape_group.setStyleSheet(
             """
@@ -4759,19 +5044,19 @@ class KlineAnalysisWindow(QMainWindow):
         shape_group_layout.addWidget(shape_label)
 
         self._show_1h_shape_signal_check = QCheckBox("1H")
-        self._show_1h_shape_signal_check.setChecked(True)
+        self._show_1h_shape_signal_check.setChecked(False)
         self._show_1h_shape_signal_check.setToolTip(shape_signal_tooltip)
         self._show_1h_shape_signal_check.toggled.connect(self._sync_chart_options)
         shape_group_layout.addWidget(self._show_1h_shape_signal_check)
 
         self._show_4h_shape_signal_check = QCheckBox("4H")
-        self._show_4h_shape_signal_check.setChecked(True)
+        self._show_4h_shape_signal_check.setChecked(False)
         self._show_4h_shape_signal_check.setToolTip(shape_signal_tooltip)
         self._show_4h_shape_signal_check.toggled.connect(self._sync_chart_options)
         shape_group_layout.addWidget(self._show_4h_shape_signal_check)
 
         self._show_1d_shape_signal_check = QCheckBox("1D")
-        self._show_1d_shape_signal_check.setChecked(True)
+        self._show_1d_shape_signal_check.setChecked(False)
         self._show_1d_shape_signal_check.setToolTip(shape_signal_tooltip)
         self._show_1d_shape_signal_check.toggled.connect(self._sync_chart_options)
         shape_group_layout.addWidget(self._show_1d_shape_signal_check)
@@ -4787,6 +5072,30 @@ class KlineAnalysisWindow(QMainWindow):
         self._shape_signal_ma_touch_check.toggled.connect(self._sync_chart_options)
         shape_group_layout.addWidget(self._shape_signal_ma_touch_check)
         top_row.addWidget(shape_group, 0)
+
+        self._shape_settings_button = QPushButton("形态：关")
+        self._shape_settings_button.setToolTip(shape_signal_tooltip)
+        shape_menu = QMenu(self._shape_settings_button)
+        self._shape_setting_actions: dict[str, QAction] = {}
+        for label, checkbox in (
+            ("1H", self._show_1h_shape_signal_check),
+            ("4H", self._show_4h_shape_signal_check),
+            ("1D", self._show_1d_shape_signal_check),
+            ("碰均线", self._shape_signal_ma_touch_check),
+        ):
+            action = shape_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(checkbox.isChecked())
+            action.toggled.connect(checkbox.setChecked)
+            checkbox.toggled.connect(action.setChecked)
+            checkbox.toggled.connect(self._refresh_compact_shape_button)
+            self._shape_setting_actions[label] = action
+        self._shape_settings_button.setMenu(shape_menu)
+        top_row.addWidget(self._shape_settings_button, 0)
+        if self._embedded:
+            self._shape_signal_group.hide()
+        else:
+            self._shape_settings_button.hide()
 
         self._status = QLabel("就绪")
         self._status.setObjectName("Subtle")
@@ -4846,6 +5155,11 @@ class KlineAnalysisWindow(QMainWindow):
         self._reverse_kline_check.setToolTip("开启后，将当前主图及副图K线按价格镜像反转显示；波动率副图不参与反转。")
         self._reverse_kline_check.toggled.connect(self._load_data)
         action_row.addWidget(self._reverse_kline_check)
+
+        self._hide_chart_btn = QPushButton("隐藏图表")
+        self._hide_chart_btn.setCheckable(True)
+        self._hide_chart_btn.toggled.connect(self._toggle_chart_visibility)
+        action_row.addWidget(self._hide_chart_btn)
 
         self._orders_drawer_button = QPushButton("委托")
         self._orders_drawer_button.clicked.connect(lambda: self._show_account_drawer("orders"))
@@ -4931,14 +5245,55 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._box_breakout_alert_check = QCheckBox("自动箱体突破")
         self._box_breakout_alert_check.toggled.connect(self._save_workspace_settings)
-        self._box_breakout_alert_check.toggled.connect(self._sync_chart_options)
         control_layout.addWidget(self._box_breakout_alert_check)
 
-        self._live_box_check = QCheckBox("历史箱体")
-        self._live_box_check.setChecked(False)
-        self._live_box_check.toggled.connect(self._save_workspace_settings)
-        self._live_box_check.toggled.connect(self._sync_chart_options)
-        control_layout.addWidget(self._live_box_check)
+        control_layout.addWidget(QLabel("自动通道"))
+        self._auto_box_check = QCheckBox("显示自动箱体")
+        self._auto_box_check.setChecked(False)
+        self._auto_box_check.toggled.connect(self._save_workspace_settings)
+        self._auto_box_check.toggled.connect(self._sync_chart_options)
+        control_layout.addWidget(self._auto_box_check)
+
+        self._history_box_check = QCheckBox("显示历史箱体")
+        self._history_box_check.setChecked(False)
+        self._history_box_check.toggled.connect(self._save_workspace_settings)
+        self._history_box_check.toggled.connect(self._sync_chart_options)
+        control_layout.addWidget(self._history_box_check)
+        self._live_box_check = self._history_box_check
+
+        self._auto_channel_check = QCheckBox("显示通道")
+        self._auto_channel_check.setChecked(False)
+        self._auto_channel_check.toggled.connect(self._on_auto_channel_visibility_changed)
+        control_layout.addWidget(self._auto_channel_check)
+
+        self._auto_channel_settings_button = QPushButton("通道参数")
+        auto_channel_menu = QMenu(self._auto_channel_settings_button)
+        auto_channel_form = QWidget(auto_channel_menu)
+        auto_channel_layout = QFormLayout(auto_channel_form)
+        auto_channel_layout.setContentsMargins(8, 8, 8, 8)
+        self._auto_channel_anchor_spin = QSpinBox(auto_channel_form)
+        self._auto_channel_anchor_spin.setRange(1, 120)
+        self._auto_channel_anchor_spin.setValue(8)
+        self._auto_channel_min_bars_spin = QSpinBox(auto_channel_form)
+        self._auto_channel_min_bars_spin.setRange(2, 500)
+        self._auto_channel_min_bars_spin.setValue(18)
+        self._auto_channel_violations_spin = QSpinBox(auto_channel_form)
+        self._auto_channel_violations_spin.setRange(0, 120)
+        self._auto_channel_violations_spin.setValue(8)
+        auto_channel_layout.addRow("锚点间距", self._auto_channel_anchor_spin)
+        auto_channel_layout.addRow("最少 K", self._auto_channel_min_bars_spin)
+        auto_channel_layout.addRow("最大违规", self._auto_channel_violations_spin)
+        auto_channel_action = QWidgetAction(auto_channel_menu)
+        auto_channel_action.setDefaultWidget(auto_channel_form)
+        auto_channel_menu.addAction(auto_channel_action)
+        self._auto_channel_settings_button.setMenu(auto_channel_menu)
+        for spin in (
+            self._auto_channel_anchor_spin,
+            self._auto_channel_min_bars_spin,
+            self._auto_channel_violations_spin,
+        ):
+            spin.valueChanged.connect(self._on_auto_channel_parameters_changed)
+        control_layout.addWidget(self._auto_channel_settings_button)
 
         self._structure_hint = QLabel("")
         self._structure_hint.setObjectName("Subtle")
@@ -5132,6 +5487,7 @@ class KlineAnalysisWindow(QMainWindow):
         control_layout.addStretch(1)
 
         chart_host = QFrame()
+        self._chart_host = chart_host
         chart_host.setObjectName("Panel")
         chart_layout = QVBoxLayout(chart_host)
         chart_layout.setContentsMargins(8, 8, 8, 8)
@@ -5346,6 +5702,13 @@ class KlineAnalysisWindow(QMainWindow):
             return
         left_width, right_width = _default_kline_splitter_sizes(available_width)
         splitter.setSizes([left_width, right_width])
+
+    @Slot(bool)
+    def _toggle_chart_visibility(self, hidden: bool) -> None:
+        chart_host = self._chart_host
+        if chart_host is not None:
+            chart_host.setVisible(not hidden)
+        self._hide_chart_btn.setText("显示图表" if hidden else "隐藏图表")
 
     def _update_secondary_controls_state(self) -> None:
         enabled = bool(self._secondary_chart_check.isChecked())
@@ -5677,6 +6040,19 @@ class KlineAnalysisWindow(QMainWindow):
             return ""
         return str(getattr(self._runtime, "environment", "") or "").strip()
 
+    def _runtime_for_task_profile(self, profile_name: str):
+        target = profile_name.strip()
+        if not target:
+            return None
+        runtime = load_runtime(target)
+        if runtime is None:
+            return None
+        runtime_profile = str(getattr(runtime, "credential_profile_name", "") or "").strip()
+        if not runtime_profile:
+            credentials = getattr(runtime, "credentials", None)
+            runtime_profile = str(getattr(credentials, "profile_name", "") or "").strip()
+        return runtime if runtime_profile == target else None
+
     def _sync_account_context(self) -> None:
         profile_name = self._active_profile_name() or "-"
         environment = self._active_environment() or "-"
@@ -5744,21 +6120,11 @@ class KlineAnalysisWindow(QMainWindow):
         self._load_data()
 
     def _matching_rr_trade_ledger_entries(self, *, symbol: str | None = None) -> list[RRTradeLedgerEntry]:
-        snapshot = self._rr_trade_ledger_snapshot if isinstance(self._rr_trade_ledger_snapshot, dict) else {}
-        raw_entries = snapshot.get("entries", [])
-        if not isinstance(raw_entries, list):
-            return []
         target_symbol = (symbol or self._symbol_input.text()).strip().upper()
         target_profile = self._active_profile_name().strip()
         target_environment = self._active_environment().strip()
         matched: list[RRTradeLedgerEntry] = []
-        for item in raw_entries:
-            if not isinstance(item, dict):
-                continue
-            try:
-                entry = RRTradeLedgerEntry.from_dict(item)
-            except Exception:
-                continue
+        for entry in self._all_rr_trade_ledger_entries():
             plan = entry.plan
             if target_profile and plan.profile_name.strip() != target_profile:
                 continue
@@ -5768,6 +6134,37 @@ class KlineAnalysisWindow(QMainWindow):
                 continue
             matched.append(entry)
         return matched
+
+    def _all_rr_trade_ledger_entries(self) -> list[RRTradeLedgerEntry]:
+        snapshot = self._rr_trade_ledger_snapshot if isinstance(self._rr_trade_ledger_snapshot, dict) else {}
+        raw_entries = snapshot.get("entries", [])
+        if not isinstance(raw_entries, list):
+            return []
+        entries: list[RRTradeLedgerEntry] = []
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                continue
+            try:
+                entries.append(RRTradeLedgerEntry.from_dict(item))
+            except Exception:
+                continue
+        return entries
+
+    def _monitorable_rr_trade_ledger_entries(self) -> list[RRTradeLedgerEntry]:
+        return [
+            entry
+            for entry in self._all_rr_trade_ledger_entries()
+            if self._rr_trade_execution_service.should_monitor_status(entry.status)
+        ]
+
+    def _next_monitorable_rr_entry(self) -> RRTradeLedgerEntry | None:
+        entries = self._monitorable_rr_trade_ledger_entries()
+        if not entries:
+            self._rr_monitor_cursor = 0
+            return None
+        index = self._rr_monitor_cursor % len(entries)
+        self._rr_monitor_cursor = (index + 1) % len(entries)
+        return entries[index]
 
     def _refresh_rr_trade_hint(self, *, symbol: str | None = None) -> None:
         if not hasattr(self, "_rr_trade_hint"):
@@ -5788,6 +6185,7 @@ class KlineAnalysisWindow(QMainWindow):
             max(50, self._limit_spin.value()),
             bool(self._prefer_local_checkbox.isChecked()),
             bool(self._secondary_average_kline_check.isChecked()),
+            bool(getattr(self, "_auto_channel_check", None) and self._auto_channel_check.isChecked()),
             bool(self._reverse_kline_check.isChecked()),
         )
 
@@ -6088,9 +6486,91 @@ class KlineAnalysisWindow(QMainWindow):
                 if self._secondary_chart_check.isChecked() and self._secondary_pending_payload is not None and self._use_native_chart:
                     self._sync_secondary_chart_range_from_primary()
             self._apply_alert_snapshot(payload.alert_snapshot)
+            self._subscribe_realtime_candle()
             self._update_refresh_hint()
         except Exception as exc:
             self._set_status(f"数据处理异常：{exc}")
+
+    @Slot(object)
+    def _apply_realtime_candle(self, candle: object) -> None:
+        if not isinstance(candle, Candle) or self._pending_payload is None:
+            return
+        payload = _merge_realtime_candle_payload(self._pending_payload, candle)
+        self._pending_payload = payload
+        self._remember_payload_cache(self._primary_payload_cache, self._loaded_primary_request_key, payload)
+        self._apply_realtime_candle_to_chart(payload)
+
+    def _apply_realtime_candle_to_chart(self, payload: KlineChartPayload) -> None:
+        if self._use_native_chart:
+            self._apply_realtime_candle_to_native_chart(payload)
+            return
+        if not payload.candles:
+            return
+        latest = payload.candles[-1]
+        ema9 = payload.ema_9[-1] if payload.ema_9 else None
+        ema21 = payload.ema_21[-1] if payload.ema_21 else None
+        self._run_js(f"window.updateRealtimeCandle({json.dumps({'candle': latest, 'ema9': ema9, 'ema21': ema21})});")
+
+    def _apply_realtime_candle_to_native_chart(self, payload: KlineChartPayload) -> None:
+        if self._native_chart is None or not payload.candles or QCandlestickSeries is None or QCandlestickSet is None:
+            return
+        display_payload = self._display_payload_for_chart(payload, is_secondary=False)
+        if not display_payload.candles:
+            return
+        candle_values = display_payload.candles[-1]
+        display_times = _build_display_times_ms(display_payload.candles, self._period_combo.currentText().strip())
+        if not display_times:
+            return
+        candle_series = next((item for item in self._native_chart.series() if isinstance(item, QCandlestickSeries)), None)
+        if candle_series is None:
+            return
+        sets = candle_series.sets()
+        timestamp = float(display_times[-1])
+        if len(sets) == len(display_payload.candles):
+            candle_set = sets[-1]
+            candle_set.setOpen(float(candle_values["open"]))
+            candle_set.setHigh(float(candle_values["high"]))
+            candle_set.setLow(float(candle_values["low"]))
+            candle_set.setClose(float(candle_values["close"]))
+            candle_set.setTimestamp(timestamp)
+        elif len(sets) + 1 == len(display_payload.candles):
+            candle_series.append(QCandlestickSet(float(candle_values["open"]), float(candle_values["high"]), float(candle_values["low"]), float(candle_values["close"]), timestamp))
+        else:
+            return
+        latest_points = {"EMA 15": payload.ema_9[-1] if payload.ema_9 else None, "SMA 50": payload.ema_21[-1] if payload.ema_21 else None}
+        for series in self._native_chart.series():
+            if not isinstance(series, QLineSeries):
+                continue
+            point = latest_points.get(series.name())
+            if not isinstance(point, dict):
+                continue
+            value = float(point.get("value") or 0.0)
+            if series.count() == len(display_payload.candles):
+                series.replace(series.count() - 1, QPointF(timestamp, value))
+            elif series.count() + 1 == len(display_payload.candles):
+                series.append(timestamp, value)
+        if self._native_chart_view is not None:
+            self._native_chart_view.update()
+
+    def _subscribe_realtime_candle(self) -> None:
+        if self._pending_payload is None:
+            return
+        symbol = self._symbol_input.text().strip().upper()
+        period = self._period_combo.currentText().strip()
+        environment = str(getattr(self._runtime, "environment", "demo") or "demo")
+        key = CandleStreamKey(symbol, period, environment)
+        if key == self._realtime_candle_key:
+            return
+        if self._realtime_candle_unsubscribe is not None:
+            try:
+                self._realtime_candle_unsubscribe()
+            except Exception:
+                pass
+        self._realtime_candle_key = key
+        self._realtime_candle_unsubscribe = self._market_client.watch_candle(
+            key,
+            lambda candle, _confirmed: self._realtime_candle_received.emit(candle),
+        )
 
     @Slot(int, KlineChartPayload)
     def _on_secondary_data_loaded(self, request_id: int, payload: KlineChartPayload) -> None:
@@ -6299,6 +6779,7 @@ class KlineAnalysisWindow(QMainWindow):
             "trend": trend_payload,
             "signals": signal_markers,
             "boxes": self._visible_box_overlays(display_payload),
+            "channels": self._visible_channel_overlays(display_payload),
         }
         try:
             self._run_js(f"window.applyChartData({json.dumps(payload_map)});")
@@ -6414,9 +6895,8 @@ class KlineAnalysisWindow(QMainWindow):
         return filtered
 
     def _visible_box_overlays(self, payload: KlineChartPayload) -> list[dict[str, Any]]:
-        show_current = self._box_breakout_alert_check.isChecked()
-        show_history = getattr(self, "_live_box_check", None)
-        show_history = bool(show_history.isChecked()) if show_history is not None else False
+        show_current = bool(getattr(self, "_auto_box_check", None) and self._auto_box_check.isChecked())
+        show_history = bool(getattr(self, "_history_box_check", None) and self._history_box_check.isChecked())
         if not show_current and not show_history:
             return []
         visible: list[dict[str, Any]] = []
@@ -6430,6 +6910,11 @@ class KlineAnalysisWindow(QMainWindow):
                 continue
             visible.append(dict(item))
         return visible
+
+    def _visible_channel_overlays(self, payload: KlineChartPayload) -> list[dict[str, Any]]:
+        if not bool(getattr(self, "_auto_channel_check", None) and self._auto_channel_check.isChecked()):
+            return []
+        return [dict(item) for item in payload.channel_overlays if isinstance(item, dict)]
 
     def _render_loaded_payload(self, payload: KlineChartPayload) -> None:
         if not self._use_native_chart:
@@ -6636,7 +7121,12 @@ class KlineAnalysisWindow(QMainWindow):
             source_payload=payload,
         )
 
-    def _render_native_chart_target(
+    def _render_native_chart_target(self, **kwargs) -> None:  # noqa: ANN003
+        payload = kwargs["payload"]
+        with measure_ui_step("kline_full_render", candles=len(payload.candles)):
+            self._render_native_chart_target_impl(**kwargs)
+
+    def _render_native_chart_target_impl(
         self,
         *,
         chart: QChart,
@@ -6895,6 +7385,7 @@ class KlineAnalysisWindow(QMainWindow):
                     is_secondary=is_secondary,
                 ),
                 box_overlays=self._visible_box_overlays(payload),
+                channel_overlays=self._visible_channel_overlays(payload),
                 workspace_lines=workspace_lines if include_workspace_lines else [],
                 workspace_rr_items=workspace_rr_items if include_workspace_lines else [],
                 selected_workspace_line_index=self._selected_line_index if include_workspace_lines else -1,
@@ -6926,18 +7417,36 @@ class KlineAnalysisWindow(QMainWindow):
     def _reload_workspace_view(self, symbol: str | None = None, period: str | None = None) -> None:
         entry = self._workspace_entry(symbol=symbol, period=period)
         alerts = entry.get("alerts", {})
+        visuals = entry.get("visuals", {})
+        auto_channel = entry.get("auto_channel", {})
         ma_cross = alerts.get("ma_cross", {}) if isinstance(alerts, dict) else {}
         box_breakout = alerts.get("box_breakout", {}) if isinstance(alerts, dict) else {}
-        box_realtime = alerts.get("box_realtime", {}) if isinstance(alerts, dict) else {}
+        visuals = visuals if isinstance(visuals, dict) else {}
+        auto_channel = auto_channel if isinstance(auto_channel, dict) else {}
         self._ma_cross_alert_check.blockSignals(True)
         self._box_breakout_alert_check.blockSignals(True)
-        self._live_box_check.blockSignals(True)
+        self._auto_box_check.blockSignals(True)
+        self._history_box_check.blockSignals(True)
+        self._auto_channel_check.blockSignals(True)
+        self._auto_channel_anchor_spin.blockSignals(True)
+        self._auto_channel_min_bars_spin.blockSignals(True)
+        self._auto_channel_violations_spin.blockSignals(True)
         self._ma_cross_alert_check.setChecked(bool(ma_cross.get("enabled", True)))
         self._box_breakout_alert_check.setChecked(bool(box_breakout.get("enabled", False)))
-        self._live_box_check.setChecked(bool(box_realtime.get("enabled", False)))
+        self._auto_box_check.setChecked(bool(visuals.get("auto_box_visible", False)))
+        self._history_box_check.setChecked(bool(visuals.get("history_box_visible", False)))
+        self._auto_channel_check.setChecked(bool(visuals.get("auto_channel_visible", False)))
+        self._auto_channel_anchor_spin.setValue(int(auto_channel.get("anchor_distance", 8) or 8))
+        self._auto_channel_min_bars_spin.setValue(int(auto_channel.get("min_bars", 18) or 18))
+        self._auto_channel_violations_spin.setValue(int(auto_channel.get("max_violations", 8) or 8))
         self._ma_cross_alert_check.blockSignals(False)
         self._box_breakout_alert_check.blockSignals(False)
-        self._live_box_check.blockSignals(False)
+        self._auto_box_check.blockSignals(False)
+        self._history_box_check.blockSignals(False)
+        self._auto_channel_check.blockSignals(False)
+        self._auto_channel_anchor_spin.blockSignals(False)
+        self._auto_channel_min_bars_spin.blockSignals(False)
+        self._auto_channel_violations_spin.blockSignals(False)
         self._backend_hint.setText(
             "当前采用Qt绘图。支持：K线 | 成交量 | 形态显示 | 画线功能 | 历史箱体 | 历史仓位"
             if self._use_native_chart
@@ -6957,14 +7466,37 @@ class KlineAnalysisWindow(QMainWindow):
             entry["alerts"] = alerts
         ma_cross = alerts.get("ma_cross", {}) if isinstance(alerts.get("ma_cross"), dict) else {}
         box_breakout = alerts.get("box_breakout", {}) if isinstance(alerts.get("box_breakout"), dict) else {}
-        box_realtime = alerts.get("box_realtime", {}) if isinstance(alerts.get("box_realtime"), dict) else {}
+        visuals = entry.get("visuals", {})
+        if not isinstance(visuals, dict):
+            visuals = {}
+            entry["visuals"] = visuals
+        auto_channel = entry.get("auto_channel", {})
+        if not isinstance(auto_channel, dict):
+            auto_channel = {}
+            entry["auto_channel"] = auto_channel
         ma_cross["enabled"] = self._ma_cross_alert_check.isChecked()
         box_breakout["enabled"] = self._box_breakout_alert_check.isChecked()
-        box_realtime["enabled"] = self._live_box_check.isChecked()
+        visuals["auto_box_visible"] = self._auto_box_check.isChecked()
+        visuals["history_box_visible"] = self._history_box_check.isChecked()
+        visuals["auto_channel_visible"] = self._auto_channel_check.isChecked()
+        auto_channel["anchor_distance"] = self._auto_channel_anchor_spin.value()
+        auto_channel["min_bars"] = self._auto_channel_min_bars_spin.value()
+        auto_channel["max_violations"] = self._auto_channel_violations_spin.value()
         alerts["ma_cross"] = ma_cross
         alerts["box_breakout"] = box_breakout
-        alerts["box_realtime"] = box_realtime
         self._save_workspace_snapshot()
+
+    @Slot(bool)
+    def _on_auto_channel_visibility_changed(self, _enabled: bool) -> None:
+        self._save_workspace_settings()
+        self._sync_chart_options()
+        self._load_data()
+
+    @Slot(int)
+    def _on_auto_channel_parameters_changed(self, _value: int) -> None:
+        self._save_workspace_settings()
+        if self._auto_channel_check.isChecked():
+            self._load_data()
 
     def _populate_line_table(self, selected_index: int | None = None) -> None:
         entry = self._workspace_entry()
@@ -7304,31 +7836,33 @@ class KlineAnalysisWindow(QMainWindow):
             raise RuntimeError("线条触发事件缺少线条标识。")
         entry = self._workspace_entry()
         lines = entry.get("lines", [])
-        line = next(
+        line_record = next(
             (
-                dict(item)
+                item
                 for item in lines
                 if isinstance(item, dict) and str(item.get("id", "") or "").strip() == line_id
             ),
             None,
         )
-        if line is None:
+        if not isinstance(line_record, dict):
             raise RuntimeError("触发线条已不存在，未提交交易。")
+        line = dict(line_record)
         action = str(line.get("action", "notify") or "notify").strip().lower()
         if action not in {"long", "short"}:
             raise RuntimeError("线条动作不是做多或做空，未提交交易。")
         if not bool(line.get("enabled", True)) or not _rr_fee_offset_enabled(line.get("trade_enabled", False)):
             raise RuntimeError("线条交易未启用，未提交交易。")
-        runtime = self._runtime
-        if runtime is None:
-            raise RuntimeError("未加载可用 API，请先选择账户。")
         instrument = self._instrument_for_symbol()
         if instrument is None or str(getattr(instrument, "inst_type", "") or "").upper() != "SWAP":
             raise RuntimeError("第一阶段线条交易只支持永续合约（SWAP）。")
-        profile_name = self._active_profile_name()
-        environment = self._active_environment()
+        profile_name = str(line.get("trade_profile_name", "") or "").strip() or self._active_profile_name()
+        environment = str(line.get("trade_environment", "") or "").strip() or self._active_environment()
         if not profile_name or not environment:
             raise RuntimeError("当前 API 账户或环境无效。")
+        if not str(line.get("trade_profile_name", "") or "").strip():
+            line_record["trade_profile_name"] = profile_name
+            line_record["trade_environment"] = environment
+            self._save_workspace_snapshot()
         candle_time = int(event.get("candle_time", 0) or 0)
         if candle_time <= 0:
             raise RuntimeError("线条触发事件缺少 K 线时间。")
@@ -7388,7 +7922,7 @@ class KlineAnalysisWindow(QMainWindow):
         return plans
 
     def _find_rr_trade_ledger_entry(self, plan_id: str) -> RRTradeLedgerEntry | None:
-        for item in self._matching_rr_trade_ledger_entries():
+        for item in self._all_rr_trade_ledger_entries():
             if item.plan.plan_id == plan_id:
                 return item
         return None
@@ -7599,12 +8133,12 @@ class KlineAnalysisWindow(QMainWindow):
             return
         if not self._line_trade_execution_queue:
             return
-        runtime = self._runtime
-        if runtime is None:
-            self._line_trade_execution_queue.clear()
-            self._set_status("线条交易队列已清空：当前 API 不可用。")
-            return
         plan = self._line_trade_execution_queue.pop(0)
+        runtime = self._runtime_for_task_profile(plan.profile_name)
+        if runtime is None:
+            self._set_status(f"线条交易未提交：API {plan.profile_name} 不可用。")
+            self._start_next_line_trade_execution()
+            return
         if self._find_rr_trade_ledger_entry(plan.plan_id) is not None:
             self._start_next_line_trade_execution()
             return
@@ -7628,17 +8162,13 @@ class KlineAnalysisWindow(QMainWindow):
     def _monitor_active_rr_trades(self) -> None:
         if self._rr_execution_in_flight:
             return
-        runtime = self._runtime
+        entry = self._next_monitorable_rr_entry()
+        if entry is None:
+            return
+        runtime = self._runtime_for_task_profile(entry.plan.profile_name)
         if runtime is None:
+            self._set_status(f"RR 监控等待：API {entry.plan.profile_name} 不可用。")
             return
-        active_entries = [
-            entry
-            for entry in self._matching_rr_trade_ledger_entries()
-            if self._rr_trade_execution_service.should_monitor_status(entry.status)
-        ]
-        if not active_entries:
-            return
-        entry = active_entries[0]
         self._start_rr_execution_action(
             action=lambda: self._rr_trade_execution_service.reconcile(
                 client=OkxRestClient(),
@@ -7671,8 +8201,10 @@ class KlineAnalysisWindow(QMainWindow):
             if confirmed != QMessageBox.StandardButton.Yes:
                 self._set_status("已取消启用 RR 交易。")
                 return
-            runtime = self._runtime
-            assert runtime is not None
+            plan_profile = str(getattr(plan, "profile_name", "") or "").strip()
+            runtime = self._runtime_for_task_profile(plan_profile) if plan_profile else self._runtime
+            if runtime is None:
+                raise RuntimeError(f"API {plan.profile_name} 不可用。")
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"无法启用 RR 交易：{exc}")
             return
@@ -7699,8 +8231,11 @@ class KlineAnalysisWindow(QMainWindow):
             entry = self._rr_ledger_entry_for_item(payload)
             if entry is None:
                 raise RuntimeError("当前 RR 没有可取消的交易记录。")
-            runtime = self._runtime
-            assert runtime is not None
+            plan = getattr(entry, "plan", None)
+            plan_profile = str(getattr(plan, "profile_name", "") or "").strip()
+            runtime = self._runtime_for_task_profile(plan_profile) if plan_profile else self._runtime
+            if runtime is None:
+                raise RuntimeError(f"API {plan_profile or '-'} 不可用。")
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"无法取消 RR 交易：{exc}")
             return
@@ -8754,7 +9289,15 @@ class KlineAnalysisWindow(QMainWindow):
         item["trigger"] = str(self._line_trigger_combo.currentData())
         item["action"] = str(self._line_action_combo.currentData())
         item["enabled"] = self._line_enabled_check.isChecked()
-        item["trade_enabled"] = self._line_trade_enabled_check.isChecked()
+        was_trade_enabled = _rr_fee_offset_enabled(item.get("trade_enabled", False))
+        trade_enabled = self._line_trade_enabled_check.isChecked()
+        item["trade_enabled"] = trade_enabled
+        if trade_enabled and (not was_trade_enabled or not str(item.get("trade_profile_name", "") or "").strip()):
+            item["trade_profile_name"] = self._active_profile_name()
+            item["trade_environment"] = self._active_environment()
+        elif not trade_enabled:
+            item.pop("trade_profile_name", None)
+            item.pop("trade_environment", None)
         item["entry_execution_mode"] = str(self._line_trade_execution_mode_combo.currentData() or "limit")
         lines[self._selected_line_index] = item
         selected_index = self._selected_line_index
@@ -9067,6 +9610,7 @@ class KlineAnalysisWindow(QMainWindow):
                 let chart = null;
                 let candlestickSeries = null;
                 const lineSeries = { ema9: null, ema21: null };
+                let channelSeries = [];
                 let trendSeries = null;
                 let volumeSeries = null;
                 let trendByTime = {};
@@ -9205,6 +9749,39 @@ class KlineAnalysisWindow(QMainWindow):
                   }
                 }
 
+                function syncChannelSeries(channels, candles) {
+                  for (const series of channelSeries) {
+                    chart.removeSeries(series);
+                  }
+                  channelSeries = [];
+                  if (!Array.isArray(channels) || !Array.isArray(candles)) return;
+                  for (const item of channels) {
+                    const startIndex = Number(item?.start_index);
+                    const endIndex = Number(item?.end_index);
+                    const start = candles[startIndex];
+                    const end = candles[endIndex];
+                    if (!start || !end) continue;
+                    const color = typeof item?.outline === 'string' ? item.outline : '#2563eb';
+                    for (const side of ['upper', 'lower']) {
+                      const startValue = Number(item?.[`${side}_start`]);
+                      const endValue = Number(item?.[`${side}_end`]);
+                      if (!Number.isFinite(startValue) || !Number.isFinite(endValue)) continue;
+                      const series = chart.addLineSeries({
+                        color,
+                        lineWidth: 2,
+                        title: side === 'upper' ? '自动通道上轨' : '自动通道下轨',
+                        priceLineVisible: false,
+                        lastValueVisible: false,
+                      });
+                      series.setData([
+                        { time: Number(start.time), value: startValue },
+                        { time: Number(end.time), value: endValue },
+                      ]);
+                      channelSeries.push(series);
+                    }
+                  }
+                }
+
                 function syncTrendSeries(points, enabled) {
                   if (trendSeries) {
                     chart.removeSeries(trendSeries);
@@ -9331,12 +9908,35 @@ class KlineAnalysisWindow(QMainWindow):
                       safePayload.show?.ema21,
                       { color: '#58c66d', lineWidth: 3, title: 'SMA 50', priceLineVisible: false, lastValueVisible: false }
                     );
+                    syncChannelSeries(Array.isArray(safePayload.channels) ? safePayload.channels : [], candles);
                     applyChartViewMode(window.__chartViewMode || 'recent');
                   } catch (error) {
                     if (window.console && window.console.error) {
                       window.console.error('[applyChartData]', error);
                     }
                     handleChartWarning(`璧板娍鍥炬覆鏌撳紓甯革細${String(error)}`);
+                  }
+                }
+
+                function updateRealtimeCandle(payload) {
+                  try {
+                    if (!chart || !candlestickSeries || !payload || !payload.candle) return;
+                    const candle = payload.candle;
+                    const time = Number(candle.time) || 0;
+                    if (!time) return;
+                    const index = currentCandles.findIndex((item) => Number(item?.time) === time);
+                    if (index >= 0) currentCandles[index] = candle;
+                    else currentCandles.push(candle);
+                    candlestickSeries.update(candle);
+                    if (volumeSeries) {
+                      const color = candle.close >= candle.open ? 'rgba(34, 197, 94, 0.85)' : 'rgba(224, 79, 132, 0.85)';
+                      volumeSeries.update({ time, value: Number(candle.volume) || 0, color });
+                    }
+                    if (payload.ema9 && lineSeries.ema9) lineSeries.ema9.update(payload.ema9);
+                    if (payload.ema21 && lineSeries.ema21) lineSeries.ema21.update(payload.ema21);
+                    if (window.__chartViewMode === 'recent') applyChartViewMode('recent');
+                  } catch (error) {
+                    if (window.console && window.console.error) window.console.error('[updateRealtimeCandle]', error);
                   }
                 }
 

@@ -54,6 +54,7 @@ from okx_quant.strategy_live_chart import StrategyLiveChartSnapshot, build_auto_
 
 from roll_terminal_qt.formatting import fmt_decimal
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
+from roll_terminal_qt.workspace_shell import preferred_profile_name
 
 
 SOURCE_MODE_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -330,7 +331,12 @@ class AutoChannelWindow(QMainWindow):
         self._profile_combo.blockSignals(False)
         if self._profile_combo.count() <= 0:
             return
-        target = current or self._last_profile_name or selected_profile
+        target = preferred_profile_name(
+            list(self._profile_snapshots),
+            current=current,
+            last=self._last_profile_name,
+            selected=selected_profile,
+        )
         index = self._profile_combo.findData(target)
         if index < 0:
             index = 0

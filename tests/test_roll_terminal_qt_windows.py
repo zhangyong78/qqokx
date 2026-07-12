@@ -11,11 +11,12 @@ import textwrap
 import unittest
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from PySide6.QtCharts import QChart, QLineSeries, QValueAxis
 from PySide6.QtCore import QPointF, QThread, Qt
 from PySide6.QtWidgets import QDoubleSpinBox, QLabel, QMessageBox, QPushButton, QSizePolicy, QTabWidget, QWidget
+from okx_quant.analysis import ChannelDetectionConfig
 from okx_quant.models import Candle
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradeOrderLink, build_rr_trade_plan
@@ -44,6 +45,7 @@ from roll_terminal_qt.line_trading_core import LineAnnotation, RiskRewardAnnotat
 from roll_terminal_qt.profile_access import profile_requires_password
 from roll_terminal_qt.smart_order_window import _safe_text as smart_safe_text
 from roll_terminal_qt.option_strategy_window import CandlestickChartView
+from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.kline_account_drawer import AccountDrawerLoadThread
 from roll_terminal_qt.smart_order_window import (
     SMART_ORDER_COMPACT_ROOT_MARGINS,
@@ -65,6 +67,7 @@ from roll_terminal_qt.kline_analysis_window import (
     _apply_drag_to_line_rule,
     _build_box_history_overlays,
     _build_box_current_overlay,
+    _build_channel_current_overlays,
     _build_rr_overlay_snapshot,
     _extend_history_box_end_index,
     _build_display_times_ms,
@@ -77,6 +80,7 @@ from roll_terminal_qt.kline_analysis_window import (
     _line_handle_visual,
     _line_time_tolerance_seconds,
     _line_price_tolerance,
+    _merge_realtime_candle_payload,
     _next_secondary_chart_kind_button_text,
     _next_secondary_layout_button_text,
     _default_native_x_range_with_right_padding,
@@ -90,15 +94,624 @@ from roll_terminal_qt.kline_analysis_window import (
     _rr_plan_position_text,
     _resolve_interaction_cursor_mode,
     _resolve_candle_time_from_x_value,
+    _slice_chart_payload_tail,
     _to_sma,
     _bar_to_ms,
     _is_local_cache_stale,
 )
 import roll_terminal_qt.kline_analysis_window as kline_analysis_module
 from roll_terminal_qt.launcher import LauncherWindow
+from roll_terminal_qt.ui import RollTerminalWindow
+from roll_terminal_qt.workspace_shell import LocalTaskCount
 
 
 class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
+
+    def test_current_channel_overlay_reuses_research_snapshot_band(self) -> None:
+        class Line:
+            def __init__(self, value: str) -> None:
+                self._value = Decimal(value)
+
+            def value_at(self, index: int) -> Decimal:
+                return self._value
+
+        band = SimpleNamespace(
+            start_index=4,
+            end_index=9,
+            upper_line=Line("101"),
+            lower_line=Line("99"),
+            label="自动通道",
+            outline="#2563eb",
+            fill="#dbeafe",
+        )
+        candles = [Candle(index * 60_000, Decimal("100"), Decimal("102"), Decimal("98"), Decimal("100"), Decimal("1"), False) for index in range(12)]
+        config = ChannelDetectionConfig(min_anchor_distance=8, min_channel_bars=18, max_violations=8)
+
+        with patch(
+            "roll_terminal_qt.kline_analysis_window.build_auto_channel_live_chart_snapshot",
+            return_value=SimpleNamespace(band_overlays=(band,)),
+        ) as build_snapshot:
+            overlays = _build_channel_current_overlays(candles, config=config)
+
+        self.assertIs(build_snapshot.call_args.kwargs["channel_config"], config)
+        self.assertEqual(len(overlays), 1)
+        self.assertEqual(overlays[0]["mode"], "current")
+        self.assertEqual(overlays[0]["start_index"], 4)
+        self.assertEqual(overlays[0]["end_index"], 9)
+        self.assertEqual(overlays[0]["upper_start"], 101.0)
+        self.assertEqual(overlays[0]["lower_start"], 99.0)
+
+    def test_disabled_auto_channel_does_not_expose_channel_layer(self) -> None:
+        check = MagicMock()
+        check.isChecked.return_value = False
+        app = SimpleNamespace(_auto_channel_check=check)
+        payload = SimpleNamespace(channel_overlays=[{"label": "自动通道"}])
+
+        self.assertEqual(KlineAnalysisWindow._visible_channel_overlays(app, payload), [])
+
+    def test_kline_auto_channel_display_controls_default_to_disabled(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}):
+            window = KlineAnalysisWindow(embedded=True)
+            try:
+                self.assertFalse(window._auto_box_check.isChecked())
+                self.assertFalse(window._history_box_check.isChecked())
+                self.assertFalse(window._auto_channel_check.isChecked())
+                self.assertFalse(window._box_breakout_alert_check.isChecked())
+                self.assertEqual(window._auto_channel_anchor_spin.value(), 8)
+                self.assertEqual(window._auto_channel_min_bars_spin.value(), 18)
+                self.assertEqual(window._auto_channel_violations_spin.value(), 8)
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_slicing_chart_payload_rebases_channel_boundaries(self) -> None:
+        payload = KlineChartPayload(
+            candles=[{"time": index, "open": 1, "high": 2, "low": 0, "close": 1, "volume": 1} for index in range(6)],
+            ema_9=[], ema_21=[], ema_55=[], trend_indicator=[], signal_markers=[], box_overlays=[], raw_candles=[], stats={},
+            channel_overlays=[{
+                "start_index": 2, "end_index": 5,
+                "upper_start": 110.0, "upper_end": 140.0,
+                "lower_start": 90.0, "lower_end": 120.0,
+            }],
+        )
+
+        sliced = _slice_chart_payload_tail(payload, 3)
+
+        self.assertEqual(sliced.channel_overlays[0]["start_index"], 0)
+        self.assertEqual(sliced.channel_overlays[0]["upper_start"], 120.0)
+        self.assertEqual(sliced.channel_overlays[0]["lower_start"], 100.0)
+
+    def test_roll_workspace_profile_switch_preserves_bound_auto_runtime(self) -> None:
+        runtime_api1 = SimpleNamespace(credential_profile_name="api1")
+        runtime_api2 = SimpleNamespace(credential_profile_name="api2")
+        app = SimpleNamespace(
+            _runtime=runtime_api2,
+            _auto_enabled=True,
+            _auto_task_runtime=runtime_api1,
+            _last_profile_name="api1",
+            _unlocked_profiles=set(),
+            _apply_api_profile=MagicMock(),
+        )
+
+        RollTerminalWindow.apply_workspace_profile(app, "api2")
+
+        app._apply_api_profile.assert_called_once_with("api2")
+        self.assertIs(RollTerminalWindow._auto_execution_runtime(app), runtime_api1)
+        self.assertIs(app._auto_task_runtime, runtime_api1)
+
+    def test_roll_workspace_managed_hides_duplicate_api_controls(self) -> None:
+        app = SimpleNamespace(_api_label=MagicMock(), _api=MagicMock())
+
+        RollTerminalWindow.set_workspace_managed(app, True)
+
+        app._api_label.setVisible.assert_called_once_with(False)
+        app._api.setVisible.assert_called_once_with(False)
+
+    def test_launcher_groups_hidden_page_tasks_by_api(self) -> None:
+        header = MagicMock()
+        status_label = MagicMock()
+        app = SimpleNamespace(
+            _pages={
+                "kline": SimpleNamespace(
+                    local_task_counts=lambda: (LocalTaskCount("api1", rr=2),)
+                ),
+                "roll": SimpleNamespace(
+                    local_task_counts=lambda: (LocalTaskCount("api2", arbitrage=1),)
+                ),
+            },
+            _workspace_header=header,
+            _local_task_status=status_label,
+        )
+
+        LauncherWindow._refresh_local_task_status(app)
+
+        header.set_task_text.assert_called_once_with("api1：RR 2｜api2：套利 1")
+        status_label.setText.assert_called_once_with("api1：RR 2｜api2：套利 1")
+
+    def test_launcher_connection_status_distinguishes_public_and_private_state(self) -> None:
+        header = MagicMock()
+        app = SimpleNamespace(
+            _pages={
+                "kline": SimpleNamespace(
+                    connection_snapshot=lambda: {
+                        "public_online": True,
+                        "private_online": False,
+                        "private_status": "",
+                    }
+                ),
+                "account": SimpleNamespace(
+                    connection_snapshot=lambda: {
+                        "public_online": False,
+                        "private_online": False,
+                        "private_status": "账户未解锁",
+                    }
+                ),
+            },
+            _active_profile_name="api1",
+            _workspace_header=header,
+        )
+
+        LauncherWindow._refresh_workspace_connection_status(app)
+
+        header.set_connection_text.assert_called_once_with("● 行情在线 · 账户未解锁", False)
+
+    def test_kline_local_task_counts_group_bound_profiles(self) -> None:
+        app = SimpleNamespace(
+            _monitorable_rr_trade_ledger_entries=lambda: [
+                SimpleNamespace(plan=SimpleNamespace(profile_name="api1")),
+                SimpleNamespace(plan=SimpleNamespace(profile_name="api2")),
+            ],
+            _workspace_entries={
+                "BTC-USDT-SWAP|4H": {
+                    "lines": [
+                        {"enabled": True, "trade_enabled": True, "trade_profile_name": "api1"},
+                        {"enabled": True, "trade_enabled": False, "trade_profile_name": "api2"},
+                    ]
+                },
+                "ETH-USDT-SWAP|1H": {
+                    "lines": [
+                        {"enabled": True, "trade_enabled": True, "trade_profile_name": "api2"},
+                    ]
+                },
+            },
+            _active_profile_name=lambda: "api2",
+        )
+
+        counts = KlineAnalysisWindow.local_task_counts(app)
+
+        self.assertEqual(
+            counts,
+            (
+                LocalTaskCount("api1", rr=1, line_conditions=1),
+                LocalTaskCount("api2", rr=1, line_conditions=1),
+            ),
+        )
+
+    def test_launcher_opens_kline_by_default_and_lazily_constructs_account(self) -> None:
+        class Home(QWidget):
+            def begin_shutdown(self, callback):  # noqa: ANN001
+                callback()
+
+            def refresh_view(self) -> None:
+                return
+
+        class Kline(QWidget):
+            def __init__(self, *, embedded: bool = False) -> None:
+                super().__init__()
+                self.embedded = embedded
+
+            def set_page_active(self, active: bool) -> None:
+                return
+
+        home_factory = MagicMock(side_effect=Home)
+        with (
+            patch("roll_terminal_qt.launcher.AccountPositionsHomeWidget", home_factory),
+            patch("roll_terminal_qt.launcher.KlineAnalysisWindow", Kline),
+        ):
+            launcher = LauncherWindow()
+            try:
+                self.assertEqual(launcher.current_page_key(), "kline")
+                self.assertIsInstance(launcher._page_stack.currentWidget(), Kline)
+                self.assertEqual(launcher._pages.keys(), {"kline"})
+                home_factory.assert_not_called()
+
+                launcher.show_page("account")
+
+                home_factory.assert_called_once()
+                self.assertEqual(launcher.current_page_key(), "account")
+                self.assertEqual(launcher._child_windows, [])
+            finally:
+                self.__class__.dispose_widget(launcher)
+
+    def test_launcher_global_profile_change_updates_loaded_pages_once(self) -> None:
+        class ProfilePage(QWidget):
+            def __init__(self, *args, embedded: bool = False, **kwargs) -> None:  # noqa: ANN002, ANN003
+                super().__init__()
+                self.applied_profiles: list[str] = []
+
+            def apply_workspace_profile(self, profile_name: str) -> None:
+                self.applied_profiles.append(profile_name)
+
+            def begin_shutdown(self, callback=None) -> None:  # noqa: ANN001
+                if callback is not None:
+                    callback()
+
+            def refresh_view(self) -> None:
+                return
+
+        runtimes = {
+            "api1": SimpleNamespace(credential_profile_name="api1", environment="demo"),
+            "api2": SimpleNamespace(credential_profile_name="api2", environment="live"),
+        }
+        with (
+            patch("roll_terminal_qt.launcher.AccountPositionsHomeWidget", ProfilePage),
+            patch("roll_terminal_qt.launcher.KlineAnalysisWindow", ProfilePage),
+            patch(
+                "roll_terminal_qt.launcher.load_profile_snapshots",
+                return_value=({"api1": {}, "api2": {}}, "api1"),
+                create=True,
+            ),
+            patch(
+                "roll_terminal_qt.launcher.load_runtime",
+                side_effect=lambda name=None: runtimes[name or "api1"],
+                create=True,
+            ),
+            patch("roll_terminal_qt.launcher.ensure_profile_unlocked", return_value=True, create=True) as unlock,
+        ):
+            launcher = LauncherWindow()
+            try:
+                launcher.show_page("account")
+
+                launcher._request_workspace_profile("api2")
+
+                self.assertEqual(launcher.active_profile_name(), "api2")
+                self.assertEqual(launcher._workspace_header.profile_combo.currentText(), "api2")
+                self.assertEqual(launcher._workspace_header.environment_label.text(), "实盘")
+                self.assertEqual(launcher._pages["kline"].applied_profiles[-1], "api2")
+                self.assertEqual(launcher._pages["account"].applied_profiles[-1], "api2")
+                unlock.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(launcher)
+
+    def test_launcher_rejected_global_profile_change_restores_previous_selection(self) -> None:
+        class Kline(QWidget):
+            def __init__(self, *, embedded: bool = False) -> None:
+                super().__init__()
+
+            def begin_shutdown(self, callback=None) -> None:  # noqa: ANN001
+                if callback is not None:
+                    callback()
+
+        runtime = SimpleNamespace(credential_profile_name="api1", environment="demo")
+        with (
+            patch("roll_terminal_qt.launcher.KlineAnalysisWindow", Kline),
+            patch(
+                "roll_terminal_qt.launcher.load_profile_snapshots",
+                return_value=({"api1": {}, "api2": {}}, "api1"),
+                create=True,
+            ),
+            patch("roll_terminal_qt.launcher.load_runtime", return_value=runtime, create=True),
+            patch("roll_terminal_qt.launcher.ensure_profile_unlocked", return_value=False, create=True),
+        ):
+            launcher = LauncherWindow()
+            try:
+                launcher._workspace_header.profile_combo.setCurrentText("api2")
+
+                self.assertEqual(launcher.active_profile_name(), "api1")
+                self.assertEqual(launcher._workspace_header.profile_combo.currentText(), "api1")
+            finally:
+                self.__class__.dispose_widget(launcher)
+
+    def test_launcher_defaults_to_moni_even_when_saved_profile_is_different(self) -> None:
+        class Kline(QWidget):
+            def __init__(self, *, embedded: bool = False) -> None:
+                super().__init__()
+
+            def apply_workspace_profile(self, profile_name: str) -> None:
+                self.profile_name = profile_name
+
+        runtimes = {
+            "moni": SimpleNamespace(credential_profile_name="moni", environment="demo"),
+            "api2": SimpleNamespace(credential_profile_name="api2", environment="live"),
+        }
+        with (
+            patch("roll_terminal_qt.launcher.KlineAnalysisWindow", Kline),
+            patch(
+                "roll_terminal_qt.launcher.load_profile_snapshots",
+                return_value=({"api2": {}, "moni": {}}, "api2"),
+            ),
+            patch("roll_terminal_qt.launcher.load_runtime", side_effect=lambda name=None: runtimes[name or "api2"]),
+        ):
+            launcher = LauncherWindow()
+            try:
+                self.assertEqual(launcher.active_profile_name(), "moni")
+                self.assertEqual(launcher._workspace_header.profile_combo.currentText(), "moni")
+                self.assertEqual(launcher._pages["kline"].profile_name, "moni")
+            finally:
+                self.__class__.dispose_widget(launcher)
+
+    def test_launcher_global_header_returns_to_account_home(self) -> None:
+        class Home(QWidget):
+            def begin_shutdown(self, callback):  # noqa: ANN001
+                callback()
+
+            def refresh_view(self) -> None:
+                return
+
+        class Kline(QWidget):
+            def __init__(self, *, embedded: bool = False) -> None:
+                super().__init__()
+
+            def set_page_active(self, active: bool) -> None:
+                return
+
+        with (
+            patch("roll_terminal_qt.launcher.AccountPositionsHomeWidget", Home),
+            patch("roll_terminal_qt.launcher.KlineAnalysisWindow", Kline),
+        ):
+            launcher = LauncherWindow()
+            try:
+                launcher._workspace_header.action("page:account").trigger()
+
+                self.assertEqual(launcher._active_page_key, "account")
+                self.assertIs(launcher._page_stack.currentWidget(), launcher._home_widget)
+            finally:
+                self.__class__.dispose_widget(launcher)
+
+    def test_launcher_kline_navigation_keeps_one_persistent_embedded_page(self) -> None:
+        class Home(QWidget):
+            def begin_shutdown(self, callback):  # noqa: ANN001
+                callback()
+
+            def refresh_view(self) -> None:
+                return
+
+        class Kline(QWidget):
+            def __init__(self, *, embedded: bool = False) -> None:
+                super().__init__()
+                self.embedded = embedded
+                self.page_active: list[bool] = []
+
+            def set_page_active(self, active: bool) -> None:
+                self.page_active.append(active)
+
+        with (
+            patch("roll_terminal_qt.launcher.AccountPositionsHomeWidget", Home),
+            patch("roll_terminal_qt.launcher.KlineAnalysisWindow", Kline),
+        ):
+            launcher = LauncherWindow()
+            try:
+                launcher.show_page("kline")
+                first = launcher._pages["kline"]
+                launcher.show_page("account")
+                launcher.show_page("kline")
+
+                self.assertIs(launcher._pages["kline"], first)
+                self.assertIs(first.parent(), launcher._page_stack)
+                self.assertEqual(launcher._child_windows, [])
+                self.assertTrue(first.embedded)
+            finally:
+                self.__class__.dispose_widget(launcher)
+
+    def test_launcher_roll_navigation_embeds_persistent_page(self) -> None:
+        class Home(QWidget):
+            def begin_shutdown(self, callback):  # noqa: ANN001
+                callback()
+
+            def refresh_view(self) -> None:
+                return
+
+        class Roll(QWidget):
+            pass
+
+        with (
+            patch("roll_terminal_qt.launcher.AccountPositionsHomeWidget", Home),
+            patch("roll_terminal_qt.launcher.RollTerminalWindow", Roll),
+        ):
+            launcher = LauncherWindow()
+            try:
+                launcher.show_page("roll")
+                first = launcher._pages["roll"]
+                launcher.show_page("account")
+                launcher.show_page("roll")
+
+                self.assertIs(launcher._pages["roll"], first)
+                self.assertIs(first.parent(), launcher._page_stack)
+                self.assertEqual(launcher._child_windows, [])
+            finally:
+                self.__class__.dispose_widget(launcher)
+
+    def test_close_warns_when_embedded_kline_has_local_tasks(self) -> None:
+        class Home(QWidget):
+            def begin_shutdown(self, callback):  # noqa: ANN001
+                callback()
+
+            def refresh_view(self) -> None:
+                return
+
+        class Kline(QWidget):
+            def __init__(self, *, embedded: bool = False) -> None:
+                super().__init__()
+
+            @staticmethod
+            def local_task_summary():
+                return {"rr": 1, "line_conditions": 0, "arbitrage": 0}
+
+        with (
+            patch("roll_terminal_qt.launcher.AccountPositionsHomeWidget", Home),
+            patch("roll_terminal_qt.launcher.KlineAnalysisWindow", Kline),
+            patch("roll_terminal_qt.launcher.QMessageBox.question", return_value=QMessageBox.StandardButton.No),
+        ):
+            launcher = LauncherWindow()
+            try:
+                launcher.show_page("kline")
+                launcher.close()
+                self.assertFalse(launcher._shutdown_in_progress)
+            finally:
+                self.__class__.dispose_widget(launcher)
+
+    def test_launcher_shows_embedded_local_task_summary(self) -> None:
+        class Home(QWidget):
+            def begin_shutdown(self, callback):  # noqa: ANN001
+                callback()
+
+            def refresh_view(self) -> None:
+                return
+
+        class Kline(QWidget):
+            def __init__(self, *, embedded: bool = False) -> None:
+                super().__init__()
+
+            @staticmethod
+            def local_task_summary():
+                return {"rr": 2, "line_conditions": 1, "arbitrage": 0}
+
+        with (
+            patch("roll_terminal_qt.launcher.AccountPositionsHomeWidget", Home),
+            patch("roll_terminal_qt.launcher.KlineAnalysisWindow", Kline),
+        ):
+            launcher = LauncherWindow()
+            try:
+                launcher.show_page("kline")
+                launcher._refresh_local_task_status()
+                self.assertEqual(launcher._local_task_status.text(), "RR 2 | 条件单 1")
+            finally:
+                launcher._pages.pop("kline").setParent(None)
+                self.__class__.dispose_widget(launcher)
+
+    def test_hiding_chart_keeps_rr_monitor_running(self) -> None:
+        chart_host = MagicMock()
+        button = MagicMock()
+        rr_timer = MagicMock()
+        app = SimpleNamespace(_chart_host=chart_host, _hide_chart_btn=button, _rr_monitor_timer=rr_timer)
+
+        KlineAnalysisWindow._toggle_chart_visibility(app, True)
+
+        chart_host.setVisible.assert_called_once_with(False)
+        button.setText.assert_called_once_with("显示图表")
+        rr_timer.stop.assert_not_called()
+
+    def test_kline_embedded_defaults_to_visible_chart_with_patterns_disabled(self) -> None:
+        window = KlineAnalysisWindow(embedded=True)
+        try:
+            self.assertFalse(window._hide_chart_btn.isChecked())
+            self.assertTrue(window._ema9.isChecked())
+            self.assertTrue(window._ema21.isChecked())
+            self.assertFalse(window._show_1h_shape_signal_check.isChecked())
+            self.assertFalse(window._show_4h_shape_signal_check.isChecked())
+            self.assertFalse(window._show_1d_shape_signal_check.isChecked())
+            self.assertFalse(window._shape_signal_ma_touch_check.isChecked())
+            self.assertFalse(window.pattern_signals_enabled())
+            self.assertTrue(window._api_profile_combo.isHidden())
+        finally:
+            self.__class__.dispose_widget(window)
+
+    def test_kline_embedded_collapses_pattern_controls_into_settings_menu(self) -> None:
+        window = KlineAnalysisWindow(embedded=True)
+        try:
+            self.assertTrue(window._shape_signal_group.isHidden())
+            self.assertFalse(window._shape_settings_button.isHidden())
+            self.assertEqual(window._shape_settings_button.text(), "形态：关")
+
+            window._shape_setting_actions["4H"].setChecked(True)
+
+            self.assertTrue(window._show_4h_shape_signal_check.isChecked())
+            self.assertEqual(window._shape_settings_button.text(), "形态：开")
+        finally:
+            self.__class__.dispose_widget(window)
+
+    def test_kline_embedded_accepts_workspace_profile_without_changing_symbol_or_period(self) -> None:
+        runtime_api1 = SimpleNamespace(
+            credential_profile_name="api1",
+            environment="demo",
+            credentials=SimpleNamespace(profile_name="api1"),
+        )
+        runtime_api2 = SimpleNamespace(
+            credential_profile_name="api2",
+            environment="live",
+            credentials=SimpleNamespace(profile_name="api2"),
+        )
+        with patch(
+            "roll_terminal_qt.kline_analysis_window.load_runtime",
+            side_effect=lambda profile_name=None: runtime_api2 if profile_name == "api2" else runtime_api1,
+        ):
+            window = KlineAnalysisWindow(embedded=True)
+        try:
+            symbol = window._symbol_input.text()
+            period = window._period_combo.currentText()
+            with (
+                patch(
+                    "roll_terminal_qt.kline_analysis_window.load_runtime",
+                    side_effect=lambda profile_name=None: runtime_api2 if profile_name == "api2" else runtime_api1,
+                ),
+                patch.object(window, "_load_data") as load_data,
+            ):
+                window.apply_workspace_profile("api2")
+
+            self.assertEqual(window.workspace_profile_name(), "api2")
+            self.assertIs(window._runtime, runtime_api2)
+            self.assertEqual(window._symbol_input.text(), symbol)
+            self.assertEqual(window._period_combo.currentText(), period)
+            load_data.assert_called_once()
+        finally:
+            self.__class__.dispose_widget(window)
+
+    def test_realtime_candle_merge_replaces_open_bar_without_history_reload(self) -> None:
+        payload = KlineChartPayload(
+            candles=[{"time": 1_000, "open": 10.0, "high": 12.0, "low": 9.0, "close": 10.0, "volume": 2.0}],
+            ema_9=[{"time": 1_000, "value": 10.0}],
+            ema_21=[{"time": 1_000, "value": 10.0}],
+            ema_55=[{"time": 1_000, "value": 10.0}],
+            trend_indicator=[],
+            signal_markers=[],
+            box_overlays=[],
+            raw_candles=[Candle(1_000, Decimal("10"), Decimal("12"), Decimal("9"), Decimal("10"), Decimal("2"), False)],
+            stats={"returned": 1},
+        )
+
+        updated = _merge_realtime_candle_payload(
+            payload,
+            Candle(1_000, Decimal("10"), Decimal("13"), Decimal("9"), Decimal("11"), Decimal("3"), False),
+        )
+
+        self.assertEqual(updated.candles[0]["close"], 11.0)
+        self.assertEqual(updated.raw_candles[0].volume, Decimal("3"))
+
+    def test_window_realtime_candle_does_not_call_history_loader_or_full_renderer(self) -> None:
+        payload = KlineChartPayload(
+            candles=[{"time": 1, "open": 10.0, "high": 12.0, "low": 9.0, "close": 10.0, "volume": 2.0}],
+            ema_9=[], ema_21=[], ema_55=[], trend_indicator=[], signal_markers=[], box_overlays=[],
+            raw_candles=[Candle(1_000, Decimal("10"), Decimal("12"), Decimal("9"), Decimal("10"), Decimal("2"), False)],
+            stats={},
+        )
+        app = SimpleNamespace(
+            _pending_payload=payload,
+            _loaded_primary_request_key=("primary",),
+            _primary_payload_cache={},
+            _remember_payload_cache=MagicMock(),
+            _apply_realtime_candle_to_chart=MagicMock(),
+            _load_data=MagicMock(),
+            _render_to_chart=MagicMock(),
+        )
+
+        KlineAnalysisWindow._apply_realtime_candle(
+            app,
+            Candle(1_000, Decimal("10"), Decimal("12"), Decimal("9"), Decimal("11"), Decimal("2"), False),
+        )
+
+        app._load_data.assert_not_called()
+        app._render_to_chart.assert_not_called()
+        app._apply_realtime_candle_to_chart.assert_called_once()
+
+    def test_measure_ui_step_logs_elapsed_ms(self) -> None:
+        messages: list[str] = []
+        with patch("roll_terminal_qt.perf_metrics.append_log_line", side_effect=messages.append):
+            with measure_ui_step("orders_apply", rows=3):
+                pass
+
+        self.assertEqual(len(messages), 1)
+        self.assertIn("[qt_perf] orders_apply", messages[0])
+        self.assertIn("elapsed_ms=", messages[0])
+        self.assertIn("rows=3", messages[0])
 
     def test_kline_account_drawer_load_thread_fetches_positions_and_orders_in_parallel(self) -> None:
         barrier = threading.Barrier(2)
@@ -156,8 +769,16 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             def closeEvent(self, event) -> None:  # noqa: ANN001
                 event.ignore()
 
-        with patch("roll_terminal_qt.launcher.AccountPositionsHomeWidget", ShutdownHome):
+        class Kline(QWidget):
+            def __init__(self, *, embedded: bool = False) -> None:
+                super().__init__()
+
+        with (
+            patch("roll_terminal_qt.launcher.AccountPositionsHomeWidget", ShutdownHome),
+            patch("roll_terminal_qt.launcher.KlineAnalysisWindow", Kline),
+        ):
             launcher = LauncherWindow()
+            launcher.show_page("account")
         child = BlockingChild()
         try:
             child.show()
@@ -2574,12 +3195,16 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     "management_mode": "trail_after_2r",
                     "entry_execution_mode": "chase_best_quote",
                     "fee_offset_enabled": False,
+                    "trade_profile_name": "api1",
+                    "trade_environment": "live",
                 }]
                 event = {"kind": "line_alert", "line_id": "line-1", "trade_action": "long", "trade_enabled": True, "candle_time": 200}
                 with patch.object(window, "_instrument_for_symbol", return_value=instrument):
                     plan = window._build_line_trade_plan_from_event(event)
 
-                self.assertEqual(plan.plan_id, "moni:BTC-USDT-SWAP:line-1:200")
+                self.assertEqual(plan.plan_id, "api1:BTC-USDT-SWAP:line-1:200")
+                self.assertEqual(plan.profile_name, "api1")
+                self.assertEqual(plan.environment, "live")
                 self.assertEqual(plan.direction, "long")
                 self.assertEqual(plan.entry_price, Decimal("60000.0"))
                 self.assertEqual(plan.stop_loss_price, Decimal("59000.0"))
@@ -2596,6 +3221,13 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         ):
             window = KlineAnalysisWindow()
             try:
+                window._runtime = ArbitrageTradeRuntime(
+                    credentials=SimpleNamespace(profile_name="moni"),
+                    environment="demo",
+                    trade_mode="cross",
+                    position_mode="net",
+                    credential_profile_name="moni",
+                )
                 window._workspace_entry()["lines"] = [{
                     "id": "line-1", "kind": "horizontal", "label": "Breakout long", "trigger": "cross_above",
                     "action": "long", "enabled": True, "time_a": 100, "price_a": 60000.0, "time_b": 100, "price_b": 60000.0,
@@ -2609,6 +3241,8 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
                 self.assertTrue(window._workspace_entry()["lines"][0]["trade_enabled"])
                 self.assertEqual(window._workspace_entry()["lines"][0]["entry_execution_mode"], "chase_best_quote")
+                self.assertEqual(window._workspace_entry()["lines"][0]["trade_profile_name"], "moni")
+                self.assertEqual(window._workspace_entry()["lines"][0]["trade_environment"], "demo")
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -2632,6 +3266,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     "trade_enabled": True, "time_a": 100, "price_a": 60000.0, "time_b": 100, "price_b": 60000.0,
                     "stop_loss_price": 59000.0, "risk_amount": 125.0, "direct_take_profit_r": 2.0,
                     "management_mode": "fixed_tp", "entry_execution_mode": "limit", "fee_offset_enabled": False,
+                    "trade_profile_name": "api1", "trade_environment": "live",
                 }]
                 event = {"kind": "line_alert", "line_id": "line-1", "trade_action": "long", "trade_enabled": True, "candle_time": 200}
                 with patch.object(window, "_instrument_for_symbol", return_value=instrument):
@@ -2642,7 +3277,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     plans = window._build_armed_line_trade_plans([event, event])
 
                 self.assertEqual(len(plans), 1)
-                self.assertEqual(plans[0].plan_id, "moni:BTC-USDT-SWAP:line-1:200")
+                self.assertEqual(plans[0].plan_id, "api1:BTC-USDT-SWAP:line-1:200")
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -2653,6 +3288,9 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         )
         runtime = ArbitrageTradeRuntime(
             credentials=SimpleNamespace(profile_name="moni"), environment="demo", trade_mode="cross", position_mode="net", credential_profile_name="moni",
+        )
+        bound_runtime = ArbitrageTradeRuntime(
+            credentials=SimpleNamespace(profile_name="api1"), environment="live", trade_mode="cross", position_mode="net", credential_profile_name="api1",
         )
         with (
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
@@ -2666,6 +3304,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     "trade_enabled": True, "time_a": 100, "price_a": 60000.0, "time_b": 100, "price_b": 60000.0,
                     "stop_loss_price": 59000.0, "risk_amount": 125.0, "direct_take_profit_r": 2.0,
                     "management_mode": "fixed_tp", "entry_execution_mode": "limit", "fee_offset_enabled": False,
+                    "trade_profile_name": "api1", "trade_environment": "live",
                 }]
                 event = {"kind": "line_alert", "line_id": "line-1", "trade_action": "long", "trade_enabled": True, "candle_time": 200}
                 window._line_trade_armed_check.blockSignals(True)
@@ -2674,13 +3313,44 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 with (
                     patch.object(window, "_instrument_for_symbol", return_value=instrument),
                     patch.object(window, "_start_rr_execution_action") as start_execution,
+                    patch("roll_terminal_qt.kline_analysis_window.load_runtime", return_value=bound_runtime) as load_bound_runtime,
                 ):
                     window._enqueue_line_trade_events([event])
 
                 self.assertEqual(start_execution.call_count, 1)
+                load_bound_runtime.assert_called_with("api1")
                 self.assertEqual(len(window._line_trade_execution_queue), 0)
             finally:
                 self.__class__.dispose_widget(window)
+
+    def test_kline_monitorable_rr_entries_are_not_filtered_by_visible_profile(self) -> None:
+        api1 = SimpleNamespace(status="protected", plan=SimpleNamespace(profile_name="api1"))
+        api2 = SimpleNamespace(status="entry_working", plan=SimpleNamespace(profile_name="api2"))
+        stopped = SimpleNamespace(status="cancelled", plan=SimpleNamespace(profile_name="api3"))
+        app = SimpleNamespace(
+            _all_rr_trade_ledger_entries=lambda: [api1, api2, stopped],
+            _rr_trade_execution_service=SimpleNamespace(
+                should_monitor_status=lambda status: status in {"protected", "entry_working"}
+            ),
+        )
+
+        entries = KlineAnalysisWindow._monitorable_rr_trade_ledger_entries(app)
+
+        self.assertEqual([entry.plan.profile_name for entry in entries], ["api1", "api2"])
+
+    def test_kline_rr_monitor_rotates_across_bound_profiles(self) -> None:
+        api1 = SimpleNamespace(plan=SimpleNamespace(profile_name="api1"))
+        api2 = SimpleNamespace(plan=SimpleNamespace(profile_name="api2"))
+        app = SimpleNamespace(
+            _rr_monitor_cursor=0,
+            _monitorable_rr_trade_ledger_entries=lambda: [api1, api2],
+        )
+
+        first = KlineAnalysisWindow._next_monitorable_rr_entry(app)
+        second = KlineAnalysisWindow._next_monitorable_rr_entry(app)
+
+        self.assertIs(first, api1)
+        self.assertIs(second, api2)
 
     def test_kline_alert_snapshot_forwards_line_events_to_trade_queue(self) -> None:
         with (
@@ -4749,12 +5419,12 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     alert_snapshot=None,
                 )
 
-                window._box_breakout_alert_check.setChecked(True)
-                window._live_box_check.setChecked(False)
+                window._auto_box_check.setChecked(True)
+                window._history_box_check.setChecked(False)
                 current_only = window._visible_box_overlays(payload)
 
-                window._box_breakout_alert_check.setChecked(False)
-                window._live_box_check.setChecked(True)
+                window._auto_box_check.setChecked(False)
+                window._history_box_check.setChecked(True)
                 history_only = window._visible_box_overlays(payload)
             finally:
                 self.__class__.dispose_widget(window)

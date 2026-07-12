@@ -4,7 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from okx_quant.models import Credentials, OrderPlan, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderStatus, OkxRestClient, OkxTicker, _okx_trade_order_request_log_fragment
@@ -312,6 +312,65 @@ class OkxClientOrderRequestTest(TestCase):
         self.assertTrue(status["available"])
         self.assertTrue(status["connected"])
         self.assertEqual(status["positions_version"], 7)
+
+    def test_get_cached_algo_order_statuses_parses_business_ws_payload(self) -> None:
+        client = OkxRestClient()
+
+        class _StubAlgoWs:
+            @staticmethod
+            def get_latest_orders(*, limit: int):
+                assert limit == 20
+                return 11, [
+                    {
+                        "algoId": "algo-1",
+                        "instId": "BTC-USDT-SWAP",
+                        "instType": "SWAP",
+                        "state": "live",
+                        "side": "sell",
+                        "ordType": "conditional",
+                        "triggerPx": "71000",
+                        "orderPx": "-1",
+                        "sz": "2",
+                    }
+                ]
+
+        client._algo_ws_connection_for = lambda *args, **kwargs: _StubAlgoWs()  # type: ignore[method-assign]
+
+        result = client.get_cached_algo_order_statuses(
+            Credentials(api_key="k", secret_key="s", passphrase="p"),
+            environment="demo",
+            limit=20,
+        )
+
+        assert result is not None
+        version, items = result
+        self.assertEqual(version, 11)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].source_kind, "algo")
+        self.assertEqual(items[0].algo_id, "algo-1")
+        self.assertEqual(items[0].trigger_price, Decimal("71000"))
+
+    def test_add_private_update_listener_returns_connection_unsubscribe(self) -> None:
+        client = OkxRestClient()
+        unsubscribe = MagicMock()
+
+        class _StubPrivateWs:
+            @staticmethod
+            def add_update_listener(listener):  # noqa: ANN001
+                listener("orders", 3)
+                return unsubscribe
+
+        client._private_ws_connection_for = lambda *args, **kwargs: _StubPrivateWs()  # type: ignore[method-assign]
+        received: list[tuple[str, int]] = []
+
+        result = client.add_private_update_listener(
+            Credentials(api_key="k", secret_key="s", passphrase="p"),
+            environment="demo",
+            listener=lambda channel, version: received.append((channel, version)),
+        )
+
+        self.assertIs(result, unsubscribe)
+        self.assertEqual(received, [("orders", 3)])
 
     def test_get_cached_public_market_snapshots_use_ws_payloads(self) -> None:
         client = OkxRestClient()

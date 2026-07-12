@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.71`
+当前版本：`v0.6.72`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -29,7 +29,7 @@
 
 ## 近期更新
 
-`v0.6.71` 这一轮版本内容比较集中，重点新增和调整如下：
+`v0.6.72` 这一轮版本内容比较集中，重点新增和调整如下：
 
 - API 环境与策略环境的一致性防呆补齐：
   - 启动确认弹窗现在会同时显示 `API环境`、`策略环境` 和 `环境状态`
@@ -136,7 +136,7 @@
   - 这样做移仓或专业平仓时，不用再自己去脑补这条腿后面大概还剩多少现货
 - Qt 端这轮开始从“单一终端”往“多模块主壳”升级：
   - 新增 `roll_terminal_qt/launcher.py`，现在已经有一个 Qt 主壳页来统一管理多个独立模块入口
-  - 当前主壳已纳入四个模块方向：`专业套利终端`、`无限下单`、`划线交易台`、`自动通道`
+  - 当前主壳保留 `专业套利终端` 与 `无限下单`；`划线交易台` 不再作为独立入口，`自动通道` 后续并入 K 线功能
   - 各模块会共享同一套数据根目录、配置目录、状态目录和日志目录，但界面与运行逻辑继续各自独立
   - API profile 解锁逻辑也抽成了共享 helper，后续这些 Qt 模块切换 profile 时会更统一
 - Qt 主壳这轮继续往“交易 + 分析工作台”扩：
@@ -144,6 +144,17 @@
   - `roll_terminal_qt/kline_analysis_window.py` 现在走本地优先工作区：按 `symbol + period` 保存画线、告警开关和事件日志
   - `roll_terminal_qt/kline_alerts.py` 已经落地 `EMA15/SMA50`、水平线/趋势线、自动箱体突破三类本地告警逻辑，并做同 K 线去重
   - `okx_quant/persistence.py` 新增 `kline_analysis_workspace.json`，说明这块已经开始形成独立状态文件，而不是临时内存态
+- Qt 本地交易终端现已采用单窗口实时架构：
+  - 主窗口默认打开 K线，并在全局顶栏提供“K线 / 持仓 / 专业套利 / 交易工具 / 期权工具”；账户持仓和专业套利按需创建，返回后保留页面现场
+  - 新启动默认优先使用 `moni` API 配置；没有 `moni` 时才回退到已选或首个可用配置
+  - API、模拟/实盘环境、行情/私有连接状态和本地任务摘要统一提升到全局顶栏；页面内不再重复显示 API 下拉框
+  - 顶部 API 只决定当前查看账户和新操作账户；已运行 RR、线条条件和自动套利继续绑定启动时的 API，不会因查看其他账户而改发订单
+  - K线图默认显示，EMA15/SMA50 默认开启，1H/4H/1D 形态默认关闭；嵌入页使用紧凑的“形态：关/开”菜单
+  - 自动通道已收进 K线左侧分析模块：自动箱体、历史箱体、通道显示与箱体突破告警彼此独立，默认关闭；通道识别复用原研究模块，参数按 API / 标的 / 周期保存
+  - K线页仍可隐藏图表，RR 与本地条件任务不会因切页或隐藏图表而停止
+  - `orders`、`positions`、`account` 使用私有 WS，条件/OCO 类算法单使用业务 WS `orders-algo`；REST 仅用于启动快照、断线恢复、60 秒安全校验与历史查询
+  - 当前合约 K线在首次历史加载后订阅业务 WS；开 K 替换、新 K 追加都走增量图表更新，不重新拉取整段历史
+  - Qt 主进程不再创建隐藏 Tk 根窗口或运行 Tk 事件泵；遗留 Tk 期权工具会独立启动，并继续使用同一数据目录
 - Qt 账户持仓首页这轮也补实了一批操作闭环：
   - 当前委托不再只看 WS，`roll_terminal_qt/order_service.py` 会把 `WS 当前委托` 和 `REST pending/algo` 一起合并显示
   - `roll_terminal_qt/account_positions_home.py` 新增了“撤单选中”真实执行链路，能按普通委托 / 算法委托分别撤单
@@ -427,7 +438,7 @@ python main.py
 - [okx_quant/backtest_ui.py](/D:/qqokx/okx_quant/backtest_ui.py)：回测界面，当前已支持动态保护规则编辑、运行编号/归档编号区分、以及新的回测 K 线图交互
 - [okx_quant/backtest_audit.py](/D:/qqokx/okx_quant/backtest_audit.py)：回测审计导出，当前已改成流式 CSV 写出
 - [okx_quant/candle_store.py](/D:/qqokx/okx_quant/candle_store.py)：本地 K 线存储，当前已支持查询缓存根数与时间覆盖范围，以及过期未确认 K 线自动转确认
-- [okx_quant/strategy_symbol_defaults.py](/D:/qqokx/okx_quant/strategy_symbol_defaults.py)：分币种策略默认模板，当前已固化 `v0.6.71` 的多头/空头独立参数
+- [okx_quant/strategy_symbol_defaults.py](/D:/qqokx/okx_quant/strategy_symbol_defaults.py)：分币种策略默认模板，当前已固化 `v0.6.72` 的多头/空头独立参数
 - [okx_quant/multi_coin_market_digest.py](/D:/qqokx/okx_quant/multi_coin_market_digest.py)：多币种市场早报，当前已支持“明确观点 + 最近复盘命中率”邮件内容
 - [okx_quant/analysis_email_validation.py](/D:/qqokx/okx_quant/analysis_email_validation.py)：多币种早报邮件的历史观点回放验证与汇总导出
 - [reports/ema55_slope_short_research_report.html](/D:/qqokx/reports/ema55_slope_short_research_report.html)：EMA55 斜率做空研究报告（HTML）
@@ -604,7 +615,7 @@ scripts\release_one_click.bat
   ：服务器升级操作清单，适合按实盘环境灰度启用私有 WS 加速
 - [软件开发指南.md](/D:/qqokx/软件开发指南.md)
   ：开发维护说明，已补充策略 schema / runtime registry、EMA55 斜率做空、回测与 UI 接入约定
-- [版本开发日志_v0.6.71.md](/D:/qqokx/版本开发日志_v0.6.71.md)
+- [版本开发日志_v0.6.72.md](/D:/qqokx/版本开发日志_v0.6.72.md)
   ：本轮版本开发日志，归档 EMA55 策略、研究报告、B 方案结构重构与验证结果
 - [reports/strategy_ui_schema_b_impl.md](/D:/qqokx/reports/strategy_ui_schema_b_impl.md)
   ：B 方案实施说明，记录 schema / registry 这一轮已经解掉的耦合和剩余尾项
